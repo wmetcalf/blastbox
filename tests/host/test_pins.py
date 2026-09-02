@@ -327,3 +327,97 @@ def test_a_directory_symlink_is_not_followed(tmp_path):
     )
     (root / "link").symlink_to(outside, target_is_directory=True)
     assert {p.floor for p in scan(root)} == {"0.1.27"}
+
+
+def test_a_different_distribution_ending_in_blastbox_is_not_matched(tmp_path):
+    root = _repo(tmp_path, {
+        "pyproject.toml": PYPROJECT,
+        "deploy/docker/Dockerfile.w": '''
+            FROM p
+            RUN pip install "not-blastbox==0.1.1" "myblastbox==0.1.2"
+        ''',
+    })
+    assert {p.floor for p in scan(root)} == {"0.1.27"}
+    assert not [p for p in scan(root) if p.kind == "dockerfile-pip"]
+
+
+def test_the_strongest_lower_bound_wins(tmp_path):
+    """A set may carry several lower bounds; the first written is arbitrary."""
+    root = _repo(tmp_path, {
+        "pyproject.toml": '''
+            [project]
+            name = "c"
+            version = "0.1.0"
+            dependencies = ["blastbox>=0.1.5,>=0.1.27,<0.2"]
+        '''
+    })
+    assert [p.floor for p in scan(root)] == ["0.1.27"]
+
+
+def test_pip_global_options_before_install(tmp_path):
+    root = _repo(tmp_path, {
+        "pyproject.toml": PYPROJECT,
+        "deploy/docker/Dockerfile.w": '''
+            FROM p
+            RUN python -m pip --isolated --no-cache-dir install "blastbox==0.1.17"
+        ''',
+    })
+    assert sorted(disagreements(scan(root))) == ["0.1.17", "0.1.27"]
+
+
+def test_every_install_on_one_logical_run_is_reported(tmp_path):
+    root = _repo(tmp_path, {
+        "pyproject.toml": PYPROJECT,
+        "deploy/docker/Dockerfile.w": '''
+            FROM p
+            RUN pip install "blastbox==0.1.17" \\
+             && pip install "blastbox[host]==0.1.20"
+        ''',
+    })
+    assert sorted(disagreements(scan(root))) == ["0.1.17", "0.1.20", "0.1.27"]
+
+
+def test_suffix_convention_dockerfiles_are_scanned(tmp_path):
+    root = _repo(tmp_path, {
+        "pyproject.toml": PYPROJECT,
+        "deploy/worker.Dockerfile": '''
+            FROM p
+            RUN pip install "blastbox==0.1.17"
+        ''',
+    })
+    assert sorted(disagreements(scan(root))) == ["0.1.17", "0.1.27"]
+
+
+def test_indented_lock_entries_are_found(tmp_path):
+    """Leading whitespace is legal in a requirements-format file.
+
+    NOTE the leading `#` line: _repo() runs textwrap.dedent, which would strip
+    the very indentation under test if every line were indented.
+    """
+    root = _repo(tmp_path, {
+        "pyproject.toml": PYPROJECT,
+        "deploy/requirements.lock": "# lock\n    blastbox==0.1.17 \\\n        --hash=sha256:abc\n",
+    })
+    lock_pins = [p for p in scan(root) if p.kind == "lock"]
+    assert [p.floor for p in lock_pins] == ["0.1.17"], lock_pins
+    assert sorted(disagreements(scan(root))) == ["0.1.17", "0.1.27"]
+
+
+def test_an_unreadable_directory_fails_instead_of_under_reporting(tmp_path):
+    """Silently skipping a directory returns OK on a repo never fully read."""
+    import os
+
+    import pytest as _pytest
+
+    from blastbox.host.pins import PinScanError
+
+    root = _repo(tmp_path, {"pyproject.toml": PYPROJECT})
+    blocked = root / "deploy"
+    blocked.mkdir(exist_ok=True)
+    (blocked / "Dockerfile.w").write_text('RUN pip install "blastbox==0.1.1"\n', encoding="utf-8")
+    os.chmod(blocked, 0o000)
+    try:
+        with _pytest.raises(PinScanError):
+            scan(root)
+    finally:
+        os.chmod(blocked, 0o755)

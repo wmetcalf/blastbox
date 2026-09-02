@@ -29,16 +29,27 @@ from pathlib import Path
 
 _ARG_RE = re.compile(r'^\s*ARG\s+BLASTBOX_VERSION\s*=\s*["\']?([0-9][^"\'\s]*)["\']?')
 # A real install: `pip install`, `pip3 install`, `uv pip install`, `python -m pip install`.
-_INSTALL_RE = re.compile(r'\b(?:pip[0-9.]*|uv\s+pip)\s+install\b')
+# `pip install`, `pip3 install`, `uv pip install`, and pip global options in
+# between (`python -m pip --isolated install ...`).
+_INSTALL_RE = re.compile(r'\b(?:pip[0-9.]*|uv\s+pip)\s+(?:-[^\s]+\s+)*install\b')
 # `blastbox`, optional extras, then a specifier set. Stops at a PEP 508 marker (`;`),
 # a quote, or whitespace.
 _REQ_RE = re.compile(
-    r'(?i:blastbox)(?P<extras>\[[a-zA-Z0-9,._\-]+\])?\s*'
-    r'(?P<spec>(?:[=<>!~]=|[<>])\s*[0-9][^"\';\s]*'
-    r'(?:\s*,\s*(?:[=<>!~]=|[<>])\s*[0-9][^"\';\s]*)*)'
+    r'(?<![\w.\-])(?i:blastbox)(?P<extras>\[[a-zA-Z0-9,._\-]+\])?\s*'
+    r'(?P<spec>(?:[=<>!~]=|[<>])\s*v?[0-9][^"\';\s]*'
+    r'(?:\s*,\s*(?:[=<>!~]=|[<>])\s*v?[0-9][^"\';\s]*)*)'
 )
-_LOCK_RE = re.compile(r'^(?i:blastbox)(?:\[[a-zA-Z0-9,._\-]+\])?\s*==\s*([^\s\;]+)')
+# Leading whitespace is legal in a requirements-format file.
+_LOCK_RE = re.compile(r'^\s*(?i:blastbox)(?:\[[a-zA-Z0-9,._\-]+\])?\s*==\s*([^\s\;]+)')
 _ARG_USE_RE = re.compile(r'\$\{?BLASTBOX_VERSION\}?')
+
+
+def _version_key(version: str) -> tuple[int, ...]:
+    """Sortable release tuple; non-numeric suffixes sort before the release."""
+    m = re.match(r"^(\d+(?:\.\d+)*)", version)
+    if not m:
+        return (0,)
+    return tuple(int(part) for part in m.group(1).split("."))
 
 
 def _normalise_version(version: str) -> str:
@@ -87,12 +98,18 @@ class Pin:
         `blastbox<=0.2,>=0.1.27` guarantees 0.1.27, not 0.2. Order in the
         specifier is not meaningful, so every part is examined.
         """
+        floors: list[str] = []
         for part in self.specifier.split(","):
             part = part.strip()
             for op in ("==", ">=", "~="):
                 if part.startswith(op):
-                    return _normalise_version(part[len(op):].strip())
-        return None
+                    floors.append(_normalise_version(part[len(op):].strip().lstrip("vV")))
+                    break
+        if not floors:
+            return None
+        # A set may carry more than one lower bound; the strongest is what the
+        # pin actually guarantees, and it is not necessarily written first.
+        return max(floors, key=_version_key)
 
 
 def _strip_comment(line: str) -> str:
@@ -203,19 +220,22 @@ def _scan_dockerfile(path: Path) -> list[Pin]:
             continue
         if "blastbox" not in line.lower() or not _INSTALL_RE.search(line):
             continue
-        parsed = _split_requirement(_isolate_requirement(line))
-        if parsed:
-            out.append(Pin(str(path), lineno, "dockerfile-pip", line.strip(), parsed[1]))
+        # One logical RUN can install blastbox more than once
+        # (`pip install a && pip install b`); report every pin.
+        for token in _isolate_requirements(line):
+            parsed = _split_requirement(token)
+            if parsed:
+                out.append(Pin(str(path), lineno, "dockerfile-pip", line.strip(), parsed[1]))
     return out
 
 
-def _isolate_requirement(line: str) -> str:
-    """Pull the blastbox requirement token out of an install command line."""
-    m = _REQ_RE.search(line)
-    if not m:
-        return ""
-    start = line.lower().rfind("blastbox", 0, m.end())
-    return line[start : m.end()]
+def _isolate_requirements(line: str) -> list[str]:
+    """Every blastbox requirement token on an install command line."""
+    out: list[str] = []
+    for m in _REQ_RE.finditer(line):
+        start = line.lower().rfind("blastbox", 0, m.end())
+        out.append(line[start : m.end()])
+    return out
 
 
 def _scan_lock(path: Path) -> list[Pin]:
@@ -245,8 +265,11 @@ def _walk(root: Path):
         current = stack.pop()
         try:
             entries = list(current.iterdir())
-        except OSError:
-            continue
+        except OSError as exc:
+            # Swallowing this under-reports pins and returns OK on a repo that
+            # was never fully read -- the same vacuous pass as a malformed
+            # pyproject.
+            raise PinScanError(f"{current}: {exc}") from exc
         for entry in entries:
             # is_dir() follows symlinks: a link to / would walk the filesystem,
             # and a link back into the tree would loop. Scan the repo only.
@@ -266,7 +289,7 @@ def scan(root: Path) -> list[Pin]:
         name = path.name
         if name == "pyproject.toml":
             pins.extend(_scan_pyproject(path))
-        elif name.startswith("Dockerfile"):
+        elif name.startswith("Dockerfile") or name.endswith((".Dockerfile", ".dockerfile")):
             pins.extend(_scan_dockerfile(path))
         elif re.fullmatch(r"requirements[\w.\-]*\.(txt|lock)|[\w.\-]+\.lock", name):
             pins.extend(_scan_lock(path))
