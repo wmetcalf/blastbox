@@ -265,18 +265,49 @@ def version_in_image(image: str, runner: Runner | None = None) -> tuple[str, str
             "docker", "run", "--rm",
             *_CONFINE,
             "--entrypoint", "sh", image, "-lc",
-            'for p in /opt/*/bin/python; do [ -x "$p" ] || continue; '
-            'v=$("$p" - <<\'EOF\'\n' + _PROBE + "EOF\n" + '); '
-            'case "$v" in ""|NOPKG*) continue;; *) printf %s "$v"; exit 0;; esac; '
-            'done; printf NOPKG',
+            # `tried` distinguishes "there was no interpreter to run" from
+            # "an interpreter was there and did not answer" -- the confined UID
+            # cannot execute a root-only python, and reporting that as NOPKG
+            # says "not a blastbox image" about an image nobody could look
+            # inside. Absence and failure are different answers.
+            # Three outcomes, kept apart. `nopkg` remembers that an
+            # interpreter ANSWERED "not installed" -- without it, a venv python
+            # correctly reporting NOPKG fell through to the found-but-failed
+            # branch and came back as PROBEFAIL, turning a definite answer into
+            # "could not look". No interpreter at all is NOPKG too: an image
+            # with no python is not a blastbox image, which is precisely
+            # RedTusk's pure-JVM worker base.
+            'tried=; nopkg=; for p in /opt/*/bin/python; do [ -x "$p" ] || continue; '
+            'tried=1; v=$("$p" - <<\'EOF\'\n' + _PROBE + "EOF\n" + '); '
+            'case "$v" in NOPKG*) nopkg=1; continue;; '
+            '""|PROBEFAIL*) continue;; '
+            '*) printf %s "$v"; exit 0;; esac; '
+            'done; '
+            'if [ -n "$nopkg" ]; then printf NOPKG; '
+            'elif [ -n "$tried" ]; then printf PROBEFAIL; '
+            'else printf NOPKG; fi',
         ])
     except subprocess.TimeoutExpired:
         return UNKNOWN, "probe timed out"
     raw = (proc.stdout or "").strip().splitlines()
     line = _sanitise(raw[-1]) if raw else ""
+    # The sentinels are checked BEFORE the "looks like a version" branch: they
+    # are not versions, and matching that branch first returned the literal
+    # string PROBEFAIL to callers as though it were one.
+    if proc.returncode == 0 and line.startswith(_PROBEFAIL):
+        return UNKNOWN, "an interpreter was present but did not answer"
     if proc.returncode == 0 and line and line != NOPKG:
         return line, ""
-    return UNKNOWN, (_sanitise((proc.stderr or "").strip())[:140] or "no blastbox in image")
+    if proc.returncode == 0 and line == NOPKG:
+        # The probe RAN and found no blastbox. That is an answer -- "this is not
+        # a blastbox image" -- and it is not the same as "the probe failed",
+        # which is what returning UNKNOWN here used to say. The distinction is
+        # the whole point of the NOPKG sentinel, and collapsing it made
+        # verify_contents call a pure-JVM worker base a stamp DISAGREEMENT: the
+        # image is not supposed to contain blastbox, so there is nothing to
+        # disagree with.
+        return NOPKG, "the image contains no blastbox"
+    return UNKNOWN, (_sanitise((proc.stderr or "").strip())[:140] or "probe produced no output")
 
 
 def survey(runner: Runner | None = None) -> list[Container]:

@@ -1266,7 +1266,9 @@ def _stamp_cmd(args: argparse.Namespace) -> int:
     print(f"  base name     {got.base_name}")
     print(f"  base digest   {got.base_digest}")
     print(f"  base image id {got.base_image_id}")
-    if not agrees:
+    if agrees is None:
+        print(f"  contents     {detail} (nothing to join)")
+    elif not agrees:
         print(
             f"\nSTAMP DISAGREES WITH THE IMAGE: {detail}\n"
             "  The blastbox label is a self-report written at build time. It\n"

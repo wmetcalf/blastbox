@@ -124,16 +124,12 @@ class Stamp:
         if not self.reproducible:
             return False
         run = runner or _run
-        # Check the reference a REBUILD would actually use, which is what
-        # build_args emits: the repo@digest when there is one, otherwise the
-        # base NAME. Inspecting the image ID instead reported OK for a base
-        # whose tag had been deleted -- the ID is still in docker's store, but
-        # the tag is what gets handed to the builder, and the rebuild fails.
-        ref = (
-            f"{repo_of(self.base_name)}@{self.base_digest}"
-            if _DIGEST_RE.match(self.base_digest or "")
-            else self.base_name
-        )
+        # Check the reference a REBUILD would actually use. build_args pins to
+        # exactly the base it was given, and that is what base_name records, so
+        # there is nothing to reconstruct here. Inspecting the image ID instead
+        # reported OK for a base whose tag had been deleted -- the ID is still
+        # in docker's store, but the tag is what gets handed to the builder.
+        ref = self.base_name
         # A failure to ASK is not an answer. Callers state "the base is gone"
         # on a False, so an unreachable daemon must raise rather than be
         # reported as absence -- the same rule read() and doctor already follow.
@@ -169,8 +165,8 @@ class Stamp:
         asked, for the same reason `resolvable` does: a failure to ASK is not
         an answer, and silence here would read as "verified".
         """
-        if _DIGEST_RE.match(self.base_digest or ""):
-            return ""  # a registry digest cannot move
+        if "@sha256:" in (self.base_name or ""):
+            return ""  # pinned by digest in the reference itself; it cannot move
         recorded = self.base_image_id or ""
         name = self.base_name or ""
         if not _DIGEST_RE.match(recorded) or name in (UNKNOWN, ""):
@@ -288,6 +284,56 @@ def base_image_id(image: str, runner: Runner | None = None) -> str:
     raise StampError(f"{image}: cannot resolve an image ID (absent, or docker unavailable)")
 
 
+def _digest_from(image: str, digests_json: str) -> str:
+    """Pick the repo digest belonging to ``image``'s repository, or "".
+
+    Shared by the single-fact and the one-snapshot readers so both apply the
+    same rule: one image can carry digests from several repositories, and a
+    sole entry for the WRONG repository is refused rather than assumed.
+    """
+    try:
+        # Docker reports a nil RepoDigests field as JSON `null`, which decodes
+        # to None and is not iterable.
+        raw = json.loads(digests_json or "[]")
+    except json.JSONDecodeError:
+        raw = []
+    digests = [str(d) for d in (raw or [])]
+    repo = repo_of(image)
+    want = _canonical_repo(repo)
+    matching = [d for d in digests if _canonical_repo(d.split("@", 1)[0]) == want]
+    if matching:
+        return matching[0].split("@", 1)[-1]
+    if digests:
+        raise StampError(
+            f"{image}: {len(digests)} repo digests and none for {repo!r}; "
+            "cannot tell which base this is"
+        )
+    return ""
+
+
+def _inspect_base(image: str, runner: Runner | None = None) -> tuple[str, str]:
+    """``(repo_digest, image_id)`` for ``image``, read from ONE inspect.
+
+    Both facts describe the same image only if they were read at the same
+    moment. Asking twice lets a mutable tag move in between and produces a
+    stamp pairing one image's digest with another's ID.
+    """
+    run = runner or _run
+    proc = run(["docker", "inspect", "--type", "image", image,
+                "--format", "{{json .RepoDigests}}\t{{.Id}}"])
+    if proc.returncode != 0 or not (proc.stdout or "").strip():
+        raise StampError(
+            f"{image}: cannot resolve a digest (image absent, or docker "
+            "unavailable). Pull or build the base first; stamping 'unknown' "
+            "would look recorded while being unreproducible."
+        )
+    raw = proc.stdout.strip().split("\t")
+    digests_json, image_id = raw[0], (raw[1].strip() if len(raw) > 1 else "")
+    if not image_id:
+        raise StampError(f"{image}: cannot resolve an image ID (absent, or docker unavailable)")
+    return _digest_from(image, digests_json), image_id
+
+
 def base_digest(image: str, runner: Runner | None = None) -> str:
     """The REPO digest of ``image``, or "" when it has none (never pushed).
 
@@ -295,30 +341,10 @@ def base_digest(image: str, runner: Runner | None = None) -> str:
     identifier and belongs in its own label.
     """
     run = runner or _run
-    repo = repo_of(image)
     proc = run(["docker", "inspect", "--type", "image", image,
                 "--format", "{{json .RepoDigests}}"])
     if proc.returncode == 0:
-        try:
-            # Docker reports a nil RepoDigests field as JSON `null`, which
-            # decodes to None and is not iterable.
-            raw = json.loads(proc.stdout.strip() or "[]")
-        except json.JSONDecodeError:
-            raw = []
-        digests = [str(d) for d in (raw or [])]
-        # One image can carry digests from several repositories; take the one
-        # for the repo actually requested. A sole entry that does NOT match is
-        # still the wrong repository, so it is refused rather than assumed.
-        want = _canonical_repo(repo)
-        matching = [d for d in digests if _canonical_repo(d.split("@", 1)[0]) == want]
-        if matching:
-            return matching[0].split("@", 1)[-1]
-        if digests:
-            raise StampError(
-                f"{image}: {len(digests)} repo digests and none for {repo!r}; "
-                "cannot tell which base this is"
-            )
-        return ""
+        return _digest_from(image, proc.stdout.strip())
     raise StampError(
         f"{image}: cannot resolve a digest (image absent, or docker unavailable). "
         "Pull or build the base first; stamping 'unknown' would look recorded "
@@ -504,8 +530,20 @@ def build_args(
             "recorded and cannot be rebuilt; write the revision the tree came "
             "from into that file as part of the deploy."
         )
-    digest = base_digest(base, runner) if base else ""
-    image_id = base_image_id(base, runner) if base and not digest else ""
+    # ONE inspect for both facts. Two separate lookups let a tag change between
+    # them and label image A's digest next to image B's ID -- a stamp that is
+    # internally inconsistent and would send anyone checking it to the wrong
+    # image. The pair is only meaningful read from the same snapshot.
+    digest, snapshot_id = _inspect_base(base, runner) if base else ("", "")
+    # ALWAYS record the ID when the pin is by reference. It used to be skipped
+    # whenever a repo digest was found, which was harmless while a digest also
+    # became the pin -- but the pin is now the caller's reference, and with the
+    # containerd image store a local image HAS a repo digest, so skipping the ID
+    # left exactly the mutable-tag case with nothing for `base_moved` to compare
+    # against. The check that makes a reference pin trustworthy would have been
+    # silently disabled on the hosts that need it.
+    pinned_by_digest = "@sha256:" in (base or "")
+    image_id = snapshot_id if base and not pinned_by_digest else ""
     labels = {
         LABEL_BLASTBOX: blastbox_version,
         LABEL_REVISION: revision,
@@ -518,22 +556,29 @@ def build_args(
         _require_shell_safe(key, value)
         args += ["--label", f"{key}={value}"]
     if base:
-        # A registry digest is a real pin and every builder resolves it. An
-        # image ID is NOT a usable FROM: buildkit reads `sha256:...` as the
-        # repository `docker.io/library/sha256:...` and tries to PULL it, so a
-        # local-only base pinned by ID fails the build outright ("pull access
-        # denied") under the default builder. The classic builder does resolve
-        # it, which is exactly why this survived a hand-verified build -- the
-        # box that proved it had buildkit off.
+        # ONE RULE: pin to exactly the reference the caller named.
         #
-        # For a local-only base we therefore pass the REFERENCE the caller
-        # named and record the image ID in the label. That is a weaker pin: the
-        # reference is mutable, so the guarantee is "the build used whatever
-        # this reference meant at build time, and the label says which image
-        # that was" -- checkable after the fact (the recorded ID either still
-        # matches the reference or it does not), rather than guaranteed by
-        # construction. Push the base to a registry to get the strong form.
-        pinned = f"{repo_of(base)}@{digest}" if digest else base
+        # Deriving a "better" reference from `docker inspect` produces one the
+        # builder cannot resolve, in two different ways, both measured:
+        #
+        #   * An image ID is not a FROM at all. buildkit reads `sha256:...` as
+        #     the repository `docker.io/library/sha256:...` and tries to pull.
+        #   * A RepoDigest is not proof of a registry. With the containerd image
+        #     store, buildkit assigns a locally built image a manifest digest
+        #     that was never pushed anywhere, so `repo@sha256:...` sends the
+        #     build to Docker Hub for a digest that only exists on this host.
+        #     That killed a real build of redtusk-cold-worker on a fleet node
+        #     while every unit test passed -- the laptop's image store reported
+        #     no RepoDigests at all, so the branch was never taken there.
+        #
+        # If a caller wants a digest pin they pass `repo@sha256:...` as the
+        # base, and they get it verbatim. Anything else is pinned by the name
+        # they gave, with the digest and image ID still RECORDED in the labels.
+        # For a name, the guarantee is "the build used whatever this reference
+        # meant at build time, and the label says which image that was" --
+        # checkable afterwards via `Stamp.base_moved` rather than guaranteed by
+        # construction. Push the base and pass repo@digest for the strong form.
+        pinned = base
         _require_shell_safe(base_arg, pinned)
         args += ["--build-arg", f"{base_arg}={pinned}"]
     return args
@@ -548,7 +593,7 @@ def _require_shell_safe(key: str, value: str) -> None:
         )
 
 
-def verify_contents(image: str, runner: Runner | None = None) -> tuple[bool, str]:
+def verify_contents(image: str, runner: Runner | None = None) -> tuple[bool | None, str]:
     """Check the recorded blastbox version against what the image ACTUALLY has.
 
     The `org.blastbox.version` label is a self-report: `build_args` writes
@@ -561,15 +606,21 @@ def verify_contents(image: str, runner: Runner | None = None) -> tuple[bool, str
 
     This is the join: it runs the same probe `doctor` uses, inside the image.
 
-    Returns (agrees, detail).
+    Returns (agrees, detail), where agrees is None when there is nothing to
+    join -- the image contains no blastbox at all. That is not a disagreement:
+    RedTusk's worker base is a pure JVM/Tika image, deliberately without
+    python, and calling its stamp a lie because the join found nothing failed
+    a build that was entirely correct.
     """
-    from blastbox.host.doctor import UNKNOWN as D_UNKNOWN  # noqa: PLC0415 -- cycle
+    from blastbox.host.doctor import NOPKG, UNKNOWN as D_UNKNOWN  # noqa: PLC0415 -- cycle
     from blastbox.host.doctor import version_in_image  # noqa: PLC0415
 
     stamped = read(image, runner).blastbox
     if stamped in (UNKNOWN, ""):
         return False, "image records no blastbox version"
     actual, detail = version_in_image(image, runner)
+    if actual == NOPKG:
+        return None, detail or "the image contains no blastbox"
     if actual == D_UNKNOWN:
         return False, f"cannot read the image's blastbox: {detail}"
     if actual != stamped:
