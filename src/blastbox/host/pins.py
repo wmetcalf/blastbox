@@ -257,6 +257,108 @@ def _scan_dockerfile(path: Path) -> list[Pin]:
     return out
 
 
+def _split_commands(line: str) -> list[str]:
+    """Split a shell line on `&&` / `|` that are OUTSIDE quotes.
+
+    A regex split cannot do this: an option value may legitimately contain the
+    separator -- `pip install --index-url "https://a|b" blastbox==1.0" -- and
+    cutting there drops the requirement from the scan entirely, which is the
+    silent under-report this module exists to prevent.
+
+    A top-level `;` or `&` ends a command as surely as `&&` does. A PEP 508
+    marker also uses a semicolon, but one that survives the shell is quoted,
+    and quoted text never reaches the split.
+    """
+    parts: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    depth = 0          # $( … ) nesting
+    backtick = False   # ` … `
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        escaped = ch == "\\" and i + 1 < len(line)
+        if quote:
+            if escaped and quote == '"':
+                buf.append(line[i : i + 2])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            buf.append(ch)
+            i += 1
+            continue
+        if ch in "\"'":
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if escaped:
+            buf.append(line[i : i + 2])
+            i += 2
+            continue
+        # A pipeline inside a command substitution belongs to that substitution,
+        # not to the install command: `--extra-index-url $(cmd | grep x)` is one
+        # argument. Splitting there drops the requirement from the scan.
+        # Process substitution opens a nested command too: `<(cmd | x)`.
+        if line[i : i + 2] in ("$(", "${", "<(", ">("):
+            depth += 1
+            buf.append(line[i : i + 2])
+            i += 2
+            continue
+        if ch == "}" and depth:
+            depth -= 1
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == ")" and depth:
+            depth -= 1
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "`":
+            backtick = not backtick
+            buf.append(ch)
+            i += 1
+            continue
+        if depth or backtick:
+            buf.append(ch)
+            i += 1
+            continue
+        if line[i : i + 2] == "&&":
+            parts.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        if ch == "|":
+            parts.append("".join(buf))
+            buf = []
+            i += 2 if line[i : i + 2] == "||" else 1
+            continue
+        # A top-level `;` or `&` ends a command too. These were excluded at
+        # first out of a concern for PEP 508 markers -- but a marker's
+        # semicolon only survives the shell if it is QUOTED, and quoted text is
+        # already protected above. An UNQUOTED `;` really is a separator, so
+        # treating it as one matches what the shell does rather than working
+        # around a case that cannot occur.
+        if ch == "&" and (
+            (buf and buf[-1] == ">")            # `2>&1`
+            or line[i : i + 2] == "&>"          # bash `&>file`
+        ):
+            buf.append(ch)
+            i += 1
+            continue
+        if ch in ";&":
+            parts.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    parts.append("".join(buf))
+    return parts
+
+
 def _isolate_requirements(line: str) -> list[str]:
     """Every blastbox requirement token on an install command line.
 
@@ -264,12 +366,27 @@ def _isolate_requirements(line: str) -> list[str]:
     install one just as a pyproject can, and dropping it here would repeat the
     silent-omission bug already fixed for pyproject.
     """
+    # Only what the install command is actually given. A continued RUN often
+    # mentions the package outside the install -- `RUN echo "blastbox==0.1.19"
+    # && pip install "blastbox==0.1.19"` -- and reading the whole line reported
+    # the DIAGNOSTIC string as the repo's pin. `pins` then showed a version
+    # nothing installs, and `--set` rewrote the echo while leaving the real
+    # dependency stale, because both agree on "the first match".
     out: list[str] = []
-    for m in _REQ_RE.finditer(line):
-        start = line.lower().rfind("blastbox", 0, m.end())
-        out.append(line[start : m.end()])
-    for m in _DIRECT_REF_RE.finditer(line):
-        out.append(m.group(0))
+    # One logical RUN can hold several commands, and only the arguments of the
+    # INSTALLS are requirements. Each `&&`/`|` segment is considered on its own
+    # so that `pip install X && echo X` reads the first and not the second,
+    # while `pip install X && pip install Y` still reads both.
+    for segment in _split_commands(line):
+        m = _INSTALL_RE.search(segment)
+        if not m:
+            continue
+        args = segment[m.end():]
+        for r in _REQ_RE.finditer(args):
+            start = args.lower().rfind("blastbox", 0, r.end())
+            out.append(args[start : r.end()])
+        for r in _DIRECT_REF_RE.finditer(args):
+            out.append(r.group(0))
     return out
 
 
@@ -391,7 +508,11 @@ _BOUND_OPS = ("<=", "<", "!=")
 # Anchors the rewrite to the blastbox requirement itself. `line.find(specifier)`
 # does not: given `["other==0.1.27", "blastbox==0.1.27"]` it finds the FIRST
 # occurrence and rewrites somebody else's dependency, silently.
-_REQ_NAME = r"(?i:blastbox)(?:\[[A-Za-z0-9,._\-]+\])?"
+# The lookbehind is the same boundary `_REQ_RE` uses, and it is load-bearing:
+# without it `blastbox` matches the SUFFIX of `not-blastbox`, so a continued
+# install listing an unrelated distribution first had that one rewritten -- and
+# the search stopped there, leaving the real pin stale.
+_REQ_NAME = r"(?<![\w.\-])(?i:blastbox)(?:\[[A-Za-z0-9,._\-]+\])?"
 
 
 _OP_RE = re.compile(r"^(==|>=|<=|~=|!=|<|>)\s*(.*)$")
@@ -414,7 +535,16 @@ def _spec_pattern(spec: str) -> str:
             re.escape(m.group(1)) + r"\s*" + re.escape(m.group(2)) if m
             else re.escape(stripped)
         )
-    return r"\s*,\s*".join(parts)
+    # A trailing boundary, so `==0.1` does not match inside `==0.1.2`. Without
+    # it, two pins on one logical line sharing a specifier made the second
+    # search re-match the FIRST, already-rewritten occurrence and extend it to
+    # `0.1.2.2` -- a legitimate bump failing on a version that merely extends
+    # the old one.
+    # The boundary covers every character a PEP 440 version can CONTINUE with:
+    # `+` (local), `!` (epoch) and `-` as well as word characters and dots.
+    # `(?![\w.])` alone let `==1.0` match inside `==1.0+cpu`, so a second pin on
+    # the same line re-matched the first rewrite.
+    return r"\s*,\s*".join(parts) + r"(?![\w.+!\-])"
 
 
 def _rewrite_specifier(spec: str, version: str) -> str:
@@ -459,6 +589,29 @@ def _violated_bound(spec: str, version: str) -> str | None:
     return None
 
 
+def _logical_span(lines: list[str], start: int) -> range:
+    """Physical line indices forming the logical line beginning at ``start``.
+
+    A shell requirement is routinely written across continuations:
+
+        RUN pip install --no-cache-dir \\
+            "blastbox[host]==0.1.27" \\
+            "fastapi"
+
+    The scanner attributes the pin to the FIRST physical line, because that is
+    where the logical line begins -- but the requirement text is on a later one,
+    so rewriting only that first line finds nothing to replace.
+    """
+    # Mirrors `_logical_lines` exactly, comment stripping included: a `#` ends
+    # that physical line even inside a continued RUN, so a span computed from
+    # the RAW text would join lines the scanner did not -- and the two must
+    # agree, or the rewriter searches a different region than the pin describes.
+    end = start
+    while end < len(lines) and _strip_comment(lines[end]).rstrip().endswith("\\"):
+        end += 1
+    return range(start, min(end + 1, len(lines)))
+
+
 def _rewrite_line(line: str, pin: Pin, version: str) -> str:
     """Replace the version in one pin's line, touching nothing else on it."""
     if pin.kind == "dockerfile-arg":
@@ -494,6 +647,18 @@ def _rewrite_line(line: str, pin: Pin, version: str) -> str:
 def _hash_lines(indent: str, digests: list[str]) -> list[str]:
     """Render `--hash=sha256:...` continuation lines for a locked requirement."""
     return [f"{indent}--hash=sha256:{d}" for d in digests]
+
+
+def _eol_of(line: str) -> str:
+    """The line ending ``line`` uses, so a regenerated block keeps it.
+
+    The hash block is rebuilt from scratch rather than edited, so it does not
+    inherit the file's endings the way a rewritten line does: emitting "\n"
+    into a CRLF lock would leave that file with mixed endings.
+    """
+    if line.endswith("\r\n"):
+        return "\r\n"
+    return "\n" if line.endswith("\n") else ""
 
 
 def set_version(
@@ -570,14 +735,42 @@ def set_version(
     staged: dict[Path, str] = {}
     for rel, file_pins in by_path.items():
         path = root / rel
-        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        # newline="" keeps CRLF intact: without it a SUCCESSFUL bump silently
+        # rewrote every line ending in the file.
+        with path.open(encoding="utf-8", newline="") as fh:
+            lines = fh.read().splitlines(keepends=True)
         needs_hashes = False
         for pin in sorted(file_pins, key=lambda p: p.line, reverse=True):
             i = pin.line - 1
             if not 0 <= i < len(lines):
                 raise PinScanError(f"{rel}:{pin.line}: line is gone; re-scan and retry")
-            eol = "\n" if lines[i].endswith("\n") else ""
-            lines[i] = _rewrite_line(lines[i].rstrip("\n"), pin, version) + eol
+            # Search the whole logical line, not just its first physical one.
+            # Rewriting is still per-PHYSICAL-line so that continuations,
+            # indentation and everything else on the other lines survive.
+            span = _logical_span(lines, i) if pin.kind != "dockerfile-arg" else range(i, i + 1)
+            first_error: PinScanError | None = None
+            for j in span:
+                try:
+                    eol = "\n" if lines[j].endswith("\n") else ""
+                    lines[j] = _rewrite_line(lines[j].rstrip("\n"), pin, version) + eol
+                    break
+                except PinScanError as exc:
+                    first_error = first_error or exc
+                    continue
+            else:
+                # A one-line span has nothing to search, so its specific
+                # diagnosis -- "no version found after `=`" for an ARG -- is the
+                # useful message. Replacing it with "not found anywhere in its
+                # logical line" would describe a search that never happened.
+                if len(span) == 1 and first_error is not None:
+                    raise first_error
+                raise PinScanError(
+                    f"{pin.path}:{pin.line}: cannot locate the blastbox requirement "
+                    f"{pin.raw.strip()[:60]!r} anywhere in its logical line "
+                    f"(physical lines {span.start + 1}-{span.stop}). Refusing to "
+                    "guess -- a partial rewrite leaves the repo pinned to two "
+                    "versions."
+                ) from first_error
             if pin.kind == "lock" and "--hash=" in "".join(lines[i : i + 4]):
                 needs_hashes = True
         if needs_hashes:
@@ -590,23 +783,49 @@ def set_version(
             lines = _replace_hashes(lines, file_pins, digests, rel)
         staged[path] = "".join(lines)
 
+    # Keep the originals: the verification below runs against the files on
+    # disk, so a failure at that point has already modified them. Restoring is
+    # what makes "nothing is written unless every pin moved" true at the end of
+    # the operation and not just at the start of it.
+    # Bytes, not text: `read_text` performs universal-newline translation, so a
+    # CRLF file restored through it comes back with LF endings -- a "rollback"
+    # that rewrites every line of the file it was meant to leave alone.
+    original = {path: path.read_bytes() for path in staged}
     for path, text in staged.items():
-        path.write_text(text, encoding="utf-8")
+        # newline="" on the WRITE is unobservable on POSIX -- newline=None only
+        # translates on platforms whose linesep is not "\n" -- so no test here
+        # can kill a mutant that drops it. It is still required: on Windows the
+        # default would translate the "\n" inside an already-CRLF line and
+        # produce "\r\r\n".
+        path.write_text(text, encoding="utf-8", newline="")
 
     # Verify by RE-SCANNING rather than by trusting the rewrite: the scanner is
     # what reports drift, so agreeing with it is the only check that means
     # anything. `disagreements` groups by version and always returns the
     # grouping, so drift is more than one key -- not a non-empty result.
-    after = scan(root)
-    groups = disagreements(after)
-    wanted = _normalise_version(version)
-    stale = {v: p for v, p in groups.items() if _normalise_version(v) != wanted}
+    # Any failure from here on must restore, not just a stale-pin finding: if
+    # the re-scan itself raises -- a file this rewrite made unparseable would do
+    # it -- returning without restoring leaves exactly the half-applied state
+    # the staging exists to prevent.
+    def _restore() -> None:
+        for path, data in original.items():
+            path.write_bytes(data)
+
+    try:
+        after = scan(root)
+        groups = disagreements(after)
+        wanted = _normalise_version(version)
+        stale = {v: q for v, q in groups.items() if _normalise_version(v) != wanted}
+    except Exception:
+        _restore()
+        raise
     if stale:
+        _restore()
         raise PinScanError(
-            f"{root}: after setting {version}, {sum(len(p) for p in stale.values())} "
+            f"{root}: after setting {version}, {sum(len(q) for q in stale.values())} "
             f"pin(s) still resolve to {sorted(stale)}: "
-            f"{[f'{q.path}:{q.line}' for ps in stale.values() for q in ps]}. "
-            "The rewrite did not reach every pin."
+            f"{[f'{q.path}:{q.line}' for qs in stale.values() for q in qs]}. "
+            "The rewrite did not reach every pin. Every file has been restored."
         )
     return sorted(str(q) for q in staged)
 
@@ -633,16 +852,18 @@ def _replace_hashes(
             if "--hash=" in req_line:
                 head = req_line.split("--hash=", 1)[0].rstrip()
                 lines[start - 1] = (
-                    head + " " + " ".join(f"--hash=sha256:{d}" for d in digests) + "\n"
+                    head + " " + " ".join(f"--hash=sha256:{d}" for d in digests)
+                    + (_eol_of(req_line) or "\n")
                 )
             continue
         # The separator is " \\\n", with the SPACE: written as "...hash\\" the
         # backslash abuts the digest, and what pip reads as the hash value is
         # no longer the hash. Every continuation but the last gets one.
-        block = [ln + (" \\\n" if n < len(digests) - 1 else "\n")
+        eol = _eol_of(lines[start]) or _eol_of(lines[start - 1]) or "\n"
+        block = [ln + (" \\" + eol if n < len(digests) - 1 else eol)
                  for n, ln in enumerate(_hash_lines(indent, digests))]
         # The requirement line itself ends in a backslash when hashes follow.
-        req = lines[start - 1].rstrip("\n").rstrip().rstrip("\\").rstrip()
-        lines[start - 1] = f"{req} \\\n"
+        req = lines[start - 1].rstrip("\r\n").rstrip().rstrip("\\").rstrip()
+        lines[start - 1] = f"{req} \\" + (_eol_of(lines[start - 1]) or "\n")
         lines[start:end] = block
     return lines

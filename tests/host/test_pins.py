@@ -783,3 +783,567 @@ def test_a_nonsense_version_is_refused(tmp_path):
     root = _consumer(tmp_path, lock=False)
     with _pytest.raises(PinScanError):
         set_version(root, ">=0.1.30", digests=_D)
+
+
+def test_a_requirement_on_a_continuation_line_is_rewritten(tmp_path):
+    """Shell requirements are routinely written across backslashes.
+
+    The scanner attributes the pin to the FIRST physical line, because that is
+    where the logical line begins -- but the text is on a later one, so
+    rewriting only that first line found nothing. Measured on two real repos:
+    pdf-titan-arum and win-validator both refused a bump for this reason.
+    """
+    from blastbox.host.pins import disagreements, scan, set_version
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    df = root / "Dockerfile.ingress"
+    df.write_text(
+        "FROM x\n"
+        "RUN pip install --no-cache-dir \\\n"
+        '        "blastbox>=0.1.19" \\\n'
+        '        "fastapi"\n'
+    )
+    set_version(root, "0.1.32")
+    text = df.read_text()
+    assert '"blastbox>=0.1.32" \\\n' in text, text
+    assert '"fastapi"' in text, "the rest of the command must survive"
+    assert text.count("\\\n") == 2, "the continuations must survive"
+    assert sorted(disagreements(scan(root))) == ["0.1.32"]
+
+
+def test_only_the_line_holding_the_requirement_is_touched(tmp_path):
+    """Other lines of the same logical line keep their exact text."""
+    from blastbox.host.pins import set_version
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    df = root / "Dockerfile.ingress"
+    before = (
+        "FROM x\n"
+        "RUN pip install --no-cache-dir \\\n"
+        '        "blastbox>=0.1.19" \\\n'
+        '        "psycopg[binary,pool]" "redis"\n'
+    )
+    df.write_text(before)
+    set_version(root, "0.1.32")
+    after = df.read_text().splitlines()
+    for n in (0, 1, 3):
+        assert after[n] == before.splitlines()[n], f"line {n + 1} changed: {after[n]!r}"
+
+
+def test_a_requirement_that_is_nowhere_in_its_logical_line_still_refuses(tmp_path):
+    """The span search must not become a licence to rewrite the wrong line."""
+    import pytest as _pytest
+
+    from blastbox.host import pins as pins_mod
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (root / "Dockerfile").write_text(
+        "FROM x\nRUN pip install \\\n"
+        '        "blastbox>=0.1.19" \\\n'
+        '        "fastapi"\n'
+    )
+    # Make every line unmatchable, as a corrupted file would be.
+    monkey = pins_mod._rewrite_line
+
+    def never(line, pin, version):
+        raise pins_mod.PinScanError("no match here")
+
+    pins_mod._rewrite_line = never
+    try:
+        with _pytest.raises(pins_mod.PinScanError) as e:
+            pins_mod.set_version(root, "0.1.32")
+        assert "cannot locate" in str(e.value)
+    finally:
+        pins_mod._rewrite_line = monkey
+
+
+def test_a_comment_ends_a_continuation_for_the_span_too(tmp_path):
+    """`_logical_span` must join exactly what `_logical_lines` joined.
+
+    A `#` ends that physical line even inside a continued RUN, so a span
+    computed from the raw text would search lines the scanner never joined.
+    """
+    from blastbox.host.pins import _logical_span, _logical_lines
+
+    text = (
+        "RUN pip install \\\n"
+        '        "blastbox>=0.1.19" \\\n'
+        "# a comment, whose trailing backslash is prose \\\n"
+        '        "fastapi"\n'
+    )
+    lines = text.splitlines(keepends=True)
+    span = _logical_span(lines, 0)
+    joined_start, _ = _logical_lines(text)[0]
+    assert joined_start == 1
+    # The comment line ends the join for the scanner, so the span must stop there.
+    assert span.stop == 3, f"span {span} joined past the comment"
+
+
+def test_a_dockerfile_arg_keeps_its_specific_diagnosis(tmp_path):
+    """A one-line span has nothing to search; its own error is the useful one."""
+    import pytest as _pytest
+
+    from blastbox.host.pins import PinScanError, scan
+
+    from blastbox.host import pins as pins_mod
+
+    root = _consumer(tmp_path, lock=False)
+    pins = [p for p in scan(root) if p.kind == "dockerfile-arg"]
+    assert pins, "fixture assumption: the scanner reports the ARG"
+
+    # A line whose ARG has no version to replace. The span is one line, so the
+    # specific diagnosis is the only useful one -- "not found anywhere in its
+    # logical line" would describe a search that never happened.
+    with _pytest.raises(PinScanError) as e:
+        pins_mod._rewrite_line("ARG BLASTBOX_VERSION=", pins[0], "0.1.32")
+    assert "no version found after" in str(e.value)
+
+
+def test_a_one_line_span_propagates_its_own_error_through_set_version(tmp_path):
+    """The re-raise, exercised where it actually lives.
+
+    Asserting on `_rewrite_line` directly leaves `set_version`'s handling
+    untested: a mutant that always emits the generic "not found anywhere in its
+    logical line" message survived until this test existed.
+    """
+    import pytest as _pytest
+
+    from blastbox.host import pins as pins_mod
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text(
+        '[project]\nname = "x"\ndependencies = ["blastbox>=0.1.19"]\n'
+    )
+    real = pins_mod._rewrite_line
+
+    def specific(line, pin, version):
+        raise pins_mod.PinScanError("SPECIFIC-DIAGNOSIS: no version found after `=`")
+
+    pins_mod._rewrite_line = specific
+    try:
+        with _pytest.raises(pins_mod.PinScanError) as e:
+            pins_mod.set_version(root, "0.1.32")
+    finally:
+        pins_mod._rewrite_line = real
+    assert "SPECIFIC-DIAGNOSIS" in str(e.value), (
+        f"a one-line span must keep its own diagnosis, got: {e.value}"
+    )
+    assert "anywhere in its logical line" not in str(e.value)
+
+
+def test_a_package_whose_name_ends_in_blastbox_is_not_rewritten(tmp_path):
+    """`blastbox` matches the SUFFIX of `not-blastbox` without a left boundary.
+
+    Listed first in a continued install, the unrelated distribution was
+    rewritten and the search stopped there, leaving the real pin stale -- a
+    corrupted file AND a missed bump.
+    """
+    from blastbox.host.pins import set_version
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    df = root / "Dockerfile"
+    df.write_text(
+        "FROM x\nRUN pip install \\\n"
+        '        "not-blastbox>=0.1.19" \\\n'
+        '        "blastbox>=0.1.19"\n'
+    )
+    set_version(root, "0.1.32")
+    text = df.read_text()
+    assert '"not-blastbox>=0.1.19"' in text, f"an unrelated package was rewritten: {text}"
+    assert '"blastbox>=0.1.32"' in text, text
+
+
+def test_a_failed_verification_restores_every_file(tmp_path, monkeypatch):
+    """The verification runs against the files on DISK, which are already written."""
+    import pytest as _pytest
+
+    from blastbox.host import pins as pins_mod
+
+    root = _consumer(tmp_path, lock=False)
+    before = {p: (root / p).read_text() for p in ("pyproject.toml", "Dockerfile.worker")}
+
+    # Rewrite the pyproject but not the Dockerfile, so the re-scan sees drift.
+    real = pins_mod._rewrite_line
+
+    def partial(line, pin, version):
+        if pin.kind == "dockerfile-arg":
+            return line
+        return real(line, pin, version)
+
+    monkeypatch.setattr(pins_mod, "_rewrite_line", partial)
+    with _pytest.raises(pins_mod.PinScanError) as e:
+        pins_mod.set_version(root, "0.1.32", digests=_D)
+    assert "did not reach every pin" in str(e.value)
+    for rel, text in before.items():
+        assert (root / rel).read_text() == text, f"{rel} was left modified"
+
+
+def test_files_are_restored_when_the_verification_itself_raises(tmp_path, monkeypatch):
+    """A rollback that only covers the "stale pin" branch is not a rollback.
+
+    If the re-scan raises -- which a file this rewrite made unparseable would
+    do -- returning without restoring leaves exactly the half-applied state the
+    staging exists to prevent.
+    """
+    import pytest as _pytest
+
+    from blastbox.host import pins as pins_mod
+
+    root = _consumer(tmp_path, lock=False)
+    before = {p: (root / p).read_text() for p in ("pyproject.toml", "Dockerfile.worker")}
+
+    real_scan = pins_mod.scan
+    calls = {"n": 0}
+
+    def scan_then_explode(r):
+        calls["n"] += 1
+        if calls["n"] > 1:                    # the verification pass
+            raise pins_mod.PinScanError("unparseable after rewrite")
+        return real_scan(r)
+
+    monkeypatch.setattr(pins_mod, "scan", scan_then_explode)
+    with _pytest.raises(pins_mod.PinScanError):
+        pins_mod.set_version(root, "0.1.32", digests=_D)
+    for rel, text in before.items():
+        assert (root / rel).read_text() == text, f"{rel} was left modified"
+
+
+def test_a_requirement_split_mid_token_is_refused_not_mangled(tmp_path):
+    """`"blastbox>=\\` / `0.1.19"` -- the continuation falls INSIDE the token.
+
+    No physical line holds the whole requirement, so the rewriter cannot place
+    it. Refusing is the correct outcome and the file must be untouched: joining
+    the write across lines to support a form nobody writes would risk
+    corrupting the ones everybody does. Pinned as a test so this stays a
+    refusal rather than drifting into a partial rewrite later.
+    """
+    import pytest as _pytest
+
+    from blastbox.host.pins import PinScanError, set_version
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    df = root / "Dockerfile"
+    df.write_text('FROM x\nRUN pip install "blastbox>=\\\n0.1.19"\n')
+    before = df.read_text()
+    with _pytest.raises(PinScanError) as e:
+        set_version(root, "0.1.32")
+    assert "cannot locate" in str(e.value)
+    assert df.read_text() == before, "a refused bump must leave the file alone"
+
+
+def test_two_pins_sharing_a_specifier_on_one_logical_line(tmp_path):
+    """`==0.1` must not match inside the `==0.1.2` it was just rewritten to.
+
+    Without a trailing boundary the second pin's search re-matched the FIRST,
+    already-rewritten occurrence and extended it to `0.1.2.2`, so a legitimate
+    bump failed on a version that merely extends the old one.
+    """
+    from blastbox.host.pins import disagreements, scan, set_version
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    df = root / "Dockerfile"
+    df.write_text(
+        "FROM x\nRUN pip install \\\n"
+        '        "blastbox==0.1" \\\n'
+        '        "blastbox[host]==0.1"\n'
+    )
+    set_version(root, "0.1.2")
+    text = df.read_text()
+    assert '"blastbox==0.1.2"' in text, text
+    assert '"blastbox[host]==0.1.2"' in text, text
+    assert "0.1.2.2" not in text, f"a rewritten occurrence was rewritten again: {text}"
+    assert sorted(disagreements(scan(root))) == ["0.1.2"]
+
+
+def test_a_blastbox_token_outside_the_install_is_refused_not_corrupted(tmp_path):
+    """A diagnostic string sharing the requirement's text.
+
+    The rewriter has no model of which words are install ARGUMENTS -- that
+    parsing lives in the scanner, and duplicating it here is the divergence
+    that caused the comment-stripping bug. So the guarantee is the safe one:
+    the bump fails and every file is restored, rather than the echo text being
+    quietly rewritten and the real dependency left stale.
+    """
+    import pytest as _pytest
+
+    from blastbox.host.pins import PinScanError, set_version
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    df = root / "Dockerfile"
+    df.write_text(
+        "FROM x\n"
+        'RUN echo "blastbox==0.1.19" \\\n'
+        '        && pip install "blastbox==0.1.19"\n'
+    )
+    before = df.read_text()
+    with _pytest.raises(PinScanError):
+        set_version(root, "0.1.32")
+    assert df.read_text() == before, "a failed bump must leave the file untouched"
+
+
+def test_a_token_after_the_install_command_is_not_a_pin(tmp_path):
+    """Mirror of the echo-before case: the stray token comes AFTER the install.
+
+    Trimming the front does not help there; each `&&` segment is considered on
+    its own so only the install's own arguments count.
+    """
+    from blastbox.host.pins import scan
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (root / "Dockerfile").write_text(
+        "FROM x\n"
+        'RUN pip install "blastbox==0.1.30" \\\n'
+        '        && echo "blastbox==0.1.19"\n'
+    )
+    floors = sorted({p.floor for p in scan(root) if p.floor})
+    assert floors == ["0.1.30"], f"the echoed version was read as a pin: {floors}"
+
+
+def test_a_crlf_file_keeps_its_line_endings(tmp_path):
+    """`read_text` translates CRLF to LF, so both the write AND the rollback
+    would silently rewrite every line of a file they were meant to leave alone."""
+    from blastbox.host.pins import set_version
+
+    root = tmp_path
+    (root / "pyproject.toml").write_bytes(
+        b'[project]\r\nname = "x"\r\ndependencies = ["blastbox>=0.1.27,<0.2"]\r\n'
+    )
+    set_version(root, "0.1.30", digests=_D)
+    data = (root / "pyproject.toml").read_bytes()
+    assert b"0.1.30" in data
+    assert data.count(b"\r\n") == 3, f"line endings were rewritten: {data!r}"
+    assert b"\n" not in data.replace(b"\r\n", b""), "a bare LF was introduced"
+
+
+def test_a_local_version_does_not_rematch_the_pin_it_just_wrote(tmp_path):
+    """`==1.0` must not match inside `==1.0+cpu`."""
+    from blastbox.host.pins import set_version
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    df = root / "Dockerfile"
+    df.write_text(
+        "FROM x\nRUN pip install \\\n"
+        '        "blastbox==1.0" \\\n'
+        '        "blastbox[host]==1.0"\n'
+    )
+    set_version(root, "1.0+cpu", digests=_D)
+    text = df.read_text()
+    assert '"blastbox==1.0+cpu"' in text, text
+    assert '"blastbox[host]==1.0+cpu"' in text, text
+    assert "+cpu+cpu" not in text and "1.0+cpu.0" not in text, text
+
+
+def test_a_rollback_restores_crlf_files_byte_for_byte(tmp_path, monkeypatch):
+    """Snapshotting with `read_text` would restore LF endings.
+
+    That is a "rollback" which rewrites every line of the file it was meant to
+    leave alone -- so the snapshot is taken as bytes.
+    """
+    import pytest as _pytest
+
+    from blastbox.host import pins as pins_mod
+
+    root = tmp_path
+    pyproject = root / "pyproject.toml"
+    original = b'[project]\r\nname = "x"\r\ndependencies = ["blastbox>=0.1.27,<0.2"]\r\n'
+    pyproject.write_bytes(original)
+    (root / "Dockerfile.w").write_bytes(
+        b"ARG BLASTBOX_VERSION=0.1.27\r\nFROM x\r\n"
+        b'RUN pip install "blastbox==${BLASTBOX_VERSION}"\r\n'
+    )
+    df_original = (root / "Dockerfile.w").read_bytes()
+
+    # Rewrite the pyproject but not the Dockerfile, so verification sees drift.
+    real = pins_mod._rewrite_line
+
+    def partial(line, pin, version):
+        if pin.kind == "dockerfile-arg":
+            return line
+        return real(line, pin, version)
+
+    monkeypatch.setattr(pins_mod, "_rewrite_line", partial)
+    with _pytest.raises(pins_mod.PinScanError):
+        pins_mod.set_version(root, "0.1.30", digests=_D)
+    assert pyproject.read_bytes() == original, "CRLF was not restored byte-for-byte"
+    assert (root / "Dockerfile.w").read_bytes() == df_original
+
+
+def test_a_separator_inside_a_quoted_option_does_not_split_the_command(tmp_path):
+    """`--index-url "https://a|b"` must not cut the requirement off the scan.
+
+    A regex split loses the pin entirely, and a pin that is never seen is the
+    silent under-report this module exists to prevent.
+    """
+    from blastbox.host.pins import scan
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (root / "Dockerfile").write_text(
+        "FROM x\n"
+        'RUN pip install --index-url "https://mirror/a|b" "blastbox==0.1.30"\n'
+    )
+    floors = sorted({p.floor for p in scan(root) if p.floor})
+    assert floors == ["0.1.30"], f"the requirement was lost: {floors}"
+
+
+def test_an_unquoted_separator_still_splits(tmp_path):
+    """The quote awareness must not disable the splitting it wraps."""
+    from blastbox.host.pins import scan
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (root / "Dockerfile").write_text(
+        "FROM x\n"
+        'RUN pip install "blastbox==0.1.30" && echo "blastbox==0.1.19"\n'
+    )
+    floors = sorted({p.floor for p in scan(root) if p.floor})
+    assert floors == ["0.1.30"], f"the echoed version leaked in: {floors}"
+
+
+def test_a_pipeline_inside_a_command_substitution_does_not_split(tmp_path):
+    """`$(cmd | grep x)` is one argument, not two commands."""
+    from blastbox.host.pins import scan
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (root / "Dockerfile").write_text(
+        "FROM x\n"
+        'RUN pip install --extra-index-url $(cat /u | head -1) "blastbox==0.1.30"\n'
+    )
+    floors = sorted({p.floor for p in scan(root) if p.floor})
+    assert floors == ["0.1.30"], f"the requirement was lost: {floors}"
+
+
+def test_a_backtick_substitution_does_not_split_either(tmp_path):
+    from blastbox.host.pins import scan
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (root / "Dockerfile").write_text(
+        "FROM x\n"
+        'RUN pip install --extra-index-url `cat /u | head -1` "blastbox==0.1.30"\n'
+    )
+    floors = sorted({p.floor for p in scan(root) if p.floor})
+    assert floors == ["0.1.30"], f"the requirement was lost: {floors}"
+
+
+def test_a_top_level_semicolon_ends_the_install_command(tmp_path):
+    """`pip install X ; echo Y` is two commands, and only the first installs."""
+    from blastbox.host.pins import scan
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (root / "Dockerfile").write_text(
+        "FROM x\nRUN pip install \"blastbox==0.1.30\" ; echo \"blastbox==0.1.19\"\n"
+    )
+    floors = sorted({p.floor for p in scan(root) if p.floor})
+    assert floors == ["0.1.30"], f"the echoed version leaked in: {floors}"
+
+
+def test_a_quoted_pep508_marker_is_not_split(tmp_path):
+    """A marker that survives the shell is quoted, and quoting is respected."""
+    from blastbox.host.pins import scan
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (root / "Dockerfile").write_text(
+        "FROM x\n"
+        'RUN pip install "blastbox>=0.1.30; python_version >= \'3.12\'"\n'
+    )
+    floors = sorted({p.floor for p in scan(root) if p.floor})
+    assert floors == ["0.1.30"], f"the marker broke the requirement: {floors}"
+
+
+def test_a_background_ampersand_ends_the_command(tmp_path):
+    from blastbox.host.pins import scan
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (root / "Dockerfile").write_text(
+        "FROM x\nRUN pip install \"blastbox==0.1.30\" & echo \"blastbox==0.1.19\"\n"
+    )
+    floors = sorted({p.floor for p in scan(root) if p.floor})
+    assert floors == ["0.1.30"], f"the backgrounded command leaked in: {floors}"
+
+
+def test_a_redirection_ampersand_is_not_a_separator(tmp_path):
+    """`2>&1` is a redirection, not a background command."""
+    from blastbox.host.pins import scan
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (root / "Dockerfile").write_text(
+        "FROM x\nRUN pip install -q 2>&1 \"blastbox==0.1.30\"\n"
+    )
+    floors = sorted({p.floor for p in scan(root) if p.floor})
+    assert floors == ["0.1.30"], f"the requirement was lost: {floors}"
+
+
+def test_a_parameter_expansion_does_not_split(tmp_path):
+    """`${VAR//a|b/}` holds a pipe that belongs to the expansion."""
+    from blastbox.host.pins import scan
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (root / "Dockerfile").write_text(
+        "FROM x\nRUN pip install --extra-index-url ${U//a|b/} \"blastbox==0.1.30\"\n"
+    )
+    floors = sorted({p.floor for p in scan(root) if p.floor})
+    assert floors == ["0.1.30"], f"the requirement was lost: {floors}"
+
+
+def test_a_crlf_lock_keeps_crlf_in_the_regenerated_hash_block(tmp_path):
+    """The hash block is rebuilt, so it does not inherit endings like a rewrite.
+
+    Emitting "\\n" into a CRLF lock leaves the file with mixed endings.
+    """
+    from blastbox.host.pins import set_version
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (root / "deploy").mkdir()
+    lock = root / "deploy" / "requirements.lock"
+    lock.write_bytes(
+        b"blastbox==0.1.27 \\\r\n"
+        b"    --hash=sha256:" + b"a" * 64 + b" \\\r\n"
+        b"    --hash=sha256:" + b"b" * 64 + b"\r\n"
+    )
+    set_version(root, "0.1.30", digests=_D)
+    data = lock.read_bytes()
+    assert b"0.1.30" in data
+    assert b"\n" not in data.replace(b"\r\n", b""), f"a bare LF was introduced: {data!r}"
+
+
+def test_a_bash_combined_redirection_is_not_a_separator(tmp_path):
+    """`&>file` starts with the ampersand, so the `2>&1` guard does not see it."""
+    from blastbox.host.pins import scan
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (root / "Dockerfile").write_text(
+        "FROM x\nRUN pip install &>/tmp/log \"blastbox==0.1.30\"\n"
+    )
+    floors = sorted({p.floor for p in scan(root) if p.floor})
+    assert floors == ["0.1.30"], f"the requirement was lost: {floors}"
+
+
+def test_a_process_substitution_does_not_split(tmp_path):
+    """`<(cmd | x)` opens a nested command, like `$( … )`."""
+    from blastbox.host.pins import scan
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (root / "Dockerfile").write_text(
+        "FROM x\nRUN pip install -r <(cat a | tr -d ' ') \"blastbox==0.1.30\"\n"
+    )
+    floors = sorted({p.floor for p in scan(root) if p.floor})
+    assert floors == ["0.1.30"], f"the requirement was lost: {floors}"
