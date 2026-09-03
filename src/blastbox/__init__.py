@@ -18,7 +18,7 @@ from blastbox.worker.harness import run_detonation
 #
 # The literal remains the fallback for an uninstalled source tree (a checkout on sys.path with
 # no dist-info), where there is no metadata to read and this file is the only answer available.
-_FALLBACK_VERSION = "0.1.31"  # keep in sync with pyproject [project].version
+_FALLBACK_VERSION = "0.1.32"  # keep in sync with pyproject [project].version
 try:
     __version__ = _dist_version("blastbox")
 except PackageNotFoundError:  # running from a source tree that was never installed
