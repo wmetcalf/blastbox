@@ -300,7 +300,8 @@ def _split_commands(line: str) -> list[str]:
         # A pipeline inside a command substitution belongs to that substitution,
         # not to the install command: `--extra-index-url $(cmd | grep x)` is one
         # argument. Splitting there drops the requirement from the scan.
-        if line[i : i + 2] in ("$(", "${"):
+        # Process substitution opens a nested command too: `<(cmd | x)`.
+        if line[i : i + 2] in ("$(", "${", "<(", ">("):
             depth += 1
             buf.append(line[i : i + 2])
             i += 2
@@ -340,8 +341,10 @@ def _split_commands(line: str) -> list[str]:
         # already protected above. An UNQUOTED `;` really is a separator, so
         # treating it as one matches what the shell does rather than working
         # around a case that cannot occur.
-        if ch == "&" and buf and buf[-1] == ">":
-            # `2>&1` -- a redirection, not a background separator.
+        if ch == "&" and (
+            (buf and buf[-1] == ">")            # `2>&1`
+            or line[i : i + 2] == "&>"          # bash `&>file`
+        ):
             buf.append(ch)
             i += 1
             continue

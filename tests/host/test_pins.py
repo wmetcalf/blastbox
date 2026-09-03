@@ -1321,3 +1321,29 @@ def test_a_crlf_lock_keeps_crlf_in_the_regenerated_hash_block(tmp_path):
     data = lock.read_bytes()
     assert b"0.1.30" in data
     assert b"\n" not in data.replace(b"\r\n", b""), f"a bare LF was introduced: {data!r}"
+
+
+def test_a_bash_combined_redirection_is_not_a_separator(tmp_path):
+    """`&>file` starts with the ampersand, so the `2>&1` guard does not see it."""
+    from blastbox.host.pins import scan
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (root / "Dockerfile").write_text(
+        "FROM x\nRUN pip install &>/tmp/log \"blastbox==0.1.30\"\n"
+    )
+    floors = sorted({p.floor for p in scan(root) if p.floor})
+    assert floors == ["0.1.30"], f"the requirement was lost: {floors}"
+
+
+def test_a_process_substitution_does_not_split(tmp_path):
+    """`<(cmd | x)` opens a nested command, like `$( … )`."""
+    from blastbox.host.pins import scan
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (root / "Dockerfile").write_text(
+        "FROM x\nRUN pip install -r <(cat a | tr -d ' ') \"blastbox==0.1.30\"\n"
+    )
+    floors = sorted({p.floor for p in scan(root) if p.floor})
+    assert floors == ["0.1.30"], f"the requirement was lost: {floors}"
