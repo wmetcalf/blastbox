@@ -980,3 +980,33 @@ def test_a_failed_verification_restores_every_file(tmp_path, monkeypatch):
     assert "did not reach every pin" in str(e.value)
     for rel, text in before.items():
         assert (root / rel).read_text() == text, f"{rel} was left modified"
+
+
+def test_files_are_restored_when_the_verification_itself_raises(tmp_path, monkeypatch):
+    """A rollback that only covers the "stale pin" branch is not a rollback.
+
+    If the re-scan raises -- which a file this rewrite made unparseable would
+    do -- returning without restoring leaves exactly the half-applied state the
+    staging exists to prevent.
+    """
+    import pytest as _pytest
+
+    from blastbox.host import pins as pins_mod
+
+    root = _consumer(tmp_path, lock=False)
+    before = {p: (root / p).read_text() for p in ("pyproject.toml", "Dockerfile.worker")}
+
+    real_scan = pins_mod.scan
+    calls = {"n": 0}
+
+    def scan_then_explode(r):
+        calls["n"] += 1
+        if calls["n"] > 1:                    # the verification pass
+            raise pins_mod.PinScanError("unparseable after rewrite")
+        return real_scan(r)
+
+    monkeypatch.setattr(pins_mod, "scan", scan_then_explode)
+    with _pytest.raises(pins_mod.PinScanError):
+        pins_mod.set_version(root, "0.1.32", digests=_D)
+    for rel, text in before.items():
+        assert (root / rel).read_text() == text, f"{rel} was left modified"

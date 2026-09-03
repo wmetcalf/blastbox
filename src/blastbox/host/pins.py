@@ -654,17 +654,28 @@ def set_version(
     # what reports drift, so agreeing with it is the only check that means
     # anything. `disagreements` groups by version and always returns the
     # grouping, so drift is more than one key -- not a non-empty result.
-    after = scan(root)
-    groups = disagreements(after)
-    wanted = _normalise_version(version)
-    stale = {v: p for v, p in groups.items() if _normalise_version(v) != wanted}
-    if stale:
+    # Any failure from here on must restore, not just a stale-pin finding: if
+    # the re-scan itself raises -- a file this rewrite made unparseable would do
+    # it -- returning without restoring leaves exactly the half-applied state
+    # the staging exists to prevent.
+    def _restore() -> None:
         for path, text in original.items():
             path.write_text(text, encoding="utf-8")
+
+    try:
+        after = scan(root)
+        groups = disagreements(after)
+        wanted = _normalise_version(version)
+        stale = {v: q for v, q in groups.items() if _normalise_version(v) != wanted}
+    except Exception:
+        _restore()
+        raise
+    if stale:
+        _restore()
         raise PinScanError(
-            f"{root}: after setting {version}, {sum(len(p) for p in stale.values())} "
+            f"{root}: after setting {version}, {sum(len(q) for q in stale.values())} "
             f"pin(s) still resolve to {sorted(stale)}: "
-            f"{[f'{q.path}:{q.line}' for ps in stale.values() for q in ps]}. "
+            f"{[f'{q.path}:{q.line}' for qs in stale.values() for q in qs]}. "
             "The rewrite did not reach every pin. Every file has been restored."
         )
     return sorted(str(q) for q in staged)
