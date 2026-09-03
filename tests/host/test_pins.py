@@ -661,3 +661,82 @@ def test_setting_a_repo_with_no_pins_is_refused(tmp_path):
     (tmp_path / "pyproject.toml").write_text('[project]\nname = "x"\n')
     with _pytest.raises(PinScanError):
         set_version(tmp_path, "0.1.30", digests=_D)
+
+
+def test_a_direct_reference_is_refused_rather_than_silently_left(tmp_path):
+    """`blastbox @ git+...` has no floor, so the re-scan cannot notice it.
+
+    Left in place it survives a "successful" bump while still pointing at the
+    old revision -- the one pin whose staleness is completely invisible.
+    """
+    import pytest as _pytest
+
+    from blastbox.host.pins import PinScanError, set_version
+
+    root = _consumer(tmp_path, lock=False)
+    (root / "pyproject.toml").write_text(
+        '[project]\nname = "x"\ndependencies = [\n'
+        '  "blastbox @ git+https://example/blastbox@v0.1.27",\n]\n'
+    )
+    with _pytest.raises(PinScanError) as e:
+        set_version(root, "0.1.30", digests=_D)
+    assert "cannot be rewritten safely" in str(e.value)
+    assert "git+" in str(e.value)
+
+
+def test_a_version_that_violates_a_preserved_bound_is_refused(tmp_path):
+    """Keeping `<0.2` while setting 0.2.0 writes a specifier nothing satisfies."""
+    import pytest as _pytest
+
+    from blastbox.host.pins import PinScanError, set_version
+
+    root = _consumer(tmp_path, lock=False)
+    with _pytest.raises(PinScanError) as e:
+        set_version(root, "0.2.0", digests=_D)
+    assert "does not satisfy" in str(e.value)
+    # and nothing was written
+    assert "0.1.27" in (root / "pyproject.toml").read_text()
+
+
+def test_another_package_with_the_same_specifier_is_not_rewritten(tmp_path):
+    """`line.find(specifier)` rewrites whoever comes first on the line."""
+    from blastbox.host.pins import set_version
+
+    root = _consumer(tmp_path, lock=False)
+    (root / "pyproject.toml").write_text(
+        '[project]\nname = "x"\n'
+        'dependencies = ["other>=0.1.27,<0.2", "blastbox>=0.1.27,<0.2"]\n'
+    )
+    set_version(root, "0.1.30", digests=_D)
+    text = (root / "pyproject.toml").read_text()
+    assert '"other>=0.1.27,<0.2"' in text, f"someone else's dependency moved: {text}"
+    assert '"blastbox>=0.1.30,<0.2"' in text, text
+
+
+def test_hashes_written_on_the_requirement_line_are_replaced(tmp_path):
+    """`blastbox==X --hash=...` inline: the version moved, the hashes must too."""
+    from blastbox.host.pins import set_version
+
+    root = _consumer(tmp_path, lock=False)
+    (root / "deploy").mkdir(exist_ok=True)
+    lock = root / "deploy" / "requirements.lock"
+    lock.write_text("blastbox==0.1.27 --hash=sha256:" + "a" * 64 + "\n")
+    set_version(root, "0.1.30", digests=_D)
+    text = lock.read_text()
+    assert "blastbox==0.1.30" in text
+    assert "a" * 64 not in text, f"old digest survived beside the new version: {text}"
+    assert f"--hash=sha256:{_D[0]}" in text
+
+
+def test_a_quoted_dockerfile_arg_default_is_rewritten(tmp_path):
+    from blastbox.host.pins import scan, set_version
+
+    root = _consumer(tmp_path, lock=False)
+    (root / "Dockerfile.worker").write_text(
+        'ARG BLASTBOX_VERSION="0.1.27"\nFROM x\n'
+        'RUN pip install "blastbox==${BLASTBOX_VERSION}"\n'
+    )
+    if not any(p.kind == "dockerfile-arg" for p in scan(root)):
+        pytest.skip("the scanner does not report a quoted ARG default")
+    set_version(root, "0.1.30", digests=_D)
+    assert 'ARG BLASTBOX_VERSION="0.1.30"' in (root / "Dockerfile.worker").read_text()
