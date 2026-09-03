@@ -839,8 +839,11 @@ def test_a_requirement_that_is_nowhere_in_its_logical_line_still_refuses(tmp_pat
     from blastbox.host import pins as pins_mod
 
     root = tmp_path
-    (root / "pyproject.toml").write_text(
-        '[project]\nname = "x"\ndependencies = ["blastbox>=0.1.19"]\n'
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (root / "Dockerfile").write_text(
+        "FROM x\nRUN pip install \\\n"
+        '        "blastbox>=0.1.19" \\\n'
+        '        "fastapi"\n'
     )
     # Make every line unmatchable, as a corrupted file would be.
     monkey = pins_mod._rewrite_line
@@ -855,3 +858,77 @@ def test_a_requirement_that_is_nowhere_in_its_logical_line_still_refuses(tmp_pat
         assert "cannot locate" in str(e.value)
     finally:
         pins_mod._rewrite_line = monkey
+
+
+def test_a_comment_ends_a_continuation_for_the_span_too(tmp_path):
+    """`_logical_span` must join exactly what `_logical_lines` joined.
+
+    A `#` ends that physical line even inside a continued RUN, so a span
+    computed from the raw text would search lines the scanner never joined.
+    """
+    from blastbox.host.pins import _logical_span, _logical_lines
+
+    text = (
+        "RUN pip install \\\n"
+        '        "blastbox>=0.1.19" \\\n'
+        "# a comment, whose trailing backslash is prose \\\n"
+        '        "fastapi"\n'
+    )
+    lines = text.splitlines(keepends=True)
+    span = _logical_span(lines, 0)
+    joined_start, _ = _logical_lines(text)[0]
+    assert joined_start == 1
+    # The comment line ends the join for the scanner, so the span must stop there.
+    assert span.stop == 3, f"span {span} joined past the comment"
+
+
+def test_a_dockerfile_arg_keeps_its_specific_diagnosis(tmp_path):
+    """A one-line span has nothing to search; its own error is the useful one."""
+    import pytest as _pytest
+
+    from blastbox.host.pins import PinScanError, scan
+
+    from blastbox.host import pins as pins_mod
+
+    root = _consumer(tmp_path, lock=False)
+    pins = [p for p in scan(root) if p.kind == "dockerfile-arg"]
+    assert pins, "fixture assumption: the scanner reports the ARG"
+
+    # A line whose ARG has no version to replace. The span is one line, so the
+    # specific diagnosis is the only useful one -- "not found anywhere in its
+    # logical line" would describe a search that never happened.
+    with _pytest.raises(PinScanError) as e:
+        pins_mod._rewrite_line("ARG BLASTBOX_VERSION=", pins[0], "0.1.32")
+    assert "no version found after" in str(e.value)
+
+
+def test_a_one_line_span_propagates_its_own_error_through_set_version(tmp_path):
+    """The re-raise, exercised where it actually lives.
+
+    Asserting on `_rewrite_line` directly leaves `set_version`'s handling
+    untested: a mutant that always emits the generic "not found anywhere in its
+    logical line" message survived until this test existed.
+    """
+    import pytest as _pytest
+
+    from blastbox.host import pins as pins_mod
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text(
+        '[project]\nname = "x"\ndependencies = ["blastbox>=0.1.19"]\n'
+    )
+    real = pins_mod._rewrite_line
+
+    def specific(line, pin, version):
+        raise pins_mod.PinScanError("SPECIFIC-DIAGNOSIS: no version found after `=`")
+
+    pins_mod._rewrite_line = specific
+    try:
+        with _pytest.raises(pins_mod.PinScanError) as e:
+            pins_mod.set_version(root, "0.1.32")
+    finally:
+        pins_mod._rewrite_line = real
+    assert "SPECIFIC-DIAGNOSIS" in str(e.value), (
+        f"a one-line span must keep its own diagnosis, got: {e.value}"
+    )
+    assert "anywhere in its logical line" not in str(e.value)

@@ -472,8 +472,12 @@ def _logical_span(lines: list[str], start: int) -> range:
     where the logical line begins -- but the requirement text is on a later one,
     so rewriting only that first line finds nothing to replace.
     """
+    # Mirrors `_logical_lines` exactly, comment stripping included: a `#` ends
+    # that physical line even inside a continued RUN, so a span computed from
+    # the RAW text would join lines the scanner did not -- and the two must
+    # agree, or the rewriter searches a different region than the pin describes.
     end = start
-    while end < len(lines) and lines[end].rstrip("\n").rstrip().endswith("\\"):
+    while end < len(lines) and _strip_comment(lines[end]).rstrip().endswith("\\"):
         end += 1
     return range(start, min(end + 1, len(lines)))
 
@@ -599,21 +603,29 @@ def set_version(
             # Rewriting is still per-PHYSICAL-line so that continuations,
             # indentation and everything else on the other lines survive.
             span = _logical_span(lines, i) if pin.kind != "dockerfile-arg" else range(i, i + 1)
+            first_error: PinScanError | None = None
             for j in span:
                 try:
                     eol = "\n" if lines[j].endswith("\n") else ""
                     lines[j] = _rewrite_line(lines[j].rstrip("\n"), pin, version) + eol
                     break
-                except PinScanError:
+                except PinScanError as exc:
+                    first_error = first_error or exc
                     continue
             else:
+                # A one-line span has nothing to search, so its specific
+                # diagnosis -- "no version found after `=`" for an ARG -- is the
+                # useful message. Replacing it with "not found anywhere in its
+                # logical line" would describe a search that never happened.
+                if len(span) == 1 and first_error is not None:
+                    raise first_error
                 raise PinScanError(
                     f"{pin.path}:{pin.line}: cannot locate the blastbox requirement "
                     f"{pin.raw.strip()[:60]!r} anywhere in its logical line "
                     f"(physical lines {span.start + 1}-{span.stop}). Refusing to "
                     "guess -- a partial rewrite leaves the repo pinned to two "
                     "versions."
-                )
+                ) from first_error
             if pin.kind == "lock" and "--hash=" in "".join(lines[i : i + 4]):
                 needs_hashes = True
         if needs_hashes:
