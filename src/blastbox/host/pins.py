@@ -272,6 +272,8 @@ def _split_commands(line: str) -> list[str]:
     parts: list[str] = []
     buf: list[str] = []
     quote: str | None = None
+    depth = 0          # $( … ) nesting
+    backtick = False   # ` … `
     i = 0
     while i < len(line):
         ch = line[i]
@@ -294,6 +296,28 @@ def _split_commands(line: str) -> list[str]:
         if escaped:
             buf.append(line[i : i + 2])
             i += 2
+            continue
+        # A pipeline inside a command substitution belongs to that substitution,
+        # not to the install command: `--extra-index-url $(cmd | grep x)` is one
+        # argument. Splitting there drops the requirement from the scan.
+        if line[i : i + 2] == "$(":
+            depth += 1
+            buf.append(line[i : i + 2])
+            i += 2
+            continue
+        if ch == ")" and depth:
+            depth -= 1
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "`":
+            backtick = not backtick
+            buf.append(ch)
+            i += 1
+            continue
+        if depth or backtick:
+            buf.append(ch)
+            i += 1
             continue
         if line[i : i + 2] == "&&":
             parts.append("".join(buf))

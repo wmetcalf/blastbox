@@ -1207,3 +1207,30 @@ def test_an_unquoted_separator_still_splits(tmp_path):
     )
     floors = sorted({p.floor for p in scan(root) if p.floor})
     assert floors == ["0.1.30"], f"the echoed version leaked in: {floors}"
+
+
+def test_a_pipeline_inside_a_command_substitution_does_not_split(tmp_path):
+    """`$(cmd | grep x)` is one argument, not two commands."""
+    from blastbox.host.pins import scan
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (root / "Dockerfile").write_text(
+        "FROM x\n"
+        'RUN pip install --extra-index-url $(cat /u | head -1) "blastbox==0.1.30"\n'
+    )
+    floors = sorted({p.floor for p in scan(root) if p.floor})
+    assert floors == ["0.1.30"], f"the requirement was lost: {floors}"
+
+
+def test_a_backtick_substitution_does_not_split_either(tmp_path):
+    from blastbox.host.pins import scan
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (root / "Dockerfile").write_text(
+        "FROM x\n"
+        'RUN pip install --extra-index-url `cat /u | head -1` "blastbox==0.1.30"\n'
+    )
+    floors = sorted({p.floor for p in scan(root) if p.floor})
+    assert floors == ["0.1.30"], f"the requirement was lost: {floors}"
