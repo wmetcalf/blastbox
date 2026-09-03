@@ -1010,3 +1010,27 @@ def test_files_are_restored_when_the_verification_itself_raises(tmp_path, monkey
         pins_mod.set_version(root, "0.1.32", digests=_D)
     for rel, text in before.items():
         assert (root / rel).read_text() == text, f"{rel} was left modified"
+
+
+def test_a_requirement_split_mid_token_is_refused_not_mangled(tmp_path):
+    """`"blastbox>=\\` / `0.1.19"` -- the continuation falls INSIDE the token.
+
+    No physical line holds the whole requirement, so the rewriter cannot place
+    it. Refusing is the correct outcome and the file must be untouched: joining
+    the write across lines to support a form nobody writes would risk
+    corrupting the ones everybody does. Pinned as a test so this stays a
+    refusal rather than drifting into a partial rewrite later.
+    """
+    import pytest as _pytest
+
+    from blastbox.host.pins import PinScanError, set_version
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    df = root / "Dockerfile"
+    df.write_text('FROM x\nRUN pip install "blastbox>=\\\n0.1.19"\n')
+    before = df.read_text()
+    with _pytest.raises(PinScanError) as e:
+        set_version(root, "0.1.32")
+    assert "cannot locate" in str(e.value)
+    assert df.read_text() == before, "a refused bump must leave the file alone"
