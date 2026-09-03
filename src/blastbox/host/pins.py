@@ -257,10 +257,58 @@ def _scan_dockerfile(path: Path) -> list[Pin]:
     return out
 
 
-# Shell command separators. `&&` and `|` only, not `;` -- a PEP 508 marker
-# (`blastbox>=0.1; python_version >= "3.12"`) uses a semicolon, so cutting
-# there would truncate a requirement rather than a command.
-_CMD_SEP_RE = re.compile(r"&&|\|\|?")
+def _split_commands(line: str) -> list[str]:
+    """Split a shell line on `&&` / `|` that are OUTSIDE quotes.
+
+    A regex split cannot do this: an option value may legitimately contain the
+    separator -- `pip install --index-url "https://a|b" blastbox==1.0" -- and
+    cutting there drops the requirement from the scan entirely, which is the
+    silent under-report this module exists to prevent.
+
+    `;` is deliberately not a separator: a PEP 508 marker
+    (`blastbox>=0.1; python_version >= "3.12"`) uses one, so cutting there
+    would truncate a requirement rather than a command.
+    """
+    parts: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        escaped = ch == "\\" and i + 1 < len(line)
+        if quote:
+            if escaped and quote == '"':
+                buf.append(line[i : i + 2])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            buf.append(ch)
+            i += 1
+            continue
+        if ch in "\"'":
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if escaped:
+            buf.append(line[i : i + 2])
+            i += 2
+            continue
+        if line[i : i + 2] == "&&":
+            parts.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        if ch == "|":
+            parts.append("".join(buf))
+            buf = []
+            i += 2 if line[i : i + 2] == "||" else 1
+            continue
+        buf.append(ch)
+        i += 1
+    parts.append("".join(buf))
+    return parts
 
 
 def _isolate_requirements(line: str) -> list[str]:
@@ -281,7 +329,7 @@ def _isolate_requirements(line: str) -> list[str]:
     # INSTALLS are requirements. Each `&&`/`|` segment is considered on its own
     # so that `pip install X && echo X` reads the first and not the second,
     # while `pip install X && pip install Y` still reads both.
-    for segment in _CMD_SEP_RE.split(line):
+    for segment in _split_commands(line):
         m = _INSTALL_RE.search(segment)
         if not m:
             continue

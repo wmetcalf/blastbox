@@ -1175,3 +1175,35 @@ def test_a_rollback_restores_crlf_files_byte_for_byte(tmp_path, monkeypatch):
         pins_mod.set_version(root, "0.1.30", digests=_D)
     assert pyproject.read_bytes() == original, "CRLF was not restored byte-for-byte"
     assert (root / "Dockerfile.w").read_bytes() == df_original
+
+
+def test_a_separator_inside_a_quoted_option_does_not_split_the_command(tmp_path):
+    """`--index-url "https://a|b"` must not cut the requirement off the scan.
+
+    A regex split loses the pin entirely, and a pin that is never seen is the
+    silent under-report this module exists to prevent.
+    """
+    from blastbox.host.pins import scan
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (root / "Dockerfile").write_text(
+        "FROM x\n"
+        'RUN pip install --index-url "https://mirror/a|b" "blastbox==0.1.30"\n'
+    )
+    floors = sorted({p.floor for p in scan(root) if p.floor})
+    assert floors == ["0.1.30"], f"the requirement was lost: {floors}"
+
+
+def test_an_unquoted_separator_still_splits(tmp_path):
+    """The quote awareness must not disable the splitting it wraps."""
+    from blastbox.host.pins import scan
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (root / "Dockerfile").write_text(
+        "FROM x\n"
+        'RUN pip install "blastbox==0.1.30" && echo "blastbox==0.1.19"\n'
+    )
+    floors = sorted({p.floor for p in scan(root) if p.floor})
+    assert floors == ["0.1.30"], f"the echoed version leaked in: {floors}"
