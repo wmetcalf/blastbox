@@ -783,3 +783,75 @@ def test_a_nonsense_version_is_refused(tmp_path):
     root = _consumer(tmp_path, lock=False)
     with _pytest.raises(PinScanError):
         set_version(root, ">=0.1.30", digests=_D)
+
+
+def test_a_requirement_on_a_continuation_line_is_rewritten(tmp_path):
+    """Shell requirements are routinely written across backslashes.
+
+    The scanner attributes the pin to the FIRST physical line, because that is
+    where the logical line begins -- but the text is on a later one, so
+    rewriting only that first line found nothing. Measured on two real repos:
+    pdf-titan-arum and win-validator both refused a bump for this reason.
+    """
+    from blastbox.host.pins import disagreements, scan, set_version
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    df = root / "Dockerfile.ingress"
+    df.write_text(
+        "FROM x\n"
+        "RUN pip install --no-cache-dir \\\n"
+        '        "blastbox>=0.1.19" \\\n'
+        '        "fastapi"\n'
+    )
+    set_version(root, "0.1.32")
+    text = df.read_text()
+    assert '"blastbox>=0.1.32" \\\n' in text, text
+    assert '"fastapi"' in text, "the rest of the command must survive"
+    assert text.count("\\\n") == 2, "the continuations must survive"
+    assert sorted(disagreements(scan(root))) == ["0.1.32"]
+
+
+def test_only_the_line_holding_the_requirement_is_touched(tmp_path):
+    """Other lines of the same logical line keep their exact text."""
+    from blastbox.host.pins import set_version
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    df = root / "Dockerfile.ingress"
+    before = (
+        "FROM x\n"
+        "RUN pip install --no-cache-dir \\\n"
+        '        "blastbox>=0.1.19" \\\n'
+        '        "psycopg[binary,pool]" "redis"\n'
+    )
+    df.write_text(before)
+    set_version(root, "0.1.32")
+    after = df.read_text().splitlines()
+    for n in (0, 1, 3):
+        assert after[n] == before.splitlines()[n], f"line {n + 1} changed: {after[n]!r}"
+
+
+def test_a_requirement_that_is_nowhere_in_its_logical_line_still_refuses(tmp_path):
+    """The span search must not become a licence to rewrite the wrong line."""
+    import pytest as _pytest
+
+    from blastbox.host import pins as pins_mod
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text(
+        '[project]\nname = "x"\ndependencies = ["blastbox>=0.1.19"]\n'
+    )
+    # Make every line unmatchable, as a corrupted file would be.
+    monkey = pins_mod._rewrite_line
+
+    def never(line, pin, version):
+        raise pins_mod.PinScanError("no match here")
+
+    pins_mod._rewrite_line = never
+    try:
+        with _pytest.raises(pins_mod.PinScanError) as e:
+            pins_mod.set_version(root, "0.1.32")
+        assert "cannot locate" in str(e.value)
+    finally:
+        pins_mod._rewrite_line = monkey
