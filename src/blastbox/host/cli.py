@@ -1058,6 +1058,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pp.set_defaults(func=_pins_cmd)
 
+    bip = sub.add_parser(
+        "build-images",
+        help="build an engine's declared image chain, each image stamped and verified",
+    )
+    bip.add_argument("repo", help="path to the consumer repo (it declares blastbox-images.toml)")
+    bip.add_argument("--tag", required=True, help="tag to build the whole chain under")
+    bip.add_argument(
+        "--dry-run", action="store_true",
+        help="print what would be built and exported, and touch nothing",
+    )
+    bip.set_defaults(func=_build_images_cmd)
+
     pdoc = sub.add_parser(
         "doctor",
         help="report the blastbox version every running container is actually on",
@@ -1105,6 +1117,45 @@ def build_parser() -> argparse.ArgumentParser:
 
     return p
 
+
+
+def _build_images_cmd(args: argparse.Namespace) -> int:
+    """Build a declared image chain, stamped, and verify every result.
+
+    The declaration lives with the Dockerfiles it names, so a new engine writes
+    a spec rather than the fourth copy of a shell script -- every one of which
+    had drifted from the others in a way that silently produced a wrong image.
+    """
+    from blastbox.host.images import (  # noqa: PLC0415
+        PlanError, describe, load_plan, missing_dockerfiles,
+    )
+
+    root = Path(args.repo).resolve()
+    if not root.is_dir():
+        print(f"not a directory: {root}")
+        return 2
+    try:
+        plan = load_plan(root)
+    except PlanError as exc:
+        print(f"cannot read the image plan: {exc}")
+        return 2
+
+    missing = missing_dockerfiles(plan)
+    if missing:
+        # Reported BEFORE anything is built: otherwise this surfaces deep inside
+        # a docker build, as an error about something else.
+        print(f"{len(missing)} declared Dockerfile(s) do not exist:")
+        for m in missing:
+            print(f"  {m}")
+        return 2
+
+    print(describe(plan, args.tag))
+    if args.dry_run:
+        return 0
+    print()
+    print("build execution is not wired yet -- run the engine's build script.")
+    print("The plan above is what it must do; --dry-run is the contract.")
+    return 0
 
 
 def _release_digests(version: str) -> list[str] | None:
