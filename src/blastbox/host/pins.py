@@ -265,9 +265,9 @@ def _split_commands(line: str) -> list[str]:
     cutting there drops the requirement from the scan entirely, which is the
     silent under-report this module exists to prevent.
 
-    `;` is deliberately not a separator: a PEP 508 marker
-    (`blastbox>=0.1; python_version >= "3.12"`) uses one, so cutting there
-    would truncate a requirement rather than a command.
+    A top-level `;` or `&` ends a command as surely as `&&` does. A PEP 508
+    marker also uses a semicolon, but one that survives the shell is quoted,
+    and quoted text never reaches the split.
     """
     parts: list[str] = []
     buf: list[str] = []
@@ -328,6 +328,17 @@ def _split_commands(line: str) -> list[str]:
             parts.append("".join(buf))
             buf = []
             i += 2 if line[i : i + 2] == "||" else 1
+            continue
+        # A top-level `;` or `&` ends a command too. These were excluded at
+        # first out of a concern for PEP 508 markers -- but a marker's
+        # semicolon only survives the shell if it is QUOTED, and quoted text is
+        # already protected above. An UNQUOTED `;` really is a separator, so
+        # treating it as one matches what the shell does rather than working
+        # around a case that cannot occur.
+        if ch in ";&":
+            parts.append("".join(buf))
+            buf = []
+            i += 1
             continue
         buf.append(ch)
         i += 1

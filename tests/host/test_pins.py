@@ -1234,3 +1234,42 @@ def test_a_backtick_substitution_does_not_split_either(tmp_path):
     )
     floors = sorted({p.floor for p in scan(root) if p.floor})
     assert floors == ["0.1.30"], f"the requirement was lost: {floors}"
+
+
+def test_a_top_level_semicolon_ends_the_install_command(tmp_path):
+    """`pip install X ; echo Y` is two commands, and only the first installs."""
+    from blastbox.host.pins import scan
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (root / "Dockerfile").write_text(
+        "FROM x\nRUN pip install \"blastbox==0.1.30\" ; echo \"blastbox==0.1.19\"\n"
+    )
+    floors = sorted({p.floor for p in scan(root) if p.floor})
+    assert floors == ["0.1.30"], f"the echoed version leaked in: {floors}"
+
+
+def test_a_quoted_pep508_marker_is_not_split(tmp_path):
+    """A marker that survives the shell is quoted, and quoting is respected."""
+    from blastbox.host.pins import scan
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (root / "Dockerfile").write_text(
+        "FROM x\n"
+        'RUN pip install "blastbox>=0.1.30; python_version >= \'3.12\'"\n'
+    )
+    floors = sorted({p.floor for p in scan(root) if p.floor})
+    assert floors == ["0.1.30"], f"the marker broke the requirement: {floors}"
+
+
+def test_a_background_ampersand_ends_the_command(tmp_path):
+    from blastbox.host.pins import scan
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (root / "Dockerfile").write_text(
+        "FROM x\nRUN pip install \"blastbox==0.1.30\" & echo \"blastbox==0.1.19\"\n"
+    )
+    floors = sorted({p.floor for p in scan(root) if p.floor})
+    assert floors == ["0.1.30"], f"the backgrounded command leaked in: {floors}"
