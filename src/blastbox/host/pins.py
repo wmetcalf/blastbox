@@ -257,6 +257,14 @@ def _scan_dockerfile(path: Path) -> list[Pin]:
     return out
 
 
+# `pip install`, `pip3 install`, `python -m pip install`, `uv pip install`, and
+# the same with GLOBAL OPTIONS in between: `pip --isolated --no-cache-dir
+# install` is real and already had a test.
+_INSTALL_RE = re.compile(
+    r"(?i)\b(?:uv\s+)?pip[0-9.]*(?:\s+-{1,2}[\w-]+(?:=\S+)?)*\s+install\b"
+)
+
+
 def _isolate_requirements(line: str) -> list[str]:
     """Every blastbox requirement token on an install command line.
 
@@ -264,6 +272,14 @@ def _isolate_requirements(line: str) -> list[str]:
     install one just as a pyproject can, and dropping it here would repeat the
     silent-omission bug already fixed for pyproject.
     """
+    # Only what the install command is actually given. A continued RUN often
+    # mentions the package outside the install -- `RUN echo "blastbox==0.1.19"
+    # && pip install "blastbox==0.1.19"` -- and reading the whole line reported
+    # the DIAGNOSTIC string as the repo's pin. `pins` then showed a version
+    # nothing installs, and `--set` rewrote the echo while leaving the real
+    # dependency stale, because both agree on "the first match".
+    m = _INSTALL_RE.search(line)
+    line = line[m.end():] if m else line
     out: list[str] = []
     for m in _REQ_RE.finditer(line):
         start = line.lower().rfind("blastbox", 0, m.end())
@@ -418,7 +434,12 @@ def _spec_pattern(spec: str) -> str:
             re.escape(m.group(1)) + r"\s*" + re.escape(m.group(2)) if m
             else re.escape(stripped)
         )
-    return r"\s*,\s*".join(parts)
+    # A trailing boundary, so `==0.1` does not match inside `==0.1.2`. Without
+    # it, two pins on one logical line sharing a specifier made the second
+    # search re-match the FIRST, already-rewritten occurrence and extend it to
+    # `0.1.2.2` -- a legitimate bump failing on a version that merely extends
+    # the old one.
+    return r"\s*,\s*".join(parts) + r"(?![\w.])"
 
 
 def _rewrite_specifier(spec: str, version: str) -> str:

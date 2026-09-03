@@ -1034,3 +1034,55 @@ def test_a_requirement_split_mid_token_is_refused_not_mangled(tmp_path):
         set_version(root, "0.1.32")
     assert "cannot locate" in str(e.value)
     assert df.read_text() == before, "a refused bump must leave the file alone"
+
+
+def test_two_pins_sharing_a_specifier_on_one_logical_line(tmp_path):
+    """`==0.1` must not match inside the `==0.1.2` it was just rewritten to.
+
+    Without a trailing boundary the second pin's search re-matched the FIRST,
+    already-rewritten occurrence and extended it to `0.1.2.2`, so a legitimate
+    bump failed on a version that merely extends the old one.
+    """
+    from blastbox.host.pins import disagreements, scan, set_version
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    df = root / "Dockerfile"
+    df.write_text(
+        "FROM x\nRUN pip install \\\n"
+        '        "blastbox==0.1" \\\n'
+        '        "blastbox[host]==0.1"\n'
+    )
+    set_version(root, "0.1.2")
+    text = df.read_text()
+    assert '"blastbox==0.1.2"' in text, text
+    assert '"blastbox[host]==0.1.2"' in text, text
+    assert "0.1.2.2" not in text, f"a rewritten occurrence was rewritten again: {text}"
+    assert sorted(disagreements(scan(root))) == ["0.1.2"]
+
+
+def test_a_blastbox_token_outside_the_install_is_refused_not_corrupted(tmp_path):
+    """A diagnostic string sharing the requirement's text.
+
+    The rewriter has no model of which words are install ARGUMENTS -- that
+    parsing lives in the scanner, and duplicating it here is the divergence
+    that caused the comment-stripping bug. So the guarantee is the safe one:
+    the bump fails and every file is restored, rather than the echo text being
+    quietly rewritten and the real dependency left stale.
+    """
+    import pytest as _pytest
+
+    from blastbox.host.pins import PinScanError, set_version
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    df = root / "Dockerfile"
+    df.write_text(
+        "FROM x\n"
+        'RUN echo "blastbox==0.1.19" \\\n'
+        '        && pip install "blastbox==0.1.19"\n'
+    )
+    before = df.read_text()
+    with _pytest.raises(PinScanError):
+        set_version(root, "0.1.32")
+    assert df.read_text() == before, "a failed bump must leave the file untouched"
