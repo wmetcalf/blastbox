@@ -502,3 +502,162 @@ def test_a_direct_reference_on_a_dockerfile_install_line_is_a_pin(tmp_path):
     })
     refs = [p for p in scan(root) if p.specifier.startswith("@")]
     assert len(refs) == 1, [(p.file if hasattr(p, "file") else p.path, p.specifier) for p in scan(root)]
+
+
+# --- set_version -----------------------------------------------------------
+
+_D = ["1" * 64, "2" * 64]
+
+
+def _consumer(tmp_path, *, lock=True):
+    """A repo pinning blastbox by every path the scanner recognises."""
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "x"\ndependencies = ["blastbox>=0.1.27,<0.2"]\n'
+        '[project.optional-dependencies]\nhost = ["blastbox[host,s3]>=0.1.27,<0.2"]\n'
+    )
+    (tmp_path / "Dockerfile.worker").write_text(
+        "ARG BLASTBOX_VERSION=0.1.27\nFROM x\n"
+        'RUN pip install "blastbox==${BLASTBOX_VERSION}"\n'
+    )
+    if lock:
+        (tmp_path / "deploy").mkdir(exist_ok=True)
+        (tmp_path / "deploy" / "requirements.lock").write_text(
+            "blastbox==0.1.27 \\\n"
+            "    --hash=sha256:" + "a" * 64 + " \\\n"
+            "    --hash=sha256:" + "b" * 64 + "\n"
+            "    # via x (pyproject.toml)\n"
+        )
+    return tmp_path
+
+
+def test_one_input_moves_every_pin(tmp_path):
+    """The point of the command: seven places, one version."""
+    from blastbox.host.pins import disagreements, scan, set_version
+
+    root = _consumer(tmp_path)
+    set_version(root, "0.1.30", digests=_D)
+    groups = disagreements(scan(root))
+    assert sorted(groups) == ["0.1.30"], groups
+
+
+def test_an_upper_bound_is_not_moved(tmp_path):
+    """`<0.2` is a deliberate ceiling.
+
+    Rewriting it down silently narrows what the consumer accepts; rewriting it
+    up raises a ceiling nobody chose.
+    """
+    from blastbox.host.pins import set_version
+
+    root = _consumer(tmp_path)
+    set_version(root, "0.1.30", digests=_D)
+    assert '"blastbox>=0.1.30,<0.2"' in (root / "pyproject.toml").read_text()
+
+
+def test_extras_and_quoting_survive(tmp_path):
+    from blastbox.host.pins import set_version
+
+    root = _consumer(tmp_path)
+    set_version(root, "0.1.30", digests=_D)
+    assert '"blastbox[host,s3]>=0.1.30,<0.2"' in (root / "pyproject.toml").read_text()
+
+
+def test_a_dockerfile_arg_moves_too(tmp_path):
+    from blastbox.host.pins import set_version
+
+    root = _consumer(tmp_path)
+    set_version(root, "0.1.30", digests=_D)
+    assert "ARG BLASTBOX_VERSION=0.1.30" in (root / "Dockerfile.worker").read_text()
+
+
+def test_a_hash_pinned_lock_without_digests_is_refused(tmp_path):
+    """A version bumped without its hashes is a lock pip rejects outright."""
+    import pytest as _pytest
+
+    from blastbox.host.pins import PinScanError, set_version
+
+    root = _consumer(tmp_path)
+    with _pytest.raises(PinScanError) as e:
+        set_version(root, "0.1.30", digests=None)
+    assert "hash-pinned" in str(e.value)
+
+
+def test_the_rewritten_lock_keeps_the_space_before_the_continuation(tmp_path):
+    """`...hash\\` abuts the digest, so what pip reads as the hash is not the hash."""
+    from blastbox.host.pins import set_version
+
+    root = _consumer(tmp_path)
+    set_version(root, "0.1.30", digests=_D)
+    text = (root / "deploy" / "requirements.lock").read_text()
+    assert f"--hash=sha256:{_D[0]} \\\n" in text, text
+    assert f"{_D[0]}\\" not in text.replace(f"{_D[0]} \\", ""), "backslash abuts the digest"
+    assert text.count("--hash=sha256:") == len(_D)
+
+
+def test_the_lock_still_parses_as_a_requirements_file(tmp_path):
+    """Shape, not just substrings: the continuation-joined result is read."""
+    import re
+    from blastbox.host.pins import set_version
+
+    root = _consumer(tmp_path)
+    set_version(root, "0.1.30", digests=_D)
+    lock = (root / "deploy" / "requirements.lock")
+    # Join continuations the way pip does, then check the requirement line.
+    joined = re.sub(r"\\\n\s*", " ", lock.read_text())
+    line = next(ln for ln in joined.splitlines() if ln.startswith("blastbox=="))
+    assert line.split()[0] == "blastbox==0.1.30"
+    assert line.count("--hash=sha256:") == len(_D)
+    for d in _D:
+        assert f"--hash=sha256:{d}" in line
+
+
+def test_nothing_is_written_when_one_file_cannot_be_rewritten(tmp_path, monkeypatch):
+    """A half-applied bump leaves the repo pinned to TWO versions.
+
+    That is the drift this module reports, so producing it while claiming to
+    fix it is the worst available outcome.
+    """
+    import pytest as _pytest
+
+    from blastbox.host import pins as pins_mod
+
+    root = _consumer(tmp_path)
+    before = {p: (root / p).read_text() for p in ("pyproject.toml", "Dockerfile.worker")}
+
+    real = pins_mod._rewrite_line
+    calls = {"n": 0}
+
+    def flaky(line, pin, version):
+        calls["n"] += 1
+        if calls["n"] > 2:
+            raise pins_mod.PinScanError("simulated failure on a later file")
+        return real(line, pin, version)
+
+    monkeypatch.setattr(pins_mod, "_rewrite_line", flaky)
+    with _pytest.raises(pins_mod.PinScanError):
+        pins_mod.set_version(root, "0.1.30", digests=_D)
+    for rel, text in before.items():
+        assert (root / rel).read_text() == text, f"{rel} was written despite the failure"
+
+
+def test_an_incomplete_rewrite_is_caught_by_rescanning(tmp_path, monkeypatch):
+    """The scanner reports drift, so agreeing with it is the only real check."""
+    import pytest as _pytest
+
+    from blastbox.host import pins as pins_mod
+
+    root = _consumer(tmp_path, lock=False)
+    monkeypatch.setattr(pins_mod, "_rewrite_line", lambda line, pin, version: line)
+    with _pytest.raises(pins_mod.PinScanError) as e:
+        pins_mod.set_version(root, "0.1.30")
+    assert "did not reach every pin" in str(e.value)
+
+
+def test_setting_a_repo_with_no_pins_is_refused(tmp_path):
+    """Rewriting nothing and reporting success is how a bump gets skipped."""
+    import pytest as _pytest
+
+    from blastbox.host.pins import PinScanError, set_version
+
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    with _pytest.raises(PinScanError):
+        set_version(tmp_path, "0.1.30", digests=_D)

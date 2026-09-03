@@ -1047,6 +1047,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="report every install-path blastbox pin in a consumer repo (exit 1 on drift)",
     )
     pp.add_argument("repo", help="path to the consumer repo (redtusk, clippyshot, ...)")
+    pp.add_argument(
+        "--set", dest="set_version", metavar="VERSION",
+        help="point every pin at VERSION (one input for every install path), "
+             "refreshing hash-pinned locks from PyPI",
+    )
+    pp.add_argument(
+        "--allow-unreleased", action="store_true",
+        help="with --set, accept a version that is not on PyPI yet",
+    )
     pp.set_defaults(func=_pins_cmd)
 
     pdoc = sub.add_parser(
@@ -1098,6 +1107,64 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 
+def _release_digests(version: str) -> list[str] | None:
+    """sha256 of every artifact PyPI has for ``version``; None when it has none.
+
+    None is "this release does not exist there", which is a refusal reason, not
+    an empty list to carry on with. Bumping a consumer to a version PyPI has not
+    published yet produces a repo that cannot install -- measured: a floor moved
+    to 0.1.29 minutes before the index carried it, and CI failed with
+    "No matching distribution found" on a version that had genuinely been
+    released.
+    """
+    import json  # noqa: PLC0415
+    import urllib.error  # noqa: PLC0415
+    import urllib.request  # noqa: PLC0415
+
+    url = f"https://pypi.org/pypi/blastbox/{version}/json"
+    try:
+        with urllib.request.urlopen(url, timeout=30) as fh:
+            data = json.load(fh)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise
+    return [f["digests"]["sha256"] for f in data.get("urls", [])]
+
+
+def _pins_set(root: Path, version: str, *, allow_unreleased: bool) -> int:
+    """Point every pin at one version, and prove it by re-scanning."""
+    from blastbox.host.pins import PinScanError, set_version  # noqa: PLC0415
+
+    digests: list[str] | None = []
+    try:
+        digests = _release_digests(version)
+    except Exception as exc:  # noqa: BLE001 -- network shape varies; the message is what matters
+        if not allow_unreleased:
+            print(f"cannot reach PyPI to check {version}: {exc}")
+            print("  Pass --allow-unreleased to set it anyway (a hash-pinned lock")
+            print("  cannot be refreshed without the digests, and will refuse).")
+            return 2
+        digests = []
+    if digests is None:
+        if not allow_unreleased:
+            print(f"blastbox {version} is not on PyPI.")
+            print("  Pinning a consumer to it produces a repo that cannot install.")
+            print("  Publish the release first, or pass --allow-unreleased.")
+            return 2
+        digests = []
+
+    try:
+        changed = set_version(root, version, digests=digests)
+    except PinScanError as exc:
+        print(f"cannot set: {exc}")
+        return 2
+    for path in changed:
+        print(f"  updated {Path(path).relative_to(root)}")
+    print(f"OK: every pin in {root.name} now resolves to {version}")
+    return 0
+
+
 def _pins_cmd(args: argparse.Namespace) -> int:
     """Report every install-path blastbox pin in a consumer repo.
 
@@ -1111,6 +1178,10 @@ def _pins_cmd(args: argparse.Namespace) -> int:
     if not root.is_dir():
         print(f"not a directory: {root}")
         return 2
+
+    if getattr(args, "set_version", None):
+        return _pins_set(root, args.set_version, allow_unreleased=args.allow_unreleased)
+
     try:
         pins = scan(root)
     except PinScanError as exc:
