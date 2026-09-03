@@ -554,6 +554,29 @@ def build_app(
 
         return StreamingResponse(_iter_fh(), media_type=resolved_media_type, headers=headers)
 
+    def _load_result_metadata(job_id: str) -> object:
+        """The dispatcher-sealed envelope for a DONE job, parsed.
+
+        Exposed alongside ``serve_artifact_file`` because not everything a product
+        needs to serve is an ARTIFACT. ``serve_artifact_file`` requires the path to
+        be a declared artifact -- correctly, since undeclared bytes were never
+        re-hashed by the trust gate -- so a product that embeds a document in the
+        ENVELOPE has no way to read it back.
+
+        Measured cost of the gap: RedTusk moved its rmeta document into the
+        envelope (its `metadata.json` collided with the envelope's own at the zip
+        root) and stopped declaring the artifact. Its `/v1/jobs/{id}/rmeta` route
+        still asked for the file, so every completed job 404'd on the documented
+        retrieval route while the data sat in the envelope, intact.
+
+        Same gates as the artifact routes: job id validated, DONE required, read
+        through the BlobStore rather than the local job dir -- which by then may
+        not exist on this node at all.
+        """
+        _validate_job_id(job_id)
+        _require_done(job_id)
+        return _fetch_and_parse_metadata(_blob_store, job_id)
+
     def _serve_artifact_file(
         job_id: str,
         relative: str,
@@ -1085,6 +1108,7 @@ def build_app(
     app.state.job_root = _job_root
     app.state.blob_store = _blob_store
     app.state.serve_artifact_file = _serve_artifact_file
+    app.state.load_result_metadata = _load_result_metadata
 
     # Generic perceptual-hash search (GET /v1/similar), mounted only when the
     # store can actually serve it (the SQL store; memory/redis cannot). Keeps the
