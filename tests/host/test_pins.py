@@ -1273,3 +1273,51 @@ def test_a_background_ampersand_ends_the_command(tmp_path):
     )
     floors = sorted({p.floor for p in scan(root) if p.floor})
     assert floors == ["0.1.30"], f"the backgrounded command leaked in: {floors}"
+
+
+def test_a_redirection_ampersand_is_not_a_separator(tmp_path):
+    """`2>&1` is a redirection, not a background command."""
+    from blastbox.host.pins import scan
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (root / "Dockerfile").write_text(
+        "FROM x\nRUN pip install -q 2>&1 \"blastbox==0.1.30\"\n"
+    )
+    floors = sorted({p.floor for p in scan(root) if p.floor})
+    assert floors == ["0.1.30"], f"the requirement was lost: {floors}"
+
+
+def test_a_parameter_expansion_does_not_split(tmp_path):
+    """`${VAR//a|b/}` holds a pipe that belongs to the expansion."""
+    from blastbox.host.pins import scan
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (root / "Dockerfile").write_text(
+        "FROM x\nRUN pip install --extra-index-url ${U//a|b/} \"blastbox==0.1.30\"\n"
+    )
+    floors = sorted({p.floor for p in scan(root) if p.floor})
+    assert floors == ["0.1.30"], f"the requirement was lost: {floors}"
+
+
+def test_a_crlf_lock_keeps_crlf_in_the_regenerated_hash_block(tmp_path):
+    """The hash block is rebuilt, so it does not inherit endings like a rewrite.
+
+    Emitting "\\n" into a CRLF lock leaves the file with mixed endings.
+    """
+    from blastbox.host.pins import set_version
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (root / "deploy").mkdir()
+    lock = root / "deploy" / "requirements.lock"
+    lock.write_bytes(
+        b"blastbox==0.1.27 \\\r\n"
+        b"    --hash=sha256:" + b"a" * 64 + b" \\\r\n"
+        b"    --hash=sha256:" + b"b" * 64 + b"\r\n"
+    )
+    set_version(root, "0.1.30", digests=_D)
+    data = lock.read_bytes()
+    assert b"0.1.30" in data
+    assert b"\n" not in data.replace(b"\r\n", b""), f"a bare LF was introduced: {data!r}"

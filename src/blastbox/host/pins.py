@@ -300,10 +300,15 @@ def _split_commands(line: str) -> list[str]:
         # A pipeline inside a command substitution belongs to that substitution,
         # not to the install command: `--extra-index-url $(cmd | grep x)` is one
         # argument. Splitting there drops the requirement from the scan.
-        if line[i : i + 2] == "$(":
+        if line[i : i + 2] in ("$(", "${"):
             depth += 1
             buf.append(line[i : i + 2])
             i += 2
+            continue
+        if ch == "}" and depth:
+            depth -= 1
+            buf.append(ch)
+            i += 1
             continue
         if ch == ")" and depth:
             depth -= 1
@@ -335,6 +340,11 @@ def _split_commands(line: str) -> list[str]:
         # already protected above. An UNQUOTED `;` really is a separator, so
         # treating it as one matches what the shell does rather than working
         # around a case that cannot occur.
+        if ch == "&" and buf and buf[-1] == ">":
+            # `2>&1` -- a redirection, not a background separator.
+            buf.append(ch)
+            i += 1
+            continue
         if ch in ";&":
             parts.append("".join(buf))
             buf = []
@@ -636,6 +646,18 @@ def _hash_lines(indent: str, digests: list[str]) -> list[str]:
     return [f"{indent}--hash=sha256:{d}" for d in digests]
 
 
+def _eol_of(line: str) -> str:
+    """The line ending ``line`` uses, so a regenerated block keeps it.
+
+    The hash block is rebuilt from scratch rather than edited, so it does not
+    inherit the file's endings the way a rewritten line does: emitting "\n"
+    into a CRLF lock would leave that file with mixed endings.
+    """
+    if line.endswith("\r\n"):
+        return "\r\n"
+    return "\n" if line.endswith("\n") else ""
+
+
 def set_version(
     root: Path,
     version: str,
@@ -827,16 +849,18 @@ def _replace_hashes(
             if "--hash=" in req_line:
                 head = req_line.split("--hash=", 1)[0].rstrip()
                 lines[start - 1] = (
-                    head + " " + " ".join(f"--hash=sha256:{d}" for d in digests) + "\n"
+                    head + " " + " ".join(f"--hash=sha256:{d}" for d in digests)
+                    + (_eol_of(req_line) or "\n")
                 )
             continue
         # The separator is " \\\n", with the SPACE: written as "...hash\\" the
         # backslash abuts the digest, and what pip reads as the hash value is
         # no longer the hash. Every continuation but the last gets one.
-        block = [ln + (" \\\n" if n < len(digests) - 1 else "\n")
+        eol = _eol_of(lines[start]) or _eol_of(lines[start - 1]) or "\n"
+        block = [ln + (" \\" + eol if n < len(digests) - 1 else eol)
                  for n, ln in enumerate(_hash_lines(indent, digests))]
         # The requirement line itself ends in a backslash when hashes follow.
-        req = lines[start - 1].rstrip("\n").rstrip().rstrip("\\").rstrip()
-        lines[start - 1] = f"{req} \\\n"
+        req = lines[start - 1].rstrip("\r\n").rstrip().rstrip("\\").rstrip()
+        lines[start - 1] = f"{req} \\" + (_eol_of(lines[start - 1]) or "\n")
         lines[start:end] = block
     return lines
