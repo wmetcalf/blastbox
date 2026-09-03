@@ -257,12 +257,10 @@ def _scan_dockerfile(path: Path) -> list[Pin]:
     return out
 
 
-# `pip install`, `pip3 install`, `python -m pip install`, `uv pip install`, and
-# the same with GLOBAL OPTIONS in between: `pip --isolated --no-cache-dir
-# install` is real and already had a test.
-_INSTALL_RE = re.compile(
-    r"(?i)\b(?:uv\s+)?pip[0-9.]*(?:\s+-{1,2}[\w-]+(?:=\S+)?)*\s+install\b"
-)
+# Shell command separators. `&&` and `|` only, not `;` -- a PEP 508 marker
+# (`blastbox>=0.1; python_version >= "3.12"`) uses a semicolon, so cutting
+# there would truncate a requirement rather than a command.
+_CMD_SEP_RE = re.compile(r"&&|\|\|?")
 
 
 def _isolate_requirements(line: str) -> list[str]:
@@ -278,14 +276,21 @@ def _isolate_requirements(line: str) -> list[str]:
     # the DIAGNOSTIC string as the repo's pin. `pins` then showed a version
     # nothing installs, and `--set` rewrote the echo while leaving the real
     # dependency stale, because both agree on "the first match".
-    m = _INSTALL_RE.search(line)
-    line = line[m.end():] if m else line
     out: list[str] = []
-    for m in _REQ_RE.finditer(line):
-        start = line.lower().rfind("blastbox", 0, m.end())
-        out.append(line[start : m.end()])
-    for m in _DIRECT_REF_RE.finditer(line):
-        out.append(m.group(0))
+    # One logical RUN can hold several commands, and only the arguments of the
+    # INSTALLS are requirements. Each `&&`/`|` segment is considered on its own
+    # so that `pip install X && echo X` reads the first and not the second,
+    # while `pip install X && pip install Y` still reads both.
+    for segment in _CMD_SEP_RE.split(line):
+        m = _INSTALL_RE.search(segment)
+        if not m:
+            continue
+        args = segment[m.end():]
+        for r in _REQ_RE.finditer(args):
+            start = args.lower().rfind("blastbox", 0, r.end())
+            out.append(args[start : r.end()])
+        for r in _DIRECT_REF_RE.finditer(args):
+            out.append(r.group(0))
     return out
 
 
@@ -439,7 +444,11 @@ def _spec_pattern(spec: str) -> str:
     # search re-match the FIRST, already-rewritten occurrence and extend it to
     # `0.1.2.2` -- a legitimate bump failing on a version that merely extends
     # the old one.
-    return r"\s*,\s*".join(parts) + r"(?![\w.])"
+    # The boundary covers every character a PEP 440 version can CONTINUE with:
+    # `+` (local), `!` (epoch) and `-` as well as word characters and dots.
+    # `(?![\w.])` alone let `==1.0` match inside `==1.0+cpu`, so a second pin on
+    # the same line re-matched the first rewrite.
+    return r"\s*,\s*".join(parts) + r"(?![\w.+!\-])"
 
 
 def _rewrite_specifier(spec: str, version: str) -> str:
@@ -618,7 +627,10 @@ def set_version(
     staged: dict[Path, str] = {}
     for rel, file_pins in by_path.items():
         path = root / rel
-        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        # newline="" keeps CRLF intact: without it a SUCCESSFUL bump silently
+        # rewrote every line ending in the file.
+        with path.open(encoding="utf-8", newline="") as fh:
+            lines = fh.read().splitlines(keepends=True)
         needs_hashes = False
         for pin in sorted(file_pins, key=lambda p: p.line, reverse=True):
             i = pin.line - 1
@@ -667,9 +679,17 @@ def set_version(
     # disk, so a failure at that point has already modified them. Restoring is
     # what makes "nothing is written unless every pin moved" true at the end of
     # the operation and not just at the start of it.
-    original = {path: path.read_text(encoding="utf-8") for path in staged}
+    # Bytes, not text: `read_text` performs universal-newline translation, so a
+    # CRLF file restored through it comes back with LF endings -- a "rollback"
+    # that rewrites every line of the file it was meant to leave alone.
+    original = {path: path.read_bytes() for path in staged}
     for path, text in staged.items():
-        path.write_text(text, encoding="utf-8")
+        # newline="" on the WRITE is unobservable on POSIX -- newline=None only
+        # translates on platforms whose linesep is not "\n" -- so no test here
+        # can kill a mutant that drops it. It is still required: on Windows the
+        # default would translate the "\n" inside an already-CRLF line and
+        # produce "\r\r\n".
+        path.write_text(text, encoding="utf-8", newline="")
 
     # Verify by RE-SCANNING rather than by trusting the rewrite: the scanner is
     # what reports drift, so agreeing with it is the only check that means
@@ -680,8 +700,8 @@ def set_version(
     # it -- returning without restoring leaves exactly the half-applied state
     # the staging exists to prevent.
     def _restore() -> None:
-        for path, text in original.items():
-            path.write_text(text, encoding="utf-8")
+        for path, data in original.items():
+            path.write_bytes(data)
 
     try:
         after = scan(root)

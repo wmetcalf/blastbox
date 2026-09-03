@@ -1086,3 +1086,92 @@ def test_a_blastbox_token_outside_the_install_is_refused_not_corrupted(tmp_path)
     with _pytest.raises(PinScanError):
         set_version(root, "0.1.32")
     assert df.read_text() == before, "a failed bump must leave the file untouched"
+
+
+def test_a_token_after_the_install_command_is_not_a_pin(tmp_path):
+    """Mirror of the echo-before case: the stray token comes AFTER the install.
+
+    Trimming the front does not help there; each `&&` segment is considered on
+    its own so only the install's own arguments count.
+    """
+    from blastbox.host.pins import scan
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    (root / "Dockerfile").write_text(
+        "FROM x\n"
+        'RUN pip install "blastbox==0.1.30" \\\n'
+        '        && echo "blastbox==0.1.19"\n'
+    )
+    floors = sorted({p.floor for p in scan(root) if p.floor})
+    assert floors == ["0.1.30"], f"the echoed version was read as a pin: {floors}"
+
+
+def test_a_crlf_file_keeps_its_line_endings(tmp_path):
+    """`read_text` translates CRLF to LF, so both the write AND the rollback
+    would silently rewrite every line of a file they were meant to leave alone."""
+    from blastbox.host.pins import set_version
+
+    root = tmp_path
+    (root / "pyproject.toml").write_bytes(
+        b'[project]\r\nname = "x"\r\ndependencies = ["blastbox>=0.1.27,<0.2"]\r\n'
+    )
+    set_version(root, "0.1.30", digests=_D)
+    data = (root / "pyproject.toml").read_bytes()
+    assert b"0.1.30" in data
+    assert data.count(b"\r\n") == 3, f"line endings were rewritten: {data!r}"
+    assert b"\n" not in data.replace(b"\r\n", b""), "a bare LF was introduced"
+
+
+def test_a_local_version_does_not_rematch_the_pin_it_just_wrote(tmp_path):
+    """`==1.0` must not match inside `==1.0+cpu`."""
+    from blastbox.host.pins import set_version
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    df = root / "Dockerfile"
+    df.write_text(
+        "FROM x\nRUN pip install \\\n"
+        '        "blastbox==1.0" \\\n'
+        '        "blastbox[host]==1.0"\n'
+    )
+    set_version(root, "1.0+cpu", digests=_D)
+    text = df.read_text()
+    assert '"blastbox==1.0+cpu"' in text, text
+    assert '"blastbox[host]==1.0+cpu"' in text, text
+    assert "+cpu+cpu" not in text and "1.0+cpu.0" not in text, text
+
+
+def test_a_rollback_restores_crlf_files_byte_for_byte(tmp_path, monkeypatch):
+    """Snapshotting with `read_text` would restore LF endings.
+
+    That is a "rollback" which rewrites every line of the file it was meant to
+    leave alone -- so the snapshot is taken as bytes.
+    """
+    import pytest as _pytest
+
+    from blastbox.host import pins as pins_mod
+
+    root = tmp_path
+    pyproject = root / "pyproject.toml"
+    original = b'[project]\r\nname = "x"\r\ndependencies = ["blastbox>=0.1.27,<0.2"]\r\n'
+    pyproject.write_bytes(original)
+    (root / "Dockerfile.w").write_bytes(
+        b"ARG BLASTBOX_VERSION=0.1.27\r\nFROM x\r\n"
+        b'RUN pip install "blastbox==${BLASTBOX_VERSION}"\r\n'
+    )
+    df_original = (root / "Dockerfile.w").read_bytes()
+
+    # Rewrite the pyproject but not the Dockerfile, so verification sees drift.
+    real = pins_mod._rewrite_line
+
+    def partial(line, pin, version):
+        if pin.kind == "dockerfile-arg":
+            return line
+        return real(line, pin, version)
+
+    monkeypatch.setattr(pins_mod, "_rewrite_line", partial)
+    with _pytest.raises(pins_mod.PinScanError):
+        pins_mod.set_version(root, "0.1.30", digests=_D)
+    assert pyproject.read_bytes() == original, "CRLF was not restored byte-for-byte"
+    assert (root / "Dockerfile.w").read_bytes() == df_original
