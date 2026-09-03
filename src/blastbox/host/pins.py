@@ -372,3 +372,277 @@ def disagreements(pins: list[Pin]) -> dict[str, list[Pin]]:
         if floor:
             groups.setdefault(floor, []).append(pin)
     return groups
+
+
+# ---------------------------------------------------------------------------
+# Rewriting: one version input for every install path.
+# ---------------------------------------------------------------------------
+#
+# Bumping a consumer by hand means editing every place `scan` reports -- and the
+# whole reason this module exists is that people miss some. Three RedTusk bumps
+# in one day each touched seven pins across four file formats, and the only
+# reason none was missed is that `pins` was run afterwards. The scanner already
+# knows every location; rewriting from the same list is what makes "one version
+# input" true rather than aspirational.
+
+_FLOOR_OPS = ("==", ">=", "~=")
+_BOUND_OPS = ("<=", "<", "!=")
+
+# Anchors the rewrite to the blastbox requirement itself. `line.find(specifier)`
+# does not: given `["other==0.1.27", "blastbox==0.1.27"]` it finds the FIRST
+# occurrence and rewrites somebody else's dependency, silently.
+_REQ_NAME = r"(?i:blastbox)(?:\[[A-Za-z0-9,._\-]+\])?"
+
+
+_OP_RE = re.compile(r"^(==|>=|<=|~=|!=|<|>)\s*(.*)$")
+
+
+def _spec_pattern(spec: str) -> str:
+    """A whitespace-tolerant pattern for one specifier as written in a file.
+
+    `scan` stores specifiers with whitespace stripped, so the pattern has to
+    tolerate what the FILE may contain: spaces around the commas and between an
+    operator and its version. Escaping the part whole matched `>=0.1.27` but
+    not the equally valid `>= 0.1.27`, and the caller then refused a line it
+    could have rewritten.
+    """
+    parts = []
+    for part in spec.split(","):
+        stripped = part.strip()
+        m = _OP_RE.match(stripped)
+        parts.append(
+            re.escape(m.group(1)) + r"\s*" + re.escape(m.group(2)) if m
+            else re.escape(stripped)
+        )
+    return r"\s*,\s*".join(parts)
+
+
+def _rewrite_specifier(spec: str, version: str) -> str:
+    """Point every FLOOR in ``spec`` at ``version``, leaving bounds alone.
+
+    An upper bound is a deliberate compatibility ceiling: rewriting `<0.2` to
+    `<0.1.31` would silently narrow what the consumer accepts, and rewriting it
+    UP would raise a ceiling nobody chose. Only the floors move.
+    """
+    out = []
+    for part in spec.split(","):
+        stripped = part.strip()
+        for op in _FLOOR_OPS:
+            if stripped.startswith(op):
+                out.append(f"{op}{version}")
+                break
+        else:
+            out.append(stripped)
+    return ",".join(out)
+
+
+def _violated_bound(spec: str, version: str) -> str | None:
+    """A preserved bound the target version does not satisfy, if any.
+
+    Keeping `<0.2` while setting 0.2.0 yields `>=0.2.0,<0.2`: a specifier
+    nothing can satisfy, written by a command that reported success.
+    """
+    key = _version_key(_normalise_version(version))
+    for part in spec.split(","):
+        stripped = part.strip()
+        for op in _BOUND_OPS:
+            if not stripped.startswith(op):
+                continue
+            bound = _normalise_version(stripped[len(op):].strip().lstrip("vV"))
+            if not bound:
+                break
+            bk = _version_key(bound)
+            bad = (key >= bk) if op == "<" else (key > bk) if op == "<=" else (key == bk)
+            if bad:
+                return stripped
+            break
+    return None
+
+
+def _rewrite_line(line: str, pin: Pin, version: str) -> str:
+    """Replace the version in one pin's line, touching nothing else on it."""
+    if pin.kind == "dockerfile-arg":
+        # `ARG BLASTBOX_VERSION=0.1.30`, possibly quoted. The quotes are part of
+        # the file's style and are preserved rather than normalised away.
+        new, n = re.subn(
+            r"(=\s*[\"\']?)v?\d[\w.\-+!]*",
+            lambda m: m.group(1) + version,
+            line,
+            count=1,
+        )
+        if not n:
+            raise PinScanError(
+                f"{pin.path}:{pin.line}: no version found after `=` to rewrite in "
+                f"{line.strip()!r}"
+            )
+        return new
+
+    new_spec = _rewrite_specifier(pin.specifier, version)
+    pattern = re.compile(f"({_REQ_NAME}\\s*){_spec_pattern(pin.specifier)}")
+    new, n = pattern.subn(lambda m: m.group(1) + new_spec, line, count=1)
+    if not n:
+        raise PinScanError(
+            f"{pin.path}:{pin.line}: cannot locate the blastbox requirement "
+            f"{pin.raw!r} on this line to rewrite it. A pin written across a "
+            "line continuation is attributed to the first physical line, which "
+            "is not where the text lives. Refusing to guess -- a partial "
+            "rewrite leaves the repo pinned to two versions."
+        )
+    return new
+
+
+def _hash_lines(indent: str, digests: list[str]) -> list[str]:
+    """Render `--hash=sha256:...` continuation lines for a locked requirement."""
+    return [f"{indent}--hash=sha256:{d}" for d in digests]
+
+
+def set_version(
+    root: Path,
+    version: str,
+    *,
+    digests: list[str] | None = None,
+) -> list[str]:
+    """Point every pin under ``root`` at ``version``. Returns changed paths.
+
+    ``digests`` are the sha256 hashes of the release's PyPI artifacts, required
+    only when a hash-pinned lock file is present: rewriting the version there
+    without the hashes produces a lock that `pip install --require-hashes`
+    rejects outright, which is a broken build rather than a bumped one.
+
+    Rewrites nothing unless every file can be rewritten. A half-applied bump
+    leaves a repo pinned to two versions -- exactly the drift this module
+    reports -- so the work is staged in memory and written only at the end.
+    """
+    # `v0.1.30` is how the tag is spelled, and callers paste tags. Accepting it
+    # verbatim wrote the `v` into every pin and then failed verification against
+    # the scanner, which strips it -- a bump that damaged the repo and reported
+    # failure. Strip it once, here, so what is written and what is verified are
+    # the same string.
+    version = version.strip().lstrip("vV")
+    if not re.match(r"^\d+(\.\d+)*", version):
+        raise PinScanError(
+            f"{version!r} does not look like a version. Pass it as 0.1.30, not "
+            "as a tag or a specifier."
+        )
+
+    pins = scan(root)
+    if not pins:
+        raise PinScanError(f"{root}: no blastbox pins found; nothing to set")
+
+    # Pins this rewriter must not pretend to handle. Each would otherwise be
+    # left untouched, and the re-scan below cannot notice: a direct reference
+    # has no FLOOR, so `disagreements` never groups it and a stale
+    # `blastbox @ git+...@v0.1.27` would survive a "successful" bump silently.
+    unhandled = []
+    for pin in pins:
+        if pin.floor is None:
+            unhandled.append(f"{pin.path}:{pin.line} ({pin.kind}) {pin.raw.strip()[:70]}")
+        elif pin.line <= 0:
+            # TOML locks (uv/poetry/pdm) are reported without a line, because
+            # the package is a table rather than a requirement line. Rewriting
+            # by line number cannot work, and guessing would corrupt the lock.
+            unhandled.append(f"{pin.path} ({pin.kind}) -- no line to rewrite")
+    if unhandled:
+        raise PinScanError(
+            f"{root}: {len(unhandled)} pin(s) cannot be rewritten safely and would "
+            f"be left at their current version while this reported success:\n  "
+            + "\n  ".join(unhandled)
+            + "\nUpdate these by hand (or with their own tool) and re-run."
+        )
+
+    conflicts = [
+        f"{pin.path}:{pin.line} keeps {bad!r}"
+        for pin in pins
+        if (bad := _violated_bound(pin.specifier, version))
+    ]
+    if conflicts:
+        raise PinScanError(
+            f"{root}: {version} does not satisfy a bound that would be preserved:\n  "
+            + "\n  ".join(conflicts)
+            + "\nSetting it would write a specifier nothing can install. Raise "
+            "the ceiling deliberately first."
+        )
+
+    by_path: dict[str, list[Pin]] = {}
+    for pin in pins:
+        by_path.setdefault(pin.path, []).append(pin)
+
+    staged: dict[Path, str] = {}
+    for rel, file_pins in by_path.items():
+        path = root / rel
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        needs_hashes = False
+        for pin in sorted(file_pins, key=lambda p: p.line, reverse=True):
+            i = pin.line - 1
+            if not 0 <= i < len(lines):
+                raise PinScanError(f"{rel}:{pin.line}: line is gone; re-scan and retry")
+            eol = "\n" if lines[i].endswith("\n") else ""
+            lines[i] = _rewrite_line(lines[i].rstrip("\n"), pin, version) + eol
+            if pin.kind == "lock" and "--hash=" in "".join(lines[i : i + 4]):
+                needs_hashes = True
+        if needs_hashes:
+            if not digests:
+                raise PinScanError(
+                    f"{rel} is hash-pinned, so bumping it needs the release's "
+                    "sha256 digests. Without them `pip install --require-hashes` "
+                    "rejects the lock and the build fails at install time."
+                )
+            lines = _replace_hashes(lines, file_pins, digests, rel)
+        staged[path] = "".join(lines)
+
+    for path, text in staged.items():
+        path.write_text(text, encoding="utf-8")
+
+    # Verify by RE-SCANNING rather than by trusting the rewrite: the scanner is
+    # what reports drift, so agreeing with it is the only check that means
+    # anything. `disagreements` groups by version and always returns the
+    # grouping, so drift is more than one key -- not a non-empty result.
+    after = scan(root)
+    groups = disagreements(after)
+    wanted = _normalise_version(version)
+    stale = {v: p for v, p in groups.items() if _normalise_version(v) != wanted}
+    if stale:
+        raise PinScanError(
+            f"{root}: after setting {version}, {sum(len(p) for p in stale.values())} "
+            f"pin(s) still resolve to {sorted(stale)}: "
+            f"{[f'{q.path}:{q.line}' for ps in stale.values() for q in ps]}. "
+            "The rewrite did not reach every pin."
+        )
+    return sorted(str(q) for q in staged)
+
+
+def _replace_hashes(
+    lines: list[str], file_pins: list[Pin], digests: list[str], rel: str
+) -> list[str]:
+    """Swap the `--hash=` continuation lines under each locked blastbox pin."""
+    for pin in sorted(file_pins, key=lambda p: p.line, reverse=True):
+        if pin.kind != "lock":
+            continue
+        start = pin.line  # first line AFTER the requirement
+        end = start
+        indent = "    "
+        while end < len(lines) and "--hash=" in lines[end]:
+            indent = lines[end][: len(lines[end]) - len(lines[end].lstrip())]
+            end += 1
+        if end == start:
+            # Hashes can live ON the requirement line rather than below it. The
+            # version has already been rewritten by this point, so skipping here
+            # leaves the OLD digests beside the NEW version -- a lock that fails
+            # `--require-hashes` while the command reports success.
+            req_line = lines[start - 1]
+            if "--hash=" in req_line:
+                head = req_line.split("--hash=", 1)[0].rstrip()
+                lines[start - 1] = (
+                    head + " " + " ".join(f"--hash=sha256:{d}" for d in digests) + "\n"
+                )
+            continue
+        # The separator is " \\\n", with the SPACE: written as "...hash\\" the
+        # backslash abuts the digest, and what pip reads as the hash value is
+        # no longer the hash. Every continuation but the last gets one.
+        block = [ln + (" \\\n" if n < len(digests) - 1 else "\n")
+                 for n, ln in enumerate(_hash_lines(indent, digests))]
+        # The requirement line itself ends in a backslash when hashes follow.
+        req = lines[start - 1].rstrip("\n").rstrip().rstrip("\\").rstrip()
+        lines[start - 1] = f"{req} \\\n"
+        lines[start:end] = block
+    return lines
