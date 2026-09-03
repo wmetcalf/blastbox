@@ -736,7 +736,12 @@ def test_a_quoted_dockerfile_arg_default_is_rewritten(tmp_path):
         'ARG BLASTBOX_VERSION="0.1.27"\nFROM x\n'
         'RUN pip install "blastbox==${BLASTBOX_VERSION}"\n'
     )
-    if not any(p.kind == "dockerfile-arg" for p in scan(root)):
-        pytest.skip("the scanner does not report a quoted ARG default")
+    # Asserted, not skipped on. A conditional skip here would hide the very
+    # regression this test exists for -- if the scanner stopped reporting a
+    # quoted ARG, the pin would go unrewritten and nothing would say so.
+    assert any(p.kind == "dockerfile-arg" for p in scan(root)), (
+        "the scanner no longer reports a quoted ARG default; the rewrite below "
+        "would silently cover nothing"
+    )
     set_version(root, "0.1.30", digests=_D)
     assert 'ARG BLASTBOX_VERSION="0.1.30"' in (root / "Dockerfile.worker").read_text()
