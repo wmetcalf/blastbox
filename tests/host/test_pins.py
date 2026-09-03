@@ -932,3 +932,51 @@ def test_a_one_line_span_propagates_its_own_error_through_set_version(tmp_path):
         f"a one-line span must keep its own diagnosis, got: {e.value}"
     )
     assert "anywhere in its logical line" not in str(e.value)
+
+
+def test_a_package_whose_name_ends_in_blastbox_is_not_rewritten(tmp_path):
+    """`blastbox` matches the SUFFIX of `not-blastbox` without a left boundary.
+
+    Listed first in a continued install, the unrelated distribution was
+    rewritten and the search stopped there, leaving the real pin stale -- a
+    corrupted file AND a missed bump.
+    """
+    from blastbox.host.pins import set_version
+
+    root = tmp_path
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    df = root / "Dockerfile"
+    df.write_text(
+        "FROM x\nRUN pip install \\\n"
+        '        "not-blastbox>=0.1.19" \\\n'
+        '        "blastbox>=0.1.19"\n'
+    )
+    set_version(root, "0.1.32")
+    text = df.read_text()
+    assert '"not-blastbox>=0.1.19"' in text, f"an unrelated package was rewritten: {text}"
+    assert '"blastbox>=0.1.32"' in text, text
+
+
+def test_a_failed_verification_restores_every_file(tmp_path, monkeypatch):
+    """The verification runs against the files on DISK, which are already written."""
+    import pytest as _pytest
+
+    from blastbox.host import pins as pins_mod
+
+    root = _consumer(tmp_path, lock=False)
+    before = {p: (root / p).read_text() for p in ("pyproject.toml", "Dockerfile.worker")}
+
+    # Rewrite the pyproject but not the Dockerfile, so the re-scan sees drift.
+    real = pins_mod._rewrite_line
+
+    def partial(line, pin, version):
+        if pin.kind == "dockerfile-arg":
+            return line
+        return real(line, pin, version)
+
+    monkeypatch.setattr(pins_mod, "_rewrite_line", partial)
+    with _pytest.raises(pins_mod.PinScanError) as e:
+        pins_mod.set_version(root, "0.1.32", digests=_D)
+    assert "did not reach every pin" in str(e.value)
+    for rel, text in before.items():
+        assert (root / rel).read_text() == text, f"{rel} was left modified"

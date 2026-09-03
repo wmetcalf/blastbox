@@ -391,7 +391,11 @@ _BOUND_OPS = ("<=", "<", "!=")
 # Anchors the rewrite to the blastbox requirement itself. `line.find(specifier)`
 # does not: given `["other==0.1.27", "blastbox==0.1.27"]` it finds the FIRST
 # occurrence and rewrites somebody else's dependency, silently.
-_REQ_NAME = r"(?i:blastbox)(?:\[[A-Za-z0-9,._\-]+\])?"
+# The lookbehind is the same boundary `_REQ_RE` uses, and it is load-bearing:
+# without it `blastbox` matches the SUFFIX of `not-blastbox`, so a continued
+# install listing an unrelated distribution first had that one rewritten -- and
+# the search stopped there, leaving the real pin stale.
+_REQ_NAME = r"(?<![\w.\-])(?i:blastbox)(?:\[[A-Za-z0-9,._\-]+\])?"
 
 
 _OP_RE = re.compile(r"^(==|>=|<=|~=|!=|<|>)\s*(.*)$")
@@ -638,6 +642,11 @@ def set_version(
             lines = _replace_hashes(lines, file_pins, digests, rel)
         staged[path] = "".join(lines)
 
+    # Keep the originals: the verification below runs against the files on
+    # disk, so a failure at that point has already modified them. Restoring is
+    # what makes "nothing is written unless every pin moved" true at the end of
+    # the operation and not just at the start of it.
+    original = {path: path.read_text(encoding="utf-8") for path in staged}
     for path, text in staged.items():
         path.write_text(text, encoding="utf-8")
 
@@ -650,11 +659,13 @@ def set_version(
     wanted = _normalise_version(version)
     stale = {v: p for v, p in groups.items() if _normalise_version(v) != wanted}
     if stale:
+        for path, text in original.items():
+            path.write_text(text, encoding="utf-8")
         raise PinScanError(
             f"{root}: after setting {version}, {sum(len(p) for p in stale.values())} "
             f"pin(s) still resolve to {sorted(stale)}: "
             f"{[f'{q.path}:{q.line}' for ps in stale.values() for q in ps]}. "
-            "The rewrite did not reach every pin."
+            "The rewrite did not reach every pin. Every file has been restored."
         )
     return sorted(str(q) for q in staged)
 
