@@ -394,9 +394,27 @@ _BOUND_OPS = ("<=", "<", "!=")
 _REQ_NAME = r"(?i:blastbox)(?:\[[A-Za-z0-9,._\-]+\])?"
 
 
+_OP_RE = re.compile(r"^(==|>=|<=|~=|!=|<|>)\s*(.*)$")
+
+
 def _spec_pattern(spec: str) -> str:
-    """A whitespace-tolerant pattern for one specifier as written in a file."""
-    return r"\s*,\s*".join(re.escape(part.strip()) for part in spec.split(","))
+    """A whitespace-tolerant pattern for one specifier as written in a file.
+
+    `scan` stores specifiers with whitespace stripped, so the pattern has to
+    tolerate what the FILE may contain: spaces around the commas and between an
+    operator and its version. Escaping the part whole matched `>=0.1.27` but
+    not the equally valid `>= 0.1.27`, and the caller then refused a line it
+    could have rewritten.
+    """
+    parts = []
+    for part in spec.split(","):
+        stripped = part.strip()
+        m = _OP_RE.match(stripped)
+        parts.append(
+            re.escape(m.group(1)) + r"\s*" + re.escape(m.group(2)) if m
+            else re.escape(stripped)
+        )
+    return r"\s*,\s*".join(parts)
 
 
 def _rewrite_specifier(spec: str, version: str) -> str:
@@ -495,6 +513,18 @@ def set_version(
     leaves a repo pinned to two versions -- exactly the drift this module
     reports -- so the work is staged in memory and written only at the end.
     """
+    # `v0.1.30` is how the tag is spelled, and callers paste tags. Accepting it
+    # verbatim wrote the `v` into every pin and then failed verification against
+    # the scanner, which strips it -- a bump that damaged the repo and reported
+    # failure. Strip it once, here, so what is written and what is verified are
+    # the same string.
+    version = version.strip().lstrip("vV")
+    if not re.match(r"^\d+(\.\d+)*", version):
+        raise PinScanError(
+            f"{version!r} does not look like a version. Pass it as 0.1.30, not "
+            "as a tag or a specifier."
+        )
+
     pins = scan(root)
     if not pins:
         raise PinScanError(f"{root}: no blastbox pins found; nothing to set")

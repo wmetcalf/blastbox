@@ -745,3 +745,41 @@ def test_a_quoted_dockerfile_arg_default_is_rewritten(tmp_path):
     )
     set_version(root, "0.1.30", digests=_D)
     assert 'ARG BLASTBOX_VERSION="0.1.30"' in (root / "Dockerfile.worker").read_text()
+
+
+def test_a_tag_style_version_is_accepted_and_written_without_the_v(tmp_path):
+    """Callers paste tags. `v0.1.30` must not end up inside the pins.
+
+    Written verbatim it produced `>=v0.1.30` and then failed verification
+    against the scanner, which strips the prefix -- a bump that damaged the
+    repo and reported failure.
+    """
+    from blastbox.host.pins import disagreements, scan, set_version
+
+    root = _consumer(tmp_path, lock=False)
+    set_version(root, "v0.1.30", digests=_D)
+    assert '"blastbox>=0.1.30,<0.2"' in (root / "pyproject.toml").read_text()
+    assert sorted(disagreements(scan(root))) == ["0.1.30"]
+
+
+def test_a_specifier_with_spaces_is_rewritten_not_refused(tmp_path):
+    """`scan` strips whitespace; the FILE may contain it."""
+    from blastbox.host.pins import set_version
+
+    root = _consumer(tmp_path, lock=False)
+    (root / "pyproject.toml").write_text(
+        '[project]\nname = "x"\ndependencies = ["blastbox >= 0.1.27, <0.2"]\n'
+    )
+    set_version(root, "0.1.30", digests=_D)
+    assert "0.1.30" in (root / "pyproject.toml").read_text()
+    assert "0.1.27" not in (root / "pyproject.toml").read_text()
+
+
+def test_a_nonsense_version_is_refused(tmp_path):
+    import pytest as _pytest
+
+    from blastbox.host.pins import PinScanError, set_version
+
+    root = _consumer(tmp_path, lock=False)
+    with _pytest.raises(PinScanError):
+        set_version(root, ">=0.1.30", digests=_D)
