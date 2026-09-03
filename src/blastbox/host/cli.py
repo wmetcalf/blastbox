@@ -1060,7 +1060,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     bip = sub.add_parser(
         "build-images",
-        help="build an engine's declared image chain, each image stamped and verified",
+        help="check an engine's declared image chain and print the resolved plan "
+             "(--dry-run today; execution not yet wired)",
     )
     bip.add_argument("repo", help="path to the consumer repo (it declares blastbox-images.toml)")
     bip.add_argument("--tag", required=True, help="tag to build the whole chain under")
@@ -1127,7 +1128,7 @@ def _build_images_cmd(args: argparse.Namespace) -> int:
     had drifted from the others in a way that silently produced a wrong image.
     """
     from blastbox.host.images import (  # noqa: PLC0415
-        PlanError, describe, load_plan, missing_dockerfiles,
+        PlanError, arg_problems, describe, load_plan, missing_dockerfiles,
     )
 
     root = Path(args.repo).resolve()
@@ -1149,12 +1150,20 @@ def _build_images_cmd(args: argparse.Namespace) -> int:
             print(f"  {m}")
         return 2
 
+    # The check this module exists for: docker silently ignores a --build-arg the
+    # Dockerfile does not declare, so a wrong base_arg means the build resolves
+    # its own default while the stamp claims the pinned base.
+    problems = arg_problems(plan)
+    if problems:
+        print(f"{len(problems)} image(s) declare a base_arg that does not select their base:")
+        for p_ in problems:
+            print(f"  {p_}")
+        return 2
+
     print(describe(plan, args.tag))
-    if args.dry_run:
-        return 0
     print()
-    print("build execution is not wired yet -- run the engine's build script.")
-    print("The plan above is what it must do; --dry-run is the contract.")
+    print("execution is not wired yet -- run the engine's build script. The plan")
+    print("above is what it must do, and this command checks that it CAN.")
     return 0
 
 

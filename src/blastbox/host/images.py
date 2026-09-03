@@ -64,7 +64,9 @@ SPEC_NAME = "blastbox-images.toml"
 # ext4 file populated with `mke2fs -d` (Firecracker boots it). Nothing else.
 ROOTFS_KINDS = frozenset({"dir", "ext4"})
 
-_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$", re.IGNORECASE)
+# Lowercase only: docker repository names are, so `MyImage` would pass here and
+# fail at tag time instead.
+_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 
 
 class PlanError(RuntimeError):
@@ -110,7 +112,10 @@ class RootfsSpec:
         Destinations are per-host (a FC dir under $HOME on one node, /var/lib on
         another), so they are written as variables rather than baked in.
         """
-        return os.path.expandvars(self.dest) if env is None else _expand(self.dest, env)
+        # Always the SAME expander: os.path.expandvars does not understand
+        # `${VAR:-default}`, so falling back to it made default handling depend
+        # on whether the caller happened to pass an env.
+        return _expand(self.dest, dict(os.environ) if env is None else env)
 
 
 def _expand(text: str, env: dict[str, str]) -> str:
@@ -130,9 +135,15 @@ def _expand(text: str, env: dict[str, str]) -> str:
         name = braced or bare
         if name is None:
             return m.group(0)
-        if name in env:
-            return env[name]
-        return default if default is not None else m.group(0)
+        value = env.get(name)
+        if value:
+            return value
+        # An EMPTY variable takes the default, as `${VAR:-x}` does in the shell.
+        # A compose env routinely carries `TITANARUM_FC_DIR=` for an unset knob,
+        # and treating that as "set" resolves the path to a hole.
+        if default is not None:
+            return default
+        return value if value is not None else m.group(0)
 
     return re.sub(r"\$\{(\w+)(?::-([^}]*))?\}|\$(\w+)", sub, text)
 
@@ -205,6 +216,17 @@ def load_plan(root: Path | str) -> Plan:
             build_args=args,
             internal=base in seen,
         )
+        # A base naming an image declared LATER is almost certainly a mistake,
+        # and treating it as upstream means docker tries to pull it from a
+        # registry -- failing with "pull access denied" for an image this very
+        # plan builds. Refuse and say so.
+        forward = {str(x.get("name") or "").strip() for x in raw_images[i + 1:]}
+        if base in forward:
+            raise PlanError(
+                f"{path}: image {name!r} is based on {base!r}, which this plan "
+                "declares LATER. A base must be built before it is used; "
+                "reorder them."
+            )
         seen[name] = spec
         images.append(spec)
 
@@ -227,14 +249,22 @@ def load_plan(root: Path | str) -> Plan:
         if not dest:
             raise PlanError(f"{path}: [[rootfs]] #{i + 1} declares no dest")
         size = item.get("size_mib")
-        if kind == "ext4" and size is not None and int(size) <= 0:
-            raise PlanError(f"{path}: [[rootfs]] #{i + 1} size_mib must be positive")
+        if size is not None:
+            try:
+                size = int(size)
+            except (TypeError, ValueError) as exc:
+                raise PlanError(
+                    f"{path}: [[rootfs]] #{i + 1} size_mib must be a whole number of "
+                    f"MiB, got {item.get('size_mib')!r}"
+                ) from exc
+            if size <= 0:
+                raise PlanError(f"{path}: [[rootfs]] #{i + 1} size_mib must be positive")
         rootfs.append(
             RootfsSpec(
                 kind=kind,
                 image=image,
                 dest=dest,
-                size_mib=int(size) if size is not None else None,
+                size_mib=size,
                 requires=tuple(str(r) for r in (item.get("requires") or ())),
             )
         )
@@ -281,17 +311,57 @@ def missing_dockerfiles(plan: Plan, env: dict[str, str] | None = None) -> list[s
     return out
 
 
-def build_command(spec: ImageSpec, tag: str, stamp_flags: list[str]) -> list[str]:
+def arg_problems(plan: Plan, env: dict[str, str] | None = None) -> list[str]:
+    """Images whose declared ``base_arg`` does not actually select their base.
+
+    Checked in the DRY RUN, because this is the failure the whole module exists
+    for: docker silently ignores a --build-arg the Dockerfile does not declare,
+    so the build resolves its own default while the stamp claims the pinned
+    base. Reporting it before a build beats discovering it in the artifact.
+    """
+    from blastbox.host.stamp import StampError, assert_arg_selects_base  # noqa: PLC0415
+
+    out: list[str] = []
+    for spec in plan.images:
+        path = dockerfile_path(plan, spec, env)
+        if not path.is_file():
+            continue
+        try:
+            assert_arg_selects_base(path, spec.base_arg)
+        except StampError as exc:
+            out.append(f"{spec.name}: {exc}")
+    return out
+
+
+def build_command(
+    spec: ImageSpec,
+    tag: str,
+    stamp_flags: list[str],
+    base_ref: str | None = None,
+    env: dict[str, str] | None = None,
+) -> list[str]:
     """The `docker build` argv for one image.
+
+    Passes the base through ``spec.base_arg`` when ``base_ref`` is given, unless
+    ``stamp_flags`` already carries it -- `blastbox stamp` emits that build-arg
+    itself, and passing it twice lets the two disagree. Without either, the plan
+    would claim a pinned base while the Dockerfile fell back to its own default.
+
+    The context is EXPANDED: `$BLASTBOX_SRC` handed to docker literally is a
+    directory named `$BLASTBOX_SRC`, which does not exist.
 
     Returned as a LIST, never a string: a label value containing a space would
     word-split into loose docker arguments, and the failure surfaces as docker's
     usage message rather than anything about the stamp.
     """
     argv = ["docker", "build", "-f", spec.dockerfile, *stamp_flags]
+    already = any(f.startswith(f"{spec.base_arg}=") for f in stamp_flags)
+    if base_ref and not already:
+        argv += ["--build-arg", f"{spec.base_arg}={base_ref}"]
     for key, value in sorted(spec.build_args.items()):
         argv += ["--build-arg", f"{key}={value}"]
-    argv += ["-t", spec.tagged(tag), spec.context]
+    context = _expand(spec.context, dict(os.environ) if env is None else env)
+    argv += ["-t", spec.tagged(tag), context]
     return argv
 
 

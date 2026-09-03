@@ -79,18 +79,17 @@ def test_the_chain_pins_to_the_tag_being_built(tmp_path: Path) -> None:
     assert refs["titanarum-fc-worker"] == "titanarum-cold-worker:t9"
 
 
-def test_a_base_that_is_neither_upstream_nor_earlier_is_still_accepted_as_upstream(
-    tmp_path: Path,
-) -> None:
-    """Only a name declared EARLIER counts as internal.
+def test_a_forward_reference_is_refused(tmp_path: Path) -> None:
+    """A base naming an image declared LATER is a mistake, not an upstream ref.
 
-    Forward references would let the chain claim to build on something that does
-    not exist yet, so a name appearing later is treated as an upstream
-    reference and pulled -- where it fails loudly and immediately.
+    Treating it as upstream makes docker try to pull an image this very plan
+    builds, failing with "pull access denied" -- a message that sends you
+    looking at registry credentials.
     """
     text = TITANARUM.replace('base = "titanarum-base"\n', 'base = "titanarum-fc-worker"\n', 1)
-    plan = load_plan(_plan(tmp_path, text))
-    assert plan.image("titanarum-cold-worker").internal is False
+    with pytest.raises(PlanError) as e:
+        load_plan(_plan(tmp_path, text))
+    assert "declares LATER" in str(e.value)
 
 
 def test_an_image_with_no_base_is_refused(tmp_path: Path) -> None:
@@ -236,3 +235,86 @@ context = "$OTHER_SRC"
     assert missing_dockerfiles(plan, env) == []
     # ...and against the plan root alone it is correctly reported missing.
     assert missing_dockerfiles(plan, {}) != []
+
+
+def test_an_uppercase_image_name_is_refused(tmp_path: Path) -> None:
+    """Docker repository names are lowercase; this would fail at tag time."""
+    text = TITANARUM.replace('name = "titanarum-base"', 'name = "Titanarum-Base"', 1)
+    with pytest.raises(PlanError) as e:
+        load_plan(_plan(tmp_path, text))
+    assert "no usable name" in str(e.value)
+
+
+def test_an_empty_variable_takes_the_default(tmp_path: Path) -> None:
+    """`${VAR:-x}` with VAR="" selects x, as the shell does.
+
+    A compose env routinely carries `TITANARUM_FC_DIR=` for an unset knob, and
+    treating that as "set" resolves the destination to a hole.
+    """
+    text = TITANARUM.replace(
+        'dest = "$TITANARUM_FC_DIR/titanarum-rootfs.ext4"',
+        'dest = "${TITANARUM_FC_DIR:-/var/lib/titan-fc}/titanarum-rootfs.ext4"',
+    )
+    plan = load_plan(_plan(tmp_path, text))
+    assert plan.rootfs[0].resolved_dest({"TITANARUM_FC_DIR": ""}) == (
+        "/var/lib/titan-fc/titanarum-rootfs.ext4"
+    )
+
+
+def test_a_nonsense_rootfs_size_is_a_plan_error(tmp_path: Path) -> None:
+    """`"3GiB"` must refuse with a reason, not raise ValueError from int()."""
+    text = TITANARUM.replace("size_mib = 3072", 'size_mib = "3GiB"')
+    with pytest.raises(PlanError) as e:
+        load_plan(_plan(tmp_path, text))
+    assert "whole number of MiB" in str(e.value)
+
+
+def test_the_build_command_passes_the_base_it_claims_to_pin(tmp_path: Path) -> None:
+    """Otherwise the plan says pinned and the Dockerfile uses its own default."""
+    plan = load_plan(_plan(tmp_path, TITANARUM))
+    argv = build_command(plan.image("titanarum-cold-worker"), "t9", [], "titanarum-base:t9")
+    assert "--build-arg" in argv
+    assert "BASE_IMAGE=titanarum-base:t9" in argv
+
+
+def test_the_base_is_not_passed_twice_when_stamp_already_carries_it(tmp_path: Path) -> None:
+    """`blastbox stamp` emits that build-arg itself; two copies can disagree."""
+    plan = load_plan(_plan(tmp_path, TITANARUM))
+    argv = build_command(
+        plan.image("titanarum-cold-worker"), "t9",
+        ["--build-arg", "BASE_IMAGE=titanarum-base@sha256:" + "a" * 64],
+        "titanarum-base:t9",
+    )
+    assert sum(1 for a in argv if a.startswith("BASE_IMAGE=")) == 1
+    assert "BASE_IMAGE=titanarum-base:t9" not in argv
+
+
+def test_the_build_context_is_expanded(tmp_path: Path) -> None:
+    """`$BLASTBOX_SRC` handed to docker literally is a directory that does not exist."""
+    text = TITANARUM.replace(
+        'dockerfile = "deploy/firecracker/Dockerfile.titanarum"',
+        'dockerfile = "deploy/firecracker/Dockerfile.titanarum"\ncontext = "$OTHER_SRC"',
+    )
+    plan = load_plan(_plan(tmp_path, text))
+    argv = build_command(
+        plan.image("titanarum-fc-worker"), "t9", [], None, {"OTHER_SRC": "/srv/bb"}
+    )
+    assert argv[-1] == "/srv/bb"
+
+
+def test_the_default_form_works_without_an_explicit_env(tmp_path: Path, monkeypatch) -> None:
+    """`os.path.expandvars` does not understand `${VAR:-default}`.
+
+    Falling back to it made default handling depend on whether the caller
+    happened to pass an env -- so `describe()` resolved a destination that
+    `resolved_dest()` left with a hole in it.
+    """
+    text = TITANARUM.replace(
+        'dest = "$TITANARUM_FC_DIR/titanarum-rootfs.ext4"',
+        'dest = "${TITANARUM_FC_DIR:-/var/lib/titan-fc}/titanarum-rootfs.ext4"',
+    )
+    plan = load_plan(_plan(tmp_path, text))
+    monkeypatch.delenv("TITANARUM_FC_DIR", raising=False)
+    assert plan.rootfs[0].resolved_dest() == "/var/lib/titan-fc/titanarum-rootfs.ext4"
+    monkeypatch.setenv("TITANARUM_FC_DIR", "/srv/fc")
+    assert plan.rootfs[0].resolved_dest() == "/srv/fc/titanarum-rootfs.ext4"
