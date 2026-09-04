@@ -150,6 +150,11 @@ class RootfsSpec:
         return _expand(self.dest, dict(os.environ) if env is None else env)
 
 
+# Enough for a default holding a variable that itself holds one. Deeper than
+# that is not a path an operator writes; it is a loop.
+_EXPAND_PASSES = 8
+
+
 def _expand(text: str, env: dict[str, str]) -> str:
     """`$VAR`, `${VAR}` and `${VAR:-default}`.
 
@@ -182,7 +187,20 @@ def _expand(text: str, env: dict[str, str]) -> str:
             return default
         return value if value is not None else m.group(0)
 
-    return re.sub(r"\$\{(\w+)(?::-([^}]*))?\}|\$(\w+)", sub, text)
+    # Applied REPEATEDLY, because a default can itself hold a variable:
+    # `${TITANARUM_FC_DIR:-$HOME/titanarum-bb-fc}` is ordinary shell and is what
+    # this engine's compose files and its old export script already wrote. One
+    # pass substituted the default verbatim and left `$HOME` in the result,
+    # which then read as an unresolved destination and refused a good plan.
+    #
+    # Bounded, and it stops as soon as nothing changes: an env mapping a name
+    # back to itself (`A=$A`) would otherwise spin forever.
+    for _ in range(_EXPAND_PASSES):
+        expanded = re.sub(r"\$\{(\w+)(?::-([^}]*))?\}|\$(\w+)", sub, text)
+        if expanded == text:
+            return expanded
+        text = expanded
+    return text
 
 
 @dataclass(frozen=True)

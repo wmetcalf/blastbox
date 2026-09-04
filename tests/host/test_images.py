@@ -765,3 +765,38 @@ def test_an_unresolved_build_arg_is_marked_in_the_dry_run(tmp_path: Path) -> Non
     # or fail for that instead.
     arg_line = next(ln for ln in ok.splitlines() if "BLASTBOX_VERSION" in ln)
     assert "BLASTBOX_VERSION=0.1.34" in arg_line and "UNRESOLVED" not in arg_line
+
+
+def test_a_default_may_itself_contain_a_variable(tmp_path: Path) -> None:
+    """`${TITANARUM_FC_DIR:-$HOME/titanarum-bb-fc}` is ordinary shell, and it is
+    what the engine's compose files and its old export script already wrote.
+
+    One substitution pass put the default in verbatim and left `$HOME` in the
+    result, which then read as an unresolved destination and refused a perfectly
+    good plan.
+    """
+    text = TITANARUM.replace(
+        'dest = "$TITANARUM_FC_DIR/titanarum-rootfs.ext4"',
+        'dest = "${TITANARUM_FC_DIR:-$HOME/titanarum-bb-fc}/titanarum-rootfs.ext4"',
+    )
+    plan = load_plan(_plan(tmp_path, text))
+    rf = next(r for r in plan.rootfs if r.kind == "ext4")
+    assert rf.resolved_dest({"HOME": "/home/coz"}) == (
+        "/home/coz/titanarum-bb-fc/titanarum-rootfs.ext4"
+    )
+    # and the variable still wins when it is set
+    assert rf.resolved_dest({"HOME": "/home/coz", "TITANARUM_FC_DIR": "/srv/fc"}) == (
+        "/srv/fc/titanarum-rootfs.ext4"
+    )
+
+
+def test_expansion_terminates_on_a_self_referential_variable(tmp_path: Path) -> None:
+    """`A=$A` maps a name back to itself. Repeating until nothing changes needs
+    a bound, or the plan never loads."""
+    text = TITANARUM.replace(
+        'dest = "$TITANARUM_FC_DIR/titanarum-rootfs.ext4"',
+        'dest = "$LOOP/titanarum-rootfs.ext4"',
+    )
+    plan = load_plan(_plan(tmp_path, text))
+    rf = next(r for r in plan.rootfs if r.kind == "ext4")
+    assert rf.resolved_dest({"LOOP": "$LOOP"}) == "$LOOP/titanarum-rootfs.ext4"
