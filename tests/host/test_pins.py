@@ -15,7 +15,7 @@ def _repo(tmp_path, files: dict[str, str]):
     return tmp_path
 
 
-PYPROJECT = '''
+PYPROJECT = """
     [project]
     name = "consumer"
     version = "0.1.0"
@@ -24,22 +24,25 @@ PYPROJECT = '''
     ]
     [project.optional-dependencies]
     host = ["blastbox[host,s3]>=0.1.27,<0.2"]
-'''
+"""
 
 
 def test_finds_pins_across_every_install_path(tmp_path):
-    root = _repo(tmp_path, {
-        "pyproject.toml": PYPROJECT,
-        "deploy/docker/Dockerfile.worker": '''
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": PYPROJECT,
+            "deploy/docker/Dockerfile.worker": """
             FROM python:3.12
             ARG BLASTBOX_VERSION=0.1.27
             RUN pip install --no-cache-dir "blastbox==${BLASTBOX_VERSION}"
-        ''',
-        "deploy/requirements.lock": '''
+        """,
+            "deploy/requirements.lock": """
             blastbox==0.1.27 \\
                 --hash=sha256:abc
-        ''',
-    })
+        """,
+        },
+    )
     kinds = sorted(p.kind for p in scan(root))
     assert kinds == ["dockerfile-arg", "lock", "pyproject", "pyproject"]
     assert {p.floor for p in scan(root)} == {"0.1.27"}
@@ -52,15 +55,18 @@ def test_a_commented_out_install_line_is_not_a_pin(tmp_path):
     survives every other filter -- only stripping the comment excludes it. That
     is the exact shape that made a naive grep report phantom pins.
     """
-    root = _repo(tmp_path, {
-        "pyproject.toml": PYPROJECT,
-        "deploy/docker/Dockerfile.worker": """
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": PYPROJECT,
+            "deploy/docker/Dockerfile.worker": """
             FROM python:3.12
             # was: pip install "blastbox==0.1.9" before the lock existed
             ARG BLASTBOX_VERSION=0.1.27
             RUN pip install "blastbox==${BLASTBOX_VERSION}"
         """,
-    })
+        },
+    )
     assert {p.floor for p in scan(root)} == {"0.1.27"}, [
         (p.line, p.raw) for p in scan(root) if p.floor != "0.1.27"
     ]
@@ -72,14 +78,17 @@ def test_a_specifier_outside_an_install_line_is_not_a_pin(tmp_path):
     Uncommented, so comment-stripping cannot save it; it names blastbox with a
     specifier but installs nothing.
     """
-    root = _repo(tmp_path, {
-        "pyproject.toml": PYPROJECT,
-        "deploy/docker/Dockerfile.host": """
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": PYPROJECT,
+            "deploy/docker/Dockerfile.host": """
             FROM python:3.12
             ENV BLASTBOX_NOTE=blastbox>=0.1.9
             LABEL requires="blastbox>=0.1.9"
         """,
-    })
+        },
+    )
     assert {p.floor for p in scan(root)} == {"0.1.27"}, [
         (p.line, p.raw) for p in scan(root) if p.floor != "0.1.27"
     ]
@@ -90,11 +99,14 @@ def test_lockfiles_under_docs_and_tests_are_ignored(tmp_path):
 
     A fixture lock inside tests/ is a fixture, not this repo's install path.
     """
-    root = _repo(tmp_path, {
-        "pyproject.toml": PYPROJECT,
-        "tests/fixtures/requirements.lock": "blastbox==0.1.9 \\\n    --hash=sha256:abc\n",
-        "docs/examples/requirements.lock": "blastbox==0.1.5 \\\n    --hash=sha256:def\n",
-    })
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": PYPROJECT,
+            "tests/fixtures/requirements.lock": "blastbox==0.1.9 \\\n    --hash=sha256:abc\n",
+            "docs/examples/requirements.lock": "blastbox==0.1.5 \\\n    --hash=sha256:def\n",
+        },
+    )
     assert {p.floor for p in scan(root)} == {"0.1.27"}, [
         (p.path, p.raw) for p in scan(root) if p.floor != "0.1.27"
     ]
@@ -102,35 +114,43 @@ def test_lockfiles_under_docs_and_tests_are_ignored(tmp_path):
 
 def test_drift_between_install_paths_is_reported(tmp_path):
     """The real shape: pyproject moved, the worker Dockerfile did not."""
-    root = _repo(tmp_path, {
-        "pyproject.toml": PYPROJECT,
-        "deploy/docker/Dockerfile.worker": '''
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": PYPROJECT,
+            "deploy/docker/Dockerfile.worker": """
             FROM python:3.12
             ARG BLASTBOX_VERSION=0.1.17
             RUN pip install "blastbox==${BLASTBOX_VERSION}"
-        ''',
-    })
+        """,
+        },
+    )
     groups = disagreements(scan(root))
     assert sorted(groups) == ["0.1.17", "0.1.27"]
 
 
 def test_a_mention_without_an_install_is_not_a_pin(tmp_path):
     """COPY/ENV naming blastbox must not count; only an install line does."""
-    root = _repo(tmp_path, {
-        "pyproject.toml": PYPROJECT,
-        "deploy/docker/Dockerfile.host": '''
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": PYPROJECT,
+            "deploy/docker/Dockerfile.host": """
             FROM python:3.12
             ENV BLASTBOX_BLOB_URL=s3://blastbox/x
             COPY blastbox-0.1.9-py3-none-any.whl /tmp/
-        ''',
-    })
+        """,
+        },
+    )
     assert [p.kind for p in scan(root)] == ["pyproject", "pyproject"]
 
 
 def test_extras_do_not_truncate_line_attribution(tmp_path):
     """`req.split(",")[0]` truncated `blastbox[host,s3]` to `blastbox[host`."""
-    root = _repo(tmp_path, {
-        "pyproject.toml": '''
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": """
             [project]
             name = "c"
             version = "0.1.0"
@@ -138,75 +158,91 @@ def test_extras_do_not_truncate_line_attribution(tmp_path):
             [project.optional-dependencies]
             a = ["blastbox[host,s3]>=0.1.27,<0.2"]
             b = ["blastbox[host,s3]>=0.1.27,<0.2"]
-        '''
-    })
+        """
+        },
+    )
     lines = sorted(p.line for p in scan(root))
-    assert lines == [5, 7, 8], lines          # distinct, real lines
+    assert lines == [5, 7, 8], lines  # distinct, real lines
     assert all(p.line != 0 for p in scan(root))
 
 
 def test_environment_markers_do_not_leak_into_the_version(tmp_path):
-    root = _repo(tmp_path, {
-        "pyproject.toml": '''
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": """
             [project]
             name = "c"
             version = "0.1.0"
             dependencies = ["blastbox>=0.1.27; python_version >= '3.12'"]
-        '''
-    })
+        """
+        },
+    )
     assert {p.floor for p in scan(root)} == {"0.1.27"}
     assert not [p for p in scan(root) if p.kind.startswith("dockerfile")]
 
 
 def test_compatible_release_pins_count_as_drift(tmp_path):
     """`~=` was matched but yielded no floor, so it vanished from drift groups."""
-    root = _repo(tmp_path, {
-        "pyproject.toml": '''
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": """
             [project]
             name = "c"
             version = "0.1.0"
             dependencies = ["blastbox~=0.1.17"]
-        ''',
-        "deploy/docker/Dockerfile.w": '''
+        """,
+            "deploy/docker/Dockerfile.w": """
             FROM p
             RUN pip install "blastbox==0.1.27"
-        ''',
-    })
+        """,
+        },
+    )
     assert sorted(disagreements(scan(root))) == ["0.1.17", "0.1.27"]
 
 
 def test_a_wrapped_run_install_is_one_logical_line(tmp_path):
-    root = _repo(tmp_path, {
-        "pyproject.toml": PYPROJECT,
-        "deploy/docker/Dockerfile.w": '''
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": PYPROJECT,
+            "deploy/docker/Dockerfile.w": """
             FROM p
             RUN pip install --no-cache-dir \\
                   "blastbox[host]>=0.1.17,<0.2" \\
              && echo done
-        ''',
-    })
+        """,
+        },
+    )
     assert sorted(disagreements(scan(root))) == ["0.1.17", "0.1.27"]
 
 
 def test_an_unused_ARG_is_not_a_pin(tmp_path):
     """Documented contract: the ARG is a pin only if an install consumes it."""
-    root = _repo(tmp_path, {
-        "pyproject.toml": PYPROJECT,
-        "deploy/docker/Dockerfile.w": '''
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": PYPROJECT,
+            "deploy/docker/Dockerfile.w": """
             FROM p
             ARG BLASTBOX_VERSION=0.1.9
             RUN echo "$BLASTBOX_VERSION" > /etc/note
-        ''',
-    })
+        """,
+        },
+    )
     assert {p.floor for p in scan(root)} == {"0.1.27"}
     assert not [p for p in scan(root) if p.kind.startswith("dockerfile")]
 
 
 def test_lock_pins_with_extras_are_found(tmp_path):
-    root = _repo(tmp_path, {
-        "pyproject.toml": PYPROJECT,
-        "deploy/requirements.lock": 'blastbox[host]==0.1.17 \\\n    --hash=sha256:abc\n',
-    })
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": PYPROJECT,
+            "deploy/requirements.lock": "blastbox[host]==0.1.17 \\\n    --hash=sha256:abc\n",
+        },
+    )
     assert sorted(disagreements(scan(root))) == ["0.1.17", "0.1.27"]
 
 
@@ -223,13 +259,16 @@ def test_a_malformed_pyproject_raises_instead_of_reporting_clean(tmp_path):
 
 def test_echoing_a_requirement_is_not_an_install(tmp_path):
     """`pip`/`install` as bare words is not an install command."""
-    root = _repo(tmp_path, {
-        "pyproject.toml": PYPROJECT,
-        "deploy/docker/Dockerfile.w": '''
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": PYPROJECT,
+            "deploy/docker/Dockerfile.w": """
             FROM p
             RUN echo "to install run: blastbox>=0.1.9" > /etc/readme
-        ''',
-    })
+        """,
+        },
+    )
     assert {p.floor for p in scan(root)} == {"0.1.27"}
     assert not [p for p in scan(root) if p.kind.startswith("dockerfile")]
 
@@ -240,15 +279,18 @@ def test_a_bare_name_does_not_attribute_to_the_description(tmp_path):
     A bare-name needle matched the description line and reported pyproject:8
     instead of the dependency at :12.
     """
-    root = _repo(tmp_path, {
-        "pyproject.toml": '''
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": """
             [project]
             name = "titanarum"
             version = "0.1.0"
             description = "PDF forensic engine for blastbox"
             dependencies = ["blastbox>=0.1.27,<0.2"]
-        '''
-    })
+        """
+        },
+    )
     pins = scan(root)
     assert [p.line for p in pins] == [6], [(p.line, p.raw) for p in pins]
 
@@ -259,61 +301,73 @@ def test_an_upper_bound_is_not_a_floor(tmp_path):
     Specifier order is not meaningful, so a leading upper bound must not be
     read as the version.
     """
-    root = _repo(tmp_path, {
-        "pyproject.toml": '''
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": """
             [project]
             name = "c"
             version = "0.1.0"
             dependencies = ["blastbox<=0.2,>=0.1.27"]
-        '''
-    })
+        """
+        },
+    )
     assert [p.floor for p in scan(root)] == ["0.1.27"]
 
 
 def test_only_an_upper_bound_yields_no_floor(tmp_path):
-    root = _repo(tmp_path, {
-        "pyproject.toml": '''
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": """
             [project]
             name = "c"
             version = "0.1.0"
             dependencies = ["blastbox<0.2"]
-        '''
-    })
+        """
+        },
+    )
     assert [p.floor for p in scan(root)] == [None]
     assert disagreements(scan(root)) == {}
 
 
 def test_distribution_name_is_case_insensitive(tmp_path):
     """PEP 508 names are case-insensitive; `Blastbox` is the same project."""
-    root = _repo(tmp_path, {
-        "pyproject.toml": '''
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": """
             [project]
             name = "c"
             version = "0.1.0"
             dependencies = ["Blastbox>=0.1.27,<0.2"]
-        ''',
-        "deploy/docker/Dockerfile.w": '''
+        """,
+            "deploy/docker/Dockerfile.w": """
             FROM p
             RUN pip install "BlastBox==0.1.17"
-        ''',
-    })
+        """,
+        },
+    )
     assert sorted(disagreements(scan(root))) == ["0.1.17", "0.1.27"]
 
 
 def test_equal_releases_spelled_differently_are_one_group(tmp_path):
     """0.1.27 and 0.1.27.0 are the same release -- grouping raw text invents drift."""
-    root = _repo(tmp_path, {
-        "pyproject.toml": '''
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": """
             [project]
             name = "c"
             version = "0.1.0"
             dependencies = ["blastbox>=0.1.27,<0.2"]
-        ''',
-        "deploy/docker/Dockerfile.w": '''
+        """,
+            "deploy/docker/Dockerfile.w": """
             FROM p
             RUN pip install "blastbox==0.1.27.0"
-        ''',
-    })
+        """,
+        },
+    )
     assert sorted(disagreements(scan(root))) == ["0.1.27"]
 
 
@@ -330,61 +384,76 @@ def test_a_directory_symlink_is_not_followed(tmp_path):
 
 
 def test_a_different_distribution_ending_in_blastbox_is_not_matched(tmp_path):
-    root = _repo(tmp_path, {
-        "pyproject.toml": PYPROJECT,
-        "deploy/docker/Dockerfile.w": '''
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": PYPROJECT,
+            "deploy/docker/Dockerfile.w": """
             FROM p
             RUN pip install "not-blastbox==0.1.1" "myblastbox==0.1.2"
-        ''',
-    })
+        """,
+        },
+    )
     assert {p.floor for p in scan(root)} == {"0.1.27"}
     assert not [p for p in scan(root) if p.kind == "dockerfile-pip"]
 
 
 def test_the_strongest_lower_bound_wins(tmp_path):
     """A set may carry several lower bounds; the first written is arbitrary."""
-    root = _repo(tmp_path, {
-        "pyproject.toml": '''
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": """
             [project]
             name = "c"
             version = "0.1.0"
             dependencies = ["blastbox>=0.1.5,>=0.1.27,<0.2"]
-        '''
-    })
+        """
+        },
+    )
     assert [p.floor for p in scan(root)] == ["0.1.27"]
 
 
 def test_pip_global_options_before_install(tmp_path):
-    root = _repo(tmp_path, {
-        "pyproject.toml": PYPROJECT,
-        "deploy/docker/Dockerfile.w": '''
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": PYPROJECT,
+            "deploy/docker/Dockerfile.w": """
             FROM p
             RUN python -m pip --isolated --no-cache-dir install "blastbox==0.1.17"
-        ''',
-    })
+        """,
+        },
+    )
     assert sorted(disagreements(scan(root))) == ["0.1.17", "0.1.27"]
 
 
 def test_every_install_on_one_logical_run_is_reported(tmp_path):
-    root = _repo(tmp_path, {
-        "pyproject.toml": PYPROJECT,
-        "deploy/docker/Dockerfile.w": '''
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": PYPROJECT,
+            "deploy/docker/Dockerfile.w": """
             FROM p
             RUN pip install "blastbox==0.1.17" \\
              && pip install "blastbox[host]==0.1.20"
-        ''',
-    })
+        """,
+        },
+    )
     assert sorted(disagreements(scan(root))) == ["0.1.17", "0.1.20", "0.1.27"]
 
 
 def test_suffix_convention_dockerfiles_are_scanned(tmp_path):
-    root = _repo(tmp_path, {
-        "pyproject.toml": PYPROJECT,
-        "deploy/worker.Dockerfile": '''
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": PYPROJECT,
+            "deploy/worker.Dockerfile": """
             FROM p
             RUN pip install "blastbox==0.1.17"
-        ''',
-    })
+        """,
+        },
+    )
     assert sorted(disagreements(scan(root))) == ["0.1.17", "0.1.27"]
 
 
@@ -394,10 +463,13 @@ def test_indented_lock_entries_are_found(tmp_path):
     NOTE the leading `#` line: _repo() runs textwrap.dedent, which would strip
     the very indentation under test if every line were indented.
     """
-    root = _repo(tmp_path, {
-        "pyproject.toml": PYPROJECT,
-        "deploy/requirements.lock": "# lock\n    blastbox==0.1.17 \\\n        --hash=sha256:abc\n",
-    })
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": PYPROJECT,
+            "deploy/requirements.lock": "# lock\n    blastbox==0.1.17 \\\n        --hash=sha256:abc\n",
+        },
+    )
     lock_pins = [p for p in scan(root) if p.kind == "lock"]
     assert [p.floor for p in lock_pins] == ["0.1.17"], lock_pins
     assert sorted(disagreements(scan(root))) == ["0.1.17", "0.1.27"]
@@ -414,7 +486,9 @@ def test_an_unreadable_directory_fails_instead_of_under_reporting(tmp_path):
     root = _repo(tmp_path, {"pyproject.toml": PYPROJECT})
     blocked = root / "deploy"
     blocked.mkdir(exist_ok=True)
-    (blocked / "Dockerfile.w").write_text('RUN pip install "blastbox==0.1.1"\n', encoding="utf-8")
+    (blocked / "Dockerfile.w").write_text(
+        'RUN pip install "blastbox==0.1.1"\n', encoding="utf-8"
+    )
     os.chmod(blocked, 0o000)
     try:
         with _pytest.raises(PinScanError):
@@ -429,23 +503,28 @@ def test_a_direct_reference_is_a_pin_not_a_silent_drop(tmp_path):
     It carries no comparison specifier, so the requirement pattern could not see
     it and it vanished — the repo then reported OK against a drifted Dockerfile.
     """
-    root = _repo(tmp_path, {
-        "pyproject.toml": '''
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": """
             [project]
             name = "c"
             version = "0.1.0"
             dependencies = ["blastbox @ git+https://example.invalid/blastbox@v0.1.30"]
-        ''',
-    })
+        """,
+        },
+    )
     pins = scan(root)
     assert len(pins) == 1, pins
     assert "git+https" in pins[0].specifier
-    assert pins[0].floor is None          # a URL is not a version; never fake one
+    assert pins[0].floor is None  # a URL is not a version; never fake one
 
 
 def test_pep735_dependency_groups_are_scanned(tmp_path):
-    root = _repo(tmp_path, {
-        "pyproject.toml": '''
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": """
             [project]
             name = "c"
             version = "0.1.0"
@@ -453,55 +532,70 @@ def test_pep735_dependency_groups_are_scanned(tmp_path):
 
             [dependency-groups]
             dev = ["blastbox>=0.1.5"]
-        ''',
-    })
+        """,
+        },
+    )
     assert sorted(disagreements(scan(root))) == ["0.1.27", "0.1.5"]
 
 
 def test_a_toml_lock_is_parsed_as_toml_not_as_requirements(tmp_path):
     """uv.lock/poetry.lock were selected then handed to a requirements regex
     that can never match TOML: read, zero pins, reported clean."""
-    root = _repo(tmp_path, {
-        "pyproject.toml": PYPROJECT,
-        "uv.lock": '''
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": PYPROJECT,
+            "uv.lock": """
             [[package]]
             name = "blastbox"
             version = "0.1.17"
-        ''',
-    })
+        """,
+        },
+    )
     assert sorted(disagreements(scan(root))) == ["0.1.17", "0.1.27"]
 
 
 def test_constraints_and_requirements_dir_are_install_paths(tmp_path):
-    root = _repo(tmp_path, {
-        "pyproject.toml": PYPROJECT,
-        "constraints.txt": "blastbox==0.1.9\n",
-        "requirements/base.txt": "blastbox==0.1.11\n",
-    })
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": PYPROJECT,
+            "constraints.txt": "blastbox==0.1.9\n",
+            "requirements/base.txt": "blastbox==0.1.11\n",
+        },
+    )
     assert sorted(disagreements(scan(root))) == ["0.1.11", "0.1.27", "0.1.9"]
 
 
 def test_constraint_files_with_range_specifiers_are_parsed(tmp_path):
     """A hashed lock pins with ==, but constraints/requirements files carry any
     specifier; matching only == skipped them silently."""
-    root = _repo(tmp_path, {
-        "pyproject.toml": PYPROJECT,
-        "constraints.txt": "blastbox>=0.1.9,<0.2\n",
-    })
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": PYPROJECT,
+            "constraints.txt": "blastbox>=0.1.9,<0.2\n",
+        },
+    )
     assert sorted(disagreements(scan(root))) == ["0.1.27", "0.1.9"]
 
 
 def test_a_direct_reference_on_a_dockerfile_install_line_is_a_pin(tmp_path):
     """A Dockerfile can install a direct reference just as a pyproject can."""
-    root = _repo(tmp_path, {
-        "pyproject.toml": PYPROJECT,
-        "deploy/docker/Dockerfile.w": '''
+    root = _repo(
+        tmp_path,
+        {
+            "pyproject.toml": PYPROJECT,
+            "deploy/docker/Dockerfile.w": """
             FROM p
             RUN pip install "blastbox @ git+https://example.invalid/b@v0.1.30"
-        ''',
-    })
+        """,
+        },
+    )
     refs = [p for p in scan(root) if p.specifier.startswith("@")]
-    assert len(refs) == 1, [(p.file if hasattr(p, "file") else p.path, p.specifier) for p in scan(root)]
+    assert len(refs) == 1, [
+        (p.file if hasattr(p, "file") else p.path, p.specifier) for p in scan(root)
+    ]
 
 
 # --- set_version -----------------------------------------------------------
@@ -589,7 +683,9 @@ def test_the_rewritten_lock_keeps_the_space_before_the_continuation(tmp_path):
     set_version(root, "0.1.30", digests=_D)
     text = (root / "deploy" / "requirements.lock").read_text()
     assert f"--hash=sha256:{_D[0]} \\\n" in text, text
-    assert f"{_D[0]}\\" not in text.replace(f"{_D[0]} \\", ""), "backslash abuts the digest"
+    assert f"{_D[0]}\\" not in text.replace(f"{_D[0]} \\", ""), (
+        "backslash abuts the digest"
+    )
     assert text.count("--hash=sha256:") == len(_D)
 
 
@@ -600,7 +696,7 @@ def test_the_lock_still_parses_as_a_requirements_file(tmp_path):
 
     root = _consumer(tmp_path)
     set_version(root, "0.1.30", digests=_D)
-    lock = (root / "deploy" / "requirements.lock")
+    lock = root / "deploy" / "requirements.lock"
     # Join continuations the way pip does, then check the requirement line.
     joined = re.sub(r"\\\n\s*", " ", lock.read_text())
     line = next(ln for ln in joined.splitlines() if ln.startswith("blastbox=="))
@@ -621,7 +717,9 @@ def test_nothing_is_written_when_one_file_cannot_be_rewritten(tmp_path, monkeypa
     from blastbox.host import pins as pins_mod
 
     root = _consumer(tmp_path)
-    before = {p: (root / p).read_text() for p in ("pyproject.toml", "Dockerfile.worker")}
+    before = {
+        p: (root / p).read_text() for p in ("pyproject.toml", "Dockerfile.worker")
+    }
 
     real = pins_mod._rewrite_line
     calls = {"n": 0}
@@ -636,7 +734,9 @@ def test_nothing_is_written_when_one_file_cannot_be_rewritten(tmp_path, monkeypa
     with _pytest.raises(pins_mod.PinScanError):
         pins_mod.set_version(root, "0.1.30", digests=_D)
     for rel, text in before.items():
-        assert (root / rel).read_text() == text, f"{rel} was written despite the failure"
+        assert (root / rel).read_text() == text, (
+            f"{rel} was written despite the failure"
+        )
 
 
 def test_an_incomplete_rewrite_is_caught_by_rescanning(tmp_path, monkeypatch):
@@ -841,9 +941,7 @@ def test_a_requirement_that_is_nowhere_in_its_logical_line_still_refuses(tmp_pat
     root = tmp_path
     (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
     (root / "Dockerfile").write_text(
-        "FROM x\nRUN pip install \\\n"
-        '        "blastbox>=0.1.19" \\\n'
-        '        "fastapi"\n'
+        'FROM x\nRUN pip install \\\n        "blastbox>=0.1.19" \\\n        "fastapi"\n'
     )
     # Make every line unmatchable, as a corrupted file would be.
     monkey = pins_mod._rewrite_line
@@ -953,7 +1051,9 @@ def test_a_package_whose_name_ends_in_blastbox_is_not_rewritten(tmp_path):
     )
     set_version(root, "0.1.32")
     text = df.read_text()
-    assert '"not-blastbox>=0.1.19"' in text, f"an unrelated package was rewritten: {text}"
+    assert '"not-blastbox>=0.1.19"' in text, (
+        f"an unrelated package was rewritten: {text}"
+    )
     assert '"blastbox>=0.1.32"' in text, text
 
 
@@ -964,7 +1064,9 @@ def test_a_failed_verification_restores_every_file(tmp_path, monkeypatch):
     from blastbox.host import pins as pins_mod
 
     root = _consumer(tmp_path, lock=False)
-    before = {p: (root / p).read_text() for p in ("pyproject.toml", "Dockerfile.worker")}
+    before = {
+        p: (root / p).read_text() for p in ("pyproject.toml", "Dockerfile.worker")
+    }
 
     # Rewrite the pyproject but not the Dockerfile, so the re-scan sees drift.
     real = pins_mod._rewrite_line
@@ -994,14 +1096,16 @@ def test_files_are_restored_when_the_verification_itself_raises(tmp_path, monkey
     from blastbox.host import pins as pins_mod
 
     root = _consumer(tmp_path, lock=False)
-    before = {p: (root / p).read_text() for p in ("pyproject.toml", "Dockerfile.worker")}
+    before = {
+        p: (root / p).read_text() for p in ("pyproject.toml", "Dockerfile.worker")
+    }
 
     real_scan = pins_mod.scan
     calls = {"n": 0}
 
     def scan_then_explode(r):
         calls["n"] += 1
-        if calls["n"] > 1:                    # the verification pass
+        if calls["n"] > 1:  # the verification pass
             raise pins_mod.PinScanError("unparseable after rewrite")
         return real_scan(r)
 
@@ -1154,7 +1258,9 @@ def test_a_rollback_restores_crlf_files_byte_for_byte(tmp_path, monkeypatch):
 
     root = tmp_path
     pyproject = root / "pyproject.toml"
-    original = b'[project]\r\nname = "x"\r\ndependencies = ["blastbox>=0.1.27,<0.2"]\r\n'
+    original = (
+        b'[project]\r\nname = "x"\r\ndependencies = ["blastbox>=0.1.27,<0.2"]\r\n'
+    )
     pyproject.write_bytes(original)
     (root / "Dockerfile.w").write_bytes(
         b"ARG BLASTBOX_VERSION=0.1.27\r\nFROM x\r\n"
@@ -1188,8 +1294,7 @@ def test_a_separator_inside_a_quoted_option_does_not_split_the_command(tmp_path)
     root = tmp_path
     (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
     (root / "Dockerfile").write_text(
-        "FROM x\n"
-        'RUN pip install --index-url "https://mirror/a|b" "blastbox==0.1.30"\n'
+        'FROM x\nRUN pip install --index-url "https://mirror/a|b" "blastbox==0.1.30"\n'
     )
     floors = sorted({p.floor for p in scan(root) if p.floor})
     assert floors == ["0.1.30"], f"the requirement was lost: {floors}"
@@ -1202,8 +1307,7 @@ def test_an_unquoted_separator_still_splits(tmp_path):
     root = tmp_path
     (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
     (root / "Dockerfile").write_text(
-        "FROM x\n"
-        'RUN pip install "blastbox==0.1.30" && echo "blastbox==0.1.19"\n'
+        'FROM x\nRUN pip install "blastbox==0.1.30" && echo "blastbox==0.1.19"\n'
     )
     floors = sorted({p.floor for p in scan(root) if p.floor})
     assert floors == ["0.1.30"], f"the echoed version leaked in: {floors}"
@@ -1243,7 +1347,7 @@ def test_a_top_level_semicolon_ends_the_install_command(tmp_path):
     root = tmp_path
     (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
     (root / "Dockerfile").write_text(
-        "FROM x\nRUN pip install \"blastbox==0.1.30\" ; echo \"blastbox==0.1.19\"\n"
+        'FROM x\nRUN pip install "blastbox==0.1.30" ; echo "blastbox==0.1.19"\n'
     )
     floors = sorted({p.floor for p in scan(root) if p.floor})
     assert floors == ["0.1.30"], f"the echoed version leaked in: {floors}"
@@ -1256,8 +1360,7 @@ def test_a_quoted_pep508_marker_is_not_split(tmp_path):
     root = tmp_path
     (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
     (root / "Dockerfile").write_text(
-        "FROM x\n"
-        'RUN pip install "blastbox>=0.1.30; python_version >= \'3.12\'"\n'
+        "FROM x\nRUN pip install \"blastbox>=0.1.30; python_version >= '3.12'\"\n"
     )
     floors = sorted({p.floor for p in scan(root) if p.floor})
     assert floors == ["0.1.30"], f"the marker broke the requirement: {floors}"
@@ -1269,7 +1372,7 @@ def test_a_background_ampersand_ends_the_command(tmp_path):
     root = tmp_path
     (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
     (root / "Dockerfile").write_text(
-        "FROM x\nRUN pip install \"blastbox==0.1.30\" & echo \"blastbox==0.1.19\"\n"
+        'FROM x\nRUN pip install "blastbox==0.1.30" & echo "blastbox==0.1.19"\n'
     )
     floors = sorted({p.floor for p in scan(root) if p.floor})
     assert floors == ["0.1.30"], f"the backgrounded command leaked in: {floors}"
@@ -1282,7 +1385,7 @@ def test_a_redirection_ampersand_is_not_a_separator(tmp_path):
     root = tmp_path
     (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
     (root / "Dockerfile").write_text(
-        "FROM x\nRUN pip install -q 2>&1 \"blastbox==0.1.30\"\n"
+        'FROM x\nRUN pip install -q 2>&1 "blastbox==0.1.30"\n'
     )
     floors = sorted({p.floor for p in scan(root) if p.floor})
     assert floors == ["0.1.30"], f"the requirement was lost: {floors}"
@@ -1295,7 +1398,7 @@ def test_a_parameter_expansion_does_not_split(tmp_path):
     root = tmp_path
     (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
     (root / "Dockerfile").write_text(
-        "FROM x\nRUN pip install --extra-index-url ${U//a|b/} \"blastbox==0.1.30\"\n"
+        'FROM x\nRUN pip install --extra-index-url ${U//a|b/} "blastbox==0.1.30"\n'
     )
     floors = sorted({p.floor for p in scan(root) if p.floor})
     assert floors == ["0.1.30"], f"the requirement was lost: {floors}"
@@ -1320,7 +1423,9 @@ def test_a_crlf_lock_keeps_crlf_in_the_regenerated_hash_block(tmp_path):
     set_version(root, "0.1.30", digests=_D)
     data = lock.read_bytes()
     assert b"0.1.30" in data
-    assert b"\n" not in data.replace(b"\r\n", b""), f"a bare LF was introduced: {data!r}"
+    assert b"\n" not in data.replace(b"\r\n", b""), (
+        f"a bare LF was introduced: {data!r}"
+    )
 
 
 def test_a_bash_combined_redirection_is_not_a_separator(tmp_path):
@@ -1330,7 +1435,7 @@ def test_a_bash_combined_redirection_is_not_a_separator(tmp_path):
     root = tmp_path
     (root / "pyproject.toml").write_text('[project]\nname = "x"\n')
     (root / "Dockerfile").write_text(
-        "FROM x\nRUN pip install &>/tmp/log \"blastbox==0.1.30\"\n"
+        'FROM x\nRUN pip install &>/tmp/log "blastbox==0.1.30"\n'
     )
     floors = sorted({p.floor for p in scan(root) if p.floor})
     assert floors == ["0.1.30"], f"the requirement was lost: {floors}"
@@ -1347,3 +1452,63 @@ def test_a_process_substitution_does_not_split(tmp_path):
     )
     floors = sorted({p.floor for p in scan(root) if p.floor})
     assert floors == ["0.1.30"], f"the requirement was lost: {floors}"
+
+
+def test_a_hash_pinned_lock_missing_a_new_dependency_is_reported(tmp_path):
+    """`pip install --require-hashes` refuses the WHOLE file over one gap.
+
+    Measured with pip 26:
+
+        ERROR: In --require-hashes mode, all requirements must have their
+        versions pinned with ==. These do not: pydantic>=2.6.0 (from blastbox)
+
+    So a release that gains a dependency turns every consumer's hash-pinned
+    lock into one that cannot install, and rewriting only the blastbox line
+    makes the bump look successful until the image build fails.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    lock = tmp_path / "deploy" / "requirements.lock"
+    lock.parent.mkdir()
+    lock.write_text(
+        "blastbox==0.1.38 \\\n    --hash=sha256:" + "a" * 64 + "\n"
+        "pydantic==2.13.5 \\\n    --hash=sha256:" + "b" * 64 + "\n"
+    )
+    gaps = missing_from_locks(tmp_path, ["pydantic>=2.6.0", "packaging>=23.0"])
+    assert list(gaps) == [str(lock)], gaps
+    assert gaps[str(lock)] == ["packaging"], gaps
+
+
+def test_a_lock_that_carries_everything_is_not_reported(tmp_path):
+    """The check must not fire on a lock that is actually complete."""
+    from blastbox.host.pins import missing_from_locks
+
+    lock = tmp_path / "requirements.lock"
+    lock.write_text(
+        "blastbox==0.1.39 \\\n    --hash=sha256:" + "a" * 64 + "\n"
+        "pydantic==2.13.5 \\\n    --hash=sha256:" + "b" * 64 + "\n"
+        "packaging==25.0 \\\n    --hash=sha256:" + "c" * 64 + "\n"
+    )
+    assert missing_from_locks(tmp_path, ["pydantic>=2.6.0", "packaging>=23.0"]) == {}
+
+
+def test_a_lock_without_hashes_is_left_alone(tmp_path):
+    """Only `--require-hashes` makes an incomplete closure fatal.
+
+    A plain requirements file lets pip resolve the rest itself, so reporting it
+    would be noise -- and noise is how a check stops being read.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    plain = tmp_path / "requirements.txt"
+    plain.write_text("blastbox==0.1.39\npydantic==2.13.5\n")
+    assert missing_from_locks(tmp_path, ["pydantic>=2.6.0", "packaging>=23.0"]) == {}
+
+
+def test_distribution_names_compare_normalised(tmp_path):
+    """A lock may spell `ruamel.yaml` as `ruamel-yaml`; they are one package."""
+    from blastbox.host.pins import missing_from_locks
+
+    lock = tmp_path / "requirements.lock"
+    lock.write_text("Ruamel-YAML==0.18.6 \\\n    --hash=sha256:" + "a" * 64 + "\n")
+    assert missing_from_locks(tmp_path, ["ruamel.yaml>=0.18"]) == {}

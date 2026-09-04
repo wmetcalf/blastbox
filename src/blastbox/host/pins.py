@@ -20,9 +20,11 @@ twelve stale pins and every one was a comment. So this reads the INSTALL PATH
 only: parsed requirements, install directives with comments stripped and
 continuations joined, and lock pins -- and never ``docs/`` or ``tests/``.
 """
+
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,11 +33,11 @@ _ARG_RE = re.compile(r'^\s*ARG\s+BLASTBOX_VERSION\s*=\s*["\']?([0-9][^"\'\s]*)["
 # A real install: `pip install`, `pip3 install`, `uv pip install`, `python -m pip install`.
 # `pip install`, `pip3 install`, `uv pip install`, and pip global options in
 # between (`python -m pip --isolated install ...`).
-_INSTALL_RE = re.compile(r'\b(?:pip[0-9.]*|uv\s+pip)\s+(?:-[^\s]+\s+)*install\b')
+_INSTALL_RE = re.compile(r"\b(?:pip[0-9.]*|uv\s+pip)\s+(?:-[^\s]+\s+)*install\b")
 # `blastbox`, optional extras, then a specifier set. Stops at a PEP 508 marker (`;`),
 # a quote, or whitespace.
 _REQ_RE = re.compile(
-    r'(?<![\w.\-])(?i:blastbox)(?P<extras>\[[a-zA-Z0-9,._\-]+\])?\s*'
+    r"(?<![\w.\-])(?i:blastbox)(?P<extras>\[[a-zA-Z0-9,._\-]+\])?\s*"
     r'(?P<spec>(?:[=<>!~]=|[<>])\s*v?[0-9][^"\';\s]*'
     r'(?:\s*,\s*(?:[=<>!~]=|[<>])\s*v?[0-9][^"\';\s]*)*)'
 )
@@ -43,10 +45,10 @@ _REQ_RE = re.compile(
 # with ==, but constraints.txt and requirements/*.txt legitimately carry any
 # specifier -- matching only == silently skipped them.
 _LOCK_RE = re.compile(
-    r'^\s*(?i:blastbox)(?:\[[a-zA-Z0-9,._\-]+\])?\s*'
-    r'((?:[=<>!~]=|[<>])\s*v?[0-9][^\s;]*(?:\s*,\s*(?:[=<>!~]=|[<>])\s*v?[0-9][^\s;]*)*)'
+    r"^\s*(?i:blastbox)(?:\[[a-zA-Z0-9,._\-]+\])?\s*"
+    r"((?:[=<>!~]=|[<>])\s*v?[0-9][^\s;]*(?:\s*,\s*(?:[=<>!~]=|[<>])\s*v?[0-9][^\s;]*)*)"
 )
-_ARG_USE_RE = re.compile(r'\$\{?BLASTBOX_VERSION\}?')
+_ARG_USE_RE = re.compile(r"\$\{?BLASTBOX_VERSION\}?")
 
 
 def _version_key(version: str) -> tuple[int, ...]:
@@ -104,7 +106,7 @@ class Pin:
 
     path: str
     line: int
-    kind: str          # pyproject | dockerfile-arg | dockerfile-pip | lock
+    kind: str  # pyproject | dockerfile-arg | dockerfile-pip | lock
     raw: str
     specifier: str
 
@@ -122,7 +124,9 @@ class Pin:
             part = part.strip()
             for op in ("==", ">=", "~="):
                 if part.startswith(op):
-                    floors.append(_normalise_version(part[len(op):].strip().lstrip("vV")))
+                    floors.append(
+                        _normalise_version(part[len(op) :].strip().lstrip("vV"))
+                    )
                     break
         if not floors:
             return None
@@ -216,8 +220,10 @@ def _scan_pyproject(path: Path) -> list[Pin]:
                 i + 1
                 for i, ln in enumerate(lines)
                 if (i + 1) not in claimed
-                and any(n and n in _strip_comment(ln).replace(" ", "") for n in
-                        (needle.replace(" ", "") for needle in needles))
+                and any(
+                    n and n in _strip_comment(ln).replace(" ", "")
+                    for n in (needle.replace(" ", "") for needle in needles)
+                )
             ),
             0,
         )
@@ -235,7 +241,9 @@ def _scan_dockerfile(path: Path) -> list[Pin]:
     logical = _logical_lines(text)
     # An ARG is only a pin if something in the file installs blastbox THROUGH it.
     arg_is_used = any(
-        _INSTALL_RE.search(line) and "blastbox" in line.lower() and _ARG_USE_RE.search(line)
+        _INSTALL_RE.search(line)
+        and "blastbox" in line.lower()
+        and _ARG_USE_RE.search(line)
         for _, line in logical
     )
 
@@ -244,7 +252,15 @@ def _scan_dockerfile(path: Path) -> list[Pin]:
         arg = _ARG_RE.match(line)
         if arg:
             if arg_is_used:
-                out.append(Pin(str(path), lineno, "dockerfile-arg", line.strip(), "==" + arg.group(1)))
+                out.append(
+                    Pin(
+                        str(path),
+                        lineno,
+                        "dockerfile-arg",
+                        line.strip(),
+                        "==" + arg.group(1),
+                    )
+                )
             continue
         if "blastbox" not in line.lower() or not _INSTALL_RE.search(line):
             continue
@@ -253,7 +269,9 @@ def _scan_dockerfile(path: Path) -> list[Pin]:
         for token in _isolate_requirements(line):
             parsed = _split_requirement(token)
             if parsed:
-                out.append(Pin(str(path), lineno, "dockerfile-pip", line.strip(), parsed[1]))
+                out.append(
+                    Pin(str(path), lineno, "dockerfile-pip", line.strip(), parsed[1])
+                )
     return out
 
 
@@ -272,8 +290,8 @@ def _split_commands(line: str) -> list[str]:
     parts: list[str] = []
     buf: list[str] = []
     quote: str | None = None
-    depth = 0          # $( … ) nesting
-    backtick = False   # ` … `
+    depth = 0  # $( … ) nesting
+    backtick = False  # ` … `
     i = 0
     while i < len(line):
         ch = line[i]
@@ -341,9 +359,12 @@ def _split_commands(line: str) -> list[str]:
         # already protected above. An UNQUOTED `;` really is a separator, so
         # treating it as one matches what the shell does rather than working
         # around a case that cannot occur.
-        if ch == "&" and (
-            (buf and buf[-1] == ">")            # `2>&1`
-            or line[i : i + 2] == "&>"          # bash `&>file`
+        if (
+            ch == "&"
+            and (
+                (buf and buf[-1] == ">")  # `2>&1`
+                or line[i : i + 2] == "&>"  # bash `&>file`
+            )
         ):
             buf.append(ch)
             i += 1
@@ -381,7 +402,7 @@ def _isolate_requirements(line: str) -> list[str]:
         m = _INSTALL_RE.search(segment)
         if not m:
             continue
-        args = segment[m.end():]
+        args = segment[m.end() :]
         for r in _REQ_RE.finditer(args):
             start = args.lower().rfind("blastbox", 0, r.end())
             out.append(args[start : r.end()])
@@ -413,8 +434,15 @@ def _scan_toml_lock(path: Path) -> list[Pin]:
             continue
         version = str(pkg.get("version", "")).strip()
         if version:
-            out.append(Pin(str(path), 0, "lock", f"{pkg.get('name')}=={version}",
-                           "==" + version))
+            out.append(
+                Pin(
+                    str(path),
+                    0,
+                    "lock",
+                    f"{pkg.get('name')}=={version}",
+                    "==" + version,
+                )
+            )
     return out
 
 
@@ -427,8 +455,9 @@ def _scan_lock(path: Path) -> list[Pin]:
     for i, raw in enumerate(lines, 1):
         m = _LOCK_RE.match(raw)
         if m:
-            out.append(Pin(str(path), i, "lock", raw.strip(),
-                           re.sub(r"\s+", "", m.group(1))))
+            out.append(
+                Pin(str(path), i, "lock", raw.strip(), re.sub(r"\s+", "", m.group(1)))
+            )
     return out
 
 
@@ -470,7 +499,9 @@ def scan(root: Path) -> list[Pin]:
         name = path.name
         if name == "pyproject.toml":
             pins.extend(_scan_pyproject(path))
-        elif name.startswith("Dockerfile") or name.endswith((".Dockerfile", ".dockerfile")):
+        elif name.startswith("Dockerfile") or name.endswith(
+            (".Dockerfile", ".dockerfile")
+        ):
             pins.extend(_scan_dockerfile(path))
         elif name in _TOML_LOCK_NAMES:
             pins.extend(_scan_toml_lock(path))
@@ -532,7 +563,8 @@ def _spec_pattern(spec: str) -> str:
         stripped = part.strip()
         m = _OP_RE.match(stripped)
         parts.append(
-            re.escape(m.group(1)) + r"\s*" + re.escape(m.group(2)) if m
+            re.escape(m.group(1)) + r"\s*" + re.escape(m.group(2))
+            if m
             else re.escape(stripped)
         )
     # A trailing boundary, so `==0.1` does not match inside `==0.1.2`. Without
@@ -578,11 +610,13 @@ def _violated_bound(spec: str, version: str) -> str | None:
         for op in _BOUND_OPS:
             if not stripped.startswith(op):
                 continue
-            bound = _normalise_version(stripped[len(op):].strip().lstrip("vV"))
+            bound = _normalise_version(stripped[len(op) :].strip().lstrip("vV"))
             if not bound:
                 break
             bk = _version_key(bound)
-            bad = (key >= bk) if op == "<" else (key > bk) if op == "<=" else (key == bk)
+            bad = (
+                (key >= bk) if op == "<" else (key > bk) if op == "<=" else (key == bk)
+            )
             if bad:
                 return stripped
             break
@@ -661,6 +695,61 @@ def _eol_of(line: str) -> str:
     return "\n" if line.endswith("\n") else ""
 
 
+def missing_from_locks(root: Path, requires: Sequence[str]) -> dict[str, list[str]]:
+    """Runtime dependencies of a release that hash-pinned locks do not carry.
+
+    `pip install --require-hashes` refuses the WHOLE file when any dependency
+    it must resolve is not pinned there:
+
+        ERROR: In --require-hashes mode, all requirements must have their
+        versions pinned with ==. These do not: pydantic>=2.6.0 (from blastbox)
+
+    So a release that gains a dependency turns every consumer's hash-pinned
+    lock into a lock that cannot install -- and `pins --set` rewrites only the
+    blastbox line, which makes the bump look successful right up until the
+    image build fails. Measured: blastbox 0.1.39 added `packaging`, which no
+    consumer lock carried.
+
+    Only the BASE requirements are checked. Extras are conditional on what the
+    consumer installs, and this cannot know which; reporting `boto3` missing
+    from a lock for a repo that never asked for `blastbox[s3]` would be noise
+    that teaches people to ignore the check.
+    """
+    out: dict[str, list[str]] = {}
+    wanted = [_dist_name(r) for r in requires]
+    wanted = [name for name in wanted if name]
+    for path in _walk(root):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if "--hash=" not in text:
+            continue  # not hash-pinned; pip resolves the rest itself
+        have = {
+            _dist_name(line)
+            for line in text.splitlines()
+            if "==" in line and not line.lstrip().startswith("#")
+        }
+        gaps = [name for name in wanted if name not in have]
+        if gaps:
+            out[str(path)] = gaps
+    return out
+
+
+def _dist_name(requirement: str) -> str:
+    """The normalised distribution name in a requirement line, or "".
+
+    Normalised per PEP 503, because a lock may spell what a requirement calls
+    `ruamel.yaml` as `ruamel-yaml` and the two must compare equal.
+    """
+    text = _strip_comment(requirement).strip()
+    text = text.split(";", 1)[0]  # environment marker
+    match = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)", text)
+    if not match:
+        return ""
+    return re.sub(r"[-_.]+", "-", match.group(1)).lower()
+
+
 def set_version(
     root: Path,
     version: str,
@@ -701,7 +790,9 @@ def set_version(
     unhandled = []
     for pin in pins:
         if pin.floor is None:
-            unhandled.append(f"{pin.path}:{pin.line} ({pin.kind}) {pin.raw.strip()[:70]}")
+            unhandled.append(
+                f"{pin.path}:{pin.line} ({pin.kind}) {pin.raw.strip()[:70]}"
+            )
         elif pin.line <= 0:
             # TOML locks (uv/poetry/pdm) are reported without a line, because
             # the package is a table rather than a requirement line. Rewriting
@@ -747,7 +838,11 @@ def set_version(
             # Search the whole logical line, not just its first physical one.
             # Rewriting is still per-PHYSICAL-line so that continuations,
             # indentation and everything else on the other lines survive.
-            span = _logical_span(lines, i) if pin.kind != "dockerfile-arg" else range(i, i + 1)
+            span = (
+                _logical_span(lines, i)
+                if pin.kind != "dockerfile-arg"
+                else range(i, i + 1)
+            )
             first_error: PinScanError | None = None
             for j in span:
                 try:
@@ -852,7 +947,9 @@ def _replace_hashes(
             if "--hash=" in req_line:
                 head = req_line.split("--hash=", 1)[0].rstrip()
                 lines[start - 1] = (
-                    head + " " + " ".join(f"--hash=sha256:{d}" for d in digests)
+                    head
+                    + " "
+                    + " ".join(f"--hash=sha256:{d}" for d in digests)
                     + (_eol_of(req_line) or "\n")
                 )
             continue
@@ -860,8 +957,10 @@ def _replace_hashes(
         # backslash abuts the digest, and what pip reads as the hash value is
         # no longer the hash. Every continuation but the last gets one.
         eol = _eol_of(lines[start]) or _eol_of(lines[start - 1]) or "\n"
-        block = [ln + (" \\" + eol if n < len(digests) - 1 else eol)
-                 for n, ln in enumerate(_hash_lines(indent, digests))]
+        block = [
+            ln + (" \\" + eol if n < len(digests) - 1 else eol)
+            for n, ln in enumerate(_hash_lines(indent, digests))
+        ]
         # The requirement line itself ends in a backslash when hashes follow.
         req = lines[start - 1].rstrip("\r\n").rstrip().rstrip("\\").rstrip()
         lines[start - 1] = f"{req} \\" + (_eol_of(lines[start - 1]) or "\n")
