@@ -765,3 +765,79 @@ def test_an_unresolved_build_arg_is_marked_in_the_dry_run(tmp_path: Path) -> Non
     # or fail for that instead.
     arg_line = next(ln for ln in ok.splitlines() if "BLASTBOX_VERSION" in ln)
     assert "BLASTBOX_VERSION=0.1.34" in arg_line and "UNRESOLVED" not in arg_line
+
+
+def test_a_default_may_itself_contain_a_variable(tmp_path: Path) -> None:
+    """`${TITANARUM_FC_DIR:-$HOME/titanarum-bb-fc}` is ordinary shell, and it is
+    what the engine's compose files and its old export script already wrote.
+
+    One substitution pass put the default in verbatim and left `$HOME` in the
+    result, which then read as an unresolved destination and refused a perfectly
+    good plan.
+    """
+    text = TITANARUM.replace(
+        'dest = "$TITANARUM_FC_DIR/titanarum-rootfs.ext4"',
+        'dest = "${TITANARUM_FC_DIR:-$HOME/titanarum-bb-fc}/titanarum-rootfs.ext4"',
+    )
+    plan = load_plan(_plan(tmp_path, text))
+    rf = next(r for r in plan.rootfs if r.kind == "ext4")
+    assert rf.resolved_dest({"HOME": "/home/coz"}) == (
+        "/home/coz/titanarum-bb-fc/titanarum-rootfs.ext4"
+    )
+    # and the variable still wins when it is set
+    assert rf.resolved_dest({"HOME": "/home/coz", "TITANARUM_FC_DIR": "/srv/fc"}) == (
+        "/srv/fc/titanarum-rootfs.ext4"
+    )
+
+
+def test_a_substituted_value_is_not_re_expanded(tmp_path: Path) -> None:
+    """The shell does not re-read a variable's VALUE as a template, and neither
+    does this.
+
+    It matters for more than fidelity: this function also builds docker
+    `--build-arg`s, so re-expanding values would rewrite a literal `$` inside a
+    token or a password into whatever variable happened to share its name.
+    """
+    from blastbox.host.images import _expand
+
+    env = {"TOKEN": "abc$HOME", "HOME": "/home/coz"}
+    assert _expand("$TOKEN", env) == "abc$HOME"
+
+
+def test_expansion_terminates_on_a_self_referential_default(tmp_path: Path) -> None:
+    """`${A:-$A}` terminates: the inner `$A` is unset with no default of its
+    own, so it is left visible.
+
+    It terminates because values are never re-expanded, NOT because of the
+    depth bound — removing that bound leaves this passing. The bound is a
+    backstop for pathological nesting, and this test does not cover it.
+    """
+    from blastbox.host.images import _expand
+
+    assert _expand("${A:-$A}/f", {}) == "$A/f"
+
+
+@pytest.mark.parametrize(
+    ("text", "env", "want"),
+    [
+        # the finding: a regex `[^}]*` stops at the FIRST `}` and hands the
+        # recursion `${B:-/tmp`, leaving a good destination reported unresolved
+        ("${A:-${B:-/tmp}}/x", {"B": "/srv"}, "/srv/x"),
+        ("${A:-${B:-/tmp}}/x", {}, "/tmp/x"),
+        ("${A:-${B:-/tmp}}/x", {"A": "/opt"}, "/opt/x"),
+        # three deep, because two could pass by accident
+        ("${A:-${B:-${C:-/tmp}}}/x", {"C": "/c"}, "/c/x"),
+        # unbalanced braces are literal text, not a half-parsed expansion
+        ("${A:-x/f", {}, "${A:-x/f"),
+        # a name that is not an identifier is left alone
+        ("${not-a-name}/f", {}, "${not-a-name}/f"),
+    ],
+)
+def test_nested_braced_defaults_are_parsed_by_balance(
+    text: str, env: dict[str, str], want: str
+) -> None:
+    """A default can hold a braced default of its own, and a regex cannot
+    balance braces."""
+    from blastbox.host.images import _expand
+
+    assert _expand(text, env) == want
