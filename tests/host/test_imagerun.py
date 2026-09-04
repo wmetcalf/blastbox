@@ -1017,3 +1017,33 @@ def test_the_audit_sees_a_setuid_file_below_an_unreadable_directory(
         export_rootfs(plan, plan.rootfs[0], "t1", run=run, log=lambda _: None,
                       extract=extract)
     assert "/locked/mount" in str(e.value)
+
+
+def test_a_staging_directory_that_was_never_named_is_refused(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An empty stdout with a zero exit is not a directory.
+
+    `Path("")` is `.` — it exists and is writable — so the export would extract
+    an image over the working directory and then try to move it into place. Not
+    hypothetical: a stubbed runner returning "" did exactly that and left a
+    `usr/bin/true` in the repo, which `git add -A` then committed.
+    """
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_root_prefix", lambda: ["sudo"])
+    monkeypatch.setattr(mod, "_can_be_root", lambda: True)
+    dest_dir = tmp_path / "fc"
+    dest_dir.mkdir()
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    plan = _plan(tmp_path)
+
+    class SilentMktemp(FakeRunner):
+        def __call__(self, argv, **kw):
+            self.calls.append(list(argv))
+            return subprocess.CompletedProcess(list(argv), 0, stdout="", stderr="")
+
+    with pytest.raises(BuildError) as e:
+        export_rootfs(plan, plan.rootfs[0], "t1", run=SilentMktemp(), log=lambda _: None,
+                      extract=_fake_extract({"/init": "x"}))
+    assert "named no directory" in str(e.value)

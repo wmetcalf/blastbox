@@ -353,7 +353,18 @@ def _stage_dir(parent: Path, priv: list[str], run: Runner) -> Path:
             f"could not create a staging directory in {parent}: "
             f"{(proc.stderr or '').strip()}"
         )
-    return Path((proc.stdout or "").strip())
+    # An empty stdout with a zero exit is not a directory. `Path("")` is `.`,
+    # which EXISTS and is writable, so the whole export would then extract an
+    # image over the working directory and later try to move it into place.
+    # This is not hypothetical: a stubbed runner returning "" did exactly that
+    # and left a `usr/bin/true` in the repo.
+    name = (proc.stdout or "").strip()
+    if not name:
+        raise BuildError(
+            f"mktemp reported success but named no directory in {parent}; "
+            "refusing to stage into the working directory"
+        )
+    return Path(name)
 
 
 def _source_state(repo: Path) -> str:
