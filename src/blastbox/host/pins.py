@@ -854,75 +854,30 @@ def missing_from_locks(
     """
     out: dict[str, list[str]] = {}
     parsed = [_requirement(r) for r in requires]
-    roots = _install_roots(root)
-    for path in roots:
-        pins, _unused, env = _effective_pins(path, root)
+    sets = _install_sets(root)
+    roots = [member for members in sets for member in members]
+    for members in sets:
+        pins, env = _merged_pins(members, root)
         if "blastbox" not in pins:
             continue  # somebody else's requirements; not ours to judge
         if not any(pin.hashed for entries in pins.values() for pin in entries):
             continue  # not hash-pinned; pip resolves the rest itself
-        scope = {
-            k: v for k, v in {**env, **(environment or {})}.items() if k != "__extras__"
-        }
-        # An APPLICABLE blastbox entry. A portable lock whose only blastbox pin
-        # is `; sys_platform == "win32"` does not install blastbox on Linux, so
-        # demanding its dependency closure there refuses a correct lock.
-        if not any(_marker_holds(pin.marker, scope) for pin in pins["blastbox"]):
-            continue
-        # Only from blastbox entries whose own markers apply: a portable lock
-        # may pin `blastbox[host]` for one interpreter and `blastbox[s3]` for
-        # another, and unioning both checks a closure pip never installs.
-        # TWO kinds of extra, and they fail differently. Measured against real
-        # pip in python:3.12-slim, on RedTusk's own lock with fastapi removed:
-        #
-        #     blastbox[host]==...  ->  pip install --require-hashes  FAILS
-        #     blastbox==...        ->  pip install --require-hashes  SUCCEEDS
-        #
-        # Only the extras the LOCK LINE spells are enforced by pip. The ones the
-        # repository merely declares (`blastbox[host,s3]` in pyproject) are not:
-        # uv writes a plain `blastbox==` line, so the install succeeds and the
-        # IMAGE is short a package it imports -- RedTusk's Dockerfiles then run
-        # `pip install -e . --no-deps`, which does not re-check. That is a real
-        # defect and worth reporting, but it is not the same defect, and saying
-        # "pip will reject the file" about it would be false.
-        enforced = {
-            e
-            for pin in pins["blastbox"]
-            if _marker_holds(pin.marker, scope)
-            for e in pin.extras
-        }
-        declared = _declared_extras_for(root, path, roots)
-        if not enforced and not declared:
-            declared = _extras_in_play(parsed, pins, scope)
-        extras = enforced | declared
-        extras = _with_nested_extras(extras, parsed, scope)
-        gaps: list[str] = []
-        for req in parsed:
-            if req is None or not _applies(req, extras, scope):
-                continue
-            gap = _gap(req, pins, scope, requirements_of)
-            if not gap:
-                continue
-            # Which failure is it? A requirement reachable only through an extra
-            # the lock line does not spell is a RUNTIME hole, not an install
-            # one, and the message says which so an operator is not sent looking
-            # for a pip error that will not happen.
-            if not _pip_enforces(req, enforced, scope):
-                gap += " [not an install failure: the image would import it]"
-            gaps.append(gap)
-        # The TRANSITIVE closure, not just blastbox's own requirements. pip
-        # resolves what the pinned packages themselves need, and refuses the
-        # file when any of it is unpinned: removing `pydantic-core` from a lock
-        # that pins `pydantic` fails the install even though blastbox never
-        # names it. Measured -- four such packages in a seven-package fixture.
-        #
-        # Only with a resolver: without one there is no metadata to walk, and
-        # reporting everything as unverifiable would be noise.
-        if requirements_of is not None:
-            deep = _transitive_gaps(parsed, extras, pins, scope, requirements_of)
-            gaps.extend(g for g in deep if g not in gaps)
+        # A universal lock is judged on EVERY branch it claims to cover.
+        scopes = _scopes_for(env, environment)
+        found: dict[str, list[str]] = {}
+        for label, scope in scopes:
+            for gap in _judge_scope(
+                members, root, roots, pins, scope, parsed, requirements_of
+            ):
+                found.setdefault(gap, []).append(label)
+        gaps = [
+            gap
+            if len(scopes) == 1 or len(where) == len(scopes)
+            else f"{gap} [on {', '.join(where)}]"
+            for gap, where in found.items()
+        ]
         if gaps:
-            out[str(path)] = gaps
+            out[" + ".join(str(m) for m in members)] = gaps
     return out
 
 
@@ -1078,6 +1033,244 @@ def _install_roots(root: Path) -> list[Path]:
     ]
 
 
+def _constraint_conflicts(
+    members: Sequence[Path],
+    root: Path,
+    pins: dict[str, list[_Pin]],
+    scope: dict[str, str],
+) -> list[str]:
+    """Pins this set's own `-c` files exclude -- an install pip will refuse."""
+    from packaging.version import InvalidVersion  # noqa: PLC0415
+
+    out: list[str] = []
+    specs = _constraint_specs(members, root)
+    if not specs:
+        return out
+    for name, entries in sorted(pins.items()):
+        spec_source = specs.get(name)
+        if spec_source is None:
+            continue
+        specifier, source = spec_source
+        for pin in entries:
+            if not _marker_holds(pin.marker, scope):
+                continue
+            version = pin.version.lstrip("=").strip()
+            if not version:
+                continue
+            try:
+                allowed = specifier.contains(version, prereleases=True)
+            except InvalidVersion:
+                continue  # not a version we can compare; not evidence of a conflict
+            if not allowed:
+                out.append(
+                    f"{name}=={version} is excluded by the constraint "
+                    f"{name}{specifier} in {source}"
+                )
+                break
+    return out
+
+
+def _constraint_specs(
+    members: Sequence[Path], root: Path
+) -> dict[str, tuple[Any, Path]]:
+    """`{name: (specifier, source)}` constraining this install set.
+
+    A constraint installs nothing; it restricts what a version may be. A root
+    pinning `packaging==26.3` under a constraint of `packaging==22` is a lock
+    pip REFUSES to resolve -- and the closure check called it complete, because
+    every name it wanted was present and hashed. pip documents `-c` as
+    repeatable and follows it recursively, so both roles are walked: a
+    requirements file contributes its `-c` targets, a constraint file
+    contributes its own lines and its own references.
+    """
+    out: dict[str, tuple[Any, Path]] = {}
+    seen: set[tuple[Path, bool]] = set()
+
+    def walk(path: Path, *, constraining: bool) -> None:
+        key = (path.resolve(), constraining)
+        if key in seen:
+            return
+        seen.add(key)
+        try:
+            text = _read_requirements(path)
+        except PinScanError:
+            return  # unreadable here is not a verdict; the caller already reports it
+        for line in _joined_lines(text):
+            references = _requirement_args(line)
+            constraints = _constraint_args(line)
+            for name in constraints:
+                target = _safe_include(path.parent / name, root)
+                if target is not None:
+                    walk(target, constraining=True)
+            for name in references:
+                target = _safe_include(path.parent / name, root)
+                if target is not None:
+                    walk(target, constraining=constraining)
+            if not constraining or references or constraints:
+                continue
+            # A constraint file may be hashed like any other: the hash
+            # arguments are not part of the requirement grammar, so they come
+            # off before parsing or every hashed constraint reads as absent.
+            req = _requirement(_HASH_RE.sub("", _strip_comment(line)).strip())
+            if req is not None and str(req.specifier):
+                out.setdefault(_dist_name(req.name), (req.specifier, path))
+
+    for member in members:
+        walk(member, constraining=False)
+    return out
+
+
+def _scopes_for(
+    env: dict[str, str], environment: dict[str, str] | None
+) -> list[tuple[str, dict[str, str]]]:
+    """The marker environments one lock must be judged under.
+
+    Normally one: what the lock's header says, with the caller's overrides on
+    top. A `--universal` lock is a different promise -- one file for all
+    operating systems -- so it is judged under each branch it covers, and a
+    requirement that is missing on only some of them says which.
+
+    An explicit caller value still wins: naming `sys_platform` is a deliberate
+    question about one target, and answering a different one would be a lie.
+    """
+    base = {
+        k: v
+        for k, v in {**env, **(environment or {})}.items()
+        if k not in ("__extras__", "__universal__")
+    }
+    if env.get("__universal__") != "1":
+        return [("", base)]
+    return [(label, {**values, **base}) for label, values in _UNIVERSAL_BRANCHES]
+
+
+def _judge_scope(
+    members: Sequence[Path],
+    root: Path,
+    roots: Sequence[Path],
+    pins: dict[str, list[_Pin]],
+    scope: dict[str, str],
+    parsed: Sequence[Any],
+    requirements_of: Callable[[str, str], list[str] | None] | None,
+) -> list[str]:
+    """What this install set is missing IN ONE marker environment."""
+    gaps: list[str] = []
+    # An APPLICABLE blastbox entry. A portable lock whose only blastbox pin
+    # is `; sys_platform == "win32"` does not install blastbox on Linux, so
+    # demanding its dependency closure there refuses a correct lock.
+    if not any(_marker_holds(pin.marker, scope) for pin in pins["blastbox"]):
+        return []
+    # Only from blastbox entries whose own markers apply: a portable lock
+    # may pin `blastbox[host]` for one interpreter and `blastbox[s3]` for
+    # another, and unioning both checks a closure pip never installs.
+    # TWO kinds of extra, and they fail differently. Measured against real
+    # pip in python:3.12-slim, on RedTusk's own lock with fastapi removed:
+    #
+    #     blastbox[host]==...  ->  pip install --require-hashes  FAILS
+    #     blastbox==...        ->  pip install --require-hashes  SUCCEEDS
+    #
+    # Only the extras the LOCK LINE spells are enforced by pip. The ones the
+    # repository merely declares (`blastbox[host,s3]` in pyproject) are not:
+    # uv writes a plain `blastbox==` line, so the install succeeds and the
+    # IMAGE is short a package it imports -- RedTusk's Dockerfiles then run
+    # `pip install -e . --no-deps`, which does not re-check. That is a real
+    # defect and worth reporting, but it is not the same defect, and saying
+    # "pip will reject the file" about it would be false.
+    enforced = {
+        e
+        for pin in pins["blastbox"]
+        if _marker_holds(pin.marker, scope)
+        for e in pin.extras
+    }
+    declared = set()
+    for member in members:
+        declared |= _declared_extras_for(root, member, roots)
+    if not enforced and not declared:
+        declared = _extras_in_play(parsed, pins, scope)
+    extras = enforced | declared
+    extras = _with_nested_extras(extras, parsed, scope)
+    for req in parsed:
+        if req is None or not _applies(req, extras, scope):
+            continue
+        gap = _gap(req, pins, scope, requirements_of)
+        if not gap:
+            continue
+        # Which failure is it? A requirement reachable only through an extra
+        # the lock line does not spell is a RUNTIME hole, not an install
+        # one, and the message says which so an operator is not sent looking
+        # for a pip error that will not happen.
+        if not _pip_enforces(req, enforced, scope):
+            gap += " [not an install failure: the image would import it]"
+        gaps.append(gap)
+    # The TRANSITIVE closure, not just blastbox's own requirements. pip
+    # resolves what the pinned packages themselves need, and refuses the
+    # file when any of it is unpinned: removing `pydantic-core` from a lock
+    # that pins `pydantic` fails the install even though blastbox never
+    # names it. Measured -- four such packages in a seven-package fixture.
+    #
+    # Only with a resolver: without one there is no metadata to walk, and
+    # reporting everything as unverifiable would be noise.
+    if requirements_of is not None:
+        deep = _transitive_gaps(parsed, extras, pins, scope, requirements_of)
+        gaps.extend(g for g in deep if g not in gaps)
+    # A pin the set's own constraints forbid. Everything above asks whether
+    # a version is PRESENT; pip also refuses a resolution its constraints
+    # exclude, and that lock fails the install the check just approved.
+    gaps.extend(
+        g for g in _constraint_conflicts(members, root, pins, scope) if g not in gaps
+    )
+    return gaps
+
+
+def _merged_pins(
+    members: Sequence[Path], root: Path
+) -> tuple[dict[str, list[_Pin]], dict[str, str]]:
+    """One requirement set's pins and target environment, across its files."""
+    pins: dict[str, list[_Pin]] = {}
+    env: dict[str, str] = {}
+    for member in members:
+        sub, _unused, sub_env = _effective_pins(member, root)
+        for name, entries in sub.items():
+            pins.setdefault(name, []).extend(entries)
+        env = {**env, **sub_env}
+    return pins, env
+
+
+def _install_sets(root: Path) -> list[tuple[Path, ...]]:
+    """Install roots, with files ONE command installs together kept together.
+
+    `pip install -r blastbox.lock -r deps.lock` is a single resolution: pip
+    documents `-r` as repeatable, and it merges the files before resolving.
+    Treating each as its own root reported `blastbox.lock` incomplete for
+    dependencies `deps.lock` supplies in the very same command. Files installed
+    by SEPARATE commands stay separate, because those really are separate
+    resolutions.
+    """
+    roots = _install_roots(root)
+    known = {p.resolve(): p for p in roots}
+    sets: list[tuple[Path, ...]] = []
+    seen: set[frozenset[Path]] = set()
+    grouped: set[Path] = set()
+    for path in _walk(root):
+        if not _INSTALL_SCRIPT_RE.fullmatch(path.name) or _is_install_input(path):
+            continue
+        for line in _joined_lines(_read_small(path)):
+            named = [
+                known[r]
+                for r in dict.fromkeys(_referenced_in(line, path.parent, root))
+                if r in known
+            ]
+            if len(named) < 2:
+                continue
+            key = frozenset(p.resolve() for p in named)
+            if key in seen:
+                continue
+            seen.add(key)
+            sets.append(tuple(named))
+            grouped |= key
+    sets.extend((p,) for p in roots if p.resolve() not in grouped)
+    return sets
+
+
 def _referenced(path: Path, root: Path) -> list[Path]:
     """Requirement files an install script hands to pip with `-r`.
 
@@ -1166,6 +1359,64 @@ def _joined_lines(text: str) -> list[str]:
     return out
 
 
+# uv's bare platform names carry its DEFAULT architecture, measured with
+# `uv pip compile --python-platform <name>` against marker-guarded requirements.
+_WIN = {
+    "sys_platform": "win32",
+    "os_name": "nt",
+    "platform_system": "Windows",
+    "platform_machine": "x86_64",
+}
+_MAC = {
+    "sys_platform": "darwin",
+    "os_name": "posix",
+    "platform_system": "Darwin",
+    "platform_machine": "arm64",
+}
+_NIX = {
+    "sys_platform": "linux",
+    "os_name": "posix",
+    "platform_system": "Linux",
+    "platform_machine": "x86_64",
+}
+# The branches a `--universal` lock promises to cover.
+_UNIVERSAL_BRANCHES = (("linux", _NIX), ("windows", _WIN), ("macos", _MAC))
+
+
+def _generated_command(text: str) -> str:
+    """The compile command a lock records in its LEADING comment block.
+
+    uv and pip-tools write the command they were run with at the top of the
+    file. Searching the whole text for `--python-version` instead let any later
+    note override it -- `# migration target: --python-version 3.13` above a
+    lock generated for 3.12 made the checker evaluate the wrong interpreter and
+    skip a dependency guarded by `python_version < "3.13"`. The header is the
+    only part of a lock that describes the lock; everything after it describes
+    a package.
+    """
+    out: list[str] = []
+    capturing = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            if capturing:
+                break
+            continue
+        if not line.startswith("#"):
+            break  # the header ends where the requirements begin
+        body = line.lstrip("#").strip()
+        if not capturing and re.search(
+            r"\b(uv (pip compile|lock)|pip-compile)\b", body
+        ):
+            capturing = True
+        if capturing:
+            continued = body.endswith("\\")
+            out.append(body.rstrip("\\").strip())
+            if not continued:
+                break
+    return " ".join(out)
+
+
 def _lock_environment(text: str) -> dict[str, str]:
     """The environment a lock says it was compiled for, if it says.
 
@@ -1175,6 +1426,15 @@ def _lock_environment(text: str) -> dict[str, str]:
     guarded by `python_version < "3.13"` gets skipped for a 3.12 lock.
     """
     out: dict[str, str] = {}
+    # Only the generated header: see `_generated_command`.
+    text = _generated_command(text)
+    if re.search(r"--universal\b", text):
+        # `uv pip compile --universal` generates ONE file compatible with all
+        # operating systems, architectures and Python implementations. Judging
+        # it under the machine that happens to run `pins` accepts a lock whose
+        # Windows install fails: a newly required `winonly; sys_platform ==
+        # "win32"` is simply skipped on Linux.
+        out["__universal__"] = "1"
     match = re.search(r"--python-version[=\s]+(\d+(?:\.\d+)+)", text)
     if match:
         version = match.group(1)
@@ -1208,24 +1468,6 @@ def _lock_environment(text: str) -> dict[str, str]:
         # Leaving it to the running interpreter skipped an arm64-guarded
         # dependency for a macos lock on an x86 Linux host. An explicit target
         # triple overrides these below.
-        _WIN = {
-            "sys_platform": "win32",
-            "os_name": "nt",
-            "platform_system": "Windows",
-            "platform_machine": "x86_64",
-        }
-        _MAC = {
-            "sys_platform": "darwin",
-            "os_name": "posix",
-            "platform_system": "Darwin",
-            "platform_machine": "arm64",
-        }
-        _NIX = {
-            "sys_platform": "linux",
-            "os_name": "posix",
-            "platform_system": "Linux",
-            "platform_machine": "x86_64",
-        }
         for needle, values in (
             ("windows", _WIN),
             ("win32", _WIN),
@@ -1432,6 +1674,35 @@ def _shell_tokens(text: str) -> list[str]:
         return []  # unbalanced quotes: not a command we can read
 
 
+def _option_args(tokens: Sequence[str], names: tuple[str, str]) -> list[str]:
+    """Filenames given to one repeatable pip option, in every spelling.
+
+    pip accepts `-r file`, `-rfile`, `-r=file` and `--requirement=file`, and
+    documents both `-r` and `-c` as repeatable. One reader for both, because
+    three private copies of this pattern is how a quoted include stopped being
+    followed.
+    """
+    short, long = names
+    out: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in (short, long):
+            if index + 1 < len(tokens):
+                out.append(tokens[index + 1])
+            index += 2
+            continue
+        for prefix in (f"{long}=", f"{short}="):
+            if token.startswith(prefix):
+                out.append(token[len(prefix) :])
+                break
+        else:
+            if token.startswith(short) and len(token) > len(short):
+                out.append(token[len(short) :])  # the attached short form
+        index += 1
+    return out
+
+
 def _requirement_args(text: str) -> list[str]:
     """Filenames given to `-r` / `--requirement`, parsed as a shell would.
 
@@ -1440,25 +1711,12 @@ def _requirement_args(text: str) -> list[str]:
     exist -- so the real lock is never promoted to a root and its closure is
     never checked.
     """
-    tokens = _shell_tokens(text)
-    out: list[str] = []
-    index = 0
-    while index < len(tokens):
-        token = tokens[index]
-        if token in ("-r", "--requirement"):
-            if index + 1 < len(tokens):
-                out.append(tokens[index + 1])
-            index += 2
-            continue
-        for prefix in ("--requirement=", "-r="):
-            if token.startswith(prefix):
-                out.append(token[len(prefix) :])
-                break
-        else:
-            if token.startswith("-r") and len(token) > 2:
-                out.append(token[2:])  # the attached short form
-        index += 1
-    return out
+    return _option_args(_shell_tokens(text), ("-r", "--requirement"))
+
+
+def _constraint_args(text: str) -> list[str]:
+    """Filenames given to `-c` / `--constraint`, parsed as a shell would."""
+    return _option_args(_shell_tokens(text), ("-c", "--constraint"))
 
 
 def _referenced_in(line: str, base: Path, root: Path) -> list[Path]:

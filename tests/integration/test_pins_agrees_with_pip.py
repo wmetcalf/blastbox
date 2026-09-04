@@ -43,6 +43,23 @@ _BASE_LOCK = _HERE / "pip_agreement_base.lock"
 _REQUIRES = _HERE / "pip_agreement_requires.json"
 
 
+_PULL_TIMEOUT = 600
+_RUN_TIMEOUT = 300
+
+# What a REJECTION by pip looks like when pip is answering the question we
+# asked. Anything else that fails -- an unreachable registry, a broken index, a
+# stalled pull -- is infrastructure, and calling it "pip rejected the lock"
+# turns an offline CI host into a checker disagreement it cannot reproduce.
+_VERDICT_MARKERS = (
+    "--require-hashes",
+    "hashes are required",
+    "do not match the hashes",
+    "resolutionimpossible",
+    "dependency resolution failed",
+    "cannot install",
+)
+
+
 def _docker_available() -> bool:
     if shutil.which("docker") is None:
         return False
@@ -50,6 +67,26 @@ def _docker_available() -> bool:
         subprocess.run(["docker", "info"], capture_output=True, check=False).returncode
         == 0
     )
+
+
+class _Unavailable(Exception):
+    """The environment could not answer the question. Not a verdict."""
+
+
+def _pull() -> None:
+    """Fetch the image up front, so a pull failure is not read as a rejection."""
+    try:
+        proc = subprocess.run(
+            ["docker", "pull", "-q", _IMAGE],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_PULL_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise _Unavailable(f"docker pull timed out after {_PULL_TIMEOUT}s") from exc
+    if proc.returncode != 0:
+        raise _Unavailable(f"cannot pull {_IMAGE}: {proc.stderr.strip()[-400:]}")
 
 
 def _without(text: str, package: str) -> str:
@@ -60,29 +97,46 @@ def _without(text: str, package: str) -> str:
 
 
 def _pip_accepts(lock: Path) -> bool:
-    """Whether real pip resolves this file under --require-hashes."""
-    proc = subprocess.run(
-        [
-            "docker",
-            "run",
-            "--rm",
-            "-v",
-            f"{lock.parent}:/w:ro",
-            _IMAGE,
-            "pip",
-            "install",
-            "-q",
-            "--no-cache-dir",
-            "--dry-run",
-            "--require-hashes",
-            "-r",
-            f"/w/{lock.name}",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
+    """Whether real pip resolves this file under --require-hashes.
+
+    Raises `_Unavailable` when the run did not produce a resolver verdict at
+    all: `docker run` failing, the process being killed, or pip failing for a
+    reason that is about the network rather than about the file.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "-v",
+                f"{lock.parent}:/w:ro",
+                _IMAGE,
+                "pip",
+                "install",
+                "-q",
+                "--no-cache-dir",
+                "--dry-run",
+                "--require-hashes",
+                "-r",
+                f"/w/{lock.name}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_RUN_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise _Unavailable(f"pip run timed out after {_RUN_TIMEOUT}s") from exc
+    if proc.returncode == 0:
+        return True
+    output = f"{proc.stdout}\n{proc.stderr}".lower()
+    if any(marker in output for marker in _VERDICT_MARKERS):
+        return False
+    raise _Unavailable(
+        f"pip exited {proc.returncode} without a resolver verdict: "
+        f"{proc.stderr.strip()[-400:]}"
     )
-    return proc.returncode == 0
 
 
 @pytest.mark.skipif(not _docker_available(), reason="needs a working docker")
@@ -92,6 +146,10 @@ def test_the_checker_and_pip_agree_about_install_failures(tmp_path):
     Gaps the checker marks runtime-only are excluded on purpose: those are the
     ones pip accepts by design, and that distinction is what this protects.
     """
+    try:
+        _pull()
+    except _Unavailable as exc:
+        pytest.skip(str(exc))
     base = _BASE_LOCK.read_text()
     requires = json.loads(_REQUIRES.read_text())
     packages = sorted(
@@ -111,9 +169,39 @@ def test_the_checker_and_pip_agree_about_install_failures(tmp_path):
             for gap in entries
             if "not an install failure" not in gap
         ]
-        accepted = _pip_accepts(lock)
+        try:
+            accepted = _pip_accepts(lock)
+        except _Unavailable as exc:
+            pytest.skip(f"cannot ask pip (removed={package}): {exc}")
         if bool(claimed) != (not accepted):
             disagreements.append(
                 {"removed": package, "we_claim": claimed, "pip_accepts": accepted}
             )
     assert not disagreements, f"checker and pip disagree: {disagreements}"
+
+
+@pytest.mark.skipif(not _docker_available(), reason="needs a working docker")
+def test_a_broken_environment_is_not_read_as_a_pip_verdict(tmp_path, monkeypatch):
+    """The two failure kinds are distinguished by RUNNING them, not by reading.
+
+    Both cases below exit non-zero. Treating that alone as "pip rejected the
+    lock" reported an unreachable registry as a checker disagreement.
+    """
+    lock = tmp_path / "requirements.lock"
+    lock.write_text(_BASE_LOCK.read_text())
+
+    # 1. A real pip verdict: a lock with an unhashed entry cannot resolve under
+    #    --require-hashes, and pip says so in terms this classifies.
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    (broken / "requirements.lock").write_text("packaging==26.3\n")
+    assert _pip_accepts(broken / "requirements.lock") is False
+
+    # 2. Infrastructure: the image cannot be obtained. Same non-zero exit, and
+    #    it must NOT come back as "pip rejected the lock".
+    monkeypatch.setattr(
+        "tests.integration.test_pins_agrees_with_pip._IMAGE",
+        "blastbox.invalid/nonexistent:0",
+    )
+    with pytest.raises(_Unavailable):
+        _pip_accepts(lock)
