@@ -534,7 +534,9 @@ def test_a_lowercase_arg_keyword_is_recognised(tmp_path: Path) -> None:
         "arg BASE_IMAGE\narg JDK_BUILD_IMAGE\narg ZXING_BUILD_IMAGE\nfrom ${BASE_IMAGE}\n"
     )
     plan = load_plan(_plan(tmp_path, TITANARUM))
-    assert [p for p in arg_problems(plan, {}) if "titanarum-base" in p] == []
+    # Only BASE_IMAGE is at issue; the stub omits the other two on purpose.
+    problems = [p for p in arg_problems(plan, {}) if "`ARG BASE_IMAGE`" in p]
+    assert problems == [], problems
 
 
 def test_the_dry_run_shows_declared_build_args(tmp_path: Path) -> None:
@@ -587,22 +589,40 @@ def test_destinations_colliding_after_resolution_are_refused(
     assert "would overwrite" in str(e.value)
 
 
-def test_an_arg_split_across_a_continuation_is_read_correctly(tmp_path: Path) -> None:
-    """`ARG FOO \\` + `BAR` is ONE instruction declaring FOO.
+def _base_dockerfile(tmp_path: Path, body: str) -> Plan:
+    d = tmp_path / "deploy" / "docker"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "Dockerfile.titanarum-base").write_text(
+        "ARG BASE_IMAGE\n" + body + "FROM ${BASE_IMAGE}\n"
+    )
+    return load_plan(_plan(tmp_path, TITANARUM))
 
-    A line-by-line match would invent an ARG named BAR and then report the real
-    missing one as present.
+
+def test_an_arg_split_across_a_continuation_is_read_correctly(tmp_path: Path) -> None:
+    """`ARG \\` + `JDK_BUILD_IMAGE` is ONE instruction declaring that arg.
+
+    Line-by-line, the first line is an ARG with no name and the second is a
+    bare word, so a correctly-declared build arg gets reported missing.
     """
     from blastbox.host.images import arg_problems
 
-    d = tmp_path / "deploy" / "docker"
-    d.mkdir(parents=True)
-    (d / "Dockerfile.titanarum-base").write_text(
-        "ARG BASE_IMAGE\nARG JDK_BUILD_IMAGE \\\n     ZXING_BUILD_IMAGE\nFROM ${BASE_IMAGE}\n"
-    )
-    plan = load_plan(_plan(tmp_path, TITANARUM))
-    problems = [p for p in arg_problems(plan, {}) if "titanarum-base" in p]
-    assert any("ZXING_BUILD_IMAGE" in p for p in problems), problems
+    plan = _base_dockerfile(tmp_path, "ARG \\\n    JDK_BUILD_IMAGE\n")
+    problems = [p for p in arg_problems(plan, {}) if "`ARG JDK_BUILD_IMAGE`" in p]
+    assert problems == [], problems
+
+
+def test_a_continuation_line_is_not_mistaken_for_an_arg_instruction(
+    tmp_path: Path,
+) -> None:
+    """The dangerous direction. A RUN continuation whose next line begins with
+    the word ARG is not an ARG instruction; reading it as one reports a
+    misspelled --build-arg as correctly declared, which is exactly the silent
+    failure this function exists to catch."""
+    from blastbox.host.images import arg_problems
+
+    plan = _base_dockerfile(tmp_path, "RUN echo hello \\\n    ARG JDK_BUILD_IMAGE\n")
+    problems = [p for p in arg_problems(plan, {}) if "`ARG JDK_BUILD_IMAGE`" in p]
+    assert problems, "a continuation line was read as an ARG instruction"
 
 
 def test_an_unreadable_dockerfile_is_reported_not_raised(tmp_path: Path) -> None:
