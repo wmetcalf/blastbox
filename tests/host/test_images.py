@@ -760,4 +760,8 @@ def test_an_unresolved_build_arg_is_marked_in_the_dry_run(tmp_path: Path) -> Non
     out = describe(plan, "t1", {})
     assert "BLASTBOX_VERSION=$BLASTBOX_VERSION [UNRESOLVED]" in out, out
     ok = describe(plan, "t1", {"BLASTBOX_VERSION": "0.1.34"})
-    assert "BLASTBOX_VERSION=0.1.34" in ok and "UNRESOLVED" not in ok
+    # Scoped to the build-arg line: the rootfs DESTINATION is legitimately
+    # unresolved under this env, and asserting on the whole output would pass
+    # or fail for that instead.
+    arg_line = next(ln for ln in ok.splitlines() if "BLASTBOX_VERSION" in ln)
+    assert "BLASTBOX_VERSION=0.1.34" in arg_line and "UNRESOLVED" not in arg_line
