@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from blastbox.host.images import (
+    Plan,
     PlanError,
     build_command,
     describe,
