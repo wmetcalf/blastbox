@@ -837,7 +837,20 @@ def describe(plan: Plan, tag: str, env: dict[str, str] | None = None) -> str:
             resolved_size = None
             size = f" [UNRESOLVED SIZE: {exc}]"
         else:
-            size = f" {resolved_size} MiB" if resolved_size else ""
+            # A DEFAULTED size keeps whatever is already in place, so reporting
+            # the declaration would name a filesystem the run will not build.
+            # Read here with a plain stat: `describe` is not privileged, so if
+            # it cannot look it says the declared size and says why, rather
+            # than inventing one.
+            effective, note = resolved_size, ""
+            if resolved_size and rf.size_is_defaulted(env):
+                try:
+                    have = -(-Path(rf.resolved_dest(env)).stat().st_size // (1024 * 1024))
+                except OSError:
+                    have = 0
+                if have > resolved_size:
+                    effective, note = have, f" (keeping the existing {have}, declared {resolved_size})"
+            size = f" {effective} MiB{note}" if effective else ""
         dest = rf.resolved_dest(env)
         unresolved = " [UNRESOLVED]" if "$" in dest else ""
         lines.append(

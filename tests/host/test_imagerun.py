@@ -1298,7 +1298,11 @@ def test_the_shrink_check_compares_bytes_not_floored_mib(
     live = dest_dir / "demo.ext4"
     live.write_bytes(b"\0" * (64 * 1024 * 1024 + 4096))  # 64 MiB + one block
     monkeypatch.setenv("DEMO_DIR", str(dest_dir))
-    plan = _plan(tmp_path)  # declares exactly 64 MiB
+    # An EXPLICIT override, because a defaulted size now preserves this
+    # artifact rather than refusing it. The byte precision still matters here:
+    # floored, 64 MiB + one block reads as 64 and an explicit 64 slips through.
+    monkeypatch.setenv("ROOTFS_MIB", "64")
+    plan = _plan(tmp_path, SPEC.replace("size_mib = 64", 'size_mib = "${ROOTFS_MIB:-64}"'))
     with pytest.raises(BuildError) as e:
         export_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
                       extract=_fake_extract({"/init": "x"}))
@@ -1386,3 +1390,20 @@ def test_an_override_larger_than_the_existing_artifact_grows_it(
     export_rootfs(plan, plan.rootfs[0], "t1", run=run, log=lambda _: None,
                   extract=_fake_extract({"/init": "x"}))
     assert "300M" in run.verb("truncate")[0]
+
+
+def test_sub_mib_growth_still_preserves_the_artifact(tmp_path: Path, monkeypatch) -> None:
+    """64 MiB plus one filesystem block floors to 64, so the preservation did
+    not trigger and the shrink guard aborted — on an enlarged artifact with no
+    override, the exact case preservation exists for."""
+    dest_dir = tmp_path / "fc"
+    dest_dir.mkdir()
+    (dest_dir / "demo.ext4").write_bytes(b"\0" * (64 * 1024 * 1024 + 4096))
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    monkeypatch.delenv("ROOTFS_MIB", raising=False)
+    plan = _plan(tmp_path)  # declares 64 MiB
+    run = FakeRunner()
+    export_rootfs(plan, plan.rootfs[0], "t1", run=run, log=lambda _: None,
+                  extract=_fake_extract({"/init": "x"}))
+    # rounded UP, so the new image is not smaller than what it replaces
+    assert "65M" in run.verb("truncate")[0], run.verb("truncate")

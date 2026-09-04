@@ -854,3 +854,24 @@ def test_the_dry_run_shows_the_resolved_rootfs_size(tmp_path: Path) -> None:
     assert " 3072 MiB" in describe(plan, "t1", {})
     assert " 4096 MiB" in describe(plan, "t1", {"ROOTFS_MIB": "4096"})
     assert "ROOTFS_MIB" not in describe(plan, "t1", {})
+
+
+def test_the_dry_run_reports_the_size_it_will_actually_build(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A defaulted size keeps whatever is already in place, so printing the
+    declaration would name a filesystem the run will not build — in exactly the
+    scenario preservation exists for."""
+    from blastbox.host.images import describe
+
+    dest = tmp_path / "fc"
+    dest.mkdir()
+    (dest / "titanarum-rootfs.ext4").write_bytes(b"\0" * (5000 * 1024 * 1024))
+    env = {"TITANARUM_FC_DIR": str(dest)}
+    text = TITANARUM.replace("size_mib = 3072", 'size_mib = "${ROOTFS_MIB:-3072}"')
+    plan = load_plan(_plan(tmp_path, text))
+    out = describe(plan, "t1", env)
+    assert "5000 MiB (keeping the existing 5000, declared 3072)" in out, out
+    # with an override the operator's number is what runs, and is what is shown
+    out2 = describe(plan, "t1", {**env, "ROOTFS_MIB": "6000"})
+    assert " 6000 MiB" in out2 and "keeping" not in out2, out2
