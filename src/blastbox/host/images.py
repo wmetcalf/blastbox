@@ -142,6 +142,25 @@ class RootfsSpec:
     # default costs nothing there either.
     forbid_setuid: bool = True
 
+    def size_is_defaulted(self, env: dict[str, str] | None = None) -> bool:
+        """Whether the size came from the literal fallback, not an override.
+
+        `${ROOTFS_MIB:-3072}` with ROOTFS_MIB unset is a DEFAULT: the caller
+        expressed no opinion, so the artifact already in place should keep its
+        size. With it set, the caller did express one and it must be obeyed --
+        including downward, where the shrink guard then asks for confirmation.
+
+        A plain integer counts as defaulted too: it is the spec's fallback, not
+        something the operator chose for this run.
+        """
+        if not isinstance(self.size_mib, str):
+            return True
+        env = dict(os.environ) if env is None else env
+        # Every variable mentioned must be absent or empty for this to be a
+        # pure default.
+        names = re.findall(r"\$\{?(\w+)", self.size_mib)
+        return not any(env.get(n) for n in names)
+
     def resolved_size_mib(self, env: dict[str, str] | None = None) -> int | None:
         """``size_mib`` with any variables expanded, or None.
 

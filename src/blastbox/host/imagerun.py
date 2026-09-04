@@ -786,7 +786,19 @@ def stage_rootfs(
         if spec.kind == "dir":
             ready = staging
         else:
-            size = spec.resolved_size_mib(env) or _existing_mib(dest, priv, run) or 1536
+            declared = spec.resolved_size_mib(env) or 1536
+            existing = _existing_mib(dest, priv, run)
+            if spec.size_is_defaulted(env) and existing > declared:
+                # No override given, and the artifact in place is bigger: KEEP
+                # its size. The exporter this replaces derived the default from
+                # `stat` on the existing file, so a deployment that had grown
+                # its rootfs kept it across rebuilds without anyone
+                # remembering. Taking the literal instead makes every such
+                # rebuild fail the shrink guard -- correct, and useless.
+                log(f"   keeping the existing {existing} MiB (declared {declared}, no override)")
+                size = existing
+            else:
+                size = declared
             _refuse_shrink(dest, size, priv, run)
             staged_size = size
             # Unique per run, not a fixed `<dest>.new`. Two concurrent exports
