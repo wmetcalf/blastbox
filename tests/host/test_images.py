@@ -25,11 +25,13 @@ from blastbox.host.images import (
     SPEC_NAME,
     Plan,
     PlanError,
+    _is_secret,
     build_command,
     describe,
     load_plan,
     missing_dockerfiles,
     resolve_chain,
+    unresolved_names,
 )
 
 TITANARUM = """
@@ -1056,3 +1058,100 @@ def test_a_secret_build_argument_is_not_printed(tmp_path: Path) -> None:
     assert "REGISTRY_TOKEN=<redacted>" in out, out
     # a non-secret name is still shown, because that is what makes a dry run useful
     assert "JDK_BUILD_IMAGE=eclipse-temurin:25-jdk" in out
+
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "GITHUB_PAT",
+        "SSH_PRIVATE_KEY",
+        "REGISTRY_PASS",
+        "DEPLOY_KEY",
+        "NPM_TOKEN",
+        "AWS_SECRET_ACCESS_KEY",
+        "DB_PASSPHRASE",
+    ],
+)
+def test_conventional_credential_names_are_redacted(name: str) -> None:
+    """`describe()` prints before every dry run AND every real build.
+
+    A value that reaches it reaches terminal scrollback and CI logs, so the
+    names operators actually use for credentials have to be covered -- none of
+    these carried a denylisted substring, and all three of PAT, PRIVATE_KEY and
+    PASS were printed in full.
+    """
+    assert _is_secret(name), name
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "PATH",
+        "PATCH_LEVEL",
+        "COMPATIBILITY",
+        "CACHE_KEY",
+        "BLASTBOX_VERSION",
+        "JDK_BUILD_IMAGE",
+        "BUILD_PASSTHROUGH",
+    ],
+)
+def test_ordinary_build_args_are_still_shown(name: str) -> None:
+    """Redaction has a cost: a hidden value is one an operator cannot check.
+
+    `PAT` is matched as a whole segment precisely so `PATH`, `PATCH_LEVEL` and
+    `COMPATIBILITY` stay readable, and bare `KEY` needs a qualifier so
+    `CACHE_KEY` does too.
+    """
+    assert not _is_secret(name), name
+
+
+def test_a_secret_value_is_not_printed_by_describe(tmp_path: Path) -> None:
+    """End to end, since that is where the leak would happen."""
+    plan_file = tmp_path / "blastbox-images.toml"
+    plan_file.write_text(
+        '[engine]\nname = "demo"\n\n[[image]]\nname = "demo"\nbase = "debian:12"\n'
+        'dockerfile = "Dockerfile"\nbuild_args = { GITHUB_PAT = "$GITHUB_PAT" }\n'
+    )
+    plan = load_plan(plan_file)
+    text = describe(plan, "t1", {"GITHUB_PAT": "ghp_reallysecretvalue"})
+    assert "ghp_reallysecretvalue" not in text
+    assert "GITHUB_PAT" in text
+
+
+@pytest.mark.parametrize("expr", ["${not-a-name}", "${A:+fallback}", "${1FOO}"])
+def test_a_balanced_but_unsupported_expansion_is_reported(expr: str) -> None:
+    """Balanced braces are not the same as an expansion we can perform.
+
+    `_expand` keeps these verbatim, so staying silent handed docker the literal
+    placeholder while pre-build validation reported no problem at all.
+    """
+    assert unresolved_names(expr, {}) == [expr]
+
+
+def test_a_supported_expansion_is_still_not_reported() -> None:
+    """The new report must not fire on the forms that do resolve."""
+    assert unresolved_names("${DIR:-/tmp}", {"DIR": "/srv"}) == []
+    assert unresolved_names("${DIR:-/tmp}", {}) == []
+    assert unresolved_names("$SET", {"SET": "x"}) == []
+
+
+def test_a_destination_containing_a_literal_dollar_is_not_called_unresolved(
+    tmp_path: Path,
+) -> None:
+    """The dry run must agree with the run it previews.
+
+    `describe()` judged the destination by looking for `$` in the RESULT, so a
+    directory whose expansion legitimately contains one was reported unresolved
+    while the real export considered it fine.
+    """
+    plan_file = tmp_path / "blastbox-images.toml"
+    plan_file.write_text(
+        '[engine]\nname = "demo"\n\n[[image]]\nname = "demo"\nbase = "debian:12"\n'
+        'dockerfile = "Dockerfile"\n\n'
+        '[[rootfs]]\nkind = "dir"\nimage = "demo"\ndest = "$ODD/rootfs"\n'
+    )
+    plan = load_plan(plan_file)
+    text = describe(plan, "t1", {"ODD": "/srv/we$rd"})
+    assert "/srv/we$rd/rootfs" in text
+    assert "UNRESOLVED" not in text

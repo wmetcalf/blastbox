@@ -6,13 +6,18 @@ import json
 import pathlib
 import subprocess
 
+import pytest
+
 from blastbox.host.stamp import (
     LABEL_BASE_DIGEST,
     LABEL_BASE_NAME,
     LABEL_BLASTBOX,
+    Stamp,
+    LABEL_BUILDERS,
     LABEL_REVISION,
     UNKNOWN,
     base_digest,
+    canonical_version,
     build_args,
     git_revision,
     read,
@@ -26,11 +31,13 @@ def _fake(responses: dict[tuple, tuple[int, str]]):
             if argv[: len(key)] == key:
                 return subprocess.CompletedProcess(list(argv), code, out, "")
         return subprocess.CompletedProcess(list(argv), 1, "", "no stub")
+
     return run
 
 
 def test_a_dirty_tree_is_marked_dirty():
     """A clean sha for a dirty tree names a commit that never built this."""
+
     # rev-parse and status share the ("git","-C") prefix, so _fake cannot tell
     # them apart; branch on the subcommand instead.
     def run2(argv):
@@ -38,6 +45,7 @@ def test_a_dirty_tree_is_marked_dirty():
         if "rev-parse" in argv:
             return subprocess.CompletedProcess(argv, 0, "abc123\n", "")
         return subprocess.CompletedProcess(argv, 0, " M src/x.py\n", "")
+
     assert git_revision(".", run2) == "abc123-dirty"
 
 
@@ -47,27 +55,43 @@ def test_a_clean_tree_records_the_bare_sha():
         if "rev-parse" in argv:
             return subprocess.CompletedProcess(argv, 0, "abc123\n", "")
         return subprocess.CompletedProcess(argv, 0, "", "")
+
     assert git_revision(".", run) == "abc123"
 
 
 def test_base_is_recorded_by_digest_not_tag():
     """A tag can be re-pointed or deleted; that is what lost the worker base."""
+
     def run(argv):
         argv = list(argv)
         if "{{json .RepoDigests}}" in argv:
             return subprocess.CompletedProcess(
-                argv, 0, json.dumps(["reg/img@sha256:2baf1f40105d9501fe319a8ec463fdf4325a2a5df445adf3f572f626253678c9"]), "")
+                argv,
+                0,
+                json.dumps(
+                    [
+                        "reg/img@sha256:2baf1f40105d9501fe319a8ec463fdf4325a2a5df445adf3f572f626253678c9"
+                    ]
+                ),
+                "",
+            )
         return subprocess.CompletedProcess(argv, 1, "", "")
-    assert base_digest("reg/img:tag", run) == "sha256:2baf1f40105d9501fe319a8ec463fdf4325a2a5df445adf3f572f626253678c9"
+
+    assert (
+        base_digest("reg/img:tag", run)
+        == "sha256:2baf1f40105d9501fe319a8ec463fdf4325a2a5df445adf3f572f626253678c9"
+    )
 
 
 def test_a_local_only_base_has_no_repo_digest():
     """An image ID is NOT a repo digest and must not be written as one."""
+
     def run(argv):
         argv = list(argv)
         if "{{json .RepoDigests}}" in argv:
             return subprocess.CompletedProcess(argv, 0, "[]", "")
         return subprocess.CompletedProcess(argv, 1, "", "")
+
     assert base_digest("redtusk-worker:bb0127", run) == ""
 
 
@@ -77,8 +101,17 @@ def test_the_image_id_is_recorded_under_its_own_label():
     def run(argv):
         argv = list(argv)
         assert argv[:2] == ["docker", "inspect"] and "{{.Id}}" in argv, argv
-        return subprocess.CompletedProcess(argv, 0, "sha256:812c058028763ae1abffeb35d1bdab5473d534a921d930408f71c455f853e4bf\n", "")
-    assert base_image_id("img:tag", run) == "sha256:812c058028763ae1abffeb35d1bdab5473d534a921d930408f71c455f853e4bf"
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            "sha256:812c058028763ae1abffeb35d1bdab5473d534a921d930408f71c455f853e4bf\n",
+            "",
+        )
+
+    assert (
+        base_image_id("img:tag", run)
+        == "sha256:812c058028763ae1abffeb35d1bdab5473d534a921d930408f71c455f853e4bf"
+    )
     assert LABEL_BASE_IMAGE_ID != "org.opencontainers.image.base.digest"
 
 
@@ -93,10 +126,20 @@ def test_build_args_carry_all_four_facts():
             # repo must match the image asked about: the selector refuses a
             # digest belonging to another repository.
             return subprocess.CompletedProcess(
-                argv, 0,
-                json.dumps(["base@sha256:5e657ff6158d3e2a6d23e2a523917a2305acee9423365e268695c4b7b8919f4c"])
-                + "\t" + _IID + "\n", "")
+                argv,
+                0,
+                json.dumps(
+                    [
+                        "base@sha256:5e657ff6158d3e2a6d23e2a523917a2305acee9423365e268695c4b7b8919f4c"
+                    ]
+                )
+                + "\t"
+                + _IID
+                + "\n",
+                "",
+            )
         return subprocess.CompletedProcess(argv, 1, "", "")
+
     args = build_args(blastbox_version="0.1.27", repo=".", base="base:tag", runner=run)
     joined = " ".join(args)
     assert f"{LABEL_BLASTBOX}=0.1.27" in joined
@@ -124,8 +167,10 @@ def test_an_image_without_a_base_digest_is_not_reproducible():
 
 def test_a_fully_stamped_image_is_reproducible():
     labels = {
-        LABEL_BLASTBOX: "0.1.27", LABEL_REVISION: "5aa1abc",
-        LABEL_BASE_NAME: "b:t", LABEL_BASE_DIGEST: "sha256:5e657ff6158d3e2a6d23e2a523917a2305acee9423365e268695c4b7b8919f4c",
+        LABEL_BLASTBOX: "0.1.27",
+        LABEL_REVISION: "5aa1abc",
+        LABEL_BASE_NAME: "b:t",
+        LABEL_BASE_DIGEST: "sha256:5e657ff6158d3e2a6d23e2a523917a2305acee9423365e268695c4b7b8919f4c",
     }
     run = _fake({("docker", "inspect"): (0, json.dumps(labels))})
     assert read("img", run).reproducible
@@ -143,6 +188,7 @@ def test_a_non_git_tree_uses_the_recorded_revision_file(tmp_path):
 
     def run(argv):
         return subprocess.CompletedProcess(list(argv), 128, "", "not a git repository")
+
     assert git_revision(tmp_path, run) == "d1e2f3a"
 
 
@@ -157,12 +203,14 @@ def test_a_real_checkout_wins_over_a_stale_revision_file(tmp_path):
         if "rev-parse" in argv:
             return subprocess.CompletedProcess(argv, 0, "1234abc\n", "")
         return subprocess.CompletedProcess(argv, 0, "", "")
+
     assert git_revision(tmp_path, run) == "1234abc"
 
 
 def test_no_git_and_no_file_is_unknown_not_a_guess(tmp_path):
     def run(argv):
         return subprocess.CompletedProcess(list(argv), 128, "", "not a git repository")
+
     assert git_revision(tmp_path, run) == UNKNOWN
 
 
@@ -178,6 +226,7 @@ def _git(sha: str, dirty: bool = False):
     """git + docker stand-in. The repo digest it reports MATCHES the image asked
     about, because base_digest() now refuses a digest belonging to another
     repository."""
+
     def run(argv):
         argv = list(argv)
         if "rev-parse" in argv:
@@ -186,24 +235,28 @@ def _git(sha: str, dirty: bool = False):
             return subprocess.CompletedProcess(argv, 0, " M x\n" if dirty else "", "")
         if "{{json .RepoDigests}}" in argv:
             from blastbox.host.stamp import repo_of
+
             # `docker inspect --type image <ref>` -- the ref is not argv[2].
             repo = repo_of(_inspect_ref(argv))
             return subprocess.CompletedProcess(
-                argv, 0,
-                json.dumps([f"{repo}@{_BD}"]), "")
+                argv, 0, json.dumps([f"{repo}@{_BD}"]), ""
+            )
         if "{{json .RepoDigests}}\t{{.Id}}" in argv:
             # The one-snapshot read: both facts must come from the same inspect,
             # or a moving tag pairs one image's digest with another's ID.
             from blastbox.host.stamp import repo_of
+
             repo = repo_of(_inspect_ref(argv))
             return subprocess.CompletedProcess(
-                argv, 0, json.dumps([f"{repo}@{_BD}"]) + "\t" + _IID + "\n", "")
+                argv, 0, json.dumps([f"{repo}@{_BD}"]) + "\t" + _IID + "\n", ""
+            )
         if "{{.Id}}" in argv:
             # The image ID is now recorded for every reference pin, because it
             # is what `base_moved` compares against. Answered explicitly rather
             # than by a catch-all: a fake that answers anything proves nothing.
             return subprocess.CompletedProcess(argv, 0, _IID + "\n", "")
         return subprocess.CompletedProcess(argv, 1, "", "")
+
     return run
 
 
@@ -219,10 +272,18 @@ def test_a_dirty_build_is_not_reproducible():
     """
     from blastbox.host.stamp import Stamp
 
-    assert not Stamp(blastbox="0.1.27",
-        revision="abc1234-dirty", base_name="b:t", base_digest="sha256:5e657ff6158d3e2a6d23e2a523917a2305acee9423365e268695c4b7b8919f4c").reproducible
-    assert Stamp(blastbox="0.1.27",
-        revision="abc1234", base_name="b:t", base_digest="sha256:5e657ff6158d3e2a6d23e2a523917a2305acee9423365e268695c4b7b8919f4c").reproducible
+    assert not Stamp(
+        blastbox="0.1.27",
+        revision="abc1234-dirty",
+        base_name="b:t",
+        base_digest="sha256:5e657ff6158d3e2a6d23e2a523917a2305acee9423365e268695c4b7b8919f4c",
+    ).reproducible
+    assert Stamp(
+        blastbox="0.1.27",
+        revision="abc1234",
+        base_name="b:t",
+        base_digest="sha256:5e657ff6158d3e2a6d23e2a523917a2305acee9423365e268695c4b7b8919f4c",
+    ).reproducible
 
 
 def test_base_labels_are_emitted_even_without_a_base():
@@ -234,7 +295,9 @@ def test_base_labels_are_emitted_even_without_a_base():
     from blastbox.host.stamp import LABEL_BASE_DIGEST as BD
     from blastbox.host.stamp import LABEL_BASE_NAME as BN
 
-    joined = " ".join(build_args(blastbox_version="0.1.27", repo=".", runner=_git("5aa1abc")))
+    joined = " ".join(
+        build_args(blastbox_version="0.1.27", repo=".", runner=_git("5aa1abc"))
+    )
     assert f"{BN}=" in joined
     assert f"{BD}=" in joined
 
@@ -250,10 +313,13 @@ def test_the_build_is_pinned_to_exactly_the_base_that_was_named():
     the branch was never taken there.
     """
     args = build_args(
-        blastbox_version="0.1.27", repo=".", base="base:tag", runner=_git("5aa1abc"))
+        blastbox_version="0.1.27", repo=".", base="base:tag", runner=_git("5aa1abc")
+    )
     joined = " ".join(args)
     assert "--build-arg BASE_IMAGE=base:tag" in joined, joined
-    assert f"BASE_IMAGE=base@{_BD}" not in joined, "a local RepoDigest is not a registry pin"
+    assert f"BASE_IMAGE=base@{_BD}" not in joined, (
+        "a local RepoDigest is not a registry pin"
+    )
     # The digest is still RECORDED; only what gets PINNED changed.
     assert f"{LABEL_BASE_DIGEST}={_BD}" in joined, joined
 
@@ -262,15 +328,20 @@ def test_a_caller_supplied_digest_reference_is_passed_through_verbatim():
     """Asking for a digest pin explicitly is how you get the strong form."""
     ref = f"registry.example/base@{_BD}"
     args = build_args(
-        blastbox_version="0.1.27", repo=".", base=ref, runner=_git("5aa1abc"))
+        blastbox_version="0.1.27", repo=".", base=ref, runner=_git("5aa1abc")
+    )
     assert f"--build-arg BASE_IMAGE={ref}" in " ".join(args)
 
 
 def test_the_pinned_build_arg_name_is_configurable():
     """Consumer Dockerfiles disagree: BASE_IMAGE here, BASE in the gvisor one."""
     args = build_args(
-        blastbox_version="0.1.27", repo=".", base="b:t",
-        base_arg="BASE", runner=_git("5aa1abc"))
+        blastbox_version="0.1.27",
+        repo=".",
+        base="b:t",
+        base_arg="BASE",
+        runner=_git("5aa1abc"),
+    )
     assert "BASE=b:t" in " ".join(args)
 
 
@@ -282,6 +353,7 @@ def test_an_unresolvable_base_raises_instead_of_stamping_unknown():
 
     def run(argv):
         return subprocess.CompletedProcess(list(argv), 1, "", "No such image")
+
     with _pytest.raises(StampError):
         base_digest("missing:tag", run)
 
@@ -296,8 +368,18 @@ def test_ambiguous_repo_digests_raise_rather_than_guess():
         argv = list(argv)
         if "{{json .RepoDigests}}" in argv:
             return subprocess.CompletedProcess(
-                argv, 0, json.dumps(["other/x@sha256:ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb", "third/y@sha256:3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d"]), "")
+                argv,
+                0,
+                json.dumps(
+                    [
+                        "other/x@sha256:ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+                        "third/y@sha256:3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d",
+                    ]
+                ),
+                "",
+            )
         return subprocess.CompletedProcess(argv, 1, "", "")
+
     with _pytest.raises(StampError):
         base_digest("wanted/z:tag", run)
 
@@ -307,9 +389,22 @@ def test_the_digest_for_the_requested_repository_is_chosen():
         argv = list(argv)
         if "{{json .RepoDigests}}" in argv:
             return subprocess.CompletedProcess(
-                argv, 0, json.dumps(["other/x@sha256:9834876dcfb05cb167a5c24953eba58c4ac89b1adf57f28f2f9d09af107ee8f0", "wanted/z@sha256:3e744b9dc39389baf0c5a0660589b8402f3dbb49b89b3e75f2c9355852a3c677"]), "")
+                argv,
+                0,
+                json.dumps(
+                    [
+                        "other/x@sha256:9834876dcfb05cb167a5c24953eba58c4ac89b1adf57f28f2f9d09af107ee8f0",
+                        "wanted/z@sha256:3e744b9dc39389baf0c5a0660589b8402f3dbb49b89b3e75f2c9355852a3c677",
+                    ]
+                ),
+                "",
+            )
         return subprocess.CompletedProcess(argv, 1, "", "")
-    assert base_digest("wanted/z:tag", run) == "sha256:3e744b9dc39389baf0c5a0660589b8402f3dbb49b89b3e75f2c9355852a3c677"
+
+    assert (
+        base_digest("wanted/z:tag", run)
+        == "sha256:3e744b9dc39389baf0c5a0660589b8402f3dbb49b89b3e75f2c9355852a3c677"
+    )
 
 
 def test_an_uninspectable_image_raises_rather_than_reading_as_unstamped():
@@ -320,6 +415,7 @@ def test_an_uninspectable_image_raises_rather_than_reading_as_unstamped():
 
     def run(argv):
         return subprocess.CompletedProcess(list(argv), 1, "", "No such object")
+
     with _pytest.raises(StampError):
         read("typo:tag", run)
 
@@ -345,7 +441,12 @@ def test_a_registry_port_is_not_mistaken_for_a_tag():
     assert repo_of("host:5000/img:tag") == "host:5000/img"
     assert repo_of("host:5000/img") == "host:5000/img"
     assert repo_of("img:tag") == "img"
-    assert repo_of("img@sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") == "img"
+    assert (
+        repo_of(
+            "img@sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        )
+        == "img"
+    )
     assert repo_of("ns/img:tag") == "ns/img"
 
 
@@ -359,6 +460,7 @@ def test_a_missing_git_binary_falls_back_to_the_revision_file(tmp_path):
 
     def run(argv):
         raise FileNotFoundError("git")
+
     assert git_revision(tmp_path, run) == "a1b2c3d"
 
 
@@ -366,16 +468,27 @@ def test_a_base_digest_without_a_name_is_not_reproducible():
     """A bare sha256 does not say which repository to pull it from."""
     from blastbox.host.stamp import Stamp
 
-    assert not Stamp(blastbox="0.1.27", revision="abc1234", base_digest="sha256:5e657ff6158d3e2a6d23e2a523917a2305acee9423365e268695c4b7b8919f4c").reproducible
-    assert Stamp(blastbox="0.1.27", revision="abc1234",
-                 base_digest="sha256:5e657ff6158d3e2a6d23e2a523917a2305acee9423365e268695c4b7b8919f4c", base_name="b:t").reproducible
+    assert not Stamp(
+        blastbox="0.1.27",
+        revision="abc1234",
+        base_digest="sha256:5e657ff6158d3e2a6d23e2a523917a2305acee9423365e268695c4b7b8919f4c",
+    ).reproducible
+    assert Stamp(
+        blastbox="0.1.27",
+        revision="abc1234",
+        base_digest="sha256:5e657ff6158d3e2a6d23e2a523917a2305acee9423365e268695c4b7b8919f4c",
+        base_name="b:t",
+    ).reproducible
 
 
 def test_a_local_only_base_is_reproducible_via_its_image_id():
     from blastbox.host.stamp import Stamp
 
-    assert Stamp(blastbox="0.1.27",
-        revision="abc1234", base_name="b:t", base_image_id="sha256:812c058028763ae1abffeb35d1bdab5473d534a921d930408f71c455f853e4bf",
+    assert Stamp(
+        blastbox="0.1.27",
+        revision="abc1234",
+        base_name="b:t",
+        base_image_id="sha256:812c058028763ae1abffeb35d1bdab5473d534a921d930408f71c455f853e4bf",
     ).reproducible
 
 
@@ -395,39 +508,61 @@ def test_a_local_only_base_records_the_image_id_and_pins_by_reference():
             return subprocess.CompletedProcess(argv, 0, "", "")
         if "{{json .RepoDigests}}\t{{.Id}}" in argv:
             return subprocess.CompletedProcess(
-                argv, 0,
-                "[]\tsha256:812c058028763ae1abffeb35d1bdab5473d534a921d930408f71c455f853e4bf\n", "")
+                argv,
+                0,
+                "[]\tsha256:812c058028763ae1abffeb35d1bdab5473d534a921d930408f71c455f853e4bf\n",
+                "",
+            )
         return subprocess.CompletedProcess(argv, 1, "", "")
 
-    joined = " ".join(build_args(
-        blastbox_version="0.1.27", repo=".", base="redtusk-worker:bb0127", runner=run))
-    assert f"{LABEL_BASE_IMAGE_ID}=sha256:812c058028763ae1abffeb35d1bdab5473d534a921d930408f71c455f853e4bf" in joined
-    assert f"{LABEL_BASE_DIGEST}=" in joined            # emitted, but empty
-    assert f"{LABEL_BASE_DIGEST}=sha256:812c058028763ae1abffeb35d1bdab5473d534a921d930408f71c455f853e4bf" not in joined   # never as a digest
+    joined = " ".join(
+        build_args(
+            blastbox_version="0.1.27",
+            repo=".",
+            base="redtusk-worker:bb0127",
+            runner=run,
+        )
+    )
+    assert (
+        f"{LABEL_BASE_IMAGE_ID}=sha256:812c058028763ae1abffeb35d1bdab5473d534a921d930408f71c455f853e4bf"
+        in joined
+    )
+    assert f"{LABEL_BASE_DIGEST}=" in joined  # emitted, but empty
+    assert (
+        f"{LABEL_BASE_DIGEST}=sha256:812c058028763ae1abffeb35d1bdab5473d534a921d930408f71c455f853e4bf"
+        not in joined
+    )  # never as a digest
     # The build is pinned to the REFERENCE, not the ID: buildkit reads
     # `sha256:...` as the repository `docker.io/library/sha256:...` and tries to
     # pull it, so pinning by ID fails the build under the default builder.
     assert "BASE_IMAGE=redtusk-worker:bb0127" in joined
-    assert "BASE_IMAGE=sha256:812c058028763ae1abffeb35d1bdab5473d534a921d930408f71c455f853e4bf" not in joined
+    assert (
+        "BASE_IMAGE=sha256:812c058028763ae1abffeb35d1bdab5473d534a921d930408f71c455f853e4bf"
+        not in joined
+    )
 
 
 def test_an_unrunnable_git_status_is_not_reported_clean(tmp_path):
     """rev-parse succeeded, status failed: we cannot claim the tree is clean."""
+
     def run(argv):
         argv = list(argv)
         if "rev-parse" in argv:
             return subprocess.CompletedProcess(argv, 0, "abc1234\n", "")
         return subprocess.CompletedProcess(argv, 128, "", "fatal: unreadable index")
+
     assert git_revision(tmp_path, run) == "abc1234-dirty"
 
 
 def test_null_repodigests_do_not_crash():
     """Docker reports a nil RepoDigests field as JSON `null`, not `[]`."""
+
     def run(argv):
         argv = list(argv)
         if "{{json .RepoDigests}}" in argv:
             return subprocess.CompletedProcess(argv, 0, "null", "")
         return subprocess.CompletedProcess(argv, 1, "", "")
+
     assert base_digest("local:only", run) == ""
 
 
@@ -439,6 +574,7 @@ def test_an_unknown_revision_is_refused_before_emitting_flags(tmp_path):
 
     def run(argv):
         return subprocess.CompletedProcess(list(argv), 128, "", "not a git repository")
+
     with _pytest.raises(StampError):
         build_args(blastbox_version="0.1.27", repo=tmp_path, runner=run)
 
@@ -447,7 +583,10 @@ def test_a_missing_blastbox_version_is_not_reproducible():
     from blastbox.host.stamp import Stamp
 
     assert not Stamp(
-        revision="abc1234", base_name="b:t", base_digest="sha256:5e657ff6158d3e2a6d23e2a523917a2305acee9423365e268695c4b7b8919f4c").reproducible
+        revision="abc1234",
+        base_name="b:t",
+        base_digest="sha256:5e657ff6158d3e2a6d23e2a523917a2305acee9423365e268695c4b7b8919f4c",
+    ).reproducible
 
 
 _D64 = "sha256:" + "a" * 64
@@ -463,13 +602,16 @@ def test_a_stamped_image_whose_base_is_gone_is_not_resolvable():
     from blastbox.host.stamp import Stamp
 
     st = Stamp(blastbox="0.1.27", revision="abc1234", base_name="b:t", base_digest=_D64)
-    assert st.reproducible                      # it recorded enough
+    assert st.reproducible  # it recorded enough
+
     def gone(argv):
         return subprocess.CompletedProcess(list(argv), 1, "", "No such object")
-    assert not st.resolvable(gone)              # but the base is gone
+
+    assert not st.resolvable(gone)  # but the base is gone
 
     def present(argv):
         return subprocess.CompletedProcess(list(argv), 0, "sha256:x\n", "")
+
     assert st.resolvable(present)
 
 
@@ -486,20 +628,24 @@ def test_untracked_files_count_as_dirty(tmp_path):
         if "rev-parse" in argv:
             return subprocess.CompletedProcess(argv, 0, "abc1234\n", "")
         return subprocess.CompletedProcess(argv, 0, "?? new_input.py\n", "")
+
     assert git_revision(tmp_path, run) == "abc1234-dirty"
     assert any("--untracked-files=normal" in a for a in seen), seen
 
 
 def test_a_malformed_recorded_digest_is_not_reproducible():
-    """"Present" is not "valid" -- an image can carry anything in a label."""
+    """ "Present" is not "valid" -- an image can carry anything in a label."""
     from blastbox.host.stamp import Stamp
 
     assert not Stamp(
-        blastbox="0.1.27", revision="abc1234", base_name="b:t",
-        base_digest="not-a-digest").reproducible
+        blastbox="0.1.27",
+        revision="abc1234",
+        base_name="b:t",
+        base_digest="not-a-digest",
+    ).reproducible
     assert not Stamp(
-        blastbox="0.1.27", revision="zzz", base_name="b:t",
-        base_digest=_D64).reproducible
+        blastbox="0.1.27", revision="zzz", base_name="b:t", base_digest=_D64
+    ).reproducible
 
 
 def test_a_sole_digest_from_another_repository_is_refused():
@@ -512,8 +658,10 @@ def test_a_sole_digest_from_another_repository_is_refused():
         argv = list(argv)
         if "{{json .RepoDigests}}" in argv:
             return subprocess.CompletedProcess(
-                argv, 0, json.dumps([f"someone-else/img@{_D64}"]), "")
+                argv, 0, json.dumps([f"someone-else/img@{_D64}"]), ""
+            )
         return subprocess.CompletedProcess(argv, 1, "", "")
+
     with _pytest.raises(StampError):
         base_digest("wanted/z:tag", run)
 
@@ -522,12 +670,15 @@ def test_a_fully_qualified_hub_reference_matches_the_short_repo_digest():
     """Verified against a real daemon: `docker inspect docker.io/minio/minio:latest`
     returns RepoDigests as `minio/minio@sha256:…`. Without normalising the implicit
     Hub registry, stamping a fully-qualified base raised instead of resolving."""
+
     def run(argv):
         argv = list(argv)
         if "{{json .RepoDigests}}" in argv:
             return subprocess.CompletedProcess(
-                argv, 0, json.dumps([f"minio/minio@{_D64}"]), "")
+                argv, 0, json.dumps([f"minio/minio@{_D64}"]), ""
+            )
         return subprocess.CompletedProcess(argv, 1, "", "")
+
     assert base_digest("docker.io/minio/minio:latest", run) == _D64
     assert base_digest("index.docker.io/minio/minio:latest", run) == _D64
     assert base_digest("minio/minio:latest", run) == _D64
@@ -543,8 +694,10 @@ def test_a_genuinely_different_repository_still_raises():
         argv = list(argv)
         if "{{json .RepoDigests}}" in argv:
             return subprocess.CompletedProcess(
-                argv, 0, json.dumps([f"someone/else@{_D64}"]), "")
+                argv, 0, json.dumps([f"someone/else@{_D64}"]), ""
+            )
         return subprocess.CompletedProcess(argv, 1, "", "")
+
     with _pytest.raises(StampError):
         base_digest("docker.io/minio/minio:latest", run)
 
@@ -581,7 +734,8 @@ def test_a_stamp_matching_the_image_agrees():
         argv = list(argv)
         if argv[:2] == ["docker", "inspect"]:
             return subprocess.CompletedProcess(
-                argv, 0, json.dumps({LABEL_BLASTBOX: "0.1.27"}), "")
+                argv, 0, json.dumps({LABEL_BLASTBOX: "0.1.27"}), ""
+            )
         if argv[:2] == ["docker", "run"]:
             return subprocess.CompletedProcess(argv, 0, "0.1.27\n", "")
         return subprocess.CompletedProcess(argv, 1, "", "")
@@ -627,7 +781,9 @@ def test_a_non_commit_revision_file_is_refused_at_build_time():
     from blastbox.host.stamp import REVISION_FILE, StampError
 
     d = tempfile.mkdtemp()
-    (pathlib.Path(d) / REVISION_FILE).write_text("release-2026-09-02\n", encoding="utf-8")
+    (pathlib.Path(d) / REVISION_FILE).write_text(
+        "release-2026-09-02\n", encoding="utf-8"
+    )
 
     def run(argv):
         return subprocess.CompletedProcess(list(argv), 128, "", "not a git repository")
@@ -644,8 +800,7 @@ def test_unparseable_inspect_output_raises_rather_than_reading_as_unstamped():
 
     def run(argv):
         # docker emitting two objects for an ambiguous name
-        return subprocess.CompletedProcess(
-            list(argv), 0, '{"a":"1"}\n{"a":"1"}\n', "")
+        return subprocess.CompletedProcess(list(argv), 0, '{"a":"1"}\n{"a":"1"}\n', "")
 
     with _pytest.raises(StampError):
         read("ambiguous", run)
@@ -708,7 +863,9 @@ def test_a_file_with_no_from_is_refused(tmp_path):
 def test_a_correctly_parameterized_dockerfile_is_accepted(tmp_path):
     from blastbox.host.stamp import assert_arg_selects_base
 
-    assert_arg_selects_base(_df(tmp_path, "ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\nRUN true\n"), "BASE_IMAGE")
+    assert_arg_selects_base(
+        _df(tmp_path, "ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\nRUN true\n"), "BASE_IMAGE"
+    )
 
 
 def test_the_instruction_keyword_is_case_insensitive(tmp_path):
@@ -718,12 +875,16 @@ def test_the_instruction_keyword_is_case_insensitive(tmp_path):
     """
     from blastbox.host.stamp import assert_arg_selects_base
 
-    assert_arg_selects_base(_df(tmp_path, "arg BASE_IMAGE=d\nfrom ${BASE_IMAGE}\n"), "BASE_IMAGE")
+    assert_arg_selects_base(
+        _df(tmp_path, "arg BASE_IMAGE=d\nfrom ${BASE_IMAGE}\n"), "BASE_IMAGE"
+    )
 
 
 def test_the_arg_name_is_case_sensitive(tmp_path):
     """Keywords fold; NAMES do not. `ARG base_image` does not satisfy BASE_IMAGE."""
-    assert "declares no" in _refused(_df(tmp_path, "ARG base_image\nfrom ${base_image}\n"))
+    assert "declares no" in _refused(
+        _df(tmp_path, "ARG base_image\nfrom ${base_image}\n")
+    )
 
 
 def test_a_dollar_prefix_of_a_longer_name_does_not_count(tmp_path):
@@ -735,7 +896,9 @@ def test_a_dollar_prefix_of_a_longer_name_does_not_count(tmp_path):
 def test_a_bare_dollar_reference_is_accepted(tmp_path):
     from blastbox.host.stamp import assert_arg_selects_base
 
-    assert_arg_selects_base(_df(tmp_path, "ARG BASE_IMAGE\nFROM $BASE_IMAGE\n"), "BASE_IMAGE")
+    assert_arg_selects_base(
+        _df(tmp_path, "ARG BASE_IMAGE\nFROM $BASE_IMAGE\n"), "BASE_IMAGE"
+    )
 
 
 def test_a_default_expansion_is_accepted(tmp_path):
@@ -842,8 +1005,11 @@ def test_a_local_only_base_is_pinned_by_a_reference_a_builder_can_resolve(tmp_pa
     df = tmp_path / "Dockerfile"
     df.write_text("ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\n")
     args = build_args(
-        blastbox_version="0.1.28", repo=tmp_path, base="redtusk-worker:bb0128",
-        dockerfile=df, runner=run,
+        blastbox_version="0.1.28",
+        repo=tmp_path,
+        base="redtusk-worker:bb0128",
+        dockerfile=df,
+        runner=run,
     )
     joined = " ".join(args)
     assert "--build-arg BASE_IMAGE=redtusk-worker:bb0128" in joined, joined
@@ -874,8 +1040,13 @@ def test_a_moved_local_base_is_reported_rather_than_read_as_verified():
     from blastbox.host.stamp import Stamp
 
     old, new = "sha256:" + "a" * 64, "sha256:" + "b" * 64
-    s = Stamp(blastbox="0.1.28", revision="c" * 40, base_name="redtusk-worker:bb0128",
-              base_digest="", base_image_id=old)
+    s = Stamp(
+        blastbox="0.1.28",
+        revision="c" * 40,
+        base_name="redtusk-worker:bb0128",
+        base_digest="",
+        base_image_id=old,
+    )
     assert s.base_moved(_moved_runner(old, new)) == new
     assert s.base_moved(_moved_runner(old, old)) == "", "unmoved must report nothing"
 
@@ -884,9 +1055,13 @@ def test_a_registry_digest_is_never_reported_as_moved():
     """A digest is immutable; asking whether it moved is a category error."""
     from blastbox.host.stamp import Stamp
 
-    s = Stamp(blastbox="0.1.28", revision="c" * 40,
-              base_name="registry.example/base@sha256:" + "d" * 64,
-              base_digest="sha256:" + "d" * 64, base_image_id="sha256:" + "a" * 64)
+    s = Stamp(
+        blastbox="0.1.28",
+        revision="c" * 40,
+        base_name="registry.example/base@sha256:" + "d" * 64,
+        base_digest="sha256:" + "d" * 64,
+        base_image_id="sha256:" + "a" * 64,
+    )
 
     def explode(argv):  # must not even be consulted
         raise AssertionError("docker was asked about an immutable digest")
@@ -900,11 +1075,18 @@ def test_an_unanswerable_move_check_raises_rather_than_reporting_agreement():
 
     from blastbox.host.stamp import Stamp, StampError
 
-    s = Stamp(blastbox="0.1.28", revision="c" * 40, base_name="redtusk-worker:bb0128",
-              base_digest="", base_image_id="sha256:" + "a" * 64)
+    s = Stamp(
+        blastbox="0.1.28",
+        revision="c" * 40,
+        base_name="redtusk-worker:bb0128",
+        base_digest="",
+        base_image_id="sha256:" + "a" * 64,
+    )
 
     def broken(argv):
-        return subprocess.CompletedProcess(argv, 1, "", "Cannot connect to the Docker daemon")
+        return subprocess.CompletedProcess(
+            argv, 1, "", "Cannot connect to the Docker daemon"
+        )
 
     with _pytest.raises(StampError):
         s.base_moved(broken)
@@ -914,11 +1096,18 @@ def test_an_absent_base_is_left_to_resolvable_not_double_reported():
     """One problem must not be counted as two."""
     from blastbox.host.stamp import Stamp
 
-    s = Stamp(blastbox="0.1.28", revision="c" * 40, base_name="redtusk-worker:bb0128",
-              base_digest="", base_image_id="sha256:" + "a" * 64)
+    s = Stamp(
+        blastbox="0.1.28",
+        revision="c" * 40,
+        base_name="redtusk-worker:bb0128",
+        base_digest="",
+        base_image_id="sha256:" + "a" * 64,
+    )
 
     def gone(argv):
-        return subprocess.CompletedProcess(argv, 1, "", "Error: No such image: redtusk-worker:bb0128")
+        return subprocess.CompletedProcess(
+            argv, 1, "", "Error: No such image: redtusk-worker:bb0128"
+        )
 
     assert s.base_moved(gone) == ""
 
@@ -932,14 +1121,21 @@ def test_a_deleted_base_TAG_is_unresolvable_even_when_the_image_id_survives():
     """
     from blastbox.host.stamp import Stamp
 
-    s = Stamp(blastbox="0.1.28", revision="c" * 40, base_name="redtusk-worker:bb0128",
-              base_digest="", base_image_id="sha256:" + "a" * 64)
+    s = Stamp(
+        blastbox="0.1.28",
+        revision="c" * 40,
+        base_name="redtusk-worker:bb0128",
+        base_digest="",
+        base_image_id="sha256:" + "a" * 64,
+    )
     asked = []
 
     def run(argv):
         argv = list(argv)
         asked.append(argv)
-        return subprocess.CompletedProcess(argv, 1, "", "Error: No such image: redtusk-worker:bb0128")
+        return subprocess.CompletedProcess(
+            argv, 1, "", "Error: No such image: redtusk-worker:bb0128"
+        )
 
     assert s.resolvable(run) is False
     assert any("redtusk-worker:bb0128" in a for a in asked[0]), (
@@ -976,10 +1172,13 @@ def test_an_image_with_no_blastbox_is_not_a_stamp_disagreement(monkeypatch):
         argv = list(argv)
         if "inspect" in argv:
             return subprocess.CompletedProcess(
-                argv, 0, '{"org.blastbox.version":"0.1.29"}', "")
+                argv, 0, '{"org.blastbox.version":"0.1.29"}', ""
+            )
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    monkeypatch.setattr(doctor, "version_in_image", lambda i, r=None: (doctor.NOPKG, ""))
+    monkeypatch.setattr(
+        doctor, "version_in_image", lambda i, r=None: (doctor.NOPKG, "")
+    )
     agrees, _ = verify_contents("redtusk-worker:x", run)
     assert agrees is None, "no blastbox in the image is 'nothing to join', not a lie"
 
@@ -993,11 +1192,15 @@ def test_a_failed_probe_is_still_a_disagreement(monkeypatch):
         argv = list(argv)
         if "inspect" in argv:
             return subprocess.CompletedProcess(
-                argv, 0, '{"org.blastbox.version":"0.1.29"}', "")
+                argv, 0, '{"org.blastbox.version":"0.1.29"}', ""
+            )
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     monkeypatch.setattr(
-        doctor, "version_in_image", lambda i, r=None: (doctor.UNKNOWN, "probe timed out"))
+        doctor,
+        "version_in_image",
+        lambda i, r=None: (doctor.UNKNOWN, "probe timed out"),
+    )
     agrees, detail = verify_contents("redtusk-worker:x", run)
     assert agrees is False and "probe timed out" in detail
 
@@ -1013,8 +1216,11 @@ def test_a_reference_pin_always_records_the_id_that_makes_it_checkable():
     """
     from blastbox.host.stamp import LABEL_BASE_IMAGE_ID
 
-    joined = " ".join(build_args(
-        blastbox_version="0.1.29", repo=".", base="base:tag", runner=_git("5aa1abc")))
+    joined = " ".join(
+        build_args(
+            blastbox_version="0.1.29", repo=".", base="base:tag", runner=_git("5aa1abc")
+        )
+    )
     assert f"{LABEL_BASE_IMAGE_ID}={_IID}" in joined, joined
 
 
@@ -1022,9 +1228,14 @@ def test_an_explicit_digest_reference_needs_no_id():
     """Nothing can move, so there is nothing to compare -- do not ask docker."""
     from blastbox.host.stamp import LABEL_BASE_IMAGE_ID
 
-    joined = " ".join(build_args(
-        blastbox_version="0.1.29", repo=".", base=f"reg.example/base@{_BD}",
-        runner=_git("5aa1abc")))
+    joined = " ".join(
+        build_args(
+            blastbox_version="0.1.29",
+            repo=".",
+            base=f"reg.example/base@{_BD}",
+            runner=_git("5aa1abc"),
+        )
+    )
     assert f"{LABEL_BASE_IMAGE_ID}=" in joined
     assert f"{LABEL_BASE_IMAGE_ID}={_IID}" not in joined
 
@@ -1051,3 +1262,206 @@ def test_the_digest_and_the_id_come_from_one_snapshot():
     build_args(blastbox_version="0.1.29", repo=".", base="base:tag", runner=run)
     assert len(calls) == 1, f"the base was inspected {len(calls)} times: {calls}"
     assert calls[0] == "{{json .RepoDigests}}\t{{.Id}}", calls[0]
+
+
+def test_builder_pins_are_recorded_in_the_labels(tmp_path):
+    """A multi-stage Dockerfile COPIES artifacts out of its builder stages.
+
+    Pinning them only in the build argv leaves the same plan, revision and base
+    able to produce a different image once a builder tag moves, with every label
+    identical -- the drift the pinning exists to prevent, with nothing recording
+    it afterwards.
+    """
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "t@e.st"], check=True
+    )
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "t"], check=True)
+    (tmp_path / "f").write_text("x")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "f"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "i"], check=True)
+
+    jdk = "eclipse-temurin@sha256:" + "9" * 64
+    args = build_args(
+        blastbox_version="0.1.38",
+        repo=tmp_path,
+        builders={"JDK_BUILD_IMAGE": jdk},
+    )
+    label = f"{LABEL_BUILDERS}=JDK_BUILD_IMAGE={jdk}"
+    assert label in args, args
+
+
+def test_an_image_with_no_builder_stages_records_an_empty_set(tmp_path):
+    """Most images have none. That is not a defect and must not read as one."""
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "t@e.st"], check=True
+    )
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "t"], check=True)
+    (tmp_path / "f").write_text("x")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "f"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "i"], check=True)
+
+    args = build_args(blastbox_version="0.1.38", repo=tmp_path)
+    assert f"{LABEL_BUILDERS}=" in args
+
+
+def test_the_builder_label_is_read_back(monkeypatch):
+    """Provenance nobody can read is not provenance."""
+    jdk = "eclipse-temurin@sha256:" + "9" * 64
+
+    def run(argv):
+        return subprocess.CompletedProcess(
+            argv, 0, json.dumps({LABEL_BUILDERS: f"JDK_BUILD_IMAGE={jdk}"}), ""
+        )
+
+    assert read("demo:t1", run).builders == f"JDK_BUILD_IMAGE={jdk}"
+
+
+def test_the_recorded_base_name_can_differ_from_the_one_built_against(tmp_path):
+    """A chain builds against private staging tags the run then removes.
+
+    Recording those leaves every child stamped with a reference deleted by the
+    very run that created it. The digest and ID still come from inspecting what
+    was actually built on -- only the NAME is the one a rebuild should use.
+    """
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "t@e.st"], check=True
+    )
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "t"], check=True)
+    (tmp_path / "f").write_text("x")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "f"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "i"], check=True)
+
+    ident = "sha256:" + "a" * 64
+
+    def run(argv):
+        if "rev-parse" in argv:
+            return subprocess.CompletedProcess(argv, 0, "abc1234\n", "")
+        if "status" in argv:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.CompletedProcess(argv, 0, f"[]\t{ident}", "")
+
+    args = build_args(
+        blastbox_version="0.1.38",
+        repo=tmp_path,
+        base="demo-base:t1-blastbox-staging-99",
+        record_base_as="demo-base:t1",
+        runner=run,
+    )
+    assert f"{LABEL_BASE_NAME}=demo-base:t1" in args, args
+    assert not any("staging-99" in a for a in args if a.startswith(LABEL_BASE_NAME)), (
+        args
+    )
+    # The PIN is still what was actually built against.
+    assert "BASE_IMAGE=demo-base:t1-blastbox-staging-99" in args, args
+
+
+def test_base_state_can_be_asked_about_a_different_reference():
+    """During verification the recorded name is not published yet.
+
+    The same image is reachable under its staging alias, so the LOOKUP is
+    redirected while the record stays as it is.
+    """
+    looked_at = []
+
+    def run(argv):
+        looked_at.append(argv[4])
+        return subprocess.CompletedProcess(argv, 0, "sha256:" + "b" * 64 + "\n", "")
+
+    stamp = Stamp(
+        blastbox="0.1.38",
+        revision="b" * 40,
+        base_name="demo-base:t1",
+        base_digest="sha256:" + "b" * 64,
+        base_image_id="sha256:" + "b" * 64,
+    )
+    present, ident = stamp.base_state(run, "demo-base:t1-blastbox-staging-99")
+    assert present and ident == "sha256:" + "b" * 64
+    assert looked_at == ["demo-base:t1-blastbox-staging-99"], looked_at
+    assert stamp.base_name == "demo-base:t1", "the record was rewritten"
+
+
+def test_presence_and_identity_come_from_one_inspection():
+    """Asked separately, an absent base recreated in between reads as fine.
+
+    `resolvable()` returns True for the newly present image and `base_moved()`
+    then compares nothing, so verification accepts an image whose base is not
+    the one it records -- the concurrent-tag case these checks exist for.
+    """
+    calls = []
+    ids = iter(["sha256:" + "c" * 64, "sha256:" + "d" * 64])
+
+    def run(argv):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, next(ids) + "\n", "")
+
+    stamp = Stamp(
+        blastbox="0.1.38",
+        revision="b" * 40,
+        base_name="demo-base:t1",
+        base_digest="sha256:" + "c" * 64,
+        base_image_id="sha256:" + "c" * 64,
+    )
+    present, ident = stamp.base_state(run)
+    assert len(calls) == 1, "presence and identity took two inspections"
+    assert present and ident == "sha256:" + "c" * 64
+
+
+@pytest.mark.parametrize(
+    ("declared", "installed"),
+    [
+        ("0.2.0-rc1", "0.2.0rc1"),
+        ("0.2.0_rev_3", "0.2.0.post3"),
+        ("0.2.0+linux-x86", "0.2.0+linux.x86"),
+        ("0.2.0", "0.2.0"),
+    ],
+)
+def test_a_stamp_agrees_with_the_installers_spelling_of_the_same_release(
+    monkeypatch, declared, installed
+):
+    """The label carries what the repo declared; the probe reports what pip did.
+
+    `0.2.0-rc1` and `0.2.0rc1` are the same release. Failing a build over the
+    punctuation rejects exactly the valid pins this tooling accepts.
+    """
+    import blastbox.host.doctor as doctor
+    import blastbox.host.stamp as mod
+
+    monkeypatch.setattr(mod, "read", lambda i, r=None: Stamp(blastbox=declared))
+    monkeypatch.setattr(doctor, "version_in_image", lambda i, r=None: (installed, ""))
+    agrees, detail = mod.verify_contents("demo:t1")
+    assert agrees is not False, detail
+
+
+def test_a_genuinely_different_version_is_still_caught(monkeypatch):
+    """Canonicalising must not turn the join into a rubber stamp."""
+    import blastbox.host.doctor as doctor
+    import blastbox.host.stamp as mod
+
+    monkeypatch.setattr(mod, "read", lambda i, r=None: Stamp(blastbox="0.1.34"))
+    monkeypatch.setattr(doctor, "version_in_image", lambda i, r=None: ("0.1.31", ""))
+    agrees, detail = mod.verify_contents("demo:t1")
+    assert agrees is False and "0.1.31" in detail
+
+
+def test_an_unparseable_version_falls_back_to_what_was_written():
+    """Used to COMPARE, so it must not raise inside a verification path."""
+    assert canonical_version("not-a-version") == "not-a-version"
+
+
+def test_equal_releases_spelled_with_different_precision_agree(monkeypatch):
+    """`blastbox>=0.2` pins `0.2`; the installed metadata may read `0.2.0`.
+
+    They are the same release to any installer, but `str(Version(...))` keeps
+    the release-segment spelling it was given -- so comparing canonical STRINGS
+    rejected a correctly built image over a trailing zero.
+    """
+    import blastbox.host.doctor as doctor
+    import blastbox.host.stamp as mod
+
+    monkeypatch.setattr(mod, "read", lambda i, r=None: Stamp(blastbox="0.2"))
+    monkeypatch.setattr(doctor, "version_in_image", lambda i, r=None: ("0.2.0", ""))
+    agrees, detail = mod.verify_contents("demo:t1")
+    assert agrees is not False, detail

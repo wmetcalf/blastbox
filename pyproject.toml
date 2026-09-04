@@ -27,6 +27,14 @@ classifiers = [
 # protocol). An engine adapter installs `blastbox` and stays lean.
 dependencies = [
     "pydantic>=2.6.0",
+    # PEP 440 semantics, in the one place they cannot be approximated: a pin of
+    # `0.2.0-rc1` is normalised by the installer to `0.2.0rc1`, so a stamp that
+    # records the source spelling and compares it literally against
+    # `importlib.metadata.version()` fails verification for a build that is
+    # entirely correct. The adopter engines' build wrappers already require
+    # this to be importable from blastbox's environment for their version
+    # floor; declaring it makes that true rather than hoped for.
+    "packaging>=23.0",
 ]
 
 [project.optional-dependencies]

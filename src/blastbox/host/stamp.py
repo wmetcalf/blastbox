@@ -19,12 +19,13 @@ tooling can read them:
 ``org.opencontainers.image.base.digest``, ``.base.name``, ``.revision``,
 plus ``org.blastbox.version`` for the framework version, which OCI has no key for.
 """
+
 from __future__ import annotations
 
 import json
 import re
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,6 +39,11 @@ LABEL_BASE_DIGEST = "org.opencontainers.image.base.digest"
 # it exactly on this host, but it is NOT a repo digest and must not be written
 # into the OCI key as if it were.
 LABEL_BASE_IMAGE_ID = "org.blastbox.base.image_id"
+# The BUILDER stages, which are as much a part of what an image contains as its
+# base is: a multi-stage Dockerfile COPIES artifacts out of them. Recorded as
+# `ARG=ref` pairs joined by commas -- one label rather than one per argument,
+# because the set is declared per image and varies between them.
+LABEL_BUILDERS = "org.blastbox.builders"
 
 # Emitted flags are consumed with `$(blastbox stamp ...)`. Command substitution
 # word-splits its output but does NOT remove quotes, so a quoted value arrives
@@ -76,7 +82,9 @@ def _run(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(list(argv), capture_output=True, text=True, timeout=60)
     except subprocess.TimeoutExpired as exc:
-        raise StampError(f"{argv[0]} timed out: {' '.join(map(str, argv))[:120]}") from exc
+        raise StampError(
+            f"{argv[0]} timed out: {' '.join(map(str, argv))[:120]}"
+        ) from exc
     except FileNotFoundError as exc:
         if argv and argv[0] == "git":
             raise
@@ -92,6 +100,9 @@ class Stamp:
     base_name: str = UNKNOWN
     base_digest: str = UNKNOWN
     base_image_id: str = UNKNOWN
+    # `ARG=ref` pairs, comma-joined. Empty when the image declares no builder
+    # stages, which is the common case and not a defect.
+    builders: str = ""
 
     @property
     def reproducible(self) -> bool:
@@ -116,58 +127,75 @@ class Stamp:
             and not self.revision.endswith(DIRTY_SUFFIX)
         )
 
-    def resolvable(self, runner: Runner | None = None) -> bool:
-        """Whether the recorded base is STILL present on this host.
+    def base_state(
+        self, runner: Runner | None = None, ref: str | None = None
+    ) -> tuple[bool, str]:
+        """``(present, current_image_id)`` for the recorded base, from ONE look.
 
-        `reproducible` says the image recorded enough; this says the recorded
-        base can actually be found. They differ exactly in the case that
-        started this work: a perfectly stamped image whose base has since been
-        deleted is not rebuildable, and reporting OK for it would repeat the
-        original failure.
+        Presence and identity are the same question asked of the same moment.
+        Answered separately -- `resolvable()` then `base_moved()` -- a base that
+        is absent for the first call and recreated before the second reports
+        "present, and nothing moved", and the newly present image's ID is never
+        compared with the record at all. That is precisely the concurrent-tag
+        case these checks exist for.
+
+        ``ref`` overrides WHICH reference to inspect, for the window in which
+        the recorded name is not yet published. The chain builds under private
+        staging tags while the stamps name the tags that WILL be published, so
+        during verification the recorded name does not exist yet and the same
+        image is reachable under its staging alias. The record is unchanged;
+        only the lookup is redirected.
+
+        Raises rather than answering when the question cannot be ASKED: callers
+        state "the base is gone" on a False, so an unreachable daemon must not
+        be reported as absence.
         """
-        if not self.reproducible:
-            return False
         run = runner or _run
         # Check the reference a REBUILD would actually use. build_args pins to
         # exactly the base it was given, and that is what base_name records, so
         # there is nothing to reconstruct here. Inspecting the image ID instead
         # reported OK for a base whose tag had been deleted -- the ID is still
         # in docker's store, but the tag is what gets handed to the builder.
-        ref = self.base_name
-        # A failure to ASK is not an answer. Callers state "the base is gone"
-        # on a False, so an unreachable daemon must raise rather than be
-        # reported as absence -- the same rule read() and doctor already follow.
-        proc = run(["docker", "inspect", "--type", "image", ref,
-                    "--format", "{{.Id}}"])
+        name = ref or self.base_name
+        proc = run(
+            ["docker", "inspect", "--type", "image", name, "--format", "{{.Id}}"]
+        )
         if proc.returncode == 0:
-            return True
+            return True, (proc.stdout or "").strip()
         stderr = (proc.stderr or "").lower()
         if "no such" in stderr or "not found" in stderr:
-            return False
+            return False, ""
         raise StampError(
-            f"cannot determine whether {ref} is present: "
+            f"cannot determine whether {name} is present: "
             f"{(proc.stderr or '').strip()[:120]}"
         )
 
+    def resolvable(self, runner: Runner | None = None, ref: str | None = None) -> bool:
+        """Whether the recorded base is STILL present on this host.
 
-    def base_moved(self, runner: Runner | None = None) -> str:
+        `reproducible` says the image recorded enough; this says the recorded
+        base can actually be found. They differ exactly in the case that started
+        this work: a perfectly stamped image whose base has since been deleted
+        is not rebuildable, and reporting OK for it would repeat the original
+        failure.
+        """
+        if not self.reproducible:
+            return False
+        return self.base_state(runner, ref)[0]
+
+    def base_moved(self, runner: Runner | None = None, ref: str | None = None) -> str:
         """The base reference's CURRENT image ID, when it differs from the record.
 
         Empty string means "no disagreement to report": either the base was
         pinned by a registry digest (immutable, nothing to check), nothing was
-        recorded, or the reference still resolves to the image that was stamped.
+        recorded, the reference is gone entirely -- which is `resolvable`'s
+        finding, and reporting it here too would double-count one problem as
+        two -- or it still resolves to the image that was stamped.
 
         This is the check that makes an ID-only stamp trustworthy after the
         fact. A local tag can move between the inspection that produced the
         label and the build that consumed it -- concurrent builds do exactly
         this -- and the result is a child built from B while claiming A.
-        Nothing can prevent that without a registry digest, but the tag either
-        still resolves to the recorded ID or it does not, and that is
-        answerable.
-
-        Raises rather than reporting agreement when the question cannot be
-        asked, for the same reason `resolvable` does: a failure to ASK is not
-        an answer, and silence here would read as "verified".
         """
         if "@sha256:" in (self.base_name or ""):
             return ""  # pinned by digest in the reference itself; it cannot move
@@ -175,20 +203,9 @@ class Stamp:
         name = self.base_name or ""
         if not _DIGEST_RE.match(recorded) or name in (UNKNOWN, ""):
             return ""
-        run = runner or _run
-        proc = run(["docker", "inspect", "--type", "image", name, "--format", "{{.Id}}"])
-        if proc.returncode != 0:
-            stderr = (proc.stderr or "").lower()
-            if "no such" in stderr or "not found" in stderr:
-                # The reference is gone entirely -- that is `resolvable`'s
-                # finding, not a moved tag, and reporting it here too would
-                # double-count one problem as two.
-                return ""
-            raise StampError(
-                f"cannot determine whether {name} still resolves to the recorded "
-                f"image: {(proc.stderr or '').strip()[:120]}"
-            )
-        current = (proc.stdout or "").strip()
+        present, current = self.base_state(runner, ref)
+        if not present:
+            return ""
         return "" if current == recorded else current
 
 
@@ -224,13 +241,22 @@ def git_revision(repo: Path | str, runner: Runner | None = None) -> str:
         return recorded or UNKNOWN
     sha = head.stdout.strip()
     try:
+        # `normal` is enough HERE: this only needs the boolean "is the tree
+        # dirty", and an untracked directory already answers it. `_source_state`
+        # in imagerun needs `all`, because it fingerprints WHAT changed.
         # --untracked-files=normal overrides a repo/global
         # status.showUntrackedFiles=no. Untracked files are build inputs -- a
         # COPY picks them up -- so hiding them would stamp a dirty tree clean.
-        dirty = run([
-            "git", "-C", str(repo), "status", "--porcelain",
-            "--untracked-files=normal",
-        ])
+        dirty = run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "status",
+                "--porcelain",
+                "--untracked-files=normal",
+            ]
+        )
     except (FileNotFoundError, OSError):
         # git vanished between the two calls; we cannot claim the tree is clean.
         return f"{sha}{DIRTY_SUFFIX}"
@@ -248,15 +274,19 @@ def git_revision(repo: Path | str, runner: Runner | None = None) -> str:
 # daemon: `docker inspect docker.io/minio/minio:latest` returns `minio/minio@…`.
 # Without normalising, stamping a fully-qualified base raises "1 repo digests and
 # none for 'docker.io/minio/minio'".
-_HUB_PREFIXES = ("docker.io/library/", "index.docker.io/library/",
-                 "docker.io/", "index.docker.io/")
+_HUB_PREFIXES = (
+    "docker.io/library/",
+    "index.docker.io/library/",
+    "docker.io/",
+    "index.docker.io/",
+)
 
 
 def _canonical_repo(repo: str) -> str:
     """Strip Docker Hub's implicit registry/namespace so references compare equal."""
     for prefix in _HUB_PREFIXES:
         if repo.startswith(prefix):
-            return repo[len(prefix):]
+            return repo[len(prefix) :]
     return repo
 
 
@@ -285,7 +315,9 @@ def base_image_id(image: str, runner: Runner | None = None) -> str:
     proc = run(["docker", "inspect", "--type", "image", image, "--format", "{{.Id}}"])
     if proc.returncode == 0 and proc.stdout.strip():
         return proc.stdout.strip()
-    raise StampError(f"{image}: cannot resolve an image ID (absent, or docker unavailable)")
+    raise StampError(
+        f"{image}: cannot resolve an image ID (absent, or docker unavailable)"
+    )
 
 
 def repo_digest_ref(image: str, digests_json: str) -> str:
@@ -336,8 +368,17 @@ def _inspect_base(image: str, runner: Runner | None = None) -> tuple[str, str]:
     stamp pairing one image's digest with another's ID.
     """
     run = runner or _run
-    proc = run(["docker", "inspect", "--type", "image", image,
-                "--format", "{{json .RepoDigests}}\t{{.Id}}"])
+    proc = run(
+        [
+            "docker",
+            "inspect",
+            "--type",
+            "image",
+            image,
+            "--format",
+            "{{json .RepoDigests}}\t{{.Id}}",
+        ]
+    )
     if proc.returncode != 0 or not (proc.stdout or "").strip():
         raise StampError(
             f"{image}: cannot resolve a digest (image absent, or docker "
@@ -347,7 +388,9 @@ def _inspect_base(image: str, runner: Runner | None = None) -> tuple[str, str]:
     raw = proc.stdout.strip().split("\t")
     digests_json, image_id = raw[0], (raw[1].strip() if len(raw) > 1 else "")
     if not image_id:
-        raise StampError(f"{image}: cannot resolve an image ID (absent, or docker unavailable)")
+        raise StampError(
+            f"{image}: cannot resolve an image ID (absent, or docker unavailable)"
+        )
     return _digest_from(image, digests_json), image_id
 
 
@@ -358,8 +401,17 @@ def base_digest(image: str, runner: Runner | None = None) -> str:
     identifier and belongs in its own label.
     """
     run = runner or _run
-    proc = run(["docker", "inspect", "--type", "image", image,
-                "--format", "{{json .RepoDigests}}"])
+    proc = run(
+        [
+            "docker",
+            "inspect",
+            "--type",
+            "image",
+            image,
+            "--format",
+            "{{json .RepoDigests}}",
+        ]
+    )
     if proc.returncode == 0:
         return _digest_from(image, proc.stdout.strip())
     raise StampError(
@@ -489,8 +541,14 @@ def assert_arg_selects_base(dockerfile: Path | str, base_arg: str) -> None:
 
 
 def build_args(
-    *, blastbox_version: str, repo: Path | str, base: str | None = None,
-    base_arg: str = "BASE_IMAGE", dockerfile: Path | str | None = None,
+    *,
+    blastbox_version: str,
+    repo: Path | str,
+    base: str | None = None,
+    base_arg: str = "BASE_IMAGE",
+    dockerfile: Path | str | None = None,
+    record_base_as: str | None = None,
+    builders: Mapping[str, str] | None = None,
     runner: Runner | None = None,
 ) -> list[str]:
     """`docker build` flags that stamp the image.
@@ -564,9 +622,24 @@ def build_args(
     labels = {
         LABEL_BLASTBOX: blastbox_version,
         LABEL_REVISION: revision,
-        LABEL_BASE_NAME: base or "",
+        # What a REBUILD should name, which is not always what this build was
+        # given. A chain builds against private staging tags that are removed
+        # once the run publishes; recording those would leave every child of an
+        # internal base stamped with a reference that no longer exists -- the
+        # image reads back as STAMPED BUT UNBUILDABLE the moment it succeeds.
+        # The digest and ID below still come from inspecting what was actually
+        # built on, and publication points this name at exactly that image.
+        LABEL_BASE_NAME: record_base_as or base or "",
         LABEL_BASE_DIGEST: digest,
         LABEL_BASE_IMAGE_ID: image_id,
+        # Provenance, not a pin: the pins themselves go through as build args.
+        # Without this, the same plan, revision and base could produce a
+        # different image after a builder tag moved, and every label would be
+        # identical -- the builder-stage drift this pinning exists to prevent,
+        # left unrecorded and so undetectable afterwards.
+        LABEL_BUILDERS: ",".join(
+            f"{k}={v}" for k, v in sorted((builders or {}).items())
+        ),
     }
     args: list[str] = []
     for key, value in labels.items():
@@ -610,7 +683,50 @@ def _require_shell_safe(key: str, value: str) -> None:
         )
 
 
-def verify_contents(image: str, runner: Runner | None = None) -> tuple[bool | None, str]:
+def canonical_version(version: str) -> str:
+    """``version`` as an installer would record it, or unchanged if unparseable.
+
+    `0.2.0-rc1`, `0.2.0_rev_3` and `0.2.0+linux-x86` are all valid PEP 440 and
+    all normalise to something else once installed (`0.2.0rc1`, `0.2.0.post3`,
+    `0.2.0+linux.x86`). Comparing the source spelling against
+    `importlib.metadata.version()` therefore fails for pins that are perfectly
+    correct.
+
+    Unparseable input is returned as it came: this is used to COMPARE, and a
+    value nobody can parse should fall back to comparing what was actually
+    written rather than raise inside a verification path.
+    """
+    from packaging.version import InvalidVersion, Version  # noqa: PLC0415
+
+    try:
+        return str(Version(version))
+    except InvalidVersion:
+        return version
+
+
+def _same_release(left: str, right: str) -> bool:
+    """Whether two spellings name the same release under PEP 440.
+
+    Compared as VERSIONS, not as canonical strings. `0.2` and `0.2.0` are equal
+    to pip and to any installer, and `str(Version(...))` preserves the
+    release-segment spelling it was given -- so a consumer pinning
+    `blastbox>=0.2` got an image whose metadata reads `0.2.0` and failed its own
+    verification over a trailing zero.
+
+    Falls back to comparing what was written when either side cannot be parsed:
+    this runs inside a verification path and must not raise.
+    """
+    from packaging.version import InvalidVersion, Version  # noqa: PLC0415
+
+    try:
+        return Version(left) == Version(right)
+    except InvalidVersion:
+        return left == right
+
+
+def verify_contents(
+    image: str, runner: Runner | None = None
+) -> tuple[bool | None, str]:
     """Check the recorded blastbox version against what the image ACTUALLY has.
 
     The `org.blastbox.version` label is a self-report: `build_args` writes
@@ -640,7 +756,11 @@ def verify_contents(image: str, runner: Runner | None = None) -> tuple[bool | No
         return None, detail or "the image contains no blastbox"
     if actual == D_UNKNOWN:
         return False, f"cannot read the image's blastbox: {detail}"
-    if actual != stamped:
+    # Compared CANONICALLY. The label carries the spelling the repo declared and
+    # the probe reports the spelling the installer recorded; `0.2.0-rc1` and
+    # `0.2.0rc1` are the same release, and failing a build over the punctuation
+    # would reject exactly the valid pins this tooling accepts.
+    if not _same_release(actual, stamped):
         return False, f"label says {stamped}, image contains {actual}"
     return True, actual
 
@@ -652,8 +772,17 @@ def read(image: str, runner: Runner | None = None) -> Stamp:
     name or a stopped daemon must not read as "this image is unstamped".
     """
     run = runner or _run
-    proc = run(["docker", "inspect", "--type", "image", image,
-                "--format", "{{json .Config.Labels}}"])
+    proc = run(
+        [
+            "docker",
+            "inspect",
+            "--type",
+            "image",
+            image,
+            "--format",
+            "{{json .Config.Labels}}",
+        ]
+    )
     if proc.returncode != 0:
         raise StampError(
             f"{image}: cannot inspect ({(proc.stderr or '').strip()[:120]})"
@@ -671,4 +800,5 @@ def read(image: str, runner: Runner | None = None) -> Stamp:
         base_name=labels.get(LABEL_BASE_NAME, UNKNOWN),
         base_digest=labels.get(LABEL_BASE_DIGEST, UNKNOWN),
         base_image_id=labels.get(LABEL_BASE_IMAGE_ID, UNKNOWN),
+        builders=labels.get(LABEL_BUILDERS, ""),
     )
