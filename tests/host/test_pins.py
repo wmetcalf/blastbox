@@ -2672,3 +2672,160 @@ def test_a_base_dependency_is_always_an_install_failure(tmp_path):
     )
     gaps = missing_from_locks(tmp_path, ["pydantic>=2.6.0", "packaging>=23.0"])
     assert list(gaps.values()) == [["packaging"]], gaps
+
+
+def test_a_quoted_include_is_followed(tmp_path):
+    """pip accepts `-r "child.lock"`, and the shell is not involved here.
+
+    Keeping the quotes made `_safe_include` reject a path that does not exist,
+    so the child stayed unresolved while still being removed from the roots --
+    leaving an install set nobody checked.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path, "child.lock", _entry("pydantic==2.13.5") + _entry("packaging==26.3")
+    )
+    _write(
+        tmp_path,
+        "root.lock",
+        _entry("blastbox==0.1.39") + '-r "child.lock"\n' + _entry("backport==1.0"),
+    )
+    assert (
+        missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"}) == {}
+    )
+
+    # NOT vacuous: break the child and the same call must report it.
+    _write(tmp_path, "child.lock", _entry("pydantic==2.13.5"))
+    broken = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert list(broken.values()) == [["packaging"]], broken
+
+
+def test_two_extras_of_one_package_are_both_traversed(tmp_path):
+    """`parent[feature]` needing `child[a]` and `child[b]` visits child twice.
+
+    A cycle key of (name, version) makes the second visit a no-op, so a lock
+    carrying a's dependencies but not b's is accepted although pip enables both.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    meta = {
+        ("parent", "1.0"): [
+            'child[a]>=1; extra == "feature"',
+            'child[b]>=1; extra == "feature"',
+        ],
+        ("child", "1.0"): ['dep-a>=1; extra == "a"', 'dep-b>=1; extra == "b"'],
+    }
+    _write(
+        tmp_path,
+        "req.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("parent==1.0")
+        + _entry("child==1.0")
+        + _entry("dep-a==1.0"),
+    )
+    gaps = missing_from_locks(
+        tmp_path,
+        ["pydantic>=2.6.0", "parent[feature]>=1"],
+        requirements_of=lambda n, v: meta.get((n, v)),
+    )
+    assert list(gaps.values()) == [["dep-b (needed by child)"]], gaps
+
+    # BOTH orders. The walk pops depth-first, so with a (name, version) key
+    # only one of these two arrangements short-circuits -- whichever extra is
+    # visited second. Testing one of them lets the bug survive half the time.
+    _write(
+        tmp_path,
+        "req.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("parent==1.0")
+        + _entry("child==1.0")
+        + _entry("dep-b==1.0"),
+    )
+    other = missing_from_locks(
+        tmp_path,
+        ["pydantic>=2.6.0", "parent[feature]>=1"],
+        requirements_of=lambda n, v: meta.get((n, v)),
+    )
+    assert list(other.values()) == [["dep-a (needed by child)"]], other
+
+
+def test_a_commented_out_install_is_not_an_install(tmp_path):
+    """`# old: pip install -r prod.lock` is a note, not a command.
+
+    Promoting it to a root judges that lock alone and refuses a bump for
+    dependencies its real parent install set supplies.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path, "prod.lock", _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5")
+    )
+    _write(
+        tmp_path,
+        "dev.lock",
+        "-r prod.lock\n" + _entry("packaging==26.3") + _entry("backport==1.0"),
+    )
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\n# old: pip install -r prod.lock\n"
+        "RUN pip install --require-hashes -r dev.lock\n"
+    )
+    assert (
+        missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"}) == {}
+    )
+
+
+def test_extras_are_attributed_to_the_command_that_installs_the_lock(tmp_path):
+    """A multi-stage Dockerfile installs different things in different stages.
+
+    Taking every `blastbox[...]` in the file applies `host` to a production
+    lock whose stage installs plain blastbox, and rejects it for omitting
+    dependencies it never asked for.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    body = (
+        _entry("pydantic==2.13.5") + _entry("packaging==26.3") + _entry("backport==1.0")
+    )
+    _write(tmp_path, "prod.lock", _entry("blastbox==0.1.39") + body)
+    _write(
+        tmp_path,
+        "dev.lock",
+        _entry("blastbox==0.1.39")
+        + body
+        + _entry("fastapi==1.2.0")
+        + _entry("uvicorn==1.1.0"),
+    )
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12 AS prod\n"
+        "RUN pip install --require-hashes -r prod.lock\n"
+        "FROM python:3.12 AS dev\n"
+        "RUN pip install blastbox[host] --require-hashes -r dev.lock\n"
+    )
+    gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert gaps == {}, gaps
+
+
+def test_the_cli_reports_an_unreadable_lock_instead_of_crashing(tmp_path, capsys):
+    """Recognised locks RAISE when unreadable, on purpose.
+
+    That has to reach the operator as the command's own diagnostic and exit 2,
+    not as a traceback out of a check they did not ask for.
+    """
+    import blastbox.host.pins as mod
+    from blastbox.host.cli import _pins_set
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\ndependencies = ["blastbox>=0.1.38,<0.2"]\n'
+    )
+    _write(tmp_path, "requirements.lock", _entry("blastbox==0.1.38"))
+    limit = mod._LOCK_READ_LIMIT
+    try:
+        mod._LOCK_READ_LIMIT = 10
+        rc = _pins_set(tmp_path, "0.1.39", allow_unreleased=True)
+    finally:
+        mod._LOCK_READ_LIMIT = limit
+    assert rc == 2
+    assert "cannot check the dependency closure" in capsys.readouterr().out

@@ -1618,7 +1618,15 @@ def _pins_set(root: Path, version: str, *, allow_unreleased: bool) -> int:
         except Exception as exc:  # noqa: BLE001 -- network shape varies
             print(f"cannot read {version}'s dependencies from PyPI: {exc}")
             return 2
-        gaps = missing_from_locks(root, requires, requirements_of=_requirements_of)
+        try:
+            gaps = missing_from_locks(root, requires, requirements_of=_requirements_of)
+        except PinScanError as exc:
+            # Recognised locks RAISE when they cannot be read, deliberately --
+            # reading one as empty reports its whole closure present. That has
+            # to arrive as the CLI's own diagnostic and exit 2, not as a
+            # traceback from inside a check the operator did not ask for.
+            print(f"cannot check the dependency closure: {exc}")
+            return 2
         if gaps:
             print(f"refusing to pin {root.name} to blastbox {version}:")
             for path, names in sorted(gaps.items()):

@@ -26,7 +26,7 @@ from __future__ import annotations
 import os
 import stat
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Sequence, Set as AbstractSet
 from typing import Any
 import tomllib
 from dataclasses import dataclass
@@ -941,9 +941,9 @@ def _transitive_gaps(
     than the drift it guards against.
     """
     gaps: list[str] = []
-    seen: set[tuple[str, str]] = set()
-    queue: list[tuple[Any, set[str]]] = [
-        (req, extras)
+    seen: set[tuple[str, str, frozenset[str]]] = set()
+    queue: list[tuple[Any, frozenset[str]]] = [
+        (req, frozenset(extras))
         for req in parsed
         if req is not None and _applies(req, extras, scope)
     ]
@@ -959,14 +959,18 @@ def _transitive_gaps(
         ]
         if not usable:
             continue  # the direct pass already reported it, or it does not apply
-        key = (name, usable[0].version)
+        wanted = frozenset(e.lower() for e in (req.extras or set()))
+        # The extras are PART of the identity. `parent[feature]` requiring both
+        # `child[a]` and `child[b]` visits child twice, and a key of
+        # (name, version) makes the second visit a no-op -- so a lock carrying
+        # a's dependencies but not b's is accepted although pip enables both.
+        key = (name, usable[0].version, wanted)
         if key in seen:
             continue
         seen.add(key)
         nested = requirements_of(name, usable[0].version)
         if nested is None:
             continue
-        wanted = {e.lower() for e in (req.extras or set())}
         for sub in (_requirement(r) for r in nested):
             if sub is None or not _applies(sub, wanted, scope):
                 continue
@@ -1080,7 +1084,11 @@ def _referenced(path: Path, root: Path) -> list[Path]:
     # A quoted path is the same path: the shell strips the quotes before pip
     # ever sees them, and refusing to match one drops a real install set.
     for match in re.finditer(
-        r"""(?:-r|--requirement)[=\s]+["']?([\w./\-]+)""", _read_small(path)
+        r"""(?:-r|--requirement)[=\s]+["']?([\w./\-]+)""",
+        # Comments stripped: `# old: pip install -r prod.lock` is a note, and
+        # promoting it to a root judges that lock alone -- refusing a bump for
+        # dependencies its real parent install set supplies.
+        "\n".join(_strip_comment(line) for line in _read_small(path).splitlines()),
     ):
         for base in (path.parent, root):
             target = _safe_include(base / match.group(1), root)
@@ -1250,7 +1258,7 @@ def _effective_pins(
         return pins, extras, env
     env.update(_lock_environment(text))
     for line in _joined_lines(text):
-        include = re.match(r"^(?:-r|--requirement)[=\s]+(\S+)", line)
+        include = re.match(r"""^(?:-r|--requirement)[=\s]+["']?([^\s"']+)""", line)
         if include:
             target = _safe_include(path.parent / include.group(1), root or path.parent)
             if target is None:
@@ -1354,11 +1362,35 @@ def _declared_extras_for(root: Path, lock: Path, roots: Sequence[Path]) -> set[s
     for path in _walk(root):
         if not _INSTALL_SCRIPT_RE.fullmatch(path.name) or _is_install_input(path):
             continue
-        if target in set(_referenced(path, root)):
-            out |= _blastbox_extras_in(path)
+        # Per COMMAND, not per file. A multi-stage Dockerfile can install plain
+        # blastbox from prod.lock in one stage and `blastbox[host]` from
+        # dev.lock in another; taking every occurrence in the file applies host
+        # to prod.lock and rejects a lock whose stage never installs it.
+        for line in _joined_lines(_read_small(path)):
+            if target not in set(_referenced_in(line, path.parent, root)):
+                continue
+            out |= {
+                e.strip().lower()
+                for match in re.finditer(r"(?i)\bblastbox\[([^\]]+)\]", line)
+                for e in match.group(1).split(",")
+                if e.strip()
+            }
     if out:
         return out
     return _declared_blastbox_extras(root) if len(roots) == 1 else set()
+
+
+def _referenced_in(line: str, base: Path, root: Path) -> list[Path]:
+    """Requirement files named by ONE command."""
+    out: list[Path] = []
+    for match in re.finditer(
+        r"""(?:-r|--requirement)[=\s]+["']?([\w./\-]+)""", _strip_comment(line)
+    ):
+        for candidate in (base, root):
+            target = _safe_include(candidate / match.group(1), root)
+            if target is not None:
+                out.append(target)
+    return out
 
 
 def _blastbox_extras_in(path: Path) -> set[str]:
@@ -1509,7 +1541,7 @@ def _with_nested_extras(
         out = grown
 
 
-def _applies(req, extras: set[str], environment: dict[str, str] | None) -> bool:
+def _applies(req, extras: AbstractSet[str], environment: dict[str, str] | None) -> bool:
     """Whether ``req`` is one this lock actually has to carry."""
     if req.marker is None:
         return True
