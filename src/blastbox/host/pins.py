@@ -1084,7 +1084,7 @@ def _referenced(path: Path, root: Path) -> list[Path]:
     # A quoted path is the same path: the shell strips the quotes before pip
     # ever sees them, and refusing to match one drops a real install set.
     for match in re.finditer(
-        r"""(?:-r|--requirement)[=\s]+["']?([\w./\-]+)""",
+        r"""(?:-r[=\s]*|--requirement[=\s]+)["']?([\w./\-]+)""",
         # Comments stripped: `# old: pip install -r prod.lock` is a note, and
         # promoting it to a root judges that lock alone -- refusing a bump for
         # dependencies its real parent install set supplies.
@@ -1124,7 +1124,9 @@ def _includes(path: Path, root: Path) -> list[Path]:
     # only ever installed through the complete dev set.
     text = _read_requirements(path) if _is_install_input(path) else _read_small(path)
     for raw in _joined_lines(text):
-        match = re.match(r"""^(?:-r|--requirement)[=\s]+["']?([^\s"']+)""", raw.strip())
+        match = re.match(
+            r"""^(?:-r[=\s]*|--requirement[=\s]+)["']?([^\s"']+)""", raw.strip()
+        )
         if not match:
             continue
         target = _safe_include(path.parent / match.group(1), root)
@@ -1188,13 +1190,34 @@ def _lock_environment(text: str) -> dict[str, str]:
     platform = re.search(r"--python-platform[=\s]+(\S+)", text)
     if platform:
         token = platform.group(1).lower()
-        _WIN = {"sys_platform": "win32", "os_name": "nt", "platform_system": "Windows"}
+        # The bare names carry uv's DEFAULT architecture, which is not the
+        # host's. Measured with `uv pip compile --python-platform <name>`
+        # against marker-guarded requirements, because the help text lists the
+        # aliases without saying what they resolve to:
+        #     macos    -> platform_machine == "arm64"
+        #     linux    -> platform_machine == "x86_64"
+        #     windows  -> platform_machine == "x86_64"
+        # Leaving it to the running interpreter skipped an arm64-guarded
+        # dependency for a macos lock on an x86 Linux host. An explicit target
+        # triple overrides these below.
+        _WIN = {
+            "sys_platform": "win32",
+            "os_name": "nt",
+            "platform_system": "Windows",
+            "platform_machine": "x86_64",
+        }
         _MAC = {
             "sys_platform": "darwin",
             "os_name": "posix",
             "platform_system": "Darwin",
+            "platform_machine": "arm64",
         }
-        _NIX = {"sys_platform": "linux", "os_name": "posix", "platform_system": "Linux"}
+        _NIX = {
+            "sys_platform": "linux",
+            "os_name": "posix",
+            "platform_system": "Linux",
+            "platform_machine": "x86_64",
+        }
         for needle, values in (
             ("windows", _WIN),
             ("win32", _WIN),
@@ -1258,7 +1281,9 @@ def _effective_pins(
         return pins, extras, env
     env.update(_lock_environment(text))
     for line in _joined_lines(text):
-        include = re.match(r"""^(?:-r|--requirement)[=\s]+["']?([^\s"']+)""", line)
+        include = re.match(
+            r"""^(?:-r[=\s]*|--requirement[=\s]+)["']?([^\s"']+)""", line
+        )
         if include:
             target = _safe_include(path.parent / include.group(1), root or path.parent)
             if target is None:
@@ -1384,7 +1409,7 @@ def _referenced_in(line: str, base: Path, root: Path) -> list[Path]:
     """Requirement files named by ONE command."""
     out: list[Path] = []
     for match in re.finditer(
-        r"""(?:-r|--requirement)[=\s]+["']?([\w./\-]+)""", _strip_comment(line)
+        r"""(?:-r[=\s]*|--requirement[=\s]+)["']?([\w./\-]+)""", _strip_comment(line)
     ):
         for candidate in (base, root):
             target = _safe_include(candidate / match.group(1), root)

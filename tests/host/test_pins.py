@@ -2829,3 +2829,90 @@ def test_the_cli_reports_an_unreadable_lock_instead_of_crashing(tmp_path, capsys
         mod._LOCK_READ_LIMIT = limit
     assert rc == 2
     assert "cannot check the dependency closure" in capsys.readouterr().out
+
+
+def test_the_attached_short_form_of_r_is_followed(tmp_path):
+    """pip accepts `-rFILE` with no separator at all.
+
+    Requiring whitespace or `=` left the child unresolved while it was still
+    removed from the roots -- an install set nobody checks, which accepts any
+    closure.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path, "child.pins", _entry("pydantic==2.13.5") + _entry("packaging==26.3")
+    )
+    _write(
+        tmp_path,
+        "root.lock",
+        _entry("blastbox==0.1.39") + "-rchild.pins\n" + _entry("backport==1.0"),
+    )
+    assert (
+        missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"}) == {}
+    )
+
+    # NOT vacuous: break the child and the same call must report it.
+    _write(tmp_path, "child.pins", _entry("pydantic==2.13.5"))
+    broken = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert list(broken.values()) == [["packaging"]], broken
+
+
+def test_a_bare_platform_name_carries_uvs_default_architecture(tmp_path):
+    """Measured, because uv's help lists the aliases without resolving them.
+
+        uv pip compile --python-platform macos    -> platform_machine "arm64"
+        uv pip compile --python-platform linux    -> platform_machine "x86_64"
+
+    Leaving it to the running interpreter skipped an arm64-guarded dependency
+    for a macos lock on an x86 Linux host.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    reqs = ["pydantic>=2.6.0", 'mac-arm>=1; platform_machine == "arm64"']
+    for platform, expected in (("macos", [["mac-arm"]]), ("linux", [])):
+        _write(
+            tmp_path,
+            "req.lock",
+            f"# uv pip compile --generate-hashes --python-platform {platform}\n"
+            + _entry("blastbox==0.1.39")
+            + _entry("pydantic==2.13.5"),
+        )
+        gaps = missing_from_locks(tmp_path, reqs)
+        assert list(gaps.values()) == expected, (platform, gaps)
+
+    # An explicit triple still wins over the bare default.
+    _write(
+        tmp_path,
+        "req.lock",
+        "# uv pip compile --python-platform x86_64-apple-darwin\n"
+        + _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5"),
+    )
+    assert missing_from_locks(tmp_path, reqs) == {}
+
+
+def test_bare_platform_names_map_to_uvs_measured_defaults():
+    """Asserted on the mapping itself, not only through a gap.
+
+    This host is x86_64 Linux, so a gap-level test of the `linux` default
+    agrees with the ambient machine whether or not the mapping sets it -- the
+    mutant survives. The values come from measuring uv:
+
+        uv pip compile --python-platform macos    -> arm64
+        uv pip compile --python-platform linux    -> x86_64
+        uv pip compile --python-platform windows  -> x86_64
+    """
+    from blastbox.host.pins import _lock_environment
+
+    def machine(target):
+        return _lock_environment(f"# uv pip compile --python-platform {target}").get(
+            "platform_machine"
+        )
+
+    assert machine("macos") == "arm64"
+    assert machine("linux") == "x86_64"
+    assert machine("windows") == "x86_64"
+    # An explicit triple overrides the bare default in both directions.
+    assert machine("aarch64-unknown-linux-gnu") == "aarch64"
+    assert machine("x86_64-apple-darwin") == "x86_64"
