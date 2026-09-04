@@ -491,7 +491,11 @@ def _walk(root: Path):
             if entry.is_dir():
                 if entry.name not in _SKIP_DIRS:
                     stack.append(entry)
-            else:
+            elif entry.is_file():
+                # REGULAR files only, for the same reason symlinks are skipped:
+                # a FIFO named `pipe.lock` looks like a candidate lock and
+                # blocks forever when opened, and a character device reads
+                # without end. `is_file()` is False for both.
                 yield entry
 
 
@@ -504,8 +508,14 @@ _REQ_NAME_RE = re.compile(
 _INSTALL_SCRIPT_RE = re.compile(
     r"(?i)^(dockerfile.*|makefile|.*\.(sh|bash|mk|ya?ml|dockerfile))$"
 )
-# Enough for any requirements file or install script; anything larger is data.
+# Enough for any install script; anything larger is data we should not open.
 _READ_LIMIT = 1 << 20
+# Generated hash locks are legitimately large -- a full closure with two hashes
+# per entry runs to megabytes -- so a RECOGNISED lock gets a generous bound and
+# an error beyond it. Silently reading it as empty makes the file look like it
+# holds no blastbox pin, and `pins --set` then updates every other pin and
+# reports success while the lock stays stale.
+_LOCK_READ_LIMIT = 64 << 20
 
 
 # Anything pip would plausibly be handed with `-r`. Broader than the set we
@@ -525,6 +535,31 @@ def _is_requirements_file(path: Path) -> bool:
         _REQ_NAME_RE.fullmatch(path.name)
         or (path.parent.name == "requirements" and path.name.endswith(".txt"))
     )
+
+
+def _read_requirements(path: Path) -> str:
+    """Read a recognised requirements file, refusing to treat it as absent.
+
+    `_read_small` returns "" for anything oversized, which is the right answer
+    for a file we merely guessed at and the WRONG one for a lock: it would look
+    like it carries no blastbox pin, and the bump would be accepted with that
+    lock left stale.
+    """
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        raise PinScanError(f"{path}: {exc}") from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise PinScanError(f"{path}: not a regular file; refusing to read it")
+    if st.st_size > _LOCK_READ_LIMIT:
+        raise PinScanError(
+            f"{path}: {st.st_size} bytes is too large to read as a requirements "
+            "file. Treating it as empty would report every dependency present."
+        )
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise PinScanError(f"{path}: {exc}") from exc
 
 
 def _read_small(path: Path) -> str:
@@ -814,7 +849,9 @@ def missing_from_locks(
             continue  # somebody else's requirements; not ours to judge
         if not any(pin.hashed for entries in pins.values() for pin in entries):
             continue  # not hash-pinned; pip resolves the rest itself
-        scope = {**env, **(environment or {})}
+        scope = {
+            k: v for k, v in {**env, **(environment or {})}.items() if k != "__extras__"
+        }
         # An APPLICABLE blastbox entry. A portable lock whose only blastbox pin
         # is `; sys_platform == "win32"` does not install blastbox on Linux, so
         # demanding its dependency closure there refuses a correct lock.
@@ -829,6 +866,10 @@ def missing_from_locks(
             if _marker_holds(pin.marker, scope)
             for e in pin.extras
         }
+        # What the lock's own header says it was compiled for. uv writes a plain
+        # `blastbox==...` line even for `--extra host`, so without this an older
+        # lock carrying half a grown extra is never recognised as needing it.
+        extras |= {e for e in env.get("__extras__", "").split(",") if e}
         extras |= _extras_in_play(parsed, pins, scope)
         extras = _with_nested_extras(extras, parsed, scope)
         gaps: list[str] = []
@@ -877,37 +918,57 @@ def _install_roots(root: Path) -> list[Path]:
     # children included left NO roots, so nothing was judged and every closure
     # passed. Ordinary `.txt` files that include nothing stay out: they are
     # fixtures and corpora, not install sets.
-    candidates: list[Path] = []
+    inputs: list[Path] = []
     included: set[Path] = set()
+    aggregates: set[Path] = set()
     for path in _walk(root):
         if not _is_install_input(path):
             continue
+        inputs.append(path)
         names = _includes(path, root)  # read once; used for both decisions
         included |= set(names)
-        if names or _is_requirements_file(path):
-            candidates.append(path)
-    known = {p.resolve() for p in candidates}
+        if names:
+            aggregates.add(path.resolve())
+
+    # What an install command actually hands to pip. pip imposes no naming
+    # convention, so a hashed `deps.txt` that includes nothing is a real
+    # install set even though nothing about its name says so.
     direct: set[Path] = set()
     for path in _walk(root):
-        if _is_requirements_file(path) or not _INSTALL_SCRIPT_RE.fullmatch(path.name):
+        if _is_install_input(path) or not _INSTALL_SCRIPT_RE.fullmatch(path.name):
             continue
-        for target in _referenced(path, root):
-            if target in known:
-                direct.add(target)
+        direct |= set(_referenced(path, root))
+
+    candidates = [
+        p
+        for p in inputs
+        if p.resolve() in aggregates
+        or p.resolve() in direct
+        or _is_requirements_file(p)
+    ]
     return [
         p for p in candidates if p.resolve() not in included or p.resolve() in direct
     ]
 
 
 def _referenced(path: Path, root: Path) -> list[Path]:
-    """Requirement files an install script hands to pip with `-r`."""
+    """Requirement files an install script hands to pip with `-r`.
+
+    Resolved against the repository root as well as the script's own directory.
+    `docker build -f deploy/Dockerfile .` copies `prod.lock` from the CONTEXT,
+    so `pip install -r prod.lock` inside it names `<root>/prod.lock`, not
+    `deploy/prod.lock` -- and resolving only the latter drops the reference,
+    which then removes that lock from the roots and accepts its incomplete
+    closure.
+    """
     out: list[Path] = []
     for match in re.finditer(
         r"(?:-r|--requirement)[=\s]+([\w./\-]+)", _read_small(path)
     ):
-        target = _safe_include(path.parent / match.group(1), root)
-        if target is not None:
-            out.append(target)
+        for base in (path.parent, root):
+            target = _safe_include(base / match.group(1), root)
+            if target is not None:
+                out.append(target)
     return out
 
 
@@ -984,6 +1045,12 @@ def _lock_environment(text: str) -> dict[str, str]:
     # not this one, so evaluating that lock's markers against the local
     # sys_platform skips the requirements it exists to carry. uv takes bare
     # names and target triples; both are matched here.
+    # `--extra host` (repeatable) is uv recording which optional sets it
+    # resolved. That is authoritative where inference is a guess, and an older
+    # lock missing half a newly grown extra cannot be inferred at all.
+    extras = re.findall(r"--extra[=\s]+([A-Za-z0-9._-]+)", text)
+    if extras:
+        out["__extras__"] = ",".join(sorted({e.lower() for e in extras}))
     platform = re.search(r"--python-platform[=\s]+(\S+)", text)
     if platform:
         token = platform.group(1).lower()
@@ -1025,10 +1092,10 @@ def _effective_pins(
     pins: dict[str, list[_Pin]] = {}
     extras: set[str] = set()  # kept for signature stability; see _declared_extras
     env: dict[str, str] = {}
-    # Through the one guarded reader: `_walk` yields whatever is in the tree,
-    # and a FIFO named `pipe.lock` is a candidate lock that blocks forever when
-    # opened.
-    text = _read_small(path)
+    # The STRICT reader: this file is a lock we are judging, and reading it as
+    # empty would report its whole closure present. Non-regular files (a FIFO
+    # named `pipe.lock` blocks forever when opened) and oversized ones raise.
+    text = _read_requirements(path)
     if not text:
         return pins, extras, env
     env.update(_lock_environment(text))
