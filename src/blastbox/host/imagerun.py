@@ -23,6 +23,8 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import hashlib
+import time
+import datetime
 import os
 import re
 import shutil
@@ -50,6 +52,7 @@ __all__ = [
     "export_rootfs",
     "publish_staged",
     "publish_tags",
+    "sweep_stale_staging_tags",
     "restore_tags",
     "run_plan",
     "stage_rootfs",
@@ -278,6 +281,69 @@ class PublishedTags:
     published: dict[str, str]
 
 
+_STAGING_MARKER = "-blastbox-staging-"
+
+
+def sweep_stale_staging_tags(
+    older_than_hours: int = 24, *, run: Runner | None = None, log: Log = _log
+) -> list[str]:
+    """Drop private build tags left behind by runs that finished long ago.
+
+    A refused build deliberately KEEPS its staging tags: they are the only names
+    those images have, and an operator diagnosing why verification rejected one
+    needs to inspect it. That is only defensible if they do not accumulate --
+    repeated failures would otherwise pin every rejected chain on disk forever.
+
+    Age, not liveness. Deciding by pid means guessing whether a pid belongs to a
+    concurrent run or was recycled, and guessing wrong deletes a tag a live run
+    still needs. Anything this old belongs to a run nobody is still reading.
+    """
+    runner = run or _default_runner
+    proc = runner(
+        ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}\t{{.CreatedAt}}"],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        return []  # not worth failing a build over; the next run tries again
+    cutoff = time.time() - older_than_hours * 3600
+    dropped: list[str] = []
+    for line in (proc.stdout or "").splitlines():
+        ref, _, created = line.partition("\t")
+        if _STAGING_MARKER not in ref:
+            continue
+        stamp = _created_at(created)
+        if stamp is None or stamp > cutoff:
+            continue
+        if (
+            runner(["docker", "rmi", "--no-prune", ref], capture_output=True).returncode
+            == 0
+        ):
+            dropped.append(ref)
+    if dropped:
+        log(f"   swept {len(dropped)} staging tag(s) from earlier runs")
+    return dropped
+
+
+def _created_at(value: str) -> float | None:
+    """docker's `{{.CreatedAt}}` as an epoch, or None if it cannot be read.
+
+    Unparseable means "do not touch it": this decides whether to DELETE an
+    image, and a format this cannot read is not evidence that it is old.
+    """
+    text = value.strip()
+    if not text:
+        return None
+    # "2026-09-04 11:51:02 +0100 BST" -- the trailing zone NAME is not
+    # parseable by %z, and is redundant beside the offset.
+    parts = text.split()
+    if len(parts) >= 3:
+        text = " ".join(parts[:3])
+    try:
+        return datetime.datetime.strptime(text, "%Y-%m-%d %H:%M:%S %z").timestamp()
+    except ValueError:
+        return None
+
+
 def publish_tags(
     staged: Sequence[str], tag: str, *, run: Runner | None = None, log: Log = _log
 ) -> PublishedTags:
@@ -424,6 +490,13 @@ def build_plan(
         raise BuildError(
             "the plan cannot be built as declared:\n  " + "\n  ".join(problems)
         )
+
+    # After validation, before the first build. A run that is REFUSED keeps its
+    # own staging tags for inspection, so the bound on accumulation has to come
+    # from somewhere, and this is the point where it costs nothing -- the plan
+    # is known good and no docker command has run yet, which is a property the
+    # "nothing runs until the size is known" test enforces.
+    sweep_stale_staging_tags(run=run, log=log)
 
     built: list[str] = []
     # The chain is built and linked under a PRIVATE tag. `resolve_chain` is

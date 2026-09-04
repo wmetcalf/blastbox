@@ -8,6 +8,7 @@ is where all of those failures lived — rather than about docker.
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import os
 import signal
 import stat
@@ -3355,3 +3356,67 @@ def test_a_rollback_that_cannot_identify_the_artifact_leaves_it_alone(
     mod._restore_backup(staged, mod._default_runner, said.append)
     assert dest.read_text() == "live", "rolled back over an unidentifiable artifact"
     assert any("cannot establish" in s for s in said), said
+
+
+def _images_listing(rows: list[tuple[str, str]]) -> str:
+    return "\n".join(f"{ref}\t{created}" for ref, created in rows)
+
+
+def test_stale_staging_tags_are_swept_but_recent_ones_are_kept() -> None:
+    """A refused build KEEPS its staging tags; that must still be bounded.
+
+    Those tags are the only names the rejected images have, so removing them on
+    failure would leave a dangling image and a question nobody can answer --
+    but repeated failures would otherwise pin every rejected chain on disk.
+    """
+    import blastbox.host.imagerun as mod
+
+    old = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=3)
+    recent = datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=5)
+    fmt = "%Y-%m-%d %H:%M:%S %z UTC"
+    listing = _images_listing(
+        [
+            ("demo:t1-blastbox-staging-1-aaaa", old.strftime(fmt)),
+            ("demo:t1-blastbox-staging-2-bbbb", recent.strftime(fmt)),
+            ("demo:t1", old.strftime(fmt)),
+            ("upstream:1", old.strftime(fmt)),
+        ]
+    )
+    removed: list[str] = []
+
+    def run(argv, **kw):
+        a = list(argv)
+        if a[:2] == ["docker", "images"]:
+            return subprocess.CompletedProcess(a, 0, listing, "")
+        if a[:2] == ["docker", "rmi"]:
+            removed.append(a[-1])
+        return subprocess.CompletedProcess(a, 0, "", "")
+
+    dropped = mod.sweep_stale_staging_tags(run=run, log=lambda _: None)
+    assert removed == ["demo:t1-blastbox-staging-1-aaaa"], removed
+    assert dropped == removed
+    # A live run's tags, and every ordinary tag, are left alone.
+    assert "demo:t1-blastbox-staging-2-bbbb" not in removed
+    assert "demo:t1" not in removed
+
+
+def test_a_creation_time_that_cannot_be_read_is_not_swept() -> None:
+    """This decides whether to DELETE an image.
+
+    A timestamp format we cannot parse is not evidence that the image is old.
+    """
+    import blastbox.host.imagerun as mod
+
+    listing = _images_listing([("demo:t1-blastbox-staging-1-aaaa", "who knows")])
+    removed: list[str] = []
+
+    def run(argv, **kw):
+        a = list(argv)
+        if a[:2] == ["docker", "images"]:
+            return subprocess.CompletedProcess(a, 0, listing, "")
+        if a[:2] == ["docker", "rmi"]:
+            removed.append(a[-1])
+        return subprocess.CompletedProcess(a, 0, "", "")
+
+    assert mod.sweep_stale_staging_tags(run=run, log=lambda _: None) == []
+    assert removed == []
