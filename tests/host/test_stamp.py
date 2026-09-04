@@ -1513,14 +1513,13 @@ def test_base_check_is_quiet_when_the_base_still_agrees():
     assert _stamp_with(recorded).base_check(run) == (True, "")
 
 
-def test_base_check_does_not_inspect_a_digest_pinned_base():
-    """A reference pinned by digest cannot move; asking is pointless."""
-    calls = []
+def test_a_digest_pinned_base_is_still_checked_for_PRESENCE():
+    """A digest reference cannot move. It can still be gone.
 
-    def run(argv):
-        calls.append(argv)
-        raise AssertionError("inspected a digest-pinned base")
-
+    Those are different answers, and absence is the one `resolvable` was asked
+    for -- skipping the inspection for immutable references accepted an image
+    whose recorded base is no longer on the host.
+    """
     st = Stamp(
         blastbox="0.1.39",
         revision="b" * 40,
@@ -1528,5 +1527,10 @@ def test_base_check_does_not_inspect_a_digest_pinned_base():
         base_digest="sha256:" + "c" * 64,
         base_image_id="sha256:" + "c" * 64,
     )
-    assert st.base_check(run) == (True, "")
-    assert calls == []
+    gone, calls = _answers("absent")
+    assert st.base_check(gone) == (False, "")
+    assert len(calls) == 1, "a digest-pinned base was never looked for"
+
+    # Present, and never reported as moved however the id reads back.
+    here, _ = _answers("present", "sha256:" + "f" * 64)
+    assert st.base_check(here) == (True, "")

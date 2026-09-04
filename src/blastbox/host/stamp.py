@@ -186,11 +186,15 @@ class Stamp:
         ``moved_to`` is "" when there is nothing to report: pinned by digest,
         nothing recorded to compare, or still the stamped image.
         """
-        if "@sha256:" in (self.base_name or ""):
-            return True, ""  # pinned by digest in the reference; it cannot move
         present, current = self.base_state(runner, ref)
         if not present:
             return False, ""
+        # A digest reference cannot MOVE, but it can be gone -- which is a
+        # different answer, and the one `resolvable` was asked for. Skipping the
+        # inspection entirely for these accepted an image whose recorded base is
+        # no longer on the host.
+        if "@sha256:" in (self.base_name or ""):
+            return True, ""
         recorded = self.base_image_id or ""
         if not _DIGEST_RE.match(recorded) or (self.base_name or "") in (UNKNOWN, ""):
             return True, ""
