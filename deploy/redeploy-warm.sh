@@ -249,7 +249,7 @@ cat <<ROLLBACK
   # discover there is nothing to put back is the worst outcome available, and
   # this block is pasted by someone whose warm tier is already broken.
   if [ -e $FC_DIR/rootfs.ext4.$SUF ]; then mv $FC_DIR/rootfs.ext4.$SUF $FC_DIR/rootfs.ext4; else echo "NO FC BACKUP at $FC_DIR/rootfs.ext4.$SUF - leaving the live image in place"; fi
-  if [ -e $GVISOR_DIR/rootfs.$SUF ]; then sudo rm -rf $GVISOR_DIR/rootfs && sudo mv $GVISOR_DIR/rootfs.$SUF $GVISOR_DIR/rootfs; else echo "NO gVISOR BACKUP at $GVISOR_DIR/rootfs.$SUF - leaving the live tree in place"; fi
+  if sudo test -e $GVISOR_DIR/rootfs.$SUF; then sudo rm -rf $GVISOR_DIR/rootfs && sudo mv $GVISOR_DIR/rootfs.$SUF $GVISOR_DIR/rootfs; else echo "NO gVISOR BACKUP at $GVISOR_DIR/rootfs.$SUF - leaving the live tree in place"; fi
   [ -f $FC_DIR/firecracker.$SUF ] && mv $FC_DIR/firecracker.$SUF $FC_DIR/firecracker
   $COMPOSE_WRAPPER $COMPOSE_FILES up -d --force-recreate api dispatcher dispatcher-fc dispatcher-gvisor
 ROLLBACK
@@ -261,12 +261,16 @@ cat <<ROLLBACK
   # rootfs published by \`blastbox build-images\` keeps the PREVIOUS artifact at
   # <dest>.bak -- not the .bak-$WARM_TAG names the superseded in-script swap used.
   #
+  # The gVisor check goes through sudo like every other gVisor operation here:
+  # that tree is root-owned, and an unprivileged test reports a real backup as
+  # missing whenever its parent is not searchable by the deployment user.
+  #
   # There may be NO .bak at all: a first publication has nothing to keep, and
   # preserving the old tree after an atomic exchange is best-effort. So each
   # restore checks before it destroys -- removing the live tree and only then
   # finding nothing to put back is the worst outcome available here.
   if [ -e $FC_DIR/rootfs.ext4.bak ]; then mv $FC_DIR/rootfs.ext4.bak $FC_DIR/rootfs.ext4; else echo "NO FC BACKUP at $FC_DIR/rootfs.ext4.bak - leaving the live image in place"; fi
-  if [ -e $GVISOR_DIR/rootfs.bak ]; then sudo rm -rf $GVISOR_DIR/rootfs && sudo mv $GVISOR_DIR/rootfs.bak $GVISOR_DIR/rootfs; else echo "NO gVISOR BACKUP at $GVISOR_DIR/rootfs.bak - leaving the live tree in place"; fi
+  if sudo test -e $GVISOR_DIR/rootfs.bak; then sudo rm -rf $GVISOR_DIR/rootfs && sudo mv $GVISOR_DIR/rootfs.bak $GVISOR_DIR/rootfs; else echo "NO gVISOR BACKUP at $GVISOR_DIR/rootfs.bak - leaving the live tree in place"; fi
   [ -f $FC_DIR/firecracker.$SUF ] && mv $FC_DIR/firecracker.$SUF $FC_DIR/firecracker
   $COMPOSE_WRAPPER $COMPOSE_FILES up -d --force-recreate api dispatcher dispatcher-fc dispatcher-gvisor
 ROLLBACK
