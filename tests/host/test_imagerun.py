@@ -1419,3 +1419,77 @@ def test_sub_mib_growth_still_preserves_the_artifact(tmp_path: Path, monkeypatch
                   extract=_fake_extract({"/init": "x"}))
     # rounded UP, so the new image is not smaller than what it replaces
     assert "65M" in run.verb("truncate")[0], run.verb("truncate")
+
+
+def test_a_failing_builder_pull_aborts_the_build(tmp_path: Path, monkeypatch) -> None:
+    """An unchecked pull that fails on a registry error leaves a STALE local
+    image, which the inspect then resolves happily — so the build succeeds from
+    an older builder while every recorded digest looks right."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
+    text = SPEC.replace(
+        'base = "upstream:1"',
+        'base = "upstream:1"\nbuild_args = { JDK_BUILD_IMAGE = "eclipse-temurin:25-jdk" }',
+        1,
+    )
+    run = FakeRunner(fail="eclipse-temurin:25-jdk")
+    with pytest.raises(BuildError) as e:
+        build_plan(_plan(tmp_path, text), "t1", blastbox_version="0.1.36", run=run,
+                   log=lambda _: None)
+    assert "pull builder" in str(e.value)
+    assert run.verb("docker", "build") == [], "a build ran on a stale builder"
+
+
+def test_a_failed_ext4_stage_leaves_no_partial_image(tmp_path: Path, monkeypatch) -> None:
+    """`ready` is a SIBLING file, not inside the staging tree, so removing the
+    tree alone left a partly-formatted image of the declared size beside the
+    destination after every failed attempt."""
+    dest_dir = tmp_path / "fc"
+    dest_dir.mkdir()
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    plan = _plan(tmp_path)
+    run = FakeRunner(fail="mkfs.ext4")
+    with pytest.raises(BuildError):
+        export_rootfs(plan, plan.rootfs[0], "t1", run=run, log=lambda _: None,
+                      extract=_fake_extract({"/init": "x"}))
+    removed = [c for c in run.calls if "rm" in c and any(a.endswith(".img") for a in c)]
+    assert removed, f"the staged image was not removed: {run.calls}"
+
+
+def test_publication_rolls_back_when_a_later_artifact_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A later publish failing left the earlier destinations on the NEW release
+    and the rest on the old — the mixed release the staging phase was written to
+    prevent, arriving one step later."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
+    monkeypatch.setattr(mod, "_read_stamp", lambda i, r=None: _FakeStamp())
+    monkeypatch.setattr(mod, "_verify_contents", lambda i, r=None: (True, ""))
+    d = tmp_path / "out"
+    d.mkdir()
+    monkeypatch.setenv("DEMO_DIR", str(d))
+    text = SPEC.replace('dest = "$DEMO_DIR/demo.ext4"', 'dest = "$DEMO_DIR/first.ext4"') + (
+        '\n[[rootfs]]\nkind = "ext4"\nimage = "demo-worker"\n'
+        'dest = "$DEMO_DIR/second.ext4"\nsize_mib = 64\nrequires = ["/init"]\n'
+    )
+    plan = _plan(tmp_path, text)
+
+    class FailSecondPublish(FakeRunner):
+        def __call__(self, argv, **kw):
+            bare = self._bare(list(argv))
+            if bare[:1] == ["mv"] and bare[-1].endswith("second.ext4"):
+                self.calls.append(list(argv))
+                return subprocess.CompletedProcess(list(argv), 1, stdout="", stderr="EIO")
+            return super().__call__(argv, **kw)
+
+    run = FailSecondPublish()
+    with pytest.raises(BuildError):
+        run_plan(plan, "t1", blastbox_version="0.1.36", run=run, log=lambda _: None,
+                 extract=_fake_extract({"/init": "x"}))
+    # first.ext4 did not exist before this run, so the inverse of publishing it
+    # is removing it -- leaving it would be a partial publish of a failed release
+    rolled = [c for c in run.calls if "rm" in c and any(a.endswith("first.ext4") for a in c)]
+    assert rolled, f"the first artifact was not rolled back: {run.calls}"
