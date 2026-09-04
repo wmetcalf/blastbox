@@ -4,7 +4,6 @@ An engine ships a ``StaticUI`` (its packaged ``static/`` dir); ``build_app`` ser
 ``index.html`` at ``GET /`` and mounts an optional ``assets/`` subdir at ``/assets``.
 The UI is mounted LAST so it never shadows ``/v1/*`` or product routes.
 """
-
 from __future__ import annotations
 
 import pytest

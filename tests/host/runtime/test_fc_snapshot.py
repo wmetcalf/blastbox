@@ -5,7 +5,6 @@ OPAQUE artifact (it never inspects it). FC-specific mechanics
 (create_snapshot/restore_from_snapshot/resolve_mem_dir, the FcSnapshotArtifact,
 the FcSnapshotBackend wiring) are tested in ``test_fc_snapshot_backend.py``.
 """
-
 from __future__ import annotations
 
 import threading
@@ -200,7 +199,6 @@ def test_build_wraps_boot_base_failure_as_build_error(tmp_path):
 def test_build_preserves_snapshot_error_subclasses(tmp_path):
     """A backend that raises a SnapshotError (e.g. SnapshotBuildError) is NOT
     re-wrapped — it propagates as-is (the `except SnapshotError: raise` arm)."""
-
     class BoomBackend(FakeBackend):
         def boot_base(self):
             raise SnapshotBuildError("backend already chose the error")
@@ -272,9 +270,7 @@ def test_restore_preserves_snapshot_error_subclasses(tmp_path):
     mgr.build()
     with pytest.raises(SnapshotRestoreError, match="backend already chose"):
         mgr.restore("slot-x")
-    assert not (
-        tmp_path / "slots" / "slot-x"
-    ).exists()  # cleanup on the SnapshotError path too
+    assert not (tmp_path / "slots" / "slot-x").exists()  # cleanup on the SnapshotError path too
 
 
 def test_a_failed_retirement_is_retried_by_the_next_build(tmp_path):
@@ -348,10 +344,10 @@ def test_a_failed_orphan_sweep_is_retried_on_the_next_build(tmp_path):
     backend = _FlakySweep()
     mgr = SnapshotManager(tmp_path, backend)
     mgr.build()
-    assert backend.sweeps == 1  # tried, and failed
+    assert backend.sweeps == 1                      # tried, and failed
 
-    mgr.invalidate()  # force the next build to run for real
-    backend.fail_sweep = False  # the filesystem recovers
+    mgr.invalidate()                                # force the next build to run for real
+    backend.fail_sweep = False                      # the filesystem recovers
     mgr.build()
     assert backend.sweeps == 2, (
         "the orphan sweep never ran again: the latch was set before the call, so a single "
@@ -376,7 +372,6 @@ def test_the_manager_hands_its_checkpoint_root_to_a_backend_that_asks(tmp_path):
     to pass it. Introspection, not except-TypeError: a TypeError raised INSIDE a sweep must never
     be read as an older signature.
     """
-
     class _WantsDir(FakeBackend):
         def __init__(self):
             super().__init__()
@@ -393,7 +388,6 @@ def test_the_manager_hands_its_checkpoint_root_to_a_backend_that_asks(tmp_path):
 
 def test_a_no_argument_sweep_still_works(tmp_path):
     """A backend that owns its layout takes no argument; the manager must not force one on it."""
-
     class _NoArgs(FakeBackend):
         def __init__(self):
             super().__init__()
@@ -410,7 +404,6 @@ def test_a_no_argument_sweep_still_works(tmp_path):
 
 def test_a_typeerror_from_inside_a_sweep_is_not_read_as_an_old_signature(tmp_path):
     """It must be reported as a failed sweep (and retried), never silently re-called bare."""
-
     class _Explodes(FakeBackend):
         def __init__(self):
             super().__init__()
@@ -423,9 +416,7 @@ def test_a_typeerror_from_inside_a_sweep_is_not_read_as_an_old_signature(tmp_pat
     backend = _Explodes()
     mgr = SnapshotManager(tmp_path, backend)
     mgr.build()
-    assert backend.calls == 1, (
-        "the sweep must not be retried bare as a compatibility fallback"
-    )
+    assert backend.calls == 1, "the sweep must not be retried bare as a compatibility fallback"
 
     # ...and it stays retryable: the next build asks again.
     mgr.invalidate()
@@ -440,7 +431,6 @@ def test_a_base_we_could_not_kill_stays_reachable_for_retry(tmp_path):
     process-control failure. The async retry then booted another base beside the first — which
     nothing tracked and nothing could ever reap, for the life of the process.
     """
-
     class _Unkillable(FakeBackend):
         def __init__(self):
             super().__init__()
@@ -454,9 +444,7 @@ def test_a_base_we_could_not_kill_stays_reachable_for_retry(tmp_path):
             def _kill():
                 outer.kills += 1
                 if outer.fail_kill:
-                    raise RuntimeError(
-                        "teardown unconfirmed; the sandbox may still be running"
-                    )
+                    raise RuntimeError("teardown unconfirmed; the sandbox may still be running")
                 boot.killed = True
 
             boot.kill = _kill
@@ -494,7 +482,6 @@ def test_a_retained_base_is_retried_even_once_the_artifact_exists(tmp_path):
     was unreachable until some unrelated invalidation. The base VM sat running through normal
     operation, which is exactly when the success path retains one.
     """
-
     class _Unkillable(FakeBackend):
         def __init__(self):
             super().__init__()
@@ -562,7 +549,6 @@ def test_acquire_built_reads_the_artifact_under_the_build_lock(tmp_path):
 
 def test_acquire_built_refuses_and_kicks_the_async_build(tmp_path):
     """Not built: report capacity and start the build OFF this thread — never build inline."""
-
     class _Counting(FakeBackend):
         def __init__(self):
             super().__init__()
@@ -586,7 +572,6 @@ def test_an_undead_base_is_retried_on_the_per_spawn_path(tmp_path):
     rather than build(). No later call reached the retry while the artifact stayed installed, so
     the base VM and its host RAM lived as long as the dispatcher.
     """
-
     class _Unkillable(FakeBackend):
         def __init__(self):
             super().__init__()
@@ -612,7 +597,7 @@ def test_an_undead_base_is_retried_on_the_per_spawn_path(tmp_path):
 
     backend.fail_kill = False
     before = backend.kills
-    mgr.acquire_built()  # the ONLY call production makes once an artifact exists
+    mgr.acquire_built()          # the ONLY call production makes once an artifact exists
 
     assert backend.kills > before, (
         "the retained base was never retried: build() is not called again while the artifact is "

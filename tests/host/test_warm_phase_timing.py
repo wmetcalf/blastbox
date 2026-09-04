@@ -18,7 +18,6 @@ These tests pin the three properties that make the numbers worth reading:
     the guest's time to whatever follows it);
   * an early exit is self-localizing -- the last phase present is where dispatch left.
 """
-
 from __future__ import annotations
 
 import logging
@@ -71,9 +70,7 @@ def _parse(line: str) -> dict[str, float]:
     pairs = _pairs(line)
     names = [k for k, _ in pairs]
     dupes = sorted({n for n in names if names.count(n) > 1})
-    assert not dupes, (
-        f"phase(s) {dupes} appear more than once, so the line double-counts: {line}"
-    )
+    assert not dupes, f"phase(s) {dupes} appear more than once, so the line double-counts: {line}"
     return dict(pairs)
 
 
@@ -101,32 +98,17 @@ def test_a_clean_warm_run_emits_one_phase_line_covering_every_phase(tmp_path, ca
     assert store.get(job.job_id).status == JobStatus.DONE
 
     lines = _phase_lines(caplog)
-    assert len(lines) == 1, (
-        f"expected exactly one warm_phases line per job, got {lines}"
-    )
+    assert len(lines) == 1, f"expected exactly one warm_phases line per job, got {lines}"
     line = lines[0]
-    assert f"job_id={job.job_id}" in line, (
-        f"the line must be attributable to a job: {line}"
-    )
+    assert f"job_id={job.job_id}" in line, f"the line must be attributable to a job: {line}"
     assert "outcome=done" in line
 
     phases = _parse(line)
     # Every step of the slot cycle a HOST can see. `guest` is the only one that is extraction;
     # if the others sum to more than it does, tuning the engine is the wrong lever -- which is
     # the entire question this instrumentation exists to answer.
-    for name in (
-        "slot_claim",
-        "fetch",
-        "stage",
-        "go",
-        "guest",
-        "rdump",
-        "validate",
-        "seal",
-        "commit",
-        "release",
-        "purge",
-    ):
+    for name in ("slot_claim", "fetch", "stage", "go", "guest", "rdump",
+                 "validate", "seal", "commit", "release", "purge"):
         assert name in phases, f"phase {name!r} missing from: {line}"
     assert phases["total"] > 0.0
 
@@ -234,10 +216,8 @@ def test_a_job_id_of_all_digits_is_not_read_as_a_phase():
     segment. Any test that maxes over the parsed phases inherited the bug, and the failure named
     a phase that does not exist, so it read as a real timing regression rather than a parse bug.
     """
-    line = (
-        "warm_phases job_id=24388167-a7e2-4f1a-8074-d1b913fbd57c outcome=done "
-        "total=0.304 slot_claim=0.000 guest=0.300 rdump=0.000 purge=0.001"
-    )
+    line = ("warm_phases job_id=24388167-a7e2-4f1a-8074-d1b913fbd57c outcome=done "
+            "total=0.304 slot_claim=0.000 guest=0.300 rdump=0.000 purge=0.001")
     phases = _parse(line)
     assert "job_id" not in phases, phases
     assert phases["guest"] == 0.300

@@ -5,12 +5,7 @@ SIGNATURE conformance is enforced statically by mypy (``SnapshotManager`` calls 
 positionally and is type-checked against these Protocols). This test guards the NAME contract
 for the REAL backends + handles, so renaming/dropping a seam method can't silently break it —
 unlike a hand-written fake, which would tautologically "conform" to whatever it copies."""
-
-from blastbox.host.runtime.snapshot_backend import (
-    BootHandle,
-    RestoreHandle,
-    SnapshotBackend,
-)
+from blastbox.host.runtime.snapshot_backend import BootHandle, RestoreHandle, SnapshotBackend
 
 
 def test_real_backends_satisfy_the_seam():

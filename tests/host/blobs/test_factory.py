@@ -3,7 +3,6 @@
 Mirrors tests/host/jobs/test_factory.py: unset MUST give the local backend so a
 single-node deployment needs no configuration and no S3 dependency.
 """
-
 import pytest
 
 from blastbox.host.blobs.factory import build_blob_store_from_env

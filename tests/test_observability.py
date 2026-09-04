@@ -3,7 +3,6 @@
 Checks configure_logging emits to stderr (JSON by default), and that
 metrics increment correctly and render to prometheus text format.
 """
-
 from __future__ import annotations
 
 import json
@@ -108,13 +107,8 @@ class TestPoolMetrics:
         from blastbox.observability import metrics as m
 
         m.record_pool_state(
-            spawning=1,
-            warming=2,
-            idle=3,
-            assigned=1,
-            draining=0,
-            warm_target=6,
-            burst_active=True,
+            spawning=1, warming=2, idle=3, assigned=1, draining=0,
+            warm_target=6, burst_active=True,
         )
         assert m.POOL_SLOTS.labels(state="idle")._value.get() == 3
         assert m.POOL_SLOTS.labels(state="warming")._value.get() == 2
@@ -122,13 +116,8 @@ class TestPoolMetrics:
         assert m.POOL_WARM_TARGET._value.get() == 6
         assert m.POOL_BURST_ACTIVE._value.get() == 1
         m.record_pool_state(
-            spawning=0,
-            warming=0,
-            idle=0,
-            assigned=0,
-            draining=0,
-            warm_target=2,
-            burst_active=False,
+            spawning=0, warming=0, idle=0, assigned=0, draining=0,
+            warm_target=2, burst_active=False,
         )
         assert m.POOL_BURST_ACTIVE._value.get() == 0
 
@@ -149,10 +138,7 @@ class TestDispatchMetrics:
 
         b = m.JOBS_DISPATCHED_TOTAL.labels(path="warm", outcome="done")._value.get()
         m.record_job_dispatched(path="warm", outcome="done")
-        assert (
-            m.JOBS_DISPATCHED_TOTAL.labels(path="warm", outcome="done")._value.get()
-            == b + 1
-        )
+        assert m.JOBS_DISPATCHED_TOTAL.labels(path="warm", outcome="done")._value.get() == b + 1
 
     def test_job_duration_histogram(self):
         from blastbox.observability import metrics as m

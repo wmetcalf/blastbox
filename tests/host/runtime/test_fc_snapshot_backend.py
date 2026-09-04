@@ -6,7 +6,6 @@ These cover the FC-specific pieces that used to live on the manager:
 - ``boot_base().checkpoint(dest)`` producing an ``FcSnapshotArtifact``, and
 - ``restore_in`` issuing load+resume and exposing the per-slot vsock.
 """
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -59,11 +58,7 @@ def test_create_snapshot_pauses_then_snapshots():
         (
             "PUT",
             "/snapshot/create",
-            {
-                "snapshot_type": "Full",
-                "snapshot_path": "/s/state",
-                "mem_file_path": "/s/mem",
-            },
+            {"snapshot_type": "Full", "snapshot_path": "/s/state", "mem_file_path": "/s/mem"},
         ),
     ]
 
@@ -162,7 +157,9 @@ def test_from_env_explicit_mem_dir_arg_overrides_env(tmp_path, monkeypatch):
     """An explicit mem_dir= arg short-circuits env resolution."""
     monkeypatch.setenv("BLASTBOX_SNAPSHOT_MEM_TMPFS", "1")  # would pick /dev/shm
     arg_dir = tmp_path / "explicit"
-    backend = FcSnapshotBackend.from_env(tmp_path / "base", object(), mem_dir=arg_dir)
+    backend = FcSnapshotBackend.from_env(
+        tmp_path / "base", object(), mem_dir=arg_dir
+    )
     assert backend.mem_dir == arg_dir
 
 
@@ -197,7 +194,9 @@ class FakeBootHandle:
 
 class FakeRestoreHandle:
     def __init__(self, slot_workdir: Path, *, fail_load=False):
-        self.api = FakeApi(fail_on=("PUT", "/snapshot/load") if fail_load else None)
+        self.api = FakeApi(
+            fail_on=("PUT", "/snapshot/load") if fail_load else None
+        )
         self.vsock_uds = str(Path(slot_workdir) / "vsock.sock")
         self.killed = False
 

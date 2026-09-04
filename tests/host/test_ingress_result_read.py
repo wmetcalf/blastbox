@@ -3,20 +3,16 @@
 After Task 5 the worker purges its job dir, so on a multi-node deployment the API
 node has no local copy — reading from disk would 404 every completed job.
 """
-
 import io
 
 
 class MemoryBlobStore:
-    def __init__(self, log=None):
-        self.objects = {}
-
+    def __init__(self, log=None): self.objects = {}
     def put_sample(self, sha256, src): ...
     def get_sample(self, sha256, dest): ...
     def put_output(self, job_id, out_dir): ...
     def open_output(self, job_id, name):
         return io.BytesIO(self.objects[(job_id, name)])
-
     def delete_job(self, job_id): ...
 
 
@@ -88,7 +84,5 @@ def test_result_route_non_dict_metadata_manifest_is_not_500(ingress_client_facto
         client.app.state.job_store.update(job_id, status="done")
 
         got = client.get(f"/v1/jobs/{job_id}/result")
-        assert got.status_code == 200, (
-            f"manifest {bad!r} must hit the empty-artifacts fallback, not 500"
-        )
+        assert got.status_code == 200, f"manifest {bad!r} must hit the empty-artifacts fallback, not 500"
         assert got.headers["content-type"] == "application/zip"

@@ -4,7 +4,6 @@ This is the highest-risk failure in the design: sample blobs are content-address
 and SHARED, so a sweeper that deletes them breaks unrelated jobs silently — including
 future re-runs of the same corpus.
 """
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -38,9 +37,7 @@ def test_expiring_a_job_calls_delete_job(tmp_path: Path, expired_job_factory):
     assert blobs.deleted == [job.job_id]
 
 
-def test_expiring_a_job_never_deletes_shared_samples(
-    tmp_path: Path, expired_job_factory
-):
+def test_expiring_a_job_never_deletes_shared_samples(tmp_path: Path, expired_job_factory):
     store = InMemoryJobStore()
     expired_job_factory(store, sha256="a" * 64)
     blobs = Blobs()
@@ -50,9 +47,7 @@ def test_expiring_a_job_never_deletes_shared_samples(
     assert blobs.samples == {"a" * 64}, "sample blob must survive job expiry"
 
 
-def test_delete_job_failure_does_not_block_other_jobs(
-    tmp_path: Path, expired_job_factory
-):
+def test_delete_job_failure_does_not_block_other_jobs(tmp_path: Path, expired_job_factory):
     """A blob-store hiccup reaping one job's results must not abort the sweep for others."""
     store = InMemoryJobStore()
     job1 = expired_job_factory(store, sha256="a" * 64)
@@ -73,9 +68,7 @@ def test_delete_job_failure_does_not_block_other_jobs(
     assert blobs.deleted == [job2.job_id]
 
 
-def test_failed_delete_leaves_job_sweepable_then_a_later_sweep_expires_it(
-    tmp_path: Path, expired_job_factory
-):
+def test_failed_delete_leaves_job_sweepable_then_a_later_sweep_expires_it(tmp_path: Path, expired_job_factory):
     """A transient delete_job failure must NOT advance the job to EXPIRED / clear expires_at -- else
     the result blob is orphaned forever (an EXPIRED job with null expires_at is never re-selected).
     The job stays in its terminal state with expires_at intact, and a later sweep whose delete
@@ -100,12 +93,8 @@ def test_failed_delete_leaves_job_sweepable_then_a_later_sweep_expires_it(
     # Sweep 1: delete_job raises -> job NOT marked EXPIRED, expires_at intact -> still sweepable.
     sweeper.expire_due(store)
     after = store.get(job.job_id)
-    assert after.status is JobStatus.DONE, (
-        "a failed blob delete must not mark the job EXPIRED"
-    )
-    assert after.expires_at is not None, (
-        "expires_at must be preserved so the next sweep retries"
-    )
+    assert after.status is JobStatus.DONE, "a failed blob delete must not mark the job EXPIRED"
+    assert after.expires_at is not None, "expires_at must be preserved so the next sweep retries"
     assert blobs.deleted == []
 
     # Sweep 2: delete_job now succeeds -> job advances to EXPIRED and the blob is reaped.

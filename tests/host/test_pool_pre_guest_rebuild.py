@@ -12,7 +12,6 @@ destroy a healthy base. But a slot that never reached its guest did not fail ON 
 failed to become able to run one, and that ambiguity is absent. Waiting for 48 of those means the
 tier silently degrades to cold-only for hours, which is most of what a warm tier is for.
 """
-
 import threading
 from pathlib import Path
 from uuid import uuid4
@@ -31,26 +30,14 @@ class _Wedged:
 
     def spawn(self) -> Slot:
         sid = str(uuid4())
-        return Slot(
-            slot_id=sid,
-            control_dir=Path(f"/fake/c/{sid}"),
-            input_dir=Path(f"/fake/i/{sid}"),
-            output_dir=Path(f"/fake/o/{sid}"),
-            state=SlotState.WARMING,
-            spawned_at=0.0,
-        )
+        return Slot(slot_id=sid, control_dir=Path(f"/fake/c/{sid}"),
+                    input_dir=Path(f"/fake/i/{sid}"), output_dir=Path(f"/fake/o/{sid}"),
+                    state=SlotState.WARMING, spawned_at=0.0)
 
-    def is_ready(self, slot):
-        return True
-
-    def is_alive(self, slot):
-        return True
-
-    def recycle(self, slot):
-        return None
-
-    def reap(self, slot):
-        return None
+    def is_ready(self, slot): return True
+    def is_alive(self, slot): return True
+    def recycle(self, slot): return None
+    def reap(self, slot): return None
 
     def invalidate_base(self) -> None:
         with self._lock:
@@ -62,9 +49,7 @@ def _pool(rt, **kw):
     above the pre-guest bar, so a test that trips can only have tripped the fast path. At
     warm_size=2 the ordinary threshold is 4 and the two are indistinguishable -- which is exactly
     how the first version of this test passed for the wrong reason."""
-    return WarmPool(
-        runtime=rt, warm_size=24, concurrent_ceiling=32, spawn_rate_limit=1000.0, **kw
-    )
+    return WarmPool(runtime=rt, warm_size=24, concurrent_ceiling=32, spawn_rate_limit=1000.0, **kw)
 
 
 def _claim_distinct(pool, n):
@@ -91,8 +76,7 @@ def test_three_slots_that_never_reach_their_guest_convict_the_base():
         _fail(pool, slot, stage="pre_guest")
     assert rt.base_invalidations >= 1
     assert max(pool._pool_consecutive_failures.values(), default=0) < 48, (
-        "must have tripped the pre-guest path, not the ordinary threshold"
-    )
+        "must have tripped the pre-guest path, not the ordinary threshold")
 
 
 def test_the_same_slot_failing_repeatedly_does_not_convict_the_base():
@@ -107,8 +91,7 @@ def test_the_same_slot_failing_repeatedly_does_not_convict_the_base():
     for _ in range(6):
         _fail(pool, slot, stage="pre_guest")
     assert len(pool._pool_pre_guest_failures.get("", set())) <= 1, (
-        "one slot must contribute at most one piece of evidence"
-    )
+        "one slot must contribute at most one piece of evidence")
     assert rt.base_invalidations == 0
 
 
@@ -118,7 +101,7 @@ def test_failures_inside_the_guest_still_need_the_full_threshold():
     rt = _Wedged()
     pool = _pool(rt, pre_guest_rebuild_after=3)
     for slot in _claim_distinct(pool, 6):
-        _fail(pool, slot, stage=None)  # failed IN the guest: could be the document
+        _fail(pool, slot, stage=None)      # failed IN the guest: could be the document
     assert rt.base_invalidations == 0
 
 
@@ -129,7 +112,7 @@ def test_a_served_job_clears_the_pre_guest_evidence():
     a, b, c, d = _claim_distinct(pool, 4)
     _fail(pool, a, stage="pre_guest")
     _fail(pool, b, stage="pre_guest")
-    pool.release(c, dirty=False)  # a clean, served job
+    pool.release(c, dirty=False)                    # a clean, served job
     _fail(pool, d, stage="pre_guest")
     assert rt.base_invalidations == 0, "the streak must restart after a served job"
 
@@ -145,16 +128,12 @@ def test_the_threshold_is_configurable():
 def test_the_kwarg_is_only_passed_to_pools_that_accept_it():
     """A pool predating the attribution must behave exactly as before, not raise TypeError -- the
     ladder this seam replaced swallowed that as a 'fallback' and released a slot twice."""
-
     def old_release(slot, *, dirty=False, fault=None): ...
     def new_release(slot, *, dirty=False, fault=None, fault_stage=None): ...
-
-    assert release_kwargs(
-        old_release, dirty=True, fault="worker", fault_stage="pre_guest"
-    ) == {"dirty": True, "fault": "worker"}
-    assert release_kwargs(
-        new_release, dirty=True, fault="worker", fault_stage="pre_guest"
-    ) == {"dirty": True, "fault": "worker", "fault_stage": "pre_guest"}
+    assert release_kwargs(old_release, dirty=True, fault="worker", fault_stage="pre_guest") == {
+        "dirty": True, "fault": "worker"}
+    assert release_kwargs(new_release, dirty=True, fault="worker", fault_stage="pre_guest") == {
+        "dirty": True, "fault": "worker", "fault_stage": "pre_guest"}
 
 
 # --- the dispatch-side half: deciding WHEN a failure is pre-guest ----------------------------
@@ -164,11 +143,11 @@ def test_warm_fault_stage_reports_pre_guest_only_when_the_guest_never_ran():
     from blastbox.host.dispatch import _PhaseTimer, warm_fault_stage
 
     class _Ctl:
-        guest_started = False  # the guest PROVED it never started
+        guest_started = False                 # the guest PROVED it never started
 
     wedged = _PhaseTimer("j")
     for ph in ("slot_claim", "fetch", "stage", "go"):
-        wedged.mark(ph)  # ...then wait_for_done times out; no `guest`
+        wedged.mark(ph)                       # ...then wait_for_done times out; no `guest`
     assert warm_fault_stage(False, "worker", wedged, _Ctl()) == "pre_guest"
 
     # THE GUEST PHASE DOES NOT RESCUE IT. That mark means only that wait_for_done RETURNED --
@@ -181,16 +160,14 @@ def test_warm_fault_stage_reports_pre_guest_only_when_the_guest_never_ran():
     for ph in ("slot_claim", "fetch", "stage", "go", "guest"):
         ran.mark(ph)
     assert warm_fault_stage(False, "worker", ran, _Ctl()) == "pre_guest", (
-        "a worker-written completion status is not proof that detonation executed"
-    )
+        "a worker-written completion status is not proof that detonation executed")
 
     # ...whereas an ack that DID arrive is proof it ran, phase mark or not.
     class _Started:
         guest_started = True
 
     assert warm_fault_stage(False, "worker", ran, _Started()) is None, (
-        "a failure after the guest executed could be the document"
-    )
+        "a failure after the guest executed could be the document")
     assert warm_fault_stage(False, "worker", wedged, _Started()) is None
 
     # ...and UNKNOWN still convicts nothing, in either shape.
@@ -208,7 +185,6 @@ def test_warm_fault_stage_reports_pre_guest_only_when_the_guest_never_ran():
 
 def test_phase_timer_reports_which_phases_ran():
     from blastbox.host.dispatch import _PhaseTimer
-
     t = _PhaseTimer("j")
     t.mark("go")
     assert t.reached("go") and not t.reached("guest")
@@ -221,11 +197,9 @@ def test_the_fast_path_is_on_by_default():
     and is never attributed to the base, and a worker too old to ack leaves the answer UNKNOWN,
     which also never convicts."""
     from blastbox.host.pool_config import PoolConfig
-
     assert PoolConfig.pre_guest_rebuild_after == 3
-    pool = WarmPool(
-        runtime=_Wedged(), warm_size=24, concurrent_ceiling=32, spawn_rate_limit=1000.0
-    )
+    pool = WarmPool(runtime=_Wedged(), warm_size=24, concurrent_ceiling=32,
+                    spawn_rate_limit=1000.0)
     assert pool._pre_guest_rebuild_after == 3
 
 
@@ -253,16 +227,13 @@ def test_the_escape_hatch_does_not_leak_evidence():
     for slot in _claim_distinct(pool, 8):
         _fail(pool, slot, stage="pre_guest")
     total = sum(len(v) for v in pool._pool_pre_guest_failures.values())
-    assert total == 0, (
-        f"evidence accumulated with repair disabled: {total} slot ids retained"
-    )
+    assert total == 0, f"evidence accumulated with repair disabled: {total} slot ids retained"
 
 
 def test_a_failed_repair_hands_the_evidence_back():
     """The crossing count (3) is far below the ordinary threshold (48), so restoring only the
     integer streak made the fast path a one-shot: the same unrepaired base had to accumulate
     three fresh distinct slots again before it would even retry."""
-
     class _RepairFails(_Wedged):
         def invalidate_base(self):
             raise OSError("could not drop the base artifact")
@@ -273,8 +244,7 @@ def test_a_failed_repair_hands_the_evidence_back():
         _fail(pool, slot, stage="pre_guest")
     retained = len(pool._pool_pre_guest_failures.get("", set()))
     assert retained >= 3, (
-        f"a failed repair must not discard the evidence that justified it (kept {retained})"
-    )
+        f"a failed repair must not discard the evidence that justified it (kept {retained})")
 
 
 def test_a_success_from_a_retired_generation_does_not_clear_current_evidence():
@@ -291,8 +261,7 @@ def test_a_success_from_a_retired_generation_does_not_clear_current_evidence():
     pool._base_generation[ident] = gen + 1
     pool.release(stale, dirty=False)
     assert len(pool._pool_pre_guest_failures.get("", set())) == 2, (
-        "a success from a retired base must not clear the current base's evidence"
-    )
+        "a success from a retired base must not clear the current base's evidence")
 
 
 def test_the_stage_is_only_reported_when_the_guest_PROVED_it_never_started():
@@ -301,23 +270,19 @@ def test_the_stage_is_only_reported_when_the_guest_PROVED_it_never_started():
     from blastbox.host.dispatch import _PhaseTimer, warm_fault_stage
 
     class _Ctl:
-        def __init__(self, started):
-            self.guest_started = started
+        def __init__(self, started): self.guest_started = started
 
     wedged = _PhaseTimer("j")
     for ph in ("slot_claim", "fetch", "stage", "go"):
-        wedged.mark(ph)  # ...then a timeout; `guest` never marked
+        wedged.mark(ph)                      # ...then a timeout; `guest` never marked
 
     assert warm_fault_stage(False, "worker", wedged, _Ctl(False)) == "pre_guest"
-    assert warm_fault_stage(False, "worker", wedged, _Ctl(True)) is None, (
+    assert warm_fault_stage(False, "worker", wedged, _Ctl(True)) is None, \
         "it acked, so it ran -- the document is the suspect, not the base"
-    )
-    assert warm_fault_stage(False, "worker", wedged, _Ctl(None)) is None, (
+    assert warm_fault_stage(False, "worker", wedged, _Ctl(None)) is None, \
         "UNKNOWN (older worker image) must never convict"
-    )
-    assert warm_fault_stage(False, "worker", wedged, None) is None, (
+    assert warm_fault_stage(False, "worker", wedged, None) is None, \
         "a seam with no ack at all must never convict"
-    )
 
 
 # --- review round 2 on #90 --------------------------------------------------------------------
@@ -346,9 +311,7 @@ def test_the_fast_path_names_the_tier_it_convicted():
     pool = _pool(rt, pre_guest_rebuild_after=3)
     for slot in _claim_distinct(pool, 3):
         _fail(pool, slot, stage="pre_guest")
-    assert rt.invalidated == ["tierB"], (
-        f"expected only the convicted tier, got {rt.invalidated}"
-    )
+    assert rt.invalidated == ["tierB"], f"expected only the convicted tier, got {rt.invalidated}"
 
 
 def test_a_success_on_another_base_does_not_abandon_this_ones_repair():
@@ -358,14 +321,13 @@ def test_a_success_on_another_base_does_not_abandon_this_ones_repair():
     rt = _TieredWedge()
     pool = _pool(rt, pre_guest_rebuild_after=3)
     a, b, c, other = _claim_distinct(pool, 4)
-    rt._ident[other.slot_id] = "tierA"  # a DIFFERENT base
+    rt._ident[other.slot_id] = "tierA"          # a DIFFERENT base
     _fail(pool, a, stage="pre_guest")
     _fail(pool, b, stage="pre_guest")
-    pool.release(other, dirty=False)  # healthy tier A serves a job
+    pool.release(other, dirty=False)            # healthy tier A serves a job
     _fail(pool, c, stage="pre_guest")
     assert rt.base_invalidations >= 1, (
-        "a success on another base must not abandon this base's repair"
-    )
+        "a success on another base must not abandon this base's repair")
 
 
 def test_a_committed_generation_does_not_inherit_retired_evidence():
@@ -377,8 +339,7 @@ def test_a_committed_generation_does_not_inherit_retired_evidence():
         _fail(pool, slot, stage="pre_guest")
     assert rt.base_invalidations == 1
     assert not pool._pool_pre_guest_failures.get("tierB"), (
-        "the freshly installed generation must start with no inherited evidence"
-    )
+        "the freshly installed generation must start with no inherited evidence")
 
 
 def test_evidence_accumulating_DURING_the_repair_is_not_charged_to_the_replacement():
@@ -401,12 +362,11 @@ def test_evidence_accumulating_DURING_the_repair_is_not_charged_to_the_replaceme
     rt.invalidate_base = _drop
     _fail(pool, a, stage="pre_guest")
     _fail(pool, b, stage="pre_guest")
-    _fail(pool, c, stage="pre_guest")  # crosses -> drop() runs, stragglers land inside
+    _fail(pool, c, stage="pre_guest")          # crosses -> drop() runs, stragglers land inside
     assert rt.base_invalidations == 1
     assert not pool._pool_pre_guest_failures.get("tierB"), (
         "the committed generation inherited the retired base's stragglers: "
-        f"{pool._pool_pre_guest_failures}"
-    )
+        f"{pool._pool_pre_guest_failures}")
 
 
 def test_the_loser_of_the_repair_race_keeps_its_evidence():
@@ -424,8 +384,7 @@ def test_the_loser_of_the_repair_race_keeps_its_evidence():
     assert rt.base_invalidations == 0, "the cooldown must suppress the second repair"
     kept = len(pool._pool_pre_guest_failures.get("tierB", set()))
     assert kept >= 3, (
-        f"the loser must keep the evidence that justified its decision (kept {kept})"
-    )
+        f"the loser must keep the evidence that justified its decision (kept {kept})")
 
 
 def test_a_cooldown_from_THIS_base_still_discards_its_evidence():
@@ -434,13 +393,12 @@ def test_a_cooldown_from_THIS_base_still_discards_its_evidence():
     rt = _TieredWedge()
     pool = _pool(rt, pre_guest_rebuild_after=3, base_rebuild_cooldown_s=300.0)
     pool._last_base_rebuild_at = pool._clock()
-    pool._last_base_rebuild_idents = {"tierB"}  # ...and it was THIS one
+    pool._last_base_rebuild_idents = {"tierB"}       # ...and it was THIS one
     for slot in _claim_distinct(pool, 3):
         _fail(pool, slot, stage="pre_guest")
     assert rt.base_invalidations == 0
     assert not pool._pool_pre_guest_failures.get("tierB"), (
-        "a base that a rebuild did not fix must not keep accumulating toward another"
-    )
+        "a base that a rebuild did not fix must not keep accumulating toward another")
 
 
 def test_a_real_rebuild_records_which_base_it_repaired():
@@ -453,9 +411,7 @@ def test_a_real_rebuild_records_which_base_it_repaired():
     for slot in _claim_distinct(pool, 3):
         _fail(pool, slot, stage="pre_guest")
     assert rt.base_invalidations == 1, "the first crossing must actually repair"
-    assert pool._last_base_rebuild_idents == {"tierB"}, (
-        "the repair must record its target"
-    )
+    assert pool._last_base_rebuild_idents == {"tierB"}, "the repair must record its target"
 
     # ...and now the SAME base keeps failing inside the cooldown: evidence must be discarded,
     # which only works if the identity above was recorded.
@@ -463,8 +419,7 @@ def test_a_real_rebuild_records_which_base_it_repaired():
         _fail(pool, slot, stage="pre_guest")
     assert rt.base_invalidations == 1, "the cooldown must suppress the second repair"
     assert not pool._pool_pre_guest_failures.get("tierB"), (
-        "a base a rebuild did not fix must not keep accumulating toward another"
-    )
+        "a base a rebuild did not fix must not keep accumulating toward another")
 
 
 def test_the_repaired_identity_comes_from_what_was_actually_repaired():
@@ -479,15 +434,13 @@ def test_the_repaired_identity_comes_from_what_was_actually_repaired():
     def _drop(*, reason=None, only=None):
         rt.base_invalidations += 1
         return ["tierA"]
-
     rt.invalidate_base = _drop
 
     for slot in _claim_distinct(pool, 3):
         _fail(pool, slot, stage="pre_guest")
     assert rt.base_invalidations == 1
     assert "tierB" not in pool._last_base_rebuild_idents, (
-        "tierB was never repaired, so the cooldown must not treat it as just-rebuilt"
-    )
+        "tierB was never repaired, so the cooldown must not treat it as just-rebuilt")
 
 
 def test_an_ordinary_repair_also_names_its_tier():
@@ -498,10 +451,9 @@ def test_an_ordinary_repair_also_names_its_tier():
     # ordinary threshold is small here so plain worker faults cross it
     pool = _pool(rt, pre_guest_rebuild_after=0, snapshot_rebuild_after=3)
     for slot in _claim_distinct(pool, 3):
-        _fail(pool, slot, stage=None)  # ordinary worker faults, no pre-guest evidence
+        _fail(pool, slot, stage=None)              # ordinary worker faults, no pre-guest evidence
     assert rt.invalidated == ["tierB"], (
-        f"an ordinary repair must name the tier that crossed, got {rt.invalidated}"
-    )
+        f"an ordinary repair must name the tier that crossed, got {rt.invalidated}")
 
 
 def test_every_tier_a_repair_committed_is_recorded():
@@ -513,8 +465,7 @@ def test_every_tier_a_repair_committed_is_recorded():
 
     def _drop(*, reason=None, only=None):
         rt.base_invalidations += 1
-        return ["tierA", "tierB"]  # the repair covered BOTH
-
+        return ["tierA", "tierB"]                  # the repair covered BOTH
     rt.invalidate_base = _drop
 
     a, b, c, sib1, sib2 = _claim_distinct(pool, 5)
@@ -523,17 +474,14 @@ def test_every_tier_a_repair_committed_is_recorded():
     rt._ident[sib2.slot_id] = "tierA"
     _fail(pool, sib1, stage=None)
     _fail(pool, sib2, stage=None)
-    assert pool._pool_consecutive_failures.get("tierA") == 2, (
-        "precondition: tierA has a streak"
-    )
+    assert pool._pool_consecutive_failures.get("tierA") == 2, "precondition: tierA has a streak"
 
     # ...and tierB's crossing triggers a repair that covers BOTH tiers.
     for slot in (a, b, c):
         _fail(pool, slot, stage="pre_guest")
     assert pool._last_base_rebuild_idents == {"tierA", "tierB"}
     assert not pool._pool_consecutive_failures.get("tierA"), (
-        "tierA was rebuilt by this repair, so its pre-rebuild streak must not survive it"
-    )
+        "tierA was rebuilt by this repair, so its pre-rebuild streak must not survive it")
 
 
 def test_a_retired_generations_success_does_not_bump_the_per_base_token():
@@ -550,16 +498,13 @@ def test_a_retired_generations_success_does_not_bump_the_per_base_token():
     current, stale = _claim_distinct(pool, 2)
 
     pool.release(current, dirty=False)
-    assert pool._clean_release_by_base.get("tierB") == 1, (
-        "a current-generation success counts"
-    )
+    assert pool._clean_release_by_base.get("tierB") == 1, "a current-generation success counts"
 
     ident, gen = pool._slot_base.get(stale.slot_id, ("tierB", 0))
-    pool._slot_base[stale.slot_id] = (ident, gen - 1)  # retired generation
+    pool._slot_base[stale.slot_id] = (ident, gen - 1)      # retired generation
     pool.release(stale, dirty=False)
     assert pool._clean_release_by_base.get("tierB") == 1, (
-        "a success from a base that has already been replaced says nothing about the current one"
-    )
+        "a success from a base that has already been replaced says nothing about the current one")
 
 
 def test_the_loser_discards_evidence_when_the_winner_repaired_THIS_base():
@@ -582,10 +527,9 @@ def test_the_loser_discards_evidence_when_the_winner_repaired_THIS_base():
     class _WinnerFinishesFirst:
         def __enter__(self):
             real.acquire()
-            pool._last_base_rebuild_at = pool._clock()  # the winner just committed...
-            pool._last_base_rebuild_idents = {"tierB"}  # ...on THIS base
+            pool._last_base_rebuild_at = pool._clock()      # the winner just committed...
+            pool._last_base_rebuild_idents = {"tierB"}      # ...on THIS base
             return self
-
         def __exit__(self, *exc):
             real.release()
             return False
@@ -596,8 +540,7 @@ def test_the_loser_discards_evidence_when_the_winner_repaired_THIS_base():
         _fail(pool, slot, stage="pre_guest")
     assert rt.base_invalidations == 0, "the winner's cooldown must suppress the loser"
     assert not pool._pool_pre_guest_failures.get("tierB"), (
-        "evidence from the generation the winner replaced must not survive into the new one"
-    )
+        "evidence from the generation the winner replaced must not survive into the new one")
 
 
 def test_a_partial_repair_clears_the_evidence_of_the_tiers_it_did_replace():
@@ -612,20 +555,16 @@ def test_a_partial_repair_clears_the_evidence_of_the_tiers_it_did_replace():
 
     def _drop(*, reason=None, only=None):
         raise _PartialFail("tierB could not be dropped")
-
     rt.invalidate_base = _drop
 
     sib, a, b, c = _claim_distinct(pool, 4)
     rt._ident[sib.slot_id] = "tierA"
-    _fail(pool, sib, stage="pre_guest")  # evidence against the OLD tierA
+    _fail(pool, sib, stage="pre_guest")              # evidence against the OLD tierA
     assert pool._pool_pre_guest_failures.get("tierA")
     for slot in (a, b, c):
-        _fail(
-            pool, slot, stage="pre_guest"
-        )  # tierB crosses; the repair partially fails
+        _fail(pool, slot, stage="pre_guest")         # tierB crosses; the repair partially fails
     assert not pool._pool_pre_guest_failures.get("tierA"), (
-        "tierA's generation advanced, so evidence against its retired artifact must go with it"
-    )
+        "tierA's generation advanced, so evidence against its retired artifact must go with it")
 
 
 def test_a_crossed_pre_guest_episode_outranks_an_ordinary_streak():
@@ -639,20 +578,15 @@ def test_a_crossed_pre_guest_episode_outranks_an_ordinary_streak():
     pre-guest path is the only way it can ever be repaired.
     """
     rt = _TieredWedge()
-    pool = _pool(
-        rt,
-        pre_guest_rebuild_after=3,
-        snapshot_rebuild_after=10,
-        base_rebuild_cooldown_s=0,
-    )
+    pool = _pool(rt, pre_guest_rebuild_after=3, snapshot_rebuild_after=10,
+                 base_rebuild_cooldown_s=0)
 
     def _drop(*, reason=None, only=None):
         if only == "tierA":
-            raise OSError("tierA could not be dropped")  # streak is restored
+            raise OSError("tierA could not be dropped")     # streak is restored
         rt.invalidated.append(only)
         rt.base_invalidations += 1
         return [only]
-
     rt.invalidate_base = _drop
 
     slots = _claim_distinct(pool, 13)
@@ -660,14 +594,12 @@ def test_a_crossed_pre_guest_episode_outranks_an_ordinary_streak():
         rt._ident[s_.slot_id] = "tierA"
         _fail(pool, s_, stage=None)
     assert pool._pool_consecutive_failures.get("tierA", 0) >= 10, (
-        "precondition: tierA's streak survived its failed repair"
-    )
+        "precondition: tierA's streak survived its failed repair")
 
     for s_ in slots[10:]:
         _fail(pool, s_, stage="pre_guest")
     assert "tierB" in rt.invalidated, (
-        f"the proven-poisoned tier must be selected over a mere streak, got {rt.invalidated}"
-    )
+        f"the proven-poisoned tier must be selected over a mere streak, got {rt.invalidated}")
 
 
 def test_a_success_during_the_lock_wait_discards_the_losing_episode():
@@ -682,13 +614,11 @@ def test_a_success_during_the_lock_wait_discards_the_losing_episode():
         def __enter__(self):
             real.acquire()
             pool._last_base_rebuild_at = pool._clock()
-            pool._last_base_rebuild_idents = {"tierA"}  # a DIFFERENT tier
+            pool._last_base_rebuild_idents = {"tierA"}          # a DIFFERENT tier
             # ...and meanwhile a tierB slot completed cleanly
             pool._clean_release_by_base["tierB"] = (
-                pool._clean_release_by_base.get("tierB", 0) + 1
-            )
+                pool._clean_release_by_base.get("tierB", 0) + 1)
             return self
-
         def __exit__(self, *exc):
             real.release()
             return False
@@ -698,8 +628,7 @@ def test_a_success_during_the_lock_wait_discards_the_losing_episode():
         _fail(pool, slot, stage="pre_guest")
     assert rt.base_invalidations == 0
     assert not pool._pool_pre_guest_failures.get("tierB"), (
-        "a base that succeeded during the wait must not keep its pre-recovery evidence"
-    )
+        "a base that succeeded during the wait must not keep its pre-recovery evidence")
 
 
 def test_a_spawn_episode_uses_the_pool_wide_success_token():
@@ -754,7 +683,7 @@ def test_a_success_during_the_cooldown_discards_the_episode_too():
     rt = _TieredWedge()
     pool = _pool(rt, pre_guest_rebuild_after=3, base_rebuild_cooldown_s=300.0)
     pool._last_base_rebuild_at = pool._clock()
-    pool._last_base_rebuild_idents = {"tierA"}  # a DIFFERENT tier is cooling
+    pool._last_base_rebuild_idents = {"tierA"}        # a DIFFERENT tier is cooling
     pool._succeeded_since_locked = lambda ident, token, scope=(): ident == "tierB"
 
     for slot in _claim_distinct(pool, 3):
@@ -762,11 +691,9 @@ def test_a_success_during_the_cooldown_discards_the_episode_too():
 
     assert rt.base_invalidations == 0, "the cooldown must suppress the repair"
     assert not pool._pool_pre_guest_failures.get("tierB"), (
-        "a base that succeeded since the decision must not have its evidence restored"
-    )
+        "a base that succeeded since the decision must not have its evidence restored")
     assert not pool._pool_consecutive_failures.get("tierB"), (
-        "...nor its ordinary streak"
-    )
+        "...nor its ordinary streak")
 
 
 def test_a_base_that_did_NOT_succeed_still_gets_its_evidence_back():
@@ -783,8 +710,7 @@ def test_a_base_that_did_NOT_succeed_still_gets_its_evidence_back():
 
     assert rt.base_invalidations == 0
     assert len(pool._pool_pre_guest_failures.get("tierB", set())) >= 3, (
-        "no success means the evidence is still valid and must be handed back"
-    )
+        "no success means the evidence is still valid and must be handed back")
 
 
 class _ScopedWedge(_TieredWedge):
@@ -812,8 +738,7 @@ def _release_during_the_decision(pool, ident):
             with pool._lock:
                 pool._clean_release_count += 1
                 pool._clean_release_by_base[ident] = (
-                    pool._clean_release_by_base.get(ident, 0) + 1
-                )
+                    pool._clean_release_by_base.get(ident, 0) + 1)
         return real()
 
     pool._clock = _clock
@@ -828,11 +753,10 @@ def test_a_sibling_tiers_success_does_not_cancel_the_guilty_tiers_spawn_repair()
     its repair."""
     rt = _ScopedWedge(guilty=("tierB",))
     pool = _pool(rt, snapshot_rebuild_after=2, base_rebuild_cooldown_s=0)
-    fired = _release_during_the_decision(pool, "tierA")  # a DIFFERENT tier succeeds
+    fired = _release_during_the_decision(pool, "tierA")      # a DIFFERENT tier succeeds
 
     assert pool._maybe_rebuild_base(5, reason="spawn") is True, (
-        "tierA's success cancelled tierB's repair; tierB produced no successful slot at all"
-    )
+        "tierA's success cancelled tierB's repair; tierB produced no successful slot at all")
     assert fired, "the injected sibling release never landed — the test proves nothing"
     assert rt.base_invalidations == 1
 
@@ -841,11 +765,10 @@ def test_the_guilty_tiers_own_success_still_cancels_its_spawn_repair():
     """Fail-closed control: the guard must keep working for the tier it is actually about."""
     rt = _ScopedWedge(guilty=("tierB",))
     pool = _pool(rt, snapshot_rebuild_after=2, base_rebuild_cooldown_s=0)
-    fired = _release_during_the_decision(pool, "tierB")  # the GUILTY tier succeeds
+    fired = _release_during_the_decision(pool, "tierB")      # the GUILTY tier succeeds
 
     assert pool._maybe_rebuild_base(5, reason="spawn") is False, (
-        "a base that produced a valid result while being judged must not be rebuilt"
-    )
+        "a base that produced a valid result while being judged must not be rebuilt")
     assert fired
     assert rt.base_invalidations == 0
 
@@ -853,21 +776,19 @@ def test_the_guilty_tiers_own_success_still_cancels_its_spawn_repair():
 def test_a_runtime_without_the_seam_keeps_the_pool_wide_token():
     """One base means pool-wide IS the right scope; a runtime that cannot attribute must not
     silently lose the guard that the pool-wide counter provides."""
-    rt = _TieredWedge()  # no spawn_guilty_identities
+    rt = _TieredWedge()                                      # no spawn_guilty_identities
     pool = _pool(rt, snapshot_rebuild_after=2, base_rebuild_cooldown_s=0)
     assert pool._spawn_success_scope() == ()
     fired = _release_during_the_decision(pool, "tierA")
 
     assert pool._maybe_rebuild_base(5, reason="spawn") is False, (
-        "with no attribution the pool-wide counter is all there is, and it moved"
-    )
+        "with no attribution the pool-wide counter is all there is, and it moved")
     assert fired
 
 
 def test_a_broken_attribution_seam_does_not_stop_a_repair_decision():
     """The seam is an optimisation. A runtime that raises must degrade to pool-wide, not crash
     the maintenance tick that is trying to repair a wedged tier."""
-
     class _Broken(_TieredWedge):
         def spawn_guilty_identities(self):
             raise RuntimeError("cascade lock timed out")
@@ -892,8 +813,7 @@ def test_a_recovery_during_the_lock_wait_is_caught_even_when_the_winner_failed()
             # The holder's repair raised: no _last_base_rebuild_at, no _last_base_rebuild_idents.
             # Meanwhile a current-generation tierB slot completed cleanly.
             pool._clean_release_by_base["tierB"] = (
-                pool._clean_release_by_base.get("tierB", 0) + 1
-            )
+                pool._clean_release_by_base.get("tierB", 0) + 1)
             return self
 
         def __exit__(self, *exc):
@@ -907,8 +827,7 @@ def test_a_recovery_during_the_lock_wait_is_caught_even_when_the_winner_failed()
 
     assert rt.base_invalidations == 0, (
         "tierB produced a valid result while this decision queued; rebuilding it now is an "
-        "outage taken against a base that just proved it works"
-    )
+        "outage taken against a base that just proved it works")
 
 
 def test_a_failed_repair_does_not_restore_evidence_the_base_has_since_disproved():
@@ -921,8 +840,7 @@ def test_a_failed_repair_does_not_restore_evidence_the_base_has_since_disproved(
     def _drop(*, reason=None, only=None):
         # A slow repair that ultimately fails -- and while it ran, a tierB slot completed.
         pool._clean_release_by_base["tierB"] = (
-            pool._clean_release_by_base.get("tierB", 0) + 1
-        )
+            pool._clean_release_by_base.get("tierB", 0) + 1)
         raise OSError("tierB could not be dropped")
 
     rt.invalidate_base = _drop
@@ -931,8 +849,7 @@ def test_a_failed_repair_does_not_restore_evidence_the_base_has_since_disproved(
 
     assert not pool._pool_pre_guest_failures.get("tierB"), (
         "pre-recovery pre-guest evidence was handed back to a base that has since produced a "
-        "valid result"
-    )
+        "valid result")
 
 
 def test_a_sibling_tiers_cooldown_does_not_discard_this_tiers_spawn_streak():
@@ -942,14 +859,13 @@ def test_a_sibling_tiers_cooldown_does_not_discard_this_tiers_spawn_streak():
     rt = _ScopedWedge(guilty=("tierB",))
     pool = _pool(rt, snapshot_rebuild_after=2, base_rebuild_cooldown_s=300.0)
     pool._last_base_rebuild_at = pool._clock()
-    pool._last_base_rebuild_idents = {"tierA"}  # a DIFFERENT tier was repaired
+    pool._last_base_rebuild_idents = {"tierA"}          # a DIFFERENT tier was repaired
     pool._spawn_consecutive_failures = 5
 
-    assert pool._maybe_rebuild_base(5, reason="spawn") is False  # cooling, correctly
+    assert pool._maybe_rebuild_base(5, reason="spawn") is False   # cooling, correctly
     assert pool._spawn_consecutive_failures == 5, (
         "tierB's spawn evidence was discarded because tierA had just been repaired; tierB must "
-        "not sacrifice another threshold-sized batch of spawns for that"
-    )
+        "not sacrifice another threshold-sized batch of spawns for that")
 
 
 def test_a_cooldown_from_this_tiers_own_repair_still_discards_the_streak():
@@ -957,18 +873,17 @@ def test_a_cooldown_from_this_tiers_own_repair_still_discards_the_streak():
     rt = _ScopedWedge(guilty=("tierB",))
     pool = _pool(rt, snapshot_rebuild_after=2, base_rebuild_cooldown_s=300.0)
     pool._last_base_rebuild_at = pool._clock()
-    pool._last_base_rebuild_idents = {"tierB"}  # THIS tier was just repaired
+    pool._last_base_rebuild_idents = {"tierB"}          # THIS tier was just repaired
     pool._spawn_consecutive_failures = 5
 
     assert pool._maybe_rebuild_base(5, reason="spawn") is False
     assert pool._spawn_consecutive_failures == 0, (
-        "this tier was just rebuilt and still fails, so the cause is elsewhere -- drop it"
-    )
+        "this tier was just rebuilt and still fails, so the cause is elsewhere -- drop it")
 
 
 def test_an_unattributed_spawn_cooldown_still_discards_the_streak():
     """No attribution -> the old pool-wide behaviour, unchanged."""
-    rt = _TieredWedge()  # no spawn_guilty_identities seam
+    rt = _TieredWedge()                                 # no spawn_guilty_identities seam
     pool = _pool(rt, snapshot_rebuild_after=2, base_rebuild_cooldown_s=300.0)
     pool._last_base_rebuild_at = pool._clock()
     pool._last_base_rebuild_idents = {"tierA"}
@@ -988,20 +903,18 @@ def test_a_spawn_repair_hands_the_cascade_the_scope_it_judged():
 
     assert pool._maybe_rebuild_base(5, reason="spawn") is True
     assert rt.invalidated == [("tierB",)], (
-        f"the repair must be handed the judged scope, got {rt.invalidated}"
-    )
+        f"the repair must be handed the judged scope, got {rt.invalidated}")
 
 
 def test_an_unattributed_spawn_repair_still_names_no_target():
     """No scope -> nothing to freeze, and the cascade's own fallback is correct. Passing only=()
     would match no tier and silently repair nothing."""
-    rt = _TieredWedge()  # no spawn_guilty_identities seam
+    rt = _TieredWedge()                       # no spawn_guilty_identities seam
     pool = _pool(rt, snapshot_rebuild_after=2, base_rebuild_cooldown_s=0)
 
     assert pool._maybe_rebuild_base(5, reason="spawn") is True
     assert rt.invalidated == [None], (
-        f"an unattributed spawn repair must leave targeting to the cascade, got {rt.invalidated}"
-    )
+        f"an unattributed spawn repair must leave targeting to the cascade, got {rt.invalidated}")
 
 
 def test_the_recovery_check_lives_inside_the_restore():
@@ -1013,12 +926,11 @@ def test_the_recovery_check_lives_inside_the_restore():
     base that had just proved it works. Pinned by making the PUBLIC predicate lie: if the decision
     still consulted it, the stale 'not recovered' verdict would get the evidence restored."""
     pool = _pool(_TieredWedge(), pre_guest_rebuild_after=3)
-    pool._base_succeeded_since = lambda *a, **k: False  # the stale pre-lock verdict
-    pool._clean_release_by_base["tierB"] = 9  # ...but tierB has since recovered
+    pool._base_succeeded_since = lambda *a, **k: False        # the stale pre-lock verdict
+    pool._clean_release_by_base["tierB"] = 9                  # ...but tierB has since recovered
 
-    assert (
-        pool._restore_episode("tierB", 3, frozenset({"x"}), "job", token=8) is False
-    ), "the restore trusted a verdict taken in an earlier critical section"
+    assert pool._restore_episode("tierB", 3, frozenset({"x"}), "job", token=8) is False, (
+        "the restore trusted a verdict taken in an earlier critical section")
     assert not pool._pool_pre_guest_failures.get("tierB")
     assert not pool._pool_consecutive_failures.get("tierB")
 
@@ -1052,16 +964,14 @@ def test_a_release_during_the_runtime_query_is_not_swallowed_by_the_token():
     def _guilty_and_meanwhile_a_success():
         with pool._lock:
             pool._clean_release_by_base["tierB"] = (
-                pool._clean_release_by_base.get("tierB", 0) + 1
-            )
+                pool._clean_release_by_base.get("tierB", 0) + 1)
         return ["tierB"]
 
     rt.spawn_guilty_identities = _guilty_and_meanwhile_a_success
 
     assert pool._maybe_rebuild_base(5, reason="spawn") is False, (
         "tierB produced a valid result inside the decision window; the token must have been "
-        "captured before the query, so that release is still visible as a change"
-    )
+        "captured before the query, so that release is still visible as a change")
     assert rt.base_invalidations == 0
 
 
@@ -1077,14 +987,13 @@ def test_a_retired_generation_success_does_not_move_the_pool_wide_token():
     # Stamp the slot to a RETIRED generation of its base, then let it succeed.
     with pool._lock:
         pool._slot_base[slot.slot_id] = ("tierB", 0)
-        pool._base_generation["tierB"] = 1  # the base has since been rebuilt
+        pool._base_generation["tierB"] = 1          # the base has since been rebuilt
         before = pool._clean_release_count
 
     pool.release(slot, dirty=False)
 
     assert pool._clean_release_count == before, (
-        "a slot from a retired generation moved the pool-wide recovery token"
-    )
+        "a slot from a retired generation moved the pool-wide recovery token")
 
 
 def test_a_current_generation_success_still_moves_the_pool_wide_token():
@@ -1094,7 +1003,7 @@ def test_a_current_generation_success_still_moves_the_pool_wide_token():
     slot = _claim_distinct(pool, 1)[0]
     with pool._lock:
         pool._slot_base[slot.slot_id] = ("tierB", 1)
-        pool._base_generation["tierB"] = 1  # SAME generation
+        pool._base_generation["tierB"] = 1          # SAME generation
         before = pool._clean_release_count
 
     pool.release(slot, dirty=False)

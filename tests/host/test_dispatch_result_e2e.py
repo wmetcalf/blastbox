@@ -13,7 +13,6 @@ This test drives the REAL Dispatcher.dispatch_once() to a DONE completion with
 a real LocalBlobStore (no mocked blob store), then hits the FastAPI routes
 through TestClient and asserts they serve the result.
 """
-
 from __future__ import annotations
 
 import hashlib
@@ -40,9 +39,7 @@ def _fake_runtime() -> RuntimeSelection:
     return RuntimeSelection(runtime="runc", secure=False, warnings=["no runsc"])
 
 
-def _write_valid_output_dir(
-    output_dir: Path, *, artifact_content: bytes = b"PNG_DATA"
-) -> None:
+def _write_valid_output_dir(output_dir: Path, *, artifact_content: bytes = b"PNG_DATA") -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     artifact_path = output_dir / "page-001.png"
     artifact_path.write_bytes(artifact_content)
@@ -72,9 +69,7 @@ def _write_valid_output_dir(
     (output_dir / "metadata.json").write_bytes(json.dumps(envelope).encode())
 
 
-def test_classic_dispatcher_result_is_served_by_the_api_through_the_blob_store(
-    tmp_path,
-):
+def test_classic_dispatcher_result_is_served_by_the_api_through_the_blob_store(tmp_path):
     job_root = tmp_path / "jobs"
     job_root.mkdir()
 
@@ -101,11 +96,7 @@ def test_classic_dispatcher_result_is_served_by_the_api_through_the_blob_store(
 
     dispatcher = Dispatcher(
         job_store=store,
-        engines={
-            _ENGINE_NAME: EngineSpec(
-                name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"]
-            )
-        },
+        engines={_ENGINE_NAME: EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"])},
         limits=Limits(),
         job_root=job_root,
         runtime_selector=_fake_runtime,
@@ -118,15 +109,11 @@ def test_classic_dispatcher_result_is_served_by_the_api_through_the_blob_store(
     # put_output must have actually populated the blob store's results dir --
     # the concrete symptom in the finding.
     results_metadata = blob_store._blob_root / "results" / job.job_id / "metadata.json"
-    assert results_metadata.is_file(), (
-        "put_output must have written the result under blob_root"
-    )
+    assert results_metadata.is_file(), "put_output must have written the result under blob_root"
 
     # Disable the default "infected" ZIP password (BLASTBOX_ZIP_PASSWORD) -- this test is
     # about the blob-store wiring (Finding P1), not the malware-safe-transport encryption.
-    app = build_app(
-        job_store=store, job_root=job_root, blob_store=blob_store, zip_password=""
-    )
+    app = build_app(job_store=store, job_root=job_root, blob_store=blob_store, zip_password="")
     client = TestClient(app)
 
     meta_resp = client.get(f"/v1/jobs/{job.job_id}/metadata")

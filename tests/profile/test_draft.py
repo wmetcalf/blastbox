@@ -1,5 +1,4 @@
 """Deterministic tests for PolicyDraft union, analysis, and emitters."""
-
 from blastbox.profile import NetDraft, PolicyDraft
 
 
@@ -22,7 +21,7 @@ def test_union_accumulates():
 
 def test_denylist_violations():
     d = _draft(syscalls={"openat", "mmap", "read", "write"})
-    assert d.denylist_violations({"ptrace", "bpf"}) == set()  # safe
+    assert d.denylist_violations({"ptrace", "bpf"}) == set()      # safe
     assert d.denylist_violations({"mmap", "ptrace"}) == {"mmap"}  # violation
 
 
@@ -39,7 +38,7 @@ def test_emitters_shape():
     assert oci["defaultAction"] == "SCMP_ACT_ERRNO"
     assert sorted(oci["syscalls"][0]["names"]) == ["mmap", "openat"]
     nono = d.to_nono_profile("soffice")
-    assert nono["network"]["block"] is True  # no inet -> block safe
+    assert nono["network"]["block"] is True            # no inet -> block safe
     assert "/usr/lib" in nono["filesystem"]["read"]
 
 

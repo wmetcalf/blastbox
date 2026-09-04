@@ -1,7 +1,6 @@
 """Security posture restored from the engines' bespoke hosts (lost in the migration):
 hardening response headers on every response + API docs withheld by default.
 """
-
 from __future__ import annotations
 
 import pytest

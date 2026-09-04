@@ -7,7 +7,6 @@ Structure
 3. Real smoke-run tests (bwrap IS installed on this host; skip if userns
    is restricted).
 """
-
 from __future__ import annotations
 
 import subprocess
@@ -24,7 +23,6 @@ from blastbox.worker.sandbox.bwrap import BubblewrapSandbox, _make_apply_rlimits
 # Helpers
 # ---------------------------------------------------------------------------
 
-
 def _make_sandbox(
     *,
     bwrap_path: str | None = None,
@@ -32,7 +30,6 @@ def _make_sandbox(
 ) -> BubblewrapSandbox:
     """Construct a BubblewrapSandbox; skip if bwrap is not found."""
     import shutil
-
     path = bwrap_path or shutil.which("bwrap") or "/usr/bin/bwrap"
     if not Path(path).exists():
         pytest.skip("bwrap not installed on this host")
@@ -42,7 +39,6 @@ def _make_sandbox(
 # ---------------------------------------------------------------------------
 # Part 1: argv-building unit tests
 # ---------------------------------------------------------------------------
-
 
 class TestBwrapArgvBuilding:
     """Test _build_argv without running bwrap."""
@@ -216,7 +212,7 @@ class TestBwrapArgvBuilding:
         idx = argv.index(normalised_target)
         assert argv[idx - 2] in ("--bind", "--ro-bind"), (
             f"evil target must be preceded by source then flag, "
-            f"got argv[idx-2]={argv[idx - 2]!r}"
+            f"got argv[idx-2]={argv[idx-2]!r}"
         )
         # The target is a single list element, not split by the shell.
         assert " " in normalised_target or ";" in normalised_target, (
@@ -232,7 +228,7 @@ class TestBwrapArgvBuilding:
         assert "--" in argv
         # Inner argv is the last part after the final --
         # (aa-exec may be prepended, but inner argv always ends the list)
-        assert argv[-len(inner) :] == inner
+        assert argv[-len(inner):] == inner
 
     def test_no_shell_true_flag(self) -> None:
         """_build_argv never produces a 'shell=True' token (just a sanity check)."""
@@ -247,7 +243,6 @@ class TestBwrapArgvBuilding:
 # Part 2: insecurity_reasons unit tests
 # ---------------------------------------------------------------------------
 
-
 class TestBwrapInsecurityReasons:
     """Test insecurity_reasons without running bwrap."""
 
@@ -257,7 +252,6 @@ class TestBwrapInsecurityReasons:
         (Builder mocked so this runs where python3-libseccomp is absent.)"""
         import blastbox.worker.sandbox.bwrap as bwrap_mod
         import blastbox.worker.sandbox.seccomp_denylist as denylist_mod
-
         monkeypatch.setattr(bwrap_mod, "_LIBSECCOMP_AVAILABLE", True)
         monkeypatch.setattr(denylist_mod, "build_bpf_bytes", lambda: b"\x00" * 16)
         sb = _make_sandbox()
@@ -267,7 +261,6 @@ class TestBwrapInsecurityReasons:
     def test_secure_false_when_seccomp_missing(self, monkeypatch) -> None:
         """secure is False when seccomp lib is absent."""
         import blastbox.worker.sandbox.bwrap as bwrap_mod
-
         monkeypatch.setattr(bwrap_mod, "_LIBSECCOMP_AVAILABLE", False)
         sb = _make_sandbox()
         assert sb.secure is False
@@ -275,7 +268,6 @@ class TestBwrapInsecurityReasons:
     def test_apparmor_missing_when_no_aa_exec(self, monkeypatch) -> None:
         """When aa-exec is absent, 'apparmor_missing' is in reasons."""
         import blastbox.worker.sandbox.bwrap as bwrap_mod
-
         # Patch shutil.which in the bwrap module namespace so aa-exec is not found.
         original_which = bwrap_mod.shutil.which
         monkeypatch.setattr(
@@ -289,7 +281,6 @@ class TestBwrapInsecurityReasons:
     def test_insecurity_reasons_returns_copy(self, monkeypatch) -> None:
         """insecurity_reasons returns a new list each time (copy, not reference)."""
         import blastbox.worker.sandbox.bwrap as bwrap_mod
-
         monkeypatch.setattr(bwrap_mod, "_LIBSECCOMP_AVAILABLE", False)
         sb = _make_sandbox()
         r1 = sb.insecurity_reasons
@@ -302,7 +293,6 @@ class TestBwrapInsecurityReasons:
         Fail-safe: the gate never mistakes an UNFILTERED bwrap for secure (nsjail carries seccomp
         via KAFEL; the deployed container/gVisor path is preferred)."""
         import blastbox.worker.sandbox.bwrap as bwrap_mod
-
         monkeypatch.setattr(bwrap_mod, "_LIBSECCOMP_AVAILABLE", False)
         sb = _make_sandbox()
         assert "seccomp_not_implemented" in sb.insecurity_reasons
@@ -313,7 +303,6 @@ class TestBwrapInsecurityReasons:
 # ---------------------------------------------------------------------------
 # Part 3: Real smoke-run tests
 # ---------------------------------------------------------------------------
-
 
 class TestBwrapRealRun:
     """Integration tests that actually invoke bwrap.
@@ -326,14 +315,11 @@ class TestBwrapRealRun:
     def check_userns(self) -> None:
         """Skip if user namespaces are not usable on this host."""
         import shutil
-
         if not shutil.which("bwrap"):
             pytest.skip("bwrap not installed")
         # Quick probe: attempt a minimal bwrap run
         try:
-            true_path = (
-                "/usr/bin/true" if Path("/usr/bin/true").exists() else "/bin/true"
-            )
+            true_path = "/usr/bin/true" if Path("/usr/bin/true").exists() else "/bin/true"
             r = subprocess.run(
                 [
                     "bwrap",
@@ -341,30 +327,15 @@ class TestBwrapRealRun:
                     "--unshare-all",
                     "--die-with-parent",
                     "--clearenv",
-                    "--proc",
-                    "/proc",
-                    "--dev",
-                    "/dev",
-                    "--ro-bind",
-                    "/usr",
-                    "/usr",
-                    "--symlink",
-                    "usr/bin",
-                    "/bin",
-                    "--symlink",
-                    "usr/lib",
-                    "/lib",
-                    "--symlink",
-                    "usr/lib64",
-                    "/lib64",
-                    "--symlink",
-                    "usr/sbin",
-                    "/sbin",
-                    "--ro-bind",
-                    "/etc",
-                    "/etc",
-                    "--tmpfs",
-                    "/tmp",
+                    "--proc", "/proc",
+                    "--dev", "/dev",
+                    "--ro-bind", "/usr", "/usr",
+                    "--symlink", "usr/bin", "/bin",
+                    "--symlink", "usr/lib", "/lib",
+                    "--symlink", "usr/lib64", "/lib64",
+                    "--symlink", "usr/sbin", "/sbin",
+                    "--ro-bind", "/etc", "/etc",
+                    "--tmpfs", "/tmp",
                     "--",
                     true_path,
                 ],
@@ -386,7 +357,6 @@ class TestBwrapRealRun:
         (profile blastbox-sandbox may not be loaded on the host).
         """
         import blastbox.worker.sandbox.bwrap as bwrap_mod
-
         monkeypatch.setattr(bwrap_mod, "_LIBSECCOMP_AVAILABLE", False)
         sb = BubblewrapSandbox()
         # Disable aa-exec so bwrap doesn't try to attach a non-existent profile.
@@ -417,7 +387,6 @@ class TestBwrapRealRun:
     def test_env_stripped(self, monkeypatch) -> None:
         """Host os.environ sentinel must NOT appear in bwrap child's env."""
         import os as _os
-
         sentinel = "BLASTBOX_BWRAP_SECRET_XYZ"
         _os.environ[sentinel] = "must-not-appear"
         try:
@@ -459,7 +428,6 @@ class TestBwrapRealRun:
 # Part 4: make_apply_rlimits helper
 # ---------------------------------------------------------------------------
 
-
 def test_make_apply_rlimits_returns_callable() -> None:
     """_make_apply_rlimits returns a callable."""
     fn = _make_apply_rlimits(Limits())
@@ -469,7 +437,6 @@ def test_make_apply_rlimits_returns_callable() -> None:
 def test_make_apply_rlimits_callable_has_expected_signature() -> None:
     """The returned function takes no arguments (it's a preexec_fn)."""
     import inspect
-
     fn = _make_apply_rlimits(Limits())
     sig = inspect.signature(fn)
     assert len(sig.parameters) == 0, "preexec_fn must take no arguments"
@@ -525,14 +492,9 @@ def _kafel_deny_names() -> set[str]:
     """Plain syscall names in the KAFEL blastbox_deny ERRNO(1) block. Any line containing a brace
     is skipped — that drops the block delimiters AND the nested `clone { ... }` arg-filter, which
     is asserted separately (names never share a line with a brace here)."""
-    policy = (
-        Path(__file__).resolve().parents[3]
-        / "deploy"
-        / "seccomp"
-        / "blastbox.seccomp.policy"
-    )
+    policy = Path(__file__).resolve().parents[3] / "deploy" / "seccomp" / "blastbox.seccomp.policy"
     text = policy.read_text()
-    block = text[text.index("ERRNO(1) {") : text.index("USE ")]
+    block = text[text.index("ERRNO(1) {"):text.index("USE ")]
     names: set[str] = set()
     for line in block.splitlines():
         line = line.split("//", 1)[0].strip()
@@ -549,16 +511,12 @@ def test_bwrap_denylist_matches_kafel_policy() -> None:
     """The bwrap BPF denylist (seccomp_denylist.DENY_ERRNO1) MUST equal the nsjail KAFEL ERRNO(1)
     plain-name block, and the clone namespace bitmask must equal the KAFEL mask — so both backends
     deny the exact same syscalls (no drift)."""
-    from blastbox.worker.sandbox.seccomp_denylist import (
-        CLONE_NS_BITS,
-        CLONE_NS_MASK,
-        DENY_ERRNO1,
-    )
+    from blastbox.worker.sandbox.seccomp_denylist import CLONE_NS_BITS, CLONE_NS_MASK, DENY_ERRNO1
 
     # KAFEL can't lex `umount2` so the nsjail policy names that syscall `umount`; libseccomp needs
     # the real x86_64 `umount2`. Same syscall, backend-appropriate name — normalize that one.
     assert set(DENY_ERRNO1) == (_kafel_deny_names() - {"umount"}) | {"umount2"}
-    assert len(DENY_ERRNO1) == len(set(DENY_ERRNO1))  # no duplicates
+    assert len(DENY_ERRNO1) == len(set(DENY_ERRNO1))          # no duplicates
     assert sum(CLONE_NS_BITS) == CLONE_NS_MASK == 0x7E020000  # 7 CLONE_NEW* bits
 
 

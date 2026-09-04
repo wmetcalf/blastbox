@@ -3,7 +3,6 @@
 A product mounts its own FastAPI routers on the shared ingress core via
 IngressExtension, and `blastbox serve` resolves one from BLASTBOX_INGRESS_EXTENSION.
 """
-
 from __future__ import annotations
 
 import pytest
@@ -35,7 +34,6 @@ def _app(**kw):
 
 # --- Task 1: the seam -------------------------------------------------------
 
-
 def test_extension_router_is_mounted():
     c = TestClient(_app(extension=IngressExtension(routers=(_dummy_router(),))))
     assert c.get("/v1/ext/ping").json() == {"pong": True}
@@ -62,7 +60,6 @@ def test_extension_route_inherits_bearer_auth():
 
 
 # --- Task 2: the env loader -------------------------------------------------
-
 
 def test_load_ingress_extension_resolves_factory():
     ext = load_ingress_extension("tests.host.ingress.test_extension:_factory")

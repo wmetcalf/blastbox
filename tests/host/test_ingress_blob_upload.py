@@ -4,7 +4,6 @@ Otherwise a worker can claim a job whose blob is not there yet and is pushed dow
 the release-and-retry path for a sample that was never missing — a self-inflicted
 race that looks exactly like object-store flakiness.
 """
-
 from pathlib import Path
 
 
@@ -14,13 +13,10 @@ from blastbox.host.blobs.base import BlobFetchError
 class RecordingBlobStore:
     """Records the ORDER of put_sample vs the job-store create."""
 
-    def __init__(self, log):
-        self.log = log
-
+    def __init__(self, log): self.log = log
     def put_sample(self, sha256, src):
         assert Path(src).is_file()
         self.log.append(("put_sample", sha256))
-
     def get_sample(self, sha256, dest): ...
     def put_output(self, job_id, out_dir): ...
     def open_output(self, job_id, name): ...

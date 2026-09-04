@@ -7,7 +7,6 @@ timeout now RETIRES the slot rather than re-driving it -- were written into a fo
 three-column table and were invisible in the rendered guide. Both describe how to lose a warm tier
 during a brownout, which is the failure this whole branch exists to prevent.
 """
-
 from pathlib import Path
 
 import pytest
@@ -40,26 +39,21 @@ def test_every_table_row_has_exactly_the_columns_its_header_declares(doc: Path) 
         if not s.startswith("|"):
             header_cells = None
             continue
-        if set(s) <= set("|-: "):  # the |---|---| separator
+        if set(s) <= set("|-: "):          # the |---|---| separator
             header_cells = _cells(lines[n - 2]) if n >= 2 else None
             continue
         if header_cells is None:
             continue
         got = _cells(line)
         if got != header_cells:
-            bad.append(
-                f"{doc.name}:{n} has {got} cells, header declares {header_cells}: "
-                f"{s[:90]}"
-            )
+            bad.append(f"{doc.name}:{n} has {got} cells, header declares {header_cells}: "
+                       f"{s[:90]}")
     assert not bad, (
-        "table rows whose surplus cells are DROPPED by markdown renderers:\n  "
-        + "\n  ".join(bad)
+        "table rows whose surplus cells are DROPPED by markdown renderers:\n  " + "\n  ".join(bad)
     )
 
 
-def test_the_hibernate_timeout_row_does_not_claim_an_attribution_the_code_withholds() -> (
-    None
-):
+def test_the_hibernate_timeout_row_does_not_claim_an_attribution_the_code_withholds() -> None:
     """_maintain_idle retires with fault=None on purpose -- a park give-up is control-plane
     evidence, not a worker death -- and retire() only advances failure attribution for
     fault == "worker". The guide claimed the opposite, so an operator would expect repeated park
@@ -94,9 +88,7 @@ def test_the_guide_never_advertises_a_knob_the_code_does_not_read():
     """
     import re
 
-    doc = (
-        Path(__file__).resolve().parents[1] / "docs" / "CONFIGURATION.md"
-    ).read_text()
+    doc = (Path(__file__).resolve().parents[1] / "docs" / "CONFIGURATION.md").read_text()
     src_root = Path(__file__).resolve().parents[1] / "src"
     source = "\n".join(p.read_text() for p in src_root.rglob("*.py"))
 
@@ -117,5 +109,4 @@ def test_the_guide_never_advertises_a_knob_the_code_does_not_read():
 
     assert not phantom, (
         "docs/CONFIGURATION.md advertises env vars that no source file reads, so setting them does "
-        "nothing and says nothing:\n  " + "\n  ".join(phantom)
-    )
+        "nothing and says nothing:\n  " + "\n  ".join(phantom))

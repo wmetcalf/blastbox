@@ -24,6 +24,7 @@ def _capable():
     return c
 
 
+
 def _dirs(tmp_path):
     ctrl = tmp_path / "ctrl"
     ctrl.mkdir()
@@ -48,7 +49,7 @@ def test_the_worker_marks_the_job_before_it_starts(tmp_path):
 
 def test_the_host_reads_the_marker_and_reports_started(tmp_path):
     ctrl, src, out = _dirs(tmp_path)
-    seen = _capable()  # image known to mark
+    seen = _capable()                                   # image known to mark
     host = HostWarmControl(ctrl, ack_capable=seen)
     host.signal_go(WarmJobSpec(input_path=src, output_dir=out, params={}))
     guest = FileWarmControl(ctrl)
@@ -64,7 +65,7 @@ def test_a_wedged_worker_reports_not_started(tmp_path):
     host = HostWarmControl(ctrl, ack_capable=_capable())
     host.signal_go(WarmJobSpec(input_path=src, output_dir=out, params={}))
     try:
-        host.wait_for_done(timeout_s=0.3)  # nothing ever picks it up
+        host.wait_for_done(timeout_s=0.3)            # nothing ever picks it up
     except Exception:
         pass
     assert host.guest_started is False
@@ -74,7 +75,7 @@ def test_an_older_worker_stays_unknown(tmp_path):
     """No marker has ever been seen from this image, so a missing one means "old worker", not
     "wedged" -- and must convict nothing."""
     ctrl, src, out = _dirs(tmp_path)
-    host = HostWarmControl(ctrl)  # no capability memory
+    host = HostWarmControl(ctrl)                     # no capability memory
     host.signal_go(WarmJobSpec(input_path=src, output_dir=out, params={}))
     try:
         host.wait_for_done(timeout_s=0.3)
@@ -105,9 +106,7 @@ def test_the_gvisor_wrapper_forwards_the_signal(tmp_path):
     w = GvisorHostWarmControl(ctrl, ack_capable=seen)
     assert w.guest_started is None
     w._inner.guest_started = True
-    assert w.guest_started is True, (
-        "the wrapper must forward the wrapped control's state"
-    )
+    assert w.guest_started is True, "the wrapper must forward the wrapped control's state"
 
 
 def test_the_gvisor_runtime_shares_capability_across_slots(tmp_path):
@@ -132,16 +131,12 @@ def test_a_worker_that_cannot_mark_its_start_refuses_the_job(tmp_path, monkeypat
     from blastbox.errors import WarmTimeout
 
     ctrl, src, out = _dirs(tmp_path)
-    HostWarmControl(ctrl).signal_go(
-        WarmJobSpec(input_path=src, output_dir=out, params={})
-    )
+    HostWarmControl(ctrl).signal_go(WarmJobSpec(input_path=src, output_dir=out, params={}))
 
     guest = FileWarmControl(ctrl)
-
     def _boom(name, content):
         if name == WARM_STARTED:
             raise OSError("no space left on device")
-
     monkeypatch.setattr(guest, "_atomic_write", _boom)
 
     with pytest.raises(WarmTimeout, match="mark job start"):
@@ -154,21 +149,20 @@ def test_capability_is_learned_from_readiness_not_from_a_completed_job(tmp_path)
     poisoned-from-the-outset base this repairs, which is what a dispatcher restarting onto a bad
     artifact produces. `ready` is written when the slot WARMS, which a wedged base still does."""
     ctrl, src, out = _dirs(tmp_path)
-    FileWarmControl(ctrl).signal_ready()  # the slot warms...
-    host = HostWarmControl(ctrl)  # ...with NO prior capability memory
+    FileWarmControl(ctrl).signal_ready()          # the slot warms...
+    host = HostWarmControl(ctrl)                  # ...with NO prior capability memory
     host.signal_go(WarmJobSpec(input_path=src, output_dir=out, params={}))
     try:
-        host.wait_for_done(timeout_s=0.3)  # ...and then never executes anything
+        host.wait_for_done(timeout_s=0.3)         # ...and then never executes anything
     except Exception:
         pass
     assert host.guest_started is False, (
-        "readiness advertised the capability, so a missing marker is the guest, not an old image"
-    )
+        "readiness advertised the capability, so a missing marker is the guest, not an old image")
 
 
 def test_an_older_image_that_advertises_nothing_stays_unknown(tmp_path):
     ctrl, src, out = _dirs(tmp_path)
-    (ctrl / "ready").write_text("ready\n")  # old worker: no advertisement
+    (ctrl / "ready").write_text("ready\n")        # old worker: no advertisement
     host = HostWarmControl(ctrl)
     host.signal_go(WarmJobSpec(input_path=src, output_dir=out, params={}))
     try:
@@ -188,7 +182,7 @@ def test_a_hostile_ready_file_cannot_block_or_exhaust_the_dispatcher(tmp_path):
     ctrl, src, out = _dirs(tmp_path)
     outside = tmp_path / "secret"
     outside.write_text("ack=1\n")
-    os.symlink(outside, ctrl / "ready")  # symlink out of the confined dir
+    os.symlink(outside, ctrl / "ready")            # symlink out of the confined dir
 
     host = HostWarmControl(ctrl)
     host.signal_go(WarmJobSpec(input_path=src, output_dir=out, params={}))
@@ -197,8 +191,7 @@ def test_a_hostile_ready_file_cannot_block_or_exhaust_the_dispatcher(tmp_path):
     except Exception:
         pass
     assert host.guest_started is None, (
-        "a symlinked `ready` must not be followed, and must not teach capability"
-    )
+        "a symlinked `ready` must not be followed, and must not teach capability")
 
 
 def test_an_oversized_ready_file_is_refused(tmp_path):
@@ -222,23 +215,21 @@ def test_the_gvisor_base_build_records_ack_capability(tmp_path):
 
     ctrl = tmp_path / "ctrl"
     ctrl.mkdir()
-    FileWarmControl(ctrl).signal_ready()  # the base advertises
+    FileWarmControl(ctrl).signal_ready()               # the base advertises
 
     seen = AckCapability()
     h = object.__new__(GvisorBootHandle)
     h._ctrl = ctrl
-    h._ready = lambda _d, _t: None  # readiness already satisfied
+    h._ready = lambda _d, _t: None                     # readiness already satisfied
     h._ack_capable = seen
-    h._ack_gen = 0  # the build epoch this build started under
+    h._ack_gen = 0                        # the build epoch this build started under
     GvisorBootHandle.wait_ready(h, 1.0)
     assert not seen.capable_for(h._ack_gen), (
         "readiness must only OBSERVE: checkpoint() has not run, so there is no artifact yet and "
-        "no base a slot could be restored from"
-    )
-    seen.publish(h._ack_gen)  # ...the build then publishes
+        "no base a slot could be restored from")
+    seen.publish(h._ack_gen)                           # ...the build then publishes
     assert seen.capable_for(h._ack_gen), (
-        "the base's advertisement must be believed once its artifact is published"
-    )
+        "the base's advertisement must be believed once its artifact is published")
 
 
 def test_a_gvisor_build_that_never_checkpoints_teaches_nothing(tmp_path):
@@ -251,7 +242,7 @@ def test_a_gvisor_build_that_never_checkpoints_teaches_nothing(tmp_path):
 
     ctrl = tmp_path / "ctrl"
     ctrl.mkdir()
-    FileWarmControl(ctrl).signal_ready()  # this base DOES advertise
+    FileWarmControl(ctrl).signal_ready()               # this base DOES advertise
 
     seen = AckCapability()
     h = object.__new__(GvisorBootHandle)
@@ -259,11 +250,10 @@ def test_a_gvisor_build_that_never_checkpoints_teaches_nothing(tmp_path):
     h._ready = lambda _d, _t: None
     h._ack_capable = seen
     h._ack_gen = 0
-    GvisorBootHandle.wait_ready(h, 1.0)  # ...and then its checkpoint fails
+    GvisorBootHandle.wait_ready(h, 1.0)                # ...and then its checkpoint fails
 
     assert not seen.capable_for(h._ack_gen), (
-        "a build that published no artifact taught the capability anyway"
-    )
+        "a build that published no artifact taught the capability anyway")
 
 
 def test_a_confirmation_from_a_superseded_build_is_ignored(tmp_path):
@@ -287,11 +277,9 @@ def test_a_confirmation_from_a_superseded_build_is_ignored(tmp_path):
     seen.publish(1)
 
     assert not seen.capable_for(1), (
-        "the replacement inherited a capability advertised by the build it superseded"
-    )
+        "the replacement inherited a capability advertised by the build it superseded")
     assert not seen.capable_for(h._ack_gen), (
-        "the superseded build's own epoch is no longer published, so it answers UNKNOWN"
-    )
+        "the superseded build's own epoch is no longer published, so it answers UNKNOWN")
 
 
 def test_an_older_gvisor_base_teaches_nothing(tmp_path):
@@ -299,19 +287,18 @@ def test_an_older_gvisor_base_teaches_nothing(tmp_path):
 
     ctrl = tmp_path / "ctrl"
     ctrl.mkdir()
-    (ctrl / "ready").write_text("ready\n")  # old image: no advertisement
+    (ctrl / "ready").write_text("ready\n")             # old image: no advertisement
 
     seen = AckCapability()
     h = object.__new__(GvisorBootHandle)
     h._ctrl = ctrl
     h._ready = lambda _d, _t: None
     h._ack_capable = seen
-    h._ack_gen = 0  # the build epoch this build started under
+    h._ack_gen = 0                        # the build epoch this build started under
     GvisorBootHandle.wait_ready(h, 1.0)
-    seen.publish(h._ack_gen)  # it publishes fine; it simply never advertised
+    seen.publish(h._ack_gen)          # it publishes fine; it simply never advertised
     assert not seen.capable_for(h._ack_gen), (
-        "no advertisement means UNKNOWN, which must convict nothing"
-    )
+        "no advertisement means UNKNOWN, which must convict nothing")
 
 
 def test_a_host_filesystem_failure_is_not_charged_to_the_base(tmp_path):
@@ -330,23 +317,18 @@ def test_a_host_filesystem_failure_is_not_charged_to_the_base(tmp_path):
     out = tmp_path / "out"
     out.mkdir()
     (ctrl / "go.json").write_text(
-        json.dumps(
-            {"ack": True, "input_path": str(src), "output_dir": str(out), "params": {}}
-        )
-    )
+        json.dumps({"ack": True, "input_path": str(src), "output_dir": str(out), "params": {}}))
 
     guest = FileWarmControl(ctrl)
 
     def _boom(name, content):
         raise OSError(28, "No space left on device")
-
     guest._atomic_write = _boom
 
     with pytest.raises(WarmTimeout) as ei:
         guest.wait_for_go(timeout_s=1.0)
     assert getattr(ei.value, "host_io", False) is True, (
-        "a host-filesystem failure must carry host_io so it is not blamed on the worker"
-    )
+        "a host-filesystem failure must carry host_io so it is not blamed on the worker")
 
 
 def test_a_replaced_base_does_not_inherit_the_previous_capability():
@@ -362,10 +344,9 @@ def test_a_replaced_base_does_not_inherit_the_previous_capability():
     cap.publish(0)
     assert cap.capable_for(0) is True
 
-    cap.publish(1)  # a rolled-back image, which never advertised
+    cap.publish(1)                        # a rolled-back image, which never advertised
     assert cap.capable_for(1) is False, (
-        "a new base may be a different image; capability must be re-learned, not inherited"
-    )
+        "a new base may be a different image; capability must be re-learned, not inherited")
 
 
 def test_an_unwritable_control_dir_is_not_read_as_a_wedged_guest(tmp_path, monkeypatch):
@@ -379,7 +360,7 @@ def test_an_unwritable_control_dir_is_not_read_as_a_wedged_guest(tmp_path, monke
     from blastbox.errors import WarmTimeout
 
     ctrl, src, out = _dirs(tmp_path)
-    host = HostWarmControl(ctrl, ack_capable=_capable())  # image known to mark starts
+    host = HostWarmControl(ctrl, ack_capable=_capable())     # image known to mark starts
     host.signal_go(WarmJobSpec(input_path=src, output_dir=out, params={}))
     monkeypatch.setattr(type(host), "_ctrl_writable", lambda self: False)
 
@@ -387,8 +368,7 @@ def test_an_unwritable_control_dir_is_not_read_as_a_wedged_guest(tmp_path, monke
         host.wait_for_done(timeout_s=0.3)
     assert getattr(ei.value, "host_io", False) is True
     assert host.guest_started is None, (
-        "a storage incident must leave the answer UNKNOWN, not 'the guest never started'"
-    )
+        "a storage incident must leave the answer UNKNOWN, not 'the guest never started'")
 
 
 def test_a_writable_control_dir_still_reports_a_wedged_guest(tmp_path):
@@ -419,10 +399,8 @@ def test_invalidate_base_leaves_the_capability_to_publication():
     """
     from blastbox.host.runtime.fc_snapshot_runtime import SnapshotSlotRuntime
 
-    for cls, mgr_attr in (
-        (SnapshotSlotRuntime, "_manager"),
-        (GvisorSnapshotSlotRuntime, "_mgr"),
-    ):
+    for cls, mgr_attr in ((SnapshotSlotRuntime, "_manager"),
+                          (GvisorSnapshotSlotRuntime, "_mgr")):
         cap = AckCapability(artifact_scoped=True)
         cap.observe(3)
         cap.publish(3)
@@ -435,8 +413,7 @@ def test_invalidate_base_leaves_the_capability_to_publication():
 
         assert cap.capable_for(3) is True, (
             f"{cls.__name__}.invalidate_base wrote the capability; retirement belongs to the "
-            f"next publish(), and a second writer reintroduces the drift #92 removed"
-        )
+            f"next publish(), and a second writer reintroduces the drift #92 removed")
 
 
 def test_the_writability_probe_actually_probes(tmp_path):
@@ -456,7 +433,7 @@ def test_the_writability_probe_actually_probes(tmp_path):
     assert host._ctrl_writable() is True, "a normal dir is writable"
     assert not any(ctrl.iterdir()), "the probe must not leave its temp file behind"
 
-    ctrl.chmod(stat.S_IRUSR | stat.S_IXUSR)  # read-only
+    ctrl.chmod(stat.S_IRUSR | stat.S_IXUSR)          # read-only
     try:
         assert host._ctrl_writable() is False, "a read-only dir must report unwritable"
     finally:
@@ -481,9 +458,7 @@ def test_the_probe_cannot_be_used_to_truncate_a_host_file(tmp_path):
 
     host = HostWarmControl(ctrl)
     assert host._ctrl_writable() is True, "a writable dir is still writable"
-    assert victim.read_text() == "PRECIOUS", (
-        "the probe must never follow a planted symlink"
-    )
+    assert victim.read_text() == "PRECIOUS", "the probe must never follow a planted symlink"
 
 
 def test_the_probe_leaves_nothing_behind(tmp_path):
@@ -509,21 +484,17 @@ def test_a_failed_probe_stays_failed_even_if_cleanup_also_fails(tmp_path, monkey
 
     def _no_write(*a, **k):
         raise OSError(5, "I/O error")
-
     monkeypatch.setattr(envelope, "atomic_write_confined", _no_write)
 
     real_open = os.open
-
     def _no_open(path, *a, **k):
         if str(path) == str(ctrl):
             raise OSError(5, "I/O error")
         return real_open(path, *a, **k)
-
     monkeypatch.setattr(os, "open", _no_open)
 
     assert host._ctrl_writable() is False, (
-        "a failed probe must stay failed when the cleanup fails too"
-    )
+        "a failed probe must stay failed when the cleanup fails too")
 
 
 def test_a_retired_control_cannot_resurrect_a_stale_capability():
@@ -542,12 +513,11 @@ def test_a_retired_control_cannot_resurrect_a_stale_capability():
     cap.publish(new_epoch)
     assert cap.capable_for(new_epoch) is False, "a replaced base must re-advertise"
 
-    cap.learn(old_epoch)  # the RETIRED control's ack lands late
+    cap.learn(old_epoch)                          # the RETIRED control's ack lands late
     assert cap.capable_for(new_epoch) is False, (
-        "a late ack from a retired epoch must not teach the base that replaced it"
-    )
+        "a late ack from a retired epoch must not teach the base that replaced it")
 
-    cap.learn(new_epoch)  # the new base advertising still works
+    cap.learn(new_epoch)                          # the new base advertising still works
     assert cap.capable_for(new_epoch) is True
 
 
@@ -558,10 +528,9 @@ def test_a_control_stamps_the_generation_it_was_built_under(tmp_path):
     cap.publish(0)
     host = HostWarmControl(ctrl, ack_capable=cap, ack_generation=0)
     assert host._ack_gen == 0
-    cap.publish(1)  # the base is replaced
+    cap.publish(1)                                # the base is replaced
     assert not cap.capable_for(host._ack_gen), (
-        "the control is stale by construction: its epoch is no longer the published one"
-    )
+        "the control is stale by construction: its epoch is no longer the published one")
 
 
 def test_an_old_slot_claimed_after_a_reset_keeps_its_own_generation(tmp_path):
@@ -575,43 +544,38 @@ def test_an_old_slot_claimed_after_a_reset_keeps_its_own_generation(tmp_path):
     cap = AckCapability()
     old_gen = 0
     cap.observe(old_gen)
-    cap.publish(old_gen)  # the old base advertised and was installed
+    cap.publish(old_gen)                          # the old base advertised and was installed
 
-    cap.publish(1)  # replaced (silently) while a slot is idle
+    cap.publish(1)                                # replaced (silently) while a slot is idle
     # the OLD slot is claimed afterwards and carries its own stamp
     stale_ctl = HostWarmControl(ctrl, ack_capable=cap, ack_generation=old_gen)
     assert stale_ctl._ack_gen == old_gen
 
-    FileWarmControl(ctrl).signal_ready()  # its worker advertises, late
+    FileWarmControl(ctrl).signal_ready()          # its worker advertises, late
     (ctrl / "go.json").write_text(
-        json.dumps({"ack": True, "input_path": "/", "output_dir": "/", "params": {}})
-    )
+        json.dumps({"ack": True, "input_path": "/", "output_dir": "/", "params": {}}))
     try:
         stale_ctl.wait_for_done(timeout_s=0.2)
     except Exception:
         pass
     assert cap.capable_for(1) is False, (
-        "a slot from the retired epoch must not teach the base that replaced it"
-    )
+        "a slot from the retired epoch must not teach the base that replaced it")
 
 
 def test_a_slot_spawned_after_the_reset_does_teach_the_new_base(tmp_path):
     ctrl = tmp_path / "ctrl"
     ctrl.mkdir()
     cap = AckCapability()
-    cap.publish(1)  # the current artifact
+    cap.publish(1)                                # the current artifact
     fresh = HostWarmControl(ctrl, ack_capable=cap, ack_generation=1)
     FileWarmControl(ctrl).signal_ready()
     (ctrl / "go.json").write_text(
-        json.dumps({"ack": True, "input_path": "/", "output_dir": "/", "params": {}})
-    )
+        json.dumps({"ack": True, "input_path": "/", "output_dir": "/", "params": {}}))
     try:
         fresh.wait_for_done(timeout_s=0.2)
     except Exception:
         pass
-    assert cap.capable_for(1) is True, (
-        "the current epoch's advertisement must still count"
-    )
+    assert cap.capable_for(1) is True, "the current epoch's advertisement must still count"
 
 
 def test_a_retired_base_build_cannot_teach_the_replacement(tmp_path):
@@ -630,15 +594,14 @@ def test_a_retired_base_build_cannot_teach_the_replacement(tmp_path):
     h._ctrl = ctrl
     h._ready = lambda _d, _t: None
     h._ack_capable = cap
-    h._ack_gen = 0  # this build started under the OLD epoch
+    h._ack_gen = 0                        # this build started under the OLD epoch
 
-    GvisorBootHandle.wait_ready(h, 1.0)  # it advertises on the way out
+    GvisorBootHandle.wait_ready(h, 1.0)   # it advertises on the way out
     # ...but the base was replaced while it waited, so the REPLACEMENT is what publishes.
     cap.publish(1)
 
     assert cap.capable_for(1) is False, (
-        "a retired build's advertisement must not describe the base that replaced it"
-    )
+        "a retired build's advertisement must not describe the base that replaced it")
 
 
 def test_the_probe_allocates_a_real_data_block(tmp_path):
@@ -650,11 +613,7 @@ def test_the_probe_allocates_a_real_data_block(tmp_path):
     ctrl = tmp_path / "ctrl"
     ctrl.mkdir()
     written = []
-    real = (
-        warm_mod.atomic_write_confined
-        if hasattr(warm_mod, "atomic_write_confined")
-        else None
-    )
+    real = warm_mod.atomic_write_confined if hasattr(warm_mod, "atomic_write_confined") else None
     from blastbox.contract import envelope
 
     real_write = envelope.atomic_write_confined
@@ -670,8 +629,7 @@ def test_the_probe_allocates_a_real_data_block(tmp_path):
         envelope.atomic_write_confined = real_write
     _ = real
     assert written and all(d for d in written), (
-        f"the probe must write a non-empty payload, got {written!r}"
-    )
+        f"the probe must write a non-empty payload, got {written!r}")
 
 
 def test_a_spawn_racing_an_invalidation_cannot_be_taught_by_the_retired_artifact():
@@ -686,18 +644,16 @@ def test_a_spawn_racing_an_invalidation_cannot_be_taught_by_the_retired_artifact
     """
     cap = AckCapability()
     cap.observe(0)
-    cap.publish(0)  # the old artifact advertised
+    cap.publish(0)                        # the old artifact advertised
 
-    racing_slot_epoch = 0  # the racing spawn got the RETIRED artifact
-    cap.publish(1)  # the replacement (silent) is installed
+    racing_slot_epoch = 0                 # the racing spawn got the RETIRED artifact
+    cap.publish(1)                        # the replacement (silent) is installed
 
-    cap.learn(racing_slot_epoch)  # its ack lands late
+    cap.learn(racing_slot_epoch)          # its ack lands late
     assert cap.capable_for(1) is False, (
-        "the retired artifact's slot taught the base that replaced it"
-    )
+        "the retired artifact's slot taught the base that replaced it")
     assert cap.capable_for(racing_slot_epoch) is False, (
-        "and its own epoch is no longer published, so it answers UNKNOWN rather than True"
-    )
+        "and its own epoch is no longer published, so it answers UNKNOWN rather than True")
 
 
 def test_a_slot_from_an_older_artifact_is_not_judged_by_the_current_one():
@@ -711,13 +667,12 @@ def test_a_slot_from_an_older_artifact_is_not_judged_by_the_current_one():
     """
     cap = AckCapability()
     cap.observe(1)
-    cap.publish(1)  # the CURRENT artifact advertises
+    cap.publish(1)                        # the CURRENT artifact advertises
     assert cap.capable_for(1) is True
-    assert bool(cap) is True  # ...so a bare flag read says "capable"
+    assert bool(cap) is True              # ...so a bare flag read says "capable"
 
     assert cap.capable_for(0) is False, (
-        "a slot from the retired artifact was judged by the current base's advertisement"
-    )
+        "a slot from the retired artifact was judged by the current base's advertisement")
 
 
 def test_a_slot_with_no_artifact_identity_stays_unknown():
@@ -728,5 +683,4 @@ def test_a_slot_with_no_artifact_identity_stays_unknown():
     cap.publish(3)
     assert cap.capable_for(3) is True
     assert cap.capable_for(None) is False, (
-        "an unstamped control inherited the published artifact's capability"
-    )
+        "an unstamped control inherited the published artifact's capability")

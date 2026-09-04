@@ -1,5 +1,4 @@
 """UrlGrabEngine: fetch one URL, seal the response. Network fetch is injected (no real I/O)."""
-
 from __future__ import annotations
 
 import hashlib
@@ -10,12 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from blastbox.engines.urlgrab import (
-    FetchError,
-    FetchResult,
-    UrlGrabEngine,
-    _CappedRedirect,
-)
+from blastbox.engines.urlgrab import FetchError, FetchResult, UrlGrabEngine, _CappedRedirect
 from blastbox.limits import Limits
 from blastbox.worker.harness import run_detonation
 
@@ -48,30 +42,19 @@ def test_default_fetch_blocked_scheme_redirect_is_a_fetch_failure(monkeypatch):
 
     def blocked(self, req, timeout=None):
         raise urllib.error.HTTPError("file:///etc/passwd", 302, "Found", {}, None)
-
     monkeypatch.setattr(urllib.request.OpenerDirector, "open", blocked)
     with pytest.raises(FetchError):
         _default_fetch("http://evil/", timeout=5, max_bytes=100, max_redirects=3)
 
-    def http404(
-        self, req, timeout=None
-    ):  # a genuine 4xx (http url) is still a RESPONSE
-        raise urllib.error.HTTPError(
-            "http://x/missing", 404, "Not Found", {}, io.BytesIO(b"nope")
-        )
-
+    def http404(self, req, timeout=None):     # a genuine 4xx (http url) is still a RESPONSE
+        raise urllib.error.HTTPError("http://x/missing", 404, "Not Found", {}, io.BytesIO(b"nope"))
     monkeypatch.setattr(urllib.request.OpenerDirector, "open", http404)
-    assert (
-        _default_fetch("http://x/", timeout=5, max_bytes=100, max_redirects=3).status
-        == 404
-    )
+    assert _default_fetch("http://x/", timeout=5, max_bytes=100, max_redirects=3).status == 404
 
 
-def _run(
-    tmp_path: Path, engine: UrlGrabEngine, url_text: bytes, limits: Limits | None = None
-) -> tuple[int, dict, Path]:
+def _run(tmp_path: Path, engine: UrlGrabEngine, url_text: bytes,
+         limits: Limits | None = None) -> tuple[int, dict, Path]:
     import tempfile
-
     work = Path(tempfile.mkdtemp(dir=tmp_path))  # unique per call (tests may loop)
     indir = work / "in"
     outdir = work / "out"
@@ -79,26 +62,17 @@ def _run(
     outdir.mkdir()
     inp = indir / "url.txt"
     inp.write_bytes(url_text)
-    rc = run_detonation(
-        engine, input_path=inp, output_dir=outdir, limits=limits or Limits()
-    )
+    rc = run_detonation(engine, input_path=inp, output_dir=outdir, limits=limits or Limits())
     meta = json.loads((outdir / "metadata.json").read_text())
     return rc, meta, outdir
 
 
-def _ok_fetch(
-    body=b"<html>evil</html>", status=200, ct="text/html", truncated=False, final=None
-):
+def _ok_fetch(body=b"<html>evil</html>", status=200, ct="text/html", truncated=False, final=None):
     def fetch(url, *, timeout, max_bytes, max_redirects, verify_tls=True):
         return FetchResult(
-            final_url=final or url,
-            status=status,
-            content_type=ct,
-            server="nginx",
-            body=body[:max_bytes],
-            truncated=truncated,
+            final_url=final or url, status=status, content_type=ct, server="nginx",
+            body=body[:max_bytes], truncated=truncated,
         )
-
     return fetch
 
 
@@ -107,22 +81,14 @@ def test_verify_tls_passed_to_fetch_and_recorded(tmp_path: Path) -> None:
 
     def fetch(url, *, timeout, max_bytes, max_redirects, verify_tls):
         seen["verify_tls"] = verify_tls
-        return FetchResult(
-            final_url=url,
-            status=200,
-            content_type="text/html",
-            server="FakeNet/1.3",
-            body=b"ok",
-            truncated=False,
-        )
+        return FetchResult(final_url=url, status=200, content_type="text/html",
+                           server="FakeNet/1.3", body=b"ok", truncated=False)
 
     # default = verify ON
     _run(tmp_path, UrlGrabEngine(fetch_fn=fetch), b"https://x/")
     assert seen["verify_tls"] is True
     # opt out → passed through + recorded in the envelope for provenance
-    _, meta, _ = _run(
-        tmp_path, UrlGrabEngine(fetch_fn=fetch, verify_tls=False), b"https://x/"
-    )
+    _, meta, _ = _run(tmp_path, UrlGrabEngine(fetch_fn=fetch, verify_tls=False), b"https://x/")
     assert seen["verify_tls"] is False
     assert meta["payload"]["fields"]["tls_verified"] is False
 
@@ -133,14 +99,8 @@ def test_verify_tls_env_default(tmp_path: Path, monkeypatch) -> None:
 
     def fetch(url, *, timeout, max_bytes, max_redirects, verify_tls):
         seen["v"] = verify_tls
-        return FetchResult(
-            final_url=url,
-            status=200,
-            content_type="t",
-            server="s",
-            body=b"x",
-            truncated=False,
-        )
+        return FetchResult(final_url=url, status=200, content_type="t", server="s",
+                           body=b"x", truncated=False)
 
     _run(tmp_path, UrlGrabEngine(fetch_fn=fetch), b"https://x/")
     assert seen["v"] is False
@@ -164,25 +124,17 @@ def test_successful_fetch_seals_body_and_metadata(tmp_path: Path) -> None:
 
 def test_http_error_status_is_still_a_response(tmp_path: Path) -> None:
     # 404 has a body — it's a real response, not a transport failure.
-    eng = UrlGrabEngine(
-        fetch_fn=_ok_fetch(body=b"not found", status=404, ct="text/plain")
-    )
+    eng = UrlGrabEngine(fetch_fn=_ok_fetch(body=b"not found", status=404, ct="text/plain"))
     rc, meta, _ = _run(tmp_path, eng, b"http://badmakeup.biz/gone")
     assert meta["status"] == "ok"
-    assert (
-        meta["payload"]["fields"]["status"] == 404
-        and meta["payload"]["fields"]["fetched"] is True
-    )
+    assert meta["payload"]["fields"]["status"] == 404 and meta["payload"]["fields"]["fetched"] is True
 
 
 def test_dead_url_is_ok_not_engine_error(tmp_path: Path) -> None:
     # DNS NXDOMAIN / connection refused → a normal "dead URL" verdict, NOT engine_error.
     def boom(url, *, timeout, max_bytes, max_redirects, verify_tls=True):
         raise FetchError("Name or service not known")
-
-    rc, meta, outdir = _run(
-        tmp_path, UrlGrabEngine(fetch_fn=boom), b"http://sinkholed.example/"
-    )
+    rc, meta, outdir = _run(tmp_path, UrlGrabEngine(fetch_fn=boom), b"http://sinkholed.example/")
     assert meta["status"] == "ok"  # must not FAIL the job
     assert meta["payload"]["fields"]["fetched"] is False
     assert any(w["code"] == "fetch_failed" for w in meta["warnings"])
@@ -204,17 +156,13 @@ def test_invalid_url_is_rejected_without_fetching(tmp_path: Path) -> None:
 
 def test_first_nonempty_line_is_the_url(tmp_path: Path) -> None:
     eng = UrlGrabEngine(fetch_fn=_ok_fetch())
-    rc, meta, _ = _run(
-        tmp_path, eng, b"\n   \n  https://drive.google.com/open?id=abc  \njunk\n"
-    )
+    rc, meta, _ = _run(tmp_path, eng, b"\n   \n  https://drive.google.com/open?id=abc  \njunk\n")
     assert meta["payload"]["fields"]["url"] == "https://drive.google.com/open?id=abc"
 
 
 def test_truncation_warns(tmp_path: Path) -> None:
     eng = UrlGrabEngine(fetch_fn=_ok_fetch(body=b"x" * 10, truncated=True))
-    rc, meta, _ = _run(
-        tmp_path, eng, b"http://h/big", limits=Limits(max_artifact_bytes=10)
-    )
+    rc, meta, _ = _run(tmp_path, eng, b"http://h/big", limits=Limits(max_artifact_bytes=10))
     assert any(w["code"] == "body_truncated" for w in meta["warnings"])
     assert meta["payload"]["fields"]["truncated"] is True
 

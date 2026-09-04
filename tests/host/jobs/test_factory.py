@@ -1,5 +1,4 @@
 """build_job_store_from_env — the shared-store selector for serve + dispatch."""
-
 from blastbox.host.jobs.base import Job
 from blastbox.host.jobs.factory import build_job_store_from_env
 from blastbox.host.jobs.memory import InMemoryJobStore

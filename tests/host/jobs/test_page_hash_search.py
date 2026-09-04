@@ -11,7 +11,6 @@ these tests are gated on ``BLASTBOX_TEST_PG_DSN`` pointing at a Postgres with th
 ``bktree`` extension (CI builds one from ``deploy/docker/postgres``). They skip
 when the DSN is unset or the extension is absent.
 """
-
 from __future__ import annotations
 
 import os
@@ -127,18 +126,13 @@ def _done_job(store: SqlJobStore, *, filename: str = "doc.pdf") -> Job:
 # Extraction: index_page_hashes walks the typed envelope
 # ---------------------------------------------------------------------------
 
-
 def test_index_page_hashes_extracts_and_persists(store, tmp_path):
     job = _done_job(store)
     env = _seal_with_pages(
         tmp_path,
         [
-            _make_page(
-                0, phash="00000000000000ff", colorhash="0011223344556a", sha256="a" * 64
-            ),
-            _make_page(
-                1, phash="ffffffffffffffff", colorhash="ffeeddccbbaa99", sha256="b" * 64
-            ),
+            _make_page(0, phash="00000000000000ff", colorhash="0011223344556a", sha256="a" * 64),
+            _make_page(1, phash="ffffffffffffffff", colorhash="ffeeddccbbaa99", sha256="b" * 64),
         ],
     )
     written = store.index_page_hashes(job.job_id, env)
@@ -150,9 +144,7 @@ def test_index_page_hashes_extracts_and_persists(store, tmp_path):
 
 def test_index_is_idempotent_upsert(store, tmp_path):
     job = _done_job(store)
-    env = _seal_with_pages(
-        tmp_path, [_make_page(0, phash="0" * 16, colorhash="0" * 14, sha256="c" * 64)]
-    )
+    env = _seal_with_pages(tmp_path, [_make_page(0, phash="0" * 16, colorhash="0" * 14, sha256="c" * 64)])
     store.index_page_hashes(job.job_id, env)
     store.index_page_hashes(job.job_id, env)  # second call must not duplicate
     assert len(store.find_by_page_sha256("c" * 64)) == 1
@@ -161,9 +153,7 @@ def test_index_is_idempotent_upsert(store, tmp_path):
 def test_page_with_only_some_hashes_is_indexed(store, tmp_path):
     """A page with colorhash+sha256 but no phash is still stored (phash NULL)."""
     job = _done_job(store)
-    env = _seal_with_pages(
-        tmp_path, [_make_page(0, colorhash="1234567890abcd", sha256="d" * 64)]
-    )
+    env = _seal_with_pages(tmp_path, [_make_page(0, colorhash="1234567890abcd", sha256="d" * 64)])
     assert store.index_page_hashes(job.job_id, env) == 1
     # Exact lookups work; phash search simply won't surface a NULL-phash row.
     assert len(store.find_by_colorhash("1234567890abcd")) == 1
@@ -180,25 +170,14 @@ def test_page_with_no_hashes_is_skipped(store, tmp_path):
 # find_by_page_sha256 / find_by_colorhash — exact match + DONE gating
 # ---------------------------------------------------------------------------
 
-
 def test_exact_lookups_only_return_done_jobs(store, tmp_path):
     done = _done_job(store, filename="done.pdf")
     running = Job.new(engine="test-engine", filename="running.pdf")
     store.create(running)
     store.update(running.job_id, status=JobStatus.RUNNING)
 
-    env_done = _seal_with_pages(
-        tmp_path / "d",
-        _mkdir(
-            tmp_path / "d", [_make_page(0, colorhash="aaaaaaaaaaaaaa", sha256="1" * 64)]
-        ),
-    )
-    env_run = _seal_with_pages(
-        tmp_path / "r",
-        _mkdir(
-            tmp_path / "r", [_make_page(0, colorhash="aaaaaaaaaaaaaa", sha256="2" * 64)]
-        ),
-    )
+    env_done = _seal_with_pages(tmp_path / "d", _mkdir(tmp_path / "d", [_make_page(0, colorhash="aaaaaaaaaaaaaa", sha256="1" * 64)]))
+    env_run = _seal_with_pages(tmp_path / "r", _mkdir(tmp_path / "r", [_make_page(0, colorhash="aaaaaaaaaaaaaa", sha256="2" * 64)]))
     store.index_page_hashes(done.job_id, env_done)
     store.index_page_hashes(running.job_id, env_run)
 
@@ -210,9 +189,7 @@ def test_exact_lookups_only_return_done_jobs(store, tmp_path):
 
 def test_find_by_colorhash_no_match(store, tmp_path):
     job = _done_job(store)
-    env = _seal_with_pages(
-        tmp_path, [_make_page(0, colorhash="00000000000000", sha256="e" * 64)]
-    )
+    env = _seal_with_pages(tmp_path, [_make_page(0, colorhash="00000000000000", sha256="e" * 64)])
     store.index_page_hashes(job.job_id, env)
     assert store.find_by_colorhash("ffffffffffffff") == []
 
@@ -220,7 +197,6 @@ def test_find_by_colorhash_no_match(store, tmp_path):
 # ---------------------------------------------------------------------------
 # find_similar_phash — Hamming distance threshold
 # ---------------------------------------------------------------------------
-
 
 def test_find_similar_phash_within_and_outside_threshold(store, tmp_path):
     job = _done_job(store)
@@ -281,15 +257,9 @@ def test_find_similar_phash_ordering_and_limit(store, tmp_path):
     env = _seal_with_pages(
         tmp_path,
         [
-            _make_page(
-                0, phash=_phash_hex(0b1111), sha256="0" * 64, artifact_id="i0"
-            ),  # d=4
-            _make_page(
-                1, phash=_phash_hex(0b1), sha256="1" * 64, artifact_id="i1"
-            ),  # d=1
-            _make_page(
-                2, phash=_phash_hex(0b11), sha256="2" * 64, artifact_id="i2"
-            ),  # d=2
+            _make_page(0, phash=_phash_hex(0b1111), sha256="0" * 64, artifact_id="i0"),   # d=4
+            _make_page(1, phash=_phash_hex(0b1), sha256="1" * 64, artifact_id="i1"),      # d=1
+            _make_page(2, phash=_phash_hex(0b11), sha256="2" * 64, artifact_id="i2"),     # d=2
         ],
     )
     store.index_page_hashes(job.job_id, env)
@@ -297,23 +267,19 @@ def test_find_similar_phash_ordering_and_limit(store, tmp_path):
     hits = store.find_similar_phash(target, max_distance=64)
     assert [h["distance"] for h in hits] == [1, 2, 4]  # ascending by distance
     # limit truncates after ordering
-    assert [
-        h["distance"]
-        for h in store.find_similar_phash(target, max_distance=64, limit=2)
-    ] == [1, 2]
+    assert [h["distance"] for h in store.find_similar_phash(target, max_distance=64, limit=2)] == [1, 2]
 
 
 # ---------------------------------------------------------------------------
 # find_similar_colorhash — per-bin L1
 # ---------------------------------------------------------------------------
 
-
 def test_find_similar_colorhash_total_cap(store, tmp_path):
     job = _done_job(store)
     # target 0000000000000; near differs by 3 in one bin (L1 3); far by 15.
     target = "0" * 14
-    near = "3" + "0" * 13  # total L1 = 3
-    far = "f" + "0" * 13  # total L1 = 15
+    near = "3" + "0" * 13       # total L1 = 3
+    far = "f" + "0" * 13        # total L1 = 15
     env = _seal_with_pages(
         tmp_path,
         [
@@ -354,9 +320,7 @@ def test_find_similar_colorhash_no_caps_delegates_to_exact(store, tmp_path):
         tmp_path,
         [
             _make_page(0, colorhash=target, sha256="0" * 64, artifact_id="i0"),
-            _make_page(
-                1, colorhash="1234567890abce", sha256="1" * 64, artifact_id="i1"
-            ),
+            _make_page(1, colorhash="1234567890abce", sha256="1" * 64, artifact_id="i1"),
         ],
     )
     store.index_page_hashes(job.job_id, env)
@@ -419,7 +383,6 @@ def test_search_is_runtime_gated_not_just_structural(store, tmp_path):
 # ---------------------------------------------------------------------------
 # small local helper used by the DONE-gating test
 # ---------------------------------------------------------------------------
-
 
 def _mkdir(path: Path, pages: list[Page]) -> list[Page]:
     path.mkdir(parents=True, exist_ok=True)

@@ -5,7 +5,6 @@ worker's traffic off the docker bridge, filtered to that worker's per-job IP, in
 pcap. This module holds the *pure* decisions (which iface, which filter, where to write, whether
 to capture at all) so they are unit-testable without docker or root.
 """
-
 from __future__ import annotations
 
 import pytest
@@ -21,7 +20,6 @@ from blastbox.host.capture import (
 # ---------------------------------------------------------------------------
 # bridge_iface_for_network — docker network → host bridge iface
 # ---------------------------------------------------------------------------
-
 
 def test_bridge_iface_defaults_to_br_id_prefix():
     # No custom bridge name → docker names the host iface br-<first 12 of network id>.
@@ -45,7 +43,6 @@ def test_bridge_iface_missing_id_raises():
 # ---------------------------------------------------------------------------
 # tcpdump_argv — capture command
 # ---------------------------------------------------------------------------
-
 
 def test_tcpdump_argv_filters_to_worker_ip_and_writes_pcap():
     argv = tcpdump_argv("br-abc123", "172.20.0.5", "/jobs/J/capture/dump.pcap")
@@ -77,7 +74,6 @@ def test_tcpdump_argv_rejects_non_ip_worker_addr():
 # capture_target_from_inspect — decide whether/what to capture for a container
 # ---------------------------------------------------------------------------
 
-
 def _inspect(*, labels, networks, job_root="/jobs"):
     return {
         "Name": "/blastbox-worker-abc123-1",
@@ -106,9 +102,7 @@ def test_no_capture_for_network_none():
 def test_capture_target_built_for_labeled_egress_worker():
     insp = _inspect(
         labels={"blastbox.net.capture": "1", "blastbox.job_id": "J1"},
-        networks={
-            "bb-net0": {"IPAddress": "172.20.0.7", "NetworkID": "ed7fd8287f2a00"}
-        },
+        networks={"bb-net0": {"IPAddress": "172.20.0.7", "NetworkID": "ed7fd8287f2a00"}},
     )
     tgt = capture_target_from_inspect(
         insp, job_root="/srv/jobs", network_iface={"ed7fd8287f2a00": "br-ed7fd8287f2a"}
@@ -128,8 +122,6 @@ def test_capture_target_strips_cidr_suffix_from_ip():
         labels={"blastbox.net.capture": "1", "blastbox.job_id": "J2"},
         networks={"bb-fakenet": {"IPAddress": "172.28.100.9/16", "NetworkID": "abc"}},
     )
-    tgt = capture_target_from_inspect(
-        insp, job_root="/jobs", network_iface={"abc": "br-abc"}
-    )
+    tgt = capture_target_from_inspect(insp, job_root="/jobs", network_iface={"abc": "br-abc"})
     assert tgt is not None
     assert tgt.worker_ip == "172.28.100.9"

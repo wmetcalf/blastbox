@@ -2,7 +2,6 @@
 
 Test 2 (the round-trip keystone) lives in test_roundtrip.py.
 """
-
 from __future__ import annotations
 
 import hashlib
@@ -74,12 +73,8 @@ class _MissingArtifactEngine:
         return DetonationResult(
             payload=Record(fields={"note": "no file"}),
             artifacts=[DeclaredArtifact(id="ghost", path="ghost.png", kind="image")],
-            detected=Detection(
-                label="unknown",
-                mime="application/octet-stream",
-                confidence=0.0,
-                source="test",
-            ),
+            detected=Detection(label="unknown", mime="application/octet-stream",
+                               confidence=0.0, source="test"),
         )
 
 
@@ -92,15 +87,9 @@ class _TraversalArtifactEngine:
     def detonate(self, input: Path, outdir: Path, limits: Limits) -> DetonationResult:
         return DetonationResult(
             payload=Record(fields={}),
-            artifacts=[
-                DeclaredArtifact(id="escape", path="../escape.bin", kind="image")
-            ],
-            detected=Detection(
-                label="unknown",
-                mime="application/octet-stream",
-                confidence=0.0,
-                source="test",
-            ),
+            artifacts=[DeclaredArtifact(id="escape", path="../escape.bin", kind="image")],
+            detected=Detection(label="unknown", mime="application/octet-stream",
+                               confidence=0.0, source="test"),
         )
 
 
@@ -130,9 +119,7 @@ def test_happy_path_writes_metadata_and_real_hash(tmp_path: Path) -> None:
     outdir.mkdir()
 
     noop = _NoopEngine()
-    rc = run_detonation(
-        noop, input_path=input_file, output_dir=outdir, limits=_limits()
-    )
+    rc = run_detonation(noop, input_path=input_file, output_dir=outdir, limits=_limits())
 
     assert rc == 0, "exit code must be 0"
 
@@ -140,14 +127,11 @@ def test_happy_path_writes_metadata_and_real_hash(tmp_path: Path) -> None:
     assert meta_path.exists(), "metadata.json must be written"
 
     from blastbox.contract import envelope_from_json
-
     env = envelope_from_json(meta_path.read_bytes())
 
     assert env.engine == _ENGINE_NAME
     assert env.status == "ok"
-    assert env.input_sha256 == expected_input_sha, (
-        "input_sha256 must be stamped from the real file"
-    )
+    assert env.input_sha256 == expected_input_sha, "input_sha256 must be stamped from the real file"
     assert len(env.artifacts) == 1
     # sha256 must match the real on-disk file, not something made up
     real_sha = hashlib.sha256((outdir / "page-001.png").read_bytes()).hexdigest()
@@ -170,9 +154,7 @@ def test_engine_raises_writes_engine_error_envelope(tmp_path: Path) -> None:
     outdir.mkdir()
 
     engine = _RaisingEngine()
-    rc = run_detonation(
-        engine, input_path=input_file, output_dir=outdir, limits=_limits()
-    )
+    rc = run_detonation(engine, input_path=input_file, output_dir=outdir, limits=_limits())
 
     assert rc == 0, "engine error must still return 0"
 
@@ -180,7 +162,6 @@ def test_engine_raises_writes_engine_error_envelope(tmp_path: Path) -> None:
     assert meta_path.exists()
 
     from blastbox.contract import envelope_from_json
-
     env = envelope_from_json(meta_path.read_bytes())
 
     assert env.status == "engine_error"
@@ -188,17 +169,13 @@ def test_engine_raises_writes_engine_error_envelope(tmp_path: Path) -> None:
     # The secret path must be scrubbed from warning messages
     assert len(env.warnings) >= 1
     for w in env.warnings:
-        assert "/secret/path" not in w.message, (
-            "secret path must be scrubbed from warning"
-        )
+        assert "/secret/path" not in w.message, "secret path must be scrubbed from warning"
     # Payload must be a Record with an "error" field
     assert isinstance(env.payload, Record)
     assert "error" in env.payload.fields
     # The error value must also be scrubbed
     err_val = env.payload.fields["error"]
-    assert "/secret/path" not in str(err_val), (
-        "secret path must be scrubbed from payload"
-    )
+    assert "/secret/path" not in str(err_val), "secret path must be scrubbed from payload"
 
 
 # ---------------------------------------------------------------------------
@@ -216,14 +193,11 @@ def test_missing_declared_artifact_falls_back_to_engine_error(tmp_path: Path) ->
     outdir.mkdir()
 
     engine = _MissingArtifactEngine()
-    rc = run_detonation(
-        engine, input_path=input_file, output_dir=outdir, limits=_limits()
-    )
+    rc = run_detonation(engine, input_path=input_file, output_dir=outdir, limits=_limits())
 
     assert rc == 0
 
     from blastbox.contract import envelope_from_json
-
     env = envelope_from_json((outdir / "metadata.json").read_bytes())
 
     assert env.status == "engine_error"
@@ -246,14 +220,11 @@ def test_traversal_path_falls_back_to_engine_error(tmp_path: Path) -> None:
     outdir.mkdir()
 
     engine = _TraversalArtifactEngine()
-    rc = run_detonation(
-        engine, input_path=input_file, output_dir=outdir, limits=_limits()
-    )
+    rc = run_detonation(engine, input_path=input_file, output_dir=outdir, limits=_limits())
 
     assert rc == 0
 
     from blastbox.contract import envelope_from_json
-
     env = envelope_from_json((outdir / "metadata.json").read_bytes())
 
     assert env.status == "engine_error"
@@ -275,23 +246,16 @@ def test_main_happy_path_via_args(tmp_path: Path) -> None:
     output_dir.mkdir()
 
     noop = _NoopEngine()
-    rc = main(
-        noop,
-        argv=[
-            "--input-dir",
-            str(input_dir),
-            "--output-dir",
-            str(output_dir),
-        ],
-    )
+    rc = main(noop, argv=[
+        "--input-dir", str(input_dir),
+        "--output-dir", str(output_dir),
+    ])
 
     assert rc == 0
     assert (output_dir / "metadata.json").exists()
 
 
-def test_main_happy_path_via_env(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_main_happy_path_via_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """main() reads BLASTBOX_INPUT_DIR / BLASTBOX_OUTPUT_DIR from env."""
     input_dir = tmp_path / "in"
     input_dir.mkdir()
@@ -319,15 +283,10 @@ def test_main_zero_files_in_input_dir_returns_nonzero(tmp_path: Path) -> None:
     output_dir.mkdir()
 
     noop = _NoopEngine()
-    rc = main(
-        noop,
-        argv=[
-            "--input-dir",
-            str(input_dir),
-            "--output-dir",
-            str(output_dir),
-        ],
-    )
+    rc = main(noop, argv=[
+        "--input-dir", str(input_dir),
+        "--output-dir", str(output_dir),
+    ])
 
     assert rc != 0
 
@@ -343,15 +302,10 @@ def test_main_multiple_files_in_input_dir_returns_nonzero(tmp_path: Path) -> Non
     output_dir.mkdir()
 
     noop = _NoopEngine()
-    rc = main(
-        noop,
-        argv=[
-            "--input-dir",
-            str(input_dir),
-            "--output-dir",
-            str(output_dir),
-        ],
-    )
+    rc = main(noop, argv=[
+        "--input-dir", str(input_dir),
+        "--output-dir", str(output_dir),
+    ])
 
     assert rc != 0
 
@@ -359,7 +313,6 @@ def test_main_multiple_files_in_input_dir_returns_nonzero(tmp_path: Path) -> Non
 # --------------------------------------------------------------------------- egress-readiness barrier
 def test_gateway_route_hex_little_endian() -> None:
     from blastbox.worker.harness import _gateway_route_hex
-
     # 172.32.0.10 → bytes AC 20 00 0A → little-endian hex 0A0020AC (matches /proc/net/route)
     assert _gateway_route_hex("172.32.0.10") == "0A0020AC"
     assert _gateway_route_hex("10.0.0.1") == "0100000A"
@@ -369,7 +322,6 @@ def test_default_route_via_dev_for_tun(tmp_path: Path, monkeypatch) -> None:
     import builtins
 
     from blastbox.worker import harness
-
     route = tmp_path / "route"
     # the socks tier installs `default dev tun0` (no gateway) — Iface=tun0, Destination=00000000
     route.write_text(
@@ -378,26 +330,17 @@ def test_default_route_via_dev_for_tun(tmp_path: Path, monkeypatch) -> None:
         "tun0\t00000000\t00000000\t0001\t0\t0\t0\t00000000\n"
     )
     real_open = builtins.open
-    monkeypatch.setattr(
-        builtins,
-        "open",
-        lambda p, *a, **k: (
-            real_open(route, *a, **k)
-            if p == "/proc/net/route"
-            else real_open(p, *a, **k)
-        ),
-    )
+    monkeypatch.setattr(builtins, "open", lambda p, *a, **k: (
+        real_open(route, *a, **k) if p == "/proc/net/route" else real_open(p, *a, **k)
+    ))
     assert harness._default_route_via_dev("tun0") is True
-    assert (
-        harness._default_route_via_dev("eth0") is False
-    )  # eth0 has no default route here
+    assert harness._default_route_via_dev("eth0") is False  # eth0 has no default route here
 
 
 def test_default_route_via_reads_proc_route(tmp_path: Path, monkeypatch) -> None:
     import builtins
 
     from blastbox.worker import harness
-
     route = tmp_path / "route"
     # header + a non-default link route + the default via 172.32.0.10 (gw 0A0020AC)
     route.write_text(
@@ -406,29 +349,19 @@ def test_default_route_via_reads_proc_route(tmp_path: Path, monkeypatch) -> None
         "eth0\t00000000\t0A0020AC\t0003\t0\t0\t0\t00000000\n"
     )
     real_open = builtins.open
-    monkeypatch.setattr(
-        builtins,
-        "open",
-        lambda p, *a, **k: (
-            real_open(route, *a, **k)
-            if p == "/proc/net/route"
-            else real_open(p, *a, **k)
-        ),
-    )
+    monkeypatch.setattr(builtins, "open", lambda p, *a, **k: (
+        real_open(route, *a, **k) if p == "/proc/net/route" else real_open(p, *a, **k)
+    ))
     assert harness._default_route_via("172.32.0.10") is True
     assert harness._default_route_via("172.32.0.99") is False
 
 
 def test_wait_for_egress_gateway_returns_when_wired(monkeypatch) -> None:
     from blastbox.worker import harness
-
     calls = {"n": 0}
     # not wired for the first 2 probes, then wired
-    monkeypatch.setattr(
-        harness,
-        "_default_route_via",
-        lambda gw: calls.__setitem__("n", calls["n"] + 1) or calls["n"] >= 3,
-    )
+    monkeypatch.setattr(harness, "_default_route_via",
+                        lambda gw: calls.__setitem__("n", calls["n"] + 1) or calls["n"] >= 3)
     slept = []
     ok = harness._wait_for_egress_gateway("172.32.0.10", 5.0, sleep_fn=slept.append)
     assert ok is True and calls["n"] == 3 and len(slept) == 2
@@ -436,13 +369,10 @@ def test_wait_for_egress_gateway_returns_when_wired(monkeypatch) -> None:
 
 def test_wait_for_egress_gateway_times_out(monkeypatch) -> None:
     from blastbox.worker import harness
-
     monkeypatch.setattr(harness, "_default_route_via", lambda gw: False)
     t = {"now": 0.0}
     ok = harness._wait_for_egress_gateway(
-        "172.32.0.10",
-        1.0,
-        sleep_fn=lambda s: t.__setitem__("now", t["now"] + 0.1),
+        "172.32.0.10", 1.0, sleep_fn=lambda s: t.__setitem__("now", t["now"] + 0.1),
         clock=lambda: t["now"],
     )
     assert ok is False

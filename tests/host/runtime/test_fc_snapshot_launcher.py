@@ -1,5 +1,4 @@
 """Unit tests for the FC snapshot launcher (Phase 2 orchestration)."""
-
 from __future__ import annotations
 import subprocess
 
@@ -58,11 +57,7 @@ def test_api_boot_sequence_mirrors_cold_config_and_starts_last():
 
 
 def test_api_boot_sequence_paths_overridable():
-    seq = dict(
-        api_boot_sequence(
-            FakeCfg(), vsock_uds="/abs/v.sock", outdisk_path="/abs/o.ext4"
-        )
-    )
+    seq = dict(api_boot_sequence(FakeCfg(), vsock_uds="/abs/v.sock", outdisk_path="/abs/o.ext4"))
     assert seq["/vsock"]["uds_path"] == "/abs/v.sock"
     assert seq["/drives/outdisk"]["path_on_host"] == "/abs/o.ext4"
 
@@ -132,7 +127,7 @@ def test_boot_base_uses_api_socket_and_runs_full_config(tmp_path):
         "/entropy",
         "/actions",
     ]
-    assert handle.vsock_uds == str(Path(cwd) / REL_VSOCK)  # the build's OWN workdir
+    assert handle.vsock_uds == str(Path(cwd) / REL_VSOCK)   # the build's OWN workdir
 
 
 class FakeApiPatch(FakeApi):
@@ -171,11 +166,8 @@ def test_boot_base_handle_checkpoint_writes_artifact_under_base_and_mem_dir(tmp_
     # Generation-stamped, NOT fixed: a rebuild must never overwrite files that live restored
     # microVMs are still using as memory backing (upstream, PR #82).
     assert art.snapshot_path.parent == dest
-    assert (
-        art.snapshot_path.name.startswith("warm-")
-        and art.snapshot_path.suffix == ".snapshot"
-    )
-    assert art.mem_path.parent == memdir  # mem on the launcher's mem_dir
+    assert art.snapshot_path.name.startswith("warm-") and art.snapshot_path.suffix == ".snapshot"
+    assert art.mem_path.parent == memdir            # mem on the launcher's mem_dir
     assert art.mem_path.name.startswith("warm-") and art.mem_path.suffix == ".mem"
     # The boot PUTs ran first; checkpoint appended PATCH /vm Paused + PUT create Full.
     assert ("/vm", {"state": "Paused"}) in handle.api.calls
@@ -205,7 +197,7 @@ def test_boot_base_handle_checkpoint_defaults_mem_to_base_dir(tmp_path):
     )
     handle = launcher.boot_base()
     art = handle.checkpoint(base / "base")
-    assert art.mem_path.parent == base  # defaults to base_dir
+    assert art.mem_path.parent == base           # defaults to base_dir
     assert art.mem_path.name.startswith("warm-") and art.mem_path.suffix == ".mem"
 
 
@@ -234,22 +226,20 @@ def test_restore_in_spawns_in_slot_cwd_and_copies_base_outdisk(tmp_path):
     # The per-slot disk is a COPY of the base outdisk (snapshot-time-consistent ext4),
     # NOT a fresh mkfs — a fresh mkfs corrupts the restored guest's cached ext4 state.
     assert made == []  # no fresh mkfs on restore
-    assert copied == [(tmp_path / "snap" / "base" / REL_OUTDISK, slot / REL_OUTDISK)]
+    assert copied == [
+        (tmp_path / "snap" / "base" / REL_OUTDISK, slot / REL_OUTDISK)
+    ]
 
 
 def test_spawn_kills_proc_when_api_socket_never_appears(tmp_path):
     """_spawn must terminate the spawned firecracker if the API socket times out."""
-
     class TrackProc:
         def __init__(self):
             self.terminated = False
-
         def poll(self):
             return None
-
         def terminate(self):
             self.terminated = True
-
         def wait(self, timeout=None):
             return 0
 
@@ -259,8 +249,7 @@ def test_spawn_kills_proc_when_api_socket_never_appears(tmp_path):
         raise TimeoutError("api socket never appeared")
 
     launcher = FcSnapshotLauncher(
-        FakeCfg(),
-        tmp_path,
+        FakeCfg(), tmp_path,
         popen=lambda argv, cwd=None: proc,
         api_factory=FakeApi,
         wait_socket=never_ready,
@@ -270,7 +259,6 @@ def test_spawn_kills_proc_when_api_socket_never_appears(tmp_path):
         make_outdisk=_make_outdisk_file,
     )
     import pytest
-
     with pytest.raises(TimeoutError):
         launcher.boot_base()
     assert proc.terminated is True
@@ -301,8 +289,7 @@ def test_boot_base_kills_proc_when_post_spawn_step_fails(tmp_path):
         raise OSError("ENOSPC making outdisk")
 
     launcher = FcSnapshotLauncher(
-        FakeCfg(),
-        tmp_path / "snap",
+        FakeCfg(), tmp_path / "snap",
         popen=lambda argv, cwd=None: proc,
         api_factory=FakeApi,
         wait_socket=lambda p: None,
@@ -326,8 +313,7 @@ def test_restore_in_kills_proc_when_copy_fails(tmp_path):
         raise OSError("disk full copying outdisk")
 
     launcher = FcSnapshotLauncher(
-        FakeCfg(),
-        base,
+        FakeCfg(), base,
         popen=lambda argv, cwd=None: proc,
         api_factory=FakeApi,
         wait_socket=lambda p: None,
@@ -348,8 +334,7 @@ def test_restore_in_raises_and_does_not_spawn_when_base_outdisk_missing(tmp_path
 
     spawned = []
     launcher = FcSnapshotLauncher(
-        FakeCfg(),
-        tmp_path / "snap",
+        FakeCfg(), tmp_path / "snap",
         popen=lambda argv, cwd=None: spawned.append(1) or _TrackProc(),
         api_factory=FakeApi,
         wait_socket=lambda p: None,
@@ -382,7 +367,7 @@ def test_checkpoint_fails_when_its_generation_disk_is_missing(tmp_path):
         popen=lambda argv, cwd=None: FakeProc(),
         api_factory=FakeApiPatch,
         wait_socket=lambda p: None,
-        make_outdisk=lambda p: None,  # deliberately does NOT create it
+        make_outdisk=lambda p: None,      # deliberately does NOT create it
     )
     handle = launcher.boot_base()
 
@@ -400,9 +385,7 @@ def test_a_partial_checkpoint_whose_cleanup_fails_is_retried(tmp_path, monkeypat
     base = tmp_path / "snap"
     memdir = tmp_path / "ram"
     launcher = FcSnapshotLauncher(
-        FakeCfg(),
-        base,
-        mem_dir=memdir,
+        FakeCfg(), base, mem_dir=memdir,
         popen=lambda argv, cwd=None: FakeProc(),
         api_factory=FakeApiPatch,
         wait_socket=lambda p: None,
@@ -443,10 +426,7 @@ def test_a_partial_checkpoint_whose_cleanup_fails_is_retried(tmp_path, monkeypat
     monkeypatch.undo()
     monkeypatch.setattr(
         "blastbox.host.runtime.fc_snapshot_backend._create_snapshot",
-        lambda api, snap, mem: (
-            Path(snap).write_bytes(b"s"),
-            Path(mem).write_bytes(b"m"),
-        ),
+        lambda api, snap, mem: (Path(snap).write_bytes(b"s"), Path(mem).write_bytes(b"m")),
     )
     handle2 = launcher.boot_base()
     handle2.checkpoint(base)
@@ -481,17 +461,14 @@ def test_orphan_generations_from_a_dead_dispatcher_are_swept(tmp_path):
     orphan_snap = base / f"warm-{dead}-000000000000000001.snapshot"
     orphan_mem = memdir / f"warm-{dead}-000000000000000001.mem"
     ours = base / f"warm-{mine}-000000000000000002.snapshot"
-    unrelated = base / "warm.snapshot"  # legacy fixed name, not a generation
+    unrelated = base / "warm.snapshot"       # legacy fixed name, not a generation
     for f in (orphan_snap, orphan_mem, ours, unrelated):
         f.write_bytes(b"x")
 
     launcher = FcSnapshotLauncher(
-        FakeCfg(),
-        base,
-        mem_dir=memdir,
+        FakeCfg(), base, mem_dir=memdir,
         popen=lambda argv, cwd=None: FakeProc(),
-        api_factory=FakeApiPatch,
-        wait_socket=lambda p: None,
+        api_factory=FakeApiPatch, wait_socket=lambda p: None,
         make_outdisk=_make_outdisk_file,
     )
     removed = launcher.sweep_orphan_generations()
@@ -523,19 +500,14 @@ def test_the_sweep_never_touches_a_live_dispatchers_generation(tmp_path):
     live.write_bytes(b"x")
 
     launcher = FcSnapshotLauncher(
-        FakeCfg(),
-        base,
-        mem_dir=base,
+        FakeCfg(), base, mem_dir=base,
         popen=lambda argv, cwd=None: FakeProc(),
-        api_factory=FakeApiPatch,
-        wait_socket=lambda p: None,
+        api_factory=FakeApiPatch, wait_socket=lambda p: None,
         make_outdisk=_make_outdisk_file,
     )
     try:
         assert launcher.sweep_orphan_generations() == 0
-        assert live.exists(), (
-            "a live owner's generation was swept -- its microVMs map that file"
-        )
+        assert live.exists(), "a live owner's generation was swept -- its microVMs map that file"
     finally:
         holder.close()
 
@@ -587,20 +559,15 @@ def test_a_generation_from_a_reused_pid_is_swept(tmp_path):
     base = tmp_path / "snap"
     base.mkdir()
 
-    stale = (
-        base / f"warm-{os.getpid()}_1-0000000000000000001.mem"
-    )  # our pid, old start time
+    stale = base / f"warm-{os.getpid()}_1-0000000000000000001.mem"   # our pid, old start time
     ours = base / f"warm-{owner_token()}-0000000000000000002.mem"
     stale.write_bytes(b"x")
     ours.write_bytes(b"x")
 
     launcher = FcSnapshotLauncher(
-        FakeCfg(),
-        base,
-        mem_dir=base,
+        FakeCfg(), base, mem_dir=base,
         popen=lambda argv, cwd=None: FakeProc(),
-        api_factory=FakeApiPatch,
-        wait_socket=lambda p: None,
+        api_factory=FakeApiPatch, wait_socket=lambda p: None,
         make_outdisk=_make_outdisk_file,
     )
     assert launcher.sweep_orphan_generations() == 0, (
@@ -626,12 +593,9 @@ def test_the_retry_list_stays_shared_across_handles(tmp_path, monkeypatch):
     base = tmp_path / "snap"
     memdir = tmp_path / "ram"
     launcher = FcSnapshotLauncher(
-        FakeCfg(),
-        base,
-        mem_dir=memdir,
+        FakeCfg(), base, mem_dir=memdir,
         popen=lambda argv, cwd=None: FakeProc(),
-        api_factory=FakeApiPatch,
-        wait_socket=lambda p: None,
+        api_factory=FakeApiPatch, wait_socket=lambda p: None,
         make_outdisk=_make_outdisk_file,
     )
     handle = launcher.boot_base()
@@ -682,6 +646,7 @@ def test_a_sweep_that_could_not_remove_an_orphan_reports_it(tmp_path, monkeypatc
     """
     import errno as _errno
 
+
     base = tmp_path / "base"
     base.mkdir()
     mem = tmp_path / "mem"
@@ -691,7 +656,6 @@ def test_a_sweep_that_could_not_remove_an_orphan_reports_it(tmp_path, monkeypatc
     orphan.write_bytes(b"x" * 8)
 
     from blastbox.host.runtime.snapshot_backend import owner_lease_path
-
     owner_lease_path(base, "999999_1234").write_bytes(b"")
 
     def _boom(self, missing_ok=False):
@@ -715,7 +679,6 @@ def test_a_clean_sweep_still_reports_success(tmp_path, monkeypatch):
     orphan = mem / "warm-999999_1234-000000000000000001.mem"
     orphan.write_bytes(b"x" * 8)
     from blastbox.host.runtime.snapshot_backend import owner_lease_path
-
     owner_lease_path(base, "999999_1234").write_bytes(b"")
 
     launcher = FcSnapshotLauncher(FakeCfg(), base, mem_dir=mem)
@@ -802,12 +765,9 @@ def test_stranded_partials_are_retried_before_the_base_boots(tmp_path):
     leftover.write_bytes(b"x" * 32)
 
     launcher = FcSnapshotLauncher(
-        FakeCfg(),
-        base,
-        mem_dir=base,
+        FakeCfg(), base, mem_dir=base,
         popen=lambda argv, cwd=None: FakeProc(),
-        api_factory=FakeApiPatch,
-        wait_socket=lambda p: None,
+        api_factory=FakeApiPatch, wait_socket=lambda p: None,
         make_outdisk=_make_outdisk_file,
     )
     launcher._stranded_partials.append(str(leftover))
@@ -834,20 +794,15 @@ def test_no_generation_is_written_without_a_lease(tmp_path, monkeypatch):
     base = tmp_path / "snap"
     base.mkdir()
     launcher = FcSnapshotLauncher(
-        FakeCfg(),
-        base,
-        mem_dir=base,
+        FakeCfg(), base, mem_dir=base,
         popen=lambda argv, cwd=None: FakeProc(),
-        api_factory=FakeApiPatch,
-        wait_socket=lambda p: None,
+        api_factory=FakeApiPatch, wait_socket=lambda p: None,
         make_outdisk=_make_outdisk_file,
     )
     handle = launcher.boot_base()
     with pytest.raises(SnapshotBuildError):
         handle.checkpoint(base)
-    assert not list(base.glob("warm-*")), (
-        "a generation was written with no lease covering it"
-    )
+    assert not list(base.glob("warm-*")), "a generation was written with no lease covering it"
 
 
 def test_legacy_pre_generation_artifacts_are_surfaced(tmp_path, monkeypatch, caplog):
@@ -870,9 +825,7 @@ def test_legacy_pre_generation_artifacts_are_surfaced(tmp_path, monkeypatch, cap
     legacy_mem.write_bytes(b"y" * 32)
 
     launcher = FcSnapshotLauncher(FakeCfg(), base, mem_dir=mem)
-    with caplog.at_level(
-        _logging.WARNING, logger="blastbox.host.runtime.fc_snapshot_launcher"
-    ):
+    with caplog.at_level(_logging.WARNING, logger="blastbox.host.runtime.fc_snapshot_launcher"):
         launcher.sweep_orphan_generations()
 
     assert "legacy_artifacts_present" in caplog.text, (
@@ -884,18 +837,14 @@ def test_legacy_pre_generation_artifacts_are_surfaced(tmp_path, monkeypatch, cap
     )
 
 
-def test_legacy_artifacts_are_reclaimed_only_on_an_explicit_opt_in(
-    tmp_path, monkeypatch
-):
+def test_legacy_artifacts_are_reclaimed_only_on_an_explicit_opt_in(tmp_path, monkeypatch):
     """...and the operator, who alone knows the old dispatcher is gone, can say so."""
     monkeypatch.setenv("BLASTBOX_SNAPSHOT_RECLAIM_LEGACY", "1")
     base = tmp_path / "snap"
     base.mkdir()
     legacy = base / "warm.mem"
     legacy.write_bytes(b"y" * 32)
-    keep = (
-        base / "warm-999999_1-000000000000000001.mem"
-    )  # a real generation, not legacy
+    keep = base / "warm-999999_1-000000000000000001.mem"   # a real generation, not legacy
     keep.write_bytes(b"z")
 
     launcher = FcSnapshotLauncher(FakeCfg(), base, mem_dir=base)
@@ -921,9 +870,7 @@ def test_a_dead_dispatchers_base_workdir_is_reclaimed(tmp_path):
     dead = base / "base-999999_4242-0000000000000000001"
     dead.mkdir()
     (dead / "outdisk.ext4").write_bytes(b"x" * 8)
-    owner_lease_path(base, "999999_4242").write_bytes(
-        b""
-    )  # released: owner provably gone
+    owner_lease_path(base, "999999_4242").write_bytes(b"")     # released: owner provably gone
     mine = base / f"base-{owner_token()}-0000000000000000002"
     mine.mkdir()
 
@@ -947,12 +894,9 @@ def test_a_completed_base_workdir_is_removed(tmp_path):
     base = tmp_path / "snap"
     base.mkdir()
     launcher = FcSnapshotLauncher(
-        FakeCfg(),
-        base,
-        mem_dir=base,
+        FakeCfg(), base, mem_dir=base,
         popen=lambda argv, cwd=None: FakeProc(),
-        api_factory=FakeApiPatch,
-        wait_socket=lambda p: None,
+        api_factory=FakeApiPatch, wait_socket=lambda p: None,
         make_outdisk=_make_outdisk_file,
     )
     handle = launcher.boot_base()
@@ -974,21 +918,18 @@ def test_a_base_workdir_is_retained_when_its_vm_will_not_die(tmp_path):
 
     class _Undead(FakeProc):
         def poll(self):
-            return None  # never exits
+            return None                      # never exits
 
         def wait(self, timeout=None):
             raise subprocess.TimeoutExpired("fc", timeout or 5)
 
         def kill(self):
-            pass  # SIGKILL lands, but the process still will not reap
+            pass                             # SIGKILL lands, but the process still will not reap
 
     launcher = FcSnapshotLauncher(
-        FakeCfg(),
-        base,
-        mem_dir=base,
+        FakeCfg(), base, mem_dir=base,
         popen=lambda argv, cwd=None: _Undead(),
-        api_factory=FakeApiPatch,
-        wait_socket=lambda p: None,
+        api_factory=FakeApiPatch, wait_socket=lambda p: None,
         make_outdisk=_make_outdisk_file,
     )
     handle = launcher.boot_base()
@@ -1018,12 +959,9 @@ def test_a_base_workdir_that_could_not_be_removed_is_retried(tmp_path, monkeypat
     base = tmp_path / "snap"
     base.mkdir()
     launcher = FcSnapshotLauncher(
-        FakeCfg(),
-        base,
-        mem_dir=base,
+        FakeCfg(), base, mem_dir=base,
         popen=lambda argv, cwd=None: FakeProc(),
-        api_factory=FakeApiPatch,
-        wait_socket=lambda p: None,
+        api_factory=FakeApiPatch, wait_socket=lambda p: None,
         make_outdisk=_make_outdisk_file,
     )
     handle = launcher.boot_base()
@@ -1060,7 +998,6 @@ def test_a_failed_base_boot_removes_its_unique_workdir(tmp_path):
     skips base-* paths owned by THIS process, so every async build retry left another one behind
     until the snapshot filesystem filled.
     """
-
     class _BoomApi(FakeApiPatch):
         def put(self, path, body):
             raise RuntimeError("boot sequence failed")
@@ -1068,12 +1005,9 @@ def test_a_failed_base_boot_removes_its_unique_workdir(tmp_path):
     base = tmp_path / "snap"
     base.mkdir()
     launcher = FcSnapshotLauncher(
-        FakeCfg(),
-        base,
-        mem_dir=base,
+        FakeCfg(), base, mem_dir=base,
         popen=lambda argv, cwd=None: FakeProc(),
-        api_factory=_BoomApi,
-        wait_socket=lambda p: None,
+        api_factory=_BoomApi, wait_socket=lambda p: None,
         make_outdisk=_make_outdisk_file,
     )
     with pytest.raises(RuntimeError):
@@ -1093,7 +1027,6 @@ def test_a_failed_boot_retains_the_workdir_of_a_live_microvm(tmp_path):
     microVM's workdir — its disk and sockets — and dropped the only process handle, leaving an
     untracked VM per retry.
     """
-
     class _Undead(FakeProc):
         def poll(self):
             return None
@@ -1111,12 +1044,9 @@ def test_a_failed_boot_retains_the_workdir_of_a_live_microvm(tmp_path):
     base = tmp_path / "snap"
     base.mkdir()
     launcher = FcSnapshotLauncher(
-        FakeCfg(),
-        base,
-        mem_dir=base,
+        FakeCfg(), base, mem_dir=base,
         popen=lambda argv, cwd=None: _Undead(),
-        api_factory=_BoomApi,
-        wait_socket=lambda p: None,
+        api_factory=_BoomApi, wait_socket=lambda p: None,
         make_outdisk=_make_outdisk_file,
     )
     with pytest.raises(RuntimeError):

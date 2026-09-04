@@ -1,5 +1,4 @@
 """S3BlobStore against an in-process S3 (moto)."""
-
 import hashlib
 
 import pytest
@@ -73,7 +72,7 @@ def test_put_output_compresses_by_default(store, tmp_path):
     (out / "metadata.json").write_bytes(b'{"a":1}' * 500)
     store.put_output("j9", out)
     with store.open_output("j9", "metadata.json") as fh:
-        assert fh.read() == b'{"a":1}' * 500  # transparent on read
+        assert fh.read() == b'{"a":1}' * 500        # transparent on read
 
 
 def test_put_output_skips_a_symlink_to_a_file_outside_the_output_dir(store, tmp_path):
@@ -96,12 +95,9 @@ def test_put_output_skips_a_symlink_to_a_file_outside_the_output_dir(store, tmp_
     with pytest.raises(BlobFetchError):
         store.open_output("j10", "metadata.json")
     s3 = boto3.client("s3", region_name="us-east-1")
-    assert (
-        s3.list_objects_v2(Bucket=BUCKET, Prefix="pfx/results/j10/metadata.json")[
-            "KeyCount"
-        ]
-        == 0
-    )
+    assert s3.list_objects_v2(
+        Bucket=BUCKET, Prefix="pfx/results/j10/metadata.json"
+    )["KeyCount"] == 0
 
     with store.open_output("j10", "legit.txt") as fh:
         assert fh.read() == b"legit-bytes"
@@ -170,9 +166,7 @@ def _surviving_versions(prefix):
     return versions, markers
 
 
-def test_delete_job_really_removes_bytes_on_a_versioned_bucket(
-    versioned_store, tmp_path
-):
+def test_delete_job_really_removes_bytes_on_a_versioned_bucket(versioned_store, tmp_path):
     """A keyless delete on a versioned bucket is not a delete.
 
     ``list_objects_v2`` reports current versions only, and ``delete_objects``
@@ -240,9 +234,7 @@ def test_bucket_is_versioned_counts_suspended_as_versioned(tmp_path, status, exp
         assert st._bucket_is_versioned() is expected
 
 
-def test_delete_job_clears_the_residue_an_old_keyless_delete_left(
-    versioned_store, tmp_path
-):
+def test_delete_job_clears_the_residue_an_old_keyless_delete_left(versioned_store, tmp_path):
     """A job "deleted" by the previous implementation must actually clean up.
 
     The old code issued a keyless delete, which on a versioned bucket adds a
@@ -261,9 +253,7 @@ def test_delete_job_clears_the_residue_an_old_keyless_delete_left(
         Bucket=BUCKET, Delete={"Objects": [{"Key": "pfx/results/jr/metadata.json"}]}
     )
     versions, markers = _surviving_versions("pfx/results/jr/")
-    assert len(versions) == 2 and len(markers) == 1, (
-        "fixture must reproduce the residue"
-    )
+    assert len(versions) == 2 and len(markers) == 1, "fixture must reproduce the residue"
 
     versioned_store.delete_job("jr")
 
@@ -272,9 +262,7 @@ def test_delete_job_clears_the_residue_an_old_keyless_delete_left(
     assert markers == [], f"{len(markers)} delete marker(s) survived"
 
 
-def test_delete_job_assumes_versioned_when_status_cannot_be_read(
-    versioned_store, tmp_path
-):
+def test_delete_job_assumes_versioned_when_status_cannot_be_read(versioned_store, tmp_path):
     """Unable to read the status -> take the safe path, not the lossy one.
 
     Guessing "unversioned" would silently retain data an operator asked to delete.
@@ -372,9 +360,7 @@ def test_an_unreadable_status_is_never_cached(versioned_store):
     assert versioned_store._versioned is True
 
 
-def test_noncurrent_versions_are_deleted_before_the_current_one(
-    versioned_store, tmp_path
-):
+def test_noncurrent_versions_are_deleted_before_the_current_one(versioned_store, tmp_path):
     """Partial failure must not leave the object invisible but still stored.
 
     Deleting the current version first makes the key vanish from an ordinary
@@ -436,9 +422,7 @@ def test_delete_lists_one_page_at_a_time_rather_than_the_whole_history(
     assert all(m is not None and m <= 1000 for m in seen_maxkeys), seen_maxkeys
 
 
-def test_unversioned_bucket_without_versioning_permissions_still_deletes(
-    store, tmp_path
-):
+def test_unversioned_bucket_without_versioning_permissions_still_deletes(store, tmp_path):
     """The regression this fix must not cause.
 
     An UNVERSIONED bucket whose policy grants neither GetBucketVersioning nor
@@ -459,10 +443,8 @@ def test_unversioned_bucket_without_versioning_permissions_still_deletes(
     denied = botocore.exceptions.ClientError(
         {"Error": {"Code": "AccessDenied", "Message": "no"}}, "op"
     )
-    with (
-        patch.object(store._s3, "get_bucket_versioning", side_effect=denied),
-        patch.object(store._s3, "list_object_versions", side_effect=denied),
-    ):
+    with patch.object(store._s3, "get_bucket_versioning", side_effect=denied), \
+         patch.object(store._s3, "list_object_versions", side_effect=denied):
         store.delete_job("jn")
 
     s3 = boto3.client("s3", region_name="us-east-1")
@@ -497,13 +479,8 @@ def test_a_confirmed_versioned_bucket_still_refuses_when_versions_cannot_be_list
 
 @pytest.mark.parametrize(
     "code,transient",
-    [
-        ("Throttling", True),
-        ("RequestTimeout", True),
-        ("InternalError", True),
-        ("AccessDenied", False),
-        ("NotImplemented", False),
-    ],
+    [("Throttling", True), ("RequestTimeout", True), ("InternalError", True),
+     ("AccessDenied", False), ("NotImplemented", False)],
 )
 def test_only_a_PERMANENT_denial_may_fall_back_to_a_keyless_delete(
     store, tmp_path, code, transient
@@ -524,13 +501,9 @@ def test_only_a_PERMANENT_denial_may_fall_back_to_a_keyless_delete(
     (out / "metadata.json").write_bytes(b"{}")
     store.put_output(f"jt{code}", out)
 
-    err = botocore.exceptions.ClientError(
-        {"Error": {"Code": code, "Message": "x"}}, "op"
-    )
-    with (
-        patch.object(store._s3, "get_bucket_versioning", side_effect=err),
-        patch.object(store._s3, "list_object_versions", side_effect=err),
-    ):
+    err = botocore.exceptions.ClientError({"Error": {"Code": code, "Message": "x"}}, "op")
+    with patch.object(store._s3, "get_bucket_versioning", side_effect=err), \
+         patch.object(store._s3, "list_object_versions", side_effect=err):
         if transient:
             with pytest.raises(botocore.exceptions.ClientError):
                 store.delete_job(f"jt{code}")
@@ -575,11 +548,8 @@ def test_delete_job_raises_when_delete_objects_reports_partial_errors(store, tmp
     def _partial_failure(**kwargs):
         response = real_delete_objects(**kwargs)
         response["Errors"] = [
-            {
-                "Key": "pfx/results/j6/metadata.json",
-                "Code": "AccessDenied",
-                "Message": "insufficient permissions",
-            }
+            {"Key": "pfx/results/j6/metadata.json", "Code": "AccessDenied",
+             "Message": "insufficient permissions"}
         ]
         return response
 

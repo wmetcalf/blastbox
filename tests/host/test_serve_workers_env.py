@@ -11,7 +11,6 @@ Every sibling knob in this codebase already tolerates empty (`_int_env`, `_uploa
 Fixing the PARSER rather than only the compose file covers every deployment path -- k8s, systemd,
 a hand-run container -- not just the one compose file that happened to expose it.
 """
-
 from __future__ import annotations
 
 import pytest

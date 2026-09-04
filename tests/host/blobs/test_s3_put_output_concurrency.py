@@ -21,7 +21,6 @@ produces a DONE job whose manifest promises bytes the store does not have, repor
 with the only real copy deleted. Concurrency is exactly the kind of change that breaks an
 ordering invariant quietly, so every test here is aimed at the barrier, not at the speed.
 """
-
 from __future__ import annotations
 
 import json
@@ -47,19 +46,12 @@ def _out_dir(tmp_path, n_artifacts: int, *, declare: bool = True):
     for i in range(n_artifacts):
         name = f"page-{i:03d}.png"
         (out / name).write_bytes(f"PNG{i}".encode())
-        arts.append(
-            {"id": name, "path": name, "kind": "image", "sha256": "0" * 64, "bytes": 4}
-        )
-    (out / SEAL).write_text(
-        json.dumps(
-            {
-                "engine": "t",
-                "status": "ok",
-                "input_sha256": "a" * 64,
-                "artifacts": arts if declare else [],
-            }
-        )
-    )
+        arts.append({"id": name, "path": name, "kind": "image",
+                     "sha256": "0" * 64, "bytes": 4})
+    (out / SEAL).write_text(json.dumps({
+        "engine": "t", "status": "ok", "input_sha256": "a" * 64,
+        "artifacts": arts if declare else [],
+    }))
     return out
 
 
@@ -96,8 +88,8 @@ def _store(tmp_path, s3, **env):
     with moto.mock_aws():
         boto3.client("s3", region_name="us-east-1").create_bucket(Bucket=BUCKET)
         st = S3BlobStore(f"s3://{BUCKET}/pfx", job_root=tmp_path, env=env)
-    st._s3 = s3  # swap in the recorder AFTER construction
-    st._compress = False  # gzip is orthogonal here and only obscures the bodies
+    st._s3 = s3            # swap in the recorder AFTER construction
+    st._compress = False   # gzip is orthogonal here and only obscures the bodies
     return st
 
 
@@ -109,8 +101,7 @@ def test_the_seal_is_written_after_every_artifact(tmp_path):
     fails. That ordering IS the durability guarantee; nothing else in the system re-checks it."""
     s3 = _RecordingS3()
     _store(tmp_path, s3, BLASTBOX_BLOB_UPLOAD_CONCURRENCY="8").put_output(
-        "j", _out_dir(tmp_path, 40)
-    )
+        "j", _out_dir(tmp_path, 40))
 
     assert len(s3.calls) == 41
     assert s3.calls[-1].endswith(SEAL), (
@@ -147,7 +138,7 @@ def test_every_stored_artifact_is_counted_toward_the_declared_check(tmp_path):
     """
     s3 = _RecordingS3()
     store = _store(tmp_path, s3, BLASTBOX_BLOB_UPLOAD_CONCURRENCY="16")
-    store.put_output("j", _out_dir(tmp_path, 200, declare=True))  # all 200 declared
+    store.put_output("j", _out_dir(tmp_path, 200, declare=True))   # all 200 declared
 
     assert len(s3.calls) == 201
 
@@ -169,9 +160,7 @@ def test_uploads_actually_overlap(tmp_path):
 
     assert s3.max_concurrent > 1, "uploads never overlapped — still serial"
     # 32 objects x 50ms serial = 1.6s; at 8-way it should be nearer 0.2s + the seal.
-    assert elapsed < 0.9, (
-        f"32 x 50ms uploads took {elapsed:.2f}s — not meaningfully parallel"
-    )
+    assert elapsed < 0.9, f"32 x 50ms uploads took {elapsed:.2f}s — not meaningfully parallel"
 
 
 def test_concurrency_of_one_bypasses_the_pool_entirely(tmp_path):
@@ -205,11 +194,8 @@ def test_a_bad_concurrency_setting_falls_back_instead_of_crashing(tmp_path):
     for bad in ("", "banana", "0", "-4"):
         s3 = _RecordingS3()
         _store(tmp_path / bad, s3, BLASTBOX_BLOB_UPLOAD_CONCURRENCY=bad).put_output(
-            "j", _out_dir(tmp_path / bad, 3)
-        )
-        assert s3.calls[-1].endswith(SEAL), (
-            f"upload broke for BLASTBOX_BLOB_UPLOAD_CONCURRENCY={bad!r}"
-        )
+            "j", _out_dir(tmp_path / bad, 3))
+        assert s3.calls[-1].endswith(SEAL), f"upload broke for BLASTBOX_BLOB_UPLOAD_CONCURRENCY={bad!r}"
 
 
 def test_a_declared_artifact_the_walker_missed_still_blocks_the_seal(tmp_path):
@@ -231,32 +217,14 @@ def test_a_declared_artifact_the_walker_missed_still_blocks_the_seal(tmp_path):
     (out / "real" / "hidden.png").write_bytes(b"PNGX")
     (out / "link").symlink_to(out / "real", target_is_directory=True)
     (out / "page-000.png").write_bytes(b"PNG0")
-    (out / SEAL).write_text(
-        json.dumps(
-            {
-                "engine": "t",
-                "status": "ok",
-                "input_sha256": "a" * 64,
-                "artifacts": [
-                    {
-                        "id": "a",
-                        "path": "page-000.png",
-                        "kind": "image",
-                        "sha256": "0" * 64,
-                        "bytes": 4,
-                    },
-                    # real file, but reachable only THROUGH the symlinked dir the walker will not enter
-                    {
-                        "id": "b",
-                        "path": "link/hidden.png",
-                        "kind": "image",
-                        "sha256": "0" * 64,
-                        "bytes": 4,
-                    },
-                ],
-            }
-        )
-    )
+    (out / SEAL).write_text(json.dumps({
+        "engine": "t", "status": "ok", "input_sha256": "a" * 64,
+        "artifacts": [
+            {"id": "a", "path": "page-000.png", "kind": "image", "sha256": "0" * 64, "bytes": 4},
+            # real file, but reachable only THROUGH the symlinked dir the walker will not enter
+            {"id": "b", "path": "link/hidden.png", "kind": "image", "sha256": "0" * 64, "bytes": 4},
+        ],
+    }))
 
     # sanity: the scenario is real -- the leaf is a genuine file, not a symlink
     assert (out / "link" / "hidden.png").is_file()
@@ -297,21 +265,11 @@ def test_concurrent_jobs_share_one_upload_budget(tmp_path):
         d.mkdir(parents=True)
         for i in range(12):
             (d / f"page-{i:03d}.png").write_bytes(b"PNG")
-        (d / SEAL).write_text(
-            json.dumps(
-                {
-                    "engine": "t",
-                    "status": "ok",
-                    "input_sha256": "a" * 64,
-                    "artifacts": [],
-                }
-            )
-        )
+        (d / SEAL).write_text(json.dumps(
+            {"engine": "t", "status": "ok", "input_sha256": "a" * 64, "artifacts": []}))
         dirs.append((f"j{n}", d))
 
-    threads = [
-        threading.Thread(target=store.put_output, args=(jid, d)) for jid, d in dirs
-    ]
+    threads = [threading.Thread(target=store.put_output, args=(jid, d)) for jid, d in dirs]
     for t in threads:
         t.start()
     for t in threads:
@@ -322,15 +280,11 @@ def test_concurrent_jobs_share_one_upload_budget(tmp_path):
         f"4 concurrent jobs reached {s3.max_concurrent} simultaneous uploads against a budget of "
         f"{limit} — the executor is per-job, not per-dispatcher"
     )
-    assert s3.max_concurrent > 1, (
-        "no overlap at all — the shared pool is not being used"
-    )
+    assert s3.max_concurrent > 1, "no overlap at all — the shared pool is not being used"
 
 
 @pytest.mark.parametrize("configured,expected_min", [("4", 10), ("16", 16), ("64", 64)])
-def test_the_connection_pool_is_sized_to_the_upload_budget(
-    tmp_path, configured, expected_min
-):
+def test_the_connection_pool_is_sized_to_the_upload_budget(tmp_path, configured, expected_min):
     """botocore's connection pool defaults to 10. A fan-out wider than the pool does not error --
     it BLOCKS, so the change looks deployed, measures as no faster, and gives no clue why. No
     behavioural test can see this (a fake client has no pool), so assert the config directly.
@@ -343,11 +297,8 @@ def test_the_connection_pool_is_sized_to_the_upload_budget(
     """
     with moto.mock_aws():
         boto3.client("s3", region_name="us-east-1").create_bucket(Bucket=BUCKET)
-        store = S3BlobStore(
-            f"s3://{BUCKET}/pfx",
-            job_root=tmp_path,
-            env={"BLASTBOX_BLOB_UPLOAD_CONCURRENCY": configured},
-        )
+        store = S3BlobStore(f"s3://{BUCKET}/pfx", job_root=tmp_path,
+                            env={"BLASTBOX_BLOB_UPLOAD_CONCURRENCY": configured})
 
     assert store._upload_concurrency == int(configured)
     assert store._s3.meta.config.max_pool_connections == expected_min, (

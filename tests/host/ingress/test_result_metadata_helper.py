@@ -10,7 +10,6 @@ and stopped declaring the artifact, but its `/v1/jobs/{id}/rmeta` route still
 asked for the file. Every completed job 404'd on the documented retrieval route
 while the data sat in the envelope, intact.
 """
-
 from __future__ import annotations
 
 from fastapi import APIRouter, Request
@@ -34,9 +33,7 @@ def _router():
 
 def _app(tmp_path, store):
     return build_app(
-        job_store=store,
-        job_root=tmp_path / "jobs",
-        allowed_engines={"probe"},
+        job_store=store, job_root=tmp_path / "jobs", allowed_engines={"probe"},
         extension=IngressExtension(routers=(_router(),)),
     )
 
@@ -56,10 +53,7 @@ def test_an_unknown_job_is_404(tmp_path):
     store = InMemoryJobStore()
     _make_done_job(tmp_path, store)
     c = TestClient(_app(tmp_path, store))
-    assert (
-        c.get("/v1/jobs/00000000-0000-4000-8000-000000000000/envelope").status_code
-        == 404
-    )
+    assert c.get("/v1/jobs/00000000-0000-4000-8000-000000000000/envelope").status_code == 404
 
 
 def test_a_malformed_job_id_does_not_reach_the_store(tmp_path):

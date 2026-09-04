@@ -1,5 +1,4 @@
 """Tests for RedisJobStore via fakeredis."""
-
 from __future__ import annotations
 
 import json
@@ -24,7 +23,6 @@ def _make_job(engine: str = "test", filename: str = "file.docx") -> Job:
 # ---------------------------------------------------------------------------
 # Basic CRUD via JSON
 # ---------------------------------------------------------------------------
-
 
 def test_create_and_get():
     store = _make_store()
@@ -86,7 +84,6 @@ def test_list_by_status():
 # JSON serialization (not pickle)
 # ---------------------------------------------------------------------------
 
-
 def test_stored_as_json():
     """Data must be stored as JSON text, not pickle."""
     r = fakeredis.FakeRedis()
@@ -116,7 +113,6 @@ def test_params_stored_in_json():
 # ---------------------------------------------------------------------------
 # TTL set on every set
 # ---------------------------------------------------------------------------
-
 
 def test_ttl_set_on_create():
     r = fakeredis.FakeRedis()
@@ -152,7 +148,6 @@ def test_no_ttl_when_zero():
 # list uses scan_iter (not KEYS) — behaviorally verified via prefix match
 # ---------------------------------------------------------------------------
 
-
 def test_list_uses_prefix_scan():
     """list() must only return jobs from this store's prefix."""
     r = fakeredis.FakeRedis()
@@ -170,7 +165,6 @@ def test_list_uses_prefix_scan():
 # ---------------------------------------------------------------------------
 # claim_next atomic under concurrent claimers
 # ---------------------------------------------------------------------------
-
 
 def test_claim_next_returns_oldest_queued():
     store = _make_store()
@@ -266,7 +260,6 @@ def test_claim_rechecks_engine_inside_watch(monkeypatch):
     # If a candidate's engine is reassigned AFTER the scan selects it but BEFORE the watched re-read,
     # the watched section must re-validate the engine predicate and NOT claim the now-foreign job.
     import blastbox.host.jobs.redis_store as rs
-
     store = _make_store()
     job = _make_job(engine="mine", filename="ours.docx")
     store.create(job)
@@ -277,9 +270,7 @@ def test_claim_rechecks_engine_inside_watch(monkeypatch):
     def flaky_decode(raw):
         j = real_decode(raw)
         calls["n"] += 1
-        if (
-            j is not None and calls["n"] >= 2
-        ):  # first decode (scan) matches; later (watch re-read) drifts
+        if j is not None and calls["n"] >= 2:   # first decode (scan) matches; later (watch re-read) drifts
             j.engine = "other"
         return j
 
@@ -287,4 +278,4 @@ def test_claim_rechecks_engine_inside_watch(monkeypatch):
     # scan selects it (engine "mine"), watched re-read sees "other" → skip; rescan now also sees
     # "other" → no candidate → None. Without the watched engine re-check this would claim a foreign job.
     assert store.claim_next(engine="mine") is None
-    assert store.get(job.job_id).status is JobStatus.QUEUED  # never claimed
+    assert store.get(job.job_id).status is JobStatus.QUEUED   # never claimed

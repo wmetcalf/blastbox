@@ -16,7 +16,6 @@ Covers (per the plan):
 - FIX 2: non-UUID job_id returns 404 before any store/fs use.
 - FIX 3: output_dir re-derived from job_root; tampered result_dir is ignored.
 """
-
 from __future__ import annotations
 
 import hashlib
@@ -172,9 +171,7 @@ def test_readyz_does_not_leak_store_error(tmp_path):
     client, store = _make_client(tmp_path)
 
     def boom():
-        raise RuntimeError(
-            "could not connect: host=db.internal port=5432 password=hunter2"
-        )
+        raise RuntimeError("could not connect: host=db.internal port=5432 password=hunter2")
 
     store.count = boom  # type: ignore[method-assign]  # readyz probes via count()
     resp = client.get("/v1/readyz")
@@ -203,9 +200,7 @@ def test_get_artifact_post_seal_disk_tamper_is_inert(tmp_path):
     tests/host/blobs/test_local.py::test_put_output_skips_a_symlink_to_a_file_outside_the_output_dir.)
     """
     client, store = _make_client(tmp_path)
-    job, output_dir = _make_done_job(
-        tmp_path, store, artifact_data=b"PRISTINE-PNG-BYTES"
-    )
+    job, output_dir = _make_done_job(tmp_path, store, artifact_data=b"PRISTINE-PNG-BYTES")
     outside = tmp_path / "outside_secret"
     outside.write_bytes(b"OUTSIDE-SECRET")
 
@@ -265,9 +260,7 @@ def _push_to_blob(tmp_path: Path, job_id: str, output_dir: Path) -> None:
     """
     from blastbox.host.blobs.local import LocalBlobStore
 
-    LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs").put_output(
-        job_id, output_dir
-    )
+    LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs").put_output(job_id, output_dir)
 
 
 def _make_done_job(
@@ -296,12 +289,7 @@ def _make_done_job(
     art_path.write_bytes(artifact_data)
 
     # Seal a valid envelope
-    detection = Detection(
-        label="docx",
-        mime="application/vnd.openxmlformats",
-        confidence=0.99,
-        source="magika",
-    )
+    detection = Detection(label="docx", mime="application/vnd.openxmlformats", confidence=0.99, source="magika")
     payload = Page(
         index=0,
         dims=Dimensions(width=210, height=297, unit="mm"),
@@ -342,9 +330,7 @@ class TestJobSubmission:
         resp = client.post(
             "/v1/jobs",
             data={"engine": "clippyshot"},
-            files={
-                "file": ("doc.docx", io.BytesIO(b"hello"), "application/octet-stream")
-            },
+            files={"file": ("doc.docx", io.BytesIO(b"hello"), "application/octet-stream")},
         )
         assert resp.status_code == 202
         body = resp.json()
@@ -437,9 +423,7 @@ class TestJobSubmission:
         resp = client.post(
             "/v1/jobs",
             data={"engine": "clippyshot"},
-            files={
-                "file": (".hidden", io.BytesIO(b"data"), "application/octet-stream")
-            },
+            files={"file": (".hidden", io.BytesIO(b"data"), "application/octet-stream")},
         )
         assert resp.status_code == 202
         job = store.get(resp.json()["job_id"])
@@ -458,13 +442,7 @@ class TestJobSubmission:
         resp = client.post(
             "/v1/jobs",
             data={"engine": "clippyshot"},
-            files={
-                "file": (
-                    "validname.bin",
-                    io.BytesIO(b"data"),
-                    "application/octet-stream",
-                )
-            },
+            files={"file": ("validname.bin", io.BytesIO(b"data"), "application/octet-stream")},
         )
         assert resp.status_code == 202
         job = store.get(resp.json()["job_id"])
@@ -663,9 +641,7 @@ class TestArtifactRoutesDone:
         _, store = _make_client(tmp_path)
         artifact_data = b"PNG_CONTENT_BYTES_PURGED"
         job, output_dir = _make_done_job(tmp_path, store, artifact_data=artifact_data)
-        shutil.rmtree(
-            tmp_path / "jobs" / job.job_id
-        )  # simulate the worker's post-upload purge
+        shutil.rmtree(tmp_path / "jobs" / job.job_id)  # simulate the worker's post-upload purge
         client, _ = _make_client(tmp_path, store=store)
         resp = client.get(f"/v1/jobs/{job.job_id}/artifacts/page-001")
         assert resp.status_code == 200
@@ -754,9 +730,7 @@ class TestArtifactConfinement:
         meta_data["artifacts"][0]["path"] = "../../../etc/passwd"
         meta_path.write_text(json.dumps(meta_data))
         _push_to_blob(tmp_path, job.job_id, output_dir)
-        shutil.rmtree(
-            tmp_path / "jobs" / job.job_id
-        )  # simulate the worker's post-upload purge
+        shutil.rmtree(tmp_path / "jobs" / job.job_id)  # simulate the worker's post-upload purge
 
         client, _ = _make_client(tmp_path, store=store)
         resp = client.get(f"/v1/jobs/{job.job_id}/artifacts/page-001")
@@ -813,12 +787,7 @@ class TestAuth:
         the bearer token; /v1/healthz + /v1/version stay public regardless."""
         client, _ = _make_client(tmp_path, api_key="secret123", metrics_public=False)
         assert client.get("/metrics").status_code == 401
-        assert (
-            client.get(
-                "/metrics", headers={"Authorization": "Bearer secret123"}
-            ).status_code
-            == 200
-        )
+        assert client.get("/metrics", headers={"Authorization": "Bearer secret123"}).status_code == 200
         # Health/version must NOT be gated by the metrics toggle.
         assert client.get("/v1/healthz").status_code == 200
         assert client.get("/v1/version").status_code == 200
@@ -938,11 +907,9 @@ class TestDeleteJob:
         # The blob store's delete_job is genuinely wired up, not just coincidentally
         # absent: a fresh LocalBlobStore instance pointed at the same blob_root sees
         # the results gone too (not merely a same-process cache artifact).
-        assert (
-            not LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
-            ._results_dir(job.job_id)
-            .exists()
-        )
+        assert not LocalBlobStore(
+            tmp_path / "jobs", blob_root=tmp_path / "blobs"
+        )._results_dir(job.job_id).exists()
 
     def test_delete_blob_failure_leaves_job_row_intact(self, tmp_path, monkeypatch):
         """Finding E2: a blob-store delete_job failure must NOT be swallowed with the
@@ -994,9 +961,7 @@ class TestErrorScrubbing:
         body_str = resp.text
         # No internal paths in the response
         for prefix in ("/home", "/var", "/etc", "/proc"):
-            assert prefix not in body_str, (
-                f"internal path {prefix!r} leaked in 400 response"
-            )
+            assert prefix not in body_str, f"internal path {prefix!r} leaked in 400 response"
 
 
 # ===========================================================================
@@ -1102,9 +1067,7 @@ class TestChunkedOverLimitReturns413:
             b'Content-Disposition: form-data; name="file"; filename="big.bin"\r\n'
             b"Content-Type: application/octet-stream\r\n\r\n"
             + large
-            + b"\r\n--"
-            + boundary
-            + b"--\r\n"
+            + b"\r\n--" + boundary + b"--\r\n"
         )
         content_type = b"multipart/form-data; boundary=testboundary1234"
 
@@ -1134,9 +1097,7 @@ class TestChunkedOverLimitReturns413:
             b'Content-Disposition: form-data; name="file"; filename="big2.bin"\r\n'
             b"Content-Type: application/octet-stream\r\n\r\n"
             + large
-            + b"\r\n--"
-            + boundary
-            + b"--\r\n"
+            + b"\r\n--" + boundary + b"--\r\n"
         )
         client.post(
             "/v1/jobs",
@@ -1160,9 +1121,7 @@ class TestChunkedOverLimitReturns413:
             b'Content-Disposition: form-data; name="file"; filename="metric.bin"\r\n'
             b"Content-Type: application/octet-stream\r\n\r\n"
             + large
-            + b"\r\n--"
-            + boundary
-            + b"--\r\n"
+            + b"\r\n--" + boundary + b"--\r\n"
         )
         before = REJECTIONS_TOTAL.labels(reason="body_too_large")._value.get()
         client.post(
@@ -1323,7 +1282,6 @@ class TestOutputDirRederived:
         resp = client.get(f"/v1/jobs/{job.job_id}/result")
         if resp.status_code == 200:
             import zipfile as zf
-
             zdata = io.BytesIO(resp.content)
             with zf.ZipFile(zdata) as z:
                 names = z.namelist()
@@ -1356,9 +1314,7 @@ class TestTierRoutingGate:
         resp = self._submit(client, "gvisor")
         assert resp.status_code == 202
         job = store.get(resp.json()["job_id"])
-        assert (
-            job.target_tier is None
-        )  # dropped — not honored without the operator flag
+        assert job.target_tier is None  # dropped — not honored without the operator flag
 
     def test_target_tier_honored_when_routing_enabled(self, tmp_path, monkeypatch):
         monkeypatch.setenv("BLASTBOX_ALLOW_TIER_ROUTING", "1")
@@ -1412,9 +1368,7 @@ def test_net_policy_invalid_name_rejected(tmp_path, monkeypatch):
             files={"file": ("x.docx", b"data", "application/octet-stream")},
         )
         assert resp.status_code in (200, 202)
-        assert (
-            store.get(resp.json()["job_id"]).net_policy is None
-        )  # rejected, not stored
+        assert store.get(resp.json()["job_id"]).net_policy is None  # rejected, not stored
 
 
 def test_require_engine_allowlist_empty_raises(tmp_path, monkeypatch):

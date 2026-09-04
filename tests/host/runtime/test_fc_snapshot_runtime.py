@@ -3,7 +3,6 @@
 The SnapshotManager + launcher are faked, so these exercise the SlotRuntime
 contract (spawn = build-once + restore; is_ready/is_alive track the restore;
 reap kills + cleans) and the builder's manager wiring."""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -124,8 +123,8 @@ def test_is_ready_holds_during_settle_window(tmp_path):
     now[0] = 102.9
     assert rt.is_ready(slot) is False  # still inside the 3s window
     now[0] = 103.1
-    assert rt.is_ready(slot) is True  # settle elapsed → promotable
-    assert rt.is_alive(slot) is True  # is_alive is NOT gated by settle
+    assert rt.is_ready(slot) is True   # settle elapsed → promotable
+    assert rt.is_alive(slot) is True   # is_alive is NOT gated by settle
 
 
 def test_is_ready_false_when_proc_dead(tmp_path):
@@ -297,9 +296,7 @@ def test_spawn_refuses_to_build_inline(tmp_path):
     with pytest.raises(RuntimeAtCapacity):
         rt.spawn()
     assert mgr.kicked == 1, "the async build must still be kicked"
-    assert mgr.builds == 0, (
-        "spawn built INLINE — that is the stall this exists to prevent"
-    )
+    assert mgr.builds == 0, "spawn built INLINE — that is the stall this exists to prevent"
     assert mgr.restored == []
 
     # Once the artifact exists, spawn proceeds normally.

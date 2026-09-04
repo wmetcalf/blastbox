@@ -1,5 +1,4 @@
 """Tests for retention sweeper."""
-
 from __future__ import annotations
 
 import contextlib
@@ -30,7 +29,6 @@ from blastbox.host.jobs.retention import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-
 def _make_job(
     status: JobStatus = JobStatus.DONE,
     expires_at: float | None = None,
@@ -56,7 +54,6 @@ def _future(delta: float = 3600.0) -> float:
 # ---------------------------------------------------------------------------
 # Basic expiry of terminal-status jobs
 # ---------------------------------------------------------------------------
-
 
 def test_expires_done_job_past_expiry(tmp_path):
     store = InMemoryJobStore()
@@ -131,7 +128,6 @@ def test_does_not_expire_no_expires_at(tmp_path):
 # Non-terminal jobs must NOT be expired
 # ---------------------------------------------------------------------------
 
-
 def test_does_not_expire_queued_job(tmp_path):
     store = InMemoryJobStore()
     result_dir = tmp_path / "q1" / "result"
@@ -171,7 +167,6 @@ def test_does_not_expire_running_job(tmp_path):
 # ---------------------------------------------------------------------------
 # rmtree confinement — result_dir outside job_root must be refused
 # ---------------------------------------------------------------------------
-
 
 def test_rmtree_refused_outside_job_root(tmp_path):
     """A result_dir pointing outside job_root must not be deleted."""
@@ -232,7 +227,6 @@ def test_rmtree_confined_to_job_root(tmp_path):
 # followed during deletion
 # ---------------------------------------------------------------------------
 
-
 def test_symlink_escape_not_followed(tmp_path):
     """A symlink inside the result dir pointing outside the base is not followed."""
     job_root = tmp_path / "jobs"
@@ -270,7 +264,6 @@ def test_symlink_escape_not_followed(tmp_path):
 # ---------------------------------------------------------------------------
 # Failure logging (not crashing the sweeper)
 # ---------------------------------------------------------------------------
-
 
 def test_failure_on_one_job_does_not_block_others(tmp_path, caplog):
     """A failure expiring one job must not prevent others from being expired."""
@@ -311,7 +304,6 @@ def test_failure_on_one_job_does_not_block_others(tmp_path, caplog):
 # purge_job_dir — the shared helper both dispatchers call (#84)
 # ---------------------------------------------------------------------------
 
-
 class TestPurgeJobDir:
     """The helper is the ONLY thing standing between a terminal job and sample bytes
     left on spare hardware, so its refusals and its successes must both be exact:
@@ -337,10 +329,7 @@ class TestPurgeJobDir:
         assert purge_job_dir(root, "never-existed", logging.getLogger("t")) is True
 
     def test_a_peer_reaping_concurrently_is_not_reported_as_a_failure(
-        self,
-        tmp_path,
-        monkeypatch,
-        caplog,
+        self, tmp_path, monkeypatch, caplog,
     ):
         """rmtree losing the race to a peer is the NORMAL two-dispatcher case.
 
@@ -357,7 +346,7 @@ class TestPurgeJobDir:
         real_rmtree = shutil.rmtree
 
         def racing_rmtree(path, *a, **kw):
-            real_rmtree(path, *a, **kw)  # the peer's delete, landing first
+            real_rmtree(path, *a, **kw)      # the peer's delete, landing first
             raise FileNotFoundError(2, "No such file or directory", str(path))
 
         monkeypatch.setattr("blastbox.host.jobs.retention.shutil.rmtree", racing_rmtree)
@@ -368,9 +357,7 @@ class TestPurgeJobDir:
         assert "PURGE FAILED" not in caplog.text
         assert "sample bytes may remain" not in caplog.text
 
-    def test_a_real_rmtree_failure_is_still_reported(
-        self, tmp_path, monkeypatch, caplog
-    ):
+    def test_a_real_rmtree_failure_is_still_reported(self, tmp_path, monkeypatch, caplog):
         """The counterpart: a genuine OSError must keep the loud alarm and return False,
         so the concurrent-reap exemption above cannot be read as 'purge never fails'."""
         root = tmp_path / "jobs"
@@ -379,9 +366,7 @@ class TestPurgeJobDir:
         def failing_rmtree(path, *a, **kw):
             raise PermissionError(13, "Permission denied", str(path))
 
-        monkeypatch.setattr(
-            "blastbox.host.jobs.retention.shutil.rmtree", failing_rmtree
-        )
+        monkeypatch.setattr("blastbox.host.jobs.retention.shutil.rmtree", failing_rmtree)
 
         with caplog.at_level(logging.ERROR):
             assert purge_job_dir(root, "abc", logging.getLogger("t")) is False
@@ -389,9 +374,7 @@ class TestPurgeJobDir:
         assert (root / "abc").exists()
 
     @pytest.mark.parametrize("job_id", ["", ".", "..", "a/b", "..\\b", "../victim"])
-    def test_refuses_anything_that_is_not_one_path_component(
-        self, tmp_path, job_id, caplog
-    ):
+    def test_refuses_anything_that_is_not_one_path_component(self, tmp_path, job_id, caplog):
         """'victim/child/..' is strictly UNDER job_root yet resolves to a different job's
         tree, so containment alone cannot protect a peer. Job IDs are server-side uuid4
         and ingress validates them, but Job.from_dict() does not — an imported or
@@ -448,10 +431,7 @@ class TestPurgeJobDir:
         assert (outside / "precious.bin").exists()
 
     def test_a_canonicalisation_error_is_contained_not_raised(
-        self,
-        tmp_path,
-        monkeypatch,
-        caplog,
+        self, tmp_path, monkeypatch, caplog,
     ):
         """A symlink loop makes Path.resolve() raise RuntimeError. Both dispatchers call
         this from terminal cleanup, so an escape here would mask the job's real outcome
@@ -473,7 +453,6 @@ class TestPurgeJobDir:
 # retry_pending_uploads — what makes retaining a result legitimate (#85)
 # ---------------------------------------------------------------------------
 
-
 class _FakeBlobs:
     """Minimal BlobStore: put_output can be made to fail, has_output reflects what landed."""
 
@@ -486,9 +465,7 @@ class _FakeBlobs:
         self.put_calls += 1
         if self.fail_put:
             raise OSError("object store unavailable")
-        self.stored[job_id] = sorted(
-            p.name for p in Path(out_dir).rglob("*") if p.is_file()
-        )
+        self.stored[job_id] = sorted(p.name for p in Path(out_dir).rglob("*") if p.is_file())
 
     def has_output(self, job_id: str) -> bool:
         return "metadata.json" in self.stored.get(job_id, [])
@@ -510,6 +487,7 @@ _JID = "44444444-4444-4444-8444-444444444444"
 
 
 class TestRetryPendingUploads:
+
     def test_drains_a_retained_result_once_the_store_recovers(self, tmp_path):
         """The whole reason a tree may be retained. Without this sweep the two dispatchers had to
         choose between destroying a host-sealed, unreproducible result and keeping it forever as
@@ -517,15 +495,13 @@ class TestRetryPendingUploads:
         store = InMemoryJobStore()
         job = Job.new(engine="redtusk", filename="a.doc")
         job.job_id = _JID
-        job.status = JobStatus.FAILED  # our own exhaustion path FAILs the job
+        job.status = JobStatus.FAILED           # our own exhaustion path FAILs the job
         job.error = f"result upload failed after 3 attempts; {RESULT_RETAINED_MARKER}"
         store.create(job)
         _sealed_tree(tmp_path, _JID)
         blobs = _FakeBlobs()
 
-        assert (
-            retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 1
-        )
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 1
         assert blobs.has_output(_JID)
 
     def test_is_a_noop_once_the_result_is_already_durable(self, tmp_path):
@@ -536,9 +512,7 @@ class TestRetryPendingUploads:
         blobs = _FakeBlobs()
         blobs.stored[_JID] = ["metadata.json"]
 
-        assert (
-            retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
-        )
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
         assert blobs.put_calls == 0
 
     def test_never_overwrites_a_peers_authoritative_result(self, tmp_path):
@@ -550,30 +524,24 @@ class TestRetryPendingUploads:
         store = InMemoryJobStore()
         job = Job.new(engine="redtusk", filename="a.doc")
         job.job_id = _JID
-        job.status = JobStatus.DONE  # the peer won
+        job.status = JobStatus.DONE             # the peer won
         store.create(job)
         _sealed_tree(tmp_path, _JID)
         blobs = _FakeBlobs()
 
-        assert (
-            retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
-        )
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
         assert blobs.put_calls == 0, "uploaded a stale attempt over the peer's result"
 
     def test_leaves_the_tree_when_the_store_cannot_be_read(self, tmp_path):
         """Fails safe in the same direction as everything else here: unable to prove the tree is
         ours, we neither upload it nor lose it."""
-
         class Broken(InMemoryJobStore):
             def get(self, job_id):
                 raise RuntimeError("store down")
 
         _sealed_tree(tmp_path, _JID)
         blobs = _FakeBlobs()
-        assert (
-            retry_pending_uploads(tmp_path, blobs, Broken(), logging.getLogger("t"))
-            == 0
-        )
+        assert retry_pending_uploads(tmp_path, blobs, Broken(), logging.getLogger("t")) == 0
         assert blobs.put_calls == 0
 
     def test_ignores_ordinary_scratch_with_no_sealed_result(self, tmp_path):
@@ -585,9 +553,7 @@ class TestRetryPendingUploads:
         (d / "input.bin").write_bytes(b"MALWARE")
         blobs = _FakeBlobs()
 
-        assert (
-            retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
-        )
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
         assert blobs.put_calls == 0
 
     def test_a_still_failing_upload_keeps_the_tree(self, tmp_path):
@@ -597,14 +563,10 @@ class TestRetryPendingUploads:
         d = _sealed_tree(tmp_path, _JID)
         blobs = _FakeBlobs(fail_put=True)
 
-        assert (
-            retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
-        )
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
         assert (d / "output" / "metadata.json").exists()
 
-    def test_repairs_the_job_to_done_so_the_recovered_result_is_actually_servable(
-        self, tmp_path
-    ):
+    def test_repairs_the_job_to_done_so_the_recovered_result_is_actually_servable(self, tmp_path):
         """Uploading the bytes is only HALF the recovery.
 
         The job was FAILED because its upload exhausted, and open_output is DONE-gated — so a
@@ -622,10 +584,7 @@ class TestRetryPendingUploads:
         store.create(job)
         _sealed_tree(tmp_path, _JID)
 
-        assert (
-            retry_pending_uploads(tmp_path, _FakeBlobs(), store, logging.getLogger("t"))
-            == 1
-        )
+        assert retry_pending_uploads(tmp_path, _FakeBlobs(), store, logging.getLogger("t")) == 1
         repaired = store.get(_JID)
         assert repaired.status is JobStatus.DONE
         assert repaired.error is None
@@ -641,18 +600,13 @@ class TestRetryPendingUploads:
         job.status = JobStatus.FAILED
         job.error = "worker exited non-zero"
         store.create(job)
-        _sealed_tree(
-            tmp_path, _JID, pending=False
-        )  # no sentinel: the host never retained it
+        _sealed_tree(tmp_path, _JID, pending=False)   # no sentinel: the host never retained it
 
         blobs = _FakeBlobs()
-        assert (
-            retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
-        )
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
         assert blobs.put_calls == 0, "published a tree the host never sealed"
-        assert store.get(_JID).status is JobStatus.FAILED, (
-            "promoted an unrelated failure to DONE"
-        )
+        assert store.get(_JID).status is JobStatus.FAILED, "promoted an unrelated failure to DONE"
+
 
     def test_never_publishes_a_tree_the_host_never_sealed(self, tmp_path):
         """A root metadata.json is NOT proof of a host seal.
@@ -667,19 +621,15 @@ class TestRetryPendingUploads:
         job = Job.new(engine="redtusk", filename="a.doc")
         job.job_id = _JID
         job.status = JobStatus.FAILED
-        job.error = "output rejected by the trust gate"  # never sealed
+        job.error = "output rejected by the trust gate"      # never sealed
         store.create(job)
         d = tmp_path / _JID
         (d / "output").mkdir(parents=True)
         (d / "output" / "metadata.json").write_text('{"forged": "by the worker"}')
-        assert not (
-            d / PENDING_UPLOAD_SENTINEL
-        ).exists()  # the host vouched for nothing
+        assert not (d / PENDING_UPLOAD_SENTINEL).exists()    # the host vouched for nothing
 
         blobs = _FakeBlobs()
-        assert (
-            retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
-        )
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
         assert blobs.put_calls == 0, "published worker-controlled bytes as a job result"
 
     def test_repairs_a_job_whose_bytes_are_already_durable(self, tmp_path):
@@ -694,23 +644,19 @@ class TestRetryPendingUploads:
         store.create(job)
         _sealed_tree(tmp_path, _JID)
         blobs = _FakeBlobs()
-        blobs.stored[_JID] = ["metadata.json"]  # already there
+        blobs.stored[_JID] = ["metadata.json"]               # already there
 
         retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t"))
         assert blobs.put_calls == 0, "re-uploaded bytes that were already durable"
-        assert store.get(_JID).status is JobStatus.DONE, (
-            "left a job FAILED with a durable result"
-        )
+        assert store.get(_JID).status is JobStatus.DONE, "left a job FAILED with a durable result"
 
     def test_a_row_lost_to_a_ttl_is_not_uploaded(self, tmp_path):
         """Redis rows expire (24h default). A missing row yields no marker, so the sweep does
         nothing — the safe direction: the age reclaim still bounds the tree."""
-        store = InMemoryJobStore()  # no row for _JID at all
+        store = InMemoryJobStore()                            # no row for _JID at all
         _sealed_tree(tmp_path, _JID)
         blobs = _FakeBlobs()
-        assert (
-            retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
-        )
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
         assert blobs.put_calls == 0
 
     def test_a_repaired_job_gets_its_post_done_work_done(self, tmp_path):
@@ -726,17 +672,12 @@ class TestRetryPendingUploads:
         d = _sealed_tree(tmp_path, _JID)
 
         seen: list[tuple[str, Path, str]] = []
-        retry_pending_uploads(
-            tmp_path,
-            _FakeBlobs(),
-            store,
-            logging.getLogger("t"),
-            on_repaired=lambda jid, out, seal: seen.append((jid, out, seal)),
-        )
+        retry_pending_uploads(tmp_path, _FakeBlobs(), store, logging.getLogger("t"),
+                              on_repaired=lambda jid, out, seal: seen.append((jid, out, seal)))
         assert [(s[0], s[1]) for s in seen] == [(_JID, d / "output")]
         # The hook is handed the SEAL BYTES, read while the tree was still held — so it does not
         # matter whether a peer reclaims the tree the moment the row goes DONE.
-        assert seen[0][2].strip() == '{"sealed": true}'
+        assert seen[0][2].strip() == '{"sealed": true}' 
 
     def test_a_failing_post_repair_hook_never_undoes_the_repair(self, tmp_path):
         """Best-effort: the bytes are durable and the status is correct. An indexing problem must
@@ -752,21 +693,17 @@ class TestRetryPendingUploads:
         def boom(jid, out, seal):
             raise RuntimeError("indexer down")
 
-        retry_pending_uploads(
-            tmp_path, _FakeBlobs(), store, logging.getLogger("t"), on_repaired=boom
-        )
+        retry_pending_uploads(tmp_path, _FakeBlobs(), store, logging.getLogger("t"),
+                              on_repaired=boom)
         assert store.get(_JID).status is JobStatus.DONE
 
-    def test_the_post_repair_hook_does_not_run_when_the_repair_did_not_happen(
-        self, tmp_path
-    ):
+    def test_the_post_repair_hook_does_not_run_when_the_repair_did_not_happen(self, tmp_path):
         """The hook means "this job just became DONE". Running it on a CAS that lost — a peer
         moved the row out of FAILED between our read and our write — would index a result for a
         job whose terminal state somebody else owns, off an envelope from our stale attempt."""
-
         class LosesTheCas(InMemoryJobStore):
             def update_if_status(self, job_id, expect_status, **kw):
-                return False  # somebody else moved it first
+                return False               # somebody else moved it first
 
         store = LosesTheCas()
         job = Job.new(engine="redtusk", filename="a.doc")
@@ -777,14 +714,10 @@ class TestRetryPendingUploads:
         _sealed_tree(tmp_path, _JID)
 
         seen: list[str] = []
-        retry_pending_uploads(
-            tmp_path,
-            _FakeBlobs(),
-            store,
-            logging.getLogger("t"),
-            on_repaired=lambda jid, out, seal: seen.append(jid),
-        )
+        retry_pending_uploads(tmp_path, _FakeBlobs(), store, logging.getLogger("t"),
+                              on_repaired=lambda jid, out, seal: seen.append(jid))
         assert seen == [], "indexed a job this sweep did not repair"
+
 
     def test_a_worker_cannot_forge_its_way_into_the_results_namespace(self, tmp_path):
         """The gate must be a HOST fact, and job.error is not one.
@@ -802,17 +735,13 @@ class TestRetryPendingUploads:
         job = Job.new(engine="redtusk", filename="a.doc")
         job.job_id = _JID
         job.status = JobStatus.FAILED
-        job.error = f"engine_error: {RESULT_RETAINED_MARKER}"  # forged by the worker
+        job.error = f"engine_error: {RESULT_RETAINED_MARKER}"      # forged by the worker
         store.create(job)
-        _sealed_tree(tmp_path, _JID, pending=False)  # host vouched for nothing
+        _sealed_tree(tmp_path, _JID, pending=False)                # host vouched for nothing
 
         blobs = _FakeBlobs()
-        assert (
-            retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
-        )
-        assert blobs.put_calls == 0, (
-            "a worker forged its way into the results namespace"
-        )
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
+        assert blobs.put_calls == 0, "a worker forged its way into the results namespace"
         assert store.get(_JID).status is JobStatus.FAILED
 
     def test_an_expired_job_is_never_resurrected(self, tmp_path):
@@ -828,9 +757,7 @@ class TestRetryPendingUploads:
         _sealed_tree(tmp_path, _JID)
 
         blobs = _FakeBlobs()
-        assert (
-            retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
-        )
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
         assert blobs.put_calls == 0, "resurrected an expired job's result"
 
 
@@ -851,7 +778,6 @@ class TestDeepTreeRemoval:
         the next run inherits it. Remove it with the very function under test."""
         yield
         from blastbox.host.jobs.retention import _rmtree_iterative
-
         for child in list(tmp_path.iterdir()):
             if child.is_dir() and not child.is_symlink():
                 with contextlib.suppress(OSError):
@@ -896,14 +822,10 @@ class TestDeepTreeRemoval:
             d = root / "abc"
             (d / "output").mkdir(parents=True)
             (d / "input.bin").write_bytes(b"MALWARE-BYTES-MUST-NOT-PERSIST")
-            self._nest(
-                d / "output", 2000, leaf=lambda: pathlib.Path("payload").write_text("x")
-            )
+            self._nest(d / "output", 2000, leaf=lambda: pathlib.Path("payload").write_text("x"))
 
             assert purge_job_dir(root, "abc", logging.getLogger("t")) is True
-            assert not d.exists(), (
-                "a deep tree survived because the removal ran out of fds"
-            )
+            assert not d.exists(), "a deep tree survived because the removal ran out of fds"
         finally:
             resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
 
@@ -912,9 +834,7 @@ class TestDeepTreeRemoval:
         d = root / "abc"
         (d / "output").mkdir(parents=True)
         (d / "input.bin").write_bytes(b"MALWARE-BYTES-MUST-NOT-PERSIST")
-        self._nest(
-            d / "output", 1500, leaf=lambda: pathlib.Path("payload").write_text("x")
-        )
+        self._nest(d / "output", 1500, leaf=lambda: pathlib.Path("payload").write_text("x"))
 
         assert purge_job_dir(root, "abc", logging.getLogger("t")) is True
         assert not d.exists(), "a nested tree made itself permanently undeletable"
@@ -985,9 +905,7 @@ class TestRemovalRobustness:
         finally:
             os.chmod(pinned, 0o755)
 
-    def test_residue_from_an_interrupted_purge_does_not_poison_the_next_one(
-        self, tmp_path
-    ):
+    def test_residue_from_an_interrupted_purge_does_not_poison_the_next_one(self, tmp_path):
         """The hoist used a fixed `.rm-0`, so residue from a killed purge (likely, given the spin
         above) made every later attempt rename onto a NON-EMPTY dir — ENOTEMPTY, zero progress,
         forever. Hoist names are now probed for freshness."""
@@ -1035,7 +953,6 @@ class TestRemovalRobustness:
     def _no_stranded_trees(self, tmp_path):
         yield
         from blastbox.host.jobs.retention import _rmtree_iterative
-
         for child in list(tmp_path.iterdir()):
             if child.is_dir() and not child.is_symlink():
                 with contextlib.suppress(OSError):
@@ -1049,7 +966,6 @@ class TestRemovalRobustness:
         it saw ordinary scratch, the fall-through repair could never run, and the job stayed
         FAILED with a durable result and every result route answering 409.
         """
-
         class CasFails(InMemoryJobStore):
             def update_if_status(self, job_id, expect_status, **kw):
                 return False
@@ -1067,9 +983,7 @@ class TestRemovalRobustness:
             "the marker was dropped before the repair landed — nothing can retry it now"
         )
 
-    def test_a_sentinel_that_cannot_be_written_is_an_error_not_a_shrug(
-        self, tmp_path, caplog
-    ):
+    def test_a_sentinel_that_cannot_be_written_is_an_error_not_a_shrug(self, tmp_path, caplog):
         """It is the ONLY durable record that a tree holds the last copy: the in-memory carve-out
         covers just the immediate purge, and once consumed the reclaim treats the tree as ordinary
         scratch. A failure here is pending data loss and has to read like one."""
@@ -1094,26 +1008,17 @@ class TestRemovalRobustness:
         job.job_id = _JID
         job.status = JobStatus.FAILED
         job.error = f"upload failed; {RESULT_RETAINED_MARKER}"
-        job.expires_at = time.time() - 10_000  # long past, from the original failure
+        job.expires_at = time.time() - 10_000          # long past, from the original failure
         store.create(job)
         _sealed_tree(tmp_path, _JID)
 
-        retry_pending_uploads(
-            tmp_path,
-            _FakeBlobs(),
-            store,
-            logging.getLogger("t"),
-            retention_seconds=3600,
-        )
+        retry_pending_uploads(tmp_path, _FakeBlobs(), store, logging.getLogger("t"),
+                              retention_seconds=3600)
         row = store.get(_JID)
         assert row.status is JobStatus.DONE
-        assert row.expires_at > time.time(), (
-            "repaired job kept an already-expired retention clock"
-        )
+        assert row.expires_at > time.time(), "repaired job kept an already-expired retention clock"
 
-    def test_a_failing_post_repair_hook_leaves_a_servable_job_and_says_so(
-        self, tmp_path, caplog
-    ):
+    def test_a_failing_post_repair_hook_leaves_a_servable_job_and_says_so(self, tmp_path, caplog):
         """The recovery itself must stand, and the shortfall must be visible.
 
         Keeping the sentinel here would NOT buy a retry — this sweep only looks at FAILED rows and
@@ -1134,16 +1039,15 @@ class TestRemovalRobustness:
             raise RuntimeError("indexer down")
 
         with caplog.at_level(logging.WARNING):
-            retry_pending_uploads(
-                tmp_path, _FakeBlobs(), store, logging.getLogger("t"), on_repaired=boom
-            )
+            retry_pending_uploads(tmp_path, _FakeBlobs(), store, logging.getLogger("t"),
+                                  on_repaired=boom)
         assert store.get(_JID).status is JobStatus.DONE, "the repair itself must stand"
         assert not (d / PENDING_UPLOAD_SENTINEL).exists(), (
             "kept a marker no later tick can act on — a mechanism that does not exist"
         )
-        assert any(
-            "post-repair indexing failed" in r.message for r in caplog.records
-        ), "the shortfall was not reported"
+        assert any("post-repair indexing failed" in r.message for r in caplog.records), (
+            "the shortfall was not reported"
+        )
 
     def test_expiry_never_deletes_a_pending_upload_tree(self, tmp_path):
         """The reclaim spares this tree as the only copy, and the retention sweeper would rmtree
@@ -1172,26 +1076,20 @@ class TestMarkerOwnership:
     """The marker is written BEFORE the terminal CAS so a crash cannot lose it — which means one
     can outlive an attempt that LOST that CAS. It records the claim it was written under."""
 
-    def test_a_marker_from_a_superseded_attempt_never_publishes_its_bytes(
-        self, tmp_path
-    ):
+    def test_a_marker_from_a_superseded_attempt_never_publishes_its_bytes(self, tmp_path):
         store = InMemoryJobStore()
         job = Job.new(engine="redtusk", filename="a.doc")
         job.job_id = _JID
         job.status = JobStatus.FAILED
-        job.claim_id = "the-peer"  # the row moved on
+        job.claim_id = "the-peer"                      # the row moved on
         job.error = f"x; {RESULT_RETAINED_MARKER}"
         store.create(job)
         d = _sealed_tree(tmp_path, _JID, pending=False)
         (d / PENDING_UPLOAD_SENTINEL).write_text("our-stale-claim")
 
         blobs = _FakeBlobs()
-        assert (
-            retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
-        )
-        assert blobs.put_calls == 0, (
-            "published a superseded attempt's bytes over the owner's"
-        )
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
+        assert blobs.put_calls == 0, "published a superseded attempt's bytes over the owner's"
         assert store.get(_JID).status is JobStatus.FAILED
 
     def test_a_marker_matching_the_current_claim_is_acted_on(self, tmp_path):
@@ -1205,15 +1103,10 @@ class TestMarkerOwnership:
         d = _sealed_tree(tmp_path, _JID, pending=False)
         (d / PENDING_UPLOAD_SENTINEL).write_text("ours")
 
-        assert (
-            retry_pending_uploads(tmp_path, _FakeBlobs(), store, logging.getLogger("t"))
-            == 1
-        )
+        assert retry_pending_uploads(tmp_path, _FakeBlobs(), store, logging.getLogger("t")) == 1
         assert store.get(_JID).status is JobStatus.DONE
 
-    def test_a_declared_path_written_with_dot_or_double_slash_still_counts_as_declared(
-        self,
-    ):
+    def test_a_declared_path_written_with_dot_or_double_slash_still_counts_as_declared(self):
         """Manifest paths are stored verbatim, so './nested/x' or 'nested//x' would not match the
         walker's normalized 'nested/x' — the artifact would look UNDECLARED and an unstorable one
         would be skipped while the seal was still committed."""
@@ -1223,22 +1116,11 @@ class TestMarkerOwnership:
         from blastbox.host.blobs.base import _declared_paths
 
         d = Path(tempfile.mkdtemp())
-        (d / "metadata.json").write_text(
-            _json.dumps(
-                {
-                    "artifacts": [
-                        {"path": "./nested/x.png"},
-                        {"path": "nested//y.png"},
-                        {"path": "plain.png"},
-                    ]
-                }
-            )
-        )
+        (d / "metadata.json").write_text(_json.dumps({"artifacts": [
+            {"path": "./nested/x.png"}, {"path": "nested//y.png"}, {"path": "plain.png"}]}))
         assert _declared_paths(d) == {"nested/x.png", "nested/y.png", "plain.png"}
 
-    def test_the_last_copy_rule_does_not_depend_on_being_handed_a_blob_store(
-        self, tmp_path
-    ):
+    def test_the_last_copy_rule_does_not_depend_on_being_handed_a_blob_store(self, tmp_path):
         """Without a store there is no durable copy to check — which means the tree cannot be
         PROVEN redundant, so it is the last copy by definition.
 
@@ -1258,9 +1140,7 @@ class TestMarkerOwnership:
         for pth in sorted(d.rglob("*"), reverse=True) + [d]:
             os.utime(pth, (old, old))
 
-        removed = reap_stale_scratch(
-            tmp_path, 60.0, store, logging.getLogger("t")
-        )  # no store
+        removed = reap_stale_scratch(tmp_path, 60.0, store, logging.getLogger("t"))  # no store
         assert removed == 0, "deleted a sealed result because no blob store was passed"
         assert (d / "output" / "metadata.json").exists()
 
@@ -1289,19 +1169,15 @@ class TestMarkerOwnership:
         job = Job.new(engine="redtusk", filename="a.doc")
         job.job_id = _JID
         job.status = JobStatus.FAILED
-        job.claim_id = None  # requeued since we marked it
+        job.claim_id = None                                  # requeued since we marked it
         job.error = f"x; {RESULT_RETAINED_MARKER}"
         store.create(job)
         d = _sealed_tree(tmp_path, _JID, pending=False)
         (d / PENDING_UPLOAD_SENTINEL).write_text("our-stale-claim")
 
         blobs = _FakeBlobs()
-        assert (
-            retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
-        )
-        assert blobs.put_calls == 0, (
-            "published a superseded attempt's bytes onto a requeued job"
-        )
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 0
+        assert blobs.put_calls == 0, "published a superseded attempt's bytes onto a requeued job"
 
     def test_a_losing_attempt_cannot_withdraw_the_winners_marker(self, tmp_path):
         """The marker is ONE shared pathname under a job_root two dispatchers share.
@@ -1310,31 +1186,20 @@ class TestMarkerOwnership:
         leaving the winner's tree unprotected by the last-copy rule and its result invisible to
         the recovery sweep.
         """
-        from blastbox.host.jobs.retention import (
-            clear_pending_upload,
-            mark_pending_upload,
-        )
+        from blastbox.host.jobs.retention import clear_pending_upload, mark_pending_upload
 
         d = tmp_path / _JID
         d.mkdir()
         mark_pending_upload(tmp_path, _JID, logging.getLogger("t"), "the-winner")
 
-        clear_pending_upload(
-            tmp_path, _JID, "the-loser"
-        )  # a superseded attempt withdrawing
-        assert (d / PENDING_UPLOAD_SENTINEL).is_file(), (
-            "a loser deleted the winner's marker"
-        )
+        clear_pending_upload(tmp_path, _JID, "the-loser")     # a superseded attempt withdrawing
+        assert (d / PENDING_UPLOAD_SENTINEL).is_file(), "a loser deleted the winner's marker"
         assert (d / PENDING_UPLOAD_SENTINEL).read_text() == "the-winner"
 
-        clear_pending_upload(
-            tmp_path, _JID, "the-winner"
-        )  # the owner withdrawing its own
+        clear_pending_upload(tmp_path, _JID, "the-winner")    # the owner withdrawing its own
         assert not (d / PENDING_UPLOAD_SENTINEL).exists()
 
-    def test_a_result_uploaded_into_an_expiring_job_is_not_left_orphaned(
-        self, tmp_path
-    ):
+    def test_a_result_uploaded_into_an_expiring_job_is_not_left_orphaned(self, tmp_path):
         """Recovery and retention run in different processes over one store.
 
         If the row EXPIRES while we are uploading, our seal lands after retention's delete_job and
@@ -1342,14 +1207,13 @@ class TestMarkerOwnership:
         expires_at was cleared, so nothing will ever select it for deletion and nothing can serve
         it (open_output is DONE-gated). Undo our own write rather than orphan the bytes.
         """
-
         class ExpiresMidUpload(InMemoryJobStore):
             """FAILED when the sweep looks, EXPIRED by the time the repair CAS runs."""
 
             expired = False
 
             def update_if_status(self, job_id, expect_status, **kw):
-                type(self).expired = True  # retention won the race
+                type(self).expired = True         # retention won the race
                 return False
 
             def get(self, job_id):
@@ -1361,7 +1225,7 @@ class TestMarkerOwnership:
         store = ExpiresMidUpload()
         job = Job.new(engine="redtusk", filename="a.doc")
         job.job_id = _JID
-        job.status = JobStatus.FAILED  # ...until retention expires it mid-upload
+        job.status = JobStatus.FAILED             # ...until retention expires it mid-upload
         job.error = f"x; {RESULT_RETAINED_MARKER}"
         store.create(job)
         _sealed_tree(tmp_path, _JID)
@@ -1405,26 +1269,17 @@ class TestLegacyMigration:
         old = time.time() - 99_999
         for pth in sorted(d.rglob("*"), reverse=True) + [d]:
             os.utime(pth, (old, old))
-        assert (
-            reap_stale_scratch(
-                tmp_path, 60.0, store, logging.getLogger("t"), blob_store=blobs
-            )
-            == 0
-        )
+        assert reap_stale_scratch(tmp_path, 60.0, store, logging.getLogger("t"),
+                                  blob_store=blobs) == 0
 
         migrated, skipped, failed = migrate_legacy_results(
-            tmp_path, blobs, store, logging.getLogger("t")
-        )
+            tmp_path, blobs, store, logging.getLogger("t"))
         assert (migrated, failed) == (1, 0)
         assert blobs.has_output(_JID), "the legacy result is durable now"
 
         # After: it is redundant, so the sweep collects it — the disk finally comes back.
-        assert (
-            reap_stale_scratch(
-                tmp_path, 60.0, store, logging.getLogger("t"), blob_store=blobs
-            )
-            == 1
-        )
+        assert reap_stale_scratch(tmp_path, 60.0, store, logging.getLogger("t"),
+                                  blob_store=blobs) == 1
         assert not d.exists()
 
     def test_it_leaves_FAILED_jobs_to_the_recovery_sweep(self, tmp_path):
@@ -1439,9 +1294,7 @@ class TestLegacyMigration:
         _sealed_tree(tmp_path, _JID)
         blobs = _FakeBlobs()
 
-        assert migrate_legacy_results(
-            tmp_path, blobs, store, logging.getLogger("t")
-        ) == (0, 0, 0)
+        assert migrate_legacy_results(tmp_path, blobs, store, logging.getLogger("t")) == (0, 0, 0)
         assert blobs.put_calls == 0
 
     def test_dry_run_touches_nothing(self, tmp_path):
@@ -1454,8 +1307,7 @@ class TestLegacyMigration:
         blobs = _FakeBlobs()
 
         migrated, _, failed = migrate_legacy_results(
-            tmp_path, blobs, store, logging.getLogger("t"), dry_run=True
-        )
+            tmp_path, blobs, store, logging.getLogger("t"), dry_run=True)
         assert (migrated, failed) == (1, 0)
         assert blobs.put_calls == 0, "a dry run wrote to the blob store"
         assert not blobs.has_output(_JID)
@@ -1471,10 +1323,9 @@ class TestLegacyMigration:
         store.create(job)
         _sealed_tree(tmp_path, _JID, pending=False)
         blobs = _FakeBlobs()
-        blobs.stored[_JID] = ["metadata.json"]  # a previous run already migrated it
+        blobs.stored[_JID] = ["metadata.json"]          # a previous run already migrated it
 
         migrated, skipped, failed = migrate_legacy_results(
-            tmp_path, blobs, store, logging.getLogger("t")
-        )
+            tmp_path, blobs, store, logging.getLogger("t"))
         assert (migrated, skipped, failed) == (0, 1, 0)
         assert blobs.put_calls == 0, "re-uploaded a result that was already durable"

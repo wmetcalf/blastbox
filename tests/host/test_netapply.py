@@ -1,5 +1,4 @@
 """TDD tests for blastbox.host.netapply.docker_network_args."""
-
 from __future__ import annotations
 
 import logging
@@ -13,7 +12,6 @@ from blastbox.host.netpolicy import Personality
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
 
 def _p(
     exit_driver: str,
@@ -117,16 +115,11 @@ def test_resolv_tor_is_udp_not_use_vc():
 
 def _inspect_p(exit_driver: str, config: dict[str, str] | None = None) -> Personality:
     return Personality(
-        name=f"inspect-{exit_driver}",
-        exit_driver=exit_driver,
-        inspect=True,
-        config=config or {},
+        name=f"inspect-{exit_driver}", exit_driver=exit_driver, inspect=True, config=config or {}
     )
 
 
-@pytest.mark.parametrize(
-    "driver", ["direct", "inetsim", "tor", "socks", "openvpn", "wireguard"]
-)
+@pytest.mark.parametrize("driver", ["direct", "inetsim", "tor", "socks", "openvpn", "wireguard"])
 def test_inspect_egress_rides_bb_inspect(driver):
     # The worker faces the sslproxy/MITM gateway on bb-inspect, NOT the exit's own bridge. Every
     # route-inspectable egress driver qualifies (httpproxy does NOT — see below).
@@ -163,12 +156,9 @@ def test_httpproxy_without_inspect_still_rides_bb_socks():
 
 def test_inspect_routes_via_gateway_predicate():
     from blastbox.host.netapply import inspect_routes_via_gateway
-
     assert inspect_routes_via_gateway(_inspect_p("socks")) is True
     assert inspect_routes_via_gateway(_inspect_p("tor")) is True
-    assert (
-        inspect_routes_via_gateway(_inspect_p("httpproxy")) is False
-    )  # not route-inspectable
+    assert inspect_routes_via_gateway(_inspect_p("httpproxy")) is False  # not route-inspectable
     assert inspect_routes_via_gateway(_p("socks")) is False  # inspect not requested
 
 
@@ -182,9 +172,7 @@ def test_driver_set_consistency():
     assert netapply._EGRESS_DRIVERS <= valid
     assert netapply._SOCKS_DRIVERS <= netapply._EGRESS_DRIVERS
     assert netapply._RESOLV_DRIVERS <= valid
-    assert (
-        netapply._EGRESS_DRIVERS <= netapply._RESOLV_DRIVERS
-    )  # resolv covers egress + httpproxy
+    assert netapply._EGRESS_DRIVERS <= netapply._RESOLV_DRIVERS  # resolv covers egress + httpproxy
     assert set(netapply._BRIDGE_NETWORKS) <= valid
     # httpproxy is the one egress driver deliberately excluded from the route-inspectable set.
     assert "httpproxy" in valid and "httpproxy" not in netapply._EGRESS_DRIVERS
@@ -235,9 +223,7 @@ def test_resolv_none_for_no_egress_drivers(driver):
     assert worker_resolv_conf(_p(driver, config={"dns": "1.1.1.1"})) is None
 
 
-@pytest.mark.parametrize(
-    "driver", ["direct", "inetsim", "socks", "wireguard", "openvpn"]
-)
+@pytest.mark.parametrize("driver", ["direct", "inetsim", "socks", "wireguard", "openvpn"])
 def test_resolv_none_when_no_dns_configured(driver):
     # Opt-in: with no dns= the operator keeps docker's default resolv.conf (prior behavior).
     assert worker_resolv_conf(_p(driver)) is None

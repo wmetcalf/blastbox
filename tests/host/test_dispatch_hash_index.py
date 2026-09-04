@@ -5,7 +5,6 @@ store's `index_page_hashes` only when `supports_hash_search()` is True (PG+bktre
 no-op when the store lacks the capability (memory/redis) or has it but returns
 False (SQLite / plain Postgres), and never let an indexing error fail a DONE job.
 """
-
 from __future__ import annotations
 
 from blastbox.host.dispatch import Dispatcher, EngineSpec

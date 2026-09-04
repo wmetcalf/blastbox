@@ -1,5 +1,4 @@
 """Tests for blastbox.limits."""
-
 from __future__ import annotations
 
 import pytest
@@ -10,7 +9,6 @@ from blastbox.limits import Limits
 # ---------------------------------------------------------------------------
 # Default values are valid
 # ---------------------------------------------------------------------------
-
 
 def test_defaults_valid():
     lim = Limits()
@@ -28,50 +26,40 @@ def test_defaults_valid():
 # Bounds checking — zero/negative rejected
 # ---------------------------------------------------------------------------
 
-
-@pytest.mark.parametrize(
-    "field",
-    [
-        "memory_bytes",
-        "tmpfs_bytes",
-        "max_input_bytes",
-        "max_metadata_bytes",
-        "max_artifact_bytes",
-        "max_total_artifact_bytes",
-    ],
-)
+@pytest.mark.parametrize("field", [
+    "memory_bytes",
+    "tmpfs_bytes",
+    "max_input_bytes",
+    "max_metadata_bytes",
+    "max_artifact_bytes",
+    "max_total_artifact_bytes",
+])
 def test_byte_field_zero_rejected(field):
     with pytest.raises(ValueError, match=field):
         Limits(**{field: 0})
 
 
-@pytest.mark.parametrize(
-    "field",
-    [
-        "memory_bytes",
-        "tmpfs_bytes",
-        "max_input_bytes",
-        "max_metadata_bytes",
-        "max_artifact_bytes",
-        "max_total_artifact_bytes",
-    ],
-)
+@pytest.mark.parametrize("field", [
+    "memory_bytes",
+    "tmpfs_bytes",
+    "max_input_bytes",
+    "max_metadata_bytes",
+    "max_artifact_bytes",
+    "max_total_artifact_bytes",
+])
 def test_byte_field_negative_rejected(field):
     with pytest.raises(ValueError, match=field):
         Limits(**{field: -1})
 
 
-@pytest.mark.parametrize(
-    "field",
-    [
-        "memory_bytes",
-        "tmpfs_bytes",
-        "max_input_bytes",
-        "max_metadata_bytes",
-        "max_artifact_bytes",
-        "max_total_artifact_bytes",
-    ],
-)
+@pytest.mark.parametrize("field", [
+    "memory_bytes",
+    "tmpfs_bytes",
+    "max_input_bytes",
+    "max_metadata_bytes",
+    "max_artifact_bytes",
+    "max_total_artifact_bytes",
+])
 def test_byte_field_huge_rejected(field):
     # 1000 GiB is above the ceiling
     huge = 1000 * 1024 * 1024 * 1024
@@ -107,7 +95,6 @@ def test_max_artifacts_negative_rejected():
 # ---------------------------------------------------------------------------
 # from_env — parse env vars
 # ---------------------------------------------------------------------------
-
 
 def test_from_env_timeout(monkeypatch):
     monkeypatch.setenv("BLASTBOX_TIMEOUT", "120")
@@ -185,7 +172,6 @@ def test_from_env_bad_value_fails_loudly(monkeypatch):
 # ---------------------------------------------------------------------------
 # No engine-specific fields
 # ---------------------------------------------------------------------------
-
 
 def test_no_dpi_field():
     lim = Limits()

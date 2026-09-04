@@ -5,7 +5,6 @@ deterministically; a fake clock drives rate-limit/timeout logic.  The background
 thread is exercised only in test_9_stop_thread, keeping all other tests
 synchronous via tick().
 """
-
 from __future__ import annotations
 
 import pytest
@@ -92,10 +91,10 @@ def test_spawn_completing_after_stop_is_reaped_not_leaked() -> None:
     # _slots. Publishing it then would leak a live cloud instance -> reap it instead.
     rt = _FakeRuntime()
     pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
-    pool._stop_event.set()  # shutdown already in progress
-    pool._spawn_to_deficit(ready=True)  # a spawn completes while stopping
-    assert len(rt.reaped) == 1  # the just-created slot was reaped...
-    assert not pool._slots  # ...and never published (no leak)
+    pool._stop_event.set()                 # shutdown already in progress
+    pool._spawn_to_deficit(ready=True)     # a spawn completes while stopping
+    assert len(rt.reaped) == 1             # the just-created slot was reaped...
+    assert not pool._slots                 # ...and never published (no leak)
 
 
 def test_claim_prefers_fresh_liveness_when_runtime_provides_it() -> None:
@@ -108,20 +107,18 @@ def test_claim_prefers_fresh_liveness_when_runtime_provides_it() -> None:
             self.claim_checks = 0
 
         def is_alive(self, slot: Slot) -> bool:
-            return True  # background/tick view: still (cached) alive
+            return True                       # background/tick view: still (cached) alive
 
         def is_alive_for_claim(self, slot: Slot) -> bool:
             self.claim_checks += 1
-            return False  # fresh view: terminated since the last tick
+            return False                      # fresh view: terminated since the last tick
 
     rt = _FreshRuntime()
     pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
     pool._spawn_to_deficit(ready=True)
-    next(iter(pool._slots.values())).state = SlotState.IDLE  # make it claimable
-    assert (
-        pool._try_claim_one() is None
-    )  # dead-at-claim slot dropped, nothing handed out
-    assert rt.claim_checks == 1  # used the FRESH hand-out check, not is_alive
+    next(iter(pool._slots.values())).state = SlotState.IDLE   # make it claimable
+    assert pool._try_claim_one() is None      # dead-at-claim slot dropped, nothing handed out
+    assert rt.claim_checks == 1               # used the FRESH hand-out check, not is_alive
 
 
 def test_stop_budget_covers_spawn_plus_reap() -> None:
@@ -131,12 +128,8 @@ def test_stop_budget_covers_spawn_plus_reap() -> None:
     class _CfgRt(_FakeRuntime):
         cfg = type("C", (), {"cli_timeout_s": 120.0})()
 
-    assert (
-        WarmPool(runtime=_CfgRt(), warm_size=1)._default_stop_budget() == 270.0
-    )  # 2*120 + 30
-    assert (
-        WarmPool(runtime=_FakeRuntime(), warm_size=1)._default_stop_budget() == 150.0
-    )  # floor (no cli)
+    assert WarmPool(runtime=_CfgRt(), warm_size=1)._default_stop_budget() == 270.0   # 2*120 + 30
+    assert WarmPool(runtime=_FakeRuntime(), warm_size=1)._default_stop_budget() == 150.0   # floor (no cli)
 
 
 def test_stop_waits_for_inflight_spawn_then_reaps() -> None:
@@ -154,17 +147,15 @@ def test_stop_waits_for_inflight_spawn_then_reaps() -> None:
     rt = _SlowSpawn()
     pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
     pool.start()
-    assert entered.wait(
-        timeout=5
-    )  # daemon is inside spawn() (in-flight, not yet published)
+    assert entered.wait(timeout=5)                 # daemon is inside spawn() (in-flight, not yet published)
     st = threading.Thread(target=lambda: pool.stop(stop_timeout_s=10.0))
     st.start()
     time.sleep(0.3)
-    assert st.is_alive()  # stop() is WAITING for the in-flight spawn, not returning
-    release.set()  # let spawn finish -> daemon's post-spawn reap runs
+    assert st.is_alive()                           # stop() is WAITING for the in-flight spawn, not returning
+    release.set()                                  # let spawn finish -> daemon's post-spawn reap runs
     st.join(timeout=5)
     assert not st.is_alive()
-    assert len(rt.reaped) == 1  # the raced slot was reaped, not leaked
+    assert len(rt.reaped) == 1                      # the raced slot was reaped, not leaked
     assert not pool._slots
 
 
@@ -176,7 +167,7 @@ def test_stop_fast_path_returns_promptly() -> None:
     time.sleep(0.3)
     t0 = time.monotonic()
     pool.stop(stop_timeout_s=100.0)
-    assert time.monotonic() - t0 < 5.0  # returned fast, didn't burn the 100s ceiling
+    assert time.monotonic() - t0 < 5.0             # returned fast, didn't burn the 100s ceiling
 
 
 def test_stop_is_bounded_when_spawn_wedged() -> None:
@@ -186,7 +177,7 @@ def test_stop_is_bounded_when_spawn_wedged() -> None:
     class _WedgedSpawn(_FakeRuntime):
         def spawn(self) -> Slot:
             entered.set()
-            never.wait(timeout=10)  # not released by the test; daemon exits after 10s
+            never.wait(timeout=10)                 # not released by the test; daemon exits after 10s
             return super().spawn()
 
     rt = _WedgedSpawn()
@@ -196,7 +187,7 @@ def test_stop_is_bounded_when_spawn_wedged() -> None:
     t0 = time.monotonic()
     orphans = pool.stop(stop_timeout_s=1.0)
     dt = time.monotonic() - t0
-    assert 0.8 < dt < 5.0  # gave up ~1s (the ceiling), did NOT hang for 10s
+    assert 0.8 < dt < 5.0                           # gave up ~1s (the ceiling), did NOT hang for 10s
     # ...and the in-flight spawn is REPORTED as an orphan. It isn't in _slots yet, so len(_slots)
     # can't see it — the +1 for a wedged thread is the only thing that keeps the caller's node-budget
     # reservation alive for a worker that may still come up. (Previously untested: dropping the +1
@@ -211,14 +202,10 @@ def test_after_stop_spawn_tracks_slot_when_reap_fails() -> None:
     # matching every other reap-failure path (release/health/stop).
     rt = _ReapFailRuntime()
     pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
-    pool._stop_event.set()  # shutdown already in progress
-    pool._spawn_to_deficit(
-        ready=True
-    )  # a spawn completes while stopping; its reap raises
-    assert len(pool._slots) == 1  # tracked, not leaked
-    assert (
-        next(iter(pool._slots.values())).state == SlotState.DRAINING
-    )  # quarantined husk
+    pool._stop_event.set()                 # shutdown already in progress
+    pool._spawn_to_deficit(ready=True)     # a spawn completes while stopping; its reap raises
+    assert len(pool._slots) == 1           # tracked, not leaked
+    assert next(iter(pool._slots.values())).state == SlotState.DRAINING   # quarantined husk
 
 
 def test_release_quarantines_slot_when_reap_fails() -> None:
@@ -230,7 +217,7 @@ def test_release_quarantines_slot_when_reap_fails() -> None:
     slot = next(iter(pool._slots.values()))
     slot.state = SlotState.ASSIGNED
     pool.release(slot)
-    assert slot.slot_id in pool._slots  # NOT popped — quarantined
+    assert slot.slot_id in pool._slots                       # NOT popped — quarantined
     assert pool._slots[slot.slot_id].state == SlotState.DRAINING
 
 
@@ -250,21 +237,17 @@ def test_reap_and_count_skips_concurrent_double_dispose() -> None:
     pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
     slot = rt.spawn()
     owner_ret: list[bool] = []
-    t = threading.Thread(
-        target=lambda: owner_ret.append(pool._reap_and_count(slot)), daemon=True
-    )
+    t = threading.Thread(target=lambda: owner_ret.append(pool._reap_and_count(slot)), daemon=True)
     t.start()
-    assert entered.wait(timeout=5)  # first reap in-flight -> slot in _reaping
+    assert entered.wait(timeout=5)     # first reap in-flight -> slot in _reaping
     # concurrent second dispose must be a no-op that reports it did NOT dispose (False) -- so the caller
     # leaves the slot tracked instead of popping a slot whose real terminate might still fail.
     assert pool._reap_and_count(slot) is False
-    assert (
-        rt.reaped == []
-    )  # second call did NOT invoke a real reap (first still blocked)
+    assert rt.reaped == []             # second call did NOT invoke a real reap (first still blocked)
     release.set()
     t.join(timeout=5)
     assert rt.reaped == [slot.slot_id]  # exactly ONE real disposal
-    assert owner_ret == [True]  # the owning call reports it DID dispose
+    assert owner_ret == [True]          # the owning call reports it DID dispose
 
 
 def test_caller_keeps_slot_tracked_when_reap_skipped() -> None:
@@ -275,9 +258,9 @@ def test_caller_keeps_slot_tracked_when_reap_skipped() -> None:
     pool = WarmPool(runtime=rt, warm_size=1)
     pool._spawn_to_deficit(ready=True)
     slot = next(iter(pool._slots.values()))
-    pool._reap_and_count = lambda s, **kw: False  # type: ignore[assignment]  # simulate a concurrent skip
+    pool._reap_and_count = lambda s, **kw: False   # type: ignore[assignment]  # simulate a concurrent skip
     pool.retire(slot)
-    assert slot.slot_id in pool._slots  # left tracked for the owning thread, not popped
+    assert slot.slot_id in pool._slots   # left tracked for the owning thread, not popped
 
 
 class _FinalizeFailRuntime(_FakeRuntime):
@@ -299,8 +282,8 @@ def test_promote_warming_evicts_slot_reaped_during_finalize() -> None:
     ids = set(pool._slots.keys())
     assert len(ids) == 2
     pool._promote_warming()
-    assert pool.slot_count == 0  # both dead husks removed (not stuck DRAINING)
-    assert set(rt.reaped) == ids  # and they were reaped
+    assert pool.slot_count == 0          # both dead husks removed (not stuck DRAINING)
+    assert set(rt.reaped) == ids         # and they were reaped
 
 
 class _ExternallyDrainedReapFails(_FakeRuntime):
@@ -308,7 +291,7 @@ class _ExternallyDrainedReapFails(_FakeRuntime):
     WITHOUT reaping — and reap() then RAISES (the VM may still be running)."""
 
     def is_ready(self, slot: Slot) -> bool:
-        slot.state = SlotState.DRAINING  # external drain — NOT a runtime-internal reap
+        slot.state = SlotState.DRAINING   # external drain — NOT a runtime-internal reap
         return False
 
     def reap(self, slot: Slot) -> None:
@@ -324,7 +307,7 @@ def test_promote_warming_quarantines_externally_drained_slot_when_reap_fails() -
     pool._spawn_to_deficit(ready=True)
     sid = next(iter(pool._slots.keys()))
     pool._promote_warming()
-    assert sid in pool._slots  # reap raised → NOT popped, quarantined (still tracked)
+    assert sid in pool._slots            # reap raised → NOT popped, quarantined (still tracked)
 
 
 def test_health_check_quarantines_slot_when_reap_fails() -> None:
@@ -335,9 +318,9 @@ def test_health_check_quarantines_slot_when_reap_fails() -> None:
     pool._spawn_to_deficit(ready=True)
     sid = next(iter(pool._slots))
     pool._slots[sid].state = SlotState.IDLE
-    rt.set_alive(sid, False)  # mark it dead so _health_check tries to evict it
+    rt.set_alive(sid, False)            # mark it dead so _health_check tries to evict it
     pool._health_check()
-    assert sid in pool._slots  # NOT popped — quarantined
+    assert sid in pool._slots           # NOT popped — quarantined
     assert pool._slots[sid].state == SlotState.DRAINING
 
 
@@ -357,7 +340,7 @@ def test_promote_warming_quarantines_slot_when_is_ready_raises() -> None:
     pool._spawn_to_deficit(ready=True)
     sid = next(iter(pool._slots))
     pool._promote_warming()
-    assert sid in pool._slots  # NOT evicted — quarantined
+    assert sid in pool._slots                                # NOT evicted — quarantined
     assert pool._slots[sid].state == SlotState.DRAINING
 
 
@@ -498,9 +481,7 @@ def test_5_liveness_race() -> None:
 
     # Identify the two idle slot_ids and kill the first one
     with pool._lock:
-        idle_ids = [
-            s.slot_id for s in pool._slots.values() if s.state == SlotState.IDLE
-        ]
+        idle_ids = [s.slot_id for s in pool._slots.values() if s.state == SlotState.IDLE]
     assert len(idle_ids) == 2
 
     dead_id = idle_ids[0]
@@ -518,15 +499,13 @@ def test_5_liveness_race() -> None:
     # (issue #75: claim() never reaps inline — a wedged reap would block the claim path and, with
     # the warm-only gate, hold a slot reservation that locks peers out of healthy slots).
     with pool._lock:
-        assert (
-            pool._slots[dead_id].state == SlotState.DRAINING
-        )  # can't be handed out again
+        assert pool._slots[dead_id].state == SlotState.DRAINING   # can't be handed out again
         assert dead_id in pool._deferred_reap
-    assert dead_id not in rt.reaped  # not reaped on the claim path...
+    assert dead_id not in rt.reaped        # not reaped on the claim path...
     pool.tick()
-    _join_reaper(pool)  # disposal runs on the dedicated reaper thread
-    assert dead_id in rt.reaped  # ...disposed off the tick + claim paths instead
-    assert dead_id not in pool._slots  # and untracked once disposed
+    _join_reaper(pool)                     # disposal runs on the dedicated reaper thread
+    assert dead_id in rt.reaped            # ...disposed off the tick + claim paths instead
+    assert dead_id not in pool._slots      # and untracked once disposed
 
 
 # ---------------------------------------------------------------------------
@@ -536,8 +515,8 @@ def test_5_liveness_race() -> None:
 
 
 def test_6_no_double_claim() -> None:
-    N = 4  # idle slots available
-    M = 8  # threads racing to claim
+    N = 4   # idle slots available
+    M = 8   # threads racing to claim
 
     rt = _FakeRuntime()
     pool = WarmPool(runtime=rt, warm_size=N, concurrent_ceiling=N)
@@ -666,12 +645,10 @@ def test_stop_retains_slot_whose_reap_fails() -> None:
     pool = WarmPool(runtime=rt, warm_size=1)
     pool._spawn_to_deficit(ready=True)
     sid = next(iter(pool._slots.keys()))
-    pool._slots[sid].state = SlotState.IDLE  # an IDLE slot at stop time...
+    pool._slots[sid].state = SlotState.IDLE       # an IDLE slot at stop time...
     pool.stop()
-    assert sid in pool._slots  # NOT popped — quarantined for manual cleanup
-    assert (
-        pool._slots[sid].state == SlotState.DRAINING
-    )  # ...is now unclaimable (claim() picks IDLE)
+    assert sid in pool._slots                      # NOT popped — quarantined for manual cleanup
+    assert pool._slots[sid].state == SlotState.DRAINING  # ...is now unclaimable (claim() picks IDLE)
 
 
 def test_stop_marks_slots_draining_before_reaping() -> None:
@@ -691,13 +668,11 @@ def test_stop_marks_slots_draining_before_reaping() -> None:
     pool = WarmPool(runtime=rt, warm_size=2)
     pool._spawn_to_deficit(ready=True)
     for s in pool._slots.values():
-        s.state = SlotState.IDLE  # claimable before stop
+        s.state = SlotState.IDLE                   # claimable before stop
     ids = set(pool._slots.keys())
     pool.stop()
     assert set(rt.state_at_reap.keys()) == ids
-    assert all(
-        st == SlotState.DRAINING for st in rt.state_at_reap.values()
-    )  # never IDLE at reap
+    assert all(st == SlotState.DRAINING for st in rt.state_at_reap.values())  # never IDLE at reap
 
 
 # ---------------------------------------------------------------------------
@@ -764,7 +739,7 @@ def test_11_burst_never_exceeds_concurrent_ceiling() -> None:
 
     warm_size = 3
     burst_size = 5
-    ceiling = 4  # warm_size + burst_size would be 8 > ceiling
+    ceiling = 4   # warm_size + burst_size would be 8 > ceiling
 
     pool = WarmPool(
         runtime=rt,
@@ -817,8 +792,8 @@ def test_12_burst_spawn_to_deficit_uses_effective_target() -> None:
     pool._record_demand_miss()
     clock.advance(2.0)
     pool._record_demand_miss()
-    pool.tick()  # burst triggers + spawns to effective_target
-    pool.tick()  # promote warming → idle
+    pool.tick()   # burst triggers + spawns to effective_target
+    pool.tick()   # promote warming → idle
 
     assert pool.burst_active is True
     assert pool.idle_count == warm_size + burst_size
@@ -841,9 +816,7 @@ def test_13_health_check_evicts_dead_idle_slots() -> None:
 
     # Kill one slot without going through claim/release
     with pool._lock:
-        idle_ids = [
-            s.slot_id for s in pool._slots.values() if s.state == SlotState.IDLE
-        ]
+        idle_ids = [s.slot_id for s in pool._slots.values() if s.state == SlotState.IDLE]
     dead_id = idle_ids[0]
     rt.set_alive(dead_id, False)
 
@@ -854,8 +827,8 @@ def test_13_health_check_evicts_dead_idle_slots() -> None:
     assert dead_id in rt.reaped
 
     # After another tick the pool should have spawned a replacement
-    pool.tick()  # spawn replacement
-    pool.tick()  # promote to IDLE
+    pool.tick()   # spawn replacement
+    pool.tick()   # promote to IDLE
 
     # We should be back to warm_size idle slots
     assert pool.idle_count == 2
@@ -894,7 +867,7 @@ def test_15_is_healthy_true_during_warmup_grace() -> None:
     )
 
     pool.start()  # records _started_at
-    pool.tick()  # spawns but not ready
+    pool.tick()   # spawns but not ready
 
     # At t=0, within warmup grace → healthy
     assert pool.is_healthy() is True
@@ -943,11 +916,7 @@ def test_stuck_warming_slot_evicted_after_timeout() -> None:
     rt = _FakeRuntime()
     rt.set_default_ready_after(10**9)  # never becomes ready
     pool = WarmPool(
-        runtime=rt,
-        warm_size=1,
-        clock=clock,
-        spawn_rate_limit=100.0,
-        warming_timeout_s=60.0,
+        runtime=rt, warm_size=1, clock=clock, spawn_rate_limit=100.0, warming_timeout_s=60.0
     )
     pool.tick()  # spawn one WARMING slot (spawned_at = clock = 0)
     warming = [s for s in pool._slots.values() if s.state == SlotState.WARMING]
@@ -1081,17 +1050,15 @@ def test_release_does_not_republish_slot_drained_during_recycle() -> None:
     class _DrainDuringRecycle(_RecycleRuntime):
         def recycle(self, slot: Slot) -> None:
             super().recycle(slot)
-            slot.state = (
-                SlotState.DRAINING
-            )  # simulate stop() winning the race mid-recycle
+            slot.state = SlotState.DRAINING   # simulate stop() winning the race mid-recycle
 
     rt = _DrainDuringRecycle()
     pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, jobs_per_recycle=1)
     _warm_one(pool)
     s1 = pool.claim(timeout_s=1.0)
     assert s1 is not None
-    pool.release(s1)  # recycle drains it → must reap, NOT return to IDLE
-    assert rt.reaped == [s1.slot_id]  # fell through to the reap fail-safe
+    pool.release(s1)                          # recycle drains it → must reap, NOT return to IDLE
+    assert rt.reaped == [s1.slot_id]          # fell through to the reap fail-safe
     assert pool.claim(timeout_s=0.2) is None  # never republished as claimable
 
 
@@ -1112,13 +1079,8 @@ def test_reuse_returns_slot_to_idle_and_recycles_on_cadence() -> None:
 
 def test_reuse_reaps_at_max_jobs_per_slot() -> None:
     rt = _RecycleRuntime()
-    pool = WarmPool(
-        runtime=rt,
-        warm_size=1,
-        spawn_rate_limit=100.0,
-        jobs_per_recycle=1,
-        max_jobs_per_slot=2,
-    )
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0,
+                    jobs_per_recycle=1, max_jobs_per_slot=2)
     _warm_one(pool)
     s1 = pool.claim(timeout_s=1.0)
     pool.release(s1)  # job 1: reset (1%1==0), reused
@@ -1154,20 +1116,14 @@ def test_dirty_release_force_recycles_off_cadence() -> None:
     # A failed run (dirty=True) must reset the slot BEFORE reuse even on a non-boundary job, so the
     # next job never inherits a wedged/contaminated warm worker.
     rt = _RecycleRuntime()
-    pool = WarmPool(
-        runtime=rt, warm_size=1, spawn_rate_limit=100.0, jobs_per_recycle=10
-    )
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, jobs_per_recycle=10)
     _warm_one(pool)
     s1 = pool.claim(timeout_s=1.0)
     assert s1 is not None
-    pool.release(
-        s1, dirty=True
-    )  # job 1: 1 % 10 != 0 but DIRTY → force recycle, then back to IDLE
+    pool.release(s1, dirty=True)  # job 1: 1 % 10 != 0 but DIRTY → force recycle, then back to IDLE
     assert rt.recycled == [s1.slot_id] and rt.reaped == []
     s2 = pool.claim(timeout_s=1.0)
-    assert (
-        s2 is not None and s2.slot_id == s1.slot_id
-    )  # reset-in-place, same slot reused
+    assert s2 is not None and s2.slot_id == s1.slot_id  # reset-in-place, same slot reused
     pool.stop()
 
 
@@ -1186,14 +1142,12 @@ def test_resize_down_reaps_surplus_idle_slots() -> None:
     # regression (marla finding 3): lowering the target must proactively reap surplus IDLE
     # slots so a node-autosizer downsize actually frees resources — not just lazily.
     rt = _FakeRuntime()
-    pool = WarmPool(
-        runtime=rt, warm_size=4, concurrent_ceiling=8, spawn_rate_limit=1000.0
-    )
+    pool = WarmPool(runtime=rt, warm_size=4, concurrent_ceiling=8, spawn_rate_limit=1000.0)
     for _ in range(6):
-        pool.tick()  # spawn + promote WARMING→IDLE up to warm_size=4
+        pool.tick()                          # spawn + promote WARMING→IDLE up to warm_size=4
     assert pool.idle_count == 4 and pool.slot_count == 4
     pool.resize(warm_size=1, concurrent_ceiling=1)
-    pool.tick()  # should reap the 3 surplus IDLE slots
+    pool.tick()                              # should reap the 3 surplus IDLE slots
     assert pool.slot_count == 1
     assert len(rt.reaped) == 3
 
@@ -1204,21 +1158,19 @@ def test_spawn_stops_when_resize_lowers_ceiling_mid_batch() -> None:
     # per-spawn ceiling recheck must pick up the concurrent downsize and stop early, so the
     # pool never exceeds the new ceiling (a transient RAM overshoot on a tight node).
     rt = _FakeRuntime()
-    pool = WarmPool(
-        runtime=rt, warm_size=8, concurrent_ceiling=8, spawn_rate_limit=1000.0
-    )
+    pool = WarmPool(runtime=rt, warm_size=8, concurrent_ceiling=8, spawn_rate_limit=1000.0)
     orig_spawn = rt.spawn
     calls = {"n": 0}
 
     def racing_spawn() -> Slot:
         calls["n"] += 1
-        if calls["n"] == 1:  # a concurrent autosizer downsize mid-batch
+        if calls["n"] == 1:                       # a concurrent autosizer downsize mid-batch
             pool.resize(warm_size=2, concurrent_ceiling=2)
         return orig_spawn()
 
-    rt.spawn = racing_spawn  # type: ignore[method-assign]
-    pool._spawn_to_deficit(ready=True)  # would spawn 8 for the old ceiling
-    assert pool.slot_count <= 2  # but stopped at the lowered ceiling
+    rt.spawn = racing_spawn                        # type: ignore[method-assign]
+    pool._spawn_to_deficit(ready=True)            # would spawn 8 for the old ceiling
+    assert pool.slot_count <= 2                    # but stopped at the lowered ceiling
     pool.stop()
 
 
@@ -1228,21 +1180,19 @@ def test_spawn_reaps_slot_when_ceiling_drops_during_slow_spawn() -> None:
     # ceiling. The PUBLISH step must re-check and reap the completed slot rather than admit
     # it one past the new cap (RAM overshoot on a tight node).
     rt = _FakeRuntime()
-    pool = WarmPool(
-        runtime=rt, warm_size=2, concurrent_ceiling=2, spawn_rate_limit=1000.0
-    )
+    pool = WarmPool(runtime=rt, warm_size=2, concurrent_ceiling=2, spawn_rate_limit=1000.0)
     orig_spawn = rt.spawn
     calls = {"n": 0}
 
     def slow_spawn() -> Slot:
         calls["n"] += 1
-        if calls["n"] == 2:  # ceiling drops DURING the 2nd in-flight spawn
+        if calls["n"] == 2:                       # ceiling drops DURING the 2nd in-flight spawn
             pool.resize(warm_size=1, concurrent_ceiling=1)
         return orig_spawn()
 
-    rt.spawn = slow_spawn  # type: ignore[method-assign]
+    rt.spawn = slow_spawn                          # type: ignore[method-assign]
     pool._spawn_to_deficit(ready=True)
-    assert pool.slot_count == 1  # 1st published; 2nd reaped at publish (over cap)
+    assert pool.slot_count == 1                    # 1st published; 2nd reaped at publish (over cap)
     assert len(rt.reaped) >= 1
     pool.stop()
 
@@ -1254,9 +1204,7 @@ def test_reap_surplus_noop_until_autosized() -> None:
     # instead of being reaped the instant the effective target drops. Only a pool an
     # external controller has resize()d reaps surplus eagerly.
     rt = _FakeRuntime()
-    pool = WarmPool(
-        runtime=rt, warm_size=4, concurrent_ceiling=8, spawn_rate_limit=1000.0
-    )
+    pool = WarmPool(runtime=rt, warm_size=4, concurrent_ceiling=8, spawn_rate_limit=1000.0)
     for _ in range(6):
         pool.tick()
     assert pool.idle_count == 4
@@ -1264,7 +1212,7 @@ def test_reap_surplus_noop_until_autosized() -> None:
     # count, WITHOUT a resize() — i.e. this pool never opted into the autosizer.
     pool._warm_size = 1
     pool._reap_surplus()
-    assert pool.slot_count == 4 and rt.reaped == []  # cushion preserved, nothing reaped
+    assert pool.slot_count == 4 and rt.reaped == []       # cushion preserved, nothing reaped
     # once an external controller resize()s it, eager surplus reaping turns on
     pool.resize(warm_size=1, concurrent_ceiling=1)
     pool._reap_surplus()
@@ -1277,22 +1225,18 @@ def test_stop_returns_orphan_count_for_unreaped_slots() -> None:
     # running) so the caller keeps its node-budget reservation for the still-consumed RAM instead
     # of removing the snapshot and letting peers reallocate it. Clean stop → 0; failed reap → >0.
     rt = _ReapFailRuntime()
-    pool = WarmPool(
-        runtime=rt, warm_size=3, concurrent_ceiling=8, spawn_rate_limit=1000.0
-    )
+    pool = WarmPool(runtime=rt, warm_size=3, concurrent_ceiling=8, spawn_rate_limit=1000.0)
     for _ in range(6):
         pool.tick()
     assert pool.slot_count == 3
     orphans = pool.stop()
-    assert orphans == 3  # every reap raised → all 3 left tracked as orphans
+    assert orphans == 3                       # every reap raised → all 3 left tracked as orphans
 
     rt2 = _FakeRuntime()
-    pool2 = WarmPool(
-        runtime=rt2, warm_size=2, concurrent_ceiling=8, spawn_rate_limit=1000.0
-    )
+    pool2 = WarmPool(runtime=rt2, warm_size=2, concurrent_ceiling=8, spawn_rate_limit=1000.0)
     for _ in range(6):
         pool2.tick()
-    assert pool2.stop() == 0  # clean shutdown → no orphans
+    assert pool2.stop() == 0                   # clean shutdown → no orphans
 
 
 def test_resize_mark_autosized_false_keeps_legacy_behavior() -> None:
@@ -1302,21 +1246,17 @@ def test_resize_mark_autosized_false_keeps_legacy_behavior() -> None:
     # change the pool's behavior: a failed opt-in has to drain lazily exactly like an un-managed
     # pool. resize(mark_autosized=False) makes those moves a true no-op for reaping.
     rt = _FakeRuntime()
-    pool = WarmPool(
-        runtime=rt, warm_size=4, concurrent_ceiling=8, spawn_rate_limit=1000.0
-    )
+    pool = WarmPool(runtime=rt, warm_size=4, concurrent_ceiling=8, spawn_rate_limit=1000.0)
     for _ in range(6):
         pool.tick()
     assert pool.idle_count == 4
     # the CLI pre-shrink then restore-on-skip, both provisional:
     pool.resize(warm_size=0, concurrent_ceiling=1, mark_autosized=False)
     pool.resize(warm_size=4, concurrent_ceiling=8, mark_autosized=False)
-    assert pool._autosized is False  # never flipped into managed mode
-    pool._warm_size = 1  # target drops (as post-burst drain)
+    assert pool._autosized is False                       # never flipped into managed mode
+    pool._warm_size = 1                                    # target drops (as post-burst drain)
     pool._reap_surplus()
-    assert (
-        pool.slot_count == 4 and rt.reaped == []
-    )  # lazy drain preserved — nothing reaped
+    assert pool.slot_count == 4 and rt.reaped == []        # lazy drain preserved — nothing reaped
     pool.stop()
 
 
@@ -1324,17 +1264,15 @@ def test_reap_surplus_leaves_assigned_slots_untouched() -> None:
     # regression (round-2): surplus reaping must only take IDLE slots; a slot serving a
     # job (ASSIGNED) must never be reaped, even when it counts toward the surplus.
     rt = _FakeRuntime()
-    pool = WarmPool(
-        runtime=rt, warm_size=3, concurrent_ceiling=8, spawn_rate_limit=1000.0
-    )
+    pool = WarmPool(runtime=rt, warm_size=3, concurrent_ceiling=8, spawn_rate_limit=1000.0)
     for _ in range(6):
         pool.tick()
     assert pool.idle_count == 3
-    claimed = pool.claim(timeout_s=1.0)  # one slot IDLE -> ASSIGNED
+    claimed = pool.claim(timeout_s=1.0)               # one slot IDLE -> ASSIGNED
     assert claimed is not None and pool.assigned_count == 1
     pool.resize(warm_size=0, concurrent_ceiling=1)
-    pool.tick()  # reap surplus IDLE, NOT the assigned one
-    assert claimed.slot_id in pool._slots  # the in-flight slot survives
+    pool.tick()                                       # reap surplus IDLE, NOT the assigned one
+    assert claimed.slot_id in pool._slots             # the in-flight slot survives
     assert claimed.slot_id not in rt.reaped
 
 
@@ -1352,7 +1290,7 @@ def test_claim_not_blocked_by_a_hung_dead_slot_reap() -> None:
 
         def reap(self, slot: Slot) -> None:
             self.reap_entered.set()
-            release.wait(30)  # wedged disposal
+            release.wait(30)          # wedged disposal
             super().reap(slot)
 
     rt = _HungReapRuntime()
@@ -1361,20 +1299,14 @@ def test_claim_not_blocked_by_a_hung_dead_slot_reap() -> None:
     slots = list(pool._slots.values())
     for s in slots:
         s.state = SlotState.IDLE
-    rt.set_alive(
-        slots[0].slot_id, False
-    )  # first candidate is dead -> triggers the reap path
+    rt.set_alive(slots[0].slot_id, False)      # first candidate is dead -> triggers the reap path
 
     got: list = []
-    t = threading.Thread(
-        target=lambda: got.append(pool.claim(timeout_s=0.5)), daemon=True
-    )
+    t = threading.Thread(target=lambda: got.append(pool.claim(timeout_s=0.5)), daemon=True)
     t.start()
     t.join(10)
     try:
-        assert not t.is_alive(), (
-            "claim() blocked on the hung dead-slot reap (issue #75)"
-        )
+        assert not t.is_alive(), "claim() blocked on the hung dead-slot reap (issue #75)"
         # and it still hands out the OTHER, healthy slot rather than failing the caller
         assert got and got[0] is not None and got[0].slot_id == slots[1].slot_id
     finally:
@@ -1390,25 +1322,21 @@ def test_deferred_husk_is_disposed_and_replaced_without_blocking_the_tick() -> N
     # ceiling the replacement spawns on a LATER tick. Deliberate — an unconfirmed disposal may still
     # be a live worker holding node RAM, and this pool counts it rather than over-commit the node.
     rt = _FakeRuntime()
-    pool = WarmPool(
-        runtime=rt, warm_size=2, concurrent_ceiling=2, spawn_rate_limit=100.0
-    )
+    pool = WarmPool(runtime=rt, warm_size=2, concurrent_ceiling=2, spawn_rate_limit=100.0)
     pool._spawn_to_deficit(ready=True)
     slots = list(pool._slots.values())
     for s in slots:
         s.state = SlotState.IDLE
     rt.set_alive(slots[0].slot_id, False)
-    assert (
-        pool._try_claim_one() is not None
-    )  # hands out the healthy one, defers the dead
+    assert pool._try_claim_one() is not None          # hands out the healthy one, defers the dead
     assert slots[0].slot_id in pool._deferred_reap
 
-    pool.tick()  # kicks the reaper; does NOT block on it
+    pool.tick()                                        # kicks the reaper; does NOT block on it
     _join_reaper(pool)
-    assert slots[0].slot_id in rt.reaped  # husk disposed off the tick + claim paths
-    assert slots[0].slot_id not in pool._slots  # ...and untracked
+    assert slots[0].slot_id in rt.reaped               # husk disposed off the tick + claim paths
+    assert slots[0].slot_id not in pool._slots         # ...and untracked
 
-    pool.tick()  # headroom now really free -> replacement
+    pool.tick()                                        # headroom now really free -> replacement
     assert len(pool._slots) == 2, {s.slot_id: s.state for s in pool._slots.values()}
 
 
@@ -1430,7 +1358,7 @@ def test_stop_disposes_a_deferred_husk() -> None:
 def _join_reaper(pool, timeout: float = 5.0) -> None:
     """Wait for the dedicated deferred-reap thread (issue #75 disposal is asynchronous)."""
     for entry in list(getattr(pool, "_reaper_threads", [])):
-        entry[0].join(timeout)  # entry = [thread, last_progress_at, retired]
+        entry[0].join(timeout)   # entry = [thread, last_progress_at, retired]
 
 
 class _CachedLivenessRuntime(_FakeRuntime):
@@ -1441,9 +1369,7 @@ class _CachedLivenessRuntime(_FakeRuntime):
     the (possibly wedged) reap on the tick loop would trade one stalled claim for a whole-tier stall.
     """
 
-    def __init__(
-        self, hang: threading.Event | None = None, probe_delay: float = 0.0
-    ) -> None:
+    def __init__(self, hang: threading.Event | None = None, probe_delay: float = 0.0) -> None:
         super().__init__()
         self.fresh_dead: set[str] = set()
         self._hang = hang
@@ -1456,7 +1382,7 @@ class _CachedLivenessRuntime(_FakeRuntime):
     def set_reap_delay(self, seconds: float) -> None:
         self._reap_delay = seconds
 
-    def is_alive(self, slot: Slot) -> bool:  # background/tick view: still cached-alive
+    def is_alive(self, slot: Slot) -> bool:          # background/tick view: still cached-alive
         return True
 
     def is_alive_for_claim(self, slot: Slot) -> bool:
@@ -1465,15 +1391,11 @@ class _CachedLivenessRuntime(_FakeRuntime):
         return slot.slot_id not in self.fresh_dead
 
     def reap(self, slot: Slot) -> None:
-        wedge = (
-            (slot.slot_id == self.hang_slot)
-            if self.hang_slot
-            else (slot.slot_id in self.fresh_dead)
-        )
+        wedge = (slot.slot_id == self.hang_slot) if self.hang_slot else (slot.slot_id in self.fresh_dead)
         if self._hang is not None and wedge:
-            self._hang.wait(20)  # wedged disposal
+            self._hang.wait(20)                       # wedged disposal
         if self._reap_delay:
-            time.sleep(self._reap_delay)  # slow-but-working disposal
+            time.sleep(self._reap_delay)              # slow-but-working disposal
         super().reap(slot)
 
 
@@ -1487,17 +1409,13 @@ def test_pool_keeps_serving_while_a_deferred_reap_is_wedged() -> None:
     pool._spawn_to_deficit(ready=True)
     pool._promote_warming()
     slots = list(pool._slots.values())
-    rt.fresh_dead.add(slots[0].slot_id)  # dead only to the FRESH hand-out check
+    rt.fresh_dead.add(slots[0].slot_id)               # dead only to the FRESH hand-out check
     pool.start()
     try:
-        assert (
-            pool.claim(timeout_s=1.0) is not None
-        )  # defers the husk, hands out the healthy slot
-        time.sleep(0.4)  # ticks run while the reaper is wedged
+        assert pool.claim(timeout_s=1.0) is not None  # defers the husk, hands out the healthy slot
+        time.sleep(0.4)                               # ticks run while the reaper is wedged
         # the tier is STILL serving: maintenance ran and a replacement is available
-        assert pool.claim(timeout_s=1.0) is not None, (
-            "pool stopped serving while a reap was wedged"
-        )
+        assert pool.claim(timeout_s=1.0) is not None, "pool stopped serving while a reap was wedged"
     finally:
         hang.set()
         pool.stop()
@@ -1508,13 +1426,11 @@ def test_claim_scan_is_bounded_when_every_probe_stalls() -> None:
     # up to cli_timeout_s on the cloud tiers. N dead slots must not hold the caller (and its
     # warm-gate reservation, #72) for N x probe. The rescan is deadline-bounded with a grace floor.
     rt = _CachedLivenessRuntime(probe_delay=0.4)
-    pool = WarmPool(
-        runtime=rt, warm_size=10, concurrent_ceiling=10, spawn_rate_limit=1000.0
-    )
+    pool = WarmPool(runtime=rt, warm_size=10, concurrent_ceiling=10, spawn_rate_limit=1000.0)
     pool._spawn_to_deficit(ready=True)
     pool._promote_warming()
     for s in pool._slots.values():
-        rt.fresh_dead.add(s.slot_id)  # every slot dead at hand-out
+        rt.fresh_dead.add(s.slot_id)                  # every slot dead at hand-out
     t0 = time.monotonic()
     assert pool.claim(timeout_s=0.05) is None
     elapsed = time.monotonic() - t0
@@ -1536,12 +1452,12 @@ def test_stop_racing_the_reaper_does_not_double_terminate() -> None:
     pool._promote_warming()
     slots = list(pool._slots.values())
     for s in slots[:2]:
-        rt.fresh_dead.add(s.slot_id)  # two husks; the reaper wedges on the first
-    rt.hang_slot = slots[0].slot_id  # ONLY the first wedges (stop() must stay free)
+        rt.fresh_dead.add(s.slot_id)                  # two husks; the reaper wedges on the first
+    rt.hang_slot = slots[0].slot_id                   # ONLY the first wedges (stop() must stay free)
     pool._try_claim_one()
     pool._reap_deferred()
     time.sleep(0.2)
-    pool.stop(stop_timeout_s=1.0)  # bounded: don't burn the 150s default budget
+    pool.stop(stop_timeout_s=1.0)                     # bounded: don't burn the 150s default budget
     hang.set()
     _join_reaper(pool)
     assert len(rt.reaped) == len(set(rt.reaped)), f"double-terminated: {rt.reaped}"
@@ -1562,14 +1478,10 @@ def test_stop_waits_for_a_reaper_mid_terminate() -> None:
     rt.hang_slot = slots[0].slot_id
     pool._try_claim_one()
     pool._reap_deferred()
-    time.sleep(0.15)  # reaper is now inside the wedged terminate
-    threading.Timer(
-        0.4, release.set
-    ).start()  # it completes shortly after stop() begins
+    time.sleep(0.15)                               # reaper is now inside the wedged terminate
+    threading.Timer(0.4, release.set).start()      # it completes shortly after stop() begins
     orphans = pool.stop(stop_timeout_s=5)
-    assert slots[0].slot_id in rt.reaped, (
-        "stop() left a worker the reaper was mid-terminate on"
-    )
+    assert slots[0].slot_id in rt.reaped, "stop() left a worker the reaper was mid-terminate on"
     assert orphans == 0
 
 
@@ -1586,7 +1498,7 @@ def test_concurrent_ticks_never_exceed_the_reaper_bound() -> None:
     created: list[int] = []
     real_thread = threading.Thread
 
-    class _CountingThread(real_thread):  # type: ignore[misc,valid-type]
+    class _CountingThread(real_thread):     # type: ignore[misc,valid-type]
         def __init__(self, *a, **k):
             super().__init__(*a, **k)
             if k.get("name") == "blastbox-pool-reaper":
@@ -1594,15 +1506,13 @@ def test_concurrent_ticks_never_exceed_the_reaper_bound() -> None:
 
     class _GatedRuntime(_FakeRuntime):
         def reap(self, slot: Slot) -> None:
-            gate.wait(10)  # hold every reaper alive for the whole race
+            gate.wait(10)                    # hold every reaper alive for the whole race
             super().reap(slot)
 
     rt = _GatedRuntime()
-    pool = WarmPool(
-        runtime=rt, warm_size=12, concurrent_ceiling=12, spawn_rate_limit=1000.0
-    )
+    pool = WarmPool(runtime=rt, warm_size=12, concurrent_ceiling=12, spawn_rate_limit=1000.0)
     pool._spawn_to_deficit(ready=True)
-    for slot in pool._slots.values():  # a queue deep enough to want many reapers
+    for slot in pool._slots.values():        # a queue deep enough to want many reapers
         slot.state = SlotState.DRAINING
         with pool._lock:
             pool._deferred_reap.add(slot.slot_id)
@@ -1615,8 +1525,7 @@ def test_concurrent_ticks_never_exceed_the_reaper_bound() -> None:
         for t in kicks:
             t.join(5)
         assert len(created) <= pool._MAX_REAPERS, (
-            f"spawned {len(created)} reapers, bound is {pool._MAX_REAPERS}"
-        )
+            f"spawned {len(created)} reapers, bound is {pool._MAX_REAPERS}")
     finally:
         pool_mod.threading.Thread = real_thread
         gate.set()
@@ -1633,13 +1542,11 @@ def test_require_tracked_refuses_to_reap_an_untracked_slot() -> None:
     pool._spawn_to_deficit(ready=True)
     slot = next(iter(pool._slots.values()))
 
-    with pool._lock:  # simulate: another path already disposed + popped it
+    with pool._lock:                          # simulate: another path already disposed + popped it
         pool._slots.pop(slot.slot_id, None)
 
     assert pool._reap_and_count(slot, require_tracked=True) is False
-    assert slot.slot_id not in rt.reaped, (
-        "re-terminated a slot that was already disposed"
-    )
+    assert slot.slot_id not in rt.reaped, "re-terminated a slot that was already disposed"
     # ...while the default (untracked-tolerant) call still disposes, as every other path relies on
     assert pool._reap_and_count(slot) is True
     assert slot.slot_id in rt.reaped
@@ -1662,15 +1569,11 @@ def test_wedged_reaper_does_not_inflate_the_orphan_count() -> None:
     pool._reap_deferred()
     time.sleep(0.2)
     try:
-        orphans = pool.stop(stop_timeout_s=0.5)  # reaper still wedged -> join expires
+        orphans = pool.stop(stop_timeout_s=0.5)       # reaper still wedged -> join expires
         # ABSOLUTE, not `orphans == len(_slots)` — that is a tautology (both sides read the same
         # dict), so any mutation dropping the slot satisfies it while under-reporting the orphan.
-        assert orphans == 1, (
-            f"expected exactly 1 orphan (the wedged live worker), got {orphans}"
-        )
-        assert slot.slot_id in pool._slots, (
-            "the wedged reaper's slot must remain tracked"
-        )
+        assert orphans == 1, f"expected exactly 1 orphan (the wedged live worker), got {orphans}"
+        assert slot.slot_id in pool._slots, "the wedged reaper's slot must remain tracked"
     finally:
         hang.set()
         _join_reaper(pool)
@@ -1683,25 +1586,21 @@ def test_mass_slot_death_drains_in_parallel() -> None:
     # reaper pool must keep recovery parallel.
     rt = _CachedLivenessRuntime()
     n = 8
-    pool = WarmPool(
-        runtime=rt, warm_size=n, concurrent_ceiling=n, spawn_rate_limit=1000.0
-    )
+    pool = WarmPool(runtime=rt, warm_size=n, concurrent_ceiling=n, spawn_rate_limit=1000.0)
     pool._spawn_to_deficit(ready=True)
     pool._promote_warming()
     for s in pool._slots.values():
         rt.fresh_dead.add(s.slot_id)
     slow = 0.3
     rt.set_reap_delay(slow)
-    pool._try_claim_one()  # discovers + defers all of them
+    pool._try_claim_one()                              # discovers + defers all of them
     t0 = time.monotonic()
     pool.tick()
     _join_reaper(pool, timeout=60)
     elapsed = time.monotonic() - t0
     assert len(rt.reaped) == n, rt.reaped
     # parallel across _MAX_REAPERS -> well under the serial n*slow
-    assert elapsed < n * slow * 0.75, (
-        f"drain looks serial: {elapsed:.2f}s for {n} x {slow}s"
-    )
+    assert elapsed < n * slow * 0.75, f"drain looks serial: {elapsed:.2f}s for {n} x {slow}s"
 
 
 def test_stop_clears_the_deferred_queue_so_a_restart_cannot_re_terminate() -> None:
@@ -1730,7 +1629,7 @@ def test_stop_budget_is_shared_between_tick_thread_and_reaper() -> None:
     class _BothWedged(_CachedLivenessRuntime):
         def spawn(self) -> Slot:
             slot = super().spawn()
-            if self.fresh_dead:  # wedge only AFTER the first slot exists
+            if self.fresh_dead:              # wedge only AFTER the first slot exists
                 spawn_gate.wait(20)
             return slot
 
@@ -1739,23 +1638,22 @@ def test_stop_budget_is_shared_between_tick_thread_and_reaper() -> None:
     pool._spawn_to_deficit(ready=True)
     pool._promote_warming()
     slot = next(iter(pool._slots.values()))
-    rt.fresh_dead.add(slot.slot_id)  # from here spawns wedge too
+    rt.fresh_dead.add(slot.slot_id)          # from here spawns wedge too
     rt.hang_slot = slot.slot_id
-    pool._try_claim_one()  # defer the husk
-    pool._reap_deferred()  # reaper wedges in reap
-    pool.start()  # tick thread wedges in spawn
+    pool._try_claim_one()                    # defer the husk
+    pool._reap_deferred()                    # reaper wedges in reap
+    pool.start()                             # tick thread wedges in spawn
     time.sleep(0.3)
     try:
         t0 = time.monotonic()
-        pool.stop(stop_timeout_s=0.5)  # BOTH wedged: must stay within ONE budget
+        pool.stop(stop_timeout_s=0.5)        # BOTH wedged: must stay within ONE budget
         elapsed = time.monotonic() - t0
-        assert elapsed < 1.0, (
-            f"shutdown took {elapsed:.2f}s on a 0.5s budget (double-charged?)"
-        )
+        assert elapsed < 1.0, f"shutdown took {elapsed:.2f}s on a 0.5s budget (double-charged?)"
     finally:
         spawn_gate.set()
         reap_gate.set()
         _join_reaper(pool)
+
 
 
 def test_successful_reap_pops_under_the_ownership_lock() -> None:
@@ -1770,9 +1668,7 @@ def test_successful_reap_pops_under_the_ownership_lock() -> None:
 
     assert pool._reap_and_count(slot, pop_on_success=True) is True
     with pool._lock:
-        assert (
-            slot.slot_id not in pool._slots
-        )  # untracked atomically with the ownership release
+        assert slot.slot_id not in pool._slots      # untracked atomically with the ownership release
         assert slot.slot_id not in pool._reaping
 
 
@@ -1791,9 +1687,7 @@ def test_pop_on_success_keeps_a_failed_reap_quarantined() -> None:
     except RuntimeError:
         pass
     with pool._lock:
-        assert slot.slot_id in pool._slots, (
-            "a FAILED reap must stay tracked (quarantined)"
-        )
+        assert slot.slot_id in pool._slots, "a FAILED reap must stay tracked (quarantined)"
         assert slot.slot_id not in pool._reaping, "ownership must still be released"
 
 
@@ -1804,9 +1698,7 @@ def test_dead_reapers_are_pruned_so_the_queue_keeps_draining() -> None:
     # in _deferred_reap holding ceiling headroom — the tier quietly stops replacing slots.
     # More rounds than _MAX_REAPERS, so an unpruned list would stall partway through.
     rt = _CachedLivenessRuntime()
-    pool = WarmPool(
-        runtime=rt, warm_size=1, concurrent_ceiling=4, spawn_rate_limit=1000.0
-    )
+    pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=4, spawn_rate_limit=1000.0)
     rounds = 6
     assert rounds > pool._MAX_REAPERS
     for _ in range(rounds):
@@ -1815,14 +1707,12 @@ def test_dead_reapers_are_pruned_so_the_queue_keeps_draining() -> None:
         idle = [s for s in pool._slots.values() if s.state == SlotState.IDLE]
         assert idle, "expected a fresh IDLE slot each round"
         rt.fresh_dead.add(idle[0].slot_id)
-        pool._try_claim_one()  # defers it
+        pool._try_claim_one()                    # defers it
         pool._reap_deferred()
         _join_reaper(pool)
     assert len(rt.reaped) == rounds, f"only {len(rt.reaped)}/{rounds} husks disposed"
     with pool._lock:
-        assert not pool._deferred_reap, (
-            f"queue stalled with {len(pool._deferred_reap)} husks"
-        )
+        assert not pool._deferred_reap, f"queue stalled with {len(pool._deferred_reap)} husks"
 
 
 def test_drain_passes_both_guards_to_the_reap_primitive() -> None:
@@ -1844,7 +1734,7 @@ def test_drain_passes_both_guards_to_the_reap_primitive() -> None:
         seen.append(kw)
         return real(s, **kw)
 
-    pool._reap_and_count = _spy  # type: ignore[method-assign]
+    pool._reap_and_count = _spy            # type: ignore[method-assign]
     pool._drain_deferred_reaps()
     assert seen, "the drain never reached the reap primitive"
     assert seen[0].get("require_tracked") is True, seen[0]
@@ -1860,7 +1750,7 @@ def _spy_reap_kwargs(pool):
         seen.append(kw)
         return real(slot, **kw)
 
-    pool._reap_and_count = _spy  # type: ignore[method-assign]
+    pool._reap_and_count = _spy            # type: ignore[method-assign]
     return seen
 
 
@@ -1877,7 +1767,6 @@ def _assert_guarded(seen, path: str) -> None:
 # released — two windows in which a concurrent stop() terminates the same worker a second time.
 # These pin each CALL SITE (mutation-proven: stripping the kwargs from any one of them used to
 # leave the whole suite green).
-
 
 def test_release_passes_both_reap_guards() -> None:
     rt = _FakeRuntime()
@@ -1903,14 +1792,10 @@ def test_retire_passes_both_reap_guards() -> None:
 
 def test_reap_surplus_passes_both_reap_guards() -> None:
     rt = _FakeRuntime()
-    pool = WarmPool(
-        runtime=rt, warm_size=4, concurrent_ceiling=4, spawn_rate_limit=1000.0
-    )
+    pool = WarmPool(runtime=rt, warm_size=4, concurrent_ceiling=4, spawn_rate_limit=1000.0)
     pool._spawn_to_deficit(ready=True)
     pool._promote_warming()
-    pool.resize(
-        warm_size=1, concurrent_ceiling=1
-    )  # marks the pool autosized -> surplus reaping
+    pool.resize(warm_size=1, concurrent_ceiling=1)      # marks the pool autosized -> surplus reaping
     seen = _spy_reap_kwargs(pool)
     pool._reap_surplus()
     _assert_guarded(seen, "_reap_surplus()")
@@ -1922,7 +1807,7 @@ def test_health_check_passes_both_reap_guards() -> None:
     pool._spawn_to_deficit(ready=True)
     pool._promote_warming()
     slot = next(iter(pool._slots.values()))
-    rt.set_alive(slot.slot_id, False)  # dead IDLE slot -> health eviction
+    rt.set_alive(slot.slot_id, False)                   # dead IDLE slot -> health eviction
     seen = _spy_reap_kwargs(pool)
     pool._health_check()
     _assert_guarded(seen, "_health_check()")
@@ -1935,7 +1820,7 @@ def test_promote_warming_passes_both_reap_guards() -> None:
     # DURING the loop — exactly what a concurrent stop() does — so flip it inside is_ready().
     class _NotReadyFlipsToDraining(_FakeRuntime):
         def is_ready(self, slot: Slot) -> bool:
-            slot.state = SlotState.DRAINING  # a concurrent stop() flips it mid-promote
+            slot.state = SlotState.DRAINING    # a concurrent stop() flips it mid-promote
             return False
 
     rt = _NotReadyFlipsToDraining()
@@ -1946,8 +1831,6 @@ def test_promote_warming_passes_both_reap_guards() -> None:
     seen = _spy_reap_kwargs(pool)
     pool._promote_warming()
     _assert_guarded(seen, "_promote_warming()")
-
-
 def test_wedged_reapers_stop_counting_so_the_queue_keeps_draining() -> None:
     # issue #77: a wedged runtime.reap can't be killed, but it must not hold a slot in the reaper
     # pool forever — _MAX_REAPERS stuck disposals would otherwise stop the queue draining for the
@@ -1958,27 +1841,25 @@ def test_wedged_reapers_stop_counting_so_the_queue_keeps_draining() -> None:
     # even with the watchdog removed).
     hang = threading.Event()
     rt = _CachedLivenessRuntime(hang=hang)
-    pool = WarmPool(
-        runtime=rt, warm_size=8, concurrent_ceiling=8, spawn_rate_limit=1000.0
-    )
-    pool._REAPER_WEDGED_AFTER_S = 0.2  # shrink the watchdog for the test
+    pool = WarmPool(runtime=rt, warm_size=8, concurrent_ceiling=8, spawn_rate_limit=1000.0)
+    pool._REAPER_WEDGED_AFTER_S = 0.2                 # shrink the watchdog for the test
     pool._spawn_to_deficit(ready=True)
     pool._promote_warming()
     slots = list(pool._slots.values())
-    wedged = slots[: pool._MAX_REAPERS]
-    healthy = slots[pool._MAX_REAPERS :]
+    wedged = slots[:pool._MAX_REAPERS]
+    healthy = slots[pool._MAX_REAPERS:]
     assert healthy, "need slots beyond the reaper cap"
-    rt.fresh_dead = {s.slot_id for s in wedged}  # ONLY these block inside reap()
+    rt.fresh_dead = {s.slot_id for s in wedged}       # ONLY these block inside reap()
 
     try:
-        for s in wedged:  # queue the wedging ones FIRST
+        for s in wedged:                              # queue the wedging ones FIRST
             with pool._lock:
                 s.state = SlotState.DRAINING
                 pool._deferred_reap.add(s.slot_id)
         pool._reap_deferred()
-        time.sleep(0.35)  # all reapers now blocked, past the watchdog
+        time.sleep(0.35)                              # all reapers now blocked, past the watchdog
 
-        for s in healthy:  # now the ones that must still get disposed
+        for s in healthy:                             # now the ones that must still get disposed
             with pool._lock:
                 s.state = SlotState.DRAINING
                 pool._deferred_reap.add(s.slot_id)
@@ -1986,12 +1867,11 @@ def test_wedged_reapers_stop_counting_so_the_queue_keeps_draining() -> None:
         want = {s.slot_id for s in healthy}
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline and not want.issubset(set(rt.reaped)):
-            pool._reap_deferred()  # must be ALLOWED to start more reapers
+            pool._reap_deferred()                     # must be ALLOWED to start more reapers
             time.sleep(0.05)
         assert want.issubset(set(rt.reaped)), (
             f"queue stalled behind {len(wedged)} wedged reapers: "
-            f"{len(set(rt.reaped) & want)}/{len(want)} disposed"
-        )
+            f"{len(set(rt.reaped) & want)}/{len(want)} disposed")
     finally:
         hang.set()
         _join_reaper(pool)
@@ -2008,15 +1888,12 @@ def test_hand_out_probe_is_always_inline_never_threaded() -> None:
     made: list[str] = []
     real_thread = threading.Thread
 
-    class _CountingThread(real_thread):  # type: ignore[misc,valid-type]
+    class _CountingThread(real_thread):     # type: ignore[misc,valid-type]
         def __init__(self, *a, **k):
             super().__init__(*a, **k)
             made.append(k.get("name") or "")
 
-    for rt in (
-        _FakeRuntime(),
-        _CachedLivenessRuntime(),
-    ):  # without AND with the remote seam
+    for rt in (_FakeRuntime(), _CachedLivenessRuntime()):   # without AND with the remote seam
         pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
         pool._spawn_to_deficit(ready=True)
         pool._promote_warming()
@@ -2028,9 +1905,7 @@ def test_hand_out_probe_is_always_inline_never_threaded() -> None:
             pool_mod.threading.Thread = real_thread
         # Assert on the PROPERTY (no thread at all), not on a name — a watchdog reintroduced
         # under any other thread name would otherwise slip past this regression test.
-        assert made == [], (
-            f"_try_claim_one created thread(s) for {type(rt).__name__}: {made}"
-        )
+        assert made == [], f"_try_claim_one created thread(s) for {type(rt).__name__}: {made}"
 
 
 def test_total_reaper_threads_are_hard_capped_even_when_all_are_wedged() -> None:
@@ -2046,12 +1921,8 @@ def test_total_reaper_threads_are_hard_capped_even_when_all_are_wedged() -> None
 
     rt = _NeverReaps()
     n = 80
-    pool = WarmPool(
-        runtime=rt, warm_size=n, concurrent_ceiling=n, spawn_rate_limit=10000.0
-    )
-    pool._REAPER_WEDGED_AFTER_S = (
-        0.02  # every reaper counts as wedged almost immediately
-    )
+    pool = WarmPool(runtime=rt, warm_size=n, concurrent_ceiling=n, spawn_rate_limit=10000.0)
+    pool._REAPER_WEDGED_AFTER_S = 0.02        # every reaper counts as wedged almost immediately
     pool._spawn_to_deficit(ready=True)
     pool._promote_warming()
     with pool._lock:
@@ -2059,15 +1930,12 @@ def test_total_reaper_threads_are_hard_capped_even_when_all_are_wedged() -> None
             slot.state = SlotState.DRAINING
             pool._deferred_reap.add(sid)
     try:
-        for _ in range(60):  # hammer the kick; watchdog keeps freeing slots
+        for _ in range(60):                    # hammer the kick; watchdog keeps freeing slots
             pool._reap_deferred()
             time.sleep(0.02)
-        alive = sum(
-            1 for t in threading.enumerate() if t.name == "blastbox-pool-reaper"
-        )
+        alive = sum(1 for t in threading.enumerate() if t.name == "blastbox-pool-reaper")
         assert alive <= pool._MAX_REAPER_THREADS, (
-            f"{alive} live reapers exceeds the hard cap of {pool._MAX_REAPER_THREADS}"
-        )
+            f"{alive} live reapers exceeds the hard cap of {pool._MAX_REAPER_THREADS}")
     finally:
         hang.set()
         _join_reaper(pool, timeout=10)
@@ -2081,15 +1949,13 @@ def test_a_reaper_making_progress_is_not_treated_as_wedged() -> None:
     # the queue drains first and the test passes even with progress-tracking removed.
     class _SlowButWorking(_FakeRuntime):
         def reap(self, slot: Slot) -> None:
-            time.sleep(0.05)  # working, just not instant
+            time.sleep(0.05)                    # working, just not instant
             super().reap(slot)
 
     rt = _SlowButWorking()
     n = 40
-    pool = WarmPool(
-        runtime=rt, warm_size=n, concurrent_ceiling=n, spawn_rate_limit=10000.0
-    )
-    pool._MAX_REAPERS = 1  # exactly ONE reaper may make progress
+    pool = WarmPool(runtime=rt, warm_size=n, concurrent_ceiling=n, spawn_rate_limit=10000.0)
+    pool._MAX_REAPERS = 1                       # exactly ONE reaper may make progress
     # Watchdog LONGER than one reap (0.05s) but far shorter than the whole drain (40 x 0.05 = 2s):
     # a progressing reaper stamps every ~0.05s so it never looks stalled, while age-based detection
     # would flag it after 0.3s. (A watchdog shorter than one reap would flag even a working reaper
@@ -2103,15 +1969,14 @@ def test_a_reaper_making_progress_is_not_treated_as_wedged() -> None:
             pool._deferred_reap.add(sid)
 
     try:
-        pool._reap_deferred()  # start the single reaper
-        for _ in range(12):  # keep kicking well past the watchdog window
+        pool._reap_deferred()                   # start the single reaper
+        for _ in range(12):                     # keep kicking well past the watchdog window
             time.sleep(0.1)
             pool._reap_deferred()
             with pool._lock:
                 assert len(pool._reaper_threads) <= 1, (
                     f"a progressing reaper was misread as wedged: "
-                    f"{len(pool._reaper_threads)} reapers for _MAX_REAPERS=1"
-                )
+                    f"{len(pool._reaper_threads)} reapers for _MAX_REAPERS=1")
     finally:
         _join_reaper(pool, timeout=15)
 
@@ -2121,7 +1986,7 @@ class _UnknownProbeRuntime(_FakeRuntime):
     redesign turns on. Nothing else in the suite ever returns None, so the pool's whole UNKNOWN
     branch was dead code under test (mutations that deleted or inverted it all survived)."""
 
-    def __init__(self) -> None:  # noqa: D107
+    def __init__(self) -> None:            # noqa: D107
         super().__init__()
         self.unknown: set[str] = set()
         self.probe_delay = 0.0
@@ -2129,9 +1994,7 @@ class _UnknownProbeRuntime(_FakeRuntime):
     def is_alive_for_claim(self, slot: Slot) -> "bool | None":
         if slot.slot_id in self.unknown:
             if self.probe_delay:
-                time.sleep(
-                    self.probe_delay
-                )  # a REAL brownout probe is slow, not instant
+                time.sleep(self.probe_delay)   # a REAL brownout probe is slow, not instant
             return None
         return True
 
@@ -2144,20 +2007,14 @@ def test_unknown_probe_never_destroys_and_serves_a_healthy_slot_behind_it() -> N
     pool._spawn_to_deficit(ready=True)
     pool._promote_warming()
     slots = list(pool._slots.values())
-    rt.unknown = {slots[0].slot_id, slots[1].slot_id}  # first two can't be probed
+    rt.unknown = {slots[0].slot_id, slots[1].slot_id}       # first two can't be probed
 
     got = pool.claim(timeout_s=2.0)
-    assert got is not None and got.slot_id == slots[2].slot_id, (
-        "healthy slot behind UNKNOWN not served"
-    )
+    assert got is not None and got.slot_id == slots[2].slot_id, "healthy slot behind UNKNOWN not served"
     with pool._lock:
         for s in slots[:2]:
-            assert s.state == SlotState.IDLE, (
-                f"UNKNOWN slot left in {s.state}, must stay IDLE"
-            )
-            assert s.slot_id not in pool._deferred_reap, (
-                "UNKNOWN slot queued for disposal"
-            )
+            assert s.state == SlotState.IDLE, f"UNKNOWN slot left in {s.state}, must stay IDLE"
+            assert s.slot_id not in pool._deferred_reap, "UNKNOWN slot queued for disposal"
     assert not rt.reaped, f"UNKNOWN destroyed a worker: {rt.reaped}"
 
 
@@ -2165,22 +2022,18 @@ def test_all_unknown_claim_terminates_promptly_without_destroying_anything() -> 
     # issue #77: with EVERY slot UNKNOWN the scan must not spin — it returns None within the
     # caller's budget and leaves the whole (possibly healthy) pool intact.
     rt = _UnknownProbeRuntime()
-    pool = WarmPool(
-        runtime=rt, warm_size=8, concurrent_ceiling=8, spawn_rate_limit=1000.0
-    )
+    pool = WarmPool(runtime=rt, warm_size=8, concurrent_ceiling=8, spawn_rate_limit=1000.0)
     pool._spawn_to_deficit(ready=True)
     pool._promote_warming()
     with pool._lock:
         rt.unknown = set(pool._slots)
-    rt.probe_delay = 0.3  # 8 slots x 0.3s = 2.4s if the scan ignores its deadline
+    rt.probe_delay = 0.3                  # 8 slots x 0.3s = 2.4s if the scan ignores its deadline
 
     t0 = time.monotonic()
     assert pool.claim(timeout_s=0.1) is None
     elapsed = time.monotonic() - t0
     # bounded by the grace floor + one in-flight probe, NOT by probing every slot
-    assert elapsed < pool._SCAN_GRACE_S + 0.9, (
-        f"all-UNKNOWN scan ran away: {elapsed:.2f}s"
-    )
+    assert elapsed < pool._SCAN_GRACE_S + 0.9, f"all-UNKNOWN scan ran away: {elapsed:.2f}s"
     with pool._lock:
         assert all(s.state == SlotState.IDLE for s in pool._slots.values())
         assert not pool._deferred_reap
@@ -2200,9 +2053,7 @@ def test_each_reaper_stamps_its_OWN_progress_entry() -> None:
             super().reap(slot)
 
     rt = _Slow()
-    pool = WarmPool(
-        runtime=rt, warm_size=6, concurrent_ceiling=6, spawn_rate_limit=10000.0
-    )
+    pool = WarmPool(runtime=rt, warm_size=6, concurrent_ceiling=6, spawn_rate_limit=10000.0)
     pool._spawn_to_deficit(ready=True)
     pool._promote_warming()
     with pool._lock:
@@ -2210,7 +2061,7 @@ def test_each_reaper_stamps_its_OWN_progress_entry() -> None:
             slot.state = SlotState.DRAINING
             pool._deferred_reap.add(sid)
     try:
-        pool._reap_deferred()  # starts _MAX_REAPERS threads
+        pool._reap_deferred()                      # starts _MAX_REAPERS threads
         time.sleep(0.2)
         with pool._lock:
             entries = list(pool._reaper_threads)
@@ -2227,17 +2078,10 @@ def test_each_reaper_stamps_its_OWN_progress_entry() -> None:
 
 # ------------------------------------------------ issue #77 round 2: escalated-review regressions
 
-
 def _slot(slot_id: str, state):  # noqa: ANN001
     from blastbox.host.pool import Slot
-
-    return Slot(
-        slot_id=slot_id,
-        control_dir="/tmp/c",
-        input_dir="/tmp/i",
-        output_dir="/tmp/o",
-        state=state,
-    )
+    return Slot(slot_id=slot_id, control_dir="/tmp/c", input_dir="/tmp/i", output_dir="/tmp/o",
+                state=state)
 
 
 def test_f5_claim_passes_its_remaining_budget_to_the_runtimes_claim_probe():
@@ -2278,8 +2122,7 @@ def test_f5_claim_passes_its_remaining_budget_to_the_runtimes_claim_probe():
     # (issue #77 round 4). The point of the finding stands: the probe must be bounded by the POOL's
     # deadline, never left to the runtime's own much larger claim_probe_timeout_s.
     assert seen[0] <= pool._SCAN_GRACE_S + 1e-6, (
-        f"probe was handed {seen[0]}s, beyond the scan deadline"
-    )
+        f"probe was handed {seen[0]}s, beyond the scan deadline")
 
 
 def test_f20_a_nonblocking_claim_can_still_take_a_ready_slot():
@@ -2312,9 +2155,7 @@ def test_f20_a_nonblocking_claim_can_still_take_a_ready_slot():
     pool = WarmPool(runtime=_Rt(), warm_size=0)
     slot = _slot("s1", SlotState.IDLE)
     pool._slots["s1"] = slot
-    assert pool.claim(timeout_s=0) is slot, (
-        f"non-blocking claim failed; budgets={budgets}"
-    )
+    assert pool.claim(timeout_s=0) is slot, f"non-blocking claim failed; budgets={budgets}"
 
 
 def test_f5_a_runtime_without_the_budget_kwarg_still_works():
@@ -2347,7 +2188,6 @@ def test_f5_a_runtime_without_the_budget_kwarg_still_works():
 
 # ------------------------- issue #77 round 3: the escalated review of the round-2 fixes ----------
 
-
 def test_f10_a_reaper_retired_while_wedged_does_not_rejoin_the_drain():
     """Dropping a wedged reaper from the progress count is what lets replacements spawn -- but
     nothing STOPPED the original. If its terminate ever returned it resumed draining alongside its
@@ -2378,11 +2218,11 @@ def test_f10_a_reaper_retired_while_wedged_does_not_rejoin_the_drain():
         pool._slots[s.slot_id] = s
         pool._deferred_reap.add(s.slot_id)
 
-    retired_box = [[None, 0.0, True]]  # this reaper was declared wedged and retired
+    retired_box = [[None, 0.0, True]]      # this reaper was declared wedged and retired
     pool._drain_deferred_reaps(retired_box)
     assert reaped == [], f"a retired reaper kept draining the queue: {reaped}"
 
-    live_box = [[None, 0.0, False]]  # a healthy one still drains it
+    live_box = [[None, 0.0, False]]        # a healthy one still drains it
     pool._drain_deferred_reaps(live_box)
     assert len(reaped) == 3, f"a live reaper must drain the queue, got {reaped}"
 
@@ -2412,12 +2252,12 @@ def test_f10_the_spawner_retires_a_reaper_that_has_stopped_making_progress():
 
     pool = WarmPool(runtime=_Rt(), warm_size=0)
     release = threading.Event()
-    t = threading.Thread(target=release.wait, daemon=True)  # a real, still-alive thread
+    t = threading.Thread(target=release.wait, daemon=True)   # a real, still-alive thread
     t.start()
     try:
         stale = [t, pool._clock() - (pool._REAPER_WEDGED_AFTER_S + 1.0), False]
         pool._reaper_threads.append(stale)
-        s = _slot("s0", SlotState.DRAINING)  # give it a reason to look at the queue
+        s = _slot("s0", SlotState.DRAINING)          # give it a reason to look at the queue
         pool._slots["s0"] = s
         pool._deferred_reap.add("s0")
         pool._reap_deferred()
@@ -2449,7 +2289,7 @@ def test_f26_an_unknown_slot_is_probed_once_per_claim_not_once_per_scan():
 
         def is_alive_for_claim(self, slot, *, budget_s=None):  # noqa: ANN001
             probes.append(slot.slot_id)
-            return None  # fast UNKNOWN, exactly like a throttled describe
+            return None            # fast UNKNOWN, exactly like a throttled describe
 
         def reap(self, slot):  # noqa: ANN001
             pass
@@ -2458,24 +2298,19 @@ def test_f26_an_unknown_slot_is_probed_once_per_claim_not_once_per_scan():
     for i in range(3):
         s = _slot(f"s{i}", SlotState.IDLE)
         pool._slots[s.slot_id] = s
-    assert pool.claim(timeout_s=0.3) is None  # every slot unknown -> no claim
-    assert len(probes) == 3, (
-        f"expected one probe per slot for the whole claim, got {probes}"
-    )
+    assert pool.claim(timeout_s=0.3) is None       # every slot unknown -> no claim
+    assert len(probes) == 3, f"expected one probe per slot for the whole claim, got {probes}"
 
 
 # ---------------- marla loop (run-41): UNKNOWN must be survivable, not permanent -----------------
 
-
 def _unknown_rt(reaped: list):
     """A runtime whose probes never give a definitive answer (a persistent host/control-plane fault)."""
-
     class _Rt:
         kind = "test"
 
         def spawn(self):
             from blastbox.host.pool import SlotState
-
             return _slot(f"new{len(reaped)}", SlotState.IDLE)
 
         def is_ready(self, slot):  # noqa: ANN001
@@ -2489,7 +2324,6 @@ def _unknown_rt(reaped: list):
 
         def reap(self, slot):  # noqa: ANN001
             reaped.append(slot.slot_id)
-
     return _Rt()
 
 
@@ -2503,11 +2337,9 @@ def test_a_transient_unknown_does_not_cost_the_slot():
     slot = _slot("s1", SlotState.IDLE)
     pool._slots["s1"] = slot
     for _ in range(20):
-        clock[0] += 1.0  # 20 seconds of solid UNKNOWN
+        clock[0] += 1.0          # 20 seconds of solid UNKNOWN
         pool._health_check()
-    assert reaped == [], (
-        f"a transient brownout destroyed a healthy warm worker: {reaped}"
-    )
+    assert reaped == [], f"a transient brownout destroyed a healthy warm worker: {reaped}"
     assert pool._slots.get("s1") is slot
 
 
@@ -2525,15 +2357,14 @@ def test_a_PERSISTENT_unknown_eventually_escalates_to_dead():
     slot = _slot("s1", SlotState.IDLE)
     pool._slots["s1"] = slot
     for _ in range(400):
-        clock[0] += 5.0  # well past any sane grace
+        clock[0] += 5.0          # well past any sane grace
         pool._health_check()
     # Disposal is ASYNCHRONOUS: an escalated slot is handed to the bounded deferred reapers rather
     # than terminated inline, so a tier's worth of 120s AWS terminates cannot stall the tick thread.
     pool._drain_deferred_reaps()
     assert reaped == ["s1"], (
         f"a PERMANENTLY unknown slot was never escalated: reaped={reaped} "
-        f"(tier wedged at zero capacity -- the pre-#77 self-heal that was removed)"
-    )
+        f"(tier wedged at zero capacity -- the pre-#77 self-heal that was removed)")
 
 
 def test_a_definitive_answer_resets_the_unknown_clock():
@@ -2602,16 +2433,12 @@ def test_an_unknown_slot_is_re_probed_later_in_the_same_claim():
     pool = WarmPool(runtime=_Rt(), warm_size=0, clock=lambda: clock[0])
     pool._slots["s1"] = _slot("s1", SlotState.IDLE)
     unprobeable: dict[str, float] = {}
-    assert (
-        pool._try_claim_one(clock[0] + 1, clock[0] + 1, unprobeable) is None
-    )  # unknown -> skip
+    assert pool._try_claim_one(clock[0] + 1, clock[0] + 1, unprobeable) is None   # unknown -> skip
     assert len(probes) == 1
-    clock[0] += pool._UNPROBEABLE_COOLDOWN_S + 0.1  # cooldown elapses
-    recovered["v"] = True  # control plane back
+    clock[0] += pool._UNPROBEABLE_COOLDOWN_S + 0.1                                # cooldown elapses
+    recovered["v"] = True                                                          # control plane back
     got = pool._try_claim_one(clock[0] + 1, clock[0] + 1, unprobeable)
-    assert got is not None, (
-        f"a recovered slot was never re-probed within the claim: probes={probes}"
-    )
+    assert got is not None, f"a recovered slot was never re-probed within the claim: probes={probes}"
     assert len(probes) == 2
 
 
@@ -2645,25 +2472,22 @@ def test_escalation_that_cannot_dispose_returns_the_slot_instead_of_quarantining
                 raise RuntimeError("terminate failed: throttled")
 
     clock = [1000.0]
-    pool = WarmPool(
-        runtime=_Rt(), warm_size=1, clock=lambda: clock[0], unknown_grace_s=60.0
-    )
+    pool = WarmPool(runtime=_Rt(), warm_size=1, clock=lambda: clock[0], unknown_grace_s=60.0)
     pool._slots["s1"] = _slot("s1", SlotState.IDLE)
-    for _ in range(40):  # ride out a brownout longer than the grace
+    for _ in range(40):                       # ride out a brownout longer than the grace
         clock[0] += 5.0
         pool._health_check()
-        pool._drain_deferred_reaps()  # disposal is asynchronous now (bounded reapers)
+        pool._drain_deferred_reaps()      # disposal is asynchronous now (bounded reapers)
     assert reap_calls, "escalation never even attempted a disposal"
 
-    brownout["v"] = False  # control plane recovers
+    brownout["v"] = False                     # control plane recovers
     clock[0] += 5.0
     pool._health_check()
     pool._drain_deferred_reaps()
     s = pool._slots.get("s1")
     assert s is not None, "the slot vanished despite never being disposed of"
     assert s.state == SlotState.IDLE, (
-        f"slot stuck in {s.state} after the brownout ended — permanently zero capacity"
-    )
+        f"slot stuck in {s.state} after the brownout ended — permanently zero capacity")
 
 
 def test_unknown_since_leak_is_pruned_when_slots_leave():
@@ -2681,7 +2505,7 @@ def test_unknown_since_leak_is_pruned_when_slots_leave():
             return True
 
         def is_alive(self, slot):  # noqa: ANN001
-            return None  # always UNKNOWN -> stamps _unknown_since
+            return None            # always UNKNOWN -> stamps _unknown_since
 
         def reap(self, slot):  # noqa: ANN001
             pass
@@ -2691,13 +2515,11 @@ def test_unknown_since_leak_is_pruned_when_slots_leave():
     for i in range(5):
         pool._slots[f"s{i}"] = _slot(f"s{i}", SlotState.IDLE)
         clock[0] += 1.0
-        pool._health_check()  # stamps an entry for each
-        pool._slots.pop(f"s{i}")  # ...and the slot then leaves the pool
+        pool._health_check()                 # stamps an entry for each
+        pool._slots.pop(f"s{i}")             # ...and the slot then leaves the pool
     clock[0] += 1.0
     pool._health_check()
-    assert pool._unknown_since == {}, (
-        f"bookkeeping leaked for departed slots: {pool._unknown_since}"
-    )
+    assert pool._unknown_since == {}, f"bookkeeping leaked for departed slots: {pool._unknown_since}"
 
 
 def test_escalated_disposals_do_not_block_the_tick_thread():
@@ -2720,27 +2542,21 @@ def test_escalated_disposals_do_not_block_the_tick_thread():
             return True
 
         def is_alive(self, slot):  # noqa: ANN001
-            return None  # permanently UNKNOWN -> escalation fires
+            return None                     # permanently UNKNOWN -> escalation fires
 
         def reap(self, slot):  # noqa: ANN001
             reaping["n"] += 1
             raise AssertionError("reap must NOT run inline on the tick thread")
 
     clock = [1000.0]
-    pool = WarmPool(
-        runtime=_Rt(), warm_size=0, clock=lambda: clock[0], unknown_grace_s=10.0
-    )
+    pool = WarmPool(runtime=_Rt(), warm_size=0, clock=lambda: clock[0], unknown_grace_s=10.0)
     for i in range(3):
         pool._slots[f"s{i}"] = _slot(f"s{i}", SlotState.IDLE)
     for _ in range(6):
         clock[0] += 5.0
-        pool._health_check()  # must not raise: nothing reaped inline
-    assert reaping["n"] == 0, (
-        "an escalated disposal ran synchronously on the tick thread"
-    )
-    assert pool._deferred_reap, (
-        "escalated slots were not handed to the bounded deferred reapers"
-    )
+        pool._health_check()                # must not raise: nothing reaped inline
+    assert reaping["n"] == 0, "an escalated disposal ran synchronously on the tick thread"
+    assert pool._deferred_reap, "escalated slots were not handed to the bounded deferred reapers"
 
 
 def test_a_brownout_is_not_recorded_as_demand():
@@ -2762,7 +2578,7 @@ def test_a_brownout_is_not_recorded_as_demand():
             return True
 
         def is_alive_for_claim(self, slot, *, budget_s=None):  # noqa: ANN001
-            return None  # fast UNKNOWN, like a throttled describe
+            return None                     # fast UNKNOWN, like a throttled describe
 
         def reap(self, slot):  # noqa: ANN001
             pass
@@ -2770,11 +2586,9 @@ def test_a_brownout_is_not_recorded_as_demand():
     pool = WarmPool(runtime=_Rt(), warm_size=0)
     pool._slots["s1"] = _slot("s1", SlotState.IDLE)
     misses: list[int] = []
-    pool._record_demand_miss = lambda: misses.append(1)  # type: ignore[method-assign]
+    pool._record_demand_miss = lambda: misses.append(1)   # type: ignore[method-assign]
     assert pool.claim(timeout_s=0.2) is None
-    assert misses == [], (
-        f"a control-plane brownout was billed as demand pressure: {len(misses)}"
-    )
+    assert misses == [], f"a control-plane brownout was billed as demand pressure: {len(misses)}"
 
 
 def test_a_successful_claim_probe_resets_the_unknown_grace():
@@ -2803,21 +2617,18 @@ def test_a_successful_claim_probe_resets_the_unknown_grace():
             pass
 
     clock = [1000.0]
-    pool = WarmPool(
-        runtime=_Rt(), warm_size=0, clock=lambda: clock[0], unknown_grace_s=50.0
-    )
+    pool = WarmPool(runtime=_Rt(), warm_size=0, clock=lambda: clock[0], unknown_grace_s=50.0)
     pool._slots["s1"] = _slot("s1", SlotState.IDLE)
 
     clock[0] += 10.0
-    pool._health_check()  # UNKNOWN -> clock starts
+    pool._health_check()                       # UNKNOWN -> clock starts
     assert "s1" in pool._unknown_since
 
-    answers["v"] = True  # control plane recovers, and a CLAIM succeeds
+    answers["v"] = True                        # control plane recovers, and a CLAIM succeeds
     got = pool.claim(timeout_s=0.2)
     assert got is not None
     assert "s1" not in pool._unknown_since, (
-        "a slot that answered at claim time still carried its unknown clock toward escalation"
-    )
+        "a slot that answered at claim time still carried its unknown clock toward escalation")
 
 
 def test_a_definitive_probe_lifts_the_demand_suppression():
@@ -2850,16 +2661,15 @@ def test_a_definitive_probe_lifts_the_demand_suppression():
     pool = WarmPool(runtime=_Rt(), warm_size=0, clock=lambda: clock[0])
     pool._slots["s1"] = _slot("s1", SlotState.IDLE)
     unprobeable: dict[str, float] = {}
-    assert pool._try_claim_one(None, None, unprobeable) is None  # UNKNOWN -> suppressed
+    assert pool._try_claim_one(None, None, unprobeable) is None      # UNKNOWN -> suppressed
     assert "s1" in unprobeable
 
-    answers["v"] = True  # control plane recovers
-    clock[0] += pool._UNPROBEABLE_COOLDOWN_S + 0.1  # ...and the cooldown elapses
+    answers["v"] = True                                             # control plane recovers
+    clock[0] += pool._UNPROBEABLE_COOLDOWN_S + 0.1                   # ...and the cooldown elapses
     got = pool._try_claim_one(None, None, unprobeable)
     assert got is not None
     assert "s1" not in unprobeable, (
-        "a definitively-answered slot stayed suppressed, muting demand for the rest of the claim"
-    )
+        "a definitively-answered slot stayed suppressed, muting demand for the rest of the claim")
 
 
 def test_the_unknown_clock_is_not_backdated_across_a_slow_health_pass():
@@ -2882,7 +2692,7 @@ def test_the_unknown_clock_is_not_backdated_across_a_slow_health_pass():
             return True
 
         def is_alive(self, slot):  # noqa: ANN001
-            clock[0] += 40.0  # each probe is SLOW, as during a real brownout
+            clock[0] += 40.0        # each probe is SLOW, as during a real brownout
             return None
 
         def reap(self, slot):  # noqa: ANN001
@@ -2891,9 +2701,7 @@ def test_the_unknown_clock_is_not_backdated_across_a_slow_health_pass():
     # One pass costs 4 x 40s = 160s, so every slot is legitimately re-probed 160s apart. The grace
     # sits ABOVE that but BELOW 160 + the backdating error (up to a full pass), so only a backdated
     # clock can push a slot over it.
-    pool = WarmPool(
-        runtime=_Rt(), warm_size=0, clock=lambda: clock[0], unknown_grace_s=200.0
-    )
+    pool = WarmPool(runtime=_Rt(), warm_size=0, clock=lambda: clock[0], unknown_grace_s=200.0)
     for i in range(4):
         pool._slots[f"s{i}"] = _slot(f"s{i}", SlotState.IDLE)
 
@@ -2905,16 +2713,14 @@ def test_the_unknown_clock_is_not_backdated_across_a_slow_health_pass():
     stamps = dict(pool._unknown_since)
     assert len(stamps) == 4
     assert max(stamps.values()) > min(stamps.values()), (
-        f"all four slots share one timestamp, so the later ones are backdated: {stamps}"
-    )
+        f"all four slots share one timestamp, so the later ones are backdated: {stamps}")
 
     # Pass 2: the last slot has genuinely been unknown for only one pass, far inside the 100s grace.
     pool._health_check()
     pool._drain_deferred_reaps()
     assert reaped == [], (
         f"escalated on backdated time: every slot has been unknown for one 160s pass, inside the "
-        f"200s grace, yet these were reaped: {reaped}"
-    )
+        f"200s grace, yet these were reaped: {reaped}")
 
 
 def test_a_stale_health_result_is_dropped_when_a_claim_took_the_slot():
@@ -2947,8 +2753,7 @@ def test_a_stale_health_result_is_dropped_when_a_claim_took_the_slot():
     pool._health_check()
     assert "s1" not in pool._unknown_since, (
         "a health result that lost the race to a claim was written anyway, and will age while the "
-        "slot is ASSIGNED"
-    )
+        "slot is ASSIGNED")
 
 
 def test_the_wedged_after_threshold_exceeds_one_reap_call():
@@ -2978,16 +2783,13 @@ def test_the_wedged_after_threshold_exceeds_one_reap_call():
 
     pool = WarmPool(runtime=_Rt(), warm_size=0)
     assert pool._reaper_wedged_after_s() > 120.0, (
-        "a legitimate 120s disposal would be declared wedged and replaced mid-flight"
-    )
+        "a legitimate 120s disposal would be declared wedged and replaced mid-flight")
 
     class _NoCfg(_Rt):
         cfg = None
 
-    assert (
-        WarmPool(runtime=_NoCfg(), warm_size=0)._reaper_wedged_after_s()
-        == WarmPool._REAPER_WEDGED_AFTER_S
-    )  # runtimes without a cfg keep the floor
+    assert WarmPool(runtime=_NoCfg(), warm_size=0)._reaper_wedged_after_s() == \
+        WarmPool._REAPER_WEDGED_AFTER_S      # runtimes without a cfg keep the floor
 
 
 def test_the_wedge_threshold_sees_through_a_cascade():
@@ -3014,9 +2816,9 @@ def test_the_wedge_threshold_sees_through_a_cascade():
             pass
 
     slow = _Rt()
-    slow.cfg = SimpleNamespace(cli_timeout_s=120.0)  # type: ignore[attr-defined]
+    slow.cfg = SimpleNamespace(cli_timeout_s=120.0)      # type: ignore[attr-defined]
     fast = _Rt()
-    fast.cfg = SimpleNamespace(cli_timeout_s=30.0)  # type: ignore[attr-defined]
+    fast.cfg = SimpleNamespace(cli_timeout_s=30.0)       # type: ignore[attr-defined]
 
     class _Cascade(_Rt):
         tiers = [SimpleNamespace(runtime=fast), SimpleNamespace(runtime=slow)]
@@ -3024,8 +2826,7 @@ def test_the_wedge_threshold_sees_through_a_cascade():
     pool = WarmPool(runtime=_Cascade(), warm_size=1)
     assert pool._reaper_wedged_after_s() > 120.0, (
         "behind a cascade the threshold fell back to the floor, so a legitimate 120s disposal is "
-        "declared wedged and replaced mid-flight"
-    )
+        "declared wedged and replaced mid-flight")
 
 
 class _UnknownReadyRuntime(_FakeRuntime):
@@ -3055,12 +2856,8 @@ def test_a_brownout_does_not_evict_the_tiers_warming_slots() -> None:
     clock = _FakeClock()
     rt = _UnknownReadyRuntime()
     pool = WarmPool(
-        runtime=rt,
-        warm_size=1,
-        clock=clock,
-        spawn_rate_limit=100.0,
-        warming_timeout_s=60.0,
-        unknown_grace_s=300.0,
+        runtime=rt, warm_size=1, clock=clock, spawn_rate_limit=100.0,
+        warming_timeout_s=60.0, unknown_grace_s=300.0,
     )
     pool.tick()
     warming = [s for s in pool._slots.values() if s.state == SlotState.WARMING]
@@ -3070,9 +2867,7 @@ def test_a_brownout_does_not_evict_the_tiers_warming_slots() -> None:
     # Well past warming_timeout_s, still inside the unknown grace: the slot SURVIVES.
     clock.advance(120.0)
     pool.tick()
-    assert slot_id in pool._slots, (
-        "a slot we could not ask about was evicted by the warming timeout"
-    )
+    assert slot_id in pool._slots, "a slot we could not ask about was evicted by the warming timeout"
     assert slot_id not in rt.reaped
 
     # The control plane comes back and says "ready": it promotes, having never been destroyed.
@@ -3110,19 +2905,13 @@ def test_an_unknown_that_outlasts_the_grace_still_evicts() -> None:
     clock = _FakeClock()
     rt = _UnknownReadyRuntime()
     pool = WarmPool(
-        runtime=rt,
-        warm_size=1,
-        clock=clock,
-        spawn_rate_limit=100.0,
-        warming_timeout_s=60.0,
-        unknown_grace_s=100.0,
+        runtime=rt, warm_size=1, clock=clock, spawn_rate_limit=100.0,
+        warming_timeout_s=60.0, unknown_grace_s=100.0,
     )
     pool.tick()
-    slot_id = [s for s in pool._slots.values() if s.state == SlotState.WARMING][
-        0
-    ].slot_id
+    slot_id = [s for s in pool._slots.values() if s.state == SlotState.WARMING][0].slot_id
 
-    clock.advance(90.0)  # past warming timeout, and the episode is first OBSERVED here
+    clock.advance(90.0)   # past warming timeout, and the episode is first OBSERVED here
     pool.tick()
     assert slot_id in pool._slots
     # The grace runs from when the UNKNOWN was first SEEN, not from spawn -- we cannot start a
@@ -3133,9 +2922,7 @@ def test_an_unknown_that_outlasts_the_grace_still_evicts() -> None:
     pool.tick()
     _drain_reapers(pool)
     assert clock() - since > 100.0, "sanity: the episode really did outlast the grace"
-    assert slot_id in rt.reaped, (
-        "an outage that outlasts the grace must still let the slot age out"
-    )
+    assert slot_id in rt.reaped, "an outage that outlasts the grace must still let the slot age out"
     assert slot_id not in pool._slots
 
 
@@ -3148,17 +2935,11 @@ def test_a_definitive_not_ready_still_ages_the_slot_out() -> None:
     rt = _FakeRuntime()
     rt.set_default_ready_after(10**9)  # answers, definitively, "not ready"
     pool = WarmPool(
-        runtime=rt,
-        warm_size=1,
-        clock=clock,
-        spawn_rate_limit=100.0,
-        warming_timeout_s=60.0,
-        unknown_grace_s=300.0,
+        runtime=rt, warm_size=1, clock=clock, spawn_rate_limit=100.0,
+        warming_timeout_s=60.0, unknown_grace_s=300.0,
     )
     pool.tick()
-    slot_id = [s for s in pool._slots.values() if s.state == SlotState.WARMING][
-        0
-    ].slot_id
+    slot_id = [s for s in pool._slots.values() if s.state == SlotState.WARMING][0].slot_id
 
     clock.advance(70.0)
     pool.tick()
@@ -3172,17 +2953,11 @@ def test_a_recovered_control_plane_resumes_aging_the_slot() -> None:
     clock = _FakeClock()
     rt = _UnknownReadyRuntime()
     pool = WarmPool(
-        runtime=rt,
-        warm_size=1,
-        clock=clock,
-        spawn_rate_limit=100.0,
-        warming_timeout_s=60.0,
-        unknown_grace_s=300.0,
+        runtime=rt, warm_size=1, clock=clock, spawn_rate_limit=100.0,
+        warming_timeout_s=60.0, unknown_grace_s=300.0,
     )
     pool.tick()
-    slot_id = [s for s in pool._slots.values() if s.state == SlotState.WARMING][
-        0
-    ].slot_id
+    slot_id = [s for s in pool._slots.values() if s.state == SlotState.WARMING][0].slot_id
 
     clock.advance(120.0)
     pool.tick()
@@ -3194,12 +2969,8 @@ def test_a_recovered_control_plane_resumes_aging_the_slot() -> None:
     rt._ready_after[slot_id] = 10**9
     clock.advance(1.0)
     pool.tick()
-    assert pool._warming_unknown_since.get(slot_id) is None, (
-        "the episode must be cleared"
-    )
-    assert slot_id in rt.reaped, (
-        "with the brownout over, the long-overdue slot ages out"
-    )
+    assert pool._warming_unknown_since.get(slot_id) is None, "the episode must be cleared"
+    assert slot_id in rt.reaped, "with the brownout over, the long-overdue slot ages out"
 
 
 def test_a_zero_grace_disables_the_warming_exemption_entirely() -> None:
@@ -3210,24 +2981,16 @@ def test_a_zero_grace_disables_the_warming_exemption_entirely() -> None:
     clock = _FakeClock()
     rt = _UnknownReadyRuntime()
     pool = WarmPool(
-        runtime=rt,
-        warm_size=1,
-        clock=clock,
-        spawn_rate_limit=100.0,
-        warming_timeout_s=60.0,
-        unknown_grace_s=0.0,
+        runtime=rt, warm_size=1, clock=clock, spawn_rate_limit=100.0,
+        warming_timeout_s=60.0, unknown_grace_s=0.0,
     )
     pool.tick()
-    slot_id = [s for s in pool._slots.values() if s.state == SlotState.WARMING][
-        0
-    ].slot_id
+    slot_id = [s for s in pool._slots.values() if s.state == SlotState.WARMING][0].slot_id
 
     clock.advance(70.0)
     pool.tick()
     _drain_reapers(pool)
-    assert slot_id in rt.reaped, (
-        "grace=0 must disable the exemption, not enable it forever"
-    )
+    assert slot_id in rt.reaped, "grace=0 must disable the exemption, not enable it forever"
 
 
 class _DrainingOnProbeRuntime(_FakeRuntime):
@@ -3253,26 +3016,16 @@ def test_an_unknown_probe_does_not_reap_a_draining_slot() -> None:
     ref: dict = {}
     clock = _FakeClock()
     rt = _DrainingOnProbeRuntime(ref)
-    pool = WarmPool(
-        runtime=rt,
-        warm_size=1,
-        clock=clock,
-        spawn_rate_limit=100.0,
-        warming_timeout_s=600.0,
-        unknown_grace_s=300.0,
-    )
+    pool = WarmPool(runtime=rt, warm_size=1, clock=clock, spawn_rate_limit=100.0,
+                    warming_timeout_s=600.0, unknown_grace_s=300.0)
     ref["pool"] = pool
     pool.tick()
     slot_id = next(iter(pool._slots))
 
     clock.advance(1.0)
-    pool.tick()  # is_ready flips it to DRAINING and returns UNKNOWN
-    assert pool._slots[slot_id].state == SlotState.DRAINING, (
-        "sanity: the branch is reachable"
-    )
-    assert slot_id not in rt.reaped, (
-        "a slot we could not ask about was reaped as not-ready"
-    )
+    pool.tick()   # is_ready flips it to DRAINING and returns UNKNOWN
+    assert pool._slots[slot_id].state == SlotState.DRAINING, "sanity: the branch is reachable"
+    assert slot_id not in rt.reaped, "a slot we could not ask about was reaped as not-ready"
 
 
 def test_an_unqueryable_liveness_probe_does_not_reap_a_recycled_slot() -> None:
@@ -3282,7 +3035,6 @@ def test_an_unqueryable_liveness_probe_does_not_reap_a_recycled_slot() -> None:
     is not: it means we could not TELL, and the slot had just been reset successfully and served
     its job fine. This path runs once PER JOB, so the mistake was charged at job rate.
     """
-
     class _RecycleOkProbeRaises(_FakeRuntime):
         def recycle(self, slot: Slot) -> None:
             pass
@@ -3295,18 +3047,15 @@ def test_an_unqueryable_liveness_probe_does_not_reap_a_recycled_slot() -> None:
     pool._spawn_to_deficit(ready=True)
     slot = next(iter(pool._slots.values()))
     slot.state = SlotState.ASSIGNED
-    pool.release(slot, dirty=True)  # dirty forces the recycle branch
+    pool.release(slot, dirty=True)      # dirty forces the recycle branch
 
-    assert slot.slot_id not in rt.reaped, (
-        "a slot we could not probe was reaped after a good recycle"
-    )
+    assert slot.slot_id not in rt.reaped, "a slot we could not probe was reaped after a good recycle"
     assert pool._slots[slot.slot_id].state == SlotState.IDLE
 
 
 def test_a_failed_recycle_still_reaps() -> None:
     """The other half: an unreset slot must never go back to IDLE, or the next job inherits a
     contaminated worker. Splitting the handler must not weaken this."""
-
     class _RecycleRaises(_FakeRuntime):
         def recycle(self, slot: Slot) -> None:
             raise RuntimeError("snapshot revert failed")
@@ -3324,7 +3073,6 @@ def test_a_failed_recycle_still_reaps() -> None:
 def test_a_confirmed_dead_slot_after_recycle_is_still_reaped() -> None:
     """And the third case: a CONFIRMED False must keep reaping. Widening the probe handler to
     treat everything as unknown would republish genuinely dead workers."""
-
     class _RecycleOkButDead(_FakeRuntime):
         def recycle(self, slot: Slot) -> None:
             pass
@@ -3361,9 +3109,7 @@ def test_maintenance_holds_an_exclusive_window_so_claim_cannot_take_the_slot() -
             live = pool._slots[slot.slot_id]
             seen_states.append(live.state)
             # A claimant running right now must NOT be able to take it.
-            assert pool.claim(timeout_s=0.0) is None, (
-                "claim took a slot under maintenance"
-            )
+            assert pool.claim(timeout_s=0.0) is None, "claim took a slot under maintenance"
             return True
 
     ref: dict = {}
@@ -3374,9 +3120,7 @@ def test_maintenance_holds_an_exclusive_window_so_claim_cannot_take_the_slot() -
     pool.tick()
 
     assert seen_states, "the maintenance hook never ran"
-    assert seen_states[0] == SlotState.ASSIGNED, (
-        "the slot was not reserved before the hook ran"
-    )
+    assert seen_states[0] == SlotState.ASSIGNED, "the slot was not reserved before the hook ran"
     # ...and it is handed back afterwards.
     slot_id = next(iter(pool._slots))
     assert pool._slots[slot_id].state == SlotState.IDLE
@@ -3385,7 +3129,6 @@ def test_maintenance_holds_an_exclusive_window_so_claim_cannot_take_the_slot() -
 def test_a_raising_maintenance_hook_still_hands_the_slot_back() -> None:
     """A slot stranded in ASSIGNED is capacity lost forever: _spawn_to_deficit counts it as active,
     so nothing replaces it and nothing can claim it."""
-
     class _RaisingRuntime(_FakeRuntime):
         def maintain_idle(self, slot: Slot) -> bool:
             raise RuntimeError("describe blew up")
@@ -3396,15 +3139,11 @@ def test_a_raising_maintenance_hook_still_hands_the_slot_back() -> None:
     pool.tick()
 
     slot_id = next(iter(pool._slots))
-    assert pool._slots[slot_id].state == SlotState.IDLE, (
-        "the slot was stranded in ASSIGNED"
-    )
+    assert pool._slots[slot_id].state == SlotState.IDLE, "the slot was stranded in ASSIGNED"
     assert slot_id not in rt.reaped, "an exception is not a verdict about the slot"
 
 
-def test_a_maintenance_retirement_whose_terminate_fails_is_retried_not_stranded() -> (
-    None
-):
+def test_a_maintenance_retirement_whose_terminate_fails_is_retried_not_stranded() -> None:
     """`retire()` does NOT raise on a failed reap -- it logs pool.retire_reap_error and returns
     normally, leaving the slot tracked and DRAINING.
 
@@ -3416,20 +3155,15 @@ def test_a_maintenance_retirement_whose_terminate_fails_is_retried_not_stranded(
 
     MUTATION: drop the _deferred_reap enqueue -> the husk sits DRAINING with nothing retrying it.
     """
-
     class _UnusableUnreapable(_FakeRuntime):
         def maintain_idle(self, slot: Slot) -> bool:
-            return False  # terminal: retire it
+            return False                          # terminal: retire it
 
         def reap(self, slot: Slot) -> None:
             raise OSError("terminate-instances: throttled")
 
-    pool = WarmPool(
-        runtime=_UnusableUnreapable(),
-        warm_size=1,
-        spawn_rate_limit=100.0,
-        maintain_interval_s=0.0,
-    )
+    pool = WarmPool(runtime=_UnusableUnreapable(), warm_size=1, spawn_rate_limit=100.0,
+                    maintain_interval_s=0.0)
     pool._spawn_to_deficit(ready=True)
     slot = next(iter(pool._slots.values()))
     slot.state = SlotState.IDLE
@@ -3438,8 +3172,7 @@ def test_a_maintenance_retirement_whose_terminate_fails_is_retried_not_stranded(
 
     cur = pool._slots.get(slot.slot_id)
     assert cur is not None and cur.state == SlotState.DRAINING, (
-        "sanity: a failed terminate should leave the husk tracked and DRAINING"
-    )
+        "sanity: a failed terminate should leave the husk tracked and DRAINING")
     assert slot.slot_id in pool._deferred_reap, (
         "the husk was left DRAINING with nothing retrying its disposal; it counts against "
         "concurrent_ceiling forever and its replacement never spawns"
@@ -3455,7 +3188,6 @@ def test_the_cooldown_stamp_does_not_resurrect_a_slot_removed_during_the_hook() 
 
     MUTATION: re-stamp unconditionally -> the entry comes back for a slot that is gone.
     """
-
     class _VanishingRuntime(_FakeRuntime):
         def __init__(self, pool_ref: dict) -> None:
             super().__init__()
@@ -3471,9 +3203,7 @@ def test_the_cooldown_stamp_does_not_resurrect_a_slot_removed_during_the_hook() 
 
     ref: dict = {}
     rt = _VanishingRuntime(ref)
-    pool = WarmPool(
-        runtime=rt, warm_size=1, spawn_rate_limit=100.0, maintain_interval_s=0.0
-    )
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, maintain_interval_s=0.0)
     ref["pool"] = pool
     pool._spawn_to_deficit(ready=True)
     slot = next(iter(pool._slots.values()))
@@ -3499,30 +3229,24 @@ def test_a_slow_definitive_probe_credits_the_time_it_spent_blocked() -> None:
     MUTATION: close the episode at probe_began -> the blocked interval is not credited.
     """
     now = [1000.0]
-    answers: list = [None, False]  # UNKNOWN, then a SLOW definitive "not ready yet"
+    answers: list = [None, False]        # UNKNOWN, then a SLOW definitive "not ready yet"
 
     class _SlowThenDefinite(_FakeRuntime):
         def is_ready(self, slot: Slot):
             a = answers.pop(0) if answers else False
             if a is False:
-                now[0] += 30.0  # the definitive probe blocks for 30s before answering
+                now[0] += 30.0           # the definitive probe blocks for 30s before answering
             return a
 
-    pool = WarmPool(
-        runtime=_SlowThenDefinite(),
-        warm_size=1,
-        spawn_rate_limit=100.0,
-        clock=lambda: now[0],
-        warming_timeout_s=60.0,
-        unknown_grace_s=300.0,
-    )
+    pool = WarmPool(runtime=_SlowThenDefinite(), warm_size=1, spawn_rate_limit=100.0,
+                    clock=lambda: now[0], warming_timeout_s=60.0, unknown_grace_s=300.0)
     pool._spawn_to_deficit(ready=True)
     slot = next(iter(pool._slots.values()))
     slot.state = SlotState.WARMING
 
-    pool._promote_warming()  # opens the episode at t=1000
+    pool._promote_warming()              # opens the episode at t=1000
     now[0] += 10.0
-    pool._promote_warming()  # blocks 30s, then answers definitively -> closes it
+    pool._promote_warming()              # blocks 30s, then answers definitively -> closes it
 
     credit = pool._warming_unknown_credit.get(slot.slot_id, 0.0)
     assert credit >= 40.0, (
@@ -3546,17 +3270,11 @@ def test_time_spent_inside_an_unanswered_probe_counts_as_unobservable() -> None:
 
     class _SlowUnknownRuntime(_FakeRuntime):
         def is_ready(self, slot: Slot):
-            now[0] += 30.0  # the probe blocks for 30s...
-            return None  # ...and then answers nothing
+            now[0] += 30.0          # the probe blocks for 30s...
+            return None             # ...and then answers nothing
 
-    pool = WarmPool(
-        runtime=_SlowUnknownRuntime(),
-        warm_size=1,
-        spawn_rate_limit=100.0,
-        clock=lambda: now[0],
-        warming_timeout_s=60.0,
-        unknown_grace_s=300.0,
-    )
+    pool = WarmPool(runtime=_SlowUnknownRuntime(), warm_size=1, spawn_rate_limit=100.0,
+                    clock=lambda: now[0], warming_timeout_s=60.0, unknown_grace_s=300.0)
     pool._spawn_to_deficit(ready=True)
     slot = next(iter(pool._slots.values()))
     slot.state = SlotState.WARMING
@@ -3587,17 +3305,12 @@ def test_promotion_clears_the_idle_unknown_clock_too() -> None:
         def is_ready(self, slot: Slot):
             return True
 
-    pool = WarmPool(
-        runtime=_ReadyRuntime(),
-        warm_size=1,
-        spawn_rate_limit=100.0,
-        clock=lambda: now[0],
-        unknown_grace_s=60.0,
-    )
+    pool = WarmPool(runtime=_ReadyRuntime(), warm_size=1, spawn_rate_limit=100.0,
+                    clock=lambda: now[0], unknown_grace_s=60.0)
     pool._spawn_to_deficit(ready=True)
     slot = next(iter(pool._slots.values()))
     slot.state = SlotState.WARMING
-    pool._unknown_since[slot.slot_id] = 100.0  # the capped-eviction fallback, long ago
+    pool._unknown_since[slot.slot_id] = 100.0      # the capped-eviction fallback, long ago
 
     now[0] += 5.0
     pool._promote_warming()
@@ -3621,14 +3334,12 @@ def test_a_spawn_reaped_instead_of_published_leaves_no_marker_behind() -> None:
     """
     pool = WarmPool(runtime=_FakeRuntime(), warm_size=1, spawn_rate_limit=100.0)
     slot = pool._runtime.spawn()
-    pool._never_ready.add(slot.slot_id)  # as _spawn_to_deficit would have
+    pool._never_ready.add(slot.slot_id)          # as _spawn_to_deficit would have
 
-    pool._stop_event.set()  # shutdown raced the in-flight spawn -> drop path
+    pool._stop_event.set()                       # shutdown raced the in-flight spawn -> drop path
     pool._publish_or_reap_spawned(slot, {})
 
-    assert slot.slot_id not in pool._slots, (
-        "sanity: the slot must have been dropped, not published"
-    )
+    assert slot.slot_id not in pool._slots, "sanity: the slot must have been dropped, not published"
     assert slot.slot_id not in pool._never_ready, (
         "the never-ready marker outlived a slot that never entered the pool; nothing sweeps "
         "untracked ids, so it leaks one per discarded worker"
@@ -3654,7 +3365,6 @@ def test_a_proven_slot_is_restored_to_idle_not_warming() -> None:
     MUTATION: key the restore on _warming_unknown_credit and stop clearing it at promotion ->
     the proven slot comes back WARMING.
     """
-
     class _Unreapable(_FakeRuntime):
         def reap(self, slot: Slot) -> None:
             raise OSError("terminate-instances: throttled")
@@ -3662,9 +3372,7 @@ def test_a_proven_slot_is_restored_to_idle_not_warming() -> None:
     pool = WarmPool(runtime=_Unreapable(), warm_size=1, spawn_rate_limit=100.0)
     pool._spawn_to_deficit(ready=True)
     slot = next(iter(pool._slots.values()))
-    assert slot.slot_id in pool._never_ready, (
-        "a freshly spawned slot has never been ready"
-    )
+    assert slot.slot_id in pool._never_ready, "a freshly spawned slot has never been ready"
 
     # Promote it FOR REAL, so the clearing is exercised rather than simulated. The banked credit
     # must go with it: it is WARMING-scoped, and leaving it behind is precisely what turned a
@@ -3674,15 +3382,11 @@ def test_a_proven_slot_is_restored_to_idle_not_warming() -> None:
     pool._promote_warming()
     assert slot.state == SlotState.IDLE, "sanity: the slot must have been promoted"
     assert slot.slot_id not in pool._never_ready, (
-        "promotion did not clear the never-ready marker, so a proven slot still looks unproven"
-    )
+        "promotion did not clear the never-ready marker, so a proven slot still looks unproven")
     assert slot.slot_id not in pool._warming_unknown_credit, (
         "the WARMING-scoped credit outlived promotion; that is the lifetime bug that made it a "
-        "permanent 'was once warming-unknown' flag"
-    )
-    pool._warming_unknown_credit[slot.slot_id] = (
-        3.0  # the stale entry the old code keyed on
-    )
+        "permanent 'was once warming-unknown' flag")
+    pool._warming_unknown_credit[slot.slot_id] = 3.0   # the stale entry the old code keyed on
 
     # ...now escalated on suspicion and queued for disposal, which will fail.
     slot.state = SlotState.DRAINING
@@ -3715,24 +3419,18 @@ def test_an_undone_disposal_does_not_publish_a_never_ready_slot_as_claimable() -
 
     class _BrownoutRuntime(_FakeRuntime):
         def is_ready(self, slot: Slot):
-            return None  # control plane will not answer
+            return None                       # control plane will not answer
 
         def reap(self, slot: Slot) -> None:
-            raise OSError("terminate-instances: throttled")  # the same outage
+            raise OSError("terminate-instances: throttled")   # the same outage
 
-    pool = WarmPool(
-        runtime=_BrownoutRuntime(),
-        warm_size=1,
-        spawn_rate_limit=100.0,
-        clock=lambda: now[0],
-        warming_timeout_s=10.0,
-        unknown_grace_s=5.0,
-    )
+    pool = WarmPool(runtime=_BrownoutRuntime(), warm_size=1, spawn_rate_limit=100.0,
+                    clock=lambda: now[0], warming_timeout_s=10.0, unknown_grace_s=5.0)
     pool._spawn_to_deficit(ready=True)
     slot = next(iter(pool._slots.values()))
     slot.state = SlotState.WARMING
 
-    for _ in range(4):  # age past the grace and the warming timeout
+    for _ in range(4):                        # age past the grace and the warming timeout
         pool.tick()
         now[0] += 6.0
     _drain_reapers(pool)
@@ -3745,9 +3443,7 @@ def test_an_undone_disposal_does_not_publish_a_never_ready_slot_as_claimable() -
     )
 
 
-def test_a_warming_slot_whose_unknown_episode_expires_is_suspected_not_convicted() -> (
-    None
-):
+def test_a_warming_slot_whose_unknown_episode_expires_is_suspected_not_convicted() -> None:
     """The IDLE path escalates an expired UNKNOWN "on suspicion, not on a verdict". The WARMING
     path did not, and the asymmetry costs a tier its capacity during the outage this PR exists to
     survive.
@@ -3762,7 +3458,7 @@ def test_a_warming_slot_whose_unknown_episode_expires_is_suspected_not_convicted
     MUTATION: drop the warming-unknown ids from `suspected` -> the slot is convicted, reaped
     synchronously and stranded, and this fails.
     """
-    ready_answer: list = [None]  # UNKNOWN: the control plane will not say
+    ready_answer: list = [None]        # UNKNOWN: the control plane will not say
 
     reap_threads: list = []
 
@@ -3781,19 +3477,13 @@ def test_a_warming_slot_whose_unknown_episode_expires_is_suspected_not_convicted
 
     now = [1000.0]
     rt = _BrownoutRuntime()
-    pool = WarmPool(
-        runtime=rt,
-        warm_size=1,
-        spawn_rate_limit=100.0,
-        clock=lambda: now[0],
-        warming_timeout_s=10.0,
-        unknown_grace_s=5.0,
-    )
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, clock=lambda: now[0],
+                    warming_timeout_s=10.0, unknown_grace_s=5.0)
     pool._spawn_to_deficit(ready=True)
     slot = next(iter(pool._slots.values()))
     slot.state = SlotState.WARMING
 
-    for _ in range(4):  # age it past both the grace and the warming timeout
+    for _ in range(4):                 # age it past both the grace and the warming timeout
         pool.tick()
         now[0] += 6.0
 
@@ -3837,16 +3527,11 @@ def test_a_slow_maintenance_hook_does_not_become_eligible_again_immediately() ->
     class _SlowRuntime(_FakeRuntime):
         def maintain_idle(self, slot: Slot) -> bool:
             calls.append(now[0])
-            now[0] += 30.0  # a stalled describe at the health-probe bound
+            now[0] += 30.0          # a stalled describe at the health-probe bound
             return True
 
-    pool = WarmPool(
-        runtime=_SlowRuntime(),
-        warm_size=1,
-        spawn_rate_limit=100.0,
-        clock=lambda: now[0],
-        maintain_interval_s=5.0,
-    )
+    pool = WarmPool(runtime=_SlowRuntime(), warm_size=1, spawn_rate_limit=100.0,
+                    clock=lambda: now[0], maintain_interval_s=5.0)
     pool._spawn_to_deficit(ready=True)
     for sl in pool._slots.values():
         sl.state = SlotState.IDLE
@@ -3856,7 +3541,7 @@ def test_a_slow_maintenance_hook_does_not_become_eligible_again_immediately() ->
         now[0] += 0.1
 
     assert len(calls) == 1, (
-        f"{len(calls)} slow maintenance passes across 5 ticks ({len(calls) * 30}s of tick-thread "
+        f"{len(calls)} slow maintenance passes across 5 ticks ({len(calls)*30}s of tick-thread "
         f"blockage): a hook that outruns its own cooldown is eligible the moment it returns"
     )
 
@@ -3871,15 +3556,12 @@ def test_the_maintenance_cooldown_map_does_not_grow_without_bound() -> None:
 
     MUTATION: remove the _maintain_last.pop from _forget_slot_health -> the map keeps every id.
     """
-
     class _MaintainedRuntime(_FakeRuntime):
         def maintain_idle(self, slot: Slot) -> bool:
             return True
 
     rt = _MaintainedRuntime()
-    pool = WarmPool(
-        runtime=rt, warm_size=1, spawn_rate_limit=100.0, maintain_interval_s=0.0
-    )
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, maintain_interval_s=0.0)
     seen: set = set()
     for _ in range(6):
         pool._spawn_to_deficit(ready=True)
@@ -3890,9 +3572,7 @@ def test_the_maintenance_cooldown_map_does_not_grow_without_bound() -> None:
             seen.add(sl.slot_id)
             pool.retire(sl)
 
-    assert len(seen) >= 3, (
-        "sanity: several distinct slots really did pass through maintenance"
-    )
+    assert len(seen) >= 3, "sanity: several distinct slots really did pass through maintenance"
     leaked = set(pool._maintain_last) - set(pool._slots)
     assert not leaked, (
         f"{len(leaked)} cooldown entries survive slots that have left the pool; on a disposable "
@@ -3920,18 +3600,13 @@ def test_maintenance_is_rate_limited_per_slot_not_run_on_every_tick() -> None:
             return True
 
     rt = _CountingRuntime()
-    pool = WarmPool(
-        runtime=rt,
-        warm_size=1,
-        spawn_rate_limit=100.0,
-        clock=lambda: now[0],
-        maintain_interval_s=5.0,
-    )
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0,
+                    clock=lambda: now[0], maintain_interval_s=5.0)
     pool._spawn_to_deficit(ready=True)
     for sl in pool._slots.values():
         sl.state = SlotState.IDLE
 
-    for _ in range(20):  # 2 seconds of ticks at 0.1s
+    for _ in range(20):                 # 2 seconds of ticks at 0.1s
         pool._maintain_idle()
         now[0] += 0.1
 
@@ -3940,16 +3615,12 @@ def test_maintenance_is_rate_limited_per_slot_not_run_on_every_tick() -> None:
         f"control-plane call per tick"
     )
 
-    now[0] += 5.0  # past the cooldown
+    now[0] += 5.0                       # past the cooldown
     pool._maintain_idle()
-    assert len(calls) == 2, (
-        "the cooldown never expires — the slot would stop being reconciled"
-    )
+    assert len(calls) == 2, "the cooldown never expires — the slot would stop being reconciled"
 
 
-def test_an_unusable_slot_is_never_claimable_between_maintenance_and_retirement() -> (
-    None
-):
+def test_an_unusable_slot_is_never_claimable_between_maintenance_and_retirement() -> None:
     """An unusable slot must never be handed to a claimant between the verdict and its disposal.
 
     The observation point has moved twice. It first watched runtime.base_identity(), which
@@ -3964,11 +3635,9 @@ def test_an_unusable_slot_is_never_claimable_between_maintenance_and_retirement(
     acted_on: list = []
 
     class _UnusableRuntime(_FakeRuntime):
-        def maintain_idle(self, slot: Slot, *, budget_s=None) -> bool:  # noqa: ANN001
-            acted_on.append(
-                slot.slot_id
-            )  # the slot the PASS chose, not whichever _slots
-            return False  # iterates first -- a replacement may already exist
+        def maintain_idle(self, slot: Slot, *, budget_s=None) -> bool:    # noqa: ANN001
+            acted_on.append(slot.slot_id)   # the slot the PASS chose, not whichever _slots
+            return False                    # iterates first -- a replacement may already exist
 
     rt = _UnusableRuntime()
     pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
@@ -3980,19 +3649,14 @@ def test_an_unusable_slot_is_never_claimable_between_maintenance_and_retirement(
 
     pool._maintain_idle()
 
-    assert len(acted_on) == 1, (
-        f"the maintenance pass ran {len(acted_on)} times, not once"
-    )
+    assert len(acted_on) == 1, f"the maintenance pass ran {len(acted_on)} times, not once"
     sid = acted_on[0]
     state = pool._slots[sid].state
     assert state is SlotState.DRAINING, (
         f"slot was {state} after an unusable verdict; anything claimable here hands a caller a "
         f"worker that is about to be terminated"
     )
-    assert sid in pool._deferred_reap, (
-        "the husk was left with nobody owning its disposal"
-    )
-
+    assert sid in pool._deferred_reap, "the husk was left with nobody owning its disposal"
 
 def test_maintenance_rotates_so_every_idle_slot_is_eventually_reconciled() -> None:
     """issue #80: 'ONE slot per tick' has to mean a DIFFERENT slot per tick.
@@ -4017,9 +3681,7 @@ def test_maintenance_rotates_so_every_idle_slot_is_eventually_reconciled() -> No
     # to the next one) -- and a mutation that broke the cursor survived the first version of this
     # test for exactly that reason. Turning the cooldown off leaves the cursor as the only thing
     # that can rotate.
-    pool = WarmPool(
-        runtime=rt, warm_size=3, spawn_rate_limit=100.0, maintain_interval_s=0.0
-    )
+    pool = WarmPool(runtime=rt, warm_size=3, spawn_rate_limit=100.0, maintain_interval_s=0.0)
     pool._spawn_to_deficit(ready=True)
     for s in pool._slots.values():
         s.state = SlotState.IDLE
@@ -4038,7 +3700,6 @@ def test_maintenance_rotates_so_every_idle_slot_is_eventually_reconciled() -> No
 def test_a_slot_reported_unusable_is_retired() -> None:
     """The terminal give-up has to RETURN capacity. Parking a permanently unclaimable slot is the
     failure mode issue #80 calls out: it blocks its own replacement."""
-
     class _UnusableRuntime(_FakeRuntime):
         def maintain_idle(self, slot: Slot) -> bool:
             return False
@@ -4085,27 +3746,21 @@ def test_a_slot_restored_to_warming_is_not_re_condemned_on_the_very_next_tick():
             super().__init__()
             self.terminates = 0
 
-        def is_ready(self, slot):  # noqa: ANN001 -- brownout: no verdict either way
+        def is_ready(self, slot):   # noqa: ANN001 -- brownout: no verdict either way
             return None
 
-        def is_alive(self, slot):  # noqa: ANN001
+        def is_alive(self, slot):   # noqa: ANN001
             return None
 
-        def reap(self, slot):  # noqa: ANN001 -- disposal fails, as it does in a brownout
+        def reap(self, slot):       # noqa: ANN001 -- disposal fails, as it does in a brownout
             self.terminates += 1
             raise OSError("terminate-instances: throttled")
 
     rt = _Throttled()
-    pool = WarmPool(
-        runtime=rt,
-        warm_size=1,
-        spawn_rate_limit=1e6,
-        clock=lambda: now[0],
-        warming_timeout_s=30.0,
-        unknown_grace_s=60.0,
-    )
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=1e6, clock=lambda: now[0],
+                    warming_timeout_s=30.0, unknown_grace_s=60.0)
     pool._spawn_to_deficit(ready=True)
-    for _ in range(40):  # 200s of simulated time at a 5s tick
+    for _ in range(40):                       # 200s of simulated time at a 5s tick
         pool._promote_warming()
         pool._health_check()
         pool._drain_deferred_reaps()
@@ -4127,16 +3782,16 @@ def test_a_maintenance_hook_failure_is_not_charged_as_a_worker_fault():
     class _NeverParks(_FakeRuntime):
         kind = "aws-ec2-hibernate"
 
-        def maintain_idle(self, slot):  # noqa: ANN001
+        def maintain_idle(self, slot):   # noqa: ANN001
             return False
 
-        def reap(self, slot):  # noqa: ANN001
+        def reap(self, slot):            # noqa: ANN001
             pass
 
     rt = _NeverParks()
     pool = WarmPool(runtime=rt, warm_size=3, spawn_rate_limit=1e6, clock=lambda: now[0])
     blamed: list[str] = []
-    pool._blame_tiers = lambda ids: blamed.extend(ids)  # type: ignore[method-assign]
+    pool._blame_tiers = lambda ids: blamed.extend(ids)   # type: ignore[method-assign]
     pool._spawn_to_deficit(ready=True)
     for slot in list(pool._slots.values()):
         slot.state = SlotState.IDLE
@@ -4144,9 +3799,7 @@ def test_a_maintenance_hook_failure_is_not_charged_as_a_worker_fault():
         now[0] += 10.0
         pool._maintain_idle()
 
-    assert not blamed, (
-        f"{len(blamed)} slots blamed on the cascade for a control-plane park failure"
-    )
+    assert not blamed, f"{len(blamed)} slots blamed on the cascade for a control-plane park failure"
     assert not any(pool._pool_consecutive_failures.values()), (
         f"restore-failure streak {dict(pool._pool_consecutive_failures)} charged to the base for "
         f"an outage that said nothing about any worker"
@@ -4170,31 +3823,23 @@ def test_a_suspected_slot_is_never_reaped_on_the_tick_thread():
             super().__init__()
             self.sync_reaps = 0
 
-        def is_ready(self, slot):  # noqa: ANN001
+        def is_ready(self, slot):   # noqa: ANN001
             return None
 
-        def is_alive(self, slot):  # noqa: ANN001
+        def is_alive(self, slot):   # noqa: ANN001
             return None
 
-        def reap(self, slot):  # noqa: ANN001
+        def reap(self, slot):       # noqa: ANN001
             self.sync_reaps += 1
 
     rt = _Unknowable()
-    pool = WarmPool(
-        runtime=rt,
-        warm_size=1,
-        spawn_rate_limit=1e6,
-        clock=lambda: now[0],
-        warming_timeout_s=30.0,
-        unknown_grace_s=60.0,
-    )
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=1e6, clock=lambda: now[0],
+                    warming_timeout_s=30.0, unknown_grace_s=60.0)
     pool._spawn_to_deficit(ready=True)
     for _ in range(40):
         pool._promote_warming()
         pool._health_check()
-        assert rt.sync_reaps == 0, (
-            "a suspected slot was reaped in-line on the tick thread"
-        )
+        assert rt.sync_reaps == 0, "a suspected slot was reaped in-line on the tick thread"
         now[0] += 5.0
     assert pool._deferred_reap, (
         "the slot was condemned but never handed to the deferred reapers -- if it is being "
@@ -4214,11 +3859,9 @@ def test_a_serial_spawn_reaped_before_publication_leaves_no_marker_behind():
     box: dict = {}
 
     class _StopsMidSpawn(_FakeRuntime):
-        def spawn(self):  # noqa: ANN001, ANN201
+        def spawn(self):    # noqa: ANN001, ANN201
             slot = super().spawn()
-            box[
-                "pool"
-            ]._stop_event.set()  # stop() landed while the create was in flight
+            box["pool"]._stop_event.set()      # stop() landed while the create was in flight
             return slot
 
     rt = _StopsMidSpawn()
@@ -4247,10 +3890,10 @@ def test_a_maintenance_hook_that_cannot_tell_does_not_retire_the_slot():
             super().__init__()
             self.reaps = 0
 
-        def maintain_idle(self, slot):  # noqa: ANN001 -- could not determine; NOT a verdict
+        def maintain_idle(self, slot):   # noqa: ANN001 -- could not determine; NOT a verdict
             return None
 
-        def reap(self, slot):  # noqa: ANN001
+        def reap(self, slot):            # noqa: ANN001
             self.reaps += 1
 
     rt = _Unsure()
@@ -4274,13 +3917,12 @@ def test_a_failed_maintenance_reap_is_not_requeued_after_shutdown():
     so a pool restarted on the same object releases the id on its first tick and re-terminates a
     resource whose disposal already failed -- the quarantine rule, broken from the far side of the
     clear meant to enforce it."""
-
     class _Throttled(_FakeRuntime):
         def __init__(self) -> None:
             super().__init__()
             self.attempts = 0
 
-        def reap(self, slot):  # noqa: ANN001
+        def reap(self, slot):    # noqa: ANN001
             self.attempts += 1
             raise OSError("terminate-instances: throttled")
 
@@ -4289,12 +3931,10 @@ def test_a_failed_maintenance_reap_is_not_requeued_after_shutdown():
     pool._spawn_to_deficit(ready=True)
     sid = next(iter(pool._slots))
     pool._slots[sid].state = SlotState.DRAINING
-    pool._maintain_reap_tries[sid] = (
-        0  # a maintenance husk still within its retry budget
-    )
+    pool._maintain_reap_tries[sid] = 0        # a maintenance husk still within its retry budget
     pool._deferred_reap.add(sid)
 
-    pool._stop_event.set()  # shutdown has begun and the queues were cleared
+    pool._stop_event.set()                    # shutdown has begun and the queues were cleared
     pool._drain_deferred_reaps()
     for entry in list(pool._reaper_threads):
         entry[0].join(timeout=5)
@@ -4318,13 +3958,12 @@ def test_a_suspected_slot_is_not_republished_during_shutdown():
     because a reaper owned it. A pool restarted on the same object could then hand a job to a
     resource whose termination failed. Requeue and restore owe shutdown the same thing.
     """
-
     class _Throttled(_FakeRuntime):
         def __init__(self) -> None:
             super().__init__()
             self.attempts = 0
 
-        def reap(self, slot):  # noqa: ANN001
+        def reap(self, slot):    # noqa: ANN001
             self.attempts += 1
             raise OSError("terminate-instances: throttled")
 
@@ -4333,7 +3972,7 @@ def test_a_suspected_slot_is_not_republished_during_shutdown():
     pool._spawn_to_deficit(ready=True)
     sid = next(iter(pool._slots))
     pool._slots[sid].state = SlotState.DRAINING
-    pool._suspected_unknown.add(sid)  # escalated on suspicion, never confirmed dead
+    pool._suspected_unknown.add(sid)          # escalated on suspicion, never confirmed dead
     pool._deferred_reap.add(sid)
 
     pool._stop_event.set()
@@ -4359,9 +3998,7 @@ def test_every_deferred_reap_producer_goes_through_the_chokepoint() -> None:
     import ast
     from pathlib import Path
 
-    src = (
-        Path(__file__).resolve().parents[2] / "src/blastbox/host/pool.py"
-    ).read_text()
+    src = (Path(__file__).resolve().parents[2] / "src/blastbox/host/pool.py").read_text()
     tree = ast.parse(src)
     offenders = []
     for node in ast.walk(tree):
@@ -4371,15 +4008,9 @@ def test_every_deferred_reap_producer_goes_through_the_chokepoint() -> None:
             continue
         recv = node.func.value
         if isinstance(recv, ast.Attribute) and recv.attr == "_deferred_reap":
-            fn = next(
-                (
-                    f
-                    for f in ast.walk(tree)
-                    if isinstance(f, ast.FunctionDef)
-                    and f.lineno <= node.lineno <= (f.end_lineno or 0)
-                ),
-                None,
-            )
+            fn = next((f for f in ast.walk(tree)
+                       if isinstance(f, ast.FunctionDef)
+                       and f.lineno <= node.lineno <= (f.end_lineno or 0)), None)
             name = fn.name if fn else "<module>"
             if name != "_queue_deferred_reap_unlocked":
                 offenders.append(f"{name}() at pool.py:{node.lineno}")
@@ -4400,10 +4031,10 @@ def test_the_maintenance_producer_publishes_nothing_after_shutdown() -> None:
     now = [1000.0]
 
     class _Unusable(_FakeRuntime):
-        def maintain_idle(self, slot):  # noqa: ANN001
+        def maintain_idle(self, slot):    # noqa: ANN001
             return False
 
-        def reap(self, slot):  # noqa: ANN001
+        def reap(self, slot):             # noqa: ANN001
             raise OSError("terminate-instances: throttled")
 
     rt = _Unusable()
@@ -4412,7 +4043,7 @@ def test_the_maintenance_producer_publishes_nothing_after_shutdown() -> None:
     sid = next(iter(pool._slots))
     pool._slots[sid].state = SlotState.IDLE
 
-    pool._stop_event.set()  # shutdown has begun and the queues were cleared
+    pool._stop_event.set()                # shutdown has begun and the queues were cleared
     now[0] += 10.0
     pool._maintain_idle()
 
@@ -4430,13 +4061,12 @@ def test_the_last_permitted_disposal_is_not_requeued_for_one_more():
     third disposal had just failed (stored value 2) was requeued for a FOURTH. Driven at the
     boundary, because that is where the off-by-one lives.
     """
-
     class _NeverDisposes(_FakeRuntime):
         def __init__(self) -> None:
             super().__init__()
             self.terminates = 0
 
-        def reap(self, slot):  # noqa: ANN001
+        def reap(self, slot):             # noqa: ANN001
             self.terminates += 1
             raise OSError("terminate-instances: throttled")
 
@@ -4454,16 +4084,12 @@ def test_the_last_permitted_disposal_is_not_requeued_for_one_more():
     for entry in list(pool._reaper_threads):
         entry[0].join(timeout=5)
 
-    assert rt.terminates == 1, (
-        "the attempt under test must actually have run and failed"
-    )
+    assert rt.terminates == 1, "the attempt under test must actually have run and failed"
     assert sid not in pool._deferred_reap_next, (
         f"a husk whose disposal #{budget} just failed was requeued for #{budget + 1}; the budget "
         f"is compared against the stored count instead of the one that just failed"
     )
-    assert sid not in pool._maintain_reap_tries, (
-        "an abandoned husk must not keep its retry budget"
-    )
+    assert sid not in pool._maintain_reap_tries, "an abandoned husk must not keep its retry budget"
 
 
 def test_no_new_reaper_thread_starts_once_shutdown_has_begun():
@@ -4475,13 +4101,12 @@ def test_no_new_reaper_thread_starts_once_shutdown_has_begun():
     resource stop() has already disposed of or quarantined. Guarding only the queue left this open
     -- a tick thread inside a slow maintenance hook returns after stop() and spawns reapers anyway.
     """
-
     class _Slow(_FakeRuntime):
         def __init__(self) -> None:
             super().__init__()
             self.terminates = 0
 
-        def reap(self, slot):  # noqa: ANN001
+        def reap(self, slot):    # noqa: ANN001
             self.terminates += 1
 
     rt = _Slow()
@@ -4489,7 +4114,7 @@ def test_no_new_reaper_thread_starts_once_shutdown_has_begun():
     pool._spawn_to_deficit(ready=True)
     sid = next(iter(pool._slots))
     pool._slots[sid].state = SlotState.DRAINING
-    pool._deferred_reap.add(sid)  # queued before shutdown, as a real race leaves it
+    pool._deferred_reap.add(sid)          # queued before shutdown, as a real race leaves it
 
     pool._stop_event.set()
     pool._reap_deferred()
@@ -4500,22 +4125,19 @@ def test_no_new_reaper_thread_starts_once_shutdown_has_begun():
         f"{len(pool._reaper_threads)} reaper thread(s) started after shutdown; stop() has already "
         f"joined its snapshot, so nothing will ever join these"
     )
-    assert rt.terminates == 0, (
-        "a terminate was issued by a reaper stop() cannot account for"
-    )
+    assert rt.terminates == 0, "a terminate was issued by a reaper stop() cannot account for"
 
 
 def test_no_maintenance_pass_starts_once_shutdown_has_begun():
     """Guarding the individual writes was not enough: the pass stamps the per-slot cooldown at its
     TOP, before the hook runs, so a pass entered after stop() re-created an entry _forget_slot_health
     had already collected. Nothing a maintenance pass does during shutdown serves a later pass."""
-
     class _Unusable(_FakeRuntime):
         def __init__(self) -> None:
             super().__init__()
             self.hooks = 0
 
-        def maintain_idle(self, slot):  # noqa: ANN001
+        def maintain_idle(self, slot):    # noqa: ANN001
             self.hooks += 1
             return False
 
@@ -4529,39 +4151,34 @@ def test_no_maintenance_pass_starts_once_shutdown_has_begun():
     pool._maintain_idle()
 
     assert rt.hooks == 0, "a maintenance hook ran during shutdown"
-    assert not pool._maintain_last, (
-        "the pass stamped a cooldown nothing will ever collect"
-    )
+    assert not pool._maintain_last, "the pass stamped a cooldown nothing will ever collect"
 
 
 def test_a_maintenance_verdict_does_not_retire_during_shutdown():
     """The retire is issued straight from the tick thread, bypassing BOTH the deferred queue and
     the reaper threads -- which is why guarding those two did not close it. stop() disposes every
     tracked slot itself, so this would be a second terminate on a resource it already handled."""
-
     class _Unusable(_FakeRuntime):
         def __init__(self) -> None:
             super().__init__()
             self.terminates = 0
 
-        def maintain_idle(self, slot):  # noqa: ANN001
-            self.pool._stop_event.set()  # stop() lands while the hook is running
+        def maintain_idle(self, slot):    # noqa: ANN001
+            self.pool._stop_event.set()   # stop() lands while the hook is running
             return False
 
-        def reap(self, slot):  # noqa: ANN001
+        def reap(self, slot):             # noqa: ANN001
             self.terminates += 1
 
     rt = _Unusable()
     pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=1e6)
-    rt.pool = pool  # type: ignore[attr-defined]
+    rt.pool = pool                        # type: ignore[attr-defined]
     pool._spawn_to_deficit(ready=True)
     sid = next(iter(pool._slots))
     pool._slots[sid].state = SlotState.IDLE
 
     pool._maintain_idle()
-    assert rt.terminates == 0, (
-        "retired a slot mid-shutdown; stop() disposes them itself"
-    )
+    assert rt.terminates == 0, "retired a slot mid-shutdown; stop() disposes them itself"
 
 
 def test_forget_slot_health_collects_every_per_slot_map():
@@ -4586,17 +4203,16 @@ def test_a_slot_reaped_during_its_readiness_probe_is_not_resurrected():
     inside that window. Writing the unknown-episode maps afterwards re-creates exactly what the
     forget just removed -- and _warming_unknown_since's only other cleanup is a sweep that stops
     running the moment stop() is called, so the entry would be permanent."""
-
     class _ReapedMidProbe(_FakeRuntime):
-        def is_ready(self, slot):  # noqa: ANN001
-            with self.pool._lock:  # stop() wins the race while we are "in" the probe
+        def is_ready(self, slot):    # noqa: ANN001
+            with self.pool._lock:    # stop() wins the race while we are "in" the probe
                 self.pool._slots.pop(slot.slot_id, None)
                 self.pool._forget_slot_health(slot.slot_id)
-            return None  # ...and only then does the probe answer UNKNOWN
+            return None              # ...and only then does the probe answer UNKNOWN
 
     rt = _ReapedMidProbe()
     pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=1e6)
-    rt.pool = pool  # type: ignore[attr-defined]
+    rt.pool = pool                   # type: ignore[attr-defined]
     pool._spawn_to_deficit(ready=True)
     pool._promote_warming()
 
@@ -4629,33 +4245,26 @@ def test_a_slow_base_identity_does_not_stall_the_whole_pool():
             super().__init__()
             self.slow = False
 
-        def base_identity(self, slot):  # noqa: ANN001
+        def base_identity(self, slot):    # noqa: ANN001
             if self.slow:
-                time.sleep(2.0)  # a cascade/remote identity lookup that stalls
+                time.sleep(2.0)           # a cascade/remote identity lookup that stalls
             return "tierA"
 
     rt = _SlowIdentity()
-    pool = WarmPool(
-        runtime=rt,
-        warm_size=2,
-        concurrent_ceiling=4,
-        clock=time.monotonic,
-        spawn_rate_limit=1e6,
-    )
+    pool = WarmPool(runtime=rt, warm_size=2, concurrent_ceiling=4,
+                    clock=time.monotonic, spawn_rate_limit=1e6)
     pool.tick()
     pool.tick()
-    assert any(s.state == SlotState.IDLE for s in pool._slots.values()), (
-        "need a warm IDLE slot"
-    )
+    assert any(s.state == SlotState.IDLE for s in pool._slots.values()), "need a warm IDLE slot"
 
     pool.resize(warm_size=4)
     rt.slow = True
     publisher = threading.Thread(target=pool.tick, daemon=True)
     publisher.start()
-    time.sleep(0.3)  # let it get INTO the callout
+    time.sleep(0.3)                       # let it get INTO the callout
 
     t0 = time.monotonic()
-    pool.claim(timeout_s=0.0)  # non-blocking, on a slot that is already IDLE
+    pool.claim(timeout_s=0.0)             # non-blocking, on a slot that is already IDLE
     blocked = time.monotonic() - t0
     publisher.join(timeout=10)
 
@@ -4680,25 +4289,17 @@ def test_a_slow_base_identity_does_not_stall_the_pool_on_the_concurrent_path_eit
             super().__init__()
             self.slow = False
 
-        def base_identity(self, slot):  # noqa: ANN001
+        def base_identity(self, slot):    # noqa: ANN001
             if self.slow:
                 time.sleep(2.0)
             return "tierA"
 
     rt = _SlowIdentity()
-    pool = WarmPool(
-        runtime=rt,
-        warm_size=2,
-        concurrent_ceiling=6,
-        spawn_concurrency=3,
-        clock=time.monotonic,
-        spawn_rate_limit=1e6,
-    )
+    pool = WarmPool(runtime=rt, warm_size=2, concurrent_ceiling=6, spawn_concurrency=3,
+                    clock=time.monotonic, spawn_rate_limit=1e6)
     pool.tick()
     pool.tick()
-    assert any(s.state == SlotState.IDLE for s in pool._slots.values()), (
-        "need a warm IDLE slot"
-    )
+    assert any(s.state == SlotState.IDLE for s in pool._slots.values()), "need a warm IDLE slot"
 
     pool.resize(warm_size=6)
     rt.slow = True
@@ -4726,22 +4327,18 @@ def test_the_maintenance_pass_is_bounded_by_the_pools_budget_not_the_runtimes():
     seen: list = []
 
     class _Budgeted(_FakeRuntime):
-        def maintain_idle(self, slot, *, budget_s=None):  # noqa: ANN001
+        def maintain_idle(self, slot, *, budget_s=None):    # noqa: ANN001
             seen.append(budget_s)
             return True
 
     rt = _Budgeted()
-    pool = WarmPool(
-        runtime=rt, warm_size=1, spawn_rate_limit=1e6, maintain_budget_s=2.5
-    )
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=1e6, maintain_budget_s=2.5)
     pool._spawn_to_deficit(ready=True)
     sid = next(iter(pool._slots))
     pool._slots[sid].state = SlotState.IDLE
     pool._maintain_idle()
 
-    assert seen == [2.5], (
-        f"the hook was called with {seen}; the pool's budget was not applied"
-    )
+    assert seen == [2.5], f"the hook was called with {seen}; the pool's budget was not applied"
 
 
 def test_a_hook_without_a_budget_parameter_is_still_supported():
@@ -4750,14 +4347,12 @@ def test_a_hook_without_a_budget_parameter_is_still_supported():
     seen: list = []
 
     class _OldSignature(_FakeRuntime):
-        def maintain_idle(self, slot):  # noqa: ANN001 -- no budget_s
+        def maintain_idle(self, slot):    # noqa: ANN001 -- no budget_s
             seen.append(slot.slot_id)
             return True
 
     rt = _OldSignature()
-    pool = WarmPool(
-        runtime=rt, warm_size=1, spawn_rate_limit=1e6, maintain_budget_s=2.5
-    )
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=1e6, maintain_budget_s=2.5)
     pool._spawn_to_deficit(ready=True)
     sid = next(iter(pool._slots))
     pool._slots[sid].state = SlotState.IDLE
@@ -4773,7 +4368,7 @@ def test_stop_closes_a_runtime_that_has_background_work():
     closed: list = []
 
     class _HasBackgroundWork(_FakeRuntime):
-        def close(self):  # noqa: ANN201
+        def close(self):    # noqa: ANN201
             closed.append(True)
 
     pool = WarmPool(runtime=_HasBackgroundWork(), warm_size=1, spawn_rate_limit=1e6)
@@ -4785,14 +4380,13 @@ def test_stop_closes_a_runtime_that_has_background_work():
 
 def test_a_runtime_close_that_raises_does_not_block_shutdown():
     """Best-effort, like every other optional seam here: shutdown must complete regardless."""
-
     class _BadClose(_FakeRuntime):
-        def close(self):  # noqa: ANN201
+        def close(self):    # noqa: ANN201
             raise RuntimeError("cannot join")
 
     pool = WarmPool(runtime=_BadClose(), warm_size=1, spawn_rate_limit=1e6)
     pool._spawn_to_deficit(ready=True)
-    pool.stop()  # must not raise
+    pool.stop()          # must not raise
 
 
 def test_closing_the_runtime_stays_inside_the_shutdown_budget():
@@ -4805,7 +4399,7 @@ def test_closing_the_runtime_stays_inside_the_shutdown_budget():
     seen: list = []
 
     class _SlowClose(_FakeRuntime):
-        def close(self, *, timeout_s=None):  # noqa: ANN001
+        def close(self, *, timeout_s=None):    # noqa: ANN001
             seen.append(timeout_s)
             time.sleep(min(0.2, timeout_s if timeout_s is not None else 0.2))
 
@@ -4834,11 +4428,11 @@ def test_a_restarted_pool_can_admit_deferred_tiers_again():
             super().__init__()
             self.closed = False
 
-        def close(self, *, timeout_s=None):  # noqa: ANN001
+        def close(self, *, timeout_s=None):    # noqa: ANN001
             self.closed = True
             events.append("close")
 
-        def reopen(self):  # noqa: ANN201
+        def reopen(self):    # noqa: ANN201
             self.closed = False
             events.append("reopen")
 
@@ -4856,18 +4450,12 @@ def test_a_restarted_pool_can_admit_deferred_tiers_again():
         pool.stop(stop_timeout_s=0.0)
 
 
-@pytest.mark.parametrize(
-    ("given", "expected"),
-    [
-        (-5.0, 0.0),  # negative defeats the rate limit outright
-        (
-            float("nan"),
-            5.0,
-        ),  # every comparison against NaN is False -> nothing ever eligible
-        (float("inf"), 5.0),
-        (12.0, 12.0),
-    ],
-)
+@pytest.mark.parametrize(("given", "expected"), [
+    (-5.0, 0.0),                 # negative defeats the rate limit outright
+    (float("nan"), 5.0),         # every comparison against NaN is False -> nothing ever eligible
+    (float("inf"), 5.0),
+    (12.0, 12.0),
+])
 def test_the_maintenance_interval_is_validated(given, expected):
     """Both maintenance knobs are operator-settable from the environment now, so an out-of-range
     one breaks the guarantee its own doc row makes.
@@ -4877,23 +4465,15 @@ def test_the_maintenance_interval_is_validated(given, expected):
     inverse -- no slot is ever eligible, so a half-resumed instance is never reconciled and just
     keeps running and billing, silently, with maintenance apparently configured.
     """
-    pool = WarmPool(
-        runtime=_FakeRuntime(),
-        warm_size=1,
-        spawn_rate_limit=1e6,
-        maintain_interval_s=given,
-    )
+    pool = WarmPool(runtime=_FakeRuntime(), warm_size=1, spawn_rate_limit=1e6,
+                    maintain_interval_s=given)
     assert pool._maintain_interval_s == expected
 
 
 def test_the_maintenance_budget_is_validated_the_same_way():
     """The budget was clamped and the interval was not, in the same commit that added both."""
-    pool = WarmPool(
-        runtime=_FakeRuntime(),
-        warm_size=1,
-        spawn_rate_limit=1e6,
-        maintain_budget_s=float("nan"),
-    )
+    pool = WarmPool(runtime=_FakeRuntime(), warm_size=1, spawn_rate_limit=1e6,
+                    maintain_budget_s=float("nan"))
     assert pool._maintain_budget_s == 5.0
 
 
@@ -4904,25 +4484,24 @@ def test_maintenance_does_not_retire_a_slot_shutdown_already_took():
     already failed. stop() flips every slot to DRAINING under the pool lock before reaping, so
     "is it still the ASSIGNED slot I reserved?" is the compare-and-swap that closes the window.
     """
-
     class _Unusable(_FakeRuntime):
         def __init__(self) -> None:
             super().__init__()
             self.terminates = 0
 
-        def maintain_idle(self, slot, *, budget_s=None):  # noqa: ANN001
+        def maintain_idle(self, slot, *, budget_s=None):    # noqa: ANN001
             # stop() wins the race while the hook is running: it flips the slot to DRAINING
             # under the lock, exactly as the real stop() does before reaping.
             with self.pool._lock:
                 self.pool._slots[slot.slot_id].state = SlotState.DRAINING
             return False
 
-        def reap(self, slot):  # noqa: ANN001
+        def reap(self, slot):    # noqa: ANN001
             self.terminates += 1
 
     rt = _Unusable()
     pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=1e6)
-    rt.pool = pool  # type: ignore[attr-defined]
+    rt.pool = pool           # type: ignore[attr-defined]
     pool._spawn_to_deficit(ready=True)
     sid = next(iter(pool._slots))
     pool._slots[sid].state = SlotState.IDLE
@@ -4948,7 +4527,7 @@ def test_the_tick_gives_the_runtime_its_periodic_beat():
     beats: list = []
 
     class _Beating(_FakeRuntime):
-        def poll(self):  # noqa: ANN201
+        def poll(self):    # noqa: ANN201
             beats.append(1)
 
     pool = WarmPool(runtime=_Beating(), warm_size=0, spawn_rate_limit=1e6)
@@ -4960,16 +4539,14 @@ def test_the_tick_gives_the_runtime_its_periodic_beat():
 
 def test_a_runtime_poll_that_raises_does_not_break_the_tick():
     class _BadPoll(_FakeRuntime):
-        def poll(self):  # noqa: ANN201
+        def poll(self):    # noqa: ANN201
             raise RuntimeError("probe scheduling blew up")
 
     pool = WarmPool(runtime=_BadPoll(), warm_size=0, spawn_rate_limit=1e6)
-    pool.tick()  # must not raise
+    pool.tick()          # must not raise
 
 
-def test_a_stop_landing_between_the_latch_and_the_lock_makes_no_maintenance_writes() -> (
-    None
-):
+def test_a_stop_landing_between_the_latch_and_the_lock_makes_no_maintenance_writes() -> None:
     """The shutdown latch was read BEFORE _lock was acquired, so it was a hint, not a gate.
 
     `_maintain_idle` returns early when _stop_event is set. But that read happens at the top of the
@@ -4996,12 +4573,8 @@ def test_a_stop_landing_between_the_latch_and_the_lock_makes_no_maintenance_writ
             calls.append(slot.slot_id)
             return True
 
-    pool = WarmPool(
-        runtime=_CountingRuntime(),
-        warm_size=1,
-        spawn_rate_limit=100.0,
-        maintain_interval_s=0.0,
-    )
+    pool = WarmPool(runtime=_CountingRuntime(), warm_size=1, spawn_rate_limit=100.0,
+                    maintain_interval_s=0.0)
     pool._spawn_to_deficit(ready=True)
     slot = next(iter(pool._slots.values()))
     slot.state = SlotState.IDLE
@@ -5011,14 +4584,14 @@ def test_a_stop_landing_between_the_latch_and_the_lock_makes_no_maintenance_writ
     class _StopOnAcquire:
         """stop() lands after the fast-path read, while this pass is taking the lock."""
 
-        def __enter__(self):  # noqa: ANN204
+        def __enter__(self):                     # noqa: ANN204
             pool._stop_event.set()
             return real_lock.__enter__()
 
-        def __exit__(self, *exc):  # noqa: ANN002, ANN204
+        def __exit__(self, *exc):                # noqa: ANN002, ANN204
             return real_lock.__exit__(*exc)
 
-    pool._lock = _StopOnAcquire()  # type: ignore[assignment]
+    pool._lock = _StopOnAcquire()                # type: ignore[assignment]
     try:
         pool._maintain_idle()
     finally:
@@ -5026,21 +4599,16 @@ def test_a_stop_landing_between_the_latch_and_the_lock_makes_no_maintenance_writ
 
     assert calls == [], (
         f"the maintenance hook ran during shutdown ({calls}); it makes control-plane calls whose "
-        f"results land behind stop()'s clears and are never read"
-    )
+        f"results land behind stop()'s clears and are never read")
     assert slot.state == SlotState.IDLE, (
         "a slot was reserved ASSIGNED during shutdown; _spawn_to_deficit counts it as active, so "
-        "it is capacity lost with no later pass to hand it back"
-    )
+        "it is capacity lost with no later pass to hand it back")
     assert pool._maintain_last == {}, (
         f"_maintain_last was stamped during shutdown ({pool._maintain_last}); this is the exact "
-        f"re-creation-after-_forget_slot_health leak the latch exists to prevent"
-    )
+        f"re-creation-after-_forget_slot_health leak the latch exists to prevent")
 
 
-def test_a_runtime_may_declare_a_warming_slot_terminal_before_the_pools_own_budget() -> (
-    None
-):
+def test_a_runtime_may_declare_a_warming_slot_terminal_before_the_pools_own_budget() -> None:
     """Two clocks disagreed silently, and the shorter one had no way to say so.
 
     ec2-hibernate gives up on parking at `hibernate_timeout_s` (300s) and reports not-ready. The
@@ -5058,48 +4626,42 @@ def test_a_runtime_may_declare_a_warming_slot_terminal_before_the_pools_own_budg
     MUTATION: drop the `_terminal` clause from the stuck_warming comprehension -> the slot survives
     the health check and this fails.
     """
-
     class _TerminalWhenAsked(_FakeRuntime):
         terminal: bool = False
 
         def is_ready(self, slot: Slot) -> "bool | None":
-            return False  # never promotes on its own
+            return False                      # never promotes on its own
 
         def is_warming_terminal(self, slot: Slot) -> bool:
             return self.terminal
 
     rt = _TerminalWhenAsked()
     # A warming budget far longer than the runtime's own give-up point.
-    pool = WarmPool(
-        runtime=rt, warm_size=1, spawn_rate_limit=100.0, warming_timeout_s=600.0
-    )
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, warming_timeout_s=600.0)
     pool._spawn_to_deficit(ready=True)
     slot = next(iter(pool._slots.values()))
     slot.state = SlotState.WARMING
 
     pool._health_check()
     assert slot.slot_id in pool._slots, (
-        "sanity: a WARMING slot inside both budgets must not be evicted"
-    )
+        "sanity: a WARMING slot inside both budgets must not be evicted")
 
-    rt.terminal = True  # the runtime gives up
+    rt.terminal = True                        # the runtime gives up
     pool._health_check()
 
     cur = pool._slots.get(slot.slot_id)
     assert cur is None or cur.state is SlotState.DRAINING, (
         "a WARMING slot the runtime declared terminal was left alone until warming_timeout_s; it is "
         "a running, billing instance past its documented destruction point, blocking its own "
-        "replacement"
-    )
+        "replacement")
 
 
 def test_a_raising_or_unknown_terminal_hook_never_destroys_a_warming_slot() -> None:
-    """ "We could not tell" is not "destroy it" -- the whole point of this branch.
+    """"We could not tell" is not "destroy it" -- the whole point of this branch.
 
     MUTATION: use `hook(slot)` instead of `hook(slot) is True`, or drop the try/except, and a
     truthy-but-not-True or a raising hook starts reaping healthy slots.
     """
-
     class _BadHook(_FakeRuntime):
         mode = "raise"
 
@@ -5115,14 +4677,12 @@ def test_a_raising_or_unknown_terminal_hook_never_destroys_a_warming_slot() -> N
                 # would read it as "destroy"; identity does not. None alone cannot catch this,
                 # because bool(None) is already False.
                 return "hibernating"
-            return None  # UNKNOWN
+            return None                        # UNKNOWN
 
     for mode in ("raise", "unknown", "truthy"):
         rt = _BadHook()
         rt.mode = mode
-        pool = WarmPool(
-            runtime=rt, warm_size=1, spawn_rate_limit=100.0, warming_timeout_s=600.0
-        )
+        pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, warming_timeout_s=600.0)
         pool._spawn_to_deficit(ready=True)
         slot = next(iter(pool._slots.values()))
         slot.state = SlotState.WARMING
@@ -5132,8 +4692,7 @@ def test_a_raising_or_unknown_terminal_hook_never_destroys_a_warming_slot() -> N
         cur = pool._slots.get(slot.slot_id)
         assert cur is not None and cur.state is SlotState.WARMING, (
             f"a {mode} terminal hook destroyed a healthy WARMING slot; an absent answer is not "
-            f"evidence, and during a correlated brownout every slot answers this way at once"
-        )
+            f"evidence, and during a correlated brownout every slot answers this way at once")
 
 
 def test_a_park_give_up_is_not_charged_to_the_restore_failure_streak() -> None:
@@ -5152,7 +4711,6 @@ def test_a_park_give_up_is_not_charged_to_the_restore_failure_streak() -> None:
 
     MUTATION: drop `_terminal_ids` from the `confirmed` filter -> the streak advances and this fails.
     """
-
     class _GivesUp(_FakeRuntime):
         def is_ready(self, slot: Slot) -> "bool | None":
             return False
@@ -5160,9 +4718,8 @@ def test_a_park_give_up_is_not_charged_to_the_restore_failure_streak() -> None:
         def is_warming_terminal(self, slot: Slot) -> bool:
             return True
 
-    pool = WarmPool(
-        runtime=_GivesUp(), warm_size=2, spawn_rate_limit=100.0, warming_timeout_s=600.0
-    )
+    pool = WarmPool(runtime=_GivesUp(), warm_size=2, spawn_rate_limit=100.0,
+                    warming_timeout_s=600.0)
     pool._spawn_to_deficit(ready=True)
     for s in pool._slots.values():
         s.state = SlotState.WARMING
@@ -5173,18 +4730,13 @@ def test_a_park_give_up_is_not_charged_to_the_restore_failure_streak() -> None:
     assert pool._spawn_consecutive_failures == before, (
         f"a park give-up advanced the restore-failure streak "
         f"({before} -> {pool._spawn_consecutive_failures}); the guide promises it does not, and "
-        f"the streak drives base invalidation on a correlated control-plane fault"
-    )
+        f"the streak drives base invalidation on a correlated control-plane fault")
     # ...but the slots ARE still retired: excluding them from the streak must not keep them alive.
-    assert (
-        all(s.state is SlotState.DRAINING for s in pool._slots.values())
-        or not pool._slots
-    ), "the terminal slots were not retired at all"
+    assert all(s.state is SlotState.DRAINING for s in pool._slots.values()) or not pool._slots, (
+        "the terminal slots were not retired at all")
 
 
-def test_shutdown_latches_runtime_background_work_before_spending_the_join_budget() -> (
-    None
-):
+def test_shutdown_latches_runtime_background_work_before_spending_the_join_budget() -> None:
     """`close()` latches AND joins, and it only runs after the joins have eaten the allowance.
 
     So a cascade admission worker kept starting deferred builds and owed sweeps through the tick
@@ -5208,20 +4760,16 @@ def test_shutdown_latches_runtime_background_work_before_spending_the_join_budge
         def reap(self, slot: Slot) -> None:
             order.append("reap")
 
-    pool = WarmPool(
-        runtime=_LatchRecordingRuntime(), warm_size=1, spawn_rate_limit=100.0
-    )
+    pool = WarmPool(runtime=_LatchRecordingRuntime(), warm_size=1, spawn_rate_limit=100.0)
     pool.start()
     pool.stop(stop_timeout_s=2.0)
 
     assert "latched" in order, (
         "stop() never latched the runtime's background work, so an admission worker keeps issuing "
-        "control-plane calls for the whole shutdown"
-    )
+        "control-plane calls for the whole shutdown")
     assert order.index("latched") < order.index("closed"), (
         f"the latch ran no earlier than close() ({order}); the point is to stop new work BEFORE "
-        f"the joins consume the shared budget, not after"
-    )
+        f"the joins consume the shared budget, not after")
 
 
 def test_the_runtime_is_closed_only_after_its_slots_have_been_reaped() -> None:
@@ -5262,13 +4810,9 @@ def test_the_runtime_is_closed_only_after_its_slots_have_been_reaped() -> None:
 
     assert "reap-after-close" not in events, (
         f"a slot was reaped after the runtime was closed ({events}); a runtime whose close() drops "
-        f"the session its reap() needs then leaks every live worker"
-    )
+        f"the session its reap() needs then leaks every live worker")
     assert events.index("close") > events.index("reap"), (
-        f"close() ran before the reap loop ({events})"
-    )
-    assert orphans == 0, (
-        f"slots were leaked as orphans ({orphans}) because reap failed after close"
-    )
+        f"close() ran before the reap loop ({events})")
+    assert orphans == 0, f"slots were leaked as orphans ({orphans}) because reap failed after close"
     # ...and the LATCH still runs first: this must not undo the earlier shutdown-ordering fix.
     assert events[0] == "latch", f"the shutdown latch no longer runs first ({events})"

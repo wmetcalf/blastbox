@@ -1,10 +1,9 @@
 """StraceCapture parsing — deterministic against a sample strace log."""
-
 from pathlib import Path
 
 from blastbox.profile import StraceCapture
 
-_SAMPLE = r"""1234 execve("/usr/bin/soffice", ["soffice"], 0x7f) = 0
+_SAMPLE = r'''1234 execve("/usr/bin/soffice", ["soffice"], 0x7f) = 0
 1234 openat(AT_FDCWD, "/usr/lib/libreoffice/program/libuno.so", O_RDONLY|O_CLOEXEC) = 3
 1234 newfstatat(AT_FDCWD, "/etc/fonts/fonts.conf", {st_mode=S_IFREG}, 0) = 0
 1234 openat(AT_FDCWD, "/tmp/out/page-001.pdf", O_WRONLY|O_CREAT|O_TRUNC, 0644) = 4
@@ -12,21 +11,17 @@ _SAMPLE = r"""1234 execve("/usr/bin/soffice", ["soffice"], 0x7f) = 0
 1235 connect(5, {sa_family=AF_UNIX, sun_path="@/tmp/dbus-abc"}, 12) = 0
 1234 mmap(NULL, 8192, PROT_READ, MAP_PRIVATE, 3, 0) = 0x7f00
 1234 +++ exited with 0 +++
-"""
+'''
 
 _WITH_EGRESS = _SAMPLE + (
-    "1236 connect(7, {sa_family=AF_INET, sin_port=htons(443), "
+    '1236 connect(7, {sa_family=AF_INET, sin_port=htons(443), '
     'sin_addr=inet_addr("93.184.216.34")}, 16) = 0\n'
 )
 
 
 def test_wrap_builds_strace_argv(tmp_path):
     argv = StraceCapture().wrap(["soffice", "--convert-to", "pdf"], tmp_path / "t.log")
-    assert (
-        argv[0] == "strace"
-        and "-f" in argv
-        and argv[-3:] == ["soffice", "--convert-to", "pdf"]
-    )
+    assert argv[0] == "strace" and "-f" in argv and argv[-3:] == ["soffice", "--convert-to", "pdf"]
     assert "-o" in argv and str(tmp_path / "t.log") in argv
 
 
@@ -36,18 +31,18 @@ def test_parse_extracts_syscalls_paths_net(tmp_path):
     d = StraceCapture().parse(log)
     assert {"execve", "openat", "newfstatat", "socket", "connect", "mmap"} <= d.syscalls
     assert "exited" not in d.syscalls
-    assert "/tmp/out/page-001.pdf" in d.write_paths  # O_WRONLY|O_CREAT
+    assert "/tmp/out/page-001.pdf" in d.write_paths            # O_WRONLY|O_CREAT
     assert "/usr/lib/libreoffice/program/libuno.so" in d.read_paths
     assert "/etc/fonts/fonts.conf" in d.read_paths
-    assert "/tmp/out/page-001.pdf" not in d.read_paths  # write, not read
-    assert d.net.unix is True and d.net.inet == set()  # local IPC only
+    assert "/tmp/out/page-001.pdf" not in d.read_paths          # write, not read
+    assert d.net.unix is True and d.net.inet == set()           # local IPC only
 
 
 def test_parse_flags_inet_egress(tmp_path):
     log = tmp_path / "t.log"
     log.write_text(_WITH_EGRESS)
     d = StraceCapture().parse(log)
-    assert ("93.184.216.34", 443) in d.net.inet  # real egress flagged
+    assert ("93.184.216.34", 443) in d.net.inet                # real egress flagged
 
 
 def test_parse_path_in_memory(tmp_path: Path):

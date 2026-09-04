@@ -1,15 +1,8 @@
 # tests/bench/test_scenarios.py
 import pytest
 from blastbox.bench.scenarios import (
-    BenchConfig,
-    ScenarioResult,
-    check_requirement,
-    get_scenario,
-    list_scenarios,
-    run_scenario,
-    scenario,
-    _sandbox_overhead_impl,
-    _snapshot_restore_latency_impl,
+    BenchConfig, ScenarioResult, check_requirement, get_scenario, list_scenarios,
+    run_scenario, scenario, _sandbox_overhead_impl, _snapshot_restore_latency_impl,
 )
 from blastbox.bench.harness import Report
 
@@ -69,7 +62,6 @@ def test_sandbox_overhead_impl_compares_backends_with_fake_runner():
 # --- Task 10 ---
 class _FakeRuntime:
     """Minimal stand-in: spawn returns a slot, reap is a no-op."""
-
     def __init__(self):
         self.spawned = 0
 
@@ -86,5 +78,5 @@ def test_snapshot_restore_latency_impl_times_spawns():
     cfg = BenchConfig(runs=5, warmup=1)
     res = _snapshot_restore_latency_impl(cfg, runtime=rt)
     assert res.status == "ok"
-    assert rt.spawned == 6  # warmup + runs
+    assert rt.spawned == 6                       # warmup + runs
     assert res.report.summary("restore").n == 5  # warmup excluded

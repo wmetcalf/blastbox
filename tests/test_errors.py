@@ -1,5 +1,4 @@
 """Tests for blastbox.errors."""
-
 from __future__ import annotations
 
 
@@ -19,7 +18,6 @@ from blastbox.errors import (
 # ---------------------------------------------------------------------------
 # sanitize_public_error — root-agnostic absolute-path scrubber
 # ---------------------------------------------------------------------------
-
 
 def test_scrubber_redacts_etc_passwd():
     msg = "open /etc/passwd failed"
@@ -71,7 +69,6 @@ def test_scrubber_long_nested_path():
 # ---------------------------------------------------------------------------
 # Exception hierarchy
 # ---------------------------------------------------------------------------
-
 
 def test_blastbox_error_is_exception():
     e = BlastboxError("base error")
@@ -136,12 +133,7 @@ def test_validation_error_hierarchy():
 
 def test_sanitize_public_error_redacts_dsn_credentials():
     from blastbox.errors import sanitize_public_error
-
-    out = sanitize_public_error(
-        "conn failed: postgresql://u:secret@db.internal:5432/jobs"
-    )
+    out = sanitize_public_error("conn failed: postgresql://u:secret@db.internal:5432/jobs")
     assert "secret" not in out and "<redacted>" in out
-    out2 = sanitize_public_error(
-        "could not connect host=db.internal port=5432 password=hunter2"
-    )
+    out2 = sanitize_public_error("could not connect host=db.internal port=5432 password=hunter2")
     assert "hunter2" not in out2 and "db.internal" not in out2 and "5432" not in out2

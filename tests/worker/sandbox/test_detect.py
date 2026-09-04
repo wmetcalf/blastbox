@@ -3,7 +3,6 @@
 Tests run on the host.  We inject a fake status_path so no /proc needed,
 and use monkeypatching to control which backends are available.
 """
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -34,7 +33,6 @@ def _good_status_file(tmp_path: Path) -> Path:
 # Test: forced backend selection
 # ---------------------------------------------------------------------------
 
-
 def test_select_sandbox_container_backend(monkeypatch, tmp_path: Path) -> None:
     """select_sandbox(backend='container') returns a ContainerSandbox."""
     status_file = _good_status_file(tmp_path)
@@ -61,27 +59,22 @@ def test_select_sandbox_env_override_container(monkeypatch, tmp_path: Path) -> N
 def test_select_sandbox_env_override_bwrap(monkeypatch, tmp_path: Path) -> None:
     """BLASTBOX_SANDBOX=bwrap forces bwrap backend."""
     import shutil
-
     if not shutil.which("bwrap"):
         pytest.skip("bwrap not installed")
     monkeypatch.setenv("BLASTBOX_SANDBOX", "bwrap")
     monkeypatch.setenv("BLASTBOX_WARN_ON_INSECURE", "1")
     # Patch seccomp lib to False so bwrap can be used without the lib.
     import blastbox.worker.sandbox.bwrap as bwrap_mod
-
     monkeypatch.setattr(bwrap_mod, "_LIBSECCOMP_AVAILABLE", False)
 
     # The smoketest in select_sandbox runs /usr/bin/true through bwrap.
     # We monkeypatch _make_backend so we can disable aa-exec on the
     # BubblewrapSandbox instance (the default profile may not be loaded).
     import blastbox.worker.sandbox.detect as detect_mod
-
     original_make_backend = detect_mod._make_backend
 
     def _patched_make_backend(name, *, warn_on_insecure, status_path):
-        sb = original_make_backend(
-            name, warn_on_insecure=warn_on_insecure, status_path=status_path
-        )
+        sb = original_make_backend(name, warn_on_insecure=warn_on_insecure, status_path=status_path)
         if name == "bwrap":
             sb._aa_exec = None  # disable aa-exec so profile isn't required
         return sb
@@ -131,7 +124,6 @@ def test_select_sandbox_env_override_nono(monkeypatch, tmp_path: Path) -> None:
 def test_select_sandbox_env_override_nsjail(monkeypatch, tmp_path: Path) -> None:
     """BLASTBOX_SANDBOX=nsjail forces nsjail backend."""
     import shutil
-
     if not shutil.which("nsjail"):
         pytest.skip("nsjail not installed")
     monkeypatch.setenv("BLASTBOX_SANDBOX", "nsjail")
@@ -146,13 +138,9 @@ def test_select_sandbox_env_override_nsjail(monkeypatch, tmp_path: Path) -> None
 # Test: auto-selection
 # ---------------------------------------------------------------------------
 
-
-def test_select_sandbox_auto_container_inside_container(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_select_sandbox_auto_container_inside_container(monkeypatch, tmp_path: Path) -> None:
     """Inside a container, auto mode picks the container backend."""
     import blastbox.worker.sandbox.detect as detect_mod
-
     status_file = _good_status_file(tmp_path)
     monkeypatch.setenv("BLASTBOX_WARN_ON_INSECURE", "1")
     monkeypatch.delenv("BLASTBOX_SANDBOX", raising=False)
@@ -163,22 +151,18 @@ def test_select_sandbox_auto_container_inside_container(
     assert isinstance(sb, ContainerSandbox)
 
 
-def test_select_sandbox_auto_host_prefers_nsjail_or_bwrap(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_select_sandbox_auto_host_prefers_nsjail_or_bwrap(monkeypatch, tmp_path: Path) -> None:
     """On a bare-metal host, auto mode picks nsjail or bwrap (not container).
 
     If neither nsjail nor bwrap is functional, falls back to container.
     """
     import shutil
     import blastbox.worker.sandbox.detect as detect_mod
-
     monkeypatch.setenv("BLASTBOX_WARN_ON_INSECURE", "1")
     monkeypatch.delenv("BLASTBOX_SANDBOX", raising=False)
     monkeypatch.setattr(detect_mod, "_in_container", lambda: False)
     # Patch seccomp so bwrap can be used even without the lib.
     import blastbox.worker.sandbox.bwrap as bwrap_mod
-
     monkeypatch.setattr(bwrap_mod, "_LIBSECCOMP_AVAILABLE", False)
 
     sb = select_sandbox(_status_path=tmp_path / "unused")
@@ -198,7 +182,6 @@ def test_select_sandbox_auto_host_prefers_nsjail_or_bwrap(
 # Test: smoketest
 # ---------------------------------------------------------------------------
 
-
 def test_select_sandbox_smoketest_passes(monkeypatch, tmp_path: Path) -> None:
     """/usr/bin/true smoketest succeeds for container backend."""
     status_file = _good_status_file(tmp_path)
@@ -206,7 +189,6 @@ def test_select_sandbox_smoketest_passes(monkeypatch, tmp_path: Path) -> None:
 
     sb = select_sandbox(backend="container", _status_path=status_file)
     from blastbox.worker.sandbox.base import SandboxRequest
-
     result = sb.run(SandboxRequest(argv=["/usr/bin/true"]))
     assert result.exit_code == 0
     assert not result.killed
@@ -215,7 +197,6 @@ def test_select_sandbox_smoketest_passes(monkeypatch, tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Test: invalid / unknown backend
 # ---------------------------------------------------------------------------
-
 
 def test_select_sandbox_invalid_backend_raises(monkeypatch) -> None:
     """Unknown backend name → SandboxUnavailable."""
@@ -234,7 +215,6 @@ def test_select_sandbox_env_invalid_raises(monkeypatch, tmp_path: Path) -> None:
 # Test: insecure backend rejected in auto mode without WARN_ON_INSECURE
 # ---------------------------------------------------------------------------
 
-
 def test_select_sandbox_refuses_insecure_in_auto(monkeypatch, tmp_path: Path) -> None:
     """In auto mode without WARN_ON_INSECURE, an insecure backend is skipped.
 
@@ -243,7 +223,6 @@ def test_select_sandbox_refuses_insecure_in_auto(monkeypatch, tmp_path: Path) ->
     With BLASTBOX_WARN_ON_INSECURE unset, no backend passes → SandboxUnavailable.
     """
     import blastbox.worker.sandbox.detect as detect_mod
-
     status_file = _good_status_file(tmp_path)
     monkeypatch.delenv("BLASTBOX_WARN_ON_INSECURE", raising=False)
     monkeypatch.delenv("BLASTBOX_SANDBOX", raising=False)
@@ -254,12 +233,9 @@ def test_select_sandbox_refuses_insecure_in_auto(monkeypatch, tmp_path: Path) ->
         select_sandbox(_status_path=status_file)
 
 
-def test_select_sandbox_allows_insecure_with_warn_on_insecure(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_select_sandbox_allows_insecure_with_warn_on_insecure(monkeypatch, tmp_path: Path) -> None:
     """With BLASTBOX_WARN_ON_INSECURE=1, an insecure backend is accepted."""
     import blastbox.worker.sandbox.detect as detect_mod
-
     status_file = _good_status_file(tmp_path)
     monkeypatch.setenv("BLASTBOX_WARN_ON_INSECURE", "1")
     monkeypatch.delenv("BLASTBOX_SANDBOX", raising=False)
@@ -272,7 +248,6 @@ def test_select_sandbox_allows_insecure_with_warn_on_insecure(
 # ---------------------------------------------------------------------------
 # Test: forced insecure backend refused without WARN_ON_INSECURE
 # ---------------------------------------------------------------------------
-
 
 def test_select_sandbox_forced_insecure_refused(monkeypatch, tmp_path: Path) -> None:
     """Forced backend that is insecure → SandboxUnavailable without WARN_ON_INSECURE."""
@@ -287,7 +262,6 @@ def test_select_sandbox_forced_insecure_refused(monkeypatch, tmp_path: Path) -> 
 # ---------------------------------------------------------------------------
 # Test: _in_container helper
 # ---------------------------------------------------------------------------
-
 
 def test_in_container_returns_bool() -> None:
     """_in_container() always returns a bool (not None)."""

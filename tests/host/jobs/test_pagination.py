@@ -5,7 +5,6 @@ reports ``total`` via ``count()`` — so a large jobs table never fully material
 tests pin that contract for the in-memory, Redis (fakeredis), and SQLite backends together,
 including the SQLite ``LIMIT -1 OFFSET n`` sentinel path (bare offset, no limit).
 """
-
 from __future__ import annotations
 
 import fakeredis
@@ -56,32 +55,22 @@ def test_update_if_status_cas_all_backends(store):
     store.update(jid, status=JobStatus.RUNNING)
 
     # Mismatched expectation -> no write, returns False.
-    assert (
-        store.update_if_status(jid, JobStatus.QUEUED, status=JobStatus.FAILED) is False
-    )
+    assert store.update_if_status(jid, JobStatus.QUEUED, status=JobStatus.FAILED) is False
     assert store.get(jid).status == JobStatus.RUNNING  # unchanged
 
     # Matching expectation -> applies, returns True.
-    assert (
-        store.update_if_status(
-            jid, JobStatus.RUNNING, status=JobStatus.FAILED, error="boom"
-        )
-        is True
-    )
+    assert store.update_if_status(
+        jid, JobStatus.RUNNING, status=JobStatus.FAILED, error="boom"
+    ) is True
     got = store.get(jid)
     assert got.status == JobStatus.FAILED and got.error == "boom"
 
     # Now RUNNING no longer matches -> a second CAS can't clobber the terminal state.
-    assert (
-        store.update_if_status(jid, JobStatus.RUNNING, status=JobStatus.DONE) is False
-    )
+    assert store.update_if_status(jid, JobStatus.RUNNING, status=JobStatus.DONE) is False
     assert store.get(jid).status == JobStatus.FAILED
 
     # Missing job -> False.
-    assert (
-        store.update_if_status("nope", JobStatus.RUNNING, status=JobStatus.FAILED)
-        is False
-    )
+    assert store.update_if_status("nope", JobStatus.RUNNING, status=JobStatus.FAILED) is False
 
 
 def test_claim_next_stamps_unique_claim_id(store):
@@ -102,46 +91,29 @@ def test_update_if_status_claim_id_fences_aba(store):
     assert c1
 
     # The owner's write keyed on (RUNNING, c1) applies now (still our claim).
-    assert (
-        store.update_if_status(
-            claimed.job_id, JobStatus.RUNNING, expect_claim_id=c1, worker_runtime="warm"
-        )
-        is True
-    )
+    assert store.update_if_status(
+        claimed.job_id, JobStatus.RUNNING, expect_claim_id=c1, worker_runtime="warm"
+    ) is True
 
     # ABA: requeue (clear claim) then reclaim -> a fresh claim c2.
-    assert (
-        store.update_if_status(
-            claimed.job_id,
-            JobStatus.RUNNING,
-            expect_claim_id=c1,
-            status=JobStatus.QUEUED,
-            claim_id=None,
-        )
-        is True
-    )
+    assert store.update_if_status(
+        claimed.job_id, JobStatus.RUNNING, expect_claim_id=c1,
+        status=JobStatus.QUEUED, claim_id=None,
+    ) is True
     reclaimed = store.claim_next()
     c2 = reclaimed.claim_id
     assert c2 and c2 != c1
 
     # The OLD owner (c1) must NOT be able to terminal-write the reclaimed job (ABA closed).
-    assert (
-        store.update_if_status(
-            claimed.job_id, JobStatus.RUNNING, expect_claim_id=c1, status=JobStatus.DONE
-        )
-        is False
-    )
-    assert (
-        store.get(claimed.job_id).status == JobStatus.RUNNING
-    )  # still the new claim's job
+    assert store.update_if_status(
+        claimed.job_id, JobStatus.RUNNING, expect_claim_id=c1, status=JobStatus.DONE
+    ) is False
+    assert store.get(claimed.job_id).status == JobStatus.RUNNING  # still the new claim's job
 
     # The CURRENT owner (c2) can.
-    assert (
-        store.update_if_status(
-            claimed.job_id, JobStatus.RUNNING, expect_claim_id=c2, status=JobStatus.DONE
-        )
-        is True
-    )
+    assert store.update_if_status(
+        claimed.job_id, JobStatus.RUNNING, expect_claim_id=c2, status=JobStatus.DONE
+    ) is True
     assert store.get(claimed.job_id).status == JobStatus.DONE
 
 
@@ -197,9 +169,7 @@ def test_list_offset_beyond_end_is_empty(store):
 
 def test_list_limit_none_returns_all_unordered(store):
     _seed(store, 7)
-    assert (
-        len(store.list()) == 7
-    )  # callers that iterate everything (dispatch/retention)
+    assert len(store.list()) == 7  # callers that iterate everything (dispatch/retention)
 
 
 def test_list_status_filter_with_window(store):

@@ -1,5 +1,4 @@
 """Tests for the warm-pool config + factory (host/pool_config.py)."""
-
 from __future__ import annotations
 
 import os
@@ -104,9 +103,7 @@ def test_build_pool_bumps_warming_timeout_from_runtime_readiness(monkeypatch):
     class _SlowRuntime(_FakeRuntime):
         readiness_timeout_s = 300.0
 
-    cfg = PoolConfig(
-        runtime=RUNTIME_FIRECRACKER, warm_size=1, concurrent_ceiling=1
-    )  # default warming 120
+    cfg = PoolConfig(runtime=RUNTIME_FIRECRACKER, warm_size=1, concurrent_ceiling=1)  # default warming 120
     pool = build_warm_pool(cfg, runtime=_SlowRuntime())
     assert pool._warming_timeout_s == 300.0
 
@@ -117,13 +114,9 @@ def test_build_pool_explicit_warming_timeout_wins(monkeypatch):
     class _SlowRuntime(_FakeRuntime):
         readiness_timeout_s = 300.0
 
-    cfg = PoolConfig.from_env(
-        runtime=RUNTIME_FIRECRACKER, warm_size=1, concurrent_ceiling=1
-    )
+    cfg = PoolConfig.from_env(runtime=RUNTIME_FIRECRACKER, warm_size=1, concurrent_ceiling=1)
     pool = build_warm_pool(cfg, runtime=_SlowRuntime())
-    assert (
-        pool._warming_timeout_s == 90.0
-    )  # operator override is NOT overridden by the runtime budget
+    assert pool._warming_timeout_s == 90.0   # operator override is NOT overridden by the runtime budget
 
 
 # --- warm-snapshot gate ----------------------------------------------------
@@ -185,10 +178,8 @@ def test_gvisor_runtime_routes_to_gvisor_snapshot(monkeypatch):
         return sentinel
 
     import blastbox.host.runtime.gvisor_snapshot_runtime as g
-
     monkeypatch.setattr(g, "select_gvisor_snapshot_runtime", _capture)
     from blastbox.host.pool_config import build_warm_pool, PoolConfig
-
     pool = build_warm_pool(PoolConfig.from_env())
     # The pool must wrap the runtime the gvisor selector returned...
     assert pool is not None and pool.runtime is sentinel
@@ -255,17 +246,10 @@ def test_build_warm_pool_forwards_the_safety_controls(monkeypatch):
     monkeypatch.setenv("BLASTBOX_POOL_CAPACITY_STARVED_AFTER_S", "77.5")
 
     class _Rt:
-        def spawn(self):
-            raise RuntimeError("not used")
-
-        def is_ready(self, slot):
-            return True
-
-        def is_alive(self, slot):
-            return True
-
-        def reap(self, slot):
-            return None
+        def spawn(self): raise RuntimeError("not used")
+        def is_ready(self, slot): return True
+        def is_alive(self, slot): return True
+        def reap(self, slot): return None
 
     pool = build_warm_pool(PoolConfig.from_env(runtime="none"), runtime=_Rt())
     assert pool is not None
@@ -286,35 +270,24 @@ def test_unset_knobs_do_not_override_the_pools_own_defaults(monkeypatch):
     """
     import inspect
 
-    for var in (
-        "BLASTBOX_POOL_MAX_CONSECUTIVE_FAILURES",
-        "BLASTBOX_POOL_UNKNOWN_GRACE_S",
-        "BLASTBOX_POOL_CAPACITY_STARVED_AFTER_S",
-    ):
+    for var in ("BLASTBOX_POOL_MAX_CONSECUTIVE_FAILURES",
+                "BLASTBOX_POOL_UNKNOWN_GRACE_S",
+                "BLASTBOX_POOL_CAPACITY_STARVED_AFTER_S"):
         monkeypatch.delenv(var, raising=False)
 
     class _Rt:
-        def spawn(self):
-            raise RuntimeError("not used")
-
-        def is_ready(self, slot):
-            return True
-
-        def is_alive(self, slot):
-            return True
-
-        def reap(self, slot):
-            return None
+        def spawn(self): raise RuntimeError("not used")
+        def is_ready(self, slot): return True
+        def is_alive(self, slot): return True
+        def reap(self, slot): return None
 
     pool = build_warm_pool(PoolConfig.from_env(runtime="none"), runtime=_Rt())
     assert pool is not None
 
     params = inspect.signature(WarmPool.__init__).parameters
-    for attr, arg in (
-        ("_max_consecutive_failures", "max_consecutive_failures"),
-        ("_unknown_grace_s", "unknown_grace_s"),
-        ("_capacity_starved_after_s", "capacity_starved_after_s"),
-    ):
+    for attr, arg in (("_max_consecutive_failures", "max_consecutive_failures"),
+                      ("_unknown_grace_s", "unknown_grace_s"),
+                      ("_capacity_starved_after_s", "capacity_starved_after_s")):
         assert getattr(pool, attr) == params[arg].default, (
             f"{arg}: an unconfigured knob must leave WarmPool's own default "
             f"({params[arg].default}) alone, got {getattr(pool, attr)}"
@@ -350,9 +323,7 @@ def test_the_rebuild_escape_hatch_also_disables_cascade_tier_repair(monkeypatch)
     )
 
     monkeypatch.delenv("BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER", raising=False)
-    assert build_cascade_runtime(getter).tier_rebuild_after == 4, (
-        "unset keeps the default"
-    )
+    assert build_cascade_runtime(getter).tier_rebuild_after == 4, "unset keeps the default"
 
 
 def test_a_resolved_config_override_reaches_cascade_tier_repair(monkeypatch):
@@ -364,28 +335,13 @@ def test_a_resolved_config_override_reaches_cascade_tier_repair(monkeypatch):
     """
     captured: dict[str, object] = {}
 
-    def _fake_cascade(
-        get=None,
-        *,
-        warm_snapshot=False,
-        tier_rebuild_after=None,
-        tier_rebuild_after_explicit=None,
-    ):
+    def _fake_cascade(get=None, *, warm_snapshot=False, tier_rebuild_after=None,
+                      tier_rebuild_after_explicit=None):
         captured["tier_rebuild_after"] = tier_rebuild_after
-        return type(
-            "R",
-            (),
-            {
-                "spawn": lambda s: None,
-                "is_ready": lambda s, x: True,
-                "is_alive": lambda s, x: True,
-                "reap": lambda s, x: None,
-            },
-        )()
+        return type("R", (), {"spawn": lambda s: None, "is_ready": lambda s, x: True,
+                              "is_alive": lambda s, x: True, "reap": lambda s, x: None})()
 
-    monkeypatch.setattr(
-        "blastbox.host.runtime.cascade.build_cascade_runtime", _fake_cascade
-    )
+    monkeypatch.setattr("blastbox.host.runtime.cascade.build_cascade_runtime", _fake_cascade)
     monkeypatch.delenv("BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER", raising=False)
 
     # Explicit override, NOT via the environment — this is the case that used to be lost.
@@ -406,28 +362,13 @@ def test_the_cascade_threshold_is_derived_the_same_way_as_the_pools(monkeypatch)
     """
     captured: dict[str, object] = {}
 
-    def _fake_cascade(
-        get=None,
-        *,
-        warm_snapshot=False,
-        tier_rebuild_after=None,
-        tier_rebuild_after_explicit=None,
-    ):
+    def _fake_cascade(get=None, *, warm_snapshot=False, tier_rebuild_after=None,
+                      tier_rebuild_after_explicit=None):
         captured["tier_rebuild_after"] = tier_rebuild_after
-        return type(
-            "R",
-            (),
-            {
-                "spawn": lambda s: None,
-                "is_ready": lambda s, x: True,
-                "is_alive": lambda s, x: True,
-                "reap": lambda s, x: None,
-            },
-        )()
+        return type("R", (), {"spawn": lambda s: None, "is_ready": lambda s, x: True,
+                              "is_alive": lambda s, x: True, "reap": lambda s, x: None})()
 
-    monkeypatch.setattr(
-        "blastbox.host.runtime.cascade.build_cascade_runtime", _fake_cascade
-    )
+    monkeypatch.setattr("blastbox.host.runtime.cascade.build_cascade_runtime", _fake_cascade)
     monkeypatch.delenv("BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER", raising=False)
 
     cfg = PoolConfig.from_env(runtime="cascade", warm_size=8, concurrent_ceiling=16)
@@ -449,20 +390,11 @@ def test_resize_retunes_the_cascade_threshold(monkeypatch):
     from blastbox.host.runtime.cascade import CascadingRuntime, Tier
 
     class _Rt:
-        def prepare(self):
-            return True
-
-        def spawn(self):
-            raise RuntimeError("unused")
-
-        def is_ready(self, slot):
-            return True
-
-        def is_alive(self, slot):
-            return True
-
-        def reap(self, slot):
-            return None
+        def prepare(self): return True
+        def spawn(self): raise RuntimeError("unused")
+        def is_ready(self, slot): return True
+        def is_alive(self, slot): return True
+        def reap(self, slot): return None
 
     casc = CascadingRuntime(tiers=[Tier(name="a", runtime=_Rt(), capacity=4)])
     assert casc.tier_rebuild_after == 4, "derived default"
@@ -485,24 +417,14 @@ def test_an_explicit_cascade_threshold_is_never_retuned():
     from blastbox.host.runtime.cascade import CascadingRuntime, Tier
 
     class _Rt:
-        def prepare(self):
-            return True
+        def prepare(self): return True
+        def spawn(self): raise RuntimeError("unused")
+        def is_ready(self, slot): return True
+        def is_alive(self, slot): return True
+        def reap(self, slot): return None
 
-        def spawn(self):
-            raise RuntimeError("unused")
-
-        def is_ready(self, slot):
-            return True
-
-        def is_alive(self, slot):
-            return True
-
-        def reap(self, slot):
-            return None
-
-    casc = CascadingRuntime(
-        tiers=[Tier(name="a", runtime=_Rt(), capacity=4)], tier_rebuild_after=7
-    )
+    casc = CascadingRuntime(tiers=[Tier(name="a", runtime=_Rt(), capacity=4)],
+                            tier_rebuild_after=7)
     pool = WarmPool(runtime=casc, warm_size=4, concurrent_ceiling=32)
     pool.resize(warm_size=16)
     assert casc.tier_rebuild_after == 7, "a pinned threshold must survive every resize"
@@ -518,29 +440,14 @@ def test_a_derived_cascade_threshold_is_still_retunable(monkeypatch):
     """
     captured: dict[str, object] = {}
 
-    def _fake_cascade(
-        get=None,
-        *,
-        warm_snapshot=False,
-        tier_rebuild_after=None,
-        tier_rebuild_after_explicit=None,
-    ):
+    def _fake_cascade(get=None, *, warm_snapshot=False, tier_rebuild_after=None,
+                      tier_rebuild_after_explicit=None):
         captured["after"] = tier_rebuild_after
         captured["explicit"] = tier_rebuild_after_explicit
-        return type(
-            "R",
-            (),
-            {
-                "spawn": lambda s: None,
-                "is_ready": lambda s, x: True,
-                "is_alive": lambda s, x: True,
-                "reap": lambda s, x: None,
-            },
-        )()
+        return type("R", (), {"spawn": lambda s: None, "is_ready": lambda s, x: True,
+                              "is_alive": lambda s, x: True, "reap": lambda s, x: None})()
 
-    monkeypatch.setattr(
-        "blastbox.host.runtime.cascade.build_cascade_runtime", _fake_cascade
-    )
+    monkeypatch.setattr("blastbox.host.runtime.cascade.build_cascade_runtime", _fake_cascade)
     monkeypatch.delenv("BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER", raising=False)
 
     # Nothing configured: the 16 below is DERIVED from warm_size and must stay retunable.
@@ -553,9 +460,8 @@ def test_a_derived_cascade_threshold_is_still_retunable(monkeypatch):
     )
 
     # An operator's number stays pinned.
-    cfg = PoolConfig.from_env(
-        runtime="cascade", warm_size=8, concurrent_ceiling=16, snapshot_rebuild_after=7
-    )
+    cfg = PoolConfig.from_env(runtime="cascade", warm_size=8, concurrent_ceiling=16,
+                              snapshot_rebuild_after=7)
     build_warm_pool(cfg)
     assert captured["after"] == 7
     assert captured["explicit"] is True
@@ -566,20 +472,16 @@ def test_build_cascade_runtime_honours_the_explicit_flag(monkeypatch):
     from blastbox.host.runtime.cascade import build_cascade_runtime
 
     # build_cascade_runtime imports this lazily from pool_config, so patch it there.
-    monkeypatch.setattr(
-        "blastbox.host.pool_config.select_runtime_by_name",
-        lambda name, **kw: type("R", (), {"spawn": lambda s: None})(),
-    )
+    monkeypatch.setattr("blastbox.host.pool_config.select_runtime_by_name",
+                        lambda name, **kw: type("R", (), {"spawn": lambda s: None})())
     env = {"BLASTBOX_POOL_TIERS": "stub:2"}
     getter = lambda k: env.get(k) or os.environ.get(k)  # noqa: E731
 
-    derived = build_cascade_runtime(
-        getter, tier_rebuild_after=8, tier_rebuild_after_explicit=False
-    )
+    derived = build_cascade_runtime(getter, tier_rebuild_after=8,
+                                    tier_rebuild_after_explicit=False)
     assert derived.tier_rebuild_after_explicit is False
-    pinned = build_cascade_runtime(
-        getter, tier_rebuild_after=7, tier_rebuild_after_explicit=True
-    )
+    pinned = build_cascade_runtime(getter, tier_rebuild_after=7,
+                                   tier_rebuild_after_explicit=True)
     assert pinned.tier_rebuild_after_explicit is True
 
 
@@ -593,29 +495,21 @@ def test_an_injected_cascade_gets_the_configured_rebuild_threshold(monkeypatch):
     PoolConfig(snapshot_rebuild_after=0) disabled pool-wide invalidation while the injected
     cascade went on invalidating tier bases every four spawn failures.
     """
-
     class _InjectedCascade:
-        tier_rebuild_after = 4  # the cascade's own default
+        tier_rebuild_after = 4                     # the cascade's own default
         tier_rebuild_after_explicit = False
 
-        def spawn(self):
-            return None
-
-        def is_ready(self, s):
-            return True
-
-        def is_alive(self, s):
-            return True
-
-        def reap(self, s):
-            return None
+        def spawn(self): return None
+        def is_ready(self, s): return True
+        def is_alive(self, s): return True
+        def reap(self, s): return None
 
     rt = _InjectedCascade()
     monkeypatch.delenv("BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER", raising=False)
     cfg = PoolConfig.from_env(snapshot_rebuild_after=0)
     pool = build_warm_pool(cfg, runtime=rt)
     assert pool is not None
-    assert pool._snapshot_rebuild_after == 0  # the hatch closed the pool-wide path...
+    assert pool._snapshot_rebuild_after == 0       # the hatch closed the pool-wide path...
     assert rt.tier_rebuild_after == 0, (
         "...but the injected cascade kept invalidating tier bases every 4 spawn failures"
     )
@@ -624,22 +518,14 @@ def test_an_injected_cascade_gets_the_configured_rebuild_threshold(monkeypatch):
 
 def test_an_injected_cascade_the_caller_pinned_is_not_stomped(monkeypatch):
     """With nothing configured the number is DERIVED — it must not overwrite a caller's own."""
-
     class _PinnedCascade:
         tier_rebuild_after = 7
         tier_rebuild_after_explicit = True
 
-        def spawn(self):
-            return None
-
-        def is_ready(self, s):
-            return True
-
-        def is_alive(self, s):
-            return True
-
-        def reap(self, s):
-            return None
+        def spawn(self): return None
+        def is_ready(self, s): return True
+        def is_alive(self, s): return True
+        def reap(self, s): return None
 
     rt = _PinnedCascade()
     monkeypatch.delenv("BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER", raising=False)
@@ -649,28 +535,18 @@ def test_an_injected_cascade_the_caller_pinned_is_not_stomped(monkeypatch):
 
 def test_an_unpinned_injected_cascade_follows_the_derived_policy(monkeypatch):
     """One policy, both consumers — the injected path included."""
-
     class _UnpinnedCascade:
         tier_rebuild_after = 4
         tier_rebuild_after_explicit = False
 
-        def spawn(self):
-            return None
-
-        def is_ready(self, s):
-            return True
-
-        def is_alive(self, s):
-            return True
-
-        def reap(self, s):
-            return None
+        def spawn(self): return None
+        def is_ready(self, s): return True
+        def is_alive(self, s): return True
+        def reap(self, s): return None
 
     rt = _UnpinnedCascade()
     monkeypatch.delenv("BLASTBOX_POOL_SNAPSHOT_REBUILD_AFTER", raising=False)
-    pool = build_warm_pool(
-        PoolConfig.from_env(warm_size=8, concurrent_ceiling=16), runtime=rt
-    )
+    pool = build_warm_pool(PoolConfig.from_env(warm_size=8, concurrent_ceiling=16), runtime=rt)
     assert pool is not None
     assert rt.tier_rebuild_after == pool._snapshot_rebuild_after == 16
 
@@ -700,14 +576,12 @@ def test_a_config_float_that_parses_but_cannot_mean_anything_is_rejected(monkeyp
 
     MUTATION: delete the isfinite/`< 0` guard in _float/_opt_float and every case here is honoured.
     """
-    attrs = {
-        "BLASTBOX_POOL_SPAWN_RATE": "spawn_rate_limit",
-        "BLASTBOX_POOL_WARMING_TIMEOUT_S": "warming_timeout_s",
-        "BLASTBOX_POOL_UNKNOWN_GRACE_S": "unknown_grace_s",
-        "BLASTBOX_POOL_CAPACITY_STARVED_AFTER_S": "capacity_starved_after_s",
-        "BLASTBOX_POOL_MAINTAIN_INTERVAL_S": "maintain_interval_s",
-        "BLASTBOX_POOL_MAINTAIN_BUDGET_S": "maintain_budget_s",
-    }
+    attrs = {"BLASTBOX_POOL_SPAWN_RATE": "spawn_rate_limit",
+             "BLASTBOX_POOL_WARMING_TIMEOUT_S": "warming_timeout_s",
+             "BLASTBOX_POOL_UNKNOWN_GRACE_S": "unknown_grace_s",
+             "BLASTBOX_POOL_CAPACITY_STARVED_AFTER_S": "capacity_starved_after_s",
+             "BLASTBOX_POOL_MAINTAIN_INTERVAL_S": "maintain_interval_s",
+             "BLASTBOX_POOL_MAINTAIN_BUDGET_S": "maintain_budget_s"}
     defaults = {k: getattr(PoolConfig.from_env(), a) for k, a in attrs.items()}
 
     for key, attr in attrs.items():
@@ -716,8 +590,7 @@ def test_a_config_float_that_parses_but_cannot_mean_anything_is_rejected(monkeyp
             got = getattr(PoolConfig.from_env(), attr)
             assert got == defaults[key] or (got is None and defaults[key] is None), (
                 f"{key}={bad!r} was honoured as {got!r} instead of falling back to "
-                f"{defaults[key]!r}"
-            )
+                f"{defaults[key]!r}")
             monkeypatch.delenv(key)
 
     # 0 stays legal -- it is the documented "disabled" -- EXCEPT for the one knob where
@@ -731,13 +604,12 @@ def test_a_config_float_that_parses_but_cannot_mean_anything_is_rejected(monkeyp
         got = getattr(PoolConfig.from_env(), attr)
         if key in zero_is_not_off:
             assert got != 0.0, (
-                f"{key}=0 was honoured as a zero cooldown, i.e. maintenance on EVERY tick"
-            )
+                f"{key}=0 was honoured as a zero cooldown, i.e. maintenance on EVERY tick")
         else:
             assert got == 0.0
         monkeypatch.delenv(key)
 
-    for key, attr in attrs.items():  # ...and a real value is still honoured
+    for key, attr in attrs.items():   # ...and a real value is still honoured
         monkeypatch.setenv(key, "12.5")
         assert getattr(PoolConfig.from_env(), attr) == 12.5
         monkeypatch.delenv(key)
@@ -762,21 +634,15 @@ def test_late_added_knobs_cannot_rebind_a_positional_callers_arguments():
     kw_only = {f.name for f in dataclasses.fields(PoolConfig) if f.kw_only}
     assert {"maintain_interval_s", "maintain_budget_s"} <= kw_only, (
         "the mid-dataclass additions are still positional, so every existing positional caller "
-        "silently rebinds its later arguments"
-    )
+        "silently rebinds its later arguments")
 
     # The behavioural half: a positional call must still bind what it always bound.
     positional = [f for f in dataclasses.fields(PoolConfig) if not f.kw_only]
-    idx = next(
-        i for i, f in enumerate(positional) if f.name == "capacity_starved_after_s"
-    )
+    idx = next(i for i, f in enumerate(positional) if f.name == "capacity_starved_after_s")
     args = [f.default for f in positional[:idx]] + [321.0]
     cfg = PoolConfig(*args)
     assert cfg.capacity_starved_after_s == 321.0, (
         f"a positional argument intended for capacity_starved_after_s bound to something else "
         f"(got capacity_starved_after_s={cfg.capacity_starved_after_s!r}, "
-        f"maintain_interval_s={cfg.maintain_interval_s!r})"
-    )
-    assert cfg.maintain_interval_s is None, (
-        "the maintenance knob absorbed a positional argument"
-    )
+        f"maintain_interval_s={cfg.maintain_interval_s!r})")
+    assert cfg.maintain_interval_s is None, "the maintenance knob absorbed a positional argument"

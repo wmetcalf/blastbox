@@ -7,7 +7,6 @@ later build fails on ENOSPC. The constraint that makes this non-trivial: a resto
 the memory file mapped as its backing store for its whole life, so the pair can only be unlinked
 once its LAST user is reaped.
 """
-
 from __future__ import annotations
 
 import contextlib
@@ -18,10 +17,7 @@ import pytest
 from pathlib import Path
 
 from blastbox.host.runtime.fc_snapshot import SnapshotError, SnapshotManager
-from blastbox.host.runtime.fc_snapshot_backend import (
-    FcSnapshotArtifact,
-    FcSnapshotBackend,
-)
+from blastbox.host.runtime.fc_snapshot_backend import FcSnapshotArtifact, FcSnapshotBackend
 
 
 class _FakeBoot:
@@ -48,7 +44,7 @@ class _FakeBackend:
     def __init__(self, root: Path) -> None:
         self.root = root
         self.n = 0
-
+    
     def available(self) -> bool:
         return True
 
@@ -95,14 +91,10 @@ def test_a_superseded_generation_is_reclaimed_once_its_last_user_is_reaped(tmp_p
     # gen1 still has TWO live users -- unlinking now would pull the backing store out from
     # under running microVMs.
     mgr.release("slot-a")
-    assert "warm-gen1.mem" in _gens(tmp_path), (
-        "still mapped by slot-b — must not be unlinked"
-    )
+    assert "warm-gen1.mem" in _gens(tmp_path), "still mapped by slot-b — must not be unlinked"
 
     mgr.release("slot-b")
-    assert _gens(tmp_path) == {"warm-gen2.mem"}, (
-        "gen1 drained; its files must be reclaimed"
-    )
+    assert _gens(tmp_path) == {"warm-gen2.mem"}, "gen1 drained; its files must be reclaimed"
 
 
 def test_the_current_generation_is_never_reclaimed(tmp_path):
@@ -135,7 +127,7 @@ def test_release_of_an_unknown_slot_is_a_no_op(tmp_path):
     mgr.build()
     mgr.restore("slot-a")
     mgr.release("slot-a")
-    mgr.release("slot-a")  # double reap
+    mgr.release("slot-a")     # double reap
     mgr.release("never-seen")
     assert _gens(tmp_path) == {"warm-gen1.mem"}
 
@@ -262,7 +254,7 @@ def test_the_generation_is_selected_and_pinned_under_one_lock(tmp_path):
             if self._armed:
                 self._armed = False
                 entered.set()
-                racer_done.wait(5.0)  # deterministic: no sleeps, no timing assumptions
+                racer_done.wait(5.0)      # deterministic: no sleeps, no timing assumptions
             return self._inner.__enter__()
 
         def __exit__(self, *a):
@@ -270,7 +262,7 @@ def test_the_generation_is_selected_and_pinned_under_one_lock(tmp_path):
 
     def _racer():
         entered.wait(5.0)
-        mgr.invalidate()  # discards any generation nothing has pinned yet
+        mgr.invalidate()          # discards any generation nothing has pinned yet
         mgr.build()
         racer_done.set()
 
@@ -279,9 +271,7 @@ def test_the_generation_is_selected_and_pinned_under_one_lock(tmp_path):
     th.start()
     mgr.restore("slot-a")
     th.join(10.0)
-    assert racer_done.is_set(), (
-        "the racing invalidate never ran — the test proved nothing"
-    )
+    assert racer_done.is_set(), "the racing invalidate never ran — the test proved nothing"
 
     assert restored_with, "restore_in must have been reached"
     assert restored_with[0].exists(), (
@@ -314,12 +304,11 @@ def test_a_spawn_that_cannot_publish_its_slot_releases_the_pin(tmp_path):
             killed.append(True)
 
     be.restore_in = lambda w, a: _HandleWithBadUds()  # type: ignore[assignment]
-
     class _Cfg:
         max_extracted_bytes = 1 << 20
 
     rt = SnapshotSlotRuntime(_Cfg(), mgr, settle_s=0.0)
-    mgr.build()  # spawn() no longer builds INLINE -- that is what stalled the tick thread
+    mgr.build()   # spawn() no longer builds INLINE -- that is what stalled the tick thread
 
     with pytest.raises(Exception):
         rt.spawn()
@@ -351,18 +340,17 @@ def test_a_generation_is_retained_when_the_vm_cannot_be_confirmed_dead(tmp_path)
 
     (tmp_path / "slots" / "x").mkdir(parents=True, exist_ok=True)
     be.restore_in = lambda w, a: _UnkillableHandle()  # type: ignore[assignment]
-
     class _Cfg:
         max_extracted_bytes = 1 << 20
 
     rt = SnapshotSlotRuntime(_Cfg(), mgr, settle_s=0.0)
-    mgr.build()  # spawn() no longer builds INLINE -- that is what stalled the tick thread
+    mgr.build()   # spawn() no longer builds INLINE -- that is what stalled the tick thread
 
     slot = rt.spawn()
     gen1 = tmp_path / "snap" / "warm-gen1.mem"
     assert gen1.exists()
 
-    mgr.invalidate()  # supersede it while the slot is live
+    mgr.invalidate()      # supersede it while the slot is live
     mgr.build()
     # kill() raises -> the VM is NOT provably gone. reap propagates so the pool quarantines the
     # slot rather than recording a successful disposal and replacing it.
@@ -393,9 +381,7 @@ def test_a_build_whose_base_teardown_fails_still_registers_its_artifact(tmp_path
 
     art = mgr.build()
     assert art is not None
-    assert mgr.artifact is art, (
-        "the artifact must be registered despite the teardown failure"
-    )
+    assert mgr.artifact is art, "the artifact must be registered despite the teardown failure"
 
     # ...and being registered, it is now reclaimable like any other generation
     mgr.invalidate()
@@ -471,12 +457,12 @@ def test_a_failed_checkpoint_removes_the_files_it_wrote(tmp_path):
 
     def _create_then_fail(api, snap, mem):
         Path(snap).write_bytes(b"partial")
-        Path(mem).write_bytes(b"m" * 4096)  # a RAM-sized file, in miniature
+        Path(mem).write_bytes(b"m" * 4096)     # a RAM-sized file, in miniature
         raise RuntimeError("snapshot create reported an error after committing")
 
     handle = launcher._Handle(None, object(), "vsock.sock", mem_dir=mem_dir)  # type: ignore[arg-type]
 
-    for _ in range(3):  # repeated build retries
+    for _ in range(3):                          # repeated build retries
         with pytest.raises(Exception):
             with _patched(launcher, "_create_snapshot", _create_then_fail):
                 handle.checkpoint(dest)
@@ -492,7 +478,6 @@ import contextlib as _contextlib
 def _patched(mod, name, value):
     """Patch a name that the code under test imports lazily inside the function."""
     import blastbox.host.runtime.fc_snapshot_backend as backend
-
     old = getattr(backend, name)
     setattr(backend, name, value)
     try:
@@ -527,7 +512,7 @@ def test_spawn_cleanup_retains_the_pin_when_it_cannot_kill_the_vm(tmp_path):
         max_extracted_bytes = 1 << 20
 
     rt = SnapshotSlotRuntime(_Cfg(), mgr, settle_s=0.0)
-    mgr.build()  # spawn() no longer builds INLINE -- that is what stalled the tick thread
+    mgr.build()   # spawn() no longer builds INLINE -- that is what stalled the tick thread
     gen1 = tmp_path / "snap" / "warm-gen1.mem"
 
     with pytest.raises(Exception):
@@ -565,7 +550,7 @@ def test_a_generation_whose_discard_fails_stays_retryable(tmp_path):
 
     be.discard = _flaky_discard  # type: ignore[assignment]
 
-    mgr.release("slot-a")  # cleanup fails, and the immediate retry fails too
+    mgr.release("slot-a")                    # cleanup fails, and the immediate retry fails too
     assert gen1.exists(), "sanity: the failed unlink left the file in place"
 
     # The generation must still be RETRYABLE once the underlying problem clears — the point is
@@ -589,9 +574,8 @@ def test_the_base_outdisk_is_versioned_with_its_generation(tmp_path):
     """
     from blastbox.host.runtime.fc_snapshot_backend import FcSnapshotArtifact
 
-    art = FcSnapshotArtifact(
-        tmp_path / "s.snapshot", tmp_path / "m.mem", tmp_path / "warm-gen1.outdisk.ext4"
-    )
+    art = FcSnapshotArtifact(tmp_path / "s.snapshot", tmp_path / "m.mem",
+                             tmp_path / "warm-gen1.outdisk.ext4")
     assert art.outdisk_path is not None, "the artifact must carry its own disk"
 
     # ...and discard() must remove all three, or the versioning just leaks a third file.
@@ -599,12 +583,11 @@ def test_the_base_outdisk_is_versioned_with_its_generation(tmp_path):
         p.write_bytes(b"x")
 
     from blastbox.host.runtime.fc_snapshot_backend import FcSnapshotBackend
+    FcSnapshotBackend.discard(object(), art)   # type: ignore[arg-type]
 
-    FcSnapshotBackend.discard(object(), art)  # type: ignore[arg-type]
-
-    assert not any(
-        p.exists() for p in (art.snapshot_path, art.mem_path, art.outdisk_path)
-    ), "every file of a drained generation must be reclaimed, including the disk"
+    assert not any(p.exists() for p in (art.snapshot_path, art.mem_path, art.outdisk_path)), (
+        "every file of a drained generation must be reclaimed, including the disk"
+    )
 
 
 def test_the_restore_rollback_path_also_keeps_failed_discards_retryable(tmp_path):
@@ -629,7 +612,7 @@ def test_the_restore_rollback_path_also_keeps_failed_discards_retryable(tmp_path
     be.discard = _flaky_discard  # type: ignore[assignment]
 
     def _retire_then_fail(slot_workdir, artifact):
-        mgr.invalidate()  # retire the generation we are holding
+        mgr.invalidate()          # retire the generation we are holding
         mgr.build()
         raise RuntimeError("restore failed after the generation was retired")
 
@@ -662,7 +645,7 @@ def test_a_build_invalidated_while_running_does_not_publish(tmp_path):
 
     class _BootThatGetsInvalidated(_FakeBoot):
         def wait_ready(self, timeout_s: float) -> None:
-            mgr.invalidate()  # the repair lands mid-build
+            mgr.invalidate()      # the repair lands mid-build
 
     be.boot_base = lambda: _BootThatGetsInvalidated(be)  # type: ignore[assignment]
 
@@ -745,7 +728,7 @@ def test_an_invalidate_racing_publication_still_rejects_the_build(tmp_path):
     class _BootThatArms(_FakeBoot):
         def checkpoint(self, dest_dir):
             art = super().checkpoint(dest_dir)
-            gate.arm()  # the next lock taken is the compare/publish one
+            gate.arm()            # the next lock taken is the compare/publish one
             return art
 
     be.boot_base = lambda: _BootThatArms(be)  # type: ignore[assignment]
@@ -753,7 +736,7 @@ def test_an_invalidate_racing_publication_still_rejects_the_build(tmp_path):
 
     def _racer():
         entered.wait(5.0)
-        mgr._build_lock = real_lock  # invalidate must not deadlock on the gate
+        mgr._build_lock = real_lock      # invalidate must not deadlock on the gate
         mgr.invalidate()
         mgr._build_lock = gate
         invalidated.set()
@@ -764,9 +747,7 @@ def test_an_invalidate_racing_publication_still_rejects_the_build(tmp_path):
         mgr.build()
     th.join(10.0)
 
-    assert invalidated.is_set(), (
-        "the racing invalidate never ran — the test proved nothing"
-    )
+    assert invalidated.is_set(), "the racing invalidate never ran — the test proved nothing"
     # TWO orderings are correct, and the invariant spans both: either the build loses and is
     # discarded, or it publishes and the (serialized) invalidate then retires what it published.
     # Asserting one specific outcome would encode a scheduling accident rather than the rule.
@@ -792,7 +773,7 @@ def test_an_invalidated_build_retries_at_once(tmp_path):
 
     be.boot_base = lambda: _BootThatGetsInvalidated(be)  # type: ignore[assignment]
 
-    mgr._build_worker()  # the worker swallows the rejection
+    mgr._build_worker()          # the worker swallows the rejection
 
     assert mgr._retry_not_before == 0.0, (
         f"a deliberate rejection armed the failure backoff (retry gate={mgr._retry_not_before})"
@@ -807,10 +788,7 @@ def test_the_backend_reports_unlink_failures_so_they_stay_retryable(tmp_path):
     backend that logged a transient EIO/EROFS and returned normally defeated the whole retryable
     machinery built over the last several rounds.
     """
-    from blastbox.host.runtime.fc_snapshot_backend import (
-        FcSnapshotArtifact,
-        FcSnapshotBackend,
-    )
+    from blastbox.host.runtime.fc_snapshot_backend import FcSnapshotArtifact, FcSnapshotBackend
 
     snap = tmp_path / "warm-x.snapshot"
     mem = tmp_path / "warm-x.mem"
@@ -829,7 +807,7 @@ def test_the_backend_reports_unlink_failures_so_they_stay_retryable(tmp_path):
     mp.setattr(pathlib.Path, "unlink", _boom)
     try:
         with pytest.raises(OSError):
-            FcSnapshotBackend.discard(object(), art)  # type: ignore[arg-type]
+            FcSnapshotBackend.discard(object(), art)   # type: ignore[arg-type]
     finally:
         mp.undo()
 
@@ -885,7 +863,7 @@ def test_a_restore_whose_cleanup_cannot_kill_firecracker_keeps_its_pin(tmp_path)
 
     def _restore_fails_and_kill_fails(slot_workdir, artifact):
         exc = SnapshotRestoreError("load failed")
-        exc.kill_failed = True  # the backend could not confirm the process is gone
+        exc.kill_failed = True        # the backend could not confirm the process is gone
         raise exc
 
     be.restore_in = _restore_fails_and_kill_fails  # type: ignore[assignment]
@@ -913,7 +891,7 @@ def test_a_cancelled_restore_keeps_its_pin_when_teardown_is_unconfirmed(tmp_path
 
     def _cancelled_with_live_process(slot_workdir, artifact):
         exc = KeyboardInterrupt("operator interrupted mid-restore")
-        exc.kill_failed = True  # the process could not be confirmed gone
+        exc.kill_failed = True        # the process could not be confirmed gone
         raise exc
 
     be.restore_in = _cancelled_with_live_process  # type: ignore[assignment]

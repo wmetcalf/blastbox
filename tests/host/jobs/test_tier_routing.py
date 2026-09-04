@@ -6,7 +6,6 @@ operator/test tier routing — the API gate (BLASTBOX_ALLOW_TIER_ROUTING) contro
 target_tier can be SET at submit; here we verify it's HONORED at claim, the same way on
 both backends, and stays a no-op for ordinary (untargeted) jobs.
 """
-
 from __future__ import annotations
 
 import pytest
@@ -24,7 +23,6 @@ def store(request, tmp_path):
         import fakeredis
 
         from blastbox.host.jobs.redis_store import RedisJobStore
-
         return RedisJobStore(fakeredis.FakeRedis(), ttl_seconds=3600)
     return SqlJobStore(f"sqlite:///{tmp_path / 'jobs.db'}")
 
@@ -37,9 +35,7 @@ def _queued(filename: str = "f.docx", target_tier: str | None = None) -> Job:
 
 def test_untargeted_job_claimable_by_any_tier(store):
     store.create(_queued(target_tier=None))
-    claimed = store.claim_next(
-        claimant_tier="gvisor"
-    )  # any tier claims an untargeted job
+    claimed = store.claim_next(claimant_tier="gvisor")  # any tier claims an untargeted job
     assert claimed is not None
     assert claimed.status == JobStatus.RUNNING
 
@@ -85,16 +81,15 @@ def test_worker_tier_and_target_tier_round_trip(store):
 
 # --- claimable_after (capacity-deferral eligibility) --------------------------------------
 
-
 def test_deferred_job_not_claimed_until_window_passes(store):
     # PR #60: a job with claimable_after in the FUTURE is temporarily ineligible (a dispatcher
     # deferred it for lack of node-budget headroom), so claim_next skips it — on all backends.
     import time
 
     j = _queued(filename="deferred.docx")
-    j.claimable_after = time.time() + 100.0  # not claimable yet
+    j.claimable_after = time.time() + 100.0        # not claimable yet
     store.create(j)
-    assert store.claim_next(claimant_tier="cold") is None  # skipped
+    assert store.claim_next(claimant_tier="cold") is None      # skipped
 
     # once eligible (claimable_after in the past), it's claimable.
     j2 = _queued(filename="eligible.docx")
@@ -110,7 +105,7 @@ def test_deferred_job_does_not_block_claimable_work(store):
     import time
 
     old_deferred = _queued(filename="old_deferred.docx")
-    old_deferred.created_at = 100.0  # oldest
+    old_deferred.created_at = 100.0                # oldest
     old_deferred.claimable_after = time.time() + 100.0
     store.create(old_deferred)
     newer = _queued(filename="newer.docx")
@@ -118,9 +113,7 @@ def test_deferred_job_does_not_block_claimable_work(store):
     store.create(newer)
 
     claimed = store.claim_next(claimant_tier="cold")
-    assert (
-        claimed is not None and claimed.filename == "newer.docx"
-    )  # skipped the older deferred one
+    assert claimed is not None and claimed.filename == "newer.docx"   # skipped the older deferred one
 
 
 def test_claimable_after_round_trips(store):
@@ -133,20 +126,13 @@ def test_claimable_after_round_trips(store):
 
 # --- untargeted_only count (cross-tier dedup) --------------------------------------------
 
-
 def test_count_untargeted_only(store):
     # PR #60: count(untargeted_only=True) counts ONLY target_tier IS NULL — the queue shared by
     # every tier of an engine — so the sizer can de-duplicate it across a multi-tier engine.
-    store.create(_queued(filename="u1.docx", target_tier=None))  # untargeted
+    store.create(_queued(filename="u1.docx", target_tier=None))          # untargeted
     store.create(_queued(filename="fc.docx", target_tier="firecracker"))  # targeted
-    store.create(_queued(filename="u2.docx", target_tier=None))  # untargeted
-    assert (
-        store.count(JobStatus.QUEUED, untargeted_only=True) == 2
-    )  # only the 2 untargeted
-    assert store.count(JobStatus.QUEUED) == 3  # all
-    assert (
-        store.count(JobStatus.QUEUED, claimant_tier="firecracker") == 3
-    )  # untargeted + fc-targeted
-    assert (
-        store.count(JobStatus.QUEUED, claimant_tier="gvisor") == 2
-    )  # untargeted only (no gv-targeted)
+    store.create(_queued(filename="u2.docx", target_tier=None))          # untargeted
+    assert store.count(JobStatus.QUEUED, untargeted_only=True) == 2       # only the 2 untargeted
+    assert store.count(JobStatus.QUEUED) == 3                             # all
+    assert store.count(JobStatus.QUEUED, claimant_tier="firecracker") == 3  # untargeted + fc-targeted
+    assert store.count(JobStatus.QUEUED, claimant_tier="gvisor") == 2     # untargeted only (no gv-targeted)

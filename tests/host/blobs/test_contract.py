@@ -1,5 +1,4 @@
 """One contract, both backends — behaviour that must not diverge."""
-
 import pytest
 
 from blastbox.host.blobs.base import BlobFetchError

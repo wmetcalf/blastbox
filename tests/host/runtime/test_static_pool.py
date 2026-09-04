@@ -33,15 +33,11 @@ class FakeProbe:
 
 
 def _cfg(*specs: str, **kw) -> StaticPoolConfig:
-    workers = tuple(
-        StaticWorker.parse(s, default_port=8765, default_token=kw.pop("token", None))
-        for s in specs
-    )
+    workers = tuple(StaticWorker.parse(s, default_port=8765, default_token=kw.pop("token", None)) for s in specs)
     return StaticPoolConfig(workers=workers, **kw)
 
 
 # --------------------------------------------------------------- parsing / config
-
 
 def test_worker_parse_host_port():
     w = StaticWorker.parse("10.0.0.5:9000", default_port=8765, default_token=None)
@@ -54,9 +50,7 @@ def test_worker_parse_host_only_uses_default_port():
 
 
 def test_worker_parse_url():
-    w = StaticWorker.parse(
-        "https://w.internal:8443/", default_port=8765, default_token=None
-    )
+    w = StaticWorker.parse("https://w.internal:8443/", default_port=8765, default_token=None)
     assert w.url == "https://w.internal:8443" and w.host is None
 
 
@@ -80,17 +74,13 @@ def test_from_env_empty_is_no_workers():
 
 # --------------------------------------------------------------- availability (fail-closed)
 
-
 def test_available_false_when_no_workers():
     rt = StaticPoolRuntime(_cfg(), http_probe=FakeProbe(all_ok=True))
     assert rt.available() is False
 
 
 def test_available_true_when_one_box_healthy():
-    rt = StaticPoolRuntime(
-        _cfg("10.0.0.1:8765", "10.0.0.2:8765"),
-        http_probe=FakeProbe(healthy={"10.0.0.2"}),
-    )
+    rt = StaticPoolRuntime(_cfg("10.0.0.1:8765", "10.0.0.2:8765"), http_probe=FakeProbe(healthy={"10.0.0.2"}))
     assert rt.available() is True
 
 
@@ -100,7 +90,6 @@ def test_available_false_when_all_unreachable():
 
 
 # --------------------------------------------------------------- lifecycle
-
 
 def test_spawn_claims_free_box_and_sets_endpoint():
     rt = StaticPoolRuntime(_cfg("10.0.0.7:9001"), http_probe=FakeProbe(all_ok=True))
@@ -123,25 +112,19 @@ def test_spawn_exhausts_then_reap_frees():
 
 def test_spawn_skips_unhealthy_worker():
     # box "dead" fails /healthz -> the claim must skip it and hand out "live"
-    rt = StaticPoolRuntime(
-        _cfg("dead:8765", "live:8765"), http_probe=FakeProbe(healthy={"live"})
-    )
+    rt = StaticPoolRuntime(_cfg("dead:8765", "live:8765"), http_probe=FakeProbe(healthy={"live"}))
     slot = rt.spawn()
     assert slot.ip == "live"
 
 
 def test_spawn_raises_when_no_free_worker_healthy():
-    rt = StaticPoolRuntime(
-        _cfg("a:8765", "b:8765"), http_probe=FakeProbe(healthy=set())
-    )
+    rt = StaticPoolRuntime(_cfg("a:8765", "b:8765"), http_probe=FakeProbe(healthy=set()))
     with pytest.raises(StaticPoolUnhealthy):
         rt.spawn()
 
 
 def test_spawn_distributes_across_distinct_boxes():
-    rt = StaticPoolRuntime(
-        _cfg("a:8765", "b:8765", "c:8765"), http_probe=FakeProbe(all_ok=True)
-    )
+    rt = StaticPoolRuntime(_cfg("a:8765", "b:8765", "c:8765"), http_probe=FakeProbe(all_ok=True))
     idxs = {rt.spawn().worker_index for _ in range(3)}
     assert idxs == {0, 1, 2}  # each claim a distinct box
 
@@ -153,12 +136,12 @@ def test_dirty_reap_quarantines_box_until_cooldown():
     cfg = _cfg("a:8765", dirty_cooldown_s=30.0)
     rt = StaticPoolRuntime(cfg, http_probe=FakeProbe(all_ok=True), clock=lambda: now[0])
     s1 = rt.spawn()
-    rt.reap(s1, dirty=True)  # box goes into cooldown
+    rt.reap(s1, dirty=True)                       # box goes into cooldown
     with pytest.raises(StaticPoolExhausted):
-        rt.spawn()  # still cooling -> not claimable
-    now[0] += 31.0  # cooldown expires
+        rt.spawn()                                # still cooling -> not claimable
+    now[0] += 31.0                                # cooldown expires
     s2 = rt.spawn()
-    assert s2.worker_index == s1.worker_index  # reclaimed after cooldown
+    assert s2.worker_index == s1.worker_index     # reclaimed after cooldown
 
 
 def test_clean_reap_has_no_cooldown():
@@ -166,7 +149,7 @@ def test_clean_reap_has_no_cooldown():
     cfg = _cfg("a:8765", dirty_cooldown_s=30.0)
     rt = StaticPoolRuntime(cfg, http_probe=FakeProbe(all_ok=True), clock=lambda: now[0])
     s1 = rt.spawn()
-    rt.reap(s1, dirty=False)  # clean -> immediately reusable
+    rt.reap(s1, dirty=False)                       # clean -> immediately reusable
     assert rt.spawn().worker_index == s1.worker_index
 
 
@@ -182,16 +165,13 @@ def test_reap_is_idempotent():
 
 # --------------------------------------------------------------- transport compatibility + protocol
 
-
 def test_slot_works_with_remote_http_transport():
     rt = StaticPoolRuntime(_cfg("10.0.1.9:8765"), http_probe=FakeProbe(all_ok=True))
     assert slot_base_url(rt.spawn()) == "http://10.0.1.9:8765"
 
 
 def test_url_worker_slot_base_url():
-    rt = StaticPoolRuntime(
-        _cfg("https://w.internal:8443"), http_probe=FakeProbe(all_ok=True)
-    )
+    rt = StaticPoolRuntime(_cfg("https://w.internal:8443"), http_probe=FakeProbe(all_ok=True))
     assert slot_base_url(rt.spawn()) == "https://w.internal:8443"
 
 
@@ -202,48 +182,33 @@ def test_satisfies_slotruntime_protocol():
 
 def test_static_dispatch_style_is_network():
     rt = StaticPoolRuntime(_cfg("a:8765"), http_probe=FakeProbe(all_ok=True))
-    assert rt.dispatch_style == "network"  # capability-based routing -> VmJobDispatcher
+    assert rt.dispatch_style == "network"   # capability-based routing -> VmJobDispatcher
 
 
 def test_tls_mode_uses_https_scheme(tmp_path):
     from blastbox.host.pki import ensure_ca
     from blastbox.tls import client_ssl_context
-
     ensure_ca(tmp_path)  # writes ca.crt
     ctx = client_ssl_context(str(tmp_path / "ca.crt"))
-    rt = StaticPoolRuntime(
-        _cfg("10.0.0.9:8765"), http_probe=FakeProbe(all_ok=True), ssl_context=ctx
-    )
+    rt = StaticPoolRuntime(_cfg("10.0.0.9:8765"), http_probe=FakeProbe(all_ok=True), ssl_context=ctx)
     assert rt.ssl_context is ctx
-    assert (
-        slot_base_url(rt.spawn()) == "https://10.0.0.9:8765"
-    )  # host:port -> https in TLS mode
+    assert slot_base_url(rt.spawn()) == "https://10.0.0.9:8765"   # host:port -> https in TLS mode
 
 
 def test_tls_forces_https_on_plaintext_url_worker(tmp_path):
     from blastbox.host.pki import ensure_ca
     from blastbox.tls import client_ssl_context
-
     ensure_ca(tmp_path)
     ctx = client_ssl_context(str(tmp_path / "ca.crt"))
-    rt = StaticPoolRuntime(
-        _cfg("http://w.internal:8443"),
-        http_probe=FakeProbe(all_ok=True),
-        ssl_context=ctx,
-    )
-    assert (
-        slot_base_url(rt.spawn()) == "https://w.internal:8443"
-    )  # never plaintext under mTLS
+    rt = StaticPoolRuntime(_cfg("http://w.internal:8443"), http_probe=FakeProbe(all_ok=True), ssl_context=ctx)
+    assert slot_base_url(rt.spawn()) == "https://w.internal:8443"   # never plaintext under mTLS
 
 
 def test_select_builds_ssl_context_from_dispatch_tls_env(tmp_path):
     from blastbox.host.pki import ensure_ca
-
     ensure_ca(tmp_path)
-    env = {
-        "BLASTBOX_STATIC_WORKERS": "10.0.0.1:8765",
-        "BLASTBOX_DISPATCH_TLS_CA": str(tmp_path / "ca.crt"),
-    }
+    env = {"BLASTBOX_STATIC_WORKERS": "10.0.0.1:8765",
+           "BLASTBOX_DISPATCH_TLS_CA": str(tmp_path / "ca.crt")}
     rt = select_static_pool_runtime(env.get, require_available=False)
     assert rt.ssl_context is not None
 
@@ -259,27 +224,20 @@ def test_token_forwarded_as_auth_header():
 
 # --------------------------------------------------------------- selection
 
-
 def test_select_requires_available_raises_when_empty():
     with pytest.raises(StaticPoolUnavailable):
-        select_static_pool_runtime(
-            {}.get, require_available=True, http_probe=FakeProbe(all_ok=True)
-        )
+        select_static_pool_runtime({}.get, require_available=True, http_probe=FakeProbe(all_ok=True))
 
 
 def test_select_requires_available_raises_when_unreachable():
     env = {"BLASTBOX_STATIC_WORKERS": "10.0.0.1:8765"}
     with pytest.raises(StaticPoolUnavailable):
-        select_static_pool_runtime(
-            env.get, require_available=True, http_probe=FakeProbe(healthy=set())
-        )
+        select_static_pool_runtime(env.get, require_available=True, http_probe=FakeProbe(healthy=set()))
 
 
 def test_select_returns_runtime_when_reachable():
     env = {"BLASTBOX_STATIC_WORKERS": "10.0.0.1:8765,10.0.0.2:8765"}
-    rt = select_static_pool_runtime(
-        env.get, require_available=True, http_probe=FakeProbe(all_ok=True)
-    )
+    rt = select_static_pool_runtime(env.get, require_available=True, http_probe=FakeProbe(all_ok=True))
     assert isinstance(rt, StaticPoolRuntime) and len(rt.cfg.workers) == 2
 
 
@@ -288,9 +246,7 @@ def test_pool_config_registers_static_runtime(monkeypatch):
     from blastbox.host import pool_config
 
     monkeypatch.setenv("BLASTBOX_POOL_RUNTIME", "static")
-    monkeypatch.setenv(
-        "BLASTBOX_STATIC_WORKERS", ""
-    )  # empty -> require_available raises
+    monkeypatch.setenv("BLASTBOX_STATIC_WORKERS", "")  # empty -> require_available raises
     cfg = pool_config.PoolConfig.from_env()
     with pytest.raises(StaticPoolUnavailable):
         pool_config.build_warm_pool(cfg=cfg)
@@ -306,7 +262,6 @@ def test_static_local_probe_failure_is_unknown_not_fleet_wide_death():
     reconfigured) says nothing about the box -- and it hits every worker on the same tick, so a
     plain False marked the entire tier dead at once. That is the exact fault `_aws` was hardened
     against, left in place on this tier (issue #77 marla-loop 2)."""
-
     def _boom(*a, **k):
         raise OSError("[Errno 24] Too many open files")
 
@@ -314,15 +269,13 @@ def test_static_local_probe_failure_is_unknown_not_fleet_wide_death():
     # exactly as an exhausted fd table would mid-run.
     rt = StaticPoolRuntime(_cfg("10.0.0.1:8765"), http_probe=FakeProbe(all_ok=True))
     slot = rt.spawn()
-    rt._probe = _boom  # type: ignore[assignment]
-    assert rt.is_alive(slot) is None, (
-        "a host-side probe failure must be UNKNOWN, not a verdict"
-    )
+    rt._probe = _boom                       # type: ignore[assignment]
+    assert rt.is_alive(slot) is None, "a host-side probe failure must be UNKNOWN, not a verdict"
 
     # ...while a box that ANSWERS unhealthy is still a real verdict.
     rt2 = StaticPoolRuntime(_cfg("10.0.0.1:8765"), http_probe=FakeProbe(all_ok=True))
     slot2 = rt2.spawn()
-    rt2._probe = FakeProbe(healthy=set())  # type: ignore[assignment]
+    rt2._probe = FakeProbe(healthy=set())   # type: ignore[assignment]
     assert rt2.is_alive(slot2) is False
 
 
@@ -339,14 +292,9 @@ def test_local_exhaustion_reaches_is_alive_through_the_REAL_probe(monkeypatch):
     def _exhausted(req, timeout):  # noqa: ANN001
         raise OSError(_errno.EMFILE, "Too many open files")
 
-    monkeypatch.setattr(
-        awsmod, "_default_open", lambda *a, **k: _exhausted(*a, **k), raising=False
-    )
-    monkeypatch.setattr(
-        "blastbox.host.runtime.remote_http._default_open",
-        lambda *a, **k: _exhausted(*a, **k),
-        raising=False,
-    )
+    monkeypatch.setattr(awsmod, "_default_open", lambda *a, **k: _exhausted(*a, **k), raising=False)
+    monkeypatch.setattr("blastbox.host.runtime.remote_http._default_open",
+                        lambda *a, **k: _exhausted(*a, **k), raising=False)
     assert _default_http_probe("http://10.0.0.1:8765/healthz", {}, 1.0) is None, (
         "local fd exhaustion must not be reported as a worker verdict"
     )
@@ -355,11 +303,8 @@ def test_local_exhaustion_reaches_is_alive_through_the_REAL_probe(monkeypatch):
     def _refused(req, timeout):  # noqa: ANN001
         raise ConnectionRefusedError(_errno.ECONNREFUSED, "Connection refused")
 
-    monkeypatch.setattr(
-        "blastbox.host.runtime.remote_http._default_open",
-        lambda *a, **k: _refused(*a, **k),
-        raising=False,
-    )
+    monkeypatch.setattr("blastbox.host.runtime.remote_http._default_open",
+                        lambda *a, **k: _refused(*a, **k), raising=False)
     assert _default_http_probe("http://10.0.0.1:8765/healthz", {}, 1.0) is False
 
 
@@ -379,25 +324,15 @@ def test_real_fd_exhaustion_does_not_reap_the_fleet(monkeypatch):
         if exhausted["v"]:
             # EXACTLY what urllib.request.AbstractHTTPHandler.do_open raises on a socket failure.
             raise urllib.error.URLError(OSError(_errno.EMFILE, "Too many open files"))
-
         class _R:
             status = 200
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
         return _R()
 
-    monkeypatch.setattr(
-        "blastbox.host.runtime.remote_http._default_open", _opener, raising=False
-    )
+    monkeypatch.setattr("blastbox.host.runtime.remote_http._default_open", _opener, raising=False)
 
-    rt = StaticPoolRuntime(
-        _cfg("10.0.0.1:8765", "10.0.0.2:8765")
-    )  # REAL probe, not a fake
+    rt = StaticPoolRuntime(_cfg("10.0.0.1:8765", "10.0.0.2:8765"))   # REAL probe, not a fake
     pool = WarmPool(runtime=rt, warm_size=2)
     for _ in range(2):
         s = rt.spawn()
@@ -408,12 +343,10 @@ def test_real_fd_exhaustion_does_not_reap_the_fleet(monkeypatch):
     exhausted["v"] = True
     pool._health_check()
     alive = [rt.is_alive(s) for s in pool._slots.values()]
-    assert all(a is None for a in alive), (
-        f"local fd exhaustion read as a verdict: {alive}"
-    )
+    assert all(a is None for a in alive), f"local fd exhaustion read as a verdict: {alive}"
     assert len(pool._slots) == 2, "the entire fleet was reaped by one health tick"
 
-    exhausted["v"] = False  # pressure clears
+    exhausted["v"] = False                       # pressure clears
     assert all(rt.is_alive(s) is True for s in pool._slots.values())
 
 
@@ -431,24 +364,16 @@ def test_the_mTLS_probe_reports_unknown_on_local_exhaustion(monkeypatch):
     def _boom(req, timeout, context=None):  # noqa: ANN001
         raise urllib.error.URLError(OSError(_errno.ENOMEM, "Cannot allocate memory"))
 
-    monkeypatch.setattr(
-        "blastbox.host.runtime.remote_http._default_open", _boom, raising=False
-    )
+    monkeypatch.setattr("blastbox.host.runtime.remote_http._default_open", _boom, raising=False)
     assert probe("https://10.0.0.1:8765/healthz", {}, 1.0) is None, (
-        "the mTLS probe convicted a worker on local resource exhaustion"
-    )
+        "the mTLS probe convicted a worker on local resource exhaustion")
 
     def _refused(req, timeout, context=None):  # noqa: ANN001
-        raise urllib.error.URLError(
-            ConnectionRefusedError(_errno.ECONNREFUSED, "refused")
-        )
+        raise urllib.error.URLError(ConnectionRefusedError(_errno.ECONNREFUSED, "refused"))
 
-    monkeypatch.setattr(
-        "blastbox.host.runtime.remote_http._default_open", _refused, raising=False
-    )
+    monkeypatch.setattr("blastbox.host.runtime.remote_http._default_open", _refused, raising=False)
     assert probe("https://10.0.0.1:8765/healthz", {}, 1.0) is False, (
-        "a refusal is a real answer about the box and must stay False"
-    )
+        "a refusal is a real answer about the box and must stay False")
 
 
 def test_env_probe_timeout_below_the_floor_cannot_brick_the_tier():
@@ -460,7 +385,7 @@ def test_env_probe_timeout_below_the_floor_cannot_brick_the_tier():
 
     assert _cfg(probe_timeout_s=0.0).probe_timeout_s >= _MIN_PROBE_S
     assert _cfg(probe_timeout_s=0.01).probe_timeout_s >= _MIN_PROBE_S
-    assert _cfg(probe_timeout_s=7.5).probe_timeout_s == 7.5  # a sane value is untouched
+    assert _cfg(probe_timeout_s=7.5).probe_timeout_s == 7.5      # a sane value is untouched
 
 
 def test_static_hand_out_probe_honours_the_claim_deadline():
@@ -476,7 +401,7 @@ def test_static_hand_out_probe_honours_the_claim_deadline():
 
     rt = StaticPoolRuntime(_cfg("10.0.0.1:8765"), http_probe=FakeProbe(all_ok=True))
     slot = rt.spawn()
-    rt._probe = _probe  # type: ignore[assignment]
+    rt._probe = _probe                       # type: ignore[assignment]
     assert rt.is_alive_for_claim(slot, budget_s=0.4) is True
     assert seen and seen[-1] <= 0.4, f"probe ignored the 0.4s claim budget: {seen}"
 
@@ -493,12 +418,10 @@ def test_cooldown_only_misses_are_capacity_not_a_broken_fleet():
     can invalidate an unrelated healthy snapshot base.
     """
     cfg = _cfg("a:8765", "b:8765", dirty_cooldown_s=30.0)
-    rt = StaticPoolRuntime(
-        cfg, http_probe=FakeProbe(all_ok=True)
-    )  # both answer /healthz
+    rt = StaticPoolRuntime(cfg, http_probe=FakeProbe(all_ok=True))   # both answer /healthz
     a = rt.spawn()
     b = rt.spawn()
-    rt.reap(a, dirty=True)  # both quarantined, neither unhealthy
+    rt.reap(a, dirty=True)      # both quarantined, neither unhealthy
     rt.reap(b, dirty=True)
 
     with pytest.raises(StaticPoolExhausted) as ei:
@@ -517,7 +440,7 @@ def test_an_unknown_health_probe_is_capacity_not_a_broken_fleet():
     "a slow or erroring control plane must never read as dead" invariant as issue #77.
     """
     cfg = _cfg("a:8765", "b:8765")
-    rt = StaticPoolRuntime(cfg, http_probe=lambda *a, **kw: None)  # UNKNOWN, not False
+    rt = StaticPoolRuntime(cfg, http_probe=lambda *a, **kw: None)   # UNKNOWN, not False
 
     with pytest.raises(StaticPoolExhausted) as ei:
         rt.spawn()
@@ -529,7 +452,7 @@ def test_an_unknown_health_probe_is_capacity_not_a_broken_fleet():
 def test_a_genuinely_failing_probe_is_still_unhealthy():
     """The carve-out must stay narrow: False is a real verdict and must keep reporting a fault."""
     cfg = _cfg("a:8765", "b:8765")
-    rt = StaticPoolRuntime(cfg, http_probe=FakeProbe(healthy=set()))  # explicit False
+    rt = StaticPoolRuntime(cfg, http_probe=FakeProbe(healthy=set()))   # explicit False
 
     with pytest.raises(StaticPoolUnhealthy):
         rt.spawn()
@@ -547,24 +470,16 @@ def test_a_static_workers_failures_survive_its_slot():
     """
     from blastbox.host.pool import WarmPool
 
-    rt = StaticPoolRuntime(
-        _cfg("10.0.0.1:8765", "10.0.0.2:8765"), http_probe=FakeProbe(all_ok=True)
-    )
-    pool = WarmPool(
-        runtime=rt,
-        warm_size=1,
-        concurrent_ceiling=2,
-        max_consecutive_failures=2,
-        eviction_window_s=10_000.0,
-        max_evictions_per_window=10,
-    )
+    rt = StaticPoolRuntime(_cfg("10.0.0.1:8765", "10.0.0.2:8765"),
+                           http_probe=FakeProbe(all_ok=True))
+    pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=2,
+                    max_consecutive_failures=2, eviction_window_s=10_000.0,
+                    max_evictions_per_window=10)
 
     slot1 = rt.spawn()
     pool._slots[slot1.slot_id] = slot1
     key1 = pool._health_key(slot1)
-    assert key1 == f"static:{slot1.worker_index}", (
-        "the physical box must be the identity"
-    )
+    assert key1 == f"static:{slot1.worker_index}", "the physical box must be the identity"
 
     pool.release(slot1, dirty=True, fault="worker")
     assert pool._slot_failures.get(key1) == 1
@@ -594,22 +509,11 @@ def test_a_disposable_runtimes_history_is_still_dropped_with_its_slot():
 
     class _Disposable:
         def spawn(self):
-            return Slot(
-                slot_id=str(uuid4()),
-                control_dir="/c",
-                input_dir="/i",
-                output_dir="/o",
-                state=SlotState.IDLE,
-            )
-
-        def is_ready(self, s):
-            return True
-
-        def is_alive(self, s):
-            return True
-
-        def reap(self, s):
-            pass
+            return Slot(slot_id=str(uuid4()), control_dir="/c", input_dir="/i",
+                        output_dir="/o", state=SlotState.IDLE)
+        def is_ready(self, s): return True
+        def is_alive(self, s): return True
+        def reap(self, s): pass
 
     pool = WarmPool(runtime=_Disposable(), warm_size=1, concurrent_ceiling=2)
     slot = pool._runtime.spawn()
@@ -639,14 +543,12 @@ def test_a_static_tier_under_a_cascade_keeps_its_worker_identity():
     from blastbox.host.pool import WarmPool
     from blastbox.host.runtime.cascade import CascadingRuntime, Tier
 
-    inner = StaticPoolRuntime(
-        _cfg("10.0.0.1:8765", "10.0.0.2:8765"), http_probe=FakeProbe(all_ok=True)
-    )
+    inner = StaticPoolRuntime(_cfg("10.0.0.1:8765", "10.0.0.2:8765"),
+                              http_probe=FakeProbe(all_ok=True))
     # Tier name deliberately DIFFERENT from the inner identity prefix, or a qualified key and a
     # bare one look identical and the assertion proves nothing.
-    casc = CascadingRuntime(
-        tiers=[Tier(name="boxes", runtime=inner, capacity=2)], tier_rebuild_after=99
-    )
+    casc = CascadingRuntime(tiers=[Tier(name="boxes", runtime=inner, capacity=2)],
+                            tier_rebuild_after=99)
     pool = WarmPool(runtime=casc, warm_size=1, concurrent_ceiling=2)
 
     slot = casc.spawn()
@@ -669,26 +571,14 @@ def test_a_cascade_over_a_disposable_tier_reports_no_identity():
 
     class _Disposable:
         def spawn(self):
-            return Slot(
-                slot_id="d1",
-                control_dir="/c",
-                input_dir="/i",
-                output_dir="/o",
-                state=SlotState.IDLE,
-            )
+            return Slot(slot_id="d1", control_dir="/c", input_dir="/i", output_dir="/o",
+                        state=SlotState.IDLE)
+        def is_ready(self, s): return True
+        def is_alive(self, s): return True
+        def reap(self, s): pass
 
-        def is_ready(self, s):
-            return True
-
-        def is_alive(self, s):
-            return True
-
-        def reap(self, s):
-            pass
-
-    casc = CascadingRuntime(
-        tiers=[Tier(name="d", runtime=_Disposable(), capacity=2)], tier_rebuild_after=99
-    )
+    casc = CascadingRuntime(tiers=[Tier(name="d", runtime=_Disposable(), capacity=2)],
+                            tier_rebuild_after=99)
     slot = casc.spawn()
     assert casc.worker_identity(slot) is None
 
@@ -703,17 +593,11 @@ def test_a_job_fault_clears_the_boxs_failures_not_the_slots():
     """
     from blastbox.host.pool import WarmPool
 
-    rt = StaticPoolRuntime(
-        _cfg("10.0.0.1:8765", "10.0.0.2:8765"), http_probe=FakeProbe(all_ok=True)
-    )
-    pool = WarmPool(
-        runtime=rt,
-        warm_size=1,
-        concurrent_ceiling=2,
-        max_consecutive_failures=2,
-        eviction_window_s=10_000.0,
-        max_evictions_per_window=10,
-    )
+    rt = StaticPoolRuntime(_cfg("10.0.0.1:8765", "10.0.0.2:8765"),
+                           http_probe=FakeProbe(all_ok=True))
+    pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=2,
+                    max_consecutive_failures=2, eviction_window_s=10_000.0,
+                    max_evictions_per_window=10)
 
     slot = rt.spawn()
     pool._slots[slot.slot_id] = slot
@@ -744,9 +628,8 @@ def test_a_burned_out_static_box_leaves_the_rotation():
     forever — each crossing logged, and charged against the eviction budget for an eviction that
     never happened.
     """
-    rt = StaticPoolRuntime(
-        _cfg("10.0.0.1:8765", "10.0.0.2:8765"), http_probe=FakeProbe(all_ok=True)
-    )
+    rt = StaticPoolRuntime(_cfg("10.0.0.1:8765", "10.0.0.2:8765"),
+                           http_probe=FakeProbe(all_ok=True))
     doomed = rt.spawn()
     idx = doomed.worker_index
 
@@ -795,19 +678,12 @@ def test_the_pool_tells_a_reusing_runtime_about_burnout():
             burned.append(slot.worker_index)
             super().burn_out(slot)
 
-    rt = _Reusing(
-        _cfg("10.0.0.1:8765", "10.0.0.2:8765"), http_probe=FakeProbe(all_ok=True)
-    )
-    pool = WarmPool(
-        runtime=rt,
-        warm_size=1,
-        concurrent_ceiling=2,
-        max_consecutive_failures=2,
-        eviction_window_s=10_000.0,
-        max_evictions_per_window=10,
-    )
+    rt = _Reusing(_cfg("10.0.0.1:8765", "10.0.0.2:8765"), http_probe=FakeProbe(all_ok=True))
+    pool = WarmPool(runtime=rt, warm_size=1, concurrent_ceiling=2,
+                    max_consecutive_failures=2, eviction_window_s=10_000.0,
+                    max_evictions_per_window=10)
 
-    for _ in range(2):  # two worker faults on the SAME physical box
+    for _ in range(2):                     # two worker faults on the SAME physical box
         slot = rt.spawn()
         slot.worker_index = 0
         pool._slots[slot.slot_id] = slot
@@ -829,9 +705,8 @@ def test_is_ready_forwards_UNKNOWN_rather_than_calling_it_not_ready():
     WARMING population aged out and was evicted, each charged as a confirmed restore failure. That
     is issue #79's failure on the tier nobody converted.
     """
-
     class _CannotAsk:
-        def __call__(self, url, headers, timeout):  # noqa: ANN001 -- local exhaustion, not a verdict
+        def __call__(self, url, headers, timeout):   # noqa: ANN001 -- local exhaustion, not a verdict
             raise OSError(24, "Too many open files")
 
     rt = StaticPoolRuntime(_cfg("10.0.0.1:8765"), http_probe=_CannotAsk())
@@ -865,22 +740,15 @@ def test_static_availability_is_tri_state_so_a_transient_local_fault_defers_not_
     no-verdict case raises the plain StaticPoolUnavailable again.
     """
     from blastbox.host.runtime.cascade import _is_undecided_availability
-    from blastbox.host.runtime.static_pool import (
-        StaticPoolNoVerdict,
-        StaticPoolUnavailable,
-    )
+    from blastbox.host.runtime.static_pool import StaticPoolNoVerdict, StaticPoolUnavailable
 
-    rt = StaticPoolRuntime(
-        _cfg("10.0.0.1:8765", "10.0.0.2:8765"), http_probe=FakeProbe(all_ok=True)
-    )
+    rt = StaticPoolRuntime(_cfg("10.0.0.1:8765", "10.0.0.2:8765"), http_probe=FakeProbe(all_ok=True))
 
-    rt._health_ok = lambda w, timeout=None: None  # nobody answered
+    rt._health_ok = lambda w, timeout=None: None                      # nobody answered
     assert rt.available() is None, "an unaskable fleet must be UNKNOWN, not down"
 
-    rt._health_ok = lambda w, timeout=None: False  # everyone answered, all sick
-    assert rt.available() is False, (
-        "a fleet that answered and is down is still a verdict"
-    )
+    rt._health_ok = lambda w, timeout=None: False                     # everyone answered, all sick
+    assert rt.available() is False, "a fleet that answered and is down is still a verdict"
 
     # MIXED: one definitive no, one unaskable. `all(v is None)` required EVERY probe to be silent
     # before answering UNKNOWN, so this came out False -- which contradicts what False promises
@@ -890,26 +758,20 @@ def test_static_availability_is_tri_state_so_a_transient_local_fault_defers_not_
     rt._health_ok = lambda w, timeout=None: False if w.host == "10.0.0.1" else None
     assert rt.available() is None, (
         "a fleet with one unhealthy and one UNOBSERVABLE worker reported a definitive verdict; the "
-        "unobservable one may be healthy, and the cascade drops the tier for the process lifetime"
-    )
+        "unobservable one may be healthy, and the cascade drops the tier for the process lifetime")
 
-    rt._health_ok = lambda w, timeout=None: w.host == "10.0.0.1"  # one healthy
+    rt._health_ok = lambda w, timeout=None: w.host == "10.0.0.1"      # one healthy
     assert rt.available() is True
 
     # ...and the cascade must classify the no-verdict case as DEFERRABLE, not as a verdict.
     assert issubclass(StaticPoolNoVerdict, StaticPoolUnavailable), (
-        "every existing `except StaticPoolUnavailable` must still catch it"
-    )
+        "every existing `except StaticPoolUnavailable` must still catch it")
     assert _is_undecided_availability(StaticPoolNoVerdict("nobody answered")) is True, (
         "the cascade treats a static no-verdict as a VERDICT, so the tier is dropped for the "
-        "process lifetime instead of deferred and re-probed"
-    )
-    assert (
-        _is_undecided_availability(StaticPoolUnavailable("fleet is down")) is False
-    ), (
+        "process lifetime instead of deferred and re-probed")
+    assert _is_undecided_availability(StaticPoolUnavailable("fleet is down")) is False, (
         "a real 'the fleet is down' verdict must NOT be deferred, or an unusable tier is retried "
-        "forever"
-    )
+        "forever")
 
 
 def test_availability_stops_probing_once_a_worker_answers_healthy():
@@ -924,10 +786,8 @@ def test_availability_stops_probing_once_a_worker_answers_healthy():
     MUTATION: restore the eager `verdicts = [...]` comprehension -> 100 probes, not 1.
     """
     probed: list[str] = []
-    rt = StaticPoolRuntime(
-        _cfg(*[f"10.0.0.{i}:8765" for i in range(1, 40)]),
-        http_probe=FakeProbe(all_ok=True),
-    )
+    rt = StaticPoolRuntime(_cfg(*[f"10.0.0.{i}:8765" for i in range(1, 40)]),
+                           http_probe=FakeProbe(all_ok=True))
 
     def _first_is_healthy(w, timeout=None):  # noqa: ANN001, ANN202
         probed.append(w.host)
@@ -937,14 +797,11 @@ def test_availability_stops_probing_once_a_worker_answers_healthy():
     assert rt.available() is True
     assert len(probed) == 1, (
         f"probed {len(probed)} of {len(rt.cfg.workers)} workers after the first already answered "
-        f"healthy; each unreachable box costs probe_timeout_s, on dispatcher startup"
-    )
+        f"healthy; each unreachable box costs probe_timeout_s, on dispatcher startup")
 
     # ...and the tri-state answers still hold, which is what the short-circuit must not cost.
     probed.clear()
     rt._health_ok = lambda w, timeout=None: False if w.host == "10.0.0.1" else None
-    assert rt.available() is None, (
-        "one unobservable worker must not read as a fleet verdict"
-    )
+    assert rt.available() is None, "one unobservable worker must not read as a fleet verdict"
     rt._health_ok = lambda w, timeout=None: False
     assert rt.available() is False, "a fleet that all answered no is still a verdict"

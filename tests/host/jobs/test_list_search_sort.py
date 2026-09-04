@@ -1,7 +1,6 @@
 """list(q=, sort=, order=) + count(q=) — filename substring search + whitelist
 column sort, restored from the engines' bespoke list views (the generic /v1/jobs
 had only status filtering, so both engines' search boxes + sort headers were dead)."""
-
 from __future__ import annotations
 
 from blastbox.host.jobs.base import Job, JobStatus
@@ -10,11 +9,7 @@ from blastbox.host.jobs.memory import InMemoryJobStore
 
 def _store() -> InMemoryJobStore:
     s = InMemoryJobStore()
-    for fn, created in [
-        ("report.docx", 1.0),
-        ("Invoice.pdf", 2.0),
-        ("report_v2.xlsx", 3.0),
-    ]:
+    for fn, created in [("report.docx", 1.0), ("Invoice.pdf", 2.0), ("report_v2.xlsx", 3.0)]:
         j = Job.new(engine="e", filename=fn)
         j.created_at = created
         j.status = JobStatus.DONE
@@ -46,11 +41,7 @@ def test_sort_by_filename_asc():
 def test_default_newest_first_and_unknown_sort_falls_back():
     s = _store()
     assert [j.filename for j in s.list(newest_first=True)] == [
-        "report_v2.xlsx",
-        "Invoice.pdf",
-        "report.docx",
+        "report_v2.xlsx", "Invoice.pdf", "report.docx",
     ]
     # a non-whitelisted sort field is ignored (no injection) → newest-first
-    assert [j.filename for j in s.list(sort="bogus", newest_first=True)][
-        0
-    ] == "report_v2.xlsx"
+    assert [j.filename for j in s.list(sort="bogus", newest_first=True)][0] == "report_v2.xlsx"

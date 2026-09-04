@@ -32,9 +32,7 @@ def test_the_gvisor_base_is_stamped_before_runsc_run(tmp_path, monkeypatch):
     epoch = [7]
     started_at = epoch[0]
 
-    monkeypatch.setattr(
-        gs, "_prepare_slot_dirs", lambda cfg, base: base.mkdir(parents=True)
-    )
+    monkeypatch.setattr(gs, "_prepare_slot_dirs", lambda cfg, base: base.mkdir(parents=True))
     monkeypatch.setattr(gs, "_write_oci_config", lambda cfg, base, in_ro=True: None)
     monkeypatch.setattr(gs, "_runsc", lambda cfg: ["runsc"])
 
@@ -56,11 +54,10 @@ def test_the_gvisor_base_is_stamped_before_runsc_run(tmp_path, monkeypatch):
 
     assert handle._ack_gen == started_at, (
         "the handle carries the generation current when the build FINISHED; a build that is "
-        "already being discarded must not be able to teach its replacement"
-    )
+        "already being discarded must not be able to teach its replacement")
     # And the consequence: its advertisement is ignored, so capability stays UNKNOWN.
     cap.observe(handle._ack_gen)
-    cap.publish(epoch[0])  # the REPLACEMENT is what actually publishes
+    cap.publish(epoch[0])          # the REPLACEMENT is what actually publishes
     assert not cap.capable_for(epoch[0]), "a retired build taught the replacement epoch"
 
 
@@ -93,10 +90,8 @@ def test_the_fc_base_is_stamped_before_the_microvm_spawns(tmp_path, monkeypatch)
         workdir.mkdir(parents=True, exist_ok=True)
         # THE WINDOW: the base is replaced during the (slow) microVM launch + API boot.
         epoch[0] += 1
-        return (
-            type("P", (), {"pid": 1})(),
-            type("A", (), {"put": lambda self, *a, **k: None})(),
-        )
+        return (type("P", (), {"pid": 1})(),
+                type("A", (), {"put": lambda self, *a, **k: None})())
 
     lch._spawn = _spawn
 
@@ -104,34 +99,26 @@ def test_the_fc_base_is_stamped_before_the_microvm_spawns(tmp_path, monkeypatch)
 
     assert seen["gen"] == started_at, (
         "the READY listener was stamped with the generation current at BIND time, after the "
-        "spawn -- so an invalidation during the launch is credited to the replacement"
-    )
+        "spawn -- so an invalidation during the launch is credited to the replacement")
     cap.observe(seen["gen"])
-    cap.publish(epoch[0])  # the REPLACEMENT is what actually publishes
-    assert not cap.capable_for(epoch[0]), (
-        "a retired base build taught the replacement epoch"
-    )
+    cap.publish(epoch[0])          # the REPLACEMENT is what actually publishes
+    assert not cap.capable_for(epoch[0]), "a retired base build taught the replacement epoch"
 
 
-@pytest.mark.parametrize(
-    "factory, expected",
-    [
-        (lambda p: None, {}),  # legacy one-arg seam (CRaC, doubles)
-        (lambda p, ack_generation=None: None, {"ack_generation": 7}),
-        (lambda p, **kw: None, {"ack_generation": 7}),
-        (lambda p, *, ack_generation=None: None, {"ack_generation": 7}),
-    ],
-)
+@pytest.mark.parametrize("factory, expected", [
+    (lambda p: None, {}),                                  # legacy one-arg seam (CRaC, doubles)
+    (lambda p, ack_generation=None: None, {"ack_generation": 7}),
+    (lambda p, **kw: None, {"ack_generation": 7}),
+    (lambda p, *, ack_generation=None: None, {"ack_generation": 7}),
+])
 def test_a_legacy_ready_factory_is_never_handed_the_new_kwarg(factory, expected):
     """ready_check_factory is a public seam; one-argument callables must keep working."""
     assert _ready_factory_kwargs(factory, ack_generation=7) == expected
 
 
 def test_no_stamp_means_no_kwarg():
-    assert (
-        _ready_factory_kwargs(lambda p, ack_generation=None: None, ack_generation=None)
-        == {}
-    )
+    assert _ready_factory_kwargs(lambda p, ack_generation=None: None,
+                                 ack_generation=None) == {}
 
 
 def test_the_snapshot_runtime_stamps_the_slot_with_the_pinned_epoch(tmp_path):
@@ -156,17 +143,13 @@ def test_the_snapshot_runtime_stamps_the_slot_with_the_pinned_epoch(tmp_path):
 
     class _Manager:
         """A rebuild landed between a build_epoch read and restore()'s selection."""
-
-        build_epoch = 9  # what is current NOW
-
+        build_epoch = 9                      # what is current NOW
         def acquire_built(self):
             pass
-
         def restore(self, slot_id):
             return _Handle()
-
         def pinned_epoch(self, slot_id):
-            return 4  # what this slot ACTUALLY restored from
+            return 4                         # what this slot ACTUALLY restored from
 
     rt = object.__new__(SnapshotSlotRuntime)
     rt._manager = _Manager()
@@ -180,8 +163,7 @@ def test_the_snapshot_runtime_stamps_the_slot_with_the_pinned_epoch(tmp_path):
     slot = SnapshotSlotRuntime.spawn(rt)
     assert slot.ack_generation == 4, (
         f"the slot must carry the epoch restore() pinned, not the current one; got "
-        f"{slot.ack_generation}"
-    )
+        f"{slot.ack_generation}")
 
 
 def test_the_gvisor_runtime_also_stamps_the_slot_with_the_pinned_epoch(tmp_path):
@@ -198,16 +180,13 @@ def test_the_gvisor_runtime_also_stamps_the_slot_with_the_pinned_epoch(tmp_path)
         slot_workdir = str(wd)
 
     class _Manager:
-        build_epoch = 9  # what is current NOW
-
+        build_epoch = 9                      # what is current NOW
         def acquire_built(self):
             pass
-
         def restore(self, slot_id):
             return _Handle()
-
         def pinned_epoch(self, slot_id):
-            return 4  # what this slot ACTUALLY restored from
+            return 4                         # what this slot ACTUALLY restored from
 
     rt = object.__new__(GvisorSnapshotSlotRuntime)
     rt._mgr = _Manager()
@@ -221,5 +200,4 @@ def test_the_gvisor_runtime_also_stamps_the_slot_with_the_pinned_epoch(tmp_path)
     slot = GvisorSnapshotSlotRuntime.spawn(rt)
     assert slot.ack_generation == 4, (
         f"the slot must carry the epoch restore() pinned, not the current one; got "
-        f"{slot.ack_generation}"
-    )
+        f"{slot.ack_generation}")

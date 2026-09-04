@@ -4,7 +4,6 @@ branch vouching for a use outside it -- that the source comment had acknowledged
 approximation without ever measuring how wide it was. These pin both directions: the collapses it
 must report, and the correct shapes it must stay quiet about.
 """
-
 import ast
 import pathlib
 import sys
@@ -14,10 +13,10 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "scripts"))
 import pattern_sweep as ps  # noqa: E402
 
-PREAMBLE = """
+PREAMBLE = '''
 class R:
     def is_ready(self, s) -> "bool | None": ...
-"""
+'''
 
 
 def sweep(body: str):
@@ -27,7 +26,7 @@ def sweep(body: str):
 
 
 COLLAPSES = {
-    "guard_in_a_sibling_branch": """
+    "guard_in_a_sibling_branch": '''
     def f(self, s):
         rt = R()
         healthy = rt.is_ready(s)
@@ -36,8 +35,8 @@ COLLAPSES = {
                 return "unknown"
         if not healthy:
             return "dead"
-""",
-    "guard_only_in_the_else_arm": """
+''',
+    "guard_only_in_the_else_arm": '''
     def f(self, s):
         rt = R()
         healthy = rt.is_ready(s)
@@ -48,8 +47,8 @@ COLLAPSES = {
                 return "unknown"
         if not healthy:
             return "dead"
-""",
-    "guard_after_the_consuming_use": """
+''',
+    "guard_after_the_consuming_use": '''
     def f(self, s):
         rt = R()
         healthy = rt.is_ready(s)
@@ -57,57 +56,57 @@ COLLAPSES = {
             return "dead"
         if healthy is None:
             return "unknown"
-""",
+''',
     # Binding forms. Only bare `x = call()` was recognised, so ANNOTATING the variable with the
     # very type that makes it dangerous switched the checker off.
-    "annotated_assignment": """
+    "annotated_assignment": '''
     def f(self, s):
         rt = R()
         ok: "bool | None" = rt.is_ready(s)
         if not ok:
             return "dead"
-""",
-    "walrus_binding": """
+''',
+    "walrus_binding": '''
     def f(self, s):
         rt = R()
         if not (ok := rt.is_ready(s)):
             return "dead"
-""",
-    "tuple_target": """
+''',
+    "tuple_target": '''
     def f(self, s):
         rt = R()
         ok, why = rt.is_ready(s), "probe"
         if not ok:
             return "dead"
-""",
+''',
     # Boolean contexts the docstring advertised or implied, none of which were implemented for
     # the variable form -- each coerces None to False exactly as silently as `if not x`.
-    "while_loop": """
+    "while_loop": '''
     def f(self, s):
         rt = R()
         ok = rt.is_ready(s)
         while ok:
             return "ok"
-""",
-    "ternary_test": """
+''',
+    "ternary_test": '''
     def f(self, s):
         rt = R()
         ok = rt.is_ready(s)
         return "ok" if ok else "dead"
-""",
-    "assert_statement": """
+''',
+    "assert_statement": '''
     def f(self, s):
         rt = R()
         ok = rt.is_ready(s)
         assert ok
-""",
-    "bool_call": """
+''',
+    "bool_call": '''
     def f(self, s):
         rt = R()
         ok = rt.is_ready(s)
         return bool(ok)
-""",
-    "guard_in_a_nested_def_that_never_runs": """
+''',
+    "guard_in_a_nested_def_that_never_runs": '''
     def f(self, s):
         rt = R()
         ok = rt.is_ready(s)
@@ -116,8 +115,8 @@ COLLAPSES = {
                 return "unknown"
         if not ok:
             return "dead"
-""",
-    "value_reprobed_after_the_guard": """
+''',
+    "value_reprobed_after_the_guard": '''
     def f(self, s):
         rt = R()
         ok = rt.is_ready(s)
@@ -126,8 +125,8 @@ COLLAPSES = {
         ok = rt.is_ready(s)
         if not ok:
             return "dead"
-""",
-    "guard_inside_a_try_body": """
+''',
+    "guard_inside_a_try_body": '''
     def f(self, s):
         rt = R()
         healthy = rt.is_ready(s)
@@ -138,11 +137,11 @@ COLLAPSES = {
             pass
         if not healthy:
             return "dead"
-""",
+''',
 }
 
 CORRECT = {
-    "dominating_early_return": """
+    "dominating_early_return": '''
     def f(self, s):
         rt = R()
         healthy = rt.is_ready(s)
@@ -150,8 +149,8 @@ CORRECT = {
             return "unknown"
         if not healthy:
             return "dead"
-""",
-    "guard_inside_a_with_block": """
+''',
+    "guard_inside_a_with_block": '''
     def f(self, s):
         rt = R()
         healthy = rt.is_ready(s)
@@ -160,8 +159,8 @@ CORRECT = {
                 return "unknown"
         if not healthy:
             return "dead"
-""",
-    "later_guard_for_a_non_consuming_use": """
+''',
+    "later_guard_for_a_non_consuming_use": '''
     def f(self, s):
         rt = R()
         healthy = rt.is_ready(s)
@@ -170,14 +169,14 @@ CORRECT = {
         if healthy is False:
             return "dead"
         return "unknown"
-""",
-    "same_line_ternary_guard": """
+''',
+    "same_line_ternary_guard": '''
     def f(self, s):
         rt = R()
         ok = rt.is_ready(s)
         return None if ok is None else bool(ok)
-""",
-    "use_of_the_same_name_before_the_tri_state_call": """
+''',
+    "use_of_the_same_name_before_the_tri_state_call": '''
     def f(self, s):
         rt = R()
         ok = self.commit()
@@ -187,8 +186,8 @@ CORRECT = {
         if ok is None:
             return "unknown"
         return "ok"
-""",
-    "guard_and_use_both_in_the_same_branch": """
+''',
+    "guard_and_use_both_in_the_same_branch": '''
     def f(self, s):
         rt = R()
         healthy = rt.is_ready(s)
@@ -197,22 +196,18 @@ CORRECT = {
                 return "unknown"
             if not healthy:
                 return "dead"
-""",
+''',
 }
 
 
 @pytest.mark.parametrize("name", sorted(COLLAPSES))
 def test_a_tri_state_collapse_is_reported(name):
-    assert sweep(COLLAPSES[name]), (
-        f"{name}: UNKNOWN is consumed as False and the sweep said nothing"
-    )
+    assert sweep(COLLAPSES[name]), f"{name}: UNKNOWN is consumed as False and the sweep said nothing"
 
 
 @pytest.mark.parametrize("name", sorted(CORRECT))
 def test_correctly_discriminated_code_is_not_reported(name):
-    assert not sweep(CORRECT[name]), (
-        f"{name}: false positive -- all three states are handled"
-    )
+    assert not sweep(CORRECT[name]), f"{name}: false positive -- all three states are handled"
 
 
 def test_the_module_does_not_run_its_report_on_import(capsys):
@@ -223,7 +218,7 @@ def test_the_module_does_not_run_its_report_on_import(capsys):
 
 def test_a_use_is_reported_once_per_use_not_once_per_assignment():
     """Two branches assigning one variable re-ran the whole use scan and duplicated every hit."""
-    hits = sweep("""
+    hits = sweep('''
     def f(self, s):
         rt = R()
         if s.cold:
@@ -232,7 +227,7 @@ def test_a_use_is_reported_once_per_use_not_once_per_assignment():
             ok = rt.is_ready(s)
         if not ok:
             return "dead"
-""")
+''')
     assert len(hits) == 1, hits
 
 
@@ -240,13 +235,13 @@ def test_a_declaration_outside_a_class_body_is_still_found():
     """tri_state_defs walked only ClassDef bodies, so a module-level or nested `bool | None`
     helper yielded `tri-state methods found: 0` -- and P1 then reported `none` for every use of
     it. A scan that found nothing to look for printed the same line as a clean run."""
-    tree = ast.parse("""
+    tree = ast.parse('''
 def is_settled(s) -> "bool | None": ...
 
 class Outer:
     def wrap(self):
         def is_quiesced(s) -> "bool | None": ...
-""")
+''')
     found = {name for _cls, name in ps.tri_state_defs({"m.py": tree})}
     assert found == {"is_settled", "is_quiesced"}, found
 
@@ -255,18 +250,13 @@ class Outer:
 P2_CASES = {
     # `with A(), B():` is ONE statement, and Python defines multiple items as NESTING, so B mins
     # against a live outer scope -- the safe case, reported as costing 2x the bound.
-    "one_with_statement_two_items": (
-        "clean",
-        """
+    "one_with_statement_two_items": ("clean", '''
 class C:
     def f(self):
         with self._a_budget(10), self._b_budget(5):
             pass
-""",
-    ),
-    "mutually_exclusive_arms": (
-        "clean",
-        """
+'''),
+    "mutually_exclusive_arms": ("clean", '''
 class C:
     def f(self, c):
         if c:
@@ -275,41 +265,31 @@ class C:
         else:
             with self._b_budget(5):
                 pass
-""",
-    ),
-    "properly_nested_scopes": (
-        "clean",
-        """
+'''),
+    "properly_nested_scopes": ("clean", '''
 class C:
     def f(self):
         with self._a_budget(10):
             with self._b_budget(5):
                 pass
-""",
-    ),
-    "genuine_siblings": (
-        "report",
-        """
+'''),
+    "genuine_siblings": ("report", '''
 class C:
     def f(self):
         with self._a_budget(10):
             pass
         with self._b_budget(5):
             pass
-""",
-    ),
+'''),
     # A single lexical scope cannot be its own sibling, so the unbounded-multiplier case -- a
     # fresh full deadline on every iteration -- was the one shape never reported.
-    "scope_inside_a_loop": (
-        "report",
-        """
+    "scope_inside_a_loop": ("report", '''
 class C:
     def f(self, xs):
         for x in xs:
             with self._a_budget(10):
                 pass
-""",
-    ),
+'''),
 }
 
 
@@ -323,9 +303,7 @@ def test_p2_budget_scopes(name):
 # --- P3: throttle stamps -------------------------------------------------------------------
 def test_p3_does_not_fire_on_substring_matches_of_its_own_keywords():
     """`self._st-AT-e`, `self._d-AT-a` and `self._k-NOW-n_good` matched "at"/"now" as SUBSTRINGS."""
-    hits = ps.find_p3(
-        {
-            "p.py": ast.parse("""
+    hits = ps.find_p3({"p.py": ast.parse('''
 class C:
     def f(self):
         now = self._clock()
@@ -335,17 +313,13 @@ class C:
         self._data = now
         self._chosen = self._known_good
         self.work()
-""")
-        }
-    )
+''')})
     assert not hits, hits
 
 
 def test_p3_ignores_a_stamp_that_records_a_failure_event():
     """A stamp inside an `except` records WHEN THE FAILURE HAPPENED -- the correct shape."""
-    hits = ps.find_p3(
-        {
-            "p.py": ast.parse("""
+    hits = ps.find_p3({"p.py": ast.parse('''
 class C:
     def f(self):
         now = self._clock()
@@ -357,9 +331,7 @@ class C:
             self._fail_at = self._clock()
             self.report()
             raise
-""")
-        }
-    )
+''')})
     assert not hits, hits
 
 
@@ -371,9 +343,7 @@ def test_the_sweep_exits_nonzero_when_it_cannot_scan(tmp_path, monkeypatch, caps
     assert "CANNOT SCAN" in capsys.readouterr().out
 
 
-def test_a_scan_that_found_no_declarations_refuses_to_report_clean(
-    tmp_path, monkeypatch, capsys
-):
+def test_a_scan_that_found_no_declarations_refuses_to_report_clean(tmp_path, monkeypatch, capsys):
     """P1 can only report uses of names the declaration scan collected, so zero declarations
     guarantees `none` -- the most reassuring line in the output, produced by scanning nothing."""
     for f in ps.FILES:
@@ -386,7 +356,7 @@ def test_a_scan_that_found_no_declarations_refuses_to_report_clean(
 
 # --- P1b: a guard that MENTIONS the unknown without eliminating it -------------------------
 
-_NOTES_BUT_DOES_NOT_GUARD = """
+_NOTES_BUT_DOES_NOT_GUARD = '''
     def f(self, s):
         rt = R()
         ok = rt.is_ready(s)
@@ -394,9 +364,9 @@ _NOTES_BUT_DOES_NOT_GUARD = """
             self.log("unknown")
         if not ok:
             self.reap(s)
-"""
+'''
 
-_GUARD_EXITS = """
+_GUARD_EXITS = '''
     def f(self, s):
         rt = R()
         ok = rt.is_ready(s)
@@ -404,9 +374,9 @@ _GUARD_EXITS = """
             return "unknown"
         if not ok:
             self.reap(s)
-"""
+'''
 
-_ARMS_RECONVERGE = """
+_ARMS_RECONVERGE = '''
     def f(self, s):
         rt = R()
         ok = rt.is_ready(s)
@@ -416,9 +386,9 @@ _ARMS_RECONVERGE = """
             self.close_episode(s)
         if not ok:
             self.reap(s)
-"""
+'''
 
-_USE_CONFINED_TO_THE_ELSE = """
+_USE_CONFINED_TO_THE_ELSE = '''
     def f(self, s):
         rt = R()
         ok = rt.is_ready(s)
@@ -427,7 +397,7 @@ _USE_CONFINED_TO_THE_ELSE = """
         else:
             if not ok:
                 self.reap(s)
-"""
+'''
 
 
 def _strict(body: str):
@@ -473,17 +443,17 @@ def test_strict_mode_accepts_a_use_confined_to_the_else_arm():
 
 # --- `is True` is a coercion, and it matters inside a tri-state contract ---------------------
 
-_COERCES_INSIDE_CONTRACT = """
+_COERCES_INSIDE_CONTRACT = '''
     def is_ready(self, s):
         rt = R()
         return rt.is_ready(s) is True
-"""
+'''
 
-_COERCES_OUTSIDE_CONTRACT = """
+_COERCES_OUTSIDE_CONTRACT = '''
     def available(self):
         rt = R()
         return any(rt.is_ready(w) is True for w in self.workers)
-"""
+'''
 
 
 def test_is_True_inside_a_tri_state_method_is_reported():
@@ -526,20 +496,13 @@ def test_the_checker_passes_on_a_clean_tree_but_still_gates_a_real_collapse(tmp_
     repo = Path(__file__).resolve().parents[1]
 
     def _sweep(root: Path) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            [sys.executable, str(repo / "scripts" / "pattern_sweep.py"), str(root)],
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
+        return subprocess.run([sys.executable, str(repo / "scripts" / "pattern_sweep.py"), str(root)],
+                              capture_output=True, text=True, timeout=300)
 
     clean = _sweep(repo)
     assert clean.returncode == 0, (
         "pattern_sweep exits nonzero on an unmodified tree, so it cannot gate anything:\n"
-        + "\n".join(ln for ln in clean.stdout.splitlines() if "available()" in ln)[
-            :2000
-        ]
-    )
+        + "\n".join(ln for ln in clean.stdout.splitlines() if "available()" in ln)[:2000])
 
     # ...and it must still catch a genuine collapse.
     work = tmp_path / "src"
@@ -548,28 +511,18 @@ def test_the_checker_passes_on_a_clean_tree_but_still_gates_a_real_collapse(tmp_
     src = target.read_text()
     marker = "    def is_ready(self"
     assert marker in src, "fixture: cascade.py no longer declares is_ready as expected"
-    target.write_text(
-        src.replace(
-            marker,
-            "    def _deliberately_collapsed(self, slot):\n"
-            "        if not self.is_alive(slot):   # UNKNOWN read as dead\n"
-            "            return 'reap'\n"
-            "        return 'keep'\n\n" + marker,
-            1,
-        )
-    )
+    target.write_text(src.replace(
+        marker,
+        "    def _deliberately_collapsed(self, slot):\n"
+        "        if not self.is_alive(slot):   # UNKNOWN read as dead\n"
+        "            return 'reap'\n"
+        "        return 'keep'\n\n" + marker, 1))
 
     dirty = _sweep(tmp_path)
     assert dirty.returncode != 0, (
         "a deliberately collapsed `if not self.is_alive(slot)` was NOT reported; suppressing every "
-        "receiver-ambiguous name retires the checker on exactly the methods it exists to police"
-    )
-    p1 = (
-        dirty.stdout.split("=== P1")[1].split("=== P2")[0]
-        if "=== P1" in dirty.stdout
-        else ""
-    )
+        "receiver-ambiguous name retires the checker on exactly the methods it exists to police")
+    p1 = dirty.stdout.split("=== P1")[1].split("=== P2")[0] if "=== P1" in dirty.stdout else ""
     assert "self.is_alive()" in p1 and "used as `not <call>`" in p1, (
         "the collapse was not reported in the GATED P1 section (the report names the call site, "
-        f"not the enclosing function):\n{p1[:1200]}"
-    )
+        f"not the enclosing function):\n{p1[:1200]}")

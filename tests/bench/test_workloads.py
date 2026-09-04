@@ -10,4 +10,4 @@ def test_soffice_argv_is_a_list_with_convert_to():
 
 def test_available_sandbox_backends_includes_none_first():
     backends = available_sandbox_backends()
-    assert backends[0] == "none"  # the unsandboxed baseline is always present
+    assert backends[0] == "none"   # the unsandboxed baseline is always present

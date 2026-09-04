@@ -8,7 +8,6 @@ Fixtures:
   writes valid output + done file (mirrors the cold-path test style).
 - All tests use tmp_path so nothing touches the real filesystem.
 """
-
 from __future__ import annotations
 
 import contextlib
@@ -37,12 +36,7 @@ from blastbox.host.jobs.memory import InMemoryJobStore
 from blastbox.host.pool import Slot, SlotState
 from blastbox.host.runtime.docker import RuntimeSelection
 from blastbox.limits import Limits
-from blastbox.worker.warm import (
-    FileWarmControl,
-    HostWarmControl,
-    WarmJobSpec,
-    WarmTimeout,
-)
+from blastbox.worker.warm import FileWarmControl, HostWarmControl, WarmJobSpec, WarmTimeout
 
 
 # ---------------------------------------------------------------------------
@@ -143,9 +137,7 @@ def _make_slot(tmp_path: Path, slot_id: str | None = None) -> Slot:
     )
 
 
-def _setup_job_dirs(
-    job_root: Path, job: Job, *, input_content: bytes = b"malware"
-) -> Path:
+def _setup_job_dirs(job_root: Path, job: Job, *, input_content: bytes = b"malware") -> Path:
     """Create the job directory structure (same logic as cold-path test)."""
     job_dir = job_root / job.job_id
     input_dir = job_dir / "input"
@@ -171,9 +163,7 @@ class FakeWarmPool:
         self._slot = slot
         self.release_calls: list[Slot] = []
         self.release_dirty: list[bool] = []
-        self.release_fault: list[
-            str | None
-        ] = []  # parallel to release_calls: the dirty flag per release
+        self.release_fault: list[str | None] = []  # parallel to release_calls: the dirty flag per release
         # Default: a file-based warm runtime that deliberately lacks the vsock
         # warm-path seam (stage_warm_input / host_warm_control /
         # materialize_warm_output), so the dispatcher falls back to the
@@ -194,9 +184,7 @@ class FakeWarmPool:
     def claim(self, *, timeout_s: float) -> Slot | None:
         return self._slot
 
-    def release(
-        self, slot: Slot, *, dirty: bool = False, fault: str | None = None
-    ) -> None:
+    def release(self, slot: Slot, *, dirty: bool = False, fault: str | None = None) -> None:
         self.release_calls.append(slot)
         self.release_dirty.append(dirty)
         # Recording the ATTRIBUTION, not just the dirty bit: dirty says "recycle this slot",
@@ -271,9 +259,7 @@ def _make_dispatcher_with_pool(
     if engines is None:
         engines = {_ENGINE_NAME: _engine_spec()}
     if subprocess_runner is None:
-        subprocess_runner = lambda *a, **kw: subprocess.CompletedProcess(
-            a[0], 0, "", ""
-        )  # noqa: E731
+        subprocess_runner = lambda *a, **kw: subprocess.CompletedProcess(a[0], 0, "", "")  # noqa: E731
 
     return Dispatcher(
         job_store=store,
@@ -475,9 +461,7 @@ def test_1_warm_happy_path(tmp_path):
     # Start fake worker thread: writes valid output then signals done
     _start_fake_worker(
         slot,
-        output_fn=lambda out_dir: _make_valid_output_dir(
-            out_dir, input_sha256=_INPUT_SHA
-        ),
+        output_fn=lambda out_dir: _make_valid_output_dir(out_dir, input_sha256=_INPUT_SHA),
     )
 
     dispatcher = _make_dispatcher_with_pool(
@@ -496,9 +480,7 @@ def test_1_warm_happy_path(tmp_path):
     # pool.release must have been called exactly once with our slot, CLEAN (the run succeeded)
     assert len(pool.release_calls) == 1
     assert pool.release_calls[0] is slot
-    assert pool.release_dirty == [
-        False
-    ]  # clean DONE → slot safe to reuse without a forced reset
+    assert pool.release_dirty == [False]  # clean DONE → slot safe to reuse without a forced reset
 
     # staged input must be gone (job_root/job_id/input/<filename>)
     staged_input = tmp_path / "jobs" / job.job_id / "input" / Path(job.filename).name
@@ -528,7 +510,6 @@ class _RecordingBlobs:
             raise OSError(f"object store down (attempt {self.calls})")
         self.saw_metadata = (Path(out_dir) / "metadata.json").is_file()
         self.uploaded.append(job_id)
-
     def open_output(self, job_id, name): ...
     def delete_job(self, job_id):
         self.deleted.append(job_id)
@@ -547,26 +528,18 @@ def test_warm_dispatch_uploads_result_to_blob_store_before_done(tmp_path):
     pool = FakeWarmPool(slot)
     _start_fake_worker(
         slot,
-        output_fn=lambda out_dir: _make_valid_output_dir(
-            out_dir, input_sha256=_INPUT_SHA
-        ),
+        output_fn=lambda out_dir: _make_valid_output_dir(out_dir, input_sha256=_INPUT_SHA),
     )
 
     blobs = _RecordingBlobs()
     dispatcher = _make_dispatcher_with_pool(
-        store,
-        job_root=tmp_path / "jobs",
-        pool=pool,
-        worker_timeout_s=10,
-        blob_store=blobs,
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10, blob_store=blobs,
     )
     result = dispatcher.dispatch_once()
 
     assert result is True
     assert blobs.uploaded == [job.job_id]
-    assert blobs.saw_metadata, (
-        "the host-materialized output dir must be sealed before upload"
-    )
+    assert blobs.saw_metadata, "the host-materialized output dir must be sealed before upload"
     final_job = store.get(job.job_id)
     assert final_job.status == JobStatus.DONE
 
@@ -585,18 +558,12 @@ def test_warm_upload_failure_fails_job_and_releases_slot_dirty(tmp_path):
     pool = FakeWarmPool(slot)
     _start_fake_worker(
         slot,
-        output_fn=lambda out_dir: _make_valid_output_dir(
-            out_dir, input_sha256=_INPUT_SHA
-        ),
+        output_fn=lambda out_dir: _make_valid_output_dir(out_dir, input_sha256=_INPUT_SHA),
     )
 
     blobs = _RecordingBlobs(fail_times=999)
     dispatcher = _make_dispatcher_with_pool(
-        store,
-        job_root=tmp_path / "jobs",
-        pool=pool,
-        worker_timeout_s=10,
-        blob_store=blobs,
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10, blob_store=blobs,
         put_output_max_attempts=3,
     )
     result = dispatcher.dispatch_once()
@@ -638,18 +605,12 @@ def test_warm_reclaimed_claim_skips_upload_instead_of_clobbering_peer_result(tmp
     pool = FakeWarmPool(slot)
     _start_fake_worker(
         slot,
-        output_fn=lambda out_dir: _make_valid_output_dir(
-            out_dir, input_sha256=_INPUT_SHA
-        ),
+        output_fn=lambda out_dir: _make_valid_output_dir(out_dir, input_sha256=_INPUT_SHA),
     )
 
     blobs = _RecordingBlobs()
     dispatcher = _make_dispatcher_with_pool(
-        store,
-        job_root=tmp_path / "jobs",
-        pool=pool,
-        worker_timeout_s=10,
-        blob_store=blobs,
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10, blob_store=blobs,
     )
 
     # Simulate a peer reclaiming the job right after the host materializes + seals the
@@ -665,13 +626,9 @@ def test_warm_reclaimed_claim_skips_upload_instead_of_clobbering_peer_result(tmp
     result = dispatcher.dispatch_once()
 
     assert result is True
-    assert blobs.uploaded == [], (
-        "put_output must never be called once ownership is lost"
-    )
+    assert blobs.uploaded == [], "put_output must never be called once ownership is lost"
     stored = store.get(job.job_id)
-    assert stored.status == JobStatus.RUNNING, (
-        "must not clobber the peer's ownership of this job"
-    )
+    assert stored.status == JobStatus.RUNNING, "must not clobber the peer's ownership of this job"
     assert stored.claim_id == "peer-claim-id-not-ours"
 
     # The slot must still be released exactly once (dirty -- this attempt did not cleanly finish).
@@ -707,10 +664,7 @@ def test_warm_claim_lost_before_staging_is_not_blamed_on_the_worker(tmp_path):
     slot = _make_slot(tmp_path)
     pool = FakeWarmPool(slot)
     dispatcher = _make_dispatcher_with_pool(
-        store,
-        job_root=tmp_path / "jobs",
-        pool=pool,
-        worker_timeout_s=10,
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
     )
 
     # The peer must reclaim AFTER this dispatcher takes its own claim -- flipping it up front
@@ -729,9 +683,7 @@ def test_warm_claim_lost_before_staging_is_not_blamed_on_the_worker(tmp_path):
     dispatcher.dispatch_once()
 
     stored = store.get(job.job_id)
-    assert stored.claim_id == "peer-claim-id-not-ours", (
-        "the peer must still own the job"
-    )
+    assert stored.claim_id == "peer-claim-id-not-ours", "the peer must still own the job"
 
     assert pool.release_calls == [slot], "the slot must still be released exactly once"
     assert pool.release_dirty == [True], (
@@ -760,10 +712,7 @@ def test_a_genuine_warm_failure_is_still_blamed_on_the_worker(tmp_path):
     pool = FakeWarmPool(slot)
     # No fake worker started -> the run times out against this slot: real worker evidence.
     dispatcher = _make_dispatcher_with_pool(
-        store,
-        job_root=tmp_path / "jobs",
-        pool=pool,
-        worker_timeout_s=0.5,
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=0.5,
     )
 
     dispatcher.dispatch_once()
@@ -797,10 +746,7 @@ def test_warm_claim_lost_before_sealing_is_not_blamed_on_the_worker(tmp_path):
 
     _start_fake_worker(slot, output_fn=_output_then_peer_reclaims)
     dispatcher = _make_dispatcher_with_pool(
-        store,
-        job_root=tmp_path / "jobs",
-        pool=pool,
-        worker_timeout_s=10,
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
     )
 
     dispatcher.dispatch_once()
@@ -832,15 +778,10 @@ def test_warm_claim_lost_at_the_done_write_is_not_blamed_on_the_worker(tmp_path)
     pool = FakeWarmPool(slot)
     _start_fake_worker(
         slot,
-        output_fn=lambda out_dir: _make_valid_output_dir(
-            out_dir, input_sha256=_INPUT_SHA
-        ),
+        output_fn=lambda out_dir: _make_valid_output_dir(out_dir, input_sha256=_INPUT_SHA),
     )
     dispatcher = _make_dispatcher_with_pool(
-        store,
-        job_root=tmp_path / "jobs",
-        pool=pool,
-        worker_timeout_s=10,
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
     )
 
     # Let the pre-upload ownership check SUCCEED (it reads the store before the flip), then flip
@@ -887,24 +828,17 @@ def test_a_broken_release_is_not_retried_as_a_compatibility_fallback(tmp_path):
     slot = _make_slot(tmp_path)
 
     class _BrokenRelease(FakeWarmPool):
-        def release(
-            self, slot: Slot, *, dirty: bool = False, fault: str | None = None
-        ) -> None:
+        def release(self, slot: Slot, *, dirty: bool = False, fault: str | None = None) -> None:
             super().release(slot, dirty=dirty, fault=fault)
             raise TypeError("bug inside release(), NOT an old signature")
 
     pool = _BrokenRelease(slot)
     _start_fake_worker(
         slot,
-        output_fn=lambda out_dir: _make_valid_output_dir(
-            out_dir, input_sha256=_INPUT_SHA
-        ),
+        output_fn=lambda out_dir: _make_valid_output_dir(out_dir, input_sha256=_INPUT_SHA),
     )
     dispatcher = _make_dispatcher_with_pool(
-        store,
-        job_root=tmp_path / "jobs",
-        pool=pool,
-        worker_timeout_s=10,
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
     )
 
     with contextlib.suppress(TypeError):
@@ -930,24 +864,18 @@ def test_warm_dispatch_stamps_worker_tier(tmp_path):
     pool = FakeWarmPool(slot)
     _start_fake_worker(
         slot,
-        output_fn=lambda out_dir: _make_valid_output_dir(
-            out_dir, input_sha256=_INPUT_SHA
-        ),
+        output_fn=lambda out_dir: _make_valid_output_dir(out_dir, input_sha256=_INPUT_SHA),
     )
 
     dispatcher = _make_dispatcher_with_pool(
-        store,
-        job_root=tmp_path / "jobs",
-        pool=pool,
-        worker_timeout_s=10,
-        tier="gvisor",
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10, tier="gvisor",
     )
     assert dispatcher.dispatch_once() is True
     final_job = store.get(job.job_id)
     assert final_job is not None
     assert final_job.status == JobStatus.DONE
-    assert final_job.worker_runtime == "warm"  # generic tier marker (unchanged)
-    assert final_job.worker_tier == "gvisor"  # specific backend (new)
+    assert final_job.worker_runtime == "warm"   # generic tier marker (unchanged)
+    assert final_job.worker_tier == "gvisor"     # specific backend (new)
 
 
 def test_warm_done_cas_fenced_against_concurrent_recovery(tmp_path):
@@ -968,10 +896,7 @@ def test_warm_done_cas_fenced_against_concurrent_recovery(tmp_path):
     def _output_then_peer_recovers(out_dir):
         _make_valid_output_dir(out_dir, input_sha256=_INPUT_SHA)
         assert store.update_if_status(
-            job.job_id,
-            JobStatus.RUNNING,
-            status=JobStatus.FAILED,
-            error="peer recovered (stale)",
+            job.job_id, JobStatus.RUNNING, status=JobStatus.FAILED, error="peer recovered (stale)"
         )
 
     _start_fake_worker(slot, output_fn=_output_then_peer_recovers)
@@ -981,13 +906,9 @@ def test_warm_done_cas_fenced_against_concurrent_recovery(tmp_path):
     dispatcher.dispatch_once()
 
     final = store.get(job.job_id)
-    assert (
-        final.status == JobStatus.FAILED
-    )  # DONE did NOT resurrect the peer-recovered job
+    assert final.status == JobStatus.FAILED  # DONE did NOT resurrect the peer-recovered job
     assert final.error == "peer recovered (stale)"
-    assert (
-        final.result_summary is None
-    )  # the DONE write (with result_summary) never applied
+    assert final.result_summary is None  # the DONE write (with result_summary) never applied
 
 
 # ===========================================================================
@@ -1093,9 +1014,7 @@ def test_3_warm_timeout(tmp_path):
     assert final_job is not None
     assert final_job.status == JobStatus.FAILED
     assert final_job.error is not None
-    assert (
-        "timed out" in final_job.error.lower() or "timeout" in final_job.error.lower()
-    )
+    assert "timed out" in final_job.error.lower() or "timeout" in final_job.error.lower()
 
     # Slot released exactly once, DIRTY (timeout → force-reset before reuse)
     assert len(pool.release_calls) == 1
@@ -1254,17 +1173,11 @@ def test_5_slot_released_on_every_path(tmp_path):
     pool_happy = FakeWarmPool(slot_happy)
     _start_fake_worker(
         slot_happy,
-        output_fn=lambda out_dir: _make_valid_output_dir(
-            out_dir, input_sha256=_INPUT_SHA
-        ),
+        output_fn=lambda out_dir: _make_valid_output_dir(out_dir, input_sha256=_INPUT_SHA),
     )
-    d = _make_dispatcher_with_pool(
-        store, job_root=tmp_path / "jobs_happy", pool=pool_happy, worker_timeout_s=10
-    )
+    d = _make_dispatcher_with_pool(store, job_root=tmp_path / "jobs_happy", pool=pool_happy, worker_timeout_s=10)
     d.dispatch_once()
-    assert len(pool_happy.release_calls) == 1, (
-        "happy: release must be called exactly once"
-    )
+    assert len(pool_happy.release_calls) == 1, "happy: release must be called exactly once"
 
     # --- trust failure ---
     store2 = InMemoryJobStore()
@@ -1280,13 +1193,9 @@ def test_5_slot_released_on_every_path(tmp_path):
         (output_dir / "metadata.json").write_bytes(b'{"bad": true}')
 
     _start_fake_worker(slot_trust, output_fn=_bad)
-    d2 = _make_dispatcher_with_pool(
-        store2, job_root=tmp_path / "jobs_trust", pool=pool_trust, worker_timeout_s=10
-    )
+    d2 = _make_dispatcher_with_pool(store2, job_root=tmp_path / "jobs_trust", pool=pool_trust, worker_timeout_s=10)
     d2.dispatch_once()
-    assert len(pool_trust.release_calls) == 1, (
-        "trust-fail: release must be called exactly once"
-    )
+    assert len(pool_trust.release_calls) == 1, "trust-fail: release must be called exactly once"
 
     # --- warm timeout ---
     store3 = InMemoryJobStore()
@@ -1296,16 +1205,9 @@ def test_5_slot_released_on_every_path(tmp_path):
     _setup_job_dirs(tmp_path / "jobs_timeout", job3)
     slot_timeout = _make_slot(tmp_path / "slot_timeout")
     pool_timeout = FakeWarmPool(slot_timeout)
-    d3 = _make_dispatcher_with_pool(
-        store3,
-        job_root=tmp_path / "jobs_timeout",
-        pool=pool_timeout,
-        worker_timeout_s=1,
-    )
+    d3 = _make_dispatcher_with_pool(store3, job_root=tmp_path / "jobs_timeout", pool=pool_timeout, worker_timeout_s=1)
     d3.dispatch_once()
-    assert len(pool_timeout.release_calls) == 1, (
-        "timeout: release must be called exactly once"
-    )
+    assert len(pool_timeout.release_calls) == 1, "timeout: release must be called exactly once"
 
 
 # ===========================================================================
@@ -1332,9 +1234,7 @@ def test_6_image_never_job_derived_in_warm_mode(tmp_path):
 
     _start_fake_worker(
         slot,
-        output_fn=lambda out_dir: _make_valid_output_dir(
-            out_dir, input_sha256=_INPUT_SHA
-        ),
+        output_fn=lambda out_dir: _make_valid_output_dir(out_dir, input_sha256=_INPUT_SHA),
     )
 
     cold_called: list[list[str]] = []
@@ -1359,7 +1259,8 @@ def test_6_image_never_job_derived_in_warm_mode(tmp_path):
     # The warm path must have been taken (subprocess not called for docker run)
     docker_runs = [a for a in cold_called if len(a) >= 2 and a[:2] == ["docker", "run"]]
     assert docker_runs == [], (
-        f"warm path taken → no cold docker run should be launched; got: {docker_runs}"
+        "warm path taken → no cold docker run should be launched; "
+        f"got: {docker_runs}"
     )
 
     # Pool release was called (confirming warm path was used)
@@ -1404,9 +1305,7 @@ def test_materialize_defeats_destination_symlink(tmp_path):
     dst.mkdir()
     outside = tmp_path / "victim"
     outside.write_bytes(b"ORIGINAL")
-    (dst / "page-001.png").symlink_to(
-        outside
-    )  # cold-worker-planted symlink in the reused dir
+    (dst / "page-001.png").symlink_to(outside)  # cold-worker-planted symlink in the reused dir
 
     disp._materialize_sealed_warm_output(env, src, dst)
 
@@ -1423,9 +1322,7 @@ def test_materialize_detects_content_swap(tmp_path):
     disp = _make_dispatcher_with_pool(store, job_root=tmp_path / "jobs")
     src = tmp_path / "slot_out"
     env = _seal_over(src, content=b"ORIGINAL-X")  # 10 bytes
-    (src / "page-001.png").write_bytes(
-        b"SWAPPED-YZ"
-    )  # 10 bytes, different content -> sha mismatch
+    (src / "page-001.png").write_bytes(b"SWAPPED-YZ")  # 10 bytes, different content -> sha mismatch
 
     dst = tmp_path / "job_out"
     with pytest.raises(OutputTrustError):
@@ -1453,12 +1350,8 @@ def test_requeue_recovers_only_stale_warm_jobs(tmp_path, monkeypatch):
     RUNNING past worker_timeout_s + grace (owner gone) is failed; a younger one (possibly live)
     is left alone. Cold jobs requeue via the docker-ps + grace path."""
     store = InMemoryJobStore()
-    disp = _make_dispatcher_with_pool(
-        store, job_root=tmp_path / "jobs", worker_timeout_s=30
-    )
-    monkeypatch.setattr(
-        disp, "_list_active_worker_job_ids", lambda: set()
-    )  # docker ps: none active
+    disp = _make_dispatcher_with_pool(store, job_root=tmp_path / "jobs", worker_timeout_s=30)
+    monkeypatch.setattr(disp, "_list_active_worker_job_ids", lambda: set())  # docker ps: none active
     now = time.time()
 
     # Young warm job (within worker_timeout_s=30 + grace): could be live -> left alone.
@@ -1485,13 +1378,9 @@ def test_requeue_recovers_only_stale_warm_jobs(tmp_path, monkeypatch):
     recovered = disp.requeue_orphaned_jobs()
 
     assert recovered == 2  # stale warm (failed) + cold (requeued)
-    assert (
-        store.get(live_warm.job_id).status == JobStatus.RUNNING
-    )  # live warm protected
+    assert store.get(live_warm.job_id).status == JobStatus.RUNNING  # live warm protected
     failed = store.get(stale_warm.job_id)
-    assert (
-        failed.status == JobStatus.FAILED
-    )  # crashed-owner warm -> terminal, never re-detonated
+    assert failed.status == JobStatus.FAILED  # crashed-owner warm -> terminal, never re-detonated
     assert "recovered: warm worker owner gone" in failed.security_warnings
     assert store.get(cold.job_id).status == JobStatus.QUEUED
 
@@ -1500,12 +1389,8 @@ def test_requeue_warm_recovery_runs_when_docker_probe_fails(tmp_path, monkeypatc
     """Warm recovery is TIME-based and must NOT be gated by the docker probe — a docker ps
     failure (returns None) still recovers a stale warm job, while cold requeue is skipped."""
     store = InMemoryJobStore()
-    disp = _make_dispatcher_with_pool(
-        store, job_root=tmp_path / "jobs", worker_timeout_s=30
-    )
-    monkeypatch.setattr(
-        disp, "_list_active_worker_job_ids", lambda: None
-    )  # docker ps FAILED
+    disp = _make_dispatcher_with_pool(store, job_root=tmp_path / "jobs", worker_timeout_s=30)
+    monkeypatch.setattr(disp, "_list_active_worker_job_ids", lambda: None)  # docker ps FAILED
     now = time.time()
 
     stale_warm = Job.new(engine=_ENGINE_NAME, filename="warm.docx")
@@ -1523,18 +1408,14 @@ def test_requeue_warm_recovery_runs_when_docker_probe_fails(tmp_path, monkeypatc
     recovered = disp.requeue_orphaned_jobs()
     assert recovered == 1  # warm recovered despite the docker-probe failure
     assert store.get(stale_warm.job_id).status == JobStatus.FAILED
-    assert (
-        store.get(cold.job_id).status == JobStatus.RUNNING
-    )  # cold requeue skipped (docker down)
+    assert store.get(cold.job_id).status == JobStatus.RUNNING  # cold requeue skipped (docker down)
 
 
 def test_warm_recovery_deletes_stale_input(tmp_path, monkeypatch):
     """A recovered (owner-gone) warm job's staged input is deleted by the sweep — the gone owner
     won't clean up, so without this the untrusted input would leak when retention is disabled."""
     store = InMemoryJobStore()
-    disp = _make_dispatcher_with_pool(
-        store, job_root=tmp_path / "jobs", worker_timeout_s=30
-    )
+    disp = _make_dispatcher_with_pool(store, job_root=tmp_path / "jobs", worker_timeout_s=30)
     monkeypatch.setattr(disp, "_list_active_worker_job_ids", lambda: set())
 
     job = Job.new(engine=_ENGINE_NAME, filename="stale.docx")
@@ -1563,9 +1444,7 @@ class _CapPool:
         self._slot = slot
 
     @property
-    def idle_count(
-        self,
-    ) -> int:  # MUST mirror WarmPool.idle_count (a @property, not a method)
+    def idle_count(self) -> int:  # MUST mirror WarmPool.idle_count (a @property, not a method)
         return self._idle
 
     def claim(self, *, timeout_s: float) -> Slot | None:  # noqa: ARG002
@@ -1575,12 +1454,8 @@ class _CapPool:
 def test_warm_only_requires_pool(tmp_path):
     with pytest.raises(ValueError):
         Dispatcher(
-            job_store=InMemoryJobStore(),
-            engines={},
-            limits=_limits(),
-            job_root=tmp_path,
-            pool=None,
-            warm_only=True,
+            job_store=InMemoryJobStore(), engines={}, limits=_limits(),
+            job_root=tmp_path, pool=None, warm_only=True,
         )
 
 
@@ -1589,12 +1464,8 @@ def test_warm_only_claim_gate_leaves_job_queued_when_no_idle(tmp_path):
     job = _make_job()
     store.create(job)
     d = Dispatcher(
-        job_store=store,
-        engines={},
-        limits=_limits(),
-        job_root=tmp_path,
-        pool=_CapPool(idle=0),
-        warm_only=True,
+        job_store=store, engines={}, limits=_limits(), job_root=tmp_path,
+        pool=_CapPool(idle=0), warm_only=True,
     )
     assert d.dispatch_once() is False  # gated: no free warm slot, nothing claimed
     assert store.get(job.job_id).status == JobStatus.QUEUED
@@ -1606,36 +1477,24 @@ def test_warm_only_requeues_on_slot_miss(tmp_path):
     store.create(job)
     # Gate passes (idle=1) but the slot dies -> claim() returns None -> requeue, never cold.
     d = Dispatcher(
-        job_store=store,
-        engines={},
-        limits=_limits(),
-        job_root=tmp_path,
-        pool=_CapPool(idle=1, slot=None),
-        warm_only=True,
+        job_store=store, engines={}, limits=_limits(), job_root=tmp_path,
+        pool=_CapPool(idle=1, slot=None), warm_only=True,
     )
     assert d.dispatch_once() is True  # a job was claimed
     final = store.get(job.job_id)
-    assert (
-        final.status == JobStatus.QUEUED
-    )  # requeued for the cold dispatcher / another sidecar
+    assert final.status == JobStatus.QUEUED  # requeued for the cold dispatcher / another sidecar
     assert final.claim_id is None
 
 
 def test_warm_slot_reservation_counter_caps_at_idle(tmp_path):
     # issue #72: the atomic gate reservation admits at most idle_count concurrent claims.
-    d = Dispatcher(
-        job_store=InMemoryJobStore(),
-        engines={},
-        limits=_limits(),
-        job_root=tmp_path,
-        pool=_CapPool(idle=2),
-        warm_only=True,
-    )
-    assert d._reserve_warm_slot() is True  # 1 of 2 idle
-    assert d._reserve_warm_slot() is True  # 2 of 2 idle
-    assert d._reserve_warm_slot() is False  # idle exhausted by reservations → GATED
+    d = Dispatcher(job_store=InMemoryJobStore(), engines={}, limits=_limits(),
+                   job_root=tmp_path, pool=_CapPool(idle=2), warm_only=True)
+    assert d._reserve_warm_slot() is True     # 1 of 2 idle
+    assert d._reserve_warm_slot() is True     # 2 of 2 idle
+    assert d._reserve_warm_slot() is False    # idle exhausted by reservations → GATED
     d._release_warm_reservation()
-    assert d._reserve_warm_slot() is True  # freed → capacity available again
+    assert d._reserve_warm_slot() is True      # freed → capacity available again
 
 
 def test_warm_only_gate_blocks_second_claim_while_slot_in_flight(tmp_path):
@@ -1651,26 +1510,20 @@ def test_warm_only_gate_blocks_second_claim_while_slot_in_flight(tmp_path):
     release = _t.Event()
 
     class _BlockingPool(_CapPool):
-        def claim(self, *, timeout_s):  # noqa: ARG002
-            in_claim.set()  # thread A is now INSIDE claim(), holding its reservation
+        def claim(self, *, timeout_s):        # noqa: ARG002
+            in_claim.set()                     # thread A is now INSIDE claim(), holding its reservation
             release.wait(5)
-            return self._slot  # slot=None → A requeues its job (irrelevant to the gate)
+            return self._slot                  # slot=None → A requeues its job (irrelevant to the gate)
 
-    d = Dispatcher(
-        job_store=store,
-        engines={},
-        limits=_limits(),
-        job_root=tmp_path,
-        pool=_BlockingPool(idle=1, slot=None),
-        warm_only=True,
-    )
+    d = Dispatcher(job_store=store, engines={}, limits=_limits(), job_root=tmp_path,
+                   pool=_BlockingPool(idle=1, slot=None), warm_only=True)
 
     a = _t.Thread(target=d.dispatch_once, daemon=True)
     a.start()
-    assert in_claim.wait(5)  # A reserved the 1 idle slot and is in claim()
+    assert in_claim.wait(5)                    # A reserved the 1 idle slot and is in claim()
 
     # The single idle slot is reserved by A → a second dispatch must NOT claim (was over-claim pre-#72)
-    assert d.dispatch_once() is False  # GATED: returns immediately, nothing claimed
+    assert d.dispatch_once() is False          # GATED: returns immediately, nothing claimed
 
     release.set()
     a.join(5)
@@ -1685,22 +1538,14 @@ def test_warm_reservation_released_if_predispatch_raises(tmp_path):
     # try/finally around the slot claim. But the pre-claim path construction (Path(job.filename))
     # runs BEFORE that try — an exception there must NOT leak the reservation, else the warm gate
     # under-admits forever and the sidecar re-wedges.
-    d = Dispatcher(
-        job_store=InMemoryJobStore(),
-        engines={},
-        limits=_limits(),
-        job_root=tmp_path,
-        pool=_CapPool(idle=1, slot=object()),
-        warm_only=True,
-    )
-    d._warm_slot_reservations = 1  # simulate: dispatch_once reserved before claiming
+    d = Dispatcher(job_store=InMemoryJobStore(), engines={}, limits=_limits(),
+                   job_root=tmp_path, pool=_CapPool(idle=1, slot=object()), warm_only=True)
+    d._warm_slot_reservations = 1            # simulate: dispatch_once reserved before claiming
     bad = _make_job()
-    bad.filename = None  # Path(None) raises TypeError in the pre-claim window
+    bad.filename = None                      # Path(None) raises TypeError in the pre-claim window
     with pytest.raises(TypeError):
         d._dispatch_claimed_job(bad, warm_reserved=True)
-    assert (
-        d._warm_slot_reservations == 0
-    )  # released despite the exception (RED before the fix)
+    assert d._warm_slot_reservations == 0    # released despite the exception (RED before the fix)
 
 
 def test_a_blob_fetch_failure_is_not_blamed_on_the_warm_slot(tmp_path):
@@ -1721,10 +1566,7 @@ def test_a_blob_fetch_failure_is_not_blamed_on_the_warm_slot(tmp_path):
     slot = _make_slot(tmp_path)
     pool = FakeWarmPool(slot)
     dispatcher = _make_dispatcher_with_pool(
-        store,
-        job_root=tmp_path / "jobs",
-        pool=pool,
-        worker_timeout_s=10,
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
     )
     # The host cannot materialise the sample (blob store unreachable).
     dispatcher._materialise_sample = lambda job, path: False  # type: ignore[method-assign]
@@ -1757,15 +1599,10 @@ def test_an_upload_failure_is_not_blamed_on_the_worker(tmp_path):
     pool = FakeWarmPool(slot)
     _start_fake_worker(
         slot,
-        output_fn=lambda out_dir: _make_valid_output_dir(
-            out_dir, input_sha256=_INPUT_SHA
-        ),
+        output_fn=lambda out_dir: _make_valid_output_dir(out_dir, input_sha256=_INPUT_SHA),
     )
     dispatcher = _make_dispatcher_with_pool(
-        store,
-        job_root=tmp_path / "jobs",
-        pool=pool,
-        worker_timeout_s=10,
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
     )
     # The blob store rejects the upload; the worker did nothing wrong.
     dispatcher._upload_output = lambda job, output_dir: False  # type: ignore[method-assign]
@@ -1826,10 +1663,7 @@ def test_a_staging_failure_is_unattributed_unless_the_runtime_opts_in(tmp_path):
     runtime.stage_warm_input = _boom  # type: ignore[assignment]
     pool = FakeWarmPool(slot, runtime=runtime)
     dispatcher = _make_dispatcher_with_pool(
-        store,
-        job_root=tmp_path / "jobs",
-        pool=pool,
-        worker_timeout_s=10,
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
     )
 
     with contextlib.suppress(RuntimeError):
@@ -1850,10 +1684,7 @@ def test_a_staging_failure_is_unattributed_unless_the_runtime_opts_in(tmp_path):
     slot2 = _make_slot(tmp_path / "s2")
     pool2 = FakeWarmPool(slot2, runtime=runtime)
     d2 = _make_dispatcher_with_pool(
-        store2,
-        job_root=tmp_path / "jobs2",
-        pool=pool2,
-        worker_timeout_s=10,
+        store2, job_root=tmp_path / "jobs2", pool=pool2, worker_timeout_s=10,
     )
     with contextlib.suppress(RuntimeError):
         d2.dispatch_once()
@@ -1891,17 +1722,12 @@ def test_unreadable_output_convicts_the_worker(tmp_path):
     runtime.materialize_warm_output = _boom  # type: ignore[assignment]
     pool = FakeWarmPool(slot, runtime=runtime)
     dispatcher = _make_dispatcher_with_pool(
-        store,
-        job_root=tmp_path / "jobs",
-        pool=pool,
-        worker_timeout_s=10,
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
     )
 
     dispatcher.dispatch_once()
 
-    assert store.get(job.job_id).status == JobStatus.FAILED, (
-        "the materialize failure must be reached"
-    )
+    assert store.get(job.job_id).status == JobStatus.FAILED, "the materialize failure must be reached"
     assert pool.release_fault == ["worker"], (
         f"output that cannot be read back IS worker evidence (got {pool.release_fault})"
     )
@@ -1949,17 +1775,12 @@ def test_a_signal_failure_is_unattributed_unless_signalling_is_a_transport(tmp_p
     runtime.host_warm_control = lambda s: _DeafControl(s)  # type: ignore[assignment]
     pool = FakeWarmPool(slot, runtime=runtime)
     dispatcher = _make_dispatcher_with_pool(
-        store,
-        job_root=tmp_path / "jobs",
-        pool=pool,
-        worker_timeout_s=10,
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
     )
 
     dispatcher.dispatch_once()
 
-    assert store.get(job.job_id).status == JobStatus.FAILED, (
-        "the signal failure must be reached"
-    )
+    assert store.get(job.job_id).status == JobStatus.FAILED, "the signal failure must be reached"
     assert pool.release_fault == ["unknown"], (
         f"a host-side control write is not worker evidence (got {pool.release_fault})"
     )
@@ -1977,10 +1798,7 @@ def test_a_signal_failure_is_unattributed_unless_signalling_is_a_transport(tmp_p
     slot2 = _make_slot(tmp_path / "s2")
     pool2 = FakeWarmPool(slot2, runtime=runtime)
     d2 = _make_dispatcher_with_pool(
-        store2,
-        job_root=tmp_path / "jobs2",
-        pool=pool2,
-        worker_timeout_s=10,
+        store2, job_root=tmp_path / "jobs2", pool=pool2, worker_timeout_s=10,
     )
     d2.dispatch_once()
     assert pool2.release_fault == ["worker"], (
@@ -2004,12 +1822,9 @@ def test_a_file_ipc_staging_failure_is_NOT_blamed_on_the_worker(tmp_path, monkey
     _setup_job_dirs(tmp_path / "jobs", job)
 
     slot = _make_slot(tmp_path)
-    pool = FakeWarmPool(slot)  # no runtime seam -> the copy2 file path
+    pool = FakeWarmPool(slot)          # no runtime seam -> the copy2 file path
     dispatcher = _make_dispatcher_with_pool(
-        store,
-        job_root=tmp_path / "jobs",
-        pool=pool,
-        worker_timeout_s=10,
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
     )
 
     def _boom(src, dst, **kw):
@@ -2042,19 +1857,14 @@ def test_oversize_output_convicts_the_worker(tmp_path):
 
     _start_fake_worker(slot, output_fn=_fat_output)
     dispatcher = _make_dispatcher_with_pool(
-        store,
-        job_root=tmp_path / "jobs",
-        pool=pool,
-        worker_timeout_s=10,
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
     )
     # The cap lives on Limits, not on the dispatcher; shrink it so a small fake output trips it.
     dispatcher._limits = replace(dispatcher._limits, max_total_artifact_bytes=1024)
 
     dispatcher.dispatch_once()
 
-    assert store.get(job.job_id).status == JobStatus.FAILED, (
-        "the size cap must be reached"
-    )
+    assert store.get(job.job_id).status == JobStatus.FAILED, "the size cap must be reached"
     assert pool.release_fault == ["worker"], (
         f"output beyond the declared bound IS worker evidence (got {pool.release_fault})"
     )
@@ -2086,10 +1896,7 @@ def test_a_deadline_consumed_before_waiting_convicts_the_worker(tmp_path):
     runtime.host_warm_control = lambda s: _SlowControl(s)  # type: ignore[assignment]
     pool = FakeWarmPool(slot, runtime=runtime)
     dispatcher = _make_dispatcher_with_pool(
-        store,
-        job_root=tmp_path / "jobs",
-        pool=pool,
-        worker_timeout_s=1,
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=1,
     )
 
     dispatcher.dispatch_once()
@@ -2120,15 +1927,10 @@ def test_a_trust_check_the_host_could_not_complete_is_not_worker_evidence(tmp_pa
     pool = FakeWarmPool(slot)
     _start_fake_worker(
         slot,
-        output_fn=lambda out_dir: _make_valid_output_dir(
-            out_dir, input_sha256=_INPUT_SHA
-        ),
+        output_fn=lambda out_dir: _make_valid_output_dir(out_dir, input_sha256=_INPUT_SHA),
     )
     dispatcher = _make_dispatcher_with_pool(
-        store,
-        job_root=tmp_path / "jobs",
-        pool=pool,
-        worker_timeout_s=10,
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
     )
 
     def _cannot_check(*a, **kw):
@@ -2143,9 +1945,7 @@ def test_a_trust_check_the_host_could_not_complete_is_not_worker_evidence(tmp_pa
     finally:
         monkey.undo()
 
-    assert store.get(job.job_id).status == JobStatus.FAILED, (
-        "the trust path must be reached"
-    )
+    assert store.get(job.job_id).status == JobStatus.FAILED, "the trust path must be reached"
     assert pool.release_fault == ["unknown"], (
         f"a check the HOST could not complete is not worker evidence (got {pool.release_fault})"
     )
@@ -2173,10 +1973,7 @@ def test_a_host_disk_failure_reading_output_is_not_worker_evidence(tmp_path):
     runtime.materialize_warm_output = _enospc  # type: ignore[assignment]
     pool = FakeWarmPool(slot, runtime=runtime)
     dispatcher = _make_dispatcher_with_pool(
-        store,
-        job_root=tmp_path / "jobs",
-        pool=pool,
-        worker_timeout_s=10,
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
     )
 
     dispatcher.dispatch_once()
@@ -2209,10 +2006,7 @@ def test_an_artifact_swapped_during_materialization_convicts_the_worker(tmp_path
     slot = _make_slot(tmp_path)
     pool = FakeWarmPool(slot)
     dispatcher = _make_dispatcher_with_pool(
-        store,
-        job_root=tmp_path / "jobs",
-        pool=pool,
-        worker_timeout_s=10,
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
     )
 
     env = SimpleNamespace(artifacts=[SimpleNamespace(id="a1", path="a.bin", bytes=4)])
@@ -2220,40 +2014,26 @@ def test_an_artifact_swapped_during_materialization_convicts_the_worker(tmp_path
     monkey = pytest.MonkeyPatch()
     try:
         # A worker DELETING its declared artifact -> conviction.
-        monkey.setattr(
-            "blastbox.host.dispatch.open_confined_regular_fd",
-            lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError("gone")),
-        )
+        monkey.setattr("blastbox.host.dispatch.open_confined_regular_fd",
+                       lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError("gone")))
         with pytest.raises(OutputTrustError) as ei:
-            dispatcher._materialize_sealed_warm_output(
-                env, tmp_path / "src", tmp_path / "dst"
-            )
-        assert not isinstance(ei.value, OutputTrustUnknown), (
-            "a swap IS the worker's doing"
-        )
+            dispatcher._materialize_sealed_warm_output(env, tmp_path / "src", tmp_path / "dst")
+        assert not isinstance(ei.value, OutputTrustUnknown), "a swap IS the worker's doing"
 
         # A host limit on the same call -> unattributed.
-        monkey.setattr(
-            "blastbox.host.dispatch.open_confined_regular_fd",
-            lambda *a, **kw: (_ for _ in ()).throw(OSError(24, "Too many open files")),
-        )
+        monkey.setattr("blastbox.host.dispatch.open_confined_regular_fd",
+                       lambda *a, **kw: (_ for _ in ()).throw(OSError(24, "Too many open files")))
         with pytest.raises(OutputTrustUnknown):
-            dispatcher._materialize_sealed_warm_output(
-                env, tmp_path / "src", tmp_path / "dst"
-            )
+            dispatcher._materialize_sealed_warm_output(env, tmp_path / "src", tmp_path / "dst")
 
         # ...and a SYMLINK SWAP surfaces as ELOOP from the confinement check, which is a verdict:
         # classifying it as unknown let repeated malicious swaps escape burnout entirely.
         import errno as _errno
 
-        monkey.setattr(
-            "blastbox.host.dispatch.open_confined_regular_fd",
-            lambda *a, **kw: (_ for _ in ()).throw(_errno_oserror(_errno.ELOOP)),
-        )
+        monkey.setattr("blastbox.host.dispatch.open_confined_regular_fd",
+                       lambda *a, **kw: (_ for _ in ()).throw(_errno_oserror(_errno.ELOOP)))
         with pytest.raises(OutputTrustError) as ei2:
-            dispatcher._materialize_sealed_warm_output(
-                env, tmp_path / "src", tmp_path / "dst"
-            )
+            dispatcher._materialize_sealed_warm_output(env, tmp_path / "src", tmp_path / "dst")
         assert not isinstance(ei2.value, OutputTrustUnknown), (
             "a worker symlink swap is a verdict, not a host failure"
         )
@@ -2284,16 +2064,11 @@ def test_trust_handlers_respect_the_non_verdict_subtype_end_to_end(tmp_path):
             output_fn=lambda out: _make_valid_output_dir(out, input_sha256=_INPUT_SHA),
         )
         d = _make_dispatcher_with_pool(
-            store,
-            job_root=tmp_path / f"jobs-{id(err)}",
-            pool=pool,
-            worker_timeout_s=10,
+            store, job_root=tmp_path / f"jobs-{id(err)}", pool=pool, worker_timeout_s=10,
         )
         mp = pytest.MonkeyPatch()
-        mp.setattr(
-            "blastbox.host.dispatch.validate_worker_output",
-            lambda *a, **kw: (_ for _ in ()).throw(err),
-        )
+        mp.setattr("blastbox.host.dispatch.validate_worker_output",
+                   lambda *a, **kw: (_ for _ in ()).throw(err))
         try:
             d.dispatch_once()
         finally:
@@ -2322,18 +2097,16 @@ def test_trust_handlers_respect_the_non_verdict_subtype_end_to_end(tmp_path):
             slot,
             output_fn=lambda out: _make_valid_output_dir(out, input_sha256=_INPUT_SHA),
         )
-        d = _make_dispatcher_with_pool(
-            store, job_root=root, pool=pool, worker_timeout_s=10
-        )
+        d = _make_dispatcher_with_pool(store, job_root=root, pool=pool, worker_timeout_s=10)
         d._materialize_sealed_warm_output = (  # type: ignore[method-assign]
             lambda *a, **kw: (_ for _ in ()).throw(err)
         )
         d.dispatch_once()
         return pool.release_fault[0] if pool.release_fault else None
 
-    assert (
-        _run_materialize(OutputTrustUnknown("EMFILE opening the artifact")) == "unknown"
-    ), "the materialize handler must respect the non-verdict subtype too"
+    assert _run_materialize(OutputTrustUnknown("EMFILE opening the artifact")) == "unknown", (
+        "the materialize handler must respect the non-verdict subtype too"
+    )
     assert _run_materialize(OutputTrustError("artifact vanished")) == "worker", (
         "a real swap must still convict at the materialize handler"
     )
@@ -2359,19 +2132,14 @@ def test_a_host_side_done_file_failure_is_not_worker_evidence(tmp_path):
 
     class _HostIoControl(_RecordingVsockControl):
         def wait_for_done(self, *, timeout_s: float) -> str:
-            err = WarmTimeout(
-                "could not read done file: [Errno 24] Too many open files"
-            )
+            err = WarmTimeout("could not read done file: [Errno 24] Too many open files")
             err.host_io = True
             raise err
 
     runtime.host_warm_control = lambda s: _HostIoControl(s)  # type: ignore[assignment]
     pool = FakeWarmPool(slot, runtime=runtime)
     dispatcher = _make_dispatcher_with_pool(
-        store,
-        job_root=tmp_path / "jobs",
-        pool=pool,
-        worker_timeout_s=10,
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
     )
 
     dispatcher.dispatch_once()
@@ -2399,19 +2167,14 @@ def test_a_host_disk_failure_inside_rdump_is_not_worker_evidence(tmp_path):
     runtime = _FakeVsockRuntime()
 
     def _rdump_host_failure(s):
-        err = ValueError(
-            "cannot read ext4 image /slots/x/outdisk.ext4: [Errno 24] EMFILE"
-        )
-        err.host_io = True  # exactly what rdump_ext4 now attaches
+        err = ValueError("cannot read ext4 image /slots/x/outdisk.ext4: [Errno 24] EMFILE")
+        err.host_io = True          # exactly what rdump_ext4 now attaches
         raise err
 
     runtime.materialize_warm_output = _rdump_host_failure  # type: ignore[assignment]
     pool = FakeWarmPool(slot, runtime=runtime)
     dispatcher = _make_dispatcher_with_pool(
-        store,
-        job_root=tmp_path / "jobs",
-        pool=pool,
-        worker_timeout_s=10,
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
     )
 
     dispatcher.dispatch_once()
@@ -2439,20 +2202,17 @@ def test_a_host_side_vsock_setup_failure_is_not_worker_evidence(tmp_path):
     runtime = _FakeVsockRuntime()
 
     class _HostIoControl(_RecordingVsockControl):
-        signal_is_transport = True  # a real transport seam...
+        signal_is_transport = True          # a real transport seam...
 
         def signal_go(self, spec, *, deadline=None):
             err = OSError(24, "Too many open files")
-            err.host_io = True  # ...whose failure was OURS
+            err.host_io = True              # ...whose failure was OURS
             raise err
 
     runtime.host_warm_control = lambda s: _HostIoControl(s)  # type: ignore[assignment]
     pool = FakeWarmPool(slot, runtime=runtime)
     dispatcher = _make_dispatcher_with_pool(
-        store,
-        job_root=tmp_path / "jobs",
-        pool=pool,
-        worker_timeout_s=10,
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
     )
 
     dispatcher.dispatch_once()
@@ -2480,13 +2240,8 @@ def test_a_worker_symlink_at_done_is_a_verdict_not_host_io(tmp_path):
 
     mp = pytest.MonkeyPatch()
     try:
-        for bad, expect_host_io in (
-            (_errno.ELOOP, False),
-            (_errno.ENOTDIR, False),
-            (_errno.EMFILE, True),
-            (_errno.EIO, True),
-        ):
-
+        for bad, expect_host_io in ((_errno.ELOOP, False), (_errno.ENOTDIR, False),
+                                    (_errno.EMFILE, True), (_errno.EIO, True)):
             def _boom(*a, _e=bad, **kw):
                 raise OSError(_e, "done-file failure")
 
@@ -2531,10 +2286,7 @@ def test_a_worker_made_path_conflict_on_the_file_handshake_is_a_verdict(tmp_path
     runtime.host_warm_control = lambda s: _FileControl(s)  # type: ignore[assignment]
     pool = FakeWarmPool(slot, runtime=runtime)
     dispatcher = _make_dispatcher_with_pool(
-        store,
-        job_root=tmp_path / "jobs",
-        pool=pool,
-        worker_timeout_s=10,
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
     )
 
     dispatcher.dispatch_once()
@@ -2567,10 +2319,7 @@ def test_a_host_resource_failure_on_the_file_handshake_is_still_ours(tmp_path):
     runtime.host_warm_control = lambda s: _FullDisk(s)  # type: ignore[assignment]
     pool = FakeWarmPool(slot, runtime=runtime)
     dispatcher = _make_dispatcher_with_pool(
-        store,
-        job_root=tmp_path / "jobs",
-        pool=pool,
-        worker_timeout_s=10,
+        store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
     )
 
     dispatcher.dispatch_once()

@@ -1,5 +1,4 @@
 """Test FcApiClient against a real Unix-socket HTTP server."""
-
 from __future__ import annotations
 
 import json

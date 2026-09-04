@@ -3,7 +3,6 @@
 Proves that a metadata.json written by run_detonation is accepted verbatim by
 the host's trust validator, and that a wrong input_sha256 is rejected.
 """
-
 from __future__ import annotations
 
 import hashlib
@@ -74,9 +73,7 @@ def test_harness_output_accepted_by_host_trust(tmp_path: Path) -> None:
 
     # Run harness
     engine = _NoopEngine()
-    rc = run_detonation(
-        engine, input_path=input_file, output_dir=outdir, limits=_limits()
-    )
+    rc = run_detonation(engine, input_path=input_file, output_dir=outdir, limits=_limits())
     assert rc == 0, "harness must succeed"
 
     # Host validates the output — must NOT raise
@@ -108,9 +105,7 @@ def test_wrong_input_sha_causes_host_to_reject(tmp_path: Path) -> None:
     outdir.mkdir()
 
     engine = _NoopEngine()
-    rc = run_detonation(
-        engine, input_path=input_file, output_dir=outdir, limits=_limits()
-    )
+    rc = run_detonation(engine, input_path=input_file, output_dir=outdir, limits=_limits())
     assert rc == 0
 
     # Pass a WRONG sha256 to the host
@@ -132,9 +127,7 @@ def test_engine_error_envelope_accepted_by_host_trust(tmp_path: Path) -> None:
         name: str = "raising-rt-engine"
         formats: frozenset[str] = frozenset({"*"})
 
-        def detonate(
-            self, input: Path, outdir: Path, limits: Limits
-        ) -> DetonationResult:
+        def detonate(self, input: Path, outdir: Path, limits: Limits) -> DetonationResult:
             raise RuntimeError("something exploded /internal/secret/file.cfg")
 
     input_file = tmp_path / "in" / "bad.bin"
@@ -147,9 +140,7 @@ def test_engine_error_envelope_accepted_by_host_trust(tmp_path: Path) -> None:
     outdir.mkdir()
 
     engine = _RaisingEngine()
-    rc = run_detonation(
-        engine, input_path=input_file, output_dir=outdir, limits=_limits()
-    )
+    rc = run_detonation(engine, input_path=input_file, output_dir=outdir, limits=_limits())
     assert rc == 0
 
     # Host must accept engine_error envelopes

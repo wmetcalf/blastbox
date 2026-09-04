@@ -13,7 +13,6 @@ class UnreachableBlobStore:
     def put_sample(self, sha256, src): ...
     def get_sample(self, sha256, dest):
         raise BlobFetchError("object store unreachable")
-
     def put_output(self, job_id, out_dir): ...
     def open_output(self, job_id, name): ...
     def delete_job(self, job_id): ...
@@ -23,13 +22,11 @@ class FetchingBlobStore:
     def __init__(self, data=b"materialised"):
         self.data = data
         self.calls = 0
-
     def put_sample(self, sha256, src): ...
     def get_sample(self, sha256, dest):
         self.calls += 1
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(self.data)
-
     def put_output(self, job_id, out_dir): ...
     def open_output(self, job_id, name): ...
     def delete_job(self, job_id): ...
@@ -39,7 +36,6 @@ class FlakyBlobStore:
     """Fails ``fail_times`` calls with BlobFetchError, then materialises normally --
     a fetch that was transiently broken and later recovers (unlike UnreachableBlobStore,
     which never succeeds)."""
-
     def __init__(self, fail_times, data=b"materialised"):
         self.fail_times = fail_times
         self.data = data
@@ -124,16 +120,11 @@ def test_release_clears_claim_id_and_backs_the_job_off(vm_dispatcher_factory):
     released = store.get(job.job_id)
     assert released.status is JobStatus.QUEUED
     assert released.claim_id is None, "a released job must not keep its claim token"
-    assert released.claimable_after > time.time(), (
-        "must back off, not be instantly re-claimable"
-    )
-    assert released.created_at == job.created_at, (
-        "submission time must not be rewritten"
-    )
+    assert released.claimable_after > time.time(), "must back off, not be instantly re-claimable"
+    assert released.created_at == job.created_at, "submission time must not be rewritten"
 
 
 # --- bounded materialise retries (Task 4/5 fix: give up instead of looping forever) -------
-
 
 def test_permanently_missing_sample_eventually_fails_the_job(vm_dispatcher_factory):
     """A sample that can NEVER be materialised (deleted/never-written blob) must not loop
@@ -152,38 +143,25 @@ def test_permanently_missing_sample_eventually_fails_the_job(vm_dispatcher_facto
 
     for attempt in range(1, MAX_MATERIALISE_ATTEMPTS + 1):
         claimed = store.claim_next()
-        assert claimed is not None, (
-            f"job must still be claimable before attempt {attempt}"
-        )
+        assert claimed is not None, f"job must still be claimable before attempt {attempt}"
         disp._process(claimed)
         current = store.get(job.job_id)
         assert current.materialise_attempts == attempt
 
         if attempt < MAX_MATERIALISE_ATTEMPTS:
-            assert current.status is JobStatus.QUEUED, (
-                f"attempt {attempt} should release, not fail"
-            )
+            assert current.status is JobStatus.QUEUED, f"attempt {attempt} should release, not fail"
             assert current.error is None
             # Bypass the backoff window (claimable_after) so the loop can re-claim the job on
             # the next iteration without waiting out blob_retry_backoff_s -- the backoff itself
             # is already covered by test_release_clears_claim_id_and_backs_the_job_off above.
             store.update(job.job_id, claimable_after=None)
         else:
-            assert current.status is JobStatus.FAILED, (
-                "must give up once the bound is reached"
-            )
-            assert current.error, (
-                "a terminal give-up must carry a non-empty, explanatory error"
-            )
-            assert (
-                str(MAX_MATERIALISE_ATTEMPTS) in current.error
-                or "attempts" in current.error
-            )
+            assert current.status is JobStatus.FAILED, "must give up once the bound is reached"
+            assert current.error, "a terminal give-up must carry a non-empty, explanatory error"
+            assert str(MAX_MATERIALISE_ATTEMPTS) in current.error or "attempts" in current.error
 
 
-def test_successful_materialisation_after_a_prior_failure_does_not_misfire(
-    vm_dispatcher_factory,
-):
+def test_successful_materialisation_after_a_prior_failure_does_not_misfire(vm_dispatcher_factory):
     """A successful fetch must not leave the retry counter in a state that prematurely fails a
     later, unrelated attempt. Here the sample fails to materialise once (counter -> 1, released)
     and then materialises successfully on the very next attempt, well under
@@ -212,9 +190,7 @@ def test_successful_materialisation_after_a_prior_failure_does_not_misfire(
     disp._process(reclaimed)
     done = store.get(job.job_id)
     assert done.status is JobStatus.DONE
-    assert done.materialise_attempts == 0, (
-        "a successful fetch must reset the counter (Finding E3)"
-    )
+    assert done.materialise_attempts == 0, "a successful fetch must reset the counter (Finding E3)"
 
 
 def test_counter_is_consecutive_not_lifetime_across_a_reset(tmp_path):
@@ -231,12 +207,10 @@ def test_counter_is_consecutive_not_lifetime_across_a_reset(tmp_path):
 
     class ScriptedBlobStore:
         """Fails on specific 1-indexed call numbers; materialises otherwise."""
-
         def __init__(self, fail_on, data=b"materialised"):
             self.fail_on = set(fail_on)
             self.data = data
             self.calls = 0
-
         def put_sample(self, sha256, src): ...
         def get_sample(self, sha256, dest):
             self.calls += 1
@@ -244,7 +218,6 @@ def test_counter_is_consecutive_not_lifetime_across_a_reset(tmp_path):
                 raise BlobFetchError("scripted failure")
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(self.data)
-
         def put_output(self, job_id, out_dir): ...
         def open_output(self, job_id, name): ...
         def delete_job(self, job_id): ...
@@ -272,10 +245,7 @@ def test_counter_is_consecutive_not_lifetime_across_a_reset(tmp_path):
         return ({"detected": "test"}, True)
 
     disp = VmJobDispatcher(
-        store=store,
-        job_root=tmp_path,
-        validate=_validate,
-        blob_store=blobs,
+        store=store, job_root=tmp_path, validate=_validate, blob_store=blobs,
         put_output_retry_backoff_s=0.0,
     )
 
@@ -284,9 +254,7 @@ def test_counter_is_consecutive_not_lifetime_across_a_reset(tmp_path):
         claimed = store.claim_next()
         disp._process(claimed)
         current = store.get(job.job_id)
-        assert current.status is JobStatus.QUEUED, (
-            f"attempt {expected_attempt} should release"
-        )
+        assert current.status is JobStatus.QUEUED, f"attempt {expected_attempt} should release"
         assert current.materialise_attempts == expected_attempt
         store.update(job.job_id, claimable_after=None)
 
@@ -295,12 +263,8 @@ def test_counter_is_consecutive_not_lifetime_across_a_reset(tmp_path):
     claimed = store.claim_next()
     disp._process(claimed)
     requeued = store.get(job.job_id)
-    assert requeued.status is JobStatus.QUEUED, (
-        "NoWarmSlot must requeue, not fail, the job"
-    )
-    assert requeued.materialise_attempts == 0, (
-        "the successful fetch must have reset the counter"
-    )
+    assert requeued.status is JobStatus.QUEUED, "NoWarmSlot must requeue, not fail, the job"
+    assert requeued.materialise_attempts == 0, "the successful fetch must have reset the counter"
 
     # Attempt 4: fetch fails again -- this must land at attempt 1 (the post-reset baseline),
     # NOT attempt 3 (2 old failures + this one), which is exactly the lifetime-vs-consecutive
