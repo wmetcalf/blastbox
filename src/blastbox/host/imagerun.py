@@ -736,7 +736,22 @@ def stage_rootfs(
         if spec.kind == "dir":
             ready = staging
         else:
-            size = spec.size_mib or _existing_mib(dest) or 1536
+            size = spec.resolved_size_mib(env) or _existing_mib(dest) or 1536
+            existing = _existing_mib(dest)
+            if existing and size < existing:
+                # Refused, not silently obeyed. The exporter this replaces
+                # matched the artifact already in place, so a declaration that
+                # is smaller is either a mistake or a deliberate shrink -- and
+                # the deliberate one is rare enough to be worth confirming.
+                # Silently shrinking either fails inside mkfs.ext4 once the
+                # extracted tree no longer fits, or fills up in the guest and
+                # surfaces as whatever the workload was doing at the time.
+                raise BuildError(
+                    f"{dest} is {existing} MiB and the plan asks for {size} MiB. "
+                    "Refusing to shrink a rootfs that is already in place; set "
+                    "the size explicitly (ROOTFS_MIB, or size_mib in the plan) "
+                    "if that is intended."
+                )
             # Unique per run, not a fixed `<dest>.new`. Two concurrent exports
             # to one destination would otherwise truncate and format the SAME
             # file, and one can rename it live while the other is still writing

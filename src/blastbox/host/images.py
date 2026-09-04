@@ -129,7 +129,11 @@ class RootfsSpec:
     kind: str
     image: str
     dest: str
-    size_mib: int | None = None
+    # An int, or an expandable string like "${ROOTFS_MIB:-3072}". The old
+    # export scripts honoured a ROOTFS_MIB override, and a spec that could only
+    # hold a literal would take that away -- silently shrinking a rootfs an
+    # operator had deliberately grown.
+    size_mib: int | str | None = None
     requires: tuple[str, ...] = ()
     # Defaults ON. `deploy/firecracker/build-rootfs.sh` refused any image
     # carrying a setuid/setgid binary, and adopting this module must not
@@ -137,6 +141,27 @@ class RootfsSpec:
     # rootfs either way, and the live gVisor tree has none today, so the
     # default costs nothing there either.
     forbid_setuid: bool = True
+
+    def resolved_size_mib(self, env: dict[str, str] | None = None) -> int | None:
+        """``size_mib`` with any variables expanded, or None.
+
+        Raises PlanError rather than guessing when the result is not a positive
+        whole number: an unset `${ROOTFS_MIB}` that silently became a default
+        would build a filesystem nobody chose.
+        """
+        if self.size_mib is None or isinstance(self.size_mib, int):
+            return self.size_mib
+        raw = _expand(self.size_mib, dict(os.environ) if env is None else env).strip()
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise PlanError(
+                f"{self.dest}: size_mib is {self.size_mib!r}, which resolves to "
+                f"{raw!r} — not a whole number of MiB"
+            ) from exc
+        if value <= 0:
+            raise PlanError(f"{self.dest}: size_mib resolves to {value}, which is not positive")
+        return value
 
     def resolved_dest(self, env: dict[str, str] | None = None) -> str:
         """`dest` with $VARS expanded from the environment.
@@ -455,7 +480,19 @@ def load_plan(root: Path | str) -> Plan:
                 f"{path}: [[rootfs]] #{i + 1} size_mib is a boolean; it must be "
                 "a whole number of MiB"
             )
-        if size is not None:
+        if isinstance(size, str):
+            # Deferred ONLY when it actually holds a variable. `"3GiB"` is a
+            # typo, and deferring it would surface at export -- after every
+            # image has been built -- instead of when the plan is read.
+            if "$" not in size:
+                raise PlanError(
+                    f"{path}: [[rootfs]] #{i + 1} size_mib must be a whole number of "
+                    f"MiB, got {size!r}. A string is only accepted when it holds a "
+                    'variable, e.g. "${ROOTFS_MIB:-3072}"'
+                )
+            if not size.strip():
+                raise PlanError(f"{path}: [[rootfs]] #{i + 1} size_mib is empty")
+        elif size is not None:
             if isinstance(size, float) and not size.is_integer():
                 raise PlanError(
                     f"{path}: [[rootfs]] #{i + 1} size_mib is {size!r}; truncating "

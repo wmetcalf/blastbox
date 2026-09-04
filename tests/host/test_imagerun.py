@@ -1145,3 +1145,49 @@ def test_the_staging_root_is_made_traversable_before_it_is_checked(
         f"the tree was checked before it was made traversable: {order}"
     )
 
+
+
+def test_the_size_may_come_from_the_environment(tmp_path: Path, monkeypatch) -> None:
+    """The exporter this replaces honoured a ROOTFS_MIB override. A spec that
+    could only hold a literal would take that away."""
+    dest_dir = tmp_path / "fc"
+    dest_dir.mkdir()
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    monkeypatch.setenv("ROOTFS_MIB", "128")
+    plan = _plan(tmp_path, SPEC.replace("size_mib = 64", 'size_mib = "${ROOTFS_MIB:-64}"'))
+    run = FakeRunner()
+    export_rootfs(plan, plan.rootfs[0], "t1", run=run, log=lambda _: None,
+                  extract=_fake_extract({"/init": "x"}))
+    truncate = run.verb("truncate")
+    assert truncate and "128M" in truncate[0], truncate
+
+
+def test_a_rootfs_is_not_silently_shrunk(tmp_path: Path, monkeypatch) -> None:
+    """Shrinking either fails inside mkfs.ext4 once the extracted tree no longer
+    fits, or fills up in the guest and surfaces as whatever the workload was
+    doing at the time. Neither points at the size."""
+    dest_dir = tmp_path / "fc"
+    dest_dir.mkdir()
+    live = dest_dir / "demo.ext4"
+    live.write_bytes(b"\0" * (200 * 1024 * 1024))  # 200 MiB already in place
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    plan = _plan(tmp_path)  # declares 64 MiB
+    with pytest.raises(BuildError) as e:
+        export_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                      extract=_fake_extract({"/init": "x"}))
+    assert "Refusing to shrink" in str(e.value)
+    assert live.stat().st_size == 200 * 1024 * 1024, "the live artifact was touched"
+
+
+def test_growing_a_rootfs_is_allowed(tmp_path: Path, monkeypatch) -> None:
+    """The guard is against SHRINKING; growing is the ordinary case when an
+    engine's payload gets bigger."""
+    dest_dir = tmp_path / "fc"
+    dest_dir.mkdir()
+    (dest_dir / "demo.ext4").write_bytes(b"\0" * (32 * 1024 * 1024))
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    plan = _plan(tmp_path)  # declares 64 MiB
+    run = FakeRunner()
+    export_rootfs(plan, plan.rootfs[0], "t1", run=run, log=lambda _: None,
+                  extract=_fake_extract({"/init": "x"}))
+    assert run.verb("mkfs.ext4")
