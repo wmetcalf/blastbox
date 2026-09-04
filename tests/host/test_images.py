@@ -641,3 +641,40 @@ def test_an_unreadable_dockerfile_is_reported_not_raised(tmp_path: Path) -> None
     finally:
         f.chmod(0o644)
     assert any("cannot read" in p for p in problems), problems
+
+
+def test_source_repo_defaults_to_the_context_not_the_plan_root(tmp_path: Path) -> None:
+    """An image built from another tree is stamped with THAT tree's revision.
+
+    Defaulting to the plan root would record a commit that does not contain the
+    Dockerfile which built the image — the un-rebuildable state this module
+    exists to prevent, re-created by the tool meant to prevent it.
+    """
+    from blastbox.host.images import source_repo_path
+
+    text = TITANARUM + (
+        '\n[[image]]\nname = "titanarum-warm"\n'
+        'dockerfile = "deploy/gvisor/Dockerfile.titanarum"\n'
+        'base = "titanarum-base"\ncontext = "$BLASTBOX_SRC"\n'
+    )
+    plan = load_plan(_plan(tmp_path, text))
+    env = {"BLASTBOX_SRC": "/srv/blastbox"}
+    warm = next(i for i in plan.images if i.name == "titanarum-warm")
+    home = next(i for i in plan.images if i.name == "titanarum-base")
+    assert source_repo_path(plan, warm, env) == Path("/srv/blastbox")
+    assert source_repo_path(plan, home, env) == plan.root
+
+
+def test_an_explicit_source_repo_overrides_the_context(tmp_path: Path) -> None:
+    """Context and source tree are not always the same: docker can be handed a
+    build context that is not the repo the Dockerfile is versioned in."""
+    from blastbox.host.images import source_repo_path
+
+    text = TITANARUM.replace(
+        'dockerfile = "deploy/docker/Dockerfile.titanarum-base"',
+        'dockerfile = "deploy/docker/Dockerfile.titanarum-base"\n'
+        'source_repo = "/srv/other"',
+        1,
+    )
+    plan = load_plan(_plan(tmp_path, text))
+    assert source_repo_path(plan, plan.images[0], {}) == Path("/srv/other")

@@ -105,6 +105,13 @@ class ImageSpec:
     base: str
     base_arg: str = "BASE_IMAGE"
     context: str = "."
+    # The tree whose REVISION this image's stamp records. Defaults to the
+    # context, which is right for both ordinary cases: an image built from this
+    # repo records this repo, and one built from another tree (redtusk's warm
+    # images come from blastbox's own deploy/) records THAT tree. Stamping the
+    # latter with the consumer's revision names a commit that does not contain
+    # the Dockerfile which built the image.
+    source_repo: str = ""
     build_args: dict[str, str] = field(default_factory=dict)
     # True when `base` names another image in this chain rather than an upstream
     # reference. Chain bases are built here; upstream ones are pulled first so
@@ -234,7 +241,15 @@ def load_plan(root: Path | str) -> Plan:
     if not raw_images:
         raise PlanError(f"{path}: declares no [[image]]; there is nothing to build")
 
-    known_image_keys = {"name", "dockerfile", "base", "base_arg", "context", "build_args"}
+    known_image_keys = {
+        "name",
+        "dockerfile",
+        "base",
+        "base_arg",
+        "context",
+        "source_repo",
+        "build_args",
+    }
     known_rootfs_keys = {"kind", "image", "dest", "size_mib", "requires"}
 
     seen: dict[str, ImageSpec] = {}
@@ -287,6 +302,7 @@ def load_plan(root: Path | str) -> Plan:
             base=base,
             base_arg=str(item.get("base_arg") or "BASE_IMAGE").strip(),
             context=str(item.get("context") or ".").strip(),
+            source_repo=str(item.get("source_repo") or "").strip(),
             build_args=args,
             internal=base in seen,
         )
@@ -464,6 +480,19 @@ def dockerfile_path(plan: Plan, spec: ImageSpec, env: dict[str, str] | None = No
     return base / spec.dockerfile
 
 
+def source_repo_path(plan: Plan, spec: ImageSpec, env: dict[str, str] | None = None) -> Path:
+    """The tree whose revision ``spec``'s stamp should record.
+
+    Falls back to the CONTEXT rather than the plan root: an image built from
+    another tree must be stamped with that tree's commit, or the stamp names a
+    revision which does not contain the Dockerfile that produced the image --
+    exactly the un-rebuildable state this whole module exists to prevent.
+    """
+    env = dict(os.environ) if env is None else env
+    raw = _expand(spec.source_repo, env) if spec.source_repo else _expand(spec.context, env)
+    return Path(raw) if Path(raw).is_absolute() else plan.root / raw
+
+
 def missing_dockerfiles(plan: Plan, env: dict[str, str] | None = None) -> list[str]:
     """Declared Dockerfiles that are not present, each shown with its context."""
     out: list[str] = []
@@ -585,6 +614,9 @@ def describe(plan: Plan, tag: str, env: dict[str, str] | None = None) -> str:
         kind = "chain" if spec.internal else "upstream"
         ctx = _expand(spec.context, env)
         where = "" if ctx == "." else f" [context {ctx}]"
+        src = source_repo_path(plan, spec, env)
+        if src != plan.root:
+            where += f" [stamped from {src}]"
         if spec.build_args:
             where += " " + " ".join(
                 f"--build-arg {k}={v}" for k, v in sorted(spec.build_args.items())
