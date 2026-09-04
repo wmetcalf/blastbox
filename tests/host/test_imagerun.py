@@ -60,6 +60,16 @@ class FakeRunner:
             list(argv), rc, stdout=self.stdout, stderr="boom" if rc else ""
         )
 
+    @staticmethod
+    def _bare(call: list[str]) -> list[str]:
+        """The command without its privilege prefix.
+
+        Whether one is there depends on the MACHINE — CI runners have
+        passwordless sudo, this laptop does not — so a matcher that did not
+        strip it made two of these tests pass locally and fail in CI.
+        """
+        return call[1:] if call and call[0] == "sudo" else call
+
     def verb(self, *words: str) -> list[list[str]]:
         """Calls whose LEADING words are exactly these.
 
@@ -69,10 +79,21 @@ class FakeRunner:
         first version of this helper passed for that reason.
         """
         n = len(words)
-        return [c for c in self.calls if list(c[:n]) == list(words)]
+        return [c for c in self.calls if list(self._bare(c)[:n]) == list(words)]
 
     def tagged(self, tag: str) -> list[list[str]]:
         return [c for c in self.calls if tag in c]
+
+
+@pytest.fixture(autouse=True)
+def _pinned_privilege(monkeypatch: pytest.MonkeyPatch):
+    """Pin the privilege decision so these tests do not depend on whether the
+    machine running them has passwordless sudo. Tests about privilege override
+    it explicitly."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_root_prefix", lambda: [])
+    monkeypatch.setattr(mod, "_can_be_root", lambda: False)
 
 
 def _repo(tmp_path: Path, spec: str = SPEC) -> Path:
@@ -251,7 +272,7 @@ def test_the_previous_artifact_is_kept_for_rollback(
     run = FakeRunner()
     export_rootfs(plan, plan.rootfs[0], "t1", run=run, log=lambda _: None,
                   extract=_fake_extract({"/init": "x"}))
-    moves = [c for c in run.verb("mv") if c[-1].endswith(".bak")]
+    moves = [c for c in run.verb("mv") if c[-1].endswith(".bak")]  # prefix-stripped
     assert moves, f"nothing was kept for rollback: {run.calls}"
 
 
