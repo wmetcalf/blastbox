@@ -77,14 +77,21 @@ _NAME_RE = re.compile(r"^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*$")
 _COMPONENT = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
 _REF_RE = re.compile(
     r"^" + _COMPONENT +
-    r"(?::[0-9]+)?"                       # registry port
-    r"(?:/" + _COMPONENT + r")*"
-    r"(?::[A-Za-z0-9_][A-Za-z0-9._-]*)?"
+    # A port only counts when a path component FOLLOWS it. Optional, it also
+    # matched `ubuntu:<129 digits>` -- consuming an all-numeric tag and slipping
+    # past the length bound below, so the dry run called the plan runnable and
+    # the build then rejected its own base.
+    r"(?:(?::[0-9]+)?(?:/" + _COMPONENT + r")+)?"
+    # The tag is bounded here as it already is for the tags we generate:
+    # docker's distribution grammar caps it at 128, so an over-long one made
+    # the dry run report a plan the build would then reject on its base.
+    r"(?::[A-Za-z0-9_][A-Za-z0-9._-]{0,127})?"
     r"(?:@sha256:[0-9a-f]{64})?$"
 )
 
 # A tag names one build. A colon or slash would make `name:tag` parse as
 # something else entirely.
+_MAX_TAG = 128  # docker's distribution reference grammar
 _TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$")
 
 
@@ -208,14 +215,62 @@ def _close_brace(text: str, open_at: int) -> int | None:
     reported as unresolved.
     """
     depth = 0
-    for i in range(open_at, len(text)):
-        if text[i] == "{":
+    i = open_at
+    while i < len(text):
+        # Only `${` opens a level. `${DIR:-/tmp/{scratch}/cache}` is valid shell
+        # whose literal `{` is not an expansion; counting it left the whole
+        # expression unterminated and the destination refused.
+        if text[i] == "{" and (i == open_at or text[i - 1] == "$"):
             depth += 1
         elif text[i] == "}":
             depth -= 1
             if depth == 0:
                 return i
+        i += 1
     return None
+
+
+def unresolved_names(text: str, env: dict[str, str], _depth: int = 0) -> list[str]:
+    """Variables in ``text`` that will not resolve, innermost defaults included.
+
+    Asked of the TEMPLATE, never of the result. Scanning the output for `$`
+    cannot tell an unset placeholder from a literal dollar in a VALUE -- and a
+    token or password containing one would then be reported unresolved and
+    abort the build, which turns data corruption into a hard failure rather
+    than fixing it.
+    """
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] != "$":
+            i += 1
+            continue
+        if i + 1 < n and text[i + 1] == "{":
+            close = _close_brace(text, i + 1)
+            if close is None:
+                # `${SECRET` with no closing brace. _expand leaves it verbatim,
+                # so skipping here reported no problem and handed the literal
+                # placeholder to docker -- which the old result-based check at
+                # least refused.
+                out.append(text[i:][:32])
+                i += 1
+                continue
+            name, sep, default = text[i + 2 : close].partition(":-")
+            if name.isidentifier() and not env.get(name):
+                if sep and _depth < _EXPAND_DEPTH:
+                    out += unresolved_names(default, env, _depth + 1)
+                elif not sep:
+                    out.append(name)
+            i = close + 1
+            continue
+        m = re.match(r"\$(\w+)", text[i:])
+        if m:
+            if not env.get(m.group(1)):
+                out.append(m.group(1))
+            i += m.end()
+            continue
+        i += 1
+    return out
 
 
 def _expand(text: str, env: dict[str, str], _depth: int = 0) -> str:
@@ -339,6 +394,10 @@ def load_plan(root: Path | str) -> Plan:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
         raise PlanError(f"{path} not found; the engine declares no image chain") from exc
+    except UnicodeDecodeError as exc:
+        # Neither OSError nor TOMLDecodeError, so it escaped to the CLI as a
+        # traceback instead of the normal validation message and exit 2.
+        raise PlanError(f"{path}: not valid UTF-8 ({exc})") from exc
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise PlanError(f"{path}: {exc}") from exc
 
@@ -425,7 +484,7 @@ def load_plan(root: Path | str) -> Plan:
                     f"{path}: image {name!r} build_arg {k!r} must be a scalar; "
                     "docker takes NAME=VALUE strings"
                 )
-            args[str(k)] = str(v)
+            args[str(k)] = _arg_value(v)
         spec = ImageSpec(
             name=name,
             dockerfile=dockerfile,
@@ -555,7 +614,17 @@ def load_plan(root: Path | str) -> Plan:
         # Compared RESOLVED, not as written: `$A/x` and `$B/x` are different
         # strings that are the same path when both point at the same directory,
         # and the second would silently overwrite the first.
-        key = rf.resolved_dest()
+        # Normalised: `/srv/images/rootfs` and `/srv/images/./rootfs` are the
+        # same artifact and were two different dictionary keys, so the second
+        # silently overwrote the first and the dry run reported success.
+        # realpath on the PARENT, then the name. `normpath` collapses `..`
+        # lexically, so with `/base/link -> /other/child` it reads
+        # `/base/link/../rootfs` as `/base/rootfs` and calls two genuinely
+        # distinct artifacts a collision. The final component is left
+        # unresolved: it is what we are about to replace, and it may be a
+        # symlink we must not follow.
+        resolved = Path(rf.resolved_dest())
+        key = str(Path(os.path.realpath(resolved.parent)) / resolved.name)
         if key in dests:
             raise PlanError(
                 f"{path}: {rf.image!r} and {dests[key]!r} both export to "
@@ -564,6 +633,19 @@ def load_plan(root: Path | str) -> Plan:
         dests[key] = rf.image
 
     return Plan(engine=engine, images=tuple(images), rootfs=tuple(rootfs), root=root)
+
+
+def _arg_value(value: object) -> str:
+    """A build-arg value as docker will receive it.
+
+    TOML's `false` becomes Python's `False`, and `str()` would hand docker the
+    capitalised spelling -- so a Dockerfile comparing against `false` sees
+    something else. Docker passes these verbatim, so the TOML spelling is the
+    one to keep.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
 
 
 def _bool(path: Path, index: int, key: str, value: object) -> bool:
@@ -680,9 +762,12 @@ def unresolved_build_args(plan: Plan, env: dict[str, str] | None = None) -> list
     out: list[str] = []
     for spec in plan.images:
         for key, raw in sorted(spec.build_args.items()):
-            shown = _expand(raw, env)
-            if "$" in shown:
-                out.append(f"{spec.name}: --build-arg {key}={shown}")
+            missing = unresolved_names(raw, env)
+            if missing:
+                out.append(
+                    f"{spec.name}: --build-arg {key}={raw} needs "
+                    f"{', '.join(sorted(set(missing)))}"
+                )
     return out
 
 
@@ -791,6 +876,11 @@ def build_command(
     for key, value in sorted(spec.build_args.items()):
         argv += ["--build-arg", f"{key}={_expand(value, env_map)}"]
     context = _expand(spec.context, dict(os.environ) if env is None else env)
+    if plan is not None and not Path(context).is_absolute():
+        # Against the PLAN ROOT, exactly as `-f` is. Passed relative, docker
+        # resolves it against whatever directory the caller happens to be in,
+        # so `COPY` reads from the wrong repository -- or finds nothing.
+        context = str(plan.root / context)
     argv += ["-t", spec.tagged(tag), context]
     return argv
 
