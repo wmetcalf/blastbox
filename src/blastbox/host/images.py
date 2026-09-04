@@ -809,7 +809,16 @@ def describe(plan: Plan, tag: str, env: dict[str, str] | None = None) -> str:
         )
     for rf in plan.rootfs:
         need = f" requires {list(rf.requires)}" if rf.requires else ""
-        size = f" {rf.size_mib} MiB" if rf.size_mib else ""
+        # RESOLVED, like the destinations and the build args. A dry run that
+        # prints `${ROOTFS_MIB:-7000} MiB` has not said how big the filesystem
+        # will be, which is the one question it exists to answer.
+        try:
+            resolved_size = rf.resolved_size_mib(env)
+        except PlanError as exc:  # a size that cannot resolve is worth showing
+            resolved_size = None
+            size = f" [UNRESOLVED SIZE: {exc}]"
+        else:
+            size = f" {resolved_size} MiB" if resolved_size else ""
         dest = rf.resolved_dest(env)
         unresolved = " [UNRESOLVED]" if "$" in dest else ""
         lines.append(
