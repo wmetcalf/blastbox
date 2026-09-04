@@ -384,8 +384,17 @@ def publish_tags(
             )
             _drop_staging_tags(staged, runner)
             raise
-    _drop_staging_tags(staged, runner)
-    return PublishedTags(tuple(order), previous, published)
+    # The record FIRST. Dropping the private tags is tidy-up, but it can raise
+    # -- a KeyboardInterrupt, a missing docker -- and if it propagates from
+    # here the caller never receives the record, so its rollback restores the
+    # rootfs and leaves the live tags on the new release. Exactly the mixed
+    # state the rollback exists to prevent, produced by the cleanup after it.
+    record = PublishedTags(tuple(order), previous, published)
+    try:
+        _drop_staging_tags(staged, runner)
+    except BaseException as exc:  # noqa: BLE001 -- tidy-up must not lose the record
+        log(f"   note: could not drop the staging tags ({exc})")
+    return record
 
 
 def restore_tags(
@@ -536,10 +545,20 @@ def build_plan(
         # a builder tag moved, and every label stayed identical -- the drift
         # this pinning exists to prevent, left with nothing recording it.
         pinned_args = _pin_builder_images(spec, env, run, log, pull=pull)
+        # The label is PERMANENT and `stamp --read` prints it, so a
+        # secret-named argument must not reach it -- an already-digested value
+        # is preserved verbatim, and `_redact_argv` cannot see a credential
+        # nested inside `org.blastbox.builders`. The build still receives the
+        # pin; only the record drops it.
+        provenance = {k: v for k, v in pinned_args.items() if not _images._is_secret(k)}  # noqa: SLF001
+        for key in sorted(set(pinned_args) - set(provenance)):
+            log(
+                f"   note: {key} pinned but not recorded (its name reads as a credential)"
+            )
         try:
             flags = _stamp_flags(
                 record_base_as=record_as,
-                builders=pinned_args,
+                builders=provenance,
                 blastbox_version=blastbox_version,
                 repo=source,
                 base=base_ref,
@@ -643,21 +662,14 @@ def verify_built(
         # recorded name resolves on its own.
         alias = (aliases or {}).get(stamp.base_name or "")
         try:
-            # Returns the base's CURRENT id when it differs from the record, and
-            # "" when there is nothing to report. It RAISES when the question
-            # cannot be asked, which is not the same as agreement.
-            moved = stamp.base_moved(runner, alias)  # type: ignore[arg-type]
+            # ONE inspection answering both questions. Asked separately, a tag
+            # that still points at the recorded image for the first call and is
+            # retagged before the second reports "present, nothing moved" and
+            # the replacement is never compared -- the concurrent-retag case
+            # these checks exist for, surviving between them.
+            still_there, moved = stamp.base_check(runner, alias)  # type: ignore[arg-type]
         except Exception as exc:  # noqa: BLE001
-            bad.append(f"{image}: could not confirm its base did not move ({exc})")
-            continue
-        # `base_moved` deliberately answers "" when the recorded base is GONE --
-        # absence is `resolvable`'s question, and nothing here was asking it. A
-        # perfectly stamped image whose base has been deleted cannot be rebuilt
-        # from what it records, which is the original failure this all exists for.
-        try:
-            still_there = stamp.resolvable(runner, alias)  # type: ignore[arg-type]
-        except Exception as exc:  # noqa: BLE001
-            bad.append(f"{image}: could not confirm its base is still present ({exc})")
+            bad.append(f"{image}: could not confirm its base ({exc})")
             continue
         if not still_there:
             where = f" (looked for it as {alias})" if alias else ""
