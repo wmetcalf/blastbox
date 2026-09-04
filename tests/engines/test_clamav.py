@@ -51,7 +51,8 @@ def _daemon_sees_our_paths() -> bool:
     from blastbox.engines.clamav import ClamdCannotSeePath, scan_path
 
     with tempfile.NamedTemporaryFile(suffix=".txt") as fh:
-        fh.write(b"harmless"); fh.flush()
+        fh.write(b"harmless")
+        fh.flush()
         try:
             scan_path(Path(fh.name), timeout=10)
             return True
@@ -96,8 +97,8 @@ def test_an_unreachable_daemon_is_an_engine_error_not_a_clean_verdict(tmp_path):
     # A DIFFERENT NODE TYPE, not a scan with holes in it. There is no `infected` field
     # to misread — `infected: false` from a scanner that never ran is indistinguishable
     # from a real clean verdict, which is the confusion this test exists to prevent.
-    assert r.payload.type == "signature_scan_unavailable", r.payload
-    assert not hasattr(r.payload, "infected"), r.payload
+    assert r.payload.fields["schema"] == "signature_scan_unavailable", r.payload.fields
+    assert "infected" not in r.payload.fields, r.payload.fields
     assert any(w.code == "clamd_unavailable" for w in r.warnings)
 
 
@@ -136,7 +137,7 @@ def test_an_unknown_signature_database_is_a_warning_not_a_silence(tmp_path, monk
     monkeypatch.setattr("blastbox.engines.clamav.db_version", lambda *a, **k: None)
     r = _run(tmp_path, b"harmless", scan_fn=lambda data, **kw: [])
     assert r.status == "ok"
-    assert r.payload.db_version == "unknown"
+    assert r.payload.fields["db_version"] == "unknown"
     assert any(w.code == "db_version_unknown" for w in r.warnings)
 
 
@@ -144,7 +145,7 @@ def test_the_result_says_it_stopped_at_the_first_hit(tmp_path):
     """`signature_count: 1` on an archive means AT LEAST one, not exactly one. Sealed so
     the reader is not left to assume the stronger reading."""
     r = _run(tmp_path, b"x", scan_fn=lambda data, **kw: ["Some.Sig"])
-    assert r.payload.first_hit_only is True
+    assert r.payload.fields["first_hit_only"] is True
 
 
 # --- against a real daemon ---------------------------------------------------------
@@ -153,15 +154,15 @@ def test_the_result_says_it_stopped_at_the_first_hit(tmp_path):
 def test_eicar_is_detected_by_a_real_daemon(tmp_path):
     r = _run(tmp_path, EICAR)
     assert r.status == "ok"
-    assert r.payload.infected is True, r.payload.fields
-    assert r.payload.signature_count >= 1
-    assert any("eicar" in sig.lower() for sig in r.payload.signatures), r.payload.signatures
+    assert r.payload.fields["infected"] is True, r.payload.fields
+    assert r.payload.fields["signature_count"] >= 1
+    assert any("eicar" in sig.lower() for sig in r.payload.fields["signatures"]), r.payload.fields["signatures"]
 
 
 @live
 def test_a_clean_sample_is_clean(tmp_path):
     r = _run(tmp_path, b"nothing interesting in here at all")
-    assert r.status == "ok" and r.payload.infected is False
+    assert r.status == "ok" and r.payload.fields["infected"] is False
 
 
 @live
@@ -174,8 +175,8 @@ def test_an_infected_archive_is_detected(tmp_path):
         z.writestr("b/two.com", EICAR)
         z.writestr("c/clean.txt", b"fine")
     r = _run(tmp_path, buf.getvalue())
-    assert r.payload.infected is True
-    assert r.payload.first_hit_only is True
+    assert r.payload.fields["infected"] is True
+    assert r.payload.fields["first_hit_only"] is True
 
 
 @shared_fs
@@ -204,7 +205,7 @@ def test_all_match_by_path_returns_more_than_the_first_hit(tmp_path):
 
     r = _run(tmp_path, z.read_bytes(), stream=False)
     assert r.status == "ok"
-    assert r.payload.first_hit_only is False, (
+    assert r.payload.fields["first_hit_only"] is False, (
         "an all-match result still claims it stopped at the first hit")
 
 
@@ -214,7 +215,7 @@ def test_the_stream_fallback_still_declares_itself_incomplete(tmp_path):
     a reader must be able to tell its `signature_count` is a floor, not a total."""
     r = _run(tmp_path, EICAR, stream=True)
     assert r.status == "ok"
-    assert r.payload.first_hit_only is True
+    assert r.payload.fields["first_hit_only"] is True
 
 
 @shared_fs
@@ -235,7 +236,7 @@ def test_duplicate_signature_names_are_collapsed(tmp_path):
 @live
 def test_the_database_version_is_sealed_with_the_verdict(tmp_path):
     r = _run(tmp_path, b"harmless")
-    assert r.payload.db_version.startswith("ClamAV"), r.payload
+    assert r.payload.fields["db_version"].startswith("ClamAV"), r.payload
 
 
 # --- the contract itself ----------------------------------------------------
@@ -248,8 +249,13 @@ def test_the_payload_round_trips_through_the_node_parser(tmp_path):
 
     r = _run(tmp_path, b"x", scan_fn=lambda data, **kw: ["Eicar-Test-Signature"])
     node = parse_node(r.payload.model_dump(by_alias=True))
-    assert node.type == "signature_scan"
-    assert node.signatures == ["Eicar-Test-Signature"] and node.first_hit_only is True
+    # GENERIC ON THE WIRE. An engine runs in a container and the host validating its
+    # envelope does not import it, so an engine-registered tag is rejected host-side
+    # (observed live). The typed model still validated the fields on the way out.
+    assert node.type == "record"
+    assert node.fields["schema"] == "signature_scan"
+    assert node.fields["signatures"] == ["Eicar-Test-Signature"]
+    assert node.fields["first_hit_only"] is True
 
 
 def test_a_missing_database_version_cannot_be_omitted():

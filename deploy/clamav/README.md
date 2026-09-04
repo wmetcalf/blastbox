@@ -19,7 +19,8 @@ the database load per scan) is what the **warm tier** already solves.
 ## Build
 
 ```bash
-docker build -t clamav-cold-worker:dev -f deploy/docker/Dockerfile.clamav-cold-worker .
+docker build --build-arg SIGNATURE_DATE=$(date -u +%F) \
+  -t clamav-cold-worker:dev -f deploy/docker/Dockerfile.clamav-cold-worker .
 docker build --build-arg BASE=clamav-cold-worker:dev \
   -f deploy/gvisor/Dockerfile.clamav -t clamav-warm:gvisor .
 ```
@@ -59,7 +60,23 @@ artifact, and looks exactly like a working deployment.
 
 ## Refreshing signatures
 
-Rebuild the image. There is deliberately no in-place `freshclam --daemon` in the worker:
-a warm slot that updates its own database makes the version sealed in an envelope a claim
-about *when the scan ran* rather than about the image, and two slots from one checkpoint
-would disagree. Rebuild, re-checkpoint, roll.
+```bash
+docker build --build-arg SIGNATURE_DATE=$(date -u +%F) \
+  -t clamav-cold-worker:dev -f deploy/docker/Dockerfile.clamav-cold-worker .
+```
+
+**`--build-arg SIGNATURE_DATE` is required, and a rebuild without it is a no-op.** Docker
+reuses the `freshclam` layer whenever nothing above it changed, so a plain rebuild re-tags
+an image carrying whatever signatures it was *first* built with. This was measured, not
+theorised: a rebuild three days on produced an image whose database was still the original
+day's, and the earlier version of this file told operators to do exactly that. A scanner
+silently running an old database is the failure this engine exists to make visible — it
+should not be manufactured by the build instructions.
+
+The check is the evidence itself: the engine seals the real `db_version` with every
+verdict, so compare that against what the build intended rather than trusting either.
+
+There is deliberately no in-place `freshclam --daemon` in the worker: a warm slot that
+updates its own database makes the sealed version a claim about *when the scan ran*
+rather than about the image, and two slots restored from one checkpoint would disagree.
+Rebuild, re-checkpoint, roll.

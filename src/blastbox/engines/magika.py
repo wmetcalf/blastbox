@@ -39,7 +39,7 @@ from typing import Literal
 
 from pydantic import Field
 
-from blastbox.contract import Detection, Warning, register_node_type
+from blastbox.contract import Detection, Record, Warning, register_node_type
 from blastbox.contract.nodes import _Node
 from blastbox.limits import Limits
 from blastbox.worker.engine import DetonationResult
@@ -158,6 +158,25 @@ def identify(data: bytes) -> dict:
     }
 
 
+
+def _sealed(node) -> Record:
+    """Validate strictly, then seal GENERICALLY — and this reverses a choice made
+    earlier today for a reason worth recording.
+
+    The typed node (`ContentTypeIdentification`) is the right contract: it bounds the fields, forbids
+    extras, and turns a rename into a parse error. But `register_node_type` registers
+    into the REGISTRY OF THE PROCESS THAT IMPORTS THE ENGINE — and an engine runs in a
+    container while the dispatcher validating its envelope does not import it. Observed
+    live: the host rejected a perfectly good result with
+    `Input tag 'content_type_identification' ... does not match any of the expected tags`.
+
+    So the model still does the checking (constructed and validated above), and what
+    goes on the wire is `Record` — the generic floor any host can validate. The field
+    names and bounds are still enforced; they are enforced where they can be.
+    """
+    return Record(fields={"schema": node.type, **node.model_dump(exclude={"type"})})
+
+
 class MagikaEngine:
     """Identify one sample's content type."""
 
@@ -193,7 +212,7 @@ class MagikaEngine:
             # "looked, found nothing identifiable" — `unknown` is a real Magika answer
             # and must not be manufactured by a failure. No `label` key at all here.
             return DetonationResult(
-                payload=ContentTypeUnavailable(error=str(exc)[:1000]),
+                payload=_sealed(ContentTypeUnavailable(error=str(exc)[:1000])),
                 artifacts=[],
                 detected=Detection(label="unidentified", mime="application/octet-stream",
                                    confidence=0.0, source=self.name),
@@ -216,7 +235,7 @@ class MagikaEngine:
                         f"— reason: {got['overwrite_reason']}"))
 
         return DetonationResult(
-            payload=ContentTypeIdentification(bytes_read=len(data), file_size=size, **got),
+            payload=_sealed(ContentTypeIdentification(bytes_read=len(data), file_size=size, **got)),
             artifacts=[],
             # THE SCORE IS THE CONFIDENCE. Not 1.0: this engine's answer is a
             # prediction, and a consumer that ranks or thresholds on confidence must see

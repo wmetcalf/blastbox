@@ -14,7 +14,12 @@
 # that are really build differences. This tracks the CAPE box (ClamAV 1.5.3).
 #
 # Build context = blastbox repo root:
-#   docker build -t clamav-cold-worker:dev -f deploy/docker/Dockerfile.clamav-cold-worker .
+#   docker build --build-arg SIGNATURE_DATE=$(date -u +%F) \
+#     -t clamav-cold-worker:dev -f deploy/docker/Dockerfile.clamav-cold-worker .
+#
+# WITHOUT `--build-arg SIGNATURE_DATE` A REBUILD DOES NOT REFRESH SIGNATURES — see the
+# ARG below. That is the difference between a scanner that is current and one that only
+# looks current.
 FROM ubuntu:26.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -32,9 +37,25 @@ COPY deploy/clamav/entrypoint.sh /usr/local/bin/clamav-entrypoint
 # slot spawn. `freshclam` at build time makes the image self-contained and makes the
 # database version a property OF THE IMAGE — which is what the engine seals with each
 # verdict, so a stale image is visible in the evidence instead of being invisible.
+# CACHE-BUSTS THE SIGNATURE FETCH, and this is not optional bookkeeping. Docker reuses
+# this layer whenever nothing above it changed, so `docker build` on an unmodified tree
+# re-tags an image carrying WHATEVER SIGNATURES IT WAS FIRST BUILT WITH. Measured: a
+# rebuild three days later produced an image whose database was still the original day's.
+# An operator who rebuilds to refresh signatures gets a no-op that looks like a refresh —
+# and a scanner silently running an old database is the failure this engine exists to
+# make visible, manufactured by its own build instructions.
+#
+#   docker build --build-arg SIGNATURE_DATE=$(date -u +%F) ...
+#
+# The value is not read; changing it is the whole point. It is also stamped into the
+# image so `docker inspect` can answer "what did this build intend to fetch?" — and the
+# engine seals the ACTUAL `db_version` with every verdict, so the two can be compared.
+ARG SIGNATURE_DATE=unpinned
 RUN install -d -o clamav -g clamav /var/lib/clamav /run/clamav \
+    && echo "signature fetch requested for: ${SIGNATURE_DATE}" \
     && freshclam --config-file=/etc/clamav/freshclam.conf --stdout \
-    && chown -R clamav:clamav /var/lib/clamav
+    && chown -R clamav:clamav /var/lib/clamav \
+    && sigtool --info /var/lib/clamav/daily.cvd 2>/dev/null | head -3 || true
 
 # Install THIS-tree blastbox plus the clamd client. `--break-system-packages` because
 # the image has no other Python consumer and a venv buys nothing here.

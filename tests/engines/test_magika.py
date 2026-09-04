@@ -53,9 +53,9 @@ def test_the_model_prediction_survives_an_overwrite(tmp_path):
     something the tool declined to stand behind. Both, plus the reason."""
     r = _run(tmp_path, b"x", identify_fn=_fake(
         label="unknown", model_label="psd", score=0.34, overwrite_reason="low_confidence"))
-    f = r.payload
-    assert f.label == "unknown" and f.model_label == "psd"
-    assert f.overwrite_reason == "low_confidence"
+    f = r.payload.fields
+    assert f["label"] == "unknown" and f["model_label"] == "psd"
+    assert f["overwrite_reason"] == "low_confidence"
     assert any(w.code == "prediction_overwritten" for w in r.warnings), r.warnings
 
 
@@ -79,8 +79,8 @@ def test_a_model_that_will_not_load_is_engine_error_never_unknown(tmp_path):
     # has no `label` field to misread, and a consumer discriminating on `_type` cannot
     # take it for an answer — `unknown` is a real Magika result and a failure must not
     # be able to spell one.
-    assert r.payload.type == "content_type_unavailable", r.payload
-    assert not hasattr(r.payload, "label"), r.payload
+    assert r.payload.fields["schema"] == "content_type_unavailable", r.payload.fields
+    assert "label" not in r.payload.fields, r.payload.fields
     assert r.detected.confidence == 0.0
 
 
@@ -89,7 +89,7 @@ def test_a_truncated_read_is_disclosed(tmp_path, monkeypatch):
     all of it, and nothing else in the envelope would show the difference."""
     monkeypatch.setenv("BLASTBOX_MAGIKA_MAX_BYTES", "16")
     r = _run(tmp_path, b"y" * 64, identify_fn=_fake())
-    assert r.payload.bytes_read == 16 and r.payload.file_size == 64
+    assert r.payload.fields["bytes_read"] == 16 and r.payload.fields["file_size"] == 64
     assert any(w.code == "truncated_input" for w in r.warnings), r.warnings
 
 
@@ -113,7 +113,7 @@ live = pytest.mark.skipif(not _live, reason="magika model not installed")
 def test_real_magika_identifies_an_elf(tmp_path):
     r = _run(tmp_path, Path("/usr/bin/ls").read_bytes())
     assert r.status == "ok"
-    assert r.payload.label == "elf"
+    assert r.payload.fields["label"] == "elf"
     assert r.detected.confidence > 0.9
 
 
@@ -123,26 +123,31 @@ def test_real_magika_declines_random_bytes_and_says_what_it_guessed(tmp_path):
     rather than a stub: random bytes deliver `unknown`, and the model underneath had a
     guess it was not confident enough to stand behind."""
     r = _run(tmp_path, bytes(range(256)) * 8)
-    f = r.payload
-    assert f.label == "unknown", f
-    assert f.overwrite_reason != "none", f
-    assert f.model_label != "unknown", (
+    f = r.payload.fields
+    assert f["label"] == "unknown", f
+    assert f["overwrite_reason"] != "none", f
+    assert f["model_label"] != "unknown", (
         "the raw model prediction was lost — the overwrite is unreportable without it")
     assert r.detected.confidence < 0.9
 
 
 # --- the contract itself ----------------------------------------------------
 
-def test_the_payload_is_a_registered_type_not_a_bag(tmp_path):
-    """A NAMED TYPE IS ONLY WORTH ANYTHING IF THE FAR SIDE CAN PARSE IT. Registration is
-    what makes `parse_node()` accept the discriminator; without it the type exists but
-    every consumer round-tripping an envelope rejects the payload it was sent."""
+def test_the_payload_seals_generically_but_names_its_schema(tmp_path):
+    """SEALED AS `Record`, VALIDATED AS A TYPED NODE — and the schema tag survives.
+
+    An engine runs in a container; the dispatcher validating its envelope does not
+    import it, so a `register_node_type` tag is unknown host-side and the whole result
+    is REJECTED (observed live: "Input tag 'content_type_identification' ... does not
+    match any of the expected tags"). So the wire form is the generic floor every host
+    can parse, and `schema` records what shape the fields have."""
     from blastbox.contract import parse_node
 
     r = _run(tmp_path, b"x", identify_fn=_fake())
-    round_tripped = parse_node(r.payload.model_dump(by_alias=True))
-    assert round_tripped.type == "content_type_identification"
-    assert round_tripped.label == "elf" and round_tripped.score == 0.99
+    node = parse_node(r.payload.model_dump(by_alias=True))
+    assert node.type == "record"
+    assert node.fields["schema"] == "content_type_identification"
+    assert node.fields["label"] == "elf" and node.fields["score"] == 0.99
 
 
 def test_an_out_of_range_score_is_refused_not_stored():

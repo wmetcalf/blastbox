@@ -55,7 +55,7 @@ from typing import Literal
 
 from pydantic import Field
 
-from blastbox.contract import Detection, Warning, register_node_type
+from blastbox.contract import Detection, Record, Warning, register_node_type
 from blastbox.contract.nodes import _Node
 from blastbox.limits import Limits
 from blastbox.worker.engine import DetonationResult
@@ -301,6 +301,25 @@ def _detected(hits: list[str]) -> Detection:
     )
 
 
+
+def _sealed(node) -> Record:
+    """Validate strictly, then seal GENERICALLY — and this reverses a choice made
+    earlier today for a reason worth recording.
+
+    The typed node (`SignatureScan`) is the right contract: it bounds the fields, forbids
+    extras, and turns a rename into a parse error. But `register_node_type` registers
+    into the REGISTRY OF THE PROCESS THAT IMPORTS THE ENGINE — and an engine runs in a
+    container while the dispatcher validating its envelope does not import it. Observed
+    live: the host rejected a perfectly good result with
+    `Input tag 'signature_scan' ... does not match any of the expected tags`.
+
+    So the model still does the checking (constructed and validated above), and what
+    goes on the wire is `Record` — the generic floor any host can validate. The field
+    names and bounds are still enforced; they are enforced where they can be.
+    """
+    return Record(fields={"schema": node.type, **node.model_dump(exclude={"type"})})
+
+
 class ClamAVEngine:
     """Scan one sample against a resident ClamAV database."""
 
@@ -339,8 +358,8 @@ class ClamAVEngine:
             # could not look must never seal a result that reads as "looked, found
             # nothing" — that is a false negative manufactured by an outage.
             return DetonationResult(
-                payload=SignatureScanUnavailable(error=str(exc)[:1000],
-                                                 db_version=version or "unknown"),
+                payload=_sealed(SignatureScanUnavailable(error=str(exc)[:1000],
+                                                         db_version=version or "unknown")),
                 artifacts=[],
                 detected=_detected([]),
                 warnings=[Warning(code="clamd_unavailable", message=str(exc)[:2000])],
@@ -364,7 +383,7 @@ class ClamAVEngine:
                 message="clamd answered the scan but not VERSION, so the signature "
                         "database date behind this verdict is unknown"))
         return DetonationResult(
-            payload=SignatureScan(
+            payload=_sealed(SignatureScan(
                 infected=bool(hits),
                 signatures=hits[:64],
                 signature_count=len(hits),
@@ -374,7 +393,7 @@ class ClamAVEngine:
                 # matched" from "this is the first of an unknown number".
                 first_hit_only=not all_match,
                 bytes_scanned=data_len,
-            ),
+            )),
             artifacts=[],
             detected=_detected(hits),
             warnings=warnings,
