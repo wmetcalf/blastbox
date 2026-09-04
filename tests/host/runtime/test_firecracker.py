@@ -1397,6 +1397,20 @@ class TestFirecrackerLiveBoot:
 
     NOT run in CI or on a dev host. Run on a FC-capable host (e.g. toolz2) with
     BLASTBOX_FC_BIN / BLASTBOX_FC_KERNEL / BLASTBOX_FC_ROOTFS set.
+
+    Against a FLEET rootfs rather than the probe one built by
+    `deploy/firecracker/build-rootfs.sh`, also set:
+
+      BLASTBOX_FC_TEST_ENGINE   the engine that rootfs carries (redtusk, ...)
+      BLASTBOX_FC_TEST_INPUT    a document that engine can actually parse
+      BLASTBOX_FC_MEM_MIB       what the deployment gives the guest
+
+    That last one is not optional and cost three runs to find: at the default
+    the redtusk JVM cannot commit its heap inside the guest and the job comes
+    back `engine_error` with
+    `os::commit_memory(...) failed; error='Not enough space'` -- which reads
+    like a broken worker rather than a guest that is simply too small. The FC
+    overlay sets 2048.
     """
 
     @pytest.fixture
@@ -1447,6 +1461,7 @@ class TestFirecrackerLiveBoot:
         rdump and validates through the trust gate — input-sha round-trips and the
         artifact hash is recomputed from disk (never trusted from the guest)."""
         import hashlib
+        import os
         import time
 
         from blastbox.host.trust import validate_worker_output
@@ -1461,7 +1476,22 @@ class TestFirecrackerLiveBoot:
             time.sleep(0.5)
         assert rt.is_ready(slot), "guest never signalled READY"
 
-        payload = b"live-fc-job-roundtrip-" + b"Z" * 2048
+        # The rootfs decides the engine, and every fleet rootfs carries a REAL
+        # engine (redtusk, titanarum, clippyshot) rather than the probe that
+        # `deploy/firecracker/build-rootfs.sh` bakes. Hardcoding "probe" made
+        # this fail on exactly the hosts it exists to be run on, with
+        # `engine mismatch: expected 'probe', worker reported 'redtusk'` --
+        # a confusing trust error instead of a verdict. Measured on toolz3
+        # against /var/lib/redtusk-fc.
+        engine = os.environ.get("BLASTBOX_FC_TEST_ENGINE", "probe")
+
+        # A real engine needs a real document; the probe takes any bytes.
+        supplied = os.environ.get("BLASTBOX_FC_TEST_INPUT", "").strip()
+        payload = (
+            Path(supplied).read_bytes()
+            if supplied
+            else b"live-fc-job-roundtrip-" + b"Z" * 2048
+        )
         sha = hashlib.sha256(payload).hexdigest()
         src = Path(fc_scratch) / "input.bin"
         src.write_bytes(payload)
@@ -1476,12 +1506,20 @@ class TestFirecrackerLiveBoot:
             envelope = validate_worker_output(
                 output_dir=slot.output_dir,
                 input_sha256=sha,
-                engine="probe",
+                engine=engine,
                 limits=Limits.from_env(),
             )
             assert envelope.status == "ok"
             assert envelope.input_sha256 == sha
-            assert len(envelope.artifacts) == 1
+            # The subject here is the trust gate -- the input sha round-tripping
+            # and the artifact hash being recomputed from the disk rather than
+            # taken from the guest. How MANY artifacts an engine writes is the
+            # engine's business: measured on toolz3, redtusk returns `ok` with
+            # ZERO artifacts for a plain text file (it writes rmeta to the
+            # output disk, not an extracted artifact), so only the probe's
+            # exact count is pinned.
+            if engine == "probe":
+                assert len(envelope.artifacts) == 1
         finally:
             rt.reap(slot)
 
