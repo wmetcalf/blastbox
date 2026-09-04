@@ -1544,11 +1544,12 @@ def _release_digests(version: str) -> list[str] | None:
 
 
 def _release_requires(version: str) -> list[str]:
-    """``version``'s BASE runtime requirements, as PyPI records them.
+    """``version``'s runtime requirements, as PyPI records them.
 
-    Extras are dropped: they are conditional on what the consumer installs, and
-    a check that cannot know which would report `boto3` missing from a lock for
-    a repo that never asked for `blastbox[s3]`.
+    ALL of them, extras included. Which apply is decided per lock, from the
+    extras that lock's own blastbox entry asks for -- dropping them here meant
+    a new dependency of `blastbox[host]` was never checked at all, and the bump
+    reported success while the next `--require-hashes` install failed.
     """
     import json  # noqa: PLC0415
     import urllib.request  # noqa: PLC0415
@@ -1556,11 +1557,7 @@ def _release_requires(version: str) -> list[str]:
     url = f"https://pypi.org/pypi/blastbox/{version}/json"
     with urllib.request.urlopen(url, timeout=30) as fh:
         data = json.load(fh)
-    return [
-        req
-        for req in (data.get("info", {}).get("requires_dist") or [])
-        if "extra ==" not in req
-    ]
+    return list(data.get("info", {}).get("requires_dist") or [])
 
 
 def _pins_set(root: Path, version: str, *, allow_unreleased: bool) -> int:

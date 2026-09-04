@@ -1512,3 +1512,156 @@ def test_distribution_names_compare_normalised(tmp_path):
     lock = tmp_path / "requirements.lock"
     lock.write_text("Ruamel-YAML==0.18.6 \\\n    --hash=sha256:" + "a" * 64 + "\n")
     assert missing_from_locks(tmp_path, ["ruamel.yaml>=0.18"]) == {}
+
+
+_R = [
+    "pydantic>=2.6.0",
+    "packaging>=23.0",
+    'fastapi>=0.115.0; extra == "host"',
+    'uvicorn>=0.27; extra == "host"',
+    'structlog>=24.1; extra == "host"',
+    'boto3>=1.34; extra == "s3"',
+    'pytest>=8; extra == "dev"',
+    'ruff>=0.6; extra == "dev"',
+    'mypy>=1.11; extra == "dev"',
+    # dev pulls the host extra in, so `blastbox` is one of its requirements --
+    # and every lock pins blastbox.
+    'blastbox[host]; extra == "dev"',
+    # Shared with the runtime closure: starlette brings httpx in too.
+    'httpx>=0.27; extra == "dev"',
+    # An extra whose only other dependency is absent from a runtime lock.
+    'blastbox[host]; extra == "docs"',
+    'sphinx>=7; extra == "docs"',
+    'colorama>=0.4; sys_platform == "win32"',
+]
+
+
+def _lock(path, *entries):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(f"{e} \\\n    --hash=sha256:{'a' * 64}\n" for e in entries))
+    return path
+
+
+def test_a_hashed_lock_that_does_not_pin_blastbox_is_not_ours_to_judge(tmp_path):
+    """A repo may hold an unrelated hashed lock -- tooling, docs.
+
+    Reporting it as missing every blastbox dependency would refuse a bump that
+    is perfectly fine.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _lock(tmp_path / "tooling.lock", "ruff==0.6.9")
+    assert missing_from_locks(tmp_path, _R) == {}
+
+
+def test_an_extra_the_lock_was_compiled_for_is_checked(tmp_path):
+    """uv records resolved names only, so the entry cannot say which extras.
+
+    A lock carrying fastapi and uvicorn was compiled for the host extra whether
+    or not it says so -- and a dependency added to that extra must be reported.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    lock = _lock(
+        tmp_path / "req.lock",
+        "blastbox==0.1.39",
+        "pydantic==2.13.5",
+        "packaging==26.3",
+        "fastapi==0.115.0",
+        "uvicorn==0.30.0",
+    )
+    gaps = missing_from_locks(tmp_path, _R, environment={"sys_platform": "linux"})
+    assert gaps == {str(lock): ["structlog"]}, gaps
+
+
+def test_an_extra_the_lock_never_asked_for_is_not_reported(tmp_path):
+    """`boto3` missing from a repo that never wanted s3 is not a gap.
+
+    Nor are pytest and ruff: `dev` depends on `blastbox[host]`, so the lock's
+    own blastbox entry once inferred the whole dev extra and reported a
+    runtime lock as missing a test framework.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _lock(
+        tmp_path / "req.lock",
+        "blastbox==0.1.39",
+        "pydantic==2.13.5",
+        "packaging==26.3",
+    )
+    assert missing_from_locks(tmp_path, _R, environment={"sys_platform": "linux"}) == {}
+
+
+def test_a_marker_that_does_not_apply_is_not_a_gap(tmp_path):
+    """A Linux lock correctly omits a win32-only dependency."""
+    from blastbox.host.pins import missing_from_locks
+
+    _lock(
+        tmp_path / "req.lock", "blastbox==0.1.39", "pydantic==2.13.5", "packaging==26.3"
+    )
+    assert missing_from_locks(tmp_path, _R, environment={"sys_platform": "linux"}) == {}
+    gaps = missing_from_locks(tmp_path, _R, environment={"sys_platform": "win32"})
+    assert list(gaps.values()) == [["colorama"]], gaps
+
+
+def test_a_pinned_version_must_also_satisfy_the_requirement(tmp_path):
+    """Presence is not enough: pip cannot resolve `packaging==22` for `>=23`."""
+    from blastbox.host.pins import missing_from_locks
+
+    lock = _lock(
+        tmp_path / "req.lock", "blastbox==0.1.39", "pydantic==2.13.5", "packaging==22.0"
+    )
+    gaps = missing_from_locks(tmp_path, _R, environment={"sys_platform": "linux"})
+    assert gaps == {str(lock): ["packaging (pinned 22.0, needs >=23.0)"]}, gaps
+
+
+def test_a_split_lock_is_complete_across_its_includes(tmp_path):
+    """pip installs `-r base.lock` as ONE requirement set.
+
+    Checking each physical file alone reports pins that are correctly hashed in
+    the file next door, so a valid split lock could never be bumped.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _lock(tmp_path / "base.lock", "pydantic==2.13.5", "packaging==26.3")
+    top = tmp_path / "req.lock"
+    top.write_text(f"-r base.lock\nblastbox==0.1.39 \\\n    --hash=sha256:{'a' * 64}\n")
+    assert missing_from_locks(tmp_path, _R, environment={"sys_platform": "linux"}) == {}
+
+
+def test_a_single_shared_dependency_does_not_infer_a_whole_extra(tmp_path):
+    """Measured on RedTusk's real lock, which is why this is a majority.
+
+    `httpx` is in a runtime closure for its own reasons, and the `dev` extra
+    happens to want it too. Inferring dev from that reported pytest, mypy and
+    ruff missing from a RUNTIME lock -- noise that teaches people to ignore the
+    check.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _lock(
+        tmp_path / "req.lock",
+        "blastbox==0.1.39",
+        "pydantic==2.13.5",
+        "packaging==26.3",
+        "httpx==0.27.2",
+    )
+    assert missing_from_locks(tmp_path, _R, environment={"sys_platform": "linux"}) == {}
+
+
+def test_an_extras_own_blastbox_requirement_does_not_infer_it(tmp_path):
+    """`dev` depends on `blastbox[host]`, and every lock pins blastbox.
+
+    Counting that as evidence the extra was requested infers it from the lock's
+    own entry -- which is what happened on the real lock, reporting a runtime
+    lock as missing sphinx and a test framework.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _lock(
+        tmp_path / "req.lock",
+        "blastbox==0.1.39",
+        "pydantic==2.13.5",
+        "packaging==26.3",
+    )
+    assert missing_from_locks(tmp_path, _R, environment={"sys_platform": "linux"}) == {}

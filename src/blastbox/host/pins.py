@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
+from typing import Any
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -695,47 +696,6 @@ def _eol_of(line: str) -> str:
     return "\n" if line.endswith("\n") else ""
 
 
-def missing_from_locks(root: Path, requires: Sequence[str]) -> dict[str, list[str]]:
-    """Runtime dependencies of a release that hash-pinned locks do not carry.
-
-    `pip install --require-hashes` refuses the WHOLE file when any dependency
-    it must resolve is not pinned there:
-
-        ERROR: In --require-hashes mode, all requirements must have their
-        versions pinned with ==. These do not: pydantic>=2.6.0 (from blastbox)
-
-    So a release that gains a dependency turns every consumer's hash-pinned
-    lock into a lock that cannot install -- and `pins --set` rewrites only the
-    blastbox line, which makes the bump look successful right up until the
-    image build fails. Measured: blastbox 0.1.39 added `packaging`, which no
-    consumer lock carried.
-
-    Only the BASE requirements are checked. Extras are conditional on what the
-    consumer installs, and this cannot know which; reporting `boto3` missing
-    from a lock for a repo that never asked for `blastbox[s3]` would be noise
-    that teaches people to ignore the check.
-    """
-    out: dict[str, list[str]] = {}
-    wanted = [_dist_name(r) for r in requires]
-    wanted = [name for name in wanted if name]
-    for path in _walk(root):
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        if "--hash=" not in text:
-            continue  # not hash-pinned; pip resolves the rest itself
-        have = {
-            _dist_name(line)
-            for line in text.splitlines()
-            if "==" in line and not line.lstrip().startswith("#")
-        }
-        gaps = [name for name in wanted if name not in have]
-        if gaps:
-            out[str(path)] = gaps
-    return out
-
-
 def _dist_name(requirement: str) -> str:
     """The normalised distribution name in a requirement line, or "".
 
@@ -748,6 +708,218 @@ def _dist_name(requirement: str) -> str:
     if not match:
         return ""
     return re.sub(r"[-_.]+", "-", match.group(1)).lower()
+
+
+def missing_from_locks(
+    root: Path,
+    requires: Sequence[str],
+    *,
+    environment: dict[str, str] | None = None,
+) -> dict[str, list[str]]:
+    """Requirements of a release that a hash-pinned blastbox lock cannot satisfy.
+
+    `pip install --require-hashes` refuses the WHOLE file when a dependency it
+    must resolve is not pinned there:
+
+        ERROR: In --require-hashes mode, all requirements must have their
+        versions pinned with ==. These do not: pydantic>=2.6.0 (from blastbox)
+
+    So a release that gains a dependency turns every consumer's hash-pinned
+    lock into a lock that cannot install -- and `pins --set` rewrites only the
+    blastbox line, which makes the bump look successful right up until the
+    image build fails. Measured: blastbox 0.1.39 added `packaging`, which no
+    consumer lock carried.
+
+    What counts as applicable is decided PER LOCK, because guessing either way
+    is wrong in practice:
+
+    * Only files that pin blastbox are examined. A repo may hold an unrelated
+      hashed lock -- tooling, docs -- and reporting it as missing every
+      blastbox dependency would refuse a bump that is perfectly fine.
+    * EXTRAS are worked out per lock, from the entry AND from what the lock
+      already carries. `blastbox[host]==0.1.39` says so outright, but a
+      uv-compiled lock records only resolved names -- `uv pip compile --extra
+      host` writes a plain `blastbox==0.1.39` line -- so an extra also counts
+      as requested when something only IT brings in is already pinned. A lock
+      holding fastapi was compiled for the host extra whether or not it says
+      so; a lock with no boto3 was not compiled for s3 and is not missing it.
+    * MARKERS are evaluated for the environment the lock is for. A base
+      dependency guarded by `sys_platform == "win32"` is correctly absent from
+      a Linux lock.
+    * `-r other.lock` includes are followed. pip installs them as one
+      requirement set, so checking each physical file alone reports pins that
+      are present in the file next door.
+
+    Presence is not enough: a locked version must also SATISFY the specifier.
+    `packaging==22` against a release needing `packaging>=23` is pinned, hashed,
+    and still unresolvable.
+    """
+    out: dict[str, list[str]] = {}
+    parsed = [_requirement(r) for r in requires]
+    for path in _walk(root):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if "--hash=" not in text:
+            continue  # not hash-pinned; pip resolves the rest itself
+        pinned, extras = _effective_pins(path)
+        if "blastbox" not in pinned:
+            continue  # somebody else's lock; not ours to judge
+        extras |= _extras_in_play(parsed, pinned, environment)
+        gaps: list[str] = []
+        for req in parsed:
+            if req is None or not _applies(req, extras, environment):
+                continue
+            name = _dist_name(req.name)
+            if name not in pinned:
+                gaps.append(name)
+            elif not _satisfies(req, pinned[name]):
+                gaps.append(f"{name} (pinned {pinned[name]}, needs {req.specifier})")
+        if gaps:
+            out[str(path)] = gaps
+    return out
+
+
+def _extras_in_play(
+    parsed: Sequence[Any], pinned: dict[str, str], environment: dict[str, str] | None
+) -> set[str]:
+    """Extras this lock was compiled for, inferred from what it already holds.
+
+    A uv-compiled lock records resolved names only: `uv pip compile --extra
+    host` writes a plain `blastbox==0.1.39` line, so the extras cannot be read
+    off the entry. But a lock that carries fastapi was compiled for the host
+    extra whether or not it says so, and one with no boto3 was not compiled for
+    s3 -- which is the distinction that keeps this from being noise.
+
+    Only dependencies UNIQUE to an extra count, and a MAJORITY of them must be
+    present. A single shared package says nothing: on RedTusk's real lock the
+    `dev` extra's only "present" dependency was `blastbox` itself -- dev
+    depends on `blastbox[host]` -- which inferred dev and reported pytest,
+    mypy and ruff missing from a RUNTIME lock. Noise like that is how a check
+    stops being read.
+
+    A majority still catches what this exists for: a release that ADDS a
+    dependency to an extra leaves all the others pinned, so the extra is
+    recognised and the new one reported.
+
+    The limit worth knowing: an extra with exactly ONE dependency is invisible
+    once that dependency is missing -- a lock without boto3 looks the same
+    whether it dropped `blastbox[s3]` or never asked for it. A lock that spells
+    its extras (`blastbox[s3]==...`) is not subject to that, since the entry
+    says so outright.
+    """
+    base: set[str] = set()
+    by_extra: dict[str, set[str]] = {}
+    for req in parsed:
+        if req is None:
+            continue
+        marker = str(getattr(req, "marker", "") or "")
+        name = _dist_name(req.name)
+        if "extra ==" not in marker:
+            base.add(name)
+            continue
+        for extra in re.findall(r"extra\s*==\s*[\"\']([^\"\']+)", marker):
+            by_extra.setdefault(extra.lower(), set()).add(name)
+    found = set()
+    for extra, names in by_extra.items():
+        # `blastbox` itself is excluded: an extra that depends on
+        # `blastbox[host]` would otherwise be inferred by the lock's own entry.
+        unique = names - base - {"blastbox"}
+        if not unique:
+            continue
+        if len(unique & set(pinned)) * 2 >= len(unique):
+            found.add(extra)
+    return found
+
+
+def _effective_pins(
+    path: Path, _seen: set[Path] | None = None
+) -> tuple[dict[str, str], set[str]]:
+    """``({name: version}, extras)`` for a lock and everything it includes.
+
+    pip installs `-r other.lock` as part of ONE requirement set, so a split
+    lock is complete even though neither file is on its own.
+    """
+    seen = _seen if _seen is not None else set()
+    resolved = path.resolve()
+    if resolved in seen:
+        return {}, set()  # a cycle; whatever it holds has been read already
+    seen.add(resolved)
+    pinned: dict[str, str] = {}
+    extras: set[str] = set()
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return pinned, extras
+    for raw in text.splitlines():
+        line = _strip_comment(raw).strip()
+        if not line:
+            continue
+        include = re.match(r"^(?:-r|--requirement)[=\s]+(\S+)", line)
+        if include:
+            sub, sub_extras = _effective_pins(path.parent / include.group(1), seen)
+            pinned.update(sub)
+            extras |= sub_extras
+            continue
+        match = re.match(
+            r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(\[[^\]]*\])?\s*==\s*([^\s\\;]+)", line
+        )
+        if not match:
+            continue
+        name = _dist_name(match.group(1))
+        pinned[name] = match.group(3)
+        if name == "blastbox" and match.group(2):
+            extras |= {
+                e.strip().lower() for e in match.group(2)[1:-1].split(",") if e.strip()
+            }
+    return pinned, extras
+
+
+def _requirement(text: str):
+    """A parsed requirement, or None when it cannot be read.
+
+    Unparseable metadata must not turn into a refusal: this decides whether to
+    BLOCK a version bump, and a requirement nobody can parse is not evidence
+    that a lock is incomplete.
+    """
+    from packaging.requirements import InvalidRequirement, Requirement  # noqa: PLC0415
+
+    try:
+        return Requirement(text)
+    except InvalidRequirement:
+        return None
+
+
+def _applies(req, extras: set[str], environment: dict[str, str] | None) -> bool:
+    """Whether ``req`` is one this lock actually has to carry."""
+    if req.marker is None:
+        return True
+    env = dict(environment or {})
+    # `extra` is only defined when evaluating for an extra, so try each the lock
+    # asked for -- plus the empty one, which is how a base requirement guarded
+    # by an ordinary marker gets evaluated.
+    for extra in sorted(extras) + [""]:
+        try:
+            if req.marker.evaluate({**env, "extra": extra}):
+                return True
+        except Exception:  # noqa: BLE001 -- an unevaluable marker is not a gap
+            return False
+    return False
+
+
+def _satisfies(req, version: str) -> bool:
+    """Whether the locked ``version`` satisfies ``req``.
+
+    Presence alone is not enough: `packaging==22` against a release needing
+    `packaging>=23` is pinned, hashed, and still unresolvable by pip.
+    """
+    if not req.specifier:
+        return True
+    try:
+        return req.specifier.contains(version, prereleases=True)
+    except Exception:  # noqa: BLE001 -- an unreadable version is not a gap
+        return True
 
 
 def set_version(
