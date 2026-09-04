@@ -1,4 +1,52 @@
 #!/usr/bin/env bash
+#
+# ============================================================================
+# THE REBUILD/EXPORT HALF OF THIS SCRIPT IS SUPERSEDED -- AND NOW REFUSES TO
+# RUN UNLESS YOU ASK FOR IT BY NAME.
+#
+# Every adopter engine declares its image chain in `blastbox-images.toml` and
+# builds it with:
+#
+#     blastbox build-images <repo> --tag <tag>        # --dry-run to inspect
+#
+# That replaces steps 3-4 (rootfs build + staged swap). It stamps and VERIFIES
+# every image before exporting, checks the rootfs contains what the engine
+# declares it needs, refuses to publish a sandbox rootfs carrying setuid
+# binaries, takes a per-destination lock so a concurrent run cannot corrupt the
+# swap, and KEEPS THE SIZE ALREADY IN PLACE unless explicitly overridden.
+#
+# What `build-images` does NOT do, and why this file still exists:
+#
+#   * It does not check out a blastbox ref or force-install a dev wheel over
+#     the engine's shipped blastbox (steps 1-2). For an UNRELEASED hotfix --
+#     a fix branch not yet on PyPI -- that derivation is still the way in, so
+#     it is kept behind REDEPLOY_MODE=legacy-rebuild. For a released blastbox,
+#     bump the engine's pin and use `build-images`.
+#   * It does not swap the Firecracker BINARY. The image plan covers images and
+#     rootfs artifacts only, so FC_BIN_SRC is handled here, in BOTH modes.
+#   * It does not touch compose. Steps 5-6 (.env image vars, recreate, smoke)
+#     and the rollback block are not superseded.
+#
+# MODES
+#
+#   REDEPLOY_MODE=recreate        (default) steps 5-6 + the optional FC binary
+#                                 swap. Assumes the images and rootfs are
+#                                 already published by `blastbox build-images`.
+#   REDEPLOY_MODE=legacy-rebuild  the original steps 1-6. Explicit opt-in.
+#   REDEPLOY_CHECK_ONLY=1         validate mode + presets + guards, print the
+#                                 plan, change nothing.
+#
+# The presets in this file have DRIFTED from what is deployed:
+#
+#     redtusk    ROOTFS_MIB=1024   live: 1536 (toolz2), 3072 (toolz3)
+#     clippyshot ROOTFS_MIB=7000   live: 6144 (both hosts)
+#
+# Running the redtusk preset as written would SHRINK that rootfs by 512 MiB on
+# toolz2 and 2 GiB on toolz3. A comment does not stop that, so legacy-rebuild
+# now measures the live artifact and refuses to shrink it unless the operator
+# sets ALLOW_ROOTFS_SHRINK=1.
+# ============================================================================
+#
 # Redeploy an adopter engine's blastbox.host stack onto a patched blastbox,
 # rebuilding BOTH warm-snapshot worker rootfs (Firecracker + gVisor) so a
 # blastbox fix (e.g. the warm-tier restore clock-jump) actually reaches the
@@ -76,6 +124,44 @@ log(){ printf '\033[1;36m[redeploy-warm]\033[0m %s\n' "$*"; }
 
 log "engine=$ENGINE ref=$BLASTBOX_REF -> $WARM_IMAGE / $WARM_COLD_IMAGE"
 
+MODE="${REDEPLOY_MODE:-recreate}"
+case "$MODE" in
+  recreate|legacy-rebuild) ;;
+  *) echo "unknown REDEPLOY_MODE=$MODE (recreate|legacy-rebuild)" >&2; exit 2 ;;
+esac
+
+# The rebuild half is opt-in, and the opt-in still does not license a shrink.
+# `build-images` preserves the size already in place; these presets do not, and
+# the drift above is real, so measure the artifact rather than trusting a
+# comment nobody reads at 3am.
+if [ "$MODE" = legacy-rebuild ] && [ -f "$FC_DIR/rootfs.ext4" ]; then
+  live_mib=$(( $(stat -c %s "$FC_DIR/rootfs.ext4") / 1048576 ))
+  if [ "$ROOTFS_MIB" -lt "$live_mib" ]; then
+    if [ "${ALLOW_ROOTFS_SHRINK:-0}" = 1 ]; then
+      log "WARNING: rebuilding $FC_DIR/rootfs.ext4 at ${ROOTFS_MIB} MiB over a live ${live_mib} MiB image (ALLOW_ROOTFS_SHRINK=1)"
+    else
+      echo "refusing to rebuild $FC_DIR/rootfs.ext4 at ${ROOTFS_MIB} MiB: the live" >&2
+      echo "image is ${live_mib} MiB, and this preset would shrink it by $(( live_mib - ROOTFS_MIB )) MiB." >&2
+      echo "Use \`blastbox build-images\`, which keeps the existing size, or set" >&2
+      echo "ROOTFS_MIB=$live_mib, or ALLOW_ROOTFS_SHRINK=1 if the shrink is intended." >&2
+      exit 2
+    fi
+  fi
+fi
+
+if [ "$MODE" = legacy-rebuild ]; then
+  log "mode=legacy-rebuild: steps 1-6 (superseded rebuild half is ENABLED)"
+else
+  log "mode=recreate: steps 5-6 + optional FC binary swap; rootfs/images must"
+  log "  already be published by \`blastbox build-images <repo> --tag $WARM_TAG\`"
+fi
+
+if [ "${REDEPLOY_CHECK_ONLY:-0}" = 1 ]; then
+  log "check-only: nothing was changed"
+  exit 0
+fi
+
+if [ "$MODE" = legacy-rebuild ]; then
 # --- 1. blastbox wheel from BLASTBOX_REF --------------------------------------
 log "checkout $BLASTBOX_REF + build wheel (via $BASE_IMAGE pip, no-cache so a PyPI wheel isn't served)"
 git -C "$REPO" fetch --quiet origin "$BLASTBOX_REF" && git -C "$REPO" checkout --quiet "$BLASTBOX_REF"
@@ -119,6 +205,11 @@ docker export "$cid" | sudo tar -x -C "$GVISOR_DIR/rootfs.${WARM_TAG}"; docker r
 log "stage rootfs (backups -> *.$SUF)"
 mv "$FC_DIR/rootfs.ext4" "$FC_DIR/rootfs.ext4.$SUF"; mv "$FC_DIR/rootfs.ext4.${WARM_TAG}" "$FC_DIR/rootfs.ext4"
 sudo mv "$GVISOR_DIR/rootfs" "$GVISOR_DIR/rootfs.$SUF"; sudo mv "$GVISOR_DIR/rootfs.${WARM_TAG}" "$GVISOR_DIR/rootfs"
+fi
+
+# --- 4b. optional Firecracker binary swap (BOTH modes) ------------------------
+# `build-images` publishes images and rootfs; the FC binary is not in the plan,
+# so this stays here and stays reachable without the rebuild half.
 if [ -n "$FC_BIN_SRC" ]; then
   log "swap firecracker binary <- $FC_BIN_SRC"
   cp -a "$FC_DIR/firecracker" "$FC_DIR/firecracker.$SUF"
@@ -129,7 +220,10 @@ fi
 # --- 5. .env image vars + recreate (NOT postgres) -----------------------------
 cd "$COMPOSE_DIR"
 cp .env ".env.$SUF"
-grep -vE "^(${IMAGE_ENV}|${WORKER_IMAGE_ENV})=" .env > .env.tmp
+# `grep -v` exits 1 when it selects NO lines -- an .env holding only the two
+# image vars is exactly that -- and under `set -e` the redeploy would abort
+# here, after the backup and before the rewrite. Only status 2 is an error.
+grep -vE "^(${IMAGE_ENV}|${WORKER_IMAGE_ENV})=" .env > .env.tmp || [ $? -eq 1 ]
 echo "${IMAGE_ENV}=${WARM_IMAGE}"        >> .env.tmp
 echo "${WORKER_IMAGE_ENV}=${WARM_COLD_IMAGE}" >> .env.tmp
 mv .env.tmp .env
@@ -145,13 +239,27 @@ if [ -n "$SMOKE_FILE" ] && [ -f "$SMOKE_FILE" ]; then
   log "smoke: $jid -> $st"
 fi
 
-rm -rf "$SRC" "$WHEELS"
+[ "$MODE" = legacy-rebuild ] && rm -rf "$SRC" "$WHEELS"
+if [ "$MODE" = legacy-rebuild ]; then
 cat <<ROLLBACK
 
-[redeploy-warm] DONE. ROLLBACK if needed:
+[redeploy-warm] DONE (legacy-rebuild). ROLLBACK if needed:
   cd $COMPOSE_DIR && cp .env.$SUF .env
   mv $FC_DIR/rootfs.ext4.$SUF $FC_DIR/rootfs.ext4
   sudo rm -rf $GVISOR_DIR/rootfs && sudo mv $GVISOR_DIR/rootfs.$SUF $GVISOR_DIR/rootfs
   [ -f $FC_DIR/firecracker.$SUF ] && mv $FC_DIR/firecracker.$SUF $FC_DIR/firecracker
   $COMPOSE_WRAPPER $COMPOSE_FILES up -d --force-recreate api dispatcher dispatcher-fc dispatcher-gvisor
 ROLLBACK
+else
+cat <<ROLLBACK
+
+[redeploy-warm] DONE (recreate). ROLLBACK if needed:
+  cd $COMPOSE_DIR && cp .env.$SUF .env
+  # rootfs published by \`blastbox build-images\` keeps the PREVIOUS artifact at
+  # <dest>.bak -- not the .bak-$WARM_TAG names the superseded in-script swap used:
+  mv $FC_DIR/rootfs.ext4.bak $FC_DIR/rootfs.ext4
+  sudo rm -rf $GVISOR_DIR/rootfs && sudo mv $GVISOR_DIR/rootfs.bak $GVISOR_DIR/rootfs
+  [ -f $FC_DIR/firecracker.$SUF ] && mv $FC_DIR/firecracker.$SUF $FC_DIR/firecracker
+  $COMPOSE_WRAPPER $COMPOSE_FILES up -d --force-recreate api dispatcher dispatcher-fc dispatcher-gvisor
+ROLLBACK
+fi
