@@ -874,10 +874,14 @@ def unresolved_destinations(plan: Plan, env: dict[str, str] | None = None) -> li
     Printing a warning and continuing invites running it anyway.
     """
     out: list[str] = []
+    scope = dict(os.environ) if env is None else env
     for rf in plan.rootfs:
-        dest = rf.resolved_dest(env)
-        if "$" in dest:
-            out.append(f"{rf.image} -> {dest}")
+        # Asked of the TEMPLATE. Searching the RESULT for a dollar cannot tell
+        # an unset placeholder from a directory whose name legitimately holds
+        # one, and this is the refusal the CLI reaches FIRST -- so fixing only
+        # `describe()` left the supported case still rejected by every run.
+        if unresolved_names(rf.dest, scope):
+            out.append(f"{rf.image} -> {rf.resolved_dest(env)}")
     return out
 
 
@@ -1054,11 +1058,11 @@ def describe(plan: Plan, tag: str, env: dict[str, str] | None = None) -> str:
         # destination whose expansion legitimately contains a dollar was marked
         # unresolved here while the real run considered it fine, so the dry run
         # disagreed with the thing it is supposed to preview.
-        unresolved = (
-            " [UNRESOLVED]"
-            if unresolved_names(rf.dest, env or dict(os.environ))
-            else ""
-        )
+        # `env`, not `env or os.environ`: an empty dict is a caller isolating
+        # expansion from the host, and falling back to the ambient environment
+        # let a variable the process happens to define mark a genuinely
+        # unresolved destination as fine.
+        unresolved = " [UNRESOLVED]" if unresolved_names(rf.dest, env) else ""
         lines.append(
             f"  export {rf.kind}{size} from {rf.image}:{tag} -> {dest}{need}{unresolved}"
         )

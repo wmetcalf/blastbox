@@ -10,6 +10,7 @@ from blastbox.host.stamp import (
     LABEL_BASE_DIGEST,
     LABEL_BASE_NAME,
     LABEL_BLASTBOX,
+    Stamp,
     LABEL_BUILDERS,
     LABEL_REVISION,
     UNKNOWN,
@@ -1107,3 +1108,90 @@ def test_the_builder_label_is_read_back(monkeypatch):
         )
 
     assert read("demo:t1", run).builders == f"JDK_BUILD_IMAGE={jdk}"
+
+
+def test_the_recorded_base_name_can_differ_from_the_one_built_against(tmp_path):
+    """A chain builds against private staging tags the run then removes.
+
+    Recording those leaves every child stamped with a reference deleted by the
+    very run that created it. The digest and ID still come from inspecting what
+    was actually built on -- only the NAME is the one a rebuild should use.
+    """
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "t@e.st"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "t"], check=True)
+    (tmp_path / "f").write_text("x")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "f"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "i"], check=True)
+
+    ident = "sha256:" + "a" * 64
+
+    def run(argv):
+        if "rev-parse" in argv:
+            return subprocess.CompletedProcess(argv, 0, "abc1234\n", "")
+        if "status" in argv:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.CompletedProcess(argv, 0, f"[]\t{ident}", "")
+
+    args = build_args(
+        blastbox_version="0.1.38",
+        repo=tmp_path,
+        base="demo-base:t1-blastbox-staging-99",
+        record_base_as="demo-base:t1",
+        runner=run,
+    )
+    assert f"{LABEL_BASE_NAME}=demo-base:t1" in args, args
+    assert not any("staging-99" in a for a in args if a.startswith(LABEL_BASE_NAME)), args
+    # The PIN is still what was actually built against.
+    assert "BASE_IMAGE=demo-base:t1-blastbox-staging-99" in args, args
+
+
+def test_base_state_can_be_asked_about_a_different_reference():
+    """During verification the recorded name is not published yet.
+
+    The same image is reachable under its staging alias, so the LOOKUP is
+    redirected while the record stays as it is.
+    """
+    looked_at = []
+
+    def run(argv):
+        looked_at.append(argv[4])
+        return subprocess.CompletedProcess(argv, 0, "sha256:" + "b" * 64 + "\n", "")
+
+    stamp = Stamp(
+        blastbox="0.1.38",
+        revision="b" * 40,
+        base_name="demo-base:t1",
+        base_digest="sha256:" + "b" * 64,
+        base_image_id="sha256:" + "b" * 64,
+    )
+    present, ident = stamp.base_state(run, "demo-base:t1-blastbox-staging-99")
+    assert present and ident == "sha256:" + "b" * 64
+    assert looked_at == ["demo-base:t1-blastbox-staging-99"], looked_at
+    assert stamp.base_name == "demo-base:t1", "the record was rewritten"
+
+
+def test_presence_and_identity_come_from_one_inspection():
+    """Asked separately, an absent base recreated in between reads as fine.
+
+    `resolvable()` returns True for the newly present image and `base_moved()`
+    then compares nothing, so verification accepts an image whose base is not
+    the one it records -- the concurrent-tag case these checks exist for.
+    """
+    calls = []
+    ids = iter(["sha256:" + "c" * 64, "sha256:" + "d" * 64])
+
+    def run(argv):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, next(ids) + "\n", "")
+
+    stamp = Stamp(
+        blastbox="0.1.38",
+        revision="b" * 40,
+        base_name="demo-base:t1",
+        base_digest="sha256:" + "c" * 64,
+        base_image_id="sha256:" + "c" * 64,
+    )
+    present, ident = stamp.base_state(run)
+    assert len(calls) == 1, "presence and identity took two inspections"
+    assert present and ident == "sha256:" + "c" * 64

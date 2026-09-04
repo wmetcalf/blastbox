@@ -30,7 +30,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 
@@ -353,7 +353,16 @@ def build_plan(
     # given that name too, so an internal base still resolves to the image from
     # this run rather than to a stale tag of the same name.
     staging = _staging_tag(tag)
-    for spec, base_ref in _images.resolve_chain(plan, staging):
+    # Two views of the same chain: what each image is BUILT against (the private
+    # staging tags of this run) and what its stamp should NAME (the tags this
+    # run will publish). They differ only for internal bases, and conflating
+    # them is what left every child stamped with a reference that gets removed
+    # at the end of the very run that created it.
+    # Paired by position, not keyed on the spec: `ImageSpec` carries a dict of
+    # build args and is not hashable.
+    published_chain = [ref for _spec, ref in _images.resolve_chain(plan, tag)]
+    for index, (spec, base_ref) in enumerate(_images.resolve_chain(plan, staging)):
+        record_as = published_chain[index] if spec.internal else None
         if pull and not spec.internal:
             # Present locally BEFORE it is inspected for a digest. Otherwise the
             # build pulls it itself and can get a different push of the same
@@ -370,6 +379,7 @@ def build_plan(
         pinned_args = _pin_builder_images(spec, env, run, log, pull=pull)
         try:
             flags = _stamp_flags(
+                record_base_as=record_as,
                 builders=pinned_args,
                 blastbox_version=blastbox_version,
                 repo=source,
@@ -419,7 +429,11 @@ def build_plan(
 
 
 def verify_built(
-    images: Sequence[str], *, run: Runner | None = None, log: Log = _log
+    images: Sequence[str],
+    *,
+    aliases: Mapping[str, str] | None = None,
+    run: Runner | None = None,
+    log: Log = _log,
 ) -> dict[str, str]:
     """Every image must record enough to be rebuilt, and record it TRUTHFULLY.
 
@@ -463,11 +477,17 @@ def verify_built(
         if not stamp.reproducible:
             bad.append(f"{image}: {_why_unusable(stamp)}")
             continue
+        # The stamp names the tag that WILL be published; during verification
+        # that tag does not exist yet and the same image is reachable under the
+        # staging alias this run built it as. Only the lookup is redirected --
+        # what the image records is unchanged, and after publication the
+        # recorded name resolves on its own.
+        alias = (aliases or {}).get(stamp.base_name or "")
         try:
             # Returns the base's CURRENT id when it differs from the record, and
             # "" when there is nothing to report. It RAISES when the question
             # cannot be asked, which is not the same as agreement.
-            moved = stamp.base_moved(runner)  # type: ignore[arg-type]
+            moved = stamp.base_moved(runner, alias)  # type: ignore[arg-type]
         except Exception as exc:  # noqa: BLE001
             bad.append(f"{image}: could not confirm its base did not move ({exc})")
             continue
@@ -476,14 +496,16 @@ def verify_built(
         # perfectly stamped image whose base has been deleted cannot be rebuilt
         # from what it records, which is the original failure this all exists for.
         try:
-            still_there = stamp.resolvable(runner)  # type: ignore[arg-type]
+            still_there = stamp.resolvable(runner, alias)  # type: ignore[arg-type]
         except Exception as exc:  # noqa: BLE001
             bad.append(f"{image}: could not confirm its base is still present ({exc})")
             continue
         if not still_there:
+            where = f" (looked for it as {alias})" if alias else ""
             bad.append(
                 f"{image}: the base it records ({stamp.base_name}) is no longer "
-                "present on this host — it cannot be rebuilt from what it names"
+                f"present on this host{where} — it cannot be rebuilt from what "
+                "it names"
             )
             continue
         if moved:
@@ -1429,8 +1451,13 @@ def run_plan(
     )
     log("\n>> verify: every image must record what it was built from")
     staging = _staging_tag(tag)
+    aliases = {
+        f"{spec.base}:{tag}": f"{spec.base}:{staging}"
+        for spec in plan.images
+        if spec.internal
+    }
     try:
-        verified = verify_built(staged_tags, run=run, log=log)
+        verified = verify_built(staged_tags, aliases=aliases, run=run, log=log)
     except BaseException:
         # Deliberately NOT cleaned up. The staging tags are the only names these
         # images have, and an operator diagnosing why verification refused one

@@ -685,11 +685,16 @@ class _FakeStamp:
         self.base_digest = ""
         self.revision = "b" * 40
         self.blastbox = "0.1.34"
+        # Which reference each check was redirected to, so a test can assert
+        # the alias was used rather than only that verification passed.
+        self.asked_as: list[str | None] = []
 
-    def base_moved(self, _runner=None):
+    def base_moved(self, _runner=None, ref=None):
+        self.asked_as.append(ref)
         return self._moved
 
-    def resolvable(self, _runner=None):
+    def resolvable(self, _runner=None, ref=None):
+        self.asked_as.append(ref)
         # A separate question from `base_moved`, which answers "" for a base
         # that is GONE rather than moved. Verification asks both.
         return self._resolvable
@@ -2996,3 +3001,72 @@ def test_a_verification_failure_leaves_the_images_inspectable(
         )
     assert not removed, removed
     assert any(mod._staging_tag("t1") in s for s in said), said
+
+
+def test_a_published_child_names_a_base_that_still_exists(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The chain builds under private tags that the run then removes.
+
+    Recording those left every child of an internal base stamped with a
+    reference deleted by the very run that created it -- `blastbox stamp --read`
+    reports STAMPED BUT UNBUILDABLE the moment the build succeeds. Measured on
+    toolz3 before this fix, on all three internal-base images.
+    """
+    import blastbox.host.imagerun as mod
+
+    _resolves_to(monkeypatch)
+    recorded: list[str | None] = []
+
+    def spy(**kw):
+        recorded.append(kw.get("record_base_as"))
+        return []
+
+    monkeypatch.setattr(mod, "_stamp_flags", spy)
+    build_plan(
+        _plan(tmp_path),
+        "t1",
+        blastbox_version="0.1.38",
+        run=FakeRunner(),
+        log=lambda _: None,
+    )
+    # demo-base is upstream (nothing to redirect); demo-worker is internal and
+    # must name the tag this run publishes, not the tag it was built against.
+    assert recorded == [None, "demo-base:t1"], recorded
+
+
+def test_verification_looks_the_recorded_base_up_under_its_staging_alias(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The recorded tag does not exist yet while verification runs.
+
+    Publishing it earlier is the bug this staging scheme exists to fix, so the
+    lookup is redirected instead -- the record itself is unchanged.
+    """
+    import blastbox.host.imagerun as mod
+
+    _resolves_to(monkeypatch)
+    monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
+    stamps: list = []
+
+    def make(image, runner=None):
+        s = _FakeStamp(name="demo-base:t1")
+        stamps.append(s)
+        return s
+
+    monkeypatch.setattr(mod, "_read_stamp", make)
+    monkeypatch.setattr(mod, "_verify_contents", lambda i, r=None: (True, ""))
+    monkeypatch.setenv("DEMO_DIR", str(tmp_path / "out"))
+    run_plan(
+        _plan(tmp_path),
+        "t1",
+        blastbox_version="0.1.34",
+        run=FakeRunner(),
+        log=lambda _: None,
+        extract=lambda image, dest: (dest / "init").write_text("x"),
+        extract_preserves_ownership=True,
+    )
+    staging = mod._staging_tag("t1")
+    asked = [ref for s in stamps for ref in s.asked_as]
+    assert asked, "nothing was asked about the base at all"
+    assert all(ref == f"demo-base:{staging}" for ref in asked), asked

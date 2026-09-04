@@ -1749,6 +1749,16 @@ def _stamp_cmd(args: argparse.Namespace) -> int:
     print(f"  base name     {got.base_name}")
     print(f"  base digest   {got.base_digest}")
     print(f"  base image id {got.base_image_id}")
+    # Provenance nobody can read is not provenance. A multi-stage image COPIES
+    # files out of its builders, so which builder it used belongs beside the
+    # base -- otherwise reading it means knowing the label name and running
+    # `docker inspect` by hand.
+    if got.builders:
+        for pair in got.builders.split(","):
+            arg, _, ref = pair.partition("=")
+            print(f"  builder       {arg} = {ref}")
+    else:
+        print("  builder       (none declared)")
     if agrees is None:
         print(f"  contents     {detail} (nothing to join)")
     elif not agrees:
