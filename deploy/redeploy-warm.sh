@@ -1,4 +1,32 @@
 #!/usr/bin/env bash
+#
+# ============================================================================
+# THE REBUILD/EXPORT HALF OF THIS SCRIPT IS SUPERSEDED.
+#
+# Every adopter engine now declares its image chain in `blastbox-images.toml`
+# and builds it with:
+#
+#     blastbox build-images <repo> --tag <tag>        # --dry-run to inspect
+#
+# Use that instead of steps 1-4 below. It stamps and VERIFIES every image
+# before exporting, checks the rootfs contains what the engine declares it
+# needs, refuses to publish a sandbox rootfs carrying setuid binaries, and
+# takes a per-destination lock so a concurrent run cannot corrupt the swap.
+#
+# The presets in this file have DRIFTED from what is deployed, which is the
+# concrete reason not to use them:
+#
+#     redtusk    ROOTFS_MIB=1024   live: 1536 (toolz2), 3072 (toolz3)
+#     clippyshot ROOTFS_MIB=7000   live: 6144 (both hosts)
+#
+# Running the redtusk preset as written would SHRINK that rootfs by 512 MiB on
+# toolz2 and 2 GiB on toolz3. `build-images` keeps the size already in place
+# unless an operator explicitly overrides it.
+#
+# The compose recreate + rollback steps (5-6) are NOT superseded and remain
+# useful; that is why this file still exists.
+# ============================================================================
+#
 # Redeploy an adopter engine's blastbox.host stack onto a patched blastbox,
 # rebuilding BOTH warm-snapshot worker rootfs (Firecracker + gVisor) so a
 # blastbox fix (e.g. the warm-tier restore clock-jump) actually reaches the
