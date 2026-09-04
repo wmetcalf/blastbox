@@ -203,8 +203,15 @@ def load_plan(root: Path | str) -> Plan:
     would otherwise fail deep inside a docker build with a message about
     something else entirely.
     """
+    # Either the directory holding the spec or the spec file itself. Appending
+    # the filename unconditionally turns a path to the file into
+    # `.../blastbox-images.toml/blastbox-images.toml`, whose NotADirectoryError
+    # names a path the caller never wrote and reads like a corrupt tree.
     root = Path(root)
-    path = root / SPEC_NAME
+    if root.name == SPEC_NAME or (root.is_file() and root.suffix == ".toml"):
+        path, root = root, root.parent
+    else:
+        path = root / SPEC_NAME
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:

@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from blastbox.host.images import (
+    SPEC_NAME,
     Plan,
     PlanError,
     build_command,
@@ -678,3 +679,18 @@ def test_an_explicit_source_repo_overrides_the_context(tmp_path: Path) -> None:
     )
     plan = load_plan(_plan(tmp_path, text))
     assert source_repo_path(plan, plan.images[0], {}) == Path("/srv/other")
+
+
+def test_load_plan_accepts_the_spec_file_itself(tmp_path: Path) -> None:
+    """Appending the filename unconditionally produced
+    `blastbox-images.toml/blastbox-images.toml` and a NotADirectoryError naming
+    a path the caller never wrote."""
+    spec = _plan(tmp_path, TITANARUM) / SPEC_NAME
+    plan = load_plan(spec)
+    assert plan.engine == "titanarum"
+    assert plan.root == spec.parent
+
+
+def test_load_plan_still_accepts_the_directory(tmp_path: Path) -> None:
+    d = _plan(tmp_path, TITANARUM)
+    assert load_plan(d).root == d
