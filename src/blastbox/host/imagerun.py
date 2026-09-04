@@ -269,11 +269,7 @@ def verify_built(images: Sequence[str], *, run: Runner | None = None, log: Log =
             bad.append(f"{image}: {exc}")
             continue
         if not stamp.reproducible:
-            bad.append(
-                f"{image}: stamp is incomplete — revision={stamp.revision!r} "
-                f"base={stamp.base_name!r} digest={stamp.base_digest or stamp.base_image_id!r} "
-                f"blastbox={stamp.blastbox!r}"
-            )
+            bad.append(f"{image}: {_why_unusable(stamp)}")
             continue
         try:
             # Returns the base's CURRENT id when it differs from the record, and
@@ -317,6 +313,34 @@ def _stage_dir(parent: Path, priv: list[str], run: Runner) -> Path:
             f"{(proc.stderr or '').strip()}"
         )
     return Path((proc.stdout or "").strip())
+
+
+def _why_unusable(stamp: object) -> str:
+    """Which condition of ``Stamp.reproducible`` this stamp fails.
+
+    "stamp is incomplete" plus a dump of four fields is not actionable. The
+    common case by far is a DIRTY tree, and the fix for that is `git commit`,
+    which the operator will not infer from a field list.
+    """
+    revision = str(getattr(stamp, "revision", "") or "")
+    base_name = str(getattr(stamp, "base_name", "") or "")
+    blastbox = str(getattr(stamp, "blastbox", "") or "")
+    pin = str(getattr(stamp, "base_digest", "") or getattr(stamp, "base_image_id", "") or "")
+    if revision.endswith("-dirty"):
+        return (
+            f"built from a DIRTY tree ({revision}). The uncommitted changes are "
+            "recorded nowhere, so that revision cannot rebuild this image — "
+            "commit them, or build from a clean checkout"
+        )
+    if revision in ("", "unknown"):
+        return "records no source revision; it was built without a stamp"
+    if not pin or pin == "unknown":
+        return f"records no base digest for {base_name or 'its base'}; a tag can move or be deleted"
+    if base_name in ("", "unknown"):
+        return "records a base digest but not which repository to pull it from"
+    if blastbox in ("", "unknown"):
+        return "records no blastbox version"
+    return f"stamp is unusable (revision={revision!r} base={base_name!r} blastbox={blastbox!r})"
 
 
 def _remove_tree(path: Path, priv: list[str], run: Runner) -> None:

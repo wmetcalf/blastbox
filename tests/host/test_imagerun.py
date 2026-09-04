@@ -525,11 +525,13 @@ def test_an_unstamped_image_does_not_pass_verification(monkeypatch) -> None:
     exported it. `Stamp.reproducible` is the predicate that answers this."""
     import blastbox.host.imagerun as mod
 
-    monkeypatch.setattr(mod, "_read_stamp", lambda i, r=None: _FakeStamp(reproducible=False))
+    unstamped = _FakeStamp(reproducible=False)
+    unstamped.revision = "unknown"  # the sentinel a bare image reads back
+    monkeypatch.setattr(mod, "_read_stamp", lambda i, r=None: unstamped)
     monkeypatch.setattr(mod, "_verify_contents", lambda i, r=None: (True, ""))
     with pytest.raises(BuildError) as e:
         verify_built(["demo:t1"], log=lambda _: None)
-    assert "stamp is incomplete" in str(e.value)
+    assert "no source revision" in str(e.value)
 
 
 def test_a_base_that_moved_is_caught_before_anything_is_exported(monkeypatch) -> None:
@@ -748,3 +750,26 @@ def test_a_successful_run_publishes_every_declared_artifact(
     published = [c[-1] for c in run.verb("mv")]
     assert str(d / "first.ext4") in published, run.calls
     assert str(d / "second.ext4") in published, run.calls
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expect"),
+    [
+        ("revision", "a" * 40 + "-dirty", "DIRTY"),
+        ("revision", "unknown", "no source revision"),
+        ("base_image_id", "", "no base digest"),
+        ("blastbox", "unknown", "no blastbox version"),
+    ],
+)
+def test_a_rejected_stamp_says_which_condition_it_failed(field, value, expect) -> None:
+    """"stamp is incomplete" plus four fields is not actionable.
+
+    Hit on the real chain: every image was refused for the same reason — a
+    dirty tree — and the message named none of it. The fix is `git commit`, and
+    an operator will not infer that from a field dump.
+    """
+    from blastbox.host.imagerun import _why_unusable
+
+    stamp = _FakeStamp()
+    setattr(stamp, field, value)
+    assert expect in _why_unusable(stamp)
