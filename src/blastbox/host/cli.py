@@ -1128,7 +1128,7 @@ def _build_images_cmd(args: argparse.Namespace) -> int:
     had drifted from the others in a way that silently produced a wrong image.
     """
     from blastbox.host.images import (  # noqa: PLC0415
-        PlanError, arg_problems, describe, load_plan, missing_dockerfiles,
+        PlanError, arg_problems, check_tag, describe, load_plan, missing_dockerfiles,
         unresolved_destinations,
     )
 
@@ -1137,6 +1137,7 @@ def _build_images_cmd(args: argparse.Namespace) -> int:
         print(f"not a directory: {root}")
         return 2
     try:
+        check_tag(args.tag)
         plan = load_plan(root)
     except PlanError as exc:
         print(f"cannot read the image plan: {exc}")

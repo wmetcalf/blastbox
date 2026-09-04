@@ -320,7 +320,7 @@ def test_the_default_form_works_without_an_explicit_env(tmp_path: Path, monkeypa
     assert plan.rootfs[0].resolved_dest() == "/srv/fc/titanarum-rootfs.ext4"
 
 
-@pytest.mark.parametrize("bad", ["worker-", "worker.", "worker..base", "-worker", "wo__rker"])
+@pytest.mark.parametrize("bad", ["worker-", "worker.", "worker..base", "-worker", "worker!x"])
 def test_invalid_repository_names_are_refused(tmp_path: Path, bad: str) -> None:
     """Separators sit BETWEEN alphanumerics; accepting these moves the failure
     to `docker tag`, which is the wrong place to find out."""
@@ -375,3 +375,91 @@ def test_an_unresolved_destination_is_reported_for_refusal(tmp_path: Path) -> No
     plan = load_plan(_plan(tmp_path, TITANARUM))
     assert unresolved_destinations(plan, {}) != []
     assert unresolved_destinations(plan, {"TITANARUM_FC_DIR": "/srv"}) == []
+
+
+@pytest.mark.parametrize("ok", ["my__worker", "a--b", "worker.base", "w0rker-1"])
+def test_docker_valid_names_are_accepted(tmp_path: Path, ok: str) -> None:
+    """`__` and repeated dashes ARE valid docker repository components.
+
+    Refusing names docker accepts is its own kind of wrong -- an earlier,
+    stricter pattern here did exactly that.
+    """
+    text = TITANARUM.replace('name = "titanarum-base"', f'name = "{ok}"', 1)
+    text = text.replace('base = "titanarum-base"', f'base = "{ok}"', 1)
+    assert load_plan(_plan(tmp_path, text)).images[0].name == ok
+
+
+def test_a_single_image_table_is_refused(tmp_path: Path) -> None:
+    """`[image]` instead of `[[image]]` declares one image and drops the rest."""
+    spec = '[engine]\nname = "e"\n[image]\nname = "a"\ndockerfile = "D"\nbase = "u:1"\n'
+    with pytest.raises(PlanError) as e:
+        load_plan(_plan(tmp_path, spec))
+    assert "ARRAY of tables" in str(e.value)
+
+
+def test_requires_as_a_bare_string_is_refused(tmp_path: Path) -> None:
+    """Iterating a string yields one requirement per CHARACTER."""
+    text = TITANARUM.replace('requires = ["/init"]', 'requires = "/init"')
+    with pytest.raises(PlanError) as e:
+        load_plan(_plan(tmp_path, text))
+    assert "must be an ARRAY" in str(e.value)
+
+
+def test_an_ext4_without_a_size_is_refused(tmp_path: Path) -> None:
+    text = TITANARUM.replace("size_mib = 3072\n", "")
+    with pytest.raises(PlanError) as e:
+        load_plan(_plan(tmp_path, text))
+    assert "declares no size_mib" in str(e.value)
+
+
+def test_two_rootfs_entries_may_not_share_a_destination(tmp_path: Path) -> None:
+    """The second would overwrite the first, decided by declaration order."""
+    extra = (
+        '\n[[rootfs]]\nkind = "ext4"\nimage = "titanarum-base"\n'
+        'dest = "$TITANARUM_FC_DIR/titanarum-rootfs.ext4"\nsize_mib = 512\n'
+    )
+    with pytest.raises(PlanError) as e:
+        load_plan(_plan(tmp_path, TITANARUM + extra))
+    assert "would overwrite" in str(e.value)
+
+
+def test_an_empty_variable_without_a_default_stays_unresolved(tmp_path: Path) -> None:
+    """`$X/file` with X empty gives `/file`, a plausible path at the root."""
+    from blastbox.host.images import unresolved_destinations
+
+    plan = load_plan(_plan(tmp_path, TITANARUM))
+    assert unresolved_destinations(plan, {"TITANARUM_FC_DIR": ""}) != []
+
+
+@pytest.mark.parametrize("bad", ["", "a:b", "a/b", ".lead", "-lead"])
+def test_an_unusable_tag_is_refused(bad: str) -> None:
+    from blastbox.host.images import check_tag
+
+    with pytest.raises(PlanError):
+        check_tag(bad)
+
+
+def test_a_misspelled_build_arg_is_reported(tmp_path: Path) -> None:
+    """A misspelled builder pin is discarded by docker, so the stage keeps its
+    mutable default while the plan reads as if it were pinned."""
+    from blastbox.host.images import arg_problems
+
+    d = tmp_path / "deploy" / "docker"
+    d.mkdir(parents=True)
+    (d / "Dockerfile.titanarum-base").write_text(
+        "ARG BASE_IMAGE\nARG JDK_BUILD_IMAGE\nFROM ${BASE_IMAGE}\n"
+    )
+    text = TITANARUM.replace("ZXING_BUILD_IMAGE", "ZXING_BUILD_IMGE")
+    plan = load_plan(_plan(tmp_path, text))
+    problems = [x for x in arg_problems(plan, {}) if "titanarum-base" in x]
+    assert any("ZXING_BUILD_IMGE" in x for x in problems), problems
+
+
+def test_the_dry_run_shows_an_external_context(tmp_path: Path) -> None:
+    text = TITANARUM.replace(
+        'dockerfile = "deploy/firecracker/Dockerfile.titanarum"',
+        'dockerfile = "deploy/firecracker/Dockerfile.titanarum"\ncontext = "$OTHER"',
+    )
+    plan = load_plan(_plan(tmp_path, text))
+    out = describe(plan, "t9", {"OTHER": "/srv/bb", "TITANARUM_FC_DIR": "/f"})
+    assert "[context /srv/bb]" in out

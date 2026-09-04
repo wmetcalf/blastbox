@@ -66,10 +66,16 @@ ROOTFS_KINDS = frozenset({"dir", "ext4"})
 
 # Lowercase only: docker repository names are, so `MyImage` would pass here and
 # fail at tag time instead.
-# Separators sit BETWEEN alphanumerics and never double or trail: `worker-`,
-# `worker.` and `worker..base` are not valid repository names, and accepting
-# them here just moves the failure to `docker tag`.
-_NAME_RE = re.compile(r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$")
+# Docker's own repository-name grammar, not a stricter guess: separators sit
+# BETWEEN alphanumerics, and `__` and repeated dashes ARE valid
+# (`my__worker`, `a--b`). Rejecting those would refuse names docker accepts,
+# which is its own kind of wrong; `worker-`, `worker.` and `worker..base` are
+# still refused, because accepting them just moves the failure to `docker tag`.
+_NAME_RE = re.compile(r"^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*$")
+
+# A tag names one build. A colon or slash would make `name:tag` parse as
+# something else entirely.
+_TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$")
 
 
 class PlanError(RuntimeError):
@@ -141,6 +147,11 @@ def _expand(text: str, env: dict[str, str]) -> str:
         value = env.get(name)
         if value:
             return value
+        if value == "" and default is None:
+            # `$X/file` with X empty gives `/file` -- a plausible-looking path
+            # at the filesystem root. Leave the variable visible so the caller
+            # refuses instead of writing there.
+            return m.group(0)
         # An EMPTY variable takes the default, as `${VAR:-x}` does in the shell.
         # A compose env routinely carries `TITANARUM_FC_DIR=` for an unset knob,
         # and treating that as "set" resolves the path to a hole.
@@ -189,6 +200,16 @@ def load_plan(root: Path | str) -> Plan:
         raise PlanError(f"{path}: [engine].name must be a plain name, got {engine!r}")
 
     raw_images = data.get("image") or []
+    if isinstance(raw_images, dict):
+        raise PlanError(
+            f"{path}: [image] must be an ARRAY of tables -- write [[image]], "
+            "once per image. A single [image] table declares one image and "
+            "silently drops any others."
+        )
+    if not isinstance(raw_images, list) or any(
+        not isinstance(x, dict) for x in raw_images
+    ):
+        raise PlanError(f"{path}: [[image]] entries must be tables")
     if not raw_images:
         raise PlanError(f"{path}: declares no [[image]]; there is nothing to build")
 
@@ -287,17 +308,65 @@ def load_plan(root: Path | str) -> Plan:
                 ) from exc
             if size <= 0:
                 raise PlanError(f"{path}: [[rootfs]] #{i + 1} size_mib must be positive")
+        if kind == "ext4" and size is None:
+            raise PlanError(
+                f"{path}: [[rootfs]] #{i + 1} is ext4 but declares no size_mib. "
+                "The filesystem has to be created at some size, and guessing one "
+                "either wastes the difference or fails to fit the image."
+            )
         rootfs.append(
             RootfsSpec(
                 kind=kind,
                 image=image,
                 dest=dest,
                 size_mib=size,
-                requires=tuple(str(r) for r in (item.get("requires") or ())),
+                requires=_requires(path, i, item.get("requires")),
             )
         )
 
+    dests: dict[str, str] = {}
+    for rf in rootfs:
+        # Compared as DECLARED: two entries resolving to one path means the
+        # second silently overwrites the first, and which one survives depends
+        # on declaration order.
+        if rf.dest in dests:
+            raise PlanError(
+                f"{path}: {rf.image!r} and {dests[rf.dest]!r} both export to "
+                f"{rf.dest!r}; the second would overwrite the first"
+            )
+        dests[rf.dest] = rf.image
+
     return Plan(engine=engine, images=tuple(images), rootfs=tuple(rootfs), root=root)
+
+
+def _requires(path: Path, index: int, value: object) -> tuple[str, ...]:
+    """`requires` as a tuple of paths.
+
+    A bare string is the natural typo (`requires = "/init"`) and iterating it
+    yields one requirement per CHARACTER -- so the check would look for a file
+    named `/`, then `i`, then `n`. Refused.
+    """
+    if value is None:
+        return ()
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        raise PlanError(
+            f"{path}: [[rootfs]] #{index + 1} requires must be an ARRAY of paths, "
+            f'got {value!r}. Write requires = ["/init"].'
+        )
+    return tuple(str(r) for r in value)
+
+
+def check_tag(tag: str) -> None:
+    """Refuse a tag that would not name one build.
+
+    A colon or slash makes `name:tag` parse as something else entirely, and an
+    empty tag silently becomes `name:` -- which docker reads as `latest`.
+    """
+    if not _TAG_RE.match(tag or ""):
+        raise PlanError(
+            f"{tag!r} is not a usable tag: letters, digits, dot, dash and "
+            "underscore only, and it may not start with a separator."
+        )
 
 
 def resolve_chain(plan: Plan, tag: str) -> list[tuple[ImageSpec, str]]:
@@ -373,6 +442,24 @@ def arg_problems(plan: Plan, env: dict[str, str] | None = None) -> list[str]:
             assert_arg_selects_base(path, spec.base_arg)
         except StampError as exc:
             out.append(f"{spec.name}: {exc}")
+        # Every OTHER build_arg too. A misspelled builder pin
+        # (`JDK_BUILD_IMGE`) is discarded by docker, so the stage keeps its
+        # mutable default while the plan reads as if it were pinned -- the same
+        # silent failure as a wrong base_arg, one level down.
+        declared = set(
+            re.findall(
+                r"^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)",
+                path.read_text(encoding="utf-8"),
+                re.MULTILINE,
+            )
+        )
+        for key in sorted(spec.build_args):
+            if key not in declared:
+                out.append(
+                    f"{spec.name}: {path} declares no `ARG {key}`, so docker "
+                    f"would ignore that --build-arg. Declared: "
+                    f"{', '.join(sorted(declared)) or 'none'}"
+                )
     return out
 
 
@@ -420,9 +507,11 @@ def describe(plan: Plan, tag: str, env: dict[str, str] | None = None) -> str:
     lines = [f"engine {plan.engine}, tag {tag}"]
     for spec, base_ref in resolve_chain(plan, tag):
         kind = "chain" if spec.internal else "upstream"
+        ctx = _expand(spec.context, env)
+        where = "" if ctx == "." else f" [context {ctx}]"
         lines.append(
             f"  build {spec.tagged(tag)}  <- {base_ref} ({kind}) "
-            f"via {spec.dockerfile} --base-arg {spec.base_arg}"
+            f"via {spec.dockerfile} --base-arg {spec.base_arg}{where}"
         )
     for rf in plan.rootfs:
         need = f" requires {list(rf.requires)}" if rf.requires else ""
