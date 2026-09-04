@@ -50,4 +50,8 @@ COPY deploy/firecracker/guest.clippyshot.env /opt/blastbox/guest.env
 RUN chmod +x /init && mkdir -p /mnt/outdisk \
     && printf '%s' 'clippyshot.engine:ClippyShotEngine' > /opt/blastbox/engine \
     # Strip setuid/setgid (the in-VM Converter runs soffice directly, no setuid).
-    && find / -xdev -type f -perm /6000 -exec chmod a-s {} + 2>/dev/null || true
+    && { find / -xdev -type f -perm /6000 -exec chmod a-s {} + 2>/dev/null || true; }
+    # The braces matter: `A && B || true` applies the fallback to the WHOLE
+    # chain, so a failing mkdir above was swallowed and the image shipped
+    # without a mountpoint the gVisor restore needs. Only the find may fail
+    # (it exits non-zero when it cannot read a path), and only it is excused.
