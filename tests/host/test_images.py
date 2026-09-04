@@ -9,6 +9,18 @@ from pathlib import Path
 
 import pytest
 
+def _sized(path: Path, nbytes: int) -> Path:
+    """A SPARSE file of exactly ``nbytes``.
+
+    These tests only need the logical length that `stat` reports. Writing the
+    bytes allocated the whole thing in RAM and then wrote it to disk -- a 5 GiB
+    buffer in one case, which can OOM a CI runner outright.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as fh:
+        fh.truncate(nbytes)
+    return path
+
 from blastbox.host.images import (
     SPEC_NAME,
     Plan,
@@ -866,7 +878,7 @@ def test_the_dry_run_reports_the_size_it_will_actually_build(
 
     dest = tmp_path / "fc"
     dest.mkdir()
-    (dest / "titanarum-rootfs.ext4").write_bytes(b"\0" * (5000 * 1024 * 1024))
+    _sized(dest / "titanarum-rootfs.ext4", 5000 * 1024 * 1024)
     env = {"TITANARUM_FC_DIR": str(dest)}
     text = TITANARUM.replace("size_mib = 3072", 'size_mib = "${ROOTFS_MIB:-3072}"')
     plan = load_plan(_plan(tmp_path, text))

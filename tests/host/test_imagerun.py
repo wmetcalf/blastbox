@@ -15,6 +15,18 @@ from pathlib import Path
 
 import pytest
 
+def _sized(path: Path, nbytes: int) -> Path:
+    """A SPARSE file of exactly ``nbytes``.
+
+    These tests only need the logical length that `stat` reports. Writing the
+    bytes allocated the whole thing in RAM and then wrote it to disk -- a 5 GiB
+    buffer in one case, which can OOM a CI runner outright.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as fh:
+        fh.truncate(nbytes)
+    return path
+
 from blastbox.host.images import PlanError, load_plan
 from blastbox.host.imagerun import (
     BuildError,
@@ -1188,7 +1200,7 @@ def test_a_literal_size_never_shrinks_a_live_artifact(
     dest_dir = tmp_path / "fc"
     dest_dir.mkdir()
     live = dest_dir / "demo.ext4"
-    live.write_bytes(b"\0" * (200 * 1024 * 1024))  # 200 MiB already in place
+    _sized(live, 200 * 1024 * 1024)  # 200 MiB already in place
     monkeypatch.setenv("DEMO_DIR", str(dest_dir))
     monkeypatch.delenv("ROOTFS_MIB", raising=False)
     plan = _plan(tmp_path)  # declares a literal 64 MiB
@@ -1203,7 +1215,7 @@ def test_growing_a_rootfs_is_allowed(tmp_path: Path, monkeypatch) -> None:
     engine's payload gets bigger."""
     dest_dir = tmp_path / "fc"
     dest_dir.mkdir()
-    (dest_dir / "demo.ext4").write_bytes(b"\0" * (32 * 1024 * 1024))
+    _sized(dest_dir / "demo.ext4", 32 * 1024 * 1024)
     monkeypatch.setenv("DEMO_DIR", str(dest_dir))
     plan = _plan(tmp_path)  # declares 64 MiB
     run = FakeRunner()
@@ -1247,7 +1259,7 @@ def test_a_shrink_is_refused_again_at_publication(tmp_path: Path, monkeypatch) -
     staged = mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=run, log=lambda _: None,
                               extract=_fake_extract({"/init": "x"}))
     # another run publishes something larger while ours sits staged
-    (dest_dir / "demo.ext4").write_bytes(b"\0" * (200 * 1024 * 1024))
+    _sized(dest_dir / "demo.ext4", 200 * 1024 * 1024)
     with pytest.raises(BuildError) as e:
         mod.publish_staged(staged, run=run, log=lambda _: None)
     assert "Refusing to shrink" in str(e.value)
@@ -1266,7 +1278,7 @@ def test_a_destination_that_cannot_be_measured_fails_closed(
     monkeypatch.setattr(mod, "_can_be_root", lambda: True)
     dest_dir = tmp_path / "fc"
     dest_dir.mkdir()
-    (dest_dir / "demo.ext4").write_bytes(b"\0" * 1024)
+    _sized(dest_dir / "demo.ext4", 1024)
     monkeypatch.setenv("DEMO_DIR", str(dest_dir))
     plan = _plan(tmp_path)
 
@@ -1296,7 +1308,7 @@ def test_the_shrink_check_compares_bytes_not_floored_mib(
     dest_dir = tmp_path / "fc"
     dest_dir.mkdir()
     live = dest_dir / "demo.ext4"
-    live.write_bytes(b"\0" * (64 * 1024 * 1024 + 4096))  # 64 MiB + one block
+    _sized(live, 64 * 1024 * 1024 + 4096)  # 64 MiB + one block
     monkeypatch.setenv("DEMO_DIR", str(dest_dir))
     # An EXPLICIT override, because a defaulted size now preserves this
     # artifact rather than refusing it. The byte precision still matters here:
@@ -1326,7 +1338,7 @@ def test_the_destination_is_measured_at_the_selected_privilege(
     monkeypatch.setattr(mod, "_can_be_root", lambda: True)
     dest_dir = tmp_path / "fc"
     dest_dir.mkdir()
-    (dest_dir / "demo.ext4").write_bytes(b"\0" * 1024)
+    _sized(dest_dir / "demo.ext4", 1024)
     monkeypatch.setenv("DEMO_DIR", str(dest_dir))
     plan = _plan(tmp_path)
     run = FakeRunner()
@@ -1349,7 +1361,7 @@ def test_an_enlarged_rootfs_keeps_its_size_when_no_override_is_given(
     """
     dest_dir = tmp_path / "fc"
     dest_dir.mkdir()
-    (dest_dir / "demo.ext4").write_bytes(b"\0" * (200 * 1024 * 1024))
+    _sized(dest_dir / "demo.ext4", 200 * 1024 * 1024)
     monkeypatch.setenv("DEMO_DIR", str(dest_dir))
     monkeypatch.delenv("ROOTFS_MIB", raising=False)
     plan = _plan(tmp_path, SPEC.replace("size_mib = 64", 'size_mib = "${ROOTFS_MIB:-64}"'))
@@ -1367,7 +1379,7 @@ def test_an_explicit_override_is_obeyed_not_maxed(tmp_path: Path, monkeypatch) -
     silently discarded."""
     dest_dir = tmp_path / "fc"
     dest_dir.mkdir()
-    (dest_dir / "demo.ext4").write_bytes(b"\0" * (200 * 1024 * 1024))
+    _sized(dest_dir / "demo.ext4", 200 * 1024 * 1024)
     monkeypatch.setenv("DEMO_DIR", str(dest_dir))
     monkeypatch.setenv("ROOTFS_MIB", "100")
     plan = _plan(tmp_path, SPEC.replace("size_mib = 64", 'size_mib = "${ROOTFS_MIB:-64}"'))
@@ -1382,7 +1394,7 @@ def test_an_override_larger_than_the_existing_artifact_grows_it(
 ) -> None:
     dest_dir = tmp_path / "fc"
     dest_dir.mkdir()
-    (dest_dir / "demo.ext4").write_bytes(b"\0" * (100 * 1024 * 1024))
+    _sized(dest_dir / "demo.ext4", 100 * 1024 * 1024)
     monkeypatch.setenv("DEMO_DIR", str(dest_dir))
     monkeypatch.setenv("ROOTFS_MIB", "300")
     plan = _plan(tmp_path, SPEC.replace("size_mib = 64", 'size_mib = "${ROOTFS_MIB:-64}"'))
@@ -1398,7 +1410,7 @@ def test_sub_mib_growth_still_preserves_the_artifact(tmp_path: Path, monkeypatch
     override, the exact case preservation exists for."""
     dest_dir = tmp_path / "fc"
     dest_dir.mkdir()
-    (dest_dir / "demo.ext4").write_bytes(b"\0" * (64 * 1024 * 1024 + 4096))
+    _sized(dest_dir / "demo.ext4", 64 * 1024 * 1024 + 4096)
     monkeypatch.setenv("DEMO_DIR", str(dest_dir))
     monkeypatch.delenv("ROOTFS_MIB", raising=False)
     plan = _plan(tmp_path)  # declares 64 MiB
