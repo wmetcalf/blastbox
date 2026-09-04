@@ -3701,3 +3701,75 @@ def test_two_exact_pins_for_one_package_in_a_set_are_unresolvable(tmp_path):
     assert any("more than one version" in g and "packaging" in g for g in reported), (
         reported
     )
+
+
+def test_equivalent_version_spellings_are_one_pin(tmp_path):
+    """`packaging==26.3` and `packaging==26.3.0` are the same pin to pip.
+
+    Calling them a contradiction rejects a lock pip resolves without complaint.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "blastbox.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging==26.3"),
+    )
+    _write(tmp_path, "deps.lock", _entry("packaging==26.3.0") + _entry("backport==1.0"))
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\n"
+        "RUN pip install --require-hashes -r blastbox.lock -r deps.lock\n"
+    )
+    env = {"python_version": "3.12"}
+    assert missing_from_locks(tmp_path, _RM, environment=env) == {}
+    # Control: a genuinely different version IS a contradiction.
+    _write(tmp_path, "deps.lock", _entry("packaging==22.0") + _entry("backport==1.0"))
+    gaps = missing_from_locks(tmp_path, _RM, environment=env)
+    assert any(
+        "more than one version" in g for entries in gaps.values() for g in entries
+    ), gaps
+
+
+def test_arbitrary_equality_compares_the_spelling(tmp_path):
+    """`===` is textual: `===26.3` and `===26.3.0` are NOT the same pin."""
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "blastbox.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging===26.3"),
+    )
+    _write(
+        tmp_path, "deps.lock", _entry("packaging===26.3.0") + _entry("backport==1.0")
+    )
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\n"
+        "RUN pip install --require-hashes -r blastbox.lock -r deps.lock\n"
+    )
+    gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert any(
+        "more than one version" in g for entries in gaps.values() for g in entries
+    ), gaps
+
+
+def test_extras_are_attributed_only_within_their_install_segment(tmp_path):
+    """`echo -r prod.lock && pip install blastbox[host] -r dev.lock`.
+
+    Reading the whole line attributes host to prod.lock, whose own base-only
+    install is then reported missing dependencies it deliberately omits.
+    """
+    from blastbox.host.pins import _declared_extras_for
+
+    (tmp_path / "prod.lock").write_text("")
+    (tmp_path / "dev.lock").write_text("")
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\n"
+        "RUN echo -r prod.lock > /dev/null \\\n"
+        "    && pip install blastbox[host] -r dev.lock\n"
+    )
+    assert _declared_extras_for(tmp_path, tmp_path / "dev.lock", 2) == {"host"}
+    assert _declared_extras_for(tmp_path, tmp_path / "prod.lock", 2) == set()

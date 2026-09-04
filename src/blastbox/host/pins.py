@@ -831,6 +831,9 @@ class _Pin:
     # a portable lock can pin blastbox twice under exclusive markers, and
     # unioning both would check a closure pip never installs.
     extras: frozenset[str] = frozenset()
+    # `===` is ARBITRARY equality: pip compares the string, not the version.
+    # `==1.0` and `==1.0.0` are the same pin; `===1.0` and `===1.0.0` are not.
+    arbitrary: bool = False
 
 
 def missing_from_locks(
@@ -1178,6 +1181,27 @@ def _scopes_for(
     return [(label, {**values, **base}) for label, values in _UNIVERSAL_BRANCHES]
 
 
+def _pin_identity(pin: _Pin) -> tuple[Any, str]:
+    """``(identity, as written)`` -- what makes two pins the SAME pin to pip.
+
+    PEP 440 versions compare canonically: `1.0` and `1.0.0` are one pin, and
+    reporting them as a contradiction refuses a lock pip resolves. The
+    comparison key is the `Version` itself, not its string -- `str(Version(
+    "26.3.0"))` keeps the trailing zero, so comparing spellings would change
+    nothing. Under `===` the comparison IS textual, so there the spelling is
+    the identity.
+    """
+    from packaging.version import InvalidVersion, Version  # noqa: PLC0415
+
+    raw = pin.version.lstrip("=").strip()
+    if pin.arbitrary:
+        return ("===", raw), raw
+    try:
+        return Version(raw), raw
+    except InvalidVersion:
+        return ("==", raw), raw  # not a version we can normalise; compare as written
+
+
 def _judge_scope(
     iset: _InstallSet,
     root: Path,
@@ -1194,13 +1218,17 @@ def _judge_scope(
     # satisfy both and cannot: the set is unresolvable however well it covers
     # the closure, and `_gap` was satisfied as soon as EITHER version matched.
     for name, entries in sorted(pins.items()):
-        versions = {
-            pin.version.lstrip("=").strip()
-            for pin in entries
-            if _marker_holds(pin.marker, scope)
-        }
+        # Compared as VERSIONS: `1.0` and `1.0.0` are the same pin to pip, and
+        # calling them a contradiction rejects a valid lock. `===` keeps its
+        # own semantics, since it compares the string.
+        versions: dict[Any, str] = {}
+        for pin in entries:
+            if not _marker_holds(pin.marker, scope):
+                continue
+            identity, written = _pin_identity(pin)
+            versions.setdefault(identity, written)
         if len(versions) > 1:
-            spelled = ", ".join(sorted(versions))
+            spelled = ", ".join(sorted(versions.values()))
             gaps.append(
                 f"{name} is pinned to more than one version in this install "
                 f"set ({spelled}); pip cannot satisfy both"
@@ -1604,7 +1632,7 @@ def _lock_environment(text: str) -> dict[str, str]:
     return out
 
 
-def _exact_pin(line: str) -> tuple[str, frozenset[str], str] | None:
+def _exact_pin(line: str) -> tuple[str, frozenset[str], str, bool] | None:
     """``(name, extras, version)`` for a lock entry pinning one exact version.
 
     `packaging!=21,==23` is an exact pin whose `==` is not first; pip resolves
@@ -1623,7 +1651,12 @@ def _exact_pin(line: str) -> tuple[str, frozenset[str], str] | None:
     if len(exact) != 1:
         return None  # no single exact version: pip has a range here, not a pin
     extras = frozenset(e.strip().lower() for e in (req.extras or set()) if e.strip())
-    return _dist_name(req.name), extras, exact[0].version
+    return (
+        _dist_name(req.name),
+        extras,
+        exact[0].version,
+        exact[0].operator == "===",
+    )
 
 
 def _effective_pins(
@@ -1675,7 +1708,7 @@ def _effective_pins(
         entry = _exact_pin(line)
         if entry is None:
             continue
-        name, entry_extras, version = entry
+        name, entry_extras, version, arbitrary = entry
         _, _, after = line.partition(";")
         marker = after.split("--hash")[0].strip() if after else ""
         pins.setdefault(name, []).append(
@@ -1688,6 +1721,7 @@ def _effective_pins(
                 # rewrites the blastbox version without replacing its hashes.
                 hashed=_HASH_RE.search(line) is not None,
                 extras=entry_extras,
+                arbitrary=arbitrary,
             )
         )
     return pins, extras, env
@@ -1762,15 +1796,17 @@ def _declared_extras_for(root: Path, lock: Path, n_sets: int) -> set[str]:
         # blastbox from prod.lock in one stage and `blastbox[host]` from
         # dev.lock in another; taking every occurrence in the file applies host
         # to prod.lock and rejects a lock whose stage never installs it.
+        # Per install SEGMENT, and only from its arguments. A line may hold a
+        # non-install command naming a lock -- `echo -r prod.lock && pip
+        # install blastbox[host] -r dev.lock` -- and reading the whole line
+        # attributes host to prod.lock, whose own base-only install is then
+        # reported missing dependencies it deliberately does not carry.
         for line in _joined_lines(_read_small(path)):
-            if target not in set(_referenced_in(line, path.parent, root)):
-                continue
-            out |= {
-                e.strip().lower()
-                for match in re.finditer(r"(?i)\bblastbox\[([^\]]+)\]", line)
-                for e in match.group(1).split(",")
-                if e.strip()
-            }
+            for segment in _install_segments(line):
+                if target not in set(_referenced_in(segment, path.parent, root)):
+                    continue
+                for token in _shell_tokens(segment):
+                    out |= _extras_of(token)
     if out:
         return out
     return _declared_blastbox_extras(root) if n_sets == 1 else set()
