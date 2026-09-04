@@ -1058,6 +1058,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pp.set_defaults(func=_pins_cmd)
 
+    bip = sub.add_parser(
+        "build-images",
+        help="check an engine's declared image chain and print the resolved plan "
+             "(--dry-run today; execution not yet wired)",
+    )
+    bip.add_argument("repo", help="path to the consumer repo (it declares blastbox-images.toml)")
+    bip.add_argument("--tag", required=True, help="tag to build the whole chain under")
+    bip.add_argument(
+        "--dry-run", action="store_true",
+        help="REQUIRED for now: print what would be built and exported, and "
+             "touch nothing. Execution is not implemented, so requiring the "
+             "flag today means omitting it will mean 'really build' the day it "
+             "is -- rather than silently changing what an existing command does.",
+    )
+    bip.set_defaults(func=_build_images_cmd)
+
     pdoc = sub.add_parser(
         "doctor",
         help="report the blastbox version every running container is actually on",
@@ -1105,6 +1121,68 @@ def build_parser() -> argparse.ArgumentParser:
 
     return p
 
+
+
+def _build_images_cmd(args: argparse.Namespace) -> int:
+    """Build a declared image chain, stamped, and verify every result.
+
+    The declaration lives with the Dockerfiles it names, so a new engine writes
+    a spec rather than the fourth copy of a shell script -- every one of which
+    had drifted from the others in a way that silently produced a wrong image.
+    """
+    from blastbox.host.images import (  # noqa: PLC0415
+        PlanError, arg_problems, check_tag, describe, load_plan, missing_dockerfiles,
+        unresolved_destinations,
+    )
+
+    root = Path(args.repo).resolve()
+    if not root.is_dir():
+        print(f"not a directory: {root}")
+        return 2
+    try:
+        check_tag(args.tag)
+        plan = load_plan(root)
+    except PlanError as exc:
+        print(f"cannot read the image plan: {exc}")
+        return 2
+
+    missing = missing_dockerfiles(plan)
+    if missing:
+        # Reported BEFORE anything is built: otherwise this surfaces deep inside
+        # a docker build, as an error about something else.
+        print(f"{len(missing)} declared Dockerfile(s) do not exist:")
+        for m in missing:
+            print(f"  {m}")
+        return 2
+
+    # The check this module exists for: docker silently ignores a --build-arg the
+    # Dockerfile does not declare, so a wrong base_arg means the build resolves
+    # its own default while the stamp claims the pinned base.
+    problems = arg_problems(plan)
+    if problems:
+        print(f"{len(problems)} image(s) declare a base_arg that does not select their base:")
+        for p_ in problems:
+            print(f"  {p_}")
+        return 2
+
+    if not args.dry_run:
+        print("execution is not implemented yet; pass --dry-run to see the plan.")
+        return 2
+
+    unresolved = unresolved_destinations(plan)
+    if unresolved:
+        print(f"{len(unresolved)} export destination(s) contain an unset variable:")
+        for u in unresolved:
+            print(f"  {u}")
+        print("Set them, or give the declaration a ${VAR:-default}.")
+        return 2
+
+    print(describe(plan, args.tag))
+    print()
+    print("checked: every Dockerfile exists, every declared ARG is honoured by")
+    print("it, and every destination resolves. Run the engine's build script to")
+    print("execute; this plan is what it must do.")
+    return 0
 
 
 def _release_digests(version: str) -> list[str] | None:
