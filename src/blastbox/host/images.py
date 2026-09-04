@@ -131,6 +131,12 @@ class RootfsSpec:
     dest: str
     size_mib: int | None = None
     requires: tuple[str, ...] = ()
+    # Defaults ON. `deploy/firecracker/build-rootfs.sh` refused any image
+    # carrying a setuid/setgid binary, and adopting this module must not
+    # silently drop a hardening gate that already existed. It is a sandbox
+    # rootfs either way, and the live gVisor tree has none today, so the
+    # default costs nothing there either.
+    forbid_setuid: bool = True
 
     def resolved_dest(self, env: dict[str, str] | None = None) -> str:
         """`dest` with $VARS expanded from the environment.
@@ -207,7 +213,12 @@ def load_plan(root: Path | str) -> Plan:
     # the filename unconditionally turns a path to the file into
     # `.../blastbox-images.toml/blastbox-images.toml`, whose NotADirectoryError
     # names a path the caller never wrote and reads like a corrupt tree.
-    root = Path(root)
+    # RESOLVED. A relative root survives into `dockerfile_path`, and the build
+    # then runs with cwd=root, so docker resolves `repo/deploy/Dockerfile`
+    # against `repo/` and looks for `repo/repo/deploy/Dockerfile`. The CLI
+    # avoids this only because it resolves its own argument first; a library
+    # caller writing `load_plan("repo")` would not.
+    root = Path(root).resolve()
     if root.name == SPEC_NAME or (root.is_file() and root.suffix == ".toml"):
         path, root = root, root.parent
     else:
@@ -257,7 +268,7 @@ def load_plan(root: Path | str) -> Plan:
         "source_repo",
         "build_args",
     }
-    known_rootfs_keys = {"kind", "image", "dest", "size_mib", "requires"}
+    known_rootfs_keys = {"kind", "image", "dest", "size_mib", "requires", "forbid_setuid"}
 
     seen: dict[str, ImageSpec] = {}
     images: list[ImageSpec] = []
@@ -404,6 +415,14 @@ def load_plan(root: Path | str) -> Plan:
                 dest=dest,
                 size_mib=size,
                 requires=_requires(path, i, item.get("requires")),
+                # Only when DECLARED, so the dataclass default is the one and
+                # only statement of it. Repeating the default at the call site
+                # makes the field's own default dead code that nothing can test.
+                **(
+                    {"forbid_setuid": _bool(path, i, "forbid_setuid", item["forbid_setuid"])}
+                    if "forbid_setuid" in item
+                    else {}
+                ),
             )
         )
 
@@ -421,6 +440,20 @@ def load_plan(root: Path | str) -> Plan:
         dests[key] = rf.image
 
     return Plan(engine=engine, images=tuple(images), rootfs=tuple(rootfs), root=root)
+
+
+def _bool(path: Path, index: int, key: str, value: object) -> bool:
+    """A declared flag must be a real boolean.
+
+    TOML has one, so a string here is a mistake -- and `forbid_setuid = "false"`
+    read as truthy would silently keep a gate the author meant to turn off,
+    while `= "true"` on a looser reading would silently drop one.
+    """
+    if not isinstance(value, bool):
+        raise PlanError(
+            f"{path}: [[rootfs]] #{index + 1} {key} must be true or false, got {value!r}"
+        )
+    return value
 
 
 def _requires(path: Path, index: int, value: object) -> tuple[str, ...]:
@@ -508,6 +541,24 @@ def missing_dockerfiles(plan: Plan, env: dict[str, str] | None = None) -> list[s
         if not path.is_file():
             where = spec.context if spec.context != "." else "this repo"
             out.append(f"{spec.dockerfile} (context {where})")
+    return out
+
+
+def unresolved_build_args(plan: Plan, env: dict[str, str] | None = None) -> list[str]:
+    """Build args whose value still holds an unset variable.
+
+    `_expand` deliberately leaves `$VAR` visible rather than blanking it, which
+    makes the hole legible -- but handing that literal to docker builds with a
+    placeholder, or fails deep inside the Dockerfile at a line that has nothing
+    to do with the missing variable. Reported before anything is built.
+    """
+    env = dict(os.environ) if env is None else env
+    out: list[str] = []
+    for spec in plan.images:
+        for key, raw in sorted(spec.build_args.items()):
+            shown = _expand(raw, env)
+            if "$" in shown:
+                out.append(f"{spec.name}: --build-arg {key}={shown}")
     return out
 
 
@@ -608,8 +659,13 @@ def build_command(
     already = any(f.startswith(f"{spec.base_arg}=") for f in stamp_flags)
     if base_ref and not already:
         argv += ["--build-arg", f"{spec.base_arg}={base_ref}"]
+    # Values are EXPANDED. A spec that had to write the blastbox version as a
+    # literal would carry a second copy of the pyproject pin, and the two would
+    # drift -- which is the failure this whole module exists to catch, one
+    # level up. `BLASTBOX_VERSION = "$BLASTBOX_VERSION"` keeps one source.
+    env_map = dict(os.environ) if env is None else env
     for key, value in sorted(spec.build_args.items()):
-        argv += ["--build-arg", f"{key}={value}"]
+        argv += ["--build-arg", f"{key}={_expand(value, env_map)}"]
     context = _expand(spec.context, dict(os.environ) if env is None else env)
     argv += ["-t", spec.tagged(tag), context]
     return argv
@@ -633,9 +689,15 @@ def describe(plan: Plan, tag: str, env: dict[str, str] | None = None) -> str:
         if src != plan.root:
             where += f" [stamped from {src}]"
         if spec.build_args:
-            where += " " + " ".join(
-                f"--build-arg {k}={v}" for k, v in sorted(spec.build_args.items())
-            )
+            # Marked when a value does not resolve, exactly as destinations
+            # are: an operator reading `=$BLASTBOX_VERSION` should see that it
+            # is a hole, not a value docker will somehow work out.
+            rendered = []
+            for k, v in sorted(spec.build_args.items()):
+                shown = _expand(v, env)
+                mark = " [UNRESOLVED]" if "$" in shown else ""
+                rendered.append(f"--build-arg {k}={shown}{mark}")
+            where += " " + " ".join(rendered)
         lines.append(
             f"  build {spec.tagged(tag)}  <- {base_ref} ({kind}) "
             f"via {spec.dockerfile} --base-arg {spec.base_arg}{where}"

@@ -1060,17 +1060,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     bip = sub.add_parser(
         "build-images",
-        help="check an engine's declared image chain and print the resolved plan "
-             "(--dry-run today; execution not yet wired)",
+        help="build an engine's declared image chain, stamped and verified, then "
+             "export the rootfs artifacts it declares (--dry-run to inspect)",
     )
     bip.add_argument("repo", help="path to the consumer repo (it declares blastbox-images.toml)")
     bip.add_argument("--tag", required=True, help="tag to build the whole chain under")
     bip.add_argument(
         "--dry-run", action="store_true",
-        help="REQUIRED for now: print what would be built and exported, and "
-             "touch nothing. Execution is not implemented, so requiring the "
-             "flag today means omitting it will mean 'really build' the day it "
-             "is -- rather than silently changing what an existing command does.",
+        help="print what would be built and exported, and touch nothing",
+    )
+    bip.add_argument(
+        "--blastbox-version",
+        help="the blastbox version the images will INSTALL, recorded in every "
+             "stamp. Read from the repo's pyproject when omitted; that is only "
+             "correct when the repo pins what it is about to install",
     )
     bip.set_defaults(func=_build_images_cmd)
 
@@ -1165,10 +1168,6 @@ def _build_images_cmd(args: argparse.Namespace) -> int:
             print(f"  {p_}")
         return 2
 
-    if not args.dry_run:
-        print("execution is not implemented yet; pass --dry-run to see the plan.")
-        return 2
-
     unresolved = unresolved_destinations(plan)
     if unresolved:
         print(f"{len(unresolved)} export destination(s) contain an unset variable:")
@@ -1177,12 +1176,76 @@ def _build_images_cmd(args: argparse.Namespace) -> int:
         print("Set them, or give the declaration a ${VAR:-default}.")
         return 2
 
-    print(describe(plan, args.tag))
+    # Resolved BEFORE the description is printed. A dry run that renders
+    # `--build-arg BLASTBOX_VERSION=$BLASTBOX_VERSION` has not told the operator
+    # what it would do, which is the one question a dry run exists to answer.
+    version = args.blastbox_version or _declared_blastbox_version(root)
+    env = {**os.environ, **({"BLASTBOX_VERSION": version} if version else {})}
+
+    print(describe(plan, args.tag, env))
+    if args.dry_run:
+        if not version:
+            print()
+            print("NOTE: the blastbox version these images install could not be")
+            print(f"read from {root}/pyproject.toml, so it shows unresolved above.")
+            print("Pass --blastbox-version <version> to see the real plan.")
+        print()
+        print("checked: every Dockerfile exists, every declared ARG is honoured by")
+        print("it, and every destination resolves. Nothing was built.")
+        return 0
+
+    # Recording the wrong version is worse than recording nothing, so a version
+    # that could not be read is a refusal rather than a guess.
+    if not version:
+        print("could not read the blastbox version these images will install from")
+        print(f"  {root}/pyproject.toml")
+        print("Pass it explicitly:  --blastbox-version <version>")
+        return 2
+
+    from blastbox.host.imagerun import BuildError, run_plan  # noqa: PLC0415
+
     print()
-    print("checked: every Dockerfile exists, every declared ARG is honoured by")
-    print("it, and every destination resolves. Run the engine's build script to")
-    print("execute; this plan is what it must do.")
+    try:
+        run_plan(plan, args.tag, blastbox_version=version)
+    except BuildError as exc:
+        print(f"\n{exc}")
+        return 1
+    print()
+    print(f"all images stamped and every artifact exported at :{args.tag}.")
     return 0
+
+
+def _declared_blastbox_version(root: Path) -> str:
+    """The blastbox version ``root``'s pyproject pins, or "".
+
+    Matched on the version DIGITS, not by splitting on `=`: `blastbox>=0.1.27`
+    has two fields, `blastbox==0.1.28` three, and a range drags its upper bound
+    into whichever field it lands in. Comment lines are dropped first — a
+    version mentioned in prose is not a pin, and letting one win here would
+    stamp a version nothing installs.
+    """
+    import re  # noqa: PLC0415
+
+    try:
+        text = (root / "pyproject.toml").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    body = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    # `==`, `~=` and `>=` only -- NOT every two-character operator. `!=0.1.27`
+    # names the one version that will not be installed, and reading it as the
+    # version this installs writes a false number into every image stamp: the
+    # exact lie this tooling exists to catch.
+    #
+    # `>=` is included on purpose, and it is not "whatever pip resolves". This
+    # value is passed to the build, and the Dockerfiles install
+    # `blastbox==${BLASTBOX_VERSION}` with it -- the floor becomes an exact
+    # install, so recording it is true by construction. `verify_built` then
+    # compares the label against what the image actually contains, so a repo
+    # whose Dockerfile stops honouring the arg is caught rather than trusted.
+    m = re.search(
+        r"blastbox(?:\[[A-Za-z0-9,._-]+\])?\s*(==|~=|>=)\s*([0-9]+(?:\.[0-9]+)*)", body
+    )
+    return m.group(2) if m else ""
 
 
 def _release_digests(version: str) -> list[str] | None:
