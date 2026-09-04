@@ -1573,7 +1573,9 @@ def test_an_extra_the_lock_was_compiled_for_is_checked(tmp_path):
         "uvicorn==0.30.0",
     )
     gaps = missing_from_locks(tmp_path, _R, environment={"sys_platform": "linux"})
-    assert gaps == {str(lock): ["structlog"]}, gaps
+    # A RUNTIME hole, not an install failure: the lock line is a plain
+    # `blastbox==`, which pip does not bind to the host extra.
+    assert gaps == {str(lock): ["structlog" + _RUNTIME]}, gaps
 
 
 def test_an_extra_the_lock_never_asked_for_is_not_reported(tmp_path):
@@ -1670,6 +1672,10 @@ def test_an_extras_own_blastbox_requirement_does_not_infer_it(tmp_path):
 
 
 _H = "--hash=sha256:" + "a" * 64
+# Appended when a gap is reachable only through an extra the LOCK LINE does
+# not spell: pip installs such a file happily and the image is short a
+# package it imports. Measured against real pip; see the module docstring.
+_RUNTIME = " [not an install failure: the image would import it]"
 _RM = [
     "pydantic>=2.6.0",
     "packaging>=23.0",
@@ -1885,7 +1891,7 @@ def test_an_extras_platform_only_members_do_not_dilute_the_evidence(tmp_path):
     # Two of THREE applicable host dependencies is a majority; two of four,
     # counting the Windows-only one, is not.
     gaps = missing_from_locks(tmp_path, _RN, environment={"sys_platform": "linux"})
-    assert list(gaps.values()) == [["structlog"]], gaps
+    assert list(gaps.values()) == [["structlog" + _RUNTIME]], gaps
 
 
 def test_an_extra_that_enables_another_pulls_its_closure_in(tmp_path):
@@ -1905,7 +1911,9 @@ def test_an_extra_that_enables_another_pulls_its_closure_in(tmp_path):
         + _entry("pytest==8.3.3"),
     )
     gaps = missing_from_locks(tmp_path, _RN, environment={"sys_platform": "linux"})
-    assert list(gaps.values()) == [["fastapi", "uvicorn", "structlog"]], gaps
+    assert list(gaps.values()) == [
+        [n + _RUNTIME for n in ("fastapi", "uvicorn", "structlog")]
+    ], gaps
 
 
 def test_a_lock_that_asks_for_no_extras_is_still_left_alone(tmp_path):
@@ -2425,7 +2433,7 @@ def test_the_repository_declares_which_blastbox_extras_it_installs(tmp_path):
         + _entry("fastapi==1.2.0"),
     )
     gaps = missing_from_locks(tmp_path, _RM)
-    assert list(gaps.values()) == [["uvicorn"]], gaps
+    assert list(gaps.values()) == [["uvicorn" + _RUNTIME]], gaps
 
 
 def test_an_extra_the_repository_never_asks_for_is_not_demanded(tmp_path):
@@ -2632,3 +2640,47 @@ def test_an_inline_space_form_hash_is_replaced_too(tmp_path):
     text = lock.read_text()
     assert "0.1.39" in text and new in text, text
     assert old_hash not in text, text
+
+
+def test_a_spelled_extra_is_an_install_failure_and_a_plain_one_is_not(tmp_path):
+    """The distinction is measured against real pip, not assumed.
+
+    On RedTusk's own lock with fastapi removed, in python:3.12-slim:
+
+        blastbox[host]==...  ->  pip install --require-hashes  FAILS
+        blastbox==...        ->  pip install --require-hashes  SUCCEEDS
+
+    Both are worth reporting -- the second leaves the image short a package it
+    imports, because the Dockerfiles then run `pip install -e . --no-deps` --
+    but calling the second a pip rejection would send an operator looking for
+    an error that never happens.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\ndependencies = ["blastbox[host]>=0.1.39,<0.2"]\n'
+    )
+    body = (
+        _entry("pydantic==2.13.5") + _entry("packaging==26.3") + _entry("backport==1.0")
+    )
+
+    # The lock LINE spells the extra: pip enforces it, so no annotation.
+    _write(tmp_path, "req.lock", _entry("blastbox[host]==0.1.39") + body)
+    spelled = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert list(spelled.values()) == [["fastapi", "uvicorn"]], spelled
+
+    # A plain line: the same packages are missing, and pip would not care.
+    _write(tmp_path, "req.lock", _entry("blastbox==0.1.39") + body)
+    plain = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert list(plain.values()) == [["fastapi" + _RUNTIME, "uvicorn" + _RUNTIME]], plain
+
+
+def test_a_base_dependency_is_always_an_install_failure(tmp_path):
+    """`packaging` is the case that started this, and pip does reject it."""
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path, "req.lock", _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5")
+    )
+    gaps = missing_from_locks(tmp_path, ["pydantic>=2.6.0", "packaging>=23.0"])
+    assert list(gaps.values()) == [["packaging"]], gaps

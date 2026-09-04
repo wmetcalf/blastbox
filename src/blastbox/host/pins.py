@@ -864,33 +864,60 @@ def missing_from_locks(
         # Only from blastbox entries whose own markers apply: a portable lock
         # may pin `blastbox[host]` for one interpreter and `blastbox[s3]` for
         # another, and unioning both checks a closure pip never installs.
-        extras = {
+        # TWO kinds of extra, and they fail differently. Measured against real
+        # pip in python:3.12-slim, on RedTusk's own lock with fastapi removed:
+        #
+        #     blastbox[host]==...  ->  pip install --require-hashes  FAILS
+        #     blastbox==...        ->  pip install --require-hashes  SUCCEEDS
+        #
+        # Only the extras the LOCK LINE spells are enforced by pip. The ones the
+        # repository merely declares (`blastbox[host,s3]` in pyproject) are not:
+        # uv writes a plain `blastbox==` line, so the install succeeds and the
+        # IMAGE is short a package it imports -- RedTusk's Dockerfiles then run
+        # `pip install -e . --no-deps`, which does not re-check. That is a real
+        # defect and worth reporting, but it is not the same defect, and saying
+        # "pip will reject the file" about it would be false.
+        enforced = {
             e
             for pin in pins["blastbox"]
             if _marker_holds(pin.marker, scope)
             for e in pin.extras
         }
-        # What the lock's own header says it was compiled for. uv writes a plain
-        # `blastbox==...` line even for `--extra host`, so without this an older
-        # lock carrying half a grown extra is never recognised as needing it.
-        # What this repository asks blastbox for, wherever it says so:
-        # `blastbox[host,s3]` in pyproject, a Dockerfile pip line, or the lock
-        # entry itself. That is the authoritative answer; inference is only for
-        # repos that never spell it.
-        extras |= _declared_extras_for(root, path, roots)
-        if not extras:
-            extras |= _extras_in_play(parsed, pins, scope)
+        declared = _declared_extras_for(root, path, roots)
+        if not enforced and not declared:
+            declared = _extras_in_play(parsed, pins, scope)
+        extras = enforced | declared
         extras = _with_nested_extras(extras, parsed, scope)
         gaps: list[str] = []
         for req in parsed:
             if req is None or not _applies(req, extras, scope):
                 continue
             gap = _gap(req, pins, scope, requirements_of)
-            if gap:
-                gaps.append(gap)
+            if not gap:
+                continue
+            # Which failure is it? A requirement reachable only through an extra
+            # the lock line does not spell is a RUNTIME hole, not an install
+            # one, and the message says which so an operator is not sent looking
+            # for a pip error that will not happen.
+            if not _pip_enforces(req, enforced, scope):
+                gap += " [not an install failure: the image would import it]"
+            gaps.append(gap)
         if gaps:
             out[str(path)] = gaps
     return out
+
+
+def _pip_enforces(req, enforced: set[str], scope: dict[str, str]) -> bool:
+    """Whether pip itself will demand ``req`` for this lock.
+
+    A base requirement always. An extra-gated one only when the lock LINE names
+    that extra -- `blastbox[host]==...` binds pip, a plain `blastbox==...` does
+    not, whatever the repository declares elsewhere.
+    """
+    marker = str(getattr(req, "marker", "") or "")
+    if "extra ==" not in marker:
+        return True
+    return _applies(req, enforced, scope) if enforced else False
 
 
 def _gap(
