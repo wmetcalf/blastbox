@@ -1061,6 +1061,9 @@ def test_a_requirement_under_an_unreadable_directory_is_not_reported_missing(
     """
     from blastbox.host.imagerun import _Unreadable, _present_in
 
+    if os.geteuid() == 0:
+        pytest.skip("root traverses 0o000 directories, so this cannot be provoked here")
+
     tree = tmp_path / "tree"
     tree.mkdir()
     locked = tree / "opt"
@@ -1093,7 +1096,28 @@ def test_the_staging_root_is_made_traversable_before_it_is_checked(
     monkeypatch.setenv("DEMO_DIR", str(dest_dir))
     plan = _plan(tmp_path)
     run = FakeRunner()
+
+    # The REQUIREMENT check is what the ordering bug broke, so that is what has
+    # to be observed. Asserting only that chmod precedes the setuid `find` left
+    # a hole: moving _normalize_root between the two checks restores the
+    # production bug and still satisfies it.
+    order: list[str] = []
+    real_requires = mod._check_requires
+    real_normalize = mod._normalize_root
+
+    def spy_requires(*a, **kw):
+        order.append("check_requires")
+        return real_requires(*a, **kw)
+
+    def spy_normalize(*a, **kw):
+        order.append("normalize_root")
+        return real_normalize(*a, **kw)
+
+    monkeypatch.setattr(mod, "_check_requires", spy_requires)
+    monkeypatch.setattr(mod, "_normalize_root", spy_normalize)
     export_rootfs(plan, plan.rootfs[0], "t1", run=run, log=lambda _: None,
                   extract=_fake_extract({"/init": "x"}))
-    order = [c for c in run.calls if "chmod" in c or "find" in c]
-    assert order and "chmod" in order[0], f"the tree was checked before it was normalized: {order}"
+    assert order == ["normalize_root", "check_requires"], (
+        f"the tree was checked before it was made traversable: {order}"
+    )
+
