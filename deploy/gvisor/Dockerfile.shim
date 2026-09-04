@@ -43,6 +43,10 @@ RUN mkdir -p /in /out /ctrl \
     #
     # The Firecracker path has refused such images since build-rootfs.sh was
     # written; the gVisor path simply never had the check, so nothing said so.
-    && find / -xdev -type f -perm /6000 -exec chmod a-s {} + 2>/dev/null || true
+    && { find / -xdev -type f -perm /6000 -exec chmod a-s {} + 2>/dev/null || true; }
+    # The braces matter: `A && B || true` applies the fallback to the WHOLE
+    # chain, so a failing mkdir above was swallowed and the image shipped
+    # without a mountpoint the gVisor restore needs. Only the find may fail
+    # (it exits non-zero when it cannot read a path), and only it is excused.
 
 # The warm worker env then sets LD_PRELOAD=/opt/clippyshot/accept-retry.so (soffice only).

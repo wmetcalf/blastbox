@@ -48,7 +48,11 @@ COPY deploy/firecracker/engines.py /opt/blastbox/engines.py
 RUN printf '%s' "${ENGINE}" > /opt/blastbox/engine \
     && mkdir -p /in /out /ctrl \
     # Strip setuid/setgid: the warm worker runs java directly as a non-root uid.
-    && find / -xdev -type f -perm /6000 -exec chmod a-s {} + 2>/dev/null || true
+    && { find / -xdev -type f -perm /6000 -exec chmod a-s {} + 2>/dev/null || true; }
+    # The braces matter: `A && B || true` applies the fallback to the WHOLE
+    # chain, so a failing mkdir above was swallowed and the image shipped
+    # without a mountpoint the gVisor restore needs. Only the find may fail
+    # (it exits non-zero when it cannot read a path), and only it is excused.
 
 # The warm entrypoint is supplied by the host via BLASTBOX_GVISOR_WARM_ARGV
 # (= ["/opt/redtusk/bin/python3", "/opt/blastbox/run_warm.py"]); no ENTRYPOINT/CMD
