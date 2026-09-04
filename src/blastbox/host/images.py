@@ -74,10 +74,11 @@ ROOTFS_KINDS = frozenset({"dir", "ext4"})
 _NAME_RE = re.compile(r"^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*$")
 
 # An upstream reference: repo[:tag][@digest], optionally registry/namespace.
+_COMPONENT = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
 _REF_RE = re.compile(
-    r"^[a-z0-9]+(?:[._-][a-z0-9]+)*"
+    r"^" + _COMPONENT +
     r"(?::[0-9]+)?"                       # registry port
-    r"(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*"
+    r"(?:/" + _COMPONENT + r")*"
     r"(?::[A-Za-z0-9_][A-Za-z0-9._-]*)?"
     r"(?:@sha256:[0-9a-f]{64})?$"
 )
@@ -204,9 +205,20 @@ def load_plan(root: Path | str) -> Plan:
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise PlanError(f"{path}: {exc}") from exc
 
-    engine = str((data.get("engine") or {}).get("name") or "").strip()
+    raw_engine = data.get("engine") or {}
+    if not isinstance(raw_engine, dict):
+        raise PlanError(f"{path}: [engine] must be a table with a name")
+    engine = str(raw_engine.get("name") or "").strip()
     if not _NAME_RE.match(engine):
         raise PlanError(f"{path}: [engine].name must be a plain name, got {engine!r}")
+
+    unknown_top = sorted(set(data) - {"engine", "image", "rootfs"})
+    if unknown_top:
+        # `[[images]]` instead of `[[image]]` parses fine and declares nothing.
+        raise PlanError(
+            f"{path}: unknown top-level section(s) {unknown_top}; "
+            "expected [engine], [[image]] and [[rootfs]]"
+        )
 
     raw_images = data.get("image") or []
     if isinstance(raw_images, dict):
@@ -374,15 +386,16 @@ def load_plan(root: Path | str) -> Plan:
 
     dests: dict[str, str] = {}
     for rf in rootfs:
-        # Compared as DECLARED: two entries resolving to one path means the
-        # second silently overwrites the first, and which one survives depends
-        # on declaration order.
-        if rf.dest in dests:
+        # Compared RESOLVED, not as written: `$A/x` and `$B/x` are different
+        # strings that are the same path when both point at the same directory,
+        # and the second would silently overwrite the first.
+        key = rf.resolved_dest()
+        if key in dests:
             raise PlanError(
-                f"{path}: {rf.image!r} and {dests[rf.dest]!r} both export to "
-                f"{rf.dest!r}; the second would overwrite the first"
+                f"{path}: {rf.image!r} and {dests[key]!r} both export to "
+                f"{key!r}; the second would overwrite the first"
             )
-        dests[rf.dest] = rf.image
+        dests[key] = rf.image
 
     return Plan(engine=engine, images=tuple(images), rootfs=tuple(rootfs), root=root)
 
@@ -401,7 +414,13 @@ def _requires(path: Path, index: int, value: object) -> tuple[str, ...]:
             f"{path}: [[rootfs]] #{index + 1} requires must be an ARRAY of paths, "
             f'got {value!r}. Write requires = ["/init"].'
         )
-    return tuple(str(r) for r in value)
+    for r in value:
+        if not isinstance(r, str):
+            raise PlanError(
+                f"{path}: [[rootfs]] #{index + 1} requires entries must be paths, "
+                f"got {r!r}"
+            )
+    return tuple(value)
 
 
 def check_tag(tag: str) -> None:
@@ -494,11 +513,20 @@ def arg_problems(plan: Plan, env: dict[str, str] | None = None) -> list[str]:
         # (`JDK_BUILD_IMGE`) is discarded by docker, so the stage keeps its
         # mutable default while the plan reads as if it were pinned -- the same
         # silent failure as a wrong base_arg, one level down.
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            # A declared-but-unreadable Dockerfile is a finding, not a crash:
+            # this function's job is to REPORT problems with the plan.
+            out.append(f"{spec.name}: cannot read {path} ({exc})")
+            continue
+        # Continuations joined first: `ARG FOO \` + `BAR` is one instruction
+        # declaring FOO, and a line-by-line match would invent an ARG named BAR.
+        joined = re.sub(r"\\\n[ \t]*", " ", text)
         declared = set(
             re.findall(
-                r"(?i)^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)",
-                path.read_text(encoding="utf-8"),
-                re.MULTILINE,
+                r"(?im)^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)",
+                joined,
             )
         )
         for key in sorted(spec.build_args):

@@ -542,3 +542,81 @@ def test_the_dry_run_shows_declared_build_args(tmp_path: Path) -> None:
     plan = load_plan(_plan(tmp_path, TITANARUM))
     out = describe(plan, "t9", {"TITANARUM_FC_DIR": "/f"})
     assert "--build-arg JDK_BUILD_IMAGE=eclipse-temurin:25-jdk" in out
+
+
+@pytest.mark.parametrize("ok", ["my__base:1", "a--b/c--d:tag", "reg.io:5000/a__b:1"])
+def test_repeated_separators_in_a_base_reference_are_accepted(tmp_path: Path, ok: str) -> None:
+    """Same grammar as image names. My first reference pattern over-rejected
+    these, which is the mistake I had already made once on names."""
+    text = TITANARUM.replace('base = "eclipse-temurin:25-jre"', f'base = "{ok}"', 1)
+    assert load_plan(_plan(tmp_path, text)).images[0].base == ok
+
+
+def test_an_unknown_top_level_section_is_refused(tmp_path: Path) -> None:
+    """`[[images]]` parses fine as TOML and declares nothing."""
+    with pytest.raises(PlanError) as e:
+        load_plan(_plan(tmp_path, TITANARUM.replace("[[image]]", "[[images]]", 1)))
+    assert "unknown top-level section" in str(e.value)
+
+
+def test_a_non_table_engine_section_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(PlanError) as e:
+        load_plan(_plan(tmp_path, 'engine = "titanarum"\n[[image]]\nname = "a"\ndockerfile = "D"\nbase = "u:1"\n'))
+    assert "must be a table" in str(e.value)
+
+
+def test_a_non_string_requirement_is_refused(tmp_path: Path) -> None:
+    text = TITANARUM.replace('requires = ["/init"]', "requires = [1]")
+    with pytest.raises(PlanError) as e:
+        load_plan(_plan(tmp_path, text))
+    assert "must be paths" in str(e.value)
+
+
+def test_destinations_colliding_after_resolution_are_refused(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`$A/x` and `$B/x` are different strings and the same path."""
+    monkeypatch.setenv("TITANARUM_FC_DIR", "/shared")
+    monkeypatch.setenv("OTHER_DIR", "/shared")
+    extra = (
+        '\n[[rootfs]]\nkind = "ext4"\nimage = "titanarum-base"\n'
+        'dest = "$OTHER_DIR/titanarum-rootfs.ext4"\nsize_mib = 512\n'
+    )
+    with pytest.raises(PlanError) as e:
+        load_plan(_plan(tmp_path, TITANARUM + extra))
+    assert "would overwrite" in str(e.value)
+
+
+def test_an_arg_split_across_a_continuation_is_read_correctly(tmp_path: Path) -> None:
+    """`ARG FOO \\` + `BAR` is ONE instruction declaring FOO.
+
+    A line-by-line match would invent an ARG named BAR and then report the real
+    missing one as present.
+    """
+    from blastbox.host.images import arg_problems
+
+    d = tmp_path / "deploy" / "docker"
+    d.mkdir(parents=True)
+    (d / "Dockerfile.titanarum-base").write_text(
+        "ARG BASE_IMAGE\nARG JDK_BUILD_IMAGE \\\n     ZXING_BUILD_IMAGE\nFROM ${BASE_IMAGE}\n"
+    )
+    plan = load_plan(_plan(tmp_path, TITANARUM))
+    problems = [p for p in arg_problems(plan, {}) if "titanarum-base" in p]
+    assert any("ZXING_BUILD_IMAGE" in p for p in problems), problems
+
+
+def test_an_unreadable_dockerfile_is_reported_not_raised(tmp_path: Path) -> None:
+    """This function's job is to REPORT problems with the plan."""
+    from blastbox.host.images import arg_problems
+
+    d = tmp_path / "deploy" / "docker"
+    d.mkdir(parents=True)
+    f = d / "Dockerfile.titanarum-base"
+    f.write_text("ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\n")
+    f.chmod(0o000)
+    plan = load_plan(_plan(tmp_path, TITANARUM))
+    try:
+        problems = arg_problems(plan, {})
+    finally:
+        f.chmod(0o644)
+    assert any("cannot read" in p for p in problems), problems
