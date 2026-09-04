@@ -1428,8 +1428,17 @@ def run_plan(
         plan, tag, blastbox_version=blastbox_version, env=env, run=run, log=log
     )
     log("\n>> verify: every image must record what it was built from")
-    verified = verify_built(staged_tags, run=run, log=log)
     staging = _staging_tag(tag)
+    try:
+        verified = verify_built(staged_tags, run=run, log=log)
+    except BaseException:
+        # Deliberately NOT cleaned up. The staging tags are the only names these
+        # images have, and an operator diagnosing why verification refused one
+        # needs to be able to `docker inspect` it. They are clearly marked and
+        # scoped to this pid; dropping them here would leave dangling images and
+        # a question nobody can answer.
+        log(f"   images left tagged :{staging} for inspection")
+        raise
     # Staged FIRST, all of them, then published. Publishing each as it is built
     # leaves the earlier destinations on the new release and the later ones on
     # the old when a later export fails -- the warm tiers then run a mixed

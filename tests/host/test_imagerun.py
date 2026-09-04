@@ -2959,3 +2959,40 @@ def test_the_default_extraction_is_still_refused_without_privilege(
             log=lambda _: None,
         )
     assert "not root and has no passwordless sudo" in str(e.value)
+
+
+def test_a_verification_failure_leaves_the_images_inspectable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The staging tags are the only names these images have.
+
+    Dropping them when verification refuses one would leave a dangling image
+    and a question nobody can answer -- so they stay, and the run says so.
+    """
+    import blastbox.host.imagerun as mod
+
+    _resolves_to(monkeypatch)
+    monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
+    monkeypatch.setattr(
+        mod, "_read_stamp", lambda i, r=None: _FakeStamp(reproducible=False)
+    )
+    monkeypatch.setenv("DEMO_DIR", str(tmp_path / "out"))
+    said: list[str] = []
+    removed: list[list[str]] = []
+    run = FakeRunner()
+
+    def watched(argv, **kw):
+        if list(argv)[:2] == ["docker", "rmi"]:
+            removed.append(list(argv))
+        return run(argv, **kw)
+
+    with pytest.raises(BuildError):
+        run_plan(
+            _plan(tmp_path),
+            "t1",
+            blastbox_version="0.1.34",
+            run=watched,
+            log=said.append,
+        )
+    assert not removed, removed
+    assert any(mod._staging_tag("t1") in s for s in said), said
