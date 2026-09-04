@@ -1465,3 +1465,72 @@ def test_equal_releases_spelled_with_different_precision_agree(monkeypatch):
     monkeypatch.setattr(doctor, "version_in_image", lambda i, r=None: ("0.2.0", ""))
     agrees, detail = mod.verify_contents("demo:t1")
     assert agrees is not False, detail
+
+
+def _stamp_with(ident):
+    return Stamp(
+        blastbox="0.1.39",
+        revision="b" * 40,
+        base_name="demo-base:t1",
+        base_digest=ident,
+        base_image_id=ident,
+    )
+
+
+def _answers(result, ident=""):
+    calls = []
+
+    def run(argv):
+        calls.append(argv)
+        if result == "absent":
+            return subprocess.CompletedProcess(argv, 1, "", "No such image")
+        return subprocess.CompletedProcess(argv, 0, ident + "\n", "")
+
+    return run, calls
+
+
+def test_base_check_reports_an_absent_base_as_absent():
+    """A base that is GONE cannot be rebuilt from, and must not read as agreeing."""
+    recorded = "sha256:" + "c" * 64
+    run, calls = _answers("absent")
+    present, moved = _stamp_with(recorded).base_check(run)
+    assert present is False and moved == ""
+    assert len(calls) == 1, calls
+
+
+def test_base_check_reports_a_base_that_moved():
+    recorded = "sha256:" + "c" * 64
+    now = "sha256:" + "d" * 64
+    run, calls = _answers("present", now)
+    present, moved = _stamp_with(recorded).base_check(run)
+    assert present is True and moved == now
+    assert len(calls) == 1, "presence and identity took more than one inspection"
+
+
+def test_base_check_is_quiet_when_the_base_still_agrees():
+    recorded = "sha256:" + "c" * 64
+    run, _ = _answers("present", recorded)
+    assert _stamp_with(recorded).base_check(run) == (True, "")
+
+
+def test_a_digest_pinned_base_is_still_checked_for_PRESENCE():
+    """A digest reference cannot move. It can still be gone.
+
+    Those are different answers, and absence is the one `resolvable` was asked
+    for -- skipping the inspection for immutable references accepted an image
+    whose recorded base is no longer on the host.
+    """
+    st = Stamp(
+        blastbox="0.1.39",
+        revision="b" * 40,
+        base_name="demo-base@sha256:" + "c" * 64,
+        base_digest="sha256:" + "c" * 64,
+        base_image_id="sha256:" + "c" * 64,
+    )
+    gone, calls = _answers("absent")
+    assert st.base_check(gone) == (False, "")
+    assert len(calls) == 1, "a digest-pinned base was never looked for"
+
+    # Present, and never reported as moved however the id reads back.
+    here, _ = _answers("present", "sha256:" + "f" * 64)
+    assert st.base_check(here) == (True, "")

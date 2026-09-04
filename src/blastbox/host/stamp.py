@@ -170,6 +170,36 @@ class Stamp:
             f"{(proc.stderr or '').strip()[:120]}"
         )
 
+    def base_check(
+        self, runner: Runner | None = None, ref: str | None = None
+    ) -> tuple[bool, str]:
+        """``(present, moved_to)`` for the recorded base, from ONE inspection.
+
+        `resolvable()` and `base_moved()` each ask docker independently. Called
+        one after the other -- which is what verification did -- a tag that
+        still points at the recorded image during the first call and is
+        retagged before the second reports "present, and nothing moved", and
+        the replacement's ID is never compared with the record at all. That is
+        the concurrent-retag case the pair exists to catch, surviving between
+        the two questions.
+
+        ``moved_to`` is "" when there is nothing to report: pinned by digest,
+        nothing recorded to compare, or still the stamped image.
+        """
+        present, current = self.base_state(runner, ref)
+        if not present:
+            return False, ""
+        # A digest reference cannot MOVE, but it can be gone -- which is a
+        # different answer, and the one `resolvable` was asked for. Skipping the
+        # inspection entirely for these accepted an image whose recorded base is
+        # no longer on the host.
+        if "@sha256:" in (self.base_name or ""):
+            return True, ""
+        recorded = self.base_image_id or ""
+        if not _DIGEST_RE.match(recorded) or (self.base_name or "") in (UNKNOWN, ""):
+            return True, ""
+        return True, ("" if current == recorded else current)
+
     def resolvable(self, runner: Runner | None = None, ref: str | None = None) -> bool:
         """Whether the recorded base is STILL present on this host.
 

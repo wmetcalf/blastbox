@@ -23,8 +23,12 @@ continuations joined, and lock pins -- and never ``docs/`` or ``tests/``.
 
 from __future__ import annotations
 
+import os
+import stat
 import re
-from collections.abc import Sequence
+import shlex
+from collections.abc import Callable, Sequence, Set as AbstractSet
+from typing import Any
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -136,9 +140,29 @@ class Pin:
 
 
 def _strip_comment(line: str) -> str:
-    """Drop a trailing ``#`` comment. Prose lives there; pins do not."""
-    hashpos = line.find("#")
-    return line if hashpos < 0 else line[:hashpos]
+    """Drop a trailing ``#`` comment. Prose lives there; pins do not.
+
+    A comment starts only at the beginning of the line or after whitespace --
+    pip's documented rule, and the shell's. Cutting at ANY ``#`` truncated a
+    VCS requirement at its fragment, so
+    `pip install git+https://.../blastbox.git#egg=blastbox[s3]` read as an
+    install of nothing in particular.
+
+    Quoted text is data, not a comment: `RUN echo "step # 1" && pip install
+    blastbox==2` is one command whose pin lives AFTER the hash, and cutting
+    there hid the install from `pins --set`, which then reported success while
+    that Dockerfile stayed stale.
+    """
+    quote: str | None = None
+    for index, char in enumerate(line):
+        if quote is not None:
+            if char == quote:
+                quote = None
+        elif char in "\"'":
+            quote = char
+        elif char == "#" and (index == 0 or line[index - 1].isspace()):
+            return line[:index]
+    return line
 
 
 def _logical_lines(text: str) -> list[tuple[int, str]]:
@@ -448,7 +472,7 @@ def _scan_toml_lock(path: Path) -> list[Pin]:
 
 def _scan_lock(path: Path) -> list[Pin]:
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = _read_requirements(path).splitlines()
     except OSError as exc:
         raise PinScanError(f"{path}: {exc}") from exc
     out: list[Pin] = []
@@ -488,8 +512,97 @@ def _walk(root: Path):
             if entry.is_dir():
                 if entry.name not in _SKIP_DIRS:
                     stack.append(entry)
-            else:
+            elif entry.is_file():
+                # REGULAR files only, for the same reason symlinks are skipped:
+                # a FIFO named `pipe.lock` looks like a candidate lock and
+                # blocks forever when opened, and a character device reads
+                # without end. `is_file()` is False for both.
                 yield entry
+
+
+_REQ_NAME_RE = re.compile(
+    r"(requirements|constraints)[\w.\-]*\.(txt|lock)|[\w.\-]+\.lock"
+)
+# Files that plausibly RUN a pip install. Bounded by name on purpose: the
+# alternative is reading every file in the repository, and a consumer tree
+# holds VM images and corpora.
+_INSTALL_SCRIPT_RE = re.compile(
+    r"(?i)^(dockerfile.*|makefile|.*\.(sh|bash|mk|ya?ml|dockerfile))$"
+)
+# Enough for any install script; anything larger is data we should not open.
+_READ_LIMIT = 1 << 20
+# pip documents `--hash <hash>` and accepts `--hash=<hash>`; both are hashed.
+_HASH_RE = re.compile(r"--hash[=\s]+\S+")
+# Generated hash locks are legitimately large -- a full closure with two hashes
+# per entry runs to megabytes -- so a RECOGNISED lock gets a generous bound and
+# an error beyond it. Silently reading it as empty makes the file look like it
+# holds no blastbox pin, and `pins --set` then updates every other pin and
+# reports success while the lock stays stale.
+_LOCK_READ_LIMIT = 64 << 20
+
+
+# Anything pip would plausibly be handed with `-r`. Broader than the set we
+# JUDGE: an aggregator named `all.txt` holds nothing but `-r` lines, so it is
+# never a lock itself, but it is what makes its two siblings one install set.
+_INSTALL_INPUT_RE = re.compile(r"(?i)^[\w.\-]+\.(txt|in|lock)$")
+
+
+def _is_install_input(path: Path) -> bool:
+    """Whether ``path`` could name other requirement files."""
+    return bool(_INSTALL_INPUT_RE.fullmatch(path.name)) or _is_requirements_file(path)
+
+
+def _is_requirements_file(path: Path) -> bool:
+    """Whether ``path`` is a lock this check should JUDGE."""
+    return bool(
+        _REQ_NAME_RE.fullmatch(path.name)
+        or (path.parent.name == "requirements" and path.name.endswith(".txt"))
+    )
+
+
+def _read_requirements(path: Path) -> str:
+    """Read a recognised requirements file, refusing to treat it as absent.
+
+    `_read_small` returns "" for anything oversized, which is the right answer
+    for a file we merely guessed at and the WRONG one for a lock: it would look
+    like it carries no blastbox pin, and the bump would be accepted with that
+    lock left stale.
+    """
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        raise PinScanError(f"{path}: {exc}") from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise PinScanError(f"{path}: not a regular file; refusing to read it")
+    if st.st_size > _LOCK_READ_LIMIT:
+        raise PinScanError(
+            f"{path}: {st.st_size} bytes is too large to read as a requirements "
+            "file. Treating it as empty would report every dependency present."
+        )
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise PinScanError(f"{path}: {exc}") from exc
+
+
+def _read_small(path: Path) -> str:
+    """Read a text file, or "" if it is unreadable or too large to be one.
+
+    `_walk` yields every file in the repo, and reading them all as UTF-8 to look
+    for `-r` lines pulls archives, database snapshots and VM images into memory.
+    """
+    try:
+        st = os.lstat(path)
+        # REGULAR files only, and checked here because this is the one place
+        # that opens anything. `_walk` yields whatever is in the tree, so a FIFO
+        # named `pipe.lock` looks like a candidate lock -- and opening it blocks
+        # forever, from a file the scanner was merely told to look at. A
+        # character device is the same hazard with unbounded reads instead.
+        if not stat.S_ISREG(st.st_mode) or st.st_size > _READ_LIMIT:
+            return ""
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 def scan(root: Path) -> list[Pin]:
@@ -505,9 +618,7 @@ def scan(root: Path) -> list[Pin]:
             pins.extend(_scan_dockerfile(path))
         elif name in _TOML_LOCK_NAMES:
             pins.extend(_scan_toml_lock(path))
-        elif re.fullmatch(
-            r"(requirements|constraints)[\w.\-]*\.(txt|lock)|[\w.\-]+\.lock", name
-        ) or (path.parent.name == "requirements" and name.endswith(".txt")):
+        elif _is_requirements_file(path):
             pins.extend(_scan_lock(path))
     return sorted(pins, key=lambda p: (p.path, p.line))
 
@@ -695,47 +806,6 @@ def _eol_of(line: str) -> str:
     return "\n" if line.endswith("\n") else ""
 
 
-def missing_from_locks(root: Path, requires: Sequence[str]) -> dict[str, list[str]]:
-    """Runtime dependencies of a release that hash-pinned locks do not carry.
-
-    `pip install --require-hashes` refuses the WHOLE file when any dependency
-    it must resolve is not pinned there:
-
-        ERROR: In --require-hashes mode, all requirements must have their
-        versions pinned with ==. These do not: pydantic>=2.6.0 (from blastbox)
-
-    So a release that gains a dependency turns every consumer's hash-pinned
-    lock into a lock that cannot install -- and `pins --set` rewrites only the
-    blastbox line, which makes the bump look successful right up until the
-    image build fails. Measured: blastbox 0.1.39 added `packaging`, which no
-    consumer lock carried.
-
-    Only the BASE requirements are checked. Extras are conditional on what the
-    consumer installs, and this cannot know which; reporting `boto3` missing
-    from a lock for a repo that never asked for `blastbox[s3]` would be noise
-    that teaches people to ignore the check.
-    """
-    out: dict[str, list[str]] = {}
-    wanted = [_dist_name(r) for r in requires]
-    wanted = [name for name in wanted if name]
-    for path in _walk(root):
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        if "--hash=" not in text:
-            continue  # not hash-pinned; pip resolves the rest itself
-        have = {
-            _dist_name(line)
-            for line in text.splitlines()
-            if "==" in line and not line.lstrip().startswith("#")
-        }
-        gaps = [name for name in wanted if name not in have]
-        if gaps:
-            out[str(path)] = gaps
-    return out
-
-
 def _dist_name(requirement: str) -> str:
     """The normalised distribution name in a requirement line, or "".
 
@@ -748,6 +818,1199 @@ def _dist_name(requirement: str) -> str:
     if not match:
         return ""
     return re.sub(r"[-_.]+", "-", match.group(1)).lower()
+
+
+@dataclass(frozen=True)
+class _Pin:
+    """One pinned requirement as a lock states it."""
+
+    version: str
+    marker: str
+    hashed: bool
+    # Extras named on THIS entry (`blastbox[host]==...`). Kept per entry because
+    # a portable lock can pin blastbox twice under exclusive markers, and
+    # unioning both would check a closure pip never installs.
+    extras: frozenset[str] = frozenset()
+
+
+def missing_from_locks(
+    root: Path,
+    requires: Sequence[str],
+    *,
+    environment: dict[str, str] | None = None,
+    requirements_of: Callable[[str, str], list[str] | None] | None = None,
+) -> dict[str, list[str]]:
+    """Requirements of a release that a hash-pinned blastbox lock cannot satisfy.
+
+    `pip install --require-hashes` refuses the WHOLE file when a dependency it
+    must resolve is not pinned there:
+
+        ERROR: In --require-hashes mode, all requirements must have their
+        versions pinned with ==. These do not: pydantic>=2.6.0 (from blastbox)
+
+    So a release that gains a dependency turns every consumer's hash-pinned
+    lock into a lock that cannot install -- and `pins --set` rewrites only the
+    blastbox line, which makes the bump look successful right up until the
+    image build fails. Measured: blastbox 0.1.39 added `packaging`, which no
+    consumer lock carried.
+
+    Judged per INSTALL SET, not per file. `-r` includes are followed and only
+    the roots of the include graph are examined: `pip install -r all.txt` where
+    `all.txt` names blastbox.lock and deps.lock installs them together, so
+    judging blastbox.lock alone reports everything deps.lock carries.
+
+    Every requirement is checked against the entries whose MARKERS apply to the
+    lock's environment -- a portable lock legitimately pins one distribution
+    twice under mutually exclusive markers -- and a pin only counts when it is
+    HASHED, since an unhashed entry in an included file fails the same install
+    it appears to satisfy.
+    """
+    out: dict[str, list[str]] = {}
+    parsed = [_requirement(r) for r in requires]
+    sets = _install_sets(root)
+    roots = [member for members in sets for member in members]
+    for members in sets:
+        pins, env = _merged_pins(members, root)
+        if "blastbox" not in pins:
+            continue  # somebody else's requirements; not ours to judge
+        if not any(pin.hashed for entries in pins.values() for pin in entries):
+            continue  # not hash-pinned; pip resolves the rest itself
+        # A universal lock is judged on EVERY branch it claims to cover.
+        scopes = _scopes_for(env, environment)
+        found: dict[str, list[str]] = {}
+        for label, scope in scopes:
+            for gap in _judge_scope(
+                members, root, roots, pins, scope, parsed, requirements_of
+            ):
+                found.setdefault(gap, []).append(label)
+        gaps = [
+            gap
+            if len(scopes) == 1 or len(where) == len(scopes)
+            else f"{gap} [on {', '.join(where)}]"
+            for gap, where in found.items()
+        ]
+        if gaps:
+            out[" + ".join(str(m) for m in members)] = gaps
+    return out
+
+
+def _transitive_gaps(
+    parsed: Sequence[Any],
+    extras: set[str],
+    pins: dict[str, list[_Pin]],
+    scope: dict[str, str],
+    requirements_of: Callable[[str, str], list[str] | None],
+) -> list[str]:
+    """Everything the pinned packages themselves need and the lock lacks.
+
+    pip resolves the whole graph, not just the top level, and refuses the file
+    when any part of it is unpinned: removing `pydantic-core` from a lock that
+    pins `pydantic` fails the install although blastbox never names it. Four of
+    the seven packages in the differential fixture are of that kind, and the
+    checker was silent about all four until this walk existed.
+
+    Breadth-first from the requirements that apply, through the versions this
+    lock actually pins, carrying each requirement's own extras.
+
+    Silent when metadata cannot be fetched: one unreachable index is an unknown
+    edge, not evidence of a gap, and refusing a bump over it would be worse
+    than the drift it guards against.
+    """
+    gaps: list[str] = []
+    seen: set[tuple[str, str, frozenset[str]]] = set()
+    queue: list[tuple[Any, frozenset[str]]] = [
+        (req, frozenset(extras))
+        for req in parsed
+        if req is not None and _applies(req, extras, scope)
+    ]
+    while queue:
+        req, _active = queue.pop()
+        name = _dist_name(req.name)
+        usable = [
+            pin
+            for pin in pins.get(name, [])
+            if pin.hashed
+            and _marker_holds(pin.marker, scope)
+            and (not req.specifier or _satisfies(req, pin.version))
+        ]
+        if not usable:
+            continue  # the direct pass already reported it, or it does not apply
+        wanted = frozenset(e.lower() for e in (req.extras or set()))
+        # The extras are PART of the identity. `parent[feature]` requiring both
+        # `child[a]` and `child[b]` visits child twice, and a key of
+        # (name, version) makes the second visit a no-op -- so a lock carrying
+        # a's dependencies but not b's is accepted although pip enables both.
+        key = (name, usable[0].version, wanted)
+        if key in seen:
+            continue
+        seen.add(key)
+        nested = requirements_of(name, usable[0].version)
+        if nested is None:
+            continue
+        for sub in (_requirement(r) for r in nested):
+            if sub is None or not _applies(sub, wanted, scope):
+                continue
+            sub_name = _dist_name(sub.name)
+            fits = [
+                pin
+                for pin in pins.get(sub_name, [])
+                if pin.hashed
+                and _marker_holds(pin.marker, scope)
+                and (not sub.specifier or _satisfies(sub, pin.version))
+            ]
+            if not fits:
+                gaps.append(f"{sub_name} (needed by {name})")
+                continue
+            queue.append((sub, wanted))
+    return sorted(set(gaps))
+
+
+def _pip_enforces(req, enforced: set[str], scope: dict[str, str]) -> bool:
+    """Whether pip itself will demand ``req`` for this lock.
+
+    A base requirement always. An extra-gated one only when the lock LINE names
+    that extra -- `blastbox[host]==...` binds pip, a plain `blastbox==...` does
+    not, whatever the repository declares elsewhere.
+    """
+    marker = str(getattr(req, "marker", "") or "")
+    if "extra ==" not in marker:
+        return True
+    return _applies(req, enforced, scope) if enforced else False
+
+
+def _gap(
+    req,
+    pins: dict[str, list[_Pin]],
+    scope: dict[str, str],
+    requirements_of: Callable[[str, str], list[str] | None] | None = None,
+) -> str:
+    """How ``req`` is unsatisfied by ``pins``, or "" when it is satisfied."""
+    name = _dist_name(req.name)
+    applicable = [p for p in pins.get(name, []) if _marker_holds(p.marker, scope)]
+    if not applicable:
+        return name
+    usable = [p for p in applicable if p.hashed]
+    if not usable:
+        return f"{name} (pinned but not hashed)"
+    matching = [p for p in usable if not req.specifier or _satisfies(req, p.version)]
+    if not matching:
+        shown = ", ".join(sorted({p.version for p in usable}))
+        return f"{name} (pinned {shown}, needs {req.specifier})"
+    return ""
+
+
+def _install_roots(root: Path) -> list[Path]:
+    """Requirement files that something actually installs -- one per set.
+
+    A file included by another is installed as PART of that set, so judging it
+    alone reports pins present in its sibling. But inclusion does not prove it
+    is never an entrypoint: a Dockerfile may install `prod.lock` directly while
+    `dev.lock` includes it, and dropping it from the roots would check only the
+    dev closure and accept a bump that leaves production failing. So a file
+    named by an install command counts as a root even when it is also included.
+    """
+    # A candidate is a lock by NAME, or a file that aggregates other
+    # requirement files. An aggregator named `all.txt` holds nothing but `-r`
+    # lines, so it is never a lock itself -- and excluding it while marking its
+    # children included left NO roots, so nothing was judged and every closure
+    # passed. Ordinary `.txt` files that include nothing stay out: they are
+    # fixtures and corpora, not install sets.
+    inputs: list[Path] = []
+    # Direct references are resolved FIRST: pip imposes no suffix convention, so
+    # `pip install -r prod.pins` names a real install set that the name filter
+    # would otherwise keep out of the candidate list entirely.
+    direct: set[Path] = set()
+    for path in _walk(root):
+        if _INSTALL_SCRIPT_RE.fullmatch(path.name) and not _is_install_input(path):
+            direct |= set(_referenced(path, root))
+    included: set[Path] = set()
+    aggregates: set[Path] = set()
+    for path in _walk(root):
+        if not _is_install_input(path) and path.resolve() not in direct:
+            continue
+        inputs.append(path)
+        names = _includes(path, root)  # read once; used for both decisions
+        included |= set(names)
+        if names:
+            aggregates.add(path.resolve())
+
+    candidates = [
+        p
+        for p in inputs
+        if p.resolve() in aggregates
+        or p.resolve() in direct
+        or _is_requirements_file(p)
+    ]
+    return [
+        p for p in candidates if p.resolve() not in included or p.resolve() in direct
+    ]
+
+
+def _constraint_conflicts(
+    members: Sequence[Path],
+    root: Path,
+    pins: dict[str, list[_Pin]],
+    scope: dict[str, str],
+) -> list[str]:
+    """Pins this set's own `-c` files exclude -- an install pip will refuse."""
+    from packaging.version import InvalidVersion  # noqa: PLC0415
+
+    out: list[str] = []
+    specs = _constraint_specs(members, root)
+    if not specs:
+        return out
+    for name, entries in sorted(pins.items()):
+        spec_source = specs.get(name)
+        if spec_source is None:
+            continue
+        specifier, source = spec_source
+        for pin in entries:
+            if not _marker_holds(pin.marker, scope):
+                continue
+            version = pin.version.lstrip("=").strip()
+            if not version:
+                continue
+            try:
+                allowed = specifier.contains(version, prereleases=True)
+            except InvalidVersion:
+                continue  # not a version we can compare; not evidence of a conflict
+            if not allowed:
+                out.append(
+                    f"{name}=={version} is excluded by the constraint "
+                    f"{name}{specifier} in {source}"
+                )
+                break
+    return out
+
+
+def _constraint_specs(
+    members: Sequence[Path], root: Path
+) -> dict[str, tuple[Any, Path]]:
+    """`{name: (specifier, source)}` constraining this install set.
+
+    A constraint installs nothing; it restricts what a version may be. A root
+    pinning `packaging==26.3` under a constraint of `packaging==22` is a lock
+    pip REFUSES to resolve -- and the closure check called it complete, because
+    every name it wanted was present and hashed. pip documents `-c` as
+    repeatable and follows it recursively, so both roles are walked: a
+    requirements file contributes its `-c` targets, a constraint file
+    contributes its own lines and its own references.
+    """
+    out: dict[str, tuple[Any, Path]] = {}
+    seen: set[tuple[Path, bool]] = set()
+
+    def walk(path: Path, *, constraining: bool) -> None:
+        key = (path.resolve(), constraining)
+        if key in seen:
+            return
+        seen.add(key)
+        try:
+            text = _read_requirements(path)
+        except PinScanError:
+            return  # unreadable here is not a verdict; the caller already reports it
+        for line in _joined_lines(text):
+            references = _requirement_args(line)
+            constraints = _constraint_args(line)
+            for name in constraints:
+                target = _safe_include(path.parent / name, root)
+                if target is not None:
+                    walk(target, constraining=True)
+            for name in references:
+                target = _safe_include(path.parent / name, root)
+                if target is not None:
+                    walk(target, constraining=constraining)
+            if not constraining or references or constraints:
+                continue
+            # A constraint file may be hashed like any other: the hash
+            # arguments are not part of the requirement grammar, so they come
+            # off before parsing or every hashed constraint reads as absent.
+            req = _requirement(_HASH_RE.sub("", _strip_comment(line)).strip())
+            if req is not None and str(req.specifier):
+                out.setdefault(_dist_name(req.name), (req.specifier, path))
+
+    for member in members:
+        walk(member, constraining=False)
+    return out
+
+
+def _scopes_for(
+    env: dict[str, str], environment: dict[str, str] | None
+) -> list[tuple[str, dict[str, str]]]:
+    """The marker environments one lock must be judged under.
+
+    Normally one: what the lock's header says, with the caller's overrides on
+    top. A `--universal` lock is a different promise -- one file for all
+    operating systems -- so it is judged under each branch it covers, and a
+    requirement that is missing on only some of them says which.
+
+    An explicit caller value still wins: naming `sys_platform` is a deliberate
+    question about one target, and answering a different one would be a lie.
+    """
+    base = {
+        k: v
+        for k, v in {**env, **(environment or {})}.items()
+        if k not in ("__extras__", "__universal__")
+    }
+    if env.get("__universal__") != "1":
+        return [("", base)]
+    return [(label, {**values, **base}) for label, values in _UNIVERSAL_BRANCHES]
+
+
+def _judge_scope(
+    members: Sequence[Path],
+    root: Path,
+    roots: Sequence[Path],
+    pins: dict[str, list[_Pin]],
+    scope: dict[str, str],
+    parsed: Sequence[Any],
+    requirements_of: Callable[[str, str], list[str] | None] | None,
+) -> list[str]:
+    """What this install set is missing IN ONE marker environment."""
+    gaps: list[str] = []
+    # An APPLICABLE blastbox entry. A portable lock whose only blastbox pin
+    # is `; sys_platform == "win32"` does not install blastbox on Linux, so
+    # demanding its dependency closure there refuses a correct lock.
+    if not any(_marker_holds(pin.marker, scope) for pin in pins["blastbox"]):
+        return []
+    # Only from blastbox entries whose own markers apply: a portable lock
+    # may pin `blastbox[host]` for one interpreter and `blastbox[s3]` for
+    # another, and unioning both checks a closure pip never installs.
+    # TWO kinds of extra, and they fail differently. Measured against real
+    # pip in python:3.12-slim, on RedTusk's own lock with fastapi removed:
+    #
+    #     blastbox[host]==...  ->  pip install --require-hashes  FAILS
+    #     blastbox==...        ->  pip install --require-hashes  SUCCEEDS
+    #
+    # Only the extras the LOCK LINE spells are enforced by pip. The ones the
+    # repository merely declares (`blastbox[host,s3]` in pyproject) are not:
+    # uv writes a plain `blastbox==` line, so the install succeeds and the
+    # IMAGE is short a package it imports -- RedTusk's Dockerfiles then run
+    # `pip install -e . --no-deps`, which does not re-check. That is a real
+    # defect and worth reporting, but it is not the same defect, and saying
+    # "pip will reject the file" about it would be false.
+    enforced = {
+        e
+        for pin in pins["blastbox"]
+        if _marker_holds(pin.marker, scope)
+        for e in pin.extras
+    }
+    declared = set()
+    for member in members:
+        declared |= _declared_extras_for(root, member, roots)
+    if not enforced and not declared:
+        declared = _extras_in_play(parsed, pins, scope)
+    extras = enforced | declared
+    extras = _with_nested_extras(extras, parsed, scope)
+    for req in parsed:
+        if req is None or not _applies(req, extras, scope):
+            continue
+        gap = _gap(req, pins, scope, requirements_of)
+        if not gap:
+            continue
+        # Which failure is it? A requirement reachable only through an extra
+        # the lock line does not spell is a RUNTIME hole, not an install
+        # one, and the message says which so an operator is not sent looking
+        # for a pip error that will not happen.
+        if not _pip_enforces(req, enforced, scope):
+            gap += " [not an install failure: the image would import it]"
+        gaps.append(gap)
+    # The TRANSITIVE closure, not just blastbox's own requirements. pip
+    # resolves what the pinned packages themselves need, and refuses the
+    # file when any of it is unpinned: removing `pydantic-core` from a lock
+    # that pins `pydantic` fails the install even though blastbox never
+    # names it. Measured -- four such packages in a seven-package fixture.
+    #
+    # Only with a resolver: without one there is no metadata to walk, and
+    # reporting everything as unverifiable would be noise.
+    if requirements_of is not None:
+        deep = _transitive_gaps(parsed, extras, pins, scope, requirements_of)
+        gaps.extend(g for g in deep if g not in gaps)
+    # A pin the set's own constraints forbid. Everything above asks whether
+    # a version is PRESENT; pip also refuses a resolution its constraints
+    # exclude, and that lock fails the install the check just approved.
+    gaps.extend(
+        g for g in _constraint_conflicts(members, root, pins, scope) if g not in gaps
+    )
+    return gaps
+
+
+def _merged_pins(
+    members: Sequence[Path], root: Path
+) -> tuple[dict[str, list[_Pin]], dict[str, str]]:
+    """One requirement set's pins and target environment, across its files."""
+    pins: dict[str, list[_Pin]] = {}
+    env: dict[str, str] = {}
+    for member in members:
+        sub, _unused, sub_env = _effective_pins(member, root)
+        for name, entries in sub.items():
+            pins.setdefault(name, []).extend(entries)
+        env = {**env, **sub_env}
+    return pins, env
+
+
+def _install_sets(root: Path) -> list[tuple[Path, ...]]:
+    """Install roots, with files ONE command installs together kept together.
+
+    `pip install -r blastbox.lock -r deps.lock` is a single resolution: pip
+    documents `-r` as repeatable, and it merges the files before resolving.
+    Treating each as its own root reported `blastbox.lock` incomplete for
+    dependencies `deps.lock` supplies in the very same command. Files installed
+    by SEPARATE commands stay separate, because those really are separate
+    resolutions.
+    """
+    roots = _install_roots(root)
+    known = {p.resolve(): p for p in roots}
+    sets: list[tuple[Path, ...]] = []
+    seen: set[frozenset[Path]] = set()
+    grouped: set[Path] = set()
+    for path in _walk(root):
+        if not _INSTALL_SCRIPT_RE.fullmatch(path.name) or _is_install_input(path):
+            continue
+        for line in _joined_lines(_read_small(path)):
+            named = [
+                known[r]
+                for r in dict.fromkeys(_referenced_in(line, path.parent, root))
+                if r in known
+            ]
+            if len(named) < 2:
+                continue
+            key = frozenset(p.resolve() for p in named)
+            if key in seen:
+                continue
+            seen.add(key)
+            sets.append(tuple(named))
+            grouped |= key
+    sets.extend((p,) for p in roots if p.resolve() not in grouped)
+    return sets
+
+
+def _install_segments(line: str) -> list[str]:
+    """The parts of a shell line that are pip install commands.
+
+    A script line is not one command. `echo -r prod.lock && pip install -r
+    dev.lock` names two files to a naive reader, and promoting `prod.lock` to
+    an install root judges it ALONE -- blocking a bump for dependencies the
+    `dev.lock` that really includes it supplies.
+    """
+    segments = re.split(r"&&|\|\||[;|]", line)
+    return [seg for seg in segments if _INSTALL_RE.search(seg)]
+
+
+def _referenced(path: Path, root: Path) -> list[Path]:
+    """Requirement files an install script hands to pip with `-r`.
+
+    Resolved against the repository root as well as the script's own directory.
+    `docker build -f deploy/Dockerfile .` copies `prod.lock` from the CONTEXT,
+    so `pip install -r prod.lock` inside it names `<root>/prod.lock`, not
+    `deploy/prod.lock` -- and resolving only the latter drops the reference,
+    which then removes that lock from the roots and accepts its incomplete
+    closure.
+    """
+    out: list[Path] = []
+    # A quoted path is the same path: the shell strips the quotes before pip
+    # ever sees them, and refusing to match one drops a real install set.
+    # Comments stripped: `# old: pip install -r prod.lock` is a note, and
+    # promoting it to a root judges that lock alone -- refusing a bump for
+    # dependencies its real parent install set supplies.
+    # Only from a pip install command: see `_install_segments`.
+    for line in _joined_lines(_read_small(path)):
+        for segment in _install_segments(line):
+            for name in _requirement_args(segment):
+                for base in (path.parent, root):
+                    target = _safe_include(base / name, root)
+                    if target is not None:
+                        out.append(target)
+    return out
+
+
+def _safe_include(path: Path, root: Path) -> Path | None:
+    """``path`` if it is a plain file inside ``root``, else None.
+
+    `_walk` deliberately refuses symlinks and stays inside the repository; an
+    include naming `/dev/zero`, a FIFO, or `../../etc` walks straight past that
+    policy. Reading a FIFO blocks forever and reading /dev/zero exhausts memory,
+    both from a file the scanner was merely told to look at.
+    """
+    try:
+        resolved = path.resolve()
+        resolved.relative_to(root.resolve())
+    except (OSError, ValueError):
+        return None
+    if path.is_symlink() or not resolved.is_file():
+        return None
+    return resolved
+
+
+def _includes(path: Path, root: Path) -> list[Path]:
+    """Paths this requirement file pulls in with `-r` / `--requirement`."""
+    out: list[Path] = []
+    # The bounded LOCK reader for files we recognise: `_read_small` returns ""
+    # past 1 MiB, so a large `dev.lock` looked like it included nothing and its
+    # `prod.lock` stayed an independent root, reported incomplete though it is
+    # only ever installed through the complete dev set.
+    # Strict only for files we RECOGNISE as locks. `_is_install_input` accepts
+    # any `.txt`/`.in`, so using it here sent an unrelated 65 MiB corpus through
+    # the reader that raises -- blocking `pins --set` on a repository whose data
+    # files are none of its business.
+    text = (
+        _read_requirements(path) if _is_requirements_file(path) else _read_small(path)
+    )
+    for raw in _joined_lines(text):
+        for name in _requirement_args(raw):
+            target = _safe_include(path.parent / name, root)
+            if target is not None:
+                out.append(target)
+    return out
+
+
+def _joined_lines(text: str) -> list[str]:
+    """Logical requirement lines, with backslash continuations merged.
+
+    A pin and its hashes are one requirement written across several lines; read
+    separately, the hashes look like entries of their own and the pin looks
+    unhashed.
+    """
+    out: list[str] = []
+    buf = ""
+    for raw in text.splitlines():
+        line = _strip_comment(raw).rstrip()
+        if not line.strip():
+            continue
+        if line.endswith("\\"):
+            buf += line[:-1] + " "
+            continue
+        out.append((buf + line).strip())
+        buf = ""
+    if buf.strip():
+        out.append(buf.strip())
+    return out
+
+
+# uv's bare platform names carry its DEFAULT architecture, measured with
+# `uv pip compile --python-platform <name>` against marker-guarded requirements.
+_WIN = {
+    "sys_platform": "win32",
+    "os_name": "nt",
+    "platform_system": "Windows",
+    "platform_machine": "x86_64",
+}
+_MAC = {
+    "sys_platform": "darwin",
+    "os_name": "posix",
+    "platform_system": "Darwin",
+    "platform_machine": "arm64",
+}
+_NIX = {
+    "sys_platform": "linux",
+    "os_name": "posix",
+    "platform_system": "Linux",
+    "platform_machine": "x86_64",
+}
+# The branches a `--universal` lock promises to cover.
+_UNIVERSAL_BRANCHES = (("linux", _NIX), ("windows", _WIN), ("macos", _MAC))
+
+
+def _generated_command(text: str) -> str:
+    """The compile command a lock records in its LEADING comment block.
+
+    uv and pip-tools write the command they were run with at the top of the
+    file. Searching the whole text for `--python-version` instead let any later
+    note override it -- `# migration target: --python-version 3.13` above a
+    lock generated for 3.12 made the checker evaluate the wrong interpreter and
+    skip a dependency guarded by `python_version < "3.13"`. The header is the
+    only part of a lock that describes the lock; everything after it describes
+    a package.
+    """
+    out: list[str] = []
+    capturing = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            if capturing:
+                break
+            continue
+        if not line.startswith("#"):
+            break  # the header ends where the requirements begin
+        body = line.lstrip("#").strip()
+        if not capturing and re.search(
+            r"\b(uv (pip compile|lock)|pip-compile)\b", body
+        ):
+            capturing = True
+        if capturing:
+            continued = body.endswith("\\")
+            out.append(body.rstrip("\\").strip())
+            if not continued:
+                break
+    return " ".join(out)
+
+
+def _lock_environment(text: str) -> dict[str, str]:
+    """The environment a lock says it was compiled for, if it says.
+
+    uv records its own command line in the header, so a lock produced with
+    `--python-version 3.12` states its target. Evaluating that lock's markers
+    against whatever interpreter happens to run `pins` is how a dependency
+    guarded by `python_version < "3.13"` gets skipped for a 3.12 lock.
+    """
+    out: dict[str, str] = {}
+    # Only the generated header: see `_generated_command`.
+    text = _generated_command(text)
+    if re.search(r"--universal\b", text):
+        # `uv pip compile --universal` generates ONE file compatible with all
+        # operating systems, architectures and Python implementations. Judging
+        # it under the machine that happens to run `pins` accepts a lock whose
+        # Windows install fails: a newly required `winonly; sys_platform ==
+        # "win32"` is simply skipped on Linux.
+        out["__universal__"] = "1"
+    match = re.search(r"--python-version[=\s]+(\d+(?:\.\d+)+)", text)
+    if match:
+        version = match.group(1)
+        full = version if version.count(".") >= 2 else f"{version}.0"
+        out["python_version"] = ".".join(version.split(".")[:2])
+        out["python_full_version"] = full
+    # `uv pip compile --python-platform windows` resolves for a machine that is
+    # not this one, so evaluating that lock's markers against the local
+    # sys_platform skips the requirements it exists to carry. uv takes bare
+    # names and target triples; both are matched here.
+    # `--extra host` (repeatable) is uv recording which optional sets it
+    # resolved. That is authoritative where inference is a guess, and an older
+    # lock missing half a newly grown extra cannot be inferred at all.
+    # NOT `--extra` from the header. That selects the CONSUMER's optional
+    # dependency group, not blastbox's: RedTusk's lock says `--extra host`,
+    # which is redtusk's own `host` group whose contents are
+    # `blastbox[host,s3]`. The names coincide and the meaning does not -- taking
+    # it as blastbox's extras claims `host` for the right reason by accident and
+    # misses `s3` entirely. What the repo asks blastbox for is written in the
+    # requirement itself, which `_declared_blastbox_extras` reads.
+    platform = re.search(r"--python-platform[=\s]+(\S+)", text)
+    if platform:
+        token = platform.group(1).lower()
+        # The bare names carry uv's DEFAULT architecture, which is not the
+        # host's. Measured with `uv pip compile --python-platform <name>`
+        # against marker-guarded requirements, because the help text lists the
+        # aliases without saying what they resolve to:
+        #     macos    -> platform_machine == "arm64"
+        #     linux    -> platform_machine == "x86_64"
+        #     windows  -> platform_machine == "x86_64"
+        # Leaving it to the running interpreter skipped an arm64-guarded
+        # dependency for a macos lock on an x86 Linux host. An explicit target
+        # triple overrides these below.
+        for needle, values in (
+            ("windows", _WIN),
+            ("win32", _WIN),
+            ("msvc", _WIN),
+            ("darwin", _MAC),
+            ("macos", _MAC),
+            ("apple", _MAC),
+            ("linux", _NIX),
+        ):
+            if needle in token:
+                out.update(values)
+                break
+        # The ARCHITECTURE in a target triple. Leaving it to the executing host
+        # skips a requirement guarded by `platform_machine == "aarch64"`
+        # whenever the lock was compiled for one and this machine is not.
+        for arch in (
+            "aarch64",
+            "arm64",
+            "x86_64",
+            "i686",
+            "ppc64le",
+            "s390x",
+            "armv7l",
+        ):
+            if arch not in token:
+                continue
+            # `aarch64-apple-darwin` evaluates as `platform_machine == "arm64"`:
+            # that is what the platform calls the same architecture, and a
+            # requirement guarded by `arm64` would otherwise be skipped.
+            if arch in ("aarch64", "arm64"):
+                out["platform_machine"] = (
+                    "arm64" if out.get("sys_platform") == "darwin" else arch
+                )
+            else:
+                out["platform_machine"] = arch
+            break
+    return out
+
+
+def _exact_pin(line: str) -> tuple[str, frozenset[str], str] | None:
+    """``(name, extras, version)`` for a lock entry pinning one exact version.
+
+    `packaging!=21,==23` is an exact pin whose `==` is not first; pip resolves
+    it to 23 and hashes it like any other. Parsed rather than pattern-matched
+    so the ORDER of the specifiers cannot decide whether a pin is seen.
+    """
+    text = _HASH_RE.sub("", _strip_comment(line)).strip()
+    if not text:
+        return None
+    req = _requirement(text)
+    if req is None:
+        return None
+    exact = [
+        s for s in req.specifier if s.operator in ("==", "===") and "*" not in s.version
+    ]
+    if len(exact) != 1:
+        return None  # no single exact version: pip has a range here, not a pin
+    extras = frozenset(e.strip().lower() for e in (req.extras or set()) if e.strip())
+    return _dist_name(req.name), extras, exact[0].version
+
+
+def _effective_pins(
+    path: Path, root: Path | None = None, _seen: set[Path] | None = None
+) -> tuple[dict[str, list[_Pin]], set[str], dict[str, str]]:
+    """``({name: [pin, ...]}, extras, environment)`` for a file and its includes.
+
+    pip installs `-r other.lock` as part of ONE requirement set, so a split
+    lock is complete even though neither file is on its own.
+    """
+    seen = _seen if _seen is not None else set()
+    resolved = path.resolve()
+    if resolved in seen:
+        return {}, set(), {}  # a cycle; whatever it holds has been read already
+    seen.add(resolved)
+    pins: dict[str, list[_Pin]] = {}
+    extras: set[str] = set()  # kept for signature stability; see _declared_extras
+    env: dict[str, str] = {}
+    # The STRICT reader: this file is a lock we are judging, and reading it as
+    # empty would report its whole closure present. Non-regular files (a FIFO
+    # named `pipe.lock` blocks forever when opened) and oversized ones raise.
+    text = _read_requirements(path)
+    if not text:
+        return pins, extras, env
+    env.update(_lock_environment(text))
+    for line in _joined_lines(text):
+        # One parser for every `-r` spelling, shared with `_includes` and
+        # `_referenced`. This was a third private regex, and it disagreed with
+        # the other two: it stopped a filename at the first quote, so a lock
+        # including `-r "prod set.txt"` had that file's pins silently missing
+        # from its closure and was reported incomplete for pins it installs.
+        references = _requirement_args(line)
+        if references:
+            for name in references:
+                target = _safe_include(path.parent / name, root or path.parent)
+                if target is None:
+                    continue
+                sub, sub_extras, sub_env = _effective_pins(target, root, seen)
+                for pkg, entries in sub.items():
+                    pins.setdefault(pkg, []).extend(entries)
+                extras |= sub_extras
+                env = {**sub_env, **env}
+            continue
+        # The whole requirement, not a leading `==`: a valid hashed entry may
+        # spell its exact pin as `packaging!=21,==23`, and reading only the
+        # first specifier dropped it from the pins entirely -- so a release
+        # needing `packaging>=23` was reported missing against a lock that
+        # pins exactly 23.
+        entry = _exact_pin(line)
+        if entry is None:
+            continue
+        name, entry_extras, version = entry
+        _, _, after = line.partition(";")
+        marker = after.split("--hash")[0].strip() if after else ""
+        pins.setdefault(name, []).append(
+            _Pin(
+                version=version,
+                marker=marker,
+                # BOTH spellings. pip documents `--hash <hash>` and its parser
+                # accepts the space form, so matching only `--hash=` reads a
+                # perfectly good lock as unhashed -- and `set_version` then
+                # rewrites the blastbox version without replacing its hashes.
+                hashed=_HASH_RE.search(line) is not None,
+                extras=entry_extras,
+            )
+        )
+    return pins, extras, env
+
+
+def _marker_holds(marker: str, scope: dict[str, str]) -> bool:
+    """Whether a lock entry's own marker applies. No marker means always."""
+    if not marker:
+        return True
+    from packaging.markers import InvalidMarker, Marker  # noqa: PLC0415
+
+    try:
+        return Marker(marker).evaluate(scope)
+    except (InvalidMarker, Exception):  # noqa: BLE001 -- unreadable: assume it applies
+        return True
+
+
+def _requirement(text: str):
+    """A parsed requirement, or None when it cannot be read.
+
+    Unparseable metadata must not turn into a refusal: this decides whether to
+    BLOCK a version bump, and a requirement nobody can parse is not evidence
+    that a lock is incomplete.
+    """
+    from packaging.requirements import InvalidRequirement, Requirement  # noqa: PLC0415
+
+    try:
+        return Requirement(text)
+    except InvalidRequirement:
+        return None
+
+
+def _applicable_names(pins: dict[str, list[_Pin]], scope: dict[str, str]) -> set[str]:
+    """Distributions this lock actually installs in ``scope``.
+
+    A portable lock carries names whose only entries are `sys_platform ==
+    "win32"`. Counting those as present on Linux infers an extra from packages
+    that are never installed there, and then reports every one of its
+    dependencies missing.
+    """
+    return {
+        name
+        for name, entries in pins.items()
+        if any(_marker_holds(pin.marker, scope) for pin in entries)
+    }
+
+
+def _declared_extras_for(root: Path, lock: Path, roots: Sequence[Path]) -> set[str]:
+    """Blastbox extras that apply to THIS install set.
+
+    A declaration is evidence only about the set that selects it. A `dev`
+    optional group containing `blastbox[host]` says nothing about a separate
+    production lock installing plain blastbox, and demanding host's closure
+    there rejects a correct lock.
+
+    Attributed two ways, both narrow:
+
+    * a file that installs this lock and also names blastbox extras -- a
+      Dockerfile doing `pip install blastbox[host]` beside `-r prod.lock`;
+    * the repository's declarations, but ONLY when there is a single install
+      set, where there is nothing to confuse them with. RedTusk is that case:
+      one lock, and `blastbox[host,s3]` in its pyproject.
+
+    Anything else falls through to inference -- a guess, but a local one.
+    """
+    out: set[str] = set()
+    target = lock.resolve()
+    for path in _walk(root):
+        if not _INSTALL_SCRIPT_RE.fullmatch(path.name) or _is_install_input(path):
+            continue
+        # Per COMMAND, not per file. A multi-stage Dockerfile can install plain
+        # blastbox from prod.lock in one stage and `blastbox[host]` from
+        # dev.lock in another; taking every occurrence in the file applies host
+        # to prod.lock and rejects a lock whose stage never installs it.
+        for line in _joined_lines(_read_small(path)):
+            if target not in set(_referenced_in(line, path.parent, root)):
+                continue
+            out |= {
+                e.strip().lower()
+                for match in re.finditer(r"(?i)\bblastbox\[([^\]]+)\]", line)
+                for e in match.group(1).split(",")
+                if e.strip()
+            }
+    if out:
+        return out
+    return _declared_blastbox_extras(root) if len(roots) == 1 else set()
+
+
+def _shell_tokens(text: str) -> list[str]:
+    """One line, tokenised as a shell would. Empty when it cannot be read.
+
+    `comments=False` because `_strip_comment` has already applied pip's and the
+    shell's rule (a comment opens at whitespace); letting shlex apply its own
+    cut a VCS requirement at its `#egg=` fragment. The single tokeniser exists
+    so the two callers cannot drift apart -- three private copies of the `-r`
+    pattern is exactly how a quoted include stopped being followed.
+    """
+    try:
+        return shlex.split(_strip_comment(text), comments=False)
+    except ValueError:
+        return []  # unbalanced quotes: not a command we can read
+
+
+def _option_args(tokens: Sequence[str], names: tuple[str, str]) -> list[str]:
+    """Filenames given to one repeatable pip option, in every spelling.
+
+    pip accepts `-r file`, `-rfile`, `-r=file` and `--requirement=file`, and
+    documents both `-r` and `-c` as repeatable. One reader for both, because
+    three private copies of this pattern is how a quoted include stopped being
+    followed.
+    """
+    short, long = names
+    out: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in (short, long):
+            if index + 1 < len(tokens):
+                out.append(tokens[index + 1])
+            index += 2
+            continue
+        for prefix in (f"{long}=", f"{short}="):
+            if token.startswith(prefix):
+                out.append(token[len(prefix) :])
+                break
+        else:
+            if token.startswith(short) and len(token) > len(short):
+                out.append(token[len(short) :])  # the attached short form
+        index += 1
+    return out
+
+
+def _requirement_args(text: str) -> list[str]:
+    """Filenames given to `-r` / `--requirement`, parsed as a shell would.
+
+    `pip install -r "prod lock.txt"` names a file with a space in it. A path
+    character class stops at the space and resolves `prod`, which does not
+    exist -- so the real lock is never promoted to a root and its closure is
+    never checked.
+    """
+    return _option_args(_shell_tokens(text), ("-r", "--requirement"))
+
+
+def _constraint_args(text: str) -> list[str]:
+    """Filenames given to `-c` / `--constraint`, parsed as a shell would."""
+    return _option_args(_shell_tokens(text), ("-c", "--constraint"))
+
+
+def _referenced_in(line: str, base: Path, root: Path) -> list[Path]:
+    """Requirement files named by ONE command."""
+    out: list[Path] = []
+    for name in [n for seg in _install_segments(line) for n in _requirement_args(seg)]:
+        for candidate in (base, root):
+            target = _safe_include(candidate / name, root)
+            if target is not None:
+                out.append(target)
+    return out
+
+
+def _extras_of(spec: str) -> set[str]:
+    """The extras named by one requirement string, if it names blastbox.
+
+    Falls back to the name-and-extras PREFIX when the whole requirement will
+    not parse. A Dockerfile writes `blastbox[s3]==${BLASTBOX_VERSION}`, whose
+    specifier is a shell placeholder rather than a version -- ClippyShot's real
+    install line, and dropping it lost the s3 extra entirely. The fallback is
+    anchored, so it only ever reads a token that STARTS as a blastbox
+    requirement, never prose that mentions one.
+    """
+    req = _requirement(spec)
+    if req is not None:
+        if _dist_name(req.name) != "blastbox":
+            return set()
+        return {e.strip().lower() for e in (req.extras or set()) if e.strip()}
+    # Anywhere in the token, because every real spelling of an unparseable
+    # blastbox requirement puts the extras somewhere other than position 0:
+    # a local checkout (`-e /src/blastbox[host]`), a VCS install
+    # (`git+https://.../blastbox.git#egg=blastbox[s3]`), and a placeholder
+    # version (`blastbox[s3]==${BLASTBOX_VERSION}`) all genuinely install it.
+    # Prose is excluded by the CALLER -- only install-command arguments and
+    # declared dependency fields reach here -- not by anchoring this pattern.
+    found: set[str] = set()
+    for match in re.finditer(r"(?i)blastbox\[([^\]]+)\]", spec.strip()):
+        found |= {e.strip().lower() for e in match.group(1).split(",") if e.strip()}
+    return found
+
+
+def _blastbox_extras_in(path: Path) -> set[str]:
+    """Blastbox extras this file actually INSTALLS.
+
+    Parsed, not grepped. `# develop with blastbox[host]` in a comment, or a
+    project description mentioning it, is prose -- and matching it refused a
+    base-only lock for missing every host dependency that no install path asks
+    for.
+    """
+    out: set[str] = set()
+    text = _read_small(path)
+    if path.name == "pyproject.toml":
+        try:
+            data = tomllib.loads(text)
+        except (tomllib.TOMLDecodeError, ValueError):
+            return out
+        project = data.get("project") or {}
+        specs = list(project.get("dependencies") or [])
+        for group in (project.get("optional-dependencies") or {}).values():
+            specs.extend(group or [])
+        # PEP 735 groups live at the TOP level, not under [project], and a lock
+        # is commonly compiled from one. `_scan_pyproject` already reads them.
+        for group in (data.get("dependency-groups") or {}).values():
+            specs.extend(group or [])
+        for spec in specs:
+            if isinstance(spec, str):
+                out |= _extras_of(spec)
+        return out
+    # A Dockerfile or script: only arguments of an actual install command.
+    for line in _joined_lines(text):
+        tokens = _shell_tokens(line)
+        if "install" not in tokens or not any("pip" in tok for tok in tokens):
+            continue
+        for token in tokens:
+            out |= _extras_of(token)
+    return out
+
+
+def _declared_blastbox_extras(root: Path) -> set[str]:
+    """Blastbox extras this repository asks for, from its own requirements.
+
+    `blastbox[host,s3]>=0.1.39` says exactly which optional sets the consumer
+    installs, and it is written in pyproject, a Dockerfile pip line, or the
+    lock entry. Nothing has to be inferred from what a lock happens to carry.
+    """
+    out: set[str] = set()
+    for path in _walk(root):
+        # Declarations only. A LOCK's own `blastbox[...]` entries are read
+        # per-entry with their markers, so scanning them here as plain text
+        # would pool `blastbox[host]; python_version < "3.13"` together with
+        # `blastbox[s3]; python_version >= "3.13"` and demand a closure pip
+        # installs on neither.
+        if not (
+            path.name == "pyproject.toml"
+            or path.name.startswith("Dockerfile")
+            or path.name.endswith((".Dockerfile", ".dockerfile"))
+        ):
+            continue
+        out |= _blastbox_extras_in(path)
+    return out
+
+
+def _declared_extras(parsed: Sequence[Any]) -> set[str]:
+    """Every extra the release's own metadata mentions."""
+    out: set[str] = set()
+    for req in parsed:
+        if req is None:
+            continue
+        marker = str(getattr(req, "marker", "") or "")
+        out |= {e.lower() for e in re.findall(r"extra\s*==\s*[\"\']([^\"\']+)", marker)}
+    return out
+
+
+def _extras_in_play(
+    parsed: Sequence[Any],
+    pins: dict[str, list[_Pin]],
+    environment: dict[str, str] | None,
+) -> set[str]:
+    """Extras this lock was compiled for, inferred from what it already holds.
+
+    A uv-compiled lock records resolved names only: `uv pip compile --extra
+    host` writes a plain `blastbox==0.1.39` line, so the extras cannot be read
+    off the entry. But a lock that carries fastapi was compiled for the host
+    extra whether or not it says so, and one with no boto3 was not compiled for
+    s3 -- which is the distinction that keeps this from being noise.
+
+    Evidence is counted only from requirements that APPLY. A host extra with a
+    `pywin32; extra == "host" and sys_platform == "win32"` member has two
+    dependencies on Windows and one on Linux; counting the Windows-only one
+    against a Linux lock pushes it under the threshold, the extra is not
+    recognised, and a genuinely missing pin is then accepted.
+
+    Only dependencies UNIQUE to an extra count, and MORE THAN HALF of them must
+    be present. On RedTusk's real lock the `dev` extra's only "present"
+    dependency was `blastbox` itself -- dev depends on `blastbox[host]` -- which
+    inferred dev and reported pytest, mypy and ruff missing from a RUNTIME lock.
+    Noise like that is how a check stops being read. Half is not a majority
+    either: an extra with two unique dependencies, one of which the lock pins
+    for its own reasons, would otherwise be inferred from that single package.
+
+    The limit worth knowing: an extra with exactly ONE dependency is invisible
+    once that dependency is missing -- a lock without boto3 looks the same
+    whether it dropped `blastbox[s3]` or never asked for it. A lock that spells
+    its extras (`blastbox[s3]==...`) is not subject to that.
+    """
+    env = dict(environment or {})
+    present = _applicable_names(pins, env)
+    base: set[str] = set()
+    by_extra: dict[str, set[str]] = {}
+    for req in parsed:
+        if req is None:
+            continue
+        marker = str(getattr(req, "marker", "") or "")
+        name = _dist_name(req.name)
+        if "extra ==" not in marker:
+            base.add(name)
+            continue
+        for extra in re.findall(r"extra\s*==\s*[\"\']([^\"\']+)", marker):
+            if not _marker_holds(marker, {**env, "extra": extra}):
+                continue  # e.g. a win32-only member of an extra, on Linux
+            by_extra.setdefault(extra.lower(), set()).add(name)
+    found = set()
+    for extra, names in by_extra.items():
+        # Unique across EVERY extra, not just against the base. If `host` needs
+        # a and b while `dev` needs a, b and pytest, a host-only lock carries a
+        # majority of dev's requirements too -- and dev gets inferred from
+        # evidence that belongs entirely to host.
+        #
+        # `blastbox` itself is excluded for the same reason: an extra that
+        # depends on `blastbox[host]` would otherwise be inferred by the lock's
+        # own entry, which every lock has.
+        others = (
+            set().union(*(v for k, v in by_extra.items() if k != extra))
+            if len(by_extra) > 1
+            else set()
+        )
+        unique = names - base - others - {"blastbox"}
+        if not unique:
+            continue
+        if len(unique & present) * 2 > len(unique):
+            found.add(extra)
+    return found
+
+
+def _with_nested_extras(
+    extras: set[str], parsed: Sequence[Any], environment: dict[str, str] | None
+) -> set[str]:
+    """``extras`` plus every blastbox extra they enable, transitively.
+
+    One extra can turn another on: `blastbox[host]; extra == "dev"` means a
+    lock built for `dev` installs the whole host closure, and pip then demands
+    hashes for all of it. Recording only the distribution name discarded the
+    `[host]` part, so those dependencies were never checked -- the lock looked
+    complete and the install failed.
+    """
+    env = dict(environment or {})
+    out = set(extras)
+    while True:
+        grown = set(out)
+        for req in parsed:
+            if req is None or _dist_name(req.name) != "blastbox":
+                continue
+            nested = {e.lower() for e in getattr(req, "extras", set()) or set()}
+            if not nested:
+                continue
+            marker = str(getattr(req, "marker", "") or "")
+            if not marker:
+                grown |= nested
+                continue
+            for extra in sorted(out) + [""]:
+                if _marker_holds(marker, {**env, "extra": extra}):
+                    grown |= nested
+                    break
+        if grown == out:
+            return out
+        out = grown
+
+
+def _applies(req, extras: AbstractSet[str], environment: dict[str, str] | None) -> bool:
+    """Whether ``req`` is one this lock actually has to carry."""
+    if req.marker is None:
+        return True
+    env = dict(environment or {})
+    # `extra` is only defined when evaluating for an extra, so try each the lock
+    # asked for -- plus the empty one, which is how a base requirement guarded
+    # by an ordinary marker gets evaluated.
+    for extra in sorted(extras) + [""]:
+        try:
+            if req.marker.evaluate({**env, "extra": extra}):
+                return True
+        except Exception:  # noqa: BLE001 -- an unevaluable marker is not a gap
+            return False
+    return False
+
+
+def _satisfies(req, version: str) -> bool:
+    """Whether the locked ``version`` satisfies ``req``.
+
+    Presence alone is not enough: `packaging==22` against a release needing
+    `packaging>=23` is pinned, hashed, and still unresolvable by pip.
+    """
+    if not req.specifier:
+        return True
+    try:
+        return req.specifier.contains(version, prereleases=True)
+    except Exception:  # noqa: BLE001 -- an unreadable version is not a gap
+        return True
 
 
 def set_version(
@@ -866,7 +2129,7 @@ def set_version(
                     "guess -- a partial rewrite leaves the repo pinned to two "
                     "versions."
                 ) from first_error
-            if pin.kind == "lock" and "--hash=" in "".join(lines[i : i + 4]):
+            if pin.kind == "lock" and _HASH_RE.search("".join(lines[i : i + 4])):
                 needs_hashes = True
         if needs_hashes:
             if not digests:
@@ -922,7 +2185,14 @@ def set_version(
             f"{[f'{q.path}:{q.line}' for qs in stale.values() for q in qs]}. "
             "The rewrite did not reach every pin. Every file has been restored."
         )
-    return sorted(str(q) for q in staged)
+    # Only what actually CHANGED. Every staged file is written -- the atomic
+    # restore below depends on that -- but a rewrite that produced identical
+    # bytes is not an update, and reporting it as one tells an operator their
+    # repo moved when it did not. Re-running `pins --set` on a correct repo
+    # should say nothing happened, because nothing did.
+    return sorted(
+        str(q) for q, text in staged.items() if original[q] != text.encode("utf-8")
+    )
 
 
 def _replace_hashes(
@@ -935,7 +2205,7 @@ def _replace_hashes(
         start = pin.line  # first line AFTER the requirement
         end = start
         indent = "    "
-        while end < len(lines) and "--hash=" in lines[end]:
+        while end < len(lines) and _HASH_RE.search(lines[end]):
             indent = lines[end][: len(lines[end]) - len(lines[end].lstrip())]
             end += 1
         if end == start:
@@ -944,8 +2214,12 @@ def _replace_hashes(
             # leaves the OLD digests beside the NEW version -- a lock that fails
             # `--require-hashes` while the command reports success.
             req_line = lines[start - 1]
-            if "--hash=" in req_line:
-                head = req_line.split("--hash=", 1)[0].rstrip()
+            # Either spelling: a lock written with `--hash sha256:...` would
+            # otherwise keep its OLD digests beside a NEW version, and the
+            # version-only rescan reports success while the install rejects it.
+            inline = _HASH_RE.search(req_line)
+            if inline:
+                head = req_line[: inline.start()].rstrip()
                 lines[start - 1] = (
                     head
                     + " "

@@ -737,6 +737,14 @@ class _FakeStamp:
         # Which reference each check was redirected to, so a test can assert
         # the alias was used rather than only that verification passed.
         self.asked_as: list[str | None] = []
+        # How many times verification asked about the base at all.
+        self.checks = 0
+
+    def base_check(self, _runner=None, ref=None):
+        # ONE call answering both questions, as the real Stamp now does.
+        self.asked_as.append(ref)
+        self.checks += 1
+        return self._resolvable, self._moved
 
     def base_moved(self, _runner=None, ref=None):
         self.asked_as.append(ref)
@@ -3604,3 +3612,100 @@ def test_every_tag_in_the_chain_is_locked_for_the_whole_publication() -> None:
         ["demo-base:stg", "demo-worker:stg"], "t1", run=run, log=lambda _: None
     )
     assert observed == [True], observed
+
+
+def test_the_base_is_inspected_once_per_image(tmp_path: Path, monkeypatch) -> None:
+    """Presence and identity are one question asked of one moment.
+
+    Asked separately, a tag that still points at the recorded image for the
+    first call and is retagged before the second reports "present, nothing
+    moved" -- and the replacement is never compared with the record at all.
+    """
+    import blastbox.host.imagerun as mod
+
+    _resolves_to(monkeypatch)
+    stamps: list = []
+
+    def make(image, runner=None):
+        s = _FakeStamp()
+        stamps.append(s)
+        return s
+
+    monkeypatch.setattr(mod, "_read_stamp", make)
+    monkeypatch.setattr(mod, "_verify_contents", lambda i, r=None: (True, ""))
+    verify_built(["demo:t1"], log=lambda _: None)
+    assert [s.checks for s in stamps] == [1], [s.checks for s in stamps]
+
+
+def test_a_secret_named_builder_is_pinned_but_not_recorded(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The provenance label is PERMANENT and `stamp --read` prints it.
+
+    An already-digested value is preserved verbatim, and `_redact_argv` cannot
+    see a credential nested inside `org.blastbox.builders` -- so a secret-named
+    argument that happens to look like a digest reference would be embedded in
+    the image forever.
+    """
+    import blastbox.host.imagerun as mod
+
+    _resolves_to(monkeypatch)
+    _pin_staging(monkeypatch)
+    secret = "registry.example@sha256:" + "7" * 64
+    jdk = "eclipse-temurin@sha256:" + "9" * 64
+    monkeypatch.setattr(
+        mod,
+        "_pin_builder_images",
+        lambda *a, **k: {"REGISTRY_PASS": secret, "JDK_BUILD_IMAGE": jdk},
+    )
+    seen: list[dict] = []
+
+    def spy(**kw):
+        seen.append(kw)
+        return []
+
+    monkeypatch.setattr(mod, "_stamp_flags", spy)
+    said: list[str] = []
+    build_plan(
+        _plan(tmp_path),
+        "t1",
+        blastbox_version="0.1.39",
+        run=FakeRunner(),
+        log=said.append,
+    )
+    assert seen, "the stamp was never built"
+    for kw in seen:
+        recorded = kw.get("builders") or {}
+        assert "REGISTRY_PASS" not in recorded, recorded
+        assert recorded.get("JDK_BUILD_IMAGE") == jdk, recorded
+    assert not any(secret in s for s in said), said
+    assert any("REGISTRY_PASS" in s and "not recorded" in s for s in said), said
+
+
+def test_cleanup_cannot_strand_the_publication_record(monkeypatch) -> None:
+    """Dropping the private tags is tidy-up, and tidy-up must not lose a record.
+
+    If it propagates, the caller never receives what it published, so its
+    rollback restores the rootfs and leaves the live tags on the new release --
+    the mixed state the rollback exists to prevent, produced by the cleanup
+    that runs after it.
+    """
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_image_state", lambda image, run=None: "")
+    monkeypatch.setattr(mod, "_image_id", lambda image, run=None: _VERIFIED_ID)
+
+    def boom(staged, run):
+        raise KeyboardInterrupt("operator gave up during cleanup")
+
+    monkeypatch.setattr(mod, "_drop_staging_tags", boom)
+    said: list[str] = []
+    pub = mod.publish_tags(
+        ["demo-base:stg"],
+        "t1",
+        run=lambda argv, **kw: subprocess.CompletedProcess(list(argv), 0, "", ""),
+        log=said.append,
+    )
+    assert pub.tags == ("demo-base:t1",), pub
+    assert pub.published["demo-base:t1"] == _VERIFIED_ID
+    assert any("could not drop the staging tags" in s for s in said), said

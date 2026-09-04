@@ -1544,11 +1544,12 @@ def _release_digests(version: str) -> list[str] | None:
 
 
 def _release_requires(version: str) -> list[str]:
-    """``version``'s BASE runtime requirements, as PyPI records them.
+    """``version``'s runtime requirements, as PyPI records them.
 
-    Extras are dropped: they are conditional on what the consumer installs, and
-    a check that cannot know which would report `boto3` missing from a lock for
-    a repo that never asked for `blastbox[s3]`.
+    ALL of them, extras included. Which apply is decided per lock, from the
+    extras that lock's own blastbox entry asks for -- dropping them here meant
+    a new dependency of `blastbox[host]` was never checked at all, and the bump
+    reported success while the next `--require-hashes` install failed.
     """
     import json  # noqa: PLC0415
     import urllib.request  # noqa: PLC0415
@@ -1556,11 +1557,28 @@ def _release_requires(version: str) -> list[str]:
     url = f"https://pypi.org/pypi/blastbox/{version}/json"
     with urllib.request.urlopen(url, timeout=30) as fh:
         data = json.load(fh)
-    return [
-        req
-        for req in (data.get("info", {}).get("requires_dist") or [])
-        if "extra ==" not in req
-    ]
+    return list(data.get("info", {}).get("requires_dist") or [])
+
+
+def _requirements_of(name: str, version: str) -> list[str] | None:
+    """A dependency's own requirements, so its EXTRAS can be checked too.
+
+    `uvicorn` becoming `uvicorn[standard]` enables packages pip must resolve
+    and hash as well, and a version match alone says nothing about those. None
+    means "could not ask", which the caller reports rather than treating as
+    verified.
+    """
+    import json  # noqa: PLC0415
+    import urllib.error  # noqa: PLC0415
+    import urllib.request  # noqa: PLC0415
+
+    url = f"https://pypi.org/pypi/{name}/{version}/json"
+    try:
+        with urllib.request.urlopen(url, timeout=30) as fh:
+            data = json.load(fh)
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    return list(data.get("info", {}).get("requires_dist") or [])
 
 
 def _pins_set(root: Path, version: str, *, allow_unreleased: bool) -> int:
@@ -1600,7 +1618,15 @@ def _pins_set(root: Path, version: str, *, allow_unreleased: bool) -> int:
         except Exception as exc:  # noqa: BLE001 -- network shape varies
             print(f"cannot read {version}'s dependencies from PyPI: {exc}")
             return 2
-        gaps = missing_from_locks(root, requires)
+        try:
+            gaps = missing_from_locks(root, requires, requirements_of=_requirements_of)
+        except PinScanError as exc:
+            # Recognised locks RAISE when they cannot be read, deliberately --
+            # reading one as empty reports its whole closure present. That has
+            # to arrive as the CLI's own diagnostic and exit 2, not as a
+            # traceback from inside a check the operator did not ask for.
+            print(f"cannot check the dependency closure: {exc}")
+            return 2
         if gaps:
             print(f"refusing to pin {root.name} to blastbox {version}:")
             for path, names in sorted(gaps.items()):

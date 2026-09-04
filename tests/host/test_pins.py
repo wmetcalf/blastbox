@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import textwrap
 
+import pytest
+
 from blastbox.host.pins import disagreements, scan
 
 
@@ -1512,3 +1514,2001 @@ def test_distribution_names_compare_normalised(tmp_path):
     lock = tmp_path / "requirements.lock"
     lock.write_text("Ruamel-YAML==0.18.6 \\\n    --hash=sha256:" + "a" * 64 + "\n")
     assert missing_from_locks(tmp_path, ["ruamel.yaml>=0.18"]) == {}
+
+
+_R = [
+    "pydantic>=2.6.0",
+    "packaging>=23.0",
+    'fastapi>=0.115.0; extra == "host"',
+    'uvicorn>=0.27; extra == "host"',
+    'structlog>=24.1; extra == "host"',
+    'boto3>=1.34; extra == "s3"',
+    'pytest>=8; extra == "dev"',
+    'ruff>=0.6; extra == "dev"',
+    'mypy>=1.11; extra == "dev"',
+    # dev pulls the host extra in, so `blastbox` is one of its requirements --
+    # and every lock pins blastbox.
+    'blastbox[host]; extra == "dev"',
+    # Shared with the runtime closure: starlette brings httpx in too.
+    'httpx>=0.27; extra == "dev"',
+    # An extra whose only other dependency is absent from a runtime lock.
+    'blastbox[host]; extra == "docs"',
+    'sphinx>=7; extra == "docs"',
+    'colorama>=0.4; sys_platform == "win32"',
+]
+
+
+def _lock(path, *entries):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(f"{e} \\\n    --hash=sha256:{'a' * 64}\n" for e in entries))
+    return path
+
+
+def test_a_hashed_lock_that_does_not_pin_blastbox_is_not_ours_to_judge(tmp_path):
+    """A repo may hold an unrelated hashed lock -- tooling, docs.
+
+    Reporting it as missing every blastbox dependency would refuse a bump that
+    is perfectly fine.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _lock(tmp_path / "tooling.lock", "ruff==0.6.9")
+    assert missing_from_locks(tmp_path, _R) == {}
+
+
+def test_an_extra_the_lock_was_compiled_for_is_checked(tmp_path):
+    """uv records resolved names only, so the entry cannot say which extras.
+
+    A lock carrying fastapi and uvicorn was compiled for the host extra whether
+    or not it says so -- and a dependency added to that extra must be reported.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    lock = _lock(
+        tmp_path / "req.lock",
+        "blastbox==0.1.39",
+        "pydantic==2.13.5",
+        "packaging==26.3",
+        "fastapi==0.115.0",
+        "uvicorn==0.30.0",
+    )
+    gaps = missing_from_locks(tmp_path, _R, environment={"sys_platform": "linux"})
+    # A RUNTIME hole, not an install failure: the lock line is a plain
+    # `blastbox==`, which pip does not bind to the host extra.
+    assert gaps == {str(lock): ["structlog" + _RUNTIME]}, gaps
+
+
+def test_an_extra_the_lock_never_asked_for_is_not_reported(tmp_path):
+    """`boto3` missing from a repo that never wanted s3 is not a gap.
+
+    Nor are pytest and ruff: `dev` depends on `blastbox[host]`, so the lock's
+    own blastbox entry once inferred the whole dev extra and reported a
+    runtime lock as missing a test framework.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _lock(
+        tmp_path / "req.lock",
+        "blastbox==0.1.39",
+        "pydantic==2.13.5",
+        "packaging==26.3",
+    )
+    assert missing_from_locks(tmp_path, _R, environment={"sys_platform": "linux"}) == {}
+
+
+def test_a_marker_that_does_not_apply_is_not_a_gap(tmp_path):
+    """A Linux lock correctly omits a win32-only dependency."""
+    from blastbox.host.pins import missing_from_locks
+
+    _lock(
+        tmp_path / "req.lock", "blastbox==0.1.39", "pydantic==2.13.5", "packaging==26.3"
+    )
+    assert missing_from_locks(tmp_path, _R, environment={"sys_platform": "linux"}) == {}
+    gaps = missing_from_locks(tmp_path, _R, environment={"sys_platform": "win32"})
+    assert list(gaps.values()) == [["colorama"]], gaps
+
+
+def test_a_pinned_version_must_also_satisfy_the_requirement(tmp_path):
+    """Presence is not enough: pip cannot resolve `packaging==22` for `>=23`."""
+    from blastbox.host.pins import missing_from_locks
+
+    lock = _lock(
+        tmp_path / "req.lock", "blastbox==0.1.39", "pydantic==2.13.5", "packaging==22.0"
+    )
+    gaps = missing_from_locks(tmp_path, _R, environment={"sys_platform": "linux"})
+    assert gaps == {str(lock): ["packaging (pinned 22.0, needs >=23.0)"]}, gaps
+
+
+def test_a_split_lock_is_complete_across_its_includes(tmp_path):
+    """pip installs `-r base.lock` as ONE requirement set.
+
+    Checking each physical file alone reports pins that are correctly hashed in
+    the file next door, so a valid split lock could never be bumped.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _lock(tmp_path / "base.lock", "pydantic==2.13.5", "packaging==26.3")
+    top = tmp_path / "req.lock"
+    top.write_text(f"-r base.lock\nblastbox==0.1.39 \\\n    --hash=sha256:{'a' * 64}\n")
+    assert missing_from_locks(tmp_path, _R, environment={"sys_platform": "linux"}) == {}
+
+
+def test_a_single_shared_dependency_does_not_infer_a_whole_extra(tmp_path):
+    """Measured on RedTusk's real lock, which is why this is a majority.
+
+    `httpx` is in a runtime closure for its own reasons, and the `dev` extra
+    happens to want it too. Inferring dev from that reported pytest, mypy and
+    ruff missing from a RUNTIME lock -- noise that teaches people to ignore the
+    check.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _lock(
+        tmp_path / "req.lock",
+        "blastbox==0.1.39",
+        "pydantic==2.13.5",
+        "packaging==26.3",
+        "httpx==0.27.2",
+    )
+    assert missing_from_locks(tmp_path, _R, environment={"sys_platform": "linux"}) == {}
+
+
+def test_an_extras_own_blastbox_requirement_does_not_infer_it(tmp_path):
+    """`dev` depends on `blastbox[host]`, and every lock pins blastbox.
+
+    Counting that as evidence the extra was requested infers it from the lock's
+    own entry -- which is what happened on the real lock, reporting a runtime
+    lock as missing sphinx and a test framework.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _lock(
+        tmp_path / "req.lock",
+        "blastbox==0.1.39",
+        "pydantic==2.13.5",
+        "packaging==26.3",
+    )
+    assert missing_from_locks(tmp_path, _R, environment={"sys_platform": "linux"}) == {}
+
+
+_H = "--hash=sha256:" + "a" * 64
+# Appended when a gap is reachable only through an extra the LOCK LINE does
+# not spell: pip installs such a file happily and the image is short a
+# package it imports. Measured against real pip; see the module docstring.
+_RUNTIME = " [not an install failure: the image would import it]"
+_RM = [
+    "pydantic>=2.6.0",
+    "packaging>=23.0",
+    'fastapi>=1; extra == "host"',
+    'uvicorn>=1; extra == "host"',
+    'boto3>=1; extra == "s3"',
+    'sphinx>=7; extra == "s3"',
+    'backport>=1; python_version < "3.13"',
+]
+
+
+def _write(d, name, body):
+    (d / name).write_text(body)
+    return d / name
+
+
+def _entry(spec, hashed=True):
+    return f"{spec} \\\n    {_H}\n" if hashed else f"{spec}\n"
+
+
+def test_sibling_includes_are_one_install_set(tmp_path):
+    """`pip install -r all.txt` where all.txt names two locks installs BOTH.
+
+    Judging blastbox.lock alone reports everything its sibling carries -- and
+    the aggregator itself is skipped for having no hashes of its own, so the
+    valid split lock could never be bumped.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(tmp_path, "blastbox.lock", _entry("blastbox==0.1.39"))
+    _write(
+        tmp_path,
+        "deps.lock",
+        _entry("pydantic==2.13.5")
+        + _entry("packaging==26.3")
+        + _entry("backport==1.0"),
+    )
+    _write(tmp_path, "all.txt", "-r blastbox.lock\n-r deps.lock\n")
+    gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert gaps == {}, gaps
+
+    # NOT vacuous: {} is also what "nothing was judged" looks like, which is
+    # exactly what an earlier version of this fix produced -- the aggregator was
+    # excluded from the candidates while its children were marked included, so
+    # there were no roots at all and every closure passed. Break the set and the
+    # same call must report it.
+    _write(tmp_path, "deps.lock", _entry("pydantic==2.13.5"))
+    broken = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert list(broken.values()) == [["packaging", "backport"]], broken
+
+
+def test_an_included_pin_without_a_hash_does_not_satisfy_anything(tmp_path):
+    """`--require-hashes` needs a hash for EVERY requirement.
+
+    An unhashed `packaging==25.0` in an included file is pinned and present and
+    still fails the install it appears to satisfy.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(tmp_path, "req.lock", _entry("blastbox==0.1.39") + "-r deps.txt\n")
+    _write(tmp_path, "deps.txt", "pydantic==2.13.5\npackaging==25.0\nbackport==1.0\n")
+    gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert list(gaps.values()) == [
+        [
+            "pydantic (pinned but not hashed)",
+            "packaging (pinned but not hashed)",
+            "backport (pinned but not hashed)",
+        ]
+    ], gaps
+
+
+def test_a_distribution_pinned_twice_under_exclusive_markers(tmp_path):
+    """A portable lock legitimately pins one distribution twice.
+
+    Discarding the markers let the last physical entry overwrite the earlier
+    one, so a valid 3.12 lock was rejected -- or an invalid one accepted, if
+    the lines happened to be the other way round.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    base = (
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging==26.3")
+    )
+    lock = (
+        base
+        + _entry('backport==1.0 ; python_version < "3.13"')
+        + _entry('backport==0.5 ; python_version >= "3.13"')
+    )
+    _write(tmp_path, "req.lock", lock)
+    assert (
+        missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"}) == {}
+    )
+    # The 3.13 entry is the one that does not satisfy `backport>=1`; under that
+    # environment the requirement no longer applies at all, so still no gap.
+    assert (
+        missing_from_locks(tmp_path, _RM, environment={"python_version": "3.13"}) == {}
+    )
+
+
+def test_the_marker_appropriate_pin_is_the_one_checked(tmp_path):
+    """Selecting by marker has to actually select, not merely not-crash."""
+    from blastbox.host.pins import missing_from_locks
+
+    base = (
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging==26.3")
+    )
+    lock = (
+        base
+        + _entry('backport==0.5 ; python_version < "3.13"')
+        + _entry('backport==9.0 ; python_version >= "3.13"')
+    )
+    _write(tmp_path, "req.lock", lock)
+    gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert list(gaps.values()) == [["backport (pinned 0.5, needs >=1)"]], gaps
+
+
+def test_half_the_dependencies_of_an_extra_is_not_a_majority(tmp_path):
+    """`s3` has two unique dependencies and the lock pins one for its own reasons.
+
+    Equality is half, not a majority -- and inferring the extra from a single
+    shared package is the false positive the threshold exists to avoid.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    lock = (
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging==26.3")
+        + _entry("boto3==1.34")
+        + _entry("backport==1.0")
+    )
+    _write(tmp_path, "req.lock", lock)
+    assert (
+        missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"}) == {}
+    )
+
+
+def test_the_lock_states_the_environment_its_markers_are_for(tmp_path):
+    """A lock compiled for 3.12 must not be judged by whatever runs `pins`.
+
+    uv records its command line in the header, so the lock says which
+    interpreter it targets. Evaluating against the running one skipped a
+    dependency guarded by `python_version < "3.13"` whenever the CLI happened
+    to be newer.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    header = (
+        "# This file was autogenerated by uv via the following command:\n"
+        "#    uv pip compile pyproject.toml --generate-hashes "
+        "--python-version 3.12 -o req.lock\n"
+    )
+    _write(
+        tmp_path,
+        "req.lock",
+        header
+        + _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging==26.3"),
+    )
+    # No environment passed: the lock's own header has to supply it.
+    gaps = missing_from_locks(tmp_path, _RM)
+    assert list(gaps.values()) == [["backport"]], gaps
+
+    # And the other direction, so the running interpreter cannot mask this: a
+    # lock compiled for 3.14 does not need a dependency guarded by < 3.13.
+    # Whichever version happens to run these tests, one of the two assertions
+    # disagrees with it.
+    newer = header.replace("--python-version 3.12", "--python-version 3.14")
+    _write(
+        tmp_path,
+        "req.lock",
+        newer
+        + _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging==26.3"),
+    )
+    assert missing_from_locks(tmp_path, _RM) == {}
+
+
+_RN = [
+    "pydantic>=2.6.0",
+    'fastapi>=0.100; extra == "host"',
+    'uvicorn>=0.20; extra == "host"',
+    'structlog>=24; extra == "host"',
+    'pywin32>=306; extra == "host" and sys_platform == "win32"',
+    'blastbox[host]; extra == "dev"',
+    'pytest>=8; extra == "dev"',
+]
+
+
+def test_an_extras_platform_only_members_do_not_dilute_the_evidence(tmp_path):
+    """`pywin32` is a host dependency that a Linux lock correctly lacks.
+
+    Counting it against a Linux lock pushed `host` under the threshold, so the
+    extra was not recognised -- and the genuinely missing `structlog` pin was
+    then accepted. The evidence set has to be the requirements that APPLY.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "req.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("fastapi==0.115.0")
+        + _entry("uvicorn==0.30.0"),
+    )
+    # Two of THREE applicable host dependencies is a majority; two of four,
+    # counting the Windows-only one, is not.
+    gaps = missing_from_locks(tmp_path, _RN, environment={"sys_platform": "linux"})
+    assert list(gaps.values()) == [["structlog" + _RUNTIME]], gaps
+
+
+def test_an_extra_that_enables_another_pulls_its_closure_in(tmp_path):
+    """`blastbox[host]; extra == "dev"` means a dev lock installs host too.
+
+    pip enables it transitively and then demands hashes for all of it, so
+    recording only the distribution name -- discarding `[host]` -- left those
+    dependencies unchecked while the lock looked complete.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "req.lock",
+        _entry("blastbox[dev]==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("pytest==8.3.3"),
+    )
+    gaps = missing_from_locks(tmp_path, _RN, environment={"sys_platform": "linux"})
+    assert list(gaps.values()) == [
+        [n + _RUNTIME for n in ("fastapi", "uvicorn", "structlog")]
+    ], gaps
+
+
+def test_a_lock_that_asks_for_no_extras_is_still_left_alone(tmp_path):
+    """Neither fix may turn the base case into noise."""
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path, "req.lock", _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5")
+    )
+    assert (
+        missing_from_locks(tmp_path, _RN, environment={"sys_platform": "linux"}) == {}
+    )
+
+
+def test_a_lock_installed_directly_is_still_judged_on_its_own(tmp_path):
+    """Inclusion does not prove a file is never an entrypoint.
+
+    A Dockerfile installs prod.lock directly while dev.lock includes it. If
+    prod.lock is dropped from the roots, only the complete dev closure is
+    checked and a bump is accepted that leaves the production install failing
+    under `--require-hashes`.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path, "prod.lock", _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5")
+    )
+    _write(
+        tmp_path,
+        "dev.lock",
+        "-r prod.lock\n" + _entry("packaging==26.3") + _entry("backport==1.0"),
+    )
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\nRUN pip install --require-hashes -r prod.lock\n"
+    )
+    gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert list(gaps) == [str(tmp_path / "prod.lock")], gaps
+    assert list(gaps.values()) == [["packaging", "backport"]], gaps
+
+
+def test_a_lock_only_ever_included_is_not_judged_alone(tmp_path):
+    """The other half: with no direct install, the set is what counts."""
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path, "prod.lock", _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5")
+    )
+    _write(
+        tmp_path,
+        "dev.lock",
+        "-r prod.lock\n" + _entry("packaging==26.3") + _entry("backport==1.0"),
+    )
+    assert (
+        missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"}) == {}
+    )
+
+
+def test_marker_specific_blastbox_entries_do_not_pool_their_extras(tmp_path):
+    """A portable lock can pin blastbox twice under exclusive markers.
+
+    Unioning both extras checks a closure pip would never install on either
+    interpreter, and refuses a lock that is correct for both.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    lock = (
+        _entry('blastbox[host]==0.1.39 ; python_version < "3.13"')
+        + _entry('blastbox[s3]==0.1.39 ; python_version >= "3.13"')
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging==26.3")
+        + _entry("fastapi==1.2.0")
+        + _entry("uvicorn==1.1.0")
+        + _entry("backport==1.0")
+    )
+    _write(tmp_path, "req.lock", lock)
+    # On 3.12 only the host entry applies, so s3's boto3 is not demanded.
+    gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert gaps == {}, gaps
+    # And the lock IS being judged: drop a host dependency and it says so.
+    _write(tmp_path, "req.lock", lock.replace(_entry("uvicorn==1.1.0"), ""))
+    broken = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert list(broken.values()) == [["uvicorn"]], broken
+
+
+def test_one_extras_dependencies_do_not_infer_another(tmp_path):
+    """`dev` requiring everything `host` does, plus pytest, is common.
+
+    Counting the shared names as evidence for dev means a host-only lock
+    satisfies dev's majority and gets refused for missing pytest.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    reqs = [
+        "pydantic>=2.6.0",
+        'a-lib>=1; extra == "host"',
+        'b-lib>=1; extra == "host"',
+        'a-lib>=1; extra == "dev"',
+        'b-lib>=1; extra == "dev"',
+        'pytest>=8; extra == "dev"',
+    ]
+    _write(
+        tmp_path,
+        "req.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("a-lib==1.0")
+        + _entry("b-lib==1.0"),
+    )
+    assert missing_from_locks(tmp_path, reqs) == {}
+
+
+def test_only_requirement_files_are_treated_as_install_sets(tmp_path):
+    """`_walk` yields everything, and reading it all pulls VM images into memory.
+
+    Asserted by CONSEQUENCE rather than by timing: a document that merely
+    mentions a pinned, hashed blastbox is judged as a lock if the candidate set
+    is everything, and then reports its dependencies missing.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path, "req.lock", _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5")
+    )
+    # Prose, not a lock -- but indistinguishable from one if it is read as one.
+    (tmp_path / "UPGRADING.md").write_text(
+        "Pin it like this:\n\n" + _entry("blastbox==0.1.39")
+    )
+    blob = tmp_path / "rootfs.ext4"
+    with blob.open("wb") as fh:
+        fh.truncate(64 * 1024 * 1024)  # sparse; only its SIZE matters here
+    gaps = missing_from_locks(tmp_path, ["pydantic>=2.6.0"])
+    assert gaps == {}, gaps
+
+
+def test_the_lock_states_the_platform_its_markers_are_for(tmp_path):
+    """`uv pip compile --python-platform windows` resolves for another machine.
+
+    Evaluating that lock's markers against the local `sys_platform` skips the
+    Windows-only requirements it exists to carry.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    reqs = ["pydantic>=2.6.0", 'pywin32>=306; sys_platform == "win32"']
+    header = (
+        "# This file was autogenerated by uv via the following command:\n"
+        "#    uv pip compile pyproject.toml --generate-hashes "
+        "--python-platform windows -o req.lock\n"
+    )
+    _write(
+        tmp_path,
+        "req.lock",
+        header + _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5"),
+    )
+    gaps = missing_from_locks(tmp_path, reqs)
+    assert list(gaps.values()) == [["pywin32"]], gaps
+
+    # And the other direction, so the local platform cannot mask it.
+    linux = header.replace("--python-platform windows", "--python-platform linux")
+    _write(
+        tmp_path,
+        "req.lock",
+        linux + _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5"),
+    )
+    assert missing_from_locks(tmp_path, reqs) == {}
+
+
+def test_pins_that_do_not_apply_are_not_evidence_for_an_extra(tmp_path):
+    """A portable lock carries names it never installs on this platform.
+
+    Counting those as present infers an extra from packages that are not there,
+    and then reports every one of its dependencies missing.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    reqs = [
+        "pydantic>=2.6.0",
+        'win-a>=1; extra == "gui"',
+        'win-b>=1; extra == "gui"',
+        'gui-c>=1; extra == "gui"',
+    ]
+    lock = (
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry('win-a==1.0 ; sys_platform == "win32"')
+        + _entry('win-b==1.0 ; sys_platform == "win32"')
+    )
+    _write(tmp_path, "req.lock", lock)
+    assert (
+        missing_from_locks(tmp_path, reqs, environment={"sys_platform": "linux"}) == {}
+    )
+
+
+def test_an_include_outside_the_repository_is_refused(tmp_path):
+    """`_walk` stays inside the repo and refuses symlinks; includes must too.
+
+    A `-r /dev/zero` exhausts memory and a FIFO blocks forever, both reached
+    from a file the scanner was merely told to look at.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    outside = tmp_path.parent / f"outside-{tmp_path.name}.lock"
+    outside.write_text(_entry("pydantic==2.13.5"))
+    try:
+        _write(tmp_path, "req.lock", _entry("blastbox==0.1.39") + f"-r {outside}\n")
+        gaps = missing_from_locks(tmp_path, ["pydantic>=2.6.0"])
+        assert list(gaps.values()) == [["pydantic"]], gaps
+    finally:
+        outside.unlink()
+
+
+def test_an_include_naming_a_special_file_is_refused(tmp_path):
+    """Reading a FIFO blocks forever; the check must not open one."""
+    import os
+
+    from blastbox.host.pins import missing_from_locks
+
+    fifo = tmp_path / "pipe.lock"
+    os.mkfifo(fifo)
+    _write(tmp_path, "req.lock", _entry("blastbox==0.1.39") + "-r pipe.lock\n")
+    gaps = missing_from_locks(tmp_path, ["pydantic>=2.6.0"])
+    assert list(gaps.values()) == [["pydantic"]], gaps
+
+
+def test_a_lock_that_does_not_install_blastbox_here_is_not_judged(tmp_path):
+    """A portable lock may pin blastbox only for another platform.
+
+    pip skips the package entirely on this one, so demanding its dependency
+    closure refuses a lock that is correct.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "req.lock",
+        _entry('blastbox==0.1.39 ; sys_platform == "win32"')
+        + _entry("pydantic==2.13.5"),
+    )
+    assert (
+        missing_from_locks(tmp_path, _RM, environment={"sys_platform": "linux"}) == {}
+    )
+
+    # NOT vacuous: on the platform where blastbox IS installed, the same lock
+    # is judged and its gaps reported.
+    gaps = missing_from_locks(
+        tmp_path, _RM, environment={"sys_platform": "win32", "python_version": "3.12"}
+    )
+    assert list(gaps.values()) == [["packaging", "backport"]], gaps
+
+
+def test_a_recognised_lock_that_cannot_be_read_is_an_error_not_an_absence(tmp_path):
+    """Reading a lock as empty reports its whole closure present.
+
+    `pins --set` would then update every other pin and report success while the
+    lock stays stale -- the silent half-bump this module exists to prevent.
+    """
+    import blastbox.host.pins as mod
+    from blastbox.host.pins import PinScanError, missing_from_locks
+
+    lock = tmp_path / "requirements.lock"
+    lock.write_text(_entry("blastbox==0.1.39") + _entry("pydantic==2.13.5"))
+    monkey = mod._LOCK_READ_LIMIT
+    try:
+        mod._LOCK_READ_LIMIT = 10  # anything real is "too large"
+        with pytest.raises(PinScanError, match="too large"):
+            missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    finally:
+        mod._LOCK_READ_LIMIT = monkey
+
+
+def test_a_directly_installed_lock_is_a_candidate_whatever_its_name(tmp_path):
+    """pip imposes no naming convention on `-r`.
+
+    A hashed `deps.txt` that includes nothing is a real install set, and
+    deriving the candidate list from names alone never evaluates it.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path, "deps.txt", _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5")
+    )
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\nRUN pip install --require-hashes -r deps.txt\n"
+    )
+    gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert list(gaps.values()) == [["packaging", "backport"]], gaps
+
+
+def test_a_reference_is_resolved_against_the_build_context(tmp_path):
+    """`docker build -f deploy/Dockerfile .` copies from the CONTEXT.
+
+    `pip install -r prod.lock` inside it names `<root>/prod.lock`, not
+    `deploy/prod.lock`. Resolving only the latter drops the reference, which
+    removes the lock from the roots and accepts its incomplete closure.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path, "prod.lock", _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5")
+    )
+    _write(
+        tmp_path,
+        "dev.lock",
+        "-r prod.lock\n" + _entry("packaging==26.3") + _entry("backport==1.0"),
+    )
+    (tmp_path / "deploy").mkdir()
+    (tmp_path / "deploy" / "Dockerfile").write_text(
+        "FROM python:3.12\nCOPY prod.lock .\nRUN pip install --require-hashes -r prod.lock\n"
+    )
+    gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert list(gaps) == [str(tmp_path / "prod.lock")], gaps
+
+
+def test_setting_the_version_already_pinned_reports_no_change(tmp_path):
+    """Re-running `pins --set` on a correct repo should say nothing happened.
+
+    Every staged file is still WRITTEN -- the atomic restore depends on that --
+    but a rewrite producing identical bytes is not an update, and reporting one
+    tells an operator their repo moved when it did not.
+    """
+    from blastbox.host.pins import set_version
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\ndependencies = ["blastbox>=0.1.39,<0.2"]\n'
+    )
+    assert set_version(tmp_path, "0.1.39") == []
+
+
+def test_a_real_change_is_still_reported(tmp_path):
+    """The other direction: silence must mean nothing changed, not nothing ran."""
+    from blastbox.host.pins import set_version
+
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "demo"\ndependencies = ["blastbox>=0.1.38,<0.2"]\n'
+    )
+    assert set_version(tmp_path, "0.1.39") == [str(pyproject)]
+    assert "0.1.39" in pyproject.read_text()
+
+
+def test_a_dependency_that_gains_an_extra_needs_that_closure_too(tmp_path):
+    """`uvicorn` becoming `uvicorn[standard]` enables packages pip must hash.
+
+    A version match alone says nothing about those, so an older lock passes the
+    check and then fails the install.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    reqs = ["pydantic>=2.6.0", "uvicorn[standard]>=0.27"]
+    closure = {("uvicorn", "0.30.0"): ['watchfiles>=0.13; extra == "standard"']}
+    _write(
+        tmp_path,
+        "req.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("uvicorn==0.30.0"),
+    )
+    gaps = missing_from_locks(
+        tmp_path, reqs, requirements_of=lambda n, v: closure.get((n, v))
+    )
+    assert list(gaps.values()) == [["watchfiles (needed by uvicorn)"]], gaps
+
+    # With the closure present it is satisfied -- so the check is not simply
+    # refusing every extras-bearing dependency.
+    _write(
+        tmp_path,
+        "req.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("uvicorn==0.30.0")
+        + _entry("watchfiles==0.24.0"),
+    )
+    assert (
+        missing_from_locks(
+            tmp_path, reqs, requirements_of=lambda n, v: closure.get((n, v))
+        )
+        == {}
+    )
+
+
+def test_without_metadata_the_closure_is_not_claimed_either_way(tmp_path):
+    """A resolver that cannot answer means one unknown edge, not a gap.
+
+    Refusing a bump because an index was unreachable is worse than the drift it
+    guards against, and claiming the closure verified would be a lie. The
+    direct requirements are still checked.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    reqs = ["pydantic>=2.6.0", "uvicorn[standard]>=0.27"]
+    _write(
+        tmp_path,
+        "req.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("uvicorn==0.30.0"),
+    )
+    assert missing_from_locks(tmp_path, reqs, requirements_of=lambda n, v: None) == {}
+
+    # ... and a DIRECT requirement is still reported without any resolver.
+    gaps = missing_from_locks(tmp_path, [*reqs, "packaging>=23.0"])
+    assert list(gaps.values()) == [["packaging"]], gaps
+
+
+def test_the_space_form_of_hash_counts_as_hashed(tmp_path):
+    """pip documents `--hash <hash>` and its parser accepts it.
+
+    Reading such a lock as unhashed makes `set_version` rewrite the blastbox
+    version without replacing its artifact hashes.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    h = "--hash sha256:" + "a" * 64
+    (tmp_path / "req.lock").write_text(
+        f"blastbox==0.1.39 \\\n    {h}\npydantic==2.13.5 \\\n    {h}\n"
+    )
+    gaps = missing_from_locks(tmp_path, ["pydantic>=2.6.0", "packaging>=23.0"])
+    assert list(gaps.values()) == [["packaging"]], gaps
+
+
+def test_a_target_triple_records_its_architecture(tmp_path):
+    """`--python-platform aarch64-unknown-linux-gnu` is not just "linux"."""
+    from blastbox.host.pins import missing_from_locks
+
+    reqs = ["pydantic>=2.6.0", 'arm-only>=1; platform_machine == "aarch64"']
+    header = (
+        "# uv pip compile pyproject.toml --generate-hashes "
+        "--python-platform aarch64-unknown-linux-gnu -o req.lock\n"
+    )
+    _write(
+        tmp_path,
+        "req.lock",
+        header + _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5"),
+    )
+    assert list(missing_from_locks(tmp_path, reqs).values()) == [["arm-only"]]
+
+    x86 = header.replace("aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu")
+    _write(
+        tmp_path,
+        "req.lock",
+        x86 + _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5"),
+    )
+    assert missing_from_locks(tmp_path, reqs) == {}
+
+
+def test_a_directly_named_lock_with_any_suffix_is_a_candidate(tmp_path):
+    """pip imposes no suffix convention on `-r`."""
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path, "prod.pins", _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5")
+    )
+    (tmp_path / "install.sh").write_text(
+        "#!/bin/sh\npip install --require-hashes -r prod.pins\n"
+    )
+    gaps = missing_from_locks(tmp_path, ["pydantic>=2.6.0", "packaging>=23.0"])
+    assert list(gaps.values()) == [["packaging"]], gaps
+
+
+def test_the_scanner_refuses_a_lock_it_cannot_read(tmp_path):
+    """`scan()` is what `pins` reports and what `set_version` verifies against.
+
+    A lock read as empty simply vanishes from it, so the rewrite updates every
+    other pin and the re-scan agrees -- a half-bumped repo reported as correct.
+    """
+    import blastbox.host.pins as mod
+    from blastbox.host.pins import PinScanError, scan
+
+    lock = tmp_path / "requirements.lock"
+    lock.write_text(_entry("blastbox==0.1.39"))
+    limit = mod._LOCK_READ_LIMIT
+    try:
+        mod._LOCK_READ_LIMIT = 10
+        with pytest.raises(PinScanError, match="too large"):
+            scan(tmp_path)
+    finally:
+        mod._LOCK_READ_LIMIT = limit
+
+
+def test_the_repository_declares_which_blastbox_extras_it_installs(tmp_path):
+    """`blastbox[host,s3]` says exactly which optional sets are installed.
+
+    NOT uv's `--extra` header: that selects the CONSUMER's own optional group.
+    RedTusk's real lock says `--extra host`, which is redtusk's `host` group
+    whose contents are `blastbox[host,s3]` -- the names coincide and the
+    meanings do not, so reading it as blastbox's extras claims `host` by
+    accident and misses `s3` entirely.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\n\n[project.optional-dependencies]\n'
+        'host = ["blastbox[host]>=0.1.39,<0.2"]\n'
+    )
+    # Only ONE of host's dependencies -- below any inference threshold, so the
+    # declaration is the only thing that can find this.
+    _write(
+        tmp_path,
+        "req.lock",
+        "# uv pip compile pyproject.toml --extra host --generate-hashes "
+        "--python-version 3.12 -o req.lock\n"
+        + _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging==26.3")
+        + _entry("backport==1.0")
+        + _entry("fastapi==1.2.0"),
+    )
+    gaps = missing_from_locks(tmp_path, _RM)
+    assert list(gaps.values()) == [["uvicorn" + _RUNTIME]], gaps
+
+
+def test_an_extra_the_repository_never_asks_for_is_not_demanded(tmp_path):
+    """The other direction: declaring host must not drag s3 in."""
+    from blastbox.host.pins import missing_from_locks
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\ndependencies = ["blastbox[host]>=0.1.39,<0.2"]\n'
+    )
+    _write(
+        tmp_path,
+        "req.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging==26.3")
+        + _entry("backport==1.0")
+        + _entry("fastapi==1.2.0")
+        + _entry("uvicorn==1.1.0"),
+    )
+    assert (
+        missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"}) == {}
+    )
+
+
+def test_the_space_form_of_hash_is_replaced_on_a_bump(tmp_path):
+    """The READ side learned both spellings; the WRITE side had not.
+
+    `set_version` would change `blastbox==...` and leave the OLD artifact
+    hashes beside the new version, and its version-only rescan reports success
+    while the next hashed install rejects the file.
+    """
+    from blastbox.host.pins import set_version
+
+    old_hash = "b" * 64
+    lock = tmp_path / "requirements.lock"
+    lock.write_text(f"blastbox==0.1.38 \\\n    --hash sha256:{old_hash}\n")
+    new = "c" * 64
+    set_version(tmp_path, "0.1.39", digests=[new])
+    text = lock.read_text()
+    assert "0.1.39" in text, text
+    assert old_hash not in text, text
+    assert new in text, text
+
+
+def test_a_quoted_requirement_path_is_still_a_reference(tmp_path):
+    """The shell strips the quotes before pip ever sees them."""
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path, "prod.lock", _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5")
+    )
+    _write(
+        tmp_path,
+        "dev.lock",
+        "-r prod.lock\n" + _entry("packaging==26.3") + _entry("backport==1.0"),
+    )
+    (tmp_path / "Dockerfile").write_text(
+        'FROM python:3.12\nRUN pip install --require-hashes -r "prod.lock"\n'
+    )
+    gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert list(gaps) == [str(tmp_path / "prod.lock")], gaps
+
+
+def test_an_apple_target_calls_that_architecture_arm64(tmp_path):
+    """uv evaluates `aarch64-apple-darwin` as `platform_machine == "arm64"`."""
+    from blastbox.host.pins import missing_from_locks
+
+    reqs = ["pydantic>=2.6.0", 'mac-arm>=1; platform_machine == "arm64"']
+    header = (
+        "# uv pip compile --generate-hashes --python-platform aarch64-apple-darwin\n"
+    )
+    _write(
+        tmp_path,
+        "req.lock",
+        header + _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5"),
+    )
+    assert list(missing_from_locks(tmp_path, reqs).values()) == [["mac-arm"]]
+
+    # The Linux spelling of the same architecture stays `aarch64`.
+    linux = "# uv pip compile --python-platform aarch64-unknown-linux-gnu\n"
+    _write(
+        tmp_path,
+        "req.lock",
+        linux + _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5"),
+    )
+    assert missing_from_locks(tmp_path, reqs) == {}
+
+
+def test_a_declaration_for_one_install_set_does_not_bind_another(tmp_path):
+    """A `dev` group naming `blastbox[host]` says nothing about a prod lock.
+
+    Applying the repository's declarations to every root rejects a correct
+    production lock for omitting host-only dependencies it never selected.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\ndependencies = ["blastbox>=0.1.39,<0.2"]\n\n'
+        '[project.optional-dependencies]\ndev = ["blastbox[host]>=0.1.39,<0.2"]\n'
+    )
+    _write(
+        tmp_path,
+        "prod.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging==26.3")
+        + _entry("backport==1.0"),
+    )
+    _write(
+        tmp_path,
+        "dev.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging==26.3")
+        + _entry("backport==1.0")
+        + _entry("fastapi==1.2.0")
+        + _entry("uvicorn==1.1.0"),
+    )
+    gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert gaps == {}, gaps
+
+
+def test_a_nested_extra_is_traversed(tmp_path):
+    """`parent[feature]` requiring `child[nested]` enables nested too.
+
+    Stopping at the child's own pin accepts a lock that carries `child` for
+    some other reason and none of what `nested` adds.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    meta = {
+        ("parent", "1.0"): ['child[nested]>=1; extra == "feature"'],
+        ("child", "1.0"): ['grandchild>=1; extra == "nested"'],
+    }
+    reqs = ["pydantic>=2.6.0", "parent[feature]>=1"]
+    _write(
+        tmp_path,
+        "req.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("parent==1.0")
+        + _entry("child==1.0"),
+    )
+    gaps = missing_from_locks(
+        tmp_path, reqs, requirements_of=lambda n, v: meta.get((n, v))
+    )
+    assert list(gaps.values()) == [["grandchild (needed by child)"]], gaps
+
+    # With the grandchild pinned it is satisfied.
+    _write(
+        tmp_path,
+        "req.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("parent==1.0")
+        + _entry("child==1.0")
+        + _entry("grandchild==1.0"),
+    )
+    assert (
+        missing_from_locks(
+            tmp_path, reqs, requirements_of=lambda n, v: meta.get((n, v))
+        )
+        == {}
+    )
+
+
+def test_an_extras_cycle_terminates(tmp_path):
+    """Packages can depend on each other's extras."""
+    from blastbox.host.pins import missing_from_locks
+
+    meta = {
+        ("a-pkg", "1.0"): ['b-pkg[y]>=1; extra == "x"'],
+        ("b-pkg", "1.0"): ['a-pkg[x]>=1; extra == "y"'],
+    }
+    _write(
+        tmp_path,
+        "req.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("a-pkg==1.0")
+        + _entry("b-pkg==1.0"),
+    )
+    gaps = missing_from_locks(
+        tmp_path,
+        ["pydantic>=2.6.0", "a-pkg[x]>=1"],
+        requirements_of=lambda n, v: meta.get((n, v)),
+    )
+    assert gaps == {}, gaps
+
+
+def test_an_inline_space_form_hash_is_replaced_too(tmp_path):
+    """Hashes may sit on the requirement line itself, not only below it.
+
+    That is a separate branch of the rewrite, and it kept the old digests while
+    the continuation-line branch was fixed.
+    """
+    from blastbox.host.pins import set_version
+
+    old_hash = "b" * 64
+    lock = tmp_path / "requirements.lock"
+    lock.write_text(f"blastbox==0.1.38 --hash sha256:{old_hash}\n")
+    new = "c" * 64
+    set_version(tmp_path, "0.1.39", digests=[new])
+    text = lock.read_text()
+    assert "0.1.39" in text and new in text, text
+    assert old_hash not in text, text
+
+
+def test_a_spelled_extra_is_an_install_failure_and_a_plain_one_is_not(tmp_path):
+    """The distinction is measured against real pip, not assumed.
+
+    On RedTusk's own lock with fastapi removed, in python:3.12-slim:
+
+        blastbox[host]==...  ->  pip install --require-hashes  FAILS
+        blastbox==...        ->  pip install --require-hashes  SUCCEEDS
+
+    Both are worth reporting -- the second leaves the image short a package it
+    imports, because the Dockerfiles then run `pip install -e . --no-deps` --
+    but calling the second a pip rejection would send an operator looking for
+    an error that never happens.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\ndependencies = ["blastbox[host]>=0.1.39,<0.2"]\n'
+    )
+    body = (
+        _entry("pydantic==2.13.5") + _entry("packaging==26.3") + _entry("backport==1.0")
+    )
+
+    # The lock LINE spells the extra: pip enforces it, so no annotation.
+    _write(tmp_path, "req.lock", _entry("blastbox[host]==0.1.39") + body)
+    spelled = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert list(spelled.values()) == [["fastapi", "uvicorn"]], spelled
+
+    # A plain line: the same packages are missing, and pip would not care.
+    _write(tmp_path, "req.lock", _entry("blastbox==0.1.39") + body)
+    plain = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert list(plain.values()) == [["fastapi" + _RUNTIME, "uvicorn" + _RUNTIME]], plain
+
+
+def test_a_base_dependency_is_always_an_install_failure(tmp_path):
+    """`packaging` is the case that started this, and pip does reject it."""
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path, "req.lock", _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5")
+    )
+    gaps = missing_from_locks(tmp_path, ["pydantic>=2.6.0", "packaging>=23.0"])
+    assert list(gaps.values()) == [["packaging"]], gaps
+
+
+def test_a_quoted_include_is_followed(tmp_path):
+    """pip accepts `-r "child.lock"`, and the shell is not involved here.
+
+    Keeping the quotes made `_safe_include` reject a path that does not exist,
+    so the child stayed unresolved while still being removed from the roots --
+    leaving an install set nobody checked.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path, "child.lock", _entry("pydantic==2.13.5") + _entry("packaging==26.3")
+    )
+    _write(
+        tmp_path,
+        "root.lock",
+        _entry("blastbox==0.1.39") + '-r "child.lock"\n' + _entry("backport==1.0"),
+    )
+    assert (
+        missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"}) == {}
+    )
+
+    # NOT vacuous: break the child and the same call must report it.
+    _write(tmp_path, "child.lock", _entry("pydantic==2.13.5"))
+    broken = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert list(broken.values()) == [["packaging"]], broken
+
+
+def test_two_extras_of_one_package_are_both_traversed(tmp_path):
+    """`parent[feature]` needing `child[a]` and `child[b]` visits child twice.
+
+    A cycle key of (name, version) makes the second visit a no-op, so a lock
+    carrying a's dependencies but not b's is accepted although pip enables both.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    meta = {
+        ("parent", "1.0"): [
+            'child[a]>=1; extra == "feature"',
+            'child[b]>=1; extra == "feature"',
+        ],
+        ("child", "1.0"): ['dep-a>=1; extra == "a"', 'dep-b>=1; extra == "b"'],
+    }
+    _write(
+        tmp_path,
+        "req.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("parent==1.0")
+        + _entry("child==1.0")
+        + _entry("dep-a==1.0"),
+    )
+    gaps = missing_from_locks(
+        tmp_path,
+        ["pydantic>=2.6.0", "parent[feature]>=1"],
+        requirements_of=lambda n, v: meta.get((n, v)),
+    )
+    assert list(gaps.values()) == [["dep-b (needed by child)"]], gaps
+
+    # BOTH orders. The walk pops depth-first, so with a (name, version) key
+    # only one of these two arrangements short-circuits -- whichever extra is
+    # visited second. Testing one of them lets the bug survive half the time.
+    _write(
+        tmp_path,
+        "req.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("parent==1.0")
+        + _entry("child==1.0")
+        + _entry("dep-b==1.0"),
+    )
+    other = missing_from_locks(
+        tmp_path,
+        ["pydantic>=2.6.0", "parent[feature]>=1"],
+        requirements_of=lambda n, v: meta.get((n, v)),
+    )
+    assert list(other.values()) == [["dep-a (needed by child)"]], other
+
+
+def test_a_commented_out_install_is_not_an_install(tmp_path):
+    """`# old: pip install -r prod.lock` is a note, not a command.
+
+    Promoting it to a root judges that lock alone and refuses a bump for
+    dependencies its real parent install set supplies.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path, "prod.lock", _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5")
+    )
+    _write(
+        tmp_path,
+        "dev.lock",
+        "-r prod.lock\n" + _entry("packaging==26.3") + _entry("backport==1.0"),
+    )
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\n# old: pip install -r prod.lock\n"
+        "RUN pip install --require-hashes -r dev.lock\n"
+    )
+    assert (
+        missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"}) == {}
+    )
+
+
+def test_extras_are_attributed_to_the_command_that_installs_the_lock(tmp_path):
+    """A multi-stage Dockerfile installs different things in different stages.
+
+    Taking every `blastbox[...]` in the file applies `host` to a production
+    lock whose stage installs plain blastbox, and rejects it for omitting
+    dependencies it never asked for.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    body = (
+        _entry("pydantic==2.13.5") + _entry("packaging==26.3") + _entry("backport==1.0")
+    )
+    _write(tmp_path, "prod.lock", _entry("blastbox==0.1.39") + body)
+    _write(
+        tmp_path,
+        "dev.lock",
+        _entry("blastbox==0.1.39")
+        + body
+        + _entry("fastapi==1.2.0")
+        + _entry("uvicorn==1.1.0"),
+    )
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12 AS prod\n"
+        "RUN pip install --require-hashes -r prod.lock\n"
+        "FROM python:3.12 AS dev\n"
+        "RUN pip install blastbox[host] --require-hashes -r dev.lock\n"
+    )
+    gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert gaps == {}, gaps
+
+
+def test_the_cli_reports_an_unreadable_lock_instead_of_crashing(tmp_path, capsys):
+    """Recognised locks RAISE when unreadable, on purpose.
+
+    That has to reach the operator as the command's own diagnostic and exit 2,
+    not as a traceback out of a check they did not ask for.
+    """
+    import blastbox.host.pins as mod
+    from blastbox.host.cli import _pins_set
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\ndependencies = ["blastbox>=0.1.38,<0.2"]\n'
+    )
+    _write(tmp_path, "requirements.lock", _entry("blastbox==0.1.38"))
+    limit = mod._LOCK_READ_LIMIT
+    try:
+        mod._LOCK_READ_LIMIT = 10
+        rc = _pins_set(tmp_path, "0.1.39", allow_unreleased=True)
+    finally:
+        mod._LOCK_READ_LIMIT = limit
+    assert rc == 2
+    assert "cannot check the dependency closure" in capsys.readouterr().out
+
+
+def test_the_attached_short_form_of_r_is_followed(tmp_path):
+    """pip accepts `-rFILE` with no separator at all.
+
+    Requiring whitespace or `=` left the child unresolved while it was still
+    removed from the roots -- an install set nobody checks, which accepts any
+    closure.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path, "child.pins", _entry("pydantic==2.13.5") + _entry("packaging==26.3")
+    )
+    _write(
+        tmp_path,
+        "root.lock",
+        _entry("blastbox==0.1.39") + "-rchild.pins\n" + _entry("backport==1.0"),
+    )
+    assert (
+        missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"}) == {}
+    )
+
+    # NOT vacuous: break the child and the same call must report it.
+    _write(tmp_path, "child.pins", _entry("pydantic==2.13.5"))
+    broken = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert list(broken.values()) == [["packaging"]], broken
+
+
+def test_a_bare_platform_name_carries_uvs_default_architecture(tmp_path):
+    """Measured, because uv's help lists the aliases without resolving them.
+
+        uv pip compile --python-platform macos    -> platform_machine "arm64"
+        uv pip compile --python-platform linux    -> platform_machine "x86_64"
+
+    Leaving it to the running interpreter skipped an arm64-guarded dependency
+    for a macos lock on an x86 Linux host.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    reqs = ["pydantic>=2.6.0", 'mac-arm>=1; platform_machine == "arm64"']
+    for platform, expected in (("macos", [["mac-arm"]]), ("linux", [])):
+        _write(
+            tmp_path,
+            "req.lock",
+            f"# uv pip compile --generate-hashes --python-platform {platform}\n"
+            + _entry("blastbox==0.1.39")
+            + _entry("pydantic==2.13.5"),
+        )
+        gaps = missing_from_locks(tmp_path, reqs)
+        assert list(gaps.values()) == expected, (platform, gaps)
+
+    # An explicit triple still wins over the bare default.
+    _write(
+        tmp_path,
+        "req.lock",
+        "# uv pip compile --python-platform x86_64-apple-darwin\n"
+        + _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5"),
+    )
+    assert missing_from_locks(tmp_path, reqs) == {}
+
+
+def test_bare_platform_names_map_to_uvs_measured_defaults():
+    """Asserted on the mapping itself, not only through a gap.
+
+    This host is x86_64 Linux, so a gap-level test of the `linux` default
+    agrees with the ambient machine whether or not the mapping sets it -- the
+    mutant survives. The values come from measuring uv:
+
+        uv pip compile --python-platform macos    -> arm64
+        uv pip compile --python-platform linux    -> x86_64
+        uv pip compile --python-platform windows  -> x86_64
+    """
+    from blastbox.host.pins import _lock_environment
+
+    def machine(target):
+        return _lock_environment(f"# uv pip compile --python-platform {target}").get(
+            "platform_machine"
+        )
+
+    assert machine("macos") == "arm64"
+    assert machine("linux") == "x86_64"
+    assert machine("windows") == "x86_64"
+    # An explicit triple overrides the bare default in both directions.
+    assert machine("aarch64-unknown-linux-gnu") == "aarch64"
+    assert machine("x86_64-apple-darwin") == "x86_64"
+
+
+def test_prose_mentioning_an_extra_is_not_an_install(tmp_path):
+    """A comment is not an install path.
+
+    Grepping the file text refused a base-only lock for missing every host
+    dependency because a comment said `develop with blastbox[host]`.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\n'
+        "# develop with blastbox[host] if you need the ingress app\n"
+        'description = "uses blastbox[host] in production"\n'
+        'dependencies = ["blastbox>=0.1.39,<0.2"]\n'
+    )
+    _write(
+        tmp_path,
+        "req.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging==26.3")
+        + _entry("backport==1.0"),
+    )
+    assert (
+        missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"}) == {}
+    )
+
+
+def test_an_install_line_with_a_placeholder_version_still_names_its_extras(tmp_path):
+    """ClippyShot's real line is `blastbox[s3]==${BLASTBOX_VERSION}`.
+
+    That will not parse as a requirement -- the specifier is a shell
+    placeholder -- and dropping it lost the s3 extra from a repository that
+    genuinely installs it.
+    """
+    from blastbox.host.pins import _blastbox_extras_in
+
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        "FROM python:3.12\n"
+        "RUN pip install '/tmp/build[host]' \"blastbox[s3]==${BLASTBOX_VERSION}\" \\\n"
+        "    && echo done\n"
+    )
+    assert _blastbox_extras_in(dockerfile) == {"s3"}
+
+
+def test_a_requirement_path_with_spaces_is_followed(tmp_path):
+    """`pip install -r "prod lock.txt"` names a file with a space in it."""
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "prod lock.txt",
+        _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5"),
+    )
+    _write(
+        tmp_path,
+        "dev.lock",
+        '-r "prod lock.txt"\n' + _entry("packaging==26.3") + _entry("backport==1.0"),
+    )
+    (tmp_path / "Dockerfile").write_text(
+        'FROM python:3.12\nRUN pip install --require-hashes -r "prod lock.txt"\n'
+    )
+    gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert list(gaps) == [str(tmp_path / "prod lock.txt")], gaps
+
+
+def test_an_unrelated_large_text_file_does_not_block_the_check(tmp_path):
+    """`_is_install_input` accepts any `.txt`, and data files are not locks.
+
+    Sending them through the reader that RAISES made an unrelated corpus block
+    `pins --set` on a repository whose data files are none of its business.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "requirements.lock",
+        _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5"),
+    )
+    with (tmp_path / "corpus.txt").open("wb") as fh:
+        fh.truncate(65 * 1024 * 1024)  # sparse; only its SIZE matters
+    assert missing_from_locks(tmp_path, ["pydantic>=2.6.0"]) == {}
+    # ...and the lock is still JUDGED, so the clean result above is a verdict
+    # rather than "the walk gave up before it got there".
+    assert missing_from_locks(tmp_path, ["httpx>=0.27"]) != {}
+
+
+def test_a_large_lock_still_refuses_to_be_read_as_absent(tmp_path):
+    """Narrowing the strict reader must not make it lenient for real locks."""
+    import blastbox.host.pins as mod
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "requirements.lock",
+        _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5"),
+    )
+    limit = mod._LOCK_READ_LIMIT
+    try:
+        mod._LOCK_READ_LIMIT = 16
+        with pytest.raises(mod.PinScanError, match="requirements.lock"):
+            missing_from_locks(tmp_path, ["pydantic>=2.6.0"])
+    finally:
+        mod._LOCK_READ_LIMIT = limit
+
+
+def test_a_quoted_unconventional_path_in_an_install_command_is_a_root(tmp_path):
+    """Only a shell-aware read finds `-r "prod set.pins"`.
+
+    pip imposes no suffix convention, so this file is invisible to the name
+    filter -- the install command naming it is the ONLY evidence it is a real
+    install set. Splitting on whitespace reads the filename as `"prod`, and the
+    set silently stops being checked.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(tmp_path, "prod set.pins", _entry("blastbox==0.1.39"))
+    (tmp_path / "Dockerfile").write_text(
+        'FROM python:3.12\nRUN pip install --require-hashes -r "prod set.pins"\n'
+    )
+    gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert list(gaps) == [str(tmp_path / "prod set.pins")], gaps
+    assert any("pydantic" in miss for miss in gaps[str(tmp_path / "prod set.pins")])
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ['-r "prod set.txt"', "-rprod.txt", "-r=prod.txt", "--requirement=prod.txt"],
+)
+def test_every_pip_spelling_of_a_requirement_reference_is_followed(tmp_path, spelling):
+    """pip accepts four spellings; a lock that uses any of them is one set.
+
+    Missing one splits the set: the included file stops being recognised as
+    included, is judged ALONE, and is reported incomplete for pins that sit in
+    the very file that installs it.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    name = "prod set.txt" if " " in spelling else "prod.txt"
+    _write(tmp_path, name, _entry("pydantic==2.13.5"))
+    _write(
+        tmp_path,
+        "dev.lock",
+        f"{spelling}\n"
+        + _entry("blastbox==0.1.39")
+        + _entry("packaging==26.3")
+        + _entry("backport==1.0"),
+    )
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\nRUN pip install --require-hashes -r dev.lock\n"
+    )
+    env = {"python_version": "3.12"}
+    assert missing_from_locks(tmp_path, _RM, environment=env) == {}
+    # Control: the referenced file is genuinely being READ as part of the set,
+    # so the clean verdict above is a judgement and not a silent skip.
+    _write(tmp_path, name, _entry("unrelated==1.0"))
+    assert missing_from_locks(tmp_path, _RM, environment=env) != {}
+
+
+def test_naming_an_extra_outside_an_install_command_is_not_an_install(tmp_path):
+    """A Dockerfile that WRITES the name down has not installed it."""
+    from blastbox.host.pins import _blastbox_extras_in
+
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        "FROM python:3.12\n"
+        "RUN echo blastbox[host] >> /etc/optional-deps.txt\n"
+        "RUN pip install blastbox[s3]==0.1.39\n"
+    )
+    assert _blastbox_extras_in(dockerfile) == {"s3"}
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "blastbox[s3]==${BLASTBOX_VERSION}",
+        "-e /src/blastbox[s3]",
+        "git+https://example.invalid/blastbox.git#egg=blastbox[s3]",
+    ],
+)
+def test_unparseable_but_real_installs_still_name_their_extras(tmp_path, spelling):
+    """None of these parse as a requirement; all of them install the extra."""
+    from blastbox.host.pins import _blastbox_extras_in
+
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(f"FROM python:3.12\nRUN pip install {spelling}\n")
+    assert _blastbox_extras_in(dockerfile) == {"s3"}
+
+
+def test_a_line_with_an_unbalanced_quote_does_not_stop_the_scan(tmp_path):
+    """`RUN echo can't ...` is a shell error to shlex, and a real Dockerfile line.
+
+    Raising there aborts the whole check over a line that has nothing to do
+    with installing anything -- so the tokeniser skips what it cannot read and
+    keeps going.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "requirements.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging==26.3")
+        + _entry("backport==1.0"),
+    )
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\n"
+        "RUN echo can't hurt > /etc/note\n"
+        "RUN pip install --require-hashes -r requirements.lock\n"
+    )
+    env = {"python_version": "3.12"}
+    assert missing_from_locks(tmp_path, _RM, environment=env) == {}
+    # Control: the install line after the broken one is still being read.
+    _write(tmp_path, "requirements.lock", _entry("blastbox==0.1.39"))
+    assert missing_from_locks(tmp_path, _RM, environment=env) != {}
+
+
+@pytest.mark.parametrize("where", ["before", "after"])
+def test_only_the_generated_header_names_the_target_interpreter(tmp_path, where):
+    """A note that mentions a target option is prose, not the lock's target.
+
+    RedTusk's real lock opens with four lines of human preamble before uv's
+    header, so text on both sides of the command has to stay out of it.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    note = "# migration target: --python-version 3.13\n"
+    header = (
+        "# This file was autogenerated by uv via the following command:\n"
+        "#    uv pip compile pyproject.toml --generate-hashes --python-version 3.12\n"
+    )
+    body = _entry("blastbox==0.1.39")
+    text = (note + header + body) if where == "before" else (header + note + body)
+    _write(tmp_path, "requirements.lock", text)
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\nRUN pip install --require-hashes -r requirements.lock\n"
+    )
+    requires = ['oldpy>=1.0; python_version < "3.13"']
+    gaps = missing_from_locks(tmp_path, requires)
+    assert [
+        g for g in gaps.get(str(tmp_path / "requirements.lock"), []) if "oldpy" in g
+    ], f"the 3.12 header must decide, not the note: {gaps}"
+
+
+def test_the_generated_header_still_sets_the_target(tmp_path):
+    """Control for the test above: a real 3.13 header DOES skip the marker."""
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "requirements.lock",
+        "# This file was autogenerated by uv via the following command:\n"
+        "#    uv pip compile pyproject.toml --generate-hashes --python-version 3.13\n"
+        + _entry("blastbox==0.1.39"),
+    )
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\nRUN pip install --require-hashes -r requirements.lock\n"
+    )
+    assert missing_from_locks(tmp_path, ['oldpy>=1.0; python_version < "3.13"']) == {}
+
+
+def test_two_locks_in_one_pip_command_are_one_install_set(tmp_path):
+    """`pip install -r a.lock -r b.lock` is ONE resolution; pip merges them.
+
+    Judging each alone reported the first incomplete for dependencies the
+    second supplies in the very same command.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "blastbox.lock",
+        _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5"),
+    )
+    _write(tmp_path, "deps.lock", _entry("packaging==26.3") + _entry("backport==1.0"))
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\n"
+        "RUN pip install --require-hashes -r blastbox.lock -r deps.lock\n"
+    )
+    env = {"python_version": "3.12"}
+    assert missing_from_locks(tmp_path, _RM, environment=env) == {}
+    # Control: the merged set is genuinely judged -- break the SECOND file and
+    # the set is reported, keyed by both members.
+    _write(tmp_path, "deps.lock", _entry("packaging==26.3"))
+    gaps = missing_from_locks(tmp_path, _RM, environment=env)
+    assert list(gaps) == [f"{tmp_path / 'blastbox.lock'} + {tmp_path / 'deps.lock'}"], (
+        gaps
+    )
+
+
+def test_locks_installed_by_separate_commands_stay_separate(tmp_path):
+    """Two commands are two resolutions, and neither covers the other."""
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "blastbox.lock",
+        _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5"),
+    )
+    _write(tmp_path, "deps.lock", _entry("packaging==26.3") + _entry("backport==1.0"))
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\n"
+        "RUN pip install --require-hashes -r blastbox.lock\n"
+        "RUN pip install --require-hashes -r deps.lock\n"
+    )
+    gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert list(gaps) == [str(tmp_path / "blastbox.lock")], gaps
+
+
+def test_a_constraint_that_excludes_a_pin_is_reported(tmp_path):
+    """pip applies `-c` and refuses the resolution; the check must too.
+
+    Every name is present and hashed, so the closure looks complete -- and the
+    install fails anyway, which is exactly the outcome this check exists to
+    prevent.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "requirements.lock",
+        "-c constraints.txt\n"
+        + _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging==26.3")
+        + _entry("backport==1.0"),
+    )
+    (tmp_path / "constraints.txt").write_text("packaging==22.0\n")
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\nRUN pip install --require-hashes -r requirements.lock\n"
+    )
+    env = {"python_version": "3.12"}
+    gaps = missing_from_locks(tmp_path, _RM, environment=env)
+    reported = gaps[str(tmp_path / "requirements.lock")]
+    assert any(
+        "excluded by the constraint" in g and "packaging" in g for g in reported
+    ), reported
+    # Control: a constraint that ADMITS the pin is not a conflict.
+    (tmp_path / "constraints.txt").write_text("packaging>=22.0\n")
+    assert missing_from_locks(tmp_path, _RM, environment=env) == {}
+
+
+def test_a_constraint_reached_through_another_constraint_still_counts(tmp_path):
+    """pip follows `-c` inside a constraint file too."""
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "requirements.lock",
+        "-c outer.txt\n"
+        + _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging==26.3")
+        + _entry("backport==1.0"),
+    )
+    (tmp_path / "outer.txt").write_text("-c inner.txt\n")
+    (tmp_path / "inner.txt").write_text("packaging==22.0\n")
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\nRUN pip install --require-hashes -r requirements.lock\n"
+    )
+    gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert any(
+        "excluded by the constraint" in g
+        for g in gaps.get(str(tmp_path / "requirements.lock"), [])
+    ), gaps
+
+
+def test_a_portable_locks_two_pins_are_not_constraints_on_each_other(tmp_path):
+    """A lock legitimately pins one distribution twice under exclusive markers.
+
+    Those lines are pins, not constraints: reading a requirements file's own
+    entries as constraints makes the branch that does not apply here forbid the
+    branch that does, and reports a conflict pip would never see.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "requirements.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry('packaging==22.0 ; sys_platform == "win32"')
+        + _entry('packaging==26.3 ; sys_platform == "linux"')
+        + _entry("backport==1.0"),
+    )
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\nRUN pip install --require-hashes -r requirements.lock\n"
+    )
+    gaps = missing_from_locks(
+        tmp_path, _RM, environment={"python_version": "3.12", "sys_platform": "linux"}
+    )
+    assert gaps == {}, gaps
+
+
+def test_a_hashed_constraint_file_is_still_read(tmp_path):
+    """Hash arguments are not requirement grammar; stripping them is required.
+
+    Leaving them in makes every entry in a hashed constraint file unparseable,
+    so the file reads as empty and constrains nothing.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "requirements.lock",
+        "-c constraints.txt\n"
+        + _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging==26.3")
+        + _entry("backport==1.0"),
+    )
+    _write(tmp_path, "constraints.txt", _entry("packaging==22.0"))
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\nRUN pip install --require-hashes -r requirements.lock\n"
+    )
+    gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert any(
+        "excluded by the constraint" in g
+        for g in gaps.get(str(tmp_path / "requirements.lock"), [])
+    ), gaps
+
+
+_UNIVERSAL_HEADER = (
+    "# This file was autogenerated by uv via the following command:\n"
+    "#    uv pip compile pyproject.toml --generate-hashes --universal\n"
+)
+_PLAIN_HEADER = (
+    "# This file was autogenerated by uv via the following command:\n"
+    "#    uv pip compile pyproject.toml --generate-hashes\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("header", "reported"), [(_UNIVERSAL_HEADER, True), (_PLAIN_HEADER, False)]
+)
+def test_a_universal_lock_is_judged_on_every_branch_it_covers(
+    tmp_path, header, reported
+):
+    """`--universal` is one file for ALL platforms, so all of them are checked.
+
+    Judged under the machine running `pins`, a newly required
+    `winonly; sys_platform == "win32"` is skipped on Linux and the lock is
+    accepted although its Windows install fails under hash mode.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(tmp_path, "requirements.lock", header + _entry("blastbox==0.1.39"))
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\nRUN pip install --require-hashes -r requirements.lock\n"
+    )
+    requires = ['winonly>=1.0; sys_platform == "win32"']
+    gaps = missing_from_locks(tmp_path, requires).get(
+        str(tmp_path / "requirements.lock"), []
+    )
+    hits = [g for g in gaps if "winonly" in g]
+    assert bool(hits) is reported, gaps
+    if reported:
+        assert "[on windows]" in hits[0], hits
+
+
+def test_a_universal_gap_on_every_branch_is_not_labelled(tmp_path):
+    """A requirement missing everywhere is not a per-branch fact."""
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path, "requirements.lock", _UNIVERSAL_HEADER + _entry("blastbox==0.1.39")
+    )
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\nRUN pip install --require-hashes -r requirements.lock\n"
+    )
+    gaps = missing_from_locks(tmp_path, ["everywhere>=1.0"])[
+        str(tmp_path / "requirements.lock")
+    ]
+    assert any("everywhere" in g and "[on " not in g for g in gaps), gaps
+
+
+def test_an_explicit_environment_still_narrows_a_universal_lock(tmp_path):
+    """Naming a target is a deliberate question about ONE platform."""
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path, "requirements.lock", _UNIVERSAL_HEADER + _entry("blastbox==0.1.39")
+    )
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\nRUN pip install --require-hashes -r requirements.lock\n"
+    )
+    requires = ['winonly>=1.0; sys_platform == "win32"']
+    assert (
+        missing_from_locks(tmp_path, requires, environment={"sys_platform": "linux"})
+        == {}
+    )
+
+
+def test_a_quoted_hash_does_not_hide_the_install_behind_it(tmp_path):
+    """`RUN echo "step # 1" && pip install ...` is one command, not a comment.
+
+    Cutting the line at the quoted hash hid the pin, and `pins --set` then
+    reported success while that Dockerfile stayed on the old version.
+    """
+    from blastbox.host.pins import _scan_dockerfile
+
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        'FROM python:3.12\nRUN echo "step # 1" && pip install blastbox==0.1.30\n'
+    )
+    assert [p.specifier for p in _scan_dockerfile(dockerfile)] == ["==0.1.30"]
+
+
+def test_an_exact_pin_is_found_wherever_it_sits_in_the_specifier_set(tmp_path):
+    """`packaging!=21,==23` is an exact pin; pip resolves it to 23."""
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "requirements.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging!=21.0,==26.3")
+        + _entry("backport==1.0"),
+    )
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\nRUN pip install --require-hashes -r requirements.lock\n"
+    )
+    assert (
+        missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"}) == {}
+    )
+
+
+def test_a_range_is_still_not_a_pin(tmp_path):
+    """Control: `packaging>=23,<27` resolves to nothing in particular."""
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "requirements.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging>=23.0,<27")
+        + _entry("backport==1.0"),
+    )
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\nRUN pip install --require-hashes -r requirements.lock\n"
+    )
+    env = {"python_version": "3.12"}
+    gaps = missing_from_locks(tmp_path, _RM, environment=env)
+    assert any(
+        "packaging" in g for g in gaps.get(str(tmp_path / "requirements.lock"), [])
+    ), gaps
+    # And it is reported because nothing is PINNED, not because some invented
+    # version fails the comparison: a requirement that ANY version satisfies is
+    # still a gap here, since `--require-hashes` needs an exact pin.
+    loose = missing_from_locks(tmp_path, ["packaging>=0"], environment=env)
+    assert any(
+        "packaging" in g for g in loose.get(str(tmp_path / "requirements.lock"), [])
+    ), loose
+
+
+def test_a_pep_735_group_declares_extras_too(tmp_path):
+    """A lock is commonly compiled from a top-level dependency group."""
+    from blastbox.host.pins import _blastbox_extras_in
+
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "demo"\ndependencies = ["blastbox>=0.1.39,<0.2"]\n\n'
+        '[dependency-groups]\ndev = ["blastbox[host]>=0.1.39,<0.2"]\n'
+    )
+    assert _blastbox_extras_in(pyproject) == {"host"}
+
+
+def test_only_an_install_command_names_a_root(tmp_path):
+    """`echo -r prod.lock` is not an install; judging prod.lock alone is wrong.
+
+    Its real parent set (`dev.lock`) supplies the rest, so promoting it blocks
+    a bump for dependencies that are present in the file pip actually installs.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path, "prod.lock", _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5")
+    )
+    _write(
+        tmp_path,
+        "dev.lock",
+        "-r prod.lock\n" + _entry("packaging==26.3") + _entry("backport==1.0"),
+    )
+    (tmp_path / "build.sh").write_text(
+        "#!/bin/sh\n"
+        "echo -r prod.lock > /dev/null\n"
+        "pip install --require-hashes -r dev.lock\n"
+    )
+    assert (
+        missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"}) == {}
+    )
