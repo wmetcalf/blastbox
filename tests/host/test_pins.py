@@ -2244,3 +2244,30 @@ def test_the_lock_header_states_the_extras_it_was_compiled_for(tmp_path):
     )
     gaps = missing_from_locks(tmp_path, _RM)
     assert list(gaps.values()) == [["uvicorn"]], gaps
+
+
+def test_setting_the_version_already_pinned_reports_no_change(tmp_path):
+    """Re-running `pins --set` on a correct repo should say nothing happened.
+
+    Every staged file is still WRITTEN -- the atomic restore depends on that --
+    but a rewrite producing identical bytes is not an update, and reporting one
+    tells an operator their repo moved when it did not.
+    """
+    from blastbox.host.pins import set_version
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\ndependencies = ["blastbox>=0.1.39,<0.2"]\n'
+    )
+    assert set_version(tmp_path, "0.1.39") == []
+
+
+def test_a_real_change_is_still_reported(tmp_path):
+    """The other direction: silence must mean nothing changed, not nothing ran."""
+    from blastbox.host.pins import set_version
+
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "demo"\ndependencies = ["blastbox>=0.1.38,<0.2"]\n'
+    )
+    assert set_version(tmp_path, "0.1.39") == [str(pyproject)]
+    assert "0.1.39" in pyproject.read_text()

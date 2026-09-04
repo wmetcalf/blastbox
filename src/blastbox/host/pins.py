@@ -1485,7 +1485,14 @@ def set_version(
             f"{[f'{q.path}:{q.line}' for qs in stale.values() for q in qs]}. "
             "The rewrite did not reach every pin. Every file has been restored."
         )
-    return sorted(str(q) for q in staged)
+    # Only what actually CHANGED. Every staged file is written -- the atomic
+    # restore below depends on that -- but a rewrite that produced identical
+    # bytes is not an update, and reporting it as one tells an operator their
+    # repo moved when it did not. Re-running `pins --set` on a correct repo
+    # should say nothing happened, because nothing did.
+    return sorted(
+        str(q) for q, text in staged.items() if original[q] != text.encode("utf-8")
+    )
 
 
 def _replace_hashes(
