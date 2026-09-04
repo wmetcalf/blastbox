@@ -980,3 +980,60 @@ def test_a_relative_context_resolves_against_the_plan_root(tmp_path: Path) -> No
     plan = load_plan(_plan(tmp_path, TITANARUM))
     argv = build_command(plan.images[0], "t1", [], "u:1", {}, plan)
     assert argv[-1] == str(plan.root), argv[-1]
+
+
+def test_an_all_numeric_tag_does_not_slip_past_the_length_bound(tmp_path: Path) -> None:
+    """`ubuntu:<129 digits>` was consumed by the optional PORT branch, so the
+    tag bound never saw it — the dry run called the plan runnable and the build
+    then rejected its own base."""
+    long_numeric = "1" * 129
+    text = TITANARUM.replace(
+        'base = "eclipse-temurin:25-jre"', f'base = "ubuntu:{long_numeric}"', 1
+    )
+    with pytest.raises(PlanError):
+        load_plan(_plan(tmp_path, text))
+    # a real registry port, which is what that branch exists for, still works
+    ok = TITANARUM.replace(
+        'base = "eclipse-temurin:25-jre"', 'base = "reg.example.io:5000/ubuntu:24.04"', 1
+    )
+    assert load_plan(_plan(tmp_path, ok))
+
+
+def test_an_unbalanced_expansion_is_reported(tmp_path: Path) -> None:
+    """`${SECRET` with no closing brace: `_expand` leaves it verbatim, so
+    skipping it reported no problem and handed the literal placeholder to
+    docker — which the older result-based check at least refused."""
+    from blastbox.host.images import unresolved_build_args
+
+    text = TITANARUM.replace(
+        'build_args = { JDK_BUILD_IMAGE',
+        'build_args = { BROKEN = "${SECRET", JDK_BUILD_IMAGE',
+        1,
+    )
+    plan = load_plan(_plan(tmp_path, text))
+    problems = unresolved_build_args(
+        plan, {"JDK_BUILD_IMAGE": "x", "ZXING_BUILD_IMAGE": "y", "SECRET": "s"}
+    )
+    assert problems and "BROKEN" in problems[0], problems
+
+
+def test_a_symlinked_parent_is_not_a_false_collision(tmp_path: Path, monkeypatch) -> None:
+    """`normpath` collapses `..` lexically, so with `/base/link -> /other/child`
+    it reads `/base/link/../rootfs` as `/base/rootfs` and calls two genuinely
+    distinct artifacts a collision."""
+    other = tmp_path / "other" / "child"
+    other.mkdir(parents=True)
+    base = tmp_path / "base"
+    base.mkdir()
+    (base / "link").symlink_to(other)
+    monkeypatch.setenv("TITANARUM_FC_DIR", str(base))
+    monkeypatch.setenv("OTHER", f"{base}/link/..")
+    extra = (
+        '\n[[rootfs]]\nkind = "ext4"\nimage = "titanarum-base"\n'
+        'dest = "$OTHER/titanarum-rootfs.ext4"\nsize_mib = 512\n'
+    )
+    # base/…/rootfs.ext4 vs other/…/rootfs.ext4 are different files, so the
+    # plan must LOAD; the lexical comparison called them a collision.
+    plan = load_plan(_plan(tmp_path, TITANARUM + extra))
+    dests = {r.resolved_dest() for r in plan.rootfs if r.kind == "ext4"}
+    assert len(dests) == 2, dests

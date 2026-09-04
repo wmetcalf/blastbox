@@ -77,8 +77,11 @@ _NAME_RE = re.compile(r"^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*$")
 _COMPONENT = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
 _REF_RE = re.compile(
     r"^" + _COMPONENT +
-    r"(?::[0-9]+)?"                       # registry port
-    r"(?:/" + _COMPONENT + r")*"
+    # A port only counts when a path component FOLLOWS it. Optional, it also
+    # matched `ubuntu:<129 digits>` -- consuming an all-numeric tag and slipping
+    # past the length bound below, so the dry run called the plan runnable and
+    # the build then rejected its own base.
+    r"(?:(?::[0-9]+)?(?:/" + _COMPONENT + r")+)?"
     # The tag is bounded here as it already is for the tags we generate:
     # docker's distribution grammar caps it at 128, so an over-long one made
     # the dry run report a plan the build would then reject on its base.
@@ -245,6 +248,11 @@ def unresolved_names(text: str, env: dict[str, str], _depth: int = 0) -> list[st
         if i + 1 < n and text[i + 1] == "{":
             close = _close_brace(text, i + 1)
             if close is None:
+                # `${SECRET` with no closing brace. _expand leaves it verbatim,
+                # so skipping here reported no problem and handed the literal
+                # placeholder to docker -- which the old result-based check at
+                # least refused.
+                out.append(text[i:][:32])
                 i += 1
                 continue
             name, sep, default = text[i + 2 : close].partition(":-")
@@ -609,7 +617,14 @@ def load_plan(root: Path | str) -> Plan:
         # Normalised: `/srv/images/rootfs` and `/srv/images/./rootfs` are the
         # same artifact and were two different dictionary keys, so the second
         # silently overwrote the first and the dry run reported success.
-        key = os.path.normpath(rf.resolved_dest())
+        # realpath on the PARENT, then the name. `normpath` collapses `..`
+        # lexically, so with `/base/link -> /other/child` it reads
+        # `/base/link/../rootfs` as `/base/rootfs` and calls two genuinely
+        # distinct artifacts a collision. The final component is left
+        # unresolved: it is what we are about to replace, and it may be a
+        # symlink we must not follow.
+        resolved = Path(rf.resolved_dest())
+        key = str(Path(os.path.realpath(resolved.parent)) / resolved.name)
         if key in dests:
             raise PlanError(
                 f"{path}: {rf.image!r} and {dests[key]!r} both export to "
