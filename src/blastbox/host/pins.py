@@ -872,12 +872,13 @@ def missing_from_locks(
         # What the lock's own header says it was compiled for. uv writes a plain
         # `blastbox==...` line even for `--extra host`, so without this an older
         # lock carrying half a grown extra is never recognised as needing it.
-        declared = env.get("__extras__", "")
-        if declared == "*":
-            extras |= _declared_extras(parsed)  # `--all-extras`
-        else:
-            extras |= {e for e in declared.split(",") if e}
-        extras |= _extras_in_play(parsed, pins, scope)
+        # What this repository asks blastbox for, wherever it says so:
+        # `blastbox[host,s3]` in pyproject, a Dockerfile pip line, or the lock
+        # entry itself. That is the authoritative answer; inference is only for
+        # repos that never spell it.
+        extras |= _declared_blastbox_extras(root)
+        if not extras:
+            extras |= _extras_in_play(parsed, pins, scope)
         extras = _with_nested_extras(extras, parsed, scope)
         gaps: list[str] = []
         for req in parsed:
@@ -1097,15 +1098,13 @@ def _lock_environment(text: str) -> dict[str, str]:
     # `--extra host` (repeatable) is uv recording which optional sets it
     # resolved. That is authoritative where inference is a guess, and an older
     # lock missing half a newly grown extra cannot be inferred at all.
-    if re.search(r"--all-extras\b", text):
-        # Every optional set the release declares. Recorded as a sentinel
-        # because which extras exist is a property of the RELEASE, not of the
-        # lock, and is only known where the requirements are.
-        out["__extras__"] = "*"
-    else:
-        extras = re.findall(r"--extra[=\s]+([A-Za-z0-9._-]+)", text)
-        if extras:
-            out["__extras__"] = ",".join(sorted({e.lower() for e in extras}))
+    # NOT `--extra` from the header. That selects the CONSUMER's optional
+    # dependency group, not blastbox's: RedTusk's lock says `--extra host`,
+    # which is redtusk's own `host` group whose contents are
+    # `blastbox[host,s3]`. The names coincide and the meaning does not -- taking
+    # it as blastbox's extras claims `host` for the right reason by accident and
+    # misses `s3` entirely. What the repo asks blastbox for is written in the
+    # requirement itself, which `_declared_blastbox_extras` reads.
     platform = re.search(r"--python-platform[=\s]+(\S+)", text)
     if platform:
         token = platform.group(1).lower()
@@ -1249,6 +1248,31 @@ def _applicable_names(pins: dict[str, list[_Pin]], scope: dict[str, str]) -> set
         for name, entries in pins.items()
         if any(_marker_holds(pin.marker, scope) for pin in entries)
     }
+
+
+def _declared_blastbox_extras(root: Path) -> set[str]:
+    """Blastbox extras this repository asks for, from its own requirements.
+
+    `blastbox[host,s3]>=0.1.39` says exactly which optional sets the consumer
+    installs, and it is written in pyproject, a Dockerfile pip line, or the
+    lock entry. Nothing has to be inferred from what a lock happens to carry.
+    """
+    out: set[str] = set()
+    for path in _walk(root):
+        # Declarations only. A LOCK's own `blastbox[...]` entries are read
+        # per-entry with their markers, so scanning them here as plain text
+        # would pool `blastbox[host]; python_version < "3.13"` together with
+        # `blastbox[s3]; python_version >= "3.13"` and demand a closure pip
+        # installs on neither.
+        if not (
+            path.name == "pyproject.toml"
+            or path.name.startswith("Dockerfile")
+            or path.name.endswith((".Dockerfile", ".dockerfile"))
+        ):
+            continue
+        for match in re.finditer(r"(?i)\bblastbox\[([^\]]+)\]", _read_small(path)):
+            out |= {e.strip().lower() for e in match.group(1).split(",") if e.strip()}
+    return out
 
 
 def _declared_extras(parsed: Sequence[Any]) -> set[str]:
