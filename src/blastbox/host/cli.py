@@ -1543,9 +1543,33 @@ def _release_digests(version: str) -> list[str] | None:
     return [f["digests"]["sha256"] for f in data.get("urls", [])]
 
 
+def _release_requires(version: str) -> list[str]:
+    """``version``'s BASE runtime requirements, as PyPI records them.
+
+    Extras are dropped: they are conditional on what the consumer installs, and
+    a check that cannot know which would report `boto3` missing from a lock for
+    a repo that never asked for `blastbox[s3]`.
+    """
+    import json  # noqa: PLC0415
+    import urllib.request  # noqa: PLC0415
+
+    url = f"https://pypi.org/pypi/blastbox/{version}/json"
+    with urllib.request.urlopen(url, timeout=30) as fh:
+        data = json.load(fh)
+    return [
+        req
+        for req in (data.get("info", {}).get("requires_dist") or [])
+        if "extra ==" not in req
+    ]
+
+
 def _pins_set(root: Path, version: str, *, allow_unreleased: bool) -> int:
     """Point every pin at one version, and prove it by re-scanning."""
-    from blastbox.host.pins import PinScanError, set_version  # noqa: PLC0415
+    from blastbox.host.pins import (  # noqa: PLC0415
+        PinScanError,
+        missing_from_locks,
+        set_version,
+    )
 
     digests: list[str] | None = []
     try:
@@ -1564,6 +1588,33 @@ def _pins_set(root: Path, version: str, *, allow_unreleased: bool) -> int:
             print("  Publish the release first, or pass --allow-unreleased.")
             return 2
         digests = []
+
+    # BEFORE writing anything. `pip install --require-hashes` refuses the whole
+    # file when a dependency it must resolve is not pinned there, so a release
+    # that gains one turns every hash-pinned consumer lock into a lock that
+    # cannot install -- and rewriting only the blastbox line makes the bump look
+    # successful right up until the image build fails.
+    if digests:
+        try:
+            requires = _release_requires(version)
+        except Exception as exc:  # noqa: BLE001 -- network shape varies
+            print(f"cannot read {version}'s dependencies from PyPI: {exc}")
+            return 2
+        gaps = missing_from_locks(root, requires)
+        if gaps:
+            print(f"refusing to pin {root.name} to blastbox {version}:")
+            for path, names in sorted(gaps.items()):
+                rel = Path(path).relative_to(root)
+                print(f"  {rel} is hash-pinned and does not carry: {', '.join(names)}")
+            print(
+                "  blastbox {v} needs them, and `pip install --require-hashes`".format(
+                    v=version
+                )
+            )
+            print("  rejects the whole file over a dependency it cannot resolve.")
+            print("  Regenerate the lock's closure (not just the blastbox line)")
+            print("  and re-run this.")
+            return 2
 
     try:
         changed = set_version(root, version, digests=digests)
