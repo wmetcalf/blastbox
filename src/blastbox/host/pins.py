@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import stat
 import re
+import shlex
 from collections.abc import Callable, Sequence, Set as AbstractSet
 from typing import Any
 import tomllib
@@ -139,9 +140,16 @@ class Pin:
 
 
 def _strip_comment(line: str) -> str:
-    """Drop a trailing ``#`` comment. Prose lives there; pins do not."""
-    hashpos = line.find("#")
-    return line if hashpos < 0 else line[:hashpos]
+    """Drop a trailing ``#`` comment. Prose lives there; pins do not.
+
+    A comment starts only at the beginning of the line or after whitespace --
+    pip's documented rule, and the shell's. Cutting at ANY ``#`` truncated a
+    VCS requirement at its fragment, so
+    `pip install git+https://.../blastbox.git#egg=blastbox[s3]` read as an
+    install of nothing in particular.
+    """
+    match = re.search(r"(?:^|\s)#", line)
+    return line if match is None else line[: match.start()]
 
 
 def _logical_lines(text: str) -> list[tuple[int, str]]:
@@ -1083,17 +1091,15 @@ def _referenced(path: Path, root: Path) -> list[Path]:
     out: list[Path] = []
     # A quoted path is the same path: the shell strips the quotes before pip
     # ever sees them, and refusing to match one drops a real install set.
-    for match in re.finditer(
-        r"""(?:-r[=\s]*|--requirement[=\s]+)["']?([\w./\-]+)""",
-        # Comments stripped: `# old: pip install -r prod.lock` is a note, and
-        # promoting it to a root judges that lock alone -- refusing a bump for
-        # dependencies its real parent install set supplies.
-        "\n".join(_strip_comment(line) for line in _read_small(path).splitlines()),
-    ):
-        for base in (path.parent, root):
-            target = _safe_include(base / match.group(1), root)
-            if target is not None:
-                out.append(target)
+    # Comments stripped: `# old: pip install -r prod.lock` is a note, and
+    # promoting it to a root judges that lock alone -- refusing a bump for
+    # dependencies its real parent install set supplies.
+    for line in _joined_lines(_read_small(path)):
+        for name in _requirement_args(line):
+            for base in (path.parent, root):
+                target = _safe_include(base / name, root)
+                if target is not None:
+                    out.append(target)
     return out
 
 
@@ -1122,16 +1128,18 @@ def _includes(path: Path, root: Path) -> list[Path]:
     # past 1 MiB, so a large `dev.lock` looked like it included nothing and its
     # `prod.lock` stayed an independent root, reported incomplete though it is
     # only ever installed through the complete dev set.
-    text = _read_requirements(path) if _is_install_input(path) else _read_small(path)
+    # Strict only for files we RECOGNISE as locks. `_is_install_input` accepts
+    # any `.txt`/`.in`, so using it here sent an unrelated 65 MiB corpus through
+    # the reader that raises -- blocking `pins --set` on a repository whose data
+    # files are none of its business.
+    text = (
+        _read_requirements(path) if _is_requirements_file(path) else _read_small(path)
+    )
     for raw in _joined_lines(text):
-        match = re.match(
-            r"""^(?:-r[=\s]*|--requirement[=\s]+)["']?([^\s"']+)""", raw.strip()
-        )
-        if not match:
-            continue
-        target = _safe_include(path.parent / match.group(1), root)
-        if target is not None:
-            out.append(target)
+        for name in _requirement_args(raw):
+            target = _safe_include(path.parent / name, root)
+            if target is not None:
+                out.append(target)
     return out
 
 
@@ -1281,18 +1289,22 @@ def _effective_pins(
         return pins, extras, env
     env.update(_lock_environment(text))
     for line in _joined_lines(text):
-        include = re.match(
-            r"""^(?:-r[=\s]*|--requirement[=\s]+)["']?([^\s"']+)""", line
-        )
-        if include:
-            target = _safe_include(path.parent / include.group(1), root or path.parent)
-            if target is None:
-                continue
-            sub, sub_extras, sub_env = _effective_pins(target, root, seen)
-            for name, entries in sub.items():
-                pins.setdefault(name, []).extend(entries)
-            extras |= sub_extras
-            env = {**sub_env, **env}
+        # One parser for every `-r` spelling, shared with `_includes` and
+        # `_referenced`. This was a third private regex, and it disagreed with
+        # the other two: it stopped a filename at the first quote, so a lock
+        # including `-r "prod set.txt"` had that file's pins silently missing
+        # from its closure and was reported incomplete for pins it installs.
+        references = _requirement_args(line)
+        if references:
+            for name in references:
+                target = _safe_include(path.parent / name, root or path.parent)
+                if target is None:
+                    continue
+                sub, sub_extras, sub_env = _effective_pins(target, root, seen)
+                for pkg, entries in sub.items():
+                    pins.setdefault(pkg, []).extend(entries)
+                extras |= sub_extras
+                env = {**sub_env, **env}
             continue
         match = re.match(
             r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(\[[^\]]*\])?\s*==\s*([^\s;]+)", line
@@ -1405,24 +1417,119 @@ def _declared_extras_for(root: Path, lock: Path, roots: Sequence[Path]) -> set[s
     return _declared_blastbox_extras(root) if len(roots) == 1 else set()
 
 
+def _shell_tokens(text: str) -> list[str]:
+    """One line, tokenised as a shell would. Empty when it cannot be read.
+
+    `comments=False` because `_strip_comment` has already applied pip's and the
+    shell's rule (a comment opens at whitespace); letting shlex apply its own
+    cut a VCS requirement at its `#egg=` fragment. The single tokeniser exists
+    so the two callers cannot drift apart -- three private copies of the `-r`
+    pattern is exactly how a quoted include stopped being followed.
+    """
+    try:
+        return shlex.split(_strip_comment(text), comments=False)
+    except ValueError:
+        return []  # unbalanced quotes: not a command we can read
+
+
+def _requirement_args(text: str) -> list[str]:
+    """Filenames given to `-r` / `--requirement`, parsed as a shell would.
+
+    `pip install -r "prod lock.txt"` names a file with a space in it. A path
+    character class stops at the space and resolves `prod`, which does not
+    exist -- so the real lock is never promoted to a root and its closure is
+    never checked.
+    """
+    tokens = _shell_tokens(text)
+    out: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in ("-r", "--requirement"):
+            if index + 1 < len(tokens):
+                out.append(tokens[index + 1])
+            index += 2
+            continue
+        for prefix in ("--requirement=", "-r="):
+            if token.startswith(prefix):
+                out.append(token[len(prefix) :])
+                break
+        else:
+            if token.startswith("-r") and len(token) > 2:
+                out.append(token[2:])  # the attached short form
+        index += 1
+    return out
+
+
 def _referenced_in(line: str, base: Path, root: Path) -> list[Path]:
     """Requirement files named by ONE command."""
     out: list[Path] = []
-    for match in re.finditer(
-        r"""(?:-r[=\s]*|--requirement[=\s]+)["']?([\w./\-]+)""", _strip_comment(line)
-    ):
+    for name in _requirement_args(line):
         for candidate in (base, root):
-            target = _safe_include(candidate / match.group(1), root)
+            target = _safe_include(candidate / name, root)
             if target is not None:
                 out.append(target)
     return out
 
 
+def _extras_of(spec: str) -> set[str]:
+    """The extras named by one requirement string, if it names blastbox.
+
+    Falls back to the name-and-extras PREFIX when the whole requirement will
+    not parse. A Dockerfile writes `blastbox[s3]==${BLASTBOX_VERSION}`, whose
+    specifier is a shell placeholder rather than a version -- ClippyShot's real
+    install line, and dropping it lost the s3 extra entirely. The fallback is
+    anchored, so it only ever reads a token that STARTS as a blastbox
+    requirement, never prose that mentions one.
+    """
+    req = _requirement(spec)
+    if req is not None:
+        if _dist_name(req.name) != "blastbox":
+            return set()
+        return {e.strip().lower() for e in (req.extras or set()) if e.strip()}
+    # Anywhere in the token, because every real spelling of an unparseable
+    # blastbox requirement puts the extras somewhere other than position 0:
+    # a local checkout (`-e /src/blastbox[host]`), a VCS install
+    # (`git+https://.../blastbox.git#egg=blastbox[s3]`), and a placeholder
+    # version (`blastbox[s3]==${BLASTBOX_VERSION}`) all genuinely install it.
+    # Prose is excluded by the CALLER -- only install-command arguments and
+    # declared dependency fields reach here -- not by anchoring this pattern.
+    found: set[str] = set()
+    for match in re.finditer(r"(?i)blastbox\[([^\]]+)\]", spec.strip()):
+        found |= {e.strip().lower() for e in match.group(1).split(",") if e.strip()}
+    return found
+
+
 def _blastbox_extras_in(path: Path) -> set[str]:
-    """Blastbox extras named anywhere in one file."""
+    """Blastbox extras this file actually INSTALLS.
+
+    Parsed, not grepped. `# develop with blastbox[host]` in a comment, or a
+    project description mentioning it, is prose -- and matching it refused a
+    base-only lock for missing every host dependency that no install path asks
+    for.
+    """
     out: set[str] = set()
-    for match in re.finditer(r"(?i)\bblastbox\[([^\]]+)\]", _read_small(path)):
-        out |= {e.strip().lower() for e in match.group(1).split(",") if e.strip()}
+    text = _read_small(path)
+    if path.name == "pyproject.toml":
+        try:
+            data = tomllib.loads(text)
+        except (tomllib.TOMLDecodeError, ValueError):
+            return out
+        project = data.get("project") or {}
+        specs = list(project.get("dependencies") or [])
+        for group in (project.get("optional-dependencies") or {}).values():
+            specs.extend(group or [])
+        for spec in specs:
+            if isinstance(spec, str):
+                out |= _extras_of(spec)
+        return out
+    # A Dockerfile or script: only arguments of an actual install command.
+    for line in _joined_lines(text):
+        tokens = _shell_tokens(line)
+        if "install" not in tokens or not any("pip" in tok for tok in tokens):
+            continue
+        for token in tokens:
+            out |= _extras_of(token)
     return out
 
 

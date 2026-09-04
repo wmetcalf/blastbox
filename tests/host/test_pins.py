@@ -2916,3 +2916,221 @@ def test_bare_platform_names_map_to_uvs_measured_defaults():
     # An explicit triple overrides the bare default in both directions.
     assert machine("aarch64-unknown-linux-gnu") == "aarch64"
     assert machine("x86_64-apple-darwin") == "x86_64"
+
+
+def test_prose_mentioning_an_extra_is_not_an_install(tmp_path):
+    """A comment is not an install path.
+
+    Grepping the file text refused a base-only lock for missing every host
+    dependency because a comment said `develop with blastbox[host]`.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\n'
+        "# develop with blastbox[host] if you need the ingress app\n"
+        'description = "uses blastbox[host] in production"\n'
+        'dependencies = ["blastbox>=0.1.39,<0.2"]\n'
+    )
+    _write(
+        tmp_path,
+        "req.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging==26.3")
+        + _entry("backport==1.0"),
+    )
+    assert (
+        missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"}) == {}
+    )
+
+
+def test_an_install_line_with_a_placeholder_version_still_names_its_extras(tmp_path):
+    """ClippyShot's real line is `blastbox[s3]==${BLASTBOX_VERSION}`.
+
+    That will not parse as a requirement -- the specifier is a shell
+    placeholder -- and dropping it lost the s3 extra from a repository that
+    genuinely installs it.
+    """
+    from blastbox.host.pins import _blastbox_extras_in
+
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        "FROM python:3.12\n"
+        "RUN pip install '/tmp/build[host]' \"blastbox[s3]==${BLASTBOX_VERSION}\" \\\n"
+        "    && echo done\n"
+    )
+    assert _blastbox_extras_in(dockerfile) == {"s3"}
+
+
+def test_a_requirement_path_with_spaces_is_followed(tmp_path):
+    """`pip install -r "prod lock.txt"` names a file with a space in it."""
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "prod lock.txt",
+        _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5"),
+    )
+    _write(
+        tmp_path,
+        "dev.lock",
+        '-r "prod lock.txt"\n' + _entry("packaging==26.3") + _entry("backport==1.0"),
+    )
+    (tmp_path / "Dockerfile").write_text(
+        'FROM python:3.12\nRUN pip install --require-hashes -r "prod lock.txt"\n'
+    )
+    gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert list(gaps) == [str(tmp_path / "prod lock.txt")], gaps
+
+
+def test_an_unrelated_large_text_file_does_not_block_the_check(tmp_path):
+    """`_is_install_input` accepts any `.txt`, and data files are not locks.
+
+    Sending them through the reader that RAISES made an unrelated corpus block
+    `pins --set` on a repository whose data files are none of its business.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "requirements.lock",
+        _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5"),
+    )
+    with (tmp_path / "corpus.txt").open("wb") as fh:
+        fh.truncate(65 * 1024 * 1024)  # sparse; only its SIZE matters
+    assert missing_from_locks(tmp_path, ["pydantic>=2.6.0"]) == {}
+    # ...and the lock is still JUDGED, so the clean result above is a verdict
+    # rather than "the walk gave up before it got there".
+    assert missing_from_locks(tmp_path, ["httpx>=0.27"]) != {}
+
+
+def test_a_large_lock_still_refuses_to_be_read_as_absent(tmp_path):
+    """Narrowing the strict reader must not make it lenient for real locks."""
+    import blastbox.host.pins as mod
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "requirements.lock",
+        _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5"),
+    )
+    limit = mod._LOCK_READ_LIMIT
+    try:
+        mod._LOCK_READ_LIMIT = 16
+        with pytest.raises(mod.PinScanError, match="requirements.lock"):
+            missing_from_locks(tmp_path, ["pydantic>=2.6.0"])
+    finally:
+        mod._LOCK_READ_LIMIT = limit
+
+
+def test_a_quoted_unconventional_path_in_an_install_command_is_a_root(tmp_path):
+    """Only a shell-aware read finds `-r "prod set.pins"`.
+
+    pip imposes no suffix convention, so this file is invisible to the name
+    filter -- the install command naming it is the ONLY evidence it is a real
+    install set. Splitting on whitespace reads the filename as `"prod`, and the
+    set silently stops being checked.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(tmp_path, "prod set.pins", _entry("blastbox==0.1.39"))
+    (tmp_path / "Dockerfile").write_text(
+        'FROM python:3.12\nRUN pip install --require-hashes -r "prod set.pins"\n'
+    )
+    gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert list(gaps) == [str(tmp_path / "prod set.pins")], gaps
+    assert any("pydantic" in miss for miss in gaps[str(tmp_path / "prod set.pins")])
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ['-r "prod set.txt"', "-rprod.txt", "-r=prod.txt", "--requirement=prod.txt"],
+)
+def test_every_pip_spelling_of_a_requirement_reference_is_followed(tmp_path, spelling):
+    """pip accepts four spellings; a lock that uses any of them is one set.
+
+    Missing one splits the set: the included file stops being recognised as
+    included, is judged ALONE, and is reported incomplete for pins that sit in
+    the very file that installs it.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    name = "prod set.txt" if " " in spelling else "prod.txt"
+    _write(tmp_path, name, _entry("pydantic==2.13.5"))
+    _write(
+        tmp_path,
+        "dev.lock",
+        f"{spelling}\n"
+        + _entry("blastbox==0.1.39")
+        + _entry("packaging==26.3")
+        + _entry("backport==1.0"),
+    )
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\nRUN pip install --require-hashes -r dev.lock\n"
+    )
+    env = {"python_version": "3.12"}
+    assert missing_from_locks(tmp_path, _RM, environment=env) == {}
+    # Control: the referenced file is genuinely being READ as part of the set,
+    # so the clean verdict above is a judgement and not a silent skip.
+    _write(tmp_path, name, _entry("unrelated==1.0"))
+    assert missing_from_locks(tmp_path, _RM, environment=env) != {}
+
+
+def test_naming_an_extra_outside_an_install_command_is_not_an_install(tmp_path):
+    """A Dockerfile that WRITES the name down has not installed it."""
+    from blastbox.host.pins import _blastbox_extras_in
+
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        "FROM python:3.12\n"
+        "RUN echo blastbox[host] >> /etc/optional-deps.txt\n"
+        "RUN pip install blastbox[s3]==0.1.39\n"
+    )
+    assert _blastbox_extras_in(dockerfile) == {"s3"}
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "blastbox[s3]==${BLASTBOX_VERSION}",
+        "-e /src/blastbox[s3]",
+        "git+https://example.invalid/blastbox.git#egg=blastbox[s3]",
+    ],
+)
+def test_unparseable_but_real_installs_still_name_their_extras(tmp_path, spelling):
+    """None of these parse as a requirement; all of them install the extra."""
+    from blastbox.host.pins import _blastbox_extras_in
+
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(f"FROM python:3.12\nRUN pip install {spelling}\n")
+    assert _blastbox_extras_in(dockerfile) == {"s3"}
+
+
+def test_a_line_with_an_unbalanced_quote_does_not_stop_the_scan(tmp_path):
+    """`RUN echo can't ...` is a shell error to shlex, and a real Dockerfile line.
+
+    Raising there aborts the whole check over a line that has nothing to do
+    with installing anything -- so the tokeniser skips what it cannot read and
+    keeps going.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "requirements.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging==26.3")
+        + _entry("backport==1.0"),
+    )
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\n"
+        "RUN echo can't hurt > /etc/note\n"
+        "RUN pip install --require-hashes -r requirements.lock\n"
+    )
+    env = {"python_version": "3.12"}
+    assert missing_from_locks(tmp_path, _RM, environment=env) == {}
+    # Control: the install line after the broken one is still being read.
+    _write(tmp_path, "requirements.lock", _entry("blastbox==0.1.39"))
+    assert missing_from_locks(tmp_path, _RM, environment=env) != {}
