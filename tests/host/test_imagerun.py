@@ -437,3 +437,34 @@ def test_a_failed_export_does_not_leak_a_root_owned_tree(
     assert removals and removals[-1][0] == "sudo", (
         f"the staging tree was cleaned up unprivileged: {removals}"
     )
+
+
+def test_the_published_tree_root_is_not_left_at_mkdtemp_permissions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """mkdtemp makes the staging directory 0700 and owned by the invoking user,
+    and moving it into place publishes it exactly so.
+
+    Measured against production on toolz2: the gVisor tree came out
+    `drwx------ coz coz` where the one it replaced is `drwxr-xr-x root root`.
+    Everything INSIDE is root's, because extraction runs as root — it is only
+    the top directory, which nothing extracts, that keeps mkdtemp's. A rootfs
+    whose own root a runtime cannot traverse fails to boot for a reason that
+    looks like anything but permissions.
+    """
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_root_prefix", lambda: ["sudo"])
+    monkeypatch.setattr(mod, "_can_be_root", lambda: True)
+    dest_dir = tmp_path / "gv"
+    dest_dir.mkdir()
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    text = SPEC.replace('kind = "ext4"', 'kind = "dir"').replace(
+        'dest = "$DEMO_DIR/demo.ext4"', 'dest = "$DEMO_DIR/rootfs"'
+    )
+    plan = _plan(tmp_path / "dircase", text)
+    run = FakeRunner()
+    export_rootfs(plan, plan.rootfs[0], "t1", run=run, log=lambda _: None,
+                  extract=_fake_extract({"/init": "x"}))
+    assert [c for c in run.calls if "chmod" in c and "0755" in c], run.calls
+    assert [c for c in run.calls if "chown" in c and "root:root" in c], run.calls

@@ -220,6 +220,23 @@ def _extract_image(image: str, dest: Path, run: Runner, log: Log, *, as_root: bo
     log(f"   extracted {image}")
 
 
+def _normalize_root(tree: Path, priv: list[str], run: Runner) -> None:
+    """Give the staging tree the mode and owner a filesystem ROOT has.
+
+    ``mkdtemp`` creates it 0700 and owned by the invoking user, and moving it
+    into place publishes it exactly like that -- so the gVisor tree came out
+    `drwx------ coz coz` where the one it replaced was `drwxr-xr-x root root`.
+    Every file INSIDE is already root's, because extraction runs as root; it is
+    only the top directory, which nothing extracts, that keeps mkdtemp's.
+
+    A rootfs whose own root a runtime cannot traverse is a boot failure that
+    looks like anything but a permissions problem.
+    """
+    if priv:
+        run([*priv, "chown", "root:root", str(tree)], capture_output=True)
+    run([*priv, "chmod", "0755", str(tree)], capture_output=True)
+
+
 def _check_requires(tree: Path, spec: RootfsSpec, image: str) -> None:
     """Refuse to publish a rootfs missing something the plan says it needs.
 
@@ -335,6 +352,7 @@ def export_rootfs(
         else:
             _extract_image(image, staging, run, log, as_root=as_root)
         _check_requires(staging, spec, image)
+        _normalize_root(staging, priv, run)
 
         if spec.kind == "dir":
             # Extract-and-swap, never tar over the live tree: an overlay leaves
