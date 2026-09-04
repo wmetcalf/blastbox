@@ -44,9 +44,12 @@ from blastbox.host.stamp import verify_contents as _verify_contents
 
 __all__ = [
     "BuildError",
+    "PublishedTags",
     "build_plan",
     "export_rootfs",
     "publish_staged",
+    "publish_tags",
+    "restore_tags",
     "run_plan",
     "stage_rootfs",
     "verify_built",
@@ -215,6 +218,99 @@ def _must(
     return proc
 
 
+def _staging_tag(tag: str) -> str:
+    """A private tag to build under, distinct from the one being published.
+
+    `docker build -t` moves the tag the moment the build succeeds. When that is
+    a tag the fleet dispatches on, a worker can pull an image before anything
+    has verified it, and a later failure in the chain leaves the live tags on a
+    mixture of two builds. So the chain is built under this name and only
+    retagged once every image has passed verification.
+
+    Includes the pid because two runs of the same tag on one host would
+    otherwise share a staging name and each would see the other's images.
+    Bounded to docker's 128 characters, keeping the SUFFIX -- the part that
+    makes it private -- when a long tag has to be trimmed.
+    """
+    suffix = f"-blastbox-staging-{os.getpid()}"
+    return tag[: 128 - len(suffix)] + suffix
+
+
+@dataclass(frozen=True)
+class PublishedTags:
+    """Which tags a run moved, and what each pointed at beforehand.
+
+    The "beforehand" half is the whole point: rolling a tag back means putting
+    it on the image it named BEFORE this run, and a tag that did not exist has
+    to be removed rather than left on a half-published chain.
+    """
+
+    tags: tuple[str, ...]
+    previous: dict[str, str]
+
+
+def publish_tags(
+    staged: Sequence[str], tag: str, *, run: Runner | None = None, log: Log = _log
+) -> PublishedTags:
+    """Point the requested tags at the images that were built and verified.
+
+    Rolled back as a unit. Half a chain published is the mixed-release state
+    the staging phase exists to prevent, so a failure part-way restores every
+    tag this call had already moved.
+    """
+    runner = run or _default_runner
+    previous: dict[str, str] = {}
+    published: list[str] = []
+    try:
+        for staged_tag in staged:
+            repo = staged_tag.rsplit(":", 1)[0]
+            final = f"{repo}:{tag}"
+            # BEFORE the retag, so a rollback restores what was actually there.
+            previous[final] = _image_id(final, runner)
+            log(f"   {final} <- {staged_tag}")
+            _must(["docker", "tag", staged_tag, final], f"tag {final}", runner)
+            published.append(final)
+    except BaseException:
+        restore_tags(
+            PublishedTags(tuple(published), previous), staged, run=runner, log=log
+        )
+        raise
+    _drop_staging_tags(staged, runner)
+    return PublishedTags(tuple(published), previous)
+
+
+def restore_tags(
+    published: PublishedTags,
+    staged: Sequence[str] = (),
+    *,
+    run: Runner | None = None,
+    log: Log = _log,
+) -> None:
+    """Put every tag in ``published`` back where it was before the run."""
+    runner = run or _default_runner
+    for final in reversed(published.tags):
+        was = published.previous.get(final, "")
+        if was:
+            runner(["docker", "tag", was, final], capture_output=True)
+        else:
+            # It did not exist before this run. Leaving it on a half-published
+            # chain is worse than leaving it absent, which is what a consumer
+            # of a brand-new tag is already prepared for.
+            runner(["docker", "rmi", "--no-prune", final], capture_output=True)
+        log(f"   {final} restored")
+    _drop_staging_tags(staged, runner)
+
+
+def _drop_staging_tags(staged: Sequence[str], run: Runner) -> None:
+    """Drop the private build tags; the images live on under their real ones.
+
+    Best effort: a leftover staging tag is untidy, not unsafe, and failing the
+    run over one would turn a successful publication into a reported failure.
+    """
+    for staged_tag in staged:
+        run(["docker", "rmi", "--no-prune", staged_tag], capture_output=True)
+
+
 def build_plan(
     plan: Plan,
     tag: str,
@@ -253,7 +349,11 @@ def build_plan(
         )
 
     built: list[str] = []
-    for spec, base_ref in _images.resolve_chain(plan, tag):
+    # The chain is built and linked under a PRIVATE tag. `resolve_chain` is
+    # given that name too, so an internal base still resolves to the image from
+    # this run rather than to a stale tag of the same name.
+    staging = _staging_tag(tag)
+    for spec, base_ref in _images.resolve_chain(plan, staging):
         if pull and not spec.internal:
             # Present locally BEFORE it is inspected for a digest. Otherwise the
             # build pulls it itself and can get a different push of the same
@@ -290,10 +390,10 @@ def build_plan(
             if pinned_args
             else spec
         )
-        argv = _images.build_command(to_build, tag, flags, base_ref, env, plan)
-        log(f">> build {spec.tagged(tag)}  <- {base_ref}")
+        argv = _images.build_command(to_build, staging, flags, base_ref, env, plan)
+        log(f">> build {spec.tagged(staging)}  <- {base_ref}")
         before = _source_state(source)
-        _must(argv, f"build {spec.tagged(tag)}", run, cwd=plan.root)
+        _must(argv, f"build {spec.tagged(staging)}", run, cwd=plan.root)
         after = _source_state(source)
         if before != after:
             # The label records the revision read BEFORE the build, while docker
@@ -307,7 +407,7 @@ def build_plan(
                 "image does not contain; rebuild from a checkout nothing is "
                 "writing to."
             )
-        built.append(spec.tagged(tag))
+        built.append(spec.tagged(staging))
 
     return built
 
@@ -1236,12 +1336,20 @@ def run_plan(
     publish an artifact from an image that has not been shown to record what
     built it, which is precisely the state the whole module exists to make
     impossible.
+
+    The requested TAGS are part of the export, not part of the build. `docker
+    build -t` moves a tag the instant one image succeeds, so building straight
+    into a tag the fleet dispatches on let a worker pull an unverified image,
+    and a failure later in the chain left the live tags on a mixture of two
+    builds. The chain is built under a private name and the real tags are moved
+    once, at the end, alongside the rootfs.
     """
-    built = build_plan(
+    staged_tags = build_plan(
         plan, tag, blastbox_version=blastbox_version, env=env, run=run, log=log
     )
     log("\n>> verify: every image must record what it was built from")
-    verified = verify_built(built, run=run, log=log)
+    verified = verify_built(staged_tags, run=run, log=log)
+    staging = _staging_tag(tag)
     # Staged FIRST, all of them, then published. Publishing each as it is built
     # leaves the earlier destinations on the new release and the later ones on
     # the old when a later export fails -- the warm tiers then run a mixed
@@ -1251,6 +1359,10 @@ def run_plan(
     try:
         for spec in plan.rootfs:
             log(f"\n>> stage {spec.kind} rootfs <- {spec.image}:{tag}")
+            # Keyed on the tag it was BUILT under. Exporting resolves the
+            # verified id anyway, but an empty id here would silently fall back
+            # to the mutable tag -- the exact substitution verification exists
+            # to prevent.
             staged.append(
                 stage_rootfs(
                     plan,
@@ -1260,7 +1372,7 @@ def run_plan(
                     run=run,
                     log=log,
                     extract=extract,
-                    verified_id=verified.get(f"{spec.image}:{tag}", ""),
+                    verified_id=verified[f"{spec.image}:{staging}"],
                 )
             )
     except BaseException:
@@ -1273,7 +1385,12 @@ def run_plan(
     # the mixed release the staging phase was written to prevent, arriving one
     # step later.
     done: list[_Staged] = []
+    published: list[str] = []
+    pub = PublishedTags((), {})
     try:
+        log(f"\n>> publish tags -> :{tag}")
+        pub = publish_tags(staged_tags, tag, run=run, log=log)
+        published = list(pub.tags)
         for s in staged:
             log(f"\n>> publish {s.dest}")
             publish_staged(s, run=run, log=log)
@@ -1282,5 +1399,11 @@ def run_plan(
         for s in reversed(done):
             log(f"   rolling back {s.dest}")
             _restore_backup(s, run or _default_runner, log)
+        if published:
+            # The tags moved before the rootfs did, so an artifact that failed
+            # to publish leaves images the fleet would dispatch on against a
+            # rootfs from the previous release. Put them back.
+            log("   rolling back published tags")
+            restore_tags(pub, staged_tags, run=run, log=log)
         raise
-    return built
+    return published

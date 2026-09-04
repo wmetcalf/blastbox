@@ -230,7 +230,10 @@ def test_the_chain_stops_at_the_first_failure(
 
     _resolves_to(monkeypatch)
     monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
-    run = FakeRunner(fail="demo-base:t1")
+    # The chain is built under a PRIVATE tag, so that is the name a failure has
+    # to be injected on -- and the name the second image would be built under.
+    staging = mod._staging_tag("t1")
+    run = FakeRunner(fail=f"demo-base:{staging}")
     with pytest.raises(BuildError):
         build_plan(
             _plan(tmp_path),
@@ -239,7 +242,9 @@ def test_the_chain_stops_at_the_first_failure(
             run=run,
             log=lambda _: None,
         )
-    assert run.tagged("demo-worker:t1") == [], "the chain continued past a failure"
+    assert run.tagged(f"demo-worker:{staging}") == [], (
+        "the chain continued past a failure"
+    )
 
 
 def test_a_plan_that_cannot_be_built_is_refused_before_docker_runs(
@@ -2401,7 +2406,7 @@ def test_a_build_failure_does_not_print_the_secret(tmp_path: Path, monkeypatch) 
         'base = "upstream:1"\nbuild_args = { REGISTRY_TOKEN = "$TOK" }',
         1,
     )
-    run = FakeRunner(fail="demo-base:t1")
+    run = FakeRunner(fail=f"demo-base:{mod._staging_tag('t1')}")
     with pytest.raises(BuildError) as e:
         build_plan(
             _plan(tmp_path, text),
@@ -2500,3 +2505,142 @@ def test_a_file_added_inside_an_untracked_directory_changes_the_source_state(
     after = mod._source_state(tmp_path)
     assert before and after
     assert before != after, "a new build input inside an untracked dir went unseen"
+
+
+def test_the_requested_tag_is_not_moved_by_the_build(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`docker build -t` publishes the moment ONE image succeeds.
+
+    When that tag is the one the fleet dispatches on, a worker can pull an image
+    before anything has verified it -- and a failure later in the chain leaves
+    the live tags on a mixture of two builds.
+    """
+    import blastbox.host.imagerun as mod
+
+    _resolves_to(monkeypatch)
+    monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
+    run = FakeRunner()
+    built = build_plan(
+        _plan(tmp_path), "t1", blastbox_version="0.1.33", run=run, log=lambda _: None
+    )
+    staging = mod._staging_tag("t1")
+    assert built == [f"demo-base:{staging}", f"demo-worker:{staging}"], built
+    for call in run.calls:
+        if call[:2] == ["docker", "build"]:
+            assert "demo-base:t1" not in call and "demo-worker:t1" not in call, call
+
+
+def test_the_tags_are_published_only_after_the_whole_chain_verifies(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The ordering IS the fix, so it is asserted as an ordering."""
+    import blastbox.host.imagerun as mod
+
+    _resolves_to(monkeypatch)
+    monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
+    monkeypatch.setattr(mod, "_read_stamp", lambda i, r=None: _FakeStamp())
+    monkeypatch.setattr(mod, "_verify_contents", lambda i, r=None: (True, ""))
+    monkeypatch.setenv("DEMO_DIR", str(tmp_path / "out"))
+    order: list[str] = []
+    real_verify = mod.verify_built
+
+    def spy_verify(images, **kw):
+        order.append("verify")
+        return real_verify(images, **kw)
+
+    monkeypatch.setattr(mod, "verify_built", spy_verify)
+    run = FakeRunner()
+
+    def watched(argv, **kw):
+        if list(argv)[:2] == ["docker", "tag"]:
+            order.append("tag")
+        if list(argv)[:2] == ["docker", "build"]:
+            order.append("build")
+        return run(argv, **kw)
+
+    published = run_plan(
+        _plan(tmp_path),
+        "t1",
+        blastbox_version="0.1.34",
+        run=watched,
+        log=lambda _: None,
+        extract=lambda image, dest: (dest / "init").write_text("x"),
+    )
+    assert published == ["demo-base:t1", "demo-worker:t1"], published
+    assert order.index("verify") < order.index("tag"), order
+    assert order.count("build") == 2 and order.index("build") < order.index("verify")
+
+
+def _publication_rollback(tmp_path, monkeypatch, previously) -> list[list[str]]:
+    """Run a plan whose rootfs publication fails; return the tag calls it made.
+
+    ``previously`` answers what each FINAL tag pointed at before the run, which
+    is the only thing that decides whether a rollback retags or removes.
+    """
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
+    monkeypatch.setattr(mod, "_read_stamp", lambda i, r=None: _FakeStamp())
+    monkeypatch.setattr(mod, "_verify_contents", lambda i, r=None: (True, ""))
+    monkeypatch.setattr(
+        mod,
+        "_image_id",
+        lambda image, run=None: (
+            previously.get(image, "") if "staging" not in image else _VERIFIED_ID
+        ),
+    )
+    monkeypatch.setenv("DEMO_DIR", str(tmp_path / "out"))
+    monkeypatch.setattr(
+        mod,
+        "publish_staged",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    seen: list[list[str]] = []
+    run = FakeRunner()
+
+    def watched(argv, **kw):
+        a = list(argv)
+        if a[:2] in (["docker", "tag"], ["docker", "rmi"]):
+            seen.append(a)
+        return run(argv, **kw)
+
+    with pytest.raises(OSError, match="disk full"):
+        run_plan(
+            _plan(tmp_path),
+            "t1",
+            blastbox_version="0.1.34",
+            run=watched,
+            log=lambda _: None,
+            extract=lambda image, dest: (dest / "init").write_text("x"),
+        )
+    return seen
+
+
+def test_a_failed_publication_removes_tags_that_did_not_exist_before(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Tags move before the rootfs does, so a rootfs failure would otherwise
+    leave images the fleet dispatches on against the PREVIOUS release.
+
+    Nothing pointed at these tags before the run, so putting them back means
+    removing them -- not leaving them on a half-published chain.
+    """
+    seen = _publication_rollback(tmp_path, monkeypatch, previously={})
+    removed = [a[-1] for a in seen if a[:2] == ["docker", "rmi"]]
+    assert "demo-base:t1" in removed and "demo-worker:t1" in removed, seen
+
+
+def test_a_failed_publication_restores_the_image_a_tag_had_before(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The common case in production: the tag already names the live release."""
+    old = "sha256:" + "d" * 64
+    seen = _publication_rollback(
+        tmp_path,
+        monkeypatch,
+        previously={"demo-base:t1": old, "demo-worker:t1": old},
+    )
+    restored = [a for a in seen if a[:3] == ["docker", "tag", old]]
+    assert [a[-1] for a in restored] == ["demo-worker:t1", "demo-base:t1"], seen
+    assert not [a for a in seen if a[:2] == ["docker", "rmi"] and a[-1].endswith(":t1")]
