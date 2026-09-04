@@ -1560,6 +1560,27 @@ def _release_requires(version: str) -> list[str]:
     return list(data.get("info", {}).get("requires_dist") or [])
 
 
+def _requirements_of(name: str, version: str) -> list[str] | None:
+    """A dependency's own requirements, so its EXTRAS can be checked too.
+
+    `uvicorn` becoming `uvicorn[standard]` enables packages pip must resolve
+    and hash as well, and a version match alone says nothing about those. None
+    means "could not ask", which the caller reports rather than treating as
+    verified.
+    """
+    import json  # noqa: PLC0415
+    import urllib.error  # noqa: PLC0415
+    import urllib.request  # noqa: PLC0415
+
+    url = f"https://pypi.org/pypi/{name}/{version}/json"
+    try:
+        with urllib.request.urlopen(url, timeout=30) as fh:
+            data = json.load(fh)
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    return list(data.get("info", {}).get("requires_dist") or [])
+
+
 def _pins_set(root: Path, version: str, *, allow_unreleased: bool) -> int:
     """Point every pin at one version, and prove it by re-scanning."""
     from blastbox.host.pins import (  # noqa: PLC0415
@@ -1597,7 +1618,7 @@ def _pins_set(root: Path, version: str, *, allow_unreleased: bool) -> int:
         except Exception as exc:  # noqa: BLE001 -- network shape varies
             print(f"cannot read {version}'s dependencies from PyPI: {exc}")
             return 2
-        gaps = missing_from_locks(root, requires)
+        gaps = missing_from_locks(root, requires, requirements_of=_requirements_of)
         if gaps:
             print(f"refusing to pin {root.name} to blastbox {version}:")
             for path, names in sorted(gaps.items()):

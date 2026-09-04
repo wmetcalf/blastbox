@@ -2271,3 +2271,175 @@ def test_a_real_change_is_still_reported(tmp_path):
     )
     assert set_version(tmp_path, "0.1.39") == [str(pyproject)]
     assert "0.1.39" in pyproject.read_text()
+
+
+def test_a_dependency_that_gains_an_extra_needs_that_closure_too(tmp_path):
+    """`uvicorn` becoming `uvicorn[standard]` enables packages pip must hash.
+
+    A version match alone says nothing about those, so an older lock passes the
+    check and then fails the install.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    reqs = ["pydantic>=2.6.0", "uvicorn[standard]>=0.27"]
+    closure = {("uvicorn", "0.30.0"): ['watchfiles>=0.13; extra == "standard"']}
+    _write(
+        tmp_path,
+        "req.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("uvicorn==0.30.0"),
+    )
+    gaps = missing_from_locks(
+        tmp_path, reqs, requirements_of=lambda n, v: closure.get((n, v))
+    )
+    assert list(gaps.values()) == [["uvicorn[standard] needs watchfiles"]], gaps
+
+    # With the closure present it is satisfied -- so the check is not simply
+    # refusing every extras-bearing dependency.
+    _write(
+        tmp_path,
+        "req.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("uvicorn==0.30.0")
+        + _entry("watchfiles==0.24.0"),
+    )
+    assert (
+        missing_from_locks(
+            tmp_path, reqs, requirements_of=lambda n, v: closure.get((n, v))
+        )
+        == {}
+    )
+
+
+def test_an_unverifiable_extra_is_reported_rather_than_assumed(tmp_path):
+    """Silence would report a closure verified that nobody looked at."""
+    from blastbox.host.pins import missing_from_locks
+
+    reqs = ["pydantic>=2.6.0", "uvicorn[standard]>=0.27"]
+    _write(
+        tmp_path,
+        "req.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("uvicorn==0.30.0"),
+    )
+    gaps = missing_from_locks(tmp_path, reqs, requirements_of=lambda n, v: None)
+    assert list(gaps.values()) == [
+        ["uvicorn[standard] (its extras could not be verified)"]
+    ], gaps
+
+
+def test_the_space_form_of_hash_counts_as_hashed(tmp_path):
+    """pip documents `--hash <hash>` and its parser accepts it.
+
+    Reading such a lock as unhashed makes `set_version` rewrite the blastbox
+    version without replacing its artifact hashes.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    h = "--hash sha256:" + "a" * 64
+    (tmp_path / "req.lock").write_text(
+        f"blastbox==0.1.39 \\\n    {h}\npydantic==2.13.5 \\\n    {h}\n"
+    )
+    gaps = missing_from_locks(tmp_path, ["pydantic>=2.6.0", "packaging>=23.0"])
+    assert list(gaps.values()) == [["packaging"]], gaps
+
+
+def test_a_target_triple_records_its_architecture(tmp_path):
+    """`--python-platform aarch64-unknown-linux-gnu` is not just "linux"."""
+    from blastbox.host.pins import missing_from_locks
+
+    reqs = ["pydantic>=2.6.0", 'arm-only>=1; platform_machine == "aarch64"']
+    header = (
+        "# uv pip compile pyproject.toml --generate-hashes "
+        "--python-platform aarch64-unknown-linux-gnu -o req.lock\n"
+    )
+    _write(
+        tmp_path,
+        "req.lock",
+        header + _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5"),
+    )
+    assert list(missing_from_locks(tmp_path, reqs).values()) == [["arm-only"]]
+
+    x86 = header.replace("aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu")
+    _write(
+        tmp_path,
+        "req.lock",
+        x86 + _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5"),
+    )
+    assert missing_from_locks(tmp_path, reqs) == {}
+
+
+def test_all_extras_in_the_header_seeds_every_extra(tmp_path):
+    """`--all-extras` means the lock installs every optional set there is."""
+    from blastbox.host.pins import missing_from_locks
+
+    reqs = [
+        "pydantic>=2.6.0",
+        'fastapi>=1; extra == "host"',
+        'boto3>=1; extra == "s3"',
+    ]
+    header = (
+        "# uv pip compile pyproject.toml --generate-hashes --all-extras -o req.lock\n"
+    )
+    _write(
+        tmp_path,
+        "req.lock",
+        header + _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5"),
+    )
+    gaps = missing_from_locks(tmp_path, reqs)
+    assert sorted(gaps.values())[0] == ["fastapi", "boto3"], gaps
+
+
+def test_a_directly_named_lock_with_any_suffix_is_a_candidate(tmp_path):
+    """pip imposes no suffix convention on `-r`."""
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path, "prod.pins", _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5")
+    )
+    (tmp_path / "install.sh").write_text(
+        "#!/bin/sh\npip install --require-hashes -r prod.pins\n"
+    )
+    gaps = missing_from_locks(tmp_path, ["pydantic>=2.6.0", "packaging>=23.0"])
+    assert list(gaps.values()) == [["packaging"]], gaps
+
+
+def test_the_scanner_refuses_a_lock_it_cannot_read(tmp_path):
+    """`scan()` is what `pins` reports and what `set_version` verifies against.
+
+    A lock read as empty simply vanishes from it, so the rewrite updates every
+    other pin and the re-scan agrees -- a half-bumped repo reported as correct.
+    """
+    import blastbox.host.pins as mod
+    from blastbox.host.pins import PinScanError, scan
+
+    lock = tmp_path / "requirements.lock"
+    lock.write_text(_entry("blastbox==0.1.39"))
+    limit = mod._LOCK_READ_LIMIT
+    try:
+        mod._LOCK_READ_LIMIT = 10
+        with pytest.raises(PinScanError, match="too large"):
+            scan(tmp_path)
+    finally:
+        mod._LOCK_READ_LIMIT = limit
+
+
+def test_without_a_resolver_an_extra_is_reported_unverified(tmp_path):
+    """The library default cannot reach PyPI, and must not pretend otherwise."""
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "req.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("uvicorn==0.30.0"),
+    )
+    # No `requirements_of` at all -- the parameter is omitted, not stubbed.
+    gaps = missing_from_locks(tmp_path, ["pydantic>=2.6.0", "uvicorn[standard]>=0.27"])
+    assert list(gaps.values()) == [
+        ["uvicorn[standard] (its extras could not be verified)"]
+    ], gaps

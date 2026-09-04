@@ -26,7 +26,7 @@ from __future__ import annotations
 import os
 import stat
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 import tomllib
 from dataclasses import dataclass
@@ -451,7 +451,7 @@ def _scan_toml_lock(path: Path) -> list[Pin]:
 
 def _scan_lock(path: Path) -> list[Pin]:
     try:
-        lines = _read_small(path).splitlines()
+        lines = _read_requirements(path).splitlines()
     except OSError as exc:
         raise PinScanError(f"{path}: {exc}") from exc
     out: list[Pin] = []
@@ -510,6 +510,8 @@ _INSTALL_SCRIPT_RE = re.compile(
 )
 # Enough for any install script; anything larger is data we should not open.
 _READ_LIMIT = 1 << 20
+# pip documents `--hash <hash>` and accepts `--hash=<hash>`; both are hashed.
+_HASH_RE = re.compile(r"--hash[=\s]+\S+")
 # Generated hash locks are legitimately large -- a full closure with two hashes
 # per entry runs to megabytes -- so a RECOGNISED lock gets a generous bound and
 # an error beyond it. Silently reading it as empty makes the file look like it
@@ -815,6 +817,7 @@ def missing_from_locks(
     requires: Sequence[str],
     *,
     environment: dict[str, str] | None = None,
+    requirements_of: Callable[[str, str], list[str] | None] | None = None,
 ) -> dict[str, list[str]]:
     """Requirements of a release that a hash-pinned blastbox lock cannot satisfy.
 
@@ -869,14 +872,18 @@ def missing_from_locks(
         # What the lock's own header says it was compiled for. uv writes a plain
         # `blastbox==...` line even for `--extra host`, so without this an older
         # lock carrying half a grown extra is never recognised as needing it.
-        extras |= {e for e in env.get("__extras__", "").split(",") if e}
+        declared = env.get("__extras__", "")
+        if declared == "*":
+            extras |= _declared_extras(parsed)  # `--all-extras`
+        else:
+            extras |= {e for e in declared.split(",") if e}
         extras |= _extras_in_play(parsed, pins, scope)
         extras = _with_nested_extras(extras, parsed, scope)
         gaps: list[str] = []
         for req in parsed:
             if req is None or not _applies(req, extras, scope):
                 continue
-            gap = _gap(req, pins, scope)
+            gap = _gap(req, pins, scope, requirements_of)
             if gap:
                 gaps.append(gap)
         if gaps:
@@ -884,7 +891,12 @@ def missing_from_locks(
     return out
 
 
-def _gap(req, pins: dict[str, list[_Pin]], scope: dict[str, str]) -> str:
+def _gap(
+    req,
+    pins: dict[str, list[_Pin]],
+    scope: dict[str, str],
+    requirements_of: Callable[[str, str], list[str] | None] | None = None,
+) -> str:
     """How ``req`` is unsatisfied by ``pins``, or "" when it is satisfied."""
     name = _dist_name(req.name)
     applicable = [p for p in pins.get(name, []) if _marker_holds(p.marker, scope)]
@@ -893,13 +905,52 @@ def _gap(req, pins: dict[str, list[_Pin]], scope: dict[str, str]) -> str:
     usable = [p for p in applicable if p.hashed]
     if not usable:
         return f"{name} (pinned but not hashed)"
-    if not req.specifier:
+    matching = [p for p in usable if not req.specifier or _satisfies(req, p.version)]
+    if not matching:
+        shown = ", ".join(sorted({p.version for p in usable}))
+        return f"{name} (pinned {shown}, needs {req.specifier})"
+    # A dependency can gain an EXTRA of its own: `uvicorn` becoming
+    # `uvicorn[standard]` enables packages pip must also resolve and hash, so a
+    # version match alone is not enough and an older lock passes here and fails
+    # the install.
+    wanted = {e.lower() for e in (req.extras or set())}
+    # blastbox's OWN extras are already expanded into the lock's extra set and
+    # their requirements checked directly from the release metadata we have in
+    # hand, so asking for them again here is noise rather than a second look.
+    if not wanted or name == "blastbox":
         return ""
-    for pin in usable:
-        if _satisfies(req, pin.version):
+    if requirements_of is None:
+        # Cannot be checked without that package's own metadata. Saying so is
+        # the point: silence would report a closure verified that nobody looked
+        # at, which is the failure mode this whole check exists for.
+        return f"{name}[{','.join(sorted(wanted))}] (its extras could not be verified)"
+    for pin in matching:
+        nested = requirements_of(name, pin.version)
+        if nested is None:
+            return (
+                f"{name}[{','.join(sorted(wanted))}] (its extras could not be verified)"
+            )
+        missing = [
+            _dist_name(sub.name)
+            for sub in (_requirement(r) for r in nested)
+            if sub is not None
+            and _applies(sub, wanted, scope)
+            and not _gap_name_present(sub, pins, scope)
+        ]
+        if not missing:
             return ""
-    shown = ", ".join(sorted({p.version for p in usable}))
-    return f"{name} (pinned {shown}, needs {req.specifier})"
+    return f"{name}[{','.join(sorted(wanted))}] needs {', '.join(sorted(set(missing)))}"
+
+
+def _gap_name_present(req, pins: dict[str, list[_Pin]], scope: dict[str, str]) -> bool:
+    """Whether ``req`` has an applicable, hashed, satisfying pin."""
+    name = _dist_name(req.name)
+    return any(
+        pin.hashed
+        and _marker_holds(pin.marker, scope)
+        and (not req.specifier or _satisfies(req, pin.version))
+        for pin in pins.get(name, [])
+    )
 
 
 def _install_roots(root: Path) -> list[Path]:
@@ -919,25 +970,23 @@ def _install_roots(root: Path) -> list[Path]:
     # passed. Ordinary `.txt` files that include nothing stay out: they are
     # fixtures and corpora, not install sets.
     inputs: list[Path] = []
+    # Direct references are resolved FIRST: pip imposes no suffix convention, so
+    # `pip install -r prod.pins` names a real install set that the name filter
+    # would otherwise keep out of the candidate list entirely.
+    direct: set[Path] = set()
+    for path in _walk(root):
+        if _INSTALL_SCRIPT_RE.fullmatch(path.name) and not _is_install_input(path):
+            direct |= set(_referenced(path, root))
     included: set[Path] = set()
     aggregates: set[Path] = set()
     for path in _walk(root):
-        if not _is_install_input(path):
+        if not _is_install_input(path) and path.resolve() not in direct:
             continue
         inputs.append(path)
         names = _includes(path, root)  # read once; used for both decisions
         included |= set(names)
         if names:
             aggregates.add(path.resolve())
-
-    # What an install command actually hands to pip. pip imposes no naming
-    # convention, so a hashed `deps.txt` that includes nothing is a real
-    # install set even though nothing about its name says so.
-    direct: set[Path] = set()
-    for path in _walk(root):
-        if _is_install_input(path) or not _INSTALL_SCRIPT_RE.fullmatch(path.name):
-            continue
-        direct |= set(_referenced(path, root))
 
     candidates = [
         p
@@ -1048,9 +1097,15 @@ def _lock_environment(text: str) -> dict[str, str]:
     # `--extra host` (repeatable) is uv recording which optional sets it
     # resolved. That is authoritative where inference is a guess, and an older
     # lock missing half a newly grown extra cannot be inferred at all.
-    extras = re.findall(r"--extra[=\s]+([A-Za-z0-9._-]+)", text)
-    if extras:
-        out["__extras__"] = ",".join(sorted({e.lower() for e in extras}))
+    if re.search(r"--all-extras\b", text):
+        # Every optional set the release declares. Recorded as a sentinel
+        # because which extras exist is a property of the RELEASE, not of the
+        # lock, and is only known where the requirements are.
+        out["__extras__"] = "*"
+    else:
+        extras = re.findall(r"--extra[=\s]+([A-Za-z0-9._-]+)", text)
+        if extras:
+            out["__extras__"] = ",".join(sorted({e.lower() for e in extras}))
     platform = re.search(r"--python-platform[=\s]+(\S+)", text)
     if platform:
         token = platform.group(1).lower()
@@ -1072,6 +1127,21 @@ def _lock_environment(text: str) -> dict[str, str]:
         ):
             if needle in token:
                 out.update(values)
+                break
+        # The ARCHITECTURE in a target triple. Leaving it to the executing host
+        # skips a requirement guarded by `platform_machine == "aarch64"`
+        # whenever the lock was compiled for one and this machine is not.
+        for arch in (
+            "aarch64",
+            "arm64",
+            "x86_64",
+            "i686",
+            "ppc64le",
+            "s390x",
+            "armv7l",
+        ):
+            if arch in token:
+                out["platform_machine"] = "arm64" if arch == "arm64" else arch
                 break
     return out
 
@@ -1128,7 +1198,11 @@ def _effective_pins(
             _Pin(
                 version=match.group(3),
                 marker=marker,
-                hashed="--hash=" in line,
+                # BOTH spellings. pip documents `--hash <hash>` and its parser
+                # accepts the space form, so matching only `--hash=` reads a
+                # perfectly good lock as unhashed -- and `set_version` then
+                # rewrites the blastbox version without replacing its hashes.
+                hashed=_HASH_RE.search(line) is not None,
                 extras=entry_extras,
             )
         )
@@ -1175,6 +1249,17 @@ def _applicable_names(pins: dict[str, list[_Pin]], scope: dict[str, str]) -> set
         for name, entries in pins.items()
         if any(_marker_holds(pin.marker, scope) for pin in entries)
     }
+
+
+def _declared_extras(parsed: Sequence[Any]) -> set[str]:
+    """Every extra the release's own metadata mentions."""
+    out: set[str] = set()
+    for req in parsed:
+        if req is None:
+            continue
+        marker = str(getattr(req, "marker", "") or "")
+        out |= {e.lower() for e in re.findall(r"extra\s*==\s*[\"\']([^\"\']+)", marker)}
+    return out
 
 
 def _extras_in_play(
