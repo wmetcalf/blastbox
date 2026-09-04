@@ -24,7 +24,6 @@ import contextlib
 import fcntl
 import hashlib
 import time
-import datetime
 import os
 import re
 import shutil
@@ -260,7 +259,13 @@ def _staging_tag(tag: str) -> str:
     # and the first to publish would delete tags the second still needs.
     # The pid is kept anyway: it says which process to look at when a refused
     # build leaves its images behind.
-    suffix = f"-blastbox-staging-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    # The tag carries its OWN creation time. docker's `.CreatedAt` is when the
+    # IMAGE was created, not when the tag was attached, so a cache hit gives a
+    # brand-new staging tag an old timestamp -- and a concurrent run's sweep
+    # would then delete a tag the live build still needs.
+    suffix = (
+        f"-blastbox-staging-{os.getpid()}-{uuid.uuid4().hex[:8]}-{int(time.time())}"
+    )
     return tag[: 128 - len(suffix)] + suffix
 
 
@@ -281,7 +286,10 @@ class PublishedTags:
     published: dict[str, str]
 
 
-_STAGING_MARKER = "-blastbox-staging-"
+# The COMPLETE generated shape, anchored at the end of the tag component.
+# `demo-blastbox-staging-cache:prod` is a legal image name, and a substring
+# check would have handed it to `docker rmi`.
+_STAGING_RE = re.compile(r"-blastbox-staging-\d+-[0-9a-f]{8}-(\d{10,})$")
 
 
 def sweep_stale_staging_tags(
@@ -308,11 +316,16 @@ def sweep_stale_staging_tags(
     cutoff = time.time() - older_than_hours * 3600
     dropped: list[str] = []
     for line in (proc.stdout or "").splitlines():
-        ref, _, created = line.partition("\t")
-        if _STAGING_MARKER not in ref:
+        ref, _, _created = line.partition("\t")
+        # The TAG component only. With the end anchor above this is currently
+        # equivalent to searching the whole reference -- a mutation check says
+        # so -- but it states the rule the anchor happens to enforce: only the
+        # part this module generates is ours to delete.
+        match = _STAGING_RE.search(ref.rsplit(":", 1)[-1])
+        if match is None:
             continue
-        stamp = _created_at(created)
-        if stamp is None or stamp > cutoff:
+        stamp = float(match.group(1))
+        if stamp > cutoff:
             continue
         if (
             runner(["docker", "rmi", "--no-prune", ref], capture_output=True).returncode
@@ -322,26 +335,6 @@ def sweep_stale_staging_tags(
     if dropped:
         log(f"   swept {len(dropped)} staging tag(s) from earlier runs")
     return dropped
-
-
-def _created_at(value: str) -> float | None:
-    """docker's `{{.CreatedAt}}` as an epoch, or None if it cannot be read.
-
-    Unparseable means "do not touch it": this decides whether to DELETE an
-    image, and a format this cannot read is not evidence that it is old.
-    """
-    text = value.strip()
-    if not text:
-        return None
-    # "2026-09-04 11:51:02 +0100 BST" -- the trailing zone NAME is not
-    # parseable by %z, and is redundant beside the offset.
-    parts = text.split()
-    if len(parts) >= 3:
-        text = " ".join(parts[:3])
-    try:
-        return datetime.datetime.strptime(text, "%Y-%m-%d %H:%M:%S %z").timestamp()
-    except ValueError:
-        return None
 
 
 def publish_tags(
@@ -355,38 +348,42 @@ def publish_tags(
     deleted production tag with no recorded reference to restore.
     """
     runner = run or _default_runner
+    finals = [f"{s.rsplit(':', 1)[0]}:{tag}" for s in staged]
     previous: dict[str, str] = {}
-    for staged_tag in staged:
-        final = f"{staged_tag.rsplit(':', 1)[0]}:{tag}"
-        state = _image_state(final, runner)
-        if state is None:
-            raise BuildError(
-                f"refusing to publish: cannot determine what {final} points at "
-                "now. Rollback depends on knowing whether it existed, so moving "
-                "it without that reading risks losing the image it names."
-            )
-        previous[final] = state
-
     published: dict[str, str] = {}
     order: list[str] = []
-    try:
-        for staged_tag in staged:
-            final = f"{staged_tag.rsplit(':', 1)[0]}:{tag}"
-            with _tag_lock(final):
+    with contextlib.ExitStack() as locks:
+        # EVERY tag, held across the whole snapshot-and-publish sequence. Taken
+        # one at a time, two runs could interleave a chain: A publishes the
+        # base, B publishes base and worker, A then publishes the worker -- a
+        # mixed chain although both runs reported success. Sorted, so two runs
+        # acquiring overlapping sets cannot deadlock against each other.
+        for ref in sorted(set(finals)):
+            locks.enter_context(_tag_lock(ref))
+        for final in finals:
+            state = _image_state(final, runner)
+            if state is None:
+                raise BuildError(
+                    f"refusing to publish: cannot determine what {final} points "
+                    "at now. Rollback depends on knowing whether it existed, so "
+                    "moving it without that reading risks losing the image it "
+                    "names."
+                )
+            previous[final] = state
+        try:
+            for staged_tag, final in zip(staged, finals, strict=True):
                 log(f"   {final} <- {staged_tag}")
                 _must(["docker", "tag", staged_tag, final], f"tag {final}", runner)
-                # What we put there, read back under the same lock: a rollback
-                # restores only while the tag still holds this.
+                # Read back while the lock is still held: a rollback restores
+                # only while the tag still holds this.
                 published[final] = _image_id(final, runner)
-            order.append(final)
-    except BaseException:
-        restore_tags(
-            PublishedTags(tuple(order), previous, published),
-            staged,
-            run=runner,
-            log=log,
-        )
-        raise
+                order.append(final)
+        except BaseException:
+            _restore_tags_locked(
+                PublishedTags(tuple(order), previous, published), runner, log
+            )
+            _drop_staging_tags(staged, runner)
+            raise
     _drop_staging_tags(staged, runner)
     return PublishedTags(tuple(order), previous, published)
 
@@ -407,9 +404,18 @@ def restore_tags(
     exists to prevent.
     """
     runner = run or _default_runner
+    with contextlib.ExitStack() as locks:
+        for ref in sorted(set(published.tags)):
+            locks.enter_context(_tag_lock(ref))
+        _restore_tags_locked(published, runner, log)
+    _drop_staging_tags(staged, runner)
+
+
+def _restore_tags_locked(published: PublishedTags, runner: Runner, log: Log) -> None:
+    """The restore itself, with every affected tag already locked."""
     failed: list[str] = []
-    for final in reversed(published.tags):
-        with _tag_lock(final):
+    if True:  # keeps the body's indentation stable for review
+        for final in reversed(published.tags):
             now = _image_state(final, runner)
             ours = published.published.get(final, "")
             if now is None:
@@ -440,7 +446,6 @@ def restore_tags(
             "   TAG ROLLBACK INCOMPLETE — these still point at the new release "
             "while the artifacts do not: " + ", ".join(failed)
         )
-    _drop_staging_tags(staged, runner)
 
 
 def _drop_staging_tags(staged: Sequence[str], run: Runner) -> None:
@@ -1338,7 +1343,13 @@ def stage_rootfs(
     # mutable, and re-resolving it here can hand us an image nothing checked.
     source = verified_id or image
     dest = Path(spec.resolved_dest(env))
-    if "$" in str(dest):
+    # Asked of the TEMPLATE, like the dry run and the plan validator. This is
+    # the last of the three and the one that actually guards the write, so
+    # leaving it result-based meant a destination whose expansion legitimately
+    # contains a dollar was built and verified and only then refused.
+    if _images.unresolved_names(
+        spec.dest, env if env is not None else dict(os.environ)
+    ):
         raise BuildError(
             f"{spec.dest} still contains an unset variable ({dest}); refusing to "
             "write to a path nobody chose"
@@ -1710,26 +1721,40 @@ def run_plan(
     # the earlier destinations on the NEW release and the rest on the old --
     # the mixed release the staging phase was written to prevent, arriving one
     # step later.
+    # ROOTFS FIRST, TAGS LAST.
+    #
+    # These are two different atomicity domains -- filesystem renames and the
+    # docker tag table -- so a reader can always observe one updated and the
+    # other not. That window cannot be closed here; it can only be made as
+    # small as possible and put where it does least harm. A versioned pointer
+    # the dispatcher resolves once per job is the real fix, and it belongs in
+    # the dispatcher rather than in this module.
+    #
+    # Rootfs publication is the half that actually fails -- disk, permissions,
+    # a concurrent publish -- so doing it first means the common failure never
+    # touches a tag at all. Moving the tags first meant every such failure had
+    # to unwind live production tags, which is more moving parts in exactly the
+    # situation with the least margin.
     done: list[_Staged] = []
     published: list[str] = []
     pub = PublishedTags((), {}, {})
     try:
-        log(f"\n>> publish tags -> :{tag}")
-        pub = publish_tags(staged_tags, tag, run=run, log=log)
-        published = list(pub.tags)
         for s in staged:
             log(f"\n>> publish {s.dest}")
             publish_staged(s, run=run, log=log)
             done.append(s)
+        log(f"\n>> publish tags -> :{tag}")
+        pub = publish_tags(staged_tags, tag, run=run, log=log)
+        published = list(pub.tags)
     except BaseException:
+        if pub.tags:
+            # Reached only when tag publication PARTLY succeeded: `publish_tags`
+            # unwinds its own failures, so anything left here is a later
+            # failure with tags already moved.
+            log("   rolling back published tags")
+            restore_tags(pub, staged_tags, run=run, log=log)
         for s in reversed(done):
             log(f"   rolling back {s.dest}")
             _restore_backup(s, run or _default_runner, log)
-        if published:
-            # The tags moved before the rootfs did, so an artifact that failed
-            # to publish leaves images the fleet would dispatch on against a
-            # rootfs from the previous release. Put them back.
-            log("   rolling back published tags")
-            restore_tags(pub, staged_tags, run=run, log=log)
         raise
     return published

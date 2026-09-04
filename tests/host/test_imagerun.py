@@ -8,13 +8,13 @@ is where all of those failures lived — rather than about docker.
 from __future__ import annotations
 
 import dataclasses
-import datetime
 import os
 import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -2719,7 +2719,11 @@ def test_the_tags_are_published_only_after_the_whole_chain_verifies(
 
 
 def _publication_rollback(tmp_path, monkeypatch, previously) -> list[list[str]]:
-    """Run a plan whose rootfs publication fails; return the tag calls it made.
+    """Fail PART WAY through tag publication; return the tag calls it made.
+
+    The rootfs is published first now, so a rootfs failure moves no tags at all
+    -- the case that still needs unwinding is a chain whose second tag fails
+    after the first has moved.
 
     Docker's tag table is MODELLED rather than stubbed per-call: publication
     reads what a tag points at, moves it, reads it back, and a rollback decides
@@ -2746,11 +2750,6 @@ def _publication_rollback(tmp_path, monkeypatch, previously) -> list[list[str]]:
     )
     monkeypatch.setattr(mod, "_image_id", lambda image, run=None: tags.get(image, ""))
     monkeypatch.setenv("DEMO_DIR", str(tmp_path / "out"))
-    monkeypatch.setattr(
-        mod,
-        "publish_staged",
-        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")),
-    )
     seen: list[list[str]] = []
     run = FakeRunner()
 
@@ -2758,13 +2757,16 @@ def _publication_rollback(tmp_path, monkeypatch, previously) -> list[list[str]]:
         a = list(argv)
         if a[:2] == ["docker", "tag"]:
             seen.append(a)
+            if a[3] == "demo-worker:t1":
+                # The second tag of the chain fails, with the first moved.
+                return subprocess.CompletedProcess(a, 1, "", "daemon says no")
             tags[a[3]] = tags.get(a[2], a[2])
         elif a[:2] == ["docker", "rmi"]:
             seen.append(a)
             tags.pop(a[-1], None)
         return run(argv, **kw)
 
-    with pytest.raises(OSError, match="disk full"):
+    with pytest.raises(BuildError):
         run_plan(
             _plan(tmp_path),
             "t1",
@@ -2780,15 +2782,14 @@ def _publication_rollback(tmp_path, monkeypatch, previously) -> list[list[str]]:
 def test_a_failed_publication_removes_tags_that_did_not_exist_before(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """Tags move before the rootfs does, so a rootfs failure would otherwise
-    leave images the fleet dispatches on against the PREVIOUS release.
+    """Nothing pointed at these tags before the run.
 
-    Nothing pointed at these tags before the run, so putting them back means
-    removing them -- not leaving them on a half-published chain.
+    Putting them back means removing them -- not leaving one of them on a
+    half-published chain, which is what a consumer would then dispatch on.
     """
     seen = _publication_rollback(tmp_path, monkeypatch, previously={})
     removed = [a[-1] for a in seen if a[:2] == ["docker", "rmi"]]
-    assert "demo-base:t1" in removed and "demo-worker:t1" in removed, seen
+    assert "demo-base:t1" in removed, seen
 
 
 def test_a_failed_publication_restores_the_image_a_tag_had_before(
@@ -2802,8 +2803,49 @@ def test_a_failed_publication_restores_the_image_a_tag_had_before(
         previously={"demo-base:t1": old, "demo-worker:t1": old},
     )
     restored = [a for a in seen if a[:3] == ["docker", "tag", old]]
-    assert [a[-1] for a in restored] == ["demo-worker:t1", "demo-base:t1"], seen
+    assert [a[-1] for a in restored] == ["demo-base:t1"], seen
     assert not [a for a in seen if a[:2] == ["docker", "rmi"] and a[-1].endswith(":t1")]
+
+
+def test_a_rootfs_failure_moves_no_tags_at_all(tmp_path: Path, monkeypatch) -> None:
+    """Rootfs publication is the half that actually fails.
+
+    Publishing it first means the common failure never touches a live tag --
+    previously every such failure had to unwind production tags, which is more
+    moving parts in exactly the situation with the least margin.
+    """
+    import blastbox.host.imagerun as mod
+
+    _resolves_to(monkeypatch)
+    _pin_staging(monkeypatch)
+    monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
+    monkeypatch.setattr(mod, "_read_stamp", lambda i, r=None: _FakeStamp())
+    monkeypatch.setattr(mod, "_verify_contents", lambda i, r=None: (True, ""))
+    monkeypatch.setattr(
+        mod,
+        "publish_staged",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    monkeypatch.setenv("DEMO_DIR", str(tmp_path / "out"))
+    moved: list[list[str]] = []
+    run = FakeRunner()
+
+    def watched(argv, **kw):
+        if list(argv)[:2] in (["docker", "tag"], ["docker", "rmi"]):
+            moved.append(list(argv))
+        return run(argv, **kw)
+
+    with pytest.raises(OSError, match="disk full"):
+        run_plan(
+            _plan(tmp_path),
+            "t1",
+            blastbox_version="0.1.34",
+            run=watched,
+            log=lambda _: None,
+            extract=lambda image, dest: (dest / "init").write_text("x"),
+            extract_preserves_ownership=True,
+        )
+    assert not [a for a in moved if a[:2] == ["docker", "tag"]], moved
 
 
 def test_rollback_leaves_a_concurrent_runs_publication_alone(tmp_path: Path) -> None:
@@ -3368,18 +3410,27 @@ def test_stale_staging_tags_are_swept_but_recent_ones_are_kept() -> None:
     Those tags are the only names the rejected images have, so removing them on
     failure would leave a dangling image and a question nobody can answer --
     but repeated failures would otherwise pin every rejected chain on disk.
+
+    The age comes from the TAG's own name. docker's `.CreatedAt` is when the
+    IMAGE was created, so a cache hit gives a brand-new staging tag an old
+    timestamp -- and a concurrent run's sweep would delete a tag a live build
+    still needs. That column is deliberately misleading here to prove it is
+    not read.
     """
     import blastbox.host.imagerun as mod
 
-    old = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=3)
-    recent = datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=5)
-    fmt = "%Y-%m-%d %H:%M:%S %z UTC"
+    now = int(time.time())
+    old = now - 3 * 86400
+    stale = f"demo:t1-blastbox-staging-1-aaaaaaaa-{old}"
+    fresh = f"demo:t1-blastbox-staging-2-bbbbbbbb-{now}"
     listing = _images_listing(
         [
-            ("demo:t1-blastbox-staging-1-aaaa", old.strftime(fmt)),
-            ("demo:t1-blastbox-staging-2-bbbb", recent.strftime(fmt)),
-            ("demo:t1", old.strftime(fmt)),
-            ("upstream:1", old.strftime(fmt)),
+            (stale, "2020-01-01 00:00:00 +0000 UTC"),
+            # A cache hit: brand-new tag, ancient image timestamp.
+            (fresh, "2020-01-01 00:00:00 +0000 UTC"),
+            ("demo:t1", "2020-01-01 00:00:00 +0000 UTC"),
+            # A legal image name that merely CONTAINS the marker.
+            ("demo-blastbox-staging-cache:prod", "2020-01-01 00:00:00 +0000 UTC"),
         ]
     )
     removed: list[str] = []
@@ -3393,21 +3444,33 @@ def test_stale_staging_tags_are_swept_but_recent_ones_are_kept() -> None:
         return subprocess.CompletedProcess(a, 0, "", "")
 
     dropped = mod.sweep_stale_staging_tags(run=run, log=lambda _: None)
-    assert removed == ["demo:t1-blastbox-staging-1-aaaa"], removed
+    assert removed == [stale], removed
     assert dropped == removed
-    # A live run's tags, and every ordinary tag, are left alone.
-    assert "demo:t1-blastbox-staging-2-bbbb" not in removed
-    assert "demo:t1" not in removed
+    assert fresh not in removed, "a live run's tag was swept"
+    assert "demo-blastbox-staging-cache:prod" not in removed, "not a staging tag"
 
 
-def test_a_creation_time_that_cannot_be_read_is_not_swept() -> None:
+def test_a_tag_without_the_generated_shape_is_never_swept() -> None:
     """This decides whether to DELETE an image.
 
-    A timestamp format we cannot parse is not evidence that the image is old.
+    Only the complete generated suffix identifies a tag as private build state;
+    anything else is somebody's image.
     """
     import blastbox.host.imagerun as mod
 
-    listing = _images_listing([("demo:t1-blastbox-staging-1-aaaa", "who knows")])
+    listing = _images_listing(
+        [
+            ("demo:t1-blastbox-staging-nope", "2020-01-01 00:00:00 +0000 UTC"),
+            (
+                "demo:t1-blastbox-staging-1-zzzzzzzz-1700000000",
+                "2020-01-01 00:00:00 +0000 UTC",
+            ),
+            (
+                "demo-blastbox-staging-1-aaaaaaaa-1700000000:prod",
+                "2020-01-01 00:00:00 +0000 UTC",
+            ),
+        ]
+    )
     removed: list[str] = []
 
     def run(argv, **kw):
@@ -3420,3 +3483,124 @@ def test_a_creation_time_that_cannot_be_read_is_not_swept() -> None:
 
     assert mod.sweep_stale_staging_tags(run=run, log=lambda _: None) == []
     assert removed == []
+
+
+def test_a_staging_tag_records_its_own_creation_time() -> None:
+    """The sweep reads the age out of the NAME, so the name has to carry it."""
+    import blastbox.host.imagerun as mod
+
+    before = int(time.time())
+    name = mod._staging_tag("t1")
+    match = mod._STAGING_RE.search(name)
+    assert match, name
+    assert before <= int(match.group(1)) <= int(time.time()) + 1, name
+
+
+def test_a_destination_with_a_literal_dollar_reaches_the_export(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Three separate checks guard this, and the WRITE GATE is the last of them.
+
+    Fixing the dry run and the plan validator only moved the refusal later: the
+    images were built and verified and the export then refused a path that was
+    perfectly resolved.
+    """
+    import blastbox.host.imagerun as mod
+
+    _resolves_to(monkeypatch)
+    _pin_staging(monkeypatch)
+    monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
+    monkeypatch.setattr(mod, "_read_stamp", lambda i, r=None: _FakeStamp())
+    monkeypatch.setattr(mod, "_verify_contents", lambda i, r=None: (True, ""))
+    odd = tmp_path / "we$rd"
+    odd.mkdir()
+    monkeypatch.setenv("DEMO_DIR", str(odd))
+    published = run_plan(
+        _plan(tmp_path),
+        "t1",
+        blastbox_version="0.1.34",
+        run=FakeRunner(moves=True),
+        log=lambda _: None,
+        extract=lambda image, dest: (dest / "init").write_text("x"),
+        extract_preserves_ownership=True,
+    )
+    assert published == ["demo-base:t1", "demo-worker:t1"], published
+    assert (odd / "demo.ext4").exists(), list(odd.iterdir())
+
+
+def test_a_repository_named_like_a_staging_tag_is_not_swept() -> None:
+    """The marker has to be matched in the TAG, not anywhere in the reference.
+
+    `demo-blastbox-staging-1-aaaaaaaa-<epoch>:prod` is a legal image name, and a
+    whole-reference search hands somebody's production tag to `docker rmi`.
+    """
+    import blastbox.host.imagerun as mod
+
+    old = int(time.time()) - 3 * 86400
+    listing = _images_listing(
+        [
+            (
+                f"demo-blastbox-staging-1-aaaaaaaa-{old}:prod",
+                "2020-01-01 00:00:00 +0000 UTC",
+            )
+        ]
+    )
+    removed: list[str] = []
+
+    def run(argv, **kw):
+        a = list(argv)
+        if a[:2] == ["docker", "images"]:
+            return subprocess.CompletedProcess(a, 0, listing, "")
+        if a[:2] == ["docker", "rmi"]:
+            removed.append(a[-1])
+        return subprocess.CompletedProcess(a, 0, "", "")
+
+    assert mod.sweep_stale_staging_tags(run=run, log=lambda _: None) == []
+    assert removed == [], removed
+
+
+def test_every_tag_in_the_chain_is_locked_for_the_whole_publication() -> None:
+    """Taken one at a time, two runs can interleave a chain.
+
+    A publishes the base, B publishes base and worker, A then publishes the
+    worker -- a mixed chain although both runs reported success. Proven by
+    trying to take the SECOND tag's lock while the FIRST is being moved.
+    """
+    import fcntl
+    import hashlib
+    import tempfile as _tempfile
+
+    import blastbox.host.imagerun as mod
+
+    def lock_path(ref: str) -> Path:
+        key = hashlib.sha256(f"tag:{ref}".encode()).hexdigest()[:16]
+        return Path(_tempfile.gettempdir()) / f"blastbox-publish-{key}.lock"
+
+    def held(ref: str) -> bool:
+        fd = os.open(lock_path(ref), os.O_CREAT | os.O_RDONLY, 0o666)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+        finally:
+            os.close(fd)
+
+    observed: list[bool] = []
+
+    def run(argv, **kw):
+        a = list(argv)
+        if a[:2] == ["docker", "tag"] and a[3] == "demo-base:t1":
+            # While the FIRST tag is being moved, the second must already be
+            # locked by this same publication.
+            observed.append(held("demo-worker:t1"))
+        if a[:2] == ["docker", "inspect"]:
+            return subprocess.CompletedProcess(a, 1, "", "No such image")
+        return subprocess.CompletedProcess(a, 0, _VERIFIED_ID, "")
+
+    mod.publish_tags(
+        ["demo-base:stg", "demo-worker:stg"], "t1", run=run, log=lambda _: None
+    )
+    assert observed == [True], observed

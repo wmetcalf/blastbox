@@ -704,6 +704,26 @@ def canonical_version(version: str) -> str:
         return version
 
 
+def _same_release(left: str, right: str) -> bool:
+    """Whether two spellings name the same release under PEP 440.
+
+    Compared as VERSIONS, not as canonical strings. `0.2` and `0.2.0` are equal
+    to pip and to any installer, and `str(Version(...))` preserves the
+    release-segment spelling it was given -- so a consumer pinning
+    `blastbox>=0.2` got an image whose metadata reads `0.2.0` and failed its own
+    verification over a trailing zero.
+
+    Falls back to comparing what was written when either side cannot be parsed:
+    this runs inside a verification path and must not raise.
+    """
+    from packaging.version import InvalidVersion, Version  # noqa: PLC0415
+
+    try:
+        return Version(left) == Version(right)
+    except InvalidVersion:
+        return left == right
+
+
 def verify_contents(
     image: str, runner: Runner | None = None
 ) -> tuple[bool | None, str]:
@@ -740,7 +760,7 @@ def verify_contents(
     # the probe reports the spelling the installer recorded; `0.2.0-rc1` and
     # `0.2.0rc1` are the same release, and failing a build over the punctuation
     # would reject exactly the valid pins this tooling accepts.
-    if canonical_version(actual) != canonical_version(stamped):
+    if not _same_release(actual, stamped):
         return False, f"label says {stamped}, image contains {actual}"
     return True, actual
 
