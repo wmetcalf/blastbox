@@ -1060,8 +1060,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     bip = sub.add_parser(
         "build-images",
-        help="check an engine's declared image chain and print the resolved plan "
-             "(--dry-run today; execution not yet wired)",
+        help="build an engine's declared image chain, stamped and verified, then "
+             "export the rootfs artifacts it declares (--dry-run to inspect)",
     )
     bip.add_argument("repo", help="path to the consumer repo (it declares blastbox-images.toml)")
     bip.add_argument("--tag", required=True, help="tag to build the whole chain under")

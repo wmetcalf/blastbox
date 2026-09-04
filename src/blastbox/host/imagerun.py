@@ -20,6 +20,7 @@ Every guard below is a failure that has actually happened on this fleet:
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -187,7 +188,11 @@ def build_plan(
     env = {**(dict(os.environ) if env is None else env),
            "BLASTBOX_VERSION": blastbox_version}
 
-    problems = _images.missing_dockerfiles(plan, env) + _images.arg_problems(plan, env)
+    problems = (
+        _images.missing_dockerfiles(plan, env)
+        + _images.arg_problems(plan, env)
+        + _images.unresolved_build_args(plan, env)
+    )
     if problems:
         raise BuildError(
             "the plan cannot be built as declared:\n  " + "\n  ".join(problems)
@@ -231,13 +236,29 @@ def build_plan(
         )
         argv = _images.build_command(to_build, tag, flags, base_ref, env, plan)
         log(f">> build {spec.tagged(tag)}  <- {base_ref}")
+        before = _source_state(source)
         _must(argv, f"build {spec.tagged(tag)}", run, cwd=plan.root)
+        after = _source_state(source)
+        if before != after:
+            # The label records the revision read BEFORE the build, while docker
+            # read the context during it. A concurrent deploy or an editor save
+            # in between produces an image whose contents are not the commit it
+            # names -- and it passes every stamp check, because the stamp is
+            # self-consistent. Cannot be prevented from here; it can be noticed.
+            raise BuildError(
+                f"{spec.name}: {source} changed while it was being built "
+                f"({before} -> {after}). The stamp would name a revision this "
+                "image does not contain; rebuild from a checkout nothing is "
+                "writing to."
+            )
         built.append(spec.tagged(tag))
 
     return built
 
 
-def verify_built(images: Sequence[str], *, run: Runner | None = None, log: Log = _log) -> None:
+def verify_built(
+    images: Sequence[str], *, run: Runner | None = None, log: Log = _log
+) -> dict[str, str]:
     """Every image must record enough to be rebuilt, and record it TRUTHFULLY.
 
     Read from the ARTIFACT, not from what the build was told to do: the two
@@ -260,6 +281,7 @@ def verify_built(images: Sequence[str], *, run: Runner | None = None, log: Log =
       provenance is for.
     """
     runner = None if run is None else (lambda argv: run(argv))
+    resolved: dict[str, str] = {}
     bad: list[str] = []
     for image in images:
         log(f"-- {image}")
@@ -289,11 +311,30 @@ def verify_built(images: Sequence[str], *, run: Runner | None = None, log: Log =
         agrees, detail = _verify_contents(image, runner)  # type: ignore[arg-type]
         if agrees is False:
             bad.append(f"{image}: {detail}")
+            continue
+        # The ID this tag resolved to WHILE it was being verified. Exporting by
+        # tag reopens the question: another build can retag between here and
+        # `docker create`, and the rootfs would then come from an image nothing
+        # checked.
+        ident = _image_id(image, run or _default_runner)
+        if not ident:
+            bad.append(f"{image}: could not resolve it to an image id")
+            continue
+        resolved[image] = ident
     if bad:
         raise BuildError(
             "one or more images are not reproducible from what they record:\n  "
             + "\n  ".join(bad)
         )
+    return resolved
+
+
+def _ensure_dir(path: Path, priv: list[str], run: Runner) -> None:
+    """Create ``path`` and its parents, shelling out only when root is needed."""
+    if priv:
+        _must([*priv, "mkdir", "-p", str(path)], "mkdir", run)
+    else:
+        path.mkdir(parents=True, exist_ok=True)
 
 
 def _stage_dir(parent: Path, priv: list[str], run: Runner) -> Path:
@@ -313,6 +354,38 @@ def _stage_dir(parent: Path, priv: list[str], run: Runner) -> Path:
             f"{(proc.stderr or '').strip()}"
         )
     return Path((proc.stdout or "").strip())
+
+
+def _source_state(repo: Path) -> str:
+    """A cheap fingerprint of a source tree: its HEAD plus its dirty status.
+
+    Enough to catch the case that matters -- the tree moving or being edited
+    across a build -- without hashing a whole checkout on every image.
+    """
+    head = subprocess.run(  # noqa: S603
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=False,
+    )
+    status = subprocess.run(  # noqa: S603
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        capture_output=True, text=True, check=False,
+    )
+    if head.returncode != 0:
+        return ""  # not a git tree; `git_revision` handles that case separately
+    # A stable digest, not hash(): PYTHONHASHSEED randomises that per process,
+    # so a value built here would be meaningless to compare anywhere else and
+    # unreadable in the error message.
+    dirt = hashlib.sha256(status.stdout.encode()).hexdigest()[:12]
+    return f"{head.stdout.strip()}:{dirt}"
+
+
+def _image_id(image: str, run: Runner) -> str:
+    """``image``'s current image ID, or "" if it cannot be resolved."""
+    proc = run(
+        ["docker", "inspect", "--type", "image", image, "--format", "{{.Id}}"],
+        capture_output=True,
+    )
+    return (proc.stdout or "").strip() if proc.returncode == 0 else ""
 
 
 def _why_unusable(stamp: object) -> str:
@@ -398,9 +471,12 @@ def _normalize_root(tree: Path, priv: list[str], run: Runner) -> None:
     A rootfs whose own root a runtime cannot traverse is a boot failure that
     looks like anything but a permissions problem.
     """
+    # Checked, not fired and forgotten. On a filesystem that permits rename but
+    # rejects metadata changes, an unchecked pair publishes a tree still at
+    # mkdtemp's 0700 and the invoking user -- and reports success.
     if priv:
-        run([*priv, "chown", "root:root", str(tree)], capture_output=True)
-    run([*priv, "chmod", "0755", str(tree)], capture_output=True)
+        _must([*priv, "chown", "root:root", str(tree)], "chown rootfs root", run)
+    _must([*priv, "chmod", "0755", str(tree)], "chmod rootfs root", run)
 
 
 def _present_in(tree: Path, requirement: str) -> bool:
@@ -448,6 +524,38 @@ def _requirement_problem(requirement: str) -> str:
     if ".." in PurePosixPath(requirement).parts:
         return f"{requirement!r} contains '..', which would leave the rootfs"
     return ""
+
+
+def _check_no_setuid(tree: Path, spec: RootfsSpec, image: str) -> None:
+    """Refuse a sandbox rootfs carrying setuid/setgid binaries.
+
+    `deploy/firecracker/build-rootfs.sh` has always refused these, and replacing
+    that flow with this module must not silently drop the gate. Audited on the
+    EXTRACTED tree rather than by running `find` in the image: this is what
+    actually gets published, and it needs no container.
+
+    Extraction preserves mode bits on purpose -- that is the fidelity the guest
+    needs -- so the audit and the preservation belong together.
+    """
+    if not spec.forbid_setuid:
+        return
+    found: list[str] = []
+    for path in tree.rglob("*"):
+        try:
+            st = path.lstat()
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode) and st.st_mode & (stat.S_ISUID | stat.S_ISGID):
+            found.append("/" + str(path.relative_to(tree)))
+            if len(found) >= 20:  # a full list is not more informative
+                break
+    if found:
+        raise BuildError(
+            f"{image} carries setuid/setgid binaries, which a sandbox rootfs must "
+            f"not: {sorted(found)}. Strip them in the Dockerfile "
+            "(`find / -xdev -type f -perm /6000 -exec chmod a-s {} +`), or set "
+            "`forbid_setuid = false` on this [[rootfs]] to accept them deliberately."
+        )
 
 
 def _check_requires(tree: Path, spec: RootfsSpec, image: str) -> None:
@@ -536,6 +644,7 @@ def stage_rootfs(
     run: Runner | None = None,
     log: Log = _log,
     extract: Callable[[str, Path], None] | None = None,
+    verified_id: str = "",
 ) -> _Staged:
     """Prepare the artifact a warm tier boots, WITHOUT replacing anything.
 
@@ -546,6 +655,9 @@ def stage_rootfs(
     run = run or _default_runner
     env = dict(os.environ) if env is None else env
     image = f"{spec.image}:{tag}"
+    # Extracted by the ID verification resolved, when there is one: a tag is
+    # mutable, and re-resolving it here can hand us an image nothing checked.
+    source = verified_id or image
     dest = Path(spec.resolved_dest(env))
     if "$" in str(dest):
         raise BuildError(
@@ -561,21 +673,26 @@ def stage_rootfs(
     as_root = _can_be_root()
     priv = _root_prefix() if (as_root or need_sudo) else []
 
-    _must([*priv, "mkdir", "-p", str(dest.parent)], "mkdir", run)
+    _ensure_dir(dest.parent, priv, run)
     staging = _stage_dir(dest.parent, priv, run)
     try:
         if extract is not None:
-            extract(image, staging)
+            extract(source, staging)
         else:
-            _extract_image(image, staging, run, log, as_root=as_root)
+            _extract_image(source, staging, run, log, as_root=as_root)
         _check_requires(staging, spec, image)
+        _check_no_setuid(staging, spec, image)
         _normalize_root(staging, priv, run)
 
         if spec.kind == "dir":
             ready = staging
         else:
             size = spec.size_mib or _existing_mib(dest) or 1536
-            ready = dest.with_suffix(dest.suffix + ".new")
+            # Unique per run, not a fixed `<dest>.new`. Two concurrent exports
+            # to one destination would otherwise truncate and format the SAME
+            # file, and one can rename it live while the other is still writing
+            # into it -- publication being a rename does not help.
+            ready = Path(f"{staging}.img")
             _must([*priv, "truncate", "-s", f"{size}M", str(ready)], "truncate", run)
             # `mke2fs -d` populates the image directly: no mount, no loop device
             # and no root beyond writing the file -- the same discipline the host
@@ -663,7 +780,7 @@ def run_plan(
     """
     built = build_plan(plan, tag, blastbox_version=blastbox_version, env=env, run=run, log=log)
     log("\n>> verify: every image must record what it was built from")
-    verify_built(built, run=run, log=log)
+    verified = verify_built(built, run=run, log=log)
     # Staged FIRST, all of them, then published. Publishing each as it is built
     # leaves the earlier destinations on the new release and the later ones on
     # the old when a later export fails -- the warm tiers then run a mixed
@@ -674,7 +791,10 @@ def run_plan(
         for spec in plan.rootfs:
             log(f"\n>> stage {spec.kind} rootfs <- {spec.image}:{tag}")
             staged.append(
-                stage_rootfs(plan, spec, tag, env=env, run=run, log=log, extract=extract)
+                stage_rootfs(
+                    plan, spec, tag, env=env, run=run, log=log, extract=extract,
+                    verified_id=verified.get(f"{spec.image}:{tag}", ""),
+                )
             )
     except BaseException:
         for s in staged:

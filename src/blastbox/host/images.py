@@ -131,6 +131,12 @@ class RootfsSpec:
     dest: str
     size_mib: int | None = None
     requires: tuple[str, ...] = ()
+    # Defaults ON. `deploy/firecracker/build-rootfs.sh` refused any image
+    # carrying a setuid/setgid binary, and adopting this module must not
+    # silently drop a hardening gate that already existed. It is a sandbox
+    # rootfs either way, and the live gVisor tree has none today, so the
+    # default costs nothing there either.
+    forbid_setuid: bool = True
 
     def resolved_dest(self, env: dict[str, str] | None = None) -> str:
         """`dest` with $VARS expanded from the environment.
@@ -262,7 +268,7 @@ def load_plan(root: Path | str) -> Plan:
         "source_repo",
         "build_args",
     }
-    known_rootfs_keys = {"kind", "image", "dest", "size_mib", "requires"}
+    known_rootfs_keys = {"kind", "image", "dest", "size_mib", "requires", "forbid_setuid"}
 
     seen: dict[str, ImageSpec] = {}
     images: list[ImageSpec] = []
@@ -409,6 +415,14 @@ def load_plan(root: Path | str) -> Plan:
                 dest=dest,
                 size_mib=size,
                 requires=_requires(path, i, item.get("requires")),
+                # Only when DECLARED, so the dataclass default is the one and
+                # only statement of it. Repeating the default at the call site
+                # makes the field's own default dead code that nothing can test.
+                **(
+                    {"forbid_setuid": _bool(path, i, "forbid_setuid", item["forbid_setuid"])}
+                    if "forbid_setuid" in item
+                    else {}
+                ),
             )
         )
 
@@ -426,6 +440,20 @@ def load_plan(root: Path | str) -> Plan:
         dests[key] = rf.image
 
     return Plan(engine=engine, images=tuple(images), rootfs=tuple(rootfs), root=root)
+
+
+def _bool(path: Path, index: int, key: str, value: object) -> bool:
+    """A declared flag must be a real boolean.
+
+    TOML has one, so a string here is a mistake -- and `forbid_setuid = "false"`
+    read as truthy would silently keep a gate the author meant to turn off,
+    while `= "true"` on a looser reading would silently drop one.
+    """
+    if not isinstance(value, bool):
+        raise PlanError(
+            f"{path}: [[rootfs]] #{index + 1} {key} must be true or false, got {value!r}"
+        )
+    return value
 
 
 def _requires(path: Path, index: int, value: object) -> tuple[str, ...]:
@@ -513,6 +541,24 @@ def missing_dockerfiles(plan: Plan, env: dict[str, str] | None = None) -> list[s
         if not path.is_file():
             where = spec.context if spec.context != "." else "this repo"
             out.append(f"{spec.dockerfile} (context {where})")
+    return out
+
+
+def unresolved_build_args(plan: Plan, env: dict[str, str] | None = None) -> list[str]:
+    """Build args whose value still holds an unset variable.
+
+    `_expand` deliberately leaves `$VAR` visible rather than blanking it, which
+    makes the hole legible -- but handing that literal to docker builds with a
+    placeholder, or fails deep inside the Dockerfile at a line that has nothing
+    to do with the missing variable. Reported before anything is built.
+    """
+    env = dict(os.environ) if env is None else env
+    out: list[str] = []
+    for spec in plan.images:
+        for key, raw in sorted(spec.build_args.items()):
+            shown = _expand(raw, env)
+            if "$" in shown:
+                out.append(f"{spec.name}: --build-arg {key}={shown}")
     return out
 
 

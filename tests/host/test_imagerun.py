@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from blastbox.host.images import load_plan
+from blastbox.host.images import PlanError, load_plan
 from blastbox.host.imagerun import (
     BuildError,
     build_plan,
@@ -57,9 +57,16 @@ class FakeRunner:
 
     def __call__(self, argv, *, cwd=None, capture_output=False, stdout=None):
         self.calls.append(list(argv))
-        rc = 1 if self.fail and self.fail in " ".join(argv) else 0
+        # An EXACT argv element, never a substring of the joined line. pytest's
+        # tmp_path contains the test's own name, so `fail="chmod"` inside
+        # `test_a_failed_chmod_...` matched every command's path argument and
+        # made the test pass no matter what the code did.
+        rc = 1 if self.fail and self.fail in list(argv) else 0
         out = self.stdout
         bare = self._bare(list(argv))
+        if rc == 0 and bare[:2] == ["docker", "inspect"] and "{{.Id}}" in bare:
+            # Verification resolves each tag to the id it is about to export.
+            out = "sha256:" + "e" * 64
         if rc == 0 and bare[:2] == ["mktemp", "-d"]:
             # Behaves like the real thing: the code uses the path it prints, so
             # a double that returned "" would make every later step operate on
@@ -571,7 +578,7 @@ def test_an_image_with_no_blastbox_at_all_still_passes(monkeypatch) -> None:
 
     monkeypatch.setattr(mod, "_read_stamp", lambda i, r=None: _FakeStamp())
     monkeypatch.setattr(mod, "_verify_contents", lambda i, r=None: (None, "no blastbox"))
-    verify_built(["demo:t1"], log=lambda _: None)
+    assert verify_built(["demo:t1"], run=FakeRunner(), log=lambda _: None)
 
 
 def test_a_required_path_cannot_escape_through_a_symlinked_parent(
@@ -773,3 +780,187 @@ def test_a_rejected_stamp_says_which_condition_it_failed(field, value, expect) -
     stamp = _FakeStamp()
     setattr(stamp, field, value)
     assert expect in _why_unusable(stamp)
+
+
+def test_a_setuid_binary_stops_the_rootfs_from_being_published(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """deploy/firecracker/build-rootfs.sh has always refused these, and
+    replacing that flow with this module must not silently drop the gate."""
+    dest_dir = tmp_path / "fc"
+    dest_dir.mkdir()
+    (dest_dir / "demo.ext4").write_text("live")
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    plan = _plan(tmp_path)
+
+    def extract(_image: str, dest: Path) -> None:
+        (dest / "init").write_text("x")
+        (dest / "bin").mkdir()
+        suid = dest / "bin" / "mount"
+        suid.write_text("#!/bin/sh\n")
+        suid.chmod(0o4755)
+
+    run = FakeRunner()
+    with pytest.raises(BuildError) as e:
+        export_rootfs(plan, plan.rootfs[0], "t1", run=run, log=lambda _: None, extract=extract)
+    assert "/bin/mount" in str(e.value)
+    assert (dest_dir / "demo.ext4").read_text() == "live", "the live artifact was replaced"
+    assert run.verb("mkfs.ext4") == [], "an ext4 was built from a rootfs known to be unsafe"
+
+
+def test_the_setuid_gate_can_be_turned_off_deliberately(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Turned off in the DECLARATION, where it is reviewable — not by an
+    environment variable nobody sees."""
+    dest_dir = tmp_path / "fc"
+    dest_dir.mkdir()
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    plan = _plan(tmp_path, SPEC.replace('requires = ["/init"]',
+                                        'requires = ["/init"]\nforbid_setuid = false'))
+
+    def extract(_image: str, dest: Path) -> None:
+        (dest / "init").write_text("x")
+        suid = dest / "su"
+        suid.write_text("x")
+        suid.chmod(0o4755)
+
+    run = FakeRunner()
+    export_rootfs(plan, plan.rootfs[0], "t1", run=run, log=lambda _: None, extract=extract)
+    assert run.verb("mkfs.ext4")
+
+
+def test_a_failed_chmod_stops_publication(tmp_path: Path, monkeypatch) -> None:
+    """Unchecked, a filesystem that permits rename but rejects metadata changes
+    publishes a tree still at mkdtemp's 0700 and reports success."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_root_prefix", lambda: [])
+    monkeypatch.setattr(mod, "_can_be_root", lambda: False)
+    dest_dir = tmp_path / "gv"
+    dest_dir.mkdir()
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    text = SPEC.replace('kind = "ext4"', 'kind = "dir"').replace(
+        'dest = "$DEMO_DIR/demo.ext4"', 'dest = "$DEMO_DIR/rootfs"'
+    )
+    plan = _plan(tmp_path / "dc", text)
+    run = FakeRunner(fail="chmod")
+    with pytest.raises(BuildError) as e:
+        export_rootfs(plan, plan.rootfs[0], "t1", run=run, log=lambda _: None,
+                      extract=_fake_extract({"/init": "x"}))
+    assert "chmod" in str(e.value)
+    assert not (dest_dir / "rootfs").exists(), "a tree was published after chmod failed"
+
+
+def test_two_exports_to_one_destination_do_not_share_a_staging_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A fixed `<dest>.new` means two concurrent runs truncate and format the
+    SAME file, and one can rename it live while the other is still writing."""
+    dest_dir = tmp_path / "fc"
+    dest_dir.mkdir()
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    plan = _plan(tmp_path)
+    seen = set()
+    for _ in range(2):
+        run = FakeRunner()
+        staged = mod_stage(plan, run)
+        seen.add(str(staged.ready))
+    assert len(seen) == 2, f"both exports used the same staging file: {seen}"
+
+
+def mod_stage(plan, run):
+    from blastbox.host.imagerun import stage_rootfs
+
+    return stage_rootfs(plan, plan.rootfs[0], "t1", run=run, log=lambda _: None,
+                        extract=_fake_extract({"/init": "x"}))
+
+
+def test_the_rootfs_is_extracted_from_the_id_that_was_verified(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A tag is mutable. Re-resolving it at export time can hand us an image
+    nothing checked — verify A, publish B."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
+    monkeypatch.setattr(mod, "_read_stamp", lambda i, r=None: _FakeStamp())
+    monkeypatch.setattr(mod, "_verify_contents", lambda i, r=None: (True, ""))
+    monkeypatch.setenv("DEMO_DIR", str(tmp_path / "out"))
+    extracted: list[str] = []
+    run_plan(
+        _plan(tmp_path), "t1", blastbox_version="0.1.34", run=FakeRunner(),
+        log=lambda _: None,
+        extract=lambda image, dest: (
+            extracted.append(image), (dest / "init").write_text("x")
+        )[0],
+    )
+    assert extracted == ["sha256:" + "e" * 64], extracted
+
+
+def test_an_unresolved_build_arg_is_refused_before_docker_runs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`_expand` leaves `$VAR` visible so the hole is legible; handing that
+    literal to docker builds with a placeholder, or fails deep inside the
+    Dockerfile at a line unrelated to the missing variable."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
+    monkeypatch.delenv("MISSING_THING", raising=False)
+    text = SPEC.replace(
+        'base = "upstream:1"',
+        'base = "upstream:1"\nbuild_args = { BLASTBOX_VERSION = "$MISSING_THING" }',
+        1,
+    )
+    run = FakeRunner()
+    with pytest.raises(BuildError) as e:
+        build_plan(_plan(tmp_path, text), "t1", blastbox_version="0.1.34", run=run,
+                   log=lambda _: None)
+    assert "MISSING_THING" in str(e.value)
+    assert run.calls == [], "docker ran with an unresolved build arg"
+
+
+def test_a_source_tree_that_changes_during_the_build_is_caught(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The label records the revision read BEFORE the build; docker reads the
+    context during it. A concurrent deploy or an editor save in between produces
+    an image whose contents are not the commit it names — and it passes every
+    stamp check, because the stamp is self-consistent."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
+    states = iter(["abc123:0000", "def456:0000"])  # HEAD moved under the build
+    monkeypatch.setattr(mod, "_source_state", lambda _repo: next(states))
+    with pytest.raises(BuildError) as e:
+        build_plan(_plan(tmp_path), "t1", blastbox_version="0.1.34", run=FakeRunner(),
+                   log=lambda _: None)
+    assert "changed while it was being built" in str(e.value)
+
+
+def test_a_stable_source_tree_builds(tmp_path: Path, monkeypatch) -> None:
+    """The companion: a tree that does not move must not be reported as moving,
+    or the check is just a way to fail every build."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
+    monkeypatch.setattr(mod, "_source_state", lambda _repo: "abc123:0000")
+    assert build_plan(_plan(tmp_path), "t1", blastbox_version="0.1.34", run=FakeRunner(),
+                      log=lambda _: None)
+
+
+def test_the_setuid_default_is_on_when_the_spec_says_nothing(tmp_path: Path) -> None:
+    """Stated once, in the dataclass. Repeating it at the parse site made the
+    field's own default dead code that no mutation could reach."""
+    plan = _plan(tmp_path)
+    assert plan.rootfs[0].forbid_setuid is True
+
+
+def test_a_non_boolean_setuid_flag_is_refused(tmp_path: Path) -> None:
+    """`forbid_setuid = "false"` is a string, and a truthy one — it would keep
+    a gate the author meant to turn off."""
+    with pytest.raises(PlanError) as e:
+        _plan(tmp_path, SPEC.replace('requires = ["/init"]',
+                                     'requires = ["/init"]\nforbid_setuid = "false"'))
+    assert "must be true or false" in str(e.value)
