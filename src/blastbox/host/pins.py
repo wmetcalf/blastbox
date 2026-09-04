@@ -902,9 +902,87 @@ def missing_from_locks(
             if not _pip_enforces(req, enforced, scope):
                 gap += " [not an install failure: the image would import it]"
             gaps.append(gap)
+        # The TRANSITIVE closure, not just blastbox's own requirements. pip
+        # resolves what the pinned packages themselves need, and refuses the
+        # file when any of it is unpinned: removing `pydantic-core` from a lock
+        # that pins `pydantic` fails the install even though blastbox never
+        # names it. Measured -- four such packages in a seven-package fixture.
+        #
+        # Only with a resolver: without one there is no metadata to walk, and
+        # reporting everything as unverifiable would be noise.
+        if requirements_of is not None:
+            deep = _transitive_gaps(parsed, extras, pins, scope, requirements_of)
+            gaps.extend(g for g in deep if g not in gaps)
         if gaps:
             out[str(path)] = gaps
     return out
+
+
+def _transitive_gaps(
+    parsed: Sequence[Any],
+    extras: set[str],
+    pins: dict[str, list[_Pin]],
+    scope: dict[str, str],
+    requirements_of: Callable[[str, str], list[str] | None],
+) -> list[str]:
+    """Everything the pinned packages themselves need and the lock lacks.
+
+    pip resolves the whole graph, not just the top level, and refuses the file
+    when any part of it is unpinned: removing `pydantic-core` from a lock that
+    pins `pydantic` fails the install although blastbox never names it. Four of
+    the seven packages in the differential fixture are of that kind, and the
+    checker was silent about all four until this walk existed.
+
+    Breadth-first from the requirements that apply, through the versions this
+    lock actually pins, carrying each requirement's own extras.
+
+    Silent when metadata cannot be fetched: one unreachable index is an unknown
+    edge, not evidence of a gap, and refusing a bump over it would be worse
+    than the drift it guards against.
+    """
+    gaps: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    queue: list[tuple[Any, set[str]]] = [
+        (req, extras)
+        for req in parsed
+        if req is not None and _applies(req, extras, scope)
+    ]
+    while queue:
+        req, _active = queue.pop()
+        name = _dist_name(req.name)
+        usable = [
+            pin
+            for pin in pins.get(name, [])
+            if pin.hashed
+            and _marker_holds(pin.marker, scope)
+            and (not req.specifier or _satisfies(req, pin.version))
+        ]
+        if not usable:
+            continue  # the direct pass already reported it, or it does not apply
+        key = (name, usable[0].version)
+        if key in seen:
+            continue
+        seen.add(key)
+        nested = requirements_of(name, usable[0].version)
+        if nested is None:
+            continue
+        wanted = {e.lower() for e in (req.extras or set())}
+        for sub in (_requirement(r) for r in nested):
+            if sub is None or not _applies(sub, wanted, scope):
+                continue
+            sub_name = _dist_name(sub.name)
+            fits = [
+                pin
+                for pin in pins.get(sub_name, [])
+                if pin.hashed
+                and _marker_holds(pin.marker, scope)
+                and (not sub.specifier or _satisfies(sub, pin.version))
+            ]
+            if not fits:
+                gaps.append(f"{sub_name} (needed by {name})")
+                continue
+            queue.append((sub, wanted))
+    return sorted(set(gaps))
 
 
 def _pip_enforces(req, enforced: set[str], scope: dict[str, str]) -> bool:
@@ -938,99 +1016,7 @@ def _gap(
     if not matching:
         shown = ", ".join(sorted({p.version for p in usable}))
         return f"{name} (pinned {shown}, needs {req.specifier})"
-    # A dependency can gain an EXTRA of its own: `uvicorn` becoming
-    # `uvicorn[standard]` enables packages pip must also resolve and hash, so a
-    # version match alone is not enough and an older lock passes here and fails
-    # the install.
-    wanted = {e.lower() for e in (req.extras or set())}
-    # blastbox's OWN extras are already expanded into the lock's extra set and
-    # their requirements checked directly from the release metadata we have in
-    # hand, so asking for them again here is noise rather than a second look.
-    if not wanted or name == "blastbox":
-        return ""
-    if requirements_of is None:
-        # Cannot be checked without that package's own metadata. Saying so is
-        # the point: silence would report a closure verified that nobody looked
-        # at, which is the failure mode this whole check exists for.
-        return f"{name}[{','.join(sorted(wanted))}] (its extras could not be verified)"
-    unmet: set[str] = set()
-    for pin in matching:
-        missing = _extra_closure_gaps(
-            name, pin.version, wanted, pins, scope, requirements_of, set()
-        )
-        if missing is None:
-            return (
-                f"{name}[{','.join(sorted(wanted))}] (its extras could not be verified)"
-            )
-        if not missing:
-            return ""  # one applicable pin satisfies it, which is enough
-        unmet = missing
-    return f"{name}[{','.join(sorted(wanted))}] needs {', '.join(sorted(unmet))}"
-
-
-def _extra_closure_gaps(
-    name: str,
-    version: str,
-    wanted: set[str],
-    pins: dict[str, list[_Pin]],
-    scope: dict[str, str],
-    requirements_of: Callable[[str, str], list[str] | None],
-    seen: set[tuple[str, str]],
-) -> set[str] | None:
-    """What ``name[wanted]`` needs and this lock lacks, or None if unknowable.
-
-    RECURSIVE, because an extra can enable another package's extra:
-    `parent[feature]` requiring `child[nested]` means pip enables `nested` too
-    and demands hashes for everything it brings in. Stopping at the child's own
-    pin accepts a lock that carries `child` for some other reason and none of
-    what `nested` adds.
-
-    ``seen`` guards the cycle that follows from packages depending on each
-    other's extras.
-    """
-    key = (name, version)
-    if key in seen:
-        return set()  # already accounted for; not a gap of its own
-    seen.add(key)
-    nested = requirements_of(name, version)
-    if nested is None:
-        return None
-    gaps: set[str] = set()
-    for sub in (_requirement(r) for r in nested):
-        if sub is None or not _applies(sub, wanted, scope):
-            continue
-        sub_name = _dist_name(sub.name)
-        usable = [
-            pin
-            for pin in pins.get(sub_name, [])
-            if pin.hashed
-            and _marker_holds(pin.marker, scope)
-            and (not sub.specifier or _satisfies(sub, pin.version))
-        ]
-        if not usable:
-            gaps.add(sub_name)
-            continue
-        sub_extras = {e.lower() for e in (sub.extras or set())}
-        if not sub_extras:
-            continue
-        deeper = _extra_closure_gaps(
-            sub_name, usable[0].version, sub_extras, pins, scope, requirements_of, seen
-        )
-        if deeper is None:
-            return None
-        gaps |= deeper
-    return gaps
-
-
-def _gap_name_present(req, pins: dict[str, list[_Pin]], scope: dict[str, str]) -> bool:
-    """Whether ``req`` has an applicable, hashed, satisfying pin."""
-    name = _dist_name(req.name)
-    return any(
-        pin.hashed
-        and _marker_holds(pin.marker, scope)
-        and (not req.specifier or _satisfies(req, pin.version))
-        for pin in pins.get(name, [])
-    )
+    return ""
 
 
 def _install_roots(root: Path) -> list[Path]:

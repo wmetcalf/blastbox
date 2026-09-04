@@ -2273,7 +2273,7 @@ def test_a_dependency_that_gains_an_extra_needs_that_closure_too(tmp_path):
     gaps = missing_from_locks(
         tmp_path, reqs, requirements_of=lambda n, v: closure.get((n, v))
     )
-    assert list(gaps.values()) == [["uvicorn[standard] needs watchfiles"]], gaps
+    assert list(gaps.values()) == [["watchfiles (needed by uvicorn)"]], gaps
 
     # With the closure present it is satisfied -- so the check is not simply
     # refusing every extras-bearing dependency.
@@ -2293,8 +2293,13 @@ def test_a_dependency_that_gains_an_extra_needs_that_closure_too(tmp_path):
     )
 
 
-def test_an_unverifiable_extra_is_reported_rather_than_assumed(tmp_path):
-    """Silence would report a closure verified that nobody looked at."""
+def test_without_metadata_the_closure_is_not_claimed_either_way(tmp_path):
+    """A resolver that cannot answer means one unknown edge, not a gap.
+
+    Refusing a bump because an index was unreachable is worse than the drift it
+    guards against, and claiming the closure verified would be a lie. The
+    direct requirements are still checked.
+    """
     from blastbox.host.pins import missing_from_locks
 
     reqs = ["pydantic>=2.6.0", "uvicorn[standard]>=0.27"]
@@ -2305,10 +2310,11 @@ def test_an_unverifiable_extra_is_reported_rather_than_assumed(tmp_path):
         + _entry("pydantic==2.13.5")
         + _entry("uvicorn==0.30.0"),
     )
-    gaps = missing_from_locks(tmp_path, reqs, requirements_of=lambda n, v: None)
-    assert list(gaps.values()) == [
-        ["uvicorn[standard] (its extras could not be verified)"]
-    ], gaps
+    assert missing_from_locks(tmp_path, reqs, requirements_of=lambda n, v: None) == {}
+
+    # ... and a DIRECT requirement is still reported without any resolver.
+    gaps = missing_from_locks(tmp_path, [*reqs, "packaging>=23.0"])
+    assert list(gaps.values()) == [["packaging"]], gaps
 
 
 def test_the_space_form_of_hash_counts_as_hashed(tmp_path):
@@ -2384,24 +2390,6 @@ def test_the_scanner_refuses_a_lock_it_cannot_read(tmp_path):
             scan(tmp_path)
     finally:
         mod._LOCK_READ_LIMIT = limit
-
-
-def test_without_a_resolver_an_extra_is_reported_unverified(tmp_path):
-    """The library default cannot reach PyPI, and must not pretend otherwise."""
-    from blastbox.host.pins import missing_from_locks
-
-    _write(
-        tmp_path,
-        "req.lock",
-        _entry("blastbox==0.1.39")
-        + _entry("pydantic==2.13.5")
-        + _entry("uvicorn==0.30.0"),
-    )
-    # No `requirements_of` at all -- the parameter is omitted, not stubbed.
-    gaps = missing_from_locks(tmp_path, ["pydantic>=2.6.0", "uvicorn[standard]>=0.27"])
-    assert list(gaps.values()) == [
-        ["uvicorn[standard] (its extras could not be verified)"]
-    ], gaps
 
 
 def test_the_repository_declares_which_blastbox_extras_it_installs(tmp_path):
@@ -2580,7 +2568,7 @@ def test_a_nested_extra_is_traversed(tmp_path):
     gaps = missing_from_locks(
         tmp_path, reqs, requirements_of=lambda n, v: meta.get((n, v))
     )
-    assert list(gaps.values()) == [["parent[feature] needs grandchild"]], gaps
+    assert list(gaps.values()) == [["grandchild (needed by child)"]], gaps
 
     # With the grandchild pinned it is satisfied.
     _write(
