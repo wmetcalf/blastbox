@@ -871,6 +871,12 @@ def missing_from_locks(
     out: dict[str, list[str]] = {}
     parsed = [_requirement(r) for r in requires]
     sets = _install_sets(root)
+    # How many distinct sets of FILES there are, not how many commands install
+    # them. The same lock installed twice under different `-c` files is two
+    # resolutions but one lock, and a declaration like `blastbox[host]` has
+    # only that one lock to apply to -- counting commands disabled the
+    # inference for both, and a missing host dependency went unreported.
+    n_distinct = len({iset.members for iset in sets})
     for iset in sets:
         members = iset.members
         pins, env = _merged_pins(members, root)
@@ -883,7 +889,7 @@ def missing_from_locks(
         found: dict[str, list[str]] = {}
         for label, scope in scopes:
             for gap in _judge_scope(
-                iset, root, len(sets), pins, scope, parsed, requirements_of
+                iset, root, n_distinct, pins, scope, parsed, requirements_of
             ):
                 found.setdefault(gap, []).append(label)
         gaps = [
@@ -1181,25 +1187,35 @@ def _scopes_for(
     return [(label, {**values, **base}) for label, values in _UNIVERSAL_BRANCHES]
 
 
-def _pin_identity(pin: _Pin) -> tuple[Any, str]:
-    """``(identity, as written)`` -- what makes two pins the SAME pin to pip.
-
-    PEP 440 versions compare canonically: `1.0` and `1.0.0` are one pin, and
-    reporting them as a contradiction refuses a lock pip resolves. The
-    comparison key is the `Version` itself, not its string -- `str(Version(
-    "26.3.0"))` keeps the trailing zero, so comparing spellings would change
-    nothing. Under `===` the comparison IS textual, so there the spelling is
-    the identity.
-    """
-    from packaging.version import InvalidVersion, Version  # noqa: PLC0415
+def _pin_specifier(pin: _Pin) -> Any:
+    """The specifier a lock entry states, as pip reads it."""
+    from packaging.specifiers import InvalidSpecifier, SpecifierSet  # noqa: PLC0415
 
     raw = pin.version.lstrip("=").strip()
-    if pin.arbitrary:
-        return ("===", raw), raw
     try:
-        return Version(raw), raw
-    except InvalidVersion:
-        return ("==", raw), raw  # not a version we can normalise; compare as written
+        return SpecifierSet(("===" if pin.arbitrary else "==") + raw)
+    except InvalidSpecifier:
+        return None
+
+
+def _jointly_satisfiable(first: _Pin, second: _Pin) -> bool:
+    """Whether one version can satisfy BOTH entries.
+
+    Not equality of parsed versions: `==1.0` matches the candidate `1.0+vendor`
+    because PEP 440 ignores a local segment the specifier does not state, and
+    pip resolves that pair to `1.0+vendor`. Equality of `Version` objects calls
+    it a contradiction and blocks a valid bump. Asking each specifier about the
+    other's version answers the question pip actually asks.
+
+    `===` is arbitrary equality and compares the string, so it answers for
+    itself here without a special case.
+    """
+    left, right = _pin_specifier(first), _pin_specifier(second)
+    if left is None or right is None:
+        return True  # unreadable is not evidence of a contradiction
+    a = first.version.lstrip("=").strip()
+    b = second.version.lstrip("=").strip()
+    return left.contains(b, prereleases=True) or right.contains(a, prereleases=True)
 
 
 def _judge_scope(
@@ -1221,14 +1237,20 @@ def _judge_scope(
         # Compared as VERSIONS: `1.0` and `1.0.0` are the same pin to pip, and
         # calling them a contradiction rejects a valid lock. `===` keeps its
         # own semantics, since it compares the string.
-        versions: dict[Any, str] = {}
-        for pin in entries:
-            if not _marker_holds(pin.marker, scope):
-                continue
-            identity, written = _pin_identity(pin)
-            versions.setdefault(identity, written)
-        if len(versions) > 1:
-            spelled = ", ".join(sorted(versions.values()))
+        applicable = [pin for pin in entries if _marker_holds(pin.marker, scope)]
+        clash = next(
+            (
+                (one, other)
+                for index, one in enumerate(applicable)
+                for other in applicable[index + 1 :]
+                if not _jointly_satisfiable(one, other)
+            ),
+            None,
+        )
+        if clash is not None:
+            spelled = ", ".join(
+                sorted(pin.version.lstrip("=").strip() for pin in clash)
+            )
             gaps.append(
                 f"{name} is pinned to more than one version in this install "
                 f"set ({spelled}); pip cannot satisfy both"
@@ -1503,6 +1525,24 @@ _NIX = {
 _UNIVERSAL_BRANCHES = (("linux", _NIX), ("windows", _WIN), ("macos", _MAC))
 
 
+def _target_version(request: str) -> str | None:
+    """A uv `--python-version` request as a marker value, or None.
+
+    Padded to three release components, because that is what
+    `python_full_version` holds -- and any pre/post/dev/local suffix is kept,
+    since a marker may compare against exactly that.
+    """
+    from packaging.version import InvalidVersion, Version  # noqa: PLC0415
+
+    try:
+        parsed = Version(request)
+    except InvalidVersion:
+        return None
+    release = list(parsed.release) + [0] * (3 - len(parsed.release))
+    suffix = str(parsed)[len(".".join(str(part) for part in parsed.release)) :]
+    return ".".join(str(part) for part in release[:3]) + suffix
+
+
 def _generated_command(text: str) -> str:
     """The compile command a lock records in its LEADING comment block.
 
@@ -1555,11 +1595,16 @@ def _lock_environment(text: str) -> dict[str, str]:
         # Windows install fails: a newly required `winonly; sys_platform ==
         # "win32"` is simply skipped on Linux.
         out["__universal__"] = "1"
-    match = re.search(r"--python-version[=\s]+(\d+(?:\.\d+)+)", text)
+    # The WHOLE version request, suffix and all: uv accepts `3.13rc1` and
+    # records it here, and truncating it to `3.13` skipped a dependency guarded
+    # by `python_full_version < "3.13.0rc2"` -- which applies to that target.
+    match = re.search(r"--python-version[=\s]+([0-9][^\s\"']*)", text)
     if match:
-        version = match.group(1)
-        full = version if version.count(".") >= 2 else f"{version}.0"
-        out["python_version"] = ".".join(version.split(".")[:2])
+        full = _target_version(match.group(1))
+        if full is None:
+            full = ""
+    if match and full:
+        out["python_version"] = ".".join(full.split(".")[:2])
         out["python_full_version"] = full
         # uv resolves FOR this interpreter, so a marker that asks the
         # implementation's version is asking about the target too. Leaving it
