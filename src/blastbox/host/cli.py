@@ -1168,6 +1168,21 @@ def _build_images_cmd(args: argparse.Namespace) -> int:
             print(f"  {p_}")
         return 2
 
+    # A size that does not resolve is refused HERE, in both paths. Rendering it
+    # as `[UNRESOLVED SIZE: ...]` and still exiting 0 would report a checked
+    # plan for something that cannot run.
+    bad_sizes: list[str] = []
+    for rf in plan.rootfs:
+        try:
+            rf.resolved_size_mib()
+        except PlanError as exc:
+            bad_sizes.append(str(exc))
+    if bad_sizes:
+        print(f"{len(bad_sizes)} rootfs size(s) do not resolve:")
+        for b in bad_sizes:
+            print(f"  {b}")
+        return 2
+
     unresolved = unresolved_destinations(plan)
     if unresolved:
         print(f"{len(unresolved)} export destination(s) contain an unset variable:")
