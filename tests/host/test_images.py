@@ -841,3 +841,16 @@ def test_nested_braced_defaults_are_parsed_by_balance(
     from blastbox.host.images import _expand
 
     assert _expand(text, env) == want
+
+
+def test_the_dry_run_shows_the_resolved_rootfs_size(tmp_path: Path) -> None:
+    """A dry run printing `${ROOTFS_MIB:-3072} MiB` has not said how big the
+    filesystem will be, which is the one question it exists to answer — the
+    same standard destinations and build args are already held to."""
+    from blastbox.host.images import describe
+
+    text = TITANARUM.replace("size_mib = 3072", 'size_mib = "${ROOTFS_MIB:-3072}"')
+    plan = load_plan(_plan(tmp_path, text))
+    assert " 3072 MiB" in describe(plan, "t1", {})
+    assert " 4096 MiB" in describe(plan, "t1", {"ROOTFS_MIB": "4096"})
+    assert "ROOTFS_MIB" not in describe(plan, "t1", {})

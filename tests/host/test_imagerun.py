@@ -67,6 +67,17 @@ class FakeRunner:
         if rc == 0 and bare[:2] == ["docker", "inspect"] and "{{.Id}}" in bare:
             # Verification resolves each tag to the id it is about to export.
             out = "sha256:" + "e" * 64
+        if rc == 0 and bare[:3] == ["stat", "-c", "%s"]:
+            # Really stats: a double that invented a size would make the shrink
+            # guard assert on fiction. Absent files exit non-zero, as stat does.
+            try:
+                out = str(Path(bare[3]).stat().st_size)
+            except OSError:
+                return subprocess.CompletedProcess(list(argv), 1, stdout="", stderr="no such file")
+        if rc == 0 and bare[:2] == ["test", "-e"]:
+            return subprocess.CompletedProcess(
+                list(argv), 0 if Path(bare[2]).exists() else 1, stdout="", stderr=""
+            )
         if rc == 0 and bare[:1] == ["find"] and "/6000" in bare:
             # Really runs it: a double that returned "" would make every setuid
             # test pass by reporting a clean tree it never looked at.
@@ -1145,3 +1156,170 @@ def test_the_staging_root_is_made_traversable_before_it_is_checked(
         f"the tree was checked before it was made traversable: {order}"
     )
 
+
+
+def test_the_size_may_come_from_the_environment(tmp_path: Path, monkeypatch) -> None:
+    """The exporter this replaces honoured a ROOTFS_MIB override. A spec that
+    could only hold a literal would take that away."""
+    dest_dir = tmp_path / "fc"
+    dest_dir.mkdir()
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    monkeypatch.setenv("ROOTFS_MIB", "128")
+    plan = _plan(tmp_path, SPEC.replace("size_mib = 64", 'size_mib = "${ROOTFS_MIB:-64}"'))
+    run = FakeRunner()
+    export_rootfs(plan, plan.rootfs[0], "t1", run=run, log=lambda _: None,
+                  extract=_fake_extract({"/init": "x"}))
+    truncate = run.verb("truncate")
+    assert truncate and "128M" in truncate[0], truncate
+
+
+def test_a_rootfs_is_not_silently_shrunk(tmp_path: Path, monkeypatch) -> None:
+    """Shrinking either fails inside mkfs.ext4 once the extracted tree no longer
+    fits, or fills up in the guest and surfaces as whatever the workload was
+    doing at the time. Neither points at the size."""
+    dest_dir = tmp_path / "fc"
+    dest_dir.mkdir()
+    live = dest_dir / "demo.ext4"
+    live.write_bytes(b"\0" * (200 * 1024 * 1024))  # 200 MiB already in place
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    plan = _plan(tmp_path)  # declares 64 MiB
+    with pytest.raises(BuildError) as e:
+        export_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                      extract=_fake_extract({"/init": "x"}))
+    assert "Refusing to shrink" in str(e.value)
+    assert live.stat().st_size == 200 * 1024 * 1024, "the live artifact was touched"
+
+
+def test_growing_a_rootfs_is_allowed(tmp_path: Path, monkeypatch) -> None:
+    """The guard is against SHRINKING; growing is the ordinary case when an
+    engine's payload gets bigger."""
+    dest_dir = tmp_path / "fc"
+    dest_dir.mkdir()
+    (dest_dir / "demo.ext4").write_bytes(b"\0" * (32 * 1024 * 1024))
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    plan = _plan(tmp_path)  # declares 64 MiB
+    run = FakeRunner()
+    export_rootfs(plan, plan.rootfs[0], "t1", run=run, log=lambda _: None,
+                  extract=_fake_extract({"/init": "x"}))
+    assert run.verb("mkfs.ext4")
+
+
+def test_a_size_that_cannot_resolve_fails_before_anything_is_built(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`resolved_size_mib` raises PlanError, which is NOT a BuildError — left to
+    surface from the export it escaped the CLI's handler and ended the command
+    in a traceback, after every image had been built and verified."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
+    monkeypatch.delenv("ROOTFS_MIB", raising=False)
+    monkeypatch.setenv("DEMO_DIR", str(tmp_path / "out"))
+    plan = _plan(tmp_path, SPEC.replace("size_mib = 64", 'size_mib = "$ROOTFS_MIB"'))
+    run = FakeRunner()
+    with pytest.raises(BuildError) as e:
+        run_plan(plan, "t1", blastbox_version="0.1.35", run=run, log=lambda _: None,
+                 extract=_fake_extract({"/init": "x"}))
+    assert "cannot be built as declared" in str(e.value)
+    assert run.calls == [], "docker ran before the size was known"
+
+
+def test_a_shrink_is_refused_again_at_publication(tmp_path: Path, monkeypatch) -> None:
+    """Staging and publication are separated in time, and this module supports
+    concurrent exports to one destination — so a larger run can publish in
+    between, and a check made only against the old artifact would let this one
+    shrink it back."""
+    import blastbox.host.imagerun as mod
+
+    dest_dir = tmp_path / "fc"
+    dest_dir.mkdir()
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    plan = _plan(tmp_path)  # 64 MiB
+    run = FakeRunner()
+    staged = mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=run, log=lambda _: None,
+                              extract=_fake_extract({"/init": "x"}))
+    # another run publishes something larger while ours sits staged
+    (dest_dir / "demo.ext4").write_bytes(b"\0" * (200 * 1024 * 1024))
+    with pytest.raises(BuildError) as e:
+        mod.publish_staged(staged, run=run, log=lambda _: None)
+    assert "Refusing to shrink" in str(e.value)
+    assert (dest_dir / "demo.ext4").stat().st_size == 200 * 1024 * 1024
+
+
+def test_a_destination_that_cannot_be_measured_fails_closed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An unprivileged `Path.stat()` on a root-only directory raises EACCES.
+    Reading that as "absent" lets a smaller image replace a larger one, which is
+    exactly what the guard exists to prevent."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_root_prefix", lambda: ["sudo"])
+    monkeypatch.setattr(mod, "_can_be_root", lambda: True)
+    dest_dir = tmp_path / "fc"
+    dest_dir.mkdir()
+    (dest_dir / "demo.ext4").write_bytes(b"\0" * 1024)
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    plan = _plan(tmp_path)
+
+    class UnreadableStat(FakeRunner):
+        def __call__(self, argv, **kw):
+            bare = self._bare(list(argv))
+            if bare[:3] == ["stat", "-c", "%s"]:
+                self.calls.append(list(argv))
+                return subprocess.CompletedProcess(list(argv), 1, stdout="", stderr="EACCES")
+            if bare[:2] == ["test", "-e"]:
+                self.calls.append(list(argv))
+                return subprocess.CompletedProcess(list(argv), 0, stdout="", stderr="")
+            return super().__call__(argv, **kw)
+
+    with pytest.raises(BuildError) as e:
+        export_rootfs(plan, plan.rootfs[0], "t1", run=UnreadableStat(), log=lambda _: None,
+                      extract=_fake_extract({"/init": "x"}))
+    assert "could not be measured" in str(e.value)
+
+
+def test_the_shrink_check_compares_bytes_not_floored_mib(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An image of 64 MiB plus one filesystem block floors to 64, so a 64 MiB
+    replacement passed the guard and `truncate` removed that block from a
+    filesystem somebody had deliberately extended."""
+    dest_dir = tmp_path / "fc"
+    dest_dir.mkdir()
+    live = dest_dir / "demo.ext4"
+    live.write_bytes(b"\0" * (64 * 1024 * 1024 + 4096))  # 64 MiB + one block
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    plan = _plan(tmp_path)  # declares exactly 64 MiB
+    with pytest.raises(BuildError) as e:
+        export_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                      extract=_fake_extract({"/init": "x"}))
+    assert "Refusing to shrink" in str(e.value)
+    assert live.stat().st_size == 64 * 1024 * 1024 + 4096
+
+
+def test_the_destination_is_measured_at_the_selected_privilege(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The measurement has to run as whatever can actually see the file.
+
+    Without the prefix an unprivileged `stat` on a root-only destination fails,
+    and the guard then decides on a size it never read. The fake runner stats
+    the real file whatever prefix it is given, so only asserting on the argv
+    catches this — dropping `priv` from the call otherwise breaks nothing.
+    """
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_root_prefix", lambda: ["sudo"])
+    monkeypatch.setattr(mod, "_can_be_root", lambda: True)
+    dest_dir = tmp_path / "fc"
+    dest_dir.mkdir()
+    (dest_dir / "demo.ext4").write_bytes(b"\0" * 1024)
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    plan = _plan(tmp_path)
+    run = FakeRunner()
+    export_rootfs(plan, plan.rootfs[0], "t1", run=run, log=lambda _: None,
+                  extract=_fake_extract({"/init": "x"}))
+    stats = [c for c in run.calls if "stat" in c and "%s" in c]
+    assert stats, run.calls
+    assert all(c[0] == "sudo" for c in stats), f"measured unprivileged: {stats}"

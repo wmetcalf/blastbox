@@ -196,6 +196,7 @@ def build_plan(
         _images.missing_dockerfiles(plan, env)
         + _images.arg_problems(plan, env)
         + _images.unresolved_build_args(plan, env)
+        + _size_problems(plan, env)
     )
     if problems:
         raise BuildError(
@@ -371,6 +372,23 @@ def _stage_dir(parent: Path, priv: list[str], run: Runner) -> Path:
     return Path(name)
 
 
+def _size_problems(plan: Plan, env: dict[str, str]) -> list[str]:
+    """Declared sizes that do not resolve to a positive whole number.
+
+    Checked in the PREFLIGHT. `resolved_size_mib` raises PlanError, which is not
+    a BuildError -- so left to surface from the export it escaped the CLI's
+    handler and ended the command in a traceback, after every image had been
+    built and verified.
+    """
+    out: list[str] = []
+    for rf in plan.rootfs:
+        try:
+            rf.resolved_size_mib(env)
+        except _images.PlanError as exc:
+            out.append(str(exc))
+    return out
+
+
 def _source_state(repo: Path) -> str:
     """A cheap fingerprint of a source tree: its HEAD plus its dirty status.
 
@@ -472,6 +490,36 @@ def _extract_image(image: str, dest: Path, run: Runner, log: Log, *, as_root: bo
     finally:
         run(["docker", "rm", "-f", cid], capture_output=True)
     log(f"   extracted {image}")
+
+
+def _refuse_shrink(dest: Path, size_mib: int, priv: list[str], run: Runner) -> None:
+    """Refuse to replace an artifact with a smaller one.
+
+    Not silently obeyed: the exporter this replaces matched the artifact already
+    in place, so a smaller declaration is either a mistake or a deliberate
+    shrink -- and the deliberate one is rare enough to be worth confirming.
+    Shrinking either fails inside mkfs.ext4 once the extracted tree no longer
+    fits, or fills up in the guest and surfaces as whatever the workload was
+    doing at the time. Neither points at the size.
+
+    Fails CLOSED when the size cannot be read. "I could not look" is not
+    "there is nothing there", and reading it as the latter is what lets a
+    smaller image through.
+    """
+    existing = _existing_bytes(dest, priv, run)
+    if existing is None:
+        raise BuildError(
+            f"could not read the size of {dest}; refusing to replace an artifact "
+            "that could not be measured"
+        )
+    want = size_mib * 1024 * 1024
+    if existing and want < existing:
+        raise BuildError(
+            f"{dest} is {existing} bytes and the plan asks for {want} "
+            f"({size_mib} MiB). Refusing to shrink a rootfs that is already in "
+            "place; set the size explicitly (ROOTFS_MIB, or size_mib in the "
+            "plan) if that is intended."
+        )
 
 
 def _normalize_root(tree: Path, priv: list[str], run: Runner) -> None:
@@ -677,6 +725,7 @@ class _Staged:
     priv: list[str]
     staging: Path
     ready: Path  # what gets renamed onto `dest`: the tree, or the .new image
+    size_mib: int = 0  # ext4 only; 0 for a directory tree
 
 
 def stage_rootfs(
@@ -733,10 +782,13 @@ def stage_rootfs(
         _check_requires(staging, spec, image)
         _check_no_setuid(staging, spec, image, priv, run)
 
+        staged_size = 0
         if spec.kind == "dir":
             ready = staging
         else:
-            size = spec.size_mib or _existing_mib(dest) or 1536
+            size = spec.resolved_size_mib(env) or _existing_mib(dest, priv, run) or 1536
+            _refuse_shrink(dest, size, priv, run)
+            staged_size = size
             # Unique per run, not a fixed `<dest>.new`. Two concurrent exports
             # to one destination would otherwise truncate and format the SAME
             # file, and one can rename it live while the other is still writing
@@ -754,7 +806,10 @@ def stage_rootfs(
     except BaseException:
         _remove_tree(staging, priv, run)
         raise
-    return _Staged(spec=spec, image=image, dest=dest, priv=priv, staging=staging, ready=ready)
+    return _Staged(
+        spec=spec, image=image, dest=dest, priv=priv, staging=staging, ready=ready,
+        size_mib=staged_size,
+    )
 
 
 def publish_staged(staged: _Staged, *, run: Runner | None = None, log: Log = _log) -> Path:
@@ -775,6 +830,12 @@ def publish_staged(staged: _Staged, *, run: Runner | None = None, log: Log = _lo
             _must([*priv, "mv", str(dest), f"{dest}.bak"], "keep .bak", run)
         _must([*priv, "mv", str(staged.ready), str(dest)], "publish rootfs", run)
     else:
+        # RE-CHECKED here, not only at staging. The two are separated in time and
+        # this module deliberately supports concurrent exports to one
+        # destination, so a larger run can publish in between -- and the check
+        # made against the old smaller artifact would then let this one shrink
+        # it back.
+        _refuse_shrink(dest, staged.size_mib, priv, run)
         if dest.exists():
             _must([*priv, "mv", str(dest), f"{dest}.bak"], "keep .bak", run)
         _must([*priv, "mv", str(staged.ready), str(dest)], "publish rootfs", run)
@@ -798,16 +859,40 @@ def export_rootfs(
     return publish_staged(staged, run=run, log=log)
 
 
-def _existing_mib(path: Path) -> int:
-    """Match the size of the artifact being replaced when the plan omits one.
+def _existing_bytes(path: Path, priv: list[str], run: Runner) -> int | None:
+    """Size of the artifact already in place, in BYTES. None = cannot tell.
 
-    A rootfs that silently shrinks fills up in the guest, and the failure shows
-    as whatever the workload was doing at the time rather than as a size.
+    Measured through the privileged runner when the destination needs it: an
+    unprivileged `Path.stat()` on a root-only directory raises EACCES, and
+    reading that as "absent" would let a smaller image replace a larger one --
+    the exact thing the shrink guard exists to prevent.
+
+    BYTES, not MiB: flooring the existing size makes an image of 64 MiB plus one
+    block read as 64, so a 64 MiB replacement passes the guard and `truncate`
+    removes that block from a filesystem somebody deliberately extended.
     """
+    if not priv:
+        try:
+            return path.stat().st_size
+        except FileNotFoundError:
+            return 0
+        except OSError:
+            return None
+    proc = run([*priv, "stat", "-c", "%s", str(path)], capture_output=True)
+    if proc.returncode != 0:
+        # Distinguish "not there" from "cannot look". Only the former is a zero.
+        missing = run([*priv, "test", "-e", str(path)], capture_output=True)
+        return 0 if missing.returncode != 0 else None
     try:
-        return path.stat().st_size // 1024 // 1024
-    except OSError:
-        return 0
+        return int((proc.stdout or "").strip())
+    except ValueError:
+        return None
+
+
+def _existing_mib(path: Path, priv: list[str], run: Runner) -> int:
+    """The existing size in whole MiB, for defaulting. 0 when absent/unknown."""
+    b = _existing_bytes(path, priv, run)
+    return (b // 1024 // 1024) if b else 0
 
 
 def run_plan(
