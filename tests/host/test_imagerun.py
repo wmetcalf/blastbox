@@ -444,6 +444,24 @@ def test_verification_happens_before_anything_is_exported(
         # `!=` names the version that will NOT be installed.
         ("blastbox!=0.1.27", ""),
         ("blastbox<=0.9.9", ""),
+        # PEP 440's separators are not decoration. Each of these stopped early
+        # under a hand-written pattern and yielded a DIFFERENT release --
+        # `0.2.0`, a final release, for a pin naming its release candidate --
+        # which is then passed on as an exact build arg.
+        ('"blastbox==0.2.0-rc1"', "0.2.0-rc1"),
+        ('"blastbox==0.2.0rc-1"', "0.2.0rc-1"),
+        ('"blastbox==0.2.0_rev_3"', "0.2.0_rev_3"),
+        ('"blastbox==0.2.0+linux-x86"', "0.2.0+linux-x86"),
+        ('"blastbox==0.2.0rc1"', "0.2.0rc1"),
+        ('"blastbox==1!0.2.0"', "1!0.2.0"),
+        ('"blastbox==0.2.0.post1"', "0.2.0.post1"),
+        # An environment marker is an ordinary way for a requirement to end.
+        ("\"blastbox==0.1.38; python_version >= '3.11'\"", "0.1.38"),
+        # Trailing junk is not a version we understand. Returning the part we
+        # DID parse would pass a release nobody declared on as an exact pin, so
+        # the whole match is refused instead.
+        ('"blastbox==0.2.0maybe"', ""),
+        ('"blastbox==0.2.0!!"', ""),
     ],
 )
 def test_the_installed_version_is_read_from_the_pin_not_from_delimiters(
