@@ -23,6 +23,8 @@ continuations joined, and lock pins -- and never ``docs/`` or ``tests/``.
 
 from __future__ import annotations
 
+import os
+import stat
 import re
 from collections.abc import Sequence
 from typing import Any
@@ -449,7 +451,7 @@ def _scan_toml_lock(path: Path) -> list[Pin]:
 
 def _scan_lock(path: Path) -> list[Pin]:
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = _read_small(path).splitlines()
     except OSError as exc:
         raise PinScanError(f"{path}: {exc}") from exc
     out: list[Pin] = []
@@ -532,7 +534,13 @@ def _read_small(path: Path) -> str:
     for `-r` lines pulls archives, database snapshots and VM images into memory.
     """
     try:
-        if path.stat().st_size > _READ_LIMIT:
+        st = os.lstat(path)
+        # REGULAR files only, and checked here because this is the one place
+        # that opens anything. `_walk` yields whatever is in the tree, so a FIFO
+        # named `pipe.lock` looks like a candidate lock -- and opening it blocks
+        # forever, from a file the scanner was merely told to look at. A
+        # character device is the same hazard with unbounded reads instead.
+        if not stat.S_ISREG(st.st_mode) or st.st_size > _READ_LIMIT:
             return ""
         return path.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -801,7 +809,7 @@ def missing_from_locks(
     out: dict[str, list[str]] = {}
     parsed = [_requirement(r) for r in requires]
     for path in _install_roots(root):
-        pins, _unused, env = _effective_pins(path)
+        pins, _unused, env = _effective_pins(path, root)
         if "blastbox" not in pins:
             continue  # somebody else's requirements; not ours to judge
         if not any(pin.hashed for entries in pins.values() for pin in entries):
@@ -866,12 +874,12 @@ def _install_roots(root: Path) -> list[Path]:
     # alone -- each reporting what the other carries.
     for path in _walk(root):
         if _is_install_input(path):
-            included |= set(_includes(path))
+            included |= set(_includes(path, root))
     direct: set[Path] = set()
     for path in _walk(root):
         if _is_requirements_file(path) or not _INSTALL_SCRIPT_RE.fullmatch(path.name):
             continue
-        for target in _referenced(path):
+        for target in _referenced(path, root):
             if target in known:
                 direct.add(target)
     return [
@@ -879,23 +887,46 @@ def _install_roots(root: Path) -> list[Path]:
     ]
 
 
-def _referenced(path: Path) -> list[Path]:
+def _referenced(path: Path, root: Path) -> list[Path]:
     """Requirement files an install script hands to pip with `-r`."""
     out: list[Path] = []
     for match in re.finditer(
         r"(?:-r|--requirement)[=\s]+([\w./\-]+)", _read_small(path)
     ):
-        out.append((path.parent / match.group(1)).resolve())
+        target = _safe_include(path.parent / match.group(1), root)
+        if target is not None:
+            out.append(target)
     return out
 
 
-def _includes(path: Path) -> list[Path]:
+def _safe_include(path: Path, root: Path) -> Path | None:
+    """``path`` if it is a plain file inside ``root``, else None.
+
+    `_walk` deliberately refuses symlinks and stays inside the repository; an
+    include naming `/dev/zero`, a FIFO, or `../../etc` walks straight past that
+    policy. Reading a FIFO blocks forever and reading /dev/zero exhausts memory,
+    both from a file the scanner was merely told to look at.
+    """
+    try:
+        resolved = path.resolve()
+        resolved.relative_to(root.resolve())
+    except (OSError, ValueError):
+        return None
+    if path.is_symlink() or not resolved.is_file():
+        return None
+    return resolved
+
+
+def _includes(path: Path, root: Path) -> list[Path]:
     """Paths this requirement file pulls in with `-r` / `--requirement`."""
     out: list[Path] = []
     for raw in _joined_lines(_read_small(path)):
         match = re.match(r"^(?:-r|--requirement)[=\s]+(\S+)", raw.strip())
-        if match:
-            out.append((path.parent / match.group(1)).resolve())
+        if not match:
+            continue
+        target = _safe_include(path.parent / match.group(1), root)
+        if target is not None:
+            out.append(target)
     return out
 
 
@@ -930,19 +961,44 @@ def _lock_environment(text: str) -> dict[str, str]:
     against whatever interpreter happens to run `pins` is how a dependency
     guarded by `python_version < "3.13"` gets skipped for a 3.12 lock.
     """
+    out: dict[str, str] = {}
     match = re.search(r"--python-version[=\s]+(\d+(?:\.\d+)+)", text)
-    if not match:
-        return {}
-    version = match.group(1)
-    full = version if version.count(".") >= 2 else f"{version}.0"
-    return {
-        "python_version": ".".join(version.split(".")[:2]),
-        "python_full_version": full,
-    }
+    if match:
+        version = match.group(1)
+        full = version if version.count(".") >= 2 else f"{version}.0"
+        out["python_version"] = ".".join(version.split(".")[:2])
+        out["python_full_version"] = full
+    # `uv pip compile --python-platform windows` resolves for a machine that is
+    # not this one, so evaluating that lock's markers against the local
+    # sys_platform skips the requirements it exists to carry. uv takes bare
+    # names and target triples; both are matched here.
+    platform = re.search(r"--python-platform[=\s]+(\S+)", text)
+    if platform:
+        token = platform.group(1).lower()
+        _WIN = {"sys_platform": "win32", "os_name": "nt", "platform_system": "Windows"}
+        _MAC = {
+            "sys_platform": "darwin",
+            "os_name": "posix",
+            "platform_system": "Darwin",
+        }
+        _NIX = {"sys_platform": "linux", "os_name": "posix", "platform_system": "Linux"}
+        for needle, values in (
+            ("windows", _WIN),
+            ("win32", _WIN),
+            ("msvc", _WIN),
+            ("darwin", _MAC),
+            ("macos", _MAC),
+            ("apple", _MAC),
+            ("linux", _NIX),
+        ):
+            if needle in token:
+                out.update(values)
+                break
+    return out
 
 
 def _effective_pins(
-    path: Path, _seen: set[Path] | None = None
+    path: Path, root: Path | None = None, _seen: set[Path] | None = None
 ) -> tuple[dict[str, list[_Pin]], set[str], dict[str, str]]:
     """``({name: [pin, ...]}, extras, environment)`` for a file and its includes.
 
@@ -957,17 +1013,20 @@ def _effective_pins(
     pins: dict[str, list[_Pin]] = {}
     extras: set[str] = set()  # kept for signature stability; see _declared_extras
     env: dict[str, str] = {}
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    # Through the one guarded reader: `_walk` yields whatever is in the tree,
+    # and a FIFO named `pipe.lock` is a candidate lock that blocks forever when
+    # opened.
+    text = _read_small(path)
+    if not text:
         return pins, extras, env
     env.update(_lock_environment(text))
     for line in _joined_lines(text):
         include = re.match(r"^(?:-r|--requirement)[=\s]+(\S+)", line)
         if include:
-            sub, sub_extras, sub_env = _effective_pins(
-                path.parent / include.group(1), seen
-            )
+            target = _safe_include(path.parent / include.group(1), root or path.parent)
+            if target is None:
+                continue
+            sub, sub_extras, sub_env = _effective_pins(target, root, seen)
             for name, entries in sub.items():
                 pins.setdefault(name, []).extend(entries)
             extras |= sub_extras
@@ -1024,6 +1083,21 @@ def _requirement(text: str):
         return None
 
 
+def _applicable_names(pins: dict[str, list[_Pin]], scope: dict[str, str]) -> set[str]:
+    """Distributions this lock actually installs in ``scope``.
+
+    A portable lock carries names whose only entries are `sys_platform ==
+    "win32"`. Counting those as present on Linux infers an extra from packages
+    that are never installed there, and then reports every one of its
+    dependencies missing.
+    """
+    return {
+        name
+        for name, entries in pins.items()
+        if any(_marker_holds(pin.marker, scope) for pin in entries)
+    }
+
+
 def _extras_in_play(
     parsed: Sequence[Any],
     pins: dict[str, list[_Pin]],
@@ -1057,6 +1131,7 @@ def _extras_in_play(
     its extras (`blastbox[s3]==...`) is not subject to that.
     """
     env = dict(environment or {})
+    present = _applicable_names(pins, env)
     base: set[str] = set()
     by_extra: dict[str, set[str]] = {}
     for req in parsed:
@@ -1089,7 +1164,7 @@ def _extras_in_play(
         unique = names - base - others - {"blastbox"}
         if not unique:
             continue
-        if len(unique & set(pins)) * 2 > len(unique):
+        if len(unique & present) * 2 > len(unique):
             found.add(extra)
     return found
 
