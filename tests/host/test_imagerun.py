@@ -1421,10 +1421,21 @@ def test_sub_mib_growth_still_preserves_the_artifact(tmp_path: Path, monkeypatch
     assert "65M" in run.verb("truncate")[0], run.verb("truncate")
 
 
-def test_a_failing_builder_pull_aborts_the_build(tmp_path: Path, monkeypatch) -> None:
-    """An unchecked pull that fails on a registry error leaves a STALE local
-    image, which the inspect then resolves happily — so the build succeeds from
-    an older builder while every recorded digest looks right."""
+def test_a_failing_builder_pull_does_not_record_a_stale_digest(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Reaching the builder-pin path is a HEURISTIC — `CACHE_ENDPOINT
+    = "cache:6379"` looks exactly like an image reference — so a pull failure
+    must not abort a valid build over a value docker only ever receives as a
+    string.
+
+    What must not happen is resolving a STALE local image to a digest and
+    recording it as though it were fresh. So the pull failure is reported and
+    the inspect is skipped: the value goes through unpinned.
+
+    An earlier version of this test asserted an abort. Review was right that
+    aborting is the wrong trade for a heuristic match.
+    """
     import blastbox.host.imagerun as mod
 
     monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
@@ -1434,11 +1445,13 @@ def test_a_failing_builder_pull_aborts_the_build(tmp_path: Path, monkeypatch) ->
         1,
     )
     run = FakeRunner(fail="eclipse-temurin:25-jdk")
-    with pytest.raises(BuildError) as e:
-        build_plan(_plan(tmp_path, text), "t1", blastbox_version="0.1.36", run=run,
-                   log=lambda _: None)
-    assert "pull builder" in str(e.value)
-    assert run.verb("docker", "build") == [], "a build ran on a stale builder"
+    build_plan(_plan(tmp_path, text), "t1", blastbox_version="0.1.36", run=run,
+               log=lambda _: None)
+    builds = run.verb("docker", "build")
+    assert builds, run.calls
+    passed = [a for a in builds[0] if a.startswith("JDK_BUILD_IMAGE=")]
+    assert passed == ["JDK_BUILD_IMAGE=eclipse-temurin:25-jdk"], passed
+    assert run.verb("docker", "inspect") == [], "a stale image was resolved anyway"
 
 
 def test_a_failed_ext4_stage_leaves_no_partial_image(tmp_path: Path, monkeypatch) -> None:
@@ -1493,3 +1506,106 @@ def test_publication_rolls_back_when_a_later_artifact_fails(
     # is removing it -- leaving it would be a partial publish of a failed release
     rolled = [c for c in run.calls if "rm" in c and any(a.endswith("first.ext4") for a in c)]
     assert rolled, f"the first artifact was not rolled back: {run.calls}"
+
+
+def test_rollback_uses_what_this_run_found_not_what_is_on_disk(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A stale `.bak` from an earlier run must not be resurrected as if it were
+    this run's original state."""
+    import blastbox.host.imagerun as mod
+
+    dest_dir = tmp_path / "fc"
+    dest_dir.mkdir()
+    _sized(dest_dir / "demo.ext4.bak", 4096)  # left over from some earlier run
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    plan = _plan(tmp_path)
+    run = FakeRunner()
+    staged = mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=run, log=lambda _: None,
+                              extract=_fake_extract({"/init": "x"}))
+    mod.publish_staged(staged, run=run, log=lambda _: None)
+    assert staged.had_previous is False, "the destination did not exist before this run"
+    run.calls.clear()
+    mod._restore_backup(staged, run, lambda _: None)
+    # the inverse of publishing into an empty slot is REMOVING, not restoring
+    assert [c for c in run.calls if "rm" in c and any("demo.ext4" == a.rsplit("/", 1)[-1]
+                                                     for a in c)], run.calls
+    assert not [c for c in run.calls if "mv" in c and any(a.endswith(".bak") for a in c)], (
+        "a stale backup was resurrected"
+    )
+
+
+def test_rollback_of_a_directory_swaps_atomically(tmp_path: Path, monkeypatch) -> None:
+    """`rm -rf dest` then `mv bak dest` leaves the live path absent for as long
+    as the removal takes — reintroducing, during recovery, the outage window the
+    atomic publish exists to avoid."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_exchange", lambda a, b, priv, run: True)
+    dest_dir = tmp_path / "gv"
+    dest_dir.mkdir()
+    (dest_dir / "rootfs").mkdir()
+    (dest_dir / "rootfs.bak").mkdir()
+    staged = mod._Staged(
+        spec=_plan(tmp_path).rootfs[0], image="i:t", dest=dest_dir / "rootfs",
+        priv=[], staging=dest_dir / "stg", ready=dest_dir / "stg", had_previous=True,
+    )
+    run = FakeRunner()
+    mod._restore_backup(staged, run, lambda _: None)
+    assert not [c for c in run.calls if "rm" in c and c[-1].endswith("/rootfs")], (
+        f"the live path was removed before the backup was in place: {run.calls}"
+    )
+
+
+def test_publication_is_serialised_per_destination(tmp_path: Path, monkeypatch) -> None:
+    """Re-checking narrows the check-then-swap races this module's concurrent
+    exports create; only a lock closes them."""
+    import blastbox.host.imagerun as mod
+
+    dest = tmp_path / "fc" / "demo.ext4"
+    order: list[str] = []
+    with mod._destination_lock(dest):
+        order.append("outer")
+        import subprocess as sp
+
+        # a second process must block on the same key rather than proceed
+        code = (
+            "import sys, fcntl, os, hashlib, tempfile, pathlib;"
+            f"key=hashlib.sha256({str(dest)!r}.encode()).hexdigest()[:16];"
+            "p=pathlib.Path(tempfile.gettempdir())/f'blastbox-publish-{key}.lock';"
+            "fd=os.open(p, os.O_CREAT|os.O_RDWR, 0o666);"
+            "sys.exit(0 if fcntl.flock(fd, fcntl.LOCK_EX|fcntl.LOCK_NB) is None else 1)"
+        )
+        r = sp.run([sys.executable, "-c", code], capture_output=True, check=False)
+        assert r.returncode != 0, "a second publisher took the lock while it was held"
+    # released afterwards
+    r2 = sp.run([sys.executable, "-c", code], capture_output=True, check=False)
+    assert r2.returncode == 0, "the lock was not released"
+
+
+def test_the_prior_state_is_read_at_the_selected_privilege(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`Path.exists()` answers False for a real artifact under a root-only
+    parent, and rollback would then DELETE what it just published instead of
+    restoring the old one.
+
+    Asserted on the argv: the fake runner answers truthfully whatever prefix it
+    is given, so dropping the privilege breaks nothing a result-based check can
+    see — the same shape as the size measurement.
+    """
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_root_prefix", lambda: ["sudo"])
+    monkeypatch.setattr(mod, "_can_be_root", lambda: True)
+    dest_dir = tmp_path / "fc"
+    dest_dir.mkdir()
+    _sized(dest_dir / "demo.ext4", 1024)
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    plan = _plan(tmp_path)
+    run = FakeRunner()
+    export_rootfs(plan, plan.rootfs[0], "t1", run=run, log=lambda _: None,
+                  extract=_fake_extract({"/init": "x"}))
+    probes = [c for c in run.calls if "test" in c and "-e" in c]
+    assert probes, run.calls
+    assert all(c[0] == "sudo" for c in probes), f"probed unprivileged: {probes}"
