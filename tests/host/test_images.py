@@ -815,3 +815,29 @@ def test_expansion_terminates_on_a_self_referential_default(tmp_path: Path) -> N
     from blastbox.host.images import _expand
 
     assert _expand("${A:-$A}/f", {}) == "$A/f"
+
+
+@pytest.mark.parametrize(
+    ("text", "env", "want"),
+    [
+        # the finding: a regex `[^}]*` stops at the FIRST `}` and hands the
+        # recursion `${B:-/tmp`, leaving a good destination reported unresolved
+        ("${A:-${B:-/tmp}}/x", {"B": "/srv"}, "/srv/x"),
+        ("${A:-${B:-/tmp}}/x", {}, "/tmp/x"),
+        ("${A:-${B:-/tmp}}/x", {"A": "/opt"}, "/opt/x"),
+        # three deep, because two could pass by accident
+        ("${A:-${B:-${C:-/tmp}}}/x", {"C": "/c"}, "/c/x"),
+        # unbalanced braces are literal text, not a half-parsed expansion
+        ("${A:-x/f", {}, "${A:-x/f"),
+        # a name that is not an identifier is left alone
+        ("${not-a-name}/f", {}, "${not-a-name}/f"),
+    ],
+)
+def test_nested_braced_defaults_are_parsed_by_balance(
+    text: str, env: dict[str, str], want: str
+) -> None:
+    """A default can hold a braced default of its own, and a regex cannot
+    balance braces."""
+    from blastbox.host.images import _expand
+
+    assert _expand(text, env) == want

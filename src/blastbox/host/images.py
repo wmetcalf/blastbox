@@ -155,8 +155,27 @@ class RootfsSpec:
 _EXPAND_DEPTH = 8
 
 
+def _close_brace(text: str, open_at: int) -> int | None:
+    """Index of the `}` matching the `{` at ``open_at``, or None if unbalanced.
+
+    Counted, not matched by regex. `${A:-${B:-/tmp}}` is a default holding a
+    default, and `[^}]*` stops at the FIRST `}` -- which handed the recursion
+    the truncated text `${B:-/tmp` and left a perfectly good destination
+    reported as unresolved.
+    """
+    depth = 0
+    for i in range(open_at, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
+
+
 def _expand(text: str, env: dict[str, str], _depth: int = 0) -> str:
-    """`$VAR`, `${VAR}` and `${VAR:-default}`.
+    """`$VAR`, `${VAR}` and `${VAR:-default}`, with defaults nestable.
 
     The default form matters: these destinations are copied from compose files
     that already use it, and a spec that silently dropped the default would
@@ -173,37 +192,66 @@ def _expand(text: str, env: dict[str, str], _depth: int = 0) -> str:
     docker `--build-arg`s, so re-expanding values would rewrite a literal `$`
     inside a token or password into whatever variable happened to share its
     name.
+
+    Scanned rather than regex-substituted, because a default can hold a braced
+    default of its own and a regex cannot balance braces.
     """
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] != "$":
+            out.append(text[i])
+            i += 1
+            continue
+        if i + 1 < n and text[i + 1] == "{":
+            close = _close_brace(text, i + 1)
+            if close is None:  # unbalanced: literal text, not an expansion
+                out.append(text[i])
+                i += 1
+                continue
+            inner = text[i + 2 : close]
+            name, sep, default = inner.partition(":-")
+            if not name.isidentifier():
+                out.append(text[i : close + 1])
+            else:
+                out.append(_resolve(name, default if sep else None, env, _depth,
+                                    literal=text[i : close + 1]))
+            i = close + 1
+            continue
+        m = re.match(r"\$(\w+)", text[i:])
+        if m:
+            out.append(_resolve(m.group(1), None, env, _depth, literal=m.group(0)))
+            i += m.end()
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
 
-    def sub(m: re.Match[str]) -> str:
-        braced, default, bare = m.group(1), m.group(2), m.group(3)
-        name = braced or bare
-        if name is None:
-            return m.group(0)
-        value = env.get(name)
-        if value:
-            return value  # VERBATIM: data is not re-read as a template
-        if value == "" and default is None:
-            # `$X/file` with X empty gives `/file` -- a plausible-looking path
-            # at the filesystem root. Leave the variable visible so the caller
-            # refuses instead of writing there.
-            return m.group(0)
-        # An EMPTY variable takes the default, as `${VAR:-x}` does in the shell.
-        # A compose env routinely carries `TITANARUM_FC_DIR=` for an unset knob,
-        # and treating that as "set" resolves the path to a hole.
-        if default is not None:
-            # A BACKSTOP, not a live guard. Recursion only ever descends into
-            # nested default text, which is finite and shrinks each level, and
-            # a value is never re-expanded -- so no realistic spec reaches this.
-            # It bounds a pathologically nested one rather than letting Python's
-            # own recursion limit decide. Stated plainly because nothing can
-            # mutation-test it: removing it changes no reachable behaviour.
-            if _depth >= _EXPAND_DEPTH:
-                return default
-            return _expand(default, env, _depth + 1)
-        return value if value is not None else m.group(0)
 
-    return re.sub(r"\$\{(\w+)(?::-([^}]*))?\}|\$(\w+)", sub, text)
+def _resolve(
+    name: str, default: str | None, env: dict[str, str], depth: int, *, literal: str
+) -> str:
+    """One `$NAME` or `${NAME:-default}`."""
+    value = env.get(name)
+    if value:
+        return value  # VERBATIM: data is not re-read as a template
+    if value == "" and default is None:
+        # `$X/file` with X empty gives `/file` -- a plausible-looking path at
+        # the filesystem root. Leave the variable visible so the caller refuses
+        # instead of writing there.
+        return literal
+    # An EMPTY variable takes the default, as `${VAR:-x}` does in the shell. A
+    # compose env routinely carries `TITANARUM_FC_DIR=` for an unset knob, and
+    # treating that as "set" resolves the path to a hole.
+    if default is not None:
+        # A BACKSTOP, not a live guard. Recursion only descends into nested
+        # default text, which is finite and shrinks each level, and a value is
+        # never re-expanded -- so no realistic spec reaches this. Stated plainly
+        # because nothing can mutation-test it.
+        if depth >= _EXPAND_DEPTH:
+            return default
+        return _expand(default, env, depth + 1)
+    return value if value is not None else literal
 
 @dataclass(frozen=True)
 class Plan:
