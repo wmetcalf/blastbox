@@ -834,6 +834,10 @@ class _Pin:
     # `===` is ARBITRARY equality: pip compares the string, not the version.
     # `==1.0` and `==1.0.0` are the same pin; `===1.0` and `===1.0.0` are not.
     arbitrary: bool = False
+    # The entry's WHOLE specifier set. An exact pin may carry co-restrictions
+    # (`==1.0,!=1.0+vendor`), and rebuilding the specifier from the version
+    # alone dropped them -- so a pair pip cannot resolve looked compatible.
+    specifier: str = ""
 
 
 def missing_from_locks(
@@ -1200,7 +1204,9 @@ def _pin_specifier(pin: _Pin) -> Any:
 
     raw = pin.version.lstrip("=").strip()
     try:
-        return SpecifierSet(("===" if pin.arbitrary else "==") + raw)
+        # The whole specifier set where the entry stated one: an exact pin may
+        # carry co-restrictions that decide satisfiability.
+        return SpecifierSet(pin.specifier or (("===" if pin.arbitrary else "==") + raw))
     except InvalidSpecifier:
         return None
 
@@ -1619,7 +1625,7 @@ def _lock_environment(text: str) -> dict[str, str]:
     # The WHOLE version request, suffix and all: uv accepts `3.13rc1` and
     # records it here, and truncating it to `3.13` skipped a dependency guarded
     # by `python_full_version < "3.13.0rc2"` -- which applies to that target.
-    match = re.search(r"--python-version[=\s]+([0-9][^\s\"']*)", text)
+    match = re.search(r"--python-version[=\s]+([vV]?[0-9][^\s\"']*)", text)
     if match:
         full = _target_version(match.group(1))
         if full is None:
@@ -1698,7 +1704,7 @@ def _lock_environment(text: str) -> dict[str, str]:
     return out
 
 
-def _exact_pin(line: str) -> tuple[str, frozenset[str], str, bool] | None:
+def _exact_pin(line: str) -> tuple[str, frozenset[str], str, bool, str] | None:
     """``(name, extras, version)`` for a lock entry pinning one exact version.
 
     `packaging!=21,==23` is an exact pin whose `==` is not first; pip resolves
@@ -1722,6 +1728,7 @@ def _exact_pin(line: str) -> tuple[str, frozenset[str], str, bool] | None:
         extras,
         exact[0].version,
         exact[0].operator == "===",
+        str(req.specifier),
     )
 
 
@@ -1774,7 +1781,7 @@ def _effective_pins(
         entry = _exact_pin(line)
         if entry is None:
             continue
-        name, entry_extras, version, arbitrary = entry
+        name, entry_extras, version, arbitrary, specifier = entry
         _, _, after = line.partition(";")
         marker = after.split("--hash")[0].strip() if after else ""
         pins.setdefault(name, []).append(
@@ -1788,6 +1795,7 @@ def _effective_pins(
                 hashed=_HASH_RE.search(line) is not None,
                 extras=entry_extras,
                 arbitrary=arbitrary,
+                specifier=specifier,
             )
         )
     return pins, extras, env
