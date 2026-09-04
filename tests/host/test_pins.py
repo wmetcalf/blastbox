@@ -1841,3 +1841,69 @@ def test_the_lock_states_the_environment_its_markers_are_for(tmp_path):
         + _entry("packaging==26.3"),
     )
     assert missing_from_locks(tmp_path, _RM) == {}
+
+
+_RN = [
+    "pydantic>=2.6.0",
+    'fastapi>=0.100; extra == "host"',
+    'uvicorn>=0.20; extra == "host"',
+    'structlog>=24; extra == "host"',
+    'pywin32>=306; extra == "host" and sys_platform == "win32"',
+    'blastbox[host]; extra == "dev"',
+    'pytest>=8; extra == "dev"',
+]
+
+
+def test_an_extras_platform_only_members_do_not_dilute_the_evidence(tmp_path):
+    """`pywin32` is a host dependency that a Linux lock correctly lacks.
+
+    Counting it against a Linux lock pushed `host` under the threshold, so the
+    extra was not recognised -- and the genuinely missing `structlog` pin was
+    then accepted. The evidence set has to be the requirements that APPLY.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "req.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("fastapi==0.115.0")
+        + _entry("uvicorn==0.30.0"),
+    )
+    # Two of THREE applicable host dependencies is a majority; two of four,
+    # counting the Windows-only one, is not.
+    gaps = missing_from_locks(tmp_path, _RN, environment={"sys_platform": "linux"})
+    assert list(gaps.values()) == [["structlog"]], gaps
+
+
+def test_an_extra_that_enables_another_pulls_its_closure_in(tmp_path):
+    """`blastbox[host]; extra == "dev"` means a dev lock installs host too.
+
+    pip enables it transitively and then demands hashes for all of it, so
+    recording only the distribution name -- discarding `[host]` -- left those
+    dependencies unchecked while the lock looked complete.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "req.lock",
+        _entry("blastbox[dev]==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("pytest==8.3.3"),
+    )
+    gaps = missing_from_locks(tmp_path, _RN, environment={"sys_platform": "linux"})
+    assert list(gaps.values()) == [["fastapi", "uvicorn", "structlog"]], gaps
+
+
+def test_a_lock_that_asks_for_no_extras_is_still_left_alone(tmp_path):
+    """Neither fix may turn the base case into noise."""
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path, "req.lock", _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5")
+    )
+    assert (
+        missing_from_locks(tmp_path, _RN, environment={"sys_platform": "linux"}) == {}
+    )

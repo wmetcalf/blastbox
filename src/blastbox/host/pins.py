@@ -760,6 +760,7 @@ def missing_from_locks(
             continue  # not hash-pinned; pip resolves the rest itself
         scope = {**env, **(environment or {})}
         extras |= _extras_in_play(parsed, pins, scope)
+        extras = _with_nested_extras(extras, parsed, scope)
         gaps: list[str] = []
         for req in parsed:
             if req is None or not _applies(req, extras, scope):
@@ -950,6 +951,12 @@ def _extras_in_play(
     extra whether or not it says so, and one with no boto3 was not compiled for
     s3 -- which is the distinction that keeps this from being noise.
 
+    Evidence is counted only from requirements that APPLY. A host extra with a
+    `pywin32; extra == "host" and sys_platform == "win32"` member has two
+    dependencies on Windows and one on Linux; counting the Windows-only one
+    against a Linux lock pushes it under the threshold, the extra is not
+    recognised, and a genuinely missing pin is then accepted.
+
     Only dependencies UNIQUE to an extra count, and MORE THAN HALF of them must
     be present. On RedTusk's real lock the `dev` extra's only "present"
     dependency was `blastbox` itself -- dev depends on `blastbox[host]` -- which
@@ -958,14 +965,12 @@ def _extras_in_play(
     either: an extra with two unique dependencies, one of which the lock pins
     for its own reasons, would otherwise be inferred from that single package.
 
-    A majority still catches what this exists for: a release that ADDS a
-    dependency to an extra leaves all the others pinned.
-
     The limit worth knowing: an extra with exactly ONE dependency is invisible
     once that dependency is missing -- a lock without boto3 looks the same
     whether it dropped `blastbox[s3]` or never asked for it. A lock that spells
     its extras (`blastbox[s3]==...`) is not subject to that.
     """
+    env = dict(environment or {})
     base: set[str] = set()
     by_extra: dict[str, set[str]] = {}
     for req in parsed:
@@ -977,6 +982,8 @@ def _extras_in_play(
             base.add(name)
             continue
         for extra in re.findall(r"extra\s*==\s*[\"\']([^\"\']+)", marker):
+            if not _marker_holds(marker, {**env, "extra": extra}):
+                continue  # e.g. a win32-only member of an extra, on Linux
             by_extra.setdefault(extra.lower(), set()).add(name)
     found = set()
     for extra, names in by_extra.items():
@@ -988,6 +995,40 @@ def _extras_in_play(
         if len(unique & set(pins)) * 2 > len(unique):
             found.add(extra)
     return found
+
+
+def _with_nested_extras(
+    extras: set[str], parsed: Sequence[Any], environment: dict[str, str] | None
+) -> set[str]:
+    """``extras`` plus every blastbox extra they enable, transitively.
+
+    One extra can turn another on: `blastbox[host]; extra == "dev"` means a
+    lock built for `dev` installs the whole host closure, and pip then demands
+    hashes for all of it. Recording only the distribution name discarded the
+    `[host]` part, so those dependencies were never checked -- the lock looked
+    complete and the install failed.
+    """
+    env = dict(environment or {})
+    out = set(extras)
+    while True:
+        grown = set(out)
+        for req in parsed:
+            if req is None or _dist_name(req.name) != "blastbox":
+                continue
+            nested = {e.lower() for e in getattr(req, "extras", set()) or set()}
+            if not nested:
+                continue
+            marker = str(getattr(req, "marker", "") or "")
+            if not marker:
+                grown |= nested
+                continue
+            for extra in sorted(out) + [""]:
+                if _marker_holds(marker, {**env, "extra": extra}):
+                    grown |= nested
+                    break
+        if grown == out:
+            return out
+        out = grown
 
 
 def _applies(req, extras: set[str], environment: dict[str, str] | None) -> bool:
