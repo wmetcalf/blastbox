@@ -385,3 +385,55 @@ def test_progress_lines_are_flushed(tmp_path: Path) -> None:
     assert text.index(">> build demo:t1") < text.index("CHILD-OUTPUT"), (
         f"progress landed after the child's output:\n{text}"
     )
+
+
+def test_everything_that_reads_the_staging_tree_runs_at_one_privilege(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Extraction and mkfs.ext4 must share a privilege level.
+
+    Measured on toolz2: the tree is extracted as root so ownership and setuid
+    bits survive, and a user-run `mkfs.ext4 -d` over it then dies on
+    `.pwd.lock` (mode 600, root) with "Permission denied while populating file
+    system" — after all five images had been built and verified. Splitting the
+    two is not a style question.
+    """
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_root_prefix", lambda: ["sudo"])
+    monkeypatch.setattr(mod, "_can_be_root", lambda: True)
+    dest_dir = tmp_path / "fc"
+    dest_dir.mkdir()
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    plan = _plan(tmp_path)
+    run = FakeRunner()
+    export_rootfs(plan, plan.rootfs[0], "t1", run=run, log=lambda _: None,
+                  extract=_fake_extract({"/init": "x"}))
+    mkfs = [c for c in run.calls if "mkfs.ext4" in c]
+    assert mkfs, run.calls
+    assert mkfs[0][0] == "sudo", f"mkfs ran unprivileged over a root tree: {mkfs[0]}"
+
+
+def test_a_failed_export_does_not_leak_a_root_owned_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """rmtree cannot remove what root extracted: mkdtemp makes the directory
+    this user's, while its contents are not, so an ordinary walk fails partway
+    and leaves a whole rootfs behind. Observed on toolz2 after the mkfs
+    failure."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_root_prefix", lambda: ["sudo"])
+    monkeypatch.setattr(mod, "_can_be_root", lambda: True)
+    dest_dir = tmp_path / "fc"
+    dest_dir.mkdir()
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    plan = _plan(tmp_path)
+    run = FakeRunner()
+    with pytest.raises(BuildError):
+        export_rootfs(plan, plan.rootfs[0], "t1", run=run, log=lambda _: None,
+                      extract=_fake_extract({"/usr/bin/true": "x"}))
+    removals = [c for c in run.calls if "rm" in c and "-rf" in c]
+    assert removals and removals[-1][0] == "sudo", (
+        f"the staging tree was cleaned up unprivileged: {removals}"
+    )

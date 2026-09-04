@@ -177,10 +177,16 @@ def verify_built(images: Sequence[str], *, run: Runner | None = None, log: Log =
         )
 
 
-def _remove_tree(path: Path, need_sudo: bool, run: Runner) -> None:
-    """Remove a staging tree, with sudo when it was written as root."""
-    if need_sudo or not os.access(path, os.W_OK):
-        run(["sudo", "rm", "-rf", str(path)], capture_output=True)
+def _remove_tree(path: Path, priv: list[str], run: Runner) -> None:
+    """Remove a staging tree at the privilege it was WRITTEN with.
+
+    `os.access` on the directory is not the test: mkdtemp makes it owned by this
+    user, while everything root extracted inside it is not, so an ordinary
+    rmtree walks in and fails partway. A failed export then leaves a whole
+    root-owned rootfs behind — observed on toolz2 after the mkfs failure above.
+    """
+    if priv:
+        run([*priv, "rm", "-rf", str(path)], capture_output=True)
     else:
         shutil.rmtree(path, ignore_errors=True)
 
@@ -270,10 +276,6 @@ def _sudo_needed(path: Path) -> bool:
     return not os.access(probe, os.W_OK)
 
 
-def _sudo(argv: list[str], need: bool) -> list[str]:
-    return (["sudo", *argv]) if need else argv
-
-
 def export_rootfs(
     plan: Plan,
     spec: RootfsSpec,
@@ -303,7 +305,19 @@ def export_rootfs(
             f"{spec.dest} still contains an unset variable ({dest}); refusing to "
             "write to a path nobody chose"
         )
+    # ONE privilege level for the whole export. The tree is extracted as root
+    # so ownership and setuid bits survive, which means everything that then
+    # READS it -- mkfs.ext4 above all -- has to be root as well. Splitting the
+    # two is not a style question: measured on toolz2, a root-extracted tree
+    # consumed by a user-run mkfs.ext4 dies on `.pwd.lock` (mode 600, root) with
+    # "Permission denied while populating file system", after every image has
+    # already been built and verified.
+    #
+    # `need_sudo` is the separate question of whether the DESTINATION needs
+    # root; when it does, the same prefix covers that too.
     need_sudo = _sudo_needed(dest)
+    as_root = _can_be_root()
+    priv = _root_prefix() if (as_root or need_sudo) else []
 
     staging = Path(
         tempfile.mkdtemp(
@@ -319,39 +333,39 @@ def export_rootfs(
         if extract is not None:
             extract(image, staging)
         else:
-            _extract_image(image, staging, run, log, as_root=_can_be_root())
+            _extract_image(image, staging, run, log, as_root=as_root)
         _check_requires(staging, spec, image)
 
         if spec.kind == "dir":
             # Extract-and-swap, never tar over the live tree: an overlay leaves
             # every file the new image DELETED, and the guest boots a mixture.
             if dest.exists():
-                _must(_sudo(["rm", "-rf", f"{dest}.bak"], need_sudo), "clear .bak", run)
-                _must(_sudo(["mv", str(dest), f"{dest}.bak"], need_sudo), "keep .bak", run)
-            _must(_sudo(["mkdir", "-p", str(dest.parent)], need_sudo), "mkdir", run)
-            _must(_sudo(["mv", str(staging), str(dest)], need_sudo), "publish rootfs", run)
+                _must([*priv, "rm", "-rf", f"{dest}.bak"], "clear .bak", run)
+                _must([*priv, "mv", str(dest), f"{dest}.bak"], "keep .bak", run)
+            _must([*priv, "mkdir", "-p", str(dest.parent)], "mkdir", run)
+            _must([*priv, "mv", str(staging), str(dest)], "publish rootfs", run)
             published = True  # moved into place; there is nothing left to remove
         else:
             size = spec.size_mib or _existing_mib(dest) or 1536
             tmp_img = dest.with_suffix(dest.suffix + ".new")
-            _must(_sudo(["mkdir", "-p", str(dest.parent)], need_sudo), "mkdir", run)
-            _must(_sudo(["truncate", "-s", f"{size}M", str(tmp_img)], need_sudo), "truncate", run)
+            _must([*priv, "mkdir", "-p", str(dest.parent)], "mkdir", run)
+            _must([*priv, "truncate", "-s", f"{size}M", str(tmp_img)], "truncate", run)
             # `mke2fs -d` populates the image directly: no mount, no loop device
             # and no root beyond writing the file — the same discipline the host
             # side uses for never mounting a disk it did not create.
             _must(
-                _sudo(["mkfs.ext4", "-F", "-q", "-d", str(staging), str(tmp_img)], need_sudo),
+                [*priv, "mkfs.ext4", "-F", "-q", "-d", str(staging), str(tmp_img)],
                 "mkfs.ext4",
                 run,
             )
             if dest.exists():
-                _must(_sudo(["mv", str(dest), f"{dest}.bak"], need_sudo), "keep .bak", run)
-            _must(_sudo(["mv", str(tmp_img), str(dest)], need_sudo), "publish rootfs", run)
+                _must([*priv, "mv", str(dest), f"{dest}.bak"], "keep .bak", run)
+            _must([*priv, "mv", str(tmp_img), str(dest)], "publish rootfs", run)
         log(f"   {dest}  (previous kept as {dest.name}.bak)")
         return dest
     finally:
         if not published:
-            _remove_tree(staging, need_sudo, run)
+            _remove_tree(staging, priv, run)
 
 
 def _existing_mib(path: Path) -> int:
