@@ -3512,3 +3512,192 @@ def test_only_an_install_command_names_a_root(tmp_path):
     assert (
         missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"}) == {}
     )
+
+
+def test_a_constraint_given_on_the_command_line_applies(tmp_path):
+    """`pip install -r req.lock -c limits.txt` constrains that resolution.
+
+    Nothing installs `limits.txt`, so it is not a member of the set -- and
+    walking only members meant pip's own constraint was never applied.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "requirements.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging==26.3")
+        + _entry("backport==1.0"),
+    )
+    (tmp_path / "limits.txt").write_text("packaging==22.0\n")
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\n"
+        "RUN pip install --require-hashes -r requirements.lock -c limits.txt\n"
+    )
+    env = {"python_version": "3.12"}
+    gaps = missing_from_locks(tmp_path, _RM, environment=env)
+    assert any(
+        "excluded by the constraint" in g
+        for g in gaps.get(str(tmp_path / "requirements.lock"), [])
+    ), gaps
+    # Control: the same command without the constraint is clean.
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\nRUN pip install --require-hashes -r requirements.lock\n"
+    )
+    assert missing_from_locks(tmp_path, _RM, environment=env) == {}
+
+
+def test_every_constraint_on_a_package_applies_not_just_the_first(tmp_path):
+    """`packaging>=20` and `packaging<23` together reject a pinned 26.3."""
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "requirements.lock",
+        "-c floor.txt\n-c ceiling.txt\n"
+        + _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging==26.3")
+        + _entry("backport==1.0"),
+    )
+    (tmp_path / "floor.txt").write_text("packaging>=20\n")  # admits 26.3
+    (tmp_path / "ceiling.txt").write_text("packaging<23\n")  # forbids it
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\nRUN pip install --require-hashes -r requirements.lock\n"
+    )
+    gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert any(
+        "excluded by the constraint" in g
+        for g in gaps.get(str(tmp_path / "requirements.lock"), [])
+    ), gaps
+
+
+def test_a_constraint_whose_marker_does_not_apply_is_not_a_conflict(tmp_path):
+    """`packaging<23; sys_platform == "win32"` does not constrain a Linux install."""
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "requirements.lock",
+        "-c limits.txt\n"
+        + _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging==26.3")
+        + _entry("backport==1.0"),
+    )
+    (tmp_path / "limits.txt").write_text('packaging<23; sys_platform == "win32"\n')
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\nRUN pip install --require-hashes -r requirements.lock\n"
+    )
+    env = {"python_version": "3.12", "sys_platform": "linux"}
+    assert missing_from_locks(tmp_path, _RM, environment=env) == {}
+    # Control: on the platform it names, it DOES constrain.
+    win = {"python_version": "3.12", "sys_platform": "win32"}
+    assert missing_from_locks(tmp_path, _RM, environment=win) != {}
+
+
+def test_two_installs_on_one_line_are_two_resolutions(tmp_path):
+    """`pip install -r a.lock && pip install -r b.lock` is two commands.
+
+    Merging them lets the second satisfy dependencies the first install would
+    fail without -- and it fails at build time, not here.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "blastbox.lock",
+        _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5"),
+    )
+    _write(tmp_path, "deps.lock", _entry("packaging==26.3") + _entry("backport==1.0"))
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\n"
+        "RUN pip install --require-hashes -r blastbox.lock \\\n"
+        "    && pip install --require-hashes -r deps.lock\n"
+    )
+    gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert list(gaps) == [str(tmp_path / "blastbox.lock")], gaps
+
+
+def test_one_command_installing_two_locks_is_one_set_for_declared_extras(tmp_path):
+    """A grouped set is ONE resolution, so the single-set inference applies.
+
+    Counting its member files instead disabled the fallback that reads what the
+    repository declares, and a newly missing `s3` dependency went unreported.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\ndependencies = ["blastbox[s3]>=0.1.39,<0.2"]\n'
+    )
+    _write(
+        tmp_path,
+        "blastbox.lock",
+        _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5"),
+    )
+    _write(tmp_path, "deps.lock", _entry("packaging==26.3") + _entry("backport==1.0"))
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\n"
+        "RUN pip install --require-hashes -r blastbox.lock -r deps.lock\n"
+    )
+    requires = [*_RM, 's3only>=1.0; extra == "s3"']
+    gaps = missing_from_locks(
+        tmp_path, requires, environment={"python_version": "3.12"}
+    )
+    assert any("s3only" in g for entries in gaps.values() for g in entries), gaps
+
+
+def test_the_target_interpreter_also_sets_implementation_version(tmp_path):
+    """A marker asking the implementation's version asks about the TARGET.
+
+    The target is deliberately far from any host this runs on: with 3.12
+    on both sides, the host's own value satisfies the marker and the test
+    passes whether or not the header is consulted.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "requirements.lock",
+        "# This file was autogenerated by uv via the following command:\n"
+        "#    uv pip compile pyproject.toml --generate-hashes --python-version 3.9\n"
+        + _entry("blastbox==0.1.39"),
+    )
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\nRUN pip install --require-hashes -r requirements.lock\n"
+    )
+    lock = str(tmp_path / "requirements.lock")
+    # True for the 3.9 target, false for any interpreter that can run this.
+    old = missing_from_locks(
+        tmp_path, ['oldimpl>=1.0; implementation_version < "3.10"']
+    )
+    assert any("oldimpl" in g for g in old.get(lock, [])), old
+    # ...and the other direction, so neither answer can come from the host.
+    new = missing_from_locks(
+        tmp_path, ['newimpl>=1.0; implementation_version >= "3.10"']
+    )
+    assert new == {}, new
+
+
+def test_two_exact_pins_for_one_package_in_a_set_are_unresolvable(tmp_path):
+    """pip must satisfy BOTH, and cannot; either one matching is not enough."""
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "blastbox.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging==26.3"),
+    )
+    _write(tmp_path, "deps.lock", _entry("packaging==22.0") + _entry("backport==1.0"))
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\n"
+        "RUN pip install --require-hashes -r blastbox.lock -r deps.lock\n"
+    )
+    gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    reported = [g for entries in gaps.values() for g in entries]
+    assert any("more than one version" in g and "packaging" in g for g in reported), (
+        reported
+    )

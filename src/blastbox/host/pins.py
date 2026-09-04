@@ -868,8 +868,8 @@ def missing_from_locks(
     out: dict[str, list[str]] = {}
     parsed = [_requirement(r) for r in requires]
     sets = _install_sets(root)
-    roots = [member for members in sets for member in members]
-    for members in sets:
+    for iset in sets:
+        members = iset.members
         pins, env = _merged_pins(members, root)
         if "blastbox" not in pins:
             continue  # somebody else's requirements; not ours to judge
@@ -880,7 +880,7 @@ def missing_from_locks(
         found: dict[str, list[str]] = {}
         for label, scope in scopes:
             for gap in _judge_scope(
-                members, root, roots, pins, scope, parsed, requirements_of
+                iset, root, len(sets), pins, scope, parsed, requirements_of
             ):
                 found.setdefault(gap, []).append(label)
         gaps = [
@@ -1047,7 +1047,7 @@ def _install_roots(root: Path) -> list[Path]:
 
 
 def _constraint_conflicts(
-    members: Sequence[Path],
+    iset: _InstallSet,
     root: Path,
     pins: dict[str, list[_Pin]],
     scope: dict[str, str],
@@ -1056,14 +1056,17 @@ def _constraint_conflicts(
     from packaging.version import InvalidVersion  # noqa: PLC0415
 
     out: list[str] = []
-    specs = _constraint_specs(members, root)
+    specs = _constraint_specs(iset, root)
     if not specs:
         return out
     for name, entries in sorted(pins.items()):
-        spec_source = specs.get(name)
-        if spec_source is None:
+        applicable = [
+            (specifier, source)
+            for specifier, marker, source in specs.get(name, [])
+            if _marker_holds(marker, scope)
+        ]
+        if not applicable:
             continue
-        specifier, source = spec_source
         for pin in entries:
             if not _marker_holds(pin.marker, scope):
                 continue
@@ -1071,10 +1074,16 @@ def _constraint_conflicts(
             if not version:
                 continue
             try:
-                allowed = specifier.contains(version, prereleases=True)
+                # ALL of them: pip applies every constraint it was given.
+                excluded = [
+                    (specifier, source)
+                    for specifier, source in applicable
+                    if not specifier.contains(version, prereleases=True)
+                ]
             except InvalidVersion:
                 continue  # not a version we can compare; not evidence of a conflict
-            if not allowed:
+            if excluded:
+                specifier, source = excluded[0]
                 out.append(
                     f"{name}=={version} is excluded by the constraint "
                     f"{name}{specifier} in {source}"
@@ -1084,19 +1093,27 @@ def _constraint_conflicts(
 
 
 def _constraint_specs(
-    members: Sequence[Path], root: Path
-) -> dict[str, tuple[Any, Path]]:
-    """`{name: (specifier, source)}` constraining this install set.
+    iset: _InstallSet, root: Path
+) -> dict[str, list[tuple[Any, str, Path]]]:
+    """`{name: [(specifier, marker, source), ...]}` constraining this set.
 
     A constraint installs nothing; it restricts what a version may be. A root
     pinning `packaging==26.3` under a constraint of `packaging==22` is a lock
     pip REFUSES to resolve -- and the closure check called it complete, because
-    every name it wanted was present and hashed. pip documents `-c` as
-    repeatable and follows it recursively, so both roles are walked: a
-    requirements file contributes its `-c` targets, a constraint file
-    contributes its own lines and its own references.
+    every name it wanted was present and hashed.
+
+    EVERY constraint is kept, not the first one seen: pip documents `-c` as
+    repeatable and applies all of them, so `packaging>=20` and `packaging<23`
+    together reject a pinned 23 that either alone admits. Markers are kept with
+    them, because `packaging<23; sys_platform == "win32"` does not constrain a
+    Linux install and reporting it there refuses a correct lock.
+
+    Both roles are walked: a requirements file contributes its `-c` targets, a
+    constraint file contributes its own lines and its own references. Files
+    named by `-c` on the COMMAND LINE are constraints of this resolution too,
+    though nothing installs them.
     """
-    out: dict[str, tuple[Any, Path]] = {}
+    out: dict[str, list[tuple[Any, str, Path]]] = {}
     seen: set[tuple[Path, bool]] = set()
 
     def walk(path: Path, *, constraining: bool) -> None:
@@ -1126,10 +1143,15 @@ def _constraint_specs(
             # off before parsing or every hashed constraint reads as absent.
             req = _requirement(_HASH_RE.sub("", _strip_comment(line)).strip())
             if req is not None and str(req.specifier):
-                out.setdefault(_dist_name(req.name), (req.specifier, path))
+                marker = str(req.marker) if req.marker is not None else ""
+                out.setdefault(_dist_name(req.name), []).append(
+                    (req.specifier, marker, path)
+                )
 
-    for member in members:
+    for member in iset.members:
         walk(member, constraining=False)
+    for limit in iset.constraints:
+        walk(limit, constraining=True)
     return out
 
 
@@ -1157,16 +1179,32 @@ def _scopes_for(
 
 
 def _judge_scope(
-    members: Sequence[Path],
+    iset: _InstallSet,
     root: Path,
-    roots: Sequence[Path],
+    n_sets: int,
     pins: dict[str, list[_Pin]],
     scope: dict[str, str],
     parsed: Sequence[Any],
     requirements_of: Callable[[str, str], list[str] | None] | None,
 ) -> list[str]:
     """What this install set is missing IN ONE marker environment."""
+    members = iset.members
     gaps: list[str] = []
+    # Two exact pins for one distribution, both applicable here. pip has to
+    # satisfy both and cannot: the set is unresolvable however well it covers
+    # the closure, and `_gap` was satisfied as soon as EITHER version matched.
+    for name, entries in sorted(pins.items()):
+        versions = {
+            pin.version.lstrip("=").strip()
+            for pin in entries
+            if _marker_holds(pin.marker, scope)
+        }
+        if len(versions) > 1:
+            spelled = ", ".join(sorted(versions))
+            gaps.append(
+                f"{name} is pinned to more than one version in this install "
+                f"set ({spelled}); pip cannot satisfy both"
+            )
     # An APPLICABLE blastbox entry. A portable lock whose only blastbox pin
     # is `; sys_platform == "win32"` does not install blastbox on Linux, so
     # demanding its dependency closure there refuses a correct lock.
@@ -1196,7 +1234,10 @@ def _judge_scope(
     }
     declared = set()
     for member in members:
-        declared |= _declared_extras_for(root, member, roots)
+        # The number of install SETS, not of files: two locks installed by one
+        # command are one resolution, and counting them as two disabled the
+        # single-set fallback that infers what the repository declares.
+        declared |= _declared_extras_for(root, member, n_sets)
     if not enforced and not declared:
         declared = _extras_in_play(parsed, pins, scope)
     extras = enforced | declared
@@ -1229,7 +1270,7 @@ def _judge_scope(
     # a version is PRESENT; pip also refuses a resolution its constraints
     # exclude, and that lock fails the install the check just approved.
     gaps.extend(
-        g for g in _constraint_conflicts(members, root, pins, scope) if g not in gaps
+        g for g in _constraint_conflicts(iset, root, pins, scope) if g not in gaps
     )
     return gaps
 
@@ -1248,52 +1289,76 @@ def _merged_pins(
     return pins, env
 
 
-def _install_sets(root: Path) -> list[tuple[Path, ...]]:
-    """Install roots, with files ONE command installs together kept together.
-
-    `pip install -r blastbox.lock -r deps.lock` is a single resolution: pip
-    documents `-r` as repeatable, and it merges the files before resolving.
-    Treating each as its own root reported `blastbox.lock` incomplete for
-    dependencies `deps.lock` supplies in the very same command. Files installed
-    by SEPARATE commands stay separate, because those really are separate
-    resolutions.
-    """
-    roots = _install_roots(root)
-    known = {p.resolve(): p for p in roots}
-    sets: list[tuple[Path, ...]] = []
-    seen: set[frozenset[Path]] = set()
-    grouped: set[Path] = set()
-    for path in _walk(root):
-        if not _INSTALL_SCRIPT_RE.fullmatch(path.name) or _is_install_input(path):
-            continue
-        for line in _joined_lines(_read_small(path)):
-            named = [
-                known[r]
-                for r in dict.fromkeys(_referenced_in(line, path.parent, root))
-                if r in known
-            ]
-            if len(named) < 2:
-                continue
-            key = frozenset(p.resolve() for p in named)
-            if key in seen:
-                continue
-            seen.add(key)
-            sets.append(tuple(named))
-            grouped |= key
-    sets.extend((p,) for p in roots if p.resolve() not in grouped)
-    return sets
-
-
 def _install_segments(line: str) -> list[str]:
     """The parts of a shell line that are pip install commands.
 
     A script line is not one command. `echo -r prod.lock && pip install -r
     dev.lock` names two files to a naive reader, and promoting `prod.lock` to
     an install root judges it ALONE -- blocking a bump for dependencies the
-    `dev.lock` that really includes it supplies.
+    `dev.lock` that really includes it supplies. Two pip installs on one line
+    are likewise two resolutions, not one.
     """
     segments = re.split(r"&&|\|\||[;|]", line)
     return [seg for seg in segments if _INSTALL_RE.search(seg)]
+
+
+@dataclass(frozen=True)
+class _InstallSet:
+    """One pip resolution: the files it installs, and what constrains them."""
+
+    members: tuple[Path, ...]
+    constraints: tuple[Path, ...] = ()
+
+
+def _install_sets(root: Path) -> list[_InstallSet]:
+    """Install roots grouped by the COMMAND that installs them.
+
+    `pip install -r blastbox.lock -r deps.lock` is a single resolution: pip
+    documents `-r` as repeatable and merges the files before resolving.
+    Treating each as its own root reported `blastbox.lock` incomplete for
+    dependencies `deps.lock` supplies in the very same command.
+
+    Per SEGMENT, not per line: `pip install -r a.lock && pip install -r b.lock`
+    is two resolutions that happen to share a `RUN`, and merging them lets the
+    second satisfy dependencies the first install would fail without.
+
+    A command's own `-c` files travel with it. They are not installed, so they
+    are not members -- but pip applies them to this resolution, and a pin they
+    exclude is a lock pip refuses.
+    """
+    roots = _install_roots(root)
+    known = {p.resolve(): p for p in roots}
+    sets: list[_InstallSet] = []
+    seen: set[tuple[frozenset[Path], frozenset[Path]]] = set()
+    grouped: set[Path] = set()
+    for path in _walk(root):
+        if not _INSTALL_SCRIPT_RE.fullmatch(path.name) or _is_install_input(path):
+            continue
+        for line in _joined_lines(_read_small(path)):
+            for segment in _install_segments(line):
+                named = [
+                    known[r]
+                    for r in dict.fromkeys(_referenced_in(segment, path.parent, root))
+                    if r in known
+                ]
+                if not named:
+                    continue
+                limits = tuple(
+                    dict.fromkeys(
+                        c
+                        for name in _constraint_args(segment)
+                        for base in (path.parent, root)
+                        if (c := _safe_include(base / name, root)) is not None
+                    )
+                )
+                key = (frozenset(p.resolve() for p in named), frozenset(limits))
+                if key in seen:
+                    continue
+                seen.add(key)
+                sets.append(_InstallSet(tuple(named), limits))
+                grouped |= key[0]
+    sets.extend(_InstallSet((p,)) for p in roots if p.resolve() not in grouped)
+    return sets
 
 
 def _referenced(path: Path, root: Path) -> list[Path]:
@@ -1468,6 +1533,11 @@ def _lock_environment(text: str) -> dict[str, str]:
         full = version if version.count(".") >= 2 else f"{version}.0"
         out["python_version"] = ".".join(version.split(".")[:2])
         out["python_full_version"] = full
+        # uv resolves FOR this interpreter, so a marker that asks the
+        # implementation's version is asking about the target too. Leaving it
+        # on the host skipped a dependency guarded by
+        # `implementation_version < "3.13"` when a 3.14 host judged a 3.12 lock.
+        out["implementation_version"] = full
     # `uv pip compile --python-platform windows` resolves for a machine that is
     # not this one, so evaluating that lock's markers against the local
     # sys_platform skips the requirements it exists to carry. uv takes bare
@@ -1665,7 +1735,7 @@ def _applicable_names(pins: dict[str, list[_Pin]], scope: dict[str, str]) -> set
     }
 
 
-def _declared_extras_for(root: Path, lock: Path, roots: Sequence[Path]) -> set[str]:
+def _declared_extras_for(root: Path, lock: Path, n_sets: int) -> set[str]:
     """Blastbox extras that apply to THIS install set.
 
     A declaration is evidence only about the set that selects it. A `dev`
@@ -1703,7 +1773,7 @@ def _declared_extras_for(root: Path, lock: Path, roots: Sequence[Path]) -> set[s
             }
     if out:
         return out
-    return _declared_blastbox_extras(root) if len(roots) == 1 else set()
+    return _declared_blastbox_extras(root) if n_sets == 1 else set()
 
 
 def _shell_tokens(text: str) -> list[str]:
@@ -1767,9 +1837,15 @@ def _constraint_args(text: str) -> list[str]:
 
 
 def _referenced_in(line: str, base: Path, root: Path) -> list[Path]:
-    """Requirement files named by ONE command."""
+    """Requirement files named by ONE command SEGMENT.
+
+    The caller has already isolated the segment (`_install_segments`), so no
+    filtering happens here: splitting again would be the difference between
+    `pip install -r a.lock && pip install -r b.lock` being two resolutions and
+    one.
+    """
     out: list[Path] = []
-    for name in [n for seg in _install_segments(line) for n in _requirement_args(seg)]:
+    for name in _requirement_args(line):
         for candidate in (base, root):
             target = _safe_include(candidate / name, root)
             if target is not None:
