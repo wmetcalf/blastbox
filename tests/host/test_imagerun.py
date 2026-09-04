@@ -8,6 +8,7 @@ is where all of those failures lived — rather than about docker.
 from __future__ import annotations
 
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -148,7 +149,8 @@ def _repo(tmp_path: Path, spec: str = SPEC) -> Path:
     # The extra ARGs are declared because some specs below pass them; docker
     # would silently discard an undeclared one, and arg_problems refuses first.
     (d / "deploy" / "docker" / "Dockerfile.base").write_text(
-        "ARG BASE_IMAGE\nARG JDK_BUILD_IMAGE\nARG BLASTBOX_VERSION\nFROM ${BASE_IMAGE}\n"
+        "ARG BASE_IMAGE\nARG JDK_BUILD_IMAGE\nARG BLASTBOX_VERSION\n"
+        "ARG REGISTRY_TOKEN\nFROM ${BASE_IMAGE}\n"
     )
     (d / "deploy" / "docker" / "Dockerfile.worker").write_text(
         "ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\n"
@@ -1882,3 +1884,96 @@ def test_a_protected_destination_refuses_before_creating_anything(
         assert not list(protected.iterdir()), "something was created before the refusal"
     finally:
         protected.chmod(0o755)
+
+
+def test_a_planted_fifo_does_not_hang_publication(tmp_path: Path) -> None:
+    """`O_NOFOLLOW` does not cover FIFOs.
+
+    A local user can plant one at the predictable lock path, and opening an
+    existing FIFO `O_RDONLY` blocks until a writer appears — so execution never
+    reaches the regular-file check and every publication for that destination
+    hangs forever. `O_NONBLOCK` is what prevents it.
+    """
+    import hashlib
+
+    import blastbox.host.imagerun as mod
+
+    dest = tmp_path / "fc" / "fifo-target.ext4"
+    canonical = Path(os.path.realpath(dest.parent)) / dest.name
+    key = hashlib.sha256(str(canonical).encode()).hexdigest()[:16]
+    lock = Path(tempfile.gettempdir()) / f"blastbox-publish-{key}.lock"
+    lock.unlink(missing_ok=True)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    os.mkfifo(lock)
+
+    # Bounded, so losing the guard FAILS rather than hangs. Without O_NONBLOCK
+    # this open blocks forever waiting for a writer, and an unbounded test
+    # would wedge the suite instead of reporting the regression.
+    class _Blocked(BaseException):
+        """Deliberately NOT an OSError.
+
+        `TimeoutError` subclasses `OSError`, so `pytest.raises((OSError, ...))`
+        below swallowed the alarm and the test passed with the guard removed --
+        the exact failure mode this test exists to catch, reproduced inside it.
+        """
+
+    def _too_slow(_signum, _frame):
+        raise _Blocked("opening the lock blocked: O_NONBLOCK is missing")
+
+    old = signal.signal(signal.SIGALRM, _too_slow)
+    signal.alarm(5)
+    try:
+        with pytest.raises((OSError, BuildError)):
+            with mod._destination_lock(dest):
+                pass
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+        lock.unlink(missing_ok=True)
+
+
+def test_two_spellings_of_one_destination_share_a_lock(tmp_path: Path) -> None:
+    """Different spellings would take different locks and concurrently replace
+    the same artifact — the lock would exist and serialise nothing."""
+    import hashlib
+
+    import blastbox.host.imagerun as mod
+
+    real = tmp_path / "real"
+    real.mkdir()
+    (tmp_path / "link").symlink_to(real)
+    a = real / "rootfs.ext4"
+    b = tmp_path / "link" / "rootfs.ext4"
+
+    def key_of(d: Path) -> str:
+        canonical = Path(os.path.realpath(d.parent)) / d.name
+        return hashlib.sha256(str(canonical).encode()).hexdigest()[:16]
+
+    assert key_of(a) == key_of(b), "one artifact, two lock keys"
+    # and the lock actually taken uses that key
+    with mod._destination_lock(b):
+        lock = Path(tempfile.gettempdir()) / f"blastbox-publish-{key_of(a)}.lock"
+        assert lock.exists(), "the lock was taken under a different key"
+    lock.unlink(missing_ok=True)
+
+
+def test_a_build_failure_does_not_print_the_secret(tmp_path: Path, monkeypatch) -> None:
+    """describe() redacting is not enough: a real build passes the EXPANDED
+    value in argv, and this failure message is printed by the CLI — so any
+    routine docker failure leaked the token right after a description that
+    showed it redacted."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
+    monkeypatch.setenv("TOK", "hunter2-super-secret")
+    text = SPEC.replace(
+        'base = "upstream:1"',
+        'base = "upstream:1"\nbuild_args = { REGISTRY_TOKEN = "$TOK" }',
+        1,
+    )
+    run = FakeRunner(fail="demo-base:t1")
+    with pytest.raises(BuildError) as e:
+        build_plan(_plan(tmp_path, text), "t1", blastbox_version="0.1.37", run=run,
+                   log=lambda _: None)
+    assert "hunter2-super-secret" not in str(e.value), str(e.value)
+    assert "REGISTRY_TOKEN=<redacted>" in str(e.value), str(e.value)

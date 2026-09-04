@@ -166,6 +166,23 @@ def _default_runner(
     )
 
 
+def _redact_argv(argv: Sequence[str]) -> list[str]:
+    """``argv`` with secret --build-arg VALUES masked.
+
+    describe() redacting them is not enough: a real build passes the EXPANDED
+    value here, and this failure message is printed by the CLI -- so any routine
+    docker failure put the token in terminal history and CI logs, right after a
+    description that showed it redacted.
+    """
+    from blastbox.host.images import _is_secret  # noqa: PLC0415
+
+    out: list[str] = []
+    for arg in argv:
+        name, sep, _value = arg.partition("=")
+        out.append(f"{name}=<redacted>" if sep and _is_secret(name) else arg)
+    return out
+
+
 def _must(
     argv: Sequence[str], what: str, run: Runner, *, cwd: Path | None = None
 ) -> subprocess.CompletedProcess[str]:
@@ -179,7 +196,10 @@ def _must(
     proc = run(argv, cwd=str(cwd) if cwd else None)
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()
-        raise BuildError(f"{what} failed ({' '.join(argv)}){': ' + detail if detail else ''}")
+        raise BuildError(
+            f"{what} failed ({' '.join(_redact_argv(argv))})"
+            f"{': ' + detail if detail else ''}"
+        )
     return proc
 
 
@@ -526,7 +546,14 @@ def _destination_lock(dest: Path) -> Iterator[None]:
     privilege to take a lock would mean the unprivileged path silently skipped
     it. The key is the full path, so two destinations never share a lock.
     """
-    key = hashlib.sha256(str(dest).encode()).hexdigest()[:16]
+    # CANONICAL identity, not the spelling. Two invocations naming one artifact
+    # through a symlinked parent, a `..` component, or relative vs absolute
+    # would otherwise take different locks and concurrently replace the same
+    # destination and .bak -- the lock would exist and serialise nothing.
+    # realpath on the parent, keeping the name: the final component is what we
+    # replace and may itself be a symlink we must not follow.
+    canonical = Path(os.path.realpath(dest.parent)) / dest.name
+    key = hashlib.sha256(str(canonical).encode()).hexdigest()[:16]
     path = Path(tempfile.gettempdir()) / f"blastbox-publish-{key}.lock"
     # O_RDONLY: flock needs a descriptor, not write access. The file PERSISTS,
     # so an operator who runs once as root leaves it 0644 root-owned under the
@@ -537,7 +564,12 @@ def _destination_lock(dest: Path) -> Iterator[None]:
     # world-writable directory: without it an unprivileged user can pre-create
     # it as a symlink to a root-owned file, and a root run would then follow
     # the link and fchmod that file to 0666.
-    fd = os.open(path, os.O_CREAT | os.O_RDONLY | os.O_NOFOLLOW, 0o666)
+    # O_NONBLOCK as well as O_NOFOLLOW: a local user can plant a FIFO rather
+    # than a symlink at this predictable path, and opening an existing FIFO
+    # O_RDONLY blocks until a writer appears -- so execution never reaches the
+    # regular-file check below and every publication for this destination hangs
+    # forever. O_NOFOLLOW does not cover that.
+    fd = os.open(path, os.O_CREAT | os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, 0o666)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
