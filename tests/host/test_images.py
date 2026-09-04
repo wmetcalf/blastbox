@@ -463,3 +463,82 @@ def test_the_dry_run_shows_an_external_context(tmp_path: Path) -> None:
     plan = load_plan(_plan(tmp_path, text))
     out = describe(plan, "t9", {"OTHER": "/srv/bb", "TITANARUM_FC_DIR": "/f"})
     assert "[context /srv/bb]" in out
+
+
+def test_an_unknown_image_key_is_refused(tmp_path: Path) -> None:
+    """A misspelled optional field is otherwise ignored in silence, and the pin
+    it was meant to express never happens."""
+    text = TITANARUM.replace("build_args = {", "base_args = {", 1)
+    with pytest.raises(PlanError) as e:
+        load_plan(_plan(tmp_path, text))
+    assert "unknown key" in str(e.value) and "base_args" in str(e.value)
+
+
+def test_an_unknown_rootfs_key_is_refused(tmp_path: Path) -> None:
+    text = TITANARUM.replace("size_mib = 3072", "size_mib = 3072\nsizemib = 1")
+    with pytest.raises(PlanError) as e:
+        load_plan(_plan(tmp_path, text))
+    assert "unknown key" in str(e.value)
+
+
+def test_a_single_rootfs_table_is_refused(tmp_path: Path) -> None:
+    text = TITANARUM.replace("[[rootfs]]", "[rootfs]")
+    with pytest.raises(PlanError) as e:
+        load_plan(_plan(tmp_path, text))
+    assert "ARRAY of tables" in str(e.value)
+
+
+def test_a_boolean_size_is_refused(tmp_path: Path) -> None:
+    """bool is a subclass of int, so `true` would quietly become 1 MiB."""
+    text = TITANARUM.replace("size_mib = 3072", "size_mib = true")
+    with pytest.raises(PlanError) as e:
+        load_plan(_plan(tmp_path, text))
+    assert "boolean" in str(e.value)
+
+
+@pytest.mark.parametrize("bad", ["b:", "UPPER:1", "a b", ":tag"])
+def test_an_unusable_base_reference_is_refused(tmp_path: Path, bad: str) -> None:
+    text = TITANARUM.replace('base = "eclipse-temurin:25-jre"', f'base = "{bad}"', 1)
+    with pytest.raises(PlanError) as e:
+        load_plan(_plan(tmp_path, text))
+    assert "usable reference" in str(e.value) or "no usable name" in str(e.value)
+
+
+@pytest.mark.parametrize(
+    "ok",
+    [
+        "eclipse-temurin:25-jre",
+        "python:3.12-slim-bookworm",
+        "ghcr.io/tecnativa/docker-socket-proxy:0.3.0",
+        "registry.example:5000/team/img:tag",
+        "base@sha256:" + "a" * 64,
+    ],
+)
+def test_real_upstream_references_are_accepted(tmp_path: Path, ok: str) -> None:
+    """These are references this fleet actually uses."""
+    text = TITANARUM.replace('base = "eclipse-temurin:25-jre"', f'base = "{ok}"', 1)
+    assert load_plan(_plan(tmp_path, text)).images[0].base == ok
+
+
+def test_a_lowercase_arg_keyword_is_recognised(tmp_path: Path) -> None:
+    """Dockerfile instruction keywords are case-insensitive.
+
+    The same trap already fixed once in stamp.py: `arg BASE_IMAGE` is valid and
+    reporting it as undeclared would refuse a Dockerfile docker builds fine.
+    """
+    from blastbox.host.images import arg_problems
+
+    d = tmp_path / "deploy" / "docker"
+    d.mkdir(parents=True)
+    (d / "Dockerfile.titanarum-base").write_text(
+        "arg BASE_IMAGE\narg JDK_BUILD_IMAGE\narg ZXING_BUILD_IMAGE\nfrom ${BASE_IMAGE}\n"
+    )
+    plan = load_plan(_plan(tmp_path, TITANARUM))
+    assert [p for p in arg_problems(plan, {}) if "titanarum-base" in p] == []
+
+
+def test_the_dry_run_shows_declared_build_args(tmp_path: Path) -> None:
+    """They are pins; an operator reading the plan should see them."""
+    plan = load_plan(_plan(tmp_path, TITANARUM))
+    out = describe(plan, "t9", {"TITANARUM_FC_DIR": "/f"})
+    assert "--build-arg JDK_BUILD_IMAGE=eclipse-temurin:25-jdk" in out

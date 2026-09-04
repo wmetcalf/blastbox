@@ -73,6 +73,15 @@ ROOTFS_KINDS = frozenset({"dir", "ext4"})
 # still refused, because accepting them just moves the failure to `docker tag`.
 _NAME_RE = re.compile(r"^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*$")
 
+# An upstream reference: repo[:tag][@digest], optionally registry/namespace.
+_REF_RE = re.compile(
+    r"^[a-z0-9]+(?:[._-][a-z0-9]+)*"
+    r"(?::[0-9]+)?"                       # registry port
+    r"(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*"
+    r"(?::[A-Za-z0-9_][A-Za-z0-9._-]*)?"
+    r"(?:@sha256:[0-9a-f]{64})?$"
+)
+
 # A tag names one build. A colon or slash would make `name:tag` parse as
 # something else entirely.
 _TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$")
@@ -213,9 +222,20 @@ def load_plan(root: Path | str) -> Plan:
     if not raw_images:
         raise PlanError(f"{path}: declares no [[image]]; there is nothing to build")
 
+    known_image_keys = {"name", "dockerfile", "base", "base_arg", "context", "build_args"}
+    known_rootfs_keys = {"kind", "image", "dest", "size_mib", "requires"}
+
     seen: dict[str, ImageSpec] = {}
     images: list[ImageSpec] = []
     for i, item in enumerate(raw_images):
+        unknown = sorted(set(item) - known_image_keys)
+        if unknown:
+            # A misspelled optional field (`base_args`) is otherwise ignored in
+            # silence, and the pin it was meant to express never happens.
+            raise PlanError(
+                f"{path}: [[image]] #{i + 1} has unknown key(s) {unknown}; "
+                f"expected any of {sorted(known_image_keys)}"
+            )
         name = str(item.get("name") or "").strip()
         if not _NAME_RE.match(name):
             raise PlanError(f"{path}: [[image]] #{i + 1} has no usable name ({name!r})")
@@ -235,6 +255,11 @@ def load_plan(root: Path | str) -> Plan:
             raise PlanError(
                 f"{path}: image {name!r} build_args must be a table of "
                 f"NAME = \"value\" pairs, got {type(raw_args).__name__}"
+            )
+        if base not in seen and not _REF_RE.match(base):
+            raise PlanError(
+                f"{path}: image {name!r} has base {base!r}, which is neither an "
+                "image in this plan nor a usable reference"
             )
         args = {}
         for k, v in raw_args.items():
@@ -274,8 +299,25 @@ def load_plan(root: Path | str) -> Plan:
         seen[name] = spec
         images.append(spec)
 
+    raw_rootfs = data.get("rootfs") or []
+    if isinstance(raw_rootfs, dict):
+        raise PlanError(
+            f"{path}: [rootfs] must be an ARRAY of tables -- write [[rootfs]], "
+            "once per artifact."
+        )
+    if not isinstance(raw_rootfs, list) or any(
+        not isinstance(x, dict) for x in raw_rootfs
+    ):
+        raise PlanError(f"{path}: [[rootfs]] entries must be tables")
+
     rootfs: list[RootfsSpec] = []
-    for i, item in enumerate(data.get("rootfs") or []):
+    for i, item in enumerate(raw_rootfs):
+        unknown = sorted(set(item) - known_rootfs_keys)
+        if unknown:
+            raise PlanError(
+                f"{path}: [[rootfs]] #{i + 1} has unknown key(s) {unknown}; "
+                f"expected any of {sorted(known_rootfs_keys)}"
+            )
         kind = str(item.get("kind") or "").strip()
         if kind not in ROOTFS_KINDS:
             raise PlanError(
@@ -293,6 +335,12 @@ def load_plan(root: Path | str) -> Plan:
         if not dest:
             raise PlanError(f"{path}: [[rootfs]] #{i + 1} declares no dest")
         size = item.get("size_mib")
+        if isinstance(size, bool):
+            # bool is a subclass of int, so `size_mib = true` would become 1 MiB.
+            raise PlanError(
+                f"{path}: [[rootfs]] #{i + 1} size_mib is a boolean; it must be "
+                "a whole number of MiB"
+            )
         if size is not None:
             if isinstance(size, float) and not size.is_integer():
                 raise PlanError(
@@ -448,7 +496,7 @@ def arg_problems(plan: Plan, env: dict[str, str] | None = None) -> list[str]:
         # silent failure as a wrong base_arg, one level down.
         declared = set(
             re.findall(
-                r"^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)",
+                r"(?i)^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)",
                 path.read_text(encoding="utf-8"),
                 re.MULTILINE,
             )
@@ -509,6 +557,10 @@ def describe(plan: Plan, tag: str, env: dict[str, str] | None = None) -> str:
         kind = "chain" if spec.internal else "upstream"
         ctx = _expand(spec.context, env)
         where = "" if ctx == "." else f" [context {ctx}]"
+        if spec.build_args:
+            where += " " + " ".join(
+                f"--build-arg {k}={v}" for k, v in sorted(spec.build_args.items())
+            )
         lines.append(
             f"  build {spec.tagged(tag)}  <- {base_ref} ({kind}) "
             f"via {spec.dockerfile} --base-arg {spec.base_arg}{where}"

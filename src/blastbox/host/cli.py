@@ -1067,7 +1067,10 @@ def build_parser() -> argparse.ArgumentParser:
     bip.add_argument("--tag", required=True, help="tag to build the whole chain under")
     bip.add_argument(
         "--dry-run", action="store_true",
-        help="print what would be built and exported, and touch nothing",
+        help="REQUIRED for now: print what would be built and exported, and "
+             "touch nothing. Execution is not implemented, so requiring the "
+             "flag today means omitting it will mean 'really build' the day it "
+             "is -- rather than silently changing what an existing command does.",
     )
     bip.set_defaults(func=_build_images_cmd)
 
@@ -1162,6 +1165,10 @@ def _build_images_cmd(args: argparse.Namespace) -> int:
             print(f"  {p_}")
         return 2
 
+    if not args.dry_run:
+        print("execution is not implemented yet; pass --dry-run to see the plan.")
+        return 2
+
     unresolved = unresolved_destinations(plan)
     if unresolved:
         print(f"{len(unresolved)} export destination(s) contain an unset variable:")
@@ -1172,8 +1179,9 @@ def _build_images_cmd(args: argparse.Namespace) -> int:
 
     print(describe(plan, args.tag))
     print()
-    print("execution is not wired yet -- run the engine's build script. The plan")
-    print("above is what it must do, and this command checks that it CAN.")
+    print("checked: every Dockerfile exists, every declared ARG is honoured by")
+    print("it, and every destination resolves. Run the engine's build script to")
+    print("execute; this plan is what it must do.")
     return 0
 
 
