@@ -76,12 +76,16 @@ _NAME_RE = re.compile(r"^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*$")
 # An upstream reference: repo[:tag][@digest], optionally registry/namespace.
 _COMPONENT = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
 _REF_RE = re.compile(
-    r"^" + _COMPONENT +
+    r"^"
+    + _COMPONENT
+    +
     # A port only counts when a path component FOLLOWS it. Optional, it also
     # matched `ubuntu:<129 digits>` -- consuming an all-numeric tag and slipping
     # past the length bound below, so the dry run called the plan runnable and
     # the build then rejected its own base.
-    r"(?:(?::[0-9]+)?(?:/" + _COMPONENT + r")+)?"
+    r"(?:(?::[0-9]+)?(?:/"
+    + _COMPONENT
+    + r")+)?"
     # The tag is bounded here as it already is for the tags we generate:
     # docker's distribution grammar caps it at 128, so an over-long one made
     # the dry run report a plan the build would then reject on its base.
@@ -186,7 +190,9 @@ class RootfsSpec:
                 f"{raw!r} — not a whole number of MiB"
             ) from exc
         if value <= 0:
-            raise PlanError(f"{self.dest}: size_mib resolves to {value}, which is not positive")
+            raise PlanError(
+                f"{self.dest}: size_mib resolves to {value}, which is not positive"
+            )
         return value
 
     def resolved_dest(self, env: dict[str, str] | None = None) -> str:
@@ -256,7 +262,13 @@ def unresolved_names(text: str, env: dict[str, str], _depth: int = 0) -> list[st
                 i += 1
                 continue
             name, sep, default = text[i + 2 : close].partition(":-")
-            if name.isidentifier() and not env.get(name):
+            if not name.isidentifier():
+                # Balanced, but not something we expand: `${not-a-name}` and
+                # `${A:+fallback}` both land here. `_expand` keeps them verbatim,
+                # so staying silent handed the literal placeholder to docker with
+                # the pre-build validation reporting no problem at all.
+                out.append(text[i : close + 1][:32])
+            elif not env.get(name):
                 if sep and _depth < _EXPAND_DEPTH:
                     out += unresolved_names(default, env, _depth + 1)
                 elif not sep:
@@ -313,8 +325,15 @@ def _expand(text: str, env: dict[str, str], _depth: int = 0) -> str:
             if not name.isidentifier():
                 out.append(text[i : close + 1])
             else:
-                out.append(_resolve(name, default if sep else None, env, _depth,
-                                    literal=text[i : close + 1]))
+                out.append(
+                    _resolve(
+                        name,
+                        default if sep else None,
+                        env,
+                        _depth,
+                        literal=text[i : close + 1],
+                    )
+                )
             i = close + 1
             continue
         m = re.match(r"\$(\w+)", text[i:])
@@ -351,6 +370,7 @@ def _resolve(
             return default
         return _expand(default, env, depth + 1)
     return value if value is not None else literal
+
 
 @dataclass(frozen=True)
 class Plan:
@@ -393,7 +413,9 @@ def load_plan(root: Path | str) -> Plan:
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
-        raise PlanError(f"{path} not found; the engine declares no image chain") from exc
+        raise PlanError(
+            f"{path} not found; the engine declares no image chain"
+        ) from exc
     except UnicodeDecodeError as exc:
         # Neither OSError nor TOMLDecodeError, so it escaped to the CLI as a
         # traceback instead of the normal validation message and exit 2.
@@ -439,7 +461,14 @@ def load_plan(root: Path | str) -> Plan:
         "source_repo",
         "build_args",
     }
-    known_rootfs_keys = {"kind", "image", "dest", "size_mib", "requires", "forbid_setuid"}
+    known_rootfs_keys = {
+        "kind",
+        "image",
+        "dest",
+        "size_mib",
+        "requires",
+        "forbid_setuid",
+    }
 
     seen: dict[str, ImageSpec] = {}
     images: list[ImageSpec] = []
@@ -470,7 +499,7 @@ def load_plan(root: Path | str) -> Plan:
         if not isinstance(raw_args, dict):
             raise PlanError(
                 f"{path}: image {name!r} build_args must be a table of "
-                f"NAME = \"value\" pairs, got {type(raw_args).__name__}"
+                f'NAME = "value" pairs, got {type(raw_args).__name__}'
             )
         if base not in seen and not _REF_RE.match(base):
             raise PlanError(
@@ -499,7 +528,7 @@ def load_plan(root: Path | str) -> Plan:
         # and treating it as upstream means docker tries to pull it from a
         # registry -- failing with "pull access denied" for an image this very
         # plan builds. Refuse and say so.
-        forward = {str(x.get("name") or "").strip() for x in raw_images[i + 1:]}
+        forward = {str(x.get("name") or "").strip() for x in raw_images[i + 1 :]}
         if base in forward:
             raise PlanError(
                 f"{path}: image {name!r} is based on {base!r}, which this plan "
@@ -584,7 +613,9 @@ def load_plan(root: Path | str) -> Plan:
                     f"MiB, got {item.get('size_mib')!r}"
                 ) from exc
             if size <= 0:
-                raise PlanError(f"{path}: [[rootfs]] #{i + 1} size_mib must be positive")
+                raise PlanError(
+                    f"{path}: [[rootfs]] #{i + 1} size_mib must be positive"
+                )
         if kind == "ext4" and size is None:
             raise PlanError(
                 f"{path}: [[rootfs]] #{i + 1} is ext4 but declares no size_mib. "
@@ -602,7 +633,11 @@ def load_plan(root: Path | str) -> Plan:
                 # only statement of it. Repeating the default at the call site
                 # makes the field's own default dead code that nothing can test.
                 **(
-                    {"forbid_setuid": _bool(path, i, "forbid_setuid", item["forbid_setuid"])}
+                    {
+                        "forbid_setuid": _bool(
+                            path, i, "forbid_setuid", item["forbid_setuid"]
+                        )
+                    }
                     if "forbid_setuid" in item
                     else {}
                 ),
@@ -637,11 +672,54 @@ def load_plan(root: Path | str) -> Plan:
 
 # Names whose VALUES must never be printed. Matched on the name because that
 # is what a plan controls: the value is whatever the environment holds.
-_SECRET_RE = re.compile(r"(?i)(secret|token|password|passwd|credential|api[_-]?key|auth)")
+# Substring-matched: these read as credentials wherever they appear, so
+# `MYSECRETVALUE` and `NPM_TOKEN` are both covered.
+_SECRET_RE = re.compile(
+    r"(?i)(secret|token|password|passwd|passphrase|credential|api[_-]?key|auth)"
+)
+# Matched as whole NAME SEGMENTS, never as substrings: `PAT` inside `PATH`,
+# `COMPATIBLE` or `PATCH` is not a credential, and redacting those would make
+# the dry run useless for exactly the arguments an operator needs to read.
+_SECRET_WORDS = frozenset(
+    {"pat", "pass", "key", "keys", "privatekey", "cert", "signature"}
+)
+# `KEY` alone is ambiguous -- `CACHE_KEY` is not a credential -- so it counts
+# only alongside a qualifier that makes it one.
+_KEY_QUALIFIERS = frozenset(
+    {
+        "private",
+        "signing",
+        "api",
+        "ssh",
+        "gpg",
+        "pgp",
+        "deploy",
+        "access",
+        "secret",
+        "encryption",
+        "master",
+        "license",
+    }
+)
 
 
 def _is_secret(name: str) -> bool:
-    return bool(_SECRET_RE.search(name))
+    """Whether a build-arg NAME should have its value withheld from output.
+
+    `describe()` is printed before every dry run AND every real build, so a
+    value that reaches it reaches terminal scrollback and CI logs. Conventional
+    credential names that carried no denylisted substring -- `GITHUB_PAT`,
+    `SSH_PRIVATE_KEY`, `REGISTRY_PASS` -- were printed in full.
+
+    Erring toward redaction: a needlessly hidden value costs one `--dry-run`
+    read of the plan, a printed credential costs a rotation.
+    """
+    if _SECRET_RE.search(name):
+        return True
+    segments = {s for s in re.split(r"[^A-Za-z0-9]+", name.lower()) if s}
+    if segments & (_SECRET_WORDS - {"key", "keys"}):
+        return True
+    return bool(segments & {"key", "keys"} and segments & _KEY_QUALIFIERS)
 
 
 def _arg_value(value: object) -> str:
@@ -722,7 +800,9 @@ def resolve_chain(plan: Plan, tag: str) -> list[tuple[ImageSpec, str]]:
     return out
 
 
-def dockerfile_path(plan: Plan, spec: ImageSpec, env: dict[str, str] | None = None) -> Path:
+def dockerfile_path(
+    plan: Plan, spec: ImageSpec, env: dict[str, str] | None = None
+) -> Path:
     """Where ``spec``'s Dockerfile actually lives.
 
     Relative to its CONTEXT, not the plan root. An engine legitimately builds
@@ -735,7 +815,9 @@ def dockerfile_path(plan: Plan, spec: ImageSpec, env: dict[str, str] | None = No
     return base / spec.dockerfile
 
 
-def source_repo_path(plan: Plan, spec: ImageSpec, env: dict[str, str] | None = None) -> Path:
+def source_repo_path(
+    plan: Plan, spec: ImageSpec, env: dict[str, str] | None = None
+) -> Path:
     """The tree whose revision ``spec``'s stamp should record.
 
     Falls back to the CONTEXT rather than the plan root: an image built from
@@ -744,7 +826,11 @@ def source_repo_path(plan: Plan, spec: ImageSpec, env: dict[str, str] | None = N
     exactly the un-rebuildable state this whole module exists to prevent.
     """
     env = dict(os.environ) if env is None else env
-    raw = _expand(spec.source_repo, env) if spec.source_repo else _expand(spec.context, env)
+    raw = (
+        _expand(spec.source_repo, env)
+        if spec.source_repo
+        else _expand(spec.context, env)
+    )
     return Path(raw) if Path(raw).is_absolute() else plan.root / raw
 
 
@@ -952,14 +1038,27 @@ def describe(plan: Plan, tag: str, env: dict[str, str] | None = None) -> str:
             effective, note = resolved_size, ""
             if resolved_size and rf.size_is_defaulted(env):
                 try:
-                    have = -(-Path(rf.resolved_dest(env)).stat().st_size // (1024 * 1024))
+                    have = -(
+                        -Path(rf.resolved_dest(env)).stat().st_size // (1024 * 1024)
+                    )
                 except OSError:
                     have = 0
                 if have > resolved_size:
-                    effective, note = have, f" (keeping the existing {have}, declared {resolved_size})"
+                    effective, note = (
+                        have,
+                        f" (keeping the existing {have}, declared {resolved_size})",
+                    )
             size = f" {effective} MiB{note}" if effective else ""
         dest = rf.resolved_dest(env)
-        unresolved = " [UNRESOLVED]" if "$" in dest else ""
+        # Asked of the TEMPLATE, exactly as the build arguments above are. A
+        # destination whose expansion legitimately contains a dollar was marked
+        # unresolved here while the real run considered it fine, so the dry run
+        # disagreed with the thing it is supposed to preview.
+        unresolved = (
+            " [UNRESOLVED]"
+            if unresolved_names(rf.dest, env or dict(os.environ))
+            else ""
+        )
         lines.append(
             f"  export {rf.kind}{size} from {rf.image}:{tag} -> {dest}{need}{unresolved}"
         )

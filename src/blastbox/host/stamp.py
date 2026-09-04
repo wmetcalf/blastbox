@@ -19,6 +19,7 @@ tooling can read them:
 ``org.opencontainers.image.base.digest``, ``.base.name``, ``.revision``,
 plus ``org.blastbox.version`` for the framework version, which OCI has no key for.
 """
+
 from __future__ import annotations
 
 import json
@@ -76,7 +77,9 @@ def _run(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(list(argv), capture_output=True, text=True, timeout=60)
     except subprocess.TimeoutExpired as exc:
-        raise StampError(f"{argv[0]} timed out: {' '.join(map(str, argv))[:120]}") from exc
+        raise StampError(
+            f"{argv[0]} timed out: {' '.join(map(str, argv))[:120]}"
+        ) from exc
     except FileNotFoundError as exc:
         if argv and argv[0] == "git":
             raise
@@ -137,8 +140,7 @@ class Stamp:
         # A failure to ASK is not an answer. Callers state "the base is gone"
         # on a False, so an unreachable daemon must raise rather than be
         # reported as absence -- the same rule read() and doctor already follow.
-        proc = run(["docker", "inspect", "--type", "image", ref,
-                    "--format", "{{.Id}}"])
+        proc = run(["docker", "inspect", "--type", "image", ref, "--format", "{{.Id}}"])
         if proc.returncode == 0:
             return True
         stderr = (proc.stderr or "").lower()
@@ -148,7 +150,6 @@ class Stamp:
             f"cannot determine whether {ref} is present: "
             f"{(proc.stderr or '').strip()[:120]}"
         )
-
 
     def base_moved(self, runner: Runner | None = None) -> str:
         """The base reference's CURRENT image ID, when it differs from the record.
@@ -176,7 +177,9 @@ class Stamp:
         if not _DIGEST_RE.match(recorded) or name in (UNKNOWN, ""):
             return ""
         run = runner or _run
-        proc = run(["docker", "inspect", "--type", "image", name, "--format", "{{.Id}}"])
+        proc = run(
+            ["docker", "inspect", "--type", "image", name, "--format", "{{.Id}}"]
+        )
         if proc.returncode != 0:
             stderr = (proc.stderr or "").lower()
             if "no such" in stderr or "not found" in stderr:
@@ -224,13 +227,22 @@ def git_revision(repo: Path | str, runner: Runner | None = None) -> str:
         return recorded or UNKNOWN
     sha = head.stdout.strip()
     try:
+        # `normal` is enough HERE: this only needs the boolean "is the tree
+        # dirty", and an untracked directory already answers it. `_source_state`
+        # in imagerun needs `all`, because it fingerprints WHAT changed.
         # --untracked-files=normal overrides a repo/global
         # status.showUntrackedFiles=no. Untracked files are build inputs -- a
         # COPY picks them up -- so hiding them would stamp a dirty tree clean.
-        dirty = run([
-            "git", "-C", str(repo), "status", "--porcelain",
-            "--untracked-files=normal",
-        ])
+        dirty = run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "status",
+                "--porcelain",
+                "--untracked-files=normal",
+            ]
+        )
     except (FileNotFoundError, OSError):
         # git vanished between the two calls; we cannot claim the tree is clean.
         return f"{sha}{DIRTY_SUFFIX}"
@@ -248,15 +260,19 @@ def git_revision(repo: Path | str, runner: Runner | None = None) -> str:
 # daemon: `docker inspect docker.io/minio/minio:latest` returns `minio/minio@…`.
 # Without normalising, stamping a fully-qualified base raises "1 repo digests and
 # none for 'docker.io/minio/minio'".
-_HUB_PREFIXES = ("docker.io/library/", "index.docker.io/library/",
-                 "docker.io/", "index.docker.io/")
+_HUB_PREFIXES = (
+    "docker.io/library/",
+    "index.docker.io/library/",
+    "docker.io/",
+    "index.docker.io/",
+)
 
 
 def _canonical_repo(repo: str) -> str:
     """Strip Docker Hub's implicit registry/namespace so references compare equal."""
     for prefix in _HUB_PREFIXES:
         if repo.startswith(prefix):
-            return repo[len(prefix):]
+            return repo[len(prefix) :]
     return repo
 
 
@@ -285,7 +301,9 @@ def base_image_id(image: str, runner: Runner | None = None) -> str:
     proc = run(["docker", "inspect", "--type", "image", image, "--format", "{{.Id}}"])
     if proc.returncode == 0 and proc.stdout.strip():
         return proc.stdout.strip()
-    raise StampError(f"{image}: cannot resolve an image ID (absent, or docker unavailable)")
+    raise StampError(
+        f"{image}: cannot resolve an image ID (absent, or docker unavailable)"
+    )
 
 
 def repo_digest_ref(image: str, digests_json: str) -> str:
@@ -336,8 +354,17 @@ def _inspect_base(image: str, runner: Runner | None = None) -> tuple[str, str]:
     stamp pairing one image's digest with another's ID.
     """
     run = runner or _run
-    proc = run(["docker", "inspect", "--type", "image", image,
-                "--format", "{{json .RepoDigests}}\t{{.Id}}"])
+    proc = run(
+        [
+            "docker",
+            "inspect",
+            "--type",
+            "image",
+            image,
+            "--format",
+            "{{json .RepoDigests}}\t{{.Id}}",
+        ]
+    )
     if proc.returncode != 0 or not (proc.stdout or "").strip():
         raise StampError(
             f"{image}: cannot resolve a digest (image absent, or docker "
@@ -347,7 +374,9 @@ def _inspect_base(image: str, runner: Runner | None = None) -> tuple[str, str]:
     raw = proc.stdout.strip().split("\t")
     digests_json, image_id = raw[0], (raw[1].strip() if len(raw) > 1 else "")
     if not image_id:
-        raise StampError(f"{image}: cannot resolve an image ID (absent, or docker unavailable)")
+        raise StampError(
+            f"{image}: cannot resolve an image ID (absent, or docker unavailable)"
+        )
     return _digest_from(image, digests_json), image_id
 
 
@@ -358,8 +387,17 @@ def base_digest(image: str, runner: Runner | None = None) -> str:
     identifier and belongs in its own label.
     """
     run = runner or _run
-    proc = run(["docker", "inspect", "--type", "image", image,
-                "--format", "{{json .RepoDigests}}"])
+    proc = run(
+        [
+            "docker",
+            "inspect",
+            "--type",
+            "image",
+            image,
+            "--format",
+            "{{json .RepoDigests}}",
+        ]
+    )
     if proc.returncode == 0:
         return _digest_from(image, proc.stdout.strip())
     raise StampError(
@@ -489,8 +527,12 @@ def assert_arg_selects_base(dockerfile: Path | str, base_arg: str) -> None:
 
 
 def build_args(
-    *, blastbox_version: str, repo: Path | str, base: str | None = None,
-    base_arg: str = "BASE_IMAGE", dockerfile: Path | str | None = None,
+    *,
+    blastbox_version: str,
+    repo: Path | str,
+    base: str | None = None,
+    base_arg: str = "BASE_IMAGE",
+    dockerfile: Path | str | None = None,
     runner: Runner | None = None,
 ) -> list[str]:
     """`docker build` flags that stamp the image.
@@ -610,7 +652,9 @@ def _require_shell_safe(key: str, value: str) -> None:
         )
 
 
-def verify_contents(image: str, runner: Runner | None = None) -> tuple[bool | None, str]:
+def verify_contents(
+    image: str, runner: Runner | None = None
+) -> tuple[bool | None, str]:
     """Check the recorded blastbox version against what the image ACTUALLY has.
 
     The `org.blastbox.version` label is a self-report: `build_args` writes
@@ -652,8 +696,17 @@ def read(image: str, runner: Runner | None = None) -> Stamp:
     name or a stopped daemon must not read as "this image is unstamped".
     """
     run = runner or _run
-    proc = run(["docker", "inspect", "--type", "image", image,
-                "--format", "{{json .Config.Labels}}"])
+    proc = run(
+        [
+            "docker",
+            "inspect",
+            "--type",
+            "image",
+            image,
+            "--format",
+            "{{json .Config.Labels}}",
+        ]
+    )
     if proc.returncode != 0:
         raise StampError(
             f"{image}: cannot inspect ({(proc.stderr or '').strip()[:120]})"

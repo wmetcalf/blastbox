@@ -123,15 +123,27 @@ def _pin_builder_images(
             # though it were fresh: the inspect below is skipped too.
             pulled = run(["docker", "pull", "-q", value], capture_output=True)
             if pulled.returncode != 0:
-                log(f"   note: could not pull {key}={value} "
-                    f"({(pulled.stderr or '').strip()[:120]}); left as the tag")
+                log(
+                    f"   note: could not pull {key}={value} "
+                    f"({(pulled.stderr or '').strip()[:120]}); left as the tag"
+                )
                 continue
         proc = run(
-            ["docker", "inspect", "--type", "image", value, "--format", "{{json .RepoDigests}}"],
+            [
+                "docker",
+                "inspect",
+                "--type",
+                "image",
+                value,
+                "--format",
+                "{{json .RepoDigests}}",
+            ],
             capture_output=True,
         )
         if proc.returncode != 0:
-            log(f"   note: could not resolve {key}={value} to a digest; left as the tag")
+            log(
+                f"   note: could not resolve {key}={value} to a digest; left as the tag"
+            )
             continue
         # The FULL `repo@sha256:...`, not the bare digest. A bare one handed to
         # docker as a base resolves as `docker.io/library/sha256:...` and fails
@@ -224,8 +236,10 @@ def build_plan(
     # The resolved version is put in the environment the plan expands against,
     # so a spec can write `BLASTBOX_VERSION = "$BLASTBOX_VERSION"` and keep one
     # source of truth instead of a literal that drifts from the pin.
-    env = {**(dict(os.environ) if env is None else env),
-           "BLASTBOX_VERSION": blastbox_version}
+    env = {
+        **(dict(os.environ) if env is None else env),
+        "BLASTBOX_VERSION": blastbox_version,
+    }
 
     problems = (
         _images.missing_dockerfiles(plan, env)
@@ -260,7 +274,9 @@ def build_plan(
             # Refusing here is the point. An unstamped image is one nobody can
             # rebuild, and a stamp naming an ARG the Dockerfile does not declare
             # is worse: docker discards the pin and the label lies.
-            raise BuildError(f"{spec.name}: refusing to build unstamped — {exc}") from exc
+            raise BuildError(
+                f"{spec.name}: refusing to build unstamped — {exc}"
+            ) from exc
 
         # Builder-stage images are pinned too. `JDK_BUILD_IMAGE
         # = "eclipse-temurin:25-jdk"` is a mutable tag that a multi-stage
@@ -325,8 +341,16 @@ def verify_built(
     bad: list[str] = []
     for image in images:
         log(f"-- {image}")
+        # FIRST, before anything is asked of the tag. Every check below used to
+        # re-resolve the mutable tag independently, so a concurrent retag between
+        # them let verification read image A's stamp and export image B. One
+        # resolution, and every question afterwards is asked of that ID.
+        ident = _image_id(image, run or _default_runner)
+        if not ident:
+            bad.append(f"{image}: could not resolve it to an image id")
+            continue
         try:
-            stamp = _read_stamp(image, runner)  # type: ignore[arg-type]
+            stamp = _read_stamp(ident, runner)  # type: ignore[arg-type]
         except Exception as exc:  # noqa: BLE001 - collected per image, not fatal here
             bad.append(f"{image}: {exc}")
             continue
@@ -341,6 +365,21 @@ def verify_built(
         except Exception as exc:  # noqa: BLE001
             bad.append(f"{image}: could not confirm its base did not move ({exc})")
             continue
+        # `base_moved` deliberately answers "" when the recorded base is GONE --
+        # absence is `resolvable`'s question, and nothing here was asking it. A
+        # perfectly stamped image whose base has been deleted cannot be rebuilt
+        # from what it records, which is the original failure this all exists for.
+        try:
+            still_there = stamp.resolvable(runner)  # type: ignore[arg-type]
+        except Exception as exc:  # noqa: BLE001
+            bad.append(f"{image}: could not confirm its base is still present ({exc})")
+            continue
+        if not still_there:
+            bad.append(
+                f"{image}: the base it records ({stamp.base_name}) is no longer "
+                "present on this host — it cannot be rebuilt from what it names"
+            )
+            continue
         if moved:
             bad.append(
                 f"{image}: {stamp.base_name} now resolves to {moved[:19]}…, not the "
@@ -348,18 +387,13 @@ def verify_built(
                 "an image its stamp does not name"
             )
             continue
-        agrees, detail = _verify_contents(image, runner)  # type: ignore[arg-type]
+        agrees, detail = _verify_contents(ident, runner)  # type: ignore[arg-type]
         if agrees is False:
             bad.append(f"{image}: {detail}")
             continue
-        # The ID this tag resolved to WHILE it was being verified. Exporting by
-        # tag reopens the question: another build can retag between here and
-        # `docker create`, and the rootfs would then come from an image nothing
-        # checked.
-        ident = _image_id(image, run or _default_runner)
-        if not ident:
-            bad.append(f"{image}: could not resolve it to an image id")
-            continue
+        # The ID every check above was asked of. Callers export THIS, not the
+        # tag: another build can retag between here and `docker create`, and the
+        # rootfs would then come from an image nothing checked.
         resolved[image] = ident
     if bad:
         raise BuildError(
@@ -387,7 +421,9 @@ def _stage_dir(parent: Path, priv: list[str], run: Runner) -> Path:
     """
     if not priv:
         return Path(tempfile.mkdtemp(prefix="bb-rootfs-", dir=str(parent)))
-    proc = run([*priv, "mktemp", "-d", str(parent / "bb-rootfs-XXXXXXXX")], capture_output=True)
+    proc = run(
+        [*priv, "mktemp", "-d", str(parent / "bb-rootfs-XXXXXXXX")], capture_output=True
+    )
     if proc.returncode != 0:
         raise BuildError(
             f"could not create a staging directory in {parent}: "
@@ -432,15 +468,24 @@ def _source_state(repo: Path) -> str:
     """
     head = subprocess.run(  # noqa: S603
         ["git", "-C", str(repo), "rev-parse", "HEAD"],
-        capture_output=True, text=True, check=False,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     status = subprocess.run(  # noqa: S603
-        # --untracked-files=normal explicitly, exactly as stamp.git_revision
-        # does: a repo or global config carrying status.showUntrackedFiles=no
+        # --untracked-files=all explicitly. `stamp.git_revision` forces
+        # `normal` for the same reason -- a repo or global config carrying
+        # status.showUntrackedFiles=no
         # otherwise hides a new build input created while docker was reading
         # the context, and the before/after comparison sees no change at all.
-        ["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=normal"],
-        capture_output=True, text=True, check=False,
+        # `all`, not `normal`: normal lists an untracked DIRECTORY as one entry,
+        # so adding or removing a file inside an already-untracked `generated/`
+        # leaves both snapshots reading `?? generated/` and a changing context
+        # passes the check unchanged.
+        ["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=all"],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     if head.returncode != 0:
         return ""  # not a git tree; `git_revision` handles that case separately
@@ -470,7 +515,9 @@ def _why_unusable(stamp: object) -> str:
     revision = str(getattr(stamp, "revision", "") or "")
     base_name = str(getattr(stamp, "base_name", "") or "")
     blastbox = str(getattr(stamp, "blastbox", "") or "")
-    pin = str(getattr(stamp, "base_digest", "") or getattr(stamp, "base_image_id", "") or "")
+    pin = str(
+        getattr(stamp, "base_digest", "") or getattr(stamp, "base_image_id", "") or ""
+    )
     if revision.endswith("-dirty"):
         return (
             f"built from a DIRTY tree ({revision}). The uncommitted changes are "
@@ -502,7 +549,9 @@ def _remove_tree(path: Path, priv: list[str], run: Runner) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
-def _extract_image(image: str, dest: Path, run: Runner, log: Log, *, as_root: bool) -> None:
+def _extract_image(
+    image: str, dest: Path, run: Runner, log: Log, *, as_root: bool
+) -> None:
     """Extract ``image``'s filesystem into an EMPTY ``dest``.
 
     A container is created and removed rather than ``docker save``: export gives
@@ -614,8 +663,10 @@ def _restore_backup(staged: _Staged, run: Runner, log: Log) -> None:
     if not _exists(bak, priv, run):
         # Removing the live artifact with nothing to put back is worse than
         # leaving the new one in place. Say what happened instead.
-        log(f"   CANNOT roll back {dest}: no restorable copy at {bak}; "
-            "the new artifact is still live")
+        log(
+            f"   CANNOT roll back {dest}: no restorable copy at {bak}; "
+            "the new artifact is still live"
+        )
         return
     if _exchange(bak, dest, priv, run):
         run([*priv, "rm", "-rf", str(bak)], capture_output=True)
@@ -654,7 +705,9 @@ def _exchange(a: Path, b: Path, priv: list[str], run: Runner) -> bool:
         " sys.argv[2].encode(), RENAME_EXCHANGE);"
         "sys.exit(0 if r == 0 else 1)"
     )
-    proc = run([*priv, sys.executable, "-c", script, str(a), str(b)], capture_output=True)
+    proc = run(
+        [*priv, sys.executable, "-c", script, str(a), str(b)], capture_output=True
+    )
     return proc.returncode == 0
 
 
@@ -992,7 +1045,9 @@ def stage_rootfs(
                 # its rootfs kept it across rebuilds without anyone
                 # remembering. Taking the literal instead makes every such
                 # rebuild fail the shrink guard -- correct, and useless.
-                log(f"   keeping the existing {existing} MiB (declared {declared}, no override)")
+                log(
+                    f"   keeping the existing {existing} MiB (declared {declared}, no override)"
+                )
                 size = existing
             else:
                 size = declared
@@ -1021,12 +1076,19 @@ def stage_rootfs(
             run([*priv, "rm", "-f", str(staged_ready)], capture_output=True)
         raise
     return _Staged(
-        spec=spec, image=image, dest=dest, priv=priv, staging=staging, ready=ready,
+        spec=spec,
+        image=image,
+        dest=dest,
+        priv=priv,
+        staging=staging,
+        ready=ready,
         size_mib=staged_size,
     )
 
 
-def publish_staged(staged: _Staged, *, run: Runner | None = None, log: Log = _log) -> Path:
+def publish_staged(
+    staged: _Staged, *, run: Runner | None = None, log: Log = _log
+) -> Path:
     """Swap a staged artifact into place, keeping the previous one as ``.bak``.
 
     Extract, CHECK, then swap -- and the swap is a rename within one filesystem,
@@ -1063,7 +1125,9 @@ def _publish_locked(
                 # best-effort: failing now and letting the caller roll back
                 # would undo a publication that already succeeded, so the
                 # inability to save a backup is reported, not raised.
-                keep = run([*priv, "mv", str(staged.ready), f"{dest}.bak"], capture_output=True)
+                keep = run(
+                    [*priv, "mv", str(staged.ready), f"{dest}.bak"], capture_output=True
+                )
                 if keep.returncode == 0:
                     staged.restore_from = Path(f"{dest}.bak")
                 else:
@@ -1072,15 +1136,21 @@ def _publish_locked(
                     # rollback that works and one that deletes the live
                     # artifact and finds nothing to put back.
                     staged.restore_from = staged.ready
-                    log(f"   published, but could not keep a backup of {dest}: "
+                    log(
+                        f"   published, but could not keep a backup of {dest}: "
                         f"{(keep.stderr or '').strip()}; the previous tree is at "
-                        f"{staged.ready}")
+                        f"{staged.ready}"
+                    )
             else:
-                log("   note: atomic exchange unavailable; the live path is "
-                    "briefly absent during this swap")
+                log(
+                    "   note: atomic exchange unavailable; the live path is "
+                    "briefly absent during this swap"
+                )
                 _must([*priv, "mv", str(dest), f"{dest}.bak"], "keep .bak", run)
                 staged.restore_from = Path(f"{dest}.bak")
-                _must([*priv, "mv", str(staged.ready), str(dest)], "publish rootfs", run)
+                _must(
+                    [*priv, "mv", str(staged.ready), str(dest)], "publish rootfs", run
+                )
         else:
             _must([*priv, "mv", str(staged.ready), str(dest)], "publish rootfs", run)
     else:
@@ -1167,7 +1237,9 @@ def run_plan(
     built it, which is precisely the state the whole module exists to make
     impossible.
     """
-    built = build_plan(plan, tag, blastbox_version=blastbox_version, env=env, run=run, log=log)
+    built = build_plan(
+        plan, tag, blastbox_version=blastbox_version, env=env, run=run, log=log
+    )
     log("\n>> verify: every image must record what it was built from")
     verified = verify_built(built, run=run, log=log)
     # Staged FIRST, all of them, then published. Publishing each as it is built
@@ -1181,7 +1253,13 @@ def run_plan(
             log(f"\n>> stage {spec.kind} rootfs <- {spec.image}:{tag}")
             staged.append(
                 stage_rootfs(
-                    plan, spec, tag, env=env, run=run, log=log, extract=extract,
+                    plan,
+                    spec,
+                    tag,
+                    env=env,
+                    run=run,
+                    log=log,
+                    extract=extract,
                     verified_id=verified.get(f"{spec.image}:{tag}", ""),
                 )
             )

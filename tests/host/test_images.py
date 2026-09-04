@@ -3,11 +3,13 @@
 Every failure encoded here happened for real while porting three engines'
 hand-written build scripts.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
+
 
 def _sized(path: Path, nbytes: int) -> Path:
     """A SPARSE file of exactly ``nbytes``.
@@ -21,15 +23,18 @@ def _sized(path: Path, nbytes: int) -> Path:
         fh.truncate(nbytes)
     return path
 
+
 from blastbox.host.images import (
     SPEC_NAME,
     Plan,
     PlanError,
+    _is_secret,
     build_command,
     describe,
     load_plan,
     missing_dockerfiles,
     resolve_chain,
+    unresolved_names,
 )
 
 TITANARUM = """
@@ -70,7 +75,9 @@ def test_a_real_chain_parses_in_declaration_order(tmp_path: Path) -> None:
     plan = load_plan(_plan(tmp_path, TITANARUM))
     assert plan.engine == "titanarum"
     assert [i.name for i in plan.images] == [
-        "titanarum-base", "titanarum-cold-worker", "titanarum-fc-worker",
+        "titanarum-base",
+        "titanarum-cold-worker",
+        "titanarum-fc-worker",
     ]
 
 
@@ -100,7 +107,9 @@ def test_a_forward_reference_is_refused(tmp_path: Path) -> None:
     builds, failing with "pull access denied" -- a message that sends you
     looking at registry credentials.
     """
-    text = TITANARUM.replace('base = "titanarum-base"\n', 'base = "titanarum-fc-worker"\n', 1)
+    text = TITANARUM.replace(
+        'base = "titanarum-base"\n', 'base = "titanarum-fc-worker"\n', 1
+    )
     with pytest.raises(PlanError) as e:
         load_plan(_plan(tmp_path, text))
     assert "declares LATER" in str(e.value)
@@ -114,16 +123,22 @@ def test_an_image_with_no_base_is_refused(tmp_path: Path) -> None:
 
 
 def test_duplicate_image_names_are_refused(tmp_path: Path) -> None:
-    text = TITANARUM.replace('name = "titanarum-cold-worker"', 'name = "titanarum-base"', 1)
+    text = TITANARUM.replace(
+        'name = "titanarum-cold-worker"', 'name = "titanarum-base"', 1
+    )
     with pytest.raises(PlanError) as e:
         load_plan(_plan(tmp_path, text))
     assert "two images are named" in str(e.value)
 
 
-def test_a_rootfs_from_an_image_the_chain_never_builds_is_refused(tmp_path: Path) -> None:
+def test_a_rootfs_from_an_image_the_chain_never_builds_is_refused(
+    tmp_path: Path,
+) -> None:
     """Exporting something the chain does not produce is how a rootfs gets made
     from an image nobody verified."""
-    text = TITANARUM.replace('image = "titanarum-fc-worker"\ndest', 'image = "somewhere-else"\ndest')
+    text = TITANARUM.replace(
+        'image = "titanarum-fc-worker"\ndest', 'image = "somewhere-else"\ndest'
+    )
     with pytest.raises(PlanError) as e:
         load_plan(_plan(tmp_path, text))
     assert "never builds" in str(e.value)
@@ -153,16 +168,16 @@ def test_missing_dockerfiles_are_reported_before_any_build(tmp_path: Path) -> No
     plan = load_plan(_plan(tmp_path, TITANARUM))
     assert len(missing_dockerfiles(plan)) == 3
     (tmp_path / "deploy" / "docker").mkdir(parents=True)
-    (tmp_path / "deploy" / "docker" / "Dockerfile.titanarum-base").write_text("FROM x\n")
+    (tmp_path / "deploy" / "docker" / "Dockerfile.titanarum-base").write_text(
+        "FROM x\n"
+    )
     assert len(missing_dockerfiles(plan)) == 2
 
 
 def test_the_build_command_is_argv_not_a_string(tmp_path: Path) -> None:
     """A label value with a space would word-split into loose docker arguments."""
     plan = load_plan(_plan(tmp_path, TITANARUM))
-    argv = build_command(
-        plan.image("titanarum-base"), "t9", ["--label", "org.x=a b c"]
-    )
+    argv = build_command(plan.image("titanarum-base"), "t9", ["--label", "org.x=a b c"])
     assert isinstance(argv, list)
     assert "--label" in argv and "org.x=a b c" in argv
     assert argv[-2:] == ["-t", "titanarum-base:t9"][-1:] + ["."]
@@ -181,7 +196,10 @@ def test_the_rootfs_destination_expands_host_variables(tmp_path: Path) -> None:
     """Destinations are per-host, so they are declared as variables."""
     plan = load_plan(_plan(tmp_path, TITANARUM))
     rf = plan.rootfs[0]
-    assert rf.resolved_dest({"TITANARUM_FC_DIR": "/srv/fc"}) == "/srv/fc/titanarum-rootfs.ext4"
+    assert (
+        rf.resolved_dest({"TITANARUM_FC_DIR": "/srv/fc"})
+        == "/srv/fc/titanarum-rootfs.ext4"
+    )
 
 
 def test_an_unset_variable_is_left_visible_rather_than_emptied(tmp_path: Path) -> None:
@@ -220,7 +238,9 @@ def test_a_destination_default_is_honoured(tmp_path: Path) -> None:
     plan = load_plan(_plan(tmp_path, text))
     rf = plan.rootfs[0]
     assert rf.resolved_dest({}) == "/var/lib/titan-fc/titanarum-rootfs.ext4"
-    assert rf.resolved_dest({"TITANARUM_FC_DIR": "/srv"}) == "/srv/titanarum-rootfs.ext4"
+    assert (
+        rf.resolved_dest({"TITANARUM_FC_DIR": "/srv"}) == "/srv/titanarum-rootfs.ext4"
+    )
 
 
 def test_a_dockerfile_in_another_context_is_found_there(tmp_path: Path) -> None:
@@ -233,7 +253,7 @@ def test_a_dockerfile_in_another_context_is_found_there(tmp_path: Path) -> None:
     other = tmp_path / "elsewhere" / "deploy" / "gvisor"
     other.mkdir(parents=True)
     (other / "Dockerfile.x").write_text("ARG BASE\nFROM ${BASE}\n")
-    text = '''
+    text = """
 [engine]
 name = "e"
 
@@ -243,7 +263,7 @@ dockerfile = "deploy/gvisor/Dockerfile.x"
 base = "upstream:1"
 base_arg = "BASE"
 context = "$OTHER_SRC"
-'''
+"""
     plan = load_plan(_plan(tmp_path, text))
     env = {"OTHER_SRC": str(tmp_path / "elsewhere")}
     assert missing_dockerfiles(plan, env) == []
@@ -286,16 +306,21 @@ def test_a_nonsense_rootfs_size_is_a_plan_error(tmp_path: Path) -> None:
 def test_the_build_command_passes_the_base_it_claims_to_pin(tmp_path: Path) -> None:
     """Otherwise the plan says pinned and the Dockerfile uses its own default."""
     plan = load_plan(_plan(tmp_path, TITANARUM))
-    argv = build_command(plan.image("titanarum-cold-worker"), "t9", [], "titanarum-base:t9")
+    argv = build_command(
+        plan.image("titanarum-cold-worker"), "t9", [], "titanarum-base:t9"
+    )
     assert "--build-arg" in argv
     assert "BASE_IMAGE=titanarum-base:t9" in argv
 
 
-def test_the_base_is_not_passed_twice_when_stamp_already_carries_it(tmp_path: Path) -> None:
+def test_the_base_is_not_passed_twice_when_stamp_already_carries_it(
+    tmp_path: Path,
+) -> None:
     """`blastbox stamp` emits that build-arg itself; two copies can disagree."""
     plan = load_plan(_plan(tmp_path, TITANARUM))
     argv = build_command(
-        plan.image("titanarum-cold-worker"), "t9",
+        plan.image("titanarum-cold-worker"),
+        "t9",
         ["--build-arg", "BASE_IMAGE=titanarum-base@sha256:" + "a" * 64],
         "titanarum-base:t9",
     )
@@ -316,7 +341,9 @@ def test_the_build_context_is_expanded(tmp_path: Path) -> None:
     assert argv[-1] == "/srv/bb"
 
 
-def test_the_default_form_works_without_an_explicit_env(tmp_path: Path, monkeypatch) -> None:
+def test_the_default_form_works_without_an_explicit_env(
+    tmp_path: Path, monkeypatch
+) -> None:
     """`os.path.expandvars` does not understand `${VAR:-default}`.
 
     Falling back to it made default handling depend on whether the caller
@@ -334,7 +361,9 @@ def test_the_default_form_works_without_an_explicit_env(tmp_path: Path, monkeypa
     assert plan.rootfs[0].resolved_dest() == "/srv/fc/titanarum-rootfs.ext4"
 
 
-@pytest.mark.parametrize("bad", ["worker-", "worker.", "worker..base", "-worker", "worker!x"])
+@pytest.mark.parametrize(
+    "bad", ["worker-", "worker.", "worker..base", "-worker", "worker!x"]
+)
 def test_invalid_repository_names_are_refused(tmp_path: Path, bad: str) -> None:
     """Separators sit BETWEEN alphanumerics; accepting these moves the failure
     to `docker tag`, which is the wrong place to find out."""
@@ -371,7 +400,7 @@ def test_a_build_arg_may_not_override_the_pinned_base(tmp_path: Path) -> None:
 def test_malformed_build_args_are_a_plan_error(tmp_path: Path) -> None:
     text = TITANARUM.replace(
         'build_args = { JDK_BUILD_IMAGE = "eclipse-temurin:25-jdk", ZXING_BUILD_IMAGE = "debian:12-slim" }',
-        'build_args = { NESTED = { a = 1 } }',
+        "build_args = { NESTED = { a = 1 } }",
     )
     with pytest.raises(PlanError) as e:
         load_plan(_plan(tmp_path, text))
@@ -561,7 +590,9 @@ def test_the_dry_run_shows_declared_build_args(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("ok", ["my__base:1", "a--b/c--d:tag", "reg.io:5000/a__b:1"])
-def test_repeated_separators_in_a_base_reference_are_accepted(tmp_path: Path, ok: str) -> None:
+def test_repeated_separators_in_a_base_reference_are_accepted(
+    tmp_path: Path, ok: str
+) -> None:
     """Same grammar as image names. My first reference pattern over-rejected
     these, which is the mistake I had already made once on names."""
     text = TITANARUM.replace('base = "eclipse-temurin:25-jre"', f'base = "{ok}"', 1)
@@ -577,7 +608,12 @@ def test_an_unknown_top_level_section_is_refused(tmp_path: Path) -> None:
 
 def test_a_non_table_engine_section_is_refused(tmp_path: Path) -> None:
     with pytest.raises(PlanError) as e:
-        load_plan(_plan(tmp_path, 'engine = "titanarum"\n[[image]]\nname = "a"\ndockerfile = "D"\nbase = "u:1"\n'))
+        load_plan(
+            _plan(
+                tmp_path,
+                'engine = "titanarum"\n[[image]]\nname = "a"\ndockerfile = "D"\nbase = "u:1"\n',
+            )
+        )
     assert "must be a table" in str(e.value)
 
 
@@ -726,7 +762,9 @@ def test_build_command_resolves_a_dockerfile_from_another_tree(tmp_path: Path) -
     env = {"BLASTBOX_SRC": "/srv/blastbox"}
     warm = next(i for i in plan.images if i.name == "titanarum-warm")
     argv = build_command(warm, "t1", [], "titanarum-base:t1", env, plan)
-    assert argv[argv.index("-f") + 1] == "/srv/blastbox/deploy/gvisor/Dockerfile.titanarum"
+    assert (
+        argv[argv.index("-f") + 1] == "/srv/blastbox/deploy/gvisor/Dockerfile.titanarum"
+    )
     assert argv[-1] == "/srv/blastbox"
 
 
@@ -749,12 +787,14 @@ def test_build_arg_values_are_expanded(tmp_path: Path) -> None:
     from blastbox.host.images import build_command
 
     text = TITANARUM.replace(
-        'build_args = { JDK_BUILD_IMAGE',
+        "build_args = { JDK_BUILD_IMAGE",
         'build_args = { BLASTBOX_VERSION = "$BLASTBOX_VERSION", JDK_BUILD_IMAGE',
         1,
     )
     plan = load_plan(_plan(tmp_path, text))
-    argv = build_command(plan.images[0], "t1", [], "u:1", {"BLASTBOX_VERSION": "0.1.34"}, plan)
+    argv = build_command(
+        plan.images[0], "t1", [], "u:1", {"BLASTBOX_VERSION": "0.1.34"}, plan
+    )
     assert "BLASTBOX_VERSION=0.1.34" in argv
 
 
@@ -764,7 +804,7 @@ def test_an_unresolved_build_arg_is_marked_in_the_dry_run(tmp_path: Path) -> Non
     from blastbox.host.images import describe
 
     text = TITANARUM.replace(
-        'build_args = { JDK_BUILD_IMAGE',
+        "build_args = { JDK_BUILD_IMAGE",
         'build_args = { BLASTBOX_VERSION = "$BLASTBOX_VERSION", JDK_BUILD_IMAGE',
         1,
     )
@@ -911,7 +951,7 @@ def test_a_literal_dollar_in_a_value_is_not_reported_unresolved(tmp_path: Path) 
     from blastbox.host.images import unresolved_build_args
 
     text = TITANARUM.replace(
-        'build_args = { JDK_BUILD_IMAGE',
+        "build_args = { JDK_BUILD_IMAGE",
         'build_args = { TOKEN = "$SECRET", JDK_BUILD_IMAGE',
         1,
     )
@@ -927,8 +967,8 @@ def test_a_boolean_build_arg_keeps_tomls_spelling(tmp_path: Path) -> None:
     """`str(False)` hands docker `False`; a Dockerfile comparing against
     `false` then sees something else. Docker passes these verbatim."""
     text = TITANARUM.replace(
-        'build_args = { JDK_BUILD_IMAGE',
-        'build_args = { FEATURE = false, JDK_BUILD_IMAGE',
+        "build_args = { JDK_BUILD_IMAGE",
+        "build_args = { FEATURE = false, JDK_BUILD_IMAGE",
         1,
     )
     plan = load_plan(_plan(tmp_path, text))
@@ -946,7 +986,9 @@ def test_a_non_utf8_plan_is_a_plan_error(tmp_path: Path) -> None:
     assert "UTF-8" in str(e.value)
 
 
-def test_destinations_that_normalise_to_one_path_collide(tmp_path: Path, monkeypatch) -> None:
+def test_destinations_that_normalise_to_one_path_collide(
+    tmp_path: Path, monkeypatch
+) -> None:
     """`/srv/images/rootfs` and `/srv/images/./rootfs` are the same artifact and
     were two different dictionary keys, so the second silently overwrote the
     first while the dry run reported success."""
@@ -965,10 +1007,14 @@ def test_an_over_long_upstream_tag_is_refused(tmp_path: Path) -> None:
     """docker's grammar caps a tag at 128, so the dry run was reporting a plan
     the build would then reject on its own base."""
     long_tag = "a" * 129
-    text = TITANARUM.replace('base = "eclipse-temurin:25-jre"', f'base = "ubuntu:{long_tag}"', 1)
+    text = TITANARUM.replace(
+        'base = "eclipse-temurin:25-jre"', f'base = "ubuntu:{long_tag}"', 1
+    )
     with pytest.raises(PlanError):
         load_plan(_plan(tmp_path, text))
-    ok = TITANARUM.replace('base = "eclipse-temurin:25-jre"', f'base = "ubuntu:{"a" * 128}"', 1)
+    ok = TITANARUM.replace(
+        'base = "eclipse-temurin:25-jre"', f'base = "ubuntu:{"a" * 128}"', 1
+    )
     assert load_plan(_plan(tmp_path, ok))
 
 
@@ -994,7 +1040,9 @@ def test_an_all_numeric_tag_does_not_slip_past_the_length_bound(tmp_path: Path) 
         load_plan(_plan(tmp_path, text))
     # a real registry port, which is what that branch exists for, still works
     ok = TITANARUM.replace(
-        'base = "eclipse-temurin:25-jre"', 'base = "reg.example.io:5000/ubuntu:24.04"', 1
+        'base = "eclipse-temurin:25-jre"',
+        'base = "reg.example.io:5000/ubuntu:24.04"',
+        1,
     )
     assert load_plan(_plan(tmp_path, ok))
 
@@ -1006,7 +1054,7 @@ def test_an_unbalanced_expansion_is_reported(tmp_path: Path) -> None:
     from blastbox.host.images import unresolved_build_args
 
     text = TITANARUM.replace(
-        'build_args = { JDK_BUILD_IMAGE',
+        "build_args = { JDK_BUILD_IMAGE",
         'build_args = { BROKEN = "${SECRET", JDK_BUILD_IMAGE',
         1,
     )
@@ -1017,7 +1065,9 @@ def test_an_unbalanced_expansion_is_reported(tmp_path: Path) -> None:
     assert problems and "BROKEN" in problems[0], problems
 
 
-def test_a_symlinked_parent_is_not_a_false_collision(tmp_path: Path, monkeypatch) -> None:
+def test_a_symlinked_parent_is_not_a_false_collision(
+    tmp_path: Path, monkeypatch
+) -> None:
     """`normpath` collapses `..` lexically, so with `/base/link -> /other/child`
     it reads `/base/link/../rootfs` as `/base/rootfs` and calls two genuinely
     distinct artifacts a collision."""
@@ -1046,7 +1096,7 @@ def test_a_secret_build_argument_is_not_printed(tmp_path: Path) -> None:
     from blastbox.host.images import describe
 
     text = TITANARUM.replace(
-        'build_args = { JDK_BUILD_IMAGE',
+        "build_args = { JDK_BUILD_IMAGE",
         'build_args = { REGISTRY_TOKEN = "$TOK", JDK_BUILD_IMAGE',
         1,
     )
@@ -1056,3 +1106,99 @@ def test_a_secret_build_argument_is_not_printed(tmp_path: Path) -> None:
     assert "REGISTRY_TOKEN=<redacted>" in out, out
     # a non-secret name is still shown, because that is what makes a dry run useful
     assert "JDK_BUILD_IMAGE=eclipse-temurin:25-jdk" in out
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "GITHUB_PAT",
+        "SSH_PRIVATE_KEY",
+        "REGISTRY_PASS",
+        "DEPLOY_KEY",
+        "NPM_TOKEN",
+        "AWS_SECRET_ACCESS_KEY",
+        "DB_PASSPHRASE",
+    ],
+)
+def test_conventional_credential_names_are_redacted(name: str) -> None:
+    """`describe()` prints before every dry run AND every real build.
+
+    A value that reaches it reaches terminal scrollback and CI logs, so the
+    names operators actually use for credentials have to be covered -- none of
+    these carried a denylisted substring, and all three of PAT, PRIVATE_KEY and
+    PASS were printed in full.
+    """
+    assert _is_secret(name), name
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "PATH",
+        "PATCH_LEVEL",
+        "COMPATIBILITY",
+        "CACHE_KEY",
+        "BLASTBOX_VERSION",
+        "JDK_BUILD_IMAGE",
+        "BUILD_PASSTHROUGH",
+    ],
+)
+def test_ordinary_build_args_are_still_shown(name: str) -> None:
+    """Redaction has a cost: a hidden value is one an operator cannot check.
+
+    `PAT` is matched as a whole segment precisely so `PATH`, `PATCH_LEVEL` and
+    `COMPATIBILITY` stay readable, and bare `KEY` needs a qualifier so
+    `CACHE_KEY` does too.
+    """
+    assert not _is_secret(name), name
+
+
+def test_a_secret_value_is_not_printed_by_describe(tmp_path: Path) -> None:
+    """End to end, since that is where the leak would happen."""
+    plan_file = tmp_path / "blastbox-images.toml"
+    plan_file.write_text(
+        '[engine]\nname = "demo"\n\n[[image]]\nname = "demo"\nbase = "debian:12"\n'
+        'dockerfile = "Dockerfile"\nbuild_args = { GITHUB_PAT = "$GITHUB_PAT" }\n'
+    )
+    plan = load_plan(plan_file)
+    text = describe(plan, "t1", {"GITHUB_PAT": "ghp_reallysecretvalue"})
+    assert "ghp_reallysecretvalue" not in text
+    assert "GITHUB_PAT" in text
+
+
+@pytest.mark.parametrize("expr", ["${not-a-name}", "${A:+fallback}", "${1FOO}"])
+def test_a_balanced_but_unsupported_expansion_is_reported(expr: str) -> None:
+    """Balanced braces are not the same as an expansion we can perform.
+
+    `_expand` keeps these verbatim, so staying silent handed docker the literal
+    placeholder while pre-build validation reported no problem at all.
+    """
+    assert unresolved_names(expr, {}) == [expr]
+
+
+def test_a_supported_expansion_is_still_not_reported() -> None:
+    """The new report must not fire on the forms that do resolve."""
+    assert unresolved_names("${DIR:-/tmp}", {"DIR": "/srv"}) == []
+    assert unresolved_names("${DIR:-/tmp}", {}) == []
+    assert unresolved_names("$SET", {"SET": "x"}) == []
+
+
+def test_a_destination_containing_a_literal_dollar_is_not_called_unresolved(
+    tmp_path: Path,
+) -> None:
+    """The dry run must agree with the run it previews.
+
+    `describe()` judged the destination by looking for `$` in the RESULT, so a
+    directory whose expansion legitimately contains one was reported unresolved
+    while the real export considered it fine.
+    """
+    plan_file = tmp_path / "blastbox-images.toml"
+    plan_file.write_text(
+        '[engine]\nname = "demo"\n\n[[image]]\nname = "demo"\nbase = "debian:12"\n'
+        'dockerfile = "Dockerfile"\n\n'
+        '[[rootfs]]\nkind = "dir"\nimage = "demo"\ndest = "$ODD/rootfs"\n'
+    )
+    plan = load_plan(plan_file)
+    text = describe(plan, "t1", {"ODD": "/srv/we$rd"})
+    assert "/srv/we$rd/rootfs" in text
+    assert "UNRESOLVED" not in text
