@@ -8,6 +8,7 @@ is where all of those failures lived — rather than about docker.
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1758,4 +1759,32 @@ def test_the_publish_lock_works_without_write_access(tmp_path: Path) -> None:
             pass
     finally:
         lock.chmod(0o644)
+        lock.unlink(missing_ok=True)
+
+
+def test_the_lock_refuses_a_planted_symlink(tmp_path: Path) -> None:
+    """The lock path is PREDICTABLE and lives in a world-writable directory.
+
+    Without `O_NOFOLLOW`, an unprivileged user can pre-create it as a symlink
+    to a root-owned file, and a root run then follows the link and `fchmod`s
+    that file to 0666.
+    """
+    import hashlib
+
+    import blastbox.host.imagerun as mod
+
+    victim = tmp_path / "victim"
+    victim.write_text("do not touch")
+    victim.chmod(0o600)
+    dest = tmp_path / "fc" / "attacked.ext4"
+    key = hashlib.sha256(str(dest).encode()).hexdigest()[:16]
+    lock = Path(tempfile.gettempdir()) / f"blastbox-publish-{key}.lock"
+    lock.unlink(missing_ok=True)
+    lock.symlink_to(victim)
+    try:
+        with pytest.raises((OSError, BuildError)):
+            with mod._destination_lock(dest):
+                pass
+        assert stat.S_IMODE(victim.stat().st_mode) == 0o600, "the victim was chmodded"
+    finally:
         lock.unlink(missing_ok=True)

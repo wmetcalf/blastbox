@@ -529,12 +529,19 @@ def _destination_lock(dest: Path) -> Iterator[None]:
     # usual umask -- and every later run as the deployment user would then get
     # EACCES on O_RDWR and be unable to publish at all, for a lock it only
     # wanted to read.
-    fd = os.open(path, os.O_CREAT | os.O_RDONLY, 0o666)
+    # O_NOFOLLOW, because this path is PREDICTABLE and lives in a
+    # world-writable directory: without it an unprivileged user can pre-create
+    # it as a symlink to a root-owned file, and a root run would then follow
+    # the link and fchmod that file to 0666.
+    fd = os.open(path, os.O_CREAT | os.O_RDONLY | os.O_NOFOLLOW, 0o666)
     try:
-        # Best effort, and only if we own it: umask turns the 0o666 above into
-        # 0o644 at creation, which is what strands the next user.
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise BuildError(f"{path} is not a regular file; refusing to lock on it")
+        # Widened only when we own it AND it is a plain file, so the chmod can
+        # never land on something we were pointed at.
         with contextlib.suppress(OSError):
-            if os.fstat(fd).st_uid == os.geteuid():
+            if st.st_uid == os.geteuid():
                 os.fchmod(fd, 0o666)
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
