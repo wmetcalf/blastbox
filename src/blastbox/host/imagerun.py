@@ -526,33 +526,47 @@ def _requirement_problem(requirement: str) -> str:
     return ""
 
 
-def _check_no_setuid(tree: Path, spec: RootfsSpec, image: str) -> None:
+def _check_no_setuid(
+    tree: Path, spec: RootfsSpec, image: str, priv: list[str], run: Runner
+) -> None:
     """Refuse a sandbox rootfs carrying setuid/setgid binaries.
 
     `deploy/firecracker/build-rootfs.sh` has always refused these, and replacing
     that flow with this module must not silently drop the gate. Audited on the
-    EXTRACTED tree rather than by running `find` in the image: this is what
+    EXTRACTED tree rather than by running `find` inside the image: this is what
     actually gets published, and it needs no container.
+
+    Run through `find` at the SAME privilege as the extraction, not with
+    `Path.rglob`. rglob skips a directory it cannot read and raises nothing, so
+    an unprivileged walk over a root-extracted tree scans almost none of it and
+    reports clean -- a gate that always passes is worse than no gate, because it
+    reads as evidence. A non-zero find is treated as a refusal for the same
+    reason: not being able to look is not a clean result.
 
     Extraction preserves mode bits on purpose -- that is the fidelity the guest
     needs -- so the audit and the preservation belong together.
     """
     if not spec.forbid_setuid:
         return
-    found: list[str] = []
-    for path in tree.rglob("*"):
-        try:
-            st = path.lstat()
-        except OSError:
-            continue
-        if stat.S_ISREG(st.st_mode) and st.st_mode & (stat.S_ISUID | stat.S_ISGID):
-            found.append("/" + str(path.relative_to(tree)))
-            if len(found) >= 20:  # a full list is not more informative
-                break
+    proc = run(
+        [*priv, "find", str(tree), "-xdev", "-type", "f", "-perm", "/6000"],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        raise BuildError(
+            f"could not audit {image} for setuid binaries "
+            f"({(proc.stderr or '').strip()[:200]}); refusing to publish a rootfs "
+            "that has not been checked"
+        )
+    found = sorted(
+        "/" + line.strip()[len(str(tree)) :].lstrip("/")
+        for line in (proc.stdout or "").splitlines()
+        if line.strip()
+    )
     if found:
         raise BuildError(
             f"{image} carries setuid/setgid binaries, which a sandbox rootfs must "
-            f"not: {sorted(found)}. Strip them in the Dockerfile "
+            f"not: {found[:20]}. Strip them in the Dockerfile "
             "(`find / -xdev -type f -perm /6000 -exec chmod a-s {} +`), or set "
             "`forbid_setuid = false` on this [[rootfs]] to accept them deliberately."
         )
@@ -681,7 +695,7 @@ def stage_rootfs(
         else:
             _extract_image(source, staging, run, log, as_root=as_root)
         _check_requires(staging, spec, image)
-        _check_no_setuid(staging, spec, image)
+        _check_no_setuid(staging, spec, image, priv, run)
         _normalize_root(staging, priv, run)
 
         if spec.kind == "dir":

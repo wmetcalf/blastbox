@@ -67,6 +67,12 @@ class FakeRunner:
         if rc == 0 and bare[:2] == ["docker", "inspect"] and "{{.Id}}" in bare:
             # Verification resolves each tag to the id it is about to export.
             out = "sha256:" + "e" * 64
+        if rc == 0 and bare[:1] == ["find"] and "/6000" in bare:
+            # Really runs it: a double that returned "" would make every setuid
+            # test pass by reporting a clean tree it never looked at.
+            out = subprocess.run(  # noqa: S603
+                bare, capture_output=True, text=True, check=False
+            ).stdout
         if rc == 0 and bare[:2] == ["mktemp", "-d"]:
             # Behaves like the real thing: the code uses the path it prints, so
             # a double that returned "" would make every later step operate on
@@ -964,3 +970,50 @@ def test_a_non_boolean_setuid_flag_is_refused(tmp_path: Path) -> None:
         _plan(tmp_path, SPEC.replace('requires = ["/init"]',
                                      'requires = ["/init"]\nforbid_setuid = "false"'))
     assert "must be true or false" in str(e.value)
+
+
+def test_an_audit_that_cannot_look_is_not_a_pass(tmp_path: Path, monkeypatch) -> None:
+    """A gate that always passes is worse than no gate, because it reads as
+    evidence.
+
+    The first version of this audit used `Path.rglob`, which skips a directory
+    it cannot read and raises nothing — so an unprivileged walk over a
+    root-extracted tree scanned almost none of it and reported clean. Verified
+    directly: rglob over a 0o000 directory containing a setuid file returns the
+    directory and not the file.
+    """
+    dest_dir = tmp_path / "fc"
+    dest_dir.mkdir()
+    (dest_dir / "demo.ext4").write_text("live")
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    plan = _plan(tmp_path)
+    run = FakeRunner(fail="find")
+    with pytest.raises(BuildError) as e:
+        export_rootfs(plan, plan.rootfs[0], "t1", run=run, log=lambda _: None,
+                      extract=_fake_extract({"/init": "x"}))
+    assert "could not audit" in str(e.value)
+    assert (dest_dir / "demo.ext4").read_text() == "live"
+
+
+def test_the_audit_sees_a_setuid_file_below_an_unreadable_directory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The exact shape rglob missed."""
+    dest_dir = tmp_path / "fc"
+    dest_dir.mkdir()
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    plan = _plan(tmp_path)
+
+    def extract(_image: str, dest: Path) -> None:
+        (dest / "init").write_text("x")
+        locked = dest / "locked"
+        locked.mkdir()
+        suid = locked / "mount"
+        suid.write_text("x")
+        suid.chmod(0o4755)
+
+    run = FakeRunner()
+    with pytest.raises(BuildError) as e:
+        export_rootfs(plan, plan.rootfs[0], "t1", run=run, log=lambda _: None,
+                      extract=extract)
+    assert "/locked/mount" in str(e.value)
