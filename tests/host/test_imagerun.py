@@ -12,13 +12,12 @@ from pathlib import Path
 
 import pytest
 
-from blastbox.host.images import PlanError, load_plan
+from blastbox.host.images import load_plan
 from blastbox.host.imagerun import (
     BuildError,
     build_plan,
     export_rootfs,
     run_plan,
-    verify_built,
 )
 
 SPEC = """
