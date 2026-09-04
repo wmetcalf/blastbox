@@ -1709,6 +1709,15 @@ def test_sibling_includes_are_one_install_set(tmp_path):
     gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
     assert gaps == {}, gaps
 
+    # NOT vacuous: {} is also what "nothing was judged" looks like, which is
+    # exactly what an earlier version of this fix produced -- the aggregator was
+    # excluded from the candidates while its children were marked included, so
+    # there were no roots at all and every closure passed. Break the set and the
+    # same call must report it.
+    _write(tmp_path, "deps.lock", _entry("pydantic==2.13.5"))
+    broken = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert list(broken.values()) == [["packaging", "backport"]], broken
+
 
 def test_an_included_pin_without_a_hash_does_not_satisfy_anything(tmp_path):
     """`--require-hashes` needs a hash for EVERY requirement.
@@ -1973,6 +1982,10 @@ def test_marker_specific_blastbox_entries_do_not_pool_their_extras(tmp_path):
     # On 3.12 only the host entry applies, so s3's boto3 is not demanded.
     gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
     assert gaps == {}, gaps
+    # And the lock IS being judged: drop a host dependency and it says so.
+    _write(tmp_path, "req.lock", lock.replace(_entry("uvicorn==1.1.0"), ""))
+    broken = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert list(broken.values()) == [["uvicorn"]], broken
 
 
 def test_one_extras_dependencies_do_not_infer_another(tmp_path):
@@ -2112,3 +2125,29 @@ def test_an_include_naming_a_special_file_is_refused(tmp_path):
     _write(tmp_path, "req.lock", _entry("blastbox==0.1.39") + "-r pipe.lock\n")
     gaps = missing_from_locks(tmp_path, ["pydantic>=2.6.0"])
     assert list(gaps.values()) == [["pydantic"]], gaps
+
+
+def test_a_lock_that_does_not_install_blastbox_here_is_not_judged(tmp_path):
+    """A portable lock may pin blastbox only for another platform.
+
+    pip skips the package entirely on this one, so demanding its dependency
+    closure refuses a lock that is correct.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "req.lock",
+        _entry('blastbox==0.1.39 ; sys_platform == "win32"')
+        + _entry("pydantic==2.13.5"),
+    )
+    assert (
+        missing_from_locks(tmp_path, _RM, environment={"sys_platform": "linux"}) == {}
+    )
+
+    # NOT vacuous: on the platform where blastbox IS installed, the same lock
+    # is judged and its gaps reported.
+    gaps = missing_from_locks(
+        tmp_path, _RM, environment={"sys_platform": "win32", "python_version": "3.12"}
+    )
+    assert list(gaps.values()) == [["packaging", "backport"]], gaps

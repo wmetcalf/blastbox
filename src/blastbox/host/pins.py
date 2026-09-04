@@ -815,6 +815,11 @@ def missing_from_locks(
         if not any(pin.hashed for entries in pins.values() for pin in entries):
             continue  # not hash-pinned; pip resolves the rest itself
         scope = {**env, **(environment or {})}
+        # An APPLICABLE blastbox entry. A portable lock whose only blastbox pin
+        # is `; sys_platform == "win32"` does not install blastbox on Linux, so
+        # demanding its dependency closure there refuses a correct lock.
+        if not any(_marker_holds(pin.marker, scope) for pin in pins["blastbox"]):
+            continue
         # Only from blastbox entries whose own markers apply: a portable lock
         # may pin `blastbox[host]` for one interpreter and `blastbox[s3]` for
         # another, and unioning both checks a closure pip never installs.
@@ -866,7 +871,11 @@ def _install_roots(root: Path) -> list[Path]:
     dev closure and accept a bump that leaves production failing. So a file
     named by an install command counts as a root even when it is also included.
     """
-    candidates = [p for p in _walk(root) if _is_requirements_file(p)]
+    # Install INPUTS, not just files that look like locks: an aggregator named
+    # `all.txt` holds nothing but `-r` lines, so it is never a lock itself --
+    # and excluding it while marking its children included left NO roots, so
+    # nothing was judged and every closure passed.
+    candidates = [p for p in _walk(root) if _is_install_input(p)]
     known = {p.resolve() for p in candidates}
     included: set[Path] = set()
     # Includes come from the BROADER set: an aggregator holding only `-r` lines
