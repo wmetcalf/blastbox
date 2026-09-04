@@ -871,19 +871,22 @@ def _install_roots(root: Path) -> list[Path]:
     dev closure and accept a bump that leaves production failing. So a file
     named by an install command counts as a root even when it is also included.
     """
-    # Install INPUTS, not just files that look like locks: an aggregator named
-    # `all.txt` holds nothing but `-r` lines, so it is never a lock itself --
-    # and excluding it while marking its children included left NO roots, so
-    # nothing was judged and every closure passed.
-    candidates = [p for p in _walk(root) if _is_install_input(p)]
-    known = {p.resolve() for p in candidates}
+    # A candidate is a lock by NAME, or a file that aggregates other
+    # requirement files. An aggregator named `all.txt` holds nothing but `-r`
+    # lines, so it is never a lock itself -- and excluding it while marking its
+    # children included left NO roots, so nothing was judged and every closure
+    # passed. Ordinary `.txt` files that include nothing stay out: they are
+    # fixtures and corpora, not install sets.
+    candidates: list[Path] = []
     included: set[Path] = set()
-    # Includes come from the BROADER set: an aggregator holding only `-r` lines
-    # is not a lock, and missing it puts its siblings back to being judged
-    # alone -- each reporting what the other carries.
     for path in _walk(root):
-        if _is_install_input(path):
-            included |= set(_includes(path, root))
+        if not _is_install_input(path):
+            continue
+        names = _includes(path, root)  # read once; used for both decisions
+        included |= set(names)
+        if names or _is_requirements_file(path):
+            candidates.append(path)
+    known = {p.resolve() for p in candidates}
     direct: set[Path] = set()
     for path in _walk(root):
         if _is_requirements_file(path) or not _INSTALL_SCRIPT_RE.fullmatch(path.name):
