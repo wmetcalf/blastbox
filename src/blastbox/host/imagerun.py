@@ -524,8 +524,18 @@ def _destination_lock(dest: Path) -> Iterator[None]:
     """
     key = hashlib.sha256(str(dest).encode()).hexdigest()[:16]
     path = Path(tempfile.gettempdir()) / f"blastbox-publish-{key}.lock"
-    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o666)
+    # O_RDONLY: flock needs a descriptor, not write access. The file PERSISTS,
+    # so an operator who runs once as root leaves it 0644 root-owned under the
+    # usual umask -- and every later run as the deployment user would then get
+    # EACCES on O_RDWR and be unable to publish at all, for a lock it only
+    # wanted to read.
+    fd = os.open(path, os.O_CREAT | os.O_RDONLY, 0o666)
     try:
+        # Best effort, and only if we own it: umask turns the 0o666 above into
+        # 0o644 at creation, which is what strands the next user.
+        with contextlib.suppress(OSError):
+            if os.fstat(fd).st_uid == os.geteuid():
+                os.fchmod(fd, 0o666)
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
@@ -540,7 +550,8 @@ def _restore_backup(staged: _Staged, run: Runner, log: Log) -> None:
     one. What it cannot restore, it SAYS -- a silent half-rollback is the
     thing that makes an incident hard to read afterwards.
     """
-    dest, priv, bak = staged.dest, staged.priv, Path(f"{staged.dest}.bak")
+    dest, priv = staged.dest, staged.priv
+    bak = staged.restore_from or Path(f"{staged.dest}.bak")
     # What this run FOUND, not what happens to be on disk now: a stale backup
     # from an earlier run would otherwise be resurrected as if it were ours.
     if staged.had_previous is False:
@@ -557,6 +568,12 @@ def _restore_backup(staged: _Staged, run: Runner, log: Log) -> None:
     # `mv bak dest` leaves the live path absent for as long as the removal
     # takes -- reintroducing, during recovery, the exact outage window the
     # atomic publish exists to avoid.
+    if not _exists(bak, priv, run):
+        # Removing the live artifact with nothing to put back is worse than
+        # leaving the new one in place. Say what happened instead.
+        log(f"   CANNOT roll back {dest}: no restorable copy at {bak}; "
+            "the new artifact is still live")
+        return
     if _exchange(bak, dest, priv, run):
         run([*priv, "rm", "-rf", str(bak)], capture_output=True)
         return
@@ -838,6 +855,10 @@ class _Staged:
     # do the wrong thing -- resurrect a stale artifact, or delete the new one
     # without restoring anything.
     had_previous: bool | None = None
+    # WHERE the replaceable original ended up. Normally `<dest>.bak`, but when
+    # the exchange succeeded and saving the backup then failed, the original is
+    # still sitting at `ready`. Rollback must be told, not left to assume.
+    restore_from: Path | None = None
 
 
 def stage_rootfs(
@@ -989,13 +1010,22 @@ def _publish_locked(
                 # would undo a publication that already succeeded, so the
                 # inability to save a backup is reported, not raised.
                 keep = run([*priv, "mv", str(staged.ready), f"{dest}.bak"], capture_output=True)
-                if keep.returncode != 0:
+                if keep.returncode == 0:
+                    staged.restore_from = Path(f"{dest}.bak")
+                else:
+                    # The exchange already happened, so the ORIGINAL is at
+                    # `ready`. Recording that is the difference between a
+                    # rollback that works and one that deletes the live
+                    # artifact and finds nothing to put back.
+                    staged.restore_from = staged.ready
                     log(f"   published, but could not keep a backup of {dest}: "
-                        f"{(keep.stderr or '').strip()}")
+                        f"{(keep.stderr or '').strip()}; the previous tree is at "
+                        f"{staged.ready}")
             else:
                 log("   note: atomic exchange unavailable; the live path is "
                     "briefly absent during this swap")
                 _must([*priv, "mv", str(dest), f"{dest}.bak"], "keep .bak", run)
+                staged.restore_from = Path(f"{dest}.bak")
                 _must([*priv, "mv", str(staged.ready), str(dest)], "publish rootfs", run)
         else:
             _must([*priv, "mv", str(staged.ready), str(dest)], "publish rootfs", run)
@@ -1008,6 +1038,7 @@ def _publish_locked(
         _refuse_shrink(dest, staged.size_mib, priv, run)
         if staged.had_previous:
             _must([*priv, "mv", str(dest), f"{dest}.bak"], "keep .bak", run)
+            staged.restore_from = Path(f"{dest}.bak")
         _must([*priv, "mv", str(staged.ready), str(dest)], "publish rootfs", run)
         _remove_tree(staged.staging, priv, run)
     log(f"   {dest}  (previous kept as {dest.name}.bak)")

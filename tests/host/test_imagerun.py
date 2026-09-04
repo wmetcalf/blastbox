@@ -1547,7 +1547,9 @@ def test_rollback_of_a_directory_swaps_atomically(tmp_path: Path, monkeypatch) -
     (dest_dir / "rootfs").mkdir()
     (dest_dir / "rootfs.bak").mkdir()
     staged = mod._Staged(
-        spec=_plan(tmp_path).rootfs[0], image="i:t", dest=dest_dir / "rootfs",
+        spec=_plan(tmp_path / "dc2", SPEC.replace('kind = "ext4"', 'kind = "dir"')
+                   .replace('dest = "$DEMO_DIR/demo.ext4"', 'dest = "$DEMO_DIR/rootfs"')).rootfs[0],
+        image="i:t", dest=dest_dir / "rootfs",
         priv=[], staging=dest_dir / "stg", ready=dest_dir / "stg", had_previous=True,
     )
     run = FakeRunner()
@@ -1609,3 +1611,151 @@ def test_the_prior_state_is_read_at_the_selected_privilege(
     probes = [c for c in run.calls if "test" in c and "-e" in c]
     assert probes, run.calls
     assert all(c[0] == "sudo" for c in probes), f"probed unprivileged: {probes}"
+
+
+def test_rollback_never_removes_a_live_artifact_it_cannot_replace(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The worst outcome available: after a successful exchange whose backup
+    move failed, rollback assumed `<dest>.bak` existed, deleted the live tree
+    and had nothing to put back.
+
+    Removing the live artifact with no restorable copy is worse than leaving
+    the new one in place, so it refuses and says so.
+    """
+    import blastbox.host.imagerun as mod
+
+    dest_dir = tmp_path / "gv"
+    dest_dir.mkdir()
+    (dest_dir / "rootfs").mkdir()
+    staged = mod._Staged(
+        spec=_plan(tmp_path / "dc2", SPEC.replace('kind = "ext4"', 'kind = "dir"')
+                   .replace('dest = "$DEMO_DIR/demo.ext4"', 'dest = "$DEMO_DIR/rootfs"')).rootfs[0],
+        image="i:t", dest=dest_dir / "rootfs",
+        priv=[], staging=dest_dir / "stg", ready=dest_dir / "stg",
+        had_previous=True, restore_from=dest_dir / "does-not-exist",
+    )
+    run = FakeRunner()
+    said: list[str] = []
+    mod._restore_backup(staged, run, said.append)
+    assert (dest_dir / "rootfs").exists(), "the live artifact was removed anyway"
+    assert any("CANNOT roll back" in s for s in said), said
+
+
+def test_rollback_uses_the_recorded_source_when_the_backup_move_failed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """After the exchange the ORIGINAL sits at `ready`, not at `.bak`.
+    Recording that is the difference between a rollback that works and one
+    that finds nothing."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_exchange", lambda a, b, priv, run: True)
+    dest_dir = tmp_path / "gv"
+    dest_dir.mkdir()
+    (dest_dir / "rootfs").mkdir()
+    original = dest_dir / "stg"
+    original.mkdir()
+    staged = mod._Staged(
+        spec=_plan(tmp_path / "dc2", SPEC.replace('kind = "ext4"', 'kind = "dir"')
+                   .replace('dest = "$DEMO_DIR/demo.ext4"', 'dest = "$DEMO_DIR/rootfs"')).rootfs[0],
+        image="i:t", dest=dest_dir / "rootfs",
+        priv=[], staging=original, ready=original,
+        had_previous=True, restore_from=original,
+    )
+    run = FakeRunner()
+    mod._restore_backup(staged, run, lambda _: None)
+    # exchanged from the recorded source, not from a .bak that never existed
+    assert not [c for c in run.calls if "mv" in c and any(a.endswith(".bak") for a in c)], (
+        run.calls
+    )
+
+
+def test_the_publish_lock_is_reusable_by_another_user(tmp_path: Path) -> None:
+    """The lock file PERSISTS. Created 0644 under the usual umask by a root
+    run, every later run as the deployment user got EACCES on O_RDWR — and
+    could not publish at all, for a lock it only wanted to read."""
+    import hashlib
+    import stat as statmod
+
+    import blastbox.host.imagerun as mod
+
+    dest = tmp_path / "fc" / "demo.ext4"
+    with mod._destination_lock(dest):
+        pass
+    key = hashlib.sha256(str(dest).encode()).hexdigest()[:16]
+    lock = Path(tempfile.gettempdir()) / f"blastbox-publish-{key}.lock"
+    try:
+        assert statmod.S_IMODE(lock.stat().st_mode) == 0o666, oct(lock.stat().st_mode)
+        # and it is opened read-only, so a foreign-owned 0644 lock still works
+        fd = os.open(lock, os.O_CREAT | os.O_RDONLY, 0o666)
+        os.close(fd)
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+def test_publish_records_where_the_original_went_when_the_backup_move_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Exercised through `publish_staged`, not by constructing the state.
+
+    An earlier test set `restore_from` by hand, so it passed with the recording
+    removed — it asserted my assumption about the field rather than the code
+    that fills it.
+    """
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_exchange", lambda a, b, priv, run: True)
+    dest_dir = tmp_path / "gv"
+    dest_dir.mkdir()
+    (dest_dir / "rootfs").mkdir()
+    dir_plan = _plan(
+        tmp_path / "dircase",
+        SPEC.replace('kind = "ext4"', 'kind = "dir"').replace(
+            'dest = "$DEMO_DIR/demo.ext4"', 'dest = "$DEMO_DIR/rootfs"'
+        ),
+    )
+    staged = mod._Staged(
+        spec=dir_plan.rootfs[0], image="i:t", dest=dest_dir / "rootfs",
+        priv=[], staging=dest_dir / "stg", ready=dest_dir / "stg",
+    )
+
+    class BackupMoveFails(FakeRunner):
+        def __call__(self, argv, **kw):
+            bare = self._bare(list(argv))
+            if bare[:1] == ["mv"] and bare[-1].endswith(".bak"):
+                self.calls.append(list(argv))
+                return subprocess.CompletedProcess(list(argv), 1, stdout="", stderr="EIO")
+            return super().__call__(argv, **kw)
+
+    mod.publish_staged(staged, run=BackupMoveFails(), log=lambda _: None)
+    assert staged.restore_from == staged.ready, (
+        "the original's location was not recorded, so rollback would find nothing"
+    )
+
+
+def test_the_publish_lock_works_without_write_access(tmp_path: Path) -> None:
+    """`flock` needs a descriptor, not write access.
+
+    Simulates the cross-user case that strands an operator: a persistent lock
+    file this process cannot open for writing. With `O_RDWR` the export fails
+    outright, for a lock it only ever wanted to read.
+    """
+    import hashlib
+
+    import blastbox.host.imagerun as mod
+
+    if os.geteuid() == 0:
+        pytest.skip("root opens anything for writing, so this cannot be provoked here")
+
+    dest = tmp_path / "fc" / "readonly.ext4"
+    key = hashlib.sha256(str(dest).encode()).hexdigest()[:16]
+    lock = Path(tempfile.gettempdir()) / f"blastbox-publish-{key}.lock"
+    lock.write_text("")
+    lock.chmod(0o444)  # as a root-created 0644 lock looks to another user
+    try:
+        with mod._destination_lock(dest):
+            pass
+    finally:
+        lock.chmod(0o644)
+        lock.unlink(missing_ok=True)
