@@ -362,8 +362,15 @@ def build_plan(
             _must(["docker", "pull", "-q", base_ref], f"pull {base_ref}", run)
 
         source = _images.source_repo_path(plan, spec, env)
+        # Resolved BEFORE the stamp, so the digests land in the labels. While
+        # this ran after `_stamp_flags` the pins existed only in the build argv:
+        # the same plan, revision and base could produce a different image once
+        # a builder tag moved, and every label stayed identical -- the drift
+        # this pinning exists to prevent, left with nothing recording it.
+        pinned_args = _pin_builder_images(spec, env, run, log, pull=pull)
         try:
             flags = _stamp_flags(
+                builders=pinned_args,
                 blastbox_version=blastbox_version,
                 repo=source,
                 base=base_ref,
@@ -384,7 +391,6 @@ def build_plan(
         # pulled, resolved and recorded -- so an upstream push could change what
         # lands in the image while every label stayed identical. Resolving them
         # to digests makes the build reproducible in the same sense the base is.
-        pinned_args = _pin_builder_images(spec, env, run, log, pull=pull)
         to_build = (
             replace(spec, build_args={**spec.build_args, **pinned_args})
             if pinned_args

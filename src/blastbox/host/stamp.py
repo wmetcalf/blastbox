@@ -25,7 +25,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,6 +39,11 @@ LABEL_BASE_DIGEST = "org.opencontainers.image.base.digest"
 # it exactly on this host, but it is NOT a repo digest and must not be written
 # into the OCI key as if it were.
 LABEL_BASE_IMAGE_ID = "org.blastbox.base.image_id"
+# The BUILDER stages, which are as much a part of what an image contains as its
+# base is: a multi-stage Dockerfile COPIES artifacts out of them. Recorded as
+# `ARG=ref` pairs joined by commas -- one label rather than one per argument,
+# because the set is declared per image and varies between them.
+LABEL_BUILDERS = "org.blastbox.builders"
 
 # Emitted flags are consumed with `$(blastbox stamp ...)`. Command substitution
 # word-splits its output but does NOT remove quotes, so a quoted value arrives
@@ -95,6 +100,9 @@ class Stamp:
     base_name: str = UNKNOWN
     base_digest: str = UNKNOWN
     base_image_id: str = UNKNOWN
+    # `ARG=ref` pairs, comma-joined. Empty when the image declares no builder
+    # stages, which is the common case and not a defect.
+    builders: str = ""
 
     @property
     def reproducible(self) -> bool:
@@ -533,6 +541,7 @@ def build_args(
     base: str | None = None,
     base_arg: str = "BASE_IMAGE",
     dockerfile: Path | str | None = None,
+    builders: Mapping[str, str] | None = None,
     runner: Runner | None = None,
 ) -> list[str]:
     """`docker build` flags that stamp the image.
@@ -609,6 +618,14 @@ def build_args(
         LABEL_BASE_NAME: base or "",
         LABEL_BASE_DIGEST: digest,
         LABEL_BASE_IMAGE_ID: image_id,
+        # Provenance, not a pin: the pins themselves go through as build args.
+        # Without this, the same plan, revision and base could produce a
+        # different image after a builder tag moved, and every label would be
+        # identical -- the builder-stage drift this pinning exists to prevent,
+        # left unrecorded and so undetectable afterwards.
+        LABEL_BUILDERS: ",".join(
+            f"{k}={v}" for k, v in sorted((builders or {}).items())
+        ),
     }
     args: list[str] = []
     for key, value in labels.items():
@@ -724,4 +741,5 @@ def read(image: str, runner: Runner | None = None) -> Stamp:
         base_name=labels.get(LABEL_BASE_NAME, UNKNOWN),
         base_digest=labels.get(LABEL_BASE_DIGEST, UNKNOWN),
         base_image_id=labels.get(LABEL_BASE_IMAGE_ID, UNKNOWN),
+        builders=labels.get(LABEL_BUILDERS, ""),
     )

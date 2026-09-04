@@ -2814,3 +2814,35 @@ def test_rollback_waits_for_the_destination_lock(tmp_path: Path) -> None:
         roller.join(10)
     assert done.is_set()
     assert dest.read_text() == "previous", "the rollback never completed"
+
+
+def test_the_builder_digests_reach_the_stamp_not_only_the_argv(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Resolution has to happen BEFORE the stamp is built.
+
+    While it ran afterwards the pins existed only in the build argv, so the same
+    plan, revision and base could produce a different image once a builder tag
+    moved -- with every label identical.
+    """
+    import blastbox.host.imagerun as mod
+
+    _resolves_to(monkeypatch)
+    pinned = {"JDK_BUILD_IMAGE": "eclipse-temurin@sha256:" + "9" * 64}
+    monkeypatch.setattr(mod, "_pin_builder_images", lambda *a, **k: dict(pinned))
+    seen: list[dict] = []
+
+    def spy(**kw):
+        seen.append(kw)
+        return []
+
+    monkeypatch.setattr(mod, "_stamp_flags", spy)
+    build_plan(
+        _plan(tmp_path),
+        "t1",
+        blastbox_version="0.1.38",
+        run=FakeRunner(),
+        log=lambda _: None,
+    )
+    assert seen, "the stamp was never built"
+    assert all(kw.get("builders") == pinned for kw in seen), seen
