@@ -318,3 +318,60 @@ def test_the_default_form_works_without_an_explicit_env(tmp_path: Path, monkeypa
     assert plan.rootfs[0].resolved_dest() == "/var/lib/titan-fc/titanarum-rootfs.ext4"
     monkeypatch.setenv("TITANARUM_FC_DIR", "/srv/fc")
     assert plan.rootfs[0].resolved_dest() == "/srv/fc/titanarum-rootfs.ext4"
+
+
+@pytest.mark.parametrize("bad", ["worker-", "worker.", "worker..base", "-worker", "wo__rker"])
+def test_invalid_repository_names_are_refused(tmp_path: Path, bad: str) -> None:
+    """Separators sit BETWEEN alphanumerics; accepting these moves the failure
+    to `docker tag`, which is the wrong place to find out."""
+    text = TITANARUM.replace('name = "titanarum-base"', f'name = "{bad}"', 1)
+    with pytest.raises(PlanError):
+        load_plan(_plan(tmp_path, text))
+
+
+def test_a_fractional_size_is_refused_not_truncated(tmp_path: Path) -> None:
+    """Truncating would silently build a smaller filesystem than declared."""
+    text = TITANARUM.replace("size_mib = 3072", "size_mib = 3072.9")
+    with pytest.raises(PlanError) as e:
+        load_plan(_plan(tmp_path, text))
+    assert "truncating" in str(e.value)
+
+
+def test_an_integral_float_size_is_accepted(tmp_path: Path) -> None:
+    """`3072.0` means 3072; only a real fraction is a mistake."""
+    text = TITANARUM.replace("size_mib = 3072", "size_mib = 3072.0")
+    assert load_plan(_plan(tmp_path, text)).rootfs[0].size_mib == 3072
+
+
+def test_a_build_arg_may_not_override_the_pinned_base(tmp_path: Path) -> None:
+    """Whichever won, the stamp would record a base the build may not have used."""
+    text = TITANARUM.replace(
+        'build_args = { JDK_BUILD_IMAGE = "eclipse-temurin:25-jdk", ZXING_BUILD_IMAGE = "debian:12-slim" }',
+        'build_args = { BASE_IMAGE = "something:else" }',
+    )
+    with pytest.raises(PlanError) as e:
+        load_plan(_plan(tmp_path, text))
+    assert "pins its base" in str(e.value)
+
+
+def test_malformed_build_args_are_a_plan_error(tmp_path: Path) -> None:
+    text = TITANARUM.replace(
+        'build_args = { JDK_BUILD_IMAGE = "eclipse-temurin:25-jdk", ZXING_BUILD_IMAGE = "debian:12-slim" }',
+        'build_args = { NESTED = { a = 1 } }',
+    )
+    with pytest.raises(PlanError) as e:
+        load_plan(_plan(tmp_path, text))
+    assert "must be a scalar" in str(e.value)
+
+
+def test_an_unresolved_destination_is_reported_for_refusal(tmp_path: Path) -> None:
+    """The dry run must FAIL on these, not note them and continue.
+
+    The export would write to a literal `$VAR` directory, or to a path that
+    merely looks plausible.
+    """
+    from blastbox.host.images import unresolved_destinations
+
+    plan = load_plan(_plan(tmp_path, TITANARUM))
+    assert unresolved_destinations(plan, {}) != []
+    assert unresolved_destinations(plan, {"TITANARUM_FC_DIR": "/srv"}) == []

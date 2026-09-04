@@ -66,7 +66,10 @@ ROOTFS_KINDS = frozenset({"dir", "ext4"})
 
 # Lowercase only: docker repository names are, so `MyImage` would pass here and
 # fail at tag time instead.
-_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+# Separators sit BETWEEN alphanumerics and never double or trail: `worker-`,
+# `worker.` and `worker..base` are not valid repository names, and accepting
+# them here just moves the failure to `docker tag`.
+_NAME_RE = re.compile(r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$")
 
 
 class PlanError(RuntimeError):
@@ -206,7 +209,20 @@ def load_plan(root: Path | str) -> Plan:
                 f"{path}: image {name!r} declares no base. An unpinned base is how "
                 "a rebuild silently changes what it was built on."
             )
-        args = {str(k): str(v) for k, v in (item.get("build_args") or {}).items()}
+        raw_args = item.get("build_args") or {}
+        if not isinstance(raw_args, dict):
+            raise PlanError(
+                f"{path}: image {name!r} build_args must be a table of "
+                f"NAME = \"value\" pairs, got {type(raw_args).__name__}"
+            )
+        args = {}
+        for k, v in raw_args.items():
+            if isinstance(v, (dict, list)):
+                raise PlanError(
+                    f"{path}: image {name!r} build_arg {k!r} must be a scalar; "
+                    "docker takes NAME=VALUE strings"
+                )
+            args[str(k)] = str(v)
         spec = ImageSpec(
             name=name,
             dockerfile=dockerfile,
@@ -226,6 +242,13 @@ def load_plan(root: Path | str) -> Plan:
                 f"{path}: image {name!r} is based on {base!r}, which this plan "
                 "declares LATER. A base must be built before it is used; "
                 "reorder them."
+            )
+        if spec.base_arg in args:
+            raise PlanError(
+                f"{path}: image {name!r} sets {spec.base_arg!r} in build_args, "
+                "which is the argument that pins its base. Whichever won, the "
+                "stamp would record a base the build may not have used. Change "
+                "`base` instead."
             )
         seen[name] = spec
         images.append(spec)
@@ -250,6 +273,11 @@ def load_plan(root: Path | str) -> Plan:
             raise PlanError(f"{path}: [[rootfs]] #{i + 1} declares no dest")
         size = item.get("size_mib")
         if size is not None:
+            if isinstance(size, float) and not size.is_integer():
+                raise PlanError(
+                    f"{path}: [[rootfs]] #{i + 1} size_mib is {size!r}; truncating "
+                    "it would silently build a smaller filesystem than declared"
+                )
             try:
                 size = int(size)
             except (TypeError, ValueError) as exc:
@@ -308,6 +336,21 @@ def missing_dockerfiles(plan: Plan, env: dict[str, str] | None = None) -> list[s
         if not path.is_file():
             where = spec.context if spec.context != "." else "this repo"
             out.append(f"{spec.dockerfile} (context {where})")
+    return out
+
+
+def unresolved_destinations(plan: Plan, env: dict[str, str] | None = None) -> list[str]:
+    """Rootfs destinations still containing an unexpanded variable.
+
+    A hard failure rather than a note: the export would either write to a
+    literal `$VAR` directory or, worse, to a path that merely looks plausible.
+    Printing a warning and continuing invites running it anyway.
+    """
+    out: list[str] = []
+    for rf in plan.rootfs:
+        dest = rf.resolved_dest(env)
+        if "$" in dest:
+            out.append(f"{rf.image} -> {dest}")
     return out
 
 

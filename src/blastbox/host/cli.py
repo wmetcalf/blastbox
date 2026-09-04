@@ -1129,6 +1129,7 @@ def _build_images_cmd(args: argparse.Namespace) -> int:
     """
     from blastbox.host.images import (  # noqa: PLC0415
         PlanError, arg_problems, describe, load_plan, missing_dockerfiles,
+        unresolved_destinations,
     )
 
     root = Path(args.repo).resolve()
@@ -1158,6 +1159,14 @@ def _build_images_cmd(args: argparse.Namespace) -> int:
         print(f"{len(problems)} image(s) declare a base_arg that does not select their base:")
         for p_ in problems:
             print(f"  {p_}")
+        return 2
+
+    unresolved = unresolved_destinations(plan)
+    if unresolved:
+        print(f"{len(unresolved)} export destination(s) contain an unset variable:")
+        for u in unresolved:
+            print(f"  {u}")
+        print("Set them, or give the declaration a ${VAR:-default}.")
         return 2
 
     print(describe(plan, args.tag))
