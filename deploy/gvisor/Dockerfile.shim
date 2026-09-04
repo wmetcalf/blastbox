@@ -33,6 +33,16 @@ RUN printf '%s' "${ENGINE}" > /opt/blastbox/engine
 # READ-ONLY at restore, so runsc cannot mkdir these targets itself — they MUST exist
 # in the image. Without them the base boot dies: "mounting /in: mkdir(...): read-only
 # file system", before warmup/checkpoint ever runs.
-RUN mkdir -p /in /out /ctrl
+RUN mkdir -p /in /out /ctrl \
+    # Strip setuid/setgid. Every other warm Dockerfile in this tree already
+    # does this; the shim did not, and it is the only one the gVisor path used
+    # for clippyshot -- so that engine's sandbox rootfs shipped setuid `su`,
+    # `passwd`, `mount` and ten more. Found by the export audit in 0.1.35
+    # refusing to publish the tree, and confirmed on the live artifact on
+    # toolz2 (13 of them, in place since 2026-06-20).
+    #
+    # The Firecracker path has refused such images since build-rootfs.sh was
+    # written; the gVisor path simply never had the check, so nothing said so.
+    && find / -xdev -type f -perm /6000 -exec chmod a-s {} + 2>/dev/null || true
 
 # The warm worker env then sets LD_PRELOAD=/opt/clippyshot/accept-retry.so (soffice only).
