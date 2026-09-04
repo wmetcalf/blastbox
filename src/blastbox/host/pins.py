@@ -846,7 +846,8 @@ def missing_from_locks(
     """
     out: dict[str, list[str]] = {}
     parsed = [_requirement(r) for r in requires]
-    for path in _install_roots(root):
+    roots = _install_roots(root)
+    for path in roots:
         pins, _unused, env = _effective_pins(path, root)
         if "blastbox" not in pins:
             continue  # somebody else's requirements; not ours to judge
@@ -876,7 +877,7 @@ def missing_from_locks(
         # `blastbox[host,s3]` in pyproject, a Dockerfile pip line, or the lock
         # entry itself. That is the authoritative answer; inference is only for
         # repos that never spell it.
-        extras |= _declared_blastbox_extras(root)
+        extras |= _declared_extras_for(root, path, roots)
         if not extras:
             extras |= _extras_in_play(parsed, pins, scope)
         extras = _with_nested_extras(extras, parsed, scope)
@@ -925,22 +926,73 @@ def _gap(
         # the point: silence would report a closure verified that nobody looked
         # at, which is the failure mode this whole check exists for.
         return f"{name}[{','.join(sorted(wanted))}] (its extras could not be verified)"
+    unmet: set[str] = set()
     for pin in matching:
-        nested = requirements_of(name, pin.version)
-        if nested is None:
+        missing = _extra_closure_gaps(
+            name, pin.version, wanted, pins, scope, requirements_of, set()
+        )
+        if missing is None:
             return (
                 f"{name}[{','.join(sorted(wanted))}] (its extras could not be verified)"
             )
-        missing = [
-            _dist_name(sub.name)
-            for sub in (_requirement(r) for r in nested)
-            if sub is not None
-            and _applies(sub, wanted, scope)
-            and not _gap_name_present(sub, pins, scope)
-        ]
         if not missing:
-            return ""
-    return f"{name}[{','.join(sorted(wanted))}] needs {', '.join(sorted(set(missing)))}"
+            return ""  # one applicable pin satisfies it, which is enough
+        unmet = missing
+    return f"{name}[{','.join(sorted(wanted))}] needs {', '.join(sorted(unmet))}"
+
+
+def _extra_closure_gaps(
+    name: str,
+    version: str,
+    wanted: set[str],
+    pins: dict[str, list[_Pin]],
+    scope: dict[str, str],
+    requirements_of: Callable[[str, str], list[str] | None],
+    seen: set[tuple[str, str]],
+) -> set[str] | None:
+    """What ``name[wanted]`` needs and this lock lacks, or None if unknowable.
+
+    RECURSIVE, because an extra can enable another package's extra:
+    `parent[feature]` requiring `child[nested]` means pip enables `nested` too
+    and demands hashes for everything it brings in. Stopping at the child's own
+    pin accepts a lock that carries `child` for some other reason and none of
+    what `nested` adds.
+
+    ``seen`` guards the cycle that follows from packages depending on each
+    other's extras.
+    """
+    key = (name, version)
+    if key in seen:
+        return set()  # already accounted for; not a gap of its own
+    seen.add(key)
+    nested = requirements_of(name, version)
+    if nested is None:
+        return None
+    gaps: set[str] = set()
+    for sub in (_requirement(r) for r in nested):
+        if sub is None or not _applies(sub, wanted, scope):
+            continue
+        sub_name = _dist_name(sub.name)
+        usable = [
+            pin
+            for pin in pins.get(sub_name, [])
+            if pin.hashed
+            and _marker_holds(pin.marker, scope)
+            and (not sub.specifier or _satisfies(sub, pin.version))
+        ]
+        if not usable:
+            gaps.add(sub_name)
+            continue
+        sub_extras = {e.lower() for e in (sub.extras or set())}
+        if not sub_extras:
+            continue
+        deeper = _extra_closure_gaps(
+            sub_name, usable[0].version, sub_extras, pins, scope, requirements_of, seen
+        )
+        if deeper is None:
+            return None
+        gaps |= deeper
+    return gaps
 
 
 def _gap_name_present(req, pins: dict[str, list[_Pin]], scope: dict[str, str]) -> bool:
@@ -1012,8 +1064,10 @@ def _referenced(path: Path, root: Path) -> list[Path]:
     closure.
     """
     out: list[Path] = []
+    # A quoted path is the same path: the shell strips the quotes before pip
+    # ever sees them, and refusing to match one drops a real install set.
     for match in re.finditer(
-        r"(?:-r|--requirement)[=\s]+([\w./\-]+)", _read_small(path)
+        r"""(?:-r|--requirement)[=\s]+["']?([\w./\-]+)""", _read_small(path)
     ):
         for base in (path.parent, root):
             target = _safe_include(base / match.group(1), root)
@@ -1043,8 +1097,13 @@ def _safe_include(path: Path, root: Path) -> Path | None:
 def _includes(path: Path, root: Path) -> list[Path]:
     """Paths this requirement file pulls in with `-r` / `--requirement`."""
     out: list[Path] = []
-    for raw in _joined_lines(_read_small(path)):
-        match = re.match(r"^(?:-r|--requirement)[=\s]+(\S+)", raw.strip())
+    # The bounded LOCK reader for files we recognise: `_read_small` returns ""
+    # past 1 MiB, so a large `dev.lock` looked like it included nothing and its
+    # `prod.lock` stayed an independent root, reported incomplete though it is
+    # only ever installed through the complete dev set.
+    text = _read_requirements(path) if _is_install_input(path) else _read_small(path)
+    for raw in _joined_lines(text):
+        match = re.match(r"""^(?:-r|--requirement)[=\s]+["']?([^\s"']+)""", raw.strip())
         if not match:
             continue
         target = _safe_include(path.parent / match.group(1), root)
@@ -1139,9 +1198,18 @@ def _lock_environment(text: str) -> dict[str, str]:
             "s390x",
             "armv7l",
         ):
-            if arch in token:
-                out["platform_machine"] = "arm64" if arch == "arm64" else arch
-                break
+            if arch not in token:
+                continue
+            # `aarch64-apple-darwin` evaluates as `platform_machine == "arm64"`:
+            # that is what the platform calls the same architecture, and a
+            # requirement guarded by `arm64` would otherwise be skipped.
+            if arch in ("aarch64", "arm64"):
+                out["platform_machine"] = (
+                    "arm64" if out.get("sys_platform") == "darwin" else arch
+                )
+            else:
+                out["platform_machine"] = arch
+            break
     return out
 
 
@@ -1250,6 +1318,44 @@ def _applicable_names(pins: dict[str, list[_Pin]], scope: dict[str, str]) -> set
     }
 
 
+def _declared_extras_for(root: Path, lock: Path, roots: Sequence[Path]) -> set[str]:
+    """Blastbox extras that apply to THIS install set.
+
+    A declaration is evidence only about the set that selects it. A `dev`
+    optional group containing `blastbox[host]` says nothing about a separate
+    production lock installing plain blastbox, and demanding host's closure
+    there rejects a correct lock.
+
+    Attributed two ways, both narrow:
+
+    * a file that installs this lock and also names blastbox extras -- a
+      Dockerfile doing `pip install blastbox[host]` beside `-r prod.lock`;
+    * the repository's declarations, but ONLY when there is a single install
+      set, where there is nothing to confuse them with. RedTusk is that case:
+      one lock, and `blastbox[host,s3]` in its pyproject.
+
+    Anything else falls through to inference -- a guess, but a local one.
+    """
+    out: set[str] = set()
+    target = lock.resolve()
+    for path in _walk(root):
+        if not _INSTALL_SCRIPT_RE.fullmatch(path.name) or _is_install_input(path):
+            continue
+        if target in set(_referenced(path, root)):
+            out |= _blastbox_extras_in(path)
+    if out:
+        return out
+    return _declared_blastbox_extras(root) if len(roots) == 1 else set()
+
+
+def _blastbox_extras_in(path: Path) -> set[str]:
+    """Blastbox extras named anywhere in one file."""
+    out: set[str] = set()
+    for match in re.finditer(r"(?i)\bblastbox\[([^\]]+)\]", _read_small(path)):
+        out |= {e.strip().lower() for e in match.group(1).split(",") if e.strip()}
+    return out
+
+
 def _declared_blastbox_extras(root: Path) -> set[str]:
     """Blastbox extras this repository asks for, from its own requirements.
 
@@ -1270,8 +1376,7 @@ def _declared_blastbox_extras(root: Path) -> set[str]:
             or path.name.endswith((".Dockerfile", ".dockerfile"))
         ):
             continue
-        for match in re.finditer(r"(?i)\bblastbox\[([^\]]+)\]", _read_small(path)):
-            out |= {e.strip().lower() for e in match.group(1).split(",") if e.strip()}
+        out |= _blastbox_extras_in(path)
     return out
 
 
@@ -1538,7 +1643,7 @@ def set_version(
                     "guess -- a partial rewrite leaves the repo pinned to two "
                     "versions."
                 ) from first_error
-            if pin.kind == "lock" and "--hash=" in "".join(lines[i : i + 4]):
+            if pin.kind == "lock" and _HASH_RE.search("".join(lines[i : i + 4])):
                 needs_hashes = True
         if needs_hashes:
             if not digests:
@@ -1614,7 +1719,7 @@ def _replace_hashes(
         start = pin.line  # first line AFTER the requirement
         end = start
         indent = "    "
-        while end < len(lines) and "--hash=" in lines[end]:
+        while end < len(lines) and _HASH_RE.search(lines[end]):
             indent = lines[end][: len(lines[end]) - len(lines[end].lstrip())]
             end += 1
         if end == start:
@@ -1623,8 +1728,12 @@ def _replace_hashes(
             # leaves the OLD digests beside the NEW version -- a lock that fails
             # `--require-hashes` while the command reports success.
             req_line = lines[start - 1]
-            if "--hash=" in req_line:
-                head = req_line.split("--hash=", 1)[0].rstrip()
+            # Either spelling: a lock written with `--hash sha256:...` would
+            # otherwise keep its OLD digests beside a NEW version, and the
+            # version-only rescan reports success while the install rejects it.
+            inline = _HASH_RE.search(req_line)
+            if inline:
+                head = req_line[: inline.start()].rstrip()
                 lines[start - 1] = (
                     head
                     + " "

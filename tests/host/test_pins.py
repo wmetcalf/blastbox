@@ -2448,3 +2448,187 @@ def test_an_extra_the_repository_never_asks_for_is_not_demanded(tmp_path):
     assert (
         missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"}) == {}
     )
+
+
+def test_the_space_form_of_hash_is_replaced_on_a_bump(tmp_path):
+    """The READ side learned both spellings; the WRITE side had not.
+
+    `set_version` would change `blastbox==...` and leave the OLD artifact
+    hashes beside the new version, and its version-only rescan reports success
+    while the next hashed install rejects the file.
+    """
+    from blastbox.host.pins import set_version
+
+    old_hash = "b" * 64
+    lock = tmp_path / "requirements.lock"
+    lock.write_text(f"blastbox==0.1.38 \\\n    --hash sha256:{old_hash}\n")
+    new = "c" * 64
+    set_version(tmp_path, "0.1.39", digests=[new])
+    text = lock.read_text()
+    assert "0.1.39" in text, text
+    assert old_hash not in text, text
+    assert new in text, text
+
+
+def test_a_quoted_requirement_path_is_still_a_reference(tmp_path):
+    """The shell strips the quotes before pip ever sees them."""
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path, "prod.lock", _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5")
+    )
+    _write(
+        tmp_path,
+        "dev.lock",
+        "-r prod.lock\n" + _entry("packaging==26.3") + _entry("backport==1.0"),
+    )
+    (tmp_path / "Dockerfile").write_text(
+        'FROM python:3.12\nRUN pip install --require-hashes -r "prod.lock"\n'
+    )
+    gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert list(gaps) == [str(tmp_path / "prod.lock")], gaps
+
+
+def test_an_apple_target_calls_that_architecture_arm64(tmp_path):
+    """uv evaluates `aarch64-apple-darwin` as `platform_machine == "arm64"`."""
+    from blastbox.host.pins import missing_from_locks
+
+    reqs = ["pydantic>=2.6.0", 'mac-arm>=1; platform_machine == "arm64"']
+    header = (
+        "# uv pip compile --generate-hashes --python-platform aarch64-apple-darwin\n"
+    )
+    _write(
+        tmp_path,
+        "req.lock",
+        header + _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5"),
+    )
+    assert list(missing_from_locks(tmp_path, reqs).values()) == [["mac-arm"]]
+
+    # The Linux spelling of the same architecture stays `aarch64`.
+    linux = "# uv pip compile --python-platform aarch64-unknown-linux-gnu\n"
+    _write(
+        tmp_path,
+        "req.lock",
+        linux + _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5"),
+    )
+    assert missing_from_locks(tmp_path, reqs) == {}
+
+
+def test_a_declaration_for_one_install_set_does_not_bind_another(tmp_path):
+    """A `dev` group naming `blastbox[host]` says nothing about a prod lock.
+
+    Applying the repository's declarations to every root rejects a correct
+    production lock for omitting host-only dependencies it never selected.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\ndependencies = ["blastbox>=0.1.39,<0.2"]\n\n'
+        '[project.optional-dependencies]\ndev = ["blastbox[host]>=0.1.39,<0.2"]\n'
+    )
+    _write(
+        tmp_path,
+        "prod.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging==26.3")
+        + _entry("backport==1.0"),
+    )
+    _write(
+        tmp_path,
+        "dev.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging==26.3")
+        + _entry("backport==1.0")
+        + _entry("fastapi==1.2.0")
+        + _entry("uvicorn==1.1.0"),
+    )
+    gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert gaps == {}, gaps
+
+
+def test_a_nested_extra_is_traversed(tmp_path):
+    """`parent[feature]` requiring `child[nested]` enables nested too.
+
+    Stopping at the child's own pin accepts a lock that carries `child` for
+    some other reason and none of what `nested` adds.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    meta = {
+        ("parent", "1.0"): ['child[nested]>=1; extra == "feature"'],
+        ("child", "1.0"): ['grandchild>=1; extra == "nested"'],
+    }
+    reqs = ["pydantic>=2.6.0", "parent[feature]>=1"]
+    _write(
+        tmp_path,
+        "req.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("parent==1.0")
+        + _entry("child==1.0"),
+    )
+    gaps = missing_from_locks(
+        tmp_path, reqs, requirements_of=lambda n, v: meta.get((n, v))
+    )
+    assert list(gaps.values()) == [["parent[feature] needs grandchild"]], gaps
+
+    # With the grandchild pinned it is satisfied.
+    _write(
+        tmp_path,
+        "req.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("parent==1.0")
+        + _entry("child==1.0")
+        + _entry("grandchild==1.0"),
+    )
+    assert (
+        missing_from_locks(
+            tmp_path, reqs, requirements_of=lambda n, v: meta.get((n, v))
+        )
+        == {}
+    )
+
+
+def test_an_extras_cycle_terminates(tmp_path):
+    """Packages can depend on each other's extras."""
+    from blastbox.host.pins import missing_from_locks
+
+    meta = {
+        ("a-pkg", "1.0"): ['b-pkg[y]>=1; extra == "x"'],
+        ("b-pkg", "1.0"): ['a-pkg[x]>=1; extra == "y"'],
+    }
+    _write(
+        tmp_path,
+        "req.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("a-pkg==1.0")
+        + _entry("b-pkg==1.0"),
+    )
+    gaps = missing_from_locks(
+        tmp_path,
+        ["pydantic>=2.6.0", "a-pkg[x]>=1"],
+        requirements_of=lambda n, v: meta.get((n, v)),
+    )
+    assert gaps == {}, gaps
+
+
+def test_an_inline_space_form_hash_is_replaced_too(tmp_path):
+    """Hashes may sit on the requirement line itself, not only below it.
+
+    That is a separate branch of the rewrite, and it kept the old digests while
+    the continuation-line branch was fixed.
+    """
+    from blastbox.host.pins import set_version
+
+    old_hash = "b" * 64
+    lock = tmp_path / "requirements.lock"
+    lock.write_text(f"blastbox==0.1.38 --hash sha256:{old_hash}\n")
+    new = "c" * 64
+    set_version(tmp_path, "0.1.39", digests=[new])
+    text = lock.read_text()
+    assert "0.1.39" in text and new in text, text
+    assert old_hash not in text, text
