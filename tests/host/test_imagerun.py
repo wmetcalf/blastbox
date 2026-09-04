@@ -658,28 +658,52 @@ def test_no_artifact_is_published_when_a_later_one_fails(
     assert (d / "first.ext4").read_text() == "old-first", "an artifact was published anyway"
 
 
-def test_a_builder_stage_image_is_pinned_to_a_digest(
+def test_a_builder_stage_image_is_pinned_to_a_resolvable_reference(
     tmp_path: Path, monkeypatch
 ) -> None:
     """A multi-stage Dockerfile COPIES artifacts out of these. Only the primary
     base was ever resolved and recorded, so an upstream push could change what
-    lands in the image while every label stayed identical."""
+    lands in the image while every label stayed identical.
+
+    The pin must be the FULL `repo@sha256:...`. My first version of this test
+    monkeypatched the digest helper and asserted the value I had chosen, so it
+    passed while the real code emitted a bare `sha256:...` -- which docker
+    resolves as `docker.io/library/sha256:...` and refuses with an
+    authorization error naming a repository nobody wrote. It got as far as a
+    real build on toolz2 before anything noticed. The helper is no longer
+    mocked: the runner returns what `docker inspect` actually prints.
+    """
     import blastbox.host.imagerun as mod
 
     monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
-    digest = "docker.io/library/jdk@sha256:" + "d" * 64
-    monkeypatch.setattr(mod, "_digest_from", lambda _img, _json: digest)
     text = SPEC.replace(
         'base = "upstream:1"',
         'base = "upstream:1"\nbuild_args = { JDK_BUILD_IMAGE = "eclipse-temurin:25-jdk" }',
         1,
     )
-    run = FakeRunner(stdout='["jdk@sha256:' + "d" * 64 + '"]')
+    digest = "sha256:" + "d" * 64
+
+    class InspectingRunner(FakeRunner):
+        def __call__(self, argv, **kw):
+            bare = self._bare(list(argv))
+            if bare[:2] == ["docker", "inspect"] and "{{json .RepoDigests}}" in bare:
+                # exactly what docker prints for a pulled upstream image
+                self.calls.append(list(argv))
+                return subprocess.CompletedProcess(
+                    list(argv), 0,
+                    stdout='["eclipse-temurin@' + digest + '"]', stderr="",
+                )
+            return super().__call__(argv, **kw)
+
+    run = InspectingRunner()
     build_plan(_plan(tmp_path, text), "t1", blastbox_version="0.1.34", run=run,
                log=lambda _: None)
     builds = run.verb("docker", "build")
     assert builds, run.calls
-    assert any(f"JDK_BUILD_IMAGE={digest}" in a for a in builds[0]), builds[0]
+    pinned = [a for a in builds[0] if a.startswith("JDK_BUILD_IMAGE=")]
+    assert pinned == [f"JDK_BUILD_IMAGE=eclipse-temurin@{digest}"], pinned
+    # the failure this encodes: a bare digest names no repository
+    assert not pinned[0].endswith(f"={digest}"), "pinned to a bare digest docker cannot resolve"
 
 
 def test_a_non_image_build_arg_is_left_alone(tmp_path: Path, monkeypatch) -> None:

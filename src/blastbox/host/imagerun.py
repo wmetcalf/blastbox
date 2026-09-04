@@ -34,7 +34,7 @@ from pathlib import Path, PurePosixPath
 from blastbox.host import images as _images
 from blastbox.host.images import ImageSpec, Plan, RootfsSpec
 from blastbox.host.stamp import StampError
-from blastbox.host.stamp import _digest_from
+from blastbox.host.stamp import repo_digest_ref as _repo_digest_ref
 from blastbox.host.stamp import build_args as _stamp_flags
 from blastbox.host.stamp import read as _read_stamp
 from blastbox.host.stamp import verify_contents as _verify_contents
@@ -118,7 +118,11 @@ def _pin_builder_images(
         if proc.returncode != 0:
             log(f"   note: could not resolve {key}={value} to a digest; left as the tag")
             continue
-        digest = _digest_from(value, (proc.stdout or "").strip())
+        # The FULL `repo@sha256:...`, not the bare digest. A bare one handed to
+        # docker as a base resolves as `docker.io/library/sha256:...` and fails
+        # with an authorization error naming a repository nobody wrote --
+        # measured on toolz2, on titanarum's very first real build.
+        digest = _repo_digest_ref(value, (proc.stdout or "").strip())
         if digest:
             out[key] = digest
             log(f"   pinned {key} -> {digest}")

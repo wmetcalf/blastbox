@@ -284,16 +284,16 @@ def base_image_id(image: str, runner: Runner | None = None) -> str:
     raise StampError(f"{image}: cannot resolve an image ID (absent, or docker unavailable)")
 
 
-def _digest_from(image: str, digests_json: str) -> str:
-    """Pick the repo digest belonging to ``image``'s repository, or "".
+def repo_digest_ref(image: str, digests_json: str) -> str:
+    """The full ``repo@sha256:...`` reference for ``image``'s repository, or "".
 
-    Shared by the single-fact and the one-snapshot readers so both apply the
-    same rule: one image can carry digests from several repositories, and a
-    sole entry for the WRONG repository is refused rather than assumed.
+    The full reference, not the bare digest: a bare `sha256:...` handed to
+    docker as a base resolves as `docker.io/library/sha256:...` and fails with
+    an authorization error naming a repository nobody wrote. That is fine for a
+    LABEL, which is what `_digest_from` returns, and wrong for anything the
+    build has to resolve.
     """
     try:
-        # Docker reports a nil RepoDigests field as JSON `null`, which decodes
-        # to None and is not iterable.
         raw = json.loads(digests_json or "[]")
     except json.JSONDecodeError:
         raw = []
@@ -302,13 +302,26 @@ def _digest_from(image: str, digests_json: str) -> str:
     want = _canonical_repo(repo)
     matching = [d for d in digests if _canonical_repo(d.split("@", 1)[0]) == want]
     if matching:
-        return matching[0].split("@", 1)[-1]
+        return matching[0]
     if digests:
         raise StampError(
             f"{image}: {len(digests)} repo digests and none for {repo!r}; "
             "cannot tell which base this is"
         )
     return ""
+
+
+def _digest_from(image: str, digests_json: str) -> str:
+    """The bare ``sha256:...`` for ``image``'s repository, or "".
+
+    For LABELS. Anything the build must resolve wants `repo_digest_ref`.
+
+    Shared by the single-fact and the one-snapshot readers so both apply the
+    same rule: one image can carry digests from several repositories, and a
+    sole entry for the WRONG repository is refused rather than assumed.
+    """
+    ref = repo_digest_ref(image, digests_json)
+    return ref.split("@", 1)[-1] if ref else ""
 
 
 def _inspect_base(image: str, runner: Runner | None = None) -> tuple[str, str]:
