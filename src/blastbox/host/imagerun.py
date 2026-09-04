@@ -490,6 +490,10 @@ def _normalize_root(tree: Path, priv: list[str], run: Runner) -> None:
     _must([*priv, "chmod", "0755", str(tree)], "chmod rootfs root", run)
 
 
+class _Unreadable(Exception):
+    """The tree could not be inspected, which is distinct from a missing file."""
+
+
 def _present_in(tree: Path, requirement: str) -> bool:
     """Whether ``requirement`` exists INSIDE ``tree``, on the image's own terms.
 
@@ -510,6 +514,11 @@ def _present_in(tree: Path, requirement: str) -> bool:
         candidate = current / part
         try:
             st = candidate.lstat()
+        except PermissionError as exc:
+            # Not being able to look is not an answer. Reporting "absent" here
+            # sends an operator hunting for a file that is present, which is
+            # exactly what a root-owned 0700 staging directory did.
+            raise _Unreadable(f"{requirement}: {exc}") from exc
         except OSError:
             return False
         last = i == len(parts) - 1
@@ -599,7 +608,13 @@ def _check_requires(tree: Path, spec: RootfsSpec, image: str) -> None:
             f"{spec.dest} declares a requirement that cannot be checked: "
             + "; ".join(malformed)
         )
-    missing = [r for r in spec.requires if not _present_in(tree, r)]
+    try:
+        missing = [r for r in spec.requires if not _present_in(tree, r)]
+    except _Unreadable as exc:
+        raise BuildError(
+            f"could not check what {image} contains ({exc}); refusing to publish "
+            "a rootfs that has not been checked"
+        ) from exc
     if missing:
         raise BuildError(
             f"{image} is missing {missing}, which {spec.dest} declares it requires; "
@@ -705,9 +720,14 @@ def stage_rootfs(
             extract(source, staging)
         else:
             _extract_image(source, staging, run, log, as_root=as_root)
+        # BEFORE the checks, not after. `mktemp -d` makes the staging root
+        # 0700, and under privilege it is owned by ROOT -- so the in-process
+        # requirement walk could not traverse into it and reported /init
+        # missing on a rootfs that contained it. The root's mode is ours to
+        # set; the contents are the image's.
+        _normalize_root(staging, priv, run)
         _check_requires(staging, spec, image)
         _check_no_setuid(staging, spec, image, priv, run)
-        _normalize_root(staging, priv, run)
 
         if spec.kind == "dir":
             ready = staging

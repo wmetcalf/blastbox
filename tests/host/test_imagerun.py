@@ -1047,3 +1047,53 @@ def test_a_staging_directory_that_was_never_named_is_refused(
         export_rootfs(plan, plan.rootfs[0], "t1", run=SilentMktemp(), log=lambda _: None,
                       extract=_fake_extract({"/init": "x"}))
     assert "named no directory" in str(e.value)
+
+
+def test_a_requirement_under_an_unreadable_directory_is_not_reported_missing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Hit on real hardware: `mktemp -d` under sudo makes the staging root
+    0700 and owned by ROOT, so the in-process walk could not traverse into it
+    and reported `/init` missing on a rootfs that contained it.
+
+    "Cannot look" is not "absent" — reporting absence sends an operator hunting
+    for a file that is right there.
+    """
+    from blastbox.host.imagerun import _Unreadable, _present_in
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    locked = tree / "opt"
+    locked.mkdir()
+    (locked / "init").write_text("x")
+    locked.chmod(0o000)
+    try:
+        with pytest.raises(_Unreadable):
+            _present_in(tree, "/opt/init")
+    finally:
+        locked.chmod(0o755)
+    assert _present_in(tree, "/opt/init") is True
+
+
+def test_the_staging_root_is_made_traversable_before_it_is_checked(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The ORDER is the fix: normalize, then check.
+
+    The root's mode is ours to set; the contents are the image's. Checking
+    first meant every requirement lookup ran against a directory the process
+    could not enter.
+    """
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_root_prefix", lambda: ["sudo"])
+    monkeypatch.setattr(mod, "_can_be_root", lambda: True)
+    dest_dir = tmp_path / "fc"
+    dest_dir.mkdir()
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    plan = _plan(tmp_path)
+    run = FakeRunner()
+    export_rootfs(plan, plan.rootfs[0], "t1", run=run, log=lambda _: None,
+                  extract=_fake_extract({"/init": "x"}))
+    order = [c for c in run.calls if "chmod" in c or "find" in c]
+    assert order and "chmod" in order[0], f"the tree was checked before it was normalized: {order}"
