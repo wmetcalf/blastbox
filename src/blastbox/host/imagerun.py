@@ -770,25 +770,23 @@ def stage_rootfs(
     as_root = _can_be_root()
     priv = _root_prefix() if (as_root or need_sudo) else []
 
+    # BEFORE any directory is created. `_ensure_dir`/`_stage_dir` raise a bare
+    # PermissionError under a protected destination, and the CLI catches only
+    # BuildError -- so the very environment this refusal exists for got a
+    # traceback instead of the actionable message.
+    if extract is None and not as_root:
+        raise BuildError(
+            f"cannot extract {image} with ownership preserved: this process is "
+            "not root and has no passwordless sudo. An unprivileged extraction "
+            "reassigns every file to the invoking user and drops setuid bits, "
+            "so the published rootfs would not be the image that was verified."
+        )
     _ensure_dir(dest.parent, priv, run)
     staging = _stage_dir(dest.parent, priv, run)
     try:
         if extract is not None:
             extract(source, staging)
         else:
-            if not as_root:
-                # An unprivileged tar reassigns every file to the invoking UID
-                # and drops setuid bits and device nodes, and the tree is then
-                # audited, formatted and published as if it faithfully
-                # represented the image. Refusing is the honest outcome: the
-                # artifact would not be the one that was verified.
-                raise BuildError(
-                    f"cannot extract {image} with ownership preserved: this "
-                    "process is not root and has no passwordless sudo. An "
-                    "unprivileged extraction reassigns every file to the "
-                    "invoking user and drops setuid bits, so the published "
-                    "rootfs would not be the image that was verified."
-                )
             _extract_image(source, staging, run, log, as_root=as_root)
         # BEFORE the checks, not after. `mktemp -d` makes the staging root
         # 0700, and under privilege it is owned by ROOT -- so the in-process

@@ -43,7 +43,11 @@ LABEL_BASE_IMAGE_ID = "org.blastbox.base.image_id"
 # word-splits its output but does NOT remove quotes, so a quoted value arrives
 # with literal quote characters attached. Rather than emit something that breaks,
 # refuse values that would need quoting.
-_SHELL_SAFE = re.compile(r"^[\w@%+=:,./-]*$")
+# `!` is included for PEP 440 EPOCHS (`1!0.2.0`). It is not special to any
+# shell in an unquoted word -- only interactive bash history expansion treats
+# it that way, and these values go through an argv list, never a shell line.
+# Excluding it made every epoch-bearing version impossible to build.
+_SHELL_SAFE = re.compile(r"^[\w@%+=:,./!-]*$")
 
 UNKNOWN = "unknown"
 DIRTY_SUFFIX = "-dirty"

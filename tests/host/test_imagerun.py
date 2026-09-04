@@ -1476,3 +1476,40 @@ def test_the_source_state_counts_untracked_files(tmp_path: Path) -> None:
     before = mod._source_state(repo)
     (repo / "sneaked-in").write_text("new build input")
     assert mod._source_state(repo) != before, "an untracked file left the state unchanged"
+
+
+def test_an_epoch_version_survives_the_stamp_validation(tmp_path: Path) -> None:
+    """`1!0.2.0` was captured correctly and then rejected downstream: the
+    shell-safe pattern excluded `!`, so every epoch-bearing version this
+    supports was still impossible to build."""
+    from blastbox.host.stamp import _SHELL_SAFE
+
+    assert _SHELL_SAFE.match("1!0.2.0.post2")
+    # and the pattern still refuses what it exists to refuse
+    assert not _SHELL_SAFE.match("bad;rm -rf /")
+    assert not _SHELL_SAFE.match("a$(x)")
+
+
+def test_a_protected_destination_refuses_before_creating_anything(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`_ensure_dir`/`_stage_dir` raise a bare PermissionError under a
+    protected destination, and the CLI catches only BuildError — so the very
+    environment this refusal exists for got a traceback instead of the message.
+    """
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_root_prefix", lambda: [])
+    monkeypatch.setattr(mod, "_can_be_root", lambda: False)
+    protected = tmp_path / "protected"
+    protected.mkdir()
+    protected.chmod(0o555)
+    monkeypatch.setenv("DEMO_DIR", str(protected))
+    plan = _plan(tmp_path)
+    try:
+        with pytest.raises(BuildError) as e:
+            export_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None)
+        assert "ownership preserved" in str(e.value)
+        assert not list(protected.iterdir()), "something was created before the refusal"
+    finally:
+        protected.chmod(0o755)
