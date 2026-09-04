@@ -7,7 +7,9 @@ is where all of those failures lived — rather than about docker.
 
 from __future__ import annotations
 
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -340,3 +342,46 @@ def test_a_missing_pyproject_is_not_a_crash(tmp_path: Path) -> None:
     from blastbox.host.cli import _declared_blastbox_version
 
     assert _declared_blastbox_version(tmp_path / "nope") == ""
+
+
+def test_progress_lines_are_flushed(tmp_path: Path) -> None:
+    """Observed on the first real run of this code: the log file held pages of
+    docker output and not one line saying which image was being built.
+
+    Python block-buffers stdout to a FILE while the docker child writes straight
+    to the same descriptor, so unflushed progress lines all land at the end —
+    and on a failure the last line printed is not the step that failed.
+
+    Asserting the ORDER in a real redirected file is the only thing that tests
+    this. capfd reads the descriptor after the process ends, by which point
+    everything has been flushed anyway, so a capfd version of this test passes
+    with flush removed. Mine did.
+    """
+    import blastbox.host.imagerun as mod
+
+    # .../<root>/blastbox/host/imagerun.py -> the directory holding `blastbox`
+    pkg_root = Path(mod.__file__).resolve().parents[2]
+    script = (
+        "from blastbox.host.imagerun import _log\n"
+        "import subprocess\n"
+        '_log(">> build demo:t1")\n'
+        'subprocess.run(["printf", "CHILD-OUTPUT\\n"], check=True)\n'
+    )
+    log = tmp_path / "run.log"
+    with log.open("w") as fh:
+        subprocess.run(
+            [sys.executable, "-c", script],
+            stdout=fh,
+            check=True,
+            env={
+                **os.environ,
+                "PYTHONPATH": os.pathsep.join(
+                    [str(pkg_root), os.environ.get("PYTHONPATH", "")]
+                ).rstrip(os.pathsep),
+            },
+        )
+    text = log.read_text()
+    assert ">> build demo:t1" in text and "CHILD-OUTPUT" in text, text
+    assert text.index(">> build demo:t1") < text.index("CHILD-OUTPUT"), (
+        f"progress landed after the child's output:\n{text}"
+    )

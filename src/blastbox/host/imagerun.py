@@ -44,6 +44,19 @@ Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 Log = Callable[[str], None]
 
 
+def _log(message: str) -> None:
+    """Print, FLUSHED.
+
+    Python block-buffers stdout when it is redirected to a file, while the
+    docker child writes straight to the same descriptor. Unflushed, every
+    progress line lands after all the build output it was meant to introduce:
+    an operator tailing the log sees pages of docker with nothing saying which
+    image is being built, and on a failure the last line printed is not the
+    step that failed.
+    """
+    print(message, flush=True)
+
+
 def _default_runner(
     argv: Sequence[str],
     *,
@@ -88,7 +101,7 @@ def build_plan(
     blastbox_version: str,
     env: dict[str, str] | None = None,
     run: Runner | None = None,
-    log: Log = print,
+    log: Log = _log,
     pull: bool = True,
 ) -> list[str]:
     """Build every image in the chain, each stamped with what it was built from.
@@ -268,7 +281,7 @@ def export_rootfs(
     *,
     env: dict[str, str] | None = None,
     run: Runner | None = None,
-    log: Log = print,
+    log: Log = _log,
     extract: Callable[[str, Path], None] | None = None,
 ) -> Path:
     """Produce the artifact a warm tier boots, from the image already verified.
@@ -360,7 +373,7 @@ def run_plan(
     blastbox_version: str,
     env: dict[str, str] | None = None,
     run: Runner | None = None,
-    log: Log = print,
+    log: Log = _log,
     extract: Callable[[str, Path], None] | None = None,
 ) -> list[str]:
     """Build, verify, then export — in that order, and only ever in that order.
