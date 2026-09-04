@@ -147,9 +147,22 @@ def _strip_comment(line: str) -> str:
     VCS requirement at its fragment, so
     `pip install git+https://.../blastbox.git#egg=blastbox[s3]` read as an
     install of nothing in particular.
+
+    Quoted text is data, not a comment: `RUN echo "step # 1" && pip install
+    blastbox==2` is one command whose pin lives AFTER the hash, and cutting
+    there hid the install from `pins --set`, which then reported success while
+    that Dockerfile stayed stale.
     """
-    match = re.search(r"(?:^|\s)#", line)
-    return line if match is None else line[: match.start()]
+    quote: str | None = None
+    for index, char in enumerate(line):
+        if quote is not None:
+            if char == quote:
+                quote = None
+        elif char in "\"'":
+            quote = char
+        elif char == "#" and (index == 0 or line[index - 1].isspace()):
+            return line[:index]
+    return line
 
 
 def _logical_lines(text: str) -> list[tuple[int, str]]:
@@ -1271,6 +1284,18 @@ def _install_sets(root: Path) -> list[tuple[Path, ...]]:
     return sets
 
 
+def _install_segments(line: str) -> list[str]:
+    """The parts of a shell line that are pip install commands.
+
+    A script line is not one command. `echo -r prod.lock && pip install -r
+    dev.lock` names two files to a naive reader, and promoting `prod.lock` to
+    an install root judges it ALONE -- blocking a bump for dependencies the
+    `dev.lock` that really includes it supplies.
+    """
+    segments = re.split(r"&&|\|\||[;|]", line)
+    return [seg for seg in segments if _INSTALL_RE.search(seg)]
+
+
 def _referenced(path: Path, root: Path) -> list[Path]:
     """Requirement files an install script hands to pip with `-r`.
 
@@ -1287,12 +1312,14 @@ def _referenced(path: Path, root: Path) -> list[Path]:
     # Comments stripped: `# old: pip install -r prod.lock` is a note, and
     # promoting it to a root judges that lock alone -- refusing a bump for
     # dependencies its real parent install set supplies.
+    # Only from a pip install command: see `_install_segments`.
     for line in _joined_lines(_read_small(path)):
-        for name in _requirement_args(line):
-            for base in (path.parent, root):
-                target = _safe_include(base / name, root)
-                if target is not None:
-                    out.append(target)
+        for segment in _install_segments(line):
+            for name in _requirement_args(segment):
+                for base in (path.parent, root):
+                    target = _safe_include(base / name, root)
+                    if target is not None:
+                        out.append(target)
     return out
 
 
@@ -1507,6 +1534,28 @@ def _lock_environment(text: str) -> dict[str, str]:
     return out
 
 
+def _exact_pin(line: str) -> tuple[str, frozenset[str], str] | None:
+    """``(name, extras, version)`` for a lock entry pinning one exact version.
+
+    `packaging!=21,==23` is an exact pin whose `==` is not first; pip resolves
+    it to 23 and hashes it like any other. Parsed rather than pattern-matched
+    so the ORDER of the specifiers cannot decide whether a pin is seen.
+    """
+    text = _HASH_RE.sub("", _strip_comment(line)).strip()
+    if not text:
+        return None
+    req = _requirement(text)
+    if req is None:
+        return None
+    exact = [
+        s for s in req.specifier if s.operator in ("==", "===") and "*" not in s.version
+    ]
+    if len(exact) != 1:
+        return None  # no single exact version: pip has a range here, not a pin
+    extras = frozenset(e.strip().lower() for e in (req.extras or set()) if e.strip())
+    return _dist_name(req.name), extras, exact[0].version
+
+
 def _effective_pins(
     path: Path, root: Path | None = None, _seen: set[Path] | None = None
 ) -> tuple[dict[str, list[_Pin]], set[str], dict[str, str]]:
@@ -1548,22 +1597,20 @@ def _effective_pins(
                 extras |= sub_extras
                 env = {**sub_env, **env}
             continue
-        match = re.match(
-            r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(\[[^\]]*\])?\s*==\s*([^\s;]+)", line
-        )
-        if not match:
+        # The whole requirement, not a leading `==`: a valid hashed entry may
+        # spell its exact pin as `packaging!=21,==23`, and reading only the
+        # first specifier dropped it from the pins entirely -- so a release
+        # needing `packaging>=23` was reported missing against a lock that
+        # pins exactly 23.
+        entry = _exact_pin(line)
+        if entry is None:
             continue
-        name = _dist_name(match.group(1))
+        name, entry_extras, version = entry
         _, _, after = line.partition(";")
         marker = after.split("--hash")[0].strip() if after else ""
-        entry_extras = frozenset(
-            e.strip().lower()
-            for e in (match.group(2) or "[]")[1:-1].split(",")
-            if e.strip()
-        )
         pins.setdefault(name, []).append(
             _Pin(
-                version=match.group(3),
+                version=version,
                 marker=marker,
                 # BOTH spellings. pip documents `--hash <hash>` and its parser
                 # accepts the space form, so matching only `--hash=` reads a
@@ -1722,7 +1769,7 @@ def _constraint_args(text: str) -> list[str]:
 def _referenced_in(line: str, base: Path, root: Path) -> list[Path]:
     """Requirement files named by ONE command."""
     out: list[Path] = []
-    for name in _requirement_args(line):
+    for name in [n for seg in _install_segments(line) for n in _requirement_args(seg)]:
         for candidate in (base, root):
             target = _safe_include(candidate / name, root)
             if target is not None:
@@ -1776,6 +1823,10 @@ def _blastbox_extras_in(path: Path) -> set[str]:
         project = data.get("project") or {}
         specs = list(project.get("dependencies") or [])
         for group in (project.get("optional-dependencies") or {}).values():
+            specs.extend(group or [])
+        # PEP 735 groups live at the TOP level, not under [project], and a lock
+        # is commonly compiled from one. `_scan_pyproject` already reads them.
+        for group in (data.get("dependency-groups") or {}).values():
             specs.extend(group or [])
         for spec in specs:
             if isinstance(spec, str):

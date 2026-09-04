@@ -3410,3 +3410,105 @@ def test_an_explicit_environment_still_narrows_a_universal_lock(tmp_path):
         missing_from_locks(tmp_path, requires, environment={"sys_platform": "linux"})
         == {}
     )
+
+
+def test_a_quoted_hash_does_not_hide_the_install_behind_it(tmp_path):
+    """`RUN echo "step # 1" && pip install ...` is one command, not a comment.
+
+    Cutting the line at the quoted hash hid the pin, and `pins --set` then
+    reported success while that Dockerfile stayed on the old version.
+    """
+    from blastbox.host.pins import _scan_dockerfile
+
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        'FROM python:3.12\nRUN echo "step # 1" && pip install blastbox==0.1.30\n'
+    )
+    assert [p.specifier for p in _scan_dockerfile(dockerfile)] == ["==0.1.30"]
+
+
+def test_an_exact_pin_is_found_wherever_it_sits_in_the_specifier_set(tmp_path):
+    """`packaging!=21,==23` is an exact pin; pip resolves it to 23."""
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "requirements.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging!=21.0,==26.3")
+        + _entry("backport==1.0"),
+    )
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\nRUN pip install --require-hashes -r requirements.lock\n"
+    )
+    assert (
+        missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"}) == {}
+    )
+
+
+def test_a_range_is_still_not_a_pin(tmp_path):
+    """Control: `packaging>=23,<27` resolves to nothing in particular."""
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "requirements.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging>=23.0,<27")
+        + _entry("backport==1.0"),
+    )
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\nRUN pip install --require-hashes -r requirements.lock\n"
+    )
+    env = {"python_version": "3.12"}
+    gaps = missing_from_locks(tmp_path, _RM, environment=env)
+    assert any(
+        "packaging" in g for g in gaps.get(str(tmp_path / "requirements.lock"), [])
+    ), gaps
+    # And it is reported because nothing is PINNED, not because some invented
+    # version fails the comparison: a requirement that ANY version satisfies is
+    # still a gap here, since `--require-hashes` needs an exact pin.
+    loose = missing_from_locks(tmp_path, ["packaging>=0"], environment=env)
+    assert any(
+        "packaging" in g for g in loose.get(str(tmp_path / "requirements.lock"), [])
+    ), loose
+
+
+def test_a_pep_735_group_declares_extras_too(tmp_path):
+    """A lock is commonly compiled from a top-level dependency group."""
+    from blastbox.host.pins import _blastbox_extras_in
+
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "demo"\ndependencies = ["blastbox>=0.1.39,<0.2"]\n\n'
+        '[dependency-groups]\ndev = ["blastbox[host]>=0.1.39,<0.2"]\n'
+    )
+    assert _blastbox_extras_in(pyproject) == {"host"}
+
+
+def test_only_an_install_command_names_a_root(tmp_path):
+    """`echo -r prod.lock` is not an install; judging prod.lock alone is wrong.
+
+    Its real parent set (`dev.lock`) supplies the rest, so promoting it blocks
+    a bump for dependencies that are present in the file pip actually installs.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path, "prod.lock", _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5")
+    )
+    _write(
+        tmp_path,
+        "dev.lock",
+        "-r prod.lock\n" + _entry("packaging==26.3") + _entry("backport==1.0"),
+    )
+    (tmp_path / "build.sh").write_text(
+        "#!/bin/sh\n"
+        "echo -r prod.lock > /dev/null\n"
+        "pip install --require-hashes -r dev.lock\n"
+    )
+    assert (
+        missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"}) == {}
+    )
