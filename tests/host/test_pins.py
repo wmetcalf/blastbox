@@ -3762,7 +3762,7 @@ def test_extras_are_attributed_only_within_their_install_segment(tmp_path):
     Reading the whole line attributes host to prod.lock, whose own base-only
     install is then reported missing dependencies it deliberately omits.
     """
-    from blastbox.host.pins import _declared_extras_for
+    from blastbox.host.pins import _install_sets
 
     (tmp_path / "prod.lock").write_text("")
     (tmp_path / "dev.lock").write_text("")
@@ -3771,8 +3771,46 @@ def test_extras_are_attributed_only_within_their_install_segment(tmp_path):
         "RUN echo -r prod.lock > /dev/null \\\n"
         "    && pip install blastbox[host] -r dev.lock\n"
     )
-    assert _declared_extras_for(tmp_path, tmp_path / "dev.lock", 2) == {"host"}
-    assert _declared_extras_for(tmp_path, tmp_path / "prod.lock", 2) == set()
+    named = {
+        tuple(m.name for m in iset.members): set(iset.extras)
+        for iset in _install_sets(tmp_path)
+    }
+    assert named.get(("dev.lock",)) == {"host"}, named
+    assert named.get(("prod.lock",)) == set(), named
+
+
+def test_a_shared_lock_keeps_the_extras_of_each_command_apart(tmp_path):
+    """One command installs `blastbox[host] -r a.lock -r b.lock`; another
+    installs plain `-r b.lock`.
+
+    Both succeed. Attributing host to the standalone base install reports it
+    incomplete for dependencies that live in a.lock and that this resolution
+    never asked for.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "a.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("fastapi==1.2.0")
+        + _entry("uvicorn==1.1.0"),
+    )
+    _write(
+        tmp_path,
+        "b.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging==26.3")
+        + _entry("backport==1.0"),
+    )
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\n"
+        "RUN pip install blastbox[host] --require-hashes -r a.lock -r b.lock\n"
+        "RUN pip install --require-hashes -r b.lock\n"
+    )
+    gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert gaps == {}, gaps
 
 
 def test_a_local_version_satisfies_a_plain_exact_pin(tmp_path):
@@ -3875,3 +3913,59 @@ def test_one_lock_installed_by_two_commands_still_infers_declarations(tmp_path):
         tmp_path, requires, environment={"python_version": "3.12"}
     )
     assert any("s3only" in g for entries in gaps.values() for g in entries), gaps
+
+
+def test_member_order_does_not_make_one_set_look_like_two(tmp_path):
+    """`-r a.lock -r b.lock` and `-r b.lock -r a.lock` install the same files.
+
+    Two commands, one set of files -- and treating them as two disabled the
+    repository-declaration inference that reports a missing extra dependency.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\ndependencies = ["blastbox[s3]>=0.1.39,<0.2"]\n'
+    )
+    _write(tmp_path, "a.lock", _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5"))
+    _write(tmp_path, "b.lock", _entry("packaging==26.3") + _entry("backport==1.0"))
+    (tmp_path / "one.txt").write_text("packaging>=20\n")
+    (tmp_path / "two.txt").write_text("packaging>=21\n")
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\n"
+        "RUN pip install --require-hashes -r a.lock -r b.lock -c one.txt\n"
+        "RUN pip install --require-hashes -r b.lock -r a.lock -c two.txt\n"
+    )
+    requires = [*_RM, 's3only>=1.0; extra == "s3"']
+    gaps = missing_from_locks(
+        tmp_path, requires, environment={"python_version": "3.12"}
+    )
+    assert any("s3only" in g for entries in gaps.values() for g in entries), gaps
+
+
+def test_both_constrained_resolutions_of_one_lock_are_reported(tmp_path):
+    """Two commands over the same files share an output label.
+
+    Assigning meant the second verdict replaced the first, so fixing what was
+    reported merely revealed the other failure on the next run.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path,
+        "requirements.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging==26.3")
+        + _entry("backport==1.0"),
+    )
+    (tmp_path / "first.txt").write_text("packaging<23\n")
+    (tmp_path / "second.txt").write_text("backport<1\n")
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\n"
+        "RUN pip install --require-hashes -r requirements.lock -c first.txt\n"
+        "RUN pip install --require-hashes -r requirements.lock -c second.txt\n"
+    )
+    gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    reported = gaps[str(tmp_path / "requirements.lock")]
+    assert any("packaging" in g and "excluded" in g for g in reported), reported
+    assert any("backport" in g and "excluded" in g for g in reported), reported

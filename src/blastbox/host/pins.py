@@ -876,7 +876,9 @@ def missing_from_locks(
     # resolutions but one lock, and a declaration like `blastbox[host]` has
     # only that one lock to apply to -- counting commands disabled the
     # inference for both, and a missing host dependency went unreported.
-    n_distinct = len({iset.members for iset in sets})
+    # Canonical: the same two locks named in the opposite order under
+    # different constraints are two commands installing ONE set of files.
+    n_distinct = len({frozenset(iset.members) for iset in sets})
     for iset in sets:
         members = iset.members
         pins, env = _merged_pins(members, root)
@@ -899,7 +901,12 @@ def missing_from_locks(
             for gap, where in found.items()
         ]
         if gaps:
-            out[" + ".join(str(m) for m in members)] = gaps
+            # Accumulated, not assigned: two commands installing the same files
+            # under different constraints share this label, and the second
+            # verdict silently replaced the first -- so fixing what was
+            # reported merely revealed the other failure on the next run.
+            key = " + ".join(str(m) for m in members)
+            out.setdefault(key, []).extend(g for g in gaps if g not in out[key])
     return out
 
 
@@ -1228,7 +1235,6 @@ def _judge_scope(
     requirements_of: Callable[[str, str], list[str] | None] | None,
 ) -> list[str]:
     """What this install set is missing IN ONE marker environment."""
-    members = iset.members
     gaps: list[str] = []
     # Two exact pins for one distribution, both applicable here. pip has to
     # satisfy both and cannot: the set is unresolvable however well it covers
@@ -1282,12 +1288,14 @@ def _judge_scope(
         if _marker_holds(pin.marker, scope)
         for e in pin.extras
     }
-    declared = set()
-    for member in members:
-        # The number of install SETS, not of files: two locks installed by one
-        # command are one resolution, and counting them as two disabled the
-        # single-set fallback that infers what the repository declares.
-        declared |= _declared_extras_for(root, member, n_sets)
+    # What THIS command asked blastbox for. A declaration is evidence only
+    # about the resolution that selects it.
+    declared = set(iset.extras)
+    if not declared and n_sets == 1:
+        # The repository's own declaration, but only where there is a single
+        # install set and so nothing to confuse it with. RedTusk is that case:
+        # one lock, and `blastbox[host,s3]` in its pyproject.
+        declared = _declared_blastbox_extras(root)
     if not enforced and not declared:
         declared = _extras_in_play(parsed, pins, scope)
     extras = enforced | declared
@@ -1358,6 +1366,12 @@ class _InstallSet:
 
     members: tuple[Path, ...]
     constraints: tuple[Path, ...] = ()
+    # Extras named by THIS command (`pip install blastbox[host] -r a.lock`).
+    # Held here rather than rescanned per member: one command installing
+    # `blastbox[host] -r a.lock -r b.lock` says nothing about a SEPARATE
+    # command installing plain `-r b.lock`, and attributing host to both
+    # reported the standalone base install incomplete.
+    extras: frozenset[str] = frozenset()
 
 
 def _install_sets(root: Path) -> list[_InstallSet]:
@@ -1379,7 +1393,7 @@ def _install_sets(root: Path) -> list[_InstallSet]:
     roots = _install_roots(root)
     known = {p.resolve(): p for p in roots}
     sets: list[_InstallSet] = []
-    seen: set[tuple[frozenset[Path], frozenset[Path]]] = set()
+    seen: set[tuple[frozenset[Path], frozenset[Path], frozenset[str]]] = set()
     grouped: set[Path] = set()
     for path in _walk(root):
         if not _INSTALL_SCRIPT_RE.fullmatch(path.name) or _is_install_input(path):
@@ -1401,11 +1415,18 @@ def _install_sets(root: Path) -> list[_InstallSet]:
                         if (c := _safe_include(base / name, root)) is not None
                     )
                 )
-                key = (frozenset(p.resolve() for p in named), frozenset(limits))
+                declared: set[str] = set()
+                for token in _shell_tokens(segment):
+                    declared |= _extras_of(token)
+                key = (
+                    frozenset(p.resolve() for p in named),
+                    frozenset(limits),
+                    frozenset(declared),
+                )
                 if key in seen:
                     continue
                 seen.add(key)
-                sets.append(_InstallSet(tuple(named), limits))
+                sets.append(_InstallSet(tuple(named), limits, frozenset(declared)))
                 grouped |= key[0]
     sets.extend(_InstallSet((p,)) for p in roots if p.resolve() not in grouped)
     return sets
@@ -1812,49 +1833,6 @@ def _applicable_names(pins: dict[str, list[_Pin]], scope: dict[str, str]) -> set
         for name, entries in pins.items()
         if any(_marker_holds(pin.marker, scope) for pin in entries)
     }
-
-
-def _declared_extras_for(root: Path, lock: Path, n_sets: int) -> set[str]:
-    """Blastbox extras that apply to THIS install set.
-
-    A declaration is evidence only about the set that selects it. A `dev`
-    optional group containing `blastbox[host]` says nothing about a separate
-    production lock installing plain blastbox, and demanding host's closure
-    there rejects a correct lock.
-
-    Attributed two ways, both narrow:
-
-    * a file that installs this lock and also names blastbox extras -- a
-      Dockerfile doing `pip install blastbox[host]` beside `-r prod.lock`;
-    * the repository's declarations, but ONLY when there is a single install
-      set, where there is nothing to confuse them with. RedTusk is that case:
-      one lock, and `blastbox[host,s3]` in its pyproject.
-
-    Anything else falls through to inference -- a guess, but a local one.
-    """
-    out: set[str] = set()
-    target = lock.resolve()
-    for path in _walk(root):
-        if not _INSTALL_SCRIPT_RE.fullmatch(path.name) or _is_install_input(path):
-            continue
-        # Per COMMAND, not per file. A multi-stage Dockerfile can install plain
-        # blastbox from prod.lock in one stage and `blastbox[host]` from
-        # dev.lock in another; taking every occurrence in the file applies host
-        # to prod.lock and rejects a lock whose stage never installs it.
-        # Per install SEGMENT, and only from its arguments. A line may hold a
-        # non-install command naming a lock -- `echo -r prod.lock && pip
-        # install blastbox[host] -r dev.lock` -- and reading the whole line
-        # attributes host to prod.lock, whose own base-only install is then
-        # reported missing dependencies it deliberately does not carry.
-        for line in _joined_lines(_read_small(path)):
-            for segment in _install_segments(line):
-                if target not in set(_referenced_in(segment, path.parent, root)):
-                    continue
-                for token in _shell_tokens(segment):
-                    out |= _extras_of(token)
-    if out:
-        return out
-    return _declared_blastbox_extras(root) if n_sets == 1 else set()
 
 
 def _shell_tokens(text: str) -> list[str]:
