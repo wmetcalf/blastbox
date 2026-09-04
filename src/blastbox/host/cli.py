@@ -1176,17 +1176,26 @@ def _build_images_cmd(args: argparse.Namespace) -> int:
         print("Set them, or give the declaration a ${VAR:-default}.")
         return 2
 
-    print(describe(plan, args.tag))
+    # Resolved BEFORE the description is printed. A dry run that renders
+    # `--build-arg BLASTBOX_VERSION=$BLASTBOX_VERSION` has not told the operator
+    # what it would do, which is the one question a dry run exists to answer.
+    version = args.blastbox_version or _declared_blastbox_version(root)
+    env = {**os.environ, **({"BLASTBOX_VERSION": version} if version else {})}
+
+    print(describe(plan, args.tag, env))
     if args.dry_run:
+        if not version:
+            print()
+            print("NOTE: the blastbox version these images install could not be")
+            print(f"read from {root}/pyproject.toml, so it shows unresolved above.")
+            print("Pass --blastbox-version <version> to see the real plan.")
         print()
         print("checked: every Dockerfile exists, every declared ARG is honoured by")
         print("it, and every destination resolves. Nothing was built.")
         return 0
 
-    # The version the images INSTALL, which is not necessarily the version of
-    # the CLI doing the stamping. Recording the wrong one is worse than
-    # recording nothing, so it is asked for rather than assumed.
-    version = args.blastbox_version or _declared_blastbox_version(root)
+    # Recording the wrong version is worse than recording nothing, so a version
+    # that could not be read is a refusal rather than a guess.
     if not version:
         print("could not read the blastbox version these images will install from")
         print(f"  {root}/pyproject.toml")

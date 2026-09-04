@@ -744,3 +744,20 @@ def test_build_arg_values_are_expanded(tmp_path: Path) -> None:
     plan = load_plan(_plan(tmp_path, text))
     argv = build_command(plan.images[0], "t1", [], "u:1", {"BLASTBOX_VERSION": "0.1.34"}, plan)
     assert "BLASTBOX_VERSION=0.1.34" in argv
+
+
+def test_an_unresolved_build_arg_is_marked_in_the_dry_run(tmp_path: Path) -> None:
+    """An operator reading `=$BLASTBOX_VERSION` should see a hole, not a value
+    docker will somehow work out — the same standard destinations are held to."""
+    from blastbox.host.images import describe
+
+    text = TITANARUM.replace(
+        'build_args = { JDK_BUILD_IMAGE',
+        'build_args = { BLASTBOX_VERSION = "$BLASTBOX_VERSION", JDK_BUILD_IMAGE',
+        1,
+    )
+    plan = load_plan(_plan(tmp_path, text))
+    out = describe(plan, "t1", {})
+    assert "BLASTBOX_VERSION=$BLASTBOX_VERSION [UNRESOLVED]" in out, out
+    ok = describe(plan, "t1", {"BLASTBOX_VERSION": "0.1.34"})
+    assert "BLASTBOX_VERSION=0.1.34" in ok and "UNRESOLVED" not in ok

@@ -638,10 +638,15 @@ def describe(plan: Plan, tag: str, env: dict[str, str] | None = None) -> str:
         if src != plan.root:
             where += f" [stamped from {src}]"
         if spec.build_args:
-            where += " " + " ".join(
-                f"--build-arg {k}={_expand(v, env)}"
-                for k, v in sorted(spec.build_args.items())
-            )
+            # Marked when a value does not resolve, exactly as destinations
+            # are: an operator reading `=$BLASTBOX_VERSION` should see that it
+            # is a hole, not a value docker will somehow work out.
+            rendered = []
+            for k, v in sorted(spec.build_args.items()):
+                shown = _expand(v, env)
+                mark = " [UNRESOLVED]" if "$" in shown else ""
+                rendered.append(f"--build-arg {k}={shown}{mark}")
+            where += " " + " ".join(rendered)
         lines.append(
             f"  build {spec.tagged(tag)}  <- {base_ref} ({kind}) "
             f"via {spec.dockerfile} --base-arg {spec.base_arg}{where}"
