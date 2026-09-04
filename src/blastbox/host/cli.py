@@ -1257,9 +1257,20 @@ def _declared_blastbox_version(root: Path) -> str:
     # install, so recording it is true by construction. `verify_built` then
     # compares the label against what the image actually contains, so a repo
     # whose Dockerfile stops honouring the arg is caught rather than trusted.
+    # The COMPLETE PEP 440 version, not just its dotted numeric prefix. A pin
+    # of `blastbox==0.2.0rc1` was captured as `0.2.0`, and that truncated value
+    # is then passed as the exact build arg -- so the image installs, and
+    # truthfully verifies, a different release than the repo declared.
+    #
+    # Epoch, pre/post/dev segments and a local version are all part of it:
+    #   1!0.2.0rc1.post2.dev3+g<sha>
     m = re.search(
-        r"blastbox(?:\[[A-Za-z0-9,._-]+\])?\s*(==|~=|>=)\s*([0-9]+(?:\.[0-9]+)*)", body
-    )
+        r"blastbox(?:\[[A-Za-z0-9,._-]+\])?\s*(==|~=|>=)\s*"
+        r"((?:[0-9]+!)?[0-9]+(?:\.[0-9]+)*"          # epoch + release
+        r"(?:(?:a|b|rc|alpha|beta|c|pre|preview)[0-9]*)?"   # pre-release
+        r"(?:[.-]?post[0-9]*)?(?:[.-]?dev[0-9]*)?"    # post / dev
+        r"(?:\+[A-Za-z0-9.]+)?)"                      # local version
+    , body)
     return m.group(2) if m else ""
 
 

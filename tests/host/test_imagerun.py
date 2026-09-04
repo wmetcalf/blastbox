@@ -1419,3 +1419,60 @@ def test_sub_mib_growth_still_preserves_the_artifact(tmp_path: Path, monkeypatch
                   extract=_fake_extract({"/init": "x"}))
     # rounded UP, so the new image is not smaller than what it replaces
     assert "65M" in run.verb("truncate")[0], run.verb("truncate")
+
+
+@pytest.mark.parametrize(
+    ("pin", "want"),
+    [
+        ("blastbox==0.2.0rc1", "0.2.0rc1"),
+        ("blastbox==1!0.2.0.post2", "1!0.2.0.post2"),
+        ("blastbox==0.2.0+g1234abc", "0.2.0+g1234abc"),
+        ("blastbox==0.2.0.dev4", "0.2.0.dev4"),
+        ("blastbox>=0.1.36,<0.2", "0.1.36"),
+    ],
+)
+def test_the_complete_pep440_version_is_captured(tmp_path: Path, pin, want) -> None:
+    """A pin of `0.2.0rc1` was captured as `0.2.0`, and that truncated value is
+    passed as the exact build arg — so the image installs, and then truthfully
+    verifies, a different release than the repo declared."""
+    from blastbox.host.cli import _declared_blastbox_version
+
+    (tmp_path / "pyproject.toml").write_text(f'[project]\ndependencies = ["{pin}"]\n')
+    assert _declared_blastbox_version(tmp_path) == want
+
+
+def test_an_unprivileged_extraction_is_refused(tmp_path: Path, monkeypatch) -> None:
+    """An unprivileged tar reassigns every file to the invoking UID and drops
+    setuid bits, and the tree is then audited, formatted and published as if it
+    faithfully represented the image. The artifact would not be the one that
+    was verified."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_root_prefix", lambda: [])
+    monkeypatch.setattr(mod, "_can_be_root", lambda: False)
+    dest_dir = tmp_path / "fc"
+    dest_dir.mkdir()
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    plan = _plan(tmp_path)
+    with pytest.raises(BuildError) as e:
+        export_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None)
+    assert "ownership preserved" in str(e.value)
+
+
+def test_the_source_state_counts_untracked_files(tmp_path: Path) -> None:
+    """A repo or global `status.showUntrackedFiles=no` otherwise hides a build
+    input created while docker was reading the context, and the before/after
+    comparison sees no change at all. `stamp.git_revision` already forces this."""
+    import blastbox.host.imagerun as mod
+
+    repo = tmp_path / "r"
+    repo.mkdir()
+    for cmd in (["init", "-q"], ["config", "user.email", "t@e"], ["config", "user.name", "t"],
+                ["config", "status.showUntrackedFiles", "no"]):
+        subprocess.run(["git", "-C", str(repo), *cmd], check=True, capture_output=True)
+    (repo / "a").write_text("x")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "c"], check=True, capture_output=True)
+    before = mod._source_state(repo)
+    (repo / "sneaked-in").write_text("new build input")
+    assert mod._source_state(repo) != before, "an untracked file left the state unchanged"

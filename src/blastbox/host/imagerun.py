@@ -400,7 +400,11 @@ def _source_state(repo: Path) -> str:
         capture_output=True, text=True, check=False,
     )
     status = subprocess.run(  # noqa: S603
-        ["git", "-C", str(repo), "status", "--porcelain"],
+        # --untracked-files=normal explicitly, exactly as stamp.git_revision
+        # does: a repo or global config carrying status.showUntrackedFiles=no
+        # otherwise hides a new build input created while docker was reading
+        # the context, and the before/after comparison sees no change at all.
+        ["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=normal"],
         capture_output=True, text=True, check=False,
     )
     if head.returncode != 0:
@@ -772,6 +776,19 @@ def stage_rootfs(
         if extract is not None:
             extract(source, staging)
         else:
+            if not as_root:
+                # An unprivileged tar reassigns every file to the invoking UID
+                # and drops setuid bits and device nodes, and the tree is then
+                # audited, formatted and published as if it faithfully
+                # represented the image. Refusing is the honest outcome: the
+                # artifact would not be the one that was verified.
+                raise BuildError(
+                    f"cannot extract {image} with ownership preserved: this "
+                    "process is not root and has no passwordless sudo. An "
+                    "unprivileged extraction reassigns every file to the "
+                    "invoking user and drops setuid bits, so the published "
+                    "rootfs would not be the image that was verified."
+                )
             _extract_image(source, staging, run, log, as_root=as_root)
         # BEFORE the checks, not after. `mktemp -d` makes the staging root
         # 0700, and under privilege it is owned by ROOT -- so the in-process
