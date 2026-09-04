@@ -20,14 +20,17 @@ Every guard below is a failure that has actually happened on this fleet:
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import os
 import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 
@@ -110,7 +113,19 @@ def _pin_builder_images(
         if not _looks_like_an_image(value) or "@sha256:" in value:
             continue
         if pull:
-            run(["docker", "pull", "-q", value], capture_output=True)
+            # NOT fatal, because reaching here is a HEURISTIC: `CACHE_ENDPOINT
+            # = "cache:6379"` looks exactly like an image reference, and
+            # aborting a valid build over a value docker was only ever going to
+            # receive as a string is worse than the drift.
+            #
+            # A failure is reported and the value left alone, so a stale local
+            # image cannot be silently resolved to a digest and recorded as
+            # though it were fresh: the inspect below is skipped too.
+            pulled = run(["docker", "pull", "-q", value], capture_output=True)
+            if pulled.returncode != 0:
+                log(f"   note: could not pull {key}={value} "
+                    f"({(pulled.stderr or '').strip()[:120]}); left as the tag")
+                continue
         proc = run(
             ["docker", "inspect", "--type", "image", value, "--format", "{{json .RepoDigests}}"],
             capture_output=True,
@@ -496,6 +511,121 @@ def _extract_image(image: str, dest: Path, run: Runner, log: Log, *, as_root: bo
     log(f"   extracted {image}")
 
 
+@contextlib.contextmanager
+def _destination_lock(dest: Path) -> Iterator[None]:
+    """Serialise publication AND rollback for one destination.
+
+    This module deliberately supports concurrent exports to a single
+    destination, which makes every check-then-swap a race: two runs can both
+    pass the shrink check against the old artifact, and a rollback can delete a
+    newer run's successful publication and restore a backup that is not its own.
+    Re-checking narrows those windows; only a lock closes them.
+
+    Held on a file keyed by the destination in /tmp rather than beside the
+    artifact: the destination's directory is often root-only, and needing
+    privilege to take a lock would mean the unprivileged path silently skipped
+    it. The key is the full path, so two destinations never share a lock.
+    """
+    key = hashlib.sha256(str(dest).encode()).hexdigest()[:16]
+    path = Path(tempfile.gettempdir()) / f"blastbox-publish-{key}.lock"
+    # O_RDONLY: flock needs a descriptor, not write access. The file PERSISTS,
+    # so an operator who runs once as root leaves it 0644 root-owned under the
+    # usual umask -- and every later run as the deployment user would then get
+    # EACCES on O_RDWR and be unable to publish at all, for a lock it only
+    # wanted to read.
+    # O_NOFOLLOW, because this path is PREDICTABLE and lives in a
+    # world-writable directory: without it an unprivileged user can pre-create
+    # it as a symlink to a root-owned file, and a root run would then follow
+    # the link and fchmod that file to 0666.
+    fd = os.open(path, os.O_CREAT | os.O_RDONLY | os.O_NOFOLLOW, 0o666)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise BuildError(f"{path} is not a regular file; refusing to lock on it")
+        # Widened only when we own it AND it is a plain file, so the chmod can
+        # never land on something we were pointed at.
+        with contextlib.suppress(OSError):
+            if st.st_uid == os.geteuid():
+                os.fchmod(fd, 0o666)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _restore_backup(staged: _Staged, run: Runner, log: Log) -> None:
+    """Put the previous artifact back at ``dest``, best effort.
+
+    Best effort on purpose: this runs while another failure is already
+    propagating, and raising here would replace the real error with a worse
+    one. What it cannot restore, it SAYS -- a silent half-rollback is the
+    thing that makes an incident hard to read afterwards.
+    """
+    dest, priv = staged.dest, staged.priv
+    bak = staged.restore_from or Path(f"{staged.dest}.bak")
+    # What this run FOUND, not what happens to be on disk now: a stale backup
+    # from an earlier run would otherwise be resurrected as if it were ours.
+    if staged.had_previous is False:
+        # Nothing was there before this run, so the inverse of publishing is
+        # REMOVING what we put down -- that restores the prior state exactly.
+        # Leaving it would be a partial publish of the release that just failed.
+        proc = run([*priv, "rm", "-rf", str(dest)], capture_output=True)
+        if proc.returncode == 0:
+            log(f"   removed {dest} (nothing was there before this run)")
+        else:
+            log(f"   ROLLBACK FAILED for {dest}: {(proc.stderr or '').strip()}")
+        return
+    # EXCHANGE, then delete the failed artifact. `rm -rf dest` followed by
+    # `mv bak dest` leaves the live path absent for as long as the removal
+    # takes -- reintroducing, during recovery, the exact outage window the
+    # atomic publish exists to avoid.
+    if not _exists(bak, priv, run):
+        # Removing the live artifact with nothing to put back is worse than
+        # leaving the new one in place. Say what happened instead.
+        log(f"   CANNOT roll back {dest}: no restorable copy at {bak}; "
+            "the new artifact is still live")
+        return
+    if _exchange(bak, dest, priv, run):
+        run([*priv, "rm", "-rf", str(bak)], capture_output=True)
+        return
+    proc = run([*priv, "rm", "-rf", str(dest)], capture_output=True)
+    if proc.returncode != 0:
+        log(f"   cannot roll back {dest}: {(proc.stderr or '').strip()}")
+        return
+    proc = run([*priv, "mv", str(bak), str(dest)], capture_output=True)
+    if proc.returncode != 0:
+        log(f"   ROLLBACK FAILED for {dest}: {(proc.stderr or '').strip()}")
+
+
+def _exists(path: Path, priv: list[str], run: Runner) -> bool:
+    """Whether ``path`` exists, asked at the privilege that can see it."""
+    if not priv:
+        return path.exists()
+    return run([*priv, "test", "-e", str(path)], capture_output=True).returncode == 0
+
+
+def _exchange(a: Path, b: Path, priv: list[str], run: Runner) -> bool:
+    """Atomically swap two paths; False when the platform cannot.
+
+    `mv old aside` followed by `mv new in` leaves the live path ABSENT in
+    between, and a worker that starts in that window fails for a reason nothing
+    records. `renameat2(RENAME_EXCHANGE)` has no such window.
+
+    Reported rather than assumed: the syscall needs Linux >= 3.15 and
+    filesystem support, so the caller falls back and says the window exists.
+    """
+    script = (
+        "import ctypes, sys;"
+        "libc = ctypes.CDLL(None, use_errno=True);"
+        "AT_FDCWD = -100; RENAME_EXCHANGE = 2;"
+        "r = libc.renameat2(AT_FDCWD, sys.argv[1].encode(), AT_FDCWD,"
+        " sys.argv[2].encode(), RENAME_EXCHANGE);"
+        "sys.exit(0 if r == 0 else 1)"
+    )
+    proc = run([*priv, sys.executable, "-c", script, str(a), str(b)], capture_output=True)
+    return proc.returncode == 0
+
+
 def _refuse_shrink(dest: Path, size_mib: int, priv: list[str], run: Runner) -> None:
     """Refuse to replace an artifact with a smaller one.
 
@@ -730,6 +860,16 @@ class _Staged:
     staging: Path
     ready: Path  # what gets renamed onto `dest`: the tree, or the .new image
     size_mib: int = 0  # ext4 only; 0 for a directory tree
+    # Recorded at publication, never inferred from `.bak` afterwards: a stale
+    # backup can outlive an absent destination, and `Path.exists()` answers
+    # False for a real one under a root-only parent. Both readings make rollback
+    # do the wrong thing -- resurrect a stale artifact, or delete the new one
+    # without restoring anything.
+    had_previous: bool | None = None
+    # WHERE the replaceable original ended up. Normally `<dest>.bak`, but when
+    # the exchange succeeded and saving the backup then failed, the original is
+    # still sitting at `ready`. Rollback must be told, not left to assume.
+    restore_from: Path | None = None
 
 
 def stage_rootfs(
@@ -783,6 +923,10 @@ def stage_rootfs(
         )
     _ensure_dir(dest.parent, priv, run)
     staging = _stage_dir(dest.parent, priv, run)
+    # Bound BEFORE the try: the cleanup handler reads it, and an exception from
+    # the audit -- which runs before the artifact is named -- would otherwise
+    # raise NameError and mask the real failure.
+    staged_ready: Path | None = None
     try:
         if extract is not None:
             extract(source, staging)
@@ -799,7 +943,7 @@ def stage_rootfs(
 
         staged_size = 0
         if spec.kind == "dir":
-            ready = staging
+            ready = staged_ready = staging
         else:
             declared = spec.resolved_size_mib(env) or 1536
             # Compared in BYTES and rounded UP. Flooring made an artifact of
@@ -826,7 +970,7 @@ def stage_rootfs(
             # to one destination would otherwise truncate and format the SAME
             # file, and one can rename it live while the other is still writing
             # into it -- publication being a rename does not help.
-            ready = Path(f"{staging}.img")
+            ready = staged_ready = Path(f"{staging}.img")
             _must([*priv, "truncate", "-s", f"{size}M", str(ready)], "truncate", run)
             # `mke2fs -d` populates the image directly: no mount, no loop device
             # and no root beyond writing the file -- the same discipline the host
@@ -838,6 +982,11 @@ def stage_rootfs(
             )
     except BaseException:
         _remove_tree(staging, priv, run)
+        # `ready` is a sibling FILE for ext4, not inside the staging tree, so
+        # removing the tree alone left a partly-formatted image of the declared
+        # size beside the destination after every failed attempt.
+        if staged_ready is not None and staged_ready != staging:
+            run([*priv, "rm", "-f", str(staged_ready)], capture_output=True)
         raise
     return _Staged(
         spec=spec, image=image, dest=dest, priv=priv, staging=staging, ready=ready,
@@ -855,13 +1004,53 @@ def publish_staged(staged: _Staged, *, run: Runner | None = None, log: Log = _lo
     """
     run = run or _default_runner
     dest, priv = staged.dest, staged.priv
+    with _destination_lock(dest):
+        return _publish_locked(staged, dest, priv, run, log)
+
+
+def _publish_locked(
+    staged: _Staged, dest: Path, priv: list[str], run: Runner, log: Log
+) -> Path:
+    """The swap itself, under the destination's lock."""
+    # Through the privileged runner, because `Path.exists()` answers False for a
+    # real artifact under a root-only parent -- and rollback would then delete
+    # what it just published instead of restoring anything.
+    staged.had_previous = _exists(dest, priv, run)
     if staged.spec.kind == "dir":
         # Extract-and-swap, never tar over the live tree: an overlay leaves
         # every file the new image DELETED, and the guest boots a mixture.
-        if dest.exists():
+        # `mv old aside` then `mv new in` leaves a window with NO rootfs at the
+        # live path, and a worker starting in that window fails. Swap the
+        # DIRECTORY ENTRY instead: renameat2(RENAME_EXCHANGE) is atomic, so the
+        # path is never absent. Falls back to the two-step form only where the
+        # kernel or filesystem lacks it, and says so.
+        if staged.had_previous:
             _must([*priv, "rm", "-rf", f"{dest}.bak"], "clear .bak", run)
-            _must([*priv, "mv", str(dest), f"{dest}.bak"], "keep .bak", run)
-        _must([*priv, "mv", str(staged.ready), str(dest)], "publish rootfs", run)
+            if _exchange(staged.ready, dest, priv, run):
+                # The new tree is LIVE from here on. Keeping the old one is
+                # best-effort: failing now and letting the caller roll back
+                # would undo a publication that already succeeded, so the
+                # inability to save a backup is reported, not raised.
+                keep = run([*priv, "mv", str(staged.ready), f"{dest}.bak"], capture_output=True)
+                if keep.returncode == 0:
+                    staged.restore_from = Path(f"{dest}.bak")
+                else:
+                    # The exchange already happened, so the ORIGINAL is at
+                    # `ready`. Recording that is the difference between a
+                    # rollback that works and one that deletes the live
+                    # artifact and finds nothing to put back.
+                    staged.restore_from = staged.ready
+                    log(f"   published, but could not keep a backup of {dest}: "
+                        f"{(keep.stderr or '').strip()}; the previous tree is at "
+                        f"{staged.ready}")
+            else:
+                log("   note: atomic exchange unavailable; the live path is "
+                    "briefly absent during this swap")
+                _must([*priv, "mv", str(dest), f"{dest}.bak"], "keep .bak", run)
+                staged.restore_from = Path(f"{dest}.bak")
+                _must([*priv, "mv", str(staged.ready), str(dest)], "publish rootfs", run)
+        else:
+            _must([*priv, "mv", str(staged.ready), str(dest)], "publish rootfs", run)
     else:
         # RE-CHECKED here, not only at staging. The two are separated in time and
         # this module deliberately supports concurrent exports to one
@@ -869,8 +1058,9 @@ def publish_staged(staged: _Staged, *, run: Runner | None = None, log: Log = _lo
         # made against the old smaller artifact would then let this one shrink
         # it back.
         _refuse_shrink(dest, staged.size_mib, priv, run)
-        if dest.exists():
+        if staged.had_previous:
             _must([*priv, "mv", str(dest), f"{dest}.bak"], "keep .bak", run)
+            staged.restore_from = Path(f"{dest}.bak")
         _must([*priv, "mv", str(staged.ready), str(dest)], "publish rootfs", run)
         _remove_tree(staged.staging, priv, run)
     log(f"   {dest}  (previous kept as {dest.name}.bak)")
@@ -967,7 +1157,20 @@ def run_plan(
         for s in staged:
             _remove_tree(s.staging, s.priv, run or _default_runner)
         raise
-    for s in staged:
-        log(f"\n>> publish {s.dest}")
-        publish_staged(s, run=run, log=log)
+    # Publication is rolled back too, not just staging. A later artifact
+    # failing on I/O, permissions or a concurrent publish would otherwise leave
+    # the earlier destinations on the NEW release and the rest on the old --
+    # the mixed release the staging phase was written to prevent, arriving one
+    # step later.
+    done: list[_Staged] = []
+    try:
+        for s in staged:
+            log(f"\n>> publish {s.dest}")
+            publish_staged(s, run=run, log=log)
+            done.append(s)
+    except BaseException:
+        for s in reversed(done):
+            log(f"   rolling back {s.dest}")
+            _restore_backup(s, run or _default_runner, log)
+        raise
     return built
