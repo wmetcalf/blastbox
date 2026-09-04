@@ -743,6 +743,29 @@ def _restore_backup(staged: _Staged, run: Runner, log: Log) -> None:
     thing that makes an incident hard to read afterwards.
     """
     dest, priv = staged.dest, staged.priv
+    # The SAME lock publication takes. Without it this check-and-swap races the
+    # very thing it is checking for: a second run can publish between the
+    # comparison below and the exchange that follows it.
+    with _destination_lock(dest):
+        _restore_locked(staged, dest, priv, run, log)
+
+
+def _restore_locked(
+    staged: _Staged, dest: Path, priv: list[str], run: Runner, log: Log
+) -> None:
+    """The rollback itself, under the destination's lock."""
+    # Ours, or somebody else's? `publish_staged` releases the lock when it
+    # returns, so another run can publish here before this one fails on a LATER
+    # artifact. Restoring then would replace its artifact with the release we
+    # are rolling back FROM -- a silent downgrade of a live tier, done by a
+    # recovery path.
+    now = _artifact_identity(dest, priv, run)
+    if staged.published_identity and now and now != staged.published_identity:
+        log(
+            f"   NOT rolling back {dest}: another run has published there since "
+            "(it no longer holds this run's artifact); leaving it alone"
+        )
+        return
     bak = staged.restore_from or Path(f"{staged.dest}.bak")
     # What this run FOUND, not what happens to be on disk now: a stale backup
     # from an earlier run would otherwise be resurrected as if it were ours.
@@ -1055,6 +1078,11 @@ class _Staged:
     # the exchange succeeded and saving the backup then failed, the original is
     # still sitting at `ready`. Rollback must be told, not left to assume.
     restore_from: Path | None = None
+    # WHAT this run put at `dest`, as device:inode. Rollback restores only when
+    # the destination is still that object: a concurrent run can publish in
+    # between, and putting our backup over its artifact would silently downgrade
+    # a tier to the release we were rolling back FROM.
+    published_identity: str = ""
 
 
 def stage_rootfs(
@@ -1265,6 +1293,9 @@ def _publish_locked(
             staged.restore_from = Path(f"{dest}.bak")
         _must([*priv, "mv", str(staged.ready), str(dest)], "publish rootfs", run)
         _remove_tree(staged.staging, priv, run)
+    # Recorded while the lock is still held, so it names what THIS run
+    # published rather than whatever wins a later race.
+    staged.published_identity = _artifact_identity(dest, priv, run)
     log(f"   {dest}  (previous kept as {dest.name}.bak)")
     return dest
 
@@ -1282,6 +1313,23 @@ def export_rootfs(
     """Stage one artifact and publish it. Convenience for a single export."""
     staged = stage_rootfs(plan, spec, tag, env=env, run=run, log=log, extract=extract)
     return publish_staged(staged, run=run, log=log)
+
+
+def _artifact_identity(path: Path, priv: list[str], run: Runner) -> str:
+    """`device:inode` of ``path``, or "" when it cannot be read.
+
+    Publication replaces the destination with a DIFFERENT object, so this is
+    what distinguishes "the artifact this run put here" from "whatever is here
+    now". Rollback needs that distinction: another run can publish between our
+    publication and our failure, and restoring our backup over its artifact is
+    the concurrent-clobber this module already takes a lock to prevent.
+
+    Read through the privileged runner for the same reason sizes are: an
+    unprivileged stat under a root-only parent raises, and reading that as
+    "no identity" would make every rollback skip itself.
+    """
+    proc = run([*priv, "stat", "-c", "%d:%i", str(path)], capture_output=True)
+    return (proc.stdout or "").strip() if proc.returncode == 0 else ""
 
 
 def _existing_bytes(path: Path, priv: list[str], run: Runner) -> int | None:

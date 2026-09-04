@@ -7,6 +7,7 @@ is where all of those failures lived — rather than about docker.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import signal
 import stat
@@ -643,6 +644,14 @@ def test_the_published_tree_root_is_not_left_at_mkdtemp_permissions(
     )
     assert [c for c in run.calls if "chmod" in c and "0755" in c], run.calls
     assert [c for c in run.calls if "chown" in c and "root:root" in c], run.calls
+
+
+@dataclasses.dataclass
+class _RootfsStub:
+    """The two fields publication reads off a rootfs spec."""
+
+    kind: str
+    forbid_setuid: bool = True
 
 
 class _FakeStamp:
@@ -2644,3 +2653,164 @@ def test_a_failed_publication_restores_the_image_a_tag_had_before(
     restored = [a for a in seen if a[:3] == ["docker", "tag", old]]
     assert [a[-1] for a in restored] == ["demo-worker:t1", "demo-base:t1"], seen
     assert not [a for a in seen if a[:2] == ["docker", "rmi"] and a[-1].endswith(":t1")]
+
+
+def test_rollback_leaves_a_concurrent_runs_publication_alone(tmp_path: Path) -> None:
+    """`publish_staged` releases the lock when it returns.
+
+    Another run can publish at the same destination before this one fails on a
+    LATER artifact. Restoring then replaces its artifact with the release we are
+    rolling back FROM -- a silent downgrade of a live tier, performed by the
+    recovery path itself.
+    """
+    import blastbox.host.imagerun as mod
+
+    dest = tmp_path / "rootfs.ext4"
+    dest.write_text("ours")
+    bak = tmp_path / "rootfs.ext4.bak"
+    bak.write_text("previous")
+    # The REAL runner: these assertions are about what ends up on disk, and a
+    # double that returns rc=0 without moving anything would make both of them
+    # pass no matter what the rollback did.
+    run = mod._default_runner
+    staged = mod._Staged(
+        spec=None,
+        image="demo:t1",
+        dest=dest,
+        priv=[],
+        staging=tmp_path / "stg",
+        ready=tmp_path / "stg.img",
+        had_previous=True,
+        restore_from=bak,
+        published_identity=mod._artifact_identity(dest, [], run),
+    )
+    # A concurrent run publishes the way publication actually works: a rename
+    # of a different object over the path. (Unlink-then-recreate is not the
+    # same test -- the filesystem hands back the same inode and the destination
+    # would still look like ours.)
+    theirs = tmp_path / "theirs.new"
+    theirs.write_text("theirs")
+    os.replace(theirs, dest)
+    assert mod._artifact_identity(dest, [], run) != staged.published_identity
+
+    said: list[str] = []
+    mod._restore_backup(staged, run, said.append)
+    assert dest.read_text() == "theirs", "a newer publication was clobbered"
+    assert bak.exists(), "the backup was consumed by a rollback that did nothing"
+    assert any("NOT rolling back" in s for s in said), said
+
+
+def test_rollback_still_restores_its_own_publication(tmp_path: Path) -> None:
+    """The check must not turn every rollback into a no-op."""
+    import blastbox.host.imagerun as mod
+
+    dest = tmp_path / "rootfs.ext4"
+    dest.write_text("ours")
+    bak = tmp_path / "rootfs.ext4.bak"
+    bak.write_text("previous")
+    # The REAL runner: these assertions are about what ends up on disk, and a
+    # double that returns rc=0 without moving anything would make both of them
+    # pass no matter what the rollback did.
+    run = mod._default_runner
+    staged = mod._Staged(
+        spec=None,
+        image="demo:t1",
+        dest=dest,
+        priv=[],
+        staging=tmp_path / "stg",
+        ready=tmp_path / "stg.img",
+        had_previous=True,
+        restore_from=bak,
+        published_identity=mod._artifact_identity(dest, [], run),
+    )
+    mod._restore_backup(staged, run, lambda _: None)
+    assert dest.read_text() == "previous", "the rollback did not restore"
+
+
+def test_publication_records_what_it_put_down(tmp_path: Path) -> None:
+    """The ownership check is only as good as the identity it compares against.
+
+    Recorded under the publication lock, from the destination itself -- not
+    carried over from staging, which names a different object.
+    """
+    import blastbox.host.imagerun as mod
+
+    dest = tmp_path / "rootfs.ext4"
+    dest.write_text("previous")
+    ready = tmp_path / "stage.img"
+    ready.write_text("new")
+    staging = tmp_path / "stage"
+    staging.mkdir()
+    staged = mod._Staged(
+        spec=None,
+        image="demo:t1",
+        dest=dest,
+        priv=[],
+        staging=staging,
+        ready=ready,
+        size_mib=0,
+    )
+    # Directory-kind publication is the simple rename path; the identity is
+    # recorded for both kinds at the same place.
+    staged.spec = _RootfsStub(kind="dir")
+    mod.publish_staged(staged, run=mod._default_runner, log=lambda _: None)
+    assert staged.published_identity, "nothing was recorded to compare against"
+    assert staged.published_identity == mod._artifact_identity(
+        dest, [], mod._default_runner
+    )
+
+
+def test_rollback_waits_for_the_destination_lock(tmp_path: Path) -> None:
+    """Rollback is a check-and-swap, so it races the thing it checks for.
+
+    Without the lock, a second run can publish between the ownership comparison
+    and the exchange that follows it -- the window the comparison alone cannot
+    close.
+    """
+    import threading
+
+    import blastbox.host.imagerun as mod
+
+    dest = tmp_path / "rootfs.ext4"
+    dest.write_text("ours")
+    bak = tmp_path / "rootfs.ext4.bak"
+    bak.write_text("previous")
+    staged = mod._Staged(
+        spec=None,
+        image="demo:t1",
+        dest=dest,
+        priv=[],
+        staging=tmp_path / "stg",
+        ready=tmp_path / "stg.img",
+        had_previous=True,
+        restore_from=bak,
+        published_identity=mod._artifact_identity(dest, [], mod._default_runner),
+    )
+
+    holding = threading.Event()
+    release = threading.Event()
+    done = threading.Event()
+
+    def hold() -> None:
+        with mod._destination_lock(dest):
+            holding.set()
+            release.wait(10)
+
+    def roll() -> None:
+        mod._restore_backup(staged, mod._default_runner, lambda _: None)
+        done.set()
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    assert holding.wait(10)
+    roller = threading.Thread(target=roll)
+    roller.start()
+    try:
+        assert not done.wait(1.0), "the rollback ran while the destination was locked"
+        assert dest.read_text() == "ours"
+    finally:
+        release.set()
+        holder.join(10)
+        roller.join(10)
+    assert done.is_set()
+    assert dest.read_text() == "previous", "the rollback never completed"
