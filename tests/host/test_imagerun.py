@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ from blastbox.host.imagerun import (
     build_plan,
     export_rootfs,
     run_plan,
+    verify_built,
 )
 
 SPEC = """
@@ -56,8 +58,15 @@ class FakeRunner:
     def __call__(self, argv, *, cwd=None, capture_output=False, stdout=None):
         self.calls.append(list(argv))
         rc = 1 if self.fail and self.fail in " ".join(argv) else 0
+        out = self.stdout
+        bare = self._bare(list(argv))
+        if rc == 0 and bare[:2] == ["mktemp", "-d"]:
+            # Behaves like the real thing: the code uses the path it prints, so
+            # a double that returned "" would make every later step operate on
+            # Path("") and the test would pass or fail for that instead.
+            out = tempfile.mkdtemp(prefix="fake-stage-", dir=str(Path(bare[2]).parent))
         return subprocess.CompletedProcess(
-            list(argv), rc, stdout=self.stdout, stderr="boom" if rc else ""
+            list(argv), rc, stdout=out, stderr="boom" if rc else ""
         )
 
     @staticmethod
@@ -99,8 +108,10 @@ def _pinned_privilege(monkeypatch: pytest.MonkeyPatch):
 def _repo(tmp_path: Path, spec: str = SPEC) -> Path:
     d = tmp_path / "repo"
     (d / "deploy" / "docker").mkdir(parents=True)
+    # The extra ARGs are declared because some specs below pass them; docker
+    # would silently discard an undeclared one, and arg_problems refuses first.
     (d / "deploy" / "docker" / "Dockerfile.base").write_text(
-        "ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\n"
+        "ARG BASE_IMAGE\nARG JDK_BUILD_IMAGE\nARG BLASTBOX_VERSION\nFROM ${BASE_IMAGE}\n"
     )
     (d / "deploy" / "docker" / "Dockerfile.worker").write_text(
         "ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\n"
@@ -331,6 +342,9 @@ def test_verification_happens_before_anything_is_exported(
         ("blastbox>=0.1.27,<0.2", "0.1.27"),
         ('"blastbox[host,s3]>=0.1.33"', "0.1.33"),
         ("requests>=2", ""),
+        # `!=` names the version that will NOT be installed.
+        ("blastbox!=0.1.27", ""),
+        ("blastbox<=0.9.9", ""),
     ],
 )
 def test_the_installed_version_is_read_from_the_pin_not_from_delimiters(
@@ -489,3 +503,248 @@ def test_the_published_tree_root_is_not_left_at_mkdtemp_permissions(
                   extract=_fake_extract({"/init": "x"}))
     assert [c for c in run.calls if "chmod" in c and "0755" in c], run.calls
     assert [c for c in run.calls if "chown" in c and "root:root" in c], run.calls
+
+
+class _FakeStamp:
+    def __init__(self, reproducible=True, moved="", name="base:1", ident="sha256:" + "a" * 64):
+        self.reproducible = reproducible
+        self._moved = moved
+        self.base_name = name
+        self.base_image_id = ident
+        self.base_digest = ""
+        self.revision = "b" * 40
+        self.blastbox = "0.1.34"
+
+    def base_moved(self, _runner=None):
+        return self._moved
+
+
+def test_an_unstamped_image_does_not_pass_verification(monkeypatch) -> None:
+    """`stamp.read()` fills missing labels with the sentinel "unknown", which is
+    TRUTHY — so checking `revision` accepted a completely unstamped image and
+    exported it. `Stamp.reproducible` is the predicate that answers this."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_read_stamp", lambda i, r=None: _FakeStamp(reproducible=False))
+    monkeypatch.setattr(mod, "_verify_contents", lambda i, r=None: (True, ""))
+    with pytest.raises(BuildError) as e:
+        verify_built(["demo:t1"], log=lambda _: None)
+    assert "stamp is incomplete" in str(e.value)
+
+
+def test_a_base_that_moved_is_caught_before_anything_is_exported(monkeypatch) -> None:
+    """A local base is pinned by a mutable reference, so a concurrent build can
+    retarget the tag between the inspection that wrote the label and the build
+    that consumed it: a child of image B carrying image A's digest."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(
+        mod, "_read_stamp", lambda i, r=None: _FakeStamp(moved="sha256:" + "c" * 64)
+    )
+    monkeypatch.setattr(mod, "_verify_contents", lambda i, r=None: (True, ""))
+    with pytest.raises(BuildError) as e:
+        verify_built(["demo:t1"], log=lambda _: None)
+    assert "does not name" in str(e.value)
+
+
+def test_a_stamp_that_disagrees_with_the_image_contents_is_caught(monkeypatch) -> None:
+    """Syntactically perfect labels can still be false: a stale Dockerfile
+    default or a wrong --blastbox-version records a version the image does not
+    contain, which is the precise thing provenance is for."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_read_stamp", lambda i, r=None: _FakeStamp())
+    monkeypatch.setattr(
+        mod, "_verify_contents", lambda i, r=None: (False, "labelled 0.1.34, contains 0.1.31")
+    )
+    with pytest.raises(BuildError) as e:
+        verify_built(["demo:t1"], log=lambda _: None)
+    assert "contains 0.1.31" in str(e.value)
+
+
+def test_an_image_with_no_blastbox_at_all_still_passes(monkeypatch) -> None:
+    """A pure-JVM worker base has no blastbox to compare against. That is not a
+    disagreement, and treating it as one would block a legitimate chain."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_read_stamp", lambda i, r=None: _FakeStamp())
+    monkeypatch.setattr(mod, "_verify_contents", lambda i, r=None: (None, "no blastbox"))
+    verify_built(["demo:t1"], log=lambda _: None)
+
+
+def test_a_required_path_cannot_escape_through_a_symlinked_parent(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The image controls the tree. With `usr -> /usr` inside it, a joined-path
+    lexists finds a HOST file and approves a rootfs where the guest path is
+    absent — defeating the guard in the direction that publishes."""
+    dest_dir = tmp_path / "fc"
+    dest_dir.mkdir()
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    text = SPEC.replace('requires = ["/init"]', 'requires = ["/usr/bin/env"]')
+    plan = _plan(tmp_path, text)
+
+    def extract(_image: str, dest: Path) -> None:
+        (dest / "usr").symlink_to("/usr")  # resolves on the HOST, not in the guest
+
+    with pytest.raises(BuildError) as e:
+        export_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                      extract=extract)
+    assert "/usr/bin/env" in str(e.value)
+
+
+@pytest.mark.parametrize("bad", ["init", "/../etc/passwd", "/a/../../b"])
+def test_a_requirement_that_is_not_a_confined_guest_path_is_refused(
+    tmp_path: Path, monkeypatch, bad: str
+) -> None:
+    dest_dir = tmp_path / "fc"
+    dest_dir.mkdir()
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    plan = _plan(tmp_path, SPEC.replace('requires = ["/init"]', f'requires = ["{bad}"]'))
+    with pytest.raises(BuildError) as e:
+        export_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                      extract=_fake_extract({"/init": "x"}))
+    assert "cannot be checked" in str(e.value)
+
+
+def test_no_artifact_is_published_when_a_later_one_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Publishing each as it is built leaves the earlier destinations on the new
+    release and the later ones on the old — the warm tiers then run a MIXED
+    release even though the command reported failure."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
+    monkeypatch.setattr(mod, "_read_stamp", lambda i, r=None: _FakeStamp())
+    monkeypatch.setattr(mod, "_verify_contents", lambda i, r=None: (True, ""))
+    d = tmp_path / "out"
+    d.mkdir()
+    (d / "first.ext4").write_text("old-first")
+    monkeypatch.setenv("DEMO_DIR", str(d))
+    text = SPEC.replace('dest = "$DEMO_DIR/demo.ext4"', 'dest = "$DEMO_DIR/first.ext4"') + (
+        '\n[[rootfs]]\nkind = "ext4"\nimage = "demo-worker"\n'
+        'dest = "$DEMO_DIR/second.ext4"\nsize_mib = 64\nrequires = ["/init"]\n'
+    )
+    plan = _plan(tmp_path, text)
+
+    seen: list[str] = []
+
+    def extract(image: str, dest: Path) -> None:
+        seen.append(image)
+        if len(seen) == 1:  # the first artifact stages fine
+            (dest / "init").write_text("x")
+        # the second is missing /init and must abort the whole run
+
+    run = FakeRunner()
+    with pytest.raises(BuildError):
+        run_plan(plan, "t1", blastbox_version="0.1.34", run=run, log=lambda _: None,
+                 extract=extract)
+    assert (d / "first.ext4").read_text() == "old-first", "an artifact was published anyway"
+
+
+def test_a_builder_stage_image_is_pinned_to_a_digest(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A multi-stage Dockerfile COPIES artifacts out of these. Only the primary
+    base was ever resolved and recorded, so an upstream push could change what
+    lands in the image while every label stayed identical."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
+    digest = "docker.io/library/jdk@sha256:" + "d" * 64
+    monkeypatch.setattr(mod, "_digest_from", lambda _img, _json: digest)
+    text = SPEC.replace(
+        'base = "upstream:1"',
+        'base = "upstream:1"\nbuild_args = { JDK_BUILD_IMAGE = "eclipse-temurin:25-jdk" }',
+        1,
+    )
+    run = FakeRunner(stdout='["jdk@sha256:' + "d" * 64 + '"]')
+    build_plan(_plan(tmp_path, text), "t1", blastbox_version="0.1.34", run=run,
+               log=lambda _: None)
+    builds = run.verb("docker", "build")
+    assert builds, run.calls
+    assert any(f"JDK_BUILD_IMAGE={digest}" in a for a in builds[0]), builds[0]
+
+
+def test_a_non_image_build_arg_is_left_alone(tmp_path: Path, monkeypatch) -> None:
+    """A version is not an image. Trying to pin one would fail the build for a
+    reason that has nothing to do with provenance."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
+    text = SPEC.replace(
+        'base = "upstream:1"',
+        'base = "upstream:1"\nbuild_args = { BLASTBOX_VERSION = "0.1.34" }',
+        1,
+    )
+    run = FakeRunner()
+    build_plan(_plan(tmp_path, text), "t1", blastbox_version="0.1.34", run=run,
+               log=lambda _: None)
+    assert run.verb("docker", "inspect") == [], "a plain version was treated as an image"
+
+
+def test_load_plan_resolves_a_relative_root(tmp_path: Path, monkeypatch) -> None:
+    """A relative root survives into dockerfile_path, and the build then runs
+    with cwd=root — so docker resolves `repo/deploy/...` against `repo/` and
+    looks for `repo/repo/deploy/...`."""
+    from blastbox.host.images import dockerfile_path
+
+    _repo(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    plan = load_plan("repo")
+    assert plan.root.is_absolute()
+    assert dockerfile_path(plan, plan.images[0], {}).is_absolute()
+
+
+def test_privilege_is_decided_from_the_parent_not_the_destination(tmp_path: Path) -> None:
+    """Every write is a SIBLING of the destination — the staging directory, the
+    `.new` image, the `.bak` rename.
+
+    A directory rootfs published through sudo stays owned and writable by the
+    invoking user under a /var/lib parent that is not writable, so probing the
+    destination answers "no privilege needed" and the next run dies creating the
+    staging directory, before the export starts.
+    """
+    from blastbox.host.imagerun import _sudo_needed
+
+    parent = tmp_path / "locked"
+    parent.mkdir()
+    dest = parent / "rootfs"
+    dest.mkdir()  # writable by us, exactly like a published tree
+    parent.chmod(0o555)
+    try:
+        assert _sudo_needed(dest) is True, "the unwritable parent was not noticed"
+    finally:
+        parent.chmod(0o755)
+    assert _sudo_needed(dest) is False
+
+
+def test_a_successful_run_publishes_every_declared_artifact(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The companion to the mixed-release test above.
+
+    Without this, deleting the publish phase outright broke nothing: the only
+    other test of it asserts that publication does NOT happen, which an
+    implementation that never publishes satisfies perfectly.
+    """
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
+    monkeypatch.setattr(mod, "_read_stamp", lambda i, r=None: _FakeStamp())
+    monkeypatch.setattr(mod, "_verify_contents", lambda i, r=None: (True, ""))
+    d = tmp_path / "out"
+    d.mkdir()
+    monkeypatch.setenv("DEMO_DIR", str(d))
+    text = SPEC.replace('dest = "$DEMO_DIR/demo.ext4"', 'dest = "$DEMO_DIR/first.ext4"') + (
+        '\n[[rootfs]]\nkind = "ext4"\nimage = "demo-worker"\n'
+        'dest = "$DEMO_DIR/second.ext4"\nsize_mib = 64\nrequires = ["/init"]\n'
+    )
+    plan = _plan(tmp_path, text)
+    run = FakeRunner()
+    run_plan(plan, "t1", blastbox_version="0.1.34", run=run, log=lambda _: None,
+             extract=_fake_extract({"/init": "x"}))
+    published = [c[-1] for c in run.verb("mv")]
+    assert str(d / "first.ext4") in published, run.calls
+    assert str(d / "second.ext4") in published, run.calls

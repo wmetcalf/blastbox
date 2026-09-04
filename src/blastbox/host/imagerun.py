@@ -21,19 +21,32 @@ Every guard below is a failure that has actually happened on this fleet:
 from __future__ import annotations
 
 import os
+import re
 import shutil
+import stat
 import subprocess
 import tempfile
 from collections.abc import Callable, Sequence
-from pathlib import Path
+from dataclasses import dataclass, replace
+from pathlib import Path, PurePosixPath
 
 from blastbox.host import images as _images
-from blastbox.host.images import Plan, RootfsSpec
+from blastbox.host.images import ImageSpec, Plan, RootfsSpec
 from blastbox.host.stamp import StampError
+from blastbox.host.stamp import _digest_from
 from blastbox.host.stamp import build_args as _stamp_flags
 from blastbox.host.stamp import read as _read_stamp
+from blastbox.host.stamp import verify_contents as _verify_contents
 
-__all__ = ["BuildError", "build_plan", "export_rootfs", "run_plan"]
+__all__ = [
+    "BuildError",
+    "build_plan",
+    "export_rootfs",
+    "publish_staged",
+    "run_plan",
+    "stage_rootfs",
+    "verify_built",
+]
 
 
 class BuildError(RuntimeError):
@@ -55,6 +68,62 @@ def _log(message: str) -> None:
     step that failed.
     """
     print(message, flush=True)
+
+
+_IMAGE_ARG_RE = re.compile(r"^[a-z0-9][\w./-]*(?::[\w.-]+)?(?:@sha256:[0-9a-f]{64})?$")
+
+
+def _looks_like_an_image(value: str) -> bool:
+    """Whether a build-arg value is plausibly an image reference.
+
+    Deliberately narrow: it must carry a TAG or a digest. A bare word is far
+    more likely to be a version, a path or a flag, and pinning something that is
+    not an image would fail the build for a reason that has nothing to do with
+    provenance.
+    """
+    if "@sha256:" in value:
+        return True
+    if ":" not in value:
+        return False
+    return bool(_IMAGE_ARG_RE.match(value))
+
+
+def _pin_builder_images(
+    spec: ImageSpec,
+    env: dict[str, str],
+    run: Runner,
+    log: Log,
+    *,
+    pull: bool,
+) -> dict[str, str]:
+    """Resolve image-valued build args to digests, or {} if there are none.
+
+    Already-digested references are left alone. Anything that cannot be resolved
+    is left alone too and reported rather than failing the build: a build arg
+    that merely LOOKS like an image is not worth refusing over, and the cost of
+    guessing wrong here is a confusing failure a long way from the cause.
+    """
+    out: dict[str, str] = {}
+    for key, raw in sorted(spec.build_args.items()):
+        value = _images._expand(raw, env)  # noqa: SLF001 - same package
+        if not _looks_like_an_image(value) or "@sha256:" in value:
+            continue
+        if pull:
+            run(["docker", "pull", "-q", value], capture_output=True)
+        proc = run(
+            ["docker", "inspect", "--type", "image", value, "--format", "{{json .RepoDigests}}"],
+            capture_output=True,
+        )
+        if proc.returncode != 0:
+            log(f"   note: could not resolve {key}={value} to a digest; left as the tag")
+            continue
+        digest = _digest_from(value, (proc.stdout or "").strip())
+        if digest:
+            out[key] = digest
+            log(f"   pinned {key} -> {digest}")
+        else:
+            log(f"   note: {value} has no registry digest; left as the tag")
+    return out
 
 
 def _default_runner(
@@ -148,7 +217,19 @@ def build_plan(
             # is worse: docker discards the pin and the label lies.
             raise BuildError(f"{spec.name}: refusing to build unstamped — {exc}") from exc
 
-        argv = _images.build_command(spec, tag, flags, base_ref, env, plan)
+        # Builder-stage images are pinned too. `JDK_BUILD_IMAGE
+        # = "eclipse-temurin:25-jdk"` is a mutable tag that a multi-stage
+        # Dockerfile COPIES artifacts out of, and only the primary base was ever
+        # pulled, resolved and recorded -- so an upstream push could change what
+        # lands in the image while every label stayed identical. Resolving them
+        # to digests makes the build reproducible in the same sense the base is.
+        pinned_args = _pin_builder_images(spec, env, run, log, pull=pull)
+        to_build = (
+            replace(spec, build_args={**spec.build_args, **pinned_args})
+            if pinned_args
+            else spec
+        )
+        argv = _images.build_command(to_build, tag, flags, base_ref, env, plan)
         log(f">> build {spec.tagged(tag)}  <- {base_ref}")
         _must(argv, f"build {spec.tagged(tag)}", run, cwd=plan.root)
         built.append(spec.tagged(tag))
@@ -156,12 +237,27 @@ def build_plan(
     return built
 
 
-def verify_built(images: Sequence[str], *, run: Runner | None = None, log: Log = print) -> None:
-    """Every image must read back a stamp naming what produced it.
+def verify_built(images: Sequence[str], *, run: Runner | None = None, log: Log = _log) -> None:
+    """Every image must record enough to be rebuilt, and record it TRUTHFULLY.
 
     Read from the ARTIFACT, not from what the build was told to do: the two
     disagreeing is exactly the state worth finding, and the only way to see it
     is to ask the image.
+
+    Three separate questions, because an image can pass one and fail another:
+
+    * ``Stamp.reproducible`` -- are the labels complete and usable? Truthiness
+      of ``revision`` is not that test: an unstamped image reads back as the
+      sentinel ``"unknown"``, which is truthy, so a completely unstamped image
+      passed and was exported.
+    * ``Stamp.base_moved`` -- did the tag the stamp names still point at the
+      recorded image? A local base is pinned by a mutable reference, so a
+      concurrent build can retarget it between the inspection and the build and
+      leave a child of image B carrying image A's digest.
+    * ``verify_contents`` -- is the recorded blastbox version the one actually
+      installed? A stale Dockerfile default or a wrong --blastbox-version is
+      syntactically perfect and still false, which is the precise thing
+      provenance is for.
     """
     runner = None if run is None else (lambda argv: run(argv))
     bad: list[str] = []
@@ -169,16 +265,58 @@ def verify_built(images: Sequence[str], *, run: Runner | None = None, log: Log =
         log(f"-- {image}")
         try:
             stamp = _read_stamp(image, runner)  # type: ignore[arg-type]
-        except Exception as exc:  # noqa: BLE001 - reported per image, not fatal here
+        except Exception as exc:  # noqa: BLE001 - collected per image, not fatal here
             bad.append(f"{image}: {exc}")
             continue
-        if not stamp.revision:
-            bad.append(f"{image}: stamped with no source revision")
+        if not stamp.reproducible:
+            bad.append(
+                f"{image}: stamp is incomplete — revision={stamp.revision!r} "
+                f"base={stamp.base_name!r} digest={stamp.base_digest or stamp.base_image_id!r} "
+                f"blastbox={stamp.blastbox!r}"
+            )
+            continue
+        try:
+            # Returns the base's CURRENT id when it differs from the record, and
+            # "" when there is nothing to report. It RAISES when the question
+            # cannot be asked, which is not the same as agreement.
+            moved = stamp.base_moved(runner)  # type: ignore[arg-type]
+        except Exception as exc:  # noqa: BLE001
+            bad.append(f"{image}: could not confirm its base did not move ({exc})")
+            continue
+        if moved:
+            bad.append(
+                f"{image}: {stamp.base_name} now resolves to {moved[:19]}…, not the "
+                f"{(stamp.base_image_id or '')[:19]}… it records — it was built on "
+                "an image its stamp does not name"
+            )
+            continue
+        agrees, detail = _verify_contents(image, runner)  # type: ignore[arg-type]
+        if agrees is False:
+            bad.append(f"{image}: {detail}")
     if bad:
         raise BuildError(
             "one or more images are not reproducible from what they record:\n  "
             + "\n  ".join(bad)
         )
+
+
+def _stage_dir(parent: Path, priv: list[str], run: Runner) -> Path:
+    """A fresh staging directory beside ``parent``, created with ``priv``.
+
+    ``tempfile.mkdtemp`` cannot do this when the parent needs root, so the name
+    is generated here and the directory made through the same runner as
+    everything else. ``mktemp -d`` picks the name, so two concurrent runs do not
+    collide.
+    """
+    if not priv:
+        return Path(tempfile.mkdtemp(prefix="bb-rootfs-", dir=str(parent)))
+    proc = run([*priv, "mktemp", "-d", str(parent / "bb-rootfs-XXXXXXXX")], capture_output=True)
+    if proc.returncode != 0:
+        raise BuildError(
+            f"could not create a staging directory in {parent}: "
+            f"{(proc.stderr or '').strip()}"
+        )
+    return Path((proc.stdout or "").strip())
 
 
 def _remove_tree(path: Path, priv: list[str], run: Runner) -> None:
@@ -187,7 +325,7 @@ def _remove_tree(path: Path, priv: list[str], run: Runner) -> None:
     `os.access` on the directory is not the test: mkdtemp makes it owned by this
     user, while everything root extracted inside it is not, so an ordinary
     rmtree walks in and fails partway. A failed export then leaves a whole
-    root-owned rootfs behind — observed on toolz2 after the mkfs failure above.
+    root-owned rootfs behind — observed on toolz2.
     """
     if priv:
         run([*priv, "rm", "-rf", str(path)], capture_output=True)
@@ -241,6 +379,53 @@ def _normalize_root(tree: Path, priv: list[str], run: Runner) -> None:
     run([*priv, "chmod", "0755", str(tree)], capture_output=True)
 
 
+def _present_in(tree: Path, requirement: str) -> bool:
+    """Whether ``requirement`` exists INSIDE ``tree``, on the image's own terms.
+
+    Walked component by component, refusing to follow a symlink in any parent.
+    The tree is attacker-controlled in the only sense that matters here -- it is
+    whatever the image happens to contain -- and `os.path.lexists` on a joined
+    path follows intermediate links, so an image with `usr -> /usr` would make
+    the check find a HOST file and approve a rootfs where the guest path is
+    absent. That defeats the guard in the direction that publishes.
+
+    The final component is checked with lstat, not stat: `/init` is very often a
+    symlink whose target only resolves inside the guest, and resolving it would
+    reject a correct rootfs.
+    """
+    current = tree
+    parts = [p for p in PurePosixPath(requirement).parts if p != "/"]
+    for i, part in enumerate(parts):
+        candidate = current / part
+        try:
+            st = candidate.lstat()
+        except OSError:
+            return False
+        last = i == len(parts) - 1
+        if last:
+            return True
+        if stat.S_ISLNK(st.st_mode):
+            # A link in a PARENT position would take the walk out of the tree.
+            return False
+        current = candidate
+    return False
+
+
+def _requirement_problem(requirement: str) -> str:
+    """Why ``requirement`` cannot be checked, or "".
+
+    A requirement is a path in the GUEST. Anything relative, or containing `..`,
+    either does not describe a guest path or describes one outside the rootfs,
+    and in both cases the honest answer is to refuse rather than to check
+    something else and report on that.
+    """
+    if not requirement.startswith("/"):
+        return f"{requirement!r} is not an absolute guest path"
+    if ".." in PurePosixPath(requirement).parts:
+        return f"{requirement!r} contains '..', which would leave the rootfs"
+    return ""
+
+
 def _check_requires(tree: Path, spec: RootfsSpec, image: str) -> None:
     """Refuse to publish a rootfs missing something the plan says it needs.
 
@@ -251,10 +436,13 @@ def _check_requires(tree: Path, spec: RootfsSpec, image: str) -> None:
     Checked BEFORE the live artifact is replaced, so a bad export cannot take
     the tier down at all.
     """
-    # lexists, not exists: `/init` is very often a symlink into /opt, and a
-    # symlink whose target is absent from the HOST is present in the guest.
-    # Resolving it here would reject a correct rootfs.
-    missing = [r for r in spec.requires if not os.path.lexists(tree / r.lstrip("/"))]
+    malformed = [p for p in (_requirement_problem(r) for r in spec.requires) if p]
+    if malformed:
+        raise BuildError(
+            f"{spec.dest} declares a requirement that cannot be checked: "
+            + "; ".join(malformed)
+        )
+    missing = [r for r in spec.requires if not _present_in(tree, r)]
     if missing:
         raise BuildError(
             f"{image} is missing {missing}, which {spec.dest} declares it requires; "
@@ -291,10 +479,118 @@ def _sudo_needed(path: Path) -> bool:
     who has to remember which is which will eventually run the wrong one. An
     unnecessary sudo prompt is a worse default than a check.
     """
-    probe = path if path.exists() else path.parent
+    # The PARENT, never the destination itself. Every write this module does --
+    # the staging directory, the `.new` image, the `.bak` rename -- is a
+    # SIBLING of the destination. A directory rootfs published through sudo can
+    # stay owned and writable by the invoking user under a /var/lib parent that
+    # is not, so probing the destination says "no sudo needed" and the next run
+    # dies in mkdtemp before it starts.
+    probe = path.parent
     while not probe.exists() and probe != probe.parent:
         probe = probe.parent
     return not os.access(probe, os.W_OK)
+
+
+@dataclass
+class _Staged:
+    """A rootfs prepared but not yet published."""
+
+    spec: RootfsSpec
+    image: str
+    dest: Path
+    priv: list[str]
+    staging: Path
+    ready: Path  # what gets renamed onto `dest`: the tree, or the .new image
+
+
+def stage_rootfs(
+    plan: Plan,
+    spec: RootfsSpec,
+    tag: str,
+    *,
+    env: dict[str, str] | None = None,
+    run: Runner | None = None,
+    log: Log = _log,
+    extract: Callable[[str, Path], None] | None = None,
+) -> _Staged:
+    """Prepare the artifact a warm tier boots, WITHOUT replacing anything.
+
+    Never rebuilt from a Dockerfile here. Building one produces an artifact on
+    that file's DEFAULT base -- unstamped, and not the thing that was verified a
+    moment earlier -- which reads like a rebuild and is not one.
+    """
+    run = run or _default_runner
+    env = dict(os.environ) if env is None else env
+    image = f"{spec.image}:{tag}"
+    dest = Path(spec.resolved_dest(env))
+    if "$" in str(dest):
+        raise BuildError(
+            f"{spec.dest} still contains an unset variable ({dest}); refusing to "
+            "write to a path nobody chose"
+        )
+    # ONE privilege level for the whole export. The tree is extracted as root so
+    # ownership and setuid bits survive, which means everything that then READS
+    # it -- mkfs.ext4 above all -- has to be root as well. Measured on toolz2: a
+    # root-extracted tree consumed by a user-run mkfs.ext4 dies on `.pwd.lock`
+    # (mode 600, root) after every image has already been built and verified.
+    need_sudo = _sudo_needed(dest)
+    as_root = _can_be_root()
+    priv = _root_prefix() if (as_root or need_sudo) else []
+
+    _must([*priv, "mkdir", "-p", str(dest.parent)], "mkdir", run)
+    staging = _stage_dir(dest.parent, priv, run)
+    try:
+        if extract is not None:
+            extract(image, staging)
+        else:
+            _extract_image(image, staging, run, log, as_root=as_root)
+        _check_requires(staging, spec, image)
+        _normalize_root(staging, priv, run)
+
+        if spec.kind == "dir":
+            ready = staging
+        else:
+            size = spec.size_mib or _existing_mib(dest) or 1536
+            ready = dest.with_suffix(dest.suffix + ".new")
+            _must([*priv, "truncate", "-s", f"{size}M", str(ready)], "truncate", run)
+            # `mke2fs -d` populates the image directly: no mount, no loop device
+            # and no root beyond writing the file -- the same discipline the host
+            # side uses for never mounting a disk it did not create.
+            _must(
+                [*priv, "mkfs.ext4", "-F", "-q", "-d", str(staging), str(ready)],
+                "mkfs.ext4",
+                run,
+            )
+    except BaseException:
+        _remove_tree(staging, priv, run)
+        raise
+    return _Staged(spec=spec, image=image, dest=dest, priv=priv, staging=staging, ready=ready)
+
+
+def publish_staged(staged: _Staged, *, run: Runner | None = None, log: Log = _log) -> Path:
+    """Swap a staged artifact into place, keeping the previous one as ``.bak``.
+
+    Extract, CHECK, then swap -- and the swap is a rename within one filesystem,
+    because the staging directory is created beside the destination. The
+    previous artifact is what a rollback needs, and it is the only reason the
+    Firecracker outage was minutes rather than a rebuild.
+    """
+    run = run or _default_runner
+    dest, priv = staged.dest, staged.priv
+    if staged.spec.kind == "dir":
+        # Extract-and-swap, never tar over the live tree: an overlay leaves
+        # every file the new image DELETED, and the guest boots a mixture.
+        if dest.exists():
+            _must([*priv, "rm", "-rf", f"{dest}.bak"], "clear .bak", run)
+            _must([*priv, "mv", str(dest), f"{dest}.bak"], "keep .bak", run)
+        _must([*priv, "mv", str(staged.ready), str(dest)], "publish rootfs", run)
+    else:
+        if dest.exists():
+            _must([*priv, "mv", str(dest), f"{dest}.bak"], "keep .bak", run)
+        _must([*priv, "mv", str(staged.ready), str(dest)], "publish rootfs", run)
+        _remove_tree(staged.staging, priv, run)
+    log(f"   {dest}  (previous kept as {dest.name}.bak)")
+    return dest
 
 
 def export_rootfs(
@@ -307,87 +603,9 @@ def export_rootfs(
     log: Log = _log,
     extract: Callable[[str, Path], None] | None = None,
 ) -> Path:
-    """Produce the artifact a warm tier boots, from the image already verified.
-
-    Never rebuilt from a Dockerfile here. Building one produces an artifact on
-    that file's DEFAULT base — unstamped, and not the thing that was verified a
-    moment earlier — which reads like a rebuild and is not one.
-
-    Extract, CHECK, then swap. The previous artifact is kept alongside as
-    ``.bak``: it is what a rollback needs, and it is the only reason the
-    Firecracker outage was minutes rather than a rebuild.
-    """
-    run = run or _default_runner
-    env = dict(os.environ) if env is None else env
-    image = f"{spec.image}:{tag}"
-    dest = Path(spec.resolved_dest(env))
-    if "$" in str(dest):
-        raise BuildError(
-            f"{spec.dest} still contains an unset variable ({dest}); refusing to "
-            "write to a path nobody chose"
-        )
-    # ONE privilege level for the whole export. The tree is extracted as root
-    # so ownership and setuid bits survive, which means everything that then
-    # READS it -- mkfs.ext4 above all -- has to be root as well. Splitting the
-    # two is not a style question: measured on toolz2, a root-extracted tree
-    # consumed by a user-run mkfs.ext4 dies on `.pwd.lock` (mode 600, root) with
-    # "Permission denied while populating file system", after every image has
-    # already been built and verified.
-    #
-    # `need_sudo` is the separate question of whether the DESTINATION needs
-    # root; when it does, the same prefix covers that too.
-    need_sudo = _sudo_needed(dest)
-    as_root = _can_be_root()
-    priv = _root_prefix() if (as_root or need_sudo) else []
-
-    staging = Path(
-        tempfile.mkdtemp(
-            prefix="bb-rootfs-",
-            dir=str(dest.parent) if dest.parent.exists() and not need_sudo else None,
-        )
-    )
-    # Tracked as a FLAG rather than by clearing `staging` to a sentinel path:
-    # `Path("")` stringifies to "." -- truthy, and it exists -- so a falsy check
-    # followed by rmtree would delete the working directory.
-    published = False
-    try:
-        if extract is not None:
-            extract(image, staging)
-        else:
-            _extract_image(image, staging, run, log, as_root=as_root)
-        _check_requires(staging, spec, image)
-        _normalize_root(staging, priv, run)
-
-        if spec.kind == "dir":
-            # Extract-and-swap, never tar over the live tree: an overlay leaves
-            # every file the new image DELETED, and the guest boots a mixture.
-            if dest.exists():
-                _must([*priv, "rm", "-rf", f"{dest}.bak"], "clear .bak", run)
-                _must([*priv, "mv", str(dest), f"{dest}.bak"], "keep .bak", run)
-            _must([*priv, "mkdir", "-p", str(dest.parent)], "mkdir", run)
-            _must([*priv, "mv", str(staging), str(dest)], "publish rootfs", run)
-            published = True  # moved into place; there is nothing left to remove
-        else:
-            size = spec.size_mib or _existing_mib(dest) or 1536
-            tmp_img = dest.with_suffix(dest.suffix + ".new")
-            _must([*priv, "mkdir", "-p", str(dest.parent)], "mkdir", run)
-            _must([*priv, "truncate", "-s", f"{size}M", str(tmp_img)], "truncate", run)
-            # `mke2fs -d` populates the image directly: no mount, no loop device
-            # and no root beyond writing the file — the same discipline the host
-            # side uses for never mounting a disk it did not create.
-            _must(
-                [*priv, "mkfs.ext4", "-F", "-q", "-d", str(staging), str(tmp_img)],
-                "mkfs.ext4",
-                run,
-            )
-            if dest.exists():
-                _must([*priv, "mv", str(dest), f"{dest}.bak"], "keep .bak", run)
-            _must([*priv, "mv", str(tmp_img), str(dest)], "publish rootfs", run)
-        log(f"   {dest}  (previous kept as {dest.name}.bak)")
-        return dest
-    finally:
-        if not published:
-            _remove_tree(staging, priv, run)
+    """Stage one artifact and publish it. Convenience for a single export."""
+    staged = stage_rootfs(plan, spec, tag, env=env, run=run, log=log, extract=extract)
+    return publish_staged(staged, run=run, log=log)
 
 
 def _existing_mib(path: Path) -> int:
@@ -422,7 +640,23 @@ def run_plan(
     built = build_plan(plan, tag, blastbox_version=blastbox_version, env=env, run=run, log=log)
     log("\n>> verify: every image must record what it was built from")
     verify_built(built, run=run, log=log)
-    for spec in plan.rootfs:
-        log(f"\n>> {spec.kind} rootfs <- {spec.image}:{tag}")
-        export_rootfs(plan, spec, tag, env=env, run=run, log=log, extract=extract)
+    # Staged FIRST, all of them, then published. Publishing each as it is built
+    # leaves the earlier destinations on the new release and the later ones on
+    # the old when a later export fails -- the warm tiers then run a mixed
+    # release even though the command reported failure, which is worse than not
+    # having run it.
+    staged: list[_Staged] = []
+    try:
+        for spec in plan.rootfs:
+            log(f"\n>> stage {spec.kind} rootfs <- {spec.image}:{tag}")
+            staged.append(
+                stage_rootfs(plan, spec, tag, env=env, run=run, log=log, extract=extract)
+            )
+    except BaseException:
+        for s in staged:
+            _remove_tree(s.staging, s.priv, run or _default_runner)
+        raise
+    for s in staged:
+        log(f"\n>> publish {s.dest}")
+        publish_staged(s, run=run, log=log)
     return built

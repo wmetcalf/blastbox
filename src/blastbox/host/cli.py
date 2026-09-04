@@ -1231,10 +1231,21 @@ def _declared_blastbox_version(root: Path) -> str:
     except OSError:
         return ""
     body = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    # `==`, `~=` and `>=` only -- NOT every two-character operator. `!=0.1.27`
+    # names the one version that will not be installed, and reading it as the
+    # version this installs writes a false number into every image stamp: the
+    # exact lie this tooling exists to catch.
+    #
+    # `>=` is included on purpose, and it is not "whatever pip resolves". This
+    # value is passed to the build, and the Dockerfiles install
+    # `blastbox==${BLASTBOX_VERSION}` with it -- the floor becomes an exact
+    # install, so recording it is true by construction. `verify_built` then
+    # compares the label against what the image actually contains, so a repo
+    # whose Dockerfile stops honouring the arg is caught rather than trusted.
     m = re.search(
-        r"blastbox(?:\[[A-Za-z0-9,._-]+\])?\s*[<>=!~]=\s*([0-9]+(?:\.[0-9]+)*)", body
+        r"blastbox(?:\[[A-Za-z0-9,._-]+\])?\s*(==|~=|>=)\s*([0-9]+(?:\.[0-9]+)*)", body
     )
-    return m.group(1) if m else ""
+    return m.group(2) if m else ""
 
 
 def _release_digests(version: str) -> list[str] | None:

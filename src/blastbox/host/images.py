@@ -207,7 +207,12 @@ def load_plan(root: Path | str) -> Plan:
     # the filename unconditionally turns a path to the file into
     # `.../blastbox-images.toml/blastbox-images.toml`, whose NotADirectoryError
     # names a path the caller never wrote and reads like a corrupt tree.
-    root = Path(root)
+    # RESOLVED. A relative root survives into `dockerfile_path`, and the build
+    # then runs with cwd=root, so docker resolves `repo/deploy/Dockerfile`
+    # against `repo/` and looks for `repo/repo/deploy/Dockerfile`. The CLI
+    # avoids this only because it resolves its own argument first; a library
+    # caller writing `load_plan("repo")` would not.
+    root = Path(root).resolve()
     if root.name == SPEC_NAME or (root.is_file() and root.suffix == ".toml"):
         path, root = root, root.parent
     else:
