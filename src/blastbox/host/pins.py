@@ -493,6 +493,52 @@ def _walk(root: Path):
                 yield entry
 
 
+_REQ_NAME_RE = re.compile(
+    r"(requirements|constraints)[\w.\-]*\.(txt|lock)|[\w.\-]+\.lock"
+)
+# Files that plausibly RUN a pip install. Bounded by name on purpose: the
+# alternative is reading every file in the repository, and a consumer tree
+# holds VM images and corpora.
+_INSTALL_SCRIPT_RE = re.compile(
+    r"(?i)^(dockerfile.*|makefile|.*\.(sh|bash|mk|ya?ml|dockerfile))$"
+)
+# Enough for any requirements file or install script; anything larger is data.
+_READ_LIMIT = 1 << 20
+
+
+# Anything pip would plausibly be handed with `-r`. Broader than the set we
+# JUDGE: an aggregator named `all.txt` holds nothing but `-r` lines, so it is
+# never a lock itself, but it is what makes its two siblings one install set.
+_INSTALL_INPUT_RE = re.compile(r"(?i)^[\w.\-]+\.(txt|in|lock)$")
+
+
+def _is_install_input(path: Path) -> bool:
+    """Whether ``path`` could name other requirement files."""
+    return bool(_INSTALL_INPUT_RE.fullmatch(path.name)) or _is_requirements_file(path)
+
+
+def _is_requirements_file(path: Path) -> bool:
+    """Whether ``path`` is a lock this check should JUDGE."""
+    return bool(
+        _REQ_NAME_RE.fullmatch(path.name)
+        or (path.parent.name == "requirements" and path.name.endswith(".txt"))
+    )
+
+
+def _read_small(path: Path) -> str:
+    """Read a text file, or "" if it is unreadable or too large to be one.
+
+    `_walk` yields every file in the repo, and reading them all as UTF-8 to look
+    for `-r` lines pulls archives, database snapshots and VM images into memory.
+    """
+    try:
+        if path.stat().st_size > _READ_LIMIT:
+            return ""
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
 def scan(root: Path) -> list[Pin]:
     """Every install-path blastbox pin under ``root``."""
     pins: list[Pin] = []
@@ -506,9 +552,7 @@ def scan(root: Path) -> list[Pin]:
             pins.extend(_scan_dockerfile(path))
         elif name in _TOML_LOCK_NAMES:
             pins.extend(_scan_toml_lock(path))
-        elif re.fullmatch(
-            r"(requirements|constraints)[\w.\-]*\.(txt|lock)|[\w.\-]+\.lock", name
-        ) or (path.parent.name == "requirements" and name.endswith(".txt")):
+        elif _is_requirements_file(path):
             pins.extend(_scan_lock(path))
     return sorted(pins, key=lambda p: (p.path, p.line))
 
@@ -717,6 +761,10 @@ class _Pin:
     version: str
     marker: str
     hashed: bool
+    # Extras named on THIS entry (`blastbox[host]==...`). Kept per entry because
+    # a portable lock can pin blastbox twice under exclusive markers, and
+    # unioning both would check a closure pip never installs.
+    extras: frozenset[str] = frozenset()
 
 
 def missing_from_locks(
@@ -753,12 +801,21 @@ def missing_from_locks(
     out: dict[str, list[str]] = {}
     parsed = [_requirement(r) for r in requires]
     for path in _install_roots(root):
-        pins, extras, env = _effective_pins(path)
+        pins, _unused, env = _effective_pins(path)
         if "blastbox" not in pins:
             continue  # somebody else's requirements; not ours to judge
         if not any(pin.hashed for entries in pins.values() for pin in entries):
             continue  # not hash-pinned; pip resolves the rest itself
         scope = {**env, **(environment or {})}
+        # Only from blastbox entries whose own markers apply: a portable lock
+        # may pin `blastbox[host]` for one interpreter and `blastbox[s3]` for
+        # another, and unioning both checks a closure pip never installs.
+        extras = {
+            e
+            for pin in pins["blastbox"]
+            if _marker_holds(pin.marker, scope)
+            for e in pin.extras
+        }
         extras |= _extras_in_play(parsed, pins, scope)
         extras = _with_nested_extras(extras, parsed, scope)
         gaps: list[str] = []
@@ -791,28 +848,51 @@ def _gap(req, pins: dict[str, list[_Pin]], scope: dict[str, str]) -> str:
     return f"{name} (pinned {shown}, needs {req.specifier})"
 
 
-def _install_roots(root: Path):
-    """Requirement files nothing else includes -- one per install set.
+def _install_roots(root: Path) -> list[Path]:
+    """Requirement files that something actually installs -- one per set.
 
     A file included by another is installed as PART of that set, so judging it
-    alone reports pins that are present in its sibling.
+    alone reports pins present in its sibling. But inclusion does not prove it
+    is never an entrypoint: a Dockerfile may install `prod.lock` directly while
+    `dev.lock` includes it, and dropping it from the roots would check only the
+    dev closure and accept a bump that leaves production failing. So a file
+    named by an install command counts as a root even when it is also included.
     """
-    files = [p for p in _walk(root)]
+    candidates = [p for p in _walk(root) if _is_requirements_file(p)]
+    known = {p.resolve() for p in candidates}
     included: set[Path] = set()
-    for path in files:
-        for target in _includes(path):
-            included.add(target)
-    return [p for p in files if p.resolve() not in included]
+    # Includes come from the BROADER set: an aggregator holding only `-r` lines
+    # is not a lock, and missing it puts its siblings back to being judged
+    # alone -- each reporting what the other carries.
+    for path in _walk(root):
+        if _is_install_input(path):
+            included |= set(_includes(path))
+    direct: set[Path] = set()
+    for path in _walk(root):
+        if _is_requirements_file(path) or not _INSTALL_SCRIPT_RE.fullmatch(path.name):
+            continue
+        for target in _referenced(path):
+            if target in known:
+                direct.add(target)
+    return [
+        p for p in candidates if p.resolve() not in included or p.resolve() in direct
+    ]
+
+
+def _referenced(path: Path) -> list[Path]:
+    """Requirement files an install script hands to pip with `-r`."""
+    out: list[Path] = []
+    for match in re.finditer(
+        r"(?:-r|--requirement)[=\s]+([\w./\-]+)", _read_small(path)
+    ):
+        out.append((path.parent / match.group(1)).resolve())
+    return out
 
 
 def _includes(path: Path) -> list[Path]:
     """Paths this requirement file pulls in with `-r` / `--requirement`."""
     out: list[Path] = []
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return out
-    for raw in _joined_lines(text):
+    for raw in _joined_lines(_read_small(path)):
         match = re.match(r"^(?:-r|--requirement)[=\s]+(\S+)", raw.strip())
         if match:
             out.append((path.parent / match.group(1)).resolve())
@@ -875,7 +955,7 @@ def _effective_pins(
         return {}, set(), {}  # a cycle; whatever it holds has been read already
     seen.add(resolved)
     pins: dict[str, list[_Pin]] = {}
-    extras: set[str] = set()
+    extras: set[str] = set()  # kept for signature stability; see _declared_extras
     env: dict[str, str] = {}
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -901,13 +981,19 @@ def _effective_pins(
         name = _dist_name(match.group(1))
         _, _, after = line.partition(";")
         marker = after.split("--hash")[0].strip() if after else ""
-        pins.setdefault(name, []).append(
-            _Pin(version=match.group(3), marker=marker, hashed="--hash=" in line)
+        entry_extras = frozenset(
+            e.strip().lower()
+            for e in (match.group(2) or "[]")[1:-1].split(",")
+            if e.strip()
         )
-        if name == "blastbox" and match.group(2):
-            extras |= {
-                e.strip().lower() for e in match.group(2)[1:-1].split(",") if e.strip()
-            }
+        pins.setdefault(name, []).append(
+            _Pin(
+                version=match.group(3),
+                marker=marker,
+                hashed="--hash=" in line,
+                extras=entry_extras,
+            )
+        )
     return pins, extras, env
 
 
@@ -987,9 +1073,20 @@ def _extras_in_play(
             by_extra.setdefault(extra.lower(), set()).add(name)
     found = set()
     for extra, names in by_extra.items():
-        # `blastbox` itself is excluded: an extra that depends on
-        # `blastbox[host]` would otherwise be inferred by the lock's own entry.
-        unique = names - base - {"blastbox"}
+        # Unique across EVERY extra, not just against the base. If `host` needs
+        # a and b while `dev` needs a, b and pytest, a host-only lock carries a
+        # majority of dev's requirements too -- and dev gets inferred from
+        # evidence that belongs entirely to host.
+        #
+        # `blastbox` itself is excluded for the same reason: an extra that
+        # depends on `blastbox[host]` would otherwise be inferred by the lock's
+        # own entry, which every lock has.
+        others = (
+            set().union(*(v for k, v in by_extra.items() if k != extra))
+            if len(by_extra) > 1
+            else set()
+        )
+        unique = names - base - others - {"blastbox"}
         if not unique:
             continue
         if len(unique & set(pins)) * 2 > len(unique):

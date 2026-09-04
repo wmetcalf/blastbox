@@ -1907,3 +1907,119 @@ def test_a_lock_that_asks_for_no_extras_is_still_left_alone(tmp_path):
     assert (
         missing_from_locks(tmp_path, _RN, environment={"sys_platform": "linux"}) == {}
     )
+
+
+def test_a_lock_installed_directly_is_still_judged_on_its_own(tmp_path):
+    """Inclusion does not prove a file is never an entrypoint.
+
+    A Dockerfile installs prod.lock directly while dev.lock includes it. If
+    prod.lock is dropped from the roots, only the complete dev closure is
+    checked and a bump is accepted that leaves the production install failing
+    under `--require-hashes`.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path, "prod.lock", _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5")
+    )
+    _write(
+        tmp_path,
+        "dev.lock",
+        "-r prod.lock\n" + _entry("packaging==26.3") + _entry("backport==1.0"),
+    )
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12\nRUN pip install --require-hashes -r prod.lock\n"
+    )
+    gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert list(gaps) == [str(tmp_path / "prod.lock")], gaps
+    assert list(gaps.values()) == [["packaging", "backport"]], gaps
+
+
+def test_a_lock_only_ever_included_is_not_judged_alone(tmp_path):
+    """The other half: with no direct install, the set is what counts."""
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path, "prod.lock", _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5")
+    )
+    _write(
+        tmp_path,
+        "dev.lock",
+        "-r prod.lock\n" + _entry("packaging==26.3") + _entry("backport==1.0"),
+    )
+    assert (
+        missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"}) == {}
+    )
+
+
+def test_marker_specific_blastbox_entries_do_not_pool_their_extras(tmp_path):
+    """A portable lock can pin blastbox twice under exclusive markers.
+
+    Unioning both extras checks a closure pip would never install on either
+    interpreter, and refuses a lock that is correct for both.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    lock = (
+        _entry('blastbox[host]==0.1.39 ; python_version < "3.13"')
+        + _entry('blastbox[s3]==0.1.39 ; python_version >= "3.13"')
+        + _entry("pydantic==2.13.5")
+        + _entry("packaging==26.3")
+        + _entry("fastapi==1.2.0")
+        + _entry("uvicorn==1.1.0")
+        + _entry("backport==1.0")
+    )
+    _write(tmp_path, "req.lock", lock)
+    # On 3.12 only the host entry applies, so s3's boto3 is not demanded.
+    gaps = missing_from_locks(tmp_path, _RM, environment={"python_version": "3.12"})
+    assert gaps == {}, gaps
+
+
+def test_one_extras_dependencies_do_not_infer_another(tmp_path):
+    """`dev` requiring everything `host` does, plus pytest, is common.
+
+    Counting the shared names as evidence for dev means a host-only lock
+    satisfies dev's majority and gets refused for missing pytest.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    reqs = [
+        "pydantic>=2.6.0",
+        'a-lib>=1; extra == "host"',
+        'b-lib>=1; extra == "host"',
+        'a-lib>=1; extra == "dev"',
+        'b-lib>=1; extra == "dev"',
+        'pytest>=8; extra == "dev"',
+    ]
+    _write(
+        tmp_path,
+        "req.lock",
+        _entry("blastbox==0.1.39")
+        + _entry("pydantic==2.13.5")
+        + _entry("a-lib==1.0")
+        + _entry("b-lib==1.0"),
+    )
+    assert missing_from_locks(tmp_path, reqs) == {}
+
+
+def test_only_requirement_files_are_treated_as_install_sets(tmp_path):
+    """`_walk` yields everything, and reading it all pulls VM images into memory.
+
+    Asserted by CONSEQUENCE rather than by timing: a document that merely
+    mentions a pinned, hashed blastbox is judged as a lock if the candidate set
+    is everything, and then reports its dependencies missing.
+    """
+    from blastbox.host.pins import missing_from_locks
+
+    _write(
+        tmp_path, "req.lock", _entry("blastbox==0.1.39") + _entry("pydantic==2.13.5")
+    )
+    # Prose, not a lock -- but indistinguishable from one if it is read as one.
+    (tmp_path / "UPGRADING.md").write_text(
+        "Pin it like this:\n\n" + _entry("blastbox==0.1.39")
+    )
+    blob = tmp_path / "rootfs.ext4"
+    with blob.open("wb") as fh:
+        fh.truncate(64 * 1024 * 1024)  # sparse; only its SIZE matters here
+    gaps = missing_from_locks(tmp_path, ["pydantic>=2.6.0"])
+    assert gaps == {}, gaps
