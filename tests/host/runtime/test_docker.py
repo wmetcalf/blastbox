@@ -1,4 +1,5 @@
 """Tests for blastbox.host.runtime.docker — runtime selection and argv builder."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -17,6 +18,7 @@ from blastbox.host.runtime.docker import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _argv(
     *,
@@ -66,6 +68,7 @@ def _argv(
 # InsecureRuntimeRefused is a SandboxError
 # ---------------------------------------------------------------------------
 
+
 def test_insecure_runtime_refused_is_sandbox_error():
     e = InsecureRuntimeRefused("test")
     assert isinstance(e, SandboxError)
@@ -75,6 +78,7 @@ def test_insecure_runtime_refused_is_sandbox_error():
 # ---------------------------------------------------------------------------
 # select_worker_runtime — runtime selection logic
 # ---------------------------------------------------------------------------
+
 
 def test_select_runsc_when_available(monkeypatch):
     """runsc in detected set → RuntimeSelection(runtime='runsc', secure=True)."""
@@ -103,8 +107,10 @@ def test_select_runc_allowed_with_explicit_opt_in(monkeypatch):
     sel = select_worker_runtime(available_runtimes=["runc"])
     assert sel.runtime == "runc"
     assert sel.secure is False
-    assert any("runsc" in w.lower() or "insecure" in w.lower() or "runc" in w.lower()
-               for w in sel.warnings)
+    assert any(
+        "runsc" in w.lower() or "insecure" in w.lower() or "runc" in w.lower()
+        for w in sel.warnings
+    )
 
 
 def test_require_secure_overrides_allow_runc(monkeypatch):
@@ -184,6 +190,7 @@ def test_selection_is_frozen():
 # build_worker_docker_run_argv — argv shape and security properties
 # ---------------------------------------------------------------------------
 
+
 def test_argv_is_list_of_str(tmp_path):
     """argv must be list[str] — not a string, never shell=True fodder."""
     argv = _argv(tmp_path=tmp_path)
@@ -239,17 +246,26 @@ def test_read_only_present(tmp_path):
 
 
 def test_runtime_flag_present(tmp_path):
-    argv = _argv(tmp_path=tmp_path, runtime=RuntimeSelection(runtime="runsc", secure=True, warnings=[]))
+    argv = _argv(
+        tmp_path=tmp_path,
+        runtime=RuntimeSelection(runtime="runsc", secure=True, warnings=[]),
+    )
     assert "--runtime=runsc" in argv
 
 
 def test_runtime_flag_runc(tmp_path):
-    argv = _argv(tmp_path=tmp_path, runtime=RuntimeSelection(runtime="runc", secure=False, warnings=[]))
+    argv = _argv(
+        tmp_path=tmp_path,
+        runtime=RuntimeSelection(runtime="runc", secure=False, warnings=[]),
+    )
     assert "--runtime=runc" in argv
 
 
 def test_warn_on_insecure_set_under_runsc(tmp_path):
-    argv = _argv(tmp_path=tmp_path, runtime=RuntimeSelection(runtime="runsc", secure=True, warnings=[]))
+    argv = _argv(
+        tmp_path=tmp_path,
+        runtime=RuntimeSelection(runtime="runsc", secure=True, warnings=[]),
+    )
     assert "BLASTBOX_WARN_ON_INSECURE=1" in argv
 
 
@@ -374,6 +390,7 @@ def test_worker_argv_appended(tmp_path):
 # No flag-injection via caller-controlled values
 # ---------------------------------------------------------------------------
 
+
 def test_extra_env_injection_is_single_token(tmp_path):
     """extra_env value containing '; --privileged' stays as ONE token, not a new flag."""
     malicious_value = "V; --privileged"
@@ -436,6 +453,7 @@ def test_no_shell_true_in_argv(tmp_path):
 # gVisor / runc warn-on-insecure env propagation
 # ---------------------------------------------------------------------------
 
+
 def test_runsc_sets_warn_on_insecure_env(tmp_path):
     """Under runsc, BLASTBOX_WARN_ON_INSECURE=1 must be in argv."""
     argv = _argv(
@@ -469,6 +487,7 @@ def test_runc_sets_warn_on_insecure_for_deliberate_degraded_mode(tmp_path, monke
 # ---------------------------------------------------------------------------
 # Resource caps — env override works
 # ---------------------------------------------------------------------------
+
 
 def test_worker_memory_env_override(tmp_path, monkeypatch):
     monkeypatch.setenv("BLASTBOX_WORKER_MEMORY", "2g")
@@ -527,6 +546,7 @@ def test_worker_caps_blank_env_use_defaults(tmp_path, monkeypatch, blank):
 # seccomp / apparmor optional attachment
 # ---------------------------------------------------------------------------
 
+
 def test_missing_seccomp_host_path_records_warning_not_failure(tmp_path, monkeypatch):
     """If BLASTBOX_SECCOMP_JSON_HOST is unset, argv builds OK + warning recorded."""
     monkeypatch.delenv("BLASTBOX_SECCOMP_JSON_HOST", raising=False)
@@ -575,6 +595,7 @@ def test_seccomp_host_path_attached_when_set(tmp_path, monkeypatch):
 # extra_env and labels are fully propagated
 # ---------------------------------------------------------------------------
 
+
 def test_extra_env_propagated(tmp_path):
     argv = _argv(extra_env={"MY_VAR": "my_val", "ANOTHER": "123"}, tmp_path=tmp_path)
     assert "-e" in argv
@@ -607,6 +628,7 @@ def test_no_container_name_when_none(tmp_path):
 # workdir
 # ---------------------------------------------------------------------------
 
+
 def test_workdir_defaults_to_tmp(tmp_path):
     argv = _argv(tmp_path=tmp_path)
     assert "--workdir" in argv
@@ -633,6 +655,7 @@ def test_workdir_custom(tmp_path):
 # Optional outer nono (Landlock) wrap of the worker command (cold path)
 # ---------------------------------------------------------------------------
 
+
 def _runc():
     return RuntimeSelection(runtime="runc", secure=False, warnings=[])
 
@@ -644,7 +667,7 @@ def _runsc():
 def test_nono_wrap_off_by_default(monkeypatch):
     monkeypatch.delenv("BLASTBOX_WORKER_NONO_WRAP", raising=False)
     argv = _argv(worker_argv=["blastbox", "worker"], runtime=_runc())
-    assert argv[-2:] == ["blastbox", "worker"]          # verbatim, no wrap
+    assert argv[-2:] == ["blastbox", "worker"]  # verbatim, no wrap
     assert "nono" not in " ".join(argv)
     assert "/run/nono" not in " ".join(argv)
 
@@ -659,7 +682,7 @@ def test_nono_wrap_on_under_runc(monkeypatch):
     # worker command wrapped: env HOME=/run/nono nono wrap ... -- env HOME=/tmp blastbox worker
     assert "/usr/local/bin/nono" in argv and "wrap" in argv and "--block-net" in argv
     assert "HOME=/run/nono" in argv and "HOME=/tmp" in argv
-    assert argv[-2:] == ["blastbox", "worker"]           # real worker still the tail
+    assert argv[-2:] == ["blastbox", "worker"]  # real worker still the tail
     # baseline grants present (read system dirs, write /tmp + output + dev)
     assert "-r" in argv and "/usr" in argv
     assert argv[argv.index("/job/output") - 1] == "-a"
@@ -669,9 +692,9 @@ def test_nono_wrap_skipped_under_runsc(monkeypatch):
     monkeypatch.setenv("BLASTBOX_WORKER_NONO_WRAP", "1")
     rt = _runsc()
     argv = _argv(worker_argv=["blastbox", "worker"], runtime=rt)
-    assert "nono" not in " ".join(argv)                  # ENOSYS on gVisor -> skipped
+    assert "nono" not in " ".join(argv)  # ENOSYS on gVisor -> skipped
     assert argv[-2:] == ["blastbox", "worker"]
-    assert any("Landlock" in w for w in rt.warnings)     # and warned
+    assert any("Landlock" in w for w in rt.warnings)  # and warned
 
 
 def test_nono_wrap_with_profile(monkeypatch):
@@ -679,7 +702,7 @@ def test_nono_wrap_with_profile(monkeypatch):
     monkeypatch.setenv("BLASTBOX_WORKER_NONO_PROFILE", "/etc/blastbox/worker.nono.json")
     argv = _argv(worker_argv=["blastbox", "worker"], runtime=_runc())
     assert "-p" in argv and "/etc/blastbox/worker.nono.json" in argv
-    assert "/usr" not in argv                            # profile replaces the baseline grants
+    assert "/usr" not in argv  # profile replaces the baseline grants
 
 
 # ---------------------------------------------------------------------------

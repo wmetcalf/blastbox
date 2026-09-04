@@ -14,6 +14,7 @@ bounded inline retry (a transient blip gets a real chance to succeed while this
 worker still holds the claim and the output dir exists), and on exhaustion an
 unconditional FAIL + purge — the same shape as every other terminal path.
 """
+
 import contextlib
 
 from blastbox.host.jobs.base import Job, JobStatus
@@ -30,16 +31,21 @@ class Blobs:
         self.uploaded: list[str] = []
         self.saw_metadata = False
         self.deleted: list[str] = []
+
     def put_sample(self, sha256, src): ...
     def get_sample(self, sha256, dest):
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(b"x")
+
     def put_output(self, job_id, out_dir):
         self.put_output_calls += 1
-        if self.fail_put or (self.fail_times is not None and self.put_output_calls <= self.fail_times):
+        if self.fail_put or (
+            self.fail_times is not None and self.put_output_calls <= self.fail_times
+        ):
             raise OSError(f"object store down (attempt {self.put_output_calls})")
         self.saw_metadata = (out_dir / "metadata.json").is_file()
         self.uploaded.append(job_id)
+
     def open_output(self, job_id, name): ...
     def delete_job(self, job_id):
         self.deleted.append(job_id)
@@ -62,7 +68,9 @@ def test_output_uploaded_before_purge(vm_dispatcher_factory, tmp_path):
     assert store.get(job.job_id).status is JobStatus.DONE
 
 
-def test_upload_retries_inline_and_recovers_from_a_transient_failure(vm_dispatcher_factory, tmp_path):
+def test_upload_retries_inline_and_recovers_from_a_transient_failure(
+    vm_dispatcher_factory, tmp_path
+):
     """A blip that clears up within the retry budget must still produce a normal
     DONE — the retry is supposed to be invisible to the job's outcome."""
     store = InMemoryJobStore()
@@ -71,20 +79,28 @@ def test_upload_retries_inline_and_recovers_from_a_transient_failure(vm_dispatch
     store.create(job)
     claimed = store.claim_next()
 
-    blobs = Blobs(fail_times=2)  # fails twice, then succeeds -- within a 3-attempt budget
+    blobs = Blobs(
+        fail_times=2
+    )  # fails twice, then succeeds -- within a 3-attempt budget
     disp = vm_dispatcher_factory(
-        store=store, blob_store=blobs, validate_ok=True, put_output_max_attempts=3,
+        store=store,
+        blob_store=blobs,
+        validate_ok=True,
+        put_output_max_attempts=3,
     )
     disp._process(claimed)
 
     assert blobs.put_output_calls == 3
     assert blobs.uploaded == [job.job_id]
     assert store.get(job.job_id).status is JobStatus.DONE
-    assert not (tmp_path / job.job_id).exists(), "purge must still run on the recovered success path"
+    assert not (tmp_path / job.job_id).exists(), (
+        "purge must still run on the recovered success path"
+    )
 
 
 def test_upload_failure_after_exhausting_retries_fails_the_job_and_retains_the_result(
-    vm_dispatcher_factory, tmp_path,
+    vm_dispatcher_factory,
+    tmp_path,
 ):
     """Finding D1's contract, half revised (#85).
 
@@ -111,13 +127,20 @@ def test_upload_failure_after_exhausting_retries_fails_the_job_and_retains_the_r
 
     blobs = Blobs(fail_put=True)
     disp = vm_dispatcher_factory(
-        store=store, blob_store=blobs, validate_ok=True, put_output_max_attempts=3,
+        store=store,
+        blob_store=blobs,
+        validate_ok=True,
+        put_output_max_attempts=3,
     )
     disp._process(claimed)
 
-    assert blobs.put_output_calls == 3, "must exhaust the bounded retry budget, not give up early"
+    assert blobs.put_output_calls == 3, (
+        "must exhaust the bounded retry budget, not give up early"
+    )
     final = store.get(job.job_id)
-    assert final.status is JobStatus.FAILED, "must not be left RUNNING -- there is no consumer for that"
+    assert final.status is JobStatus.FAILED, (
+        "must not be left RUNNING -- there is no consumer for that"
+    )
     assert "upload failed" in (final.error or "").lower()
     # The result is RETAINED as the only copy -- and it is the sealed output that must survive,
     # not merely the directory.
@@ -130,7 +153,9 @@ def test_upload_failure_after_exhausting_retries_fails_the_job_and_retains_the_r
     assert blobs.deleted == [job.job_id]
 
 
-def test_upload_exhaustion_with_lost_claim_does_not_reap_peer_result(vm_dispatcher_factory, tmp_path):
+def test_upload_exhaustion_with_lost_claim_does_not_reap_peer_result(
+    vm_dispatcher_factory, tmp_path
+):
     """Ultrareview bug_001 (VM path): the exhaustion reap (Finding S1) must be claim-fenced.
     The pre-upload `_claim_is_still_ours` check runs once, BEFORE the retry loop; if a peer
     requeues + re-runs + CAS-commits DONE during the backoff window, its result sits at the
@@ -146,28 +171,38 @@ def test_upload_exhaustion_with_lost_claim_does_not_reap_peer_result(vm_dispatch
     class PeerWinsDuringRetryBlobs(Blobs):
         """Every put_output attempt fails; the first failure simulates the peer's full
         requeue -> re-run -> upload -> DONE-CAS landing during our retry window."""
+
         def put_output(self, job_id, out_dir):
             first = self.put_output_calls == 0
             try:
                 super().put_output(job_id, out_dir)
             finally:
                 if first:
-                    store.update(job_id, status=JobStatus.DONE, claim_id="peer-claim-id-not-ours")
+                    store.update(
+                        job_id, status=JobStatus.DONE, claim_id="peer-claim-id-not-ours"
+                    )
 
     blobs = PeerWinsDuringRetryBlobs(fail_put=True)
     disp = vm_dispatcher_factory(
-        store=store, blob_store=blobs, validate_ok=True, put_output_max_attempts=3,
+        store=store,
+        blob_store=blobs,
+        validate_ok=True,
+        put_output_max_attempts=3,
     )
     disp._process(claimed)
 
     assert blobs.put_output_calls == 3
     assert blobs.deleted == [], "must not reap the peer's authoritative result blob"
     stored = store.get(job.job_id)
-    assert stored.status is JobStatus.DONE, "the peer's terminal DONE must survive untouched"
+    assert stored.status is JobStatus.DONE, (
+        "the peer's terminal DONE must survive untouched"
+    )
     assert stored.claim_id == "peer-claim-id-not-ours"
 
 
-def test_reclaimed_claim_skips_upload_instead_of_clobbering_peer_result(vm_dispatcher_factory, tmp_path):
+def test_reclaimed_claim_skips_upload_instead_of_clobbering_peer_result(
+    vm_dispatcher_factory, tmp_path
+):
     """Regression for the TOCTOU in the finding: put_output writes to a deterministic per-job key
     that is a per-file overwrite/union, not a claim-fenced atomic swap. If our claim is reclaimed
     (sweeper) DURING the window between the last ownership check and the upload -- here simulated
@@ -215,7 +250,8 @@ def test_reclaimed_claim_skips_upload_instead_of_clobbering_peer_result(vm_dispa
 
 
 def test_a_store_outage_during_terminal_write_does_not_destroy_the_retained_result(
-    vm_dispatcher_factory, tmp_path,
+    vm_dispatcher_factory,
+    tmp_path,
 ):
     """`terminal_status` is what the `finally` reads to tell "a peer owns this job now" from
     "we could not reach the store at all" — and only the first of those makes our tree stale.
@@ -224,6 +260,7 @@ def test_a_store_outage_during_terminal_write_does_not_destroy_the_retained_resu
     exactly like a lost claim: the retained result was purged precisely when the store was already
     sick, which is the worst possible moment to also lose the only copy of a sealed result.
     """
+
     class StoreDiesOnTerminalWrite(InMemoryJobStore):
         calls = 0
 
@@ -240,10 +277,12 @@ def test_a_store_outage_during_terminal_write_does_not_destroy_the_retained_resu
     claimed = store.claim_next()
 
     disp = vm_dispatcher_factory(
-        store=store, blob_store=Blobs(fail_put=True), validate_ok=True,
+        store=store,
+        blob_store=Blobs(fail_put=True),
+        validate_ok=True,
         put_output_max_attempts=1,
     )
-    with contextlib.suppress(Exception):        # the store error still propagates, as before
+    with contextlib.suppress(Exception):  # the store error still propagates, as before
         disp._process(claimed)
 
     assert (tmp_path / job.job_id / "output" / "metadata.json").exists(), (

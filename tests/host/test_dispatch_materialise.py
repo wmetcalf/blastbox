@@ -8,6 +8,7 @@ blob store (uploaded by another node's ingress in a shared-queue deployment) wou
 run with a garbage/missing input instead of fetching it first. These tests drive
 BOTH the cold and warm paths through ``Dispatcher._materialise_sample``.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -46,7 +47,9 @@ def _limits() -> Limits:
 
 
 def _engine_spec() -> EngineSpec:
-    return EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"])
+    return EngineSpec(
+        name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"]
+    )
 
 
 def _fake_runtime() -> RuntimeSelection:
@@ -73,8 +76,13 @@ def _make_valid_output_dir(output_dir: Path, *, input_sha256: str = _INPUT_SHA) 
             "source": "magika",
         },
         "artifacts": [
-            {"id": "page-001", "path": "page-001.png", "kind": "image",
-             "sha256": real_sha, "bytes": len(artifact_content)}
+            {
+                "id": "page-001",
+                "path": "page-001.png",
+                "kind": "image",
+                "sha256": real_sha,
+                "bytes": len(artifact_content),
+            }
         ],
         "warnings": [],
         "payload": {"_type": "extracted_text", "text": "hello world", "char_count": 11},
@@ -108,6 +116,7 @@ class UnreachableBlobStore:
     def put_sample(self, sha256, src): ...
     def get_sample(self, sha256, dest):
         raise BlobFetchError("object store unreachable")
+
     def put_output(self, job_id, out_dir): ...
     def open_output(self, job_id, name): ...
     def delete_job(self, job_id): ...
@@ -169,7 +178,10 @@ def test_cold_fetch_failure_releases_not_fails(tmp_path):
     store.create(job)
 
     dispatcher = _make_dispatcher(
-        store, job_root=job_root, blob_store=UnreachableBlobStore(), blob_retry_backoff_s=30.0
+        store,
+        job_root=job_root,
+        blob_store=UnreachableBlobStore(),
+        blob_retry_backoff_s=30.0,
     )
     result = dispatcher.dispatch_once()
 
@@ -193,17 +205,25 @@ def test_cold_permanently_missing_sample_eventually_fails_the_job(tmp_path):
     job.input_sha256 = _INPUT_SHA
     store.create(job)
 
-    dispatcher = _make_dispatcher(store, job_root=job_root, blob_store=UnreachableBlobStore())
+    dispatcher = _make_dispatcher(
+        store, job_root=job_root, blob_store=UnreachableBlobStore()
+    )
 
     for attempt in range(1, MAX_MATERIALISE_ATTEMPTS + 1):
         assert dispatcher.dispatch_once() is True
         current = store.get(job.job_id)
         assert current.materialise_attempts == attempt
         if attempt < MAX_MATERIALISE_ATTEMPTS:
-            assert current.status is JobStatus.QUEUED, f"attempt {attempt} should release"
-            store.update(job.job_id, claimable_after=None)  # bypass backoff for the loop
+            assert current.status is JobStatus.QUEUED, (
+                f"attempt {attempt} should release"
+            )
+            store.update(
+                job.job_id, claimable_after=None
+            )  # bypass backoff for the loop
         else:
-            assert current.status is JobStatus.FAILED, "must give up once the bound is reached"
+            assert current.status is JobStatus.FAILED, (
+                "must give up once the bound is reached"
+            )
             assert current.error and "attempts" in current.error
 
 
@@ -254,8 +274,9 @@ def test_cold_present_input_is_not_refetched(tmp_path):
 # ===========================================================================
 
 
-def _make_warm_dispatcher(store, *, job_root: Path, pool, blob_store=None,
-                           blob_retry_backoff_s: float = 0.0) -> Dispatcher:
+def _make_warm_dispatcher(
+    store, *, job_root: Path, pool, blob_store=None, blob_retry_backoff_s: float = 0.0
+) -> Dispatcher:
     return Dispatcher(
         job_store=store,
         engines={_ENGINE_NAME: _engine_spec()},
@@ -292,11 +313,15 @@ def test_warm_missing_input_is_materialised_then_processed(tmp_path):
     pool = FakeWarmPool(slot)
     _start_fake_worker(
         slot,
-        output_fn=lambda out_dir: _make_valid_warm_output_dir(out_dir, input_sha256=_INPUT_SHA),
+        output_fn=lambda out_dir: _make_valid_warm_output_dir(
+            out_dir, input_sha256=_INPUT_SHA
+        ),
     )
 
     input_path = job_root / job.job_id / "input" / Path(job.filename).name
-    dispatcher = _make_warm_dispatcher(store, job_root=job_root, pool=pool, blob_store=blobs)
+    dispatcher = _make_warm_dispatcher(
+        store, job_root=job_root, pool=pool, blob_store=blobs
+    )
     assert not input_path.exists()
     result = dispatcher.dispatch_once()
 
@@ -419,7 +444,9 @@ def test_counter_is_consecutive_not_lifetime_across_a_reset(tmp_path):
         claimed = store.claim_next()
         assert dispatcher._materialise_sample(claimed, input_path) is False
         current = store.get(job.job_id)
-        assert current.status is JobStatus.QUEUED, f"attempt {expected_attempt} should release"
+        assert current.status is JobStatus.QUEUED, (
+            f"attempt {expected_attempt} should release"
+        )
         assert current.materialise_attempts == expected_attempt
         store.update(job.job_id, claimable_after=None)
 

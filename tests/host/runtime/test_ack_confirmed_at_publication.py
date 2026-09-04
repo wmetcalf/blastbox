@@ -24,13 +24,15 @@ from blastbox.host.runtime.fc_snapshot import (
 )
 from blastbox.worker.warm import AckCapability
 
-EPOCH0 = 0   # SnapshotManager starts at build epoch 0
+EPOCH0 = 0  # SnapshotManager starts at build epoch 0
 
 
 class _Boot:
     """A base build that advertises ACK at readiness, as a real one does."""
 
-    def __init__(self, cap, gen, *, checkpoint_fails=False, on_ready=None, advertises=True):
+    def __init__(
+        self, cap, gen, *, checkpoint_fails=False, on_ready=None, advertises=True
+    ):
         self.ack_generation = gen
         self._cap = cap
         self._fails = checkpoint_fails
@@ -70,7 +72,9 @@ def test_a_published_build_confirms_its_advertisement(tmp_path):
     cap = AckCapability()
     mgr = _mgr(tmp_path, cap, _Boot(cap, EPOCH0))
     mgr.build()
-    assert cap.capable_for(EPOCH0), "a base that advertised AND published must be believed"
+    assert cap.capable_for(EPOCH0), (
+        "a base that advertised AND published must be believed"
+    )
 
 
 def test_a_build_whose_checkpoint_fails_confirms_nothing(tmp_path):
@@ -80,7 +84,8 @@ def test_a_build_whose_checkpoint_fails_confirms_nothing(tmp_path):
         _mgr(tmp_path, cap, boot).build()
     assert not cap.capable_for(EPOCH0), (
         "the build advertised and then produced no artifact; nothing can ever be restored from "
-        "it, so its capability must not outlive it")
+        "it, so its capability must not outlive it"
+    )
 
 
 def test_a_build_rejected_at_publication_confirms_nothing(tmp_path):
@@ -90,7 +95,7 @@ def test_a_build_rejected_at_publication_confirms_nothing(tmp_path):
     mgr = None
 
     def _invalidate_midflight():
-        mgr.invalidate()                 # bumps _build_epoch; this build is now doomed.
+        mgr.invalidate()  # bumps _build_epoch; this build is now doomed.
         # No cap.reset() any more, and that is the point: there is one identity, and
         # invalidate() already moved it (issue #92).
 
@@ -98,7 +103,9 @@ def test_a_build_rejected_at_publication_confirms_nothing(tmp_path):
     mgr = _mgr(tmp_path, cap, boot)
     with pytest.raises(SnapshotBuildInvalidated):
         mgr.build()
-    assert not cap.capable_for(EPOCH0), "a build whose artifact was rejected still taught its replacement"
+    assert not cap.capable_for(EPOCH0), (
+        "a build whose artifact was rejected still taught its replacement"
+    )
 
 
 def test_a_build_that_never_advertised_stays_unknown(tmp_path):
@@ -108,10 +115,12 @@ def test_a_build_that_never_advertised_stays_unknown(tmp_path):
 
     class _Silent(_Boot):
         def wait_ready(self, timeout_s):
-            pass                          # no observe()
+            pass  # no observe()
 
     _mgr(tmp_path, cap, _Silent(cap, EPOCH0)).build()
-    assert not cap.capable_for(EPOCH0), "publication must confirm an advertisement, never manufacture one"
+    assert not cap.capable_for(EPOCH0), (
+        "publication must confirm an advertisement, never manufacture one"
+    )
 
 
 def test_a_rejection_alone_blocks_the_confirmation(tmp_path):
@@ -126,7 +135,7 @@ def test_a_rejection_alone_blocks_the_confirmation(tmp_path):
     mgr = None
 
     def _artifact_retired_but_generation_not_yet_moved():
-        mgr.invalidate()          # drop(): _build_epoch moves, this build is doomed
+        mgr.invalidate()  # drop(): _build_epoch moves, this build is doomed
         # ...and reset() has NOT run yet, so EPOCH0 is unchanged.
 
     boot = _Boot(cap, EPOCH0, on_ready=_artifact_retired_but_generation_not_yet_moved)
@@ -136,7 +145,8 @@ def test_a_rejection_alone_blocks_the_confirmation(tmp_path):
 
     assert not cap.capable_for(EPOCH0), (
         "the artifact was discarded, so no slot can ever be restored from this base -- its "
-        "advertisement must not be credited to whatever replaces it")
+        "advertisement must not be credited to whatever replaces it"
+    )
 
 
 def test_pending_observations_do_not_accumulate(tmp_path):
@@ -146,9 +156,10 @@ def test_pending_observations_do_not_accumulate(tmp_path):
     cap = AckCapability()
     for e in range(50):
         cap.observe(e)
-        cap.publish(e)          # each rebuild installs a new artifact
+        cap.publish(e)  # each rebuild installs a new artifact
     assert len(cap._pending) <= 1, (
-        f"pending observations accumulated across rebuilds: {len(cap._pending)}")
+        f"pending observations accumulated across rebuilds: {len(cap._pending)}"
+    )
 
 
 def test_a_failed_attempt_does_not_teach_the_retry(tmp_path):
@@ -180,12 +191,13 @@ def test_a_failed_attempt_does_not_teach_the_retry(tmp_path):
     mgr = SnapshotManager(Path(tmp_path), backend, ack_capable=cap)
 
     with pytest.raises(SnapshotBuildError):
-        mgr.build()                       # attempt 1: advertised, then failed
+        mgr.build()  # attempt 1: advertised, then failed
     assert not cap.capable_for(EPOCH0), "precondition: a failed build teaches nothing"
 
-    mgr.build()                           # attempt 2: silent, and publishes
+    mgr.build()  # attempt 2: silent, and publishes
     assert not cap.capable_for(EPOCH0), (
-        "the rolled-back base inherited a capability advertised by the attempt it replaced")
+        "the rolled-back base inherited a capability advertised by the attempt it replaced"
+    )
 
 
 def test_a_retry_that_advertises_is_still_believed(tmp_path):
@@ -204,7 +216,9 @@ def test_a_retry_that_advertises_is_still_believed(tmp_path):
     with pytest.raises(SnapshotBuildError):
         mgr.build()
     mgr.build()
-    assert cap.capable_for(EPOCH0), "the retry advertised and published; that must be believed"
+    assert cap.capable_for(EPOCH0), (
+        "the retry advertised and published; that must be believed"
+    )
 
 
 def test_an_injected_manager_shares_its_capability_with_the_runtime(tmp_path):
@@ -217,7 +231,9 @@ def test_an_injected_manager_shares_its_capability_with_the_runtime(tmp_path):
     fast repair is silently disabled, on precisely the custom wiring an operator chose on
     purpose."""
     from blastbox.host.runtime.fc_snapshot_runtime import select_snapshot_runtime
-    from blastbox.host.runtime.gvisor_snapshot_runtime import select_gvisor_snapshot_runtime
+    from blastbox.host.runtime.gvisor_snapshot_runtime import (
+        select_gvisor_snapshot_runtime,
+    )
 
     cap = AckCapability()
     mgr = SnapshotManager(Path(tmp_path), _Backend(_Boot(cap, EPOCH0)), ack_capable=cap)
@@ -231,13 +247,18 @@ def test_an_injected_manager_shares_its_capability_with_the_runtime(tmp_path):
 
 def test_a_manager_double_without_the_seam_still_works(tmp_path):
     """Injected test doubles are not real managers; they must not break the selector."""
-    from blastbox.host.runtime.gvisor_snapshot_runtime import select_gvisor_snapshot_runtime
+    from blastbox.host.runtime.gvisor_snapshot_runtime import (
+        select_gvisor_snapshot_runtime,
+    )
 
     class _Double:
-        def build(self): return None
+        def build(self):
+            return None
 
     gv = select_gvisor_snapshot_runtime(manager=_Double())
-    assert gv._ack_capable is not None, "the runtime must fall back to its own capability"
+    assert gv._ack_capable is not None, (
+        "the runtime must fall back to its own capability"
+    )
 
 
 def test_an_unstamped_ack_teaches_nothing_in_snapshot_mode():
@@ -248,21 +269,22 @@ def test_an_unstamped_ack_teaches_nothing_in_snapshot_mode():
     proven non-starts and convict a healthy base. A caller that cannot say which artifact its slot
     came from has not supplied evidence about any artifact."""
     cap = AckCapability()
-    cap.publish(1)                       # a silent artifact is installed
+    cap.publish(1)  # a silent artifact is installed
     assert cap.capable_for(1) is False
 
-    cap.learn(None)                      # an unidentifiable slot acks
+    cap.learn(None)  # an unidentifiable slot acks
     assert cap.capable_for(1) is False, (
-        "an unstamped ack resurrected capability for a base that never advertised")
+        "an unstamped ack resurrected capability for a base that never advertised"
+    )
 
-    cap.learn(1)                         # ...a properly stamped one still teaches
+    cap.learn(1)  # ...a properly stamped one still teaches
     assert cap.capable_for(1) is True
 
 
 def test_an_unstamped_ack_still_teaches_the_plain_runtime():
     """With no artifact lifecycle there is one image and nothing to tell apart, so an unstamped
     ack is the only kind there is."""
-    cap = AckCapability()                # never published: the plain FC runtime
+    cap = AckCapability()  # never published: the plain FC runtime
     cap.learn(None)
     assert bool(cap) is True
     assert cap.capable_for(None) is True
@@ -308,7 +330,8 @@ def test_the_capability_is_installed_with_the_artifact_not_after_it(tmp_path):
     mgr.build()
 
     assert seen == [(True, True)], (
-        f"the capability must be installed under the SAME lock that assigns the artifact, got {seen}")
+        f"the capability must be installed under the SAME lock that assigns the artifact, got {seen}"
+    )
 
 
 def test_a_hand_assembled_stack_gets_its_epoch_source_wired(tmp_path):
@@ -351,7 +374,8 @@ def test_the_pinned_epoch_is_dropped_when_the_slot_is_reaped(tmp_path):
     for i in range(25):
         mgr.release(f"slot-{i}")
     assert mgr._pin_epoch == {}, (
-        f"reaped slots left {len(mgr._pin_epoch)} epoch entries behind")
+        f"reaped slots left {len(mgr._pin_epoch)} epoch entries behind"
+    )
 
 
 def test_a_raising_pinned_epoch_does_not_strand_the_microvm(tmp_path):
@@ -416,19 +440,21 @@ def test_a_snapshot_runtimes_fallback_capability_is_never_plain_mode():
 
     # GUARD 1 -- learn() must not set the flag at all.
     scoped = AckCapability(artifact_scoped=True)
-    scoped.learn(None)                       # an ack from some restored slot
+    scoped.learn(None)  # an ack from some restored slot
     assert bool(scoped) is False, (
-        "an unstamped ack taught an artifact-scoped capability that has published nothing")
+        "an unstamped ack taught an artifact-scoped capability that has published nothing"
+    )
 
     # GUARD 2 -- even WITH the flag set, capable_for() must answer UNKNOWN while nothing is
     # published. Forced directly, so this assertion does not depend on guard 1.
     forced = AckCapability(artifact_scoped=True)
     object.__setattr__(forced, "_capable", True)
     assert forced.capable_for(7) is False, (
-        "an artifact-scoped capability answered from the bare flag with no artifact published")
+        "an artifact-scoped capability answered from the bare flag with no artifact published"
+    )
     assert forced.capable_for(None) is False
 
-    plain = AckCapability()                  # the plain FC runtime: no artifact lifecycle
+    plain = AckCapability()  # the plain FC runtime: no artifact lifecycle
     plain.learn(None)
     assert plain.capable_for(None) is True, "the no-artifact runtime must still learn"
 
@@ -456,7 +482,8 @@ def test_both_snapshot_runtimes_build_scoped_fallbacks():
     for name, rt in (("fc", fc), ("gvisor", gv)):
         rt._ack_capable.learn(None)
         assert rt._ack_capable.capable_for(3) is False, (
-            f"{name}: the fallback fell into plain mode and is capable for any epoch")
+            f"{name}: the fallback fell into plain mode and is capable for any epoch"
+        )
 
 
 def test_a_gvisor_epoch_lookup_failure_does_not_leak_the_sandbox():
@@ -535,11 +562,12 @@ def test_a_repair_does_not_inherit_a_failed_builds_backoff(tmp_path):
     mgr.ensure_build_started()
     assert booted.wait(5)
     _t.sleep(0.02)
-    mgr.invalidate()                      # the deliberate repair, landing mid-failure
+    mgr.invalidate()  # the deliberate repair, landing mid-failure
     _t.sleep(0.4)
 
     assert _t.monotonic() >= mgr._retry_not_before, (
-        "the repair inherited the failed build's cold window")
+        "the repair inherited the failed build's cold window"
+    )
     assert mgr._build_error is None, "the superseded build's error was resurrected"
 
 
@@ -582,10 +610,14 @@ def test_the_production_capabilities_are_artifact_scoped():
 
     for mod in (fcm, gvm):
         src = inspect.getsource(mod)
-        bare = [ln.strip() for ln in src.splitlines()
-                if "AckCapability()" in ln and "ack_capable is not None" not in ln]
+        bare = [
+            ln.strip()
+            for ln in src.splitlines()
+            if "AckCapability()" in ln and "ack_capable is not None" not in ln
+        ]
         assert not bare, (
-            f"{mod.__name__} builds an UNSCOPED snapshot capability: {bare}")
+            f"{mod.__name__} builds an UNSCOPED snapshot capability: {bare}"
+        )
 
 
 def test_the_bound_epoch_sampler_does_not_re_enter_the_build_lock():
@@ -604,8 +636,12 @@ def test_the_bound_epoch_sampler_does_not_re_enter_the_build_lock():
         _ack_sampler = None
 
     be = _Backend()
-    mgr = SnapshotManager(_P("/tmp"), be, ack_capable=AckCapability(artifact_scoped=True))
-    assert be._epoch_sampler is not None, "precondition: the manager bound its epoch source"
+    mgr = SnapshotManager(
+        _P("/tmp"), be, ack_capable=AckCapability(artifact_scoped=True)
+    )
+    assert be._epoch_sampler is not None, (
+        "precondition: the manager bound its epoch source"
+    )
 
     # Sample WHILE holding _build_lock. A re-locking sampler hangs here forever.
     done = threading.Event()
@@ -642,7 +678,9 @@ def test_the_manager_binds_the_epoch_source_through_to_the_launcher(tmp_path):
     be = _BackendWithLauncher(_Boot(cap, EPOCH0))
     mgr = SnapshotManager(Path(tmp_path), be, ack_capable=cap)
 
-    assert be._launcher._ack_sampler is not None, "the LAUNCHER's sampler was never bound"
+    assert be._launcher._ack_sampler is not None, (
+        "the LAUNCHER's sampler was never bound"
+    )
     assert be._launcher._ack_sampler() == mgr.build_epoch
     assert be._epoch_sampler is not None and be._epoch_sampler() == mgr.build_epoch
 
@@ -659,20 +697,26 @@ def test_both_snapshot_runtimes_forward_the_slot_epoch_to_the_control():
     from blastbox.host.runtime.fc_snapshot_runtime import SnapshotSlotRuntime
     from blastbox.host.runtime.gvisor_snapshot_runtime import GvisorSnapshotSlotRuntime
 
-    slot = SimpleNamespace(slot_id="s1", ack_generation=4,
-                           control_dir=Path("/tmp/x/ctrl"), output_dir=Path("/tmp/x/out"))
+    slot = SimpleNamespace(
+        slot_id="s1",
+        ack_generation=4,
+        control_dir=Path("/tmp/x/ctrl"),
+        output_dir=Path("/tmp/x/out"),
+    )
 
     fc = object.__new__(SnapshotSlotRuntime)
     fc._ack_capable = AckCapability(artifact_scoped=True)
     assert SnapshotSlotRuntime.host_warm_control(fc, slot)._ack_gen == 4, (
-        "the FC runtime dropped the slot's artifact epoch on the way to the control")
+        "the FC runtime dropped the slot's artifact epoch on the way to the control"
+    )
 
     gv = object.__new__(GvisorSnapshotSlotRuntime)
     gv._ack_capable = AckCapability(artifact_scoped=True)
     ctl = GvisorSnapshotSlotRuntime.host_warm_control(gv, slot)
     inner = getattr(ctl, "_inner", ctl)
     assert inner._ack_gen == 4, (
-        "the gVisor runtime dropped the slot's artifact epoch on the way to the control")
+        "the gVisor runtime dropped the slot's artifact epoch on the way to the control"
+    )
 
 
 def test_a_failed_restore_drops_its_pinned_epoch(tmp_path):
@@ -694,7 +738,8 @@ def test_a_failed_restore_drops_its_pinned_epoch(tmp_path):
             mgr.restore(f"doomed-{i}")
 
     assert mgr._pin_epoch == {}, (
-        f"failed restores left {len(mgr._pin_epoch)} epoch entries behind")
+        f"failed restores left {len(mgr._pin_epoch)} epoch entries behind"
+    )
     assert mgr._pins == {}, "…and their pins too"
 
 
@@ -719,7 +764,7 @@ def test_a_manager_without_pinned_epoch_is_loud(tmp_path, caplog):
         def kill(self):
             pass
 
-    class _OldManager:                       # no pinned_epoch at all
+    class _OldManager:  # no pinned_epoch at all
         def acquire_built(self):
             pass
 
@@ -740,7 +785,8 @@ def test_a_manager_without_pinned_epoch_is_loud(tmp_path, caplog):
 
     assert slot.ack_generation is None
     assert any("manager_without_pinned_epoch" in r.message for r in caplog.records), (
-        "the runtime disabled the fast repair without saying so")
+        "the runtime disabled the fast repair without saying so"
+    )
 
 
 def test_a_failed_replacement_build_still_arms_the_backoff(tmp_path):
@@ -779,9 +825,11 @@ def test_a_failed_replacement_build_still_arms_the_backoff(tmp_path):
     mgr._build_worker()
 
     assert mgr._build_error is not None, (
-        "the replacement build failed on its own merits and was written off as superseded")
+        "the replacement build failed on its own merits and was written off as superseded"
+    )
     assert _t.monotonic() < mgr._retry_not_before, (
-        "no backoff armed -- the next tick relaunches a full base boot immediately")
+        "no backoff armed -- the next tick relaunches a full base boot immediately"
+    )
 
 
 def test_a_build_superseded_mid_flight_still_skips_the_backoff(tmp_path):
@@ -794,18 +842,20 @@ def test_a_build_superseded_mid_flight_still_skips_the_backoff(tmp_path):
             self._epoch_sampler = self._launcher = None
 
         def boot_base(self):
-            self._box[0].invalidate()          # the repair lands mid-build
+            self._box[0].invalidate()  # the repair lands mid-build
             raise RuntimeError("boot failed after the repair landed")
 
     box: list = []
-    mgr = SnapshotManager(Path(tmp_path), _InvalidatesDuringBoot(box),
-                          build_retry_backoff_s=30.0)
+    mgr = SnapshotManager(
+        Path(tmp_path), _InvalidatesDuringBoot(box), build_retry_backoff_s=30.0
+    )
     box.append(mgr)
     mgr._build_worker()
 
     assert mgr._build_error is None, "a superseded build must not record its error"
     assert _t.monotonic() >= mgr._retry_not_before, (
-        "a superseded build must not delay the replacement")
+        "a superseded build must not delay the replacement"
+    )
 
 
 def test_a_failure_before_the_epoch_is_sampled_is_judged_genuine(tmp_path):
@@ -833,26 +883,28 @@ def test_a_failure_before_the_epoch_is_sampled_is_judged_genuine(tmp_path):
             return _Boom()
 
     mgr = SnapshotManager(Path(tmp_path), _Backend3(), build_retry_backoff_s=30.0)
-    mgr._build_worker()                       # attempt 1 samples epoch 0 and fails
-    mgr.invalidate()                          # a repair lands BETWEEN attempts -> epoch 1
+    mgr._build_worker()  # attempt 1 samples epoch 0 and fails
+    mgr.invalidate()  # a repair lands BETWEEN attempts -> epoch 1
     mgr._retry_not_before = 0.0
     mgr._build_error = None
 
     def _enospc(*a, **k):
         raise OSError("ENOSPC")
 
-    mgr._base_dir = type("P", (), {"mkdir": _enospc,
-                                   "__truediv__": lambda s, o: s})()
-    mgr._build_worker()                       # attempt 2 dies BEFORE the sample
+    mgr._base_dir = type("P", (), {"mkdir": _enospc, "__truediv__": lambda s, o: s})()
+    mgr._build_worker()  # attempt 2 dies BEFORE the sample
 
     assert mgr._build_error is not None, (
-        "a pre-sample failure was written off as superseded using the previous attempt's epoch")
+        "a pre-sample failure was written off as superseded using the previous attempt's epoch"
+    )
     assert _t.monotonic() < mgr._retry_not_before, (
-        "no backoff armed -- a persistent filesystem fault is retried on every tick")
+        "no backoff armed -- a persistent filesystem fault is retried on every tick"
+    )
 
 
 def test_a_failure_after_the_sample_still_carries_its_epoch(tmp_path):
     """Control: the attribute must actually be attached, or the test above passes for free."""
+
     class _Boom:
         def wait_ready(self, t):
             raise RuntimeError("boom")
@@ -871,6 +923,7 @@ def test_a_failure_after_the_sample_still_carries_its_epoch(tmp_path):
         mgr.build()
     except Exception as exc:
         assert getattr(exc, "attempt_epoch", None) == 0, (
-            "the failure did not carry the epoch its attempt ran under")
+            "the failure did not carry the epoch its attempt ran under"
+        )
     else:
         raise AssertionError("expected the build to fail")

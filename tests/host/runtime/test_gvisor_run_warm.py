@@ -2,6 +2,7 @@
 
 It lives under deploy/ (not the package), so load it by path. The lazy `engines` import
 (inside main()) keeps the module importable here without engines.py present."""
+
 import importlib.util
 from pathlib import Path
 
@@ -22,7 +23,9 @@ def test_idle_timeout_parsing():
     assert m._idle_timeout_s(None) == 86400.0
     assert m._idle_timeout_s("30") == 30.0
     assert m._idle_timeout_s("  45.5 ") == 45.5
-    assert m._idle_timeout_s("garbage") == 86400.0  # bad value falls back, must not raise
+    assert (
+        m._idle_timeout_s("garbage") == 86400.0
+    )  # bad value falls back, must not raise
 
 
 def test_engine_name_baked_file_then_env_then_default(monkeypatch, tmp_path):
@@ -48,4 +51,6 @@ def test_setup_breadcrumb_is_written(monkeypatch, tmp_path):
     m = _load_run_warm()
     monkeypatch.setattr(m, "CTRL_DIR", str(tmp_path / "ctrl"))
     m._write_setup_breadcrumb("engine setup failed: boom")
-    assert (tmp_path / "ctrl" / "setup_error").read_text() == "engine setup failed: boom"
+    assert (
+        tmp_path / "ctrl" / "setup_error"
+    ).read_text() == "engine setup failed: boom"

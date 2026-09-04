@@ -9,6 +9,7 @@ These cover the properties that make overlapping spawns safe, not just faster:
 the ceiling must hold while spawns are IN FLIGHT, and a spawn that cannot be published
 must be reaped rather than leaked.
 """
+
 from __future__ import annotations
 
 import threading
@@ -56,33 +57,51 @@ def _fill(pool: WarmPool, deadline_s: float = 10.0) -> None:
 def test_default_is_serial_so_behaviour_is_unchanged():
     """Default 1 must keep the previous one-at-a-time behaviour."""
     rt = _SlowSpawnRuntime(delay=0.05)
-    pool = WarmPool(runtime=rt, warm_size=4, concurrent_ceiling=8, spawn_rate_limit=1000.0)
+    pool = WarmPool(
+        runtime=rt, warm_size=4, concurrent_ceiling=8, spawn_rate_limit=1000.0
+    )
     _fill(pool)
     assert rt.max_in_flight == 1, "default must not overlap spawns"
 
 
 def test_concurrency_overlaps_spawns():
     rt = _SlowSpawnRuntime(delay=0.2)
-    pool = WarmPool(runtime=rt, warm_size=6, concurrent_ceiling=12,
-                    spawn_rate_limit=1000.0, spawn_concurrency=4)
+    pool = WarmPool(
+        runtime=rt,
+        warm_size=6,
+        concurrent_ceiling=12,
+        spawn_rate_limit=1000.0,
+        spawn_concurrency=4,
+    )
     _fill(pool)
     assert rt.max_in_flight > 1, "spawns should overlap when concurrency > 1"
-    assert rt.max_in_flight <= 4, f"must not exceed the configured cap, saw {rt.max_in_flight}"
+    assert rt.max_in_flight <= 4, (
+        f"must not exceed the configured cap, saw {rt.max_in_flight}"
+    )
 
 
-@pytest.mark.skip(reason="VACUOUS: WarmPool.__init__ clamps warm_size to concurrent_ceiling "
-                         "(pool.py:404), so warm_size=10/ceiling=4 becomes target=4 and the "
-                         "overshoot this claims to test is unreachable. Verified: deleting BOTH "
-                         "the headroom clamp and the in-flight ceiling check still passes. "
-                         "Rewrite against a real overshoot before trusting it.")
+@pytest.mark.skip(
+    reason="VACUOUS: WarmPool.__init__ clamps warm_size to concurrent_ceiling "
+    "(pool.py:404), so warm_size=10/ceiling=4 becomes target=4 and the "
+    "overshoot this claims to test is unreachable. Verified: deleting BOTH "
+    "the headroom clamp and the in-flight ceiling check still passes. "
+    "Rewrite against a real overshoot before trusting it."
+)
 def test_ceiling_is_never_breached_under_concurrent_spawning():
     """VACUOUS -- see skip reason. Kept visible rather than deleted so the gap stays on the record."""
     rt = _SlowSpawnRuntime(delay=0.15)
-    pool = WarmPool(runtime=rt, warm_size=10, concurrent_ceiling=4,
-                    spawn_rate_limit=1000.0, spawn_concurrency=8)
+    pool = WarmPool(
+        runtime=rt,
+        warm_size=10,
+        concurrent_ceiling=4,
+        spawn_rate_limit=1000.0,
+        spawn_concurrency=8,
+    )
     _fill(pool, deadline_s=6.0)
     assert len(pool._slots) <= 4, f"ceiling breached: {len(pool._slots)} slots"
-    assert rt.max_in_flight <= 4, f"more spawns in flight than the ceiling allows: {rt.max_in_flight}"
+    assert rt.max_in_flight <= 4, (
+        f"more spawns in flight than the ceiling allows: {rt.max_in_flight}"
+    )
 
 
 def test_failed_spawns_do_not_wedge_the_batch():
@@ -100,8 +119,13 @@ def test_failed_spawns_do_not_wedge_the_batch():
             return super().spawn()
 
     rt = _HalfFail()
-    pool = WarmPool(runtime=rt, warm_size=4, concurrent_ceiling=8,
-                    spawn_rate_limit=1000.0, spawn_concurrency=4)
+    pool = WarmPool(
+        runtime=rt,
+        warm_size=4,
+        concurrent_ceiling=8,
+        spawn_rate_limit=1000.0,
+        spawn_concurrency=4,
+    )
     for _ in range(40):
         pool.tick()
         time.sleep(0.02)
@@ -113,8 +137,13 @@ def test_failed_spawns_do_not_wedge_the_batch():
 def test_in_flight_counter_returns_to_zero():
     """A leaked reservation would permanently shrink the effective ceiling."""
     rt = _SlowSpawnRuntime(delay=0.05)
-    pool = WarmPool(runtime=rt, warm_size=4, concurrent_ceiling=8,
-                    spawn_rate_limit=1000.0, spawn_concurrency=4)
+    pool = WarmPool(
+        runtime=rt,
+        warm_size=4,
+        concurrent_ceiling=8,
+        spawn_rate_limit=1000.0,
+        spawn_concurrency=4,
+    )
     _fill(pool)
     assert pool._spawns_in_flight == 0
 

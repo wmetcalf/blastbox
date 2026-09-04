@@ -6,6 +6,7 @@ Structure
 2. insecurity_reasons unit tests (monkeypatch seccomp policy path).
 3. Real smoke-run tests (nsjail IS installed; skip if userns restricted).
 """
+
 from __future__ import annotations
 
 import subprocess
@@ -22,6 +23,7 @@ from blastbox.worker.sandbox.nsjail import NsjailSandbox, _SECCOMP_POLICY_CANDID
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_sandbox(
     *,
     nsjail_path: str | None = None,
@@ -29,6 +31,7 @@ def _make_sandbox(
 ) -> NsjailSandbox:
     """Construct an NsjailSandbox; skip if nsjail is not found."""
     import shutil
+
     path = nsjail_path or shutil.which("nsjail") or "/usr/local/bin/nsjail"
     if not Path(path).exists():
         pytest.skip("nsjail not installed on this host")
@@ -38,6 +41,7 @@ def _make_sandbox(
 # ---------------------------------------------------------------------------
 # Part 1: argv-building unit tests
 # ---------------------------------------------------------------------------
+
 
 class TestNsjailArgvBuilding:
     """Test _build_argv without running nsjail."""
@@ -70,6 +74,7 @@ class TestNsjailArgvBuilding:
     def test_net_shares_when_egress_enabled(self) -> None:
         """net_egress on → --disable_clone_newnet (share the rooter-routed parent netns)."""
         from blastbox.limits import Limits
+
         sb = _make_sandbox(nsjail_path="/bin/true")
         req = SandboxRequest(argv=["/usr/bin/true"], limits=Limits(net_egress=True))
         argv = sb._build_argv(req)
@@ -116,9 +121,7 @@ class TestNsjailArgvBuilding:
         )
         argv = sb._build_argv(req)
         bm_values = [
-            argv[i + 1]
-            for i in range(len(argv) - 1)
-            if argv[i] == "--bindmount_ro"
+            argv[i + 1] for i in range(len(argv) - 1) if argv[i] == "--bindmount_ro"
         ]
         assert "/tmp/input:/jail/input" in bm_values, (
             f"ro mount not found in --bindmount_ro values; bm_values={bm_values}"
@@ -141,9 +144,7 @@ class TestNsjailArgvBuilding:
         bm_values = [
             argv[i + 1]
             for i in range(len(argv) - 1)
-            if argv[i] == "--bindmount"
-            and i + 1 < len(argv)
-            and ":" in argv[i + 1]
+            if argv[i] == "--bindmount" and i + 1 < len(argv) and ":" in argv[i + 1]
         ]
         assert "/tmp/output:/jail/output" in bm_values, (
             f"rw mount not found in --bindmount values; bm_values={bm_values}"
@@ -154,11 +155,7 @@ class TestNsjailArgvBuilding:
         sb = _make_sandbox()
         req = SandboxRequest(argv=["/usr/bin/true"], env={"MYVAR": "hello"})
         argv = sb._build_argv(req)
-        env_values = [
-            argv[i + 1]
-            for i in range(len(argv) - 1)
-            if argv[i] == "--env"
-        ]
+        env_values = [argv[i + 1] for i in range(len(argv) - 1) if argv[i] == "--env"]
         assert "MYVAR=hello" in env_values
 
     def test_minimal_env_always_injected(self) -> None:
@@ -166,11 +163,7 @@ class TestNsjailArgvBuilding:
         sb = _make_sandbox()
         req = SandboxRequest(argv=["/usr/bin/true"])
         argv = sb._build_argv(req)
-        env_values = [
-            argv[i + 1]
-            for i in range(len(argv) - 1)
-            if argv[i] == "--env"
-        ]
+        env_values = [argv[i + 1] for i in range(len(argv) - 1) if argv[i] == "--env"]
         env_keys = {v.split("=", 1)[0] for v in env_values}
         assert "PATH" in env_keys
         assert "HOME" in env_keys
@@ -217,7 +210,7 @@ class TestNsjailArgvBuilding:
         argv = sb._build_argv(req)
         assert "--" in argv
         dd_idx = argv.index("--")
-        assert argv[dd_idx + 1:] == inner
+        assert argv[dd_idx + 1 :] == inner
 
     def test_seccomp_policy_in_argv_when_present(self, tmp_path: Path) -> None:
         """--seccomp_policy is added when a policy file exists."""
@@ -242,6 +235,7 @@ class TestNsjailArgvBuilding:
 # ---------------------------------------------------------------------------
 # Part 2: insecurity_reasons unit tests
 # ---------------------------------------------------------------------------
+
 
 class TestNsjailInsecurityReasons:
     """Test insecurity_reasons without running nsjail."""
@@ -286,6 +280,7 @@ class TestNsjailInsecurityReasons:
 # Part 3: Real smoke-run tests
 # ---------------------------------------------------------------------------
 
+
 class TestNsjailRealRun:
     """Integration tests that actually invoke nsjail.
 
@@ -296,6 +291,7 @@ class TestNsjailRealRun:
     def check_nsjail_usable(self) -> None:
         """Skip if nsjail can't run a one-shot on this host."""
         import shutil
+
         if not shutil.which("nsjail"):
             pytest.skip("nsjail not installed")
         true_path = "/usr/bin/true" if Path("/usr/bin/true").exists() else "/bin/true"
@@ -303,17 +299,28 @@ class TestNsjailRealRun:
             r = subprocess.run(
                 [
                     "nsjail",
-                    "--mode", "o",
-                    "--user", "65534",
-                    "--group", "65534",
-                    "--quiet", "--really_quiet",
-                    "--bindmount_ro", "/usr:/usr",
-                    "--symlink", "usr/bin:/bin",
-                    "--symlink", "usr/lib:/lib",
-                    "--symlink", "usr/lib64:/lib64",
-                    "--symlink", "usr/sbin:/sbin",
-                    "--bindmount_ro", "/etc:/etc",
-                    "--tmpfsmount", "/tmp",
+                    "--mode",
+                    "o",
+                    "--user",
+                    "65534",
+                    "--group",
+                    "65534",
+                    "--quiet",
+                    "--really_quiet",
+                    "--bindmount_ro",
+                    "/usr:/usr",
+                    "--symlink",
+                    "usr/bin:/bin",
+                    "--symlink",
+                    "usr/lib:/lib",
+                    "--symlink",
+                    "usr/lib64:/lib64",
+                    "--symlink",
+                    "usr/sbin:/sbin",
+                    "--bindmount_ro",
+                    "/etc:/etc",
+                    "--tmpfsmount",
+                    "/tmp",
                     "--",
                     true_path,
                 ],
@@ -362,6 +369,7 @@ class TestNsjailRealRun:
     def test_env_stripped(self, tmp_path: Path) -> None:
         """Host os.environ sentinel must NOT appear in nsjail child's env."""
         import os as _os
+
         policy_path = tmp_path / "dummy.policy"
         policy_path.write_text(
             "POLICY dummy { ERRNO(1) { } } USE dummy DEFAULT ALLOW\n"

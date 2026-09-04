@@ -40,11 +40,13 @@ def test_a_symlinked_marker_is_not_a_start(tmp_path):
     (d / WARM_STARTED).symlink_to(outside)
 
     assert ctl._started_marker_present() is False, (
-        "the probe followed a symlink out of the confined control dir")
+        "the probe followed a symlink out of the confined control dir"
+    )
     with pytest.raises(WarmTimeout):
         ctl.wait_for_done(timeout_s=0.1)
     assert ctl.guest_started is False, (
-        "a symlinked marker was read as proof the guest ran, excusing the base")
+        "a symlinked marker was read as proof the guest ran, excusing the base"
+    )
 
 
 def test_a_fifo_marker_is_not_a_start_and_does_not_block(tmp_path):

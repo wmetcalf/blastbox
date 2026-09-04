@@ -311,6 +311,7 @@ def test_a_rootfs_missing_what_it_requires_never_reaches_the_live_path(
             run=run,
             log=lambda _: None,
             extract=_fake_extract({"/usr/bin/true": "x"}),
+            extract_preserves_ownership=True,
         )
     assert "/init" in str(e.value)
     assert live.read_text() == "the working rootfs", "the live artifact was replaced"
@@ -336,7 +337,13 @@ def test_a_dangling_symlink_still_counts_as_present(
 
     run = FakeRunner()
     export_rootfs(
-        plan, plan.rootfs[0], "t1", run=run, log=lambda _: None, extract=extract
+        plan,
+        plan.rootfs[0],
+        "t1",
+        run=run,
+        log=lambda _: None,
+        extract=extract,
+        extract_preserves_ownership=True,
     )
     assert run.verb("mkfs.ext4"), "a valid rootfs was not built"
 
@@ -354,6 +361,7 @@ def test_an_unresolved_destination_is_refused(tmp_path: Path, monkeypatch) -> No
             run=FakeRunner(),
             log=lambda _: None,
             extract=_fake_extract({"/init": "x"}),
+            extract_preserves_ownership=True,
         )
     assert "unset variable" in str(e.value)
 
@@ -376,6 +384,7 @@ def test_the_previous_artifact_is_kept_for_rollback(
         run=run,
         log=lambda _: None,
         extract=_fake_extract({"/init": "x"}),
+        extract_preserves_ownership=True,
     )
     moves = [c for c in run.verb("mv") if c[-1].endswith(".bak")]  # prefix-stripped
     assert moves, f"nothing was kept for rollback: {run.calls}"
@@ -403,6 +412,7 @@ def test_export_never_removes_the_working_directory(
         run=run,
         log=lambda _: None,
         extract=_fake_extract({"/init": "x"}),
+        extract_preserves_ownership=True,
     )
     removed = [c for c in run.calls if c and c[0] in {"rm", "sudo"} and "-rf" in c]
     assert not any(c[-1] in {".", str(Path.cwd())} for c in removed), run.calls
@@ -434,6 +444,7 @@ def test_verification_happens_before_anything_is_exported(
             run=run,
             log=lambda _: None,
             extract=lambda i, d: calls.append(i),
+            extract_preserves_ownership=True,
         )
     assert "not reproducible" in str(e.value)
     assert calls == [], "a rootfs was exported from an unverified image"
@@ -572,6 +583,7 @@ def test_everything_that_reads_the_staging_tree_runs_at_one_privilege(
         run=run,
         log=lambda _: None,
         extract=_fake_extract({"/init": "x"}),
+        extract_preserves_ownership=True,
     )
     mkfs = [c for c in run.calls if "mkfs.ext4" in c]
     assert mkfs, run.calls
@@ -602,6 +614,7 @@ def test_a_failed_export_does_not_leak_a_root_owned_tree(
             run=run,
             log=lambda _: None,
             extract=_fake_extract({"/usr/bin/true": "x"}),
+            extract_preserves_ownership=True,
         )
     removals = [c for c in run.calls if "rm" in c and "-rf" in c]
     assert removals and removals[-1][0] == "sudo", (
@@ -641,6 +654,7 @@ def test_the_published_tree_root_is_not_left_at_mkdtemp_permissions(
         run=run,
         log=lambda _: None,
         extract=_fake_extract({"/init": "x"}),
+        extract_preserves_ownership=True,
     )
     assert [c for c in run.calls if "chmod" in c and "0755" in c], run.calls
     assert [c for c in run.calls if "chown" in c and "root:root" in c], run.calls
@@ -785,6 +799,7 @@ def test_a_required_path_cannot_escape_through_a_symlinked_parent(
             run=FakeRunner(),
             log=lambda _: None,
             extract=extract,
+            extract_preserves_ownership=True,
         )
     assert "/usr/bin/env" in str(e.value)
 
@@ -807,6 +822,7 @@ def test_a_requirement_that_is_not_a_confined_guest_path_is_refused(
             run=FakeRunner(),
             log=lambda _: None,
             extract=_fake_extract({"/init": "x"}),
+            extract_preserves_ownership=True,
         )
     assert "cannot be checked" in str(e.value)
 
@@ -852,6 +868,7 @@ def test_no_artifact_is_published_when_a_later_one_fails(
             run=run,
             log=lambda _: None,
             extract=extract,
+            extract_preserves_ownership=True,
         )
     assert (d / "first.ext4").read_text() == "old-first", (
         "an artifact was published anyway"
@@ -1012,6 +1029,7 @@ def test_a_successful_run_publishes_every_declared_artifact(
         run=run,
         log=lambda _: None,
         extract=_fake_extract({"/init": "x"}),
+        extract_preserves_ownership=True,
     )
     published = [c[-1] for c in run.verb("mv")]
     assert str(d / "first.ext4") in published, run.calls
@@ -1062,7 +1080,13 @@ def test_a_setuid_binary_stops_the_rootfs_from_being_published(
     run = FakeRunner()
     with pytest.raises(BuildError) as e:
         export_rootfs(
-            plan, plan.rootfs[0], "t1", run=run, log=lambda _: None, extract=extract
+            plan,
+            plan.rootfs[0],
+            "t1",
+            run=run,
+            log=lambda _: None,
+            extract=extract,
+            extract_preserves_ownership=True,
         )
     assert "/bin/mount" in str(e.value)
     assert (dest_dir / "demo.ext4").read_text() == "live", (
@@ -1096,7 +1120,13 @@ def test_the_setuid_gate_can_be_turned_off_deliberately(
 
     run = FakeRunner()
     export_rootfs(
-        plan, plan.rootfs[0], "t1", run=run, log=lambda _: None, extract=extract
+        plan,
+        plan.rootfs[0],
+        "t1",
+        run=run,
+        log=lambda _: None,
+        extract=extract,
+        extract_preserves_ownership=True,
     )
     assert run.verb("mkfs.ext4")
 
@@ -1124,6 +1154,7 @@ def test_a_failed_chmod_stops_publication(tmp_path: Path, monkeypatch) -> None:
             run=run,
             log=lambda _: None,
             extract=_fake_extract({"/init": "x"}),
+            extract_preserves_ownership=True,
         )
     assert "chmod" in str(e.value)
     assert not (dest_dir / "rootfs").exists(), "a tree was published after chmod failed"
@@ -1156,6 +1187,7 @@ def mod_stage(plan, run):
         run=run,
         log=lambda _: None,
         extract=_fake_extract({"/init": "x"}),
+        extract_preserves_ownership=True,
     )
 
 
@@ -1182,6 +1214,7 @@ def test_the_rootfs_is_extracted_from_the_id_that_was_verified(
             extracted.append(image),
             (dest / "init").write_text("x"),
         )[0],
+        extract_preserves_ownership=True,
     )
     assert extracted == ["sha256:" + "e" * 64], extracted
 
@@ -1300,6 +1333,7 @@ def test_an_audit_that_cannot_look_is_not_a_pass(tmp_path: Path, monkeypatch) ->
             run=run,
             log=lambda _: None,
             extract=_fake_extract({"/init": "x"}),
+            extract_preserves_ownership=True,
         )
     assert "could not audit" in str(e.value)
     assert (dest_dir / "demo.ext4").read_text() == "live"
@@ -1325,7 +1359,13 @@ def test_the_audit_sees_a_setuid_file_below_an_unreadable_directory(
     run = FakeRunner()
     with pytest.raises(BuildError) as e:
         export_rootfs(
-            plan, plan.rootfs[0], "t1", run=run, log=lambda _: None, extract=extract
+            plan,
+            plan.rootfs[0],
+            "t1",
+            run=run,
+            log=lambda _: None,
+            extract=extract,
+            extract_preserves_ownership=True,
         )
     assert "/locked/mount" in str(e.value)
 
@@ -1362,6 +1402,7 @@ def test_a_staging_directory_that_was_never_named_is_refused(
             run=SilentMktemp(),
             log=lambda _: None,
             extract=_fake_extract({"/init": "x"}),
+            extract_preserves_ownership=True,
         )
     assert "named no directory" in str(e.value)
 
@@ -1439,6 +1480,7 @@ def test_the_staging_root_is_made_traversable_before_it_is_checked(
         run=run,
         log=lambda _: None,
         extract=_fake_extract({"/init": "x"}),
+        extract_preserves_ownership=True,
     )
     assert order == ["normalize_root", "check_requires"], (
         f"the tree was checked before it was made traversable: {order}"
@@ -1463,6 +1505,7 @@ def test_the_size_may_come_from_the_environment(tmp_path: Path, monkeypatch) -> 
         run=run,
         log=lambda _: None,
         extract=_fake_extract({"/init": "x"}),
+        extract_preserves_ownership=True,
     )
     truncate = run.verb("truncate")
     assert truncate and "128M" in truncate[0], truncate
@@ -1495,6 +1538,7 @@ def test_a_literal_size_never_shrinks_a_live_artifact(
         run=run,
         log=lambda _: None,
         extract=_fake_extract({"/init": "x"}),
+        extract_preserves_ownership=True,
     )
     assert "200M" in run.verb("truncate")[0], run.verb("truncate")
 
@@ -1515,6 +1559,7 @@ def test_growing_a_rootfs_is_allowed(tmp_path: Path, monkeypatch) -> None:
         run=run,
         log=lambda _: None,
         extract=_fake_extract({"/init": "x"}),
+        extract_preserves_ownership=True,
     )
     assert run.verb("mkfs.ext4")
 
@@ -1541,6 +1586,7 @@ def test_a_size_that_cannot_resolve_fails_before_anything_is_built(
             run=run,
             log=lambda _: None,
             extract=_fake_extract({"/init": "x"}),
+            extract_preserves_ownership=True,
         )
     assert "cannot be built as declared" in str(e.value)
     assert run.calls == [], "docker ran before the size was known"
@@ -1565,6 +1611,7 @@ def test_a_shrink_is_refused_again_at_publication(tmp_path: Path, monkeypatch) -
         run=run,
         log=lambda _: None,
         extract=_fake_extract({"/init": "x"}),
+        extract_preserves_ownership=True,
     )
     # another run publishes something larger while ours sits staged
     _sized(dest_dir / "demo.ext4", 200 * 1024 * 1024)
@@ -1611,6 +1658,7 @@ def test_a_destination_that_cannot_be_measured_fails_closed(
             run=UnreadableStat(),
             log=lambda _: None,
             extract=_fake_extract({"/init": "x"}),
+            extract_preserves_ownership=True,
         )
     assert "could not be measured" in str(e.value)
 
@@ -1641,6 +1689,7 @@ def test_the_shrink_check_compares_bytes_not_floored_mib(
             run=FakeRunner(),
             log=lambda _: None,
             extract=_fake_extract({"/init": "x"}),
+            extract_preserves_ownership=True,
         )
     assert "Refusing to shrink" in str(e.value)
     assert live.stat().st_size == 64 * 1024 * 1024 + 4096
@@ -1673,6 +1722,7 @@ def test_the_destination_is_measured_at_the_selected_privilege(
         run=run,
         log=lambda _: None,
         extract=_fake_extract({"/init": "x"}),
+        extract_preserves_ownership=True,
     )
     stats = [c for c in run.calls if "stat" in c and "%s" in c]
     assert stats, run.calls
@@ -1705,6 +1755,7 @@ def test_an_enlarged_rootfs_keeps_its_size_when_no_override_is_given(
         run=run,
         log=lambda _: None,
         extract=_fake_extract({"/init": "x"}),
+        extract_preserves_ownership=True,
     )
     truncate = run.verb("truncate")
     assert truncate and "200M" in truncate[0], truncate
@@ -1731,6 +1782,7 @@ def test_an_explicit_override_is_obeyed_not_maxed(tmp_path: Path, monkeypatch) -
             run=FakeRunner(),
             log=lambda _: None,
             extract=_fake_extract({"/init": "x"}),
+            extract_preserves_ownership=True,
         )
     assert "Refusing to shrink" in str(e.value)
 
@@ -1754,6 +1806,7 @@ def test_an_override_larger_than_the_existing_artifact_grows_it(
         run=run,
         log=lambda _: None,
         extract=_fake_extract({"/init": "x"}),
+        extract_preserves_ownership=True,
     )
     assert "300M" in run.verb("truncate")[0]
 
@@ -1778,6 +1831,7 @@ def test_sub_mib_growth_still_preserves_the_artifact(
         run=run,
         log=lambda _: None,
         extract=_fake_extract({"/init": "x"}),
+        extract_preserves_ownership=True,
     )
     # rounded UP, so the new image is not smaller than what it replaces
     assert "65M" in run.verb("truncate")[0], run.verb("truncate")
@@ -1841,6 +1895,7 @@ def test_a_failed_ext4_stage_leaves_no_partial_image(
             run=run,
             log=lambda _: None,
             extract=_fake_extract({"/init": "x"}),
+            extract_preserves_ownership=True,
         )
     removed = [c for c in run.calls if "rm" in c and any(a.endswith(".img") for a in c)]
     assert removed, f"the staged image was not removed: {run.calls}"
@@ -1888,6 +1943,7 @@ def test_publication_rolls_back_when_a_later_artifact_fails(
             run=run,
             log=lambda _: None,
             extract=_fake_extract({"/init": "x"}),
+            extract_preserves_ownership=True,
         )
     # first.ext4 did not exist before this run, so the inverse of publishing it
     # is removing it -- leaving it would be a partial publish of a failed release
@@ -1917,6 +1973,7 @@ def test_rollback_uses_what_this_run_found_not_what_is_on_disk(
         run=run,
         log=lambda _: None,
         extract=_fake_extract({"/init": "x"}),
+        extract_preserves_ownership=True,
     )
     mod.publish_staged(staged, run=run, log=lambda _: None)
     assert staged.had_previous is False, "the destination did not exist before this run"
@@ -2019,6 +2076,7 @@ def test_the_prior_state_is_read_at_the_selected_privilege(
         run=run,
         log=lambda _: None,
         extract=_fake_extract({"/init": "x"}),
+        extract_preserves_ownership=True,
     )
     probes = [c for c in run.calls if "test" in c and "-e" in c]
     assert probes, run.calls
@@ -2575,6 +2633,7 @@ def test_the_tags_are_published_only_after_the_whole_chain_verifies(
         run=watched,
         log=lambda _: None,
         extract=lambda image, dest: (dest / "init").write_text("x"),
+        extract_preserves_ownership=True,
     )
     assert published == ["demo-base:t1", "demo-worker:t1"], published
     assert order.index("verify") < order.index("tag"), order
@@ -2622,6 +2681,7 @@ def _publication_rollback(tmp_path, monkeypatch, previously) -> list[list[str]]:
             run=watched,
             log=lambda _: None,
             extract=lambda image, dest: (dest / "init").write_text("x"),
+            extract_preserves_ownership=True,
         )
     return seen
 
@@ -2846,3 +2906,56 @@ def test_the_builder_digests_reach_the_stamp_not_only_the_argv(
     )
     assert seen, "the stamp was never built"
     assert all(kw.get("builders") == pinned for kw in seen), seen
+
+
+def test_a_caller_supplied_extractor_must_attest_that_it_preserves_ownership(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The presence of a hook says nothing about what the hook DOES.
+
+    An ordinary shutil/tar callback produces an all-caller-owned tree with
+    setuid bits dropped. `_normalize_root` only fixes the staging root, so the
+    remaining checks pass and an altered filesystem gets published -- while the
+    refusal that exists for exactly this was skipped because a hook was present.
+    """
+    import blastbox.host.imagerun as mod
+
+    _resolves_to(monkeypatch)
+    monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
+    monkeypatch.setattr(mod, "_read_stamp", lambda i, r=None: _FakeStamp())
+    monkeypatch.setattr(mod, "_verify_contents", lambda i, r=None: (True, ""))
+    monkeypatch.setenv("DEMO_DIR", str(tmp_path / "out"))
+    with pytest.raises(BuildError) as e:
+        run_plan(
+            _plan(tmp_path),
+            "t1",
+            blastbox_version="0.1.34",
+            run=FakeRunner(),
+            log=lambda _: None,
+            extract=lambda image, dest: (dest / "init").write_text("x"),
+        )
+    assert "extract_preserves_ownership=True" in str(e.value)
+
+
+def test_the_default_extraction_is_still_refused_without_privilege(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The new refusal must not displace the one it sits beside."""
+    import blastbox.host.imagerun as mod
+
+    _resolves_to(monkeypatch)
+    monkeypatch.setattr(mod, "_can_be_root", lambda: False)
+    monkeypatch.setattr(mod, "_sudo_needed", lambda _d: False)
+    monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
+    monkeypatch.setattr(mod, "_read_stamp", lambda i, r=None: _FakeStamp())
+    monkeypatch.setattr(mod, "_verify_contents", lambda i, r=None: (True, ""))
+    monkeypatch.setenv("DEMO_DIR", str(tmp_path / "out"))
+    with pytest.raises(BuildError) as e:
+        run_plan(
+            _plan(tmp_path),
+            "t1",
+            blastbox_version="0.1.34",
+            run=FakeRunner(),
+            log=lambda _: None,
+        )
+    assert "not root and has no passwordless sudo" in str(e.value)

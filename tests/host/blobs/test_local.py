@@ -2,6 +2,7 @@
 rooted OUTSIDE job_root (see tests/host/blobs/test_local_roundtrip.py for the
 property this exists to guarantee: bytes surviving job-dir destruction). These
 tests cover the per-method contract in isolation."""
+
 import errno
 import hashlib
 import json
@@ -67,7 +68,9 @@ def test_put_output_then_open_output_reads_the_stored_copy(tmp_path):
     (out / "metadata.json").write_bytes(b'{"ok":true}')
     store = _store(tmp_path)
     store.put_output("j1", out)
-    assert (tmp_path / "blobs" / "results" / "j1" / "metadata.json").read_bytes() == b'{"ok":true}'
+    assert (
+        tmp_path / "blobs" / "results" / "j1" / "metadata.json"
+    ).read_bytes() == b'{"ok":true}'
     with store.open_output("j1", "metadata.json") as fh:
         assert fh.read() == b'{"ok":true}'
 
@@ -113,7 +116,9 @@ def test_open_output_reads_a_nested_artifact_path(tmp_path):
     (out / "foo" / "bar.png").write_bytes(b"PNGDATA")
     store = _store(tmp_path)
     store.put_output("j1", out)
-    assert (tmp_path / "blobs" / "results" / "j1" / "foo" / "bar.png").read_bytes() == b"PNGDATA"
+    assert (
+        tmp_path / "blobs" / "results" / "j1" / "foo" / "bar.png"
+    ).read_bytes() == b"PNGDATA"
     with store.open_output("j1", "foo/bar.png") as fh:
         assert fh.read() == b"PNGDATA"
 
@@ -124,7 +129,9 @@ def test_open_output_refuses_traversal_and_absolute_names(tmp_path, evil):
     read outside it even if an upstream validator is bypassed."""
     store = _store(tmp_path)
     (tmp_path / "blobs" / "results" / "j1").mkdir(parents=True)
-    (tmp_path / "blobs" / "results" / "secret").write_bytes(b"OUTSIDE")  # a sibling a traversal could reach
+    (tmp_path / "blobs" / "results" / "secret").write_bytes(
+        b"OUTSIDE"
+    )  # a sibling a traversal could reach
     with pytest.raises(BlobFetchError):
         store.open_output("j1", evil)
 
@@ -198,7 +205,8 @@ def test_has_output_is_false_when_the_results_dir_cannot_be_read(tmp_path, monke
 
 
 def test_the_seal_is_uploaded_last_so_a_partial_upload_is_not_mistaken_for_durable(
-    tmp_path, monkeypatch,
+    tmp_path,
+    monkeypatch,
 ):
     """put_output is a TWO-PHASE COMMIT: metadata.json lands last, so its presence means every
     other artifact already did.
@@ -226,7 +234,7 @@ def test_the_seal_is_uploaded_last_so_a_partial_upload_is_not_mistaken_for_durab
 
     def flaky(src, dest):
         calls["n"] += 1
-        if calls["n"] == 2:                      # die partway through the upload
+        if calls["n"] == 2:  # die partway through the upload
             raise OSError("object store went away")
         real(src, dest)
 
@@ -258,7 +266,9 @@ def test_a_nested_metadata_json_is_not_treated_as_the_seal(tmp_path):
 
     order = [p.relative_to(out).as_posix() for p in _upload_order(out) if p.is_file()]
     assert order[-1] == "metadata.json", f"the seal must be written last, got {order}"
-    assert "rmeta/metadata.json" in order[:-1], "a nested metadata.json is an ordinary artifact"
+    assert "rmeta/metadata.json" in order[:-1], (
+        "a nested metadata.json is an ordinary artifact"
+    )
 
 
 def test_an_unstorable_filename_is_skipped_not_retried_forever(tmp_path, caplog):
@@ -281,7 +291,7 @@ def test_an_unstorable_filename_is_skipped_not_retried_forever(tmp_path, caplog)
     (out / ("A" * 250)).write_bytes(b"undeclared, unstorable")
 
     with caplog.at_level(logging.WARNING):
-        store.put_output("j-long", out)          # must NOT raise
+        store.put_output("j-long", out)  # must NOT raise
 
     assert store.has_output("j-long") is True, "the real result must still land"
     assert (tmp_path / "blobs" / "results" / "j-long" / "metadata.json").exists()
@@ -317,13 +327,32 @@ def test_a_DECLARED_artifact_is_never_silently_skipped(tmp_path, monkeypatch):
     (out / "nested").mkdir(parents=True)
     long_name = "n" * 200
     (out / "nested" / long_name).write_bytes(b"THE DECLARED ARTIFACT")
-    (out / "metadata.json").write_text(json.dumps({
-        "engine": "redtusk", "status": "ok", "input_sha256": "a" * 64,
-        "detected": {"label": "docx", "mime": "x", "confidence": 1.0, "source": "magika"},
-        "artifacts": [{"id": "a1", "path": f"nested/{long_name}", "kind": "image",
-                       "sha256": "f" * 64, "bytes": 21}],
-        "warnings": [], "payload": {"_type": "extracted_text", "text": "x", "char_count": 1},
-    }))
+    (out / "metadata.json").write_text(
+        json.dumps(
+            {
+                "engine": "redtusk",
+                "status": "ok",
+                "input_sha256": "a" * 64,
+                "detected": {
+                    "label": "docx",
+                    "mime": "x",
+                    "confidence": 1.0,
+                    "source": "magika",
+                },
+                "artifacts": [
+                    {
+                        "id": "a1",
+                        "path": f"nested/{long_name}",
+                        "kind": "image",
+                        "sha256": "f" * 64,
+                        "bytes": 21,
+                    }
+                ],
+                "warnings": [],
+                "payload": {"_type": "extracted_text", "text": "x", "char_count": 1},
+            }
+        )
+    )
 
     # The guard is exercised directly: on this filesystem a 200-char name is now perfectly
     # storable (the temp name no longer inflates it), so forcing the error is the only honest
@@ -359,7 +388,9 @@ def test_an_unparseable_envelope_makes_every_skip_fatal(tmp_path, monkeypatch):
         store.put_output("j-unparseable", out)
 
 
-def test_a_long_but_storable_artifact_name_is_not_made_unstorable_by_the_temp_file(tmp_path):
+def test_a_long_but_storable_artifact_name_is_not_made_unstorable_by_the_temp_file(
+    tmp_path,
+):
     """The temp name must not decide what is storable.
 
     It used to be `.{dest.name}.{pid}.{tid}.{uuid4hex}.part` — ~62 characters ON TOP of the
@@ -378,13 +409,15 @@ def test_a_long_but_storable_artifact_name_is_not_made_unstorable_by_the_temp_fi
     (out / long_name).write_bytes(b"STORABLE")
     (out / "metadata.json").write_text("{}")
 
-    store.put_output("j-long", out)          # must not raise
+    store.put_output("j-long", out)  # must not raise
 
     assert store.has_output("j-long") is True
     assert (tmp_path / "blobs" / "results" / "j-long" / long_name).exists()
 
 
-def test_the_seal_does_not_commit_when_a_declared_artifact_was_never_enumerated(tmp_path, monkeypatch):
+def test_the_seal_does_not_commit_when_a_declared_artifact_was_never_enumerated(
+    tmp_path, monkeypatch
+):
     """The per-file checks only ever saw paths the WALKER returned.
 
     A worker controls the tree, so it can declare a real file the walker never yields — one inside
@@ -402,20 +435,46 @@ def test_the_seal_does_not_commit_when_a_declared_artifact_was_never_enumerated(
     out.mkdir()
     (out / "seen.png").write_bytes(b"enumerated")
     (out / "hidden.png").write_bytes(b"REAL FILE THE WALKER MISSES")
-    (out / "metadata.json").write_text(json.dumps({
-        "engine": "redtusk", "status": "ok", "input_sha256": "a" * 64,
-        "detected": {"label": "docx", "mime": "x", "confidence": 1.0, "source": "magika"},
-        "artifacts": [{"id": "a1", "path": "seen.png", "kind": "image",
-                       "sha256": "f" * 64, "bytes": 10},
-                      {"id": "a2", "path": "hidden.png", "kind": "image",
-                       "sha256": "e" * 64, "bytes": 27}],
-        "warnings": [], "payload": {"_type": "extracted_text", "text": "x", "char_count": 1},
-    }))
+    (out / "metadata.json").write_text(
+        json.dumps(
+            {
+                "engine": "redtusk",
+                "status": "ok",
+                "input_sha256": "a" * 64,
+                "detected": {
+                    "label": "docx",
+                    "mime": "x",
+                    "confidence": 1.0,
+                    "source": "magika",
+                },
+                "artifacts": [
+                    {
+                        "id": "a1",
+                        "path": "seen.png",
+                        "kind": "image",
+                        "sha256": "f" * 64,
+                        "bytes": 10,
+                    },
+                    {
+                        "id": "a2",
+                        "path": "hidden.png",
+                        "kind": "image",
+                        "sha256": "e" * 64,
+                        "bytes": 27,
+                    },
+                ],
+                "warnings": [],
+                "payload": {"_type": "extracted_text", "text": "x", "char_count": 1},
+            }
+        )
+    )
 
     # A walker that cannot see hidden.png — exactly what a symlinked dir or PATH_MAX produces.
     real_order = _upload_order
-    monkeypatch.setattr("blastbox.host.blobs.local._upload_order",
-                        lambda d: [p for p in real_order(d) if p.name != "hidden.png"])
+    monkeypatch.setattr(
+        "blastbox.host.blobs.local._upload_order",
+        lambda d: [p for p in real_order(d) if p.name != "hidden.png"],
+    )
 
     with pytest.raises(Exception):
         store.put_output("j-missed", out)
@@ -431,17 +490,46 @@ def test_a_declared_path_with_no_file_behind_it_does_not_fail_the_upload(tmp_pat
     store = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
     out = tmp_path / "out"
     out.mkdir()
-    (out / "metadata.json").write_text(json.dumps({
-        "engine": "redtusk", "status": "ok", "input_sha256": "a" * 64,
-        "detected": {"label": "docx", "mime": "x", "confidence": 1.0, "source": "magika"},
-        "artifacts": [{"id": "a1", "path": "/etc/passwd", "kind": "image",
-                       "sha256": "f" * 64, "bytes": 1},
-                      {"id": "a2", "path": "../escape.png", "kind": "image",
-                       "sha256": "e" * 64, "bytes": 1},
-                      {"id": "a3", "path": "ghost.png", "kind": "image",
-                       "sha256": "d" * 64, "bytes": 1}],
-        "warnings": [], "payload": {"_type": "extracted_text", "text": "x", "char_count": 1},
-    }))
+    (out / "metadata.json").write_text(
+        json.dumps(
+            {
+                "engine": "redtusk",
+                "status": "ok",
+                "input_sha256": "a" * 64,
+                "detected": {
+                    "label": "docx",
+                    "mime": "x",
+                    "confidence": 1.0,
+                    "source": "magika",
+                },
+                "artifacts": [
+                    {
+                        "id": "a1",
+                        "path": "/etc/passwd",
+                        "kind": "image",
+                        "sha256": "f" * 64,
+                        "bytes": 1,
+                    },
+                    {
+                        "id": "a2",
+                        "path": "../escape.png",
+                        "kind": "image",
+                        "sha256": "e" * 64,
+                        "bytes": 1,
+                    },
+                    {
+                        "id": "a3",
+                        "path": "ghost.png",
+                        "kind": "image",
+                        "sha256": "d" * 64,
+                        "bytes": 1,
+                    },
+                ],
+                "warnings": [],
+                "payload": {"_type": "extracted_text", "text": "x", "char_count": 1},
+            }
+        )
+    )
 
-    store.put_output("j-phantom", out)          # must not raise
+    store.put_output("j-phantom", out)  # must not raise
     assert store.has_output("j-phantom") is True

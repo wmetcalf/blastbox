@@ -2,6 +2,7 @@
 give up and report the last error to the caller — never left "pending" for a
 consumer that does not exist.
 """
+
 from pathlib import Path
 
 

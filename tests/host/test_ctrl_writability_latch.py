@@ -24,28 +24,31 @@ def _ctrl(tmp_path):
     d = tmp_path / "ctrl"
     d.mkdir()
     cap = AckCapability()
-    cap.learn()                      # this image advertises start markers
+    cap.learn()  # this image advertises start markers
     return HostWarmControl(d, ack_capable=cap)
 
 
-def test_a_storage_blip_that_clears_before_the_deadline_is_still_host_io(tmp_path, monkeypatch):
+def test_a_storage_blip_that_clears_before_the_deadline_is_still_host_io(
+    tmp_path, monkeypatch
+):
     monkeypatch.setattr(W, "_CTRL_PROBE_INTERVAL_S", 0.02)
     ctl = _ctrl(tmp_path)
 
     recovered_at = time.monotonic() + 0.20
 
     # Unwritable for the first 200ms of the job, healthy well before the 500ms deadline.
-    monkeypatch.setattr(ctl, "_ctrl_writable",
-                        lambda: time.monotonic() >= recovered_at)
+    monkeypatch.setattr(ctl, "_ctrl_writable", lambda: time.monotonic() >= recovered_at)
 
     with pytest.raises(WarmTimeout) as ei:
         ctl.wait_for_done(timeout_s=0.5)
 
     assert getattr(ei.value, "host_io", False) is True, (
         "the incident was over by the deadline, so the single end-of-timeout probe saw a healthy "
-        "filesystem and the storage outage was charged to the worker")
+        "filesystem and the storage outage was charged to the worker"
+    )
     assert ctl.guest_started is None, (
-        "guest_started must be UNKNOWN, not False -- False is base evidence and convicts")
+        "guest_started must be UNKNOWN, not False -- False is base evidence and convicts"
+    )
 
 
 def test_a_genuinely_wedged_guest_is_still_convicted(tmp_path, monkeypatch):
@@ -58,7 +61,9 @@ def test_a_genuinely_wedged_guest_is_still_convicted(tmp_path, monkeypatch):
         ctl.wait_for_done(timeout_s=0.2)
 
     assert getattr(ei.value, "host_io", False) is False
-    assert ctl.guest_started is False, "a silent guest on a healthy filesystem IS base evidence"
+    assert ctl.guest_started is False, (
+        "a silent guest on a healthy filesystem IS base evidence"
+    )
 
 
 def test_a_worker_that_starts_is_never_charged_to_the_base(tmp_path, monkeypatch):
@@ -82,11 +87,12 @@ def test_the_latch_does_not_leak_into_the_next_job(tmp_path, monkeypatch):
     monkeypatch.setattr(ctl, "_ctrl_writable", lambda: False)
     with pytest.raises(WarmTimeout) as first:
         ctl.wait_for_done(timeout_s=0.1)
-    assert getattr(first.value, "host_io", False) is True   # blip during job 1
+    assert getattr(first.value, "host_io", False) is True  # blip during job 1
 
     monkeypatch.setattr(ctl, "_ctrl_writable", lambda: True)
     with pytest.raises(WarmTimeout) as second:
         ctl.wait_for_done(timeout_s=0.1)
     assert getattr(second.value, "host_io", False) is False, (
-        "job 1's storage incident is still excusing job 2")
+        "job 1's storage incident is still excusing job 2"
+    )
     assert ctl.guest_started is False

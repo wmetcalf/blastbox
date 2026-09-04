@@ -25,12 +25,22 @@ def test_none_builtin_is_no_egress():
 
 def test_valid_exit_drivers_set():
     assert VALID_EXIT_DRIVERS == (
-        "none", "drop", "direct", "inetsim", "tor", "socks", "httpproxy", "wireguard", "openvpn",
+        "none",
+        "drop",
+        "direct",
+        "inetsim",
+        "tor",
+        "socks",
+        "httpproxy",
+        "wireguard",
+        "openvpn",
     )
 
 
 def test_personality_carries_opaque_config():
-    p = Personality(name="p", exit_driver="socks", inspect=True, config={"endpoint": "h:1"})
+    p = Personality(
+        name="p", exit_driver="socks", inspect=True, config={"endpoint": "h:1"}
+    )
     assert p.config["endpoint"] == "h:1"
     assert p.inspect is True
 
@@ -69,44 +79,70 @@ def test_parse_missing_exit_skipped(capsys):
 
 def _reg():
     return parse_personalities(
-        {"BLASTBOX_NETPOLICY_FAKENET": "exit=inetsim",
-         "BLASTBOX_NETPOLICY_DIRECT": "exit=direct"}
+        {
+            "BLASTBOX_NETPOLICY_FAKENET": "exit=inetsim",
+            "BLASTBOX_NETPOLICY_DIRECT": "exit=direct",
+        }
     )
 
 
 def test_resolve_defaults_to_none_when_engine_default_unset():
-    p = resolve_net_policy(job_net_policy=None, engine_default="none",
-                           registry=_reg(), allow_override=False)
+    p = resolve_net_policy(
+        job_net_policy=None,
+        engine_default="none",
+        registry=_reg(),
+        allow_override=False,
+    )
     assert p.name == "none"
 
 
 def test_resolve_uses_engine_default():
-    p = resolve_net_policy(job_net_policy=None, engine_default="fakenet",
-                           registry=_reg(), allow_override=False)
+    p = resolve_net_policy(
+        job_net_policy=None,
+        engine_default="fakenet",
+        registry=_reg(),
+        allow_override=False,
+    )
     assert p.name == "fakenet"
 
 
 def test_resolve_engine_default_unknown_failscloses_to_none():
-    p = resolve_net_policy(job_net_policy=None, engine_default="bogus",
-                           registry=_reg(), allow_override=False)
+    p = resolve_net_policy(
+        job_net_policy=None,
+        engine_default="bogus",
+        registry=_reg(),
+        allow_override=False,
+    )
     assert p.name == "none"
 
 
 def test_resolve_job_override_ignored_when_gate_off():
-    p = resolve_net_policy(job_net_policy="direct", engine_default="fakenet",
-                           registry=_reg(), allow_override=False)
+    p = resolve_net_policy(
+        job_net_policy="direct",
+        engine_default="fakenet",
+        registry=_reg(),
+        allow_override=False,
+    )
     assert p.name == "fakenet"
 
 
 def test_resolve_job_override_honored_when_gate_on_and_declared():
-    p = resolve_net_policy(job_net_policy="direct", engine_default="fakenet",
-                           registry=_reg(), allow_override=True)
+    p = resolve_net_policy(
+        job_net_policy="direct",
+        engine_default="fakenet",
+        registry=_reg(),
+        allow_override=True,
+    )
     assert p.name == "direct"
 
 
 def test_resolve_job_override_undeclared_failscloses_to_default():
-    p = resolve_net_policy(job_net_policy="nope", engine_default="fakenet",
-                           registry=_reg(), allow_override=True)
+    p = resolve_net_policy(
+        job_net_policy="nope",
+        engine_default="fakenet",
+        registry=_reg(),
+        allow_override=True,
+    )
     assert p.name == "fakenet"
 
 

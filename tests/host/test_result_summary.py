@@ -2,6 +2,7 @@
 list views. Restored the generic detection label + bounded scalar engine fields so
 the engines' list columns (Detection, page counts) work without fetching /metadata.
 """
+
 from __future__ import annotations
 
 import types
@@ -27,14 +28,18 @@ def test_adds_detected_label_and_counts():
 
 
 def test_surfaces_scalar_meta_excludes_large_strings():
-    s = _build_result_summary(_env({
-        "page_count_total": 6,
-        "page_count_rendered": 5,
-        "label": "PDF",
-        "truncated": False,
-        "clippyshot_metadata": "x" * 5000,   # large embedded JSON — excluded
-        "nested": {"a": 1},                   # non-scalar — excluded
-    }))
+    s = _build_result_summary(
+        _env(
+            {
+                "page_count_total": 6,
+                "page_count_rendered": 5,
+                "label": "PDF",
+                "truncated": False,
+                "clippyshot_metadata": "x" * 5000,  # large embedded JSON — excluded
+                "nested": {"a": 1},  # non-scalar — excluded
+            }
+        )
+    )
     assert s["meta"]["page_count_total"] == 6
     assert s["meta"]["page_count_rendered"] == 5
     assert s["meta"]["label"] == "PDF"
@@ -44,8 +49,9 @@ def test_surfaces_scalar_meta_excludes_large_strings():
 
 
 def test_robust_to_missing_payload():
-    env = types.SimpleNamespace(status="rejected", artifacts=[], warnings=[],
-                                detected=None, payload=None)
+    env = types.SimpleNamespace(
+        status="rejected", artifacts=[], warnings=[], detected=None, payload=None
+    )
     s = _build_result_summary(env)
     assert s["detected"] is None
     assert "meta" not in s  # no payload → no meta, no crash
@@ -53,6 +59,7 @@ def test_robust_to_missing_payload():
 
 def test_detected_without_label_does_not_raise():
     # a `detected` that's non-None but lacks `.label` must not AttributeError
-    env = types.SimpleNamespace(status="ok", artifacts=[], warnings=[],
-                                detected=object(), payload=None)
+    env = types.SimpleNamespace(
+        status="ok", artifacts=[], warnings=[], detected=object(), payload=None
+    )
     assert _build_result_summary(env)["detected"] is None

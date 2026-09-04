@@ -3,6 +3,7 @@
 The module lives outside the package (it is COPY'd into the rootfs), so it is
 loaded by path via importlib. The pdftoppm-backed test is gated on poppler.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -62,7 +63,9 @@ def test_probe_engine_roundtrip(tmp_path):
     src.write_bytes(b"hello")
     out = tmp_path / "out"
     out.mkdir()
-    rc = run_detonation(_eng.ProbeEngine(), input_path=src, output_dir=out, limits=Limits())
+    rc = run_detonation(
+        _eng.ProbeEngine(), input_path=src, output_dir=out, limits=Limits()
+    )
     assert rc == 0
     assert (out / "echo.txt").exists()
     assert (out / "metadata.json").exists()
@@ -89,7 +92,9 @@ def test_pdf_rasterize_multipage_trust_validated(tmp_path):
     out = tmp_path / "out"
     out.mkdir()
 
-    rc = run_detonation(_eng.PdfRasterizeEngine(), input_path=src, output_dir=out, limits=Limits())
+    rc = run_detonation(
+        _eng.PdfRasterizeEngine(), input_path=src, output_dir=out, limits=Limits()
+    )
     assert rc == 0
 
     # Payload is the document (EmbeddedResource) holding 3 Page children.

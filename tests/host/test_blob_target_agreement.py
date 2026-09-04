@@ -6,6 +6,7 @@ catches a private local store behind a shared queue. Neither can see dispatch on
 404s. That is the original 17,626-job incident with a different cause, and it stayed hidden for
 days because nothing compared the two sides.
 """
+
 from __future__ import annotations
 
 import tempfile
@@ -37,7 +38,10 @@ def _sql() -> SqlJobStore:
     return SqlJobStore(f"sqlite:///{tempfile.mkdtemp()}/j.db")
 
 
-ALL_BACKENDS = [pytest.param(InMemoryJobStore, id="memory"), pytest.param(_sql, id="sql")]
+ALL_BACKENDS = [
+    pytest.param(InMemoryJobStore, id="memory"),
+    pytest.param(_sql, id="sql"),
+]
 
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
@@ -51,7 +55,9 @@ def test_redis_backend_implements_the_registry():
     from blastbox.host.jobs.redis_store import RedisJobStore
 
     for name in ("claim_blob_target", "get_blob_target", "clear_blob_target"):
-        assert callable(getattr(RedisJobStore, name, None)), f"RedisJobStore is missing {name}"
+        assert callable(getattr(RedisJobStore, name, None)), (
+            f"RedisJobStore is missing {name}"
+        )
 
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
@@ -59,7 +65,9 @@ def test_mismatched_targets_cannot_both_start(backend):
     """Acceptance: two processes with mismatched targets cannot both start, and the message names
     both targets and which side holds which."""
     q = backend()
-    agreed = check_blob_target_agreement(q, _Store("results/stack-a"), role="dispatcher")
+    agreed = check_blob_target_agreement(
+        q, _Store("results/stack-a"), role="dispatcher"
+    )
     assert agreed and "stack-a" in agreed
 
     with pytest.raises(CanaryFailure) as ei:
@@ -67,7 +75,9 @@ def test_mismatched_targets_cannot_both_start(backend):
     msg = str(ei.value)
     assert "stack-a" in msg and "stack-b" in msg, f"both targets must be named: {msg}"
     assert "ingress" in msg, f"the message must say which process holds which: {msg}"
-    assert "blastbox blob-target reset" in msg, "the message must name the migration escape hatch"
+    assert "blastbox blob-target reset" in msg, (
+        "the message must name the migration escape hatch"
+    )
 
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
@@ -79,7 +89,10 @@ def test_matching_deployments_are_unaffected(backend):
     """
     q = backend()
     for role in ("dispatcher", "ingress", "dispatcher"):
-        assert check_blob_target_agreement(q, _Store("results/shared"), role=role) is not None
+        assert (
+            check_blob_target_agreement(q, _Store("results/shared"), role=role)
+            is not None
+        )
 
 
 def test_separate_store_instances_on_one_database_still_see_one_winner(tmp_path):
@@ -107,7 +120,8 @@ def test_separate_store_instances_on_one_database_still_see_one_winner(tmp_path)
     assert won == "s3://results/stack-a"
     assert lost == "s3://results/stack-a", (
         f"a second store instance on the SAME database registered its own target ({lost}); with "
-        f"two real processes both would boot and report agreement on different buckets")
+        f"two real processes both would boot and report agreement on different buckets"
+    )
     assert first.get_blob_target() == second.get_blob_target() == "s3://results/stack-a"
 
 
@@ -144,15 +158,20 @@ def test_an_unreadable_registry_is_unknown_not_agreement(caplog):
             pass
 
     with caplog.at_level(logging.WARNING, logger="blastbox.canary"):
-        out = check_blob_target_agreement(_UnreadableRegistry(), _Store("results/x"),
-                                          role="ingress")
+        out = check_blob_target_agreement(
+            _UnreadableRegistry(), _Store("results/x"), role="ingress"
+        )
 
-    assert out is None, f"an unreadable registry was reported as an agreed target ({out})"
+    assert out is None, (
+        f"an unreadable registry was reported as an agreed target ({out})"
+    )
     msgs = [r.getMessage() for r in caplog.records]
     assert any("blob_target_unverified" in m for m in msgs), (
-        f"an unreadable registry must say agreement is UNVERIFIED, not stay silent: {msgs}")
+        f"an unreadable registry must say agreement is UNVERIFIED, not stay silent: {msgs}"
+    )
     assert not any("agrees with the queue" in m for m in msgs), (
-        f"an unreadable registry was reported as agreement: {msgs}")
+        f"an unreadable registry was reported as agreement: {msgs}"
+    )
 
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
@@ -193,9 +212,13 @@ def test_a_store_without_the_seam_warns_rather_than_refusing(caplog):
         pass
 
     with caplog.at_level(logging.WARNING, logger="blastbox.canary"):
-        assert check_blob_target_agreement(_NoSeam(), _Store("results/x"), role="ingress") is None
+        assert (
+            check_blob_target_agreement(_NoSeam(), _Store("results/x"), role="ingress")
+            is None
+        )
     assert any("blob_target_unverified" in r.getMessage() for r in caplog.records), (
-        "a store without the seam must say so rather than silently skipping the check")
+        "a store without the seam must say so rather than silently skipping the check"
+    )
 
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
@@ -214,13 +237,24 @@ def test_local_stores_are_not_compared_by_path(backend):
     MUTATION: drop the is_local_blob_store guard -> two different local paths refuse each other.
     """
     q = backend()
-    assert check_blob_target_agreement(q, LocalBlobStore(tempfile.mkdtemp()), role="dispatcher") is None
-    assert check_blob_target_agreement(q, LocalBlobStore(tempfile.mkdtemp()), role="ingress") is None
+    assert (
+        check_blob_target_agreement(
+            q, LocalBlobStore(tempfile.mkdtemp()), role="dispatcher"
+        )
+        is None
+    )
+    assert (
+        check_blob_target_agreement(
+            q, LocalBlobStore(tempfile.mkdtemp()), role="ingress"
+        )
+        is None
+    )
     recorded = q.get_blob_target()
     assert recorded == "local:", (
         f"a local store registered {recorded!r}; it must record the path-INDEPENDENT sentinel -- "
         f"a host-local path is meaningless to compare, but recording nothing made enforcement "
-        f"depend on which side booted first")
+        f"depend on which side booted first"
+    )
 
 
 def test_every_protocol_used_with_isinstance_stays_runtime_checkable():
@@ -244,9 +278,13 @@ def test_every_protocol_used_with_isinstance_stays_runtime_checkable():
         proto = getattr(base, name)
         try:
             isinstance(store, proto)
-        except TypeError as exc:  # pragma: no cover - the failure this exists to prevent
-            pytest.fail(f"isinstance() against {name} raises: {exc}. It lost @runtime_checkable, "
-                        f"and every consumer that gates on it breaks at runtime.")
+        except (
+            TypeError
+        ) as exc:  # pragma: no cover - the failure this exists to prevent
+            pytest.fail(
+                f"isinstance() against {name} raises: {exc}. It lost @runtime_checkable, "
+                f"and every consumer that gates on it breaks at runtime."
+            )
 
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
@@ -266,9 +304,13 @@ def test_a_local_store_facing_an_s3_registered_queue_is_refused(backend):
     check_blob_target_agreement(q, _Store("results/stack-a"), role="dispatcher")
 
     with pytest.raises(CanaryFailure) as ei:
-        check_blob_target_agreement(q, LocalBlobStore(tempfile.mkdtemp()), role="ingress")
+        check_blob_target_agreement(
+            q, LocalBlobStore(tempfile.mkdtemp()), role="ingress"
+        )
     msg = str(ei.value)
-    assert "results/stack-a" in msg, f"the message must name what the queue holds: {msg}"
+    assert "results/stack-a" in msg, (
+        f"the message must name what the queue holds: {msg}"
+    )
     assert "BLASTBOX_BLOB_URL" in msg, f"the message must name the usual cause: {msg}"
 
 
@@ -280,9 +322,21 @@ def test_two_local_stores_still_agree_across_different_mount_points(backend):
     resurrect it.
     """
     q = backend()
-    assert check_blob_target_agreement(q, LocalBlobStore(tempfile.mkdtemp()), role="dispatcher") is None
-    assert check_blob_target_agreement(q, LocalBlobStore(tempfile.mkdtemp()), role="ingress") is None
-    assert q.get_blob_target() == "local:", "a local store must record the sentinel, not a path"
+    assert (
+        check_blob_target_agreement(
+            q, LocalBlobStore(tempfile.mkdtemp()), role="dispatcher"
+        )
+        is None
+    )
+    assert (
+        check_blob_target_agreement(
+            q, LocalBlobStore(tempfile.mkdtemp()), role="ingress"
+        )
+        is None
+    )
+    assert q.get_blob_target() == "local:", (
+        "a local store must record the sentinel, not a path"
+    )
 
 
 def test_the_redis_registry_behaves_like_the_others():
@@ -302,7 +356,8 @@ def test_the_redis_registry_behaves_like_the_others():
     assert q.get_blob_target() is None
     assert q.claim_blob_target("s3://results/stack-a") == "s3://results/stack-a"
     assert q.claim_blob_target("s3://results/stack-b") == "s3://results/stack-a", (
-        "the second claimant overwrote the registry instead of losing to it")
+        "the second claimant overwrote the registry instead of losing to it"
+    )
     assert q.get_blob_target() == "s3://results/stack-a"
 
     with pytest.raises(CanaryFailure):
@@ -344,12 +399,16 @@ def test_split_endpoint_routing_to_one_bucket_still_agrees(backend):
     assert check_blob_target_agreement(q, api, role="ingress")
     assert check_blob_target_agreement(q, dispatcher, role="dispatcher"), (
         "a dispatcher reaching the SAME bucket by a different endpoint was refused; that is the "
-        "shipped compose topology and it has no off switch")
+        "shipped compose topology and it has no off switch"
+    )
 
     # ...and a genuine bucket difference is still caught, endpoint notwithstanding.
     with pytest.raises(CanaryFailure):
-        check_blob_target_agreement(q, _s3_with_endpoint("other", "redtusk", "http://minio:9000"),
-                                    role="dispatcher")
+        check_blob_target_agreement(
+            q,
+            _s3_with_endpoint("other", "redtusk", "http://minio:9000"),
+            role="dispatcher",
+        )
 
 
 def test_sql_reports_unknown_when_the_row_vanishes_between_write_and_read(tmp_path):
@@ -401,7 +460,8 @@ def test_sql_reports_unknown_when_the_row_vanishes_between_write_and_read(tmp_pa
     assert out is None, (
         f"the registry read back empty after our write and we returned {out!r} -- our own value, "
         f"which the caller cannot tell from winning. That boots the losing side on the wrong "
-        f"target with the gate reporting agreement")
+        f"target with the gate reporting agreement"
+    )
 
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
@@ -420,8 +480,12 @@ def test_a_local_store_booting_first_still_conflicts_with_an_s3_peer(backend):
     MUTATION: return without claiming for local stores -> the local-first ordering boots both.
     """
     q = backend()
-    assert check_blob_target_agreement(q, LocalBlobStore(tempfile.mkdtemp()),
-                                       role="dispatcher") is None
+    assert (
+        check_blob_target_agreement(
+            q, LocalBlobStore(tempfile.mkdtemp()), role="dispatcher"
+        )
+        is None
+    )
     with pytest.raises(CanaryFailure):
         check_blob_target_agreement(q, _Store("results/stack-a"), role="ingress")
 
@@ -472,10 +536,16 @@ def test_a_credentialed_blob_url_never_reaches_the_log_or_the_registry():
     described = describe_blob_store(leaky)
     fingerprint = blob_target_fingerprint(leaky)
 
-    for label, value in (("startup log", described), ("persisted fingerprint", fingerprint)):
+    for label, value in (
+        ("startup log", described),
+        ("persisted fingerprint", fingerprint),
+    ):
         assert "s3cr3t" not in value and "AKIAKEY" not in value, (
-            f"the {label} carries the credential from BLASTBOX_BLOB_URL: {value}")
-    assert "bucket" in fingerprint, f"the bucket itself must survive redaction: {fingerprint}"
+            f"the {label} carries the credential from BLASTBOX_BLOB_URL: {value}"
+        )
+    assert "bucket" in fingerprint, (
+        f"the bucket itself must survive redaction: {fingerprint}"
+    )
 
 
 def test_an_unknown_store_shape_is_unverified_rather_than_equated_by_class():
@@ -497,14 +567,16 @@ def test_an_unknown_store_shape_is_unverified_rather_than_equated_by_class():
         """Neither local nor S3-shaped."""
 
     assert blob_target_fingerprint(CustomStore()) == "", (
-        "an unrecognised store was given a comparable identity it does not have")
+        "an unrecognised store was given a comparable identity it does not have"
+    )
 
     q = InMemoryJobStore()
     logging.disable(logging.NOTSET)
     assert check_blob_target_agreement(q, CustomStore(), role="dispatcher") is None
     assert q.get_blob_target() is None, (
         "an unidentifiable store registered a target; the next process would have to match a value "
-        "that means nothing")
+        "that means nothing"
+    )
 
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
@@ -523,14 +595,18 @@ def test_a_local_claim_that_cannot_be_read_back_is_unverified(backend):
     q.claim_blob_target = lambda fp: None  # type: ignore[method-assign]
 
     with caplog_at_warning() as records:
-        out = check_blob_target_agreement(q, LocalBlobStore(tempfile.mkdtemp()), role="ingress")
+        out = check_blob_target_agreement(
+            q, LocalBlobStore(tempfile.mkdtemp()), role="ingress"
+        )
 
     assert out is None
     msgs = [r.getMessage() for r in records]
     assert any("blob_target_unverified" in m for m in msgs), (
-        f"a failed read-back on the local path was not reported as unverified: {msgs}")
+        f"a failed read-back on the local path was not reported as unverified: {msgs}"
+    )
     assert not any("registered the local sentinel" in m for m in msgs), (
-        f"the log claimed the sentinel was registered when it was not: {msgs}")
+        f"the log claimed the sentinel was registered when it was not: {msgs}"
+    )
 
 
 import contextlib  # noqa: E402
@@ -576,17 +652,27 @@ def test_a_credentialed_blob_url_is_rejected_at_construction():
 
     from blastbox.host.blobs.s3 import S3BlobStore
 
-    env = {"AWS_ACCESS_KEY_ID": "x", "AWS_SECRET_ACCESS_KEY": "y", "AWS_DEFAULT_REGION": "us-east-1"}
+    env = {
+        "AWS_ACCESS_KEY_ID": "x",
+        "AWS_SECRET_ACCESS_KEY": "y",
+        "AWS_DEFAULT_REGION": "us-east-1",
+    }
     with pytest.raises(ValueError) as ei:
-        S3BlobStore("s3://AKIAEXAMPLE:hunter2swordfish@bucket/prefix",
-                    job_root=Path("/tmp"), env=env)
+        S3BlobStore(
+            "s3://AKIAEXAMPLE:hunter2swordfish@bucket/prefix",
+            job_root=Path("/tmp"),
+            env=env,
+        )
     msg = str(ei.value)
     # A distinctive literal, because "SECRET" also appears in AWS_SECRET_ACCESS_KEY in the remedy.
     assert "hunter2swordfish" not in msg and "AKIAEXAMPLE" not in msg, (
-        f"the rejection echoed the credential it is rejecting: {msg}")
-    assert "AWS_ACCESS_KEY_ID" in msg, "the message must say where credentials actually belong"
+        f"the rejection echoed the credential it is rejecting: {msg}"
+    )
+    assert "AWS_ACCESS_KEY_ID" in msg, (
+        "the message must say where credentials actually belong"
+    )
 
-    S3BlobStore("s3://bucket/prefix", job_root=Path("/tmp"), env=env)   # still fine
+    S3BlobStore("s3://bucket/prefix", job_root=Path("/tmp"), env=env)  # still fine
 
 
 def test_the_vm_dispatcher_gates_itself_rather_than_trusting_the_cli():
@@ -602,18 +688,28 @@ def test_the_vm_dispatcher_gates_itself_rather_than_trusting_the_cli():
 
     from blastbox.host.runtime.vm_dispatch import VmJobDispatcher
 
-    assert hasattr(VmJobDispatcher, "_startup_gate"), "the dispatcher owns no startup gate"
+    assert hasattr(VmJobDispatcher, "_startup_gate"), (
+        "the dispatcher owns no startup gate"
+    )
     src = inspect.getsource(VmJobDispatcher.run)
     assert "_startup_gate()" in src, (
         "VmJobDispatcher.run() does not invoke its own startup gate, so a programmatic caller "
-        "claims jobs without proving it can store a result")
+        "claims jobs without proving it can store a result"
+    )
 
     gate = inspect.getsource(VmJobDispatcher._startup_gate)
-    for step in ("check_store_coherence", "check_blob_target_agreement", "blob_roundtrip"):
-        assert step in gate, f"the dispatcher's gate omits {step}, which the CLI path performs"
+    for step in (
+        "check_store_coherence",
+        "check_blob_target_agreement",
+        "blob_roundtrip",
+    ):
+        assert step in gate, (
+            f"the dispatcher's gate omits {step}, which the CLI path performs"
+        )
     assert gate.index("check_blob_target_agreement") > gate.index("blob_roundtrip"), (
         "the dispatcher registers its target before probing it; a target that never proved it "
-        "works must not become the one every other process has to match")
+        "works must not become the one every other process has to match"
+    )
 
 
 def test_a_read_probe_reports_an_unreachable_store_without_refusing_the_boot():
@@ -637,10 +733,11 @@ def test_a_read_probe_reports_an_unreachable_store_without_refusing_the_boot():
             raise OSError("connection refused")
 
     with caplog_at_warning() as records:
-        check_read_access(_Unreachable(), role="ingress")     # must not raise
+        check_read_access(_Unreachable(), role="ingress")  # must not raise
 
     assert any("read_unverified" in r.getMessage() for r in records), (
-        "an unreachable store was not reported at all")
+        "an unreachable store was not reported at all"
+    )
 
 
 def test_a_denied_samples_prefix_is_reported_but_a_missing_object_is_not():
@@ -665,16 +762,21 @@ def test_a_denied_samples_prefix_is_reported_but_a_missing_object_is_not():
             raise self._exc
 
     with caplog_at_warning() as denied:
-        check_sample_read_access(_Store(PermissionError("AccessDenied on samples/")),
-                                 role="dispatcher")
+        check_sample_read_access(
+            _Store(PermissionError("AccessDenied on samples/")), role="dispatcher"
+        )
     assert any("sample_read_unverified" in r.getMessage() for r in denied), (
-        "a denied samples prefix was not reported; every claimed job would fail in get_sample")
+        "a denied samples prefix was not reported; every claimed job would fail in get_sample"
+    )
 
     with caplog_at_warning() as missing:
-        check_sample_read_access(_Store(FileNotFoundError("404 Not Found")), role="dispatcher")
+        check_sample_read_access(
+            _Store(FileNotFoundError("404 Not Found")), role="dispatcher"
+        )
     assert not [r for r in missing if "sample_read_unverified" in r.getMessage()], (
         "a MISSING probe object was reported as a permission problem; not-found proves the read "
-        "was allowed and answered")
+        "was allowed and answered"
+    )
 
 
 def test_reset_refuses_without_an_explicit_quiescence_affirmation():
@@ -703,17 +805,20 @@ def test_reset_refuses_without_an_explicit_quiescence_affirmation():
             cleared["n"] += 1
 
     import blastbox.host.jobs.factory as factory
+
     real = factory.build_job_store_from_env
-    factory.build_job_store_from_env = lambda *a, **k: _Store()   # type: ignore[assignment]
+    factory.build_job_store_from_env = lambda *a, **k: _Store()  # type: ignore[assignment]
     try:
-        rc = cli._blob_target_cmd(argparse.Namespace(blob_target_cmd="reset", yes=False))
+        rc = cli._blob_target_cmd(
+            argparse.Namespace(blob_target_cmd="reset", yes=False)
+        )
         assert rc != 0, "reset without --yes returned success"
         assert cleared["n"] == 0, "the registry was cleared despite refusing"
 
         rc = cli._blob_target_cmd(argparse.Namespace(blob_target_cmd="reset", yes=True))
         assert rc == 0 and cleared["n"] == 1, "reset with --yes did not clear"
     finally:
-        factory.build_job_store_from_env = real   # type: ignore[assignment]
+        factory.build_job_store_from_env = real  # type: ignore[assignment]
 
 
 class _WrapsEverything:
@@ -739,10 +844,11 @@ class _WrapsEverything:
         return "/".join(parts)
 
     def has_output(self, job_id: str) -> bool:
-        return False                       # swallows everything, exactly like the real one
+        return False  # swallows everything, exactly like the real one
 
     def get_sample(self, sha256, dest):  # noqa: ANN001, ANN201
         from blastbox.host.blobs.s3 import BlobFetchError
+
         raise BlobFetchError(f"sample fetch failed: {sha256}") from self._exc
 
 
@@ -765,13 +871,17 @@ def test_the_read_probe_sees_past_has_output_swallowing_every_error():
     with caplog_at_warning() as records:
         check_read_access(_WrapsEverything(_Denied()), role="ingress")
     assert any("read_unverified" in r.getMessage() for r in records), (
-        "a store that denies reads was reported as readable")
+        "a store that denies reads was reported as readable"
+    )
 
     with caplog_at_warning() as ok:
-        check_read_access(_WrapsEverything(FileNotFoundError("404 Not Found")), role="ingress")
+        check_read_access(
+            _WrapsEverything(FileNotFoundError("404 Not Found")), role="ingress"
+        )
     assert not [r for r in ok if "read_unverified" in r.getMessage()], (
         "a MISSING probe key was reported as a read failure; not-found proves the read was "
-        "permitted and answered")
+        "permitted and answered"
+    )
 
 
 def test_the_sample_probe_reads_the_wrapped_cause_not_the_generic_message():
@@ -786,15 +896,18 @@ def test_the_sample_probe_reads_the_wrapped_cause_not_the_generic_message():
     from blastbox.host.canary import check_sample_read_access
 
     with caplog_at_warning() as healthy:
-        check_sample_read_access(_WrapsEverything(FileNotFoundError("404 NoSuchKey")),
-                                 role="dispatcher")
+        check_sample_read_access(
+            _WrapsEverything(FileNotFoundError("404 NoSuchKey")), role="dispatcher"
+        )
     assert not [r for r in healthy if "sample_read_unverified" in r.getMessage()], (
-        "a healthy dispatcher whose probe key is simply absent was flagged as unable to read")
+        "a healthy dispatcher whose probe key is simply absent was flagged as unable to read"
+    )
 
     with caplog_at_warning() as denied:
         check_sample_read_access(_WrapsEverything(_Denied()), role="dispatcher")
     assert any("sample_read_unverified" in r.getMessage() for r in denied), (
-        "a denied samples prefix went unreported; every claimed job would fail in get_sample")
+        "a denied samples prefix went unreported; every claimed job would fail in get_sample"
+    )
 
 
 def test_a_programmatic_dispatcher_gets_the_periodic_canary_too():
@@ -813,9 +926,11 @@ def test_a_programmatic_dispatcher_gets_the_periodic_canary_too():
     gate = inspect.getsource(VmJobDispatcher._startup_gate)
     assert "_canary_cb" in gate and "_canary_interval_s" in gate, (
         "the dispatcher's own gate never installs the periodic canary, so only the CLI path "
-        "re-checks the store after startup")
-    assert "getattr(self, \"_canary_cb\", None) is None" in gate, (
-        "the gate must not clobber a callback the CLI already installed")
+        "re-checks the store after startup"
+    )
+    assert 'getattr(self, "_canary_cb", None) is None' in gate, (
+        "the gate must not clobber a callback the CLI already installed"
+    )
 
 
 def test_a_healthy_local_dispatcher_is_not_flagged_for_a_missing_sample(tmp_path):
@@ -836,7 +951,8 @@ def test_a_healthy_local_dispatcher_is_not_flagged_for_a_missing_sample(tmp_path
     with caplog_at_warning() as records:
         check_sample_read_access(store, role="dispatcher", scratch_dir=tmp_path)
     assert not [r for r in records if "sample_read_unverified" in r.getMessage()], (
-        "a healthy local dispatcher was told its samples prefix may be unreadable")
+        "a healthy local dispatcher was told its samples prefix may be unreadable"
+    )
 
 
 def test_an_unreadable_local_blob_root_is_reported_not_declared_ok(tmp_path):
@@ -857,14 +973,15 @@ def test_an_unreadable_local_blob_root_is_reported_not_declared_ok(tmp_path):
     root = tmp_path / "blobs"
     root.mkdir()
     store = LocalBlobStore(str(root))
-    os.chmod(root, 0)                       # unreadable by this UID
+    os.chmod(root, 0)  # unreadable by this UID
     try:
-        if os.access(root, os.R_OK):        # running as root: the probe cannot fail
+        if os.access(root, os.R_OK):  # running as root: the probe cannot fail
             pytest.skip("cannot make a directory unreadable as this user")
         with caplog_at_warning() as records:
             check_read_access(store, role="ingress")
         assert any("read_unverified" in r.getMessage() for r in records), (
-            "an unreadable blob root was declared readable; every result open would then fail")
+            "an unreadable blob root was declared readable; every result open would then fail"
+        )
     finally:
         os.chmod(root, stat.S_IRWXU)
 
@@ -889,11 +1006,14 @@ def test_the_canary_key_survives_a_container_replacement(monkeypatch):
     second = canary_job_id("aws-ec2|clippyshot|/var/lib/blastbox")
     assert first == second, (
         "the canary key changed when the container was replaced; under a DELETE-denied policy "
-        "that leaves one more permanent object per rollout")
+        "that leaves one more permanent object per rollout"
+    )
 
     # ...and without a declared identity the hostname still distinguishes genuine hosts.
     monkeypatch.delenv("BLASTBOX_DISPATCHER_ID")
     monkeypatch.setattr(socket, "gethostname", lambda: "host-1")
     a = canary_job_id("t|e|/root")
     monkeypatch.setattr(socket, "gethostname", lambda: "host-2")
-    assert a != canary_job_id("t|e|/root"), "two real hosts must not share one canary key"
+    assert a != canary_job_id("t|e|/root"), (
+        "two real hosts must not share one canary key"
+    )

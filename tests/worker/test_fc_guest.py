@@ -4,6 +4,7 @@ AF_VSOCK needs a real microVM, so the socket is injected: a fake records the
 connect target + bytes sent, letting us exercise the framing and retry logic on
 any host. A drift-guard asserts the guest's wire constants match the host's.
 """
+
 from __future__ import annotations
 
 import socket
@@ -74,11 +75,13 @@ def test_signal_ready_success_sends_token_to_host_cid():
 
 def test_signal_ready_retries_then_succeeds():
     # Two failed connects, then success — covers the host-binds-late race.
-    fac = _Factory([
-        _FakeVsock(fail_connect=True),
-        _FakeVsock(fail_connect=True),
-        _FakeVsock(),
-    ])
+    fac = _Factory(
+        [
+            _FakeVsock(fail_connect=True),
+            _FakeVsock(fail_connect=True),
+            _FakeVsock(),
+        ]
+    )
     ok = signal_ready_vsock(socket_factory=fac, retries=5, backoff_s=0.0)
     assert ok is True
     assert len(fac.made) == 3
@@ -243,7 +246,11 @@ def test_send_frame_from_file_zero_pads_short_read(tmp_path):
     try:
         send_frame_from_file(a, _ShrinkFile(), chunk=64 * 1024)
         frame = recv_frame(b, max_len=100)
-        assert len(frame) == 8 and frame[:4] == b"abcd" and frame[4:] == b"\x00\x00\x00\x00"
+        assert (
+            len(frame) == 8
+            and frame[:4] == b"abcd"
+            and frame[4:] == b"\x00\x00\x00\x00"
+        )
     finally:
         a.close()
         b.close()
@@ -284,7 +291,9 @@ def test_send_frame_from_file_pads_short_read_in_bounded_chunks(tmp_path):
     rec = _Rec()
     send_frame_from_file(rec, _BigStat(), chunk=64 * 1024)
     assert rec.max_write <= 64 * 1024  # never one giant ~5 MB buffer
-    assert rec.total == 8 + 5_000_000  # 8-byte length prefix + announced size (3 real + pad)
+    assert (
+        rec.total == 8 + 5_000_000
+    )  # 8-byte length prefix + announced size (3 real + pad)
 
 
 def test_send_frame_from_file_honors_deadline(tmp_path):

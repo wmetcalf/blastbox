@@ -8,6 +8,7 @@ extended with registered engine types.  These tests pin the fix: a registered
 subtype must validate AND round-trip (dump -> parse) as a nested child while the
 4 base types keep working and unknown ``_type`` keeps being rejected.
 """
+
 from typing import Literal
 
 import pytest
@@ -37,7 +38,9 @@ register_node_type(ClippyShotPage)
 def test_registered_subtype_validates_as_nested_child():
     """The reproduce case from the bug report: subtype nested in children."""
     root = EmbeddedResource(
-        embedded_path="/", content_type="application/pdf", depth=0,
+        embedded_path="/",
+        content_type="application/pdf",
+        depth=0,
         children=[
             ClippyShotPage(
                 index=0,
@@ -58,7 +61,9 @@ def test_registered_subtype_validates_as_nested_child():
 def test_registered_subtype_round_trips_as_nested_child():
     """dump -> parse -> dump is stable and preserves extra fields."""
     root = EmbeddedResource(
-        embedded_path="/", content_type="application/pdf", depth=0,
+        embedded_path="/",
+        content_type="application/pdf",
+        depth=0,
         children=[
             ClippyShotPage(
                 index=2,
@@ -78,10 +83,15 @@ def test_registered_subtype_round_trips_as_nested_child():
 def test_base_types_still_validate_as_nested_children():
     """The 4 base node types must still parse correctly as children."""
     root = EmbeddedResource(
-        embedded_path="/", content_type="application/zip", depth=0,
+        embedded_path="/",
+        content_type="application/zip",
+        depth=0,
         children=[
-            Page(index=0, dims=Dimensions(width=1, height=1, unit="px"),
-                 image=ArtifactRef(id="a0")),
+            Page(
+                index=0,
+                dims=Dimensions(width=1, height=1, unit="px"),
+                image=ArtifactRef(id="a0"),
+            ),
             ExtractedText(text="hi", char_count=2),
             Record(fields={"k": "v"}),
             EmbeddedResource(embedded_path="/inner", content_type="x", depth=1),
@@ -112,8 +122,9 @@ def test_extra_forbidden_still_enforced_on_child():
         "embedded_path": "/",
         "content_type": "x",
         "depth": 0,
-        "children": [{"_type": "extracted_text", "text": "x",
-                      "char_count": 1, "bogus": 99}],
+        "children": [
+            {"_type": "extracted_text", "text": "x", "char_count": 1, "bogus": 99}
+        ],
     }
     with pytest.raises(ValidationError):
         parse_node(data)
@@ -128,14 +139,21 @@ def test_registered_subtype_deeply_nested():
         ocr_chars=5,
     )
     root = EmbeddedResource(
-        embedded_path="/", content_type="application/zip", depth=0,
+        embedded_path="/",
+        content_type="application/zip",
+        depth=0,
         children=[
             EmbeddedResource(
-                embedded_path="/a", content_type="x", depth=1,
+                embedded_path="/a",
+                content_type="x",
+                depth=1,
                 children=[
-                    Page(index=0, dims=Dimensions(width=1, height=1, unit="px"),
-                         image=ArtifactRef(id="mid"),
-                         children=[leaf]),
+                    Page(
+                        index=0,
+                        dims=Dimensions(width=1, height=1, unit="px"),
+                        image=ArtifactRef(id="mid"),
+                        children=[leaf],
+                    ),
                 ],
             )
         ],

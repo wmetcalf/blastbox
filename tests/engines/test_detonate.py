@@ -4,6 +4,7 @@ These unit-test the engine logic by running the tool directly through the harnes
 (no worker). In production the dispatcher runs this engine inside a disposable
 hardened worker, which provides the isolation.
 """
+
 from __future__ import annotations
 
 import json
@@ -40,7 +41,9 @@ def _run(
 
 def test_stdin_mode_transforms_input(tmp_path: Path) -> None:
     # No {input} token -> the input bytes are fed to the tool on stdin.
-    rc, meta, outdir = _run(tmp_path, DetonateEngine(["tr", "a-z", "A-Z"]), b"blob:evil_c2")
+    rc, meta, outdir = _run(
+        tmp_path, DetonateEngine(["tr", "a-z", "A-Z"]), b"blob:evil_c2"
+    )
     assert rc == 0
     assert meta["status"] == "ok", meta
     assert (outdir / "stdout.bin").read_bytes() == b"BLOB:EVIL_C2"
@@ -49,13 +52,17 @@ def test_stdin_mode_transforms_input(tmp_path: Path) -> None:
 
 def test_input_path_token(tmp_path: Path) -> None:
     # {input} is replaced by the input file path; cat echoes it back.
-    _rc, meta, outdir = _run(tmp_path, DetonateEngine(["cat", "{input}"]), b"raw-bytes-here")
+    _rc, meta, outdir = _run(
+        tmp_path, DetonateEngine(["cat", "{input}"]), b"raw-bytes-here"
+    )
     assert meta["status"] == "ok", meta
     assert (outdir / "stdout.bin").read_bytes() == b"raw-bytes-here"
 
 
 def test_tool_not_found_is_engine_error(tmp_path: Path) -> None:
-    rc, meta, _ = _run(tmp_path, DetonateEngine(["definitely-not-a-real-tool-xyz"]), b"x")
+    rc, meta, _ = _run(
+        tmp_path, DetonateEngine(["definitely-not-a-real-tool-xyz"]), b"x"
+    )
     assert rc == 0  # engine_error is a sealed outcome, not a harness failure
     assert meta["status"] == "engine_error", meta
 
@@ -72,7 +79,10 @@ def test_unset_argv_is_engine_error(
 
 def test_output_truncated_to_cap(tmp_path: Path) -> None:
     rc, meta, outdir = _run(
-        tmp_path, DetonateEngine(["tr", "a-z", "A-Z"]), b"abcdef", Limits(max_artifact_bytes=4)
+        tmp_path,
+        DetonateEngine(["tr", "a-z", "A-Z"]),
+        b"abcdef",
+        Limits(max_artifact_bytes=4),
     )
     assert rc == 0
     assert meta["status"] == "ok", meta

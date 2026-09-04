@@ -2,7 +2,11 @@ from pathlib import Path
 
 import pytest
 
-from blastbox.host.runtime.gvisor_snapshot import GvisorSnapshotBackend, GvisorConfig, _oci_config
+from blastbox.host.runtime.gvisor_snapshot import (
+    GvisorSnapshotBackend,
+    GvisorConfig,
+    _oci_config,
+)
 
 
 class _Rec:
@@ -85,15 +89,27 @@ def test_boot_base_uses_unique_cid_per_call(tmp_path: Path) -> None:
 
 
 def test_available_uses_probe(tmp_path: Path) -> None:
-    assert GvisorSnapshotBackend(_cfg(tmp_path), run=lambda a, **k: 0, probe=lambda: True).available() is True
-    assert GvisorSnapshotBackend(_cfg(tmp_path), run=lambda a, **k: 0, probe=lambda: False).available() is False
+    assert (
+        GvisorSnapshotBackend(
+            _cfg(tmp_path), run=lambda a, **k: 0, probe=lambda: True
+        ).available()
+        is True
+    )
+    assert (
+        GvisorSnapshotBackend(
+            _cfg(tmp_path), run=lambda a, **k: 0, probe=lambda: False
+        ).available()
+        is False
+    )
 
 
 def test_available_missing_binary_is_false(tmp_path: Path) -> None:
     # No probe override + a binary that doesn't resolve -> fail-closed before the C/R probe.
     be = GvisorSnapshotBackend(
         _cfg(tmp_path, runsc_bin="definitely-not-a-real-binary-xyz"),
-        cr_capable=lambda b: pytest.fail("cr_capable must not run when the binary is missing"),
+        cr_capable=lambda b: pytest.fail(
+            "cr_capable must not run when the binary is missing"
+        ),
     )
     assert be.available() is False
 
@@ -109,11 +125,17 @@ def test_available_requires_checkpoint_restore_capability(tmp_path: Path) -> Non
         seen.append(binary)
         return False
 
-    be = GvisorSnapshotBackend(_cfg(tmp_path, runsc_bin=sys.executable), cr_capable=_incapable)
+    be = GvisorSnapshotBackend(
+        _cfg(tmp_path, runsc_bin=sys.executable), cr_capable=_incapable
+    )
     assert be.available() is False
-    assert seen == [sys.executable]  # the capability probe actually ran on the resolved binary
+    assert seen == [
+        sys.executable
+    ]  # the capability probe actually ran on the resolved binary
 
-    ok = GvisorSnapshotBackend(_cfg(tmp_path, runsc_bin=sys.executable), cr_capable=lambda b: True)
+    ok = GvisorSnapshotBackend(
+        _cfg(tmp_path, runsc_bin=sys.executable), cr_capable=lambda b: True
+    )
     assert ok.available() is True
 
 
@@ -143,7 +165,9 @@ def test_default_cr_capable_parses_help_output(monkeypatch, tmp_path: Path) -> N
         raise _sp.TimeoutExpired(argv, 5)
 
     monkeypatch.setattr(gs.subprocess, "run", _boom)
-    assert gs._default_cr_capable("runsc") is False  # timeout -> not capable (fail-closed)
+    assert (
+        gs._default_cr_capable("runsc") is False
+    )  # timeout -> not capable (fail-closed)
 
 
 def test_restore_in_propagates_run_error(tmp_path: Path) -> None:
@@ -159,10 +183,17 @@ def test_restore_in_propagates_run_error(tmp_path: Path) -> None:
 
 
 def test_oci_config_has_bind_mounts_args_and_ld_preload(tmp_path: Path) -> None:
-    cfg = _cfg(tmp_path, warm_argv=["/bin/sh", "-c", "x"], ld_preload="/opt/clippyshot/accept-retry.so")
+    cfg = _cfg(
+        tmp_path,
+        warm_argv=["/bin/sh", "-c", "x"],
+        ld_preload="/opt/clippyshot/accept-retry.so",
+    )
     spec = _oci_config(cfg, tmp_path / "wd", in_ro=True)
     assert spec["process"]["args"] == ["/bin/sh", "-c", "x"]
-    assert any(e == "LD_PRELOAD=/opt/clippyshot/accept-retry.so" for e in spec["process"]["env"])
+    assert any(
+        e == "LD_PRELOAD=/opt/clippyshot/accept-retry.so"
+        for e in spec["process"]["env"]
+    )
     dests = {m["destination"]: m for m in spec["mounts"]}
     assert dests["/in"]["options"][-1] == "ro" and dests["/out"]["options"][-1] == "rw"
     assert dests["/ctrl"]["source"] == str(tmp_path / "wd" / "ctrl")
@@ -173,7 +204,9 @@ def test_oci_config_no_ld_preload_when_unset(tmp_path: Path) -> None:
     assert not any(e.startswith("LD_PRELOAD") for e in spec["process"]["env"])
 
 
-def test_oci_config_security_posture_non_root_no_caps_no_new_privs(tmp_path: Path) -> None:
+def test_oci_config_security_posture_non_root_no_caps_no_new_privs(
+    tmp_path: Path,
+) -> None:
     # The untrusted-document worker must run NON-ROOT with NO capabilities and no-new-privs,
     # matching the docker (--user/--cap-drop=ALL) and FC (setpriv 65532) tiers.
     spec = _oci_config(_cfg(tmp_path), tmp_path / "wd", in_ro=True)
@@ -185,7 +218,9 @@ def test_oci_config_security_posture_non_root_no_caps_no_new_privs(tmp_path: Pat
 
 
 def test_oci_config_honors_custom_uid(tmp_path: Path) -> None:
-    spec = _oci_config(_cfg(tmp_path, uid=10001, gid=10001), tmp_path / "wd", in_ro=True)
+    spec = _oci_config(
+        _cfg(tmp_path, uid=10001, gid=10001), tmp_path / "wd", in_ro=True
+    )
     assert spec["process"]["user"] == {"uid": 10001, "gid": 10001}
 
 
@@ -222,6 +257,7 @@ def test_prepare_slot_dirs_perms_are_locked_down(tmp_path: Path) -> None:
 
 def test_restore_handle_alive_running(tmp_path: Path) -> None:
     from blastbox.host.runtime.gvisor_snapshot import GvisorRestoreHandle
+
     cfg = _cfg(tmp_path)
     handle = GvisorRestoreHandle(
         cfg,
@@ -235,6 +271,7 @@ def test_restore_handle_alive_running(tmp_path: Path) -> None:
 
 def test_restore_handle_alive_created_is_not_live(tmp_path: Path) -> None:
     from blastbox.host.runtime.gvisor_snapshot import GvisorRestoreHandle
+
     cfg = _cfg(tmp_path)
     handle = GvisorRestoreHandle(
         cfg,
@@ -250,6 +287,7 @@ def test_restore_handle_alive_created_is_not_live(tmp_path: Path) -> None:
 
 def test_restore_handle_alive_stopped(tmp_path: Path) -> None:
     from blastbox.host.runtime.gvisor_snapshot import GvisorRestoreHandle
+
     cfg = _cfg(tmp_path)
     handle = GvisorRestoreHandle(
         cfg,
@@ -326,7 +364,9 @@ def test_a_superseded_checkpoint_generation_is_reclaimed(tmp_path: Path) -> None
     assert not img.exists(), "a drained checkpoint generation must be removed"
 
 
-def test_discard_refuses_an_artifact_that_is_not_a_generation_dir(tmp_path: Path) -> None:
+def test_discard_refuses_an_artifact_that_is_not_a_generation_dir(
+    tmp_path: Path,
+) -> None:
     """discard() removes a TREE, so an unexpected artifact shape must never become an rmtree."""
     rec = _Rec()
     be = GvisorSnapshotBackend(_cfg(tmp_path), run=rec, ready_wait=lambda d, t: None)
@@ -336,7 +376,9 @@ def test_discard_refuses_an_artifact_that_is_not_a_generation_dir(tmp_path: Path
     (precious / "keep").write_bytes(b"important")
 
     be.discard(str(precious))
-    assert precious.exists(), "discard must refuse anything that is not one of our checkpoint dirs"
+    assert precious.exists(), (
+        "discard must refuse anything that is not one of our checkpoint dirs"
+    )
 
 
 def test_a_partial_checkpoint_cleans_up_its_own_directory(tmp_path: Path) -> None:
@@ -346,6 +388,7 @@ def test_a_partial_checkpoint_cleans_up_its_own_directory(tmp_path: Path) -> Non
     retire or discard it — and because every attempt now gets a unique name, each async retry
     leaves another partial checkpoint behind instead of overwriting the last.
     """
+
     def _run_that_fails(argv, *a, **kw):
         if "checkpoint" in argv:
             img = Path(argv[argv.index("-image-path") + 1])
@@ -354,10 +397,12 @@ def test_a_partial_checkpoint_cleans_up_its_own_directory(tmp_path: Path) -> Non
             raise RuntimeError("runsc checkpoint failed")
         return 0
 
-    be = GvisorSnapshotBackend(_cfg(tmp_path), run=_run_that_fails, ready_wait=lambda d, t: None)
+    be = GvisorSnapshotBackend(
+        _cfg(tmp_path), run=_run_that_fails, ready_wait=lambda d, t: None
+    )
     dest = tmp_path / "ckpt"
 
-    for _ in range(3):                          # repeated retries
+    for _ in range(3):  # repeated retries
         boot = be.boot_base()
         boot.wait_ready(5.0)
         with pytest.raises(Exception):
@@ -465,13 +510,16 @@ def test_kill_reports_an_unconfirmed_teardown(tmp_path: Path) -> None:
     `sandbox_gone` check stayed True and released the generation pin — a later invalidation could
     then reclaim a checkpoint a live sandbox was still restoring from.
     """
+
     def _teardown_fails(argv, *a, **kw):
         # Boot must SUCCEED, or we never get a handle to test; only the teardown commands fail.
         if any(x in argv for x in ("kill", "delete")):
             raise RuntimeError("runsc unavailable")
         return 0
 
-    be = GvisorSnapshotBackend(_cfg(tmp_path), run=_teardown_fails, ready_wait=lambda d, t: None)
+    be = GvisorSnapshotBackend(
+        _cfg(tmp_path), run=_teardown_fails, ready_wait=lambda d, t: None
+    )
     handle = be.boot_base()
 
     with pytest.raises(Exception):
@@ -483,7 +531,7 @@ def test_kill_is_quiet_when_teardown_succeeds(tmp_path: Path) -> None:
     rec = _Rec()
     be = GvisorSnapshotBackend(_cfg(tmp_path), run=rec, ready_wait=lambda d, t: None)
     handle = be.boot_base()
-    handle.kill()          # must not raise
+    handle.kill()  # must not raise
 
 
 def test_the_retry_list_stays_shared_across_handles(tmp_path: Path) -> None:
@@ -493,6 +541,7 @@ def test_the_retry_list_stays_shared_across_handles(tmp_path: Path) -> None:
     at a private copy — every later append lands there, and the next handle (still holding the
     original) never sees those directories. The FC launcher had the identical bug.
     """
+
     def _run(argv, *a, **kw):
         if "checkpoint" in argv:
             img = Path(argv[argv.index("-image-path") + 1])
@@ -543,6 +592,7 @@ def test_a_failed_restore_signals_an_unconfirmed_teardown(tmp_path: Path) -> Non
     unmanaged sandbox might still be using it, and a later invalidation could reclaim it
     underneath.
     """
+
     def _run(argv, *a, **kw):
         # The restore itself fails, and so does every teardown command.
         raise RuntimeError("runsc failure")
@@ -607,7 +657,9 @@ def test_a_live_dispatchers_checkpoint_is_never_touched(tmp_path, monkeypatch):
     backend = GvisorSnapshotBackend(_cfg(tmp_path), run=lambda *a, **k: 0)
     try:
         assert backend.sweep_orphan_generations(tmp_path) == 0
-        assert theirs.exists(), "a live owner's checkpoint was swept out from under its sandboxes"
+        assert theirs.exists(), (
+            "a live owner's checkpoint was swept out from under its sandboxes"
+        )
     finally:
         holder.close()
 
@@ -650,8 +702,9 @@ def test_stranded_checkpoints_are_retried_before_the_base_boots(tmp_path):
     leftover.mkdir(parents=True)
     (leftover / "pages.img").write_bytes(b"x" * 32)
 
-    backend = GvisorSnapshotBackend(_cfg(tmp_path), run=lambda *a, **k: 0,
-                                    ready_wait=lambda d, t: None)
+    backend = GvisorSnapshotBackend(
+        _cfg(tmp_path), run=lambda *a, **k: 0, ready_wait=lambda d, t: None
+    )
     backend._stranded_partials.append(str(leftover))
 
     backend.boot_base()
@@ -669,8 +722,9 @@ def test_no_checkpoint_is_written_without_a_lease(tmp_path, monkeypatch):
     from blastbox.host.runtime import gvisor_snapshot as mod
 
     monkeypatch.setattr(mod, "hold_owner_lease", lambda d: False)
-    backend = GvisorSnapshotBackend(_cfg(tmp_path), run=lambda *a, **k: 0,
-                                    ready_wait=lambda d, t: None)
+    backend = GvisorSnapshotBackend(
+        _cfg(tmp_path), run=lambda *a, **k: 0, ready_wait=lambda d, t: None
+    )
     handle = backend.boot_base()
     with pytest.raises(RuntimeError):
         handle.checkpoint(tmp_path)
@@ -696,7 +750,9 @@ def test_a_cancelled_restore_still_tears_its_sandbox_down(tmp_path):
             deleted.append(argv[-1])
         return 0
 
-    backend = GvisorSnapshotBackend(_cfg(tmp_path), run=_run, ready_wait=lambda d, t: None)
+    backend = GvisorSnapshotBackend(
+        _cfg(tmp_path), run=_run, ready_wait=lambda d, t: None
+    )
     with pytest.raises(KeyboardInterrupt):
         backend.restore_in(tmp_path / "slot", str(tmp_path / "checkpoint-x"))
     assert deleted, (
@@ -716,7 +772,9 @@ def test_a_cancelled_base_boot_still_tears_down(tmp_path):
             deleted.append(argv[-1])
         return 0
 
-    backend = GvisorSnapshotBackend(_cfg(tmp_path), run=_run, ready_wait=lambda d, t: None)
+    backend = GvisorSnapshotBackend(
+        _cfg(tmp_path), run=_run, ready_wait=lambda d, t: None
+    )
     with pytest.raises(KeyboardInterrupt):
         backend.boot_base()
     assert deleted, "a cancelled base boot leaked its registered container"
@@ -728,6 +786,7 @@ def test_an_unconfirmed_base_deletion_retains_its_bundle(tmp_path):
     Ignoring that result and removing the bundle anyway forgot the only cid anything could retry,
     and every later build retry leaked another base.
     """
+
     def _run(argv, **kw):
         if "run" in argv:
             raise RuntimeError("runsc run failed after registering the container")
@@ -737,7 +796,9 @@ def test_an_unconfirmed_base_deletion_retains_its_bundle(tmp_path):
             raise RuntimeError("teardown failed too")
         return 0
 
-    backend = GvisorSnapshotBackend(_cfg(tmp_path), run=_run, ready_wait=lambda d, t: None)
+    backend = GvisorSnapshotBackend(
+        _cfg(tmp_path), run=_run, ready_wait=lambda d, t: None
+    )
     with pytest.raises(RuntimeError):
         backend.boot_base()
 
@@ -760,6 +821,7 @@ def test_an_unconfirmed_restore_teardown_retains_its_bundle(tmp_path):
     sandbox/gofer processes and the checkpoint could never be reclaimed. The base-boot path
     already retains; this is its sibling.
     """
+
     def _run(argv, **kw):
         if "restore" in argv:
             raise RuntimeError("runsc restore failed after registering the sandbox")
@@ -767,11 +829,15 @@ def test_an_unconfirmed_restore_teardown_retains_its_bundle(tmp_path):
             raise RuntimeError("teardown failed too")
         return 0
 
-    backend = GvisorSnapshotBackend(_cfg(tmp_path), run=_run, ready_wait=lambda d, t: None)
+    backend = GvisorSnapshotBackend(
+        _cfg(tmp_path), run=_run, ready_wait=lambda d, t: None
+    )
     with pytest.raises(RuntimeError) as ei:
         backend.restore_in(tmp_path / "slot", str(tmp_path / "checkpoint-x"))
 
-    assert getattr(ei.value, "kill_failed", False) is True, "sanity: the pin must be retained"
+    assert getattr(ei.value, "kill_failed", False) is True, (
+        "sanity: the pin must be retained"
+    )
     assert backend._stranded_partials, (
         "the bundle was forgotten, so nothing can retry the teardown and the checkpoint stays "
         "pinned for the life of the dispatcher"

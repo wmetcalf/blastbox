@@ -80,8 +80,8 @@ def test_cascade_prepare_ready_if_any_tier_ready():
     # ready, but EVERY tier's build is still kicked.
     a, b = _PrepRuntime("a", True), _PrepRuntime("b", False)
     rt = CascadingRuntime([Tier("a", a, 1), Tier("b", b, 1)])
-    assert rt.prepare() is True                # a ready -> cascade can spawn (on a)
-    assert a.prepped == 1 and b.prepped == 1   # BOTH kicked (all async builds start)
+    assert rt.prepare() is True  # a ready -> cascade can spawn (on a)
+    assert a.prepped == 1 and b.prepped == 1  # BOTH kicked (all async builds start)
 
 
 def test_cascade_prepare_false_when_no_tier_ready():
@@ -91,7 +91,9 @@ def test_cascade_prepare_false_when_no_tier_ready():
 
 
 def test_cascade_prepare_true_without_prepare_tiers():
-    rt = CascadingRuntime([Tier("a", FakeRuntime("a"), 1)])   # no prepare() -> always ready
+    rt = CascadingRuntime(
+        [Tier("a", FakeRuntime("a"), 1)]
+    )  # no prepare() -> always ready
     assert rt.prepare() is True
 
 
@@ -101,8 +103,10 @@ def test_cascade_spawn_skips_still_building_tier():
     building, ready = _PrepRuntime("fc", False), _PrepRuntime("static", True)
     rt = CascadingRuntime([Tier("fc", building, 4), Tier("static", ready, 4)])
     slot = rt.spawn()
-    assert slot.slot_id.startswith("static")   # routed to the ready tier, not the building primary
-    assert building.spawned == []              # the building tier's spawn was never called
+    assert slot.slot_id.startswith(
+        "static"
+    )  # routed to the ready tier, not the building primary
+    assert building.spawned == []  # the building tier's spawn was never called
     building._ready = True
     # once fc is built it becomes spawnable (primary preference resumes on the next spawn)
     assert rt.spawn().slot_id.startswith("fc")
@@ -121,11 +125,11 @@ def test_cascade_resume_delegates_to_owning_tier():
 
     r, plain = ResumeRuntime("hib"), FakeRuntime("fc")
     rt = CascadingRuntime([Tier("hib", r, 1), Tier("fc", plain, 1)])
-    s_r = rt.spawn()      # owned by the resume tier
-    s_p = rt.spawn()      # owned by the plain tier
+    s_r = rt.spawn()  # owned by the resume tier
+    s_p = rt.spawn()  # owned by the plain tier
     rt.resume(s_r)
-    assert r.resumed == [s_r.slot_id]        # delegated to the owning tier's resume
-    rt.resume(s_p)                            # plain tier has no resume() -> no-op (must not raise)
+    assert r.resumed == [s_r.slot_id]  # delegated to the owning tier's resume
+    rt.resume(s_p)  # plain tier has no resume() -> no-op (must not raise)
 
 
 def test_cascade_resume_propagates_owner_failure():
@@ -136,7 +140,7 @@ def test_cascade_resume_propagates_owner_failure():
     rt = CascadingRuntime([Tier("hib", BoomResume("hib"), 1)])
     slot = rt.spawn()
     with pytest.raises(RuntimeError, match="cannot wake"):
-        rt.resume(slot)   # so _resume_on_claim retires the slot dirty
+        rt.resume(slot)  # so _resume_on_claim retires the slot dirty
 
 
 def test_cascade_is_alive_for_claim_delegates_fresh_hook():
@@ -148,18 +152,20 @@ def test_cascade_is_alive_for_claim_delegates_fresh_hook():
             super().__init__(name)
             self.claim_checks = 0
 
-        def is_alive(self, slot):        # cached / background-tick view: still alive
+        def is_alive(self, slot):  # cached / background-tick view: still alive
             return True
 
         def is_alive_for_claim(self, slot):
             self.claim_checks += 1
-            return False                 # fresh view: terminated since the last tick
+            return False  # fresh view: terminated since the last tick
 
     aws = _FreshTier("aws")
     rt = CascadingRuntime([Tier("aws", aws, 1)])
     slot = rt.spawn()
-    assert rt.is_alive(slot) is True             # cached delegate
-    assert rt.is_alive_for_claim(slot) is False  # FRESH delegate reached the tier's hook
+    assert rt.is_alive(slot) is True  # cached delegate
+    assert (
+        rt.is_alive_for_claim(slot) is False
+    )  # FRESH delegate reached the tier's hook
     assert aws.claim_checks == 1
     # a tier WITHOUT the hook (file/libvirt) falls back to its is_alive (already fresh)
     rt2 = CascadingRuntime([Tier("fc", FakeRuntime("fc"), 1)])
@@ -182,13 +188,17 @@ def test_cascade_cli_timeout_s_aggregates_max_across_tiers():
         cli_timeout_s = 90.0
 
     plain = FakeRuntime("fc")
-    assert CascadingRuntime([Tier("fc", plain, 1)]).cli_timeout_s is None   # no AWS tier -> None
-    rt = CascadingRuntime([
-        Tier("ec2", CfgRuntime("ec2", 120.0), 1),
-        Tier("snap", AttrRuntime("snap"), 1),
-        Tier("fc", plain, 1),
-    ])
-    assert rt.cli_timeout_s == 120.0   # max(120 via cfg, 90 via attr)
+    assert (
+        CascadingRuntime([Tier("fc", plain, 1)]).cli_timeout_s is None
+    )  # no AWS tier -> None
+    rt = CascadingRuntime(
+        [
+            Tier("ec2", CfgRuntime("ec2", 120.0), 1),
+            Tier("snap", AttrRuntime("snap"), 1),
+            Tier("fc", plain, 1),
+        ]
+    )
+    assert rt.cli_timeout_s == 120.0  # max(120 via cfg, 90 via attr)
 
 
 def test_cascade_resume_timeout_s_aggregates_max_across_tiers():
@@ -208,13 +218,17 @@ def test_cascade_resume_timeout_s_aggregates_max_across_tiers():
         resume_timeout_s = 45.0
 
     plain = FakeRuntime("fc")
-    assert CascadingRuntime([Tier("fc", plain, 1)]).resume_timeout_s is None   # no resume tier
-    rt = CascadingRuntime([
-        Tier("hib", CfgRuntime("hib", 120.0), 1),
-        Tier("snap", AttrRuntime("snap"), 1),
-        Tier("fc", plain, 1),
-    ])
-    assert rt.resume_timeout_s == 120.0   # max(120 via cfg, 45 via attr)
+    assert (
+        CascadingRuntime([Tier("fc", plain, 1)]).resume_timeout_s is None
+    )  # no resume tier
+    rt = CascadingRuntime(
+        [
+            Tier("hib", CfgRuntime("hib", 120.0), 1),
+            Tier("snap", AttrRuntime("snap"), 1),
+            Tier("fc", plain, 1),
+        ]
+    )
+    assert rt.resume_timeout_s == 120.0  # max(120 via cfg, 45 via attr)
 
 
 def test_cascade_delegates_warm_hooks_to_owning_tier():
@@ -222,8 +236,8 @@ def test_cascade_delegates_warm_hooks_to_owning_tier():
     # tier that owns the slot -- else gVisor/FC jobs get the wrong input/output transport.
     a, b = WarmFileRuntime("gvisor"), WarmFileRuntime("fc")
     rt = CascadingRuntime([Tier("gvisor", a, 1), Tier("fc", b, 1)])
-    s_a = rt.spawn()   # owned by tier gvisor
-    s_b = rt.spawn()   # owned by tier fc
+    s_a = rt.spawn()  # owned by tier gvisor
+    s_b = rt.spawn()  # owned by tier fc
     assert rt.host_warm_control(s_a) == f"control:{s_a.slot_id}"
     assert rt.stage_warm_input(s_b, "/in/x") == "staged:/in/x"
     rt.materialize_warm_output(s_b)
@@ -232,7 +246,7 @@ def test_cascade_delegates_warm_hooks_to_owning_tier():
 
 def test_cascade_warm_hook_missing_on_tier_raises():
     # a file cascade whose tier can't do the warm handshake fails fast rather than silently mis-routing.
-    plain = FakeRuntime("plain")   # no host_warm_control
+    plain = FakeRuntime("plain")  # no host_warm_control
     rt = CascadingRuntime([Tier("plain", plain, 1)])
     slot = rt.spawn()
     with pytest.raises(CascadeMisconfigured):
@@ -241,12 +255,13 @@ def test_cascade_warm_hook_missing_on_tier_raises():
 
 # --------------------------------------------------------------- routing
 
+
 def test_spawn_fills_primary_then_overflows():
     a, b = FakeRuntime("a"), FakeRuntime("b")
     rt = CascadingRuntime([Tier("a", a, 2), Tier("b", b, 3)])
     slots = [rt.spawn() for _ in range(4)]
-    assert [s.slot_id for s in slots[:2]] == ["a-1", "a-2"]      # primary filled first
-    assert all(s.slot_id.startswith("b") for s in slots[2:])     # then overflow
+    assert [s.slot_id for s in slots[:2]] == ["a-1", "a-2"]  # primary filled first
+    assert all(s.slot_id.startswith("b") for s in slots[2:])  # then overflow
     assert len(a.spawned) == 2 and len(b.spawned) == 2
 
 
@@ -265,7 +280,7 @@ def test_reap_frees_capacity_on_owning_tier():
     with pytest.raises(CascadeExhausted):
         rt.spawn()
     rt.reap(s)
-    rt.spawn()                      # freed slot reclaimed
+    rt.spawn()  # freed slot reclaimed
     assert a.reaped == ["a-1"] and len(a.spawned) == 2
 
 
@@ -273,8 +288,8 @@ def test_spawn_falls_through_on_tier_failure():
     a, b = FakeRuntime("a", fail_spawn=True), FakeRuntime("b")
     rt = CascadingRuntime([Tier("a", a, 2), Tier("b", b, 2)])
     s = rt.spawn()
-    assert s.slot_id.startswith("b")            # tier a raised -> routed to b
-    assert rt._counts[0] == 0 and rt._counts[1] == 1   # a's reservation released
+    assert s.slot_id.startswith("b")  # tier a raised -> routed to b
+    assert rt._counts[0] == 0 and rt._counts[1] == 1  # a's reservation released
 
 
 def test_delegates_ready_alive_reap_to_owner():
@@ -283,7 +298,7 @@ def test_delegates_ready_alive_reap_to_owner():
     sa, sb = rt.spawn(), rt.spawn()
     assert rt.is_ready(sa) and rt.is_alive(sb)
     rt.reap(sb)
-    assert b.reaped == ["b-1"] and a.reaped == []   # only the owning tier reaped
+    assert b.reaped == ["b-1"] and a.reaped == []  # only the owning tier reaped
 
 
 def test_reap_unknown_slot_is_noop():
@@ -300,8 +315,10 @@ def test_satisfies_slotruntime_protocol():
 
 def test_cascade_dispatch_style_homogeneous():
     a, b = FakeRuntime("a"), FakeRuntime("b")
-    a.dispatch_style = b.dispatch_style = "network"        # type: ignore[attr-defined]
-    assert CascadingRuntime([Tier("a", a, 1), Tier("b", b, 1)]).dispatch_style == "network"
+    a.dispatch_style = b.dispatch_style = "network"  # type: ignore[attr-defined]
+    assert (
+        CascadingRuntime([Tier("a", a, 1), Tier("b", b, 1)]).dispatch_style == "network"
+    )
 
 
 def test_cascade_dispatch_style_defaults_file():
@@ -311,16 +328,16 @@ def test_cascade_dispatch_style_defaults_file():
 
 def test_cascade_dispatch_style_mixed_raises():
     net = FakeRuntime("net")
-    net.dispatch_style = "network"                         # type: ignore[attr-defined]
+    net.dispatch_style = "network"  # type: ignore[attr-defined]
     rt = CascadingRuntime([Tier("net", net, 1), Tier("file", FakeRuntime("file"), 1)])
     with pytest.raises(CascadeMisconfigured):
-        _ = rt.dispatch_style   # can't mix transports in one job
+        _ = rt.dispatch_style  # can't mix transports in one job
 
 
 def test_cascade_exposes_inner_ssl_context():
     a = FakeRuntime("a")
-    a.dispatch_style = "network"                           # type: ignore[attr-defined]
-    a.ssl_context = "CTX"                                  # type: ignore[attr-defined]
+    a.dispatch_style = "network"  # type: ignore[attr-defined]
+    a.ssl_context = "CTX"  # type: ignore[attr-defined]
     assert CascadingRuntime([Tier("a", a, 1)]).ssl_context == "CTX"
 
 
@@ -332,13 +349,15 @@ def test_cascade_ssl_context_mixed_mtls_and_public_tls_raises():
     # a worker-mTLS tier (private CA context) + a public-TLS Lambda tier (no context) can't share
     # one transport context -- fail fast rather than silently verifying one and not the other.
     mtls = FakeRuntime("static")
-    mtls.dispatch_style = "network"                        # type: ignore[attr-defined]
-    mtls.ssl_context = "CTX"                               # type: ignore[attr-defined]
+    mtls.dispatch_style = "network"  # type: ignore[attr-defined]
+    mtls.ssl_context = "CTX"  # type: ignore[attr-defined]
     lam = FakeRuntime("lambda")
-    lam.dispatch_style = "network"                         # type: ignore[attr-defined]
-    lam.ssl_context = None                                 # type: ignore[attr-defined]
+    lam.dispatch_style = "network"  # type: ignore[attr-defined]
+    lam.ssl_context = None  # type: ignore[attr-defined]
     with pytest.raises(CascadeMisconfigured):
-        _ = CascadingRuntime([Tier("static", mtls, 1), Tier("lambda", lam, 1)]).ssl_context
+        _ = CascadingRuntime(
+            [Tier("static", mtls, 1), Tier("lambda", lam, 1)]
+        ).ssl_context
 
 
 def test_empty_tiers_rejected():
@@ -347,6 +366,7 @@ def test_empty_tiers_rejected():
 
 
 # --------------------------------------------------------------- spec parsing
+
 
 def test_parse_tiers_ok():
     assert _parse_tiers("gvisor:4, aws-ec2:16 ") == [("gvisor", 4), ("aws-ec2", 16)]
@@ -359,6 +379,7 @@ def test_parse_tiers_bad(bad):
 
 
 # --------------------------------------------------------------- build_cascade_runtime
+
 
 def test_build_primary_unavailable_raises(monkeypatch):
     from blastbox.host import pool_config
@@ -381,7 +402,9 @@ def test_build_overflow_unavailable_is_skipped(monkeypatch):
 
     monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
     rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2:16"}.get)
-    assert [t.name for t in rt.tiers] == ["gvisor"]      # local came up; cloud overflow skipped
+    assert [t.name for t in rt.tiers] == [
+        "gvisor"
+    ]  # local came up; cloud overflow skipped
 
 
 def test_build_empty_spec_raises():
@@ -394,7 +417,9 @@ def test_pool_config_registers_cascade(monkeypatch):
     from blastbox.host import pool_config
 
     monkeypatch.setenv("BLASTBOX_POOL_RUNTIME", "cascade")
-    monkeypatch.setenv("BLASTBOX_POOL_TIERS", "")   # empty -> CascadeMisconfigured proves it's wired
+    monkeypatch.setenv(
+        "BLASTBOX_POOL_TIERS", ""
+    )  # empty -> CascadeMisconfigured proves it's wired
     cfg = pool_config.PoolConfig.from_env()
     with pytest.raises(CascadeMisconfigured):
         pool_config.build_warm_pool(cfg=cfg)
@@ -418,23 +443,24 @@ def test_cascade_forwards_unknown_liveness_unchanged():
             return True
 
         def is_alive(self, slot):
-            return True                      # the CACHED view still says alive
+            return True  # the CACHED view still says alive
 
         def is_alive_for_claim(self, slot):
-            return None                      # the FRESH view couldn't answer
+            return None  # the FRESH view couldn't answer
 
         def reap(self, slot):
             pass
 
     tier_rt = _UnknownTier()
     rt = CascadingRuntime([Tier("aws-lambda-microvm", tier_rt, 1)])
-    slot = rt.spawn()                        # cascade records tier ownership on spawn
+    slot = rt.spawn()  # cascade records tier ownership on spawn
     assert rt.is_alive_for_claim(slot) is None, "cascade collapsed UNKNOWN into a bool"
 
 
 def test_cascade_forwards_the_resume_budget():
     """The claim window's remaining time must reach the owning tier, or a slow resume still burns
     the whole window in the production (cascaded) shape."""
+
     class BudgetResume(FakeRuntime):
         def __init__(self, name):
             super().__init__(name)
@@ -486,19 +512,27 @@ def test_spawn_raises_a_FAULT_when_attempted_tiers_fail_and_CAPACITY_when_merely
     )
 
     class _Broken:
-        def prepare(self): return True
-        def spawn(self): raise RuntimeError("snapshot restore failed: corrupt warm.mem")
+        def prepare(self):
+            return True
+
+        def spawn(self):
+            raise RuntimeError("snapshot restore failed: corrupt warm.mem")
 
     class _Fine:
-        def __init__(self): self.n = 0
-        def prepare(self): return True
+        def __init__(self):
+            self.n = 0
+
+        def prepare(self):
+            return True
+
         def spawn(self):
             self.n += 1
             return SimpleNamespace(slot_id=f"s{self.n}")
 
     # every ATTEMPTED tier threw -> a fault, and explicitly NOT a capacity type
-    broken = CascadingRuntime(tiers=[Tier(name="fc", runtime=_Broken(), capacity=4)],
-                              tier_rebuild_after=0)   # isolate from per-tier repair
+    broken = CascadingRuntime(
+        tiers=[Tier(name="fc", runtime=_Broken(), capacity=4)], tier_rebuild_after=0
+    )  # isolate from per-tier repair
     with pytest.raises(CascadeSpawnFailed) as ei:
         broken.spawn()
     assert not isinstance(ei.value, RuntimeAtCapacity), (
@@ -509,9 +543,10 @@ def test_spawn_raises_a_FAULT_when_attempted_tiers_fail_and_CAPACITY_when_merely
 
     # nothing attempted, everything full -> routine capacity
     fine = _Fine()
-    full = CascadingRuntime(tiers=[Tier(name="fc", runtime=fine, capacity=1)],
-                            tier_rebuild_after=0)
-    full.spawn()                       # fills the only tier
+    full = CascadingRuntime(
+        tiers=[Tier(name="fc", runtime=fine, capacity=1)], tier_rebuild_after=0
+    )
+    full.spawn()  # fills the only tier
     with pytest.raises(CascadeExhausted) as ei2:
         full.spawn()
     assert isinstance(ei2.value, RuntimeAtCapacity), (
@@ -536,17 +571,23 @@ def test_a_failed_tier_invalidation_is_reported_not_swallowed():
     invalidated: list[str] = []
 
     class _Ok:
-        def __init__(self, name): self.name = name
-        def invalidate_base(self): invalidated.append(self.name)
+        def __init__(self, name):
+            self.name = name
+
+        def invalidate_base(self):
+            invalidated.append(self.name)
 
     class _Broken:
-        def invalidate_base(self): raise RuntimeError("snapshot cleanup failed")
+        def invalidate_base(self):
+            raise RuntimeError("snapshot cleanup failed")
 
-    casc = CascadingRuntime(tiers=[
-        Tier(name="a", runtime=_Ok("a"), capacity=1),
-        Tier(name="broken", runtime=_Broken(), capacity=1),
-        Tier(name="c", runtime=_Ok("c"), capacity=1),
-    ])
+    casc = CascadingRuntime(
+        tiers=[
+            Tier(name="a", runtime=_Ok("a"), capacity=1),
+            Tier(name="broken", runtime=_Broken(), capacity=1),
+            Tier(name="c", runtime=_Ok("c"), capacity=1),
+        ]
+    )
 
     with pytest.raises(CascadeInvalidateFailed):
         casc.invalidate_base()
@@ -619,13 +660,15 @@ def test_a_deferred_tier_that_turns_out_definitively_broken_is_dropped(monkeypat
     def fake_select(name, *, warm_snapshot=False, require_available=True):
         if name == "aws-ec2":
             if state["mode"] == "throttled":
-                raise AwsProbeTimeout("sts: timed out")        # UNDECIDED -> defer
+                raise AwsProbeTimeout("sts: timed out")  # UNDECIDED -> defer
             raise RuntimeError("no aws creds (AccessDenied)")  # VERDICT   -> drop
         return FakeRuntime(name)
 
     monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
     rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2:16"}.get)
-    assert [d.name for d in rt._deferred] == ["aws-ec2"], "a throttled probe must defer, not drop"
+    assert [d.name for d in rt._deferred] == ["aws-ec2"], (
+        "a throttled probe must defer, not drop"
+    )
 
     state["mode"] = "definitive"
     rt._last_admit_attempt = None
@@ -654,15 +697,19 @@ def test_the_cascade_forwards_maintain_idle_to_the_slots_owning_tier(monkeypatch
     class _MaintainingTier(FakeRuntime):
         def maintain_idle(self, slot):
             seen.append(slot)
-            return False        # and the verdict must come back intact
+            return False  # and the verdict must come back intact
 
     from blastbox.host import pool_config
 
     def fake_select(name, *, warm_snapshot=False, require_available=True):
-        return _MaintainingTier(name) if name == "aws-ec2-hibernate" else FakeRuntime(name)
+        return (
+            _MaintainingTier(name) if name == "aws-ec2-hibernate" else FakeRuntime(name)
+        )
 
     monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
-    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2-hibernate:16"}.get)
+    rt = build_cascade_runtime(
+        {"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2-hibernate:16"}.get
+    )
 
     assert callable(getattr(rt, "maintain_idle", None)), (
         "CascadingRuntime has no maintain_idle, so pool._maintain_idle's getattr returns None "
@@ -671,7 +718,9 @@ def test_the_cascade_forwards_maintain_idle_to_the_slots_owning_tier(monkeypatch
     # gvisor has capacity 4, so the 5th spawn lands on the hibernate tier.
     slots = [rt.spawn() for _ in range(5)]
     slot = next(s for s in slots if s.slot_id.startswith("aws-ec2-hibernate"))
-    assert rt.maintain_idle(slot) is False, "the tier's UNUSABLE verdict was not forwarded back"
+    assert rt.maintain_idle(slot) is False, (
+        "the tier's UNUSABLE verdict was not forwarded back"
+    )
     assert seen, "the owning tier's maintain_idle was never called"
 
 
@@ -695,7 +744,9 @@ def test_a_deferred_tier_is_still_covered_by_the_allowed_runtimes_gate(monkeypat
 
     def fake_select(name, *, warm_snapshot=False, require_available=True):
         if name == "aws-ec2":
-            raise AwsProbeTimeout("sts: timed out")     # UNDECIDED -> deferred, not dropped
+            raise AwsProbeTimeout(
+                "sts: timed out"
+            )  # UNDECIDED -> deferred, not dropped
         return FakeRuntime(name)
 
     monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
@@ -735,12 +786,14 @@ def test_a_deferred_tiers_declared_budgets_are_in_the_cascade_totals(monkeypatch
     def fake_select(name, *, warm_snapshot=False, require_available=True):
         if name == "aws-ec2-hibernate":
             if require_available:
-                raise AwsProbeTimeout("sts: timed out")   # the PROBE is what fails
-            return _SlowTier(name)                        # construction alone is fine
+                raise AwsProbeTimeout("sts: timed out")  # the PROBE is what fails
+            return _SlowTier(name)  # construction alone is fine
         return FakeRuntime(name)
 
     monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
-    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2-hibernate:16"}.get)
+    rt = build_cascade_runtime(
+        {"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2-hibernate:16"}.get
+    )
     assert [d.name for d in rt._deferred] == ["aws-ec2-hibernate"]
 
     assert rt.readiness_timeout_s == 600.0, (
@@ -777,7 +830,7 @@ def test_a_slow_admit_probe_does_not_become_eligible_again_immediately(monkeypat
         if name == "aws-ec2":
             if require_available:
                 probes.append(now[0])
-                now[0] += 240.0            # two cli calls at their full timeout
+                now[0] += 240.0  # two cli calls at their full timeout
                 raise AwsProbeTimeout("sts: timed out")
             return FakeRuntime(name)
         return FakeRuntime(name)
@@ -793,7 +846,7 @@ def test_a_slow_admit_probe_does_not_become_eligible_again_immediately(monkeypat
         rt._admit_deferred()
 
     assert len(probes) == 1, (
-        f"{len(probes)} probes across 5 back-to-back ticks ({sum(1 for _ in probes)*240:.0f}s of "
+        f"{len(probes)} probes across 5 back-to-back ticks ({sum(1 for _ in probes) * 240:.0f}s of "
         f"tick-thread blockage): a probe that outruns _admit_retry_s is eligible the moment it "
         f"returns, so the rate limit throttles nothing"
     )
@@ -822,7 +875,7 @@ def test_a_deferred_tier_with_a_foreign_transport_is_refused_at_admission(monkey
             if require_available and not state["up"]:
                 raise AwsProbeTimeout("sts: timed out")
             return _NetworkTier(name)
-        return FakeRuntime(name)          # dispatch_style defaults to "file"
+        return FakeRuntime(name)  # dispatch_style defaults to "file"
 
     monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
     # A tier whose DECLARED transport is readable is now refused at STARTUP, not 60s later: the
@@ -832,7 +885,8 @@ def test_a_deferred_tier_with_a_foreign_transport_is_refused_at_admission(monkey
     rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2:16"}.get)
     assert [d.name for d in rt._deferred] == ["aws-ec2"]
     assert rt._deferred[0].dispatch_style == "network", (
-        "the declared transport is a config fact and must be recorded without a probe")
+        "the declared transport is a config fact and must be recorded without a probe"
+    )
 
     # The invariant is a PROPERTY, and cli.py reads it at startup to choose the file vs network
     # dispatcher. Reading it must now refuse, rather than answering "file" and letting the process
@@ -841,7 +895,9 @@ def test_a_deferred_tier_with_a_foreign_transport_is_refused_at_admission(monkey
         _ = rt.dispatch_style
 
 
-def test_a_deferred_tier_of_UNKNOWN_transport_is_still_refused_at_admission(monkeypatch):
+def test_a_deferred_tier_of_UNKNOWN_transport_is_still_refused_at_admission(
+    monkeypatch,
+):
     """The late door still matters, for the case startup genuinely cannot see.
 
     _declared_budgets is best-effort: a tier whose config is broken enough that even a probe-FREE
@@ -861,24 +917,35 @@ def test_a_deferred_tier_of_UNKNOWN_transport_is_still_refused_at_admission(monk
             if require_available and not state["up"]:
                 raise AwsProbeTimeout("sts: timed out")
             if not require_available:
-                raise RuntimeError("config too broken to build probe-free")   # transport UNKNOWN
+                raise RuntimeError(
+                    "config too broken to build probe-free"
+                )  # transport UNKNOWN
             return _NetworkTier(name)
         return FakeRuntime(name)
 
     monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
     rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2:16"}.get)
     assert [d.name for d in rt._deferred] == ["aws-ec2"]
-    assert rt._deferred[0].dispatch_style is None, "unknown must not be recorded as 'file'"
-    assert rt.dispatch_style == "file", "an unknown transport must not change the cascade's style"
+    assert rt._deferred[0].dispatch_style is None, (
+        "unknown must not be recorded as 'file'"
+    )
+    assert rt.dispatch_style == "file", (
+        "an unknown transport must not change the cascade's style"
+    )
 
     state["up"] = True
     rt._last_admit_attempt = None
     rt._admit_deferred()
 
     assert [t.name for t in rt.tiers] == ["gvisor"], (
-        "a network tier was admitted into a file cascade the file Dispatcher is already driving")
-    assert rt.dispatch_style == "file", "the cascade's transport changed under a live dispatcher"
-    assert not rt._deferred, "an incompatible tier must be dropped, not re-probed forever"
+        "a network tier was admitted into a file cascade the file Dispatcher is already driving"
+    )
+    assert rt.dispatch_style == "file", (
+        "the cascade's transport changed under a live dispatcher"
+    )
+    assert not rt._deferred, (
+        "an incompatible tier must be dropped, not re-probed forever"
+    )
 
 
 def test_two_deferred_entries_of_the_same_backend_are_both_admitted(monkeypatch):
@@ -903,9 +970,15 @@ def test_two_deferred_entries_of_the_same_backend_are_both_admitted(monkeypatch)
         return FakeRuntime(name)
 
     monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
-    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2:4,aws-ec2:16"}.get)
-    assert [d.name for d in rt._deferred] == ["aws-ec2", "aws-ec2"], "both entries must defer"
-    assert sorted(d.pos for d in rt._deferred) == [1, 2], "each carries its declared position"
+    rt = build_cascade_runtime(
+        {"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2:4,aws-ec2:16"}.get
+    )
+    assert [d.name for d in rt._deferred] == ["aws-ec2", "aws-ec2"], (
+        "both entries must defer"
+    )
+    assert sorted(d.pos for d in rt._deferred) == [1, 2], (
+        "each carries its declared position"
+    )
 
     state["up"] = True
     rt._last_admit_attempt = None
@@ -916,10 +989,14 @@ def test_two_deferred_entries_of_the_same_backend_are_both_admitted(monkeypatch)
         f"only {caps} admitted -- the second declared aws-ec2 entry was discarded as a duplicate "
         f"name, silently losing the capacity the operator configured"
     )
-    assert not rt._deferred, "both entries were admitted, so nothing should remain deferred"
+    assert not rt._deferred, (
+        "both entries were admitted, so nothing should remain deferred"
+    )
 
 
-def test_a_slow_deferred_probe_does_not_delay_a_spawn_the_primary_can_serve(monkeypatch):
+def test_a_slow_deferred_probe_does_not_delay_a_spawn_the_primary_can_serve(
+    monkeypatch,
+):
     """_admit_deferred used to run FIRST, on every spawn.
 
     It is rate-limited, but the probe itself is a synchronous availability check that can burn full
@@ -938,20 +1015,22 @@ def test_a_slow_deferred_probe_does_not_delay_a_spawn_the_primary_can_serve(monk
         if name == "aws-ec2":
             if require_available:
                 probes.append(1)
-                raise AwsProbeTimeout("sts: timed out")     # a SLOW, unreachable overflow tier
+                raise AwsProbeTimeout(
+                    "sts: timed out"
+                )  # a SLOW, unreachable overflow tier
             return FakeRuntime(name)
         return FakeRuntime(name)
 
     monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
     rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2:16"}.get)
-    rt._admit_retry_s = 0.0                       # no rate limit hiding the behaviour
+    rt._admit_retry_s = 0.0  # no rate limit hiding the behaviour
     assert [d.name for d in rt._deferred] == ["aws-ec2"]
     probes.clear()
 
     import time
 
     t0 = time.monotonic()
-    for _ in range(4):                            # every one of these the PRIMARY can serve
+    for _ in range(4):  # every one of these the PRIMARY can serve
         rt.spawn()
     elapsed = time.monotonic() - t0
     _await_admission(rt)
@@ -982,6 +1061,7 @@ def _await_admission(rt, timeout: float = 5.0) -> None:
 def test_a_recovered_tier_is_admitted_on_a_later_spawn(monkeypatch):
     """The re-probe is the actual fix: without it the tier stays gone until the process restarts."""
     from blastbox.host import pool_config
+
     throttling = {"on": True}
 
     def fake_select(name, *, warm_snapshot=False, require_available=True):
@@ -996,13 +1076,13 @@ def test_a_recovered_tier_is_admitted_on_a_later_spawn(monkeypatch):
     rt._admit_retry_s = 0.0
     assert [t.name for t in rt.tiers] == ["gvisor"]
 
-    throttling["on"] = False          # STS recovers
+    throttling["on"] = False  # STS recovers
     # Fill the primary FIRST. Admission is now lazy: spawn() tries the admitted tiers before it
     # pays for a deferred availability probe, because that probe is a synchronous cloud call on the
     # pool's sole maintenance thread and a deferred OVERFLOW tier must never delay a spawn a
     # healthy PRIMARY can serve. So the recovered tier joins when it is actually needed -- at
     # exhaustion -- rather than on the next spawn regardless.
-    for _ in range(4):                # gvisor:4
+    for _ in range(4):  # gvisor:4
         rt.spawn()
     _await_admission(rt)
     # The probe is off-thread and rate-limited now, so it runs on every spawn rather than waiting
@@ -1014,7 +1094,9 @@ def test_a_recovered_tier_is_admitted_on_a_later_spawn(monkeypatch):
 
     # ...and it is immediately usable: the primary is full at 4, so this spawn lands on the tier
     # that just joined.
-    assert rt.spawn() is not None, "the recovered tier was admitted but cannot take a spawn"
+    assert rt.spawn() is not None, (
+        "the recovered tier was admitted but cannot take a spawn"
+    )
     assert rt._deferred == []
     # Per-tier bookkeeping must grow with the tier list, or the next spawn indexes off the end.
     assert len(rt._counts) == len(rt.tiers)
@@ -1024,6 +1106,7 @@ def test_a_recovered_tier_is_admitted_on_a_later_spawn(monkeypatch):
 def test_admission_is_rate_limited(monkeypatch):
     """The probe is an STS round trip and spawn() runs on the pool's tick thread (~10Hz)."""
     from blastbox.host import pool_config
+
     attempts = {"n": 0}
 
     def fake_select(name, *, warm_snapshot=False, require_available=True):
@@ -1111,6 +1194,7 @@ def test_an_auth_verdict_is_not_retried_forever(monkeypatch):
     rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2:16"}.get)
     assert rt._deferred == [], "an auth verdict must be dropped, not deferred"
 
+
 def test_the_cascade_names_the_tier_a_spawn_repair_would_target():
     """The pool's spawn streak is one pool-wide integer with no tier attribution, but the repair
     it triggers IS narrowed here. The pool therefore has to ask the cascade which tiers a spawn
@@ -1122,27 +1206,41 @@ def test_the_cascade_names_the_tier_a_spawn_repair_would_target():
     from blastbox.host.runtime.cascade import CascadingRuntime, Tier
 
     class _Poisoned:
-        def prepare(self): return True
-        def spawn(self): raise RuntimeError("snapshot restore failed: corrupt warm.mem")
+        def prepare(self):
+            return True
+
+        def spawn(self):
+            raise RuntimeError("snapshot restore failed: corrupt warm.mem")
 
     class _Healthy:
-        def __init__(self): self.n = 0
-        def prepare(self): return True
+        def __init__(self):
+            self.n = 0
+
+        def prepare(self):
+            return True
+
         def spawn(self):
             self.n += 1
             return SimpleNamespace(slot_id=f"ok{self.n}")
 
-    rt = CascadingRuntime(tiers=[Tier(name="fc", runtime=_Poisoned(), capacity=4),
-                                 Tier(name="gv", runtime=_Healthy(), capacity=4)])
+    rt = CascadingRuntime(
+        tiers=[
+            Tier(name="fc", runtime=_Poisoned(), capacity=4),
+            Tier(name="gv", runtime=_Healthy(), capacity=4),
+        ]
+    )
 
-    assert rt.spawn_guilty_identities() == [], "no evidence yet -> caller must fall back"
+    assert rt.spawn_guilty_identities() == [], (
+        "no evidence yet -> caller must fall back"
+    )
 
-    slot = rt.spawn()          # fc raises, gv absorbs it -- the pool sees a SUCCESS
+    slot = rt.spawn()  # fc raises, gv absorbs it -- the pool sees a SUCCESS
     assert slot.slot_id == "ok1"
 
     assert rt.spawn_guilty_identities() == ["fc#0"], (
         "the poisoned tier must stay named even though the spawn as a whole succeeded -- that is "
-        "the entire failure mode: the pool cannot see the tier that failed")
+        "the entire failure mode: the pool cannot see the tier that failed"
+    )
 
 
 def test_the_named_tier_is_positional_not_just_the_backend_name():
@@ -1154,19 +1252,30 @@ def test_the_named_tier_is_positional_not_just_the_backend_name():
     from blastbox.host.runtime.cascade import CascadingRuntime, Tier
 
     class _Poisoned:
-        def prepare(self): return True
-        def spawn(self): raise RuntimeError("corrupt warm.mem")
+        def prepare(self):
+            return True
+
+        def spawn(self):
+            raise RuntimeError("corrupt warm.mem")
 
     class _Healthy:
-        def prepare(self): return True
-        def spawn(self): return SimpleNamespace(slot_id="ok")
+        def prepare(self):
+            return True
 
-    rt = CascadingRuntime(tiers=[Tier(name="fc", runtime=_Poisoned(), capacity=4),
-                                 Tier(name="fc", runtime=_Healthy(), capacity=4)])
+        def spawn(self):
+            return SimpleNamespace(slot_id="ok")
+
+    rt = CascadingRuntime(
+        tiers=[
+            Tier(name="fc", runtime=_Poisoned(), capacity=4),
+            Tier(name="fc", runtime=_Healthy(), capacity=4),
+        ]
+    )
     rt.spawn()
     assert rt.spawn_guilty_identities() == ["fc#0"], (
         "identity must carry the tier POSITION; keyed on the name alone both sibling bases "
-        "collapse to one entry")
+        "collapse to one entry"
+    )
 
 
 def test_a_tier_whose_streak_a_repair_cleared_stays_named():
@@ -1181,20 +1290,28 @@ def test_a_tier_whose_streak_a_repair_cleared_stays_named():
     from blastbox.host.runtime.cascade import CascadingRuntime, Tier
 
     class _T:
-        def prepare(self): return True
-        def spawn(self): return SimpleNamespace(slot_id="s1")
+        def prepare(self):
+            return True
 
-    rt = CascadingRuntime(tiers=[Tier(name="fc", runtime=_T(), capacity=4),
-                                 Tier(name="gv", runtime=_T(), capacity=4)])
+        def spawn(self):
+            return SimpleNamespace(slot_id="s1")
+
+    rt = CascadingRuntime(
+        tiers=[
+            Tier(name="fc", runtime=_T(), capacity=4),
+            Tier(name="gv", runtime=_T(), capacity=4),
+        ]
+    )
     slot = rt.spawn()
     assert rt.blame_tier_for_slot(slot.slot_id) is True
     assert rt.spawn_guilty_identities() == ["fc#0"]
 
     with rt._lock:
-        rt._tier_failures[0] = 0      # a repair gave tier 0 a fresh window
+        rt._tier_failures[0] = 0  # a repair gave tier 0 a fresh window
 
     assert rt.spawn_guilty_identities() == ["fc#0"], (
-        "a tier whose streak was cleared by a REPAIR, not by a success, must stay attributable")
+        "a tier whose streak was cleared by a REPAIR, not by a success, must stay attributable"
+    )
 
 
 def test_a_spawn_repair_hits_only_the_tiers_it_was_handed():
@@ -1212,17 +1329,26 @@ def test_a_spawn_repair_hits_only_the_tiers_it_was_handed():
 
     def _mk(name):
         class _T:
-            def prepare(self): return True
-            def spawn(self): return SimpleNamespace(slot_id=f"{name}-1")
+            def prepare(self):
+                return True
+
+            def spawn(self):
+                return SimpleNamespace(slot_id=f"{name}-1")
+
             def invalidate_base(self, **kw):
                 dropped.append(name)
                 return True
+
         return _T()
 
-    rt = CascadingRuntime(tiers=[Tier(name="fc", runtime=_mk("fc"), capacity=4),
-                                 Tier(name="gv", runtime=_mk("gv"), capacity=4)])
+    rt = CascadingRuntime(
+        tiers=[
+            Tier(name="fc", runtime=_mk("fc"), capacity=4),
+            Tier(name="gv", runtime=_mk("gv"), capacity=4),
+        ]
+    )
     slot = rt.spawn()
-    rt.blame_tier_for_slot(slot.slot_id)          # tier 0 is guilty -> the decision's scope
+    rt.blame_tier_for_slot(slot.slot_id)  # tier 0 is guilty -> the decision's scope
     frozen = rt.spawn_guilty_identities()
     assert frozen == ["fc#0"]
 
@@ -1233,7 +1359,8 @@ def test_a_spawn_repair_hits_only_the_tiers_it_was_handed():
     rt.invalidate_base(reason="spawn", only=frozen)
     assert dropped == ["fc"], (
         f"the repair was handed one tier and hit {dropped}; a tier that became guilty after the "
-        f"decision must not be swept into it")
+        f"decision must not be swept into it"
+    )
 
 
 def test_a_single_named_target_still_works():
@@ -1246,15 +1373,24 @@ def test_a_single_named_target_still_works():
 
     def _mk(name):
         class _T:
-            def prepare(self): return True
-            def spawn(self): return SimpleNamespace(slot_id=f"{name}-1")
+            def prepare(self):
+                return True
+
+            def spawn(self):
+                return SimpleNamespace(slot_id=f"{name}-1")
+
             def invalidate_base(self, **kw):
                 dropped.append(name)
                 return True
+
         return _T()
 
-    rt = CascadingRuntime(tiers=[Tier(name="fc", runtime=_mk("fc"), capacity=4),
-                                 Tier(name="gv", runtime=_mk("gv"), capacity=4)])
+    rt = CascadingRuntime(
+        tiers=[
+            Tier(name="fc", runtime=_mk("fc"), capacity=4),
+            Tier(name="gv", runtime=_mk("gv"), capacity=4),
+        ]
+    )
     rt.invalidate_base(reason="job", only="gv#1")
     assert dropped == ["gv"]
 
@@ -1296,7 +1432,7 @@ def test_a_probe_that_outruns_its_own_window_still_excludes_a_second_one(monkeyp
     monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
     rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2:4"}.get)
     holder["rt"] = rt
-    rt._clock = lambda: now[0]        # type: ignore[method-assign]
+    rt._clock = lambda: now[0]  # type: ignore[method-assign]
     assert [d.name for d in rt._deferred] == ["aws-ec2"]
 
     state["up"] = True
@@ -1324,12 +1460,12 @@ def test_the_cascade_forwards_the_startup_orphan_sweep_to_its_tiers(monkeypatch)
     swept: list = []
 
     class _Sweeper(FakeRuntime):
-        def sweep_orphans(self, **kw):    # noqa: ANN001, ANN003
+        def sweep_orphans(self, **kw):  # noqa: ANN001, ANN003
             swept.append(self.name)
             return ["i-orphan"]
 
     class _Raiser(FakeRuntime):
-        def sweep_orphans(self, **kw):    # noqa: ANN001, ANN003
+        def sweep_orphans(self, **kw):  # noqa: ANN001, ANN003
             raise RuntimeError("describe-instances: throttled")
 
     def fake_select(name, *, warm_snapshot=False, require_available=True):  # noqa: ANN001
@@ -1337,14 +1473,18 @@ def test_the_cascade_forwards_the_startup_orphan_sweep_to_its_tiers(monkeypatch)
             return _Sweeper(name)
         if name == "aws-lambda":
             return _Raiser(name)
-        return FakeRuntime(name)          # gvisor has no sweep at all
+        return FakeRuntime(name)  # gvisor has no sweep at all
 
     monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
-    rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-lambda:2,aws-ec2:4"}.get)
+    rt = build_cascade_runtime(
+        {"BLASTBOX_POOL_TIERS": "gvisor:4,aws-lambda:2,aws-ec2:4"}.get
+    )
 
     killed = rt.sweep_orphans()
 
-    assert swept == ["aws-ec2"], f"the sweep did not reach the tier that provides one: {swept}"
+    assert swept == ["aws-ec2"], (
+        f"the sweep did not reach the tier that provides one: {swept}"
+    )
     assert killed == ["i-orphan"], "the cascade dropped what the tier reclaimed"
 
 
@@ -1360,7 +1500,7 @@ def test_a_tier_admitted_after_a_brownout_gets_its_orphan_sweep(monkeypatch):
     state = {"up": False}
 
     class _Sweeper(FakeRuntime):
-        def sweep_orphans(self, **kw):    # noqa: ANN001, ANN003
+        def sweep_orphans(self, **kw):  # noqa: ANN001, ANN003
             swept.append(self.name)
             return ["i-predecessor"]
 
@@ -1373,9 +1513,11 @@ def test_a_tier_admitted_after_a_brownout_gets_its_orphan_sweep(monkeypatch):
 
     monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
     rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4,aws-ec2:4"}.get)
-    assert [d.name for d in rt._deferred] == ["aws-ec2"], "the tier must start out deferred"
+    assert [d.name for d in rt._deferred] == ["aws-ec2"], (
+        "the tier must start out deferred"
+    )
 
-    rt.sweep_orphans()                    # the CLI's startup sweep: the tier does not exist yet
+    rt.sweep_orphans()  # the CLI's startup sweep: the tier does not exist yet
     assert swept == [], "a deferred tier cannot be swept before it is admitted"
 
     state["up"] = True
@@ -1398,7 +1540,7 @@ def test_a_failing_sweep_does_not_unwind_the_admission_that_earned_it(monkeypatc
     state = {"up": False}
 
     class _BadSweeper(FakeRuntime):
-        def sweep_orphans(self, **kw):    # noqa: ANN001, ANN003
+        def sweep_orphans(self, **kw):  # noqa: ANN001, ANN003
             raise RuntimeError("describe-instances: Throttling")
 
     def fake_select(name, *, warm_snapshot=False, require_available=True):  # noqa: ANN001
@@ -1413,12 +1555,18 @@ def test_a_failing_sweep_does_not_unwind_the_admission_that_earned_it(monkeypatc
     state["up"] = True
     rt._last_admit_attempt = None
 
-    assert rt._admit_deferred() == 1, "a failing sweep unwound an admission that had succeeded"
+    assert rt._admit_deferred() == 1, (
+        "a failing sweep unwound an admission that had succeeded"
+    )
     assert [t.name for t in rt.tiers] == ["gvisor", "aws-ec2"]
-    assert not rt._deferred, "the tier must not be left deferred after a successful admission"
+    assert not rt._deferred, (
+        "the tier must not be left deferred after a successful admission"
+    )
 
 
-def test_a_TypeError_from_inside_a_tier_reap_is_not_mistaken_for_an_old_signature(monkeypatch):
+def test_a_TypeError_from_inside_a_tier_reap_is_not_mistaken_for_an_old_signature(
+    monkeypatch,
+):
     """`except TypeError: reap(slot)` was meant to detect a tier whose reap predates the `dirty`
     kwarg. It cannot tell that apart from a TypeError raised by the BODY of a reap that accepted
     the kwarg and had ALREADY issued its terminate -- so the disposal ran a second time against the
@@ -1432,12 +1580,15 @@ def test_a_TypeError_from_inside_a_tier_reap_is_not_mistaken_for_an_old_signatur
     calls: list = []
 
     class _RaisesInside(FakeRuntime):
-        def reap(self, slot, dirty: bool = False):   # noqa: ANN001 -- accepts the kwarg
+        def reap(self, slot, dirty: bool = False):  # noqa: ANN001 -- accepts the kwarg
             calls.append(dirty)
-            raise TypeError("boto3: unhashable type raised from inside the terminate call")
+            raise TypeError(
+                "boto3: unhashable type raised from inside the terminate call"
+            )
 
-    monkeypatch.setattr(pool_config, "select_runtime_by_name",
-                        lambda name, **kw: _RaisesInside(name))
+    monkeypatch.setattr(
+        pool_config, "select_runtime_by_name", lambda name, **kw: _RaisesInside(name)
+    )
     rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:2"}.get)
     slot = rt.spawn()
 
@@ -1457,11 +1608,12 @@ def test_a_tier_whose_reap_predates_the_dirty_kwarg_is_still_supported(monkeypat
     seen: list = []
 
     class _OldSignature(FakeRuntime):
-        def reap(self, slot):    # noqa: ANN001 -- no `dirty`
+        def reap(self, slot):  # noqa: ANN001 -- no `dirty`
             seen.append(slot.slot_id)
 
-    monkeypatch.setattr(pool_config, "select_runtime_by_name",
-                        lambda name, **kw: _OldSignature(name))
+    monkeypatch.setattr(
+        pool_config, "select_runtime_by_name", lambda name, **kw: _OldSignature(name)
+    )
     rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:2"}.get)
     slot = rt.spawn()
     rt.reap(slot, dirty=True)
@@ -1484,19 +1636,19 @@ def test_admission_probes_do_not_run_on_the_callers_thread(monkeypatch):
         if name == "aws-ec2":
             if require_available and not state["up"]:
                 raise AwsProbeTimeout("sts: timed out")
-            time.sleep(1.5)               # a slow availability probe on a recovering control plane
+            time.sleep(1.5)  # a slow availability probe on a recovering control plane
             return FakeRuntime(name)
         return FakeRuntime(name)
 
     monkeypatch.setattr(pool_config, "select_runtime_by_name", fake_select)
     rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:1,aws-ec2:4"}.get)
     rt._admit_retry_s = 0.0
-    rt.spawn()                            # fill the primary (capacity 1)
+    rt.spawn()  # fill the primary (capacity 1)
     state["up"] = True
 
     t0 = time.monotonic()
     with pytest.raises(CascadeExhausted):
-        rt.spawn()                        # triggers admission
+        rt.spawn()  # triggers admission
     blocked = time.monotonic() - t0
 
     assert blocked < 0.5, (
@@ -1513,13 +1665,21 @@ def test_close_joins_an_admission_probe_and_refuses_to_start_new_ones(monkeypatc
     bug on this branch (seven instances)."""
     from blastbox.host import pool_config
 
-    monkeypatch.setattr(pool_config, "select_runtime_by_name",
-                        lambda name, **kw: FakeRuntime(name))
+    monkeypatch.setattr(
+        pool_config, "select_runtime_by_name", lambda name, **kw: FakeRuntime(name)
+    )
     rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
     from blastbox.host.runtime.cascade import DeferredTier
 
-    rt._deferred = [DeferredTier(name="aws-ec2", capacity=4, reason="undecided",
-                                 build=lambda: FakeRuntime("aws-ec2"), pos=1)]
+    rt._deferred = [
+        DeferredTier(
+            name="aws-ec2",
+            capacity=4,
+            reason="undecided",
+            build=lambda: FakeRuntime("aws-ec2"),
+            pos=1,
+        )
+    ]
     rt._admit_retry_s = 0.0
 
     rt.close()
@@ -1535,12 +1695,20 @@ def test_reopen_lets_a_restarted_pool_admit_deferred_tiers_again(monkeypatch):
     from blastbox.host import pool_config
     from blastbox.host.runtime.cascade import DeferredTier
 
-    monkeypatch.setattr(pool_config, "select_runtime_by_name",
-                        lambda name, **kw: FakeRuntime(name))
+    monkeypatch.setattr(
+        pool_config, "select_runtime_by_name", lambda name, **kw: FakeRuntime(name)
+    )
     rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
     rt._admit_retry_s = 0.0
-    rt._deferred = [DeferredTier(name="aws-ec2", capacity=4, reason="undecided",
-                                 build=lambda: FakeRuntime("aws-ec2"), pos=1)]
+    rt._deferred = [
+        DeferredTier(
+            name="aws-ec2",
+            capacity=4,
+            reason="undecided",
+            build=lambda: FakeRuntime("aws-ec2"),
+            pos=1,
+        )
+    ]
 
     rt.close()
     rt._admit_deferred_async()
@@ -1565,25 +1733,35 @@ def test_a_thread_that_cannot_start_does_not_lock_admission_out_forever(monkeypa
     from blastbox.host import pool_config
     from blastbox.host.runtime.cascade import DeferredTier
 
-    monkeypatch.setattr(pool_config, "select_runtime_by_name",
-                        lambda name, **kw: FakeRuntime(name))
+    monkeypatch.setattr(
+        pool_config, "select_runtime_by_name", lambda name, **kw: FakeRuntime(name)
+    )
     rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
     rt._admit_retry_s = 0.0
-    rt._deferred = [DeferredTier(name="aws-ec2", capacity=4, reason="undecided",
-                                 build=lambda: FakeRuntime("aws-ec2"), pos=1)]
+    rt._deferred = [
+        DeferredTier(
+            name="aws-ec2",
+            capacity=4,
+            reason="undecided",
+            build=lambda: FakeRuntime("aws-ec2"),
+            pos=1,
+        )
+    ]
 
     real_start = threading.Thread.start
 
-    def _no_threads(self):    # noqa: ANN001
+    def _no_threads(self):  # noqa: ANN001
         raise RuntimeError("can't start new thread")
 
     monkeypatch.setattr(threading.Thread, "start", _no_threads)
     rt._admit_deferred_async()
-    assert rt._admit_inflight is False, "the in-flight flag was left set by a failed start"
+    assert rt._admit_inflight is False, (
+        "the in-flight flag was left set by a failed start"
+    )
     assert rt._admit_thread is None
 
     monkeypatch.setattr(threading.Thread, "start", real_start)
-    rt._admit_deferred_async()                 # host recovered -- admission must be possible again
+    rt._admit_deferred_async()  # host recovered -- admission must be possible again
     _await_admission(rt)
     assert [t.name for t in rt.tiers] == ["gvisor", "aws-ec2"]
 
@@ -1598,23 +1776,33 @@ def test_a_probe_that_finishes_after_close_does_not_publish_its_tier(monkeypatch
     swept: list = []
 
     class _Sweeper(FakeRuntime):
-        def sweep_orphans(self, **kw):    # noqa: ANN001, ANN003
+        def sweep_orphans(self, **kw):  # noqa: ANN001, ANN003
             swept.append(self.name)
             return []
 
-    monkeypatch.setattr(pool_config, "select_runtime_by_name",
-                        lambda name, **kw: FakeRuntime(name))
+    monkeypatch.setattr(
+        pool_config, "select_runtime_by_name", lambda name, **kw: FakeRuntime(name)
+    )
     rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
 
     def _build_after_close():
-        rt.close()                        # shutdown lands while we are still building
+        rt.close()  # shutdown lands while we are still building
         return _Sweeper("aws-ec2")
 
-    rt._deferred = [DeferredTier(name="aws-ec2", capacity=4, reason="undecided",
-                                 build=_build_after_close, pos=1)]
+    rt._deferred = [
+        DeferredTier(
+            name="aws-ec2",
+            capacity=4,
+            reason="undecided",
+            build=_build_after_close,
+            pos=1,
+        )
+    ]
     rt._admit_probe(list(rt._deferred))
 
-    assert [t.name for t in rt.tiers] == ["gvisor"], "a tier was published into a closed cascade"
+    assert [t.name for t in rt.tiers] == ["gvisor"], (
+        "a tier was published into a closed cascade"
+    )
     assert swept == [], "the orphan sweep ran during teardown"
 
 
@@ -1628,8 +1816,9 @@ def test_a_tier_discarded_during_shutdown_stays_deferred(monkeypatch):
 
     built: list = []
 
-    monkeypatch.setattr(pool_config, "select_runtime_by_name",
-                        lambda name, **kw: FakeRuntime(name))
+    monkeypatch.setattr(
+        pool_config, "select_runtime_by_name", lambda name, **kw: FakeRuntime(name)
+    )
     rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
 
     def _build_after_close():
@@ -1641,8 +1830,14 @@ def test_a_tier_discarded_during_shutdown_stays_deferred(monkeypatch):
         built.append("b")
         return FakeRuntime("aws-lambda")
 
-    pending = [DeferredTier(name="aws-ec2", capacity=4, reason="x", build=_build_after_close, pos=1),
-               DeferredTier(name="aws-lambda", capacity=2, reason="x", build=_second_build, pos=2)]
+    pending = [
+        DeferredTier(
+            name="aws-ec2", capacity=4, reason="x", build=_build_after_close, pos=1
+        ),
+        DeferredTier(
+            name="aws-lambda", capacity=2, reason="x", build=_second_build, pos=2
+        ),
+    ]
     rt._deferred = list(pending)
     rt._admit_probe(pending)
 
@@ -1655,7 +1850,9 @@ def test_a_tier_discarded_during_shutdown_stays_deferred(monkeypatch):
     )
 
 
-def test_the_post_admission_sweep_is_skipped_when_shutdown_lands_mid_publish(monkeypatch):
+def test_the_post_admission_sweep_is_skipped_when_shutdown_lands_mid_publish(
+    monkeypatch,
+):
     """The closing check happens under the lock BEFORE the append; the sweep runs after it and
     outside the lock. Shutdown landing in that window still let a probe issue describe/terminate
     calls after stop() had exhausted its deadline and proceeded. A latch has to be read at the
@@ -1666,27 +1863,35 @@ def test_the_post_admission_sweep_is_skipped_when_shutdown_lands_mid_publish(mon
     swept: list = []
 
     class _Sweeper(FakeRuntime):
-        def sweep_orphans(self, **kw):    # noqa: ANN001, ANN003
+        def sweep_orphans(self, **kw):  # noqa: ANN001, ANN003
             swept.append(self.name)
             return []
 
-    monkeypatch.setattr(pool_config, "select_runtime_by_name",
-                        lambda name, **kw: FakeRuntime(name))
+    monkeypatch.setattr(
+        pool_config, "select_runtime_by_name", lambda name, **kw: FakeRuntime(name)
+    )
     rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
 
     class _ClosesOnAppend(list):
         """Shutdown lands in the window BETWEEN the publish and the out-of-lock sweep."""
 
-        def append(self, item):    # noqa: ANN001, ANN201
+        def append(self, item):  # noqa: ANN001, ANN201
             super().append(item)
             # Set the latch the way close() does, but WITHOUT re-entering _lock: this runs
             # while _admit_probe still HOLDS it and the lock is not reentrant, so calling
             # close() here deadlocks. In production close() lands from another thread.
             rt._admit_closing = True
 
-    rt.tiers = _ClosesOnAppend(rt.tiers)    # type: ignore[assignment]
-    rt._deferred = [DeferredTier(name="aws-ec2", capacity=4, reason="x",
-                                 build=lambda: _Sweeper("aws-ec2"), pos=1)]
+    rt.tiers = _ClosesOnAppend(rt.tiers)  # type: ignore[assignment]
+    rt._deferred = [
+        DeferredTier(
+            name="aws-ec2",
+            capacity=4,
+            reason="x",
+            build=lambda: _Sweeper("aws-ec2"),
+            pos=1,
+        )
+    ]
     rt._admit_probe(list(rt._deferred))
 
     assert swept == [], "the orphan sweep ran after shutdown had already been latched"
@@ -1704,31 +1909,41 @@ def test_a_sweep_skipped_at_shutdown_is_owed_and_run_after_reopen(monkeypatch):
     swept: list = []
 
     class _Sweeper(FakeRuntime):
-        def sweep_orphans(self, **kw):    # noqa: ANN001, ANN003
+        def sweep_orphans(self, **kw):  # noqa: ANN001, ANN003
             swept.append(self.name)
             return []
 
-    monkeypatch.setattr(pool_config, "select_runtime_by_name",
-                        lambda name, **kw: FakeRuntime(name))
+    monkeypatch.setattr(
+        pool_config, "select_runtime_by_name", lambda name, **kw: FakeRuntime(name)
+    )
     rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
     rt._admit_retry_s = 0.0
 
     class _ClosesOnAppend(list):
-        def append(self, item):    # noqa: ANN001, ANN201
+        def append(self, item):  # noqa: ANN001, ANN201
             super().append(item)
-            rt._admit_closing = True      # shutdown lands between publish and sweep
+            rt._admit_closing = True  # shutdown lands between publish and sweep
 
-    rt.tiers = _ClosesOnAppend(rt.tiers)    # type: ignore[assignment]
-    rt._deferred = [DeferredTier(name="aws-ec2", capacity=4, reason="x",
-                                 build=lambda: _Sweeper("aws-ec2"), pos=1)]
+    rt.tiers = _ClosesOnAppend(rt.tiers)  # type: ignore[assignment]
+    rt._deferred = [
+        DeferredTier(
+            name="aws-ec2",
+            capacity=4,
+            reason="x",
+            build=lambda: _Sweeper("aws-ec2"),
+            pos=1,
+        )
+    ]
     rt._admit_probe(list(rt._deferred))
 
     assert swept == [], "the sweep ran during teardown"
-    assert rt._sweep_owed, "the skipped sweep was forgotten rather than recorded as owed"
+    assert rt._sweep_owed, (
+        "the skipped sweep was forgotten rather than recorded as owed"
+    )
 
     rt.reopen()
     rt.poll()
-    _await_admission(rt)          # the sweep runs on the background worker, not the tick thread
+    _await_admission(rt)  # the sweep runs on the background worker, not the tick thread
     assert swept == ["aws-ec2"], (
         "the owed sweep never ran after restart, so a predecessor's parked instances keep "
         "accruing cost with the setting apparently enabled"
@@ -1753,7 +1968,7 @@ def test_poll_probes_without_any_spawn(monkeypatch):
     rt._admit_retry_s = 0.0
     state["up"] = True
 
-    rt.poll()                      # no spawn() anywhere -- the pool is idle and healthy
+    rt.poll()  # no spawn() anywhere -- the pool is idle and healthy
     _await_admission(rt)
     assert [t.name for t in rt.tiers] == ["gvisor", "aws-ec2"]
 
@@ -1769,18 +1984,26 @@ def test_a_failed_post_admission_sweep_stays_owed(monkeypatch):
     attempts: list = []
 
     class _FailsThenWorks(FakeRuntime):
-        def sweep_orphans(self, **kw):    # noqa: ANN001, ANN003
+        def sweep_orphans(self, **kw):  # noqa: ANN001, ANN003
             attempts.append(1)
             if len(attempts) == 1:
                 raise RuntimeError("describe-instances: empty response (rc=0)")
             return ["i-predecessor"]
 
-    monkeypatch.setattr(pool_config, "select_runtime_by_name",
-                        lambda name, **kw: FakeRuntime(name))
+    monkeypatch.setattr(
+        pool_config, "select_runtime_by_name", lambda name, **kw: FakeRuntime(name)
+    )
     rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
     rt._admit_retry_s = 0.0
-    rt._deferred = [DeferredTier(name="aws-ec2", capacity=4, reason="x",
-                                 build=lambda: _FailsThenWorks("aws-ec2"), pos=1)]
+    rt._deferred = [
+        DeferredTier(
+            name="aws-ec2",
+            capacity=4,
+            reason="x",
+            build=lambda: _FailsThenWorks("aws-ec2"),
+            pos=1,
+        )
+    ]
     rt._admit_probe(list(rt._deferred))
 
     assert attempts == [1], "the sweep should have been attempted once"
@@ -1795,12 +2018,13 @@ def test_a_failed_retry_is_still_owed(monkeypatch):
     """The ledger must not be a one-shot either -- that is the problem it exists to solve."""
     from blastbox.host import pool_config
 
-    monkeypatch.setattr(pool_config, "select_runtime_by_name",
-                        lambda name, **kw: FakeRuntime(name))
+    monkeypatch.setattr(
+        pool_config, "select_runtime_by_name", lambda name, **kw: FakeRuntime(name)
+    )
     rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
 
     class _AlwaysFails(FakeRuntime):
-        def sweep_orphans(self, **kw):    # noqa: ANN001, ANN003
+        def sweep_orphans(self, **kw):  # noqa: ANN001, ANN003
             raise RuntimeError("still throttled")
 
     rt._sweep_owed = [_AlwaysFails("aws-ec2")]
@@ -1818,20 +2042,28 @@ def test_no_build_starts_once_shutdown_is_latched(monkeypatch):
 
     builds: list = []
 
-    monkeypatch.setattr(pool_config, "select_runtime_by_name",
-                        lambda name, **kw: FakeRuntime(name))
+    monkeypatch.setattr(
+        pool_config, "select_runtime_by_name", lambda name, **kw: FakeRuntime(name)
+    )
     rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
 
     def _mk(name):
         def _build():
             builds.append(name)
             return FakeRuntime(name)
+
         return _build
 
-    pending = [DeferredTier(name="aws-ec2", capacity=4, reason="x", build=_mk("aws-ec2"), pos=1),
-               DeferredTier(name="aws-lambda", capacity=2, reason="x", build=_mk("aws-lambda"), pos=2)]
+    pending = [
+        DeferredTier(
+            name="aws-ec2", capacity=4, reason="x", build=_mk("aws-ec2"), pos=1
+        ),
+        DeferredTier(
+            name="aws-lambda", capacity=2, reason="x", build=_mk("aws-lambda"), pos=2
+        ),
+    ]
     rt._deferred = list(pending)
-    rt.close()                       # shutdown latched BEFORE the probe starts
+    rt.close()  # shutdown latched BEFORE the probe starts
     rt._admit_probe(pending)
 
     assert builds == [], f"builds ran during teardown: {builds}"
@@ -1866,8 +2098,10 @@ def test_a_close_landing_mid_drain_leaves_the_unswept_runtimes_still_owed(monkey
                 self._on_sweep()
 
     from blastbox.host import pool_config
-    monkeypatch.setattr(pool_config, "select_runtime_by_name",
-                        lambda name, **kw: FakeRuntime(name))
+
+    monkeypatch.setattr(
+        pool_config, "select_runtime_by_name", lambda name, **kw: FakeRuntime(name)
+    )
     rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
 
     def _close_lands_now() -> None:
@@ -1883,11 +2117,13 @@ def test_a_close_landing_mid_drain_leaves_the_unswept_runtimes_still_owed(monkey
 
     assert swept == ["first"], (
         f"swept={swept}; the drain kept sweeping after close() latched -- each of these is an "
-        f"uncached describe plus serial terminates issued against a shutting-down runtime")
+        f"uncached describe plus serial terminates issued against a shutting-down runtime"
+    )
     assert [s.name for s in rt._sweep_owed] == ["second"], (
         f"still owed={[getattr(s, 'name', s) for s in rt._sweep_owed]}; the un-run sweep was "
         f"dropped by the drain that emptied the ledger, so reopen() will never settle it and the "
-        f"orphaned instances it would have found keep billing")
+        f"orphaned instances it would have found keep billing"
+    )
 
 
 def test_a_failed_admission_thread_start_does_not_burn_the_retry_window(monkeypatch):
@@ -1906,11 +2142,14 @@ def test_a_failed_admission_thread_start_does_not_burn_the_retry_window(monkeypa
     from blastbox.host import pool_config
     from blastbox.host.runtime import cascade as _cascade_mod
 
-    monkeypatch.setattr(pool_config, "select_runtime_by_name",
-                        lambda name, **kw: FakeRuntime(name))
+    monkeypatch.setattr(
+        pool_config, "select_runtime_by_name", lambda name, **kw: FakeRuntime(name)
+    )
     rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
     with rt._lock:
-        rt._sweep_owed = [FakeRuntime("aws-ec2")]     # something to do, so the gate is reached
+        rt._sweep_owed = [
+            FakeRuntime("aws-ec2")
+        ]  # something to do, so the gate is reached
         rt._last_admit_attempt = None
 
     class _UnstartableThread:
@@ -1927,15 +2166,20 @@ def test_a_failed_admission_thread_start_does_not_burn_the_retry_window(monkeypa
             return False
 
     monkeypatch.setattr(_cascade_mod.threading, "Thread", _UnstartableThread)
-    rt._admit_deferred_async()                        # must not raise
+    rt._admit_deferred_async()  # must not raise
 
     assert rt._last_admit_attempt is None, (
         f"_last_admit_attempt={rt._last_admit_attempt!r} after a probe that never started; the "
-        f"time gate now refuses every retry for a full _admit_retry_s window that no probe used")
-    assert rt._admit_inflight is False, "sanity: the in-flight flag is still rolled back"
+        f"time gate now refuses every retry for a full _admit_retry_s window that no probe used"
+    )
+    assert rt._admit_inflight is False, (
+        "sanity: the in-flight flag is still rolled back"
+    )
 
 
-def test_the_terminal_warming_hook_reaches_the_owning_tier_through_the_cascade(monkeypatch):
+def test_the_terminal_warming_hook_reaches_the_owning_tier_through_the_cascade(
+    monkeypatch,
+):
     """The hook was added to the runtime and not to the wrapper the pool actually holds.
 
     In every documented deployment the pool holds the CASCADE, not the tier -- the `maintain_idle`
@@ -1962,7 +2206,7 @@ def test_the_terminal_warming_hook_reaches_the_owning_tier_through_the_cascade(m
 
     class _Truthy(FakeRuntime):
         def is_warming_terminal(self, slot):  # noqa: ANN001, ANN201
-            return "hibernating"              # truthy, but not a verdict
+            return "hibernating"  # truthy, but not a verdict
 
     made: dict = {}
 
@@ -1972,18 +2216,23 @@ def test_the_terminal_warming_hook_reaches_the_owning_tier_through_the_cascade(m
 
     monkeypatch.setattr(pool_config, "select_runtime_by_name", _fake_select)
 
-    for label, cls, expected in (("terminal", _Terminal, True),
-                                 ("raising", _Exploding, False),
-                                 ("truthy-not-True", _Truthy, False),
-                                 ("no-such-hook", FakeRuntime, False)):
+    for label, cls, expected in (
+        ("terminal", _Terminal, True),
+        ("raising", _Exploding, False),
+        ("truthy-not-True", _Truthy, False),
+        ("no-such-hook", FakeRuntime, False),
+    ):
         made["gvisor"] = cls("gvisor")
         rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
         assert hasattr(rt, "is_warming_terminal"), (
             "CascadingRuntime has no is_warming_terminal, so the pool's getattr never reaches the "
-            "owning tier -- the hook is inert in every documented deployment")
+            "owning tier -- the hook is inert in every documented deployment"
+        )
         slot = rt.spawn()
         got = rt.is_warming_terminal(slot)
-        assert got is expected, f"{label}: cascade returned {got!r}, expected {expected!r}"
+        assert got is expected, (
+            f"{label}: cascade returned {got!r}, expected {expected!r}"
+        )
 
     # ...and a slot this cascade does not own is never terminal.
     rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
@@ -2003,8 +2252,9 @@ def test_begin_close_stops_new_admission_work_without_joining(monkeypatch):
     """
     from blastbox.host import pool_config
 
-    monkeypatch.setattr(pool_config, "select_runtime_by_name",
-                        lambda name, **kw: FakeRuntime(name))
+    monkeypatch.setattr(
+        pool_config, "select_runtime_by_name", lambda name, **kw: FakeRuntime(name)
+    )
     rt = build_cascade_runtime({"BLASTBOX_POOL_TIERS": "gvisor:4"}.get)
 
     swept: list[str] = []
@@ -2025,16 +2275,20 @@ def test_begin_close_stops_new_admission_work_without_joining(monkeypatch):
     with rt._lock:
         assert rt._admit_closing is True, (
             "begin_close() did not latch, so the admission worker keeps starting control-plane "
-            "work for the whole of stop()'s join budget")
+            "work for the whole of stop()'s join budget"
+        )
 
     # ...and the latch must actually suppress work, not merely be recorded.
     rt._admit_deferred_async()
     rt._run_owed_sweeps()
     assert swept == [], (
         f"work ran after begin_close() latched ({swept}); the owed sweep is a describe plus serial "
-        f"terminates, issued against a runtime that is shutting down")
+        f"terminates, issued against a runtime that is shutting down"
+    )
 
     # reopen() clears it, so a start() after a stop() is not permanently wedged.
     rt.reopen()
     with rt._lock:
-        assert rt._admit_closing is False, "reopen() must clear the latch begin_close() set"
+        assert rt._admit_closing is False, (
+            "reopen() must clear the latch begin_close() set"
+        )

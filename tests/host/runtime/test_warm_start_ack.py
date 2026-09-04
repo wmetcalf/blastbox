@@ -11,6 +11,7 @@ upgraded separately here, and the FC vsock protocol has deliberately stayed byte
 releases. The ack is therefore opt-in from the host (`"ack": true` in the job header) and sent
 only on request.
 """
+
 from blastbox.worker.warm import AckCapability
 import json
 import socket
@@ -29,7 +30,6 @@ def _capable():
     c = AckCapability()
     c.learn()
     return c
-
 
 
 def _read_frame(sock):
@@ -52,15 +52,17 @@ def _send_frame(sock, payload: bytes):
 
 
 def _control(host_sock, *, ack_capable=None):
-    return VsockHostWarmControl(Path("/unused"), connect_fn=lambda: host_sock,
-                                ack_capable=ack_capable)
+    return VsockHostWarmControl(
+        Path("/unused"), connect_fn=lambda: host_sock, ack_capable=ack_capable
+    )
 
 
 def _guest(guest_sock, *, behaviour):
     """A guest that reads the header, then behaves as told."""
+
     def run():
         header = json.loads(_read_frame(guest_sock).decode())
-        _read_frame(guest_sock)                             # the input body
+        _read_frame(guest_sock)  # the input body
         if behaviour == "acks_then_done":
             if header.get("ack"):
                 _send_frame(guest_sock, WARM_ACK.encode())
@@ -70,9 +72,10 @@ def _guest(guest_sock, *, behaviour):
                 _send_frame(guest_sock, WARM_ACK.encode())
             # ...and never sends a status: hung ON the document
         elif behaviour == "old_worker":
-            _send_frame(guest_sock, "ok".encode())          # ignores `ack` entirely
+            _send_frame(guest_sock, "ok".encode())  # ignores `ack` entirely
         elif behaviour == "wedged":
-            pass                                            # never woke up
+            pass  # never woke up
+
     t = threading.Thread(target=run, daemon=True)
     t.start()
     return t
@@ -83,6 +86,7 @@ def _run(behaviour, *, ack_capable=None):
     ctl = _control(host_sock, ack_capable=ack_capable)
     _guest(guest_sock, behaviour=behaviour)
     from blastbox.worker.warm import WarmJobSpec
+
     tmp = Path("/tmp/blastbox-ack-test-input")
     tmp.write_bytes(b"x")
     ctl.signal_go(WarmJobSpec(input_path=tmp, output_dir=Path("/tmp"), params={}))
@@ -102,15 +106,19 @@ def test_a_guest_that_starts_and_finishes_reports_started():
 def test_a_guest_that_starts_and_then_HANGS_is_not_blamed_on_the_base():
     """The exact case the inference got wrong. It ran; the document is the suspect, not the base."""
     ctl, status = _run("acks_then_hangs")
-    assert status is None                      # timed out
-    assert ctl.guest_started is True, "it acked before hanging — the base produced a usable worker"
+    assert status is None  # timed out
+    assert ctl.guest_started is True, (
+        "it acked before hanging — the base produced a usable worker"
+    )
 
 
 def test_a_wedged_guest_reports_not_started_once_the_image_is_known_to_ack():
-    seen = _capable()                             # this image has acked before
+    seen = _capable()  # this image has acked before
     ctl, status = _run("wedged", ack_capable=seen)
     assert status is None
-    assert ctl.guest_started is False, "no ack from an ack-capable image means it never ran"
+    assert ctl.guest_started is False, (
+        "no ack from an ack-capable image means it never ran"
+    )
 
 
 def test_an_older_worker_stays_UNKNOWN_rather_than_being_blamed():
@@ -123,7 +131,7 @@ def test_an_older_worker_stays_UNKNOWN_rather_than_being_blamed():
 
 def test_a_wedged_guest_on_an_UNPROVEN_image_stays_unknown():
     """Before any ack has ever been seen, a missing one means nothing."""
-    ctl, status = _run("wedged")               # no ack_capable memory
+    ctl, status = _run("wedged")  # no ack_capable memory
     assert status is None
     assert ctl.guest_started is None
 
@@ -132,6 +140,7 @@ def test_the_header_asks_for_the_ack():
     host_sock, guest_sock = socket.socketpair()
     ctl = _control(host_sock)
     from blastbox.worker.warm import WarmJobSpec
+
     tmp = Path("/tmp/blastbox-ack-test-input2")
     tmp.write_bytes(b"x")
     ctl.signal_go(WarmJobSpec(input_path=tmp, output_dir=Path("/tmp"), params={}))
@@ -139,14 +148,21 @@ def test_the_header_asks_for_the_ack():
     assert header.get("ack") is True
 
 
-@pytest.mark.parametrize("behaviour,expect", [
-    ("acks_then_done", True), ("acks_then_hangs", True), ("old_worker", None),
-])
+@pytest.mark.parametrize(
+    "behaviour,expect",
+    [
+        ("acks_then_done", True),
+        ("acks_then_hangs", True),
+        ("old_worker", None),
+    ],
+)
 def test_capability_memory_is_learned_from_any_slot(behaviour, expect):
     seen = AckCapability()
     ctl, _ = _run(behaviour, ack_capable=seen)
     assert ctl.guest_started is expect
-    assert bool(seen) is (expect is True), "an ack must teach the runtime the image is capable"
+    assert bool(seen) is (expect is True), (
+        "an ack must teach the runtime the image is capable"
+    )
 
 
 def test_the_snapshot_runtime_shares_ack_capability_across_slots(tmp_path):
@@ -157,16 +173,18 @@ def test_the_snapshot_runtime_shares_ack_capability_across_slots(tmp_path):
     """
     from blastbox.host.runtime.fc_snapshot_runtime import SnapshotSlotRuntime
 
-    rt = object.__new__(SnapshotSlotRuntime)          # no VM setup needed for this seam
+    rt = object.__new__(SnapshotSlotRuntime)  # no VM setup needed for this seam
     rt._ack_capable = AckCapability()
     slot_a = type("S", (), {"output_dir": tmp_path / "a" / "out"})()
     slot_b = type("S", (), {"output_dir": tmp_path / "b" / "out"})()
 
     ctl_a = SnapshotSlotRuntime.host_warm_control(rt, slot_a)
     ctl_b = SnapshotSlotRuntime.host_warm_control(rt, slot_b)
-    assert ctl_a._ack_capable is ctl_b._ack_capable, "capability must be shared, not per-control"
+    assert ctl_a._ack_capable is ctl_b._ack_capable, (
+        "capability must be shared, not per-control"
+    )
 
-    ctl_a._ack_capable.learn()                     # slot A acks once
+    ctl_a._ack_capable.learn()  # slot A acks once
     assert ctl_b._ack_capable, "slot B must inherit what slot A proved about the image"
 
 
@@ -178,16 +196,17 @@ def test_an_input_the_guest_refuses_is_not_blamed_on_the_base(tmp_path):
     from blastbox.worker.warm import WarmJobSpec
 
     host_sock, guest_sock = socket.socketpair()
-    seen = _capable()                                  # this image HAS acked before
+    seen = _capable()  # this image HAS acked before
     ctl = _control(host_sock, ack_capable=seen)
-    guest_sock.close()                              # the guest refuses/closes mid-transfer
+    guest_sock.close()  # the guest refuses/closes mid-transfer
 
     big = Path("/tmp/blastbox-ack-test-big")
     big.write_bytes(b"x" * (1 << 20))
     with pytest.raises(Exception):
         ctl.signal_go(WarmJobSpec(input_path=big, output_dir=Path("/tmp"), params={}))
     assert ctl.guest_started is None, (
-        "a transfer that never landed says nothing about whether the guest can execute")
+        "a transfer that never landed says nothing about whether the guest can execute"
+    )
 
 
 def test_a_transfer_that_eats_the_deadline_is_not_blamed_on_the_base(tmp_path):
@@ -197,7 +216,7 @@ def test_a_transfer_that_eats_the_deadline_is_not_blamed_on_the_base(tmp_path):
     from blastbox.worker.warm import WarmJobSpec
 
     host_sock, guest_sock = socket.socketpair()
-    seen = _capable()                                  # image is known to ack
+    seen = _capable()  # image is known to ack
     ctl = _control(host_sock, ack_capable=seen)
     big = Path("/tmp/blastbox-ack-deadline-input")
     big.write_bytes(b"x" * 4096)
@@ -205,7 +224,8 @@ def test_a_transfer_that_eats_the_deadline_is_not_blamed_on_the_base(tmp_path):
     # transfer succeeds; the caller then gives up before waiting (remaining <= 0)
     ctl.signal_go(WarmJobSpec(input_path=big, output_dir=Path("/tmp"), params={}))
     assert ctl.guest_started is None, (
-        "the host never listened for the ack, so it cannot claim the guest never started")
+        "the host never listened for the ack, so it cannot claim the guest never started"
+    )
 
 
 def test_the_state_is_claimed_only_once_the_host_listens(tmp_path):
@@ -223,9 +243,13 @@ def test_the_ready_token_advertises_ack_capability_and_stays_old_host_safe():
     from blastbox.worker.fc_guest import READY_ACK_SUFFIX, READY_TOKEN
 
     advertised = READY_TOKEN + READY_ACK_SUFFIX
-    assert _READY_TOKEN in advertised, "an older host must still recognise this as READY"
+    assert _READY_TOKEN in advertised, (
+        "an older host must still recognise this as READY"
+    )
     assert READY_ACK_SUFFIX in advertised
-    assert _READY_TOKEN not in READY_ACK_SUFFIX, "the suffix must not itself look like READY"
+    assert _READY_TOKEN not in READY_ACK_SUFFIX, (
+        "the suffix must not itself look like READY"
+    )
 
 
 def test_snapshot_mode_learns_capability_from_the_BASE_build():
@@ -238,10 +262,14 @@ def test_snapshot_mode_learns_capability_from_the_BASE_build():
 
     from blastbox.host.runtime import fc_snapshot_runtime as m
 
-    src = inspect.getsource(m.select_fc_snapshot_runtime) \
-        if hasattr(m, "select_fc_snapshot_runtime") else inspect.getsource(m)
+    src = (
+        inspect.getsource(m.select_fc_snapshot_runtime)
+        if hasattr(m, "select_fc_snapshot_runtime")
+        else inspect.getsource(m)
+    )
     assert "ack_capable=ack_capable" in src, (
-        "the base-build listener and the restore runtime must share one capability set")
+        "the base-build listener and the restore runtime must share one capability set"
+    )
 
     # the factory really does forward it
     sig = inspect.signature(m._vsock_ready_check_factory)
@@ -252,13 +280,14 @@ def test_the_snapshot_runtime_accepts_a_shared_capability_set():
     import inspect
 
     from blastbox.host.runtime.fc_snapshot_runtime import SnapshotSlotRuntime
+
     assert "ack_capable" in inspect.signature(SnapshotSlotRuntime.__init__).parameters
     rt = object.__new__(SnapshotSlotRuntime)
     shared = AckCapability()
     rt._ack_capable = shared
     a = type("S", (), {"output_dir": Path("/tmp/a/out")})()
     ctl = SnapshotSlotRuntime.host_warm_control(rt, a)
-    shared.learn()                      # learned at base build...
+    shared.learn()  # learned at base build...
     assert ctl._ack_capable, "...and visible to a control handed out before that"
 
 
@@ -285,14 +314,16 @@ def test_a_split_readiness_advertisement_is_not_lost():
     st = _VsockReadyState.__new__(_VsockReadyState)
     st.srv = srv
     st.ready = threading.Event()
-    st.stop = threading.Event() if hasattr(_VsockReadyState, "stop") else threading.Event()
+    st.stop = (
+        threading.Event() if hasattr(_VsockReadyState, "stop") else threading.Event()
+    )
 
     t = threading.Thread(target=sig._accept_loop, args=("slot-1", st), daemon=True)
     t.start()
     try:
         c = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
         c.connect(str(srv_path))
-        c.sendall(READY_TOKEN)                 # ...deliberately split
+        c.sendall(READY_TOKEN)  # ...deliberately split
         _t.sleep(0.2)
         c.sendall(READY_ACK_SUFFIX)
         c.close()
@@ -324,14 +355,21 @@ def test_a_host_resource_error_leaves_the_verdict_unknown(tmp_path):
     class _Boom:
         def recv(self, *a, **k):
             raise OSError(errno.ENOMEM, "Cannot allocate memory")
-        def close(self): pass
-        def settimeout(self, *a): pass
+
+        def close(self):
+            pass
+
+        def settimeout(self, *a):
+            pass
+
     ctl._conn = _Boom()
 
     with pytest.raises(WarmTimeout) as ei:
         ctl.wait_for_done(timeout_s=1.0)
     assert getattr(ei.value, "host_io", False) is True
-    assert ctl.guest_started is None, "we never heard from the guest, so the answer is UNKNOWN"
+    assert ctl.guest_started is None, (
+        "we never heard from the guest, so the answer is UNKNOWN"
+    )
     guest_sock.close()
 
 
@@ -357,12 +395,13 @@ def test_capability_learn_and_reset_are_mutually_exclusive():
         cap.learn()
         finished.set()
 
-    with cap._lock:                      # hold it: nothing may mutate while we do
+    with cap._lock:  # hold it: nothing may mutate while we do
         t = threading.Thread(target=_learn, daemon=True)
         t.start()
         assert entered.wait(2.0)
         assert not finished.wait(0.3), (
-            "learn() ran while the capability was locked — the check and the set are not atomic")
+            "learn() ran while the capability was locked — the check and the set are not atomic"
+        )
 
     assert finished.wait(2.0), "learn() must proceed once the lock is released"
     assert bool(cap) is True
@@ -391,6 +430,6 @@ def test_snapshot_mode_capability_is_epoch_scoped_end_to_end(tmp_path):
     assert cap.capable_for(0) is True
 
     # A slot from the RETIRED artifact is not judged by the current one, and vice versa.
-    cap.publish(1)                                  # a silent replacement
+    cap.publish(1)  # a silent replacement
     assert cap.capable_for(1) is False, "a silent replacement must not inherit"
     assert cap.capable_for(0) is False, "a retired epoch is no longer the published one"

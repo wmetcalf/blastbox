@@ -7,6 +7,7 @@ reuse the same DONE-gate + declared-artifact + traversal/absolute-path containme
 protections (Task 7 gap 2: no local disk access at all — the job dir may already be
 purged by the time this runs on a real multi-node deployment).
 """
+
 from __future__ import annotations
 
 import json
@@ -34,7 +35,9 @@ def _router(route: str, rel: str, **kw):
 def _app(tmp_path, store, router):
     # _make_done_job writes output under tmp_path/"jobs"/<id>/output
     return build_app(
-        job_store=store, job_root=tmp_path / "jobs", allowed_engines={"probe"},
+        job_store=store,
+        job_root=tmp_path / "jobs",
+        allowed_engines={"probe"},
         extension=IngressExtension(routers=(router,)),
     )
 
@@ -42,7 +45,13 @@ def _app(tmp_path, store, router):
 def test_serves_fixed_artifact_from_done_job(tmp_path):
     store = InMemoryJobStore()
     job, _ = _make_done_job(tmp_path, store)
-    c = TestClient(_app(tmp_path, store, _router("/v1/jobs/{job_id}/png", "page-001.png", media_type="image/png")))
+    c = TestClient(
+        _app(
+            tmp_path,
+            store,
+            _router("/v1/jobs/{job_id}/png", "page-001.png", media_type="image/png"),
+        )
+    )
     r = c.get(f"/v1/jobs/{job.job_id}/png")
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("image/png")
@@ -51,14 +60,20 @@ def test_serves_fixed_artifact_from_done_job(tmp_path):
 def test_missing_artifact_is_404(tmp_path):
     store = InMemoryJobStore()
     job, _ = _make_done_job(tmp_path, store)
-    c = TestClient(_app(tmp_path, store, _router("/v1/jobs/{job_id}/x", "does-not-exist.pdf")))
+    c = TestClient(
+        _app(tmp_path, store, _router("/v1/jobs/{job_id}/x", "does-not-exist.pdf"))
+    )
     assert c.get(f"/v1/jobs/{job.job_id}/x").status_code == 404
 
 
 def test_traversal_is_confined(tmp_path):
     store = InMemoryJobStore()
     job, _ = _make_done_job(tmp_path, store)
-    c = TestClient(_app(tmp_path, store, _router("/v1/jobs/{job_id}/evil", "../../../../etc/passwd")))
+    c = TestClient(
+        _app(
+            tmp_path, store, _router("/v1/jobs/{job_id}/evil", "../../../../etc/passwd")
+        )
+    )
     assert c.get(f"/v1/jobs/{job.job_id}/evil").status_code == 404
 
 
@@ -69,11 +84,27 @@ def test_undeclared_file_on_disk_is_404_trust_gate(tmp_path):
     store = InMemoryJobStore()
     job, output_dir = _make_done_job(tmp_path, store)  # declares page-001.png only
     # Worker-planted undeclared file (NOT in metadata.json artifacts[]) — exists on disk.
-    (output_dir / "document.pdf").write_bytes(b"%PDF-1.4 attacker-controlled un-re-hashed bytes")
-    c = TestClient(_app(tmp_path, store, _router("/v1/jobs/{job_id}/pdf", "document.pdf", media_type="application/pdf")))
+    (output_dir / "document.pdf").write_bytes(
+        b"%PDF-1.4 attacker-controlled un-re-hashed bytes"
+    )
+    c = TestClient(
+        _app(
+            tmp_path,
+            store,
+            _router(
+                "/v1/jobs/{job_id}/pdf", "document.pdf", media_type="application/pdf"
+            ),
+        )
+    )
     assert c.get(f"/v1/jobs/{job.job_id}/pdf").status_code == 404
     # sanity: the DECLARED artifact still serves
-    c2 = TestClient(_app(tmp_path, store, _router("/v1/jobs/{job_id}/png", "page-001.png", media_type="image/png")))
+    c2 = TestClient(
+        _app(
+            tmp_path,
+            store,
+            _router("/v1/jobs/{job_id}/png", "page-001.png", media_type="image/png"),
+        )
+    )
     assert c2.get(f"/v1/jobs/{job.job_id}/png").status_code == 200
 
 
@@ -83,8 +114,16 @@ def test_serves_fixed_artifact_when_job_dir_purged(tmp_path):
     reading exclusively through the BlobStore (never FileResponse from disk)."""
     store = InMemoryJobStore()
     job, _ = _make_done_job(tmp_path, store, artifact_data=b"PURGED-PNG-BYTES")
-    shutil.rmtree(tmp_path / "jobs" / job.job_id)  # simulate the worker's post-upload purge
-    c = TestClient(_app(tmp_path, store, _router("/v1/jobs/{job_id}/png", "page-001.png", media_type="image/png")))
+    shutil.rmtree(
+        tmp_path / "jobs" / job.job_id
+    )  # simulate the worker's post-upload purge
+    c = TestClient(
+        _app(
+            tmp_path,
+            store,
+            _router("/v1/jobs/{job_id}/png", "page-001.png", media_type="image/png"),
+        )
+    )
     r = c.get(f"/v1/jobs/{job.job_id}/png")
     assert r.status_code == 200
     assert r.content == b"PURGED-PNG-BYTES"
@@ -104,7 +143,13 @@ def test_non_list_artifacts_manifest_is_404_not_500(tmp_path):
     """
     store = InMemoryJobStore()
     job, output_dir = _make_done_job(tmp_path, store)
-    c = TestClient(_app(tmp_path, store, _router("/v1/jobs/{job_id}/png", "page-001.png", media_type="image/png")))
+    c = TestClient(
+        _app(
+            tmp_path,
+            store,
+            _router("/v1/jobs/{job_id}/png", "page-001.png", media_type="image/png"),
+        )
+    )
     for bad in (None, 5, {"path": "x"}):
         (output_dir / "metadata.json").write_text(json.dumps({"artifacts": bad}))
         _push_to_blob(tmp_path, job.job_id, output_dir)

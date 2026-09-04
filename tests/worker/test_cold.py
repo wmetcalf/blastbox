@@ -4,6 +4,7 @@ The reusable equivalent of the FC run_guest.py / gVisor run_warm.py loaders: loa
 the operator-selected engine from BLASTBOX_ENGINE='module:Class' and run the
 harness. A worker image's ENTRYPOINT is `python -m blastbox.worker.cold`.
 """
+
 from __future__ import annotations
 
 import pytest

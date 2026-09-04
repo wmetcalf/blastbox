@@ -23,6 +23,7 @@ Tests that need a REAL firecracker binary + vmlinux + rootfs are marked:
     @pytest.mark.skipif(not HAS_FC_HOST, reason="needs firecracker + kernel + rootfs")
 These should be run on toolz2 or another FC-capable host.
 """
+
 from __future__ import annotations
 
 import json
@@ -210,7 +211,7 @@ class TestFCConfigFromEnv:
         cfg = FCConfig.from_env()
         assert cfg.fc_kernel == str(k)
         assert cfg.fc_rootfs == str(r)
-        assert cfg.fc_vcpu_count == 1   # default preserved
+        assert cfg.fc_vcpu_count == 1  # default preserved
 
     def test_from_env_vcpu_override(self, monkeypatch, tmp_path):
         k = tmp_path / "vmlinux"
@@ -573,7 +574,9 @@ class TestFCConfigJson:
 
 
 class TestLaunchArgv:
-    def _spawn_and_get_argv(self, tmp_path: Path, fc_bin: str = "firecracker") -> list[str]:
+    def _spawn_and_get_argv(
+        self, tmp_path: Path, fc_bin: str = "firecracker"
+    ) -> list[str]:
         runner = _FakeSubprocessRunner()
         cfg = FCConfig(
             fc_bin=fc_bin,
@@ -636,7 +639,9 @@ class TestLaunchArgv:
             fc_rootfs="/r",
             scratch_root=str(tmp_path),
         )
-        rt = FirecrackerSlotRuntime(cfg, subprocess_runner=runner, ready_signal=_FakeReadySignal())
+        rt = FirecrackerSlotRuntime(
+            cfg, subprocess_runner=runner, ready_signal=_FakeReadySignal()
+        )
         with patch("blastbox.host.runtime.firecracker.make_ext4"):
             rt.spawn()
         for call_kwargs in runner._kwargs_log:
@@ -661,7 +666,9 @@ class TestVcpuDefault:
             # No explicit fc_vcpu_count — should use default of 1
             scratch_root=str(tmp_path),
         )
-        rt = FirecrackerSlotRuntime(cfg, subprocess_runner=runner, ready_signal=_FakeReadySignal())
+        rt = FirecrackerSlotRuntime(
+            cfg, subprocess_runner=runner, ready_signal=_FakeReadySignal()
+        )
         with patch("blastbox.host.runtime.firecracker.make_ext4"):
             slot = rt.spawn()
         slot_dir = tmp_path / slot.slot_id
@@ -681,7 +688,9 @@ class TestVcpuDefault:
             fc_vcpu_count=2,
             scratch_root=str(tmp_path),
         )
-        rt = FirecrackerSlotRuntime(cfg, subprocess_runner=runner, ready_signal=_FakeReadySignal())
+        rt = FirecrackerSlotRuntime(
+            cfg, subprocess_runner=runner, ready_signal=_FakeReadySignal()
+        )
         with patch("blastbox.host.runtime.firecracker.make_ext4"):
             slot = rt.spawn()
         slot_dir = tmp_path / slot.slot_id
@@ -754,7 +763,7 @@ class TestSlotRuntimeStateMachine:
         with patch("blastbox.host.runtime.firecracker.make_ext4"):
             slot = rt.spawn()
         fake_proc = runner.last_popen
-        assert fake_proc.returncode is None   # process is "running"
+        assert fake_proc.returncode is None  # process is "running"
         assert rt.is_alive(slot) is True
 
     def test_is_alive_false_after_process_exits(self, tmp_path):
@@ -847,8 +856,15 @@ class TestSlotRuntimeProtocol:
     def test_implements_slot_runtime_protocol(self, tmp_path):
         """FirecrackerSlotRuntime must satisfy the SlotRuntime Protocol."""
         from blastbox.host.pool import SlotRuntime
-        cfg = FCConfig(fc_bin="fc", fc_kernel="/k", fc_rootfs="/r", scratch_root=str(tmp_path))
-        rt = FirecrackerSlotRuntime(cfg, subprocess_runner=_FakeSubprocessRunner(), ready_signal=_FakeReadySignal())
+
+        cfg = FCConfig(
+            fc_bin="fc", fc_kernel="/k", fc_rootfs="/r", scratch_root=str(tmp_path)
+        )
+        rt = FirecrackerSlotRuntime(
+            cfg,
+            subprocess_runner=_FakeSubprocessRunner(),
+            ready_signal=_FakeReadySignal(),
+        )
         assert isinstance(rt, SlotRuntime)
 
 
@@ -890,7 +906,9 @@ class TestRdumpExt4:
         with pytest.raises(ValueError, match="cannot read"):
             rdump_ext4(img, dest, max_bytes=1024)
 
-    def test_e2fsck_recover_and_retry_when_first_rdump_empty(self, tmp_path, monkeypatch):
+    def test_e2fsck_recover_and_retry_when_first_rdump_empty(
+        self, tmp_path, monkeypatch
+    ):
         """A guest SIGKILLed off a no-journal ext4 can leave bitmaps inconsistent so the
         first debugfs rdump reads NOTHING ('Filesystem not open'). rdump_ext4 must then
         run e2fsck -fy (rebuilds bitmaps from the intact inode tree) and retry the rdump,
@@ -936,7 +954,9 @@ class TestRdumpExt4:
             res.stderr = b""
             if tool == "debugfs":
                 if calls.count("debugfs") == 1:
-                    res.returncode = 1  # non-zero: previously raised + bypassed recovery
+                    res.returncode = (
+                        1  # non-zero: previously raised + bypassed recovery
+                    )
                 else:
                     res.returncode = 0
                     (dest / "metadata.json").write_text("{}")
@@ -1027,7 +1047,9 @@ class TestMakeExt4:
         feats = _sp.run(
             ["debugfs", "-R", "features", str(img)], capture_output=True, text=True
         ).stdout
-        assert "metadata_csum" not in feats, f"outdisk must NOT have metadata_csum: {feats}"
+        assert "metadata_csum" not in feats, (
+            f"outdisk must NOT have metadata_csum: {feats}"
+        )
         assert "has_journal" not in feats, f"outdisk must NOT have a journal: {feats}"
 
 
@@ -1263,7 +1285,9 @@ class TestSignalGoStreaming:
 
         # Fail loudly if the old read_bytes() path is ever reintroduced.
         def _boom(self):  # noqa: ANN001
-            raise AssertionError("signal_go must stream, not read_bytes() the whole input")
+            raise AssertionError(
+                "signal_go must stream, not read_bytes() the whole input"
+            )
 
         monkeypatch.setattr(Path, "read_bytes", _boom)
 
@@ -1499,13 +1523,16 @@ def test_a_host_disk_failure_in_debugfs_is_not_the_guests_fault(tmp_path, monkey
     from blastbox.host.runtime.firecracker import rdump_ext4
 
     image = tmp_path / "outdisk.ext4"
-    image.write_bytes(b"\x00" * 0x438 + b"\x53\xef" + b"\x00" * 64)   # valid ext4 magic
+    image.write_bytes(b"\x00" * 0x438 + b"\x53\xef" + b"\x00" * 64)  # valid ext4 magic
     dest = tmp_path / "out"
 
     def _run(argv, **kw):
         if argv and argv[0] == "debugfs" and kw.get("check"):
             raise _sp.CalledProcessError(
-                1, argv, output=b"", stderr=b"rdump: No space left on device while writing",
+                1,
+                argv,
+                output=b"",
+                stderr=b"rdump: No space left on device while writing",
             )
         return _sp.CompletedProcess(argv, 1, b"", b"Filesystem not open")
 
@@ -1531,7 +1558,10 @@ def test_a_corrupt_image_is_still_the_guests_fault(tmp_path, monkeypatch):
     def _run(argv, **kw):
         if argv and argv[0] == "debugfs" and kw.get("check"):
             raise _sp.CalledProcessError(
-                1, argv, output=b"", stderr=b"Corrupt superblock; filesystem is unusable",
+                1,
+                argv,
+                output=b"",
+                stderr=b"Corrupt superblock; filesystem is unusable",
             )
         return _sp.CompletedProcess(argv, 1, b"", b"Filesystem not open")
 

@@ -9,6 +9,7 @@ microVMs were still mapping. That SIGBUSes them or silently corrupts guest memor
 A flock on a file in the shared directory is the one signal that crosses namespaces: the kernel
 holds it while the owner lives and drops it the moment the owner dies, referring to no pid at all.
 """
+
 from __future__ import annotations
 
 import fcntl
@@ -25,14 +26,16 @@ from blastbox.host.runtime.snapshot_backend import (
 )
 
 
-def test_a_live_owner_is_never_declared_dead_just_because_its_pid_is_invisible(tmp_path):
+def test_a_live_owner_is_never_declared_dead_just_because_its_pid_is_invisible(
+    tmp_path,
+):
     """The P1 in one assertion.
 
     Simulate the rolling deployment exactly: a token whose pid IS live in our namespace but is a
     DIFFERENT process (which is what pid 1 looks like from a replacement container), holding its
     lease. The pid rule says dead; ownership must say alive.
     """
-    token = f"{os.getpid()}_999999"          # our pid, a different start time
+    token = f"{os.getpid()}_999999"  # our pid, a different start time
     lease = owner_lease_path(tmp_path, token)
     lease.write_bytes(b"")
     holder = open(lease, "a+b")
@@ -54,7 +57,7 @@ def test_a_live_owner_is_never_declared_dead_just_because_its_pid_is_invisible(t
 def test_a_released_lease_proves_the_owner_is_gone(tmp_path):
     """The other direction: reclamation must still WORK, or the leak this exists to fix returns."""
     token = "999999999_4242"
-    owner_lease_path(tmp_path, token).write_bytes(b"")     # written, nobody holds it
+    owner_lease_path(tmp_path, token).write_bytes(b"")  # written, nobody holds it
     assert owner_alive(token, lease_dir=tmp_path) is False
 
 
@@ -62,14 +65,19 @@ def test_the_kernel_releases_the_lease_when_the_holder_dies(tmp_path):
     """Not a mocked release — a real process exits and the lease becomes acquirable."""
     code = textwrap.dedent(f"""
         import sys
-        sys.path.insert(0, {os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
-            os.path.abspath(__file__))))) + "/src"!r})
+        sys.path.insert(0, {
+        os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        )
+        + "/src"!r
+    })
         from blastbox.host.runtime.snapshot_backend import hold_owner_lease, owner_token
         assert hold_owner_lease({str(tmp_path)!r})
         print(owner_token())
     """)
-    token = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
-                           timeout=60).stdout.strip()
+    token = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=60
+    ).stdout.strip()
     assert token, "the child never reported its token"
     # The child has exited. Its lease file is still there; the LOCK is not.
     assert owner_lease_path(tmp_path, token).exists()
@@ -94,7 +102,7 @@ def test_our_own_lease_is_held_for_the_life_of_the_process(tmp_path):
     assert owner_alive(owner_token(), lease_dir=tmp_path) is True, (
         "this process's own lease was dropped; another dispatcher would sweep our live generations"
     )
-    assert hold_owner_lease(tmp_path) is True          # idempotent
+    assert hold_owner_lease(tmp_path) is True  # idempotent
 
 
 def test_a_lease_that_could_not_be_locked_leaves_nothing_behind(tmp_path, monkeypatch):
@@ -158,7 +166,9 @@ def test_two_builders_racing_for_one_lease_do_not_unlink_it(tmp_path, monkeypatc
     for t in threads:
         t.join()
 
-    assert all(results), f"a concurrent caller failed to take the process lease: {results}"
+    assert all(results), (
+        f"a concurrent caller failed to take the process lease: {results}"
+    )
     assert owner_lease_path(tmp_path, owner_token()).exists(), (
         "the lease file was unlinked by a loser of the race, so the winner holds a lock on an "
         "unlinked inode and its generations are unprovable"
@@ -188,8 +198,12 @@ def test_one_directory_spelled_two_ways_is_one_lease(tmp_path):
     cwd = os.getcwd()
     os.chdir(tmp_path)
     try:
-        assert hold_owner_lease("a/b") is True, "a relative spelling was treated as a new lease"
-        assert hold_owner_lease(link) is True, "a symlinked spelling was treated as a new lease"
+        assert hold_owner_lease("a/b") is True, (
+            "a relative spelling was treated as a new lease"
+        )
+        assert hold_owner_lease(link) is True, (
+            "a symlinked spelling was treated as a new lease"
+        )
     finally:
         os.chdir(cwd)
 

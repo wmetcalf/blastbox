@@ -1,4 +1,5 @@
 """Unit tests for the libvirt pool job dispatcher (in-memory store; validate stubbed)."""
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -13,7 +14,9 @@ from blastbox.host.runtime.vm_dispatch import VmJobDispatcher
 
 # the trust-gated remote factory requires limits (uses getattr(...,None) for caps); an empty ns suffices
 # for construction tests that never actually run the trust gate.
-_FAKE_LIMITS = SimpleNamespace(max_total_artifact_bytes=None, max_artifacts=None, max_metadata_bytes=None)
+_FAKE_LIMITS = SimpleNamespace(
+    max_total_artifact_bytes=None, max_artifacts=None, max_metadata_bytes=None
+)
 
 
 def _queue_job(store, tmp_path, filename="evil.dll", body=b"MZ"):
@@ -36,12 +39,12 @@ def test_dispatch_marks_done_with_summary_and_unlinks_input(tmp_path):
         return ({"verdict": {"status": "Revoked"}}, True)
 
     d = VmJobDispatcher(store, str(tmp_path), validate, worker_tier="libvirt-vm")
-    d._process(store.claim_next())                       # claim_next -> RUNNING + claim_id
+    d._process(store.claim_next())  # claim_next -> RUNNING + claim_id
     got = store.get(job.job_id)
     assert got.status is JobStatus.DONE
     assert got.result_summary["verdict"]["status"] == "Revoked"
     assert seen["path"].name == "evil.dll"
-    assert not (tmp_path / job.job_id / "input" / "evil.dll").exists()   # input consumed
+    assert not (tmp_path / job.job_id / "input" / "evil.dll").exists()  # input consumed
     # marked as a warm worker so a peer's crash-recovery sweep won't treat it as a dead cold job.
     assert got.worker_runtime == "warm"
     assert got.worker_tier == "libvirt-vm"
@@ -49,54 +52,82 @@ def test_dispatch_marks_done_with_summary_and_unlinks_input(tmp_path):
 
 def test_fail_stale_queued_jobs(tmp_path):
     import time
+
     store = InMemoryJobStore()
     old = _queue_job(store, tmp_path, filename="stale.dll")
-    old.created_at = time.time() - 10_000        # far past the TTL
+    old.created_at = time.time() - 10_000  # far past the TTL
     fresh = _queue_job(store, tmp_path, filename="fresh.dll")
 
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True),
-                        engine="authenticode", max_queued_age_s=1.0)
+    d = VmJobDispatcher(
+        store,
+        str(tmp_path),
+        lambda p: ({}, True),
+        engine="authenticode",
+        max_queued_age_s=1.0,
+    )
     d._fail_stale_queued_jobs()
 
     assert store.get(old.job_id).status is JobStatus.FAILED
     assert "max queued age" in (store.get(old.job_id).error or "")
-    assert not (tmp_path / old.job_id / "input" / "stale.dll").exists()   # untrusted input deleted
-    assert store.get(fresh.job_id).status is JobStatus.QUEUED             # fresh job untouched
+    assert not (
+        tmp_path / old.job_id / "input" / "stale.dll"
+    ).exists()  # untrusted input deleted
+    assert store.get(fresh.job_id).status is JobStatus.QUEUED  # fresh job untouched
 
 
 def test_fail_stale_queued_sweeps_other_engines_when_sole_owner(tmp_path):
     import time
+
     store = InMemoryJobStore()
     other = _queue_job(store, tmp_path, filename="orphan.bin")
-    other.engine = "some-unserved-engine"       # an engine THIS dispatcher doesn't serve
+    other.engine = "some-unserved-engine"  # an engine THIS dispatcher doesn't serve
     other.created_at = time.time() - 10_000
     # sole_owner => no peer dispatcher, so a job for an engine nobody serves must still be swept.
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True),
-                        engine="authenticode", max_queued_age_s=1.0, sole_owner=True)
+    d = VmJobDispatcher(
+        store,
+        str(tmp_path),
+        lambda p: ({}, True),
+        engine="authenticode",
+        max_queued_age_s=1.0,
+        sole_owner=True,
+    )
     d._fail_stale_queued_jobs()
     assert store.get(other.job_id).status is JobStatus.FAILED
 
 
 def test_fail_stale_queued_scopes_to_engine_when_not_sole_owner(tmp_path):
     import time
+
     store = InMemoryJobStore()
     other = _queue_job(store, tmp_path, filename="orphan.bin")
     other.engine = "some-other-engine"
     other.created_at = time.time() - 10_000
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True),
-                        engine="authenticode", max_queued_age_s=1.0)  # sole_owner False (default)
+    d = VmJobDispatcher(
+        store,
+        str(tmp_path),
+        lambda p: ({}, True),
+        engine="authenticode",
+        max_queued_age_s=1.0,
+    )  # sole_owner False (default)
     d._fail_stale_queued_jobs()
-    assert store.get(other.job_id).status is JobStatus.QUEUED   # a peer owns that engine -> left alone
+    assert (
+        store.get(other.job_id).status is JobStatus.QUEUED
+    )  # a peer owns that engine -> left alone
 
 
 def test_fail_stale_queued_disabled_by_default(tmp_path):
     import time
+
     store = InMemoryJobStore()
     old = _queue_job(store, tmp_path, filename="stale.dll")
     old.created_at = time.time() - 10_000
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True), engine="authenticode")  # TTL 0 = off
+    d = VmJobDispatcher(
+        store, str(tmp_path), lambda p: ({}, True), engine="authenticode"
+    )  # TTL 0 = off
     d._fail_stale_queued_jobs()
-    assert store.get(old.job_id).status is JobStatus.QUEUED   # no TTL configured -> no-op
+    assert (
+        store.get(old.job_id).status is JobStatus.QUEUED
+    )  # no TTL configured -> no-op
 
 
 def _capture_ensure_metadata(d):
@@ -109,6 +140,7 @@ def _capture_ensure_metadata(d):
     that necessarily follows it.
     """
     import json as _json
+
     real = d._ensure_metadata
     captured: dict[str, object] = {}
 
@@ -128,10 +160,12 @@ def test_dispatch_writes_metadata_json_on_done(tmp_path):
     # dispatcher materializes it from the summary so those routes don't 404 on a VM job.
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({"verdict": {"status": "Valid"}}, True))
+    d = VmJobDispatcher(
+        store, str(tmp_path), lambda p: ({"verdict": {"status": "Valid"}}, True)
+    )
     captured = _capture_ensure_metadata(d)
     d._process(store.claim_next())
-    assert captured["written"]["verdict"]["status"] == "Valid"   # type: ignore[index]
+    assert captured["written"]["verdict"]["status"] == "Valid"  # type: ignore[index]
     # Task 5: the worker purge invariant — nothing (including output/) survives a terminal state.
     assert not (tmp_path / job.job_id).exists()
 
@@ -143,34 +177,47 @@ def test_dispatch_metadata_overwrites_stale_and_neuters_artifacts(tmp_path):
     job = _queue_job(store, tmp_path)
     out = tmp_path / job.job_id / "output"
     out.mkdir(parents=True)
-    (out / "metadata.json").write_text('{"stale": true, "artifacts": [{"id": "x", "path": "../etc"}]}')
-    d = VmJobDispatcher(store, str(tmp_path),
-                        lambda p: ({"verdict": "ok", "artifacts": [{"id": "y", "path": "z"}]}, True))
+    (out / "metadata.json").write_text(
+        '{"stale": true, "artifacts": [{"id": "x", "path": "../etc"}]}'
+    )
+    d = VmJobDispatcher(
+        store,
+        str(tmp_path),
+        lambda p: ({"verdict": "ok", "artifacts": [{"id": "y", "path": "z"}]}, True),
+    )
     captured = _capture_ensure_metadata(d)
     d._process(store.claim_next())
     meta = captured["written"]
-    assert meta.get("verdict") == "ok" and "stale" not in meta   # overwritten with our result
-    assert meta["artifacts"] == []                               # guest artifacts neutered (security)
-    assert not (tmp_path / job.job_id).exists()                  # Task 5: purged after DONE
+    assert (
+        meta.get("verdict") == "ok" and "stale" not in meta
+    )  # overwritten with our result
+    assert meta["artifacts"] == []  # guest artifacts neutered (security)
+    assert not (tmp_path / job.job_id).exists()  # Task 5: purged after DONE
 
 
 def test_dispatch_trust_output_metadata_preserves_sealed_artifacts(tmp_path):
     # remote_http path: the transport already sealed output/metadata.json (with the real, host-extracted
     # artifact list) -> preserve it instead of clobbering to artifacts:[].
     import json
+
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
     out = tmp_path / job.job_id / "output"
     out.mkdir(parents=True)
-    sealed = {"status": "ok", "artifacts": [{"id": "p1", "path": "page.png", "sha256": "ab", "bytes": 3}]}
+    sealed = {
+        "status": "ok",
+        "artifacts": [{"id": "p1", "path": "page.png", "sha256": "ab", "bytes": 3}],
+    }
     (out / "metadata.json").write_text(json.dumps(sealed))
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: (sealed, True), trust_output_metadata=True)
+    d = VmJobDispatcher(
+        store, str(tmp_path), lambda p: (sealed, True), trust_output_metadata=True
+    )
     captured = _capture_ensure_metadata(d)
     d._process(store.claim_next())
     meta = captured["written"]
     assert meta["status"] == "ok"
-    assert meta["artifacts"][0]["id"] == "p1"   # preserved, NOT neutered
-    assert not (tmp_path / job.job_id).exists()   # Task 5: purged after DONE
+    assert meta["artifacts"][0]["id"] == "p1"  # preserved, NOT neutered
+    assert not (tmp_path / job.job_id).exists()  # Task 5: purged after DONE
 
 
 def test_dispatch_forwards_sanitized_params_to_validate(tmp_path):
@@ -189,18 +236,28 @@ def test_dispatch_forwards_sanitized_params_to_validate(tmp_path):
         seen["params"] = params
         return ({"status": "ok"}, True)
 
-    d = VmJobDispatcher(store, str(tmp_path), validate,
-                        sanitize_params=lambda p: {k: v for k, v in p.items() if k == "CLIPPYSHOT_OCR"})
+    d = VmJobDispatcher(
+        store,
+        str(tmp_path),
+        validate,
+        sanitize_params=lambda p: {k: v for k, v in p.items() if k == "CLIPPYSHOT_OCR"},
+    )
     d._process(store.claim_next())
-    assert seen["params"] == {"CLIPPYSHOT_OCR": "1"}   # allowlisted key forwarded; "bad key" dropped
+    assert seen["params"] == {
+        "CLIPPYSHOT_OCR": "1"
+    }  # allowlisted key forwarded; "bad key" dropped
 
 
 def test_dispatch_legacy_validate_without_params_kwarg(tmp_path):
     # a validate() that doesn't accept params (the libvirt-vm seam) must still work unchanged
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({"verdict": "ok"}, True),
-                        sanitize_params=lambda p: p)
+    d = VmJobDispatcher(
+        store,
+        str(tmp_path),
+        lambda p: ({"verdict": "ok"}, True),
+        sanitize_params=lambda p: p,
+    )
     d._process(store.claim_next())
     assert store.get(job.job_id).status is JobStatus.DONE
 
@@ -213,7 +270,9 @@ def test_output_validator_failure_fails_job(tmp_path):
     def boom(job, out_dir):  # noqa: ANN001
         raise RuntimeError("hash mismatch")
 
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({"status": "ok"}, True), output_validator=boom)
+    d = VmJobDispatcher(
+        store, str(tmp_path), lambda p: ({"status": "ok"}, True), output_validator=boom
+    )
     d._process(store.claim_next())
     got = store.get(job.job_id)
     assert got.status is JobStatus.FAILED
@@ -224,8 +283,12 @@ def test_output_validator_success_marks_done(tmp_path):
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
     called = {}
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({"status": "ok"}, True),
-                        output_validator=lambda j, o: called.setdefault("ok", True))
+    d = VmJobDispatcher(
+        store,
+        str(tmp_path),
+        lambda p: ({"status": "ok"}, True),
+        output_validator=lambda j, o: called.setdefault("ok", True),
+    )
     d._process(store.claim_next())
     assert store.get(job.job_id).status is JobStatus.DONE and called["ok"]
 
@@ -248,17 +311,29 @@ def test_vm_dispatch_indexes_page_hashes_when_store_supports_it(tmp_path):
     job = _queue_job(store, tmp_path)
     out = tmp_path / job.job_id / "output"
     out.mkdir(parents=True, exist_ok=True)
-    env = Envelope(engine="authenticode", input_sha256="ab" * 32,
-                   detected=Detection(label="dll", mime="application/octet-stream", confidence=1.0, source="t"),
-                   payload=Page(index=0, dims=Dimensions(width=1.0, height=1.0, unit="px"),
-                                image=ArtifactRef(id="a0")))
+    env = Envelope(
+        engine="authenticode",
+        input_sha256="ab" * 32,
+        detected=Detection(
+            label="dll", mime="application/octet-stream", confidence=1.0, source="t"
+        ),
+        payload=Page(
+            index=0,
+            dims=Dimensions(width=1.0, height=1.0, unit="px"),
+            image=ArtifactRef(id="a0"),
+        ),
+    )
     (out / "metadata.json").write_text(env.model_dump_json(by_alias=True))
 
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({"status": "ok"}, True), engine="authenticode")
-    env_parsed = d._sealed_envelope(job)                 # parses the sealed metadata.json -> Envelope
+    d = VmJobDispatcher(
+        store, str(tmp_path), lambda p: ({"status": "ok"}, True), engine="authenticode"
+    )
+    env_parsed = d._sealed_envelope(job)  # parses the sealed metadata.json -> Envelope
     assert type(env_parsed).__name__ == "Envelope"
     d._index_page_hashes(job, env_parsed)
-    assert calls == [(job.job_id, "Envelope")]   # sealed metadata.json fed through the indexer
+    assert calls == [
+        (job.job_id, "Envelope")
+    ]  # sealed metadata.json fed through the indexer
 
 
 def test_remote_done_stores_compact_summary(tmp_path):
@@ -266,27 +341,51 @@ def test_remote_done_stores_compact_summary(tmp_path):
     # NOT the full sealed metadata dict -- the full envelope stays in metadata.json for /metadata.
     from blastbox.contract import ArtifactRef, Detection, Dimensions, Page
     from blastbox.contract.envelope import Envelope
+
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
     out = tmp_path / job.job_id / "output"
     out.mkdir(parents=True, exist_ok=True)
-    env = Envelope(engine="authenticode", input_sha256="ab" * 32,
-                   detected=Detection(label="dll", mime="application/octet-stream", confidence=1.0, source="t"),
-                   payload=Page(index=0, dims=Dimensions(width=1.0, height=1.0, unit="px"),
-                                image=ArtifactRef(id="a0")))
+    env = Envelope(
+        engine="authenticode",
+        input_sha256="ab" * 32,
+        detected=Detection(
+            label="dll", mime="application/octet-stream", confidence=1.0, source="t"
+        ),
+        payload=Page(
+            index=0,
+            dims=Dimensions(width=1.0, height=1.0, unit="px"),
+            image=ArtifactRef(id="a0"),
+        ),
+    )
     (out / "metadata.json").write_text(env.model_dump_json(by_alias=True))
-    fat = {"status": "ok", "payload": {"blob": "y" * 5000}, "artifacts": [1, 2, 3]}   # what the transport returns
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: (fat, True), engine="authenticode",
-                        trust_output_metadata=True)
+    fat = {
+        "status": "ok",
+        "payload": {"blob": "y" * 5000},
+        "artifacts": [1, 2, 3],
+    }  # what the transport returns
+    d = VmJobDispatcher(
+        store,
+        str(tmp_path),
+        lambda p: (fat, True),
+        engine="authenticode",
+        trust_output_metadata=True,
+    )
     d._process(store.claim_next())
     got = store.get(job.job_id)
     assert got.status is JobStatus.DONE
-    assert got.result_summary.get("detected") == "dll" and "artifact_count" in got.result_summary
-    assert "payload" not in got.result_summary   # the fat payload was NOT persisted on the job
+    assert (
+        got.result_summary.get("detected") == "dll"
+        and "artifact_count" in got.result_summary
+    )
+    assert (
+        "payload" not in got.result_summary
+    )  # the fat payload was NOT persisted on the job
 
 
 def test_remote_no_slot_requeues_not_fails(tmp_path):
     from blastbox.host.runtime.vm_dispatch import NoWarmSlot
+
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
 
@@ -296,46 +395,67 @@ def test_remote_no_slot_requeues_not_fails(tmp_path):
     d = VmJobDispatcher(store, str(tmp_path), validate, engine="authenticode")
     d._process(store.claim_next())
     got = store.get(job.job_id)
-    assert got.status is JobStatus.QUEUED and got.claim_id is None   # requeued (never ran), NOT failed
+    assert (
+        got.status is JobStatus.QUEUED and got.claim_id is None
+    )  # requeued (never ran), NOT failed
     # The requeue RELEASES this worker's claim, so the purge invariant applies: the input must NOT
     # be left behind "for the retry". In a real fleet the next claimant is on another host and could
     # never read this worker's disk anyway; the blob store re-materialises the sample when the
     # requeued job is re-claimed. (Was: input preserved -- an old shared-filesystem assumption.)
-    assert not (tmp_path / job.job_id).exists()   # released claim -> job dir purged
+    assert not (tmp_path / job.job_id).exists()  # released claim -> job dir purged
 
 
 def test_dispatch_records_terminal_metrics(tmp_path):
     # parity with the cold dispatcher: a terminal job bumps dispatched(path,outcome) + a warm-claim HIT.
     import blastbox.observability.metrics as m
+
     store = InMemoryJobStore()
     _queue_job(store, tmp_path)
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({"status": "ok"}, True),
-                        worker_tier="aws-ec2-hibernate")
-    bd = m.JOBS_DISPATCHED_TOTAL.labels(path="aws-ec2-hibernate", outcome="done")._value.get()
+    d = VmJobDispatcher(
+        store,
+        str(tmp_path),
+        lambda p: ({"status": "ok"}, True),
+        worker_tier="aws-ec2-hibernate",
+    )
+    bd = m.JOBS_DISPATCHED_TOTAL.labels(
+        path="aws-ec2-hibernate", outcome="done"
+    )._value.get()
     bh = m.WARM_CLAIMS_TOTAL.labels(result="hit")._value.get()
     bc = m.JOB_DURATION_SECONDS.labels(path="aws-ec2-hibernate")._sum.get()
     d._process(store.claim_next())
-    assert m.JOBS_DISPATCHED_TOTAL.labels(path="aws-ec2-hibernate", outcome="done")._value.get() == bd + 1
+    assert (
+        m.JOBS_DISPATCHED_TOTAL.labels(
+            path="aws-ec2-hibernate", outcome="done"
+        )._value.get()
+        == bd + 1
+    )
     assert m.WARM_CLAIMS_TOTAL.labels(result="hit")._value.get() == bh + 1
-    assert m.JOB_DURATION_SECONDS.labels(path="aws-ec2-hibernate")._sum.get() >= bc   # duration observed
+    assert (
+        m.JOB_DURATION_SECONDS.labels(path="aws-ec2-hibernate")._sum.get() >= bc
+    )  # duration observed
 
 
 def test_requeue_records_warm_claim_miss(tmp_path):
     # a NoWarmSlot requeue is a warm-pool MISS, and must NOT count as a dispatched/hit (the job never ran).
     import blastbox.observability.metrics as m
     from blastbox.host.runtime.vm_dispatch import NoWarmSlot
+
     store = InMemoryJobStore()
     _queue_job(store, tmp_path)
 
     def validate(path):
         raise NoWarmSlot("no warm slot available within claim timeout")
 
-    d = VmJobDispatcher(store, str(tmp_path), validate, engine="authenticode", worker_tier="aws-ec2")
+    d = VmJobDispatcher(
+        store, str(tmp_path), validate, engine="authenticode", worker_tier="aws-ec2"
+    )
     bmiss = m.WARM_CLAIMS_TOTAL.labels(result="miss")._value.get()
     bhit = m.WARM_CLAIMS_TOTAL.labels(result="hit")._value.get()
     d._process(store.claim_next())
     assert m.WARM_CLAIMS_TOTAL.labels(result="miss")._value.get() == bmiss + 1
-    assert m.WARM_CLAIMS_TOTAL.labels(result="hit")._value.get() == bhit       # no false hit for a requeue
+    assert (
+        m.WARM_CLAIMS_TOTAL.labels(result="hit")._value.get() == bhit
+    )  # no false hit for a requeue
 
 
 def test_requeue_ignores_peer_finish_for_metrics(tmp_path, monkeypatch):
@@ -346,20 +466,28 @@ def test_requeue_ignores_peer_finish_for_metrics(tmp_path, monkeypatch):
     from types import SimpleNamespace
     import blastbox.observability.metrics as m
     from blastbox.host.runtime.vm_dispatch import NoWarmSlot
+
     store = InMemoryJobStore()
     _queue_job(store, tmp_path)
 
     def validate(path):
         raise NoWarmSlot("no warm slot available within claim timeout")
 
-    d = VmJobDispatcher(store, str(tmp_path), validate, engine="authenticode", worker_tier="aws-ec2")
+    d = VmJobDispatcher(
+        store, str(tmp_path), validate, engine="authenticode", worker_tier="aws-ec2"
+    )
     j = store.claim_next()
-    monkeypatch.setattr(store, "get", lambda jid: SimpleNamespace(status=JobStatus.DONE))  # peer "finished" it
+    monkeypatch.setattr(
+        store, "get", lambda jid: SimpleNamespace(status=JobStatus.DONE)
+    )  # peer "finished" it
     bhit = m.WARM_CLAIMS_TOTAL.labels(result="hit")._value.get()
     bdone = m.JOBS_DISPATCHED_TOTAL.labels(path="aws-ec2", outcome="done")._value.get()
     d._process(j)
-    assert m.WARM_CLAIMS_TOTAL.labels(result="hit")._value.get() == bhit             # no false hit
-    assert m.JOBS_DISPATCHED_TOTAL.labels(path="aws-ec2", outcome="done")._value.get() == bdone  # no false 'done'
+    assert m.WARM_CLAIMS_TOTAL.labels(result="hit")._value.get() == bhit  # no false hit
+    assert (
+        m.JOBS_DISPATCHED_TOTAL.labels(path="aws-ec2", outcome="done")._value.get()
+        == bdone
+    )  # no false 'done'
 
 
 def test_vm_dispatch_skips_indexing_when_unsupported(tmp_path):
@@ -367,13 +495,14 @@ def test_vm_dispatch_skips_indexing_when_unsupported(tmp_path):
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
     d = VmJobDispatcher(store, str(tmp_path), lambda p: ({"status": "ok"}, True))
-    d._index_page_hashes(job, None)   # must not raise
+    d._index_page_hashes(job, None)  # must not raise
 
 
 def test_resume_on_claim_calls_runtime_resume():
     from types import SimpleNamespace
 
     from blastbox.host.runtime.vm_dispatch import _resume_on_claim
+
     seen = {}
     slot = SimpleNamespace(slot_id="s1")
     pool = SimpleNamespace(
@@ -381,13 +510,14 @@ def test_resume_on_claim_calls_runtime_resume():
         release=lambda s, dirty=False: seen.setdefault("released", dirty),
     )
     _resume_on_claim(pool, slot)
-    assert seen["resumed"] is slot and "released" not in seen   # resumed, not released
+    assert seen["resumed"] is slot and "released" not in seen  # resumed, not released
 
 
 def test_resume_on_claim_releases_dirty_on_failure():
     from types import SimpleNamespace
 
     from blastbox.host.runtime.vm_dispatch import _resume_on_claim
+
     seen = {}
 
     def boom(_s):
@@ -400,16 +530,17 @@ def test_resume_on_claim_releases_dirty_on_failure():
     )
     with pytest.raises(RuntimeError, match="resume failed"):
         _resume_on_claim(pool, slot)
-    assert seen["released_dirty"] is True   # un-resumable slot retired dirty, not leaked
+    assert seen["released_dirty"] is True  # un-resumable slot retired dirty, not leaked
 
 
 def test_resume_on_claim_noop_without_resume():
     from types import SimpleNamespace
 
     from blastbox.host.runtime.vm_dispatch import _resume_on_claim
+
     # a runtime without a resume() method (disposable ec2/static/etc.) is a no-op
     pool = SimpleNamespace(runtime=SimpleNamespace(), release=lambda *a, **k: None)
-    _resume_on_claim(pool, SimpleNamespace(slot_id="s1"))   # must not raise
+    _resume_on_claim(pool, SimpleNamespace(slot_id="s1"))  # must not raise
 
 
 def test_build_remote_vm_dispatcher_constructs(tmp_path):
@@ -424,12 +555,22 @@ def test_build_remote_vm_dispatcher_constructs(tmp_path):
         def release(self, slot, *, dirty=False):  # noqa: ANN001
             pass
 
-    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _FakePool(),
-                                    tier="static", engine="clippyshot", limits=_FAKE_LIMITS)
+    vm = build_remote_vm_dispatcher(
+        InMemoryJobStore(),
+        str(tmp_path),
+        _FakePool(),
+        tier="static",
+        engine="clippyshot",
+        limits=_FAKE_LIMITS,
+    )
     assert isinstance(vm, VmJobDispatcher)
-    assert vm._trust_output_metadata is True        # the remote path preserves the sealed metadata
-    assert vm._validate_takes_params is True         # the remote_http validate accepts params
-    assert vm._validate_takes_owns is True           # ...and the ownership predicate (metadata fence)
+    assert (
+        vm._trust_output_metadata is True
+    )  # the remote path preserves the sealed metadata
+    assert vm._validate_takes_params is True  # the remote_http validate accepts params
+    assert (
+        vm._validate_takes_owns is True
+    )  # ...and the ownership predicate (metadata fence)
 
 
 def test_remote_claim_budget_is_bounded_and_reserves_detonation_time(tmp_path):
@@ -437,6 +578,7 @@ def test_remote_claim_budget_is_bounded_and_reserves_detonation_time(tmp_path):
     # warm_claim_timeout_s (NOT worker_timeout_s), and the heartbeat watchdog covers claim + detonate so
     # a slot claimed late still gets the full worker_timeout_s to run instead of being watchdog-killed.
     from blastbox.host.runtime.vm_dispatch import NoWarmSlot, build_remote_vm_dispatcher
+
     seen = {}
 
     class _NeverYieldsPool:
@@ -449,13 +591,22 @@ def test_remote_claim_budget_is_bounded_and_reserves_detonation_time(tmp_path):
         def release(self, slot, *, dirty=False):  # noqa: ANN001
             pass
 
-    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _NeverYieldsPool(),
-                                    tier="aws-ec2", engine="clippyshot", limits=_FAKE_LIMITS,
-                                    worker_timeout_s=300.0, warm_claim_timeout_s=0.05)
-    assert vm._validate_timeout_s == pytest.approx(330.05)   # 0.05 claim + 300 detonate + 30 seal-slack
+    vm = build_remote_vm_dispatcher(
+        InMemoryJobStore(),
+        str(tmp_path),
+        _NeverYieldsPool(),
+        tier="aws-ec2",
+        engine="clippyshot",
+        limits=_FAKE_LIMITS,
+        worker_timeout_s=300.0,
+        warm_claim_timeout_s=0.05,
+    )
+    assert vm._validate_timeout_s == pytest.approx(
+        330.05
+    )  # 0.05 claim + 300 detonate + 30 seal-slack
     with pytest.raises(NoWarmSlot):
-        vm._validate(tmp_path / "in.bin")                    # no slot within the claim budget -> requeue
-    assert seen["claim_timeout"] <= 0.05                     # bounded by warm_claim_timeout_s, not 300s
+        vm._validate(tmp_path / "in.bin")  # no slot within the claim budget -> requeue
+    assert seen["claim_timeout"] <= 0.05  # bounded by warm_claim_timeout_s, not 300s
 
 
 def test_remote_watchdog_includes_resume_budget(tmp_path):
@@ -463,14 +614,27 @@ def test_remote_watchdog_includes_resume_budget(tmp_path):
     # watchdog must cover claim + resume + detonate -- else a late+slow resume eats the detonation budget
     # and the job is killed mid-run. Here resume_timeout_s=180 (EC2-hibernate default).
     from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
+
     pool = SimpleNamespace(
-        runtime=SimpleNamespace(ssl_context=None, cfg=SimpleNamespace(resume_timeout_s=180.0)),
-        claim=lambda *, timeout_s: None, release=lambda s, dirty=False: None,
+        runtime=SimpleNamespace(
+            ssl_context=None, cfg=SimpleNamespace(resume_timeout_s=180.0)
+        ),
+        claim=lambda *, timeout_s: None,
+        release=lambda s, dirty=False: None,
     )
-    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), pool,
-                                    tier="aws-ec2-hibernate", engine="clippyshot", limits=_FAKE_LIMITS,
-                                    worker_timeout_s=300.0, warm_claim_timeout_s=60.0)
-    assert vm._validate_timeout_s == pytest.approx(570.0)   # 60 claim + 180 resume + 300 detonate + 30 seal
+    vm = build_remote_vm_dispatcher(
+        InMemoryJobStore(),
+        str(tmp_path),
+        pool,
+        tier="aws-ec2-hibernate",
+        engine="clippyshot",
+        limits=_FAKE_LIMITS,
+        worker_timeout_s=300.0,
+        warm_claim_timeout_s=60.0,
+    )
+    assert vm._validate_timeout_s == pytest.approx(
+        570.0
+    )  # 60 claim + 180 resume + 300 detonate + 30 seal
 
 
 def test_remote_all_stale_resume_slots_requeues_not_fails(tmp_path):
@@ -478,23 +642,37 @@ def test_remote_all_stale_resume_slots_requeues_not_fails(tmp_path):
     # _claim must raise NoWarmSlot (-> the job REQUEUES, input preserved), NOT the resume exception (which
     # _process would treat as a job failure and delete the input, though the job never ran).
     from blastbox.host.runtime.vm_dispatch import NoWarmSlot, build_remote_vm_dispatcher
-    slot = SimpleNamespace(slot_id="s1", url="http://x", auth_token=None, agent_port=8765)
+
+    slot = SimpleNamespace(
+        slot_id="s1", url="http://x", auth_token=None, agent_port=8765
+    )
     calls = {"n": 0}
 
     def claim(*, timeout_s):
         calls["n"] += 1
-        return slot if calls["n"] == 1 else None   # one stale slot, then the window is empty
+        return (
+            slot if calls["n"] == 1 else None
+        )  # one stale slot, then the window is empty
 
     def resume(s):
         raise RuntimeError("snapstart slot 's1' is 'terminated'; cannot resume")
 
-    pool = SimpleNamespace(runtime=SimpleNamespace(ssl_context=None, resume=resume),
-                           claim=claim, release=lambda s, dirty=False: None)
-    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), pool,
-                                    tier="aws-lambda-snapstart", engine="clippyshot", limits=_FAKE_LIMITS,
-                                    warm_claim_timeout_s=5.0)
+    pool = SimpleNamespace(
+        runtime=SimpleNamespace(ssl_context=None, resume=resume),
+        claim=claim,
+        release=lambda s, dirty=False: None,
+    )
+    vm = build_remote_vm_dispatcher(
+        InMemoryJobStore(),
+        str(tmp_path),
+        pool,
+        tier="aws-lambda-snapstart",
+        engine="clippyshot",
+        limits=_FAKE_LIMITS,
+        warm_claim_timeout_s=5.0,
+    )
     with pytest.raises(NoWarmSlot):
-        vm._validate(tmp_path / "in.bin")          # resume-failure window -> requeue, not fail
+        vm._validate(tmp_path / "in.bin")  # resume-failure window -> requeue, not fail
 
 
 def test_run_sets_stop_on_interrupt_so_executor_can_join(tmp_path):
@@ -503,18 +681,22 @@ def test_run_sets_stop_on_interrupt_so_executor_can_join(tmp_path):
     # join deadlocks, so the CLI's vm.stop()/pool.stop() never reap live cloud slots. Assert _stop ends up
     # set and run() returns (doesn't hang).
     store = InMemoryJobStore()
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True), engine="authenticode", concurrency=1)
+    d = VmJobDispatcher(
+        store, str(tmp_path), lambda p: ({}, True), engine="authenticode", concurrency=1
+    )
     orig_wait = d._stop.wait
 
     def fake_wait(timeout=None):
-        if timeout is None:            # the run() main-thread block == the interrupt point
+        if timeout is None:  # the run() main-thread block == the interrupt point
             raise KeyboardInterrupt
-        return orig_wait(timeout)      # worker/maintenance loop backoffs
+        return orig_wait(timeout)  # worker/maintenance loop backoffs
 
-    d._stop.wait = fake_wait           # type: ignore[method-assign]
+    d._stop.wait = fake_wait  # type: ignore[method-assign]
     with pytest.raises(KeyboardInterrupt):
         d.run()
-    assert d._stop.is_set()            # set in the finally -> loops exit, executor joins, no deadlock
+    assert (
+        d._stop.is_set()
+    )  # set in the finally -> loops exit, executor joins, no deadlock
 
 
 def test_remote_watchdog_includes_cleanup_budget(tmp_path):
@@ -522,28 +704,54 @@ def test_remote_watchdog_includes_cleanup_budget(tmp_path):
     # make_remote_validate's finally, bounded by cli_timeout_s), else a job that used most of
     # worker_timeout_s is watchdog-killed while terminating -- after its output was received + trusted.
     from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
+
     pool = SimpleNamespace(
-        runtime=SimpleNamespace(ssl_context=None,
-                                cfg=SimpleNamespace(resume_timeout_s=180.0, cli_timeout_s=120.0)),
-        claim=lambda *, timeout_s: None, release=lambda s, dirty=False: None)
-    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), pool,
-                                    tier="aws-lambda-snapstart", engine="clippyshot", limits=_FAKE_LIMITS,
-                                    worker_timeout_s=300.0, warm_claim_timeout_s=60.0)
+        runtime=SimpleNamespace(
+            ssl_context=None,
+            cfg=SimpleNamespace(resume_timeout_s=180.0, cli_timeout_s=120.0),
+        ),
+        claim=lambda *, timeout_s: None,
+        release=lambda s, dirty=False: None,
+    )
+    vm = build_remote_vm_dispatcher(
+        InMemoryJobStore(),
+        str(tmp_path),
+        pool,
+        tier="aws-lambda-snapstart",
+        engine="clippyshot",
+        limits=_FAKE_LIMITS,
+        worker_timeout_s=300.0,
+        warm_claim_timeout_s=60.0,
+    )
     # 60 claim + 180 resume + 300 detonate + 120 cleanup
-    assert vm._validate_timeout_s == pytest.approx(690.0)   # +30 seal-slack
+    assert vm._validate_timeout_s == pytest.approx(690.0)  # +30 seal-slack
 
 
 def test_remote_watchdog_cleanup_budget_from_cascade_attr(tmp_path):
     # I1: a cascade has no cfg, so the cleanup budget must come from its aggregated cli_timeout_s ATTR
     # (same fallback the resume budget uses) -- else a cascaded AWS job is watchdog-killed during terminate.
     from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
+
     pool = SimpleNamespace(
-        runtime=SimpleNamespace(ssl_context=None, resume_timeout_s=180.0, cli_timeout_s=120.0),  # no cfg
-        claim=lambda *, timeout_s: None, release=lambda s, dirty=False: None)
-    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), pool,
-                                    tier="cascade", engine="clippyshot", limits=_FAKE_LIMITS,
-                                    worker_timeout_s=300.0, warm_claim_timeout_s=60.0)
-    assert vm._validate_timeout_s == pytest.approx(690.0)   # 60 + 180 resume + 300 + 120 cleanup + 30 seal
+        runtime=SimpleNamespace(
+            ssl_context=None, resume_timeout_s=180.0, cli_timeout_s=120.0
+        ),  # no cfg
+        claim=lambda *, timeout_s: None,
+        release=lambda s, dirty=False: None,
+    )
+    vm = build_remote_vm_dispatcher(
+        InMemoryJobStore(),
+        str(tmp_path),
+        pool,
+        tier="cascade",
+        engine="clippyshot",
+        limits=_FAKE_LIMITS,
+        worker_timeout_s=300.0,
+        warm_claim_timeout_s=60.0,
+    )
+    assert vm._validate_timeout_s == pytest.approx(
+        690.0
+    )  # 60 + 180 resume + 300 + 120 cleanup + 30 seal
 
 
 def test_remote_watchdog_seal_slack_scales_with_artifact_cap(tmp_path):
@@ -552,17 +760,31 @@ def test_remote_watchdog_seal_slack_scales_with_artifact_cap(tmp_path):
     from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
 
     def budget(cap):
-        limits = SimpleNamespace(max_total_artifact_bytes=cap, max_artifacts=None, max_metadata_bytes=None)
-        pool = SimpleNamespace(runtime=SimpleNamespace(ssl_context=None),   # no cli_timeout_s / resume
-                               claim=lambda *, timeout_s: None, release=lambda s, dirty=False: None)
-        return build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), pool, tier="static",
-                                          engine="clippyshot", limits=limits, worker_timeout_s=300.0,
-                                          warm_claim_timeout_s=0.0)._validate_timeout_s
+        limits = SimpleNamespace(
+            max_total_artifact_bytes=cap, max_artifacts=None, max_metadata_bytes=None
+        )
+        pool = SimpleNamespace(
+            runtime=SimpleNamespace(ssl_context=None),  # no cli_timeout_s / resume
+            claim=lambda *, timeout_s: None,
+            release=lambda s, dirty=False: None,
+        )
+        return build_remote_vm_dispatcher(
+            InMemoryJobStore(),
+            str(tmp_path),
+            pool,
+            tier="static",
+            engine="clippyshot",
+            limits=limits,
+            worker_timeout_s=300.0,
+            warm_claim_timeout_s=0.0,
+        )._validate_timeout_s
 
-    b_small = budget(50 * 1024 * 1024)     # 50 MB -> +1s slack over the 30s base
-    b_large = budget(500 * 1024 * 1024)    # 500 MB -> +10s
-    assert b_small == pytest.approx(300.0 + 30.0 + 1.0)                    # worker + base + 50MB/50MBps
-    assert b_large - b_small == pytest.approx((450 * 1024 * 1024) / (50 * 1024 * 1024))   # scales with cap
+    b_small = budget(50 * 1024 * 1024)  # 50 MB -> +1s slack over the 30s base
+    b_large = budget(500 * 1024 * 1024)  # 500 MB -> +10s
+    assert b_small == pytest.approx(300.0 + 30.0 + 1.0)  # worker + base + 50MB/50MBps
+    assert b_large - b_small == pytest.approx(
+        (450 * 1024 * 1024) / (50 * 1024 * 1024)
+    )  # scales with cap
 
 
 def test_remote_factory_threads_engine_net_policy(tmp_path, monkeypatch):
@@ -570,13 +792,27 @@ def test_remote_factory_threads_engine_net_policy(tmp_path, monkeypatch):
     # must source the job DEFAULT from the same spec as the fixed policy -- else every untargeted job is
     # rejected ('none' default != 'inspect' fixed).
     from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
+
     monkeypatch.setenv("BLASTBOX_NETPOLICY_INSPECT", "exit=direct")
     monkeypatch.delenv("BLASTBOX_ENGINE_CLIPPYSHOT_NETPOLICY", raising=False)
-    spec = SimpleNamespace(net_policy="inspect", allowed_param_keys=frozenset(),
-                           reserved_param_keys=frozenset(), default_params=None)
-    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _FakePool(),
-                                    tier="static", engine="clippyshot", engine_spec=spec, limits=_FAKE_LIMITS)
-    assert vm._engine_net_policy == "inspect"   # job default now sourced from the spec, matching fixed
+    spec = SimpleNamespace(
+        net_policy="inspect",
+        allowed_param_keys=frozenset(),
+        reserved_param_keys=frozenset(),
+        default_params=None,
+    )
+    vm = build_remote_vm_dispatcher(
+        InMemoryJobStore(),
+        str(tmp_path),
+        _FakePool(),
+        tier="static",
+        engine="clippyshot",
+        engine_spec=spec,
+        limits=_FAKE_LIMITS,
+    )
+    assert (
+        vm._engine_net_policy == "inspect"
+    )  # job default now sourced from the spec, matching fixed
     assert vm._fixed_net_policy == "inspect"
 
 
@@ -585,17 +821,35 @@ def test_remote_factory_forwards_output_caps_to_worker(tmp_path):
     # Limits.from_env caps + HTTP 500s an over-cap result BEFORE returning the tar), so a dispatcher-raised
     # cap doesn't fail at the agent. They ride the dispatcher-owned _net_env (merged last).
     from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
-    spec = SimpleNamespace(net_policy="none", allowed_param_keys=frozenset(),
-                           reserved_param_keys=frozenset(), default_params=None)
-    limits = SimpleNamespace(max_metadata_bytes=104857600, max_total_artifact_bytes=500_000_000,
-                             max_artifacts=2000, max_artifact_bytes=209715200)
-    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _FakePool(),
-                                    tier="static", engine="clippyshot", engine_spec=spec, limits=limits)
+
+    spec = SimpleNamespace(
+        net_policy="none",
+        allowed_param_keys=frozenset(),
+        reserved_param_keys=frozenset(),
+        default_params=None,
+    )
+    limits = SimpleNamespace(
+        max_metadata_bytes=104857600,
+        max_total_artifact_bytes=500_000_000,
+        max_artifacts=2000,
+        max_artifact_bytes=209715200,
+    )
+    vm = build_remote_vm_dispatcher(
+        InMemoryJobStore(),
+        str(tmp_path),
+        _FakePool(),
+        tier="static",
+        engine="clippyshot",
+        engine_spec=spec,
+        limits=limits,
+    )
     out = vm._sanitize({})
     assert out["BLASTBOX_MAX_METADATA"] == "104857600"
     assert out["BLASTBOX_MAX_TOTAL_ARTIFACTS"] == "500000000"
     assert out["BLASTBOX_MAX_ARTIFACTS"] == "2000"
-    assert out["BLASTBOX_MAX_ARTIFACT"] == "209715200"   # per-artifact cap too (engines read it)
+    assert (
+        out["BLASTBOX_MAX_ARTIFACT"] == "209715200"
+    )  # per-artifact cap too (engines read it)
 
 
 def test_remote_factory_fixed_policy_is_resolved_not_raw(tmp_path, monkeypatch):
@@ -603,18 +857,47 @@ def test_remote_factory_fixed_policy_is_resolved_not_raw(tmp_path, monkeypatch):
     # fixed policy must be that RESOLVED name, not the raw spec -- else a job matching the raw name runs on
     # a sealed worker instead of being rejected.
     from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
-    monkeypatch.delenv("BLASTBOX_NETPOLICY_INSPECT", raising=False)   # personality NOT declared
-    spec = SimpleNamespace(net_policy="inspect", allowed_param_keys=frozenset(),
-                           reserved_param_keys=frozenset(), default_params=None)
-    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _FakePool(),
-                                    tier="static", engine="clippyshot", engine_spec=spec, limits=_FAKE_LIMITS)
-    assert vm._fixed_net_policy == "none"        # RESOLVED (fail-closed), NOT the raw "inspect"
-    assert vm._engine_net_policy == "none"       # job DEFAULT also resolved -> untargeted jobs run SEALED
+
+    monkeypatch.delenv(
+        "BLASTBOX_NETPOLICY_INSPECT", raising=False
+    )  # personality NOT declared
+    spec = SimpleNamespace(
+        net_policy="inspect",
+        allowed_param_keys=frozenset(),
+        reserved_param_keys=frozenset(),
+        default_params=None,
+    )
+    vm = build_remote_vm_dispatcher(
+        InMemoryJobStore(),
+        str(tmp_path),
+        _FakePool(),
+        tier="static",
+        engine="clippyshot",
+        engine_spec=spec,
+        limits=_FAKE_LIMITS,
+    )
+    assert (
+        vm._fixed_net_policy == "none"
+    )  # RESOLVED (fail-closed), NOT the raw "inspect"
+    assert (
+        vm._engine_net_policy == "none"
+    )  # job DEFAULT also resolved -> untargeted jobs run SEALED
     #                                              (effective "none" == fixed "none"), not rejected
-    monkeypatch.setenv("BLASTBOX_NETPOLICY_INSPECT", "exit=direct")   # now properly declared
-    vm2 = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _FakePool(),
-                                     tier="static", engine="clippyshot", engine_spec=spec, limits=_FAKE_LIMITS)
-    assert vm2._fixed_net_policy == "inspect"    # declared -> resolves to its own name (normal case unchanged)
+    monkeypatch.setenv(
+        "BLASTBOX_NETPOLICY_INSPECT", "exit=direct"
+    )  # now properly declared
+    vm2 = build_remote_vm_dispatcher(
+        InMemoryJobStore(),
+        str(tmp_path),
+        _FakePool(),
+        tier="static",
+        engine="clippyshot",
+        engine_spec=spec,
+        limits=_FAKE_LIMITS,
+    )
+    assert (
+        vm2._fixed_net_policy == "inspect"
+    )  # declared -> resolves to its own name (normal case unchanged)
     assert vm2._engine_net_policy == "inspect"
 
 
@@ -622,11 +905,25 @@ def test_remote_factory_forwards_httpproxy_env(tmp_path, monkeypatch):
     # K2: an httpproxy personality must inject the validated HTTP_PROXY/HTTPS_PROXY into the worker env
     # (like the cold dispatcher) -- else the inner sandbox opens for egress but proxy-aware clients go direct.
     from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
-    monkeypatch.setenv("BLASTBOX_NETPOLICY_PROXYTEST", "exit=httpproxy,proxy=http://p.example:3128")
-    spec = SimpleNamespace(net_policy="proxytest", allowed_param_keys=frozenset(),
-                           reserved_param_keys=frozenset(), default_params=None)
-    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _FakePool(),
-                                    tier="static", engine="clippyshot", engine_spec=spec, limits=_FAKE_LIMITS)
+
+    monkeypatch.setenv(
+        "BLASTBOX_NETPOLICY_PROXYTEST", "exit=httpproxy,proxy=http://p.example:3128"
+    )
+    spec = SimpleNamespace(
+        net_policy="proxytest",
+        allowed_param_keys=frozenset(),
+        reserved_param_keys=frozenset(),
+        default_params=None,
+    )
+    vm = build_remote_vm_dispatcher(
+        InMemoryJobStore(),
+        str(tmp_path),
+        _FakePool(),
+        tier="static",
+        engine="clippyshot",
+        engine_spec=spec,
+        limits=_FAKE_LIMITS,
+    )
     out = vm._sanitize({})
     assert out["BLASTBOX_NET_EGRESS"] == "1"
     assert out["HTTP_PROXY"] == "http://p.example:3128"
@@ -637,14 +934,30 @@ def test_remote_factory_requires_limits_and_engine(tmp_path):
     # G1/G2: the trust-gated remote path PRESERVES worker metadata, so it must fail closed without the
     # host trust gate's inputs -- limits (caps/hashes) and an exact engine to match the envelope against.
     from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
-    pool = SimpleNamespace(runtime=SimpleNamespace(ssl_context=None),
-                           claim=lambda *, timeout_s: None, release=lambda s, dirty=False: None)
+
+    pool = SimpleNamespace(
+        runtime=SimpleNamespace(ssl_context=None),
+        claim=lambda *, timeout_s: None,
+        release=lambda s, dirty=False: None,
+    )
     with pytest.raises(ValueError, match="requires limits"):
-        build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), pool,
-                                   tier="static", engine="clippyshot", limits=None)
+        build_remote_vm_dispatcher(
+            InMemoryJobStore(),
+            str(tmp_path),
+            pool,
+            tier="static",
+            engine="clippyshot",
+            limits=None,
+        )
     with pytest.raises(ValueError, match="requires engine"):
-        build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), pool,
-                                   tier="static", engine=None, limits=_FAKE_LIMITS)
+        build_remote_vm_dispatcher(
+            InMemoryJobStore(),
+            str(tmp_path),
+            pool,
+            tier="static",
+            engine=None,
+            limits=_FAKE_LIMITS,
+        )
 
 
 class _FakePool:
@@ -661,9 +974,17 @@ def test_remote_injects_net_egress_sealed_by_default(tmp_path):
     # a no-egress ('none') engine personality -> the remote worker is told BLASTBOX_NET_EGRESS=0
     from blastbox.host.dispatch import EngineSpec
     from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
+
     spec = EngineSpec(name="clippyshot", image="img", worker_argv=[], net_policy="none")
-    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _FakePool(),
-                                    tier="static", engine="clippyshot", engine_spec=spec, limits=_FAKE_LIMITS)
+    vm = build_remote_vm_dispatcher(
+        InMemoryJobStore(),
+        str(tmp_path),
+        _FakePool(),
+        tier="static",
+        engine="clippyshot",
+        engine_spec=spec,
+        limits=_FAKE_LIMITS,
+    )
     assert vm._sanitize({})["BLASTBOX_NET_EGRESS"] == "0"
 
 
@@ -672,10 +993,22 @@ def test_remote_injects_net_egress_open_for_egress_personality(tmp_path, monkeyp
     monkeypatch.setenv("BLASTBOX_NETPOLICY_INSPECT", "exit=direct")
     from blastbox.host.dispatch import EngineSpec
     from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
-    spec = EngineSpec(name="clippyshot", image="img", worker_argv=[], net_policy="inspect")
-    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _FakePool(),
-                                    tier="static", engine="clippyshot", engine_spec=spec, limits=_FAKE_LIMITS)
-    assert vm._sanitize({})["BLASTBOX_NET_EGRESS"] == "1"   # dispatcher-owned, merged last
+
+    spec = EngineSpec(
+        name="clippyshot", image="img", worker_argv=[], net_policy="inspect"
+    )
+    vm = build_remote_vm_dispatcher(
+        InMemoryJobStore(),
+        str(tmp_path),
+        _FakePool(),
+        tier="static",
+        engine="clippyshot",
+        engine_spec=spec,
+        limits=_FAKE_LIMITS,
+    )
+    assert (
+        vm._sanitize({})["BLASTBOX_NET_EGRESS"] == "1"
+    )  # dispatcher-owned, merged last
     # a hostile job param cannot flip it back
     assert vm._sanitize({"BLASTBOX_NET_EGRESS": "0"})["BLASTBOX_NET_EGRESS"] == "1"
 
@@ -685,7 +1018,9 @@ def test_dispatch_bounds_oversized_summary(tmp_path):
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
     big = {"blob": "A" * (300 * 1024)}
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: (big, True), max_summary_bytes=256 * 1024)
+    d = VmJobDispatcher(
+        store, str(tmp_path), lambda p: (big, True), max_summary_bytes=256 * 1024
+    )
     d._process(store.claim_next())
     got = store.get(job.job_id)
     assert got.status is JobStatus.DONE
@@ -694,13 +1029,21 @@ def test_dispatch_bounds_oversized_summary(tmp_path):
 
 def test_dispatch_times_out_a_hung_validate(tmp_path):
     import time as _t
+
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: _t.sleep(5),
-                        validate_timeout_s=0.3, heartbeat_s=0.1)
+    d = VmJobDispatcher(
+        store,
+        str(tmp_path),
+        lambda p: _t.sleep(5),
+        validate_timeout_s=0.3,
+        heartbeat_s=0.1,
+    )
     d._process(store.claim_next())
     got = store.get(job.job_id)
-    assert got.status is JobStatus.FAILED and got.error == "TimeoutError"   # claim thread freed
+    assert (
+        got.status is JobStatus.FAILED and got.error == "TimeoutError"
+    )  # claim thread freed
 
 
 def test_dispatch_fails_job_when_metadata_unwritable(tmp_path):
@@ -709,7 +1052,9 @@ def test_dispatch_fails_job_when_metadata_unwritable(tmp_path):
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
     d = VmJobDispatcher(store, str(tmp_path), lambda p: ({"v": 1}, True))
-    d._ensure_metadata = lambda *a, **k: False   # simulate a write failure  # type: ignore[method-assign]
+    d._ensure_metadata = lambda *a, **k: (
+        False
+    )  # simulate a write failure  # type: ignore[method-assign]
     d._process(store.claim_next())
     got = store.get(job.job_id)
     assert got.status is JobStatus.FAILED and got.error == "metadata_write_failed"
@@ -720,13 +1065,16 @@ def test_dispatch_does_not_write_metadata_on_failure(tmp_path):
     job = _queue_job(store, tmp_path)
     d = VmJobDispatcher(store, str(tmp_path), lambda p: ({"err": 1}, False))
     d._process(store.claim_next())
-    assert not (tmp_path / job.job_id / "output" / "metadata.json").exists()   # only on success
+    assert not (
+        tmp_path / job.job_id / "output" / "metadata.json"
+    ).exists()  # only on success
 
 
 def test_heartbeat_refreshes_started_at_during_validate(tmp_path):
     # a long validate() must not look abandoned to a peer recovery sweep: the heartbeat refreshes
     # started_at while it runs.
     import time as _t
+
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
     claimed = store.claim_next()
@@ -734,17 +1082,17 @@ def test_heartbeat_refreshes_started_at_during_validate(tmp_path):
 
     def slow_validate(p):
         deadline = _t.time() + 3.0
-        while _t.time() < deadline:           # wait until the heartbeat bumps started_at
+        while _t.time() < deadline:  # wait until the heartbeat bumps started_at
             if (store.get(job.job_id).started_at or 0) > t0:
                 return ({}, True)
             _t.sleep(0.02)
-        return ({}, False)                    # heartbeat never fired → fail the assertion below
+        return ({}, False)  # heartbeat never fired → fail the assertion below
 
     d = VmJobDispatcher(store, str(tmp_path), slow_validate, heartbeat_s=0.05)
     d._process(claimed)
     got = store.get(job.job_id)
-    assert got.status is JobStatus.DONE       # heartbeat fired (validate returned ok=True)
-    assert got.started_at > t0                # started_at was refreshed past claim time
+    assert got.status is JobStatus.DONE  # heartbeat fired (validate returned ok=True)
+    assert got.started_at > t0  # started_at was refreshed past claim time
 
 
 def test_heartbeat_survives_transient_store_error(tmp_path):
@@ -756,17 +1104,24 @@ def test_heartbeat_survives_transient_store_error(tmp_path):
     class _FlakyHeartbeatStore(InMemoryJobStore):
         heartbeat_raises = 0
 
-        def update_if_status(self, job_id, expect_status, *, expect_claim_id=None, **fields):
+        def update_if_status(
+            self, job_id, expect_status, *, expect_claim_id=None, **fields
+        ):
             # The heartbeat is the ONLY caller that refreshes started_at with no status change; the
             # terminal CAS sets status= and the warm-mark sets worker_runtime/worker_tier.
-            if "started_at" in fields and "status" not in fields and self.heartbeat_raises > 0:
+            if (
+                "started_at" in fields
+                and "status" not in fields
+                and self.heartbeat_raises > 0
+            ):
                 self.heartbeat_raises -= 1
                 raise RuntimeError("transient store blip")
-            return super().update_if_status(job_id, expect_status,
-                                            expect_claim_id=expect_claim_id, **fields)
+            return super().update_if_status(
+                job_id, expect_status, expect_claim_id=expect_claim_id, **fields
+            )
 
     store = _FlakyHeartbeatStore()
-    store.heartbeat_raises = 2          # first two heartbeats blow up, then recover
+    store.heartbeat_raises = 2  # first two heartbeats blow up, then recover
     job = _queue_job(store, tmp_path)
     claimed = store.claim_next()
     t0 = store.get(job.job_id).started_at
@@ -775,7 +1130,9 @@ def test_heartbeat_survives_transient_store_error(tmp_path):
         # the heartbeat interval floors at 1s; 2 injected failures push the first SURVIVING beat to
         # ~3s, so give it generous headroom (this asserts recovery, not latency).
         deadline = _t.time() + 8.0
-        while _t.time() < deadline:     # wait until a heartbeat survives the blips and bumps started_at
+        while (
+            _t.time() < deadline
+        ):  # wait until a heartbeat survives the blips and bumps started_at
             if (store.get(job.job_id).started_at or 0) > t0:
                 return ({}, True)
             _t.sleep(0.02)
@@ -784,9 +1141,11 @@ def test_heartbeat_survives_transient_store_error(tmp_path):
     d = VmJobDispatcher(store, str(tmp_path), slow_validate, heartbeat_s=0.05)
     d._process(claimed)
     got = store.get(job.job_id)
-    assert got.status is JobStatus.DONE        # heartbeat recovered + job completed despite the blips
-    assert got.started_at > t0                 # started_at was still refreshed (sweep won't orphan it)
-    assert store.heartbeat_raises == 0         # both injected errors were actually exercised
+    assert (
+        got.status is JobStatus.DONE
+    )  # heartbeat recovered + job completed despite the blips
+    assert got.started_at > t0  # started_at was still refreshed (sweep won't orphan it)
+    assert store.heartbeat_raises == 0  # both injected errors were actually exercised
 
 
 def test_dispatch_sets_retention_expiry(tmp_path):
@@ -796,7 +1155,9 @@ def test_dispatch_sets_retention_expiry(tmp_path):
     d._process(store.claim_next())
     got = store.get(job.job_id)
     assert got.finished_at is not None and got.expires_at is not None
-    assert got.expires_at == pytest.approx(got.finished_at + 100)   # retention sweeper can reclaim it
+    assert got.expires_at == pytest.approx(
+        got.finished_at + 100
+    )  # retention sweeper can reclaim it
 
 
 def test_dispatch_purges_input_when_job_was_reclaimed_before_validate(tmp_path):
@@ -804,38 +1165,59 @@ def test_dispatch_purges_input_when_job_was_reclaimed_before_validate(tmp_path):
     # CAS fails (stale claim_id) before we even reach validate.
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
-    stale = store.claim_next()                                       # claim A
-    store.update_if_status(job.job_id, JobStatus.RUNNING, expect_claim_id=stale.claim_id,
-                           status=JobStatus.QUEUED, claim_id=None, started_at=None)  # requeue
-    store.claim_next()                                              # reclaim B (now RUNNING under B)
+    stale = store.claim_next()  # claim A
+    store.update_if_status(
+        job.job_id,
+        JobStatus.RUNNING,
+        expect_claim_id=stale.claim_id,
+        status=JobStatus.QUEUED,
+        claim_id=None,
+        started_at=None,
+    )  # requeue
+    store.claim_next()  # reclaim B (now RUNNING under B)
     d = VmJobDispatcher(store, str(tmp_path), lambda p: ({"v": 1}, True))
-    d._process(stale)                                              # process with the STALE claim A
+    d._process(stale)  # process with the STALE claim A
     # Task 9: the purge is now unconditional, even here. We no longer leave the input "for the new
     # owner" -- in a real fleet the new owner is on ANOTHER host and could never read bytes left on
     # THIS worker's disk anyway, and the blob store (real in every mode) can always re-materialise
     # the sample for whoever runs the job next. So this worker purges its own dir regardless.
     assert not (tmp_path / job.job_id / "input" / "evil.dll").exists()
-    assert store.get(job.job_id).status is JobStatus.RUNNING        # stale owner couldn't terminate it
+    assert (
+        store.get(job.job_id).status is JobStatus.RUNNING
+    )  # stale owner couldn't terminate it
 
 
 def test_claim_is_ours_requeues_foreign_engine(tmp_path):
     store = InMemoryJobStore()
-    job = _queue_job(store, tmp_path)                  # engine="authenticode"
+    job = _queue_job(store, tmp_path)  # engine="authenticode"
     ran = []
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: (ran.append(p), ({}, True))[1], engine="other")
+    d = VmJobDispatcher(
+        store, str(tmp_path), lambda p: (ran.append(p), ({}, True))[1], engine="other"
+    )
     assert d._claim_is_ours(store.claim_next()) is False
     got = store.get(job.job_id)
-    assert got.status is JobStatus.QUEUED and got.claim_id is None  # requeued for the right dispatcher
-    assert ran == []                                               # foreign job never validated
+    assert (
+        got.status is JobStatus.QUEUED and got.claim_id is None
+    )  # requeued for the right dispatcher
+    assert ran == []  # foreign job never validated
 
 
 def test_claim_is_ours_accepts_matching_and_unscoped(tmp_path):
     store = InMemoryJobStore()
     _queue_job(store, tmp_path)
     claimed = store.claim_next()
-    assert VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True))._claim_is_ours(claimed) is True
-    assert VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True),
-                           engine="authenticode")._claim_is_ours(claimed) is True
+    assert (
+        VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True))._claim_is_ours(
+            claimed
+        )
+        is True
+    )
+    assert (
+        VmJobDispatcher(
+            store, str(tmp_path), lambda p: ({}, True), engine="authenticode"
+        )._claim_is_ours(claimed)
+        is True
+    )
 
 
 def test_claim_next_engine_set_keeps_vm_jobs_off_cold_dispatcher():
@@ -848,15 +1230,23 @@ def test_claim_next_engine_set_keeps_vm_jobs_off_cold_dispatcher():
     seen = set()
     while (j := store.claim_next(engine=cold_engines)) is not None:
         seen.add(j.engine)
-    assert seen == cold_engines                                   # never claimed authenticode
-    vm = store.claim_next(engine="authenticode")                  # left for the VM dispatcher
+    assert seen == cold_engines  # never claimed authenticode
+    vm = store.claim_next(engine="authenticode")  # left for the VM dispatcher
     assert vm is not None and vm.engine == "authenticode"
 
 
-def _claim_as_vm(store, job, *, started_at, worker_runtime="warm", worker_tier="libvirt-vm"):
+def _claim_as_vm(
+    store, job, *, started_at, worker_runtime="warm", worker_tier="libvirt-vm"
+):
     claimed = store.claim_next()
-    store.update_if_status(job.job_id, JobStatus.RUNNING, expect_claim_id=claimed.claim_id,
-                           started_at=started_at, worker_runtime=worker_runtime, worker_tier=worker_tier)
+    store.update_if_status(
+        job.job_id,
+        JobStatus.RUNNING,
+        expect_claim_id=claimed.claim_id,
+        started_at=started_at,
+        worker_runtime=worker_runtime,
+        worker_tier=worker_tier,
+    )
 
 
 def test_maintenance_recovers_orphaned_running_job(tmp_path):
@@ -864,8 +1254,10 @@ def test_maintenance_recovers_orphaned_running_job(tmp_path):
     # maintenance and its input dropped — not left RUNNING forever.
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
-    _claim_as_vm(store, job, started_at=1.0)             # ancient started_at, marked warm/our-tier
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True), orphan_timeout_s=10.0)
+    _claim_as_vm(store, job, started_at=1.0)  # ancient started_at, marked warm/our-tier
+    d = VmJobDispatcher(
+        store, str(tmp_path), lambda p: ({}, True), orphan_timeout_s=10.0
+    )
     d._run_maintenance()
     got = store.get(job.job_id)
     assert got.status is JobStatus.FAILED and got.error == "orphaned"
@@ -874,12 +1266,15 @@ def test_maintenance_recovers_orphaned_running_job(tmp_path):
 
 def test_maintenance_leaves_fresh_running_job_alone(tmp_path):
     import time as _t
+
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
-    _claim_as_vm(store, job, started_at=_t.time())        # freshly heartbeated
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True), orphan_timeout_s=600.0)
+    _claim_as_vm(store, job, started_at=_t.time())  # freshly heartbeated
+    d = VmJobDispatcher(
+        store, str(tmp_path), lambda p: ({}, True), orphan_timeout_s=600.0
+    )
     d._run_maintenance()
-    assert store.get(job.job_id).status is JobStatus.RUNNING   # still alive, untouched
+    assert store.get(job.job_id).status is JobStatus.RUNNING  # still alive, untouched
 
 
 def test_maintenance_sole_owner_recovers_unmarked_claim(tmp_path):
@@ -887,17 +1282,25 @@ def test_maintenance_sole_owner_recovers_unmarked_claim(tmp_path):
     # deployment; sole_owner=True lets maintenance reclaim it (no cold dispatcher to mistake it for).
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
-    _claim_as_vm(store, job, started_at=1.0, worker_runtime=None, worker_tier=None)  # unmarked, stale
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True), orphan_timeout_s=10.0,
-                        sole_owner=True)
+    _claim_as_vm(
+        store, job, started_at=1.0, worker_runtime=None, worker_tier=None
+    )  # unmarked, stale
+    d = VmJobDispatcher(
+        store,
+        str(tmp_path),
+        lambda p: ({}, True),
+        orphan_timeout_s=10.0,
+        sole_owner=True,
+    )
     d._run_maintenance()
-    assert store.get(job.job_id).status is JobStatus.FAILED       # reclaimed
+    assert store.get(job.job_id).status is JobStatus.FAILED  # reclaimed
     # without sole_owner an unmarked claim is left alone (could be a cold job)
     store2 = InMemoryJobStore()
     job2 = _queue_job(store2, tmp_path / "b")
     _claim_as_vm(store2, job2, started_at=1.0, worker_runtime=None, worker_tier=None)
-    VmJobDispatcher(store2, str(tmp_path / "b"), lambda p: ({}, True),
-                    orphan_timeout_s=10.0)._run_maintenance()
+    VmJobDispatcher(
+        store2, str(tmp_path / "b"), lambda p: ({}, True), orphan_timeout_s=10.0
+    )._run_maintenance()
     assert store2.get(job2.job_id).status is JobStatus.RUNNING
 
 
@@ -907,9 +1310,13 @@ def test_maintenance_does_not_recover_a_cold_job(tmp_path):
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
     _claim_as_vm(store, job, started_at=1.0, worker_runtime="runc", worker_tier=None)
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True), orphan_timeout_s=10.0)
+    d = VmJobDispatcher(
+        store, str(tmp_path), lambda p: ({}, True), orphan_timeout_s=10.0
+    )
     d._run_maintenance()
-    assert store.get(job.job_id).status is JobStatus.RUNNING        # left for the cold dispatcher
+    assert (
+        store.get(job.job_id).status is JobStatus.RUNNING
+    )  # left for the cold dispatcher
     assert (tmp_path / job.job_id / "input" / "evil.dll").exists()  # input NOT deleted
 
 
@@ -918,10 +1325,12 @@ def test_maintenance_expires_terminal_job_dir(tmp_path):
     job = _queue_job(store, tmp_path)
     job.result_dir = str(tmp_path / job.job_id / "output")
     (tmp_path / job.job_id / "output").mkdir(parents=True)
-    store.update(job.job_id, status=JobStatus.DONE, result_dir=job.result_dir, expires_at=1.0)  # past
+    store.update(
+        job.job_id, status=JobStatus.DONE, result_dir=job.result_dir, expires_at=1.0
+    )  # past
     d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True))
     d._run_maintenance()
-    assert not (tmp_path / job.job_id).exists()           # retention reclaimed the whole job dir
+    assert not (tmp_path / job.job_id).exists()  # retention reclaimed the whole job dir
     assert store.get(job.job_id).status is JobStatus.EXPIRED
 
 
@@ -929,6 +1338,7 @@ def test_libvirt_vm_is_a_routable_tier():
     # operators must be able to target_tier=libvirt-vm so VM-only jobs aren't claimed+failed by the
     # cold dispatcher in a shared store (ingress validates target_tier against VALID_TIERS).
     from blastbox.host.jobs.base import VALID_TIERS
+
     assert "libvirt-vm" in VALID_TIERS
 
 
@@ -937,18 +1347,24 @@ def test_engine_scoped_claim_skips_older_foreign_head(tmp_path):
     # at the queue head (no head-of-line block, no claim+requeue churn).
     store = InMemoryJobStore()
     other = Job.new(engine="other-engine", filename="b.dll")
-    store.create(other)                       # older, head of queue
+    store.create(other)  # older, head of queue
     mine = Job.new(engine="authenticode", filename="a.dll")
     store.create(mine)
     claimed = store.claim_next(engine="authenticode")
-    assert claimed is not None and claimed.job_id == mine.job_id   # skipped the foreign head
-    assert store.get(other.job_id).status is JobStatus.QUEUED      # foreign job left untouched
+    assert (
+        claimed is not None and claimed.job_id == mine.job_id
+    )  # skipped the foreign head
+    assert (
+        store.get(other.job_id).status is JobStatus.QUEUED
+    )  # foreign job left untouched
 
 
 def test_dispatch_marks_failed_when_engine_reports_not_ok(tmp_path):
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({"envelope_status": "engine_error"}, False))
+    d = VmJobDispatcher(
+        store, str(tmp_path), lambda p: ({"envelope_status": "engine_error"}, False)
+    )
     d._process(store.claim_next())
     assert store.get(job.job_id).status is JobStatus.FAILED
 
@@ -973,20 +1389,26 @@ def test_rejects_job_with_unhonored_net_policy(tmp_path):
     # opt-in: the pool here is DECLARED no-network ("none"), so a "tor" override is rejected.
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
-    job.net_policy = "tor"   # InMemoryJobStore holds the job by reference; claim_next snapshots it
+    job.net_policy = (
+        "tor"  # InMemoryJobStore holds the job by reference; claim_next snapshots it
+    )
     detonated = {"ran": False}
 
     def validate(p):
         detonated["ran"] = True
         return ({}, True)
 
-    d = VmJobDispatcher(store, str(tmp_path), validate, fixed_net_policy="none")  # declared no-network
+    d = VmJobDispatcher(
+        store, str(tmp_path), validate, fixed_net_policy="none"
+    )  # declared no-network
     d._process(store.claim_next())
     got = store.get(job.job_id)
     assert got.status is JobStatus.FAILED
     assert "net_policy" in (got.error or "") and "tor" in got.error
-    assert detonated["ran"] is False                          # rejected BEFORE validate
-    assert not (tmp_path / job.job_id / "input" / job.filename).exists()  # input dropped
+    assert detonated["ran"] is False  # rejected BEFORE validate
+    assert not (
+        tmp_path / job.job_id / "input" / job.filename
+    ).exists()  # input dropped
 
 
 def test_net_policy_enforcement_opt_in_skips_when_undeclared(tmp_path):
@@ -996,7 +1418,9 @@ def test_net_policy_enforcement_opt_in_skips_when_undeclared(tmp_path):
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
     job.net_policy = "tor"
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True))  # fixed_net_policy=None → opt-out
+    d = VmJobDispatcher(
+        store, str(tmp_path), lambda p: ({}, True)
+    )  # fixed_net_policy=None → opt-out
     d._process(store.claim_next())
     assert store.get(job.job_id).status is JobStatus.DONE
 
@@ -1006,7 +1430,9 @@ def test_accepts_job_whose_net_policy_matches_fixed(tmp_path):
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
     job.net_policy = "fakenet"
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True), fixed_net_policy="fakenet")
+    d = VmJobDispatcher(
+        store, str(tmp_path), lambda p: ({}, True), fixed_net_policy="fakenet"
+    )
     d._process(store.claim_next())
     assert store.get(job.job_id).status is JobStatus.DONE
 
@@ -1016,9 +1442,14 @@ def test_rejects_job_when_engine_default_policy_mismatches_fixed(tmp_path):
     # provisioned "fakenet": the cold path would apply tor, so the VM tier must reject rather than
     # detonate under the wrong fixed egress.
     store = InMemoryJobStore()
-    job = _queue_job(store, tmp_path)                         # job.net_policy is None
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True),
-                        fixed_net_policy="fakenet", engine_net_policy="tor")
+    job = _queue_job(store, tmp_path)  # job.net_policy is None
+    d = VmJobDispatcher(
+        store,
+        str(tmp_path),
+        lambda p: ({}, True),
+        fixed_net_policy="fakenet",
+        engine_net_policy="tor",
+    )
     d._process(store.claim_next())
     got = store.get(job.job_id)
     assert got.status is JobStatus.FAILED
@@ -1028,8 +1459,13 @@ def test_rejects_job_when_engine_default_policy_mismatches_fixed(tmp_path):
 def test_accepts_job_when_engine_default_matches_fixed(tmp_path):
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True),
-                        fixed_net_policy="fakenet", engine_net_policy="fakenet")
+    d = VmJobDispatcher(
+        store,
+        str(tmp_path),
+        lambda p: ({}, True),
+        fixed_net_policy="fakenet",
+        engine_net_policy="fakenet",
+    )
     d._process(store.claim_next())
     assert store.get(job.job_id).status is JobStatus.DONE
 
@@ -1038,11 +1474,18 @@ def test_per_job_override_takes_precedence_over_engine_default(tmp_path):
     # an explicit override wins over the engine default for the effective-policy comparison.
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
-    job.net_policy = "fakenet"                                # override matches the pool
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True),
-                        fixed_net_policy="fakenet", engine_net_policy="tor")
+    job.net_policy = "fakenet"  # override matches the pool
+    d = VmJobDispatcher(
+        store,
+        str(tmp_path),
+        lambda p: ({}, True),
+        fixed_net_policy="fakenet",
+        engine_net_policy="tor",
+    )
     d._process(store.claim_next())
-    assert store.get(job.job_id).status is JobStatus.DONE     # override (fakenet) honored, not the default
+    assert (
+        store.get(job.job_id).status is JobStatus.DONE
+    )  # override (fakenet) honored, not the default
 
 
 def test_engine_net_policy_derived_from_env_when_not_passed(tmp_path, monkeypatch):
@@ -1050,9 +1493,14 @@ def test_engine_net_policy_derived_from_env_when_not_passed(tmp_path, monkeypatc
     # reads, so a routed engine default isn't silently skipped just because a caller didn't thread it.
     monkeypatch.setenv("BLASTBOX_ENGINE_AUTHENTICODE_NETPOLICY", "tor")
     store = InMemoryJobStore()
-    job = _queue_job(store, tmp_path)                         # no per-job override
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True),
-                        engine="authenticode", fixed_net_policy="fakenet")  # engine_net_policy NOT passed
+    job = _queue_job(store, tmp_path)  # no per-job override
+    d = VmJobDispatcher(
+        store,
+        str(tmp_path),
+        lambda p: ({}, True),
+        engine="authenticode",
+        fixed_net_policy="fakenet",
+    )  # engine_net_policy NOT passed
     d._process(store.claim_next())
     got = store.get(job.job_id)
     assert got.status is JobStatus.FAILED and "tor" in (got.error or "")
@@ -1065,8 +1513,13 @@ def test_none_policy_job_rejected_on_networked_pool(tmp_path, monkeypatch):
     monkeypatch.setenv("BLASTBOX_ENGINE_AUTHENTICODE_NETPOLICY", "none")
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True),
-                        engine="authenticode", fixed_net_policy="fakenet")
+    d = VmJobDispatcher(
+        store,
+        str(tmp_path),
+        lambda p: ({}, True),
+        engine="authenticode",
+        fixed_net_policy="fakenet",
+    )
     d._process(store.claim_next())
     got = store.get(job.job_id)
     assert got.status is JobStatus.FAILED and "none" in (got.error or "")
@@ -1077,7 +1530,9 @@ def test_no_policy_anywhere_runs_on_unconfigured_pool(tmp_path):
     # effective="none" == fixed="none" → run normally (the equality model doesn't break the default).
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
-    d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True), engine="authenticode")
+    d = VmJobDispatcher(
+        store, str(tmp_path), lambda p: ({}, True), engine="authenticode"
+    )
     d._process(store.claim_next())
     assert store.get(job.job_id).status is JobStatus.DONE
 
@@ -1100,7 +1555,9 @@ def test_does_not_write_metadata_when_claim_lost_during_validate(tmp_path):
     # we bailed before publishing: no metadata.json written, and we did NOT CAS the job to DONE
     assert not (tmp_path / job.job_id / "output" / "metadata.json").exists()
     got = store.get(job.job_id)
-    assert got.status is JobStatus.RUNNING and got.claim_id == "peer-now-owns-it"  # peer still owns it
+    assert (
+        got.status is JobStatus.RUNNING and got.claim_id == "peer-now-owns-it"
+    )  # peer still owns it
     # Task 9: the purge is now unconditional here too. We no longer leave the shared input for the
     # new owner -- in a real fleet the peer holds its OWN copy on its OWN host (this worker's disk
     # was never shared with it), and the blob store can always re-materialise the sample if needed.
@@ -1120,14 +1577,16 @@ def test_dispatch_marks_failed_when_validate_raises_baseexception(tmp_path):
     d = VmJobDispatcher(store, str(tmp_path), sys_exit)
     d._process(store.claim_next())
     got = store.get(job.job_id)
-    assert got.status is JobStatus.FAILED              # normalized to a failure, not a stuck RUNNING
-    assert got.error == "RuntimeError"                 # wrapped (SystemExit → RuntimeError)
+    assert (
+        got.status is JobStatus.FAILED
+    )  # normalized to a failure, not a stuck RUNNING
+    assert got.error == "RuntimeError"  # wrapped (SystemExit → RuntimeError)
 
 
 def test_dispatch_missing_input_is_failed(tmp_path):
     store = InMemoryJobStore()
     job = _queue_job(store, tmp_path)
-    (tmp_path / job.job_id / "input" / "evil.dll").unlink()   # spooled input vanished
+    (tmp_path / job.job_id / "input" / "evil.dll").unlink()  # spooled input vanished
     d = VmJobDispatcher(store, str(tmp_path), lambda p: ({}, True))
     d._process(store.claim_next())
     assert store.get(job.job_id).status is JobStatus.FAILED
@@ -1151,30 +1610,51 @@ def test_resume_brownout_hands_the_parked_slot_back_instead_of_terminating_it():
 
     def _rt(runner):
         return LambdaSnapStartRuntime(
-            LambdaSnapStartConfig(region="us-east-1", image_identifier="arn:x",
-                                  allow_default_egress=True, resume_timeout_s=0.4,
-                                  resume_poll_s=0.05),
-            aws_runner=runner, http_probe=lambda u, h, t: False)
+            LambdaSnapStartConfig(
+                region="us-east-1",
+                image_identifier="arn:x",
+                allow_default_egress=True,
+                resume_timeout_s=0.4,
+                resume_poll_s=0.05,
+            ),
+            aws_runner=runner,
+            http_probe=lambda u, h, t: False,
+        )
 
     # (a) TRANSIENT: throttled describes -> hand the slot back, never terminate
-    throttled = _rt(lambda a, t: subprocess.CompletedProcess(
-        list(a), 255, "", "(ThrottlingException) Rate exceeded"))
+    throttled = _rt(
+        lambda a, t: subprocess.CompletedProcess(
+            list(a), 255, "", "(ThrottlingException) Rate exceeded"
+        )
+    )
     killed: list[str] = []
-    throttled._terminate = lambda s: killed.append(s.resource_id)   # type: ignore[method-assign]
+    throttled._terminate = lambda s: killed.append(s.resource_id)  # type: ignore[method-assign]
     pool = WarmPool(runtime=throttled, warm_size=1)
-    slot = AwsWorkerSlot(slot_id="p1", resource_id="mvm-parked", state=SlotState.ASSIGNED)
+    slot = AwsWorkerSlot(
+        slot_id="p1", resource_id="mvm-parked", state=SlotState.ASSIGNED
+    )
     pool._slots["p1"] = slot
     with contextlib.suppress(Exception):
         _resume_on_claim(pool, slot)
-    assert killed == [], f"a throttled resume terminated a healthy parked slot: {killed}"
-    assert pool._slots["p1"].state == SlotState.IDLE, "slot not handed back for a later attempt"
+    assert killed == [], (
+        f"a throttled resume terminated a healthy parked slot: {killed}"
+    )
+    assert pool._slots["p1"].state == SlotState.IDLE, (
+        "slot not handed back for a later attempt"
+    )
 
     # (b) CONFIRMED dead: must STILL be disposed — the softening must not swallow real verdicts
-    dead = _rt(lambda a, t: subprocess.CompletedProcess(list(a), 0, '{"state": "TERMINATED"}', ""))
+    dead = _rt(
+        lambda a, t: subprocess.CompletedProcess(
+            list(a), 0, '{"state": "TERMINATED"}', ""
+        )
+    )
     killed2: list[str] = []
-    dead._terminate = lambda s: killed2.append(s.resource_id)       # type: ignore[method-assign]
+    dead._terminate = lambda s: killed2.append(s.resource_id)  # type: ignore[method-assign]
     pool2 = WarmPool(runtime=dead, warm_size=1)
-    slot2 = AwsWorkerSlot(slot_id="p2", resource_id="mvm-dead", state=SlotState.ASSIGNED)
+    slot2 = AwsWorkerSlot(
+        slot_id="p2", resource_id="mvm-dead", state=SlotState.ASSIGNED
+    )
     pool2._slots["p2"] = slot2
     with contextlib.suppress(Exception):
         _resume_on_claim(pool2, slot2)
@@ -1182,6 +1662,7 @@ def test_resume_brownout_hands_the_parked_slot_back_instead_of_terminating_it():
 
 
 # ----------------------------------------------- issue #77 round 2: escalated-review regressions
+
 
 def test_f1_resume_timeout_hands_the_parked_slot_back_instead_of_terminating_it():
     """A resume-time CLI TIMEOUT (not a throttle) had no probe budget in scope, so it raised a
@@ -1202,18 +1683,31 @@ def test_f1_resume_timeout_hands_the_parked_slot_back_instead_of_terminating_it(
         raise subprocess.TimeoutExpired(cmd=list(argv), timeout=timeout)
 
     rt = LambdaSnapStartRuntime(
-        LambdaSnapStartConfig(region="us-east-1", image_identifier="arn:x", allow_default_egress=True,
-                              resume_timeout_s=0.4, resume_poll_s=0.05),
-        aws_runner=_timeout_runner, http_probe=lambda u, h, t: False)
+        LambdaSnapStartConfig(
+            region="us-east-1",
+            image_identifier="arn:x",
+            allow_default_egress=True,
+            resume_timeout_s=0.4,
+            resume_poll_s=0.05,
+        ),
+        aws_runner=_timeout_runner,
+        http_probe=lambda u, h, t: False,
+    )
     killed: list[str] = []
-    rt._terminate = lambda s: killed.append(s.resource_id)   # type: ignore[method-assign]
+    rt._terminate = lambda s: killed.append(s.resource_id)  # type: ignore[method-assign]
     pool = WarmPool(runtime=rt, warm_size=1)
-    slot = AwsWorkerSlot(slot_id="p1", resource_id="mvm-parked", state=SlotState.ASSIGNED)
+    slot = AwsWorkerSlot(
+        slot_id="p1", resource_id="mvm-parked", state=SlotState.ASSIGNED
+    )
     pool._slots["p1"] = slot
     with contextlib.suppress(Exception):
         _resume_on_claim(pool, slot)
-    assert killed == [], f"a timed-out resume terminated a healthy parked slot: {killed}"
-    assert pool._slots["p1"].state == SlotState.IDLE, "slot not handed back for a later attempt"
+    assert killed == [], (
+        f"a timed-out resume terminated a healthy parked slot: {killed}"
+    )
+    assert pool._slots["p1"].state == SlotState.IDLE, (
+        "slot not handed back for a later attempt"
+    )
 
 
 class _RetryPool:
@@ -1221,6 +1715,7 @@ class _RetryPool:
 
     def __init__(self, slots, resume):  # noqa: ANN001
         from types import SimpleNamespace
+
         self.slots = list(slots)
         self.assigned: set[str] = set()
         self.released: list[str] = []
@@ -1262,15 +1757,20 @@ def test_f7_claim_retry_advances_to_a_healthy_slot_after_an_unknown_resume():
 
     def resume(slot):  # noqa: ANN001
         if slot.slot_id == "A":
-            raise AwsUnknownState("aws lambda-microvms resume-microvm: transient (rc=255): Rate exceeded")
+            raise AwsUnknownState(
+                "aws lambda-microvms resume-microvm: transient (rc=255): Rate exceeded"
+            )
 
     t = [0.0]
     pool = _RetryPool([a, b], resume)
-    got = _claim_resumable_slot(pool, 5.0, clock=lambda: t.__setitem__(0, t[0] + 0.05) or t[0])
+    got = _claim_resumable_slot(
+        pool, 5.0, clock=lambda: t.__setitem__(0, t[0] + 0.05) or t[0]
+    )
     assert got is b, f"expected the healthy slot B, got {got}"
     assert pool.released == [], "an UNKNOWN resume must not destroy the slot"
     assert pool.resume_calls.count("A") == 1, (
-        f"slot A was retried {pool.resume_calls.count('A')}x instead of being passed over")
+        f"slot A was retried {pool.resume_calls.count('A')}x instead of being passed over"
+    )
 
 
 def test_f7_the_passed_over_slot_is_returned_to_the_pool_afterwards():
@@ -1289,8 +1789,12 @@ def test_f7_the_passed_over_slot_is_returned_to_the_pool_afterwards():
 
     t = [0.0]
     pool = _RetryPool([a, b], resume)
-    _claim_resumable_slot(pool, 5.0, clock=lambda: t.__setitem__(0, t[0] + 0.05) or t[0])
-    assert pool.assigned == {"B"}, f"passed-over slots leaked as ASSIGNED: {pool.assigned}"
+    _claim_resumable_slot(
+        pool, 5.0, clock=lambda: t.__setitem__(0, t[0] + 0.05) or t[0]
+    )
+    assert pool.assigned == {"B"}, (
+        f"passed-over slots leaked as ASSIGNED: {pool.assigned}"
+    )
 
 
 def test_f7_a_confirmed_dead_slot_is_still_released_dirty():
@@ -1308,7 +1812,9 @@ def test_f7_a_confirmed_dead_slot_is_still_released_dirty():
 
     t = [0.0]
     pool = _RetryPool([a, b], resume)
-    got = _claim_resumable_slot(pool, 5.0, clock=lambda: t.__setitem__(0, t[0] + 0.05) or t[0])
+    got = _claim_resumable_slot(
+        pool, 5.0, clock=lambda: t.__setitem__(0, t[0] + 0.05) or t[0]
+    )
     assert got is b
     assert pool.released == ["A"], "a confirmed-dead slot must still be retired dirty"
 
@@ -1338,13 +1844,15 @@ def test_f23_a_slot_returned_after_the_deadline_is_handed_back_untouched():
             self.released = []
             self.unclaimed = []
             self.handed_out = False
-            self.runtime = SimpleNamespace(resume=lambda s: self.resume_calls.append(s.slot_id))
+            self.runtime = SimpleNamespace(
+                resume=lambda s: self.resume_calls.append(s.slot_id)
+            )
 
         def claim(self, *, timeout_s):  # noqa: ANN001
             if self.handed_out:
                 return None
             self.handed_out = True
-            for _ in range(40):        # the probe eats the remaining claim window
+            for _ in range(40):  # the probe eats the remaining claim window
                 clock()
             return self.slot
 
@@ -1357,7 +1865,9 @@ def test_f23_a_slot_returned_after_the_deadline_is_handed_back_untouched():
     pool = _SlowProbePool()
     got = _claim_resumable_slot(pool, 1.0, clock=clock)
     assert got is None, "no slot could be resumed inside the window"
-    assert pool.resume_calls == [], "a resume was started with no budget left to pay for it"
+    assert pool.resume_calls == [], (
+        "a resume was started with no budget left to pay for it"
+    )
     assert pool.released == [], "a healthy, never-probed slot was destroyed"
     assert pool.unclaimed == ["A"], "the slot must be handed back for the next claim"
 
@@ -1370,7 +1880,10 @@ def test_a_passed_over_slot_is_released_when_its_cooldown_expires():
     from types import SimpleNamespace
 
     from blastbox.host.runtime.aws_worker import AwsUnknownState
-    from blastbox.host.runtime.vm_dispatch import _RETRY_SLOT_COOLDOWN_S, _claim_resumable_slot
+    from blastbox.host.runtime.vm_dispatch import (
+        _RETRY_SLOT_COOLDOWN_S,
+        _claim_resumable_slot,
+    )
 
     a = SimpleNamespace(slot_id="A")
     attempts = {"n": 0}
@@ -1378,7 +1891,9 @@ def test_a_passed_over_slot_is_released_when_its_cooldown_expires():
     def resume(slot):  # noqa: ANN001
         attempts["n"] += 1
         if attempts["n"] == 1:
-            raise AwsUnknownState("transient (rc=255): Rate exceeded")   # first try browns out
+            raise AwsUnknownState(
+                "transient (rc=255): Rate exceeded"
+            )  # first try browns out
 
     t = [0.0]
 
@@ -1390,7 +1905,8 @@ def test_a_passed_over_slot_is_released_when_its_cooldown_expires():
     got = _claim_resumable_slot(pool, _RETRY_SLOT_COOLDOWN_S * 4, clock=clock)
     assert got is a, (
         f"the only warm slot was never retried inside the window (attempts={attempts['n']}); "
-        f"held slots must be released when their cooldown expires, not at end-of-window")
+        f"held slots must be released when their cooldown expires, not at end-of-window"
+    )
     assert pool.assigned == {"A"}
 
 
@@ -1404,12 +1920,15 @@ def test_our_own_verdict_type_is_authoritative_over_its_cause_chain():
 
     try:
         try:
-            raise AwsUnknownState("aws lambda-microvms resume-microvm: claim probe budget exhausted")
+            raise AwsUnknownState(
+                "aws lambda-microvms resume-microvm: claim probe budget exhausted"
+            )
         except AwsUnknownState as cause:
             raise AwsWorkerError("snapstart slot p1 not ready within 60s") from cause
     except AwsWorkerError as exc:
         assert not _is_unknown_not_dead(exc), (
-            "a deliberately-chosen definitive verdict was overridden by its own debug cause")
+            "a deliberately-chosen definitive verdict was overridden by its own debug cause"
+        )
 
     # ...and the unknown verdict is of course still unknown.
     assert _is_unknown_not_dead(AwsUnknownState("transient (rc=255): Rate exceeded"))
@@ -1423,11 +1942,15 @@ def test_a_foreign_exception_wrapping_an_unknown_is_still_unknown():
 
     try:
         try:
-            raise AwsUnknownState("aws ec2 describe-instances: transient (rc=255): Rate exceeded")
+            raise AwsUnknownState(
+                "aws ec2 describe-instances: transient (rc=255): Rate exceeded"
+            )
         except AwsUnknownState as cause:
             raise RuntimeError("wrapped by some intermediate layer") from cause
     except RuntimeError as exc:
-        assert _is_unknown_not_dead(exc), "a wrapped UNKNOWN was read as a confirmed death"
+        assert _is_unknown_not_dead(exc), (
+            "a wrapped UNKNOWN was read as a confirmed death"
+        )
 
     assert not _is_unknown_not_dead(RuntimeError("something unrelated entirely"))
 
@@ -1439,7 +1962,10 @@ def test_held_slot_is_retried_against_a_REAL_warmpool():
     was supposed to fix, passing its own test. Exercise the real pool."""
     from blastbox.host.pool import Slot, SlotState, WarmPool
     from blastbox.host.runtime.aws_worker import AwsUnknownState
-    from blastbox.host.runtime.vm_dispatch import _RETRY_SLOT_COOLDOWN_S, _claim_resumable_slot
+    from blastbox.host.runtime.vm_dispatch import (
+        _RETRY_SLOT_COOLDOWN_S,
+        _claim_resumable_slot,
+    )
 
     attempts = {"n": 0}
 
@@ -1464,11 +1990,17 @@ def test_held_slot_is_retried_against_a_REAL_warmpool():
                 raise AwsUnknownState("transient (rc=255): Rate exceeded")
 
     pool = WarmPool(runtime=_Rt(), warm_size=0)
-    pool._slots["s1"] = Slot(slot_id="s1", control_dir="/tmp/c", input_dir="/tmp/i",
-                             output_dir="/tmp/o", state=SlotState.IDLE)
+    pool._slots["s1"] = Slot(
+        slot_id="s1",
+        control_dir="/tmp/c",
+        input_dir="/tmp/i",
+        output_dir="/tmp/o",
+        state=SlotState.IDLE,
+    )
     got = _claim_resumable_slot(pool, _RETRY_SLOT_COOLDOWN_S * 3)
     assert got is not None, (
-        f"the only warm slot was never retried against a real pool (attempts={attempts['n']})")
+        f"the only warm slot was never retried against a real pool (attempts={attempts['n']})"
+    )
     assert attempts["n"] >= 2
 
 
@@ -1499,15 +2031,24 @@ def test_the_release_seam_forwards_the_fault_attribution(tmp_path, monkeypatch):
         def release(self, slot, *, dirty=False, fault=None):  # noqa: ANN001
             seen.append((dirty, fault))
 
-    vd.build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _Pool(),
-                                  tier="static", engine="clippyshot", limits=_FAKE_LIMITS)
+    vd.build_remote_vm_dispatcher(
+        InMemoryJobStore(),
+        str(tmp_path),
+        _Pool(),
+        tier="static",
+        engine="clippyshot",
+        limits=_FAKE_LIMITS,
+    )
     release = captured.get("release")
-    assert release is not None, "the dispatcher never handed its release seam to the transport"
+    assert release is not None, (
+        "the dispatcher never handed its release seam to the transport"
+    )
 
     release(object(), True, "worker")
     release(object(), True, "job")
     assert seen == [(True, "worker"), (True, "job")], (
-        f"the seam dropped the attribution on its way to the pool: {seen}")
+        f"the seam dropped the attribution on its way to the pool: {seen}"
+    )
 
 
 class _BudgetRecordingPool(_RetryPool):
@@ -1516,9 +2057,11 @@ class _BudgetRecordingPool(_RetryPool):
     def __init__(self, slots, resume):  # noqa: ANN001
         super().__init__(slots, resume)
         from types import SimpleNamespace
+
         self.budgets: list[float | None] = []
         self.runtime = SimpleNamespace(
-            resume=lambda s, *, budget_s=None: self._resume_b(s, budget_s))
+            resume=lambda s, *, budget_s=None: self._resume_b(s, budget_s)
+        )
 
     def _resume_b(self, slot, budget_s):  # noqa: ANN001
         self.resume_calls.append(slot.slot_id)
@@ -1538,8 +2081,12 @@ def test_the_thaw_gets_its_declared_budget_not_the_claim_window_remainder():
     a = SimpleNamespace(slot_id="A")
     pool = _BudgetRecordingPool([a], lambda slot, budget_s: None)
     t = [0.0]
-    got = _claim_resumable_slot(pool, 60.0, thaw_budget_s=180.0,
-                                clock=lambda: t.__setitem__(0, t[0] + 0.05) or t[0])
+    got = _claim_resumable_slot(
+        pool,
+        60.0,
+        thaw_budget_s=180.0,
+        clock=lambda: t.__setitem__(0, t[0] + 0.05) or t[0],
+    )
     assert got is a
     assert pool.budgets == [180.0], (
         f"the thaw was truncated to the claim window: got {pool.budgets}, expected the declared 180s"
@@ -1559,17 +2106,26 @@ def test_a_slow_but_healthy_thaw_is_no_longer_convicted():
     def resume(slot, budget_s):  # noqa: ANN001
         if budget_s is None or budget_s < AGENT_ANSWERS_AT:
             # What the truncated window produced: silence, reported as a real verdict.
-            raise AwsWorkerError(f"ec2-hibernate slot {slot.slot_id}: agent silent after "
-                                 f"{budget_s}s")
+            raise AwsWorkerError(
+                f"ec2-hibernate slot {slot.slot_id}: agent silent after {budget_s}s"
+            )
         return None
 
     a = SimpleNamespace(slot_id="A")
     pool = _BudgetRecordingPool([a], resume)
     t = [0.0]
-    got = _claim_resumable_slot(pool, 60.0, thaw_budget_s=180.0,
-                                clock=lambda: t.__setitem__(0, t[0] + 0.05) or t[0])
-    assert got is a, "a healthy instance that needed 75s was convicted inside a 60s window"
-    assert pool.released == [], "and terminated: release(dirty=True) -> terminate-instances"
+    got = _claim_resumable_slot(
+        pool,
+        60.0,
+        thaw_budget_s=180.0,
+        clock=lambda: t.__setitem__(0, t[0] + 0.05) or t[0],
+    )
+    assert got is a, (
+        "a healthy instance that needed 75s was convicted inside a 60s window"
+    )
+    assert pool.released == [], (
+        "and terminated: release(dirty=True) -> terminate-instances"
+    )
 
 
 def test_without_a_declared_thaw_budget_the_old_behaviour_is_unchanged():
@@ -1581,8 +2137,12 @@ def test_without_a_declared_thaw_budget_the_old_behaviour_is_unchanged():
     a = SimpleNamespace(slot_id="A")
     pool = _BudgetRecordingPool([a], lambda slot, budget_s: None)
     t = [0.0]
-    got = _claim_resumable_slot(pool, 5.0, thaw_budget_s=None,
-                                clock=lambda: t.__setitem__(0, t[0] + 0.05) or t[0])
+    got = _claim_resumable_slot(
+        pool,
+        5.0,
+        thaw_budget_s=None,
+        clock=lambda: t.__setitem__(0, t[0] + 0.05) or t[0],
+    )
     assert got is a
     assert pool.budgets and pool.budgets[0] is not None and pool.budgets[0] <= 5.0, (
         f"expected the claim-window remainder, got {pool.budgets}"
@@ -1598,11 +2158,15 @@ def test_the_declared_thaw_budget_is_actually_wired_through_the_factory(tmp_path
     from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
 
     seen: dict = {}
-    slot = SimpleNamespace(slot_id="s1", url="http://x", auth_token=None, agent_port=8765)
+    slot = SimpleNamespace(
+        slot_id="s1", url="http://x", auth_token=None, agent_port=8765
+    )
 
     def resume(s, *, budget_s=None):  # noqa: ANN001
         seen["budget"] = budget_s
-        raise RuntimeError("stop here -- we only care about the budget that was granted")
+        raise RuntimeError(
+            "stop here -- we only care about the budget that was granted"
+        )
 
     claimed = {"n": 0}
 
@@ -1611,17 +2175,23 @@ def test_the_declared_thaw_budget_is_actually_wired_through_the_factory(tmp_path
         return slot if claimed["n"] == 1 else None
 
     pool = SimpleNamespace(
-        runtime=SimpleNamespace(ssl_context=None,
-                                cfg=SimpleNamespace(resume_timeout_s=180.0),
-                                resume=resume),
+        runtime=SimpleNamespace(
+            ssl_context=None, cfg=SimpleNamespace(resume_timeout_s=180.0), resume=resume
+        ),
         claim=claim,
         release=lambda s, dirty=False, **kw: None,
         unclaim=lambda s: None,
     )
-    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), pool,
-                                    tier="aws-ec2-hibernate", engine="clippyshot",
-                                    limits=_FAKE_LIMITS, worker_timeout_s=300.0,
-                                    warm_claim_timeout_s=60.0)
+    vm = build_remote_vm_dispatcher(
+        InMemoryJobStore(),
+        str(tmp_path),
+        pool,
+        tier="aws-ec2-hibernate",
+        engine="clippyshot",
+        limits=_FAKE_LIMITS,
+        worker_timeout_s=300.0,
+        warm_claim_timeout_s=60.0,
+    )
     with contextlib.suppress(Exception):
         vm._validate(tmp_path / "in.bin")
 
@@ -1634,7 +2204,7 @@ def test_the_declared_thaw_budget_is_actually_wired_through_the_factory(tmp_path
 def test_a_thaw_budget_longer_than_the_job_budget_is_still_granted(tmp_path):
     """A tier declaring a thaw longer than the entire job budget cannot be honoured: granting it
     would let one wake-up eat the job. Fall back rather than pretend, and keep the operator warning.
-    
+
     CHANGED 2026-08-21: this asserted the OPPOSITE, on the premise that granting the declared thaw
     "would let one wake-up eat the job". That premise is false in this code. Detonation is bounded
     separately by timeout=worker_timeout_s, and validate_timeout_s adds the FULL _resume_to on top
@@ -1647,7 +2217,9 @@ def test_a_thaw_budget_longer_than_the_job_budget_is_still_granted(tmp_path):
     from blastbox.host.runtime.vm_dispatch import build_remote_vm_dispatcher
 
     seen: dict = {}
-    slot = SimpleNamespace(slot_id="s1", url="http://x", auth_token=None, agent_port=8765)
+    slot = SimpleNamespace(
+        slot_id="s1", url="http://x", auth_token=None, agent_port=8765
+    )
 
     def resume(s, *, budget_s=None):  # noqa: ANN001
         seen["budget"] = budget_s
@@ -1660,17 +2232,25 @@ def test_a_thaw_budget_longer_than_the_job_budget_is_still_granted(tmp_path):
         return slot if claimed["n"] == 1 else None
 
     pool = SimpleNamespace(
-        runtime=SimpleNamespace(ssl_context=None,
-                                cfg=SimpleNamespace(resume_timeout_s=600.0),   # > worker_timeout_s
-                                resume=resume),
+        runtime=SimpleNamespace(
+            ssl_context=None,
+            cfg=SimpleNamespace(resume_timeout_s=600.0),  # > worker_timeout_s
+            resume=resume,
+        ),
         claim=claim,
         release=lambda s, dirty=False, **kw: None,
         unclaim=lambda s: None,
     )
-    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), pool,
-                                    tier="aws-ec2-hibernate", engine="clippyshot",
-                                    limits=_FAKE_LIMITS, worker_timeout_s=300.0,
-                                    warm_claim_timeout_s=60.0)
+    vm = build_remote_vm_dispatcher(
+        InMemoryJobStore(),
+        str(tmp_path),
+        pool,
+        tier="aws-ec2-hibernate",
+        engine="clippyshot",
+        limits=_FAKE_LIMITS,
+        worker_timeout_s=300.0,
+        warm_claim_timeout_s=60.0,
+    )
     with contextlib.suppress(Exception):
         vm._validate(tmp_path / "in.bin")
 
@@ -1708,7 +2288,9 @@ def test_a_thaw_is_not_STARTED_after_the_scan_window_has_closed():
 
     a = SimpleNamespace(slot_id="A")
     t = [0.0]
-    pool = _SlowClaimPool([a], lambda s: None, t, advance=5.0)   # eats the whole 5s window
+    pool = _SlowClaimPool(
+        [a], lambda s: None, t, advance=5.0
+    )  # eats the whole 5s window
 
     got = _claim_resumable_slot(pool, 5.0, thaw_budget_s=180.0, clock=lambda: t[0])
 
@@ -1737,7 +2319,7 @@ def test_a_thaw_begun_in_time_still_gets_its_whole_declared_budget(monkeypatch):
 
     a = SimpleNamespace(slot_id="A")
     t = [0.0]
-    pool = _SlowClaimPool([a], lambda s: None, t, advance=1.0)   # 4s of window left
+    pool = _SlowClaimPool([a], lambda s: None, t, advance=1.0)  # 4s of window left
 
     got = vd._claim_resumable_slot(pool, 5.0, thaw_budget_s=180.0, clock=lambda: t[0])
 
@@ -1748,7 +2330,9 @@ def test_a_thaw_begun_in_time_still_gets_its_whole_declared_budget(monkeypatch):
     )
 
 
-def test_an_infinite_declared_resume_timeout_does_not_become_an_infinite_thaw_deadline(tmp_path, monkeypatch):
+def test_an_infinite_declared_resume_timeout_does_not_become_an_infinite_thaw_deadline(
+    tmp_path, monkeypatch
+):
     """`inf > 0` is True, so the guard that was meant to accept only a real budget accepted inf.
 
     The thaw budget bounds the resume the claim seam grants OUTSIDE the claim window. Set to inf it
@@ -1764,16 +2348,19 @@ def test_an_infinite_declared_resume_timeout_does_not_become_an_infinite_thaw_de
     """
     from blastbox.host.runtime import vm_dispatch as _vd
     from blastbox.host.runtime.vm_dispatch import NoWarmSlot, build_remote_vm_dispatcher
+
     seen = {}
 
     def _capture(pool, timeout_s, *, thaw_budget_s=None):  # noqa: ANN001, ANN202
         seen["thaw"] = thaw_budget_s
-        return None                                   # no slot -> NoWarmSlot, ends the call early
+        return None  # no slot -> NoWarmSlot, ends the call early
 
     monkeypatch.setattr(_vd, "_claim_resumable_slot", _capture)
 
     class _InfResumePool:
-        runtime = type("R", (), {"ssl_context": None, "resume_timeout_s": float("inf")})()
+        runtime = type(
+            "R", (), {"ssl_context": None, "resume_timeout_s": float("inf")}
+        )()
 
         def claim(self, *, timeout_s):  # noqa: ANN001, ANN202
             return None
@@ -1781,19 +2368,27 @@ def test_an_infinite_declared_resume_timeout_does_not_become_an_infinite_thaw_de
         def release(self, slot, *, dirty=False):  # noqa: ANN001
             pass
 
-    vm = build_remote_vm_dispatcher(InMemoryJobStore(), str(tmp_path), _InfResumePool(),
-                                    tier="aws-ec2-hibernate", engine="clippyshot",
-                                    limits=_FAKE_LIMITS, worker_timeout_s=300.0,
-                                    warm_claim_timeout_s=0.05)
+    vm = build_remote_vm_dispatcher(
+        InMemoryJobStore(),
+        str(tmp_path),
+        _InfResumePool(),
+        tier="aws-ec2-hibernate",
+        engine="clippyshot",
+        limits=_FAKE_LIMITS,
+        worker_timeout_s=300.0,
+        warm_claim_timeout_s=0.05,
+    )
     with pytest.raises(NoWarmSlot):
         vm._validate(tmp_path / "in.bin")
 
     assert seen["thaw"] is None, (
         f"thaw_budget_s={seen['thaw']}; an infinite thaw deadline means the resume watchdog can "
-        f"never fire, so a wedged resume holds the slot forever instead of for one claim")
+        f"never fire, so a wedged resume holds the slot forever instead of for one claim"
+    )
     assert math.isfinite(vm._validate_timeout_s), (
         f"_validate_timeout_s={vm._validate_timeout_s}; the watchdog allowance is built from the "
-        f"same budget, so an infinite thaw disables the heartbeat watchdog outright")
+        f"same budget, so an infinite thaw disables the heartbeat watchdog outright"
+    )
 
 
 def test_a_slow_maintenance_sweep_does_not_immediately_resweep(tmp_path):
@@ -1817,8 +2412,12 @@ def test_a_slow_maintenance_sweep_does_not_immediately_resweep(tmp_path):
     from blastbox.host.jobs.memory import InMemoryJobStore
     from blastbox.host.runtime.vm_dispatch import VmJobDispatcher
 
-    d = VmJobDispatcher(InMemoryJobStore(), str(tmp_path), lambda p: ({}, True),
-                        worker_tier="libvirt-vm")
+    d = VmJobDispatcher(
+        InMemoryJobStore(),
+        str(tmp_path),
+        lambda p: ({}, True),
+        worker_tier="libvirt-vm",
+    )
     d._maintenance_interval_s = 0.20
     d._canary_cb = None
     d._canary_interval_s = 0.0
@@ -1831,9 +2430,9 @@ def test_a_slow_maintenance_sweep_does_not_immediately_resweep(tmp_path):
         if len(starts) >= 3:
             done.set()
             return
-        time.sleep(0.30)               # LONGER than the interval
+        time.sleep(0.30)  # LONGER than the interval
 
-    d._run_maintenance = _slow_sweep   # type: ignore[method-assign]
+    d._run_maintenance = _slow_sweep  # type: ignore[method-assign]
     t = threading.Thread(target=d._maintenance_loop, daemon=True)
     t.start()
     assert done.wait(timeout=10.0), "the maintenance loop never reached three sweeps"
@@ -1848,4 +2447,5 @@ def test_a_slow_maintenance_sweep_does_not_immediately_resweep(tmp_path):
     assert min(gaps) > 0.40, (
         f"sweeps restarted after {min(gaps):.3f}s despite a 0.20s interval and a 0.30s sweep "
         f"({[round(g, 3) for g in gaps]}); the deadline was dated from before the sweep, so a slow "
-        f"sweep re-triggers immediately and hammers the store it is already struggling with")
+        f"sweep re-triggers immediately and hammers the store it is already struggling with"
+    )

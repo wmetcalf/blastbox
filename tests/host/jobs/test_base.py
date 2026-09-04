@@ -1,4 +1,5 @@
 """Tests for blastbox.host.jobs.base — Job model + JobStore protocol."""
+
 from __future__ import annotations
 
 import time
@@ -11,6 +12,7 @@ from blastbox.host.jobs.base import Job, JobStatus, JobStore
 # ---------------------------------------------------------------------------
 # Job.new() shape
 # ---------------------------------------------------------------------------
+
 
 def test_new_generates_uuid():
     job = Job.new(engine="test-engine", filename="test.docx")
@@ -59,6 +61,7 @@ def test_new_optional_fields_none_or_empty():
 # to_dict / from_dict round-trip
 # ---------------------------------------------------------------------------
 
+
 def test_to_dict_from_dict_roundtrip():
     job = Job.new(engine="engine-a", filename="doc.docx")
     job.params = {"key": "value", "flag": "1"}
@@ -96,6 +99,7 @@ def test_from_dict_preserves_result_dir():
 # ---------------------------------------------------------------------------
 # to_public_dict — strips result_dir + params, sanitizes error
 # ---------------------------------------------------------------------------
+
 
 def test_public_dict_strips_result_dir():
     job = Job.new(engine="e", filename="f.txt")
@@ -163,6 +167,7 @@ def test_public_dict_no_error_passthrough():
 # JobStore protocol check
 # ---------------------------------------------------------------------------
 
+
 def test_jobstore_is_protocol():
     # Verify the protocol declares all expected methods via its annotations
     # (works on Python 3.12 where get_protocol_members is not yet available)
@@ -179,14 +184,17 @@ def test_jobstore_is_protocol():
 # Job.net_policy field
 # ---------------------------------------------------------------------------
 
+
 def test_job_net_policy_defaults_none():
     from blastbox.host.jobs.base import Job
+
     j = Job.new(engine="redtusk", filename="x.doc")
     assert j.net_policy is None
 
 
 def test_job_net_policy_roundtrips_through_dict():
     from blastbox.host.jobs.base import Job
+
     j = Job.new(engine="redtusk", filename="x.doc")
     j.net_policy = "fakenet"
     assert Job.from_dict(j.to_dict()).net_policy == "fakenet"

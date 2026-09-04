@@ -20,6 +20,7 @@ correct) from one written before the work it throttles (the bug). This check is 
 gate: it looks only at loop bodies that BOTH do periodic work AND stamp a `last_*` deadline, where
 the ordering is unambiguous.
 """
+
 from __future__ import annotations
 
 import ast
@@ -44,12 +45,24 @@ def _stamp_sites(path: Path):
         for node in ast.walk(fn):
             if not isinstance(node, ast.If):
                 continue
-            stamps = [(s.lineno, s.targets[0].id) for s in node.body
-                      if isinstance(s, ast.Assign) and isinstance(s.targets[0], ast.Name)
-                      and s.targets[0].id.startswith("last_")]
-            work = [(c.lineno, c.func.attr if isinstance(c.func, ast.Attribute)
-                     else getattr(c.func, "id", ""))
-                    for stmt in node.body for c in ast.walk(stmt) if isinstance(c, ast.Call)]
+            stamps = [
+                (s.lineno, s.targets[0].id)
+                for s in node.body
+                if isinstance(s, ast.Assign)
+                and isinstance(s.targets[0], ast.Name)
+                and s.targets[0].id.startswith("last_")
+            ]
+            work = [
+                (
+                    c.lineno,
+                    c.func.attr
+                    if isinstance(c.func, ast.Attribute)
+                    else getattr(c.func, "id", ""),
+                )
+                for stmt in node.body
+                for c in ast.walk(stmt)
+                if isinstance(c, ast.Call)
+            ]
             work = [(ln, nm) for ln, nm in work if nm in _WORK]
             if not stamps or not work:
                 continue
@@ -73,7 +86,8 @@ def test_periodic_deadlines_are_stamped_after_the_work(path):
     ]
     assert not offenders, (
         "a periodic deadline is dated from BEFORE the work it spaces out:\n  "
-        + "\n  ".join(offenders))
+        + "\n  ".join(offenders)
+    )
 
 
 @pytest.mark.parametrize("path", _FILES)
@@ -87,4 +101,5 @@ def test_the_scan_actually_finds_the_loops_it_claims_to_check(path):
     assert sites, (
         f"{path.name}: found no periodic stamp/work pairs at all. Either the loops moved or the "
         f"names in _WORK are stale -- this guard is now checking nothing and would not notice the "
-        f"bug it exists for")
+        f"bug it exists for"
+    )

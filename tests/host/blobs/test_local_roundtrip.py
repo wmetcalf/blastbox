@@ -3,6 +3,7 @@
 This is the property the worker purge invariant depends on. A store whose only copy
 is the job dir cannot serve anything once the worker purges.
 """
+
 import hashlib
 import shutil
 
@@ -29,7 +30,7 @@ def test_sample_survives_job_dir_destruction(tmp_path):
     store = _store(tmp_path)
     store.put_sample(digest, _spool(tmp_path, "j1", "invoice.doc", data))
 
-    shutil.rmtree(tmp_path / "jobs" / "j1")          # the worker purge
+    shutil.rmtree(tmp_path / "jobs" / "j1")  # the worker purge
 
     dest = tmp_path / "jobs" / "j2" / "input" / "other-name.doc"
     store.get_sample(digest, dest)
@@ -47,7 +48,9 @@ def test_identical_bytes_under_two_names_store_once(tmp_path):
 
 def test_missing_sample_raises_blob_fetch_error(tmp_path):
     with pytest.raises(BlobFetchError):
-        _store(tmp_path).get_sample("f" * 64, tmp_path / "jobs" / "j" / "input" / "x.doc")
+        _store(tmp_path).get_sample(
+            "f" * 64, tmp_path / "jobs" / "j" / "input" / "x.doc"
+        )
 
 
 def test_output_survives_job_dir_destruction(tmp_path):
@@ -57,7 +60,7 @@ def test_output_survives_job_dir_destruction(tmp_path):
     (out / "metadata.json").write_bytes(b'{"status":"ok"}')
     store.put_output("j1", out)
 
-    shutil.rmtree(tmp_path / "jobs" / "j1")          # the worker purge
+    shutil.rmtree(tmp_path / "jobs" / "j1")  # the worker purge
 
     with store.open_output("j1", "metadata.json") as fh:
         assert fh.read() == b'{"status":"ok"}'
@@ -93,7 +96,9 @@ def test_delete_job_removes_results_but_not_samples(tmp_path):
     store.delete_job("j1")
 
     assert not (tmp_path / "blobs" / "results" / "j1").exists()
-    assert (tmp_path / "blobs" / "samples" / digest).exists(), "shared sample must survive"
+    assert (tmp_path / "blobs" / "samples" / digest).exists(), (
+        "shared sample must survive"
+    )
 
 
 def test_open_output_falls_back_to_legacy_job_root_output(tmp_path):

@@ -4,6 +4,7 @@ run_forever(concurrency=N) runs N dispatch-loop threads that claim+dispatch
 independently; correctness comes from the claim fence + thread-safe stores. The
 serial path (concurrency<=1) is unchanged (runs in the calling thread).
 """
+
 from __future__ import annotations
 
 import threading

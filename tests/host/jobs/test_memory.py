@@ -1,4 +1,5 @@
 """Tests for InMemoryJobStore."""
+
 from __future__ import annotations
 
 import threading
@@ -17,6 +18,7 @@ def _make_job(engine: str = "test", filename: str = "file.docx") -> Job:
 # ---------------------------------------------------------------------------
 # Basic CRUD
 # ---------------------------------------------------------------------------
+
 
 def test_create_and_get():
     store = InMemoryJobStore()
@@ -104,6 +106,7 @@ def test_list_by_status():
 # claim_next — oldest QUEUED flips to RUNNING
 # ---------------------------------------------------------------------------
 
+
 def test_claim_next_returns_oldest_queued():
     store = InMemoryJobStore()
     j1 = Job.new(engine="e", filename="first.docx")
@@ -143,6 +146,7 @@ def test_claim_next_flips_status_in_store():
 # ---------------------------------------------------------------------------
 # Concurrent claim_next — no double-claim
 # ---------------------------------------------------------------------------
+
 
 def test_concurrent_claims_no_double_claim():
     """Two threads racing claim_next on a single queued job must not both claim it."""

@@ -10,6 +10,7 @@ Two layers:
 
 Both skip cleanly where the tools are absent, so the suite is safe to run anywhere.
 """
+
 import shutil
 
 import pytest
@@ -22,12 +23,37 @@ _HAVE_SOFFICE = shutil.which("soffice") is not None
 # Escape-only syscalls that must NEVER appear in a document conversion (mirrors the
 # shipped seccomp denylist's intent — container-escape / host-state chains).
 _ESCAPE_DENYLIST = {
-    "bpf", "keyctl", "add_key", "request_key", "kexec_load", "kexec_file_load",
-    "init_module", "finit_module", "delete_module", "ptrace", "process_vm_readv",
-    "process_vm_writev", "kcmp", "mount", "umount2", "pivot_root", "swapon", "setns",
-    "unshare", "reboot", "settimeofday", "sethostname", "iopl", "ioperm",
-    "name_to_handle_at", "open_by_handle_at", "perf_event_open", "userfaultfd",
-    "fanotify_init", "acct", "quotactl",
+    "bpf",
+    "keyctl",
+    "add_key",
+    "request_key",
+    "kexec_load",
+    "kexec_file_load",
+    "init_module",
+    "finit_module",
+    "delete_module",
+    "ptrace",
+    "process_vm_readv",
+    "process_vm_writev",
+    "kcmp",
+    "mount",
+    "umount2",
+    "pivot_root",
+    "swapon",
+    "setns",
+    "unshare",
+    "reboot",
+    "settimeofday",
+    "sethostname",
+    "iopl",
+    "ioperm",
+    "name_to_handle_at",
+    "open_by_handle_at",
+    "perf_event_open",
+    "userfaultfd",
+    "fanotify_init",
+    "acct",
+    "quotactl",
 }
 
 
@@ -41,7 +67,9 @@ def test_pipeline_captures_command(tmp_path):
     assert draft.net.inet == set()  # cat opens no sockets
 
 
-@pytest.mark.skipif(not (_HAVE_STRACE and _HAVE_SOFFICE), reason="needs strace + soffice")
+@pytest.mark.skipif(
+    not (_HAVE_STRACE and _HAVE_SOFFICE), reason="needs strace + soffice"
+)
 def test_soffice_conversion_stays_within_bounds(tmp_path):
     # minimal Flat ODT — soffice renders it natively to PDF
     src = tmp_path / "in.fodt"
@@ -58,9 +86,17 @@ def test_soffice_conversion_stays_within_bounds(tmp_path):
     home = tmp_path / "h"
     home.mkdir()
     argv = [
-        "soffice", "--headless", "--nologo", "--nofirststartwizard", "--nolockcheck",
+        "soffice",
+        "--headless",
+        "--nologo",
+        "--nofirststartwizard",
+        "--nolockcheck",
         f"-env:UserInstallation=file://{home}/lou",
-        "--convert-to", "pdf", "--outdir", str(outdir), str(src),
+        "--convert-to",
+        "pdf",
+        "--outdir",
+        str(outdir),
+        str(src),
     ]
     draft = profile_command(argv, trace_dir=tmp_path, label="soffice")
 

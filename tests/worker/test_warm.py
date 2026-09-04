@@ -10,6 +10,7 @@ Tests:
 5. FileWarmControl round-trip: ready/go.json/done file handshake; WarmTimeout on missing
    go.json; atomic-write check (temp+rename).
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -122,7 +123,9 @@ class _FakeControl:
         self._wait_count += 1
         self.call_log.append(("wait_for_go",))
         val = next(self._specs)
-        if val is WarmTimeout or (isinstance(val, type) and issubclass(val, WarmTimeout)):
+        if val is WarmTimeout or (
+            isinstance(val, type) and issubclass(val, WarmTimeout)
+        ):
             raise WarmTimeout("idle timeout (fake)")
         return val  # type: ignore[return-value]
 
@@ -363,7 +366,11 @@ def test_file_warm_control_wait_for_go_survives_restore_clock_jump(
     times = iter([0.0, timeout_s + 100.0, timeout_s + 100.0])
     monkeypatch.setattr(warm.time, "monotonic", lambda: next(times))
 
-    go_data = {"input_path": str(input_file), "output_dir": str(output_dir), "params": {}}
+    go_data = {
+        "input_path": str(input_file),
+        "output_dir": str(output_dir),
+        "params": {},
+    }
 
     def fake_sleep(_seconds: float) -> None:
         # The host delivers the job just after the restore (between poll ticks).
@@ -371,7 +378,9 @@ def test_file_warm_control_wait_for_go_survives_restore_clock_jump(
 
     monkeypatch.setattr(warm.time, "sleep", fake_sleep)
 
-    spec = ctrl.wait_for_go(timeout_s=timeout_s)  # must NOT raise despite the clock jump
+    spec = ctrl.wait_for_go(
+        timeout_s=timeout_s
+    )  # must NOT raise despite the clock jump
     assert spec.input_path == input_file
     assert spec.output_dir == output_dir
 
@@ -408,7 +417,7 @@ def test_restore_aware_deadline_expires_normally(monkeypatch):
     d = warm._RestoreAwareDeadline(10.0)  # deadline = 10.0
     assert d.expired() is False  # t=4.0
     assert d.expired() is False  # t=8.0
-    assert d.expired() is True   # t=11.0 >= 10.0 (gap 3.0 < jump threshold)
+    assert d.expired() is True  # t=11.0 >= 10.0 (gap 3.0 < jump threshold)
 
 
 def test_restore_aware_deadline_restarts_on_clock_jump(monkeypatch):
@@ -425,7 +434,7 @@ def test_restore_aware_deadline_restarts_on_clock_jump(monkeypatch):
     assert d.expired() is False  # t=10_000: jump detected -> restart (deadline 10_010)
     assert d.expired() is False  # t=10_004: fresh window, not yet elapsed
     assert d.expired() is False  # t=10_008: still within the restarted window
-    assert d.expired() is True   # t=10_011 >= restarted deadline 10_010
+    assert d.expired() is True  # t=10_011 >= restarted deadline 10_010
 
 
 def test_file_warm_control_atomic_writes(tmp_path: Path) -> None:
@@ -442,14 +451,18 @@ def test_file_warm_control_atomic_writes(tmp_path: Path) -> None:
     after_ready = set(tmp_path.iterdir())
     new_files = after_ready - before
     # Only 'ready' should exist — no leftover temp files
-    assert len(new_files) == 1, f"only 'ready' should be created, found: {[f.name for f in new_files]}"
+    assert len(new_files) == 1, (
+        f"only 'ready' should be created, found: {[f.name for f in new_files]}"
+    )
     assert (tmp_path / "ready") in new_files
 
     before2 = set(tmp_path.iterdir())
     ctrl.signal_done(status="warmup_error")
     after_done = set(tmp_path.iterdir())
     new_files2 = after_done - before2
-    assert len(new_files2) == 1, f"only 'done' should be created, found: {[f.name for f in new_files2]}"
+    assert len(new_files2) == 1, (
+        f"only 'done' should be created, found: {[f.name for f in new_files2]}"
+    )
     assert (tmp_path / "done") in new_files2
 
 
@@ -494,6 +507,7 @@ def test_file_warm_control_full_handshake(tmp_path: Path) -> None:
 
 def test_host_wait_for_done_reads_regular_done(tmp_path: Path) -> None:
     from blastbox.worker.warm import HostWarmControl
+
     ctrl = tmp_path / "ctrl"
     ctrl.mkdir()
     (ctrl / "done").write_text("ok\n")
@@ -504,6 +518,7 @@ def test_host_wait_for_done_rejects_symlinked_done(tmp_path: Path) -> None:
     """A hostile worker symlinking ctrl/done at a host file must NOT have its contents read back
     as a status — rejected (WarmTimeout). ctrl/ is worker-writable on the gVisor tier."""
     from blastbox.worker.warm import HostWarmControl
+
     ctrl = tmp_path / "ctrl"
     ctrl.mkdir()
     (tmp_path / "outside").write_text("SECRET-OUTSIDE")
@@ -537,14 +552,21 @@ def test_serve_warm_injects_uppercase_params_into_environ_before_detonate(
     # on an absent key registers no undo, so those writes would leak into other tests.
     # set-then-delete records the original (absent) state — teardown then removes
     # whatever serve_warm injects — while keeping each key absent at the test start.
-    for k in ("CLIPPYSHOT_OCR", "REDTUSK_ENABLE_THUMBNAILS", "lowercase_key", "BAD-KEY"):
+    for k in (
+        "CLIPPYSHOT_OCR",
+        "REDTUSK_ENABLE_THUMBNAILS",
+        "lowercase_key",
+        "BAD-KEY",
+    ):
         monkeypatch.setenv(k, "")
         monkeypatch.delenv(k)
 
     seen: dict[str, str | None] = {}
 
     class _EnvCaptureEngine(_WarmEngine):
-        def detonate(self, input: Path, outdir: Path, limits: Limits) -> DetonationResult:
+        def detonate(
+            self, input: Path, outdir: Path, limits: Limits
+        ) -> DetonationResult:
             # Snapshot the env exactly as engine.detonate would observe it.
             seen["ocr"] = os.environ.get("CLIPPYSHOT_OCR")
             seen["thumb_off"] = os.environ.get("REDTUSK_ENABLE_THUMBNAILS")
@@ -556,18 +578,22 @@ def test_serve_warm_injects_uppercase_params_into_environ_before_detonate(
         input_path=input_file,
         output_dir=output_dir,
         params={
-            "CLIPPYSHOT_OCR": "1",            # uppercase, allowlisted shape → injected
+            "CLIPPYSHOT_OCR": "1",  # uppercase, allowlisted shape → injected
             "REDTUSK_ENABLE_THUMBNAILS": "0",  # the toggle-OFF value must reach the engine
-            "lowercase_key": "x",             # lowercase → dropped
-            "BAD-KEY": "y",                   # has '-' → fails [A-Z][A-Z0-9_]* → dropped
+            "lowercase_key": "x",  # lowercase → dropped
+            "BAD-KEY": "y",  # has '-' → fails [A-Z][A-Z0-9_]* → dropped
         },
     )
     control = _FakeControl(specs=[spec])
 
-    rc = serve_warm(_EnvCaptureEngine(), control=control, limits=_limits(), idle_timeout_s=10.0)
+    rc = serve_warm(
+        _EnvCaptureEngine(), control=control, limits=_limits(), idle_timeout_s=10.0
+    )
 
     assert rc == 0
-    assert seen["ocr"] == "1"          # uppercase allowlisted param reached detonate
-    assert seen["thumb_off"] == "0"    # toggle-OFF is honoured per job (not just the default)
-    assert seen["lower"] is None       # lowercase dropped
-    assert seen["bad"] is None         # malformed-shape key dropped
+    assert seen["ocr"] == "1"  # uppercase allowlisted param reached detonate
+    assert (
+        seen["thumb_off"] == "0"
+    )  # toggle-OFF is honoured per job (not just the default)
+    assert seen["lower"] is None  # lowercase dropped
+    assert seen["bad"] is None  # malformed-shape key dropped

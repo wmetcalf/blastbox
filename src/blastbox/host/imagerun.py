@@ -1100,6 +1100,7 @@ def stage_rootfs(
     run: Runner | None = None,
     log: Log = _log,
     extract: Callable[[str, Path], None] | None = None,
+    extract_preserves_ownership: bool = False,
     verified_id: str = "",
 ) -> _Staged:
     """Prepare the artifact a warm tier boots, WITHOUT replacing anything.
@@ -1133,6 +1134,20 @@ def stage_rootfs(
     # PermissionError under a protected destination, and the CLI catches only
     # BuildError -- so the very environment this refusal exists for got a
     # traceback instead of the actionable message.
+    if extract is not None and not extract_preserves_ownership:
+        # The presence of a hook is not evidence about what it does. An
+        # ordinary shutil/tar callback produces an all-caller-owned tree with
+        # setuid bits dropped, and `_normalize_root` only fixes the staging
+        # ROOT -- so the remaining checks would pass and publish an altered
+        # filesystem. Callers who preserve ownership say so; the default is the
+        # safe answer for a callback this module cannot inspect.
+        raise BuildError(
+            f"cannot extract {image} through a caller-supplied hook without "
+            "extract_preserves_ownership=True. An extraction that reassigns "
+            "ownership or drops setuid bits publishes a rootfs that is not the "
+            "image that was verified, and the hook's presence alone does not "
+            "say which kind it is."
+        )
     if extract is None and not as_root:
         raise BuildError(
             f"cannot extract {image} with ownership preserved: this process is "
@@ -1315,9 +1330,19 @@ def export_rootfs(
     run: Runner | None = None,
     log: Log = _log,
     extract: Callable[[str, Path], None] | None = None,
+    extract_preserves_ownership: bool = False,
 ) -> Path:
     """Stage one artifact and publish it. Convenience for a single export."""
-    staged = stage_rootfs(plan, spec, tag, env=env, run=run, log=log, extract=extract)
+    staged = stage_rootfs(
+        plan,
+        spec,
+        tag,
+        env=env,
+        run=run,
+        log=log,
+        extract=extract,
+        extract_preserves_ownership=extract_preserves_ownership,
+    )
     return publish_staged(staged, run=run, log=log)
 
 
@@ -1383,6 +1408,7 @@ def run_plan(
     run: Runner | None = None,
     log: Log = _log,
     extract: Callable[[str, Path], None] | None = None,
+    extract_preserves_ownership: bool = False,
 ) -> list[str]:
     """Build, verify, then export — in that order, and only ever in that order.
 
@@ -1426,6 +1452,7 @@ def run_plan(
                     run=run,
                     log=log,
                     extract=extract,
+                    extract_preserves_ownership=extract_preserves_ownership,
                     verified_id=verified[f"{spec.image}:{staging}"],
                 )
             )

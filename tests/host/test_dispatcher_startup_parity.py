@@ -17,6 +17,7 @@ Each was found by review, one round apart, always the same shape: the reasoning 
 in a comment at the first site and the sibling was left as it was. Fixing a sixth instance is worth
 less than making the divergence impossible to land, which is what this does.
 """
+
 from __future__ import annotations
 
 import ast
@@ -27,7 +28,11 @@ import pytest
 _SRC = Path(__file__).resolve().parents[2] / "src" / "blastbox" / "host"
 
 #: The startup steps whose PLACEMENT is part of the contract.
-_TOPOLOGY = ("describe_blob_store", "check_store_coherence", "check_blob_target_agreement")
+_TOPOLOGY = (
+    "describe_blob_store",
+    "check_store_coherence",
+    "check_blob_target_agreement",
+)
 _PROBE = ("self_test", "blob_roundtrip")
 
 _ENTRYPOINTS = (
@@ -49,8 +54,9 @@ def _startup_sequence(path: Path, func: str) -> list[tuple[int, str, bool]]:
         for child in ast.iter_child_nodes(node):
             parents[child] = node
 
-    target = next(n for n in ast.walk(tree)
-                  if isinstance(n, ast.FunctionDef) and n.name == func)
+    target = next(
+        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == func
+    )
 
     def _in_nested_def(node) -> bool:  # noqa: ANN001
         cur = node
@@ -78,8 +84,11 @@ def _startup_sequence(path: Path, func: str) -> list[tuple[int, str, bool]]:
     for node in ast.walk(target):
         if not isinstance(node, ast.Call) or _in_nested_def(node):
             continue
-        name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(
-            node.func, "id", None)
+        name = (
+            node.func.attr
+            if isinstance(node.func, ast.Attribute)
+            else getattr(node.func, "id", None)
+        )
         if name in _TOPOLOGY + _PROBE:
             out.append((node.lineno, name, _canary_gated(node)))
     return sorted(out)
@@ -98,7 +107,8 @@ def test_topology_enforcement_is_never_behind_the_canary_toggle(path, func):
     assert not gated, (
         f"{func}() gates topology enforcement behind BLASTBOX_CANARY at {gated}; that switch is "
         f"documented as controlling the round-trip probe only, and hiding a fail-closed "
-        f"requirement behind an unrelated opt-out is how results become unreadable")
+        f"requirement behind an unrelated opt-out is how results become unreadable"
+    )
 
 
 @pytest.mark.parametrize(("path", "func"), _ENTRYPOINTS)
@@ -108,7 +118,8 @@ def test_every_entrypoint_performs_the_whole_startup_sequence(path, func):
     missing = [s for s in _TOPOLOGY if s not in present]
     assert not missing, (
         f"{func}() never calls {missing}; the other dispatcher entrypoint does, so this one boots "
-        f"without a check its twin treats as mandatory")
+        f"without a check its twin treats as mandatory"
+    )
     assert present & set(_PROBE), f"{func}() never runs the startup probe at all"
 
 
@@ -123,11 +134,14 @@ def test_the_blob_target_is_registered_only_after_the_probe(path, func):
     seq = _startup_sequence(path, func)
     probe = [ln for ln, nm, _ in seq if nm in _PROBE]
     claim = [ln for ln, nm, _ in seq if nm == "check_blob_target_agreement"]
-    assert probe and claim, f"{func}(): need both a probe and a registration to compare ({seq})"
+    assert probe and claim, (
+        f"{func}(): need both a probe and a registration to compare ({seq})"
+    )
     assert min(claim) > min(probe), (
         f"{func}() registers the blob target at line {min(claim)}, before the startup probe at "
         f"line {min(probe)}; a target that never proved it works must not become the one every "
-        f"other process has to match")
+        f"other process has to match"
+    )
 
 
 def test_both_entrypoints_agree_on_which_steps_are_gated():
@@ -148,4 +162,5 @@ def test_both_entrypoints_agree_on_which_steps_are_gated():
         f"the two dispatcher entrypoints disagree about topology enforcement.\n"
         f"  {a_name}: {a}\n  {b_name}: {b}\n"
         f"Five fixes on this branch were applied to one path and not the other; if you are "
-        f"changing one, change both.")
+        f"changing one, change both."
+    )

@@ -2,6 +2,7 @@
 
 11 test cases per the plan at docs/plans/2026-05-31-host-dispatch.md.
 """
+
 from __future__ import annotations
 
 import shutil
@@ -136,7 +137,8 @@ def _make_dispatcher(
         limits=_limits(),
         job_root=job_root,
         runtime_selector=runtime_selector,
-        subprocess_runner=subprocess_runner or (lambda *a, **kw: subprocess.CompletedProcess(a[0], 0, "", "")),
+        subprocess_runner=subprocess_runner
+        or (lambda *a, **kw: subprocess.CompletedProcess(a[0], 0, "", "")),
         worker_timeout_s=worker_timeout_s,
         job_retention_seconds=job_retention_seconds,
         pool=pool,
@@ -148,7 +150,9 @@ def _make_dispatcher(
     )
 
 
-def _setup_job_dirs(job_root: Path, job: Job, *, input_content: bytes = b"malware") -> Path:
+def _setup_job_dirs(
+    job_root: Path, job: Job, *, input_content: bytes = b"malware"
+) -> Path:
     """Create the job directory structure ingress would create; return input_path.
 
     Uses only the basename of job.filename (same logic the dispatcher uses)
@@ -199,7 +203,9 @@ def test_happy_path_done_result_summary_input_gone(tmp_path):
         _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner
+    )
     result = dispatcher.dispatch_once()
 
     assert result is True
@@ -231,7 +237,9 @@ def _sealed_metadata(job_root: Path, job) -> dict:
     precisely so the purge cannot touch them -- see blobs/local.py's header. Reading there is
     also more faithful: it is the copy the API actually serves.
     """
-    return json.loads((_blob_root(job_root) / "results" / job.job_id / "metadata.json").read_text())
+    return json.loads(
+        (_blob_root(job_root) / "results" / job.job_id / "metadata.json").read_text()
+    )
 
 
 def _blob_root(job_root: Path) -> Path:
@@ -270,9 +278,11 @@ class _RecordingBlobs:
             raise OSError(f"object store down (attempt {self.calls})")
         self.saw_metadata = (Path(out_dir) / "metadata.json").is_file()
         self.uploaded.append(job_id)
+
     def open_output(self, job_id, name): ...
     def delete_job(self, job_id):
         self.deleted.append(job_id)
+
 
 class _SnapshotBlobs(_RecordingBlobs):
     """Recording blob store that also COPIES out_dir aside at put_output time.
@@ -314,13 +324,18 @@ def test_cold_dispatch_uploads_result_to_blob_store_before_done(tmp_path):
 
     blobs = _RecordingBlobs()
     dispatcher = _make_dispatcher(
-        store, job_root=tmp_path, subprocess_runner=fake_runner, blob_store=blobs,
+        store,
+        job_root=tmp_path,
+        subprocess_runner=fake_runner,
+        blob_store=blobs,
     )
     result = dispatcher.dispatch_once()
 
     assert result is True
     assert blobs.uploaded == [job.job_id]
-    assert blobs.saw_metadata, "metadata.json must already be sealed when put_output runs"
+    assert blobs.saw_metadata, (
+        "metadata.json must already be sealed when put_output runs"
+    )
     final_job = store.get(job.job_id)
     assert final_job.status == JobStatus.DONE
     assert not input_path.exists()
@@ -346,7 +361,10 @@ def test_cold_dispatch_upload_failure_fails_job_not_done(tmp_path):
 
     blobs = _RecordingBlobs(fail_times=999)  # every attempt fails
     dispatcher = _make_dispatcher(
-        store, job_root=tmp_path, subprocess_runner=fake_runner, blob_store=blobs,
+        store,
+        job_root=tmp_path,
+        subprocess_runner=fake_runner,
+        blob_store=blobs,
         put_output_max_attempts=3,
     )
     result = dispatcher.dispatch_once()
@@ -355,7 +373,9 @@ def test_cold_dispatch_upload_failure_fails_job_not_done(tmp_path):
     assert blobs.calls == 3, "must exhaust the bounded retry budget, not give up early"
     assert blobs.uploaded == []
     final_job = store.get(job.job_id)
-    assert final_job.status == JobStatus.FAILED, "must not be marked DONE with an unstored result"
+    assert final_job.status == JobStatus.FAILED, (
+        "must not be marked DONE with an unstored result"
+    )
     assert final_job.error is not None
     assert "upload" in final_job.error.lower()
     # Normal cleanup for this dispatcher: the untrusted input is deleted on every
@@ -368,7 +388,9 @@ def test_cold_dispatch_upload_failure_fails_job_not_done(tmp_path):
     assert blobs.deleted == [job.job_id]
 
 
-def test_cold_dispatch_upload_exhaustion_with_lost_claim_does_not_reap_peer_result(tmp_path):
+def test_cold_dispatch_upload_exhaustion_with_lost_claim_does_not_reap_peer_result(
+    tmp_path,
+):
     """Ultrareview bug_001: the exhaustion reap (Finding S1) must be claim-fenced. The
     pre-upload `_claim_is_still_ours` check runs ONCE, before the retry loop -- the whole
     backoff window sits between it and the reap. If a peer requeues + re-runs + CAS-commits
@@ -392,17 +414,23 @@ def test_cold_dispatch_upload_exhaustion_with_lost_claim_does_not_reap_peer_resu
     class _PeerWinsDuringRetryBlobs(_RecordingBlobs):
         """Every put_output attempt fails; the first failure simulates the peer's full
         requeue -> re-run -> upload -> DONE-CAS landing during our retry/backoff window."""
+
         def put_output(self, job_id, out_dir):
             first = self.calls == 0
             try:
                 super().put_output(job_id, out_dir)
             finally:
                 if first:
-                    store.update(job_id, status=JobStatus.DONE, claim_id="peer-claim-id-not-ours")
+                    store.update(
+                        job_id, status=JobStatus.DONE, claim_id="peer-claim-id-not-ours"
+                    )
 
     blobs = _PeerWinsDuringRetryBlobs(fail_times=999)  # every attempt fails
     dispatcher = _make_dispatcher(
-        store, job_root=tmp_path, subprocess_runner=fake_runner, blob_store=blobs,
+        store,
+        job_root=tmp_path,
+        subprocess_runner=fake_runner,
+        blob_store=blobs,
         put_output_max_attempts=3,
     )
     result = dispatcher.dispatch_once()
@@ -411,11 +439,15 @@ def test_cold_dispatch_upload_exhaustion_with_lost_claim_does_not_reap_peer_resu
     assert blobs.calls == 3
     assert blobs.deleted == [], "must not reap the peer's authoritative result blob"
     stored = store.get(job.job_id)
-    assert stored.status == JobStatus.DONE, "the peer's terminal DONE must survive untouched"
+    assert stored.status == JobStatus.DONE, (
+        "the peer's terminal DONE must survive untouched"
+    )
     assert stored.claim_id == "peer-claim-id-not-ours"
 
 
-def test_cold_dispatch_reclaimed_claim_skips_upload_instead_of_clobbering_peer_result(tmp_path):
+def test_cold_dispatch_reclaimed_claim_skips_upload_instead_of_clobbering_peer_result(
+    tmp_path,
+):
     """Round-2 finding R2-1: put_output writes to a deterministic per-job key that is a
     per-file overwrite/union, not a claim-fenced atomic swap. If a peer reclaims this job
     (e.g. an orphan/requeue sweep) in the narrow window between the last local ownership
@@ -439,7 +471,10 @@ def test_cold_dispatch_reclaimed_claim_skips_upload_instead_of_clobbering_peer_r
 
     blobs = _RecordingBlobs()
     dispatcher = _make_dispatcher(
-        store, job_root=tmp_path, subprocess_runner=fake_runner, blob_store=blobs,
+        store,
+        job_root=tmp_path,
+        subprocess_runner=fake_runner,
+        blob_store=blobs,
     )
 
     # Simulate a peer reclaiming the job right after the host seals metadata.json but
@@ -455,9 +490,13 @@ def test_cold_dispatch_reclaimed_claim_skips_upload_instead_of_clobbering_peer_r
     result = dispatcher.dispatch_once()
 
     assert result is True
-    assert blobs.uploaded == [], "put_output must never be called once ownership is lost"
+    assert blobs.uploaded == [], (
+        "put_output must never be called once ownership is lost"
+    )
     stored = store.get(job.job_id)
-    assert stored.status == JobStatus.RUNNING, "must not clobber the peer's ownership of this job"
+    assert stored.status == JobStatus.RUNNING, (
+        "must not clobber the peer's ownership of this job"
+    )
     assert stored.claim_id == "peer-claim-id-not-ours"
     # Input is the new (peer) owner's responsibility now -- not deleted by the reclaimed worker.
     assert input_path.exists()
@@ -479,7 +518,10 @@ def test_cold_dispatch_still_owned_uploads_and_marks_done(tmp_path):
 
     blobs = _RecordingBlobs()
     dispatcher = _make_dispatcher(
-        store, job_root=tmp_path, subprocess_runner=fake_runner, blob_store=blobs,
+        store,
+        job_root=tmp_path,
+        subprocess_runner=fake_runner,
+        blob_store=blobs,
     )
     result = dispatcher.dispatch_once()
 
@@ -504,11 +546,26 @@ def test_cold_dispatch_serves_host_sealed_metadata(tmp_path):
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "page-001.png").write_bytes(content)
         env = {
-            "engine": _ENGINE_NAME, "status": "ok", "input_sha256": _INPUT_SHA,
-            "detected": {"label": "docx", "mime": "x", "confidence": 1.0, "source": "magika"},
-            "artifacts": [{"id": "page-001", "path": "page-001.png", "kind": "image",
-                           "sha256": "f" * 64, "bytes": 999999}],  # FABRICATED by the worker
-            "warnings": [], "payload": {"_type": "extracted_text", "text": "x", "char_count": 1},
+            "engine": _ENGINE_NAME,
+            "status": "ok",
+            "input_sha256": _INPUT_SHA,
+            "detected": {
+                "label": "docx",
+                "mime": "x",
+                "confidence": 1.0,
+                "source": "magika",
+            },
+            "artifacts": [
+                {
+                    "id": "page-001",
+                    "path": "page-001.png",
+                    "kind": "image",
+                    "sha256": "f" * 64,
+                    "bytes": 999999,
+                }
+            ],  # FABRICATED by the worker
+            "warnings": [],
+            "payload": {"_type": "extracted_text", "text": "x", "char_count": 1},
         }
         (output_dir / "metadata.json").write_bytes(json.dumps(env).encode())
         return subprocess.CompletedProcess(argv, 0, "", "")
@@ -537,7 +594,9 @@ def test_cold_dispatch_injects_mount_dir_env(tmp_path):
         _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner).dispatch_once()
+    _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner
+    ).dispatch_once()
     flat = seen[0]
     assert "BLASTBOX_INPUT_DIR=/input" in flat
     assert "BLASTBOX_OUTPUT_DIR=/output" in flat
@@ -553,14 +612,20 @@ def test_cold_output_size_cap_fails_undeclared_bloat(tmp_path):
     output_dir = tmp_path / job.job_id / "output"
 
     def fake_runner(argv, **kw):
-        _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)  # one tiny declared artifact
+        _make_valid_output_dir(
+            output_dir, input_sha256=_INPUT_SHA
+        )  # one tiny declared artifact
         (output_dir / "pad.bin").write_bytes(b"x" * 200_000)  # huge undeclared file
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     d = Dispatcher(
-        job_store=store, engines={_ENGINE_NAME: _engine_spec()},
-        limits=Limits(max_total_artifact_bytes=50_000), job_root=tmp_path,
-        runtime_selector=_fake_runtime, subprocess_runner=fake_runner, worker_timeout_s=30,
+        job_store=store,
+        engines={_ENGINE_NAME: _engine_spec()},
+        limits=Limits(max_total_artifact_bytes=50_000),
+        job_root=tmp_path,
+        runtime_selector=_fake_runtime,
+        subprocess_runner=fake_runner,
+        worker_timeout_s=30,
     )
     assert d.dispatch_once() is True
     final = store.get(job.job_id)
@@ -663,7 +728,9 @@ def test_nonzero_exit_fails_job_input_gone(tmp_path):
         # No output written, non-zero exit
         return subprocess.CompletedProcess(argv, 1, "", "worker crashed")
 
-    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner
+    )
     dispatcher.dispatch_once()
 
     final_job = store.get(job.job_id)
@@ -696,18 +763,22 @@ def test_timeout_kills_container_fails_job_input_gone(tmp_path):
         kill_calls.append(argv)
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner
+    )
     dispatcher.dispatch_once()
 
     final_job = store.get(job.job_id)
     assert final_job is not None
     assert final_job.status == JobStatus.FAILED
     assert final_job.error is not None
-    assert "timed out" in final_job.error.lower() or "timeout" in final_job.error.lower()
+    assert (
+        "timed out" in final_job.error.lower() or "timeout" in final_job.error.lower()
+    )
     # docker kill should have been called
-    assert any(
-        "kill" in argv for argv in kill_calls
-    ), f"docker kill not invoked; calls: {kill_calls}"
+    assert any("kill" in argv for argv in kill_calls), (
+        f"docker kill not invoked; calls: {kill_calls}"
+    )
     assert not input_path.exists()
     assert not input_path.parent.exists()
 
@@ -758,7 +829,9 @@ def test_trust_failure_fails_job_input_gone(tmp_path):
         (output_dir / "metadata.json").write_bytes(json.dumps(envelope).encode())
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner
+    )
     dispatcher.dispatch_once()
 
     final_job = store.get(job.job_id)
@@ -788,7 +861,9 @@ def test_unknown_engine_fails_job_no_subprocess_input_gone(tmp_path):
         subprocess_calls.append(argv)
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner
+    )
     dispatcher.dispatch_once()
 
     final_job = store.get(job.job_id)
@@ -806,12 +881,12 @@ def test_default_claim_keeps_legacy_store_signature(tmp_path):
     store = InMemoryJobStore()
     orig = store.claim_next
 
-    def legacy(*, claimant_tier=None):    # NO engine kwarg (pre-engine-scoping protocol)
+    def legacy(*, claimant_tier=None):  # NO engine kwarg (pre-engine-scoping protocol)
         return orig(claimant_tier=claimant_tier)
 
     store.claim_next = legacy  # type: ignore[method-assign]
     dispatcher = _make_dispatcher(store, job_root=tmp_path)
-    assert dispatcher.dispatch_once() is False    # no TypeError; just an empty queue
+    assert dispatcher.dispatch_once() is False  # no TypeError; just an empty queue
 
 
 def test_engine_scoped_dispatcher_leaves_foreign_engine_jobs(tmp_path, monkeypatch):
@@ -819,16 +894,18 @@ def test_engine_scoped_dispatcher_leaves_foreign_engine_jobs(tmp_path, monkeypat
     handle is LEFT UNCLAIMED for its real (e.g. VM) dispatcher — not stolen + failed."""
     monkeypatch.setenv("BLASTBOX_DISPATCHER_ENGINE_SCOPED", "1")
     store = InMemoryJobStore()
-    job = _make_job(engine="no-such-engine")          # not in this dispatcher's {test-engine}
+    job = _make_job(engine="no-such-engine")  # not in this dispatcher's {test-engine}
     job.input_sha256 = _INPUT_SHA
     store.create(job)
     input_path = _setup_job_dirs(tmp_path, job)
 
     dispatcher = _make_dispatcher(store, job_root=tmp_path)
-    assert dispatcher.dispatch_once() is False         # nothing claimable for our engine
+    assert dispatcher.dispatch_once() is False  # nothing claimable for our engine
     final_job = store.get(job.job_id)
-    assert final_job is not None and final_job.status == JobStatus.QUEUED  # left, not failed
-    assert input_path.exists()                          # input preserved
+    assert (
+        final_job is not None and final_job.status == JobStatus.QUEUED
+    )  # left, not failed
+    assert input_path.exists()  # input preserved
 
 
 # ---------------------------------------------------------------------------
@@ -886,7 +963,9 @@ def test_image_in_argv_is_engine_image_not_job_field(tmp_path):
             _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner
+    )
     dispatcher.dispatch_once()
 
     # Find the docker run invocation
@@ -898,7 +977,9 @@ def test_image_in_argv_is_engine_image_not_job_field(tmp_path):
     # The image must be _ENGINE_IMAGE (the last non-worker-argv positional)
     # The image appears just before the worker_argv elements.
     # It must be exactly engine.image — no job field.
-    assert _ENGINE_IMAGE in docker_run_argv, f"engine image not in argv: {docker_run_argv}"
+    assert _ENGINE_IMAGE in docker_run_argv, (
+        f"engine image not in argv: {docker_run_argv}"
+    )
     assert malicious_filename not in docker_run_argv, (
         f"job filename appeared as image in argv: {docker_run_argv}"
     )
@@ -940,7 +1021,9 @@ def test_requeue_orphaned_jobs(tmp_path):
             )
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner
+    )
 
     count = dispatcher.requeue_orphaned_jobs()
     assert count == 1
@@ -964,7 +1047,9 @@ def test_requeue_orphaned_jobs(tmp_path):
             return subprocess.CompletedProcess(argv, 1, "", "error")
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    dispatcher2 = _make_dispatcher(store2, job_root=tmp_path, subprocess_runner=failing_runner)
+    dispatcher2 = _make_dispatcher(
+        store2, job_root=tmp_path, subprocess_runner=failing_runner
+    )
     count2 = dispatcher2.requeue_orphaned_jobs()
     assert count2 == 0
 
@@ -984,8 +1069,8 @@ def test_params_key_filtering_bad_dropped_good_passes(tmp_path):
     job = _make_job(
         params={
             "VALID_KEY": "good_value",
-            "x; --privileged": "evil",   # bad key: spaces/semicolons
-            "also-bad": "val",            # bad key: hyphens
+            "x; --privileged": "evil",  # bad key: spaces/semicolons
+            "also-bad": "val",  # bad key: hyphens
             "123STARTS_WITH_DIGIT": "val",  # bad key: starts with digit
             "ANOTHER_VALID": "value2",
         }
@@ -1003,7 +1088,9 @@ def test_params_key_filtering_bad_dropped_good_passes(tmp_path):
             _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner
+    )
     dispatcher.dispatch_once()
 
     docker_run_argv = next(
@@ -1065,10 +1152,14 @@ def test_params_reserved_keys_dropped(tmp_path):
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     dispatcher = _make_dispatcher(
-        store, job_root=tmp_path, subprocess_runner=fake_runner,
-        engines={_ENGINE_NAME: _engine_spec(
-            reserved_param_keys=frozenset({"CLIPPYSHOT_WARM_DIAG_FILE"}),
-        )},
+        store,
+        job_root=tmp_path,
+        subprocess_runner=fake_runner,
+        engines={
+            _ENGINE_NAME: _engine_spec(
+                reserved_param_keys=frozenset({"CLIPPYSHOT_WARM_DIAG_FILE"}),
+            )
+        },
     )
     dispatcher.dispatch_once()
 
@@ -1082,16 +1173,26 @@ def test_params_reserved_keys_dropped(tmp_path):
         if tok == "-e" and i + 1 < len(docker_run_argv)
     }
     assert "CLIPPYSHOT_DPI" in env_keys  # ordinary tunable survives
-    for reserved in ("BLASTBOX_ENGINE", "LD_PRELOAD", "PYTHONPATH", "CLIPPYSHOT_WARM_DIAG_FILE"):
-        assert reserved not in env_keys, f"reserved key {reserved} leaked from job.params"
+    for reserved in (
+        "BLASTBOX_ENGINE",
+        "LD_PRELOAD",
+        "PYTHONPATH",
+        "CLIPPYSHOT_WARM_DIAG_FILE",
+    ):
+        assert reserved not in env_keys, (
+            f"reserved key {reserved} leaked from job.params"
+        )
     # The dispatcher still sets BLASTBOX_OUTPUT_DIR itself (merged last) — to /output, never /etc.
     out_dir_vals = [
         docker_run_argv[i + 1].split("=", 1)[1]
         for i, tok in enumerate(docker_run_argv)
-        if tok == "-e" and i + 1 < len(docker_run_argv)
+        if tok == "-e"
+        and i + 1 < len(docker_run_argv)
         and docker_run_argv[i + 1].startswith("BLASTBOX_OUTPUT_DIR=")
     ]
-    assert out_dir_vals == ["/output"], f"client overrode BLASTBOX_OUTPUT_DIR: {out_dir_vals}"
+    assert out_dir_vals == ["/output"], (
+        f"client overrode BLASTBOX_OUTPUT_DIR: {out_dir_vals}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1111,10 +1212,15 @@ def test_error_strings_scrubbed_of_filesystem_paths(tmp_path):
     def fake_runner(argv, **kw):
         # Inject an error that contains an internal path
         return subprocess.CompletedProcess(
-            argv, 1, "", f"fatal error at /var/lib/blastbox/jobs/{job.job_id}/input/malware.docx"
+            argv,
+            1,
+            "",
+            f"fatal error at /var/lib/blastbox/jobs/{job.job_id}/input/malware.docx",
         )
 
-    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner
+    )
     dispatcher.dispatch_once()
 
     final_job = store.get(job.job_id)
@@ -1156,8 +1262,11 @@ def test_requeue_grace_window(tmp_path):
     fresh.started_at = time.time()  # within the grace window
     store.create(fresh)
     d = _make_dispatcher(
-        store, job_root=tmp_path,
-        subprocess_runner=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""),
+        store,
+        job_root=tmp_path,
+        subprocess_runner=lambda argv, **kw: subprocess.CompletedProcess(
+            argv, 0, "", ""
+        ),
     )
     assert d.requeue_orphaned_jobs() == 0
     assert store.get(fresh.job_id).status == JobStatus.RUNNING
@@ -1172,6 +1281,7 @@ def test_cold_enrichment_claim_fenced_aborts_on_reclaim(tmp_path):
     # a real multi-dispatcher store. (In-memory is single-process and returns live references, so
     # it can't model a peer reclaim.)
     from blastbox.host.jobs.sql_store import SqlJobStore
+
     store = SqlJobStore(f"sqlite:///{tmp_path / 'jobs.db'}")
     job = _make_job()
     store.create(job)
@@ -1188,27 +1298,38 @@ def test_cold_enrichment_claim_fenced_aborts_on_reclaim(tmp_path):
         # fresh claim, and mark it warm — exactly the multi-dispatcher reclaim the fence detects.
         cur = store.get(job.job_id)
         store.update_if_status(
-            job.job_id, JobStatus.RUNNING, expect_claim_id=cur.claim_id,
-            status=JobStatus.QUEUED, claim_id=None,
+            job.job_id,
+            JobStatus.RUNNING,
+            expect_claim_id=cur.claim_id,
+            status=JobStatus.QUEUED,
+            claim_id=None,
         )
         new_owner = store.claim_next()
         store.update_if_status(
-            job.job_id, JobStatus.RUNNING,
-            expect_claim_id=new_owner.claim_id, worker_runtime="warm",
+            job.job_id,
+            JobStatus.RUNNING,
+            expect_claim_id=new_owner.claim_id,
+            worker_runtime="warm",
         )
         return RuntimeSelection(runtime="runc", secure=False, warnings=["stale"])
 
     disp = _make_dispatcher(
-        store, job_root=tmp_path,
-        runtime_selector=_selector_that_reclaims, subprocess_runner=_runner,
+        store,
+        job_root=tmp_path,
+        runtime_selector=_selector_that_reclaims,
+        subprocess_runner=_runner,
     )
     disp.dispatch_once()
 
     final = store.get(job.job_id)
     assert launched == []  # the stale owner aborted — no worker launched
-    assert final.worker_runtime == "warm"  # the new owner's label is NOT clobbered to "runc"
+    assert (
+        final.worker_runtime == "warm"
+    )  # the new owner's label is NOT clobbered to "runc"
     assert final.status == JobStatus.RUNNING  # still the new owner's live claim
-    assert input_path.exists()  # shared input preserved for the new owner (not deleted on abort)
+    assert (
+        input_path.exists()
+    )  # shared input preserved for the new owner (not deleted on abort)
 
 
 # ---------------------------------------------------------------------------
@@ -1223,10 +1344,10 @@ def test_sanitize_params_lowercase_dropped_uppercase_forwarded():
     )
     out = Dispatcher._sanitize_params(
         {
-            "enable_thumbnails": "true",          # lowercase → dropped by the shape floor
+            "enable_thumbnails": "true",  # lowercase → dropped by the shape floor
             "REDTUSK_ENABLE_THUMBNAILS": "true",  # uppercase + allowlisted → forwarded
             "REDTUSK_ENABLE_QR": "false",
-            "Redtusk_Mixed": "x",                 # not uppercase-only → dropped
+            "Redtusk_Mixed": "x",  # not uppercase-only → dropped
         },
         allow,
     )
@@ -1283,7 +1404,9 @@ def test_stale_queued_jobs_failed_after_max_age(tmp_path):
     _setup_job_dirs(tmp_path, fresh)
 
     # Disabled by default → no-op even for the stale job.
-    _make_dispatcher(store, job_root=tmp_path, max_queued_age_s=0)._fail_stale_queued_jobs()
+    _make_dispatcher(
+        store, job_root=tmp_path, max_queued_age_s=0
+    )._fail_stale_queued_jobs()
     assert store.get(old.job_id).status == JobStatus.QUEUED
 
     # Enabled → stale job FAILed (input gone), fresh one untouched.
@@ -1319,7 +1442,9 @@ def test_argv_build_warnings_reach_security_warnings(tmp_path, monkeypatch):
         _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner
+    )
     assert dispatcher.dispatch_once() is True
 
     final_job = store.get(job.job_id)
@@ -1383,6 +1508,7 @@ def test_netpolicy_direct_engine_puts_bb_net0_in_argv(tmp_path, monkeypatch):
 def test_netpolicy_default_none_engine_has_network_none_in_argv(tmp_path, monkeypatch):
     """A default engine (net_policy='none') → argv contains '--network=none', not 'bb-net0'."""
     import os
+
     # Scrub any BLASTBOX_NETPOLICY_* vars from the ambient env that could bleed in.
     for k in list(os.environ):
         if k.startswith("BLASTBOX_NETPOLICY_"):
@@ -1404,7 +1530,9 @@ def test_netpolicy_default_none_engine_has_network_none_in_argv(tmp_path, monkey
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     # Default engine spec has net_policy="none" (the EngineSpec default).
-    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner
+    )
     assert dispatcher.dispatch_once() is True
 
     docker_run_argv = next(
@@ -1492,11 +1620,15 @@ def test_netpolicy_direct_without_dns_no_resolv_conf(tmp_path, monkeypatch):
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     direct_engine = EngineSpec(
-        name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+        name=_ENGINE_NAME,
+        image=_ENGINE_IMAGE,
+        worker_argv=["worker", "run"],
         net_policy="direct",
     )
     dispatcher = _make_dispatcher(
-        store, job_root=tmp_path, engines={_ENGINE_NAME: direct_engine},
+        store,
+        job_root=tmp_path,
+        engines={_ENGINE_NAME: direct_engine},
         subprocess_runner=fake_runner,
     )
     assert dispatcher.dispatch_once() is True
@@ -1513,11 +1645,15 @@ def test_netpolicy_direct_without_dns_no_resolv_conf(tmp_path, monkeypatch):
 
 def _direct_dispatcher(store, tmp_path, fake_runner):
     direct_engine = EngineSpec(
-        name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+        name=_ENGINE_NAME,
+        image=_ENGINE_IMAGE,
+        worker_argv=["worker", "run"],
         net_policy="direct",
     )
     return _make_dispatcher(
-        store, job_root=tmp_path, engines={_ENGINE_NAME: direct_engine},
+        store,
+        job_root=tmp_path,
+        engines={_ENGINE_NAME: direct_engine},
         subprocess_runner=fake_runner,
     )
 
@@ -1602,15 +1738,21 @@ def test_network_capture_sealed_as_trusted_artifact(tmp_path, monkeypatch):
     assert caps[0]["sha256"] == hashlib.sha256(pcap_bytes).hexdigest()
     assert caps[0]["bytes"] == len(pcap_bytes)
     # The pcap is now servable from within the output dir.
-    assert _durable_artifact(tmp_path, job, "capture/dump.pcap").read_bytes() == pcap_bytes
+    assert (
+        _durable_artifact(tmp_path, job, "capture/dump.pcap").read_bytes() == pcap_bytes
+    )
 
 
-def test_network_capture_seal_proceeds_when_done_sentinel_never_lands(tmp_path, monkeypatch):
+def test_network_capture_seal_proceeds_when_done_sentinel_never_lands(
+    tmp_path, monkeypatch
+):
     """The .done-sentinel wait is BOUNDED: if netd never finalizes (no sentinel), the seal still
     proceeds after the (short) timeout rather than blocking — the pcap is still sealed best-effort."""
     monkeypatch.setenv("BLASTBOX_NETPOLICY_DIRECT", "exit=direct")
     monkeypatch.setenv("BLASTBOX_NET_CAPTURE", "1")
-    monkeypatch.setenv("BLASTBOX_NET_CAPTURE_WAIT_S", "0.2")  # short bound so the test is fast
+    monkeypatch.setenv(
+        "BLASTBOX_NET_CAPTURE_WAIT_S", "0.2"
+    )  # short bound so the test is fast
 
     store = InMemoryJobStore()
     job = _make_job()
@@ -1708,13 +1850,16 @@ def test_capture_refuses_symlinked_capture_dir(tmp_path, monkeypatch):
 
     assert _direct_dispatcher(store, tmp_path, fake_runner).dispatch_once() is True
     sealed = _sealed_metadata(tmp_path, job)
-    assert not [a for a in sealed["artifacts"] if a["kind"] == "network_capture"]  # refused
+    assert not [
+        a for a in sealed["artifacts"] if a["kind"] == "network_capture"
+    ]  # refused
     assert not (escape / "dump.pcap").exists()  # nothing written through the symlink
 
 
 class _FakePool:
     """Minimal warm pool stand-in that records claim() calls and never hands out a slot (so a job
     that DOES try the warm path cold-falls-back)."""
+
     def __init__(self):
         self.claim_calls = 0
         self.idle_count = 1
@@ -1749,12 +1894,19 @@ def test_warm_egress_job_bypasses_warm_slot(tmp_path, monkeypatch):
     store.create(egress_job)
     _setup_job_dirs(tmp_path, egress_job)
     output_dirs["cur"] = tmp_path / egress_job.job_id / "output"
-    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"])
+    eng = EngineSpec(
+        name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"]
+    )
     monkeypatch.setenv("BLASTBOX_ALLOW_NETPOLICY_OVERRIDE", "1")
-    d = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng},
-                         subprocess_runner=fake_runner, pool=egress_pool)
+    d = _make_dispatcher(
+        store,
+        job_root=tmp_path,
+        engines={_ENGINE_NAME: eng},
+        subprocess_runner=fake_runner,
+        pool=egress_pool,
+    )
     assert d.dispatch_once() is True
-    assert egress_pool.claim_calls == 0                      # warm slot bypassed
+    assert egress_pool.claim_calls == 0  # warm slot bypassed
     assert store.get(egress_job.job_id).status == JobStatus.DONE
 
     # no-egress job (default none) → DOES try the warm slot (claim called, then cold-falls-back)
@@ -1764,27 +1916,42 @@ def test_warm_egress_job_bypasses_warm_slot(tmp_path, monkeypatch):
     store.create(none_job)
     _setup_job_dirs(tmp_path, none_job)
     output_dirs["cur"] = tmp_path / none_job.job_id / "output"
-    d2 = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng},
-                          subprocess_runner=fake_runner, pool=none_pool)
+    d2 = _make_dispatcher(
+        store,
+        job_root=tmp_path,
+        engines={_ENGINE_NAME: eng},
+        subprocess_runner=fake_runner,
+        pool=none_pool,
+    )
     assert d2.dispatch_once() is True
-    assert none_pool.claim_calls == 1                        # warm slot attempted
+    assert none_pool.claim_calls == 1  # warm slot attempted
 
 
 def test_netd_wired_personality_refused_under_runsc(tmp_path, monkeypatch):
     """tor/socks/vpn/inspect need netd to nsenter the worker netns, which a runsc (gVisor) worker
     doesn't expose. Under the default secure runtime such a job must FAIL FAST with a clear
     diagnostic, not silently wait-then-fail-closed."""
-    monkeypatch.setenv("BLASTBOX_NETPOLICY_SX", "exit=socks,proxy=socks5://172.30.0.40:9050")
+    monkeypatch.setenv(
+        "BLASTBOX_NETPOLICY_SX", "exit=socks,proxy=socks5://172.30.0.40:9050"
+    )
     store = InMemoryJobStore()
     job = _make_job()
     job.input_sha256 = _INPUT_SHA
     store.create(job)
     _setup_job_dirs(tmp_path, job)
-    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
-                     net_policy="sx")
+    eng = EngineSpec(
+        name=_ENGINE_NAME,
+        image=_ENGINE_IMAGE,
+        worker_argv=["worker", "run"],
+        net_policy="sx",
+    )
     dispatcher = _make_dispatcher(
-        store, job_root=tmp_path, engines={_ENGINE_NAME: eng},
-        runtime_selector=lambda: RuntimeSelection(runtime="runsc", secure=True, warnings=[]),
+        store,
+        job_root=tmp_path,
+        engines={_ENGINE_NAME: eng},
+        runtime_selector=lambda: RuntimeSelection(
+            runtime="runsc", secure=True, warnings=[]
+        ),
     )
     assert dispatcher.dispatch_once() is True
     final = store.get(job.job_id)
@@ -1813,10 +1980,18 @@ def test_socks_dns_tcp_off_uses_dns_leakguard(tmp_path, monkeypatch):
             _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
-                     net_policy="sudp")
-    dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng},
-                                  subprocess_runner=fake_runner)
+    eng = EngineSpec(
+        name=_ENGINE_NAME,
+        image=_ENGINE_IMAGE,
+        worker_argv=["worker", "run"],
+        net_policy="sudp",
+    )
+    dispatcher = _make_dispatcher(
+        store,
+        job_root=tmp_path,
+        engines={_ENGINE_NAME: eng},
+        subprocess_runner=fake_runner,
+    )
     assert dispatcher.dispatch_once() is True
     argv = next(a for a in launched if a[:2] == ["docker", "run"])
     assert "blastbox.net.leakguard=dns" in argv
@@ -1845,22 +2020,35 @@ def test_egress_filter_labels_set_on_vpn_tier(tmp_path, monkeypatch):
             _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
-                     net_policy="webvpn")
-    dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng},
-                                  subprocess_runner=fake_runner)
+    eng = EngineSpec(
+        name=_ENGINE_NAME,
+        image=_ENGINE_IMAGE,
+        worker_argv=["worker", "run"],
+        net_policy="webvpn",
+    )
+    dispatcher = _make_dispatcher(
+        store,
+        job_root=tmp_path,
+        engines={_ENGINE_NAME: eng},
+        subprocess_runner=fake_runner,
+    )
     assert dispatcher.dispatch_once() is True
     argv = next(a for a in launched if a[:2] == ["docker", "run"])
     assert "blastbox.net.egress-ports=53,80,443" in argv
     assert "blastbox.net.block-internal=1" in argv
-    assert "blastbox.net.leakguard=allip" in argv   # all-IP tier keeps non-internal UDP/ICMP
+    assert (
+        "blastbox.net.leakguard=allip" in argv
+    )  # all-IP tier keeps non-internal UDP/ICMP
 
 
-@pytest.mark.parametrize("decl,driver", [
-    ("exit=socks,proxy=socks5://172.30.0.40:9050,egress_ports=53 80 443", "socks"),
-    ("exit=direct,block_internal=1", "direct"),
-    ("exit=inetsim,egress_ports=80 443", "inetsim"),
-])
+@pytest.mark.parametrize(
+    "decl,driver",
+    [
+        ("exit=socks,proxy=socks5://172.30.0.40:9050,egress_ports=53 80 443", "socks"),
+        ("exit=direct,block_internal=1", "direct"),
+        ("exit=inetsim,egress_ports=80 443", "inetsim"),
+    ],
+)
 def test_egress_filter_refused_on_unsupported_tier(tmp_path, monkeypatch, decl, driver):
     """egress_ports/block_internal are only sound on tor/openvpn/wireguard (the worker's OUTPUT carries
     the real dst:port AND egress is fail-closed until netd wires). On a proxy hop (socks/httpproxy) the
@@ -1871,8 +2059,12 @@ def test_egress_filter_refused_on_unsupported_tier(tmp_path, monkeypatch, decl, 
     job.input_sha256 = _INPUT_SHA
     store.create(job)
     _setup_job_dirs(tmp_path, job)
-    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
-                     net_policy="bad")
+    eng = EngineSpec(
+        name=_ENGINE_NAME,
+        image=_ENGINE_IMAGE,
+        worker_argv=["worker", "run"],
+        net_policy="bad",
+    )
     dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng})
     assert dispatcher.dispatch_once() is True
     final = store.get(job.job_id)
@@ -1882,14 +2074,20 @@ def test_egress_filter_refused_on_unsupported_tier(tmp_path, monkeypatch, decl, 
 
 def test_egress_ports_invalid_value_refused(tmp_path, monkeypatch):
     """A non-empty but all-invalid egress_ports (typo) must FAIL the job, not silently widen egress."""
-    monkeypatch.setenv("BLASTBOX_NETPOLICY_TYPO", "exit=openvpn,gateway=10.8.0.1,egress_ports=htts")
+    monkeypatch.setenv(
+        "BLASTBOX_NETPOLICY_TYPO", "exit=openvpn,gateway=10.8.0.1,egress_ports=htts"
+    )
     store = InMemoryJobStore()
     job = _make_job()
     job.input_sha256 = _INPUT_SHA
     store.create(job)
     _setup_job_dirs(tmp_path, job)
-    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
-                     net_policy="typo")
+    eng = EngineSpec(
+        name=_ENGINE_NAME,
+        image=_ENGINE_IMAGE,
+        worker_argv=["worker", "run"],
+        net_policy="typo",
+    )
     dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng})
     assert dispatcher.dispatch_once() is True
     final = store.get(job.job_id)
@@ -1901,25 +2099,43 @@ def test_httpproxy_env_validates_proxy_url(tmp_path):
     """The httpproxy proxy= URL is validated before injection — a malformed value injects no proxy
     env (fail closed), matching the socks tier's validation."""
     from blastbox.host.netpolicy import Personality
+
     d = _make_dispatcher(InMemoryJobStore(), job_root=tmp_path)
-    good = Personality(name="brd", exit_driver="httpproxy",
-                       config={"proxy": "http://172.30.0.30:8888"})
+    good = Personality(
+        name="brd", exit_driver="httpproxy", config={"proxy": "http://172.30.0.30:8888"}
+    )
     assert d._httpproxy_env(good)["HTTP_PROXY"] == "http://172.30.0.30:8888"
     assert d._httpproxy_env(good)["https_proxy"] == "http://172.30.0.30:8888"
-    for bad in ("not a url", "ftp://x:1", "http://", "http://h:99999x", "http://h:1 ; rm -rf"):
+    for bad in (
+        "not a url",
+        "ftp://x:1",
+        "http://",
+        "http://h:99999x",
+        "http://h:1 ; rm -rf",
+    ):
         p = Personality(name="brd", exit_driver="httpproxy", config={"proxy": bad})
         assert d._httpproxy_env(p) == {}
     # non-httpproxy driver → never injects proxy env
-    assert d._httpproxy_env(Personality(name="d", exit_driver="direct", config={})) == {}
+    assert (
+        d._httpproxy_env(Personality(name="d", exit_driver="direct", config={})) == {}
+    )
     # inline user:pass@ is STRIPPED before reaching the worker env (creds stay in the sidecar)
-    creds = Personality(name="brd", exit_driver="httpproxy",
-                        config={"proxy": "http://user:s3cr3t@172.30.0.30:8888"})
+    creds = Personality(
+        name="brd",
+        exit_driver="httpproxy",
+        config={"proxy": "http://user:s3cr3t@172.30.0.30:8888"},
+    )
     env = d._httpproxy_env(creds)
-    assert env["HTTP_PROXY"] == "http://172.30.0.30:8888"  # host:port kept, userinfo dropped
+    assert (
+        env["HTTP_PROXY"] == "http://172.30.0.30:8888"
+    )  # host:port kept, userinfo dropped
     assert all("s3cr3t" not in v and "user" not in v for v in env.values())
     # IPv6 literal: brackets must be preserved when rebuilding the credential-stripped netloc
-    v6 = Personality(name="brd", exit_driver="httpproxy",
-                     config={"proxy": "http://u:p@[2001:db8::1]:8080"})
+    v6 = Personality(
+        name="brd",
+        exit_driver="httpproxy",
+        config={"proxy": "http://u:p@[2001:db8::1]:8080"},
+    )
     assert d._httpproxy_env(v6)["HTTP_PROXY"] == "http://[2001:db8::1]:8080"
 
 
@@ -1950,33 +2166,47 @@ def test_decrypt_seal_refuses_symlinked_output(tmp_path, monkeypatch):
             (cap / "sslkeys.log").write_text("SERVER_HANDSHAKE_TRAFFIC_SECRET a b\n")
             _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
             (output_dir / "capture").mkdir(parents=True, exist_ok=True)
-            (output_dir / "capture" / "decrypted.pcap").symlink_to(escape)  # worker tampering
+            (output_dir / "capture" / "decrypted.pcap").symlink_to(
+                escape
+            )  # worker tampering
             return subprocess.CompletedProcess(argv, 0, "", "")
         if argv[:1] == ["/bin/fake-ggrc"]:
-            Path(argv[argv.index("-o") + 1]).write_bytes(b"\xd4\xc3\xb2\xa1" + b"dec" * 40)
+            Path(argv[argv.index("-o") + 1]).write_bytes(
+                b"\xd4\xc3\xb2\xa1" + b"dec" * 40
+            )
             return subprocess.CompletedProcess(argv, 0, "", "")
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     assert _direct_dispatcher(store, tmp_path, fake_runner).dispatch_once() is True
-    assert escape.read_bytes() == b"DO NOT TOUCH"  # the symlink target was never written through
+    assert (
+        escape.read_bytes() == b"DO NOT TOUCH"
+    )  # the symlink target was never written through
     sealed = _sealed_metadata(tmp_path, job)
     paths = [a["path"] for a in sealed["artifacts"]]
-    assert "capture/decrypted.pcap" not in paths      # symlinked output skipped
-    assert "capture/mixed.pcap" in paths              # the non-symlinked output still sealed
+    assert "capture/decrypted.pcap" not in paths  # symlinked output skipped
+    assert "capture/mixed.pcap" in paths  # the non-symlinked output still sealed
 
 
 def test_routed_personality_without_gateway_fails_fast(tmp_path, monkeypatch):
     """A gateway-routed tier (tor/vpn/inspect) with no gateway= can't give the worker a wait target,
     so egress would race netd. The dispatcher must FAIL FAST with a clear diagnostic."""
-    monkeypatch.setenv("BLASTBOX_NETPOLICY_TORNOGW", "exit=tor")  # routed tier, but NO gateway=
+    monkeypatch.setenv(
+        "BLASTBOX_NETPOLICY_TORNOGW", "exit=tor"
+    )  # routed tier, but NO gateway=
     store = InMemoryJobStore()
     job = _make_job()
     job.input_sha256 = _INPUT_SHA
     store.create(job)
     _setup_job_dirs(tmp_path, job)
-    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
-                     net_policy="tornogw")
-    dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng})  # runc
+    eng = EngineSpec(
+        name=_ENGINE_NAME,
+        image=_ENGINE_IMAGE,
+        worker_argv=["worker", "run"],
+        net_policy="tornogw",
+    )
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, engines={_ENGINE_NAME: eng}
+    )  # runc
     assert dispatcher.dispatch_once() is True
     final = store.get(job.job_id)
     assert final.status == JobStatus.FAILED
@@ -2025,7 +2255,9 @@ def test_decrypt_seals_decrypted_and_mixed_when_keylog_present(tmp_path, monkeyp
     assert "network_capture_mixed" in kinds
     # The decrypted pcap is servable + its hash matches. Read the DURABLE copy: the job dir
     # is purged on every terminal path (issue #84), and this is the copy the API serves.
-    dec = next(a for a in sealed["artifacts"] if a["kind"] == "network_capture_decrypted")
+    dec = next(
+        a for a in sealed["artifacts"] if a["kind"] == "network_capture_decrypted"
+    )
     served = _durable_artifact(tmp_path, job, dec["path"]).read_bytes()
     assert dec["sha256"] == hashlib.sha256(served).hexdigest()
 
@@ -2047,7 +2279,9 @@ def test_decrypt_noop_without_keylog(tmp_path, monkeypatch):
     def fake_runner(argv, **kw):
         if argv[:2] == ["docker", "run"]:
             cap.mkdir(parents=True, exist_ok=True)
-            (cap / "dump.pcap").write_bytes(b"\xd4\xc3\xb2\xa1" + b"raw" * 40)  # no keylog
+            (cap / "dump.pcap").write_bytes(
+                b"\xd4\xc3\xb2\xa1" + b"raw" * 40
+            )  # no keylog
             (cap / "dump.pcap.done").write_text("done")  # netd finalized the capture
             _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
         return subprocess.CompletedProcess(argv, 0, "", "")
@@ -2059,12 +2293,18 @@ def test_decrypt_noop_without_keylog(tmp_path, monkeypatch):
     assert store.get(job.job_id).status == JobStatus.DONE
 
 
-@pytest.mark.parametrize("env,expected", [
-    ("100", 60.0),     # clamped to the ceiling so a fat-fingered env can't wedge a dispatch thread
-    ("-5", 0.0),       # negative → floored to 0 (no wait)
-    ("3", 3.0),        # in-range value preserved
-    (None, 8.0),       # default
-])
+@pytest.mark.parametrize(
+    "env,expected",
+    [
+        (
+            "100",
+            60.0,
+        ),  # clamped to the ceiling so a fat-fingered env can't wedge a dispatch thread
+        ("-5", 0.0),  # negative → floored to 0 (no wait)
+        ("3", 3.0),  # in-range value preserved
+        (None, 8.0),  # default
+    ],
+)
 def test_decrypt_keylog_wait_is_clamped(tmp_path, monkeypatch, env, expected):
     monkeypatch.delenv("BLASTBOX_NET_DECRYPT_KEYLOG_WAIT_S", raising=False)
     if env is not None:
@@ -2074,7 +2314,9 @@ def test_decrypt_keylog_wait_is_clamped(tmp_path, monkeypatch, env, expected):
     assert d._decrypt_keylog_wait_s == expected
 
 
-@pytest.mark.parametrize("env,expected", [("100", 60.0), ("-5", 0.0), ("2", 2.0), (None, 5.0)])
+@pytest.mark.parametrize(
+    "env,expected", [("100", 60.0), ("-5", 0.0), ("2", 2.0), (None, 5.0)]
+)
 def test_net_capture_wait_is_clamped(tmp_path, monkeypatch, env, expected):
     monkeypatch.delenv("BLASTBOX_NET_CAPTURE_WAIT_S", raising=False)
     if env is not None:
@@ -2105,25 +2347,34 @@ def test_net_egress_env_reflects_personality(tmp_path, monkeypatch):
             return subprocess.CompletedProcess(argv, 0, "", "")
 
         engine = EngineSpec(
-            name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+            name=_ENGINE_NAME,
+            image=_ENGINE_IMAGE,
+            worker_argv=["worker", "run"],
             net_policy=net_policy_driver,
         )
         _make_dispatcher(
-            store, job_root=tmp_path, engines={_ENGINE_NAME: engine},
+            store,
+            job_root=tmp_path,
+            engines={_ENGINE_NAME: engine},
             subprocess_runner=fake_runner,
         ).dispatch_once()
         argv = next(a for a in launched if a[:2] == ["docker", "run"])
         # find the -e BLASTBOX_NET_EGRESS=<v> token
-        return next(t.split("=", 1)[1] for t in argv if t.startswith("BLASTBOX_NET_EGRESS="))
+        return next(
+            t.split("=", 1)[1] for t in argv if t.startswith("BLASTBOX_NET_EGRESS=")
+        )
 
-    assert run_with("direct") == "1"   # has an exit → net-share allowed
-    assert run_with("none") == "0"     # sealed → isolate
+    assert run_with("direct") == "1"  # has an exit → net-share allowed
+    assert run_with("none") == "0"  # sealed → isolate
 
 
-def test_socks_personality_labels_worker_for_wiring_and_uses_bb_socks(tmp_path, monkeypatch):
+def test_socks_personality_labels_worker_for_wiring_and_uses_bb_socks(
+    tmp_path, monkeypatch
+):
     """A socks personality → worker on bb-socks (internal) + labeled blastbox.net.wire=socks."""
     monkeypatch.setenv(
-        "BLASTBOX_NETPOLICY_TOR", "exit=socks,dns=1.1.1.1,proxy=socks5://172.30.0.40:9050"
+        "BLASTBOX_NETPOLICY_TOR",
+        "exit=socks,dns=1.1.1.1,proxy=socks5://172.30.0.40:9050",
     )
 
     store = InMemoryJobStore()
@@ -2141,11 +2392,15 @@ def test_socks_personality_labels_worker_for_wiring_and_uses_bb_socks(tmp_path, 
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     socks_engine = EngineSpec(
-        name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+        name=_ENGINE_NAME,
+        image=_ENGINE_IMAGE,
+        worker_argv=["worker", "run"],
         net_policy="tor",
     )
     dispatcher = _make_dispatcher(
-        store, job_root=tmp_path, engines={_ENGINE_NAME: socks_engine},
+        store,
+        job_root=tmp_path,
+        engines={_ENGINE_NAME: socks_engine},
         subprocess_runner=fake_runner,
     )
     assert dispatcher.dispatch_once() is True
@@ -2165,41 +2420,8 @@ def test_socks_personality_labels_worker_for_wiring_and_uses_bb_socks(tmp_path, 
 def test_httpproxy_personality_injects_proxy_env_on_bb_socks(tmp_path, monkeypatch):
     """An httpproxy personality → worker on internal bb-socks with HTTP(S)_PROXY env injected from
     the personality's proxy= (a creds-holding sidecar); NO net.wire wiring, NO resolv.conf."""
-    monkeypatch.setenv("BLASTBOX_NETPOLICY_BRD", "exit=httpproxy,proxy=http://172.30.0.30:8888")
-    store = InMemoryJobStore()
-    job = _make_job()
-    job.input_sha256 = _INPUT_SHA
-    store.create(job)
-    _setup_job_dirs(tmp_path, job)
-    output_dir = tmp_path / job.job_id / "output"
-    launched: list[list[str]] = []
-
-    def fake_runner(argv, **kw):
-        launched.append(list(argv))
-        if argv[:2] == ["docker", "run"]:
-            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
-        return subprocess.CompletedProcess(argv, 0, "", "")
-
-    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
-                     net_policy="brd")
-    dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng},
-                                  subprocess_runner=fake_runner)
-    assert dispatcher.dispatch_once() is True
-    argv = next(a for a in launched if a[:2] == ["docker", "run"])
-    assert "bb-socks" in argv
-    assert any(t == "HTTPS_PROXY=http://172.30.0.30:8888" for t in argv)
-    assert any(t == "http_proxy=http://172.30.0.30:8888" for t in argv)
-    assert not any(t.startswith("blastbox.net.wire=") for t in argv)   # no netd wiring
-    assert not any("dst=/etc/resolv.conf" in t for t in argv)          # no resolv injection
-    assert "blastbox.net.leakguard=strict" in argv                     # TCP-only → non-TCP dropped
-
-
-def test_inspect_httpproxy_fails_closed_no_inspect_label(tmp_path, monkeypatch):
-    """inspect+httpproxy is unsupported (httpproxy is not a routed path). The worker must fail
-    closed to --network=none and carry NO blastbox.net.wire=inspect label / gateway-wait — i.e. it
-    is NOT silently routed onto the MITM gateway nor degraded to a plain proxy."""
     monkeypatch.setenv(
-        "BLASTBOX_NETPOLICY_BRDINS", "exit=httpproxy,inspect=1,proxy=http://172.30.0.30:8888"
+        "BLASTBOX_NETPOLICY_BRD", "exit=httpproxy,proxy=http://172.30.0.30:8888"
     )
     store = InMemoryJobStore()
     job = _make_job()
@@ -2215,19 +2437,77 @@ def test_inspect_httpproxy_fails_closed_no_inspect_label(tmp_path, monkeypatch):
             _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
-                     net_policy="brdins")
-    dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng},
-                                  subprocess_runner=fake_runner)
+    eng = EngineSpec(
+        name=_ENGINE_NAME,
+        image=_ENGINE_IMAGE,
+        worker_argv=["worker", "run"],
+        net_policy="brd",
+    )
+    dispatcher = _make_dispatcher(
+        store,
+        job_root=tmp_path,
+        engines={_ENGINE_NAME: eng},
+        subprocess_runner=fake_runner,
+    )
     assert dispatcher.dispatch_once() is True
     argv = next(a for a in launched if a[:2] == ["docker", "run"])
-    assert "--network=none" in argv                                    # fail-closed
-    assert not any("blastbox.net.wire=inspect" in t for t in argv)     # NOT routed to MITM gw
-    assert not any(t.startswith("BLASTBOX_NET_WAIT_GATEWAY=") and t != "BLASTBOX_NET_WAIT_GATEWAY="
-                   for t in argv)                                       # no gateway wait
+    assert "bb-socks" in argv
+    assert any(t == "HTTPS_PROXY=http://172.30.0.30:8888" for t in argv)
+    assert any(t == "http_proxy=http://172.30.0.30:8888" for t in argv)
+    assert not any(t.startswith("blastbox.net.wire=") for t in argv)  # no netd wiring
+    assert not any("dst=/etc/resolv.conf" in t for t in argv)  # no resolv injection
+    assert "blastbox.net.leakguard=strict" in argv  # TCP-only → non-TCP dropped
 
 
-def test_transproxy_personality_labels_worker_and_waits_for_gateway(tmp_path, monkeypatch):
+def test_inspect_httpproxy_fails_closed_no_inspect_label(tmp_path, monkeypatch):
+    """inspect+httpproxy is unsupported (httpproxy is not a routed path). The worker must fail
+    closed to --network=none and carry NO blastbox.net.wire=inspect label / gateway-wait — i.e. it
+    is NOT silently routed onto the MITM gateway nor degraded to a plain proxy."""
+    monkeypatch.setenv(
+        "BLASTBOX_NETPOLICY_BRDINS",
+        "exit=httpproxy,inspect=1,proxy=http://172.30.0.30:8888",
+    )
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    launched: list[list[str]] = []
+
+    def fake_runner(argv, **kw):
+        launched.append(list(argv))
+        if argv[:2] == ["docker", "run"]:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    eng = EngineSpec(
+        name=_ENGINE_NAME,
+        image=_ENGINE_IMAGE,
+        worker_argv=["worker", "run"],
+        net_policy="brdins",
+    )
+    dispatcher = _make_dispatcher(
+        store,
+        job_root=tmp_path,
+        engines={_ENGINE_NAME: eng},
+        subprocess_runner=fake_runner,
+    )
+    assert dispatcher.dispatch_once() is True
+    argv = next(a for a in launched if a[:2] == ["docker", "run"])
+    assert "--network=none" in argv  # fail-closed
+    assert not any(
+        "blastbox.net.wire=inspect" in t for t in argv
+    )  # NOT routed to MITM gw
+    assert not any(
+        t.startswith("BLASTBOX_NET_WAIT_GATEWAY=") and t != "BLASTBOX_NET_WAIT_GATEWAY="
+        for t in argv
+    )  # no gateway wait
+
+
+def test_transproxy_personality_labels_worker_and_waits_for_gateway(
+    tmp_path, monkeypatch
+):
     """A first-class tor personality (CAPE transparent recipe) → worker on bb-socks labeled
     blastbox.net.wire=transproxy, and it waits for the host gateway route (not a TUN)."""
     monkeypatch.setenv(
@@ -2247,10 +2527,18 @@ def test_transproxy_personality_labels_worker_and_waits_for_gateway(tmp_path, mo
             _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
-                     net_policy="tortp")
-    dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng},
-                                  subprocess_runner=fake_runner)
+    eng = EngineSpec(
+        name=_ENGINE_NAME,
+        image=_ENGINE_IMAGE,
+        worker_argv=["worker", "run"],
+        net_policy="tortp",
+    )
+    dispatcher = _make_dispatcher(
+        store,
+        job_root=tmp_path,
+        engines={_ENGINE_NAME: eng},
+        subprocess_runner=fake_runner,
+    )
     assert dispatcher.dispatch_once() is True
     argv = next(a for a in launched if a[:2] == ["docker", "run"])
     assert "bb-socks" in argv
@@ -2267,7 +2555,8 @@ def test_inspect_personality_labels_worker_for_inspect_wiring_and_uses_bb_inspec
     """An inspect personality (egress exit + inspect=1) → worker on the internal bb-inspect bridge
     + labeled blastbox.net.wire=inspect, so netd routes it through the sslproxy/MITM gateway."""
     monkeypatch.setenv(
-        "BLASTBOX_NETPOLICY_MITM", "exit=inetsim,inspect=1,dns=172.28.100.2,gateway=172.32.0.10"
+        "BLASTBOX_NETPOLICY_MITM",
+        "exit=inetsim,inspect=1,dns=172.28.100.2,gateway=172.32.0.10",
     )
 
     store = InMemoryJobStore()
@@ -2285,16 +2574,20 @@ def test_inspect_personality_labels_worker_for_inspect_wiring_and_uses_bb_inspec
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     inspect_engine = EngineSpec(
-        name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+        name=_ENGINE_NAME,
+        image=_ENGINE_IMAGE,
+        worker_argv=["worker", "run"],
         net_policy="mitm",
     )
     dispatcher = _make_dispatcher(
-        store, job_root=tmp_path, engines={_ENGINE_NAME: inspect_engine},
+        store,
+        job_root=tmp_path,
+        engines={_ENGINE_NAME: inspect_engine},
         subprocess_runner=fake_runner,
     )
     assert dispatcher.dispatch_once() is True
     argv = next(a for a in launched if a[:2] == ["docker", "run"])
-    assert "bb-inspect" in argv          # rides the inspect bridge, NOT bb-fakenet
+    assert "bb-inspect" in argv  # rides the inspect bridge, NOT bb-fakenet
     assert "bb-fakenet" not in argv
     assert "blastbox.net.wire=inspect" in argv
     # An inspected egress worker still has egress (through the gateway) → net-share granted.
@@ -2317,7 +2610,9 @@ def test_no_capture_artifact_when_netd_produced_none(tmp_path, monkeypatch):
 
     def fake_runner(argv, **kw):
         if argv[:2] == ["docker", "run"]:
-            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)  # no pcap written
+            _make_valid_output_dir(
+                output_dir, input_sha256=_INPUT_SHA
+            )  # no pcap written
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     assert _direct_dispatcher(store, tmp_path, fake_runner).dispatch_once() is True
@@ -2335,7 +2630,7 @@ def test_cold_dispatch_requeues_when_no_gate_headroom(tmp_path):
     store = InMemoryJobStore()
     job = _make_job()
     job.input_sha256 = _INPUT_SHA
-    job.created_at = 100.0                  # old timestamp
+    job.created_at = 100.0  # old timestamp
     store.create(job)
     _setup_job_dirs(tmp_path, job)
 
@@ -2345,22 +2640,24 @@ def test_cold_dispatch_requeues_when_no_gate_headroom(tmp_path):
         ran.append(argv)
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner
+    )
     gate = DynamicConcurrencyGate(1)
-    assert gate.acquire(0.0)               # consume the only permit → cold headroom is full
+    assert gate.acquire(0.0)  # consume the only permit → cold headroom is full
     dispatcher._concurrency_gate = gate
-    dispatcher._warm_requeue_backoff_s = 0.0   # no sleep in the test
+    dispatcher._warm_requeue_backoff_s = 0.0  # no sleep in the test
 
-    assert dispatcher.dispatch_once() is True   # a job WAS claimed...
-    assert ran == []                            # ...but the cold worker never spawned
+    assert dispatcher.dispatch_once() is True  # a job WAS claimed...
+    assert ran == []  # ...but the cold worker never spawned
     final = store.get(job.job_id)
     assert final is not None
-    assert final.status == JobStatus.QUEUED     # requeued for a later worker/tick
-    assert final.claim_id is None               # claim released
+    assert final.status == JobStatus.QUEUED  # requeued for a later worker/tick
+    assert final.claim_id is None  # claim released
     # PR #60: DEFERRED via claimable_after (NOT created_at) so it's temporarily ineligible and
     # warm-eligible work is claimed first — created_at (submission time / max_queued_age) is
     # preserved.
-    assert final.created_at == 100.0            # submission time unchanged
+    assert final.created_at == 100.0  # submission time unchanged
     assert final.claimable_after is not None and final.claimable_after > time.time()
 
 
@@ -2380,13 +2677,15 @@ def test_cold_dispatch_acquires_and_releases_gate_permit(tmp_path):
         _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner
+    )
     gate = DynamicConcurrencyGate(2)
     dispatcher._concurrency_gate = gate
 
     assert dispatcher.dispatch_once() is True
     assert store.get(job.job_id).status == JobStatus.DONE
-    assert gate.in_flight == 0                   # permit taken for the run, then released
+    assert gate.in_flight == 0  # permit taken for the run, then released
 
 
 def test_cold_permit_retained_when_container_kill_fails(tmp_path):
@@ -2403,15 +2702,17 @@ def test_cold_permit_retained_when_container_kill_fails(tmp_path):
 
     def runner(argv, **kw):
         if "kill" in argv:
-            return subprocess.CompletedProcess(argv, 1, "", "kill failed")   # kill FAILS (rc!=0)
-        raise subprocess.TimeoutExpired(argv, kw.get("timeout"))             # worker times out
+            return subprocess.CompletedProcess(
+                argv, 1, "", "kill failed"
+            )  # kill FAILS (rc!=0)
+        raise subprocess.TimeoutExpired(argv, kw.get("timeout"))  # worker times out
 
     dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=runner)
     gate = DynamicConcurrencyGate(2)
     dispatcher._concurrency_gate = gate
 
     assert dispatcher.dispatch_once() is True
-    assert gate.in_flight == 1                    # permit RETAINED (orphan may still consume RAM)
+    assert gate.in_flight == 1  # permit RETAINED (orphan may still consume RAM)
 
 
 def test_cold_permit_released_when_kill_confirms(tmp_path):
@@ -2426,7 +2727,7 @@ def test_cold_permit_released_when_kill_confirms(tmp_path):
 
     def runner(argv, **kw):
         if "kill" in argv:
-            return subprocess.CompletedProcess(argv, 0, "", "")             # kill CONFIRMED
+            return subprocess.CompletedProcess(argv, 0, "", "")  # kill CONFIRMED
         raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
 
     dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=runner)
@@ -2434,7 +2735,7 @@ def test_cold_permit_released_when_kill_confirms(tmp_path):
     dispatcher._concurrency_gate = gate
 
     assert dispatcher.dispatch_once() is True
-    assert gate.in_flight == 0                    # confirmed gone → permit released
+    assert gate.in_flight == 0  # confirmed gone → permit released
 
 
 def test_retained_cold_permit_reclaimed_when_container_confirmed_gone(tmp_path):
@@ -2448,18 +2749,24 @@ def test_retained_cold_permit_reclaimed_when_container_confirmed_gone(tmp_path):
     gate = DynamicConcurrencyGate(2)
     dispatcher._concurrency_gate = gate
 
-    gate.acquire(0.0)                                    # the retained permit
-    dispatcher._retained_cold_orphans["blastbox-worker-abc123def456"] = ("abc123def456", None)
-    dispatcher._list_active_worker_job_ids = lambda: set()   # docker ps: no live workers
+    gate.acquire(0.0)  # the retained permit
+    dispatcher._retained_cold_orphans["blastbox-worker-abc123def456"] = (
+        "abc123def456",
+        None,
+    )
+    dispatcher._list_active_worker_job_ids = lambda: set()  # docker ps: no live workers
     dispatcher._reconcile_cold_orphans()
-    assert gate.in_flight == 0                           # reclaimed
+    assert gate.in_flight == 0  # reclaimed
     assert not dispatcher._retained_cold_orphans
 
-    gate.acquire(0.0)                                    # another orphan, but docker ps unreadable
-    dispatcher._retained_cold_orphans["blastbox-worker-999888777666"] = ("999888777666", None)
+    gate.acquire(0.0)  # another orphan, but docker ps unreadable
+    dispatcher._retained_cold_orphans["blastbox-worker-999888777666"] = (
+        "999888777666",
+        None,
+    )
     dispatcher._list_active_worker_job_ids = lambda: None
     dispatcher._reconcile_cold_orphans()
-    assert gate.in_flight == 1                           # still retained (absence unconfirmed)
+    assert gate.in_flight == 1  # still retained (absence unconfirmed)
 
 
 def test_confirmed_gone_cold_orphan_gets_its_tree_purged(tmp_path):
@@ -2494,14 +2801,16 @@ def test_confirmed_gone_cold_orphan_gets_its_tree_purged(tmp_path):
     assert dispatcher._concurrency_gate.in_flight == 0
 
 
-def test_failed_kill_orphan_registers_through_the_real_dispatch_path_with_no_gate(tmp_path):
+def test_failed_kill_orphan_registers_through_the_real_dispatch_path_with_no_gate(
+    tmp_path,
+):
     """Same hole as the test below, but exercised through _dispatch_claimed_job rather than by
     seeding the map — registration used to sit in the PERMIT's branch (`elif gate is not None`),
     so with the autosizer off it never ran at all and there was nothing for any sweep to find.
     """
     store = InMemoryJobStore()
     dispatcher = _make_dispatcher(store, job_root=tmp_path)
-    assert dispatcher._concurrency_gate is None          # autosizer off — the default
+    assert dispatcher._concurrency_gate is None  # autosizer off — the default
 
     job = Job.new(engine="redtusk", filename="s.doc")
     job.claim_id = "claim-1"
@@ -2515,7 +2824,7 @@ def test_failed_kill_orphan_registers_through_the_real_dispatch_path_with_no_gat
 
     def fake_inner(j, input_path, output_dir, *, orphan_out=None):
         if orphan_out is not None:
-            orphan_out.append(name)      # `docker kill` came back non-zero
+            orphan_out.append(name)  # `docker kill` came back non-zero
 
     dispatcher._dispatch_inner = fake_inner
     dispatcher._dispatch_claimed_job(job)
@@ -2524,7 +2833,9 @@ def test_failed_kill_orphan_registers_through_the_real_dispatch_path_with_no_gat
         "with no gate the failed-kill orphan is never recorded, so nothing ever purges its tree"
     )
     assert dispatcher._retained_cold_orphans[name] == (job.job_id, "claim-1")
-    assert d.exists(), "the tree must be DEFERRED, not purged under a possibly-live container"
+    assert d.exists(), (
+        "the tree must be DEFERRED, not purged under a possibly-live container"
+    )
 
 
 def test_failed_kill_orphan_is_registered_even_without_a_concurrency_gate(tmp_path):
@@ -2543,7 +2854,7 @@ def test_failed_kill_orphan_is_registered_even_without_a_concurrency_gate(tmp_pa
     """
     store = InMemoryJobStore()
     dispatcher = _make_dispatcher(store, job_root=tmp_path)
-    assert dispatcher._concurrency_gate is None          # autosizer off — the default
+    assert dispatcher._concurrency_gate is None  # autosizer off — the default
 
     jid = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
     d = tmp_path / jid
@@ -2555,7 +2866,9 @@ def test_failed_kill_orphan_is_registered_even_without_a_concurrency_gate(tmp_pa
 
     dispatcher._reconcile_cold_orphans()
 
-    assert not d.exists(), "with no gate the reconcile never purges — the deferral is dead code"
+    assert not d.exists(), (
+        "with no gate the reconcile never purges — the deferral is dead code"
+    )
 
 
 def test_confirmed_gone_cold_orphan_is_not_purged_after_a_peer_reclaims_it(tmp_path):
@@ -2573,7 +2886,7 @@ def test_confirmed_gone_cold_orphan_is_not_purged_after_a_peer_reclaims_it(tmp_p
     dispatcher._concurrency_gate.acquire(0.0)
 
     job = Job.new(engine="redtusk", filename="s.doc")
-    job.claim_id = "peer-2"                      # the PEER owns it now
+    job.claim_id = "peer-2"  # the PEER owns it now
     job.status = JobStatus.RUNNING
     store.create(job)
     d = tmp_path / job.job_id
@@ -2581,13 +2894,17 @@ def test_confirmed_gone_cold_orphan_is_not_purged_after_a_peer_reclaims_it(tmp_p
     (d / "input.bin").write_bytes(b"PEER IS USING THIS")
 
     dispatcher._retained_cold_orphans[f"blastbox-worker-{job.job_id[:12]}"] = (
-        job.job_id, "claim-1")                   # we held claim-1
+        job.job_id,
+        "claim-1",
+    )  # we held claim-1
     dispatcher._list_active_worker_job_ids = lambda: set()
 
     dispatcher._reconcile_cold_orphans()
 
     assert (d / "input.bin").exists(), "deleted a peer's staged input out from under it"
-    assert dispatcher._concurrency_gate.in_flight == 0, "the permit must still be reclaimed"
+    assert dispatcher._concurrency_gate.in_flight == 0, (
+        "the permit must still be reclaimed"
+    )
 
 
 def test_confirmed_gone_cold_orphan_with_a_failed_upload_is_retained(tmp_path):
@@ -2612,7 +2929,9 @@ def test_confirmed_gone_cold_orphan_with_a_failed_upload_is_retained(tmp_path):
 
     dispatcher._reconcile_cold_orphans()
 
-    assert (d / "output" / "metadata.json").exists(), "destroyed the only copy of a result"
+    assert (d / "output" / "metadata.json").exists(), (
+        "destroyed the only copy of a result"
+    )
 
 
 def test_cold_dispatch_fenced_after_shutdown_begins(tmp_path):
@@ -2632,17 +2951,21 @@ def test_cold_dispatch_fenced_after_shutdown_begins(tmp_path):
         ran.append(argv)
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
-    gate = DynamicConcurrencyGate(4)               # plenty of headroom...
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner
+    )
+    gate = DynamicConcurrencyGate(4)  # plenty of headroom...
     dispatcher._concurrency_gate = gate
     dispatcher._warm_requeue_backoff_s = 0.0
-    dispatcher._shutting_down.set()                # ...but shutdown has begun
+    dispatcher._shutting_down.set()  # ...but shutdown has begun
 
-    assert dispatcher.dispatch_once() is True      # claimed...
-    assert ran == []                               # ...but NOT detonated (fenced)
-    assert gate.in_flight == 0                     # no permit acquired
+    assert dispatcher.dispatch_once() is True  # claimed...
+    assert ran == []  # ...but NOT detonated (fenced)
+    assert gate.in_flight == 0  # no permit acquired
     final = store.get(job.job_id)
-    assert final is not None and final.status == JobStatus.QUEUED   # requeued for restart
+    assert (
+        final is not None and final.status == JobStatus.QUEUED
+    )  # requeued for restart
 
 
 def test_terminal_job_leaves_nothing_on_this_workers_disk(tmp_path):
@@ -2670,7 +2993,9 @@ def test_terminal_job_leaves_nothing_on_this_workers_disk(tmp_path):
         _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner
+    )
     assert dispatcher.dispatch_once() is True
     assert store.get(job.job_id).status == JobStatus.DONE
 
@@ -2705,7 +3030,9 @@ def test_a_peer_reclaimed_job_keeps_its_dir_for_the_new_owner(tmp_path):
         store.update(cur.job_id, claim_id="peer-took-it")
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner
+    )
     dispatcher.dispatch_once()
 
     assert (tmp_path / job.job_id).exists(), (
@@ -2730,7 +3057,9 @@ def test_purge_refuses_a_job_id_that_escapes_the_job_root(tmp_path):
 
     purge_job_dir(job_root, "../outside", logging.getLogger("t"))
 
-    assert (outsider / "keepme").exists(), "purge escaped job_root and deleted an outside tree"
+    assert (outsider / "keepme").exists(), (
+        "purge escaped job_root and deleted an outside tree"
+    )
     assert outsider.exists()
 
 
@@ -2820,7 +3149,7 @@ def test_a_store_failure_during_purge_does_not_escape_or_delete(tmp_path):
             raise RuntimeError("job store unavailable")
 
     dispatcher._job_store = _BrokenStore()
-    dispatcher._purge_job_dir_if_owned(job)      # must not raise
+    dispatcher._purge_job_dir_if_owned(job)  # must not raise
 
     assert (tmp_path / job.job_id).exists(), (
         "ownership was unprovable, so the tree must be left for its real owner, not deleted"
@@ -2846,10 +3175,14 @@ def test_a_live_orphaned_container_keeps_its_bind_mounted_tree(tmp_path):
 
     def fake_runner(argv, **kw):
         if "kill" in argv:
-            return subprocess.CompletedProcess(argv, 1, "", "kill failed")   # NOT confirmed gone
+            return subprocess.CompletedProcess(
+                argv, 1, "", "kill failed"
+            )  # NOT confirmed gone
         raise subprocess.TimeoutExpired(argv, 1)
 
-    dispatcher = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    dispatcher = _make_dispatcher(
+        store, job_root=tmp_path, subprocess_runner=fake_runner
+    )
     dispatcher.dispatch_once()
 
     assert (tmp_path / job.job_id).exists(), (
@@ -2866,7 +3199,7 @@ def test_put_output_is_a_real_durability_barrier(tmp_path):
 
     store = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
     with pytest.raises(FileNotFoundError):
-        store.put_output("jid", tmp_path / "jobs" / "jid" / "output")   # never created
+        store.put_output("jid", tmp_path / "jobs" / "jid" / "output")  # never created
 
 
 def test_scratch_reclaim_bounds_the_dirs_the_purge_deliberately_skips(tmp_path):
@@ -2892,12 +3225,22 @@ def test_scratch_reclaim_bounds_the_dirs_the_purge_deliberately_skips(tmp_path):
     fresh = tmp_path / "22222222-2222-4222-8222-222222222222"
     (fresh / "output").mkdir(parents=True)
 
-    blobs_before = sorted((tmp_path.parent / "blobs").rglob("*")) if (tmp_path.parent / "blobs").exists() else []
+    blobs_before = (
+        sorted((tmp_path.parent / "blobs").rglob("*"))
+        if (tmp_path.parent / "blobs").exists()
+        else []
+    )
     assert dispatcher._reap_stale_scratch() == 1
     assert not stale.exists(), "the aged tree was not reclaimed"
     assert fresh.exists(), "a live/recent tree must never be reclaimed on age"
-    blobs_after = sorted((tmp_path.parent / "blobs").rglob("*")) if (tmp_path.parent / "blobs").exists() else []
-    assert blobs_before == blobs_after, "scratch reclaim must never touch the blob store"
+    blobs_after = (
+        sorted((tmp_path.parent / "blobs").rglob("*"))
+        if (tmp_path.parent / "blobs").exists()
+        else []
+    )
+    assert blobs_before == blobs_after, (
+        "scratch reclaim must never touch the blob store"
+    )
 
 
 def test_scratch_reclaim_is_off_when_disabled(tmp_path):
@@ -2943,7 +3286,7 @@ def test_purge_survives_a_path_that_cannot_be_canonicalised(tmp_path):
     loop.symlink_to(job_root / "loopy2")
     (job_root / "loopy2").symlink_to(loop)
 
-    purge_job_dir(job_root, "loopy", logging.getLogger("t"))   # must not raise
+    purge_job_dir(job_root, "loopy", logging.getLogger("t"))  # must not raise
 
 
 def test_scratch_reclaim_spares_a_live_job_writing_into_output(tmp_path):
@@ -2960,13 +3303,15 @@ def test_scratch_reclaim_spares_a_live_job_writing_into_output(tmp_path):
     d = tmp_path / job.job_id
     (d / "output").mkdir(parents=True)
     old = time.time() - 99_999
-    os.utime(d, (old, old))                       # parent looks ancient...
+    os.utime(d, (old, old))  # parent looks ancient...
     (d / "output" / "artifact.bin").write_bytes(b"live worker writing right now")
 
     dispatcher = _make_dispatcher(store, job_root=tmp_path)
     dispatcher._scratch_max_age_s = 60.0
     assert dispatcher._reap_stale_scratch() == 0
-    assert d.exists(), "deleted a live job's tree because only the parent mtime was checked"
+    assert d.exists(), (
+        "deleted a live job's tree because only the parent mtime was checked"
+    )
 
 
 def test_scratch_reclaim_spares_a_running_job_even_if_the_whole_tree_is_old(tmp_path):
@@ -3019,7 +3364,7 @@ def test_scratch_reclaim_spares_a_fresh_tree_the_store_does_not_know_yet(tmp_pat
     d = tmp_path / "55555555-5555-4555-8555-555555555555"
     (d / "input").mkdir(parents=True)
     old = time.time() - 99_999
-    os.utime(d, (old, old))                       # parent ancient, content brand new
+    os.utime(d, (old, old))  # parent ancient, content brand new
     (d / "input" / "sample.doc").write_bytes(b"just spooled by ingress")
 
     assert dispatcher._reap_stale_scratch() == 0
@@ -3048,7 +3393,7 @@ def test_scratch_reclaim_leaves_the_tree_when_the_store_cannot_be_read(tmp_path)
 
 
 def test_scratch_reclaim_never_touches_a_colocated_blob_store(tmp_path):
-    """"The store has never heard of it" is NOT evidence of an orphan (#85 review).
+    """ "The store has never heard of it" is NOT evidence of an orphan (#85 review).
 
     job_root can legitimately contain a co-located blob store — BLASTBOX_BLOB_LOCAL_ROOT under
     job_root is a documented multi-node layout — plus lost+found when it is its own filesystem.
@@ -3066,11 +3411,19 @@ def test_scratch_reclaim_never_touches_a_colocated_blob_store(tmp_path):
     (blobs / "metadata.json").write_text("{}")
     lostfound = tmp_path / "lost+found"
     lostfound.mkdir()
-    for p in (blobs / "metadata.json", blobs, blobs.parent, tmp_path / "blobs", lostfound):
+    for p in (
+        blobs / "metadata.json",
+        blobs,
+        blobs.parent,
+        tmp_path / "blobs",
+        lostfound,
+    ):
         os.utime(p, (old, old))
 
     assert dispatcher._reap_stale_scratch() == 0
-    assert (blobs / "metadata.json").exists(), "the reclaim destroyed the durable blob store"
+    assert (blobs / "metadata.json").exists(), (
+        "the reclaim destroyed the durable blob store"
+    )
     assert lostfound.exists()
 
 
@@ -3103,11 +3456,15 @@ def test_scratch_reclaim_refuses_a_symlink_even_with_a_perfect_job_id_name(tmp_p
     os.utime(link, (old, old), follow_symlinks=False)
 
     assert dispatcher._reap_stale_scratch() == 0
-    assert (victim / "metadata.json").exists(), "the reclaim followed a symlink out of its lane"
+    assert (victim / "metadata.json").exists(), (
+        "the reclaim followed a symlink out of its lane"
+    )
     assert link.is_symlink()
 
 
-def test_a_forged_future_mtime_cannot_grant_permanent_immortality(tmp_path, monkeypatch):
+def test_a_forged_future_mtime_cannot_grant_permanent_immortality(
+    tmp_path, monkeypatch
+):
     """The guarantee is about PERMANENCE, not about one tick.
 
     A sample owns output/ (a 0o777 bind mount) and utime() is unprivileged, so it can stamp mtime
@@ -3134,14 +3491,18 @@ def test_a_forged_future_mtime_cannot_grant_permanent_immortality(tmp_path, monk
     old = time.time() - 99_999
     os.utime(d, (old, old))
     os.utime(d / "output", (old, old))
-    os.utime(pad, (2**31, 2**31))              # the sample stamps the far future
+    os.utime(pad, (2**31, 2**31))  # the sample stamps the far future
 
-    assert dispatcher._reap_stale_scratch() == 0, "a just-touched tree is genuinely live"
+    assert dispatcher._reap_stale_scratch() == 0, (
+        "a just-touched tree is genuinely live"
+    )
 
     # ...and the worker is now dead, so nothing touches it again. Time moves on.
     real = time.time
     monkeypatch.setattr(retention_mod.time, "time", lambda: real() + 3600)
-    assert dispatcher._reap_stale_scratch() == 1, "one forged stamp bought permanent immortality"
+    assert dispatcher._reap_stale_scratch() == 1, (
+        "one forged stamp bought permanent immortality"
+    )
     assert not d.exists()
 
 
@@ -3162,7 +3523,7 @@ def test_scratch_reclaim_cannot_be_evaded_by_a_worker_planting_a_symlink(tmp_pat
     dispatcher._scratch_max_age_s = 60.0
 
     busy = tmp_path.parent / "busy-host-path"
-    busy.mkdir(exist_ok=True)                      # mtime = now, refreshed on a real host
+    busy.mkdir(exist_ok=True)  # mtime = now, refreshed on a real host
 
     d = tmp_path / "99999999-9999-4999-8999-999999999999"
     (d / "output").mkdir(parents=True)
@@ -3173,7 +3534,9 @@ def test_scratch_reclaim_cannot_be_evaded_by_a_worker_planting_a_symlink(tmp_pat
     for pth in (d / "input.bin", d / "output" / "notes", d / "output", d):
         os.utime(pth, (old, old), follow_symlinks=False)
 
-    assert dispatcher._reap_stale_scratch() == 1, "a planted symlink made the tree immortal"
+    assert dispatcher._reap_stale_scratch() == 1, (
+        "a planted symlink made the tree immortal"
+    )
     assert not d.exists()
 
 
@@ -3202,10 +3565,14 @@ def test_scratch_reclaim_leaves_a_tree_whose_container_is_still_retained(tmp_pat
     dispatcher._retained_cold_orphans[f"blastbox-worker-{jid[:12]}"] = (jid, "claim-1")
 
     assert dispatcher._reap_stale_scratch() == 0
-    assert d.exists(), "deleted a tree under a container this process still believes is alive"
+    assert d.exists(), (
+        "deleted a tree under a container this process still believes is alive"
+    )
 
 
-def test_scratch_reclaim_never_deletes_a_sealed_result_that_has_no_durable_copy(tmp_path):
+def test_scratch_reclaim_never_deletes_a_sealed_result_that_has_no_durable_copy(
+    tmp_path,
+):
     """The sweep rests on "the blob store has the durable copy, so the local tree loses nothing" —
     and there are two states where that is false, each with its own HOST-only evidence.
 
@@ -3257,11 +3624,17 @@ def test_scratch_reclaim_never_deletes_a_sealed_result_that_has_no_durable_copy(
 
     assert not dispatcher._blobs.has_output(legacy), "precondition: nothing durable"
     assert dispatcher._reap_stale_scratch() == 0
-    assert (dl / "output" / "metadata.json").exists(), "deleted a legacy result's only copy"
-    assert (dp / "output" / "metadata.json").exists(), "deleted a retained result's only copy"
+    assert (dl / "output" / "metadata.json").exists(), (
+        "deleted a legacy result's only copy"
+    )
+    assert (dp / "output" / "metadata.json").exists(), (
+        "deleted a retained result's only copy"
+    )
 
 
-def test_scratch_reclaim_still_takes_a_crash_orphaned_tree_the_host_never_vouched_for(tmp_path):
+def test_scratch_reclaim_still_takes_a_crash_orphaned_tree_the_host_never_vouched_for(
+    tmp_path,
+):
     """The counterpart, and the reason the gate cannot key on output/metadata.json.
 
     The WORKER writes that file itself. A cold job whose dispatcher was SIGKILLed before it could
@@ -3281,7 +3654,7 @@ def test_scratch_reclaim_still_takes_a_crash_orphaned_tree_the_host_never_vouche
     (d / "input.bin").write_bytes(b"MALWARE-BYTES-MUST-NOT-PERSIST")
     job = Job.new(engine="redtusk", filename="a.doc")
     job.job_id = jid
-    job.status = JobStatus.FAILED                      # orphan-recovered
+    job.status = JobStatus.FAILED  # orphan-recovered
     job.error = "orphaned"
     store.create(job)
 
@@ -3289,7 +3662,9 @@ def test_scratch_reclaim_still_takes_a_crash_orphaned_tree_the_host_never_vouche
     for pth in (d / "output" / "metadata.json", d / "input.bin", d / "output", d):
         os.utime(pth, (old, old))
 
-    assert dispatcher._reap_stale_scratch() == 1, "a crash-orphaned tree is immortal again"
+    assert dispatcher._reap_stale_scratch() == 1, (
+        "a crash-orphaned tree is immortal again"
+    )
     assert not d.exists()
 
 
@@ -3305,7 +3680,7 @@ def test_scratch_reclaim_takes_a_sealed_result_once_it_is_durably_stored(tmp_pat
     d = tmp_path / jid
     (d / "output").mkdir(parents=True)
     (d / "output" / "metadata.json").write_text('{"sealed": true}')
-    dispatcher._blobs.put_output(jid, d / "output")                    # the durable copy lands
+    dispatcher._blobs.put_output(jid, d / "output")  # the durable copy lands
     assert dispatcher._blobs.has_output(jid)
 
     old = time.time() - 99_999
@@ -3326,13 +3701,15 @@ def test_scratch_reclaim_still_takes_a_crash_stranded_tree_with_no_result(tmp_pa
 
     jid = "33333333-3333-4333-8333-333333333333"
     d = tmp_path / jid
-    (d / "output").mkdir(parents=True)                                  # started, never sealed
+    (d / "output").mkdir(parents=True)  # started, never sealed
     (d / "input.bin").write_bytes(b"MALWARE-BYTES-MUST-NOT-PERSIST")
     old = time.time() - 99_999
     for pth in (d / "input.bin", d / "output", d):
         os.utime(pth, (old, old))
 
-    assert dispatcher._reap_stale_scratch() == 1, "a crash-stranded tree is unbounded again"
+    assert dispatcher._reap_stale_scratch() == 1, (
+        "a crash-stranded tree is unbounded again"
+    )
     assert not d.exists()
 
 
@@ -3349,9 +3726,10 @@ def test_scratch_reclaim_reports_only_what_it_actually_removed(tmp_path):
     os.utime(d, (time.time() - 99_999,) * 2)
 
     import blastbox.host.jobs.retention as mod
+
     real = mod.purge_job_dir
     try:
-        mod.purge_job_dir = lambda root, jid, log: False      # simulate a refusal/failure
+        mod.purge_job_dir = lambda root, jid, log: False  # simulate a refusal/failure
         assert dispatcher._reap_stale_scratch() == 0, "counted a dir it did not remove"
     finally:
         mod.purge_job_dir = real
@@ -3375,8 +3753,12 @@ def test_scratch_reclaim_spares_a_uuid_named_blob_root(tmp_path, monkeypatch):
     dispatcher = _make_dispatcher(store, job_root=tmp_path)
     dispatcher._scratch_max_age_s = 60.0
     old = time.time() - 99_999
-    for p in (blob_root / "results" / "some-job" / "metadata.json",
-              blob_root / "results" / "some-job", blob_root / "results", blob_root):
+    for p in (
+        blob_root / "results" / "some-job" / "metadata.json",
+        blob_root / "results" / "some-job",
+        blob_root / "results",
+        blob_root,
+    ):
         os.utime(p, (old, old))
 
     assert dispatcher._reap_stale_scratch() == 0
@@ -3406,13 +3788,20 @@ def test_scratch_reclaim_is_bounded_per_sweep_and_says_so(tmp_path):
         os.utime(d, (old, old))
 
     from blastbox.host.jobs.retention import reap_stale_scratch
-    removed = reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"), max_per_sweep=3)
+
+    removed = reap_stale_scratch(
+        tmp_path, 60.0, store, _logging.getLogger("t"), max_per_sweep=3
+    )
     assert removed == 3, "the cap did not bound the sweep"
     assert len(list(tmp_path.iterdir())) == 4, "removed more than the cap allowed"
 
     # ...and the next tick continues where it left off.
-    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
-                              max_per_sweep=3) == 3
+    assert (
+        reap_stale_scratch(
+            tmp_path, 60.0, store, _logging.getLogger("t"), max_per_sweep=3
+        )
+        == 3
+    )
     assert len(list(tmp_path.iterdir())) == 1
 
 
@@ -3435,18 +3824,25 @@ def test_scratch_reclaim_holds_a_pending_tree_until_its_repair_actually_lands(tm
     (d / "output").mkdir(parents=True)
     (d / "output" / "metadata.json").write_text('{"sealed": true}')
     (d / PENDING_UPLOAD_SENTINEL).write_text("")
-    dispatcher._blobs.put_output(jid, d / "output")          # bytes ARE durable
+    dispatcher._blobs.put_output(jid, d / "output")  # bytes ARE durable
     job = Job.new(engine="redtusk", filename="a.doc")
     job.job_id = jid
-    job.status = JobStatus.FAILED                            # ...but the repair never landed
+    job.status = JobStatus.FAILED  # ...but the repair never landed
     store.create(job)
 
     old = time.time() - 99_999
-    for pth in (d / "output" / "metadata.json", d / PENDING_UPLOAD_SENTINEL, d / "output", d):
+    for pth in (
+        d / "output" / "metadata.json",
+        d / PENDING_UPLOAD_SENTINEL,
+        d / "output",
+        d,
+    ):
         os.utime(pth, (old, old))
 
     assert dispatcher._reap_stale_scratch() == 0
-    assert d.exists(), "deleted the tree the repair needs, stranding the job FAILED forever"
+    assert d.exists(), (
+        "deleted the tree the repair needs, stranding the job FAILED forever"
+    )
 
 
 def test_scratch_reclaim_asks_docker_not_just_its_own_memory(tmp_path):
@@ -3466,13 +3862,21 @@ def test_scratch_reclaim_asks_docker_not_just_its_own_memory(tmp_path):
         os.utime(pth, (old, old))
 
     # No process-local knowledge at all — a fresh dispatcher after a restart.
-    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
-                              live_job_ids=lambda: {jid}) == 0
+    assert (
+        reap_stale_scratch(
+            tmp_path, 60.0, store, _logging.getLogger("t"), live_job_ids=lambda: {jid}
+        )
+        == 0
+    )
     assert d.exists(), "deleted a tree whose container docker still reports as running"
 
     # ...and an unreadable probe must not become a deletion either way round.
-    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
-                              live_job_ids=lambda: None) == 1
+    assert (
+        reap_stale_scratch(
+            tmp_path, 60.0, store, _logging.getLogger("t"), live_job_ids=lambda: None
+        )
+        == 1
+    )
 
 
 def test_scratch_reclaim_protects_a_blob_root_nested_under_a_candidate(tmp_path):
@@ -3488,14 +3892,23 @@ def test_scratch_reclaim_protects_a_blob_root_nested_under_a_candidate(tmp_path)
     (blob_root / "results" / "j").mkdir(parents=True)
     (blob_root / "results" / "j" / "metadata.json").write_text("{}")
     old = time.time() - 99_999
-    for pth in (blob_root / "results" / "j" / "metadata.json", blob_root / "results" / "j",
-                blob_root / "results", blob_root, candidate):
+    for pth in (
+        blob_root / "results" / "j" / "metadata.json",
+        blob_root / "results" / "j",
+        blob_root / "results",
+        blob_root,
+        candidate,
+    ):
         os.utime(pth, (old, old))
 
     store = InMemoryJobStore()
-    blobs = LocalBlobStore(tmp_path, blob_root=blob_root)     # no env var anywhere
-    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
-                              blob_store=blobs) == 0
+    blobs = LocalBlobStore(tmp_path, blob_root=blob_root)  # no env var anywhere
+    assert (
+        reap_stale_scratch(
+            tmp_path, 60.0, store, _logging.getLogger("t"), blob_store=blobs
+        )
+        == 0
+    )
     assert (blob_root / "results" / "j" / "metadata.json").exists(), (
         "deleted the durable blob store because it was nested inside the candidate"
     )
@@ -3504,6 +3917,7 @@ def test_scratch_reclaim_protects_a_blob_root_nested_under_a_candidate(tmp_path)
 def _blob_store_for(job_root):
     """A LocalBlobStore rooted OUTSIDE job_root, matching the production default."""
     from blastbox.host.blobs.local import LocalBlobStore
+
     return LocalBlobStore(job_root, blob_root=job_root.parent / "blobs-for-test")
 
 
@@ -3534,14 +3948,20 @@ def test_scratch_reclaim_cap_counts_work_not_just_deletions(tmp_path):
         (d / "output" / "metadata.json").write_text("{}")
         job = Job.new(engine="redtusk", filename="a.doc")
         job.job_id = jid
-        job.status = JobStatus.DONE                    # legacy: retained, never removed
+        job.status = JobStatus.DONE  # legacy: retained, never removed
         store.create(job)
         for pth in (d / "output" / "metadata.json", d / "output", d):
             os.utime(pth, (old, old))
 
     blobs = _blob_store_for(tmp_path)
-    removed = reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
-                                 blob_store=blobs, max_per_sweep=3)
+    removed = reap_stale_scratch(
+        tmp_path,
+        60.0,
+        store,
+        _logging.getLogger("t"),
+        blob_store=blobs,
+        max_per_sweep=3,
+    )
     assert removed == 0, "these are all retained"
     assert CountingStore.gets <= 4, (
         f"examined {CountingStore.gets} candidates with a cap of 3 — the cap never bounds a "
@@ -3558,7 +3978,10 @@ def test_a_retained_orphan_is_marked_on_disk_for_every_sweeper(tmp_path):
     empties the set — so the OTHER sweeper deletes exactly the trees the hold exists to protect,
     under a live 0o777 bind mount. A file in the host-only job dir is seen by every sweeper.
     """
-    from blastbox.host.jobs.retention import RETAINED_ORPHAN_SENTINEL, reap_stale_scratch
+    from blastbox.host.jobs.retention import (
+        RETAINED_ORPHAN_SENTINEL,
+        reap_stale_scratch,
+    )
     import logging as _logging
 
     store = InMemoryJobStore()
@@ -3571,10 +3994,14 @@ def test_a_retained_orphan_is_marked_on_disk_for_every_sweeper(tmp_path):
     d = tmp_path / job.job_id
     (d / "output").mkdir(parents=True)
     name = f"blastbox-worker-{job.job_id[:12]}"
-    dispatcher._dispatch_inner = lambda j, i, o, *, orphan_out=None: orphan_out.append(name)
+    dispatcher._dispatch_inner = lambda j, i, o, *, orphan_out=None: orphan_out.append(
+        name
+    )
     dispatcher._dispatch_claimed_job(job)
 
-    assert (d / RETAINED_ORPHAN_SENTINEL).is_file(), "no cross-process record of the hold"
+    assert (d / RETAINED_ORPHAN_SENTINEL).is_file(), (
+        "no cross-process record of the hold"
+    )
 
     # A COMPLETELY SEPARATE sweeper — no shared memory, no docker probe — must honour it.
     # The job is made TERMINAL first, so the status check cannot be what saves the tree: the
@@ -3596,7 +4023,10 @@ def test_a_retained_orphan_is_marked_on_disk_for_every_sweeper(tmp_path):
 def test_the_retained_orphan_hold_expires_so_the_disk_bound_still_wins(tmp_path):
     """...but not forever. A container that still has not died at twice the reclaim age is an
     operator problem, and an unbounded hold is just #84 with extra steps."""
-    from blastbox.host.jobs.retention import RETAINED_ORPHAN_SENTINEL, reap_stale_scratch
+    from blastbox.host.jobs.retention import (
+        RETAINED_ORPHAN_SENTINEL,
+        reap_stale_scratch,
+    )
     import logging as _logging
 
     store = InMemoryJobStore()
@@ -3612,7 +4042,9 @@ def test_the_retained_orphan_hold_expires_so_the_disk_bound_still_wins(tmp_path)
     assert not d.exists()
 
 
-def test_a_repaired_job_gets_the_result_summary_its_done_path_would_have_written(tmp_path):
+def test_a_repaired_job_gets_the_result_summary_its_done_path_would_have_written(
+    tmp_path,
+):
     """A recovered job was DONE with result_summary=None forever: /v1/jobs and the status route
     report null artifact/warning counts, anything tallying off them under-reports every recovered
     job, and nothing re-walks DONE jobs to fix it."""
@@ -3625,16 +4057,32 @@ def test_a_repaired_job_gets_the_result_summary_its_done_path_would_have_written
     out = tmp_path / job.job_id / "output"
     out.mkdir(parents=True)
     # A minimal sealed envelope: the summary is built from it, so it must parse.
-    (out / "metadata.json").write_text(json.dumps({
-        "engine": "redtusk", "status": "ok", "input_sha256": "a" * 64,
-        "detected": {"label": "docx", "mime": "x", "confidence": 1.0, "source": "magika"},
-        "artifacts": [], "warnings": [],
-        "payload": {"_type": "extracted_text", "text": "x", "char_count": 1},
-    }))
+    (out / "metadata.json").write_text(
+        json.dumps(
+            {
+                "engine": "redtusk",
+                "status": "ok",
+                "input_sha256": "a" * 64,
+                "detected": {
+                    "label": "docx",
+                    "mime": "x",
+                    "confidence": 1.0,
+                    "source": "magika",
+                },
+                "artifacts": [],
+                "warnings": [],
+                "payload": {"_type": "extracted_text", "text": "x", "char_count": 1},
+            }
+        )
+    )
 
-    dispatcher._index_repaired_result(job.job_id, out, (out / "metadata.json").read_text())
+    dispatcher._index_repaired_result(
+        job.job_id, out, (out / "metadata.json").read_text()
+    )
 
-    assert store.get(job.job_id).result_summary is not None, "recovered job left with null counts"
+    assert store.get(job.job_id).result_summary is not None, (
+        "recovered job left with null counts"
+    )
 
 
 def test_the_capped_sweep_rotates_so_held_trees_cannot_starve_the_rest(tmp_path):
@@ -3650,7 +4098,7 @@ def test_the_capped_sweep_rotates_so_held_trees_cannot_starve_the_rest(tmp_path)
     store = InMemoryJobStore()
     old = time.time() - 99_999
     held, reclaimable = [], []
-    for i in range(3):                                  # held: sealed result, nothing durable
+    for i in range(3):  # held: sealed result, nothing durable
         jid = f"0000000{i}-1111-4111-8111-111111111111"
         d = tmp_path / jid
         (d / "output").mkdir(parents=True)
@@ -3661,7 +4109,7 @@ def test_the_capped_sweep_rotates_so_held_trees_cannot_starve_the_rest(tmp_path)
         job.status = JobStatus.FAILED
         store.create(job)
         held.append(d)
-    for i in range(3):                                  # plain scratch, behind them in sort order
+    for i in range(3):  # plain scratch, behind them in sort order
         jid = f"9000000{i}-1111-4111-8111-111111111111"
         d = tmp_path / jid
         d.mkdir()
@@ -3672,9 +4120,15 @@ def test_the_capped_sweep_rotates_so_held_trees_cannot_starve_the_rest(tmp_path)
 
     blobs = _blob_store_for(tmp_path)
     total = 0
-    for _ in range(8):                                  # a few ticks, cap smaller than the holds
-        total += reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
-                                    blob_store=blobs, max_per_sweep=2)
+    for _ in range(8):  # a few ticks, cap smaller than the holds
+        total += reap_stale_scratch(
+            tmp_path,
+            60.0,
+            store,
+            _logging.getLogger("t"),
+            blob_store=blobs,
+            max_per_sweep=2,
+        )
     # Without rotation this is 0 forever: the three held trees fill the cap on every tick.
     assert total == 3, f"held trees starved the reclaimable ones (removed {total}/3)"
     assert all(d.exists() for d in held), "a held tree was deleted"
@@ -3700,13 +4154,15 @@ def test_a_lost_claim_during_the_upload_retry_leaves_no_sentinel(tmp_path):
     # back the same object, so mutating the stored row would otherwise rewrite our own claim_id
     # and the CAS would trivially "win" — the test would pass while testing nothing.
     ours = copy.deepcopy(job)
-    store.update(job.job_id, claim_id="the-peer")      # reclaimed mid-retry
+    store.update(job.job_id, claim_id="the-peer")  # reclaimed mid-retry
     d = tmp_path / job.job_id
     (d / "output").mkdir(parents=True)
 
     # Through the real seam, so the marker is written first and then withdrawn — not merely
     # never written. That is the sequence a crash can interrupt, so it is the one to test.
-    dispatcher._retain_for_upload_retry(ours, "result upload failed after 3 attempts; retained")
+    dispatcher._retain_for_upload_retry(
+        ours, "result upload failed after 3 attempts; retained"
+    )
 
     assert store.get(job.job_id).claim_id == "the-peer", "the peer still owns the row"
     assert not (d / PENDING_UPLOAD_SENTINEL).exists(), (
@@ -3732,13 +4188,21 @@ def test_a_blob_root_ABOVE_job_root_does_not_disable_the_whole_reclaim(tmp_path)
     os.utime(d, (time.time() - 99_999,) * 2)
 
     class RootedAbove:
-        local_root = tmp_path                          # an ANCESTOR of job_root
+        local_root = tmp_path  # an ANCESTOR of job_root
 
         def has_output(self, job_id):
             return True
 
-    assert reap_stale_scratch(job_root, 60.0, InMemoryJobStore(), _logging.getLogger("t"),
-                              blob_store=RootedAbove()) == 1, "the reclaim was disabled entirely"
+    assert (
+        reap_stale_scratch(
+            job_root,
+            60.0,
+            InMemoryJobStore(),
+            _logging.getLogger("t"),
+            blob_store=RootedAbove(),
+        )
+        == 1
+    ), "the reclaim was disabled entirely"
     assert not d.exists()
 
 
@@ -3772,11 +4236,20 @@ def test_an_expired_or_deleted_job_does_not_hold_its_tree_forever(tmp_path):
             job.status = status
             store.create(job)
         old = time.time() - 99_999
-        for pth in (d / "output" / "metadata.json", d / PENDING_UPLOAD_SENTINEL, d / "output", d):
+        for pth in (
+            d / "output" / "metadata.json",
+            d / PENDING_UPLOAD_SENTINEL,
+            d / "output",
+            d,
+        ):
             os.utime(pth, (old, old))
 
-        assert reap_stale_scratch(root, 60.0, store, _logging.getLogger("t"),
-                                  blob_store=NothingDurable()) == 1, f"{label} tree held forever"
+        assert (
+            reap_stale_scratch(
+                root, 60.0, store, _logging.getLogger("t"), blob_store=NothingDurable()
+            )
+            == 1
+        ), f"{label} tree held forever"
         assert not d.exists()
 
 
@@ -3798,15 +4271,28 @@ def test_deleting_an_unrecoverable_last_copy_is_reported_as_data_loss(tmp_path, 
     (d / "output" / "metadata.json").write_text("{}")
     (d / PENDING_UPLOAD_SENTINEL).write_text("")
     old = time.time() - 99_999
-    for pth in (d / "output" / "metadata.json", d / PENDING_UPLOAD_SENTINEL, d / "output", d):
+    for pth in (
+        d / "output" / "metadata.json",
+        d / PENDING_UPLOAD_SENTINEL,
+        d / "output",
+        d,
+    ):
         os.utime(pth, (old, old))
 
     with caplog.at_level(_logging.WARNING):
-        assert reap_stale_scratch(tmp_path, 60.0, InMemoryJobStore(), _logging.getLogger("t"),
-                                  blob_store=NothingDurable()) == 1
-    assert any(r.levelno >= _logging.ERROR and "data loss" in r.message for r in caplog.records), (
-        "the only copy of a sealed result was deleted without an ERROR saying so"
-    )
+        assert (
+            reap_stale_scratch(
+                tmp_path,
+                60.0,
+                InMemoryJobStore(),
+                _logging.getLogger("t"),
+                blob_store=NothingDurable(),
+            )
+            == 1
+        )
+    assert any(
+        r.levelno >= _logging.ERROR and "data loss" in r.message for r in caplog.records
+    ), "the only copy of a sealed result was deleted without an ERROR saying so"
 
 
 def test_the_recovery_sweep_has_its_own_off_switch(tmp_path, monkeypatch):
@@ -3831,8 +4317,11 @@ def test_the_recovery_sweep_is_bounded_and_rotates(tmp_path):
     runs inline between dispatch_once() calls — so an uncapped scan stats every entry under
     job_root before a single job can be claimed. On the fleet state this PR targets that is 97,681
     stats per tick. Bounded, and rotating so a capped prefix cannot starve the tail."""
-    from blastbox.host.jobs.retention import (PENDING_UPLOAD_SENTINEL, RESULT_RETAINED_MARKER,
-                                              retry_pending_uploads)
+    from blastbox.host.jobs.retention import (
+        PENDING_UPLOAD_SENTINEL,
+        RESULT_RETAINED_MARKER,
+        retry_pending_uploads,
+    )
     import logging as _logging
 
     class Blobs:
@@ -3859,9 +4348,15 @@ def test_the_recovery_sweep_is_bounded_and_rotates(tmp_path):
         job.error = f"x; {RESULT_RETAINED_MARKER}"
         store.create(job)
 
-    retry_pending_uploads(tmp_path, Blobs(), store, _logging.getLogger("t"), max_per_sweep=2)
-    assert len(Blobs.seen) == 2, f"the cap did not bound the sweep ({len(Blobs.seen)} uploads)"
-    retry_pending_uploads(tmp_path, Blobs(), store, _logging.getLogger("t"), max_per_sweep=2)
+    retry_pending_uploads(
+        tmp_path, Blobs(), store, _logging.getLogger("t"), max_per_sweep=2
+    )
+    assert len(Blobs.seen) == 2, (
+        f"the cap did not bound the sweep ({len(Blobs.seen)} uploads)"
+    )
+    retry_pending_uploads(
+        tmp_path, Blobs(), store, _logging.getLogger("t"), max_per_sweep=2
+    )
     assert len(set(Blobs.seen)) == 4, "the second tick re-scanned the same prefix"
 
 
@@ -3890,7 +4385,9 @@ def test_the_pending_marker_is_on_disk_BEFORE_the_terminal_write(tmp_path, monke
 
     def crashing_fail_job(j, reason):
         # Stand-in for the process dying between the two steps.
-        seen["marker_present_at_terminal_write"] = (d / PENDING_UPLOAD_SENTINEL).is_file()
+        seen["marker_present_at_terminal_write"] = (
+            d / PENDING_UPLOAD_SENTINEL
+        ).is_file()
         raise RuntimeError("process died before the terminal write landed")
 
     monkeypatch.setattr(dispatcher, "_fail_job", crashing_fail_job)
@@ -3901,7 +4398,9 @@ def test_the_pending_marker_is_on_disk_BEFORE_the_terminal_write(tmp_path, monke
     assert seen.get("marker_present_at_terminal_write") is True, (
         "the marker was written AFTER the terminal write — a crash in the gap loses the only copy"
     )
-    assert (d / PENDING_UPLOAD_SENTINEL).read_text() == "ours", "the marker must record the claim"
+    assert (d / PENDING_UPLOAD_SENTINEL).read_text() == "ours", (
+        "the marker must record the claim"
+    )
 
 
 def test_a_backward_clock_step_does_not_wipe_live_trees(tmp_path, monkeypatch):
@@ -3925,9 +4424,13 @@ def test_a_backward_clock_step_does_not_wipe_live_trees(tmp_path, monkeypatch):
     (d / "input.bin").write_bytes(b"A LIVE JOB'S SAMPLE")
 
     real = time.time
-    monkeypatch.setattr(retention_mod.time, "time", lambda: real() - 3600)   # clock steps back
+    monkeypatch.setattr(
+        retention_mod.time, "time", lambda: real() - 3600
+    )  # clock steps back
 
-    assert dispatcher._reap_stale_scratch() == 0, "a clock correction deleted live trees"
+    assert dispatcher._reap_stale_scratch() == 0, (
+        "a clock correction deleted live trees"
+    )
     assert (d / "input.bin").exists()
 
 
@@ -3960,10 +4463,28 @@ def test_disabling_recovery_does_not_turn_the_hold_into_a_leak(tmp_path):
     for pth in sorted(d.rglob("*"), reverse=True) + [d]:
         os.utime(pth, (old, old))
 
-    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
-                              blob_store=NothingDurable(), recovery_enabled=True) == 0
-    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
-                              blob_store=NothingDurable(), recovery_enabled=False) == 1
+    assert (
+        reap_stale_scratch(
+            tmp_path,
+            60.0,
+            store,
+            _logging.getLogger("t"),
+            blob_store=NothingDurable(),
+            recovery_enabled=True,
+        )
+        == 0
+    )
+    assert (
+        reap_stale_scratch(
+            tmp_path,
+            60.0,
+            store,
+            _logging.getLogger("t"),
+            blob_store=NothingDurable(),
+            recovery_enabled=False,
+        )
+        == 1
+    )
     assert not d.exists()
 
 
@@ -3972,7 +4493,10 @@ def test_the_orphan_ceiling_yields_to_a_container_docker_still_sees(tmp_path):
     must not fire while somebody positively SEES it alive — rmtree'ing a live 0o777 bind mount is
     the half-deleted tree, the spurious "PURGE FAILED" and the zero reclaimed blocks that the
     whole deferral exists to avoid."""
-    from blastbox.host.jobs.retention import RETAINED_ORPHAN_SENTINEL, reap_stale_scratch
+    from blastbox.host.jobs.retention import (
+        RETAINED_ORPHAN_SENTINEL,
+        reap_stale_scratch,
+    )
     import logging as _logging
 
     store = InMemoryJobStore()
@@ -3980,17 +4504,25 @@ def test_the_orphan_ceiling_yields_to_a_container_docker_still_sees(tmp_path):
     d = tmp_path / jid
     (d / "output").mkdir(parents=True)
     (d / RETAINED_ORPHAN_SENTINEL).write_text("")
-    old = time.time() - 99_999                      # marker far past the 2x ceiling
+    old = time.time() - 99_999  # marker far past the 2x ceiling
     for pth in sorted(d.rglob("*"), reverse=True) + [d]:
         os.utime(pth, (old, old))
 
     # docker still lists it -> the hold stands despite the ceiling
-    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
-                              live_job_ids=lambda: {jid}) == 0
+    assert (
+        reap_stale_scratch(
+            tmp_path, 60.0, store, _logging.getLogger("t"), live_job_ids=lambda: {jid}
+        )
+        == 0
+    )
     assert d.exists()
     # nobody can see it any more -> the ceiling does its job
-    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
-                              live_job_ids=lambda: set()) == 1
+    assert (
+        reap_stale_scratch(
+            tmp_path, 60.0, store, _logging.getLogger("t"), live_job_ids=lambda: set()
+        )
+        == 1
+    )
 
 
 def test_the_reclaim_yields_while_dispatch_is_saturated(tmp_path):
@@ -4012,12 +4544,20 @@ def test_the_reclaim_yields_while_dispatch_is_saturated(tmp_path):
         d.mkdir()
         os.utime(d, (old, old))
 
-    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
-                              yield_to_work=lambda: True) == 0, "swept while dispatch was busy"
+    assert (
+        reap_stale_scratch(
+            tmp_path, 60.0, store, _logging.getLogger("t"), yield_to_work=lambda: True
+        )
+        == 0
+    ), "swept while dispatch was busy"
     assert len(list(tmp_path.iterdir())) == 3
 
-    assert reap_stale_scratch(tmp_path, 60.0, store, _logging.getLogger("t"),
-                              yield_to_work=lambda: False) == 3
+    assert (
+        reap_stale_scratch(
+            tmp_path, 60.0, store, _logging.getLogger("t"), yield_to_work=lambda: False
+        )
+        == 3
+    )
     assert len(list(tmp_path.iterdir())) == 0
 
 
@@ -4034,5 +4574,13 @@ def test_a_broken_backpressure_probe_does_not_disable_the_reclaim_forever(tmp_pa
     def broken():
         raise RuntimeError("gate unavailable")
 
-    assert reap_stale_scratch(tmp_path, 60.0, InMemoryJobStore(), _logging.getLogger("t"),
-                              yield_to_work=broken) == 1
+    assert (
+        reap_stale_scratch(
+            tmp_path,
+            60.0,
+            InMemoryJobStore(),
+            _logging.getLogger("t"),
+            yield_to_work=broken,
+        )
+        == 1
+    )

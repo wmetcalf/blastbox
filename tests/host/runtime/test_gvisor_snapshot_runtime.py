@@ -55,6 +55,7 @@ def test_spawn_builds_once_then_restores(tmp_path):
 def test_prepare_gates_on_async_build(tmp_path):
     """prepare() kicks the async build (once) and reports readiness — False until is_built(),
     True after — so the pool can spawn off the tick thread without blocking on build()."""
+
     class _AsyncMgr:
         def __init__(self):
             self.started = 0
@@ -114,7 +115,10 @@ def test_config_from_env_sources_worker_rlimits():
     assert cfg2.rlimit_nproc == 8192
     assert cfg2.rlimit_nofile == 131072
     # A garbage value falls back to the default rather than crashing host startup.
-    assert _gvisor_config_from_env({"BLASTBOX_GVISOR_NPROC": "garbage"}).rlimit_nproc == 4096
+    assert (
+        _gvisor_config_from_env({"BLASTBOX_GVISOR_NPROC": "garbage"}).rlimit_nproc
+        == 4096
+    )
 
 
 def test_warm_argv_rejects_non_list_json():
@@ -157,21 +161,30 @@ def test_extra_env_passthrough_into_oci_spec():
 
     # a valid KEY=VALUE array passes through AND reaches the OCI spec env
     cfg = _gvisor_config_from_env(
-        {"BLASTBOX_GVISOR_EXTRA_ENV": '["CLIPPYSHOT_SANDBOX=container", "CLIPPYSHOT_WARN_ON_INSECURE=1"]'}
+        {
+            "BLASTBOX_GVISOR_EXTRA_ENV": '["CLIPPYSHOT_SANDBOX=container", "CLIPPYSHOT_WARN_ON_INSECURE=1"]'
+        }
     )
-    assert cfg.extra_env == ["CLIPPYSHOT_SANDBOX=container", "CLIPPYSHOT_WARN_ON_INSECURE=1"]
+    assert cfg.extra_env == [
+        "CLIPPYSHOT_SANDBOX=container",
+        "CLIPPYSHOT_WARN_ON_INSECURE=1",
+    ]
     spec_env = _oci_config(cfg, Path("/tmp/slot"), in_ro=True)["process"]["env"]
     assert "CLIPPYSHOT_SANDBOX=container" in spec_env
     assert "CLIPPYSHOT_WARN_ON_INSECURE=1" in spec_env
 
     # malformed (bad JSON / non-list / entries missing '=') is ignored, not fatal
     for bad in ("not json", '"KEY=VALUE"', "[1, 2]", '["NO_EQUALS_SIGN"]', "{}"):
-        assert _gvisor_config_from_env({"BLASTBOX_GVISOR_EXTRA_ENV": bad}).extra_env == [], bad
+        assert (
+            _gvisor_config_from_env({"BLASTBOX_GVISOR_EXTRA_ENV": bad}).extra_env == []
+        ), bad
 
 
 def test_settle_gates_readiness(tmp_path):
     clock = {"t": 0.0}
-    rt = GvisorSnapshotSlotRuntime(_FakeMgr(tmp_path), settle_s=1.0, clock=lambda: clock["t"])
+    rt = GvisorSnapshotSlotRuntime(
+        _FakeMgr(tmp_path), settle_s=1.0, clock=lambda: clock["t"]
+    )
     s = rt.spawn()
     assert rt.is_ready(s) is False
     clock["t"] = 2.0
@@ -181,6 +194,7 @@ def test_settle_gates_readiness(tmp_path):
 def test_is_ready_false_when_handle_dead(tmp_path):
     """control_dir exists (created on the host before restore) but the sandbox died
     (alive()=False) → NOT ready, so dead slots aren't promoted to IDLE."""
+
     class _DeadHandle(_FakeHandle):
         def alive(self):
             return False
@@ -224,7 +238,9 @@ def test_materialize_recovers_subdir_tree_from_root_archive(tmp_path):
                 ti = _tf.TarInfo("rmeta/metadata.json")
                 ti.size = len(payload)
                 tf.addfile(ti, io.BytesIO(payload))
-            (self.slot_workdir / "out" / WARM_OUTPUT_ARCHIVE).write_bytes(buf.getvalue())
+            (self.slot_workdir / "out" / WARM_OUTPUT_ARCHIVE).write_bytes(
+                buf.getvalue()
+            )
             return True
 
     class _Mgr(_FakeMgr):
@@ -233,14 +249,18 @@ def test_materialize_recovers_subdir_tree_from_root_archive(tmp_path):
             wd = self.base / "slots" / str(slot_id)
             for s in ("in", "out", "ctrl"):
                 (wd / s).mkdir(parents=True, exist_ok=True)
-            (wd / "out" / "metadata.json").write_text("{}")  # flat root file already propagated
+            (wd / "out" / "metadata.json").write_text(
+                "{}"
+            )  # flat root file already propagated
             return _ArchiveHandle(wd)
 
     rt = GvisorSnapshotSlotRuntime(_Mgr(tmp_path), settle_s=0.0)
     s = rt.spawn()
     rt.materialize_warm_output(s)
     out = Path(s.output_dir)
-    assert (out / "rmeta" / "metadata.json").read_text() == '{"extraction": {}}'  # subdir recovered
+    assert (
+        out / "rmeta" / "metadata.json"
+    ).read_text() == '{"extraction": {}}'  # subdir recovered
     assert not (out / WARM_OUTPUT_ARCHIVE).exists()  # archive stripped after extraction
     assert (out / "metadata.json").exists()  # flat root file untouched
 
@@ -317,7 +337,10 @@ def test_select_with_injected_manager(tmp_path):
 
 def test_select_unavailable_returns_none(monkeypatch):
     import blastbox.host.runtime.gvisor_snapshot as g
-    monkeypatch.setattr(g, "shutil", g.shutil)  # noop; force backend.available() False via a bad binary
+
+    monkeypatch.setattr(
+        g, "shutil", g.shutil
+    )  # noop; force backend.available() False via a bad binary
     monkeypatch.setenv("BLASTBOX_GVISOR_RUNSC", "definitely-not-a-real-binary-xyz")
     assert select_gvisor_snapshot_runtime(require_available=False) is None
 
@@ -362,7 +385,9 @@ def test_secure_snapshot_base_refuses_symlink(tmp_path):
 
     victim = tmp_path / "victim"
     victim.mkdir()
-    victim.chmod(0o755)  # explicit chmod, not mkdir(mode=) — the latter is masked by the umask
+    victim.chmod(
+        0o755
+    )  # explicit chmod, not mkdir(mode=) — the latter is masked by the umask
     link = tmp_path / "gvisor-snapshot"
     link.symlink_to(victim)
     with pytest.raises(PermissionError):
@@ -446,7 +471,7 @@ def test_reap_retains_the_generation_when_the_sandbox_cannot_be_killed(tmp_path)
         output_dir = str(out)
 
     slot = _Slot()
-    rt._handles[slot.slot_id] = _UnkillableHandle()   # type: ignore[index]
+    rt._handles[slot.slot_id] = _UnkillableHandle()  # type: ignore[index]
     # ...and it must PROPAGATE: returning normally told the pool the disposal succeeded, so the
     # slot was removed and replaced while a possibly-live sandbox held its pin outside pool
     # accounting. Raising quarantines the slot instead.

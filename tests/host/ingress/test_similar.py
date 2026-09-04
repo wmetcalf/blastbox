@@ -7,6 +7,7 @@ need a real PG+bktree and are gated on ``BLASTBOX_TEST_PG_DSN`` (CI builds one f
 ``deploy/docker/postgres``).  They skip when the DSN is unset / the extension is
 absent.
 """
+
 from __future__ import annotations
 
 import os
@@ -37,7 +38,9 @@ def _client(store, tmp_path) -> TestClient:
 def pg_store():
     dsn = os.environ.get("BLASTBOX_TEST_PG_DSN")
     if not dsn:
-        pytest.skip("BLASTBOX_TEST_PG_DSN not set (search is Postgres + pg_bktree only)")
+        pytest.skip(
+            "BLASTBOX_TEST_PG_DSN not set (search is Postgres + pg_bktree only)"
+        )
     s = SqlJobStore(dsn)
     if not s.supports_hash_search():
         pytest.skip("pg_bktree extension not available on the test Postgres")
@@ -58,6 +61,7 @@ def _done_job_with_pages(store, *, filename: str, rows: list[dict]) -> Job:
 # Capability gate (no DB needed)
 # ---------------------------------------------------------------------------
 
+
 def test_route_absent_for_memory_store(tmp_path):
     """A store without search support => the route is never mounted => 404."""
     client = _client(InMemoryJobStore(), tmp_path)
@@ -76,6 +80,7 @@ def test_route_absent_for_sqlite_store(tmp_path):
 # PG+bktree: route present + match semantics
 # ---------------------------------------------------------------------------
 
+
 def test_route_present_for_pg_store(pg_store, tmp_path):
     client = _client(pg_store, tmp_path)
     resp = client.get("/v1/similar", params={"sha256": "a" * 64})
@@ -89,9 +94,24 @@ def test_phash_search_within_hamming(pg_store, tmp_path):
         pg_store,
         filename="doc.pdf",
         rows=[
-            {"page_index": 0, "phash": phash_hex_to_int8(base), "colorhash": None, "sha256": "0" * 64},
-            {"page_index": 1, "phash": phash_hex_to_int8(near), "colorhash": None, "sha256": "1" * 64},
-            {"page_index": 2, "phash": phash_hex_to_int8(far), "colorhash": None, "sha256": "2" * 64},
+            {
+                "page_index": 0,
+                "phash": phash_hex_to_int8(base),
+                "colorhash": None,
+                "sha256": "0" * 64,
+            },
+            {
+                "page_index": 1,
+                "phash": phash_hex_to_int8(near),
+                "colorhash": None,
+                "sha256": "1" * 64,
+            },
+            {
+                "page_index": 2,
+                "phash": phash_hex_to_int8(far),
+                "colorhash": None,
+                "sha256": "2" * 64,
+            },
         ],
     )
     client = _client(pg_store, tmp_path)
@@ -108,7 +128,14 @@ def test_colorhash_exact_match(pg_store, tmp_path):
     _done_job_with_pages(
         pg_store,
         filename="a.pdf",
-        rows=[{"page_index": 0, "phash": None, "colorhash": "1234567890abcd", "sha256": "0" * 64}],
+        rows=[
+            {
+                "page_index": 0,
+                "phash": None,
+                "colorhash": "1234567890abcd",
+                "sha256": "0" * 64,
+            }
+        ],
     )
     client = _client(pg_store, tmp_path)
     resp = client.get("/v1/similar", params={"colorhash": "1234567890abcd"})
@@ -121,8 +148,8 @@ def test_colorhash_exact_match(pg_store, tmp_path):
 
 def test_colorhash_fuzzy_total_cap(pg_store, tmp_path):
     target = "0" * 14
-    near = "3" + "0" * 13   # total L1 = 3
-    far = "f" + "0" * 13    # total L1 = 15
+    near = "3" + "0" * 13  # total L1 = 3
+    far = "f" + "0" * 13  # total L1 = 15
     _done_job_with_pages(
         pg_store,
         filename="a.pdf",
@@ -133,7 +160,9 @@ def test_colorhash_fuzzy_total_cap(pg_store, tmp_path):
         ],
     )
     client = _client(pg_store, tmp_path)
-    resp = client.get("/v1/similar", params={"colorhash": target, "colorhash_distance": 5})
+    resp = client.get(
+        "/v1/similar", params={"colorhash": target, "colorhash_distance": 5}
+    )
     assert resp.status_code == 200
     got = {r["page_index"]: r["distance"] for r in resp.json()["results"]}
     assert got == {0: 0, 1: 3}
@@ -158,17 +187,33 @@ def test_only_done_jobs_surface(pg_store, tmp_path):
     _done_job_with_pages(
         pg_store,
         filename="done.pdf",
-        rows=[{"page_index": 0, "phash": None, "colorhash": "aaaaaaaaaaaaaa", "sha256": "1" * 64}],
+        rows=[
+            {
+                "page_index": 0,
+                "phash": None,
+                "colorhash": "aaaaaaaaaaaaaa",
+                "sha256": "1" * 64,
+            }
+        ],
     )
     running = Job.new(engine="e", filename="running.pdf")
     pg_store.create(running)
     pg_store.update(running.job_id, status=JobStatus.RUNNING)
     pg_store.upsert_page_hashes(
         running.job_id,
-        [{"page_index": 0, "phash": None, "colorhash": "aaaaaaaaaaaaaa", "sha256": "2" * 64}],
+        [
+            {
+                "page_index": 0,
+                "phash": None,
+                "colorhash": "aaaaaaaaaaaaaa",
+                "sha256": "2" * 64,
+            }
+        ],
     )
     client = _client(pg_store, tmp_path)
-    results = client.get("/v1/similar", params={"colorhash": "aaaaaaaaaaaaaa"}).json()["results"]
+    results = client.get("/v1/similar", params={"colorhash": "aaaaaaaaaaaaaa"}).json()[
+        "results"
+    ]
     assert len(results) == 1
     assert results[0]["filename"] == "done.pdf"
 
@@ -177,12 +222,16 @@ def test_only_done_jobs_surface(pg_store, tmp_path):
 # Validation (route must be mounted -> needs pg_store)
 # ---------------------------------------------------------------------------
 
+
 def test_exactly_one_hash_required(pg_store, tmp_path):
     client = _client(pg_store, tmp_path)
     assert client.get("/v1/similar").status_code == 400  # zero provided
-    assert client.get(
-        "/v1/similar", params={"phash": "0" * 16, "sha256": "a" * 64}
-    ).status_code == 400  # two provided
+    assert (
+        client.get(
+            "/v1/similar", params={"phash": "0" * 16, "sha256": "a" * 64}
+        ).status_code
+        == 400
+    )  # two provided
 
 
 def test_bad_hash_format_rejected(pg_store, tmp_path):
@@ -194,12 +243,21 @@ def test_bad_hash_format_rejected(pg_store, tmp_path):
 
 def test_out_of_range_params_rejected(pg_store, tmp_path):
     client = _client(pg_store, tmp_path)
-    assert client.get(
-        "/v1/similar", params={"phash": "0" * 16, "max_hamming": 99}
-    ).status_code == 400
-    assert client.get(
-        "/v1/similar", params={"sha256": "a" * 64, "limit": 9999}
-    ).status_code == 400
-    assert client.get(
-        "/v1/similar", params={"colorhash": "0" * 14, "colorhash_frac_max": 999}
-    ).status_code == 400
+    assert (
+        client.get(
+            "/v1/similar", params={"phash": "0" * 16, "max_hamming": 99}
+        ).status_code
+        == 400
+    )
+    assert (
+        client.get(
+            "/v1/similar", params={"sha256": "a" * 64, "limit": 9999}
+        ).status_code
+        == 400
+    )
+    assert (
+        client.get(
+            "/v1/similar", params={"colorhash": "0" * 14, "colorhash_frac_max": 999}
+        ).status_code
+        == 400
+    )

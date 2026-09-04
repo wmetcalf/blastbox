@@ -4,6 +4,7 @@
 their own app, so it needs an import-string factory rather than a prebuilt object.
 ``app_from_env`` reconstructs the app from ``BLASTBOX_*`` env so every forked worker
 is identical to the single-process app."""
+
 import os
 import time
 import pytest
@@ -32,7 +33,12 @@ def test_app_from_env_handles_empty_allowed_engines(monkeypatch):
 def test_serve_parses_workers_flag():
     # the CLI must accept --workers so multi-worker serving is reachable
     from blastbox.host.cli import build_parser  # type: ignore[attr-defined]
-    p = build_parser() if "build_parser" in dir(__import__("blastbox.host.cli", fromlist=["x"])) else None
+
+    p = (
+        build_parser()
+        if "build_parser" in dir(__import__("blastbox.host.cli", fromlist=["x"]))
+        else None
+    )
     if p is None:
         pytest.skip("no exported parser builder; covered indirectly by _serve_cmd")
     ns = p.parse_args(["serve", "--workers", "8"])
@@ -66,7 +72,7 @@ def test_serve_reaps_its_own_job_root(tmp_path, monkeypatch):
 
     from blastbox.host.ingress.app import build_app
 
-    with TestClient(build_app()):                 # lifespan starts the reaper thread
+    with TestClient(build_app()):  # lifespan starts the reaper thread
         for _ in range(40):
             if not stale.exists():
                 break

@@ -6,6 +6,7 @@ be mistaken for the release it was built on. A hardcoded `__version__` reports t
 for that wheel -- which makes the one attribute an operator reaches for to answer "what is
 actually deployed here?" the one attribute that cannot see the difference.
 """
+
 from __future__ import annotations
 
 import importlib
@@ -50,7 +51,7 @@ def test_the_fallback_literal_still_tracks_pyproject():
     """
     root = Path(blastbox.__file__).resolve().parents[2]
     pyproject = root / "pyproject.toml"
-    if not pyproject.exists():          # installed-only environment; nothing to compare against
+    if not pyproject.exists():  # installed-only environment; nothing to compare against
         return
     declared = tomllib.loads(pyproject.read_text())["project"]["version"]
     assert blastbox._FALLBACK_VERSION == declared, (

@@ -4,6 +4,7 @@ The CRaC argv + boot/checkpoint/restore orchestration are tested with INJECTED
 subprocess deps (no real CRaC JVM) — exactly how the FC/gVisor backends are tested.
 Real validation is Phase 4 (redtusk's CRaC JVM + Tika workload).
 """
+
 from __future__ import annotations
 
 import os
@@ -44,9 +45,13 @@ class _FakeProc:
 
 # --- argv -------------------------------------------------------------------
 
+
 def test_boot_argv():
     assert crac_boot_argv("java", "/img", ["-jar", "e.jar"]) == [
-        "java", "-XX:CRaCCheckpointTo=/img", "-jar", "e.jar"
+        "java",
+        "-XX:CRaCCheckpointTo=/img",
+        "-jar",
+        "e.jar",
     ]
 
 
@@ -59,6 +64,7 @@ def test_restore_argv():
 
 
 # --- available() (fail-closed) ---------------------------------------------
+
 
 def test_available_true_when_all_present(tmp_path):
     lr = CracSnapshotLauncher(CracConfig(), tmp_path, which=lambda b: f"/usr/bin/{b}")
@@ -73,6 +79,7 @@ def test_available_false_when_criu_missing(tmp_path):
 
 
 # --- boot -> checkpoint -> artifact ----------------------------------------
+
 
 def test_boot_base_then_checkpoint_produces_artifact(tmp_path):
     spawned: dict = {}
@@ -104,8 +111,11 @@ def test_boot_base_then_checkpoint_produces_artifact(tmp_path):
 
 # --- restore (via the backend) ---------------------------------------------
 
+
 def test_backend_restore_rejects_wrong_artifact_type(tmp_path):
-    backend = CracSnapshotBackend(tmp_path, CracSnapshotLauncher(CracConfig(), tmp_path))
+    backend = CracSnapshotBackend(
+        tmp_path, CracSnapshotLauncher(CracConfig(), tmp_path)
+    )
     with pytest.raises(SnapshotRestoreError):
         backend.restore_in(tmp_path / "slot", object())
 
@@ -128,6 +138,7 @@ def test_backend_restore_spawns_java_restore(tmp_path):
 
 # --- config from env --------------------------------------------------------
 
+
 def test_config_from_env(monkeypatch):
     monkeypatch.setenv("BLASTBOX_CRAC_JAVA_BIN", "/opt/jdk/bin/java")
     monkeypatch.setenv("BLASTBOX_CRAC_ENGINE_ARGV", "-jar redtusk.jar --warm")
@@ -144,6 +155,7 @@ def test_config_from_env_shlex_quoted(monkeypatch):
 
 # --- PR #7 review fixes -----------------------------------------------------
 
+
 def test_boot_base_empty_engine_argv_raises(tmp_path):
     lr = CracSnapshotLauncher(
         CracConfig(engine_argv=()), tmp_path, popen=lambda *a, **k: _FakeProc()
@@ -159,9 +171,13 @@ def test_boot_base_prepends_custom_criu_dir_to_path(tmp_path):
         spawned["env"] = env
         return _FakeProc()
 
-    cfg = CracConfig(engine_argv=("-jar", "e.jar"), criu_bin=str(tmp_path / "crbin" / "criu"))
+    cfg = CracConfig(
+        engine_argv=("-jar", "e.jar"), criu_bin=str(tmp_path / "crbin" / "criu")
+    )
     CracSnapshotLauncher(cfg, tmp_path, popen=fake_popen).boot_base()
-    assert spawned["env"]["PATH"].split(os.pathsep)[0] == str((tmp_path / "crbin").resolve())
+    assert spawned["env"]["PATH"].split(os.pathsep)[0] == str(
+        (tmp_path / "crbin").resolve()
+    )
 
 
 def test_boot_base_cleans_stale_checkpoint_dir(tmp_path):
@@ -169,6 +185,8 @@ def test_boot_base_cleans_stale_checkpoint_dir(tmp_path):
     stale.parent.mkdir(parents=True)
     stale.write_text("old")
     CracSnapshotLauncher(
-        CracConfig(engine_argv=("-jar", "e.jar")), tmp_path, popen=lambda *a, **k: _FakeProc()
+        CracConfig(engine_argv=("-jar", "e.jar")),
+        tmp_path,
+        popen=lambda *a, **k: _FakeProc(),
     ).boot_base()
     assert not stale.exists()  # stale image removed before the new boot

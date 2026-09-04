@@ -2,6 +2,7 @@
 
 11 test cases per the plan at docs/plans/2026-05-31-host-trust.md.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -62,7 +63,11 @@ def _make_output_dir(
 
     # Build the metadata.json — possibly with tampered sha/bytes
     reported_sha = meta_artifact_sha if meta_artifact_sha is not None else real_sha
-    reported_bytes = meta_artifact_bytes if meta_artifact_bytes is not None else len(artifact_content)
+    reported_bytes = (
+        meta_artifact_bytes
+        if meta_artifact_bytes is not None
+        else len(artifact_content)
+    )
 
     artifacts = [
         {
@@ -445,19 +450,26 @@ def test_too_many_artifacts_raises(tmp_path):
         content = f"data{i}".encode()
         fname = f"art{i}.bin"
         (outdir / fname).write_bytes(content)
-        arts.append({
-            "id": f"art{i}",
-            "path": fname,
-            "kind": "data",
-            "sha256": hashlib.sha256(content).hexdigest(),
-            "bytes": len(content),
-        })
+        arts.append(
+            {
+                "id": f"art{i}",
+                "path": fname,
+                "kind": "data",
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "bytes": len(content),
+            }
+        )
 
     envelope = {
         "engine": _ENGINE,
         "status": "ok",
         "input_sha256": _INPUT_SHA,
-        "detected": {"label": "docx", "mime": "text/plain", "confidence": 1.0, "source": "magika"},
+        "detected": {
+            "label": "docx",
+            "mime": "text/plain",
+            "confidence": 1.0,
+            "source": "magika",
+        },
         "artifacts": arts,
         "warnings": [],
         "payload": {"type": "extracted_text", "text": "x", "char_count": 1},
@@ -497,19 +509,26 @@ def test_total_over_max_total_artifact_bytes_raises(tmp_path):
         content = b"x" * 100  # 100 bytes each = 300 total
         fname = f"art{i}.bin"
         (outdir / fname).write_bytes(content)
-        arts.append({
-            "id": f"art{i}",
-            "path": fname,
-            "kind": "data",
-            "sha256": hashlib.sha256(content).hexdigest(),
-            "bytes": len(content),
-        })
+        arts.append(
+            {
+                "id": f"art{i}",
+                "path": fname,
+                "kind": "data",
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "bytes": len(content),
+            }
+        )
 
     envelope = {
         "engine": _ENGINE,
         "status": "ok",
         "input_sha256": _INPUT_SHA,
-        "detected": {"label": "docx", "mime": "text/plain", "confidence": 1.0, "source": "magika"},
+        "detected": {
+            "label": "docx",
+            "mime": "text/plain",
+            "confidence": 1.0,
+            "source": "magika",
+        },
         "artifacts": arts,
         "warnings": [],
         "payload": {"type": "extracted_text", "text": "x", "char_count": 1},
@@ -570,7 +589,12 @@ def test_missing_payload_raises(tmp_path):
         "engine": _ENGINE,
         "status": "ok",
         "input_sha256": _INPUT_SHA,
-        "detected": {"label": "docx", "mime": "text/plain", "confidence": 1.0, "source": "magika"},
+        "detected": {
+            "label": "docx",
+            "mime": "text/plain",
+            "confidence": 1.0,
+            "source": "magika",
+        },
         "artifacts": [],
         "warnings": [],
         # payload intentionally omitted
@@ -586,7 +610,9 @@ def test_missing_payload_raises(tmp_path):
         )
 
 
-def test_a_host_io_failure_reading_metadata_is_not_a_trust_verdict(tmp_path, monkeypatch):
+def test_a_host_io_failure_reading_metadata_is_not_a_trust_verdict(
+    tmp_path, monkeypatch
+):
     """OutputTrustError conflated "the output is bad" with "we could not read it".
 
     An OSError here (EMFILE, EIO, ENOMEM) is this dispatcher's failure, not proof the worker
@@ -605,8 +631,9 @@ def test_a_host_io_failure_reading_metadata_is_not_a_trust_verdict(tmp_path, mon
     monkeypatch.setattr("blastbox.host.trust.read_confined_regular_bytes", _boom)
 
     with pytest.raises(OutputTrustUnknown) as ei:
-        validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
-                               limits=_limits())
+        validate_worker_output(
+            output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE, limits=_limits()
+        )
     assert isinstance(ei.value, OutputTrustError), "must still fail the job closed"
 
 
@@ -623,8 +650,9 @@ def test_a_malformed_metadata_file_is_still_a_trust_verdict(tmp_path, monkeypatc
     monkeypatch.setattr("blastbox.host.trust.read_confined_regular_bytes", _bad)
 
     with pytest.raises(OutputTrustError) as ei:
-        validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
-                               limits=_limits())
+        validate_worker_output(
+            output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE, limits=_limits()
+        )
     assert not isinstance(ei.value, OutputTrustUnknown), (
         "a worker writing a non-regular file is a real verdict"
     )
@@ -647,8 +675,9 @@ def test_host_io_during_reseal_is_also_not_a_verdict(tmp_path, monkeypatch):
     monkeypatch.setattr("blastbox.host.trust.seal_envelope", _boom)
 
     with pytest.raises(OutputTrustUnknown) as ei:
-        validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
-                               limits=_limits())
+        validate_worker_output(
+            output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE, limits=_limits()
+        )
     assert isinstance(ei.value, OutputTrustError), "must still fail the job closed"
 
 
@@ -664,8 +693,9 @@ def test_a_genuine_reseal_violation_is_still_a_verdict(tmp_path, monkeypatch):
     monkeypatch.setattr("blastbox.host.trust.seal_envelope", _bad)
 
     with pytest.raises(OutputTrustError) as ei:
-        validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
-                               limits=_limits())
+        validate_worker_output(
+            output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE, limits=_limits()
+        )
     assert not isinstance(ei.value, OutputTrustUnknown)
 
 
@@ -684,13 +714,18 @@ def test_a_worker_symlink_is_a_verdict_not_an_unknown(tmp_path, monkeypatch):
     out, _ = _make_output_dir(tmp_path, artifact_content=b"payload")
 
     for bad in (_errno.ELOOP, _errno.ENOTDIR):
+
         def _boom(*a, _e=bad, **kw):
             raise OSError(_e, "confinement violation")
 
         monkeypatch.setattr("blastbox.host.trust.read_confined_regular_bytes", _boom)
         with pytest.raises(OutputTrustError) as ei:
-            validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
-                                   limits=_limits())
+            validate_worker_output(
+                output_dir=out,
+                input_sha256=_INPUT_SHA,
+                engine=_ENGINE,
+                limits=_limits(),
+            )
         assert not isinstance(ei.value, OutputTrustUnknown), (
             f"errno {bad} is a worker confinement violation, not a host failure"
         )
@@ -701,11 +736,14 @@ def test_a_worker_symlink_is_a_verdict_not_an_unknown(tmp_path, monkeypatch):
 
     monkeypatch.setattr("blastbox.host.trust.read_confined_regular_bytes", _emfile)
     with pytest.raises(OutputTrustUnknown):
-        validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
-                               limits=_limits())
+        validate_worker_output(
+            output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE, limits=_limits()
+        )
 
 
-def test_a_host_error_wrapped_by_seal_envelope_is_still_not_a_verdict(tmp_path, monkeypatch):
+def test_a_host_error_wrapped_by_seal_envelope_is_still_not_a_verdict(
+    tmp_path, monkeypatch
+):
     """seal_envelope re-raises an OSError from the confinement open as ValueError.
 
     So a host EMFILE/ENOMEM/EIO never reached the OSError handler, and the generic branch
@@ -726,8 +764,9 @@ def test_a_host_error_wrapped_by_seal_envelope_is_still_not_a_verdict(tmp_path, 
 
     monkeypatch.setattr("blastbox.host.trust.seal_envelope", _wrapped_host_error)
     with pytest.raises(OutputTrustUnknown):
-        validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
-                               limits=_limits())
+        validate_worker_output(
+            output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE, limits=_limits()
+        )
 
 
 def test_a_genuine_reseal_value_error_is_still_a_verdict(tmp_path, monkeypatch):
@@ -741,8 +780,9 @@ def test_a_genuine_reseal_value_error_is_still_a_verdict(tmp_path, monkeypatch):
 
     monkeypatch.setattr("blastbox.host.trust.seal_envelope", _bad)
     with pytest.raises(OutputTrustError) as ei:
-        validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
-                               limits=_limits())
+        validate_worker_output(
+            output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE, limits=_limits()
+        )
     assert not isinstance(ei.value, OutputTrustUnknown)
 
 
@@ -764,8 +804,9 @@ def test_a_host_error_in_the_final_caps_check_is_not_a_verdict(tmp_path, monkeyp
 
     monkeypatch.setattr("blastbox.host.trust.validate_envelope", _boom)
     with pytest.raises(OutputTrustUnknown):
-        validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
-                               limits=_limits())
+        validate_worker_output(
+            output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE, limits=_limits()
+        )
 
 
 def test_a_real_caps_violation_is_still_a_verdict(tmp_path, monkeypatch):
@@ -779,8 +820,9 @@ def test_a_real_caps_violation_is_still_a_verdict(tmp_path, monkeypatch):
 
     monkeypatch.setattr("blastbox.host.trust.validate_envelope", _bad)
     with pytest.raises(OutputTrustError) as ei:
-        validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
-                               limits=_limits())
+        validate_worker_output(
+            output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE, limits=_limits()
+        )
     assert not isinstance(ei.value, OutputTrustUnknown)
 
 
@@ -800,5 +842,6 @@ def test_a_host_error_wrapped_by_the_caps_check_is_seen_through(tmp_path, monkey
 
     monkeypatch.setattr("blastbox.host.trust.validate_envelope", _wrapped)
     with pytest.raises(OutputTrustUnknown):
-        validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
-                               limits=_limits())
+        validate_worker_output(
+            output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE, limits=_limits()
+        )

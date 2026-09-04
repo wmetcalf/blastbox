@@ -24,6 +24,7 @@ Example invocation on toolz2:
     BLASTBOX_GVISOR_RUNSC=/usr/local/bin/runsc \\
     pytest tests/integration/test_gvisor_snapshot_roundtrip.py -v
 """
+
 from __future__ import annotations
 
 import json
@@ -78,11 +79,17 @@ def _warm_rootfs() -> str | None:
 def _fixture_doc() -> Path | None:
     """Return a path to any small fixture file under tests/fixtures, or None."""
     here = Path(__file__).parent.parent  # tests/
-    candidates = list(here.glob("fixtures/**/*.docx")) + list(here.glob("fixtures/**/*.txt"))
+    candidates = list(here.glob("fixtures/**/*.docx")) + list(
+        here.glob("fixtures/**/*.txt")
+    )
     if candidates:
         return candidates[0]
     # fallback: any non-Python file in the fixtures tree
-    all_files = [p for p in here.glob("fixtures/**/*") if p.is_file() and p.suffix not in (".py", ".pyc")]
+    all_files = [
+        p
+        for p in here.glob("fixtures/**/*")
+        if p.is_file() and p.suffix not in (".py", ".pyc")
+    ]
     return all_files[0] if all_files else None
 
 
@@ -170,7 +177,9 @@ def test_gvisor_snapshot_roundtrip(tmp_path: Path) -> None:
         ctrl.signal_go(WarmJobSpec(input_path=staged, output_dir=slot.output_dir))
         status = ctrl.wait_for_done(timeout_s=60.0)
 
-        assert status == "ok", f"warm worker exited with status={status!r} (expected 'ok')"
+        assert status == "ok", (
+            f"warm worker exited with status={status!r} (expected 'ok')"
+        )
 
         # At least one output file must be present.
         output_files = list(slot.output_dir.iterdir())

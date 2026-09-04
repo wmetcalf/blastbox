@@ -1,4 +1,5 @@
 """Tests for SqlJobStore (SQLite path; Postgres gated by DSN env var)."""
+
 from __future__ import annotations
 
 import os
@@ -18,6 +19,7 @@ POSTGRES_DSN = os.environ.get("BLASTBOX_TEST_PG_DSN")
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def sqlite_store(tmp_path):
     db = tmp_path / "test.db"
@@ -31,6 +33,7 @@ def _make_job(engine: str = "test", filename: str = "file.docx") -> Job:
 # ---------------------------------------------------------------------------
 # SQLite — CRUD
 # ---------------------------------------------------------------------------
+
 
 def test_create_and_get(sqlite_store):
     job = _make_job()
@@ -104,6 +107,7 @@ def test_security_warnings_roundtrip(sqlite_store):
 # SQLite — parameterization / SQL-injection safety
 # ---------------------------------------------------------------------------
 
+
 def test_sql_injection_filename_roundtrips_intact(sqlite_store):
     """A filename containing SQL metacharacters must survive a full roundtrip."""
     evil = "'); DROP TABLE jobs; --"
@@ -128,6 +132,7 @@ def test_sql_injection_in_update_value(sqlite_store):
 # SQLite — update() column allowlist
 # ---------------------------------------------------------------------------
 
+
 def test_update_rejects_non_allowlisted_field(sqlite_store):
     job = _make_job()
     sqlite_store.create(job)
@@ -145,6 +150,7 @@ def test_update_rejects_semicolon_injection(sqlite_store):
 # ---------------------------------------------------------------------------
 # SQLite — claim_next (status-guarded CAS)
 # ---------------------------------------------------------------------------
+
 
 def test_claim_next_returns_oldest_queued(sqlite_store):
     j1 = Job.new(engine="e", filename="first.docx")
@@ -198,7 +204,9 @@ def test_claim_next_cas_guards_concurrent_status_change(sqlite_store):
 
         return original_method(claimant_tier, engine)
 
-    with unittest.mock.patch.object(sqlite_store, "_claim_next_sqlite", claim_with_interleave):
+    with unittest.mock.patch.object(
+        sqlite_store, "_claim_next_sqlite", claim_with_interleave
+    ):
         result = sqlite_store.claim_next()
 
     # The CAS should have seen rowcount==0 and returned None
@@ -241,6 +249,7 @@ def test_claim_next_cas_rowcount_guard_direct(sqlite_store):
 # ---------------------------------------------------------------------------
 # Postgres — gated (skip if DSN absent)
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.skipif(not POSTGRES_DSN, reason="BLASTBOX_TEST_PG_DSN not set")
 def test_postgres_crud():
@@ -285,9 +294,11 @@ def test_postgres_claim_next_respects_target_tier():
     job.target_tier = "gvisor"
     store.create(job)
     try:
-        assert store.claim_next(claimant_tier="firecracker") is None  # non-match → not claimed
-        assert store.claim_next(claimant_tier=None) is None            # untiered → not claimed
-        claimed = store.claim_next(claimant_tier="gvisor")            # match → claimed
+        assert (
+            store.claim_next(claimant_tier="firecracker") is None
+        )  # non-match → not claimed
+        assert store.claim_next(claimant_tier=None) is None  # untiered → not claimed
+        claimed = store.claim_next(claimant_tier="gvisor")  # match → claimed
         assert claimed is not None
         assert claimed.target_tier == "gvisor"
         assert claimed.status == JobStatus.RUNNING
@@ -311,7 +322,7 @@ def test_ensure_jobs_indexes_uses_dedicated_conn_not_pool(monkeypatch):
 
     class _Result:
         def fetchone(self):
-            return None                 # index is valid / absent → no drop needed
+            return None  # index is valid / absent → no drop needed
 
     class _FakeConn:
         def __enter__(self):
@@ -336,7 +347,9 @@ def test_ensure_jobs_indexes_uses_dedicated_conn_not_pool(monkeypatch):
 
     class _PoolBoom:
         def connection(self):
-            raise AssertionError("the pool must NOT be borrowed for the CONCURRENTLY index")
+            raise AssertionError(
+                "the pool must NOT be borrowed for the CONCURRENTLY index"
+            )
 
     store = SqlJobStore.__new__(SqlJobStore)
     store._driver = "postgres"
@@ -345,13 +358,17 @@ def test_ensure_jobs_indexes_uses_dedicated_conn_not_pool(monkeypatch):
     store._lock = threading.RLock()
 
     # call the synchronous worker directly (the PG path now runs in a background thread)
-    store._build_jobs_index_pg("idx_jobs_status_engine_tier",
-                               "idx_jobs_status_engine_tier ON jobs (status, engine, target_tier)")
+    store._build_jobs_index_pg(
+        "idx_jobs_status_engine_tier",
+        "idx_jobs_status_engine_tier ON jobs (status, engine, target_tier)",
+    )
 
     assert calls["autocommit"] is True
     assert calls["dsn"] == "postgresql://u@h/db"
     assert any("CREATE INDEX CONCURRENTLY" in s for s in calls["sql"])
-    assert any("indisvalid" in s for s in calls["sql"])   # checks for an invalid index first
+    assert any(
+        "indisvalid" in s for s in calls["sql"]
+    )  # checks for an invalid index first
 
 
 def test_ensure_jobs_indexes_rebuilds_invalid_index(monkeypatch):
@@ -366,7 +383,7 @@ def test_ensure_jobs_indexes_rebuilds_invalid_index(monkeypatch):
 
     class _Result:
         def fetchone(self):
-            return (1,)                 # an INVALID index of this name exists
+            return (1,)  # an INVALID index of this name exists
 
     class _FakeConn:
         def __enter__(self):
@@ -389,11 +406,14 @@ def test_ensure_jobs_indexes_rebuilds_invalid_index(monkeypatch):
     store._database_url = "postgresql://u@h/db"
     store._lock = threading.RLock()
 
-    store._build_jobs_index_pg("idx_jobs_status_engine_tier",
-                               "idx_jobs_status_engine_tier ON jobs (status, engine, target_tier)")
+    store._build_jobs_index_pg(
+        "idx_jobs_status_engine_tier",
+        "idx_jobs_status_engine_tier ON jobs (status, engine, target_tier)",
+    )
 
     joined = " | ".join(executed)
-    assert "DROP INDEX CONCURRENTLY" in joined          # invalid index dropped...
-    assert "CREATE INDEX CONCURRENTLY" in joined        # ...then rebuilt
-    assert executed.index(next(s for s in executed if "DROP" in s)) < \
-        executed.index(next(s for s in executed if "CREATE INDEX" in s))
+    assert "DROP INDEX CONCURRENTLY" in joined  # invalid index dropped...
+    assert "CREATE INDEX CONCURRENTLY" in joined  # ...then rebuilt
+    assert executed.index(next(s for s in executed if "DROP" in s)) < executed.index(
+        next(s for s in executed if "CREATE INDEX" in s)
+    )

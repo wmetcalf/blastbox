@@ -4,6 +4,7 @@ AF_VSOCK needs a microVM, so the transport is an AF_UNIX socketpair (the framing
 is transport-agnostic) and the host's FC CONNECT handshake is exercised against a
 tiny local AF_UNIX server that plays firecracker's role.
 """
+
 from __future__ import annotations
 
 import json
@@ -54,7 +55,9 @@ def test_vsock_job_roundtrip(tmp_path):
 
     # Host delivers the job → guest receives input + params.
     host.signal_go(
-        WarmJobSpec(input_path=src, output_dir=tmp_path / "hostout", params={"dpi": "150"})
+        WarmJobSpec(
+            input_path=src, output_dir=tmp_path / "hostout", params={"dpi": "150"}
+        )
     )
     spec = guest.wait_for_go(timeout_s=5.0)
     assert spec.input_path.read_bytes() == b"hello-untrusted-document"
@@ -146,7 +149,9 @@ def test_wait_for_go_survives_restore_clock_jump(tmp_path, monkeypatch):
     monkeypatch.setattr(warm.time, "monotonic", fake_monotonic)
 
     host = VsockHostWarmControl(tmp_path / "vsock.sock", connect_fn=lambda: host_end)
-    guest = VsockWarmControl(tmp_path / "in", outdir, listener=_RestoreListener(guest_end))
+    guest = VsockWarmControl(
+        tmp_path / "in", outdir, listener=_RestoreListener(guest_end)
+    )
     host.signal_go(WarmJobSpec(input_path=src, output_dir=outdir, params={}))
 
     spec = guest.wait_for_go(timeout_s=5.0)  # must NOT raise despite the clock jump
@@ -167,7 +172,9 @@ def test_safe_name_strips_traversal():
 def test_signal_done_without_connection_is_safe(tmp_path):
     outdir = tmp_path / "out"
     outdir.mkdir()
-    guest = VsockWarmControl(tmp_path / "in", outdir, listener=_FakeListener(socket.socketpair()[0]))
+    guest = VsockWarmControl(
+        tmp_path / "in", outdir, listener=_FakeListener(socket.socketpair()[0])
+    )
     # No wait_for_go → no connection; signal_done must not raise.
     guest.signal_done(status="idle_timeout")
 
@@ -177,7 +184,9 @@ def test_signal_done_without_connection_is_safe(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _fc_server(uds_path, reply: bytes, *, read_job: bool = False, send_status: bytes | None = None):
+def _fc_server(
+    uds_path, reply: bytes, *, read_job: bool = False, send_status: bytes | None = None
+):
     """A tiny server emulating firecracker's host->guest vsock proxy on a UDS."""
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(str(uds_path))
@@ -212,14 +221,14 @@ def _fc_server(uds_path, reply: bytes, *, read_job: bool = False, send_status: b
 
 def test_host_connect_handshake_ok(tmp_path):
     uds = tmp_path / "vsock.sock"
-    srv, t, captured = _fc_server(
-        uds, b"OK 1024\n", read_job=True, send_status=b"ok"
-    )
+    srv, t, captured = _fc_server(uds, b"OK 1024\n", read_job=True, send_status=b"ok")
     try:
         src = tmp_path / "in.bin"
         src.write_bytes(b"payload-bytes")
         host = VsockHostWarmControl(uds)  # real _connect path
-        host.signal_go(WarmJobSpec(input_path=src, output_dir=tmp_path, params={"a": "b"}))
+        host.signal_go(
+            WarmJobSpec(input_path=src, output_dir=tmp_path, params={"a": "b"})
+        )
         assert host.wait_for_done(timeout_s=5.0) == "ok"
         t.join(timeout=5.0)
         assert captured["connect_line"] == b"CONNECT 10001\n"
@@ -252,7 +261,9 @@ def test_wait_for_done_before_signal_go_raises(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_fsync_output_dir_and_sync_run_even_if_a_file_fsync_raises(tmp_path, monkeypatch):
+def test_fsync_output_dir_and_sync_run_even_if_a_file_fsync_raises(
+    tmp_path, monkeypatch
+):
     """A transient per-file fsync error (more likely on big multi-page jobs) must
     NOT skip the directory fsync (persists the metadata.json dir entry) or the final
     os.sync(). Regression for the shared-try that aborted the whole flush on one
@@ -267,7 +278,9 @@ def test_fsync_output_dir_and_sync_run_even_if_a_file_fsync_raises(tmp_path, mon
         (outdir / f"page_{i}.png").write_bytes(b"x" * 100)
     (outdir / "metadata.json").write_text("{}")
 
-    guest = VsockWarmControl(tmp_path / "in", outdir, listener=_FakeListener(socket.socketpair()[0]))
+    guest = VsockWarmControl(
+        tmp_path / "in", outdir, listener=_FakeListener(socket.socketpair()[0])
+    )
 
     real_open, real_fsync = _os.open, _os.fsync
     fsynced_dir = {"hit": False}
@@ -298,11 +311,15 @@ def test_fsync_output_dir_and_sync_run_even_if_a_file_fsync_raises(tmp_path, mon
 
     monkeypatch.setattr(fc_warm.os, "open", fake_open)
     monkeypatch.setattr(fc_warm.os, "fsync", fsync_wrapper)
-    monkeypatch.setattr(fc_warm.os, "sync", lambda: sync_called.__setitem__("hit", True))
+    monkeypatch.setattr(
+        fc_warm.os, "sync", lambda: sync_called.__setitem__("hit", True)
+    )
 
     guest._fsync_output()  # must not raise; must reach dir-fsync + os.sync()
 
-    assert fsynced_dir["hit"], "directory fsync was skipped after a per-file fsync error"
+    assert fsynced_dir["hit"], (
+        "directory fsync was skipped after a per-file fsync error"
+    )
     assert sync_called["hit"], "os.sync() global flush was not reached"
 
 
@@ -329,12 +346,16 @@ def test_the_guest_acks_before_it_starts_work_when_asked(tmp_path):
     guest = VsockWarmControl(tmp_path / "in", outdir, listener=_FakeListener(guest_end))
 
     host.signal_go(WarmJobSpec(input_path=src, output_dir=tmp_path / "ho", params={}))
-    guest.wait_for_go(timeout_s=5.0)          # the REAL guest: it should ack in here
+    guest.wait_for_go(timeout_s=5.0)  # the REAL guest: it should ack in here
     guest.signal_done(status="ok")
 
-    assert host.wait_for_done(timeout_s=5.0) == "ok", "the status must still arrive after the ack"
-    assert host.guest_started is True, "the guest confirmed it had the job before starting"
-    assert WARM_ACK                            # the sentinel is shared, not duplicated
+    assert host.wait_for_done(timeout_s=5.0) == "ok", (
+        "the status must still arrive after the ack"
+    )
+    assert host.guest_started is True, (
+        "the guest confirmed it had the job before starting"
+    )
+    assert WARM_ACK  # the sentinel is shared, not duplicated
 
 
 def test_the_guest_stays_silent_when_the_host_does_not_ask(tmp_path):
@@ -389,7 +410,7 @@ def test_a_guest_that_cannot_ack_refuses_the_job(tmp_path):
     header = json.dumps({"filename": "doc.bin", "params": {}, "ack": True}).encode()
     _send(host_end, header)
     _send(host_end, b"payload")
-    host_end.close()                     # the ack send will fail
+    host_end.close()  # the ack send will fail
 
     with pytest.raises(WarmTimeout, match="acknowledge"):
         guest.wait_for_go(timeout_s=5.0)

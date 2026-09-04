@@ -4,6 +4,7 @@ All tests run on the host (no container needed).  The subprocess-based tests
 invoke real binaries (/bin/echo, /bin/sleep, /usr/bin/env, python3).  The
 hardening self-check tests feed a fake status_path so we never need /proc.
 """
+
 from __future__ import annotations
 
 import os
@@ -65,6 +66,7 @@ def _bad_sandbox(tmp_path: Path, **kwargs) -> ContainerSandbox:
 # Test: basic echo
 # ---------------------------------------------------------------------------
 
+
 def test_run_echo_exit_zero(tmp_path: Path) -> None:
     """`run(['/bin/echo', 'hi'])` → exit 0, stdout=b'hi\\n', not killed."""
     sb = _good_sandbox(tmp_path)
@@ -78,6 +80,7 @@ def test_run_echo_exit_zero(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Test: timeout → killed=True
 # ---------------------------------------------------------------------------
+
 
 def test_run_timeout_killed(tmp_path: Path) -> None:
     """`run(['/bin/sleep','5'], timeout_s=1)` → killed=True."""
@@ -93,6 +96,7 @@ def test_run_timeout_killed(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Test: environment stripping
 # ---------------------------------------------------------------------------
+
 
 def test_env_sentinel_not_leaked(tmp_path: Path) -> None:
     """Host os.environ sentinel must NOT appear in subprocess env."""
@@ -143,6 +147,7 @@ def test_env_home_is_tmp(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Test: rlimits applied
 # ---------------------------------------------------------------------------
+
 
 def test_rlimit_as_applied_in_child(tmp_path: Path) -> None:
     """Child process can read its own RLIMIT_AS and it equals memory_bytes."""
@@ -199,6 +204,7 @@ def test_rlimit_kills_excess_allocation(tmp_path: Path) -> None:
 # Test: hardening self-check — good status, warn_on_insecure=False
 # ---------------------------------------------------------------------------
 
+
 def test_good_status_strict_only_structural_egress_reason(tmp_path: Path) -> None:
     """'Good' /proc status + warn_on_insecure=False → only structural egress reason."""
     status_file = tmp_path / "status_good"
@@ -227,6 +233,7 @@ def test_good_status_strict_secure_false_due_to_egress(tmp_path: Path) -> None:
 # Test: hardening self-check — bad status
 # ---------------------------------------------------------------------------
 
+
 def test_bad_status_has_all_per_flag_reasons(tmp_path: Path) -> None:
     """'Bad' status → insecurity_reasons contains all three per-flag reasons + egress."""
     status_file = tmp_path / "status_bad"
@@ -244,6 +251,7 @@ def test_bad_status_has_all_per_flag_reasons(tmp_path: Path) -> None:
 # Test: hardening self-check — missing fields (partial status)
 # ---------------------------------------------------------------------------
 
+
 def test_partial_status_still_constructs(tmp_path: Path) -> None:
     """Missing /proc fields are treated as insecure (per-flag reasons recorded)."""
     status_file = tmp_path / "status_partial"
@@ -259,6 +267,7 @@ def test_partial_status_still_constructs(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Test: warn_on_insecure=True (advisory) vs warn_on_insecure=False (strict)
 # ---------------------------------------------------------------------------
+
 
 def test_warn_on_insecure_false_bad_status_still_constructs(tmp_path: Path) -> None:
     """warn_on_insecure=False with bad status still constructs; caller uses secure/reasons."""
@@ -293,6 +302,7 @@ def test_warn_on_insecure_env_default_false(monkeypatch, tmp_path: Path) -> None
 # Test: SandboxResult fields
 # ---------------------------------------------------------------------------
 
+
 def test_result_has_expected_fields(tmp_path: Path) -> None:
     """SandboxResult has exit_code, stdout, stderr, killed."""
     sb = _good_sandbox(tmp_path)
@@ -307,6 +317,7 @@ def test_result_has_expected_fields(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Test: shell=False / argv is a list (structural check via subprocess mock)
 # ---------------------------------------------------------------------------
+
 
 def test_run_uses_list_argv_not_shell(tmp_path: Path, monkeypatch) -> None:
     """Verify shell=True is never passed to subprocess.Popen (structural test)."""
@@ -331,9 +342,11 @@ def test_run_uses_list_argv_not_shell(tmp_path: Path, monkeypatch) -> None:
 # Test: mounts advisory (no-op for container backend)
 # ---------------------------------------------------------------------------
 
+
 def test_mounts_are_advisory(tmp_path: Path) -> None:
     """ro_mounts / rw_mounts are accepted and don't raise; run succeeds."""
     from blastbox.worker.sandbox.base import Mount
+
     sb = _good_sandbox(tmp_path)
     req = SandboxRequest(
         argv=["/bin/echo", "hi"],
