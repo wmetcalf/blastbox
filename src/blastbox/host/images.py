@@ -150,12 +150,12 @@ class RootfsSpec:
         return _expand(self.dest, dict(os.environ) if env is None else env)
 
 
-# Enough for a default holding a variable that itself holds one. Deeper than
-# that is not a path an operator writes; it is a loop.
-_EXPAND_PASSES = 8
+# Enough for a default holding a variable whose default holds another. Deeper
+# than that is not a path an operator writes; it is a loop.
+_EXPAND_DEPTH = 8
 
 
-def _expand(text: str, env: dict[str, str]) -> str:
+def _expand(text: str, env: dict[str, str], _depth: int = 0) -> str:
     """`$VAR`, `${VAR}` and `${VAR:-default}`.
 
     The default form matters: these destinations are copied from compose files
@@ -165,6 +165,14 @@ def _expand(text: str, env: dict[str, str]) -> str:
     An unset variable with NO default is left VISIBLE rather than emptied --
     `/redtusk-rootfs.ext4` is a plausible-looking path at the filesystem root,
     and writing a rootfs there is worse than failing to resolve.
+
+    A DEFAULT is expanded again; a substituted VALUE is not. That asymmetry is
+    the shell's, and it matters here for more than fidelity: a default is
+    literal text from the spec, where `${FC_DIR:-$HOME/fc}` is what an operator
+    writes and has to work. A value is data -- and this function also builds
+    docker `--build-arg`s, so re-expanding values would rewrite a literal `$`
+    inside a token or password into whatever variable happened to share its
+    name.
     """
 
     def sub(m: re.Match[str]) -> str:
@@ -174,7 +182,7 @@ def _expand(text: str, env: dict[str, str]) -> str:
             return m.group(0)
         value = env.get(name)
         if value:
-            return value
+            return value  # VERBATIM: data is not re-read as a template
         if value == "" and default is None:
             # `$X/file` with X empty gives `/file` -- a plausible-looking path
             # at the filesystem root. Leave the variable visible so the caller
@@ -184,24 +192,18 @@ def _expand(text: str, env: dict[str, str]) -> str:
         # A compose env routinely carries `TITANARUM_FC_DIR=` for an unset knob,
         # and treating that as "set" resolves the path to a hole.
         if default is not None:
-            return default
+            # A BACKSTOP, not a live guard. Recursion only ever descends into
+            # nested default text, which is finite and shrinks each level, and
+            # a value is never re-expanded -- so no realistic spec reaches this.
+            # It bounds a pathologically nested one rather than letting Python's
+            # own recursion limit decide. Stated plainly because nothing can
+            # mutation-test it: removing it changes no reachable behaviour.
+            if _depth >= _EXPAND_DEPTH:
+                return default
+            return _expand(default, env, _depth + 1)
         return value if value is not None else m.group(0)
 
-    # Applied REPEATEDLY, because a default can itself hold a variable:
-    # `${TITANARUM_FC_DIR:-$HOME/titanarum-bb-fc}` is ordinary shell and is what
-    # this engine's compose files and its old export script already wrote. One
-    # pass substituted the default verbatim and left `$HOME` in the result,
-    # which then read as an unresolved destination and refused a good plan.
-    #
-    # Bounded, and it stops as soon as nothing changes: an env mapping a name
-    # back to itself (`A=$A`) would otherwise spin forever.
-    for _ in range(_EXPAND_PASSES):
-        expanded = re.sub(r"\$\{(\w+)(?::-([^}]*))?\}|\$(\w+)", sub, text)
-        if expanded == text:
-            return expanded
-        text = expanded
-    return text
-
+    return re.sub(r"\$\{(\w+)(?::-([^}]*))?\}|\$(\w+)", sub, text)
 
 @dataclass(frozen=True)
 class Plan:

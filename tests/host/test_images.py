@@ -790,13 +790,28 @@ def test_a_default_may_itself_contain_a_variable(tmp_path: Path) -> None:
     )
 
 
-def test_expansion_terminates_on_a_self_referential_variable(tmp_path: Path) -> None:
-    """`A=$A` maps a name back to itself. Repeating until nothing changes needs
-    a bound, or the plan never loads."""
-    text = TITANARUM.replace(
-        'dest = "$TITANARUM_FC_DIR/titanarum-rootfs.ext4"',
-        'dest = "$LOOP/titanarum-rootfs.ext4"',
-    )
-    plan = load_plan(_plan(tmp_path, text))
-    rf = next(r for r in plan.rootfs if r.kind == "ext4")
-    assert rf.resolved_dest({"LOOP": "$LOOP"}) == "$LOOP/titanarum-rootfs.ext4"
+def test_a_substituted_value_is_not_re_expanded(tmp_path: Path) -> None:
+    """The shell does not re-read a variable's VALUE as a template, and neither
+    does this.
+
+    It matters for more than fidelity: this function also builds docker
+    `--build-arg`s, so re-expanding values would rewrite a literal `$` inside a
+    token or a password into whatever variable happened to share its name.
+    """
+    from blastbox.host.images import _expand
+
+    env = {"TOKEN": "abc$HOME", "HOME": "/home/coz"}
+    assert _expand("$TOKEN", env) == "abc$HOME"
+
+
+def test_expansion_terminates_on_a_self_referential_default(tmp_path: Path) -> None:
+    """`${A:-$A}` terminates: the inner `$A` is unset with no default of its
+    own, so it is left visible.
+
+    It terminates because values are never re-expanded, NOT because of the
+    depth bound — removing that bound leaves this passing. The bound is a
+    backstop for pathological nesting, and this test does not cover it.
+    """
+    from blastbox.host.images import _expand
+
+    assert _expand("${A:-$A}/f", {}) == "$A/f"
