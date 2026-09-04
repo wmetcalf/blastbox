@@ -683,6 +683,27 @@ def _require_shell_safe(key: str, value: str) -> None:
         )
 
 
+def canonical_version(version: str) -> str:
+    """``version`` as an installer would record it, or unchanged if unparseable.
+
+    `0.2.0-rc1`, `0.2.0_rev_3` and `0.2.0+linux-x86` are all valid PEP 440 and
+    all normalise to something else once installed (`0.2.0rc1`, `0.2.0.post3`,
+    `0.2.0+linux.x86`). Comparing the source spelling against
+    `importlib.metadata.version()` therefore fails for pins that are perfectly
+    correct.
+
+    Unparseable input is returned as it came: this is used to COMPARE, and a
+    value nobody can parse should fall back to comparing what was actually
+    written rather than raise inside a verification path.
+    """
+    from packaging.version import InvalidVersion, Version  # noqa: PLC0415
+
+    try:
+        return str(Version(version))
+    except InvalidVersion:
+        return version
+
+
 def verify_contents(
     image: str, runner: Runner | None = None
 ) -> tuple[bool | None, str]:
@@ -715,7 +736,11 @@ def verify_contents(
         return None, detail or "the image contains no blastbox"
     if actual == D_UNKNOWN:
         return False, f"cannot read the image's blastbox: {detail}"
-    if actual != stamped:
+    # Compared CANONICALLY. The label carries the spelling the repo declared and
+    # the probe reports the spelling the installer recorded; `0.2.0-rc1` and
+    # `0.2.0rc1` are the same release, and failing a build over the punctuation
+    # would reject exactly the valid pins this tooling accepts.
+    if canonical_version(actual) != canonical_version(stamped):
         return False, f"label says {stamped}, image contains {actual}"
     return True, actual
 

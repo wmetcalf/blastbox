@@ -6,6 +6,8 @@ import json
 import pathlib
 import subprocess
 
+import pytest
+
 from blastbox.host.stamp import (
     LABEL_BASE_DIGEST,
     LABEL_BASE_NAME,
@@ -15,6 +17,7 @@ from blastbox.host.stamp import (
     LABEL_REVISION,
     UNKNOWN,
     base_digest,
+    canonical_version,
     build_args,
     git_revision,
     read,
@@ -1195,3 +1198,45 @@ def test_presence_and_identity_come_from_one_inspection():
     present, ident = stamp.base_state(run)
     assert len(calls) == 1, "presence and identity took two inspections"
     assert present and ident == "sha256:" + "c" * 64
+
+
+@pytest.mark.parametrize(
+    ("declared", "installed"),
+    [
+        ("0.2.0-rc1", "0.2.0rc1"),
+        ("0.2.0_rev_3", "0.2.0.post3"),
+        ("0.2.0+linux-x86", "0.2.0+linux.x86"),
+        ("0.2.0", "0.2.0"),
+    ],
+)
+def test_a_stamp_agrees_with_the_installers_spelling_of_the_same_release(
+    monkeypatch, declared, installed
+):
+    """The label carries what the repo declared; the probe reports what pip did.
+
+    `0.2.0-rc1` and `0.2.0rc1` are the same release. Failing a build over the
+    punctuation rejects exactly the valid pins this tooling accepts.
+    """
+    import blastbox.host.doctor as doctor
+    import blastbox.host.stamp as mod
+
+    monkeypatch.setattr(mod, "read", lambda i, r=None: Stamp(blastbox=declared))
+    monkeypatch.setattr(doctor, "version_in_image", lambda i, r=None: (installed, ""))
+    agrees, detail = mod.verify_contents("demo:t1")
+    assert agrees is not False, detail
+
+
+def test_a_genuinely_different_version_is_still_caught(monkeypatch):
+    """Canonicalising must not turn the join into a rubber stamp."""
+    import blastbox.host.doctor as doctor
+    import blastbox.host.stamp as mod
+
+    monkeypatch.setattr(mod, "read", lambda i, r=None: Stamp(blastbox="0.1.34"))
+    monkeypatch.setattr(doctor, "version_in_image", lambda i, r=None: ("0.1.31", ""))
+    agrees, detail = mod.verify_contents("demo:t1")
+    assert agrees is False and "0.1.31" in detail
+
+
+def test_an_unparseable_version_falls_back_to_what_was_written():
+    """Used to COMPARE, so it must not raise inside a verification path."""
+    assert canonical_version("not-a-version") == "not-a-version"

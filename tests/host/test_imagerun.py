@@ -33,6 +33,7 @@ def _sized(path: Path, nbytes: int) -> Path:
 
 
 from blastbox.host.images import PlanError, load_plan
+from blastbox.host import images as _images
 from blastbox.host.imagerun import (
     BuildError,
     build_plan,
@@ -67,10 +68,18 @@ requires = ["/init"]
 class FakeRunner:
     """Records argv and returns a scripted result per command."""
 
-    def __init__(self, fail: str | None = None, stdout: str = "") -> None:
+    def __init__(
+        self, fail: str | None = None, stdout: str = "", moves: bool = False
+    ) -> None:
         self.calls: list[list[str]] = []
         self.fail = fail
         self.stdout = stdout
+        # Opt-in, because most tests here use `mv` only as a recorded intention
+        # and their staging paths never exist on disk. The publication and
+        # rollback tests are the ones that read the destination back, and for
+        # those a `mv` that reports success without moving anything turns the
+        # assertion into a test of "the artifact could not be identified".
+        self.moves = moves
 
     def __call__(self, argv, *, cwd=None, capture_output=False, stdout=None):
         self.calls.append(list(argv))
@@ -84,6 +93,40 @@ class FakeRunner:
         if rc == 0 and bare[:2] == ["docker", "inspect"] and "{{.Id}}" in bare:
             # Verification resolves each tag to the id it is about to export.
             out = "sha256:" + "e" * 64
+        if rc == 0 and self.moves and bare[:2] == ["truncate", "-s"]:
+            # Sparse, and real. With `moves` on, the publication that follows
+            # actually renames this file -- so a truncate that only recorded its
+            # intention would make the publish fail on a missing source and the
+            # test would never reach the behaviour it is about.
+            size = bare[2]
+            mult = {"K": 1024, "M": 1024**2, "G": 1024**3}.get(size[-1].upper(), 1)
+            n = int(size.rstrip("KMGkmg")) * mult
+            with open(bare[3], "wb") as fh:
+                fh.truncate(n)
+        if rc == 0 and self.moves and bare[:1] == ["mv"] and len(bare) == 3:
+            # Really moves. Publication is a rename and rollback is its inverse,
+            # and both are now decided by reading the destination back -- so a
+            # double that reports success without moving anything makes every
+            # such test exercise "the artifact could not be identified" instead
+            # of the branch it was written for.
+            try:
+                os.replace(bare[1], bare[2])
+            except OSError as exc:
+                return subprocess.CompletedProcess(
+                    list(argv), 1, stdout="", stderr=str(exc)
+                )
+        if rc == 0 and bare[:3] == ["stat", "-c", "%d:%i"]:
+            # Really stats. Publication records device:inode to tell its own
+            # artifact from a newer run's, and rollback refuses to act on one it
+            # cannot identify -- so a double that invented or omitted this would
+            # turn every rollback test into a test of that refusal.
+            try:
+                st = Path(bare[3]).stat()
+                out = f"{st.st_dev}:{st.st_ino}"
+            except OSError:
+                return subprocess.CompletedProcess(
+                    list(argv), 1, stdout="", stderr="no such file"
+                )
         if rc == 0 and bare[:3] == ["stat", "-c", "%s"]:
             # Really stats: a double that invented a size would make the shrink
             # guard assert on fiction. Absent files exit non-zero, as stat does.
@@ -233,7 +276,7 @@ def test_the_chain_stops_at_the_first_failure(
     monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
     # The chain is built under a PRIVATE tag, so that is the name a failure has
     # to be injected on -- and the name the second image would be built under.
-    staging = mod._staging_tag("t1")
+    staging = _pin_staging(monkeypatch)
     run = FakeRunner(fail=f"demo-base:{staging}")
     with pytest.raises(BuildError):
         build_plan(
@@ -465,10 +508,15 @@ def test_verification_happens_before_anything_is_exported(
         # under a hand-written pattern and yielded a DIFFERENT release --
         # `0.2.0`, a final release, for a pin naming its release candidate --
         # which is then passed on as an exact build arg.
-        ('"blastbox==0.2.0-rc1"', "0.2.0-rc1"),
-        ('"blastbox==0.2.0rc-1"', "0.2.0rc-1"),
-        ('"blastbox==0.2.0_rev_3"', "0.2.0_rev_3"),
-        ('"blastbox==0.2.0+linux-x86"', "0.2.0+linux-x86"),
+        #
+        # Captured CANONICALLY, because that value is also written to the stamp
+        # and compared against `importlib.metadata.version()`, which reports the
+        # normalised spelling. Returning the source spelling produced an image
+        # that installed correctly and then failed its own verification.
+        ('"blastbox==0.2.0-rc1"', "0.2.0rc1"),
+        ('"blastbox==0.2.0rc-1"', "0.2.0rc1"),
+        ('"blastbox==0.2.0_rev_3"', "0.2.0.post3"),
+        ('"blastbox==0.2.0+linux-x86"', "0.2.0+linux.x86"),
         ('"blastbox==0.2.0rc1"', "0.2.0rc1"),
         ('"blastbox==1!0.2.0"', "1!0.2.0"),
         ('"blastbox==0.2.0.post1"', "0.2.0.post1"),
@@ -698,6 +746,22 @@ class _FakeStamp:
         # A separate question from `base_moved`, which answers "" for a base
         # that is GONE rather than moved. Verification asks both.
         return self._resolvable
+
+
+_PINNED_STAGING = "t1-blastbox-staging-pinned"
+
+
+def _pin_staging(monkeypatch, name: str = _PINNED_STAGING) -> str:
+    """Make the private build tag predictable for a test.
+
+    The real one carries a random component so two invocations in one process
+    cannot collide, which is exactly what a test asserting a specific name
+    cannot work with. Pinned through the same seam the code calls.
+    """
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_staging_tag", lambda tag: name)
+    return name
 
 
 _VERIFIED_ID = "sha256:" + "e" * 64
@@ -1930,6 +1994,8 @@ def test_publication_rolls_back_when_a_later_artifact_fails(
     plan = _plan(tmp_path, text)
 
     class FailSecondPublish(FakeRunner):
+        # Real moves: this asserts the first artifact was put BACK, which is a
+        # question about the filesystem, not about which commands were issued.
         def __call__(self, argv, **kw):
             bare = self._bare(list(argv))
             if bare[:1] == ["mv"] and bare[-1].endswith("second.ext4"):
@@ -1939,7 +2005,7 @@ def test_publication_rolls_back_when_a_later_artifact_fails(
                 )
             return super().__call__(argv, **kw)
 
-    run = FailSecondPublish()
+    run = FailSecondPublish(moves=True)
     with pytest.raises(BuildError):
         run_plan(
             plan,
@@ -1970,7 +2036,7 @@ def test_rollback_uses_what_this_run_found_not_what_is_on_disk(
     _sized(dest_dir / "demo.ext4.bak", 4096)  # left over from some earlier run
     monkeypatch.setenv("DEMO_DIR", str(dest_dir))
     plan = _plan(tmp_path)
-    run = FakeRunner()
+    run = FakeRunner(moves=True)
     staged = mod.stage_rootfs(
         plan,
         plan.rootfs[0],
@@ -2117,8 +2183,14 @@ def test_rollback_never_removes_a_live_artifact_it_cannot_replace(
         ready=dest_dir / "stg",
         had_previous=True,
         restore_from=dest_dir / "does-not-exist",
+        # As publication records it. Rollback refuses to act on an artifact it
+        # cannot identify, so a hand-built _Staged without this would exercise
+        # that refusal instead of the missing-backup one this test is about.
+        published_identity=mod._artifact_identity(
+            dest_dir / "rootfs", [], mod._default_runner
+        ),
     )
-    run = FakeRunner()
+    run = mod._default_runner
     said: list[str] = []
     mod._restore_backup(staged, run, said.append)
     assert (dest_dir / "rootfs").exists(), "the live artifact was removed anyway"
@@ -2478,7 +2550,7 @@ def test_a_build_failure_does_not_print_the_secret(tmp_path: Path, monkeypatch) 
         'base = "upstream:1"\nbuild_args = { REGISTRY_TOKEN = "$TOK" }',
         1,
     )
-    run = FakeRunner(fail=f"demo-base:{mod._staging_tag('t1')}")
+    run = FakeRunner(fail=f"demo-base:{_pin_staging(monkeypatch)}")
     with pytest.raises(BuildError) as e:
         build_plan(
             _plan(tmp_path, text),
@@ -2592,11 +2664,11 @@ def test_the_requested_tag_is_not_moved_by_the_build(
 
     _resolves_to(monkeypatch)
     monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
+    staging = _pin_staging(monkeypatch)
     run = FakeRunner()
     built = build_plan(
         _plan(tmp_path), "t1", blastbox_version="0.1.33", run=run, log=lambda _: None
     )
-    staging = mod._staging_tag("t1")
     assert built == [f"demo-base:{staging}", f"demo-worker:{staging}"], built
     for call in run.calls:
         if call[:2] == ["docker", "build"]:
@@ -2648,21 +2720,30 @@ def test_the_tags_are_published_only_after_the_whole_chain_verifies(
 def _publication_rollback(tmp_path, monkeypatch, previously) -> list[list[str]]:
     """Run a plan whose rootfs publication fails; return the tag calls it made.
 
-    ``previously`` answers what each FINAL tag pointed at before the run, which
-    is the only thing that decides whether a rollback retags or removes.
+    Docker's tag table is MODELLED rather than stubbed per-call: publication
+    reads what a tag points at, moves it, reads it back, and a rollback decides
+    between restoring and removing from those readings. A double that answers
+    every inspect with the same id makes all four look identical, and both
+    rollback branches then pass whatever the code does.
+
+    ``previously`` is what each FINAL tag points at before the run -- the only
+    thing that decides whether a rollback retags or removes.
     """
     import blastbox.host.imagerun as mod
 
+    staging = _pin_staging(monkeypatch)
+    tags: dict[str, str] = {
+        f"demo-base:{staging}": _VERIFIED_ID,
+        f"demo-worker:{staging}": _VERIFIED_ID,
+        **previously,
+    }
     monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
     monkeypatch.setattr(mod, "_read_stamp", lambda i, r=None: _FakeStamp())
     monkeypatch.setattr(mod, "_verify_contents", lambda i, r=None: (True, ""))
     monkeypatch.setattr(
-        mod,
-        "_image_id",
-        lambda image, run=None: (
-            previously.get(image, "") if "staging" not in image else _VERIFIED_ID
-        ),
+        mod, "_image_state", lambda image, run=None: tags.get(image, "")
     )
+    monkeypatch.setattr(mod, "_image_id", lambda image, run=None: tags.get(image, ""))
     monkeypatch.setenv("DEMO_DIR", str(tmp_path / "out"))
     monkeypatch.setattr(
         mod,
@@ -2674,8 +2755,12 @@ def _publication_rollback(tmp_path, monkeypatch, previously) -> list[list[str]]:
 
     def watched(argv, **kw):
         a = list(argv)
-        if a[:2] in (["docker", "tag"], ["docker", "rmi"]):
+        if a[:2] == ["docker", "tag"]:
             seen.append(a)
+            tags[a[3]] = tags.get(a[2], a[2])
+        elif a[:2] == ["docker", "rmi"]:
+            seen.append(a)
+            tags.pop(a[-1], None)
         return run(argv, **kw)
 
     with pytest.raises(OSError, match="disk full"):
@@ -2977,6 +3062,7 @@ def test_a_verification_failure_leaves_the_images_inspectable(
     import blastbox.host.imagerun as mod
 
     _resolves_to(monkeypatch)
+    staging = _pin_staging(monkeypatch)
     monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
     monkeypatch.setattr(
         mod, "_read_stamp", lambda i, r=None: _FakeStamp(reproducible=False)
@@ -3000,7 +3086,7 @@ def test_a_verification_failure_leaves_the_images_inspectable(
             log=said.append,
         )
     assert not removed, removed
-    assert any(mod._staging_tag("t1") in s for s in said), said
+    assert any(staging in s for s in said), said
 
 
 def test_a_published_child_names_a_base_that_still_exists(
@@ -3046,6 +3132,7 @@ def test_verification_looks_the_recorded_base_up_under_its_staging_alias(
     import blastbox.host.imagerun as mod
 
     _resolves_to(monkeypatch)
+    staging = _pin_staging(monkeypatch)
     monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
     stamps: list = []
 
@@ -3066,7 +3153,205 @@ def test_verification_looks_the_recorded_base_up_under_its_staging_alias(
         extract=lambda image, dest: (dest / "init").write_text("x"),
         extract_preserves_ownership=True,
     )
-    staging = mod._staging_tag("t1")
     asked = [ref for s in stamps for ref in s.asked_as]
     assert asked, "nothing was asked about the base at all"
     assert all(ref == f"demo-base:{staging}" for ref in asked), asked
+
+
+def test_a_secret_that_looks_like_an_image_is_not_logged(tmp_path, monkeypatch) -> None:
+    """`REGISTRY_PASS=hunter:2` looks exactly like an image reference.
+
+    The builder-pin heuristic is deliberately permissive, so such a value
+    reaches `docker pull` -- and the failure note carried the expanded
+    credential into terminal and CI logs, through the very leniency that exists
+    to avoid refusing valid builds.
+    """
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setenv("REGPASS", "hunter:2secret")
+    spec = _images.ImageSpec(
+        name="demo",
+        dockerfile="Dockerfile",
+        base="upstream:1",
+        build_args={"REGISTRY_PASS": "$REGPASS"},
+    )
+    said: list[str] = []
+    run = FakeRunner(fail="hunter:2secret")
+    out = mod._pin_builder_images(
+        spec, {"REGPASS": "hunter:2secret"}, run, said.append, pull=True
+    )
+    assert out == {}, out
+    assert said, "the skip was not reported at all"
+    joined = "\n".join(said)
+    assert "hunter:2secret" not in joined, joined
+    assert "REGISTRY_PASS" in joined, joined
+
+
+def test_an_already_digested_builder_is_still_recorded_as_provenance(
+    tmp_path, monkeypatch
+) -> None:
+    """A plan may pin its builder itself. It still supplies files to the image.
+
+    Skipping it left a multi-stage build reading back with the same empty
+    provenance as an image that has no builder stage at all.
+    """
+    import blastbox.host.imagerun as mod
+
+    jdk = "eclipse-temurin@sha256:" + "9" * 64
+    spec = _images.ImageSpec(
+        name="demo",
+        dockerfile="Dockerfile",
+        base="upstream:1",
+        build_args={"JDK_BUILD_IMAGE": jdk},
+    )
+    out = mod._pin_builder_images(spec, {}, FakeRunner(), lambda _: None, pull=True)
+    assert out == {"JDK_BUILD_IMAGE": jdk}, out
+
+
+def test_publication_refuses_when_a_tags_previous_state_is_unreadable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A rollback decides between restoring and REMOVING from this reading.
+
+    `_image_id` collapses every failure to "", which reads as "there was
+    nothing here" -- so one transient daemon error made the rollback delete a
+    live production tag and lose its only recorded reference. Unknown means
+    refuse, before anything has moved.
+    """
+    import blastbox.host.imagerun as mod
+
+    _resolves_to(monkeypatch)
+    _pin_staging(monkeypatch)
+    monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
+    monkeypatch.setattr(mod, "_read_stamp", lambda i, r=None: _FakeStamp())
+    monkeypatch.setattr(mod, "_verify_contents", lambda i, r=None: (True, ""))
+    monkeypatch.setattr(mod, "_image_state", lambda image, run=None: None)
+    monkeypatch.setenv("DEMO_DIR", str(tmp_path / "out"))
+    moved: list[list[str]] = []
+    run = FakeRunner()
+
+    def watched(argv, **kw):
+        if list(argv)[:2] == ["docker", "tag"]:
+            moved.append(list(argv))
+        return run(argv, **kw)
+
+    with pytest.raises(BuildError, match="cannot determine what"):
+        run_plan(
+            _plan(tmp_path),
+            "t1",
+            blastbox_version="0.1.34",
+            run=watched,
+            log=lambda _: None,
+            extract=lambda image, dest: (dest / "init").write_text("x"),
+            extract_preserves_ownership=True,
+        )
+    assert moved == [], moved
+
+
+def test_a_tag_rollback_leaves_a_newer_publication_alone(tmp_path: Path) -> None:
+    """The same argument as the artifact rollback, for the other half.
+
+    Two runs publishing one tag: the first can fail after the second has
+    already moved it. Putting the first run's previous image back overwrites
+    the newer one and leaves it inconsistent with the newer rootfs.
+    """
+    import blastbox.host.imagerun as mod
+
+    ours = "sha256:" + "1" * 64
+    theirs = "sha256:" + "2" * 64
+    old = "sha256:" + "0" * 64
+    tags = {"demo:t1": theirs}
+    calls: list[list[str]] = []
+
+    def run(argv, **kw):
+        a = list(argv)
+        calls.append(a)
+        if a[:2] == ["docker", "tag"]:
+            tags[a[3]] = tags.get(a[2], a[2])
+        return subprocess.CompletedProcess(a, 0, "", "")
+
+    monkeypatched = mod._image_state
+    try:
+        mod._image_state = lambda image, r=None: tags.get(image, "")
+        said: list[str] = []
+        mod.restore_tags(
+            mod.PublishedTags(("demo:t1",), {"demo:t1": old}, {"demo:t1": ours}),
+            run=run,
+            log=said.append,
+        )
+    finally:
+        mod._image_state = monkeypatched
+    assert tags["demo:t1"] == theirs, "a newer publication was overwritten"
+    assert any("NOT restoring" in s for s in said), said
+
+
+def test_a_tag_rollback_that_fails_is_reported(tmp_path: Path) -> None:
+    """Silence here reads as success while a live tag stays on a new release."""
+    import blastbox.host.imagerun as mod
+
+    ours = "sha256:" + "1" * 64
+    old = "sha256:" + "0" * 64
+
+    def run(argv, **kw):
+        return subprocess.CompletedProcess(list(argv), 1, "", "daemon says no")
+
+    monkeypatched = mod._image_state
+    try:
+        mod._image_state = lambda image, r=None: ours
+        said: list[str] = []
+        mod.restore_tags(
+            mod.PublishedTags(("demo:t1",), {"demo:t1": old}, {"demo:t1": ours}),
+            run=run,
+            log=said.append,
+        )
+    finally:
+        mod._image_state = monkeypatched
+    assert any("TAG ROLLBACK INCOMPLETE" in s for s in said), said
+    assert not any(s.strip().endswith("restored") for s in said), said
+
+
+def test_two_invocations_do_not_share_a_staging_tag() -> None:
+    """The pid alone is not unique.
+
+    Two `run_plan` calls for one requested tag inside a single process -- a
+    fleet tool building several engines, a test suite -- would retag each
+    other's images mid-build, and the first to publish would delete tags the
+    second still needs.
+    """
+    import blastbox.host.imagerun as mod
+
+    names = {mod._staging_tag("t1") for _ in range(8)}
+    assert len(names) == 8, names
+    assert all(n.startswith("t1-blastbox-staging-") for n in names), names
+    assert all(len(n) <= 128 for n in names), names
+
+
+def test_a_rollback_that_cannot_identify_the_artifact_leaves_it_alone(
+    tmp_path: Path,
+) -> None:
+    """Failing OPEN defeats the guard exactly when it is needed.
+
+    A destination that has vanished, or a stat that failed, is precisely when
+    this run's artifact cannot be told from a newer one's.
+    """
+    import blastbox.host.imagerun as mod
+
+    dest = tmp_path / "rootfs.ext4"
+    dest.write_text("live")
+    bak = tmp_path / "rootfs.ext4.bak"
+    bak.write_text("previous")
+    staged = mod._Staged(
+        spec=None,
+        image="demo:t1",
+        dest=dest,
+        priv=[],
+        staging=tmp_path / "stg",
+        ready=tmp_path / "stg.img",
+        had_previous=True,
+        restore_from=bak,
+        published_identity="",  # publication could not read it back
+    )
+    said: list[str] = []
+    mod._restore_backup(staged, mod._default_runner, said.append)
+    assert dest.read_text() == "live", "rolled back over an unidentifiable artifact"
+    assert any("cannot establish" in s for s in said), said

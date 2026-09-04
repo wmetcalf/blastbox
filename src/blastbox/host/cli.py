@@ -1506,7 +1506,16 @@ def _declared_blastbox_version(root: Path) -> str:
         body,
         re.VERBOSE | re.IGNORECASE | re.MULTILINE,
     )
-    return m.group(2) if m else ""
+    if not m:
+        return ""
+    # CANONICAL, not the source spelling. This value is passed to the build as
+    # an exact pin AND written to the stamp, while the installed distribution
+    # metadata records the normalised form -- so returning `0.2.0-rc1` here
+    # produced an image that installed correctly and then failed its own
+    # verification against `0.2.0rc1`.
+    from blastbox.host.stamp import canonical_version  # noqa: PLC0415
+
+    return canonical_version(m.group(2))
 
 
 def _release_digests(version: str) -> list[str] | None:

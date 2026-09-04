@@ -30,6 +30,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
@@ -113,7 +114,20 @@ def _pin_builder_images(
     out: dict[str, str] = {}
     for key, raw in sorted(spec.build_args.items()):
         value = _images._expand(raw, env)  # noqa: SLF001 - same package
-        if not _looks_like_an_image(value) or "@sha256:" in value:
+        # Never the VALUE for an argument whose name reads as a credential.
+        # `REGISTRY_PASS=hunter:2` looks exactly like an image reference, so it
+        # reaches the pull below and its failure message carried the expanded
+        # credential into terminal and CI logs -- a leak reached through the
+        # very heuristic that exists to be permissive.
+        shown = f"{key}=<redacted>" if _images._is_secret(key) else f"{key}={value}"  # noqa: SLF001
+        if not _looks_like_an_image(value):
+            continue
+        if "@sha256:" in value:
+            # Already immutable, so nothing to resolve -- but it still supplies
+            # files to the image, so it belongs in the provenance record.
+            # Omitting it made a multi-stage build read back with the same empty
+            # `org.blastbox.builders` as an image that has no builder at all.
+            out[key] = value
             continue
         if pull:
             # NOT fatal, because reaching here is a HEURISTIC: `CACHE_ENDPOINT
@@ -126,10 +140,17 @@ def _pin_builder_images(
             # though it were fresh: the inspect below is skipped too.
             pulled = run(["docker", "pull", "-q", value], capture_output=True)
             if pulled.returncode != 0:
-                log(
-                    f"   note: could not pull {key}={value} "
-                    f"({(pulled.stderr or '').strip()[:120]}); left as the tag"
+                # docker echoes the reference it was given, so a secret-bearing
+                # stderr is a leak too. Redacted arguments get the reason
+                # withheld, not the whole note: the operator still learns which
+                # argument was skipped and why to look at it.
+                why = (
+                    "the value is withheld because the argument name reads as a "
+                    "credential"
+                    if _images._is_secret(key)  # noqa: SLF001
+                    else (pulled.stderr or "").strip()[:120]
                 )
+                log(f"   note: could not pull {shown} ({why}); left as the tag")
                 continue
         proc = run(
             [
@@ -144,9 +165,7 @@ def _pin_builder_images(
             capture_output=True,
         )
         if proc.returncode != 0:
-            log(
-                f"   note: could not resolve {key}={value} to a digest; left as the tag"
-            )
+            log(f"   note: could not resolve {shown} to a digest; left as the tag")
             continue
         # The FULL `repo@sha256:...`, not the bare digest. A bare one handed to
         # docker as a base resolves as `docker.io/library/sha256:...` and fails
@@ -157,7 +176,7 @@ def _pin_builder_images(
             out[key] = digest
             log(f"   pinned {key} -> {digest}")
         else:
-            log(f"   note: {value} has no registry digest; left as the tag")
+            log(f"   note: {shown} has no registry digest; left as the tag")
     return out
 
 
@@ -232,21 +251,31 @@ def _staging_tag(tag: str) -> str:
     Bounded to docker's 128 characters, keeping the SUFFIX -- the part that
     makes it private -- when a long tag has to be trimmed.
     """
-    suffix = f"-blastbox-staging-{os.getpid()}"
+    # The pid alone is not unique: two `run_plan` calls for the same requested
+    # tag inside one process -- a fleet tool building several engines, a test
+    # suite -- would share a staging name, retag each other's images mid-build,
+    # and the first to publish would delete tags the second still needs.
+    # The pid is kept anyway: it says which process to look at when a refused
+    # build leaves its images behind.
+    suffix = f"-blastbox-staging-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     return tag[: 128 - len(suffix)] + suffix
 
 
 @dataclass(frozen=True)
 class PublishedTags:
-    """Which tags a run moved, and what each pointed at beforehand.
+    """Which tags a run moved, what each pointed at, and what it now holds.
 
-    The "beforehand" half is the whole point: rolling a tag back means putting
-    it on the image it named BEFORE this run, and a tag that did not exist has
-    to be removed rather than left on a half-published chain.
+    All three are needed to roll back correctly. "What it pointed at" is where
+    the tag goes back to -- and a tag that pointed at NOTHING has to be removed
+    rather than left on a half-published chain. "What it now holds" is how a
+    rollback tells its own publication from a newer run's: putting our previous
+    image back over somebody else's newer one is the same silent downgrade the
+    artifact rollback already guards against.
     """
 
     tags: tuple[str, ...]
     previous: dict[str, str]
+    published: dict[str, str]
 
 
 def publish_tags(
@@ -254,29 +283,46 @@ def publish_tags(
 ) -> PublishedTags:
     """Point the requested tags at the images that were built and verified.
 
-    Rolled back as a unit. Half a chain published is the mixed-release state
-    the staging phase exists to prevent, so a failure part-way restores every
-    tag this call had already moved.
+    Refuses before moving ANYTHING if the previous state of a tag cannot be
+    read. A rollback decides between "restore the old image" and "remove the
+    tag" from that reading, so guessing turns a transient daemon error into a
+    deleted production tag with no recorded reference to restore.
     """
     runner = run or _default_runner
     previous: dict[str, str] = {}
-    published: list[str] = []
+    for staged_tag in staged:
+        final = f"{staged_tag.rsplit(':', 1)[0]}:{tag}"
+        state = _image_state(final, runner)
+        if state is None:
+            raise BuildError(
+                f"refusing to publish: cannot determine what {final} points at "
+                "now. Rollback depends on knowing whether it existed, so moving "
+                "it without that reading risks losing the image it names."
+            )
+        previous[final] = state
+
+    published: dict[str, str] = {}
+    order: list[str] = []
     try:
         for staged_tag in staged:
-            repo = staged_tag.rsplit(":", 1)[0]
-            final = f"{repo}:{tag}"
-            # BEFORE the retag, so a rollback restores what was actually there.
-            previous[final] = _image_id(final, runner)
-            log(f"   {final} <- {staged_tag}")
-            _must(["docker", "tag", staged_tag, final], f"tag {final}", runner)
-            published.append(final)
+            final = f"{staged_tag.rsplit(':', 1)[0]}:{tag}"
+            with _tag_lock(final):
+                log(f"   {final} <- {staged_tag}")
+                _must(["docker", "tag", staged_tag, final], f"tag {final}", runner)
+                # What we put there, read back under the same lock: a rollback
+                # restores only while the tag still holds this.
+                published[final] = _image_id(final, runner)
+            order.append(final)
     except BaseException:
         restore_tags(
-            PublishedTags(tuple(published), previous), staged, run=runner, log=log
+            PublishedTags(tuple(order), previous, published),
+            staged,
+            run=runner,
+            log=log,
         )
         raise
     _drop_staging_tags(staged, runner)
-    return PublishedTags(tuple(published), previous)
+    return PublishedTags(tuple(order), previous, published)
 
 
 def restore_tags(
@@ -286,18 +332,48 @@ def restore_tags(
     run: Runner | None = None,
     log: Log = _log,
 ) -> None:
-    """Put every tag in ``published`` back where it was before the run."""
+    """Put every tag in ``published`` back where it was before the run.
+
+    Best effort in that it does not raise -- it usually runs while another
+    failure is propagating -- but never SILENT: a tag it could not restore is
+    reported, because the state it leaves behind is a live tag on a new release
+    beside a rootfs from the old one, which is the mixed release this path
+    exists to prevent.
+    """
     runner = run or _default_runner
+    failed: list[str] = []
     for final in reversed(published.tags):
-        was = published.previous.get(final, "")
-        if was:
-            runner(["docker", "tag", was, final], capture_output=True)
-        else:
-            # It did not exist before this run. Leaving it on a half-published
-            # chain is worse than leaving it absent, which is what a consumer
-            # of a brand-new tag is already prepared for.
-            runner(["docker", "rmi", "--no-prune", final], capture_output=True)
-        log(f"   {final} restored")
+        with _tag_lock(final):
+            now = _image_state(final, runner)
+            ours = published.published.get(final, "")
+            if now is None:
+                failed.append(f"{final} (cannot read what it points at now)")
+                continue
+            if ours and now and now != ours:
+                log(
+                    f"   NOT restoring {final}: another run has published there "
+                    "since; leaving it alone"
+                )
+                continue
+            was = published.previous.get(final, "")
+            if was:
+                proc = runner(["docker", "tag", was, final], capture_output=True)
+            else:
+                # It did not exist before this run. Leaving it on a
+                # half-published chain is worse than leaving it absent, which is
+                # what a consumer of a brand-new tag is already prepared for.
+                proc = runner(
+                    ["docker", "rmi", "--no-prune", final], capture_output=True
+                )
+            if proc.returncode != 0:
+                failed.append(f"{final} ({(proc.stderr or '').strip()[:80]})")
+                continue
+            log(f"   {final} restored")
+    if failed:
+        log(
+            "   TAG ROLLBACK INCOMPLETE — these still point at the new release "
+            "while the artifacts do not: " + ", ".join(failed)
+        )
     _drop_staging_tags(staged, runner)
 
 
@@ -320,6 +396,7 @@ def build_plan(
     run: Runner | None = None,
     log: Log = _log,
     pull: bool = True,
+    staging: str | None = None,
 ) -> list[str]:
     """Build every image in the chain, each stamped with what it was built from.
 
@@ -352,7 +429,11 @@ def build_plan(
     # The chain is built and linked under a PRIVATE tag. `resolve_chain` is
     # given that name too, so an internal base still resolves to the image from
     # this run rather than to a stale tag of the same name.
-    staging = _staging_tag(tag)
+    #
+    # Computed ONCE per run and shared with the caller: it carries a random
+    # component so two invocations cannot collide, so recomputing it anywhere
+    # else names images nothing built.
+    staging = staging or _staging_tag(tag)
     # Two views of the same chain: what each image is BUILT against (the private
     # staging tags of this run) and what its stamp should NAME (the tags this
     # run will publish). They differ only for internal bases, and conflating
@@ -624,6 +705,26 @@ def _source_state(repo: Path) -> str:
     return f"{head.stdout.strip()}:{dirt}"
 
 
+def _image_state(image: str, run: Runner) -> str | None:
+    """``image``'s id, "" if it is confirmed ABSENT, or None if unknowable.
+
+    `_image_id` collapses every failure to "", which reads as "there was
+    nothing here". Publication uses that to decide whether a rollback should
+    restore the previous image or REMOVE the tag -- so one transient daemon
+    error made a rollback delete the live tag and lose its only reference.
+    """
+    proc = run(
+        ["docker", "inspect", "--type", "image", image, "--format", "{{.Id}}"],
+        capture_output=True,
+    )
+    if proc.returncode == 0:
+        return (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").lower()
+    if "no such" in stderr or "not found" in stderr:
+        return ""
+    return None
+
+
 def _image_id(image: str, run: Runner) -> str:
     """``image``'s current image ID, or "" if it cannot be resolved."""
     proc = run(
@@ -730,7 +831,23 @@ def _destination_lock(dest: Path) -> Iterator[None]:
     # realpath on the parent, keeping the name: the final component is what we
     # replace and may itself be a symlink we must not follow.
     canonical = Path(os.path.realpath(dest.parent)) / dest.name
-    key = hashlib.sha256(str(canonical).encode()).hexdigest()[:16]
+    yield from _locked_on(str(canonical))
+
+
+@contextlib.contextmanager
+def _tag_lock(ref: str) -> Iterator[None]:
+    """Serialise publication AND rollback for one image tag.
+
+    The same argument as `_destination_lock`, for the other half of a
+    publication: two runs moving one tag is a check-and-swap, and a rollback
+    that does not hold the lock races the ownership check it just made.
+    """
+    yield from _locked_on(f"tag:{ref}")
+
+
+def _locked_on(key_source: str) -> Iterator[None]:
+    """The lock itself, keyed by an already-canonical identity."""
+    key = hashlib.sha256(key_source.encode()).hexdigest()[:16]
     path = Path(tempfile.gettempdir()) / f"blastbox-publish-{key}.lock"
     # O_RDONLY: flock needs a descriptor, not write access. The file PERSISTS,
     # so an operator who runs once as root leaves it 0644 root-owned under the
@@ -788,7 +905,17 @@ def _restore_locked(
     # are rolling back FROM -- a silent downgrade of a live tier, done by a
     # recovery path.
     now = _artifact_identity(dest, priv, run)
-    if staged.published_identity and now and now != staged.published_identity:
+    if not staged.published_identity or not now:
+        # Failing OPEN here defeats the guard entirely: a destination that has
+        # vanished, or a stat that failed, is exactly when we cannot tell our
+        # artifact from a newer run's -- and restoring over a newer one is the
+        # silent downgrade this check exists to prevent. Unknown means leave it.
+        log(
+            f"   NOT rolling back {dest}: cannot establish whether it still "
+            "holds this run's artifact; leaving it alone"
+        )
+        return
+    if now != staged.published_identity:
         log(
             f"   NOT rolling back {dest}: another run has published there since "
             "(it no longer holds this run's artifact); leaving it alone"
@@ -1446,11 +1573,20 @@ def run_plan(
     builds. The chain is built under a private name and the real tags are moved
     once, at the end, alongside the rootfs.
     """
+    # ONCE per run, then shared: the private tag carries a random component so
+    # two invocations cannot collide, so recomputing it here would name images
+    # nothing built.
+    staging = _staging_tag(tag)
     staged_tags = build_plan(
-        plan, tag, blastbox_version=blastbox_version, env=env, run=run, log=log
+        plan,
+        tag,
+        blastbox_version=blastbox_version,
+        env=env,
+        run=run,
+        log=log,
+        staging=staging,
     )
     log("\n>> verify: every image must record what it was built from")
-    staging = _staging_tag(tag)
     aliases = {
         f"{spec.base}:{tag}": f"{spec.base}:{staging}"
         for spec in plan.images
@@ -1503,7 +1639,7 @@ def run_plan(
     # step later.
     done: list[_Staged] = []
     published: list[str] = []
-    pub = PublishedTags((), {})
+    pub = PublishedTags((), {}, {})
     try:
         log(f"\n>> publish tags -> :{tag}")
         pub = publish_tags(staged_tags, tag, run=run, log=log)
