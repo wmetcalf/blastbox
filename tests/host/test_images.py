@@ -887,3 +887,96 @@ def test_the_dry_run_reports_the_size_it_will_actually_build(
     # with an override the operator's number is what runs, and is what is shown
     out2 = describe(plan, "t1", {**env, "ROOTFS_MIB": "6000"})
     assert " 6000 MiB" in out2 and "keeping" not in out2, out2
+
+
+def test_a_literal_brace_in_a_default_is_not_a_nesting_level(tmp_path: Path) -> None:
+    """`${DIR:-/tmp/{scratch}/cache` is valid shell whose `{` is literal.
+
+    Counting it as a nesting level left the expression unterminated, so the
+    destination or build arg using it was refused outright.
+    """
+    from blastbox.host.images import _expand
+
+    assert _expand("${DIR:-/tmp/{scratch}/cache", {"DIR": "/srv"}) == "/srv/cache"
+    assert _expand("${DIR:-/tmp/{scratch}/cache", {}) == "/tmp/{scratch/cache"
+    # a genuine nested expansion still works
+    assert _expand("${A:-${B:-/tmp}}/x", {"B": "/srv"}) == "/srv/x"
+
+
+def test_a_literal_dollar_in_a_value_is_not_reported_unresolved(tmp_path: Path) -> None:
+    """Scanning the RESULT for `$` cannot tell an unset placeholder from a
+    literal dollar in data — and a token containing one was then reported
+    unresolved and aborted the build, turning corruption into a hard failure.
+    """
+    from blastbox.host.images import unresolved_build_args
+
+    text = TITANARUM.replace(
+        'build_args = { JDK_BUILD_IMAGE',
+        'build_args = { TOKEN = "$SECRET", JDK_BUILD_IMAGE',
+        1,
+    )
+    plan = load_plan(_plan(tmp_path, text))
+    env = {"SECRET": "abc$HOME", "JDK_BUILD_IMAGE": "x", "ZXING_BUILD_IMAGE": "y"}
+    assert unresolved_build_args(plan, env) == []
+    # a genuinely unset variable is still reported, by NAME
+    problems = unresolved_build_args(plan, {})
+    assert problems and "SECRET" in problems[0]
+
+
+def test_a_boolean_build_arg_keeps_tomls_spelling(tmp_path: Path) -> None:
+    """`str(False)` hands docker `False`; a Dockerfile comparing against
+    `false` then sees something else. Docker passes these verbatim."""
+    text = TITANARUM.replace(
+        'build_args = { JDK_BUILD_IMAGE',
+        'build_args = { FEATURE = false, JDK_BUILD_IMAGE',
+        1,
+    )
+    plan = load_plan(_plan(tmp_path, text))
+    assert plan.images[0].build_args["FEATURE"] == "false"
+
+
+def test_a_non_utf8_plan_is_a_plan_error(tmp_path: Path) -> None:
+    """UnicodeDecodeError is neither OSError nor TOMLDecodeError, so it escaped
+    to the CLI as a traceback instead of the normal validation message."""
+    d = tmp_path / "repo"
+    d.mkdir(parents=True)
+    (d / SPEC_NAME).write_bytes(b'[engine]\nname = "\xff\xfe"\n')
+    with pytest.raises(PlanError) as e:
+        load_plan(d)
+    assert "UTF-8" in str(e.value)
+
+
+def test_destinations_that_normalise_to_one_path_collide(tmp_path: Path, monkeypatch) -> None:
+    """`/srv/images/rootfs` and `/srv/images/./rootfs` are the same artifact and
+    were two different dictionary keys, so the second silently overwrote the
+    first while the dry run reported success."""
+    monkeypatch.setenv("TITANARUM_FC_DIR", "/srv/images")
+    monkeypatch.setenv("OTHER", "/srv/images/.")
+    extra = (
+        '\n[[rootfs]]\nkind = "ext4"\nimage = "titanarum-base"\n'
+        'dest = "$OTHER/titanarum-rootfs.ext4"\nsize_mib = 512\n'
+    )
+    with pytest.raises(PlanError) as e:
+        load_plan(_plan(tmp_path, TITANARUM + extra))
+    assert "would overwrite" in str(e.value)
+
+
+def test_an_over_long_upstream_tag_is_refused(tmp_path: Path) -> None:
+    """docker's grammar caps a tag at 128, so the dry run was reporting a plan
+    the build would then reject on its own base."""
+    long_tag = "a" * 129
+    text = TITANARUM.replace('base = "eclipse-temurin:25-jre"', f'base = "ubuntu:{long_tag}"', 1)
+    with pytest.raises(PlanError):
+        load_plan(_plan(tmp_path, text))
+    ok = TITANARUM.replace('base = "eclipse-temurin:25-jre"', f'base = "ubuntu:{"a" * 128}"', 1)
+    assert load_plan(_plan(tmp_path, ok))
+
+
+def test_a_relative_context_resolves_against_the_plan_root(tmp_path: Path) -> None:
+    """docker resolves a relative context against the CALLER's directory, so
+    `COPY` reads from the wrong repository — or finds nothing."""
+    from blastbox.host.images import build_command
+
+    plan = load_plan(_plan(tmp_path, TITANARUM))
+    argv = build_command(plan.images[0], "t1", [], "u:1", {}, plan)
+    assert argv[-1] == str(plan.root), argv[-1]
