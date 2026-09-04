@@ -415,7 +415,11 @@ def _source_state(repo: Path) -> str:
         capture_output=True, text=True, check=False,
     )
     status = subprocess.run(  # noqa: S603
-        ["git", "-C", str(repo), "status", "--porcelain"],
+        # --untracked-files=normal explicitly, exactly as stamp.git_revision
+        # does: a repo or global config carrying status.showUntrackedFiles=no
+        # otherwise hides a new build input created while docker was reading
+        # the context, and the before/after comparison sees no change at all.
+        ["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=normal"],
         capture_output=True, text=True, check=False,
     )
     if head.returncode != 0:
@@ -906,6 +910,17 @@ def stage_rootfs(
     as_root = _can_be_root()
     priv = _root_prefix() if (as_root or need_sudo) else []
 
+    # BEFORE any directory is created. `_ensure_dir`/`_stage_dir` raise a bare
+    # PermissionError under a protected destination, and the CLI catches only
+    # BuildError -- so the very environment this refusal exists for got a
+    # traceback instead of the actionable message.
+    if extract is None and not as_root:
+        raise BuildError(
+            f"cannot extract {image} with ownership preserved: this process is "
+            "not root and has no passwordless sudo. An unprivileged extraction "
+            "reassigns every file to the invoking user and drops setuid bits, "
+            "so the published rootfs would not be the image that was verified."
+        )
     _ensure_dir(dest.parent, priv, run)
     staging = _stage_dir(dest.parent, priv, run)
     # Bound BEFORE the try: the cleanup handler reads it, and an exception from

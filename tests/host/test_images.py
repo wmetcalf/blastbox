@@ -1037,3 +1037,22 @@ def test_a_symlinked_parent_is_not_a_false_collision(tmp_path: Path, monkeypatch
     plan = load_plan(_plan(tmp_path, TITANARUM + extra))
     dests = {r.resolved_dest() for r in plan.rootfs if r.kind == "ext4"}
     assert len(dests) == 2, dests
+
+
+def test_a_secret_build_argument_is_not_printed(tmp_path: Path) -> None:
+    """The plan holds a variable REFERENCE; describe() resolved it and printed
+    the value, so a token reached terminal history and CI logs even though the
+    spec never contained it."""
+    from blastbox.host.images import describe
+
+    text = TITANARUM.replace(
+        'build_args = { JDK_BUILD_IMAGE',
+        'build_args = { REGISTRY_TOKEN = "$TOK", JDK_BUILD_IMAGE',
+        1,
+    )
+    plan = load_plan(_plan(tmp_path, text))
+    out = describe(plan, "t1", {"TOK": "hunter2-super-secret"})
+    assert "hunter2-super-secret" not in out, out
+    assert "REGISTRY_TOKEN=<redacted>" in out, out
+    # a non-secret name is still shown, because that is what makes a dry run useful
+    assert "JDK_BUILD_IMAGE=eclipse-temurin:25-jdk" in out

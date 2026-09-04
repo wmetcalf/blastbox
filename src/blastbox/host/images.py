@@ -635,6 +635,15 @@ def load_plan(root: Path | str) -> Plan:
     return Plan(engine=engine, images=tuple(images), rootfs=tuple(rootfs), root=root)
 
 
+# Names whose VALUES must never be printed. Matched on the name because that
+# is what a plan controls: the value is whatever the environment holds.
+_SECRET_RE = re.compile(r"(?i)(secret|token|password|passwd|credential|api[_-]?key|auth)")
+
+
+def _is_secret(name: str) -> bool:
+    return bool(_SECRET_RE.search(name))
+
+
 def _arg_value(value: object) -> str:
     """A build-arg value as docker will receive it.
 
@@ -909,7 +918,15 @@ def describe(plan: Plan, tag: str, env: dict[str, str] | None = None) -> str:
             rendered = []
             for k, v in sorted(spec.build_args.items()):
                 shown = _expand(v, env)
-                mark = " [UNRESOLVED]" if "$" in shown else ""
+                # Asked of the TEMPLATE: a literal `$` in a value is data, not
+                # a hole, and flagging it would mislabel a token as unresolved.
+                mark = " [UNRESOLVED]" if unresolved_names(v, env) else ""
+                if _is_secret(k) and shown != v:
+                    # The plan holds a variable REFERENCE; resolving it here
+                    # put the value into terminal history and CI logs, even
+                    # though the spec itself never contained the secret. The
+                    # NAME and the fact it resolved are what an operator needs.
+                    shown = "<redacted>"
                 rendered.append(f"--build-arg {k}={shown}{mark}")
             where += " " + " ".join(rendered)
         lines.append(
