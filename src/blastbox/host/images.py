@@ -581,6 +581,7 @@ def build_command(
     stamp_flags: list[str],
     base_ref: str | None = None,
     env: dict[str, str] | None = None,
+    plan: Plan | None = None,
 ) -> list[str]:
     """The `docker build` argv for one image.
 
@@ -596,7 +597,14 @@ def build_command(
     word-split into loose docker arguments, and the failure surfaces as docker's
     usage message rather than anything about the stamp.
     """
-    argv = ["docker", "build", "-f", spec.dockerfile, *stamp_flags]
+    # `-f` is resolved by docker against the CWD, NOT against the build
+    # context, so a Dockerfile living in another tree has to be passed
+    # resolved. Passing it raw looks for the consumer repo's path instead:
+    # missing in the ordinary case, and -- if a file of the same name happens
+    # to exist there -- it builds THAT one under the intended tag, which is
+    # the silent-wrong-image class this module exists to close.
+    df = str(dockerfile_path(plan, spec, env)) if plan is not None else spec.dockerfile
+    argv = ["docker", "build", "-f", df, *stamp_flags]
     already = any(f.startswith(f"{spec.base_arg}=") for f in stamp_flags)
     if base_ref and not already:
         argv += ["--build-arg", f"{spec.base_arg}={base_ref}"]

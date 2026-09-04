@@ -694,3 +694,37 @@ def test_load_plan_accepts_the_spec_file_itself(tmp_path: Path) -> None:
 def test_load_plan_still_accepts_the_directory(tmp_path: Path) -> None:
     d = _plan(tmp_path, TITANARUM)
     assert load_plan(d).root == d
+
+
+def test_build_command_resolves_a_dockerfile_from_another_tree(tmp_path: Path) -> None:
+    """docker resolves `-f` against the CWD, not the build context.
+
+    Passing it raw looks for the consumer repo's copy of the path — missing in
+    the ordinary case, and if a file of that name does exist there, it silently
+    builds the WRONG Dockerfile under the intended tag.
+    """
+    from blastbox.host.images import build_command
+
+    text = TITANARUM + (
+        '\n[[image]]\nname = "titanarum-warm"\n'
+        'dockerfile = "deploy/gvisor/Dockerfile.titanarum"\n'
+        'base = "titanarum-base"\ncontext = "$BLASTBOX_SRC"\n'
+    )
+    plan = load_plan(_plan(tmp_path, text))
+    env = {"BLASTBOX_SRC": "/srv/blastbox"}
+    warm = next(i for i in plan.images if i.name == "titanarum-warm")
+    argv = build_command(warm, "t1", [], "titanarum-base:t1", env, plan)
+    assert argv[argv.index("-f") + 1] == "/srv/blastbox/deploy/gvisor/Dockerfile.titanarum"
+    assert argv[-1] == "/srv/blastbox"
+
+
+def test_build_command_resolves_a_same_tree_dockerfile_too(tmp_path: Path) -> None:
+    """Resolved in the ordinary case as well, so the argv does not depend on
+    which directory it is run from."""
+    from blastbox.host.images import build_command
+
+    plan = load_plan(_plan(tmp_path, TITANARUM))
+    argv = build_command(plan.images[0], "t1", [], "u:1", {}, plan)
+    assert argv[argv.index("-f") + 1] == str(
+        plan.root / "deploy/docker/Dockerfile.titanarum-base"
+    )
