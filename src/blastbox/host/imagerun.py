@@ -112,7 +112,11 @@ def build_plan(
     is how a "rebuild" ships a mixture of two builds under one tag.
     """
     run = run or _default_runner
-    env = dict(os.environ) if env is None else env
+    # The resolved version is put in the environment the plan expands against,
+    # so a spec can write `BLASTBOX_VERSION = "$BLASTBOX_VERSION"` and keep one
+    # source of truth instead of a literal that drifts from the pin.
+    env = {**(dict(os.environ) if env is None else env),
+           "BLASTBOX_VERSION": blastbox_version}
 
     problems = _images.missing_dockerfiles(plan, env) + _images.arg_problems(plan, env)
     if problems:

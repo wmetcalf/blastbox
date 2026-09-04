@@ -608,8 +608,13 @@ def build_command(
     already = any(f.startswith(f"{spec.base_arg}=") for f in stamp_flags)
     if base_ref and not already:
         argv += ["--build-arg", f"{spec.base_arg}={base_ref}"]
+    # Values are EXPANDED. A spec that had to write the blastbox version as a
+    # literal would carry a second copy of the pyproject pin, and the two would
+    # drift -- which is the failure this whole module exists to catch, one
+    # level up. `BLASTBOX_VERSION = "$BLASTBOX_VERSION"` keeps one source.
+    env_map = dict(os.environ) if env is None else env
     for key, value in sorted(spec.build_args.items()):
-        argv += ["--build-arg", f"{key}={value}"]
+        argv += ["--build-arg", f"{key}={_expand(value, env_map)}"]
     context = _expand(spec.context, dict(os.environ) if env is None else env)
     argv += ["-t", spec.tagged(tag), context]
     return argv
@@ -634,7 +639,8 @@ def describe(plan: Plan, tag: str, env: dict[str, str] | None = None) -> str:
             where += f" [stamped from {src}]"
         if spec.build_args:
             where += " " + " ".join(
-                f"--build-arg {k}={v}" for k, v in sorted(spec.build_args.items())
+                f"--build-arg {k}={_expand(v, env)}"
+                for k, v in sorted(spec.build_args.items())
             )
         lines.append(
             f"  build {spec.tagged(tag)}  <- {base_ref} ({kind}) "

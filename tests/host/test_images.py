@@ -728,3 +728,19 @@ def test_build_command_resolves_a_same_tree_dockerfile_too(tmp_path: Path) -> No
     assert argv[argv.index("-f") + 1] == str(
         plan.root / "deploy/docker/Dockerfile.titanarum-base"
     )
+
+
+def test_build_arg_values_are_expanded(tmp_path: Path) -> None:
+    """A spec that had to write the blastbox version as a literal would carry a
+    second copy of the pyproject pin, and the two would drift — the very
+    failure this module exists to catch, one level up."""
+    from blastbox.host.images import build_command
+
+    text = TITANARUM.replace(
+        'build_args = { JDK_BUILD_IMAGE',
+        'build_args = { BLASTBOX_VERSION = "$BLASTBOX_VERSION", JDK_BUILD_IMAGE',
+        1,
+    )
+    plan = load_plan(_plan(tmp_path, text))
+    argv = build_command(plan.images[0], "t1", [], "u:1", {"BLASTBOX_VERSION": "0.1.34"}, plan)
+    assert "BLASTBOX_VERSION=0.1.34" in argv
