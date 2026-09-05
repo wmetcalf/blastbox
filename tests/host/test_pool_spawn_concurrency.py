@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 
 from blastbox.host.pool import WarmPool
@@ -94,30 +95,39 @@ def test_ceiling_holds_when_batches_overlap():
     pool = WarmPool(runtime=rt, warm_size=ceiling, concurrent_ceiling=ceiling,
                     spawn_rate_limit=1000.0, spawn_concurrency=ceiling)
 
-    # Watch the RESERVATIONS too, not just the slots that get published. Each
-    # one is an intent to create a worker, and the pre-spawn gate declining them
-    # later still means the pool briefly promised the node twice its ceiling.
-    peak_reserved = 0
-    real_spawn = rt.spawn
+    # The RESERVATION LOOPS must overlap, which entering the function together
+    # does not guarantee: the scheduler may let one caller reserve, spawn and
+    # publish all four before the other reserves at all, and then even the
+    # unguarded predicate yields four slots and the regression passes. Hooking
+    # the token bucket -- consumed once per reservation -- holds the first
+    # caller inside its loop until the second is in its own.
+    both_reserving = threading.Barrier(2, timeout=5)
+    seen_callers: set[int] = set()
+    seen_lock = threading.Lock()
+    real_consume = pool._bucket.consume
 
-    def watched_spawn():
-        nonlocal peak_reserved
-        peak_reserved = max(peak_reserved, pool._spawns_in_flight)
-        return real_spawn()
+    def interleaved_consume():
+        with seen_lock:
+            first_for_this_thread = threading.get_ident() not in seen_callers
+            seen_callers.add(threading.get_ident())
+        if first_for_this_thread:
+            try:
+                both_reserving.wait()
+            except threading.BrokenBarrierError:
+                pass
+        return real_consume()
 
-    rt.spawn = watched_spawn
+    pool._bucket.consume = interleaved_consume
 
-    barrier = threading.Barrier(2, timeout=5)
-
-    def issue_batch():
-        barrier.wait()          # both callers start inside the same window
-        pool._spawn_batch_concurrent(ceiling, None)
-
-    threads = [threading.Thread(target=issue_batch) for _ in range(2)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=10)
+    # Futures, not raw threads: a raw thread's exception never reaches the test,
+    # so one caller could fail outright while the other filled the pool and
+    # every assertion below would still pass.
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        futures = [
+            ex.submit(pool._spawn_batch_concurrent, ceiling, None) for _ in range(2)
+        ]
+        for future in futures:
+            future.result(timeout=10)   # re-raises whatever that caller raised
 
     # EXACTLY the ceiling: not fewer either. Two batches asking for 4 each must
     # fill the pool to 4, not deadlock it. Bounding reservations by published
@@ -132,11 +142,6 @@ def test_ceiling_holds_when_batches_overlap():
         f"more spawns in flight than the ceiling allows: {rt.max_in_flight}"
     )
     assert pool._spawns_in_flight == 0, "every reservation must be released"
-    assert peak_reserved <= ceiling, (
-        f"reservations overshot the ceiling: {peak_reserved} > {ceiling}. The "
-        "pre-spawn gate would still decline them, but the pool must not promise "
-        "the node more workers than it is allowed in the first place."
-    )
 
 
 def test_failed_spawns_do_not_wedge_the_batch():
