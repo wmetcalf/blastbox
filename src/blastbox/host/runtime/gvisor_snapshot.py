@@ -123,7 +123,20 @@ class _StderrSink:
         self._thread = threading.Thread(
             target=self._drain, name="runsc-stderr-drain", daemon=True
         )
-        self._thread.start()
+        try:
+            self._thread.start()
+        except BaseException:
+            # `Thread.start()` raises RuntimeError once the host is out of threads -- and the
+            # pipe is already allocated by then. Without this, every async build retry would
+            # leak TWO descriptors and compound the exhaustion toward EMFILE, i.e. the failure
+            # mode would feed itself (codex, #153). Nothing is draining, so close both ends.
+            for fd in (self._read_fd, self.write_fd):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            self._closed = True
+            raise
 
     def _drain(self) -> None:
         try:

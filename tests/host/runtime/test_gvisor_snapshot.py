@@ -1223,3 +1223,38 @@ def test_a_successful_boot_leaves_no_capture_file_behind(tmp_path, monkeypatch):
     leftovers = [p for b in bundles for p in b.glob("runsc-stderr-*")]
     assert not leftovers, f"a successful boot left a stderr capture file behind: {leftovers}"
     assert handle is not None
+
+
+def test_a_sink_whose_drain_cannot_start_leaks_no_descriptors():
+    """`Thread.start()` raises once the host is out of threads -- after `os.pipe()` has already
+    allocated both ends.
+
+    Leaking them would make the failure feed itself: every asynchronous build retry would burn
+    two more descriptors and march the process toward EMFILE (codex, #153).
+    """
+    import os as _os
+    import threading as _th
+
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    def _fd_count() -> int:
+        return len(_os.listdir("/proc/self/fd"))
+
+    class _RefusingThread(_th.Thread):
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    before = _fd_count()
+    real = gs.threading.Thread
+    gs.threading.Thread = _RefusingThread          # type: ignore[misc]
+    try:
+        for _ in range(20):
+            with pytest.raises(RuntimeError):
+                gs._StderrSink()
+    finally:
+        gs.threading.Thread = real                 # type: ignore[misc]
+
+    after = _fd_count()
+    assert after <= before + 2, (
+        f"20 refused sinks leaked descriptors: {before} -> {after}"
+    )
