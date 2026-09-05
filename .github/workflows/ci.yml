@@ -68,17 +68,23 @@ jobs:
           make -C /tmp/nsjail -j"$(nproc)"
           sudo install -m 0755 /tmp/nsjail/nsjail /usr/local/bin/nsjail
           nsjail --help | head -1
-      - name: Grant userns to bwrap and nsjail (scoped AppArmor profiles)
+      - name: Grant userns to the sandbox binaries (scoped AppArmor profiles)
         # Ubuntu 24.04 sets kernel.apparmor_restrict_unprivileged_userns=1, which blocks the
         # user namespaces both backends need -- so without this the smoke-run tests and the
         # selector tests skip and the job is green having exercised neither. The repo already
         # ships scoped per-binary profiles for exactly this (deploy/apparmor/README.md); they
-        # grant `userns` to these two binaries only, leaving the host-wide restriction intact.
+        # grant `userns` to those binaries only, leaving the host-wide restriction intact.
         run: |
-          sudo cp deploy/apparmor/blastbox-bwrap deploy/apparmor/blastbox-nsjail /etc/apparmor.d/
-          sudo apparmor_parser -r -W /etc/apparmor.d/blastbox-bwrap
-          sudo apparmor_parser -r -W /etc/apparmor.d/blastbox-nsjail
-          sudo aa-status | grep blastbox
+          # EVERY shipped profile, by glob rather than by name: a profile added to
+          # deploy/apparmor/ and forgotten here is one nothing ever parses -- which is how
+          # blastbox-runsc came to be missing until rootless runsc hit the same restriction.
+          for p in deploy/apparmor/blastbox-*; do
+            sudo cp "$p" /etc/apparmor.d/
+            sudo apparmor_parser -r -W "/etc/apparmor.d/$(basename "$p")"
+          done
+          # Name AND mode. `aa-status | grep` prints the bare name -- it cannot show the mode,
+          # so it cannot verify that these loaded as intended (codex, #161).
+          sudo grep -E '^blastbox-' /sys/kernel/security/apparmor/profiles
           # GATE, do not merely report. `... || echo` turns a failed probe into a green step,
           # and pytest then turns the same failure into skips -- so the job created to stop
           # tests skipping silently would itself go green having skipped them. That is the

@@ -1,0 +1,26 @@
+abi <abi/4.0>,
+include <tunables/global>
+
+# Grant ONLY the `userns` capability to runsc, so gVisor can create the unprivileged user
+# namespace it needs when run ROOTLESS on Ubuntu 24.04+ (where
+# kernel.apparmor_restrict_unprivileged_userns=1 blocks them by default). SCOPED to this one
+# binary — the host-wide restriction stays in force for every other process.
+#
+# Without this, a rootless `runsc run` gets far enough to create the namespace and then dies
+# starting its gofer, because AppArmor transitions the new userns into the `unprivileged_userns`
+# profile, which denies exec of /proc/self/exe. The kernel says so plainly (toolz2, 2026-09-05):
+#
+#   apparmor="AUDIT"  operation="userns_create" profile="unconfined" comm="runsc"
+#                     target="unprivileged_userns"
+#   apparmor="DENIED" operation="exec" profile="unprivileged_userns" name="/proc/self/exe"
+#                     comm="runsc" requested_mask="x" denied_mask="x"
+#
+# and the failure surfaces as `cannot create gofer process: gofer: fork/exec /proc/self/exe:
+# permission denied`, which does not mention AppArmor at all.
+#
+# Adjust the path to match your install (`which runsc`); Docker installs it at /usr/bin/runsc.
+#
+# Load:  sudo cp blastbox-runsc /etc/apparmor.d/ && sudo apparmor_parser -r -W /etc/apparmor.d/blastbox-runsc
+profile blastbox-runsc /usr/bin/runsc flags=(unconfined) {
+  userns,
+}

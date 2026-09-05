@@ -16,14 +16,53 @@ host-wide restriction stays in force for everything else. Reboot-persistent.
 sudo cp blastbox-bwrap blastbox-nsjail /etc/apparmor.d/
 sudo apparmor_parser -r -W /etc/apparmor.d/blastbox-bwrap
 sudo apparmor_parser -r -W /etc/apparmor.d/blastbox-nsjail
-sudo aa-status | grep blastbox          # verify both are loaded
+
+# ONLY if you run runsc rootless -- see below. Do not copy this file otherwise: everything in
+# /etc/apparmor.d/ is loaded at boot and on a full policy reload, so copying it "for later"
+# grants the exception now, whatever the parser line beside it says.
+sudo cp blastbox-runsc /etc/apparmor.d/ && sudo apparmor_parser -r -W /etc/apparmor.d/blastbox-runsc
+
+sudo grep -E '^blastbox-' /sys/kernel/security/apparmor/profiles   # name AND mode of each
 ```
 
-Verify it took effect (test the **binary**, not `unshare` — the grant is per-binary):
+`blastbox-runsc` is needed only for **rootless** runsc; run as root (the usual Docker
+`--runtime=runsc` path) it is exempt from the restriction and the profile is unnecessary.
+Without it, a rootless `runsc run` fails with
+
+```
+cannot create gofer process: gofer: fork/exec /proc/self/exe: permission denied
+```
+
+which never mentions AppArmor. The kernel does, and is worth checking first
+(`sudo dmesg -T | grep -i apparmor`):
+
+```
+apparmor="DENIED" operation="exec" profile="unprivileged_userns" name="/proc/self/exe" comm="runsc"
+```
+
+Verify it took effect (test the **binary**, not `unshare` — the grant is per-binary, so a
+passing check for one binary says nothing about another, and the profiles match on the path you
+edited above):
 
 ```sh
 bwrap --unshare-user --uid 0 --ro-bind / / -- /bin/true && echo "bwrap userns OK"
+nsjail -Mo --user 0 --group 0 -R / -- /bin/true         && echo "nsjail userns OK"
+runsc --rootless do /bin/true                          && echo "runsc rootless userns OK"
 ```
+
+`-R /` is not decoration: without it nsjail gives the child an empty mount namespace, so
+`/bin/true` does not exist inside and the check fails with `Couldn't launch the child process`
+(exit 255) on a host where the grant is perfectly fine. All three lines above were run.
+
+The runsc line is the one to run if you installed `blastbox-runsc`. Without the grant it exits
+**128** with
+
+```
+Error executing inside namespace: re-executing self: fork/exec /proc/self/exe: permission denied
+```
+
+(measured on a host with `apparmor_restrict_unprivileged_userns=1` and no `blastbox-runsc`
+loaded), which is the same denial that surfaces from a real run as `cannot create gofer process`.
 
 ## 2. Run the tests/worker as root
 
@@ -43,7 +82,8 @@ without lowering it for anything else.
 
 **Not needed for** `firecracker` (a KVM hypervisor — no user namespaces), `nono` (Landlock needs no
 userns), or the `container` backend (trusts the enclosing OCI boundary). It is needed for the
-`bwrap`/`nsjail` backends and for `runsc` run rootless. See **[../../docs/DEPLOYMENT.md](../../docs/DEPLOYMENT.md)**.
+`bwrap`/`nsjail` backends and for `runsc` run rootless — which is why there is a profile for each
+of those three, `runsc` included. See **[../../docs/DEPLOYMENT.md](../../docs/DEPLOYMENT.md)**.
 
 ---
 
