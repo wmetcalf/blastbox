@@ -16,6 +16,7 @@ kwarg-only tests on the gVisor side).
 
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import time
@@ -429,3 +430,37 @@ class TestWhatTheBoundsChanged:
                 "the workdir was removed although firecracker could not be confirmed gone -- "
                 "pulling the disk and sockets out from under a live microVM"
             )
+
+    def test_the_cap_holds_under_concurrency(self, tmp_path, stalled_source, monkeypatch):
+        """Check-then-act does not bound anything in the concurrency the cap exists for.
+
+        With BLASTBOX_POOL_SPAWN_CONCURRENCY above the cap, every concurrent copy could observe
+        zero stuck workers and start anyway. All threads are released from a barrier here so
+        they contend on that window deliberately (codex, #154).
+        """
+        import threading as _th
+
+        from blastbox.errors import HostDiskTimeout
+        from blastbox.host.runtime import fc_snapshot_launcher as fl
+
+        monkeypatch.setattr(fl, "_ABANDONED_COPIES", [])
+        monkeypatch.setattr(fl, "_MAX_ABANDONED_COPIES", 2)
+
+        n = 16
+        start = _th.Barrier(n)
+
+        def _attempt(i: int) -> None:
+            start.wait(10)
+            with contextlib.suppress(HostDiskTimeout):
+                fl._copy_with_deadline(stalled_source, tmp_path / f"d{i}.ext4", 0.2)
+
+        threads = [_th.Thread(target=_attempt, args=(i,), daemon=True) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        alive = [t for t in fl._ABANDONED_COPIES if t.is_alive()]
+        assert len(alive) <= 2, (
+            f"{len(alive)} copy workers started against a cap of 2: the check was not atomic"
+        )

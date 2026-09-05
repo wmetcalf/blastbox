@@ -399,15 +399,6 @@ def _copy_with_deadline(src: Path, dst: Path, timeout_s: float, *, chunk: int = 
     # (host-resource failures are deliberately exempt from the failure streaks). Past the cap,
     # refuse to start another: one stalled mount should not cost a thread and two fds per
     # retry, for the life of the process.
-    with _ABANDONED_LOCK:
-        stuck = sum(1 for t in _ABANDONED_COPIES if t.is_alive())
-        _ABANDONED_COPIES[:] = [t for t in _ABANDONED_COPIES if t.is_alive()]
-    if stuck >= _MAX_ABANDONED_COPIES:
-        raise HostDiskTimeout(
-            cmd=f"copy {src} -> {dst} (refused: {stuck} earlier copies still stuck on this host)",
-            timeout=timeout_s,
-        )
-
     done: "list[BaseException | None]" = []
 
     def _copy() -> None:
@@ -423,13 +414,30 @@ def _copy_with_deadline(src: Path, dst: Path, timeout_s: float, *, chunk: int = 
             done.append(exc)
 
     worker = _th.Thread(target=_copy, name="fc-outdisk-copy", daemon=True)
+
+    # PRUNE, CHECK AND RESERVE IN ONE CRITICAL SECTION. Checking the count and then starting
+    # the worker is check-then-act: with BLASTBOX_POOL_SPAWN_CONCURRENCY above the cap, every
+    # concurrent copy could observe zero stuck workers and start anyway, so the cap would not
+    # hold in exactly the concurrency it exists for (codex, #154). Reserving the slot by
+    # registering the worker BEFORE starting it makes the bound atomic; a worker that finishes
+    # is pruned by is_alive() on the next call, so a healthy host never accumulates.
+    with _ABANDONED_LOCK:
+        _ABANDONED_COPIES[:] = [t for t in _ABANDONED_COPIES if t.is_alive()]
+        stuck = len(_ABANDONED_COPIES)
+        if stuck >= _MAX_ABANDONED_COPIES:
+            raise HostDiskTimeout(
+                cmd=f"copy {src} -> {dst} "
+                    f"(refused: {stuck} earlier copies still stuck on this host)",
+                timeout=timeout_s,
+            )
+        _ABANDONED_COPIES.append(worker)
+
     worker.start()
     worker.join(timeout=timeout_s)
     if not done:
-        with _ABANDONED_LOCK:
-            _ABANDONED_COPIES.append(worker)
-        # Still running: the filesystem is stalled. Remove the partial destination -- a
-        # truncated outdisk is worse than none, since the guest would mount it.
+        # Still running: the filesystem is stalled. The worker stays registered above, holding
+        # its cap slot until it either finishes or the process ends. Remove the partial
+        # destination -- a truncated outdisk is worse than none, since the guest would mount it.
         with contextlib.suppress(OSError):
             dst.unlink()
         raise HostDiskTimeout(cmd=f"copy {src} -> {dst}", timeout=timeout_s)
