@@ -1,3 +1,4 @@
+import pathlib
 import time
 import json
 from pathlib import Path
@@ -1432,3 +1433,87 @@ class TestTheDrainThreadsAreBounded:
             f"5 refused drains left {len(gs._LIVE_SINKS)} reservations behind; the cap would "
             "strangle a host that has recovered"
         )
+
+    def test_a_reservation_survives_a_concurrent_prune(self, monkeypatch):
+        """A reservation is appended BEFORE its thread starts, and an unstarted thread is not
+        alive -- so pruning on liveness alone let a concurrent constructor delete a reservation
+        that had been made but not started, and both would start drains (codex, #155).
+
+        Forced deterministically: the reservation is placed by hand, then a second constructor
+        runs its prune. Counting only threads that remain alive -- which my concurrency test
+        did -- cannot see this.
+        """
+        import threading as _th
+
+        from blastbox.host.runtime import gvisor_snapshot as gs
+
+        reserved = _th.Thread(target=lambda: None, daemon=True)   # reserved, never started
+        monkeypatch.setattr(gs, "_LIVE_SINKS", [reserved])
+        monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 1)
+
+        sink = gs._StderrSink()      # its prune must NOT evict the reservation
+        try:
+            assert sink.degraded, (
+                "a concurrent prune evicted a reserved-but-unstarted drain, so this launch got "
+                "a slot the cap had already given away"
+            )
+        finally:
+            sink.close_write()
+
+    def test_a_refused_start_frees_its_reservation(self, monkeypatch):
+        """The flip side of keeping unstarted reservations: one that never starts must be
+        released explicitly, or a host out of threads loses capacity permanently."""
+        import threading as _th
+
+        from blastbox.host.runtime import gvisor_snapshot as gs
+
+        monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+        monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 2)
+
+        class _RefusingThread(_th.Thread):
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        real = gs.threading.Thread
+        gs.threading.Thread = _RefusingThread          # type: ignore[misc]
+        try:
+            for _ in range(5):
+                with pytest.raises(RuntimeError):
+                    gs._StderrSink()
+        finally:
+            gs.threading.Thread = real                 # type: ignore[misc]
+
+        assert not gs._LIVE_SINKS, (
+            f"{len(gs._LIVE_SINKS)} refused drains kept their reservations; the cap would "
+            "strangle a host that has recovered"
+        )
+
+
+def test_a_sweep_that_raises_does_not_lose_the_batch(tmp_path, monkeypatch):
+    """`rmtree` can RAISE rather than report through onerror -- worker-created nesting deep
+    enough makes recursive removal hit RecursionError.
+
+    The ledger has already been emptied by then, so an escaping exception used to lose the
+    current entry AND every unprocessed one, permanently. The pre-batch implementation iterated
+    the live list and could not lose them (codex, #155).
+    """
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    a, b, c = (str(tmp_path / n) for n in ("a", "b", "c"))
+    for d in (a, b, c):
+        pathlib.Path(d).mkdir()
+    ledger = [a, b, c]
+
+    def _rmtree(path, onerror=None, **kw):
+        if str(path) == b:
+            raise RecursionError("maximum recursion depth exceeded")
+        return None                       # a and c "succeed"
+
+    monkeypatch.setattr(gs.shutil, "rmtree", _rmtree)
+
+    with pytest.raises(RecursionError):
+        gs._retry_stranded_partials(ledger)
+
+    assert b in ledger, "the entry that raised was lost"
+    assert c in ledger, "every entry after the raise was lost"
+    assert a not in ledger, "an entry that was successfully removed should not come back"

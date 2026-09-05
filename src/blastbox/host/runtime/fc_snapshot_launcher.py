@@ -146,22 +146,31 @@ def _retry_stranded_partials(stranded: "list[str]") -> None:
         batch = list(stranded)
         del stranded[:]
     still: list[str] = []
-    for leftover in batch:
-        p = Path(leftover)
-        try:
-            if p.is_dir():
-                # base-* workdirs land here too: a failed cleanup parks the whole directory.
-                errs: list[str] = []
-                shutil.rmtree(p, onerror=lambda fn, q, exc: errs.append(str(q)))
-                if errs:
-                    still.append(leftover)
-            else:
-                p.unlink(missing_ok=True)
-        except OSError:
-            still.append(leftover)
-    with _STRANDED_LOCK:
-        # PREPEND what is still stuck, keeping anything appended while we swept.
-        stranded[:0] = still
+    done = 0
+    try:
+        for leftover in batch:
+            path = Path(leftover)
+            try:
+                if path.is_dir():
+                    # base-* workdirs land here too: a failed cleanup parks the directory.
+                    errs: list[str] = []
+                    shutil.rmtree(path, onerror=lambda fn, q, exc: errs.append(str(q)))
+                    if errs:
+                        still.append(leftover)
+                else:
+                    path.unlink(missing_ok=True)
+            except OSError:
+                still.append(leftover)
+            done += 1
+    finally:
+        # PUT BACK whatever we did not finish, and PREPEND it so anything appended while we
+        # swept survives. `rmtree` can RAISE rather than report through onerror -- a directory
+        # nested deep enough makes recursive removal hit RecursionError -- and the ledger is
+        # already empty by then, so an escaping exception would lose the current entry AND
+        # every unprocessed one, permanently. The pre-batch implementation iterated the live
+        # list and could not lose them; taking a batch has to restore what it took (codex, #155).
+        with _STRANDED_LOCK:
+            stranded[:0] = still + batch[done:]
 
 
 class _Handle:

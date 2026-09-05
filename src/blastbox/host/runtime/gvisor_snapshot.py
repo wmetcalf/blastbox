@@ -147,7 +147,14 @@ class _StderrSink:
             target=self._drain, name="runsc-stderr-drain", daemon=True
         )
         with _SINK_LOCK:
-            _LIVE_SINKS[:] = [t for t in _LIVE_SINKS if t.is_alive()]
+            # PRUNE ONLY WHAT ACTUALLY RAN. A reservation is appended before its thread is
+            # started, and an unstarted thread reports is_alive() == False -- so pruning on
+            # liveness alone let a CONCURRENT constructor delete a reservation that had been
+            # made but not yet started, and both would then start drains. The cap was defeated
+            # by the very window the reservation exists to close (codex, #155).
+            _LIVE_SINKS[:] = [
+                t for t in _LIVE_SINKS if t.is_alive() or not getattr(t, "_bb_started", False)
+            ]
             if len(_LIVE_SINKS) >= _MAX_LIVE_SINKS:
                 stuck = len(_LIVE_SINKS)
                 self._degraded = True
@@ -166,11 +173,14 @@ class _StderrSink:
         self._closed = False
         try:
             self._thread.start()
+            self._thread._bb_started = True   # type: ignore[attr-defined]
         except BaseException:
-            # NO explicit reservation release here, deliberately: a thread that never started
-            # reports is_alive() == False, so the prune at the head of the next construction
-            # reclaims its slot. An explicit remove() was written first and then deleted -- no
-            # mutation could kill it, which is the tell that it was doing nothing.
+            # RELEASE the reservation. It cannot be left to the prune any more: the prune now
+            # keeps unstarted reservations on purpose (see above), so a thread that never
+            # started would hold its slot for the life of the process.
+            with _SINK_LOCK:
+                if self._thread in _LIVE_SINKS:
+                    _LIVE_SINKS.remove(self._thread)
             # `Thread.start()` raises RuntimeError once the host is out of threads -- and the
             # pipe is already allocated by then. Without this, every async build retry would
             # leak TWO descriptors and compound the exhaustion toward EMFILE, i.e. the failure
@@ -798,14 +808,23 @@ def _retry_stranded_partials(stranded: "list[str]") -> None:
         batch = list(stranded)
         del stranded[:]
     still: list[str] = []
-    for leftover in batch:
-        errs: list[str] = []
-        shutil.rmtree(leftover, onerror=lambda fn, p, exc: errs.append(str(p)))
-        if errs:
-            still.append(leftover)
-    with _STRANDED_LOCK:
-        # PREPEND, keeping anything appended while we swept.
-        stranded[:0] = still
+    done = 0
+    try:
+        for leftover in batch:
+            errs: list[str] = []
+            shutil.rmtree(leftover, onerror=lambda fn, q, exc: errs.append(str(q)))
+            if errs:
+                still.append(leftover)
+            done += 1
+    finally:
+        # PUT BACK whatever we did not finish. `rmtree` can RAISE rather than report through
+        # onerror -- a worker-created directory nested deep enough makes recursive removal hit
+        # RecursionError -- and the ledger has already been emptied by then, so an escaping
+        # exception would lose the current entry AND every unprocessed one, permanently. The
+        # old implementation iterated the live list and so could not lose them; taking a batch
+        # has to restore what it took (codex, #155).
+        with _STRANDED_LOCK:
+            stranded[:0] = still + batch[done:]
 
 
 class GvisorSnapshotBackend:
