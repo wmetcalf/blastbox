@@ -66,6 +66,42 @@ def _runsc_cr_available() -> bool:
         return False
 
 
+def _force_delete_all(cfg, *, timeout_s: float = 20.0) -> list[str]:
+    """Force-delete every container registered under ``cfg.root``. Returns their ids.
+
+    Only this test's OWN root -- `cfg.root` is under tmp_path and unique per
+    run -- so it can never touch the fleet's containers, which live under the
+    dispatcher's own root.
+
+    Needed because failing on a timeout only stops WAITING for the build: the
+    thread keeps running, its child `runsc` keeps going, and a stalled build can
+    leave a sandbox on the host and keep writing under tmp_path after the test
+    has gone.
+    """
+    import json as _json
+    import subprocess as _sp
+
+    base = [cfg.runsc_bin, "-root", str(cfg.root)]
+    try:
+        listed = _sp.run([*base, "list", "-format=json"], capture_output=True,
+                         text=True, timeout=timeout_s, check=False)
+        containers = _json.loads(listed.stdout or "[]")
+    except Exception:  # noqa: BLE001 - cleanup is best effort by definition
+        return []
+    killed: list[str] = []
+    for entry in containers:
+        cid = entry.get("id") if isinstance(entry, dict) else None
+        if not cid:
+            continue
+        for argv in (["kill", cid, "KILL"], ["delete", "-force", cid]):
+            try:
+                _sp.run([*base, *argv], capture_output=True, timeout=timeout_s, check=False)
+            except Exception:  # noqa: BLE001
+                pass
+        killed.append(cid)
+    return killed
+
+
 def _warm_rootfs() -> str | None:
     """Return the BLASTBOX_GVISOR_ROOTFS path if set and the directory exists."""
     val = os.environ.get("BLASTBOX_GVISOR_ROOTFS", "").strip()
@@ -182,9 +218,14 @@ def test_gvisor_snapshot_roundtrip(tmp_path: Path) -> None:
     builder.start()
     builder.join(timeout=build_s)
     if builder.is_alive():
+        # Do not just stop waiting: tear down whatever the stalled build left
+        # under THIS test's private root, or a sandbox outlives the run and
+        # keeps writing into tmp_path after it is gone.
+        orphans = _force_delete_all(cfg)
         pytest.fail(
             f"warm snapshot build did not finish within {build_s}s "
-            "(set BLASTBOX_SNAPSHOT_BUILD_S to allow longer)"
+            f"(set BLASTBOX_SNAPSHOT_BUILD_S to allow longer); "
+            f"force-deleted {len(orphans)} container(s) it left behind: {orphans}"
         )
     kind, payload = outcome[0]
     if kind == "error":
