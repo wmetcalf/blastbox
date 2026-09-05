@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 import time
@@ -288,13 +289,54 @@ def read_base_ack_capability(ctrl_dir: Path) -> bool:
     return "ack=1" in raw.decode("utf-8", "replace")
 
 
+def read_setup_breadcrumb(ctrl_dir: Path, *, max_bytes: int = 4096) -> str | None:
+    """The cause `run_warm.py` left behind when engine setup died before signal_ready().
+
+    The guest writes `ctrl/setup_error` for exactly one reason, in its own words: "the host
+    only sees a bare ready-timeout ... so the failure is diagnosable". Nothing read it. The
+    host reported `warm base not READY within 120.0s` and then rmtree'd the bundle -- taking
+    the explanation with it -- so the breadcrumb was write-only and the operator was left with
+    a timeout and no cause. Measured on toolz2 against a fleet clippyshot rootfs.
+
+    Confined exactly like `read_base_ack_capability`: ctrl/ is bind-mounted 0o777 and this
+    content is worker-written, so it is read as a confined regular file, capped, and
+    sanitised to printable ASCII before it reaches a log line or an exception message.
+    """
+    # `read_confined_regular_bytes` REJECTS anything over the cap, which for a diagnostic is
+    # the wrong trade: an oversized breadcrumb would leave the operator with no cause at all,
+    # which is the very failure this function exists to end. Read through the same confined,
+    # TOCTOU-safe fd and TRUNCATE instead.
+    from blastbox.contract.envelope import open_confined_regular_fd
+    try:
+        fd = open_confined_regular_fd(ctrl_dir, "setup_error")
+    except (OSError, ValueError):
+        return None
+    try:
+        raw = os.read(fd, max_bytes)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    text = raw.decode("utf-8", "replace").strip()
+    if not text:
+        return None
+    # One line, printable only. A worker-controlled string must not smuggle control characters
+    # or newlines into an operator's log.
+    flat = " ".join(text.split())
+    return "".join(ch if 32 <= ord(ch) < 127 else "?" for ch in flat)
+
+
 def _default_ready_wait(ctrl_dir: Path, timeout_s: float) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if (ctrl_dir / "ready").exists():
             return
         time.sleep(0.2)
-    raise TimeoutError(f"warm base not READY within {timeout_s}s ({ctrl_dir})")
+    # Read the breadcrumb BEFORE anything tears the bundle down: the caller's failure path
+    # kills the container and removes this directory, so this is the only moment it exists.
+    cause = read_setup_breadcrumb(ctrl_dir)
+    detail = f": {cause}" if cause else ""
+    raise TimeoutError(f"warm base not READY within {timeout_s}s ({ctrl_dir}){detail}")
 
 
 def _best_effort_delete(cfg: GvisorConfig, run: Callable[..., int], cid: str) -> bool:
@@ -347,6 +389,7 @@ class GvisorBootHandle:
         ack_capable: "AckCapability | None" = None,
         ack_generation: "int | None" = None,
         stranded: list[str] | None = None,
+        run_text: Callable[[list[str]], str] = _default_run_text,
     ) -> None:
         # Partial checkpoint directories whose cleanup failed. OWNED BY THE BACKEND and shared in:
         # SnapshotManager kills and abandons this handle after a failed checkpoint, so a list held
@@ -358,6 +401,7 @@ class GvisorBootHandle:
         self._base = base_dir
         self._ctrl = ctrl_dir
         self._ready = ready_wait
+        self._run_text = run_text
         self._ack_capable: "AckCapability | None" = ack_capable
         # The generation this BUILD started under -- INJECTED by boot_base, which samples it
         # before `runsc run`. Sampling it here was too late: constructing this handle is the LAST
@@ -370,8 +414,33 @@ class GvisorBootHandle:
         # None is MEANINGFUL: an unidentifiable build teaches nothing (#92).
         self._ack_gen = ack_generation
 
+    def _container_status(self) -> str:
+        """`runsc state` for this base, or "" if it cannot be determined."""
+        try:
+            return str(json.loads(self._run_text([*_runsc(self._cfg), "state", self._cid]))
+                       .get("status", ""))
+        except Exception:  # noqa: BLE001 - a diagnostic must never mask the failure it explains
+            return ""
+
     def wait_ready(self, timeout_s: float) -> None:
-        self._ready(self._ctrl, timeout_s)
+        try:
+            self._ready(self._ctrl, timeout_s)
+        except TimeoutError as exc:
+            # A guest that DIED cannot ever write `ready`, so waiting out the budget taught
+            # nothing and reported nothing. Measured on toolz2: run_warm.py hit
+            # `ModuleNotFoundError: No module named 'blastbox'` at IMPORT -- before main(), so
+            # before it could drop the setup_error breadcrumb -- the container was gone in under
+            # a second, and the host still sat for 120s and then said only "not READY within
+            # 120.0s". The status separates "too slow" from "already dead", which want opposite
+            # fixes: a longer budget, or a corrected warm argv/interpreter.
+            status = self._container_status()
+            if status and status != "running":
+                raise TimeoutError(
+                    f"{exc}; the base container is {status} -- it exited before signalling "
+                    f"READY, so no budget would have helped (check the warm argv/interpreter "
+                    f"for this rootfs)"
+                ) from exc
+            raise
         # THE ONLY CHANCE to learn it. A restore gets a fresh ctrl/ and the checkpointed worker
         # resumes past its one-time signal_ready(), so `ready` is never written again -- and a
         # base wedged from its first restore never completes a job either. Read it here, while
@@ -687,6 +756,7 @@ class GvisorSnapshotBackend:
             shutil.rmtree(base, ignore_errors=True)
             raise _with_runsc_stderr(boot_exc, "runsc run") from boot_exc
         return GvisorBootHandle(self._cfg, self._run, cid, base, ctrl, self._ready,
+                                run_text=self._run_text,
                                 ack_capable=self._ack_capable,
                                 ack_generation=ack_gen,
                                 stranded=self._stranded_partials)
