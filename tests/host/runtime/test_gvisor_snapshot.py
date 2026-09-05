@@ -1517,3 +1517,58 @@ def test_a_sweep_that_raises_does_not_lose_the_batch(tmp_path, monkeypatch):
     assert b in ledger, "the entry that raised was lost"
     assert c in ledger, "every entry after the raise was lost"
     assert a not in ledger, "an entry that was successfully removed should not come back"
+
+
+def test_a_failed_pipe_does_not_strand_a_slot(monkeypatch):
+    """`os.pipe()` can fail on a host in transient EMFILE.
+
+    Because the prune deliberately keeps unstarted reservations, a failure AFTER reserving
+    would strand that slot forever -- and enough of them means a recovered host discards
+    stderr for every launch, permanently (codex, #155).
+    """
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+    monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 2)
+    monkeypatch.setattr(
+        gs.os, "pipe", lambda: (_ for _ in ()).throw(OSError(24, "Too many open files"))
+    )
+
+    for _ in range(10):
+        with pytest.raises(OSError):
+            gs._StderrSink()
+
+    assert not gs._LIVE_SINKS, (
+        f"{len(gs._LIVE_SINKS)} phantom reservations survived a failed pipe; a recovered "
+        "host would discard stderr forever"
+    )
+
+def test_the_degraded_path_starts_no_thread(monkeypatch):
+    """This branch exists to keep launches alive under exhaustion, so it must not depend on
+    starting a thread -- `Thread.start()` raises on a host that is out of them, which would
+    abort the very launch the degradation is protecting."""
+    import threading as _th
+
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+    monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 1)
+
+    first = gs._StderrSink()
+    try:
+        class _RefusingThread(_th.Thread):
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        real = gs.threading.Thread
+        gs.threading.Thread = _RefusingThread      # type: ignore[misc]
+        try:
+            degraded = gs._StderrSink()            # past the cap AND out of threads
+        finally:
+            gs.threading.Thread = real             # type: ignore[misc]
+
+        assert degraded.degraded
+        assert degraded.tail() == ""
+        degraded.close_write()                     # must not blow up without a thread
+    finally:
+        first.close_write()

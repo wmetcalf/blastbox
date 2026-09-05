@@ -143,9 +143,13 @@ class _StderrSink:
         # #155). The thread object is created first precisely so it can be reserved before it
         # runs. My commit for the first version of this cap claimed the lesson from the FC
         # copy-worker cap had been applied up front; it had not been.
-        self._thread = threading.Thread(
-            target=self._drain, name="runsc-stderr-drain", daemon=True
-        )
+        # THE PIPE FIRST, before any reservation exists. os.pipe() can fail on a host in
+        # transient EMFILE -- and because the prune deliberately keeps unstarted reservations,
+        # a failure after reserving would strand that slot FOREVER. Sixteen of those and a
+        # recovered host discards stderr for every launch, permanently (codex, #155).
+        read_fd, write_fd = os.pipe()
+        thread = threading.Thread(target=self._drain, name="runsc-stderr-drain", daemon=True)
+
         with _SINK_LOCK:
             # PRUNE ONLY WHAT ACTUALLY RAN. A reservation is appended before its thread is
             # started, and an unstarted thread reports is_alive() == False -- so pruning on
@@ -157,19 +161,29 @@ class _StderrSink:
             ]
             if len(_LIVE_SINKS) >= _MAX_LIVE_SINKS:
                 stuck = len(_LIVE_SINKS)
+                for fd in (read_fd, write_fd):
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
                 self._degraded = True
                 self._read_fd = -1
                 self.write_fd = subprocess.DEVNULL
                 self._closed = True
-                self._thread = threading.Thread(target=lambda: None, daemon=True)
-                self._thread.start()
+                # NO THREAD AT ALL. Starting even a no-op thread here can raise RuntimeError on
+                # a host that is out of threads -- and this branch exists precisely to keep the
+                # launch alive under exhaustion, so aborting it would defeat its own purpose
+                # (codex, #155). tail() and close_write() handle a threadless sink directly.
+                self._thread = None
                 _log.warning(
                     "gvisor_snapshot: %d stderr drains are still stuck (sandboxes that never "
                     "exited); launching with stderr discarded so the tier keeps serving", stuck,
                 )
                 return
-            _LIVE_SINKS.append(self._thread)      # reserve the slot before anything can run
-        self._read_fd, self.write_fd = os.pipe()
+            _LIVE_SINKS.append(thread)      # reserve the slot before anything can run
+
+        self._thread = thread
+        self._read_fd, self.write_fd = read_fd, write_fd
         self._closed = False
         try:
             self._thread.start()
@@ -239,6 +253,8 @@ class _StderrSink:
         # LAST line (the one that matters) could still be in flight. If the sandbox has also
         # exited, the drain hits EOF and ends, and the buffer is complete; if it is still
         # running, this times out and we return what has arrived.
+        if self._thread is None:
+            return ""                       # degraded: nothing was ever captured
         self._thread.join(timeout=grace_s)
         deadline = time.monotonic() + grace_s
         while time.monotonic() < deadline:
