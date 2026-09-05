@@ -1109,3 +1109,64 @@ class TestTheBoundsCodexFound:
         missing = tmp_path / "no-such-dir"
         with pytest.raises(OSError):
             _detached_stderr(missing)
+
+
+class TestControlFlowAndBundleCleanup:
+    """The second review round on #149: both of these were caused by the fixes themselves."""
+
+    def test_an_interrupt_is_not_turned_into_a_snapshot_error(self):
+        """The callers catch BaseException to clean up and re-raise a shutdown UNCHANGED.
+
+        Enriching one gives it a `stderr`, and `_with_runsc_stderr` then replaces it with a
+        GvisorCommandError -- so a Ctrl-C during a boot came back as an ordinary snapshot
+        failure and the shutdown was swallowed.
+        """
+        from blastbox.host.runtime.gvisor_snapshot import (
+            _attach_stderr_text,
+            _with_runsc_stderr,
+        )
+
+        for exc in (KeyboardInterrupt(), SystemExit(1)):
+            out = _attach_stderr_text(exc, "cannot create gofer process: permission denied")
+            assert out is exc, f"{type(exc).__name__} was replaced by {type(out).__name__}"
+            assert _with_runsc_stderr(out, "runsc run") is exc, (
+                f"{type(exc).__name__} survived the attach but not the render"
+            )
+
+    def test_an_ordinary_failure_is_still_enriched(self):
+        """The control: this is what the enrichment exists for."""
+        from blastbox.host.runtime.gvisor_snapshot import (
+            _attach_stderr_text,
+            _with_runsc_stderr,
+        )
+
+        exc = RuntimeError("runsc exited 1")
+        rendered = _with_runsc_stderr(
+            _attach_stderr_text(exc, "cannot create gofer process: permission denied"),
+            "runsc run",
+        )
+        assert "cannot create gofer process" in str(rendered)
+
+    def test_a_capture_file_failure_does_not_leak_the_bundle(self, tmp_path, monkeypatch):
+        """The bundle dir and OCI config are already on disk and no container exists yet, so
+        nothing else knows this base is there. Every async retry would leak another."""
+        from blastbox.host.runtime import gvisor_snapshot as gs
+
+        monkeypatch.setattr(gs, "_prepare_slot_dirs",
+                            lambda cfg, base: (base / "ctrl").mkdir(parents=True))
+        monkeypatch.setattr(gs, "_write_oci_config", lambda cfg, base, in_ro=True: None)
+        monkeypatch.setattr(gs, "_detached_stderr",
+                            lambda d: (_ for _ in ()).throw(OSError(24, "Too many open files")))
+
+        root = tmp_path / "root" / "r"
+        cfg = gs.GvisorConfig(
+            runsc_bin="runsc", root=root, image_rootfs=tmp_path / "rootfs",
+            network="none", warm_argv=["x"],
+        )
+        be = gs.GvisorSnapshotBackend(cfg, run=lambda *a, **k: 0)
+
+        with pytest.raises(OSError):
+            be.boot_base()
+
+        leaked = list(root.parent.glob("gvisor-base-*"))
+        assert not leaked, f"a prepared bundle was left behind: {leaked}"

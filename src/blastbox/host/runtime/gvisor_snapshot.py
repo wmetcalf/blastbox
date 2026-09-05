@@ -136,6 +136,13 @@ def _attach_stderr_text(exc: BaseException, text: str) -> BaseException:
     puts the captured tail where the existing renderer already looks, so both capture styles
     produce the same operator-facing message.
     """
+    # ORDINARY exceptions only. The callers catch BaseException on purpose, to clean up and
+    # re-raise a KeyboardInterrupt / SystemExit / cancellation unchanged. Enriching one of
+    # those gives it a `stderr`, and _with_runsc_stderr then REPLACES it with a
+    # GvisorCommandError -- turning a requested shutdown into an ordinary snapshot failure
+    # (codex, #149). A control-flow exception is not a boot diagnosis.
+    if not isinstance(exc, Exception):
+        return exc
     if text and not getattr(exc, "stderr", None):
         try:
             exc.stderr = text          # type: ignore[attr-defined]
@@ -807,7 +814,17 @@ class GvisorSnapshotBackend:
         # A FILE, not a pipe: the detached sandbox inherits this fd and holds it for its
         # whole life, so PIPE here means `subprocess.run` waits for a guest that is working
         # correctly. See _detached_stderr.
-        _err_fh, _err_path = _detached_stderr(base)
+        #
+        # Its own handler, and it must run BEFORE the launch handler exists: the bundle dir
+        # and OCI config are already on disk, no container has been created, and nothing else
+        # knows this base exists -- so an EMFILE/ENOSPC here would leak `gvisor-base-<token>`,
+        # and every async retry would leak another while the resource problem persists
+        # (codex, #149). Cannot be folded into the launch handler: that one reads _err_path.
+        try:
+            _err_fh, _err_path = _detached_stderr(base)
+        except BaseException:
+            shutil.rmtree(base, ignore_errors=True)
+            raise
         try:
             try:
                 self._run(
