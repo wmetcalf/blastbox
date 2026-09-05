@@ -1360,3 +1360,75 @@ class TestTheDrainThreadsAreBounded:
             assert not sink.degraded, "a healthy host hit the cap; slots are not being freed"
             sink.close_write()                 # EOF: the drain ends
             sink._thread.join(timeout=5)
+
+    def test_the_drain_cap_holds_under_concurrency(self, monkeypatch):
+        """Check-then-act does not bound anything in the concurrency the cap exists for.
+
+        Several concurrent restores can all observe spare capacity and start drains before any
+        of them registers. Threads are released from a barrier here so they contend on that
+        window deliberately (codex, #155).
+        """
+        import threading as _th
+
+        from blastbox.host.runtime import gvisor_snapshot as gs
+
+        monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+        monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 3)
+
+        n = 24
+        start = _th.Barrier(n)
+        made: list = []
+        made_lock = _th.Lock()
+
+        def _make() -> None:
+            start.wait(10)
+            sink = gs._StderrSink()
+            with made_lock:
+                made.append(sink)
+
+        threads = [_th.Thread(target=_make, daemon=True) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        try:
+            alive = [t for t in gs._LIVE_SINKS if t.is_alive()]
+            assert len(alive) <= 3, (
+                f"{len(alive)} drain threads started against a cap of 3: the reservation was "
+                "not made in the same critical section as the check"
+            )
+        finally:
+            for s in made:
+                s.close_write()
+
+    def test_a_drain_that_cannot_start_releases_its_reservation(self, monkeypatch):
+        """Reserving before starting must not strand the slot when the start fails, or a host
+        out of threads would permanently lose capacity it never used."""
+        import threading as _th
+
+        from blastbox.host.runtime import gvisor_snapshot as gs
+
+        monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+        monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 2)
+
+        class _RefusingThread(_th.Thread):
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        real = gs.threading.Thread
+        gs.threading.Thread = _RefusingThread          # type: ignore[misc]
+        try:
+            for _ in range(5):
+                with pytest.raises(RuntimeError):
+                    gs._StderrSink()
+        finally:
+            gs.threading.Thread = real                 # type: ignore[misc]
+
+        # The ledger must not GROW: a thread that never started is not alive, so the prune at
+        # the head of the next construction reclaims its slot. Asserting "nothing alive" would
+        # hold trivially (a never-started thread is never alive) -- this asserts the reclaim.
+        assert len(gs._LIVE_SINKS) <= 1, (
+            f"5 refused drains left {len(gs._LIVE_SINKS)} reservations behind; the cap would "
+            "strangle a host that has recovered"
+        )

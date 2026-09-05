@@ -136,9 +136,20 @@ class _StderrSink:
         # launches to protect a log. Past the cap the launch proceeds with stderr discarded and
         # says so once -- capacity over forensics, which is the right trade for the tier that
         # is serving jobs.
+        # PRUNE, CHECK AND RESERVE IN ONE CRITICAL SECTION. Checking capacity, releasing the
+        # lock, and only registering after the drain has started is check-then-act: several
+        # concurrent restores can all observe spare capacity and start drains before any of
+        # them registers, so the cap fails in exactly the concurrency it exists for (codex,
+        # #155). The thread object is created first precisely so it can be reserved before it
+        # runs. My commit for the first version of this cap claimed the lesson from the FC
+        # copy-worker cap had been applied up front; it had not been.
+        self._thread = threading.Thread(
+            target=self._drain, name="runsc-stderr-drain", daemon=True
+        )
         with _SINK_LOCK:
             _LIVE_SINKS[:] = [t for t in _LIVE_SINKS if t.is_alive()]
             if len(_LIVE_SINKS) >= _MAX_LIVE_SINKS:
+                stuck = len(_LIVE_SINKS)
                 self._degraded = True
                 self._read_fd = -1
                 self.write_fd = subprocess.DEVNULL
@@ -147,20 +158,19 @@ class _StderrSink:
                 self._thread.start()
                 _log.warning(
                     "gvisor_snapshot: %d stderr drains are still stuck (sandboxes that never "
-                    "exited); launching with stderr discarded so the tier keeps serving",
-                    len(_LIVE_SINKS),
+                    "exited); launching with stderr discarded so the tier keeps serving", stuck,
                 )
                 return
+            _LIVE_SINKS.append(self._thread)      # reserve the slot before anything can run
         self._read_fd, self.write_fd = os.pipe()
         self._closed = False
-        self._thread = threading.Thread(
-            target=self._drain, name="runsc-stderr-drain", daemon=True
-        )
         try:
             self._thread.start()
-            with _SINK_LOCK:
-                _LIVE_SINKS.append(self._thread)
         except BaseException:
+            # NO explicit reservation release here, deliberately: a thread that never started
+            # reports is_alive() == False, so the prune at the head of the next construction
+            # reclaims its slot. An explicit remove() was written first and then deleted -- no
+            # mutation could kill it, which is the tell that it was doing nothing.
             # `Thread.start()` raises RuntimeError once the host is out of threads -- and the
             # pipe is already allocated by then. Without this, every async build retry would
             # leak TWO descriptors and compound the exhaustion toward EMFILE, i.e. the failure
