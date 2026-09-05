@@ -69,6 +69,44 @@ class GvisorConfig:
     rlimit_nofile: int | None = 65536
 
 
+class GvisorCommandError(RuntimeError):
+    """A runsc command failed, carrying the command's own stderr.
+
+    `SnapshotManager.build()` wraps whatever escapes into `SnapshotBuildError`
+    using `str(exc)`, so what this carries is what the operator finally reads.
+    """
+
+
+def _with_runsc_stderr(exc: BaseException, what: str) -> BaseException:
+    """``exc`` carrying the failing command's OWN stderr, when it captured any.
+
+    `runsc run` and `runsc restore` used to discard stderr, so the only output an
+    operator saw came from the TEARDOWN that follows a failure -- `runsc kill` and
+    `runsc delete` against a container that was never created, which print
+    `FetchSpec failed: loading container: file does not exist`. That is what a
+    failed gVisor boot reported, and it says nothing about why the boot failed.
+
+    Measured on a host where the base genuinely cannot boot, the real messages
+    are specific and immediately actionable:
+
+        cannot create gofer process: gofer: fork/exec /proc/self/exe:
+            permission denied
+        cannot create sandbox: cannot read client sync file:
+            waiting for sandbox to start: EOF
+
+    Truncated from the END: runsc's useful line is the last one.
+    """
+    err = getattr(exc, "stderr", None)
+    if not err:
+        return exc
+    if isinstance(err, bytes):
+        err = err.decode("utf-8", "replace")
+    tail = err.strip()[-600:]
+    if not tail:
+        return exc
+    return GvisorCommandError(f"{what} failed: {tail}")
+
+
 def _runsc(cfg: GvisorConfig) -> list[str]:
     a = [cfg.runsc_bin, "-root", str(cfg.root), f"-network={cfg.network}"]
     if cfg.ignore_cgroups:
@@ -269,12 +307,28 @@ def _best_effort_delete(cfg: GvisorConfig, run: Callable[..., int], cid: str) ->
     Returns True when at least one teardown command SUCCEEDED. Callers that must not reclaim
     resources a live sandbox still uses check this rather than assuming a clean return."""
     ok = False
+    problems: list[str] = []
     for argv in (["kill", cid, "KILL"], ["delete", "-force", cid]):
         try:
-            run([*_runsc(cfg), *argv])
+            # CAPTURED, not discarded. Against a container that was never
+            # created runsc prints `FetchSpec failed: loading container: file
+            # does not exist`, and because this teardown follows a failed boot
+            # that line was the only stderr an operator saw -- describing the
+            # cleanup rather than the failure. But this helper also runs from
+            # kill() during ORDINARY reaping, where the container did exist and
+            # a teardown failure is the actionable thing: discarding both
+            # streams would leave "could not confirm teardown" with no reason.
+            # So: capture always, and report only when NOTHING succeeded.
+            run([*_runsc(cfg), *argv],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             ok = True
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - best effort by contract
+            detail = getattr(exc, "stderr", None)
+            if isinstance(detail, bytes):
+                detail = detail.decode("utf-8", "replace")
+            problems.append(f"{argv[0]}: {(detail or exc).__str__().strip()[-200:]}")
+    if not ok and problems:
+        _log.warning("gvisor_snapshot: teardown of %s failed -- %s", cid, "; ".join(problems))
     # REPORT it. Swallowing every failure made kill() return normally even when both the kill and
     # the force-delete failed, so the reap's `sandbox_gone` guard stayed True and released the
     # generation pin anyway -- the guard was defeated by the layer beneath it (PR #82).
@@ -612,9 +666,9 @@ class GvisorSnapshotBackend:
                 [*_runsc(self._cfg), "run", "-detach", "-bundle", str(base), cid],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
-        except BaseException:
+        except BaseException as boot_exc:
             # BaseException, matching restore_in and build()'s teardown: an interrupt or
             # cancellation during `runsc run` still leaves registered container state behind, and
             # no boot handle is returned on failure, so nothing else can ever reap it (PR #82).
@@ -629,9 +683,9 @@ class GvisorSnapshotBackend:
                 self._stranded_partials.append(str(base))
                 _log.warning("gvisor_snapshot: base %s could not be confirmed deleted; retaining "
                              "its bundle for retry", cid)
-                raise
+                raise _with_runsc_stderr(boot_exc, "runsc run") from boot_exc
             shutil.rmtree(base, ignore_errors=True)
-            raise
+            raise _with_runsc_stderr(boot_exc, "runsc run") from boot_exc
         return GvisorBootHandle(self._cfg, self._run, cid, base, ctrl, self._ready,
                                 ack_capable=self._ack_capable,
                                 ack_generation=ack_gen,
@@ -648,7 +702,7 @@ class GvisorSnapshotBackend:
                  "-detach", "-bundle", str(wd), cid],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
         except BaseException as exc:
             # BaseException, not Exception. A KeyboardInterrupt, SystemExit or task cancellation
@@ -676,5 +730,17 @@ class GvisorSnapshotBackend:
                 self._stranded_partials.append(str(wd))
                 _log.warning("gvisor_snapshot: restore sandbox %s could not be confirmed deleted; "
                              "retaining its bundle for retry", cid)
-            raise
+            # Same treatment as the base boot: `CalledProcessError.__str__` does
+            # not include captured stderr, so without this the manager reports a
+            # bare non-zero exit -- and now that the teardown is quiet, that
+            # would be ALL the operator gets. `kill_failed` travels with it:
+            # SnapshotManager reads that flag to decide whether the checkpoint
+            # may be reclaimed, and dropping it would unpin a generation an
+            # unmanaged sandbox may still be using.
+            enriched = _with_runsc_stderr(exc, "runsc restore")
+            if enriched is exc:
+                raise
+            if getattr(exc, "kill_failed", False):
+                enriched.kill_failed = True  # type: ignore[attr-defined]
+            raise enriched from exc
         return GvisorRestoreHandle(self._cfg, self._run, cid, wd, self._run_text)
