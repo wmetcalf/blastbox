@@ -123,9 +123,15 @@ def test_select_sandbox_env_override_nono(monkeypatch, tmp_path: Path) -> None:
 
 def test_select_sandbox_env_override_nsjail(monkeypatch, tmp_path: Path) -> None:
     """BLASTBOX_SANDBOX=nsjail forces nsjail backend."""
-    import shutil
-    if not shutil.which("nsjail"):
-        pytest.skip("nsjail not installed")
+    # USABILITY, not presence. On a host where nsjail is installed but unprivileged user
+    # namespaces are restricted (Ubuntu 24.04's default), select_sandbox correctly refuses
+    # with SandboxUnavailable -- so guarding on `which` alone let this test run where it
+    # could not pass. Invisible until nsjail was installed somewhere that runs these tests.
+    from .conftest import nsjail_usable
+
+    why = nsjail_usable()
+    if why:
+        pytest.skip(why)
     monkeypatch.setenv("BLASTBOX_SANDBOX", "nsjail")
     monkeypatch.setenv("BLASTBOX_WARN_ON_INSECURE", "1")
 
