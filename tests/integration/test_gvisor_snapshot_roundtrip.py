@@ -97,8 +97,12 @@ def _force_delete_all(cfg, *, timeout_s: float = 20.0) -> tuple[list[str], list[
     if listed.returncode != 0:
         return [], [f"<listing failed: rc={listed.returncode}>"]
     raw = (listed.stdout or "").strip()
+    if not raw:
+        # Exit 0 with NO document is not an empty host -- it is a listing that
+        # told us nothing. `null` is what an empty host prints.
+        return [], ["<listing produced no output>"]
     try:
-        parsed = _json.loads(raw) if raw else None
+        parsed = _json.loads(raw)
     except Exception as exc:  # noqa: BLE001
         return [], [f"<listing was not JSON: {type(exc).__name__}>"]
     if parsed is None:
@@ -131,36 +135,48 @@ def _force_delete_all(cfg, *, timeout_s: float = 20.0) -> tuple[list[str], list[
 def _sweep_until_clean(
     cfg, is_live, *, attempts: int = 3, settle_s: float = 1.0
 ) -> tuple[list[str], list[str], bool]:
-    """Repeatedly clean up after a producer that cannot be cancelled.
+    """Clean up after a producer that cannot be cancelled.
 
-    Returns (deleted, unconfirmed, producer_was_live). One pass is not enough:
-    a container can be registered AFTER an enumeration, so a single sweep can
-    report a clean host while the builder goes on creating one.
+    Returns (deleted, unconfirmed, confirmed_clean).
 
-    ``producer_was_live`` records whether the builder was running DURING a
-    sweep, not merely at the end. Checking only afterwards misses the case where
-    it registers a container after the last listing and then exits: the final
-    `is_alive()` is False and the host reads clean though nothing swept it.
+    ``confirmed_clean`` is the only claim worth making: a sweep found the
+    producer already stopped AND enumerated the host successfully AND there was
+    nothing there. Anything short of that -- the producer still running, a
+    listing that failed, a delete that could not be confirmed -- leaves the host
+    dirty as far as this test can tell.
 
-    An id unconfirmed on one pass and deleted on a later one is reconciled --
-    otherwise the report names a sandbox as possibly live after it was removed.
+    Accumulating "was it ever live" instead was wrong in both directions: a
+    producer live during an early sweep but stopped before a later CLEAN one had
+    the host reported dirty though it was confirmed empty, while a producer that
+    registered a container after the last listing and then exited read clean
+    because liveness was only checked at the end.
+
+    An id unconfirmed on one pass and deleted on a later one is reconciled, and
+    an id seen by two sweeps is reported once.
     """
     deleted: list[str] = []
     unconfirmed: list[str] = []
-    producer_was_live = False
+    confirmed_clean = False
     for _ in range(attempts):
         live_now = bool(is_live())
-        producer_was_live = producer_was_live or live_now
         found, unsure = _force_delete_all(cfg)
-        # De-duplicated: an id is one container however many sweeps see it, and
-        # a report naming it twice reads as two sandboxes.
         deleted.extend(f for f in found if f not in deleted)
         unconfirmed = [u for u in unconfirmed if u not in found]
-        unconfirmed.extend(u for u in unsure if u not in deleted)
-        if not live_now and not found:
+        unconfirmed.extend(u for u in unsure if u not in deleted and u not in unconfirmed)
+        if not live_now and not found and not unsure:
+            # Nothing running to create more, and an enumeration that actually
+            # answered. Only here can the host be called clean -- and a sweep
+            # whose listing or delete failed must NOT break, or a transient
+            # failure burns the remaining attempts.
+            # A successful enumeration finding NOTHING supersedes earlier
+            # doubt: a listing that failed two sweeps ago, and a delete that
+            # could not be confirmed, are both answered by an empty host.
+            # Without this a single transient failure taints the report forever.
+            confirmed_clean = True
+            unconfirmed = []
             break
         time.sleep(settle_s)
-    return deleted, unconfirmed, producer_was_live
+    return deleted, unconfirmed, confirmed_clean
 
 
 def _warm_rootfs() -> str | None:
@@ -284,17 +300,17 @@ def test_gvisor_snapshot_roundtrip(tmp_path: Path) -> None:
         # keeps writing into tmp_path after it is gone.
         # Sweep more than once, and record whether the producer was live DURING
         # a sweep -- see `_sweep_until_clean`.
-        deleted, unconfirmed, producer_was_live = _sweep_until_clean(
+        deleted, unconfirmed, confirmed_clean = _sweep_until_clean(
             cfg, builder.is_alive
         )
-        detail = f"force-deleted {deleted}" if deleted else "nothing to clean up"
+        detail = f"force-deleted {deleted}" if deleted else "found nothing to delete"
         if unconfirmed:
             detail += f"; COULD NOT confirm {unconfirmed} -- may still be live"
-        if producer_was_live or builder.is_alive():
+        if not confirmed_clean:
             detail += (
-                "; the build thread was RUNNING during the sweep and cannot be "
-                "cancelled, so it may have registered a container after the last "
-                "listing -- treat this host as dirty"
+                "; the host was NOT confirmed clean -- the build thread cannot be "
+                "cancelled and may have registered a container after the last "
+                "listing, so treat this host as dirty"
             )
         pytest.fail(
             f"warm snapshot build did not finish within {build_s}s "
