@@ -26,6 +26,85 @@ jobs:
         # Firecracker + Postgres suites self-skip without /dev/kvm + a DSN.
         run: pytest -q
 
+  sandbox:
+    # The nsjail and bwrap backends' tests skip in the plain `test` job -- neither binary is
+    # packaged on the runner, and neither is on the fleet hosts either (they live inside the
+    # worker images). That block therefore ran NOWHERE: a regression in the sandbox argv, the
+    # seccomp policy wiring or the insecurity reasons would have shipped green. Same reasoning
+    # as pg-search below: provide the dependencies and run them for real.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bubblewrap and the seccomp binding
+        # A venv with --system-site-packages over the DISTRO python, not setup-python: the
+        # `seccomp` bindings ship only as a distro package (python3-seccomp), and without them
+        # `test_build_bpf_bytes_valid` skips and every real bwrap test forces
+        # _LIBSECCOMP_AVAILABLE=False -- so this job could stay green while BPF generation or
+        # the real `bwrap --seccomp <fd>` path was broken.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q bubblewrap python3-seccomp python3-venv
+          bwrap --version
+          python3 -m venv --system-site-packages .venv
+          .venv/bin/python -c "import seccomp; print('seccomp binding OK')"
+          .venv/bin/pip install -q -e ".[host,dev]"
+      - name: Build and install nsjail
+        # PINNED TO A COMMIT, not a tag: `git clone --branch` only selects a ref, it verifies
+        # nothing, so a moved or recreated tag would have this trusted job build and execute
+        # different source with no change here. This SHA is the one that was built and its
+        # tests run against locally before the job was written.
+        env:
+          NSJAIL_COMMIT: f78475530b46d0186111a9096b30725f816b55fe   # tag 3.6
+        run: |
+          sudo apt-get install -y -q autoconf bison flex gcc g++ git libprotobuf-dev \
+            libnl-route-3-dev libtool make pkg-config protobuf-compiler
+          git clone -q --filter=blob:none https://github.com/google/nsjail /tmp/nsjail
+          git -C /tmp/nsjail checkout -q "$NSJAIL_COMMIT"
+          got=$(git -C /tmp/nsjail rev-parse HEAD)
+          if [ "$got" != "$NSJAIL_COMMIT" ]; then
+            echo "nsjail checkout is $got, expected $NSJAIL_COMMIT" >&2; exit 1
+          fi
+          git -C /tmp/nsjail submodule update --init --recursive --depth=1
+          make -C /tmp/nsjail -j"$(nproc)"
+          sudo install -m 0755 /tmp/nsjail/nsjail /usr/local/bin/nsjail
+          nsjail --help | head -1
+      - name: Grant userns to bwrap and nsjail (scoped AppArmor profiles)
+        # Ubuntu 24.04 sets kernel.apparmor_restrict_unprivileged_userns=1, which blocks the
+        # user namespaces both backends need -- so without this the smoke-run tests and the
+        # selector tests skip and the job is green having exercised neither. The repo already
+        # ships scoped per-binary profiles for exactly this (deploy/apparmor/README.md); they
+        # grant `userns` to these two binaries only, leaving the host-wide restriction intact.
+        run: |
+          sudo cp deploy/apparmor/blastbox-bwrap deploy/apparmor/blastbox-nsjail /etc/apparmor.d/
+          sudo apparmor_parser -r -W /etc/apparmor.d/blastbox-bwrap
+          sudo apparmor_parser -r -W /etc/apparmor.d/blastbox-nsjail
+          sudo aa-status | grep blastbox
+          # GATE, do not merely report. `... || echo` turns a failed probe into a green step,
+          # and pytest then turns the same failure into skips -- so the job created to stop
+          # tests skipping silently would itself go green having skipped them. That is the
+          # exact failure mode, reintroduced in its own verification (codex, #157).
+          #
+          # --unshare-all, not just --unshare-user: the operation that actually failed on this
+          # runner before the profiles were loaded was the NETWORK namespace
+          # ("bwrap: loopback: Failed RTM_NEWADDR"), so a probe without it does not reproduce
+          # what the tests need.
+          bwrap --unshare-all --unshare-user --uid 0 --ro-bind / / -- /bin/true
+          echo "bwrap userns+netns OK"
+      - name: Pytest (sandbox backends, with nsjail + bwrap present)
+        # -rs so the log SAYS which tests skip and why, and then REFUSE any skip that means a
+        # backend was not exercised. This job exists to run these tests; a run where they
+        # quietly went back to skipping -- a runner image that blocks namespaces again, a
+        # dropped dependency -- must fail, not pass with a shorter log. Other skip reasons
+        # (a genuinely absent optional feature) stay allowed, so this does not become a
+        # tripwire for every future skip.
+        run: |
+          set -o pipefail
+          .venv/bin/pytest -q -rs tests/worker/sandbox/ | tee /tmp/sandbox.txt
+          if grep -E "SKIPPED.*(not installed|not usable|probe failed)" /tmp/sandbox.txt; then
+            echo "::error::a sandbox backend was not exercised -- see the skips above" >&2
+            exit 1
+          fi
+
   pg-search:
     # Perceptual-hash search is Postgres + pg_bktree only — there is no SQLite
     # search path — so its tests skip in the plain `test` job. Build a Postgres

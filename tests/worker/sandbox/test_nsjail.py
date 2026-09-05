@@ -8,7 +8,6 @@ Structure
 """
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -294,40 +293,16 @@ class TestNsjailRealRun:
 
     @pytest.fixture(autouse=True)
     def check_nsjail_usable(self) -> None:
-        """Skip if nsjail can't run a one-shot on this host."""
-        import shutil
-        if not shutil.which("nsjail"):
-            pytest.skip("nsjail not installed")
-        true_path = "/usr/bin/true" if Path("/usr/bin/true").exists() else "/bin/true"
-        try:
-            r = subprocess.run(
-                [
-                    "nsjail",
-                    "--mode", "o",
-                    "--user", "65534",
-                    "--group", "65534",
-                    "--quiet", "--really_quiet",
-                    "--bindmount_ro", "/usr:/usr",
-                    "--symlink", "usr/bin:/bin",
-                    "--symlink", "usr/lib:/lib",
-                    "--symlink", "usr/lib64:/lib64",
-                    "--symlink", "usr/sbin:/sbin",
-                    "--bindmount_ro", "/etc:/etc",
-                    "--tmpfsmount", "/tmp",
-                    "--",
-                    true_path,
-                ],
-                capture_output=True,
-                timeout=10,
-            )
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
-            pytest.skip(f"nsjail probe failed: {exc}")
-        if r.returncode != 0:
-            pytest.skip(
-                f"nsjail user-namespace not usable on this host "
-                f"(exit={r.returncode}, "
-                f"stderr={r.stderr.decode(errors='replace')[:200]!r})"
-            )
+        """Skip if nsjail cannot run a one-shot on this host.
+
+        The probe is shared with test_detect via conftest: the two had different answers to
+        the same question, and the weaker one let a test run where it could not pass.
+        """
+        from .conftest import nsjail_usable
+
+        why = nsjail_usable()
+        if why:
+            pytest.skip(why)
 
     def test_echo_hi(self, tmp_path: Path) -> None:
         """run(['/usr/bin/echo', 'hi']) → exit 0, stdout=b'hi\\n', not killed."""
