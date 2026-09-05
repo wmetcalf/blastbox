@@ -187,6 +187,7 @@ class NsjailSandbox:
             extra={
                 "seccomp_policy": str(self._seccomp_policy),
                 "proc_apparmor": self._proc_apparmor_supported,
+                "proc_apparmor_attached": self.apparmor_active,
                 "insecurity_reasons": self._insecurity_reasons,
             },
         )
@@ -210,7 +211,13 @@ class NsjailSandbox:
 
     @property
     def apparmor_active(self) -> bool:
-        return self._proc_apparmor_supported
+        """Whether a profile is ACTUALLY attached, not merely whether nsjail could attach one.
+
+        Returning the probe alone told callers and diagnostics that confinement was active
+        while `_build_argv` was omitting the flag because the profile is not loaded (codex,
+        #159).
+        """
+        return self._proc_apparmor_supported and self._apparmor_profile_loaded
 
     # ------------------------------------------------------------------
     # Public interface

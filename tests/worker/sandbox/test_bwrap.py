@@ -538,3 +538,43 @@ def test_build_argv_appends_seccomp_fd_before_separator() -> None:
     assert "--seccomp" in argv and argv[argv.index("--seccomp") + 1] == "7"
     assert argv.index("--seccomp") < argv.index("--")
     assert "--seccomp" not in sb._build_argv(SandboxRequest(argv=["/usr/bin/true"]))
+
+
+class TestProfileMustBeEnforcing:
+    """A profile loaded in `complain` or `unconfined` mode logs or allows -- it does not
+    confine. Matching the securityfs line by NAME treated those as confinement: the backend
+    attaches the profile, omits `apparmor_missing`, and can be reported `secure` while nothing
+    is enforced. For untrusted workloads that has to fail closed (codex, #159).
+    """
+
+    def _profiles(self, tmp_path, contents: str, monkeypatch):
+        import blastbox.worker.sandbox.apparmor as aa
+
+        f = tmp_path / "profiles"
+        f.write_text(contents)
+        monkeypatch.setattr(aa, "_PROFILES", str(f))
+        monkeypatch.delenv("BLASTBOX_APPARMOR_PROFILES", raising=False)
+        return aa
+
+    def test_enforcing_counts(self, tmp_path, monkeypatch) -> None:
+        aa = self._profiles(tmp_path, "other (enforce)\nblastbox-sandbox (enforce)\n", monkeypatch)
+        assert aa.profile_loaded("blastbox-sandbox") is True
+
+    def test_complain_does_not_count(self, tmp_path, monkeypatch) -> None:
+        aa = self._profiles(tmp_path, "blastbox-sandbox (complain)\n", monkeypatch)
+        assert aa.profile_loaded("blastbox-sandbox") is False, (
+            "a complain-mode profile logs but does not confine"
+        )
+
+    def test_unconfined_does_not_count(self, tmp_path, monkeypatch) -> None:
+        aa = self._profiles(tmp_path, "blastbox-sandbox (unconfined)\n", monkeypatch)
+        assert aa.profile_loaded("blastbox-sandbox") is False
+
+    def test_an_unexpected_format_fails_closed(self, tmp_path, monkeypatch) -> None:
+        """A line with no mode is not a promise of enforcement."""
+        aa = self._profiles(tmp_path, "blastbox-sandbox\n", monkeypatch)
+        assert aa.profile_loaded("blastbox-sandbox") is False
+
+    def test_a_prefix_is_not_a_match(self, tmp_path, monkeypatch) -> None:
+        aa = self._profiles(tmp_path, "blastbox-sandbox-other (enforce)\n", monkeypatch)
+        assert aa.profile_loaded("blastbox-sandbox") is False

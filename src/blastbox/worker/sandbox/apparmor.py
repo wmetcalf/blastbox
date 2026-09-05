@@ -29,9 +29,26 @@ def profile_loaded(profile: str) -> bool:
     """
     asserted = os.environ.get("BLASTBOX_APPARMOR_PROFILES", "").strip()
     if asserted:
+        # An operator assertion for hosts where securityfs is unreadable by the worker. It
+        # asserts ENFORCEMENT, not mere presence -- naming a complain-mode profile here is the
+        # operator telling us something untrue.
         return profile in {p.strip() for p in asserted.split(",") if p.strip()}
     try:
         with open(_PROFILES, encoding="ascii") as fh:
-            return any(line.split(" ", 1)[0] == profile for line in fh)
+            return any(_line_is_enforcing(line, profile) for line in fh)
     except OSError:
         return False
+
+
+def _line_is_enforcing(line: str, profile: str) -> bool:
+    """One securityfs line, as `name (mode)` -- True only for THIS profile in enforce mode.
+
+    Matching the name alone treats a profile loaded in `complain` (log, allow) or `unconfined`
+    mode as confinement: the backend attaches it, omits `apparmor_missing`, and can be reported
+    `secure` while nothing is actually enforced. For untrusted workloads that has to fail
+    closed, so a line with no mode -- an unexpected format -- is not enforcing either.
+    """
+    name, _, rest = line.strip().partition(" (")
+    if name != profile:
+        return False
+    return rest.rstrip().rstrip(")") == "enforce"

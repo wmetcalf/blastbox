@@ -255,8 +255,18 @@ class TestNsjailInsecurityReasons:
         sb = NsjailSandbox(seccomp_policy=Path("/nonexistent_xyz.policy"))
         assert sb.secure is False
 
-    def test_secure_true_when_policy_present(self, tmp_path: Path) -> None:
-        """secure is True when the policy file is found (and proc_apparmor is n/a)."""
+    def test_secure_true_when_policy_present(self, tmp_path: Path, monkeypatch) -> None:
+        """secure is True when the policy file is found (and proc_apparmor is n/a).
+
+        BOTH probes are pinned. Reading them from the host made this test host-dependent the
+        moment `apparmor_missing` became a reason: on a machine whose nsjail advertises
+        --proc_apparmor with no `blastbox-sandbox` profile loaded -- the exact case this change
+        is about -- `secure` is legitimately False and the assertion below would fail for a
+        correct product (codex, #159).
+        """
+        import blastbox.worker.sandbox.nsjail as mod
+
+        monkeypatch.setattr(mod, "_probe_nsjail_proc_apparmor", lambda _p: False)
         policy = tmp_path / "ok.policy"
         policy.write_text("POLICY ok { ERRNO(1) { } } USE ok DEFAULT ALLOW\n")
         sb = _make_sandbox(seccomp_policy=policy)
@@ -427,3 +437,18 @@ class TestProcApparmorOnlyWhenTheProfileExists:
         sb = self._sandbox(monkeypatch, supported=False, loaded=False)
 
         assert "apparmor_missing" not in sb.insecurity_reasons
+
+    def test_apparmor_active_means_attached_not_merely_possible(self, monkeypatch) -> None:
+        """The property told callers confinement was active while _build_argv was omitting the
+        flag, because it returned the PROBE rather than the outcome."""
+        sb = self._sandbox(monkeypatch, supported=True, loaded=False)
+        argv = sb._build_argv(SandboxRequest(argv=["/usr/bin/true"]))
+
+        assert "--proc_apparmor" not in argv
+        assert sb.apparmor_active is False, (
+            "apparmor_active reported confinement that _build_argv did not attach"
+        )
+
+    def test_apparmor_active_is_true_when_it_really_is(self, monkeypatch) -> None:
+        sb = self._sandbox(monkeypatch, supported=True, loaded=True)
+        assert sb.apparmor_active is True
