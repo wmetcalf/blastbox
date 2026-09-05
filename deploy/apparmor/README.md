@@ -46,9 +46,13 @@ edited above):
 
 ```sh
 bwrap --unshare-user --uid 0 --ro-bind / / -- /bin/true && echo "bwrap userns OK"
-nsjail -Mo --user 0 --group 0 -- /bin/true            && echo "nsjail userns OK"
+nsjail -Mo --user 0 --group 0 -R / -- /bin/true         && echo "nsjail userns OK"
 runsc --rootless do /bin/true                          && echo "runsc rootless userns OK"
 ```
+
+`-R /` is not decoration: without it nsjail gives the child an empty mount namespace, so
+`/bin/true` does not exist inside and the check fails with `Couldn't launch the child process`
+(exit 255) on a host where the grant is perfectly fine. All three lines above were run.
 
 The runsc line is the one to run if you installed `blastbox-runsc`. Without the grant it exits
 **128** with
