@@ -26,6 +26,8 @@ These should be run on toolz2 or another FC-capable host.
 from __future__ import annotations
 
 import json
+import math
+import os
 import socket
 import struct
 import subprocess
@@ -1390,6 +1392,28 @@ class TestWorkerRuntimeEnvSelection:
 # ---------------------------------------------------------------------------
 
 
+def _live_warmup_s() -> float:
+    """Seconds to wait for READY, from BLASTBOX_FC_TEST_WARMUP_S.
+
+    Validated rather than passed to `float()` and hoped for: `inf` makes the
+    readiness loop wait forever on a guest that never comes up, and zero,
+    negative or NaN reach the READY assertion after the microVM is already
+    spawned but before the try/finally that reaps it -- stranding a live
+    Firecracker process, which is the same leak the input staging had to move
+    for. 45s matches scripts/fc_clippyshot_check.py.
+    """
+    raw = os.environ.get("BLASTBOX_FC_TEST_WARMUP_S", "").strip()
+    if not raw:
+        return 45.0
+    try:
+        value = float(raw)
+    except ValueError:
+        pytest.skip(f"BLASTBOX_FC_TEST_WARMUP_S is not a number: {raw!r}")
+    if not math.isfinite(value) or value <= 0:
+        pytest.skip(f"BLASTBOX_FC_TEST_WARMUP_S must be finite and positive: {raw!r}")
+    return value
+
+
 @pytest.mark.skipif(not HAS_FC_HOST, reason=_LIVE_FC_REASON)
 class TestFirecrackerLiveBoot:
     """End-to-end microVM boot tests — require firecracker + vmlinux + a blastbox
@@ -1438,14 +1462,21 @@ class TestFirecrackerLiveBoot:
         assert not rt.is_alive(slot)
 
     def test_live_is_ready_after_warmup(self, fc_scratch):
-        """The guest warms an engine and signals READY over vsock within 30 s —
-        the live signal VsockReadySignal listens for (FileReadySignal cannot)."""
+        """The guest warms an engine and signals READY over vsock — the live
+        signal VsockReadySignal listens for (FileReadySignal cannot).
+
+        Shares the round-trip's warmup budget. Held at 30 s while the round-trip
+        allowed 45, this failed the whole class first on a slow fleet rootfs --
+        a guest that came up at 35 s never reached the test that would have
+        accepted it.
+        """
         import time
 
+        warmup_s = _live_warmup_s()
         cfg = FCConfig.from_env(scratch_root=fc_scratch)
         rt = FirecrackerSlotRuntime(cfg)
         slot = rt.spawn()
-        deadline = time.monotonic() + 30.0
+        deadline = time.monotonic() + warmup_s
         ready = False
         while time.monotonic() < deadline:
             if rt.is_ready(slot):
@@ -1453,7 +1484,7 @@ class TestFirecrackerLiveBoot:
                 break
             time.sleep(0.5)
         rt.reap(slot)
-        assert ready, "Guest did not signal READY over vsock within 30 s"
+        assert ready, f"Guest did not signal READY over vsock within {warmup_s} s"
 
     def test_live_job_roundtrip_trust_validated(self, fc_scratch):
         """The full warm JOB round-trip: input delivered over vsock, the guest
@@ -1495,6 +1526,14 @@ class TestFirecrackerLiveBoot:
                 pytest.skip(f"BLASTBOX_FC_TEST_INPUT is not a readable file: {source}")
             payload = source.read_bytes()
             suffix = "".join(source.suffixes[-1:])  # ".pdf", never a path
+        elif engine != "probe":
+            # The probe's fabricated .bin would misdetect on an
+            # extension-sensitive engine and would not exercise the real
+            # document a fleet run promises. Missing prerequisite, not a failure.
+            pytest.skip(
+                f"BLASTBOX_FC_TEST_ENGINE={engine} needs BLASTBOX_FC_TEST_INPUT "
+                "(a document that engine can parse)"
+            )
         else:
             payload = b"live-fc-job-roundtrip-" + b"Z" * 2048
             suffix = ".bin"
@@ -1509,7 +1548,7 @@ class TestFirecrackerLiveBoot:
         # 120s to execute. Hardcoding 30 made a valid slower workload look like
         # a failure of the tier.
         limits = Limits.from_env()
-        warmup_s = float(os.environ.get("BLASTBOX_FC_TEST_WARMUP_S", "45"))
+        warmup_s = _live_warmup_s()
 
         cfg = FCConfig.from_env(scratch_root=fc_scratch)
         rt = FirecrackerSlotRuntime(cfg)
