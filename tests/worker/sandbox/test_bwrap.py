@@ -725,3 +725,48 @@ class TestTheProfileModeIsReReadPerLaunch:
         assert "aa-exec" not in " ".join(sb._build_argv(SandboxRequest(argv=["/usr/bin/true"])))
         assert "apparmor_missing" in sb.insecurity_reasons
         assert sb.secure is False
+
+
+class TestTheProfileNameCanActuallyBeSelected:
+    """`select_sandbox` -- the only path a real worker takes -- constructs both backends with no
+    arguments, and nothing read an environment variable. So an operator could load a perfect
+    profile and the worker would still look for `blastbox-sandbox` and report `apparmor_missing`:
+    the documented deployment instructions were not actionable (codex, #161).
+    """
+
+    def test_the_env_var_selects_the_profile_for_a_zero_arg_backend(self, monkeypatch) -> None:
+        """Zero-arg construction is what `select_sandbox` does -- see detect.py."""
+        monkeypatch.setenv("BLASTBOX_APPARMOR_PROFILE", "my-parser-profile")
+        assert BubblewrapSandbox()._apparmor_profile == "my-parser-profile"
+
+        import blastbox.worker.sandbox.nsjail as mod
+
+        assert mod.NsjailSandbox()._apparmor_profile == "my-parser-profile"
+
+    def test_an_explicit_argument_still_wins(self, monkeypatch) -> None:
+        """A caller that passed a name keeps control of it."""
+        monkeypatch.setenv("BLASTBOX_APPARMOR_PROFILE", "from-the-env")
+        sb = BubblewrapSandbox(apparmor_profile="from-the-caller")
+        assert sb._apparmor_profile == "from-the-caller"
+
+    def test_the_default_is_unchanged_when_nothing_is_set(self, monkeypatch) -> None:
+        monkeypatch.delenv("BLASTBOX_APPARMOR_PROFILE", raising=False)
+        assert BubblewrapSandbox()._apparmor_profile == "blastbox-sandbox"
+
+    def test_the_selected_profile_is_the_one_attached(self, tmp_path, monkeypatch) -> None:
+        """End to end: the name reaches the argv, so setting it actually confines."""
+        import shutil
+
+        import blastbox.worker.sandbox.apparmor as aa
+
+        f = tmp_path / "profiles"
+        f.write_text("my-parser-profile (enforce)\n")
+        monkeypatch.setattr(aa, "_PROFILES", str(f))
+        monkeypatch.delenv("BLASTBOX_APPARMOR_PROFILES", raising=False)
+        monkeypatch.setenv("BLASTBOX_APPARMOR_PROFILE", "my-parser-profile")
+        monkeypatch.setattr(shutil, "which", lambda n: "/usr/bin/aa-exec" if n == "aa-exec" else n)
+
+        sb = BubblewrapSandbox()
+        argv = sb._build_argv(SandboxRequest(argv=["/usr/bin/true"]))
+        assert "my-parser-profile" in argv
+        assert "apparmor_missing" not in sb.insecurity_reasons

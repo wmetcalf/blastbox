@@ -36,6 +36,26 @@ _PROFILES = "/sys/kernel/security/apparmor/profiles"
 _ENFORCING_MODES = frozenset({"enforce", "kill"})
 
 
+DEFAULT_PROFILE = "blastbox-sandbox"
+
+
+def resolve_profile(explicit: str | None = None) -> str:
+    """The profile name a backend should attach.
+
+    There was no way to choose one. Both backends took `apparmor_profile` as a constructor
+    argument, but `select_sandbox` -- the only path a real worker takes -- constructs them with
+    no arguments, and nothing read an environment variable. So an operator could load a perfect
+    profile and the worker would still look for `blastbox-sandbox` and report `apparmor_missing`
+    (codex, #161: the deployment instructions were not actionable).
+
+    Explicit argument wins over the environment, which wins over the built-in default; that
+    order keeps a caller that passed a name in control of it.
+    """
+    if explicit:
+        return explicit
+    return os.environ.get("BLASTBOX_APPARMOR_PROFILE", "").strip() or DEFAULT_PROFILE
+
+
 def profile_loaded(profile: str) -> bool:
     """True only if the named profile can be CONFIRMED loaded.
 

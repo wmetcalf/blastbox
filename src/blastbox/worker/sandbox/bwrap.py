@@ -44,6 +44,7 @@ from typing import Callable
 
 from blastbox.errors import SandboxError, SandboxUnavailable
 from blastbox.limits import Limits
+from blastbox.worker.sandbox.apparmor import DEFAULT_PROFILE, resolve_profile
 from blastbox.worker.sandbox.base import SandboxRequest, SandboxResult
 
 
@@ -53,7 +54,7 @@ _BWRAP = shutil.which("bwrap") or "/usr/bin/bwrap"
 
 # Default AppArmor profile to attach to the child process via aa-exec.
 # Profile must be loaded on the host kernel.
-_DEFAULT_APPARMOR_PROFILE = "blastbox-sandbox"
+_DEFAULT_APPARMOR_PROFILE = DEFAULT_PROFILE
 
 
 def _apparmor_profile_loaded(profile: str) -> bool:
@@ -146,7 +147,7 @@ class BubblewrapSandbox:
         self,
         bwrap_path: str = _BWRAP,
         *,
-        apparmor_profile: str = _DEFAULT_APPARMOR_PROFILE,
+        apparmor_profile: str | None = None,
     ) -> None:
         # Binary presence is RECORDED, not enforced at construction. The backend
         # stays constructible-for-inspection (secure / insecurity_reasons /
@@ -154,7 +155,7 @@ class BubblewrapSandbox:
         # SandboxUnavailable when the binary is actually needed.
         self._binary_present = bool(shutil.which(bwrap_path)) or Path(bwrap_path).exists()
         self._bwrap = bwrap_path
-        self._apparmor_profile = apparmor_profile
+        self._apparmor_profile = resolve_profile(apparmor_profile)
 
         # AppArmor: attach via ``aa-exec -p <profile> --`` ONLY when the profile
         # is confirmed loaded AND the helper exists. aa-exec against an unloaded
