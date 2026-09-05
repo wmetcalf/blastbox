@@ -185,6 +185,17 @@ def is_transport_error(exc: BaseException) -> bool:
     )
 
 
+class HostDiskTimeout(subprocess.TimeoutExpired):
+    """A HOST STORAGE helper exceeded its bound (mkfs.ext4, the outdisk copy).
+
+    A distinct type because the attribution differs from every other timeout in the system:
+    this one says the disk is stalled, so `is_host_resource_failure` excuses it from the
+    pool's restore streak and the cascade's per-tier streak. A runtime timing out -- `runsc
+    restore`, a firecracker boot -- is the opposite: that IS the tier failing, and the streaks
+    must count it or a broken tier is never repaired.
+    """
+
+
 def is_host_resource_failure(exc: BaseException) -> bool:
     """Whether a spawn failure is THIS HOST running out, rather than the tier being broken.
 
@@ -203,12 +214,17 @@ def is_host_resource_failure(exc: BaseException) -> bool:
         seen.add(id(cur))
         if isinstance(cur, OSError) and cur.errno in HOST_RESOURCE_ERRNOS:
             return True
-        # A host disk helper that ran out of time is the HOST failing, not the tier. Without
+        # A host DISK HELPER that ran out of time is the HOST failing, not the tier: without
         # this, repeated filesystem stalls walk the pool's restore streak and the cascade's
-        # per-tier streak up to the point where a perfectly healthy snapshot base is
-        # invalidated -- punishing the tier for the disk (codex, #154). subprocess.TimeoutExpired
-        # is not an OSError, so the errno rule above cannot see it.
-        if isinstance(cur, subprocess.TimeoutExpired):
+        # per-tier streak until a perfectly healthy snapshot base is invalidated -- punishing
+        # the tier for the disk.
+        #
+        # NARROW ON PURPOSE. Matching every subprocess.TimeoutExpired was wrong: the gVisor
+        # tier bounds `runsc restore` with its own cli_timeout_s, and a wedged or incompatible
+        # RUNTIME timing out there is exactly the tier failure the streaks exist to detect --
+        # excusing it would leave a broken tier unrepaired forever (codex, #154). Only the
+        # helpers that touch host storage raise HostDiskTimeout.
+        if isinstance(cur, HostDiskTimeout):
             return True
         cur = cur.__cause__ or cur.__context__
     return False

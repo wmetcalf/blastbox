@@ -49,6 +49,8 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+from blastbox.errors import HostDiskTimeout
 from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
@@ -424,6 +426,19 @@ def disk_timeout_s() -> float:
     return positive_float_env(os.environ, "BLASTBOX_FC_DISK_TIMEOUT_S", 600.0)
 
 
+def run_disk_helper(argv: list[str]) -> None:
+    """Run a host STORAGE helper, bounded, raising the narrow HostDiskTimeout on expiry.
+
+    Shared by mkfs.ext4 and the outdisk copy so the bound and the ATTRIBUTION are decided in
+    one place: a stalled disk must not be charged to the tier, and a tier timeout must not be
+    excused as a stalled disk.
+    """
+    try:
+        subprocess.run(argv, check=True, capture_output=True, timeout=disk_timeout_s())
+    except subprocess.TimeoutExpired as exc:
+        raise HostDiskTimeout(cmd=exc.cmd, timeout=exc.timeout) from exc
+
+
 def make_ext4(path: Path, size_mib: int) -> None:
     """Create a sparse ext4 image at ``path`` of ``size_mib`` MiB.
 
@@ -447,7 +462,7 @@ def make_ext4(path: Path, size_mib: int) -> None:
     file_path = Path(path)
     with open(file_path, "wb") as f:
         f.truncate(size_mib * 1024 * 1024)
-    subprocess.run(
+    run_disk_helper(
         [
             "mkfs.ext4",
             "-q",
@@ -457,16 +472,7 @@ def make_ext4(path: Path, size_mib: int) -> None:
             "-m",
             "0",
             str(file_path),
-        ],
-        check=True,
-        capture_output=True,
-        # BOUNDED. This runs on the per-slot SPAWN path, and `subprocess.run` has no default
-        # timeout -- so a stalled filesystem (a wedged overlay/NFS mount, a device error)
-        # blocked the spawning thread with nothing to time it out. The pool survives that but
-        # not for free: `stop()` reports "wedged spawn?" and the in-flight spawn stays
-        # uncommitted, holding node RAM/vCPU budget that no live worker is using. The sibling
-        # disk helpers here (debugfs rdump, e2fsck) were already bounded; this one was not.
-        timeout=disk_timeout_s(),
+        ]
     )
 
 
@@ -1148,6 +1154,28 @@ class FirecrackerSlotRuntime:
     # SlotRuntime protocol
     # ------------------------------------------------------------------
 
+    @property
+    def _stranded_scratch(self) -> list[str]:
+        """Slot dirs whose cleanup failed, awaiting a retry. Lazily created so instances built
+        without __init__ (test doubles, and the pool's own construction paths) still work."""
+        got = getattr(self, "_stranded_scratch_paths", None)
+        if got is None:
+            got = []
+            self._stranded_scratch_paths = got
+        return got
+
+    def _sweep_stranded_scratch(self) -> None:
+        """Retry removals that failed earlier. Never raises: a sweep must not break a spawn."""
+        pending = list(self._stranded_scratch)
+        if not pending:
+            return
+        self._stranded_scratch.clear()
+        for path in pending:
+            errs: list[str] = []
+            shutil.rmtree(path, onerror=lambda fn, p, exc: errs.append(str(p)))
+            if errs:
+                self._stranded_scratch.append(path)      # still stuck; try again next spawn
+
     def spawn(self) -> Slot:
         """Create a scratch dir, write fc-config.json, launch Firecracker.
 
@@ -1161,6 +1189,11 @@ class FirecrackerSlotRuntime:
         - No caller / job value can influence the argv elements.
         """
         import uuid
+
+        # BEFORE anything else: retry scratch dirs whose cleanup failed on an earlier spawn.
+        # A storage incident that stops mkfs also stops the rmtree that follows it, and
+        # nothing else in this tier would ever come back for them.
+        self._sweep_stranded_scratch()
 
         slot_id = str(uuid.uuid4())
         slot_dir = self._scratch_root / slot_id
@@ -1184,7 +1217,19 @@ class FirecrackerSlotRuntime:
         try:
             make_ext4(outdisk_path, self._cfg.fc_outdisk_mib)
         except BaseException:
-            shutil.rmtree(slot_dir, ignore_errors=True)
+            # ...and if the REMOVAL fails too -- EIO, EROFS, the same storage incident that
+            # made mkfs time out -- record the path. There is no orphan sweep for the plain FC
+            # tier, so `ignore_errors=True` alone would drop the only reference to a partial
+            # outdisk dir and every retry would leave another (codex, #154). The next spawn
+            # retries them, which is where the disk has had time to recover.
+            errs: list[str] = []
+            shutil.rmtree(slot_dir, onerror=lambda fn, p, exc: errs.append(str(p)))
+            if errs:
+                self._stranded_scratch.append(str(slot_dir))
+                _log.warning(
+                    "firecracker: could not remove partial slot dir %s; retaining it for the "
+                    "next spawn's sweep", slot_dir,
+                )
             raise
 
         # Build the vsock UDS path.  FC creates <uds_path> for the host side

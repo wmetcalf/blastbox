@@ -110,45 +110,86 @@ def test_a_missing_cp_still_falls_back(tmp_path, monkeypatch):
     assert dst.read_bytes() == b"payload", "the no-cp fallback stopped working"
 
 
+@pytest.fixture
+def stalled_source(tmp_path):
+    """A source whose `read()` blocks forever: a fifo held open by a writer that never writes.
+
+    Deterministic, unlike "a tiny timeout against a small file" -- with the copy now running in
+    a joined worker, an 8 MiB copy can beat a 0.0 s deadline and the test flakes on DID NOT
+    RAISE. A stall cannot be won by being fast.
+    """
+    import threading as _th
+
+    fifo = tmp_path / "stalled.src"
+    os.mkfifo(fifo)
+    release = _th.Event()
+
+    def _hold() -> None:
+        with open(fifo, "wb"):
+            release.wait(30)
+
+    _th.Thread(target=_hold, daemon=True).start()
+    yield fifo
+    release.set()
+
+
 class TestWhatTheBoundsChanged:
     """Follow-ups from review: introducing a timeout changes failure ATTRIBUTION and cleanup."""
 
     def test_a_disk_timeout_is_a_host_failure_not_a_tier_failure(self):
-        """`is_host_resource_failure` only knew OSError errnos, and TimeoutExpired is not an
-        OSError -- so repeated filesystem stalls would walk the pool's restore streak and the
-        cascade's per-tier streak until a HEALTHY snapshot base was invalidated, punishing the
-        tier for the disk."""
-        from blastbox.errors import is_host_resource_failure
+        """`is_host_resource_failure` only knew OSError errnos, and a timeout is not one -- so
+        repeated filesystem stalls would walk the pool's restore streak and the cascade's
+        per-tier streak until a HEALTHY snapshot base was invalidated: the disk's fault,
+        charged to the tier."""
+        from blastbox.errors import HostDiskTimeout, is_host_resource_failure
 
-        assert is_host_resource_failure(subprocess.TimeoutExpired(cmd="cp", timeout=1))
+        assert is_host_resource_failure(HostDiskTimeout(cmd="mkfs.ext4", timeout=1))
 
         # Through the cause chain, which is how it actually arrives (a launcher wraps it).
         try:
             try:
-                raise subprocess.TimeoutExpired(cmd="cp", timeout=1)
-            except subprocess.TimeoutExpired as inner:
+                raise HostDiskTimeout(cmd="cp", timeout=1)
+            except HostDiskTimeout as inner:
                 raise RuntimeError("snapshot restore failed") from inner
         except RuntimeError as outer:
             assert is_host_resource_failure(outer), "the wrapped timeout was blamed on the tier"
 
         assert not is_host_resource_failure(RuntimeError("an ordinary tier failure"))
 
-    def test_the_python_fallback_is_bounded_too(self, tmp_path, monkeypatch):
+    def test_a_runtime_timeout_is_still_the_tier_failing(self):
+        """The narrowing that matters. Excusing EVERY subprocess.TimeoutExpired was wrong: the
+        gVisor tier bounds `runsc restore` with its own cli_timeout_s, and a wedged or
+        incompatible RUNTIME timing out there is exactly what the streaks exist to detect.
+        Excusing it would leave a broken tier unrepaired forever."""
+        from blastbox.errors import is_host_resource_failure
+
+        runsc_timeout = subprocess.TimeoutExpired(cmd="runsc restore", timeout=600)
+        assert not is_host_resource_failure(runsc_timeout), (
+            "a wedged runtime was excused as a stalled disk; the tier would never be repaired"
+        )
+        try:
+            try:
+                raise runsc_timeout
+            except subprocess.TimeoutExpired as inner:
+                raise RuntimeError("gvisor restore failed") from inner
+        except RuntimeError as outer:
+            assert not is_host_resource_failure(outer)
+
+    def test_the_python_fallback_is_bounded_too(self, tmp_path, stalled_source):
         """`cp` missing or without --reflink (a BusyBox image) lands in the fallback
-        immediately -- and an unbounded copyfile there means the documented bound does not
-        hold on the very path the fallback exists for."""
+        immediately -- and an unbounded copy there means the documented bound does not hold on
+        the very path the fallback exists for."""
+        from blastbox.errors import HostDiskTimeout
         from blastbox.host.runtime import fc_snapshot_launcher as fl
 
-        src = tmp_path / "base.ext4"
-        src.write_bytes(b"x" * (8 << 20))          # 8 MiB, several chunks
         dst = tmp_path / "slot.ext4"
 
         started = time.monotonic()
-        with pytest.raises(subprocess.TimeoutExpired):
-            fl._copy_with_deadline(src, dst, 0.0)   # deadline already passed
+        with pytest.raises(HostDiskTimeout):
+            fl._copy_with_deadline(stalled_source, dst, 1.0)
         elapsed = time.monotonic() - started
 
-        assert elapsed < 10, f"the bounded copy took {elapsed:.0f}s"
+        assert elapsed < 20, f"the bounded copy took {elapsed:.0f}s"
         assert not dst.exists(), (
             "a truncated outdisk was left behind; the guest would mount it"
         )
@@ -233,24 +274,77 @@ class TestWhatTheBoundsChanged:
             "an unconfirmed firecracker was forgotten; nothing can account for or reap it"
         )
 
-    def test_the_no_cp_fallback_path_is_bounded_end_to_end(self, tmp_path, monkeypatch):
+    def test_the_no_cp_fallback_path_is_bounded_end_to_end(
+        self, tmp_path, monkeypatch, stalled_source
+    ):
         """Through `_default_copy_outdisk`, not the helper directly.
 
         Testing `_copy_with_deadline` alone leaves the WIRING unverified: reverting the
         fallback to a bare `shutil.copyfile` passed that test, because it never went through
         the fallback at all.
         """
+        from blastbox.errors import HostDiskTimeout
         from blastbox.host.runtime import fc_snapshot_launcher as fl
 
         empty = tmp_path / "emptybin"
         empty.mkdir()
         monkeypatch.setenv("PATH", str(empty))              # no `cp`: straight to the fallback
-        monkeypatch.setenv("BLASTBOX_FC_DISK_TIMEOUT_S", "0.001")
-        src = tmp_path / "base.ext4"
-        src.write_bytes(b"x" * (8 << 20))
+        monkeypatch.setenv("BLASTBOX_FC_DISK_TIMEOUT_S", "1")
         dst = tmp_path / "slot.ext4"
 
-        with pytest.raises(subprocess.TimeoutExpired):
-            fl._default_copy_outdisk(src, dst)
+        with pytest.raises(HostDiskTimeout):
+            fl._default_copy_outdisk(stalled_source, dst)
 
         assert not dst.exists(), "a truncated outdisk survived the bounded fallback"
+
+    def test_a_scratch_dir_whose_cleanup_fails_is_retried_on_the_next_spawn(
+        self, tmp_path, monkeypatch
+    ):
+        """The storage incident that makes mkfs time out also breaks the rmtree that follows.
+
+        `ignore_errors=True` alone would drop the only reference to that partial dir, and the
+        plain FC tier has no orphan sweep -- so every retry would leave another behind.
+        """
+        from blastbox.host.runtime import firecracker as fc
+
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+
+        class _Cfg:
+            fc_outdisk_mib = 8
+
+        rt = object.__new__(fc.FirecrackerSlotRuntime)
+        rt._scratch_root = scratch          # type: ignore[attr-defined]
+        rt._cfg = _Cfg()                    # type: ignore[attr-defined]
+
+        monkeypatch.setattr(
+            fc, "make_ext4",
+            lambda p, m: (_ for _ in ()).throw(fc.HostDiskTimeout(cmd="mkfs", timeout=1)),
+        )
+        # The removal fails too, exactly as it would on the stalled filesystem.
+        real_rmtree = fc.shutil.rmtree
+        broken = {"on": True}
+
+        def _rmtree(path, onerror=None, **kw):
+            if broken["on"]:
+                if onerror:
+                    onerror(os.rmdir, str(path), (OSError, OSError(5, "EIO"), None))
+                return
+            return real_rmtree(path, **kw)
+
+        monkeypatch.setattr(fc.shutil, "rmtree", _rmtree)
+
+        with pytest.raises(fc.HostDiskTimeout):
+            fc.FirecrackerSlotRuntime.spawn(rt)
+
+        assert rt._stranded_scratch, "the partial slot dir was forgotten; nothing can reclaim it"
+        stuck = list(rt._stranded_scratch)
+
+        # The disk recovers; the next spawn must clear what the last one could not.
+        broken["on"] = False
+        with pytest.raises(fc.HostDiskTimeout):
+            fc.FirecrackerSlotRuntime.spawn(rt)
+
+        assert not any(Path(p).exists() for p in stuck), (
+            f"the retained dirs were never reclaimed: {stuck}"
+        )
