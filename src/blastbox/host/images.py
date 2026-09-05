@@ -835,11 +835,30 @@ def source_repo_path(
 
 
 def missing_dockerfiles(plan: Plan, env: dict[str, str] | None = None) -> list[str]:
-    """Declared Dockerfiles that are not present, each shown with its context."""
+    """Declared Dockerfiles that are not present, each shown with its context.
+
+    A context that still holds an UNSET variable says so, because that is a
+    different problem with a different fix. The chains that build from
+    blastbox's own deploy/ declare `context = "$BLASTBOX_SRC"`, and with it
+    unset every one of their Dockerfiles reports as missing -- which reads as
+    "my repo has lost these files" when the truth is "one variable is not set".
+    `unresolved_destinations` already names its variables this way; this is the
+    same courtesy on the path an operator hits first.
+    """
+    environ = dict(os.environ) if env is None else env
     out: list[str] = []
     for spec in plan.images:
         path = dockerfile_path(plan, spec, env)
-        if not path.is_file():
+        if path.is_file():
+            continue
+        # Asked of the TEMPLATE via `unresolved_names`, for the reason that
+        # function documents: searching the expanded RESULT for a dollar cannot
+        # tell an unset placeholder from a directory whose name holds one.
+        unset = unresolved_names(spec.context, environ)
+        if unset:
+            names = ", ".join(sorted(unset))
+            out.append(f"{spec.dockerfile} (context {spec.context}: {names} is unset)")
+        else:
             where = spec.context if spec.context != "." else "this repo"
             out.append(f"{spec.dockerfile} (context {where})")
     return out
