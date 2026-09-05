@@ -168,11 +168,19 @@ class NsjailSandbox:
                 "nsjail_proc_apparmor_skipped reason=unsupported_by_installed_nsjail"
             )
 
+        from blastbox.worker.sandbox.apparmor import profile_loaded
+
+        self._apparmor_profile_loaded = profile_loaded(self._apparmor_profile)
+
         self._insecurity_reasons: list[str] = []
         if not self._binary_present:
             self._insecurity_reasons.append("binary_missing")
         if self._seccomp_policy is None:
             self._insecurity_reasons.append("seccomp_policy_missing")
+        # SAY SO. Skipping the confinement quietly would report a sandbox as secure while the
+        # child runs unconfined -- the same reason bwrap records this.
+        if self._proc_apparmor_supported and not self._apparmor_profile_loaded:
+            self._insecurity_reasons.append("apparmor_missing")
 
         _log.info(
             "NsjailSandbox initialised",
@@ -347,7 +355,16 @@ class NsjailSandbox:
             argv += ["--seccomp_policy", str(self._seccomp_policy)]
 
         # AppArmor profile via nsjail's in-kernel AA_CHANGE_ONEXEC path.
-        if self._proc_apparmor_supported:
+        #
+        # ONLY when the profile is confirmed loaded. AA_CHANGE_ONEXEC against an unloaded
+        # profile FAILS THE EXEC -- so attaching it unconditionally does not weaken the
+        # sandbox, it breaks every run. And the default names `blastbox-sandbox`, which this
+        # repository does not ship (issue #158), so the flag was being attached for a profile
+        # that is absent by default on any host whose nsjail advertises support.
+        #
+        # bwrap has always checked before using aa-exec, for exactly this reason; nsjail did
+        # not. Same question, same consequence, now the same check.
+        if self._proc_apparmor_supported and self._apparmor_profile_loaded:
             argv += ["--proc_apparmor", self._apparmor_profile]
 
         argv += ["--", *req.argv]

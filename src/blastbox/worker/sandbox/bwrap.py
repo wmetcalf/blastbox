@@ -59,22 +59,18 @@ _DEFAULT_APPARMOR_PROFILE = "blastbox-sandbox"
 def _apparmor_profile_loaded(profile: str) -> bool:
     """True only if we can CONFIRM the named AppArmor profile is loaded.
 
-    ``aa-exec`` against an *unloaded* profile fails the exec, which would break
-    every ``run``. So attach it only when sure: an explicit
-    ``BLASTBOX_APPARMOR_PROFILES`` (comma list) assertion wins; otherwise read
-    the world-readable apparmor securityfs. Any uncertainty (securityfs
-    unreadable, profile absent) → ``False`` → skip aa-exec and record
-    ``apparmor_missing``, so the sandbox still functions (just less hardened)
-    instead of failing outright.
+    ``aa-exec`` against an *unloaded* profile fails the exec, which would break every ``run``.
+    So attach it only when sure; any uncertainty means skip aa-exec and record
+    ``apparmor_missing``, so the sandbox still functions (just less hardened) instead of
+    failing outright.
+
+    The check itself now lives in `apparmor.profile_loaded`, shared with the nsjail backend --
+    which had the same hazard and no check at all (issue #158).
     """
-    asserted = os.environ.get("BLASTBOX_APPARMOR_PROFILES", "").strip()
-    if asserted:
-        return profile in {p.strip() for p in asserted.split(",") if p.strip()}
-    try:
-        with open("/sys/kernel/security/apparmor/profiles", encoding="ascii") as fh:
-            return any(line.split(" ", 1)[0] == profile for line in fh)
-    except OSError:
-        return False
+    from blastbox.worker.sandbox.apparmor import profile_loaded
+
+    return profile_loaded(profile)
+
 
 # Minimal safe environment passed to every child process.
 # HOST os.environ is NEVER inherited.

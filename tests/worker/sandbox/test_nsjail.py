@@ -376,3 +376,54 @@ class TestNsjailRealRun:
         assert isinstance(result.stdout, bytes)
         assert isinstance(result.stderr, bytes)
         assert isinstance(result.killed, bool)
+
+
+class TestProcApparmorOnlyWhenTheProfileExists:
+    """`--proc_apparmor <profile>` is AA_CHANGE_ONEXEC: against an UNLOADED profile it fails
+    the exec, so attaching it unconditionally does not weaken the sandbox -- it breaks every
+    run.
+
+    nsjail attached it whenever the installed binary advertised support, naming
+    `blastbox-sandbox`, a profile this repository does not ship (issue #158). bwrap has always
+    checked before using aa-exec for exactly this reason; nsjail did not.
+    """
+
+    @staticmethod
+    def _sandbox(monkeypatch, *, supported: bool, loaded: bool):
+        import blastbox.worker.sandbox.apparmor as aa
+        import blastbox.worker.sandbox.nsjail as mod
+
+        monkeypatch.setattr(aa, "profile_loaded", lambda _p: loaded)
+        monkeypatch.setattr(mod, "_probe_nsjail_proc_apparmor", lambda _p: supported)
+        return mod.NsjailSandbox(nsjail_path="/usr/local/bin/nsjail")
+
+    def test_the_flag_is_omitted_when_the_profile_is_not_loaded(self, monkeypatch) -> None:
+        sb = self._sandbox(monkeypatch, supported=True, loaded=False)
+        argv = sb._build_argv(SandboxRequest(argv=["/usr/bin/true"]))
+
+        assert "--proc_apparmor" not in argv, (
+            "AA_CHANGE_ONEXEC against an unloaded profile fails the exec: every run would break"
+        )
+
+    def test_the_flag_is_attached_when_the_profile_is_loaded(self, monkeypatch) -> None:
+        """The control: the confinement must still be applied where it exists."""
+        sb = self._sandbox(monkeypatch, supported=True, loaded=True)
+        argv = sb._build_argv(SandboxRequest(argv=["/usr/bin/true"]))
+
+        assert "--proc_apparmor" in argv
+        assert argv[argv.index("--proc_apparmor") + 1] == "blastbox-sandbox"
+
+    def test_a_skipped_profile_is_reported_as_insecure(self, monkeypatch) -> None:
+        """Skipping it quietly would report a sandbox as secure while the child runs
+        unconfined -- the same reason bwrap records this."""
+        sb = self._sandbox(monkeypatch, supported=True, loaded=False)
+
+        assert "apparmor_missing" in sb.insecurity_reasons
+        assert sb.secure is False
+
+    def test_nothing_is_reported_when_nsjail_cannot_do_it_anyway(self, monkeypatch) -> None:
+        """An nsjail without --proc_apparmor support was never going to confine via this path,
+        so a missing profile is not a finding about THIS host's hardening."""
+        sb = self._sandbox(monkeypatch, supported=False, loaded=False)
+
+        assert "apparmor_missing" not in sb.insecurity_reasons
