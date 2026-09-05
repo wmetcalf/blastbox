@@ -73,51 +73,94 @@ def test_concurrency_overlaps_spawns():
 def test_ceiling_holds_when_batches_overlap():
     """The reservation counter, against the caller it exists to defend against.
 
-    The previous version of this test asked for warm_size=10 with ceiling=4 and
-    asserted the pool stayed at 4. `WarmPool.__init__` clamps warm_size DOWN to
-    the ceiling, so the target was 4 all along and no overshoot was ever
-    attempted: deleting both the headroom clamp and the in-flight check left it
-    passing. It was skipped as vacuous rather than deleted, with a note to
+    The previous version asked for warm_size=10 with ceiling=4 and asserted the
+    pool stayed at 4. `WarmPool.__init__` clamps warm_size DOWN to the ceiling,
+    so the target was 4 all along and no overshoot was ever attempted: deleting
+    both guards left it passing. It was skipped as vacuous with a note to
     rewrite it against a real overshoot. This is that rewrite.
 
     `_spawn_batch_concurrent` documents `_spawns_in_flight` as defensive -- the
-    maintenance thread waits for each batch, so today's batches cannot overlap
-    and the counter is unreachable through `tick()`. It exists for "a future
+    maintenance thread waits for each batch, so batches cannot overlap through
+    `tick()` and the counter is unreachable that way. It exists for "a future
     caller which issues batches without waiting", so the test IS that caller:
-    two batches are issued concurrently, each asking for the whole ceiling.
+    two batches issued concurrently, each asking for the whole ceiling.
 
-    Without the reservation counter, both batches see an empty pool, both
-    reserve the full ceiling, and the node ends up with twice the workers it is
-    allowed -- which on a real tier is twice the RAM.
+    Without the counter both batches see an empty pool, both reserve the full
+    ceiling, and the pool promises the node twice the workers it is allowed.
     """
     rt = _SlowSpawnRuntime(delay=0.15)
     ceiling = 4
     pool = WarmPool(runtime=rt, warm_size=ceiling, concurrent_ceiling=ceiling,
                     spawn_rate_limit=1000.0, spawn_concurrency=ceiling)
 
-    # The RESERVATION LOOPS must overlap, which entering the function together
-    # does not guarantee: the scheduler may let one caller reserve, spawn and
-    # publish all four before the other reserves at all, and then even the
-    # unguarded predicate yields four slots and the regression passes. Hooking
-    # the token bucket -- consumed once per reservation -- holds the first
-    # caller inside its loop until the second is in its own.
+    # Two synchronisation points, because entering the function together proves
+    # nothing about the reservation loops:
+    #
+    #   both_reserving  -- neither caller passes its FIRST token until the other
+    #                      is in its loop too. The bucket is consumed once per
+    #                      reservation attempt, so this puts them there together.
+    #   both_consumed   -- no slot is PUBLISHED until both callers have taken a
+    #                      token. A caller's ceiling check follows its token
+    #                      immediately, so this stops one caller reserving,
+    #                      spawning and publishing a full pool before the other
+    #                      checks anything -- which lets the unguarded predicate
+    #                      yield four slots and the regression survive. Measured
+    #                      before this gate: the mutant escaped 4 runs in 10.
+    #
+    # Blocking each caller's SECOND consume instead -- proving a reservation
+    # completed rather than merely started -- is worse: when the ceiling
+    # legitimately stops the other caller at its first check it never reaches
+    # consume #2, the barrier times out, and the mutant escapes more often
+    # (measured 3/5).
+    peak_reserved = 0
+
+    def _sample_reserved() -> None:
+        nonlocal peak_reserved
+        peak_reserved = max(peak_reserved, pool._spawns_in_flight)
+
     both_reserving = threading.Barrier(2, timeout=5)
-    seen_callers: set[int] = set()
+    both_consumed = threading.Event()
+    consumes: dict[int, int] = {}
     seen_lock = threading.Lock()
     real_consume = pool._bucket.consume
 
     def interleaved_consume():
+        caller = threading.get_ident()
         with seen_lock:
-            first_for_this_thread = threading.get_ident() not in seen_callers
-            seen_callers.add(threading.get_ident())
-        if first_for_this_thread:
+            consumes[caller] = consumes.get(caller, 0) + 1
+            first_token = consumes[caller] == 1
+            everyone_in = len(consumes) == 2
+        if everyone_in:
+            both_consumed.set()
+        if first_token:
             try:
                 both_reserving.wait()
             except threading.BrokenBarrierError:
                 pass
+        # Sampled HERE, inside the reservation loop, not only at spawn time.
+        # Whether the over-reserved spawns end up published is a race -- the
+        # gate declines them and releases reservations while later gated calls
+        # are still deciding -- so the published count detects the regression
+        # only most of the time (measured 8 runs in 10). The RESERVATION count
+        # does not race: with the counter dropped from the predicate, both
+        # callers reserve the whole ceiling before anything is published,
+        # because publication waits on `both_consumed` and spawns are slow.
+        _sample_reserved()
         return real_consume()
 
     pool._bucket.consume = interleaved_consume
+
+    # Watch the RESERVATIONS too, not only the slots that get published: each is
+    # an intent to create a worker, and the pre-spawn gate declining it later
+    # still means the pool briefly promised the node more than its ceiling.
+    real_spawn = rt.spawn
+
+    def watched_spawn():
+        both_consumed.wait(timeout=5)
+        _sample_reserved()
+        return real_spawn()
+
+    rt.spawn = watched_spawn
 
     # Futures, not raw threads: a raw thread's exception never reaches the test,
     # so one caller could fail outright while the other filled the pool and
@@ -127,14 +170,13 @@ def test_ceiling_holds_when_batches_overlap():
             ex.submit(pool._spawn_batch_concurrent, ceiling, None) for _ in range(2)
         ]
         for future in futures:
-            future.result(timeout=10)   # re-raises whatever that caller raised
+            future.result(timeout=15)   # re-raises whatever that caller raised
 
-    # EXACTLY the ceiling: not fewer either. Two batches asking for 4 each must
-    # fill the pool to 4, not deadlock it. Bounding reservations by published
-    # slots alone (dropping `_spawns_in_flight` from the reservation check)
-    # makes both batches reserve the full ceiling, and then the pre-spawn gate
-    # declines every one of them -- the pool creates NOTHING and the ceiling
-    # "holds" vacuously, which is how the previous version of this test passed.
+    # EXACTLY the ceiling, not merely at most: two batches asking for 4 each
+    # must FILL the pool to 4, not deadlock it. Bounding reservations by
+    # published slots alone makes both batches reserve the full ceiling and the
+    # pre-spawn gate then declines every one of them -- the pool creates
+    # NOTHING and the ceiling "holds" vacuously, exactly as it did before.
     assert len(pool._slots) == ceiling, (
         f"expected the pool to fill to {ceiling}, got {len(pool._slots)} slots"
     )
@@ -142,6 +184,15 @@ def test_ceiling_holds_when_batches_overlap():
         f"more spawns in flight than the ceiling allows: {rt.max_in_flight}"
     )
     assert pool._spawns_in_flight == 0, "every reservation must be released"
+    assert peak_reserved <= ceiling, (
+        f"reservations overshot the ceiling: {peak_reserved} > {ceiling}"
+    )
+    # The schedule this test needs actually happened. Without this a run where
+    # one caller never reached its loop would pass silently, and the regression
+    # would go undetected on exactly that run.
+    assert len(consumes) == 2, (
+        f"both callers must reach the reservation loop; only {len(consumes)} did"
+    )
 
 
 def test_failed_spawns_do_not_wedge_the_batch():
