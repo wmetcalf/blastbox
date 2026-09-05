@@ -161,10 +161,12 @@ class BubblewrapSandbox:
         # profile fails the exec — which would break every run — so when the
         # profile can't be confirmed we skip aa-exec (and record apparmor_missing)
         # rather than break the sandbox.
-        self._aa_exec: str | None = None
-        if _apparmor_profile_loaded(self._apparmor_profile):
-            self._aa_exec = shutil.which("aa-exec")
-        if self._aa_exec is not None:
+        # Two independent facts, and they were conflated: whether the HELPER exists (static,
+        # a binary on disk) and whether the PROFILE is enforcing (dynamic, kernel state an
+        # operator can change under a running worker). Only the first belongs in a constructor.
+        self._aa_exec: str | None = shutil.which("aa-exec")
+        self._apparmor_last_seen: bool | None = None
+        if self.apparmor_active:
             _log.info(
                 "bwrap_apparmor_attach_enabled aa_exec=%s profile=%s",
                 self._aa_exec,
@@ -208,16 +210,14 @@ class BubblewrapSandbox:
                 "fix=install_python3-libseccomp_or_use_nsjail_backend_or_set_BLASTBOX_WARN_ON_INSECURE"
             )
 
-        self._insecurity_reasons: list[str] = []
+        self._static_insecurity_reasons: list[str] = []
         if not self._binary_present:
-            self._insecurity_reasons.append("binary_missing")
+            self._static_insecurity_reasons.append("binary_missing")
         if not self._seccomp_active:
             # No BPF attached -> insecure on the seccomp axis (keep the historical reason string).
-            self._insecurity_reasons.append("seccomp_not_implemented")
-        if not self._aa_exec:
-            self._insecurity_reasons.append("apparmor_missing")
+            self._static_insecurity_reasons.append("seccomp_not_implemented")
         if not self._cgroup_pids_supported:
-            self._insecurity_reasons.append("pid_limit_missing")
+            self._static_insecurity_reasons.append("pid_limit_missing")
 
         _log.info(
             "BubblewrapSandbox initialised",
@@ -225,22 +225,52 @@ class BubblewrapSandbox:
                 "seccomp_active": self._seccomp_active,
                 "apparmor": self._aa_exec,
                 "cgroup_pids": self._cgroup_pids_supported,
-                "insecurity_reasons": self._insecurity_reasons,
+                "insecurity_reasons": self.insecurity_reasons,
             },
         )
 
     # ------------------------------------------------------------------
     # Properties
 
+    def _apparmor_enforcing_now(self) -> bool:
+        """Whether the profile is enforcing AT THIS MOMENT.
+
+        A constructor snapshot goes stale in the direction that matters: switch the profile to
+        complain mode -- or unload it -- under a long-lived worker and the cached True keeps
+        attaching, and keeps REPORTING, a confinement the kernel stopped providing (codex,
+        #159). securityfs is a few dozen lines; re-reading it per launch costs nothing beside
+        spawning a sandbox.
+
+        Note what "fail closed" can and cannot mean here. It means never CLAIM or attach
+        confinement we cannot confirm. It does not mean refusing to run: the same False is what
+        an unreadable securityfs produces, and a worker that refused every job because it
+        cannot read /sys would be a worse outage than the one it prevents. The operator sees
+        `apparmor_missing`, and BLASTBOX_APPARMOR_PROFILES is the assertion for that host.
+        """
+        loaded = _apparmor_profile_loaded(self._apparmor_profile)
+        if loaded != self._apparmor_last_seen:
+            if self._apparmor_last_seen is not None:
+                _log.warning(
+                    "bwrap_apparmor_state_changed profile=%s enforcing=%s "
+                    "note=reevaluated_per_launch_not_cached_at_construction",
+                    self._apparmor_profile,
+                    loaded,
+                )
+            self._apparmor_last_seen = loaded
+        return loaded
+
     @property
     def secure(self) -> bool:
         """``False`` if any insecurity reason is present."""
-        return not bool(self._insecurity_reasons)
+        return not bool(self.insecurity_reasons)
 
     @property
     def insecurity_reasons(self) -> list[str]:
-        """Copy of the list of insecurity reason strings."""
-        return list(self._insecurity_reasons)
+        """The insecurity reasons AS OF NOW (the AppArmor one is re-read, not frozen)."""
+        reasons = list(self._static_insecurity_reasons)
+        if not self.apparmor_active:
+            reasons.append("apparmor_missing")
+        return reasons
 
     @property
     def seccomp_active(self) -> bool:
@@ -248,7 +278,8 @@ class BubblewrapSandbox:
 
     @property
     def apparmor_active(self) -> bool:
-        return self._aa_exec is not None
+        """Both halves: the helper exists AND the profile is enforcing right now."""
+        return self._aa_exec is not None and self._apparmor_enforcing_now()
 
     @property
     def cgroup_pids_supported(self) -> bool:
@@ -397,8 +428,11 @@ class BubblewrapSandbox:
         # If the profile is not loaded on the host kernel, aa-exec errors
         # out loudly rather than silently running unconfined.
         inner: list[str] = list(req.argv)
-        if self._aa_exec is not None:
-            inner = [self._aa_exec, "-p", self._apparmor_profile, "--", *inner]
+        aa_exec = self._aa_exec
+        # Spelled out rather than `if self.apparmor_active` so the narrowing is visible to the
+        # type checker; the condition is the same one, in the same order.
+        if aa_exec is not None and self._apparmor_enforcing_now():
+            inner = [aa_exec, "-p", self._apparmor_profile, "--", *inner]
         argv += inner
         return argv
 

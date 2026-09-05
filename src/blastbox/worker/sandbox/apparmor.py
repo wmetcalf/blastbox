@@ -18,6 +18,23 @@ import os
 
 _PROFILES = "/sys/kernel/security/apparmor/profiles"
 
+# The modes the kernel prints for a profile that actually DENIES. Measured against a real
+# AppArmor 4.0.1 host (toolz2) by loading a scratch profile under each `flags=(...)` and
+# reading the line back, rather than guessing at the strings:
+#
+#     flags=(enforce)   -> `name (enforce)`     denies
+#     flags=(kill)      -> `name (kill)`        denies, and kills the violating task
+#     flags=(complain)  -> `name (complain)`    logs and ALLOWS
+#     flags=(unconfined)-> `name (unconfined)`  no confinement at all
+#     flags=(prompt)    -> `name (user)`        denial is referred to a userspace agent
+#
+# `kill` is strictly stronger than `enforce` and belongs here (codex, #159). `user` (prompt
+# mode) does not: its answer to a denial comes from a process outside this system, which can
+# grant what the policy refuses, so it is not a confinement guarantee for untrusted input.
+# Anything unrecognised is not a promise of enforcement either -- unknown modes fail closed.
+# An operator who knows better has BLASTBOX_APPARMOR_PROFILES.
+_ENFORCING_MODES = frozenset({"enforce", "kill"})
+
 
 def profile_loaded(profile: str) -> bool:
     """True only if the named profile can be CONFIRMED loaded.
@@ -28,11 +45,13 @@ def profile_loaded(profile: str) -> bool:
     not readable by the worker but the operator knows what is loaded.
     """
     asserted = os.environ.get("BLASTBOX_APPARMOR_PROFILES", "").strip()
-    if asserted:
+    if profile in {p.strip() for p in asserted.split(",") if p.strip()}:
         # An operator assertion for hosts where securityfs is unreadable by the worker. It
         # asserts ENFORCEMENT, not mere presence -- naming a complain-mode profile here is the
-        # operator telling us something untrue.
-        return profile in {p.strip() for p in asserted.split(",") if p.strip()}
+        # operator telling us something untrue. It is an ADDITIONAL source of evidence, not an
+        # override: an operator who lists A and B has said nothing about C, and refusing a C
+        # the kernel reports as enforcing would drop real confinement for no gain.
+        return True
     try:
         # `surrogateescape`, not `ascii`: an AppArmor profile name is usually a PATH, and a
         # path is bytes, so one profile with a non-UTF-8 byte -- belonging to some UNRELATED
@@ -60,4 +79,4 @@ def _line_is_enforcing(line: str, profile: str) -> bool:
     name, _, rest = line.strip().partition(" (")
     if name != profile:
         return False
-    return rest.rstrip().rstrip(")") == "enforce"
+    return rest.rstrip().rstrip(")") in _ENFORCING_MODES

@@ -728,3 +728,45 @@ def test_resource_caps_explicit_env_override_wins(monkeypatch):
     argv = _argv()
     assert argv[argv.index("--memory") + 1] == "3g"
     assert argv[argv.index("--cpus") + 1] == "2"
+
+
+class TestDockerApparmorNeedsAnEnforcingProfile:
+    """The docker runtime carried a THIRD private copy of the profile check, and it had drifted
+    the way copies do: matched by name, so a `complain` profile produced
+    `--security-opt apparmor=blastbox-worker` AND suppressed the operator warning -- the
+    container reported as confined by a policy that only logged (codex, #159).
+    """
+
+    def _argv(self, tmp_path, monkeypatch, contents: str, warnings: list[str]):
+        import blastbox.worker.sandbox.apparmor as aa
+
+        f = tmp_path / "profiles"
+        f.write_text(contents)
+        monkeypatch.setattr(aa, "_PROFILES", str(f))
+        monkeypatch.delenv("BLASTBOX_APPARMOR_PROFILES", raising=False)
+        runtime = RuntimeSelection(runtime="runsc", secure=True, warnings=warnings)
+        return build_worker_docker_run_argv(
+            image="img",
+            input_path=tmp_path / "in",
+            input_mount_path="/job/input",
+            output_dir=tmp_path / "out",
+            output_mount_path="/job/output",
+            worker_argv=["run"],
+            runtime=runtime,
+        )
+
+    def test_enforcing_profile_is_attached(self, tmp_path, monkeypatch) -> None:
+        warnings: list[str] = []
+        argv = self._argv(tmp_path, monkeypatch, "blastbox-worker (enforce)\n", warnings)
+        assert any("apparmor=blastbox-worker" in a for a in argv)
+        assert not any("apparmor" in w.lower() for w in warnings)
+
+    def test_complain_profile_is_not_attached_and_the_operator_is_told(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        warnings: list[str] = []
+        argv = self._argv(tmp_path, monkeypatch, "blastbox-worker (complain)\n", warnings)
+        assert not any("apparmor=" in a for a in argv), (
+            "a complain-mode profile logs and allows; attaching it claims confinement"
+        )
+        assert any("apparmor" in w.lower() for w in warnings)

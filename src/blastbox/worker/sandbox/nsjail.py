@@ -35,6 +35,7 @@ import subprocess
 from pathlib import Path
 
 from blastbox.errors import SandboxError, SandboxUnavailable
+from blastbox.worker.sandbox.apparmor import profile_loaded
 from blastbox.worker.sandbox.base import SandboxRequest, SandboxResult
 
 
@@ -168,19 +169,16 @@ class NsjailSandbox:
                 "nsjail_proc_apparmor_skipped reason=unsupported_by_installed_nsjail"
             )
 
-        from blastbox.worker.sandbox.apparmor import profile_loaded
+        # The profile's MODE is read per launch, not cached here -- see
+        # _apparmor_enforcing_now(). This only remembers the last answer so a change can be
+        # logged once instead of every job.
+        self._apparmor_last_seen: bool | None = None
 
-        self._apparmor_profile_loaded = profile_loaded(self._apparmor_profile)
-
-        self._insecurity_reasons: list[str] = []
+        self._static_insecurity_reasons: list[str] = []
         if not self._binary_present:
-            self._insecurity_reasons.append("binary_missing")
+            self._static_insecurity_reasons.append("binary_missing")
         if self._seccomp_policy is None:
-            self._insecurity_reasons.append("seccomp_policy_missing")
-        # SAY SO. Skipping the confinement quietly would report a sandbox as secure while the
-        # child runs unconfined -- the same reason bwrap records this.
-        if self._proc_apparmor_supported and not self._apparmor_profile_loaded:
-            self._insecurity_reasons.append("apparmor_missing")
+            self._static_insecurity_reasons.append("seccomp_policy_missing")
 
         _log.info(
             "NsjailSandbox initialised",
@@ -188,9 +186,36 @@ class NsjailSandbox:
                 "seccomp_policy": str(self._seccomp_policy),
                 "proc_apparmor": self._proc_apparmor_supported,
                 "proc_apparmor_attached": self.apparmor_active,
-                "insecurity_reasons": self._insecurity_reasons,
+                "insecurity_reasons": self.insecurity_reasons,
             },
         )
+
+    def _apparmor_enforcing_now(self) -> bool:
+        """Whether the profile is enforcing AT THIS MOMENT.
+
+        A constructor snapshot goes stale in the direction that matters: switch the profile to
+        complain mode -- or unload it -- under a long-lived worker and the cached True keeps
+        attaching, and keeps REPORTING, a confinement the kernel stopped providing (codex,
+        #159). securityfs is a few dozen lines; re-reading it per launch costs nothing beside
+        spawning a sandbox.
+
+        Note what "fail closed" can and cannot mean here. It means never CLAIM or attach
+        confinement we cannot confirm. It does not mean refusing to run: the same False is what
+        an unreadable securityfs produces, and a worker that refused every job because it
+        cannot read /sys would be a worse outage than the one it prevents. The operator sees
+        `apparmor_missing`, and BLASTBOX_APPARMOR_PROFILES is the assertion for that host.
+        """
+        loaded = profile_loaded(self._apparmor_profile)
+        if loaded != self._apparmor_last_seen:
+            if self._apparmor_last_seen is not None:
+                _log.warning(
+                    "nsjail_apparmor_state_changed profile=%s enforcing=%s "
+                    "note=reevaluated_per_launch_not_cached_at_construction",
+                    self._apparmor_profile,
+                    loaded,
+                )
+            self._apparmor_last_seen = loaded
+        return loaded
 
     # ------------------------------------------------------------------
     # Properties
@@ -198,12 +223,21 @@ class NsjailSandbox:
     @property
     def secure(self) -> bool:
         """``False`` if any insecurity reason is present."""
-        return not bool(self._insecurity_reasons)
+        return not bool(self.insecurity_reasons)
 
     @property
     def insecurity_reasons(self) -> list[str]:
-        """Copy of the list of insecurity reason strings."""
-        return list(self._insecurity_reasons)
+        """The insecurity reasons AS OF NOW.
+
+        The AppArmor reason is recomputed rather than frozen at construction, so a profile
+        switched to complain mid-life is visible here instead of nowhere at all.
+        """
+        reasons = list(self._static_insecurity_reasons)
+        # SAY SO. Skipping the confinement quietly would report a sandbox as secure while the
+        # child runs unconfined -- the same reason bwrap records this.
+        if self._proc_apparmor_supported and not self._apparmor_enforcing_now():
+            reasons.append("apparmor_missing")
+        return reasons
 
     @property
     def seccomp_active(self) -> bool:
@@ -217,7 +251,7 @@ class NsjailSandbox:
         while `_build_argv` was omitting the flag because the profile is not loaded (codex,
         #159).
         """
-        return self._proc_apparmor_supported and self._apparmor_profile_loaded
+        return self._proc_apparmor_supported and self._apparmor_enforcing_now()
 
     # ------------------------------------------------------------------
     # Public interface
@@ -371,7 +405,7 @@ class NsjailSandbox:
         #
         # bwrap has always checked before using aa-exec, for exactly this reason; nsjail did
         # not. Same question, same consequence, now the same check.
-        if self._proc_apparmor_supported and self._apparmor_profile_loaded:
+        if self._proc_apparmor_supported and self._apparmor_enforcing_now():
             argv += ["--proc_apparmor", self._apparmor_profile]
 
         argv += ["--", *req.argv]

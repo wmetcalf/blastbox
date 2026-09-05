@@ -400,10 +400,13 @@ class TestProcApparmorOnlyWhenTheProfileExists:
 
     @staticmethod
     def _sandbox(monkeypatch, *, supported: bool, loaded: bool):
-        import blastbox.worker.sandbox.apparmor as aa
         import blastbox.worker.sandbox.nsjail as mod
 
-        monkeypatch.setattr(aa, "profile_loaded", lambda _p: loaded)
+        # Patch the name NSJAIL calls. Patching it on the apparmor module instead did nothing
+        # once nsjail imported it at module scope, and the `loaded=False` cases still passed --
+        # because the unpatched host answers False too. The `loaded=True` cases are what caught
+        # it, which is why the pair is kept together.
+        monkeypatch.setattr(mod, "profile_loaded", lambda _p: loaded)
         monkeypatch.setattr(mod, "_probe_nsjail_proc_apparmor", lambda _p: supported)
         return mod.NsjailSandbox(nsjail_path="/usr/local/bin/nsjail")
 
@@ -452,3 +455,50 @@ class TestProcApparmorOnlyWhenTheProfileExists:
     def test_apparmor_active_is_true_when_it_really_is(self, monkeypatch) -> None:
         sb = self._sandbox(monkeypatch, supported=True, loaded=True)
         assert sb.apparmor_active is True
+
+    def _degraded_sandbox(self, tmp_path, monkeypatch):
+        """A sandbox built while the profile was enforcing, whose profile has since been
+        switched to complain -- the real securityfs read, twice, with the file changed in
+        between, because the thing under test is that it is read AGAIN.
+
+        Each caller asserts on ONE consumer and touches nothing else first. That is not style:
+        every consumer refreshes the same last-seen field, so checking `apparmor_active` before
+        `_build_argv` would let a build that reads the CACHE pass. Both orderings were run
+        against a cached-read mutant -- the combined test survived it, these do not.
+        """
+        import blastbox.worker.sandbox.apparmor as aa
+        import blastbox.worker.sandbox.nsjail as mod
+
+        f = tmp_path / "profiles"
+        f.write_text("blastbox-sandbox (enforce)\n")
+        monkeypatch.setattr(aa, "_PROFILES", str(f))
+        monkeypatch.delenv("BLASTBOX_APPARMOR_PROFILES", raising=False)
+        monkeypatch.setattr(mod, "_probe_nsjail_proc_apparmor", lambda _p: True)
+
+        sb = mod.NsjailSandbox(nsjail_path="/usr/local/bin/nsjail")
+        # Construction observed an enforcing profile, so a cached answer is True from here on.
+        assert sb.apparmor_active is True
+        assert "--proc_apparmor" in sb._build_argv(SandboxRequest(argv=["/usr/bin/true"]))
+        assert "apparmor_missing" not in sb.insecurity_reasons
+
+        f.write_text("blastbox-sandbox (complain)\n")
+        return sb
+
+    def test_the_flag_is_dropped_when_the_profile_stops_enforcing(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        sb = self._degraded_sandbox(tmp_path, monkeypatch)
+        assert "--proc_apparmor" not in sb._build_argv(SandboxRequest(argv=["/usr/bin/true"]))
+
+    def test_the_insecurity_reason_appears_when_the_profile_stops_enforcing(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        sb = self._degraded_sandbox(tmp_path, monkeypatch)
+        assert "apparmor_missing" in sb.insecurity_reasons
+        assert sb.secure is False
+
+    def test_apparmor_active_goes_false_when_the_profile_stops_enforcing(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        sb = self._degraded_sandbox(tmp_path, monkeypatch)
+        assert sb.apparmor_active is False

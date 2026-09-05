@@ -473,7 +473,12 @@ def test_aa_exec_gated_on_profile_loaded(monkeypatch):
     monkeypatch.delenv("BLASTBOX_APPARMOR_PROFILES", raising=False)
     assert _apparmor_profile_loaded("no-such-profile-xyzzy") is False
     sb = BubblewrapSandbox(apparmor_profile="no-such-profile-xyzzy")
-    assert sb._aa_exec is None
+    # Assert the BEHAVIOUR, not the attribute: `_aa_exec` now means only "the helper exists",
+    # because whether the profile is enforcing is kernel state that changes under a running
+    # worker and so is re-read per launch.
+    assert sb.apparmor_active is False
+    argv = sb._build_argv(SandboxRequest(argv=["/usr/bin/true"]))
+    assert "no-such-profile-xyzzy" not in argv
     assert "apparmor_missing" in sb.insecurity_reasons
     assert sb.secure is False
 
@@ -645,3 +650,78 @@ class TestAnUndecodableProfileNameCannotBreakTheScan:
         sb = mod.NsjailSandbox(nsjail_path=Path("/usr/bin/nsjail"))
         assert sb.apparmor_active is False
         assert "apparmor_missing" in sb.insecurity_reasons
+
+
+class TestKillModeIsEnforcement:
+    """`kill` denies AND kills the violating task -- strictly stronger than `enforce`, so
+    rejecting it dropped a valid confinement profile (codex, #159).
+
+    The mode strings are not guesses: each was produced on a real AppArmor 4.0.1 host by
+    loading a scratch profile under `flags=(<mode>)` and reading the securityfs line back.
+    """
+
+    def _loaded(self, tmp_path, monkeypatch, contents: str) -> bool:
+        import blastbox.worker.sandbox.apparmor as aa
+
+        f = tmp_path / "profiles"
+        f.write_text(contents)
+        monkeypatch.setattr(aa, "_PROFILES", str(f))
+        monkeypatch.delenv("BLASTBOX_APPARMOR_PROFILES", raising=False)
+        return aa.profile_loaded("blastbox-sandbox")
+
+    def test_kill_mode_is_enforcing(self, tmp_path, monkeypatch) -> None:
+        assert self._loaded(tmp_path, monkeypatch, "blastbox-sandbox (kill)\n") is True
+
+    def test_prompt_mode_prints_user_and_is_not_accepted(self, tmp_path, monkeypatch) -> None:
+        """`flags=(prompt)` reads back as `(user)`: the answer to a denial comes from a
+        userspace agent that can GRANT what the policy refuses. Deliberately not confinement
+        for untrusted input; an operator who disagrees has BLASTBOX_APPARMOR_PROFILES."""
+        assert self._loaded(tmp_path, monkeypatch, "blastbox-sandbox (user)\n") is False
+
+    def test_an_operator_assertion_is_additive_not_an_override(self, tmp_path, monkeypatch) -> None:
+        """Listing A and B says nothing about C. Treating the list as an override would refuse
+        a C the kernel reports as enforcing -- dropping real confinement for no gain."""
+        import blastbox.worker.sandbox.apparmor as aa
+
+        f = tmp_path / "profiles"
+        f.write_text("blastbox-sandbox (enforce)\n")
+        monkeypatch.setattr(aa, "_PROFILES", str(f))
+        monkeypatch.setenv("BLASTBOX_APPARMOR_PROFILES", "some-other, and-another")
+        assert aa.profile_loaded("blastbox-sandbox") is True
+        assert aa.profile_loaded("some-other") is True
+        assert aa.profile_loaded("neither") is False
+
+
+class TestTheProfileModeIsReReadPerLaunch:
+    """A worker outlives its jobs. An operator switching the profile to complain mid-life used
+    to leave a cached True attaching -- and reporting -- confinement the kernel had stopped
+    providing (codex, #159)."""
+
+    def _profiles_file(self, tmp_path, monkeypatch):
+        import blastbox.worker.sandbox.apparmor as aa
+
+        f = tmp_path / "profiles"
+        f.write_text("bwrap-test-profile (enforce)\n")
+        monkeypatch.setattr(aa, "_PROFILES", str(f))
+        monkeypatch.delenv("BLASTBOX_APPARMOR_PROFILES", raising=False)
+        return f
+
+    def test_bwrap_stops_attaching_when_the_profile_stops_enforcing(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        import shutil
+
+        f = self._profiles_file(tmp_path, monkeypatch)
+        monkeypatch.setattr(shutil, "which", lambda n: "/usr/bin/aa-exec" if n == "aa-exec" else n)
+        sb = BubblewrapSandbox(apparmor_profile="bwrap-test-profile")
+
+        assert sb.apparmor_active is True
+        assert "aa-exec" in " ".join(sb._build_argv(SandboxRequest(argv=["/usr/bin/true"])))
+
+        # The operator switches it to complain under the running worker.
+        f.write_text("bwrap-test-profile (complain)\n")
+
+        assert sb.apparmor_active is False
+        assert "aa-exec" not in " ".join(sb._build_argv(SandboxRequest(argv=["/usr/bin/true"])))
+        assert "apparmor_missing" in sb.insecurity_reasons
+        assert sb.secure is False
