@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -776,3 +777,156 @@ def test_an_unconfirmed_restore_teardown_retains_its_bundle(tmp_path):
         "the bundle was forgotten, so nothing can retry the teardown and the checkpoint stays "
         "pinned for the life of the dispatcher"
     )
+
+
+# ---------------------------------------------------------------------------
+# The ready-timeout must carry the cause the guest left behind
+# ---------------------------------------------------------------------------
+
+
+class TestReadyTimeoutReportsTheBreadcrumb:
+    """`run_warm.py` writes `ctrl/setup_error` for one stated reason: without it "the host
+    only sees a bare ready-timeout". Nothing read it, and the failure path rmtree's the
+    bundle, so the explanation was destroyed unread -- measured on toolz2, where a fleet
+    rootfs produced `warm base not READY within 120.0s` and no cause at all.
+    """
+
+    def test_the_timeout_names_the_cause_the_guest_recorded(self, tmp_path):
+        from blastbox.host.runtime.gvisor_snapshot import _default_ready_wait
+
+        ctrl = tmp_path / "ctrl"
+        ctrl.mkdir()
+        (ctrl / "setup_error").write_text("engine setup failed: ModuleNotFoundError('pytesseract')")
+
+        with pytest.raises(TimeoutError) as ei:
+            _default_ready_wait(ctrl, 0.3)
+
+        msg = str(ei.value)
+        assert "not READY" in msg
+        assert "engine setup failed" in msg, f"the timeout dropped the recorded cause: {msg}"
+        assert "pytesseract" in msg
+
+    def test_a_timeout_with_no_breadcrumb_is_unchanged(self, tmp_path):
+        """The common case -- a genuinely slow base -- must not gain a bogus cause."""
+        from blastbox.host.runtime.gvisor_snapshot import _default_ready_wait
+
+        ctrl = tmp_path / "ctrl"
+        ctrl.mkdir()
+
+        with pytest.raises(TimeoutError) as ei:
+            _default_ready_wait(ctrl, 0.3)
+
+        msg = str(ei.value)
+        assert "not READY" in msg
+        assert msg.rstrip().endswith(")"), f"a trailing empty cause was appended: {msg}"
+
+    def test_a_worker_written_cause_cannot_smuggle_control_characters(self, tmp_path):
+        """ctrl/ is bind-mounted 0o777 and this string is written by the sandboxed worker.
+
+        It lands in operator logs and an exception message, so newlines (log-line injection)
+        and control bytes must not survive the read.
+        """
+        from blastbox.host.runtime.gvisor_snapshot import read_setup_breadcrumb
+
+        ctrl = tmp_path / "ctrl"
+        ctrl.mkdir()
+        (ctrl / "setup_error").write_text(
+            "boom\n2026-01-01 CRITICAL fleet is on fire\x00\x1b[31m"
+        )
+
+        cause = read_setup_breadcrumb(ctrl)
+
+        assert cause is not None
+        assert "\n" not in cause and "\x00" not in cause and "\x1b" not in cause
+        assert cause.startswith("boom")
+
+    def test_an_oversized_breadcrumb_is_capped(self, tmp_path):
+        from blastbox.host.runtime.gvisor_snapshot import read_setup_breadcrumb
+
+        ctrl = tmp_path / "ctrl"
+        ctrl.mkdir()
+        (ctrl / "setup_error").write_text("A" * 100_000)
+
+        cause = read_setup_breadcrumb(ctrl, max_bytes=4096)
+
+        assert cause is not None and len(cause) <= 4096
+
+    def test_a_breadcrumb_that_is_not_a_regular_file_is_ignored(self, tmp_path):
+        """A symlink out of the confined dir must not be followed: the worker owns this dir."""
+        from blastbox.host.runtime.gvisor_snapshot import read_setup_breadcrumb
+
+        ctrl = tmp_path / "ctrl"
+        ctrl.mkdir()
+        secret = tmp_path / "secret"
+        secret.write_text("host-side secret")
+        (ctrl / "setup_error").symlink_to(secret)
+
+        assert read_setup_breadcrumb(ctrl) is None
+
+
+class TestReadyTimeoutDistinguishesDeadFromSlow:
+    """A guest that has EXITED can never write `ready`, so the budget is irrelevant to it.
+
+    Measured on toolz2 with a fleet clippyshot rootfs: the default warm argv runs plain
+    `python3`, but blastbox lives in the image's venv, so run_warm.py died with
+    `ModuleNotFoundError: No module named 'blastbox'` at import -- before main(), hence before
+    the setup_error breadcrumb could be written. The container was gone in under a second and
+    the host still waited the full 120 s to report only "not READY within 120.0s".
+    """
+
+    def _handle(self, tmp_path, status: str | None):
+        from blastbox.host.runtime.gvisor_snapshot import GvisorBootHandle, GvisorConfig
+
+        ctrl = tmp_path / "ctrl"
+        ctrl.mkdir()
+        cfg = GvisorConfig(
+            runsc_bin="runsc",
+            root=tmp_path / "root",
+            image_rootfs=tmp_path / "rootfs",
+            network="none",
+            warm_argv=["python3", "/opt/blastbox/run_warm.py"],
+        )
+
+        def never_ready(_ctrl, _timeout):
+            raise TimeoutError("warm base not READY within 0.1s (ctrl)")
+
+        def run_text(argv):
+            if status is None:
+                return ""            # `runsc state` itself failed / not parseable
+            return json.dumps({"status": status})
+
+        return GvisorBootHandle(
+            cfg, lambda *a, **k: 0, "warm-base-x", tmp_path / "base", ctrl,
+            never_ready, run_text=run_text,
+        )
+
+    def test_a_container_that_exited_says_so(self, tmp_path):
+        h = self._handle(tmp_path, "stopped")
+
+        with pytest.raises(TimeoutError) as ei:
+            h.wait_ready(0.1)
+
+        msg = str(ei.value)
+        assert "stopped" in msg
+        assert "exited before signalling READY" in msg
+        assert "no budget would have helped" in msg, (
+            f"a dead guest was reported as if a longer timeout could fix it: {msg}"
+        )
+
+    def test_a_container_still_running_is_reported_as_a_plain_timeout(self, tmp_path):
+        """The genuinely-slow case must NOT gain a 'it exited' claim -- that would send the
+        operator to fix an argv that is fine."""
+        h = self._handle(tmp_path, "running")
+
+        with pytest.raises(TimeoutError) as ei:
+            h.wait_ready(0.1)
+
+        assert "exited before signalling READY" not in str(ei.value)
+
+    def test_an_unknowable_state_does_not_invent_a_cause(self, tmp_path):
+        h = self._handle(tmp_path, None)
+
+        with pytest.raises(TimeoutError) as ei:
+            h.wait_ready(0.1)
+
+        assert "exited before signalling READY" not in str(ei.value)

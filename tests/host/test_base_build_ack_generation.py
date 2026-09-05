@@ -46,6 +46,10 @@ def test_the_gvisor_base_is_stamped_before_runsc_run(tmp_path, monkeypatch):
     be._cfg = type("C", (), {"root": tmp_path / "root" / "r"})()
     be._run = _run
     be._ready = lambda ctrl, tmo: None
+    # Hand-built via object.__new__, so every collaborator boot_base reads must be set here.
+    # The boot handle now carries a `runsc state` reader so a ready-timeout can say whether the
+    # base is slow or already dead; this fake never needs to answer, it just has to exist.
+    be._run_text = lambda argv: ""
     be._ack_capable = cap
     be._epoch_sampler = lambda: epoch[0]
     be._stranded_partials = []
