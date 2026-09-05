@@ -35,7 +35,7 @@ import subprocess
 from pathlib import Path
 
 from blastbox.errors import SandboxError, SandboxUnavailable
-from blastbox.worker.sandbox.apparmor import profile_loaded
+from blastbox.worker.sandbox.apparmor import profile_loaded, resolve_profile
 from blastbox.worker.sandbox.base import SandboxRequest, SandboxResult
 
 
@@ -130,7 +130,7 @@ class NsjailSandbox:
         self,
         nsjail_path: str = _NSJAIL,
         *,
-        apparmor_profile: str = "blastbox-sandbox",
+        apparmor_profile: str | None = None,
         seccomp_policy: Path | None = None,
     ) -> None:
         # Binary presence is RECORDED, not enforced at construction — matching
@@ -139,7 +139,7 @@ class NsjailSandbox:
         # installed; run() raises SandboxUnavailable when it is actually needed.
         self._binary_present = bool(shutil.which(nsjail_path)) or Path(nsjail_path).exists()
         self._nsjail = nsjail_path
-        self._apparmor_profile = apparmor_profile
+        self._apparmor_profile = resolve_profile(apparmor_profile)
 
         # Resolve the seccomp policy path at construction time.
         # If an explicit path is provided, use it only if it actually exists;
