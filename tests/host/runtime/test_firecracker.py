@@ -26,6 +26,8 @@ These should be run on toolz2 or another FC-capable host.
 from __future__ import annotations
 
 import json
+import math
+import os
 import socket
 import struct
 import subprocess
@@ -1390,6 +1392,47 @@ class TestWorkerRuntimeEnvSelection:
 # ---------------------------------------------------------------------------
 
 
+def _live_engine() -> str:
+    """The engine this rootfs carries, with the prerequisites it needs enforced.
+
+    Shared by every live test that WARMS the engine, not just the round-trip:
+    the readiness test spawns the same fleet guest, so a guard on the
+    round-trip alone let the class fail at the sibling first -- the guest never
+    warms on FCConfig's 512 MiB default and READY never arrives.
+    """
+    engine = os.environ.get("BLASTBOX_FC_TEST_ENGINE", "").strip() or "probe"
+    if engine != "probe" and not os.environ.get("BLASTBOX_FC_MEM_MIB", "").strip():
+        # 512 MiB is the allocation on which the redtusk JVM cannot commit its
+        # heap; the FC overlay gives 2048, titanarum's 4608.
+        pytest.skip(
+            f"BLASTBOX_FC_TEST_ENGINE={engine} needs BLASTBOX_FC_MEM_MIB "
+            "(what the deployment gives the guest; the default is too small)"
+        )
+    return engine
+
+
+def _live_warmup_s() -> float:
+    """Seconds to wait for READY, from BLASTBOX_FC_TEST_WARMUP_S.
+
+    Validated rather than passed to `float()` and hoped for: `inf` makes the
+    readiness loop wait forever on a guest that never comes up, and zero,
+    negative or NaN reach the READY assertion after the microVM is already
+    spawned but before the try/finally that reaps it -- stranding a live
+    Firecracker process, which is the same leak the input staging had to move
+    for. 45s matches scripts/fc_clippyshot_check.py.
+    """
+    raw = os.environ.get("BLASTBOX_FC_TEST_WARMUP_S", "").strip()
+    if not raw:
+        return 45.0
+    try:
+        value = float(raw)
+    except ValueError:
+        pytest.skip(f"BLASTBOX_FC_TEST_WARMUP_S is not a number: {raw!r}")
+    if not math.isfinite(value) or value <= 0:
+        pytest.skip(f"BLASTBOX_FC_TEST_WARMUP_S must be finite and positive: {raw!r}")
+    return value
+
+
 @pytest.mark.skipif(not HAS_FC_HOST, reason=_LIVE_FC_REASON)
 class TestFirecrackerLiveBoot:
     """End-to-end microVM boot tests — require firecracker + vmlinux + a blastbox
@@ -1397,6 +1440,20 @@ class TestFirecrackerLiveBoot:
 
     NOT run in CI or on a dev host. Run on a FC-capable host (e.g. toolz2) with
     BLASTBOX_FC_BIN / BLASTBOX_FC_KERNEL / BLASTBOX_FC_ROOTFS set.
+
+    Against a FLEET rootfs rather than the probe one built by
+    `deploy/firecracker/build-rootfs.sh`, also set:
+
+      BLASTBOX_FC_TEST_ENGINE   the engine that rootfs carries (redtusk, ...)
+      BLASTBOX_FC_TEST_INPUT    a document that engine can actually parse
+      BLASTBOX_FC_MEM_MIB       what the deployment gives the guest
+
+    That last one is not optional and cost three runs to find: at the default
+    the redtusk JVM cannot commit its heap inside the guest and the job comes
+    back `engine_error` with
+    `os::commit_memory(...) failed; error='Not enough space'` -- which reads
+    like a broken worker rather than a guest that is simply too small. The FC
+    overlay sets 2048.
     """
 
     @pytest.fixture
@@ -1424,14 +1481,22 @@ class TestFirecrackerLiveBoot:
         assert not rt.is_alive(slot)
 
     def test_live_is_ready_after_warmup(self, fc_scratch):
-        """The guest warms an engine and signals READY over vsock within 30 s —
-        the live signal VsockReadySignal listens for (FileReadySignal cannot)."""
+        """The guest warms an engine and signals READY over vsock — the live
+        signal VsockReadySignal listens for (FileReadySignal cannot).
+
+        Shares the round-trip's warmup budget. Held at 30 s while the round-trip
+        allowed 45, this failed the whole class first on a slow fleet rootfs --
+        a guest that came up at 35 s never reached the test that would have
+        accepted it.
+        """
         import time
 
+        _live_engine()   # same fleet prerequisites: this test warms the engine too
+        warmup_s = _live_warmup_s()
         cfg = FCConfig.from_env(scratch_root=fc_scratch)
         rt = FirecrackerSlotRuntime(cfg)
         slot = rt.spawn()
-        deadline = time.monotonic() + 30.0
+        deadline = time.monotonic() + warmup_s
         ready = False
         while time.monotonic() < deadline:
             if rt.is_ready(slot):
@@ -1439,7 +1504,7 @@ class TestFirecrackerLiveBoot:
                 break
             time.sleep(0.5)
         rt.reap(slot)
-        assert ready, "Guest did not signal READY over vsock within 30 s"
+        assert ready, f"Guest did not signal READY over vsock within {warmup_s} s"
 
     def test_live_job_roundtrip_trust_validated(self, fc_scratch):
         """The full warm JOB round-trip: input delivered over vsock, the guest
@@ -1447,41 +1512,113 @@ class TestFirecrackerLiveBoot:
         rdump and validates through the trust gate — input-sha round-trips and the
         artifact hash is recomputed from disk (never trusted from the guest)."""
         import hashlib
+        import os
         import time
 
         from blastbox.host.trust import validate_worker_output
         from blastbox.limits import Limits
         from blastbox.worker.warm import WarmJobSpec
 
+        # The rootfs decides the engine, and every fleet rootfs carries a REAL
+        # engine (redtusk, titanarum, clippyshot) rather than the probe that
+        # `deploy/firecracker/build-rootfs.sh` bakes. Hardcoding "probe" made
+        # this fail on exactly the hosts it exists to be run on, with
+        # `engine mismatch: expected 'probe', worker reported 'redtusk'` --
+        # a confusing trust error instead of a verdict. Measured on toolz3
+        # against /var/lib/redtusk-fc.
+        engine = _live_engine()
+
+        # Staged BEFORE the microVM is spawned. Reading it afterwards put an
+        # unreadable path's exception between spawn() and the try/finally, so
+        # the VM was never reaped -- a live Firecracker process left behind
+        # while the fixture deleted its scratch directory.
+        #
+        # The SUFFIX is preserved: `_signal_go_inner` forwards the staged
+        # basename to the guest, and extension-sensitive engines detect type
+        # from it (ClippyShot's own check stages `input.docx`), so flattening a
+        # supplied .docx to input.bin would test misdetection rather than the
+        # rootfs. The name is taken as a suffix only -- never the supplied
+        # path's directory -- so nothing outside the scratch dir is written.
+        supplied = os.environ.get("BLASTBOX_FC_TEST_INPUT", "").strip()
+        if supplied:
+            source = Path(supplied)
+            if not source.is_file():
+                pytest.skip(f"BLASTBOX_FC_TEST_INPUT is not a readable file: {source}")
+            payload = source.read_bytes()
+            suffix = "".join(source.suffixes[-1:])  # ".pdf", never a path
+        elif engine != "probe":
+            # The probe's fabricated .bin would misdetect on an
+            # extension-sensitive engine and would not exercise the real
+            # document a fleet run promises. Missing prerequisite, not a failure.
+            pytest.skip(
+                f"BLASTBOX_FC_TEST_ENGINE={engine} needs BLASTBOX_FC_TEST_INPUT "
+                "(a document that engine can parse)"
+            )
+        else:
+            payload = b"live-fc-job-roundtrip-" + b"Z" * 2048
+            suffix = ".bin"
+        sha = hashlib.sha256(payload).hexdigest()
+        src = Path(fc_scratch) / f"input{suffix}"
+        src.write_bytes(payload)
+
+        # Deadlines from the CONFIGURED budgets, not hardcoded 30s. A fleet
+        # engine can be well inside its own limits and still take longer than
+        # that to warm or to run: `Limits.timeout_s` defaults to 120, and
+        # `scripts/fc_clippyshot_check.py` deliberately allows 45s to warm and
+        # 120s to execute. Hardcoding 30 made a valid slower workload look like
+        # a failure of the tier.
+        limits = Limits.from_env()
+        warmup_s = _live_warmup_s()
+
         cfg = FCConfig.from_env(scratch_root=fc_scratch)
         rt = FirecrackerSlotRuntime(cfg)
         slot = rt.spawn()
-        deadline = time.monotonic() + 30.0
+        deadline = time.monotonic() + warmup_s
         while time.monotonic() < deadline and not rt.is_ready(slot):
             time.sleep(0.5)
-        assert rt.is_ready(slot), "guest never signalled READY"
+        assert rt.is_ready(slot), f"guest never signalled READY within {warmup_s}s"
 
-        payload = b"live-fc-job-roundtrip-" + b"Z" * 2048
-        sha = hashlib.sha256(payload).hexdigest()
-        src = Path(fc_scratch) / "input.bin"
-        src.write_bytes(payload)
         try:
             control = rt.host_warm_control(slot)
+            # ONE absolute deadline across upload and execution, the way the
+            # dispatcher does it. `signal_go` streams the input and is unbounded
+            # without a deadline -- and it runs BEFORE wait_for_done's timeout
+            # starts, so a guest that reads slowly could hang this test
+            # indefinitely with a live VM attached.
+            job_deadline = time.monotonic() + float(limits.timeout_s)
             control.signal_go(
-                WarmJobSpec(input_path=src, output_dir=slot.output_dir, params={})
+                WarmJobSpec(input_path=src, output_dir=slot.output_dir, params={}),
+                deadline=job_deadline,
             )
-            assert control.wait_for_done(timeout_s=30.0) == "ok"
+            # The EXACT remainder, never a floor: `max(1.0, ...)` would hand a
+            # fresh second to a job that had already spent its budget on the
+            # upload, so a workload over `Limits.timeout_s` could still pass
+            # under a test that claims one absolute deadline. The dispatcher
+            # fails outright on a non-positive remainder; so does this.
+            remaining = job_deadline - time.monotonic()
+            assert remaining > 0, (
+                f"the upload consumed the whole {limits.timeout_s}s job budget"
+            )
+            assert control.wait_for_done(timeout_s=remaining) == "ok"
             names = rt.read_output_disk(slot)
             assert "metadata.json" in names
             envelope = validate_worker_output(
                 output_dir=slot.output_dir,
                 input_sha256=sha,
-                engine="probe",
-                limits=Limits.from_env(),
+                engine=engine,
+                limits=limits,
             )
             assert envelope.status == "ok"
             assert envelope.input_sha256 == sha
-            assert len(envelope.artifacts) == 1
+            # The subject here is the trust gate -- the input sha round-tripping
+            # and the artifact hash being recomputed from the disk rather than
+            # taken from the guest. How MANY artifacts an engine writes is the
+            # engine's business: measured on toolz3, redtusk returns `ok` with
+            # ZERO artifacts for a plain text file (it writes rmeta to the
+            # output disk, not an extracted artifact), so only the probe's
+            # exact count is pinned.
+            if engine == "probe":
+                assert len(envelope.artifacts) == 1
         finally:
             rt.reap(slot)
 
