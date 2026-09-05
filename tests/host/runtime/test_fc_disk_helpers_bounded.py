@@ -348,3 +348,84 @@ class TestWhatTheBoundsChanged:
         assert not any(Path(p).exists() for p in stuck), (
             f"the retained dirs were never reclaimed: {stuck}"
         )
+
+    def test_abandoned_copy_workers_are_capped(self, tmp_path, stalled_source, monkeypatch):
+        """A stalled mount must not cost a thread and two descriptors per retry, forever.
+
+        Host-resource failures are deliberately exempt from the pool's failure streaks, so the
+        pool keeps retrying -- which is exactly when unbounded accumulation would bite.
+        """
+        from blastbox.errors import HostDiskTimeout
+        from blastbox.host.runtime import fc_snapshot_launcher as fl
+
+        monkeypatch.setattr(fl, "_ABANDONED_COPIES", [])
+        monkeypatch.setattr(fl, "_MAX_ABANDONED_COPIES", 3)
+
+        for _ in range(10):
+            with pytest.raises(HostDiskTimeout):
+                fl._copy_with_deadline(stalled_source, tmp_path / "d.ext4", 0.2)
+
+        alive = [t for t in fl._ABANDONED_COPIES if t.is_alive()]
+        assert len(alive) <= 3, f"{len(alive)} stuck copy workers accumulated past the cap"
+
+    def test_the_cap_says_why_it_refused(self, tmp_path, stalled_source, monkeypatch):
+        """A refusal that reads like an ordinary timeout would send an operator hunting the
+        wrong thing: the disk stalled earlier and never recovered."""
+        from blastbox.errors import HostDiskTimeout
+        from blastbox.host.runtime import fc_snapshot_launcher as fl
+
+        monkeypatch.setattr(fl, "_ABANDONED_COPIES", [])
+        monkeypatch.setattr(fl, "_MAX_ABANDONED_COPIES", 1)
+
+        with pytest.raises(HostDiskTimeout):
+            fl._copy_with_deadline(stalled_source, tmp_path / "a.ext4", 0.2)
+        with pytest.raises(HostDiskTimeout) as caught:
+            fl._copy_with_deadline(stalled_source, tmp_path / "b.ext4", 0.2)
+
+        assert "still stuck on this host" in str(caught.value.cmd)
+
+    @pytest.mark.parametrize("confirmed", [False, True])
+    def test_the_workdir_survives_exactly_when_teardown_is_unconfirmed(self, tmp_path, confirmed):
+        """Retaining the generation pin but deleting the directory is HALF a rule.
+
+        When firecracker survives terminate AND kill it may still hold this slot's disk and
+        sockets open, so removing the workdir pulls them out from under a live microVM. Both
+        handlers removed it unconditionally -- including the branch that had just decided the
+        process could not be confirmed gone.
+
+        Drives the REAL `SnapshotManager.restore()`. My first version of this test asserted
+        only the classifier helper, and the mutation that removes the guard survived it -- it
+        proved nothing.
+        """
+
+        from blastbox.host.runtime.fc_snapshot import SnapshotManager
+
+        class _Boom(Exception):
+            pass
+
+        exc = _Boom("restore failed")
+        if not confirmed:
+            exc.kill_failed = True              # type: ignore[attr-defined]
+
+        class _Backend:
+            def restore_in(self, workdir, artifact):
+                workdir.mkdir(parents=True, exist_ok=True)
+                (workdir / "outdisk.ext4").write_bytes(b"a live VM may have this open")
+                raise exc
+
+        mgr = SnapshotManager(tmp_path / "snap", _Backend())
+        mgr._artifact = object()                # type: ignore[attr-defined]
+
+        with pytest.raises(Exception):
+            mgr.restore("slot-a")
+
+        workdir = (tmp_path / "snap") / "slots" / "slot-a"
+        if confirmed:
+            assert not workdir.exists(), (
+                "a CONFIRMED teardown must still clean up; the guard must not leak every workdir"
+            )
+        else:
+            assert workdir.exists(), (
+                "the workdir was removed although firecracker could not be confirmed gone -- "
+                "pulling the disk and sockets out from under a live microVM"
+            )

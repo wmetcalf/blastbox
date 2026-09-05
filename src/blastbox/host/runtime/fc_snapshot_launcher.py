@@ -22,6 +22,7 @@ import shutil
 import logging
 import os
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -366,6 +367,13 @@ def _default_make_outdisk(path: Path) -> None:
     make_ext4(path, _DEFAULT_OUTDISK_MIB)
 
 
+# Workers abandoned to a stalled filesystem. Bounded so a wedged mount cannot cost a thread
+# and two descriptors per retry forever; see _copy_with_deadline.
+_MAX_ABANDONED_COPIES = 8
+_ABANDONED_COPIES: "list[threading.Thread]" = []
+_ABANDONED_LOCK = threading.Lock()
+
+
 def _copy_with_deadline(src: Path, dst: Path, timeout_s: float, *, chunk: int = 4 << 20) -> None:
     """`shutil.copyfile` with a deadline, checked between chunks.
 
@@ -381,9 +389,25 @@ def _copy_with_deadline(src: Path, dst: Path, timeout_s: float, *, chunk: int = 
     # nothing in that loop runs again to notice (codex, #154). Joining bounds the CALLER
     # regardless of where the copy is stuck.
     #
-    # The worker is a daemon and may remain blocked on the stalled fd -- that is the honest
-    # cost, and it is the same shape as any other I/O a wedged filesystem swallows. It is
-    # bounded in COUNT by spawn attempts, and it holds no lock.
+    # WHAT THIS DOES AND DOES NOT BOUND. It bounds the caller, which is the thread the pool
+    # needs back. It does NOT make the copy stop: a worker blocked in uninterruptible (D-state)
+    # I/O cannot be cancelled by anything in this process -- not a signal, not a close, not
+    # another thread. No in-process design escapes that, which is why this one does not pretend
+    # to; the containment for a host in that state is the pool's own wedged-spawn accounting.
+    #
+    # ...but abandoned workers must not accumulate without limit while the pool keeps retrying
+    # (host-resource failures are deliberately exempt from the failure streaks). Past the cap,
+    # refuse to start another: one stalled mount should not cost a thread and two fds per
+    # retry, for the life of the process.
+    with _ABANDONED_LOCK:
+        stuck = sum(1 for t in _ABANDONED_COPIES if t.is_alive())
+        _ABANDONED_COPIES[:] = [t for t in _ABANDONED_COPIES if t.is_alive()]
+    if stuck >= _MAX_ABANDONED_COPIES:
+        raise HostDiskTimeout(
+            cmd=f"copy {src} -> {dst} (refused: {stuck} earlier copies still stuck on this host)",
+            timeout=timeout_s,
+        )
+
     done: "list[BaseException | None]" = []
 
     def _copy() -> None:
@@ -402,6 +426,8 @@ def _copy_with_deadline(src: Path, dst: Path, timeout_s: float, *, chunk: int = 
     worker.start()
     worker.join(timeout=timeout_s)
     if not done:
+        with _ABANDONED_LOCK:
+            _ABANDONED_COPIES.append(worker)
         # Still running: the filesystem is stalled. Remove the partial destination -- a
         # truncated outdisk is worse than none, since the guest would mount it.
         with contextlib.suppress(OSError):

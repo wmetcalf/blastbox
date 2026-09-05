@@ -1164,17 +1164,29 @@ class FirecrackerSlotRuntime:
             self._stranded_scratch_paths = got
         return got
 
+    @property
+    def _stranded_lock(self) -> threading.Lock:
+        """Guards the ledger above. spawn() is called concurrently whenever
+        BLASTBOX_POOL_SPAWN_CONCURRENCY > 1, and snapshot-then-clear is not atomic: one thread
+        could clear a path another had just appended, losing the only reference to a partial
+        outdisk dir for good (codex, #154)."""
+        got = getattr(self, "_stranded_lock_obj", None)
+        if got is None:
+            got = threading.Lock()
+            self._stranded_lock_obj = got
+        return got
+
     def _sweep_stranded_scratch(self) -> None:
         """Retry removals that failed earlier. Never raises: a sweep must not break a spawn."""
-        pending = list(self._stranded_scratch)
-        if not pending:
-            return
-        self._stranded_scratch.clear()
+        with self._stranded_lock:
+            pending = list(self._stranded_scratch)
+            self._stranded_scratch.clear()          # take them ATOMICALLY, not snapshot-then-clear
         for path in pending:
             errs: list[str] = []
             shutil.rmtree(path, onerror=lambda fn, p, exc: errs.append(str(p)))
             if errs:
-                self._stranded_scratch.append(path)      # still stuck; try again next spawn
+                with self._stranded_lock:
+                    self._stranded_scratch.append(path)   # still stuck; retry next spawn
 
     def spawn(self) -> Slot:
         """Create a scratch dir, write fc-config.json, launch Firecracker.
@@ -1225,7 +1237,8 @@ class FirecrackerSlotRuntime:
             errs: list[str] = []
             shutil.rmtree(slot_dir, onerror=lambda fn, p, exc: errs.append(str(p)))
             if errs:
-                self._stranded_scratch.append(str(slot_dir))
+                with self._stranded_lock:
+                    self._stranded_scratch.append(str(slot_dir))
                 _log.warning(
                     "firecracker: could not remove partial slot dir %s; retaining it for the "
                     "next spawn's sweep", slot_dir,

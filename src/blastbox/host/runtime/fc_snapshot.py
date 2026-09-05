@@ -638,6 +638,7 @@ class SnapshotManager:
         try:
             return self._backend.restore_in(slot_workdir, artifact)
         except SnapshotError as exc:
+            _keep_workdir = False
             # A failed restore never yields a handle, so the slot is never reaped —
             # remove the just-created (empty) workdir so it doesn't leak on the host.
             #
@@ -652,9 +653,17 @@ class SnapshotManager:
                     "snapshot.restore_cleanup_unconfirmed sid=%s: could not confirm the "
                     "firecracker process is gone; retaining its generation pin", sid,
                 )
-            shutil.rmtree(slot_workdir, ignore_errors=True)
+                # ...and DO NOT remove the workdir either. Retaining the pin but deleting the
+                # directory is half a rule: that firecracker may still have this slot's disk
+                # and sockets open, so removing it pulls them out from under a live microVM.
+                # The stranded-partial sweep reclaims it once the process is confirmed gone
+                # (codex, #154).
+                _keep_workdir = True
+            if not _keep_workdir:
+                shutil.rmtree(slot_workdir, ignore_errors=True)
             raise
         except BaseException as exc:
+            _keep_workdir = False
             # BaseException, not Exception: a KeyboardInterrupt or a cancellation landing mid
             # restore must not strand the pin either -- this slot will never be reaped, so
             # nothing else would ever release it and the generation would be pinned forever,
@@ -671,7 +680,9 @@ class SnapshotManager:
                     "snapshot.restore_cleanup_unconfirmed sid=%s (cancelled): could not confirm "
                     "the firecracker process is gone; retaining its generation pin", sid,
                 )
-            shutil.rmtree(slot_workdir, ignore_errors=True)
+                _keep_workdir = True    # same rule as the sibling handler above
+            if not _keep_workdir:
+                shutil.rmtree(slot_workdir, ignore_errors=True)
             if isinstance(exc, Exception):
                 raise SnapshotRestoreError(f"restore failed: {exc}") from exc
             raise
