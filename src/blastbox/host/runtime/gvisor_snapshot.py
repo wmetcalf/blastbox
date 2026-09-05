@@ -97,6 +97,13 @@ _LIVE_SINKS: "list[threading.Thread]" = []
 _SINK_LOCK = threading.Lock()
 
 
+def _release_sink_slot(thread: "threading.Thread") -> None:
+    """Give back a reservation whose sink never came up. Never raises."""
+    with _SINK_LOCK:
+        if thread in _LIVE_SINKS:
+            _LIVE_SINKS.remove(thread)
+
+
 class _StderrSink:
     """A bounded sink for a DETACHED runsc launch's stderr.
 
@@ -143,44 +150,49 @@ class _StderrSink:
         # #155). The thread object is created first precisely so it can be reserved before it
         # runs. My commit for the first version of this cap claimed the lesson from the FC
         # copy-worker cap had been applied up front; it had not been.
-        # THE PIPE FIRST, before any reservation exists. os.pipe() can fail on a host in
-        # transient EMFILE -- and because the prune deliberately keeps unstarted reservations,
-        # a failure after reserving would strand that slot FOREVER. Sixteen of those and a
-        # recovered host discards stderr for every launch, permanently (codex, #155).
-        read_fd, write_fd = os.pipe()
+        # RESERVE FIRST, ALLOCATE SECOND, RELEASE ON EITHER FAILURE.
+        #
+        # The ordering has been wrong in both directions, so both reasons are recorded here.
+        # Reserving after allocating meant an os.pipe() failure under EMFILE stranded a slot
+        # forever, because the prune keeps unstarted reservations. Allocating before consulting
+        # the cap meant a FULL cap on an fd-exhausted host raised instead of taking the DEVNULL
+        # path -- the degraded branch needing the very resource it exists to do without -- and
+        # let concurrent restores each hold a pipe before any reached the lock, so peak
+        # descriptor use exceeded the cap (codex, #155).
+        #
+        # A Thread OBJECT costs no OS resource until start(), so it can be reserved before
+        # anything is allocated. Every failure path after that releases the slot.
         thread = threading.Thread(target=self._drain, name="runsc-stderr-drain", daemon=True)
 
         with _SINK_LOCK:
             # PRUNE ONLY WHAT ACTUALLY RAN. A reservation is appended before its thread is
             # started, and an unstarted thread reports is_alive() == False -- so pruning on
             # liveness alone let a CONCURRENT constructor delete a reservation that had been
-            # made but not yet started, and both would then start drains. The cap was defeated
-            # by the very window the reservation exists to close (codex, #155).
+            # made but not yet started, and both would then start drains.
             _LIVE_SINKS[:] = [
                 t for t in _LIVE_SINKS if t.is_alive() or not getattr(t, "_bb_started", False)
             ]
             if len(_LIVE_SINKS) >= _MAX_LIVE_SINKS:
                 stuck = len(_LIVE_SINKS)
-                for fd in (read_fd, write_fd):
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
                 self._degraded = True
                 self._read_fd = -1
                 self.write_fd = subprocess.DEVNULL
                 self._closed = True
-                # NO THREAD AT ALL. Starting even a no-op thread here can raise RuntimeError on
-                # a host that is out of threads -- and this branch exists precisely to keep the
-                # launch alive under exhaustion, so aborting it would defeat its own purpose
-                # (codex, #155). tail() and close_write() handle a threadless sink directly.
+                # No pipe was allocated and NO THREAD is started: this branch must work on a
+                # host that has neither descriptors nor threads to spare.
                 self._thread = None
                 _log.warning(
                     "gvisor_snapshot: %d stderr drains are still stuck (sandboxes that never "
                     "exited); launching with stderr discarded so the tier keeps serving", stuck,
                 )
                 return
-            _LIVE_SINKS.append(thread)      # reserve the slot before anything can run
+            _LIVE_SINKS.append(thread)      # reserved: nothing allocated yet
+
+        try:
+            read_fd, write_fd = os.pipe()
+        except BaseException:
+            _release_sink_slot(thread)
+            raise
 
         self._thread = thread
         self._read_fd, self.write_fd = read_fd, write_fd
@@ -192,9 +204,7 @@ class _StderrSink:
             # RELEASE the reservation. It cannot be left to the prune any more: the prune now
             # keeps unstarted reservations on purpose (see above), so a thread that never
             # started would hold its slot for the life of the process.
-            with _SINK_LOCK:
-                if self._thread in _LIVE_SINKS:
-                    _LIVE_SINKS.remove(self._thread)
+            _release_sink_slot(self._thread)
             # `Thread.start()` raises RuntimeError once the host is out of threads -- and the
             # pipe is already allocated by then. Without this, every async build retry would
             # leak TWO descriptors and compound the exhaustion toward EMFILE, i.e. the failure

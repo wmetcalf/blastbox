@@ -1572,3 +1572,63 @@ def test_the_degraded_path_starts_no_thread(monkeypatch):
         degraded.close_write()                     # must not blow up without a thread
     finally:
         first.close_write()
+
+
+def test_a_full_cap_degrades_without_needing_a_descriptor(monkeypatch):
+    """The degraded branch must work on a host that has no descriptors to spare.
+
+    Allocating the pipe before consulting the cap meant a FULL cap on an fd-exhausted host
+    raised EMFILE instead of taking the DEVNULL path -- the branch that exists to survive
+    exhaustion needing the very resource it is meant to do without (codex, #155).
+    """
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+    monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 1)
+
+    first = gs._StderrSink()                       # fills the only slot
+    try:
+        monkeypatch.setattr(
+            gs.os, "pipe", lambda: (_ for _ in ()).throw(OSError(24, "Too many open files"))
+        )
+        degraded = gs._StderrSink()                # full cap AND no descriptors
+
+        assert degraded.degraded, "a full cap on an fd-exhausted host must still degrade"
+        assert degraded.tail() == ""
+        degraded.close_write()
+    finally:
+        first.close_write()
+
+
+def test_a_reservation_is_taken_before_any_allocation(monkeypatch):
+    """Concurrent restores must not each hold a pipe before any reaches the lock, or peak
+    descriptor use exceeds the cap even though the cap itself holds."""
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+    monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 2)
+
+    order: list[str] = []
+    real_pipe = gs.os.pipe
+
+    def _pipe():
+        order.append("pipe")
+        return real_pipe()
+
+    real_append = list.append
+
+    class _Watched(list):
+        def append(self, item):
+            order.append("reserve")
+            return real_append(self, item)
+
+    monkeypatch.setattr(gs, "_LIVE_SINKS", _Watched())
+    monkeypatch.setattr(gs.os, "pipe", _pipe)
+
+    sink = gs._StderrSink()
+    try:
+        assert order[:2] == ["reserve", "pipe"], (
+            f"allocation happened before the reservation: {order}"
+        )
+    finally:
+        sink.close_write()
