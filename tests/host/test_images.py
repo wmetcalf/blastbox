@@ -1155,3 +1155,111 @@ def test_a_destination_containing_a_literal_dollar_is_not_called_unresolved(
     text = describe(plan, "t1", {"ODD": "/srv/we$rd"})
     assert "/srv/we$rd/rootfs" in text
     assert "UNRESOLVED" not in text
+
+
+def test_a_missing_dockerfile_names_an_unset_context_variable(tmp_path):
+    """"My repo lost these files" is the wrong conclusion to invite.
+
+    The chains that build from blastbox's own deploy/ declare
+    `context = "$BLASTBOX_SRC"`. With it unset EVERY one of their Dockerfiles
+    reports as missing, and the operator goes looking in the wrong repository.
+    `unresolved_destinations` already names its variables; this is the same
+    courtesy on the path reached first.
+    """
+    from blastbox.host.images import load_plan, missing_dockerfiles
+
+    (tmp_path / "blastbox-images.toml").write_text(
+        '[engine]\nname = "demo"\n\n'
+        '[[image]]\nname = "demo"\ndockerfile = "deploy/Dockerfile.demo"\n'
+        'context = "$BLASTBOX_SRC"\nbase = "python:3.12-slim"\n'
+    )
+    plan = load_plan(tmp_path)
+
+    unset = missing_dockerfiles(plan, env={})
+    assert unset, "an unset context makes the Dockerfile unfindable"
+    assert "BLASTBOX_SRC is unset" in unset[0], unset
+
+    # Set but genuinely absent: the ordinary message, not the variable one.
+    absent = missing_dockerfiles(plan, env={"BLASTBOX_SRC": str(tmp_path / "elsewhere")})
+    assert absent, "the file is still missing"
+    assert "is unset" not in absent[0], absent
+
+
+def test_a_present_dockerfile_under_a_set_context_is_not_reported(tmp_path):
+    """The control: with the variable set and the file there, nothing is missing."""
+    from blastbox.host.images import load_plan, missing_dockerfiles
+
+    src = tmp_path / "bbsrc" / "deploy"
+    src.mkdir(parents=True)
+    (src / "Dockerfile.demo").write_text("FROM python:3.12-slim\n")
+    (tmp_path / "blastbox-images.toml").write_text(
+        '[engine]\nname = "demo"\n\n'
+        '[[image]]\nname = "demo"\ndockerfile = "deploy/Dockerfile.demo"\n'
+        'context = "$BLASTBOX_SRC"\nbase = "python:3.12-slim"\n'
+    )
+    plan = load_plan(tmp_path)
+    assert missing_dockerfiles(plan, env={"BLASTBOX_SRC": str(tmp_path / "bbsrc")}) == []
+
+
+def test_a_context_value_containing_a_dollar_is_not_an_unset_variable(tmp_path):
+    """Asked of the TEMPLATE, never the expanded result.
+
+    A directory whose NAME holds a dollar -- `/srv/$stage/src` is a legal path --
+    would otherwise be reported as an unset variable, sending the operator to
+    fix an environment that is already correct. `unresolved_destinations`
+    documents this same distinction.
+    """
+    from blastbox.host.images import load_plan, missing_dockerfiles
+
+    weird = tmp_path / "srv" / "$stage" / "bbsrc"
+    (weird / "deploy").mkdir(parents=True)
+    (weird / "deploy" / "Dockerfile.demo").write_text("FROM python:3.12-slim\n")
+    (tmp_path / "blastbox-images.toml").write_text(
+        '[engine]\nname = "demo"\n\n'
+        '[[image]]\nname = "demo"\ndockerfile = "deploy/Dockerfile.demo"\n'
+        'context = "$BLASTBOX_SRC"\nbase = "python:3.12-slim"\n'
+    )
+    plan = load_plan(tmp_path)
+    # The file IS there under that context; nothing may be reported.
+    assert missing_dockerfiles(plan, env={"BLASTBOX_SRC": str(weird)}) == []
+
+    # And when it is genuinely absent, the report must not blame `$stage`.
+    (weird / "deploy" / "Dockerfile.demo").unlink()
+    reported = missing_dockerfiles(plan, env={"BLASTBOX_SRC": str(weird)})
+    assert reported and "is unset" not in reported[0], reported
+
+
+@pytest.mark.parametrize("context", ["${A:+fallback}", "${not-a-name}"])
+def test_an_unsupported_context_expansion_is_not_called_unset(tmp_path, context):
+    """`${A:+fallback}` is not a variable that can be set.
+
+    `unresolved_names` returns the whole expression for syntax blastbox does
+    not implement, so reporting it as "unset" tells an operator to set
+    something that already IS set -- and `_expand` leaves that form literal by
+    design, so setting it could never help.
+    """
+    from blastbox.host.images import load_plan, missing_dockerfiles
+
+    (tmp_path / "blastbox-images.toml").write_text(
+        '[engine]\nname = "demo"\n\n'
+        '[[image]]\nname = "demo"\ndockerfile = "deploy/Dockerfile.demo"\n'
+        f'context = "{context}"\nbase = "python:3.12-slim"\n'
+    )
+    reported = missing_dockerfiles(load_plan(tmp_path), env={"A": "set-value"})
+    assert reported, "the Dockerfile is unfindable either way"
+    assert "is unset" not in reported[0], reported
+    assert "not an expansion blastbox understands" in reported[0], reported
+
+
+def test_a_context_mixing_both_reports_each_kind(tmp_path):
+    """One says set me, the other says rewrite me. Both need saying."""
+    from blastbox.host.images import load_plan, missing_dockerfiles
+
+    (tmp_path / "blastbox-images.toml").write_text(
+        '[engine]\nname = "demo"\n\n'
+        '[[image]]\nname = "demo"\ndockerfile = "deploy/Dockerfile.demo"\n'
+        'context = "$SRC/${A:+x}"\nbase = "python:3.12-slim"\n'
+    )
+    reported = missing_dockerfiles(load_plan(tmp_path), env={"A": "set-value"})
+    assert "SRC is unset" in reported[0], reported
+    assert "not an expansion blastbox understands" in reported[0], reported
