@@ -16,6 +16,10 @@ Required environment variables to run (all have defaults where sensible):
                                  container (default: ["worker", "warm"]).
     BLASTBOX_GVISOR_LD_PRELOAD  Optional path to an LD_PRELOAD .so to inject
                                  (default: unset).
+    BLASTBOX_SNAPSHOT_BUILD_S   Seconds to allow for the warm snapshot BUILD
+                                (default 180). The only supported way to give a
+                                slower checkpoint host more room; without it the
+                                failure arrives three minutes in.
     BLASTBOX_SNAPSHOT_SETTLE_S  Post-restore settle window in seconds before the
                                  slot is considered ready (default: "1.0").
 
@@ -94,9 +98,14 @@ def _force_delete_all(cfg, *, timeout_s: float = 20.0) -> tuple[list[str], list[
         # `runsc list -format=json` prints literal `null` when nothing is
         # registered, which parses to None -- iterating that raised TypeError
         # and turned the cleanup into a second failure. Measured on toolz3.
+        if listed.returncode != 0:
+            # A failed enumeration is NOT an empty host. Reporting "nothing to
+            # clean up" here would be the same lie as reporting an unchecked
+            # delete as a success: live sandboxes may remain and nobody is told.
+            return [], [f"<listing failed: rc={listed.returncode}>"]
         containers = _json.loads(listed.stdout or "[]") or []
         if not isinstance(containers, list):
-            return [], []
+            return [], ["<listing was not a container array>"]
     except Exception:  # noqa: BLE001 - cleanup is best effort by definition
         return [], []
     deleted: list[str] = []
@@ -236,8 +245,26 @@ def test_gvisor_snapshot_roundtrip(tmp_path: Path) -> None:
         # Do not just stop waiting: tear down whatever the stalled build left
         # under THIS test's private root, or a sandbox outlives the run and
         # keeps writing into tmp_path after it is gone.
-        deleted, unconfirmed = _force_delete_all(cfg)
+        # Sweep more than once. The builder is still running -- nothing can
+        # cancel it -- so a container may be registered AFTER the first
+        # enumeration, and a single pass would report "nothing to clean up"
+        # while the thread went on creating one. Bounded, and it says plainly
+        # when the builder outlives the sweep.
+        deleted: list[str] = []
+        unconfirmed: list[str] = []
+        for _ in range(3):
+            found, unsure = _force_delete_all(cfg)
+            deleted.extend(found)
+            unconfirmed.extend(unsure)
+            if not builder.is_alive() and not found:
+                break
+            time.sleep(1.0)
         detail = f"force-deleted {deleted}" if deleted else "nothing to clean up"
+        if builder.is_alive():
+            detail += (
+                "; the build thread is STILL RUNNING and cannot be cancelled, so it "
+                "may yet create one -- treat this host as dirty"
+            )
         if unconfirmed:
             # Loudly: these may still be running, and on a fleet node that is
             # the next run's problem.
