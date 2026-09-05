@@ -578,3 +578,70 @@ class TestProfileMustBeEnforcing:
     def test_a_prefix_is_not_a_match(self, tmp_path, monkeypatch) -> None:
         aa = self._profiles(tmp_path, "blastbox-sandbox-other (enforce)\n", monkeypatch)
         assert aa.profile_loaded("blastbox-sandbox") is False
+
+
+class TestAnUndecodableProfileNameCannotBreakTheScan:
+    """AppArmor profile names are paths, and paths are bytes. One unrelated profile carrying a
+    non-UTF-8 byte used to raise UnicodeDecodeError out of a backend CONSTRUCTOR -- and
+    `select_sandbox` only treats SandboxUnavailable as "try the next backend", so auto-selection
+    aborted instead of falling through to bwrap (codex, #159).
+    """
+
+    def _profiles(self, tmp_path, raw: bytes, monkeypatch):
+        import blastbox.worker.sandbox.apparmor as aa
+
+        f = tmp_path / "profiles"
+        f.write_bytes(raw)
+        monkeypatch.setattr(aa, "_PROFILES", str(f))
+        monkeypatch.delenv("BLASTBOX_APPARMOR_PROFILES", raising=False)
+        return aa
+
+    def test_a_bad_byte_earlier_does_not_hide_our_enforcing_profile(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The assertion that matters. Merely not raising would answer False for a profile that
+        IS enforcing -- dropping confinement because of someone else's filename."""
+        aa = self._profiles(
+            tmp_path,
+            b"/usr/bin/caf\xe9 (enforce)\nblastbox-sandbox (enforce)\n",
+            monkeypatch,
+        )
+        assert aa.profile_loaded("blastbox-sandbox") is True
+
+    def test_a_bad_byte_does_not_raise_when_ours_is_absent(self, tmp_path, monkeypatch) -> None:
+        aa = self._profiles(tmp_path, b"/usr/bin/caf\xe9 (enforce)\n", monkeypatch)
+        assert aa.profile_loaded("blastbox-sandbox") is False
+
+    def test_a_surrogate_never_matches_the_requested_name(self, tmp_path, monkeypatch) -> None:
+        aa = self._profiles(tmp_path, b"blastbox-sandbox\xe9 (enforce)\n", monkeypatch)
+        assert aa.profile_loaded("blastbox-sandbox") is False
+
+    def test_it_answers_rather_than_raising_whatever_the_decode_does(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Belt and braces: the helper is called from a constructor, so it must never propagate."""
+        import blastbox.worker.sandbox.apparmor as aa
+
+        monkeypatch.delenv("BLASTBOX_APPARMOR_PROFILES", raising=False)
+
+        def _boom(*a, **k):
+            raise UnicodeDecodeError("utf-8", b"\xe9", 0, 1, "invalid start byte")
+
+        monkeypatch.setattr("builtins.open", _boom)
+        assert aa.profile_loaded("blastbox-sandbox") is False
+
+    def test_auto_selection_survives_it(self, tmp_path, monkeypatch) -> None:
+        """Product level: the nsjail constructor runs this, and select_sandbox only catches
+        SandboxUnavailable -- so a raise here aborts selection instead of trying bwrap."""
+        import blastbox.worker.sandbox.apparmor as aa
+        import blastbox.worker.sandbox.nsjail as mod
+
+        f = tmp_path / "profiles"
+        f.write_bytes(b"/usr/bin/caf\xe9 (enforce)\n")
+        monkeypatch.setattr(aa, "_PROFILES", str(f))
+        monkeypatch.delenv("BLASTBOX_APPARMOR_PROFILES", raising=False)
+        monkeypatch.setattr(mod, "_probe_nsjail_proc_apparmor", lambda _p: True)
+
+        sb = mod.NsjailSandbox(nsjail_path=Path("/usr/bin/nsjail"))
+        assert sb.apparmor_active is False
+        assert "apparmor_missing" in sb.insecurity_reasons

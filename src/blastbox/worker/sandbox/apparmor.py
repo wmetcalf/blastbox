@@ -34,9 +34,18 @@ def profile_loaded(profile: str) -> bool:
         # operator telling us something untrue.
         return profile in {p.strip() for p in asserted.split(",") if p.strip()}
     try:
-        with open(_PROFILES, encoding="ascii") as fh:
+        # `surrogateescape`, not `ascii`: an AppArmor profile name is usually a PATH, and a
+        # path is bytes, so one profile with a non-UTF-8 byte -- belonging to some UNRELATED
+        # program -- would abort the scan before reaching ours. Swallowing that error is not
+        # enough: it would answer False for a profile that IS enforcing, so nsjail would drop
+        # `--proc_apparmor` and run the workload unconfined because of somebody else's
+        # filename. Surrogates round-trip losslessly and never equal an ASCII profile name.
+        with open(_PROFILES, encoding="utf-8", errors="surrogateescape") as fh:
             return any(_line_is_enforcing(line, profile) for line in fh)
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # This helper is called from a backend CONSTRUCTOR, and `select_sandbox` only treats
+        # `SandboxUnavailable` as "try the next backend" -- anything else aborts auto-selection
+        # rather than falling through to bwrap. It must answer, never raise (codex, #159).
         return False
 
 
