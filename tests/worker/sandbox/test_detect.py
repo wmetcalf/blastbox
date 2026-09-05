@@ -172,8 +172,14 @@ def test_select_sandbox_auto_host_prefers_nsjail_or_bwrap(monkeypatch, tmp_path:
     monkeypatch.setattr(bwrap_mod, "_LIBSECCOMP_AVAILABLE", False)
 
     sb = select_sandbox(_status_path=tmp_path / "unused")
-    # On this host nsjail and bwrap are installed, so we expect one of them.
-    has_nsjail = shutil.which("nsjail") is not None
+    # USABILITY, not presence -- the second instance of the same mistake in this file. An
+    # nsjail that is installed but cannot create user namespaces is one select_sandbox
+    # correctly declines, so counting it as available made this expect a backend the product
+    # had rightly refused. Caught the first time nsjail was actually installed where these
+    # tests run (CI, #157).
+    from .conftest import nsjail_usable
+
+    has_nsjail = nsjail_usable() is None
     has_bwrap = shutil.which("bwrap") is not None
     if has_nsjail or has_bwrap:
         assert sb.name in ("nsjail", "bwrap"), (
