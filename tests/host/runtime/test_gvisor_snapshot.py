@@ -1,3 +1,4 @@
+import time
 import json
 from pathlib import Path
 
@@ -930,3 +931,90 @@ class TestReadyTimeoutDistinguishesDeadFromSlow:
             h.wait_ready(0.1)
 
         assert "exited before signalling READY" not in str(ei.value)
+
+
+class TestEveryRunscCallIsBounded:
+    """An unbounded runsc call disables warm rebuilds for the life of the process.
+
+    `_default_run` is `subprocess.run(check=True)` with no timeout, and the build runs on a
+    daemon thread that `ensure_build_started` refuses to replace while it is alive
+    (`_build_thread.is_alive()`) -- with no watchdog anywhere. So one wedged
+    `checkpoint`/`run`/`restore`/`exec` meant the warm tier never rebuilt again: no error, no
+    log, every job on the cold tier permanently. The query helpers were already bounded
+    (`runsc state` 3s, `runsc help` 5s); the build path was not.
+
+    These drive the REAL call sites with a recording runner and assert a timeout was passed,
+    then prove end-to-end against an actually-hanging runsc that the call returns.
+    """
+
+    def _cfg(self, tmp_path, **kw):
+        from blastbox.host.runtime.gvisor_snapshot import GvisorConfig
+
+        return GvisorConfig(
+            runsc_bin="runsc", root=tmp_path / "root", image_rootfs=tmp_path / "rootfs",
+            network="none", warm_argv=["python3", "/opt/blastbox/run_warm.py"], **kw,
+        )
+
+    def test_the_checkpoint_call_is_bounded(self, tmp_path):
+        from blastbox.host.runtime.gvisor_snapshot import GvisorBootHandle
+
+        seen: list[dict] = []
+
+        def run(argv, **kw):
+            seen.append({"argv": argv, "kw": kw})
+            return 0
+
+        cfg = self._cfg(tmp_path, cli_timeout_s=42.0)
+        base = tmp_path / "base"
+        (base / "ctrl").mkdir(parents=True)
+        h = GvisorBootHandle(cfg, run, "cid", base, base / "ctrl", lambda c, t: None)
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        h.checkpoint(dest)
+
+        ckpt = [c for c in seen if "checkpoint" in c["argv"]]
+        assert ckpt, f"no checkpoint call was made: {seen}"
+        assert ckpt[0]["kw"].get("timeout") == 42.0, (
+            f"runsc checkpoint ran unbounded; a wedge here never rebuilds: {ckpt[0]['kw']}"
+        )
+
+    def test_the_boot_call_is_bounded(self, tmp_path):
+        from blastbox.host.runtime.gvisor_snapshot import GvisorSnapshotBackend
+
+        seen: list[dict] = []
+
+        def run(argv, **kw):
+            seen.append({"argv": argv, "kw": kw})
+            return 0
+
+        cfg = self._cfg(tmp_path, cli_timeout_s=37.0)
+        (tmp_path / "root").mkdir(parents=True, exist_ok=True)
+        be = GvisorSnapshotBackend(cfg, run=run)
+        be.boot_base()
+
+        boots = [c for c in seen if "run" in c["argv"] and "-detach" in c["argv"]]
+        assert boots, f"no runsc run call was made: {seen}"
+        assert boots[0]["kw"].get("timeout") == 37.0, (
+            f"runsc run ran unbounded: {boots[0]['kw']}"
+        )
+
+    def test_a_hanging_runsc_actually_returns(self, tmp_path):
+        """The property that matters, proved by EXECUTING a runsc that never exits.
+
+        Asserting the kwarg alone would pass even if `_default_run` dropped it on the floor.
+        """
+        import subprocess as sp
+
+        from blastbox.host.runtime.gvisor_snapshot import _default_run
+
+        hang = tmp_path / "runsc-that-hangs"
+        hang.write_text("#!/bin/sh\nsleep 300\n")
+        hang.chmod(0o755)
+
+        started = time.monotonic()
+        with pytest.raises(sp.TimeoutExpired):
+            _default_run([str(hang), "checkpoint"], timeout=1.0)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 30, f"the call was not bounded: it took {elapsed:.0f}s"

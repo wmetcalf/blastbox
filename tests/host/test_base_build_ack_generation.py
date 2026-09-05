@@ -43,7 +43,9 @@ def test_the_gvisor_base_is_stamped_before_runsc_run(tmp_path, monkeypatch):
         return 0
 
     be = object.__new__(gs.GvisorSnapshotBackend)
-    be._cfg = type("C", (), {"root": tmp_path / "root" / "r"})()
+    # Every attribute boot_base reads must be present on this stand-in config; cli_timeout_s
+    # bounds the runsc launch (an unbounded one could wedge the build thread forever).
+    be._cfg = type("C", (), {"root": tmp_path / "root" / "r", "cli_timeout_s": 900.0})()
     be._run = _run
     be._ready = lambda ctrl, tmo: None
     # Hand-built via object.__new__, so every collaborator boot_base reads must be set here.

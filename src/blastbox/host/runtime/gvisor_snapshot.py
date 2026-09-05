@@ -13,6 +13,7 @@ import logging
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -55,6 +56,17 @@ class GvisorConfig:
     # UserInstallation under /tmp keep soffice happy unprivileged.
     uid: int = 65532
     gid: int = 65532
+    # BOUND every runsc invocation. `_default_run` is `subprocess.run(check=True)` with no
+    # timeout, so `checkpoint`/`run`/`restore`/`exec` could block forever -- and the build runs
+    # on a daemon thread that `ensure_build_started` refuses to replace while it is alive
+    # (`_build_thread.is_alive()`), with no watchdog anywhere. One wedged runsc call therefore
+    # disabled warm rebuilds for the LIFE OF THE PROCESS, silently: no error, no log, every job
+    # on the cold tier forever. The query helpers were already bounded (`runsc state` at 3s,
+    # `runsc help` at 5s) for exactly this reason; the build path was not.
+    #
+    # Generous, not tight: a checkpoint writes the guest's whole memory image and legitimately
+    # takes minutes on a large base. The point is that it is BOUNDED, not that it is quick.
+    cli_timeout_s: float = 900.0
     # Bound the untrusted worker's process + fd count at the OCI layer. The sentry enforces
     # process.rlimits even though `-ignore-cgroups` disables cgroup pids/memory, so without
     # these a malicious doc could fork-bomb / exhaust fds and degrade the whole pool (the FC
@@ -76,6 +88,52 @@ class GvisorCommandError(RuntimeError):
     `SnapshotManager.build()` wraps whatever escapes into `SnapshotBuildError`
     using `str(exc)`, so what this carries is what the operator finally reads.
     """
+
+
+def _detached_stderr(dirpath: Path):
+    """A FILE to collect a detached runsc launch's stderr, never a pipe.
+
+    `subprocess.run(..., stderr=PIPE)` returns only at EOF on that pipe, and a `-detach`ed
+    sandbox INHERITS the write end -- so with a healthy guest that keeps running, the pipe
+    never closes and the launch never returns. That is not theoretical: it wedged the warm
+    build on toolz2 for >1500s, and only a guest that died instantly (closing the fd) let the
+    boot return at all. Introduced in #141 while adding these diagnostics; the diagnostics are
+    worth keeping, so they move to a file the sandbox may hold open without blocking us.
+
+    Returns (file object, path). The caller closes it.
+    """
+    fh = tempfile.NamedTemporaryFile(  # noqa: SIM115 - the caller owns the handle
+        prefix="runsc-stderr-", suffix=".log", dir=str(dirpath), delete=False, mode="w+b",
+    )
+    return fh, Path(fh.name)
+
+
+def _read_and_discard(path: Path, *, max_bytes: int = 8192) -> str:
+    """Tail of a launch's stderr file, then remove it. Never raises."""
+    try:
+        data = path.read_bytes()[-max_bytes:]
+    except OSError:
+        data = b""
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    return data.decode("utf-8", "replace")
+
+
+def _attach_stderr_text(exc: BaseException, text: str) -> BaseException:
+    """Give ``exc`` a ``stderr`` so _with_runsc_stderr can render it.
+
+    A launch whose stderr went to a FILE has no ``stderr`` attribute on its exception; this
+    puts the captured tail where the existing renderer already looks, so both capture styles
+    produce the same operator-facing message.
+    """
+    if text and not getattr(exc, "stderr", None):
+        try:
+            exc.stderr = text          # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - some exceptions refuse attributes; not worth failing
+            return GvisorCommandError(f"{exc}: {text.strip()[-600:]}")
+    return exc
 
 
 def _with_runsc_stderr(exc: BaseException, what: str) -> BaseException:
@@ -486,7 +544,8 @@ class GvisorBootHandle:
         img = Path(dest_dir) / f"checkpoint-{gen}"
         img.mkdir(parents=True, exist_ok=True)
         try:
-            self._run([*_runsc(self._cfg), "checkpoint", "-image-path", str(img), self._cid])
+            self._run([*_runsc(self._cfg), "checkpoint", "-image-path", str(img), self._cid],
+                      timeout=self._cfg.cli_timeout_s)
         except BaseException:
             # runsc can write part of the checkpoint and then fail. No artifact is returned, so
             # SnapshotManager never learns this directory exists and can never retire or discard
@@ -561,7 +620,8 @@ class GvisorRestoreHandle:
             f"tar cf {WARM_OUTPUT_ARCHIVE} --exclude={WARM_OUTPUT_ARCHIVE} . && sync"
         )
         try:
-            self._run([*_runsc(self._cfg), "exec", self._cid, "sh", "-c", cmd])
+            self._run([*_runsc(self._cfg), "exec", self._cid, "sh", "-c", cmd],
+                      timeout=self._cfg.cli_timeout_s)
             return True
         except Exception:  # noqa: BLE001 — materialize must never raise; fall back to the bind mount
             return False
@@ -730,14 +790,23 @@ class GvisorSnapshotBackend:
         ctrl = base / "ctrl"
         cid = f"warm-base-{token}"
         _write_oci_config(self._cfg, base, in_ro=True)
+        # A FILE, not a pipe: the detached sandbox inherits this fd and holds it for its
+        # whole life, so PIPE here means `subprocess.run` waits for a guest that is working
+        # correctly. See _detached_stderr.
+        _err_fh, _err_path = _detached_stderr(base)
         try:
-            self._run(
-                [*_runsc(self._cfg), "run", "-detach", "-bundle", str(base), cid],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
+            try:
+                self._run(
+                    [*_runsc(self._cfg), "run", "-detach", "-bundle", str(base), cid],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=_err_fh,
+                    timeout=self._cfg.cli_timeout_s,
+                )
+            finally:
+                _err_fh.close()
         except BaseException as boot_exc:
+            boot_exc = _attach_stderr_text(boot_exc, _read_and_discard(_err_path))
             # BaseException, matching restore_in and build()'s teardown: an interrupt or
             # cancellation during `runsc run` still leaves registered container state behind, and
             # no boot handle is returned on failure, so nothing else can ever reap it (PR #82).
@@ -767,14 +836,23 @@ class GvisorSnapshotBackend:
         cid = f"slot-{uuid.uuid4().hex[:12]}"
         _write_oci_config(self._cfg, wd, in_ro=True)
         try:
-            self._run(
-                [*_runsc(self._cfg), "restore", "-image-path", str(artifact),
-                 "-detach", "-bundle", str(wd), cid],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
+            _err_fh, _err_path = _detached_stderr(wd)   # a file, never a pipe: see boot_base
+            try:
+                self._run(
+                    [*_runsc(self._cfg), "restore", "-image-path", str(artifact),
+                     "-detach", "-bundle", str(wd), cid],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=_err_fh,
+                    timeout=self._cfg.cli_timeout_s,
+                )
+            finally:
+                _err_fh.close()
         except BaseException as exc:
+            # The launch wrote its stderr to a FILE (a detached sandbox inherits the fd, so a
+            # pipe would block us); move that tail onto the exception where the shared renderer
+            # already looks.
+            exc = _attach_stderr_text(exc, _read_and_discard(_err_path))
             # BaseException, not Exception. A KeyboardInterrupt, SystemExit or task cancellation
             # during `runsc restore` skipped this handler entirely -- yet the command may already
             # have registered a container and spawned its sandbox/gofer processes. Worse,
