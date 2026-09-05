@@ -1073,49 +1073,69 @@ class TestTheBoundsCodexFound:
         for kw in seen:
             assert kw.get("timeout") == 77.0, f"an unbounded teardown call: {kw}"
 
-    def test_an_oversized_stderr_file_is_read_by_the_tail_only(self, tmp_path):
-        """The detached sandbox holds this fd for its whole life and an untrusted document can
-        make the worker log without limit; slurping it to keep 8 KiB is how a diagnostic
-        becomes an OOM."""
-        from blastbox.host.runtime.gvisor_snapshot import _read_and_discard
+    def test_a_flood_of_stderr_is_bounded_in_memory(self):
+        """The sandbox holds this fd for its whole life and an untrusted document can make the
+        worker log without limit, so the sink must keep only the tail -- and must keep DRAINING,
+        or a busy guest blocks on a full pipe instead of running.
 
-        import tracemalloc
-
-        # SPARSE, so the file costs no disk but slurping it costs 64 MiB of RAM. The content
-        # assertions below are identical for both implementations -- only the allocation tells
-        # them apart, so measure that or the guard cannot be falsified.
-        big = tmp_path / "stderr.log"
-        with big.open("wb") as fh:
-            fh.truncate(64 * 1024 * 1024)
-            fh.seek(-21, 2)
-            fh.write(b"THE-INTERESTING-TAIL\n")
-
-        tracemalloc.start()
-        try:
-            out = _read_and_discard(big, max_bytes=4096)
-            _, peak = tracemalloc.get_traced_memory()
-        finally:
-            tracemalloc.stop()
-
-        assert "THE-INTERESTING-TAIL" in out, "runsc's useful line is the LAST one"
-        assert len(out) <= 4096
-        assert not big.exists(), "the capture file must not be left behind"
-        assert peak < 1024 * 1024, (
-            "read the whole 64 MiB file to keep 4 KiB of it: peak allocation "
-            f"{peak / 1024 / 1024:.1f} MiB"
-        )
-
-    def test_a_stderr_file_that_cannot_be_created_does_not_mask_the_real_error(self, tmp_path):
-        """Creating the capture file can fail on its own (ENOSPC, EMFILE, permissions).
-
-        Referencing its path from the handler turned that into an UnboundLocalError, which
-        masks the actual host-resource failure and skips the teardown it guards.
+        The write end is put in NON-BLOCKING mode deliberately. A sink that stops draining
+        would otherwise block the writer forever, and closing the fd does not reliably wake a
+        thread already blocked in `os.write` -- so the test would HANG rather than fail, which
+        is its own defect. Non-blocking turns "not draining" into a named failure in seconds.
         """
-        from blastbox.host.runtime.gvisor_snapshot import _detached_stderr
+        import os as _os
+        import time as _time
 
-        missing = tmp_path / "no-such-dir"
-        with pytest.raises(OSError):
-            _detached_stderr(missing)
+        from blastbox.host.runtime.gvisor_snapshot import _StderrSink
+
+        sink = _StderrSink(max_bytes=4096)
+        target = 4 * 1024 * 1024                    # 4 MiB through a 4 KiB sink
+        written = 0
+        try:
+            _os.set_blocking(sink.write_fd, False)
+            deadline = _time.monotonic() + 15.0
+            while written < target and _time.monotonic() < deadline:
+                try:
+                    written += _os.write(sink.write_fd, b"A" * 65536)
+                except BlockingIOError:
+                    _time.sleep(0.005)              # only reachable if nobody is draining
+            assert written >= target, (
+                f"the writer stalled after {written} bytes: the sink stopped draining, so a "
+                "busy guest would block on a full pipe instead of running"
+            )
+            # Same retry: a drained pipe can still be momentarily full, and this marker is
+            # what the tail assertion below looks for.
+            marker = b"THE-INTERESTING-TAIL\n"
+            deadline = _time.monotonic() + 5.0
+            while marker and _time.monotonic() < deadline:
+                try:
+                    marker = marker[_os.write(sink.write_fd, marker):]
+                except BlockingIOError:
+                    _time.sleep(0.005)
+            assert not marker, "could not write the tail marker even with the sink draining"
+        finally:
+            sink.close_write()
+
+        tail = sink.tail()
+        assert "THE-INTERESTING-TAIL" in tail, "runsc's useful line is the LAST one"
+        assert len(tail) <= 4096, f"the sink kept {len(tail)} bytes of a {target}-byte stream"
+
+    def test_worker_written_stderr_cannot_smuggle_control_characters(self):
+        """This text is influenced by the sandboxed worker and lands in an operator's log, so
+        newlines (log-line injection) and control bytes must not survive."""
+        import os as _os
+
+        from blastbox.host.runtime.gvisor_snapshot import _StderrSink
+
+        sink = _StderrSink()
+        try:
+            _os.write(sink.write_fd, b"boom\n2026-01-01 CRITICAL fleet is on fire\x00\x1b[31m")
+        finally:
+            sink.close_write()
+
+        tail = sink.tail()
+        assert "\n" not in tail and "\x00" not in tail and "\x1b" not in tail
+        assert tail.startswith("boom")
 
 
 class TestControlFlowAndBundleCleanup:
@@ -1162,8 +1182,10 @@ class TestControlFlowAndBundleCleanup:
         monkeypatch.setattr(gs, "_prepare_slot_dirs",
                             lambda cfg, base: (base / "ctrl").mkdir(parents=True))
         monkeypatch.setattr(gs, "_write_oci_config", lambda cfg, base, in_ro=True: None)
-        monkeypatch.setattr(gs, "_detached_stderr",
-                            lambda d: (_ for _ in ()).throw(OSError(24, "Too many open files")))
+        # EMFILE creating the sink: the bundle dir and OCI config are already on disk and no
+        # container exists, so nothing else knows this base is here.
+        monkeypatch.setattr(gs, "_StderrSink",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError(24, "Too many open files")))
 
         root = tmp_path / "root" / "r"
         cfg = gs.GvisorConfig(
@@ -1180,13 +1202,9 @@ class TestControlFlowAndBundleCleanup:
 
 
 def test_a_successful_boot_leaves_no_capture_file_behind(tmp_path, monkeypatch):
-    """Only the FAILURE path removed the stderr capture file.
-
-    So every healthy boot left one behind, per base -- and the detached sandbox keeps that fd
-    for its whole life, so each one kept growing with whatever the untrusted worker logged
-    (codex, #149). Unlinking on success ends the accumulation; the blocks are reclaimed when
-    the sandbox exits.
-    """
+    """There is no capture FILE any more -- the sink is a drained pipe -- so a healthy boot
+    can leave nothing on disk at all. Kept as a regression on the file-based design, which
+    left one growing file per base (codex, #149/#150)."""
     from blastbox.host.runtime import gvisor_snapshot as gs
 
     monkeypatch.setattr(gs, "_prepare_slot_dirs",
@@ -1203,7 +1221,5 @@ def test_a_successful_boot_leaves_no_capture_file_behind(tmp_path, monkeypatch):
     bundles = list(root.parent.glob("gvisor-base-*"))
     assert bundles, "fixture: the bundle should exist after a successful boot"
     leftovers = [p for b in bundles for p in b.glob("runsc-stderr-*")]
-    assert not leftovers, (
-        f"a successful boot left its stderr capture file behind: {leftovers}"
-    )
+    assert not leftovers, f"a successful boot left a stderr capture file behind: {leftovers}"
     assert handle is not None
