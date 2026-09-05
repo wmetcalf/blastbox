@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import subprocess
 import re
 import socket
 import ssl
@@ -201,6 +202,13 @@ def is_host_resource_failure(exc: BaseException) -> bool:
     while cur is not None and id(cur) not in seen:
         seen.add(id(cur))
         if isinstance(cur, OSError) and cur.errno in HOST_RESOURCE_ERRNOS:
+            return True
+        # A host disk helper that ran out of time is the HOST failing, not the tier. Without
+        # this, repeated filesystem stalls walk the pool's restore streak and the cascade's
+        # per-tier streak up to the point where a perfectly healthy snapshot base is
+        # invalidated -- punishing the tier for the disk (codex, #154). subprocess.TimeoutExpired
+        # is not an OSError, so the errno rule above cannot see it.
+        if isinstance(cur, subprocess.TimeoutExpired):
             return True
         cur = cur.__cause__ or cur.__context__
     return False

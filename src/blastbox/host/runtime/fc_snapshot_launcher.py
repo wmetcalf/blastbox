@@ -17,6 +17,7 @@ the full snapshot→restore→convert round-trip works pixel-identically (see th
 from __future__ import annotations
 
 import inspect
+import contextlib
 import shutil
 import logging
 import os
@@ -363,6 +364,34 @@ def _default_make_outdisk(path: Path) -> None:
     make_ext4(path, _DEFAULT_OUTDISK_MIB)
 
 
+def _copy_with_deadline(src: Path, dst: Path, timeout_s: float, *, chunk: int = 4 << 20) -> None:
+    """`shutil.copyfile` with a deadline, checked between chunks.
+
+    A stalled filesystem can block inside a single read or write, which no pure-Python copy
+    can interrupt -- but it cannot make PROGRESS either, so checking the clock between chunks
+    turns an indefinite hang into a bounded failure. The partial destination is removed: a
+    truncated outdisk is worse than none, because the guest would mount it.
+    """
+    import time as _time
+
+    deadline = _time.monotonic() + timeout_s
+    try:
+        with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+            while True:
+                if _time.monotonic() > deadline:
+                    raise subprocess.TimeoutExpired(
+                        cmd=f"copy {src} -> {dst}", timeout=timeout_s
+                    )
+                buf = fsrc.read(chunk)
+                if not buf:
+                    return
+                fdst.write(buf)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            dst.unlink()
+        raise
+
+
 def _default_copy_outdisk(src: Path, dst: Path) -> None:
     # Copy the base outdisk image byte-for-byte (preserves the exact ext4 the guest
     # snapshotted with). Prefer a reflink (CoW clone — near-instant on xfs/btrfs);
@@ -386,7 +415,11 @@ def _default_copy_outdisk(src: Path, dst: Path) -> None:
         # bounded failure back into a hang. Let the spawn fail and be retried.
         raise
     except (OSError, subprocess.CalledProcessError):
-        shutil.copyfile(src, dst)
+        # BOUNDED TOO. `cp` missing or without --reflink (a BusyBox image) lands here
+        # immediately, and an unbounded shutil.copyfile would then do the whole copy with no
+        # deadline -- so the documented bound would not hold on the very path the fallback
+        # exists for (codex, #154).
+        _copy_with_deadline(src, dst, disk_timeout_s())
 
 
 def _ready_factory_kwargs(fn: Any, *, ack_generation: "int | None") -> "dict[str, Any]":
@@ -721,6 +754,16 @@ class FcSnapshotLauncher:
             # BaseException: the caller only gets a killable _Handle once restore_in RETURNS, so
             # a KeyboardInterrupt/SystemExit/cancellation here leaks the firecracker process this
             # method just spawned -- permanently, since nothing else knows its pid (PR #82).
-            _terminate_proc(proc)
+            if not _terminate_proc(proc):
+                # UNCONFIRMED: it survived both terminate AND kill, so the microVM may still be
+                # running with this workdir's disk and sockets open. Ignoring that -- which this
+                # did -- let SnapshotManager.restore() remove the workdir and forget the spawn,
+                # leaving an orphan neither the pool nor shutdown can account for. Especially
+                # likely in the filesystem-stall case the copy timeout above exists for, since
+                # firecracker is then blocked on that same disk. Same rule boot_base already
+                # follows (codex, #154).
+                self._stranded_partials.append(str(slot_workdir))
+                _log.warning("fc_snapshot: firecracker for slot workdir %s could not be confirmed "
+                             "gone; retaining it for the next sweep", slot_workdir)
             raise
         return _Handle(proc, api, str(Path(slot_workdir) / REL_VSOCK))

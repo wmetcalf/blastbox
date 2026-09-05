@@ -1175,8 +1175,17 @@ class FirecrackerSlotRuntime:
 
         # Create the per-slot output disk.  The guest mounts this as vdb and
         # writes results here; the host reads it via rdump_ext4 after exit.
+        #
+        # CLEAN UP ON FAILURE. Nothing else can: the exception escapes before a Slot exists,
+        # so the pool has nothing to hand reap(), and every retry would leave another
+        # directory and a partially formatted image behind -- unbounded on a persistently
+        # slow disk, or under a disk timeout set below the real formatting time (codex, #154).
         outdisk_path = slot_dir / "outdisk.ext4"
-        make_ext4(outdisk_path, self._cfg.fc_outdisk_mib)
+        try:
+            make_ext4(outdisk_path, self._cfg.fc_outdisk_mib)
+        except BaseException:
+            shutil.rmtree(slot_dir, ignore_errors=True)
+            raise
 
         # Build the vsock UDS path.  FC creates <uds_path> for the host side
         # and <uds_path>_<port> for guest connects; we give FC ownership.
