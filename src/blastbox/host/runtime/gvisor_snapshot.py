@@ -649,7 +649,8 @@ class GvisorBootHandle:
                 # ...and if the cleanup ITSELF fails, nothing can rediscover the directory either.
                 # Record it for the next checkpoint's sweep rather than dropping it, exactly as the
                 # FC launcher does for its partial files.
-                self._stranded_partials.append(str(img))
+                with _STRANDED_LOCK:
+                    self._stranded_partials.append(str(img))
                 _log.warning("gvisor_snapshot: could not remove partial checkpoint %s", img)
             raise
         return str(img)
@@ -725,6 +726,10 @@ class GvisorRestoreHandle:
             raise RuntimeError(f"could not confirm teardown of runsc container {self._cid}")
 
 
+# Guards the stranded-partials ledgers this module shares between the backend and its handles.
+_STRANDED_LOCK = threading.Lock()
+
+
 def _retry_stranded_partials(stranded: "list[str]") -> None:
     """Re-attempt removal of partial checkpoints a previous failed attempt could not delete.
 
@@ -733,13 +738,24 @@ def _retry_stranded_partials(stranded: "list[str]") -> None:
     """
     if not stranded:
         return
+    # TAKE the batch under the ledger lock rather than iterating the live list and finishing
+    # with `stranded[:] = still`. That slice assignment ERASES anything appended while the
+    # sweep ran, and three separate failure paths append here -- a partial checkpoint (652), a
+    # base whose teardown could not be confirmed (925), and a restore workdir the same (987).
+    # Losing one of those loses the only record of a directory a live sandbox may still hold.
+    # Same defect and same fix as the FC launcher's ledger (#154).
+    with _STRANDED_LOCK:
+        batch = list(stranded)
+        del stranded[:]
     still: list[str] = []
-    for leftover in stranded:
+    for leftover in batch:
         errs: list[str] = []
         shutil.rmtree(leftover, onerror=lambda fn, p, exc: errs.append(str(p)))
         if errs:
             still.append(leftover)
-    stranded[:] = still
+    with _STRANDED_LOCK:
+        # PREPEND, keeping anything appended while we swept.
+        stranded[:0] = still
 
 
 class GvisorSnapshotBackend:
@@ -922,7 +938,8 @@ class GvisorSnapshotBackend:
                 # still be live. Ignoring that result and removing the bundle anyway forgot the
                 # only cid anything could retry, and every later build retry leaked another base.
                 # Keep both for the next attempt (upstream, PR #82).
-                self._stranded_partials.append(str(base))
+                with _STRANDED_LOCK:
+                    self._stranded_partials.append(str(base))
                 _log.warning("gvisor_snapshot: base %s could not be confirmed deleted; retaining "
                              "its bundle for retry", cid)
                 raise _with_runsc_stderr(boot_exc, "runsc run") from boot_exc
@@ -984,7 +1001,8 @@ class GvisorSnapshotBackend:
                 # teardown OR release that pin: repeated restores leaked sandbox/gofer processes
                 # and the checkpoint could never be reclaimed. Same retention the base-boot path
                 # now does (upstream, PR #82).
-                self._stranded_partials.append(str(wd))
+                with _STRANDED_LOCK:
+                    self._stranded_partials.append(str(wd))
                 _log.warning("gvisor_snapshot: restore sandbox %s could not be confirmed deleted; "
                              "retaining its bundle for retry", cid)
             # Same treatment as the base boot: `CalledProcessError.__str__` does

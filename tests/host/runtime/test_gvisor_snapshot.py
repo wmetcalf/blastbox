@@ -1258,3 +1258,41 @@ def test_a_sink_whose_drain_cannot_start_leaks_no_descriptors():
     assert after <= before + 2, (
         f"20 refused sinks leaked descriptors: {before} -> {after}"
     )
+
+
+def test_a_gvisor_ledger_append_during_the_sweep_is_not_erased(tmp_path, monkeypatch):
+    """`stranded[:] = still` erases anything appended while the sweep ran.
+
+    Three failure paths append to this ledger -- a partial checkpoint, a base whose teardown
+    could not be confirmed, and a restore workdir the same. Losing one loses the only record of
+    a directory a live sandbox may still hold. Identical defect to the FC launcher's ledger
+    (#154); found by looking for the same shape in the sibling module.
+
+    Deterministic rather than raced: the erase happens at the END of the sweep, so an append
+    injected from inside the sweep's own rmtree lands exactly in the window it closes over.
+    """
+    import os as _os
+
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    stuck = tmp_path / "stuck-checkpoint"
+    stuck.mkdir()
+    ledger = [str(stuck)]
+    newcomer = str(tmp_path / "appended-mid-sweep")
+
+    def _rmtree(path, onerror=None, **kw):
+        with gs._STRANDED_LOCK:
+            if newcomer not in ledger:
+                ledger.append(newcomer)          # a concurrent failure path appends
+        if onerror:
+            onerror(_os.rmdir, str(path), (OSError, OSError(5, "EIO"), None))
+        return
+
+    monkeypatch.setattr(gs.shutil, "rmtree", _rmtree)
+
+    gs._retry_stranded_partials(ledger)
+
+    assert newcomer in ledger, (
+        "an entry appended during the sweep was erased; nothing can ever reclaim that dir"
+    )
+    assert str(stuck) in ledger, "the still-stuck path must survive for the next sweep too"
