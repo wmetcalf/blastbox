@@ -58,3 +58,49 @@ def nsjail_usable() -> str | None:
             f"(exit={r.returncode}, stderr={r.stderr.decode(errors='replace')[:200]!r})"
         )
     return None
+
+
+@lru_cache(maxsize=1)
+def bwrap_usable() -> str | None:
+    """The reason bwrap cannot be used here, or None if it can.
+
+    The bwrap twin of `nsjail_usable`, and it exists for the same reason: three separate
+    places asked "is bwrap available?" and two of them answered with `shutil.which`, which is
+    a different question. A bwrap that is installed but cannot unshare a network namespace --
+    `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`, the GitHub runner's state
+    -- is one `select_sandbox` correctly declines.
+    """
+    if not shutil.which("bwrap"):
+        return "bwrap not installed"
+    true_path = "/usr/bin/true" if Path("/usr/bin/true").exists() else "/bin/true"
+    try:
+        r = subprocess.run(
+            [
+                "bwrap",
+                "--unshare-user",
+                "--unshare-all",
+                "--die-with-parent",
+                "--clearenv",
+                "--proc", "/proc",
+                "--dev", "/dev",
+                "--ro-bind", "/usr", "/usr",
+                "--symlink", "usr/bin", "/bin",
+                "--symlink", "usr/lib", "/lib",
+                "--symlink", "usr/lib64", "/lib64",
+                "--symlink", "usr/sbin", "/sbin",
+                "--ro-bind", "/etc", "/etc",
+                "--tmpfs", "/tmp",
+                "--",
+                true_path,
+            ],
+            capture_output=True,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        return f"bwrap probe failed: {exc}"
+    if r.returncode != 0:
+        return (
+            f"bwrap user-namespace not usable on this host "
+            f"(exit={r.returncode}, stderr={r.stderr.decode(errors='replace')[:200]!r})"
+        )
+    return None

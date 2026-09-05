@@ -58,9 +58,13 @@ def test_select_sandbox_env_override_container(monkeypatch, tmp_path: Path) -> N
 
 def test_select_sandbox_env_override_bwrap(monkeypatch, tmp_path: Path) -> None:
     """BLASTBOX_SANDBOX=bwrap forces bwrap backend."""
-    import shutil
-    if not shutil.which("bwrap"):
-        pytest.skip("bwrap not installed")
+    from .conftest import bwrap_usable
+
+    # USABILITY, not presence: an installed bwrap that cannot unshare a namespace is one
+    # select_sandbox correctly declines, so forcing it must skip rather than fail.
+    _why_bwrap = bwrap_usable()
+    if _why_bwrap:
+        pytest.skip(_why_bwrap)
     monkeypatch.setenv("BLASTBOX_SANDBOX", "bwrap")
     monkeypatch.setenv("BLASTBOX_WARN_ON_INSECURE", "1")
     # Patch seccomp lib to False so bwrap can be used without the lib.
@@ -162,7 +166,6 @@ def test_select_sandbox_auto_host_prefers_nsjail_or_bwrap(monkeypatch, tmp_path:
 
     If neither nsjail nor bwrap is functional, falls back to container.
     """
-    import shutil
     import blastbox.worker.sandbox.detect as detect_mod
     monkeypatch.setenv("BLASTBOX_WARN_ON_INSECURE", "1")
     monkeypatch.delenv("BLASTBOX_SANDBOX", raising=False)
@@ -177,10 +180,10 @@ def test_select_sandbox_auto_host_prefers_nsjail_or_bwrap(monkeypatch, tmp_path:
     # correctly declines, so counting it as available made this expect a backend the product
     # had rightly refused. Caught the first time nsjail was actually installed where these
     # tests run (CI, #157).
-    from .conftest import nsjail_usable
+    from .conftest import bwrap_usable, nsjail_usable
 
     has_nsjail = nsjail_usable() is None
-    has_bwrap = shutil.which("bwrap") is not None
+    has_bwrap = bwrap_usable() is None
     if has_nsjail or has_bwrap:
         assert sb.name in ("nsjail", "bwrap"), (
             f"Expected nsjail or bwrap on bare-metal host, got {sb.name!r}"
