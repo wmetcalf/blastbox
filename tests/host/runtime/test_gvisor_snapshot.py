@@ -1170,3 +1170,33 @@ class TestControlFlowAndBundleCleanup:
 
         leaked = list(root.parent.glob("gvisor-base-*"))
         assert not leaked, f"a prepared bundle was left behind: {leaked}"
+
+
+def test_a_successful_boot_leaves_no_capture_file_behind(tmp_path, monkeypatch):
+    """Only the FAILURE path removed the stderr capture file.
+
+    So every healthy boot left one behind, per base -- and the detached sandbox keeps that fd
+    for its whole life, so each one kept growing with whatever the untrusted worker logged
+    (codex, #149). Unlinking on success ends the accumulation; the blocks are reclaimed when
+    the sandbox exits.
+    """
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    monkeypatch.setattr(gs, "_prepare_slot_dirs",
+                        lambda cfg, base: (base / "ctrl").mkdir(parents=True))
+    monkeypatch.setattr(gs, "_write_oci_config", lambda cfg, base, in_ro=True: None)
+
+    root = tmp_path / "root" / "r"
+    cfg = gs.GvisorConfig(
+        runsc_bin="runsc", root=root, image_rootfs=tmp_path / "rootfs",
+        network="none", warm_argv=["x"],
+    )
+    handle = gs.GvisorSnapshotBackend(cfg, run=lambda *a, **k: 0).boot_base()
+
+    bundles = list(root.parent.glob("gvisor-base-*"))
+    assert bundles, "fixture: the bundle should exist after a successful boot"
+    leftovers = [p for b in bundles for p in b.glob("runsc-stderr-*")]
+    assert not leftovers, (
+        f"a successful boot left its stderr capture file behind: {leftovers}"
+    )
+    assert handle is not None

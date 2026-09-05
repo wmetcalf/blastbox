@@ -108,6 +108,14 @@ def _detached_stderr(dirpath: Path):
     return fh, Path(fh.name)
 
 
+def _discard_path(path: Path) -> None:
+    """Unlink a capture file, ignoring a path that is already gone. Never raises."""
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
 def _read_and_discard(path: Path, *, max_bytes: int = 8192) -> str:
     """Tail of a launch's stderr file, then remove it. Never raises."""
     try:
@@ -855,6 +863,15 @@ class GvisorSnapshotBackend:
                 raise _with_runsc_stderr(boot_exc, "runsc run") from boot_exc
             shutil.rmtree(base, ignore_errors=True)
             raise _with_runsc_stderr(boot_exc, "runsc run") from boot_exc
+        else:
+            # UNLINK on the success path too. Only the FAILURE path read (and removed) this
+            # file, so a healthy boot left one behind per base -- and the detached sandbox
+            # keeps the fd for its whole life, so each one kept growing with whatever the
+            # worker logged. Unlinking ends that accumulation and the inode's blocks are
+            # reclaimed when the sandbox exits. It does NOT bound what one long-lived sandbox
+            # can write to that inode: see issue #150, which wants runsc's own rotating
+            # --debug-log rather than a host-side sink (codex, #149).
+            _discard_path(_err_path)
         return GvisorBootHandle(self._cfg, self._run, cid, base, ctrl, self._ready,
                                 run_text=self._run_text,
                                 ack_capable=self._ack_capable,
