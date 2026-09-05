@@ -464,3 +464,39 @@ class TestWhatTheBoundsChanged:
         assert len(alive) <= 2, (
             f"{len(alive)} copy workers started against a cap of 2: the check was not atomic"
         )
+
+    def test_an_append_during_the_sweep_is_not_erased(self, tmp_path, monkeypatch):
+        """`stranded[:] = still` erases anything appended while the sweep ran.
+
+        And appends DO land there concurrently: an invalidation can start `boot_base()` while
+        an older restore is still failing, and `restore_in` appends the workdir of an
+        unconfirmed firecracker teardown. Losing that entry loses the only record of a
+        directory a live microVM may still be using (codex, #154).
+
+        Deterministic rather than raced: the append is injected from inside the sweep's own
+        rmtree, which is exactly the window the slice assignment closes over.
+        """
+        from blastbox.host.runtime import fc_snapshot_launcher as fl
+
+        stuck = tmp_path / "stuck"
+        stuck.mkdir()
+        ledger = [str(stuck)]
+        newcomer = str(tmp_path / "appended-mid-sweep")
+
+        def _rmtree(path, onerror=None, **kw):
+            # A concurrent failure path appends while we are sweeping.
+            with fl._STRANDED_LOCK:
+                if newcomer not in ledger:
+                    ledger.append(newcomer)
+            if onerror:
+                onerror(os.rmdir, str(path), (OSError, OSError(5, "EIO"), None))
+            return
+
+        monkeypatch.setattr(fl.shutil, "rmtree", _rmtree)
+
+        fl._retry_stranded_partials(ledger)
+
+        assert newcomer in ledger, (
+            "an entry appended during the sweep was erased; nothing can ever reclaim that dir"
+        )
+        assert str(stuck) in ledger, "the still-stuck path must also survive for the next sweep"

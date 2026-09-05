@@ -120,6 +120,12 @@ def api_boot_sequence(
     ]
 
 
+# Guards every stranded-partials ledger. One lock for all of them: these lists are small,
+# touched only on failure paths, and a per-list lock would have to be threaded through the
+# launcher, the backend and the handles that share them.
+_STRANDED_LOCK = threading.Lock()
+
+
 def _retry_stranded_partials(stranded: "list[str]") -> None:
     """Re-attempt deletion of partial checkpoints a previous failed attempt could not remove.
 
@@ -130,8 +136,17 @@ def _retry_stranded_partials(stranded: "list[str]") -> None:
     """
     if not stranded:
         return
+    # TAKE the batch under the ledger lock rather than iterating the live list and finishing
+    # with `stranded[:] = still`. That slice assignment ERASES anything appended while the
+    # sweep ran -- and appends do happen concurrently: an invalidation can start boot_base()
+    # while an older restore is still failing, and restore_in appends the workdir of an
+    # unconfirmed firecracker teardown. Losing that entry loses the only record of a directory
+    # a live microVM may still be using (codex, #154).
+    with _STRANDED_LOCK:
+        batch = list(stranded)
+        del stranded[:]
     still: list[str] = []
-    for leftover in stranded:
+    for leftover in batch:
         p = Path(leftover)
         try:
             if p.is_dir():
@@ -144,7 +159,9 @@ def _retry_stranded_partials(stranded: "list[str]") -> None:
                 p.unlink(missing_ok=True)
         except OSError:
             still.append(leftover)
-    stranded[:] = still
+    with _STRANDED_LOCK:
+        # PREPEND what is still stuck, keeping anything appended while we swept.
+        stranded[:0] = still
 
 
 class _Handle:
@@ -814,7 +831,8 @@ class FcSnapshotLauncher:
                 # likely in the filesystem-stall case the copy timeout above exists for, since
                 # firecracker is then blocked on that same disk. Same rule boot_base already
                 # follows (codex, #154).
-                self._stranded_partials.append(str(slot_workdir))
+                with _STRANDED_LOCK:
+                    self._stranded_partials.append(str(slot_workdir))
                 # MARK THE EXCEPTION TOO. The sweep can only delete paths; it cannot terminate
                 # a process it has no handle for. SnapshotManager.restore() reads kill_failed
                 # to decide whether the artifact stays pinned and whether this workdir may be
