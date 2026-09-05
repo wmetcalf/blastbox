@@ -182,6 +182,21 @@ class FakeRunner:
 
 
 @pytest.fixture(autouse=True)
+def _resolvable_destination(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Give SPEC's `$DEMO_DIR/demo.ext4` somewhere to resolve to.
+
+    `run_plan` stages EVERY declared rootfs -- there is no images-only mode -- so an
+    unresolved destination now fails the preflight, before any image is built. Most tests here
+    are about building and stamping and never look at the export; without this they would each
+    have to set an environment variable to describe something they do not care about.
+
+    Tests that ARE about an unresolved destination delete it explicitly (monkeypatch.delenv),
+    which reads as the deliberate act it is.
+    """
+    monkeypatch.setenv("DEMO_DIR", str(tmp_path / "demo-dest"))
+
+
+@pytest.fixture(autouse=True)
 def _pinned_privilege(monkeypatch: pytest.MonkeyPatch):
     """Pin the privilege decision so these tests do not depend on whether the
     machine running them has passwordless sudo. Tests about privilege override
@@ -3709,3 +3724,68 @@ def test_cleanup_cannot_strand_the_publication_record(monkeypatch) -> None:
     assert pub.tags == ("demo-base:t1",), pub
     assert pub.published["demo-base:t1"] == _VERIFIED_ID
     assert any("could not drop the staging tags" in s for s in said), said
+
+
+def test_an_unresolved_destination_fails_before_anything_is_built(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`export_rootfs` refuses to write to a path nobody chose -- but it refuses at the END,
+    after every image has been built and verified.
+
+    That is the same complaint `_size_problems` exists for, in its own words: "left to surface
+    from the export it escaped the CLI's handler and ended the command in a traceback, after
+    every image had been built and verified". Sizes were moved to the preflight for that
+    reason; destinations were not.
+
+    Not hypothetical: `$REDTUSK_FC_DIR/redtusk-rootfs.ext4` is the one declared destination in
+    the fleet with no `${VAR:-default}`, so a RedTusk build with that variable unset pays for
+    the whole chain before finding out.
+    """
+    import blastbox.host.imagerun as mod
+
+    _resolves_to(monkeypatch)
+    monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
+    monkeypatch.delenv("DEMO_DIR", raising=False)     # the autouse fixture supplies it
+    plan = _plan(tmp_path)
+    run = FakeRunner()
+
+    with pytest.raises(BuildError) as e:
+        run_plan(
+            plan,
+            "t1",
+            blastbox_version="0.1.35",
+            run=run,
+            log=lambda _: None,
+            extract=_fake_extract({"/init": "x"}),
+            extract_preserves_ownership=True,
+        )
+
+    assert "cannot be built as declared" in str(e.value)
+    assert "$DEMO_DIR/demo.ext4" in str(e.value), "the message must name the destination"
+    assert run.calls == [], "docker ran before the destination was known"
+
+
+def test_the_export_still_refuses_a_destination_the_preflight_did_not_see(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The preflight is an EARLY warning, not a replacement.
+
+    `export_rootfs` is the check that actually guards the write, and it must keep refusing --
+    a caller can reach it directly, and the environment can change between the two.
+    """
+    monkeypatch.delenv("DEMO_DIR", raising=False)
+    plan = _plan(tmp_path)
+    run = FakeRunner()
+
+    with pytest.raises(BuildError) as e:
+        export_rootfs(
+            plan,
+            plan.rootfs[0],
+            "t1",
+            run=run,
+            log=lambda _: None,
+            extract=_fake_extract({"/init": "x"}),
+            extract_preserves_ownership=True,
+        )
+
+    assert "refusing to write to a path nobody chose" in str(e.value)

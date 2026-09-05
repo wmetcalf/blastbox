@@ -499,6 +499,13 @@ def build_plan(
         + _images.arg_problems(plan, env)
         + _images.unresolved_build_args(plan, env)
         + _size_problems(plan, env)
+        # Destinations belong here for exactly the reason sizes do, and the reason is in
+        # _size_problems' own docstring: left to surface from the export, the failure arrives
+        # AFTER every image has been built and verified. export_rootfs still refuses -- it is
+        # the check that actually guards the write -- but refusing an hour later costs the
+        # whole build. RedTusk's `$REDTUSK_FC_DIR/redtusk-rootfs.ext4` is the live example: it
+        # is the one declared destination in the fleet with no `${VAR:-default}`.
+        + _images.unresolved_destinations(plan, env)
     )
     if problems:
         raise BuildError(
