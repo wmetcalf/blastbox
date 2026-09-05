@@ -17,12 +17,16 @@ the full snapshot→restore→convert round-trip works pixel-identically (see th
 from __future__ import annotations
 
 import inspect
+import contextlib
 import shutil
 import logging
 import os
 import subprocess
+import threading
 import time
 from pathlib import Path
+
+from blastbox.errors import HostDiskTimeout
 from typing import Any, Callable
 
 from blastbox.host.runtime.fc_api import FcApiClient
@@ -116,6 +120,12 @@ def api_boot_sequence(
     ]
 
 
+# Guards every stranded-partials ledger. One lock for all of them: these lists are small,
+# touched only on failure paths, and a per-list lock would have to be threaded through the
+# launcher, the backend and the handles that share them.
+_STRANDED_LOCK = threading.Lock()
+
+
 def _retry_stranded_partials(stranded: "list[str]") -> None:
     """Re-attempt deletion of partial checkpoints a previous failed attempt could not remove.
 
@@ -126,8 +136,17 @@ def _retry_stranded_partials(stranded: "list[str]") -> None:
     """
     if not stranded:
         return
+    # TAKE the batch under the ledger lock rather than iterating the live list and finishing
+    # with `stranded[:] = still`. That slice assignment ERASES anything appended while the
+    # sweep ran -- and appends do happen concurrently: an invalidation can start boot_base()
+    # while an older restore is still failing, and restore_in appends the workdir of an
+    # unconfirmed firecracker teardown. Losing that entry loses the only record of a directory
+    # a live microVM may still be using (codex, #154).
+    with _STRANDED_LOCK:
+        batch = list(stranded)
+        del stranded[:]
     still: list[str] = []
-    for leftover in stranded:
+    for leftover in batch:
         p = Path(leftover)
         try:
             if p.is_dir():
@@ -140,7 +159,9 @@ def _retry_stranded_partials(stranded: "list[str]") -> None:
                 p.unlink(missing_ok=True)
         except OSError:
             still.append(leftover)
-    stranded[:] = still
+    with _STRANDED_LOCK:
+        # PREPEND what is still stuck, keeping anything appended while we swept.
+        stranded[:0] = still
 
 
 class _Handle:
@@ -363,20 +384,111 @@ def _default_make_outdisk(path: Path) -> None:
     make_ext4(path, _DEFAULT_OUTDISK_MIB)
 
 
+# Workers abandoned to a stalled filesystem. Bounded so a wedged mount cannot cost a thread
+# and two descriptors per retry forever; see _copy_with_deadline.
+_MAX_ABANDONED_COPIES = 8
+_ABANDONED_COPIES: "list[threading.Thread]" = []
+_ABANDONED_LOCK = threading.Lock()
+
+
+def _copy_with_deadline(src: Path, dst: Path, timeout_s: float, *, chunk: int = 4 << 20) -> None:
+    """`shutil.copyfile` with a deadline, checked between chunks.
+
+    A stalled filesystem can block inside a single read or write, which no pure-Python copy
+    can interrupt -- but it cannot make PROGRESS either, so checking the clock between chunks
+    turns an indefinite hang into a bounded failure. The partial destination is removed: a
+    truncated outdisk is worse than none, because the guest would mount it.
+    """
+    import threading as _th
+
+    # IN A THREAD, joined with the deadline. Checking the clock between chunks is only
+    # COOPERATIVE: a stalled filesystem blocks inside a single read(), write() or close(), and
+    # nothing in that loop runs again to notice (codex, #154). Joining bounds the CALLER
+    # regardless of where the copy is stuck.
+    #
+    # WHAT THIS DOES AND DOES NOT BOUND. It bounds the caller, which is the thread the pool
+    # needs back. It does NOT make the copy stop: a worker blocked in uninterruptible (D-state)
+    # I/O cannot be cancelled by anything in this process -- not a signal, not a close, not
+    # another thread. No in-process design escapes that, which is why this one does not pretend
+    # to; the containment for a host in that state is the pool's own wedged-spawn accounting.
+    #
+    # ...but abandoned workers must not accumulate without limit while the pool keeps retrying
+    # (host-resource failures are deliberately exempt from the failure streaks). Past the cap,
+    # refuse to start another: one stalled mount should not cost a thread and two fds per
+    # retry, for the life of the process.
+    done: "list[BaseException | None]" = []
+
+    def _copy() -> None:
+        try:
+            with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+                while True:
+                    buf = fsrc.read(chunk)
+                    if not buf:
+                        break
+                    fdst.write(buf)
+            done.append(None)
+        except BaseException as exc:  # noqa: BLE001 - reported to the caller below
+            done.append(exc)
+
+    worker = _th.Thread(target=_copy, name="fc-outdisk-copy", daemon=True)
+
+    # PRUNE, CHECK AND RESERVE IN ONE CRITICAL SECTION. Checking the count and then starting
+    # the worker is check-then-act: with BLASTBOX_POOL_SPAWN_CONCURRENCY above the cap, every
+    # concurrent copy could observe zero stuck workers and start anyway, so the cap would not
+    # hold in exactly the concurrency it exists for (codex, #154). Reserving the slot by
+    # registering the worker BEFORE starting it makes the bound atomic; a worker that finishes
+    # is pruned by is_alive() on the next call, so a healthy host never accumulates.
+    with _ABANDONED_LOCK:
+        _ABANDONED_COPIES[:] = [t for t in _ABANDONED_COPIES if t.is_alive()]
+        stuck = len(_ABANDONED_COPIES)
+        if stuck >= _MAX_ABANDONED_COPIES:
+            raise HostDiskTimeout(
+                cmd=f"copy {src} -> {dst} "
+                    f"(refused: {stuck} earlier copies still stuck on this host)",
+                timeout=timeout_s,
+            )
+        _ABANDONED_COPIES.append(worker)
+
+    worker.start()
+    worker.join(timeout=timeout_s)
+    if not done:
+        # Still running: the filesystem is stalled. The worker stays registered above, holding
+        # its cap slot until it either finishes or the process ends. Remove the partial
+        # destination -- a truncated outdisk is worse than none, since the guest would mount it.
+        with contextlib.suppress(OSError):
+            dst.unlink()
+        raise HostDiskTimeout(cmd=f"copy {src} -> {dst}", timeout=timeout_s)
+    err = done[0]
+    if err is not None:
+        with contextlib.suppress(OSError):
+            dst.unlink()
+        raise err
+
+
 def _default_copy_outdisk(src: Path, dst: Path) -> None:
     # Copy the base outdisk image byte-for-byte (preserves the exact ext4 the guest
     # snapshotted with). Prefer a reflink (CoW clone — near-instant on xfs/btrfs);
     # ``--reflink=auto`` falls back to a full copy on filesystems without CoW (ext4,
     # tmpfs), so this is safe everywhere and only speeds up reflink-capable hosts. On
     # any failure (no ``cp``, odd platform) fall back to a plain Python copy.
+    from blastbox.host.runtime.firecracker import disk_timeout_s, run_disk_helper
+
     try:
-        subprocess.run(
-            ["cp", "--reflink=auto", str(src), str(dst)],
-            check=True,
-            capture_output=True,
-        )
+        # Bounded for the same reason as make_ext4, and through the same helper so the bound
+        # and the ATTRIBUTION are decided in one place.
+        run_disk_helper(["cp", "--reflink=auto", str(src), str(dst)])
+    except HostDiskTimeout:
+        # Deliberately NOT falling back. The fallback exists for "no cp, odd platform"; a cp
+        # that TIMED OUT means the filesystem itself is stalled, and copying the same bytes
+        # again in Python would stall the same way -- spending the budget twice and turning a
+        # bounded failure back into a hang. Let the spawn fail and be retried.
+        raise
     except (OSError, subprocess.CalledProcessError):
-        shutil.copyfile(src, dst)
+        # BOUNDED TOO. `cp` missing or without --reflink (a BusyBox image) lands here
+        # immediately, and an unbounded shutil.copyfile would then do the whole copy with no
+        # deadline -- so the documented bound would not hold on the very path the fallback
+        # exists for (codex, #154).
+        _copy_with_deadline(src, dst, disk_timeout_s())
 
 
 def _ready_factory_kwargs(fn: Any, *, ack_generation: "int | None") -> "dict[str, Any]":
@@ -707,10 +819,29 @@ class FcSnapshotLauncher:
         # the caller only gets a killable _Handle once restore_in RETURNS.
         try:
             self._copy_outdisk(base_outdisk, Path(slot_workdir) / REL_OUTDISK)
-        except BaseException:
+        except BaseException as exc:
             # BaseException: the caller only gets a killable _Handle once restore_in RETURNS, so
             # a KeyboardInterrupt/SystemExit/cancellation here leaks the firecracker process this
             # method just spawned -- permanently, since nothing else knows its pid (PR #82).
-            _terminate_proc(proc)
+            if not _terminate_proc(proc):
+                # UNCONFIRMED: it survived both terminate AND kill, so the microVM may still be
+                # running with this workdir's disk and sockets open. Ignoring that -- which this
+                # did -- let SnapshotManager.restore() remove the workdir and forget the spawn,
+                # leaving an orphan neither the pool nor shutdown can account for. Especially
+                # likely in the filesystem-stall case the copy timeout above exists for, since
+                # firecracker is then blocked on that same disk. Same rule boot_base already
+                # follows (codex, #154).
+                with _STRANDED_LOCK:
+                    self._stranded_partials.append(str(slot_workdir))
+                # MARK THE EXCEPTION TOO. The sweep can only delete paths; it cannot terminate
+                # a process it has no handle for. SnapshotManager.restore() reads kill_failed
+                # to decide whether the artifact stays pinned and whether this workdir may be
+                # removed -- without it the manager treats teardown as confirmed, unpins, and
+                # removes the workdir out from under a microVM that is still running on it.
+                # Same marker the gVisor restore path already sets (codex, #154).
+                with contextlib.suppress(Exception):
+                    exc.kill_failed = True  # type: ignore[attr-defined]
+                _log.warning("fc_snapshot: firecracker for slot workdir %s could not be confirmed "
+                             "gone; retaining it for the next sweep", slot_workdir)
             raise
         return _Handle(proc, api, str(Path(slot_workdir) / REL_VSOCK))
