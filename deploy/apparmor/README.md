@@ -92,9 +92,23 @@ Write an enforcing profile for the parser workload, load it, and name it:
 
 ```sh
 sudo apparmor_parser -r -W /etc/apparmor.d/my-parser-profile
-sudo aa-status | grep my-parser-profile          # must read `(enforce)` or `(kill)`
+
+# Verify the MODE, not just that the name is loaded. `aa-status | grep <name>` cannot do this:
+# it groups names under a heading and prints the bare name, so the mode is exactly what the grep
+# throws away. Either of these answers the real question:
+sudo aa-status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["profiles"]["my-parser-profile"])'
+sudo grep "^my-parser-profile " /sys/kernel/security/apparmor/profiles     # -> my-parser-profile (enforce)
+
+export BLASTBOX_SANDBOX=bwrap
 export BLASTBOX_APPARMOR_PROFILE=my-parser-profile
 ```
+
+**Both variables are needed, and the first is the one that is easy to miss.** `select_sandbox` tries
+nsjail before bwrap, and a stock nsjail cannot attach a profile *and* records no `apparmor_missing`
+for it — so on a host with a working nsjail it passes selection, and the profile you carefully
+loaded is simply never applied, silently. Setting `BLASTBOX_SANDBOX=bwrap` picks the backend that
+can actually carry it. (Check the result rather than trusting the recipe: the selected sandbox's
+`apparmor_active` is the attach outcome, not a capability probe.)
 
 `BLASTBOX_APPARMOR_PROFILE` is what a deployed worker needs: the sandbox it uses comes from
 `select_sandbox`, which constructs the backend with no arguments, so passing `apparmor_profile=` to
