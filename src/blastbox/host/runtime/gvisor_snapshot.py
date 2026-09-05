@@ -307,19 +307,28 @@ def _best_effort_delete(cfg: GvisorConfig, run: Callable[..., int], cid: str) ->
     Returns True when at least one teardown command SUCCEEDED. Callers that must not reclaim
     resources a live sandbox still uses check this rather than assuming a clean return."""
     ok = False
+    problems: list[str] = []
     for argv in (["kill", cid, "KILL"], ["delete", "-force", cid]):
         try:
-            # QUIET. These run against a container that may never have been
-            # created, so runsc prints `FetchSpec failed: loading container:
-            # file does not exist` -- and because this teardown follows a failed
-            # boot, that line was the only stderr an operator saw. It described
-            # the cleanup, not the failure. The return value is how this
-            # function reports, and callers already act on it.
+            # CAPTURED, not discarded. Against a container that was never
+            # created runsc prints `FetchSpec failed: loading container: file
+            # does not exist`, and because this teardown follows a failed boot
+            # that line was the only stderr an operator saw -- describing the
+            # cleanup rather than the failure. But this helper also runs from
+            # kill() during ORDINARY reaping, where the container did exist and
+            # a teardown failure is the actionable thing: discarding both
+            # streams would leave "could not confirm teardown" with no reason.
+            # So: capture always, and report only when NOTHING succeeded.
             run([*_runsc(cfg), *argv],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             ok = True
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - best effort by contract
+            detail = getattr(exc, "stderr", None)
+            if isinstance(detail, bytes):
+                detail = detail.decode("utf-8", "replace")
+            problems.append(f"{argv[0]}: {(detail or exc).__str__().strip()[-200:]}")
+    if not ok and problems:
+        _log.warning("gvisor_snapshot: teardown of %s failed -- %s", cid, "; ".join(problems))
     # REPORT it. Swallowing every failure made kill() return normally even when both the kill and
     # the force-delete failed, so the reap's `sandbox_gone` guard stayed True and released the
     # generation pin anyway -- the guard was defeated by the layer beneath it (PR #82).
@@ -721,5 +730,17 @@ class GvisorSnapshotBackend:
                 self._stranded_partials.append(str(wd))
                 _log.warning("gvisor_snapshot: restore sandbox %s could not be confirmed deleted; "
                              "retaining its bundle for retry", cid)
-            raise
+            # Same treatment as the base boot: `CalledProcessError.__str__` does
+            # not include captured stderr, so without this the manager reports a
+            # bare non-zero exit -- and now that the teardown is quiet, that
+            # would be ALL the operator gets. `kill_failed` travels with it:
+            # SnapshotManager reads that flag to decide whether the checkpoint
+            # may be reclaimed, and dropping it would unpin a generation an
+            # unmanaged sandbox may still be using.
+            enriched = _with_runsc_stderr(exc, "runsc restore")
+            if enriched is exc:
+                raise
+            if getattr(exc, "kill_failed", False):
+                enriched.kill_failed = True  # type: ignore[attr-defined]
+            raise enriched from exc
         return GvisorRestoreHandle(self._cfg, self._run, cid, wd, self._run_text)
