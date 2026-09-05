@@ -191,7 +191,13 @@ git -C "$REPO" fetch --quiet origin "$BLASTBOX_REF" || {
   echo "[redeploy-warm]   the wheel would be built from the current checkout instead" >&2
   exit 1
 }
-git -C "$REPO" checkout --quiet "$BLASTBOX_REF"
+# Check out what was just FETCHED, not a same-named LOCAL branch. `git checkout <ref>`
+# resolves to an existing local branch in preference to the remote one, so a stale local
+# `topic` wins over the origin/topic just fetched and the wheel is built from the old tree
+# -- while the line above claims the ref. Measured on a local branch one commit behind its
+# remote: FETCH_HEAD held the new commit, `git checkout topic` left HEAD on the old one.
+# Detached on purpose: a deploy build has no business moving the operator's branches.
+git -C "$REPO" checkout --quiet --detach FETCH_HEAD
 SRC=$(mktemp -d); WHEELS=$(mktemp -d)
 cp -r "$REPO"/. "$SRC"/ ; rm -rf "$SRC/.git" "$SRC/build" "$SRC/src/"*.egg-info 2>/dev/null || true
 docker run --rm -u root -v "$SRC":/src -v "$WHEELS":/out --entrypoint "$VENV_PIP" "$BASE_IMAGE" \

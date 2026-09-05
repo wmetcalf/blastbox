@@ -164,6 +164,77 @@ def test_a_ref_that_cannot_be_fetched_stops_before_anything_is_built(
     assert not log.exists(), f"ran past the failed fetch: {log.read_text()}"
 
 
+def _repo_with_a_stale_local_branch(tmp_path: Path) -> tuple[Path, str]:
+    """A clone whose local `topic` is one commit behind origin/topic.
+
+    Returns the clone and the commit the remote branch actually points at.
+    """
+    def git(cwd: Path, *args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=cwd, capture_output=True, text=True, check=True,
+            env=_clean_env(GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
+                           GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@x",
+                           GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@x"),
+        ).stdout.strip()
+
+    remote = tmp_path / "remote.git"
+    git(tmp_path, "init", "-q", "--bare", str(remote))
+    work = tmp_path / "work"
+    git(tmp_path, "clone", "-q", str(remote), str(work))
+    (work / "f").write_text("v1")
+    git(work, "add", "f")
+    git(work, "commit", "-qm", "v1")
+    git(work, "branch", "-M", "topic")
+    git(work, "push", "-q", "-u", "origin", "topic")
+
+    clone = tmp_path / "clone"
+    git(tmp_path, "clone", "-q", "-b", "topic", str(remote), str(clone))
+
+    (work / "f").write_text("v2")            # the remote moves on; the clone does not
+    git(work, "commit", "-qam", "v2")
+    git(work, "push", "-q", "origin", "topic")
+    return clone, git(work, "rev-parse", "HEAD")
+
+
+def test_the_ref_that_is_built_is_the_one_that_was_fetched(tmp_path: Path) -> None:
+    """`git checkout <ref>` prefers an existing LOCAL branch over the fetched remote one.
+
+    So with a stale local `topic`, the fetch succeeds, the checkout selects the old local
+    branch, and the wheel is built from a tree the log claims is the requested ref -- the
+    same false claim as a swallowed fetch failure, by a different route.
+
+    Real git, not a stub: the whole defect lives in git's own ref resolution, so a stub
+    would only reproduce whatever this test already believes.
+    """
+    clone, remote_head = _repo_with_a_stale_local_branch(tmp_path)
+    (clone / "deploy").mkdir()
+    (clone / "deploy" / "redeploy-warm.sh").write_bytes(SCRIPT.read_bytes())
+    local_head_before = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=clone, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    assert local_head_before != remote_head, "fixture: the clone must start out stale"
+
+    bin_dir = _stub_bin(tmp_path)               # docker/compose stubs; git stays REAL
+    (bin_dir / "git").unlink()
+    subprocess.run(
+        ["bash", str(clone / "deploy" / "redeploy-warm.sh")],
+        capture_output=True, text=True, check=False,
+        env=_clean_env(
+            ENGINE="redtusk", WARM_TAG=TAG, REDEPLOY_MODE="legacy-rebuild",
+            BLASTBOX_REF="topic", FC_DIR=str(tmp_path / "no-such-fc"),
+            PATH=f"{bin_dir}:{os.environ['PATH']}",
+        ),
+    )
+    # The run cannot finish (docker is a stub), but the checkout is the first thing it does.
+    head_after = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=clone, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    assert head_after == remote_head, (
+        "built from the stale local branch: HEAD is at "
+        f"{head_after[:8]}, the fetched ref is at {remote_head[:8]}"
+    )
+
+
 def test_an_unknown_mode_is_refused() -> None:
     p = _run(ENGINE="redtusk", REDEPLOY_MODE="bogus")
     assert p.returncode == 2, p.stderr
