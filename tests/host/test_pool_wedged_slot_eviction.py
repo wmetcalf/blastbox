@@ -4532,10 +4532,24 @@ def test_a_maintenance_husk_whose_reap_fails_is_retried_not_stranded():
             "a maintenance husk was stranded, not requeued")
         assert slot.slot_id not in pool._deferred_reap, (
             "the requeue was released into the SAME batch, which four concurrent reapers eat")
+    # _reap_deferred() does TWO things: it releases the held retry, and it spawns real reaper
+    # threads to drain it. Asserting on the result of the first while the second runs is a race --
+    # the reaper re-reaps, _RT.reap raises again, and `tries` is 2 before the assert reads it.
+    # Observed as an intermittent failure of exactly this test in a full-suite run.
+    #
+    # The thread target is bound from the instance at construction, so replacing it here keeps the
+    # tick's real release logic under test while making the drain inert and the state stable. The
+    # old `or pool._reaper_threads` disjunct is gone with it: it let the test pass merely because a
+    # thread was still registered, which is not what "picked the husk back up" means.
+    drained: list = []
+    pool._drain_deferred_reaps = lambda *a, **kw: drained.append(a)  # type: ignore[method-assign]
+
     pool._reap_deferred()                       # the tick releases it for the next pass
+    for entry in list(pool._reaper_threads):    # no daemon left running into the next test
+        entry[0].join(timeout=5)
     with pool._lock:
-        assert slot.slot_id in pool._deferred_reap or pool._reaper_threads, (
-            "the next tick must pick the husk back up")
+        assert slot.slot_id in pool._deferred_reap, "the next tick must pick the husk back up"
+        assert drained, "the release happened but no reaper was dispatched to drain it"
         assert pool._maintain_reap_tries[slot.slot_id] == 1
         assert pool._slots[slot.slot_id].state == SlotState.DRAINING, (
             "an UNUSABLE slot must never be handed back as claimable")
