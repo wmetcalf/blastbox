@@ -30,6 +30,7 @@ Example invocation on toolz2:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -189,15 +190,31 @@ def _warm_rootfs() -> str | None:
     return None
 
 
-def _fixture_doc() -> Path | None:
-    """Return a path to any small fixture file under tests/fixtures, or None."""
+def _fixture_doc() -> "tuple[Path | None, bool]":
+    """The document to send, and whether the CALLER vouched for it.
+
+    ``BLASTBOX_GVISOR_TEST_INPUT`` names a document the engine in this rootfs can actually
+    convert -- the same knob the FC live tests take as ``BLASTBOX_FC_TEST_INPUT``, for the
+    same reason. Only then can this test assert the CONVERSION succeeded.
+
+    Without it, the fallback is whatever `glob` returns first out of tests/fixtures. That is
+    fine for exercising checkpoint/restore and useless as a conversion probe: measured on
+    toolz2, it picks a 52-byte `sample.txt` and hands it to a ClippyShot render/OCR rootfs,
+    which answers `engine_error` -- correctly. Asserting `status == "ok"` there tests the
+    engine's format support and the directory order of a corpus, neither of which is what a
+    C/R round-trip is for. (A corpus that later gains a deliberately-malformed sample would
+    fail this test for a reason with nothing to do with checkpoint/restore.)
+    """
+    supplied = os.environ.get("BLASTBOX_GVISOR_TEST_INPUT", "").strip()
+    if supplied:
+        path = Path(supplied)
+        return (path if path.is_file() else None), True
     here = Path(__file__).parent.parent  # tests/
     candidates = list(here.glob("fixtures/**/*.docx")) + list(here.glob("fixtures/**/*.txt"))
     if candidates:
-        return candidates[0]
-    # fallback: any non-Python file in the fixtures tree
+        return candidates[0], False
     all_files = [p for p in here.glob("fixtures/**/*") if p.is_file() and p.suffix not in (".py", ".pyc")]
-    return all_files[0] if all_files else None
+    return (all_files[0] if all_files else None), False
 
 
 # ---------------------------------------------------------------------------
@@ -229,11 +246,11 @@ def test_gvisor_snapshot_roundtrip(tmp_path: Path) -> None:
             "set it to an exported clippyshot/Tika OCI rootfs dir to run this test"
         )
 
-    fixture = _fixture_doc()
+    fixture, vouched = _fixture_doc()
     if fixture is None:
         pytest.skip(
-            "no fixture document found under tests/fixtures/; "
-            "populate tests/fixtures/ with at least one .docx or .txt file"
+            "no usable input: set BLASTBOX_GVISOR_TEST_INPUT to a document this rootfs's "
+            "engine can convert, or populate tests/fixtures/ with a .docx or .txt"
         )
 
     import dataclasses
@@ -356,15 +373,32 @@ def test_gvisor_snapshot_roundtrip(tmp_path: Path) -> None:
         )
 
         # The lifecycle status above ("ok" from signal_done) only proves the worker
-        # COMPLETED — not that the conversion succeeded. Validate the envelope status in
-        # metadata.json so a failed conversion (status="engine_error") that still wrote a
-        # metadata.json can't pass this test green.
+        # COMPLETED. The envelope is what proves the JOB traversed the restored guest.
         meta_path = slot.output_dir / "metadata.json"
         assert meta_path.exists(), f"metadata.json missing from {slot.output_dir}"
         envelope = json.loads(meta_path.read_text())
-        assert envelope.get("status") == "ok", (
-            f"conversion envelope status={envelope.get('status')!r} (expected 'ok')"
+
+        # ALWAYS: the input we staged is the input the restored guest saw, attributed back to
+        # us. This is the C/R property -- it holds whatever the engine thinks of the format,
+        # and it fails if the restored container served a stale job, a stale input, or someone
+        # else's output. `status == "ok"` never checked any of that.
+        sent_sha = hashlib.sha256(staged.read_bytes()).hexdigest()
+        assert envelope.get("input_sha256") == sent_sha, (
+            f"the envelope attributes input_sha256={envelope.get('input_sha256')!r}, but the "
+            f"document staged into the restored slot hashes to {sent_sha}"
         )
+        assert envelope.get("status") in {"ok", "rejected", "engine_error"}, (
+            f"envelope carries no recognised status: {envelope.get('status')!r}"
+        )
+
+        # ONLY when the caller vouched for the input. Otherwise the fixture is whatever glob
+        # returned first, and `engine_error` may be the engine correctly declining a format it
+        # does not handle -- see _fixture_doc.
+        if vouched:
+            assert envelope.get("status") == "ok", (
+                f"conversion envelope status={envelope.get('status')!r} (expected 'ok') for "
+                f"the document named by BLASTBOX_GVISOR_TEST_INPUT"
+            )
 
     finally:
         rt.reap(slot)
