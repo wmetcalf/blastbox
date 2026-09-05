@@ -70,6 +70,52 @@ def test_concurrency_overlaps_spawns():
     assert rt.max_in_flight <= 4, f"must not exceed the configured cap, saw {rt.max_in_flight}"
 
 
+def test_a_reservation_counts_spawns_already_in_flight():
+    """The predicate itself, with no scheduler in the way.
+
+    The concurrent test below can only BIAS the interleaving; whether the
+    over-reserved spawns end up published depends on how the pre-spawn gate's
+    declines interleave with the remaining gated calls. This one removes the
+    race entirely: a batch has already reserved the whole ceiling, and the next
+    caller must reserve NOTHING.
+
+    The bucket token is the tell. `_spawn_batch_concurrent` consumes one per
+    reservation ATTEMPT and then checks the ceiling, so a caller that stops at
+    the first check has consumed exactly one. Counting in_flight-blind, it
+    consumes one per slot of headroom it wrongly believes it has.
+    """
+    rt = _SlowSpawnRuntime(delay=0.01)
+    ceiling = 4
+    pool = WarmPool(runtime=rt, warm_size=ceiling, concurrent_ceiling=ceiling,
+                    spawn_rate_limit=1000.0, spawn_concurrency=ceiling)
+
+    tokens = 0
+    real_consume = pool._bucket.consume
+
+    def counted_consume():
+        nonlocal tokens
+        tokens += 1
+        return real_consume()
+
+    pool._bucket.consume = counted_consume
+
+    # A batch already in flight has promised the node the whole ceiling; none of
+    # it is published yet, which is exactly the window the counter exists for.
+    with pool._lock:
+        pool._spawns_in_flight = ceiling
+
+    pool._spawn_batch_concurrent(ceiling, None)
+
+    assert tokens == 1, (
+        f"the caller must stop at its FIRST ceiling check, taking one token; "
+        f"took {tokens}. More than one means the reservation predicate is "
+        f"ignoring the {ceiling} spawns already in flight."
+    )
+    assert not pool._slots, f"nothing may be created: {len(pool._slots)} slots"
+    assert rt.max_in_flight == 0, "no spawn may even be attempted"
+    assert pool._spawns_in_flight == ceiling, "the in-flight count must be untouched"
+
+
 def test_ceiling_holds_when_batches_overlap():
     """The reservation counter, against the caller it exists to defend against.
 
@@ -87,6 +133,15 @@ def test_ceiling_holds_when_batches_overlap():
 
     Without the counter both batches see an empty pool, both reserve the full
     ceiling, and the pool promises the node twice the workers it is allowed.
+
+    What this test is FOR: that two overlapping callers leave the pool at
+    exactly its ceiling and neither deadlocks it. It biases the interleaving but
+    cannot guarantee it -- the gates below hold both callers in their loops and
+    stop either publishing before the other has taken a token, and that is as
+    far as scheduler-dependent synchronisation goes. The reservation PREDICATE
+    is pinned race-free by
+    `test_a_reservation_counts_spawns_already_in_flight`; do not rely on this
+    one to catch that regression on any single run.
     """
     rt = _SlowSpawnRuntime(delay=0.15)
     ceiling = 4
