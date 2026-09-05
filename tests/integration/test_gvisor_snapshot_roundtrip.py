@@ -16,6 +16,10 @@ Required environment variables to run (all have defaults where sensible):
                                  container (default: ["worker", "warm"]).
     BLASTBOX_GVISOR_LD_PRELOAD  Optional path to an LD_PRELOAD .so to inject
                                  (default: unset).
+    BLASTBOX_SNAPSHOT_BUILD_S   Seconds to allow for the warm snapshot BUILD
+                                (default 180). The only supported way to give a
+                                slower checkpoint host more room; without it the
+                                failure arrives three minutes in.
     BLASTBOX_SNAPSHOT_SETTLE_S  Post-restore settle window in seconds before the
                                  slot is considered ready (default: "1.0").
 
@@ -73,16 +77,13 @@ def _force_delete_all(cfg, *, timeout_s: float = 20.0) -> tuple[list[str], list[
     run -- so it can never touch the fleet's containers, which live under the
     dispatcher's own root.
 
-    Needed because failing on a timeout only stops WAITING for the build: the
-    thread keeps running, its child `runsc` keeps going, and a stalled build can
-    leave a sandbox on the host and keep writing under tmp_path after the test
-    has gone.
-
-    A container counts as deleted only when `runsc delete` actually SUCCEEDS.
-    Appending every id regardless of exit status is how a cleanup that silently
-    failed would still report "force-deleted 3 containers" while three sandboxes
-    kept running -- the swallow-everything mistake `_best_effort_delete` was
-    fixed for upstream.
+    EVERY path that did not actually enumerate the host reports unconfirmed. A
+    failed listing, a listing that errored or timed out, one that is not JSON,
+    and one whose shape is not a container array are all indistinguishable from
+    "no containers" to a caller that only looks at the list -- and reporting
+    `nothing to clean up` while sandboxes are live is the same lie as reporting
+    an unchecked delete as a success. Only JSON `null`, which is what runsc
+    prints for an empty host, means empty.
     """
     import json as _json
     import subprocess as _sp
@@ -91,14 +92,28 @@ def _force_delete_all(cfg, *, timeout_s: float = 20.0) -> tuple[list[str], list[
     try:
         listed = _sp.run([*base, "list", "-format=json"], capture_output=True,
                          text=True, timeout=timeout_s, check=False)
-        # `runsc list -format=json` prints literal `null` when nothing is
-        # registered, which parses to None -- iterating that raised TypeError
-        # and turned the cleanup into a second failure. Measured on toolz3.
-        containers = _json.loads(listed.stdout or "[]") or []
-        if not isinstance(containers, list):
-            return [], []
-    except Exception:  # noqa: BLE001 - cleanup is best effort by definition
-        return [], []
+    except Exception as exc:  # noqa: BLE001 - timeout, missing binary, ...
+        return [], [f"<listing errored: {type(exc).__name__}>"]
+    if listed.returncode != 0:
+        return [], [f"<listing failed: rc={listed.returncode}>"]
+    raw = (listed.stdout or "").strip()
+    if not raw:
+        # Exit 0 with NO document is not an empty host -- it is a listing that
+        # told us nothing. `null` is what an empty host prints.
+        return [], ["<listing produced no output>"]
+    try:
+        parsed = _json.loads(raw)
+    except Exception as exc:  # noqa: BLE001
+        return [], [f"<listing was not JSON: {type(exc).__name__}>"]
+    if parsed is None:
+        containers: list = []          # runsc prints `null` for an empty host
+    elif isinstance(parsed, list):
+        containers = parsed
+    else:
+        # `{}`, `false`, `0`, `""` are falsy but are NOT an empty host; an
+        # `or []` fallback would have accepted every one of them as clean.
+        return [], ["<listing was not a container array>"]
+
     deleted: list[str] = []
     unconfirmed: list[str] = []
     for entry in containers:
@@ -115,6 +130,53 @@ def _force_delete_all(cfg, *, timeout_s: float = 20.0) -> tuple[list[str], list[
             continue
         (deleted if gone.returncode == 0 else unconfirmed).append(cid)
     return deleted, unconfirmed
+
+
+def _sweep_until_clean(
+    cfg, is_live, *, attempts: int = 3, settle_s: float = 1.0
+) -> tuple[list[str], list[str], bool]:
+    """Clean up after a producer that cannot be cancelled.
+
+    Returns (deleted, unconfirmed, confirmed_clean).
+
+    ``confirmed_clean`` is the only claim worth making: a sweep found the
+    producer already stopped AND enumerated the host successfully AND there was
+    nothing there. Anything short of that -- the producer still running, a
+    listing that failed, a delete that could not be confirmed -- leaves the host
+    dirty as far as this test can tell.
+
+    Accumulating "was it ever live" instead was wrong in both directions: a
+    producer live during an early sweep but stopped before a later CLEAN one had
+    the host reported dirty though it was confirmed empty, while a producer that
+    registered a container after the last listing and then exited read clean
+    because liveness was only checked at the end.
+
+    An id unconfirmed on one pass and deleted on a later one is reconciled, and
+    an id seen by two sweeps is reported once.
+    """
+    deleted: list[str] = []
+    unconfirmed: list[str] = []
+    confirmed_clean = False
+    for _ in range(attempts):
+        live_now = bool(is_live())
+        found, unsure = _force_delete_all(cfg)
+        deleted.extend(f for f in found if f not in deleted)
+        unconfirmed = [u for u in unconfirmed if u not in found]
+        unconfirmed.extend(u for u in unsure if u not in deleted and u not in unconfirmed)
+        if not live_now and not found and not unsure:
+            # Nothing running to create more, and an enumeration that actually
+            # answered. Only here can the host be called clean -- and a sweep
+            # whose listing or delete failed must NOT break, or a transient
+            # failure burns the remaining attempts.
+            # A successful enumeration finding NOTHING supersedes earlier
+            # doubt: a listing that failed two sweeps ago, and a delete that
+            # could not be confirmed, are both answered by an empty host.
+            # Without this a single transient failure taints the report forever.
+            confirmed_clean = True
+            unconfirmed = []
+            break
+        time.sleep(settle_s)
+    return deleted, unconfirmed, confirmed_clean
 
 
 def _warm_rootfs() -> str | None:
@@ -236,12 +298,20 @@ def test_gvisor_snapshot_roundtrip(tmp_path: Path) -> None:
         # Do not just stop waiting: tear down whatever the stalled build left
         # under THIS test's private root, or a sandbox outlives the run and
         # keeps writing into tmp_path after it is gone.
-        deleted, unconfirmed = _force_delete_all(cfg)
-        detail = f"force-deleted {deleted}" if deleted else "nothing to clean up"
+        # Sweep more than once, and record whether the producer was live DURING
+        # a sweep -- see `_sweep_until_clean`.
+        deleted, unconfirmed, confirmed_clean = _sweep_until_clean(
+            cfg, builder.is_alive
+        )
+        detail = f"force-deleted {deleted}" if deleted else "found nothing to delete"
         if unconfirmed:
-            # Loudly: these may still be running, and on a fleet node that is
-            # the next run's problem.
-            detail += f"; COULD NOT confirm deletion of {unconfirmed} -- may still be live"
+            detail += f"; COULD NOT confirm {unconfirmed} -- may still be live"
+        if not confirmed_clean:
+            detail += (
+                "; the host was NOT confirmed clean -- the build thread cannot be "
+                "cancelled and may have registered a container after the last "
+                "listing, so treat this host as dirty"
+            )
         pytest.fail(
             f"warm snapshot build did not finish within {build_s}s "
             f"(set BLASTBOX_SNAPSHOT_BUILD_S to allow longer); {detail}"
