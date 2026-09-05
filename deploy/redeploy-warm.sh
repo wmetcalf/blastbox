@@ -246,7 +246,15 @@ fi
 if [ -n "$FC_BIN_SRC" ]; then
   log "swap firecracker binary <- $FC_BIN_SRC"
   cp -a "$FC_DIR/firecracker" "$FC_DIR/firecracker.$SUF"
-  cp -f "$FC_BIN_SRC" "$FC_DIR/firecracker.new" && mv -f "$FC_DIR/firecracker.new" "$FC_DIR/firecracker"
+  # SEPARATE statements again (see the fetch above): `cp ... && mv ...` is exempt from
+  # `set -e`, so a cp that failed skipped the mv and the run CARRIED ON -- and the version
+  # line below then printed the OLD binary's version, which reads as confirmation that the
+  # swap happened. Staging via .new and mv is deliberate: mv is atomic and avoids ETXTBSY
+  # on a firecracker that is currently executing.
+  cp -f "$FC_BIN_SRC" "$FC_DIR/firecracker.new"
+  mv -f "$FC_DIR/firecracker.new" "$FC_DIR/firecracker"
+  # With the two statements separated, a failed copy stops the run, so this line can only
+  # be reached after a swap that actually happened -- which is what makes it evidence.
   "$FC_DIR/firecracker" --version | head -1
 fi
 

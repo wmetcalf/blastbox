@@ -235,6 +235,73 @@ def test_the_ref_that_is_built_is_the_one_that_was_fetched(tmp_path: Path) -> No
     )
 
 
+def _fc_swap_run(tmp_path: Path, src: Path | None) -> tuple[subprocess.CompletedProcess[str], Path]:
+    """A recreate-mode run that reaches step 4b, with a stand-in firecracker in place."""
+    bin_dir = _stub_bin(tmp_path)
+    fc_dir = tmp_path / "fc"
+    fc_dir.mkdir(exist_ok=True)
+    live = fc_dir / "firecracker"
+    live.write_text("#!/bin/sh\necho 'Firecracker v0.0.0-OLD'\n")
+    live.chmod(0o755)
+    gv_dir = tmp_path / "gv"
+    (gv_dir / "rootfs").mkdir(parents=True)
+    compose_dir = tmp_path / "compose"
+    compose_dir.mkdir(exist_ok=True)
+    (compose_dir / ".env").write_text("REDTUSK_IMAGE=old\n")
+    p = _run(
+        ENGINE="redtusk",
+        FC_DIR=str(fc_dir),
+        GVISOR_DIR=str(gv_dir),
+        COMPOSE_DIR=str(compose_dir),
+        COMPOSE_WRAPPER=str(bin_dir / "compose-recorder"),
+        COMPOSE_FILES="",
+        SMOKE_FILE="",
+        FC_BIN_SRC=str(src) if src is not None else str(tmp_path / "no-such-firecracker"),
+        PATH=f"{bin_dir}:{os.environ['PATH']}",
+    )
+    return p, live
+
+
+def test_a_firecracker_swap_that_cannot_copy_stops_the_redeploy(tmp_path: Path) -> None:
+    """`cp ... && mv ...` is exempt from `set -e` exactly like the fetch above.
+
+    A cp that failed skipped the mv and the run carried on to recreate the stack -- and the
+    `--version` line then printed the OLD binary's version, which reads as confirmation the
+    swap happened. That is the worst shape this bug takes: the evidence agrees with the log.
+    """
+    p, live = _fc_swap_run(tmp_path, None)          # FC_BIN_SRC does not exist
+
+    assert p.returncode != 0, "a failed firecracker swap must stop the redeploy"
+    assert "OLD" not in p.stdout, "printed the old binary's version as if it were the new one"
+    assert "recreate api" not in p.stdout, "went on to recreate the stack without the swap"
+    assert live.read_text().count("OLD") == 1, "the live binary should be untouched"
+    # The two guards here are redundant for the STOP -- either the split statements or the
+    # cmp below would catch a missing source. They differ in what the operator is told, and
+    # that is the part worth pinning: with `cp ... && mv ...` the copy failure is swallowed
+    # and the run dies at cmp instead, reporting a mismatch "after the swap" -- blaming a
+    # swap that never ran, for a source that was never there.
+    assert "cannot stat" in p.stderr or "No such file" in p.stderr, (
+        f"the failure must name the missing source: {p.stderr!r}"
+    )
+
+
+def test_a_firecracker_swap_replaces_the_binary_and_leaves_a_rollback(tmp_path: Path) -> None:
+    """The positive control: a real swap replaces the live binary and is verified as such."""
+    src = tmp_path / "firecracker.new-build"
+    src.write_text("#!/bin/sh\necho 'Firecracker v9.9.9-NEW'\n")
+    src.chmod(0o755)
+
+    p, live = _fc_swap_run(tmp_path, src)
+
+    assert p.returncode == 0, p.stderr
+    assert "NEW" in p.stdout and "OLD" not in p.stdout
+    assert live.read_text() == src.read_text(), "the live binary was not replaced"
+    assert not (live.parent / "firecracker.new").exists(), "the staging copy was left behind"
+    assert (live.parent / f"firecracker.bak-{TAG}").read_text().count("OLD") == 1, (
+        "no rollback copy of the replaced binary"
+    )
+
+
 def test_an_unknown_mode_is_refused() -> None:
     p = _run(ENGINE="redtusk", REDEPLOY_MODE="bogus")
     assert p.returncode == 2, p.stderr
