@@ -1009,7 +1009,10 @@ class TestEveryRunscCallIsBounded:
         from blastbox.host.runtime.gvisor_snapshot import _default_run
 
         hang = tmp_path / "runsc-that-hangs"
-        hang.write_text("#!/bin/sh\nsleep 300\n")
+        # `exec`, so the timeout kill lands on the sleep itself. Without it only the shell
+        # is killed and the sleep is orphaned for five minutes, accumulating across runs and
+        # holding inherited fds (codex, #149).
+        hang.write_text("#!/bin/sh\nexec sleep 300\n")
         hang.chmod(0o755)
 
         started = time.monotonic()
@@ -1018,3 +1021,91 @@ class TestEveryRunscCallIsBounded:
         elapsed = time.monotonic() - started
 
         assert elapsed < 30, f"the call was not bounded: it took {elapsed:.0f}s"
+
+
+class TestTheBoundsCodexFound:
+    """Follow-ups from the review of #149 -- each one defeats the bound it sits next to."""
+
+    def test_a_non_finite_timeout_is_refused(self):
+        """`float()` accepts inf/nan; neither is a deadline.
+
+        `subprocess.run(timeout=inf)` never expires and nan compares false against
+        everything, so both slip past a bare `val <= 0` check and silently restore the
+        unbounded call the knob exists to prevent.
+        """
+        from blastbox.host.runtime.gvisor_snapshot_runtime import _gvisor_config_from_env
+
+        for raw in ("inf", "-inf", "nan", "0", "-5"):
+            cfg = _gvisor_config_from_env(
+                {"BLASTBOX_GVISOR_ROOTFS": "/x", "BLASTBOX_GVISOR_CLI_TIMEOUT_S": raw}
+            )
+            assert cfg.cli_timeout_s == 900.0, f"{raw!r} was accepted as a timeout"
+        ok = _gvisor_config_from_env(
+            {"BLASTBOX_GVISOR_ROOTFS": "/x", "BLASTBOX_GVISOR_CLI_TIMEOUT_S": "300"}
+        )
+        assert ok.cli_timeout_s == 300.0, "a valid override must still be honoured"
+
+    def test_the_teardown_commands_are_bounded_too(self, tmp_path):
+        """They run on the SAME thread as a launch that just timed out, against a runsc that
+        is by hypothesis wedged. Unbounded here reinstates the hang the timeouts remove."""
+        from blastbox.host.runtime.gvisor_snapshot import GvisorConfig, _best_effort_delete
+
+        seen: list[dict] = []
+
+        def run(argv, **kw):
+            seen.append(kw)
+            raise RuntimeError("teardown fails, so both commands are attempted")
+
+        cfg = GvisorConfig(
+            runsc_bin="runsc", root=tmp_path / "root", image_rootfs=tmp_path / "rootfs",
+            network="none", warm_argv=["x"], cli_timeout_s=77.0,
+        )
+        _best_effort_delete(cfg, run, "cid")
+
+        assert seen, "no teardown command ran"
+        for kw in seen:
+            assert kw.get("timeout") == 77.0, f"an unbounded teardown call: {kw}"
+
+    def test_an_oversized_stderr_file_is_read_by_the_tail_only(self, tmp_path):
+        """The detached sandbox holds this fd for its whole life and an untrusted document can
+        make the worker log without limit; slurping it to keep 8 KiB is how a diagnostic
+        becomes an OOM."""
+        from blastbox.host.runtime.gvisor_snapshot import _read_and_discard
+
+        import tracemalloc
+
+        # SPARSE, so the file costs no disk but slurping it costs 64 MiB of RAM. The content
+        # assertions below are identical for both implementations -- only the allocation tells
+        # them apart, so measure that or the guard cannot be falsified.
+        big = tmp_path / "stderr.log"
+        with big.open("wb") as fh:
+            fh.truncate(64 * 1024 * 1024)
+            fh.seek(-21, 2)
+            fh.write(b"THE-INTERESTING-TAIL\n")
+
+        tracemalloc.start()
+        try:
+            out = _read_and_discard(big, max_bytes=4096)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert "THE-INTERESTING-TAIL" in out, "runsc's useful line is the LAST one"
+        assert len(out) <= 4096
+        assert not big.exists(), "the capture file must not be left behind"
+        assert peak < 1024 * 1024, (
+            "read the whole 64 MiB file to keep 4 KiB of it: peak allocation "
+            f"{peak / 1024 / 1024:.1f} MiB"
+        )
+
+    def test_a_stderr_file_that_cannot_be_created_does_not_mask_the_real_error(self, tmp_path):
+        """Creating the capture file can fail on its own (ENOSPC, EMFILE, permissions).
+
+        Referencing its path from the handler turned that into an UnboundLocalError, which
+        masks the actual host-resource failure and skips the teardown it guards.
+        """
+        from blastbox.host.runtime.gvisor_snapshot import _detached_stderr
+
+        missing = tmp_path / "no-such-dir"
+        with pytest.raises(OSError):
+            _detached_stderr(missing)

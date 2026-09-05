@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import os
 import shutil
 import tarfile
@@ -444,8 +445,12 @@ def _float_env(env, key: str, default: float) -> float:
     except ValueError:
         _log.warning("invalid %s=%r; using %.0f", key, raw, default)
         return default
-    if val <= 0:
-        _log.warning("%s=%r must be > 0; using %.0f", key, raw, default)
+    # isfinite, not just > 0: float() happily accepts "inf" and "nan", neither of which is a
+    # deadline. `subprocess.run(timeout=inf)` never expires and `nan` compares false against
+    # everything, so both slip past a bare positivity check and silently restore the unbounded
+    # call this knob exists to prevent (codex, #149).
+    if not math.isfinite(val) or val <= 0:
+        _log.warning("%s=%r must be a finite value > 0; using %.0f", key, raw, default)
         return default
     return val
 

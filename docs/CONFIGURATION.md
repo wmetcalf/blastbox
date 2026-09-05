@@ -331,6 +331,7 @@ counts cheap.
 | `BLASTBOX_GVISOR_NETWORK` | `none` | runsc `-network`. |
 | `BLASTBOX_GVISOR_NPROC` | `4096` | RLIMIT_NPROC (fork-bomb cap; cgroups are ignored under `-ignore-cgroups`). |
 | `BLASTBOX_GVISOR_NOFILE` | `65536` | RLIMIT_NOFILE (fd-exhaustion cap). |
+| `BLASTBOX_GVISOR_CLI_TIMEOUT_S` | `900` | Bound (seconds) on every `runsc` invocation: `run`, `restore`, `checkpoint`, `exec`, and the `kill`/`delete` teardown. Deliberately generous — a checkpoint writes the whole guest memory image — but never unbounded: the build runs on a thread `ensure_build_started()` will not replace while it is alive, so one wedged call stops warm rebuilds for the life of the process. Non-finite or non-positive values are refused and the default is used. |
 | `BLASTBOX_GVISOR_WARM_ARGV` | — | The in-guest warm entrypoint argv (JSON list). |
 | `BLASTBOX_GVISOR_LD_PRELOAD` | — | `LD_PRELOAD` inside the guest (the accept-retry shim for soffice-on-restore). |
 | `BLASTBOX_GVISOR_EXTRA_ENV` | — | Extra guest env (JSON list), e.g. `CLIPPYSHOT_SANDBOX=container`. |

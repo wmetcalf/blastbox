@@ -111,7 +111,15 @@ def _detached_stderr(dirpath: Path):
 def _read_and_discard(path: Path, *, max_bytes: int = 8192) -> str:
     """Tail of a launch's stderr file, then remove it. Never raises."""
     try:
-        data = path.read_bytes()[-max_bytes:]
+        # SEEK, do not slurp. The detached sandbox holds this fd for its whole life and an
+        # untrusted document can make the worker log without limit, so read_bytes()[-N:]
+        # would allocate the entire file just to keep the last few KiB (codex, #149).
+        with path.open("rb") as fh:
+            try:
+                fh.seek(-max_bytes, os.SEEK_END)
+            except OSError:
+                fh.seek(0)                      # file shorter than the cap
+            data = fh.read(max_bytes)
     except OSError:
         data = b""
     try:
@@ -419,8 +427,14 @@ def _best_effort_delete(cfg: GvisorConfig, run: Callable[..., int], cid: str) ->
             # a teardown failure is the actionable thing: discarding both
             # streams would leave "could not confirm teardown" with no reason.
             # So: capture always, and report only when NOTHING succeeded.
+            # BOUNDED like every other runsc call. These run on the SAME thread as the
+            # launch that just timed out -- against a runsc that is by hypothesis wedged -- so
+            # an unbounded kill/delete here reinstates exactly the hang the timeouts remove
+            # (raised by codex on #149). A pipe is safe here: neither command detaches, so
+            # nothing inherits the write end.
             run([*_runsc(cfg), *argv],
-                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                timeout=cfg.cli_timeout_s)
             ok = True
         except Exception as exc:  # noqa: BLE001 - best effort by contract
             detail = getattr(exc, "stderr", None)
@@ -835,8 +849,12 @@ class GvisorSnapshotBackend:
         _prepare_slot_dirs(self._cfg, wd)
         cid = f"slot-{uuid.uuid4().hex[:12]}"
         _write_oci_config(self._cfg, wd, in_ro=True)
+        # OUTSIDE the try. Creating this file can fail on its own (ENOSPC, EMFILE, a
+        # permission problem), and the handler below reads _err_path -- so a failure here
+        # raised UnboundLocalError from the except clause, masking the real host-resource
+        # error and skipping the teardown it guards (codex, #149).
+        _err_fh, _err_path = _detached_stderr(wd)   # a file, never a pipe: see boot_base
         try:
-            _err_fh, _err_path = _detached_stderr(wd)   # a file, never a pipe: see boot_base
             try:
                 self._run(
                     [*_runsc(self._cfg), "restore", "-image-path", str(artifact),
