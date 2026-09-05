@@ -78,15 +78,32 @@ jobs:
           sudo cp deploy/apparmor/blastbox-bwrap deploy/apparmor/blastbox-nsjail /etc/apparmor.d/
           sudo apparmor_parser -r -W /etc/apparmor.d/blastbox-bwrap
           sudo apparmor_parser -r -W /etc/apparmor.d/blastbox-nsjail
-          sudo aa-status | grep blastbox || true
-          # Report, do not gate: the tests probe usability themselves and skip with a real
-          # reason, which is more informative than this step failing.
-          bwrap --unshare-user --uid 0 --ro-bind / / -- /bin/true \
-            && echo "bwrap userns OK" || echo "bwrap userns still blocked"
+          sudo aa-status | grep blastbox
+          # GATE, do not merely report. `... || echo` turns a failed probe into a green step,
+          # and pytest then turns the same failure into skips -- so the job created to stop
+          # tests skipping silently would itself go green having skipped them. That is the
+          # exact failure mode, reintroduced in its own verification (codex, #157).
+          #
+          # --unshare-all, not just --unshare-user: the operation that actually failed on this
+          # runner before the profiles were loaded was the NETWORK namespace
+          # ("bwrap: loopback: Failed RTM_NEWADDR"), so a probe without it does not reproduce
+          # what the tests need.
+          bwrap --unshare-all --unshare-user --uid 0 --ro-bind / / -- /bin/true
+          echo "bwrap userns+netns OK"
       - name: Pytest (sandbox backends, with nsjail + bwrap present)
-        # -rs so the log SAYS which tests still skip and why. A job added to stop tests
-        # skipping silently must not itself hide the next skip.
-        run: .venv/bin/pytest -q -rs tests/worker/sandbox/
+        # -rs so the log SAYS which tests skip and why, and then REFUSE any skip that means a
+        # backend was not exercised. This job exists to run these tests; a run where they
+        # quietly went back to skipping -- a runner image that blocks namespaces again, a
+        # dropped dependency -- must fail, not pass with a shorter log. Other skip reasons
+        # (a genuinely absent optional feature) stay allowed, so this does not become a
+        # tripwire for every future skip.
+        run: |
+          set -o pipefail
+          .venv/bin/pytest -q -rs tests/worker/sandbox/ | tee /tmp/sandbox.txt
+          if grep -E "SKIPPED.*(not installed|not usable|probe failed)" /tmp/sandbox.txt; then
+            echo "::error::a sandbox backend was not exercised -- see the skips above" >&2
+            exit 1
+          fi
 
   pg-search:
     # Perceptual-hash search is Postgres + pg_bktree only — there is no SQLite
