@@ -150,6 +150,28 @@ def test_gvisor_snapshot_roundtrip(tmp_path: Path) -> None:
     mgr = SnapshotManager(tmp_path / "snap", backend)
     rt = GvisorSnapshotSlotRuntime(mgr, settle_s=settle_s)
 
+    # BUILD the warm snapshot first. `spawn()` deliberately refuses to build
+    # inline -- a synchronous build there blocks the pool's only maintenance
+    # thread for a full boot plus readiness timeout (upstream PR #82) -- so the
+    # pool kicks `ensure_build_started()` on tick and spawns once it is built.
+    # Without this the test could never pass on a host that has no snapshot yet,
+    # which is every host: it died in `spawn()` with
+    # `SnapshotBuildInvalidated: warm snapshot is not built`. That went unnoticed
+    # because the test is gated behind BLASTBOX_GVISOR_ROOTFS and had never run.
+    #
+    # Built synchronously here on purpose: this is a test thread, not the
+    # maintenance thread the guard protects, and a blocking build gives a clear
+    # failure instead of a timeout if the base cannot boot at all.
+    build_s = float(os.environ.get("BLASTBOX_SNAPSHOT_BUILD_S", "180"))
+    build_started = time.monotonic()
+    try:
+        mgr.build()
+    except Exception as exc:  # noqa: BLE001 - reported as a build failure, not a round-trip one
+        pytest.fail(f"warm snapshot build failed after {time.monotonic() - build_started:.1f}s: {exc}")
+    assert time.monotonic() - build_started < build_s, (
+        f"warm snapshot build exceeded {build_s}s"
+    )
+
     slot = rt.spawn()
     slot_reaped = False
     try:

@@ -69,6 +69,44 @@ class GvisorConfig:
     rlimit_nofile: int | None = 65536
 
 
+class GvisorCommandError(RuntimeError):
+    """A runsc command failed, carrying the command's own stderr.
+
+    `SnapshotManager.build()` wraps whatever escapes into `SnapshotBuildError`
+    using `str(exc)`, so what this carries is what the operator finally reads.
+    """
+
+
+def _with_runsc_stderr(exc: BaseException, what: str) -> BaseException:
+    """``exc`` carrying the failing command's OWN stderr, when it captured any.
+
+    `runsc run` and `runsc restore` used to discard stderr, so the only output an
+    operator saw came from the TEARDOWN that follows a failure -- `runsc kill` and
+    `runsc delete` against a container that was never created, which print
+    `FetchSpec failed: loading container: file does not exist`. That is what a
+    failed gVisor boot reported, and it says nothing about why the boot failed.
+
+    Measured on a host where the base genuinely cannot boot, the real messages
+    are specific and immediately actionable:
+
+        cannot create gofer process: gofer: fork/exec /proc/self/exe:
+            permission denied
+        cannot create sandbox: cannot read client sync file:
+            waiting for sandbox to start: EOF
+
+    Truncated from the END: runsc's useful line is the last one.
+    """
+    err = getattr(exc, "stderr", None)
+    if not err:
+        return exc
+    if isinstance(err, bytes):
+        err = err.decode("utf-8", "replace")
+    tail = err.strip()[-600:]
+    if not tail:
+        return exc
+    return GvisorCommandError(f"{what} failed: {tail}")
+
+
 def _runsc(cfg: GvisorConfig) -> list[str]:
     a = [cfg.runsc_bin, "-root", str(cfg.root), f"-network={cfg.network}"]
     if cfg.ignore_cgroups:
@@ -271,7 +309,14 @@ def _best_effort_delete(cfg: GvisorConfig, run: Callable[..., int], cid: str) ->
     ok = False
     for argv in (["kill", cid, "KILL"], ["delete", "-force", cid]):
         try:
-            run([*_runsc(cfg), *argv])
+            # QUIET. These run against a container that may never have been
+            # created, so runsc prints `FetchSpec failed: loading container:
+            # file does not exist` -- and because this teardown follows a failed
+            # boot, that line was the only stderr an operator saw. It described
+            # the cleanup, not the failure. The return value is how this
+            # function reports, and callers already act on it.
+            run([*_runsc(cfg), *argv],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             ok = True
         except Exception:
             pass
@@ -612,9 +657,9 @@ class GvisorSnapshotBackend:
                 [*_runsc(self._cfg), "run", "-detach", "-bundle", str(base), cid],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
-        except BaseException:
+        except BaseException as boot_exc:
             # BaseException, matching restore_in and build()'s teardown: an interrupt or
             # cancellation during `runsc run` still leaves registered container state behind, and
             # no boot handle is returned on failure, so nothing else can ever reap it (PR #82).
@@ -629,9 +674,9 @@ class GvisorSnapshotBackend:
                 self._stranded_partials.append(str(base))
                 _log.warning("gvisor_snapshot: base %s could not be confirmed deleted; retaining "
                              "its bundle for retry", cid)
-                raise
+                raise _with_runsc_stderr(boot_exc, "runsc run") from boot_exc
             shutil.rmtree(base, ignore_errors=True)
-            raise
+            raise _with_runsc_stderr(boot_exc, "runsc run") from boot_exc
         return GvisorBootHandle(self._cfg, self._run, cid, base, ctrl, self._ready,
                                 ack_capable=self._ack_capable,
                                 ack_generation=ack_gen,
@@ -648,7 +693,7 @@ class GvisorSnapshotBackend:
                  "-detach", "-bundle", str(wd), cid],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
         except BaseException as exc:
             # BaseException, not Exception. A KeyboardInterrupt, SystemExit or task cancellation
