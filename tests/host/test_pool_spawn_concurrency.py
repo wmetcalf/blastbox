@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 
 from blastbox.host.pool import WarmPool
@@ -135,13 +134,20 @@ def test_ceiling_holds_when_batches_overlap():
     ceiling, and the pool promises the node twice the workers it is allowed.
 
     What this test is FOR: that two overlapping callers leave the pool at
-    exactly its ceiling and neither deadlocks it. It biases the interleaving but
-    cannot guarantee it -- the gates below hold both callers in their loops and
-    stop either publishing before the other has taken a token, and that is as
-    far as scheduler-dependent synchronisation goes. The reservation PREDICATE
-    is pinned race-free by
-    `test_a_reservation_counts_spawns_already_in_flight`; do not rely on this
+    exactly its ceiling. It biases the interleaving but cannot guarantee it, so
+    the reservation PREDICATE is pinned race-free by
+    `test_a_reservation_counts_spawns_already_in_flight` -- do not rely on this
     one to catch that regression on any single run.
+
+    What it deliberately does NOT claim is deadlock detection. A caller stuck
+    inside `_spawn_batch_concurrent` is stuck on the POOL's own executor, which
+    joins its workers before returning, and `concurrent.futures` joins any
+    surviving worker threads at interpreter shutdown. Measured with a spawn that
+    never returns: pytest hangs indefinitely (killed at 180 s) with a
+    `result(timeout=15)`, with `shutdown(wait=False, cancel_futures=True)`, and
+    with daemon threads on the test side -- none of them bound it, because the
+    wait is inside the code under test. Bounding it honestly needs a terminable
+    subprocess; until something needs that, this test asserts only what it can.
     """
     rt = _SlowSpawnRuntime(delay=0.15)
     ceiling = 4
@@ -220,12 +226,35 @@ def test_ceiling_holds_when_batches_overlap():
     # Futures, not raw threads: a raw thread's exception never reaches the test,
     # so one caller could fail outright while the other filled the pool and
     # every assertion below would still pass.
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        futures = [
-            ex.submit(pool._spawn_batch_concurrent, ceiling, None) for _ in range(2)
-        ]
-        for future in futures:
-            future.result(timeout=15)   # re-raises whatever that caller raised
+    # DAEMON threads with captured exceptions, not a ThreadPoolExecutor. The
+    # executor cannot bound a deadlock -- the thing this test claims to detect:
+    # its `shutdown(wait=True)` waits forever for a stuck task, and even
+    # `shutdown(wait=False)` leaves non-daemon worker threads that
+    # `concurrent.futures`' atexit handler joins at interpreter shutdown.
+    # Measured: with a spawn that never returns, that hangs pytest indefinitely
+    # (killed at 180 s) even with `result(timeout=15)`. Daemon threads let the
+    # join timeout be the bound that actually holds, and the capture list keeps
+    # a raising caller from passing silently.
+    errors: list[BaseException] = []
+
+    def run_batch() -> None:
+        try:
+            pool._spawn_batch_concurrent(ceiling, None)
+        except BaseException as exc:  # noqa: BLE001 - re-raised into the test below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run_batch, daemon=True) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+
+    # A stuck caller cannot be reported (see the docstring), but a RAISING one
+    # must not pass silently -- which is what raw threads without this did.
+    stuck = [thread for thread in threads if thread.is_alive()]
+    assert not stuck, f"{len(stuck)} batch caller(s) did not finish within 15 s"
+    if errors:
+        raise errors[0]
 
     # EXACTLY the ceiling, not merely at most: two batches asking for 4 each
     # must FILL the pool to 4, not deadlock it. Bounding reservations by
