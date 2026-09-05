@@ -66,8 +66,8 @@ def _runsc_cr_available() -> bool:
         return False
 
 
-def _force_delete_all(cfg, *, timeout_s: float = 20.0) -> list[str]:
-    """Force-delete every container registered under ``cfg.root``. Returns their ids.
+def _force_delete_all(cfg, *, timeout_s: float = 20.0) -> tuple[list[str], list[str]]:
+    """Force-delete containers under ``cfg.root``. Returns (deleted, unconfirmed).
 
     Only this test's OWN root -- `cfg.root` is under tmp_path and unique per
     run -- so it can never touch the fleet's containers, which live under the
@@ -77,6 +77,12 @@ def _force_delete_all(cfg, *, timeout_s: float = 20.0) -> list[str]:
     thread keeps running, its child `runsc` keeps going, and a stalled build can
     leave a sandbox on the host and keep writing under tmp_path after the test
     has gone.
+
+    A container counts as deleted only when `runsc delete` actually SUCCEEDS.
+    Appending every id regardless of exit status is how a cleanup that silently
+    failed would still report "force-deleted 3 containers" while three sandboxes
+    kept running -- the swallow-everything mistake `_best_effort_delete` was
+    fixed for upstream.
     """
     import json as _json
     import subprocess as _sp
@@ -85,21 +91,30 @@ def _force_delete_all(cfg, *, timeout_s: float = 20.0) -> list[str]:
     try:
         listed = _sp.run([*base, "list", "-format=json"], capture_output=True,
                          text=True, timeout=timeout_s, check=False)
-        containers = _json.loads(listed.stdout or "[]")
+        # `runsc list -format=json` prints literal `null` when nothing is
+        # registered, which parses to None -- iterating that raised TypeError
+        # and turned the cleanup into a second failure. Measured on toolz3.
+        containers = _json.loads(listed.stdout or "[]") or []
+        if not isinstance(containers, list):
+            return [], []
     except Exception:  # noqa: BLE001 - cleanup is best effort by definition
-        return []
-    killed: list[str] = []
+        return [], []
+    deleted: list[str] = []
+    unconfirmed: list[str] = []
     for entry in containers:
         cid = entry.get("id") if isinstance(entry, dict) else None
         if not cid:
             continue
-        for argv in (["kill", cid, "KILL"], ["delete", "-force", cid]):
-            try:
-                _sp.run([*base, *argv], capture_output=True, timeout=timeout_s, check=False)
-            except Exception:  # noqa: BLE001
-                pass
-        killed.append(cid)
-    return killed
+        try:
+            _sp.run([*base, "kill", cid, "KILL"], capture_output=True,
+                    timeout=timeout_s, check=False)
+            gone = _sp.run([*base, "delete", "-force", cid], capture_output=True,
+                           timeout=timeout_s, check=False)
+        except Exception:  # noqa: BLE001
+            unconfirmed.append(cid)
+            continue
+        (deleted if gone.returncode == 0 else unconfirmed).append(cid)
+    return deleted, unconfirmed
 
 
 def _warm_rootfs() -> str | None:
@@ -221,11 +236,15 @@ def test_gvisor_snapshot_roundtrip(tmp_path: Path) -> None:
         # Do not just stop waiting: tear down whatever the stalled build left
         # under THIS test's private root, or a sandbox outlives the run and
         # keeps writing into tmp_path after it is gone.
-        orphans = _force_delete_all(cfg)
+        deleted, unconfirmed = _force_delete_all(cfg)
+        detail = f"force-deleted {deleted}" if deleted else "nothing to clean up"
+        if unconfirmed:
+            # Loudly: these may still be running, and on a fleet node that is
+            # the next run's problem.
+            detail += f"; COULD NOT confirm deletion of {unconfirmed} -- may still be live"
         pytest.fail(
             f"warm snapshot build did not finish within {build_s}s "
-            f"(set BLASTBOX_SNAPSHOT_BUILD_S to allow longer); "
-            f"force-deleted {len(orphans)} container(s) it left behind: {orphans}"
+            f"(set BLASTBOX_SNAPSHOT_BUILD_S to allow longer); {detail}"
         )
     kind, payload = outcome[0]
     if kind == "error":
