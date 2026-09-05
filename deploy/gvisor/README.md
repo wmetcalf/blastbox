@@ -108,6 +108,7 @@ reads the following env vars (all optional, defaults shown):
 | `BLASTBOX_GVISOR_NPROC` | `4096` | `RLIMIT_NPROC` for the warm worker tree (fork-bomb bound) |
 | `BLASTBOX_GVISOR_NOFILE` | `65536` | `RLIMIT_NOFILE` for the warm worker tree (fd-exhaustion bound) |
 | `BLASTBOX_GVISOR_CLI_TIMEOUT_S` | `900` | Seconds any single `runsc` call may take (`run`/`restore`/`checkpoint`/`exec` and their teardown). Generous on purpose: a checkpoint writes the guest's whole memory image. Raise it for a large base; it exists so a wedged `runsc` cannot block the build thread forever, which would stop the warm tier rebuilding for the life of the process. Must be finite and > 0. |
+| `BLASTBOX_SNAPSHOT_READY_S` | `120` | Seconds a warm BASE gets to signal READY while the snapshot is built. **Shared by the Firecracker and gVisor tiers** — one `SnapshotManager`, one budget. Distinct from the build-phase budget: raising that one cannot help a base that is simply slow to warm, which is the case a cold OCR/soffice start on a loaded node hits. Must be finite and > 0. |
 
 `_gvisor_config_from_env()` assembles a `GvisorConfig` dataclass from these
 vars; `select_gvisor_snapshot_runtime()` returns the configured runtime object.

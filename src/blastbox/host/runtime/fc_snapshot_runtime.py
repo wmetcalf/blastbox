@@ -26,6 +26,7 @@ import shutil
 import threading
 import time
 import uuid
+from blastbox.host.runtime.env_knobs import positive_float_env
 from pathlib import Path
 from typing import Callable
 
@@ -551,5 +552,10 @@ def select_snapshot_runtime(
         # either _mgr_ref.append line left the whole suite green.
     )
     backend = FcSnapshotBackend.from_env(base_dir, launcher, mem_dir=mem_dir)
-    manager = SnapshotManager(base_dir, backend, ack_capable=ack_capable)
+    # Same knob as the gVisor tier: one shared SnapshotManager, one readiness budget,
+    # and neither construction site used to pass one (issue #147).
+    manager = SnapshotManager(
+        base_dir, backend, ack_capable=ack_capable,
+        ready_timeout_s=positive_float_env(os.environ, "BLASTBOX_SNAPSHOT_READY_S", 120.0),
+    )
     return SnapshotSlotRuntime(cfg, manager, settle_s=settle_s, ack_capable=ack_capable)

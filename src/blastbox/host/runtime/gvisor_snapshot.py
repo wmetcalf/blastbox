@@ -417,7 +417,10 @@ def _default_ready_wait(ctrl_dir: Path, timeout_s: float) -> None:
     # kills the container and removes this directory, so this is the only moment it exists.
     cause = read_setup_breadcrumb(ctrl_dir)
     detail = f": {cause}" if cause else ""
-    raise TimeoutError(f"warm base not READY within {timeout_s}s ({ctrl_dir}){detail}")
+    raise TimeoutError(
+        f"warm base not READY within {timeout_s}s ({ctrl_dir}){detail}"
+        f" -- raise BLASTBOX_SNAPSHOT_READY_S if this base is merely slow"
+    )
 
 
 def _best_effort_delete(cfg: GvisorConfig, run: Callable[..., int], cid: str) -> bool:

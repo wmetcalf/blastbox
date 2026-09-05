@@ -318,6 +318,7 @@ counts cheap.
 | `BLASTBOX_FC_VCPU` | `1` | **Pinned at 1** — the vsock stream-corruption mitigation. Do not raise without validating the guest vsock driver under concurrency. |
 | `BLASTBOX_FC_MEM_MIB` | `512` | Guest RAM (compose sets 2048 for LibreOffice). |
 | `BLASTBOX_FC_OUTDISK_MIB` | — | Size of the per-slot ext4 output disk the host reads via `debugfs`. |
+| `BLASTBOX_SNAPSHOT_READY_S` | `120` | Seconds a warm BASE gets to signal READY while the snapshot is built. **Shared by the Firecracker and gVisor tiers** — one `SnapshotManager`, one budget. Distinct from the build-phase budget: raising that one cannot help a base that is simply slow to warm, which is the case a cold OCR/soffice start on a loaded node hits. Must be finite and > 0. |
 | `BLASTBOX_SNAPSHOT_MEM_DIR` / `BLASTBOX_SNAPSHOT_MEM_TMPFS` | — | Where the warm memory-snapshot base lives; `_TMPFS` pins the CoW base in RAM (per-host toggle). |
 | `BLASTBOX_SNAPSHOT_RECLAIM_LEGACY` | unset (off) | Delete pre-generation snapshot artifacts (`warm.snapshot` / `warm.mem`) left by a build older than generation stamping. **Set this only once no pre-upgrade dispatcher is still running**: those files carry no owner lease, so nothing can prove an overlapping old process is not still mapping them, and unlinking a live one corrupts its microVMs. Left off, the tier logs `fc_snapshot.legacy_artifacts_present` with the paths and size — the RAM-sized `warm.mem` often occupies the very tmpfs the replacement generation needs, so it is a common cause of an upgraded tier failing every build with ENOSPC. |
 | `BLASTBOX_SNAPSHOT_SETTLE_S` | `""` | Settle delay before snapshotting a freshly-warmed guest. |
@@ -332,6 +333,7 @@ counts cheap.
 | `BLASTBOX_GVISOR_NPROC` | `4096` | RLIMIT_NPROC (fork-bomb cap; cgroups are ignored under `-ignore-cgroups`). |
 | `BLASTBOX_GVISOR_NOFILE` | `65536` | RLIMIT_NOFILE (fd-exhaustion cap). |
 | `BLASTBOX_GVISOR_CLI_TIMEOUT_S` | `900` | Bound (seconds) on every `runsc` invocation: `run`, `restore`, `checkpoint`, `exec`, and the `kill`/`delete` teardown. Deliberately generous — a checkpoint writes the whole guest memory image — but never unbounded: the build runs on a thread `ensure_build_started()` will not replace while it is alive, so one wedged call stops warm rebuilds for the life of the process. Non-finite or non-positive values are refused and the default is used. |
+| `BLASTBOX_SNAPSHOT_READY_S` | `120` | Seconds a warm BASE gets to signal READY while the snapshot is built. **Shared by the Firecracker and gVisor tiers** — one `SnapshotManager`, one budget. Distinct from the build-phase budget: raising that one cannot help a base that is simply slow to warm, which is the case a cold OCR/soffice start on a loaded node hits. Must be finite and > 0. |
 | `BLASTBOX_GVISOR_WARM_ARGV` | — | The in-guest warm entrypoint argv (JSON list). |
 | `BLASTBOX_GVISOR_LD_PRELOAD` | — | `LD_PRELOAD` inside the guest (the accept-retry shim for soffice-on-restore). |
 | `BLASTBOX_GVISOR_EXTRA_ENV` | — | Extra guest env (JSON list), e.g. `CLIPPYSHOT_SANDBOX=container`. |
