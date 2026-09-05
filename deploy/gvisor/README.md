@@ -107,6 +107,7 @@ reads the following env vars (all optional, defaults shown):
 | `BLASTBOX_SNAPSHOT_SETTLE_S` | `1.0` | Seconds to wait after restore before sending the job (post-restore settle) |
 | `BLASTBOX_GVISOR_NPROC` | `4096` | `RLIMIT_NPROC` for the warm worker tree (fork-bomb bound) |
 | `BLASTBOX_GVISOR_NOFILE` | `65536` | `RLIMIT_NOFILE` for the warm worker tree (fd-exhaustion bound) |
+| `BLASTBOX_GVISOR_CLI_TIMEOUT_S` | `900` | Seconds any single `runsc` call may take (`run`/`restore`/`checkpoint`/`exec` and their teardown). Generous on purpose: a checkpoint writes the guest's whole memory image. Raise it for a large base; it exists so a wedged `runsc` cannot block the build thread forever, which would stop the warm tier rebuilding for the life of the process. Must be finite and > 0. |
 
 `_gvisor_config_from_env()` assembles a `GvisorConfig` dataclass from these
 vars; `select_gvisor_snapshot_runtime()` returns the configured runtime object.

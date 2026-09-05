@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import os
 import shutil
 import tarfile
@@ -429,6 +430,31 @@ def _secure_snapshot_base(base_dir: Path) -> Path:
     return base_dir
 
 
+def _float_env(env, key: str, default: float) -> float:
+    """A positive float from the environment, or the default.
+
+    Zero/negative is rejected rather than honoured: `subprocess.run(timeout=0)` expires
+    instantly, so a typo'd bound would turn every runsc call into an immediate failure --
+    a worse outage than the unbounded call it replaced.
+    """
+    raw = str(env.get(key, "")).strip()
+    if not raw:
+        return default
+    try:
+        val = float(raw)
+    except ValueError:
+        _log.warning("invalid %s=%r; using %.0f", key, raw, default)
+        return default
+    # isfinite, not just > 0: float() happily accepts "inf" and "nan", neither of which is a
+    # deadline. `subprocess.run(timeout=inf)` never expires and `nan` compares false against
+    # everything, so both slip past a bare positivity check and silently restore the unbounded
+    # call this knob exists to prevent (codex, #149).
+    if not math.isfinite(val) or val <= 0:
+        _log.warning("%s=%r must be a finite value > 0; using %.0f", key, raw, default)
+        return default
+    return val
+
+
 def _int_env(env, key: str, default: int) -> int:
     raw = str(env.get(key, "")).strip()
     try:
@@ -498,4 +524,7 @@ def _gvisor_config_from_env(env):
         # Generous defense-in-depth bounds for the whole warm worker tree (see GvisorConfig).
         rlimit_nproc=_int_env(env, "BLASTBOX_GVISOR_NPROC", 4096),
         rlimit_nofile=_int_env(env, "BLASTBOX_GVISOR_NOFILE", 65536),
+        # Bounds every runsc invocation; see GvisorConfig.cli_timeout_s for why an unbounded
+        # one could disable warm rebuilds for the life of the process.
+        cli_timeout_s=_float_env(env, "BLASTBOX_GVISOR_CLI_TIMEOUT_S", 900.0),
     )

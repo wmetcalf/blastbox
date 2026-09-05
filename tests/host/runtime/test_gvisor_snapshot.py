@@ -1,3 +1,4 @@
+import time
 import json
 from pathlib import Path
 
@@ -930,3 +931,272 @@ class TestReadyTimeoutDistinguishesDeadFromSlow:
             h.wait_ready(0.1)
 
         assert "exited before signalling READY" not in str(ei.value)
+
+
+class TestEveryRunscCallIsBounded:
+    """An unbounded runsc call disables warm rebuilds for the life of the process.
+
+    `_default_run` is `subprocess.run(check=True)` with no timeout, and the build runs on a
+    daemon thread that `ensure_build_started` refuses to replace while it is alive
+    (`_build_thread.is_alive()`) -- with no watchdog anywhere. So one wedged
+    `checkpoint`/`run`/`restore`/`exec` meant the warm tier never rebuilt again: no error, no
+    log, every job on the cold tier permanently. The query helpers were already bounded
+    (`runsc state` 3s, `runsc help` 5s); the build path was not.
+
+    These drive the REAL call sites with a recording runner and assert a timeout was passed,
+    then prove end-to-end against an actually-hanging runsc that the call returns.
+    """
+
+    def _cfg(self, tmp_path, **kw):
+        from blastbox.host.runtime.gvisor_snapshot import GvisorConfig
+
+        return GvisorConfig(
+            runsc_bin="runsc", root=tmp_path / "root", image_rootfs=tmp_path / "rootfs",
+            network="none", warm_argv=["python3", "/opt/blastbox/run_warm.py"], **kw,
+        )
+
+    def test_the_checkpoint_call_is_bounded(self, tmp_path):
+        from blastbox.host.runtime.gvisor_snapshot import GvisorBootHandle
+
+        seen: list[dict] = []
+
+        def run(argv, **kw):
+            seen.append({"argv": argv, "kw": kw})
+            return 0
+
+        cfg = self._cfg(tmp_path, cli_timeout_s=42.0)
+        base = tmp_path / "base"
+        (base / "ctrl").mkdir(parents=True)
+        h = GvisorBootHandle(cfg, run, "cid", base, base / "ctrl", lambda c, t: None)
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        h.checkpoint(dest)
+
+        ckpt = [c for c in seen if "checkpoint" in c["argv"]]
+        assert ckpt, f"no checkpoint call was made: {seen}"
+        assert ckpt[0]["kw"].get("timeout") == 42.0, (
+            f"runsc checkpoint ran unbounded; a wedge here never rebuilds: {ckpt[0]['kw']}"
+        )
+
+    def test_the_boot_call_is_bounded(self, tmp_path):
+        from blastbox.host.runtime.gvisor_snapshot import GvisorSnapshotBackend
+
+        seen: list[dict] = []
+
+        def run(argv, **kw):
+            seen.append({"argv": argv, "kw": kw})
+            return 0
+
+        cfg = self._cfg(tmp_path, cli_timeout_s=37.0)
+        (tmp_path / "root").mkdir(parents=True, exist_ok=True)
+        be = GvisorSnapshotBackend(cfg, run=run)
+        be.boot_base()
+
+        boots = [c for c in seen if "run" in c["argv"] and "-detach" in c["argv"]]
+        assert boots, f"no runsc run call was made: {seen}"
+        assert boots[0]["kw"].get("timeout") == 37.0, (
+            f"runsc run ran unbounded: {boots[0]['kw']}"
+        )
+
+    def test_a_hanging_runsc_actually_returns(self, tmp_path):
+        """The property that matters, proved by EXECUTING a runsc that never exits.
+
+        Asserting the kwarg alone would pass even if `_default_run` dropped it on the floor.
+        """
+        import subprocess as sp
+
+        from blastbox.host.runtime.gvisor_snapshot import _default_run
+
+        hang = tmp_path / "runsc-that-hangs"
+        # `exec`, so the timeout kill lands on the sleep itself. Without it only the shell
+        # is killed and the sleep is orphaned for five minutes, accumulating across runs and
+        # holding inherited fds (codex, #149).
+        hang.write_text("#!/bin/sh\nexec sleep 300\n")
+        hang.chmod(0o755)
+
+        started = time.monotonic()
+        with pytest.raises(sp.TimeoutExpired):
+            _default_run([str(hang), "checkpoint"], timeout=1.0)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 30, f"the call was not bounded: it took {elapsed:.0f}s"
+
+
+class TestTheBoundsCodexFound:
+    """Follow-ups from the review of #149 -- each one defeats the bound it sits next to."""
+
+    def test_a_non_finite_timeout_is_refused(self):
+        """`float()` accepts inf/nan; neither is a deadline.
+
+        `subprocess.run(timeout=inf)` never expires and nan compares false against
+        everything, so both slip past a bare `val <= 0` check and silently restore the
+        unbounded call the knob exists to prevent.
+        """
+        from blastbox.host.runtime.gvisor_snapshot_runtime import _gvisor_config_from_env
+
+        for raw in ("inf", "-inf", "nan", "0", "-5"):
+            cfg = _gvisor_config_from_env(
+                {"BLASTBOX_GVISOR_ROOTFS": "/x", "BLASTBOX_GVISOR_CLI_TIMEOUT_S": raw}
+            )
+            assert cfg.cli_timeout_s == 900.0, f"{raw!r} was accepted as a timeout"
+        ok = _gvisor_config_from_env(
+            {"BLASTBOX_GVISOR_ROOTFS": "/x", "BLASTBOX_GVISOR_CLI_TIMEOUT_S": "300"}
+        )
+        assert ok.cli_timeout_s == 300.0, "a valid override must still be honoured"
+
+    def test_the_teardown_commands_are_bounded_too(self, tmp_path):
+        """They run on the SAME thread as a launch that just timed out, against a runsc that
+        is by hypothesis wedged. Unbounded here reinstates the hang the timeouts remove."""
+        from blastbox.host.runtime.gvisor_snapshot import GvisorConfig, _best_effort_delete
+
+        seen: list[dict] = []
+
+        def run(argv, **kw):
+            seen.append(kw)
+            raise RuntimeError("teardown fails, so both commands are attempted")
+
+        cfg = GvisorConfig(
+            runsc_bin="runsc", root=tmp_path / "root", image_rootfs=tmp_path / "rootfs",
+            network="none", warm_argv=["x"], cli_timeout_s=77.0,
+        )
+        _best_effort_delete(cfg, run, "cid")
+
+        assert seen, "no teardown command ran"
+        for kw in seen:
+            assert kw.get("timeout") == 77.0, f"an unbounded teardown call: {kw}"
+
+    def test_an_oversized_stderr_file_is_read_by_the_tail_only(self, tmp_path):
+        """The detached sandbox holds this fd for its whole life and an untrusted document can
+        make the worker log without limit; slurping it to keep 8 KiB is how a diagnostic
+        becomes an OOM."""
+        from blastbox.host.runtime.gvisor_snapshot import _read_and_discard
+
+        import tracemalloc
+
+        # SPARSE, so the file costs no disk but slurping it costs 64 MiB of RAM. The content
+        # assertions below are identical for both implementations -- only the allocation tells
+        # them apart, so measure that or the guard cannot be falsified.
+        big = tmp_path / "stderr.log"
+        with big.open("wb") as fh:
+            fh.truncate(64 * 1024 * 1024)
+            fh.seek(-21, 2)
+            fh.write(b"THE-INTERESTING-TAIL\n")
+
+        tracemalloc.start()
+        try:
+            out = _read_and_discard(big, max_bytes=4096)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert "THE-INTERESTING-TAIL" in out, "runsc's useful line is the LAST one"
+        assert len(out) <= 4096
+        assert not big.exists(), "the capture file must not be left behind"
+        assert peak < 1024 * 1024, (
+            "read the whole 64 MiB file to keep 4 KiB of it: peak allocation "
+            f"{peak / 1024 / 1024:.1f} MiB"
+        )
+
+    def test_a_stderr_file_that_cannot_be_created_does_not_mask_the_real_error(self, tmp_path):
+        """Creating the capture file can fail on its own (ENOSPC, EMFILE, permissions).
+
+        Referencing its path from the handler turned that into an UnboundLocalError, which
+        masks the actual host-resource failure and skips the teardown it guards.
+        """
+        from blastbox.host.runtime.gvisor_snapshot import _detached_stderr
+
+        missing = tmp_path / "no-such-dir"
+        with pytest.raises(OSError):
+            _detached_stderr(missing)
+
+
+class TestControlFlowAndBundleCleanup:
+    """The second review round on #149: both of these were caused by the fixes themselves."""
+
+    def test_an_interrupt_is_not_turned_into_a_snapshot_error(self):
+        """The callers catch BaseException to clean up and re-raise a shutdown UNCHANGED.
+
+        Enriching one gives it a `stderr`, and `_with_runsc_stderr` then replaces it with a
+        GvisorCommandError -- so a Ctrl-C during a boot came back as an ordinary snapshot
+        failure and the shutdown was swallowed.
+        """
+        from blastbox.host.runtime.gvisor_snapshot import (
+            _attach_stderr_text,
+            _with_runsc_stderr,
+        )
+
+        for exc in (KeyboardInterrupt(), SystemExit(1)):
+            out = _attach_stderr_text(exc, "cannot create gofer process: permission denied")
+            assert out is exc, f"{type(exc).__name__} was replaced by {type(out).__name__}"
+            assert _with_runsc_stderr(out, "runsc run") is exc, (
+                f"{type(exc).__name__} survived the attach but not the render"
+            )
+
+    def test_an_ordinary_failure_is_still_enriched(self):
+        """The control: this is what the enrichment exists for."""
+        from blastbox.host.runtime.gvisor_snapshot import (
+            _attach_stderr_text,
+            _with_runsc_stderr,
+        )
+
+        exc = RuntimeError("runsc exited 1")
+        rendered = _with_runsc_stderr(
+            _attach_stderr_text(exc, "cannot create gofer process: permission denied"),
+            "runsc run",
+        )
+        assert "cannot create gofer process" in str(rendered)
+
+    def test_a_capture_file_failure_does_not_leak_the_bundle(self, tmp_path, monkeypatch):
+        """The bundle dir and OCI config are already on disk and no container exists yet, so
+        nothing else knows this base is there. Every async retry would leak another."""
+        from blastbox.host.runtime import gvisor_snapshot as gs
+
+        monkeypatch.setattr(gs, "_prepare_slot_dirs",
+                            lambda cfg, base: (base / "ctrl").mkdir(parents=True))
+        monkeypatch.setattr(gs, "_write_oci_config", lambda cfg, base, in_ro=True: None)
+        monkeypatch.setattr(gs, "_detached_stderr",
+                            lambda d: (_ for _ in ()).throw(OSError(24, "Too many open files")))
+
+        root = tmp_path / "root" / "r"
+        cfg = gs.GvisorConfig(
+            runsc_bin="runsc", root=root, image_rootfs=tmp_path / "rootfs",
+            network="none", warm_argv=["x"],
+        )
+        be = gs.GvisorSnapshotBackend(cfg, run=lambda *a, **k: 0)
+
+        with pytest.raises(OSError):
+            be.boot_base()
+
+        leaked = list(root.parent.glob("gvisor-base-*"))
+        assert not leaked, f"a prepared bundle was left behind: {leaked}"
+
+
+def test_a_successful_boot_leaves_no_capture_file_behind(tmp_path, monkeypatch):
+    """Only the FAILURE path removed the stderr capture file.
+
+    So every healthy boot left one behind, per base -- and the detached sandbox keeps that fd
+    for its whole life, so each one kept growing with whatever the untrusted worker logged
+    (codex, #149). Unlinking on success ends the accumulation; the blocks are reclaimed when
+    the sandbox exits.
+    """
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    monkeypatch.setattr(gs, "_prepare_slot_dirs",
+                        lambda cfg, base: (base / "ctrl").mkdir(parents=True))
+    monkeypatch.setattr(gs, "_write_oci_config", lambda cfg, base, in_ro=True: None)
+
+    root = tmp_path / "root" / "r"
+    cfg = gs.GvisorConfig(
+        runsc_bin="runsc", root=root, image_rootfs=tmp_path / "rootfs",
+        network="none", warm_argv=["x"],
+    )
+    handle = gs.GvisorSnapshotBackend(cfg, run=lambda *a, **k: 0).boot_base()
+
+    bundles = list(root.parent.glob("gvisor-base-*"))
+    assert bundles, "fixture: the bundle should exist after a successful boot"
+    leftovers = [p for b in bundles for p in b.glob("runsc-stderr-*")]
+    assert not leftovers, (
+        f"a successful boot left its stderr capture file behind: {leftovers}"
+    )
+    assert handle is not None
