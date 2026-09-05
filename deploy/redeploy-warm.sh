@@ -78,14 +78,22 @@
 set -euo pipefail
 
 ENGINE="${ENGINE:?set ENGINE=clippyshot|redtusk|custom}"
+# REQUIRED, not defaulted. The presets below are "the values verified on toolz2
+# 2026-06-19", and these two aged badly: BLASTBOX_REF pointed at
+# `fix/fc-warm-entropy`, a branch since DELETED, and WARM_TAG at `warmfix` --
+# whose images still exist on toolz2, so a default run there would have
+# recreated the warm tier onto a June build without failing. Naming the tag is
+# also what the recreate path already tells you to build with
+# (`blastbox build-images <repo> --tag $WARM_TAG`), so the two now cannot
+# disagree by accident.
+WARM_TAG="${WARM_TAG:?set WARM_TAG to the tag blastbox build-images published}"
+BLASTBOX_REF="${BLASTBOX_REF:?set BLASTBOX_REF to the blastbox ref to build the wheel from (legacy-rebuild), e.g. a release tag}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
 # --- per-engine presets (the values verified on toolz2 2026-06-19) -------------
 case "$ENGINE" in
   clippyshot)
-    : "${BLASTBOX_REF:=fix/fc-warm-entropy}"
     : "${BASE_IMAGE:=clippyshot:dev}"        ; : "${COLD_IMAGE:=clippyshot-cold-worker:dev}"
-    : "${WARM_TAG:=warmfix}"
     : "${VENV_PIP:=/opt/clippyshot/bin/pip}" ; : "${VENV_PY:=/opt/clippyshot/bin/python}"
     : "${IMG_USER:=clippy}"
     : "${FC_DOCKERFILE:=deploy/firecracker/Dockerfile.clippyshot}" ; : "${ROOTFS_MIB:=7000}"
@@ -98,9 +106,7 @@ case "$ENGINE" in
     : "${API_URL:=http://127.0.0.1:8001}"    ; : "${SMOKE_FILE:=}"
     ;;
   redtusk)
-    : "${BLASTBOX_REF:=fix/fc-warm-entropy}"
     : "${BASE_IMAGE:=redtusk:0115}"          ; : "${COLD_IMAGE:=redtusk-cold-worker:0122}"
-    : "${WARM_TAG:=warmfix}"
     : "${VENV_PIP:=/opt/redtusk/bin/pip}"    ; : "${VENV_PY:=/opt/redtusk/bin/python}"
     : "${IMG_USER:=10001:10001}"
     : "${FC_DOCKERFILE:=deploy/firecracker/Dockerfile.redtusk}" ; : "${ROOTFS_MIB:=1024}"
@@ -164,7 +170,18 @@ fi
 if [ "$MODE" = legacy-rebuild ]; then
 # --- 1. blastbox wheel from BLASTBOX_REF --------------------------------------
 log "checkout $BLASTBOX_REF + build wheel (via $BASE_IMAGE pip, no-cache so a PyPI wheel isn't served)"
-git -C "$REPO" fetch --quiet origin "$BLASTBOX_REF" && git -C "$REPO" checkout --quiet "$BLASTBOX_REF"
+# SEPARATE statements, not `fetch && checkout`. `set -e` does not fire for the
+# left operand of `&&`, so a fetch of a ref that no longer exists was swallowed,
+# the checkout was skipped, and the wheel was built from WHATEVER tree the repo
+# happened to be on -- while the log line above claimed the ref. Measured: with
+# the old default (`fix/fc-warm-entropy`, a branch since deleted) the script
+# printed the fetch error and carried on to build and deploy.
+git -C "$REPO" fetch --quiet origin "$BLASTBOX_REF" || {
+  echo "[redeploy-warm] cannot fetch BLASTBOX_REF=$BLASTBOX_REF from origin" >&2
+  echo "[redeploy-warm]   the wheel would be built from the current checkout instead" >&2
+  exit 1
+}
+git -C "$REPO" checkout --quiet "$BLASTBOX_REF"
 SRC=$(mktemp -d); WHEELS=$(mktemp -d)
 cp -r "$REPO"/. "$SRC"/ ; rm -rf "$SRC/.git" "$SRC/build" "$SRC/src/"*.egg-info 2>/dev/null || true
 docker run --rm -u root -v "$SRC":/src -v "$WHEELS":/out --entrypoint "$VENV_PIP" "$BASE_IMAGE" \
