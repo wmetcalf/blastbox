@@ -1506,7 +1506,10 @@ class TestFirecrackerLiveBoot:
         # `engine mismatch: expected 'probe', worker reported 'redtusk'` --
         # a confusing trust error instead of a verdict. Measured on toolz3
         # against /var/lib/redtusk-fc.
-        engine = os.environ.get("BLASTBOX_FC_TEST_ENGINE", "probe")
+        # `.strip() or` -- an exported-but-empty value is effectively unset, and
+        # treating "" as a fleet engine skipped for prerequisites the probe path
+        # does not need, or reached the trust gate expecting an empty engine.
+        engine = os.environ.get("BLASTBOX_FC_TEST_ENGINE", "").strip() or "probe"
         if engine != "probe" and not os.environ.get("BLASTBOX_FC_MEM_MIB", "").strip():
             # FCConfig falls back to 512 MiB, on which the redtusk JVM cannot
             # even commit its heap -- the run comes back `engine_error` and
@@ -1580,7 +1583,15 @@ class TestFirecrackerLiveBoot:
                 WarmJobSpec(input_path=src, output_dir=slot.output_dir, params={}),
                 deadline=job_deadline,
             )
-            remaining = max(1.0, job_deadline - time.monotonic())
+            # The EXACT remainder, never a floor: `max(1.0, ...)` would hand a
+            # fresh second to a job that had already spent its budget on the
+            # upload, so a workload over `Limits.timeout_s` could still pass
+            # under a test that claims one absolute deadline. The dispatcher
+            # fails outright on a non-positive remainder; so does this.
+            remaining = job_deadline - time.monotonic()
+            assert remaining > 0, (
+                f"the upload consumed the whole {limits.timeout_s}s job budget"
+            )
             assert control.wait_for_done(timeout_s=remaining) == "ok"
             names = rt.read_output_disk(slot)
             assert "metadata.json" in names
