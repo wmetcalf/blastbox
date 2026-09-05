@@ -1296,3 +1296,67 @@ def test_a_gvisor_ledger_append_during_the_sweep_is_not_erased(tmp_path, monkeyp
         "an entry appended during the sweep was erased; nothing can ever reclaim that dir"
     )
     assert str(stuck) in ledger, "the still-stuck path must survive for the next sweep too"
+
+
+class TestTheDrainThreadsAreBounded:
+    """A sink's drain ends at EOF -- when the sandbox exits.
+
+    On a host where sandboxes wedge instead of exiting, one drain accumulates per restore for
+    the life of the process: the same unbounded-thread class as the FC copy workers (#154).
+    """
+
+    @staticmethod
+    def _stuck_sink(gs):
+        """A sink whose pipe never sees EOF, so its drain stays alive."""
+        return gs._StderrSink()
+
+    def test_drains_are_capped(self, monkeypatch):
+        from blastbox.host.runtime import gvisor_snapshot as gs
+
+        monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+        monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 4)
+
+        sinks = [self._stuck_sink(gs) for _ in range(20)]   # none of them ever sees EOF
+        try:
+            alive = [t for t in gs._LIVE_SINKS if t.is_alive()]
+            assert len(alive) <= 4, f"{len(alive)} drain threads accumulated past the cap"
+        finally:
+            for s in sinks:
+                s.close_write()
+
+    def test_past_the_cap_the_launch_still_proceeds(self, monkeypatch):
+        """The degradation that separates this from the FC copy cap: a copy is essential, so
+        that one REFUSES. This is diagnostics, so refusing would break warm launches to protect
+        a log. The sink degrades to DEVNULL and says so."""
+        import subprocess as _sp
+
+        from blastbox.host.runtime import gvisor_snapshot as gs
+
+        monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+        monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 1)
+
+        first = gs._StderrSink()
+        try:
+            second = gs._StderrSink()          # past the cap
+            assert second.degraded, "the sink should have degraded rather than refused"
+            assert second.write_fd == _sp.DEVNULL, (
+                "a degraded sink must hand the launch a usable fd, not a live pipe"
+            )
+            assert second.tail() == "", "a degraded sink has nothing to report"
+            second.close_write()               # must not blow up on DEVNULL
+        finally:
+            first.close_write()
+
+    def test_a_healthy_host_never_accumulates(self, monkeypatch):
+        """The control: sinks whose sandboxes exit must free their slots, or the cap would
+        eventually strangle a perfectly healthy host."""
+        from blastbox.host.runtime import gvisor_snapshot as gs
+
+        monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+        monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 2)
+
+        for _ in range(10):
+            sink = gs._StderrSink()
+            assert not sink.degraded, "a healthy host hit the cap; slots are not being freed"
+            sink.close_write()                 # EOF: the drain ends
+            sink._thread.join(timeout=5)

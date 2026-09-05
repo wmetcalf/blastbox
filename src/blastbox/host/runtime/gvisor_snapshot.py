@@ -90,6 +90,13 @@ class GvisorCommandError(RuntimeError):
     """
 
 
+# Live stderr drains. A drain ends when its sandbox exits, so a host whose sandboxes wedge
+# would otherwise accumulate one thread and two descriptors per restore forever.
+_MAX_LIVE_SINKS = 16
+_LIVE_SINKS: "list[threading.Thread]" = []
+_SINK_LOCK = threading.Lock()
+
+
 class _StderrSink:
     """A bounded sink for a DETACHED runsc launch's stderr.
 
@@ -118,6 +125,32 @@ class _StderrSink:
         self._max = max_bytes
         self._buf = bytearray()
         self._lock = threading.Lock()
+        self._degraded = False
+
+        # BOUND THE DRAIN THREADS. A sink's thread ends at EOF -- when the sandbox exits -- so
+        # on a host where sandboxes wedge instead of exiting, one accumulates per restore, for
+        # the life of the process. Same class as the FC copy-worker cap (#154).
+        #
+        # ...but the DEGRADATION differs, because the stakes do. A copy is essential: no copy,
+        # no slot, so that cap REFUSES. This is only diagnostics, so refusing would break warm
+        # launches to protect a log. Past the cap the launch proceeds with stderr discarded and
+        # says so once -- capacity over forensics, which is the right trade for the tier that
+        # is serving jobs.
+        with _SINK_LOCK:
+            _LIVE_SINKS[:] = [t for t in _LIVE_SINKS if t.is_alive()]
+            if len(_LIVE_SINKS) >= _MAX_LIVE_SINKS:
+                self._degraded = True
+                self._read_fd = -1
+                self.write_fd = subprocess.DEVNULL
+                self._closed = True
+                self._thread = threading.Thread(target=lambda: None, daemon=True)
+                self._thread.start()
+                _log.warning(
+                    "gvisor_snapshot: %d stderr drains are still stuck (sandboxes that never "
+                    "exited); launching with stderr discarded so the tier keeps serving",
+                    len(_LIVE_SINKS),
+                )
+                return
         self._read_fd, self.write_fd = os.pipe()
         self._closed = False
         self._thread = threading.Thread(
@@ -125,6 +158,8 @@ class _StderrSink:
         )
         try:
             self._thread.start()
+            with _SINK_LOCK:
+                _LIVE_SINKS.append(self._thread)
         except BaseException:
             # `Thread.start()` raises RuntimeError once the host is out of threads -- and the
             # pipe is already allocated by then. Without this, every async build retry would
@@ -155,6 +190,11 @@ class _StderrSink:
                 os.close(self._read_fd)
             except OSError:
                 pass
+
+    @property
+    def degraded(self) -> bool:
+        """True when the cap was hit and this launch runs with stderr discarded."""
+        return self._degraded
 
     def close_write(self) -> None:
         """Drop the PARENT's write end. The sandbox keeps its own dup, which is the point:
