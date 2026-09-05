@@ -27,43 +27,66 @@ jobs:
         run: pytest -q
 
   sandbox:
-    # The nsjail backend's tests skip in the plain `test` job -- nsjail is not packaged for
-    # Ubuntu, so no runner has it -- and it is installed on neither fleet host either (it
-    # lives inside the worker images). That block therefore ran NOWHERE: a regression in the
-    # sandbox argv, the seccomp policy wiring or the insecurity reasons would have shipped
-    # green. Same reasoning as pg-search below: provide the dependency and run them for real.
-    #
-    # Built from source because google/nsjail publishes no binaries (checked: 3.6, source
-    # only). The build takes seconds; the apt dependencies dominate.
+    # The nsjail and bwrap backends' tests skip in the plain `test` job -- neither binary is
+    # packaged on the runner, and neither is on the fleet hosts either (they live inside the
+    # worker images). That block therefore ran NOWHERE: a regression in the sandbox argv, the
+    # seccomp policy wiring or the insecurity reasons would have shipped green. Same reasoning
+    # as pg-search below: provide the dependencies and run them for real.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install
-        run: python -m pip install -e ".[host,dev]"
-      - name: Install bubblewrap
-        # The bwrap backend's tests skip for the same reason nsjail's did -- 26 of them on the
-        # first run of this job. bubblewrap IS packaged, so this is one apt line.
+      - name: Install bubblewrap and the seccomp binding
+        # A venv with --system-site-packages over the DISTRO python, not setup-python: the
+        # `seccomp` bindings ship only as a distro package (python3-seccomp), and without them
+        # `test_build_bpf_bytes_valid` skips and every real bwrap test forces
+        # _LIBSECCOMP_AVAILABLE=False -- so this job could stay green while BPF generation or
+        # the real `bwrap --seccomp <fd>` path was broken.
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q bubblewrap
+          sudo apt-get install -y -q bubblewrap python3-seccomp python3-venv
           bwrap --version
+          python3 -m venv --system-site-packages .venv
+          .venv/bin/python -c "import seccomp; print('seccomp binding OK')"
+          .venv/bin/pip install -q -e ".[host,dev]"
       - name: Build and install nsjail
+        # PINNED TO A COMMIT, not a tag: `git clone --branch` only selects a ref, it verifies
+        # nothing, so a moved or recreated tag would have this trusted job build and execute
+        # different source with no change here. This SHA is the one that was built and its
+        # tests run against locally before the job was written.
+        env:
+          NSJAIL_COMMIT: f78475530b46d0186111a9096b30725f816b55fe   # tag 3.6
         run: |
           sudo apt-get install -y -q autoconf bison flex gcc g++ git libprotobuf-dev \
             libnl-route-3-dev libtool make pkg-config protobuf-compiler
-          git clone -q --depth=1 --branch 3.6 https://github.com/google/nsjail /tmp/nsjail
+          git clone -q --filter=blob:none https://github.com/google/nsjail /tmp/nsjail
+          git -C /tmp/nsjail checkout -q "$NSJAIL_COMMIT"
+          got=$(git -C /tmp/nsjail rev-parse HEAD)
+          if [ "$got" != "$NSJAIL_COMMIT" ]; then
+            echo "nsjail checkout is $got, expected $NSJAIL_COMMIT" >&2; exit 1
+          fi
+          git -C /tmp/nsjail submodule update --init --recursive --depth=1
           make -C /tmp/nsjail -j"$(nproc)"
           sudo install -m 0755 /tmp/nsjail/nsjail /usr/local/bin/nsjail
           nsjail --help | head -1
-      - name: Pytest (sandbox backends, with nsjail present)
+      - name: Grant userns to bwrap and nsjail (scoped AppArmor profiles)
+        # Ubuntu 24.04 sets kernel.apparmor_restrict_unprivileged_userns=1, which blocks the
+        # user namespaces both backends need -- so without this the smoke-run tests and the
+        # selector tests skip and the job is green having exercised neither. The repo already
+        # ships scoped per-binary profiles for exactly this (deploy/apparmor/README.md); they
+        # grant `userns` to these two binaries only, leaving the host-wide restriction intact.
+        run: |
+          sudo cp deploy/apparmor/blastbox-bwrap deploy/apparmor/blastbox-nsjail /etc/apparmor.d/
+          sudo apparmor_parser -r -W /etc/apparmor.d/blastbox-bwrap
+          sudo apparmor_parser -r -W /etc/apparmor.d/blastbox-nsjail
+          sudo aa-status | grep blastbox || true
+          # Report, do not gate: the tests probe usability themselves and skip with a real
+          # reason, which is more informative than this step failing.
+          bwrap --unshare-user --uid 0 --ro-bind / / -- /bin/true \
+            && echo "bwrap userns OK" || echo "bwrap userns still blocked"
+      - name: Pytest (sandbox backends, with nsjail + bwrap present)
         # -rs so the log SAYS which tests still skip and why. A job added to stop tests
-        # skipping silently must not itself hide the next skip: unprivileged user namespaces
-        # may be restricted on the runner, and the smoke-run tests self-skip on a real probe
-        # if so -- that is a fact worth reading, not one to discover months later.
-        run: pytest -q -rs tests/worker/sandbox/
+        # skipping silently must not itself hide the next skip.
+        run: .venv/bin/pytest -q -rs tests/worker/sandbox/
 
   pg-search:
     # Perceptual-hash search is Postgres + pg_bktree only — there is no SQLite
