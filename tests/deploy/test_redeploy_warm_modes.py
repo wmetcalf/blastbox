@@ -18,6 +18,11 @@ SCRIPT = Path(__file__).resolve().parents[2] / "deploy" / "redeploy-warm.sh"
 
 _MIB = 1024 * 1024
 
+# WARM_TAG is required, so the tests name one. Nothing may assert `warmfix`:
+# that was the stale default, and an assertion mentioning it would pass for
+# the wrong reason -- or, negated, could no longer fail at all.
+TAG = "tagundertest"
+
 
 # Every knob this script reads. Inherited from the ambient shell, any of them
 # silently changes the scenario under test: `REDEPLOY_MODE=legacy-rebuild pytest`
@@ -57,12 +62,18 @@ def _clean_env(**env: str) -> dict[str, str]:
     return {**base, **env}
 
 
-def _run(**env: str) -> subprocess.CompletedProcess[str]:
+def _run(**env) -> subprocess.CompletedProcess[str]:
+    """Run the script with WARM_TAG supplied unless the test is about omitting it.
+
+    WARM_TAG is required (it used to default to `warmfix`, whose images are still
+    on toolz2), so every test that is about something ELSE has to name one.
+    """
+    env = {"WARM_TAG": TAG, **env}
     return subprocess.run(
         ["bash", str(SCRIPT)],
         capture_output=True,
         text=True,
-        env=_clean_env(**env),
+        env=_clean_env(**{k: v for k, v in env.items() if v is not None}),
         check=False,
     )
 
@@ -74,6 +85,83 @@ def _rootfs(tmp_path: Path, mib: int) -> Path:
     with (fc_dir / "rootfs.ext4").open("wb") as fh:
         fh.truncate(mib * _MIB)
     return fc_dir
+
+
+def test_a_missing_warm_tag_is_refused_rather_than_defaulted() -> None:
+    """`warmfix` was the default, and on toolz2 those images still EXIST.
+
+    redtusk:warmfix, clippyshot:warmfix and redtusk-cold-worker:warmfix are all
+    present on that host, so a default invocation there would have recreated the
+    warm tier onto a June build and succeeded. Failing closed is the only safe
+    behaviour, because the tag names what gets deployed.
+    """
+    p = _run(ENGINE="redtusk", WARM_TAG=None, REDEPLOY_CHECK_ONLY="1")
+    assert p.returncode != 0
+    assert "WARM_TAG" in p.stderr
+    # The point is not just the refusal: no stale tag may reach the image names.
+    assert "warmfix" not in p.stdout
+
+
+def test_recreate_does_not_demand_a_ref_it_will_not_use() -> None:
+    """Only legacy-rebuild builds a wheel; recreate deploys a published tag.
+
+    Requiring BLASTBOX_REF here would make the operator name a ref this run
+    never reads -- which the script would then log as the ref in use.
+    """
+    p = _run(ENGINE="redtusk", REDEPLOY_CHECK_ONLY="1")
+    assert p.returncode == 0, p.stderr
+    assert "ref=" not in p.stdout
+    assert TAG in p.stdout
+
+
+def test_legacy_rebuild_requires_the_ref_it_will_build_from() -> None:
+    p = _run(ENGINE="redtusk", REDEPLOY_MODE="legacy-rebuild", REDEPLOY_CHECK_ONLY="1")
+    assert p.returncode != 0
+    assert "BLASTBOX_REF" in p.stderr
+
+
+def test_a_ref_that_cannot_be_fetched_stops_before_anything_is_built(
+    tmp_path: Path,
+) -> None:
+    """`git fetch ... && git checkout ...` does not stop on a missing ref.
+
+    `set -e` deliberately does not fire for the left operand of `&&`, so the
+    fetch failed, the checkout was skipped, and the wheel was built from
+    WHATEVER tree the repo happened to be on -- while the line above logged the
+    ref it believed it had. The old default ref (`fix/fc-warm-entropy`) has since
+    been deleted from origin, so the DEFAULT invocation took exactly this path.
+
+    Asserting the source has no `&&` would prove nothing; this runs the script
+    with a git that fails the fetch and checks that the build never started.
+    """
+    bin_dir = _stub_bin(tmp_path)
+    log = tmp_path / "ran.log"
+    git = bin_dir / "git"
+    git.write_text(
+        "#!/bin/sh\n"
+        'for a in "$@"; do\n'
+        '  [ "$a" = fetch ] && { echo "fatal: couldn\'t find remote ref" >&2; exit 128; }\n'
+        f'  [ "$a" = checkout ] && echo "checkout $*" >> {log}\n'
+        "done\n"
+        "exit 0\n"
+    )
+    git.chmod(0o755)
+    docker = bin_dir / "docker"
+    docker.write_text(f'#!/bin/sh\necho "docker $*" >> {log}\nexit 0\n')
+    docker.chmod(0o755)
+
+    p = _run(
+        ENGINE="redtusk",
+        REDEPLOY_MODE="legacy-rebuild",
+        BLASTBOX_REF="a-branch-that-was-deleted",
+        FC_DIR=str(tmp_path / "no-such-fc"),
+        PATH=f"{bin_dir}:{os.environ['PATH']}",
+    )
+
+    assert p.returncode != 0, "a ref that cannot be fetched must stop the run"
+    assert "cannot fetch BLASTBOX_REF=a-branch-that-was-deleted" in p.stderr
+    # The real damage was downstream: it built and deployed from the wrong tree.
+    assert not log.exists(), f"ran past the failed fetch: {log.read_text()}"
 
 
 def test_an_unknown_mode_is_refused() -> None:
@@ -99,6 +187,7 @@ def test_the_rebuild_half_refuses_to_shrink_a_live_rootfs(tmp_path: Path) -> Non
     p = _run(
         ENGINE="redtusk",
         REDEPLOY_MODE="legacy-rebuild",
+        BLASTBOX_REF="refundertest",  # legacy-rebuild builds a wheel from it
         FC_DIR=str(_rootfs(tmp_path, 1536)),
         REDEPLOY_CHECK_ONLY="1",
     )
@@ -111,6 +200,7 @@ def test_a_shrink_is_possible_but_only_when_asked_for(tmp_path: Path) -> None:
     p = _run(
         ENGINE="redtusk",
         REDEPLOY_MODE="legacy-rebuild",
+        BLASTBOX_REF="refundertest",  # legacy-rebuild builds a wheel from it
         ALLOW_ROOTFS_SHRINK="1",
         FC_DIR=str(_rootfs(tmp_path, 1536)),
         REDEPLOY_CHECK_ONLY="1",
@@ -124,6 +214,7 @@ def test_a_rebuild_that_does_not_shrink_is_allowed(tmp_path: Path) -> None:
     p = _run(
         ENGINE="redtusk",
         REDEPLOY_MODE="legacy-rebuild",
+        BLASTBOX_REF="refundertest",  # legacy-rebuild builds a wheel from it
         FC_DIR=str(_rootfs(tmp_path, 1024)),
         REDEPLOY_CHECK_ONLY="1",
     )
@@ -137,6 +228,7 @@ def test_check_only_touches_nothing(tmp_path: Path) -> None:
     p = _run(
         ENGINE="redtusk",
         REDEPLOY_MODE="legacy-rebuild",
+        BLASTBOX_REF="refundertest",  # legacy-rebuild builds a wheel from it
         FC_DIR=str(fc_dir),
         REDEPLOY_CHECK_ONLY="1",
     )
@@ -182,9 +274,9 @@ def test_recreate_mode_never_reaches_the_rebuild_steps(tmp_path: Path) -> None:
     assert "compose " in logged, logged
     # The compose half is NOT superseded and must still have done its job.
     env_now = (compose_dir / ".env").read_text()
-    assert "REDTUSK_IMAGE=redtusk:warmfix" in env_now
+    assert f"REDTUSK_IMAGE=redtusk:{TAG}" in env_now
     assert "OTHER=keep" in env_now
-    assert (compose_dir / ".env.bak-warmfix").exists()
+    assert (compose_dir / f".env.bak-{TAG}").exists()
 
 
 def test_each_mode_advertises_the_rollback_paths_it_actually_leaves(
@@ -221,7 +313,7 @@ def test_each_mode_advertises_the_rollback_paths_it_actually_leaves(
     )
     assert p.returncode == 0, p.stderr
     assert "rootfs.ext4.bak " in p.stdout
-    assert "rootfs.ext4.bak-warmfix" not in p.stdout
+    assert f"rootfs.ext4.bak-{TAG}" not in p.stdout
     assert "rootfs.bak " in p.stdout
 
 

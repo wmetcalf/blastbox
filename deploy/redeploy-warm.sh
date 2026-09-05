@@ -78,16 +78,28 @@
 set -euo pipefail
 
 ENGINE="${ENGINE:?set ENGINE=clippyshot|redtusk|custom}"
+# The mode decides what is REQUIRED below, so it is validated first.
+MODE="${REDEPLOY_MODE:-recreate}"
+case "$MODE" in
+  recreate|legacy-rebuild) ;;
+  *) echo "unknown REDEPLOY_MODE=$MODE (recreate|legacy-rebuild)" >&2; exit 2 ;;
+esac
+
 # REQUIRED, not defaulted. The presets below are "the values verified on toolz2
-# 2026-06-19", and these two aged badly: BLASTBOX_REF pointed at
-# `fix/fc-warm-entropy`, a branch since DELETED, and WARM_TAG at `warmfix` --
-# whose images still exist on toolz2, so a default run there would have
-# recreated the warm tier onto a June build without failing. Naming the tag is
-# also what the recreate path already tells you to build with
-# (`blastbox build-images <repo> --tag $WARM_TAG`), so the two now cannot
-# disagree by accident.
+# 2026-06-19", and these two aged badly: WARM_TAG defaulted to `warmfix`, whose
+# images still exist on toolz2, so a default run there would have recreated the
+# warm tier onto a June build without failing anything; BLASTBOX_REF pointed at
+# `fix/fc-warm-entropy`, a branch since DELETED, which the fetch below could not
+# have checked out. Naming the tag is also what the recreate path already tells
+# you to build with (`blastbox build-images <repo> --tag $WARM_TAG`), so the two
+# now cannot disagree by accident.
 WARM_TAG="${WARM_TAG:?set WARM_TAG to the tag blastbox build-images published}"
-BLASTBOX_REF="${BLASTBOX_REF:?set BLASTBOX_REF to the blastbox ref to build the wheel from (legacy-rebuild), e.g. a release tag}"
+# Only legacy-rebuild builds a wheel. Demanding a ref in recreate mode would ask
+# the operator to name something this run never reads -- and it would then be
+# logged as the ref in use, which is exactly the false claim this change removes.
+if [ "$MODE" = legacy-rebuild ]; then
+  BLASTBOX_REF="${BLASTBOX_REF:?set BLASTBOX_REF to the blastbox ref to build the wheel from, e.g. a release tag}"
+fi
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
 # --- per-engine presets (the values verified on toolz2 2026-06-19) -------------
@@ -128,13 +140,11 @@ SUF="bak-${WARM_TAG}"
 FC_BIN_SRC="${FC_BIN_SRC:-}"   # optional: path to a patched firecracker (>=1.15.1) to swap in
 log(){ printf '\033[1;36m[redeploy-warm]\033[0m %s\n' "$*"; }
 
-log "engine=$ENGINE ref=$BLASTBOX_REF -> $WARM_IMAGE / $WARM_COLD_IMAGE"
-
-MODE="${REDEPLOY_MODE:-recreate}"
-case "$MODE" in
-  recreate|legacy-rebuild) ;;
-  *) echo "unknown REDEPLOY_MODE=$MODE (recreate|legacy-rebuild)" >&2; exit 2 ;;
-esac
+if [ "$MODE" = legacy-rebuild ]; then
+  log "engine=$ENGINE ref=$BLASTBOX_REF -> $WARM_IMAGE / $WARM_COLD_IMAGE"
+else
+  log "engine=$ENGINE -> $WARM_IMAGE / $WARM_COLD_IMAGE"
+fi
 
 # The rebuild half is opt-in, and the opt-in still does not license a shrink.
 # `build-images` preserves the size already in place; these presets do not, and
