@@ -77,16 +77,13 @@ def _force_delete_all(cfg, *, timeout_s: float = 20.0) -> tuple[list[str], list[
     run -- so it can never touch the fleet's containers, which live under the
     dispatcher's own root.
 
-    Needed because failing on a timeout only stops WAITING for the build: the
-    thread keeps running, its child `runsc` keeps going, and a stalled build can
-    leave a sandbox on the host and keep writing under tmp_path after the test
-    has gone.
-
-    A container counts as deleted only when `runsc delete` actually SUCCEEDS.
-    Appending every id regardless of exit status is how a cleanup that silently
-    failed would still report "force-deleted 3 containers" while three sandboxes
-    kept running -- the swallow-everything mistake `_best_effort_delete` was
-    fixed for upstream.
+    EVERY path that did not actually enumerate the host reports unconfirmed. A
+    failed listing, a listing that errored or timed out, one that is not JSON,
+    and one whose shape is not a container array are all indistinguishable from
+    "no containers" to a caller that only looks at the list -- and reporting
+    `nothing to clean up` while sandboxes are live is the same lie as reporting
+    an unchecked delete as a success. Only JSON `null`, which is what runsc
+    prints for an empty host, means empty.
     """
     import json as _json
     import subprocess as _sp
@@ -95,19 +92,24 @@ def _force_delete_all(cfg, *, timeout_s: float = 20.0) -> tuple[list[str], list[
     try:
         listed = _sp.run([*base, "list", "-format=json"], capture_output=True,
                          text=True, timeout=timeout_s, check=False)
-        # `runsc list -format=json` prints literal `null` when nothing is
-        # registered, which parses to None -- iterating that raised TypeError
-        # and turned the cleanup into a second failure. Measured on toolz3.
-        if listed.returncode != 0:
-            # A failed enumeration is NOT an empty host. Reporting "nothing to
-            # clean up" here would be the same lie as reporting an unchecked
-            # delete as a success: live sandboxes may remain and nobody is told.
-            return [], [f"<listing failed: rc={listed.returncode}>"]
-        containers = _json.loads(listed.stdout or "[]") or []
-        if not isinstance(containers, list):
-            return [], ["<listing was not a container array>"]
-    except Exception:  # noqa: BLE001 - cleanup is best effort by definition
-        return [], []
+    except Exception as exc:  # noqa: BLE001 - timeout, missing binary, ...
+        return [], [f"<listing errored: {type(exc).__name__}>"]
+    if listed.returncode != 0:
+        return [], [f"<listing failed: rc={listed.returncode}>"]
+    raw = (listed.stdout or "").strip()
+    try:
+        parsed = _json.loads(raw) if raw else None
+    except Exception as exc:  # noqa: BLE001
+        return [], [f"<listing was not JSON: {type(exc).__name__}>"]
+    if parsed is None:
+        containers: list = []          # runsc prints `null` for an empty host
+    elif isinstance(parsed, list):
+        containers = parsed
+    else:
+        # `{}`, `false`, `0`, `""` are falsy but are NOT an empty host; an
+        # `or []` fallback would have accepted every one of them as clean.
+        return [], ["<listing was not a container array>"]
+
     deleted: list[str] = []
     unconfirmed: list[str] = []
     for entry in containers:
@@ -124,6 +126,41 @@ def _force_delete_all(cfg, *, timeout_s: float = 20.0) -> tuple[list[str], list[
             continue
         (deleted if gone.returncode == 0 else unconfirmed).append(cid)
     return deleted, unconfirmed
+
+
+def _sweep_until_clean(
+    cfg, is_live, *, attempts: int = 3, settle_s: float = 1.0
+) -> tuple[list[str], list[str], bool]:
+    """Repeatedly clean up after a producer that cannot be cancelled.
+
+    Returns (deleted, unconfirmed, producer_was_live). One pass is not enough:
+    a container can be registered AFTER an enumeration, so a single sweep can
+    report a clean host while the builder goes on creating one.
+
+    ``producer_was_live`` records whether the builder was running DURING a
+    sweep, not merely at the end. Checking only afterwards misses the case where
+    it registers a container after the last listing and then exits: the final
+    `is_alive()` is False and the host reads clean though nothing swept it.
+
+    An id unconfirmed on one pass and deleted on a later one is reconciled --
+    otherwise the report names a sandbox as possibly live after it was removed.
+    """
+    deleted: list[str] = []
+    unconfirmed: list[str] = []
+    producer_was_live = False
+    for _ in range(attempts):
+        live_now = bool(is_live())
+        producer_was_live = producer_was_live or live_now
+        found, unsure = _force_delete_all(cfg)
+        # De-duplicated: an id is one container however many sweeps see it, and
+        # a report naming it twice reads as two sandboxes.
+        deleted.extend(f for f in found if f not in deleted)
+        unconfirmed = [u for u in unconfirmed if u not in found]
+        unconfirmed.extend(u for u in unsure if u not in deleted)
+        if not live_now and not found:
+            break
+        time.sleep(settle_s)
+    return deleted, unconfirmed, producer_was_live
 
 
 def _warm_rootfs() -> str | None:
@@ -245,30 +282,20 @@ def test_gvisor_snapshot_roundtrip(tmp_path: Path) -> None:
         # Do not just stop waiting: tear down whatever the stalled build left
         # under THIS test's private root, or a sandbox outlives the run and
         # keeps writing into tmp_path after it is gone.
-        # Sweep more than once. The builder is still running -- nothing can
-        # cancel it -- so a container may be registered AFTER the first
-        # enumeration, and a single pass would report "nothing to clean up"
-        # while the thread went on creating one. Bounded, and it says plainly
-        # when the builder outlives the sweep.
-        deleted: list[str] = []
-        unconfirmed: list[str] = []
-        for _ in range(3):
-            found, unsure = _force_delete_all(cfg)
-            deleted.extend(found)
-            unconfirmed.extend(unsure)
-            if not builder.is_alive() and not found:
-                break
-            time.sleep(1.0)
+        # Sweep more than once, and record whether the producer was live DURING
+        # a sweep -- see `_sweep_until_clean`.
+        deleted, unconfirmed, producer_was_live = _sweep_until_clean(
+            cfg, builder.is_alive
+        )
         detail = f"force-deleted {deleted}" if deleted else "nothing to clean up"
-        if builder.is_alive():
-            detail += (
-                "; the build thread is STILL RUNNING and cannot be cancelled, so it "
-                "may yet create one -- treat this host as dirty"
-            )
         if unconfirmed:
-            # Loudly: these may still be running, and on a fleet node that is
-            # the next run's problem.
-            detail += f"; COULD NOT confirm deletion of {unconfirmed} -- may still be live"
+            detail += f"; COULD NOT confirm {unconfirmed} -- may still be live"
+        if producer_was_live or builder.is_alive():
+            detail += (
+                "; the build thread was RUNNING during the sweep and cannot be "
+                "cancelled, so it may have registered a container after the last "
+                "listing -- treat this host as dirty"
+            )
         pytest.fail(
             f"warm snapshot build did not finish within {build_s}s "
             f"(set BLASTBOX_SNAPSHOT_BUILD_S to allow longer); {detail}"
