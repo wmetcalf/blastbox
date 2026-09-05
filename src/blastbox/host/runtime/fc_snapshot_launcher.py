@@ -369,12 +369,22 @@ def _default_copy_outdisk(src: Path, dst: Path) -> None:
     # ``--reflink=auto`` falls back to a full copy on filesystems without CoW (ext4,
     # tmpfs), so this is safe everywhere and only speeds up reflink-capable hosts. On
     # any failure (no ``cp``, odd platform) fall back to a plain Python copy.
+    from blastbox.host.runtime.firecracker import disk_timeout_s
+
     try:
         subprocess.run(
             ["cp", "--reflink=auto", str(src), str(dst)],
             check=True,
             capture_output=True,
+            # Bounded for the same reason as make_ext4: this is the per-slot restore path.
+            timeout=disk_timeout_s(),
         )
+    except subprocess.TimeoutExpired:
+        # Deliberately NOT falling back. The fallback exists for "no cp, odd platform"; a cp
+        # that TIMED OUT means the filesystem itself is stalled, and copying the same bytes
+        # again in Python would stall the same way -- spending the budget twice and turning a
+        # bounded failure back into a hang. Let the spawn fail and be retried.
+        raise
     except (OSError, subprocess.CalledProcessError):
         shutil.copyfile(src, dst)
 

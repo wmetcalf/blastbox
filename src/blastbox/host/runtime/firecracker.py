@@ -411,6 +411,19 @@ def firecracker_available(cfg: FCConfig | None = None) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def disk_timeout_s() -> float:
+    """Bound (seconds) for the host disk helpers this tier shells out to.
+
+    Generous on purpose -- `mkfs.ext4` on a multi-GiB image and a non-reflink copy of a
+    snapshot both legitimately take a while. The point is that they are BOUNDED: each runs on
+    the per-slot spawn path, where an unbounded external command turns a stalled filesystem
+    into a spawn thread that never returns.
+    """
+    from blastbox.host.runtime.env_knobs import positive_float_env
+
+    return positive_float_env(os.environ, "BLASTBOX_FC_DISK_TIMEOUT_S", 600.0)
+
+
 def make_ext4(path: Path, size_mib: int) -> None:
     """Create a sparse ext4 image at ``path`` of ``size_mib`` MiB.
 
@@ -447,6 +460,13 @@ def make_ext4(path: Path, size_mib: int) -> None:
         ],
         check=True,
         capture_output=True,
+        # BOUNDED. This runs on the per-slot SPAWN path, and `subprocess.run` has no default
+        # timeout -- so a stalled filesystem (a wedged overlay/NFS mount, a device error)
+        # blocked the spawning thread with nothing to time it out. The pool survives that but
+        # not for free: `stop()` reports "wedged spawn?" and the in-flight spawn stays
+        # uncommitted, holding node RAM/vCPU budget that no live worker is using. The sibling
+        # disk helpers here (debugfs rdump, e2fsck) were already bounded; this one was not.
+        timeout=disk_timeout_s(),
     )
 
 
