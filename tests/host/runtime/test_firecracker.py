@@ -1507,6 +1507,16 @@ class TestFirecrackerLiveBoot:
         # a confusing trust error instead of a verdict. Measured on toolz3
         # against /var/lib/redtusk-fc.
         engine = os.environ.get("BLASTBOX_FC_TEST_ENGINE", "probe")
+        if engine != "probe" and not os.environ.get("BLASTBOX_FC_MEM_MIB", "").strip():
+            # FCConfig falls back to 512 MiB, on which the redtusk JVM cannot
+            # even commit its heap -- the run comes back `engine_error` and
+            # reads like a broken worker rather than a guest that was never
+            # given the deployment's allocation. The FC overlay sets 2048,
+            # titanarum's 4608.
+            pytest.skip(
+                f"BLASTBOX_FC_TEST_ENGINE={engine} needs BLASTBOX_FC_MEM_MIB "
+                "(what the deployment gives the guest; the default is too small)"
+            )
 
         # Staged BEFORE the microVM is spawned. Reading it afterwards put an
         # unreadable path's exception between spawn() and the try/finally, so
@@ -1560,10 +1570,18 @@ class TestFirecrackerLiveBoot:
 
         try:
             control = rt.host_warm_control(slot)
+            # ONE absolute deadline across upload and execution, the way the
+            # dispatcher does it. `signal_go` streams the input and is unbounded
+            # without a deadline -- and it runs BEFORE wait_for_done's timeout
+            # starts, so a guest that reads slowly could hang this test
+            # indefinitely with a live VM attached.
+            job_deadline = time.monotonic() + float(limits.timeout_s)
             control.signal_go(
-                WarmJobSpec(input_path=src, output_dir=slot.output_dir, params={})
+                WarmJobSpec(input_path=src, output_dir=slot.output_dir, params={}),
+                deadline=job_deadline,
             )
-            assert control.wait_for_done(timeout_s=float(limits.timeout_s)) == "ok"
+            remaining = max(1.0, job_deadline - time.monotonic())
+            assert control.wait_for_done(timeout_s=remaining) == "ok"
             names = rt.read_output_disk(slot)
             assert "metadata.json" in names
             envelope = validate_worker_output(
