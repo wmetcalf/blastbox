@@ -1392,6 +1392,25 @@ class TestWorkerRuntimeEnvSelection:
 # ---------------------------------------------------------------------------
 
 
+def _live_engine() -> str:
+    """The engine this rootfs carries, with the prerequisites it needs enforced.
+
+    Shared by every live test that WARMS the engine, not just the round-trip:
+    the readiness test spawns the same fleet guest, so a guard on the
+    round-trip alone let the class fail at the sibling first -- the guest never
+    warms on FCConfig's 512 MiB default and READY never arrives.
+    """
+    engine = os.environ.get("BLASTBOX_FC_TEST_ENGINE", "").strip() or "probe"
+    if engine != "probe" and not os.environ.get("BLASTBOX_FC_MEM_MIB", "").strip():
+        # 512 MiB is the allocation on which the redtusk JVM cannot commit its
+        # heap; the FC overlay gives 2048, titanarum's 4608.
+        pytest.skip(
+            f"BLASTBOX_FC_TEST_ENGINE={engine} needs BLASTBOX_FC_MEM_MIB "
+            "(what the deployment gives the guest; the default is too small)"
+        )
+    return engine
+
+
 def _live_warmup_s() -> float:
     """Seconds to wait for READY, from BLASTBOX_FC_TEST_WARMUP_S.
 
@@ -1472,6 +1491,7 @@ class TestFirecrackerLiveBoot:
         """
         import time
 
+        _live_engine()   # same fleet prerequisites: this test warms the engine too
         warmup_s = _live_warmup_s()
         cfg = FCConfig.from_env(scratch_root=fc_scratch)
         rt = FirecrackerSlotRuntime(cfg)
@@ -1506,20 +1526,7 @@ class TestFirecrackerLiveBoot:
         # `engine mismatch: expected 'probe', worker reported 'redtusk'` --
         # a confusing trust error instead of a verdict. Measured on toolz3
         # against /var/lib/redtusk-fc.
-        # `.strip() or` -- an exported-but-empty value is effectively unset, and
-        # treating "" as a fleet engine skipped for prerequisites the probe path
-        # does not need, or reached the trust gate expecting an empty engine.
-        engine = os.environ.get("BLASTBOX_FC_TEST_ENGINE", "").strip() or "probe"
-        if engine != "probe" and not os.environ.get("BLASTBOX_FC_MEM_MIB", "").strip():
-            # FCConfig falls back to 512 MiB, on which the redtusk JVM cannot
-            # even commit its heap -- the run comes back `engine_error` and
-            # reads like a broken worker rather than a guest that was never
-            # given the deployment's allocation. The FC overlay sets 2048,
-            # titanarum's 4608.
-            pytest.skip(
-                f"BLASTBOX_FC_TEST_ENGINE={engine} needs BLASTBOX_FC_MEM_MIB "
-                "(what the deployment gives the guest; the default is too small)"
-            )
+        engine = _live_engine()
 
         # Staged BEFORE the microVM is spawned. Reading it afterwards put an
         # unreadable path's exception between spawn() and the try/finally, so
