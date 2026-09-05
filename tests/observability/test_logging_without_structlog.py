@@ -17,8 +17,31 @@ import pytest
 _SRC = str(Path(__file__).resolve().parents[2] / "src")
 
 # `sys.modules[name] = None` makes a later `import name` raise ImportError. That is how these
-# tests simulate an install without the extra WITHOUT uninstalling anything.
-_BLOCK = "import sys; sys.modules['structlog'] = None\n"
+# tests simulate an install without the extras WITHOUT uninstalling anything.
+#
+# EVERY optional distribution, not just structlog. Blocking one module is not a lean install: the
+# first version of this test blocked structlog alone, went green, and the real lean install on
+# toolz2 still failed -- on prometheus_client, the very next import in the same package. A
+# simulation narrower than the environment it claims to reproduce will keep passing while the
+# thing it is about stays broken.
+_OPTIONAL_MODULES = (
+    "structlog",
+    "prometheus_client",
+    "fastapi",
+    "starlette",
+    "uvicorn",
+    "multipart",
+    "psycopg",
+    "psycopg_pool",
+    "redis",
+    "pyzipper",
+    "cryptography",
+    "boto3",
+    "botocore",
+)
+_BLOCK = "import sys\n" + "".join(
+    f"sys.modules[{m!r}] = None\n" for m in _OPTIONAL_MODULES
+)
 
 
 def _run(snippet: str) -> subprocess.CompletedProcess[str]:
