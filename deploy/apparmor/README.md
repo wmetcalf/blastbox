@@ -12,11 +12,27 @@ These two profiles grant **only** the `userns` capability to **one specific bina
 host-wide restriction stays in force for everything else. Reboot-persistent.
 
 ```sh
-# adjust the binary paths inside each profile first if `which bwrap`/`which nsjail` differ
-sudo cp blastbox-bwrap blastbox-nsjail /etc/apparmor.d/
+# adjust the binary paths inside each profile first if `which bwrap`/`which nsjail`/`which runsc` differ
+sudo cp blastbox-bwrap blastbox-nsjail blastbox-runsc /etc/apparmor.d/
 sudo apparmor_parser -r -W /etc/apparmor.d/blastbox-bwrap
 sudo apparmor_parser -r -W /etc/apparmor.d/blastbox-nsjail
-sudo aa-status | grep blastbox          # verify both are loaded
+sudo apparmor_parser -r -W /etc/apparmor.d/blastbox-runsc      # only if you run runsc ROOTLESS
+sudo grep -E '^blastbox-' /sys/kernel/security/apparmor/profiles   # name AND mode of each
+```
+
+`blastbox-runsc` is needed only for **rootless** runsc; run as root (the usual Docker
+`--runtime=runsc` path) it is exempt from the restriction and the profile is unnecessary.
+Without it, a rootless `runsc run` fails with
+
+```
+cannot create gofer process: gofer: fork/exec /proc/self/exe: permission denied
+```
+
+which never mentions AppArmor. The kernel does, and is worth checking first
+(`sudo dmesg -T | grep -i apparmor`):
+
+```
+apparmor="DENIED" operation="exec" profile="unprivileged_userns" name="/proc/self/exe" comm="runsc"
 ```
 
 Verify it took effect (test the **binary**, not `unshare` — the grant is per-binary):
@@ -43,7 +59,8 @@ without lowering it for anything else.
 
 **Not needed for** `firecracker` (a KVM hypervisor — no user namespaces), `nono` (Landlock needs no
 userns), or the `container` backend (trusts the enclosing OCI boundary). It is needed for the
-`bwrap`/`nsjail` backends and for `runsc` run rootless. See **[../../docs/DEPLOYMENT.md](../../docs/DEPLOYMENT.md)**.
+`bwrap`/`nsjail` backends and for `runsc` run rootless — which is why there is a profile for each
+of those three, `runsc` included. See **[../../docs/DEPLOYMENT.md](../../docs/DEPLOYMENT.md)**.
 
 ---
 
