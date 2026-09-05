@@ -1502,27 +1502,36 @@ class TestFirecrackerLiveBoot:
         src = Path(fc_scratch) / f"input{suffix}"
         src.write_bytes(payload)
 
+        # Deadlines from the CONFIGURED budgets, not hardcoded 30s. A fleet
+        # engine can be well inside its own limits and still take longer than
+        # that to warm or to run: `Limits.timeout_s` defaults to 120, and
+        # `scripts/fc_clippyshot_check.py` deliberately allows 45s to warm and
+        # 120s to execute. Hardcoding 30 made a valid slower workload look like
+        # a failure of the tier.
+        limits = Limits.from_env()
+        warmup_s = float(os.environ.get("BLASTBOX_FC_TEST_WARMUP_S", "45"))
+
         cfg = FCConfig.from_env(scratch_root=fc_scratch)
         rt = FirecrackerSlotRuntime(cfg)
         slot = rt.spawn()
-        deadline = time.monotonic() + 30.0
+        deadline = time.monotonic() + warmup_s
         while time.monotonic() < deadline and not rt.is_ready(slot):
             time.sleep(0.5)
-        assert rt.is_ready(slot), "guest never signalled READY"
+        assert rt.is_ready(slot), f"guest never signalled READY within {warmup_s}s"
 
         try:
             control = rt.host_warm_control(slot)
             control.signal_go(
                 WarmJobSpec(input_path=src, output_dir=slot.output_dir, params={})
             )
-            assert control.wait_for_done(timeout_s=30.0) == "ok"
+            assert control.wait_for_done(timeout_s=float(limits.timeout_s)) == "ok"
             names = rt.read_output_disk(slot)
             assert "metadata.json" in names
             envelope = validate_worker_output(
                 output_dir=slot.output_dir,
                 input_sha256=sha,
                 engine=engine,
-                limits=Limits.from_env(),
+                limits=limits,
             )
             assert envelope.status == "ok"
             assert envelope.input_sha256 == sha
