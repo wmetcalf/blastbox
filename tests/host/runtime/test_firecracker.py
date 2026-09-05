@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
 import socket
 import struct
 import subprocess
@@ -66,10 +67,43 @@ from blastbox.host.runtime.firecracker import (
 
 HAS_FC_HOST: bool = firecracker_available()
 
-_LIVE_FC_REASON = (
-    "needs firecracker binary + /dev/kvm + vmlinux kernel + rootfs "
-    "(run on a FC-capable host such as toolz2)"
-)
+
+def _live_fc_skip_reason() -> str:
+    """Why the live tests are not running HERE, distinguishing the two very different causes.
+
+    The old reason was one fixed string: "needs firecracker binary + /dev/kvm + vmlinux kernel
+    + rootfs (run on a FC-capable host such as toolz2)". Run the suite ON toolz2 -- which has
+    firecracker, /dev/kvm and the images -- and all three live tests skip, telling you to go to
+    toolz2. The missing piece is the BLASTBOX_FC_* configuration that `FCConfig.from_env()`
+    needs, and no part of the message says so, so the gate reads as "wrong host" on the right
+    host. Measured while verifying a merge on real hardware; it cost a detour through the
+    images before the environment turned out to be the answer.
+
+    Kept as two separate probes rather than one, because they answer different questions and
+    only the pair can tell "this box cannot run Firecracker" apart from "this box can, but you
+    have not told the tests where the kernel and rootfs are".
+    """
+    fc_bin = os.environ.get("BLASTBOX_FC_BIN", "").strip() or "firecracker"
+    if not shutil.which(fc_bin) and not os.access(fc_bin, os.X_OK):
+        return f"no firecracker binary ({fc_bin}) -- not a Firecracker-capable host"
+    if not Path("/dev/kvm").exists():
+        return "no /dev/kvm -- not a Firecracker-capable host"
+    missing = [v for v in ("BLASTBOX_FC_KERNEL", "BLASTBOX_FC_ROOTFS")
+               if not os.environ.get(v, "").strip()]
+    if missing:
+        return (
+            f"this host HAS firecracker and /dev/kvm; {' and '.join(missing)} "
+            "must point at a kernel and a rootfs built from THIS library "
+            "(a guest older than the current READY protocol boots and then times out)"
+        )
+    return (
+        "firecracker + /dev/kvm + BLASTBOX_FC_* are all present but "
+        "firecracker_available() is False -- check the binary version and that the "
+        "configured kernel/rootfs paths exist"
+    )
+
+
+_LIVE_FC_REASON = _live_fc_skip_reason()
 
 
 # ---------------------------------------------------------------------------
@@ -1676,3 +1710,64 @@ def test_a_corrupt_image_is_still_the_guests_fault(tmp_path, monkeypatch):
     with pytest.raises(_sp.CalledProcessError) as ei:
         rdump_ext4(image, dest, 1 << 20)
     assert getattr(ei.value, "host_io", False) is False
+
+
+class TestTheLiveGateSaysWhatIsActuallyMissing:
+    """A skip reason is the only thing an operator gets when a test does not run, so a reason
+    that names the wrong precondition is worse than a vague one: it sends them somewhere else.
+
+    The old fixed string told everyone to "run on a FC-capable host such as toolz2" -- including
+    people already ON toolz2, where the live tests skip because BLASTBOX_FC_KERNEL/ROOTFS are
+    unset, not because the host lacks anything.
+    """
+
+    def _reason(self, monkeypatch, *, has_bin: bool, has_kvm: bool, env: dict) -> str:
+        import blastbox.host.runtime.firecracker as fc  # noqa: F401
+        import tests.host.runtime.test_firecracker as mod
+
+        monkeypatch.setattr(mod.shutil, "which", lambda _n: "/usr/local/bin/firecracker" if has_bin else None)
+        monkeypatch.setattr(mod.os, "access", lambda *_a, **_k: has_bin)
+        real_exists = Path.exists
+        monkeypatch.setattr(
+            mod.Path, "exists",
+            lambda self: has_kvm if str(self) == "/dev/kvm" else real_exists(self),
+        )
+        for k in ("BLASTBOX_FC_KERNEL", "BLASTBOX_FC_ROOTFS", "BLASTBOX_FC_BIN"):
+            monkeypatch.delenv(k, raising=False)
+        for k, v in env.items():
+            monkeypatch.setenv(k, v)
+        return mod._live_fc_skip_reason()
+
+    def test_a_host_without_firecracker_is_told_that(self, monkeypatch) -> None:
+        reason = self._reason(monkeypatch, has_bin=False, has_kvm=True, env={})
+        assert "not a Firecracker-capable host" in reason
+
+    def test_a_host_without_kvm_is_told_that(self, monkeypatch) -> None:
+        reason = self._reason(monkeypatch, has_bin=True, has_kvm=False, env={})
+        assert "/dev/kvm" in reason
+        assert "not a Firecracker-capable host" in reason
+
+    def test_a_capable_but_unconfigured_host_is_told_the_variables(self, monkeypatch) -> None:
+        """The toolz2 case: everything is installed and the tests still skip."""
+        reason = self._reason(monkeypatch, has_bin=True, has_kvm=True, env={})
+        assert "BLASTBOX_FC_KERNEL" in reason and "BLASTBOX_FC_ROOTFS" in reason
+        assert "HAS firecracker" in reason
+        assert "not a Firecracker-capable host" not in reason, (
+            "telling a capable host it is incapable is the bug this replaces"
+        )
+
+    def test_a_half_configured_host_names_only_what_is_missing(self, monkeypatch) -> None:
+        reason = self._reason(
+            monkeypatch, has_bin=True, has_kvm=True, env={"BLASTBOX_FC_KERNEL": "/k"}
+        )
+        assert "BLASTBOX_FC_ROOTFS" in reason
+        assert "BLASTBOX_FC_KERNEL" not in reason
+
+    def test_a_configured_host_that_still_fails_points_at_version_and_paths(
+        self, monkeypatch
+    ) -> None:
+        reason = self._reason(
+            monkeypatch, has_bin=True, has_kvm=True,
+            env={"BLASTBOX_FC_KERNEL": "/k", "BLASTBOX_FC_ROOTFS": "/r"},
+        )
+        assert "version" in reason and "paths exist" in reason
