@@ -1468,14 +1468,6 @@ class TestFirecrackerLiveBoot:
         from blastbox.limits import Limits
         from blastbox.worker.warm import WarmJobSpec
 
-        cfg = FCConfig.from_env(scratch_root=fc_scratch)
-        rt = FirecrackerSlotRuntime(cfg)
-        slot = rt.spawn()
-        deadline = time.monotonic() + 30.0
-        while time.monotonic() < deadline and not rt.is_ready(slot):
-            time.sleep(0.5)
-        assert rt.is_ready(slot), "guest never signalled READY"
-
         # The rootfs decides the engine, and every fleet rootfs carries a REAL
         # engine (redtusk, titanarum, clippyshot) rather than the probe that
         # `deploy/firecracker/build-rootfs.sh` bakes. Hardcoding "probe" made
@@ -1485,16 +1477,39 @@ class TestFirecrackerLiveBoot:
         # against /var/lib/redtusk-fc.
         engine = os.environ.get("BLASTBOX_FC_TEST_ENGINE", "probe")
 
-        # A real engine needs a real document; the probe takes any bytes.
+        # Staged BEFORE the microVM is spawned. Reading it afterwards put an
+        # unreadable path's exception between spawn() and the try/finally, so
+        # the VM was never reaped -- a live Firecracker process left behind
+        # while the fixture deleted its scratch directory.
+        #
+        # The SUFFIX is preserved: `_signal_go_inner` forwards the staged
+        # basename to the guest, and extension-sensitive engines detect type
+        # from it (ClippyShot's own check stages `input.docx`), so flattening a
+        # supplied .docx to input.bin would test misdetection rather than the
+        # rootfs. The name is taken as a suffix only -- never the supplied
+        # path's directory -- so nothing outside the scratch dir is written.
         supplied = os.environ.get("BLASTBOX_FC_TEST_INPUT", "").strip()
-        payload = (
-            Path(supplied).read_bytes()
-            if supplied
-            else b"live-fc-job-roundtrip-" + b"Z" * 2048
-        )
+        if supplied:
+            source = Path(supplied)
+            if not source.is_file():
+                pytest.skip(f"BLASTBOX_FC_TEST_INPUT is not a readable file: {source}")
+            payload = source.read_bytes()
+            suffix = "".join(source.suffixes[-1:])  # ".pdf", never a path
+        else:
+            payload = b"live-fc-job-roundtrip-" + b"Z" * 2048
+            suffix = ".bin"
         sha = hashlib.sha256(payload).hexdigest()
-        src = Path(fc_scratch) / "input.bin"
+        src = Path(fc_scratch) / f"input{suffix}"
         src.write_bytes(payload)
+
+        cfg = FCConfig.from_env(scratch_root=fc_scratch)
+        rt = FirecrackerSlotRuntime(cfg)
+        slot = rt.spawn()
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline and not rt.is_ready(slot):
+            time.sleep(0.5)
+        assert rt.is_ready(slot), "guest never signalled READY"
+
         try:
             control = rt.host_warm_control(slot)
             control.signal_go(
