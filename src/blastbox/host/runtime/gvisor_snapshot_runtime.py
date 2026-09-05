@@ -18,6 +18,8 @@ import tarfile
 import threading
 import time
 import uuid
+
+from blastbox.host.runtime.env_knobs import positive_float_env
 from pathlib import Path
 from typing import Callable
 
@@ -378,7 +380,14 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
 
     snapshot_parent = resolve_mem_dir() or Path(gcfg.root).parent
     base_dir = _secure_snapshot_base(snapshot_parent / "gvisor-snapshot")
-    mgr = SnapshotManager(base_dir, backend, ack_capable=ack_capable)
+    # The readiness budget was a hard-coded 120s that no caller passed and no knob
+    # reached, while the failure it produces tells the operator to raise a DIFFERENT
+    # variable (issue #147). A slow-but-healthy base -- a cold OCR/soffice warm-up on a
+    # loaded node -- could not be accommodated at all.
+    mgr = SnapshotManager(
+        base_dir, backend, ack_capable=ack_capable,
+        ready_timeout_s=positive_float_env(os.environ, "BLASTBOX_SNAPSHOT_READY_S", 120.0),
+    )
     return GvisorSnapshotSlotRuntime(mgr, settle_s=_settle(), ack_capable=ack_capable)
 
 

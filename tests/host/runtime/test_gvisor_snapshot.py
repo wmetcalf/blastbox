@@ -819,7 +819,14 @@ class TestReadyTimeoutReportsTheBreadcrumb:
 
         msg = str(ei.value)
         assert "not READY" in msg
-        assert msg.rstrip().endswith(")"), f"a trailing empty cause was appended: {msg}"
+        # The knob hint is expected; an empty CAUSE is not. Anchor on the ctrl dir being
+        # followed straight by the hint, so a stray ": " with nothing after it still fails.
+        assert "); " not in msg and ": \n" not in msg, (
+            f"a trailing empty cause was appended: {msg}"
+        )
+        assert "BLASTBOX_SNAPSHOT_READY_S" in msg, (
+            "a timeout with no recorded cause must still say which knob governs it"
+        )
 
     def test_a_worker_written_cause_cannot_smuggle_control_characters(self, tmp_path):
         """ctrl/ is bind-mounted 0o777 and this string is written by the sandboxed worker.
