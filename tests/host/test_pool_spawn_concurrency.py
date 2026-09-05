@@ -14,7 +14,6 @@ from __future__ import annotations
 import threading
 import time
 
-import pytest
 
 from blastbox.host.pool import WarmPool
 from blastbox.host.pool_config import PoolConfig
@@ -70,19 +69,74 @@ def test_concurrency_overlaps_spawns():
     assert rt.max_in_flight <= 4, f"must not exceed the configured cap, saw {rt.max_in_flight}"
 
 
-@pytest.mark.skip(reason="VACUOUS: WarmPool.__init__ clamps warm_size to concurrent_ceiling "
-                         "(pool.py:404), so warm_size=10/ceiling=4 becomes target=4 and the "
-                         "overshoot this claims to test is unreachable. Verified: deleting BOTH "
-                         "the headroom clamp and the in-flight ceiling check still passes. "
-                         "Rewrite against a real overshoot before trusting it.")
-def test_ceiling_is_never_breached_under_concurrent_spawning():
-    """VACUOUS -- see skip reason. Kept visible rather than deleted so the gap stays on the record."""
+def test_ceiling_holds_when_batches_overlap():
+    """The reservation counter, against the caller it exists to defend against.
+
+    The previous version of this test asked for warm_size=10 with ceiling=4 and
+    asserted the pool stayed at 4. `WarmPool.__init__` clamps warm_size DOWN to
+    the ceiling, so the target was 4 all along and no overshoot was ever
+    attempted: deleting both the headroom clamp and the in-flight check left it
+    passing. It was skipped as vacuous rather than deleted, with a note to
+    rewrite it against a real overshoot. This is that rewrite.
+
+    `_spawn_batch_concurrent` documents `_spawns_in_flight` as defensive -- the
+    maintenance thread waits for each batch, so today's batches cannot overlap
+    and the counter is unreachable through `tick()`. It exists for "a future
+    caller which issues batches without waiting", so the test IS that caller:
+    two batches are issued concurrently, each asking for the whole ceiling.
+
+    Without the reservation counter, both batches see an empty pool, both
+    reserve the full ceiling, and the node ends up with twice the workers it is
+    allowed -- which on a real tier is twice the RAM.
+    """
     rt = _SlowSpawnRuntime(delay=0.15)
-    pool = WarmPool(runtime=rt, warm_size=10, concurrent_ceiling=4,
-                    spawn_rate_limit=1000.0, spawn_concurrency=8)
-    _fill(pool, deadline_s=6.0)
-    assert len(pool._slots) <= 4, f"ceiling breached: {len(pool._slots)} slots"
-    assert rt.max_in_flight <= 4, f"more spawns in flight than the ceiling allows: {rt.max_in_flight}"
+    ceiling = 4
+    pool = WarmPool(runtime=rt, warm_size=ceiling, concurrent_ceiling=ceiling,
+                    spawn_rate_limit=1000.0, spawn_concurrency=ceiling)
+
+    # Watch the RESERVATIONS too, not just the slots that get published. Each
+    # one is an intent to create a worker, and the pre-spawn gate declining them
+    # later still means the pool briefly promised the node twice its ceiling.
+    peak_reserved = 0
+    real_spawn = rt.spawn
+
+    def watched_spawn():
+        nonlocal peak_reserved
+        peak_reserved = max(peak_reserved, pool._spawns_in_flight)
+        return real_spawn()
+
+    rt.spawn = watched_spawn
+
+    barrier = threading.Barrier(2, timeout=5)
+
+    def issue_batch():
+        barrier.wait()          # both callers start inside the same window
+        pool._spawn_batch_concurrent(ceiling, None)
+
+    threads = [threading.Thread(target=issue_batch) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    # EXACTLY the ceiling: not fewer either. Two batches asking for 4 each must
+    # fill the pool to 4, not deadlock it. Bounding reservations by published
+    # slots alone (dropping `_spawns_in_flight` from the reservation check)
+    # makes both batches reserve the full ceiling, and then the pre-spawn gate
+    # declines every one of them -- the pool creates NOTHING and the ceiling
+    # "holds" vacuously, which is how the previous version of this test passed.
+    assert len(pool._slots) == ceiling, (
+        f"expected the pool to fill to {ceiling}, got {len(pool._slots)} slots"
+    )
+    assert rt.max_in_flight <= ceiling, (
+        f"more spawns in flight than the ceiling allows: {rt.max_in_flight}"
+    )
+    assert pool._spawns_in_flight == 0, "every reservation must be released"
+    assert peak_reserved <= ceiling, (
+        f"reservations overshot the ceiling: {peak_reserved} > {ceiling}. The "
+        "pre-spawn gate would still decline them, but the pool must not promise "
+        "the node more workers than it is allowed in the first place."
+    )
 
 
 def test_failed_spawns_do_not_wedge_the_batch():
