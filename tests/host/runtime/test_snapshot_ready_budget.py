@@ -37,33 +37,16 @@ class TestTheKnobItself:
         assert positive_float_env({}, READY_ENV, 120.0) == 120.0
 
 
-def _gvisor_cr_available() -> bool:
-    """The product's own answer, never a re-implementation of it."""
-    try:
-        from blastbox.host.runtime.gvisor_snapshot import GvisorSnapshotBackend
-        from blastbox.host.runtime.gvisor_snapshot_runtime import _gvisor_config_from_env
-    except Exception:  # noqa: BLE001
-        return False
-    try:
-        return GvisorSnapshotBackend(_gvisor_config_from_env({})).available()
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def _fc_available() -> bool:
-    try:
-        from blastbox.host.runtime.firecracker import firecracker_available
-    except Exception:  # noqa: BLE001
-        return False
-    return bool(firecracker_available())
-
-
 class TestBothFactoriesPassItOn:
     """A knob nothing passes on is exactly the bug this fixes, so assert the wiring per tier.
 
-    These drive the REAL factories, so the tier has to be available -- the factory returns
-    None before constructing a manager otherwise. Gated on the product's OWN probe, and run on
-    the fleet nodes where those are true (toolz2/toolz3); they skip on a dev box.
+    These drive the REAL factories and run EVERYWHERE. They were first written gated on the
+    product's availability probe, which meant they skipped on every CI host and dev box -- so
+    deleting either factory's `ready_timeout_s` argument left the suite green, which is the
+    one thing a regression test for "a caller forgot to pass it" must never allow (codex,
+    #151). Nothing here launches a sandbox, so the availability GATE is faked while the code
+    under test -- the construction call -- is entirely real. That is the opposite of a probe
+    that re-implements what it gates: the fake stands in for the host, not for the product.
 
     The two factories BIND `SnapshotManager` differently, and that decides where a patch has
     to go:
@@ -72,9 +55,8 @@ class TestBothFactoriesPassItOn:
       FC      imports it at MODULE level     -> patch fc_snapshot_runtime's own name
 
     Patching only one silently patches nothing for the other, and the test then "passes"
-    without ever reaching the assertion it exists for -- which is exactly what happened on the
-    first run against toolz3. Each test patches the name its factory will actually resolve,
-    and `_recorder` refuses to run if it patched nothing.
+    without ever reaching its assertion -- which is exactly what happened on the first run
+    against toolz3. `_recorder` refuses to run if it patched nothing.
     """
 
     @staticmethod
@@ -97,20 +79,31 @@ class TestBothFactoriesPassItOn:
         assert patched, "no SnapshotManager binding was patched; the test would prove nothing"
         return seen
 
-    @pytest.mark.skipif(not _gvisor_cr_available(),
-                        reason="needs runsc with checkpoint/restore (run on toolz2/toolz3)")
     def test_the_gvisor_factory_passes_the_budget(self, monkeypatch, tmp_path):
         from blastbox.host.runtime import gvisor_snapshot_runtime as gr
-
         from blastbox.host.runtime import fc_snapshot
 
         seen = self._recorder(monkeypatch, fc_snapshot, gr)   # gVisor resolves it lazily
         monkeypatch.setenv(READY_ENV, "450")
         monkeypatch.setenv("BLASTBOX_GVISOR_ROOTFS", str(tmp_path))
-        # Away from /var/lib/blastbox: this test is about the kwargs the factory passes, and
-        # must not need write access to the fleet's real state dir to find out.
+        # Away from /var/lib/blastbox: this is about the kwargs the factory passes, and must
+        # not need write access to the fleet's real state dir to find out.
         monkeypatch.setenv("BLASTBOX_GVISOR_ROOT", str(tmp_path / "root"))
-        monkeypatch.setattr(gr, "GvisorSnapshotSlotRuntime", lambda *a, **k: object())
+
+        class _Backend:
+            def __init__(self, cfg, **kw):
+                pass
+
+            def available(self):
+                return True       # stands in for the HOST, not for the product
+
+        # Source module again: the gVisor factory imports the backend inside the function.
+        from blastbox.host.runtime import gvisor_snapshot as gs
+
+        monkeypatch.setattr(gs, "GvisorSnapshotBackend", _Backend)
+        monkeypatch.setattr(gr, "GvisorSnapshotBackend", _Backend, raising=False)
+        monkeypatch.setattr(gr, "GvisorSnapshotSlotRuntime", lambda *a, **k: object(),
+                            raising=False)
 
         gr.select_gvisor_snapshot_runtime(require_available=False)
 
@@ -119,16 +112,30 @@ class TestBothFactoriesPassItOn:
             f"the gVisor factory dropped the readiness budget: {seen[0]}"
         )
 
-    @pytest.mark.skipif(not _fc_available(),
-                        reason="needs firecracker + /dev/kvm (run on toolz2/toolz3)")
     def test_the_fc_factory_passes_the_budget(self, monkeypatch, tmp_path):
         from blastbox.host.runtime import fc_snapshot_runtime as fr
 
         seen = self._recorder(monkeypatch, fr)   # FC bound it at import time
         monkeypatch.setenv(READY_ENV, "615")
+        # Stand-in HOST assets so FCConfig.from_env resolves; the factory bails before the
+        # construction otherwise. Their contents are never read -- only the construction call
+        # is under test.
+        for name, var in (("vmlinux", "BLASTBOX_FC_KERNEL"), ("rootfs.ext4", "BLASTBOX_FC_ROOTFS"),
+                          ("firecracker", "BLASTBOX_FC_BIN")):
+            f = tmp_path / name
+            f.write_bytes(b"")
+            f.chmod(0o755)
+            monkeypatch.setenv(var, str(f))
+        monkeypatch.setenv("BLASTBOX_FC_JOBS_DIR", str(tmp_path / "jobs"))
+        # At its SOURCE module: the factory imports this name inside the function, exactly
+        # like SnapshotManager -- patching fr's namespace patches nothing and the REAL probe
+        # runs (it rejected the empty stand-in binary as "version unknown").
+        from blastbox.host.runtime import firecracker as fc_mod
+
+        monkeypatch.setattr(fc_mod, "firecracker_available", lambda cfg=None: True)
         monkeypatch.setattr(fr, "SnapshotSlotRuntime", lambda *a, **k: object(), raising=False)
 
-        fr.select_snapshot_runtime(require_available=False)
+        fr.select_snapshot_runtime(require_available=True)
 
         assert seen, "the factory never constructed a SnapshotManager"
         assert seen[0].get("ready_timeout_s") == 615.0, (

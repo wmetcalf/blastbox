@@ -238,6 +238,7 @@ def test_gvisor_snapshot_roundtrip(tmp_path: Path) -> None:
 
     import dataclasses
 
+    from blastbox.host.runtime.env_knobs import positive_float_env
     from blastbox.host.runtime.fc_snapshot import SnapshotManager
     from blastbox.host.runtime.gvisor_snapshot import GvisorSnapshotBackend
     from blastbox.host.runtime.gvisor_snapshot_runtime import (
@@ -261,7 +262,13 @@ def test_gvisor_snapshot_roundtrip(tmp_path: Path) -> None:
         root=tmp_path / "root",
     )
     backend = GvisorSnapshotBackend(cfg)
-    mgr = SnapshotManager(tmp_path / "snap", backend)
+    # THE KNOB THIS TEST MOTIVATED. Constructing the manager bare kept the hard-coded
+    # 120s readiness budget, so BLASTBOX_SNAPSHOT_READY_S had no effect on the one
+    # scenario it exists for -- a base that is slow but healthy (codex, #151).
+    mgr = SnapshotManager(
+        tmp_path / "snap", backend,
+        ready_timeout_s=positive_float_env(os.environ, "BLASTBOX_SNAPSHOT_READY_S", 120.0),
+    )
     rt = GvisorSnapshotSlotRuntime(mgr, settle_s=settle_s)
 
     # BUILD the warm snapshot first. `spawn()` deliberately refuses to build
