@@ -13,7 +13,7 @@ import logging
 import os
 import shutil
 import subprocess
-import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -90,51 +90,111 @@ class GvisorCommandError(RuntimeError):
     """
 
 
-def _detached_stderr(dirpath: Path):
-    """A FILE to collect a detached runsc launch's stderr, never a pipe.
+class _StderrSink:
+    """A bounded sink for a DETACHED runsc launch's stderr.
 
-    `subprocess.run(..., stderr=PIPE)` returns only at EOF on that pipe, and a `-detach`ed
-    sandbox INHERITS the write end -- so with a healthy guest that keeps running, the pipe
-    never closes and the launch never returns. That is not theoretical: it wedged the warm
-    build on toolz2 for >1500s, and only a guest that died instantly (closing the fd) let the
-    boot return at all. Introduced in #141 while adding these diagnostics; the diagnostics are
-    worth keeping, so they move to a file the sandbox may hold open without blocking us.
+    Three constraints have to hold at once, and the obvious options each break one:
 
-    Returns (file object, path). The caller closes it.
+    * `stderr=PIPE` with `subprocess.run` returns only at EOF on the pipe, and a `-detach`ed
+      sandbox inherits the write end for its whole life -- so a HEALTHY guest never lets the
+      launch return. That deadlock wedged the warm build on toolz2 for >1500s (#149).
+    * `stderr=<file>` fixes the deadlock but has no bound: the sandbox holds that fd and an
+      untrusted document can make the worker log until the volume fills (#150).
+    * `stderr=DEVNULL` bounds it perfectly and throws away the message the launch failed
+      with, which is what #141 existed to capture.
+
+    A pipe that is ALWAYS DRAINED satisfies all three. The reader thread never stops
+    consuming, so the guest can never block on a full pipe; only the last `max_bytes` are
+    kept, so memory is bounded no matter how much is written; and nothing touches disk. The
+    thread ends at EOF, i.e. when the sandbox exits and the last write fd closes.
+
+    runsc has no rotating log to delegate this to -- `--debug-log` takes `%TIMESTAMP%` /
+    `%COMMAND%` substitutions but no size or rotation flag (checked against
+    release-20260511.0 on toolz2), and `--console-socket` would mean receiving a PTY over
+    SCM_RIGHTS and changing the guest's stdio. So the bound belongs here.
     """
-    fh = tempfile.NamedTemporaryFile(  # noqa: SIM115 - the caller owns the handle
-        prefix="runsc-stderr-", suffix=".log", dir=str(dirpath), delete=False, mode="w+b",
-    )
-    return fh, Path(fh.name)
 
+    def __init__(self, *, max_bytes: int = 8192) -> None:
+        self._max = max_bytes
+        self._buf = bytearray()
+        self._lock = threading.Lock()
+        self._read_fd, self.write_fd = os.pipe()
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._drain, name="runsc-stderr-drain", daemon=True
+        )
+        try:
+            self._thread.start()
+        except BaseException:
+            # `Thread.start()` raises RuntimeError once the host is out of threads -- and the
+            # pipe is already allocated by then. Without this, every async build retry would
+            # leak TWO descriptors and compound the exhaustion toward EMFILE, i.e. the failure
+            # mode would feed itself (codex, #153). Nothing is draining, so close both ends.
+            for fd in (self._read_fd, self.write_fd):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            self._closed = True
+            raise
 
-def _discard_path(path: Path) -> None:
-    """Unlink a capture file, ignoring a path that is already gone. Never raises."""
-    try:
-        path.unlink()
-    except OSError:
-        pass
-
-
-def _read_and_discard(path: Path, *, max_bytes: int = 8192) -> str:
-    """Tail of a launch's stderr file, then remove it. Never raises."""
-    try:
-        # SEEK, do not slurp. The detached sandbox holds this fd for its whole life and an
-        # untrusted document can make the worker log without limit, so read_bytes()[-N:]
-        # would allocate the entire file just to keep the last few KiB (codex, #149).
-        with path.open("rb") as fh:
+    def _drain(self) -> None:
+        try:
+            while True:
+                chunk = os.read(self._read_fd, 65536)
+                if not chunk:
+                    return
+                with self._lock:
+                    self._buf += chunk
+                    if len(self._buf) > self._max:
+                        del self._buf[:-self._max]
+        except OSError:
+            return
+        finally:
             try:
-                fh.seek(-max_bytes, os.SEEK_END)
+                os.close(self._read_fd)
             except OSError:
-                fh.seek(0)                      # file shorter than the cap
-            data = fh.read(max_bytes)
-    except OSError:
-        data = b""
-    try:
-        path.unlink()
-    except OSError:
-        pass
-    return data.decode("utf-8", "replace")
+                pass
+
+    def close_write(self) -> None:
+        """Drop the PARENT's write end. The sandbox keeps its own dup, which is the point:
+        the drain keeps discarding for as long as the guest lives."""
+        if not self._closed:
+            self._closed = True
+            try:
+                os.close(self.write_fd)
+            except OSError:
+                pass
+
+    def tail(self, *, grace_s: float = 0.5) -> str:
+        """What the launch wrote, flattened to one printable line.
+
+        The runsc CLI has already exited by the time a caller wants this, so its bytes are in
+        the pipe -- but the drain thread may not have picked them up yet. Wait briefly for
+        something rather than racing it to an empty string.
+        """
+        # JOIN first, bounded. The runsc CLI has already exited by the time a caller wants
+        # this, so its bytes are in the pipe -- but not necessarily in the buffer yet. Waiting
+        # for "any data" is not enough: with a chatty guest the buffer is never empty, so the
+        # LAST line (the one that matters) could still be in flight. If the sandbox has also
+        # exited, the drain hits EOF and ends, and the buffer is complete; if it is still
+        # running, this times out and we return what has arrived.
+        self._thread.join(timeout=grace_s)
+        deadline = time.monotonic() + grace_s
+        while time.monotonic() < deadline:
+            with self._lock:
+                if self._buf:
+                    break
+            time.sleep(0.02)
+        with self._lock:
+            raw = bytes(self._buf)
+        text = raw.decode("utf-8", "replace").strip()
+        if not text:
+            return ""
+        # One line, printable only: this is worker-influenced text heading for an operator's
+        # log, and must not smuggle newlines or control characters into it.
+        flat = " ".join(text.split())
+        return "".join(ch if 32 <= ord(ch) < 127 else "?" for ch in flat)
 
 
 def _attach_stderr_text(exc: BaseException, text: str) -> BaseException:
@@ -832,8 +892,10 @@ class GvisorSnapshotBackend:
         # and every async retry would leak another while the resource problem persists
         # (codex, #149). Cannot be folded into the launch handler: that one reads _err_path.
         try:
-            _err_fh, _err_path = _detached_stderr(base)
+            _sink = _StderrSink()
         except BaseException:
+            # Its own handler: the bundle dir and OCI config are already on disk and no
+            # container exists, so nothing else knows this base is here (codex, #149).
             shutil.rmtree(base, ignore_errors=True)
             raise
         try:
@@ -842,13 +904,13 @@ class GvisorSnapshotBackend:
                     [*_runsc(self._cfg), "run", "-detach", "-bundle", str(base), cid],
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
-                    stderr=_err_fh,
+                    stderr=_sink.write_fd,
                     timeout=self._cfg.cli_timeout_s,
                 )
             finally:
-                _err_fh.close()
+                _sink.close_write()
         except BaseException as boot_exc:
-            boot_exc = _attach_stderr_text(boot_exc, _read_and_discard(_err_path))
+            boot_exc = _attach_stderr_text(boot_exc, _sink.tail())
             # BaseException, matching restore_in and build()'s teardown: an interrupt or
             # cancellation during `runsc run` still leaves registered container state behind, and
             # no boot handle is returned on failure, so nothing else can ever reap it (PR #82).
@@ -866,15 +928,9 @@ class GvisorSnapshotBackend:
                 raise _with_runsc_stderr(boot_exc, "runsc run") from boot_exc
             shutil.rmtree(base, ignore_errors=True)
             raise _with_runsc_stderr(boot_exc, "runsc run") from boot_exc
-        else:
-            # UNLINK on the success path too. Only the FAILURE path read (and removed) this
-            # file, so a healthy boot left one behind per base -- and the detached sandbox
-            # keeps the fd for its whole life, so each one kept growing with whatever the
-            # worker logged. Unlinking ends that accumulation and the inode's blocks are
-            # reclaimed when the sandbox exits. It does NOT bound what one long-lived sandbox
-            # can write to that inode: see issue #150, which wants runsc's own rotating
-            # --debug-log rather than a host-side sink (codex, #149).
-            _discard_path(_err_path)
+        # No success-path cleanup to do: there is no file. The drain thread keeps consuming
+        # and discarding whatever the live sandbox writes, bounded at max_bytes, and ends by
+        # itself when the sandbox exits and the last write fd closes.
         return GvisorBootHandle(self._cfg, self._run, cid, base, ctrl, self._ready,
                                 run_text=self._run_text,
                                 ack_capable=self._ack_capable,
@@ -890,7 +946,7 @@ class GvisorSnapshotBackend:
         # permission problem), and the handler below reads _err_path -- so a failure here
         # raised UnboundLocalError from the except clause, masking the real host-resource
         # error and skipping the teardown it guards (codex, #149).
-        _err_fh, _err_path = _detached_stderr(wd)   # a file, never a pipe: see boot_base
+        _sink = _StderrSink()   # bounded, always drained: see _StderrSink
         try:
             try:
                 self._run(
@@ -898,16 +954,14 @@ class GvisorSnapshotBackend:
                      "-detach", "-bundle", str(wd), cid],
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
-                    stderr=_err_fh,
+                    stderr=_sink.write_fd,
                     timeout=self._cfg.cli_timeout_s,
                 )
             finally:
-                _err_fh.close()
+                _sink.close_write()
         except BaseException as exc:
-            # The launch wrote its stderr to a FILE (a detached sandbox inherits the fd, so a
-            # pipe would block us); move that tail onto the exception where the shared renderer
-            # already looks.
-            exc = _attach_stderr_text(exc, _read_and_discard(_err_path))
+            # Move the drained tail onto the exception, where the shared renderer looks.
+            exc = _attach_stderr_text(exc, _sink.tail())
             # BaseException, not Exception. A KeyboardInterrupt, SystemExit or task cancellation
             # during `runsc restore` skipped this handler entirely -- yet the command may already
             # have registered a container and spawned its sandbox/gofer processes. Worse,

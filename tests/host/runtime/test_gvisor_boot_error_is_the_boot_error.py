@@ -10,6 +10,7 @@ denied` and was invisible.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -28,8 +29,15 @@ TEARDOWN_NOISE = b"FetchSpec failed: loading container: file does not exist\n"
 
 
 def _write_stderr(target, payload: bytes) -> None:
-    """Behave like runsc: write to the fd/file we were given, if we were given one."""
-    if hasattr(target, "write"):
+    """Behave like runsc: write to whatever fd we were handed, if we were handed one.
+
+    An int (the drained sink's pipe), a file object, or DEVNULL -- a fake that always
+    supplies the text regardless would pass even with the capture removed, which is the
+    regression these tests exist for.
+    """
+    if isinstance(target, int) and target >= 0:
+        os.write(target, payload)
+    elif hasattr(target, "write"):
         target.write(payload)
         try:
             target.flush()
@@ -185,44 +193,44 @@ def test_a_detached_child_holding_stderr_does_not_block_the_launch(tmp_path):
     """A `-detach`ed sandbox INHERITS the stderr fd and holds it for its whole life.
 
     `subprocess.run(..., stderr=PIPE)` returns only at EOF on that pipe, so capturing a
-    detached launch through a pipe waits for the guest to DIE. A guest that dies instantly
-    closed the fd and the boot returned -- which is why this looked fine against a broken
-    rootfs -- but a healthy warm base kept it open and the build hung: measured on toolz2 at
-    >1500 s, with `ensure_build_started` refusing to start another build while that thread was
-    alive, so the warm tier never rebuilt again.
+    detached launch through an UNDRAINED pipe waits for the guest to DIE. A guest that died
+    instantly closed the fd and the boot returned -- which is why this looked fine against a
+    broken rootfs -- but a healthy warm base kept it open and the build hung: measured on
+    toolz2 at >1500 s, with `ensure_build_started` refusing to start another build while that
+    thread was alive, so the warm tier never rebuilt again.
 
-    This drives the real runner with a fake runsc that detaches a child and exits, and pins the
-    difference: a FILE returns at once, a PIPE waits for the child.
+    `_StderrSink` is a pipe that is ALWAYS drained, so the launch returns as soon as the CLI
+    exits. This drives the real runner with a fake runsc that detaches a child and exits, and
+    pins the difference against the undrained form.
     """
     import time
 
-    from blastbox.host.runtime.gvisor_snapshot import _default_run, _detached_stderr
+    from blastbox.host.runtime.gvisor_snapshot import _StderrSink, _default_run
 
     runsc = tmp_path / "runsc-detaching"
     # The background child inherits stderr and lives on, exactly like a detached sandbox.
     runsc.write_text("#!/bin/sh\nsleep 5 &\nexit 0\n")
     runsc.chmod(0o755)
 
-    fh, path = _detached_stderr(tmp_path)
+    sink = _StderrSink()
     try:
         started = time.monotonic()
-        _default_run([str(runsc), "run", "-detach"], stderr=fh, timeout=30)
-        file_elapsed = time.monotonic() - started
+        _default_run([str(runsc), "run", "-detach"], stderr=sink.write_fd, timeout=30)
+        drained_elapsed = time.monotonic() - started
     finally:
-        fh.close()
-        path.unlink(missing_ok=True)
+        sink.close_write()
 
-    assert file_elapsed < 2.0, (
-        f"a file-captured detached launch waited {file_elapsed:.1f}s for the child"
+    assert drained_elapsed < 2.0, (
+        f"a drained detached launch waited {drained_elapsed:.1f}s for the child"
     )
 
-    # And the control, so the assertion above cannot pass for an unrelated reason: the pipe
-    # form really does wait for the detached child.
+    # And the control, so the assertion above cannot pass for an unrelated reason: the
+    # UNDRAINED pipe really does wait for the detached child.
     started = time.monotonic()
     _default_run([str(runsc), "run", "-detach"], stderr=subprocess.PIPE, timeout=30)
-    pipe_elapsed = time.monotonic() - started
+    undrained_elapsed = time.monotonic() - started
 
-    assert pipe_elapsed > 3.0, (
-        f"the pipe form returned in {pipe_elapsed:.1f}s -- this test no longer demonstrates "
-        "the deadlock it exists to prevent"
+    assert undrained_elapsed > 3.0, (
+        f"the undrained form returned in {undrained_elapsed:.1f}s -- this test no longer "
+        "demonstrates the deadlock it exists to prevent"
     )
