@@ -499,13 +499,6 @@ def build_plan(
         + _images.arg_problems(plan, env)
         + _images.unresolved_build_args(plan, env)
         + _size_problems(plan, env)
-        # Destinations belong here for exactly the reason sizes do, and the reason is in
-        # _size_problems' own docstring: left to surface from the export, the failure arrives
-        # AFTER every image has been built and verified. export_rootfs still refuses -- it is
-        # the check that actually guards the write -- but refusing an hour later costs the
-        # whole build. RedTusk's `$REDTUSK_FC_DIR/redtusk-rootfs.ext4` is the live example: it
-        # is the one declared destination in the fleet with no `${VAR:-default}`.
-        + _images.unresolved_destinations(plan, env)
     )
     if problems:
         raise BuildError(
@@ -1680,6 +1673,26 @@ def run_plan(
     # two invocations cannot collide, so recomputing it here would name images
     # nothing built.
     staging = _staging_tag(tag)
+    # ONE environment for the preflight, the build and the export. build_plan injects
+    # BLASTBOX_VERSION into a LOCAL copy, so a destination naming it would pass a preflight
+    # done there and still be refused by stage_rootfs, which receives the caller's original
+    # env -- the late failure this preflight exists to prevent, reintroduced by checking
+    # against a different mapping than the one that acts (codex, #156).
+    env = {
+        **(dict(os.environ) if env is None else env),
+        "BLASTBOX_VERSION": blastbox_version,
+    }
+    # HERE, not in build_plan. build_plan is a public API that builds IMAGES and never writes
+    # a rootfs, so making it require the export host's variables would refuse a legitimate
+    # image-only build on a machine that has no export destination at all. run_plan is the one
+    # that stages every declared rootfs, so it is the one that must know the destination
+    # resolves -- before docker starts (codex, #156).
+    dest_problems = _images.unresolved_destinations(plan, env)
+    if dest_problems:
+        raise BuildError(
+            "the plan cannot be built as declared:\n  " + "\n  ".join(dest_problems)
+        )
+
     staged_tags = build_plan(
         plan,
         tag,

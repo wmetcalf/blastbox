@@ -182,21 +182,6 @@ class FakeRunner:
 
 
 @pytest.fixture(autouse=True)
-def _resolvable_destination(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Give SPEC's `$DEMO_DIR/demo.ext4` somewhere to resolve to.
-
-    `run_plan` stages EVERY declared rootfs -- there is no images-only mode -- so an
-    unresolved destination now fails the preflight, before any image is built. Most tests here
-    are about building and stamping and never look at the export; without this they would each
-    have to set an environment variable to describe something they do not care about.
-
-    Tests that ARE about an unresolved destination delete it explicitly (monkeypatch.delenv),
-    which reads as the deliberate act it is.
-    """
-    monkeypatch.setenv("DEMO_DIR", str(tmp_path / "demo-dest"))
-
-
-@pytest.fixture(autouse=True)
 def _pinned_privilege(monkeypatch: pytest.MonkeyPatch):
     """Pin the privilege decision so these tests do not depend on whether the
     machine running them has passwordless sudo. Tests about privilege override
@@ -3789,3 +3774,54 @@ def test_the_export_still_refuses_a_destination_the_preflight_did_not_see(
         )
 
     assert "refusing to write to a path nobody chose" in str(e.value)
+
+
+def test_a_destination_naming_the_version_resolves_for_both_the_preflight_and_the_export(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`blastbox_version` is an ARGUMENT, not something the caller must also put in `env`.
+
+    build_plan injects it into a LOCAL copy of the environment. So a destination naming
+    $BLASTBOX_VERSION passed a preflight done there and was then refused by stage_rootfs,
+    which received the caller's original env -- the late failure this preflight exists to
+    prevent, reintroduced by checking a different mapping than the one that acts (codex, #156).
+
+    One environment now serves the preflight, the build and the export.
+    """
+    import blastbox.host.imagerun as mod
+
+    _resolves_to(monkeypatch)
+    # Same stubs the other full-run tests use: this one is about the ENVIRONMENT reaching the
+    # export, not about stamping or content verification.
+    monkeypatch.setattr(mod, "_stamp_flags", lambda **_k: [])
+    monkeypatch.setattr(mod, "_read_stamp", lambda i, r=None: _FakeStamp())
+    monkeypatch.setattr(mod, "_verify_contents", lambda i, r=None: (True, ""))
+    dest_dir = tmp_path / "out"
+    dest_dir.mkdir()
+    monkeypatch.setenv("DEMO_DIR", str(dest_dir))
+    monkeypatch.delenv("BLASTBOX_VERSION", raising=False)   # supplied ONLY as the argument
+    plan = _plan(
+        tmp_path,
+        SPEC.replace('dest = "$DEMO_DIR/demo.ext4"', 'dest = "$DEMO_DIR/demo-$BLASTBOX_VERSION.ext4"'),
+    )
+    run = FakeRunner()
+
+    run_plan(
+        plan,
+        "t1",
+        blastbox_version="0.1.40",
+        run=run,
+        log=lambda _: None,
+        extract=_fake_extract({"/init": "x"}),
+        extract_preserves_ownership=True,
+    )
+
+    # The runner is a fake, so read the RESOLVED path out of what the export actually ran.
+    ran = " ".join(" ".join(str(a) for a in c) for c in run.calls)
+    assert "demo-0.1.40.ext4" in ran, (
+        "the export never resolved $BLASTBOX_VERSION, so the preflight and the export were "
+        f"reading different environments; commands were: {ran[:400]}"
+    )
+    assert "demo-$BLASTBOX_VERSION.ext4" not in ran, (
+        "the export used the unexpanded template as a path"
+    )
