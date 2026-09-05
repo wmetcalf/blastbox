@@ -78,14 +78,34 @@
 set -euo pipefail
 
 ENGINE="${ENGINE:?set ENGINE=clippyshot|redtusk|custom}"
+# The mode decides what is REQUIRED below, so it is validated first.
+MODE="${REDEPLOY_MODE:-recreate}"
+case "$MODE" in
+  recreate|legacy-rebuild) ;;
+  *) echo "unknown REDEPLOY_MODE=$MODE (recreate|legacy-rebuild)" >&2; exit 2 ;;
+esac
+
+# REQUIRED, not defaulted. The presets below are "the values verified on toolz2
+# 2026-06-19", and these two aged badly: WARM_TAG defaulted to `warmfix`, whose
+# images still exist on toolz2, so a default run there would have recreated the
+# warm tier onto a June build without failing anything; BLASTBOX_REF pointed at
+# `fix/fc-warm-entropy`, a branch since DELETED, which the fetch below could not
+# have checked out. Naming the tag is also what the recreate path already tells
+# you to build with (`blastbox build-images <repo> --tag $WARM_TAG`), so the two
+# now cannot disagree by accident.
+WARM_TAG="${WARM_TAG:?set WARM_TAG to the tag blastbox build-images published}"
+# Only legacy-rebuild builds a wheel. Demanding a ref in recreate mode would ask
+# the operator to name something this run never reads -- and it would then be
+# logged as the ref in use, which is exactly the false claim this change removes.
+if [ "$MODE" = legacy-rebuild ]; then
+  BLASTBOX_REF="${BLASTBOX_REF:?set BLASTBOX_REF to the blastbox ref to build the wheel from, e.g. a release tag}"
+fi
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
 # --- per-engine presets (the values verified on toolz2 2026-06-19) -------------
 case "$ENGINE" in
   clippyshot)
-    : "${BLASTBOX_REF:=fix/fc-warm-entropy}"
     : "${BASE_IMAGE:=clippyshot:dev}"        ; : "${COLD_IMAGE:=clippyshot-cold-worker:dev}"
-    : "${WARM_TAG:=warmfix}"
     : "${VENV_PIP:=/opt/clippyshot/bin/pip}" ; : "${VENV_PY:=/opt/clippyshot/bin/python}"
     : "${IMG_USER:=clippy}"
     : "${FC_DOCKERFILE:=deploy/firecracker/Dockerfile.clippyshot}" ; : "${ROOTFS_MIB:=7000}"
@@ -98,9 +118,7 @@ case "$ENGINE" in
     : "${API_URL:=http://127.0.0.1:8001}"    ; : "${SMOKE_FILE:=}"
     ;;
   redtusk)
-    : "${BLASTBOX_REF:=fix/fc-warm-entropy}"
     : "${BASE_IMAGE:=redtusk:0115}"          ; : "${COLD_IMAGE:=redtusk-cold-worker:0122}"
-    : "${WARM_TAG:=warmfix}"
     : "${VENV_PIP:=/opt/redtusk/bin/pip}"    ; : "${VENV_PY:=/opt/redtusk/bin/python}"
     : "${IMG_USER:=10001:10001}"
     : "${FC_DOCKERFILE:=deploy/firecracker/Dockerfile.redtusk}" ; : "${ROOTFS_MIB:=1024}"
@@ -122,13 +140,11 @@ SUF="bak-${WARM_TAG}"
 FC_BIN_SRC="${FC_BIN_SRC:-}"   # optional: path to a patched firecracker (>=1.15.1) to swap in
 log(){ printf '\033[1;36m[redeploy-warm]\033[0m %s\n' "$*"; }
 
-log "engine=$ENGINE ref=$BLASTBOX_REF -> $WARM_IMAGE / $WARM_COLD_IMAGE"
-
-MODE="${REDEPLOY_MODE:-recreate}"
-case "$MODE" in
-  recreate|legacy-rebuild) ;;
-  *) echo "unknown REDEPLOY_MODE=$MODE (recreate|legacy-rebuild)" >&2; exit 2 ;;
-esac
+if [ "$MODE" = legacy-rebuild ]; then
+  log "engine=$ENGINE ref=$BLASTBOX_REF -> $WARM_IMAGE / $WARM_COLD_IMAGE"
+else
+  log "engine=$ENGINE -> $WARM_IMAGE / $WARM_COLD_IMAGE"
+fi
 
 # The rebuild half is opt-in, and the opt-in still does not license a shrink.
 # `build-images` preserves the size already in place; these presets do not, and
@@ -164,7 +180,24 @@ fi
 if [ "$MODE" = legacy-rebuild ]; then
 # --- 1. blastbox wheel from BLASTBOX_REF --------------------------------------
 log "checkout $BLASTBOX_REF + build wheel (via $BASE_IMAGE pip, no-cache so a PyPI wheel isn't served)"
-git -C "$REPO" fetch --quiet origin "$BLASTBOX_REF" && git -C "$REPO" checkout --quiet "$BLASTBOX_REF"
+# SEPARATE statements, not `fetch && checkout`. `set -e` does not fire for the
+# left operand of `&&`, so a fetch of a ref that no longer exists was swallowed,
+# the checkout was skipped, and the wheel was built from WHATEVER tree the repo
+# happened to be on -- while the log line above claimed the ref. Measured: with
+# the old default (`fix/fc-warm-entropy`, a branch since deleted) the script
+# printed the fetch error and carried on to build and deploy.
+git -C "$REPO" fetch --quiet origin "$BLASTBOX_REF" || {
+  echo "[redeploy-warm] cannot fetch BLASTBOX_REF=$BLASTBOX_REF from origin" >&2
+  echo "[redeploy-warm]   the wheel would be built from the current checkout instead" >&2
+  exit 1
+}
+# Check out what was just FETCHED, not a same-named LOCAL branch. `git checkout <ref>`
+# resolves to an existing local branch in preference to the remote one, so a stale local
+# `topic` wins over the origin/topic just fetched and the wheel is built from the old tree
+# -- while the line above claims the ref. Measured on a local branch one commit behind its
+# remote: FETCH_HEAD held the new commit, `git checkout topic` left HEAD on the old one.
+# Detached on purpose: a deploy build has no business moving the operator's branches.
+git -C "$REPO" checkout --quiet --detach FETCH_HEAD
 SRC=$(mktemp -d); WHEELS=$(mktemp -d)
 cp -r "$REPO"/. "$SRC"/ ; rm -rf "$SRC/.git" "$SRC/build" "$SRC/src/"*.egg-info 2>/dev/null || true
 docker run --rm -u root -v "$SRC":/src -v "$WHEELS":/out --entrypoint "$VENV_PIP" "$BASE_IMAGE" \
@@ -213,7 +246,15 @@ fi
 if [ -n "$FC_BIN_SRC" ]; then
   log "swap firecracker binary <- $FC_BIN_SRC"
   cp -a "$FC_DIR/firecracker" "$FC_DIR/firecracker.$SUF"
-  cp -f "$FC_BIN_SRC" "$FC_DIR/firecracker.new" && mv -f "$FC_DIR/firecracker.new" "$FC_DIR/firecracker"
+  # SEPARATE statements again (see the fetch above): `cp ... && mv ...` is exempt from
+  # `set -e`, so a cp that failed skipped the mv and the run CARRIED ON -- and the version
+  # line below then printed the OLD binary's version, which reads as confirmation that the
+  # swap happened. Staging via .new and mv is deliberate: mv is atomic and avoids ETXTBSY
+  # on a firecracker that is currently executing.
+  cp -f "$FC_BIN_SRC" "$FC_DIR/firecracker.new"
+  mv -f "$FC_DIR/firecracker.new" "$FC_DIR/firecracker"
+  # With the two statements separated, a failed copy stops the run, so this line can only
+  # be reached after a swap that actually happened -- which is what makes it evidence.
   "$FC_DIR/firecracker" --version | head -1
 fi
 
