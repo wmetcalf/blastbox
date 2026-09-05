@@ -12,11 +12,16 @@ These two profiles grant **only** the `userns` capability to **one specific bina
 host-wide restriction stays in force for everything else. Reboot-persistent.
 
 ```sh
-# adjust the binary paths inside each profile first if `which bwrap`/`which nsjail`/`which runsc` differ
-sudo cp blastbox-bwrap blastbox-nsjail blastbox-runsc /etc/apparmor.d/
+# adjust the binary paths inside each profile first if `which bwrap`/`which nsjail` differ
+sudo cp blastbox-bwrap blastbox-nsjail /etc/apparmor.d/
 sudo apparmor_parser -r -W /etc/apparmor.d/blastbox-bwrap
 sudo apparmor_parser -r -W /etc/apparmor.d/blastbox-nsjail
-sudo apparmor_parser -r -W /etc/apparmor.d/blastbox-runsc      # only if you run runsc ROOTLESS
+
+# ONLY if you run runsc rootless -- see below. Do not copy this file otherwise: everything in
+# /etc/apparmor.d/ is loaded at boot and on a full policy reload, so copying it "for later"
+# grants the exception now, whatever the parser line beside it says.
+sudo cp blastbox-runsc /etc/apparmor.d/ && sudo apparmor_parser -r -W /etc/apparmor.d/blastbox-runsc
+
 sudo grep -E '^blastbox-' /sys/kernel/security/apparmor/profiles   # name AND mode of each
 ```
 
@@ -35,11 +40,25 @@ which never mentions AppArmor. The kernel does, and is worth checking first
 apparmor="DENIED" operation="exec" profile="unprivileged_userns" name="/proc/self/exe" comm="runsc"
 ```
 
-Verify it took effect (test the **binary**, not `unshare` — the grant is per-binary):
+Verify it took effect (test the **binary**, not `unshare` — the grant is per-binary, so a
+passing check for one binary says nothing about another, and the profiles match on the path you
+edited above):
 
 ```sh
 bwrap --unshare-user --uid 0 --ro-bind / / -- /bin/true && echo "bwrap userns OK"
+nsjail -Mo --user 0 --group 0 -- /bin/true            && echo "nsjail userns OK"
+runsc --rootless do /bin/true                          && echo "runsc rootless userns OK"
 ```
+
+The runsc line is the one to run if you installed `blastbox-runsc`. Without the grant it exits
+**128** with
+
+```
+Error executing inside namespace: re-executing self: fork/exec /proc/self/exe: permission denied
+```
+
+(measured on a host with `apparmor_restrict_unprivileged_userns=1` and no `blastbox-runsc`
+loaded), which is the same denial that surfaces from a real run as `cannot create gofer process`.
 
 ## 2. Run the tests/worker as root
 
