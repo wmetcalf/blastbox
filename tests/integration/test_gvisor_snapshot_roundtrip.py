@@ -30,6 +30,7 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -162,15 +163,32 @@ def test_gvisor_snapshot_roundtrip(tmp_path: Path) -> None:
     # Built synchronously here on purpose: this is a test thread, not the
     # maintenance thread the guard protects, and a blocking build gives a clear
     # failure instead of a timeout if the base cannot boot at all.
+    # BOUNDED while it runs, not measured afterwards. The backend's subprocess
+    # calls have no timeout of their own, so a `runsc run` or checkpoint that
+    # stalls on a broken host never returns and an elapsed-time assertion after
+    # the call is never reached. A DAEMON thread makes the join timeout the
+    # bound that actually holds: a non-daemon one (or a ThreadPoolExecutor,
+    # which joins its workers at interpreter exit) would hang pytest instead.
     build_s = float(os.environ.get("BLASTBOX_SNAPSHOT_BUILD_S", "180"))
-    build_started = time.monotonic()
-    try:
-        mgr.build()
-    except Exception as exc:  # noqa: BLE001 - reported as a build failure, not a round-trip one
-        pytest.fail(f"warm snapshot build failed after {time.monotonic() - build_started:.1f}s: {exc}")
-    assert time.monotonic() - build_started < build_s, (
-        f"warm snapshot build exceeded {build_s}s"
-    )
+    outcome: list[tuple[str, object]] = []
+
+    def _build() -> None:
+        try:
+            outcome.append(("ok", mgr.build()))
+        except BaseException as exc:  # noqa: BLE001 - reported by the caller below
+            outcome.append(("error", exc))
+
+    builder = threading.Thread(target=_build, daemon=True, name="warm-snapshot-build")
+    builder.start()
+    builder.join(timeout=build_s)
+    if builder.is_alive():
+        pytest.fail(
+            f"warm snapshot build did not finish within {build_s}s "
+            "(set BLASTBOX_SNAPSHOT_BUILD_S to allow longer)"
+        )
+    kind, payload = outcome[0]
+    if kind == "error":
+        pytest.fail(f"warm snapshot build failed: {payload}")
 
     slot = rt.spawn()
     slot_reaped = False
