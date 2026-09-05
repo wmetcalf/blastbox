@@ -1227,3 +1227,39 @@ def test_a_context_value_containing_a_dollar_is_not_an_unset_variable(tmp_path):
     (weird / "deploy" / "Dockerfile.demo").unlink()
     reported = missing_dockerfiles(plan, env={"BLASTBOX_SRC": str(weird)})
     assert reported and "is unset" not in reported[0], reported
+
+
+@pytest.mark.parametrize("context", ["${A:+fallback}", "${not-a-name}"])
+def test_an_unsupported_context_expansion_is_not_called_unset(tmp_path, context):
+    """`${A:+fallback}` is not a variable that can be set.
+
+    `unresolved_names` returns the whole expression for syntax blastbox does
+    not implement, so reporting it as "unset" tells an operator to set
+    something that already IS set -- and `_expand` leaves that form literal by
+    design, so setting it could never help.
+    """
+    from blastbox.host.images import load_plan, missing_dockerfiles
+
+    (tmp_path / "blastbox-images.toml").write_text(
+        '[engine]\nname = "demo"\n\n'
+        '[[image]]\nname = "demo"\ndockerfile = "deploy/Dockerfile.demo"\n'
+        f'context = "{context}"\nbase = "python:3.12-slim"\n'
+    )
+    reported = missing_dockerfiles(load_plan(tmp_path), env={"A": "set-value"})
+    assert reported, "the Dockerfile is unfindable either way"
+    assert "is unset" not in reported[0], reported
+    assert "not an expansion blastbox understands" in reported[0], reported
+
+
+def test_a_context_mixing_both_reports_each_kind(tmp_path):
+    """One says set me, the other says rewrite me. Both need saying."""
+    from blastbox.host.images import load_plan, missing_dockerfiles
+
+    (tmp_path / "blastbox-images.toml").write_text(
+        '[engine]\nname = "demo"\n\n'
+        '[[image]]\nname = "demo"\ndockerfile = "deploy/Dockerfile.demo"\n'
+        'context = "$SRC/${A:+x}"\nbase = "python:3.12-slim"\n'
+    )
+    reported = missing_dockerfiles(load_plan(tmp_path), env={"A": "set-value"})
+    assert "SRC is unset" in reported[0], reported
+    assert "not an expansion blastbox understands" in reported[0], reported

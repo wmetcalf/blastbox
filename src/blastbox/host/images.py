@@ -856,8 +856,23 @@ def missing_dockerfiles(plan: Plan, env: dict[str, str] | None = None) -> list[s
         # tell an unset placeholder from a directory whose name holds one.
         unset = unresolved_names(spec.context, environ)
         if unset:
-            names = ", ".join(sorted(unset))
-            out.append(f"{spec.dockerfile} (context {spec.context}: {names} is unset)")
+            # An unset NAME and an expansion blastbox does not implement need
+            # different answers. `unresolved_names` returns the whole expression
+            # for the latter, so `${A:+fallback}` reported "is unset" even with
+            # A set -- and setting it could never help, because `_expand` leaves
+            # that syntax literal by design.
+            settable = sorted(n for n in unset if n.isidentifier())
+            unsupported = sorted(n for n in unset if not n.isidentifier())
+            parts = []
+            if settable:
+                parts.append(f"{', '.join(settable)} is unset")
+            if unsupported:
+                supported = "$VAR, ${VAR}, ${VAR:-default}"
+                parts.append(
+                    f"{', '.join(unsupported)} is not an expansion blastbox "
+                    f"understands ({supported})"
+                )
+            out.append(f"{spec.dockerfile} (context {spec.context}: {'; '.join(parts)})")
         else:
             where = spec.context if spec.context != "." else "this repo"
             out.append(f"{spec.dockerfile} (context {where})")
