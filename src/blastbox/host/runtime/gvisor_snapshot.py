@@ -90,6 +90,20 @@ class GvisorCommandError(RuntimeError):
     """
 
 
+# Live stderr drains. A drain ends when its sandbox exits, so a host whose sandboxes wedge
+# would otherwise accumulate one thread and two descriptors per restore forever.
+_MAX_LIVE_SINKS = 16
+_LIVE_SINKS: "list[threading.Thread]" = []
+_SINK_LOCK = threading.Lock()
+
+
+def _release_sink_slot(thread: "threading.Thread") -> None:
+    """Give back a reservation whose sink never came up. Never raises."""
+    with _SINK_LOCK:
+        if thread in _LIVE_SINKS:
+            _LIVE_SINKS.remove(thread)
+
+
 class _StderrSink:
     """A bounded sink for a DETACHED runsc launch's stderr.
 
@@ -118,14 +132,79 @@ class _StderrSink:
         self._max = max_bytes
         self._buf = bytearray()
         self._lock = threading.Lock()
-        self._read_fd, self.write_fd = os.pipe()
+        self._degraded = False
+
+        # BOUND THE DRAIN THREADS. A sink's thread ends at EOF -- when the sandbox exits -- so
+        # on a host where sandboxes wedge instead of exiting, one accumulates per restore, for
+        # the life of the process. Same class as the FC copy-worker cap (#154).
+        #
+        # ...but the DEGRADATION differs, because the stakes do. A copy is essential: no copy,
+        # no slot, so that cap REFUSES. This is only diagnostics, so refusing would break warm
+        # launches to protect a log. Past the cap the launch proceeds with stderr discarded and
+        # says so once -- capacity over forensics, which is the right trade for the tier that
+        # is serving jobs.
+        # PRUNE, CHECK AND RESERVE IN ONE CRITICAL SECTION. Checking capacity, releasing the
+        # lock, and only registering after the drain has started is check-then-act: several
+        # concurrent restores can all observe spare capacity and start drains before any of
+        # them registers, so the cap fails in exactly the concurrency it exists for (codex,
+        # #155). The thread object is created first precisely so it can be reserved before it
+        # runs. My commit for the first version of this cap claimed the lesson from the FC
+        # copy-worker cap had been applied up front; it had not been.
+        # RESERVE FIRST, ALLOCATE SECOND, RELEASE ON EITHER FAILURE.
+        #
+        # The ordering has been wrong in both directions, so both reasons are recorded here.
+        # Reserving after allocating meant an os.pipe() failure under EMFILE stranded a slot
+        # forever, because the prune keeps unstarted reservations. Allocating before consulting
+        # the cap meant a FULL cap on an fd-exhausted host raised instead of taking the DEVNULL
+        # path -- the degraded branch needing the very resource it exists to do without -- and
+        # let concurrent restores each hold a pipe before any reached the lock, so peak
+        # descriptor use exceeded the cap (codex, #155).
+        #
+        # A Thread OBJECT costs no OS resource until start(), so it can be reserved before
+        # anything is allocated. Every failure path after that releases the slot.
+        thread = threading.Thread(target=self._drain, name="runsc-stderr-drain", daemon=True)
+
+        with _SINK_LOCK:
+            # PRUNE ONLY WHAT ACTUALLY RAN. A reservation is appended before its thread is
+            # started, and an unstarted thread reports is_alive() == False -- so pruning on
+            # liveness alone let a CONCURRENT constructor delete a reservation that had been
+            # made but not yet started, and both would then start drains.
+            _LIVE_SINKS[:] = [
+                t for t in _LIVE_SINKS if t.is_alive() or not getattr(t, "_bb_started", False)
+            ]
+            if len(_LIVE_SINKS) >= _MAX_LIVE_SINKS:
+                stuck = len(_LIVE_SINKS)
+                self._degraded = True
+                self._read_fd = -1
+                self.write_fd = subprocess.DEVNULL
+                self._closed = True
+                # No pipe was allocated and NO THREAD is started: this branch must work on a
+                # host that has neither descriptors nor threads to spare.
+                self._thread = None
+                _log.warning(
+                    "gvisor_snapshot: %d stderr drains are still stuck (sandboxes that never "
+                    "exited); launching with stderr discarded so the tier keeps serving", stuck,
+                )
+                return
+            _LIVE_SINKS.append(thread)      # reserved: nothing allocated yet
+
+        try:
+            read_fd, write_fd = os.pipe()
+        except BaseException:
+            _release_sink_slot(thread)
+            raise
+
+        self._thread = thread
+        self._read_fd, self.write_fd = read_fd, write_fd
         self._closed = False
-        self._thread = threading.Thread(
-            target=self._drain, name="runsc-stderr-drain", daemon=True
-        )
         try:
             self._thread.start()
+            self._thread._bb_started = True   # type: ignore[attr-defined]
         except BaseException:
+            # RELEASE the reservation. It cannot be left to the prune any more: the prune now
+            # keeps unstarted reservations on purpose (see above), so a thread that never
+            # started would hold its slot for the life of the process.
+            _release_sink_slot(self._thread)
             # `Thread.start()` raises RuntimeError once the host is out of threads -- and the
             # pipe is already allocated by then. Without this, every async build retry would
             # leak TWO descriptors and compound the exhaustion toward EMFILE, i.e. the failure
@@ -156,6 +235,11 @@ class _StderrSink:
             except OSError:
                 pass
 
+    @property
+    def degraded(self) -> bool:
+        """True when the cap was hit and this launch runs with stderr discarded."""
+        return self._degraded
+
     def close_write(self) -> None:
         """Drop the PARENT's write end. The sandbox keeps its own dup, which is the point:
         the drain keeps discarding for as long as the guest lives."""
@@ -179,6 +263,8 @@ class _StderrSink:
         # LAST line (the one that matters) could still be in flight. If the sandbox has also
         # exited, the drain hits EOF and ends, and the buffer is complete; if it is still
         # running, this times out and we return what has arrived.
+        if self._thread is None:
+            return ""                       # degraded: nothing was ever captured
         self._thread.join(timeout=grace_s)
         deadline = time.monotonic() + grace_s
         while time.monotonic() < deadline:
@@ -649,7 +735,8 @@ class GvisorBootHandle:
                 # ...and if the cleanup ITSELF fails, nothing can rediscover the directory either.
                 # Record it for the next checkpoint's sweep rather than dropping it, exactly as the
                 # FC launcher does for its partial files.
-                self._stranded_partials.append(str(img))
+                with _STRANDED_LOCK:
+                    self._stranded_partials.append(str(img))
                 _log.warning("gvisor_snapshot: could not remove partial checkpoint %s", img)
             raise
         return str(img)
@@ -725,6 +812,10 @@ class GvisorRestoreHandle:
             raise RuntimeError(f"could not confirm teardown of runsc container {self._cid}")
 
 
+# Guards the stranded-partials ledgers this module shares between the backend and its handles.
+_STRANDED_LOCK = threading.Lock()
+
+
 def _retry_stranded_partials(stranded: "list[str]") -> None:
     """Re-attempt removal of partial checkpoints a previous failed attempt could not delete.
 
@@ -733,13 +824,33 @@ def _retry_stranded_partials(stranded: "list[str]") -> None:
     """
     if not stranded:
         return
+    # TAKE the batch under the ledger lock rather than iterating the live list and finishing
+    # with `stranded[:] = still`. That slice assignment ERASES anything appended while the
+    # sweep ran, and three separate failure paths append here -- a partial checkpoint (652), a
+    # base whose teardown could not be confirmed (925), and a restore workdir the same (987).
+    # Losing one of those loses the only record of a directory a live sandbox may still hold.
+    # Same defect and same fix as the FC launcher's ledger (#154).
+    with _STRANDED_LOCK:
+        batch = list(stranded)
+        del stranded[:]
     still: list[str] = []
-    for leftover in stranded:
-        errs: list[str] = []
-        shutil.rmtree(leftover, onerror=lambda fn, p, exc: errs.append(str(p)))
-        if errs:
-            still.append(leftover)
-    stranded[:] = still
+    done = 0
+    try:
+        for leftover in batch:
+            errs: list[str] = []
+            shutil.rmtree(leftover, onerror=lambda fn, q, exc: errs.append(str(q)))
+            if errs:
+                still.append(leftover)
+            done += 1
+    finally:
+        # PUT BACK whatever we did not finish. `rmtree` can RAISE rather than report through
+        # onerror -- a worker-created directory nested deep enough makes recursive removal hit
+        # RecursionError -- and the ledger has already been emptied by then, so an escaping
+        # exception would lose the current entry AND every unprocessed one, permanently. The
+        # old implementation iterated the live list and so could not lose them; taking a batch
+        # has to restore what it took (codex, #155).
+        with _STRANDED_LOCK:
+            stranded[:0] = still + batch[done:]
 
 
 class GvisorSnapshotBackend:
@@ -922,7 +1033,8 @@ class GvisorSnapshotBackend:
                 # still be live. Ignoring that result and removing the bundle anyway forgot the
                 # only cid anything could retry, and every later build retry leaked another base.
                 # Keep both for the next attempt (upstream, PR #82).
-                self._stranded_partials.append(str(base))
+                with _STRANDED_LOCK:
+                    self._stranded_partials.append(str(base))
                 _log.warning("gvisor_snapshot: base %s could not be confirmed deleted; retaining "
                              "its bundle for retry", cid)
                 raise _with_runsc_stderr(boot_exc, "runsc run") from boot_exc
@@ -984,7 +1096,8 @@ class GvisorSnapshotBackend:
                 # teardown OR release that pin: repeated restores leaked sandbox/gofer processes
                 # and the checkpoint could never be reclaimed. Same retention the base-boot path
                 # now does (upstream, PR #82).
-                self._stranded_partials.append(str(wd))
+                with _STRANDED_LOCK:
+                    self._stranded_partials.append(str(wd))
                 _log.warning("gvisor_snapshot: restore sandbox %s could not be confirmed deleted; "
                              "retaining its bundle for retry", cid)
             # Same treatment as the base boot: `CalledProcessError.__str__` does

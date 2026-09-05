@@ -1,3 +1,4 @@
+import pathlib
 import time
 import json
 from pathlib import Path
@@ -1258,3 +1259,376 @@ def test_a_sink_whose_drain_cannot_start_leaks_no_descriptors():
     assert after <= before + 2, (
         f"20 refused sinks leaked descriptors: {before} -> {after}"
     )
+
+
+def test_a_gvisor_ledger_append_during_the_sweep_is_not_erased(tmp_path, monkeypatch):
+    """`stranded[:] = still` erases anything appended while the sweep ran.
+
+    Three failure paths append to this ledger -- a partial checkpoint, a base whose teardown
+    could not be confirmed, and a restore workdir the same. Losing one loses the only record of
+    a directory a live sandbox may still hold. Identical defect to the FC launcher's ledger
+    (#154); found by looking for the same shape in the sibling module.
+
+    Deterministic rather than raced: the erase happens at the END of the sweep, so an append
+    injected from inside the sweep's own rmtree lands exactly in the window it closes over.
+    """
+    import os as _os
+
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    stuck = tmp_path / "stuck-checkpoint"
+    stuck.mkdir()
+    ledger = [str(stuck)]
+    newcomer = str(tmp_path / "appended-mid-sweep")
+
+    def _rmtree(path, onerror=None, **kw):
+        with gs._STRANDED_LOCK:
+            if newcomer not in ledger:
+                ledger.append(newcomer)          # a concurrent failure path appends
+        if onerror:
+            onerror(_os.rmdir, str(path), (OSError, OSError(5, "EIO"), None))
+        return
+
+    monkeypatch.setattr(gs.shutil, "rmtree", _rmtree)
+
+    gs._retry_stranded_partials(ledger)
+
+    assert newcomer in ledger, (
+        "an entry appended during the sweep was erased; nothing can ever reclaim that dir"
+    )
+    assert str(stuck) in ledger, "the still-stuck path must survive for the next sweep too"
+
+
+class TestTheDrainThreadsAreBounded:
+    """A sink's drain ends at EOF -- when the sandbox exits.
+
+    On a host where sandboxes wedge instead of exiting, one drain accumulates per restore for
+    the life of the process: the same unbounded-thread class as the FC copy workers (#154).
+    """
+
+    @staticmethod
+    def _stuck_sink(gs):
+        """A sink whose pipe never sees EOF, so its drain stays alive."""
+        return gs._StderrSink()
+
+    def test_drains_are_capped(self, monkeypatch):
+        from blastbox.host.runtime import gvisor_snapshot as gs
+
+        monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+        monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 4)
+
+        sinks = [self._stuck_sink(gs) for _ in range(20)]   # none of them ever sees EOF
+        try:
+            alive = [t for t in gs._LIVE_SINKS if t.is_alive()]
+            assert len(alive) <= 4, f"{len(alive)} drain threads accumulated past the cap"
+        finally:
+            for s in sinks:
+                s.close_write()
+
+    def test_past_the_cap_the_launch_still_proceeds(self, monkeypatch):
+        """The degradation that separates this from the FC copy cap: a copy is essential, so
+        that one REFUSES. This is diagnostics, so refusing would break warm launches to protect
+        a log. The sink degrades to DEVNULL and says so."""
+        import subprocess as _sp
+
+        from blastbox.host.runtime import gvisor_snapshot as gs
+
+        monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+        monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 1)
+
+        first = gs._StderrSink()
+        try:
+            second = gs._StderrSink()          # past the cap
+            assert second.degraded, "the sink should have degraded rather than refused"
+            assert second.write_fd == _sp.DEVNULL, (
+                "a degraded sink must hand the launch a usable fd, not a live pipe"
+            )
+            assert second.tail() == "", "a degraded sink has nothing to report"
+            second.close_write()               # must not blow up on DEVNULL
+        finally:
+            first.close_write()
+
+    def test_a_healthy_host_never_accumulates(self, monkeypatch):
+        """The control: sinks whose sandboxes exit must free their slots, or the cap would
+        eventually strangle a perfectly healthy host."""
+        from blastbox.host.runtime import gvisor_snapshot as gs
+
+        monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+        monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 2)
+
+        for _ in range(10):
+            sink = gs._StderrSink()
+            assert not sink.degraded, "a healthy host hit the cap; slots are not being freed"
+            sink.close_write()                 # EOF: the drain ends
+            sink._thread.join(timeout=5)
+
+    def test_the_drain_cap_holds_under_concurrency(self, monkeypatch):
+        """Check-then-act does not bound anything in the concurrency the cap exists for.
+
+        Several concurrent restores can all observe spare capacity and start drains before any
+        of them registers. Threads are released from a barrier here so they contend on that
+        window deliberately (codex, #155).
+        """
+        import threading as _th
+
+        from blastbox.host.runtime import gvisor_snapshot as gs
+
+        monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+        monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 3)
+
+        n = 24
+        start = _th.Barrier(n)
+        made: list = []
+        made_lock = _th.Lock()
+
+        def _make() -> None:
+            start.wait(10)
+            sink = gs._StderrSink()
+            with made_lock:
+                made.append(sink)
+
+        threads = [_th.Thread(target=_make, daemon=True) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        try:
+            alive = [t for t in gs._LIVE_SINKS if t.is_alive()]
+            assert len(alive) <= 3, (
+                f"{len(alive)} drain threads started against a cap of 3: the reservation was "
+                "not made in the same critical section as the check"
+            )
+        finally:
+            for s in made:
+                s.close_write()
+
+    def test_a_drain_that_cannot_start_releases_its_reservation(self, monkeypatch):
+        """Reserving before starting must not strand the slot when the start fails, or a host
+        out of threads would permanently lose capacity it never used."""
+        import threading as _th
+
+        from blastbox.host.runtime import gvisor_snapshot as gs
+
+        monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+        monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 2)
+
+        class _RefusingThread(_th.Thread):
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        real = gs.threading.Thread
+        gs.threading.Thread = _RefusingThread          # type: ignore[misc]
+        try:
+            for _ in range(5):
+                with pytest.raises(RuntimeError):
+                    gs._StderrSink()
+        finally:
+            gs.threading.Thread = real                 # type: ignore[misc]
+
+        # The ledger must not GROW: a thread that never started is not alive, so the prune at
+        # the head of the next construction reclaims its slot. Asserting "nothing alive" would
+        # hold trivially (a never-started thread is never alive) -- this asserts the reclaim.
+        assert len(gs._LIVE_SINKS) <= 1, (
+            f"5 refused drains left {len(gs._LIVE_SINKS)} reservations behind; the cap would "
+            "strangle a host that has recovered"
+        )
+
+    def test_a_reservation_survives_a_concurrent_prune(self, monkeypatch):
+        """A reservation is appended BEFORE its thread starts, and an unstarted thread is not
+        alive -- so pruning on liveness alone let a concurrent constructor delete a reservation
+        that had been made but not started, and both would start drains (codex, #155).
+
+        Forced deterministically: the reservation is placed by hand, then a second constructor
+        runs its prune. Counting only threads that remain alive -- which my concurrency test
+        did -- cannot see this.
+        """
+        import threading as _th
+
+        from blastbox.host.runtime import gvisor_snapshot as gs
+
+        reserved = _th.Thread(target=lambda: None, daemon=True)   # reserved, never started
+        monkeypatch.setattr(gs, "_LIVE_SINKS", [reserved])
+        monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 1)
+
+        sink = gs._StderrSink()      # its prune must NOT evict the reservation
+        try:
+            assert sink.degraded, (
+                "a concurrent prune evicted a reserved-but-unstarted drain, so this launch got "
+                "a slot the cap had already given away"
+            )
+        finally:
+            sink.close_write()
+
+    def test_a_refused_start_frees_its_reservation(self, monkeypatch):
+        """The flip side of keeping unstarted reservations: one that never starts must be
+        released explicitly, or a host out of threads loses capacity permanently."""
+        import threading as _th
+
+        from blastbox.host.runtime import gvisor_snapshot as gs
+
+        monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+        monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 2)
+
+        class _RefusingThread(_th.Thread):
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        real = gs.threading.Thread
+        gs.threading.Thread = _RefusingThread          # type: ignore[misc]
+        try:
+            for _ in range(5):
+                with pytest.raises(RuntimeError):
+                    gs._StderrSink()
+        finally:
+            gs.threading.Thread = real                 # type: ignore[misc]
+
+        assert not gs._LIVE_SINKS, (
+            f"{len(gs._LIVE_SINKS)} refused drains kept their reservations; the cap would "
+            "strangle a host that has recovered"
+        )
+
+
+def test_a_sweep_that_raises_does_not_lose_the_batch(tmp_path, monkeypatch):
+    """`rmtree` can RAISE rather than report through onerror -- worker-created nesting deep
+    enough makes recursive removal hit RecursionError.
+
+    The ledger has already been emptied by then, so an escaping exception used to lose the
+    current entry AND every unprocessed one, permanently. The pre-batch implementation iterated
+    the live list and could not lose them (codex, #155).
+    """
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    a, b, c = (str(tmp_path / n) for n in ("a", "b", "c"))
+    for d in (a, b, c):
+        pathlib.Path(d).mkdir()
+    ledger = [a, b, c]
+
+    def _rmtree(path, onerror=None, **kw):
+        if str(path) == b:
+            raise RecursionError("maximum recursion depth exceeded")
+        return None                       # a and c "succeed"
+
+    monkeypatch.setattr(gs.shutil, "rmtree", _rmtree)
+
+    with pytest.raises(RecursionError):
+        gs._retry_stranded_partials(ledger)
+
+    assert b in ledger, "the entry that raised was lost"
+    assert c in ledger, "every entry after the raise was lost"
+    assert a not in ledger, "an entry that was successfully removed should not come back"
+
+
+def test_a_failed_pipe_does_not_strand_a_slot(monkeypatch):
+    """`os.pipe()` can fail on a host in transient EMFILE.
+
+    Because the prune deliberately keeps unstarted reservations, a failure AFTER reserving
+    would strand that slot forever -- and enough of them means a recovered host discards
+    stderr for every launch, permanently (codex, #155).
+    """
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+    monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 2)
+    monkeypatch.setattr(
+        gs.os, "pipe", lambda: (_ for _ in ()).throw(OSError(24, "Too many open files"))
+    )
+
+    for _ in range(10):
+        with pytest.raises(OSError):
+            gs._StderrSink()
+
+    assert not gs._LIVE_SINKS, (
+        f"{len(gs._LIVE_SINKS)} phantom reservations survived a failed pipe; a recovered "
+        "host would discard stderr forever"
+    )
+
+def test_the_degraded_path_starts_no_thread(monkeypatch):
+    """This branch exists to keep launches alive under exhaustion, so it must not depend on
+    starting a thread -- `Thread.start()` raises on a host that is out of them, which would
+    abort the very launch the degradation is protecting."""
+    import threading as _th
+
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+    monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 1)
+
+    first = gs._StderrSink()
+    try:
+        class _RefusingThread(_th.Thread):
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        real = gs.threading.Thread
+        gs.threading.Thread = _RefusingThread      # type: ignore[misc]
+        try:
+            degraded = gs._StderrSink()            # past the cap AND out of threads
+        finally:
+            gs.threading.Thread = real             # type: ignore[misc]
+
+        assert degraded.degraded
+        assert degraded.tail() == ""
+        degraded.close_write()                     # must not blow up without a thread
+    finally:
+        first.close_write()
+
+
+def test_a_full_cap_degrades_without_needing_a_descriptor(monkeypatch):
+    """The degraded branch must work on a host that has no descriptors to spare.
+
+    Allocating the pipe before consulting the cap meant a FULL cap on an fd-exhausted host
+    raised EMFILE instead of taking the DEVNULL path -- the branch that exists to survive
+    exhaustion needing the very resource it is meant to do without (codex, #155).
+    """
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+    monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 1)
+
+    first = gs._StderrSink()                       # fills the only slot
+    try:
+        monkeypatch.setattr(
+            gs.os, "pipe", lambda: (_ for _ in ()).throw(OSError(24, "Too many open files"))
+        )
+        degraded = gs._StderrSink()                # full cap AND no descriptors
+
+        assert degraded.degraded, "a full cap on an fd-exhausted host must still degrade"
+        assert degraded.tail() == ""
+        degraded.close_write()
+    finally:
+        first.close_write()
+
+
+def test_a_reservation_is_taken_before_any_allocation(monkeypatch):
+    """Concurrent restores must not each hold a pipe before any reaches the lock, or peak
+    descriptor use exceeds the cap even though the cap itself holds."""
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+    monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 2)
+
+    order: list[str] = []
+    real_pipe = gs.os.pipe
+
+    def _pipe():
+        order.append("pipe")
+        return real_pipe()
+
+    real_append = list.append
+
+    class _Watched(list):
+        def append(self, item):
+            order.append("reserve")
+            return real_append(self, item)
+
+    monkeypatch.setattr(gs, "_LIVE_SINKS", _Watched())
+    monkeypatch.setattr(gs.os, "pipe", _pipe)
+
+    sink = gs._StderrSink()
+    try:
+        assert order[:2] == ["reserve", "pipe"], (
+            f"allocation happened before the reservation: {order}"
+        )
+    finally:
+        sink.close_write()

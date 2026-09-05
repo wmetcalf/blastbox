@@ -500,3 +500,35 @@ class TestWhatTheBoundsChanged:
             "an entry appended during the sweep was erased; nothing can ever reclaim that dir"
         )
         assert str(stuck) in ledger, "the still-stuck path must also survive for the next sweep"
+
+    def test_a_sweep_that_raises_does_not_lose_the_batch(self, tmp_path, monkeypatch):
+        """`rmtree` can RAISE rather than report through onerror -- worker-created nesting deep
+        enough makes recursive removal hit RecursionError.
+
+        The ledger is already empty by then, so an escaping exception used to lose the current
+        entry AND every unprocessed one, permanently. The pre-batch implementation iterated the
+        live list and could not lose them (codex, #155). Same defect as the gVisor sweep; both
+        modules carry this test because both carry the code.
+        """
+        from pathlib import Path as _P
+
+        from blastbox.host.runtime import fc_snapshot_launcher as fl
+
+        a, b, c = (str(tmp_path / n) for n in ("a", "b", "c"))
+        for d in (a, b, c):
+            _P(d).mkdir()
+        ledger = [a, b, c]
+
+        def _rmtree(path, onerror=None, **kw):
+            if str(path) == b:
+                raise RecursionError("maximum recursion depth exceeded")
+            return None
+
+        monkeypatch.setattr(fl.shutil, "rmtree", _rmtree)
+
+        with pytest.raises(RecursionError):
+            fl._retry_stranded_partials(ledger)
+
+        assert b in ledger, "the entry that raised was lost"
+        assert c in ledger, "every entry after the raise was lost"
+        assert a not in ledger, "an entry that was successfully removed should not come back"
