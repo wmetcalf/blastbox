@@ -1427,7 +1427,7 @@ def test_a_forged_future_mtime_falls_back_to_ctime(tmp_path, monkeypatch):
     assert not d.exists()
 
 
-def test_a_future_mtime_with_a_future_ctime_is_left_alone_AND_reported(tmp_path, monkeypatch,
+def test_a_future_mtime_with_a_future_ctime_is_left_alone_and_reported(tmp_path, monkeypatch,
                                                                         caplog):
     """When ctime is ALSO ahead the clock moved, and the tree's age is unknowable.
 
