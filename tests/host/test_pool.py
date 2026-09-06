@@ -1062,6 +1062,45 @@ def test_release_does_not_republish_slot_drained_during_recycle() -> None:
     assert pool.claim(timeout_s=0.2) is None  # never republished as claimable
 
 
+def test_a_zero_recycle_cadence_does_not_divide_by_zero() -> None:
+    """`jobs_per_recycle=0` must not reach the modulo in release().
+
+    The cadence is applied as `jobs % self._jobs_per_recycle == 0`, so a zero
+    would raise ZeroDivisionError on the FIRST job completion -- inside the
+    release path, i.e. after the job already ran. `max(1, ...)` in __init__ is
+    what prevents that, and nothing exercised it: removing the floor left every
+    test that names jobs_per_recycle green.
+
+    It is public constructor surface with no config or env path in front of it,
+    so a consumer of the library is the one who reaches it. 0 is a plausible
+    thing for them to pass, too -- the sibling knob `max_jobs_per_slot`
+    documents 0 as "disabled".
+    """
+    rt = _RecycleRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, jobs_per_recycle=0)
+    _warm_one(pool)
+    s1 = pool.claim(timeout_s=1.0)
+    assert s1 is not None
+    pool.release(s1)                       # would raise ZeroDivisionError unfloored
+    assert rt.recycled == [s1.slot_id]     # floored to 1: recycled every job
+
+    # And the pool keeps working afterwards, rather than being left wedged.
+    s2 = pool.claim(timeout_s=1.0)
+    assert s2 is not None and s2.slot_id == s1.slot_id
+
+
+def test_a_negative_recycle_cadence_is_normalised_too() -> None:
+    """A negative cadence does not raise, but `jobs % -2` is only 0 on even jobs
+    -- a silently different schedule. The same floor normalises it to 1."""
+    rt = _RecycleRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, jobs_per_recycle=-2)
+    _warm_one(pool)
+    s1 = pool.claim(timeout_s=1.0)
+    assert s1 is not None
+    pool.release(s1)
+    assert rt.recycled == [s1.slot_id]      # job 1 recycles; unfloored, -2 would not
+
+
 def test_reuse_returns_slot_to_idle_and_recycles_on_cadence() -> None:
     rt = _RecycleRuntime()
     pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0, jobs_per_recycle=2)
