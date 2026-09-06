@@ -1460,3 +1460,32 @@ def test_a_future_mtime_with_a_future_ctime_is_left_alone_AND_reported(tmp_path,
     assert d.exists()
     text = " ".join(r.getMessage() for r in caplog.records)
     assert d.name in text and "clock" in text.lower(), text
+
+
+def test_a_tree_named_in_skip_job_ids_is_spared(tmp_path):
+    """`skip_job_ids` is the dispatcher's memory of kills that FAILED: the container
+    may still be writing under a live 0o777 bind mount, so the tree is not ours to
+    delete yet.
+
+    dispatch.py passes it on every sweep and nothing tested it -- replacing
+    `retained = set(skip_job_ids)` with `set()` left the suite green, so the
+    parameter could have been dropped in a refactor without a single failure.
+
+    Both directions are asserted, because sparing everything would satisfy half of
+    it: the same tree, not named, is still reclaimed.
+    """
+    root = tmp_path / "jobs"
+    root.mkdir()
+    spared_id = "55555555-5555-5555-8555-555555555555"
+    reaped_id = "66666666-6666-6666-8666-666666666666"
+    spared = _aged_job_tree(root, spared_id)
+    reaped = _aged_job_tree(root, reaped_id)
+
+    removed = reap_stale_scratch(
+        root, 60.0, InMemoryJobStore(), logging.getLogger("t"),
+        skip_job_ids=frozenset({spared_id}),
+    )
+
+    assert removed == 1, "expected exactly the unnamed tree to go"
+    assert spared.exists(), "deleted a tree the dispatcher asked to keep"
+    assert not reaped.exists()
