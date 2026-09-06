@@ -1,11 +1,66 @@
 """Sandbox protocol and shared types for the blastbox worker SDK."""
 from __future__ import annotations
 
+import logging
+import os
+import signal
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from blastbox.limits import Limits  # noqa: F401 — re-exported for convenience
+
+_log = logging.getLogger("blastbox.worker.sandbox")
+
+
+def kill_sandbox_group(proc) -> None:
+    """SIGKILL the timed-out sandbox's process group -- never the worker's own.
+
+    Every backend launches its child with ``start_new_session=True``, which makes
+    that child a process-group leader, so ``os.getpgid(proc.pid)`` names the
+    sandbox's own group and killing it reaps the sandbox and its descendants.
+
+    The whole guarantee rests on that one flag, four files away from the kill, and
+    losing it is silent and fatal: the same expression then returns the WORKER's
+    group, and this SIGKILL takes down the worker plus everything sharing it -- on
+    a sandbox timeout, which is the most ordinary failure there is rather than an
+    exotic one. Measured by removing the flag from bwrap alone:
+
+        tests/worker/sandbox/ -> rc=137, killed partway through test_bwrap.py
+
+    with no failure reported, because the test that reaches the timeout path
+    (``TestBwrapRealRun::test_timeout_kills_sleep``) is the process the kill
+    destroys. In CI an rc of 137 reads as an OOM or an infrastructure flake, not
+    as a defect -- so no test could report this while the kill was unguarded.
+
+    Hence the group is compared against ours before it is signalled. The fallback
+    kills only the direct child, which leaks its descendants; a leak the caller's
+    reaper can still see beats an outage it cannot.
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):
+        return                      # already reaped: nothing to signal
+    if pgid == os.getpgid(0):
+        # Refusing is the whole point; log LOUDLY, because reaching here means a
+        # backend stopped starting a new session and the sandbox's children are
+        # now leaking on every timeout.
+        _log.error(
+            "sandbox.kill_group_refused pgid=%s reason=shares_worker_process_group "
+            "impact=descendants_of_the_sandbox_leak "
+            "fix=launch_the_child_with_start_new_session=True",
+            pgid,
+        )
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+        return
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        pass
 
 
 @dataclass(frozen=True)

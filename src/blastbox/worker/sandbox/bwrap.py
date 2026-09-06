@@ -45,7 +45,7 @@ from typing import Callable
 from blastbox.errors import SandboxError, SandboxUnavailable
 from blastbox.limits import Limits
 from blastbox.worker.sandbox.apparmor import DEFAULT_PROFILE, resolve_profile
-from blastbox.worker.sandbox.base import SandboxRequest, SandboxResult
+from blastbox.worker.sandbox.base import SandboxRequest, SandboxResult, kill_sandbox_group
 
 
 _log = logging.getLogger("blastbox.worker.sandbox.bwrap")
@@ -342,10 +342,7 @@ class BubblewrapSandbox:
                 exit_code = proc.returncode
             except subprocess.TimeoutExpired:
                 killed = True
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                except (ProcessLookupError, OSError):
-                    pass
+                kill_sandbox_group(proc)
                 try:
                     stdout, stderr = proc.communicate(timeout=2.0)
                 except subprocess.TimeoutExpired:

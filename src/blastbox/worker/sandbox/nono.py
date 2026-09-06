@@ -38,7 +38,7 @@ from typing import Callable
 
 from blastbox.errors import SandboxError, SandboxUnavailable
 from blastbox.limits import Limits
-from blastbox.worker.sandbox.base import SandboxRequest, SandboxResult
+from blastbox.worker.sandbox.base import SandboxRequest, SandboxResult, kill_sandbox_group
 
 _MINIMAL_ENV: dict[str, str] = {
     "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -189,10 +189,7 @@ class NonoSandbox:
             exit_code = proc.returncode
         except subprocess.TimeoutExpired:
             killed = True
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                pass
+            kill_sandbox_group(proc)
             try:
                 stdout, stderr = proc.communicate(timeout=2.0)
             except subprocess.TimeoutExpired:

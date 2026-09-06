@@ -28,7 +28,6 @@ Any single reason makes ``secure == False``.
 from __future__ import annotations
 
 import logging
-import os
 import shutil
 import signal
 import subprocess
@@ -36,7 +35,7 @@ from pathlib import Path
 
 from blastbox.errors import SandboxError, SandboxUnavailable
 from blastbox.worker.sandbox.apparmor import profile_loaded, resolve_profile
-from blastbox.worker.sandbox.base import SandboxRequest, SandboxResult
+from blastbox.worker.sandbox.base import SandboxRequest, SandboxResult, kill_sandbox_group
 
 
 _log = logging.getLogger("blastbox.worker.sandbox.nsjail")
@@ -296,10 +295,7 @@ class NsjailSandbox:
             exit_code = proc.returncode
         except subprocess.TimeoutExpired:
             killed = True
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                pass
+            kill_sandbox_group(proc)
             try:
                 stdout, stderr = proc.communicate(timeout=2.0)
             except subprocess.TimeoutExpired:
