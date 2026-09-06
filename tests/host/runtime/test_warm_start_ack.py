@@ -12,6 +12,7 @@ releases. The ack is therefore opt-in from the host (`"ack": true` in the job he
 only on request.
 """
 from blastbox.worker.warm import AckCapability
+import contextlib
 import json
 import socket
 import struct
@@ -20,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from blastbox.host.runtime.firecracker import VsockHostWarmControl
+from blastbox.host.runtime.firecracker import VsockHostWarmControl, VsockReadySignal
 from blastbox.worker.fc_guest import WARM_ACK
 
 
@@ -394,3 +395,74 @@ def test_snapshot_mode_capability_is_epoch_scoped_end_to_end(tmp_path):
     cap.publish(1)                                  # a silent replacement
     assert cap.capable_for(1) is False, "a silent replacement must not inherit"
     assert cap.capable_for(0) is False, "a retired epoch is no longer the published one"
+
+
+def _drive_ready(sig, *, ack_generation: int) -> None:
+    """Send one READY+ack over a real socket into the signal's accept loop.
+
+    Mirrors test_a_split_readiness_advertisement_is_not_lost, which is the only
+    way this branch is reachable: the decision lives inside the selector loop.
+    """
+    import socket as _socket
+    import threading
+    import time as _t
+
+    from blastbox.host.runtime.firecracker import _VsockReadyState
+    from blastbox.worker.fc_guest import READY_ACK_SUFFIX, READY_TOKEN
+
+    srv_path = Path("/tmp") / f"bb-defer-{_t.time_ns()}.sock"
+    srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    srv.bind(str(srv_path))
+    srv.listen(4)
+    srv.setblocking(False)
+    st = _VsockReadyState.__new__(_VsockReadyState)
+    st.srv = srv
+    st.ready = threading.Event()
+    st.stop = threading.Event()
+    t = threading.Thread(target=sig._accept_loop, args=("slot-1", st, ack_generation), daemon=True)
+    t.start()
+    try:
+        c = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        c.connect(str(srv_path))
+        c.sendall(READY_TOKEN + READY_ACK_SUFFIX)
+        c.close()
+        assert st.ready.wait(5.0), "readiness was never recognised"
+    finally:
+        st.stop.set()
+        srv.close()
+        with contextlib.suppress(OSError):
+            srv_path.unlink()
+
+
+def test_a_base_build_advertisement_is_not_believed_until_it_publishes():
+    """`defer_ack=True` must OBSERVE, not LEARN.
+
+    A base build's advertisement is only meaningful once the build produced a
+    usable artifact: `observe` parks it, `publish` confirms it, and a build that
+    never publishes leaves it disbelieved. `learn` would believe it immediately --
+    arming the fast repair from an artifact that may never exist.
+
+    fc_snapshot_runtime.py passes `defer_ack=True` for exactly this, and nothing
+    tested the wiring: forcing `self._defer_ack = False` left tests/host green.
+    """
+    seen = AckCapability()
+    seen.begin_build()
+    sig = VsockReadySignal(ack_capable=seen, defer_ack=True)
+
+    _drive_ready(sig, ack_generation=7)
+
+    assert not seen, "a base build's advertisement was believed before it published"
+    seen.publish(7)
+    assert seen, "publishing the build must confirm the observed advertisement"
+
+
+def test_a_per_slot_advertisement_is_believed_immediately():
+    """The control: a live slot's READY is about an artifact that already
+    published, so it LEARNS. Without this, 'always observe' would pass the test
+    above."""
+    seen = AckCapability()
+    sig = VsockReadySignal(ack_capable=seen, defer_ack=False)
+
+    _drive_ready(sig, ack_generation=7)
+
+    assert seen, "a per-slot advertisement must be believed at once"
