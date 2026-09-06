@@ -28,7 +28,6 @@ require it to differ from ours. A test that merely checked
 stopped having that effect.
 """
 import os
-import shutil
 import subprocess
 
 import pytest
@@ -36,44 +35,89 @@ import pytest
 from blastbox.limits import Limits
 from blastbox.worker.sandbox.base import SandboxRequest
 
+from .conftest import bwrap_usable, nsjail_usable
 
-def _bwrap():
+# nono is launched through its own `popen` seam rather than the module-level
+# `subprocess.Popen`, so `/usr/bin/true` stands in for the binary: the backend
+# still builds and launches a REAL child, which is all this test reads.
+_FAKE_NONO = "/usr/bin/true"
+
+
+def _run_via_module_popen(make_backend, recording, monkeypatch):
+    """bwrap / nsjail / container resolve `subprocess.Popen` at call time.
+
+    The backend is CONSTRUCTED BEFORE the recorder is installed. Construction
+    probes the host (cgroup-pids, seccomp, AppArmor) by running the binary, and
+    `subprocess.run` builds those probes on the very `Popen` being patched -- so
+    recording from construction captures a PROBE child, which is correctly in our
+    own process group, and the test fails on its own setup. Measured: it did.
+    """
+    backend = make_backend()
+    monkeypatch.setattr(subprocess, "Popen", recording)
+    return backend.run(
+        SandboxRequest(argv=["/bin/true"], limits=Limits(timeout_s=20))
+    )
+
+
+def _bwrap(recording, monkeypatch, tmp_path):
     from blastbox.worker.sandbox.bwrap import BubblewrapSandbox
-    return BubblewrapSandbox()
+    return _run_via_module_popen(BubblewrapSandbox, recording, monkeypatch)
 
 
-def _nsjail():
+def _nsjail(recording, monkeypatch, tmp_path):
     from blastbox.worker.sandbox.nsjail import NsjailSandbox
-    return NsjailSandbox()
+    return _run_via_module_popen(NsjailSandbox, recording, monkeypatch)
 
 
-def _container():
+def _container(recording, monkeypatch, tmp_path):
     from blastbox.worker.sandbox.container import ContainerSandbox
-    return ContainerSandbox()
+    return _run_via_module_popen(ContainerSandbox, recording, monkeypatch)
 
 
-# Gated on the HOST capability -- the binary being installed -- and never on the
-# backend's own smoketest: gating a backend's test on that backend turns a
-# malformed launch into a skip of the test written to catch it. ContainerSandbox
-# execs directly and needs no binary.
+def _nono(recording, monkeypatch, tmp_path):
+    """nono binds `subprocess.Popen` as a DEFAULT ARGUMENT, evaluated at import.
+
+    Monkeypatching the module attribute afterwards therefore binds nothing, which
+    is why this backend needs its documented `popen` seam instead -- and why it
+    would have gone on regressing unnoticed had the matrix only patched the
+    module (codex).
+    """
+    from blastbox.worker.sandbox.nono import NonoSandbox
+    sb = NonoSandbox(nono_bin=_FAKE_NONO, state_dir=tmp_path / "state", popen=recording)
+    return sb.run(SandboxRequest(argv=["/bin/true"], limits=Limits(timeout_s=20)))
+
+
+# Gated on whether the backend can actually RUN here, not merely on the binary
+# being installed. `shutil.which` answers a different question: bwrap and nsjail
+# are installed on hosts whose unprivileged user namespaces are restricted, where
+# the backend correctly returns nonzero -- and this test would then fail on the
+# host's configuration while reading as a process-group defect.
+#
+# `bwrap_usable()` / `nsjail_usable()` ask the HOST by invoking the binary
+# directly; they do not ask `select_sandbox()`, so gating on them is not the
+# circular case where a backend's own selector decides whether to test it.
 BACKENDS = [
-    pytest.param(_bwrap, marks=pytest.mark.skipif(
-        not shutil.which("bwrap"), reason="bwrap is not installed on this host")),
-    pytest.param(_nsjail, marks=pytest.mark.skipif(
-        not shutil.which("nsjail"), reason="nsjail is not installed on this host")),
-    pytest.param(_container),
+    pytest.param(_bwrap, "bwrap", marks=pytest.mark.skipif(
+        bwrap_usable() is not None, reason=f"bwrap unusable here: {bwrap_usable()}")),
+    pytest.param(_nsjail, "nsjail", marks=pytest.mark.skipif(
+        nsjail_usable() is not None, reason=f"nsjail unusable here: {nsjail_usable()}")),
+    pytest.param(_container, "container"),
+    pytest.param(_nono, "nono"),
 ]
 
 
-@pytest.mark.parametrize("make_backend", BACKENDS, ids=["bwrap", "nsjail", "container"])
-def test_a_sandbox_child_never_shares_the_workers_process_group(make_backend, monkeypatch):
+@pytest.mark.parametrize("launch,name", BACKENDS,
+                         ids=[p.values[1] for p in BACKENDS])
+def test_a_sandbox_child_never_shares_the_workers_process_group(
+    launch, name, monkeypatch, tmp_path
+):
     """The group `run()` would SIGKILL on timeout must not be our own.
 
-    Parameterized over every backend rather than whichever one `select_sandbox()`
-    happens to return: they each carry their own copy of the launch, so one
-    losing the flag is invisible in a test that only exercises the selected one.
+    Parameterized over EVERY backend rather than whichever one `select_sandbox()`
+    happens to return: each carries its own copy of the launch, so one losing the
+    flag is invisible to a test that only exercises the selected one. `detect.py`
+    enumerates four, and nono is the one a module-level patch cannot reach.
     """
-    backend = make_backend()
     real_popen = subprocess.Popen
     seen: dict = {}
 
@@ -85,13 +129,12 @@ def test_a_sandbox_child_never_shares_the_workers_process_group(make_backend, mo
         seen.setdefault("child_pgid", os.getpgid(proc.pid))
         return proc
 
-    monkeypatch.setattr(subprocess, "Popen", recording_popen)
+    result = launch(recording_popen, monkeypatch, tmp_path)
 
-    result = backend.run(SandboxRequest(argv=["/bin/true"], limits=Limits(timeout_s=20)))
-
-    assert result.exit_code == 0, f"the probe command did not run: {result}"
-    assert "child_pgid" in seen, "the backend never launched a child process"
+    assert result.exit_code == 0, f"the probe command did not run under {name}: {result}"
+    assert "child_pgid" in seen, f"{name} never launched a child process"
     assert seen["child_pgid"] != os.getpgid(0), (
-        f"the sandbox child shares the worker's process group ({seen['child_pgid']}); "
-        "on timeout os.killpg(os.getpgid(proc.pid), SIGKILL) would SIGKILL this worker"
+        f"the {name} sandbox child shares the worker's process group "
+        f"({seen['child_pgid']}); on timeout os.killpg(os.getpgid(proc.pid), SIGKILL) "
+        "would SIGKILL this worker"
     )
