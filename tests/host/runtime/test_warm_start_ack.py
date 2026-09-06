@@ -12,11 +12,11 @@ releases. The ack is therefore opt-in from the host (`"ack": true` in the job he
 only on request.
 """
 from blastbox.worker.warm import AckCapability
-import contextlib
 import json
 import socket
 import struct
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -397,75 +397,99 @@ def test_snapshot_mode_capability_is_epoch_scoped_end_to_end(tmp_path):
     assert cap.capable_for(0) is False, "a retired epoch is no longer the published one"
 
 
-def _drive_ready(sig, *, ack_generation: int) -> None:
-    """Send one READY+ack over a real socket into the signal's accept loop.
+def _drive_ready(sig, tmp_path, *, ack_generation: int) -> None:
+    """Send one READY+ack over a real socket, through the PUBLIC prepare() path.
 
-    Mirrors test_a_split_readiness_advertisement_is_not_lost, which is the only
-    way this branch is reachable: the decision lives inside the selector loop.
+    Driving `_accept_loop` directly would skip the handoff that carries the
+    caller-sampled generation into the accept thread's arguments (codex): with
+    the loop invoked by hand, `prepare()` could stop forwarding `ack_generation`
+    and every test here would still pass -- the listener would then `observe(None)`
+    and the later `publish(actual_epoch)` could not confirm the advertisement,
+    silently disabling capability detection. So prepare() binds the socket and
+    starts the thread, exactly as a launch does.
     """
     import socket as _socket
-    import threading
-    import time as _t
 
-    from blastbox.host.runtime.firecracker import _VsockReadyState
+    from blastbox.host.pool import Slot, SlotState
+    from blastbox.host.runtime.firecracker import _READY_PORT
     from blastbox.worker.fc_guest import READY_ACK_SUFFIX, READY_TOKEN
 
-    srv_path = Path("/tmp") / f"bb-defer-{_t.time_ns()}.sock"
-    srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-    srv.bind(str(srv_path))
-    srv.listen(4)
-    srv.setblocking(False)
-    st = _VsockReadyState.__new__(_VsockReadyState)
-    st.srv = srv
-    st.ready = threading.Event()
-    st.stop = threading.Event()
-    t = threading.Thread(target=sig._accept_loop, args=("slot-1", st, ack_generation), daemon=True)
-    t.start()
+    slot_dir = tmp_path / "s"
+    (slot_dir / "out").mkdir(parents=True, exist_ok=True)
+    slot = Slot(slot_id="ack-slot", control_dir=slot_dir / "ctrl",
+                input_dir=slot_dir / "in", output_dir=slot_dir / "out",
+                state=SlotState.WARMING)
+
+    sig.prepare(slot, ack_generation=ack_generation)
     try:
+        uds = slot.output_dir.parent / f"vsock.sock_{_READY_PORT}"
+        # prepare() only LOGS a failed bind and returns, so without this the test
+        # would hang on a 108-byte path overrun and read as a product defect.
+        assert uds.exists(), f"prepare() never bound the readiness listener at {uds}"
         c = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-        c.connect(str(srv_path))
+        c.connect(str(uds))
         c.sendall(READY_TOKEN + READY_ACK_SUFFIX)
         c.close()
-        assert st.ready.wait(5.0), "readiness was never recognised"
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not sig.is_ready(slot):
+            time.sleep(0.01)
+        assert sig.is_ready(slot), "readiness was never recognised"
     finally:
-        st.stop.set()
-        srv.close()
-        with contextlib.suppress(OSError):
-            srv_path.unlink()
+        sig.cleanup(slot)
 
 
-def test_a_base_build_advertisement_is_not_believed_until_it_publishes():
+def test_a_base_build_advertisement_is_not_believed_until_it_publishes(tmp_path):
     """`defer_ack=True` must OBSERVE, not LEARN.
 
     A base build's advertisement is only meaningful once the build produced a
     usable artifact: `observe` parks it, `publish` confirms it, and a build that
-    never publishes leaves it disbelieved. `learn` would believe it immediately --
-    arming the fast repair from an artifact that may never exist.
+    never publishes leaves it disbelieved. `learn` would believe it -- arming the
+    fast repair from an artifact that may never exist.
 
     fc_snapshot_runtime.py passes `defer_ack=True` for exactly this, and nothing
     tested the wiring: forcing `self._defer_ack = False` left tests/host green.
+
+    ARTIFACT-SCOPED, matching fc_snapshot_runtime.py:536, because the scoping
+    changes what the defect looks like (codex). Unscoped, a wrong `learn(7)` sets
+    the flag at once and the first assertion catches it; scoped, `learn(7)` finds
+    no published epoch to match, records nothing, and the miss only surfaces at
+    `publish(7)` -- which then has an empty `_pending` and clears the flag. Both
+    assertions are load-bearing here, and only in the production configuration
+    does the second one describe the real failure.
     """
-    seen = AckCapability()
+    seen = AckCapability(artifact_scoped=True)
     seen.begin_build()
     sig = VsockReadySignal(ack_capable=seen, defer_ack=True)
 
-    _drive_ready(sig, ack_generation=7)
+    _drive_ready(sig, tmp_path, ack_generation=7)
 
-    assert not seen, "a base build's advertisement was believed before it published"
+    assert not seen.capable_for(7), (
+        "a base build's advertisement was believed before it published"
+    )
     seen.publish(7)
-    assert seen, "publishing the build must confirm the observed advertisement"
+    assert seen.capable_for(7), (
+        "publishing the build must confirm the observed advertisement"
+    )
 
 
-def test_a_per_slot_advertisement_is_believed_immediately():
-    """The control: a live slot's READY is about an artifact that already
-    published, so it LEARNS. Without this, 'always observe' would pass the test
-    above."""
-    seen = AckCapability()
+def test_a_per_slot_advertisement_is_believed_immediately(tmp_path):
+    """The control: a live slot's READY is about an artifact that ALREADY
+    published, so it LEARNS. Without this, "always observe" would pass the test
+    above.
+
+    The publish() is the lifecycle, not setup noise -- a per-slot listener only
+    ever runs against a published artifact, and under artifact scoping an ack
+    naming an epoch that was never published teaches nothing at all.
+    """
+    seen = AckCapability(artifact_scoped=True)
+    seen.publish(7)
+    assert not seen.capable_for(7), "the artifact published without advertising"
+
     sig = VsockReadySignal(ack_capable=seen, defer_ack=False)
 
-    _drive_ready(sig, ack_generation=7)
+    _drive_ready(sig, tmp_path, ack_generation=7)
 
-    assert seen, "a per-slot advertisement must be believed at once"
+    assert seen.capable_for(7), "a per-slot advertisement must be believed at once"
 
 
 def test_the_snapshot_factory_defers_the_base_builds_ack(tmp_path, monkeypatch):
@@ -497,13 +521,20 @@ def test_the_snapshot_factory_defers_the_base_builds_ack(tmp_path, monkeypatch):
 
     monkeypatch.setattr(fc, "VsockReadySignal", _Recorder)
 
+    shared = AckCapability(artifact_scoped=True)
     _vsock_ready_check_factory(tmp_path / "vsock.sock",
-                               ack_capable=AckCapability(), ack_generation=9)
+                               ack_capable=shared, ack_generation=9)
 
     assert captured.get("defer_ack") is True, (
         f"the base-build listener was built without defer_ack: {captured}"
     )
-    assert captured.get("ack_capable") is not None, "the shared capability set was not passed"
+    # IDENTITY, not truthiness (codex): a factory that built its own AckCapability
+    # would satisfy `is not None` while readiness observations landed in an object
+    # SnapshotManager.publish() never updates, leaving every restored slot's shared
+    # capability unset.
+    assert captured.get("ack_capable") is shared, (
+        f"the shared capability object was not forwarded: {captured.get('ack_capable')!r}"
+    )
     assert captured.get("prepared_generation") == 9, (
         "the generation sampled before the spawn must be the one bound"
     )
