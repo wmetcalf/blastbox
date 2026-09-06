@@ -1329,3 +1329,163 @@ class TestLegacyMigration:
             tmp_path, blobs, store, logging.getLogger("t"))
         assert (migrated, skipped, failed) == (0, 1, 0)
         assert blobs.put_calls == 0, "re-uploaded a result that was already durable"
+
+
+# --- the age evidence that decides whether a scratch tree may be reaped -------
+#
+# `reap_stale_scratch` treats a tree as live if any entry's mtime is newer than the
+# cutoff, so "how old is this" is the whole decision. Two guards protect it, both
+# added from #84/#85 review with the rationale in the source, and neither had a
+# test: mutating them (lstat -> stat, and trusting a future mtime) left the entire
+# tests/host/jobs suite green.
+
+
+def _aged_job_tree(root: Path, job_id: str, age_s: float = 99_999.0,
+                   *, symlink_to: Path | None = None) -> Path:
+    d = root / job_id
+    (d / "output").mkdir(parents=True)
+    (d / "input.bin").write_bytes(b"x")
+    # BEFORE the ageing loop, deliberately: creating an entry updates its parent
+    # directory's mtime, so a link added afterwards leaves output/ looking fresh
+    # and the tree is held live for a reason that has nothing to do with the link.
+    if symlink_to is not None:
+        (d / "output" / "link").symlink_to(symlink_to)
+    old = time.time() - age_s
+    for p in sorted(d.rglob("*"), reverse=True) + [d]:
+        with contextlib.suppress(OSError, NotImplementedError):
+            os.utime(p, (old, old), follow_symlinks=False)
+    return d
+
+
+def test_a_symlink_to_a_busy_path_cannot_pin_the_tree_alive(tmp_path):
+    """The worker owns output/, so it can drop a symlink at a continuously-touched
+    path. Dereferencing it borrows that path's fresh mtime and the tree is never
+    reclaimed -- #84, on demand, from inside the sandbox.
+
+    `lstat` is what stops it: the link's OWN stamp is the only evidence it gets to
+    offer. Measured with the guard reverted to `stat`: reaped=0, tree survives.
+    """
+    busy = tmp_path / "busy"
+    busy.mkdir()
+    (busy / "f").write_text("x")            # freshly created => fresh mtime
+
+    root = tmp_path / "jobs"
+    root.mkdir()
+    d = _aged_job_tree(root, "11111111-1111-1111-8111-111111111111", symlink_to=busy)
+
+    removed = reap_stale_scratch(root, 60.0, InMemoryJobStore(), logging.getLogger("t"))
+    assert removed == 1, "the symlink's target pinned the tree alive"
+    assert not d.exists()
+
+
+def test_an_ordinary_fresh_file_still_keeps_the_tree(tmp_path):
+    """The positive control: a genuinely fresh entry must still count as live, or
+    the test above would pass with the age check removed altogether."""
+    root = tmp_path / "jobs"
+    root.mkdir()
+    d = _aged_job_tree(root, "22222222-2222-2222-8222-222222222222")
+    (d / "output" / "recent.bin").write_bytes(b"y")   # now
+
+    removed = reap_stale_scratch(root, 60.0, InMemoryJobStore(), logging.getLogger("t"))
+    assert removed == 0
+    assert d.exists()
+
+
+def test_a_forged_future_mtime_falls_back_to_ctime(tmp_path, monkeypatch):
+    """A future mtime must not be taken at face value.
+
+    An mtime years ahead makes a tree look live forever. The guard falls back to
+    ctime, which nothing can set: if ctime is sane the mtime was forged, and ctime
+    is the honest age.
+
+    The state is crafted rather than written to disk because it cannot be produced
+    there -- `os.utime` updates ctime as a side effect, so a file with a FUTURE
+    mtime always has a FRESH ctime. Only a stat_result can hold "future mtime, old
+    ctime" together, which is exactly the combination the guard is about.
+    """
+    root = tmp_path / "jobs"
+    root.mkdir()
+    d = _aged_job_tree(root, "33333333-3333-3333-8333-333333333333")
+    forged = d / "input.bin"
+
+    old = time.time() - 99_999
+    future = time.time() + 10_000_000
+    real_lstat = pathlib.Path.lstat
+
+    def fake_lstat(self, *a, **kw):
+        st = real_lstat(self, *a, **kw)
+        if self == forged:
+            fields = list(st)
+            fields[8] = future     # st_mtime: forged
+            fields[9] = old        # st_ctime: the honest, old age
+            return os.stat_result(fields)
+        return st
+
+    monkeypatch.setattr(pathlib.Path, "lstat", fake_lstat)
+    removed = reap_stale_scratch(root, 60.0, InMemoryJobStore(), logging.getLogger("t"))
+    assert removed == 1, "a forged future mtime pinned the tree alive"
+    assert not d.exists()
+
+
+def test_a_future_mtime_with_a_future_ctime_is_left_alone_and_reported(tmp_path, monkeypatch,
+                                                                        caplog):
+    """When ctime is ALSO ahead the clock moved, and the tree's age is unknowable.
+
+    Two halves, and the second is the one a mutation caught: the safe answer is to
+    leave the tree (deleting on a guess is unrecoverable) AND to say so once. The
+    `float("inf")` sentinel is how it gets reported -- returning the future ctime
+    instead keeps the tree just the same, so only the missing warning distinguishes
+    them, and nothing asserted the warning.
+    """
+    root = tmp_path / "jobs"
+    root.mkdir()
+    d = _aged_job_tree(root, "44444444-4444-4444-8444-444444444445")
+    odd = d / "input.bin"
+
+    future = time.time() + 10_000_000
+    real_lstat = pathlib.Path.lstat
+
+    def fake_lstat(self, *a, **kw):
+        st = real_lstat(self, *a, **kw)
+        if self == odd:
+            fields = list(st)
+            fields[8] = fields[9] = future
+            return os.stat_result(fields)
+        return st
+
+    monkeypatch.setattr(pathlib.Path, "lstat", fake_lstat)
+    with caplog.at_level(logging.WARNING, logger="t"):
+        removed = reap_stale_scratch(root, 60.0, InMemoryJobStore(), logging.getLogger("t"))
+    assert removed == 0, "deleted a tree whose age cannot be established"
+    assert d.exists()
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert d.name in text and "clock" in text.lower(), text
+
+
+def test_a_tree_named_in_skip_job_ids_is_spared(tmp_path):
+    """`skip_job_ids` is the dispatcher's memory of kills that FAILED: the container
+    may still be writing under a live 0o777 bind mount, so the tree is not ours to
+    delete yet.
+
+    dispatch.py passes it on every sweep and nothing tested it -- replacing
+    `retained = set(skip_job_ids)` with `set()` left the suite green, so the
+    parameter could have been dropped in a refactor without a single failure.
+
+    Both directions are asserted, because sparing everything would satisfy half of
+    it: the same tree, not named, is still reclaimed.
+    """
+    root = tmp_path / "jobs"
+    root.mkdir()
+    spared_id = "55555555-5555-5555-8555-555555555555"
+    reaped_id = "66666666-6666-6666-8666-666666666666"
+    spared = _aged_job_tree(root, spared_id)
+    reaped = _aged_job_tree(root, reaped_id)
+
+    removed = reap_stale_scratch(
+        root, 60.0, InMemoryJobStore(), logging.getLogger("t"),
+        skip_job_ids=frozenset({spared_id}),
+    )
+
+    assert removed == 1, "expected exactly the unnamed tree to go"
+    assert spared.exists(), "deleted a tree the dispatcher asked to keep"
+    assert not reaped.exists()
