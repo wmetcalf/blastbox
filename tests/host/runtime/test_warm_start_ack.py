@@ -466,3 +466,44 @@ def test_a_per_slot_advertisement_is_believed_immediately():
     _drive_ready(sig, ack_generation=7)
 
     assert seen, "a per-slot advertisement must be believed at once"
+
+
+def test_the_snapshot_factory_defers_the_base_builds_ack(tmp_path, monkeypatch):
+    """The production wiring, not just the class branch.
+
+    The two tests above prove VsockReadySignal honours `defer_ack`; they say
+    nothing about `_vsock_ready_check_factory` still passing it. Measured: dropping
+    `defer_ack=True` from fc_snapshot_runtime.py leaves the whole tests/host suite
+    green, so a base-build listener could silently revert to the immediate `learn()`
+    (codex).
+
+    The recorder is installed on `firecracker.VsockReadySignal`, NOT on
+    `fc_snapshot_runtime`: the factory does a function-local
+    `from ... import VsockReadySignal`, so that is the name it resolves at call
+    time. Patching the importing module's namespace binds nothing -- checked, and
+    the test then fails with an empty `captured`, which is how it should behave.
+    """
+    import blastbox.host.runtime.firecracker as fc
+    from blastbox.host.runtime.fc_snapshot_runtime import _vsock_ready_check_factory
+
+    captured: dict = {}
+
+    class _Recorder:
+        def __init__(self, **kw):
+            captured.update(kw)
+
+        def prepare(self, slot, ack_generation=None):
+            captured["prepared_generation"] = ack_generation
+
+    monkeypatch.setattr(fc, "VsockReadySignal", _Recorder)
+
+    _vsock_ready_check_factory(tmp_path / "vsock.sock",
+                               ack_capable=AckCapability(), ack_generation=9)
+
+    assert captured.get("defer_ack") is True, (
+        f"the base-build listener was built without defer_ack: {captured}"
+    )
+    assert captured.get("ack_capable") is not None, "the shared capability set was not passed"
+    assert captured.get("prepared_generation") == 9, (
+        "the generation sampled before the spawn must be the one bound"
+    )
