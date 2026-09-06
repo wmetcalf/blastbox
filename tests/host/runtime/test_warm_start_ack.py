@@ -397,7 +397,7 @@ def test_snapshot_mode_capability_is_epoch_scoped_end_to_end(tmp_path):
     assert cap.capable_for(0) is False, "a retired epoch is no longer the published one"
 
 
-def _drive_ready(sig, tmp_path, *, ack_generation: int) -> None:
+def _drive_ready(sig, *, ack_generation: int) -> None:
     """Send one READY+ack over a real socket, through the PUBLIC prepare() path.
 
     Driving `_accept_loop` directly would skip the handoff that carries the
@@ -407,15 +407,25 @@ def _drive_ready(sig, tmp_path, *, ack_generation: int) -> None:
     and the later `publish(actual_epoch)` could not confirm the advertisement,
     silently disabling capability detection. So prepare() binds the socket and
     starts the thread, exactly as a launch does.
+
+    The socket root is a short mkdtemp under /tmp, NOT `tmp_path`. prepare() puts
+    the listener at `<slot_dir>/vsock.sock_<port>` and AF_UNIX caps the whole path
+    at 108 bytes; pytest's tmp_path embeds the test's (long) name beneath whatever
+    --basetemp or TMPDIR is in force, so deriving from it would make an otherwise
+    host-independent unit test fail wherever that root happens to be long. Pinning
+    the dir keeps it deterministic per AGENTS.md rather than merely usually-true.
     """
+    import shutil
     import socket as _socket
+    import tempfile
 
     from blastbox.host.pool import Slot, SlotState
     from blastbox.host.runtime.firecracker import _READY_PORT
     from blastbox.worker.fc_guest import READY_ACK_SUFFIX, READY_TOKEN
 
-    slot_dir = tmp_path / "s"
-    (slot_dir / "out").mkdir(parents=True, exist_ok=True)
+    root = Path(tempfile.mkdtemp(prefix="bb", dir="/tmp"))
+    slot_dir = root / "s"
+    (slot_dir / "out").mkdir(parents=True)
     slot = Slot(slot_id="ack-slot", control_dir=slot_dir / "ctrl",
                 input_dir=slot_dir / "in", output_dir=slot_dir / "out",
                 state=SlotState.WARMING)
@@ -424,8 +434,11 @@ def _drive_ready(sig, tmp_path, *, ack_generation: int) -> None:
     try:
         uds = slot.output_dir.parent / f"vsock.sock_{_READY_PORT}"
         # prepare() only LOGS a failed bind and returns, so without this the test
-        # would hang on a 108-byte path overrun and read as a product defect.
-        assert uds.exists(), f"prepare() never bound the readiness listener at {uds}"
+        # would hang on the readiness wait below and read as a product defect.
+        assert uds.exists(), (
+            f"prepare() never bound the readiness listener at {uds} "
+            f"({len(str(uds))} bytes; AF_UNIX caps at 108)"
+        )
         c = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
         c.connect(str(uds))
         c.sendall(READY_TOKEN + READY_ACK_SUFFIX)
@@ -436,9 +449,10 @@ def _drive_ready(sig, tmp_path, *, ack_generation: int) -> None:
         assert sig.is_ready(slot), "readiness was never recognised"
     finally:
         sig.cleanup(slot)
+        shutil.rmtree(root, ignore_errors=True)
 
 
-def test_a_base_build_advertisement_is_not_believed_until_it_publishes(tmp_path):
+def test_a_base_build_advertisement_is_not_believed_until_it_publishes():
     """`defer_ack=True` must OBSERVE, not LEARN.
 
     A base build's advertisement is only meaningful once the build produced a
@@ -461,7 +475,7 @@ def test_a_base_build_advertisement_is_not_believed_until_it_publishes(tmp_path)
     seen.begin_build()
     sig = VsockReadySignal(ack_capable=seen, defer_ack=True)
 
-    _drive_ready(sig, tmp_path, ack_generation=7)
+    _drive_ready(sig, ack_generation=7)
 
     assert not seen.capable_for(7), (
         "a base build's advertisement was believed before it published"
@@ -472,7 +486,7 @@ def test_a_base_build_advertisement_is_not_believed_until_it_publishes(tmp_path)
     )
 
 
-def test_a_per_slot_advertisement_is_believed_immediately(tmp_path):
+def test_a_per_slot_advertisement_is_believed_immediately():
     """The control: a live slot's READY is about an artifact that ALREADY
     published, so it LEARNS. Without this, "always observe" would pass the test
     above.
@@ -487,7 +501,7 @@ def test_a_per_slot_advertisement_is_believed_immediately(tmp_path):
 
     sig = VsockReadySignal(ack_capable=seen, defer_ack=False)
 
-    _drive_ready(sig, tmp_path, ack_generation=7)
+    _drive_ready(sig, ack_generation=7)
 
     assert seen.capable_for(7), "a per-slot advertisement must be believed at once"
 
