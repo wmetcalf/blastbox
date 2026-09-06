@@ -34,7 +34,7 @@ from typing import Callable
 
 from blastbox.errors import SandboxError
 from blastbox.limits import Limits
-from blastbox.worker.sandbox.base import SandboxRequest, SandboxResult
+from blastbox.worker.sandbox.base import SandboxRequest, SandboxResult, kill_sandbox_group
 
 
 _log = logging.getLogger("blastbox.worker.sandbox.container")
@@ -284,10 +284,7 @@ class ContainerSandbox:
         except subprocess.TimeoutExpired:
             killed = True
             # Kill the entire process group to reap any children.
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                pass
+            kill_sandbox_group(proc)
             # Drain any partial output; accept another short timeout.
             try:
                 stdout, stderr = proc.communicate(timeout=2.0)

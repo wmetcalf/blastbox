@@ -183,10 +183,64 @@ def test_run_timeout_kills_and_flags(tmp_path, monkeypatch):
                 raise subprocess.TimeoutExpired(cmd="nono", timeout=timeout)
             return b"", b""
 
-    monkeypatch.setattr("os.killpg", lambda *a: None)
-    monkeypatch.setattr("os.getpgid", lambda *a: 999)
+    # The child leads its OWN group -- what start_new_session=True buys -- so these
+    # two fakes must give different answers. Returning 999 for every pid (as this
+    # test used to) makes the child's group and the worker's indistinguishable, and
+    # a `lambda *a: None` killpg records nothing, so the test could not see WHICH
+    # group was signalled: it would have passed just as happily on a SIGKILL aimed
+    # at the worker itself.
+    killed_groups: list[int] = []
+    monkeypatch.setattr("os.killpg", lambda pgid, sig: killed_groups.append(pgid))
+    monkeypatch.setattr("os.getpgid", lambda pid: 4242 if pid == 999 else 1)
     sb = NonoSandbox(nono_bin=_FAKE_NONO, state_dir=tmp_path / "s", popen=lambda *a, **k: _Timeouter())
     res = sb.run(SandboxRequest(argv=["/usr/bin/true"], limits=Limits(timeout_s=1)))
+    assert res.killed is True and res.exit_code == -int(signal.SIGKILL)
+    assert killed_groups == [4242], (
+        f"the timeout must SIGKILL the sandbox's own group, not {killed_groups}"
+    )
+
+
+def test_a_timeout_refuses_to_kill_the_group_the_worker_is_in(tmp_path, monkeypatch):
+    """The guard in `kill_sandbox_group`, exercised through a real backend.
+
+    If a backend ever stops launching with `start_new_session=True`, the child
+    shares the worker's process group and `os.getpgid(proc.pid)` names US. The
+    unguarded `os.killpg(..., SIGKILL)` then destroys the worker on the most
+    ordinary failure path there is -- and no test could report it, because the
+    test that reaches the timeout path is the process being killed (removing the
+    flag from bwrap alone makes tests/worker/sandbox exit 137 partway through,
+    which reads as an OOM rather than a defect).
+
+    So the kill must be refused and downgraded to the direct child. That leaks
+    the sandbox's descendants, which is strictly better than an outage.
+    """
+    killed_child = []
+
+    class _Timeouter:
+        returncode = None
+        pid = 999
+
+        def __init__(self):
+            self._calls = 0
+
+        def communicate(self, timeout=None):
+            self._calls += 1
+            if self._calls == 1:
+                raise subprocess.TimeoutExpired(cmd="nono", timeout=timeout)
+            return b"", b""
+
+        def kill(self):
+            killed_child.append(self.pid)
+
+    killed_groups: list[int] = []
+    monkeypatch.setattr("os.killpg", lambda pgid, sig: killed_groups.append(pgid))
+    # The failure this guards: the child's group IS the worker's.
+    monkeypatch.setattr("os.getpgid", lambda pid: 1)
+    sb = NonoSandbox(nono_bin=_FAKE_NONO, state_dir=tmp_path / "s", popen=lambda *a, **k: _Timeouter())
+    res = sb.run(SandboxRequest(argv=["/usr/bin/true"], limits=Limits(timeout_s=1)))
+
+    assert killed_groups == [], f"the worker's own process group was SIGKILLed: {killed_groups}"
+    assert killed_child == [999], "the sandbox child was not killed at all"
     assert res.killed is True and res.exit_code == -int(signal.SIGKILL)
 
 
