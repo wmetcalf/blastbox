@@ -604,3 +604,37 @@ def test_an_undead_base_is_retried_on_the_per_spawn_path(tmp_path):
         "installed, so the VM and its host RAM live as long as the dispatcher"
     )
     assert mgr._undead_bases == []
+
+
+# --- the launcher handle's readiness wait -----------------------------------
+#
+# SnapshotManager.build() calls boot.wait_ready() before checkpointing, and that
+# call IS covered (removing it fails three tests). What was not covered is the
+# other half: the real handle forwarding it to the check the launcher supplied.
+# Dropping `self._ready_check = ready_check` left the whole tests/host suite
+# green, so a base could be checkpointed without ever having signalled ready --
+# the poisoned-base case the ack machinery exists to detect.
+
+
+def test_a_base_handle_forwards_the_readiness_wait_to_its_check():
+    from blastbox.host.runtime.fc_snapshot_launcher import _Handle
+
+    seen: list[float] = []
+    handle = _Handle(object(), object(), "/tmp/unused.sock",
+                     ready_check=lambda timeout_s: seen.append(timeout_s))
+
+    handle.wait_ready(12.5)
+
+    assert seen == [12.5], f"the base's readiness check was not run: {seen}"
+
+
+def test_a_restore_handle_without_a_check_does_not_require_readiness():
+    """The counterpart, and why the attribute cannot simply be made mandatory:
+    restore handles are built without a check (fc_snapshot_launcher.py:856)
+    because a restored guest never re-signals readiness -- liveness alone stands
+    in for it. wait_ready() must therefore be a no-op rather than an error."""
+    from blastbox.host.runtime.fc_snapshot_launcher import _Handle
+
+    handle = _Handle(object(), object(), "/tmp/unused.sock")
+
+    handle.wait_ready(1.0)          # must not raise
