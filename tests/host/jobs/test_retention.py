@@ -1489,3 +1489,110 @@ def test_a_tree_named_in_skip_job_ids_is_spared(tmp_path):
     assert removed == 1, "expected exactly the unnamed tree to go"
     assert spared.exists(), "deleted a tree the dispatcher asked to keep"
     assert not reaped.exists()
+
+
+def test_a_blob_root_inside_job_root_is_protected_from_the_sweep(tmp_path):
+    """`protect_paths` stops the sweep deleting the durable copies it assumes exist.
+
+    The whole reclaim rests on "the blob store holds the durable copy, so removing
+    the local tree loses nothing". A LocalBlobStore rooted inside job_root breaks
+    that assumption from both ends: the blob root is itself a candidate, and if it
+    is uuid-named the shape check waves it through.
+
+    Both dispatchers pass this (dispatch.py, vm_dispatch.py) and nothing tested it.
+    Ignoring the parameter left the whole suite green, while the scenario below
+    deletes the only copy of the data:
+
+        protect_paths set     -> reaped=0, durable copy survives
+        protect_paths absent  -> reaped=1, durable copy GONE
+    """
+    root = tmp_path / "jobs"
+    root.mkdir()
+    blob_root = root / "77777777-7777-7777-8777-777777777777"
+    (blob_root / "sha256").mkdir(parents=True)
+    durable = blob_root / "sha256" / "deadbeef"
+    durable.write_bytes(b"the only durable copy")
+    old = time.time() - 99_999
+    for p in sorted(blob_root.rglob("*"), reverse=True) + [blob_root]:
+        with contextlib.suppress(OSError):
+            os.utime(p, (old, old))
+
+    removed = reap_stale_scratch(
+        root, 60.0, InMemoryJobStore(), logging.getLogger("t"),
+        protect_paths=(blob_root,),
+    )
+    assert removed == 0
+    assert durable.exists(), "the sweep deleted the blob store it assumes is durable"
+
+
+def test_an_ordinary_tree_beside_a_protected_blob_root_is_still_reclaimed(tmp_path):
+    """The control. A protected path that is an ANCESTOR of job_root once made every
+    job dir 'protected' and silently disabled the entire reclaim (#85 review), so
+    protection must stay narrow: only what deleting THIS candidate would destroy."""
+    root = tmp_path / "jobs"
+    root.mkdir()
+    blob_root = root / "88888888-8888-8888-8888-888888888888"
+    (blob_root / "sha256").mkdir(parents=True)
+    (blob_root / "sha256" / "cafe").write_bytes(b"durable")
+    scratch = _aged_job_tree(root, "99999999-9999-4999-8999-999999999999")
+    old = time.time() - 99_999
+    for p in sorted(blob_root.rglob("*"), reverse=True) + [blob_root]:
+        with contextlib.suppress(OSError):
+            os.utime(p, (old, old))
+
+    removed = reap_stale_scratch(
+        root, 60.0, InMemoryJobStore(), logging.getLogger("t"),
+        protect_paths=(blob_root,),
+    )
+    assert removed == 1, "protection leaked onto an ordinary scratch tree"
+    assert not scratch.exists()
+    assert (blob_root / "sha256" / "cafe").exists()
+
+
+def test_a_blob_root_nested_inside_a_candidate_is_protected_too(tmp_path):
+    """Containment, not equality: `<job_root>/<uuid>/blobs` is destroyed by deleting
+    the candidate above it, so an equality check protects it not at all.
+
+    The source says exactly this; nothing tested it, and narrowing the check to
+    `rd == p` left the suite green.
+    """
+    root = tmp_path / "jobs"
+    root.mkdir()
+    candidate = root / "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    nested_blob_root = candidate / "blobs"
+    (nested_blob_root / "sha256").mkdir(parents=True)
+    durable = nested_blob_root / "sha256" / "beef"
+    durable.write_bytes(b"durable, one level down")
+    old = time.time() - 99_999
+    for p in sorted(candidate.rglob("*"), reverse=True) + [candidate]:
+        with contextlib.suppress(OSError):
+            os.utime(p, (old, old))
+
+    removed = reap_stale_scratch(
+        root, 60.0, InMemoryJobStore(), logging.getLogger("t"),
+        protect_paths=(nested_blob_root,),
+    )
+    assert removed == 0
+    assert durable.exists(), "deleting the candidate destroyed the blob root inside it"
+
+
+def test_a_protected_ancestor_does_not_disable_the_whole_reclaim(tmp_path):
+    """The other direction, and the regression #85 review names: a protected path
+    that is an ANCESTOR of job_root (blob_root=<job_root>/.., the parent holding
+    both `jobs/` and `blobs/`) made every job dir "protected" and silently switched
+    the entire reclaim off -- which is the leak protection exists to stop.
+
+    Widening the check to `rd.is_relative_to(p)` reproduces it, and left the suite
+    green until this test.
+    """
+    parent = tmp_path / "state"
+    root = parent / "jobs"
+    root.mkdir(parents=True)
+    scratch = _aged_job_tree(root, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+
+    removed = reap_stale_scratch(
+        root, 60.0, InMemoryJobStore(), logging.getLogger("t"),
+        protect_paths=(parent,),          # an ancestor of job_root
+    )
+    assert removed == 1, "an ancestor in protect_paths disabled the reclaim entirely"
+    assert not scratch.exists()
