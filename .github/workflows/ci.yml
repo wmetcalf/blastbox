@@ -23,6 +23,41 @@ jobs:
         # Firecracker + Postgres suites self-skip without /dev/kvm + a DSN.
         run: pytest -q
 
+  egress-forwarder-image:
+    # The forwarder is a real deployment artifact but it is built on the node, not
+    # published to a registry (this repo ships only the PyPI wheel). Nothing would
+    # otherwise notice it rotting until an operator ran `egress apply --mode global` on a
+    # live node and got a build failure mid-install. Build it here, and assert the two
+    # behaviours the tier depends on: it must FAIL CLOSED with no reachable upstream, and
+    # it must refuse to start at all with no upstream configured.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the forwarder image
+        run: docker build -t blastbox-egress-forwarder:ci deploy/egress-forwarder
+      - name: It refuses to start with no upstream configured
+        run: |
+          if docker run --rm blastbox-egress-forwarder:ci; then
+            echo "::error::forwarder started without BLASTBOX_UPSTREAM_GW"; exit 1
+          fi
+      - name: Its startup gate fails closed when the overlay is unreachable
+        run: |
+          docker run -d --name fwd --cap-add NET_ADMIN \
+            -e BLASTBOX_UPSTREAM_GW=192.0.2.1 -e BLASTBOX_GATE_RETRIES=2 \
+            blastbox-egress-forwarder:ci
+          for _ in $(seq 1 30); do
+            [ "$(docker inspect -f '{{.State.Running}}' fwd)" = "false" ] && break
+            sleep 1
+          done
+          state=$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' fwd)
+          docker logs fwd
+          # Exiting non-zero IS the correct outcome: it leaves the gateway address empty
+          # so the worker's default route points nowhere.
+          case "$state" in
+            "exited 1") echo "fail-closed gate OK" ;;
+            *) echo "::error::expected 'exited 1', got '$state'"; exit 1 ;;
+          esac
+
   pg-search:
     # Perceptual-hash search is Postgres + pg_bktree only — there is no SQLite
     # search path — so its tests skip in the plain `test` job. Build a Postgres

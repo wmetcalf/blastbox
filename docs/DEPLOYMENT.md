@@ -258,6 +258,92 @@ pointing at a proxy sidecar — those don't depend on netd's routing.)
   `BLASTBOX_NET_CAPTURE=1` is set on the dispatcher (and TLS decrypt needs `BLASTBOX_NET_DECRYPT=1`);
   both default off.
 
+### Two exit modes: per-host exits and a global overlay
+
+The prerequisites above assume every node runs its own exit sidecars — which means copying VPN
+profiles and proxy credentials to every node. `blastbox egress --mode global` is the
+alternative: **one** host runs the real exits, every other node reaches them over a WireGuard
+overlay and holds no credentials at all.
+
+**The gateway address is identical in both modes.** In `local` mode `172.31.0.10` *is* the
+OpenVPN client sidecar; in `global` mode it is a credential-free forwarder
+(`deploy/egress-forwarder`) that carries traffic to the central host. Personalities, netd
+flags, worker labels and the in-netns routes are byte-identical either way — a node's mode is
+only ever *which container sits at that address*. Nothing in Python changes:
+`netwire.gateway_route_commands` takes a plain IP.
+
+| | per-host (`--mode local`) | global (`--mode global`) |
+|---|---|---|
+| credentials | on every node | on the exit host only |
+| `172.31.0.10` | the exit sidecar | credential-free forwarder |
+| blast radius of a node compromise | a VPN profile / proxy key | a wg transport key |
+| exit IP | this node's provider session | shared, central |
+
+Bring-up, exit host first (order matters — the forwarder refuses to start until the node-side
+source route exists):
+
+```sh
+# 1. exit host — already runs the sidecars
+sudo blastbox egress gateway                       # prints its public key
+sudo blastbox egress peer-add --name toolz3 --peer-ip 10.77.0.3 --public-key <peer's own>
+sudo blastbox egress gateway-exit
+
+# 2. worker node — generates its own key; the private half never travels
+sudo blastbox egress peer --peer-ip 10.77.0.3 \
+     --gateway-addr <exit host> --gateway-pubkey <exit host public key>
+sudo blastbox egress apply --mode global --upstream-gw 10.77.0.1
+
+# 3. prove it — including that killing the overlay removes egress
+sudo blastbox egress check
+sudo scripts/test-egress-leak.sh --mode global --gateway-ip 172.31.0.10
+```
+
+`apply` is **idempotent** (every step is guarded or best-effort) and installs
+`blastbox-egress.service`, which re-applies at boot. That unit is not optional bookkeeping:
+ip rules, the routing table and the `BB-WG-*` chains are all runtime state and none of it
+survives a reboot. Without it a node comes back with its bridges intact and its *enforcement*
+gone — failing closed, correctly, and staying that way until a human notices.
+
+`apply` also **allocates subnets**. The defaults (`172.28`–`172.31`) collide on a busy CAPE
+host with `cape_default`, `fakenet-ng` and per-branch compose stacks; a colliding bridge is
+moved to the first free pool and any address pinned inside it moves with it, keeping its host
+offset. Two rules keep that safe: the candidate set excludes **everything the host already
+routes**, not just docker's pools — the management LAN is a `/16` inside the first pool tried,
+and picking it would cut ssh to the node — while a summary route (`/8` or broader, e.g. a
+corporate `10.0.0.0/8`) is advisory rather than blocking, or it vetoes every candidate. A
+bridge that already exists is adopted, never re-decided. Pass `--no-auto-subnets` to fail on a
+conflict instead.
+
+**The dispatcher defers egress jobs on a degraded node.** `blastbox egress health` is a
+one-line JSON verdict, and the dispatcher consults a cached copy before launching any
+netd-wired tier: if this node's exit is down, the job is requeued with `defer` so a healthy
+peer takes it, rather than being failed one at a time for a reason that has nothing to do with
+the sample. The gate is **opt-in** — armed when `/etc/blastbox/egress.env` exists (the marker
+that this module manages the node), and forceable with `BLASTBOX_EGRESS_HEALTH_GATE=1/0`. A
+broken probe never gates.
+
+**Four things fail open if you build this by hand.** All four were found by measurement on a
+live two-node setup, each presenting as "it works" or as a plain outage; all four are now
+pinned by `tests/host/test_egress.py` and by `test-egress-leak.sh --mode global`:
+
+- An `ip rule` that matches but finds an empty table **falls through to `main`** — so a dead
+  tunnel silently becomes direct WAN egress. A blackhole rule sits behind every lookup.
+- WireGuard `AllowedIPs` is cryptokey routing, not a route. Set to the overlay prefix alone it
+  discards every internet-bound packet *inside* the tunnel, with no error anywhere. It is
+  `0.0.0.0/0` with `Table = off`, so wg-quick installs no routes and only what we deliberately
+  source-route enters the tunnel.
+- Both hosts run `FORWARD` policy `DROP`. Chains that match on source cover only the outbound
+  leg; the **return leg needs its own conntrack chain**, pointed at the bridge rather than the
+  tunnel, or the path works and the client still times out.
+- **"Running" is not health.** A container that failed its startup gate looks healthy in
+  `docker ps` forever under a restart policy. Health is asserted from the gate's log line
+  *scoped to the current incarnation* — restart count is informational, because it is
+  monotonic and disqualifying on it ejects a recovered node permanently.
+
+Every rule lives in a dedicated `BB-WG-*` chain reached by one jump and is torn down by match,
+so a co-resident CAPE rooter is never touched — `check` counts foreign `FORWARD` rules to
+assert it.
+
 Run netd as a systemd unit (packaged in `deploy/systemd/`):
 
 ```sh

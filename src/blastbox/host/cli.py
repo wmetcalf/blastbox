@@ -4,6 +4,7 @@ Subcommands:
 - ``serve``    — start the FastAPI ingress server via uvicorn.
 - ``dispatch`` — run the Dispatcher loop (claim + launch worker containers).
 - ``bench``    — run a performance benchmark scenario (or ``--list`` them).
+- ``egress``   — set up this node's egress tier (bridges, local/global exit, wg overlay).
 - ``version``  — print version and exit.
 """
 from __future__ import annotations
@@ -756,6 +757,107 @@ def _migrate_results_cmd(args) -> int:
     return 1 if failed else 0
 
 
+def _egress_cmd(args: argparse.Namespace) -> int:
+    try:
+        return _egress_cmd_inner(args)
+    except RuntimeError as exc:
+        # The host layer raises RuntimeError for "your node is not in a state where this
+        # can work" (missing image, unreachable sidecar, nothing free to relocate to).
+        # Those are all actionable messages; a traceback hides them.
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+def _egress_cmd_inner(args: argparse.Namespace) -> int:
+    """Node egress setup: bridges, exit mode, overlay transport.
+
+    Deliberately a thin shell over blastbox.host.egress{,_apply} — the decisions live
+    there as pure functions so they are testable without root.
+    """
+    from blastbox.host import egress_apply as ea
+    from blastbox.host.egress import EgressConfig
+
+    def cfg_from(args: argparse.Namespace) -> EgressConfig:
+        base = EgressConfig.from_env()
+        over: dict[str, object] = {}
+        for attr, fieldname in (("mode", "mode"), ("upstream_gw", "upstream_gw"),
+                                ("gateway_ip", "vpn_gateway_ip"), ("wg_iface", "wg_iface")):
+            v = getattr(args, attr, None)
+            if v:
+                over[fieldname] = v
+        return replace(base, **over) if over else base
+
+    # A misconfiguration is an operator error, not a crash. EgressConfig validates hard
+    # (an off-subnet gateway, a global node with no upstream) precisely so these are
+    # caught before anything touches the host — but a traceback buries the message.
+    try:
+        _ = cfg_from(args)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    action = args.egress_action
+    if action == "check":
+        cfg = cfg_from(args)
+        for row in ea.check_node(cfg):
+            print(f"  {row}")
+        return 0 if ea.node_health(cfg).healthy else 1
+
+    if action == "health":
+        # Machine-readable, for a monitoring probe or the dispatcher's own gate.
+        cfg = cfg_from(args)
+        h = ea.node_health(cfg)
+        print(json.dumps({"healthy": h.healthy, "reason": h.reason, "mode": cfg.mode}))
+        return 0 if h.healthy else 1
+
+    if action == "apply":
+        cfg = cfg_from(args)
+        cfg, notes = ea.apply_node(cfg, dry_run=args.dry_run, auto_subnets=not args.no_auto_subnets)
+        for n in notes:
+            print(f"  {n}")
+        if not args.dry_run:
+            h = ea.await_health(cfg)
+            print(f"  health: {'OK' if h.healthy else 'DEGRADED'} — {h.reason}")
+            return 0 if h.healthy else 1
+        return 0
+
+    if action == "teardown":
+        cfg = cfg_from(args)
+        for n in ea.teardown_node(cfg, remove_bridges=args.remove_bridges):
+            print(f"  {n}")
+        return 0
+
+    if action == "gateway":
+        cfg = cfg_from(args)
+        pub = ea.setup_gateway(cfg)
+        print(f"  exit host up on {cfg.overlay_gateway_ip}, udp/{cfg.wg_port}")
+        print(f"  public key: {pub}")
+        return 0
+
+    if action == "gateway-exit":
+        for n in ea.apply_exit_host(cfg_from(args)):
+            print(f"  {n}")
+        return 0
+
+    if action == "peer-add":
+        cfg = cfg_from(args)
+        added = ea.add_peer(cfg, args.name, args.peer_ip, args.public_key)
+        print(f"  peer {args.name} {'added' if added else 'already present'} at {args.peer_ip}/32")
+        print("  only the public key was supplied — no private key changed hands")
+        return 0
+
+    if action == "peer":
+        cfg = cfg_from(args)
+        pub = ea.setup_peer(cfg, args.peer_ip, args.gateway_addr, args.gateway_pubkey)
+        print(f"  peer up at {args.peer_ip} -> {args.gateway_addr}:{cfg.wg_port}")
+        print(f"  register this public key on the exit host: {pub}")
+        print("  then, in order: `blastbox egress apply --mode global --upstream-gw <overlay gw>`")
+        return 0
+
+    raise SystemExit(f"unknown egress action {action!r}")
+
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="blastbox")
     sub = p.add_subparsers(dest="command", required=True)
@@ -841,6 +943,42 @@ def build_parser() -> argparse.ArgumentParser:
     pm.add_argument("--dry-run", action="store_true",
                     help="report what would be uploaded without touching the blob store")
     pm.set_defaults(func=_migrate_results_cmd)
+
+    # egress -- node-level egress tier (bridges, exit mode, overlay transport)
+    pe = sub.add_parser(
+        "egress",
+        help="set up this node's egress tier (bridges, local or global exit, wg overlay)")
+    pe.add_argument("--mode", choices=("local", "global"), default=None,
+                    help="local: this node runs its own credentialed exit sidecars. "
+                         "global: this node holds no credentials and forwards over the "
+                         "wg overlay to the central exit host. The gateway ADDRESS is "
+                         "identical either way.")
+    pe.add_argument("--gateway-ip", default=None, help="override the gateway address")
+    pe.add_argument("--wg-iface", default=None)
+    pes = pe.add_subparsers(dest="egress_action", required=True)
+
+    pe_ap = pes.add_parser("apply", help="bring this node to the configured state (idempotent)")
+    pe_ap.add_argument("--upstream-gw", default=None,
+                       help="mode=global: overlay IP of the central exit host")
+    pe_ap.add_argument("--dry-run", action="store_true")
+    pe_ap.add_argument("--no-auto-subnets", action="store_true",
+                       help="fail on a subnet conflict instead of relocating the bridge")
+    pes.add_parser("check", help="report state; exit non-zero if egress is degraded")
+    pes.add_parser("health", help="one-line JSON health verdict (for probes / the dispatcher)")
+    pe_td = pes.add_parser("teardown", help="remove only what we created")
+    pe_td.add_argument("--remove-bridges", action="store_true")
+    pes.add_parser("gateway", help="exit host: stand up the overlay endpoint, print its public key")
+    pes.add_parser("gateway-exit", help="exit host: route peer traffic into the local sidecar")
+    pe_pa = pes.add_parser("peer-add", help="exit host: register a peer's PUBLIC key")
+    pe_pa.add_argument("--name", required=True)
+    pe_pa.add_argument("--peer-ip", required=True)
+    pe_pa.add_argument("--public-key", required=True)
+    pe_pr = pes.add_parser("peer", help="worker node: join the overlay (generates its own key)")
+    pe_pr.add_argument("--peer-ip", required=True)
+    pe_pr.add_argument("--gateway-addr", required=True)
+    pe_pr.add_argument("--gateway-pubkey", required=True)
+    pe_pr.add_argument("--upstream-gw", default=None)
+    pe.set_defaults(func=_egress_cmd, upstream_gw=None)
 
     pv = sub.add_parser("version", help="print version and exit")
     pv.set_defaults(func=_version_cmd)

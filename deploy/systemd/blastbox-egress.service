@@ -1,0 +1,58 @@
+# blastbox-egress — re-apply this node's egress tier at boot.
+#
+# WHY THIS UNIT EXISTS. The egress tier is `ip rule`s, a dedicated routing table and
+# BB-WG-* iptables chains. None of that survives a reboot. Before this unit, a node came
+# back up with its bridges intact (docker persists those) and its ENFORCEMENT gone — the
+# forwarder would fail its startup gate and stay down, so the tier failed closed rather
+# than leaking, but the node was silently useless for egress work until someone noticed.
+# Fail-closed is the correct failure; staying failed until a human intervenes is not.
+#
+# It is a oneshot with RemainAfterExit: applying is idempotent (every step is guarded or
+# best-effort), so a restart re-converges rather than stacking duplicate rules.
+#
+# ORDERING IS LOAD-BEARING. After docker (the bridges and the forwarder are containers)
+# and after wg-quick (the source route installs `default dev <wg>` into its own table,
+# which needs the interface to exist). `Wants=` rather than `Requires=` on wg-quick: on a
+# local-mode node there is no overlay at all and this unit must still run.
+#
+# Install:
+#   sudo cp deploy/systemd/blastbox-egress.service /etc/systemd/system/
+#   sudo blastbox egress apply --mode global --upstream-gw 10.77.0.1   # writes the env file
+#   sudo systemctl daemon-reload && sudo systemctl enable blastbox-egress
+#
+# Config comes from /etc/blastbox/egress.env, written by `blastbox egress apply`. It holds
+# no credentials by design — a global-mode node's egress state is entirely non-secret,
+# which is the point of centralising the exits.
+
+[Unit]
+Description=blastbox egress tier (bridges, exit mode, overlay source routing)
+After=docker.service network-online.target wg-quick@bbwg0.service
+Wants=network-online.target wg-quick@bbwg0.service
+Requires=docker.service
+# Without the env file there is no configured tier to re-apply, and `apply` would fall
+# back to defaults that may not match this node. Do nothing rather than guess.
+ConditionPathExists=/etc/blastbox/egress.env
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/blastbox/egress.env
+# Absolute path required by systemd; `blastbox` installs to the Python bin dir, usually
+# /usr/local/bin (pip) or /usr/bin (distro package). `blastbox egress apply` rewrites this
+# line to whatever it found on PATH.
+ExecStart=/usr/local/bin/blastbox egress apply
+# Re-applying is cheap and idempotent, and a node that comes up before its exit host is
+# reachable should keep trying rather than sit degraded until someone logs in.
+Restart=on-failure
+RestartSec=30
+
+# This genuinely needs privilege: it creates docker networks, writes routing tables and
+# iptables chains, and starts a NET_ADMIN container. It runs as root, bounded to the
+# capabilities it actually uses.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN CAP_DAC_OVERRIDE
+ProtectSystem=full
+# /etc/wireguard and /etc/blastbox must stay writable — key material and the env file.
+ReadWritePaths=/etc/wireguard /etc/blastbox /etc/iproute2
+
+[Install]
+WantedBy=multi-user.target

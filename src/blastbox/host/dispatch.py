@@ -535,6 +535,15 @@ class Dispatcher:
         # pool.claim already blocks up to warm_claim_timeout_s each iteration.) Sleeping briefly
         # before returning yields the requeued job to a peer dispatcher / lets a warm slot free.
         self._warm_requeue_backoff_s = max(0.0, float(warm_requeue_backoff_s))
+        # Node egress health, cached. A node whose exit sidecar or overlay forwarder is
+        # down cannot run ANY gateway-routed job, so failing them one at a time just
+        # converts one node's outage into a stream of failed user jobs. We defer instead,
+        # and a healthy peer picks them up. Probing shells out (docker inspect / ping), so
+        # it is cached — the failure it guards against lasts minutes, not milliseconds.
+        self._egress_health_ttl_s = max(
+            0.0, float(os.environ.get("BLASTBOX_EGRESS_HEALTH_TTL_S", "15") or 15))
+        self._egress_health_at: float = 0.0
+        self._egress_health: object | None = None
         # Safety floor for warm recovery: the warm staleness cutoff anchors on started_at (set at
         # CLAIM time), but a warm job's bounding deadline is only established later — after
         # pool.claim (<= warm_claim_timeout_s) + input staging. requeue_grace_s is the slack that
@@ -1151,6 +1160,47 @@ class Dispatcher:
             else:
                 self._purge_job_dir_if_owned(job)
             self._record_outcome(job, path="cold", started=t0)
+
+
+    def _node_egress_health(self):
+        """Cached verdict on whether THIS node can currently egress, or None to not gate.
+
+        OPT-IN BY DESIGN, and the default matters. The gate is only meaningful on a node
+        whose egress tier `blastbox egress apply` actually manages — there, a degraded
+        exit means every gateway-routed job will fail identically, so deferring to a peer
+        is strictly better. On any other node the probe would report "degraded" simply
+        because this module never set the tier up, and gating on that would defer every
+        netd-wired job forever on a host that was working fine. So: enabled when
+        /etc/blastbox/egress.env exists (the marker that this node is managed), and
+        forceable either way with BLASTBOX_EGRESS_HEALTH_GATE=1/0.
+
+        Returns None whenever the gate is off or the probe itself is unavailable —
+        refusing work because a health probe is broken is a worse failure than the one it
+        guards against.
+        """
+        gate = os.environ.get("BLASTBOX_EGRESS_HEALTH_GATE", "").strip().lower()
+        if gate in ("0", "false", "no", "off"):
+            return None
+        if gate not in ("1", "true", "yes", "on"):
+            try:
+                from blastbox.host.egress_apply import ENV_FILE
+                managed = ENV_FILE.exists()
+            except Exception:
+                managed = False
+            if not managed:
+                return None
+        now = time.time()
+        if self._egress_health is not None and (now - self._egress_health_at) < self._egress_health_ttl_s:
+            return self._egress_health
+        try:
+            from blastbox.host.egress import EgressConfig
+            from blastbox.host.egress_apply import node_health
+            verdict = node_health(EgressConfig.from_env())
+        except Exception as exc:  # probe unavailable -> don't gate
+            _log.debug("egress health probe unavailable: %s", exc)
+            return None
+        self._egress_health, self._egress_health_at = verdict, now
+        return verdict
 
     def _requeue_claimed(self, job: Job, *, reason: str, defer: bool = False) -> None:
         """Release OUR claim back to QUEUED so another worker/dispatcher takes the job. CAS-fenced
@@ -1875,7 +1925,23 @@ class Dispatcher:
                 f"(direct / inetsim / httpproxy).",
             )
             return
-        # Gateway-routed tiers (tor/openvpn/wireguard/inspect) have netd install the default route
+        # A gateway-routed tier cannot work at all if this node's own exit is down — the
+        # worker would sit waiting for a route into a sidecar that is gone, and fail closed
+        # on its gateway barrier. That is the right outcome for the SAMPLE but the wrong one
+        # for the JOB: nothing about it is job-specific, so every egress job claimed here
+        # would burn the same way. DEFER instead, so the job becomes briefly ineligible and
+        # a peer dispatcher with a healthy exit takes it. If the whole fleet is down the job
+        # ages out through the normal max_queued_age path rather than dying on arrival here.
+        if needs_netns_wiring:
+            health = self._node_egress_health()
+            if health is not None and not health.healthy:
+                self._requeue_claimed(
+                    job, defer=True,
+                    reason=f"node egress is degraded ({health.reason}); deferring "
+                           f"netpolicy {personality.name!r} to a peer",
+                )
+                return
+                # Gateway-routed tiers (tor/openvpn/wireguard/inspect) have netd install the default route
         # AFTER the container starts; the worker waits for that route via BLASTBOX_NET_WAIT_GATEWAY,
         # which is derived from the personality's gateway=. Without it the barrier is empty and a fast
         # engine races netd (flapping / fail-closed). Require gateway= rather than launch a racey job.
