@@ -197,7 +197,16 @@ Honesty ahead of enthusiasm, because this bounds the product:
    grants restrict which engines/tiers a node may be assigned. Still first-party nodes
    only. **Done.**
 4. **External containment verification at the exit host** (§5). This is the gate that should
-   precede any third-party node holding egress.
+   precede any third-party node holding egress. **Done** — `blastbox.host.exit_attest`,
+   `blastbox egress attest`.
+
+   One thing only live testing found, recorded because it would have shipped a signal
+   that detected nothing: peers run `PersistentKeepalive = 25`, so their tunnel counters
+   increase every 25 seconds regardless of work. A naive "did the counters move" check is
+   therefore ALWAYS true and the contradiction never fires. The delta must exceed what
+   keepalives alone explain. Verified against the live pair: 9,948 B of real traffic reads
+   as contained; 1,104 B of keepalives while the control plane says the node is working is
+   correctly reported as a leak.
 5. **Third-party registration**, behind a trust tier, non-confidential samples only.
 
 Nothing before step 4 should be sold as "register your infra".

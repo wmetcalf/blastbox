@@ -1044,6 +1044,66 @@ def teardown_node(cfg: EgressConfig, *, remove_bridges: bool = False) -> list[st
     return notes
 
 
+#: Where consecutive attestation samples are kept. WireGuard's counters are monotonic,
+#: so a single look cannot tell "sent traffic once" from "sending now" — the previous
+#: sample is the whole basis of the contradiction check.
+ATTEST_STATE = Path("/var/lib/blastbox/exit-attest.json")
+
+
+def observe_peers(cfg: EgressConfig):
+    """The exit host's own view of its peers, from `wg show <iface> dump`."""
+    from blastbox.host.exit_attest import parse_wg_dump
+
+    proc = _run(["wg", "show", cfg.wg_iface, "dump"], check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"cannot read {cfg.wg_iface} (needs root, and the interface must be up): "
+            f"{(proc.stderr or '').strip().splitlines()[-1] if proc.stderr else 'no detail'}")
+    return parse_wg_dump(proc.stdout or "")
+
+
+def _load_previous():
+    from blastbox.host.exit_attest import PeerObservation
+
+    try:
+        rows = json.loads(ATTEST_STATE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    out = []
+    for r in rows if isinstance(rows, list) else []:
+        try:
+            out.append(PeerObservation(
+                public_key=str(r["public_key"]), endpoint=str(r.get("endpoint", "")),
+                allowed_ips=tuple(r.get("allowed_ips") or ()),
+                latest_handshake=float(r.get("latest_handshake", 0)),
+                rx_bytes=int(r["rx_bytes"]), tx_bytes=int(r["tx_bytes"]),
+                observed_at=float(r["observed_at"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def _save_current(peers) -> None:
+    ATTEST_STATE.parent.mkdir(parents=True, exist_ok=True)
+    ATTEST_STATE.write_text(json.dumps([{
+        "public_key": p.public_key, "endpoint": p.endpoint,
+        "allowed_ips": list(p.allowed_ips), "latest_handshake": p.latest_handshake,
+        "rx_bytes": p.rx_bytes, "tx_bytes": p.tx_bytes, "observed_at": p.observed_at,
+    } for p in peers], indent=1))
+    os.chmod(ATTEST_STATE, 0o644)
+
+
+def attest_peers(cfg: EgressConfig, *, key_to_node, working=None):
+    """Observe, judge against the previous sample, and persist this one."""
+    from blastbox.host.exit_attest import attest
+
+    peers = observe_peers(cfg)
+    verdicts = attest(peers, key_to_node=key_to_node, working=working,
+                      previous=_load_previous())
+    _save_current(peers)
+    return verdicts
+
+
 def foreign_forward_rules() -> int:
     """FORWARD rules we did not create — the invariant that proves we left the CAPE
     rooter alone. ``check`` prints it before and after any change."""

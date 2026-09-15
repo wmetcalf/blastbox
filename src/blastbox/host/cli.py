@@ -928,6 +928,46 @@ def _egress_cmd_inner(args: argparse.Namespace) -> int:
         print("  no private key changed hands")
         return 0
 
+    if action == "attest":
+        cfg = cfg_from(args)
+        # Map wg key -> node id from the CERTIFICATES on disk, never from anything a
+        # node published: the whole point is an answer the peer cannot influence.
+        from blastbox.host.pki import load_ca, node_identity
+        key_to_node: dict[str, str] = {}
+        pki_dir = Path(args.pki_dir)
+        try:
+            ca = load_ca(pki_dir)
+        except Exception as exc:
+            print(f"error: cannot load the CA from {pki_dir}: {exc}", file=sys.stderr)
+            return 1
+        for crt in sorted(pki_dir.glob("node-*.crt")):
+            try:
+                ident = node_identity(ca, crt.read_bytes())
+            except ValueError:
+                continue          # expired or invalid: it authorises nothing
+            key_to_node[ident.wg_pubkey] = ident.node_id
+        working = {n: True for n in args.working}
+        verdicts = ea.attest_peers(cfg, key_to_node=key_to_node, working=working)
+        missing = __import__("blastbox.host.exit_attest", fromlist=["missing_peers"]) \
+            .missing_peers(ea.observe_peers(cfg), key_to_node=key_to_node)
+        if args.json:
+            print(json.dumps({
+                "verdicts": [{"node_id": v.node_id, "contained": v.contained,
+                              "contradicted": v.contradicted, "reason": v.reason}
+                             for v in verdicts],
+                "enrolled_but_absent": list(missing),
+            }, indent=2))
+        else:
+            for v in verdicts:
+                mark = "CONTRADICTED" if v.contradicted else ("ok" if v.contained else "??")
+                print(f"  [{mark}] {v.node_id}: {v.reason}")
+            for n in missing:
+                print(f"  [absent] {n}: enrolled, but no peer on {cfg.wg_iface} — every "
+                      "job placed there fails closed")
+            if not verdicts and not missing:
+                print("  no peers registered on this exit")
+        return 1 if any(v.contradicted for v in verdicts) else 0
+
     if action == "peer-prune":
         cfg = cfg_from(args)
         gone = ea.prune_expired_peers(cfg)
@@ -1117,6 +1157,18 @@ def build_parser() -> argparse.ArgumentParser:
         "BLASTBOX_PKI_DIR", "/var/lib/blastbox/pki"))
     pe_pa.add_argument("--force", action="store_true",
                        help="register a verified node whose cert grants no overlay tier")
+    pe_at = pes.add_parser(
+        "attest", parents=[common],
+        help="exit host: verify peers' containment from HERE, where they cannot edit "
+             "the answer")
+    pe_at.add_argument("--working", action="append", default=[],
+                       help="node id the control plane dispatched egress work to "
+                            "(repeatable). Supply this from the job store — never from "
+                            "the node's own heartbeat, or the adversary supplies both "
+                            "sides of the comparison.")
+    pe_at.add_argument("--pki-dir", default=os.environ.get(
+        "BLASTBOX_PKI_DIR", "/var/lib/blastbox/pki"))
+    pe_at.add_argument("--json", action="store_true")
     pes.add_parser("peer-prune", parents=[common],
                    help="exit host: drop peers whose certificate has expired (run "
                         "automatically on every apply)")
