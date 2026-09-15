@@ -382,10 +382,14 @@ def plan_subnets(cfg: EgressConfig, *, auto: bool = True) -> SubnetPlan:
         offset = int(addr) - int(ipaddress.ip_network(old_default).network_address)
         if 0 < offset < new_net.num_addresses - 1:
             adopted[addr_field] = str(new_net.network_address + offset)
-        else:
-            # The offset does not fit the adopted range; .10 is this tier's convention
-            # and is always valid for the sizes docker hands out.
+        elif new_net.num_addresses > 11:
+            # .10 is this tier's convention, but the adopted subnet was created by an
+            # OPERATOR, not by docker — a /29 bb-vpn would put .10 outside it and raise
+            # the very ValueError this block exists to avoid. Only use it when it fits.
             adopted[addr_field] = str(new_net.network_address + 10)
+        else:
+            # Too small for the convention: take the first usable host address.
+            adopted[addr_field] = str(new_net.network_address + 1)
     if adopted:
         from dataclasses import replace as _replace
         cfg = _replace(cfg, **adopted)  # type: ignore[arg-type]
@@ -560,14 +564,25 @@ def load_persisted_env() -> dict[str, str]:
 
 
 def persisted_config() -> EgressConfig:
-    """The node's own persisted egress config, falling back to the environment.
+    """The node's own persisted egress config, merged with the environment.
 
-    The FILE wins over the environment: once a node is managed, egress.env is that node's
-    state, and a stale shell variable must not silently redescribe it. Explicit CLI flags
-    still override, which is the supported way to inspect or repair.
+    Precedence is deliberately split rather than "file wins" or "env wins":
+
+        legacy bare names  <  /etc/blastbox/egress.env  <  BLASTBOX_EGRESS_*
+
+    The legacy names (``VPN_SUBNET``, ``WG_PORT``, ``NET0_SUBNET`` …) are unnamespaced
+    enough to collide with an unrelated shell variable by accident, so a managed node's
+    persisted state must outrank them — otherwise a stray export silently redescribes the
+    node. An explicit ``BLASTBOX_EGRESS_*`` is unambiguous intent and outranks the file,
+    which is what lets an operator inspect or repair without editing it. A dispatcher
+    normally sets none of these, so it simply gets the file.
     """
     env = load_persisted_env()
-    return EgressConfig.from_env({**os.environ, **env} if env else None)
+    if not env:
+        return EgressConfig.from_env(None)
+    namespaced = {k: v for k, v in os.environ.items() if k.startswith("BLASTBOX_EGRESS_")}
+    legacy = {k: v for k, v in os.environ.items() if not k.startswith("BLASTBOX_EGRESS_")}
+    return EgressConfig.from_env({**legacy, **env, **namespaced})
 
 
 def persist_config(cfg: EgressConfig) -> None:

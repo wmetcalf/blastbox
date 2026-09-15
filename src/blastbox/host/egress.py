@@ -51,6 +51,7 @@ be renumbered out from under it. This is the same discipline ``libvirt_egress`` 
 """
 from __future__ import annotations
 
+import bisect
 import ipaddress
 import os
 import re
@@ -366,10 +367,34 @@ def allocate_subnets(
     advisory = [c for c in claimed if c.prefixlen <= SUMMARY_PREFIXLEN]
     claimed = [c for c in claimed if c.prefixlen > SUMMARY_PREFIXLEN]
 
+    # Two structures on purpose. The host's claimed set is large and STATIC for the life
+    # of this call, so it is sorted once and binary-searched — emitting host addresses as
+    # /32s (needed so a flat-/8 LAN blocks the candidate containing the node's own
+    # address) multiplied it several-fold, and an exhausted pool sweeps tens of thousands
+    # of candidates, measured at tens of seconds inside a boot oneshot that retries every
+    # 30s. The ranges chosen DURING this call are a handful and grow as we go, so they
+    # stay a plain list scanned linearly.
+    #
+    # Both must be consulted. Indexing only the static set was a real bug: newly chosen
+    # ranges became invisible to later bridges and all four were allocated the same /16.
+    _static = sorted((int(c.network_address), int(c.broadcast_address), c) for c in claimed)
+    _lo = [t[0] for t in _static]
+    _widest = max((c.num_addresses for c in claimed), default=1)
+    chosen_here: list[ipaddress.IPv4Network] = []
+
     def collides(candidate: ipaddress.IPv4Network) -> ipaddress.IPv4Network | None:
-        for c in claimed:
+        for c in chosen_here:
             if candidate.overlaps(c):
                 return c
+        lo, hi = int(candidate.network_address), int(candidate.broadcast_address)
+        # Every static range starting at or before this candidate ends; walk back only as
+        # far as the widest claimed prefix could possibly reach.
+        for j in range(bisect.bisect_right(_lo, hi) - 1, -1, -1):
+            start, end, net = _static[j]
+            if end >= lo:
+                return net
+            if start < lo - _widest:
+                break
         return None
 
     conflicts: list[tuple[str, str, str]] = []
@@ -394,7 +419,7 @@ def allocate_subnets(
         want = ipaddress.IPv4Network(subnet)
         hit = collides(want)
         if hit is None:
-            claimed.append(want)
+            chosen_here.append(want)
             continue
         conflicts.append((name, str(want), str(hit)))
         if not auto:
@@ -409,7 +434,7 @@ def allocate_subnets(
             # a silent downgrade to a smaller prefix would surprise the operator far more
             # than an explicit failure.
             continue
-        claimed.append(chosen)
+        chosen_here.append(chosen)
         updates[field_for[name]] = str(chosen)
         reallocated.append((name, str(want), str(chosen)))
         # Carry pinned addresses across with their host offset intact.

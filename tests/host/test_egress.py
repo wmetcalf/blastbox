@@ -687,3 +687,73 @@ def test_an_unprivileged_probe_still_catches_a_missing_source_route(monkeypatch)
                   "stdout": "", "stderr": "Permission denied"})())
     ok, why = ea.enforcement_present(GLOBAL)
     assert not ok and "source route" in why
+
+
+def test_a_tiny_adopted_subnet_still_yields_an_in_range_gateway(monkeypatch):
+    """The adopted subnet is one an OPERATOR created, not one docker chose. The `.10`
+    convention puts the gateway outside a /29 and re-raises the exact ValueError the
+    adoption fix exists to prevent."""
+    from blastbox.host import egress_apply as ea
+
+    live = {"bb-vpn": "10.31.5.0/29"}
+
+    def fake(argv, **kw):
+        a = list(argv)
+        if a[:3] == ["docker", "network", "inspect"]:
+            out = live.get(a[3], "")
+            return type("P", (), {"returncode": 0 if out else 1, "stdout": out, "stderr": ""})()
+        return type("P", (), {"returncode": 1, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(ea, "_run", fake)
+    monkeypatch.setattr(ea, "claimed_cidrs", lambda: list(live.values()))
+    plan = ea.plan_subnets(EgressConfig())          # no exception
+    assert ipaddress.ip_address(plan.config.vpn_gateway_ip) in \
+        ipaddress.ip_network(plan.config.vpn_subnet)
+
+
+def test_an_explicit_namespaced_env_var_outranks_the_persisted_file(monkeypatch, tmp_path):
+    """A stray legacy `VPN_SUBNET` must not redescribe a managed node, but an explicit
+    BLASTBOX_EGRESS_* is unambiguous intent and is how an operator repairs one."""
+    from blastbox.host import egress_apply as ea
+
+    marker = tmp_path / "egress.env"
+    marker.write_text("BLASTBOX_EGRESS_MODE=global\n"
+                      "BLASTBOX_EGRESS_UPSTREAM_GW=10.77.0.1\n"
+                      "BLASTBOX_EGRESS_VPN_SUBNET=10.88.0.0/16\n"
+                      "BLASTBOX_EGRESS_VPN_GATEWAY_IP=10.88.0.10\n")
+    monkeypatch.setattr(ea, "ENV_FILE", marker)
+
+    monkeypatch.setenv("VPN_SUBNET", "192.168.77.0/24")          # legacy: must lose
+    assert ea.persisted_config().vpn_subnet == "10.88.0.0/16"
+
+    monkeypatch.setenv("BLASTBOX_EGRESS_VPN_SUBNET", "10.99.0.0/16")   # explicit: must win
+    monkeypatch.setenv("BLASTBOX_EGRESS_VPN_GATEWAY_IP", "10.99.0.10")
+    assert ea.persisted_config().vpn_subnet == "10.99.0.0/16"
+
+
+def test_allocator_stays_correct_and_fast_with_a_large_claimed_set():
+    """The small-input overlap test did NOT catch a real regression here.
+
+    Indexing the host's claimed set for speed made ranges chosen DURING the call
+    invisible to later bridges, and all four were allocated the same /16 — while the
+    existing test passed, because its input was too small to take the indexed path. A
+    performance structure has to be exercised at the size it exists for.
+    """
+    import time
+
+    # A wg exit host with a /32 route per fleet peer, plus a busy CAPE host's 172.16/12.
+    taken = ["172.16.0.0/12"] + [f"10.{a}.{b}.7/32" for a in range(60) for b in range(256)]
+    started = time.perf_counter()
+    plan = allocate_subnets(EgressConfig(), taken)
+    elapsed = time.perf_counter() - started
+
+    nets = [ipaddress.ip_network(s) for _n, s, _i in plan.config.bridges]
+    for i, a in enumerate(nets):
+        for b in nets[i + 1:]:
+            assert not a.overlaps(b), f"{a} overlaps {b}"
+    # ...and none may land on anything the host already claims.
+    claimed = [ipaddress.ip_network(t) for t in taken]
+    for n in nets:
+        assert not any(n.overlaps(c) for c in claimed), f"{n} collides with the host"
+    # Generous: this runs inside a boot oneshot that retries every 30s.
+    assert elapsed < 5.0, f"allocation took {elapsed:.1f}s with {len(taken)} claimed entries"
