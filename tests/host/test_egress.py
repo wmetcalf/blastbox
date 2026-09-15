@@ -961,3 +961,59 @@ def test_a_leftover_rule_at_the_same_priority_does_not_shadow_ours(monkeypatch):
     ea_ = _fake_host(monkeypatch, rules=rules, forward=_GOOD_FWD, chain=_GOOD_CHAIN)
     ok, why = ea_.enforcement_present(GLOBAL)
     assert ok, why
+
+
+# ------------------------------------------- revocation has to reach the overlay
+
+def test_an_expired_peers_certificate_marks_it_for_pruning():
+    """A node cert lives days; a wg peer stanza lives forever. Without enforcing the
+    recorded expiry, "revocation is stop renewing" revokes nothing at the overlay and
+    the short lifetime buys nothing."""
+    import datetime as dt
+
+    from blastbox.host.egress import expired_peers, gateway_peer_stanza
+
+    past = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)).isoformat()
+    future = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=5)).isoformat()
+    conf = ("[Interface]\nPrivateKey = x\n"
+            + gateway_peer_stanza("lapsed", "10.77.0.4", "A" * 43 + "=", past)
+            + gateway_peer_stanza("live", "10.77.0.5", "B" * 43 + "=", future))
+    assert expired_peers(conf) == ["lapsed"]
+
+
+def test_a_peer_with_no_recorded_expiry_is_left_alone():
+    """It predates enrolment or was force-registered. Silently dropping it would be a
+    worse surprise than leaving it — the operator gets no signal either way."""
+    from blastbox.host.egress import expired_peers, gateway_peer_stanza
+
+    conf = "[Interface]\n" + gateway_peer_stanza("legacy", "10.77.0.6", "C" * 43 + "=")
+    assert expired_peers(conf) == []
+
+
+def test_an_unparseable_expiry_does_not_drop_the_peer():
+    from blastbox.host.egress import expired_peers
+
+    conf = "# peer:weird\n# expires:soon-ish\n[Peer]\nPublicKey = x\n"
+    assert expired_peers(conf) == []
+
+
+def test_pruning_removes_only_the_lapsed_stanza(tmp_path, monkeypatch):
+    import datetime as dt
+
+    from blastbox.host import egress_apply as ea
+    from blastbox.host.egress import gateway_peer_stanza
+
+    past = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)).isoformat()
+    future = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=5)).isoformat()
+    conf = tmp_path / "bbwg0.conf"
+    conf.write_text("[Interface]\nPrivateKey = secret\n"
+                    + gateway_peer_stanza("lapsed", "10.77.0.4", "A" * 43 + "=", past)
+                    + gateway_peer_stanza("live", "10.77.0.5", "B" * 43 + "=", future))
+    monkeypatch.setattr(ea, "WG_DIR", tmp_path)
+    monkeypatch.setattr(ea, "_run", lambda argv, **kw: type(
+        "P", (), {"returncode": 0, "stdout": "", "stderr": ""})())
+
+    assert ea.prune_expired_peers(GLOBAL) == ["lapsed"]
+    body = conf.read_text()
+    assert "# peer:live" in body and "PrivateKey = secret" in body
+    assert "# peer:lapsed" not in body and "A" * 43 not in body

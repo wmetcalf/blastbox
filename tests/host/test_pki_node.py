@@ -124,7 +124,7 @@ def test_grants_default_to_nothing_not_everything(ca):
 def test_a_transport_cert_is_not_a_node_cert(ca):
     """`issue_client` produces a valid CA-signed cert with no node-info. Accepting it as
     a node identity would let any worker/dispatcher cert authorise an overlay peer."""
-    with pytest.raises(ValueError, match="not a node cert"):
+    with pytest.raises(ValueError, match="not a node identity"):
         pki.node_identity(ca, ca.issue_client("dispatcher").cert_pem)
 
 
@@ -167,8 +167,11 @@ def _peer_add(monkeypatch, tmp_path, argv_extra, *, registered):
     from blastbox.host import cli
     from blastbox.host import egress_apply as ea
 
-    def fake_add_peer(cfg, name, peer_ip, public_key):
+    def fake_add_peer(cfg, name, peer_ip, public_key, expires=None):
         registered.append((name, peer_ip, public_key))
+        # The expiry must reach the registration, or the wg stanza outlives the cert
+        # and "revocation is stop renewing" revokes nothing at the overlay.
+        registered.append(("expires", expires))
         return True
 
     monkeypatch.setattr(ea, "add_peer", fake_add_peer)
@@ -189,7 +192,8 @@ def test_peer_add_takes_the_identity_and_key_from_the_cert(ca, tmp_path, monkeyp
     got: list = []
     rc = _peer_add(monkeypatch, tmp_path, ["--cert", str(cert)], registered=got)
     assert rc == 0
-    assert got == [("toolz3", "10.77.0.3", WG)]
+    assert got[0] == ("toolz3", "10.77.0.3", WG)
+    assert got[1][0] == "expires" and got[1][1], "the cert expiry must be recorded"
 
 
 def test_peer_add_refuses_a_cert_this_ca_did_not_sign(other_ca, ca, tmp_path, monkeypatch):
@@ -221,7 +225,8 @@ def test_peer_add_still_accepts_a_raw_key_for_unenrolled_nodes(ca, tmp_path, mon
     got: list = []
     rc = _peer_add(monkeypatch, tmp_path,
                    ["--name", "legacy", "--public-key", WG2], registered=got)
-    assert rc == 0 and got == [("legacy", "10.77.0.3", WG2)]
+    assert rc == 0 and got[0] == ("legacy", "10.77.0.3", WG2)
+    assert got[1] == ("expires", None), "a raw key has no expiry to enforce"
 
 
 def test_peer_add_requires_one_of_the_two_forms(ca, tmp_path, monkeypatch):
@@ -249,7 +254,8 @@ def test_peer_add_accepts_an_overlay_granted_node(ca, tmp_path, monkeypatch):
                                    grants=NodeGrants(tiers=("wireguard",))).cert_pem)
     got: list = []
     assert _peer_add(monkeypatch, tmp_path, ["--cert", str(cert)], registered=got) == 0
-    assert got == [("toolz3", "10.77.0.3", WG)]
+    assert got[0] == ("toolz3", "10.77.0.3", WG)
+    assert got[1][0] == "expires" and got[1][1], "the cert expiry must be recorded"
 
 
 def test_force_registers_an_ungranted_node_but_says_so(ca, tmp_path, monkeypatch, capsys):
@@ -260,5 +266,40 @@ def test_force_registers_an_ungranted_node_but_says_so(ca, tmp_path, monkeypatch
                                    grants=NodeGrants(engines=("boxjs",))).cert_pem)
     got: list = []
     rc = _peer_add(monkeypatch, tmp_path, ["--cert", str(cert), "--force"], registered=got)
-    assert rc == 0 and len(got) == 1
+    assert rc == 0 and got[0][0] == "engine-only"
     assert "NONE (--force)" in capsys.readouterr().out
+
+
+# ------------------------------------------------- a node cert is not a transport cert
+
+def test_a_node_cert_cannot_authenticate_as_the_dispatcher():
+    """`tls.py` verifies the CA chain only — no EKU check, no CN check — so a node cert
+    carrying `clientAuth` is accepted by every worker as the dispatcher's client cert.
+    On a federated fleet that is privilege escalation: any registered third party could
+    drive workers directly."""
+    from cryptography import x509
+    from cryptography.x509.oid import ExtendedKeyUsageOID
+
+    import tempfile
+    from pathlib import Path as _P
+
+    ca_ = pki.ensure_ca(_P(tempfile.mkdtemp()))
+    node = x509.load_pem_x509_certificate(
+        ca_.issue_node("rando", wg_pubkey=WG).cert_pem)
+    eku = list(node.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value)
+    assert ExtendedKeyUsageOID.CLIENT_AUTH not in eku
+    assert ExtendedKeyUsageOID.SERVER_AUTH not in eku
+    assert pki.OID_NODE_AUTH in eku
+    # ...and critical, so a verifier that does not understand it refuses rather than
+    # treating the cert as a general-purpose leaf.
+    assert node.extensions.get_extension_for_class(x509.ExtendedKeyUsage).critical
+
+
+def test_a_dispatcher_cert_is_refused_as_a_node_identity(ca):
+    with pytest.raises(ValueError, match="not a node identity"):
+        pki.node_identity(ca, ca.issue_client("dispatcher").cert_pem)
+
+
+def test_a_worker_server_cert_is_refused_as_a_node_identity(ca):
+    with pytest.raises(ValueError, match="not a node identity"):
+        pki.node_identity(ca, ca.issue_server(["10.0.0.1"]).cert_pem)

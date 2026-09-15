@@ -903,6 +903,7 @@ def _egress_cmd_inner(args: argparse.Namespace) -> int:
                       f"anyway.", file=sys.stderr)
                 return 1
             name, pubkey = ident.node_id, ident.wg_pubkey
+            expires = ident.not_after.isoformat()
             provenance = (f"identity and key verified against the CA "
                           f"(expires {ident.not_after.date()}); "
                           f"overlay tiers granted: {list(overlay_tiers) or 'NONE (--force)'}")
@@ -912,15 +913,25 @@ def _egress_cmd_inner(args: argparse.Namespace) -> int:
                 return 1
         elif args.public_key and args.name:
             name, pubkey = args.name, args.public_key
-            provenance = "UNAUTHENTICATED raw key — nothing ties it to a node identity"
+            # No cert, so no expiry to enforce — the peer lives until removed by hand.
+            # That is the honest consequence of the legacy path, and the output says so.
+            expires = None
+            provenance = ("UNAUTHENTICATED raw key — nothing ties it to a node identity, "
+                          "and it will never be pruned automatically")
         else:
             print("error: give --cert (preferred), or both --name and --public-key",
                   file=sys.stderr)
             return 2
-        added = ea.add_peer(cfg, name, args.peer_ip, pubkey)
+        added = ea.add_peer(cfg, name, args.peer_ip, pubkey, expires=expires)
         print(f"  peer {name} {'added' if added else 'already present'} at {args.peer_ip}/32")
         print(f"  {provenance}")
         print("  no private key changed hands")
+        return 0
+
+    if action == "peer-prune":
+        cfg = cfg_from(args)
+        gone = ea.prune_expired_peers(cfg)
+        print(f"  pruned {len(gone)} expired peer(s)" + (f": {', '.join(gone)}" if gone else ""))
         return 0
 
     if action == "peer":
@@ -1106,6 +1117,9 @@ def build_parser() -> argparse.ArgumentParser:
         "BLASTBOX_PKI_DIR", "/var/lib/blastbox/pki"))
     pe_pa.add_argument("--force", action="store_true",
                        help="register a verified node whose cert grants no overlay tier")
+    pes.add_parser("peer-prune", parents=[common],
+                   help="exit host: drop peers whose certificate has expired (run "
+                        "automatically on every apply)")
     pe_pr = pes.add_parser("peer", parents=[common],
                            help="worker node: join the overlay (generates its own key)")
     pe_pr.add_argument("--peer-ip", required=True)

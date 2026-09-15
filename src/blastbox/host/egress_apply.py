@@ -21,6 +21,7 @@ from pathlib import Path
 
 from blastbox.host.egress import (
     ALL_CHAINS,
+    expired_peers,
     CHAIN_EXIT,
     CHAIN_FWD,
     PRIO_BLACKHOLE,
@@ -686,7 +687,35 @@ def setup_gateway(cfg: EgressConfig) -> str:
     return pub
 
 
-def add_peer(cfg: EgressConfig, name: str, peer_ip: str, public_key: str) -> bool:
+def prune_expired_peers(cfg: EgressConfig) -> list[str]:
+    """Remove peers whose recorded certificate expiry has passed. Returns their names.
+
+    This is what makes "revocation is stop renewing" real at the overlay. Without it a
+    lapsed node keeps its tunnel indefinitely and the short cert lifetime buys nothing.
+    Run on every apply on the exit host, so the boot unit enforces it too.
+    """
+    conf = WG_DIR / f"{cfg.wg_iface}.conf"
+    if not conf.exists():
+        return []
+    body = conf.read_text()
+    gone = expired_peers(body)
+    if not gone:
+        return []
+    out, drop, current = [], False, None
+    for line in body.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith("# peer:"):
+            current = stripped[len("# peer:"):].strip()
+            drop = current in gone
+        if not drop:
+            out.append(line)
+    _write_conf(conf, "".join(out))
+    _run(["systemctl", "restart", f"wg-quick@{cfg.wg_iface}"], check=False)
+    return gone
+
+
+def add_peer(cfg: EgressConfig, name: str, peer_ip: str, public_key: str,
+             expires: str | None = None) -> bool:
     """Register a peer on the exit host. Returns False if it was already present.
 
     Only the peer's PUBLIC key is accepted — the peer generates its own keypair and the
@@ -697,7 +726,7 @@ def add_peer(cfg: EgressConfig, name: str, peer_ip: str, public_key: str) -> boo
     body = conf.read_text() if conf.exists() else ""
     if f"# peer:{name}\n" in body:
         return False
-    stanza = gateway_peer_stanza(name, peer_ip, public_key)
+    stanza = gateway_peer_stanza(name, peer_ip, public_key, expires)
     _write_conf(conf, body + stanza)
     _run(["systemctl", "restart", f"wg-quick@{cfg.wg_iface}"], check=False)
     return True
@@ -939,6 +968,10 @@ def apply_node(cfg: EgressConfig, *, dry_run: bool = False,
         notes.append(f"forwarder: started at {cfg.vpn_gateway_ip} -> overlay {cfg.upstream_gw}"
                      f" ({'gate passed' if verdict.healthy else 'GATE FAILED'})")
     if cfg.exit_host:
+        pruned = prune_expired_peers(cfg)
+        if pruned:
+            notes.append(f"pruned expired peers: {', '.join(pruned)} "
+                         "(their certs lapsed; re-enrol to restore)")
         # Replay the exit-host role at boot. This is the other half of persistence: the
         # peer side was already covered, but the CENTRAL host's forwarding is what every
         # peer depends on, so losing it on reboot is a fleet-wide outage rather than one

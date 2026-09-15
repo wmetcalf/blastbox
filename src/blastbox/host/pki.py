@@ -59,6 +59,16 @@ _CA_CN = "blastbox-worker-ca"
 # non-critical so any standard tool simply ignores it.
 _OID_ARC = "1.3.6.1.4.1.99999"
 OID_NODE_INFO = x509.ObjectIdentifier(f"{_OID_ARC}.1.1")
+#: A DISTINCT extended key usage for node certs.
+#:
+#: They must NOT carry ``clientAuth``. The dispatcher's mTLS client cert carries exactly
+#: that, and ``tls.py`` verifies the CA chain only — no EKU check, no CN check — so a
+#: node cert with ``clientAuth`` is accepted by every worker as the dispatcher's. On a
+#: federated fleet that is privilege escalation: any registered third party could drive
+#: workers directly. A private EKU keeps node identity positively identifiable and
+#: unusable anywhere a client cert is expected. When the control plane learns to
+#: authenticate nodes, it checks for THIS.
+OID_NODE_AUTH = x509.ObjectIdentifier(f"{_OID_ARC}.1.2")
 
 _NODE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
 _WG_KEY_RE = re.compile(r"^[A-Za-z0-9+/]{42}[A-Za-z0-9+/=]{1,2}$")
@@ -214,8 +224,9 @@ class CertAuthority:
         needs no CRL distribution and no online check on the hot path — but that only
         bounds exposure if the lifetime is short. A week is the upper end of sensible.
 
-        The cert gets CLIENT_AUTH so the same identity can authenticate the node to the
-        control plane; it is not a server cert and carries no SANs.
+        The cert carries a PRIVATE extended key usage, never ``clientAuth`` — see
+        :data:`OID_NODE_AUTH` for why that distinction is load-bearing. It is not a
+        server cert and carries no SANs.
         """
         if not _NODE_ID_RE.match(node_id):
             raise ValueError(
@@ -234,8 +245,10 @@ class CertAuthority:
             .not_valid_before(_now() - datetime.timedelta(minutes=5))
             .not_valid_after(_now() + datetime.timedelta(days=days))
             .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
-            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]),
-                           critical=False)
+            # NOT clientAuth — see OID_NODE_AUTH. Critical, so a verifier that does not
+            # understand it refuses the cert outright rather than treating it as a
+            # general-purpose leaf.
+            .add_extension(x509.ExtendedKeyUsage([OID_NODE_AUTH]), critical=True)
             .add_extension(
                 x509.UnrecognizedExtension(
                     OID_NODE_INFO, _node_info_bytes(node_id, wg_pubkey.strip(), grants)),
@@ -303,6 +316,14 @@ def node_identity(ca: CertAuthority, cert_pem: bytes,
     if not allow_expired and _now() >= not_after:
         raise ValueError(f"node certificate expired at {not_after.isoformat()}")
 
+    try:
+        eku = cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
+    except x509.ExtensionNotFound:
+        eku = []  # type: ignore[assignment]
+    if OID_NODE_AUTH not in list(eku):
+        raise ValueError(
+            "certificate does not carry the node extended key usage — it is a transport "
+            "cert, not a node identity")
     try:
         raw = cert.extensions.get_extension_for_oid(OID_NODE_INFO).value.public_bytes()
     except x509.ExtensionNotFound as exc:

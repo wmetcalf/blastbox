@@ -52,6 +52,7 @@ be renumbered out from under it. This is the same discipline ``libvirt_egress`` 
 from __future__ import annotations
 
 import bisect
+import datetime
 import ipaddress
 import os
 import re
@@ -61,6 +62,7 @@ from typing import Iterable, Mapping, Sequence
 
 __all__ = [
     "EgressConfig",
+    "expired_peers",
     "Step",
     "EgressMode",
     "SubnetPlan",
@@ -489,7 +491,8 @@ def gateway_wg_config(cfg: EgressConfig, private_key: str) -> str:
     )
 
 
-def gateway_peer_stanza(name: str, peer_ip: str, public_key: str) -> str:
+def gateway_peer_stanza(name: str, peer_ip: str, public_key: str,
+                        expires: str | None = None) -> str:
     """One ``[Peer]`` block for the exit host.
 
     ``AllowedIPs`` is a single ``/32``: a peer may only ever source its own overlay
@@ -501,8 +504,14 @@ def gateway_peer_stanza(name: str, peer_ip: str, public_key: str) -> str:
     key = public_key.strip()
     if not re.fullmatch(r"[A-Za-z0-9+/]{42}[A-Za-z0-9+/=]{1,2}", key):
         raise ValueError("public_key is not a base64 WireGuard key")
+    # The expiry is recorded so it can be ENFORCED. A node cert lives days; a wg peer
+    # stanza lives forever, so without this "revocation is stop renewing" quietly
+    # revokes nothing at the overlay — the lapsed node keeps its tunnel indefinitely.
+    # `egress peer-prune` reads this line; the exit host runs it on every apply.
+    exp = f"# expires:{expires}\n" if expires else ""
     return (
         f"\n# peer:{name}\n"
+        f"{exp}"
         "[Peer]\n"
         f"PublicKey = {key}\n"
         f"AllowedIPs = {_ip(peer_ip)}/32\n"
@@ -912,3 +921,34 @@ ReadWritePaths=/etc/wireguard /etc/blastbox /etc/iproute2
 [Install]
 WantedBy=multi-user.target
 """
+
+
+def expired_peers(conf: str, *, now: "datetime.datetime | None" = None) -> list[str]:
+    """Names of peers in a wg-quick config whose recorded certificate expiry has passed.
+
+    Revocation for federation is "stop renewing", which bounds exposure only if something
+    actually acts on the lapse. A peer registered from a 7-day cert otherwise keeps its
+    tunnel for years. A peer with no recorded expiry is left alone — it predates
+    enrolment or was force-registered, and silently dropping it would be a worse
+    surprise than leaving it.
+    """
+    import datetime as _dt
+
+    at = now or _dt.datetime.now(_dt.timezone.utc)
+    out: list[str] = []
+    name: str | None = None
+    for line in conf.splitlines():
+        line = line.strip()
+        if line.startswith("# peer:"):
+            name = line[len("# peer:"):].strip()
+        elif line.startswith("# expires:") and name:
+            raw = line[len("# expires:"):].strip()
+            try:
+                when = _dt.datetime.fromisoformat(raw)
+            except ValueError:
+                continue
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=_dt.timezone.utc)
+            if at >= when:
+                out.append(name)
+    return out

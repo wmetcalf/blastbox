@@ -150,7 +150,10 @@ class NodeRecord:
                     egress_reason=str(c.get("egress_reason", ""))[:200],
                 ),
             )
-        except (ValueError, TypeError, OverflowError, AttributeError):
+        except (ValueError, TypeError, OverflowError, AttributeError, RecursionError):
+            # RecursionError belongs here: json.loads on deeply nested input raises it,
+            # and an uncaught one takes out the whole read — one hostile node blinding
+            # the fleet's view, which is precisely what this parser promises not to do.
             return None
 
 
