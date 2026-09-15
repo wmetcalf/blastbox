@@ -71,7 +71,20 @@ OID_NODE_INFO = x509.ObjectIdentifier(f"{_OID_ARC}.1.1")
 OID_NODE_AUTH = x509.ObjectIdentifier(f"{_OID_ARC}.1.2")
 
 _NODE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
-_WG_KEY_RE = re.compile(r"^[A-Za-z0-9+/]{42}[A-Za-z0-9+/=]{1,2}$")
+def _is_wg_key(value: str) -> bool:
+    """Exactly 32 bytes of canonically-padded base64 — a real Curve25519 public key.
+
+    A regex on the CHARACTER shape accepts a 43-character unpadded value, or 44 unpadded
+    characters that decode to 33 bytes. Such a key passed issuance, was SIGNED into a
+    node certificate, and then passed the duplicate check on the way into the WireGuard
+    config, where it poisons the interface instead of producing an immediate CLI error.
+    """
+    import base64
+
+    try:
+        return len(base64.b64decode(value.strip(), validate=True)) == 32
+    except (ValueError, TypeError):
+        return False
 
 
 @dataclass(frozen=True)
@@ -232,8 +245,9 @@ class CertAuthority:
             raise ValueError(
                 f"invalid node id {node_id!r}: lowercase letters, digits, dot, dash, "
                 "underscore; 1-63 chars")
-        if not _WG_KEY_RE.match(wg_pubkey.strip()):
-            raise ValueError("wg_pubkey is not a base64 WireGuard public key")
+        if not _is_wg_key(wg_pubkey):
+            raise ValueError(
+                "wg_pubkey is not a 32-byte base64 WireGuard public key")
         grants = grants or NodeGrants()
         key = ec.generate_private_key(ec.SECP256R1())
         builder = (
@@ -342,7 +356,7 @@ def node_identity(ca: CertAuthority, cert_pem: bytes,
         raise ValueError(
             f"subject CN {cn!r} does not match the node id {node_id!r} in the extension")
     wg = str(info.get("wg", ""))
-    if not _WG_KEY_RE.match(wg):
+    if not _is_wg_key(wg):
         raise ValueError("node-info extension carries no valid WireGuard public key")
     return NodeIdentity(
         node_id=node_id, wg_pubkey=wg, not_after=not_after,

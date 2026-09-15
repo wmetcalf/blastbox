@@ -1017,3 +1017,87 @@ def test_pruning_removes_only_the_lapsed_stanza(tmp_path, monkeypatch):
     body = conf.read_text()
     assert "# peer:live" in body and "PrivateKey = secret" in body
     assert "# peer:lapsed" not in body and "A" * 43 not in body
+
+
+# ------------------------------------------- prefix matching was a containment hole
+
+def test_a_stale_rule_for_a_similar_address_does_not_satisfy_containment(monkeypatch):
+    """`"from 172.29.0.10" in body` is TRUE for `from 172.29.0.100`. A host carrying only
+    stale rules for a different forwarder address reported full containment while the
+    current forwarder's packets matched nothing and followed ordinary host forwarding."""
+    ea_ = _fake_host(
+        monkeypatch,
+        rules=("100:\tfrom 172.29.0.100 lookup bbwg\n"
+               "101:\tfrom 172.29.0.100 blackhole\n"),
+        forward=("-P FORWARD DROP\n"
+                 "-A FORWARD -s 172.29.0.100/32 -j BB-WG-FWD\n"),
+        chain=_GOOD_CHAIN)
+    ok, why = ea_.enforcement_present(GLOBAL)
+    assert not ok
+    assert "source route" in why and "blackhole" in why
+
+
+def test_a_forward_jump_for_another_source_is_not_our_jump(monkeypatch):
+    """A jump into the same chain for a DIFFERENT source protects nothing of ours."""
+    ea_ = _fake_host(monkeypatch, rules=_GOOD_RULES,
+                     forward=("-P FORWARD DROP\n"
+                              "-A FORWARD -s 10.9.9.9/32 -j BB-WG-FWD\n"),
+                     chain=_GOOD_CHAIN)
+    ok, why = ea_.enforcement_present(GLOBAL)
+    assert not ok and "orphaned" in why
+
+
+# ------------------------------------------------- owning the address, not routing to it
+
+def test_a_forwarder_that_lost_the_gateway_address_is_not_healthy(monkeypatch):
+    """A forwarder disconnected from bb-vpn keeps running its overlay loop and keeps its
+    gate line, while nothing holds the address every worker routes to."""
+    from blastbox.host import egress_apply as ea
+
+    monkeypatch.setattr(ea, "enforcement_present", lambda cfg: (True, "ok"))
+    monkeypatch.setattr(ea, "container_state",
+                        lambda n: (True, 0, "forwarder: overlay peer 10.77.0.1 reachable"))
+    monkeypatch.setattr(ea, "address_owner", lambda cfg, addr: None)
+    h = ea.node_health(GLOBAL)
+    assert not h.healthy and "does not own" in h.reason
+
+    monkeypatch.setattr(ea, "address_owner", lambda cfg, addr: GLOBAL.forwarder_name)
+    assert ea.node_health(GLOBAL).healthy
+
+
+def test_an_exit_host_with_no_sidecar_is_not_healthy(monkeypatch):
+    """`ip route get` passes whenever the bb-vpn bridge exists, because the subnet's
+    connected route remains — so the check passed with the sidecar stopped entirely and
+    every peer forwarded toward an address nothing answers."""
+    from blastbox.host import egress_apply as ea
+
+    exit_cfg = EgressConfig(mode="global", upstream_gw="10.77.0.1", exit_host=True)
+    monkeypatch.setattr(ea, "enforcement_present", lambda cfg: (True, "ok"))
+    monkeypatch.setattr(ea, "address_owner", lambda cfg, addr: None)
+    h = ea.node_health(exit_cfg)
+    assert not h.healthy and "NOTHING holds" in h.reason
+
+
+def test_the_exit_host_role_is_judged_before_the_local_shortcut(monkeypatch):
+    """`gateway-exit` records exit_host=True while mode stays at its default "local", so
+    the local shortcut skipped every containment check on the central host."""
+    from blastbox.host import egress_apply as ea
+
+    seen: list = []
+    monkeypatch.setattr(ea, "enforcement_present",
+                        lambda cfg: (seen.append(cfg.exit_host), (True, "ok"))[1])
+    monkeypatch.setattr(ea, "address_owner", lambda cfg, addr: "bb-vpn-gw")
+    cfg = EgressConfig(exit_host=True)          # mode defaults to "local"
+    assert ea.node_health(cfg).healthy
+    assert seen == [True], "an exit host's containment must be checked, not skipped"
+
+
+def test_an_exit_hosts_containment_is_checked_despite_mode_local(monkeypatch):
+    """The role, not the mode, decides the shape — and an exit host cannot simply be
+    coerced to mode=global, because the validator rightly refuses a global config with
+    no upstream and an exit host has none."""
+    from blastbox.host import egress_apply as ea
+
+    ea_ = _fake_host(monkeypatch, rules="", forward="", chain="")
+    ok, why = ea_.enforcement_present(EgressConfig(exit_host=True))
+    assert not ok, "an exit host with no rules must not read as 'local mode is fine'"

@@ -303,3 +303,31 @@ def test_a_dispatcher_cert_is_refused_as_a_node_identity(ca):
 def test_a_worker_server_cert_is_refused_as_a_node_identity(ca):
     with pytest.raises(ValueError, match="not a node identity"):
         pki.node_identity(ca, ca.issue_server(["10.0.0.1"]).cert_pem)
+
+
+def test_a_wireguard_key_must_decode_to_exactly_32_bytes(ca):
+    """A character-shape regex accepts a 43-char unpadded value, or 44 unpadded chars
+    decoding to 33 bytes. Such a key passed issuance, was SIGNED into a certificate, and
+    passed again on the way into the WireGuard config — poisoning the interface instead
+    of producing an immediate CLI error."""
+    import base64
+
+    assert len(base64.b64decode(WG)) == 32
+    ca.issue_node("ok", wg_pubkey=WG)                      # a real key still works
+
+    for bad in ("A" * 43, "A" * 44, "A" * 40 + "=", "not base64 at all!!"):
+        with pytest.raises(ValueError, match="32-byte"):
+            ca.issue_node("x", wg_pubkey=bad)
+
+
+def test_the_exit_host_stanza_also_refuses_an_out_of_overlay_address():
+    """The overlay check was added to the PEER's own config and not to the exit host's
+    stanza — and the exit host is the side that matters, since its source route and
+    BB-WG-EXIT chain both match the overlay prefix."""
+    from blastbox.host.egress import EgressConfig, gateway_peer_stanza
+
+    cfg = EgressConfig(mode="global", upstream_gw="10.77.0.1")
+    with pytest.raises(ValueError, match="outside the overlay"):
+        gateway_peer_stanza("toolz3", "10.78.0.3", WG, None, cfg)
+    assert "AllowedIPs = 10.77.0.3/32" in gateway_peer_stanza(
+        "toolz3", "10.77.0.3", WG, None, cfg)

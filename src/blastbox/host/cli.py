@@ -857,7 +857,16 @@ def _egress_cmd_inner(args: argparse.Namespace) -> int:
         if not args.dry_run:
             h = ea.await_health(cfg)
             print(f"  health: {'OK' if h.healthy else 'DEGRADED'} — {h.reason}")
-            return 0 if h.healthy else 1
+            # APPLY REPORTS HEALTH; IT DOES NOT FAIL ON IT. A local-mode node that only
+            # runs direct/inetsim/socks/tor personalities has no sidecar at the VPN
+            # gateway address and never will — so the documented bridge-setup command
+            # waited ~45s and exited 1 after configuring everything correctly, and the
+            # boot unit then repeated that failure forever under Restart=on-failure.
+            # `check` and `health` are the commands whose exit code means "is this node
+            # currently able to egress"; `apply` means "did the configuration apply".
+            if not h.healthy:
+                print("  (the configuration applied; `blastbox egress check` is the "
+                      "command whose exit status reflects health)")
         return 0
 
     if action == "teardown":

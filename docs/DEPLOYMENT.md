@@ -287,20 +287,22 @@ source route exists):
 
 ```sh
 # 1. exit host — already runs the sidecars
-sudo blastbox egress gateway                       # prints its public key
+sudo blastbox egress gateway                       # prints the EXIT HOST's public key
 sudo blastbox egress gateway-exit                  # records the exit role; replayed at boot
 
-# 2. enrol the peer: its identity, WireGuard key and grants in one CA-signed cert
+# 2. worker node — generates its OWN key and prints it; the private half never travels
+sudo blastbox egress peer --peer-ip 10.77.0.3 \
+     --gateway-addr <exit host> --gateway-pubkey <exit host public key>
+
+# 3. back on the exit host — enrol the peer with the key step 2 just printed
 sudo blastbox pki issue-node --node-id toolz3 --wg-pubkey <the peer's public key> \
      --engine boxjs --tier openvpn --tier wireguard
 sudo blastbox egress peer-add --peer-ip 10.77.0.3 --cert /var/lib/blastbox/pki/node-toolz3.crt
 
-# 3. worker node — generates its own key; the private half never travels
-sudo blastbox egress peer --peer-ip 10.77.0.3 \
-     --gateway-addr <exit host> --gateway-pubkey <exit host public key>
+# 4. worker node again — bring up the tier
 sudo blastbox egress apply --mode global --upstream-gw 10.77.0.1
 
-# 4. prove it — including that killing the overlay removes egress
+# 5. prove it — including that killing the overlay removes egress
 sudo blastbox egress check
 sudo scripts/test-egress-leak.sh --mode global --gateway-ip 172.31.0.10
 ```

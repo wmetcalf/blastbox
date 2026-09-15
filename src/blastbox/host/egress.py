@@ -492,7 +492,8 @@ def gateway_wg_config(cfg: EgressConfig, private_key: str) -> str:
 
 
 def gateway_peer_stanza(name: str, peer_ip: str, public_key: str,
-                        expires: str | None = None) -> str:
+                        expires: str | None = None,
+                        cfg: "EgressConfig | None" = None) -> str:
     """One ``[Peer]`` block for the exit host.
 
     ``AllowedIPs`` is a single ``/32``: a peer may only ever source its own overlay
@@ -502,8 +503,14 @@ def gateway_peer_stanza(name: str, peer_ip: str, public_key: str,
     if not _SAFE_NAME.match(name):
         raise ValueError(f"unsafe peer name {name!r}")
     key = public_key.strip()
-    if not re.fullmatch(r"[A-Za-z0-9+/]{42}[A-Za-z0-9+/=]{1,2}", key):
-        raise ValueError("public_key is not a base64 WireGuard key")
+    if not _is_wg_key(key):
+        raise ValueError("public_key is not a 32-byte base64 WireGuard key")
+    # BOTH SIDES, not just the peer's own config. The overlay-membership check was added
+    # to peer_wg_config and not here, so `peer-add --peer-ip 10.78.0.3` still registered
+    # an out-of-overlay address on the EXIT HOST — where the source route and the
+    # BB-WG-EXIT chain both match the overlay prefix, so that peer's traffic bypassed
+    # them entirely. This is the side that matters more.
+    peer_ip = _overlay_member(cfg, peer_ip) if cfg is not None else _ip(peer_ip)
     # The expiry is recorded so it can be ENFORCED. A node cert lives days; a wg peer
     # stanza lives forever, so without this "revocation is stop renewing" quietly
     # revokes nothing at the overlay — the lapsed node keeps its tunnel indefinitely.
@@ -514,8 +521,24 @@ def gateway_peer_stanza(name: str, peer_ip: str, public_key: str,
         f"{exp}"
         "[Peer]\n"
         f"PublicKey = {key}\n"
-        f"AllowedIPs = {_ip(peer_ip)}/32\n"
+        f"AllowedIPs = {peer_ip}/32\n"
     )
+
+
+def _is_wg_key(value: str) -> bool:
+    """Exactly 32 bytes of canonically-padded base64 — a real Curve25519 public key.
+
+    The old regex accepted anything 43-45 base64-ish characters long, so a truncated or
+    mistyped key passed `pki issue-node`, got SIGNED into a node certificate, and then
+    passed this check again on the way into the WireGuard config, where it poisons the
+    interface instead of producing an immediate error.
+    """
+    import base64
+
+    try:
+        return len(base64.b64decode(value, validate=True)) == 32
+    except (ValueError, TypeError):
+        return False
 
 
 def _overlay_member(cfg: EgressConfig, peer_ip: str) -> str:

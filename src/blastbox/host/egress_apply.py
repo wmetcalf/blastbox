@@ -229,6 +229,40 @@ def container_state(name: str) -> tuple[bool, int, str]:
     return running, restarts, (logs.stdout or "") + (logs.stderr or "")
 
 
+def _rule_from(body: str) -> str | None:
+    """The normalised source network of an ``ip rule`` body, or None.
+
+    SUBSTRING MATCHING WAS A CONTAINMENT HOLE. `"from 172.29.0.10" in body` is true for
+    `from 172.29.0.100`, so a host carrying only stale rules for a DIFFERENT forwarder
+    address reported full containment while the current forwarder's packets matched
+    nothing and followed ordinary host forwarding. Tokenise and compare networks.
+    """
+    tok = body.split()
+    if "from" not in tok:
+        return None
+    try:
+        value = tok[tok.index("from") + 1]
+    except IndexError:
+        return None
+    if value == "all":
+        return "all"
+    try:
+        return str(ipaddress.ip_network(value, strict=False))
+    except ValueError:
+        return None
+
+
+def _rule_matches(body: str, source: str) -> bool:
+    """Does this rule body select exactly ``source`` (an address or a network)?"""
+    got = _rule_from(body)
+    if got is None:
+        return False
+    try:
+        return got == str(ipaddress.ip_network(source, strict=False))
+    except ValueError:
+        return False
+
+
 def _rules_at(rules: str, priority: int) -> list[str]:
     """EVERY ``ip rule`` body at ``priority`` — a priority is not unique.
 
@@ -347,7 +381,11 @@ def enforcement_present(cfg: EgressConfig) -> tuple[bool, str]:
       filter traversal, so a jump below it is dead code.
     * **The chain's verdict.** A blanket ACCEPT ahead of the DROP would neuter it.
     """
-    if cfg.mode != "global":
+    # The ROLE decides the shape, not the mode. An exit host records exit_host=True with
+    # mode left at its default "local" (the documented flow never passes --mode to
+    # `gateway-exit`), and it cannot simply be coerced to "global" — the validator
+    # rightly refuses a global config with no upstream, since an exit host has none.
+    if cfg.mode != "global" and not cfg.exit_host:
         return True, "local mode: the sidecar itself is the enforcement"
     missing: list[str] = []
     # AN EXIT HOST HAS A DIFFERENT SHAPE. It records mode="global" because its peers are
@@ -358,11 +396,11 @@ def enforcement_present(cfg: EgressConfig) -> tuple[bool, str]:
     chain = CHAIN_EXIT if cfg.exit_host else CHAIN_FWD
 
     rules = _run(["ip", "rule", "show"], check=False).stdout or ""
-    if not any(f"from {fwd}" in r and (f"lookup {cfg.rt_table}" in r
-                                       or f"lookup {cfg.rt_table_id}" in r)
+    if not any(_rule_matches(r, fwd) and (cfg.rt_table in r.split()
+                                          or str(cfg.rt_table_id) in r.split())
                for r in _rules_at(rules, PRIO_LOOKUP)):
         missing.append(f"source route (priority {PRIO_LOOKUP}: from {fwd} -> {cfg.rt_table})")
-    if not any(f"from {fwd}" in r and "blackhole" in r
+    if not any(_rule_matches(r, fwd) and "blackhole" in r.split()
                for r in _rules_at(rules, PRIO_BLACKHOLE)):
         missing.append(f"blackhole fall-through guard (priority {PRIO_BLACKHOLE})")
 
@@ -387,8 +425,14 @@ def enforcement_present(cfg: EgressConfig) -> tuple[bool, str]:
         for i, line in enumerate((fwd_probe.stdout or "").splitlines()):
             if not line.startswith("-A FORWARD"):
                 continue
+            # ...and it must be OUR jump. A jump into the same chain for a DIFFERENT
+            # source is somebody else's rule (or a stale one) and protects nothing of
+            # ours — the same prefix-matching mistake as the ip-rule check above.
             if line.endswith(f"-j {chain}") and jump_at is None:
-                jump_at = i
+                tok = line.split()
+                src = tok[tok.index("-s") + 1] if "-s" in tok else None
+                if src is None or _rule_matches(f"from {src}", fwd):
+                    jump_at = i
             # Does this rule swallow OUR traffic before we are reached? Narrowing the
             # last version to "docker jumps only" went too far the other way: an ACCEPT
             # that explicitly matches the forwarder's own source sails past it. Decide by
@@ -418,6 +462,25 @@ def enforcement_present(cfg: EgressConfig) -> tuple[bool, str]:
     return True, "source route, blackhole guard and an in-path WAN-escape DROP all present"
 
 
+def address_owner(cfg: EgressConfig, address: str) -> str | None:
+    """The container currently holding ``address`` on bb-vpn, or None.
+
+    `ip route get <gw>` is NOT this. The bb-vpn subnet's connected route exists whenever
+    the bridge does, so that check passed with the exit sidecar stopped entirely — and
+    every global worker then forwarded toward an address nothing answers. Ask docker who
+    actually holds it.
+    """
+    proc = _run(["docker", "network", "inspect", "bb-vpn", "--format",
+                 "{{range .Containers}}{{.Name}} {{.IPv4Address}}\n{{end}}"], check=False)
+    if proc.returncode != 0:
+        return None
+    for line in (proc.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].split("/")[0] == address:
+            return parts[0]
+    return None
+
+
 def node_health(cfg: EgressConfig) -> Health:
     """Whether this node can currently egress UNDER ITS POLICY.
 
@@ -432,6 +495,21 @@ def node_health(cfg: EgressConfig) -> Health:
       node whose traffic exits the analyst's own WAN — the exact outcome this tier exists
       to prevent, dressed as a green check.
     """
+    # EXIT HOST FIRST. `gateway-exit` records exit_host=True while mode stays at its
+    # default "local" (the documented flow never passes --mode there), and the local
+    # shortcut below then skipped every containment check — so an ICMP-dropping sidecar
+    # read permanently degraded, and an answering one read healthy after the
+    # BB-WG-EXIT rules had disappeared.
+    if cfg.exit_host:
+        enforced, why = enforcement_present(cfg)
+        if not enforced:
+            return Health(False, why)
+        owner = address_owner(cfg, cfg.vpn_gateway_ip)
+        return Health(bool(owner),
+                      f"exit host: {owner} holds {cfg.vpn_gateway_ip}; {why}" if owner
+                      else f"exit host: NOTHING holds {cfg.vpn_gateway_ip} — the exit "
+                           "sidecar is not running, so every peer forwards to an address "
+                           "that never answers")
     enforced, why = enforcement_present(cfg)
     if not enforced:
         return Health(False, why)
@@ -440,25 +518,21 @@ def node_health(cfg: EgressConfig) -> Health:
         return Health(reachable,
                       "exit sidecar reachable at the gateway address" if reachable
                       else f"nothing answers at the gateway address {cfg.vpn_gateway_ip}")
-    if cfg.exit_host:
-        # NOT a ping. An exit sidecar is a container that may well drop ICMP (the PIA
-        # client here does), and judging the central host on that reported a working
-        # exit as dead — which, with the dispatch gate wired to this verdict, would
-        # have taken the whole fleet's egress work out of circulation. What is both
-        # observable and load-bearing is that the sidecar's address still resolves on a
-        # link route: that is exactly what the peers' default route depends on.
-        on_link = iface_for(cfg.vpn_gateway_ip)
-        return Health(bool(on_link),
-                      f"exit host: sidecar {cfg.vpn_gateway_ip} on {on_link}; {why}"
-                      if on_link else
-                      f"exit host: {cfg.vpn_gateway_ip} is not reachable on any link — "
-                      "is the exit sidecar running?")
     running, restarts, logs = container_state(cfg.forwarder_name)
     verdict = forwarder_health(running=running, restart_count=restarts,
                                logs_since_start=logs)
-    if verdict.healthy:
-        return Health(True, f"{verdict.reason}; {why}")
-    return verdict
+    if not verdict.healthy:
+        return verdict
+    # A forwarder disconnected from bb-vpn — or reattached with the wrong address after a
+    # partial recreation — keeps running its overlay loop and keeps its successful gate
+    # line, while nothing holds the address every worker routes to.
+    owner = address_owner(cfg, cfg.vpn_gateway_ip)
+    if owner != cfg.forwarder_name:
+        return Health(False,
+                      f"the forwarder is up and past its gate, but {cfg.vpn_gateway_ip} "
+                      f"is held by {owner or 'NOTHING'} — workers route to an address "
+                      "the forwarder does not own")
+    return Health(True, f"{verdict.reason}; {why}")
 
 
 # --------------------------------------------------------------------------------------
@@ -710,8 +784,41 @@ def prune_expired_peers(cfg: EgressConfig) -> list[str]:
         if not drop:
             out.append(line)
     _write_conf(conf, "".join(out))
-    _run(["systemctl", "restart", f"wg-quick@{cfg.wg_iface}"], check=False)
+    # If this raises, the caller learns the peers were removed from DISK but not from the
+    # live interface — which is the difference between revocation and the appearance of it.
+    _reload_wg(cfg)
     return gone
+
+
+def _reload_wg(cfg: EgressConfig) -> None:
+    """Apply a changed wg config to the LIVE interface, or raise.
+
+    Two ways this silently did nothing. `systemctl enable --now` does not restart an
+    already-active unit, so a rewritten config never reached the interface. And on a host
+    without systemd the restart returns 127, which `check=False` swallowed — so pruning
+    an expired peer reported success while the running interface kept accepting it, and
+    the project's ONLY revocation mechanism had not taken effect.
+    """
+    if _ok(["systemctl", "is-active", f"wg-quick@{cfg.wg_iface}"]):
+        if _ok(["systemctl", "restart", f"wg-quick@{cfg.wg_iface}"]):
+            return
+    # No systemd, or the unit is not managing it: sync the live interface directly.
+    # `wg syncconf` applies peer changes without tearing the tunnel down.
+    conf = WG_DIR / f"{cfg.wg_iface}.conf"
+    stripped = _run(["wg-quick", "strip", cfg.wg_iface], check=False)
+    if stripped.returncode == 0 and stripped.stdout:
+        tmp = conf.with_suffix(".stripped")
+        try:
+            _write_conf(tmp, stripped.stdout)
+            if _ok(["wg", "syncconf", cfg.wg_iface, str(tmp)]):
+                return
+        finally:
+            tmp.unlink(missing_ok=True)
+    if not _ok(["ip", "link", "show", cfg.wg_iface]):
+        return          # interface is down; the config will be read when it comes up
+    raise RuntimeError(
+        f"changed {conf} but could NOT apply it to the live {cfg.wg_iface}; the running "
+        "interface still has the old peers. Restart it by hand before trusting this.")
 
 
 def add_peer(cfg: EgressConfig, name: str, peer_ip: str, public_key: str,
@@ -724,11 +831,23 @@ def add_peer(cfg: EgressConfig, name: str, peer_ip: str, public_key: str,
     """
     conf = WG_DIR / f"{cfg.wg_iface}.conf"
     body = conf.read_text() if conf.exists() else ""
-    if f"# peer:{name}\n" in body:
-        return False
-    stanza = gateway_peer_stanza(name, peer_ip, public_key, expires)
+    stanza = gateway_peer_stanza(name, peer_ip, public_key, expires, cfg)
+    marker = f"\n# peer:{name}\n"
+    if marker in body:
+        # RECONCILE, do not skip. Treating mere presence as success meant a RENEWED
+        # certificate changed nothing: the old expiry stayed, so the next apply pruned a
+        # peer that had just been renewed, and a rotated key was ignored outright.
+        start = body.index(marker)
+        nxt = body.find("\n# peer:", start + 1)
+        end = len(body) if nxt == -1 else nxt
+        replaced = body[:start] + stanza + body[end:]
+        if replaced == body:
+            return False
+        _write_conf(conf, replaced)
+        _reload_wg(cfg)
+        return True
     _write_conf(conf, body + stanza)
-    _run(["systemctl", "restart", f"wg-quick@{cfg.wg_iface}"], check=False)
+    _reload_wg(cfg)
     return True
 
 
@@ -923,6 +1042,16 @@ def apply_node(cfg: EgressConfig, *, dry_run: bool = False,
         notes.append(f"conflict: {bname} wanted {wanted}, taken by {hit}")
     for bname, wanted, chosen in plan.reallocated:
         notes.append(f"reallocated: {bname} {wanted} -> {chosen}")
+    if plan.advisory and plan.reallocated:
+        # SubnetPlan promises to report these so an operator can overrule. Nothing did.
+        # A broad corporate route (10.0.0.0/8) does not block allocation — it cannot, or
+        # the whole pool would be unusable — but a bridge placed inside it installs a
+        # MORE SPECIFIC connected route that shadows part of that range for this host.
+        notes.append(
+            "NOTE: chosen ranges sit inside summary route(s) "
+            + ", ".join(plan.advisory)
+            + " — a bridge there shadows that part of the summary on this host. Set the "
+              "subnets explicitly if that range is genuinely allocated.")
     # ANY unresolved conflict aborts. The old condition only fired when auto was on AND
     # nothing at all had been reallocated, so --no-auto-subnets proceeded straight into
     # ensure_bridges, and a partial allocation (one conflict resolved, another not) did
