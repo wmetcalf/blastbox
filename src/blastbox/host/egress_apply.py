@@ -1066,9 +1066,10 @@ def _load_previous():
     from blastbox.host.exit_attest import PeerObservation
 
     try:
-        rows = json.loads(ATTEST_STATE.read_text())
+        blob = json.loads(ATTEST_STATE.read_text())
     except (OSError, json.JSONDecodeError):
         return []
+    rows = blob.get("peers", []) if isinstance(blob, dict) else blob
     out = []
     for r in rows if isinstance(rows, list) else []:
         try:
@@ -1083,24 +1084,58 @@ def _load_previous():
     return out
 
 
-def _save_current(peers) -> None:
+def _save_current(peers, streak: dict[str, int] | None = None) -> None:
+    """Persist this sample, but NEVER over a newer one.
+
+    Two attestations running at once (a cron overlapping a manual run) would otherwise
+    let the slower finisher write its older sample last. The next run then differences
+    against a sample from BEFORE the one it already compared, sees counters that have
+    "not moved", and manufactures a leak accusation out of a scheduling race.
+    """
+    newest = max((p.observed_at for p in peers), default=0.0)
+    try:
+        existing = json.loads(ATTEST_STATE.read_text())
+        prior = max((float(r.get("observed_at", 0)) for r in existing.get("peers", [])),
+                    default=0.0) if isinstance(existing, dict) else 0.0
+        if prior > newest:
+            return
+    except (OSError, json.JSONDecodeError, ValueError, TypeError, AttributeError):
+        pass
     ATTEST_STATE.parent.mkdir(parents=True, exist_ok=True)
-    ATTEST_STATE.write_text(json.dumps([{
+    _write_state(peers, streak or {})
+
+
+def _write_state(peers, streak: dict[str, int]) -> None:
+    ATTEST_STATE.write_text(json.dumps({"streak": streak, "peers": [{
         "public_key": p.public_key, "endpoint": p.endpoint,
         "allowed_ips": list(p.allowed_ips), "latest_handshake": p.latest_handshake,
         "rx_bytes": p.rx_bytes, "tx_bytes": p.tx_bytes, "observed_at": p.observed_at,
-    } for p in peers], indent=1))
+    } for p in peers]}, indent=1))
     os.chmod(ATTEST_STATE, 0o644)
 
 
+def _load_streak() -> dict[str, int]:
+    try:
+        blob = json.loads(ATTEST_STATE.read_text())
+        return {str(k): int(v) for k, v in (blob.get("streak") or {}).items()}
+    except (OSError, json.JSONDecodeError, ValueError, TypeError, AttributeError):
+        return {}
+
+
 def attest_peers(cfg: EgressConfig, *, key_to_node, working=None):
-    """Observe, judge against the previous sample, and persist this one."""
+    """Observe, judge against the previous sample, and persist this one.
+
+    The quiet-window streak is persisted with the sample: a single quiet window proves
+    nothing (most detonations never open a socket), so the accusation depends on
+    sustained silence across runs and therefore on carrying that count forward.
+    """
     from blastbox.host.exit_attest import attest
 
     peers = observe_peers(cfg)
     verdicts = attest(peers, key_to_node=key_to_node, working=working,
-                      previous=_load_previous())
-    _save_current(peers)
+                      previous=_load_previous(), quiet_streak=_load_streak())
+    _save_current(peers, {v.node_id: v.quiet_windows for v in verdicts
+                          if v.quiet_windows})
     return verdicts
 
 

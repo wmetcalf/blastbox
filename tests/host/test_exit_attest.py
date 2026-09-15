@@ -9,6 +9,7 @@ from __future__ import annotations
 import time
 
 from blastbox.host.exit_attest import (
+    QUIET_WINDOWS_BEFORE_LEAK,
     STALE_HANDSHAKE_S,
     PeerObservation,
     attest,
@@ -75,7 +76,13 @@ def test_a_working_node_whose_counters_do_not_move_is_contradicted():
     t0 = time.time() - 60
     before = obs(rx=1000, tx=1000, at=t0)
     after = obs(rx=1000, tx=1000, at=t0 + 60)          # identical counters
-    [v] = attest([after], key_to_node=MAP, working={"toolz3": True}, previous=[before])
+    # One quiet window is NOT an accusation — most detonations never open a socket.
+    [first] = attest([after], key_to_node=MAP, working={"toolz3": True}, previous=[before])
+    assert first.contained and not first.contradicted and first.quiet_windows == 1
+
+    # Sustained silence while work keeps being dispatched is a different claim.
+    [v] = attest([after], key_to_node=MAP, working={"toolz3": True}, previous=[before],
+                 quiet_streak={"toolz3": QUIET_WINDOWS_BEFORE_LEAK - 1})
     assert v.contained is False and v.contradicted
     assert "not this exit" in v.reason
 
@@ -126,10 +133,18 @@ def test_a_down_tunnel_on_an_idle_node_is_merely_down():
     assert v.contained and not v.contradicted
 
 
-def test_a_peer_that_never_handshook_is_not_accused():
-    [v] = attest([obs(handshake_age=None)], key_to_node=MAP, working={"toolz3": True})
+def test_a_peer_that_never_handshook_is_innocuous_when_idle():
+    [v] = attest([obs(handshake_age=None)], key_to_node=MAP, working={"toolz3": False})
     assert v.contained and not v.contradicted
     assert "never completed a handshake" in v.reason
+
+
+def test_a_working_peer_that_never_handshook_is_the_clearest_signal_there_is():
+    """Its work has to be going somewhere and it has never once reached this exit. The
+    first version returned contained=True regardless, discarding exactly that."""
+    [v] = attest([obs(handshake_age=None)], key_to_node=MAP, working={"toolz3": True})
+    assert v.contained is False and v.contradicted
+    assert "NEVER" in v.reason
 
 
 # ------------------------------------------------------------ registration hygiene
@@ -186,7 +201,8 @@ def test_keepalive_traffic_alone_does_not_count_as_work():
     assert (after.rx_bytes - before.rx_bytes) + (after.tx_bytes - before.tx_bytes) \
         < keepalive_allowance(120)
 
-    [v] = attest([after], key_to_node=MAP, working={"toolz3": True}, previous=[before])
+    [v] = attest([after], key_to_node=MAP, working={"toolz3": True}, previous=[before],
+                 quiet_streak={"toolz3": QUIET_WINDOWS_BEFORE_LEAK - 1})
     assert v.contradicted, "keepalive-only traffic must not mask a leak"
     assert "keepalives alone explain" in v.reason
 
@@ -225,5 +241,34 @@ def test_a_counter_reset_is_not_read_as_negative_traffic():
     t0 = time.time() - 60
     [v] = attest([obs(rx=10, tx=10, at=t0 + 60)], key_to_node=MAP,
                  working={"toolz3": True},
-                 previous=[obs(rx=5_000_000, tx=5_000_000, at=t0)])
-    assert v.contradicted and "0B crossed" in v.reason
+                 previous=[obs(rx=5_000_000, tx=5_000_000, at=t0)],
+                 quiet_streak={"toolz3": QUIET_WINDOWS_BEFORE_LEAK - 1})
+    assert v.contradicted and "only 0B" in v.reason
+
+
+def test_a_single_quiet_window_never_accuses_and_counts_toward_the_streak():
+    """Most detonations are quiet: plenty of samples never open a socket, many resolve
+    one name and stop, and a job can be dispatched and still unpacking when the window
+    closes. An alarm that cries wolf trains the operator to ignore the real one."""
+    t0 = time.time() - 60
+    before, after = obs(rx=1000, tx=1000, at=t0), obs(rx=1000, tx=1000, at=t0 + 60)
+    streak: dict[str, int] = {}
+    for expected in range(1, QUIET_WINDOWS_BEFORE_LEAK):
+        [v] = attest([after], key_to_node=MAP, working={"toolz3": True},
+                     previous=[before], quiet_streak=streak)
+        assert v.contained and not v.contradicted
+        assert v.quiet_windows == expected
+        streak = {"toolz3": v.quiet_windows}
+    [final] = attest([after], key_to_node=MAP, working={"toolz3": True},
+                     previous=[before], quiet_streak=streak)
+    assert final.contradicted and final.quiet_windows == QUIET_WINDOWS_BEFORE_LEAK
+
+
+def test_real_traffic_clears_the_streak_for_the_caller():
+    """A verdict that is contained carries quiet_windows == 0, so the caller persists a
+    reset rather than accumulating toward a false accusation across an idle afternoon."""
+    t0 = time.time() - 60
+    [v] = attest([obs(rx=9_000_000, tx=9_000_000, at=t0 + 60)], key_to_node=MAP,
+                 working={"toolz3": True}, previous=[obs(rx=1000, tx=1000, at=t0)],
+                 quiet_streak={"toolz3": QUIET_WINDOWS_BEFORE_LEAK - 1})
+    assert v.contained and v.quiet_windows == 0

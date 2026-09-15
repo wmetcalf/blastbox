@@ -940,13 +940,27 @@ def _egress_cmd_inner(args: argparse.Namespace) -> int:
         except Exception as exc:
             print(f"error: cannot load the CA from {pki_dir}: {exc}", file=sys.stderr)
             return 1
-        for crt in sorted(pki_dir.glob("node-*.crt")):
+        # Every cert in the directory, not just `node-*.crt`. `pki issue-node --out`
+        # lets an operator name the file anything; globbing a prefix silently ignored
+        # those, and their node then read as an UNAUTHORISED peer — a false accusation
+        # produced by a filename convention. node_identity() is the filter: a transport
+        # cert simply fails it.
+        for crt in sorted(pki_dir.glob("*.crt")):
             try:
                 ident = node_identity(ca, crt.read_bytes())
             except ValueError:
                 continue          # expired or invalid: it authorises nothing
             key_to_node[ident.wg_pubkey] = ident.node_id
         working = {n: True for n in args.working}
+        if not working:
+            # FAIL-OPEN, and say so. With no working set, nothing can be contradicted:
+            # the leak check is inert and a silent "all ok" would be the most misleading
+            # output this command could produce. The real fix is sourcing this from the
+            # job store; until then the operator must see that it was not supplied.
+            print("  WARNING: no --working nodes given, so the leak check is INERT — "
+                  "only connectivity and registration hygiene are being verified. "
+                  "Pass the nodes the control plane dispatched egress work to.",
+                  file=sys.stderr)
         verdicts = ea.attest_peers(cfg, key_to_node=key_to_node, working=working)
         missing = __import__("blastbox.host.exit_attest", fromlist=["missing_peers"]) \
             .missing_peers(ea.observe_peers(cfg), key_to_node=key_to_node)

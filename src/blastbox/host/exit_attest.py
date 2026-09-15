@@ -44,6 +44,7 @@ __all__ = [
     "parse_wg_dump",
     "attest",
     "STALE_HANDSHAKE_S",
+    "QUIET_WINDOWS_BEFORE_LEAK",
 ]
 
 #: A peer that has not completed a handshake in this long is not connected. WireGuard
@@ -66,6 +67,19 @@ KEEPALIVE_INTERVAL_S = 25.0
 KEEPALIVE_BYTES_ALLOWANCE = 512
 #: Floor, so a very short sampling window cannot make the allowance near-zero.
 MIN_TRAFFIC_BYTES = 4096
+
+#: CONSECUTIVE quiet windows before a working node is called a leak.
+#:
+#: A single quiet window means nothing, and assuming otherwise would make this unusable.
+#: Most detonations are quiet: plenty of samples never open a socket, many resolve one
+#: name and stop, and a job can be dispatched and still be unpacking when the window
+#: closes. Accusing on one sample would take working nodes out of service constantly,
+#: and an alarm that cries wolf is worse than no alarm — it trains the operator to
+#: ignore the one real leak.
+#:
+#: Sustained silence across several windows while the control plane keeps dispatching
+#: egress work is a different claim, and a much stronger one.
+QUIET_WINDOWS_BEFORE_LEAK = 3
 
 
 def keepalive_allowance(elapsed_s: float) -> int:
@@ -109,6 +123,10 @@ class Verdict:
     #: to merely having nothing to report. Callers should treat these very differently:
     #: the first is a node to take out of service, the second is a node to keep watching.
     contradicted: bool = False
+    #: Consecutive quiet-while-working windows behind this verdict. Carried so the
+    #: caller can persist it, and so a report can say "2 of 3" rather than only ever
+    #: showing the final accusation.
+    quiet_windows: int = 0
 
 
 def parse_wg_dump(dump: str, *, observed_at: float | None = None) -> list[PeerObservation]:
@@ -149,6 +167,7 @@ def attest(
     key_to_node: Mapping[str, str],
     working: Mapping[str, bool] | None = None,
     previous: Sequence[PeerObservation] | None = None,
+    quiet_streak: Mapping[str, int] | None = None,
     at: float | None = None,
 ) -> list[Verdict]:
     """Judge each peer from the exit host's own observations.
@@ -187,10 +206,18 @@ def attest(
             continue
 
         if not obs.ever_connected:
+            # "Never handshook" is innocuous for an idle node and damning for a working
+            # one: its work has to be going somewhere, and it has never once reached
+            # this exit. The earlier version returned contained=True regardless, which
+            # discarded the clearest signal available.
+            is_working = bool(working.get(node_id))
             verdicts.append(Verdict(
-                node_id=node_id, contained=True,
-                reason="registered but has never completed a handshake; nothing to "
-                       "contain yet"))
+                node_id=node_id, contained=not is_working, contradicted=is_working,
+                reason=("the control plane dispatched egress work to it and it has NEVER "
+                        "completed a handshake — its traffic has never once reached this "
+                        "exit" if is_working else
+                        "registered but has never completed a handshake; nothing to "
+                        "contain yet")))
             continue
 
         if not obs.connected(now=when):
@@ -219,11 +246,22 @@ def attest(
         real_traffic = delta > allowance
 
         if working.get(node_id) and not real_traffic:
+            streak = (quiet_streak or {}).get(node_id, 0) + 1
+            if streak < QUIET_WINDOWS_BEFORE_LEAK:
+                # Not yet an accusation. Most detonations are quiet — see
+                # QUIET_WINDOWS_BEFORE_LEAK — so one window proves nothing.
+                verdicts.append(Verdict(
+                    node_id=node_id, contained=True, quiet_windows=streak,
+                    reason=(f"connected; only {delta}B in {int(elapsed)}s while work was "
+                            f"dispatched ({streak} of {QUIET_WINDOWS_BEFORE_LEAK} quiet "
+                            "windows). Many samples never open a socket, so this is "
+                            "only suspicious once it persists")))
+                continue
             verdicts.append(Verdict(
-                node_id=node_id, contained=False, contradicted=True,
-                reason=(f"the control plane dispatched egress work to it, but only "
-                        f"{delta}B crossed its tunnel in {int(elapsed)}s — under the "
-                        f"{allowance}B that keepalives alone explain. Its traffic is "
+                node_id=node_id, contained=False, contradicted=True, quiet_windows=streak,
+                reason=(f"egress work dispatched across {streak} consecutive windows and "
+                        f"only {delta}B crossed its tunnel in the last {int(elapsed)}s — "
+                        f"under the {allowance}B keepalives alone explain. Its traffic is "
                         "leaving by some path that is not this exit")))
             continue
 
