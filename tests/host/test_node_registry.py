@@ -226,3 +226,83 @@ def test_build_falls_back_to_in_memory_for_a_store_without_the_seam():
     from blastbox.host.node_registry import build_node_registry
 
     assert isinstance(build_node_registry(InMemoryJobStore()), InMemoryNodeRegistry)
+
+
+# ----------------------------------------------------------------- the Redis backend
+
+class _FakeRedis:
+    """Enough Redis to exercise the registry: set/get/delete/scan_iter with TTLs."""
+
+    def __init__(self):
+        self.data: dict[str, tuple[str, float | None]] = {}
+        self.scan_calls = 0
+
+    def set(self, key, value, ex=None):
+        self.data[key] = (value, ex)
+
+    def get(self, key):
+        row = self.data.get(key)
+        return None if row is None else row[0].encode()
+
+    def delete(self, key):
+        self.data.pop(key, None)
+
+    def scan_iter(self, match=None, count=None):
+        self.scan_calls += 1
+        pre = (match or "").rstrip("*")
+        yield from [k for k in list(self.data) if k.startswith(pre)]
+
+
+def test_the_redis_registry_behaves_like_the_others():
+    from blastbox.host.node_registry import RedisNodeRegistry
+
+    reg = RedisNodeRegistry(_FakeRedis())
+    reg.publish(rec("toolz3", slots=4))
+    reg.publish(rec("toolz2", slots=8))
+    reg.publish(rec("dead", age=STALE_AFTER_S + 60))
+    assert fresh_node_ids(reg.read_all()) == ("toolz2", "toolz3")
+    reg.forget("toolz2")
+    assert fresh_node_ids(reg.read_all()) == ("toolz3",)
+
+
+def test_the_redis_registry_uses_scan_not_keys():
+    """This runs on a schedule against a Redis that is ALSO serving the job store, and
+    KEYS blocks the server for the whole keyspace."""
+    from blastbox.host.node_registry import RedisNodeRegistry
+
+    client = _FakeRedis()
+    assert not hasattr(client, "keys")           # the fake offers no KEYS to fall back on
+    RedisNodeRegistry(client).read_all()
+    assert client.scan_calls == 1
+
+
+def test_the_redis_ttl_outlives_the_staleness_window():
+    """Expiry must never race a reader into dropping a node that is merely a heartbeat
+    behind — the record's own ts is what decides freshness. The TTL only stops dead keys
+    accumulating in a shared Redis."""
+    from blastbox.host.node_registry import RedisNodeRegistry
+
+    client = _FakeRedis()
+    RedisNodeRegistry(client).publish(rec("toolz3"))
+    (_value, ttl) = client.data["blastbox:node:toolz3"]
+    assert ttl > STALE_AFTER_S
+
+
+def test_a_key_that_expires_between_scan_and_get_is_skipped():
+    from blastbox.host.node_registry import RedisNodeRegistry
+
+    client = _FakeRedis()
+    reg = RedisNodeRegistry(client)
+    reg.publish(rec("vanishing"))
+    original_get = client.get
+    client.get = lambda key: None if "vanishing" in key else original_get(key)
+    assert reg.read_all() == []
+
+
+def test_build_selects_the_redis_backend_from_a_redis_job_store():
+    from blastbox.host.node_registry import RedisNodeRegistry, build_node_registry
+
+    class FakeJobStore:
+        _r = _FakeRedis()
+
+    assert isinstance(build_node_registry(FakeJobStore()), RedisNodeRegistry)

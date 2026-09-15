@@ -42,6 +42,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Iterable, Protocol
 
 __all__ = [
+    "RedisNodeRegistry",
     "SqlNodeRegistry",
     "build_node_registry",
     "NodeClaims",
@@ -316,6 +317,57 @@ def build_node_registry(store=None) -> NodeRegistry:
         store = build_job_store_from_env()
     if hasattr(store, "connection") and hasattr(store, "param_style"):
         return SqlNodeRegistry(store)
-    # Redis is a follow-up; in-memory matches the job store's own single-process default
-    # and carries the same caveat (`serve` and `dispatch` will not share it).
+    client = getattr(store, "_r", None)
+    if client is not None and hasattr(client, "scan_iter"):
+        return RedisNodeRegistry(client)
+    # In-memory matches the job store's own single-process default and carries the same
+    # caveat: `serve` and `dispatch` are separate processes and will not share it.
     return InMemoryNodeRegistry()
+
+
+class RedisNodeRegistry:
+    """Registry over the Redis the job store already uses.
+
+    One key per node under ``blastbox:node:``, carrying the record as JSON, with a Redis
+    TTL as well as the in-record timestamp. BOTH, deliberately: the TTL keeps a dead
+    node's key from accumulating forever in a shared Redis an operator also pokes at,
+    while :func:`valid_record` remains the authority on freshness — it is the one that
+    also rejects a future-dated record, which a TTL cannot see.
+
+    The TTL is generously longer than the staleness window so expiry never races a
+    reader into dropping a node that is merely a heartbeat behind; the record's own ``ts``
+    is what actually decides.
+    """
+
+    PREFIX = "blastbox:node:"
+
+    def __init__(self, client, *, stale_after_s: float = STALE_AFTER_S) -> None:
+        self._r = client
+        self._ttl = int(max(60.0, stale_after_s * 10))
+
+    def _key(self, node_id: str) -> str:
+        return f"{self.PREFIX}{node_id}"
+
+    def publish(self, rec: NodeRecord) -> None:
+        if not _NODE_ID_RE.match(rec.node_id):
+            raise ValueError(f"invalid node id {rec.node_id!r}")
+        self._r.set(self._key(rec.node_id), rec.to_json(), ex=self._ttl)
+
+    def read_all(self, *, stale_after_s: float = STALE_AFTER_S) -> list[NodeRecord]:
+        out: list[NodeRecord] = []
+        # SCAN, not KEYS: this runs on a schedule against a Redis that is also serving
+        # the job store, and KEYS blocks the server for the whole keyspace.
+        for key in self._r.scan_iter(match=f"{self.PREFIX}*", count=200):
+            raw = self._r.get(key)
+            if raw is None:              # expired between the scan and the get
+                continue
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", "replace")
+            rec = NodeRecord.from_json(raw)
+            if valid_record(rec, stale_after_s=stale_after_s):
+                assert rec is not None
+                out.append(rec)
+        return sorted(out, key=lambda r: r.node_id)
+
+    def forget(self, node_id: str) -> None:
+        self._r.delete(self._key(node_id))
