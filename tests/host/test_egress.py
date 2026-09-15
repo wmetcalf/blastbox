@@ -828,14 +828,19 @@ def test_refuses_to_allocate_when_it_cannot_read_the_hosts_routes(monkeypatch):
 
 
 @pytest.mark.parametrize("rule,buries", [
-    # burying: reached first, and could match a NEW outbound packet from the forwarder
+    # --- buries us: could match a NEW outbound packet, OR is not fully understood ---
     ("-A FORWARD -j DOCKER-FORWARD", True),                       # docker's terminal ACCEPT
     ("-A FORWARD -j ACCEPT", True),                               # unrestricted
     ("-A FORWARD -s 172.29.0.10/32 -j ACCEPT", True),             # matches the forwarder
     ("-A FORWARD -s 172.29.0.0/16 -j ACCEPT", True),              # contains the forwarder
     ("-A FORWARD -i br-bb0 -j ACCEPT", True),                     # our own ingress bridge
-    ("-A FORWARD -i br-bb0 -m state --state NEW -j ACCEPT", True),
-    # not burying: provably cannot match us
+    # negation: every one of these failed OPEN in an earlier version
+    ("-A FORWARD ! --ctstate ESTABLISHED,RELATED -j ACCEPT", True),
+    ("-A FORWARD ! -i docker0 -j ACCEPT", True),
+    ("-A FORWARD ! -s 192.0.2.0/24 -j ACCEPT", True),
+    ("-A FORWARD -i br+ -j ACCEPT", True),                        # interface wildcard
+    ("-A FORWARD -m physdev --physdev-in eth0 -j ACCEPT", True),  # unknown match module
+    # --- does not bury us: a shape the predicate fully understands ---
     ("-A FORWARD -s 192.0.2.7/32 -j ACCEPT", False),              # unrelated (CAPE rooter)
     ("-A FORWARD -s 10.9.9.0/24 -j ACCEPT", False),               # unrelated subnet
     ("-A FORWARD -i docker0 -o eth0 -j ACCEPT", False),           # other ingress interface
@@ -843,13 +848,17 @@ def test_refuses_to_allocate_when_it_cannot_read_the_hosts_routes(monkeypatch):
     ("-A FORWARD -j DOCKER-USER", False),                         # RETURNs by default
     ("-A FORWARD -s 172.29.0.10/32 -j BB-WG-FWD", False),         # our own jump
 ])
-def test_only_an_accept_that_could_match_us_counts_as_burying_the_chain(rule, buries):
-    """This predicate has been wrong in BOTH directions across review rounds.
+def test_unparsed_iptables_syntax_counts_as_burying_the_chain(rule, buries):
+    """The default is inverted on purpose, and every negation case here was a live bug.
 
-    Checking every ACCEPT condemned correctly-ordered nodes (the CAPE rooter has dozens of
-    narrow ones); checking only docker's jumps let an explicit `-s <forwarder>/32 -j ACCEPT`
-    sail past. A rule is excluded only when it provably cannot match a NEW outbound packet
-    from the forwarder — wrong source, wrong ingress interface, or established-only.
+    Four review rounds each found another piece of iptables syntax an earlier version
+    mis-parsed — `! --ctstate`, `! -s`, `-i br+`, unknown match modules — and every miss
+    failed OPEN, reporting a buried chain as fine. Enumerating the ways a rule can be
+    harmless is a losing game against a matcher with negation, wildcards and arbitrary
+    extensions, so a rule buries us UNLESS it is a shape the predicate fully understands.
+
+    A false positive degrades a node (loud). A false negative lets malware out of the
+    analyst's own WAN while the check says OK. Do not rebalance this toward "prove safe".
     """
     from blastbox.host.egress_apply import _accepts_our_traffic
 

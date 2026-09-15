@@ -243,56 +243,80 @@ def _rule_at(rules: str, priority: int) -> str:
 
 
 
+#: iptables match tokens this predicate understands well enough to reason about. A rule
+#: using anything else is not analysed — see :func:`_accepts_our_traffic`.
+_UNDERSTOOD_MATCHES = frozenset({
+    "-A", "FORWARD", "-j", "ACCEPT", "-s", "-i", "-o", "-d",
+    "-m", "conntrack", "--ctstate", "state", "--state",
+})
+
+
 def _accepts_our_traffic(rule: str, fwd: str, bridge: str | None = None) -> bool:
     """Would this FORWARD rule terminally accept a NEW outbound packet from the forwarder?
 
-    ACCEPT in a jumped-to chain ends filter traversal — it does not return — so any such
-    rule reached BEFORE our jump makes the WAN-escape DROP dead code. But the co-resident
-    CAPE rooter and docker between them put dozens of ACCEPTs in FORWARD, and almost none
-    of them can touch us.
+    ACCEPT in a jumped-to chain ends filter traversal, so such a rule reached BEFORE our
+    jump makes the WAN-escape DROP dead code.
 
-    This predicate has now been wrong in BOTH directions, which is why it is spelled out
-    rather than clever: checking every ACCEPT condemned correctly-ordered nodes; checking
-    only docker's jumps let an explicit `-s <forwarder>/32 -j ACCEPT` sail past. It
-    excludes a rule only when it provably cannot match us:
+    THE DEFAULT IS INVERTED ON PURPOSE, AND THAT IS THE WHOLE DESIGN. Four review rounds
+    went into this one predicate, each finding another piece of iptables syntax the
+    previous version mis-parsed — negated matches (``! --ctstate``, ``! -s``), interface
+    wildcards (``-i br+``) — and every miss failed OPEN, reporting a buried chain as
+    fine. Trying to enumerate the ways a rule can be harmless is a losing game against a
+    matcher with negation, wildcards and arbitrary extension modules.
 
-    * ``--ctstate ESTABLISHED,RELATED`` — matches return traffic for flows that already
-      exist. A NEW outbound connection does not match it, so it cannot pre-empt our DROP.
-    * ``-i <iface>`` naming something other than the bridge the forwarder sits on. Ingress
-      is deterministic: our packets enter FORWARD from that bridge and no other.
-    * ``-s <cidr>`` not containing the forwarder's address.
-
-    Anything else — including an unrestricted ACCEPT, an unparseable one, or a jump into
-    docker's forwarding chains (which hold a terminal ACCEPT for the non-internal bb-net0
-    bridge) — is treated as burying us. Erring toward "uncontained" is the right direction:
-    it degrades a node rather than silently trusting one.
+    So: a rule buries us UNLESS it is one of a few shapes this function fully and exactly
+    understands. Unknown syntax, any negation, any wildcard — all count as burying. The
+    cost of a false positive is a node reported uncontained (degraded, deferred work,
+    loud); the cost of a false negative is malware egressing the analyst's own WAN while
+    the check says OK. Those are not comparable, so do not "simplify" this back into
+    proving safety.
     """
     if "-j DOCKER-FORWARD" in rule or "-j DOCKER-ISOLATION" in rule:
         return True
     if not rule.rstrip().endswith("-j ACCEPT"):
         return False
+
     tokens = rule.split()
-
-    if "--ctstate" in tokens:
-        states = tokens[tokens.index("--ctstate") + 1] if len(
-            tokens) > tokens.index("--ctstate") + 1 else ""
-        if states and set(states.split(",")) <= {"ESTABLISHED", "RELATED"}:
-            return False
-
-    if bridge and "-i" in tokens:
-        try:
-            if tokens[tokens.index("-i") + 1] != bridge:
-                return False
-        except IndexError:
+    # Negation anywhere: not analysed.
+    if "!" in tokens or any(t.startswith("!") for t in tokens):
+        return True
+    # Any match token we do not recognise: not analysed. (Values are skipped by only
+    # inspecting tokens that look like flags.)
+    for t in tokens:
+        if t.startswith("-") and t not in _UNDERSTOOD_MATCHES and not _is_value(t):
             return True
 
-    if "-s" in tokens:
+    def val(flag: str) -> str | None:
         try:
-            src = ipaddress.ip_network(tokens[tokens.index("-s") + 1], strict=False)
-            return ipaddress.ip_address(fwd) in src
+            return tokens[tokens.index(flag) + 1]
         except (ValueError, IndexError):
+            return None
+
+    # Return traffic only: a NEW outbound connection cannot match it.
+    states = val("--ctstate") or val("--state")
+    if states and set(states.split(",")) <= {"ESTABLISHED", "RELATED"}:
+        return False
+
+    # Ingress is deterministic: our packets enter FORWARD from the forwarder's bridge and
+    # no other. A wildcard (`br+`) is not analysed.
+    iif = val("-i")
+    if bridge and iif and "+" not in iif and iif != bridge:
+        return False
+
+    src = val("-s")
+    if src:
+        try:
+            if ipaddress.ip_address(fwd) not in ipaddress.ip_network(src, strict=False):
+                return False
+        except ValueError:
             return True
     return True
+
+
+def _is_value(token: str) -> bool:
+    """A leading '-' that is part of a VALUE (a negative number, a range) rather than a
+    flag. Kept separate so the unknown-flag check above stays readable."""
+    return len(token) > 1 and (token[1].isdigit() or token[1] == ".")
 
 
 def enforcement_present(cfg: EgressConfig) -> tuple[bool, str]:
