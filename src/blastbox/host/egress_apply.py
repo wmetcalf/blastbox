@@ -243,33 +243,56 @@ def _rule_at(rules: str, priority: int) -> str:
 
 
 
-def _accepts_our_traffic(rule: str, fwd: str) -> bool:
-    """Would this FORWARD rule terminally accept the forwarder's packets?
+def _accepts_our_traffic(rule: str, fwd: str, bridge: str | None = None) -> bool:
+    """Would this FORWARD rule terminally accept a NEW outbound packet from the forwarder?
 
     ACCEPT in a jumped-to chain ends filter traversal — it does not return — so any such
-    rule reached BEFORE our jump makes the WAN-escape DROP dead code. Three shapes count:
+    rule reached BEFORE our jump makes the WAN-escape DROP dead code. But the co-resident
+    CAPE rooter and docker between them put dozens of ACCEPTs in FORWARD, and almost none
+    of them can touch us.
 
-    * a jump into docker's forwarding chains, which hold a terminal ACCEPT for the
-      non-internal bb-net0 bridge the forwarder sits on;
-    * an ACCEPT with no source restriction, which covers everything including us;
-    * an ACCEPT whose ``-s`` contains the forwarder's address.
+    This predicate has now been wrong in BOTH directions, which is why it is spelled out
+    rather than clever: checking every ACCEPT condemned correctly-ordered nodes; checking
+    only docker's jumps let an explicit `-s <forwarder>/32 -j ACCEPT` sail past. It
+    excludes a rule only when it provably cannot match us:
 
-    A narrow ACCEPT for some unrelated source does NOT count — the co-resident CAPE
-    rooter has dozens, and treating those as fatal reported correctly-ordered nodes as
-    uncontained.
+    * ``--ctstate ESTABLISHED,RELATED`` — matches return traffic for flows that already
+      exist. A NEW outbound connection does not match it, so it cannot pre-empt our DROP.
+    * ``-i <iface>`` naming something other than the bridge the forwarder sits on. Ingress
+      is deterministic: our packets enter FORWARD from that bridge and no other.
+    * ``-s <cidr>`` not containing the forwarder's address.
+
+    Anything else — including an unrestricted ACCEPT, an unparseable one, or a jump into
+    docker's forwarding chains (which hold a terminal ACCEPT for the non-internal bb-net0
+    bridge) — is treated as burying us. Erring toward "uncontained" is the right direction:
+    it degrades a node rather than silently trusting one.
     """
     if "-j DOCKER-FORWARD" in rule or "-j DOCKER-ISOLATION" in rule:
         return True
     if not rule.rstrip().endswith("-j ACCEPT"):
         return False
     tokens = rule.split()
-    if "-s" not in tokens:
-        return True                      # unrestricted source: covers us
-    try:
-        src = ipaddress.ip_network(tokens[tokens.index("-s") + 1], strict=False)
-        return ipaddress.ip_address(fwd) in src
-    except (ValueError, IndexError):
-        return True                      # unparseable: assume it could match
+
+    if "--ctstate" in tokens:
+        states = tokens[tokens.index("--ctstate") + 1] if len(
+            tokens) > tokens.index("--ctstate") + 1 else ""
+        if states and set(states.split(",")) <= {"ESTABLISHED", "RELATED"}:
+            return False
+
+    if bridge and "-i" in tokens:
+        try:
+            if tokens[tokens.index("-i") + 1] != bridge:
+                return False
+        except IndexError:
+            return True
+
+    if "-s" in tokens:
+        try:
+            src = ipaddress.ip_network(tokens[tokens.index("-s") + 1], strict=False)
+            return ipaddress.ip_address(fwd) in src
+        except (ValueError, IndexError):
+            return True
+    return True
 
 
 def enforcement_present(cfg: EgressConfig) -> tuple[bool, str]:
@@ -319,6 +342,9 @@ def enforcement_present(cfg: EgressConfig) -> tuple[bool, str]:
     # enforcement and is readable, so a verdict still means something; the filter layer is
     # reported as unverified rather than counted against the node.
     unverified: list[str] = []
+    # The bridge our packets enter FORWARD from. Knowing it lets an ACCEPT restricted to
+    # some other input interface be excluded instead of condemning the node.
+    bridge_iface = iface_for(fwd)
     fwd_probe = _run(["iptables", "-w", "2", "-S", "FORWARD"], check=False)
     if fwd_probe.returncode != 0:
         unverified.append(f"{CHAIN_FWD} jump (needs root; `blastbox egress check` as root "
@@ -334,7 +360,7 @@ def enforcement_present(cfg: EgressConfig) -> tuple[bool, str]:
             # last version to "docker jumps only" went too far the other way: an ACCEPT
             # that explicitly matches the forwarder's own source sails past it. Decide by
             # whether the rule could actually match us, not by which chain it names.
-            if docker_at is None and _accepts_our_traffic(line, fwd):
+            if docker_at is None and _accepts_our_traffic(line, fwd, bridge_iface):
                 docker_at = i
         if jump_at is None:
             missing.append(f"FORWARD jump into {CHAIN_FWD} (the chain is orphaned)")

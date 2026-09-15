@@ -828,23 +828,32 @@ def test_refuses_to_allocate_when_it_cannot_read_the_hosts_routes(monkeypatch):
 
 
 @pytest.mark.parametrize("rule,buries", [
+    # burying: reached first, and could match a NEW outbound packet from the forwarder
     ("-A FORWARD -j DOCKER-FORWARD", True),                       # docker's terminal ACCEPT
     ("-A FORWARD -j ACCEPT", True),                               # unrestricted
     ("-A FORWARD -s 172.29.0.10/32 -j ACCEPT", True),             # matches the forwarder
     ("-A FORWARD -s 172.29.0.0/16 -j ACCEPT", True),              # contains the forwarder
+    ("-A FORWARD -i br-bb0 -j ACCEPT", True),                     # our own ingress bridge
+    ("-A FORWARD -i br-bb0 -m state --state NEW -j ACCEPT", True),
+    # not burying: provably cannot match us
     ("-A FORWARD -s 192.0.2.7/32 -j ACCEPT", False),              # unrelated (CAPE rooter)
     ("-A FORWARD -s 10.9.9.0/24 -j ACCEPT", False),               # unrelated subnet
+    ("-A FORWARD -i docker0 -o eth0 -j ACCEPT", False),           # other ingress interface
+    ("-A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT", False),  # return only
     ("-A FORWARD -j DOCKER-USER", False),                         # RETURNs by default
     ("-A FORWARD -s 172.29.0.10/32 -j BB-WG-FWD", False),         # our own jump
 ])
 def test_only_an_accept_that_could_match_us_counts_as_burying_the_chain(rule, buries):
-    """ACCEPT in a jumped-to chain ends filter traversal, so one reached before our jump
-    makes the DROP dead code — but only if it could match the forwarder. Checking every
-    ACCEPT condemned correct nodes; checking only docker's let a forwarder-matching
-    ACCEPT sail past."""
+    """This predicate has been wrong in BOTH directions across review rounds.
+
+    Checking every ACCEPT condemned correctly-ordered nodes (the CAPE rooter has dozens of
+    narrow ones); checking only docker's jumps let an explicit `-s <forwarder>/32 -j ACCEPT`
+    sail past. A rule is excluded only when it provably cannot match a NEW outbound packet
+    from the forwarder — wrong source, wrong ingress interface, or established-only.
+    """
     from blastbox.host.egress_apply import _accepts_our_traffic
 
-    assert _accepts_our_traffic(rule, "172.29.0.10") is buries
+    assert _accepts_our_traffic(rule, "172.29.0.10", "br-bb0") is buries
 
 
 def test_a_forwarder_matching_accept_above_our_jump_fails_containment(monkeypatch):
