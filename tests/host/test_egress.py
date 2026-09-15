@@ -825,3 +825,32 @@ def test_refuses_to_allocate_when_it_cannot_read_the_hosts_routes(monkeypatch):
         "P", (), {"returncode": 1, "stdout": "", "stderr": ""})())
     with pytest.raises(ea.HostFactsUnavailable, match="management LAN"):
         ea.plan_subnets(EgressConfig())
+
+
+@pytest.mark.parametrize("rule,buries", [
+    ("-A FORWARD -j DOCKER-FORWARD", True),                       # docker's terminal ACCEPT
+    ("-A FORWARD -j ACCEPT", True),                               # unrestricted
+    ("-A FORWARD -s 172.29.0.10/32 -j ACCEPT", True),             # matches the forwarder
+    ("-A FORWARD -s 172.29.0.0/16 -j ACCEPT", True),              # contains the forwarder
+    ("-A FORWARD -s 192.0.2.7/32 -j ACCEPT", False),              # unrelated (CAPE rooter)
+    ("-A FORWARD -s 10.9.9.0/24 -j ACCEPT", False),               # unrelated subnet
+    ("-A FORWARD -j DOCKER-USER", False),                         # RETURNs by default
+    ("-A FORWARD -s 172.29.0.10/32 -j BB-WG-FWD", False),         # our own jump
+])
+def test_only_an_accept_that_could_match_us_counts_as_burying_the_chain(rule, buries):
+    """ACCEPT in a jumped-to chain ends filter traversal, so one reached before our jump
+    makes the DROP dead code — but only if it could match the forwarder. Checking every
+    ACCEPT condemned correct nodes; checking only docker's let a forwarder-matching
+    ACCEPT sail past."""
+    from blastbox.host.egress_apply import _accepts_our_traffic
+
+    assert _accepts_our_traffic(rule, "172.29.0.10") is buries
+
+
+def test_a_forwarder_matching_accept_above_our_jump_fails_containment(monkeypatch):
+    fwd = ("-P FORWARD DROP\n"
+           "-A FORWARD -s 172.29.0.0/16 -j ACCEPT\n"          # swallows us first
+           "-A FORWARD -s 172.29.0.10/32 -j BB-WG-FWD\n")
+    ea_ = _fake_host(monkeypatch, rules=_GOOD_RULES, forward=fwd, chain=_GOOD_CHAIN)
+    ok, why = ea_.enforcement_present(GLOBAL)
+    assert not ok and "BELOW" in why

@@ -242,6 +242,36 @@ def _rule_at(rules: str, priority: int) -> str:
     return ""
 
 
+
+def _accepts_our_traffic(rule: str, fwd: str) -> bool:
+    """Would this FORWARD rule terminally accept the forwarder's packets?
+
+    ACCEPT in a jumped-to chain ends filter traversal — it does not return — so any such
+    rule reached BEFORE our jump makes the WAN-escape DROP dead code. Three shapes count:
+
+    * a jump into docker's forwarding chains, which hold a terminal ACCEPT for the
+      non-internal bb-net0 bridge the forwarder sits on;
+    * an ACCEPT with no source restriction, which covers everything including us;
+    * an ACCEPT whose ``-s`` contains the forwarder's address.
+
+    A narrow ACCEPT for some unrelated source does NOT count — the co-resident CAPE
+    rooter has dozens, and treating those as fatal reported correctly-ordered nodes as
+    uncontained.
+    """
+    if "-j DOCKER-FORWARD" in rule or "-j DOCKER-ISOLATION" in rule:
+        return True
+    if not rule.rstrip().endswith("-j ACCEPT"):
+        return False
+    tokens = rule.split()
+    if "-s" not in tokens:
+        return True                      # unrestricted source: covers us
+    try:
+        src = ipaddress.ip_network(tokens[tokens.index("-s") + 1], strict=False)
+        return ipaddress.ip_address(fwd) in src
+    except (ValueError, IndexError):
+        return True                      # unparseable: assume it could match
+
+
 def enforcement_present(cfg: EgressConfig) -> tuple[bool, str]:
     """Is this node's egress ENFORCEMENT installed and actually in the path, right now?
 
@@ -300,16 +330,11 @@ def enforcement_present(cfg: EgressConfig) -> tuple[bool, str]:
                 continue
             if line.endswith(f"-j {CHAIN_FWD}") and jump_at is None:
                 jump_at = i
-            # Only a rule that could actually swallow OUR traffic counts as burying us:
-            # a jump into docker's forwarding chain (which holds a terminal ACCEPT for
-            # the non-internal bb-net0 bridge) or an unconditional ACCEPT. A narrow
-            # ACCEPT for some unrelated source — the CAPE rooter has dozens — does not
-            # touch us, and treating it as fatal would report a correctly-ordered node
-            # as uncontained.
-            if docker_at is None and (
-                    "-j DOCKER-FORWARD" in line
-                    or "-j DOCKER-ISOLATION" in line
-                    or line.strip() == "-A FORWARD -j ACCEPT"):
+            # Does this rule swallow OUR traffic before we are reached? Narrowing the
+            # last version to "docker jumps only" went too far the other way: an ACCEPT
+            # that explicitly matches the forwarder's own source sails past it. Decide by
+            # whether the rule could actually match us, not by which chain it names.
+            if docker_at is None and _accepts_our_traffic(line, fwd):
                 docker_at = i
         if jump_at is None:
             missing.append(f"FORWARD jump into {CHAIN_FWD} (the chain is orphaned)")
