@@ -181,7 +181,8 @@ def _peer_add(monkeypatch, tmp_path, argv_extra, *, registered):
 def test_peer_add_takes_the_identity_and_key_from_the_cert(ca, tmp_path, monkeypatch):
     """The point of the whole exercise: registration becomes a signature check, and the
     operator supplies a file rather than retyping a key."""
-    issued = ca.issue_node("toolz3", wg_pubkey=WG)
+    issued = ca.issue_node("toolz3", wg_pubkey=WG,
+                           grants=NodeGrants(tiers=("openvpn",)))
     cert = tmp_path / "toolz3.crt"
     cert.write_bytes(issued.cert_pem)
 
@@ -205,7 +206,8 @@ def test_peer_add_refuses_a_name_that_contradicts_the_cert(ca, tmp_path, monkeyp
     """Otherwise an operator could register a verified key under someone else's name,
     and the wg config comment — the only human-readable trace — would lie."""
     cert = tmp_path / "toolz3.crt"
-    cert.write_bytes(ca.issue_node("toolz3", wg_pubkey=WG).cert_pem)
+    cert.write_bytes(ca.issue_node("toolz3", wg_pubkey=WG,
+                                   grants=NodeGrants(tiers=("openvpn",))).cert_pem)
 
     got: list = []
     rc = _peer_add(monkeypatch, tmp_path,
@@ -226,3 +228,37 @@ def test_peer_add_requires_one_of_the_two_forms(ca, tmp_path, monkeypatch):
     got: list = []
     assert _peer_add(monkeypatch, tmp_path, [], registered=got) == 2
     assert got == []
+
+
+def test_peer_add_refuses_a_verified_node_with_no_overlay_grant(ca, tmp_path, monkeypatch):
+    """Identity is not authorisation. A cert granting no overlay tier belongs to a node
+    that was never meant to peer — local-mode, or enrolled for engine work only — and
+    registering it anyway would let the signature check stand in for a policy decision."""
+    cert = tmp_path / "engine-only.crt"
+    cert.write_bytes(ca.issue_node("engine-only", wg_pubkey=WG,
+                                   grants=NodeGrants(engines=("boxjs",))).cert_pem)
+
+    got: list = []
+    assert _peer_add(monkeypatch, tmp_path, ["--cert", str(cert)], registered=got) == 1
+    assert got == []
+
+
+def test_peer_add_accepts_an_overlay_granted_node(ca, tmp_path, monkeypatch):
+    cert = tmp_path / "peer.crt"
+    cert.write_bytes(ca.issue_node("toolz3", wg_pubkey=WG,
+                                   grants=NodeGrants(tiers=("wireguard",))).cert_pem)
+    got: list = []
+    assert _peer_add(monkeypatch, tmp_path, ["--cert", str(cert)], registered=got) == 0
+    assert got == [("toolz3", "10.77.0.3", WG)]
+
+
+def test_force_registers_an_ungranted_node_but_says_so(ca, tmp_path, monkeypatch, capsys):
+    """The escape hatch stays — a rollout will have nodes enrolled before their grants
+    are right — but the output must not read like a clean registration."""
+    cert = tmp_path / "engine-only.crt"
+    cert.write_bytes(ca.issue_node("engine-only", wg_pubkey=WG,
+                                   grants=NodeGrants(engines=("boxjs",))).cert_pem)
+    got: list = []
+    rc = _peer_add(monkeypatch, tmp_path, ["--cert", str(cert), "--force"], registered=got)
+    assert rc == 0 and len(got) == 1
+    assert "NONE (--force)" in capsys.readouterr().out

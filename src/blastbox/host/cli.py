@@ -888,9 +888,24 @@ def _egress_cmd_inner(args: argparse.Namespace) -> int:
             except (ValueError, FileNotFoundError) as exc:
                 print(f"error: {exc}", file=sys.stderr)
                 return 1
+            # IDENTITY IS NOT AUTHORISATION. Verifying the signature says WHICH node
+            # this is; it says nothing about whether that node is supposed to be on the
+            # overlay. A cert granting no overlay tier belongs to a node that was never
+            # meant to peer — a local-mode node, or one enrolled for engine work only —
+            # and adding it anyway would let an identity check stand in for a policy
+            # decision, which is the habit this whole change exists to break.
+            overlay_tiers = tuple(t for t in ("openvpn", "wireguard")
+                                  if ident.grants.allows_tier(t))
+            if not overlay_tiers and not args.force:
+                print(f"error: {ident.node_id} is not granted an overlay tier "
+                      f"(has: {list(ident.grants.tiers) or 'none'}). Reissue with "
+                      f"--tier openvpn/--tier wireguard, or pass --force to register it "
+                      f"anyway.", file=sys.stderr)
+                return 1
             name, pubkey = ident.node_id, ident.wg_pubkey
             provenance = (f"identity and key verified against the CA "
-                          f"(expires {ident.not_after.date()})")
+                          f"(expires {ident.not_after.date()}); "
+                          f"overlay tiers granted: {list(overlay_tiers) or 'NONE (--force)'}")
             if args.name and args.name != name:
                 print(f"error: --name {args.name!r} contradicts the cert's identity "
                       f"{name!r}", file=sys.stderr)
@@ -1089,6 +1104,8 @@ def build_parser() -> argparse.ArgumentParser:
                             "--cert; this is kept for nodes not yet enrolled.")
     pe_pa.add_argument("--pki-dir", default=os.environ.get(
         "BLASTBOX_PKI_DIR", "/var/lib/blastbox/pki"))
+    pe_pa.add_argument("--force", action="store_true",
+                       help="register a verified node whose cert grants no overlay tier")
     pe_pr = pes.add_parser("peer", parents=[common],
                            help="worker node: join the overlay (generates its own key)")
     pe_pr.add_argument("--peer-ip", required=True)
