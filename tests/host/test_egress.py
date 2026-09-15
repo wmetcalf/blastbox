@@ -632,6 +632,9 @@ def test_adopting_a_relocated_bridge_carries_its_gateway_along(monkeypatch):
 
     monkeypatch.setattr(ea, "_run", fake_run)
     monkeypatch.setattr(ea, "claimed_cidrs", lambda: list(live.values()))
+    # A real host always has routes; without this the allocator correctly refuses to
+    # allocate blind (see test_refuses_to_allocate_when_it_cannot_read_the_hosts_routes).
+    monkeypatch.setattr(ea, "host_route_cidrs", lambda: ["172.18.0.0/16"])
     plan = ea.plan_subnets(EgressConfig())          # defaults say 172.31.0.10
     assert plan.config.vpn_subnet == "10.31.0.0/16"
     assert plan.config.vpn_gateway_ip == "10.31.0.10"   # offset preserved, not stale
@@ -706,6 +709,7 @@ def test_a_tiny_adopted_subnet_still_yields_an_in_range_gateway(monkeypatch):
 
     monkeypatch.setattr(ea, "_run", fake)
     monkeypatch.setattr(ea, "claimed_cidrs", lambda: list(live.values()))
+    monkeypatch.setattr(ea, "host_route_cidrs", lambda: ["172.18.0.0/16"])
     plan = ea.plan_subnets(EgressConfig())          # no exception
     assert ipaddress.ip_address(plan.config.vpn_gateway_ip) in \
         ipaddress.ip_network(plan.config.vpn_subnet)
@@ -757,3 +761,67 @@ def test_allocator_stays_correct_and_fast_with_a_large_claimed_set():
         assert not any(n.overlaps(c) for c in claimed), f"{n} collides with the host"
     # Generous: this runs inside a boot oneshot that retries every 30s.
     assert elapsed < 5.0, f"allocation took {elapsed:.1f}s with {len(taken)} claimed entries"
+
+
+def test_every_egress_action_parses_without_the_suppressed_options():
+    """`default=argparse.SUPPRESS` omits the attribute entirely when the option is
+    unused, which is exactly what stops the sub-parser clobbering a pre-verb value — but
+    it means any unconditional `args.mode` would raise AttributeError. Pin the contract
+    for all eight actions so a future `args.mode` is caught here, not in production."""
+    from blastbox.host.cli import build_parser
+
+    p = build_parser()
+    key = "A" * 43 + "="
+    for argv in (["egress", "check"], ["egress", "health"], ["egress", "apply"],
+                 ["egress", "teardown"], ["egress", "gateway"], ["egress", "gateway-exit"],
+                 ["egress", "peer-add", "--name", "n", "--peer-ip", "10.77.0.3",
+                  "--public-key", key],
+                 ["egress", "peer", "--peer-ip", "10.77.0.3", "--gateway-addr", "1.2.3.4",
+                  "--gateway-pubkey", key]):
+        ns = p.parse_args(argv)
+        for opt in ("mode", "gateway_ip", "wg_iface", "upstream_gw"):
+            assert getattr(ns, opt, None) is None, f"{argv[1]}: {opt} unexpectedly set"
+
+
+def test_both_argv_positions_survive_for_every_action():
+    """argparse writes a sub-parser's defaults back over the parent namespace, so an
+    option declared in both places loses its pre-verb value. That regression made
+    `egress --mode global apply` silently fall back to LOCAL mode — applying a global
+    node with no enforcement and reporting OK."""
+    from blastbox.host.cli import build_parser
+
+    p = build_parser()
+    for action in ("apply", "check", "health", "teardown"):
+        pre = p.parse_args(["egress", "--mode", "global", action])
+        post = p.parse_args(["egress", action, "--mode", "global"])
+        assert getattr(pre, "mode", None) == "global", f"{action}: pre-verb lost"
+        assert getattr(post, "mode", None) == "global", f"{action}: post-verb lost"
+
+
+def test_an_unrelated_accept_does_not_read_as_burying_our_chain(monkeypatch):
+    """A narrow ACCEPT for some other source — the CAPE rooter has dozens — cannot
+    swallow our traffic. Treating every earlier ACCEPT as fatal reported a
+    correctly-ordered node as uncontained."""
+    from blastbox.host import egress_apply as ea
+
+    fwd = ("-P FORWARD DROP\n"
+           "-A FORWARD -s 192.0.2.7/32 -j ACCEPT\n"              # unrelated, narrow
+           "-A FORWARD -s 172.29.0.10/32 -j BB-WG-FWD\n"
+           "-A FORWARD -j DOCKER-FORWARD\n")
+    ea_ = _fake_host(monkeypatch, rules=_GOOD_RULES, forward=fwd, chain=_GOOD_CHAIN)
+    ok, why = ea_.enforcement_present(GLOBAL)
+    assert ok, why
+
+
+def test_refuses_to_allocate_when_it_cannot_read_the_hosts_routes(monkeypatch):
+    """An empty claimed set is indistinguishable between "this host routes nothing"
+    (impossible) and "`ip` is missing" — and allocating on it is exactly how a bridge
+    lands on the management LAN and cuts the node off."""
+    from blastbox.host import egress_apply as ea
+
+    monkeypatch.setattr(ea, "host_route_cidrs", lambda: [])
+    monkeypatch.setattr(ea, "docker_network_cidrs", lambda: [])
+    monkeypatch.setattr(ea, "_run", lambda argv, **kw: type(
+        "P", (), {"returncode": 1, "stdout": "", "stderr": ""})())
+    with pytest.raises(ea.HostFactsUnavailable, match="management LAN"):
+        ea.plan_subnets(EgressConfig())

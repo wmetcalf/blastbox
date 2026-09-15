@@ -1179,18 +1179,6 @@ class Dispatcher:
             self._record_outcome(job, path="cold", started=t0)
 
 
-    def _egress_mode(self) -> str:
-        """This node's configured egress mode, or "local" when unknown/unmanaged.
-
-        Cheap and cached alongside the health verdict: it only changes when an operator
-        re-applies, and it decides WHICH tiers the health probe legitimately speaks for.
-        """
-        try:
-            from blastbox.host.egress_apply import persisted_config
-            return persisted_config().mode
-        except Exception:
-            return "local"
-
     def _node_egress_health(self):
         """Cached verdict on whether THIS node can currently egress, or None to not gate.
 
@@ -1980,22 +1968,20 @@ class Dispatcher:
         # a fleet-wide outage does not become a permanent claim/defer spin; expiry stays
         # with max_queued_age, which is the mechanism that can see the whole queue's age.
         #
-        # WHICH TIERS THE PROBE ACTUALLY SPEAKS FOR, and it depends on the MODE.
-        # node_health measures one thing: the bb-vpn gateway address — the local sidecar,
-        # or in global mode the overlay forwarder occupying it.
-        #   local  — tor and socks egress via their own bb-socks sidecars, whose liveness
-        #            it never looks at, so gating them on a dead VPN sidecar would remove
-        #            working capacity for an outage that cannot affect them.
-        #   global — the node holds no credentials at all and every gateway-routed tier
-        #            points at that one forwarder, so it IS their chokepoint too; leaving
-        #            them un-gated dispatches them into a fail-closed worker that burns
-        #            the job while a healthy peer was available.
-        if self._egress_mode() == "global":
-            gated_by_gateway_health = (
-                personality.exit_driver in ("openvpn", "wireguard", "tor")
-                or inspect_routes_via_gateway(personality))
-        else:
-            gated_by_gateway_health = personality.exit_driver in ("openvpn", "wireguard")
+        # WHICH TIERS THE PROBE ACTUALLY SPEAKS FOR. node_health measures exactly one
+        # thing: the bb-vpn gateway address — the local sidecar, or in global mode the
+        # overlay forwarder occupying it. Only openvpn/wireguard route through it.
+        #
+        # This is narrower than it first looks, and the reason is a real boundary worth
+        # knowing: THE OVERLAY CARRIES THE bb-vpn TIERS ONLY. The forwarder is started
+        # with BLASTBOX_WORKER_SUBNET=<vpn_subnet>, and the node-side source route keys
+        # on its single uplink /32 — so tor (host REDIRECT to a local tor daemon), socks
+        # (in-netns TUN to a SOCKS sidecar) and httpproxy egress through their own local
+        # sidecars in BOTH modes. Their liveness is independent of the forwarder, so
+        # gating them on it would remove working capacity for an outage that cannot
+        # affect them. It also means a global-mode node running those tiers is not
+        # actually credential-free for them — see docs/DEPLOYMENT.md.
+        gated_by_gateway_health = personality.exit_driver in ("openvpn", "wireguard")
         if gated_by_gateway_health:
             health = self._node_egress_health()
             if health is not None and not health.healthy:
@@ -2012,6 +1998,20 @@ class Dispatcher:
                         for stale, _n in newest:
                             self._egress_defer_n.pop(stale, None)
                 delay = min(self._egress_defer_cap_s, 2.0 * (2 ** min(n - 1, 8)))
+                # An egress outage must be VISIBLE. Deferring deliberately does not
+                # terminalise the job (a healthy peer may still take it, and this node
+                # cannot see the fleet), so without a loud signal the only symptom is a
+                # queue that quietly stops draining — indistinguishable from "nothing
+                # submitted". Warn once per escalation step rather than per spin, so a
+                # long outage is one line per doubling instead of thousands.
+                if n & (n - 1) == 0:  # 1, 2, 4, 8, ... — powers of two only
+                    _log.warning(
+                        "egress DEGRADED on this node: %s. %d job(s) deferred so far; "
+                        "this one has waited %d attempt(s), next eligible in %.0fs. "
+                        "Jobs are NOT failed — a healthy peer can still take them, and "
+                        "BLASTBOX_MAX_QUEUED_AGE_S (off by default) is what expires them. "
+                        "Run `blastbox egress check` as root.",
+                        health.reason, len(self._egress_defer_n), n, delay)
                 self._requeue_claimed(
                     job, defer=True, defer_s=delay,
                     reason=f"node egress is degraded ({health.reason}); deferring "

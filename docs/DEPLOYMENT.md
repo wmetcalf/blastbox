@@ -317,6 +317,16 @@ corporate `10.0.0.0/8`) is advisory rather than blocking, or it vetoes every can
 bridge that already exists is adopted, never re-decided. Pass `--no-auto-subnets` to fail on a
 conflict instead.
 
+**The overlay carries the `bb-vpn` tiers only — `openvpn` and `wireguard`.** The forwarder
+is started with `BLASTBOX_WORKER_SUBNET=<vpn_subnet>` and the node-side source route keys on
+its single uplink `/32`, so `tor` (a host REDIRECT into a local tor daemon), `socks` (an
+in-netns TUN to a SOCKS sidecar) and `httpproxy` egress through their own local sidecars in
+**both** modes. Two consequences worth stating plainly: their liveness is independent of the
+forwarder, so a dead overlay does not gate them; and **a global-mode node running those tiers
+is not credential-free for them** — it still holds whatever its tor/SOCKS/proxy sidecars need,
+and their traffic leaves by this node, not the central exit. If you want every tier
+centralised, run only `openvpn`/`wireguard` personalities on global-mode nodes.
+
 **The dispatcher defers egress jobs on a degraded node.** `blastbox egress health` is a
 one-line JSON verdict, and the dispatcher consults a cached copy before launching any
 netd-wired tier: if this node's exit is down, the job is requeued with `defer` so a healthy

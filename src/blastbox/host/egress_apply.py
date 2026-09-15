@@ -170,6 +170,16 @@ def host_route_cidrs() -> list[str]:
     return out
 
 
+class HostFactsUnavailable(RuntimeError):
+    """We cannot enumerate what this host already uses, so we must not allocate.
+
+    ``host_route_cidrs`` returning nothing is indistinguishable between "this host routes
+    nothing" (impossible) and "`ip` is not installed / not on PATH under sudo". Allocating
+    on an empty claimed set is precisely how a bridge lands on the management LAN and cuts
+    the node off — the failure the /32 emission exists to prevent. Refuse instead.
+    """
+
+
 def claimed_cidrs() -> list[str]:
     """Everything an allocator must avoid: docker's pools plus the host's own routing."""
     seen: list[str] = []
@@ -290,7 +300,16 @@ def enforcement_present(cfg: EgressConfig) -> tuple[bool, str]:
                 continue
             if line.endswith(f"-j {CHAIN_FWD}") and jump_at is None:
                 jump_at = i
-            if ("-j DOCKER" in line or "-j ACCEPT" in line) and docker_at is None:
+            # Only a rule that could actually swallow OUR traffic counts as burying us:
+            # a jump into docker's forwarding chain (which holds a terminal ACCEPT for
+            # the non-internal bb-net0 bridge) or an unconditional ACCEPT. A narrow
+            # ACCEPT for some unrelated source — the CAPE rooter has dozens — does not
+            # touch us, and treating it as fatal would report a correctly-ordered node
+            # as uncontained.
+            if docker_at is None and (
+                    "-j DOCKER-FORWARD" in line
+                    or "-j DOCKER-ISOLATION" in line
+                    or line.strip() == "-A FORWARD -j ACCEPT"):
                 docker_at = i
         if jump_at is None:
             missing.append(f"FORWARD jump into {CHAIN_FWD} (the chain is orphaned)")
@@ -399,7 +418,14 @@ def plan_subnets(cfg: EgressConfig, *, auto: bool = True) -> SubnetPlan:
     # rejects the create with the exact "Pool overlaps" error this allocator exists to
     # prevent, and `ensure_bridges` raises CalledProcessError (which the CLI does not
     # catch) rather than a clean message.
-    return allocate_subnets(cfg, claimed_cidrs(), auto=auto, skip=frozenset(existing))
+    claimed = claimed_cidrs()
+    if auto and not host_route_cidrs():
+        raise HostFactsUnavailable(
+            "cannot read this host's routes (`ip` missing or not permitted), so the "
+            "allocator cannot tell which ranges are already in use — it would happily "
+            "take the management LAN. Install iproute2, or pass --no-auto-subnets and "
+            "set the subnets explicitly.")
+    return allocate_subnets(cfg, claimed, auto=auto, skip=frozenset(existing))
 
 
 def ensure_bridges(cfg: EgressConfig, *, dry_run: bool = False) -> list[str]:
