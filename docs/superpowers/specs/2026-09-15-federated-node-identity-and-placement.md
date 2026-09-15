@@ -115,9 +115,26 @@ the view**, which `plan_sizes` already is.
 
 ### 4.3 Placement
 
-Feed the federated view to `plan_sizes`. The new input is not algorithmic, it is
-**eligibility**: a node may only be assigned an engine its cert grants, and a netpolicy tier
-its cert grants. Placement then becomes the existing sizing problem over a filtered set.
+**Correction, 2026-09-15, from building it.** This section originally said "feed the
+federated view to `plan_sizes`". That was wrong about the code. `node_sizer.plan_sizes`
+sizes the POOLS ON ONE NODE against that node's RAM/vCPU budget; it knows nothing about
+other machines and should not learn. *Which node should this job go to* is a different
+question and now lives in `blastbox.host.placement`, leaving the working local allocator
+alone.
+
+Eligibility is the only new decision, and it has one rule: **grants decide, claims
+order.** `eligible()` filters on the certificate's grants — engine, tier, and whether the
+node may hold credentials — and a node absent from the resolved grants is simply not
+eligible (fail-closed, and the common rollout case). `rank()` then orders that already-
+eligible set using the node's own unverified numbers, which is safe precisely because
+being wrong there costs latency rather than containment: a node that over-claims capacity
+attracts work, runs it slowly, its backlog climbs, and it demotes itself.
+
+Two reporting functions exist because silence is right for placement and wrong for an
+operator: `unverified_nodes()` (registered, no resolvable cert — otherwise a fleet
+shrinking from lapsed certs looks exactly like an idle fleet) and `over_claiming_nodes()`
+(advertising engines it is not granted — either a stale grant or a node probing for work,
+and those want different responses).
 
 ## 5. The actually hard part: a registered node is untrusted
 
@@ -172,10 +189,13 @@ Honesty ahead of enthusiasm, because this bounds the product:
 
 1. **Node certs from the existing CA**, and make `egress peer`/`peer-add` consume them
    instead of a pasted public key. Pure win, small, removes a manual step I built by hand.
+   **Done** — `pki issue-node` / `show-node`, `egress peer-add --cert`.
 2. **Node registration + heartbeat in the job store**, read-only at first: a federated view
-   that nothing yet acts on. Observable, reversible, no placement risk.
-3. **Eligibility filtering in `plan_sizes`** — grants restrict which engines/tiers a node may
-   be assigned. Still first-party nodes only.
+   that nothing yet acts on. Observable, reversible, no placement risk. **Done** —
+   `blastbox.host.node_registry` (in-memory + SQL; Redis is a follow-up).
+3. **Eligibility filtering** (`blastbox.host.placement`, NOT `plan_sizes` — see §4.3) —
+   grants restrict which engines/tiers a node may be assigned. Still first-party nodes
+   only. **Done.**
 4. **External containment verification at the exit host** (§5). This is the gate that should
    precede any third-party node holding egress.
 5. **Third-party registration**, behind a trust tier, non-confidential samples only.
