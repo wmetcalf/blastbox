@@ -116,6 +116,23 @@ class SqlJobStore:
         # Report only the scheme — never the full DSN (it carries credentials).
         raise ValueError(f"unsupported database url scheme: {scheme!r} (use sqlite/postgresql)")
 
+    @property
+    def param_style(self) -> str:
+        """The driver's placeholder (``?`` or ``%s``).
+
+        Public so a SIBLING table in this same database — the node registry — can build
+        statements without re-deriving the driver or opening a second connection pool.
+        The pool is sized as the node's concurrency ceiling (see __init__), so a second
+        one would quietly double this process's share of ``max_connections``.
+        """
+        return self._param
+
+    @contextmanager
+    def connection(self):
+        """Borrow a pooled connection. See :attr:`param_style` for why this is public."""
+        with self._lock, self._connect() as conn:
+            yield conn
+
     @contextmanager
     def _connect(self):
         if self._driver == "sqlite":
