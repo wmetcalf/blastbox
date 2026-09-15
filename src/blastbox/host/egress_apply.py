@@ -21,6 +21,9 @@ from pathlib import Path
 
 from blastbox.host.egress import (
     ALL_CHAINS,
+    CHAIN_FWD,
+    PRIO_BLACKHOLE,
+    PRIO_LOOKUP,
     EgressConfig,
     Health,
     Step,
@@ -53,11 +56,23 @@ RT_TABLES = Path("/etc/iproute2/rt_tables")
 # --------------------------------------------------------------------------------------
 
 def _run(argv, *, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        list(argv), check=check, text=True,
-        stdout=subprocess.PIPE if capture else None,
-        stderr=subprocess.PIPE if capture else None,
-    )
+    """Run a command. A MISSING BINARY is a normal outcome here, not an exception.
+
+    ``check=False`` suppresses a non-zero exit but not ``FileNotFoundError``, and only
+    ``_ok`` wrapped that. So teardown on a host without ``systemctl`` raised out of
+    ``teardown_node`` after the rules were already gone but BEFORE the env file was
+    removed — leaving the dispatch gate armed on a node with no tier.
+    """
+    try:
+        return subprocess.run(
+            list(argv), check=check, text=True,
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.PIPE if capture else None,
+        )
+    except FileNotFoundError as exc:
+        if check:
+            raise
+        return subprocess.CompletedProcess(list(argv), 127, "", f"{exc.strerror}: {argv[0]}")
 
 
 def _ok(argv) -> bool:
@@ -202,32 +217,84 @@ def container_state(name: str) -> tuple[bool, int, str]:
     return running, restarts, (logs.stdout or "") + (logs.stderr or "")
 
 
+def _rule_at(rules: str, priority: int) -> str:
+    """The body of the ``ip rule`` at ``priority``, or "" — anchored, not substring-matched.
+
+    ``ip rule show`` emits ``100:\tfrom 10.29.0.10 lookup bbwg``. Matching the body as a
+    bare substring of the whole output cannot tell our rule from the same text at a
+    priority BELOW ``32766: from all lookup main``, which would provide no containment at
+    all while reading as present.
+    """
+    for line in (rules or "").splitlines():
+        head, sep, body = line.partition(":")
+        if sep and head.strip().isdigit() and int(head.strip()) == priority:
+            return " ".join(body.split())
+    return ""
+
+
 def enforcement_present(cfg: EgressConfig) -> tuple[bool, str]:
-    """Is this node's egress ENFORCEMENT actually installed right now?
+    """Is this node's egress ENFORCEMENT installed and actually in the path, right now?
 
     The forwarder's startup gate cannot answer this and must not be trusted to. It pings
     the overlay peer, which lies INSIDE ``overlay_net`` — so the probe matches the
-    priority-99 ``to <overlay> lookup main`` rule and is resolved out of the MAIN table,
+    priority-99 ``to <overlay> lookup main`` rule and is resolved out of the MAIN table
     without the priority-100 source route, the priority-101 blackhole or the BB-WG-FWD
-    chain being consulted at all. The gate therefore proves the tunnel is up; it proves
-    nothing whatsoever about containment, and a node can pass it with every enforcement
-    rule deleted. Check the rules from the host, where they are visible.
+    chain being consulted at all. The gate proves the tunnel is up and nothing more.
+
+    Three things are checked, and each was a false-pass in an earlier version:
+
+    * **The ip rules, anchored to their priority** — see :func:`_rule_at`. The table may
+      render as its name or as the bare numeric id (``lookup 220``): ``ensure_rt_table``
+      writes the ``/etc/iproute2/rt_tables`` alias, but that is a dpkg conffile an
+      iproute2 upgrade can replace fleet-wide. Routing is unaffected either way, so
+      insisting on the name would turn a cosmetic file change into a fleet-wide outage.
+    * **The FORWARD jump, and its position.** ``iptables -S BB-WG-FWD`` prints only the
+      chain's OWN rules — never the jump into it — so checking the chain alone reports a
+      fully-enforced node when the jump has been flushed away and the chain is an orphan
+      enforcing nothing. Position matters too: docker's DOCKER-FORWARD holds a terminal
+      ACCEPT for the non-internal bb-net0 bridge, and ACCEPT in a jumped-to chain ends
+      filter traversal, so a jump below it is dead code.
+    * **The chain's verdict.** A blanket ACCEPT ahead of the DROP would neuter it.
     """
     if cfg.mode != "global":
         return True, "local mode: the sidecar itself is the enforcement"
-    rules = _run(["ip", "rule", "show"], check=False).stdout or ""
+    missing: list[str] = []
     fwd = cfg.forwarder_uplink_ip
-    missing = []
-    if f"from {fwd} lookup {cfg.rt_table}" not in rules.replace("  ", " "):
-        missing.append(f"source route (from {fwd} -> table {cfg.rt_table})")
-    if f"from {fwd} blackhole" not in rules.replace("  ", " "):
-        missing.append("blackhole fall-through guard")
-    chain = _run(["iptables", "-S", "BB-WG-FWD"], check=False)
-    if chain.returncode != 0 or "-j DROP" not in (chain.stdout or ""):
-        missing.append("BB-WG-FWD WAN-escape DROP")
+
+    rules = _run(["ip", "rule", "show"], check=False).stdout or ""
+    lookup = _rule_at(rules, PRIO_LOOKUP)
+    if f"from {fwd}" not in lookup or not (
+            f"lookup {cfg.rt_table}" in lookup or f"lookup {cfg.rt_table_id}" in lookup):
+        missing.append(f"source route (priority {PRIO_LOOKUP}: from {fwd} -> {cfg.rt_table})")
+    hole = _rule_at(rules, PRIO_BLACKHOLE)
+    if f"from {fwd}" not in hole or "blackhole" not in hole:
+        missing.append(f"blackhole fall-through guard (priority {PRIO_BLACKHOLE})")
+
+    fwd_chain = _run(["iptables", "-w", "2", "-S", "FORWARD"], check=False).stdout or ""
+    jump_at = docker_at = None
+    for i, line in enumerate(fwd_chain.splitlines()):
+        if not line.startswith("-A FORWARD"):
+            continue
+        if line.endswith(f"-j {CHAIN_FWD}") and jump_at is None:
+            jump_at = i
+        if ("-j DOCKER" in line or "-j ACCEPT" in line) and docker_at is None:
+            docker_at = i
+    if jump_at is None:
+        missing.append(f"FORWARD jump into {CHAIN_FWD} (the chain is orphaned)")
+    elif docker_at is not None and docker_at < jump_at:
+        missing.append(f"{CHAIN_FWD} is BELOW an earlier ACCEPT in FORWARD (its DROP is dead code)")
+
+    chain = _run(["iptables", "-w", "2", "-S", CHAIN_FWD], check=False)
+    body = [ln for ln in (chain.stdout or "").splitlines() if ln.startswith(f"-A {CHAIN_FWD}")]
+    if chain.returncode != 0 or not body:
+        missing.append(f"{CHAIN_FWD} chain")
+    elif not body[-1].endswith("-j DROP") or any(ln.endswith("-j ACCEPT") and "-o" not in ln
+                                                 for ln in body):
+        missing.append(f"{CHAIN_FWD} WAN-escape DROP (a blanket ACCEPT precedes it)")
+
     if missing:
         return False, "enforcement MISSING: " + ", ".join(missing)
-    return True, "source route, blackhole guard and WAN-escape DROP all present"
+    return True, "source route, blackhole guard and an in-path WAN-escape DROP all present"
 
 
 def node_health(cfg: EgressConfig) -> Health:
@@ -475,7 +542,12 @@ def load_persisted_env() -> dict[str, str]:
 
 
 def persisted_config() -> EgressConfig:
-    """The node's own persisted egress config, falling back to the environment."""
+    """The node's own persisted egress config, falling back to the environment.
+
+    The FILE wins over the environment: once a node is managed, egress.env is that node's
+    state, and a stale shell variable must not silently redescribe it. Explicit CLI flags
+    still override, which is the supported way to inspect or repair.
+    """
     env = load_persisted_env()
     return EgressConfig.from_env({**os.environ, **env} if env else None)
 
@@ -520,9 +592,15 @@ def install_persistence_unit(cfg: EgressConfig | None = None) -> str:
     # silently wrote an ExecStart pointing at a file that does not exist.
     exec_start = f"{sys.executable} -m blastbox.host.cli egress apply"
     body = persistence_unit(exec_start, (cfg or EgressConfig()).wg_iface)
+    # "is it ENABLED", not "does the file match". An early return on content alone meant
+    # a node whose first `systemctl enable` failed never retried it on any later apply:
+    # the unit sat in /etc/systemd/system with no multi-user.target symlink while every
+    # apply reported "already installed and current", and reboot persistence — the whole
+    # point — was silently absent.
+    enabled = _run(["systemctl", "is-enabled", "blastbox-egress"], check=False).returncode == 0
     try:
-        if UNIT_DST.exists() and UNIT_DST.read_text() == body:
-            return "persistence unit: already installed and current"
+        if UNIT_DST.exists() and UNIT_DST.read_text() == body and enabled:
+            return "persistence unit: already installed and enabled"
         UNIT_DST.parent.mkdir(parents=True, exist_ok=True)
         UNIT_DST.write_text(body)
         os.chmod(UNIT_DST, 0o644)
@@ -530,7 +608,13 @@ def install_persistence_unit(cfg: EgressConfig | None = None) -> str:
         return (f"persistence unit NOT installed ({exc.strerror}); tier applied but "
                 "will not survive a reboot")
     _run(["systemctl", "daemon-reload"], check=False)
-    _run(["systemctl", "enable", "blastbox-egress"], check=False)
+    rc = _run(["systemctl", "enable", "blastbox-egress"], check=False)
+    if rc.returncode != 0:
+        # Never claim it. A swallowed enable failure is how a node reports persistent and
+        # comes back from a reboot with no enforcement.
+        return (f"persistence unit written but NOT ENABLED "
+                f"({(rc.stderr or '').strip().splitlines()[-1] if rc.stderr else 'systemctl failed'})"
+                " — the tier will not survive a reboot")
     return f"persistence unit installed and enabled (ExecStart={exec_start})"
 
 

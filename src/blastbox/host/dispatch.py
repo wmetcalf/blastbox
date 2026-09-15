@@ -550,9 +550,17 @@ class Dispatcher:
         # outage becomes a permanent ~0.5Hz claim/defer spin per job that no path ever
         # terminates. Bound it: after this long still degraded, fail the job with the
         # health reason so the operator sees a cause instead of a silent queue.
-        self._egress_defer_max_s = max(
-            0.0, float(os.environ.get("BLASTBOX_EGRESS_DEFER_MAX_S", "600") or 600))
-        self._egress_defer_since: dict[str, float] = {}
+        # Escalating backoff, NOT a kill switch. Failing the job would destroy work a
+        # healthy peer could still run — and this node cannot observe whether a peer was
+        # offered it, so "no peer took this job" would be an assertion about the fleet
+        # made from one node. Worse, a degraded node has all its egress capacity idle, so
+        # it wins the next claim race most often and would be the one destroying them.
+        # Instead the re-claim window grows 2s -> cap, which removes the ~0.5Hz spin
+        # without terminalising anything; max_queued_age remains the expiry mechanism.
+        self._egress_defer_cap_s = max(
+            2.0, float(os.environ.get("BLASTBOX_EGRESS_DEFER_CAP_S", "300") or 300))
+        self._egress_defer_lock = threading.Lock()
+        self._egress_defer_n: dict[str, int] = {}
         # Safety floor for warm recovery: the warm staleness cutoff anchors on started_at (set at
         # CLAIM time), but a warm job's bounding deadline is only established later — after
         # pool.claim (<= warm_claim_timeout_s) + input staging. requeue_grace_s is the slack that
@@ -1202,20 +1210,32 @@ class Dispatcher:
         if self._egress_health is not None and (now - self._egress_health_at) < self._egress_health_ttl_s:
             return self._egress_health
         try:
+            from blastbox.host.egress_apply import ENV_FILE as _ef
             from blastbox.host.egress_apply import node_health, persisted_config
             # persisted_config(), NOT EgressConfig.from_env(): the gate is armed by
             # /etc/blastbox/egress.env, so it must probe with that file's contents.
             # from_env() reads os.environ, which no dispatcher shape populates — it
             # yielded the class defaults and pinged an address a relocated node does
             # not hold.
-            verdict = node_health(persisted_config())
-        except Exception as exc:  # probe unavailable -> don't gate
+            try:
+                cfg = persisted_config()
+            except ValueError as exc:
+                # A MANAGED node whose config will not parse is a definite problem, not a
+                # probe malfunction — egress.env is written non-atomically, so a crash
+                # mid-write truncates it. Returning None here would fail the containment
+                # gate OPEN on a node whose egress state is unreadable. Degrade instead.
+                from blastbox.host.egress import Health as _H
+                verdict = _H(False, f"{_ef} is unreadable ({exc}); cannot prove containment")
+            else:
+                verdict = node_health(cfg)
+        except Exception as exc:  # probe machinery unavailable -> don't gate
             _log.debug("egress health probe unavailable: %s", exc)
             return None
         self._egress_health, self._egress_health_at = verdict, now
         return verdict
 
-    def _requeue_claimed(self, job: Job, *, reason: str, defer: bool = False) -> None:
+    def _requeue_claimed(self, job: Job, *, reason: str, defer: bool = False,
+                         defer_s: float | None = None) -> None:
         """Release OUR claim back to QUEUED so another worker/dispatcher takes the job. CAS-fenced
         on our claim_id and clears it, so a job reclaimed since we claimed is left untouched;
         started_at/worker_runtime/worker_tier are reset so it looks fresh. The staged input is
@@ -1240,7 +1260,8 @@ class Dispatcher:
         )
         if defer:
             # ineligible for a short window; retried once warm may have freed cold headroom.
-            fields["claimable_after"] = time.time() + max(2.0, self._warm_requeue_backoff_s)
+            fields["claimable_after"] = time.time() + max(
+                2.0, self._warm_requeue_backoff_s if defer_s is None else defer_s)
         requeued = self._job_store.update_if_status(
             job.job_id,
             JobStatus.RUNNING,
@@ -1943,8 +1964,10 @@ class Dispatcher:
         # on its gateway barrier. That is the right outcome for the SAMPLE but the wrong one
         # for the JOB: nothing about it is job-specific, so every egress job claimed here
         # would burn the same way. DEFER instead, so the job becomes briefly ineligible and
-        # a peer dispatcher with a healthy exit takes it. If the whole fleet is down the job
-        # ages out through the normal max_queued_age path rather than dying on arrival here.
+        # a peer dispatcher with a healthy exit takes it. The window escalates on repeat so
+        # a fleet-wide outage does not become a permanent claim/defer spin; expiry stays
+        # with max_queued_age, which is the mechanism that can see the whole queue's age.
+        #
         # ONLY the tiers whose health node_health actually measures. It probes exactly
         # one thing — the bb-vpn gateway address (the local sidecar, or the overlay
         # forwarder occupying it). tor and socks egress via bb-socks sidecars whose
@@ -1954,38 +1977,30 @@ class Dispatcher:
         if gated_by_gateway_health:
             health = self._node_egress_health()
             if health is not None and not health.healthy:
-                now = time.time()
-                since = self._egress_defer_since.setdefault(job.job_id, now)
-                if self._egress_defer_max_s and (now - since) >= self._egress_defer_max_s:
-                    # No peer took it either. Fail with the CAUSE rather than leave it
-                    # queued forever with error=None, which is indistinguishable from
-                    # "not picked up yet" and is the single-node deployment's whole
-                    # experience of this outage.
-                    self._egress_defer_since.pop(job.job_id, None)
-                    self._fail_job(
-                        job,
-                        f"node egress has been degraded for "
-                        f"{int(now - since)}s and no peer took this job: {health.reason}. "
-                        f"netpolicy {personality.name!r} (exit={personality.exit_driver}) "
-                        f"cannot run until the exit is restored "
-                        f"(check `blastbox egress check`).",
-                    )
-                    return
-                # Bound the map: a long outage must not accumulate one entry per job
-                # forever. Oldest-first eviction; a re-claimed job simply restarts its
-                # clock, which only ever delays the failure.
-                if len(self._egress_defer_since) > 4096:
-                    for stale, _t in sorted(
-                            self._egress_defer_since.items(), key=lambda kv: kv[1])[:1024]:
-                        self._egress_defer_since.pop(stale, None)
+                with self._egress_defer_lock:
+                    n = self._egress_defer_n.get(job.job_id, 0) + 1
+                    self._egress_defer_n[job.job_id] = n
+                    # Bound the map by dropping the NEWEST entries: they are the furthest
+                    # from their cap, so losing their count costs least. Evicting the
+                    # oldest would reset the clocks of exactly the jobs nearest the cap
+                    # and postpone escalation forever — the original unbounded spin.
+                    if len(self._egress_defer_n) > 4096:
+                        newest = sorted(self._egress_defer_n.items(),
+                                        key=lambda kv: kv[1])[:1024]
+                        for stale, _n in newest:
+                            self._egress_defer_n.pop(stale, None)
+                delay = min(self._egress_defer_cap_s, 2.0 * (2 ** min(n - 1, 8)))
                 self._requeue_claimed(
-                    job, defer=True,
+                    job, defer=True, defer_s=delay,
                     reason=f"node egress is degraded ({health.reason}); deferring "
-                           f"netpolicy {personality.name!r} to a peer",
+                           f"netpolicy {personality.name!r} to a peer "
+                           f"(attempt {n}, next eligible in {delay:.0f}s)",
                 )
                 return
-            self._egress_defer_since.pop(job.job_id, None)
-                # Gateway-routed tiers (tor/openvpn/wireguard/inspect) have netd install the default route
+            with self._egress_defer_lock:
+                self._egress_defer_n.pop(job.job_id, None)
+
+        # Gateway-routed tiers (tor/openvpn/wireguard/inspect) have netd install the default route
         # AFTER the container starts; the worker waits for that route via BLASTBOX_NET_WAIT_GATEWAY,
         # which is derived from the personality's gateway=. Without it the barrier is empty and a fast
         # engine races netd (flapping / fail-closed). Require gateway= rather than launch a racey job.

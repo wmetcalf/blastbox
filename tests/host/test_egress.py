@@ -31,7 +31,19 @@ from blastbox.host.egress import (
 
 
 def _argvs(steps):
-    return [" ".join(s.argv) for s in steps]
+    """Rendered argv with the xtables `-w` wait flag removed.
+
+    Tests here assert ROUTING AND FILTER INTENT, not lock handling, so the flag would
+    only make every assertion brittle. `test_every_iptables_call_waits_for_the_xtables_lock`
+    pins the flag itself.
+    """
+    out = []
+    for st in steps:
+        a = list(st.argv)
+        if a and a[0] == "iptables" and len(a) > 2 and a[1] == "-w":
+            del a[1:3]
+        out.append(" ".join(a))
+    return out
 
 
 GLOBAL = EgressConfig(mode="global", upstream_gw="10.77.0.1")
@@ -416,46 +428,116 @@ def test_apply_survives_an_unwritable_unit_path(monkeypatch, tmp_path):
 
 # --------------------------------------------------- health must assert containment
 
-def test_health_fails_when_enforcement_rules_are_absent(monkeypatch):
-    """The forwarder's gate pings the overlay peer, which is INSIDE overlay_net — so it
-    matches the priority-99 `lookup main` rule and never consults the source route, the
-    blackhole or the DROP chain. A node can pass its gate with containment entirely
-    deleted, so health has to check the rules from the host instead of trusting it."""
+def _fake_host(monkeypatch, *, rules: str, forward: str, chain: str):
+    """Stand in for the host, using REAL `ip rule show` / `iptables -S` output shapes.
+
+    Built from captured formatting (tab after the priority, `-A FORWARD ...` lines),
+    not from the implementation's own f-strings — a fixture echoing the matcher back at
+    itself certifies the control without constraining it, which is how the first version
+    of these tests passed while enforcement_present was blind to an orphaned chain.
+    """
     from blastbox.host import egress_apply as ea
 
-    monkeypatch.setattr(ea, "_run", lambda argv, **k: type(
-        "P", (), {"returncode": 0, "stdout": "", "stderr": ""})())
-    ok, why = ea.enforcement_present(GLOBAL)
-    assert not ok
-    for expected in ("source route", "blackhole", "DROP"):
-        assert expected in why
-
-
-def test_health_passes_when_every_enforcement_rule_is_present(monkeypatch):
-    from blastbox.host import egress_apply as ea
-
-    rules = (f"100:\tfrom {GLOBAL.forwarder_uplink_ip} lookup {GLOBAL.rt_table}\n"
-             f"101:\tfrom {GLOBAL.forwarder_uplink_ip} blackhole\n")
-
-    def fake(argv, **k):
-        out = rules if argv[:3] == ["ip", "rule", "show"] else "-A BB-WG-FWD -j DROP"
+    def fake(argv, **kw):
+        a = list(argv)
+        if a[:3] == ["ip", "rule", "show"]:
+            out = rules
+        elif a[-1] == "FORWARD":
+            out = forward
+        elif a[-1] == "BB-WG-FWD":
+            out = chain
+        else:
+            out = ""
         return type("P", (), {"returncode": 0, "stdout": out, "stderr": ""})()
 
     monkeypatch.setattr(ea, "_run", fake)
+    return ea
+
+
+_GOOD_RULES = ("0:\tfrom all lookup local\n"
+               "99:\tfrom all to 10.77.0.0/24 lookup main\n"
+               "100:\tfrom 172.29.0.10 lookup bbwg\n"
+               "101:\tfrom 172.29.0.10 blackhole\n"
+               "32766:\tfrom all lookup main\n")
+_GOOD_FWD = ("-P FORWARD DROP\n"
+             "-A FORWARD -d 172.29.0.10/32 -j BB-WG-FWD-RET\n"
+             "-A FORWARD -s 172.29.0.10/32 -j BB-WG-FWD\n"
+             "-A FORWARD -j DOCKER-FORWARD\n")
+_GOOD_CHAIN = "-N BB-WG-FWD\n-A BB-WG-FWD -o bbwg0 -j ACCEPT\n-A BB-WG-FWD -j DROP\n"
+
+
+def test_health_passes_only_when_every_layer_is_in_the_path(monkeypatch):
+    ea = _fake_host(monkeypatch, rules=_GOOD_RULES, forward=_GOOD_FWD, chain=_GOOD_CHAIN)
     ok, why = ea.enforcement_present(GLOBAL)
     assert ok, why
 
 
-def test_the_overlay_probe_cannot_prove_containment():
-    """Pin the reason the gate is insufficient, so nobody 'simplifies' health back to it.
+def test_an_orphaned_chain_is_not_enforcement(monkeypatch):
+    """`iptables -S BB-WG-FWD` prints the chain's own rules and NEVER the jump into it.
+    Checking the chain alone reported a fully-enforced node whose jump had been flushed
+    away — the chain sitting there enforcing nothing."""
+    ea = _fake_host(monkeypatch, rules=_GOOD_RULES,
+                    forward="-P FORWARD DROP\n-A FORWARD -j DOCKER-FORWARD\n",
+                    chain=_GOOD_CHAIN)
+    ok, why = ea.enforcement_present(GLOBAL)
+    assert not ok and "orphaned" in why
 
-    The gate's target is the upstream gateway, and that address is inside overlay_net —
-    the prefix the priority-99 rule sends to the main table ahead of every enforcement
-    rule."""
-    import ipaddress
 
-    assert ipaddress.ip_address(GLOBAL.upstream_gw) in ipaddress.ip_network(GLOBAL.overlay_net)
-    assert PRIO_OVERLAY_MAIN < PRIO_LOOKUP
+def test_a_jump_below_an_earlier_accept_is_not_enforcement(monkeypatch):
+    """ACCEPT in a jumped-to chain ends filter traversal, so a jump below docker's
+    terminal bridge ACCEPT makes our DROP dead code. A docker daemon restart does this."""
+    ea = _fake_host(monkeypatch, rules=_GOOD_RULES,
+                    forward=("-P FORWARD DROP\n-A FORWARD -j DOCKER-FORWARD\n"
+                             "-A FORWARD -s 172.29.0.10/32 -j BB-WG-FWD\n"),
+                    chain=_GOOD_CHAIN)
+    ok, why = ea.enforcement_present(GLOBAL)
+    assert not ok and "BELOW" in why
+
+
+def test_rules_below_the_main_lookup_are_not_enforcement(monkeypatch):
+    """Matching the rule body as a bare substring of the whole output could not tell our
+    priority-100 rule from the same text below `32766: from all lookup main`, which
+    provides no containment at all."""
+    ea = _fake_host(monkeypatch,
+                    rules=("32766:\tfrom all lookup main\n"
+                           "32800:\tfrom 172.29.0.10 lookup bbwg\n"
+                           "32801:\tfrom 172.29.0.10 blackhole\n"),
+                    forward=_GOOD_FWD, chain=_GOOD_CHAIN)
+    assert not ea.enforcement_present(GLOBAL)[0]
+
+
+def test_a_numeric_table_id_still_counts_as_enforcement(monkeypatch):
+    """/etc/iproute2/rt_tables is a dpkg conffile an iproute2 upgrade can replace, after
+    which `ip rule show` prints `lookup 220` instead of `lookup bbwg`. Routing is
+    unaffected, so insisting on the name would turn a cosmetic file change into a
+    fleet-wide false outage."""
+    ea = _fake_host(monkeypatch,
+                    rules=_GOOD_RULES.replace("lookup bbwg", "lookup 220"),
+                    forward=_GOOD_FWD, chain=_GOOD_CHAIN)
+    assert ea.enforcement_present(GLOBAL)[0]
+
+
+def test_a_blanket_accept_ahead_of_the_drop_is_not_enforcement(monkeypatch):
+    ea = _fake_host(monkeypatch, rules=_GOOD_RULES, forward=_GOOD_FWD,
+                    chain="-N BB-WG-FWD\n-A BB-WG-FWD -j ACCEPT\n-A BB-WG-FWD -j DROP\n")
+    assert not ea.enforcement_present(GLOBAL)[0]
+
+
+def test_missing_rules_are_named_individually(monkeypatch):
+    ea = _fake_host(monkeypatch, rules="", forward=_GOOD_FWD, chain=_GOOD_CHAIN)
+    ok, why = ea.enforcement_present(GLOBAL)
+    assert not ok
+    assert "source route" in why and "blackhole" in why
+
+
+def test_a_missing_binary_does_not_raise_out_of_teardown(monkeypatch):
+    """check=False suppresses a non-zero exit but NOT FileNotFoundError, and only _ok
+    wrapped that — so teardown on a host without systemctl raised AFTER the rules were
+    removed but BEFORE the env file, leaving the dispatch gate armed on a dead tier."""
+    from blastbox.host import egress_apply as ea
+
+    proc = ea._run(["definitely-not-a-real-binary-xyz"], check=False)
+    assert proc.returncode == 127
 
 
 def test_teardown_disarms_the_dispatch_gate(monkeypatch, tmp_path):
@@ -554,3 +636,16 @@ def test_adopting_a_relocated_bridge_carries_its_gateway_along(monkeypatch):
     assert plan.config.vpn_subnet == "10.31.0.0/16"
     assert plan.config.vpn_gateway_ip == "10.31.0.10"   # offset preserved, not stale
     assert plan.config.forwarder_uplink_ip == "10.29.0.10"
+
+
+def test_every_iptables_call_waits_for_the_xtables_lock():
+    """dockerd and the co-resident CAPE rooter mutate iptables constantly, and an
+    unwaited call does not queue — it fails outright. A `-C` guard failing that way is
+    indistinguishable from "rule absent", and the delete-then-insert jump is DESTRUCTIVE
+    if the delete wins the lock and the insert loses it."""
+    for steps in (forwarder_source_route_steps(GLOBAL, "eth0"),
+                  exit_host_steps(GLOBAL, "br-x"),
+                  teardown_steps(GLOBAL)):
+        for st in steps:
+            if st.argv[0] == "iptables":
+                assert st.argv[1] == "-w", f"unwaited: {' '.join(st.argv)}"

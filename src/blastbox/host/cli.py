@@ -958,19 +958,29 @@ def build_parser() -> argparse.ArgumentParser:
     # sub-parser, so an option declared only on the parent is reachable solely in the
     # pre-verb position — which made every documented `egress apply --mode global ...`
     # die with "unrecognized arguments". Inheriting them puts them in both positions.
+    # default=argparse.SUPPRESS is load-bearing. argparse parses a sub-command into a
+    # FRESH namespace and copies every key back over the parent's, so an option declared
+    # in both places has its pre-verb value overwritten by the sub-parser's default —
+    # `egress --mode global apply` silently became mode=None, which is worse than the
+    # "unrecognized arguments" it replaced because it fails OPEN into local mode.
+    # SUPPRESS omits the key entirely when the option is absent, so neither position
+    # clobbers the other.
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--mode", choices=("local", "global"), default=None,
+    common.add_argument("--mode", choices=("local", "global"), default=argparse.SUPPRESS,
                         help="local: this node runs its own credentialed exit sidecars. "
                              "global: this node holds no credentials and forwards over the "
                              "wg overlay to the central exit host. The gateway ADDRESS is "
                              "identical either way.")
-    common.add_argument("--gateway-ip", default=None, help="override the gateway address")
-    common.add_argument("--wg-iface", default=None)
-    common.add_argument("--upstream-gw", default=None,
+    common.add_argument("--gateway-ip", default=argparse.SUPPRESS,
+                        help="override the gateway address")
+    common.add_argument("--wg-iface", default=argparse.SUPPRESS)
+    common.add_argument("--upstream-gw", default=argparse.SUPPRESS,
                         help="mode=global: overlay IP of the central exit host")
-    pe.add_argument("--mode", choices=("local", "global"), default=None, help=argparse.SUPPRESS)
-    pe.add_argument("--gateway-ip", default=None, help=argparse.SUPPRESS)
-    pe.add_argument("--wg-iface", default=None, help=argparse.SUPPRESS)
+    pe.add_argument("--mode", choices=("local", "global"), default=argparse.SUPPRESS,
+                    help=argparse.SUPPRESS)
+    pe.add_argument("--gateway-ip", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    pe.add_argument("--wg-iface", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    pe.add_argument("--upstream-gw", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     pes = pe.add_subparsers(dest="egress_action", required=True)
 
     pe_ap = pes.add_parser("apply", parents=[common],
@@ -998,7 +1008,7 @@ def build_parser() -> argparse.ArgumentParser:
     pe_pr.add_argument("--peer-ip", required=True)
     pe_pr.add_argument("--gateway-addr", required=True)
     pe_pr.add_argument("--gateway-pubkey", required=True)
-    pe.set_defaults(func=_egress_cmd, upstream_gw=None)
+    pe.set_defaults(func=_egress_cmd)
 
     pv = sub.add_parser("version", help="print version and exit")
     pv.set_defaults(func=_version_cmd)

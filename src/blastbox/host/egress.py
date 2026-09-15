@@ -104,6 +104,12 @@ class Step:
     netns. Node setup is different: it is re-run on every boot by the persistence unit and
     by any operator re-applying config, so every step has to be idempotent on its own.
 
+    Every ``iptables`` invocation carries ``-w``: dockerd and the co-resident CAPE rooter
+    mutate iptables constantly, and an unwaited call does not queue — it fails outright
+    with "another app is currently holding the xtables lock". A guard failing that way is
+    indistinguishable from "rule absent", and a delete/insert pair losing the lock
+    halfway leaves the chain orphaned.
+
     ``guard``  — if this command SUCCEEDS, ``argv`` is skipped. ``iptables -C`` is the
                  canonical case: check-then-add, so a re-apply does not stack duplicate
                  jump rules in a chain the CAPE rooter also lives in.
@@ -525,12 +531,12 @@ def _chain_jump_steps(chain: str, match: list[str]) -> list[Step]:
     for longer than the refill takes; an empty user chain RETURNs, falling through to
     docker's bridge ACCEPT.
     """
-    steps: list[Step] = [Step.best_effort(["iptables", "-N", chain], f"create {chain}")]
-    steps += [Step.best_effort(["iptables", "-D", "FORWARD", *match, "-j", chain])
+    steps: list[Step] = [Step.best_effort(["iptables", "-w", "5", "-N", chain], f"create {chain}")]
+    steps += [Step.best_effort(["iptables", "-w", "5", "-D", "FORWARD", *match, "-j", chain])
               for _ in range(4)]
-    steps.append(Step.of(["iptables", "-I", "FORWARD", "1", *match, "-j", chain],
+    steps.append(Step.of(["iptables", "-w", "5", "-I", "FORWARD", "1", *match, "-j", chain],
                          desc=f"jump FORWARD[1] -> {chain} (re-hoisted above docker's)"))
-    steps.append(Step.of(["iptables", "-F", chain], desc=f"flush {chain}"))
+    steps.append(Step.of(["iptables", "-w", "5", "-F", chain], desc=f"flush {chain}"))
     return steps
 
 
@@ -547,10 +553,10 @@ def return_chain_steps(chain: str, out_iface: str, dest: str) -> list[Step]:
     oif = _iface(out_iface)
     return [
         *_chain_jump_steps(chain, ["-d", _net(dest)]),
-        Step.of(["iptables", "-A", chain, "-o", oif,
+        Step.of(["iptables", "-w", "5", "-A", chain, "-o", oif,
                  "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
                 desc="accept established return traffic"),
-        Step.of(["iptables", "-A", chain, "-j", "DROP"], desc="drop new inbound flows"),
+        Step.of(["iptables", "-w", "5", "-A", chain, "-j", "DROP"], desc="drop new inbound flows"),
     ]
 
 
@@ -615,10 +621,10 @@ def forwarder_source_route_steps(cfg: EgressConfig, bridge_iface: str) -> list[S
         # Belt and braces: even if something restores a main-table default for this source,
         # anything not leaving via the tunnel is dropped.
         *_chain_jump_steps(CHAIN_FWD, ["-s", fwd]),
-        Step.of(["iptables", "-A", CHAIN_FWD, "-o", wg, "-j", "ACCEPT"]),
-        Step.of(["iptables", "-A", CHAIN_FWD, "-j", "DROP"], desc="no WAN escape"),
-        Step.ensure(["iptables", "-t", "nat", "-C", "POSTROUTING", "-o", wg, "-j", "MASQUERADE"],
-                    ["iptables", "-t", "nat", "-A", "POSTROUTING", "-o", wg, "-j", "MASQUERADE"],
+        Step.of(["iptables", "-w", "5", "-A", CHAIN_FWD, "-o", wg, "-j", "ACCEPT"]),
+        Step.of(["iptables", "-w", "5", "-A", CHAIN_FWD, "-j", "DROP"], desc="no WAN escape"),
+        Step.ensure(["iptables", "-w", "5", "-t", "nat", "-C", "POSTROUTING", "-o", wg, "-j", "MASQUERADE"],
+                    ["iptables", "-w", "5", "-t", "nat", "-A", "POSTROUTING", "-o", wg, "-j", "MASQUERADE"],
                     "SNAT onto the tunnel address (AllowedIPs is a /32)"),
         # The return leg goes back to the forwarder over its DOCKER BRIDGE, not over the
         # tunnel — replies arrive from wg and must be forwarded onto the bridge. Naming
@@ -653,12 +659,12 @@ def exit_host_steps(cfg: EgressConfig, exit_iface: str) -> list[Step]:
         *_overlay_main_steps(cfg.overlay_net),
         *_rule_steps(["from", cfg.overlay_net], cfg.rt_table),
         *_chain_jump_steps(CHAIN_EXIT, ["-s", cfg.overlay_net]),
-        Step.of(["iptables", "-A", CHAIN_EXIT, "-o", eif, "-j", "ACCEPT"],
+        Step.of(["iptables", "-w", "5", "-A", CHAIN_EXIT, "-o", eif, "-j", "ACCEPT"],
                 desc="peer traffic may ONLY leave by the exit bridge"),
-        Step.of(["iptables", "-A", CHAIN_EXIT, "-j", "DROP"]),
-        Step.ensure(["iptables", "-t", "nat", "-C", "POSTROUTING",
+        Step.of(["iptables", "-w", "5", "-A", CHAIN_EXIT, "-j", "DROP"]),
+        Step.ensure(["iptables", "-w", "5", "-t", "nat", "-C", "POSTROUTING",
                      "-s", cfg.overlay_net, "-o", eif, "-j", "MASQUERADE"],
-                    ["iptables", "-t", "nat", "-A", "POSTROUTING",
+                    ["iptables", "-w", "5", "-t", "nat", "-A", "POSTROUTING",
                      "-s", cfg.overlay_net, "-o", eif, "-j", "MASQUERADE"],
                     "SNAT so the sidecar sees a local source"),
         *return_chain_steps(CHAIN_EXIT_RET, cfg.wg_iface, cfg.overlay_net),
@@ -681,11 +687,11 @@ def teardown_steps(cfg: EgressConfig) -> list[Step]:
         for _ in range(4):
             cmds.append(Step.best_effort(["ip", "rule", "del", "priority", str(prio)]))
     cmds.append(Step.best_effort(["ip", "route", "flush", "table", cfg.rt_table]))
-    cmds.append(Step.best_effort(["iptables", "-t", "nat", "-D", "POSTROUTING",
+    cmds.append(Step.best_effort(["iptables", "-w", "5", "-t", "nat", "-D", "POSTROUTING",
                                   "-o", cfg.wg_iface, "-j", "MASQUERADE"]))
     for chain in ALL_CHAINS:
-        cmds.append(Step.best_effort(["iptables", "-F", chain]))
-        cmds.append(Step.best_effort(["iptables", "-X", chain]))
+        cmds.append(Step.best_effort(["iptables", "-w", "5", "-F", chain]))
+        cmds.append(Step.best_effort(["iptables", "-w", "5", "-X", chain]))
     return cmds
 
 
