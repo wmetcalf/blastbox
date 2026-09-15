@@ -270,30 +270,48 @@ def enforcement_present(cfg: EgressConfig) -> tuple[bool, str]:
     if f"from {fwd}" not in hole or "blackhole" not in hole:
         missing.append(f"blackhole fall-through guard (priority {PRIO_BLACKHOLE})")
 
-    fwd_chain = _run(["iptables", "-w", "2", "-S", "FORWARD"], check=False).stdout or ""
-    jump_at = docker_at = None
-    for i, line in enumerate(fwd_chain.splitlines()):
-        if not line.startswith("-A FORWARD"):
-            continue
-        if line.endswith(f"-j {CHAIN_FWD}") and jump_at is None:
-            jump_at = i
-        if ("-j DOCKER" in line or "-j ACCEPT" in line) and docker_at is None:
-            docker_at = i
-    if jump_at is None:
-        missing.append(f"FORWARD jump into {CHAIN_FWD} (the chain is orphaned)")
-    elif docker_at is not None and docker_at < jump_at:
-        missing.append(f"{CHAIN_FWD} is BELOW an earlier ACCEPT in FORWARD (its DROP is dead code)")
+    # THE FILTER LAYER IS ONLY OBSERVABLE AS ROOT. `ip rule show` works unprivileged;
+    # `iptables -S` does not — it exits 4 with "Permission denied". The dispatcher is
+    # cap-dropped BY DESIGN (netd exists as a separate privileged helper for exactly that
+    # reason), so treating an unreadable filter table as "missing" would report every
+    # healthy node as uncontained and defer all of its egress work forever. Distinguish
+    # CANNOT OBSERVE from OBSERVED ABSENT: the routing layer above is the primary
+    # enforcement and is readable, so a verdict still means something; the filter layer is
+    # reported as unverified rather than counted against the node.
+    unverified: list[str] = []
+    fwd_probe = _run(["iptables", "-w", "2", "-S", "FORWARD"], check=False)
+    if fwd_probe.returncode != 0:
+        unverified.append(f"{CHAIN_FWD} jump (needs root; `blastbox egress check` as root "
+                          "verifies it)")
+    else:
+        jump_at = docker_at = None
+        for i, line in enumerate((fwd_probe.stdout or "").splitlines()):
+            if not line.startswith("-A FORWARD"):
+                continue
+            if line.endswith(f"-j {CHAIN_FWD}") and jump_at is None:
+                jump_at = i
+            if ("-j DOCKER" in line or "-j ACCEPT" in line) and docker_at is None:
+                docker_at = i
+        if jump_at is None:
+            missing.append(f"FORWARD jump into {CHAIN_FWD} (the chain is orphaned)")
+        elif docker_at is not None and docker_at < jump_at:
+            missing.append(
+                f"{CHAIN_FWD} is BELOW an earlier ACCEPT in FORWARD (its DROP is dead code)")
 
-    chain = _run(["iptables", "-w", "2", "-S", CHAIN_FWD], check=False)
-    body = [ln for ln in (chain.stdout or "").splitlines() if ln.startswith(f"-A {CHAIN_FWD}")]
-    if chain.returncode != 0 or not body:
-        missing.append(f"{CHAIN_FWD} chain")
-    elif not body[-1].endswith("-j DROP") or any(ln.endswith("-j ACCEPT") and "-o" not in ln
-                                                 for ln in body):
-        missing.append(f"{CHAIN_FWD} WAN-escape DROP (a blanket ACCEPT precedes it)")
+        chain = _run(["iptables", "-w", "2", "-S", CHAIN_FWD], check=False)
+        body = [ln for ln in (chain.stdout or "").splitlines()
+                if ln.startswith(f"-A {CHAIN_FWD}")]
+        if chain.returncode != 0 or not body:
+            missing.append(f"{CHAIN_FWD} chain")
+        elif not body[-1].endswith("-j DROP") or any(
+                ln.endswith("-j ACCEPT") and "-o" not in ln for ln in body):
+            missing.append(f"{CHAIN_FWD} WAN-escape DROP (a blanket ACCEPT precedes it)")
 
     if missing:
         return False, "enforcement MISSING: " + ", ".join(missing)
+    if unverified:
+        return True, ("source route and blackhole guard present; unverified: "
+                      + ", ".join(unverified))
     return True, "source route, blackhole guard and an in-path WAN-escape DROP all present"
 
 

@@ -649,3 +649,41 @@ def test_every_iptables_call_waits_for_the_xtables_lock():
         for st in steps:
             if st.argv[0] == "iptables":
                 assert st.argv[1] == "-w", f"unwaited: {' '.join(st.argv)}"
+
+
+def test_an_unprivileged_probe_does_not_condemn_a_healthy_node(monkeypatch):
+    """`ip rule show` works unprivileged; `iptables -S` exits 4 with Permission denied.
+
+    The dispatcher is cap-dropped BY DESIGN — netd exists as a separate privileged helper
+    for exactly that reason — so counting an unreadable filter table as "missing" would
+    report every healthy node as uncontained and defer all of its egress work forever.
+    CANNOT OBSERVE is not OBSERVED ABSENT.
+    """
+    from blastbox.host import egress_apply as ea
+
+    rules = ("100:\tfrom 172.29.0.10 lookup bbwg\n"
+             "101:\tfrom 172.29.0.10 blackhole\n")
+
+    def unprivileged(argv, **kw):
+        a = list(argv)
+        if a[:3] == ["ip", "rule", "show"]:
+            return type("P", (), {"returncode": 0, "stdout": rules, "stderr": ""})()
+        return type("P", (), {"returncode": 4, "stdout": "",
+                              "stderr": "Permission denied"})()
+
+    monkeypatch.setattr(ea, "_run", unprivileged)
+    ok, why = ea.enforcement_present(GLOBAL)
+    assert ok, why
+    assert "unverified" in why          # reported, not silently ignored
+
+
+def test_an_unprivileged_probe_still_catches_a_missing_source_route(monkeypatch):
+    """The routing layer IS readable unprivileged, so a verdict still means something —
+    degrading gracefully must not become degrading to useless."""
+    from blastbox.host import egress_apply as ea
+
+    monkeypatch.setattr(ea, "_run", lambda argv, **kw: type(
+        "P", (), {"returncode": 0 if list(argv)[:3] == ["ip", "rule", "show"] else 4,
+                  "stdout": "", "stderr": "Permission denied"})())
+    ok, why = ea.enforcement_present(GLOBAL)
+    assert not ok and "source route" in why
