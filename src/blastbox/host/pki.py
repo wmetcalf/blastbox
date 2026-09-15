@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import datetime
 import ipaddress
+import json
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from cryptography import x509
@@ -28,6 +30,85 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 _CA_CN = "blastbox-worker-ca"
+
+# ---------------------------------------------------------------------------------------
+# Node identity (federation)
+# ---------------------------------------------------------------------------------------
+#
+# A NODE certificate is a third leaf kind alongside server/client. It names a machine
+# rather than a process, and carries two things the transport certs do not: the node's
+# WireGuard public key, and its GRANTS — which engines and which netpolicy tiers that
+# node may be assigned.
+#
+# WHY THE WIREGUARD KEY LIVES IN THE CERT. Today an operator reads a public key off one
+# host and pastes it into a command on another. That is an unauthenticated channel doing
+# authorisation: nothing ties the key to a node identity, nothing stops a typo, and
+# nothing revokes it. Binding the key into a CA-signed cert makes peer registration a
+# signature check instead of an act of faith, and makes revocation "stop renewing".
+#
+# WHY GRANTS ARE IN THE CERT RATHER THAN A SIDE TABLE. The grant travels with the
+# identity and is signed by the same authority, so a node cannot present a valid identity
+# and a forged capability. The cost — noted in the design spec as an open question — is
+# that changing a grant requires reissuance. With short-lived certs that is a renewal,
+# not an outage.
+#
+# THE OID ARC BELOW IS A PLACEHOLDER AND IS NOT REGISTERED. 1.3.6.1.4.1.99999 is not an
+# IANA Private Enterprise Number. It is fine for certificates that never leave this
+# organisation's own CA, which is the current design, but it MUST be replaced with a real
+# PEN arc before these certs are trusted by anything outside it. The extension is
+# non-critical so any standard tool simply ignores it.
+_OID_ARC = "1.3.6.1.4.1.99999"
+OID_NODE_INFO = x509.ObjectIdentifier(f"{_OID_ARC}.1.1")
+
+_NODE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
+_WG_KEY_RE = re.compile(r"^[A-Za-z0-9+/]{42}[A-Za-z0-9+/=]{1,2}$")
+
+
+@dataclass(frozen=True)
+class NodeGrants:
+    """What a node is permitted to be assigned. Absent/empty means "nothing", not "all".
+
+    Fail-closed by construction: a cert issued without grants authorises no work, so
+    forgetting to set them produces an idle node rather than an unrestricted one.
+    """
+
+    engines: tuple[str, ...] = ()
+    tiers: tuple[str, ...] = ()
+    #: May this node hold provider credentials (a local VPN/proxy sidecar)? A
+    #: global-mode worker node should be issued False — it forwards over the overlay and
+    #: has no business holding a profile.
+    credentials: bool = False
+
+    def allows_engine(self, engine: str) -> bool:
+        return engine in self.engines
+
+    def allows_tier(self, tier: str) -> bool:
+        return tier in self.tiers
+
+
+@dataclass(frozen=True)
+class NodeIdentity:
+    """A verified node cert, parsed. Produced only by :func:`node_identity`."""
+
+    node_id: str
+    wg_pubkey: str
+    grants: NodeGrants
+    not_after: datetime.datetime
+
+    @property
+    def expired(self) -> bool:
+        return _now() >= self.not_after
+
+
+def _node_info_bytes(node_id: str, wg_pubkey: str, grants: NodeGrants) -> bytes:
+    return json.dumps({
+        "v": 1,
+        "node_id": node_id,
+        "wg": wg_pubkey,
+        "engines": list(grants.engines),
+        "tiers": list(grants.tiers),
+        "credentials": grants.credentials,
+    }, separators=(",", ":"), sort_keys=True).encode()
 _UTC = datetime.timezone.utc
 
 
@@ -125,6 +206,44 @@ class CertAuthority:
         cert = self._sign(cn, key.public_key(), [], server=False, client=True, days=days)
         return IssuedCert(cert.public_bytes(serialization.Encoding.PEM), _key_pem(key))
 
+    def issue_node(self, node_id: str, *, wg_pubkey: str,
+                   grants: NodeGrants | None = None, days: int = 7) -> IssuedCert:
+        """A NODE cert: identity + its WireGuard public key + its grants.
+
+        ``days`` is short on purpose. Revocation for federation is "stop renewing", which
+        needs no CRL distribution and no online check on the hot path — but that only
+        bounds exposure if the lifetime is short. A week is the upper end of sensible.
+
+        The cert gets CLIENT_AUTH so the same identity can authenticate the node to the
+        control plane; it is not a server cert and carries no SANs.
+        """
+        if not _NODE_ID_RE.match(node_id):
+            raise ValueError(
+                f"invalid node id {node_id!r}: lowercase letters, digits, dot, dash, "
+                "underscore; 1-63 chars")
+        if not _WG_KEY_RE.match(wg_pubkey.strip()):
+            raise ValueError("wg_pubkey is not a base64 WireGuard public key")
+        grants = grants or NodeGrants()
+        key = ec.generate_private_key(ec.SECP256R1())
+        builder = (
+            x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, node_id)]))
+            .issuer_name(self._cert.subject)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_now() - datetime.timedelta(minutes=5))
+            .not_valid_after(_now() + datetime.timedelta(days=days))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]),
+                           critical=False)
+            .add_extension(
+                x509.UnrecognizedExtension(
+                    OID_NODE_INFO, _node_info_bytes(node_id, wg_pubkey.strip(), grants)),
+                critical=False)
+        )
+        cert = builder.sign(self._key, hashes.SHA256())
+        return IssuedCert(cert.public_bytes(serialization.Encoding.PEM), _key_pem(key))
+
     def sign_csr(self, csr_pem: bytes, *, days: int = 2) -> bytes:
         """Sign a worker-generated CSR (Phase 2: the worker's key never leaves the box). SANs are taken
         from the CSR; a bad signature is rejected. Returns the server cert PEM."""
@@ -147,6 +266,71 @@ class CertAuthority:
             raise ValueError("server CSR has no SubjectAlternativeName; refusing to issue a SAN-less server cert")
         cert = self._sign(cn, csr.public_key(), sans, server=True, client=False, days=days)
         return cert.public_bytes(serialization.Encoding.PEM)
+
+
+def node_identity(ca: CertAuthority, cert_pem: bytes,
+                  *, allow_expired: bool = False) -> NodeIdentity:
+    """Verify a node cert against ``ca`` and return its identity, or raise.
+
+    THIS IS THE AUTHORISATION CHECK, so it does the whole job rather than parsing
+    hopefully:
+
+    * the CA's signature is verified — an unsigned or foreign cert is rejected, which is
+      the entire point of replacing a pasted public key;
+    * expiry is enforced, because "stop renewing" is the revocation mechanism and an
+      unchecked expiry silently disables it;
+    * the CN and the extension's ``node_id`` must agree, so the human-readable subject
+      cannot say one thing while the authorising payload says another.
+    """
+    cert = x509.load_pem_x509_certificate(cert_pem)
+    ca_pub = x509.load_pem_x509_certificate(ca.cert_pem).public_key()
+    if not isinstance(ca_pub, ec.EllipticCurvePublicKey):
+        # This CA only ever generates P-256 (`_generate_ca`), but `import_ca` accepts an
+        # externally-produced one. Say so rather than fall through to a confusing
+        # attribute error at verification time.
+        raise ValueError(
+            f"this CA's key is {type(ca_pub).__name__}, not EC; node-cert verification "
+            "here only implements ECDSA")
+    algo = cert.signature_hash_algorithm
+    if algo is None:
+        raise ValueError("node certificate has no signature hash algorithm")
+    try:
+        ca_pub.verify(cert.signature, cert.tbs_certificate_bytes, ec.ECDSA(algo))
+    except Exception as exc:
+        raise ValueError(f"node certificate is not signed by this CA: {exc}") from exc
+
+    not_after = cert.not_valid_after_utc
+    if not allow_expired and _now() >= not_after:
+        raise ValueError(f"node certificate expired at {not_after.isoformat()}")
+
+    try:
+        raw = cert.extensions.get_extension_for_oid(OID_NODE_INFO).value.public_bytes()
+    except x509.ExtensionNotFound as exc:
+        raise ValueError("certificate carries no node-info extension — not a node cert") from exc
+    try:
+        info = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"node-info extension is not valid JSON: {exc}") from exc
+    if info.get("v") != 1:
+        raise ValueError(f"unsupported node-info version {info.get('v')!r}")
+
+    cn = next((str(a.value) for a in cert.subject
+               if a.oid == NameOID.COMMON_NAME), None)
+    node_id = str(info.get("node_id", ""))
+    if cn != node_id:
+        raise ValueError(
+            f"subject CN {cn!r} does not match the node id {node_id!r} in the extension")
+    wg = str(info.get("wg", ""))
+    if not _WG_KEY_RE.match(wg):
+        raise ValueError("node-info extension carries no valid WireGuard public key")
+    return NodeIdentity(
+        node_id=node_id, wg_pubkey=wg, not_after=not_after,
+        grants=NodeGrants(
+            engines=tuple(info.get("engines") or ()),
+            tiers=tuple(info.get("tiers") or ()),
+            credentials=bool(info.get("credentials", False)),
+        ),
+    )
 
 
 def _key_pem(key: ec.EllipticCurvePrivateKey) -> bytes:

@@ -721,6 +721,40 @@ def _pki_cmd(args: argparse.Namespace) -> int:
         out.write_bytes(cert_pem)
         print(f"signed server cert ({args.days}d) -> {out}")
         return 0
+    if args.pki_action == "issue-node":
+        from blastbox.host.pki import NodeGrants
+        grants = NodeGrants(engines=tuple(args.engine), tiers=tuple(args.tier),
+                            credentials=bool(args.credentials))
+        issued = ca.issue_node(args.node_id, wg_pubkey=args.wg_pubkey,
+                               grants=grants, days=args.days)
+        if args.out:
+            crt, key = issued.write(Path(args.out).parent or pki_dir, Path(args.out).name)
+            print(f"node cert for {args.node_id} ({args.days}d) -> {crt} / {key}")
+        else:
+            crt, key = issued.write(pki_dir, f"node-{args.node_id}")
+            print(f"node cert for {args.node_id} ({args.days}d) -> {crt} / {key}")
+        if not grants.engines and not grants.tiers:
+            # Fail-closed defaults are correct but silently useless; say so once here
+            # rather than let an operator debug an idle node.
+            print("  NOTE: no --engine/--tier granted, so this node is authorised for "
+                  "nothing. Reissue with grants when you want it to take work.")
+        print(f"  grants: engines={list(grants.engines)} tiers={list(grants.tiers)} "
+              f"credentials={grants.credentials}")
+        return 0
+    if args.pki_action == "show-node":
+        from blastbox.host.pki import node_identity
+        try:
+            ident = node_identity(ca, Path(args.cert).read_bytes(), allow_expired=True)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps({
+            "node_id": ident.node_id, "wg_pubkey": ident.wg_pubkey,
+            "engines": list(ident.grants.engines), "tiers": list(ident.grants.tiers),
+            "credentials": ident.grants.credentials,
+            "not_after": ident.not_after.isoformat(), "expired": ident.expired,
+        }, indent=2))
+        return 1 if ident.expired else 0
     if args.pki_action == "show-ca":
         print((pki_dir / "ca.crt").read_text(), end="")
         return 0
@@ -846,9 +880,32 @@ def _egress_cmd_inner(args: argparse.Namespace) -> int:
 
     if action == "peer-add":
         cfg = cfg_from(args)
-        added = ea.add_peer(cfg, args.name, args.peer_ip, args.public_key)
-        print(f"  peer {args.name} {'added' if added else 'already present'} at {args.peer_ip}/32")
-        print("  only the public key was supplied — no private key changed hands")
+        if args.cert:
+            from blastbox.host.pki import load_ca, node_identity
+            try:
+                ident = node_identity(load_ca(Path(args.pki_dir)),
+                                      Path(args.cert).read_bytes())
+            except (ValueError, FileNotFoundError) as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+            name, pubkey = ident.node_id, ident.wg_pubkey
+            provenance = (f"identity and key verified against the CA "
+                          f"(expires {ident.not_after.date()})")
+            if args.name and args.name != name:
+                print(f"error: --name {args.name!r} contradicts the cert's identity "
+                      f"{name!r}", file=sys.stderr)
+                return 1
+        elif args.public_key and args.name:
+            name, pubkey = args.name, args.public_key
+            provenance = "UNAUTHENTICATED raw key — nothing ties it to a node identity"
+        else:
+            print("error: give --cert (preferred), or both --name and --public-key",
+                  file=sys.stderr)
+            return 2
+        added = ea.add_peer(cfg, name, args.peer_ip, pubkey)
+        print(f"  peer {name} {'added' if added else 'already present'} at {args.peer_ip}/32")
+        print(f"  {provenance}")
+        print("  no private key changed hands")
         return 0
 
     if action == "peer":
@@ -930,6 +987,25 @@ def build_parser() -> argparse.ArgumentParser:
     pk_csr.add_argument("--csr", required=True, help="path to the CSR PEM")
     pk_csr.add_argument("--out", default=None, help="output cert path (default: <csr>.crt)")
     pk_csr.add_argument("--days", type=int, default=30)
+    pk_node = pks.add_parser(
+        "issue-node",
+        help="mint a NODE cert: identity + its WireGuard key + its grants")
+    pk_node.add_argument("--node-id", required=True,
+                         help="the machine's identity (lowercase, 1-63 chars)")
+    pk_node.add_argument("--wg-pubkey", required=True,
+                         help="the node's WireGuard PUBLIC key (printed by `egress peer`)")
+    pk_node.add_argument("--engine", action="append", default=[],
+                         help="engine this node may be assigned (repeatable; default none)")
+    pk_node.add_argument("--tier", action="append", default=[],
+                         help="netpolicy tier this node may be assigned (repeatable)")
+    pk_node.add_argument("--credentials", action="store_true",
+                         help="this node may hold provider credentials (a local VPN/proxy "
+                              "sidecar). Leave OFF for a global-mode worker node.")
+    pk_node.add_argument("--days", type=int, default=7,
+                         help="short by design: revocation is 'stop renewing'")
+    pk_node.add_argument("--out", default=None, help="write <out>.crt/.key (default: stdout)")
+    pk_show = pks.add_parser("show-node", help="verify a node cert and print its identity")
+    pk_show.add_argument("--cert", required=True)
     pks.add_parser("show-ca", help="print the CA cert (public trust anchor)")
     pk_imp = pks.add_parser(
         "import-ca", help="install a pre-generated CA (share one root across hosts / a worker pool)")
@@ -999,10 +1075,20 @@ def build_parser() -> argparse.ArgumentParser:
     pes.add_parser("gateway-exit", parents=[common],
                    help="exit host: route peer traffic into the local sidecar")
     pe_pa = pes.add_parser("peer-add", parents=[common],
-                           help="exit host: register a peer's PUBLIC key")
-    pe_pa.add_argument("--name", required=True)
+                           help="exit host: register a peer from its NODE CERT (preferred) "
+                                "or a raw public key")
+    pe_pa.add_argument("--cert", default=None,
+                       help="the peer's node cert. Its identity and WireGuard key are "
+                            "taken from the CA-signed payload, so registration is a "
+                            "signature check rather than trust in a pasted string.")
+    pe_pa.add_argument("--name", default=None,
+                       help="peer name (taken from the cert when --cert is used)")
     pe_pa.add_argument("--peer-ip", required=True)
-    pe_pa.add_argument("--public-key", required=True)
+    pe_pa.add_argument("--public-key", default=None,
+                       help="LEGACY: a raw WireGuard public key, unauthenticated. Prefer "
+                            "--cert; this is kept for nodes not yet enrolled.")
+    pe_pa.add_argument("--pki-dir", default=os.environ.get(
+        "BLASTBOX_PKI_DIR", "/var/lib/blastbox/pki"))
     pe_pr = pes.add_parser("peer", parents=[common],
                            help="worker node: join the overlay (generates its own key)")
     pe_pr.add_argument("--peer-ip", required=True)

@@ -288,18 +288,36 @@ source route exists):
 ```sh
 # 1. exit host — already runs the sidecars
 sudo blastbox egress gateway                       # prints its public key
-sudo blastbox egress peer-add --name toolz3 --peer-ip 10.77.0.3 --public-key <peer's own>
-sudo blastbox egress gateway-exit
+sudo blastbox egress gateway-exit                  # records the exit role; replayed at boot
 
-# 2. worker node — generates its own key; the private half never travels
+# 2. enrol the peer: its identity, WireGuard key and grants in one CA-signed cert
+sudo blastbox pki issue-node --node-id toolz3 --wg-pubkey <the peer's public key> \
+     --engine boxjs --tier openvpn --tier wireguard
+sudo blastbox egress peer-add --peer-ip 10.77.0.3 --cert /var/lib/blastbox/pki/node-toolz3.crt
+
+# 3. worker node — generates its own key; the private half never travels
 sudo blastbox egress peer --peer-ip 10.77.0.3 \
      --gateway-addr <exit host> --gateway-pubkey <exit host public key>
 sudo blastbox egress apply --mode global --upstream-gw 10.77.0.1
 
-# 3. prove it — including that killing the overlay removes egress
+# 4. prove it — including that killing the overlay removes egress
 sudo blastbox egress check
 sudo scripts/test-egress-leak.sh --mode global --gateway-ip 172.31.0.10
 ```
+
+**Peers are registered from a CA-signed node cert, not a pasted key.** `pki issue-node`
+binds three things into one signed object: the node's identity, its WireGuard public key,
+and its **grants** — which engines and netpolicy tiers it may be assigned, and whether it
+may hold provider credentials at all. `peer-add --cert` then verifies the CA signature and
+takes the identity and key from the payload, so registering a peer is a signature check
+rather than trust in a string an operator retyped. Grants default to **nothing**, so a cert
+issued without them produces an idle node rather than an unrestricted one, and revocation is
+"stop renewing" — which is why the default lifetime is a week.
+
+`--name`/`--public-key` still work for nodes not yet enrolled, and say plainly that the key
+is unauthenticated. The certificate's node-info extension uses a **placeholder OID arc that
+is not an IANA Private Enterprise Number**; it is fine while these certs never leave this
+CA, and must be replaced before they do. Design context: `docs/superpowers/specs/2026-09-15-federated-node-identity-and-placement.md`.
 
 `apply` is **idempotent** (every step is guarded or best-effort) and installs
 `blastbox-egress.service`, which re-applies at boot. That unit is not optional bookkeeping:
