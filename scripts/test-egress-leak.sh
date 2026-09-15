@@ -75,7 +75,7 @@ wired_exit_ip() {
 if [[ "$TEST_MODE" == global ]]; then
   echo "== global (overlay) mode: gateway ${GATEWAY_IP}, overlay ${WG_IF} =="
   docker network inspect "$BB_VPN" >/dev/null 2>&1 || {
-    echo "ERROR: $BB_VPN missing — run `blastbox egress apply --mode global` first" >&2; exit 1; }
+    echo "ERROR: $BB_VPN missing — run 'blastbox egress apply --mode global' first" >&2; exit 1; }
 
   echo "== G1. the forwarder is genuinely healthy, not crash-looping =="
   rc="$(docker inspect -f '{{.RestartCount}}' bb-egress-forwarder 2>/dev/null || echo missing)"
@@ -132,7 +132,7 @@ if [[ "$TEST_MODE" == global ]]; then
 fi
 
 docker network inspect "$BB_SOCKS" >/dev/null 2>&1 || {
-  echo "ERROR: $BB_SOCKS missing — run `blastbox egress apply` first" >&2; exit 1; }
+  echo "ERROR: $BB_SOCKS missing — run 'blastbox egress apply' first" >&2; exit 1; }
 
 echo "== 1. fail-closed: worker on the internal bridge, NOT wired =="
 # --network is INTERNAL, so docker installs no default route off the box. A success

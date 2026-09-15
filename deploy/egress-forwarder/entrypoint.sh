@@ -7,16 +7,25 @@
 # (10.77.0.1) is not on-link from inside a docker bridge, and the kernel rejects a `via`
 # whose gateway it cannot reach directly ("Nexthop has invalid gateway"). So the packet
 # path is: worker -> us (172.31.0.10) -> our uplink next hop = the NODE -> the node
-# source-routes us into wg. The node-side `ip rule`/DROP pair installed by
-# install-wg-overlay.sh --peer-forwarder is the enforcement; we are the plumbing.
+# source-routes us into wg. The node-side ip rule/DROP pair installed by
+# 'blastbox egress apply --mode global' (blastbox.host.egress.forwarder_source_route_steps)
+# is the enforcement; we are the plumbing.
 #
 # WHICH MEANS WE MUST NOT TRUST OUR OWN UPLINK. Left alone, our default route reaches the
 # node's WAN — precisely the leak the tier exists to prevent. Two things stop that:
 #   1. FORWARD policy DROP first, before any route is touched.
-#   2. A startup gate: we must be able to reach the overlay peer. Only the node's source
-#      route can make that succeed, so reachability is a positive proof that node-side
-#      enforcement is live. If it fails we EXIT, leaving nothing at the gateway address —
-#      the worker's default route then points at a dead IP and the tier is closed.
+#   2. A startup gate: we must be able to reach the overlay peer. If it fails we EXIT,
+#      leaving nothing at the gateway address — the worker's default route then points
+#      at a dead IP and the tier is closed.
+#      WHAT THIS GATE DOES **NOT** PROVE: that node-side enforcement is installed. The
+#      peer address is inside the overlay prefix, and the node's priority-99
+#      "to <overlay> lookup main" rule sorts AHEAD of the source route, the blackhole
+#      guard and the BB-WG-FWD chain — so this probe is resolved out of the main table
+#      without consulting any of them. It proves the TUNNEL is up, nothing more. The
+#      node checks containment itself, from where the rules are visible:
+#      blastbox.host.egress_apply.enforcement_present. Do not re-describe this gate as
+#      a containment proof; an earlier version of this comment did, and the claim was
+#      false in a way that made a degraded node report healthy.
 # Failing to start is the correct outcome. A forwarder that comes up without the node
 # rules is a forwarder that quietly NATs malware onto the node's WAN.
 #

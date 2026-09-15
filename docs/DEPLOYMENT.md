@@ -245,9 +245,12 @@ kill-switch for `direct` / `inetsim`, which attach to their own self-contained `
 pointing at a proxy sidecar — those don't depend on netd's routing.)
 
 **Prerequisites** (the overlay needs more than just the netd process):
-- **Pre-create the internal docker bridges** the dispatcher attaches wired workers to:
-  `docker network create --internal bb-socks` (socks/tor), `bb-vpn` (openvpn/wireguard),
-  `bb-inspect`; plus `bb-net0` (`direct`) / `bb-fakenet` (`inetsim`) if you use those.
+- **Create the bridges with `sudo blastbox egress apply`** — it creates `bb-socks`
+  (socks/tor), `bb-vpn` (openvpn/wireguard), `bb-net0` (`direct`) and `bb-fakenet`
+  (`inetsim`), and relocates any whose default subnet collides with something already on
+  the host (see *Two exit modes* below). Do **not** hand-create these: a hand-pinned
+  bridge is adopted as-is, which silently discards that collision avoidance.
+  `bb-inspect` is still manual: `docker network create --internal bb-inspect`.
 - **Use the `runc` runtime for netd-wired tiers.** netd needs a **host-visible netns** to wire the
   worker, so the dispatcher refuses `tor`/`socks`/`openvpn`/`wireguard`/route-inspected jobs unless
   the runtime is `runc` (gVisor/FC hide the netns). Set `BLASTBOX_ALLOW_RUNC=1` accordingly.

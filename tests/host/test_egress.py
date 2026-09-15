@@ -233,12 +233,29 @@ def test_forwarder_starts_on_the_routable_bridge_first():
 
 # -------------------------------------------------------------------------- idempotence
 
-def test_chain_jumps_are_guarded_so_reapply_does_not_stack_duplicates():
+def test_chain_jumps_are_re_hoisted_to_position_1_not_merely_confirmed():
+    """`iptables -C` matches at ANY index, so an existence guard is position-blind.
+
+    Docker re-inserts DOCKER-USER/DOCKER-FORWARD at the head of FORWARD on every daemon
+    start, and DOCKER-FORWARD holds a terminal ACCEPT for the non-internal bb-net0
+    bridge. Once our jump is below that, the chain's `-j DROP` is dead code and no
+    re-apply could ever hoist it back. So the jump must be delete-then-insert-at-1, and
+    the delete must repeat to collapse any duplicates an older state left.
+    """
     for steps in (forwarder_source_route_steps(GLOBAL, "eth0"),
                   exit_host_steps(GLOBAL, "br-x")):
+        text = _argvs(steps)
+        inserts = [c for c in text if c.startswith("iptables -I FORWARD 1")]
+        assert inserts, "expected the jump to be inserted at position 1"
+        for ins in inserts:
+            chain = ins.split()[-1]
+            dels = [c for c in text if c.startswith("iptables -D FORWARD") and c.endswith(chain)]
+            assert len(dels) >= 2, f"{chain}: need repeated deletes to collapse duplicates"
+            # and every delete must precede the insert
+            assert text.index(ins) > max(text.index(d) for d in dels)
         for st in steps:
-            if "-I" in st.argv and "FORWARD" in st.argv:
-                assert st.guard is not None and "-C" in st.guard
+            if st.argv[:4] == ("iptables", "-I", "FORWARD", "1"):
+                assert st.guard is None, "an existence guard would defeat the re-hoist"
 
 
 def test_rule_adds_are_preceded_by_a_delete():
@@ -394,3 +411,146 @@ def test_apply_survives_an_unwritable_unit_path(monkeypatch, tmp_path):
                         lambda *a, **k: (_ for _ in ()).throw(OSError(30, "Read-only file system")))
     msg = ea.install_persistence_unit()
     assert "NOT installed" in msg and "Read-only" in msg
+
+
+
+# --------------------------------------------------- health must assert containment
+
+def test_health_fails_when_enforcement_rules_are_absent(monkeypatch):
+    """The forwarder's gate pings the overlay peer, which is INSIDE overlay_net — so it
+    matches the priority-99 `lookup main` rule and never consults the source route, the
+    blackhole or the DROP chain. A node can pass its gate with containment entirely
+    deleted, so health has to check the rules from the host instead of trusting it."""
+    from blastbox.host import egress_apply as ea
+
+    monkeypatch.setattr(ea, "_run", lambda argv, **k: type(
+        "P", (), {"returncode": 0, "stdout": "", "stderr": ""})())
+    ok, why = ea.enforcement_present(GLOBAL)
+    assert not ok
+    for expected in ("source route", "blackhole", "DROP"):
+        assert expected in why
+
+
+def test_health_passes_when_every_enforcement_rule_is_present(monkeypatch):
+    from blastbox.host import egress_apply as ea
+
+    rules = (f"100:\tfrom {GLOBAL.forwarder_uplink_ip} lookup {GLOBAL.rt_table}\n"
+             f"101:\tfrom {GLOBAL.forwarder_uplink_ip} blackhole\n")
+
+    def fake(argv, **k):
+        out = rules if argv[:3] == ["ip", "rule", "show"] else "-A BB-WG-FWD -j DROP"
+        return type("P", (), {"returncode": 0, "stdout": out, "stderr": ""})()
+
+    monkeypatch.setattr(ea, "_run", fake)
+    ok, why = ea.enforcement_present(GLOBAL)
+    assert ok, why
+
+
+def test_the_overlay_probe_cannot_prove_containment():
+    """Pin the reason the gate is insufficient, so nobody 'simplifies' health back to it.
+
+    The gate's target is the upstream gateway, and that address is inside overlay_net —
+    the prefix the priority-99 rule sends to the main table ahead of every enforcement
+    rule."""
+    import ipaddress
+
+    assert ipaddress.ip_address(GLOBAL.upstream_gw) in ipaddress.ip_network(GLOBAL.overlay_net)
+    assert PRIO_OVERLAY_MAIN < PRIO_LOOKUP
+
+
+def test_teardown_disarms_the_dispatch_gate(monkeypatch, tmp_path):
+    """Leaving egress.env behind keeps the dispatch gate armed on a node with no tier —
+    every egress job deferred forever — and ConditionPathExists resurrects the tier at
+    the next boot."""
+    from blastbox.host import egress_apply as ea
+
+    marker = tmp_path / "egress.env"
+    marker.write_text("BLASTBOX_EGRESS_MODE=global\n")
+    monkeypatch.setattr(ea, "ENV_FILE", marker)
+    monkeypatch.setattr(ea, "_run", lambda argv, **k: type(
+        "P", (), {"returncode": 0, "stdout": "", "stderr": ""})())
+    monkeypatch.setattr(ea, "run_steps", lambda steps, **k: [])
+    monkeypatch.setattr(ea, "_ok", lambda argv: False)
+    notes = ea.teardown_node(GLOBAL)
+    assert not marker.exists()
+    assert any("disarmed" in n for n in notes)
+
+
+def test_persisted_config_is_what_the_dispatcher_probes_with(monkeypatch, tmp_path):
+    """The gate arms on egress.env's existence, so it must probe with its CONTENT.
+    Reading os.environ instead gave the class defaults — and on a relocated node that
+    means pinging an address nothing holds."""
+    from blastbox.host import egress_apply as ea
+
+    marker = tmp_path / "egress.env"
+    marker.write_text("# comment\nBLASTBOX_EGRESS_MODE=global\n"
+                      "BLASTBOX_EGRESS_UPSTREAM_GW=10.77.0.1\n"
+                      "BLASTBOX_EGRESS_VPN_SUBNET=10.88.0.0/16\n"
+                      "BLASTBOX_EGRESS_VPN_GATEWAY_IP=10.88.0.10\n")
+    monkeypatch.setattr(ea, "ENV_FILE", marker)
+    cfg = ea.persisted_config()
+    assert cfg.mode == "global"
+    assert cfg.vpn_gateway_ip == "10.88.0.10"
+
+
+def test_start_forwarder_checks_the_image_before_destroying_the_running_one(monkeypatch):
+    """Removing first turned a working, gate-passed forwarder into no forwarder at all
+    on a node whose image tag had been pruned — and the boot unit retries every 30s."""
+    from blastbox.host import egress_apply as ea
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(ea, "_ok", lambda argv: not (argv[:3] == ["docker", "image", "inspect"]))
+    monkeypatch.setattr(ea, "_run", lambda argv, **k: calls.append(list(argv)))
+    with pytest.raises(RuntimeError, match="is missing"):
+        ea.start_forwarder(GLOBAL)
+    assert not any(c[:3] == ["docker", "rm", "-f"] for c in calls), \
+        "the running forwarder was destroyed before the image check"
+
+
+def test_the_persistence_unit_is_generated_not_read_from_deploy():
+    """A wheel ships no deploy/ tree, so reading the unit off disk always took the
+    'not found' branch on a pip-installed node — the reboot fix was inert on exactly
+    the installs that needed it. The shipped copy must match the generated one."""
+    from pathlib import Path as _P
+
+    from blastbox.host.egress import persistence_unit
+
+    shipped = _P(__file__).resolve().parents[2] / "deploy" / "systemd" / "blastbox-egress.service"
+    assert shipped.read_text() == persistence_unit("/usr/local/bin/blastbox egress apply")
+
+
+def test_the_generated_unit_carries_its_load_bearing_directives():
+    from blastbox.host.egress import persistence_unit
+
+    body = persistence_unit("/x/python -m blastbox.host.cli egress apply", "bbwg9")
+    assert "ExecStart=/x/python -m blastbox.host.cli egress apply" in body
+    # Ordering after wg-quick: the source route needs the interface to exist.
+    assert "After=docker.service network-online.target wg-quick@bbwg9.service" in body
+    # Wants, not Requires — a local-mode node has no overlay and must still run.
+    assert "Requires=docker.service" in body and "Wants=network-online.target" in body
+    assert "ConditionPathExists=/etc/blastbox/egress.env" in body
+
+
+def test_adopting_a_relocated_bridge_carries_its_gateway_along(monkeypatch):
+    """Replacing vpn_subnet while leaving vpn_gateway_ip in the OLD range makes
+    EgressConfig's validator raise from inside the planner — an uncaught ValueError that
+    the boot unit repeats every 30s. Reproduced on a live node whose bridges had been
+    relocated to 10.31.0.0/16 while the config still said 172.31.0.10."""
+    from blastbox.host import egress_apply as ea
+
+    live = {"bb-net0": "10.29.0.0/16", "bb-fakenet": "10.28.100.0/24",
+            "bb-socks": "10.30.0.0/16", "bb-vpn": "10.31.0.0/16"}
+
+    def fake_run(argv, **k):
+        out = ""
+        if argv[:3] == ["docker", "network", "inspect"]:
+            out = live.get(argv[3], "")
+            return type("P", (), {"returncode": 0 if out else 1, "stdout": out, "stderr": ""})()
+        return type("P", (), {"returncode": 1, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(ea, "_run", fake_run)
+    monkeypatch.setattr(ea, "claimed_cidrs", lambda: list(live.values()))
+    plan = ea.plan_subnets(EgressConfig())          # defaults say 172.31.0.10
+    assert plan.config.vpn_subnet == "10.31.0.0/16"
+    assert plan.config.vpn_gateway_ip == "10.31.0.10"   # offset preserved, not stale
+    assert plan.config.forwarder_uplink_ip == "10.29.0.10"

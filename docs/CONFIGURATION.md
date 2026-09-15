@@ -443,6 +443,39 @@ consumer sets** (often mapped from its *own* env, e.g. win-validator's `AUTHENTI
 | `BLASTBOX_ENGINE_<NAME>_RESERVED_KEYS` | unset | Extra param keys **dropped unconditionally** (cold **and** warm), unioned into the engine's built-in `reserved_param_keys` floor. For knobs that must *never* be client/job-settable because they're RCE-adjacent — a JVM engine's `JAVA_BIN`/`JAVA_OPTS`/`WORKER_JAR`, a sandbox-downgrade switch. Keys are upper-cased and stripped **before** the `_PARAM_KEYS` allowlist is applied, so a reserved key can't be re-admitted by also listing it. The framework core carries **no** hardcoded `CLIPPYSHOT_*`/engine-specific reserved keys — each engine declares its own floor (via `EngineSpec.reserved_param_keys`) and the operator extends it here. e.g. `BLASTBOX_ENGINE_REDTUSK_RESERVED_KEYS=JAVA_BIN,JAVA_OPTS,WORKER_JAR`. |
 | `BLASTBOX_ENGINE_<NAME>_ALLOWED_RUNTIMES` | unset (any tier) | Comma-list of dispatcher **tiers** this engine may run on, from the canonical vocabulary `cold` / `firecracker` / `gvisor` / `libvirt-vm` / `aws-ec2` / `aws-ec2-hibernate` / `aws-lambda-microvm` / `aws-lambda-snapstart` / `static` / `cascade`. **Unset or empty ⇒ any tier.** Set ⇒ the dispatcher **refuses to start** (before the pool spawns any slot) if its own tier — `cold`, or `BLASTBOX_POOL_RUNTIME` — isn't listed, so a runtime misconfig can't silently route a locally-vetted engine onto a public-AWS/remote worker with a different egress posture. Must list **every** tier the engine is meant to run on (fail-closed). An unknown tier name is a hard error. e.g. `BLASTBOX_ENGINE_CLIPPYSHOT_ALLOWED_RUNTIMES=cold,firecracker,gvisor`. |
 
+
+### Node egress tier (`blastbox egress`)
+
+Written to `/etc/blastbox/egress.env` by `blastbox egress apply` and read back by the
+boot unit **and by the dispatcher's health gate**. Contains no credentials by design.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BLASTBOX_EGRESS_MODE` | `local` | `local` = this node runs its own credentialed exit sidecars; `global` = credential-free forwarder over the wg overlay to a central exit host |
+| `BLASTBOX_EGRESS_VPN_GATEWAY_IP` | `172.31.0.10` | the gateway address workers route to — **identical in both modes**; must match each personality's `gateway=` |
+| `BLASTBOX_EGRESS_VPN_SUBNET` | `172.31.0.0/16` | bb-vpn (openvpn/wireguard workers) |
+| `BLASTBOX_EGRESS_SOCKS_SUBNET` | `172.30.0.0/16` | bb-socks (socks/tor/httpproxy workers) |
+| `BLASTBOX_EGRESS_NET0_SUBNET` | `172.29.0.0/16` | bb-net0 (`direct`; also the forwarder's uplink) |
+| `BLASTBOX_EGRESS_FAKENET_SUBNET` | `172.28.100.0/24` | bb-fakenet (`inetsim`) |
+| `BLASTBOX_EGRESS_FORWARDER_UPLINK_IP` | `172.29.0.10` | global mode: the forwarder's **static** uplink address; the node-side source route keys on it |
+| `BLASTBOX_EGRESS_UPSTREAM_GW` | — | global mode: overlay IP of the central exit host (required) |
+| `BLASTBOX_EGRESS_OVERLAY_NET` / `_OVERLAY_GW` | `10.77.0.0/24` / `10.77.0.1` | the WireGuard overlay |
+| `BLASTBOX_EGRESS_WG_IF` / `_WG_PORT` | `bbwg0` / `51821` | overlay interface and listen port |
+| `BLASTBOX_EGRESS_FORWARDER_IMAGE` | `blastbox-egress-forwarder:dev` | must exist; `apply` refuses rather than build it |
+
+Any bridge `apply` relocates carries its pinned addresses with it, so after a
+reallocation **update every personality's `gateway=`** to the new
+`BLASTBOX_EGRESS_VPN_GATEWAY_IP` — they are separate sources of truth and nothing
+reconciles them.
+
+Dispatcher-side knobs (not written to the file):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BLASTBOX_EGRESS_HEALTH_GATE` | auto | `1`/`0` forces the defer-on-degraded gate on or off. Auto = armed only when `/etc/blastbox/egress.env` exists |
+| `BLASTBOX_EGRESS_HEALTH_TTL_S` | `15` | how long a health verdict is cached |
+| `BLASTBOX_EGRESS_DEFER_MAX_S` | `600` | after this long still degraded, a deferred job is FAILED with the health reason instead of deferring forever |
+
 ## Network policy / egress overlay (netpolicy)
 
 Egress control has two layers: the **dispatcher** resolves a per-job *personality* (a named egress policy) and picks the worker's Docker `--network`; the privileged **`blastbox-netd`** helper (a host systemd unit, out-of-band from the cap-dropped dispatcher) wires the actual exit — netns TUN + tun2socks, host REDIRECT → tor, a VPN gateway route, or an MITM inspect gateway. Everything is **fail-closed**: unset/malformed knobs leave the worker with **no route out**, and the whole feature is inert until an operator declares a personality.

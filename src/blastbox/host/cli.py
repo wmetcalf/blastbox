@@ -778,14 +778,19 @@ def _egress_cmd_inner(args: argparse.Namespace) -> int:
     from blastbox.host.egress import EgressConfig
 
     def cfg_from(args: argparse.Namespace) -> EgressConfig:
-        base = EgressConfig.from_env()
+        # The node's PERSISTED config is the base, not bare os.environ. `check`/`health`
+        # on a managed node must describe that node — reading the environment alone
+        # reported a global-mode node as local and probed the default gateway address,
+        # which on a relocated node is an address nothing holds. Explicit flags and
+        # environment still override, so an operator can inspect a hypothetical.
+        base = ea.persisted_config()
         over: dict[str, object] = {}
         for attr, fieldname in (("mode", "mode"), ("upstream_gw", "upstream_gw"),
                                 ("gateway_ip", "vpn_gateway_ip"), ("wg_iface", "wg_iface")):
             v = getattr(args, attr, None)
             if v:
                 over[fieldname] = v
-        return replace(base, **over) if over else base
+        return replace(base, **over) if over else base  # type: ignore[arg-type]
 
     # A misconfiguration is an operator error, not a crash. EgressConfig validates hard
     # (an off-subnet gateway, a global node with no upstream) precisely so these are
@@ -948,36 +953,51 @@ def build_parser() -> argparse.ArgumentParser:
     pe = sub.add_parser(
         "egress",
         help="set up this node's egress tier (bridges, local or global exit, wg overlay)")
-    pe.add_argument("--mode", choices=("local", "global"), default=None,
-                    help="local: this node runs its own credentialed exit sidecars. "
-                         "global: this node holds no credentials and forwards over the "
-                         "wg overlay to the central exit host. The gateway ADDRESS is "
-                         "identical either way.")
-    pe.add_argument("--gateway-ip", default=None, help="override the gateway address")
-    pe.add_argument("--wg-iface", default=None)
+    # Common options live on a PARENT parser that every action inherits, not on the
+    # `egress` parser itself. argparse hands everything after the action verb to the
+    # sub-parser, so an option declared only on the parent is reachable solely in the
+    # pre-verb position — which made every documented `egress apply --mode global ...`
+    # die with "unrecognized arguments". Inheriting them puts them in both positions.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--mode", choices=("local", "global"), default=None,
+                        help="local: this node runs its own credentialed exit sidecars. "
+                             "global: this node holds no credentials and forwards over the "
+                             "wg overlay to the central exit host. The gateway ADDRESS is "
+                             "identical either way.")
+    common.add_argument("--gateway-ip", default=None, help="override the gateway address")
+    common.add_argument("--wg-iface", default=None)
+    common.add_argument("--upstream-gw", default=None,
+                        help="mode=global: overlay IP of the central exit host")
+    pe.add_argument("--mode", choices=("local", "global"), default=None, help=argparse.SUPPRESS)
+    pe.add_argument("--gateway-ip", default=None, help=argparse.SUPPRESS)
+    pe.add_argument("--wg-iface", default=None, help=argparse.SUPPRESS)
     pes = pe.add_subparsers(dest="egress_action", required=True)
 
-    pe_ap = pes.add_parser("apply", help="bring this node to the configured state (idempotent)")
-    pe_ap.add_argument("--upstream-gw", default=None,
-                       help="mode=global: overlay IP of the central exit host")
+    pe_ap = pes.add_parser("apply", parents=[common],
+                           help="bring this node to the configured state (idempotent)")
     pe_ap.add_argument("--dry-run", action="store_true")
     pe_ap.add_argument("--no-auto-subnets", action="store_true",
                        help="fail on a subnet conflict instead of relocating the bridge")
-    pes.add_parser("check", help="report state; exit non-zero if egress is degraded")
-    pes.add_parser("health", help="one-line JSON health verdict (for probes / the dispatcher)")
-    pe_td = pes.add_parser("teardown", help="remove only what we created")
+    pes.add_parser("check", parents=[common],
+                   help="report state; exit non-zero if egress is degraded")
+    pes.add_parser("health", parents=[common],
+                   help="one-line JSON health verdict (for probes / the dispatcher)")
+    pe_td = pes.add_parser("teardown", parents=[common], help="remove only what we created")
     pe_td.add_argument("--remove-bridges", action="store_true")
-    pes.add_parser("gateway", help="exit host: stand up the overlay endpoint, print its public key")
-    pes.add_parser("gateway-exit", help="exit host: route peer traffic into the local sidecar")
-    pe_pa = pes.add_parser("peer-add", help="exit host: register a peer's PUBLIC key")
+    pes.add_parser("gateway", parents=[common],
+                   help="exit host: stand up the overlay endpoint, print its public key")
+    pes.add_parser("gateway-exit", parents=[common],
+                   help="exit host: route peer traffic into the local sidecar")
+    pe_pa = pes.add_parser("peer-add", parents=[common],
+                           help="exit host: register a peer's PUBLIC key")
     pe_pa.add_argument("--name", required=True)
     pe_pa.add_argument("--peer-ip", required=True)
     pe_pa.add_argument("--public-key", required=True)
-    pe_pr = pes.add_parser("peer", help="worker node: join the overlay (generates its own key)")
+    pe_pr = pes.add_parser("peer", parents=[common],
+                           help="worker node: join the overlay (generates its own key)")
     pe_pr.add_argument("--peer-ip", required=True)
     pe_pr.add_argument("--gateway-addr", required=True)
     pe_pr.add_argument("--gateway-pubkey", required=True)
-    pe_pr.add_argument("--upstream-gw", default=None)
     pe.set_defaults(func=_egress_cmd, upstream_gw=None)
 
     pv = sub.add_parser("version", help="print version and exit")

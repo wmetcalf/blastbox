@@ -29,9 +29,7 @@ whose gateway it cannot reach directly. The real packet path is
 
 Two behaviours are therefore deliberate and should not be "fixed":
 
-- **It refuses to start if it cannot reach the overlay peer.** Only the node's source route
-  can make that probe succeed, so reachability is positive proof that node-side enforcement
-  is live. Failing to start is correct: it leaves the gateway address empty, the worker's
+- **It refuses to start if it cannot reach the overlay peer.** Failing to start is correct: it leaves the gateway address empty, the worker's
   default route points at a dead IP, and the tier is closed. A forwarder that came up
   without the node rules would quietly NAT malware onto the node's WAN.
 - **It exits when the overlay later dies**, rather than lingering. The node's DROP rule
@@ -48,7 +46,9 @@ its gate log line plus a zero restart count.
 docker build -t blastbox-egress-forwarder:dev deploy/egress-forwarder
 ```
 
-`blastbox egress apply --mode global` builds it automatically if the tag is absent.
+`blastbox egress apply --mode global` requires this image to exist and refuses to
+start without it — deliberately, and *before* touching a running forwarder, so a
+pruned tag cannot turn a working node into an empty gateway address.
 
 ## Verify
 

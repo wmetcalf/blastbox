@@ -24,6 +24,7 @@ jobs:
         run: pytest -q
 
   egress-forwarder-image:
+    timeout-minutes: 15
     # The forwarder is a real deployment artifact but it is built on the node, not
     # published to a registry (this repo ships only the PyPI wheel). Nothing would
     # otherwise notice it rotting until an operator ran `egress apply --mode global` on a
@@ -53,10 +54,22 @@ jobs:
           docker logs fwd
           # Exiting non-zero IS the correct outcome: it leaves the gateway address empty
           # so the worker's default route points nowhere.
+          # The exit CODE alone is not proof: entrypoint.sh exits 1 on the uplink-detection
+          # path too, before the gate ever runs, so a broken entrypoint would report
+          # "fail-closed OK". Require the gate's own message, the same way
+          # egress.GATE_OK_PATTERN refuses to judge a forwarder on liveness.
           case "$state" in
-            "exited 1") echo "fail-closed gate OK" ;;
+            "exited 1") : ;;
             *) echo "::error::expected 'exited 1', got '$state'"; exit 1 ;;
           esac
+          if docker logs fwd 2>&1 | grep -q "overlay peer 192.0.2.1 unreachable after"; then
+            echo "fail-closed gate OK (the gate ran, retried, and refused)"
+          else
+            echo "::error::container exited 1 but the startup gate never ran"; exit 1
+          fi
+      - name: Clean up
+        if: always()
+        run: docker rm -f fwd || true
 
   pg-search:
     # Perceptual-hash search is Postgres + pg_bktree only — there is no SQLite

@@ -69,6 +69,7 @@ __all__ = [
     "forwarder_run_argv",
     "forwarder_source_route_steps",
     "gateway_wg_config",
+    "persistence_unit",
     "peer_wg_config",
     "return_chain_steps",
     "teardown_steps",
@@ -240,24 +241,24 @@ class EgressConfig:
         shell installer used, so an existing node's env keeps working)."""
         e = os.environ if env is None else env
 
-        def pick(new: str, legacy: str, default: object) -> object:
-            return e.get(f"BLASTBOX_EGRESS_{new}", e.get(legacy, default))
+        def pick(new: str, legacy: str, default: str) -> str:
+            return str(e.get(f"BLASTBOX_EGRESS_{new}", e.get(legacy, default)))
 
         return cls(
-            mode=str(pick("MODE", "EGRESS_MODE", "local")),
-            net0_subnet=str(pick("NET0_SUBNET", "NET0_SUBNET", cls.net0_subnet)),
-            fakenet_subnet=str(pick("FAKENET_SUBNET", "FAKENET_SUBNET", cls.fakenet_subnet)),
-            socks_subnet=str(pick("SOCKS_SUBNET", "SOCKS_SUBNET", cls.socks_subnet)),
-            vpn_subnet=str(pick("VPN_SUBNET", "VPN_SUBNET", cls.vpn_subnet)),
-            vpn_gateway_ip=str(pick("VPN_GATEWAY_IP", "VPN_GATEWAY_IP", cls.vpn_gateway_ip)),
-            forwarder_uplink_ip=str(
-                pick("FORWARDER_UPLINK_IP", "FORWARDER_UPLINK_IP", cls.forwarder_uplink_ip)),
-            upstream_gw=str(pick("UPSTREAM_GW", "UPSTREAM_GW", "")),
-            wg_iface=str(pick("WG_IF", "WG_IF", cls.wg_iface)),
-            wg_port=int(pick("WG_PORT", "WG_PORT", cls.wg_port)),
-            overlay_net=str(pick("OVERLAY_NET", "OVERLAY_NET", cls.overlay_net)),
-            overlay_gateway_ip=str(pick("OVERLAY_GW", "GW_OVERLAY_IP", cls.overlay_gateway_ip)),
-            forwarder_image=str(pick("FORWARDER_IMAGE", "FORWARDER_IMAGE", cls.forwarder_image)),
+            mode=pick("MODE", "EGRESS_MODE", "local"),
+            net0_subnet=pick("NET0_SUBNET", "NET0_SUBNET", cls.net0_subnet),
+            fakenet_subnet=pick("FAKENET_SUBNET", "FAKENET_SUBNET", cls.fakenet_subnet),
+            socks_subnet=pick("SOCKS_SUBNET", "SOCKS_SUBNET", cls.socks_subnet),
+            vpn_subnet=pick("VPN_SUBNET", "VPN_SUBNET", cls.vpn_subnet),
+            vpn_gateway_ip=pick("VPN_GATEWAY_IP", "VPN_GATEWAY_IP", cls.vpn_gateway_ip),
+            forwarder_uplink_ip=pick(
+                "FORWARDER_UPLINK_IP", "FORWARDER_UPLINK_IP", cls.forwarder_uplink_ip),
+            upstream_gw=pick("UPSTREAM_GW", "UPSTREAM_GW", ""),
+            wg_iface=pick("WG_IF", "WG_IF", cls.wg_iface),
+            wg_port=int(pick("WG_PORT", "WG_PORT", str(cls.wg_port))),
+            overlay_net=pick("OVERLAY_NET", "OVERLAY_NET", cls.overlay_net),
+            overlay_gateway_ip=pick("OVERLAY_GW", "GW_OVERLAY_IP", cls.overlay_gateway_ip),
+            forwarder_image=pick("FORWARDER_IMAGE", "FORWARDER_IMAGE", cls.forwarder_image),
         )
 
     def to_env_lines(self) -> list[str]:
@@ -314,7 +315,7 @@ _CANDIDATE_BASES = ("172.16.0.0/12", "10.0.0.0/8")
 
 def _iter_candidates(prefixlen: int) -> Iterable[ipaddress.IPv4Network]:
     for base in _CANDIDATE_BASES:
-        net = ipaddress.ip_network(base)
+        net = ipaddress.IPv4Network(base)
         if prefixlen < net.prefixlen:
             continue
         yield from net.subnets(new_prefix=prefixlen)
@@ -351,19 +352,23 @@ def allocate_subnets(
     Relocating is safe precisely because the gateway address is per-node config rather
     than code: netd takes it as a flag and ``gateway_route_commands`` takes a plain IP.
     """
-    claimed = [ipaddress.ip_network(t, strict=False) for t in taken]
+    # v4 only: every candidate pool and every bridge here is v4, and an IPv6 entry in
+    # `taken` can never overlap one, so filtering keeps the types honest rather than
+    # silently comparing across families.
+    claimed = [n for n in (ipaddress.ip_network(t, strict=False) for t in taken)
+               if isinstance(n, ipaddress.IPv4Network)]
     advisory = [c for c in claimed if c.prefixlen <= SUMMARY_PREFIXLEN]
     claimed = [c for c in claimed if c.prefixlen > SUMMARY_PREFIXLEN]
 
     def collides(candidate: ipaddress.IPv4Network) -> ipaddress.IPv4Network | None:
         for c in claimed:
-            if candidate.version == c.version and candidate.overlaps(c):
+            if candidate.overlaps(c):
                 return c
         return None
 
     conflicts: list[tuple[str, str, str]] = []
     reallocated: list[tuple[str, str, str]] = []
-    updates: dict[str, str] = {}
+    updates: dict[str, object] = {}
     # Newly chosen ranges must not collide with each other either, so they join `claimed`
     # as we go. Without this two relocated bridges can both land on the same free pool.
     field_for = {
@@ -380,7 +385,7 @@ def allocate_subnets(
         # containers.
         if name in skip:
             continue
-        want = ipaddress.ip_network(subnet)
+        want = ipaddress.IPv4Network(subnet)
         hit = collides(want)
         if hit is None:
             claimed.append(want)
@@ -411,7 +416,7 @@ def allocate_subnets(
                 chosen.network_address + (int(ipaddress.ip_address(cfg.forwarder_uplink_ip))
                                           - int(want.network_address)))
 
-    new_cfg = replace(cfg, **updates) if updates else cfg
+    new_cfg = replace(cfg, **updates) if updates else cfg  # type: ignore[arg-type]
     return SubnetPlan(config=new_cfg, conflicts=tuple(conflicts),
                       reallocated=tuple(reallocated),
                       advisory=tuple(str(a) for a in advisory))
@@ -503,19 +508,30 @@ def peer_wg_config(cfg: EgressConfig, private_key: str, peer_ip: str,
 # --------------------------------------------------------------------------------------
 
 def _chain_jump_steps(chain: str, match: list[str]) -> list[Step]:
-    """Create ``chain``, jump to it from FORWARD if not already, then flush it.
+    """Create ``chain``, put its FORWARD jump back at POSITION 1, then flush it.
 
-    The jump is guarded by ``-C`` so a re-apply does not stack duplicates; the contents
-    are flushed so they stay declarative. Creating the chain is best-effort because
-    ``-N`` fails when it already exists, which is the normal re-apply case.
+    DELETE-THEN-INSERT, not check-then-insert. ``iptables -C`` matches a rule at ANY
+    index, so a guard on existence is position-blind: once anything lands above our jump
+    the guard keeps passing and no re-apply can ever hoist it back. That is not
+    hypothetical — docker re-inserts DOCKER-USER/DOCKER-FORWARD at the head of FORWARD on
+    every daemon start, and DOCKER-FORWARD holds a terminal ACCEPT for the non-internal
+    bb-net0 bridge. ACCEPT in a jumped-to chain ends filter traversal, so a buried
+    BB-WG-FWD means its ``-j DROP`` is dead code and the only thing left holding the line
+    is the routing layer. Deleting first (repeatedly — an older buggy state may hold
+    several) and re-inserting at 1 both de-duplicates and re-asserts precedence on every
+    apply, which is exactly what the boot unit is for.
+
+    The flush happens AFTER the jump is re-seated so the chain is never wired-but-empty
+    for longer than the refill takes; an empty user chain RETURNs, falling through to
+    docker's bridge ACCEPT.
     """
-    return [
-        Step.best_effort(["iptables", "-N", chain], f"create {chain}"),
-        Step.ensure(["iptables", "-C", "FORWARD", *match, "-j", chain],
-                    ["iptables", "-I", "FORWARD", "1", *match, "-j", chain],
-                    f"jump FORWARD -> {chain}"),
-        Step.of(["iptables", "-F", chain], desc=f"flush {chain}"),
-    ]
+    steps: list[Step] = [Step.best_effort(["iptables", "-N", chain], f"create {chain}")]
+    steps += [Step.best_effort(["iptables", "-D", "FORWARD", *match, "-j", chain])
+              for _ in range(4)]
+    steps.append(Step.of(["iptables", "-I", "FORWARD", "1", *match, "-j", chain],
+                         desc=f"jump FORWARD[1] -> {chain} (re-hoisted above docker's)"))
+    steps.append(Step.of(["iptables", "-F", chain], desc=f"flush {chain}"))
+    return steps
 
 
 def return_chain_steps(chain: str, out_iface: str, dest: str) -> list[Step]:
@@ -757,3 +773,65 @@ def forwarder_health(
             f"(restarts so far: {restart_count})")
     note = f" (recovered after {restart_count} restart(s))" if restart_count else ""
     return Health(True, f"forwarder up and past its overlay probe{note}")
+
+
+#: The boot-time re-apply unit, as a STRING rather than a file read from ``deploy/``.
+#:
+#: ``deploy/`` is not shipped in the wheel (no MANIFEST.in, and package-data lists only
+#: ``py.typed``), and a pip install is the distribution channel this repo actually has.
+#: Reading the unit off disk therefore always took the "not found" branch on a real
+#: node — so the reboot-persistence fix was inert on exactly the installs that needed
+#: it, while printing a note that scrolled past among a dozen others. Generating it here
+#: makes persistence work identically from a wheel and a checkout.
+#: ``deploy/systemd/blastbox-egress.service`` is kept as the hand-install copy and is
+#: asserted to match this text by ``tests/host/test_egress.py``.
+def persistence_unit(exec_start: str, wg_iface: str = "bbwg0") -> str:
+    """Render the systemd unit that re-applies this node's egress tier at boot."""
+    return f"""# blastbox-egress — re-apply this node's egress tier at boot.
+#
+# WHY THIS UNIT EXISTS. The egress tier is `ip rule`s, a dedicated routing table and
+# BB-WG-* iptables chains. None of that survives a reboot. Without this unit a node comes
+# back with its bridges intact (docker persists those) and its ENFORCEMENT gone — the
+# forwarder fails its startup gate and stays down, so the tier fails closed rather than
+# leaking, but the node is silently useless for egress work until someone notices.
+# Fail-closed is the correct failure; staying failed until a human intervenes is not.
+#
+# Oneshot with RemainAfterExit: applying is idempotent (every step is guarded, deleted
+# first, or best-effort), so a restart re-converges rather than stacking duplicates.
+#
+# ORDERING IS LOAD-BEARING. After docker (the bridges and the forwarder are containers)
+# and after wg-quick (the source route installs `default dev <wg>` into its own table,
+# which needs the interface to exist). `Wants=` not `Requires=` on wg-quick: a local-mode
+# node has no overlay at all and this unit must still run.
+#
+# Generated by `blastbox egress apply` from blastbox.host.egress.persistence_unit.
+
+[Unit]
+Description=blastbox egress tier (bridges, exit mode, overlay source routing)
+After=docker.service network-online.target wg-quick@{wg_iface}.service
+Wants=network-online.target wg-quick@{wg_iface}.service
+Requires=docker.service
+# Without the env file there is no configured tier to re-apply, and `apply` would fall
+# back to defaults that may not match this node. Do nothing rather than guess.
+ConditionPathExists=/etc/blastbox/egress.env
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/blastbox/egress.env
+ExecStart={exec_start}
+# Re-applying is cheap and idempotent, and a node that comes up before its exit host is
+# reachable should keep trying rather than sit degraded until someone logs in.
+Restart=on-failure
+RestartSec=30
+
+# This genuinely needs privilege: it creates docker networks, writes routing tables and
+# iptables chains, and starts a NET_ADMIN container. Runs as root, bounded to the
+# capabilities it actually uses.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN CAP_DAC_OVERRIDE
+ProtectSystem=full
+ReadWritePaths=/etc/wireguard /etc/blastbox /etc/iproute2
+
+[Install]
+WantedBy=multi-user.target
+"""
