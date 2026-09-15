@@ -284,3 +284,109 @@ def test_a_renamed_field_is_a_parse_error_not_a_silent_none():
     drifted = {**ok, "only_first_hit": ok.pop("first_hit_only")}
     with pytest.raises(pydantic.ValidationError):
         SignatureScan(**drifted)
+
+
+# ------------------------------------------------ unscanned is not clean
+
+def _stub_engine(**kw):
+    """A driver with both scan paths stubbed, so these exercise the decision logic."""
+    from blastbox.engines.clamav import ClamAVEngine
+
+    return ClamAVEngine(scan_fn=kw.get("scan_fn", lambda data, timeout=None: []),
+                        path_scan_fn=kw.get("path_scan_fn", lambda p, timeout=None: []))
+
+
+def _detonate(engine, tmp_path, size):
+    from blastbox.limits import Limits
+
+    sample = tmp_path / "sample.bin"
+    sample.write_bytes(b"\0" * size)
+    return engine.detonate(sample, tmp_path / "out", Limits(timeout_s=30))
+
+
+def test_a_file_over_the_scanner_limit_is_not_reported_clean(tmp_path, monkeypatch):
+    """clamd DECLINES a file over MaxFileSize and returns no hits. Sealing that as
+    `infected: false` is a false negative manufactured by configuration — and the shipped
+    clamd.conf's own comment says the driver reads these limits back and says so. It
+    didn't.
+    """
+    from blastbox.engines import clamav
+
+    monkeypatch.setattr(clamav, "MAX_SCANNABLE_BYTES", 1024)
+    res = _detonate(_stub_engine(), tmp_path, 4096)
+
+    assert res.status == "engine_error"
+    assert res.detected.label != "clean"
+    assert res.detected.confidence == 0.0
+    # The payload type has no `infected` field to misread — that is the whole design.
+    # _sealed() puts the model on the wire as a generic Record whose `schema` field
+    # names the real type — a consumer discriminates on that, and it has no `infected`.
+    assert res.payload.fields["schema"] == "signature_scan_unavailable"
+    assert "infected" not in res.payload.fields
+    assert any(w.code == "sample_exceeds_scanner_limit" for w in res.warnings)
+
+
+def test_a_file_within_the_limit_still_scans_normally(tmp_path, monkeypatch):
+    from blastbox.engines import clamav
+
+    monkeypatch.setattr(clamav, "MAX_SCANNABLE_BYTES", 1024 * 1024)
+    res = _detonate(_stub_engine(), tmp_path, 4096)
+    assert res.status == "ok"
+    assert res.detected.label == "clean"
+
+
+def test_a_scanner_outage_does_not_emit_a_high_confidence_clean_label(tmp_path):
+    """The typed payload was already careful; the Detection beside it was not. The
+    generic job summary surfaces that label independently, so every list view showed a
+    confident CLEAN for a sample nothing had looked at."""
+    from blastbox.engines.clamav import ClamdUnavailable
+
+    def dead(*a, **kw):
+        raise ClamdUnavailable("connection refused")
+
+    res = _detonate(_stub_engine(scan_fn=dead, path_scan_fn=dead), tmp_path, 16)
+    assert res.status == "engine_error"
+    assert res.detected.label == "unknown" and res.detected.confidence == 0.0
+
+
+def test_a_truncated_scan_that_found_nothing_is_not_clean(tmp_path):
+    """`Heuristics.Limits.Exceeded` means clamd stopped early. Counting it as a
+    signature reports every big archive as malware; dropping it silently reports the
+    same archive as clean. It is neither."""
+    from blastbox.engines.clamav import _LIMIT_HEURISTIC
+
+    res = _detonate(_stub_engine(path_scan_fn=lambda p, timeout=None: [_LIMIT_HEURISTIC],
+                       scan_fn=lambda d, timeout=None: [_LIMIT_HEURISTIC]),
+               tmp_path, 16)
+    assert res.detected.label != "clean"
+    assert any(w.code == "scan_truncated_by_limits" for w in res.warnings)
+
+
+def test_a_truncated_scan_that_found_something_still_reports_the_signature(tmp_path):
+    """The truncation must not mask a real hit that was found before the limit."""
+    from blastbox.engines.clamav import _LIMIT_HEURISTIC
+
+    res = _detonate(_stub_engine(path_scan_fn=lambda p, timeout=None: ["Eicar-Test-Signature",
+                                                             _LIMIT_HEURISTIC],
+                       scan_fn=lambda d, timeout=None: ["Eicar-Test-Signature",
+                                                        _LIMIT_HEURISTIC]),
+               tmp_path, 16)
+    assert res.detected.label == "Eicar-Test-Signature"
+    assert any(w.code == "scan_truncated_by_limits" for w in res.warnings)
+    # ...and the limit notice is not itself reported as a signature.
+    assert _LIMIT_HEURISTIC not in (res.payload.fields.get("signatures") or [])
+
+
+def test_the_config_and_the_driver_agree_on_the_limit():
+    """They must, and disagreeing in the permissive direction re-opens the hole."""
+    import re
+    from pathlib import Path
+
+    from blastbox.engines.clamav import MAX_SCANNABLE_BYTES
+
+    conf = (Path(__file__).resolve().parents[2] / "deploy/clamav/clamd.conf").read_text()
+    m = re.search(r"^MaxFileSize\s+(\d+)M", conf, re.M)
+    assert m, "clamd.conf must state MaxFileSize"
+    assert MAX_SCANNABLE_BYTES <= int(m.group(1)) * 1024 * 1024
+    assert re.search(r"^AlertExceedsMax\s+true", conf, re.M), \
+        "without AlertExceedsMax, 'declined' and 'clean' are identical on the wire"
