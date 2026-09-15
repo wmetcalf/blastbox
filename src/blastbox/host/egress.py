@@ -194,6 +194,16 @@ class EgressConfig:
     rt_table_id: int = 220
     forwarder_image: str = "blastbox-egress-forwarder:dev"
     forwarder_name: str = "bb-egress-forwarder"
+    #: True on the CENTRAL EXIT HOST — the node whose local sidecars serve every peer.
+    #: Persisted so the boot unit can replay `exit_host_steps`. Without it the exit
+    #: host's source route, SNAT and BB-WG-EXIT chains lived only in the running kernel:
+    #: WireGuard came back after a reboot and peer-to-sidecar forwarding did not, taking
+    #: EVERY global-mode worker's egress offline until someone re-ran the command.
+    exit_host: bool = False
+    #: NOTE exit_host and mode are ORTHOGONAL. An exit host records mode="global"
+    #: (its peers are global) but must never run a forwarder — it IS the exit. Applying
+    #: both roles on one node made it try to attach a forwarder to the address its own
+    #: sidecar already holds.
 
     def __post_init__(self) -> None:
         if self.mode not in _MODES:
@@ -266,6 +276,8 @@ class EgressConfig:
             overlay_net=pick("OVERLAY_NET", "OVERLAY_NET", cls.overlay_net),
             overlay_gateway_ip=pick("OVERLAY_GW", "GW_OVERLAY_IP", cls.overlay_gateway_ip),
             forwarder_image=pick("FORWARDER_IMAGE", "FORWARDER_IMAGE", cls.forwarder_image),
+            exit_host=pick("EXIT_HOST", "EXIT_HOST", "0").strip().lower()
+            in ("1", "true", "yes", "on"),
         )
 
     def to_env_lines(self) -> list[str]:
@@ -289,6 +301,7 @@ class EgressConfig:
             f"BLASTBOX_EGRESS_OVERLAY_NET={self.overlay_net}",
             f"BLASTBOX_EGRESS_OVERLAY_GW={self.overlay_gateway_ip}",
             f"BLASTBOX_EGRESS_FORWARDER_IMAGE={self.forwarder_image}",
+            f"BLASTBOX_EGRESS_EXIT_HOST={'1' if self.exit_host else '0'}",
         ]
 
 
@@ -496,6 +509,24 @@ def gateway_peer_stanza(name: str, peer_ip: str, public_key: str) -> str:
     )
 
 
+def _overlay_member(cfg: EgressConfig, peer_ip: str) -> str:
+    """Validate a peer address lies INSIDE the overlay, or raise.
+
+    The exit host's source-route rule and its BB-WG-EXIT containment chain both match
+    ``cfg.overlay_net``. A typo'd peer address outside it (10.78.0.3 for 10.77.0.3) is
+    accepted by WireGuard and written as the worker interface address — and then matches
+    neither rule, so its traffic skips sidecar routing and the DROP entirely and follows
+    ordinary host forwarding. Catch it at config-writing time, on both sides.
+    """
+    ip = _ip(peer_ip)
+    if ipaddress.ip_address(ip) not in ipaddress.ip_network(cfg.overlay_net):
+        raise ValueError(
+            f"peer address {ip} is outside the overlay {cfg.overlay_net}; the exit host's "
+            "source route and containment chain both match the overlay prefix, so this "
+            "peer's traffic would bypass them entirely")
+    return ip
+
+
 def peer_wg_config(cfg: EgressConfig, private_key: str, peer_ip: str,
                    gateway_addr: str, gateway_pubkey: str) -> str:
     """``wg-quick`` config for a WORKER NODE peer.
@@ -517,12 +548,13 @@ def peer_wg_config(cfg: EgressConfig, private_key: str, peer_ip: str,
     puts there. Permission to *encrypt* is decided here; permission to *egress* is decided
     there.
     """
+    peer_ip = _overlay_member(cfg, peer_ip)
     prefixlen = ipaddress.ip_network(cfg.overlay_net).prefixlen
     return (
         "# blastbox egress overlay — WORKER NODE peer. See blastbox.host.egress.peer_wg_config\n"
         "# for why AllowedIPs is /0 and Table is off; they are load-bearing together.\n"
         "[Interface]\n"
-        f"Address = {_ip(peer_ip)}/{prefixlen}\n"
+        f"Address = {peer_ip}/{prefixlen}\n"
         f"PrivateKey = {private_key}\n"
         "Table = off\n"
         f"PostUp = ip route replace {cfg.overlay_net} dev %i\n"
@@ -679,8 +711,14 @@ def exit_host_steps(cfg: EgressConfig, exit_iface: str) -> list[Step]:
     gw = _ip(cfg.vpn_gateway_ip)
     eif = _iface(exit_iface)
     return [
-        Step.of(["ip", "route", "replace", "default", "via", gw, "table", cfg.rt_table],
-                desc="table: default via the local exit sidecar"),
+        # `dev` is pinned explicitly. Without it the kernel resolves the next hop
+        # against whatever is reachable at that instant, and on a host that also holds
+        # the overlay interface it picked `dev bbwg0` — a default route pointing the
+        # sidecar's address down the tunnel it arrived from. The tier then reported every
+        # rule present and carried nothing.
+        Step.of(["ip", "route", "replace", "default", "via", gw, "dev", eif,
+                 "table", cfg.rt_table],
+                desc=f"table: default via the local exit sidecar on {eif}"),
         *_overlay_main_steps(cfg.overlay_net),
         *_rule_steps(["from", cfg.overlay_net], cfg.rt_table),
         *_chain_jump_steps(CHAIN_EXIT, ["-s", cfg.overlay_net]),
@@ -706,11 +744,19 @@ def teardown_steps(cfg: EgressConfig) -> list[Step]:
     partially-applied state still tears down cleanly.
     """
     cmds: list[Step] = []
-    for prio in ALL_PRIORITIES:
-        # Loop: a re-applied node can hold more than one rule at a priority if an earlier
-        # version added without deleting first.
+    # DELETE BY FULL SELECTOR, not by bare priority. `ip rule del priority N` selects
+    # solely by preference: on a shared host that already uses 99/100/101 — a CAPE
+    # rooter, a netplan routing-policy, another VPN — it silently removes SOMEONE ELSE'S
+    # rule while claiming to remove only blastbox state. Naming the same selector we
+    # added means we can only ever delete our own.
+    fwd, overlay, table = cfg.forwarder_uplink_ip, cfg.overlay_net, cfg.rt_table
+    for selector in (["to", overlay, "lookup", "main"],
+                     ["from", fwd, "lookup", table], ["from", fwd, "blackhole"],
+                     ["from", overlay, "lookup", table], ["from", overlay, "blackhole"]):
+        # Repeat: an earlier version added without deleting first, so a host may hold
+        # duplicates. Each delete removes one.
         for _ in range(4):
-            cmds.append(Step.best_effort(["ip", "rule", "del", "priority", str(prio)]))
+            cmds.append(Step.best_effort(["ip", "rule", "del", *selector]))
     cmds.append(Step.best_effort(["ip", "route", "flush", "table", cfg.rt_table]))
     cmds.append(Step.best_effort(["iptables", "-w", "5", "-t", "nat", "-D", "POSTROUTING",
                                   "-o", cfg.wg_iface, "-j", "MASQUERADE"]))

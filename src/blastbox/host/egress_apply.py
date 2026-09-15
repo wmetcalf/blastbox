@@ -21,6 +21,7 @@ from pathlib import Path
 
 from blastbox.host.egress import (
     ALL_CHAINS,
+    CHAIN_EXIT,
     CHAIN_FWD,
     PRIO_BLACKHOLE,
     PRIO_LOOKUP,
@@ -227,20 +228,22 @@ def container_state(name: str) -> tuple[bool, int, str]:
     return running, restarts, (logs.stdout or "") + (logs.stderr or "")
 
 
-def _rule_at(rules: str, priority: int) -> str:
-    """The body of the ``ip rule`` at ``priority``, or "" — anchored, not substring-matched.
+def _rules_at(rules: str, priority: int) -> list[str]:
+    """EVERY ``ip rule`` body at ``priority`` — a priority is not unique.
 
-    ``ip rule show`` emits ``100:\tfrom 10.29.0.10 lookup bbwg``. Matching the body as a
-    bare substring of the whole output cannot tell our rule from the same text at a
-    priority BELOW ``32766: from all lookup main``, which would provide no containment at
-    all while reading as present.
+    Returning only the first match was a live misreport: a host carrying a leftover rule
+    at the same preference (an earlier experiment, another tool, a previous version of
+    this tier) had its correct rule shadowed and the node was declared uncontained while
+    fully enforced. Anchoring to the priority is still necessary — the same body below
+    ``32766: from all lookup main`` provides no containment — but the anchor selects a
+    SET, not a single line.
     """
+    out: list[str] = []
     for line in (rules or "").splitlines():
         head, sep, body = line.partition(":")
         if sep and head.strip().isdigit() and int(head.strip()) == priority:
-            return " ".join(body.split())
-    return ""
-
+            out.append(" ".join(body.split()))
+    return out
 
 
 #: iptables match tokens this predicate understands well enough to reason about. A rule
@@ -346,15 +349,20 @@ def enforcement_present(cfg: EgressConfig) -> tuple[bool, str]:
     if cfg.mode != "global":
         return True, "local mode: the sidecar itself is the enforcement"
     missing: list[str] = []
-    fwd = cfg.forwarder_uplink_ip
+    # AN EXIT HOST HAS A DIFFERENT SHAPE. It records mode="global" because its peers are
+    # global, but it runs no forwarder — it IS the exit. Its containment is the overlay
+    # source route plus BB-WG-EXIT, keyed on the overlay prefix rather than a forwarder
+    # /32. Checking it for forwarder rules reported the working central host as degraded.
+    fwd = cfg.overlay_net if cfg.exit_host else cfg.forwarder_uplink_ip
+    chain = CHAIN_EXIT if cfg.exit_host else CHAIN_FWD
 
     rules = _run(["ip", "rule", "show"], check=False).stdout or ""
-    lookup = _rule_at(rules, PRIO_LOOKUP)
-    if f"from {fwd}" not in lookup or not (
-            f"lookup {cfg.rt_table}" in lookup or f"lookup {cfg.rt_table_id}" in lookup):
+    if not any(f"from {fwd}" in r and (f"lookup {cfg.rt_table}" in r
+                                       or f"lookup {cfg.rt_table_id}" in r)
+               for r in _rules_at(rules, PRIO_LOOKUP)):
         missing.append(f"source route (priority {PRIO_LOOKUP}: from {fwd} -> {cfg.rt_table})")
-    hole = _rule_at(rules, PRIO_BLACKHOLE)
-    if f"from {fwd}" not in hole or "blackhole" not in hole:
+    if not any(f"from {fwd}" in r and "blackhole" in r
+               for r in _rules_at(rules, PRIO_BLACKHOLE)):
         missing.append(f"blackhole fall-through guard (priority {PRIO_BLACKHOLE})")
 
     # THE FILTER LAYER IS ONLY OBSERVABLE AS ROOT. `ip rule show` works unprivileged;
@@ -371,14 +379,14 @@ def enforcement_present(cfg: EgressConfig) -> tuple[bool, str]:
     bridge_iface = iface_for(fwd)
     fwd_probe = _run(["iptables", "-w", "2", "-S", "FORWARD"], check=False)
     if fwd_probe.returncode != 0:
-        unverified.append(f"{CHAIN_FWD} jump (needs root; `blastbox egress check` as root "
+        unverified.append(f"{chain} jump (needs root; `blastbox egress check` as root "
                           "verifies it)")
     else:
         jump_at = docker_at = None
         for i, line in enumerate((fwd_probe.stdout or "").splitlines()):
             if not line.startswith("-A FORWARD"):
                 continue
-            if line.endswith(f"-j {CHAIN_FWD}") and jump_at is None:
+            if line.endswith(f"-j {chain}") and jump_at is None:
                 jump_at = i
             # Does this rule swallow OUR traffic before we are reached? Narrowing the
             # last version to "docker jumps only" went too far the other way: an ACCEPT
@@ -387,19 +395,19 @@ def enforcement_present(cfg: EgressConfig) -> tuple[bool, str]:
             if docker_at is None and _accepts_our_traffic(line, fwd, bridge_iface):
                 docker_at = i
         if jump_at is None:
-            missing.append(f"FORWARD jump into {CHAIN_FWD} (the chain is orphaned)")
+            missing.append(f"FORWARD jump into {chain} (the chain is orphaned)")
         elif docker_at is not None and docker_at < jump_at:
             missing.append(
-                f"{CHAIN_FWD} is BELOW an earlier ACCEPT in FORWARD (its DROP is dead code)")
+                f"{chain} is BELOW an earlier ACCEPT in FORWARD (its DROP is dead code)")
 
-        chain = _run(["iptables", "-w", "2", "-S", CHAIN_FWD], check=False)
-        body = [ln for ln in (chain.stdout or "").splitlines()
-                if ln.startswith(f"-A {CHAIN_FWD}")]
-        if chain.returncode != 0 or not body:
-            missing.append(f"{CHAIN_FWD} chain")
+        probe = _run(["iptables", "-w", "2", "-S", chain], check=False)
+        body = [ln for ln in (probe.stdout or "").splitlines()
+                if ln.startswith(f"-A {chain}")]
+        if probe.returncode != 0 or not body:
+            missing.append(f"{chain} chain")
         elif not body[-1].endswith("-j DROP") or any(
                 ln.endswith("-j ACCEPT") and "-o" not in ln for ln in body):
-            missing.append(f"{CHAIN_FWD} WAN-escape DROP (a blanket ACCEPT precedes it)")
+            missing.append(f"{chain} WAN-escape DROP (a blanket ACCEPT precedes it)")
 
     if missing:
         return False, "enforcement MISSING: " + ", ".join(missing)
@@ -431,6 +439,19 @@ def node_health(cfg: EgressConfig) -> Health:
         return Health(reachable,
                       "exit sidecar reachable at the gateway address" if reachable
                       else f"nothing answers at the gateway address {cfg.vpn_gateway_ip}")
+    if cfg.exit_host:
+        # NOT a ping. An exit sidecar is a container that may well drop ICMP (the PIA
+        # client here does), and judging the central host on that reported a working
+        # exit as dead — which, with the dispatch gate wired to this verdict, would
+        # have taken the whole fleet's egress work out of circulation. What is both
+        # observable and load-bearing is that the sidecar's address still resolves on a
+        # link route: that is exactly what the peers' default route depends on.
+        on_link = iface_for(cfg.vpn_gateway_ip)
+        return Health(bool(on_link),
+                      f"exit host: sidecar {cfg.vpn_gateway_ip} on {on_link}; {why}"
+                      if on_link else
+                      f"exit host: {cfg.vpn_gateway_ip} is not reachable on any link — "
+                      "is the exit sidecar running?")
     running, restarts, logs = container_state(cfg.forwarder_name)
     verdict = forwarder_health(running=running, restart_count=restarts,
                                logs_since_start=logs)
@@ -507,7 +528,21 @@ def ensure_bridges(cfg: EgressConfig, *, dry_run: bool = False) -> list[str]:
     notes: list[str] = []
     for name, subnet, internal in cfg.bridges:
         if _ok(["docker", "network", "inspect", name]):
-            notes.append(f"{name}: present")
+            # PRESENT IS NOT ENOUGH. The whole fail-closed property of bb-socks/bb-vpn/
+            # bb-fakenet is that docker installs no route off the box for an INTERNAL
+            # network. A same-named network created without --internal keeps docker's
+            # ordinary host-NAT path, so an inetsim worker egresses directly and a failed
+            # netd wiring leaves a live default route — silently, since everything else
+            # reports the bridge as present.
+            actual = (_run(["docker", "network", "inspect", name, "--format",
+                            "{{.Internal}}"], check=False).stdout or "").strip()
+            if internal and actual != "true":
+                raise RuntimeError(
+                    f"{name} exists but is NOT internal — its workers would egress "
+                    f"directly, defeating the fail-closed property. Remove it "
+                    f"(`docker network rm {name}`) and re-run so it is recreated with "
+                    "--internal, after stopping anything attached to it.")
+            notes.append(f"{name}: present{' (internal)' if internal else ''}")
             continue
         argv = ["docker", "network", "create", "--subnet", subnet]
         if internal:
@@ -577,17 +612,49 @@ def _write_conf(path: Path, content: str) -> None:
 
 
 def ensure_rt_table(cfg: EgressConfig) -> None:
+    """Register our routing-table alias, refusing to share an ID with anything else.
+
+    Appending `220 bbwg` when 220 is already mapped to another subsystem gives the SAME
+    kernel table two names: `ip route replace ... table bbwg` then overwrites that
+    subsystem's routes, and teardown later flushes a table we do not own. These are
+    exactly the hosts where that happens — a co-resident CAPE rooter writes per-VPN
+    tables with operator-chosen numeric IDs.
+    """
     RT_TABLES.parent.mkdir(parents=True, exist_ok=True)
     line = f"{cfg.rt_table_id} {cfg.rt_table}"
     existing = RT_TABLES.read_text() if RT_TABLES.exists() else ""
+    for raw in existing.splitlines():
+        entry = raw.split("#", 1)[0].split()
+        if len(entry) < 2:
+            continue
+        tid, name = entry[0], entry[1]
+        if tid == str(cfg.rt_table_id) and name != cfg.rt_table:
+            raise RuntimeError(
+                f"routing table id {cfg.rt_table_id} is already claimed by {name!r} in "
+                f"{RT_TABLES}. Sharing it would overwrite that subsystem's routes and "
+                f"teardown would flush them. Set BLASTBOX_EGRESS_RT_TABLE_ID to a free id.")
+        if name == cfg.rt_table and tid != str(cfg.rt_table_id):
+            raise RuntimeError(
+                f"routing table name {cfg.rt_table!r} already maps to id {tid} in "
+                f"{RT_TABLES}, not {cfg.rt_table_id}.")
     if line not in existing:
         with RT_TABLES.open("a") as fh:
             fh.write(line + "\n")
 
 
 def wg_up(cfg: EgressConfig) -> None:
-    if not _ok(["systemctl", "enable", "--now", f"wg-quick@{cfg.wg_iface}"]):
-        _run(["wg-quick", "up", cfg.wg_iface], check=False)
+    """Bring the overlay interface up, or raise. Both paths failing is not a warning.
+
+    Discarding the fallback's return code meant `egress gateway`/`peer` printed a public
+    key and exited zero while the interface had never started — an operator would go on
+    configuring an overlay that does not exist (missing kernel module, invalid config).
+    """
+    if _ok(["systemctl", "enable", "--now", f"wg-quick@{cfg.wg_iface}"]):
+        return
+    proc = _run(["wg-quick", "up", cfg.wg_iface], check=False)
+    if proc.returncode != 0 and not _ok(["ip", "link", "show", cfg.wg_iface]):
+        tail = (proc.stderr or "").strip().splitlines()[-1] if proc.stderr else "no detail"
+        raise RuntimeError(f"could not bring up {cfg.wg_iface}: {tail}")
 
 
 def setup_gateway(cfg: EgressConfig) -> str:
@@ -597,9 +664,20 @@ def setup_gateway(cfg: EgressConfig) -> str:
     os.chmod(WG_DIR, 0o700)
     priv, pub = ensure_keypair(cfg.wg_iface)
     conf = WG_DIR / f"{cfg.wg_iface}.conf"
+    want = gateway_wg_config(cfg, priv.read_text().strip())
     if not conf.exists():
-        _write_conf(conf, gateway_wg_config(cfg, priv.read_text().strip()))
+        _write_conf(conf, want)
     else:
+        # RECONCILE the [Interface], KEEP the [Peer] stanzas. Skipping the rewrite meant
+        # a changed overlay address or port — or a regenerated keypair — was printed back
+        # to the operator while the live interface kept the old values, so newly
+        # configured peers could never handshake. Peers are appended by `peer-add` and
+        # must survive.
+        body = conf.read_text()
+        peers = body[body.index("\n# peer:"):] if "\n# peer:" in body else ""
+        if body != want + peers:
+            _write_conf(conf, want + peers)
+            _run(["systemctl", "restart", f"wg-quick@{cfg.wg_iface}"], check=False)
         # It holds a PrivateKey line. A conf left 0644 by a predecessor installer or a
         # restore was never corrected here, and the exit host's key is the one that lets
         # an attacker impersonate the central exit for every peer.
@@ -680,6 +758,15 @@ def persisted_config() -> EgressConfig:
     """
     env = load_persisted_env()
     if not env:
+        # ABSENT is not the same as PRESENT-BUT-EMPTY. The dispatch gate arms on the
+        # file's existence, so falling back to defaults here gives mode='local' on a
+        # managed global node — the gate then skips every global containment check and
+        # merely pings the default gateway, where a stale forwarder answering makes a
+        # node with no source route and no DROP rules look healthy.
+        if ENV_FILE.exists():
+            raise ValueError(
+                f"{ENV_FILE} exists but is empty or unreadable; this node is marked "
+                "managed and its egress configuration cannot be determined")
         return EgressConfig.from_env(None)
     namespaced = {k: v for k, v in os.environ.items() if k.startswith("BLASTBOX_EGRESS_")}
     legacy = {k: v for k, v in os.environ.items() if not k.startswith("BLASTBOX_EGRESS_")}
@@ -780,8 +867,11 @@ def start_forwarder(cfg: EgressConfig) -> None:
             f"  docker build -t {cfg.forwarder_image} deploy/egress-forwarder\n"
             "(the running forwarder, if any, was left alone)")
     _run(["docker", "rm", "-f", cfg.forwarder_name], check=False)
-    _run(forwarder_run_argv(cfg))
-    _run(forwarder_connect_argv(cfg))
+    for argv in (forwarder_run_argv(cfg), forwarder_connect_argv(cfg)):
+        proc = _run(argv, check=False)
+        if proc.returncode != 0:
+            tail = (proc.stderr or "").strip().splitlines()[-1] if proc.stderr else "no detail"
+            raise RuntimeError(f"could not start the forwarder: {tail}")
 
 
 def apply_node(cfg: EgressConfig, *, dry_run: bool = False,
@@ -804,16 +894,37 @@ def apply_node(cfg: EgressConfig, *, dry_run: bool = False,
         notes.append(f"conflict: {bname} wanted {wanted}, taken by {hit}")
     for bname, wanted, chosen in plan.reallocated:
         notes.append(f"reallocated: {bname} {wanted} -> {chosen}")
-    if plan.conflicts and not plan.reallocated and auto_subnets:
-        raise RuntimeError("subnet conflicts with nothing free to relocate to; "
-                           "set the ranges explicitly")
+    # ANY unresolved conflict aborts. The old condition only fired when auto was on AND
+    # nothing at all had been reallocated, so --no-auto-subnets proceeded straight into
+    # ensure_bridges, and a partial allocation (one conflict resolved, another not) did
+    # too. docker does not necessarily reject an overlap with a non-docker host route, so
+    # the result can be a connected route over the management LAN.
+    unresolved = [c for c in plan.conflicts
+                  if c[0] not in {r[0] for r in plan.reallocated}]
+    if unresolved:
+        detail = "; ".join(f"{b} wants {w}, taken by {h}" for b, w, h in unresolved)
+        raise RuntimeError(
+            f"unresolved subnet conflict(s): {detail}. "
+            + ("Nothing free to relocate to — set the ranges explicitly."
+               if auto_subnets else "Re-run without --no-auto-subnets, or set them explicitly."))
 
     notes += ensure_bridges(cfg, dry_run=dry_run)
     if dry_run:
         return cfg, notes
 
     ensure_rt_table(cfg)
-    if cfg.mode == "global":
+    if cfg.mode == "local":
+        # CONVERGE, do not merely skip. A node previously applied in global mode still
+        # has the credential-free forwarder (with a restart policy that revives it at the
+        # same gateway address the local sidecar must occupy), plus source-routing rules
+        # and BB-WG chains. Leaving them means `apply` does not bring the node to the
+        # requested mode and the local exit may be unable to start.
+        if _ok(["docker", "inspect", cfg.forwarder_name]):
+            _run(["docker", "rm", "-f", cfg.forwarder_name], check=False)
+            run_steps(teardown_steps(cfg))
+            notes.append("removed stale global-mode state (forwarder, source route, "
+                         "BB-WG-* chains) before applying local mode")
+    if cfg.mode == "global" and not cfg.exit_host:
         # The bridge the forwarder is reachable on — where its return traffic must go.
         bridge = iface_for(cfg.forwarder_uplink_ip)
         if not bridge:
@@ -827,21 +938,40 @@ def apply_node(cfg: EgressConfig, *, dry_run: bool = False,
         verdict = await_health(cfg)
         notes.append(f"forwarder: started at {cfg.vpn_gateway_ip} -> overlay {cfg.upstream_gw}"
                      f" ({'gate passed' if verdict.healthy else 'GATE FAILED'})")
+    if cfg.exit_host:
+        # Replay the exit-host role at boot. This is the other half of persistence: the
+        # peer side was already covered, but the CENTRAL host's forwarding is what every
+        # peer depends on, so losing it on reboot is a fleet-wide outage rather than one
+        # node's.
+        try:
+            notes += apply_exit_host(cfg)
+        except RuntimeError as exc:
+            notes.append(f"exit-host rules NOT applied ({exc}) — peers cannot egress here")
     persist_config(cfg)
     notes.append(f"config persisted to {ENV_FILE}")
     notes.append(install_persistence_unit(cfg))
     return cfg, notes
 
 
-def apply_exit_host(cfg: EgressConfig) -> list[str]:
-    """Point peer traffic at this host's local exit sidecar."""
+def apply_exit_host(cfg: EgressConfig, *, persist: bool = False) -> list[str]:
+    """Point peer traffic at this host's local exit sidecar.
+
+    ``persist`` records the exit-host role in egress.env so the boot unit replays it;
+    the CLI sets it, the boot-time replay does not (it is already acting on the record).
+    """
     eif = iface_for(cfg.vpn_gateway_ip)
     if not eif:
         raise RuntimeError(f"no interface route to {cfg.vpn_gateway_ip} — is the sidecar up?")
     ensure_rt_table(cfg)
     run_steps(exit_host_steps(cfg, eif))
-    return [f"peer traffic {cfg.overlay_net} -> exit sidecar {cfg.vpn_gateway_ip} via {eif}",
-            "everything else from the overlay is DROPped"]
+    notes = [f"peer traffic {cfg.overlay_net} -> exit sidecar {cfg.vpn_gateway_ip} via {eif}",
+             "everything else from the overlay is DROPped"]
+    if persist:
+        from dataclasses import replace as _replace
+        persist_config(_replace(cfg, exit_host=True))
+        notes.append(install_persistence_unit(cfg))
+        notes.append("exit-host role recorded — the boot unit will replay these rules")
+    return notes
 
 
 def teardown_node(cfg: EgressConfig, *, remove_bridges: bool = False) -> list[str]:

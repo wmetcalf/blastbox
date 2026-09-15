@@ -872,3 +872,92 @@ def test_a_forwarder_matching_accept_above_our_jump_fails_containment(monkeypatc
     ea_ = _fake_host(monkeypatch, rules=_GOOD_RULES, forward=fwd, chain=_GOOD_CHAIN)
     ok, why = ea_.enforcement_present(GLOBAL)
     assert not ok and "BELOW" in why
+
+
+def test_the_exit_host_role_is_persisted_so_a_reboot_replays_it():
+    """The boot unit runs `egress apply`, whose local path never calls exit_host_steps.
+    Without a recorded role the CENTRAL host came back from a reboot with WireGuard up
+    and peer-to-sidecar forwarding gone — a fleet-wide egress outage, not one node's."""
+    cfg = EgressConfig(mode="global", upstream_gw="10.77.0.1", exit_host=True)
+    assert "BLASTBOX_EGRESS_EXIT_HOST=1" in cfg.to_env_lines()
+    back = EgressConfig.from_env(dict(l.split("=", 1) for l in cfg.to_env_lines()))
+    assert back.exit_host is True
+
+
+def test_a_peer_address_outside_the_overlay_is_refused():
+    """The exit host's source route and BB-WG-EXIT chain both match overlay_net, so a
+    typo'd peer address outside it matches neither and follows ordinary host forwarding
+    — bypassing sidecar routing and the DROP entirely."""
+    with pytest.raises(ValueError, match="outside the overlay"):
+        peer_wg_config(GLOBAL, "KEY", "10.78.0.3", "192.0.2.1", "A" * 43 + "=")
+    assert "Address = 10.77.0.3/24" in peer_wg_config(
+        GLOBAL, "KEY", "10.77.0.3", "192.0.2.1", "A" * 43 + "=")
+
+
+def test_teardown_deletes_ip_rules_by_selector_not_bare_priority():
+    """`ip rule del priority N` selects solely by preference, so on a shared host using
+    99/100/101 it silently removes someone else's rule while claiming to remove only
+    blastbox state."""
+    for st in teardown_steps(GLOBAL):
+        if st.argv[:3] == ("ip", "rule", "del"):
+            assert "priority" not in st.argv, f"bare-priority delete: {' '.join(st.argv)}"
+            assert any(t in st.argv for t in ("from", "to")), \
+                f"unqualified delete: {' '.join(st.argv)}"
+
+
+def test_an_existing_non_internal_bridge_is_refused(monkeypatch):
+    """A same-named network created without --internal keeps docker's host-NAT path, so
+    an inetsim worker egresses directly and a failed netd wiring leaves a live default
+    route — silently, since everything else reports the bridge as present."""
+    from blastbox.host import egress_apply as ea
+
+    def fake(argv, **kw):
+        a = list(argv)
+        if a[:3] == ["docker", "network", "inspect"] and a[-1] == "{{.Internal}}":
+            return type("P", (), {"returncode": 0, "stdout": "false", "stderr": ""})()
+        return type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(ea, "_run", fake)
+    monkeypatch.setattr(ea, "_ok", lambda argv: True)
+    with pytest.raises(RuntimeError, match="NOT internal"):
+        ea.ensure_bridges(EgressConfig())
+
+
+def test_an_empty_managed_env_file_is_not_silently_treated_as_local(monkeypatch, tmp_path):
+    """The gate arms on the file's EXISTENCE, so falling back to defaults gives
+    mode='local' on a managed global node — skipping every global containment check."""
+    from blastbox.host import egress_apply as ea
+
+    marker = tmp_path / "egress.env"
+    marker.write_text("# nothing but a comment\n")
+    monkeypatch.setattr(ea, "ENV_FILE", marker)
+    with pytest.raises(ValueError, match="empty or unreadable"):
+        ea.persisted_config()
+
+
+def test_a_claimed_routing_table_id_is_refused(monkeypatch, tmp_path):
+    """Two names for one kernel table means `ip route replace ... table bbwg` overwrites
+    the other subsystem's routes and teardown flushes a table we do not own."""
+    from blastbox.host import egress_apply as ea
+
+    rt = tmp_path / "rt_tables"
+    rt.write_text("# reserved\n255 local\n220 cape_vpn\n")
+    monkeypatch.setattr(ea, "RT_TABLES", rt)
+    with pytest.raises(RuntimeError, match="already claimed by 'cape_vpn'"):
+        ea.ensure_rt_table(EgressConfig())
+
+
+def test_a_leftover_rule_at_the_same_priority_does_not_shadow_ours(monkeypatch):
+    """A priority is not unique. Reading only the FIRST rule at 100/101 let a leftover
+    from an earlier experiment shadow the correct one, and a fully-enforced node was
+    reported uncontained. Observed live on the exit host."""
+    from blastbox.host import egress_apply as ea
+
+    rules = ("99:\tfrom all to 10.77.0.0/24 lookup main\n"
+             "100:\tfrom 172.20.0.10 lookup bbwg\n"        # stale, listed first
+             "100:\tfrom 172.29.0.10 lookup bbwg\n"        # ours
+             "101:\tfrom 172.20.0.10 blackhole\n"          # stale, listed first
+             "101:\tfrom 172.29.0.10 blackhole\n")         # ours
+    ea_ = _fake_host(monkeypatch, rules=rules, forward=_GOOD_FWD, chain=_GOOD_CHAIN)
+    ok, why = ea_.enforcement_present(GLOBAL)
+    assert ok, why

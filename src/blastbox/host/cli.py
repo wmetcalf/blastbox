@@ -840,7 +840,7 @@ def _egress_cmd_inner(args: argparse.Namespace) -> int:
         return 0
 
     if action == "gateway-exit":
-        for n in ea.apply_exit_host(cfg_from(args)):
+        for n in ea.apply_exit_host(cfg_from(args), persist=True):
             print(f"  {n}")
         return 0
 

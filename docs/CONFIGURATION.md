@@ -474,7 +474,7 @@ Dispatcher-side knobs (not written to the file):
 |---|---|---|
 | `BLASTBOX_EGRESS_HEALTH_GATE` | auto | `1`/`0` forces the defer-on-degraded gate on or off. Auto = armed only when `/etc/blastbox/egress.env` exists |
 | `BLASTBOX_EGRESS_HEALTH_TTL_S` | `15` | how long a health verdict is cached |
-| `BLASTBOX_EGRESS_DEFER_MAX_S` | `600` | after this long still degraded, a deferred job is FAILED with the health reason instead of deferring forever |
+| `BLASTBOX_EGRESS_DEFER_CAP_S` | `300` | ceiling on the escalating re-claim delay for a deferred job. Deferring never FAILS a job — a healthy peer may still take it; `BLASTBOX_MAX_QUEUED_AGE_S` (off by default) is what expires one |
 
 ## Network policy / egress overlay (netpolicy)
 
