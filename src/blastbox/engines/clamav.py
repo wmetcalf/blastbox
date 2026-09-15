@@ -292,6 +292,26 @@ def scan_stream(data: bytes, timeout: float = 120.0) -> list[str]:
     return hits
 
 
+#: clamd's own name for "I stopped early because a limit was hit". With
+#: `AlertExceedsMax` on it arrives in the hit list, but it is NOT a signature match —
+#: treating it as one would report every oversized sample as malware, and ignoring it
+#: would report every oversized sample as clean. It is neither: it means the scan is
+#: incomplete.
+_LIMIT_HEURISTIC = "Heuristics.Limits.Exceeded"
+
+#: The shipped clamd.conf sets `MaxFileSize 25M` / `StreamMaxLength 25M`, and blastbox's
+#: default input limit is 100 MiB. A file in between is NOT SCANNED — clamd declines it
+#: — and without this check the empty hit list was sealed as a clean verdict. The conf's
+#: own comment says "a scanner that reports clean on a file it declined to read is the
+#: false negative this whole engine rewrite was about. The driver reads them back and
+#: says so." It did not. Now it does.
+#:
+#: Override when you change clamd.conf; they must agree, and disagreeing in the
+#: permissive direction re-opens exactly this hole.
+MAX_SCANNABLE_BYTES = int(os.environ.get("BLASTBOX_CLAMD_MAX_FILE_BYTES",
+                                         str(25 * 1024 * 1024)))
+
+
 def _detected(hits: list[str]) -> Detection:
     return Detection(
         label=hits[0] if hits else "clean",
@@ -299,6 +319,19 @@ def _detected(hits: list[str]) -> Detection:
         confidence=1.0,
         source="clamav",
     )
+
+
+def _undetermined() -> Detection:
+    """The detection for a scan that did not happen.
+
+    `_detected([])` yields `label="clean", confidence=1.0`, and the generic job summary
+    surfaces that label independently of the typed payload — so an outage or a declined
+    file produced a HIGH-CONFIDENCE CLEAN verdict in every list view, no matter how
+    carefully the payload was typed. The payload discrimination was doing its job; the
+    detection beside it was quietly contradicting it.
+    """
+    return Detection(label="unknown", mime="application/octet-stream",
+                     confidence=0.0, source="clamav")
 
 
 
@@ -335,6 +368,27 @@ class ClamAVEngine:
     def detonate(self, input: Path, outdir: Path, limits: Limits) -> DetonationResult:
         data_len = input.stat().st_size
         version = db_version(2.0)
+        if data_len > MAX_SCANNABLE_BYTES:
+            # NOT a clean result. clamd declines a file over MaxFileSize and returns no
+            # hits; sealing that as `infected: false` is a false negative manufactured by
+            # configuration. Same payload type as a daemon outage, for the same reason:
+            # it has no `infected` field to misread.
+            return DetonationResult(
+                payload=_sealed(SignatureScanUnavailable(
+                    error=(f"sample is {data_len} bytes, above the scanner's "
+                           f"{MAX_SCANNABLE_BYTES}-byte limit (clamd MaxFileSize / "
+                           "StreamMaxLength) — it was NOT scanned. Raise both the clamd "
+                           "limits and BLASTBOX_CLAMD_MAX_FILE_BYTES together, or reject "
+                           "the sample upstream."),
+                    db_version=version or "unknown")),
+                artifacts=[],
+                detected=_undetermined(),
+                warnings=[Warning(
+                    code="sample_exceeds_scanner_limit",
+                    message=f"{data_len} bytes > {MAX_SCANNABLE_BYTES}; no signatures "
+                            "were applied to this sample")],
+                status="engine_error",
+            )
         # ALL-MATCH WHEN THE DAEMON CAN SEE THE FILE, which in the in-guest deployment it
         # always can. Roughly 9x the signatures on real samples; see the module docstring.
         all_match = _shares_filesystem()
@@ -361,12 +415,25 @@ class ClamAVEngine:
                 payload=_sealed(SignatureScanUnavailable(error=str(exc)[:1000],
                                                          db_version=version or "unknown")),
                 artifacts=[],
-                detected=_detected([]),
+                detected=_undetermined(),
                 warnings=[Warning(code="clamd_unavailable", message=str(exc)[:2000])],
                 status="engine_error",
             )
 
+        # `Heuristics.Limits.Exceeded` is clamd saying it stopped early, not a
+        # signature. Left in `hits` it reports every oversized archive as malware;
+        # dropped silently it reports the same sample as clean. It is neither — the scan
+        # is incomplete, so the detection becomes "unknown" and a warning says why.
+        truncated = [h for h in hits if h.startswith(_LIMIT_HEURISTIC)]
+        hits = [h for h in hits if not h.startswith(_LIMIT_HEURISTIC)]
+
         warnings: list[Warning] = []
+        if truncated:
+            warnings.append(Warning(
+                code="scan_truncated_by_limits",
+                message="clamd hit a scan limit (MaxScanSize/MaxFiles/MaxRecursion) and "
+                        "stopped early, so parts of this sample were never examined: "
+                        + ", ".join(sorted(set(truncated))[:5])))
         if degraded:
             warnings.append(Warning(
                 code="all_match_unavailable",
@@ -395,7 +462,9 @@ class ClamAVEngine:
                 bytes_scanned=data_len,
             )),
             artifacts=[],
-            detected=_detected(hits),
+            # A truncated scan that found nothing has not found nothing — it ran out of
+            # budget. Only a COMPLETE scan may say "clean".
+            detected=_detected(hits) if (hits or not truncated) else _undetermined(),
             warnings=warnings,
             status="ok",
         )
