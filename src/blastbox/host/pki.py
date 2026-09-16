@@ -295,9 +295,36 @@ class CertAuthority:
         return cert.public_bytes(serialization.Encoding.PEM)
 
 
-def node_identity(ca: CertAuthority, cert_pem: bytes,
+class TrustAnchor:
+    """A CA's PUBLIC half only — enough to VERIFY, not to issue.
+
+    Verification needs the CA certificate and nothing else, but the only loader was
+    `load_ca`, which reads `ca.key` too and raises without it. That made `egress
+    peer-add --cert` — an operation whose entire job is checking a signature — require
+    the CA PRIVATE KEY to be present on the exit host, contradicting `CertAuthority`'s
+    own docstring ("Hold the key only on the dispatcher") and putting the key that mints
+    every node identity onto the machine that carries every peer's traffic.
+    """
+
+    def __init__(self, cert: x509.Certificate) -> None:
+        self._cert = cert
+
+    @property
+    def cert_pem(self) -> bytes:
+        return self._cert.public_bytes(serialization.Encoding.PEM)
+
+
+def load_trust_anchor(pki_dir: Path) -> TrustAnchor:
+    """Load ca.crt alone. Use this wherever the operation only VERIFIES."""
+    return TrustAnchor(x509.load_pem_x509_certificate((Path(pki_dir) / "ca.crt").read_bytes()))
+
+
+def node_identity(ca: "CertAuthority | TrustAnchor", cert_pem: bytes,
                   *, allow_expired: bool = False) -> NodeIdentity:
     """Verify a node cert against ``ca`` and return its identity, or raise.
+
+    ``ca`` may be a full :class:`CertAuthority` or a verify-only
+    :class:`TrustAnchor`; only its public certificate is read.
 
     THIS IS THE AUTHORISATION CHECK, so it does the whole job rather than parsing
     hopefully:

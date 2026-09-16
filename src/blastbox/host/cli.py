@@ -897,9 +897,15 @@ def _egress_cmd_inner(args: argparse.Namespace) -> int:
     if action == "peer-add":
         cfg = cfg_from(args)
         if args.cert:
-            from blastbox.host.pki import load_ca, node_identity
+            # THE PUBLIC HALF IS ENOUGH, and insisting on more was a real privilege
+            # problem: `load_ca` reads ca.key and raises without it, so this — an
+            # operation whose whole job is checking a signature — required the key that
+            # mints every node identity to sit on the exit host, the machine that
+            # carries every peer's traffic. CertAuthority's own docstring says to hold
+            # that key only on the dispatcher.
+            from blastbox.host.pki import load_trust_anchor, node_identity
             try:
-                ident = node_identity(load_ca(Path(args.pki_dir)),
+                ident = node_identity(load_trust_anchor(Path(args.pki_dir)),
                                       Path(args.cert).read_bytes())
             except (ValueError, FileNotFoundError) as exc:
                 print(f"error: {exc}", file=sys.stderr)
@@ -948,11 +954,13 @@ def _egress_cmd_inner(args: argparse.Namespace) -> int:
         cfg = cfg_from(args)
         # Map wg key -> node id from the CERTIFICATES on disk, never from anything a
         # node published: the whole point is an answer the peer cannot influence.
-        from blastbox.host.pki import load_ca, node_identity
+        # The public half only: attestation VERIFIES, and this runs on the exit host,
+        # which is the last machine that should hold the key that mints node identities.
+        from blastbox.host.pki import load_trust_anchor, node_identity
         key_to_node: dict[str, str] = {}
         pki_dir = Path(args.pki_dir)
         try:
-            ca = load_ca(pki_dir)
+            ca = load_trust_anchor(pki_dir)
         except Exception as exc:
             print(f"error: cannot load the CA from {pki_dir}: {exc}", file=sys.stderr)
             return 1
@@ -996,7 +1004,14 @@ def _egress_cmd_inner(args: argparse.Namespace) -> int:
                       "job placed there fails closed")
             if not verdicts and not missing:
                 print("  no peers registered on this exit")
-        return 1 if any(v.contradicted for v in verdicts) else 0
+        # AN ABSENT PEER IS A FINDING, and this used to exit 0 for it — so a cron or CI
+        # invocation reported success for an exit host on which an enrolled node has no
+        # tunnel at all and every job placed there fails closed. Distinct codes because
+        # the two demand different responses: 1 is a suspected LEAK (investigate the
+        # node), 2 is a registration or connectivity fault (fix the enrolment).
+        if any(v.contradicted for v in verdicts):
+            return 1
+        return 2 if missing else 0
 
     if action == "peer-prune":
         cfg = cfg_from(args)
@@ -1195,7 +1210,8 @@ def build_parser() -> argparse.ArgumentParser:
     pe_at = pes.add_parser(
         "attest", parents=[common],
         help="exit host: verify peers' containment from HERE, where they cannot edit "
-             "the answer")
+             "the answer. Exit 0 = clean, 1 = a peer CONTRADICTS its containment "
+             "claim, 2 = an enrolled peer has no tunnel at all")
     pe_at.add_argument("--working", action="append", default=[],
                        help="node id the control plane dispatched egress work to "
                             "(repeatable). Supply this from the job store — never from "

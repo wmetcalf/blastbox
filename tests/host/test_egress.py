@@ -1421,3 +1421,227 @@ def test_the_routing_table_id_the_error_message_names_is_actually_read():
     lines = dict(line.split("=", 1) for line in cfg.to_env_lines())
     assert lines["BLASTBOX_EGRESS_RT_TABLE_ID"] == "251"
     assert EgressConfig.from_env(lines).rt_table_id == 251
+
+
+def test_bringing_the_overlay_up_reconciles_an_interface_that_is_already_up(monkeypatch):
+    """`systemctl enable --now` does not restart an ACTIVE unit. So re-running `egress
+    peer` on a node whose interface was already up rewrote the config, printed a public
+    key and exited 0 while the live interface kept the previous gateway address, port
+    and peer key. The operator registers that key on the exit host, the handshake never
+    happens, and nothing anywhere reports a failure. This is exactly what _reload_wg was
+    written for, and wg_up did not use it."""
+    from blastbox.host import egress_apply as ea
+
+    calls = []
+
+    def fake_ok(argv):
+        calls.append(argv)
+        return argv[:2] == ["systemctl", "is-active"] or argv[:3] == ["ip", "link", "show"]
+
+    reloaded = []
+    monkeypatch.setattr(ea, "_ok", fake_ok)
+    monkeypatch.setattr(ea, "_reload_wg", lambda cfg: reloaded.append(cfg.wg_iface))
+    ea.wg_up(EgressConfig())
+
+    assert reloaded == ["bbwg0"], "an already-up interface must be reconciled, not skipped"
+    assert not any(a[:2] == ["systemctl", "enable"] for a in calls), (
+        "enable --now on an active unit is the no-op this test exists to prevent"
+    )
+
+
+def test_bringing_up_a_down_overlay_still_starts_it(monkeypatch):
+    """The other half: nothing is running, so it must actually be started."""
+    from blastbox.host import egress_apply as ea
+
+    started = []
+
+    def fake_ok(argv):
+        if argv[:2] == ["systemctl", "enable"]:
+            started.append(argv)
+            return True
+        return False        # not active, no such link
+
+    monkeypatch.setattr(ea, "_ok", fake_ok)
+    monkeypatch.setattr(ea, "_reload_wg",
+                        lambda cfg: pytest.fail("must not reconcile an interface that is down"))
+    ea.wg_up(EgressConfig())
+    assert started
+
+
+# --------------------------------------------------------------------------------------
+# The RETURN leg: fails closed, and therefore silently.
+# --------------------------------------------------------------------------------------
+
+def _iptables_stub(monkeypatch, *, readable=True, chains=()):
+    from blastbox.host import egress_apply as ea
+
+    def run(argv, **kw):
+        rc, out = 1, ""
+        if argv[:1] == ["iptables"]:
+            if not readable:
+                rc = 4          # xtables: permission denied
+            elif argv[-1] == "FORWARD":
+                rc, out = 0, ""
+            elif argv[-1] in chains:
+                rc, out = 0, f"-N {argv[-1]}\n"
+        return type("P", (), {"returncode": rc, "stdout": out, "stderr": ""})()
+
+    monkeypatch.setattr(ea, "_run", run)
+
+
+def test_a_missing_return_chain_is_reported_rather_than_read_as_healthy(monkeypatch):
+    """Both hosts run FORWARD policy DROP and the outbound chains match on SOURCE, so
+    without its own conntrack chain the reply direction matches nothing. This fails
+    CLOSED — which is why it must NOT count as "uncontained", that would be a leak
+    alarm about the opposite of a leak — but it is a total outage with a famously
+    confusing presentation: the forward path works, tcpdump shows the replies arriving,
+    and every client times out. Nothing checked for it."""
+    from blastbox.host import egress_apply as ea
+    from blastbox.host.egress import CHAIN_EXIT_RET
+
+    _iptables_stub(monkeypatch, chains=())
+    why = ea.return_chain_missing(EgressConfig(exit_host=True))
+    assert why and CHAIN_EXIT_RET in why and "time out" in why
+
+
+def test_a_present_return_chain_says_nothing(monkeypatch):
+    from blastbox.host import egress_apply as ea
+    from blastbox.host.egress import CHAIN_FWD_RET
+
+    _iptables_stub(monkeypatch, chains=(CHAIN_FWD_RET,))
+    assert ea.return_chain_missing(EgressConfig(mode="global", upstream_gw="10.77.0.1")) is None
+
+
+def test_iptables_being_unreadable_is_not_reported_as_a_missing_chain(monkeypatch):
+    """"Cannot observe" is not "observed absent" — the dispatcher is cap-dropped, and
+    reading its inability as a fault would mark every healthy node unhealthy."""
+    from blastbox.host import egress_apply as ea
+
+    _iptables_stub(monkeypatch, readable=False)
+    assert ea.return_chain_missing(EgressConfig(exit_host=True)) is None
+
+
+# --------------------------------------------------------------------------------------
+# Peer registration collisions
+# --------------------------------------------------------------------------------------
+
+_GW_CONF = """[Interface]
+PrivateKey = x
+Address = 10.77.0.1/24
+
+# peer:toolz3
+[Peer]
+PublicKey = AAAA
+AllowedIPs = 10.77.0.3/32
+"""
+
+
+def test_two_peers_cannot_share_one_overlay_address():
+    """AllowedIPs is cryptokey routing, not a route table: for a destination WireGuard
+    picks the LAST matching peer. So registering toolz4 on an address toolz3 already
+    holds delivers toolz3's return traffic into toolz4's tunnel — one tenant's replies
+    handed to another tenant's node, on the host whose whole purpose is keeping them
+    apart, with no error anywhere."""
+    from blastbox.host.egress_apply import _refuse_peer_collision
+
+    with pytest.raises(RuntimeError, match="already registered to peer 'toolz3'"):
+        _refuse_peer_collision(_GW_CONF, name="toolz4", peer_ip="10.77.0.3",
+                               public_key="BBBB", iface="bbwg0")
+    # the bare form as well as the /32 the config records
+    with pytest.raises(RuntimeError):
+        _refuse_peer_collision(_GW_CONF, name="toolz4", peer_ip="10.77.0.3/32",
+                               public_key="BBBB", iface="bbwg0")
+
+
+def test_one_public_key_cannot_be_registered_twice():
+    """wg-quick refuses the duplicate at load time, but the config has already been
+    rewritten — so the exit host is left with a file it cannot apply and drops every
+    peer at the next reload."""
+    from blastbox.host.egress_apply import _refuse_peer_collision
+
+    with pytest.raises(RuntimeError, match="already registered as peer 'toolz3'"):
+        _refuse_peer_collision(_GW_CONF, name="toolz4", peer_ip="10.77.0.9",
+                               public_key="AAAA", iface="bbwg0")
+
+
+def test_renewing_the_same_peer_is_not_a_collision():
+    """Renewal is the COMMON path — a 7-day cert means every node comes back weekly —
+    and refusing it would make the fix worse than the bug."""
+    from blastbox.host.egress_apply import _refuse_peer_collision
+
+    _refuse_peer_collision(_GW_CONF, name="toolz3", peer_ip="10.77.0.3",
+                           public_key="AAAA", iface="bbwg0")
+    # including a rotated key at the same address
+    _refuse_peer_collision(_GW_CONF, name="toolz3", peer_ip="10.77.0.3",
+                           public_key="CCCC", iface="bbwg0")
+
+
+def test_a_free_address_and_key_are_accepted():
+    from blastbox.host.egress_apply import _refuse_peer_collision
+
+    _refuse_peer_collision(_GW_CONF, name="toolz4", peer_ip="10.77.0.4",
+                           public_key="BBBB", iface="bbwg0")
+
+
+# --------------------------------------------------------------------------------------
+# The overlay prefix was never checked against anything.
+# --------------------------------------------------------------------------------------
+
+def _routes(monkeypatch, cidrs, *, ours=()):
+    from blastbox.host import egress_apply as ea
+
+    monkeypatch.setattr(ea, "claimed_cidrs", lambda: list(cidrs))
+    monkeypatch.setattr(ea, "_run", lambda argv, **kw: type("P", (), {
+        "returncode": 0,
+        "stdout": __import__("json").dumps([{"dst": d} for d in ours]),
+        "stderr": "",
+    })())
+
+
+def test_an_overlay_prefix_the_host_already_routes_is_refused(monkeypatch):
+    """allocate_subnets only knows the four bridges, so the overlay was applied to
+    whatever host it landed on. On a box already routing 10.77.0.0/24 — a CAPE
+    per-analysis VPN range, a corporate LAN — bringing the interface up puts the
+    overlay address and the `to <overlay> lookup main` rule over a live network, and an
+    exit host additionally source-routes the whole prefix into its sidecar."""
+    from blastbox.host import egress_apply as ea
+
+    _routes(monkeypatch, ["10.77.0.0/24", "192.168.1.0/24"])
+    with pytest.raises(RuntimeError, match="overlaps 10.77.0.0/24"):
+        ea.check_overlay_net(EgressConfig())
+
+
+def test_a_partial_overlap_is_also_refused(monkeypatch):
+    """A /32 inside our prefix is someone's live address; handing that address to a
+    peer misdelivers their traffic."""
+    from blastbox.host import egress_apply as ea
+
+    _routes(monkeypatch, ["10.77.0.7/32"])
+    with pytest.raises(RuntimeError):
+        ea.check_overlay_net(EgressConfig())
+
+
+def test_our_own_overlay_route_is_not_a_conflict(monkeypatch):
+    """Re-applying must be idempotent; by the second run our own route is in the
+    table, and vetoing it would make the tier un-reappliable."""
+    from blastbox.host import egress_apply as ea
+
+    _routes(monkeypatch, ["10.77.0.0/24"], ours=["10.77.0.0/24"])
+    ea.check_overlay_net(EgressConfig())
+
+
+def test_a_summary_prefix_is_advisory_here_too(monkeypatch):
+    """An interface configured 10.0.12.34/8 yields 10.0.0.0/8; the bridge allocator
+    treats that as advisory for exactly this reason, and this check must agree or the
+    flat-10 lab can never run an overlay at all."""
+    from blastbox.host import egress_apply as ea
+
+    _routes(monkeypatch, ["10.0.0.0/8"])
+    ea.check_overlay_net(EgressConfig())
+
+
+def test_a_free_overlay_prefix_is_accepted(monkeypatch):
+    from blastbox.host import egress_apply as ea
+
+    _routes(monkeypatch, ["192.168.1.0/24", "172.17.0.0/16"])
+    ea.check_overlay_net(EgressConfig())

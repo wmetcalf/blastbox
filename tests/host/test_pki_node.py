@@ -360,3 +360,33 @@ def test_the_exit_host_stanza_also_refuses_an_out_of_overlay_address():
         gateway_peer_stanza("toolz3", "10.78.0.3", WG, None, cfg)
     assert "AllowedIPs = 10.77.0.3/32" in gateway_peer_stanza(
         "toolz3", "10.77.0.3", WG, None, cfg)
+
+
+def test_verifying_a_node_cert_needs_only_the_public_half(ca, tmp_path):
+    """`egress peer-add --cert` checks a signature. The only loader was `load_ca`,
+    which reads ca.key and raises without it — so an operation that verifies required
+    the key that MINTS every node identity to be present on the exit host, the machine
+    carrying every peer's traffic, contradicting CertAuthority's own docstring."""
+    issued = ca.issue_node("toolz3", wg_pubkey=WG, grants=NodeGrants(tiers=("wireguard",)))
+
+    # An exit host that holds ca.crt and NOTHING else.
+    exit_pki = tmp_path / "exit-pki"
+    exit_pki.mkdir()
+    (exit_pki / "ca.crt").write_bytes(pki.load_trust_anchor(tmp_path / "pki").cert_pem)
+    assert not (exit_pki / "ca.key").exists()
+
+    ident = pki.node_identity(pki.load_trust_anchor(exit_pki), issued.cert_pem)
+    assert ident.node_id == "toolz3"
+    assert ident.wg_pubkey == WG
+
+    # And it is still a real check, not a parse.
+    with pytest.raises(ValueError):
+        pki.node_identity(pki.load_trust_anchor(exit_pki),
+                          pki.ensure_ca(tmp_path / "rogue").issue_node(
+                              "toolz3", wg_pubkey=WG).cert_pem)
+
+
+def test_a_trust_anchor_cannot_issue_anything():
+    """It must be the public half, not a CertAuthority with a missing attribute."""
+    assert not hasattr(pki.TrustAnchor, "issue_node")
+    assert not hasattr(pki.TrustAnchor, "key_pem")

@@ -29,6 +29,7 @@ from blastbox.host.egress import (
     CHAIN_FWD,
     CHAIN_FWD_RET,
     PRIO_BLACKHOLE,
+    SUMMARY_PREFIXLEN,
     PRIO_LOOKUP,
     EgressConfig,
     Health,
@@ -578,6 +579,30 @@ def address_owner(cfg: EgressConfig, address: str) -> str | None:
     return None
 
 
+def return_chain_missing(cfg: EgressConfig) -> str | None:
+    """Reason string if this role's conntrack RETURN chain is absent, else None.
+
+    Deliberately NOT part of :func:`enforcement_present`. A missing return chain is not
+    a containment failure — it fails CLOSED, because both hosts run FORWARD policy DROP
+    and the reply direction then matches nothing — so counting it as "uncontained"
+    would raise a leak alarm about the opposite of a leak. But it IS a total outage
+    with a famously confusing presentation: the forward path works, tcpdump shows the
+    replies arriving, and every client times out. Nothing checked for it, so a node in
+    that state advertised itself as healthy and silently failed every job it took.
+
+    Returns None rather than a false negative when iptables cannot be read at all (the
+    cap-dropped dispatcher): "cannot observe" is not "observed absent".
+    """
+    chain = CHAIN_EXIT_RET if cfg.exit_host else CHAIN_FWD_RET
+    if _run(["iptables", "-w", "2", "-S", "FORWARD"], check=False).returncode != 0:
+        return None
+    if _chain_exists(chain):
+        return None
+    return (f"{chain} is missing, so the conntrack RETURN leg is dropped by FORWARD's "
+            "policy: the tunnel will handshake, packets will leave, replies will arrive "
+            "at this host and every client will time out")
+
+
 def node_health(cfg: EgressConfig) -> Health:
     """Whether this node can currently egress UNDER ITS POLICY.
 
@@ -608,6 +633,8 @@ def node_health(cfg: EgressConfig) -> Health:
         # and prune_expired_peers runs on every apply (boot unit, reconcile timer), so
         # the fleet goes dark on a 7-day clock with nothing having said so. Say so.
         soon = peer_expiry_note(cfg)
+        if (ret := return_chain_missing(cfg)) is not None:
+            return Health(False, f"exit host: {ret}{soon}")
         return Health(bool(owner),
                       (f"exit host: {owner} holds {cfg.vpn_gateway_ip}; {why}" if owner
                        else f"exit host: NOTHING holds {cfg.vpn_gateway_ip} — the exit "
@@ -616,6 +643,8 @@ def node_health(cfg: EgressConfig) -> Health:
     enforced, why = enforcement_present(cfg)
     if not enforced:
         return Health(False, why)
+    if cfg.mode == "global" and (ret := return_chain_missing(cfg)) is not None:
+        return Health(False, ret)
     if cfg.mode == "local":
         reachable = _ok(["ping", "-c1", "-W2", cfg.vpn_gateway_ip])
         return Health(reachable,
@@ -707,6 +736,56 @@ def plan_subnets(cfg: EgressConfig, *, auto: bool = True) -> SubnetPlan:
             "iproute2, or set BLASTBOX_EGRESS_ALLOW_UNKNOWN_ROUTES=1 to proceed anyway "
             "(and be certain your subnets are free).")
     return allocate_subnets(cfg, claimed, auto=auto, skip=frozenset(existing))
+
+
+def check_overlay_net(cfg: EgressConfig) -> None:
+    """Refuse an overlay prefix this host already routes somewhere else.
+
+    THE FOUR BRIDGES ARE ALLOCATED AGAINST `claimed_cidrs()`; THE OVERLAY NEVER WAS.
+    `allocate_subnets` only knows about bb-net0/bb-fakenet/bb-socks/bb-vpn, so the
+    default 10.77.0.0/24 was applied to whatever host it landed on. On a box that
+    already routes it — a CAPE per-analysis VPN range, a corporate LAN, another
+    overlay — bringing the interface up installs the overlay address and the
+    `to <overlay> lookup main` rule over a real network, and the exit host additionally
+    source-routes the whole prefix into its sidecar. That is both an outage for the
+    existing network and a silent misdelivery of its traffic.
+
+    The node's own wg interface is not a conflict: re-applying must be idempotent, and
+    by the second run our own overlay route is in the table.
+
+    A summary prefix is advisory (see :data:`~blastbox.host.egress.SUMMARY_PREFIXLEN`),
+    for the same reason the bridge allocator treats it as advisory: an interface
+    configured 10.0.12.34/8 must not veto every 10/8 candidate on the host.
+    """
+    try:
+        want = ipaddress.ip_network(cfg.overlay_net, strict=False)
+    except ValueError:
+        return
+    ours: set[str] = set()
+    proc = _run(["ip", "-j", "route", "show", "dev", cfg.wg_iface], check=False)
+    if proc.returncode == 0:
+        try:
+            ours = {r["dst"] for r in json.loads(proc.stdout or "[]") if r.get("dst")}
+        except (json.JSONDecodeError, TypeError):
+            ours = set()
+    for cidr in claimed_cidrs():
+        if cidr in ours:
+            continue
+        try:
+            other = ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            continue
+        if other.version != want.version or not other.overlaps(want):
+            continue
+        if other.prefixlen <= SUMMARY_PREFIXLEN and other.prefixlen < want.prefixlen:
+            continue        # advisory summary, same rule the bridge allocator uses
+        raise RuntimeError(
+            f"the overlay prefix {cfg.overlay_net} overlaps {cidr}, which this host "
+            "already routes. Bringing the overlay up would put its address and the "
+            f"`to {cfg.overlay_net} lookup main` rule over a live network — and on an "
+            "exit host source-route the whole prefix into the exit sidecar. Choose a "
+            "free range with --overlay-net (and the matching --upstream-gw), or remove "
+            "the conflicting route first.")
 
 
 def ensure_bridges(cfg: EgressConfig, *, dry_run: bool = False) -> list[str]:
@@ -828,12 +907,24 @@ def ensure_rt_table(cfg: EgressConfig) -> None:
 
 
 def wg_up(cfg: EgressConfig) -> None:
-    """Bring the overlay interface up, or raise. Both paths failing is not a warning.
+    """Bring the overlay interface up WITH THE CURRENT CONFIG, or raise.
 
     Discarding the fallback's return code meant `egress gateway`/`peer` printed a public
     key and exited zero while the interface had never started — an operator would go on
     configuring an overlay that does not exist (missing kernel module, invalid config).
+
+    ALREADY-UP IS THE INTERESTING CASE, and it was the silent one. `systemctl enable
+    --now` does not restart an active unit, so re-running `egress peer` on a node whose
+    interface was already up rewrote the config, took this early return, printed a
+    public key and exited 0 — with the LIVE interface still holding the previous
+    gateway address, port and peer key. The operator then registers that key on the exit
+    host and the handshake never happens, with nothing anywhere reporting a failure.
+    This is the same defect `_reload_wg` was written for; it just was not used here.
     """
+    if _ok(["systemctl", "is-active", f"wg-quick@{cfg.wg_iface}"]) \
+            or _ok(["ip", "link", "show", cfg.wg_iface]):
+        _reload_wg(cfg)
+        return
     if _ok(["systemctl", "enable", "--now", f"wg-quick@{cfg.wg_iface}"]):
         return
     proc = _run(["wg-quick", "up", cfg.wg_iface], check=False)
@@ -845,6 +936,7 @@ def wg_up(cfg: EgressConfig) -> None:
 def setup_gateway(cfg: EgressConfig) -> str:
     """Stand up the exit host's overlay endpoint. Returns its public key."""
     _require_wg()
+    check_overlay_net(cfg)
     WG_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(WG_DIR, 0o700)
     priv, pub = ensure_keypair(cfg.wg_iface)
@@ -862,7 +954,9 @@ def setup_gateway(cfg: EgressConfig) -> str:
         peers = body[body.index("\n# peer:"):] if "\n# peer:" in body else ""
         if body != want + peers:
             _write_conf(conf, want + peers)
-            _run(["systemctl", "restart", f"wg-quick@{cfg.wg_iface}"], check=False)
+            # wg_up below reconciles a live interface via _reload_wg, which RAISES if
+            # neither path reached it. This used to be a `check=False` restart whose
+            # failure was discarded, so a rewritten [Interface] could stay on disk only.
         # It holds a PrivateKey line. A conf left 0644 by a predecessor installer or a
         # restore was never corrected here, and the exit host's key is the one that lets
         # an attacker impersonate the central exit for every peer.
@@ -953,6 +1047,47 @@ def _reload_wg(cfg: EgressConfig) -> None:
         "interface still has the old peers. Restart it by hand before trusting this.")
 
 
+def _peer_blocks(body: str) -> list[tuple[str, str, str]]:
+    """``(name, allowed_ip, public_key)`` for each peer in a gateway wg config."""
+    out: list[tuple[str, str, str]] = []
+    name = ip = key = ""
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("# peer:"):
+            if name:
+                out.append((name, ip, key))
+            name, ip, key = stripped[len("# peer:"):].strip(), "", ""
+        elif stripped.startswith("AllowedIPs") and name:
+            ip = stripped.partition("=")[2].strip()
+        elif stripped.startswith("PublicKey") and name:
+            key = stripped.partition("=")[2].strip()
+    if name:
+        out.append((name, ip, key))
+    return out
+
+
+def _refuse_peer_collision(body: str, *, name: str, peer_ip: str, public_key: str,
+                           iface: str) -> None:
+    """Raise if this registration would collide with a DIFFERENT existing peer."""
+    want_ip = {peer_ip, f"{peer_ip}/32"}
+    for other, ip, key in _peer_blocks(body):
+        if other == name:
+            continue        # a renewal of the same peer: reconciled by the caller
+        if ip and ip in want_ip:
+            raise RuntimeError(
+                f"{peer_ip} is already registered to peer {other!r} on {iface}. "
+                "AllowedIPs is cryptokey routing, not a route table: the LAST matching "
+                f"peer wins, so adding {name!r} here would deliver {other!r}'s return "
+                "traffic into a different node's tunnel. Pick a free overlay address, "
+                f"or remove {other!r} first.")
+        if key and key == public_key:
+            raise RuntimeError(
+                f"that public key is already registered as peer {other!r} on {iface}. "
+                "wg-quick refuses a duplicate key at load time, so writing this would "
+                "leave an exit host with a config it cannot apply and drop every peer "
+                "at the next reload.")
+
+
 def add_peer(cfg: EgressConfig, name: str, peer_ip: str, public_key: str,
              expires: str | None = None) -> bool:
     """Register a peer on the exit host. Returns False if it was already present.
@@ -960,9 +1095,24 @@ def add_peer(cfg: EgressConfig, name: str, peer_ip: str, public_key: str,
     Only the peer's PUBLIC key is accepted — the peer generates its own keypair and the
     private half never travels. There is deliberately no option to generate a peer's key
     here.
+
+    Raises on a COLLISION with a different peer. Nothing checked this, and both shapes
+    misroute silently:
+
+    * **Two peers on one overlay address.** ``AllowedIPs`` is cryptokey routing, not a
+      route table: for a given destination WireGuard picks the LAST matching peer, so
+      enrolling toolz4 at an address toolz3 already holds sends toolz3's return traffic
+      into toolz4's tunnel. One tenant's replies delivered to another tenant's node, on
+      an exit host whose entire purpose is keeping them apart, and no error anywhere.
+    * **One public key under two names.** wg-quick refuses the duplicate key when the
+      config is applied, but `_write_conf` has already replaced the file — so the exit
+      host ends up with a config it cannot load and every peer drops at the next
+      reload.
     """
     conf = WG_DIR / f"{cfg.wg_iface}.conf"
     body = conf.read_text() if conf.exists() else ""
+    _refuse_peer_collision(body, name=name, peer_ip=peer_ip, public_key=public_key,
+                           iface=cfg.wg_iface)
     stanza = gateway_peer_stanza(name, peer_ip, public_key, expires, cfg)
     marker = f"\n# peer:{name}\n"
     if marker in body:
@@ -986,6 +1136,7 @@ def add_peer(cfg: EgressConfig, name: str, peer_ip: str, public_key: str,
 def setup_peer(cfg: EgressConfig, peer_ip: str, gateway_addr: str, gateway_pubkey: str) -> str:
     """Stand up a worker node's overlay endpoint. Returns its public key to register."""
     _require_wg()
+    check_overlay_net(cfg)
     priv, pub = ensure_keypair(cfg.wg_iface)
     _write_conf(WG_DIR / f"{cfg.wg_iface}.conf",
                 peer_wg_config(cfg, priv.read_text().strip(), peer_ip,
