@@ -44,7 +44,20 @@ def test_a_confident_overwrite_is_not_called_a_confidence_problem(tmp_path):
     codes = [w.code for w in r.warnings]
     assert codes == ["prediction_overwritten"], codes
     msg = r.warnings[0].message
-    assert "overwrite_map" in msg and "confidence" not in msg.lower(), msg
+    # The point is that the warning must not ASSERT the model was unsure. It may (and
+    # now must) say WHICH label the score describes, which is a different statement and
+    # the one that stops a reader pairing 0.9991 with "unknown".
+    assert "overwrite_map" in msg, msg
+    assert "low_confidence" not in msg and "unsure" not in msg.lower(), msg
+    assert "randombytes" in msg and "NOT in the delivered label" in msg, msg
+    # ...and the generic confidence field must not claim that number for a label the
+    # model never predicted.
+    assert r.detected.label == "unknown"
+    assert r.detected.confidence == 0.0, (
+        "0.9991 is certainty about randombytes; publishing it as confidence in "
+        "'unknown' makes a threshold see a near-certain finding about something else"
+    )
+    assert r.payload.fields["score"] == 0.9991, "the raw score still belongs in the payload"
 
 
 def test_the_model_prediction_survives_an_overwrite(tmp_path):
@@ -239,3 +252,43 @@ def test_the_read_limit_env_var_is_validated(monkeypatch, raw, expect_default):
     got = _max_bytes()
     assert (got == DEFAULT_MAX_BYTES) is expect_default
     assert got > 0, "a non-positive limit identifies the empty string, not the sample"
+
+
+def test_a_low_confidence_fallback_does_not_publish_the_rejected_guesss_doubt(tmp_path):
+    """The other direction, and it is not harmless either. Measured against magika
+    1.0.3, a short text file gives label="txt", model_label="batch", score=0.374 — the
+    0.374 is the model's DOUBT ABOUT BATCH, and Magika chose txt precisely because of
+    it. Publishing 0.374 as confidence in "txt" makes a threshold discard a label the
+    library was more sure of than the one it rejected."""
+    r = _run(tmp_path, b"hello\n" * 40, identify_fn=_fake(
+        label="txt", model_label="batch", score=0.3735,
+        overwrite_reason="low_confidence"))
+    assert r.payload.fields["label"] == "txt"
+    assert r.payload.fields["score"] == 0.3735, "the raw score stays in the typed payload"
+    assert r.detected.confidence == 0.0, (
+        "0.0 here means 'no confidence value', as it does everywhere else in this "
+        "codebase — not 'zero confidence in txt'"
+    )
+    assert [w.code for w in r.warnings] == ["prediction_overwritten"]
+
+
+def test_an_ordinary_identification_still_carries_the_model_score(tmp_path):
+    """Withholding the number on EVERY answer would be its own dishonesty: with no
+    overwrite the score does describe the delivered label, and a consumer that ranks or
+    thresholds on confidence needs it."""
+    r = _run(tmp_path, b"x", identify_fn=_fake(
+        label="elf", model_label="elf", score=0.9987, overwrite_reason="none"))
+    assert r.detected.confidence == 0.9987
+    assert r.warnings == []
+
+
+def test_an_unrecognised_overwrite_sentinel_is_treated_as_an_overwrite(tmp_path):
+    """Fail toward saying less. If a future magika spells "no overwrite" a third way,
+    reading it as an overwrite costs one withheld number and a spurious warning;
+    reading a real overwrite as none is the misreport this distinction exists for."""
+    from blastbox.engines.magika import _was_overwritten
+
+    assert not _was_overwritten("none")
+    assert not _was_overwritten("OverwriteReason.NONE")
+    assert _was_overwritten("overwrite_map")
+    assert _was_overwritten("something_new_in_2027")

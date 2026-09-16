@@ -108,9 +108,16 @@ class ContentTypeIdentification(_Node):
     is_text: bool
     extensions: list[str] = Field(default_factory=list, max_length=16)
 
-    #: The model's certainty in the DELIVERED label. Bounded here, so a future backend
-    #: returning a percentage instead of a fraction fails validation rather than
-    #: quietly producing 99.0-confidence evidence.
+    #: The model's certainty in ``model_label`` — which is the delivered ``label`` only
+    #: when ``overwrite_reason`` is empty. This comment used to say "in the DELIVERED
+    #: label", and that is false on every overwrite, in both directions. Measured
+    #: against magika 1.0.3: random bytes give label="unknown", model_label=
+    #: "randombytes", score=0.998 — a 99.8%-confident "unknown", where the 0.998 is
+    #: certainty about randombytes; and a short text file gives label="txt",
+    #: model_label="batch", score=0.374, where the 0.374 is the model's doubt about
+    #: BATCH and says nothing about txt. Read the two fields together or not at all.
+    #: Bounded here, so a future backend returning a percentage instead of a fraction
+    #: fails validation rather than quietly producing 99.0-confidence evidence.
     score: float = Field(ge=0.0, le=1.0)
 
     #: What the model itself predicted, and why it was not used. Together these are the
@@ -163,6 +170,17 @@ def _magika():
         except Exception as exc:  # pragma: no cover - depends on the install
             raise MagikaUnavailable(f"could not load the Magika model: {exc}") from exc
     return _MAGIKA
+
+
+#: Magika's sentinel for "the model's prediction was delivered unchanged". Spelled two
+#: ways because `str(OverwriteReason.NONE)` has differed between releases, and getting
+#: this wrong in the permissive direction (treating a real overwrite as none) is the
+#: failure this whole distinction exists to prevent.
+_NO_OVERWRITE = ("none", "OverwriteReason.NONE")
+
+
+def _was_overwritten(reason: str) -> bool:
+    return reason not in _NO_OVERWRITE
 
 
 def identify(data: bytes) -> dict:
@@ -270,7 +288,8 @@ class MagikaEngine:
                 status="engine_error",
             )
 
-        if got["overwrite_reason"] not in ("none", "OverwriteReason.NONE"):
+        overwritten = _was_overwritten(got["overwrite_reason"])
+        if overwritten:
             # NOT "low confidence" — that was this warning's first name and it was
             # wrong for the commonest case. Random bytes come back with the model
             # CONFIDENT (`randombytes` at 0.9991) and the overwrite reason
@@ -281,17 +300,36 @@ class MagikaEngine:
             warnings.append(Warning(
                 code="prediction_overwritten",
                 message=f"Magika delivered {got['label']!r} instead of its model's "
-                        f"prediction {got['model_label']!r} (score {got['score']}) "
-                        f"— reason: {got['overwrite_reason']}"))
+                        f"prediction {got['model_label']!r} — reason: "
+                        f"{got['overwrite_reason']}. The score {got['score']} is the "
+                        f"model's certainty in {got['model_label']!r}, NOT in the "
+                        f"delivered label; do not read it as confidence in "
+                        f"{got['label']!r}."))
 
         return DetonationResult(
             payload=_sealed(ContentTypeIdentification(bytes_read=len(data), file_size=size, **got)),
             artifacts=[],
-            # THE SCORE IS THE CONFIDENCE. Not 1.0: this engine's answer is a
-            # prediction, and a consumer that ranks or thresholds on confidence must see
-            # the model's actual certainty rather than the engine's enthusiasm.
+            # THE SCORE IS THE CONFIDENCE, WITH ONE HONEST EXCEPTION. Not 1.0: this
+            # engine's answer is a prediction, and a consumer that ranks or thresholds
+            # on confidence must see the model's actual certainty rather than the
+            # engine's enthusiasm.
+            #
+            # But the score belongs to `model_label`, and on an overwrite that is a
+            # DIFFERENT label from the one delivered. Carrying it across is wrong in
+            # both directions and neither is harmless: `overwrite_map` on random bytes
+            # publishes "unknown" at 0.998, so a threshold sees a near-certain finding
+            # where the certainty is about something else; `low_confidence` publishes
+            # the fallback "txt" at 0.374, so the same threshold discards a label
+            # Magika chose PRECISELY BECAUSE the model was unsure — the doubt belongs
+            # to the guess that was rejected, not to the fallback that replaced it.
+            # This engine cannot state a calibrated confidence in a label its model did
+            # not produce, so on an overwrite it reports 0.0, which throughout this
+            # codebase means "no confidence value, not zero confidence". The label and
+            # the warning still carry the finding; only the number nobody can justify
+            # is withheld. The typed payload keeps the raw score either way.
             detected=Detection(label=got["label"], mime=got["mime_type"],
-                               confidence=got["score"], source=self.name),
+                               confidence=0.0 if overwritten else got["score"],
+                               source=self.name),
             warnings=warnings,
             status="ok",
         )

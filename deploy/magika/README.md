@@ -21,7 +21,17 @@ than 1.0. Anything that ranks or thresholds on confidence sees the truth.
 floor it replaces its prediction with a generic label: random bytes come back `unknown`,
 while the model underneath guessed `psd` at 0.344. The envelope carries the delivered
 `label`, the raw `model_label`, and the `overwrite_reason` that separates them, plus a
-`prediction_overwritten` warning (NOT `low_confidence_overwrite`, which this file carried for a while: the commonest overwrite is `overwrite_map` on random bytes, which happens while the model is confident at ~0.999, so naming it a confidence problem described the opposite of what occurred). Sealing only one of the two would either hide that a
+`prediction_overwritten` warning (NOT `low_confidence_overwrite`, which this file carried for a while: the commonest overwrite is `overwrite_map` on random bytes, which happens while the model is confident at ~0.999, so naming it a confidence problem described the opposite of what occurred). The `score` beside them is the model's certainty in **`model_label`**, not in the
+delivered `label` — measured against magika 1.0.3, random bytes give
+`label=unknown, model_label=randombytes, score=0.998`, and a short text file gives
+`label=txt, model_label=batch, score=0.374`. The envelope's generic
+`detected.confidence` is therefore withheld (0.0, meaning "no value") whenever an
+overwrite happened: this engine cannot state a calibrated confidence in a label its
+model did not produce, and carrying the number across is wrong in both directions —
+publishing a near-certain "unknown", or discarding a "txt" for doubt that belonged to
+the guess Magika rejected. The raw score stays in the typed payload either way.
+
+Sealing only one of the two would either hide that a
 guess existed or report a guess the tool declined to stand behind.
 
 A model that fails to load seals `engine_error` and emits **no `label` key at all** —
