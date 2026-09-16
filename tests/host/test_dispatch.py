@@ -4289,8 +4289,8 @@ def test_a_certificate_that_expires_inside_the_ttl_window_stops_authorising(tmp_
     from blastbox.host import placement as placement_mod
 
     _issue_node_cert(tmp_path, monkeypatch, engines=("boxjs",))
+    monkeypatch.setenv("BLASTBOX_NODE_GRANTS_TTL_S", "10000")
     g = _gate()
-    g._ttl_s = 10_000.0
     assert g.grants() is not None
 
     # Thirty days pass. Both clocks move: `pki._now` is what `node_identity` checks
@@ -4322,14 +4322,21 @@ def test_a_concurrent_reader_does_not_get_the_previous_grants_at_the_ttl_boundar
     from blastbox.host import pki
 
     crt = _issue_node_cert(tmp_path, monkeypatch, engines=("boxjs",))
+    # The TTL is read PER CALL now (it was frozen in __init__ while every other variable
+    # was per-call), so it is set through the environment like the real thing.
+    monkeypatch.setenv("BLASTBOX_NODE_GRANTS_TTL_S", "30")
     g = _gate()
-    g._ttl_s = 30.0
     assert g.grants() is not None
 
     rogue = pki.ensure_ca(tmp_path / "rogue")
     crt.write_bytes(rogue.issue_node("toolz3", wg_pubkey="A" * 43 + "=",
                                      grants=pki.NodeGrants(engines=("boxjs",))).cert_pem)
-    g._at = time.time() - 60.0
+    # MONOTONIC: the cache clock is time.monotonic() now, because a backward NTP step
+    # on the wall clock made the cache permanently fresh AND disabled the expiry guard —
+    # both bounds failing open together. Staling it with a wall-clock value would make
+    # `now - _at` hugely negative and the entry eternally fresh, so the refresh this
+    # test races would never start.
+    g._at = time.monotonic() - 60.0
 
     in_verification = threading.Event()
     original = pki.node_identity

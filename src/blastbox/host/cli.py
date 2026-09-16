@@ -1110,7 +1110,7 @@ def _pki_cmd(args: argparse.Namespace) -> int:
         # a healthy identity for a certificate the dispatcher refuses; and it says
         # nothing about whether the gate is armed. A node quietly not draining its queue
         # had no diagnostic at all.
-        from blastbox.host.placement import NO_GATE, SelfGrants, refusal
+        from blastbox.host.placement import NO_GATE, SelfGrants
 
         gate = SelfGrants()
         cert_at = gate.cert_path()
@@ -1134,9 +1134,16 @@ def _pki_cmd(args: argparse.Namespace) -> int:
             status["credentials"] = value.credentials
             # What this node would do with the COMMONEST job, which is the thing the
             # grant list does not make obvious: a sealed job needs no tier at all.
+            # THROUGH THE GATE'S OWN PREDICATE, not a hand-rolled call that drops
+            # `require_credentials`. This printed would_run["socks"] = "yes" for a
+            # certificate with credentials=False while the dispatcher refused it — the
+            # diagnostic added for "a node quietly not draining its queue" actively
+            # contradicting the gate it exists to explain, on four of the eight tiers it
+            # lists.
             status["would_run"] = {
-                name: (refusal(value, engine=args.engine, tier=None if name in ("none", "drop")
-                               else name) or "yes")
+                name: (gate.refuse(engine=args.engine,
+                                   personality=type("_P", (), {"exit_driver": name})())
+                       or "yes")
                 for name in ("none", "direct", "tor", "socks", "httpproxy",
                              "openvpn", "wireguard", "inetsim")
             }

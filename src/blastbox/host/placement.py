@@ -208,7 +208,12 @@ NO_GATE = object()
 #: a truthy string, so requiring a grant for it made a node issued the documented
 #: `--tier openvpn --tier wireguard` refuse every ordinary job, release it to a fleet
 #: where no peer was granted it either, and stop draining the queue entirely.
-UNGOVERNED_TIERS = ("none", "drop", "")
+#: NO EMPTY STRING. It was in this tuple, and a real `Personality` never has an empty
+#: `exit_driver` — netpolicy validates it against a closed list — so "" was unreachable
+#: by any legitimate path and fired only when the gate FAILED TO READ a personality
+#: (a renamed attribute, a duck-typed stand-in). That is precisely the case that must
+#: refuse, and instead it skipped both the tier and the credentials check.
+UNGOVERNED_TIERS = ("none", "drop")
 
 #: Exit drivers whose sidecar carries a PROVIDER SECRET on this host. socks and httpproxy
 #: run against a local sidecar in BOTH egress modes — the SOCKS URL and the proxy URL are
@@ -251,6 +256,24 @@ class SelfGrants:
     TTL_ENV = "BLASTBOX_NODE_GRANTS_TTL_S"
     PKI_ENV = "BLASTBOX_PKI_DIR"
 
+    @property
+    def _ttl(self) -> float:
+        """Read per call, like every other variable this class consults.
+
+        It was read once in ``__init__`` while CERT_ENV, GATE_ENV and PKI_ENV were all
+        per-call — so an operator could hot-swap the certificate or arm the gate on a
+        running dispatcher, but changing the TTL silently did nothing until restart, and
+        `pki node-status` (a fresh instance) would confirm a change that had not taken
+        effect in the process that matters. A garbage value is reported, not raised: it
+        used to crash `node-status`, the command whose job is reporting misconfiguration.
+        """
+        raw = os.environ.get(self.TTL_ENV, "") or "300"
+        try:
+            return max(5.0, float(raw))
+        except ValueError:
+            self._log.warning("%s=%r is not a number; using 300s", self.TTL_ENV, raw)
+            return 300.0
+
     def __init__(self, *, log: "logging.Logger | None" = None) -> None:
         import logging as _logging
         import threading
@@ -258,10 +281,20 @@ class SelfGrants:
         self._log = log or _logging.getLogger("blastbox.host.placement")
         self._lock = threading.Lock()
         self._cached: "NodeGrants | None | object" = NO_GATE
+        #: MONOTONIC, not wall clock. `time.time()` is settable: a backward NTP step of
+        #: D seconds makes `now - self._at` negative — trivially "fresh" — so the cache
+        #: never expired, and because the expiry guard used the same clock `now >=
+        #: self._until` was false too. BOTH of the gate's bounds failed in the same
+        #: direction, open, and a revoked certificate kept authorising work for the
+        #: length of the step. This repo has a documented prior incident with exactly
+        #: this cause (retention.py: a 1h rollback deleting live job trees).
         self._at = 0.0
-        self._until = 0.0          # the cached certificate's not_after
+        #: The cached certificate's not_after, as a WALL-CLOCK timestamp — not_after is
+        #: an absolute instant. Deliberately NOT zeroed on a failed verification: doing
+        #: that made the expiry guard inert on the failure branch, so a stale `_at`
+        #: pinned the refusal for a whole TTL (which has no ceiling).
+        self._until = 0.0
         self._node_id = ""
-        self._ttl_s = max(5.0, float(os.environ.get(self.TTL_ENV, "300") or 300))
 
     # -- inputs ------------------------------------------------------------------
     def cert_path(self) -> "Path | None":
@@ -318,14 +351,14 @@ class SelfGrants:
         # stamp and take the PREVIOUS value — so a just-revoked certificate kept
         # authorising work for the length of one signature check, once per TTL.
         with self._lock:
-            now = time.time()
-            fresh = self._at and (now - self._at) < self._ttl_s
+            now = time.monotonic()
+            fresh = self._at and (now - self._at) < self._ttl
             # EXPIRY OUTRANKS THE TTL. node_identity enforces not_after at PARSE time, so
             # a certificate that lapsed mid-window kept authorising until the next
             # refresh — and the TTL has a floor but no ceiling, so an operator "reducing
             # PKI I/O" could make that window outlast the seven-day lifetime that IS the
             # revocation mechanism.
-            if fresh and not (self._until and now >= self._until):
+            if fresh and not (self._until and time.time() >= self._until):
                 return self._cached
             try:
                 from blastbox.host.pki import load_trust_anchor, node_identity
@@ -340,9 +373,9 @@ class SelfGrants:
                     "until it is renewed — `blastbox pki issue-node` for the same node "
                     "id and wg key. This is revocation working, not a bug.", path, exc)
                 value = None
-                self._until = 0.0
+                self._node_id = ""     # the old identity is not this node's any more
             self._cached = value
-            self._at = time.time()
+            self._at = time.monotonic()
             return value
 
     @property
@@ -354,12 +387,25 @@ class SelfGrants:
     def egress_mode(self) -> str:
         """This node's persisted egress mode, or "" when the tier does not manage it.
 
-        A MANAGED NODE THAT DOES NOT SAY IS LOCAL. ``BLASTBOX_EGRESS_MODE`` was added
-        only recently; every egress.env written before it has no MODE line — and those
-        nodes are local-mode BY DEFINITION, because local was the only mode. The same
-        blank comes from an unreadable or truncated file. Defaulting that to "" dropped
-        the credentials requirement for exactly the nodes most likely to be holding a
-        provider profile.
+        A MANAGED NODE THAT CANNOT SAY IS TREATED AS LOCAL — for the credentials
+        question only, and conservatively.
+
+        THE ORIGINAL JUSTIFICATION HERE WAS FALSE and is recorded so it is not repeated:
+        it claimed "BLASTBOX_EGRESS_MODE was added only recently, so every egress.env
+        written before it has no MODE line". It is the FIRST line ``to_env_lines()``
+        emits and has been since the commit that introduced the file, so no such legacy
+        file exists. What the default actually covers is the other case: a truncated,
+        empty or unreadable egress.env, where ``load_persisted_env`` returns {}.
+
+        That case is real but it cuts both ways, and the cut is asymmetric. Guessing
+        "global" on a local node drops the credentials requirement from the nodes most
+        likely to hold a provider profile; guessing "local" on a global node demands a
+        grant it was correctly issued without, which idles it. Both are bad; only the
+        first is a containment failure, so the guess goes that way — and it is LOUD,
+        because ``persisted_config()`` treats the identical condition as a hard error
+        ("this node is marked managed and its egress configuration cannot be
+        determined") and an operator should hear about the file rather than about a
+        certificate.
         """
         from blastbox.host.egress_apply import ENV_FILE, load_persisted_env
         try:
@@ -372,7 +418,14 @@ class SelfGrants:
             mode = load_persisted_env().get("BLASTBOX_EGRESS_MODE", "")
         except Exception:           # noqa: BLE001
             mode = ""
-        return mode or "local"
+        if not mode:
+            self._log.warning(
+                "%s exists but declares no BLASTBOX_EGRESS_MODE (truncated, unreadable "
+                "or hand-edited). Assuming local mode for the credentials check, which "
+                "is the conservative guess — but fix the file: `blastbox egress check` "
+                "treats this same state as a hard error.", ENV_FILE)
+            return "local"
+        return mode
 
     def holds_credentials(self, personality) -> bool:
         """Would running this personality HERE mean this node holds a provider secret?"""
@@ -387,6 +440,10 @@ class SelfGrants:
         if value is NO_GATE:
             return None
         driver = getattr(personality, "exit_driver", "") or ""
+        if not driver:
+            # Unreadable, not ungoverned. See UNGOVERNED_TIERS.
+            return ("this job's network personality could not be read, so the tier it "
+                    "would run under is unknown and cannot be checked against the grants")
         tier = None if driver in UNGOVERNED_TIERS else driver
         from typing import cast
         return refusal(cast("NodeGrants | None", value), engine=engine, tier=tier,

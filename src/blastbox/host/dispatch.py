@@ -1293,11 +1293,18 @@ class Dispatcher:
             # and not the store — the claim/requeue amplification the comment claimed to fix
             # carried on every few seconds, and the "will not reconsider for 300s" it printed
             # was false.
-            if (until := self._grants_cooldown.get(job.job_id)) and time.time() < until:
+            if (until := self._grants_cooldown.get(job.job_id)) and time.monotonic() < until:
+                # RELEASE THE RESERVATION. This method is the SOLE owner of freeing the
+                # warm-slot gate reservation (issue #72); every other early return
+                # honours that and this one did not, so each visit leaked one. Once the
+                # leak reached the idle-slot count a warm-only sidecar stopped claiming
+                # ANY job, granted or not, and never recovered without a restart.
+                if warm_reserved:
+                    self._release_warm_reservation()
                 self._requeue_claimed(
                     job, defer=True, defer_s=self._egress_shared_defer_s,
                     reason=f"this node's certificate does not grant this work; in a local "
-                           f"cooldown for another {until - time.time():.0f}s",
+                           f"cooldown for another {until - time.monotonic():.0f}s",
                 )
                 return
             why = self._grants_gate.refuse(engine=job.engine, personality=personality)
@@ -1313,16 +1320,29 @@ class Dispatcher:
                     n = max(self._grants_defer_n.get(job.job_id, 0),
                             self._grants_defer_floor) + 1
                     self._grants_defer_n[job.job_id] = n
+                    shared_defer, local = self._egress_defer_plan(n)
+                    # INSIDE the lock, with the counter it belongs to. Written outside,
+                    # a write landing after another thread evicted this job left a
+                    # cooldown with no counter — an entry no future eviction pass would
+                    # ever consider, so the map grew without bound.
+                    self._grants_cooldown[job.job_id] = time.monotonic() + local
                     if len(self._grants_defer_n) > self.EGRESS_DEFER_MAX:
+                        now_m = time.monotonic()
+                        # SWEEP THE ELAPSED ONES; never discard a LIVE cooldown. The
+                        # first version popped both maps together, so one pass destroyed
+                        # ~1022 live cooldowns and returned those jobs to the 5s floor —
+                        # reinstating the spin the escalation exists to bound, and
+                        # continuously, because a lapsed certificate keeps the map pinned
+                        # at the cap. The egress gate bounds its cooldown by EXPIRY for
+                        # exactly this reason.
+                        for k in [k for k, v in self._grants_cooldown.items() if v <= now_m]:
+                            self._grants_cooldown.pop(k, None)
                         for stale, stale_n in sorted(self._grants_defer_n.items(),
                                                      key=lambda kv: kv[1])[:self.EGRESS_DEFER_EVICT]:
                             if stale == job.job_id:
                                 continue
                             self._grants_defer_floor = max(self._grants_defer_floor, stale_n)
                             self._grants_defer_n.pop(stale, None)
-                            self._grants_cooldown.pop(stale, None)
-                shared_defer, local = self._egress_defer_plan(n)
-                self._grants_cooldown[job.job_id] = time.time() + local
                 if n & (n - 1) == 0:          # powers of two only
                     _log.warning(
                         "node grants refuse job=%s engine=%s tier=%s: %s. Releasing to the "
@@ -1337,6 +1357,19 @@ class Dispatcher:
                            "releasing to the fleet",
                 )
                 return
+            # GRANTED — CLEAR THE STATE. The egress gate's shape was copied without its
+            # cleanup, so nothing reset these and a renewed certificate did not resume
+            # refused work: the cooldown is checked BEFORE `refuse()` is consulted, so
+            # every previously-refused job kept bouncing on the shared defer for the rest
+            # of its cooldown — up to the 300s cap — while the log still claimed the
+            # certificate did not grant it. The floor ratcheted up on every eviction and
+            # never came down, so the first refusal of an unrelated job a week later
+            # started at the cap.
+            with self._grants_defer_lock:
+                self._grants_defer_n.pop(job.job_id, None)
+                self._grants_cooldown.pop(job.job_id, None)
+                if not self._grants_defer_n:
+                    self._grants_defer_floor = 0
 
         # Try the warm path if a pool is configured. EXCEPTION: an egress personality needs the cold
         # path's netd netns-wiring + dispatcher network args/labels, which the warm tier can't apply
