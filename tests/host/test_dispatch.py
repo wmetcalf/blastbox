@@ -4051,12 +4051,16 @@ class _DeferOnly:
     EGRESS_DEFER_EVICT = _D.EGRESS_DEFER_EVICT
     _bump_egress_defer = _D._bump_egress_defer
 
+    _egress_defer_plan = _D._egress_defer_plan
+
     def __init__(self):
         import threading
 
         self._egress_defer_lock = threading.Lock()
         self._egress_defer_n: dict[str, int] = {}
         self._egress_defer_floor = 0
+        self._egress_defer_cap_s = 300.0
+        self._egress_shared_defer_s = 5.0
 
 
 def _delay(n, cap=300.0):
@@ -4107,3 +4111,37 @@ def test_a_healthy_fleet_does_not_inherit_a_raised_floor():
     d._egress_defer_n.clear()
     d._egress_defer_floor = 0          # what the success path does
     assert _delay(d._bump_egress_defer("fresh")) == 2.0
+
+
+def test_the_escalating_backoff_is_local_and_the_store_defer_stays_short():
+    """`claimable_after` lives in the SHARED job store, so the delay this node computed
+    from its own attempt count blocked EVERY dispatcher: after eight tries, a job no
+    node in the fleet could claim for five minutes. That contradicts the reasoning
+    beside the constant ("a healthy peer could still run it") and the warning the loop
+    prints ("a healthy peer can still take them") — during a single-node outage, the
+    case those sentences are about, the degraded node was holding the job away from the
+    peers that could run it."""
+    d = _DeferOnly()
+    shared = [d._egress_defer_plan(n)[0] for n in range(1, 40)]
+    local = [d._egress_defer_plan(n)[1] for n in range(1, 40)]
+
+    assert max(shared) <= 10.0, (
+        "the fleet-wide defer must stay in seconds however long this node has been "
+        "degraded — it is what stops a healthy peer from taking the job"
+    )
+    assert shared[-1] == shared[8], "the fleet-wide defer must stop growing"
+    assert local[0] < local[8], "this node's own re-examination interval must escalate"
+    assert max(local) == d._egress_defer_cap_s
+    assert all(s <= l for s, l in zip(shared, local)), (
+        "telling the store to wait LONGER than this node's own cooldown would make "
+        "the escalation pointless and block peers as well"
+    )
+
+
+def test_this_node_stays_out_of_the_way_for_the_escalated_window_not_the_store():
+    """The whole point: after a few attempts this node leaves the job alone for
+    minutes, while any peer can claim it seconds later."""
+    d = _DeferOnly()
+    shared, local = d._egress_defer_plan(9)
+    assert local >= 300.0
+    assert shared <= 10.0

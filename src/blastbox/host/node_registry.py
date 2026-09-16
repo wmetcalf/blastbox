@@ -1,5 +1,14 @@
 """Federated node registry: who is out there, what they have, and what they may run.
 
+NOT YET WIRED INTO DISPATCH — READ THIS BEFORE TRUSTING ANY SENTENCE BELOW.
+Nothing in ``src/`` imports this module except its sibling
+:mod:`blastbox.host.placement`; there is no CLI subcommand, the dispatcher has no hook,
+and no code path consults it when placing a job. Everything here is written in the
+present tense because it describes what the module DOES when called, and a reader could
+reasonably take that as a description of the running system. It is not one. This is
+step 2/3 of the spec's five-step order, and step 5 ("third-party registration") is the
+one that would make it load-bearing.
+
 This is the MEMBERSHIP half of the federation design
 (``docs/superpowers/specs/2026-09-15-federated-node-identity-and-placement.md``). It is
 deliberately NOT :mod:`blastbox.host.node_share`, which is a bind-mounted directory in a

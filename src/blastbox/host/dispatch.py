@@ -559,6 +559,24 @@ class Dispatcher:
         # without terminalising anything; max_queued_age remains the expiry mechanism.
         self._egress_defer_cap_s = max(
             2.0, float(os.environ.get("BLASTBOX_EGRESS_DEFER_CAP_S", "300") or 300))
+        # ...BUT THE ESCALATION IS LOCAL AND THE DEFER IS NOT, and for a while those were
+        # the same number. `claimable_after` lives in the SHARED job store, so the delay
+        # this node computed from ITS OWN attempt count blocked every dispatcher in the
+        # fleet — after eight tries, a job no node could claim for five minutes. That
+        # directly contradicts the reasoning three lines up ("a healthy peer could still
+        # run it") and the warning this loop prints ("Jobs are NOT failed — a healthy
+        # peer can still take them"): during a SINGLE-node outage, which is the case
+        # those sentences are about, the degraded node was holding the job away from the
+        # peers that could run it.
+        #
+        # So the two concerns are separated. The store sees a SHORT defer, enough to stop
+        # an immediate re-claim thrash and no more, and the escalating window becomes a
+        # LOCAL cooldown: this node declines to re-examine that job — and to pay for the
+        # health probe — until it expires. The spin this bounds is this node's, which is
+        # the only one it is entitled to reason about.
+        self._egress_shared_defer_s = max(
+            1.0, float(os.environ.get("BLASTBOX_EGRESS_SHARED_DEFER_S", "5") or 5))
+        self._egress_cooldown: dict[str, float] = {}
         self._egress_defer_lock = threading.Lock()
         self._egress_defer_n: dict[str, int] = {}
         #: Attempt count a job re-enters at when its entry was evicted. Without it the
@@ -1187,6 +1205,26 @@ class Dispatcher:
     #: sheds. Both arbitrary; what matters is that shedding cannot lose escalation.
     EGRESS_DEFER_MAX = 4096
     EGRESS_DEFER_EVICT = 1024
+
+    def _egress_defer_plan(self, n: int) -> tuple[float, float]:
+        """``(what the STORE is told, how long THIS NODE stays away)`` for attempt ``n``.
+
+        Two numbers, and for a while they were one. `claimable_after` is shared state:
+        the escalating delay this node computed from its own attempt count blocked
+        EVERY dispatcher, so after eight tries a job no node in the fleet could claim
+        for five minutes. That contradicts the reasoning beside the cap ("a healthy
+        peer could still run it") and the warning this loop prints ("a healthy peer can
+        still take them") — during a single-node outage, the case those sentences are
+        about, the degraded node was holding the job away from the peers that could run
+        it. The store now hears a short, constant defer; the escalation is a local
+        cooldown bounding this node's own re-examination and health probes.
+        """
+        local = min(self._egress_defer_cap_s, 2.0 * (2 ** min(n - 1, 8)))
+        # Never tell the store to wait LONGER than this node's own cooldown: that would
+        # block peers for a window this node is not even using, which is the whole
+        # defect, just smaller. On the first attempt the local window is the shorter of
+        # the two, so it wins.
+        return min(self._egress_shared_defer_s, local), local
 
     def _bump_egress_defer(self, job_id: str) -> int:
         """Attempt number for this job's next egress defer, bounding the map.
@@ -2032,10 +2070,20 @@ class Dispatcher:
         # actually credential-free for them — see docs/DEPLOYMENT.md.
         gated_by_gateway_health = personality.exit_driver in ("openvpn", "wireguard")
         if gated_by_gateway_health:
+            # Still inside this node's own cooldown for this job: put it straight back
+            # with the short shared defer and do NOT probe health again. Re-probing was
+            # the cost the escalation existed to bound.
+            if (until := self._egress_cooldown.get(job.job_id)) and time.time() < until:
+                self._requeue_claimed(
+                    job, defer=True, defer_s=self._egress_shared_defer_s,
+                    reason=f"this node is in a local egress cooldown for another "
+                           f"{until - time.time():.0f}s; releasing to the fleet",
+                )
+                return
             health = self._node_egress_health()
             if health is not None and not health.healthy:
                 n = self._bump_egress_defer(job.job_id)
-                delay = min(self._egress_defer_cap_s, 2.0 * (2 ** min(n - 1, 8)))
+                shared_defer, delay = self._egress_defer_plan(n)
                 # An egress outage must be VISIBLE. Deferring deliberately does not
                 # terminalise the job (a healthy peer may still take it, and this node
                 # cannot see the fleet), so without a loud signal the only symptom is a
@@ -2045,20 +2093,30 @@ class Dispatcher:
                 if n & (n - 1) == 0:  # 1, 2, 4, 8, ... — powers of two only
                     _log.warning(
                         "egress DEGRADED on this node: %s. %d job(s) deferred so far; "
-                        "this one has waited %d attempt(s), next eligible in %.0fs. "
+                        "this one has waited %d attempt(s); THIS NODE will not "
+                        "reconsider it for %.0fs (a peer may claim it within seconds). "
                         "Jobs are NOT failed — a healthy peer can still take them, and "
                         "BLASTBOX_MAX_QUEUED_AGE_S (off by default) is what expires them. "
                         "Run `blastbox egress check` as root.",
                         health.reason, len(self._egress_defer_n), n, delay)
+                # SHORT in the store, long locally. The store's claimable_after is
+                # fleet-wide; a peer with working egress must be able to take this job
+                # now, which is exactly what the warning above promises.
+                self._egress_cooldown[job.job_id] = time.time() + delay
+                if len(self._egress_cooldown) > self.EGRESS_DEFER_MAX:
+                    now_t = time.time()
+                    for k in [k for k, v in self._egress_cooldown.items() if v <= now_t]:
+                        self._egress_cooldown.pop(k, None)
                 self._requeue_claimed(
-                    job, defer=True, defer_s=delay,
-                    reason=f"node egress is degraded ({health.reason}); deferring "
-                           f"netpolicy {personality.name!r} to a peer "
-                           f"(attempt {n}, next eligible in {delay:.0f}s)",
+                    job, defer=True, defer_s=shared_defer,
+                    reason=f"node egress is degraded ({health.reason}); releasing "
+                           f"netpolicy {personality.name!r} to the fleet "
+                           f"(this node will not reconsider it for {delay:.0f}s)",
                 )
                 return
             with self._egress_defer_lock:
                 self._egress_defer_n.pop(job.job_id, None)
+                self._egress_cooldown.pop(job.job_id, None)
                 # The outage is over for this job, so the floor has served its purpose.
                 # Leaving it raised would make the first defer of an unrelated blip a
                 # week later start at the 300s cap.

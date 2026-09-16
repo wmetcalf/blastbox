@@ -155,3 +155,36 @@ def test_an_unverified_node_is_not_also_reported_as_over_claiming():
     view = [rec("stranger", engines=("boxjs",))]
     assert unverified_nodes(view, {}) == ("stranger",)
     assert over_claiming_nodes(view, {}) == ()
+
+
+def test_the_module_says_plainly_that_nothing_calls_it_yet():
+    """THE ONE RULE is written in the present tense — "grants decide eligibility, full
+    stop" — and a reader can reasonably take that as a description of the running
+    system. It is not one: nothing in src/ consults this module when placing a job, so
+    a compromised node cannot in fact be stopped by it from electing itself for work it
+    is not granted. The docstring must say so until dispatch actually calls it, and
+    this test is the thing that notices when that stops being true."""
+    import pathlib
+    import subprocess
+
+    from blastbox.host import node_registry, placement
+
+    root = pathlib.Path(placement.__file__).resolve().parents[3]
+    hits = subprocess.run(
+        ["grep", "-rIl", "-e", "host.placement", "-e", "host import placement",
+         "-e", "host.node_registry", "-e", "host import node_registry",
+         "--include=*.py", str(root / "blastbox")],
+        capture_output=True, text=True).stdout.split()
+    callers = {pathlib.Path(h).name for h in hits} - {"placement.py", "node_registry.py"}
+
+    for mod in (placement, node_registry):
+        if callers:
+            assert "NOT YET WIRED" not in (mod.__doc__ or ""), (
+                f"{mod.__name__} IS now called from {sorted(callers)} — remove the "
+                "not-wired banner from both modules and from this test's premise"
+            )
+        else:
+            assert "NOT YET WIRED" in (mod.__doc__ or ""), (
+                f"{mod.__name__} is imported by nothing in src/, so its present-tense "
+                "guarantees describe a system that does not exist yet; say so"
+            )

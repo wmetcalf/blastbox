@@ -1,5 +1,15 @@
 """Which nodes may run what — the eligibility half of federated placement.
 
+NOT YET WIRED INTO DISPATCH — READ THIS BEFORE TRUSTING ANY SENTENCE BELOW.
+Nothing in ``src/`` imports this module at all (its sibling
+:mod:`blastbox.host.node_registry` is imported only from here); there is no CLI
+subcommand, the dispatcher has no hook,
+and no code path consults it when placing a job. Everything here is written in the
+present tense because it describes what the module DOES when called, and a reader could
+reasonably take that as a description of the running system. It is not one. This is
+step 2/3 of the spec's five-step order, and step 5 ("third-party registration") is the
+one that would make it load-bearing.
+
 A CORRECTION TO THE SPEC THIS IMPLEMENTS. The design note
 (``docs/superpowers/specs/2026-09-15-federated-node-identity-and-placement.md``, step 3)
 said "eligibility filtering in ``plan_sizes``". That was wrong about the code:

@@ -191,11 +191,18 @@ Honesty ahead of enthusiasm, because this bounds the product:
    instead of a pasted public key. Pure win, small, removes a manual step I built by hand.
    **Done** — `pki issue-node` / `show-node`, `egress peer-add --cert`.
 2. **Node registration + heartbeat in the job store**, read-only at first: a federated view
-   that nothing yet acts on. Observable, reversible, no placement risk. **Done** —
-   `blastbox.host.node_registry` (in-memory + SQL; Redis is a follow-up).
+   that nothing yet acts on. Observable, reversible, no placement risk. **Written, NOT
+   WIRED** — `blastbox.host.node_registry` (in-memory + SQL; Redis is a follow-up).
+   `build_node_registry` is never called and `SqlNodeRegistry` creates a `nodes` table
+   nothing writes to.
 3. **Eligibility filtering** (`blastbox.host.placement`, NOT `plan_sizes` — see §4.3) —
    grants restrict which engines/tiers a node may be assigned. Still first-party nodes
-   only. **Done.**
+   only. **Written, NOT WIRED.** `eligible()`/`rank()` exist and are tested, and nothing
+   in `src/` calls them — no CLI subcommand, no dispatcher hook — so no code path
+   consults grants when placing a job. Steps 2 and 3 are libraries waiting for a caller,
+   and "Done" read as "in force", which is the exact confusion §5 is about. Both modules
+   carry a NOT-YET-WIRED banner, pinned by a test that fails once something imports
+   them.
 4. **External containment verification at the exit host** (§5). This is the gate that should
    precede any third-party node holding egress. **Done** — `blastbox.host.exit_attest`,
    `blastbox egress attest`.
