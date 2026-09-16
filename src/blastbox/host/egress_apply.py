@@ -8,6 +8,7 @@ without root or a docker daemon.
 """
 from __future__ import annotations
 
+import contextlib
 import ipaddress
 import json
 import logging
@@ -18,6 +19,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 from blastbox.host.egress import (
     ALL_CHAINS,
@@ -30,6 +32,7 @@ from blastbox.host.egress import (
     CHAIN_FWD_RET,
     PRIO_BLACKHOLE,
     SUMMARY_PREFIXLEN,
+    _iface,
     PRIO_LOOKUP,
     EgressConfig,
     Health,
@@ -866,6 +869,46 @@ def ensure_keypair(stem: str) -> tuple[Path, str]:
     return priv, pub.read_text().strip()
 
 
+@contextlib.contextmanager
+def conf_lock(cfg: EgressConfig) -> Iterator[None]:
+    """Hold an exclusive lock across a WireGuard config read-modify-write-reload.
+
+    EVERY MUTATION OF ``<iface>.conf`` IS A READ-MODIFY-WRITE, AND NOTHING SERIALISED
+    THEM. ``add_peer`` reads the file, appends or reconciles a stanza, writes the whole
+    thing back and reloads the interface. Two provisioning processes enrolling DIFFERENT
+    nodes at the same time therefore both read the original, both write their own
+    version, and the second write silently discards the first — from disk AND, because
+    the reload follows, from the live interface. Both processes report success. The
+    first node's tunnel never comes up, its operator sees a registered peer in their own
+    output, and the exit host has no record of it.
+
+    The collision check in :func:`_refuse_peer_collision` does not help here and cannot:
+    it reads the same stale snapshot, so it sees no conflict either.
+
+    ``flock`` on a sidecar file rather than on the config itself: the config is replaced
+    by ``write_text``, and a lock held on an inode that is about to be superseded
+    protects nothing. Advisory, which is enough — every writer in this module goes
+    through here, and wg-quick does not write this file.
+    """
+    import fcntl
+
+    WG_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = WG_DIR / f".{_iface(cfg.wg_iface)}.conf.lock"
+    old = os.umask(0o077)
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    finally:
+        os.umask(old)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        # Released implicitly by the close, but say so: a reader here should not have to
+        # know that to be sure the lock is not leaked on an exception.
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 def _write_conf(path: Path, content: str) -> None:
     old = os.umask(0o077)
     try:
@@ -942,26 +985,31 @@ def setup_gateway(cfg: EgressConfig) -> str:
     priv, pub = ensure_keypair(cfg.wg_iface)
     conf = WG_DIR / f"{cfg.wg_iface}.conf"
     want = gateway_wg_config(cfg, priv.read_text().strip())
-    if not conf.exists():
-        _write_conf(conf, want)
-    else:
-        # RECONCILE the [Interface], KEEP the [Peer] stanzas. Skipping the rewrite meant
-        # a changed overlay address or port — or a regenerated keypair — was printed back
-        # to the operator while the live interface kept the old values, so newly
-        # configured peers could never handshake. Peers are appended by `peer-add` and
-        # must survive.
-        body = conf.read_text()
-        peers = body[body.index("\n# peer:"):] if "\n# peer:" in body else ""
-        if body != want + peers:
-            _write_conf(conf, want + peers)
-            # wg_up below reconciles a live interface via _reload_wg, which RAISES if
-            # neither path reached it. This used to be a `check=False` restart whose
-            # failure was discarded, so a rewritten [Interface] could stay on disk only.
-        # It holds a PrivateKey line. A conf left 0644 by a predecessor installer or a
-        # restore was never corrected here, and the exit host's key is the one that lets
-        # an attacker impersonate the central exit for every peer.
-        os.chmod(conf, 0o600)
-    wg_up(cfg)
+    # This preserves the [Peer] stanzas by re-reading them, so it is a read-modify-write
+    # over the same file add_peer mutates: without the lock, a `gateway` re-run
+    # concurrent with an enrolment writes back a peer list that predates it.
+    with conf_lock(cfg):
+        if not conf.exists():
+            _write_conf(conf, want)
+        else:
+            # RECONCILE the [Interface], KEEP the [Peer] stanzas. Skipping the rewrite
+            # meant a changed overlay address or port — or a regenerated keypair — was
+            # printed back to the operator while the live interface kept the old values,
+            # so newly configured peers could never handshake. Peers are appended by
+            # `peer-add` and must survive.
+            body = conf.read_text()
+            peers = body[body.index("\n# peer:"):] if "\n# peer:" in body else ""
+            if body != want + peers:
+                _write_conf(conf, want + peers)
+                # wg_up below reconciles a live interface via _reload_wg, which RAISES if
+                # neither path reached it. This used to be a `check=False` restart whose
+                # failure was discarded, so a rewritten [Interface] could stay on disk
+                # only.
+            # It holds a PrivateKey line. A conf left 0644 by a predecessor installer or
+            # a restore was never corrected here, and the exit host's key is the one that
+            # lets an attacker impersonate the central exit for every peer.
+            os.chmod(conf, 0o600)
+        wg_up(cfg)
     return pub
 
 
@@ -997,23 +1045,30 @@ def prune_expired_peers(cfg: EgressConfig) -> list[str]:
     conf = WG_DIR / f"{cfg.wg_iface}.conf"
     if not conf.exists():
         return []
-    body = conf.read_text()
-    gone = expired_peers(body)
-    if not gone:
-        return []
-    out, drop, current = [], False, None
-    for line in body.splitlines(keepends=True):
-        stripped = line.strip()
-        if stripped.startswith("# peer:"):
-            current = stripped[len("# peer:"):].strip()
-            drop = current in gone
-        if not drop:
-            out.append(line)
-    _write_conf(conf, "".join(out))
-    # If this raises, the caller learns the peers were removed from DISK but not from the
-    # live interface — which is the difference between revocation and the appearance of it.
-    _reload_wg(cfg)
-    return gone
+    # Same lock as add_peer, and for the same reason in the other direction: an
+    # enrolment landing between this read and this write would be dropped by the prune,
+    # and a prune landing inside an enrolment would be undone by it. The reconcile timer
+    # runs this every few minutes on the exit host, so the overlap is routine rather
+    # than exotic.
+    with conf_lock(cfg):
+        body = conf.read_text()
+        gone = expired_peers(body)
+        if not gone:
+            return []
+        out, drop, current = [], False, None
+        for line in body.splitlines(keepends=True):
+            stripped = line.strip()
+            if stripped.startswith("# peer:"):
+                current = stripped[len("# peer:"):].strip()
+                drop = current in gone
+            if not drop:
+                out.append(line)
+        _write_conf(conf, "".join(out))
+        # If this raises, the caller learns the peers were removed from DISK but not
+        # from the live interface — which is the difference between revocation and the
+        # appearance of it.
+        _reload_wg(cfg)
+        return gone
 
 
 def _reload_wg(cfg: EgressConfig) -> None:
@@ -1110,27 +1165,31 @@ def add_peer(cfg: EgressConfig, name: str, peer_ip: str, public_key: str,
       reload.
     """
     conf = WG_DIR / f"{cfg.wg_iface}.conf"
-    body = conf.read_text() if conf.exists() else ""
-    _refuse_peer_collision(body, name=name, peer_ip=peer_ip, public_key=public_key,
-                           iface=cfg.wg_iface)
-    stanza = gateway_peer_stanza(name, peer_ip, public_key, expires, cfg)
-    marker = f"\n# peer:{name}\n"
-    if marker in body:
-        # RECONCILE, do not skip. Treating mere presence as success meant a RENEWED
-        # certificate changed nothing: the old expiry stayed, so the next apply pruned a
-        # peer that had just been renewed, and a rotated key was ignored outright.
-        start = body.index(marker)
-        nxt = body.find("\n# peer:", start + 1)
-        end = len(body) if nxt == -1 else nxt
-        replaced = body[:start] + stanza + body[end:]
-        if replaced == body:
-            return False
-        _write_conf(conf, replaced)
+    # THE READ MUST BE INSIDE THE LOCK, not merely the write. That is the whole race:
+    # two enrolments reading the same snapshot and each writing a whole file back.
+    with conf_lock(cfg):
+        body = conf.read_text() if conf.exists() else ""
+        _refuse_peer_collision(body, name=name, peer_ip=peer_ip, public_key=public_key,
+                               iface=cfg.wg_iface)
+        stanza = gateway_peer_stanza(name, peer_ip, public_key, expires, cfg)
+        marker = f"\n# peer:{name}\n"
+        if marker in body:
+            # RECONCILE, do not skip. Treating mere presence as success meant a RENEWED
+            # certificate changed nothing: the old expiry stayed, so the next apply
+            # pruned a peer that had just been renewed, and a rotated key was ignored
+            # outright.
+            start = body.index(marker)
+            nxt = body.find("\n# peer:", start + 1)
+            end = len(body) if nxt == -1 else nxt
+            replaced = body[:start] + stanza + body[end:]
+            if replaced == body:
+                return False
+            _write_conf(conf, replaced)
+            _reload_wg(cfg)
+            return True
+        _write_conf(conf, body + stanza)
         _reload_wg(cfg)
         return True
-    _write_conf(conf, body + stanza)
-    _reload_wg(cfg)
-    return True
 
 
 def setup_peer(cfg: EgressConfig, peer_ip: str, gateway_addr: str, gateway_pubkey: str) -> str:
@@ -1138,10 +1197,11 @@ def setup_peer(cfg: EgressConfig, peer_ip: str, gateway_addr: str, gateway_pubke
     _require_wg()
     check_overlay_net(cfg)
     priv, pub = ensure_keypair(cfg.wg_iface)
-    _write_conf(WG_DIR / f"{cfg.wg_iface}.conf",
-                peer_wg_config(cfg, priv.read_text().strip(), peer_ip,
-                               gateway_addr, gateway_pubkey))
-    wg_up(cfg)
+    with conf_lock(cfg):
+        _write_conf(WG_DIR / f"{cfg.wg_iface}.conf",
+                    peer_wg_config(cfg, priv.read_text().strip(), peer_ip,
+                                   gateway_addr, gateway_pubkey))
+        wg_up(cfg)
     return pub
 
 

@@ -1667,3 +1667,155 @@ def test_the_ci_script_extracts_the_same_pattern_the_module_compiles():
     spec.loader.exec_module(mod)
 
     assert mod.gate_ok_pattern().pattern == GATE_OK_PATTERN.pattern
+
+
+# --------------------------------------------------------------------------------------
+# Concurrent enrolment. Every mutation of <iface>.conf is a read-modify-write.
+# --------------------------------------------------------------------------------------
+
+def _wg_key(n: int) -> str:
+    """A syntactically valid WireGuard public key — 32 bytes, base64. gateway_peer_stanza
+    validates the shape, so "KEY3====" is rejected before the race can even happen."""
+    import base64
+
+    return base64.b64encode(bytes([n]) * 32).decode()
+
+
+def _slow_registrar(monkeypatch, tmp_path, *, delay=0.05):
+    """add_peer against a real file, with the read and the write pulled apart so two
+    threads reliably interleave. The sleep only widens a window that already exists —
+    on a real exit host the gap is a file read, a string build and a `wg syncconf`."""
+    import time
+
+    from blastbox.host import egress_apply as ea
+
+    monkeypatch.setattr(ea, "WG_DIR", tmp_path)
+    monkeypatch.setattr(ea, "_reload_wg", lambda cfg: None)
+
+    real_write = ea._write_conf
+
+    def slow_write(path, content):
+        time.sleep(delay)
+        real_write(path, content)
+
+    monkeypatch.setattr(ea, "_write_conf", slow_write)
+    return ea
+
+
+def test_two_concurrent_enrolments_do_not_lose_one_of_the_peers(monkeypatch, tmp_path):
+    """THE RACE. add_peer reads the whole config, appends a stanza and writes the whole
+    thing back. Two provisioning processes enrolling DIFFERENT nodes both read the
+    original, both write their own version, and the second silently discards the first —
+    from disk and, because the reload follows, from the live interface. Both report
+    success, so the first node's operator sees a registered peer that the exit host has
+    no record of.
+
+    _refuse_peer_collision cannot catch this and does not try: it reads the same stale
+    snapshot, so it sees no conflict either.
+    """
+    import threading
+
+    ea = _slow_registrar(monkeypatch, tmp_path)
+    cfg = EgressConfig(mode="global", upstream_gw="10.77.0.1", exit_host=True)
+    (tmp_path / "bbwg0.conf").write_text("[Interface]\nPrivateKey = x\nAddress = 10.77.0.1/24\n")
+
+    errors: list[BaseException] = []
+
+    def enrol(n):
+        try:
+            ea.add_peer(cfg, f"toolz{n}", f"10.77.0.{n}", _wg_key(n))
+        except BaseException as exc:      # noqa: BLE001 - reported, not swallowed
+            errors.append(exc)
+
+    threads = [threading.Thread(target=enrol, args=(n,)) for n in (3, 4, 5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert not errors, errors
+    body = (tmp_path / "bbwg0.conf").read_text()
+    for n in (3, 4, 5):
+        assert f"# peer:toolz{n}" in body, (
+            f"toolz{n} was enrolled successfully and is not in the config — another "
+            f"enrolment overwrote it. Config:\n{body}"
+        )
+
+
+def test_the_lock_is_held_across_the_read_not_only_the_write(monkeypatch, tmp_path):
+    """Locking the write alone fixes nothing: the two enrolments would still each build
+    a whole file from the same stale snapshot and the second would still win."""
+    import threading
+
+    from blastbox.host import egress_apply as ea
+
+    monkeypatch.setattr(ea, "WG_DIR", tmp_path)
+    monkeypatch.setattr(ea, "_reload_wg", lambda cfg: None)
+    cfg = EgressConfig(mode="global", upstream_gw="10.77.0.1", exit_host=True)
+    (tmp_path / "bbwg0.conf").write_text("[Interface]\nPrivateKey = x\n")
+
+    reads_while_locked: list[bool] = []
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hold():
+        with ea.conf_lock(cfg):
+            holding.set()
+            release.wait(timeout=10)
+
+    t = threading.Thread(target=hold)
+    t.start()
+    assert holding.wait(timeout=10)
+
+    done = threading.Event()
+
+    def contend():
+        with ea.conf_lock(cfg):
+            reads_while_locked.append(True)
+        done.set()
+
+    c = threading.Thread(target=contend)
+    c.start()
+    entered_early = done.wait(timeout=0.5)
+    release.set()
+    t.join(timeout=10)
+    c.join(timeout=10)
+
+    assert not entered_early, "conf_lock did not exclude a second holder"
+    assert reads_while_locked == [True], "the contender never got in after the release"
+
+
+def test_pruning_and_enrolling_do_not_undo_each_other(monkeypatch, tmp_path):
+    """The reconcile timer runs prune on the exit host every few minutes, so overlap
+    with an enrolment is routine rather than exotic. Without a shared lock a prune
+    landing mid-enrolment is undone by it, and an enrolment landing mid-prune is
+    dropped."""
+    import datetime as dt
+    import threading
+
+    ea = _slow_registrar(monkeypatch, tmp_path, delay=0.05)
+    cfg = EgressConfig(mode="global", upstream_gw="10.77.0.1", exit_host=True)
+    past = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)).isoformat()
+    (tmp_path / "bbwg0.conf").write_text(
+        "[Interface]\nPrivateKey = x\n\n"
+        f"# peer:stale\n# expires: {past}\n[Peer]\nPublicKey = " + _wg_key(9) + "\nAllowedIPs = 10.77.0.9/32\n")
+
+    results: dict[str, object] = {}
+
+    def do_prune():
+        results["pruned"] = ea.prune_expired_peers(cfg)
+
+    def do_add():
+        results["added"] = ea.add_peer(cfg, "fresh", "10.77.0.4", _wg_key(4))
+
+    ts = [threading.Thread(target=do_prune), threading.Thread(target=do_add)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(timeout=30)
+
+    body = (tmp_path / "bbwg0.conf").read_text()
+    assert results.get("pruned") == ["stale"], results
+    assert results.get("added") is True, results
+    assert "# peer:fresh" in body, f"the enrolment was lost to the prune:\n{body}"
+    assert "# peer:stale" not in body, f"the prune was undone by the enrolment:\n{body}"
