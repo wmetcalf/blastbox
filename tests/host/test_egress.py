@@ -1642,3 +1642,28 @@ def test_a_free_overlay_prefix_is_accepted(monkeypatch):
 
     _routes(monkeypatch, ["192.168.1.0/24", "172.17.0.0/16"])
     ea.check_overlay_net(EgressConfig())
+
+
+def test_the_ci_script_extracts_the_same_pattern_the_module_compiles():
+    """scripts/ci/assert-gate-line.py lifts GATE_OK_PATTERN out of the module SOURCE
+    instead of importing it: the egress-forwarder CI job installs no Python
+    dependencies, and `import blastbox.host.egress` pulls blastbox/__init__ -> the
+    worker engine -> pydantic, which died with ModuleNotFoundError while the forwarder
+    under test had printed exactly the right line.
+
+    That keeps the pattern from being retyped, but only while the extraction still
+    works — a rename or a reformat would leave the CI check reading nothing. This is
+    the thing that notices.
+    """
+    import importlib.util
+    from pathlib import Path as _P
+
+    from blastbox.host.egress import GATE_OK_PATTERN
+
+    script = _P(__file__).resolve().parents[2] / "scripts/ci/assert-gate-line.py"
+    spec = importlib.util.spec_from_file_location("assert_gate_line", script)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    assert mod.gate_ok_pattern().pattern == GATE_OK_PATTERN.pattern
