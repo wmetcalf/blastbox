@@ -58,8 +58,24 @@ host = [
 s3 = [
     "boto3>=1.34",
 ]
+# The ClamAV engine's clamd client. Lives in the WORKER image, not the host: the daemon
+# is a unix socket inside the guest, so nothing on the host ever imports this.
+clamav = [
+    "clamd>=1.0.2",
+]
+# The Magika content-type engine (model + onnxruntime). Worker-image only, like clamav —
+# nothing on the host imports it.
+magika = [
+    "magika>=1.0.0",
+]
 dev = [
-    "blastbox[host]",            # the http/ingress tests need the host stack (fastapi, etc.)
+    "blastbox[host]",              # the http/ingress tests need the host stack (fastapi, etc.)
+    "blastbox[clamav]",
+    # magika too, and for the same reason. Without it tests/engines/test_magika.py's
+    # `live` block skips silently in CI, so the model-loading path — the _MAGIKA
+    # singleton, the identify() wrapper, onnxruntime version handling — is never
+    # executed by anything, and the asymmetry is invisible in "N passed / M skipped".
+    "blastbox[magika]",
     "pytest>=8.0.0",
     "mypy>=1.9.0",
     # 0.16 expanded ruff's default rule set -> 244 pre-existing violations across the

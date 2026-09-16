@@ -111,6 +111,71 @@ jobs:
             exit 1
           fi
 
+  egress-forwarder-image:
+    timeout-minutes: 15
+    # The forwarder is a real deployment artifact but it is built on the node, not
+    # published to a registry (this repo ships only the PyPI wheel). Nothing would
+    # otherwise notice it rotting until an operator ran `egress apply --mode global` on a
+    # live node and got a build failure mid-install. Build it here, and assert the
+    # behaviours the tier depends on: it must FAIL CLOSED with no reachable upstream, it
+    # must refuse to start at all with no upstream configured, and — the one this job was
+    # missing — it must print a gate line that `egress.GATE_OK_PATTERN` ACCEPTS when the
+    # overlay is fine. Both existing assertions were negative, so the single string the
+    # dispatcher's health gate keys on was never produced or matched anywhere in CI.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the forwarder image
+        run: docker build -t blastbox-egress-forwarder:ci deploy/egress-forwarder
+      - name: It refuses to start with no upstream configured
+        run: |
+          if docker run --rm blastbox-egress-forwarder:ci; then
+            echo "::error::forwarder started without BLASTBOX_UPSTREAM_GW"; exit 1
+          fi
+      - name: Its startup gate fails closed when the overlay is unreachable
+        run: |
+          docker run -d --name fwd --cap-add NET_ADMIN \
+            -e BLASTBOX_UPSTREAM_GW=192.0.2.1 -e BLASTBOX_GATE_RETRIES=2 \
+            blastbox-egress-forwarder:ci
+          for _ in $(seq 1 30); do
+            [ "$(docker inspect -f '{{.State.Running}}' fwd)" = "false" ] && break
+            sleep 1
+          done
+          state=$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' fwd)
+          docker logs fwd
+          # Exiting non-zero IS the correct outcome: it leaves the gateway address empty
+          # so the worker's default route points nowhere.
+          # The exit CODE alone is not proof: entrypoint.sh exits 1 on the uplink-detection
+          # path too, before the gate ever runs, so a broken entrypoint would report
+          # "fail-closed OK". Require the gate's own message, the same way
+          # egress.GATE_OK_PATTERN refuses to judge a forwarder on liveness.
+          case "$state" in
+            "exited 1") : ;;
+            *) echo "::error::expected 'exited 1', got '$state'"; exit 1 ;;
+          esac
+          if docker logs fwd 2>&1 | grep -q "overlay peer 192.0.2.1 unreachable after"; then
+            echo "fail-closed gate OK (the gate ran, retried, and refused)"
+          else
+            echo "::error::container exited 1 but the startup gate never ran"; exit 1
+          fi
+      - name: Its gate SUCCESS line is the one the health gate recognises
+        run: |
+          # A reachable upstream: the container's own bridge gateway always answers.
+          UP=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}')
+          docker run -d --name fwdok --cap-add NET_ADMIN --sysctl net.ipv4.ip_forward=1 \
+            -e BLASTBOX_UPSTREAM_GW="$UP" blastbox-egress-forwarder:ci
+          for _ in $(seq 1 30); do
+            docker logs fwdok 2>&1 | grep -q 'overlay peer' && break
+            sleep 1
+          done
+          docker logs fwdok > /tmp/fwdok.log 2>&1
+          cat /tmp/fwdok.log
+          python3 scripts/ci/assert-gate-line.py /tmp/fwdok.log
+          docker rm -f fwdok
+      - name: Clean up
+        if: always()
+        run: docker rm -f fwd || true
+
   pg-search:
     # Perceptual-hash search is Postgres + pg_bktree only — there is no SQLite
     # search path — so its tests skip in the plain `test` job. Build a Postgres

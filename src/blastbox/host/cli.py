@@ -4,6 +4,7 @@ Subcommands:
 - ``serve``    — start the FastAPI ingress server via uvicorn.
 - ``dispatch`` — run the Dispatcher loop (claim + launch worker containers).
 - ``bench``    — run a performance benchmark scenario (or ``--list`` them).
+- ``egress``   — set up this node's egress tier (bridges, local/global exit, wg overlay).
 - ``version``  — print version and exit.
 """
 
@@ -1061,6 +1062,47 @@ def _pki_cmd(args: argparse.Namespace) -> int:
         out.write_bytes(cert_pem)
         print(f"signed server cert ({args.days}d) -> {out}")
         return 0
+    if args.pki_action == "issue-node":
+        from blastbox.host.pki import NodeGrants
+        grants = NodeGrants(engines=tuple(args.engine), tiers=tuple(args.tier),
+                            credentials=bool(args.credentials))
+        issued = ca.issue_node(args.node_id, wg_pubkey=args.wg_pubkey,
+                               grants=grants, days=args.days)
+        if args.out:
+            # `write` appends the suffixes, so an --out the operator spelled with one
+            # produced toolz3.crt.crt and toolz3.crt.key — findable only by looking.
+            stem = Path(args.out)
+            if stem.suffix in (".crt", ".key", ".pem"):
+                stem = stem.with_suffix("")
+            crt, key = issued.write(stem.parent or pki_dir, stem.name)
+        else:
+            crt, key = issued.write(pki_dir, f"node-{args.node_id}")
+        print(f"node cert for {args.node_id} ({args.days}d) -> {crt} / {key}")
+        print(f"  {key} is a PRIVATE KEY (0600). Renewal is this same command with the "
+              f"same --node-id and --wg-pubkey, then `egress peer-add --cert {crt}`; at "
+              f"{args.days}d it is a recurring step, not a one-off enrolment.")
+        if not grants.engines and not grants.tiers:
+            # Fail-closed defaults are correct but silently useless; say so once here
+            # rather than let an operator debug an idle node.
+            print("  NOTE: no --engine/--tier granted, so this node is authorised for "
+                  "nothing. Reissue with grants when you want it to take work.")
+        print(f"  grants: engines={list(grants.engines)} tiers={list(grants.tiers)} "
+              f"credentials={grants.credentials}")
+        return 0
+    if args.pki_action == "show-node":
+        from blastbox.host.pki import node_identity
+        try:
+            ident = node_identity(ca, Path(args.cert).read_bytes(), allow_expired=True)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps({
+            "node_id": ident.node_id, "wg_pubkey": ident.wg_pubkey,
+            "engines": list(ident.grants.engines), "tiers": list(ident.grants.tiers),
+            "credentials": ident.grants.credentials,
+            "not_after": ident.not_after.isoformat(), "expired": ident.expired,
+        }, indent=2))
+        return 1 if ident.expired else 0
     if args.pki_action == "show-ca":
         print((pki_dir / "ca.crt").read_text(), end="")
         return 0
@@ -1105,6 +1147,239 @@ def _migrate_results_cmd(args) -> int:
         + (" (dry run — nothing was uploaded)" if args.dry_run else "")
     )
     return 1 if failed else 0
+
+
+def _egress_cmd(args: argparse.Namespace) -> int:
+    try:
+        return _egress_cmd_inner(args)
+    except RuntimeError as exc:
+        # The host layer raises RuntimeError for "your node is not in a state where this
+        # can work" (missing image, unreachable sidecar, nothing free to relocate to).
+        # Those are all actionable messages; a traceback hides them.
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+def _egress_cmd_inner(args: argparse.Namespace) -> int:
+    """Node egress setup: bridges, exit mode, overlay transport.
+
+    Deliberately a thin shell over blastbox.host.egress{,_apply} — the decisions live
+    there as pure functions so they are testable without root.
+    """
+    from blastbox.host import egress_apply as ea
+    from blastbox.host.egress import EgressConfig
+
+    def cfg_from(args: argparse.Namespace) -> EgressConfig:
+        # The node's PERSISTED config is the base, not bare os.environ. `check`/`health`
+        # on a managed node must describe that node — reading the environment alone
+        # reported a global-mode node as local and probed the default gateway address,
+        # which on a relocated node is an address nothing holds. Explicit flags and
+        # environment still override, so an operator can inspect a hypothetical.
+        base = ea.persisted_config()
+        over: dict[str, object] = {}
+        for attr, fieldname in (("mode", "mode"), ("upstream_gw", "upstream_gw"),
+                                ("gateway_ip", "vpn_gateway_ip"), ("wg_iface", "wg_iface")):
+            v = getattr(args, attr, None)
+            if v:
+                over[fieldname] = v
+        return replace(base, **over) if over else base  # type: ignore[arg-type]
+
+    # A misconfiguration is an operator error, not a crash. EgressConfig validates hard
+    # (an off-subnet gateway, a global node with no upstream) precisely so these are
+    # caught before anything touches the host — but a traceback buries the message.
+    try:
+        _ = cfg_from(args)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    action = args.egress_action
+    if action == "check":
+        cfg = cfg_from(args)
+        for row in ea.check_node(cfg):
+            print(f"  {row}")
+        return 0 if ea.node_health(cfg).healthy else 1
+
+    if action == "health":
+        # Machine-readable, for a monitoring probe or the dispatcher's own gate.
+        cfg = cfg_from(args)
+        h = ea.node_health(cfg)
+        print(json.dumps({"healthy": h.healthy, "reason": h.reason, "mode": cfg.mode}))
+        return 0 if h.healthy else 1
+
+    if action == "apply":
+        cfg = cfg_from(args)
+        cfg, notes = ea.apply_node(cfg, dry_run=args.dry_run, auto_subnets=not args.no_auto_subnets)
+        for n in notes:
+            print(f"  {n}")
+        if not args.dry_run:
+            h = ea.await_health(cfg)
+            print(f"  health: {'OK' if h.healthy else 'DEGRADED'} — {h.reason}")
+            # APPLY REPORTS HEALTH; IT DOES NOT FAIL ON IT. A local-mode node that only
+            # runs direct/inetsim/socks/tor personalities has no sidecar at the VPN
+            # gateway address and never will — so the documented bridge-setup command
+            # waited ~45s and exited 1 after configuring everything correctly, and the
+            # boot unit then repeated that failure forever under Restart=on-failure.
+            # `check` and `health` are the commands whose exit code means "is this node
+            # currently able to egress"; `apply` means "did the configuration apply".
+            if not h.healthy:
+                print("  (the configuration applied; `blastbox egress check` is the "
+                      "command whose exit status reflects health)")
+        return 0
+
+    if action == "teardown":
+        cfg = cfg_from(args)
+        for n in ea.teardown_node(cfg, remove_bridges=args.remove_bridges):
+            print(f"  {n}")
+        return 0
+
+    if action == "gateway":
+        cfg = cfg_from(args)
+        pub = ea.setup_gateway(cfg)
+        print(f"  exit host up on {cfg.overlay_gateway_ip}, udp/{cfg.wg_port}")
+        print(f"  public key: {pub}")
+        return 0
+
+    if action == "gateway-exit":
+        for n in ea.apply_exit_host(cfg_from(args), persist=True):
+            print(f"  {n}")
+        return 0
+
+    if action == "peer-add":
+        cfg = cfg_from(args)
+        if args.cert:
+            # THE PUBLIC HALF IS ENOUGH, and insisting on more was a real privilege
+            # problem: `load_ca` reads ca.key and raises without it, so this — an
+            # operation whose whole job is checking a signature — required the key that
+            # mints every node identity to sit on the exit host, the machine that
+            # carries every peer's traffic. CertAuthority's own docstring says to hold
+            # that key only on the dispatcher.
+            from blastbox.host.pki import load_trust_anchor, node_identity
+            try:
+                ident = node_identity(load_trust_anchor(Path(args.pki_dir)),
+                                      Path(args.cert).read_bytes())
+            except (ValueError, FileNotFoundError) as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+            # IDENTITY IS NOT AUTHORISATION. Verifying the signature says WHICH node
+            # this is; it says nothing about whether that node is supposed to be on the
+            # overlay. A cert granting no overlay tier belongs to a node that was never
+            # meant to peer — a local-mode node, or one enrolled for engine work only —
+            # and adding it anyway would let an identity check stand in for a policy
+            # decision, which is the habit this whole change exists to break.
+            overlay_tiers = tuple(t for t in ("openvpn", "wireguard")
+                                  if ident.grants.allows_tier(t))
+            if not overlay_tiers and not args.force:
+                print(f"error: {ident.node_id} is not granted an overlay tier "
+                      f"(has: {list(ident.grants.tiers) or 'none'}). Reissue with "
+                      f"--tier openvpn/--tier wireguard, or pass --force to register it "
+                      f"anyway.", file=sys.stderr)
+                return 1
+            name, pubkey = ident.node_id, ident.wg_pubkey
+            expires = ident.not_after.isoformat()
+            provenance = (f"identity and key verified against the CA "
+                          f"(expires {ident.not_after.date()}); "
+                          f"overlay tiers granted: {list(overlay_tiers) or 'NONE (--force)'}")
+            if args.name and args.name != name:
+                print(f"error: --name {args.name!r} contradicts the cert's identity "
+                      f"{name!r}", file=sys.stderr)
+                return 1
+        elif args.public_key and args.name:
+            name, pubkey = args.name, args.public_key
+            # No cert, so no expiry to enforce — the peer lives until removed by hand.
+            # That is the honest consequence of the legacy path, and the output says so.
+            expires = None
+            provenance = ("UNAUTHENTICATED raw key — nothing ties it to a node identity, "
+                          "and it will never be pruned automatically")
+        else:
+            print("error: give --cert (preferred), or both --name and --public-key",
+                  file=sys.stderr)
+            return 2
+        added = ea.add_peer(cfg, name, args.peer_ip, pubkey, expires=expires)
+        print(f"  peer {name} {'added' if added else 'already present'} at {args.peer_ip}/32")
+        print(f"  {provenance}")
+        print("  no private key changed hands")
+        return 0
+
+    if action == "attest":
+        cfg = cfg_from(args)
+        # Map wg key -> node id from the CERTIFICATES on disk, never from anything a
+        # node published: the whole point is an answer the peer cannot influence.
+        # The public half only: attestation VERIFIES, and this runs on the exit host,
+        # which is the last machine that should hold the key that mints node identities.
+        from blastbox.host.pki import load_trust_anchor, node_identity
+        key_to_node: dict[str, str] = {}
+        pki_dir = Path(args.pki_dir)
+        try:
+            ca = load_trust_anchor(pki_dir)
+        except Exception as exc:
+            print(f"error: cannot load the CA from {pki_dir}: {exc}", file=sys.stderr)
+            return 1
+        # Every cert in the directory, not just `node-*.crt`. `pki issue-node --out`
+        # lets an operator name the file anything; globbing a prefix silently ignored
+        # those, and their node then read as an UNAUTHORISED peer — a false accusation
+        # produced by a filename convention. node_identity() is the filter: a transport
+        # cert simply fails it.
+        for crt in sorted(pki_dir.glob("*.crt")):
+            try:
+                ident = node_identity(ca, crt.read_bytes())
+            except ValueError:
+                continue          # expired or invalid: it authorises nothing
+            key_to_node[ident.wg_pubkey] = ident.node_id
+        working = {n: True for n in args.working}
+        if not working:
+            # FAIL-OPEN, and say so. With no working set, nothing can be contradicted:
+            # the leak check is inert and a silent "all ok" would be the most misleading
+            # output this command could produce. The real fix is sourcing this from the
+            # job store; until then the operator must see that it was not supplied.
+            print("  WARNING: no --working nodes given, so the leak check is INERT — "
+                  "only connectivity and registration hygiene are being verified. "
+                  "Pass the nodes the control plane dispatched egress work to.",
+                  file=sys.stderr)
+        verdicts = ea.attest_peers(cfg, key_to_node=key_to_node, working=working)
+        missing = __import__("blastbox.host.exit_attest", fromlist=["missing_peers"]) \
+            .missing_peers(ea.observe_peers(cfg), key_to_node=key_to_node)
+        if args.json:
+            print(json.dumps({
+                "verdicts": [{"node_id": v.node_id, "contained": v.contained,
+                              "contradicted": v.contradicted, "reason": v.reason}
+                             for v in verdicts],
+                "enrolled_but_absent": list(missing),
+            }, indent=2))
+        else:
+            for v in verdicts:
+                mark = "CONTRADICTED" if v.contradicted else ("ok" if v.contained else "??")
+                print(f"  [{mark}] {v.node_id}: {v.reason}")
+            for n in missing:
+                print(f"  [absent] {n}: enrolled, but no peer on {cfg.wg_iface} — every "
+                      "job placed there fails closed")
+            if not verdicts and not missing:
+                print("  no peers registered on this exit")
+        # AN ABSENT PEER IS A FINDING, and this used to exit 0 for it — so a cron or CI
+        # invocation reported success for an exit host on which an enrolled node has no
+        # tunnel at all and every job placed there fails closed. Distinct codes because
+        # the two demand different responses: 1 is a suspected LEAK (investigate the
+        # node), 2 is a registration or connectivity fault (fix the enrolment).
+        if any(v.contradicted for v in verdicts):
+            return 1
+        return 2 if missing else 0
+
+    if action == "peer-prune":
+        cfg = cfg_from(args)
+        gone = ea.prune_expired_peers(cfg)
+        print(f"  pruned {len(gone)} expired peer(s)" + (f": {', '.join(gone)}" if gone else ""))
+        return 0
+
+    if action == "peer":
+        cfg = cfg_from(args)
+        pub = ea.setup_peer(cfg, args.peer_ip, args.gateway_addr, args.gateway_pubkey)
+        print(f"  peer up at {args.peer_ip} -> {args.gateway_addr}:{cfg.wg_port}")
+        print(f"  register this public key on the exit host: {pub}")
+        print("  then, in order: `blastbox egress apply --mode global --upstream-gw <overlay gw>`")
+        return 0
+
+    raise SystemExit(f"unknown egress action {action!r}")
+
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1190,6 +1465,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--out", default=None, help="output cert path (default: <csr>.crt)"
     )
     pk_csr.add_argument("--days", type=int, default=30)
+    pk_node = pks.add_parser(
+        "issue-node",
+        help="mint a NODE cert: identity + its WireGuard key + its grants")
+    pk_node.add_argument("--node-id", required=True,
+                         help="the machine's identity (lowercase, 1-63 chars)")
+    pk_node.add_argument("--wg-pubkey", required=True,
+                         help="the node's WireGuard PUBLIC key (printed by `egress peer`)")
+    pk_node.add_argument("--engine", action="append", default=[],
+                         help="engine this node may be assigned (repeatable; default none)")
+    pk_node.add_argument("--tier", action="append", default=[],
+                         help="netpolicy tier this node may be assigned (repeatable)")
+    pk_node.add_argument("--credentials", action="store_true",
+                         help="this node may hold provider credentials (a local VPN/proxy "
+                              "sidecar). Leave OFF for a global-mode worker node.")
+    pk_node.add_argument("--days", type=int, default=7,
+                         help="short by design: revocation is 'stop renewing'")
+    pk_node.add_argument(
+        "--out", default=None,
+        help="basename to write, as <out>.crt and <out>.key. A trailing .crt is "
+             "stripped, so --out /tmp/toolz3.crt writes /tmp/toolz3.crt and .key rather "
+             "than toolz3.crt.crt. Default: <pki-dir>/node-<node-id>.{crt,key} — this "
+             "command ALWAYS writes a private key to disk, it never prints to stdout")
+    pk_show = pks.add_parser("show-node", help="verify a node cert and print its identity")
+    pk_show.add_argument("--cert", required=True)
     pks.add_parser("show-ca", help="print the CA cert (public trust anchor)")
     pk_imp = pks.add_parser(
         "import-ca",
@@ -1333,6 +1632,95 @@ def build_parser() -> argparse.ArgumentParser:
         "pass it explicitly when stamping a build that pins a different one",
     )
     pst.set_defaults(func=_stamp_cmd)
+
+    # egress -- node-level egress tier (bridges, exit mode, overlay transport)
+    pe = sub.add_parser(
+        "egress",
+        help="set up this node's egress tier (bridges, local or global exit, wg overlay)")
+    # Common options live on a PARENT parser that every action inherits, not on the
+    # `egress` parser itself. argparse hands everything after the action verb to the
+    # sub-parser, so an option declared only on the parent is reachable solely in the
+    # pre-verb position — which made every documented `egress apply --mode global ...`
+    # die with "unrecognized arguments". Inheriting them puts them in both positions.
+    # default=argparse.SUPPRESS is load-bearing. argparse parses a sub-command into a
+    # FRESH namespace and copies every key back over the parent's, so an option declared
+    # in both places has its pre-verb value overwritten by the sub-parser's default —
+    # `egress --mode global apply` silently became mode=None, which is worse than the
+    # "unrecognized arguments" it replaced because it fails OPEN into local mode.
+    # SUPPRESS omits the key entirely when the option is absent, so neither position
+    # clobbers the other.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--mode", choices=("local", "global"), default=argparse.SUPPRESS,
+                        help="local: this node runs its own credentialed exit sidecars. "
+                             "global: this node holds no credentials and forwards over the "
+                             "wg overlay to the central exit host. The gateway ADDRESS is "
+                             "identical either way.")
+    common.add_argument("--gateway-ip", default=argparse.SUPPRESS,
+                        help="override the gateway address")
+    common.add_argument("--wg-iface", default=argparse.SUPPRESS)
+    common.add_argument("--upstream-gw", default=argparse.SUPPRESS,
+                        help="mode=global: overlay IP of the central exit host")
+    pe.add_argument("--mode", choices=("local", "global"), default=argparse.SUPPRESS,
+                    help=argparse.SUPPRESS)
+    pe.add_argument("--gateway-ip", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    pe.add_argument("--wg-iface", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    pe.add_argument("--upstream-gw", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    pes = pe.add_subparsers(dest="egress_action", required=True)
+
+    pe_ap = pes.add_parser("apply", parents=[common],
+                           help="bring this node to the configured state (idempotent)")
+    pe_ap.add_argument("--dry-run", action="store_true")
+    pe_ap.add_argument("--no-auto-subnets", action="store_true",
+                       help="fail on a subnet conflict instead of relocating the bridge")
+    pes.add_parser("check", parents=[common],
+                   help="report state; exit non-zero if egress is degraded")
+    pes.add_parser("health", parents=[common],
+                   help="one-line JSON health verdict (for probes / the dispatcher)")
+    pe_td = pes.add_parser("teardown", parents=[common], help="remove only what we created")
+    pe_td.add_argument("--remove-bridges", action="store_true")
+    pes.add_parser("gateway", parents=[common],
+                   help="exit host: stand up the overlay endpoint, print its public key")
+    pes.add_parser("gateway-exit", parents=[common],
+                   help="exit host: route peer traffic into the local sidecar")
+    pe_pa = pes.add_parser("peer-add", parents=[common],
+                           help="exit host: register a peer from its NODE CERT (preferred) "
+                                "or a raw public key")
+    pe_pa.add_argument("--cert", default=None,
+                       help="the peer's node cert. Its identity and WireGuard key are "
+                            "taken from the CA-signed payload, so registration is a "
+                            "signature check rather than trust in a pasted string.")
+    pe_pa.add_argument("--name", default=None,
+                       help="peer name (taken from the cert when --cert is used)")
+    pe_pa.add_argument("--peer-ip", required=True)
+    pe_pa.add_argument("--public-key", default=None,
+                       help="LEGACY: a raw WireGuard public key, unauthenticated. Prefer "
+                            "--cert; this is kept for nodes not yet enrolled.")
+    pe_pa.add_argument("--pki-dir", default=os.environ.get(
+        "BLASTBOX_PKI_DIR", "/var/lib/blastbox/pki"))
+    pe_pa.add_argument("--force", action="store_true",
+                       help="register a verified node whose cert grants no overlay tier")
+    pe_at = pes.add_parser(
+        "attest", parents=[common],
+        help="exit host: verify peers' containment from HERE, where they cannot edit "
+             "the answer. Exit 0 = clean, 1 = a peer CONTRADICTS its containment "
+             "claim, 2 = an enrolled peer has no tunnel at all")
+    pe_at.add_argument("--working", action="append", default=[],
+                       help="node id the control plane dispatched egress work to "
+                            "(repeatable). Supply this from the job store — never from "
+                            "the node's own heartbeat, or the adversary supplies both "
+                            "sides of the comparison.")
+    pe_at.add_argument("--pki-dir", default=os.environ.get(
+        "BLASTBOX_PKI_DIR", "/var/lib/blastbox/pki"))
+    pe_at.add_argument("--json", action="store_true")
+    pes.add_parser("peer-prune", parents=[common],
+                   help="exit host: drop peers whose certificate has expired (run "
+                        "automatically on every apply)")
+    pe_pr = pes.add_parser("peer", parents=[common],
+                           help="worker node: join the overlay (generates its own key)")
+    pe_pr.add_argument("--peer-ip", required=True)
+    pe_pr.add_argument("--gateway-addr", required=True)
+    pe_pr.add_argument("--gateway-pubkey", required=True)
+    pe.set_defaults(func=_egress_cmd)
 
     pv = sub.add_parser("version", help="print version and exit")
     pv.set_defaults(func=_version_cmd)

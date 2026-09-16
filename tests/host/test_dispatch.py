@@ -4036,3 +4036,112 @@ def test_a_broken_backpressure_probe_does_not_disable_the_reclaim_forever(tmp_pa
 
     assert reap_stale_scratch(tmp_path, 60.0, InMemoryJobStore(), _logging.getLogger("t"),
                               yield_to_work=broken) == 1
+
+
+# --------------------------------------------------------------------------------------
+# The egress-defer backoff must bound its own map without un-bounding the spin.
+# --------------------------------------------------------------------------------------
+
+class _DeferOnly:
+    """Just the defer bookkeeping, unbound from Dispatcher's construction cost."""
+
+    from blastbox.host.dispatch import Dispatcher as _D
+
+    EGRESS_DEFER_MAX = _D.EGRESS_DEFER_MAX
+    EGRESS_DEFER_EVICT = _D.EGRESS_DEFER_EVICT
+    _bump_egress_defer = _D._bump_egress_defer
+
+    _egress_defer_plan = _D._egress_defer_plan
+
+    def __init__(self):
+        import threading
+
+        self._egress_defer_lock = threading.Lock()
+        self._egress_defer_n: dict[str, int] = {}
+        self._egress_defer_floor = 0
+        self._egress_defer_cap_s = 300.0
+        self._egress_shared_defer_s = 5.0
+
+
+def _delay(n, cap=300.0):
+    return min(cap, 2.0 * (2 ** min(n - 1, 8)))
+
+
+def test_an_overflowing_defer_map_does_not_reset_jobs_to_the_two_second_floor():
+    """The eviction dropped the LOWEST-attempt entries, reasoning they were "furthest
+    from their cap, so losing their count costs least". The actual cost of losing an
+    entry is that the job restarts at n=1 and gets `delay = 2.0` again — so past 4096
+    deferred jobs the overflow repeatedly evicted exactly the jobs that had not
+    escalated, and they re-claimed at ~0.5Hz for the length of the outage. That is the
+    spin the whole block was written to bound, and max_queued_age is off by default so
+    nothing terminated them."""
+    d = _DeferOnly()
+    jobs = [f"j{i}" for i in range(6000)]
+    for _round in range(12):
+        delays = [_delay(d._bump_egress_defer(j)) for j in jobs]
+
+    assert min(delays) > 2.0, "some job is still re-claiming at the 2s floor"
+    assert min(delays) == 300.0, "every job should have reached the cap by round 12"
+    assert len(d._egress_defer_n) <= d.EGRESS_DEFER_MAX, "the map is unbounded again"
+
+
+def test_the_map_stays_bounded():
+    d = _DeferOnly()
+    for i in range(d.EGRESS_DEFER_MAX * 3):
+        d._bump_egress_defer(f"j{i}")
+    assert len(d._egress_defer_n) <= d.EGRESS_DEFER_MAX
+
+
+def test_a_jobs_own_entry_is_never_evicted_by_its_own_bump():
+    """Otherwise the caller reads a count for a key that is already gone."""
+    d = _DeferOnly()
+    for i in range(d.EGRESS_DEFER_MAX + 1):
+        d._bump_egress_defer(f"j{i}")
+    last = f"j{d.EGRESS_DEFER_MAX}"
+    assert last in d._egress_defer_n
+
+
+def test_a_healthy_fleet_does_not_inherit_a_raised_floor():
+    """Leaving the floor up would make the first defer of an unrelated blip a week
+    later start at the 300s cap."""
+    d = _DeferOnly()
+    for i in range(d.EGRESS_DEFER_MAX + d.EGRESS_DEFER_EVICT + 10):
+        d._bump_egress_defer(f"j{i}")
+    assert d._egress_defer_floor > 0
+    d._egress_defer_n.clear()
+    d._egress_defer_floor = 0          # what the success path does
+    assert _delay(d._bump_egress_defer("fresh")) == 2.0
+
+
+def test_the_escalating_backoff_is_local_and_the_store_defer_stays_short():
+    """`claimable_after` lives in the SHARED job store, so the delay this node computed
+    from its own attempt count blocked EVERY dispatcher: after eight tries, a job no
+    node in the fleet could claim for five minutes. That contradicts the reasoning
+    beside the constant ("a healthy peer could still run it") and the warning the loop
+    prints ("a healthy peer can still take them") — during a single-node outage, the
+    case those sentences are about, the degraded node was holding the job away from the
+    peers that could run it."""
+    d = _DeferOnly()
+    shared = [d._egress_defer_plan(n)[0] for n in range(1, 40)]
+    local = [d._egress_defer_plan(n)[1] for n in range(1, 40)]
+
+    assert max(shared) <= 10.0, (
+        "the fleet-wide defer must stay in seconds however long this node has been "
+        "degraded — it is what stops a healthy peer from taking the job"
+    )
+    assert shared[-1] == shared[8], "the fleet-wide defer must stop growing"
+    assert local[0] < local[8], "this node's own re-examination interval must escalate"
+    assert max(local) == d._egress_defer_cap_s
+    assert all(sh <= lo for sh, lo in zip(shared, local)), (
+        "telling the store to wait LONGER than this node's own cooldown would make "
+        "the escalation pointless and block peers as well"
+    )
+
+
+def test_this_node_stays_out_of_the_way_for_the_escalated_window_not_the_store():
+    """The whole point: after a few attempts this node leaves the job alone for
+    minutes, while any peer can claim it seconds later."""
+    d = _DeferOnly()
+    shared, local = d._egress_defer_plan(9)
+    assert local >= 300.0
+    assert shared <= 10.0

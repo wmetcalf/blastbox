@@ -245,9 +245,12 @@ kill-switch for `direct` / `inetsim`, which attach to their own self-contained `
 pointing at a proxy sidecar — those don't depend on netd's routing.)
 
 **Prerequisites** (the overlay needs more than just the netd process):
-- **Pre-create the internal docker bridges** the dispatcher attaches wired workers to:
-  `docker network create --internal bb-socks` (socks/tor), `bb-vpn` (openvpn/wireguard),
-  `bb-inspect`; plus `bb-net0` (`direct`) / `bb-fakenet` (`inetsim`) if you use those.
+- **Create the bridges with `sudo blastbox egress apply`** — it creates `bb-socks`
+  (socks/tor), `bb-vpn` (openvpn/wireguard), `bb-net0` (`direct`) and `bb-fakenet`
+  (`inetsim`), and relocates any whose default subnet collides with something already on
+  the host (see *Two exit modes* below). Do **not** hand-create these: a hand-pinned
+  bridge is adopted as-is, which silently discards that collision avoidance.
+  `bb-inspect` is still manual: `docker network create --internal bb-inspect`.
 - **Use the `runc` runtime for netd-wired tiers.** netd needs a **host-visible netns** to wire the
   worker, so the dispatcher refuses `tor`/`socks`/`openvpn`/`wireguard`/route-inspected jobs unless
   the runtime is `runc` (gVisor/FC hide the netns). Set `BLASTBOX_ALLOW_RUNC=1` accordingly.
@@ -257,6 +260,134 @@ pointing at a proxy sidecar — those don't depend on netd's routing.)
 - **Enable capture/decrypt on the dispatcher.** netd only captures a pcap when
   `BLASTBOX_NET_CAPTURE=1` is set on the dispatcher (and TLS decrypt needs `BLASTBOX_NET_DECRYPT=1`);
   both default off.
+
+### Two exit modes: per-host exits and a global overlay
+
+The prerequisites above assume every node runs its own exit sidecars — which means copying VPN
+profiles and proxy credentials to every node. `blastbox egress --mode global` is the
+alternative: **one** host runs the real exits, every other node reaches them over a WireGuard
+overlay and holds no credentials at all.
+
+**The gateway address is identical in both modes.** In `local` mode `172.31.0.10` *is* the
+OpenVPN client sidecar; in `global` mode it is a credential-free forwarder
+(`deploy/egress-forwarder`) that carries traffic to the central host. Personalities, netd
+flags, worker labels and the in-netns routes are byte-identical either way — a node's mode is
+only ever *which container sits at that address*. Nothing in Python changes:
+`netwire.gateway_route_commands` takes a plain IP.
+
+| | per-host (`--mode local`) | global (`--mode global`) |
+|---|---|---|
+| credentials | on every node | on the exit host only |
+| `172.31.0.10` | the exit sidecar | credential-free forwarder |
+| blast radius of a node compromise | a VPN profile / proxy key | a wg transport key |
+| exit IP | this node's provider session | shared, central |
+
+Bring-up, exit host first (order matters — the forwarder refuses to start until the node-side
+source route exists):
+
+```sh
+# 1. exit host — already runs the sidecars
+sudo blastbox egress gateway                       # prints the EXIT HOST's public key
+sudo blastbox egress gateway-exit                  # records the exit role; replayed at boot
+
+# 2. worker node — generates its OWN key and prints it; the private half never travels
+sudo blastbox egress peer --peer-ip 10.77.0.3 \
+     --gateway-addr <exit host> --gateway-pubkey <exit host public key>
+
+# 3. back on the exit host — enrol the peer with the key step 2 just printed
+sudo blastbox pki issue-node --node-id toolz3 --wg-pubkey <the peer's public key> \
+     --engine boxjs --tier openvpn --tier wireguard
+sudo blastbox egress peer-add --peer-ip 10.77.0.3 --cert /var/lib/blastbox/pki/node-toolz3.crt
+
+# 4. worker node again — bring up the tier
+sudo blastbox egress apply --mode global --upstream-gw 10.77.0.1
+
+# 5. prove it — including that killing the overlay removes egress
+sudo blastbox egress check
+# reads the gateway and interface from /etc/blastbox/egress.env, so it follows a
+# subnet reallocation; pass --gateway-ip / --wg-if only to override
+sudo scripts/test-egress-leak.sh --mode global
+```
+
+**Step 3 RECURS.** `pki issue-node` defaults to a 7-day lifetime — that short lifetime is
+what makes "revocation is stop renewing" work without a CRL or any online check — and the
+exit host's `prune_expired_peers` runs on every `apply`, which now includes the reconcile
+timer. So a fleet enrolled in one afternoon loses every tunnel on the same afternoon a
+week later unless step 3 is repeated for each node with the same node id and wg key,
+followed by `egress peer-add --cert`. From the worker's own side nothing looks wrong when
+this happens: its rules are intact and `enforcement_present` passes; only the forwarder's
+gate starts failing. `blastbox egress check` on the exit host and its `health` line both
+warn two days ahead, naming each peer and the hours it has left.
+
+**Peers are registered from a CA-signed node cert, not a pasted key.** `pki issue-node`
+binds three things into one signed object: the node's identity, its WireGuard public key,
+and its **grants** — which engines and netpolicy tiers it may be assigned, and whether it
+may hold provider credentials at all. `peer-add --cert` then verifies the CA signature and
+takes the identity and key from the payload, so registering a peer is a signature check
+rather than trust in a string an operator retyped. Grants default to **nothing**, so a cert
+issued without them produces an idle node rather than an unrestricted one, and revocation is
+"stop renewing" — which is why the default lifetime is a week.
+
+`--name`/`--public-key` still work for nodes not yet enrolled, and say plainly that the key
+is unauthenticated. The certificate's node-info extension uses a **placeholder OID arc that
+is not an IANA Private Enterprise Number**; it is fine while these certs never leave this
+CA, and must be replaced before they do. Design context: `docs/superpowers/specs/2026-09-15-federated-node-identity-and-placement.md`.
+
+`apply` is **idempotent** (every step is guarded or best-effort) and installs
+`blastbox-egress.service`, which re-applies at boot. That unit is not optional bookkeeping:
+ip rules, the routing table and the `BB-WG-*` chains are all runtime state and none of it
+survives a reboot. Without it a node comes back with its bridges intact and its *enforcement*
+gone — failing closed, correctly, and staying that way until a human notices.
+
+`apply` also **allocates subnets**. The defaults (`172.28`–`172.31`) collide on a busy CAPE
+host with `cape_default`, `fakenet-ng` and per-branch compose stacks; a colliding bridge is
+moved to the first free pool and any address pinned inside it moves with it, keeping its host
+offset. Two rules keep that safe: the candidate set excludes **everything the host already
+routes**, not just docker's pools — the management LAN is a `/16` inside the first pool tried,
+and picking it would cut ssh to the node — while a summary route (`/8` or broader, e.g. a
+corporate `10.0.0.0/8`) is advisory rather than blocking, or it vetoes every candidate. A
+bridge that already exists is adopted, never re-decided. Pass `--no-auto-subnets` to fail on a
+conflict instead.
+
+**The overlay carries the `bb-vpn` tiers only — `openvpn` and `wireguard`.** The forwarder
+is started with `BLASTBOX_WORKER_SUBNET=<vpn_subnet>` and the node-side source route keys on
+its single uplink `/32`, so `tor` (a host REDIRECT into a local tor daemon), `socks` (an
+in-netns TUN to a SOCKS sidecar) and `httpproxy` egress through their own local sidecars in
+**both** modes. Two consequences worth stating plainly: their liveness is independent of the
+forwarder, so a dead overlay does not gate them; and **a global-mode node running those tiers
+is not credential-free for them** — it still holds whatever its tor/SOCKS/proxy sidecars need,
+and their traffic leaves by this node, not the central exit. If you want every tier
+centralised, run only `openvpn`/`wireguard` personalities on global-mode nodes.
+
+**The dispatcher defers egress jobs on a degraded node.** `blastbox egress health` is a
+one-line JSON verdict, and the dispatcher consults a cached copy before launching any
+netd-wired tier: if this node's exit is down, the job is requeued with `defer` so a healthy
+peer takes it, rather than being failed one at a time for a reason that has nothing to do with
+the sample. The gate is **opt-in** — armed when `/etc/blastbox/egress.env` exists (the marker
+that this module manages the node), and forceable with `BLASTBOX_EGRESS_HEALTH_GATE=1/0`. A
+broken probe never gates.
+
+**Four things fail open if you build this by hand.** All four were found by measurement on a
+live two-node setup, each presenting as "it works" or as a plain outage; all four are now
+pinned by `tests/host/test_egress.py` and by `test-egress-leak.sh --mode global`:
+
+- An `ip rule` that matches but finds an empty table **falls through to `main`** — so a dead
+  tunnel silently becomes direct WAN egress. A blackhole rule sits behind every lookup.
+- WireGuard `AllowedIPs` is cryptokey routing, not a route. Set to the overlay prefix alone it
+  discards every internet-bound packet *inside* the tunnel, with no error anywhere. It is
+  `0.0.0.0/0` with `Table = off`, so wg-quick installs no routes and only what we deliberately
+  source-route enters the tunnel.
+- Both hosts run `FORWARD` policy `DROP`. Chains that match on source cover only the outbound
+  leg; the **return leg needs its own conntrack chain**, pointed at the bridge rather than the
+  tunnel, or the path works and the client still times out.
+- **"Running" is not health.** A container that failed its startup gate looks healthy in
+  `docker ps` forever under a restart policy. Health is asserted from the gate's log line
+  *scoped to the current incarnation* — restart count is informational, because it is
+  monotonic and disqualifying on it ejects a recovered node permanently.
+
+Every rule lives in a dedicated `BB-WG-*` chain reached by one jump and is torn down by match,
+so a co-resident CAPE rooter is never touched — `check` counts foreign `FORWARD` rules to
+assert it.
 
 Run netd as a systemd unit (packaged in `deploy/systemd/`):
 

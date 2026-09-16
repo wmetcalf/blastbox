@@ -1,0 +1,43 @@
+# Cold-path (runsc/runc) worker image for the Magika content-type engine, and the base
+# for a warm gVisor rootfs.
+#
+# Magika predicts what a file IS from its bytes with a small neural model, which makes it
+# a real second opinion against magic-byte identification — the two disagree on exactly
+# the interesting files. See src/blastbox/engines/magika.py for why the score and the
+# pre-overwrite model prediction are both sealed.
+#
+# THE MODEL IS BAKED AT BUILD TIME AND WARMED AT SLOT START. `magika` ships its model in
+# the wheel, but the first `Magika()` also initialises onnxruntime. The build-time load
+# below PROVES the model loads in this image rather than discovering it at the first
+# sample; it cannot carry anything across the process boundary, so it does not make a
+# cold worker's first answer cheaper and this comment used to claim it did. What does is
+# MagikaEngine.warmup(), called before a slot signals READY — which on the gVisor rootfs
+# is also where the checkpoint is taken.
+#
+# NO NETWORK AT RUN TIME. Nothing is fetched per job — unlike a signature engine there is
+# no feed to refresh, so this image never needs egress.
+#
+# Build context = blastbox repo root:
+#   docker build -t magika-cold-worker:dev -f deploy/docker/Dockerfile.magika-cold-worker .
+FROM python:3.12-slim
+
+RUN useradd -u 10001 -m worker
+
+COPY pyproject.toml README.md /src/blastbox/
+COPY src /src/blastbox/src
+RUN pip install --no-cache-dir "/src/blastbox[magika]" \
+    && rm -rf /src \
+    && python -c "import blastbox.worker.cold, blastbox.engines.magika as m; \
+r = m.identify(b'#!/bin/sh\necho hi\n'); \
+print('magika worker ready:', r['model'], r['label'], r['score'])"
+
+# Operator-fixed engine, never job-derived.
+ENV BLASTBOX_ENGINE=blastbox.engines.magika:MagikaEngine \
+    BLASTBOX_DETONATE_NAME=magika
+
+USER 10001:10001
+ENTRYPOINT ["python", "-m", "blastbox.worker.cold"]
+
+LABEL org.opencontainers.image.title="magika-cold-worker" \
+      org.opencontainers.image.description="Magika content-type identification worker (neural file-type prediction; score + pre-overwrite model label sealed)" \
+      org.opencontainers.image.version="0.1.0"

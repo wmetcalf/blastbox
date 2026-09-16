@@ -1,0 +1,98 @@
+# Cold-path (runsc/runc) worker image for the ClamAV engine, and the base the warm
+# gVisor rootfs (deploy/gvisor/Dockerfile.clamav) is built on top of.
+#
+# THE DAEMON LIVES IN THE WORKER, NOT BESIDE IT. clamd listens on a unix socket inside
+# this container and nothing else can reach it. The alternative — a long-lived clamd
+# service that callers scan against over TCP — was built first and was wrong: it put the
+# scanner outside the execution substrate, so the sample reached it without a signed job
+# bundle and its answer came back without a sealed envelope, bypassing ADR-002. It also
+# meant every tenant's samples crossed one shared daemon's address space.
+#
+# UBUNTU 26.04, NOT THE UPSTREAM ALPINE IMAGE. musl's regex and locale behaviour is not
+# glibc's, and ClamAV's signature set includes PCRE and normalisation rules; an engine
+# whose libc differs from the one it is compared against produces coverage differences
+# that are really build differences. This tracks the CAPE box (ClamAV 1.5.3).
+#
+# Build context = blastbox repo root:
+#   docker build --build-arg SIGNATURE_DATE=$(date -u +%F) \
+#     -t clamav-cold-worker:dev -f deploy/docker/Dockerfile.clamav-cold-worker .
+#
+# WITHOUT `--build-arg SIGNATURE_DATE` A REBUILD DOES NOT REFRESH SIGNATURES — see the
+# ARG below. That is the difference between a scanner that is current and one that only
+# looks current.
+FROM ubuntu:26.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        clamav-daemon clamav-freshclam ca-certificates python3 python3-pip python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY deploy/clamav/clamd.conf /etc/clamav/clamd.conf
+COPY deploy/clamav/freshclam.conf /etc/clamav/freshclam.conf
+COPY deploy/clamav/entrypoint.sh /usr/local/bin/clamav-entrypoint
+
+# BAKE THE SIGNATURE DATABASE INTO THE IMAGE. A worker that downloads a gigabyte of
+# definitions on first job is not a worker, and on the warm tier it would do it once per
+# slot spawn. `freshclam` at build time makes the image self-contained and makes the
+# database version a property OF THE IMAGE — which is what the engine seals with each
+# verdict, so a stale image is visible in the evidence instead of being invisible.
+# CACHE-BUSTS THE SIGNATURE FETCH, and this is not optional bookkeeping. Docker reuses
+# this layer whenever nothing above it changed, so `docker build` on an unmodified tree
+# re-tags an image carrying WHATEVER SIGNATURES IT WAS FIRST BUILT WITH. Measured: a
+# rebuild three days later produced an image whose database was still the original day's.
+# An operator who rebuilds to refresh signatures gets a no-op that looks like a refresh —
+# and a scanner silently running an old database is the failure this engine exists to
+# make visible, manufactured by its own build instructions.
+#
+#   docker build --build-arg SIGNATURE_DATE=$(date -u +%F) ...
+#
+# The value is not read; changing it is the whole point. It is also stamped into the
+# image so `docker inspect` can answer "what did this build intend to fetch?" — and the
+# engine seals the ACTUAL `db_version` with every verdict, so the two can be compared.
+ARG SIGNATURE_DATE=unpinned
+#
+# NO TRAILING `|| true` ON THIS CHAIN. It used to end `... | head -3 || true`, and `||`
+# binds to the WHOLE preceding AND-list, not to the last command — so a freshclam that
+# fetched main.cvd and then failed on daily.cvd exited 0 and the layer was committed.
+# entrypoint.sh only tests for main.cvd, so that partial database passed the runtime
+# guard too, and the image served yearly-cadence signatures while reporting a perfectly
+# ordinary `ClamAV <ver>/<sigs>` db_version. A scanner silently running an incomplete
+# database is the exact failure this image is built to make visible. The tolerated part
+# — the informational sigtool line — is isolated in its own subshell.
+RUN install -d -o clamav -g clamav /var/lib/clamav /run/clamav \
+    && echo "signature fetch requested for: ${SIGNATURE_DATE}" \
+    && freshclam --config-file=/etc/clamav/freshclam.conf --stdout \
+    && chown -R clamav:clamav /var/lib/clamav \
+    # freshclam exits 0 having fetched only some of what it was asked for, so assert the
+    # set we actually depend on rather than trusting its status.
+    && for db in main daily bytecode; do \
+         { [ -f "/var/lib/clamav/$db.cvd" ] || [ -f "/var/lib/clamav/$db.cld" ]; } \
+           || { echo "FATAL: freshclam exited 0 but $db is missing from the image" >&2; exit 1; }; \
+       done \
+    && ( sigtool --info /var/lib/clamav/daily.cvd 2>/dev/null | head -3 || true )
+
+# Install THIS-tree blastbox plus the clamd client. `--break-system-packages` because
+# the image has no other Python consumer and a venv buys nothing here.
+COPY pyproject.toml README.md /src/blastbox/
+COPY src /src/blastbox/src
+RUN pip install --no-cache-dir --break-system-packages "/src/blastbox[clamav]" \
+    && rm -rf /src \
+    && python3 -c "import blastbox.worker.cold, blastbox.engines.clamav; print('clamav worker ready')"
+
+# The engine is operator-fixed per image, never job-derived. BLASTBOX_CLAMD_SOCKET is
+# left UNSET on purpose: unset means the in-guest default, and setting it would invite a
+# deployment to point the worker at a daemon somewhere else — which is the shape this
+# image exists to eliminate.
+ENV BLASTBOX_ENGINE=blastbox.engines.clamav:ClamAVEngine \
+    BLASTBOX_DETONATE_NAME=clamav
+
+# The daemon needs to be root to drop to `clamav` itself (User in clamd.conf), and the
+# scan never executes the sample — it parses it, which is why slot reuse is defensible
+# at all (see the engine's module docstring). The sandbox boundary is the OUTER runtime
+# (runsc), not a uid inside it.
+ENTRYPOINT ["/usr/local/bin/clamav-entrypoint", "python3", "-m", "blastbox.worker.cold"]
+
+LABEL org.opencontainers.image.title="clamav-cold-worker" \
+      org.opencontainers.image.description="ClamAV signature scanning worker (in-guest clamd on a unix socket; Ubuntu 26.04)" \
+      org.opencontainers.image.version="0.1.0"

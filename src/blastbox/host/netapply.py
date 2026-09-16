@@ -21,9 +21,11 @@ So ``--network=none`` is emitted only for ``none`` / ``drop`` (and an unrecogniz
 ``inspect`` on a non-routable one); the sidecar drivers fail closed via "internal bridge, no
 route", not by literally being downgraded to ``none``.
 
-Operators are responsible for pre-creating the ``bb-*`` docker networks on the host before
-launching the dispatcher.  This module only names them in the argv; it never creates or
-inspects them.
+This module only names the networks in the argv; it never creates or inspects them.
+``blastbox egress apply`` (:mod:`blastbox.host.egress`) creates ``bb-net0`` /
+``bb-fakenet`` / ``bb-socks`` / ``bb-vpn`` and MAY RENUMBER them when their default
+subnets collide with something already on the host — so do not hardcode their ranges
+anywhere. ``bb-inspect`` is the exception: it is still operator-created.
 """
 from __future__ import annotations
 
