@@ -21,7 +21,7 @@ than 1.0. Anything that ranks or thresholds on confidence sees the truth.
 floor it replaces its prediction with a generic label: random bytes come back `unknown`,
 while the model underneath guessed `psd` at 0.344. The envelope carries the delivered
 `label`, the raw `model_label`, and the `overwrite_reason` that separates them, plus a
-`low_confidence_overwrite` warning. Sealing only one of the two would either hide that a
+`prediction_overwritten` warning (NOT `low_confidence_overwrite`, which this file carried for a while: the commonest overwrite is `overwrite_map` on random bytes, which happens while the model is confident at ~0.999, so naming it a confidence problem described the opposite of what occurred). Sealing only one of the two would either hide that a
 guess existed or report a guess the tool declined to stand behind.
 
 A model that fails to load seals `engine_error` and emits **no `label` key at all** —

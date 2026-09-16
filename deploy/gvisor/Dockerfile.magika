@@ -9,8 +9,12 @@
 #
 # NO READINESS ENTRYPOINT, unlike the ClamAV rootfs. That one must block until its daemon
 # answers, because checkpointing a half-loaded clamd freezes a scanner that reports every
-# sample clean. Magika has no daemon and no separate readiness state: the model is loaded
-# in-process on first use, and the cold image already proved at BUILD time that it loads.
+# sample clean. Magika has no daemon and no separate readiness state — the model is loaded
+# IN-PROCESS by MagikaEngine.warmup(), which serve_warm() calls before signalling READY,
+# and READY is where the checkpoint is taken. That method did not exist when this line was
+# first written, and the container's first line ("CHECKPOINTED with the model loaded") was
+# false: `_MAGIKA` was still None in the checkpoint, so every restore paid the full model
+# load on its one job — the warm tier delivering cold latency. It now holds.
 # A restore that somehow lacked it would raise MagikaUnavailable and seal `engine_error`
 # — loud, not silently wrong.
 #

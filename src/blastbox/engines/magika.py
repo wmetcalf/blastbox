@@ -32,6 +32,7 @@ is a materially smaller surface than ClamAV's, let alone a browser's.
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
@@ -49,6 +50,34 @@ from blastbox.worker.engine import DetonationResult
 #: ordinary inputs and stops a multi-gigabyte sample from being read into memory to
 #: answer a question that never needed the middle of it.
 DEFAULT_MAX_BYTES = 64 * 1024 * 1024
+
+_log = logging.getLogger("blastbox.engines.magika")
+
+
+def _max_bytes() -> int:
+    """How much of the sample to read, from the environment, VALIDATED.
+
+    `int(os.environ[...])` raised ValueError out of `detonate` on any non-numeric value
+    — a typo in a deployment env file failed every job on that node with a traceback
+    rather than a reason. A zero or negative value was worse: it reads nothing and
+    Magika then identifies the empty string, producing a confident answer about a file
+    nobody looked at. Both fall back to the default, loudly.
+    """
+    raw = os.environ.get("BLASTBOX_MAGIKA_MAX_BYTES")
+    if raw is None:
+        return DEFAULT_MAX_BYTES
+    try:
+        value = int(raw)
+    except ValueError:
+        _log.warning("BLASTBOX_MAGIKA_MAX_BYTES=%r is not a number; using %d",
+                     raw, DEFAULT_MAX_BYTES)
+        return DEFAULT_MAX_BYTES
+    if value <= 0:
+        _log.warning("BLASTBOX_MAGIKA_MAX_BYTES=%d would read nothing at all, which "
+                     "identifies the empty string rather than the sample; using %d",
+                     value, DEFAULT_MAX_BYTES)
+        return DEFAULT_MAX_BYTES
+    return value
 
 
 @register_node_type
@@ -188,8 +217,29 @@ class MagikaEngine:
         if name is not None or "BLASTBOX_DETONATE_NAME" in os.environ:
             self.name = name or os.environ["BLASTBOX_DETONATE_NAME"]
 
+    def warmup(self) -> None:
+        """Load the model BEFORE the slot signals READY.
+
+        `serve_warm` calls this and only then signals READY, and the gVisor checkpoint is
+        taken AT READY — so whatever is resident here is what every restore inherits.
+        Without it `_MAGIKA` was still None in the checkpoint, and the warm tier's one
+        job per restore paid the full `Magika()` + onnxruntime init that the whole warm
+        rationale is built on avoiding. Both Dockerfiles claimed the model was
+        "CHECKPOINTED with the model loaded"; nothing implemented it, and
+        Dockerfile.magika contradicted its own first line four lines later.
+
+        Deliberately not fatal on its own: a failure here would reap the slot before it
+        could seal an engine error with a reason in it. `_magika()` raises
+        MagikaUnavailable on the first detonation instead, which is the path the outage
+        tests cover. Warming is an optimisation; refusing to answer is the contract.
+        """
+        try:
+            _magika()
+        except MagikaUnavailable:
+            _log.warning("magika.warmup: model not loadable; the first job will say why")
+
     def detonate(self, input: Path, outdir: Path, limits: Limits) -> DetonationResult:
-        max_bytes = int(os.environ.get("BLASTBOX_MAGIKA_MAX_BYTES", DEFAULT_MAX_BYTES))
+        max_bytes = _max_bytes()
         size = input.stat().st_size
         with input.open("rb") as fh:
             data = fh.read(max_bytes)

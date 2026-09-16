@@ -181,3 +181,61 @@ def test_a_renamed_field_is_a_parse_error_not_a_silent_none():
     drifted = {**ok, "dl_label": ok.pop("model_label")}   # the rename
     with pytest.raises(pydantic.ValidationError):
         ContentTypeIdentification(**drifted)
+
+
+def test_the_engine_warms_the_model_before_ready_because_that_is_what_gets_checkpointed():
+    """`serve_warm` calls `warmup()` and only then signals READY; the gVisor checkpoint
+    is taken AT READY, so whatever is resident then is what every restore inherits.
+    Neither engine defined `warmup`, so `_MAGIKA` was None in the checkpoint and each
+    restore paid the full model load on its single job — the warm tier delivering cold
+    latency, while two Dockerfiles asserted the model was checkpointed loaded."""
+    from blastbox.engines import magika as mod
+    from blastbox.engines.magika import MagikaEngine
+
+    assert hasattr(MagikaEngine, "warmup")
+    loaded = []
+    saved = mod._MAGIKA
+    mod._MAGIKA = None
+    try:
+        mod._MAGIKA = None
+        orig = mod._magika
+        mod._magika = lambda: loaded.append(1)  # type: ignore[assignment]
+        MagikaEngine().warmup()
+        assert loaded, "warmup() must actually touch the model, not just exist"
+    finally:
+        mod._magika = orig  # type: ignore[assignment]
+        mod._MAGIKA = saved
+
+
+def test_a_model_that_cannot_load_does_not_kill_the_slot_at_warmup():
+    """A reaped slot cannot seal an engine error with a reason in it. The outage must
+    surface through detonate(), which produces a typed, sealed, reviewable result."""
+    from blastbox.engines import magika as mod
+    from blastbox.engines.magika import MagikaEngine, MagikaUnavailable
+
+    orig = mod._magika
+    saved = mod._MAGIKA
+    try:
+        def boom():
+            raise MagikaUnavailable("no model here")
+        mod._magika = boom  # type: ignore[assignment]
+        MagikaEngine().warmup()  # must not raise
+    finally:
+        mod._magika = orig  # type: ignore[assignment]
+        mod._MAGIKA = saved
+
+
+@pytest.mark.parametrize("raw,expect_default", [
+    ("abc", True),        # a typo in a deployment env file failed every job with a traceback
+    ("", True),
+    ("0", True),          # reads nothing, so Magika identifies the EMPTY STRING confidently
+    ("-1", True),
+    ("4096", False),
+])
+def test_the_read_limit_env_var_is_validated(monkeypatch, raw, expect_default):
+    from blastbox.engines.magika import DEFAULT_MAX_BYTES, _max_bytes
+
+    monkeypatch.setenv("BLASTBOX_MAGIKA_MAX_BYTES", raw)
+    got = _max_bytes()
+    assert (got == DEFAULT_MAX_BYTES) is expect_default
+    assert got > 0, "a non-positive limit identifies the empty string, not the sample"

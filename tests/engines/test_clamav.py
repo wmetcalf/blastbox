@@ -494,3 +494,241 @@ def test_the_conf_enables_the_encrypted_alert_the_driver_depends_on():
 
     conf = (Path(__file__).resolve().parents[2] / "deploy/clamav/clamd.conf").read_text()
     assert "ArchiveBlockEncrypted true" in conf
+
+
+# --------------------------------------------------------------------------------------
+# The limits the conf declares and the limits the driver enforces must be one thing.
+# --------------------------------------------------------------------------------------
+
+def _conf_text() -> str:
+    from pathlib import Path as _P
+
+    return (_P(__file__).resolve().parents[2] / "deploy/clamav/clamd.conf").read_text()
+
+
+def test_the_driver_reads_the_conf_limits_rather_than_a_hardcoded_copy(tmp_path, monkeypatch):
+    """The conf has claimed "The driver reads them back and says so" since it was
+    written. For two commits it did not: a module constant, evaluated once at import,
+    with a comment asking operators to keep the two in sync by hand."""
+    from blastbox.engines import clamav
+
+    conf = tmp_path / "clamd.conf"
+    conf.write_text("MaxFileSize 7M\nStreamMaxLength 9M\nPCREMaxFileSize 1M\n")
+    monkeypatch.setenv(clamav.CLAMD_CONF_ENV, str(conf))
+    monkeypatch.delenv("BLASTBOX_CLAMD_MAX_FILE_BYTES", raising=False)
+    # The SMALLER of the two: whichever bounds the transport actually used is the point
+    # past which a verdict cannot be trusted, and PCREMaxFileSize must not be mistaken
+    # for MaxFileSize (that exact substring confusion corrupted this conf once already).
+    assert clamav.max_scannable_bytes() == 7 * 1024 * 1024
+
+
+def test_the_env_override_can_lower_the_limit_but_never_raise_it(tmp_path, monkeypatch):
+    """"Set BLASTBOX_CLAMD_MAX_FILE_BYTES to match blastbox's input limit" is the
+    natural operator move and it is the dangerous one: files between the conf's limit
+    and the raised one are declined by clamd, come back with no hits, and seal as clean
+    at confidence 1.0. An env var on the worker cannot make a daemon read more."""
+    from blastbox.engines import clamav
+
+    conf = tmp_path / "clamd.conf"
+    conf.write_text("MaxFileSize 25M\nStreamMaxLength 25M\n")
+    monkeypatch.setenv(clamav.CLAMD_CONF_ENV, str(conf))
+
+    monkeypatch.setenv("BLASTBOX_CLAMD_MAX_FILE_BYTES", str(100 * 1024 * 1024))
+    assert clamav.max_scannable_bytes() == 25 * 1024 * 1024, "the raise must be ignored"
+
+    monkeypatch.setenv("BLASTBOX_CLAMD_MAX_FILE_BYTES", str(5 * 1024 * 1024))
+    assert clamav.max_scannable_bytes() == 5 * 1024 * 1024, "lowering is always allowed"
+
+
+def test_an_unreadable_conf_falls_back_rather_than_scanning_without_a_limit(monkeypatch):
+    """A remote TCP daemon's config is not ours to read. Losing the limit entirely would
+    turn every oversized file back into a silent clean."""
+    from blastbox.engines import clamav
+
+    monkeypatch.setenv(clamav.CLAMD_CONF_ENV, "/nonexistent/clamd.conf")
+    monkeypatch.delenv("BLASTBOX_CLAMD_MAX_FILE_BYTES", raising=False)
+    assert clamav.max_scannable_bytes() == clamav.MAX_SCANNABLE_BYTES > 0
+
+
+def test_stream_max_length_is_cross_checked_too_not_only_max_file_size():
+    """Only MaxFileSize was ever compared against the driver; StreamMaxLength bounds the
+    INSTREAM fallback, which is the transport every remote-daemon deployment uses."""
+    import re
+
+    from blastbox.engines.clamav import _conf_size
+
+    conf = _conf_text()
+    for directive in ("MaxFileSize", "StreamMaxLength"):
+        assert re.search(rf"^{directive}\s+\d+[KMG]?$", conf, re.M), f"{directive} missing"
+        assert _conf_size(conf, directive), f"{directive} unparseable by the driver"
+    assert _conf_size(conf, "MaxFileSize") == _conf_size(conf, "StreamMaxLength"), (
+        "the path scan and the stream fallback must decline the same files, or the "
+        "ClamdCannotSeePath downgrade silently changes what 'clean' means"
+    )
+
+
+def test_pcre_max_file_size_is_not_mistaken_for_max_file_size():
+    """Anchored name matching. A substring match here is exactly how this file was
+    corrupted into something clamd refuses to parse."""
+    from blastbox.engines.clamav import _conf_size
+
+    conf = "PCREMaxFileSize 1M\nMaxFileSize 25M\n"
+    assert _conf_size(conf, "MaxFileSize") == 25 * 1024 * 1024
+    assert _conf_size(conf, "PCREMaxFileSize") == 1024 * 1024
+
+
+def test_a_commented_out_directive_is_not_read_as_set():
+    from blastbox.engines.clamav import _conf_size
+
+    assert _conf_size("# MaxFileSize 400M\nMaxFileSize 25M\n", "MaxFileSize") == 25 * 1024 * 1024
+
+
+def test_the_sealed_signature_cap_matches_the_model_and_is_announced():
+    """`signatures` was documented as "EVERY signature reported" and silently truncated
+    to 64 with no warning, in a module whose thesis is that a result must never quietly
+    say less than it knows. A count/list mismatch is inferable; inferable is not said."""
+    from blastbox.engines.clamav import MAX_SEALED_SIGNATURES, SignatureScan
+
+    field = SignatureScan.model_fields["signatures"]
+    limits = [m for m in field.metadata if hasattr(m, "max_length")]
+    assert limits and limits[0].max_length == MAX_SEALED_SIGNATURES, (
+        "a model stricter than the slice turns a heavily-flagged sample into a sealing "
+        "failure instead of a truncated result"
+    )
+
+
+def test_a_truncated_signature_list_carries_a_warning(tmp_path):
+    from blastbox.engines.clamav import MAX_SEALED_SIGNATURES
+
+    hits = [f"Win.Trojan.Fam{i}-1" for i in range(MAX_SEALED_SIGNATURES + 16)]
+    res = _detonate(_stub_engine(path_scan_fn=lambda p, timeout=None: hits,
+                                 scan_fn=lambda d, timeout=None: hits), tmp_path, 16)
+    assert res.payload.fields["signature_count"] == len(hits)
+    assert len(res.payload.fields["signatures"]) == MAX_SEALED_SIGNATURES
+    w = [x for x in res.warnings if x.code == "signatures_truncated"]
+    assert w, "the dropped names may be the distinguishing ones; say so"
+    assert str(len(hits)) in w[0].message
+
+
+def test_an_unreachable_daemon_does_not_escape_detonate_as_a_raw_oserror(tmp_path, monkeypatch):
+    """socket.connect() sat above the try, so a dead or not-yet-bound clamd raised
+    FileNotFoundError straight out of detonate(). The harness's blanket except kept it
+    from becoming a false CLEAN, but it bypassed the typed payload, db_version, the
+    clamd_unavailable warning, and — for bind-mounted-socket deployments — the
+    ClamdCannotSeePath downgrade to INSTREAM, so those nodes failed every job."""
+    from blastbox.engines import clamav
+
+    monkeypatch.setenv("BLASTBOX_CLAMD_SOCKET", str(tmp_path / "nope.ctl"))
+    monkeypatch.delenv("BLASTBOX_CLAMD_HOST", raising=False)
+    with pytest.raises(clamav.ClamdUnavailable):
+        clamav._raw_command("PING", 2.0)
+
+
+# --------------------------------------------------------------------------------------
+# The DEFAULT scan path, offline. Every test exercising `scan_path` was gated behind
+# @live/@shared_fs, so in CI (40 skipped) nothing covered it — and the offline helper
+# forces BLASTBOX_CLAMD_FORCE_STREAM, so `first_hit_only` was only ever asserted True,
+# which is the value the env var produces. Mutation-tested against the real suite: three
+# separate reverts of this parser left every offline test green.
+# --------------------------------------------------------------------------------------
+
+def _reply(monkeypatch, lines):
+    from blastbox.engines import clamav
+
+    monkeypatch.setattr(clamav, "_raw_command", lambda c, t: list(lines))
+
+
+def test_all_match_returns_every_signature_not_only_the_first(monkeypatch):
+    """The whole reason ALLMATCHSCAN exists here: 344 signatures across 40 LNK samples
+    where SCAN returned 36."""
+    from blastbox.engines.clamav import scan_path
+
+    _reply(monkeypatch, ["/s: Win.A-1 FOUND", "/s: Win.B-2 FOUND", "/s: Win.C-3 FOUND", "/s: OK"])
+    assert scan_path(Path("/s")) == ["Win.A-1", "Win.B-2", "Win.C-3"]
+
+
+def test_the_first_hit_stays_first(monkeypatch):
+    """Order is the one thing a consumer can rely on to reconstruct what a first-hit
+    scan would have said."""
+    from blastbox.engines.clamav import scan_path
+
+    _reply(monkeypatch, ["/s: Zzz-1 FOUND", "/s: Aaa-2 FOUND"])
+    assert scan_path(Path("/s"))[0] == "Zzz-1"
+
+
+def test_duplicate_signature_names_are_collapsed(monkeypatch):
+    """An archive whose members all match the same family reports it once per member."""
+    from blastbox.engines.clamav import scan_path
+
+    _reply(monkeypatch, ["/a.zip: Win.X-1 FOUND", "/a.zip: Win.X-1 FOUND",
+                         "/a.zip: Win.Y-2 FOUND", "/a.zip: Win.X-1 FOUND"])
+    assert scan_path(Path("/a.zip")) == ["Win.X-1", "Win.Y-2"]
+
+
+def test_an_error_line_in_the_reply_is_an_outage_not_a_finding(monkeypatch):
+    """Deleting this branch makes a daemon that broke mid-file report a clean scan, and
+    every offline test still passed."""
+    from blastbox.engines import clamav
+
+    _reply(monkeypatch, ["/s: Can't allocate memory ERROR"])
+    with pytest.raises(clamav.ClamdUnavailable, match="clamd reported an error"):
+        clamav.scan_path(Path("/s"))
+
+
+@pytest.mark.parametrize("line", [
+    "/s: File path check failure: No such file or directory. ERROR",
+    "/s: lstat() failed: No such file or directory. ERROR",
+    "/s: Can't access file /s ERROR",
+])
+def test_a_path_the_daemon_cannot_see_is_classified_for_the_stream_downgrade(monkeypatch, line):
+    """Misclassifying this as a generic outage fails every job on a bind-mounted-socket
+    deployment instead of degrading it to INSTREAM. Nothing pinned these strings."""
+    from blastbox.engines import clamav
+
+    _reply(monkeypatch, [line])
+    with pytest.raises(clamav.ClamdCannotSeePath):
+        clamav.scan_path(Path("/s"))
+
+
+def test_first_hit_only_is_false_on_the_all_match_path(tmp_path, monkeypatch):
+    """The offline helper forces the stream fallback, so `first_hit_only` was only ever
+    asserted True — the value that env var produces, which proves nothing. Replacing
+    `first_hit_only=not all_match` with a literal True passed the whole offline suite.
+
+    It matters because `first_hit_only` is how a consumer knows whether
+    `signature_count` is the whole story.
+    """
+    monkeypatch.delenv("BLASTBOX_CLAMD_FORCE_STREAM", raising=False)
+    monkeypatch.setattr("blastbox.engines.clamav._shares_filesystem", lambda: True)
+    res = _detonate(_stub_engine(path_scan_fn=lambda p, timeout=None: ["Win.A-1", "Win.B-2"]),
+                    tmp_path, 16)
+    assert res.payload.fields["first_hit_only"] is False
+    assert res.payload.fields["signatures"] == ["Win.A-1", "Win.B-2"]
+
+
+def test_first_hit_only_is_true_when_the_stream_fallback_was_used(tmp_path, monkeypatch):
+    """The other half, so the field is pinned in both directions rather than to one
+    constant."""
+    monkeypatch.setenv("BLASTBOX_CLAMD_FORCE_STREAM", "1")
+    res = _detonate(_stub_engine(scan_fn=lambda d, timeout=None: ["Win.A-1"]), tmp_path, 16)
+    assert res.payload.fields["first_hit_only"] is True
+
+
+def test_the_clamav_engine_warms_by_proving_the_daemon_answers(monkeypatch):
+    """serve_warm signals READY only after warmup(), and the gVisor checkpoint is taken
+    there. A slot that reached READY without ever speaking to clamd restores into the
+    same ignorance on every job."""
+    from blastbox.engines import clamav
+
+    calls = []
+    monkeypatch.setattr(clamav, "ping", lambda t=1.0: calls.append(t) or True)
+    clamav.ClamAVEngine().warmup()
+    assert calls, "warmup() must actually probe the daemon"
+
+
+def test_a_dead_daemon_does_not_kill_the_slot_at_warmup(monkeypatch):
+    """A reaped slot cannot seal a signature_scan_unavailable payload saying why."""
+    from blastbox.engines import clamav
+
+    monkeypatch.setattr(clamav, "ping", lambda t=1.0: False)
+    clamav.ClamAVEngine().warmup()  # must not raise

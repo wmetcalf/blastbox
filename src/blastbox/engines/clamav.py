@@ -45,6 +45,7 @@ result.
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
@@ -90,9 +91,13 @@ class SignatureScan(_Node):
     type: Literal["signature_scan"] = Field(default="signature_scan", alias="_type")
 
     infected: bool
-    #: EVERY signature reported, as a list — it was a comma-joined string, which asks
+    #: The signatures reported, as a list — it was a comma-joined string, which asks
     #: each consumer to re-split it and get the escaping right on a name containing a
-    #: comma.
+    #: comma. Capped at :data:`MAX_SEALED_SIGNATURES`; when the cap bites, the envelope
+    #: carries a `signatures_truncated` warning and `signature_count` still holds the
+    #: real total. This used to say "EVERY signature reported" while `detonate` sealed
+    #: `hits[:64]` with no warning at all, in a module whose whole thesis is that a
+    #: result must never quietly say less than it knows.
     signatures: list[str] = Field(default_factory=list, max_length=64)
     signature_count: int = Field(ge=0)
 
@@ -250,14 +255,23 @@ def _raw_command(command: str, timeout: float) -> list[str]:
     """
     import socket
 
-    if host := os.environ.get(_HOST_ENV):
-        sock = socket.create_connection(
-            (host, int(os.environ.get(_PORT_ENV, "3310"))), timeout=timeout)
-    else:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        sock.connect(os.environ.get(_SOCKET_ENV, DEFAULT_SOCKET))
+    # CONNECTING IS PART OF THE COMMAND. These three lines sat ABOVE the try, so a
+    # daemon that was dead or had not yet bound its socket raised FileNotFoundError /
+    # ConnectionRefusedError straight out of `detonate`, which catches only
+    # ClamdUnavailable. The harness's blanket `except Exception` kept it from becoming a
+    # false CLEAN, but every promise the outage path makes was bypassed: no typed
+    # SignatureScanUnavailable payload, no db_version, no `clamd_unavailable` warning,
+    # and — worst for the bind-mounted-socket deployment — no ClamdCannotSeePath
+    # downgrade to INSTREAM, so those nodes failed every job instead of degrading.
+    sock: socket.socket | None = None
     try:
+        if host := os.environ.get(_HOST_ENV):
+            sock = socket.create_connection(
+                (host, int(os.environ.get(_PORT_ENV, "3310"))), timeout=timeout)
+        else:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect(os.environ.get(_SOCKET_ENV, DEFAULT_SOCKET))
         sock.sendall(b"n" + command.encode() + b"\n")
         buf = b""
         while True:
@@ -268,7 +282,8 @@ def _raw_command(command: str, timeout: float) -> list[str]:
     except OSError as exc:
         raise ClamdUnavailable(f"clamd did not answer {command.split()[0]}: {exc}") from exc
     finally:
-        sock.close()
+        if sock is not None:
+            sock.close()
     return buf.decode("utf-8", "replace").splitlines()
 
 
@@ -320,17 +335,88 @@ _LIMIT_HEURISTIC = "Heuristics.Limits.Exceeded"
 #: nothing (its contents were never examined). Same shape as the limit heuristic.
 _ENCRYPTED_HEURISTIC = "Heuristics.Encrypted"
 
-#: The shipped clamd.conf sets `MaxFileSize 25M` / `StreamMaxLength 25M`, and blastbox's
-#: default input limit is 100 MiB. A file in between is NOT SCANNED — clamd declines it
-#: — and without this check the empty hit list was sealed as a clean verdict. The conf's
-#: own comment says "a scanner that reports clean on a file it declined to read is the
-#: false negative this whole engine rewrite was about. The driver reads them back and
-#: says so." It did not. Now it does.
-#:
-#: Override when you change clamd.conf; they must agree, and disagreeing in the
-#: permissive direction re-opens exactly this hole.
+#: How many signature NAMES the sealed envelope carries. `signature_count` is always
+#: the real total; past this the names are dropped and a `signatures_truncated` warning
+#: is added. Must match `SignatureScan.signatures`' max_length, which is asserted by a
+#: test — a model that silently rejected an over-long list would turn a heavily-flagged
+#: sample into a sealing failure instead of a truncated result.
+_log_clamav = logging.getLogger("blastbox.engines.clamav")
+
+MAX_SEALED_SIGNATURES = 64
+
+#: Fallback when clamd.conf cannot be read (host-side tests, a remote TCP daemon whose
+#: config we do not have). The shipped conf's own value is preferred — see
+#: :func:`max_scannable_bytes`.
 MAX_SCANNABLE_BYTES = int(os.environ.get("BLASTBOX_CLAMD_MAX_FILE_BYTES",
                                          str(25 * 1024 * 1024)))
+
+#: Where the running daemon's config lives. entrypoint.sh relocates it under a writable
+#: directory when the rootfs is read-only and exports the socket path; the conf path
+#: follows the same shape.
+CLAMD_CONF_ENV = "BLASTBOX_CLAMD_CONF"
+DEFAULT_CLAMD_CONF = "/etc/clamav/clamd.conf"
+
+_SIZE_SUFFIXES = {"": 1, "K": 1024, "M": 1024 * 1024, "G": 1024 * 1024 * 1024}
+
+
+def _conf_size(conf: str, directive: str) -> int | None:
+    """One ClamAV size directive in bytes, or None if absent/unparseable.
+
+    ClamAV writes sizes as a bare number or with a K/M/G suffix, and matches directive
+    names case-insensitively. The name is anchored: `MaxFileSize` must not also match
+    `PCREMaxFileSize` — that exact substring confusion is how a previous commit here
+    corrupted the shipped config into something clamd refuses to parse.
+    """
+    for line in conf.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, _, value = line.partition(" ")
+        if name.lower() != directive.lower():
+            continue
+        value = value.strip()
+        mult = _SIZE_SUFFIXES.get(value[-1:].upper(), None) if value[-1:].isalpha() else 1
+        digits = value[:-1] if (value[-1:].isalpha()) else value
+        if mult is None or not digits.isdigit():
+            return None
+        return int(digits) * mult
+    return None
+
+
+def max_scannable_bytes() -> int:
+    """The largest file this daemon will actually READ, from its own config.
+
+    A file over clamd's `MaxFileSize` is NOT SCANNED — the daemon declines it — and an
+    empty hit list from a declined file was sealed as a clean verdict. The shipped
+    clamd.conf has always said "The driver reads them back and says so", and for two
+    commits it did not: the driver used a module constant with a hand-maintained comment
+    asking operators to keep the two in sync, evaluated once at import. So a limit
+    raised in the conf silently went unenforced here, a limit raised HERE silently
+    promised scanning that clamd would decline, and entrypoint.sh's own rewrite of the
+    conf could not be noticed at all. Now it reads them back.
+
+    `StreamMaxLength` bounds the INSTREAM fallback and `MaxFileSize` the path scan;
+    whichever is smaller is the number past which a verdict cannot be trusted, so that
+    is the one used. `BLASTBOX_CLAMD_MAX_FILE_BYTES` may only LOWER the result: the
+    conf's own comment calls the permissive direction "exactly this hole", and an
+    operator raising an env var on the worker cannot make a daemon read more.
+    """
+    conf_path = os.environ.get(CLAMD_CONF_ENV, DEFAULT_CLAMD_CONF)
+    declared: int | None = None
+    try:
+        with open(conf_path, encoding="utf-8", errors="replace") as fh:
+            conf = fh.read()
+    except OSError:
+        conf = ""
+    if conf:
+        sizes = [v for v in (_conf_size(conf, "MaxFileSize"),
+                             _conf_size(conf, "StreamMaxLength")) if v]
+        declared = min(sizes) if sizes else None
+    env = os.environ.get("BLASTBOX_CLAMD_MAX_FILE_BYTES")
+    if env and env.isdigit():
+        asked = int(env)
+        return min(asked, declared) if declared else asked
+    return declared if declared else MAX_SCANNABLE_BYTES
 
 
 def _detected(hits: list[str]) -> Detection:
@@ -386,10 +472,29 @@ class ClamAVEngine:
         if name is not None or "BLASTBOX_DETONATE_NAME" in os.environ:
             self.name = name or os.environ["BLASTBOX_DETONATE_NAME"]
 
+    def warmup(self) -> None:
+        """Make the slot's READY mean "the daemon answers", which is what gets frozen.
+
+        Unlike Magika there is no in-process model to load — clamd is a separate process
+        and its ~1 GB parse is paid by the container's entrypoint. What this adds is the
+        same assertion at the boundary the CHECKPOINT is taken at: `serve_warm` signals
+        READY only after warmup, and a gVisor restore inherits whatever state existed
+        then. A slot that reached READY without ever having spoken to clamd restores into
+        the same ignorance, and the first job discovers it.
+
+        Not fatal: a reaped slot cannot seal an engine error saying why, and the outage
+        path in `detonate` is the one that produces a typed, sealed, reviewable result.
+        """
+        if not ping(2.0):
+            _log_clamav.warning(
+                "clamav.warmup: clamd did not answer PING; the slot is READY but the "
+                "first job will seal a signature_scan_unavailable rather than a verdict")
+
     def detonate(self, input: Path, outdir: Path, limits: Limits) -> DetonationResult:
         data_len = input.stat().st_size
         version = db_version(2.0)
-        if data_len > MAX_SCANNABLE_BYTES:
+        limit = max_scannable_bytes()
+        if data_len > limit:
             # NOT a clean result. clamd declines a file over MaxFileSize and returns no
             # hits; sealing that as `infected: false` is a false negative manufactured by
             # configuration. Same payload type as a daemon outage, for the same reason:
@@ -397,7 +502,7 @@ class ClamAVEngine:
             return DetonationResult(
                 payload=_sealed(SignatureScanUnavailable(
                     error=(f"sample is {data_len} bytes, above the scanner's "
-                           f"{MAX_SCANNABLE_BYTES}-byte limit (clamd MaxFileSize / "
+                           f"{limit}-byte limit (clamd MaxFileSize / "
                            "StreamMaxLength) — it was NOT scanned. Raise both the clamd "
                            "limits and BLASTBOX_CLAMD_MAX_FILE_BYTES together, or reject "
                            "the sample upstream."),
@@ -406,7 +511,7 @@ class ClamAVEngine:
                 detected=_undetermined(),
                 warnings=[Warning(
                     code="sample_exceeds_scanner_limit",
-                    message=f"{data_len} bytes > {MAX_SCANNABLE_BYTES}; no signatures "
+                    message=f"{data_len} bytes > {limit}; no signatures "
                             "were applied to this sample")],
                 status="engine_error",
             )
@@ -502,6 +607,16 @@ class ClamAVEngine:
                         f"INSTREAM and stopped at the first signature — set "
                         f"BLASTBOX_CLAMD_FORCE_STREAM to make that the intended mode and "
                         f"silence this: {degraded}"))
+        if len(hits) > MAX_SEALED_SIGNATURES:
+            # The list is bounded by the model and the count is not, so a careful reader
+            # could infer the truncation — but nothing in the envelope SAID it, and on a
+            # heavily-flagged toolkit sample the dropped tail may hold the distinguishing
+            # families. Inferable is not the same as stated.
+            warnings.append(Warning(
+                code="signatures_truncated",
+                message=f"{len(hits)} signatures matched; the envelope carries the first "
+                        f"{MAX_SEALED_SIGNATURES}. signature_count is the real total, and "
+                        f"the dropped names are not recoverable from this result."))
         if version is None:
             # The scan happened, so the result stands — but a verdict whose signature age
             # is unknown is worth less than one that states it, and silently omitting the
@@ -513,7 +628,7 @@ class ClamAVEngine:
         return DetonationResult(
             payload=_sealed(SignatureScan(
                 infected=bool(hits),
-                signatures=hits[:64],
+                signatures=hits[:MAX_SEALED_SIGNATURES],
                 signature_count=len(hits),
                 db_version=version or "unknown",
                 # TRUE ONLY ON THE STREAM FALLBACK NOW, and that is the point of
