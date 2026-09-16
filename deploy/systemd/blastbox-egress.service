@@ -31,8 +31,13 @@ Type=oneshot
 RemainAfterExit=yes
 EnvironmentFile=/etc/blastbox/egress.env
 ExecStart=/usr/local/bin/blastbox egress apply
-# Re-applying is cheap and idempotent, and a node that comes up before its exit host is
-# reachable should keep trying rather than sit degraded until someone logs in.
+# Restart=on-failure only covers a raised exception (a missing image, an unresolvable
+# subnet conflict). It deliberately does NOT cover a DEGRADED apply: `egress apply` exits
+# 0 when the tier is installed but unhealthy, because a local-mode node legitimately has
+# no forwarder to be healthy about. With Type=oneshot + RemainAfterExit the unit is then
+# `active (exited)` and can never fire again — so the recurring reconvergence this tier
+# needs lives in blastbox-egress.timer, not here. Do not "fix" that by making apply exit
+# non-zero on DEGRADED; that ejects every correct local-mode node instead.
 Restart=on-failure
 RestartSec=30
 

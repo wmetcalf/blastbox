@@ -32,13 +32,25 @@ Two behaviours are therefore deliberate and should not be "fixed":
 - **It refuses to start if it cannot reach the overlay peer.** Failing to start is correct: it leaves the gateway address empty, the worker's
   default route points at a dead IP, and the tier is closed. A forwarder that came up
   without the node rules would quietly NAT malware onto the node's WAN.
-- **It exits when the overlay later dies**, rather than lingering. The node's DROP rule
+- **It exits when the overlay stays dead**, rather than lingering. The node's DROP rule
   already prevents a WAN escape; a forwarder still advertising an address it can no longer
-  serve just turns a hard failure into a slow one.
+  serve just turns a hard failure into a slow one. It takes three consecutive failed
+  probes (three packets each, 15s apart) to call the overlay dead — a single dropped ICMP
+  packet used to be enough, and with `on-failure:3` that made three unrelated blips over
+  a week into a permanent node outage.
 
 `blastbox egress apply` runs it with `--restart on-failure:3`, never `unless-stopped` — a
-crash-looping container looks healthy in `docker ps` forever, and health is asserted from
-its gate log line plus a zero restart count.
+crash-looping container looks healthy in `docker ps` forever. Health is asserted from the
+gate log line **of the container's current start** (`docker logs --since` its `StartedAt`;
+reading the whole history lets a line from a previous, since-failed start vouch for a
+forwarder that is now crash-looping).
+
+The restart count is **reported, not disqualifying**. This README and the `egress` module
+docstring both used to say health required a zero restart count; `forwarder_health` takes
+`restart_count` as informational only, and deliberately so — ejecting a node from the
+dispatch pool permanently because one overlay blip restarted its forwarder is a worse
+failure than the one it prevents. What is recovered from should not be held against a
+node forever.
 
 ## Build
 

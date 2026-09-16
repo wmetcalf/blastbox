@@ -36,6 +36,9 @@
 set -eu
 UP="${BLASTBOX_UPSTREAM_GW:?BLASTBOX_UPSTREAM_GW is required (overlay IP of the exit host)}"
 SUBNET="${BLASTBOX_WORKER_SUBNET:-172.31.0.0/16}"
+# Consecutive failed probes (each 3 packets, 15s apart) before we call the overlay
+# dead. 3 => ~45s of sustained silence, comfortably longer than a wg re-key.
+LOSS_THRESHOLD="${BLASTBOX_FORWARDER_LOSS_THRESHOLD:-3}"
 RETRIES="${BLASTBOX_GATE_RETRIES:-15}"
 
 UPLINK_GW="${BLASTBOX_UPLINK_GW:-$(ip route show default | awk '/default/{print $3; exit}')}"
@@ -85,6 +88,28 @@ echo "forwarder: serving $SUBNET (fail-closed; holds no provider credentials)"
 # 3. Stay closed if the overlay later dies. The node's DROP rule already prevents a WAN
 #    escape, but a forwarder advertising a gateway address it can no longer serve just
 #    turns a hard failure into a slow one. Exit and let the worker hit a dead route.
-while ping -c1 -W2 "$UP" >/dev/null 2>&1; do sleep 15; done
-echo "forwarder: lost the overlay peer $UP — exiting to fail closed" >&2
-exit 1
+#
+#    A THRESHOLD, NOT A SINGLE PACKET. This was `while ping -c1 -W2 "$UP"; do sleep 15;
+#    done` — one probe, one packet, no retry. Any single loss (ICMP rate limiting on the
+#    exit host, a handshake re-key taking longer than 2s, ordinary WAN jitter) ended the
+#    container. That matters because `--restart on-failure:3` is deliberate and
+#    RestartCount is monotonic for the container's life: three such blips, days apart,
+#    spend the budget and leave the forwarder Exited for good. The overlay being down is
+#    a sustained condition; require evidence of one.
+LOST=0
+while :; do
+  if ping -c3 -W3 -i 0.3 "$UP" >/dev/null 2>&1; then
+    if [ "$LOST" -gt 0 ]; then
+      echo "forwarder: overlay peer $UP answered again after ${LOST} failed probe(s)" >&2
+    fi
+    LOST=0
+  else
+    LOST=$((LOST + 1))
+    echo "forwarder: overlay peer $UP did not answer (${LOST}/${LOSS_THRESHOLD})" >&2
+    if [ "$LOST" -ge "$LOSS_THRESHOLD" ]; then
+      echo "forwarder: lost the overlay peer $UP for ${LOST} consecutive probes — exiting to fail closed" >&2
+      exit 1
+    fi
+  fi
+  sleep 15
+done

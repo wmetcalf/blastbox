@@ -42,8 +42,11 @@ are the reason this module exists as code with tests instead of as a runbook:
    outbound leg; the return leg needs its own conntrack chain or the path works and the
    client still times out. See :func:`return_chain_steps`.
 4. **A restart policy can mask a failed startup gate** — a crash-looping forwarder looks
-   healthy in ``docker ps`` forever. Health is asserted from the gate's log line and a
-   zero restart count, never from "running". See :func:`forwarder_health`.
+   healthy in ``docker ps`` forever. Health is asserted from the gate's log line SCOPED
+   TO THE CONTAINER'S CURRENT START, never from "running". The restart count is reported
+   alongside it but is deliberately NOT disqualifying: one transient overlay blip would
+   otherwise eject a recovered node from the dispatch pool permanently. See
+   :func:`forwarder_health`.
 
 Every rule lives in a dedicated ``BB-WG-*`` chain reached by a single jump and is removed
 by match, never by index — these nodes run a co-resident CAPE rooter whose rules must not
@@ -767,13 +770,47 @@ def exit_host_steps(cfg: EgressConfig, exit_iface: str) -> list[Step]:
     ]
 
 
-def teardown_steps(cfg: EgressConfig) -> list[Step]:
-    """Remove only what we created.
+#: The FORWARD jump each BB-WG-* chain is reached by, as a function of the config. Kept
+#: beside the builders that install them so teardown cannot drift from apply — the reason
+#: it is a table rather than four literals in two places.
+def chain_jump_matches(cfg: EgressConfig) -> list[tuple[str, list[str]]]:
+    """``(chain, match)`` for every jump this tier can install, for BOTH roles.
+
+    Teardown emits a delete for all of them regardless of the node's current role: a host
+    that was an exit host yesterday and a worker today still carries yesterday's jump, and
+    a teardown that removes only today's shape leaves it behind.
+    """
+    fwd = _ip(cfg.forwarder_uplink_ip)
+    overlay = cfg.overlay_net
+    return [
+        (CHAIN_FWD, ["-s", fwd]),
+        (CHAIN_FWD_RET, ["-d", _net(f"{fwd}/32")]),
+        (CHAIN_EXIT, ["-s", overlay]),
+        (CHAIN_EXIT_RET, ["-d", _net(overlay)]),
+    ]
+
+
+def teardown_steps(cfg: EgressConfig, exit_iface: str | None = None) -> list[Step]:
+    """Remove only what we created — and all of it.
 
     Rules are deleted **by match or by our own priority**, never by index: these hosts run
     a co-resident CAPE rooter (13 FORWARD rules on one, 77 on another) and deleting by
     index would renumber its rules out from under it. Everything is best-effort so a
     partially-applied state still tears down cleanly.
+
+    THE FORWARD JUMPS MUST GO FIRST, and for a long time they were not removed at all.
+    ``iptables -X`` refuses to delete a chain anything still jumps to, and every step here
+    is best-effort, so the failure was discarded and all four chains survived teardown as
+    empty, still-referenced chains while the caller printed "BB-WG-* chains ... removed".
+    An operator auditing FORWARD after a teardown saw blastbox rules the tool said it had
+    deleted. ``-F`` before ``-D`` as well: a flushed chain that is briefly still jumped to
+    RETURNs, which is the same fall-through the live chain's DROP existed to prevent, so
+    the window is left as short and as harmless as possible.
+
+    ``exit_iface`` is needed only to remove the exit host's SNAT, whose rule names it. A
+    caller that does not know the role passes ``None`` and that one rule is left; it is
+    inert without the chains and rules above it, but it is also the one thing this
+    function cannot claim to have removed.
     """
     cmds: list[Step] = []
     # DELETE BY FULL SELECTOR, not by bare priority. `ip rule del priority N` selects
@@ -792,8 +829,18 @@ def teardown_steps(cfg: EgressConfig) -> list[Step]:
     cmds.append(Step.best_effort(["ip", "route", "flush", "table", cfg.rt_table]))
     cmds.append(Step.best_effort(["iptables", "-w", "5", "-t", "nat", "-D", "POSTROUTING",
                                   "-o", cfg.wg_iface, "-j", "MASQUERADE"]))
-    for chain in ALL_CHAINS:
+    if exit_iface is not None:
+        eif = _iface(exit_iface)
+        for _ in range(4):
+            cmds.append(Step.best_effort(["iptables", "-w", "5", "-t", "nat", "-D", "POSTROUTING",
+                                          "-s", cfg.overlay_net, "-o", eif, "-j", "MASQUERADE"]))
+    for chain, match in chain_jump_matches(cfg):
         cmds.append(Step.best_effort(["iptables", "-w", "5", "-F", chain]))
+        # Repeat, for the same reason apply deletes four times before inserting: an older
+        # buggy state may hold duplicate jumps, and one -D removes exactly one.
+        for _ in range(4):
+            cmds.append(Step.best_effort(["iptables", "-w", "5", "-D", "FORWARD",
+                                          *match, "-j", chain]))
         cmds.append(Step.best_effort(["iptables", "-w", "5", "-X", chain]))
     return cmds
 
@@ -929,8 +976,13 @@ Type=oneshot
 RemainAfterExit=yes
 EnvironmentFile=/etc/blastbox/egress.env
 ExecStart={exec_start}
-# Re-applying is cheap and idempotent, and a node that comes up before its exit host is
-# reachable should keep trying rather than sit degraded until someone logs in.
+# Restart=on-failure only covers a raised exception (a missing image, an unresolvable
+# subnet conflict). It deliberately does NOT cover a DEGRADED apply: `egress apply` exits
+# 0 when the tier is installed but unhealthy, because a local-mode node legitimately has
+# no forwarder to be healthy about. With Type=oneshot + RemainAfterExit the unit is then
+# `active (exited)` and can never fire again — so the recurring reconvergence this tier
+# needs lives in blastbox-egress.timer, not here. Do not "fix" that by making apply exit
+# non-zero on DEGRADED; that ejects every correct local-mode node instead.
 Restart=on-failure
 RestartSec=30
 
@@ -943,6 +995,84 @@ ReadWritePaths=/etc/wireguard /etc/blastbox /etc/iproute2
 
 [Install]
 WantedBy=multi-user.target
+"""
+
+
+def reconcile_timer_unit(interval: str = "3min") -> str:
+    """Render the timer that RE-APPLIES the tier periodically, not just at boot.
+
+    THREE SEPARATE WAYS ENFORCEMENT DISAPPEARS AND NOTHING BRINGS IT BACK, all found by
+    review and all fixed by one recurring reconcile:
+
+    1. **dockerd restarts on its own.** ``Requires=docker.service`` propagates a restart
+       only when docker is restarted EXPLICITLY (``man systemd.unit``), and docker ships
+       ``Restart=always`` — so a crash or OOM restart propagates nothing. Docker rebuilds
+       FORWARD on every daemon start, re-inserting DOCKER-FORWARD (which holds a terminal
+       ACCEPT for the non-internal bb-net0 bridge) above our jump. The BB-WG-FWD DROP is
+       then dead code and this unit, already `active (exited)`, never re-hoists it.
+    2. **The forwarder exhausts its restart budget.** ``--restart on-failure:3`` is
+       deliberate — a forwarder that cannot carry traffic must be visibly dead — but
+       RestartCount is monotonic for the container's life, so three transient overlay
+       blips days apart leave it Exited with nothing to start it again.
+    3. **A node boots before its exit host is reachable.** The startup gate fails, apply
+       reports DEGRADED and exits 0, and the unit goes inactive for good.
+
+    A reconcile is cheap: every step is guarded, deleted-then-re-added, or best-effort,
+    so a converged node's re-apply is a few dozen syscalls and changes nothing.
+    ``Persistent=`` is deliberately absent — this is not a missed-work-catch-up job, and
+    firing a reconcile storm on a host that was off for a week helps nobody.
+    """
+    return f"""# blastbox-egress.timer — re-apply the egress tier periodically, not only at boot.
+#
+# The boot unit alone is not enough; see reconcile_timer_unit's docstring for the three
+# measured ways a node loses enforcement while systemd still reports the unit active.
+# This is a CONVERGENCE loop, not a health check: it does not decide anything, it just
+# re-asserts the state `apply` computed, which is idempotent by construction.
+#
+# Generated by `blastbox egress apply` from blastbox.host.egress.reconcile_timer_unit.
+
+[Unit]
+Description=periodically re-apply the blastbox egress tier
+ConditionPathExists=/etc/blastbox/egress.env
+
+[Timer]
+OnBootSec={interval}
+OnUnitInactiveSec={interval}
+# Spread across a fleet so a hundred nodes do not all rewrite their FORWARD chains in
+# the same second as each other and as a docker restart.
+RandomizedDelaySec=45
+AccuracySec=10s
+Unit=blastbox-egress-reconcile.service
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+def reconcile_service_unit(exec_start: str) -> str:
+    """The one-shot the timer triggers.
+
+    A SEPARATE unit from blastbox-egress.service on purpose. That one is
+    ``RemainAfterExit=yes`` so it can express "this node's tier is set up"; restarting it
+    every few minutes would make that state meaningless and would also fight
+    ``Restart=on-failure``. This one is a plain oneshot that runs and exits.
+    """
+    return f"""# blastbox-egress-reconcile — the periodic re-apply triggered by blastbox-egress.timer.
+#
+# Generated by `blastbox egress apply` from blastbox.host.egress.reconcile_service_unit.
+
+[Unit]
+Description=re-apply the blastbox egress tier (periodic reconcile)
+After=docker.service
+ConditionPathExists=/etc/blastbox/egress.env
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/blastbox/egress.env
+ExecStart={exec_start}
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN CAP_DAC_OVERRIDE
+ProtectSystem=full
+ReadWritePaths=/etc/wireguard /etc/blastbox /etc/iproute2
 """
 
 

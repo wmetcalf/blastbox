@@ -54,18 +54,41 @@ fi
 clamd --config-file="$CONF" &
 CLAMD=$!
 
+# WAIT FOR AN ANSWER, NOT FOR AN INODE. This loop used to test `[ ! -S <socket> ]`,
+# which is true the moment clamd binds and listen()s — before it has finished parsing
+# the database. A connect() during that window lands in the listen backlog instead of
+# erroring, so socket existence cannot distinguish "bound" from "answering", and the
+# whole point of the wait (and of the warm tier checkpointing a READY slot, which
+# freezes whatever state this loop signalled) is the difference between the two.
+# python3 is already in the image for blastbox, so this costs no new package.
+clamd_answers() {
+    python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(5)
+try:
+    s.connect(sys.argv[1])
+    s.sendall(b"nPING\n")
+    sys.exit(0 if s.recv(64).strip() == b"PONG" else 1)
+except OSError:
+    sys.exit(1)
+finally:
+    s.close()
+' "$1"
+}
+
 i=0
-while [ ! -S "$SOCKDIR/clamd.ctl" ]; do
+until clamd_answers "$SOCKDIR/clamd.ctl"; do
     i=$((i + 1))
     if [ "$i" -gt 300 ]; then
-        echo "[clamav] clamd did not open $SOCKDIR/clamd.ctl within 300s" >&2
+        echo "[clamav] clamd did not answer PING on $SOCKDIR/clamd.ctl within 300s" >&2
         exit 1
     fi
-    # A dead clamd never opens the socket, so without this the loop waits the full
-    # timeout to report a failure that already happened.
+    # A dead clamd never answers, so without this the loop waits the full timeout to
+    # report a failure that already happened.
     kill -0 "$CLAMD" 2>/dev/null || { echo "[clamav] clamd exited during startup" >&2; exit 1; }
     sleep 1
 done
-echo "[clamav] daemon ready (socket $SOCKDIR/clamd.ctl)" >&2
+echo "[clamav] daemon ready and answering PING (socket $SOCKDIR/clamd.ctl)" >&2
 
 exec "$@"

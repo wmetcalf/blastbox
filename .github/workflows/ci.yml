@@ -28,9 +28,12 @@ jobs:
     # The forwarder is a real deployment artifact but it is built on the node, not
     # published to a registry (this repo ships only the PyPI wheel). Nothing would
     # otherwise notice it rotting until an operator ran `egress apply --mode global` on a
-    # live node and got a build failure mid-install. Build it here, and assert the two
-    # behaviours the tier depends on: it must FAIL CLOSED with no reachable upstream, and
-    # it must refuse to start at all with no upstream configured.
+    # live node and got a build failure mid-install. Build it here, and assert the
+    # behaviours the tier depends on: it must FAIL CLOSED with no reachable upstream, it
+    # must refuse to start at all with no upstream configured, and — the one this job was
+    # missing — it must print a gate line that `egress.GATE_OK_PATTERN` ACCEPTS when the
+    # overlay is fine. Both existing assertions were negative, so the single string the
+    # dispatcher's health gate keys on was never produced or matched anywhere in CI.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -67,6 +70,20 @@ jobs:
           else
             echo "::error::container exited 1 but the startup gate never ran"; exit 1
           fi
+      - name: Its gate SUCCESS line is the one the health gate recognises
+        run: |
+          # A reachable upstream: the container's own bridge gateway always answers.
+          UP=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}')
+          docker run -d --name fwdok --cap-add NET_ADMIN --sysctl net.ipv4.ip_forward=1 \
+            -e BLASTBOX_UPSTREAM_GW="$UP" blastbox-egress-forwarder:ci
+          for _ in $(seq 1 30); do
+            docker logs fwdok 2>&1 | grep -q 'overlay peer' && break
+            sleep 1
+          done
+          docker logs fwdok > /tmp/fwdok.log 2>&1
+          cat /tmp/fwdok.log
+          python3 scripts/ci/assert-gate-line.py /tmp/fwdok.log
+          docker rm -f fwdok
       - name: Clean up
         if: always()
         run: docker rm -f fwd || true

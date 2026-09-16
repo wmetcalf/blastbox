@@ -11,9 +11,21 @@
 # profile or a proxy key. That is the reason to centralise exits rather than copy secrets
 # to every node.
 #
-# NOT a NAT to the internet: the default route inside points at the overlay peer, so if
-# WireGuard is down there is nowhere for packets to go and the tier fails closed —
-# the same property the internal bridge gives us locally.
+# WHERE THE FAIL-CLOSED PROPERTY ACTUALLY LIVES — this said the opposite for a while,
+# which is worse than saying nothing, because it is the first thing a reader consults
+# before changing the container. It claimed "the default route inside points at the
+# overlay peer, so if WireGuard is down there is nowhere for packets to go". It does
+# not. entrypoint.sh cannot install such a route (the peer is not on-link from a docker
+# bridge; the kernel rejects a `via` it cannot reach directly), says so explicitly, and
+# instead MASQUERADEs the worker subnet out its own uplink — which reaches the node's
+# WAN. Nothing inside this container stops a packet once its startup gate has passed.
+#
+# Fail-closed is enforced ENTIRELY node-side, by blastbox.host.egress
+# .forwarder_source_route_steps: an `ip rule` sending our source address to a table whose
+# only route is the tunnel, a blackhole rule behind it so an empty table cannot fall
+# through to main, and the BB-WG-FWD chain's DROP. This container's contribution is to
+# EXIT when the overlay dies, so the gateway address goes empty and the worker's default
+# route points at nothing. Do not read anything here as a second, independent guard.
 #
 #   docker build -t blastbox-egress-forwarder:dev deploy/egress-forwarder
 FROM alpine:3.20

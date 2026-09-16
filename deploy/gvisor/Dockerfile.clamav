@@ -41,8 +41,12 @@ RUN printf '%s' "${ENGINE}" > /opt/blastbox/engine \
     # /run/clamav must exist and be writable IN THE ROOTFS: the daemon's socket is
     # created there before the checkpoint, and a restored rootfs is read-only.
     && install -d -o clamav -g clamav /run/clamav \
-    # Strip setuid/setgid — nothing in this image needs to escalate.
-    && find / -xdev -type f -perm /6000 -exec chmod a-s {} + 2>/dev/null || true
+    # Strip setuid/setgid — nothing in this image needs to escalate. The `|| true` is
+    # scoped to the find alone: `&& find ... || true` would bind to the whole AND-list
+    # above it, so a failed mkdir or install would also exit 0 and commit a rootfs whose
+    # socket directory does not exist — unfixable later, because the restored rootfs is
+    # read-only.
+    && ( find / -xdev -type f -perm /6000 -exec chmod a-s {} + 2>/dev/null || true )
 
 # The warm entrypoint is supplied by the host via BLASTBOX_GVISOR_WARM_ARGV; it must go
 # through the clamav entrypoint so the daemon is up and ANSWERING before the checkpoint

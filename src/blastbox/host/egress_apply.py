@@ -23,7 +23,9 @@ from blastbox.host.egress import (
     ALL_CHAINS,
     expired_peers,
     CHAIN_EXIT,
+    CHAIN_EXIT_RET,
     CHAIN_FWD,
+    CHAIN_FWD_RET,
     PRIO_BLACKHOLE,
     PRIO_LOOKUP,
     EgressConfig,
@@ -40,6 +42,8 @@ from blastbox.host.egress import (
     gateway_wg_config,
     peer_wg_config,
     persistence_unit,
+    reconcile_service_unit,
+    reconcile_timer_unit,
     teardown_steps,
 )
 
@@ -320,6 +324,14 @@ _UNDERSTOOD_MATCHES = frozenset({
 })
 
 
+def _chain_exists(chain: str) -> bool:
+    """Does this user chain exist right now? ``iptables -S <chain>`` errors if it does
+    not, which is the whole test — and is deliberately NOT the same question as whether
+    anything jumps to it (see :func:`enforcement_present`, where an orphaned chain read
+    as containment for one review round)."""
+    return _run(["iptables", "-w", "5", "-S", chain], check=False).returncode == 0
+
+
 def _accepts_our_traffic(rule: str, fwd: str, bridge: str | None = None) -> bool:
     """Would this FORWARD rule terminally accept a NEW outbound packet from the forwarder?
 
@@ -372,13 +384,23 @@ def _accepts_our_traffic(rule: str, fwd: str, bridge: str | None = None) -> bool
     if bridge and iif and "+" not in iif and iif != bridge:
         return False
 
+    # `fwd` is a single forwarder address on a worker node and the whole overlay PREFIX
+    # on an exit host. This used to be `ip_address(fwd) not in ip_network(src)`, so on an
+    # exit host `ip_address("10.77.0.0/24")` raised ValueError and the except-branch —
+    # correctly conservative for genuinely unknown syntax — condemned EVERY unrelated
+    # `-s ... -j ACCEPT` above our jump. A co-resident CAPE rooter has dozens, so a
+    # perfectly healthy central exit reported its DROP as dead code, permanently.
+    # Overlap, not membership, is the question in both cases: a rule whose source set
+    # intersects ours can carry some of our packets, and partial is enough to bury us.
     src = val("-s")
     if src:
         try:
-            if ipaddress.ip_address(fwd) not in ipaddress.ip_network(src, strict=False):
-                return False
+            ours = ipaddress.ip_network(fwd, strict=False)
+            theirs = ipaddress.ip_network(src, strict=False)
         except ValueError:
             return True
+        if ours.version != theirs.version or not ours.overlaps(theirs):
+            return False
     return True
 
 
@@ -1064,7 +1086,52 @@ def install_persistence_unit(cfg: EgressConfig | None = None) -> str:
         return (f"persistence unit written but NOT ENABLED "
                 f"({(rc.stderr or '').strip().splitlines()[-1] if rc.stderr else 'systemctl failed'})"
                 " — the tier will not survive a reboot")
-    return f"persistence unit installed and enabled (ExecStart={exec_start})"
+    note = f"persistence unit installed and enabled (ExecStart={exec_start})"
+    return f"{note}; {install_reconcile_timer(exec_start)}"
+
+
+#: How often the reconcile timer re-asserts enforcement. Short enough that a dockerd
+#: restart does not leave the BB-WG jump buried for long (the window in which malware
+#: could egress our own WAN), long enough to be free.
+RECONCILE_INTERVAL = "3min"
+TIMER_DST = UNIT_DST.parent / "blastbox-egress.timer"
+RECONCILE_DST = UNIT_DST.parent / "blastbox-egress-reconcile.service"
+
+
+def install_reconcile_timer(exec_start: str) -> str:
+    """Install and enable the periodic re-apply timer.
+
+    Boot-time persistence is not enough. See ``egress.reconcile_timer_unit`` for the
+    three measured ways a node loses enforcement while systemd still reports its unit
+    active — the sharpest being an unattended dockerd restart, which rebuilds FORWARD
+    with docker's terminal ACCEPT for bb-net0 above our jump, making the WAN-escape DROP
+    dead code with nothing scheduled to re-hoist it.
+
+    Failure here is reported, never fatal: the tier itself is applied either way.
+    """
+    timer_body = reconcile_timer_unit(RECONCILE_INTERVAL)
+    svc_body = reconcile_service_unit(exec_start)
+    active = _run(["systemctl", "is-enabled", "blastbox-egress.timer"], check=False).returncode == 0
+    try:
+        if not (TIMER_DST.exists() and TIMER_DST.read_text() == timer_body
+                and RECONCILE_DST.exists() and RECONCILE_DST.read_text() == svc_body
+                and active):
+            TIMER_DST.write_text(timer_body)
+            RECONCILE_DST.write_text(svc_body)
+            os.chmod(TIMER_DST, 0o644)
+            os.chmod(RECONCILE_DST, 0o644)
+            _run(["systemctl", "daemon-reload"], check=False)
+        else:
+            return f"reconcile timer already enabled (every {RECONCILE_INTERVAL})"
+    except OSError as exc:
+        return (f"reconcile timer NOT installed ({exc.strerror}) — a dockerd restart "
+                "will bury the FORWARD jump until someone re-runs apply")
+    rc = _run(["systemctl", "enable", "--now", "blastbox-egress.timer"], check=False)
+    if rc.returncode != 0:
+        return ("reconcile timer written but NOT ENABLED "
+                f"({(rc.stderr or '').strip().splitlines()[-1] if rc.stderr else 'systemctl failed'})"
+                " — enforcement will not be re-asserted between reboots")
+    return f"reconcile timer enabled (re-applies every {RECONCILE_INTERVAL})"
 
 
 def await_health(cfg: EgressConfig, *, timeout_s: float = 45.0) -> Health:
@@ -1231,16 +1298,25 @@ def apply_exit_host(cfg: EgressConfig, *, persist: bool = False) -> list[str]:
 def teardown_node(cfg: EgressConfig, *, remove_bridges: bool = False) -> list[str]:
     notes: list[str] = []
     _run(["docker", "rm", "-f", cfg.forwarder_name], check=False)
-    run_steps(teardown_steps(cfg))
     # The exit-host SNAT names the bb-vpn bridge, whose interface teardown_steps cannot
     # know. Resolve it here; without this the rule survived every teardown and a later
     # re-apply stacked a second one naming a bridge that no longer exists.
-    eif = iface_for(cfg.vpn_gateway_ip)
-    if eif:
-        for _ in range(4):
-            _run(["iptables", "-t", "nat", "-D", "POSTROUTING",
-                  "-s", cfg.overlay_net, "-o", eif, "-j", "MASQUERADE"], check=False)
-    notes.append("ip rules, routing table, BB-WG-* chains and SNAT removed (by match)")
+    run_steps(teardown_steps(cfg, exit_iface=iface_for(cfg.vpn_gateway_ip)))
+    # VERIFY, DO NOT ANNOUNCE. This used to append "BB-WG-* chains ... removed" whatever
+    # happened, and because every teardown step is best-effort and `-X` refuses to delete
+    # a still-referenced chain, that sentence was false on every run. The same defect
+    # class the rest of this module exists to hunt: reporting an intention as an outcome.
+    leftover_chains = [c for c in ALL_CHAINS if _chain_exists(c)]
+    fwd_rules = _run(["iptables", "-w", "5", "-S", "FORWARD"], check=False).stdout
+    leftover_jumps = [c for c in ALL_CHAINS if f"-j {c}" in fwd_rules]
+    if not leftover_chains and not leftover_jumps:
+        notes.append("ip rules, routing table, BB-WG-* chains and SNAT removed (by match)")
+    else:
+        notes.append(
+            "WARNING: ip rules, routing table and SNAT removed, but "
+            + (f"FORWARD still jumps to {', '.join(leftover_jumps)}; " if leftover_jumps else "")
+            + (f"chains still present: {', '.join(leftover_chains)}" if leftover_chains else "")
+            + " — remove them by hand before re-applying")
     _run(["systemctl", "disable", "--now", f"wg-quick@{cfg.wg_iface}"], check=False)
     _run(["wg-quick", "down", cfg.wg_iface], check=False)
     notes.append(f"{cfg.wg_iface} down; keys left in {KEY_DIR}")
@@ -1254,6 +1330,16 @@ def teardown_node(cfg: EgressConfig, *, remove_bridges: bool = False) -> list[st
     # deferring every one of them forever, and the next reboot silently resurrects the
     # tier we just removed.
     _run(["systemctl", "disable", "--now", "blastbox-egress"], check=False)
+    # And the reconcile timer, which would otherwise re-apply the tier we just removed
+    # within RECONCILE_INTERVAL. ConditionPathExists on egress.env would stop it too,
+    # but only if the unlink below succeeds — belt and braces, in that order.
+    _run(["systemctl", "disable", "--now", "blastbox-egress.timer"], check=False)
+    for unit in (TIMER_DST, RECONCILE_DST):
+        try:
+            unit.unlink()
+        except OSError:
+            pass
+    _run(["systemctl", "daemon-reload"], check=False)
     try:
         ENV_FILE.unlink()
         notes.append(f"{ENV_FILE} removed; dispatch gate disarmed, boot unit disabled")
@@ -1385,7 +1471,17 @@ def check_node(cfg: EgressConfig) -> list[str]:
     rules = _run(["ip", "rule", "show"], check=False).stdout or ""
     rows.append(f"ip rules referencing {cfg.rt_table}: {rules.count(cfg.rt_table)}")
     rows.append(f"blackhole guards present: {rules.count('blackhole')}")
-    chains = _run(["iptables", "-S"], check=False).stdout or ""
-    rows.append(f"BB-WG-* chains: {sum(chains.count(c) > 0 for c in ALL_CHAINS)}/4")
+    # A worker node installs only the two FWD chains and an exit host only the two EXIT
+    # chains — the roles are mutually exclusive — so the old "N/4" printed 2/4 on every
+    # healthy node of either role and read as half the enforcement missing. Report the
+    # chains THIS role is supposed to have, and name any belonging to the other one,
+    # which is a leftover from a role change rather than a healthy state.
+    expected = (CHAIN_EXIT, CHAIN_EXIT_RET) if cfg.exit_host else (CHAIN_FWD, CHAIN_FWD_RET)
+    have = [c for c in expected if _chain_exists(c)]
+    rows.append(f"BB-WG-* chains for this role ({'exit host' if cfg.exit_host else 'worker node'}): "
+                f"{len(have)}/{len(expected)} — {', '.join(have) or 'none'}")
+    stray = [c for c in ALL_CHAINS if c not in expected and _chain_exists(c)]
+    if stray:
+        rows.append(f"chains from the OTHER role still present (leftover): {', '.join(stray)}")
     rows.append(f"foreign FORWARD rules (must be unchanged by us): {foreign_forward_rules()}")
     return rows

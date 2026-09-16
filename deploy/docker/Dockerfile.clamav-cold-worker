@@ -51,11 +51,26 @@ COPY deploy/clamav/entrypoint.sh /usr/local/bin/clamav-entrypoint
 # image so `docker inspect` can answer "what did this build intend to fetch?" — and the
 # engine seals the ACTUAL `db_version` with every verdict, so the two can be compared.
 ARG SIGNATURE_DATE=unpinned
+#
+# NO TRAILING `|| true` ON THIS CHAIN. It used to end `... | head -3 || true`, and `||`
+# binds to the WHOLE preceding AND-list, not to the last command — so a freshclam that
+# fetched main.cvd and then failed on daily.cvd exited 0 and the layer was committed.
+# entrypoint.sh only tests for main.cvd, so that partial database passed the runtime
+# guard too, and the image served yearly-cadence signatures while reporting a perfectly
+# ordinary `ClamAV <ver>/<sigs>` db_version. A scanner silently running an incomplete
+# database is the exact failure this image is built to make visible. The tolerated part
+# — the informational sigtool line — is isolated in its own subshell.
 RUN install -d -o clamav -g clamav /var/lib/clamav /run/clamav \
     && echo "signature fetch requested for: ${SIGNATURE_DATE}" \
     && freshclam --config-file=/etc/clamav/freshclam.conf --stdout \
     && chown -R clamav:clamav /var/lib/clamav \
-    && sigtool --info /var/lib/clamav/daily.cvd 2>/dev/null | head -3 || true
+    # freshclam exits 0 having fetched only some of what it was asked for, so assert the
+    # set we actually depend on rather than trusting its status.
+    && for db in main daily bytecode; do \
+         { [ -f "/var/lib/clamav/$db.cvd" ] || [ -f "/var/lib/clamav/$db.cld" ]; } \
+           || { echo "FATAL: freshclam exited 0 but $db is missing from the image" >&2; exit 1; }; \
+       done \
+    && ( sigtool --info /var/lib/clamav/daily.cvd 2>/dev/null | head -3 || true )
 
 # Install THIS-tree blastbox plus the clamd client. `--break-system-packages` because
 # the image has no other Python consumer and a venv buys nothing here.

@@ -645,6 +645,46 @@ def test_the_persistence_unit_is_generated_not_read_from_deploy():
     assert shipped.read_text() == persistence_unit("/usr/local/bin/blastbox egress apply")
 
 
+def test_the_reconcile_timer_is_shipped_and_matches_what_apply_installs():
+    """Boot persistence alone leaves three measured holes — an unattended dockerd
+    restart burying the FORWARD jump, a forwarder that has spent its on-failure:3
+    budget, and a node that booted before its exit host — in all of which systemd still
+    reports blastbox-egress active(exited) and nothing re-asserts enforcement."""
+    from pathlib import Path as _P
+
+    from blastbox.host.egress import reconcile_service_unit, reconcile_timer_unit
+    from blastbox.host.egress_apply import RECONCILE_INTERVAL
+
+    d = _P(__file__).resolve().parents[2] / "deploy" / "systemd"
+    ex = "/usr/local/bin/blastbox egress apply"
+    assert (d / "blastbox-egress.timer").read_text() == reconcile_timer_unit(RECONCILE_INTERVAL)
+    assert (d / "blastbox-egress-reconcile.service").read_text() == reconcile_service_unit(ex)
+
+
+def test_the_reconcile_service_does_not_remain_after_exit():
+    """It must be a plain oneshot. RemainAfterExit is what makes the BOOT unit able to
+    say "this node's tier is set up"; carrying it here would make the timer's repeated
+    triggers either no-ops or a fight with Restart=on-failure."""
+    from blastbox.host.egress import reconcile_service_unit
+
+    body = reconcile_service_unit("/x/blastbox egress apply")
+    assert "RemainAfterExit" not in body
+    assert "Restart=" not in body
+    assert "ConditionPathExists=/etc/blastbox/egress.env" in body
+
+
+def test_the_timer_fires_repeatedly_not_only_at_boot():
+    """OnBootSec alone would make this a second boot unit and leave every non-reboot
+    hole open."""
+    from blastbox.host.egress import reconcile_timer_unit
+
+    body = reconcile_timer_unit("3min")
+    assert "OnUnitInactiveSec=3min" in body
+    assert "Unit=blastbox-egress-reconcile.service" in body
+    # A fleet must not rewrite its FORWARD chains in lockstep.
+    assert "RandomizedDelaySec" in body
+
+
 def test_the_generated_unit_carries_its_load_bearing_directives():
     from blastbox.host.egress import persistence_unit
 
@@ -1224,3 +1264,53 @@ def test_no_auto_subnets_does_not_disable_the_host_facts_check(monkeypatch):
     # The deliberate override is separate, and explicit.
     monkeypatch.setenv("BLASTBOX_EGRESS_ALLOW_UNKNOWN_ROUTES", "1")
     ea.plan_subnets(EgressConfig(), auto=False)
+
+
+def test_the_gate_success_regex_matches_a_line_the_forwarder_can_actually_emit():
+    """The one string the dispatcher's health gate keys on lived in four hand-copied
+    places with nothing tying them together: the entrypoint (the source of truth),
+    GATE_OK_PATTERN, hardcoded literals in this file, and a third spelling in
+    scripts/test-egress-leak.sh. CI only ever exercised the FAILURE line, so rewording
+    the success line would keep every test and the whole CI job green while every
+    global-mode node reported "has not logged a successful overlay probe" and the
+    dispatcher deferred 100% of egress jobs fleet-wide.
+
+    So: read the shell script and check the regex against what it can really print.
+    """
+    import re
+    from pathlib import Path as _P
+
+    from blastbox.host.egress import GATE_OK_PATTERN
+
+    src = (_P(__file__).resolve().parents[2] / "deploy/egress-forwarder/entrypoint.sh").read_text()
+    # Every double-quoted echo the script can emit, with shell expansions stood in for.
+    emitted = [
+        re.sub(r"\$\{?\w+\}?", "VALUE", m)
+        for m in re.findall(r'^\s*echo "([^"]*)"', src, re.M)
+    ]
+    assert emitted, "no echo lines found — the extraction, not the contract, is broken"
+    matching = [line for line in emitted if GATE_OK_PATTERN.search(line)]
+    assert matching, (
+        "GATE_OK_PATTERN matches NOTHING the forwarder prints. Every global-mode node "
+        f"will read as unhealthy. Pattern: {GATE_OK_PATTERN.pattern!r}; lines: {emitted}"
+    )
+
+
+def test_the_leak_script_and_the_health_gate_look_for_the_same_line():
+    """Third copy of the same contract. A divergence here means the operator's proof
+    and the dispatcher's gate disagree about whether a node is carrying traffic."""
+    import re
+    from pathlib import Path as _P
+
+    from blastbox.host.egress import GATE_OK_PATTERN
+
+    script = (_P(__file__).resolve().parents[2] / "scripts/test-egress-leak.sh").read_text()
+    greps = re.findall(r"grep -q '([^']+)'", script)
+    overlay = [g for g in greps if "overlay peer" in g]
+    assert overlay, "the leak test no longer greps for the gate line at all"
+    for g in overlay:
+        probe = g.replace(".*", "10.77.0.1")
+        assert GATE_OK_PATTERN.search(probe), (
+            f"the leak test greps {g!r}, which GATE_OK_PATTERN "
+            f"({GATE_OK_PATTERN.pattern!r}) does not accept"
+        )
