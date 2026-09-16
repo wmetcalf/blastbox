@@ -17,6 +17,8 @@ import tarfile
 import threading
 import time
 import uuid
+
+from blastbox.host.runtime.env_knobs import positive_float_env
 from pathlib import Path
 from typing import Callable
 
@@ -377,7 +379,14 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
 
     snapshot_parent = resolve_mem_dir() or Path(gcfg.root).parent
     base_dir = _secure_snapshot_base(snapshot_parent / "gvisor-snapshot")
-    mgr = SnapshotManager(base_dir, backend, ack_capable=ack_capable)
+    # The readiness budget was a hard-coded 120s that no caller passed and no knob
+    # reached, while the failure it produces tells the operator to raise a DIFFERENT
+    # variable (issue #147). A slow-but-healthy base -- a cold OCR/soffice warm-up on a
+    # loaded node -- could not be accommodated at all.
+    mgr = SnapshotManager(
+        base_dir, backend, ack_capable=ack_capable,
+        ready_timeout_s=positive_float_env(os.environ, "BLASTBOX_SNAPSHOT_READY_S", 120.0),
+    )
     return GvisorSnapshotSlotRuntime(mgr, settle_s=_settle(), ack_capable=ack_capable)
 
 
@@ -498,4 +507,7 @@ def _gvisor_config_from_env(env):
         # Generous defense-in-depth bounds for the whole warm worker tree (see GvisorConfig).
         rlimit_nproc=_int_env(env, "BLASTBOX_GVISOR_NPROC", 4096),
         rlimit_nofile=_int_env(env, "BLASTBOX_GVISOR_NOFILE", 65536),
+        # Bounds every runsc invocation; see GvisorConfig.cli_timeout_s for why an unbounded
+        # one could disable warm rebuilds for the life of the process.
+        cli_timeout_s=positive_float_env(env, "BLASTBOX_GVISOR_CLI_TIMEOUT_S", 900.0),
     )

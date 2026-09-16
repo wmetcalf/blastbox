@@ -656,7 +656,7 @@ def test_the_first_hit_stays_first(monkeypatch):
     assert scan_path(Path("/s"))[0] == "Zzz-1"
 
 
-def test_duplicate_signature_names_are_collapsed(monkeypatch):
+def test_duplicate_signature_names_are_collapsed_offline(monkeypatch):
     """An archive whose members all match the same family reports it once per member."""
     from blastbox.engines.clamav import scan_path
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "blastbox"
-version = "0.1.26"
+version = "0.1.40"
 description = "Reusable detonation framework: run untrusted documents through disposable, hardened workers"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -27,6 +27,14 @@ classifiers = [
 # protocol). An engine adapter installs `blastbox` and stays lean.
 dependencies = [
     "pydantic>=2.6.0",
+    # PEP 440 semantics, in the one place they cannot be approximated: a pin of
+    # `0.2.0-rc1` is normalised by the installer to `0.2.0rc1`, so a stamp that
+    # records the source spelling and compares it literally against
+    # `importlib.metadata.version()` fails verification for a build that is
+    # entirely correct. The adopter engines' build wrappers already require
+    # this to be importable from blastbox's environment for their version
+    # floor; declaring it makes that true rather than hoped for.
+    "packaging>=23.0",
 ]
 
 [project.optional-dependencies]
@@ -103,3 +111,9 @@ markers = [
     "docker: exercises the built Docker image",
     "perf: performance benchmark gate; needs a benchmarkable host (skipped otherwise)",
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# E402 in tests is CORRECT, not debt. `pytest.importorskip("boto3")` has to run BEFORE the
+# imports it guards, otherwise the module raises at collection time on any machine without the
+# optional dependency instead of skipping. Moving those imports to the top would break the skip.
+"tests/**" = ["E402"]

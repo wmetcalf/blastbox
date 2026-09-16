@@ -59,7 +59,7 @@ import datetime
 import ipaddress
 import os
 import re
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from typing import Iterable, Mapping, Sequence
 
 

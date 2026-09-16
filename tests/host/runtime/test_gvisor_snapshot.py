@@ -1,3 +1,6 @@
+import pathlib
+import time
+import json
 from pathlib import Path
 
 import pytest
@@ -776,3 +779,856 @@ def test_an_unconfirmed_restore_teardown_retains_its_bundle(tmp_path):
         "the bundle was forgotten, so nothing can retry the teardown and the checkpoint stays "
         "pinned for the life of the dispatcher"
     )
+
+
+# ---------------------------------------------------------------------------
+# The ready-timeout must carry the cause the guest left behind
+# ---------------------------------------------------------------------------
+
+
+class TestReadyTimeoutReportsTheBreadcrumb:
+    """`run_warm.py` writes `ctrl/setup_error` for one stated reason: without it "the host
+    only sees a bare ready-timeout". Nothing read it, and the failure path rmtree's the
+    bundle, so the explanation was destroyed unread -- measured on toolz2, where a fleet
+    rootfs produced `warm base not READY within 120.0s` and no cause at all.
+    """
+
+    def test_the_timeout_names_the_cause_the_guest_recorded(self, tmp_path):
+        from blastbox.host.runtime.gvisor_snapshot import _default_ready_wait
+
+        ctrl = tmp_path / "ctrl"
+        ctrl.mkdir()
+        (ctrl / "setup_error").write_text("engine setup failed: ModuleNotFoundError('pytesseract')")
+
+        with pytest.raises(TimeoutError) as ei:
+            _default_ready_wait(ctrl, 0.3)
+
+        msg = str(ei.value)
+        assert "not READY" in msg
+        assert "engine setup failed" in msg, f"the timeout dropped the recorded cause: {msg}"
+        assert "pytesseract" in msg
+
+    def test_a_timeout_with_no_breadcrumb_is_unchanged(self, tmp_path):
+        """The common case -- a genuinely slow base -- must not gain a bogus cause."""
+        from blastbox.host.runtime.gvisor_snapshot import _default_ready_wait
+
+        ctrl = tmp_path / "ctrl"
+        ctrl.mkdir()
+
+        with pytest.raises(TimeoutError) as ei:
+            _default_ready_wait(ctrl, 0.3)
+
+        msg = str(ei.value)
+        assert "not READY" in msg
+        # The knob hint is expected; an empty CAUSE is not. Anchor on the ctrl dir being
+        # followed straight by the hint, so a stray ": " with nothing after it still fails.
+        assert "); " not in msg and ": \n" not in msg, (
+            f"a trailing empty cause was appended: {msg}"
+        )
+        assert "BLASTBOX_SNAPSHOT_READY_S" in msg, (
+            "a timeout with no recorded cause must still say which knob governs it"
+        )
+
+    def test_a_worker_written_cause_cannot_smuggle_control_characters(self, tmp_path):
+        """ctrl/ is bind-mounted 0o777 and this string is written by the sandboxed worker.
+
+        It lands in operator logs and an exception message, so newlines (log-line injection)
+        and control bytes must not survive the read.
+        """
+        from blastbox.host.runtime.gvisor_snapshot import read_setup_breadcrumb
+
+        ctrl = tmp_path / "ctrl"
+        ctrl.mkdir()
+        (ctrl / "setup_error").write_text(
+            "boom\n2026-01-01 CRITICAL fleet is on fire\x00\x1b[31m"
+        )
+
+        cause = read_setup_breadcrumb(ctrl)
+
+        assert cause is not None
+        assert "\n" not in cause and "\x00" not in cause and "\x1b" not in cause
+        assert cause.startswith("boom")
+
+    def test_an_oversized_breadcrumb_is_capped(self, tmp_path):
+        from blastbox.host.runtime.gvisor_snapshot import read_setup_breadcrumb
+
+        ctrl = tmp_path / "ctrl"
+        ctrl.mkdir()
+        (ctrl / "setup_error").write_text("A" * 100_000)
+
+        cause = read_setup_breadcrumb(ctrl, max_bytes=4096)
+
+        assert cause is not None and len(cause) <= 4096
+
+    def test_a_breadcrumb_that_is_not_a_regular_file_is_ignored(self, tmp_path):
+        """A symlink out of the confined dir must not be followed: the worker owns this dir."""
+        from blastbox.host.runtime.gvisor_snapshot import read_setup_breadcrumb
+
+        ctrl = tmp_path / "ctrl"
+        ctrl.mkdir()
+        secret = tmp_path / "secret"
+        secret.write_text("host-side secret")
+        (ctrl / "setup_error").symlink_to(secret)
+
+        assert read_setup_breadcrumb(ctrl) is None
+
+
+class TestReadyTimeoutDistinguishesDeadFromSlow:
+    """A guest that has EXITED can never write `ready`, so the budget is irrelevant to it.
+
+    Measured on toolz2 with a fleet clippyshot rootfs: the default warm argv runs plain
+    `python3`, but blastbox lives in the image's venv, so run_warm.py died with
+    `ModuleNotFoundError: No module named 'blastbox'` at import -- before main(), hence before
+    the setup_error breadcrumb could be written. The container was gone in under a second and
+    the host still waited the full 120 s to report only "not READY within 120.0s".
+    """
+
+    def _handle(self, tmp_path, status: str | None):
+        from blastbox.host.runtime.gvisor_snapshot import GvisorBootHandle, GvisorConfig
+
+        ctrl = tmp_path / "ctrl"
+        ctrl.mkdir()
+        cfg = GvisorConfig(
+            runsc_bin="runsc",
+            root=tmp_path / "root",
+            image_rootfs=tmp_path / "rootfs",
+            network="none",
+            warm_argv=["python3", "/opt/blastbox/run_warm.py"],
+        )
+
+        def never_ready(_ctrl, _timeout):
+            raise TimeoutError("warm base not READY within 0.1s (ctrl)")
+
+        def run_text(argv):
+            if status is None:
+                return ""            # `runsc state` itself failed / not parseable
+            return json.dumps({"status": status})
+
+        return GvisorBootHandle(
+            cfg, lambda *a, **k: 0, "warm-base-x", tmp_path / "base", ctrl,
+            never_ready, run_text=run_text,
+        )
+
+    def test_a_container_that_exited_says_so(self, tmp_path):
+        h = self._handle(tmp_path, "stopped")
+
+        with pytest.raises(TimeoutError) as ei:
+            h.wait_ready(0.1)
+
+        msg = str(ei.value)
+        assert "stopped" in msg
+        assert "exited before signalling READY" in msg
+        assert "no budget would have helped" in msg, (
+            f"a dead guest was reported as if a longer timeout could fix it: {msg}"
+        )
+
+    def test_a_container_still_running_is_reported_as_a_plain_timeout(self, tmp_path):
+        """The genuinely-slow case must NOT gain a 'it exited' claim -- that would send the
+        operator to fix an argv that is fine."""
+        h = self._handle(tmp_path, "running")
+
+        with pytest.raises(TimeoutError) as ei:
+            h.wait_ready(0.1)
+
+        assert "exited before signalling READY" not in str(ei.value)
+
+    def test_an_unknowable_state_does_not_invent_a_cause(self, tmp_path):
+        h = self._handle(tmp_path, None)
+
+        with pytest.raises(TimeoutError) as ei:
+            h.wait_ready(0.1)
+
+        assert "exited before signalling READY" not in str(ei.value)
+
+
+class TestEveryRunscCallIsBounded:
+    """An unbounded runsc call disables warm rebuilds for the life of the process.
+
+    `_default_run` is `subprocess.run(check=True)` with no timeout, and the build runs on a
+    daemon thread that `ensure_build_started` refuses to replace while it is alive
+    (`_build_thread.is_alive()`) -- with no watchdog anywhere. So one wedged
+    `checkpoint`/`run`/`restore`/`exec` meant the warm tier never rebuilt again: no error, no
+    log, every job on the cold tier permanently. The query helpers were already bounded
+    (`runsc state` 3s, `runsc help` 5s); the build path was not.
+
+    These drive the REAL call sites with a recording runner and assert a timeout was passed,
+    then prove end-to-end against an actually-hanging runsc that the call returns.
+    """
+
+    def _cfg(self, tmp_path, **kw):
+        from blastbox.host.runtime.gvisor_snapshot import GvisorConfig
+
+        return GvisorConfig(
+            runsc_bin="runsc", root=tmp_path / "root", image_rootfs=tmp_path / "rootfs",
+            network="none", warm_argv=["python3", "/opt/blastbox/run_warm.py"], **kw,
+        )
+
+    def test_the_checkpoint_call_is_bounded(self, tmp_path):
+        from blastbox.host.runtime.gvisor_snapshot import GvisorBootHandle
+
+        seen: list[dict] = []
+
+        def run(argv, **kw):
+            seen.append({"argv": argv, "kw": kw})
+            return 0
+
+        cfg = self._cfg(tmp_path, cli_timeout_s=42.0)
+        base = tmp_path / "base"
+        (base / "ctrl").mkdir(parents=True)
+        h = GvisorBootHandle(cfg, run, "cid", base, base / "ctrl", lambda c, t: None)
+        dest = tmp_path / "dest"
+        dest.mkdir()
+
+        h.checkpoint(dest)
+
+        ckpt = [c for c in seen if "checkpoint" in c["argv"]]
+        assert ckpt, f"no checkpoint call was made: {seen}"
+        assert ckpt[0]["kw"].get("timeout") == 42.0, (
+            f"runsc checkpoint ran unbounded; a wedge here never rebuilds: {ckpt[0]['kw']}"
+        )
+
+    def test_the_boot_call_is_bounded(self, tmp_path):
+        from blastbox.host.runtime.gvisor_snapshot import GvisorSnapshotBackend
+
+        seen: list[dict] = []
+
+        def run(argv, **kw):
+            seen.append({"argv": argv, "kw": kw})
+            return 0
+
+        cfg = self._cfg(tmp_path, cli_timeout_s=37.0)
+        (tmp_path / "root").mkdir(parents=True, exist_ok=True)
+        be = GvisorSnapshotBackend(cfg, run=run)
+        be.boot_base()
+
+        boots = [c for c in seen if "run" in c["argv"] and "-detach" in c["argv"]]
+        assert boots, f"no runsc run call was made: {seen}"
+        assert boots[0]["kw"].get("timeout") == 37.0, (
+            f"runsc run ran unbounded: {boots[0]['kw']}"
+        )
+
+    def test_a_hanging_runsc_actually_returns(self, tmp_path):
+        """The property that matters, proved by EXECUTING a runsc that never exits.
+
+        Asserting the kwarg alone would pass even if `_default_run` dropped it on the floor.
+        """
+        import subprocess as sp
+
+        from blastbox.host.runtime.gvisor_snapshot import _default_run
+
+        hang = tmp_path / "runsc-that-hangs"
+        # `exec`, so the timeout kill lands on the sleep itself. Without it only the shell
+        # is killed and the sleep is orphaned for five minutes, accumulating across runs and
+        # holding inherited fds (codex, #149).
+        hang.write_text("#!/bin/sh\nexec sleep 300\n")
+        hang.chmod(0o755)
+
+        started = time.monotonic()
+        with pytest.raises(sp.TimeoutExpired):
+            _default_run([str(hang), "checkpoint"], timeout=1.0)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 30, f"the call was not bounded: it took {elapsed:.0f}s"
+
+
+class TestTheBoundsCodexFound:
+    """Follow-ups from the review of #149 -- each one defeats the bound it sits next to."""
+
+    def test_a_non_finite_timeout_is_refused(self):
+        """`float()` accepts inf/nan; neither is a deadline.
+
+        `subprocess.run(timeout=inf)` never expires and nan compares false against
+        everything, so both slip past a bare `val <= 0` check and silently restore the
+        unbounded call the knob exists to prevent.
+        """
+        from blastbox.host.runtime.gvisor_snapshot_runtime import _gvisor_config_from_env
+
+        for raw in ("inf", "-inf", "nan", "0", "-5"):
+            cfg = _gvisor_config_from_env(
+                {"BLASTBOX_GVISOR_ROOTFS": "/x", "BLASTBOX_GVISOR_CLI_TIMEOUT_S": raw}
+            )
+            assert cfg.cli_timeout_s == 900.0, f"{raw!r} was accepted as a timeout"
+        ok = _gvisor_config_from_env(
+            {"BLASTBOX_GVISOR_ROOTFS": "/x", "BLASTBOX_GVISOR_CLI_TIMEOUT_S": "300"}
+        )
+        assert ok.cli_timeout_s == 300.0, "a valid override must still be honoured"
+
+    def test_the_teardown_commands_are_bounded_too(self, tmp_path):
+        """They run on the SAME thread as a launch that just timed out, against a runsc that
+        is by hypothesis wedged. Unbounded here reinstates the hang the timeouts remove."""
+        from blastbox.host.runtime.gvisor_snapshot import GvisorConfig, _best_effort_delete
+
+        seen: list[dict] = []
+
+        def run(argv, **kw):
+            seen.append(kw)
+            raise RuntimeError("teardown fails, so both commands are attempted")
+
+        cfg = GvisorConfig(
+            runsc_bin="runsc", root=tmp_path / "root", image_rootfs=tmp_path / "rootfs",
+            network="none", warm_argv=["x"], cli_timeout_s=77.0,
+        )
+        _best_effort_delete(cfg, run, "cid")
+
+        assert seen, "no teardown command ran"
+        for kw in seen:
+            assert kw.get("timeout") == 77.0, f"an unbounded teardown call: {kw}"
+
+    def test_a_flood_of_stderr_is_bounded_in_memory(self):
+        """The sandbox holds this fd for its whole life and an untrusted document can make the
+        worker log without limit, so the sink must keep only the tail -- and must keep DRAINING,
+        or a busy guest blocks on a full pipe instead of running.
+
+        The write end is put in NON-BLOCKING mode deliberately. A sink that stops draining
+        would otherwise block the writer forever, and closing the fd does not reliably wake a
+        thread already blocked in `os.write` -- so the test would HANG rather than fail, which
+        is its own defect. Non-blocking turns "not draining" into a named failure in seconds.
+        """
+        import os as _os
+        import time as _time
+
+        from blastbox.host.runtime.gvisor_snapshot import _StderrSink
+
+        sink = _StderrSink(max_bytes=4096)
+        target = 4 * 1024 * 1024                    # 4 MiB through a 4 KiB sink
+        written = 0
+        try:
+            _os.set_blocking(sink.write_fd, False)
+            deadline = _time.monotonic() + 15.0
+            while written < target and _time.monotonic() < deadline:
+                try:
+                    written += _os.write(sink.write_fd, b"A" * 65536)
+                except BlockingIOError:
+                    _time.sleep(0.005)              # only reachable if nobody is draining
+            assert written >= target, (
+                f"the writer stalled after {written} bytes: the sink stopped draining, so a "
+                "busy guest would block on a full pipe instead of running"
+            )
+            # Same retry: a drained pipe can still be momentarily full, and this marker is
+            # what the tail assertion below looks for.
+            marker = b"THE-INTERESTING-TAIL\n"
+            deadline = _time.monotonic() + 5.0
+            while marker and _time.monotonic() < deadline:
+                try:
+                    marker = marker[_os.write(sink.write_fd, marker):]
+                except BlockingIOError:
+                    _time.sleep(0.005)
+            assert not marker, "could not write the tail marker even with the sink draining"
+        finally:
+            sink.close_write()
+
+        tail = sink.tail()
+        assert "THE-INTERESTING-TAIL" in tail, "runsc's useful line is the LAST one"
+        assert len(tail) <= 4096, f"the sink kept {len(tail)} bytes of a {target}-byte stream"
+
+    def test_worker_written_stderr_cannot_smuggle_control_characters(self):
+        """This text is influenced by the sandboxed worker and lands in an operator's log, so
+        newlines (log-line injection) and control bytes must not survive."""
+        import os as _os
+
+        from blastbox.host.runtime.gvisor_snapshot import _StderrSink
+
+        sink = _StderrSink()
+        try:
+            _os.write(sink.write_fd, b"boom\n2026-01-01 CRITICAL fleet is on fire\x00\x1b[31m")
+        finally:
+            sink.close_write()
+
+        tail = sink.tail()
+        assert "\n" not in tail and "\x00" not in tail and "\x1b" not in tail
+        assert tail.startswith("boom")
+
+
+class TestControlFlowAndBundleCleanup:
+    """The second review round on #149: both of these were caused by the fixes themselves."""
+
+    def test_an_interrupt_is_not_turned_into_a_snapshot_error(self):
+        """The callers catch BaseException to clean up and re-raise a shutdown UNCHANGED.
+
+        Enriching one gives it a `stderr`, and `_with_runsc_stderr` then replaces it with a
+        GvisorCommandError -- so a Ctrl-C during a boot came back as an ordinary snapshot
+        failure and the shutdown was swallowed.
+        """
+        from blastbox.host.runtime.gvisor_snapshot import (
+            _attach_stderr_text,
+            _with_runsc_stderr,
+        )
+
+        for exc in (KeyboardInterrupt(), SystemExit(1)):
+            out = _attach_stderr_text(exc, "cannot create gofer process: permission denied")
+            assert out is exc, f"{type(exc).__name__} was replaced by {type(out).__name__}"
+            assert _with_runsc_stderr(out, "runsc run") is exc, (
+                f"{type(exc).__name__} survived the attach but not the render"
+            )
+
+    def test_an_ordinary_failure_is_still_enriched(self):
+        """The control: this is what the enrichment exists for."""
+        from blastbox.host.runtime.gvisor_snapshot import (
+            _attach_stderr_text,
+            _with_runsc_stderr,
+        )
+
+        exc = RuntimeError("runsc exited 1")
+        rendered = _with_runsc_stderr(
+            _attach_stderr_text(exc, "cannot create gofer process: permission denied"),
+            "runsc run",
+        )
+        assert "cannot create gofer process" in str(rendered)
+
+    def test_a_capture_file_failure_does_not_leak_the_bundle(self, tmp_path, monkeypatch):
+        """The bundle dir and OCI config are already on disk and no container exists yet, so
+        nothing else knows this base is there. Every async retry would leak another."""
+        from blastbox.host.runtime import gvisor_snapshot as gs
+
+        monkeypatch.setattr(gs, "_prepare_slot_dirs",
+                            lambda cfg, base: (base / "ctrl").mkdir(parents=True))
+        monkeypatch.setattr(gs, "_write_oci_config", lambda cfg, base, in_ro=True: None)
+        # EMFILE creating the sink: the bundle dir and OCI config are already on disk and no
+        # container exists, so nothing else knows this base is here.
+        monkeypatch.setattr(gs, "_StderrSink",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError(24, "Too many open files")))
+
+        root = tmp_path / "root" / "r"
+        cfg = gs.GvisorConfig(
+            runsc_bin="runsc", root=root, image_rootfs=tmp_path / "rootfs",
+            network="none", warm_argv=["x"],
+        )
+        be = gs.GvisorSnapshotBackend(cfg, run=lambda *a, **k: 0)
+
+        with pytest.raises(OSError):
+            be.boot_base()
+
+        leaked = list(root.parent.glob("gvisor-base-*"))
+        assert not leaked, f"a prepared bundle was left behind: {leaked}"
+
+
+def test_a_successful_boot_leaves_no_capture_file_behind(tmp_path, monkeypatch):
+    """There is no capture FILE any more -- the sink is a drained pipe -- so a healthy boot
+    can leave nothing on disk at all. Kept as a regression on the file-based design, which
+    left one growing file per base (codex, #149/#150)."""
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    monkeypatch.setattr(gs, "_prepare_slot_dirs",
+                        lambda cfg, base: (base / "ctrl").mkdir(parents=True))
+    monkeypatch.setattr(gs, "_write_oci_config", lambda cfg, base, in_ro=True: None)
+
+    root = tmp_path / "root" / "r"
+    cfg = gs.GvisorConfig(
+        runsc_bin="runsc", root=root, image_rootfs=tmp_path / "rootfs",
+        network="none", warm_argv=["x"],
+    )
+    handle = gs.GvisorSnapshotBackend(cfg, run=lambda *a, **k: 0).boot_base()
+
+    bundles = list(root.parent.glob("gvisor-base-*"))
+    assert bundles, "fixture: the bundle should exist after a successful boot"
+    leftovers = [p for b in bundles for p in b.glob("runsc-stderr-*")]
+    assert not leftovers, f"a successful boot left a stderr capture file behind: {leftovers}"
+    assert handle is not None
+
+
+def test_a_sink_whose_drain_cannot_start_leaks_no_descriptors():
+    """`Thread.start()` raises once the host is out of threads -- after `os.pipe()` has already
+    allocated both ends.
+
+    Leaking them would make the failure feed itself: every asynchronous build retry would burn
+    two more descriptors and march the process toward EMFILE (codex, #153).
+    """
+    import os as _os
+    import threading as _th
+
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    def _fd_count() -> int:
+        return len(_os.listdir("/proc/self/fd"))
+
+    class _RefusingThread(_th.Thread):
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    before = _fd_count()
+    real = gs.threading.Thread
+    gs.threading.Thread = _RefusingThread          # type: ignore[misc]
+    try:
+        for _ in range(20):
+            with pytest.raises(RuntimeError):
+                gs._StderrSink()
+    finally:
+        gs.threading.Thread = real                 # type: ignore[misc]
+
+    after = _fd_count()
+    assert after <= before + 2, (
+        f"20 refused sinks leaked descriptors: {before} -> {after}"
+    )
+
+
+def test_a_gvisor_ledger_append_during_the_sweep_is_not_erased(tmp_path, monkeypatch):
+    """`stranded[:] = still` erases anything appended while the sweep ran.
+
+    Three failure paths append to this ledger -- a partial checkpoint, a base whose teardown
+    could not be confirmed, and a restore workdir the same. Losing one loses the only record of
+    a directory a live sandbox may still hold. Identical defect to the FC launcher's ledger
+    (#154); found by looking for the same shape in the sibling module.
+
+    Deterministic rather than raced: the erase happens at the END of the sweep, so an append
+    injected from inside the sweep's own rmtree lands exactly in the window it closes over.
+    """
+    import os as _os
+
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    stuck = tmp_path / "stuck-checkpoint"
+    stuck.mkdir()
+    ledger = [str(stuck)]
+    newcomer = str(tmp_path / "appended-mid-sweep")
+
+    def _rmtree(path, onerror=None, **kw):
+        with gs._STRANDED_LOCK:
+            if newcomer not in ledger:
+                ledger.append(newcomer)          # a concurrent failure path appends
+        if onerror:
+            onerror(_os.rmdir, str(path), (OSError, OSError(5, "EIO"), None))
+        return
+
+    monkeypatch.setattr(gs.shutil, "rmtree", _rmtree)
+
+    gs._retry_stranded_partials(ledger)
+
+    assert newcomer in ledger, (
+        "an entry appended during the sweep was erased; nothing can ever reclaim that dir"
+    )
+    assert str(stuck) in ledger, "the still-stuck path must survive for the next sweep too"
+
+
+class TestTheDrainThreadsAreBounded:
+    """A sink's drain ends at EOF -- when the sandbox exits.
+
+    On a host where sandboxes wedge instead of exiting, one drain accumulates per restore for
+    the life of the process: the same unbounded-thread class as the FC copy workers (#154).
+    """
+
+    @staticmethod
+    def _stuck_sink(gs):
+        """A sink whose pipe never sees EOF, so its drain stays alive."""
+        return gs._StderrSink()
+
+    def test_drains_are_capped(self, monkeypatch):
+        from blastbox.host.runtime import gvisor_snapshot as gs
+
+        monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+        monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 4)
+
+        sinks = [self._stuck_sink(gs) for _ in range(20)]   # none of them ever sees EOF
+        try:
+            alive = [t for t in gs._LIVE_SINKS if t.is_alive()]
+            assert len(alive) <= 4, f"{len(alive)} drain threads accumulated past the cap"
+        finally:
+            for s in sinks:
+                s.close_write()
+
+    def test_past_the_cap_the_launch_still_proceeds(self, monkeypatch):
+        """The degradation that separates this from the FC copy cap: a copy is essential, so
+        that one REFUSES. This is diagnostics, so refusing would break warm launches to protect
+        a log. The sink degrades to DEVNULL and says so."""
+        import subprocess as _sp
+
+        from blastbox.host.runtime import gvisor_snapshot as gs
+
+        monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+        monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 1)
+
+        first = gs._StderrSink()
+        try:
+            second = gs._StderrSink()          # past the cap
+            assert second.degraded, "the sink should have degraded rather than refused"
+            assert second.write_fd == _sp.DEVNULL, (
+                "a degraded sink must hand the launch a usable fd, not a live pipe"
+            )
+            assert second.tail() == "", "a degraded sink has nothing to report"
+            second.close_write()               # must not blow up on DEVNULL
+        finally:
+            first.close_write()
+
+    def test_a_healthy_host_never_accumulates(self, monkeypatch):
+        """The control: sinks whose sandboxes exit must free their slots, or the cap would
+        eventually strangle a perfectly healthy host."""
+        from blastbox.host.runtime import gvisor_snapshot as gs
+
+        monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+        monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 2)
+
+        for _ in range(10):
+            sink = gs._StderrSink()
+            assert not sink.degraded, "a healthy host hit the cap; slots are not being freed"
+            sink.close_write()                 # EOF: the drain ends
+            sink._thread.join(timeout=5)
+
+    def test_the_drain_cap_holds_under_concurrency(self, monkeypatch):
+        """Check-then-act does not bound anything in the concurrency the cap exists for.
+
+        Several concurrent restores can all observe spare capacity and start drains before any
+        of them registers. Threads are released from a barrier here so they contend on that
+        window deliberately (codex, #155).
+        """
+        import threading as _th
+
+        from blastbox.host.runtime import gvisor_snapshot as gs
+
+        monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+        monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 3)
+
+        n = 24
+        start = _th.Barrier(n)
+        made: list = []
+        made_lock = _th.Lock()
+
+        def _make() -> None:
+            start.wait(10)
+            sink = gs._StderrSink()
+            with made_lock:
+                made.append(sink)
+
+        threads = [_th.Thread(target=_make, daemon=True) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        try:
+            alive = [t for t in gs._LIVE_SINKS if t.is_alive()]
+            assert len(alive) <= 3, (
+                f"{len(alive)} drain threads started against a cap of 3: the reservation was "
+                "not made in the same critical section as the check"
+            )
+        finally:
+            for s in made:
+                s.close_write()
+
+    def test_a_drain_that_cannot_start_releases_its_reservation(self, monkeypatch):
+        """Reserving before starting must not strand the slot when the start fails, or a host
+        out of threads would permanently lose capacity it never used."""
+        import threading as _th
+
+        from blastbox.host.runtime import gvisor_snapshot as gs
+
+        monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+        monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 2)
+
+        class _RefusingThread(_th.Thread):
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        real = gs.threading.Thread
+        gs.threading.Thread = _RefusingThread          # type: ignore[misc]
+        try:
+            for _ in range(5):
+                with pytest.raises(RuntimeError):
+                    gs._StderrSink()
+        finally:
+            gs.threading.Thread = real                 # type: ignore[misc]
+
+        # The ledger must not GROW: a thread that never started is not alive, so the prune at
+        # the head of the next construction reclaims its slot. Asserting "nothing alive" would
+        # hold trivially (a never-started thread is never alive) -- this asserts the reclaim.
+        assert len(gs._LIVE_SINKS) <= 1, (
+            f"5 refused drains left {len(gs._LIVE_SINKS)} reservations behind; the cap would "
+            "strangle a host that has recovered"
+        )
+
+    def test_a_reservation_survives_a_concurrent_prune(self, monkeypatch):
+        """A reservation is appended BEFORE its thread starts, and an unstarted thread is not
+        alive -- so pruning on liveness alone let a concurrent constructor delete a reservation
+        that had been made but not started, and both would start drains (codex, #155).
+
+        Forced deterministically: the reservation is placed by hand, then a second constructor
+        runs its prune. Counting only threads that remain alive -- which my concurrency test
+        did -- cannot see this.
+        """
+        import threading as _th
+
+        from blastbox.host.runtime import gvisor_snapshot as gs
+
+        reserved = _th.Thread(target=lambda: None, daemon=True)   # reserved, never started
+        monkeypatch.setattr(gs, "_LIVE_SINKS", [reserved])
+        monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 1)
+
+        sink = gs._StderrSink()      # its prune must NOT evict the reservation
+        try:
+            assert sink.degraded, (
+                "a concurrent prune evicted a reserved-but-unstarted drain, so this launch got "
+                "a slot the cap had already given away"
+            )
+        finally:
+            sink.close_write()
+
+    def test_a_refused_start_frees_its_reservation(self, monkeypatch):
+        """The flip side of keeping unstarted reservations: one that never starts must be
+        released explicitly, or a host out of threads loses capacity permanently."""
+        import threading as _th
+
+        from blastbox.host.runtime import gvisor_snapshot as gs
+
+        monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+        monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 2)
+
+        class _RefusingThread(_th.Thread):
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        real = gs.threading.Thread
+        gs.threading.Thread = _RefusingThread          # type: ignore[misc]
+        try:
+            for _ in range(5):
+                with pytest.raises(RuntimeError):
+                    gs._StderrSink()
+        finally:
+            gs.threading.Thread = real                 # type: ignore[misc]
+
+        assert not gs._LIVE_SINKS, (
+            f"{len(gs._LIVE_SINKS)} refused drains kept their reservations; the cap would "
+            "strangle a host that has recovered"
+        )
+
+
+def test_a_sweep_that_raises_does_not_lose_the_batch(tmp_path, monkeypatch):
+    """`rmtree` can RAISE rather than report through onerror -- worker-created nesting deep
+    enough makes recursive removal hit RecursionError.
+
+    The ledger has already been emptied by then, so an escaping exception used to lose the
+    current entry AND every unprocessed one, permanently. The pre-batch implementation iterated
+    the live list and could not lose them (codex, #155).
+    """
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    a, b, c = (str(tmp_path / n) for n in ("a", "b", "c"))
+    for d in (a, b, c):
+        pathlib.Path(d).mkdir()
+    ledger = [a, b, c]
+
+    def _rmtree(path, onerror=None, **kw):
+        if str(path) == b:
+            raise RecursionError("maximum recursion depth exceeded")
+        return None                       # a and c "succeed"
+
+    monkeypatch.setattr(gs.shutil, "rmtree", _rmtree)
+
+    with pytest.raises(RecursionError):
+        gs._retry_stranded_partials(ledger)
+
+    assert b in ledger, "the entry that raised was lost"
+    assert c in ledger, "every entry after the raise was lost"
+    assert a not in ledger, "an entry that was successfully removed should not come back"
+
+
+def test_a_failed_pipe_does_not_strand_a_slot(monkeypatch):
+    """`os.pipe()` can fail on a host in transient EMFILE.
+
+    Because the prune deliberately keeps unstarted reservations, a failure AFTER reserving
+    would strand that slot forever -- and enough of them means a recovered host discards
+    stderr for every launch, permanently (codex, #155).
+    """
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+    monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 2)
+    monkeypatch.setattr(
+        gs.os, "pipe", lambda: (_ for _ in ()).throw(OSError(24, "Too many open files"))
+    )
+
+    for _ in range(10):
+        with pytest.raises(OSError):
+            gs._StderrSink()
+
+    assert not gs._LIVE_SINKS, (
+        f"{len(gs._LIVE_SINKS)} phantom reservations survived a failed pipe; a recovered "
+        "host would discard stderr forever"
+    )
+
+def test_the_degraded_path_starts_no_thread(monkeypatch):
+    """This branch exists to keep launches alive under exhaustion, so it must not depend on
+    starting a thread -- `Thread.start()` raises on a host that is out of them, which would
+    abort the very launch the degradation is protecting."""
+    import threading as _th
+
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+    monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 1)
+
+    first = gs._StderrSink()
+    try:
+        class _RefusingThread(_th.Thread):
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        real = gs.threading.Thread
+        gs.threading.Thread = _RefusingThread      # type: ignore[misc]
+        try:
+            degraded = gs._StderrSink()            # past the cap AND out of threads
+        finally:
+            gs.threading.Thread = real             # type: ignore[misc]
+
+        assert degraded.degraded
+        assert degraded.tail() == ""
+        degraded.close_write()                     # must not blow up without a thread
+    finally:
+        first.close_write()
+
+
+def test_a_full_cap_degrades_without_needing_a_descriptor(monkeypatch):
+    """The degraded branch must work on a host that has no descriptors to spare.
+
+    Allocating the pipe before consulting the cap meant a FULL cap on an fd-exhausted host
+    raised EMFILE instead of taking the DEVNULL path -- the branch that exists to survive
+    exhaustion needing the very resource it is meant to do without (codex, #155).
+    """
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+    monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 1)
+
+    first = gs._StderrSink()                       # fills the only slot
+    try:
+        monkeypatch.setattr(
+            gs.os, "pipe", lambda: (_ for _ in ()).throw(OSError(24, "Too many open files"))
+        )
+        degraded = gs._StderrSink()                # full cap AND no descriptors
+
+        assert degraded.degraded, "a full cap on an fd-exhausted host must still degrade"
+        assert degraded.tail() == ""
+        degraded.close_write()
+    finally:
+        first.close_write()
+
+
+def test_a_reservation_is_taken_before_any_allocation(monkeypatch):
+    """Concurrent restores must not each hold a pipe before any reaches the lock, or peak
+    descriptor use exceeds the cap even though the cap itself holds."""
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    monkeypatch.setattr(gs, "_LIVE_SINKS", [])
+    monkeypatch.setattr(gs, "_MAX_LIVE_SINKS", 2)
+
+    order: list[str] = []
+    real_pipe = gs.os.pipe
+
+    def _pipe():
+        order.append("pipe")
+        return real_pipe()
+
+    real_append = list.append
+
+    class _Watched(list):
+        def append(self, item):
+            order.append("reserve")
+            return real_append(self, item)
+
+    monkeypatch.setattr(gs, "_LIVE_SINKS", _Watched())
+    monkeypatch.setattr(gs.os, "pipe", _pipe)
+
+    sink = gs._StderrSink()
+    try:
+        assert order[:2] == ["reserve", "pipe"], (
+            f"allocation happened before the reservation: {order}"
+        )
+    finally:
+        sink.close_write()

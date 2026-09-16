@@ -6,7 +6,6 @@ race that looks exactly like object-store flakiness.
 """
 from pathlib import Path
 
-import pytest
 
 from blastbox.host.blobs.base import BlobFetchError
 

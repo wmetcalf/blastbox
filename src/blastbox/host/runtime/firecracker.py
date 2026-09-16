@@ -49,6 +49,8 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+from blastbox.errors import HostDiskTimeout
 from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
@@ -411,6 +413,32 @@ def firecracker_available(cfg: FCConfig | None = None) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def disk_timeout_s() -> float:
+    """Bound (seconds) for the host disk helpers this tier shells out to.
+
+    Generous on purpose -- `mkfs.ext4` on a multi-GiB image and a non-reflink copy of a
+    snapshot both legitimately take a while. The point is that they are BOUNDED: each runs on
+    the per-slot spawn path, where an unbounded external command turns a stalled filesystem
+    into a spawn thread that never returns.
+    """
+    from blastbox.host.runtime.env_knobs import positive_float_env
+
+    return positive_float_env(os.environ, "BLASTBOX_FC_DISK_TIMEOUT_S", 600.0)
+
+
+def run_disk_helper(argv: list[str]) -> None:
+    """Run a host STORAGE helper, bounded, raising the narrow HostDiskTimeout on expiry.
+
+    Shared by mkfs.ext4 and the outdisk copy so the bound and the ATTRIBUTION are decided in
+    one place: a stalled disk must not be charged to the tier, and a tier timeout must not be
+    excused as a stalled disk.
+    """
+    try:
+        subprocess.run(argv, check=True, capture_output=True, timeout=disk_timeout_s())
+    except subprocess.TimeoutExpired as exc:
+        raise HostDiskTimeout(cmd=exc.cmd, timeout=exc.timeout) from exc
+
+
 def make_ext4(path: Path, size_mib: int) -> None:
     """Create a sparse ext4 image at ``path`` of ``size_mib`` MiB.
 
@@ -434,7 +462,7 @@ def make_ext4(path: Path, size_mib: int) -> None:
     file_path = Path(path)
     with open(file_path, "wb") as f:
         f.truncate(size_mib * 1024 * 1024)
-    subprocess.run(
+    run_disk_helper(
         [
             "mkfs.ext4",
             "-q",
@@ -444,9 +472,7 @@ def make_ext4(path: Path, size_mib: int) -> None:
             "-m",
             "0",
             str(file_path),
-        ],
-        check=True,
-        capture_output=True,
+        ]
     )
 
 
@@ -1128,6 +1154,40 @@ class FirecrackerSlotRuntime:
     # SlotRuntime protocol
     # ------------------------------------------------------------------
 
+    @property
+    def _stranded_scratch(self) -> list[str]:
+        """Slot dirs whose cleanup failed, awaiting a retry. Lazily created so instances built
+        without __init__ (test doubles, and the pool's own construction paths) still work."""
+        got = getattr(self, "_stranded_scratch_paths", None)
+        if got is None:
+            got = []
+            self._stranded_scratch_paths = got
+        return got
+
+    @property
+    def _stranded_lock(self) -> threading.Lock:
+        """Guards the ledger above. spawn() is called concurrently whenever
+        BLASTBOX_POOL_SPAWN_CONCURRENCY > 1, and snapshot-then-clear is not atomic: one thread
+        could clear a path another had just appended, losing the only reference to a partial
+        outdisk dir for good (codex, #154)."""
+        got = getattr(self, "_stranded_lock_obj", None)
+        if got is None:
+            got = threading.Lock()
+            self._stranded_lock_obj = got
+        return got
+
+    def _sweep_stranded_scratch(self) -> None:
+        """Retry removals that failed earlier. Never raises: a sweep must not break a spawn."""
+        with self._stranded_lock:
+            pending = list(self._stranded_scratch)
+            self._stranded_scratch.clear()          # take them ATOMICALLY, not snapshot-then-clear
+        for path in pending:
+            errs: list[str] = []
+            shutil.rmtree(path, onerror=lambda fn, p, exc: errs.append(str(p)))
+            if errs:
+                with self._stranded_lock:
+                    self._stranded_scratch.append(path)   # still stuck; retry next spawn
+
     def spawn(self) -> Slot:
         """Create a scratch dir, write fc-config.json, launch Firecracker.
 
@@ -1142,6 +1202,11 @@ class FirecrackerSlotRuntime:
         """
         import uuid
 
+        # BEFORE anything else: retry scratch dirs whose cleanup failed on an earlier spawn.
+        # A storage incident that stops mkfs also stops the rmtree that follows it, and
+        # nothing else in this tier would ever come back for them.
+        self._sweep_stranded_scratch()
+
         slot_id = str(uuid.uuid4())
         slot_dir = self._scratch_root / slot_id
         output_dir = slot_dir / "out"
@@ -1155,8 +1220,30 @@ class FirecrackerSlotRuntime:
 
         # Create the per-slot output disk.  The guest mounts this as vdb and
         # writes results here; the host reads it via rdump_ext4 after exit.
+        #
+        # CLEAN UP ON FAILURE. Nothing else can: the exception escapes before a Slot exists,
+        # so the pool has nothing to hand reap(), and every retry would leave another
+        # directory and a partially formatted image behind -- unbounded on a persistently
+        # slow disk, or under a disk timeout set below the real formatting time (codex, #154).
         outdisk_path = slot_dir / "outdisk.ext4"
-        make_ext4(outdisk_path, self._cfg.fc_outdisk_mib)
+        try:
+            make_ext4(outdisk_path, self._cfg.fc_outdisk_mib)
+        except BaseException:
+            # ...and if the REMOVAL fails too -- EIO, EROFS, the same storage incident that
+            # made mkfs time out -- record the path. There is no orphan sweep for the plain FC
+            # tier, so `ignore_errors=True` alone would drop the only reference to a partial
+            # outdisk dir and every retry would leave another (codex, #154). The next spawn
+            # retries them, which is where the disk has had time to recover.
+            errs: list[str] = []
+            shutil.rmtree(slot_dir, onerror=lambda fn, p, exc: errs.append(str(p)))
+            if errs:
+                with self._stranded_lock:
+                    self._stranded_scratch.append(str(slot_dir))
+                _log.warning(
+                    "firecracker: could not remove partial slot dir %s; retaining it for the "
+                    "next spawn's sweep", slot_dir,
+                )
+            raise
 
         # Build the vsock UDS path.  FC creates <uds_path> for the host side
         # and <uds_path>_<port> for guest connects; we give FC ownership.

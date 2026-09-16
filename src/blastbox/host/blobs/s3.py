@@ -15,7 +15,8 @@ import gzip
 import hashlib
 import io
 import os
-from collections.abc import Callable, Mapping
+import time
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 import threading
 from pathlib import Path, PurePosixPath
@@ -36,6 +37,55 @@ from blastbox.observability import get_logger
 _log = get_logger("blastbox.blobs.s3")
 
 _CHUNK = 1024 * 1024
+
+# DeleteObjects accepts at most 1000 keys per call. list_objects_v2 pages happened to
+# respect that on their own; list_object_versions returns versions AND delete markers,
+# whose combined count can exceed one page's worth, so batch explicitly.
+_DELETE_BATCH = 1000
+
+# How long a bucket's versioning status is trusted. Short enough that enabling
+# versioning on a live bucket is picked up without restarting every dispatcher,
+# long enough that a retention sweep deleting thousands of jobs does not add a
+# GetBucketVersioning per job.
+_VERSIONING_TTL_S = 300.0
+
+# Error codes that mean "this principal/endpoint will NEVER answer this call", as
+# opposed to "not right now". Only these justify falling back to a keyless delete:
+# a throttle or timeout says nothing about whether the bucket is versioned, and
+# treating it as unversioned would silently retain versions on one that is.
+# NotImplemented/MethodNotAllowed cover S3-compatible stores without the versioning
+# APIs at all.
+_PERMANENT_DENIALS = frozenset({
+    "AccessDenied", "AllAccessDisabled", "Forbidden", "403",
+    "InvalidAccessKeyId", "SignatureDoesNotMatch", "UnauthorizedAccess",
+    "NotImplemented", "MethodNotAllowed",
+})
+
+
+def _is_permanent_denial(exc: BaseException) -> bool:
+    """Whether ``exc`` is a settled refusal rather than a transient failure."""
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return False
+    error = response.get("Error") or {}
+    if str(error.get("Code")) in _PERMANENT_DENIALS:
+        return True
+    status = (response.get("ResponseMetadata") or {}).get("HTTPStatusCode")
+    return status in (401, 403, 405, 501)
+
+
+def _batched(
+    items: Iterable[dict[str, str]], size: int
+) -> Iterator[list[dict[str, str]]]:
+    """Yield ``items`` in lists of at most ``size`` (itertools.batched is 3.12+)."""
+    batch: list[dict[str, str]] = []
+    for item in items:
+        batch.append(item)
+        if len(batch) >= size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
 # put_output costs one round-trip PER OBJECT, and a result tree is often hundreds of them.
 # Measured on the fleet (200 corpus documents, FC tier, 24 slots): the upload was 39.7% of all
@@ -80,6 +130,21 @@ class S3BlobStore:
 
         e = os.environ if env is None else env
         parsed = urlparse(url)
+        # REJECT user-info rather than quietly carrying it. `urlparse` puts everything before the
+        # `@` into netloc, so `s3://key:secret@bucket/prefix` yields a BUCKET of
+        # "key:secret@bucket" -- which is not a bucket. Every request then goes to an invalid name
+        # and fails at read time, while the canary's identity comparison (which redacts for display
+        # and for the persisted fingerprint) sees the same "bucket" on both sides and reports
+        # agreement. Redacting the display was necessary -- that string is written into the job
+        # queue -- but it is not sufficient: it made a broken configuration look healthy. Credentials
+        # belong in AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, not in the URL.
+        if "@" in parsed.netloc:
+            raise ValueError(
+                "BLASTBOX_BLOB_URL must not carry credentials: "
+                f"{parsed.scheme}://***@{parsed.netloc.rsplit('@', 1)[-1]}{parsed.path} — the text "
+                "before '@' becomes part of the bucket name and every request fails against it. "
+                "Put credentials in AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (or the instance "
+                "role) and give this variable the bucket alone.")
         self._bucket = parsed.netloc
         self._prefix = parsed.path.strip("/")
         self._job_root = Path(job_root)
@@ -92,6 +157,10 @@ class S3BlobStore:
         )
         self._upload_pool: ThreadPoolExecutor | None = None
         self._upload_pool_lock = threading.Lock()
+        # Resolved on first delete (one GetBucketVersioning), then reused for
+        # _VERSIONING_TTL_S. See _bucket_is_versioned.
+        self._versioned: bool | None = None
+        self._versioned_at: float = 0.0
         # botocore's connection pool defaults to 10. Left alone, a fan-out wider than that
         # silently BLOCKS on the pool rather than erroring -- the change would look deployed,
         # measure as no faster, and give no clue why. Size it to the SHARED upload budget, which
@@ -343,6 +412,109 @@ class S3BlobStore:
             return False
         return True
 
+    def _bucket_is_versioned(self) -> bool:
+        """Whether deletes on this bucket need an explicit ``VersionId``.
+
+        ``Suspended`` counts as versioned: suspending stops NEW versions but keeps
+        every version created while it was enabled, so a keyless delete there still
+        leaves those bytes behind.
+
+        The answer is cached for ``_VERSIONING_TTL_S`` rather than forever: a store
+        outlives a bucket's configuration, and versioning enabled after the first
+        delete would otherwise keep taking the keyless path until a restart.
+
+        If the status cannot be read (typically ``GetBucketVersioning`` not granted)
+        this assumes VERSIONED, and does NOT cache that answer. That is the safe default for an operation whose whole
+        contract is that the bytes are gone: guessing "unversioned" would silently
+        retain data an operator asked to delete, which is the failure this method
+        exists to prevent. The cost of guessing wrong is a wider listing call, not
+        data loss.
+        """
+        now = time.monotonic()
+        if self._versioned is not None and (now - self._versioned_at) < _VERSIONING_TTL_S:
+            return self._versioned
+        try:
+            status = self._s3.get_bucket_versioning(Bucket=self._bucket).get("Status")
+        except Exception:  # noqa: BLE001 — any failure to read status is "assume versioned"
+            _log.warning(
+                "could not read bucket versioning for %s; assuming versioned so deletes "
+                "remove every version (grant s3:GetBucketVersioning to silence this)",
+                self._bucket,
+            )
+            # NOT cached. A transient failure (throttle, DNS, timeout) must not pin a
+            # long-lived store into the versioned path until the process restarts.
+            return True
+        self._versioned = status in ("Enabled", "Suspended")
+        self._versioned_at = now
+        return self._versioned
+
+    def _current_keys_page(self, prefix: str) -> list[dict[str, str]]:
+        """One page of CURRENT keys — the keyless delete, correct on an unversioned bucket."""
+        page = self._s3.list_objects_v2(
+            Bucket=self._bucket, Prefix=prefix, MaxKeys=_DELETE_BATCH
+        )
+        return [{"Key": o["Key"]} for o in page.get("Contents", [])]
+
+    def _next_delete_page(self, prefix: str) -> list[dict[str, str]]:
+        """One page of delete targets under ``prefix``, newest-listing first.
+
+        Deliberately ONE page, re-listed from scratch on each call rather than
+        paginated. Two reasons:
+
+        * Deleting while paginating walks a listing that is being mutated
+          underneath: the continuation token names an object the previous batch
+          just removed, and the remainder is skipped. That silently left 100 of
+          1100 objects behind in test.
+        * Materialising the whole listing first fixes that but holds a key plus
+          version id for every historical version at once, and version history is
+          precisely the unbounded thing here. Re-listing bounds the working set to
+          one page while keeping every entry reachable.
+
+        Delete markers are included deliberately: leaving them behind keeps a
+        tombstone for a job whose bytes are gone, and a marker left by an earlier
+        keyless delete is exactly the residue this fixes.
+
+        Noncurrent versions and delete markers are ordered BEFORE the current
+        version. If a delete partially fails (Object Lock, an IAM condition), the
+        object stays visible in an ordinary listing instead of the current version
+        vanishing while older bytes remain -- the state that looks deleted but is
+        not.
+        """
+        if not self._bucket_is_versioned():
+            return self._current_keys_page(prefix)
+
+        try:
+            page = self._s3.list_object_versions(
+                Bucket=self._bucket, Prefix=prefix, MaxKeys=_DELETE_BATCH
+            )
+        except Exception as exc:  # noqa: BLE001 — typically ListBucketVersions not granted
+            if self._versioned is not None or not _is_permanent_denial(exc):
+                # Either the bucket really does report versioning, or this failure is
+                # TRANSIENT (throttle, timeout, 5xx) and says nothing about whether it
+                # is. Both cases must propagate: deleting the current key here would
+                # write a marker over bytes we were asked to remove and report a
+                # reclaim that did not happen.
+                raise
+            # We never established that this bucket IS versioned (_bucket_is_versioned
+            # only assumed so because the status read failed), AND this refusal is
+            # permanent, not transient. An UNVERSIONED bucket whose
+            # policy grants neither GetBucketVersioning nor ListBucketVersions worked
+            # fine before this change, and must keep working: fall back to the keyless
+            # delete that has always been correct there. Loudly, because if the bucket
+            # IS versioned this silently retains noncurrent versions -- exactly the bug
+            # this method exists to fix.
+            _log.warning(
+                "cannot read bucket versioning OR list versions for %s (%s); falling back "
+                "to a keyless delete. If this bucket is versioned, noncurrent versions are "
+                "being RETAINED — grant s3:GetBucketVersioning (cheap, read-only) or "
+                "s3:ListBucketVersions + s3:DeleteObjectVersion.",
+                self._bucket, type(exc).__name__,
+            )
+            return self._current_keys_page(prefix)
+        entries = [*page.get("Versions", []), *page.get("DeleteMarkers", [])]
+        entries.sort(key=lambda e: bool(e.get("IsLatest")))
+        return [{"Key": e["Key"], "VersionId": e["VersionId"]} for e in entries]
+
     def delete_job(self, job_id: str) -> None:
         """Drop this job's RESULTS only.
 
@@ -361,16 +533,28 @@ class S3BlobStore:
         or the ingress DELETE route) leaves the job retryable instead.
         """
         prefix = self._key("results", job_id) + "/"
-        paginator = self._s3.get_paginator("list_objects_v2")
-        errors: list[dict] = []
-        for page in paginator.paginate(Bucket=self._bucket, Prefix=prefix):
-            keys = [{"Key": o["Key"]} for o in page.get("Contents", [])]
-            if not keys:
-                continue
-            response = self._s3.delete_objects(Bucket=self._bucket, Delete={"Objects": keys})
-            errors.extend(response.get("Errors") or [])
+        errors: dict[tuple, dict] = {}
+        # Take one page, delete it, then LIST AGAIN from the start. See
+        # _next_delete_page for why this is not a paginate-and-delete loop. The pass
+        # stops as soon as one makes no progress, so an undeletable object cannot
+        # spin here -- it lands in `errors` and the raise below reports it.
+        while True:
+            targets = self._next_delete_page(prefix)
+            if not targets:
+                break
+            deleted = 0
+            for batch in _batched(targets, _DELETE_BATCH):
+                response = self._s3.delete_objects(
+                    Bucket=self._bucket, Delete={"Objects": batch}
+                )
+                failed = response.get("Errors") or []
+                for err in failed:
+                    errors[(err.get("Key"), err.get("VersionId"))] = err
+                deleted += len(batch) - len(failed)
+            if deleted == 0:
+                break
         if errors:
-            first = errors[0]
+            first = next(iter(errors.values()))
             raise BlobFetchError(
                 f"delete_job partially failed for {job_id}: {len(errors)} object(s) "
                 f"undeleted (first: key={first.get('Key')!r} code={first.get('Code')!r})"

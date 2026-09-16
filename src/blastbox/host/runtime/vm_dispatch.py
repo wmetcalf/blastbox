@@ -22,6 +22,7 @@ import json
 import contextlib
 import inspect
 import logging
+import math
 import os
 import threading
 import time
@@ -153,6 +154,9 @@ class VmJobDispatcher:
         # to run it. interval<=0 disables. orphan_timeout: a RUNNING job not heartbeat-refreshed in
         # this long has a dead owner → FAIL it (keep it comfortably above heartbeat_s).
         self._maintenance_interval_s = float(maintenance_interval_s)
+        # Set by the CLI after construction; None = no periodic self-test.
+        self._canary_cb: "Callable[[], None] | None" = None
+        self._canary_interval_s = 0.0
         self._orphan_timeout_s = max(self._heartbeat_s * 4, float(orphan_timeout_s))
         # sole_owner: this is the ONLY dispatcher on the store (VM-only deployment, no cold/container
         # dispatcher). Then orphan recovery can also reclaim a stale RUNNING job that was claimed but
@@ -965,19 +969,122 @@ class VmJobDispatcher:
             logger.warning("vm_dispatch: stale-queued sweep failed", exc_info=True)
 
     def _maintenance_loop(self) -> None:
-        while not self._stop.wait(self._maintenance_interval_s):
-            self._run_maintenance()
+        last_canary = last_maint = time.monotonic()
+        while True:
+            # Sleep to the EARLIER of the two deadlines. Waiting a fixed maintenance interval
+            # quantised the canary to it: with the CLI's 60s default, BLASTBOX_CANARY_INTERVAL_S=5
+            # ran about every 60s and 90 ran about every 120s. A configured cadence that silently
+            # becomes a different cadence is its own small lie.
+            now = time.monotonic()
+            waits = []
+            if self._maintenance_interval_s > 0:
+                waits.append(self._maintenance_interval_s - (now - last_maint))
+            if self._canary_cb is not None and self._canary_interval_s > 0:
+                waits.append(self._canary_interval_s - (now - last_canary))
+            if not waits:
+                return
+            if self._stop.wait(max(0.05, min(waits))):
+                return
+            now = time.monotonic()
+            # The periodic store self-test rides the maintenance timer, for the same reason
+            # maintenance does: one place, on a cadence, off the claim path. Without it the
+            # network tiers (aws/static/cascade) probed the blob store once at startup and never
+            # again -- BLASTBOX_CANARY_INTERVAL_S was accepted and then silently ignored for
+            # exactly the deployments whose results always travel through a shared store.
+            cb, every = self._canary_cb, self._canary_interval_s
+            if cb is not None and every > 0 and time.monotonic() - last_canary >= every:
+                try:
+                    cb()
+                except Exception:  # noqa: BLE001 — advisory once serving; never kill the loop
+                    logger.warning("vm_dispatch: canary raised; continuing to serve", exc_info=True)
+                # Re-stamped from COMPLETION: the round-trip can block for the store's own
+                # timeout, so stamping first would re-probe every pass precisely when the store
+                # is least able to answer.
+                last_canary = time.monotonic()
+            if self._maintenance_interval_s > 0 and now - last_maint >= self._maintenance_interval_s:
+                # RE-STAMPED FROM COMPLETION, for the same reason as the canary three lines above --
+                # a rule that was applied to the canary and not to its sibling. `now` predates the
+                # wait, so stamping it here dates the deadline from BEFORE a sweep that can run for
+                # minutes: retention retries every pending upload through the same store, so when
+                # the store is down a sweep routinely outlasts the interval. The next pass then
+                # finds the deadline already overdue, min(waits) goes negative, the loop waits its
+                # 50ms floor and sweeps again -- continuous retries against an unhealthy store,
+                # with no interval at all, produced by the interval logic.
+                self._run_maintenance()
+                last_maint = time.monotonic()
+
+    def _startup_gate(self) -> None:
+        """Prove this dispatcher can store a result before it claims a job.
+
+        The same sequence the CLI performs, owned by the dispatcher so a programmatic caller cannot
+        skip it: identity log, store coherence, the round-trip probe, then blob-target registration
+        -- registration LAST, because it persists and a target that never proved it works must not
+        become the one every other process has to match.
+        """
+        blobs = getattr(self, "_blobs", None)
+        if blobs is None:
+            return
+        from blastbox.host.canary import (
+            blob_roundtrip,
+            check_blob_target_agreement,
+            check_sample_read_access,
+            check_store_coherence,
+            describe_blob_store,
+        )
+        from blastbox.host.cli import _canary_settings, _require_shared_blob_store
+
+        enabled, interval = _canary_settings()
+        logger.info("canary.blob_store %s", describe_blob_store(blobs))
+        check_store_coherence(self._store, blobs, self._job_root,
+                              require_shared=_require_shared_blob_store())
+        # Bound unconditionally: binding it inside the canary branch and reading it below is the
+        # UnboundLocalError this branch already shipped once, in the CLI, for the same reason.
+        key = "|".join((str(getattr(self, "_worker_tier", "") or ""), str(self._job_root)))
+        if enabled:
+            logger.info("canary.ok %s", blob_roundtrip(blobs, key_hint=key,
+                                                       scratch_dir=self._job_root))
+            # The round-trip only exercises results/. A policy that grants those and denies the
+            # samples prefix passes it and then fails every job at get_sample.
+            check_sample_read_access(blobs, role="dispatcher", scratch_dir=self._job_root)
+        check_blob_target_agreement(self._store, blobs, role="dispatcher")
+        # ...and the PERIODIC re-check, which the CLI used to install by reaching in and setting
+        # these fields from outside. A programmatic dispatcher got the startup probe and then never
+        # re-checked, against a documented cadence -- the same shape as the startup gate itself
+        # living in one caller. Only when the canary is enabled, and only if nobody has already
+        # wired a callback (the CLI sets its own, richer one before calling run()).
+        if enabled and interval > 0 and getattr(self, "_canary_cb", None) is None:
+            def _periodic(_b=blobs, _k=key, _jr=self._job_root) -> None:
+                logger.info("canary.ok %s", blob_roundtrip(_b, key_hint=_k, scratch_dir=_jr))
+
+            self._canary_cb = _periodic
+            self._canary_interval_s = interval
 
     def run(self) -> None:
         """Block, claiming + processing jobs on ``concurrency`` threads until :meth:`stop`. Also runs
         periodic maintenance (retention + orphan recovery) so a VM-only deployment doesn't accumulate
         terminal output dirs / leave crashed claims RUNNING forever."""
+        # THE GATE LIVES HERE, not only in the CLI. `build_remote_vm_dispatcher(...)` is a supported
+        # factory and constructing VmJobDispatcher directly is supported too, so an embedder calling
+        # run() got no store-coherence enforcement, no blob-target agreement and no round-trip -- it
+        # claimed its first job immediately and failed it, against a documented guarantee that every
+        # dispatcher variant gates before its first claim. Putting it in run() makes the guarantee a
+        # property of the dispatcher rather than of one caller.
+        #
+        # Idempotent: the CLI path runs the same checks before calling run(), and re-running them is
+        # a re-registration of the same identity plus at most one extra round-trip, both cheap and
+        # both harmless. Cheaper than the alternative, which is two entrypoints that must be kept in
+        # step by hand -- a shape this branch has now been bitten by five times.
+        self._startup_gate()
         logger.info("vm_dispatch: claiming from %s (%d workers)", type(self._store).__name__,
                     self._concurrency)
         with ThreadPoolExecutor(max_workers=self._concurrency + 1, thread_name_prefix="vmclaim") as ex:
             for _ in range(self._concurrency):
                 ex.submit(self._worker_loop)
-            if self._maintenance_interval_s > 0:
+            # EITHER timer is reason enough to run the loop. Gating solely on maintenance meant
+            # a deployment that disables it (the constructor explicitly supports that) silently
+            # got no periodic canary either, however it was configured.
+            if self._maintenance_interval_s > 0 or (
+                    self._canary_cb is not None and self._canary_interval_s > 0):
                 ex.submit(self._maintenance_loop)
             try:
                 self._stop.wait()
@@ -1080,10 +1187,18 @@ _RETRY_SLOT_COOLDOWN_S = 3.0   # how long a slot that just failed to resume is p
 
 
 def _claim_resumable_slot(pool: Any, timeout_s: float, *,
+                          thaw_budget_s: float | None = None,
                           clock: "Callable[[], float]" = time.monotonic) -> Any:
     """Claim a warm slot and resume it, trying OTHER slots when one can't be woken.
 
     Returns the claimed+resumed slot, or None if the window closed without one.
+
+    ``timeout_s`` bounds how long we SCAN for a claimable slot. ``thaw_budget_s`` -- the tier's own
+    ``resume_timeout_s`` -- is the separate budget a claimed slot gets to wake up in, deliberately
+    NOT taken from the claim window (issue #81). One fair thaw may therefore overrun the claim
+    window; the loop's own deadline check then ends the scan, so the worst case is bounded at
+    roughly one claim window plus one thaw, and the job requeues rather than convicting a worker
+    that was merely slow.
 
     issue #77 round 2: this loop used to rely on a failed resume having REMOVED the slot from the
     pool (``release(dirty=True)``), so "try the next one" happened for free. Making the UNKNOWN
@@ -1145,18 +1260,46 @@ def _claim_resumable_slot(pool: Any, timeout_s: float, *,
                 continue
             if sid is not None:
                 tried[sid] = clock()
-            remaining_for_resume = deadline - clock()
-            if remaining_for_resume <= 0:
-                # The window closed while we were probing. Hand the slot back untouched rather than
-                # starting a resume we cannot afford -- attempting one with no budget is how a
-                # never-probed healthy slot got destroyed (issue #77 round 5).
+            # THE THAW IS NOT PART OF THE CLAIM WINDOW (issue #81).
+            #
+            # This used to hand the resume whatever was LEFT of the claim window. ec2-hibernate
+            # declares resume_timeout_s=180 -- its own statement of how long a healthy hibernated
+            # instance may take to thaw -- while warm_claim_timeout_s defaults to 60, so the tier
+            # could NEVER receive the budget it says it needs. Every window was truncated, and a
+            # truncated window ending in silence was then read as a confirmed failure and the
+            # instance terminated. Three attempts to fix that in the VERDICT logic each produced
+            # the mirror image of the previous bug, because the rule cannot distinguish "the agent
+            # is dead" from "the agent needed more time than we gave it" when we never give it the
+            # time it declared. It is a configuration contradiction, not a classification problem.
+            #
+            # So the thaw gets its OWN budget, granted outside the claim window: the slot stays
+            # ASSIGNED and the job waits. The claim window keeps bounding how long we SCAN for a
+            # slot; it no longer bounds how long a worker is allowed to wake up.
+            # ...but a thaw may not START outside the window either. pool.claim BLOCKS to its own
+            # deadline and never returns early, so it can hand back a slot exactly as the scan
+            # window closes -- and the declared-budget branch then began a fresh resume_timeout_s
+            # (180s for ec2-hibernate) for a caller whose window was already gone. The
+            # no-declared-budget branch refused precisely that, so whether the guard applied
+            # depended on which TIER you were on rather than on the clock. Overrunning the window
+            # is the deliberate part; starting after it is not.
+            remaining_window = deadline - clock()
+            if remaining_window <= 0:
+                # Hand the slot back untouched rather than starting a resume we cannot afford --
+                # attempting one with no budget is how a never-probed healthy slot got destroyed
+                # (issue #77 round 5).
                 unclaim = getattr(pool, "unclaim", None)
                 if callable(unclaim):
                     with contextlib.suppress(Exception):
                         unclaim(slot)
                 break
+            if thaw_budget_s is not None:
+                budget_for_resume = float(thaw_budget_s)
+            else:
+                # No declared thaw budget (a tier with no resume seam, or a fast one): unchanged --
+                # whatever is left of the window, which the check above has proven is positive.
+                budget_for_resume = remaining_window
             try:
-                _resume_on_claim(pool, slot, budget_s=remaining_for_resume)
+                _resume_on_claim(pool, slot, budget_s=budget_for_resume)
                 return slot
             except Exception as exc:  # noqa: BLE001 -- dead slots are already retired dirty by
                 last_exc = exc        # _resume_on_claim; UNKNOWN ones were handed back. Try another.
@@ -1225,11 +1368,42 @@ def build_remote_vm_dispatcher(
     _resume_to = getattr(getattr(pool.runtime, "cfg", None), "resume_timeout_s", None)
     if _resume_to is None:
         _resume_to = getattr(pool.runtime, "resume_timeout_s", None)
+    if _resume_to is not None and not math.isfinite(float(_resume_to)):
+        # Sanitize ONCE, here, because _resume_to feeds THREE consumers -- the sizing warning
+        # below, _thaw_budget, and the _validate_timeout_s watchdog allowance -- and a non-finite
+        # value breaks each differently. `inf > 0` is True, so it passed the thaw guard and became
+        # an infinite resume deadline; it then also made _validate_timeout_s infinite, which
+        # disables the heartbeat watchdog outright -- a wedged resume is then unrecoverable rather
+        # than merely slow. Guarding only the thaw site would have left that second one live.
+        # Treat it as UNDECLARED: that path is bounded (the claim remainder) and recoverable.
+        logger.warning(
+            "vm_dispatch: %s declares a non-finite resume_timeout_s=%r -- ignoring it; the thaw "
+            "falls back to the claim remainder. A resume budget must be a finite number of seconds.",
+            tier, _resume_to)
+        _resume_to = None
     if _resume_to is not None and float(_resume_to) >= worker_timeout_s:
-        logger.warning("vm_dispatch: resume_timeout_s=%.0f >= worker_timeout_s=%.0f -- lower "
-                       "BLASTBOX_LAMBDA_SNAPSTART_RESUME_TIMEOUT_S below BLASTBOX_WORKER_TIMEOUT_S so a "
-                       "slow resume can't outlast the job budget and leak a live slot", float(_resume_to),
-                       worker_timeout_s)
+        # Informational, not a defect. The premise -- "a slow wake can abandon the claim thread with
+        # a live billing slot" -- was true when the thaw ran on the claim window's remainder; the
+        # thaw now has its own budget and validate_timeout_s reserves the FULL resume_timeout_s on
+        # top of the job budget, so the watchdog covers it whatever its size (issue #81).
+        logger.debug("vm_dispatch: resume_timeout_s=%.0f >= worker_timeout_s=%.0f -- supported; the "
+                     "thaw is budgeted separately and the watchdog allowance already reserves it",
+                     float(_resume_to), worker_timeout_s)
+    # The thaw budget the claim seam grants OUTSIDE the claim window (issue #81).
+    # Granted for ANY declared resume_timeout_s, including one at or above worker_timeout_s.
+    # Withholding it there did not withhold a budget -- it fell back to the CLAIM REMAINDER (see
+    # _claim_resumable_slot), i.e. exactly the truncation this change exists to remove, and the
+    # strictly worse of the two options: a hibernate tier resuming inside a 60s remainder gets one
+    # full-duration silent probe while describe still says `running`, which is `silent_while_up` in
+    # aws_worker.resume -- a CONVICTING verdict -- so the healthy parked instance is released dirty
+    # and terminated. The thaw cannot eat the job either way: detonation is bounded separately by
+    # timeout=worker_timeout_s, and validate_timeout_s below already reserves the FULL _resume_to on
+    # top of the claim wait and the job budget, whatever its size. Sizing them backwards is still
+    # worth telling the operator about, but the answer to a badly sized budget is not to substitute
+    # an even smaller one.
+    _thaw_budget: float | None = None
+    if _resume_to is not None and float(_resume_to) > 0:
+        _thaw_budget = float(_resume_to)
     # Disposable AWS tiers have no recycle(), so make_remote_validate's finally release() runs a
     # SYNCHRONOUS terminate-instances/terminate-microvm (bounded by the aws-cli timeout) BEFORE validate()
     # returns -- i.e. INSIDE the heartbeat watchdog. Budget that cleanup too, else a job that used most of
@@ -1269,7 +1443,10 @@ def build_remote_vm_dispatcher(
         # job's input/content. So REQUEUE (NoWarmSlot), don't FAIL+delete-input: AWS auto-terminates
         # parked slots in correlated batches, so a whole claim window can be stale at once and that
         # must not fail jobs.
-        slot = _claim_resumable_slot(pool, warm_claim_timeout_s)
+        # Hand the tier's DECLARED thaw budget through, separately from the claim window (issue
+        # #81). _resume_to is resume_timeout_s: for a cascade, the max across its wrapped tiers,
+        # which is exactly the "can this tier ever get a fair window?" number.
+        slot = _claim_resumable_slot(pool, warm_claim_timeout_s, thaw_budget_s=_thaw_budget)
         if slot is None:
             raise NoWarmSlot("no warm slot available within claim timeout")   # capacity -> REQUEUE
         return slot
@@ -1390,14 +1567,16 @@ def build_remote_vm_dispatcher(
     if _tier_resume is None:
         _tier_resume = getattr(pool.runtime, "resume_timeout_s", None)
     if _tier_resume is not None and float(_tier_resume) > float(warm_claim_timeout_s):
-        logger.warning(
-            "vm_dispatch: warm_claim_timeout_s=%.0fs cannot honour the %s tier's declared "
-            "resume_timeout_s=%.0fs -- a slot that legitimately takes longer than the claim window "
-            "is judged on a window it was never given. NOTE the resume budget is "
-            "min(resume_timeout_s, remaining claim window), so RAISING warm_claim_timeout_s alone "
-            "does not close the gap: the tier's own resume_timeout_s must come down to at or below "
-            "the claim window, or the claim path must stop truncating it. Tracking in issue #81.",
-            float(warm_claim_timeout_s), tier, float(_tier_resume),
+        # Was a WARNING whose formula ("min(resume_timeout_s, remaining claim window)") is no longer
+        # true and whose advice -- lower the tier's resume_timeout_s -- now directly SHRINKS
+        # _thaw_budget, i.e. re-creates the truncation it was warning about. It also fired on the
+        # shipped default (180 vs 60) at every dispatcher start. This shape is supported now.
+        logger.debug(
+            "vm_dispatch: %s declares resume_timeout_s=%.0fs against warm_claim_timeout_s=%.0fs -- "
+            "expected; the thaw is granted in full outside the claim window (issue #81), so a slow "
+            "wake is bounded at roughly one claim window plus one thaw and the job requeues rather "
+            "than convicting a worker that was merely slow.",
+            tier, float(_tier_resume), float(warm_claim_timeout_s),
         )
 
     validate = make_remote_validate(

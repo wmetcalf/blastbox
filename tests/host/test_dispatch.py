@@ -4132,7 +4132,7 @@ def test_the_escalating_backoff_is_local_and_the_store_defer_stays_short():
     assert shared[-1] == shared[8], "the fleet-wide defer must stop growing"
     assert local[0] < local[8], "this node's own re-examination interval must escalate"
     assert max(local) == d._egress_defer_cap_s
-    assert all(s <= l for s, l in zip(shared, local)), (
+    assert all(sh <= lo for sh, lo in zip(shared, local)), (
         "telling the store to wait LONGER than this node's own cooldown would make "
         "the escalation pointless and block peers as well"
     )

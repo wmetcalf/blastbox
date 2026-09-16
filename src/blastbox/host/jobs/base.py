@@ -308,6 +308,66 @@ class JobStore(Protocol):
 
 
 @runtime_checkable
+class BlobTargetRegistry(Protocol):
+    """OPTIONAL registry proving every process on one queue writes results to the SAME blob target.
+
+    A SEPARATE Protocol that ``JobStore`` does NOT inherit, for the same reason ``PageHashSearch``
+    is separate: an optional capability folded into the base contract makes every backend that
+    lacks it fail the structural check. All three shipped stores do implement this one, but a
+    third-party store satisfying ``JobStore`` must not be broken by its absence -- consumers gate
+    on ``isinstance(store, BlobTargetRegistry)``.
+
+    WHY THE JOB STORE. `blob_roundtrip` proves a process can write and read ITS OWN store, and
+    `check_store_coherence` catches a private local store behind a shared queue. Neither can prove
+    two processes point at the same place: dispatch on `s3://results/stack-b` and serve on
+    `s3://results/stack-a` both pass their own checks while every finished job 404s -- the original
+    17,626-job incident with a different cause. Proving it needs an identity the two exchange
+    through something they already share, and the queue is the only such thing by definition: if
+    they do not share it, they are not the same deployment.
+
+    CLAIM, NOT GET-THEN-PUT. `claim_blob_target` is a compare-and-swap, not a read followed by a
+    write, because two processes starting together would otherwise both read an empty registry,
+    both write, and neither would see a mismatch -- the check-then-act shape that would defeat the
+    whole check on exactly the boot-storm this is meant to catch. Each backend has the primitive:
+    ``INSERT ... ON CONFLICT DO NOTHING`` on SQL, ``SET NX`` on Redis, the existing lock in memory.
+    """
+
+    def claim_blob_target(self, fingerprint: str) -> "str | None":
+        """Register ``fingerprint`` if none is recorded, and return what is NOW recorded.
+
+        Returns ``fingerprint`` when this process won the race (or re-registered the same value),
+        the OTHER value when a different process got there first, and ``None`` when the registry
+        could not be read back at all.
+
+        NONE IS NOT AGREEMENT. Both backends originally returned the caller's own fingerprint when
+        the read-back came up empty -- "assume I won" -- which the caller cannot distinguish from
+        actually winning. That is reachable: a `clear_blob_target()` (the documented migration
+        remedy, which an operator runs precisely while a mismatched process is crash-looping) can
+        commit between a losing write and the read, and on Redis an `allkeys-*` eviction does the
+        same with nobody involved. The losing process then logs agreement and boots on the wrong
+        target -- the exact silent split this seam exists to prevent, produced by the seam. UNKNOWN
+        gets its own value, and the caller treats it as unverified rather than as a verdict.
+
+        Atomic: concurrent callers must all observe the same winner.
+        """
+        ...
+
+    def get_blob_target(self) -> str | None:
+        """The recorded target, or None. READ-ONLY -- must never register anything.
+
+        Separate from ``claim_blob_target`` because a diagnostic that writes is not a diagnostic:
+        `blastbox blob-target show` reaching for the claim would register its own argument on an
+        empty queue, and every real process would then mismatch it. A command for inspecting the
+        registry must not be able to poison it.
+        """
+        ...
+
+    def clear_blob_target(self) -> None:
+        """Forget the recorded target, for a deliberate migration. See ``blastbox blob-target``."""
+        ...
+
+
+@runtime_checkable
 class PageHashSearch(Protocol):
     """OPTIONAL per-page perceptual-hash index + similarity search surface.
 

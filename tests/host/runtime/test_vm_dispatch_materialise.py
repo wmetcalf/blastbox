@@ -3,7 +3,6 @@
 An unreachable object store is a property of THIS worker's connectivity, not of the
 sample. Failing would permanently discard work because one node's link blipped.
 """
-import pytest
 
 from blastbox.host.blobs.base import BlobFetchError
 from blastbox.host.jobs.base import Job, JobStatus
@@ -20,7 +19,9 @@ class UnreachableBlobStore:
 
 
 class FetchingBlobStore:
-    def __init__(self, data=b"materialised"): self.data = data; self.calls = 0
+    def __init__(self, data=b"materialised"):
+        self.data = data
+        self.calls = 0
     def put_sample(self, sha256, src): ...
     def get_sample(self, sha256, dest):
         self.calls += 1

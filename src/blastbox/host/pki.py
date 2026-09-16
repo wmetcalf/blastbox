@@ -21,7 +21,7 @@ import ipaddress
 import json
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from cryptography import x509

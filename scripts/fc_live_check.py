@@ -73,7 +73,7 @@ def main() -> None:
     shutil.rmtree(scratch, ignore_errors=True)
 
     print("\n=== SUMMARY ===")
-    print(f"  boot:       OK (state WARMING, alive during window)")
+    print("  boot:       OK (state WARMING, alive during window)")
     print(f"  vsock READY: {'OK in %.1fs' % dt if ready else 'FAILED (no READY in 30s)'}")
     print(f"  outdisk:     {'OK marker=%s' % ('ready' in (outdisk_names or [])) if ready else 'n/a'}")
 

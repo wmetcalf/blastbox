@@ -197,32 +197,21 @@ def _detect_docker_runtimes() -> set[str]:
 
 
 def _apparmor_profile_loaded(profile_name: str) -> bool:
-    """Check whether the named AppArmor profile is loaded on the host.
+    """Whether the named AppArmor profile is loaded AND enforcing on the host.
 
-    Two probe paths, in order:
+    This was a third private copy of a check the sandbox backends already shared, and it had
+    drifted in exactly the way a copy does: it matched the securityfs line by NAME, so a
+    profile loaded in `complain` or `unconfined` mode counted as confinement. The container
+    then got `--security-opt apparmor=<profile>` **and** no `_APPARMOR_WARNING`, telling the
+    operator the workload was confined by a policy that only logged (codex, #159).
 
-    1. Explicit operator assertion via ``BLASTBOX_APPARMOR_PROFILES`` env var
-       (comma-separated list of loaded profile names).  Use this when the
-       dispatcher runs inside a container that doesn't bind-mount
-       ``/sys/kernel/security``.
-
-    2. Direct read of ``/sys/kernel/security/apparmor/profiles``.  Works on
-       bare metal and in containers that bind-mount securityfs.
+    Two probe paths, unchanged in intent: an explicit operator assertion via
+    ``BLASTBOX_APPARMOR_PROFILES`` (for a dispatcher in a container with no
+    ``/sys/kernel/security`` mount), else a direct read of securityfs.
     """
-    listed = os.environ.get("BLASTBOX_APPARMOR_PROFILES", "")
-    if listed:
-        names = {x.strip() for x in listed.split(",") if x.strip()}
-        if profile_name in names:
-            return True
-    try:
-        with open("/sys/kernel/security/apparmor/profiles") as f:
-            for line in f:
-                name = line.split(" ", 1)[0].strip()
-                if name == profile_name:
-                    return True
-    except OSError:
-        return False
-    return False
+    from blastbox.worker.sandbox.apparmor import profile_loaded
+
+    return profile_loaded(profile_name)
 
 
 # ---------------------------------------------------------------------------

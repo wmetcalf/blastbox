@@ -4,7 +4,6 @@ consumer that does not exist.
 """
 from pathlib import Path
 
-import pytest
 
 from blastbox.host.blobs.base import upload_output_with_retry
 

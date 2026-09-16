@@ -886,7 +886,6 @@ def test_an_unrelated_accept_does_not_read_as_burying_our_chain(monkeypatch):
     """A narrow ACCEPT for some other source — the CAPE rooter has dozens — cannot
     swallow our traffic. Treating every earlier ACCEPT as fatal reported a
     correctly-ordered node as uncontained."""
-    from blastbox.host import egress_apply as ea
 
     fwd = ("-P FORWARD DROP\n"
            "-A FORWARD -s 192.0.2.7/32 -j ACCEPT\n"              # unrelated, narrow
@@ -964,7 +963,7 @@ def test_the_exit_host_role_is_persisted_so_a_reboot_replays_it():
     and peer-to-sidecar forwarding gone — a fleet-wide egress outage, not one node's."""
     cfg = EgressConfig(mode="global", upstream_gw="10.77.0.1", exit_host=True)
     assert "BLASTBOX_EGRESS_EXIT_HOST=1" in cfg.to_env_lines()
-    back = EgressConfig.from_env(dict(l.split("=", 1) for l in cfg.to_env_lines()))
+    back = EgressConfig.from_env(dict(line.split("=", 1) for line in cfg.to_env_lines()))
     assert back.exit_host is True
 
 
@@ -1035,7 +1034,6 @@ def test_a_leftover_rule_at_the_same_priority_does_not_shadow_ours(monkeypatch):
     """A priority is not unique. Reading only the FIRST rule at 100/101 let a leftover
     from an earlier experiment shadow the correct one, and a fully-enforced node was
     reported uncontained. Observed live on the exit host."""
-    from blastbox.host import egress_apply as ea
 
     rules = ("99:\tfrom all to 10.77.0.0/24 lookup main\n"
              "100:\tfrom 172.20.0.10 lookup bbwg\n"        # stale, listed first
@@ -1180,7 +1178,6 @@ def test_an_exit_hosts_containment_is_checked_despite_mode_local(monkeypatch):
     """The role, not the mode, decides the shape — and an exit host cannot simply be
     coerced to mode=global, because the validator rightly refuses a global config with
     no upstream and an exit host has none."""
-    from blastbox.host import egress_apply as ea
 
     ea_ = _fake_host(monkeypatch, rules="", forward="", chain="")
     ok, why = ea_.enforcement_present(EgressConfig(exit_host=True))

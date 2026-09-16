@@ -9,6 +9,16 @@ them (see *Per-engine params* below), never the whole environment.
 > **How values are read.** Most knobs are read as `os.environ.get(...) or default` — a
 > **set-but-empty** value (e.g. `FOO=` from a compose `${FOO:-}`) is treated as *unset*.
 > Booleans are truthy unless one of `"" 0 false no`.
+>
+> **Numeric warm-pool knobs are validated at startup.** A value that parses as a float but
+> cannot mean a duration — `nan`, `inf`, `-inf`, or any negative — is **ignored with a warning**
+> and the default is used (the same convention as `BLASTBOX_CANARY_INTERVAL_S`), rather than
+> being honoured. Both directions used to misbehave silently: a *negative*
+> interval makes `now - last >= interval` always true, so the thing it rate-limits runs every
+> tick; `nan` makes every comparison against it false, so whatever it gates never happens. Use
+> **`0`** for "disabled" where the row says so. Note that a RATE LIMIT has no meaningful "off":
+> `BLASTBOX_POOL_MAINTAIN_INTERVAL_S=0` would mean *no cooldown* — the maintenance seam on every
+> tick (~10Hz) — so it is ignored with a warning and the default is used instead.
 
 See **[DEPLOYMENT.md](DEPLOYMENT.md)** for which of these to set for each deployment shape
 and the tier-capability matrix.
@@ -49,6 +59,104 @@ The default CSP (`middleware.DEFAULT_CSP`) is `default-src 'self'; script-src 's
 | `BLASTBOX_MAX_QUEUED_AGE_S` | `0` (off) | Opt-in **stale-queued reaper**: TTL after which a job still QUEUED is FAILed and its (untrusted) input deleted — bounds the `target_tier` footgun (a job pinned to a tier no dispatcher serves) and a >1k batch backlog. Honored by **every** dispatcher variant: the cold container `Dispatcher` and the network-endpoint `VmJobDispatcher` (libvirt-VM / static / AWS / cascade). `0` ⇒ never reap on age (correct for huge legitimate batches). |
 | `BLASTBOX_ALLOW_TIER_ROUTING` | `0` | Allow a job to **request a specific warm backend** via a `target_tier` field at submit (claim-predicate honored by every store: memory / sql / redis). **Off (default) ⇒ `target_tier` is silently ignored** (like a per-job override that isn't permitted). The `worker_tier` label (e.g. `firecracker` / `gvisor` / `libvirt-vm`) is what a warm sidecar advertises and what UIs show. Gate this *with* `BLASTBOX_MAX_QUEUED_AGE_S` — a job pinned to a tier whose dispatcher is down would otherwise queue forever. |
 | `BLASTBOX_DISPATCH_SOLE_OWNER` | `0` | Network-endpoint dispatcher only. `1` ⇒ this is the **only** dispatcher on the store, so orphan recovery may also reclaim a claim that crashed before the `worker_runtime="warm"` stamp. Leave `0` on a **shared** store (a cold dispatcher for the same engine) — it would otherwise FAIL that peer's live jobs. |
+
+## Startup store canary
+
+Before a dispatcher claims its first job it proves it can actually **store and serve a result**:
+it PUTs a sealed envelope through the same blob store it will use for real results, reads the
+bytes back, compares them and deletes them. Not a mock — a store that cannot do that cannot serve
+a job, whatever the config says. Runs on **every** dispatcher variant: the container `Dispatcher`
+and the network-endpoint `VmJobDispatcher` (libvirt-VM / static / AWS / cascade).
+
+**Startup fails closed; the periodic pass only logs.** A misconfigured store at boot is a config
+error and the useful failure is a loud one — the alternative is a stack that looks healthy and
+marks thousands of jobs DONE with results nobody can fetch. Once serving, a store that goes away
+is a *brownout*, not a config error, and tearing down warm capacity over it is the behaviour
+issue #79 exists to prevent.
+
+| Var | Default | Notes |
+|---|---|---|
+| `BLASTBOX_CANARY` | `1` (on) | Startup self-test + periodic re-check. **Disabled only by an explicit false** — `0`/`false`/`no`/`off`. Anything else (including a typo, or the set-but-empty value compose produces for an unset variable) leaves it **ENABLED** and logs a warning: an affirmative allowlist would let a fat-fingered `treu` silently fail *open* on a check whose whole value is failing closed. |
+| `BLASTBOX_CANARY_INTERVAL_S` | `900` | How often to re-run the round-trip while serving. Advisory: it logs, it never gates. `0` ⇒ startup only. Non-numeric, **non-finite** (`nan`, `inf`) and **negative** values fall back to 900 with a warning — `float()` accepts all three, and each would silently switch the periodic pass off while the documented disable value is `0`. Network dispatchers (aws/static/cascade) honour this cadence too; their loop wakes on the earlier of this and the maintenance interval. **Versioned buckets:** the probe reuses a stable key, so at most one LIVE object exists — but each re-run still writes a new version and the delete adds a marker, so the canary also best-effort deletes its own noncurrent versions. That needs `s3:ListBucketVersions` + `s3:DeleteObjectVersion`; where those are withheld `delete_job` now RAISES first, so `_cleanup` logs `canary.cleanup_failed` and the version purge never runs — the leftover is reported rather than silent, and the remedy is still a lifecycle rule expiring noncurrent versions under the results prefix. The purge lists a page at a time and re-lists after each delete, so it keeps working past the 1000-entry page boundary the canary's stable key reaches in about ten days at this cadence. |
+| `BLASTBOX_REQUIRE_SHARED_BLOB_STORE` | `0` (advisory) | Declare that this deployment's results **must** be readable by other machines. With it set, a dispatcher claiming from a shared queue (postgres/redis) while writing to a `LocalBlobStore` **refuses to start**. Default is a loud warning instead, because the canary cannot infer the answer: both single-node-on-local-postgres and multi-node-with-`BLASTBOX_BLOB_LOCAL_ROOT`-on-NFS are documented, valid configurations that look identical from inside the process. Set this on a fleet where a local store is never correct. An unrecognised non-empty value is **warned about and treated as unset** rather than silently ignored. |
+
+### Blob-target agreement (dispatcher ↔ ingress)
+
+Every process on one job queue must write and read results at the **same** blob target. The
+round-trip canary only ever touches its own store, so `dispatch` on `s3://results/stack-b` and
+`serve` on `s3://results/stack-a` both pass their own checks while every finished job reaches DONE
+and then 404s.
+
+At startup each process registers its target through the **job queue** — the one thing the two are
+guaranteed to share — and **refuses to start** if another process already registered a different
+one, naming both targets and which side holds which. Registration is a compare-and-swap, so a
+simultaneous boot has exactly one winner rather than each process recording its own answer.
+
+Deliberately migrating targets:
+
+```
+blastbox blob-target show          # what the queue currently requires
+blastbox blob-target reset --yes   # forget it; both sides re-register on next start
+```
+
+Set **`BLASTBOX_DISPATCHER_ID`** to a stable name per logical dispatcher when running under
+Docker or Kubernetes. The canary key falls back to the container hostname, which is ephemeral —
+so without it, every rollout writes a new probe key, and on a store that grants PUT/GET but denies
+DELETE that means one more permanent object per restart.
+
+`reset` **refuses without `--yes`**, because agreement is checked only at startup: processes that
+are already running never revalidate, so clearing under a live fleet lets a restarted process adopt
+the new target while the others keep the old one — results written to one store and served from
+another. Stop every dispatcher and ingress on this queue first.
+
+After a reset, start **one** side first and confirm its logged `canary.blob_store` line before
+starting the other — otherwise you simply record the wrong target again. There is no environment
+variable for this on purpose: one set to get past a migration tends to stay set, silently disarming
+the check on a fleet that believes it is protected.
+
+**Non-local stores only.** A `LocalBlobStore` fingerprint is a host-local *path*, and the
+documented multi-node NFS deployment legitimately mounts one export at different mount points per
+host — comparing those paths would refuse a working fleet. The real local hazard, a *private* local
+store behind a shared queue, is what the shared-store coherence check above is for.
+
+A third-party `JobStore` that does not implement the registry logs
+`canary.blob_target_unverified` and starts — absence of the capability is not evidence of
+disagreement.
+
+
+**On a versioned S3 bucket**, `S3BlobStore.delete_job` is version-aware (issue #89): it probes
+`GetBucketVersioning` once per store and, when versioning is `Enabled` *or* `Suspended`, removes
+every version and delete marker under the job's results prefix rather than adding a marker over
+them. Suspended counts because suspending stops new versions but keeps the ones already made.
+
+Grant **`s3:GetBucketVersioning`** on every S3 deployment, versioned or not — it is read-only and
+it is what lets the store take the cheap path knowingly. On a versioned bucket also grant
+**`s3:ListBucketVersions` + `s3:DeleteObjectVersion`**; without them the delete raises and the job
+stays retryable rather than being reported as reclaimed.
+
+If `GetBucketVersioning` is withheld the store assumes versioned — the safe default for an
+operation whose contract is that the bytes are gone. If version listing is *also* permanently
+refused (no permission, or an S3-compatible endpoint without the versioning APIs) it falls back to
+the keyless delete and logs a warning naming the permissions, so an unversioned bucket with a
+narrow policy keeps working. That fallback is scoped deliberately: it does not apply to a bucket
+**confirmed** versioned, and a *transient* failure (throttle, timeout, 5xx) propagates rather than
+being mistaken for "unversioned".
+
+A lifecycle rule expiring noncurrent versions is still worth having as a backstop for residue left
+by earlier versions of blastbox (deletes before this fix left a marker plus every prior version),
+and `BLASTBOX_CANARY_INTERVAL_S=0` bounds the canary's share to one object per boot.
+
+The startup line names the backend, bucket, prefix and endpoint
+(`canary.blob_store S3BlobStore(bucket/prefix via http://…)`), and `blastbox serve` logs the same
+shape for the target it serves results **from** — so a dispatcher and an API pointed at different
+targets are greppable side by side. The probe stages its synthetic output under the dispatcher's
+own job root (not the system temp dir) and uses a key stable per host+tier, so a store that denies
+DELETE leaves exactly one object rather than one per probe.
+
+That mismatch now **fails** rather than merely being visible: each process registers its blob
+target through the job queue at startup and refuses to start if another process on that queue
+registered a different one, in either boot order, including local-versus-remote. See
+*Blob-target agreement* below for the enforcement, its scope, and the migration command.
 
 ## Runtime selection (docker: runc / runsc)
 
@@ -119,8 +227,10 @@ configuration — set them when an incident or a specific tier demands it.
 | `BLASTBOX_POOL_PRE_GUEST_REBUILD_AFTER` | `3` | How many **distinct** slots must fail *before their guest ever executes* before the base is judged poisoned. Far lower than `SNAPSHOT_REBUILD_AFTER` on purpose: that threshold is sized for failures which might be the **documents**, so it must tolerate a run of bad samples. A slot that never reached its guest carries no such ambiguity — it did not fail *on* a sample, it failed to become able to run one. At `warm_size=24` the ordinary threshold is 48, so without this a wedged base costs 48 real jobs, each burning the full worker timeout, before the tier repairs itself — which is how a warm tier silently degrades to cold-only for hours. Distinct slots, because one wedged worker is not a wedged base. The guest itself reports the start: it sends a START frame the moment it has the job and before it begins work, so a document that **hangs a healthy slot** acks first and is never attributed to the base. A worker image too old to send one leaves the answer UNKNOWN, which also never convicts — so a mixed-version fleet degrades to today's behaviour rather than misfiring. `0` disables the fast path; values below 2 are floored to 2. |
 | `BLASTBOX_POOL_MAX_EVICTIONS_PER_WINDOW` | `max(2, warm_size)` | Cap on slots evicted per window, so one bad signal cannot churn the whole warm set at once. **`0` blocks heuristic eviction entirely** — the incident escape hatch, and the direction a zero reads in; it is *not* an "unlimited" sentinel. This stops only the *wedge heuristic*: a slot the runtime CONFIRMS dead is still reaped. |
 | `BLASTBOX_POOL_MAX_CONSECUTIVE_FAILURES` | pool default (`2`) | Worker-attributed failures in a row before a reusable slot is burned out. Only failures attributed to the *worker* count — a bad sample (`engine_error`) or a host-side failure does not. |
-| `BLASTBOX_POOL_UNKNOWN_GRACE_S` | `300` | How long a slot may stay **continuously UNKNOWN** (control plane not answering) before it may be replaced. Must comfortably outlast a real control-plane brownout. `0` disables the escalation, which lets a slot stay unknown forever and wedges the tier. |
+| `BLASTBOX_POOL_UNKNOWN_GRACE_S` | `300` | How long a slot may stay **continuously UNKNOWN** (control plane not answering) before it may be replaced. Must comfortably outlast a real control-plane brownout. `0` disables the escalation, which lets a slot stay unknown forever and wedges the tier. **Also bounds the WARMING exemption (issue #79): a slot whose readiness is UNKNOWN is not aged against `warming_timeout_s` while an episode is open, and the unobservable interval is credited back when it closes.** ⚠️ `0` therefore does the OPPOSITE on the two paths: it disables escalation for an IDLE slot (which can then stay unknown forever), but it also disables the WARMING exemption — so every WARMING slot is aged and evicted on the control plane's silence, which is the brownout failure this setting otherwise prevents. Do not set `0` as an incident escape hatch. |
 | `BLASTBOX_POOL_CAPACITY_STARVED_AFTER_S` | `300` | How long the pool may be unable to spawn **for capacity reasons** before that stops being backpressure and is logged as `pool.spawn_capacity_starved` (ERROR, once per episode). `0` disables the alert. |
+| `BLASTBOX_POOL_MAINTAIN_INTERVAL_S` | `5` | Per-slot cooldown for the idle-maintenance seam. The hook may make uncached control-plane calls and `tick()` runs at ~10Hz, so without an interval an `aws-ec2-hibernate` pool issues a describe every 0.1s per slot and **manufactures the very brownout** the rest of this page exists to survive. This is the pool's control-plane CALL RATE; turn it up during an incident. **`0` is NOT an off switch here** — it would mean *no cooldown*, i.e. the opposite — so it is ignored with a warning and this default is used. |
+| `BLASTBOX_POOL_MAINTAIN_BUDGET_S` | `5` | How long ONE maintenance pass may occupy the pool's **single tick thread** — the thread that also drives promotion, health checks, reaping and replacement spawning. The runtime's own ceiling (`BLASTBOX_AWS_HEALTH_PROBE_TIMEOUT_S`, 30s) is sized for a *background* probe, and the rotation reaches a different slot each tick, so a control-plane brownout stalls that thread **continuously** rather than once. Expiry is **not a verdict**: the bounded call answers UNKNOWN and the slot is reconsidered on a later rotation, never retired for it. `0` ⇒ fall back to the runtime's own ceiling. |
 
 > Capacity misses are deliberately *not* failures: a full cascade, a cooling static fleet or a
 > saturated tier must never invalidate a base. `pool_spawn_capacity_miss_total` counts them
@@ -208,6 +318,8 @@ counts cheap.
 | `BLASTBOX_FC_VCPU` | `1` | **Pinned at 1** — the vsock stream-corruption mitigation. Do not raise without validating the guest vsock driver under concurrency. |
 | `BLASTBOX_FC_MEM_MIB` | `512` | Guest RAM (compose sets 2048 for LibreOffice). |
 | `BLASTBOX_FC_OUTDISK_MIB` | — | Size of the per-slot ext4 output disk the host reads via `debugfs`. |
+| `BLASTBOX_FC_DISK_TIMEOUT_S` | `600` | Bound (seconds) on the host disk helpers this tier shells out to on the per-slot spawn path: `mkfs.ext4` for the output disk and the `cp --reflink=auto` of the base outdisk. Generous on purpose (a multi-GiB image and a non-reflink copy both take a while), but never unbounded: a stalled filesystem would otherwise block the spawning thread with nothing to time it out. Must be finite and > 0. |
+| `BLASTBOX_SNAPSHOT_READY_S` | `120` | Seconds a warm BASE gets to signal READY while the snapshot is built. **Shared by the Firecracker and gVisor tiers** — one `SnapshotManager`, one budget. Distinct from the build-phase budget: raising that one cannot help a base that is simply slow to warm, which is the case a cold OCR/soffice start on a loaded node hits. Must be finite and > 0. |
 | `BLASTBOX_SNAPSHOT_MEM_DIR` / `BLASTBOX_SNAPSHOT_MEM_TMPFS` | — | Where the warm memory-snapshot base lives; `_TMPFS` pins the CoW base in RAM (per-host toggle). |
 | `BLASTBOX_SNAPSHOT_RECLAIM_LEGACY` | unset (off) | Delete pre-generation snapshot artifacts (`warm.snapshot` / `warm.mem`) left by a build older than generation stamping. **Set this only once no pre-upgrade dispatcher is still running**: those files carry no owner lease, so nothing can prove an overlapping old process is not still mapping them, and unlinking a live one corrupts its microVMs. Left off, the tier logs `fc_snapshot.legacy_artifacts_present` with the paths and size — the RAM-sized `warm.mem` often occupies the very tmpfs the replacement generation needs, so it is a common cause of an upgraded tier failing every build with ENOSPC. |
 | `BLASTBOX_SNAPSHOT_SETTLE_S` | `""` | Settle delay before snapshotting a freshly-warmed guest. |
@@ -221,6 +333,8 @@ counts cheap.
 | `BLASTBOX_GVISOR_NETWORK` | `none` | runsc `-network`. |
 | `BLASTBOX_GVISOR_NPROC` | `4096` | RLIMIT_NPROC (fork-bomb cap; cgroups are ignored under `-ignore-cgroups`). |
 | `BLASTBOX_GVISOR_NOFILE` | `65536` | RLIMIT_NOFILE (fd-exhaustion cap). |
+| `BLASTBOX_GVISOR_CLI_TIMEOUT_S` | `900` | Bound (seconds) on every `runsc` invocation: `run`, `restore`, `checkpoint`, `exec`, and the `kill`/`delete` teardown. Deliberately generous — a checkpoint writes the whole guest memory image — but never unbounded: the build runs on a thread `ensure_build_started()` will not replace while it is alive, so one wedged call stops warm rebuilds for the life of the process. Non-finite or non-positive values are refused and the default is used. |
+| `BLASTBOX_SNAPSHOT_READY_S` | `120` | Seconds a warm BASE gets to signal READY while the snapshot is built. **Shared by the Firecracker and gVisor tiers** — one `SnapshotManager`, one budget. Distinct from the build-phase budget: raising that one cannot help a base that is simply slow to warm, which is the case a cold OCR/soffice start on a loaded node hits. Must be finite and > 0. |
 | `BLASTBOX_GVISOR_WARM_ARGV` | — | The in-guest warm entrypoint argv (JSON list). |
 | `BLASTBOX_GVISOR_LD_PRELOAD` | — | `LD_PRELOAD` inside the guest (the accept-retry shim for soffice-on-restore). |
 | `BLASTBOX_GVISOR_EXTRA_ENV` | — | Extra guest env (JSON list), e.g. `CLIPPYSHOT_SANDBOX=container`. |
@@ -252,6 +366,7 @@ win-validator stays libvirt — no Windows/nested-virt on either).
 | `BLASTBOX_AWS_PROFILE` | — | Named CLI profile (else default cred chain). |
 | `BLASTBOX_AWS_AGENT_PORT` | `8765` | Port the in-worker HTTP agent listens on. |
 | `BLASTBOX_AWS_MAX_DURATION_S` | `3600` | Hard lifetime cap requested of the worker (belt-and-braces reap). |
+| `BLASTBOX_AWS_HEALTH_PROBE_TIMEOUT_S` | `30` | Ceiling on ONE background/health `describe` for an AWS tier. Generous (it is not on dispatch latency) but finite, so a control-plane brownout cannot stall the pool's single tick thread for the full `cli_timeout_s` (120s) per IDLE slot. Non-finite or `<= 0` falls back to the default rather than disabling the bound — an unbounded probe is the stall this exists to prevent. See also `BLASTBOX_POOL_MAINTAIN_BUDGET_S`, which bounds the whole maintenance pass. |
 | **Lambda MicroVM** (`aws-lambda-microvm`) | | transport = per-VM HTTPS URL + JWE token |
 | `BLASTBOX_LAMBDA_IMAGE` | — | **Required.** An **in-account** MicroVM image ARN built via `create-microvm-image` (the managed base `…:aws:microvm-image:al2023-1` is **not** directly runnable — verified live). |
 | `BLASTBOX_LAMBDA_EXEC_ROLE_ARN` | — | Execution role for `run-microvm`. |
@@ -282,10 +397,10 @@ win-validator stays libvirt — no Windows/nested-virt on either).
 | `BLASTBOX_EC2_ROOT_DEVICE` | `/dev/xvda` | Root device name (AL2023 ARM64). |
 | `BLASTBOX_EC2_HIBERNATE_READY_TIMEOUT_S` | `600` | Warming budget — must cover boot + `engine.warmup()` + the `ec2-hibinit` reserve wait + `stop --hibernate` → stopped (all in `is_ready`). |
 | `BLASTBOX_EC2_HIBERNATE_RESUME_TIMEOUT_S` | `180` | Budget for `start-instances` + `/healthz` on claim (kept below the job timeout). |
-| `BLASTBOX_EC2_HIBERNATE_TIMEOUT_S` | `300` | Per-slot budget for `stop --hibernate` → `stopped`; if hibernation doesn't take (instance lands back `running`) the slot re-drives. |
+| `BLASTBOX_EC2_HIBERNATE_TIMEOUT_S` | `300` | Per-slot budget for `stop --hibernate` → `stopped`; if hibernation doesn't take (instance lands back `running`) the slot re-drives. ⚠️ This is now a WHOLE-EPISODE give-up budget, not a retry budget: it is not reset by a re-drive, it is frozen and credited across no-verdict episodes, and on expiry the slot is RETIRED (`maintain_idle` returns False and the pool reaps it) with **no worker-fault attribution** — a park give-up is control-plane evidence, so it deliberately does NOT charge the tier's failure streak and never triggers base repair rather than re-driven. Size it as the point at which you want the slot destroyed. |
 | `BLASTBOX_EC2_HIBERNATE_RESUME_POLL_S` | `5` | Health re-probe interval while a resumed slot settles (`start-instances` → `/healthz`). |
 | `BLASTBOX_EC2_SELF_TERMINATE` | `1` (on) | Crash backstop, **default-on** here too but **uptime-based** (`systemd-run --on-active`, a monotonic timer that doesn't advance while hibernated) — so unlike the disposable tier's wall-clock TTL it **can't fire on resume**. A leaked *running* instance self-terminates after `MAX_DURATION_S` of cumulative running time; a parked one never accrues it. Set `0` to disable. |
-| `BLASTBOX_EC2_ORPHAN_MAX_AGE_S` | `0` (off) | **Host-side orphan sweep.** The uptime backstop above is frozen while an instance is *hibernated*, so a slot **parked when its dispatcher crashed** never self-terminates (encrypted-root-EBS cost only). When `>0`, the dispatcher runs `sweep_orphans()` — `describe-instances` filtered by the `blastbox-tier` tag + `stopped`/`stopping` state, terminating any **not** carrying *this* dispatcher process's `blastbox-run` id and older than this many seconds. `0` ⇒ never sweep. Recommend a value **≥ peak park duration** (e.g. `3600`). Runs once at dispatcher start (reclaims a *predecessor's* leaks — never this run's live parked slots). **Assumes ONE `aws-ec2-hibernate` deployment per account+region.** The sweep filters only by the `blastbox-tier` tag, so a *second* independent hibernate deployment in the same account would match here; the per-process run-id fence protects this run's live slots but **not** another deployment's — so enable this only where a single hibernate deployment owns the account/region, and size the age generously if you run several dispatchers of it. Needs `ec2:DescribeInstances` + `ec2:TerminateInstances`. |
+| `BLASTBOX_EC2_ORPHAN_MAX_AGE_S` | `0` (off) | **Host-side orphan sweep.** The uptime backstop above is frozen while an instance is *hibernated*, so a slot **parked when its dispatcher crashed** never self-terminates (encrypted-root-EBS cost only). When `>0`, the dispatcher runs `sweep_orphans()` — `describe-instances` filtered by the `blastbox-tier` tag + `stopped`/`stopping` state, terminating any **not** carrying *this* dispatcher process's `blastbox-run` id and older than this many seconds. `0` ⇒ never sweep. Recommend a value **≥ peak park duration** (e.g. `3600`). Runs once at dispatcher start (reclaims a *predecessor's* leaks — never this run's live parked slots), **and once more for a tier that was DEFERRED at startup, at the moment it is admitted** — admission is the first instant that tier exists, so it is that tier's equivalent of start-up, not an extra periodic sweep. The single-deployment assumption below applies to both. **Assumes ONE `aws-ec2-hibernate` deployment per account+region.** The sweep filters only by the `blastbox-tier` tag, so a *second* independent hibernate deployment in the same account would match here; the per-process run-id fence protects this run's live slots but **not** another deployment's — so enable this only where a single hibernate deployment owns the account/region, and size the age generously if you run several dispatchers of it. Needs `ec2:DescribeInstances` + `ec2:TerminateInstances`. |
 
 The **generic worker agent** (`python -m blastbox.worker.http_agent`, `BLASTBOX_ENGINE=module:Class`)
 serves any engine over `GET /healthz` + `POST /detonate`; bake it + the engine + its deps into the
@@ -354,7 +469,15 @@ top is unchanged (it still sees one runtime); each tier reads its own backend co
 | `BLASTBOX_POOL_TIERS` | — | **Required.** Ordered `backend:capacity` list, e.g. `static:4,aws-ec2:16` — 4 warm local + up to 16 overflow on AWS. Backends: `gvisor`, `firecracker`, `static`, `aws-ec2`, `aws-lambda-microvm`. **All tiers must share a dispatch style** (see below) — don't mix file-handshake (`gvisor`/`firecracker`) with network-endpoint (`static`/`aws-*`). |
 
 The **primary** (first) tier must be available at startup (fail-closed); an **overflow** tier that isn't
-available is logged and skipped, so capacity still comes up if the cloud/remote tier is misconfigured.
+available is handled by VERDICT (issue #79): a tier CONFIRMED unusable (bad credentials, wrong
+instance type) is logged and skipped as before, but one whose availability probe reached NO
+VERDICT (throttle, timeout, unparseable answer) is DEFERRED and re-probed every ~60s until it
+answers, rather than being lost until restart. An admitted deferred tier joins at the END of the
+cascade — a LOWER priority than its position in `BLASTBOX_POOL_TIERS`. A deferred tier's declared
+timeouts and transport still count toward the cascade's budgets and its dispatch-style/TLS
+uniformity checks, so a mixed-transport cascade is still refused at startup. A PRIMARY tier that
+cannot be decided raises a `CascadeMisconfigured` explicitly marked retryable — a supervisor
+should retry it, unlike the permanent misconfiguration of the same type.
 Set `BLASTBOX_POOL_WARM_SIZE` to the primary tier's capacity (keep those warm), `BLASTBOX_POOL_CEILING` to
 the sum, `BLASTBOX_DISPATCH_CONCURRENCY` to the ceiling, and `BLASTBOX_POOL_BURST_SIZE` to the overflow
 capacity — the pool only raises its target to `WARM_SIZE + BURST_SIZE` (default burst **4**), so without

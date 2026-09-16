@@ -75,6 +75,21 @@ def cascade_all_local(runtime: object) -> bool:
         members = list(members)  # type: ignore[arg-type]
     except TypeError:
         return False
+    #: DEFERRED tiers count. A tier whose availability probe reached no verdict is no longer
+    #: dropped for the process lifetime -- it sits in `_deferred` and joins `tiers` ~60s later. So
+    #: `tiers` alone answers "which tiers are running RIGHT NOW", and this function is asking
+    #: something else: "is every member of this cascade node-local?" Reading only `tiers` let an
+    #: aws-ec2 tier deferred by an STS brownout be invisible here while `reachable_tiers` already
+    #: counted it, and the classification is a ONE-SHOT startup decision (cli.py builds the
+    #: DynamicConcurrencyGate from it once), so the mistake is permanent for that process: the
+    #: cascade gets enrolled in the LOCAL RAM water-fill, and when the cloud tier is admitted its
+    #: slots are budgeted as this node's RAM -- the over-reserve-and-mis-shed this is fail-closed
+    #: against. The deferral machine added the sixth reader of `_deferred`; this is the seventh.
+    deferred = getattr(runtime, "_deferred", None) or []
+    try:
+        members = members + list(deferred)
+    except TypeError:
+        return False          # malformed _deferred -> fail closed, same as a malformed tiers
     if not members:
         return False
     return all(manages(getattr(t, "name", "")) for t in members)

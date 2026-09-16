@@ -593,3 +593,53 @@ def test_drained_pool_self_heals_to_its_floor_under_light_load():
     busy_neighbor = _sz("clippyshot", ram=4096, demand=40, min_warm=12, queued=40)
     contended = plan_sizes([drained, busy_neighbor], budget)
     assert contended["redtusk"].warm_size >= 4, contended
+
+
+def test_a_deferred_off_node_tier_keeps_the_cascade_out_of_the_local_water_fill():
+    """`tiers` answers "what is running now"; this function asks "is every member node-local".
+
+    Those were the same question until this branch added DEFERRAL. A tier whose availability probe
+    reaches no verdict is no longer dropped for the life of the process -- it waits in `_deferred`
+    and joins `tiers` ~60s later. Reading only `tiers` therefore let an aws-ec2 tier deferred by an
+    STS brownout be invisible here while `reachable_tiers` already counted it: the two disagreed
+    about the same object.
+
+    The disagreement is not recoverable, because this classification is a ONE-SHOT startup decision
+    -- cli.py computes `node_managed` once and builds the DynamicConcurrencyGate from it for the
+    life of the process. So a cascade with a cloud tier gets permanently enrolled in the LOCAL RAM
+    water-fill, and when the deferred tier is admitted its slots are budgeted as this node's RAM:
+    the over-reserve-and-mis-shed this function's docstring is explicitly fail-closed against.
+
+    MUTATION: drop `_deferred` from the members list -> True, and the cascade is enrolled.
+    """
+    from types import SimpleNamespace
+
+    from blastbox.host.node_sizer import cascade_all_local
+    from blastbox.host.runtime.cascade import DeferredTier
+
+    deferred_cloud = DeferredTier(
+        name="aws-ec2", capacity=16, reason="sts: throttled", build=lambda: None, pos=1,
+        readiness_timeout_s=600.0, resume_timeout_s=180.0, dispatch_style="network",
+        ssl_context=None, cli_timeout_s=120.0)
+    casc = SimpleNamespace(
+        kind="cascade",
+        tiers=[SimpleNamespace(name="firecracker", runtime=SimpleNamespace(), capacity=8)],
+        _deferred=[deferred_cloud])
+
+    assert cascade_all_local(casc) is False, (
+        "a cascade holding a DEFERRED aws-ec2 tier was classified all-local, so the autosizer "
+        "enrolls it in the local RAM water-fill; ~60s later the cloud tier is admitted and 16 slots "
+        "that hold no local RAM are budgeted as if they did")
+
+    # ...and an all-local cascade is still enrolled: this must fail CLOSED, not fail ALWAYS.
+    deferred_local = DeferredTier(
+        name="gvisor", capacity=4, reason="runsc probe timed out", build=lambda: None, pos=1,
+        readiness_timeout_s=120.0, resume_timeout_s=0.0, dispatch_style="local",
+        ssl_context=None, cli_timeout_s=0.0)
+    local_only = SimpleNamespace(
+        kind="cascade",
+        tiers=[SimpleNamespace(name="firecracker", runtime=SimpleNamespace(), capacity=8)],
+        _deferred=[deferred_local])
+    assert cascade_all_local(local_only) is True, (
+        "a cascade whose deferred tier is ALSO node-local must stay managed; refusing every cascade "
+        "with a deferred member would drop it out of the water-fill it belongs in")

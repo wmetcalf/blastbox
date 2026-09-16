@@ -1,0 +1,4 @@
+[
+  "pydantic>=2.6.0",
+  "packaging>=23.0"
+]

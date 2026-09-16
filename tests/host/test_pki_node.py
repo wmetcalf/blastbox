@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import datetime
 import json
-import re
 
 import pytest
 from cryptography import x509
