@@ -309,6 +309,28 @@ sudo blastbox egress check
 sudo scripts/test-egress-leak.sh --mode global
 ```
 
+**Arming the grants gate on a worker (optional).** `pki issue-node` writes the cert on
+the host you ran it on — step 3 above runs on the EXIT HOST — so enabling enforcement on
+a worker means copying two files to it and pointing one variable at them:
+
+```bash
+# on the exit host
+scp /var/lib/blastbox/pki/node-toolz3.crt /var/lib/blastbox/pki/ca.crt toolz3:/var/lib/blastbox/pki/
+# on the worker, in the dispatcher's environment
+BLASTBOX_NODE_CERT=/var/lib/blastbox/pki/node-toolz3.crt
+```
+
+`ca.crt` is required and is easy to forget: verification needs the CA's **public** half
+on the worker (never `ca.key`, which stays on the issuing host). Then
+`blastbox pki node-status` on the worker says whether the gate is armed, whether the
+certificate verifies, and what it would accept. A node whose certificate does not verify
+**refuses all work** — that is revocation working, and it is also what an unnoticed
+missing `ca.crt` looks like, so check `node-status` before concluding the fleet is idle.
+
+Note that once the gate is armed, the paragraph below about the worker side looking fine
+no longer holds: an expired certificate stops the worker taking any job at all, not just
+its egress ones.
+
 **Step 3 RECURS.** `pki issue-node` defaults to a 7-day lifetime — that short lifetime is
 what makes "revocation is stop renewing" work without a CRL or any online check — and the
 exit host's `prune_expired_peers` runs on every `apply`, which now includes the reconcile

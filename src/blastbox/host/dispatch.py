@@ -63,6 +63,7 @@ from blastbox.host.canary import (
     check_store_coherence,
     describe_blob_store,
 )
+from blastbox.host.placement import SelfGrants
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
 from blastbox.host.runtime.docker import (
     RuntimeSelection,
@@ -599,12 +600,15 @@ class Dispatcher:
         self._egress_shared_defer_s = max(
             1.0, float(os.environ.get("BLASTBOX_EGRESS_SHARED_DEFER_S", "5") or 5))
         self._egress_cooldown: dict[str, float] = {}
-        # This node's own grants, resolved from its node cert. See _self_grants.
-        self._self_grants_cached = None
-        self._self_grants_at = 0.0
-        self._self_node_id = ""
-        self._self_grants_ttl_s = max(
-            5.0, float(os.environ.get("BLASTBOX_NODE_GRANTS_TTL_S", "300") or 300))
+        # ONE implementation, shared with VmJobDispatcher. Two dispatch classes with two
+        # copies of "may I run this" is how one of them ends up with no copy at all —
+        # which is exactly what happened before this was extracted.
+        self._grants_gate = SelfGrants(log=_log)
+        # Its OWN defer state, never the egress gate's — see the comment at the call site.
+        self._grants_defer_lock = threading.Lock()
+        self._grants_defer_n: dict[str, int] = {}
+        self._grants_defer_floor = 0
+        self._grants_cooldown: dict[str, float] = {}
         self._egress_defer_lock = threading.Lock()
         self._egress_defer_n: dict[str, int] = {}
         #: Attempt count a job re-enters at when its entry was evicted. Without it the
@@ -1238,6 +1242,102 @@ class Dispatcher:
                 self._release_warm_reservation()
             raise
 
+        # ------------------------------------------------------------------
+        # MAY THIS NODE RUN THIS AT ALL? Grants decide; claims never widen.
+        # ------------------------------------------------------------------
+        # BEFORE THE WARM/COLD BRANCH, AND THAT POSITION IS THE WHOLE POINT. This check
+        # first lived inside `_dispatch_inner`, which is only the COLD path —
+        # `_dispatch_warm` is called as its ALTERNATIVE a few lines below and never
+        # reaches it, so a node with an unverifiable certificate still ran every job
+        # that landed on an idle warm slot. An authority control with a second door is
+        # not an authority control.
+        #
+        # It is also ahead of the runsc/netns check inside `_dispatch_inner`, which
+        # `_fail_job`s. Judged after that, a job this node may not run was DESTROYED
+        # rather than released — and on the strength of a refusal it had no standing to
+        # make, since a granted runc peer could have run it.
+        #
+        # RELEASED, NOT FAILED. This node not being permitted to run a job says nothing
+        # about whether a peer is, and this node cannot see the fleet. Same reasoning,
+        # and the same short shared defer, as the egress health gate.
+        personality = self._resolve_personality(job)
+        # AN UNKNOWN ENGINE IS STILL A FAILURE, gated or not. `refusal()` rejects an
+        # unrecognised engine NAME ("engine 'boxjs-v2' is not granted") before
+        # `_dispatch_inner` can reach its own `unknown engine` fail — and this path
+        # releases rather than fails, so the job became immortal: no peer can run an
+        # engine that does not exist either, and max_queued_age is off by default.
+        # Terminalise it here, exactly as an ungated node would, so behaviour does not
+        # diverge on whether a certificate happens to be configured.
+        # ...so DON'T INTERCEPT IT HERE. Failing it at this point skips the cleanup the
+        # dispatch path's own finally block owns (three existing behavioural tests say
+        # so), and `_dispatch_inner` already fails it correctly one layer down. Letting
+        # an unknown engine fall through to that is both the smaller change and the
+        # right one: the gate has no opinion about an engine this node does not have.
+        # ...but NOT for an engine this node does not have. `refusal()` would reject an
+        # unrecognised engine NAME first, and this path releases rather than fails, so a
+        # typo'd engine became immortal: no peer can run an engine that does not exist
+        # either, and max_queued_age is off by default. Failing it HERE is wrong too — it
+        # skips the cleanup the dispatch path's finally block owns, which three existing
+        # behavioural tests pin — so let it fall through to `_dispatch_inner`, which
+        # already fails it correctly. The gate has no opinion about an engine this node
+        # does not have.
+        if job.engine in self._engines:
+
+            # ITS OWN COOLDOWN, READ AS WELL AS WRITTEN. The first version reused the egress
+            # health gate's `_egress_defer_n` / `_egress_cooldown`, which was wrong three
+            # ways: that map's eviction lives inside the egress branch these jobs never
+            # reach, so it grew without bound; the egress gate READS the cooldown and would
+            # report "this node is in a local egress cooldown" for an outage that never
+            # happened, surviving certificate renewal; and the shared floor leaked between
+            # them. It also only ever WROTE the cooldown, so the escalation throttled the log
+            # and not the store — the claim/requeue amplification the comment claimed to fix
+            # carried on every few seconds, and the "will not reconsider for 300s" it printed
+            # was false.
+            if (until := self._grants_cooldown.get(job.job_id)) and time.time() < until:
+                self._requeue_claimed(
+                    job, defer=True, defer_s=self._egress_shared_defer_s,
+                    reason=f"this node's certificate does not grant this work; in a local "
+                           f"cooldown for another {until - time.time():.0f}s",
+                )
+                return
+            why = self._grants_gate.refuse(engine=job.engine, personality=personality)
+            if why is not None:
+                # THROTTLED AND ESCALATING, like the egress health gate below — and more
+                # necessary here, not less. That gate guards a TRANSIENT condition and still
+                # escalates; a grants refusal is a STANDING one (a certificate does not renew
+                # itself), so a flat 5s defer with an unconditional log line meant a lapsed
+                # node claiming, logging and CAS-requeueing every queued job every five
+                # seconds, forever: store write amplification plus a log flood, with
+                # max_queued_age off by default so nothing terminates it.
+                with self._grants_defer_lock:
+                    n = max(self._grants_defer_n.get(job.job_id, 0),
+                            self._grants_defer_floor) + 1
+                    self._grants_defer_n[job.job_id] = n
+                    if len(self._grants_defer_n) > self.EGRESS_DEFER_MAX:
+                        for stale, stale_n in sorted(self._grants_defer_n.items(),
+                                                     key=lambda kv: kv[1])[:self.EGRESS_DEFER_EVICT]:
+                            if stale == job.job_id:
+                                continue
+                            self._grants_defer_floor = max(self._grants_defer_floor, stale_n)
+                            self._grants_defer_n.pop(stale, None)
+                            self._grants_cooldown.pop(stale, None)
+                shared_defer, local = self._egress_defer_plan(n)
+                self._grants_cooldown[job.job_id] = time.time() + local
+                if n & (n - 1) == 0:          # powers of two only
+                    _log.warning(
+                        "node grants refuse job=%s engine=%s tier=%s: %s. Releasing to the "
+                        "fleet; a granted peer may still run it. (attempt %d; this node will "
+                        "not reconsider it for %.0fs)",
+                        job.job_id, job.engine, personality.exit_driver, why, n, local)
+                if warm_reserved:
+                    self._release_warm_reservation()
+                self._requeue_claimed(
+                    job, defer=True, defer_s=shared_defer,
+                    reason=f"this node's certificate does not grant this work ({why}); "
+                           "releasing to the fleet",
+                )
+                return
+
         # Try the warm path if a pool is configured. EXCEPTION: an egress personality needs the cold
         # path's netd netns-wiring + dispatcher network args/labels, which the warm tier can't apply
         # (warm-tier networking is a future phase) — so an egress job on a warm slot would silently
@@ -1419,88 +1519,18 @@ class Dispatcher:
                     self._egress_defer_n.pop(stale, None)
             return n
 
-    def _egress_mode(self) -> str:
-        """This node's persisted egress mode, or "" when the tier does not manage it.
-
-        Only used to decide whether a VPN tier means this node HOLDS credentials (local
-        mode) or merely forwards over the overlay to a host that does (global mode) —
-        the distinction `NodeGrants.credentials` exists to make.
-        """
-        try:
-            from blastbox.host.egress_apply import load_persisted_env
-            return load_persisted_env().get("BLASTBOX_EGRESS_MODE", "")
-        except Exception:      # noqa: BLE001 - absence is not local mode
-            return ""
-
     def _self_grants(self):
-        """This node's own ``NodeGrants``; ``None`` means UNVERIFIABLE (refuse
-        everything) and ``_NO_GATE`` means no gate is configured here. Cached.
-
-        The three-way return is deliberate. "This node has no certificate to be judged
-        against" and "this node's certificate does not verify" are opposite answers —
-        the first must run everything, the second must run nothing — and collapsing
-        them into one falsy value is how a lapsed identity would silently become an
-        unrestricted one.
-
-        THE LEADERLESS SHAPE. `placement.eligible()` answers "which nodes may run this"
-        over a fleet view; a dispatcher is one node and asks the same predicate about
-        ITSELF before it runs anything. Both go through `placement.refusal`, because two
-        implementations of "what the grants permit" is the fastest way to lose the
-        convergence the design depends on — and this is the copy that actually enforces.
-
-        OPT-IN, LIKE THE EGRESS HEALTH GATE, and for the same reason. Enforcement turns
-        on only when this node has been given a node certificate to be judged against
-        (`BLASTBOX_NODE_CERT`, or `<pki>/node-<BLASTBOX_NODE_ID>.crt`). Making it
-        mandatory would stop every existing first-party deployment dead on upgrade,
-        which is a worse failure than the one it prevents — and until the spec's step 5
-        there are no third-party nodes for it to constrain. Force either way with
-        BLASTBOX_NODE_GRANTS_GATE=1/0.
-
-        AN UNREADABLE OR LAPSED CERTIFICATE REFUSES, it does not fall open. That is the
-        whole revocation mechanism: "stop renewing" bounds exposure only if something
-        acts on the lapse, and a dispatcher that kept working with an expired identity
-        would make the short lifetime decorative. The refusal is loud and names renewal.
-        """
-        gate = os.environ.get("BLASTBOX_NODE_GRANTS_GATE", "").strip().lower()
-        if gate in ("0", "false", "no", "off"):
-            return _NO_GATE
-        cert_path = self._node_cert_path()
-        if cert_path is None:
-            if gate in ("1", "true", "yes", "on"):
-                _log.warning(
-                    "BLASTBOX_NODE_GRANTS_GATE is on but this node has no node "
-                    "certificate (set BLASTBOX_NODE_CERT or BLASTBOX_NODE_ID); refusing "
-                    "all work rather than running ungoverned")
-                return None
-            return _NO_GATE
-        now = time.time()
-        if self._self_grants_at and (now - self._self_grants_at) < self._self_grants_ttl_s:
-            return self._self_grants_cached
-        self._self_grants_at = now
-        try:
-            from blastbox.host.pki import load_trust_anchor, node_identity
-            pki_dir = Path(os.environ.get("BLASTBOX_PKI_DIR", "/var/lib/blastbox/pki"))
-            ident = node_identity(load_trust_anchor(pki_dir), cert_path.read_bytes())
-            self._self_grants_cached = ident.grants
-            self._self_node_id = ident.node_id
-        except Exception as exc:          # noqa: BLE001 - every failure is a refusal
-            _log.warning(
-                "this node's certificate (%s) does not verify: %s. Refusing work until "
-                "it is renewed — `blastbox pki issue-node` for the same node id and wg "
-                "key. This is revocation working, not a bug.", cert_path, exc)
-            self._self_grants_cached = None
-        return self._self_grants_cached
+        """This node's own grants; see :class:`blastbox.host.placement.SelfGrants`."""
+        return self._grants_gate.grants()
 
     def _node_cert_path(self):
-        explicit = os.environ.get("BLASTBOX_NODE_CERT", "").strip()
-        if explicit:
-            return Path(explicit)
-        node_id = os.environ.get("BLASTBOX_NODE_ID", "").strip()
-        if not node_id:
-            return None
-        pki_dir = Path(os.environ.get("BLASTBOX_PKI_DIR", "/var/lib/blastbox/pki"))
-        candidate = pki_dir / f"node-{node_id}.crt"
-        return candidate if candidate.exists() else None
+        return self._grants_gate.cert_path()
+
+    def _egress_mode(self) -> str:
+        return self._grants_gate.egress_mode()
+
+    def _holds_credentials(self, personality) -> bool:
+        return self._grants_gate.holds_credentials(personality)
 
     def _node_egress_health(self):
         """Cached verdict on whether THIS node can currently egress, or None to not gate.
@@ -2314,42 +2344,6 @@ class Dispatcher:
         # gating them on it would remove working capacity for an outage that cannot
         # affect them. It also means a global-mode node running those tiers is not
         # actually credential-free for them — see docs/DEPLOYMENT.md.
-        # ------------------------------------------------------------------
-        # Step 2d: MAY THIS NODE RUN THIS AT ALL? Grants decide; claims never widen.
-        # ------------------------------------------------------------------
-        # The authority check, finally in force. `placement` has said "grants decide
-        # eligibility, full stop" in the present tense since it was written while
-        # nothing consulted it — so a reader concluded a compromised node could not
-        # elect itself for work it was not granted, and no code path checked.
-        #
-        # RELEASED, NOT FAILED. This node not being permitted to run a job says nothing
-        # about whether a peer is, and this node cannot see the fleet; failing it here
-        # would destroy work on an assertion it has no standing to make. Same reasoning,
-        # and the same short shared defer, as the egress health gate below.
-        self_grants = self._self_grants()
-        if self_grants is not _NO_GATE:
-            from blastbox.host.placement import refusal
-            # A local-mode exit is the node running a credentialed provider sidecar
-            # itself, which is exactly what `credentials` governs. A global-mode node
-            # forwards over the overlay and holds nothing, so the same tier there does
-            # not need the grant.
-            needs_creds = (personality.exit_driver in ("openvpn", "wireguard")
-                           and self._egress_mode() == "local")
-            why = refusal(self_grants, engine=job.engine,
-                          tier=personality.exit_driver or None,
-                          require_credentials=needs_creds)
-            if why is not None:
-                _log.warning(
-                    "node grants refuse job=%s engine=%s tier=%s: %s. Releasing to the "
-                    "fleet; a granted peer may still run it.",
-                    job.job_id, job.engine, personality.exit_driver, why)
-                self._requeue_claimed(
-                    job, defer=True, defer_s=self._egress_shared_defer_s,
-                    reason=f"this node's certificate does not grant this work ({why}); "
-                           "releasing to the fleet",
-                )
-                return
-
         gated_by_gateway_health = personality.exit_driver in ("openvpn", "wireguard")
         if gated_by_gateway_health:
             # Still inside this node's own cooldown for this job: put it straight back

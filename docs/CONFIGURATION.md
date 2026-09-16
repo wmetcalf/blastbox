@@ -602,11 +602,30 @@ run it.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `BLASTBOX_NODE_CERT` | — | path to this node's cert from `pki issue-node`. Its presence is what TURNS THE GATE ON |
-| `BLASTBOX_NODE_ID` | — | alternative to the above: resolves `<BLASTBOX_PKI_DIR>/node-<id>.crt` if that file exists |
-| `BLASTBOX_PKI_DIR` | `/var/lib/blastbox/pki` | where `ca.crt` lives. Only the CA's **public** half is needed here |
-| `BLASTBOX_NODE_GRANTS_GATE` | — | `1` forces the gate on (and refuses everything if no certificate is configured); `0` forces it off |
-| `BLASTBOX_NODE_GRANTS_TTL_S` | `300` | how long a resolved certificate is cached. A renewal is picked up, and a lapse starts refusing, within this window |
+| `BLASTBOX_NODE_CERT` | — | path to this node's cert from `pki issue-node`. **Setting it at all is what arms the gate** — even to an empty value, which counts as a configured-but-unproducible identity and refuses |
+| `BLASTBOX_PKI_DIR` | `/var/lib/blastbox/pki` | where `ca.crt` lives. Only the CA's **public** half is needed on a worker |
+| `BLASTBOX_NODE_GRANTS_GATE` | — | `0`/`false`/`no`/`off` force the gate off. **Any other non-empty value forces it on**, so a typo'd `enforce` hardens rather than silently disarms |
+| `BLASTBOX_NODE_GRANTS_TTL_S` | `300` | how long a verified certificate is cached. Certificate **expiry outranks this**: a cert that lapses inside the window stops authorising immediately, so raising the TTL cannot outlive the 7-day lifetime that is the revocation mechanism |
+
+`BLASTBOX_NODE_ID` is **not** part of this. It has meant "physical-host slug for share-dir
+scoping" since long before the gate existed (see the sizer section above), and an early
+version of this feature resolved a certificate path from it — so an operator setting it
+for the documented NFS reason armed a security control they had never heard of. Arming
+the gate is explicit, or it is not arming.
+
+Both the container dispatcher and `VmJobDispatcher` (the AWS / static-pool / cascade
+path) consult the same gate object. There is no third door.
+
+Ask a node what it resolves to:
+
+```bash
+blastbox pki node-status            # is the gate armed? does the cert verify? what would it accept?
+blastbox pki node-status --engine clamav
+```
+
+It prints the resolved certificate path, the grants, and a per-tier verdict — including
+that a **sealed (`none`) job needs no tier grant at all**, which the grant list alone
+does not make obvious. Exit 1 when the gate is armed and the certificate does not verify.
 
 **Opt-in by design.** A node with no certificate configured runs unrestricted, exactly
 as before — making the gate mandatory would stop every existing first-party deployment
