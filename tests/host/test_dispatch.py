@@ -4145,3 +4145,148 @@ def test_this_node_stays_out_of_the_way_for_the_escalated_window_not_the_store()
     shared, local = d._egress_defer_plan(9)
     assert local >= 300.0
     assert shared <= 10.0
+
+
+# --------------------------------------------------------------------------------------
+# The node-grants gate: "may I run this", asked of this node's own certificate.
+# --------------------------------------------------------------------------------------
+
+class _GrantsOnly:
+    """Just the grants resolution, unbound from Dispatcher's construction cost."""
+
+    from blastbox.host.dispatch import Dispatcher as _D
+
+    _self_grants = _D._self_grants
+    _node_cert_path = _D._node_cert_path
+    _egress_mode = _D._egress_mode
+
+    def __init__(self):
+        self._self_grants_cached = None
+        self._self_grants_at = 0.0
+        self._self_node_id = ""
+        self._self_grants_ttl_s = 300.0
+
+
+def _issue_node_cert(tmp_path, monkeypatch, **grant_kw):
+    from blastbox.host import pki
+
+    pki_dir = tmp_path / "pki"
+    ca = pki.ensure_ca(pki_dir)
+    issued = ca.issue_node("toolz3", wg_pubkey="A" * 43 + "=",
+                           grants=pki.NodeGrants(**grant_kw))
+    crt, _key = issued.write(tmp_path, "node-toolz3")
+    monkeypatch.setenv("BLASTBOX_PKI_DIR", str(pki_dir))
+    monkeypatch.setenv("BLASTBOX_NODE_CERT", str(crt))
+    return crt
+
+
+def test_a_node_with_no_certificate_is_not_gated(monkeypatch):
+    """Enforcement is opt-in per node. Making it mandatory would stop every existing
+    first-party deployment dead on upgrade — a worse failure than the one it prevents,
+    and until third-party registration exists there is nothing for it to constrain."""
+    from blastbox.host.dispatch import _NO_GATE
+
+    monkeypatch.delenv("BLASTBOX_NODE_CERT", raising=False)
+    monkeypatch.delenv("BLASTBOX_NODE_ID", raising=False)
+    monkeypatch.delenv("BLASTBOX_NODE_GRANTS_GATE", raising=False)
+    assert _GrantsOnly()._self_grants() is _NO_GATE
+
+
+def test_a_verified_certificate_yields_exactly_its_grants(tmp_path, monkeypatch):
+    _issue_node_cert(tmp_path, monkeypatch, engines=("boxjs",), tiers=("wireguard",))
+    g = _GrantsOnly()._self_grants()
+    assert g is not None
+    assert g.allows_engine("boxjs") and not g.allows_engine("clamav")
+    assert g.allows_tier("wireguard") and not g.allows_tier("openvpn")
+    assert g.credentials is False
+
+
+def test_an_unverifiable_certificate_refuses_and_does_not_fall_open(tmp_path, monkeypatch):
+    """"Revocation is stop renewing" bounds exposure only if something ACTS on the
+    lapse. A dispatcher that kept working with an expired or foreign identity would
+    make the seven-day lifetime decorative.
+
+    `None` here, never `_NO_GATE`: the two mean opposite things — "this node's cert did
+    not verify" must run nothing, "this node has no cert" must run everything — and
+    collapsing them into one falsy value is exactly how a lapsed identity becomes an
+    unrestricted one.
+    """
+    from blastbox.host.dispatch import _NO_GATE
+
+    # A cert from a DIFFERENT CA: signature verification fails.
+    from blastbox.host import pki
+
+    rogue = pki.ensure_ca(tmp_path / "rogue")
+    issued = rogue.issue_node("toolz3", wg_pubkey="A" * 43 + "=",
+                              grants=pki.NodeGrants(engines=("boxjs",)))
+    crt, _ = issued.write(tmp_path, "node-toolz3")
+    pki.ensure_ca(tmp_path / "pki")
+    monkeypatch.setenv("BLASTBOX_PKI_DIR", str(tmp_path / "pki"))
+    monkeypatch.setenv("BLASTBOX_NODE_CERT", str(crt))
+
+    g = _GrantsOnly()._self_grants()
+    assert g is None, "a foreign certificate must refuse, not abstain"
+    assert g is not _NO_GATE
+
+
+def test_a_missing_certificate_file_refuses_when_the_gate_is_forced_on(tmp_path, monkeypatch):
+    from blastbox.host.dispatch import _NO_GATE
+
+    monkeypatch.setenv("BLASTBOX_NODE_GRANTS_GATE", "1")
+    monkeypatch.delenv("BLASTBOX_NODE_CERT", raising=False)
+    monkeypatch.delenv("BLASTBOX_NODE_ID", raising=False)
+    g = _GrantsOnly()._self_grants()
+    assert g is None and g is not _NO_GATE
+
+
+def test_the_gate_can_be_turned_off_even_with_a_certificate_present(tmp_path, monkeypatch):
+    from blastbox.host.dispatch import _NO_GATE
+
+    _issue_node_cert(tmp_path, monkeypatch, engines=("boxjs",))
+    monkeypatch.setenv("BLASTBOX_NODE_GRANTS_GATE", "0")
+    assert _GrantsOnly()._self_grants() is _NO_GATE
+
+
+def test_the_grants_are_cached_but_not_forever(tmp_path, monkeypatch):
+    """A renewed certificate must be picked up without a restart, and a lapsed one must
+    start refusing — both are the same TTL."""
+    _issue_node_cert(tmp_path, monkeypatch, engines=("boxjs",))
+    d = _GrantsOnly()
+    first = d._self_grants()
+    assert first is not None
+    d._self_grants_ttl_s = 0.0          # expire immediately
+    assert d._self_grants() is not None  # re-read, still valid
+    assert d._self_grants_at > 0
+
+
+def test_a_vpn_tier_needs_the_credentials_grant_only_in_local_mode(tmp_path, monkeypatch):
+    """`credentials` governs whether a node may HOLD a provider profile. A local-mode
+    node running openvpn holds one; a global-mode node forwards over the overlay to a
+    host that does and holds nothing, so requiring the grant there would idle every
+    correctly-issued worker node."""
+    from blastbox.host import egress_apply as ea
+    from blastbox.host.placement import refusal
+    from blastbox.host.pki import NodeGrants
+
+    d = _GrantsOnly()
+    env = tmp_path / "egress.env"
+
+    env.write_text("BLASTBOX_EGRESS_MODE=global\n")
+    monkeypatch.setattr(ea, "ENV_FILE", env)
+    assert d._egress_mode() == "global"
+
+    env.write_text("BLASTBOX_EGRESS_MODE=local\n")
+    assert d._egress_mode() == "local"
+
+    g = NodeGrants(engines=("boxjs",), tiers=("openvpn",), credentials=False)
+    assert refusal(g, engine="boxjs", tier="openvpn", require_credentials=False) is None
+    assert refusal(g, engine="boxjs", tier="openvpn", require_credentials=True) is not None
+
+
+def test_an_unmanaged_node_does_not_read_as_local_mode(monkeypatch, tmp_path):
+    """Absence of an egress.env is not local mode; reading it that way would demand a
+    credentials grant from every node that never ran `egress apply`."""
+    from blastbox.host import egress_apply as ea
+
+    monkeypatch.setattr(ea, "ENV_FILE", tmp_path / "nope.env")
+    assert _GrantsOnly()._egress_mode() == ""

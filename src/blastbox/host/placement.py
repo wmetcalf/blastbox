@@ -1,14 +1,16 @@
 """Which nodes may run what — the eligibility half of federated placement.
 
-NOT YET WIRED INTO DISPATCH — READ THIS BEFORE TRUSTING ANY SENTENCE BELOW.
-Nothing in ``src/`` imports this module at all (its sibling
-:mod:`blastbox.host.node_registry` is imported only from here); there is no CLI
-subcommand, the dispatcher has no hook,
-and no code path consults it when placing a job. Everything here is written in the
-present tense because it describes what the module DOES when called, and a reader could
-reasonably take that as a description of the running system. It is not one. This is
-step 2/3 of the spec's five-step order, and step 5 ("third-party registration") is the
-one that would make it load-bearing.
+WIRED INTO DISPATCH AS OF 2026-09-16, and only the self-check is. A dispatcher calls
+:func:`refusal` about ITSELF before running a claimed job — "may I run this" — using the
+grants resolved from its own node certificate. That is the leaderless shape the spec's
+§4.2 argues for: no elected placer, every node applying the same deterministic predicate
+to the same inputs. It is OPT-IN per node (a node with no certificate to be judged
+against runs unrestricted, as every first-party deployment does today), because making
+it mandatory would stop every existing install dead on upgrade.
+
+What is still NOT wired: :func:`eligible` and :func:`rank` over a FLEET view, which is
+the "choose a node for this job" half. Nothing builds that view — `build_node_registry`
+is called by nothing — so the ordering functions below have no production caller yet.
 
 A CORRECTION TO THE SPEC THIS IMPLEMENTS. The design note
 (``docs/superpowers/specs/2026-09-15-federated-node-identity-and-placement.md``, step 3)
@@ -67,6 +69,41 @@ class Candidate:
         return max(0, self.record.claims.backlog)
 
 
+def refusal(
+    grants: NodeGrants | None,
+    *,
+    engine: str,
+    tier: str | None = None,
+    require_credentials: bool = False,
+) -> str | None:
+    """Why these grants forbid this work, or ``None`` if they permit it.
+
+    ONE PREDICATE, TWO CALLERS, AND THAT IS THE POINT. :func:`eligible` asks it about
+    every node in a fleet view — "who may run this" — and a dispatcher asks it about
+    ITSELF before claiming — "may I". The spec's §4.2 argues for leaderless convergence,
+    where every dispatcher runs the same deterministic decision over the same inputs;
+    two implementations of "what the grants permit" would be the fastest way to lose
+    that, and the self-check is the one that is actually enforcing anything.
+
+    ``None`` grants is a REFUSAL, not an absence of opinion: a node that has registered
+    but whose certificate the reader could not verify — expired, foreign, unenrolled —
+    may not be given work. The reason names that case separately from empty grants so an
+    operator can tell a lapsed cert from a deliberate revocation, which
+    :func:`unverified_nodes` exists to surface; the DECISION is identical either way.
+    """
+    if grants is None:
+        return ("no verifiable node certificate, so nothing is granted (expired, "
+                "foreign, or never enrolled)")
+    if not grants.allows_engine(engine):
+        return f"engine {engine!r} is not granted (granted: {list(grants.engines) or 'none'})"
+    if tier is not None and not grants.allows_tier(tier):
+        return f"netpolicy tier {tier!r} is not granted (granted: {list(grants.tiers) or 'none'})"
+    if require_credentials and not grants.credentials:
+        return ("this work needs a node that may hold provider credentials, and this "
+                "certificate grants credentials=False")
+    return None
+
+
 def eligible(
     view: Sequence[NodeRecord],
     grants: Mapping[str, NodeGrants],
@@ -92,15 +129,10 @@ def eligible(
     out: list[Candidate] = []
     for rec in view:
         g = grants.get(rec.node_id)
-        if g is None:
-            continue
-        if not g.allows_engine(engine):
-            continue
-        if tier is not None and not g.allows_tier(tier):
-            continue
-        if require_credentials and not g.credentials:
-            continue
-        out.append(Candidate(node_id=rec.node_id, record=rec, grants=g))
+        if refusal(g, engine=engine, tier=tier,
+                   require_credentials=require_credentials) is None:
+            assert g is not None          # refusal() returns a reason when it is
+            out.append(Candidate(node_id=rec.node_id, record=rec, grants=g))
     # Deterministic: every dispatcher runs this over the same view and must agree.
     return tuple(sorted(out, key=lambda c: c.node_id))
 

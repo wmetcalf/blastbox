@@ -593,6 +593,31 @@ reallocation **update every personality's `gateway=`** to the new
 `BLASTBOX_EGRESS_VPN_GATEWAY_IP` — they are separate sources of truth and nothing
 reconciles them.
 
+### Node grants (who this node may run work for)
+
+A dispatcher checks its OWN node certificate before running a claimed job: grants decide
+what it may run, and a job it is not granted is **released back to the fleet**, not
+failed — this node cannot see the fleet and has no standing to assert that no peer can
+run it.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BLASTBOX_NODE_CERT` | — | path to this node's cert from `pki issue-node`. Its presence is what TURNS THE GATE ON |
+| `BLASTBOX_NODE_ID` | — | alternative to the above: resolves `<BLASTBOX_PKI_DIR>/node-<id>.crt` if that file exists |
+| `BLASTBOX_PKI_DIR` | `/var/lib/blastbox/pki` | where `ca.crt` lives. Only the CA's **public** half is needed here |
+| `BLASTBOX_NODE_GRANTS_GATE` | — | `1` forces the gate on (and refuses everything if no certificate is configured); `0` forces it off |
+| `BLASTBOX_NODE_GRANTS_TTL_S` | `300` | how long a resolved certificate is cached. A renewal is picked up, and a lapse starts refusing, within this window |
+
+**Opt-in by design.** A node with no certificate configured runs unrestricted, exactly
+as before — making the gate mandatory would stop every existing first-party deployment
+dead on upgrade, and until third-party registration exists there is nothing for it to
+constrain.
+
+**An unverifiable certificate refuses; it does not abstain.** Expired, foreign or
+unreadable all mean "run nothing", because "revocation is stop renewing" bounds exposure
+only if something acts on the lapse. That is a different state from "no certificate
+configured", and the two must never collapse into one.
+
 Dispatcher-side knobs (not written to the file):
 
 | Variable | Default | Meaning |
