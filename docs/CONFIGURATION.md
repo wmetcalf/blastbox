@@ -461,6 +461,8 @@ boot unit **and by the dispatcher's health gate**. Contains no credentials by de
 | `BLASTBOX_EGRESS_UPSTREAM_GW` | — | global mode: overlay IP of the central exit host (required) |
 | `BLASTBOX_EGRESS_OVERLAY_NET` / `_OVERLAY_GW` | `10.77.0.0/24` / `10.77.0.1` | the WireGuard overlay |
 | `BLASTBOX_EGRESS_WG_IF` / `_WG_PORT` | `bbwg0` / `51821` | overlay interface and listen port |
+| `BLASTBOX_EGRESS_RT_TABLE` / `_RT_TABLE_ID` | `bbwg` / `220` | the dedicated routing table's name and numeric id. Change the id when something else on the host already claims it — a co-resident CAPE rooter writes per-VPN tables with operator-chosen numbers, and `apply` refuses rather than stomp one |
+| `BLASTBOX_EGRESS_EXIT_HOST` | `0` | `1` marks this host as the CENTRAL EXIT, set by `egress gateway-exit` rather than by hand. It is load-bearing: `apply` replays the exit-host rules and prunes lapsed peers only when it is set, `enforcement_present` checks the overlay prefix and `BB-WG-EXIT` instead of the forwarder address and `BB-WG-FWD`, and `node_health` takes an entirely different path. Dropping this line while hand-editing the file makes the exit host re-apply as a worker node |
 | `BLASTBOX_EGRESS_FORWARDER_IMAGE` | `blastbox-egress-forwarder:dev` | must exist; `apply` refuses rather than build it |
 
 Any bridge `apply` relocates carries its pinned addresses with it, so after a

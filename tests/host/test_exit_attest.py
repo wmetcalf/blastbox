@@ -104,17 +104,41 @@ def test_an_idle_node_with_still_counters_is_not_accused():
     assert v.contained and not v.contradicted
 
 
-def test_the_working_signal_must_come_from_the_control_plane_not_the_node():
-    """Pinned as an API shape: `working` is a separate argument precisely so the caller
-    supplies it from the job store. If it were read off the node's heartbeat the
-    adversary would supply both sides of the comparison."""
-    import inspect
+def test_no_observation_a_node_can_influence_ever_produces_a_contradiction():
+    """The `working` signal must come from the JOB STORE, not from anything the node
+    says — otherwise the adversary supplies both sides of the comparison.
 
-    from blastbox.host import exit_attest
+    This used to assert on `attest.__doc__` and on the parameter's existence, which
+    constrains nothing: the hypothesised regression (a convenience default like
+    `working = working or {n: r.claims.egress_healthy ...}`) keeps both the signature
+    and the sentence and passes. So assert the BEHAVIOUR instead — with no control-plane
+    input, no arrangement of the peer's own observable state may be turned into a
+    finding against it, because every one of those numbers comes over the wire from the
+    node.
+    """
+    import itertools
+    import time
 
-    sig = inspect.signature(exit_attest.attest)
-    assert "working" in sig.parameters
-    assert "must come from the job store" in exit_attest.attest.__doc__
+    t0 = time.time()
+    for stale, moved in itertools.product((0, STALE_HANDSHAKE_S + 60), (0, 10_000)):
+        verdicts = attest(
+            [obs(at=t0 + 60, handshake_age=stale, rx=moved, tx=moved)],
+            key_to_node=MAP, working=None,
+            previous=[obs(at=t0, rx=0, tx=0)])
+        assert not any(v.contradicted for v in verdicts), (
+            f"a peer was judged from its own numbers alone "
+            f"(handshake_age={stale}, delta={moved})")
+
+
+def test_the_same_observations_do_produce_a_contradiction_once_the_control_plane_speaks():
+    """The other half, so the test above cannot pass by attest() being inert."""
+    import time
+
+    t0 = time.time()
+    [v] = attest([obs(at=t0 + 60, rx=0, tx=0)], key_to_node=MAP,
+                 working={"toolz3": True}, previous=[obs(at=t0, rx=0, tx=0)],
+                 quiet_streak={"toolz3": QUIET_WINDOWS_BEFORE_LEAK})
+    assert v.contradicted
 
 
 # --------------------------------------------------------------------- tunnel is down

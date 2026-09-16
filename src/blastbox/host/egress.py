@@ -276,6 +276,14 @@ class EgressConfig:
             forwarder_uplink_ip=pick(
                 "FORWARDER_UPLINK_IP", "FORWARDER_UPLINK_IP", cls.forwarder_uplink_ip),
             upstream_gw=pick("UPSTREAM_GW", "UPSTREAM_GW", ""),
+            # Named in ensure_rt_table's only remediation ("Set
+            # BLASTBOX_EGRESS_RT_TABLE_ID to a free id") and, until now, read by
+            # nothing: no from_env, no to_env_lines, no CLI flag, no docs entry. So an
+            # operator whose host already maps 220 to a CAPE rooter's table hit an
+            # unrecoverable `egress apply` with instructions that did nothing, and the
+            # boot unit repeated the raise every 30s forever.
+            rt_table=pick("RT_TABLE", "RT_TABLE", cls.rt_table),
+            rt_table_id=int(pick("RT_TABLE_ID", "RT_TABLE_ID", str(cls.rt_table_id))),
             wg_iface=pick("WG_IF", "WG_IF", cls.wg_iface),
             wg_port=int(pick("WG_PORT", "WG_PORT", str(cls.wg_port))),
             overlay_net=pick("OVERLAY_NET", "OVERLAY_NET", cls.overlay_net),
@@ -301,6 +309,8 @@ class EgressConfig:
             f"BLASTBOX_EGRESS_VPN_GATEWAY_IP={self.vpn_gateway_ip}",
             f"BLASTBOX_EGRESS_FORWARDER_UPLINK_IP={self.forwarder_uplink_ip}",
             f"BLASTBOX_EGRESS_UPSTREAM_GW={self.upstream_gw}",
+            f"BLASTBOX_EGRESS_RT_TABLE={self.rt_table}",
+            f"BLASTBOX_EGRESS_RT_TABLE_ID={self.rt_table_id}",
             f"BLASTBOX_EGRESS_WG_IF={self.wg_iface}",
             f"BLASTBOX_EGRESS_WG_PORT={self.wg_port}",
             f"BLASTBOX_EGRESS_OVERLAY_NET={self.overlay_net}",
@@ -1076,19 +1086,15 @@ ReadWritePaths=/etc/wireguard /etc/blastbox /etc/iproute2
 """
 
 
-def expired_peers(conf: str, *, now: "datetime.datetime | None" = None) -> list[str]:
-    """Names of peers in a wg-quick config whose recorded certificate expiry has passed.
+def peer_expiries(conf: str) -> list[tuple[str, "datetime.datetime"]]:
+    """``(peer name, expiry)`` for every peer in a wg-quick config that records one.
 
-    Revocation for federation is "stop renewing", which bounds exposure only if something
-    actually acts on the lapse. A peer registered from a 7-day cert otherwise keeps its
-    tunnel for years. A peer with no recorded expiry is left alone — it predates
-    enrolment or was force-registered, and silently dropping it would be a worse
-    surprise than leaving it.
+    A peer with no recorded expiry is omitted — it predates enrolment or was
+    force-registered, and treating "no data" as "expired" would silently drop it.
     """
     import datetime as _dt
 
-    at = now or _dt.datetime.now(_dt.timezone.utc)
-    out: list[str] = []
+    out: list[tuple[str, _dt.datetime]] = []
     name: str | None = None
     for line in conf.splitlines():
         line = line.strip()
@@ -1102,6 +1108,49 @@ def expired_peers(conf: str, *, now: "datetime.datetime | None" = None) -> list[
                 continue
             if when.tzinfo is None:
                 when = when.replace(tzinfo=_dt.timezone.utc)
-            if at >= when:
-                out.append(name)
+            out.append((name, when))
+    return out
+
+
+def expired_peers(conf: str, *, now: "datetime.datetime | None" = None) -> list[str]:
+    """Names of peers in a wg-quick config whose recorded certificate expiry has passed.
+
+    Revocation for federation is "stop renewing", which bounds exposure only if something
+    actually acts on the lapse. A peer registered from a 7-day cert otherwise keeps its
+    tunnel for years. A peer with no recorded expiry is left alone — it predates
+    enrolment or was force-registered, and silently dropping it would be a worse
+    surprise than leaving it.
+    """
+    import datetime as _dt
+
+    at = now or _dt.datetime.now(_dt.timezone.utc)
+    return [n for n, when in peer_expiries(conf) if at >= when]
+
+
+def expiring_peers(conf: str, *, within_days: float = 2.0,
+                   now: "datetime.datetime | None" = None) -> list[tuple[str, float]]:
+    """``(peer name, days left)`` for peers close enough to expiry to act on.
+
+    THE SAME MECHANISM THAT MAKES REVOCATION REAL DELETES EVERY LEGITIMATE PEER ON A
+    FIXED CLOCK. `issue_node` defaults to 7 days, `peer-add --cert` records the expiry,
+    and `prune_expired_peers` runs on every exit-host apply — including the boot unit's
+    and, now, the reconcile timer's. So a fleet enrolled on day 0 loses every tunnel on
+    day 7, and from the node's own side nothing looks wrong: its rules are intact, its
+    `enforcement_present` passes, only the forwarder's gate starts failing.
+
+    Short lifetimes are the right design — revocation with no CRL and no online check —
+    but a cliff nobody is warned about is not. This is the warning, surfaced by
+    `egress check` and by the exit host's health so it shows up before the outage rather
+    than as one. Renewal is `pki issue-node` again for the same node id and wg key,
+    followed by `egress peer-add --cert`; it is a RECURRING step, which the deployment
+    docs previously did not say.
+    """
+    import datetime as _dt
+
+    at = now or _dt.datetime.now(_dt.timezone.utc)
+    out: list[tuple[str, float]] = []
+    for name, when in peer_expiries(conf):
+        left = (when - at).total_seconds() / 86400.0
+        if left <= within_days:
+            out.append((name, left))
     return out

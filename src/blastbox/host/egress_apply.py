@@ -22,6 +22,8 @@ from pathlib import Path
 from blastbox.host.egress import (
     ALL_CHAINS,
     expired_peers,
+    expiring_peers,
+    peer_expiries,
     CHAIN_EXIT,
     CHAIN_EXIT_RET,
     CHAIN_FWD,
@@ -600,11 +602,17 @@ def node_health(cfg: EgressConfig) -> Health:
         if not enforced:
             return Health(False, why)
         owner = address_owner(cfg, cfg.vpn_gateway_ip)
+        # A peer about to lapse is not a health failure — the tier is working, and
+        # degrading the exit host would be a fleet-wide outage in response to one node's
+        # paperwork. But every peer enrolled in the same hour expires in the same hour,
+        # and prune_expired_peers runs on every apply (boot unit, reconcile timer), so
+        # the fleet goes dark on a 7-day clock with nothing having said so. Say so.
+        soon = peer_expiry_note(cfg)
         return Health(bool(owner),
-                      f"exit host: {owner} holds {cfg.vpn_gateway_ip}; {why}" if owner
-                      else f"exit host: NOTHING holds {cfg.vpn_gateway_ip} — the exit "
-                           "sidecar is not running, so every peer forwards to an address "
-                           "that never answers")
+                      (f"exit host: {owner} holds {cfg.vpn_gateway_ip}; {why}" if owner
+                       else f"exit host: NOTHING holds {cfg.vpn_gateway_ip} — the exit "
+                            "sidecar is not running, so every peer forwards to an address "
+                            "that never answers") + soon)
     enforced, why = enforcement_present(cfg)
     if not enforced:
         return Health(False, why)
@@ -861,6 +869,28 @@ def setup_gateway(cfg: EgressConfig) -> str:
         os.chmod(conf, 0o600)
     wg_up(cfg)
     return pub
+
+
+#: How far ahead to warn about peer certificates lapsing. Two days is enough notice to
+#: re-issue by hand on a working day, and short enough that the warning still means
+#: something when it appears.
+PEER_EXPIRY_WARN_DAYS = 2.0
+
+
+def peer_expiry_note(cfg: EgressConfig, *, within_days: float = PEER_EXPIRY_WARN_DAYS) -> str:
+    """A human sentence about peers close to expiry, or "" when there is nothing to say."""
+    conf = WG_DIR / f"{cfg.wg_iface}.conf"
+    try:
+        soon = expiring_peers(conf.read_text(), within_days=within_days)
+    except OSError:
+        return ""
+    if not soon:
+        return ""
+    parts = [f"{n} ({'EXPIRED' if d <= 0 else f'{d * 24:.0f}h'})" for n, d in sorted(soon)]
+    return (f" — WARNING: {len(soon)} peer certificate(s) lapse within {within_days:g} "
+            f"days and will be PRUNED on the next apply: {', '.join(parts)}. Renew with "
+            "`pki issue-node` for the same node id and wg key, then `egress peer-add "
+            "--cert`; this is a recurring step, not a one-off enrolment.")
 
 
 def prune_expired_peers(cfg: EgressConfig) -> list[str]:
@@ -1484,4 +1514,15 @@ def check_node(cfg: EgressConfig) -> list[str]:
     if stray:
         rows.append(f"chains from the OTHER role still present (leftover): {', '.join(stray)}")
     rows.append(f"foreign FORWARD rules (must be unchanged by us): {foreign_forward_rules()}")
+    if cfg.exit_host:
+        conf = WG_DIR / f"{cfg.wg_iface}.conf"
+        try:
+            body = conf.read_text()
+        except OSError:
+            body = ""
+        if body:
+            rows.append(f"enrolled peers: {len(peer_expiries(body))} with a recorded expiry")
+            note = peer_expiry_note(cfg)
+            rows.append(note.lstrip(" —").strip() if note
+                        else f"no peer certificate lapses within {PEER_EXPIRY_WARN_DAYS:g} days")
     return rows

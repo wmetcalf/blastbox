@@ -66,7 +66,7 @@ pruned tag cannot turn a working node into an empty gateway address.
 
 ```bash
 sudo blastbox egress check
-sudo scripts/test-egress-leak.sh --mode global --gateway-ip 172.31.0.10
+sudo scripts/test-egress-leak.sh --mode global   # gateway/interface come from egress.env
 ```
 
 The leak test is the only thing that proves the tier: it demands a **failed** fetch with

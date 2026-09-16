@@ -149,15 +149,44 @@ def test_the_extension_is_non_critical_so_standard_tools_ignore_it(ca):
     assert ext.critical is False
 
 
-def test_the_placeholder_oid_arc_is_flagged_in_the_source():
-    """1.3.6.1.4.1.99999 is not an IANA Private Enterprise Number. That is acceptable for
-    certs that never leave this CA and unacceptable the moment they do, so the warning
-    must stay next to the constant where someone changing it will read it."""
-    import inspect
+def test_a_node_cert_carries_no_standard_purpose_so_it_cannot_double_as_a_client_cert(ca):
+    """Why the private arc exists at all: a node cert authorises WireGuard peering and
+    federated placement, and nothing else. If it carried `clientAuth` it would also
+    authenticate to the dispatcher's mTLS, so enrolling someone's hardware as a peer
+    would hand them a control-plane credential.
 
-    src = inspect.getsource(pki)
-    assert "NOT REGISTERED" in src
-    assert re.search(r"1\.3\.6\.1\.4\.1\.99999", src)
+    This used to assert that the string "NOT REGISTERED" appeared in the module source
+    — true of any change to the OID handling as long as the comment survived. The
+    property worth pinning is what the certificate permits.
+    """
+    from cryptography.x509.oid import ExtendedKeyUsageOID
+
+    cert = x509.load_pem_x509_certificate(ca.issue_node('toolz3', wg_pubkey=WG).cert_pem)
+    eku = cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
+    oids = {u.dotted_string for u in eku}
+    assert oids == {pki.OID_NODE_AUTH.dotted_string}, oids
+    standard = {v.dotted_string for k, v in vars(ExtendedKeyUsageOID).items()
+                if not k.startswith("_")}
+    assert not (oids & standard), (
+        f"a node cert must carry no standard EKU; got {oids & standard}"
+    )
+
+
+def test_the_node_eku_is_critical_so_a_verifier_cannot_ignore_it(ca):
+    """A non-critical EKU may be skipped by a verifier that does not recognise it,
+    which turns "authorised for nothing standard" into "unconstrained"."""
+    cert = x509.load_pem_x509_certificate(ca.issue_node('toolz3', wg_pubkey=WG).cert_pem)
+    assert cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage).critical
+
+
+def test_the_placeholder_oid_arc_is_still_the_documented_one():
+    """1.3.6.1.4.1.99999 is not an IANA Private Enterprise Number. Acceptable for certs
+    that never leave this CA, and not the moment they do — so a change to it should be
+    deliberate, and this fails loudly when one happens."""
+    assert pki.OID_NODE_AUTH.dotted_string.startswith("1.3.6.1.4.1.99999."), (
+        "if this arc was replaced with a registered PEN, update the comment beside the "
+        "constant and this test together"
+    )
 
 
 # ------------------------------------------------------------------- peer-add integration

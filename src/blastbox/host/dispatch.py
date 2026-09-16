@@ -561,6 +561,10 @@ class Dispatcher:
             2.0, float(os.environ.get("BLASTBOX_EGRESS_DEFER_CAP_S", "300") or 300))
         self._egress_defer_lock = threading.Lock()
         self._egress_defer_n: dict[str, int] = {}
+        #: Attempt count a job re-enters at when its entry was evicted. Without it the
+        #: eviction below reinstates the very spin the backoff exists to bound — see
+        #: the comment there.
+        self._egress_defer_floor = 0
         # Safety floor for warm recovery: the warm staleness cutoff anchors on started_at (set at
         # CLAIM time), but a warm job's bounding deadline is only established later — after
         # pool.claim (<= warm_claim_timeout_s) + input staging. requeue_grace_s is the slack that
@@ -1178,6 +1182,41 @@ class Dispatcher:
                 self._purge_job_dir_if_owned(job)
             self._record_outcome(job, path="cold", started=t0)
 
+
+    #: Cap on the per-job egress-defer attempt map, and how many entries one overflow
+    #: sheds. Both arbitrary; what matters is that shedding cannot lose escalation.
+    EGRESS_DEFER_MAX = 4096
+    EGRESS_DEFER_EVICT = 1024
+
+    def _bump_egress_defer(self, job_id: str) -> int:
+        """Attempt number for this job's next egress defer, bounding the map.
+
+        NEITHER EVICTION DIRECTION IS SAFE ON ITS OWN, and this is the second time round
+        on the same bug. Evicting the OLDEST entries resets the clocks of exactly the
+        jobs nearest the cap. Evicting the NEWEST — what this did, reasoning that they
+        were "furthest from their cap, so losing their count costs least" — drops the
+        entries that have not escalated YET, so past EGRESS_DEFER_MAX deferred jobs
+        those re-enter at n=1, get the 2.0s floor again, and re-claim at ~0.5Hz for as
+        long as the outage lasts. That is the same unbounded spin the backoff exists to
+        bound, reached from the other side, and `max_queued_age` is off by default so
+        nothing terminates them.
+
+        The real cost of losing an entry is not distance from the cap; it is that the
+        job RESTARTS. So remember how far the evicted entries had got and let their
+        successors resume from there.
+        """
+        with self._egress_defer_lock:
+            n = max(self._egress_defer_n.get(job_id, 0), self._egress_defer_floor) + 1
+            self._egress_defer_n[job_id] = n
+            if len(self._egress_defer_n) > self.EGRESS_DEFER_MAX:
+                evictable = sorted(self._egress_defer_n.items(),
+                                   key=lambda kv: kv[1])[:self.EGRESS_DEFER_EVICT]
+                for stale, stale_n in evictable:
+                    if stale == job_id:
+                        continue
+                    self._egress_defer_floor = max(self._egress_defer_floor, stale_n)
+                    self._egress_defer_n.pop(stale, None)
+            return n
 
     def _node_egress_health(self):
         """Cached verdict on whether THIS node can currently egress, or None to not gate.
@@ -1995,18 +2034,7 @@ class Dispatcher:
         if gated_by_gateway_health:
             health = self._node_egress_health()
             if health is not None and not health.healthy:
-                with self._egress_defer_lock:
-                    n = self._egress_defer_n.get(job.job_id, 0) + 1
-                    self._egress_defer_n[job.job_id] = n
-                    # Bound the map by dropping the NEWEST entries: they are the furthest
-                    # from their cap, so losing their count costs least. Evicting the
-                    # oldest would reset the clocks of exactly the jobs nearest the cap
-                    # and postpone escalation forever — the original unbounded spin.
-                    if len(self._egress_defer_n) > 4096:
-                        newest = sorted(self._egress_defer_n.items(),
-                                        key=lambda kv: kv[1])[:1024]
-                        for stale, _n in newest:
-                            self._egress_defer_n.pop(stale, None)
+                n = self._bump_egress_defer(job.job_id)
                 delay = min(self._egress_defer_cap_s, 2.0 * (2 ** min(n - 1, 8)))
                 # An egress outage must be VISIBLE. Deferring deliberately does not
                 # terminalise the job (a healthy peer may still take it, and this node
@@ -2031,6 +2059,11 @@ class Dispatcher:
                 return
             with self._egress_defer_lock:
                 self._egress_defer_n.pop(job.job_id, None)
+                # The outage is over for this job, so the floor has served its purpose.
+                # Leaving it raised would make the first defer of an unrelated blip a
+                # week later start at the 300s cap.
+                if not self._egress_defer_n:
+                    self._egress_defer_floor = 0
 
         # Gateway-routed tiers (tor/openvpn/wireguard/inspect) have netd install the default route
         # AFTER the container starts; the worker waits for that route via BLASTBOX_NET_WAIT_GATEWAY,

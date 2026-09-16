@@ -4036,3 +4036,74 @@ def test_a_broken_backpressure_probe_does_not_disable_the_reclaim_forever(tmp_pa
 
     assert reap_stale_scratch(tmp_path, 60.0, InMemoryJobStore(), _logging.getLogger("t"),
                               yield_to_work=broken) == 1
+
+
+# --------------------------------------------------------------------------------------
+# The egress-defer backoff must bound its own map without un-bounding the spin.
+# --------------------------------------------------------------------------------------
+
+class _DeferOnly:
+    """Just the defer bookkeeping, unbound from Dispatcher's construction cost."""
+
+    from blastbox.host.dispatch import Dispatcher as _D
+
+    EGRESS_DEFER_MAX = _D.EGRESS_DEFER_MAX
+    EGRESS_DEFER_EVICT = _D.EGRESS_DEFER_EVICT
+    _bump_egress_defer = _D._bump_egress_defer
+
+    def __init__(self):
+        import threading
+
+        self._egress_defer_lock = threading.Lock()
+        self._egress_defer_n: dict[str, int] = {}
+        self._egress_defer_floor = 0
+
+
+def _delay(n, cap=300.0):
+    return min(cap, 2.0 * (2 ** min(n - 1, 8)))
+
+
+def test_an_overflowing_defer_map_does_not_reset_jobs_to_the_two_second_floor():
+    """The eviction dropped the LOWEST-attempt entries, reasoning they were "furthest
+    from their cap, so losing their count costs least". The actual cost of losing an
+    entry is that the job restarts at n=1 and gets `delay = 2.0` again — so past 4096
+    deferred jobs the overflow repeatedly evicted exactly the jobs that had not
+    escalated, and they re-claimed at ~0.5Hz for the length of the outage. That is the
+    spin the whole block was written to bound, and max_queued_age is off by default so
+    nothing terminated them."""
+    d = _DeferOnly()
+    jobs = [f"j{i}" for i in range(6000)]
+    for _round in range(12):
+        delays = [_delay(d._bump_egress_defer(j)) for j in jobs]
+
+    assert min(delays) > 2.0, "some job is still re-claiming at the 2s floor"
+    assert min(delays) == 300.0, "every job should have reached the cap by round 12"
+    assert len(d._egress_defer_n) <= d.EGRESS_DEFER_MAX, "the map is unbounded again"
+
+
+def test_the_map_stays_bounded():
+    d = _DeferOnly()
+    for i in range(d.EGRESS_DEFER_MAX * 3):
+        d._bump_egress_defer(f"j{i}")
+    assert len(d._egress_defer_n) <= d.EGRESS_DEFER_MAX
+
+
+def test_a_jobs_own_entry_is_never_evicted_by_its_own_bump():
+    """Otherwise the caller reads a count for a key that is already gone."""
+    d = _DeferOnly()
+    for i in range(d.EGRESS_DEFER_MAX + 1):
+        d._bump_egress_defer(f"j{i}")
+    last = f"j{d.EGRESS_DEFER_MAX}"
+    assert last in d._egress_defer_n
+
+
+def test_a_healthy_fleet_does_not_inherit_a_raised_floor():
+    """Leaving the floor up would make the first defer of an unrelated blip a week
+    later start at the 300s cap."""
+    d = _DeferOnly()
+    for i in range(d.EGRESS_DEFER_MAX + d.EGRESS_DEFER_EVICT + 10):
+        d._bump_egress_defer(f"j{i}")
+    assert d._egress_defer_floor > 0
+    d._egress_defer_n.clear()
+    d._egress_defer_floor = 0          # what the success path does
+    assert _delay(d._bump_egress_defer("fresh")) == 2.0

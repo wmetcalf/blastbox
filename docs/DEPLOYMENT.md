@@ -304,8 +304,20 @@ sudo blastbox egress apply --mode global --upstream-gw 10.77.0.1
 
 # 5. prove it — including that killing the overlay removes egress
 sudo blastbox egress check
-sudo scripts/test-egress-leak.sh --mode global --gateway-ip 172.31.0.10
+# reads the gateway and interface from /etc/blastbox/egress.env, so it follows a
+# subnet reallocation; pass --gateway-ip / --wg-if only to override
+sudo scripts/test-egress-leak.sh --mode global
 ```
+
+**Step 3 RECURS.** `pki issue-node` defaults to a 7-day lifetime — that short lifetime is
+what makes "revocation is stop renewing" work without a CRL or any online check — and the
+exit host's `prune_expired_peers` runs on every `apply`, which now includes the reconcile
+timer. So a fleet enrolled in one afternoon loses every tunnel on the same afternoon a
+week later unless step 3 is repeated for each node with the same node id and wg key,
+followed by `egress peer-add --cert`. From the worker's own side nothing looks wrong when
+this happens: its rules are intact and `enforcement_present` passes; only the forwarder's
+gate starts failing. `blastbox egress check` on the exit host and its `health` line both
+warn two days ahead, naming each peer and the hours it has left.
 
 **Peers are registered from a CA-signed node cert, not a pasted key.** `pki issue-node`
 binds three things into one signed object: the node's identity, its WireGuard public key,

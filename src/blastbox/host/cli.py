@@ -728,11 +728,18 @@ def _pki_cmd(args: argparse.Namespace) -> int:
         issued = ca.issue_node(args.node_id, wg_pubkey=args.wg_pubkey,
                                grants=grants, days=args.days)
         if args.out:
-            crt, key = issued.write(Path(args.out).parent or pki_dir, Path(args.out).name)
-            print(f"node cert for {args.node_id} ({args.days}d) -> {crt} / {key}")
+            # `write` appends the suffixes, so an --out the operator spelled with one
+            # produced toolz3.crt.crt and toolz3.crt.key — findable only by looking.
+            stem = Path(args.out)
+            if stem.suffix in (".crt", ".key", ".pem"):
+                stem = stem.with_suffix("")
+            crt, key = issued.write(stem.parent or pki_dir, stem.name)
         else:
             crt, key = issued.write(pki_dir, f"node-{args.node_id}")
-            print(f"node cert for {args.node_id} ({args.days}d) -> {crt} / {key}")
+        print(f"node cert for {args.node_id} ({args.days}d) -> {crt} / {key}")
+        print(f"  {key} is a PRIVATE KEY (0600). Renewal is this same command with the "
+              f"same --node-id and --wg-pubkey, then `egress peer-add --cert {crt}`; at "
+              f"{args.days}d it is a recurring step, not a one-off enrolment.")
         if not grants.engines and not grants.tiers:
             # Fail-closed defaults are correct but silently useless; say so once here
             # rather than let an operator debug an idle node.
@@ -1092,7 +1099,12 @@ def build_parser() -> argparse.ArgumentParser:
                               "sidecar). Leave OFF for a global-mode worker node.")
     pk_node.add_argument("--days", type=int, default=7,
                          help="short by design: revocation is 'stop renewing'")
-    pk_node.add_argument("--out", default=None, help="write <out>.crt/.key (default: stdout)")
+    pk_node.add_argument(
+        "--out", default=None,
+        help="basename to write, as <out>.crt and <out>.key. A trailing .crt is "
+             "stripped, so --out /tmp/toolz3.crt writes /tmp/toolz3.crt and .key rather "
+             "than toolz3.crt.crt. Default: <pki-dir>/node-<node-id>.{crt,key} — this "
+             "command ALWAYS writes a private key to disk, it never prints to stdout")
     pk_show = pks.add_parser("show-node", help="verify a node cert and print its identity")
     pk_show.add_argument("--cert", required=True)
     pks.add_parser("show-ca", help="print the CA cert (public trust anchor)")

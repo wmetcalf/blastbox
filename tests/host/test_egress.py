@@ -1314,3 +1314,110 @@ def test_the_leak_script_and_the_health_gate_look_for_the_same_line():
             f"the leak test greps {g!r}, which GATE_OK_PATTERN "
             f"({GATE_OK_PATTERN.pattern!r}) does not accept"
         )
+
+
+# --------------------------------------------------------------------------------------
+# The mechanism that makes revocation real also deletes every legitimate peer.
+# --------------------------------------------------------------------------------------
+
+_PEER_CONF = """[Interface]
+PrivateKey = x
+
+# peer: toolz3
+# expires: {soon}
+[Peer]
+PublicKey = aaa
+
+# peer: toolz4
+# expires: {later}
+[Peer]
+PublicKey = bbb
+
+# peer: legacy
+[Peer]
+PublicKey = ccc
+"""
+
+
+def _conf_at(now):
+    import datetime as dt
+
+    return _PEER_CONF.format(soon=(now + dt.timedelta(hours=20)).isoformat(),
+                             later=(now + dt.timedelta(days=6)).isoformat())
+
+
+def test_a_peer_about_to_lapse_is_reported_before_it_is_pruned():
+    """issue_node defaults to 7 days, peer-add records the expiry, and
+    prune_expired_peers runs on every exit-host apply — boot unit and reconcile timer
+    included. A fleet enrolled in one afternoon therefore loses every tunnel on the same
+    afternoon a week later, and from each node's own side nothing looks wrong: its rules
+    are intact and enforcement_present passes. Short lifetimes are the right design; a
+    cliff nobody is warned about is not."""
+    import datetime as dt
+
+    from blastbox.host.egress import expiring_peers
+
+    now = dt.datetime(2026, 9, 15, tzinfo=dt.timezone.utc)
+    soon = dict(expiring_peers(_conf_at(now), within_days=2, now=now))
+    assert "toolz3" in soon and 0 < soon["toolz3"] < 2
+    assert "toolz4" not in soon, "six days out is not yet actionable"
+    assert "legacy" not in soon, "no recorded expiry is not the same as expired"
+
+
+def test_an_already_expired_peer_still_shows_in_the_warning():
+    """It has not been pruned yet — the next apply will do that — so the operator should
+    see it now rather than discover it as an outage."""
+    import datetime as dt
+
+    from blastbox.host.egress import expired_peers, expiring_peers
+
+    now = dt.datetime(2026, 9, 15, tzinfo=dt.timezone.utc)
+    conf = _conf_at(now - dt.timedelta(days=2))
+    assert "toolz3" in expired_peers(conf, now=now)
+    assert dict(expiring_peers(conf, within_days=2, now=now))["toolz3"] <= 0
+
+
+def test_the_warning_names_the_renewal_command(tmp_path, monkeypatch):
+    """"Revocation is stop renewing" only bounds exposure if renewing is a thing
+    somebody knows how to do; there is no `pki renew-node`, and the deployment docs
+    never said step 3 recurs."""
+    import datetime as dt
+
+    from blastbox.host import egress_apply as ea
+
+    now = dt.datetime.now(dt.timezone.utc)
+    monkeypatch.setattr(ea, "WG_DIR", tmp_path)
+    (tmp_path / "bbwg0.conf").write_text(_conf_at(now))
+    note = ea.peer_expiry_note(EgressConfig(exit_host=True))
+    assert "toolz3" in note and "PRUNED" in note
+    assert "pki issue-node" in note and "peer-add" in note
+    assert "recurring" in note
+
+
+def test_no_note_when_nothing_is_close_to_lapsing(tmp_path, monkeypatch):
+    """A warning that is always on is not a warning."""
+    import datetime as dt
+
+    from blastbox.host import egress_apply as ea
+
+    now = dt.datetime.now(dt.timezone.utc)
+    monkeypatch.setattr(ea, "WG_DIR", tmp_path)
+    (tmp_path / "bbwg0.conf").write_text(
+        _PEER_CONF.format(soon=(now + dt.timedelta(days=30)).isoformat(),
+                          later=(now + dt.timedelta(days=40)).isoformat()))
+    assert ea.peer_expiry_note(EgressConfig(exit_host=True)) == ""
+
+
+def test_the_routing_table_id_the_error_message_names_is_actually_read():
+    """ensure_rt_table's only remediation is "Set BLASTBOX_EGRESS_RT_TABLE_ID to a free
+    id", and nothing read it: no from_env, no to_env_lines, no CLI flag, no docs entry.
+    An operator whose host already maps 220 to a CAPE rooter's table had an
+    unrecoverable apply and instructions that did nothing, repeated by the boot unit
+    every 30 seconds."""
+    env = {"BLASTBOX_EGRESS_RT_TABLE_ID": "251", "BLASTBOX_EGRESS_RT_TABLE": "bbwg2"}
+    cfg = EgressConfig.from_env(env)
+    assert (cfg.rt_table_id, cfg.rt_table) == (251, "bbwg2")
+    # and it must survive the round trip through egress.env, or a reboot loses it
+    lines = dict(line.split("=", 1) for line in cfg.to_env_lines())
+    assert lines["BLASTBOX_EGRESS_RT_TABLE_ID"] == "251"
+    assert EgressConfig.from_env(lines).rt_table_id == 251
