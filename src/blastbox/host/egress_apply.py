@@ -172,6 +172,17 @@ def host_route_cidrs() -> list[str]:
     return out
 
 
+def _allow_unknown_routes() -> bool:
+    """The deliberate override for a host with no iproute2 at all.
+
+    Separate from --no-auto-subnets on purpose: choosing your own subnets and being
+    unable to see the host's are different decisions, and conflating them let the second
+    happen silently whenever someone made the first.
+    """
+    return os.environ.get("BLASTBOX_EGRESS_ALLOW_UNKNOWN_ROUTES", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 class HostFactsUnavailable(RuntimeError):
     """We cannot enumerate what this host already uses, so we must not allocate.
 
@@ -227,6 +238,26 @@ def container_state(name: str) -> tuple[bool, int, str]:
         argv += ["--since", parts[2]]
     logs = _run([*argv, name], check=False)
     return running, restarts, (logs.stdout or "") + (logs.stderr or "")
+
+
+def _chain_accept_escapes(rule: str, want_dev: str | None) -> bool:
+    """Does this BB-WG chain rule ACCEPT traffic out of something it should not?
+
+    The old test was `"-o" not in ln`, a SUBSTRING over the whole rule that never
+    compared the interface to anything. `-A BB-WG-FWD -o eth0 -j ACCEPT` ahead of the
+    DROP is a total WAN escape and passed it; so did a blanket ACCEPT carrying the
+    characters "-o" anywhere else, e.g. in a `--comment`. The chain's one job is "may
+    leave ONLY by the tunnel / the exit bridge", so compare the device.
+    """
+    if not rule.rstrip().endswith("-j ACCEPT"):
+        return False
+    tok = rule.split()
+    if "-o" not in tok:
+        return True                      # unrestricted ACCEPT: escapes by definition
+    try:
+        return tok[tok.index("-o") + 1] != want_dev
+    except IndexError:
+        return True
 
 
 def _rule_from(body: str) -> str | None:
@@ -394,6 +425,8 @@ def enforcement_present(cfg: EgressConfig) -> tuple[bool, str]:
     # /32. Checking it for forwarder rules reported the working central host as degraded.
     fwd = cfg.overlay_net if cfg.exit_host else cfg.forwarder_uplink_ip
     chain = CHAIN_EXIT if cfg.exit_host else CHAIN_FWD
+    # On an exit host the sanctioned egress device is the bb-vpn bridge, not the tunnel.
+    eif = iface_for(cfg.vpn_gateway_ip) if cfg.exit_host else None
 
     rules = _run(["ip", "rule", "show"], check=False).stdout or ""
     if not any(_rule_matches(r, fwd) and (cfg.rt_table in r.split()
@@ -403,6 +436,31 @@ def enforcement_present(cfg: EgressConfig) -> tuple[bool, str]:
     if not any(_rule_matches(r, fwd) and "blackhole" in r.split()
                for r in _rules_at(rules, PRIO_BLACKHOLE)):
         missing.append(f"blackhole fall-through guard (priority {PRIO_BLACKHOLE})")
+
+    # THE TABLE'S CONTENTS ARE THE ENFORCEMENT, and nothing looked at them. The rule
+    # sends our source to a table; the blackhole behind it only fires when that table
+    # yields NO route. So a table holding `default dev <WAN>` is a complete bypass that
+    # every check above reports as fully contained — the rule is present, the blackhole
+    # is present, and neither is doing anything. This function never ran
+    # `ip route show table` at all.
+    #
+    # An empty table is FINE here: that is the wg-is-down case the blackhole exists for,
+    # and it fails closed. What must not be true is a default pointing anywhere but the
+    # tunnel (worker) or the exit bridge (exit host).
+    want_dev = eif if cfg.exit_host else cfg.wg_iface
+    table = _run(["ip", "route", "show", "table", cfg.rt_table], check=False)
+    if table.returncode == 0:
+        for line in (table.stdout or "").splitlines():
+            if not line.startswith("default"):
+                continue
+            tok = line.split()
+            dev = tok[tok.index("dev") + 1] if "dev" in tok else None
+            if dev != want_dev:
+                missing.append(
+                    f"table {cfg.rt_table} routes default via {dev or 'an unknown device'}, "
+                    f"not {want_dev} — the source route sends our traffic there, and the "
+                    "blackhole cannot fire because a route WAS found")
+            break
 
     # THE FILTER LAYER IS ONLY OBSERVABLE AS ROOT. `ip rule show` works unprivileged;
     # `iptables -S` does not — it exits 4 with "Permission denied". The dispatcher is
@@ -415,7 +473,11 @@ def enforcement_present(cfg: EgressConfig) -> tuple[bool, str]:
     unverified: list[str] = []
     # The bridge our packets enter FORWARD from. Knowing it lets an ACCEPT restricted to
     # some other input interface be excluded instead of condemning the node.
-    bridge_iface = iface_for(fwd)
+    # NOT iface_for(fwd): on an exit host fwd is a prefix, and `ip route get <prefix>`
+    # resolves via the default route to the WAN device — so the `-i` refinement was
+    # comparing against the wrong interface entirely.
+    bridge_iface = iface_for(cfg.vpn_gateway_ip if cfg.exit_host
+                             else cfg.forwarder_uplink_ip)
     fwd_probe = _run(["iptables", "-w", "2", "-S", "FORWARD"], check=False)
     if fwd_probe.returncode != 0:
         unverified.append(f"{chain} jump (needs root; `blastbox egress check` as root "
@@ -431,7 +493,16 @@ def enforcement_present(cfg: EgressConfig) -> tuple[bool, str]:
             if line.endswith(f"-j {chain}") and jump_at is None:
                 tok = line.split()
                 src = tok[tok.index("-s") + 1] if "-s" in tok else None
-                if src is None or _rule_matches(f"from {src}", fwd):
+                if src is not None:
+                    ours = _rule_matches(f"from {src}", fwd)
+                else:
+                    # No `-s` is only OUR jump if it is genuinely UNQUALIFIED. A jump
+                    # narrowed by any other selector (`-i lo`, `-d`, `-m mark`) is
+                    # reachable by traffic that is not ours, so accepting it certified
+                    # an orphan chain as in-path — the very condition this check exists
+                    # to detect.
+                    ours = tok == ["-A", "FORWARD", "-j", chain]
+                if ours:
                     jump_at = i
             # Does this rule swallow OUR traffic before we are reached? Narrowing the
             # last version to "docker jumps only" went too far the other way: an ACCEPT
@@ -451,8 +522,10 @@ def enforcement_present(cfg: EgressConfig) -> tuple[bool, str]:
         if probe.returncode != 0 or not body:
             missing.append(f"{chain} chain")
         elif not body[-1].endswith("-j DROP") or any(
-                ln.endswith("-j ACCEPT") and "-o" not in ln for ln in body):
-            missing.append(f"{chain} WAN-escape DROP (a blanket ACCEPT precedes it)")
+                _chain_accept_escapes(ln, want_dev) for ln in body):
+            missing.append(
+                f"{chain} WAN-escape DROP (an ACCEPT ahead of it leaves by something "
+                f"other than {want_dev})")
 
     if missing:
         return False, "enforcement MISSING: " + ", ".join(missing)
@@ -590,12 +663,19 @@ def plan_subnets(cfg: EgressConfig, *, auto: bool = True) -> SubnetPlan:
     # prevent, and `ensure_bridges` raises CalledProcessError (which the CLI does not
     # catch) rather than a clean message.
     claimed = claimed_cidrs()
-    if auto and not host_route_cidrs():
+    # ALWAYS, not just when auto-allocating. The guard used to sit behind `if auto`, and
+    # its own error message pointed the operator at --no-auto-subnets as the workaround —
+    # which turned the safety check OFF rather than narrowing it. With host routes
+    # unknown, `claimed` holds docker's pools only, nothing conflicts, and
+    # ensure_bridges happily creates the CONFIGURED bridge over the management LAN. The
+    # check is about knowing what the host uses; that matters whoever picked the range.
+    if not host_route_cidrs() and not _allow_unknown_routes():
         raise HostFactsUnavailable(
-            "cannot read this host's routes (`ip` missing or not permitted), so the "
-            "allocator cannot tell which ranges are already in use — it would happily "
-            "take the management LAN. Install iproute2, or pass --no-auto-subnets and "
-            "set the subnets explicitly.")
+            "cannot read this host's routes (`ip` missing, or not permitted), so neither "
+            "the allocator nor this check can tell which ranges are already in use — a "
+            "bridge could land on the management LAN and cut the node off. Install "
+            "iproute2, or set BLASTBOX_EGRESS_ALLOW_UNKNOWN_ROUTES=1 to proceed anyway "
+            "(and be certain your subnets are free).")
     return allocate_subnets(cfg, claimed, auto=auto, skip=frozenset(existing))
 
 
@@ -1121,9 +1201,21 @@ def apply_exit_host(cfg: EgressConfig, *, persist: bool = False) -> list[str]:
     ``persist`` records the exit-host role in egress.env so the boot unit replays it;
     the CLI sets it, the boot-time replay does not (it is already acting on the record).
     """
+    # `ip route get` is NOT proof the sidecar exists — that lesson was applied to
+    # node_health and not here. With nothing holding the address it resolves via the
+    # DEFAULT ROUTE to the WAN device, and that device was then substituted into
+    # `-A BB-WG-EXIT -o <WAN> -j ACCEPT` and the SNAT: an explicit rule sending every
+    # peer's malware traffic out of the central host's own WAN, which enforcement_present
+    # would have reported as a correct in-path DROP. Ask who holds the address.
+    owner = address_owner(cfg, cfg.vpn_gateway_ip)
+    if not owner:
+        raise RuntimeError(
+            f"nothing holds {cfg.vpn_gateway_ip} on bb-vpn — the exit sidecar is not "
+            "running. Start it before installing the exit path, or peer traffic would be "
+            "routed at whatever the default route resolves to.")
     eif = iface_for(cfg.vpn_gateway_ip)
     if not eif:
-        raise RuntimeError(f"no interface route to {cfg.vpn_gateway_ip} — is the sidecar up?")
+        raise RuntimeError(f"no interface route to {cfg.vpn_gateway_ip}")
     ensure_rt_table(cfg)
     run_steps(exit_host_steps(cfg, eif))
     notes = [f"peer traffic {cfg.overlay_net} -> exit sidecar {cfg.vpn_gateway_ip} via {eif}",

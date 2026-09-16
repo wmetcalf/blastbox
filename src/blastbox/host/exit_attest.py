@@ -245,8 +245,24 @@ def attest(
         allowance = keepalive_allowance(elapsed)
         real_traffic = delta > allowance
 
+        carried = (quiet_streak or {}).get(node_id, 0)
+        if not working.get(node_id) and not real_traffic:
+            # IDLE IS NOT INNOCENCE, IT IS ABSENCE OF EVIDENCE. Emitting the default
+            # quiet_windows=0 here dropped the node from the caller's persisted map and
+            # silently reset its streak — so a node that is busy two windows in three
+            # never reaches the threshold, and ordinary scheduling defeated the only
+            # leak signal this module can produce. Measured: 12 windows of
+            # keepalive-only traffic with work dispatched 2-in-3 peaked at a streak of
+            # 2 and never accused. Carry the count; only real traffic clears it.
+            verdicts.append(Verdict(
+                node_id=node_id, contained=True, quiet_windows=carried,
+                reason=(f"connected; {delta}B in {int(elapsed)}s is keepalive-only, and "
+                        "no work was dispatched here"
+                        + (f" (still holding {carried} unexplained quiet window(s))"
+                           if carried else ""))))
+            continue
         if working.get(node_id) and not real_traffic:
-            streak = (quiet_streak or {}).get(node_id, 0) + 1
+            streak = carried + 1
             if streak < QUIET_WINDOWS_BEFORE_LEAK:
                 # Not yet an accusation. Most detonations are quiet — see
                 # QUIET_WINDOWS_BEFORE_LEAK — so one window proves nothing.

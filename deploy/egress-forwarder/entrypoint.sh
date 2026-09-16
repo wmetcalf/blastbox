@@ -43,14 +43,26 @@ UPLINK_IF="$(ip route show default | awk '/default/{print $5; exit}')"
 [ -n "$UPLINK_GW" ] && [ -n "$UPLINK_IF" ] || {
   echo "forwarder: no uplink route — cannot reach the overlay; refusing to start" >&2; exit 1; }
 
-# 1. Fail closed BEFORE touching routing. Nothing is forwarded until a rule says so.
+# 1. Fail closed BEFORE anything else. Nothing is forwarded until a rule says so.
 iptables -P FORWARD DROP
-iptables -t nat -A POSTROUTING -s "$SUBNET" -o "$UPLINK_IF" -j MASQUERADE
-iptables -A FORWARD -s "$SUBNET" -o "$UPLINK_IF" -j ACCEPT
-iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
 
-# 2. Startup gate: reaching the overlay peer proves the node is source-routing us into
-#    wg. Retry, because the forwarder and wg-quick can race at boot.
+# 2. THE GATE RUNS BEFORE THE PLUMBING, and the order is the point.
+#
+# The first version installed the MASQUERADE and the forwarding ACCEPT here and probed
+# afterwards — so for the whole retry window (15 tries x 2s = ~30s) the container was
+# fully forwarding worker traffic to the node while still deciding whether node-side
+# enforcement existed. `--restart on-failure:3` repeated that up to four times, about two
+# minutes of live forwarding per boot. The file's own claim ("if it fails we EXIT, leaving
+# nothing at the gateway address") and the CI assertion both describe the END state and
+# neither covered that window.
+#
+# It is reachable on an ordinary reboot: dockerd restores this container before
+# blastbox-egress.service can run (the unit is After=docker.service by design), so the
+# node has no source route and no BB-WG-FWD, and docker's own terminal ACCEPT for the
+# non-internal bb-net0 bridge would carry those packets out of the node's WAN.
+#
+# Reaching the overlay peer proves the node IS source-routing us — only its rules can
+# make that succeed. So: prove it first, forward second.
 n=0
 until ping -c1 -W2 "$UP" >/dev/null 2>&1; do
   n=$((n+1))
@@ -61,6 +73,11 @@ until ping -c1 -W2 "$UP" >/dev/null 2>&1; do
     exit 1; }
   sleep 2
 done
+
+# 3. Only now is it safe to carry traffic.
+iptables -t nat -A POSTROUTING -s "$SUBNET" -o "$UPLINK_IF" -j MASQUERADE
+iptables -A FORWARD -s "$SUBNET" -o "$UPLINK_IF" -j ACCEPT
+iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
 
 echo "forwarder: overlay peer $UP reachable via ${UPLINK_IF}/${UPLINK_GW}"
 echo "forwarder: serving $SUBNET (fail-closed; holds no provider credentials)"

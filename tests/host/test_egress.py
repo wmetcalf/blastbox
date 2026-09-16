@@ -340,9 +340,23 @@ def test_egress_health_gate_is_off_unless_the_node_is_managed(monkeypatch, tmp_p
     assert probe(Fake()) is None
 
 
-def test_egress_health_gate_never_raises_into_the_dispatch_path(monkeypatch):
-    """A broken probe must not fail jobs. Refusing work because a health check is broken
-    is a worse failure than the outage it guards against."""
+def test_a_broken_probe_on_a_managed_node_degrades_rather_than_waving_work_through():
+    """This REVERSES an earlier decision here, and the reasoning is worth keeping.
+
+    The first version returned None (don't gate) for any probe exception, on the
+    principle that refusing work because a health check is broken is worse than the
+    outage it guards against. That principle is right for an UNMANAGED node — and an
+    unmanaged node never reaches this code, because the gate arms on
+    /etc/blastbox/egress.env existing.
+
+    On a MANAGED node the same code path meant an unanticipated parse error in any of
+    node_health's five shell-outs silently disarmed containment gating for a TTL at a
+    time, logged at DEBUG. That is the opposite posture of the ValueError branch beside
+    it, which degrades deliberately. And the cost is not symmetric: degrading here
+    DEFERS to a peer, it does not fail the job.
+
+    Only "this build has no egress module" still fails open.
+    """
     from blastbox.host import dispatch as d
 
     class Fake:
@@ -350,10 +364,40 @@ def test_egress_health_gate_never_raises_into_the_dispatch_path(monkeypatch):
         _egress_health_at = 0.0
         _egress_health_ttl_s = 15.0
 
-    monkeypatch.setenv("BLASTBOX_EGRESS_HEALTH_GATE", "1")
-    monkeypatch.setattr("blastbox.host.egress_apply.node_health",
-                        lambda cfg: (_ for _ in ()).throw(OSError("docker is gone")))
-    assert d.Dispatcher._node_egress_health(Fake()) is None
+    import os
+
+    os.environ["BLASTBOX_EGRESS_HEALTH_GATE"] = "1"
+    try:
+        import blastbox.host.egress_apply as ea
+
+        real = ea.node_health
+        ea.node_health = lambda cfg: (_ for _ in ()).throw(OSError("docker is gone"))
+        try:
+            verdict = d.Dispatcher._node_egress_health(Fake())
+            assert verdict is not None, "a managed node must not skip the gate"
+            assert not verdict.healthy
+            assert "probe itself failed" in verdict.reason
+        finally:
+            ea.node_health = real
+
+        # ...but a build without the module at all still fails open.
+        import builtins
+
+        real_import = builtins.__import__
+
+        def no_egress(name, *a, **kw):
+            if "egress_apply" in name:
+                raise ImportError("no egress module in this build")
+            return real_import(name, *a, **kw)
+
+        builtins.__import__ = no_egress
+        try:
+            Fake._egress_health = None
+            assert d.Dispatcher._node_egress_health(Fake()) is None
+        finally:
+            builtins.__import__ = real_import
+    finally:
+        os.environ.pop("BLASTBOX_EGRESS_HEALTH_GATE", None)
 
 
 def test_a_summary_route_does_not_veto_every_candidate():
@@ -1101,3 +1145,82 @@ def test_an_exit_hosts_containment_is_checked_despite_mode_local(monkeypatch):
     ea_ = _fake_host(monkeypatch, rules="", forward="", chain="")
     ok, why = ea_.enforcement_present(EgressConfig(exit_host=True))
     assert not ok, "an exit host with no rules must not read as 'local mode is fine'"
+
+
+def test_a_poisoned_routing_table_is_not_containment(monkeypatch):
+    """The rule sends our source to a table; the blackhole behind it fires only when that
+    table yields NO route. So a table holding `default dev <WAN>` is a complete bypass
+    that every other check reports as contained — and nothing ever ran
+    `ip route show table` at all."""
+    from blastbox.host import egress_apply as ea
+
+    def host(table):
+        def fake(argv, **kw):
+            a = list(argv)
+            if a[:3] == ["ip", "rule", "show"]:
+                out = _GOOD_RULES
+            elif a[:4] == ["ip", "route", "show", "table"]:
+                out = table
+            elif a[-1] == "FORWARD":
+                out = _GOOD_FWD
+            else:
+                out = _GOOD_CHAIN
+            return type("P", (), {"returncode": 0, "stdout": out, "stderr": ""})()
+        monkeypatch.setattr(ea, "_run", fake)
+        return ea
+
+    ok, why = host("default dev eth0 scope link\n").enforcement_present(GLOBAL)
+    assert not ok and "not bbwg0" in why
+
+    assert host("default dev bbwg0 scope link\n").enforcement_present(GLOBAL)[0]
+    # An EMPTY table is the wg-is-down case the blackhole exists for: fails closed.
+    assert host("").enforcement_present(GLOBAL)[0]
+
+
+@pytest.mark.parametrize("chain_rule,escapes", [
+    ("-A BB-WG-FWD -o eth0 -j ACCEPT", True),               # a total WAN escape
+    ('-A BB-WG-FWD -m comment --comment "x-o-x" -j ACCEPT', True),   # blanket, "-o" in a comment
+    ("-A BB-WG-FWD -j ACCEPT", True),                       # unrestricted
+    ("-A BB-WG-FWD -o bbwg0 -j ACCEPT", False),             # the sanctioned device
+])
+def test_a_chain_accept_must_name_the_sanctioned_device(chain_rule, escapes):
+    """The old test was `"-o" not in ln` — a substring over the whole rule that never
+    compared the interface to anything."""
+    from blastbox.host.egress_apply import _chain_accept_escapes
+
+    assert _chain_accept_escapes(chain_rule, "bbwg0") is escapes
+
+
+def test_an_unqualified_jump_counts_but_a_narrowed_one_does_not(monkeypatch):
+    """A jump with no `-s` was accepted as ours. One narrowed by any OTHER selector is
+    reachable by traffic that is not ours, so accepting it certified an orphan chain."""
+    for forward, contained in (
+            ("-P FORWARD DROP\n-A FORWARD -j BB-WG-FWD\n", True),          # unqualified
+            ("-P FORWARD DROP\n-A FORWARD -i lo -j BB-WG-FWD\n", False),   # narrowed
+    ):
+        ea_ = _fake_host(monkeypatch, rules=_GOOD_RULES, forward=forward,
+                         chain=_GOOD_CHAIN)
+        monkeypatch.setattr(ea_, "_run", ea_._run)
+        assert ea_.enforcement_present(GLOBAL)[0] is contained
+
+
+def test_no_auto_subnets_does_not_disable_the_host_facts_check(monkeypatch):
+    """The guard sat behind `if auto`, and its own error message pointed the operator at
+    --no-auto-subnets as the workaround — which turned the safety check OFF rather than
+    narrowing it. Choosing your own subnets and being unable to see the host's are
+    different decisions."""
+    from blastbox.host import egress_apply as ea
+
+    monkeypatch.setattr(ea, "host_route_cidrs", lambda: [])
+    monkeypatch.setattr(ea, "docker_network_cidrs", lambda: [])
+    monkeypatch.setattr(ea, "_run", lambda argv, **kw: type(
+        "P", (), {"returncode": 1, "stdout": "", "stderr": ""})())
+    monkeypatch.delenv("BLASTBOX_EGRESS_ALLOW_UNKNOWN_ROUTES", raising=False)
+
+    for auto in (True, False):
+        with pytest.raises(ea.HostFactsUnavailable):
+            ea.plan_subnets(EgressConfig(), auto=auto)
+
+    # The deliberate override is separate, and explicit.
+    monkeypatch.setenv("BLASTBOX_EGRESS_ALLOW_UNKNOWN_ROUTES", "1")
+    ea.plan_subnets(EgressConfig(), auto=False)

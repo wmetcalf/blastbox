@@ -272,3 +272,56 @@ def test_real_traffic_clears_the_streak_for_the_caller():
                  working={"toolz3": True}, previous=[obs(rx=1000, tx=1000, at=t0)],
                  quiet_streak={"toolz3": QUIET_WINDOWS_BEFORE_LEAK - 1})
     assert v.contained and v.quiet_windows == 0
+
+
+def test_an_idle_window_does_not_forgive_prior_silence():
+    """THE bug that defeated the only leak signal this module can produce.
+
+    The streak was incremented only in the working-and-quiet branch; every other branch
+    emitted the default quiet_windows=0, which dropped the node from the caller's
+    persisted map and silently reset it. Since `working` means "has egress work
+    dispatched RIGHT NOW" and jobs are discrete, a real fleet interleaves busy and idle
+    windows constantly — so a node busy two windows in three never reached the
+    threshold, no matter how long it leaked.
+    """
+    t0 = time.time() - 10_000
+    streak: dict = {}
+    prev = obs(rx=0, tx=0, at=t0)
+    contradicted = False
+    for i, is_working in enumerate([True, True, False] * 4):
+        cur = obs(rx=(i + 1) * 150, tx=(i + 1) * 150, at=t0 + (i + 1) * 60)
+        [v] = attest([cur], key_to_node=MAP, working={"toolz3": is_working},
+                     previous=[prev], quiet_streak=streak, at=cur.observed_at)
+        streak = {v.node_id: v.quiet_windows}
+        contradicted = contradicted or v.contradicted
+        prev = cur
+    assert contradicted, "a leaking node busy 2-in-3 must still be caught"
+
+
+def test_real_traffic_still_clears_the_streak():
+    """The carry must not become a ratchet — a node that starts behaving has to be
+    forgiven, or every node eventually accumulates an accusation."""
+    t0 = time.time() - 10_000
+    streak: dict = {}
+    prev = obs(rx=0, tx=0, at=t0)
+    for i, is_working in enumerate([True, True, False] * 4):
+        cur = obs(rx=(i + 1) * 500_000, tx=(i + 1) * 500_000, at=t0 + (i + 1) * 60)
+        [v] = attest([cur], key_to_node=MAP, working={"toolz3": is_working},
+                     previous=[prev], quiet_streak=streak, at=cur.observed_at)
+        streak = {v.node_id: v.quiet_windows}
+        assert not v.contradicted
+        prev = cur
+    assert streak == {"toolz3": 0}
+
+
+def test_a_node_never_given_work_is_never_accused():
+    t0 = time.time() - 10_000
+    streak: dict = {}
+    prev = obs(rx=0, tx=0, at=t0)
+    for i in range(12):
+        cur = obs(rx=(i + 1) * 150, tx=(i + 1) * 150, at=t0 + (i + 1) * 60)
+        [v] = attest([cur], key_to_node=MAP, working={"toolz3": False},
+                     previous=[prev], quiet_streak=streak, at=cur.observed_at)
+        streak = {v.node_id: v.quiet_windows}
+        assert not v.contradicted
+        prev = cur

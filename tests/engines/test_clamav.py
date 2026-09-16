@@ -390,3 +390,107 @@ def test_the_config_and_the_driver_agree_on_the_limit():
     assert MAX_SCANNABLE_BYTES <= int(m.group(1)) * 1024 * 1024
     assert re.search(r"^AlertExceedsMax\s+true", conf, re.M), \
         "without AlertExceedsMax, 'declined' and 'clean' are identical on the wire"
+
+
+def test_clamd_conf_has_no_malformed_directives():
+    """A REGRESSION GUARD FOR A SELF-INFLICTED OUTAGE.
+
+    An edit that replaced `MaxFileSize 25M` also hit `PCREMaxFileSize 25M` — the former
+    is a SUBSTRING of the latter — destroying the PCRE limit and leaving a literal
+    `PCRE# ...` line. clamd refuses a config with an unknown option, so every ClamAV
+    worker would have failed to start, and nothing in the test suite looked at this file.
+    """
+    from pathlib import Path
+
+    conf = (Path(__file__).resolve().parents[2] / "deploy/clamav/clamd.conf").read_text()
+    directives = []
+    for raw in conf.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        assert "#" not in line.split()[0], f"malformed directive: {raw!r}"
+        assert len(line.split()) >= 2, f"directive with no value: {raw!r}"
+        directives.append(line.split()[0])
+
+    dupes = {d for d in directives if directives.count(d) > 1}
+    assert not dupes, f"duplicated directives (a bad edit usually): {sorted(dupes)}"
+
+    # The settings the driver's correctness actually depends on.
+    for required in ("AlertExceedsMax", "MaxFileSize", "StreamMaxLength", "PCREMaxFileSize"):
+        assert required in directives, f"{required} is missing from clamd.conf"
+
+
+def test_an_empty_or_unrecognised_clamd_reply_is_not_a_clean_scan(monkeypatch):
+    """Silence used to fall through the parse loop and return [] — indistinguishable
+    from "scanned, nothing matched", which is then sealed `infected: false, status: ok`.
+    A clean verdict manufactured by silence is the failure this engine exists to prevent."""
+    from pathlib import Path
+
+    from blastbox.engines import clamav
+
+    for reply in ([], ["UNKNOWN COMMAND"], ["garbage without a terminator"]):
+        monkeypatch.setattr(clamav, "_raw_command", lambda c, t, r=reply: r)
+        with pytest.raises(clamav.ClamdUnavailable, match="no recognisable scan result"):
+            clamav.scan_path(Path("/x"))
+
+    # ...and a genuine clean reply still works.
+    monkeypatch.setattr(clamav, "_raw_command", lambda c, t: ["/x: OK"])
+    assert clamav.scan_path(Path("/x")) == []
+
+
+def test_a_path_containing_a_colon_space_does_not_corrupt_the_signature(monkeypatch):
+    """clamd echoes the path before the signature; splitting at the FIRST ": " landed
+    inside filenames like "sample: copy.zip"."""
+    from pathlib import Path
+
+    from blastbox.engines import clamav
+
+    monkeypatch.setattr(clamav, "_raw_command",
+                        lambda c, t: ["/s/sample: copy.zip: Win.Trojan.Foo-1 FOUND"])
+    assert clamav.scan_path(Path("/x")) == ["Win.Trojan.Foo-1"]
+
+
+def test_a_truncated_scan_with_no_hits_is_not_sealed_as_clean(tmp_path):
+    """The detection was downgraded to "unknown", but the PAYLOAD still said
+    `infected: false` with `status="ok"` — and the payload is the thing the design says
+    consumers discriminate on."""
+    from blastbox.engines.clamav import _LIMIT_HEURISTIC
+
+    res = _detonate(_stub_engine(path_scan_fn=lambda p, timeout=None: [_LIMIT_HEURISTIC],
+                                 scan_fn=lambda d, timeout=None: [_LIMIT_HEURISTIC]),
+                    tmp_path, 16)
+    assert res.status == "engine_error"
+    assert res.payload.fields["schema"] == "signature_scan_unavailable"
+    assert "infected" not in res.payload.fields
+    assert res.detected.confidence == 0.0
+
+
+def test_an_encrypted_archive_is_reported_unscannable(tmp_path):
+    """clamd.conf has promised exactly this since it was written — "reported as
+    unscannable rather than clean by the driver" — and nothing implemented it."""
+    from blastbox.engines.clamav import _ENCRYPTED_HEURISTIC
+
+    enc = f"{_ENCRYPTED_HEURISTIC}.Zip"
+    res = _detonate(_stub_engine(path_scan_fn=lambda p, timeout=None: [enc],
+                                 scan_fn=lambda d, timeout=None: [enc]),
+                    tmp_path, 16)
+    assert res.status == "engine_error"
+    assert res.payload.fields["schema"] == "signature_scan_unavailable"
+    assert any(w.code == "encrypted_archive_not_scanned" for w in res.warnings)
+
+
+def test_a_real_signature_alongside_an_encrypted_member_is_still_reported(tmp_path):
+    from blastbox.engines.clamav import _ENCRYPTED_HEURISTIC
+
+    hits = ["Eicar-Test-Signature", f"{_ENCRYPTED_HEURISTIC}.Zip"]
+    res = _detonate(_stub_engine(path_scan_fn=lambda p, timeout=None: hits,
+                                 scan_fn=lambda d, timeout=None: hits), tmp_path, 16)
+    assert res.detected.label == "Eicar-Test-Signature"
+    assert _ENCRYPTED_HEURISTIC not in (res.payload.fields.get("signatures") or [])
+
+
+def test_the_conf_enables_the_encrypted_alert_the_driver_depends_on():
+    from pathlib import Path
+
+    conf = (Path(__file__).resolve().parents[2] / "deploy/clamav/clamd.conf").read_text()
+    assert "ArchiveBlockEncrypted true" in conf

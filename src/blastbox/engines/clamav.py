@@ -207,6 +207,17 @@ def scan_path(path: Path, timeout: float = 300.0) -> list[str]:
     returned — stays first.
     """
     lines = _raw_command(f"ALLMATCHSCAN {path}", timeout)
+    # POSITIVE EVIDENCE REQUIRED. An empty reply, or one made only of lines this parser
+    # does not recognise (`UNKNOWN COMMAND`, a protocol change, a truncated read), used
+    # to fall through the loop and return [] — indistinguishable from "scanned, nothing
+    # matched", which detonate() then seals as `infected: false, status: ok`. That is a
+    # clean verdict manufactured by silence, which is the failure this engine's whole
+    # design exists to prevent.
+    if not lines or not any(ln.strip().endswith((" OK", " FOUND", "ERROR"))
+                            for ln in lines):
+        raise ClamdUnavailable(
+            "clamd returned no recognisable scan result"
+            + (f" (got {lines[:3]!r})" if lines else " (empty reply)"))
     hits: list[str] = []
     for line in lines:
         line = line.strip()
@@ -219,7 +230,11 @@ def scan_path(path: Path, timeout: float = 300.0) -> list[str]:
                 raise ClamdCannotSeePath(line)
             raise ClamdUnavailable(f"clamd reported an error: {line}")
         if line.endswith(" FOUND"):
-            sig = line.partition(": ")[2][: -len(" FOUND")].strip()
+            # rpartition, not partition. clamd echoes the PATH before the signature, and
+            # a path containing ": " (common enough — "sample: copy.zip") made the first
+            # split land inside the filename, so the recorded signature carried a chunk
+            # of the path. Strip the suffix first, then take the LAST separator.
+            sig = line[: -len(" FOUND")].rpartition(": ")[2].strip()
             if sig and sig not in hits:
                 hits.append(sig)
     return hits
@@ -298,6 +313,12 @@ def scan_stream(data: bytes, timeout: float = 120.0) -> list[str]:
 #: would report every oversized sample as clean. It is neither: it means the scan is
 #: incomplete.
 _LIMIT_HEURISTIC = "Heuristics.Limits.Exceeded"
+
+#: clamd's name for "this archive member is encrypted and I could not look inside".
+#: With `ArchiveBlockEncrypted true` it arrives in the hit list, and it is neither a
+#: detection (a password-protected zip is not malware by virtue of being encrypted) nor
+#: nothing (its contents were never examined). Same shape as the limit heuristic.
+_ENCRYPTED_HEURISTIC = "Heuristics.Encrypted"
 
 #: The shipped clamd.conf sets `MaxFileSize 25M` / `StreamMaxLength 25M`, and blastbox's
 #: default input limit is 100 MiB. A file in between is NOT SCANNED — clamd declines it
@@ -425,7 +446,47 @@ class ClamAVEngine:
         # dropped silently it reports the same sample as clean. It is neither — the scan
         # is incomplete, so the detection becomes "unknown" and a warning says why.
         truncated = [h for h in hits if h.startswith(_LIMIT_HEURISTIC)]
-        hits = [h for h in hits if not h.startswith(_LIMIT_HEURISTIC)]
+        encrypted = [h for h in hits if h.startswith(_ENCRYPTED_HEURISTIC)]
+        hits = [h for h in hits
+                if not h.startswith((_LIMIT_HEURISTIC, _ENCRYPTED_HEURISTIC))]
+
+        if encrypted and not hits:
+            # The conf has promised this since it was written: "It is reported as
+            # unscannable rather than clean by the driver." Nothing implemented it.
+            return DetonationResult(
+                payload=_sealed(SignatureScanUnavailable(
+                    error=("the sample contains encrypted archive member(s) clamd could "
+                           "not inspect: " + ", ".join(sorted(set(encrypted))[:5])
+                           + ". Its contents were NOT examined."),
+                    db_version=version or "unknown")),
+                artifacts=[],
+                detected=_undetermined(),
+                warnings=[Warning(
+                    code="encrypted_archive_not_scanned",
+                    message="encrypted members were skipped; no clean verdict can be "
+                            "drawn from this scan")],
+                status="engine_error",
+            )
+
+        if truncated and not hits:
+            # NOT a clean scan. The detection was already downgraded to "unknown", but
+            # the PAYLOAD still said `infected: false` with `status="ok"` — and a consumer
+            # reading the typed payload (the thing the design says to discriminate on)
+            # got a clean verdict for content clamd stopped before examining. Same
+            # treatment as the size refusal: a payload type with no `infected` field.
+            return DetonationResult(
+                payload=_sealed(SignatureScanUnavailable(
+                    error=("clamd hit a scan limit (MaxScanSize/MaxFiles/MaxRecursion) and "
+                           "stopped early, so parts of this sample were NEVER examined: "
+                           + ", ".join(sorted(set(truncated))[:5])),
+                    db_version=version or "unknown")),
+                artifacts=[],
+                detected=_undetermined(),
+                warnings=[Warning(
+                    code="scan_truncated_by_limits",
+                    message="the scan was incomplete; no clean verdict can be drawn from it")],
+                status="engine_error",
+            )
 
         warnings: list[Warning] = []
         if truncated:

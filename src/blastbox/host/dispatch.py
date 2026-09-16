@@ -1228,9 +1228,19 @@ class Dispatcher:
                 verdict = _H(False, f"{_ef} is unreadable ({exc}); cannot prove containment")
             else:
                 verdict = node_health(cfg)
-        except Exception as exc:  # probe machinery unavailable -> don't gate
+        except (ImportError, AttributeError) as exc:
+            # ONLY the "this build has no egress module" case fails open. A blanket
+            # `except Exception` here also swallowed anything node_health's five
+            # shell-outs and their parsers could raise, silently DISARMING containment
+            # gating for a TTL at a time on a managed node — the opposite posture of the
+            # ValueError branch just above, which degrades on purpose.
             _log.debug("egress health probe unavailable: %s", exc)
             return None
+        except Exception as exc:
+            from blastbox.host.egress import Health as _H
+            _log.warning("egress health probe FAILED (%s); treating this node as "
+                         "degraded rather than skipping the containment gate", exc)
+            verdict = _H(False, f"the containment probe itself failed: {exc}")
         self._egress_health, self._egress_health_at = verdict, now
         return verdict
 
