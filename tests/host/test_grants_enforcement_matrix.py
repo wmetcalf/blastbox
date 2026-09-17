@@ -438,3 +438,151 @@ def test_granting_credentials_lets_the_credentialed_tier_run(tmp_path, monkeypat
     validated: list = []
     _vm(store, tmp_path, validated, fixed_net_policy="openvpn")._process(store.claim_next())
     assert validated, "credentials=True was granted and the tier was still refused"
+
+
+# ------------------------------------------- an armed node does not destroy a peer's work
+
+def test_an_armed_node_releases_an_engine_it_does_not_have(tmp_path, monkeypatch):
+    """FOUND BY UPSTREAM REVIEW. `dispatch_once()` is unscoped by default, so on a shared
+    store a node can claim a job for an engine a PEER has and it does not. Falling
+    through to `unknown engine` destroys that work on exactly the assertion this gate
+    refuses to let a node make everywhere else — "no peer can run this"."""
+    store = InMemoryJobStore()
+    job = _make_job(engine="an-engine-this-node-does-not-have")
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    _arm(tmp_path, monkeypatch, engines=(_ENGINE_NAME,))
+
+    calls: list = []
+    _make_dispatcher(store, job_root=tmp_path,
+                     subprocess_runner=lambda a, **k: calls.append(a)
+                     or subprocess.CompletedProcess(a, 0, "", "")).dispatch_once()
+
+    final = store.get(job.job_id)
+    assert calls == []
+    assert final.status == JobStatus.QUEUED, (
+        f"an armed node destroyed a job a peer may support (got {final.status})"
+    )
+
+
+def test_an_UNGATED_node_still_fails_an_unknown_engine(tmp_path, monkeypatch):
+    """The single-node deployment, where `unknown engine` genuinely is terminal. Turning
+    that into a permanent requeue would replace a clear failure with a job that sits
+    queued forever."""
+    store = InMemoryJobStore()
+    job = _make_job(engine="no-such-engine")
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    _disarm(monkeypatch)
+
+    _make_dispatcher(store, job_root=tmp_path,
+                     subprocess_runner=lambda a, **k: subprocess.CompletedProcess(a, 0, "", "")
+                     ).dispatch_once()
+    assert store.get(job.job_id).status == JobStatus.FAILED
+
+
+def test_there_is_exactly_one_no_gate_sentinel():
+    """A reviewer flagged the orphaned duplicate in dispatch.py as a trap — "any future
+    code that reaches for the local name gets an `is` comparison that is always False" —
+    and the next change to that file did precisely that, making an ungated node take the
+    armed branch. Identity is the whole contract of a sentinel."""
+    from blastbox.host import dispatch
+    from blastbox.host.placement import NO_GATE
+
+    assert dispatch._NO_GATE is NO_GATE, (
+        "dispatch.py has its own NO_GATE object again; every `is` comparison against it "
+        "is silently always-False"
+    )
+
+
+def test_the_forced_off_gate_is_reported_as_forced_off(tmp_path, monkeypatch, capsys):
+    """node-status told an operator "no certificate configured — set BLASTBOX_NODE_CERT"
+    when the certificate WAS set and the gate was explicitly disabled. The command exists
+    to give the right remediation."""
+    import json
+
+    from blastbox.host.cli import main
+
+    _arm(tmp_path, monkeypatch, engines=(_ENGINE_NAME,))
+    monkeypatch.setenv("BLASTBOX_NODE_GRANTS_GATE", "off")
+    main(["pki", "--dir", str(tmp_path / "pki"), "node-status"])
+    out = json.loads(capsys.readouterr().out)
+
+    assert out["gate_armed"] is False
+    assert "off" in out["why"] and "DESPITE" in out["why"], out["why"]
+    assert out["cert_path"] is not None
+
+
+def test_a_rolled_back_wall_clock_cannot_resurrect_an_expired_certificate(tmp_path, monkeypatch):
+    """FOUND BY UPSTREAM REVIEW, on the fix for the previous round's clock finding.
+    Switching cache FRESHNESS to monotonic was half a fix: once the monotonic TTL
+    elapsed, `node_identity()` re-verified against the same rolled-back WALL clock,
+    decided the expired certificate was fine, and republished its grants. The process
+    kept authorising an expired identity until wall time caught up — or forever.
+
+    A deadline recorded in ELAPSED time cannot be moved by setting the clock."""
+    import datetime
+    import time as _time
+
+    from blastbox.host import pki
+    from blastbox.host import placement as pl
+
+    _arm(tmp_path, monkeypatch, engines=(_ENGINE_NAME,))
+    g = pl.SelfGrants()
+    assert g.grants() is not None, "precondition: it verifies while valid"
+    assert g._until_mono > 0, "a monotonic deadline must be recorded on success"
+
+    # The certificate expires...
+    # Capture the REAL clocks first; patching a lambda that calls the patched name is
+    # how the first version of this test recursed into itself.
+    real_time, real_mono, real_now = _time.time, _time.monotonic, pki._now
+
+    # THE ROLLBACK IS WHAT FOOLS node_identity, and that is the whole point. An earlier
+    # version of this test moved `pki._now` FORWARD, so node_identity refused on its own
+    # and the test passed with the monotonic deadline deleted — green for a reason that
+    # had nothing to do with what it claims to test.
+    #
+    # Here the certificate has genuinely expired in real time, and the wall clock is 60
+    # days behind, so `node_identity` re-verifies it as perfectly valid and `_until` (a
+    # wall-clock instant) is comfortably in the "future". Nothing on the wall clock can
+    # tell. Only elapsed time can.
+    back = datetime.timedelta(days=60)
+    monkeypatch.setattr(pki, "_now", lambda: real_now() - back)
+    monkeypatch.setattr(pl.time, "time", lambda: real_time() - back.total_seconds())
+    # EIGHT DAYS OF ELAPSED TIME, because that is what "the certificate expired" means
+    # physically: the 7-day cert is past its life, and the monotonic clock is the only
+    # one that noticed. Advancing it by less than the certificate's lifetime would leave
+    # the deadline in the future and test nothing.
+    monkeypatch.setattr(pl.time, "monotonic", lambda: real_mono() + 8 * 86400.0)
+
+    assert g.grants() is None, (
+        "an expired certificate was republished after a wall-clock rollback; the "
+        "monotonic deadline is not being honoured"
+    )
+
+
+def test_a_genuinely_renewed_certificate_does_extend_the_deadline(tmp_path, monkeypatch):
+    """The other direction of the rule above, and it matters: if a deadline could only
+    ever shrink, renewal would never take effect and the node would refuse forever. A
+    LATER not_after — which comes from the signed payload, not from the host clock — is
+    the only thing that may move it out."""
+    from blastbox.host import pki
+    from blastbox.host import placement as pl
+
+    crt = _arm(tmp_path, monkeypatch, engines=(_ENGINE_NAME,))
+    g = pl.SelfGrants()
+    assert g.grants() is not None
+    first_deadline = g._until_mono
+
+    # Re-issue the SAME identity with a longer life: a real renewal.
+    ca = pki.ensure_ca(tmp_path / "pki")
+    crt.write_bytes(ca.issue_node("toolz3", wg_pubkey=WG, days=30,
+                                  grants=pki.NodeGrants(engines=(_ENGINE_NAME,))).cert_pem)
+    g._at = 0.0          # force a re-read, as the TTL would
+    assert g.grants() is not None
+    assert g._until_mono > first_deadline, (
+        "a renewed certificate did not extend the deadline; the node would refuse until "
+        "the process restarted"
+    )

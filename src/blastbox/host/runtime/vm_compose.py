@@ -89,7 +89,9 @@ class VmWorkerSpec:
     mac_prefix: str = "52:54:00:bb"     # OUI for assign-enforce MACs (last 2 octets derived from the IP)
     dhcp_server: str = ""               # clean-traffic DHCPSERVER (trusted dnsmasq); "" → subnet+".1"
     overlay_dir: str = "/dev/shm"
-    subnet_prefix: str = "192.168.122."
+    #: Tracks LibvirtVmConfig.subnet_prefix, which tracks `network`. Asserted by a test:
+    #: this is the YAML-facing copy and it WINS, so drift here is drift in production.
+    subnet_prefix: str = "192.168.221."
 
     # guest agent
     agent_port: int = 8765

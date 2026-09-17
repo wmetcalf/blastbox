@@ -1118,7 +1118,10 @@ def _pki_cmd(args: argparse.Namespace) -> int:
         armed = value is not NO_GATE
         status: dict[str, object] = {
             "gate_armed": armed,
-            "why": ("no certificate configured — this node runs unrestricted "
+            "why": (f"{SelfGrants.GATE_ENV} is set to off — this node runs unrestricted "
+                    f"DESPITE having a certificate at {cert_at}. Unset it to arm the gate."
+                    if not armed and gate.gate_forced() == "off" and cert_at is not None
+                    else "no certificate configured — this node runs unrestricted "
                     f"(set {SelfGrants.CERT_ENV} to arm it)" if not armed
                     else "certificate verified" if value is not None
                     else "certificate configured but DOES NOT VERIFY — this node refuses "

@@ -166,7 +166,14 @@ class LibvirtVmConfig:
     ``no-ip-spoofing`` learn an attacker-supplied lease (DHCP-learning mode), nor disturb a sibling's
     learning. "" auto-derives ``subnet_prefix + "1"`` (the libvirt default bridge/dnsmasq IP); set
     explicitly for a non-standard network gateway. Only emitted for the ``clean-traffic`` nwfilter."""
-    subnet_prefix: str = "192.168.122."
+    #: MUST TRACK `network`. This stayed at libvirt's `default` subnet when the network
+    #: default moved to bb-isolated (192.168.221.0/24) — so with pure defaults
+    #: `_domain_xml()` pinned DHCPSERVER to a bridge address that does not exist and
+    #: `_ip_for_mac()` rejected every neighbour on the real subnet, leaving the VM
+    #: undiscoverable. The same "second copy of a default" mistake as `network` itself,
+    #: one field over. `_assert_subnet_matches_network()` now checks it against what
+    #: libvirt reports rather than trusting either default.
+    subnet_prefix: str = "192.168.221."
     """DHCP subnet of ``network``; used to resolve the worker IP via the host neigh table."""
 
     boot_timeout_s: float = 240.0
@@ -413,6 +420,55 @@ class LibvirtVmRuntime:
     FORWARDING_MODES = ("nat", "route", "bridge", "private", "vepa", "passthrough",
                         "hostdev", "open")
 
+    def _network_xml(self) -> "tuple[int, str]":
+        """``(returncode, xml)`` for this VM's libvirt network. One reader, two callers."""
+        proc = self._virsh("net-dumpxml", self.cfg.network)
+        rc = getattr(proc, "returncode", 1)
+        return rc, ((getattr(proc, "stdout", "") or "") if rc == 0 else "")
+
+    def _network_forwards(self) -> bool:
+        """Does this network reach the physical network? Unreadable counts as NO, so the
+        `direct` contradiction above is raised rather than skipped — the egress check
+        refuses an unreadable network anyway, and this ordering keeps that the loudest
+        failure."""
+        rc, xml = self._network_xml()
+        if rc != 0 or "<network" not in xml:
+            return False
+        m = re.search(r"<forward\b[^>]*\bmode=['\"]([a-z]+)['\"]", xml)
+        mode = m.group(1).lower() if m else ("nat" if "<forward" in xml else None)
+        return mode in self.FORWARDING_MODES if mode else False
+
+    def _assert_subnet_matches_network(self) -> None:
+        """The configured subnet_prefix must be the one this libvirt network actually
+        serves, or the guest is undiscoverable in a way that looks like a boot failure.
+
+        `subnet_prefix` feeds DHCPSERVER in the domain XML and the neighbour filter in
+        `_ip_for_mac`. When the network default moved and this did not, both silently
+        pointed at an address range nothing was on — `virsh net-dumpxml` knows the truth,
+        so ask it instead of trusting two defaults to stay in step.
+
+        A MISMATCH IS A WARNING, NOT A REFUSAL. Being on the wrong subnet is an
+        availability bug, not a containment one, and an operator with a deliberate
+        split-horizon layout should not be blocked by it — unlike
+        :meth:`_assert_egress_is_governed`, where the failure mode is malware on the
+        internet.
+        """
+        proc = self._virsh("net-dumpxml", self.cfg.network)
+        if getattr(proc, "returncode", 1) != 0:
+            return          # the egress check already refuses on an unreadable network
+        m = re.search(r"<ip[^>]*\baddress=['\"]([0-9.]+)['\"]", getattr(proc, "stdout", "") or "")
+        if not m:
+            return          # no <ip> (a pure-L2 network); subnet_prefix is not used
+        actual = m.group(1).rsplit(".", 1)[0] + "."
+        want = (self.cfg.subnet_prefix or "").rstrip(".") + "."
+        if want != actual:
+            logger.warning(
+                "libvirt network %r serves %s0/24 but subnet_prefix is %r. The guest's "
+                "DHCPSERVER and the neighbour lookup both key on subnet_prefix, so this "
+                "worker will boot and then never be discovered as ready. Set "
+                "subnet_prefix=%r, or point `network` at the one matching it.",
+                self.cfg.network, actual, self.cfg.subnet_prefix, actual)
+
     def _assert_egress_is_governed(self) -> None:
         """Refuse to boot an unpoliced VM onto a network that reaches the internet.
 
@@ -431,15 +487,26 @@ class LibvirtVmRuntime:
         caller's fail-closed reap path handles it, like every other finalize failure.
         """
         if self.cfg.egress_policy is not None:
+            # ...with ONE exception, which is the mirror image of the check below.
+            # `direct` means "go straight out" and `routing_commands()` deliberately
+            # emits no routing and no NAT for it — it relies on the NETWORK to provide a
+            # path. On an isolated network there is none, so the filter chain accepts the
+            # packet and it dies with no return route: the job loses connectivity and
+            # nothing says why. A policy that promises egress on a network that cannot
+            # carry it is a contradiction, and a loud one is better than a silent one.
+            driver = getattr(self.cfg.egress_policy, "exit_driver", None)
+            if driver == "direct" and not self._network_forwards():
+                raise RuntimeError(
+                    f"egress_policy.exit_driver is 'direct' but libvirt network "
+                    f"{self.cfg.network!r} does not forward, so there is no path out and "
+                    "no NAT to create one — the worker would accept packets that never "
+                    "get a reply. Use a forwarding network for direct egress, or an "
+                    "exit_driver that builds its own path (openvpn/wireguard/socks).")
             return          # per-worker rules govern it; the network's own mode is moot
-        proc = self._virsh("net-dumpxml", self.cfg.network)
-        rc = getattr(proc, "returncode", 1)
-        xml = (getattr(proc, "stdout", "") or "") if rc == 0 else ""
+        rc, xml = self._network_xml()
         if rc != 0 or "<network" not in xml:
-            err = (getattr(proc, "stderr", "") or "").strip().splitlines()
             raise RuntimeError(
-                f"cannot read libvirt network {self.cfg.network!r} "
-                f"({err[-1] if err else 'no output'}), "
+                f"cannot read libvirt network {self.cfg.network!r}, "
                 "so it is not known whether this VM would have internet access. Refusing "
                 "to boot an unpoliced worker onto an unknown network. Define it with "
                 "`virsh net-define deploy/libvirt/bb-isolated.xml && virsh net-start "
@@ -465,6 +532,7 @@ class LibvirtVmRuntime:
         # libvirt network from `start` onward, so a check after that races the thing it
         # is checking.
         self._assert_egress_is_governed()
+        self._assert_subnet_matches_network()
         sid, name, overlay = self._alloc_overlay_name()
         # Assign+enforce: hand this worker a fixed (MAC, IP) and pin it. Allocated BEFORE the try so a
         # pool-exhaustion error doesn't leave a half-built domain; the reservation + explicit pin go in

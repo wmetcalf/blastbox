@@ -294,6 +294,14 @@ class SelfGrants:
         #: that made the expiry guard inert on the failure branch, so a stale `_at`
         #: pinned the refusal for a whole TTL (which has no ceiling).
         self._until = 0.0
+        #: ...and the SAME deadline on the monotonic clock, which is the one that
+        #: actually holds under a rollback. Switching only cache freshness to monotonic
+        #: was half a fix: after the TTL elapsed, `node_identity` re-verified against the
+        #: rolled-back WALL clock, decided the expired certificate was still valid, and
+        #: republished its grants — so the process kept authorising an expired identity
+        #: until wall time caught up, or forever if it never did. A deadline recorded in
+        #: elapsed time cannot be moved by setting the clock.
+        self._until_mono = 0.0
         self._node_id = ""
 
     # -- inputs ------------------------------------------------------------------
@@ -358,8 +366,9 @@ class SelfGrants:
             # refresh — and the TTL has a floor but no ceiling, so an operator "reducing
             # PKI I/O" could make that window outlast the seven-day lifetime that IS the
             # revocation mechanism.
-            if fresh and not (self._until and time.time() >= self._until):
+            if fresh and not self._expired(now):
                 return self._cached
+            prev_until = self._until
             try:
                 from blastbox.host.pki import load_trust_anchor, node_identity
                 pki_dir = Path(os.environ.get(self.PKI_ENV, "/var/lib/blastbox/pki"))
@@ -367,6 +376,24 @@ class SelfGrants:
                 value: "NodeGrants | None" = ident.grants
                 self._node_id = ident.node_id
                 self._until = ident.not_after.timestamp()
+                # The same instant measured in ELAPSED time. `node_identity` has just
+                # confirmed the certificate is valid NOW, so however wrong the wall clock
+                # is, it has at most (not_after - now) of validity left from this moment.
+                fresh_deadline = now + max(0.0, self._until - time.time())
+                # A DEADLINE MAY ONLY MOVE FORWARD FOR A GENUINELY NEWER CERTIFICATE.
+                # Recomputing it unconditionally re-introduced the exact bug it exists to
+                # prevent: the rolled-back wall clock made `not_after - time.time()` look
+                # enormous, so every re-verification pushed the deadline further out and
+                # the expired identity was republished forever. `not_after` is the only
+                # thing that distinguishes a renewal from the same certificate seen
+                # again through a lying clock — and it comes from the signed payload, not
+                # from the host.
+                if self._until_mono and ident.not_after.timestamp() <= prev_until:
+                    self._until_mono = min(self._until_mono, fresh_deadline)
+                else:
+                    self._until_mono = fresh_deadline
+                if self._expired(time.monotonic()):
+                    value = None        # already past it; do not publish
             except Exception as exc:      # noqa: BLE001 - every failure is a refusal
                 self._log.warning(
                     "this node's certificate (%s) does not verify: %s. Refusing work "
@@ -377,6 +404,18 @@ class SelfGrants:
             self._cached = value
             self._at = time.monotonic()
             return value
+
+    def _expired(self, now_mono: float) -> bool:
+        """Has the cached certificate passed its not_after, by EITHER clock?
+
+        Both are consulted and either one is enough. The wall clock catches the ordinary
+        case and the monotonic deadline catches the rollback case, where the wall clock
+        is the thing lying. Requiring both to agree would mean a rolled-back clock could
+        veto the deadline that exists because of it.
+        """
+        if self._until and time.time() >= self._until:
+            return True
+        return bool(self._until_mono and now_mono >= self._until_mono)
 
     @property
     def node_id(self) -> str:

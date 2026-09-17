@@ -153,8 +153,12 @@ def test_ip_pool_parse_and_mac_derivation():
 def test_dhcpserver_restricts_clean_traffic_dhcp_source(monkeypatch):
     # clean-traffic emits DHCPSERVER (trusted dnsmasq) so a rogue worker can't DHCP itself a different
     # lease that DHCP-learning would then pin. Derived from subnet_prefix; overridable; clean-traffic only.
-    x = _rt()._domain_xml("bbvm-x", "/o.qcow2")                       # learning default
-    assert "<parameter name='DHCPSERVER' value='192.168.122.1'/>" in x
+    rt = _rt()                                                        # learning default
+    x = rt._domain_xml("bbvm-x", "/o.qcow2")
+    # Derived from the CONFIG, not a literal: hardcoding the default subnet here is how
+    # `subnet_prefix` was left behind when `network` moved to bb-isolated — the test
+    # would have caught it and instead would have been "fixed" to match the regression.
+    assert f"<parameter name='DHCPSERVER' value='{rt.cfg.subnet_prefix}1'/>" in x
     x2 = _rt(dhcp_server="10.9.0.1")._domain_xml("bbvm-x", "/o.qcow2")
     assert "<parameter name='DHCPSERVER' value='10.9.0.1'/>" in x2
     # assign-enforce branch carries it too (alongside the explicit IP pin)

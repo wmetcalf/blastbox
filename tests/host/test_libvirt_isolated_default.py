@@ -160,3 +160,74 @@ def test_no_default_in_the_tree_points_at_libvirts_nat_network():
                 assert f.default != "default", (
                     f"{cls.__name__}.network defaults to libvirt's NAT network"
                 )
+
+
+# ------------------------------------------- the ADDRESS defaults must move too
+
+def test_the_subnet_defaults_track_the_network_default():
+    """FOUND BY UPSTREAM REVIEW, an hour after the network default moved. `network`
+    became bb-isolated (192.168.221.0/24) and `subnet_prefix` stayed at libvirt's
+    `default` subnet — so with pure defaults `_domain_xml()` pinned DHCPSERVER to a
+    bridge address that does not exist and `_ip_for_mac()` rejected every neighbour on
+    the real subnet: the VM boots and is never discovered as ready.
+
+    The same "second copy of a default" mistake as `network` itself, one field over,
+    made while writing the test that catches it for `network`."""
+    from blastbox.host.runtime.vm_compose import VmWorkerSpec as VmSpec
+
+    cfg = VmConfig(golden_base="/x")
+    assert cfg.subnet_prefix == "192.168.221.", (
+        f"subnet_prefix={cfg.subnet_prefix!r} does not serve {cfg.network!r}"
+    )
+    assert VmSpec.subnet_prefix == cfg.subnet_prefix, "the YAML copy drifted, and it wins"
+    assert cfg.resolved_gateway == "192.168.221.1"
+
+
+def test_a_subnet_mismatch_is_reported(monkeypatch, caplog):
+    """A wrong subnet is an availability bug, not a containment one, so it warns rather
+    than refusing — but it must not be silent, because the symptom (a VM that boots and
+    never becomes ready) looks nothing like its cause."""
+    import logging
+
+    rt = _runtime(monkeypatch,
+                  xml="<network><name>bb-isolated</name><ip address='10.9.9.1'/></network>")
+    with caplog.at_level(logging.WARNING):
+        rt._assert_subnet_matches_network()
+    assert "subnet_prefix" in caplog.text and "10.9.9." in caplog.text
+
+
+def test_a_matching_subnet_says_nothing(monkeypatch, caplog):
+    import logging
+
+    rt = _runtime(monkeypatch,
+                  xml="<network><name>bb-isolated</name><ip address='192.168.221.1'/></network>")
+    with caplog.at_level(logging.WARNING):
+        rt._assert_subnet_matches_network()
+    assert "subnet_prefix" not in caplog.text
+
+
+# ------------------------------------ 'direct' egress needs a network that forwards
+
+def test_direct_egress_is_refused_on_a_network_that_cannot_carry_it(monkeypatch):
+    """`direct` means "go straight out" and `routing_commands()` emits no routing and no
+    NAT for it — it relies on the NETWORK for the path. On an isolated network the filter
+    chain accepts the packet and it dies with no return route: the job loses connectivity
+    and nothing says why. A contradiction should be loud."""
+    policy = type("P", (), {"exit_driver": "direct"})()
+    rt = _runtime(monkeypatch, xml=ISOLATED, egress_policy=policy)
+    with pytest.raises(RuntimeError, match="does not forward"):
+        rt._assert_egress_is_governed()
+
+
+def test_direct_egress_is_fine_on_a_forwarding_network(monkeypatch):
+    policy = type("P", (), {"exit_driver": "direct"})()
+    _runtime(monkeypatch, xml=NAT, network="default",
+             egress_policy=policy)._assert_egress_is_governed()
+
+
+@pytest.mark.parametrize("driver", ["openvpn", "wireguard", "socks", "tor"])
+def test_a_tunnel_driver_is_fine_on_an_isolated_network(monkeypatch, driver):
+    """These build their own path; they do not need the network to provide one. Without
+    this the fix above would be a blanket ban on isolated networks."""
+    policy = type("P", (), {"exit_driver": driver})()
+    _runtime(monkeypatch, xml=ISOLATED, egress_policy=policy)._assert_egress_is_governed()

@@ -63,6 +63,13 @@ from blastbox.host.canary import (
     check_store_coherence,
     describe_blob_store,
 )
+# NO_GATE is imported, never re-declared. This module used to define its own
+# `_NO_GATE = object()`, left behind when the gate was extracted — a second,
+# non-identical object. A reviewer flagged it as a trap ("any future code that
+# reaches for the local name gets an `is` comparison that is always False"), and
+# the very next change here did exactly that: a guard that was always true, so an
+# ungated node took the armed branch.
+from blastbox.host.placement import NO_GATE as _NO_GATE
 from blastbox.host.placement import SelfGrants
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
 from blastbox.host.runtime.docker import (
@@ -102,9 +109,6 @@ _GUEST_SEAM_ERRORS: tuple[type[BaseException], ...] = _guest_seam_errors()
 
 _JOB_ID_RE = re.compile(r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
 
-#: "No grants gate is configured on this node." Distinct from ``None``, which means the
-#: gate IS configured and this node's certificate did not verify — opposite decisions.
-_NO_GATE = object()
 
 _log = logging.getLogger("blastbox.host.dispatch")
 
@@ -1281,6 +1285,28 @@ class Dispatcher:
         # behavioural tests pin — so let it fall through to `_dispatch_inner`, which
         # already fails it correctly. The gate has no opinion about an engine this node
         # does not have.
+        if job.engine not in self._engines and self._grants_gate.grants() is not _NO_GATE:
+            # AN ARMED NODE CANNOT INFER FLEET-WIDE ENGINE AVAILABILITY FROM ITS OWN
+            # REGISTRY. `dispatch_once()` is unscoped by default, so on a shared store a
+            # node can claim a job for an engine a PEER has and it does not. Falling
+            # through to `_dispatch_inner`'s `unknown engine` failure destroys that work
+            # on exactly the assertion this gate refuses to let a node make everywhere
+            # else — "no peer can run this". Release it instead.
+            #
+            # Only when ARMED. An ungated node is the single-node deployment where
+            # `unknown engine` genuinely is terminal, and changing that would turn a
+            # clear failure into a job that sits queued forever.
+            _log.warning("engine %r is not on this node; releasing job=%s to the fleet "
+                         "rather than failing work a peer may support",
+                         job.engine, job.job_id)
+            if warm_reserved:
+                self._release_warm_reservation()
+            self._requeue_claimed(
+                job, defer=True, defer_s=self._egress_shared_defer_s,
+                reason=f"engine {job.engine!r} is not available on this node; releasing "
+                       "to the fleet",
+            )
+            return
         if job.engine in self._engines:
 
             # ITS OWN COOLDOWN, READ AS WELL AS WRITTEN. The first version reused the egress
