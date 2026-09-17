@@ -56,6 +56,35 @@ MUTATIONS=(
 # "caught" and the script print "every arm is covered" and exit 0: the exact false
 # assurance its own header was written to end. Establish that the unmutated tree is
 # green before believing any red.
+# ...AND PROVE THE MUTATIONS ARE ACTUALLY IMPORTED. A reviewer flagged that this script
+# mutates a COPY while `$PY` is the original venv, whose editable install resolves
+# `blastbox` back to the original checkout — under which every mutation would be inert and
+# every "caught" would be for some other reason. It is currently FALSE, because
+# pyproject's `pythonpath = ["src"]` makes pytest prepend the COPY's src. But it is false
+# by a setting in another file, so it is asserted here rather than assumed: if that
+# pythonpath is ever removed, this script must stop claiming anything.
+echo "=== self-check: the copy's source is what the tests import ==="
+cat > /tmp/marla-import-check.py <<'PYCHK'
+import pathlib, blastbox.host.placement as m
+here = pathlib.Path(__file__).resolve()
+mod = pathlib.Path(m.__file__).resolve()
+def test_the_mutated_copy_is_what_gets_imported():
+    assert str(mod).startswith(str(pathlib.Path.cwd())), (
+        f"tests import {mod}, which is OUTSIDE this working copy ({pathlib.Path.cwd()}). "
+        "Every mutation below would be inert and every 'caught' meaningless."
+    )
+PYCHK
+cp /tmp/marla-import-check.py tests/host/test_zz_import_check.py
+if ! "$PY" -m pytest tests/host/test_zz_import_check.py -q -p no:randomly >/tmp/marla-import.log 2>&1; then
+  echo "  SELF-CHECK FAILED — mutations would not be imported:" >&2
+  grep -a "OUTSIDE this working copy" /tmp/marla-import.log >&2 || tail -5 /tmp/marla-import.log >&2
+  rm -f tests/host/test_zz_import_check.py
+  exit 1
+fi
+rm -f tests/host/test_zz_import_check.py
+echo "  the tests import this copy's source, so mutations take effect"
+echo
+
 echo "=== baseline: the matrix must PASS on the unmutated tree ==="
 if ! "$PY" -m pytest $MATRIX -q -p no:randomly >/tmp/marla-baseline.log 2>&1; then
   echo "  BASELINE FAILED — the matrix does not pass before any mutation, so every"
