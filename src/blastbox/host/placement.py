@@ -303,8 +303,22 @@ class SelfGrants:
         #: elapsed time cannot be moved by setting the clock.
         self._until_mono = 0.0
         self._node_id = ""
+        self._warned: set = set()
 
     # -- inputs ------------------------------------------------------------------
+    def _warn_once(self, key: str, msg: str, *args: object) -> None:
+        """Log a configuration warning the first time only, per (key, arguments).
+
+        These fire from paths that run once per JOB. An identical line per job does not
+        inform anyone; it hides the line that would have. Keyed on the arguments too, so
+        a value that CHANGES is reported again.
+        """
+        stamp = (key, args)
+        if stamp in self._warned:
+            return
+        self._warned.add(stamp)
+        self._log.warning(msg, *args)
+
     def cert_path(self) -> "Path | None":
         """Where this node's certificate should be, or None if no identity is configured.
 
@@ -316,9 +330,42 @@ class SelfGrants:
         failure is already a refusal, instead of collapsing into "no identity".
         """
         if self.CERT_ENV not in os.environ:
-            return None
+            return self._legacy_cert_path()
         raw = os.environ[self.CERT_ENV].strip()
         return Path(raw) if raw else Path(f"<{self.CERT_ENV} is set but empty>")
+
+    def _legacy_cert_path(self) -> "Path | None":
+        """The pre-CERT_ENV arming route, honoured only when its certificate really exists.
+
+        A FAIL-OPEN UPGRADE, INTRODUCED BY THE FIX FOR THE OPPOSITE BUG. The gate first
+        armed from ``BLASTBOX_NODE_ID`` by resolving ``<pki>/node-<id>.crt``. That was
+        removed because the name is ALREADY the sizer's physical-host slug, documented
+        for an unrelated NFS reason, so setting it for that reason armed a security
+        control the operator had never heard of. Correct — but it also means every node
+        that had genuinely armed the gate that way goes SILENTLY UNGATED on upgrade,
+        which is the one direction this module is never allowed to fail.
+
+        The two cases are distinguishable by a fact rather than a guess: whether the
+        derived certificate is actually there. A sizer-only node has no
+        ``node-<slug>.crt`` and stays ungated; a node that armed the old way has one and
+        keeps its gate. Deprecated, and it says so once, because silently changing what a
+        security control does across an upgrade is worse than either behaviour.
+        """
+        node_id = os.environ.get("BLASTBOX_NODE_ID", "").strip()
+        if not node_id:
+            return None
+        pki_dir = Path(os.environ.get(self.PKI_ENV, "/var/lib/blastbox/pki"))
+        candidate = pki_dir / f"node-{node_id}.crt"
+        if not candidate.exists():
+            return None          # the sizer's host slug; nothing to do with this gate
+        self._warn_once(
+            "legacy-arming",
+            "BLASTBOX_NODE_ID=%s resolves to %s, so this node's grants gate is armed the "
+            "OLD way. That route is deprecated because the variable is also the sizer's "
+            "host slug: set %s explicitly instead. Honouring it here so an upgrade does "
+            "not silently un-gate a node that was gated.", node_id, candidate,
+            self.CERT_ENV)
+        return candidate
 
     def gate_forced(self) -> str:
         """``"on"``, ``"off"`` or ``""`` (unset) from :data:`GATE_ENV`.
@@ -334,7 +381,11 @@ class SelfGrants:
         if raw.lower() in ("0", "false", "no", "off"):
             return "off"
         if raw.lower() not in ("1", "true", "yes", "on"):
-            self._log.warning(
+            # ONCE. `gate_forced()` runs on every `grants()`, i.e. once per job, so an
+            # unrecognised value printed an identical line per job forever — burying the
+            # very signal that would have told the operator about the typo.
+            self._warn_once(
+                "gate-value",
                 "%s=%r is not a value I recognise. Treating it as ON, because a "
                 "hardening knob that silently does nothing is worse than a loud one. "
                 "Use 1/true/yes/on or 0/false/no/off.", self.GATE_ENV, raw)

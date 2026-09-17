@@ -586,3 +586,68 @@ def test_a_genuinely_renewed_certificate_does_extend_the_deadline(tmp_path, monk
         "a renewed certificate did not extend the deadline; the node would refuse until "
         "the process restarted"
     )
+
+
+# ------------------------------------------ the upgrade path must not silently un-gate
+
+def test_a_node_armed_the_OLD_way_stays_gated_across_the_upgrade(tmp_path, monkeypatch):
+    """FOUND IN AN UNREAD REVIEWER OUTPUT from the previous round — findings already paid
+    for and never triaged.
+
+    The gate first armed from BLASTBOX_NODE_ID by resolving <pki>/node-<id>.crt. That was
+    removed because the name is already the sizer's host slug, so setting it for THAT
+    reason armed a control the operator had never heard of. Correct — and it also meant
+    every node genuinely armed the old way went SILENTLY UNGATED on upgrade, which is the
+    one direction this module may never fail."""
+    from blastbox.host import pki
+    from blastbox.host.placement import NO_GATE, SelfGrants
+
+    pki_dir = tmp_path / "pki"
+    ca = pki.ensure_ca(pki_dir)
+    ca.issue_node("toolz3", wg_pubkey=WG,
+                  grants=pki.NodeGrants(engines=(_ENGINE_NAME,))).write(pki_dir, "node-toolz3")
+    monkeypatch.delenv("BLASTBOX_NODE_CERT", raising=False)
+    monkeypatch.delenv("BLASTBOX_NODE_GRANTS_GATE", raising=False)
+    monkeypatch.setenv("BLASTBOX_PKI_DIR", str(pki_dir))
+    monkeypatch.setenv("BLASTBOX_NODE_ID", "toolz3")
+
+    g = SelfGrants().grants()
+    assert g is not NO_GATE, "an upgrade silently un-gated a node that was gated"
+    assert g is not None and g.allows_engine(_ENGINE_NAME)
+
+
+def test_the_sizer_host_slug_still_does_not_arm_anything(tmp_path, monkeypatch):
+    """The other half, and the reason the old route was removed: BLASTBOX_NODE_ID set for
+    share-dir scoping, with no certificate of that name, must change nothing. The two
+    cases are told apart by a FACT — whether the derived certificate exists — not a
+    guess."""
+    from blastbox.host import pki
+    from blastbox.host.placement import NO_GATE, SelfGrants
+
+    pki_dir = tmp_path / "pki"
+    pki.ensure_ca(pki_dir)                      # a CA, but no node-host-a.crt
+    monkeypatch.delenv("BLASTBOX_NODE_CERT", raising=False)
+    monkeypatch.delenv("BLASTBOX_NODE_GRANTS_GATE", raising=False)
+    monkeypatch.setenv("BLASTBOX_PKI_DIR", str(pki_dir))
+    monkeypatch.setenv("BLASTBOX_NODE_ID", "host-a")
+
+    assert SelfGrants().grants() is NO_GATE
+
+
+def test_configuration_warnings_do_not_repeat_per_job(monkeypatch, caplog):
+    """`gate_forced()` runs on every `grants()`, i.e. once per job, so an unrecognised
+    value printed an identical line per job forever — burying the signal that would have
+    told the operator about the typo."""
+    import logging
+
+    from blastbox.host.placement import SelfGrants
+
+    monkeypatch.delenv("BLASTBOX_NODE_CERT", raising=False)
+    monkeypatch.setenv("BLASTBOX_NODE_GRANTS_GATE", "enforce")
+    g = SelfGrants()
+    with caplog.at_level(logging.WARNING):
+        for _ in range(25):
+            g.gate_forced()
+    assert caplog.text.count("not a value I recognise") == 1, (
+        f"warned {caplog.text.count('not a value I recognise')} times in 25 calls"
+    )
