@@ -111,6 +111,28 @@ jobs:
             exit 1
           fi
 
+  grants-enforcement:
+    timeout-minutes: 25
+    # A PASSING SUITE IS NOT EVIDENCE THAT A CONTROL WORKS. The node-grants gate was
+    # twice found to be disableable with every test green, because the tests written for
+    # it asserted on `inspect.getsource()` substrings rather than running anything. This
+    # job removes the control, one arm at a time, and requires the enforcement matrix to
+    # go RED each time. A control the tests cannot notice the absence of is not tested.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -q -e ".[host,dev]"
+      - name: The matrix itself passes
+        run: .venv/bin/python -m pytest tests/host/test_grants_enforcement_matrix.py -q
+      - name: ...and fails without the control it tests
+        run: scripts/ci/prove-grants-enforcement.sh
+
   egress-forwarder-image:
     timeout-minutes: 15
     # The forwarder is a real deployment artifact but it is built on the node, not
