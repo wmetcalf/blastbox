@@ -26,6 +26,18 @@
       virsh net-define deploy/libvirt/bb-isolated.xml
       virsh net-start bb-isolated
       virsh net-autostart bb-isolated
+  VERIFIED ON REAL LIBVIRT (genesis, libvirt 11.1.0, 2026-09-17). Defined, started, and
+  probed with a veth in a network namespace attached to the bridge, which is what a
+  guest's tap is topologically:
+      bridge address 192.168.221.1/24, namespace at .50
+      ping 192.168.221.1  -> YES     (the segment is LIVE; a negative below means something)
+      curl https://1.1.1.1 -> no answer
+      ping 1.1.1.1         -> unreachable
+  With a CONTROL, because "no internet" is worthless if the probe cannot detect internet:
+  the identical probe in a routed+masqueraded namespace on the same host reached
+  1.1.1.1 and reported the site's egress address. So the probe works, and this network
+  does not carry it.
+
   Verify it does NOT forward:
       virsh net-dumpxml bb-isolated | grep -c '<forward'     # must print 0
 -->
