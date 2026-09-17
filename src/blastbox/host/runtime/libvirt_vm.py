@@ -110,8 +110,24 @@ class LibvirtVmConfig:
 
     mem_mb: int = 4096
     vcpus: int = 2
-    network: str = "default"
-    """libvirt network the worker NIC attaches to."""
+    network: str = "bb-isolated"
+    """libvirt network the worker NIC attaches to.
+
+    NOT ``default``. libvirt's ``default`` network is ``<forward mode='nat'/>`` — it has
+    working internet — and this field's old default combined with ``egress_policy=None``
+    (whose docstring says "worker reaches whatever the libvirt network allows") meant a
+    VmConfig with nothing specified put a malware VM on NAT with no host-side rules at
+    all. Two independent defaults, each individually defensible, conspiring into direct
+    egress.
+
+    ``bb-isolated`` is libvirt's own idiom for "no internet": a ``<network>`` with NO
+    ``<forward>`` element, so the guest reaches the host and its peers and nothing
+    forwards to the physical NIC. Shipped in ``deploy/libvirt/bb-isolated.xml``.
+
+    THE DEFAULT IS NOT THE CONTROL. :meth:`_assert_egress_is_governed` verifies at spawn
+    that the network this VM actually attaches to does not forward whenever no
+    ``egress_policy`` is set — a default can be overridden by a config file, a check
+    cannot."""
 
     machine: str = "pc"
     emulator: str = ""
@@ -162,8 +178,9 @@ class LibvirtVmConfig:
 
     egress_policy: VmEgressPolicy | None = None
     """Optional host-side egress policy applied to the worker's IP at spawn, removed at reap
-    (the rooter model — see libvirt_egress). None = no per-worker egress rules (worker reaches
-    whatever the libvirt network allows)."""
+    (the rooter model — see libvirt_egress). None = no per-worker egress rules, which is
+    safe ONLY on a non-forwarding network — see :meth:`_assert_egress_is_governed`, which
+    refuses to boot the pairing this docstring used to describe as normal."""
 
     gateway: str | None = None
     """Bridge/resolver IP exempted for DNS under ``block_internal``. Defaults to
@@ -388,11 +405,66 @@ class LibvirtVmRuntime:
         raise RuntimeError("could not allocate a unique VM overlay name after 8 attempts")
 
     # ---- SlotRuntime ---------------------------------------------------------
+    #: libvirt forward modes that reach the physical network. A network with NO
+    #: <forward> element at all is libvirt's isolated mode — guest-to-guest and
+    #: guest-to-host only — and is the one shape that is safe without per-worker rules.
+    #: `route` is included deliberately: it does not NAT, but it forwards, and a malware
+    #: VM on a routed network is on the LAN.
+    FORWARDING_MODES = ("nat", "route", "bridge", "private", "vepa", "passthrough",
+                        "hostdev", "open")
+
+    def _assert_egress_is_governed(self) -> None:
+        """Refuse to boot an unpoliced VM onto a network that reaches the internet.
+
+        THE PAIRING THIS PREVENTS was reachable from the defaults alone: `network` was
+        `"default"` (libvirt's NAT network) and `egress_policy` was None, so a VmConfig
+        that specified nothing put a malware VM on working internet with no host-side
+        rules. Neither default was wrong by itself, which is why nothing caught it.
+
+        A default cannot be the control — a config file, an env var or a caller overrides
+        it silently. This reads what the guest will ACTUALLY be attached to, at spawn,
+        from libvirt itself.
+
+        FAILS CLOSED ON NOT KNOWING. If `net-dumpxml` cannot be read the answer is not
+        "probably fine": an unreadable network definition is exactly the state in which
+        an operator most wants to be stopped. Raises rather than returning False so the
+        caller's fail-closed reap path handles it, like every other finalize failure.
+        """
+        if self.cfg.egress_policy is not None:
+            return          # per-worker rules govern it; the network's own mode is moot
+        proc = self._virsh("net-dumpxml", self.cfg.network)
+        rc = getattr(proc, "returncode", 1)
+        xml = (getattr(proc, "stdout", "") or "") if rc == 0 else ""
+        if rc != 0 or "<network" not in xml:
+            err = (getattr(proc, "stderr", "") or "").strip().splitlines()
+            raise RuntimeError(
+                f"cannot read libvirt network {self.cfg.network!r} "
+                f"({err[-1] if err else 'no output'}), "
+                "so it is not known whether this VM would have internet access. Refusing "
+                "to boot an unpoliced worker onto an unknown network. Define it with "
+                "`virsh net-define deploy/libvirt/bb-isolated.xml && virsh net-start "
+                "bb-isolated && virsh net-autostart bb-isolated`.")
+        match = re.search(r"<forward\b[^>]*\bmode=['\"]([a-z]+)['\"]", xml)
+        mode = match.group(1).lower() if match else ("nat" if "<forward" in xml else None)
+        if mode is None:
+            return          # no <forward> element: libvirt's isolated mode. Correct.
+        if mode in self.FORWARDING_MODES:
+            raise RuntimeError(
+                f"libvirt network {self.cfg.network!r} is <forward mode='{mode}'>, which "
+                "reaches the physical network, and this worker has NO egress_policy — so "
+                "it would detonate malware with direct internet access. Either attach it "
+                "to an isolated network (deploy/libvirt/bb-isolated.xml, the default) or "
+                "give it an egress_policy.")
+
     def spawn(self) -> VmSlot:
         """Provision a COW overlay off the golden, define+start the domain, and return a WARMING
         slot IMMEDIATELY. Readiness (agent up) and the one-time finalize (egress + clean snapshot)
         happen in ``is_ready()`` so the ~60s guest boot never blocks the pool's tick loop —
         matching the async-spawn contract of the FC/gVisor runtimes."""
+        # BEFORE the overlay, the define, or the boot. The guest is reachable on the
+        # libvirt network from `start` onward, so a check after that races the thing it
+        # is checking.
+        self._assert_egress_is_governed()
         sid, name, overlay = self._alloc_overlay_name()
         # Assign+enforce: hand this worker a fixed (MAC, IP) and pin it. Allocated BEFORE the try so a
         # pool-exhaustion error doesn't leave a half-built domain; the reservation + explicit pin go in

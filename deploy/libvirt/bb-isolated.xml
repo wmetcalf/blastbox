@@ -1,0 +1,40 @@
+<!--
+  bb-isolated — the libvirt network a blastbox VM worker attaches to by default.
+
+  THE ABSENCE OF <forward> IS THE WHOLE POINT. That is libvirt's isolated mode: guests on
+  this network reach each other and the host, and nothing is forwarded to the physical
+  NIC. There is no rule to get wrong and no daemon to fail open — a packet has nowhere to
+  go because no path exists, which is the same property the container tier gets from
+  docker's `internal` bridge flag.
+
+  DO NOT ADD <forward mode='nat'/>. libvirt's shipped `default` network has exactly that,
+  and VmConfig.network used to point at it: a worker with no egress_policy therefore had
+  working internet, from the defaults alone, with no host-side rules. VmRuntime refuses
+  to boot that pairing now (see _assert_egress_is_governed), and this file is the other
+  half of the fix.
+
+  A worker that NEEDS egress gets it the governed way — an egress_policy applied to its
+  IP by the rooter (blastbox.host.runtime.libvirt_egress) — not by being placed on a
+  network that forwards.
+
+  DHCP is offered because the guest agent is reached over this network and the IP
+  reservation scheme (net-update add ip-dhcp-host) writes into it. The range is the
+  tier's, not libvirt's default 192.168.122.0/24, so defining this cannot disturb an
+  existing `default` network on the same host.
+
+  Install:
+      virsh net-define deploy/libvirt/bb-isolated.xml
+      virsh net-start bb-isolated
+      virsh net-autostart bb-isolated
+  Verify it does NOT forward:
+      virsh net-dumpxml bb-isolated | grep -c '<forward'     # must print 0
+-->
+<network>
+  <name>bb-isolated</name>
+  <bridge name='bb-virbr0' stp='on' delay='0'/>
+  <ip address='192.168.221.1' netmask='255.255.255.0'>
+    <dhcp>
+      <range start='192.168.221.2' end='192.168.221.254'/>
+    </dhcp>
+  </ip>
+</network>

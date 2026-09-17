@@ -19,7 +19,7 @@ trap 'rm -rf "$WORK"' EXIT
 cp -a "$REPO" "$WORK/bb"
 cd "$WORK/bb" || exit 1
 PY="$REPO/.venv/bin/python"
-MATRIX=tests/host/test_grants_enforcement_matrix.py
+MATRIX="tests/host/test_grants_enforcement_matrix.py tests/host/test_libvirt_isolated_default.py"
 
 # name|file|python-replacement. Each disables ONE arm of the control.
 MUTATIONS=(
@@ -33,6 +33,11 @@ MUTATIONS=(
   "the VM tier resolution|src/blastbox/host/runtime/vm_dispatch.py|s=s.replace('        registry = self._net_policy_registry()','        return type(\"_P\", (), {\"exit_driver\": \"none\"})()   # MUTANT',1)"
   "release-not-fail (cold)|src/blastbox/host/dispatch.py|s=s.replace('                self._requeue_claimed(\n                    job, defer=True, defer_s=shared_defer,','                self._fail_job(job, \"mutant\"); return\n                self._requeue_claimed(\n                    job, defer=True, defer_s=shared_defer,',1)"
   "release-not-fail (VM)|src/blastbox/host/runtime/vm_dispatch.py|s=s.replace('                status=JobStatus.QUEUED, claim_id=None, started_at=None,','                status=JobStatus.FAILED, claim_id=None, started_at=None,',1)"
+  # --- the libvirt isolation control ---
+  "the libvirt isolation check|src/blastbox/host/runtime/libvirt_vm.py|s=s.replace('        if self.cfg.egress_policy is not None:\n            return          # per-worker rules govern it','        return   # MUTANT\n        if self.cfg.egress_policy is not None:\n            return',1)"
+  "the isolated default network|src/blastbox/host/runtime/libvirt_vm.py|s=s.replace('    network: str = \"bb-isolated\"','    network: str = \"default\"',1)"
+  "the fail-closed unreadable-network branch|src/blastbox/host/runtime/libvirt_vm.py|s=s.replace('        if rc != 0 or \"<network\" not in xml:','        if False:',1)"
+  "the check running BEFORE the boot|src/blastbox/host/runtime/libvirt_vm.py|s=s.replace('        self._assert_egress_is_governed()\n        sid, name, overlay','        sid, name, overlay',1)"
 )
 
 pass=0; fail=0
@@ -53,7 +58,7 @@ PYEOF
     printf '%-44s \033[31mANCHOR MISSING (mutation did not apply)\033[0m\n' "$name"
     fail=$((fail+1)); cp "$REPO/$file" "$file"; continue
   fi
-  if "$PY" -m pytest "$MATRIX" -q -p no:randomly >/dev/null 2>&1; then
+  if "$PY" -m pytest $MATRIX -q -p no:randomly >/dev/null 2>&1; then
     printf '%-44s \033[31mNOT CAUGHT — the matrix passes without this\033[0m\n' "$name"
     fail=$((fail+1))
   else

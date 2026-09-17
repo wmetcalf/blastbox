@@ -309,6 +309,31 @@ sudo blastbox egress check
 sudo scripts/test-egress-leak.sh --mode global
 ```
 
+**libvirt VM workers get no internet unless they are given it.** The VM tier attaches
+workers to `bb-isolated` — a libvirt network with **no `<forward>` element**, which is
+libvirt's own idiom for "guests reach each other and the host, nothing forwards to the
+physical NIC". Define it once per VM host:
+
+```bash
+sudo virsh net-define deploy/libvirt/bb-isolated.xml
+sudo virsh net-start bb-isolated
+sudo virsh net-autostart bb-isolated
+sudo virsh net-dumpxml bb-isolated | grep -c '<forward'    # must print 0
+```
+
+This replaces libvirt's shipped `default` network, which is `<forward mode='nat'/>` and
+has working internet. That was the previous default, and combined with `egress_policy`
+being optional it meant a VM worker configured with nothing at all detonated malware with
+direct NAT egress and no host-side rules — two individually reasonable defaults
+conspiring, which is why neither looked wrong.
+
+The default is not the control. `spawn()` reads the network the guest will **actually**
+attach to and refuses to boot a worker that has no `egress_policy` onto anything that
+forwards — including `route`, which does not translate addresses but still puts the guest
+on your LAN — and refuses just as firmly when it cannot read the network definition at
+all. A worker that *needs* egress gets it the governed way: a per-worker `egress_policy`
+applied to its IP by the rooter, not by being placed on a network that forwards.
+
 **Arming the grants gate on a worker (optional).** `pki issue-node` writes the cert on
 the host you ran it on — step 3 above runs on the EXIT HOST — so enabling enforcement on
 a worker means copying two files to it and pointing one variable at them:

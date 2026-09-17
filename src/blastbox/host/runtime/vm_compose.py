@@ -76,7 +76,11 @@ class VmWorkerSpec:
     # domain shape
     mem_mb: int = 4096
     vcpus: int = 2
-    network: str = "default"
+    #: MUST TRACK LibvirtVmConfig.network, and did not: this is the YAML-facing copy and
+    #: it overrides the runtime's default whenever compose is used, so fixing one and not
+    #: the other leaves the whole compose path on libvirt's NAT network. A test asserts
+    #: the two agree. Not `default` — that is libvirt's <forward mode='nat'/> network.
+    network: str = "bb-isolated"
     disk_bus: str = "sata"
     nic_model: str = "e1000"
     nwfilter: str = "clean-traffic"
