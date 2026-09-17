@@ -78,6 +78,19 @@ PUT_OUTPUT_RETRY_BACKOFF_S = 1.0
 
 logger = logging.getLogger(__name__)
 
+#: The tier of a pool that has not declared its provisioned egress. NOT "none": a libvirt
+#: VM with no declared policy is left on the UNRESTRICTED network (see `_process`), so
+#: calling it sealed put it in UNGOVERNED_TIERS and skipped both the tier and the
+#: credentials arm — on exactly the remote pools this control exists for.
+_UNDECLARED = "\x00undeclared"
+
+
+def _no_gate():
+    """placement.NO_GATE, imported lazily to keep this module's import graph unchanged."""
+    from blastbox.host.placement import NO_GATE
+
+    return NO_GATE
+
 
 class NoWarmSlot(RuntimeError):
     """No warm slot was available to run a claimed job. The dispatcher REQUEUES the job (it never ran)
@@ -420,10 +433,25 @@ class VmJobDispatcher:
         """
         from blastbox.host.netpolicy import resolve_net_policy
 
-        name = (self._fixed_net_policy
-                or job.net_policy
-                or self._engine_default_policy(job.engine)
-                or "none")
+        # MIRROR `_process` EXACTLY, including the case-folding it does and the order it
+        # uses. The previous version put `fixed` FIRST and never normalised case, so with
+        # fixed_net_policy='VPN' the gate judged tier 'vpn' while _process's effective
+        # policy was 'none' — and a certificate lacking a 'vpn' tier then RELEASED that
+        # job forever instead of letting _process FAIL it terminally.
+        effective = (job.net_policy
+                     or self._engine_default_policy(job.engine)
+                     or "none").strip().lower()
+        fixed = (self._fixed_net_policy or "").strip().lower()
+        if self._fixed_net_policy is None:
+            # AN UNDECLARED POOL IS NOT A SEALED ONE. `_process`'s own comment says a
+            # libvirt VM with egress_policy=None "is left on the (unrestricted) libvirt
+            # network, NOT --network=none", which is exactly why it refuses to assume
+            # 'none' for the policy check. The gate must not assume it either: resolving
+            # to 'none' put the tier in UNGOVERNED_TIERS, so tier AND credentials were
+            # skipped and only the engine name was ever checked — on the aws/static/
+            # cascade pools this control exists for.
+            return type("_P", (), {"exit_driver": _UNDECLARED})()
+        name = fixed or effective
         # RESOLVE_NET_POLICY NEVER RAISES, and the first version of this leaned on an
         # `except Exception` fallback that was therefore DEAD CODE with a comment
         # claiming the opposite. Its documented behaviour is "an unknown name at any step
@@ -439,7 +467,7 @@ class VmJobDispatcher:
         registry = self._net_policy_registry()
         resolved = resolve_net_policy(job_net_policy=name, engine_default="none",
                                       registry=registry, allow_override=True)
-        if str(name).strip().lower() not in ("none", "drop", "") and resolved.name != name:
+        if name not in ("none", "drop", "") and resolved.name != name:
             return type("_P", (), {"exit_driver": str(name).strip().lower()})()
         return resolved
 
@@ -477,8 +505,17 @@ class VmJobDispatcher:
         # blob store configured (`job.input_sha256 is None`) the peer cannot
         # re-materialise the sample, so deleting it makes that peer FAIL the job: the one
         # contract this gate makes, turned into its opposite.
-        why = self._grants_gate.refuse(engine=job.engine,
-                                       personality=self._effective_personality(job))
+        personality = self._effective_personality(job)
+        why = self._grants_gate.refuse(engine=job.engine, personality=personality)
+        if why is None and personality.exit_driver is _UNDECLARED \
+                and self._grants_gate.grants() is not _no_gate():
+            # An undeclared pool passed the engine check and had NOTHING to check its
+            # tier or credentials against. Rather than invent a tier name the operator
+            # would have to guess, say what to fix.
+            why = ("this pool declares no fixed_net_policy, so this node cannot know what "
+                   "egress its VMs actually have and cannot check it against the "
+                   "certificate's tier or credentials grants. Declare fixed_net_policy "
+                   "(the pool's provisioned egress), or run this pool ungated.")
         if why is not None:
             # DEFERRED AND THROTTLED. `_worker_loop` only backs off when `claim_next`
             # returns None, so a refusal that simply returned re-claimed THE SAME JOB

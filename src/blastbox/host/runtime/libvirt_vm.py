@@ -426,17 +426,45 @@ class LibvirtVmRuntime:
         rc = getattr(proc, "returncode", 1)
         return rc, ((getattr(proc, "stdout", "") or "") if rc == 0 else "")
 
+    #: A `<forward>` ELEMENT, not the substring. `"<forward" in xml` also matches
+    #: `<forwarder`, and `<dns><forwarder addr='...'/></dns>` is perfectly ordinary on an
+    #: ISOLATED network — so adding split-DNS to bb-isolated used to invert this check in
+    #: both directions at once: an unpoliced worker was refused with a message claiming
+    #: the network was NAT, and a `direct` worker was allowed onto a network that cannot
+    #: carry it.
+    _FORWARD_EL = re.compile(r"<forward(?=[\s/>])", re.I)
+    _FORWARD_MODE = re.compile(r"<forward\b[^>]*\bmode=['\"]([^'\"]+)['\"]", re.I)
+
+    def _forward_mode(self, xml: str) -> "str | None":
+        """The network's forward mode, ``None`` if it has no ``<forward>`` element at all.
+
+        A modeless ``<forward/>`` is NAT, which is what libvirt does with it.
+        """
+        m = self._FORWARD_MODE.search(xml)
+        if m:
+            return m.group(1).strip().lower()
+        return "nat" if self._FORWARD_EL.search(xml) else None
+
     def _network_forwards(self) -> bool:
-        """Does this network reach the physical network? Unreadable counts as NO, so the
-        `direct` contradiction above is raised rather than skipped — the egress check
-        refuses an unreadable network anyway, and this ordering keeps that the loudest
-        failure."""
-        rc, xml = self._network_xml()
-        if rc != 0 or "<network" not in xml:
+        """Does this network reach the physical network?
+
+        Callers must have already refused an unreadable network — see
+        :meth:`_assert_egress_is_governed`, which does that FIRST now. An earlier version
+        of this docstring claimed "the egress check refuses an unreadable network anyway",
+        which was false: that refusal lived below an unconditional `return` in the
+        has-a-policy branch, so an unreadable network produced no refusal at all for
+        tunnel drivers and the WRONG diagnosis for `direct` ("does not forward", telling
+        the operator to switch to a NAT network because libvirtd was down).
+        """
+        _rc, xml = self._network_xml()
+        mode = self._forward_mode(xml)
+        if mode is None:
             return False
-        m = re.search(r"<forward\b[^>]*\bmode=['\"]([a-z]+)['\"]", xml)
-        mode = m.group(1).lower() if m else ("nat" if "<forward" in xml else None)
-        return mode in self.FORWARDING_MODES if mode else False
+        # UNRECOGNISED MEANS FORWARDING. The old test was `mode in FORWARDING_MODES` — an
+        # allowlist of bad modes — so any mode libvirt adds later, or any typo, read as
+        # safe. The one shape that is safe is "no <forward> element", and it is already
+        # handled above; everything else is presumed to reach the network.
+        return True
 
     def _assert_subnet_matches_network(self) -> None:
         """The configured subnet_prefix must be the one this libvirt network actually
@@ -470,7 +498,7 @@ class LibvirtVmRuntime:
                 self.cfg.network, actual, self.cfg.subnet_prefix, actual)
 
     def _assert_egress_is_governed(self) -> None:
-        """Refuse to boot an unpoliced VM onto a network that reaches the internet.
+        """Refuse to boot a VM whose egress this node cannot account for.
 
         THE PAIRING THIS PREVENTS was reachable from the defaults alone: `network` was
         `"default"` (libvirt's NAT network) and `egress_policy` was None, so a VmConfig
@@ -481,21 +509,29 @@ class LibvirtVmRuntime:
         it silently. This reads what the guest will ACTUALLY be attached to, at spawn,
         from libvirt itself.
 
-        FAILS CLOSED ON NOT KNOWING. If `net-dumpxml` cannot be read the answer is not
-        "probably fine": an unreadable network definition is exactly the state in which
-        an operator most wants to be stopped. Raises rather than returning False so the
-        caller's fail-closed reap path handles it, like every other finalize failure.
+        FAILS CLOSED ON NOT KNOWING, AND THAT CHECK COMES FIRST. It used to sit below the
+        has-a-policy branch's unconditional `return`, so an unreadable network was only
+        refused for an unpoliced worker — every tunnel driver sailed past it and `direct`
+        got a refusal that misdiagnosed a down libvirtd as a wrong exit driver.
         """
+        rc, xml = self._network_xml()
+        if rc != 0 or "<network" not in xml:
+            raise RuntimeError(
+                f"cannot read libvirt network {self.cfg.network!r}, so it is not known "
+                "whether this VM would have internet access. Refusing to boot. Define it "
+                "with `virsh net-define deploy/libvirt/bb-isolated.xml && virsh net-start "
+                "bb-isolated && virsh net-autostart bb-isolated`, and check that libvirtd "
+                "is running.")
+        forwards = self._network_forwards()
+
         if self.cfg.egress_policy is not None:
-            # ...with ONE exception, which is the mirror image of the check below.
             # `direct` means "go straight out" and `routing_commands()` deliberately
             # emits no routing and no NAT for it — it relies on the NETWORK to provide a
             # path. On an isolated network there is none, so the filter chain accepts the
             # packet and it dies with no return route: the job loses connectivity and
             # nothing says why. A policy that promises egress on a network that cannot
             # carry it is a contradiction, and a loud one is better than a silent one.
-            driver = getattr(self.cfg.egress_policy, "exit_driver", None)
-            if driver == "direct" and not self._network_forwards():
+            if getattr(self.cfg.egress_policy, "exit_driver", None) == "direct" and not forwards:
                 raise RuntimeError(
                     f"egress_policy.exit_driver is 'direct' but libvirt network "
                     f"{self.cfg.network!r} does not forward, so there is no path out and "
@@ -503,25 +539,15 @@ class LibvirtVmRuntime:
                     "get a reply. Use a forwarding network for direct egress, or an "
                     "exit_driver that builds its own path (openvpn/wireguard/socks).")
             return          # per-worker rules govern it; the network's own mode is moot
-        rc, xml = self._network_xml()
-        if rc != 0 or "<network" not in xml:
+
+        if forwards:
             raise RuntimeError(
-                f"cannot read libvirt network {self.cfg.network!r}, "
-                "so it is not known whether this VM would have internet access. Refusing "
-                "to boot an unpoliced worker onto an unknown network. Define it with "
-                "`virsh net-define deploy/libvirt/bb-isolated.xml && virsh net-start "
-                "bb-isolated && virsh net-autostart bb-isolated`.")
-        match = re.search(r"<forward\b[^>]*\bmode=['\"]([a-z]+)['\"]", xml)
-        mode = match.group(1).lower() if match else ("nat" if "<forward" in xml else None)
-        if mode is None:
-            return          # no <forward> element: libvirt's isolated mode. Correct.
-        if mode in self.FORWARDING_MODES:
-            raise RuntimeError(
-                f"libvirt network {self.cfg.network!r} is <forward mode='{mode}'>, which "
-                "reaches the physical network, and this worker has NO egress_policy — so "
-                "it would detonate malware with direct internet access. Either attach it "
-                "to an isolated network (deploy/libvirt/bb-isolated.xml, the default) or "
-                "give it an egress_policy.")
+                f"libvirt network {self.cfg.network!r} is <forward mode="
+                f"{self._forward_mode(xml)!r}>, which reaches the physical network, and "
+                "this worker has NO egress_policy — so it would detonate malware with "
+                "direct internet access. Either attach it to an isolated network "
+                "(deploy/libvirt/bb-isolated.xml, the default) or give it an "
+                "egress_policy.")
 
     def spawn(self) -> VmSlot:
         """Provision a COW overlay off the golden, define+start the domain, and return a WARMING

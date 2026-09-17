@@ -432,7 +432,11 @@ class SelfGrants:
                 "egress-mode",
                 "%s exists but declares no BLASTBOX_EGRESS_MODE (truncated, unreadable "
                 "or hand-edited). Assuming local mode for the credentials check, which "
-                "is the conservative guess — but fix the file.", ENV_FILE)
+                "is the conservative guess: a global-mode node judged local is idled, a "
+                "local-mode node judged global holds provider credentials it was not "
+                "granted. Fix the file — and note that `blastbox egress check` will NOT "
+                "flag this, because persisted_config() only raises when the file is "
+                "entirely unreadable, not when it parses without a MODE line.", ENV_FILE)
             return "local"
         return mode
 

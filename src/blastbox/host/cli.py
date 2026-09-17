@@ -1118,14 +1118,33 @@ def _pki_cmd(args: argparse.Namespace) -> int:
         armed = value is not NO_GATE
         status: dict[str, object] = {
             "gate_armed": armed,
-            "why": (f"{SelfGrants.GATE_ENV} is set to off — this node runs unrestricted "
-                    f"DESPITE having a certificate at {cert_at}. Unset it to arm the gate."
-                    if not armed and gate.gate_forced() == "off" and cert_at is not None
-                    else "no certificate configured — this node runs unrestricted "
-                    f"(set {SelfGrants.CERT_ENV} to arm it)" if not armed
-                    else "certificate verified" if value is not None
-                    else "certificate configured but DOES NOT VERIFY — this node refuses "
-                         "all work until it is renewed"),
+            # EVERY ARM STATES ONLY WHAT WAS ACTUALLY CHECKED. Two were wrong:
+            #  * the forced-off arm asserted "DESPITE having a certificate at X" for a
+            #    path `cert_path()` deliberately never touches, and then said "unset it
+            #    to arm the gate" — which, for a path that does not exist, turns a node
+            #    reporting "runs unrestricted" into one that refuses every job. The
+            #    command telling the operator to make that edit is the worst place for it.
+            #  * with the gate forced ON and no certificate, `grants()` returns None, so
+            #    `armed` was True and it reported "certificate configured but DOES NOT
+            #    VERIFY" while `cert_path` in the same object was null — contradicting
+            #    its own log line a few milliseconds earlier.
+            "why": (
+                f"{SelfGrants.GATE_ENV} is off, so this node runs unrestricted. A "
+                f"certificate path IS configured ({cert_at}) — whether it is usable was "
+                f"not checked, because the gate is disabled. Unset {SelfGrants.GATE_ENV} "
+                "to arm it, and verify with this command afterwards."
+                if not armed and gate.gate_forced() == "off" and cert_at is not None
+                else f"{SelfGrants.GATE_ENV} is off, so this node runs unrestricted (no "
+                f"certificate is configured either)."
+                if not armed and gate.gate_forced() == "off"
+                else "no certificate configured — this node runs unrestricted "
+                f"(set {SelfGrants.CERT_ENV} to arm it)" if not armed
+                else f"{SelfGrants.GATE_ENV} is on but no certificate is configured, so "
+                f"this node refuses ALL work. Set {SelfGrants.CERT_ENV}."
+                if value is None and cert_at is None
+                else "certificate verified" if value is not None
+                else "certificate configured but DOES NOT VERIFY — this node refuses "
+                     "all work until it is renewed"),
             "cert_path": str(cert_at) if cert_at else None,
             "forced": gate.gate_forced() or None,
             "egress_mode": gate.egress_mode() or None,

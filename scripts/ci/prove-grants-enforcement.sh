@@ -34,13 +34,13 @@ MUTATIONS=(
   "release-not-fail (cold)|src/blastbox/host/dispatch.py|s=s.replace('                self._requeue_claimed(\n                    job, defer=True, defer_s=shared_defer,','                self._fail_job(job, \"mutant\"); return\n                self._requeue_claimed(\n                    job, defer=True, defer_s=shared_defer,',1)"
   "release-not-fail (VM)|src/blastbox/host/runtime/vm_dispatch.py|s=s.replace('                status=JobStatus.QUEUED, claim_id=None, started_at=None,','                status=JobStatus.FAILED, claim_id=None, started_at=None,',1)"
   # --- the libvirt isolation control ---
-  "the libvirt isolation check|src/blastbox/host/runtime/libvirt_vm.py|s=s.replace('        if mode in self.FORWARDING_MODES:','        if False:',1)"
+  "the libvirt isolation check|src/blastbox/host/runtime/libvirt_vm.py|s=s.replace('        if forwards:\n            raise RuntimeError(','        if False:\n            raise RuntimeError(',1)"
   "the isolated default network|src/blastbox/host/runtime/libvirt_vm.py|s=s.replace('    network: str = \"bb-isolated\"','    network: str = \"default\"',1)"
-  "the fail-closed unreadable-network branch|src/blastbox/host/runtime/libvirt_vm.py|parts=s.split('        if rc != 0 or \"<network\" not in xml:'); assert len(parts)==3; s=parts[0]+'        if rc != 0 or \"<network\" not in xml:'+parts[1]+'        if False:'+parts[2]"
+  "the fail-closed unreadable-network branch|src/blastbox/host/runtime/libvirt_vm.py|s=s.replace('        if rc != 0 or \"<network\" not in xml:','        if False:',1)"
   "the check running BEFORE the boot|src/blastbox/host/runtime/libvirt_vm.py|s=s.replace('        self._assert_egress_is_governed()\n        self._assert_subnet_matches_network()\n        sid, name, overlay','        sid, name, overlay',1)"
   # --- from the upstream review of the fixes themselves ---
   "the subnet default tracking the network|src/blastbox/host/runtime/libvirt_vm.py|s=s.replace('    subnet_prefix: str = \"192.168.221.\"','    subnet_prefix: str = \"192.168.122.\"',1)"
-  "the direct-egress contradiction|src/blastbox/host/runtime/libvirt_vm.py|s=s.replace('            if driver == \"direct\" and not self._network_forwards():','            if False:',1)"
+  "the direct-egress contradiction|src/blastbox/host/runtime/libvirt_vm.py|s=s.replace('exit_driver\", None) == \"direct\" and not forwards:','exit_driver\", None) == \"direct\" and False:',1)"
   "the per-call verification (cache it again)|src/blastbox/host/placement.py|s=s.replace('        self._node_id = ident.node_id\n        return ident.grants','        self._node_id = ident.node_id\n        self.__dict__.setdefault(\"_mutant\", ident.grants)\n        return self.__dict__[\"_mutant\"]',1)"
   "releasing an engine this node lacks|src/blastbox/host/dispatch.py|s=s.replace('        if job.engine not in self._engines and self._grants_gate.grants() is not _NO_GATE:','        if False:',1)"
   "the single NO_GATE sentinel|src/blastbox/host/dispatch.py|s=s.replace('from blastbox.host.placement import NO_GATE as _NO_GATE','_NO_GATE = object()   # MUTANT: a second, non-identical sentinel',1)"

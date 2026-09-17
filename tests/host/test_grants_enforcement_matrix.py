@@ -232,7 +232,7 @@ def test_the_warm_reservation_is_not_leaked_by_a_refusal(tmp_path, monkeypatch):
 # to constrain were precisely the ones running ungoverned, and an operator setting
 # BLASTBOX_NODE_CERT on such a node would see no refusals and conclude it worked.
 
-def _vm(store, tmp_path, validated, *, fixed_net_policy=None):
+def _vm(store, tmp_path, validated, *, fixed_net_policy="direct"):
     from blastbox.host.runtime.vm_dispatch import VmJobDispatcher
 
     def validate(path):
@@ -243,7 +243,7 @@ def _vm(store, tmp_path, validated, *, fixed_net_policy=None):
                            fixed_net_policy=fixed_net_policy)
 
 
-def _vm_job(store, tmp_path, engine="authenticode", net_policy=None):
+def _vm_job(store, tmp_path, engine="authenticode", net_policy="direct"):
     from blastbox.host.jobs.base import Job
 
     job = Job.new(engine=engine, filename="evil.dll")
@@ -275,11 +275,13 @@ def test_vm_path_does_not_validate_an_ungranted_engine(tmp_path, monkeypatch):
 def test_vm_path_still_runs_a_granted_engine(tmp_path, monkeypatch):
     store = InMemoryJobStore()
     job = _vm_job(store, tmp_path)
-    _arm(tmp_path, monkeypatch, engines=("authenticode",))
+    # The pool declares fixed_net_policy="direct", so the tier is governed and must be
+    # granted — an undeclared pool is refused outright now, with an actionable message.
+    _arm(tmp_path, monkeypatch, engines=("authenticode",), tiers=("direct",))
 
     validated: list = []
     _vm(store, tmp_path, validated)._process(store.claim_next())
-    assert validated, "a granted engine was refused by the VM dispatcher"
+    assert validated, "a granted engine+tier was refused by the VM dispatcher"
     assert store.get(job.job_id).status == JobStatus.DONE
 
 
@@ -511,7 +513,10 @@ def test_the_forced_off_gate_is_reported_as_forced_off(tmp_path, monkeypatch, ca
     out = json.loads(capsys.readouterr().out)
 
     assert out["gate_armed"] is False
-    assert "off" in out["why"] and "DESPITE" in out["why"], out["why"]
+    assert "is off" in out["why"], out["why"]
+    # ...and it must NOT assert the certificate is usable, which it never checked, nor
+    # tell the operator to unset the gate without saying to verify afterwards.
+    assert "not checked" in out["why"], out["why"]
     assert out["cert_path"] is not None
 
 
@@ -665,3 +670,56 @@ def test_the_old_arming_route_warns_and_does_NOT_arm(tmp_path, monkeypatch, capl
         assert g.grants() is NO_GATE, "the sizer's host slug armed the gate"
     assert "does NOT arm" in caplog.text and "host-a" in caplog.text
     assert g.node_id == "", "it must not adopt another node's identity"
+
+
+def test_a_VM_pool_that_declares_no_egress_is_refused_with_something_actionable(
+        tmp_path, monkeypatch):
+    """`_process`'s own comment says a libvirt VM with no declared policy "is left on the
+    (unrestricted) libvirt network, NOT --network=none", which is why it refuses to assume
+    'none' for its net_policy check. The gate assumed it anyway: resolving to 'none' put
+    the tier in UNGOVERNED_TIERS, so the tier AND credentials arms were skipped and only
+    the engine name was checked — on the aws/static/cascade pools this control exists for.
+
+    It is refused now, and with a message naming the fix rather than a tier the operator
+    would have to guess."""
+    store = InMemoryJobStore()
+    job = _vm_job(store, tmp_path, net_policy=None)
+    _arm(tmp_path, monkeypatch, engines=("authenticode",), tiers=("direct",))
+
+    validated: list = []
+    _vm(store, tmp_path, validated, fixed_net_policy=None)._process(store.claim_next())
+
+    assert validated == [], "an undeclared pool ran work with its tier unchecked"
+    assert store.get(job.job_id).status == JobStatus.QUEUED
+
+
+def test_an_UNGATED_vm_pool_with_no_declared_egress_still_runs(tmp_path, monkeypatch):
+    """The refusal above is a GATE decision. An ungated node must keep the documented
+    opt-out working, or this becomes a breaking change for every existing VM pool."""
+    store = InMemoryJobStore()
+    _vm_job(store, tmp_path, net_policy=None)
+    _disarm(monkeypatch)
+
+    validated: list = []
+    _vm(store, tmp_path, validated, fixed_net_policy=None)._process(store.claim_next())
+    assert validated, "an ungated VM pool was refused for not declaring its egress"
+
+
+def test_the_vm_tier_mirrors_process_including_case(monkeypatch):
+    """`_effective_personality` put `fixed` first and never folded case, so with
+    fixed_net_policy='VPN' the gate judged tier 'vpn' while `_process`'s effective policy
+    was 'none' — and a certificate lacking a 'vpn' tier then RELEASED that job forever
+    instead of letting `_process` FAIL it terminally."""
+    from blastbox.host.runtime.vm_dispatch import VmJobDispatcher
+
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_VPN", "exit=openvpn")
+    d = VmJobDispatcher.__new__(VmJobDispatcher)
+    d._fixed_net_policy = "VPN"
+    d._engine_net_policy = None
+    d._net_policies_cached = None
+    job = type("J", (), {"engine": "boxjs", "net_policy": None, "job_id": "j"})()
+
+    p = d._effective_personality(job)
+    assert p.exit_driver == "openvpn", (
+        f"tier judged {p.exit_driver!r}; _process folds case and would use 'vpn'"
+    )

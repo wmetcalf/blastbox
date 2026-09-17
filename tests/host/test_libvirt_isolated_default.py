@@ -231,3 +231,73 @@ def test_a_tunnel_driver_is_fine_on_an_isolated_network(monkeypatch, driver):
     this the fix above would be a blanket ban on isolated networks."""
     policy = type("P", (), {"exit_driver": driver})()
     _runtime(monkeypatch, xml=ISOLATED, egress_policy=policy)._assert_egress_is_governed()
+
+
+# ------------------------------------------- the checks the review round disproved
+
+DNS_ISOLATED = ("<network><name>bb-isolated</name><bridge name='bb-virbr0'/>"
+                "<dns><forwarder addr='192.168.221.1'/></dns>"
+                "<ip address='192.168.221.1' netmask='255.255.255.0'/></network>")
+
+
+def test_a_dns_forwarder_is_not_a_forward_element(monkeypatch):
+    """`"<forward" in xml` also matches `<forwarder`, and `<dns><forwarder/></dns>` is
+    perfectly ordinary on an ISOLATED network — so adding split-DNS to bb-isolated
+    inverted this check in BOTH directions at once: an unpoliced worker was refused with
+    a message claiming the network was NAT, and a `direct` worker was allowed onto a
+    network that cannot carry it."""
+    rt = _runtime(monkeypatch, xml=DNS_ISOLATED)
+    rt._assert_egress_is_governed()                      # must NOT refuse
+    assert rt._network_forwards() is False
+    assert rt._forward_mode(DNS_ISOLATED) is None
+
+    policy = type("P", (), {"exit_driver": "direct"})()
+    with pytest.raises(RuntimeError, match="does not forward"):
+        _runtime(monkeypatch, xml=DNS_ISOLATED, egress_policy=policy
+                 )._assert_egress_is_governed()
+
+
+@pytest.mark.parametrize("mode", ["tomato", "NAT", "Route", "some-future-mode"])
+def test_an_unrecognised_forward_mode_is_refused(monkeypatch, mode):
+    """The test was `mode in FORWARDING_MODES` — an ALLOWLIST OF BAD MODES — so any mode
+    libvirt adds later, or any capitalisation, read as safe and an unpoliced malware VM
+    booted onto it. The only safe shape is "no <forward> element at all"."""
+    xml = f"<network><name>n</name><forward mode='{mode}'/></network>"
+    with pytest.raises(RuntimeError, match="reaches the physical network"):
+        _runtime(monkeypatch, xml=xml, network="n")._assert_egress_is_governed()
+
+
+def test_an_unreadable_network_is_refused_WHATEVER_the_policy(monkeypatch):
+    """The unreadable-network refusal sat BELOW the has-a-policy branch's unconditional
+    return, so it only ever fired for an unpoliced worker: every tunnel driver sailed
+    past it, and `direct` got a refusal that misdiagnosed a down libvirtd as a wrong exit
+    driver ("use a forwarding network" — an instruction to build the NAT network this
+    whole change exists to eliminate)."""
+    for driver in (None, "direct", "openvpn", "wireguard", "socks", "tor"):
+        policy = None if driver is None else type("P", (), {"exit_driver": driver})()
+        rt = _runtime(monkeypatch, rc=1, stderr="error: failed to get network", 
+                      egress_policy=policy)
+        with pytest.raises(RuntimeError, match="not known whether this VM would have"):
+            rt._assert_egress_is_governed()
+
+
+def test_the_shipped_network_and_the_code_default_are_the_same_subnet():
+    """A THIRD copy of the subnet, asserted by nothing. Re-subnetting the shipped XML to
+    avoid a site collision left every default VM worker with a DHCPSERVER and neighbour
+    filter pointed at an empty range — the "boots and is never discovered as ready"
+    failure — with all tests green."""
+    import xml.etree.ElementTree as ET
+    from pathlib import Path as _P
+
+    root = ET.parse(_P(__file__).resolve().parents[2] / "deploy/libvirt/bb-isolated.xml").getroot()
+    ip = root.find("ip")
+    assert ip is not None, "the shipped network no longer declares an address"
+    shipped = ip.get("address").rsplit(".", 1)[0] + "."
+    assert shipped == VmConfig(golden_base="/x").subnet_prefix, (
+        f"bb-isolated.xml serves {shipped}0/24 but subnet_prefix is "
+        f"{VmConfig(golden_base='/x').subnet_prefix!r}"
+    )
+    rng = root.find("./ip/dhcp/range")
+    assert rng is not None and rng.get("start").startswith(shipped), (
+        "the DHCP range is not on the network's own subnet"
+    )
