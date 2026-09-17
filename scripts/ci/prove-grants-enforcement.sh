@@ -44,7 +44,27 @@ MUTATIONS=(
   "the monotonic expiry deadline|src/blastbox/host/placement.py|s=s.replace('        return bool(self._until_mono and now_mono >= self._until_mono)','        return False',1)"
   "releasing an engine this node lacks|src/blastbox/host/dispatch.py|s=s.replace('        if job.engine not in self._engines and self._grants_gate.grants() is not _NO_GATE:','        if False:',1)"
   "the single NO_GATE sentinel|src/blastbox/host/dispatch.py|s=s.replace('from blastbox.host.placement import NO_GATE as _NO_GATE','_NO_GATE = object()   # MUTANT: a second, non-identical sentinel',1)"
+  # The only code that can turn an UNGATED node into a GATED one from the environment
+  # alone — and the route that was deleted once already for arming a control nobody
+  # asked for. Widening it is the regression that matters.
+  "the legacy-arming existence guard|src/blastbox/host/placement.py|s=s.replace('        if not candidate.exists():\n            return None','        if False:\n            return None',1)"
 )
+
+# BASELINE FIRST. The script's only criterion is "pytest fails with the mutation
+# applied" — which is also what happens when the suite was ALREADY failing. A single
+# unrelated broken test in either matrix file would make all 19 mutations report
+# "caught" and the script print "every arm is covered" and exit 0: the exact false
+# assurance its own header was written to end. Establish that the unmutated tree is
+# green before believing any red.
+echo "=== baseline: the matrix must PASS on the unmutated tree ==="
+if ! "$PY" -m pytest $MATRIX -q -p no:randomly >/tmp/marla-baseline.log 2>&1; then
+  echo "  BASELINE FAILED — the matrix does not pass before any mutation, so every"
+  echo "  'caught' below would be meaningless. Fix the suite first:" >&2
+  tail -15 /tmp/marla-baseline.log >&2
+  exit 1
+fi
+echo "  baseline green ($(grep -oE '[0-9]+ passed' /tmp/marla-baseline.log | tail -1))"
+echo
 
 pass=0; fail=0
 printf '%-44s %s\n' "MUTATION" "MATRIX"

@@ -302,6 +302,9 @@ class SelfGrants:
         #: until wall time caught up, or forever if it never did. A deadline recorded in
         #: elapsed time cannot be moved by setting the clock.
         self._until_mono = 0.0
+        #: ``(not_after timestamp, monotonic instant it was first verified)``. The anchor
+        #: the deadline above is measured from.
+        self._anchor: "tuple[float, float] | None" = None
         self._node_id = ""
         self._warned: set = set()
 
@@ -419,7 +422,6 @@ class SelfGrants:
             # revocation mechanism.
             if fresh and not self._expired(now):
                 return self._cached
-            prev_until = self._until
             try:
                 from blastbox.host.pki import load_trust_anchor, node_identity
                 pki_dir = Path(os.environ.get(self.PKI_ENV, "/var/lib/blastbox/pki"))
@@ -430,21 +432,46 @@ class SelfGrants:
                 # The same instant measured in ELAPSED time. `node_identity` has just
                 # confirmed the certificate is valid NOW, so however wrong the wall clock
                 # is, it has at most (not_after - now) of validity left from this moment.
-                fresh_deadline = now + max(0.0, self._until - time.time())
-                # A DEADLINE MAY ONLY MOVE FORWARD FOR A GENUINELY NEWER CERTIFICATE.
-                # Recomputing it unconditionally re-introduced the exact bug it exists to
-                # prevent: the rolled-back wall clock made `not_after - time.time()` look
-                # enormous, so every re-verification pushed the deadline further out and
-                # the expired identity was republished forever. `not_after` is the only
-                # thing that distinguishes a renewal from the same certificate seen
-                # again through a lying clock — and it comes from the signed payload, not
-                # from the host.
-                if self._until_mono and ident.not_after.timestamp() <= prev_until:
-                    self._until_mono = min(self._until_mono, fresh_deadline)
-                else:
-                    self._until_mono = fresh_deadline
+                # THE DEADLINE IS A CEILING ON THE CERTIFICATE'S REMAINING LIFE, NOT A
+                # RATCHET. The first version took min() of the old and new deadlines,
+                # which made ONE transient forward clock step permanent: an RTC six days
+                # fast at boot recorded a deadline six days short, and after NTP
+                # corrected it the node refused every job for the rest of the
+                # certificate's life — silently, because this branch has no log, and
+                # confusingly, because `pki show-node` on the same file still reported it
+                # valid. A control that fails closed forever on a clock glitch is not
+                # safer than one that re-reads; it is just broken in the quiet direction.
+                #
+                # So: recompute from the certificate each time, and BOUND it by the
+                # remaining life the signed payload allows. `node_identity` has just
+                # verified not_after against the wall clock, so a rolled-back clock
+                # cannot manufacture life the certificate does not have — the cap is
+                # (not_after - not_before), which no clock can inflate.
+                # ANCHOR THE DEADLINE TO WHEN THIS CERTIFICATE WAS FIRST SEEN, and give
+                # it exactly the lifetime the CA signed. Both previous attempts failed
+                # because they re-derived it from `now`:
+                #   * recomputing it freely let a rolled-back clock push it out forever;
+                #   * min()-ing it against the old value made ONE transient forward clock
+                #     step permanent, so an RTC six days fast at boot refused every job
+                #     for the rest of the certificate's life, silently.
+                # The lifetime (not_after - not_before) comes entirely from the signed
+                # payload, so no host clock can inflate it, and the anchor is elapsed
+                # time, which no host clock can move. A certificate therefore gets one
+                # lifetime of monotonic validity from first sight, however wrong the
+                # clock was at that moment or becomes afterwards.
+                #
+                # Keyed on not_after: the same certificate seen again keeps its anchor; a
+                # renewal (a later not_after) legitimately gets a new one.
+                lifetime = max(0.0, self._until - ident.not_before.timestamp())
+                self._until_mono = self._anchor_for(ident, now) + lifetime
                 if self._expired(time.monotonic()):
-                    value = None        # already past it; do not publish
+                    value = None
+                    self._node_id = ""
+                    self._warn_once(
+                        "expired-deadline",
+                        "this node's certificate is past its monotonic validity deadline "
+                        "even though the wall clock disagrees; refusing work. If the host "
+                        "clock has just been corrected, restart the dispatcher.")
             except Exception as exc:      # noqa: BLE001 - every failure is a refusal
                 self._log.warning(
                     "this node's certificate (%s) does not verify: %s. Refusing work "
@@ -455,6 +482,18 @@ class SelfGrants:
             self._cached = value
             self._at = time.monotonic()
             return value
+
+    def _anchor_for(self, ident, now_mono: float) -> float:
+        """The monotonic instant this certificate was FIRST verified.
+
+        A certificate is identified by its ``not_after``: seeing the same one again keeps
+        the original anchor (so its validity cannot be renewed by re-reading the file),
+        while a genuine renewal carries a later ``not_after`` and starts a new one.
+        """
+        na = ident.not_after.timestamp()
+        if self._anchor is None or self._anchor[0] != na:
+            self._anchor = (na, now_mono)
+        return self._anchor[1]
 
     def _expired(self, now_mono: float) -> bool:
         """Has the cached certificate passed its not_after, by EITHER clock?

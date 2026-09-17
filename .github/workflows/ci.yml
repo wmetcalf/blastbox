@@ -129,7 +129,14 @@ jobs:
           python -m venv .venv
           .venv/bin/pip install -q -e ".[host,dev]"
       - name: The matrix itself passes
-        run: .venv/bin/python -m pytest tests/host/test_grants_enforcement_matrix.py -q
+        # BOTH files. This step is the baseline the mutation proof's verdict depends on,
+        # and it used to run only the first — so a failure in the libvirt file, which
+        # covers six of the mutations, would have gone unnoticed here AND made every
+        # mutation report "caught" in the step below.
+        run: |
+          .venv/bin/python -m pytest \
+            tests/host/test_grants_enforcement_matrix.py \
+            tests/host/test_libvirt_isolated_default.py -q
       - name: ...and fails without the control it tests
         run: scripts/ci/prove-grants-enforcement.sh
 
