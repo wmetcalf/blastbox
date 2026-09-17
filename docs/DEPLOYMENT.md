@@ -321,6 +321,19 @@ sudo virsh net-autostart bb-isolated
 sudo virsh net-dumpxml bb-isolated | grep -c '<forward'    # must print 0
 ```
 
+Verify against **`net-dumpxml`**, not the file. The shipped XML's comments mention
+`<forward>` several times (warning you not to add one), so `grep -c '<forward'` on
+`deploy/libvirt/bb-isolated.xml` prints 3 and proves nothing; `net-dumpxml` returns what
+libvirt actually parsed, comments stripped. Confirmed on a live host: the file greps 3,
+the dump greps 0.
+
+If `net-start` fails with `Unable to create: /var/lib/libvirt/dnsmasq/<bridge>.status`
+(`errno=13`), the cause is host ownership, not this definition: `/var/lib/libvirt/dnsmasq`
+must be `root:root`. dnsmasq drops to `nobody` and cannot create a new status file in a
+directory owned by someone else — and networks defined *before* the ownership changed keep
+working, because their status files already exist, so the breakage only ever shows up on
+the next new network.
+
 This replaces libvirt's shipped `default` network, which is `<forward mode='nat'/>` and
 has working internet. That was the previous default, and combined with `egress_policy`
 being optional it meant a VM worker configured with nothing at all detonated malware with
