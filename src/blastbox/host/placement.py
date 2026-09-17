@@ -37,7 +37,6 @@ a node claiming it can.
 from __future__ import annotations
 
 import os
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Mapping, Sequence
@@ -227,13 +226,13 @@ CREDENTIALED_IN_LOCAL_MODE = ("openvpn", "wireguard")
 
 
 class SelfGrants:
-    """What THIS node's certificate permits, cached, with every failure a refusal.
+    """What THIS node's certificate permits. Read and verified PER CALL.
 
-    ONE IMPLEMENTATION, SHARED BY EVERY DISPATCH CLASS. It lived on ``Dispatcher`` first,
-    which meant ``VmJobDispatcher`` — the AWS / static-pool / cascade path, i.e. the
-    REMOTE workers this whole control exists to constrain — was entirely ungoverned, and
-    ``Dispatcher``'s own warm path bypassed it too. Two dispatch classes with two copies
-    of "may I run this" is how one of them ends up with no copy at all.
+    ONE IMPLEMENTATION, SHARED BY EVERY DISPATCH CLASS. It lived on ``Dispatcher``
+    first, which meant ``VmJobDispatcher`` — the AWS / static-pool / cascade path, i.e.
+    the REMOTE workers this whole control exists to constrain — was entirely ungoverned,
+    and ``Dispatcher``'s own warm path bypassed it too. Two dispatch classes with two
+    copies of "may I run this" is how one of them ends up with no copy at all.
 
     THREE STATES, NOT TWO:
 
@@ -245,6 +244,28 @@ class SelfGrants:
     * ``None`` — configured but UNVERIFIABLE (expired, foreign, missing, unreadable).
       Runs nothing. "Revocation is stop renewing" bounds exposure only if something acts
       on the lapse.
+
+    THERE IS NO CACHE, AND THAT IS THE DESIGN.
+    -----------------------------------------
+    An earlier version cached the verified grants behind a TTL. Across five attempts,
+    that cache produced substantially every defect this class has had: a timestamp
+    published before the value, so a concurrent worker got the previous grants
+    mid-refresh; freshness measured on a settable clock, so a backward NTP step made the
+    cache permanently fresh; expiry enforced only at parse time, so a certificate that
+    lapsed inside the window kept authorising; a monotonic deadline recomputed on every
+    refresh, so a rolled-back clock pushed it out forever; and then a ratchet fixing THAT
+    which made one transient forward clock step refuse every job for the rest of the
+    certificate's life, silently. Five bugs, one cause, each fix introducing the next.
+
+    So the cache is gone. Every call opens the file, verifies the CA signature, and
+    checks expiry — the same work ``pki show-node`` does, measured in single-digit
+    milliseconds, against a job that is about to detonate malware in a VM. Nothing here
+    now depends on a clock this process cannot trust, on state surviving between calls,
+    or on two threads agreeing about either. `node_identity` is the only expiry
+    authority, consulted fresh, every time.
+
+    The cost is one file read and one ECDSA verify per claimed job. The benefit is that
+    the failure modes above are not merely fixed — they are unrepresentable.
     """
 
     #: Env var that ARMS the gate. Deliberately NOT ``BLASTBOX_NODE_ID``: that name is
@@ -253,62 +274,17 @@ class SelfGrants:
     #: set it for THAT reason refuse every job with a message about PKI renewal.
     CERT_ENV = "BLASTBOX_NODE_CERT"
     GATE_ENV = "BLASTBOX_NODE_GRANTS_GATE"
-    TTL_ENV = "BLASTBOX_NODE_GRANTS_TTL_S"
     PKI_ENV = "BLASTBOX_PKI_DIR"
-
-    @property
-    def _ttl(self) -> float:
-        """Read per call, like every other variable this class consults.
-
-        It was read once in ``__init__`` while CERT_ENV, GATE_ENV and PKI_ENV were all
-        per-call — so an operator could hot-swap the certificate or arm the gate on a
-        running dispatcher, but changing the TTL silently did nothing until restart, and
-        `pki node-status` (a fresh instance) would confirm a change that had not taken
-        effect in the process that matters. A garbage value is reported, not raised: it
-        used to crash `node-status`, the command whose job is reporting misconfiguration.
-        """
-        raw = os.environ.get(self.TTL_ENV, "") or "300"
-        try:
-            return max(5.0, float(raw))
-        except ValueError:
-            self._log.warning("%s=%r is not a number; using 300s", self.TTL_ENV, raw)
-            return 300.0
+    #: Only consulted to WARN that a node looks configured the old way. Never to arm.
+    LEGACY_ID_ENV = "BLASTBOX_NODE_ID"
 
     def __init__(self, *, log: "logging.Logger | None" = None) -> None:
         import logging as _logging
-        import threading
 
         self._log = log or _logging.getLogger("blastbox.host.placement")
-        self._lock = threading.Lock()
-        self._cached: "NodeGrants | None | object" = NO_GATE
-        #: MONOTONIC, not wall clock. `time.time()` is settable: a backward NTP step of
-        #: D seconds makes `now - self._at` negative — trivially "fresh" — so the cache
-        #: never expired, and because the expiry guard used the same clock `now >=
-        #: self._until` was false too. BOTH of the gate's bounds failed in the same
-        #: direction, open, and a revoked certificate kept authorising work for the
-        #: length of the step. This repo has a documented prior incident with exactly
-        #: this cause (retention.py: a 1h rollback deleting live job trees).
-        self._at = 0.0
-        #: The cached certificate's not_after, as a WALL-CLOCK timestamp — not_after is
-        #: an absolute instant. Deliberately NOT zeroed on a failed verification: doing
-        #: that made the expiry guard inert on the failure branch, so a stale `_at`
-        #: pinned the refusal for a whole TTL (which has no ceiling).
-        self._until = 0.0
-        #: ...and the SAME deadline on the monotonic clock, which is the one that
-        #: actually holds under a rollback. Switching only cache freshness to monotonic
-        #: was half a fix: after the TTL elapsed, `node_identity` re-verified against the
-        #: rolled-back WALL clock, decided the expired certificate was still valid, and
-        #: republished its grants — so the process kept authorising an expired identity
-        #: until wall time caught up, or forever if it never did. A deadline recorded in
-        #: elapsed time cannot be moved by setting the clock.
-        self._until_mono = 0.0
-        #: ``(not_after timestamp, monotonic instant it was first verified)``. The anchor
-        #: the deadline above is measured from.
-        self._anchor: "tuple[float, float] | None" = None
         self._node_id = ""
         self._warned: set = set()
 
-    # -- inputs ------------------------------------------------------------------
     def _warn_once(self, key: str, msg: str, *args: object) -> None:
         """Log a configuration warning the first time only, per (key, arguments).
 
@@ -322,6 +298,7 @@ class SelfGrants:
         self._warned.add(stamp)
         self._log.warning(msg, *args)
 
+    # -- inputs ------------------------------------------------------------------
     def cert_path(self) -> "Path | None":
         """Where this node's certificate should be, or None if no identity is configured.
 
@@ -333,42 +310,45 @@ class SelfGrants:
         failure is already a refusal, instead of collapsing into "no identity".
         """
         if self.CERT_ENV not in os.environ:
-            return self._legacy_cert_path()
+            self._warn_if_legacy_arming()
+            return None
         raw = os.environ[self.CERT_ENV].strip()
         return Path(raw) if raw else Path(f"<{self.CERT_ENV} is set but empty>")
 
-    def _legacy_cert_path(self) -> "Path | None":
-        """The pre-CERT_ENV arming route, honoured only when its certificate really exists.
+    def _warn_if_legacy_arming(self) -> None:
+        """Say so when a node LOOKS armed the old way. Never arm from it.
 
-        A FAIL-OPEN UPGRADE, INTRODUCED BY THE FIX FOR THE OPPOSITE BUG. The gate first
-        armed from ``BLASTBOX_NODE_ID`` by resolving ``<pki>/node-<id>.crt``. That was
-        removed because the name is ALREADY the sizer's physical-host slug, documented
-        for an unrelated NFS reason, so setting it for that reason armed a security
-        control the operator had never heard of. Correct — but it also means every node
-        that had genuinely armed the gate that way goes SILENTLY UNGATED on upgrade,
-        which is the one direction this module is never allowed to fail.
+        The gate once resolved ``<pki>/node-<BLASTBOX_NODE_ID>.crt``. Removing that was
+        right — the name is already the sizer's documented host slug — but it silently
+        un-gates any node that had armed that way, so a later version honoured the old
+        path when the file existed. That was worse: ``pki issue-node`` writes
+        ``node-<id>.crt`` into the pki dir by default and the exit host holds one for
+        EVERY node it ever issued, so a host setting the slug for the documented NFS
+        reason armed itself with a PEER'S IDENTITY — grants, credentials and all. And
+        deleting that file put it back to ungated, reintroducing the fail-open it was
+        added to close.
 
-        The two cases are distinguishable by a fact rather than a guess: whether the
-        derived certificate is actually there. A sizer-only node has no
-        ``node-<slug>.crt`` and stays ungated; a node that armed the old way has one and
-        keeps its gate. Deprecated, and it says so once, because silently changing what a
-        security control does across an upgrade is worse than either behaviour.
+        Neither behaviour is defensible, so this does neither. It warns, once, and the
+        operator arms the gate explicitly or not at all. The gate has never shipped
+        enabled, so there is no fleet silently relying on the old route.
         """
-        node_id = os.environ.get("BLASTBOX_NODE_ID", "").strip()
+        node_id = os.environ.get(self.LEGACY_ID_ENV, "").strip()
         if not node_id:
-            return None
+            return
         pki_dir = Path(os.environ.get(self.PKI_ENV, "/var/lib/blastbox/pki"))
-        candidate = pki_dir / f"node-{node_id}.crt"
-        if not candidate.exists():
-            return None          # the sizer's host slug; nothing to do with this gate
-        self._warn_once(
-            "legacy-arming",
-            "BLASTBOX_NODE_ID=%s resolves to %s, so this node's grants gate is armed the "
-            "OLD way. That route is deprecated because the variable is also the sizer's "
-            "host slug: set %s explicitly instead. Honouring it here so an upgrade does "
-            "not silently un-gate a node that was gated.", node_id, candidate,
-            self.CERT_ENV)
-        return candidate
+        try:
+            looks_legacy = (pki_dir / f"node-{node_id}.crt").exists()
+        except OSError:
+            looks_legacy = False
+        if looks_legacy:
+            self._warn_once(
+                "legacy-arming", 
+                "%s=%s and %s/node-%s.crt exists, which looks like the OLD way of arming "
+                "the grants gate. It does NOT arm it: that route was removed because %s "
+                "is also the sizer's host slug, and honouring it armed hosts with another "
+                "node's identity. This node is UNGATED. Set %s explicitly to arm it.",
+                self.LEGACY_ID_ENV, node_id, pki_dir, node_id, self.LEGACY_ID_ENV,
+                self.CERT_ENV)
 
     def gate_forced(self) -> str:
         """``"on"``, ``"off"`` or ``""`` (unset) from :data:`GATE_ENV`.
@@ -384,9 +364,6 @@ class SelfGrants:
         if raw.lower() in ("0", "false", "no", "off"):
             return "off"
         if raw.lower() not in ("1", "true", "yes", "on"):
-            # ONCE. `gate_forced()` runs on every `grants()`, i.e. once per job, so an
-            # unrecognised value printed an identical line per job forever — burying the
-            # very signal that would have told the operator about the typo.
             self._warn_once(
                 "gate-value",
                 "%s=%r is not a value I recognise. Treating it as ON, because a "
@@ -396,116 +373,33 @@ class SelfGrants:
 
     # -- the answer --------------------------------------------------------------
     def grants(self):
-        """This node's grants, :data:`NO_GATE`, or ``None``. Cached under a lock."""
+        """This node's grants, :data:`NO_GATE`, or ``None``. Verified fresh, every call."""
         forced = self.gate_forced()
         if forced == "off":
             return NO_GATE
         path = self.cert_path()
         if path is None:
             if forced == "on":
-                self._log.warning(
+                self._warn_once(
+                    "forced-no-cert",
                     "%s is on but no certificate is configured (%s). Refusing all work "
                     "rather than running ungoverned.", self.GATE_ENV, self.CERT_ENV)
                 return None
             return NO_GATE
-        # ONE REFRESH AT A TIME, AND THE TIMESTAMP IS PUBLISHED WITH THE VALUE. Setting
-        # the timestamp before the verification let a second dispatch worker see a fresh
-        # stamp and take the PREVIOUS value — so a just-revoked certificate kept
-        # authorising work for the length of one signature check, once per TTL.
-        with self._lock:
-            now = time.monotonic()
-            fresh = self._at and (now - self._at) < self._ttl
-            # EXPIRY OUTRANKS THE TTL. node_identity enforces not_after at PARSE time, so
-            # a certificate that lapsed mid-window kept authorising until the next
-            # refresh — and the TTL has a floor but no ceiling, so an operator "reducing
-            # PKI I/O" could make that window outlast the seven-day lifetime that IS the
-            # revocation mechanism.
-            if fresh and not self._expired(now):
-                return self._cached
-            try:
-                from blastbox.host.pki import load_trust_anchor, node_identity
-                pki_dir = Path(os.environ.get(self.PKI_ENV, "/var/lib/blastbox/pki"))
-                ident = node_identity(load_trust_anchor(pki_dir), path.read_bytes())
-                value: "NodeGrants | None" = ident.grants
-                self._node_id = ident.node_id
-                self._until = ident.not_after.timestamp()
-                # The same instant measured in ELAPSED time. `node_identity` has just
-                # confirmed the certificate is valid NOW, so however wrong the wall clock
-                # is, it has at most (not_after - now) of validity left from this moment.
-                # THE DEADLINE IS A CEILING ON THE CERTIFICATE'S REMAINING LIFE, NOT A
-                # RATCHET. The first version took min() of the old and new deadlines,
-                # which made ONE transient forward clock step permanent: an RTC six days
-                # fast at boot recorded a deadline six days short, and after NTP
-                # corrected it the node refused every job for the rest of the
-                # certificate's life — silently, because this branch has no log, and
-                # confusingly, because `pki show-node` on the same file still reported it
-                # valid. A control that fails closed forever on a clock glitch is not
-                # safer than one that re-reads; it is just broken in the quiet direction.
-                #
-                # So: recompute from the certificate each time, and BOUND it by the
-                # remaining life the signed payload allows. `node_identity` has just
-                # verified not_after against the wall clock, so a rolled-back clock
-                # cannot manufacture life the certificate does not have — the cap is
-                # (not_after - not_before), which no clock can inflate.
-                # ANCHOR THE DEADLINE TO WHEN THIS CERTIFICATE WAS FIRST SEEN, and give
-                # it exactly the lifetime the CA signed. Both previous attempts failed
-                # because they re-derived it from `now`:
-                #   * recomputing it freely let a rolled-back clock push it out forever;
-                #   * min()-ing it against the old value made ONE transient forward clock
-                #     step permanent, so an RTC six days fast at boot refused every job
-                #     for the rest of the certificate's life, silently.
-                # The lifetime (not_after - not_before) comes entirely from the signed
-                # payload, so no host clock can inflate it, and the anchor is elapsed
-                # time, which no host clock can move. A certificate therefore gets one
-                # lifetime of monotonic validity from first sight, however wrong the
-                # clock was at that moment or becomes afterwards.
-                #
-                # Keyed on not_after: the same certificate seen again keeps its anchor; a
-                # renewal (a later not_after) legitimately gets a new one.
-                lifetime = max(0.0, self._until - ident.not_before.timestamp())
-                self._until_mono = self._anchor_for(ident, now) + lifetime
-                if self._expired(time.monotonic()):
-                    value = None
-                    self._node_id = ""
-                    self._warn_once(
-                        "expired-deadline",
-                        "this node's certificate is past its monotonic validity deadline "
-                        "even though the wall clock disagrees; refusing work. If the host "
-                        "clock has just been corrected, restart the dispatcher.")
-            except Exception as exc:      # noqa: BLE001 - every failure is a refusal
-                self._log.warning(
-                    "this node's certificate (%s) does not verify: %s. Refusing work "
-                    "until it is renewed — `blastbox pki issue-node` for the same node "
-                    "id and wg key. This is revocation working, not a bug.", path, exc)
-                value = None
-                self._node_id = ""     # the old identity is not this node's any more
-            self._cached = value
-            self._at = time.monotonic()
-            return value
-
-    def _anchor_for(self, ident, now_mono: float) -> float:
-        """The monotonic instant this certificate was FIRST verified.
-
-        A certificate is identified by its ``not_after``: seeing the same one again keeps
-        the original anchor (so its validity cannot be renewed by re-reading the file),
-        while a genuine renewal carries a later ``not_after`` and starts a new one.
-        """
-        na = ident.not_after.timestamp()
-        if self._anchor is None or self._anchor[0] != na:
-            self._anchor = (na, now_mono)
-        return self._anchor[1]
-
-    def _expired(self, now_mono: float) -> bool:
-        """Has the cached certificate passed its not_after, by EITHER clock?
-
-        Both are consulted and either one is enough. The wall clock catches the ordinary
-        case and the monotonic deadline catches the rollback case, where the wall clock
-        is the thing lying. Requiring both to agree would mean a rolled-back clock could
-        veto the deadline that exists because of it.
-        """
-        if self._until and time.time() >= self._until:
-            return True
-        return bool(self._until_mono and now_mono >= self._until_mono)
+        try:
+            from blastbox.host.pki import load_trust_anchor, node_identity
+            pki_dir = Path(os.environ.get(self.PKI_ENV, "/var/lib/blastbox/pki"))
+            ident = node_identity(load_trust_anchor(pki_dir), path.read_bytes())
+        except Exception as exc:      # noqa: BLE001 - every failure is a refusal
+            self._warn_once(
+                "verify-failed",
+                "this node's certificate (%s) does not verify: %s. Refusing work until "
+                "it is renewed — `blastbox pki issue-node` for the same node id and wg "
+                "key. This is revocation working, not a bug.", path, exc)
+            self._node_id = ""
+            return None
+        self._node_id = ident.node_id
+        return ident.grants
 
     @property
     def node_id(self) -> str:
@@ -516,25 +410,11 @@ class SelfGrants:
     def egress_mode(self) -> str:
         """This node's persisted egress mode, or "" when the tier does not manage it.
 
-        A MANAGED NODE THAT CANNOT SAY IS TREATED AS LOCAL — for the credentials
-        question only, and conservatively.
-
-        THE ORIGINAL JUSTIFICATION HERE WAS FALSE and is recorded so it is not repeated:
-        it claimed "BLASTBOX_EGRESS_MODE was added only recently, so every egress.env
-        written before it has no MODE line". It is the FIRST line ``to_env_lines()``
-        emits and has been since the commit that introduced the file, so no such legacy
-        file exists. What the default actually covers is the other case: a truncated,
-        empty or unreadable egress.env, where ``load_persisted_env`` returns {}.
-
-        That case is real but it cuts both ways, and the cut is asymmetric. Guessing
-        "global" on a local node drops the credentials requirement from the nodes most
-        likely to hold a provider profile; guessing "local" on a global node demands a
-        grant it was correctly issued without, which idles it. Both are bad; only the
-        first is a containment failure, so the guess goes that way — and it is LOUD,
-        because ``persisted_config()`` treats the identical condition as a hard error
-        ("this node is marked managed and its egress configuration cannot be
-        determined") and an operator should hear about the file rather than about a
-        certificate.
+        A MANAGED NODE THAT CANNOT SAY IS TREATED AS LOCAL — for the credentials question
+        only, and conservatively. Guessing "global" on a local node drops the credentials
+        requirement from the nodes most likely to hold a provider profile; guessing
+        "local" on a global node demands a grant it was correctly issued without, which
+        idles it. Only the first is a containment failure, so the guess goes that way.
         """
         from blastbox.host.egress_apply import ENV_FILE, load_persisted_env
         try:
@@ -548,11 +428,11 @@ class SelfGrants:
         except Exception:           # noqa: BLE001
             mode = ""
         if not mode:
-            self._log.warning(
+            self._warn_once(
+                "egress-mode",
                 "%s exists but declares no BLASTBOX_EGRESS_MODE (truncated, unreadable "
                 "or hand-edited). Assuming local mode for the credentials check, which "
-                "is the conservative guess — but fix the file: `blastbox egress check` "
-                "treats this same state as a hard error.", ENV_FILE)
+                "is the conservative guess — but fix the file.", ENV_FILE)
             return "local"
         return mode
 

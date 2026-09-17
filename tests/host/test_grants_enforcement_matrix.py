@@ -515,105 +515,9 @@ def test_the_forced_off_gate_is_reported_as_forced_off(tmp_path, monkeypatch, ca
     assert out["cert_path"] is not None
 
 
-def test_a_rolled_back_wall_clock_cannot_resurrect_an_expired_certificate(tmp_path, monkeypatch):
-    """FOUND BY UPSTREAM REVIEW, on the fix for the previous round's clock finding.
-    Switching cache FRESHNESS to monotonic was half a fix: once the monotonic TTL
-    elapsed, `node_identity()` re-verified against the same rolled-back WALL clock,
-    decided the expired certificate was fine, and republished its grants. The process
-    kept authorising an expired identity until wall time caught up — or forever.
-
-    A deadline recorded in ELAPSED time cannot be moved by setting the clock."""
-    import datetime
-    import time as _time
-
-    from blastbox.host import pki
-    from blastbox.host import placement as pl
-
-    _arm(tmp_path, monkeypatch, engines=(_ENGINE_NAME,))
-    g = pl.SelfGrants()
-    assert g.grants() is not None, "precondition: it verifies while valid"
-    assert g._until_mono > 0, "a monotonic deadline must be recorded on success"
-
-    # The certificate expires...
-    # Capture the REAL clocks first; patching a lambda that calls the patched name is
-    # how the first version of this test recursed into itself.
-    real_time, real_mono, real_now = _time.time, _time.monotonic, pki._now
-
-    # THE ROLLBACK IS WHAT FOOLS node_identity, and that is the whole point. An earlier
-    # version of this test moved `pki._now` FORWARD, so node_identity refused on its own
-    # and the test passed with the monotonic deadline deleted — green for a reason that
-    # had nothing to do with what it claims to test.
-    #
-    # Here the certificate has genuinely expired in real time, and the wall clock is 60
-    # days behind, so `node_identity` re-verifies it as perfectly valid and `_until` (a
-    # wall-clock instant) is comfortably in the "future". Nothing on the wall clock can
-    # tell. Only elapsed time can.
-    back = datetime.timedelta(days=60)
-    monkeypatch.setattr(pki, "_now", lambda: real_now() - back)
-    monkeypatch.setattr(pl.time, "time", lambda: real_time() - back.total_seconds())
-    # EIGHT DAYS OF ELAPSED TIME, because that is what "the certificate expired" means
-    # physically: the 7-day cert is past its life, and the monotonic clock is the only
-    # one that noticed. Advancing it by less than the certificate's lifetime would leave
-    # the deadline in the future and test nothing.
-    monkeypatch.setattr(pl.time, "monotonic", lambda: real_mono() + 8 * 86400.0)
-
-    assert g.grants() is None, (
-        "an expired certificate was republished after a wall-clock rollback; the "
-        "monotonic deadline is not being honoured"
-    )
-
-
-def test_a_genuinely_renewed_certificate_does_extend_the_deadline(tmp_path, monkeypatch):
-    """The other direction of the rule above, and it matters: if a deadline could only
-    ever shrink, renewal would never take effect and the node would refuse forever. A
-    LATER not_after — which comes from the signed payload, not from the host clock — is
-    the only thing that may move it out."""
-    from blastbox.host import pki
-    from blastbox.host import placement as pl
-
-    crt = _arm(tmp_path, monkeypatch, engines=(_ENGINE_NAME,))
-    g = pl.SelfGrants()
-    assert g.grants() is not None
-    first_deadline = g._until_mono
-
-    # Re-issue the SAME identity with a longer life: a real renewal.
-    ca = pki.ensure_ca(tmp_path / "pki")
-    crt.write_bytes(ca.issue_node("toolz3", wg_pubkey=WG, days=30,
-                                  grants=pki.NodeGrants(engines=(_ENGINE_NAME,))).cert_pem)
-    g._at = 0.0          # force a re-read, as the TTL would
-    assert g.grants() is not None
-    assert g._until_mono > first_deadline, (
-        "a renewed certificate did not extend the deadline; the node would refuse until "
-        "the process restarted"
-    )
 
 
 # ------------------------------------------ the upgrade path must not silently un-gate
-
-def test_a_node_armed_the_OLD_way_stays_gated_across_the_upgrade(tmp_path, monkeypatch):
-    """FOUND IN AN UNREAD REVIEWER OUTPUT from the previous round — findings already paid
-    for and never triaged.
-
-    The gate first armed from BLASTBOX_NODE_ID by resolving <pki>/node-<id>.crt. That was
-    removed because the name is already the sizer's host slug, so setting it for THAT
-    reason armed a control the operator had never heard of. Correct — and it also meant
-    every node genuinely armed the old way went SILENTLY UNGATED on upgrade, which is the
-    one direction this module may never fail."""
-    from blastbox.host import pki
-    from blastbox.host.placement import NO_GATE, SelfGrants
-
-    pki_dir = tmp_path / "pki"
-    ca = pki.ensure_ca(pki_dir)
-    ca.issue_node("toolz3", wg_pubkey=WG,
-                  grants=pki.NodeGrants(engines=(_ENGINE_NAME,))).write(pki_dir, "node-toolz3")
-    monkeypatch.delenv("BLASTBOX_NODE_CERT", raising=False)
-    monkeypatch.delenv("BLASTBOX_NODE_GRANTS_GATE", raising=False)
-    monkeypatch.setenv("BLASTBOX_PKI_DIR", str(pki_dir))
-    monkeypatch.setenv("BLASTBOX_NODE_ID", "toolz3")
-
-    g = SelfGrants().grants()
-    assert g is not NO_GATE, "an upgrade silently un-gated a node that was gated"
-    assert g is not None and g.allows_engine(_ENGINE_NAME)
 
 
 def test_the_sizer_host_slug_still_does_not_arm_anything(tmp_path, monkeypatch):
@@ -651,3 +555,113 @@ def test_configuration_warnings_do_not_repeat_per_job(monkeypatch, caplog):
     assert caplog.text.count("not a value I recognise") == 1, (
         f"warned {caplog.text.count('not a value I recognise')} times in 25 calls"
     )
+
+
+# --------------------------------------------------------------- no cache, no clock
+
+def test_the_gate_holds_no_cached_state_between_calls():
+    """THE STRUCTURAL CLAIM, asserted structurally. Across five attempts the TTL cache
+    produced substantially every defect this class has had — a timestamp published
+    before the value, freshness on a settable clock, expiry enforced only at parse time,
+    a deadline a rolled-back clock could push out forever, and a ratchet fixing that
+    which bricked nodes on a forward step. Five bugs, one cause, each fix introducing
+    the next.
+
+    It is not enough that they are fixed; they must be UNREPRESENTABLE. No cached
+    verdict, no timestamps, no lock — nothing whose correctness depends on a clock this
+    process cannot trust or on two threads agreeing about it."""
+    from blastbox.host.placement import SelfGrants
+
+    g = SelfGrants()
+    banned = {"_at", "_ttl", "_ttl_s", "_until", "_until_mono", "_anchor", "_cached",
+              "_lock", "_expired", "_anchor_for"}
+    present = banned & set(vars(g)) | banned & set(vars(type(g)))
+    assert not present, f"cached/clock state is back: {sorted(present)}"
+
+
+def test_an_expired_certificate_refuses_immediately(tmp_path, monkeypatch):
+    """No window to wait out. `node_identity` is the only expiry authority and it is
+    consulted fresh on every call."""
+    import datetime
+
+    from blastbox.host import pki
+    from blastbox.host.placement import NO_GATE, SelfGrants
+
+    _arm(tmp_path, monkeypatch, engines=(_ENGINE_NAME,))
+    g = SelfGrants()
+    assert g.grants() is not None
+
+    real_now = pki._now
+    monkeypatch.setattr(pki, "_now",
+                        lambda: real_now() + datetime.timedelta(days=30))
+    v = g.grants()
+    assert v is None and v is not NO_GATE, "an expired certificate still authorised work"
+
+
+def test_a_renewal_takes_effect_on_the_very_next_job(tmp_path, monkeypatch):
+    """The other side of having no cache, and a real improvement: renewal used to wait
+    out a TTL with no way to force a re-read short of a restart."""
+    from blastbox.host import pki
+    from blastbox.host.placement import SelfGrants
+
+    crt = _arm(tmp_path, monkeypatch, engines=("only-this",))
+    g = SelfGrants()
+    assert not g.grants().allows_engine(_ENGINE_NAME)
+
+    ca = pki.ensure_ca(tmp_path / "pki")
+    crt.write_bytes(ca.issue_node("toolz3", wg_pubkey=WG,
+                                  grants=pki.NodeGrants(engines=(_ENGINE_NAME,))).cert_pem)
+    assert g.grants().allows_engine(_ENGINE_NAME), "a renewal did not take effect at once"
+
+
+def test_no_clock_manipulation_changes_the_verdict(tmp_path, monkeypatch):
+    """Both directions, because the cache failed open on a rollback and closed on a
+    forward step. With nothing retained between calls, neither can bite."""
+    import time as _time
+
+    from blastbox.host import placement as pl
+
+    _arm(tmp_path, monkeypatch, engines=(_ENGINE_NAME,))
+    g = pl.SelfGrants()
+    baseline = g.grants()
+    assert baseline is not None
+
+    real = _time.time
+    for offset in (-60 * 86400, +60 * 86400):
+        monkeypatch.setattr(_time, "time", lambda o=offset: real() + o)
+        v = g.grants()
+        assert v is not None and v.engines == baseline.engines, (
+            f"a wall-clock shift of {offset / 86400:.0f} days changed the verdict"
+        )
+
+
+# --------------------------------------------------- the legacy route warns, never arms
+
+def test_the_old_arming_route_warns_and_does_NOT_arm(tmp_path, monkeypatch, caplog):
+    """Both previous behaviours were wrong. Ignoring BLASTBOX_NODE_ID silently un-gated
+    a node armed the old way; honouring it armed hosts with a PEER'S identity, because
+    `pki issue-node` writes node-<id>.crt into the pki dir by default and the exit host
+    holds one for every node it ever issued — and deleting that file put it back to
+    ungated, reintroducing the fail-open it was added to close.
+
+    So it does neither: it warns, once, and the operator arms explicitly or not at all."""
+    import logging
+
+    from blastbox.host import pki
+    from blastbox.host.placement import NO_GATE, SelfGrants
+
+    pki_dir = tmp_path / "pki"
+    ca = pki.ensure_ca(pki_dir)
+    ca.issue_node("host-a", wg_pubkey=WG,
+                  grants=pki.NodeGrants(engines=("clamav",), credentials=True)
+                  ).write(pki_dir, "node-host-a")
+    monkeypatch.delenv("BLASTBOX_NODE_CERT", raising=False)
+    monkeypatch.delenv("BLASTBOX_NODE_GRANTS_GATE", raising=False)
+    monkeypatch.setenv("BLASTBOX_PKI_DIR", str(pki_dir))
+    monkeypatch.setenv("BLASTBOX_NODE_ID", "host-a")
+
+    g = SelfGrants()
+    with caplog.at_level(logging.WARNING):
+        assert g.grants() is NO_GATE, "the sizer's host slug armed the gate"
+    assert "does NOT arm" in caplog.text and "host-a" in caplog.text
+    assert g.node_id == "", "it must not adopt another node's identity"

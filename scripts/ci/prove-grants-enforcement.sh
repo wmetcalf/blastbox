@@ -41,13 +41,13 @@ MUTATIONS=(
   # --- from the upstream review of the fixes themselves ---
   "the subnet default tracking the network|src/blastbox/host/runtime/libvirt_vm.py|s=s.replace('    subnet_prefix: str = \"192.168.221.\"','    subnet_prefix: str = \"192.168.122.\"',1)"
   "the direct-egress contradiction|src/blastbox/host/runtime/libvirt_vm.py|s=s.replace('            if driver == \"direct\" and not self._network_forwards():','            if False:',1)"
-  "the monotonic expiry deadline|src/blastbox/host/placement.py|s=s.replace('        return bool(self._until_mono and now_mono >= self._until_mono)','        return False',1)"
+  "the per-call verification (cache it again)|src/blastbox/host/placement.py|s=s.replace('        self._node_id = ident.node_id\n        return ident.grants','        self._node_id = ident.node_id\n        self.__dict__.setdefault(\"_mutant\", ident.grants)\n        return self.__dict__[\"_mutant\"]',1)"
   "releasing an engine this node lacks|src/blastbox/host/dispatch.py|s=s.replace('        if job.engine not in self._engines and self._grants_gate.grants() is not _NO_GATE:','        if False:',1)"
   "the single NO_GATE sentinel|src/blastbox/host/dispatch.py|s=s.replace('from blastbox.host.placement import NO_GATE as _NO_GATE','_NO_GATE = object()   # MUTANT: a second, non-identical sentinel',1)"
   # The only code that can turn an UNGATED node into a GATED one from the environment
   # alone — and the route that was deleted once already for arming a control nobody
   # asked for. Widening it is the regression that matters.
-  "the legacy-arming existence guard|src/blastbox/host/placement.py|s=s.replace('        if not candidate.exists():\n            return None','        if False:\n            return None',1)"
+  "the legacy route staying UNARMED|src/blastbox/host/placement.py|s=s.replace('            self._warn_if_legacy_arming()\n            return None','            return Path(os.environ.get(self.PKI_ENV, \"/var/lib/blastbox/pki\")) / (\"node-\" + os.environ.get(self.LEGACY_ID_ENV, \"x\") + \".crt\")',1)"
 )
 
 # BASELINE FIRST. The script's only criterion is "pytest fails with the mutation
