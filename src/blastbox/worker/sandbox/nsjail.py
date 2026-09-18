@@ -34,10 +34,12 @@ host with no ``blastbox-sandbox`` profile loaded is skipped by ``select_sandbox`
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import shutil
 import signal
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
 
 from blastbox.errors import SandboxError, SandboxUnavailable
@@ -212,6 +214,26 @@ class NsjailSandbox:
                 "insecurity_reasons": self.insecurity_reasons,
             },
         )
+
+    @contextlib.contextmanager
+    def apparmor_suspended(self) -> Iterator[None]:
+        """Build argv WITHOUT the AppArmor prefix, for DIAGNOSIS ONLY.
+
+        A child profile narrow enough for one parser may deny ``/usr/bin/true``, which is
+        what `select_sandbox` runs as its smoketest -- so a perfectly good backend carrying a
+        perfectly good profile can fail the probe and be rejected, and the operator is told
+        only "smoketest failed" (codex, #177). Re-running the probe with the profile
+        suspended distinguishes "this backend does not work" from "your profile does not
+        permit the probe binary", which are different one-line fixes.
+
+        It does NOT run a workload unconfined: the caller uses it for the probe only, and the
+        rejection stands either way.
+        """
+        saved, self._aa_exec = self._aa_exec, None
+        try:
+            yield
+        finally:
+            self._aa_exec = saved
 
     def _apparmor_enforcing_now(self) -> bool:
         """Whether the profile is enforcing AT THIS MOMENT.

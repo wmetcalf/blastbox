@@ -163,6 +163,19 @@ nsjail, the profile you carefully loaded was never applied, silently, and nothin
 backends now attach it and both report when they cannot. Still check the result rather than trusting
 the recipe: the selected sandbox's `apparmor_active` is the attach outcome, not a capability probe.
 
+**Your profile must also permit `/usr/bin/true`.** `select_sandbox` smoketests each backend by
+running it, through the full argv — profile included, because a probe that skips the confinement is
+not testing what will actually run. A profile narrow enough to deny the probe's loader and libraries
+fails the smoketest, and the backend is rejected. That is now diagnosed rather than blamed on the
+backend: the rejection re-runs the probe with the profile suspended and, if that passes, says so —
+
+```
+nsjail smoketest fails with AppArmor profile 'my-parser-profile' but passes without it:
+the profile denies the probe /usr/bin/true. Permit it in the profile ... or unload the profile
+```
+
+— but the fix is yours: `/usr/bin/true ix,` plus whatever your base abstraction needs.
+
 **One rule your profile needs.** nsjail is launched with `--proc_rw` when a profile is attached (it
 has to be: aa-exec transitions by writing `/proc/self/attr/exec`, and nsjail's default read-only
 `/proc` makes that write fail with `EROFS`, killing the exec). A writable `/proc/self/attr` is the

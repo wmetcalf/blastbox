@@ -631,10 +631,14 @@ def test_the_apparmor_transition_really_reaches_the_kernel_through_this_argv() -
     sb = NsjailSandbox(nsjail_path=nsjail)
     base = [a for a in sb._build_argv(SandboxRequest(argv=[python, "-c", probe]))
             if a != "--really_quiet"]
-    assert "--proc_rw" not in base, (
-        "this host has an enforcing profile, so the default build is already rw; "
-        "the two-way comparison below needs the read-only default"
-    )
+    if "--proc_rw" in base:
+        # A host configured exactly as deploy/apparmor/README.md prescribes: the profile is
+        # enforcing, so the product ALREADY passes --proc_rw and there is no read-only build
+        # left to compare against. That is the good outcome, not a failure -- asserting here
+        # would fail the suite precisely on a correctly configured sandbox host (codex, #177).
+        # The other direction is still worth checking before leaving.
+        assert "aa-exec" in " ".join(base)
+        pytest.skip("profile is enforcing here, so the default build is already --proc_rw")
 
     ro = subprocess.run(base, capture_output=True, text=True, timeout=120)
     rw = subprocess.run(base[:1] + ["--proc_rw"] + base[1:],

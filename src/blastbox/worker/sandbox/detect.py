@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 from pathlib import Path
 from blastbox.errors import SandboxUnavailable
 from blastbox.worker.sandbox.base import Sandbox, SandboxRequest
@@ -94,19 +95,55 @@ def _make_backend(
     raise SandboxUnavailable(f"unknown backend: {name!r}")
 
 
-def _smoketest(sb: Sandbox) -> tuple[bool, Exception | None]:
-    """Run ``/usr/bin/true``; return ``(True, None)`` on success."""
-    # Prefer /usr/bin/true which works on merged-usr systems.
-    true_path = "/usr/bin/true" if Path("/usr/bin/true").exists() else "/bin/true"
+def _probe(sb: Sandbox, argv: list[str]) -> Exception | None:
+    """Run ``argv`` through ``sb``; None on success, else why not."""
     try:
-        result = sb.run(SandboxRequest(argv=[true_path]))
+        result = sb.run(SandboxRequest(argv=argv))
     except Exception as exc:  # noqa: BLE001
-        return False, exc
+        return exc
     if result.exit_code != 0 or result.killed:
-        return False, SandboxUnavailable(
+        return SandboxUnavailable(
             f"{sb.name} smoketest exit={result.exit_code} killed={result.killed}"
         )
-    return True, None
+    return None
+
+
+def _smoketest(sb: Sandbox) -> tuple[bool, Exception | None]:
+    """Run ``/usr/bin/true`` through the backend's REAL argv; ``(True, None)`` on success.
+
+    The probe deliberately carries everything a job carries, AppArmor prefix included -- a
+    probe that skips the confinement is not testing what will run. The cost is that a child
+    profile narrow enough for one parser can deny the probe binary, and then a working
+    backend with a working profile is rejected with nothing but "smoketest failed" to go on
+    (codex, #177). So on failure, when a profile was attached, probe once more with it
+    suspended: if THAT succeeds, the profile is the cause and the message says so. The
+    rejection stands either way -- a profile that cannot run ``/usr/bin/true`` is a profile
+    to fix, not one to quietly bypass -- but "fix your profile" and "this backend does not
+    work here" are different afternoons.
+    """
+    # Prefer /usr/bin/true which works on merged-usr systems.
+    true_path = "/usr/bin/true" if Path("/usr/bin/true").exists() else "/bin/true"
+    err = _probe(sb, [true_path])
+    if err is None:
+        return True, None
+
+    suspend = getattr(sb, "apparmor_suspended", None)
+    if suspend is not None and getattr(sb, "apparmor_active", False):
+        with suspend():
+            unconfined_err = _probe(sb, [true_path])
+        if unconfined_err is None:
+            profile = getattr(sb, "_apparmor_profile", "the child profile")
+            _log.warning(
+                "sandbox smoketest fails only WITH the AppArmor profile",
+                extra={"backend": sb.name, "profile": profile, "probe": true_path},
+            )
+            return False, SandboxUnavailable(
+                f"{sb.name} smoketest fails with AppArmor profile {profile!r} but passes "
+                f"without it: the profile denies the probe {true_path}. Permit it in the "
+                f"profile (it is also what a worker's own preflight runs), or unload the "
+                f"profile and accept apparmor_missing"
+            )
+    return False, err
 
 
 def _security_state(sb: Sandbox) -> tuple[bool, list[str]]:
@@ -206,11 +243,20 @@ def select_sandbox(
     if any("apparmor_missing" in r for r in rejections):
         # The likeliest cause of a fleet-wide "nothing is available" after #160: nsjail no
         # longer calls itself secure without a MAC profile, which it never actually applied
-        # before either. Name the two ways out rather than making the operator find them.
+        # before either. Name the way out rather than making the operator find it -- and name
+        # the RIGHT one: `apparmor_missing` has two independent causes, and telling an
+        # operator with no `aa-exec` to load a profile sends them to fix the half that is
+        # already fine (codex, #177). The helper is checked here rather than remembered from
+        # a backend, because every backend that could have told us was already rejected.
+        remedy = (
+            "installing the aa-exec helper (the apparmor / apparmor-utils package)"
+            if shutil.which("aa-exec") is None
+            else "loading the child profile named by BLASTBOX_APPARMOR_PROFILE "
+                 "(default blastbox-sandbox) in enforce or kill mode"
+        )
         hint = (
-            "; apparmor_missing is satisfied by loading the child profile "
-            "(deploy/apparmor/README.md) or accepted knowingly with "
-            "BLASTBOX_WARN_ON_INSECURE=1"
+            f"; apparmor_missing is satisfied by {remedy} — see deploy/apparmor/README.md — "
+            "or accepted knowingly with BLASTBOX_WARN_ON_INSECURE=1"
         )
     raise SandboxUnavailable(
         "no sandbox backend available: "

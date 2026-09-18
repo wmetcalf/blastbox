@@ -5,7 +5,9 @@ and use monkeypatching to control which backends are available.
 """
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -358,3 +360,132 @@ class TestTheNothingAvailableMessageIsDiagnosable:
         with pytest.raises(SandboxUnavailable) as ei:
             select_sandbox(_status_path=_good_status_file(tmp_path))
         assert "deploy/apparmor" not in str(ei.value)
+
+
+# ---------------------------------------------------------------------------
+# Test: a child profile that denies the probe is diagnosed, not just "failed"
+# ---------------------------------------------------------------------------
+
+class TestAProfileThatDeniesTheProbeSaysSo:
+    """The smoketest runs the REAL argv, AppArmor prefix included -- as it should, since a
+    probe that skips the confinement tests something we never run.
+
+    The cost: a child profile narrow enough for one parser can deny `/usr/bin/true`, and then
+    a working backend carrying a working profile is rejected with nothing but "smoketest
+    failed" to go on (codex, #177). The rejection stands -- a profile that cannot run the
+    probe is a profile to fix, not one to bypass -- but it now says which of the two it is.
+    """
+
+    class _FakeSandbox:
+        """Fails the probe while confined, passes with the profile suspended."""
+
+        name = "nsjail"
+        secure = True
+        insecurity_reasons: list[str] = []
+        apparmor_active = True
+        _apparmor_profile = "my-parser-profile"
+
+        def __init__(self) -> None:
+            self.confined = True
+            self.runs: list[bool] = []
+
+        @contextlib.contextmanager
+        def apparmor_suspended(self):
+            self.confined = False
+            try:
+                yield
+            finally:
+                self.confined = True
+
+        def run(self, req):
+            self.runs.append(self.confined)
+            code = 126 if self.confined else 0
+            return SimpleNamespace(exit_code=code, killed=False, stdout=b"", stderr=b"")
+
+    def _select(self, monkeypatch, tmp_path: Path):
+        import blastbox.worker.sandbox.detect as detect_mod
+
+        monkeypatch.delenv("BLASTBOX_WARN_ON_INSECURE", raising=False)
+        monkeypatch.delenv("BLASTBOX_SANDBOX", raising=False)
+        monkeypatch.setattr(detect_mod, "_in_container", lambda: False)
+        sb = self._FakeSandbox()
+        monkeypatch.setattr(detect_mod, "_make_backend", lambda name, **kw: sb)
+        with pytest.raises(SandboxUnavailable) as ei:
+            select_sandbox(_status_path=_good_status_file(tmp_path))
+        return sb, str(ei.value)
+
+    def test_the_message_names_the_profile_and_the_probe(self, monkeypatch, tmp_path: Path) -> None:
+        _sb, msg = self._select(monkeypatch, tmp_path)
+        assert "my-parser-profile" in msg
+        assert "true" in msg
+        assert "passes without it" in msg
+
+    def test_the_backend_is_still_rejected(self, monkeypatch, tmp_path: Path) -> None:
+        """Diagnosis is not permission. A probe that only passes unconfined has not shown
+        that the workload can run, and running it anyway would be the 'configuration is
+        present' answer to a question about whether it is in force."""
+        _sb, msg = self._select(monkeypatch, tmp_path)
+        assert "no sandbox backend available" in msg
+
+    def test_the_second_probe_really_ran_unconfined(self, monkeypatch, tmp_path: Path) -> None:
+        sb, _msg = self._select(monkeypatch, tmp_path)
+        assert sb.runs[:2] == [True, False], sb.runs
+        assert sb.confined is True, "the suspension leaked past the probe"
+
+    def test_a_backend_with_no_profile_is_not_probed_twice(
+            self, monkeypatch, tmp_path: Path) -> None:
+        """No profile attached ⇒ nothing to suspend, and re-running a failing probe would
+        only double the outage's cost."""
+        import blastbox.worker.sandbox.detect as detect_mod
+
+        sb = self._FakeSandbox()
+        sb.apparmor_active = False
+        monkeypatch.delenv("BLASTBOX_WARN_ON_INSECURE", raising=False)
+        monkeypatch.delenv("BLASTBOX_SANDBOX", raising=False)
+        monkeypatch.setattr(detect_mod, "_in_container", lambda: False)
+        monkeypatch.setattr(detect_mod, "_make_backend", lambda name, **kw: sb)
+        with pytest.raises(SandboxUnavailable):
+            select_sandbox(_status_path=_good_status_file(tmp_path))
+        assert sb.runs == [True] * len(sb.runs)
+
+
+class TestTheRecoveryHintNamesTheHalfThatIsActuallyMissing:
+    """`apparmor_missing` has two independent causes -- no `aa-exec` helper, or no enforcing
+    profile -- and telling an operator with no helper to go load a profile sends them to fix
+    the half that is already fine (codex, #177)."""
+
+    def _msg(self, monkeypatch, tmp_path: Path, *, aa_exec: str | None) -> str:
+        import blastbox.worker.sandbox.detect as detect_mod
+
+        monkeypatch.delenv("BLASTBOX_WARN_ON_INSECURE", raising=False)
+        monkeypatch.delenv("BLASTBOX_SANDBOX", raising=False)
+        monkeypatch.setattr(detect_mod, "_in_container", lambda: False)
+        monkeypatch.setattr(detect_mod.shutil, "which", lambda _n: aa_exec)
+
+        class _Insecure:
+            secure = False
+            insecurity_reasons = ["apparmor_missing"]
+
+        monkeypatch.setattr(detect_mod, "_make_backend", lambda name, **kw: _Insecure())
+        monkeypatch.setattr(detect_mod, "_smoketest", lambda sb: (True, None))
+        with pytest.raises(SandboxUnavailable) as ei:
+            select_sandbox(_status_path=_good_status_file(tmp_path))
+        return str(ei.value)
+
+    def test_no_helper_points_at_the_package(self, monkeypatch, tmp_path: Path) -> None:
+        msg = self._msg(monkeypatch, tmp_path, aa_exec=None)
+        assert "aa-exec" in msg
+        assert "BLASTBOX_APPARMOR_PROFILE" not in msg, (
+            "sent the operator to load a profile when the helper is what is missing"
+        )
+
+    def test_a_present_helper_points_at_the_profile(self, monkeypatch, tmp_path: Path) -> None:
+        msg = self._msg(monkeypatch, tmp_path, aa_exec="/usr/bin/aa-exec")
+        assert "BLASTBOX_APPARMOR_PROFILE" in msg
+        assert "enforce or kill" in msg
+
+    def test_both_ways_out_are_always_offered(self, monkeypatch, tmp_path: Path) -> None:
+        for aa in (None, "/usr/bin/aa-exec"):
+            msg = self._msg(monkeypatch, tmp_path, aa_exec=aa)
+            assert "deploy/apparmor" in msg
+            assert "BLASTBOX_WARN_ON_INSECURE" in msg
