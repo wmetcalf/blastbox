@@ -108,6 +108,17 @@ jobs:
         # This runner does. So run the real constructor, the real argv builder and a real
         # detonation, and require the child to come back reporting the profile -- the one
         # assertion in this repo that the whole #160 mechanism works end to end.
+        env:
+          # The step above verified the profile's NAME AND MODE with `sudo grep`. This step
+          # runs as the unprivileged runner user, on purpose -- a worker is not root -- and
+          # /sys/kernel/security/apparmor/profiles is root-only, so `profile_loaded()` cannot
+          # read it and answers False. That is exactly the case BLASTBOX_APPARMOR_PROFILES
+          # exists for (docs/CONFIGURATION.md), and it is an assertion, not proof.
+          #
+          # The proof is below and needs no trust: /proc/self/attr/current, read from INSIDE
+          # the jail, is the kernel naming the profile AND its mode. If the assertion were a
+          # lie, the child would report something else and this step fails.
+          BLASTBOX_APPARMOR_PROFILES: blastbox-sandbox
         run: |
           set -o pipefail
           .venv/bin/python - <<'PY'
@@ -132,6 +143,10 @@ jobs:
                   failures.append(f"{sb.name}: rc={res.exit_code} {res.stderr[-300:]!r}")
               elif not got.startswith("blastbox-sandbox"):
                   failures.append(f"{sb.name}: child reports {got!r}, not the attached profile")
+              elif "(enforce)" not in got and "(kill)" not in got:
+                  # The kernel's own word on the MODE, from inside the jail. complain-mode
+                  # confinement logs and allows, and is not confinement.
+                  failures.append(f"{sb.name}: child profile is not enforcing: {got!r}")
           if failures:
               print("::error::" + " | ".join(failures))
               sys.exit(1)
