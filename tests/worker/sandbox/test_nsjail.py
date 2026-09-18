@@ -1549,11 +1549,38 @@ class TestAProbeThatCannotRunFailsClosed:
         assert sb.apparmor_active is True
         assert sb._consecutive_transients == 0, "the failure count survived a success"
 
-    def test_the_probe_timeout_is_bounded(self) -> None:
-        """A probe is `aa-exec -p <profile> -- /usr/bin/true` in a jail. The old 60s meant a
-        broken probe cost a minute per launch on a path that runs before every job."""
+    def test_the_blocking_time_of_a_broken_probe_is_bounded(self, tmp_path, monkeypatch) -> None:
+        """The COST, not the launch count.
+
+        The other tests here inject a TimeoutExpired that returns in microseconds and then assert
+        that the number of launches does not grow. On the host being modelled each launch waits
+        out `_PROBE_TIMEOUT_S`, so the quantity that actually hurts -- seconds of blocking before
+        a refused job -- was asserted nowhere and would not change if the timeout went back to 60
+        (lens, round 6 of #177). This test charges the clock for each launch.
+        """
+        import subprocess
+
         import blastbox.worker.sandbox.apparmor as aa
 
+        spent = {"s": 0.0}
+
+        def _slow(argv, n):
+            spent["s"] += aa._PROBE_TIMEOUT_S        # a launch that waits out its timeout
+            raise subprocess.TimeoutExpired(argv, aa._PROBE_TIMEOUT_S)
+
+        sb, _ = self._sb(tmp_path, monkeypatch, _slow)
+        clock = {"t": aa.time.monotonic()}
+        monkeypatch.setattr(aa.time, "monotonic", lambda: clock["t"])
+
+        # Worst case a real worker meets: every read is a fresh window until the state settles.
+        for _ in range(aa._TRANSIENT_SETTLED_AFTER + 2):
+            sb.apparmor_active
+            clock["t"] += aa._TRANSIENT_TTL_S + 0.1
+
+        assert spent["s"] <= 150.0, (
+            f"a broken probe blocks for {spent['s']:.0f}s before the state settles -- that is a "
+            f"worker that looks hung, not one that reports"
+        )
         assert aa._PROBE_TIMEOUT_S <= 30.0, aa._PROBE_TIMEOUT_S
 
     def test_the_short_ttl_is_much_shorter_than_a_verdict(self) -> None:
@@ -1608,4 +1635,127 @@ def test_two_different_unprovable_causes_both_get_said(tmp_path, monkeypatch, ca
     assert "assertion_unprovable" in first
     assert "proof_unmeasurable" in second, (
         "the second cause was silenced by the first cause's warn-once slot"
+    )
+
+
+class TestAFailedProbeDoesNotDiscardAProvenVerdict:
+    """A transient probe failure is news about the PROBE, not about the profile.
+
+    Failing closed on it discarded an `(enforce)` reading taken seconds earlier and refused the
+    job -- on a backend the selector had admitted as confined, because a fork failed. The refusal
+    was then cached, so a host that had already recovered stayed refused for the window with no
+    measurement at all: the round-4 defect, wearing a new hat (lens, round 6 of #177).
+    """
+
+    def _armed(self, tmp_path, monkeypatch):
+        import blastbox.worker.sandbox.apparmor as aa
+        import blastbox.worker.sandbox.nsjail as mod
+
+        monkeypatch.setenv("BLASTBOX_APPARMOR_PROFILES", "blastbox-sandbox")
+        monkeypatch.setattr(aa, "_PROFILES", "/nonexistent")
+        monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
+        monkeypatch.setattr(mod, "_supports_proc_rw", lambda _p: True)
+        state = {"broken": False, "launches": 0}
+
+        def _run(argv, **kw):
+            from types import SimpleNamespace
+            state["launches"] += 1
+            if state["broken"]:
+                import subprocess
+                raise subprocess.TimeoutExpired(argv, 1)
+            ok = "blastbox-sandbox (enforce)\n" if "attr/current" in " ".join(argv) else ""
+            return SimpleNamespace(returncode=0, stdout=ok, stderr="")
+
+        monkeypatch.setattr(aa.subprocess, "run", _run)
+        nsjail = tmp_path / "nsjail"
+        nsjail.write_text(_FAKE_NSJAIL)
+        nsjail.chmod(0o755)
+        sb = mod.NsjailSandbox(nsjail_path=str(nsjail))
+        assert sb.apparmor_active is True            # a REAL measurement, cached
+        sb.note_admitted(armed=True)
+        return sb, state, aa
+
+    def test_a_fork_failure_does_not_refuse_a_job(self, tmp_path, monkeypatch) -> None:
+        from blastbox.errors import SandboxUnavailable
+
+        sb, state, aa = self._armed(tmp_path, monkeypatch)
+        clock = {"t": aa.time.monotonic() + aa._PROOF_TTL_S + 1}
+        monkeypatch.setattr(aa.time, "monotonic", lambda: clock["t"])
+        state["broken"] = True
+
+        assert sb.apparmor_active is True, "a proven verdict was discarded because a fork failed"
+        try:
+            sb._refuse_if_confinement_regressed(sb.apparmor_active)
+        except SandboxUnavailable as exc:                        # pragma: no cover
+            raise AssertionError(f"the job was refused for a failed probe: {exc}") from exc
+
+    def test_the_fallback_is_only_for_a_MEASURED_verdict(self, tmp_path, monkeypatch) -> None:
+        """A previous fail-closed guess is not a verdict. Falling back on one would propagate it
+        forward forever, and the state would never settle."""
+        import subprocess
+
+        import blastbox.worker.sandbox.apparmor as aa
+        import blastbox.worker.sandbox.nsjail as mod
+
+        monkeypatch.setenv("BLASTBOX_APPARMOR_PROFILES", "blastbox-sandbox")
+        monkeypatch.setattr(aa, "_PROFILES", "/nonexistent")
+        monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
+        monkeypatch.setattr(mod, "_supports_proc_rw", lambda _p: True)
+        monkeypatch.setattr(aa.subprocess, "run",
+                            lambda argv, **kw: (_ for _ in ()).throw(
+                                subprocess.TimeoutExpired(argv, 1)))
+        nsjail = tmp_path / "nsjail"
+        nsjail.write_text(_FAKE_NSJAIL)
+        nsjail.chmod(0o755)
+        sb = mod.NsjailSandbox(nsjail_path=str(nsjail))
+
+        clock = {"t": aa.time.monotonic()}
+        monkeypatch.setattr(aa.time, "monotonic", lambda: clock["t"])
+        for _ in range(aa._TRANSIENT_SETTLED_AFTER):
+            assert sb.apparmor_active is False
+            clock["t"] += aa._TRANSIENT_TTL_S + 0.1
+        assert sb._proof is not None and sb._proof[2] == aa._PROOF_TTL_S, (
+            "the unmeasured guess was treated as a verdict, so it never settled"
+        )
+        assert sb._proof[3] is False, "a guess is marked as measured"
+
+    def test_the_operator_is_not_told_to_reload_a_loaded_profile(
+            self, tmp_path, monkeypatch) -> None:
+        """An unmeasurable probe reported a bare `apparmor_missing`, so the selector's remedy sent
+        the operator to load a profile that may well be loaded and enforcing."""
+        import subprocess
+
+        import blastbox.worker.sandbox.apparmor as aa
+        import blastbox.worker.sandbox.nsjail as mod
+
+        monkeypatch.setenv("BLASTBOX_APPARMOR_PROFILES", "blastbox-sandbox")
+        monkeypatch.setattr(aa, "_PROFILES", "/nonexistent")
+        monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
+        monkeypatch.setattr(mod, "_supports_proc_rw", lambda _p: True)
+        monkeypatch.setattr(aa.subprocess, "run",
+                            lambda argv, **kw: (_ for _ in ()).throw(
+                                subprocess.TimeoutExpired(argv, 1)))
+        nsjail = tmp_path / "nsjail"
+        nsjail.write_text(_FAKE_NSJAIL)
+        nsjail.chmod(0o755)
+        sb = mod.NsjailSandbox(nsjail_path=str(nsjail))
+
+        assert sb.apparmor_active is False
+        reason = sb.apparmor_blocked_reason
+        assert reason is not None, "the real cause never reached the selector"
+        assert "cannot run" in reason
+        assert "Reloading the profile will not help" in reason
+
+
+@pytest.mark.parametrize("backend", ["nsjail", "bwrap"])
+def test_both_backends_expose_the_blocked_reason(backend: str) -> None:
+    """The field is set from the SHARED proof path, so a property on one backend only meant the
+    selector's `getattr` found nothing and the real cause was silently dropped for the other
+    (found while fixing round 6 of #177)."""
+    import blastbox.worker.sandbox.bwrap as bw
+    import blastbox.worker.sandbox.nsjail as nj
+
+    cls = nj.NsjailSandbox if backend == "nsjail" else bw.BubblewrapSandbox
+    assert isinstance(getattr(cls, "apparmor_blocked_reason", None), property), (
+        f"{cls.__name__} does not expose apparmor_blocked_reason, so detect.py cannot read it"
     )

@@ -369,14 +369,6 @@ class NsjailSandbox(AppArmorProofMixin):
     def seccomp_active(self) -> bool:
         return self._seccomp_policy is not None
 
-    @property
-    def apparmor_blocked_reason(self) -> str | None:
-        """Why no profile can be attached on this host, when the cause is not the obvious two.
-
-        `apparmor_missing` has three causes -- no helper, no enforcing profile, and an nsjail
-        build without `--proc_rw` -- and the selector's remedy can only guess at the first two.
-        """
-        return self._apparmor_blocked_reason
 
     def run(self, request: SandboxRequest) -> SandboxResult:
         """Run ``request.argv`` inside an nsjail one-shot sandbox.

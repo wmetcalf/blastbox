@@ -37,9 +37,9 @@ _PROFILES = "/sys/kernel/security/apparmor/profiles"
 # point is that the window is BOUNDED rather than the life of the worker.
 _PROOF_TTL_S = 30.0
 
-# A probe that could not RUN is cached far more briefly: long enough to stop a storm of 60s
-# launches (six per `insecurity_reasons` + `secure` read, measured), short enough that the
-# backend recovers on its own the moment probes work again.
+# A fail-closed answer with nothing measured behind it is cached far more briefly than a verdict:
+# long enough to stop a launch storm (3 per read, measured), short enough that the backend
+# recovers on its own the moment probes work again.
 _TRANSIENT_TTL_S = 2.0
 
 # A probe can be broken PERMANENTLY, not transiently: memfd unsupported, a wrapper binary that
@@ -218,9 +218,11 @@ class AppArmorProofMixin:
     seccomp-less probe existed only in bwrap, and every test for the proof cache and the name
     match exercised the nsjail copy only. Two copies, one of them fixed and tested.
 
-    A host class must provide: ``_aa_exec``, ``_apparmor_profile``, ``_binary_present``,
-    ``_apparmor_last_seen``, ``_proof``, ``_warned_unprovable``, ``_armed_at_admission``,
-    ``name``, and ``_build_argv(req, *, attach_apparmor=...)``.
+    A host class must provide exactly three things: ``name``, ``_aa_exec``,
+    ``_apparmor_profile``, and a ``_build_argv(req, *, attach_apparmor=...)``. Everything else
+    the proof needs has a class-level default below and belongs to the mixin -- the earlier
+    version of this list told a third-backend author to supply state that the mixin owns, and
+    named one attribute (``_warned_unprovable``) that no longer exists (lens, round 6 of #177).
     """
 
     # The contract a host class must satisfy. Declared rather than implied so the type checker
@@ -237,11 +239,18 @@ class AppArmorProofMixin:
     # which is exactly what happened once already. Defaults make that unrepeatable
     # (claude-code-review lens, round 5 of #177).
     _apparmor_last_seen: bool | None = None
-    _proof: tuple[bool, float, float] | None = None
+    # (verdict, stamped_at, ttl, measured). `measured` is load-bearing: a transient failure may
+    # fall back on a real measurement, but not on a previous fail-closed guess -- otherwise the
+    # guess propagates forward forever and the state never settles.
+    _proof: tuple[bool, float, float, bool] | None = None
     _warned: frozenset[str] = frozenset()
     _consecutive_transients: int = 0
     _suspended_for_diagnosis: bool = False
     _armed_at_admission: bool | None = None
+    # Why no profile can be attached, when the cause is NOT one of the obvious two (no helper,
+    # no enforcing profile). The selector carries it into its rejection so the remedy does not
+    # tell an operator to reload a profile that is already loaded.
+    _apparmor_blocked_reason: str | None = None
 
     def _apparmor_enforcing_now(self) -> bool:
         raise NotImplementedError
@@ -251,6 +260,22 @@ class AppArmorProofMixin:
     # makes every backend's real builder an "incompatible override" for keywords the mixin
     # never uses.
     _build_argv: Any
+
+    @property
+    def apparmor_blocked_reason(self) -> str | None:
+        """Why no profile can be attached here, when the cause is not one of the obvious two.
+
+        `apparmor_missing` has several causes -- no `aa-exec`, no enforcing profile, an nsjail
+        build without `--proc_rw`, a proof probe that cannot run -- and the selector's generic
+        remedy can only guess at the first two. Anything that knows better sets the field; the
+        selector carries this into its rejection so an operator is not sent to reload a profile
+        that is already loaded.
+
+        Lives on the MIXIN, not one backend: bwrap sets the field from the shared proof path, and
+        while the property existed only on nsjail the selector's `getattr` found nothing and the
+        cause was silently dropped for bwrap (found while fixing round 6).
+        """
+        return self._apparmor_blocked_reason
 
     def _run_probe(self, req: SandboxRequest) -> subprocess.CompletedProcess[str]:
         """Run one probe with the profile ATTACHED, and hand back the finished process.
@@ -357,10 +382,13 @@ class AppArmorProofMixin:
           reason that is not the profile -- the seccomp filter blocking a syscall `cat` needs
           but `/usr/bin/true` does not, say. That is why this branch warns and names the reader
           to permit, instead of reporting the profile as proven (qwen, round 6 of #177).
-        * TRANSIENT -- the probe itself failed (a 60s timeout, ENOMEM on fork). Not a verdict:
-          answer from the last one if there is one, and write NO cache entry, because caching
-          a transient failure refused every job for the whole TTL on a host that had already
-          recovered (claude-code-review lens, round 4 of #177).
+        * TRANSIENT -- the probe itself failed (the `_PROBE_TIMEOUT_S` timeout, ENOMEM on fork).
+          Not a verdict about the profile, so it never overwrites one: if a MEASURED verdict
+          exists, that is the answer and its cache entry is left to expire on its own schedule.
+          With nothing ever measured there is nothing to fall back on, so it fails closed and
+          caches THAT for `_TRANSIENT_TTL_S` -- widened to `_PROOF_TTL_S` once
+          `_TRANSIENT_SETTLED_AFTER` consecutive failures say the probe is simply broken, which
+          is what stops a permanently broken host re-probing before every job.
 
         Order matters for cost: the proof comes FIRST, and the structural attach probe runs only
         when the proof cannot report -- it is load-bearing for exactly that branch. Asking it
@@ -386,7 +414,7 @@ class AppArmorProofMixin:
                     "no profile is attached",
                     self.name, self._apparmor_profile, got,
                 )
-            self._proof = (ok, time.monotonic(), _PROOF_TTL_S)
+            self._proof = (ok, time.monotonic(), _PROOF_TTL_S, True)
             return ok
 
         attaches = self._apparmor_attaches_at_all()
@@ -399,30 +427,51 @@ class AppArmorProofMixin:
             # alternative -- refusing every job because one fork failed -- is the worse error.
             attaches = self._apparmor_attaches_at_all()
         if attaches is None:
-            # TRANSIENT, twice. We know NOTHING about this profile -- not that it is absent, not
-            # that it is enforcing -- so this is the one branch that must not fall back on the
-            # operator's word. Before the round-4 refactor an exception here answered False and
-            # the backend reported `apparmor_missing`; the refactor turned it into "trust the
-            # assertion", so a host whose proof jail could not launch reported `secure = True`
-            # and attached `--proc_rw` on the strength of an environment variable that was never
-            # measured (claude-code-review lens, round 5 of #177 -- reproduced: reasons [],
-            # secure True, six 60s probes, nothing cached). Back to fail-closed.
-            #
-            # Cached only for `_TRANSIENT_TTL_S`, not the verdict TTL: long enough to stop the
-            # probe storm, short enough that the backend re-arms itself the moment probes work.
             self._consecutive_transients += 1
+            # TRANSIENT, twice -- and this is news about the PROBE, not about the profile. So
+            # the LAST VERDICT wins if there is one. Failing closed here discarded an `(enforce)`
+            # reading taken seconds earlier and refused the job, on a backend the selector had
+            # admitted as confined, because a fork failed -- and the refusal was itself cached,
+            # so a host that had already recovered stayed refused for the whole window with no
+            # measurement at all. That is the round-4 defect this branch was written to fix,
+            # wearing a new hat (claude-code-review lens, round 6 of #177). The existing entry is
+            # left alone so it expires on its own schedule and the next window re-measures.
+            if self._proof is not None and self._proof[3]:
+                _log.warning(
+                    "apparmor_proof_probe_failed backend=%s profile=%s age=%.0fs "
+                    "note=answering from the last verdict (%s); the probe failed, not the "
+                    "profile",
+                    self.name, self._apparmor_profile,
+                    time.monotonic() - self._proof[1],
+                    "enforcing" if self._proof[0] else "not enforcing",
+                )
+                return self._proof[0]
+
+            # NOTHING has ever been measured on this backend. There is no verdict to fall back
+            # on and confinement cannot be claimed, so fail closed -- which is what this did
+            # before the round-4 refactor turned it into "trust the environment variable".
             settled = self._consecutive_transients >= _TRANSIENT_SETTLED_AFTER
+            # The REAL cause, carried into the selector's rejection. Reporting a bare
+            # `apparmor_missing` sent the operator to load a profile that may well be loaded
+            # and enforcing; nothing about it was measured (lens, round 6).
+            self._apparmor_blocked_reason = (
+                f"the AppArmor proof probe cannot run here (attempt "
+                f"{self._consecutive_transients}), so nothing is known about profile "
+                f"{self._apparmor_profile!r} -- it may be loaded and enforcing. Permit "
+                f"{_PROOF_READER or 'a file reader'} in the profile, or accept the gap with "
+                f"BLASTBOX_WARN_ON_INSECURE=1. Reloading the profile will not help."
+            )
             self._warn_once(
                 "unmeasurable",
                 "apparmor_proof_unmeasurable backend=%s profile=%s "
-                "note=the probe failed transiently twice; confinement CANNOT be confirmed, so "
-                "this backend reports apparmor_missing until a probe succeeds"
-                % (self.name, self._apparmor_profile)
+                "note=the probe failed transiently twice and nothing has ever been measured "
+                "on this backend; confinement CANNOT be confirmed, so it reports "
+                "apparmor_missing" % (self.name, self._apparmor_profile),
             )
             if settled:
-                # Not transient any more, whatever the errno said: this probe is broken. Hold
-                # the fail-closed answer for the full TTL so the cost is once per window rather
-                # than three launches per job (measured), and still re-measure after it.
+                # Not transient any more, whatever the errno said: this probe is broken. Hold the
+                # fail-closed answer for the full TTL so the cost is once per window rather than
+                # three launches per job (measured), and still re-measure after it.
                 _log.warning(
                     "apparmor_proof_unmeasurable_settled backend=%s profile=%s attempts=%d "
                     "note=treating the probe as broken; re-measured every %.0fs",
@@ -430,9 +479,10 @@ class AppArmorProofMixin:
                     _PROOF_TTL_S,
                 )
             self._proof = (
-                False, time.monotonic(), _PROOF_TTL_S if settled else _TRANSIENT_TTL_S,
+                False, time.monotonic(), _PROOF_TTL_S if settled else _TRANSIENT_TTL_S, False,
             )
             return False
+
         self._consecutive_transients = 0
         if not attaches:
             _log.warning(
@@ -441,7 +491,7 @@ class AppArmorProofMixin:
                 "documented probe binary); no profile is attached",
                 self.name, self._apparmor_profile,
             )
-            self._proof = (False, time.monotonic(), _PROOF_TTL_S)
+            self._proof = (False, time.monotonic(), _PROOF_TTL_S, True)
             return False
 
         self._warn_once(
@@ -451,7 +501,7 @@ class AppArmorProofMixin:
             "stands unverified. Permit it to have the assertion checked."
             % (self.name, self._apparmor_profile, _PROOF_READER or "a file reader")
         )
-        self._proof = (True, time.monotonic(), _PROOF_TTL_S)
+        self._proof = (True, time.monotonic(), _PROOF_TTL_S, True)
         return True
 
     def _warn_once(self, key: str, msg: str) -> None:
