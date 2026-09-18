@@ -359,7 +359,23 @@ class AppArmorProofMixin:
 
         attaches = self._apparmor_attaches_at_all()
         if attaches is None:
-            return self._proof[0] if self._proof is not None else True
+            # RETRY once. A transient failure with no previous verdict is the one moment this
+            # has nothing to fall back on, and "trust the assertion" there is a fail-open
+            # window, however narrow (nemotron, round 5 of #177). One more attempt costs a
+            # jail launch and removes the single-fork-failure case; if it is still transient
+            # the honest answer is the operator's assertion, said out loud, because the
+            # alternative -- refusing every job because one fork failed -- is the worse error.
+            attaches = self._apparmor_attaches_at_all()
+        if attaches is None:
+            if self._proof is not None:
+                return self._proof[0]
+            self._warn_once_unprovable(
+                "apparmor_proof_unmeasurable profile=%s "
+                "note=the probe failed transiently twice and there is no earlier verdict; "
+                "the assertion stands UNVERIFIED for now and will be re-measured"
+                % self._apparmor_profile
+            )
+            return True
         if not attaches:
             _log.warning(
                 "apparmor_assertion_disproved profile=%s "

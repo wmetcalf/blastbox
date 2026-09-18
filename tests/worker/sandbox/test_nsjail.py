@@ -1344,3 +1344,56 @@ class TestTheProofCacheAndTheNameMatch:
             pytest.skip("no file reader on this host")
         if Path("/bin").is_symlink():
             assert aa._PROOF_READER.startswith("/usr/"), aa._PROOF_READER
+
+
+def test_a_single_transient_probe_failure_is_retried_before_it_is_believed(
+        tmp_path, monkeypatch) -> None:
+    """A transient probe failure with no earlier verdict is the one moment the proof has
+    nothing to fall back on, and trusting the assertion there is a fail-open window, however
+    narrow (nemotron, round 5 of #177).
+
+    One retry removes the single-fork-failure case. Two in a row is reported out loud and the
+    operator's assertion stands -- refusing every job because one fork failed is the worse
+    error, and the next TTL re-measures.
+    """
+    import subprocess
+
+    import blastbox.worker.sandbox.apparmor as aa
+    import blastbox.worker.sandbox.nsjail as mod
+
+    monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
+    monkeypatch.setattr(mod, "_supports_proc_rw", lambda _p: True)
+    monkeypatch.setattr(aa, "profile_evidence", lambda _p: aa.ASSERTED)
+    monkeypatch.setattr(mod, "profile_loaded", lambda _p: True)
+
+    # The READER probe never reports here (the profile denies it), so the verdict rests on the
+    # structural attach probe -- and that is the one made transiently flaky, because it is the
+    # only path where a transient failure has nothing to fall back on.
+    calls = {"reader": 0, "attach": 0}
+
+    def _flaky(argv, **kw):
+        from types import SimpleNamespace
+        joined = " ".join(argv)
+        if "/proc/self/attr/current" in joined:
+            calls["reader"] += 1
+            return SimpleNamespace(returncode=1, stdout="", stderr="denied")
+        calls["attach"] += 1
+        if calls["attach"] == 1:
+            raise OSError(12, "Cannot allocate memory")     # transient, once
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(aa.subprocess, "run", _flaky)
+    nsjail = tmp_path / "nsjail"
+    nsjail.write_text(_FAKE_NSJAIL)
+    nsjail.chmod(0o755)
+    sb = mod.NsjailSandbox(nsjail_path=str(nsjail))
+
+    assert sb.apparmor_active is True
+    assert calls["attach"] == 2, (
+        f"the attach probe ran {calls['attach']}x -- a single transient failure was believed "
+        f"without a retry"
+    )
+    assert sb._proof is not None and sb._proof[0] is True, (
+        "the recovered probe produced no verdict to cache"
+    )
+    assert subprocess is not None
