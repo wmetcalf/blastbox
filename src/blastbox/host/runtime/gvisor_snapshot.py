@@ -344,22 +344,33 @@ def _runsc(cfg: GvisorConfig) -> list[str]:
     return a
 
 
+_WARN_ON_INSECURE = "BLASTBOX_WARN_ON_INSECURE"
+
+
 def _oci_config(cfg: GvisorConfig, workdir: Path, *, in_ro: bool) -> dict:
     """A self-contained OCI spec (config.json) for the warm/restore container with
     per-slot bind mounts. Pure (no runsc spec needed) so it's unit-testable."""
     env = ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "HOME=/tmp"]
-    # Same reason docker.py:446 sets it for the runc/runsc path: gVisor virtualises /proc, so
-    # a worker's in-container hardening self-check cannot observe the host-level flags that
-    # ARE applied, and it aborts on its own self-check. This is the second dispatcher-managed
-    # runsc launch path and it never got the variable, while docs/DEPLOYMENT.md asserted that
-    # "workers launched by the dispatcher under runsc already get" it -- bounding the blast
-    # radius of a fail-closed with a claim that was true of one launcher out of two
-    # (claude-blast-radius lens, #177). An operator override in extra_env still wins: it is
-    # appended after this.
-    env.append("BLASTBOX_WARN_ON_INSECURE=1")
     if cfg.ld_preload:
         env.append(f"LD_PRELOAD={cfg.ld_preload}")
     env.extend(cfg.extra_env)
+
+    # Same reason docker.py sets it for the runc/runsc path: gVisor virtualises /proc, so a
+    # worker's in-container hardening self-check cannot observe the host-level flags that ARE
+    # applied, and it aborts on its own self-check. This is the second dispatcher-managed runsc
+    # launch path and it never got the variable, while docs/DEPLOYMENT.md asserted that "workers
+    # launched by the dispatcher under runsc already get" it -- bounding the blast radius of a
+    # fail-closed with a claim that was true of one launcher out of two (claude-blast-radius
+    # lens, #177).
+    #
+    # SET ONLY IF THE OPERATOR HAS NOT. Appending the default first and relying on extra_env
+    # coming later does NOT let the operator win: execve takes a list and getenv returns the
+    # FIRST match, so `extra_env=["BLASTBOX_WARN_ON_INSECURE=0"]` was silently overridden by the
+    # default (measured: a child given DUP=first,DUP=second reads "first"). A duplicate key is
+    # not an override -- it is a coin flip on the reader's implementation (codex, round 2 of
+    # #177).
+    if not any(e.split("=", 1)[0] == _WARN_ON_INSECURE for e in env):
+        env.append(f"{_WARN_ON_INSECURE}=1")
     spec: dict = {
         "ociVersion": "1.0.0",
         "process": {
