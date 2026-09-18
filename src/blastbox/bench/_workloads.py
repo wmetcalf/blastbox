@@ -3,6 +3,7 @@
 Imported lazily by the scenarios so the bench package imports with no soffice."""
 from __future__ import annotations
 
+import logging
 import shutil
 import subprocess
 import tempfile
@@ -11,6 +12,8 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from blastbox.bench.scenarios import BenchConfig
+
+_log = logging.getLogger("blastbox.bench")
 
 # Resolve via PATH so the workload uses the SAME soffice the requirement check
 # (shutil.which) found, not a possibly-different hardcoded location.
@@ -30,15 +33,39 @@ def soffice_argv(input_path: str, outdir: str) -> list[str]:
 
 
 def available_sandbox_backends() -> tuple[str, ...]:
-    """``none`` (baseline) + whichever sandbox binaries are installed."""
+    """``none`` (baseline) + whichever backends will actually RUN here.
+
+    A binary on disk is not a backend the bench can measure. `soffice_runner.run_one` goes
+    through `select_sandbox(backend=...)`, which applies the security gate in forced mode
+    too -- so since #160 a host with nsjail installed and no child AppArmor profile raises
+    `insecure: apparmor_missing` on every iteration. `_measure_runner` swallows per-sample
+    exceptions, the backend yields zero samples, and `_sandbox_overhead_impl` then reports
+    the WHOLE scenario `insufficient`, discarding the `none` baseline it had already
+    collected. A refusal by the selector is a bench that measured nothing and blamed the
+    host (claude-blast-radius lens, #177).
+
+    So ask the selector, not the filesystem, and offer only what it hands back.
+    """
+    from blastbox.errors import SandboxUnavailable
+    from blastbox.worker.sandbox.detect import select_sandbox
+
     backends = ["none"]
-    for name, present in (
-        ("bwrap", shutil.which("bwrap")),
-        ("nsjail", shutil.which("nsjail")),
-        ("nono", shutil.which("nono")),
-    ):
-        if present:
-            backends.append(name)
+    for name in ("bwrap", "nsjail", "nono"):
+        if shutil.which(name) is None:
+            continue
+        try:
+            select_sandbox(backend=name)
+        except SandboxUnavailable as exc:
+            _log.warning(
+                "bench_sandbox_backend_skipped backend=%s reason=%s", name, exc,
+            )
+            continue
+        except Exception as exc:                       # noqa: BLE001 - never fail the bench
+            _log.warning(
+                "bench_sandbox_backend_skipped backend=%s reason=unexpected:%s", name, exc,
+            )
+            continue
+        backends.append(name)
     return tuple(backends)
 
 

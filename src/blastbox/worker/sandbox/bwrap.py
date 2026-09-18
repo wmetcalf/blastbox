@@ -44,17 +44,23 @@ from typing import Callable
 
 from blastbox.errors import SandboxError, SandboxUnavailable
 from blastbox.limits import Limits
-from blastbox.worker.sandbox.apparmor import DEFAULT_PROFILE, resolve_profile
+from blastbox.worker.sandbox.apparmor import (
+    AppArmorProofMixin,
+    profile_loaded,
+    find_aa_exec as _find_aa_exec,
+    resolve_profile,
+)
 from blastbox.worker.sandbox.base import SandboxRequest, SandboxResult, kill_sandbox_group
 
 
 _log = logging.getLogger("blastbox.worker.sandbox.bwrap")
 
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 _BWRAP = shutil.which("bwrap") or "/usr/bin/bwrap"
 
-# Default AppArmor profile to attach to the child process via aa-exec.
-# Profile must be loaded on the host kernel.
-_DEFAULT_APPARMOR_PROFILE = DEFAULT_PROFILE
 
 
 def _apparmor_profile_loaded(profile: str) -> bool:
@@ -66,10 +72,11 @@ def _apparmor_profile_loaded(profile: str) -> bool:
     failing outright.
 
     The check itself now lives in `apparmor.profile_loaded`, shared with the nsjail backend --
-    which had the same hazard and no check at all (issue #158).
+    which had the same hazard and no check at all (issue #158). Imported at MODULE level, like
+    nsjail does it: the lazy import inside this function meant the name did not exist on this
+    module, so a test patching `bwrap.profile_loaded` pinned nothing and the bwrap half silently
+    read the host -- the same asymmetry that hid `_find_aa_exec` (codex, #177).
     """
-    from blastbox.worker.sandbox.apparmor import profile_loaded
-
     return profile_loaded(profile)
 
 
@@ -124,7 +131,7 @@ for _d in ("/bin", "/sbin", "/lib", "/lib64"):
 _RO_SYSTEM_DIRS = ("/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc")
 
 
-class BubblewrapSandbox:
+class BubblewrapSandbox(AppArmorProofMixin):
     """Sandbox backend that wraps the ``bwrap`` binary.
 
     Construction probes the host for capabilities (cgroup-pids, seccomp,
@@ -165,9 +172,19 @@ class BubblewrapSandbox:
         # Two independent facts, and they were conflated: whether the HELPER exists (static,
         # a binary on disk) and whether the PROFILE is enforcing (dynamic, kernel state an
         # operator can change under a running worker). Only the first belongs in a constructor.
-        self._aa_exec: str | None = shutil.which("aa-exec")
+        # BEFORE the first apparmor_active read. That property is not a plain accessor: on
+        # the asserted path it launches a jail to measure the profile and caches the result
+        # here, and both constructors read it while deciding what to log -- so uninitialised
+        # state crashed construction outright on any host with BLASTBOX_APPARMOR_PROFILES set
+        # (found by running it).
+        self._aa_exec: str | None = _find_aa_exec()
         self._apparmor_last_seen: bool | None = None
-        if self.apparmor_active:
+        # NOT apparmor_active here. That property is not a plain accessor: on the asserted path
+        # it builds an argv and launches a jail, which needs constructor state that does not
+        # exist yet -- calling it from __init__ crashed construction outright (found by running
+        # it). The cheap facts are enough to log an intention; the measurement happens on the
+        # first real read, which is the selector's security check, still before any job.
+        if self._aa_exec is not None and self._apparmor_enforcing_now():
             _log.info(
                 "bwrap_apparmor_attach_enabled aa_exec=%s profile=%s",
                 self._aa_exec,
@@ -220,18 +237,80 @@ class BubblewrapSandbox:
         if not self._cgroup_pids_supported:
             self._static_insecurity_reasons.append("pid_limit_missing")
 
+        # What confinement looked like when the selector admitted this backend. A LOSS
+        # of it later is a refusal (see _refuse_if_confinement_regressed); never having
+        # had it is not.
+        # An ASSERTED profile is not a confirmed one -- see apparmor_active, which measures it
+        # from inside the jail rather than believing it, on a TTL rather than once. Deliberately
+        # NOT measured here: see the note above the log block.
+        # None = not recorded yet, and deliberately NOT measured here: the measurement can
+        # launch a jail (an asserted profile is proved, not believed), which a constructor
+        # cannot do -- it crashed construction outright on a host with BLASTBOX_APPARMOR_PROFILES
+        # set. `note_admitted()` records it when the selector admits this backend; a backend
+        # built directly by an engine and never passed through `select_sandbox` takes its
+        # baseline from its first launch instead.
+        # The CHEAP facts, which are all a constructor may consult: the helper exists and the
+        # profile reads as enforcing. Not apparmor_active -- that measures an asserted profile
+        # by launching a jail, needs state this constructor has not built yet, and crashed
+        # construction outright on a host with BLASTBOX_APPARMOR_PROFILES set (found by running
+        # it). `note_admitted()` refines this at the moment the selector admits the backend,
+        # which is the admission that actually matters.
+        # None until something measures it. NOT `_apparmor_enforcing_now()`: on the asserted
+        # path that is just the environment variable, while the guard compares it against
+        # apparmor_active, which is PROOF-level -- two yardsticks, so a profile that the proof
+        # disproved looked like confinement that had been "lost", the guard refused every job,
+        # and selection fell through to `container`. One yardstick: `note_admitted()` records
+        # what the selector observed, and a backend nobody admitted takes its baseline from its
+        # first launch (claude-code-review lens, round 4 of #177).
+        self._armed_at_admission: bool | None = None
+
         _log.info(
             "BubblewrapSandbox initialised",
             extra={
                 "seccomp_active": self._seccomp_active,
                 "apparmor": self._aa_exec,
                 "cgroup_pids": self._cgroup_pids_supported,
-                "insecurity_reasons": self.insecurity_reasons,
+                # The STATIC reasons only. `insecurity_reasons` derives the AppArmor one from
+                # apparmor_active, which measures an asserted profile by launching a jail --
+                # not something a constructor can do, and not something a log line should
+                # trigger. The live answer is what the selector reads a moment later.
+                "static_insecurity_reasons": list(self._static_insecurity_reasons),
             },
         )
 
     # ------------------------------------------------------------------
     # Properties
+
+    def _run_probe(self, req: SandboxRequest) -> subprocess.CompletedProcess[str]:
+        """The probe, WITH the seccomp filter a real job carries -- fd and all.
+
+        Two things the mixin's default cannot do for bwrap: the filter is a per-run memfd
+        rather than a path, and the child only sees it if the launch passes it. Building the
+        argv without doing both produced `bwrap: Can't read seccomp data: Bad file descriptor`
+        on every probe, which the proof then reported as "the profile cannot be attached at
+        all" -- a correctly loaded profile declared unusable by a broken diagnostic (CI, #177).
+
+        Without it the probes would launch an UNFILTERED bwrap, so a filter/profile interaction
+        -- aa-exec needing a syscall the denylist blocks -- would be invisible to every
+        diagnostic here and paid for by the first real job. The smoketest's own rule: a probe
+        that skips the confinement is not testing what will run.
+        """
+        fd: int | None = None
+        try:
+            if self._seccomp_bpf is not None:
+                fd = os.memfd_create("blastbox_seccomp_probe", 0)
+                os.write(fd, self._seccomp_bpf)
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.set_inheritable(fd, True)
+            return subprocess.run(
+                self._build_argv(req, seccomp_fd=fd, attach_apparmor=True),
+                capture_output=True, text=True, timeout=60,
+                close_fds=True, pass_fds=() if fd is None else (fd,),
+            )
+        finally:
+            if fd is not None:
+                os.close(fd)
+
 
     def _apparmor_enforcing_now(self) -> bool:
         """Whether the profile is enforcing AT THIS MOMENT.
@@ -278,11 +357,6 @@ class BubblewrapSandbox:
         return self._seccomp_active
 
     @property
-    def apparmor_active(self) -> bool:
-        """Both halves: the helper exists AND the profile is enforcing right now."""
-        return self._aa_exec is not None and self._apparmor_enforcing_now()
-
-    @property
     def cgroup_pids_supported(self) -> bool:
         return self._cgroup_pids_supported
 
@@ -307,6 +381,11 @@ class BubblewrapSandbox:
             raise SandboxError("argv must be a non-empty list of strings")
         if not self._binary_present:
             raise SandboxUnavailable(f"bwrap not found at {self._bwrap!r}")
+        # ONE read for this launch, shared by the guard and the argv: two independent reads
+        # can straddle a profile being unloaded, and the argv silently losing the prefix after
+        # the guard approved it is exactly what the guard exists to prevent.
+        attached = self.apparmor_active
+        self._refuse_if_confinement_regressed(attached)
 
         # A FRESH memfd per run holds the BPF program bwrap reads via --seccomp <fd>. pass_fds
         # keeps it open + inheritable across the close_fds=True fork; the parent closes its copy
@@ -320,7 +399,15 @@ class BubblewrapSandbox:
                 os.write(seccomp_fd, self._seccomp_bpf)
                 os.lseek(seccomp_fd, 0, os.SEEK_SET)
                 os.set_inheritable(seccomp_fd, True)
-            argv = self._build_argv(request, seccomp_fd=seccomp_fd)
+            # `attach_apparmor=attached`: the SAME read the guard just approved. Without it
+            # _build_argv evaluated apparmor_active a second time, and a profile that vanished
+            # between the two dropped the aa-exec prefix from a launch the guard had certified
+            # as confined -- the TOCTOU the nsjail half closed in round 2, still open here two
+            # rounds later because the fix was applied to one copy (claude-code-review lens,
+            # round 4 of #177). The mixin now makes that kind of drift impossible.
+            argv = self._build_argv(
+                request, seccomp_fd=seccomp_fd, attach_apparmor=attached
+            )
             killed = False
 
             try:
@@ -362,7 +449,13 @@ class BubblewrapSandbox:
     # ------------------------------------------------------------------
     # Internal
 
-    def _build_argv(self, req: SandboxRequest, *, seccomp_fd: int | None = None) -> list[str]:
+    def _build_argv(
+        self,
+        req: SandboxRequest,
+        *,
+        seccomp_fd: int | None = None,
+        attach_apparmor: bool | None = None,
+    ) -> list[str]:
         """Build the full bwrap argument vector for ``req``.
 
         All mount source/target paths are placed as value arguments after
@@ -427,9 +520,14 @@ class BubblewrapSandbox:
         # out loudly rather than silently running unconfined.
         inner: list[str] = list(req.argv)
         aa_exec = self._aa_exec
-        # Spelled out rather than `if self.apparmor_active` so the narrowing is visible to the
-        # type checker; the condition is the same one, in the same order.
-        if aa_exec is not None and self._apparmor_enforcing_now():
+        # `attach_apparmor` is the caller's single answer for this launch (run() reads
+        # apparmor_active once and passes it); None means decide here. The proof probe passes
+        # True explicitly -- it is the thing that ESTABLISHES belief, so it cannot wait on it.
+        if aa_exec is not None:
+            decided = self.apparmor_active if attach_apparmor is None else attach_apparmor
+            if not decided:
+                aa_exec = None
+        if aa_exec is not None:
             inner = [aa_exec, "-p", self._apparmor_profile, "--", *inner]
         argv += inner
         return argv

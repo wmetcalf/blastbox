@@ -1,6 +1,7 @@
 import pathlib
 import time
 import json
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -1632,3 +1633,41 @@ def test_a_reservation_is_taken_before_any_allocation(monkeypatch):
         )
     finally:
         sink.close_write()
+
+
+def test_the_worker_self_check_leniency_reaches_the_gvisor_tier() -> None:
+    """docs/DEPLOYMENT.md bounds the blast radius of the new fail-closed with "workers
+    launched by the dispatcher under runsc already get" BLASTBOX_WARN_ON_INSECURE. That was
+    true of exactly one of the two dispatcher-managed runsc launchers: docker.py set it and
+    this one, the warm/snapshot tier, never did -- so the sentence was reassurance for a tier
+    that would fail closed anyway (claude-blast-radius lens, #177).
+
+    Same rationale as docker.py: gVisor virtualises /proc, so the in-container self-check
+    cannot see host-level hardening that IS applied.
+    """
+    env = _oci_config(_cfg(Path(tempfile.mkdtemp())), Path("/tmp/x"), in_ro=True)[
+        "process"]["env"]
+    assert "BLASTBOX_WARN_ON_INSECURE=1" in env
+
+
+def test_an_operator_override_wins_and_the_key_appears_once() -> None:
+    """The first version of this test asserted ORDERING and claimed "last value wins in an OCI
+    env list". It does not: execve takes a list and getenv returns the FIRST match (measured --
+    a child given DUP=first,DUP=second reads "first"), so appending the default before
+    extra_env silently overrode the operator's explicit 0 while a passing test said otherwise
+    (codex, round 2 of #177).
+
+    A duplicate key is not an override in either direction; it is a coin flip on the reader's
+    implementation. So the key appears exactly once, and it is the operator's value.
+    """
+    cfg = _cfg(Path(tempfile.mkdtemp()), extra_env=["BLASTBOX_WARN_ON_INSECURE=0"])
+    env = _oci_config(cfg, Path("/tmp/x"), in_ro=True)["process"]["env"]
+    hits = [e for e in env if e.startswith("BLASTBOX_WARN_ON_INSECURE=")]
+    assert hits == ["BLASTBOX_WARN_ON_INSECURE=0"], hits
+
+
+def test_the_default_is_added_when_the_operator_says_nothing() -> None:
+    cfg = _cfg(Path(tempfile.mkdtemp()), extra_env=["SOMETHING_ELSE=1"])
+    env = _oci_config(cfg, Path("/tmp/x"), in_ro=True)["process"]["env"]
+    hits = [e for e in env if e.startswith("BLASTBOX_WARN_ON_INSECURE=")]
+    assert hits == ["BLASTBOX_WARN_ON_INSECURE=1"], hits

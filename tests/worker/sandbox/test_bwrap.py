@@ -645,7 +645,10 @@ class TestAnUndecodableProfileNameCannotBreakTheScan:
         f.write_bytes(b"/usr/bin/caf\xe9 (enforce)\n")
         monkeypatch.setattr(aa, "_PROFILES", str(f))
         monkeypatch.delenv("BLASTBOX_APPARMOR_PROFILES", raising=False)
-        monkeypatch.setattr(mod, "_probe_nsjail_proc_apparmor", lambda _p: True)
+        # aa-exec present, so the constructor actually reaches profile_loaded() and the
+        # undecodable byte is on the path under test. (Was _probe_nsjail_proc_apparmor,
+        # which nsjail never had a flag for -- see nsjail._find_aa_exec, #160.)
+        monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
 
         sb = mod.NsjailSandbox(nsjail_path=Path("/usr/bin/nsjail"))
         assert sb.apparmor_active is False
@@ -678,7 +681,7 @@ class TestKillModeIsEnforcement:
         for untrusted input; an operator who disagrees has BLASTBOX_APPARMOR_PROFILES."""
         assert self._loaded(tmp_path, monkeypatch, "blastbox-sandbox (user)\n") is False
 
-    def test_an_operator_assertion_is_additive_not_an_override(self, tmp_path, monkeypatch) -> None:
+    def test_an_operator_assertion_is_additive_where_it_applies(self, tmp_path, monkeypatch) -> None:
         """Listing A and B says nothing about C. Treating the list as an override would refuse
         a C the kernel reports as enforcing -- dropping real confinement for no gain."""
         import blastbox.worker.sandbox.apparmor as aa
@@ -688,8 +691,40 @@ class TestKillModeIsEnforcement:
         monkeypatch.setattr(aa, "_PROFILES", str(f))
         monkeypatch.setenv("BLASTBOX_APPARMOR_PROFILES", "some-other, and-another")
         assert aa.profile_loaded("blastbox-sandbox") is True
-        assert aa.profile_loaded("some-other") is True
         assert aa.profile_loaded("neither") is False
+
+    def test_the_kernel_outranks_the_assertion_when_it_can_be_read(
+            self, tmp_path, monkeypatch) -> None:
+        """The assertion used to be checked FIRST and returned True before securityfs was
+        opened, so naming a complain-mode -- or entirely absent -- profile produced
+        `secure = True`, `apparmor_active = True` and, for nsjail, `--proc_rw`: no
+        enforcement, a widened /proc, and a backend reporting itself hardened
+        (claude-security lens, #177). Where the kernel answers, the kernel wins."""
+        import blastbox.worker.sandbox.apparmor as aa
+
+        f = tmp_path / "profiles"
+        f.write_text("blastbox-sandbox (complain)\nsomething-else (enforce)\n")
+        monkeypatch.setattr(aa, "_PROFILES", str(f))
+        monkeypatch.setenv("BLASTBOX_APPARMOR_PROFILES", "blastbox-sandbox,not-loaded-at-all")
+        assert aa.profile_loaded("blastbox-sandbox") is False, "complain mode was asserted away"
+        assert aa.profile_loaded("not-loaded-at-all") is False, "an absent profile was asserted in"
+
+    def test_the_assertion_still_carries_an_unreadable_securityfs(
+            self, tmp_path, monkeypatch, caplog) -> None:
+        """The case it was written for: /sys/kernel/security/apparmor/profiles is root-only,
+        and a non-root worker cannot read it. There the assertion is the only evidence there
+        is -- and the log says so, because `secure` now rides on it."""
+        import logging
+
+        import blastbox.worker.sandbox.apparmor as aa
+
+        monkeypatch.setattr(aa, "_PROFILES", str(tmp_path / "does-not-exist"))
+        monkeypatch.setenv("BLASTBOX_APPARMOR_PROFILES", "blastbox-sandbox")
+        aa._WARNED_ASSERTED.clear()
+        with caplog.at_level(logging.WARNING, logger="blastbox.worker.sandbox.apparmor"):
+            assert aa.profile_loaded("blastbox-sandbox") is True
+            assert aa.profile_loaded("other") is False
+        assert "asserted_not_verified" in caplog.text
 
 
 class TestTheProfileModeIsReReadPerLaunch:
@@ -770,3 +805,150 @@ class TestTheProfileNameCanActuallyBeSelected:
         argv = sb._build_argv(SandboxRequest(argv=["/usr/bin/true"]))
         assert "my-parser-profile" in argv
         assert "apparmor_missing" not in sb.insecurity_reasons
+
+
+class TestTheProbeCarriesTheSeccompFilterAndItsFileDescriptor:
+    """CI caught this; the local suite could not.
+
+    bwrap's seccomp filter is a per-run memfd, not a path, so a probe needs BOTH the
+    `--seccomp <fd>` argument and the fd itself passed to the child. Building only the argv
+    produced `bwrap: Can't read seccomp data: Bad file descriptor` on every probe, and the
+    proof reported that as "the profile cannot be attached at all" -- a correctly loaded,
+    enforcing profile declared unusable by a broken diagnostic.
+
+    It escaped locally because this host has no python3-seccomp, so `_seccomp_bpf` is None and
+    no fd is ever built. The filter is synthesised here rather than waiting for a runner.
+    """
+
+    def _sb(self, tmp_path):
+        from blastbox.worker.sandbox.bwrap import BubblewrapSandbox
+
+        fake = tmp_path / "bwrap"
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(0o755)
+        sb = BubblewrapSandbox(bwrap_path=str(fake))
+        sb._seccomp_bpf = b"\x00" * 16          # a filter exists on this host, as in production
+        sb._seccomp_active = True
+        return sb
+
+    def test_the_descriptor_is_passed_and_is_readable_at_launch(self, tmp_path, monkeypatch):
+        import os
+        import subprocess as sp
+
+        import blastbox.worker.sandbox.bwrap as bw
+        from blastbox.worker.sandbox.base import SandboxRequest
+
+        seen: dict = {}
+
+        def _capture(argv, **kw):
+            seen["argv"] = argv
+            seen["pass_fds"] = kw.get("pass_fds", ())
+            # The fd must be OPEN and hold the filter at the moment of launch -- the failure
+            # mode was a closed/never-passed descriptor, which only shows up in the child.
+            fd = seen["pass_fds"][0] if seen["pass_fds"] else None
+            if fd is not None:
+                os.lseek(fd, 0, os.SEEK_SET)
+                seen["contents"] = os.read(fd, 16)
+            from types import SimpleNamespace
+            return SimpleNamespace(returncode=0, stdout="blastbox-sandbox (enforce)\n", stderr="")
+
+        monkeypatch.setattr(bw.subprocess, "run", _capture)
+        sb = self._sb(tmp_path)
+        sb._run_probe(SandboxRequest(argv=["/usr/bin/true"]))
+
+        assert "--seccomp" in seen["argv"], "the probe ran an UNFILTERED bwrap"
+        assert seen["pass_fds"], "the --seccomp fd was never passed to the child"
+        assert seen["contents"] == b"\x00" * 16
+        idx = seen["argv"].index("--seccomp")
+        assert seen["argv"][idx + 1] == str(seen["pass_fds"][0]), (
+            "the argv names a different fd from the one passed"
+        )
+        assert sp is not None
+
+    def test_the_descriptor_does_not_leak(self, tmp_path, monkeypatch):
+        """One memfd per probe, closed by the probe -- a worker probes once per TTL for the
+        life of the process."""
+        import os
+
+        import blastbox.worker.sandbox.bwrap as bw
+        from blastbox.worker.sandbox.base import SandboxRequest
+
+        grabbed: list[int] = []
+
+        def _capture(argv, **kw):
+            grabbed.extend(kw.get("pass_fds", ()))
+            from types import SimpleNamespace
+            return SimpleNamespace(returncode=0, stdout="x\n", stderr="")
+
+        monkeypatch.setattr(bw.subprocess, "run", _capture)
+        sb = self._sb(tmp_path)
+        for _ in range(3):
+            sb._run_probe(SandboxRequest(argv=["/usr/bin/true"]))
+
+        assert grabbed, "no fd was passed at all"
+        for fd in grabbed:
+            with pytest.raises(OSError):
+                os.fstat(fd)                      # every probe closed its own
+
+
+def test_the_production_launch_passes_the_seccomp_descriptor_too(tmp_path, monkeypatch) -> None:
+    """The PROBE's fd wiring is now pinned; `run()` builds the same memfd the same way and had
+    no local coverage at all.
+
+    Instrumenting `os.memfd_create` across the whole sandbox suite recorded four calls, every
+    one of them the probe's -- so on any host without python3-seccomp (this one, and the CI
+    `test` job) the production launch path was entirely unexecuted, and a dropped `pass_fds`
+    there would surface only as `bwrap: Can't read seccomp data` on real detonations. That is
+    the blind spot that already cost one CI round, left open on the hotter path
+    (claude-code-review lens, round 5 of #177).
+    """
+    import os
+
+    import blastbox.worker.sandbox.bwrap as bw
+    from blastbox.worker.sandbox.base import SandboxRequest
+
+    import blastbox.worker.sandbox.apparmor as aa
+
+    # KERNEL evidence, pinned: otherwise the real environment decides whether the asserted proof
+    # path runs, and this test measures the host (lens, round 6 of #177).
+    monkeypatch.setattr(aa, "profile_evidence", lambda _p: aa.KERNEL)
+
+    fake = tmp_path / "bwrap"
+    fake.write_text("#!/bin/sh\nexit 0\n")
+    fake.chmod(0o755)
+    sb = bw.BubblewrapSandbox(bwrap_path=str(fake))
+    sb._seccomp_bpf = b"\xde\xad\xbe\xef"          # synthesised: no python3-seccomp here
+    sb._seccomp_active = True
+
+    seen: dict = {}
+
+    class _Popen:
+        def __init__(self, argv, **kw):
+            seen["argv"] = argv
+            seen["pass_fds"] = kw.get("pass_fds", ())
+            fd = seen["pass_fds"][0] if seen["pass_fds"] else None
+            if fd is not None:
+                os.lseek(fd, 0, os.SEEK_SET)
+                seen["contents"] = os.read(fd, 4)
+            self.returncode = 0
+            self.pid = 4242
+
+        def communicate(self, timeout=None):
+            return (b"", b"")
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(bw.subprocess, "Popen", _Popen)
+    sb.run(SandboxRequest(argv=["/usr/bin/true"]))
+
+    assert "--seccomp" in seen["argv"], "the production launch ran an UNFILTERED bwrap"
+    assert seen["pass_fds"], "the --seccomp fd was never passed to the child"
+    assert seen["contents"] == b"\xde\xad\xbe\xef"
+    idx = seen["argv"].index("--seccomp")
+    assert seen["argv"][idx + 1] == str(seen["pass_fds"][0]), (
+        "the argv names a different fd from the one passed"
+    )

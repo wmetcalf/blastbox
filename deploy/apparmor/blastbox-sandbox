@@ -1,0 +1,110 @@
+# abi 3.0, NOT 4.0 -- deliberately different from blastbox-{bwrap,nsjail,runsc} in this
+# directory. Those declare 4.0 because they need the `userns` rule, which only exists there. This
+# profile uses nothing newer than 3.0, and an AppArmor 3.x parser (Ubuntu 22.04 LTS) has no
+# /etc/apparmor.d/abi/4.0 -- so pinning 4.0 here would make the ONE profile a host must load for
+# any inner backend to be `secure` fail to compile on a supported LTS (glm, round 6 of #177).
+# Verified: compiles under both abi declarations on an AppArmor 4.x parser.
+abi <abi/3.0>,
+include <tunables/global>
+
+# blastbox-sandbox — the CHILD profile, attached to the detonated workload itself.
+#
+# Different in kind from blastbox-{bwrap,nsjail,runsc} in this directory: those grant `userns`
+# to a sandbox BINARY so it can build a jail. This one is applied INSIDE that jail, to the
+# payload, via `aa-exec -p blastbox-sandbox --` on the inner argv (both the nsjail and bwrap
+# backends do this). Until #160 the repo demanded this profile by default and shipped no file
+# for it, so every host reported `apparmor_missing` and, once that became a real insecurity
+# reason, had no selectable inner backend at all.
+#
+# Load:  sudo cp blastbox-sandbox /etc/apparmor.d/
+#        sudo apparmor_parser -r -W /etc/apparmor.d/blastbox-sandbox
+#        grep '^blastbox-sandbox ' /sys/kernel/security/apparmor/profiles   # name AND mode
+#
+# WHAT THIS PROFILE IS FOR, AND WHAT IT IS NOT.
+#
+# It is NOT a filesystem allowlist. The jail already is one: the workload sees only what the
+# backend bind-mounts (a read-only /usr, a tmpfs /tmp, the job's own input and output), and
+# those paths are per-job and not knowable here. Writing a narrow path policy in this file
+# would be a policy about paths the workload cannot reach anyway, and it would deny
+# `/usr/bin/true` — which `select_sandbox` runs as its backend smoketest, so a profile too
+# narrow for it takes the whole backend down.
+#
+# It exists to mediate what the jail cannot. Attaching a profile makes the nsjail backend pass
+# `--proc_rw` (aa-exec transitions by writing /proc/self/attr/exec, which is EROFS under
+# nsjail's default read-only /proc), and that flag makes more of /proc writable than
+# /proc/self/attr alone — measured with open(O_WRONLY) inside the real argv at uid 65534:
+# /proc/self/mem, clear_refs, coredump_filter, oom_score_adj, {uid,gid}_map and
+# /proc/1/oom_score_adj all become writable. /proc/self/mem is the one that matters: a payload
+# can rewrite its own read-only and executable mappings without mprotect. The deny rules below
+# are what takes that surface back, which is why the flag is only ever attached together with
+# a profile.
+profile blastbox-sandbox flags=(attach_disconnected,mediate_deleted) {
+  include <abstractions/base>
+
+  # The jail decides WHAT is visible; this profile does not re-decide it. `ix` keeps the
+  # workload's own children under this same profile — a payload cannot shed it by exec'ing.
+  / r,
+  /** rwlkmix,
+
+  # ---- the /proc surface --proc_rw opens -------------------------------------------------
+  #
+  # `**`, NOT `*`. AppArmor's `*` does not cross a `/`: `deny /proc/*/mem` compiles to
+  # `/proc/[^/]+/mem` and therefore does NOT cover `/proc/self/task/<tid>/mem`, which is a
+  # real directory entry offering the same address-space write interface -- and which the
+  # blanket `/** rwlkmix,` above then allows. Measured: through that path a child under the
+  # first version of this profile wrote 8 bytes into a PROT_READ page and read them back.
+  # So the profile shipped with this PR would have left the child STRICTLY LESS confined than
+  # a child with no profile at all, which keeps a read-only /proc and no --proc_rw
+  # (claude-security lens, round 2 of #177). Every /proc deny below crosses `/` for that
+  # reason; tests/deploy/test_apparmor_profiles.py checks the COMPILED expressions, not this
+  # text, because the text is what looked right the first time.
+  deny /proc/**/mem rwklx,
+  deny /proc/**/clear_refs w,
+  deny /proc/**/coredump_filter w,
+  deny /proc/**/oom_score_adj w,
+  deny /proc/**/uid_map w,
+  deny /proc/**/gid_map w,
+  deny /proc/**/setgroups w,
+  deny /proc/**/timerslack_ns w,
+  deny /proc/sys/** w,
+  deny /proc/sysrq-trigger w,
+
+  # Re-entering the attr interface is how a confined task asks for a different profile. A
+  # profile with no change_profile rules already refuses; say it, and audit the attempt.
+  # (Per-thread attr lives under /proc/<pid>/task/<tid>/attr/, hence `**` here too.)
+  audit deny /proc/**/attr/{current,exec,prev} w,
+  audit deny change_profile,
+
+  # ---- capabilities and operations a detonation never needs ------------------------------
+  audit deny ptrace,
+  audit deny mount,
+  audit deny umount,
+  audit deny pivot_root,
+  audit deny capability sys_admin,
+  audit deny capability sys_module,
+  audit deny capability sys_ptrace,
+  audit deny capability sys_rawio,
+  audit deny capability sys_boot,
+  audit deny capability mac_admin,
+  audit deny capability mac_override,
+
+  # The backend governs egress (a sealed netns, or a rooter-routed one). Raw and packet
+  # sockets are neither, and are a forgery surface for anything that does get a route.
+  #
+  # PER FAMILY, not a bare `raw`. In AppArmor's network grammar `raw` is a socket TYPE, so
+  # `audit deny network raw,` denies SOCK_RAW in EVERY family -- including AF_NETLINK, which
+  # is what glibc opens for getaddrinfo(AI_ADDRCONFIG), getifaddrs() and if_nameindex(). It
+  # silently swallowed the `network netlink raw,` allow three lines below: compiling this
+  # profile with that allow deleted produced a byte-identical policy, so the allow was dead
+  # and every DNS lookup in the workload would have taken an audit denial
+  # (claude-code-review lens, round 2 of #177).
+  audit deny network inet raw,
+  audit deny network inet6 raw,
+  audit deny network packet,
+  network inet stream,
+  network inet6 stream,
+  network inet dgram,
+  network inet6 dgram,
+  network unix,
+  network netlink raw,
+}

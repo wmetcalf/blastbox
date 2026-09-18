@@ -22,23 +22,40 @@ Security guarantees on every :meth:`run` call:
 
 * ``seccomp_policy_missing`` — the KAFEL policy file was not found in any
   of the standard search locations; nsjail will run without syscall filtering.
+* ``apparmor_missing`` — no ``aa-exec`` helper, or the profile is not enforcing right
+  now, so no MAC profile is attached to the child. Symmetric with bwrap, which has
+  always reported this; nsjail used to gate it on a probe for an nsjail flag that does
+  not exist, so it reported nothing at all (#160).
+* ``binary_missing`` — the nsjail binary itself was not found.
 
-Any single reason makes ``secure == False``.
+Any single reason makes ``secure == False`` — including ``apparmor_missing``, which means a
+host with no ``blastbox-sandbox`` profile loaded is skipped by ``select_sandbox`` unless
+``BLASTBOX_WARN_ON_INSECURE=1``. See ``deploy/apparmor/README.md``.
 """
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import signal
 import subprocess
 from pathlib import Path
 
 from blastbox.errors import SandboxError, SandboxUnavailable
-from blastbox.worker.sandbox.apparmor import profile_loaded, resolve_profile
+from blastbox.worker.sandbox.apparmor import (
+    AppArmorProofMixin,
+    find_aa_exec as _find_aa_exec,
+    profile_loaded,
+    resolve_profile,
+)
 from blastbox.worker.sandbox.base import SandboxRequest, SandboxResult, kill_sandbox_group
 
 
 _log = logging.getLogger("blastbox.worker.sandbox.nsjail")
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
 
 _NSJAIL = shutil.which("nsjail") or "/usr/local/bin/nsjail"
 
@@ -90,25 +107,41 @@ def _find_seccomp_policy() -> Path | None:
     return None
 
 
-def _probe_nsjail_proc_apparmor(nsjail_path: str) -> bool:
-    """Return True if this nsjail binary supports ``--proc_apparmor``."""
+
+
+def _supports_proc_rw(nsjail_path: str) -> bool:
+    """Whether the INSTALLED nsjail accepts ``--proc_rw``.
+
+    aa-exec cannot transition without it (nsjail's default read-only /proc turns the write
+    to /proc/self/attr/exec into EROFS), so attaching the prefix to a build that rejects the
+    flag does not weaken confinement -- it kills every job with `Unknown argument`. Worse,
+    the failure looks exactly like a profile that denies the probe binary, so the operator is
+    sent to edit a profile that is correct (claude-code-review lens, #177).
+
+    Probing a flag that DOES exist upstream is not the mistake this module is recovering
+    from: the dead ``--proc_apparmor`` probe was wrong because the flag it looked for never
+    existed anywhere, so the answer was always False and the branch was dead. This one is
+    checked against the binary actually installed, and a False answer changes behaviour
+    (skip the attachment, report `apparmor_missing`) rather than silently doing nothing.
+    """
     try:
-        r = subprocess.run(
-            [nsjail_path, "--help"],
-            capture_output=True,
-            text=True,
-            timeout=5,
+        out = subprocess.run(
+            [nsjail_path, "--help"], capture_output=True, text=True, timeout=10,
         )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+    except (OSError, subprocess.SubprocessError):
+        # Unreadable capability = not confirmed. Fail SAFE (no attachment, reported),
+        # never fail-open into an argv that cannot run.
         return False
-    return "--proc_apparmor" in r.stdout or "--proc_apparmor" in r.stderr
+    return "--proc_rw" in (out.stdout + out.stderr)
 
 
-class NsjailSandbox:
+class NsjailSandbox(AppArmorProofMixin):
     """Sandbox backend that wraps the ``nsjail`` binary.
 
-    Construction probes for the KAFEL policy file and AppArmor support,
-    and records any deficiencies in :attr:`insecurity_reasons`.  No
+    Construction probes for the KAFEL policy file and the ``aa-exec`` helper, and records
+    any deficiencies in :attr:`insecurity_reasons`. The AppArmor profile's MODE is NOT a
+    construction-time fact -- an operator can unload it under a running worker -- so it is
+    re-read per launch (see :meth:`_apparmor_enforcing_now`).  No
     exception is raised — callers inspect :attr:`secure` and
     :attr:`insecurity_reasons` to decide whether to proceed.
 
@@ -117,7 +150,7 @@ class NsjailSandbox:
     nsjail_path:
         Path to the ``nsjail`` binary.  Defaults to ``shutil.which("nsjail")``.
     apparmor_profile:
-        AppArmor profile name to attach via ``--proc_apparmor`` (if supported).
+        AppArmor profile name to attach to the child via ``aa-exec``.
     seccomp_policy:
         Explicit path to the KAFEL policy file.  If ``None``, the standard
         candidate paths are tried in order.
@@ -150,7 +183,43 @@ class NsjailSandbox:
         else:
             self._seccomp_policy = _find_seccomp_policy()
 
-        self._proc_apparmor_supported = _probe_nsjail_proc_apparmor(self._nsjail)
+        # Initialised before anything can call _apparmor_enforcing_now() (the log block
+        # below does): it only remembers the last answer so a change logs once.
+        self._apparmor_last_seen: bool | None = None
+
+        # BEFORE the first apparmor_active read. That property is not a plain accessor: on
+        # the asserted path it launches a jail to measure the profile and caches the result
+        # here, and both constructors read it while deciding what to log -- so uninitialised
+        # state crashed construction outright on any host with BLASTBOX_APPARMOR_PROFILES set
+        # (found by running it).
+        self._aa_exec: str | None = _find_aa_exec()
+        # A LOCAL, not an attribute: read once, on the next statement, and nothing else in the
+        # repo touched it. A per-instance field that reads like a live capability flag but is
+        # construction-time scratch is one more plausible answer to "which field says whether a
+        # profile is attached?" -- a question that already had four (claude-code-review lens,
+        # round 4 of #177). The durable fact is _apparmor_blocked_reason.
+        proc_rw_supported = (
+            self._binary_present and _supports_proc_rw(nsjail_path)
+            if self._aa_exec is not None
+            else False
+        )
+        # A THIRD cause for apparmor_missing, kept distinct from the other two. Clearing
+        # `_aa_exec` made the log block below announce `reason=aa_exec_not_found` -- the helper
+        # was found -- and made the selector's remedy tell the operator to load a profile that
+        # is already loaded and enforcing, which is the very defect the remedy was added to fix
+        # (claude-code-review lens, round 2 of #177).
+        self._apparmor_blocked_reason: str | None = None
+        if self._aa_exec is not None and self._binary_present and not proc_rw_supported:
+            self._apparmor_blocked_reason = (
+                f"the installed nsjail at {nsjail_path} has no --proc_rw, so aa-exec would "
+                f"fail with EROFS; no profile can be attached with this build"
+            )
+            _log.warning(
+                "nsjail_apparmor_unavailable reason=installed_nsjail_has_no_--proc_rw "
+                "path=%s note=aa_exec_would_fail_with_EROFS_so_no_profile_is_attached",
+                nsjail_path,
+            )
+            self._aa_exec = None
 
         if self._seccomp_policy is None:
             _log.warning(
@@ -163,15 +232,29 @@ class NsjailSandbox:
                 str(self._seccomp_policy),
             )
 
-        if not self._proc_apparmor_supported:
+        # Log what will ACTUALLY happen, not what the binaries make possible. Branching on
+        # the helper alone announced `attach_enabled` on every host with apparmor-utils
+        # installed and no profile loaded -- while bwrap, from identical state, logged
+        # `attach_skipped ... run_proceeds_without_apparmor` at WARNING. That is the same
+        # two-backends-disagree-about-their-own-hardening asymmetry #160 exists to remove,
+        # one layer down, with the accurate line at the level that does NOT reach an alerting
+        # pipeline (claude-code-review lens, #177).
+        if self._apparmor_blocked_reason is not None:
+            pass                    # already logged above, with the real cause
+        elif self._aa_exec is None:
             _log.warning(
-                "nsjail_proc_apparmor_skipped reason=unsupported_by_installed_nsjail"
+                "nsjail_apparmor_skipped reason=aa_exec_not_found "
+                "note=child_runs_without_an_apparmor_profile"
             )
-
-        # The profile's MODE is read per launch, not cached here -- see
-        # _apparmor_enforcing_now(). This only remembers the last answer so a change can be
-        # logged once instead of every job.
-        self._apparmor_last_seen: bool | None = None
+        elif not self._apparmor_enforcing_now():
+            _log.warning(
+                "nsjail_apparmor_attach_skipped reason=profile_not_confirmed_enforcing "
+                "profile=%s note=run_proceeds_without_apparmor",
+                self._apparmor_profile,
+            )
+        else:
+            _log.info("nsjail_apparmor_attach_enabled aa_exec=%s profile=%s",
+                      self._aa_exec, self._apparmor_profile)
 
         self._static_insecurity_reasons: list[str] = []
         if not self._binary_present:
@@ -179,13 +262,48 @@ class NsjailSandbox:
         if self._seccomp_policy is None:
             self._static_insecurity_reasons.append("seccomp_policy_missing")
 
+        # What confinement looked like when the selector admitted this backend. A LOSS
+        # of it later is a refusal (see _refuse_if_confinement_regressed); never having
+        # had it is not.
+        # An ASSERTED profile is not a confirmed one -- see apparmor_active, which measures it
+        # from inside the jail rather than believing it, on a TTL rather than once.
+        # It is deliberately NOT measured from this constructor. That property is not a plain accessor: on the asserted path
+        # it builds an argv and launches a jail, which needs constructor state that does not
+        # exist yet -- calling it from __init__ crashed construction outright (found by running
+        # it). The cheap facts are enough to log an intention; the measurement happens on the
+        # first real read, which is the selector's security check, still before any job.
+        # None = not recorded yet, and deliberately NOT measured here: the measurement can
+        # launch a jail (an asserted profile is proved, not believed), which a constructor
+        # cannot do -- it crashed construction outright on a host with BLASTBOX_APPARMOR_PROFILES
+        # set. `note_admitted()` records it when the selector admits this backend; a backend
+        # built directly by an engine and never passed through `select_sandbox` takes its
+        # baseline from its first launch instead.
+        # The CHEAP facts, which are all a constructor may consult: the helper exists and the
+        # profile reads as enforcing. Not apparmor_active -- that measures an asserted profile
+        # by launching a jail, needs state this constructor has not built yet, and crashed
+        # construction outright on a host with BLASTBOX_APPARMOR_PROFILES set (found by running
+        # it). `note_admitted()` refines this at the moment the selector admits the backend,
+        # which is the admission that actually matters.
+        # None until something measures it. NOT `_apparmor_enforcing_now()`: on the asserted
+        # path that is just the environment variable, while the guard compares it against
+        # apparmor_active, which is PROOF-level -- two yardsticks, so a profile that the proof
+        # disproved looked like confinement that had been "lost", the guard refused every job,
+        # and selection fell through to `container`. One yardstick: `note_admitted()` records
+        # what the selector observed, and a backend nobody admitted takes its baseline from its
+        # first launch (claude-code-review lens, round 4 of #177).
+        self._armed_at_admission: bool | None = None
+
         _log.info(
             "NsjailSandbox initialised",
             extra={
                 "seccomp_policy": str(self._seccomp_policy),
-                "proc_apparmor": self._proc_apparmor_supported,
-                "proc_apparmor_attached": self.apparmor_active,
-                "insecurity_reasons": self.insecurity_reasons,
+                "aa_exec": self._aa_exec,
+                # The STATIC reasons only. `insecurity_reasons` derives the AppArmor one from
+                # apparmor_active, which measures an asserted profile by launching a jail --
+                # not something a constructor can do, and not something a log line should
+                # trigger. The live answer is what the selector reads a moment later.
+                "apparmor_helper": self._aa_exec,
+                "static_insecurity_reasons": list(self._static_insecurity_reasons),
             },
         )
 
@@ -232,9 +350,18 @@ class NsjailSandbox:
         switched to complain mid-life is visible here instead of nowhere at all.
         """
         reasons = list(self._static_insecurity_reasons)
-        # SAY SO. Skipping the confinement quietly would report a sandbox as secure while the
-        # child runs unconfined -- the same reason bwrap records this.
-        if self._proc_apparmor_supported and not self._apparmor_enforcing_now():
+        # SAY SO. Skipping the confinement quietly would report a sandbox as secure while
+        # the child runs unconfined -- the same reason bwrap records this. The old
+        # condition gated this on a probe for a flag that does not exist, so it was
+        # ALWAYS False: nsjail reported secure=True with no confinement mechanism at all
+        # while bwrap, in the identical situation, correctly reported itself insecure.
+        # Two backends, opposite answers, and the silent one had nothing.
+        # ONE source of truth: apparmor_active. It is the property that decides the argv and
+        # the guard, and it is where an ASSERTED profile gets measured -- so computing this
+        # reason separately meant a disproved assertion produced no reason at all while the
+        # attachment was (correctly) dropped: secure=True with no confinement, the exact shape
+        # of the defect #160 exists to remove (codex, #177).
+        if not self.apparmor_active:
             reasons.append("apparmor_missing")
         return reasons
 
@@ -242,18 +369,6 @@ class NsjailSandbox:
     def seccomp_active(self) -> bool:
         return self._seccomp_policy is not None
 
-    @property
-    def apparmor_active(self) -> bool:
-        """Whether a profile is ACTUALLY attached, not merely whether nsjail could attach one.
-
-        Returning the probe alone told callers and diagnostics that confinement was active
-        while `_build_argv` was omitting the flag because the profile is not loaded (codex,
-        #159).
-        """
-        return self._proc_apparmor_supported and self._apparmor_enforcing_now()
-
-    # ------------------------------------------------------------------
-    # Public interface
 
     def run(self, request: SandboxRequest) -> SandboxResult:
         """Run ``request.argv`` inside an nsjail one-shot sandbox.
@@ -272,8 +387,15 @@ class NsjailSandbox:
             raise SandboxError("argv must be a non-empty list of strings")
         if not self._binary_present:
             raise SandboxUnavailable(f"nsjail not found at {self._nsjail!r}")
+        # ONE read of securityfs for this launch, shared by the guard and the argv. They
+        # used to read it independently, so a profile that stopped being confirmable between
+        # the two produced exactly what the guard exists to prevent -- an unconfined argv on
+        # a backend admitted as confined -- with no refusal and no error
+        # (claude-security lens, round 2 of #177).
+        attached = self.apparmor_active
+        self._refuse_if_confinement_regressed(attached)
 
-        argv = self._build_argv(request)
+        argv = self._build_argv(request, attach_apparmor=attached)
         killed = False
 
         try:
@@ -324,7 +446,9 @@ class NsjailSandbox:
     # ------------------------------------------------------------------
     # Internal
 
-    def _build_argv(self, req: SandboxRequest) -> list[str]:
+    def _build_argv(
+        self, req: SandboxRequest, *, attach_apparmor: bool | None = None
+    ) -> list[str]:
         """Build the full nsjail argument vector for ``req``.
 
         All mount source/target paths are encoded as ``src:tgt`` in value
@@ -391,18 +515,66 @@ class NsjailSandbox:
         if self._seccomp_policy is not None:
             argv += ["--seccomp_policy", str(self._seccomp_policy)]
 
-        # AppArmor profile via nsjail's in-kernel AA_CHANGE_ONEXEC path.
+        # AppArmor: prefix the INNER argv with ``aa-exec -p <profile> --``, exactly as the
+        # bwrap backend does. nsjail has no apparmor flag of its own (see _find_aa_exec),
+        # and aa-exec is a userspace helper that needs nothing from it.
         #
-        # ONLY when the profile is confirmed loaded. AA_CHANGE_ONEXEC against an unloaded
-        # profile FAILS THE EXEC -- so attaching it unconditionally does not weaken the
-        # sandbox, it breaks every run. And the default names `blastbox-sandbox`, which this
-        # repository does not ship (issue #158), so the flag was being attached for a profile
-        # that is absent by default on any host whose nsjail advertises support.
+        # ONLY when the profile is confirmed ENFORCING. aa-exec against an unloaded profile
+        # fails the execve, which would break every run — so an unconfirmed profile means
+        # skip it and report `apparmor_missing`, keeping the sandbox working but honest
+        # about being less hardened.
         #
-        # bwrap has always checked before using aa-exec, for exactly this reason; nsjail did
-        # not. Same question, same consequence, now the same check.
-        if self._proc_apparmor_supported and self._apparmor_enforcing_now():
-            argv += ["--proc_apparmor", self._apparmor_profile]
+        # Evaluated ONCE: the flag below and the argv prefix must agree. Two separate reads
+        # of securityfs can disagree (the profile is re-read per launch, by design), and
+        # either half alone is a broken run -- `--proc_rw` with no aa-exec needlessly
+        # loosens /proc, aa-exec with no `--proc_rw` fails every execve (see below).
+        # `attach_apparmor` is run()'s single answer for this launch; None means "decide
+        # here", for the direct callers (tests, diagnostics) that have no launch context.
+        aa_exec = self._aa_exec
+        if aa_exec is not None:
+            decided = self.apparmor_active if attach_apparmor is None else attach_apparmor
+            if not decided:
+                aa_exec = None
 
-        argv += ["--", *req.argv]
+        # `--proc_rw` is REQUIRED for aa-exec, and is why the userspace route was written off
+        # as impossible for nsjail (deploy/apparmor/README.md, #160). aa-exec performs the
+        # transition by writing /proc/self/attr/exec; nsjail mounts /proc read-only by
+        # default, so that write returns EROFS and the execve fails -- every job, not just
+        # the confinement. Measured inside this argv on an AppArmor 4.x host:
+        #
+        #   default    open('/proc/self/attr/exec', O_WRONLY) -> EROFS
+        #              aa-exec: ERROR: Read-only file system   (rc=1, nothing runs)
+        #   --proc_rw  the open succeeds; the child reports the profile the argv asked for
+        #
+        # WHAT IT COSTS -- corrected, because the first measurement written here was wrong.
+        # It probed with `echo x > $f`, which fails with EINVAL on files that reject the
+        # content, and that was misread as "blocked"; the comment then claimed only
+        # /proc/self/attr became writable. Re-probed with open(O_WRONLY), which cannot lie
+        # about the errno, the real answer at uid 65534 in this jail is:
+        #
+        #   writable with --proc_rw: /proc/self/attr/*, /proc/self/mem, /proc/self/clear_refs,
+        #     /proc/self/coredump_filter, /proc/self/oom_score_adj, /proc/1/oom_score_adj,
+        #     /proc/self/{uid,gid}_map, /proc/self/timerslack_ns   (all EROFS without it)
+        #   still refused either way: /proc/sys/** and /proc/sysrq-trigger (EACCES -- a
+        #     different gate, ownership and the user namespace, not the mount flag)
+        #
+        # /proc/self/mem is the one that matters: a payload can rewrite its own read-only and
+        # executable mappings without mprotect. Cross-process /proc/<pid>/mem is still gated
+        # by ptrace_scope, so this is a widened surface inside the jail, not an escape from
+        # it -- but it IS wider than the pre-#160 child had, and the comment that said
+        # otherwise is exactly the kind of confident-and-disproved claim this repo keeps
+        # finding (claude-security lens, #177).
+        #
+        # The trade only closes because the two travel together: the flag is attached ONLY
+        # when an enforcing child profile is attached with it, and AppArmor mediates these
+        # paths, so the profile is what takes the surface back (deploy/apparmor/README.md
+        # lists the deny rules every child profile should carry). No profile => no --proc_rw
+        # => the child keeps the read-only /proc it always had.
+        if aa_exec is not None:
+            argv.append("--proc_rw")
+
+        inner = list(req.argv)
+        if aa_exec is not None:
+            inner = [aa_exec, "-p", self._apparmor_profile, "--", *inner]
+        argv += ["--", *inner]
         return argv

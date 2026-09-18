@@ -57,6 +57,28 @@ redundant, and (for nono) Landlock isn't even available under runsc (below).
     (`deploy/apparmor/blastbox-{bwrap,nsjail}` — they grant `userns` to *only* those two binaries,
     leaving the host-wide restriction in force; see `deploy/apparmor/README.md`). Do **not** use
     `sysctl …unprivileged_userns=0` — that lowers the control host-wide.
+  - **The CHILD profile is a separate thing, and it now gates selection.** The two profiles
+    above let the sandbox *binaries* create a userns; `blastbox-sandbox` is the profile applied
+    to the detonated child. Without it loaded, `nsjail` and `bwrap` both report
+    `apparmor_missing` and are **skipped** by `select_sandbox` — nsjail included, which used to
+    be silently exempt because it gated the reason on a flag nsjail never had (#160). So load
+    it with the others:
+
+    ```sh
+    sudo cp deploy/apparmor/blastbox-sandbox /etc/apparmor.d/
+    sudo apparmor_parser -r -W /etc/apparmor.d/blastbox-sandbox
+    grep '^blastbox-sandbox ' /sys/kernel/security/apparmor/profiles   # name AND mode
+    ```
+
+    It is shipped in this repo (it was not, before #160, which is what made the requirement
+    unsatisfiable). Read `deploy/apparmor/README.md` before adapting it: attaching a profile is
+    also what makes nsjail pass `--proc_rw`, and the profile's deny rules are the mitigation for
+    the `/proc` surface that opens. The alternative is accepting the gap knowingly with
+    `BLASTBOX_WARN_ON_INSECURE=1`; the "no sandbox backend available" message names both.
+
+    Dispatcher-launched workers under `runsc` carry that variable already (both launchers —
+    `host/runtime/docker.py` and the warm/snapshot tier), so this bites bare-metal and
+    directly-invoked workers first.
 - **Host with gVisor** → `runsc` (the secure default; `runc` is fail-closed-refused unless
   `BLASTBOX_ALLOW_RUNC=1`). Inner sandbox = `container`.
 - **Host with KVM** → `firecracker` — the strongest boundary (hardware VM, no guest NIC).

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import pytest
 from functools import lru_cache
 from pathlib import Path
 
@@ -104,3 +105,31 @@ def bwrap_usable() -> str | None:
             f"(exit={r.returncode}, stderr={r.stderr.decode(errors='replace')[:200]!r})"
         )
     return None
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_apparmor_env(monkeypatch):
+    """The AppArmor environment is HOST state, and these tests must not read it.
+
+    `apparmor_active` consults `profile_evidence()`, which reads the real
+    `BLASTBOX_APPARMOR_PROFILES` and the real securityfs. Tests that patch only
+    `profile_loaded` or `_apparmor_enforcing_now` were therefore passing because the variable
+    happens to be unset here: evidence came back NONE and the whole ASSERTED path -- the proof
+    probe, the TTL cache, the exact-name match, i.e. the subject of #177 -- was never entered.
+    Exporting the variable the way docs/CONFIGURATION.md tells operators to made ELEVEN of them
+    fail (claude-code-review lens, round 5 of #177).
+
+    So the default is hermetic: no assertion, no profile name. A test that wants the asserted
+    path sets it explicitly and patches `apparmor.profile_evidence`, which is the seam that
+    decides.
+
+    This fixture is now BELT AND BRACES, not the fix. It was, briefly: deleting the variable made
+    twelve tests pass that fail with it set, which hid them rather than fixing them (lens, round 6
+    of #177). Each of those has since been pinned at the seam it actually depends on -- the
+    evidence, not just the profile -- and the suite passes with the variable exported and this
+    fixture removed. The CI `sandbox` job runs it both ways to keep that true.
+    """
+    monkeypatch.delenv("BLASTBOX_APPARMOR_PROFILES", raising=False)
+    monkeypatch.delenv("BLASTBOX_APPARMOR_PROFILE", raising=False)
+
+

@@ -96,6 +96,61 @@ jobs:
           # what the tests need.
           bwrap --unshare-all --unshare-user --uid 0 --ro-bind / / -- /bin/true
           echo "bwrap userns+netns OK"
+          # The CHILD profile specifically. The loop above loads it because it matches the
+          # glob, but nothing so far PROVES the backends see it -- and without it every
+          # assertion about attaching a profile is a mock talking to a mock, while
+          # select_sandbox refuses both namespace backends for `apparmor_missing`. Gate on
+          # the mode, then on what the product does with it.
+          sudo grep -E '^blastbox-sandbox \(enforce\)$' /sys/kernel/security/apparmor/profiles
+      - name: The backends actually attach the shipped child profile (not a mock)
+        # Every unit test for the attach path monkeypatches _find_aa_exec and
+        # _apparmor_enforcing_now, because a developer host rarely has the profile loaded.
+        # This runner does. So run the real constructor, the real argv builder and a real
+        # detonation, and require the child to come back reporting the profile -- the one
+        # assertion in this repo that the whole #160 mechanism works end to end.
+        env:
+          # The step above verified the profile's NAME AND MODE with `sudo grep`. This step
+          # runs as the unprivileged runner user, on purpose -- a worker is not root -- and
+          # /sys/kernel/security/apparmor/profiles is root-only, so `profile_loaded()` cannot
+          # read it and answers False. That is exactly the case BLASTBOX_APPARMOR_PROFILES
+          # exists for (docs/CONFIGURATION.md), and it is an assertion, not proof.
+          #
+          # The proof is below and needs no trust: /proc/self/attr/current, read from INSIDE
+          # the jail, is the kernel naming the profile AND its mode. If the assertion were a
+          # lie, the child would report something else and this step fails.
+          BLASTBOX_APPARMOR_PROFILES: blastbox-sandbox
+        run: |
+          set -o pipefail
+          .venv/bin/python - <<'PY'
+          import sys
+          from blastbox.worker.sandbox.base import SandboxRequest
+          from blastbox.worker.sandbox.nsjail import NsjailSandbox
+          from blastbox.worker.sandbox.bwrap import BubblewrapSandbox
+
+          failures = []
+          for sb in (NsjailSandbox(), BubblewrapSandbox()):
+              if not sb.apparmor_active:
+                  failures.append(f"{sb.name}: did not arm: {sb.insecurity_reasons}")
+                  continue
+              argv = sb._build_argv(SandboxRequest(argv=["/usr/bin/true"]))
+              if "aa-exec" not in " ".join(argv):
+                  failures.append(f"{sb.name}: armed but attaches nothing")
+              res = sb.run(SandboxRequest(
+                  argv=["/bin/sh", "-c", "cat /proc/self/attr/current"]))
+              got = res.stdout.decode().strip()
+              print(f"{sb.name}: rc={res.exit_code} child profile={got!r}")
+              if res.exit_code != 0:
+                  failures.append(f"{sb.name}: rc={res.exit_code} {res.stderr[-300:]!r}")
+              elif not got.startswith("blastbox-sandbox"):
+                  failures.append(f"{sb.name}: child reports {got!r}, not the attached profile")
+              elif "(enforce)" not in got and "(kill)" not in got:
+                  # The kernel's own word on the MODE, from inside the jail. complain-mode
+                  # confinement logs and allows, and is not confinement.
+                  failures.append(f"{sb.name}: child profile is not enforcing: {got!r}")
+          if failures:
+              print("::error::" + " | ".join(failures))
+              sys.exit(1)
+          PY
       - name: Pytest (sandbox backends, with nsjail + bwrap present)
         # -rs so the log SAYS which tests skip and why, and then REFUSE any skip that means a
         # backend was not exercised. This job exists to run these tests; a run where they
@@ -106,8 +161,47 @@ jobs:
         run: |
           set -o pipefail
           .venv/bin/pytest -q -rs tests/worker/sandbox/ | tee /tmp/sandbox.txt
-          if grep -E "SKIPPED.*(not installed|not usable|probe failed)" /tmp/sandbox.txt; then
+          if grep -E "SKIPPED.*(not installed|not usable|probe failed|no --proc_rw|AppArmor not enabled|no file reader|did not arm)" /tmp/sandbox.txt; then
             echo "::error::a sandbox backend was not exercised -- see the skips above" >&2
+            exit 1
+          fi
+          # The END-TO-END test by name. The pattern above is a denylist of known skip reasons,
+          # and the skips this job most needs to refuse are the ones a FUTURE change introduces:
+          # the one test that runs the real product argv and requires the child to report the
+          # attached profile can skip for "this nsjail build has no --proc_rw" or "AppArmor not
+          # enabled", and the job would have gone green having never proven the #160 mechanism
+          # at all (claude-code-review lens, round 5 of #177). Require it to have RUN.
+          .venv/bin/pytest -q -rA \
+            tests/worker/sandbox/test_nsjail.py::test_the_product_argv_really_transitions_the_child \
+            | tee /tmp/e2e.txt
+          grep -qE "^PASSED" /tmp/e2e.txt || {
+            echo "::error::the end-to-end AppArmor transition test did not run" >&2; exit 1; }
+      - name: Pytest (sandbox backends, with the operator's AppArmor assertion set)
+        # The SAME suite with BLASTBOX_APPARMOR_PROFILES exported, because that is the documented
+        # production posture for a non-root worker (docs/CONFIGURATION.md) and it takes a
+        # DIFFERENT code path: `profile_evidence` answers ASSERTED, so the in-jail proof, the TTL
+        # cache and the exact-name match -- the subject of #160/#177 -- actually execute. Without
+        # this step, no run of the suite anywhere entered that path, and twelve tests were passing
+        # only because the variable happens to be unset on developer hosts and runners.
+        env:
+          BLASTBOX_APPARMOR_PROFILES: blastbox-sandbox
+        run: |
+          set -o pipefail
+          .venv/bin/pytest -q -rs tests/worker/sandbox/ | tee /tmp/asserted.txt
+          if grep -E "SKIPPED.*(not installed|not usable|probe failed)" /tmp/asserted.txt; then
+            echo "::error::a sandbox backend was not exercised on the asserted path" >&2
+            exit 1
+          fi
+      - name: Pytest (shipped AppArmor profiles compile)
+        # tests/deploy/ runs in the `test` job with no -rs and no tripwire, so the two tests that
+        # compile every shipped profile would vanish without a trace if the runner image ever
+        # dropped apparmor-utils -- and a syntax error in the child profile would then reach an
+        # operator instead of CI (claude-code-review lens, round 5 of #177).
+        run: |
+          set -o pipefail
+          .venv/bin/pytest -q -rs tests/deploy/ | tee /tmp/deploy.txt
+          if grep -E "SKIPPED.*apparmor_parser not installed" /tmp/deploy.txt; then
+            echo "::error::the shipped profiles were never compiled" >&2
             exit 1
           fi
 

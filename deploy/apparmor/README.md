@@ -105,20 +105,32 @@ nsjail child -> <binary-profile> (unconfined)
 bwrap  child -> <binary-profile> (unconfined)
 ```
 
-bwrap says so: `apparmor_missing` appears in `insecurity_reasons` and the backend is not `secure`.
-nsjail does not, and the asymmetry is deliberate rather than an oversight — it only evaluates the
-profile when the installed nsjail advertises `--proc_apparmor`, which no upstream build does, so on
-a stock nsjail a complain, unconfined, or entirely absent profile produces **no reason at all**.
-Whether that should change is [#160](https://github.com/wmetcalf/blastbox/issues/160); it is not a
-free fix, because nsjail is first in the auto-selection order and making it permanently non-`secure`
-would silently move every deployment to another backend.
+Both backends say so: `apparmor_missing` appears in `insecurity_reasons` and the backend is not
+`secure`. That is new in [#160](https://github.com/wmetcalf/blastbox/issues/160) — nsjail used to
+stay silent, because it evaluated the profile only when the installed nsjail advertised
+`--proc_apparmor`, a flag no upstream build has ever had. The probe was always False, so nsjail
+never attached a profile *and* never reported the lack: a backend with no MAC confinement
+whatsoever reporting `secure = True`, while bwrap in the identical situation reported itself
+insecure. nsjail now attaches the profile through `aa-exec` like bwrap does, and reports
+`apparmor_missing` when it cannot.
+
+Note the consequence for auto-selection, since nsjail is first in the order: on a host with **no
+`blastbox-sandbox` profile loaded**, nsjail is no longer `secure`, so `select_sandbox` skips it
+(and bwrap, for the same reason) unless `BLASTBOX_WARN_ON_INSECURE=1` is set. Load a profile —
+["Attaching a real child profile"](#attaching-a-real-child-profile) below — or set that variable
+knowingly.
 
 | | can a MAC profile be attached to the child? |
 |---|---|
 | **bwrap** | **Yes.** `aa-exec -p <profile> --` is prefixed to the inner argv; `/proc/self/attr/exec` is writable inside, so the transition reaches the kernel. It needs only a profile that exists. |
-| **nsjail** | **Not as shipped.** `--proc_apparmor` does not exist in any upstream nsjail (checked against 3.6 and the installed build), and the userspace route fails with `aa-exec: ERROR: Read-only file system` because nsjail mounts `/proc` read-only. Adding `--proc_rw` does make the transition reach the kernel, with `/proc/sys` still read-only — see [#160](https://github.com/wmetcalf/blastbox/issues/160). |
+| **nsjail** | **Yes, since [#160](https://github.com/wmetcalf/blastbox/issues/160).** `--proc_apparmor` does not exist in any upstream nsjail (checked against 3.6, the installed build, and a code search of the whole tree — `apparmor` appears zero times), so the profile is attached the same way bwrap attaches it: `aa-exec -p <profile> --` on the inner argv. That needs one thing from nsjail — `--proc_rw`. aa-exec transitions by writing `/proc/self/attr/exec`, nsjail mounts `/proc` read-only by default, and the write returns `EROFS`, which fails the **execve** — so the prefix without the flag is not weaker confinement, it is every job dying with `aa-exec: ERROR: Read-only file system`. Both are attached together, and only when the profile is confirmed enforcing. |
 
-So on a default installation the inner sandboxes rest on **namespaces, plus seccomp where its
+`--proc_rw` widens `/proc` for the child by more than `/proc/self/attr` — `/proc/self/mem` among
+them. The measurement and the profile rules that take that surface back are in
+[Attaching a real child profile](#attaching-a-real-child-profile) below; the flag is attached only
+alongside an enforcing profile, never by default.
+
+So without a loaded profile the inner sandboxes rest on **namespaces, plus seccomp where its
 prerequisites are met** — kafel for nsjail, a BPF denylist for bwrap. Neither filter is
 unconditional: bwrap needs `python3-libseccomp` (without it the child runs with no syscall filter
 and the backend records `seccomp_not_implemented`), and nsjail needs its kafel policy file
@@ -139,16 +151,86 @@ sudo apparmor_parser -r -W /etc/apparmor.d/my-parser-profile
 sudo aa-status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["profiles"]["my-parser-profile"])'
 sudo grep "^my-parser-profile " /sys/kernel/security/apparmor/profiles     # -> my-parser-profile (enforce)
 
-export BLASTBOX_SANDBOX=bwrap
 export BLASTBOX_APPARMOR_PROFILE=my-parser-profile
 ```
 
-**Both variables are needed, and the first is the one that is easy to miss.** `select_sandbox` tries
-nsjail before bwrap, and a stock nsjail cannot attach a profile *and* records no `apparmor_missing`
-for it — so on a host with a working nsjail it passes selection, and the profile you carefully
-loaded is simply never applied, silently. Setting `BLASTBOX_SANDBOX=bwrap` picks the backend that
-can actually carry it. (Check the result rather than trusting the recipe: the selected sandbox's
-`apparmor_active` is the attach outcome, not a capability probe.)
+**One variable, since [#160](https://github.com/wmetcalf/blastbox/issues/160).** This used to also
+require `BLASTBOX_SANDBOX=bwrap`, because `select_sandbox` tries nsjail first and a stock nsjail
+could not attach a profile *and* reported no `apparmor_missing` for it — so on a host with a working
+nsjail, the profile you carefully loaded was never applied, silently, and nothing said so. Both
+backends now attach it and both report when they cannot. Still check the result rather than trusting
+the recipe: the selected sandbox's `apparmor_active` is the attach outcome, not a capability probe.
+
+**Your profile must also permit `/usr/bin/true`.** `select_sandbox` smoketests each backend by
+running it, through the full argv — profile included, because a probe that skips the confinement is
+not testing what will actually run. A profile narrow enough to deny the probe's loader and libraries
+fails the smoketest, and the backend is rejected. That is now diagnosed rather than blamed on the
+backend: the rejection re-runs the probe with the profile suspended and, if that passes, says so —
+
+```
+nsjail smoketest fails with AppArmor profile 'my-parser-profile' but passes without it:
+the profile denies the probe /usr/bin/true. Permit it in the profile ... or unload the profile
+```
+
+— but the fix is yours: `/usr/bin/true ix,` plus whatever your base abstraction needs.
+
+### Measured on a real AppArmor 3.0.4 host
+
+Everything below was verified on Ubuntu 22.04.5 (AppArmor parser 3.0.4) by loading this profile
+and launching a child through `aa-exec -p blastbox-sandbox`, the way both backends do. Kernel
+answers, not reasoning:
+
+```
+profile (from /proc/self/attr/current):  blastbox-sandbox (enforce)
+  EACCES  /proc/self/mem
+  EACCES  /proc/self/task/<tid>/mem          <- the alias a single-star glob misses
+  EACCES  /proc/self/clear_refs
+  EACCES  /proc/self/attr/exec
+  EACCES  /proc/self/oom_score_adj
+getaddrinfo("localhost"):  OK               <- netlink still permitted
+```
+
+Both halves were proved, not just the good one. A variant profile carrying the original
+`deny /proc/*/mem` was loaded on the same host, and under it `/proc/self/task/<tid>/mem` came back
+**WRITABLE** — so the glob distinction is real and this profile closes it. And the same file
+declaring `abi <abi/4.0>` does not compile there at all (`Could not open 'abi/4.0'`), which is why
+this one pins 3.0.
+
+**The rules your profile needs, because `--proc_rw` widens /proc.** nsjail is launched with
+`--proc_rw` whenever a profile is attached, and it has to be: aa-exec transitions by writing
+`/proc/self/attr/exec`, and nsjail's default read-only `/proc` turns that into `EROFS`, killing the
+exec rather than weakening it.
+
+Measured inside the real argv at the child's uid (65534, user namespace), with `open(O_WRONLY)` —
+not `echo`, which fails with `EINVAL` on files that reject the content and reads as "blocked":
+
+| path | default | with `--proc_rw` |
+|---|---|---|
+| `/proc/self/attr/*`, `/proc/self/mem`, `/proc/self/clear_refs`, `/proc/self/coredump_filter`, `/proc/self/oom_score_adj`, `/proc/1/oom_score_adj`, `/proc/self/{uid,gid}_map` | `EROFS` | **writable** |
+| `/proc/sys/**`, `/proc/sysrq-trigger` | `EACCES` | `EACCES` (ownership + userns, not the mount flag) |
+
+`/proc/self/mem` is the one that matters: a payload can rewrite its own read-only and executable
+mappings without `mprotect`. Cross-process `/proc/<pid>/mem` is still gated by `ptrace_scope`, so
+this is a wider surface inside the jail, not an escape from it — but it is wider than the child had
+before, and the profile is what takes it back. The flag and the profile travel together by design:
+no profile, no `--proc_rw`, and the child keeps its read-only `/proc`.
+
+So a child profile is not optional hardening here; it is the mitigation for the flag it enables:
+
+```
+deny /proc/*/mem rw,
+deny /proc/*/clear_refs w,
+deny /proc/*/coredump_filter w,
+deny /proc/*/oom_score_adj w,
+deny /proc/*/{uid,gid}_map w,
+deny /proc/*/attr/{current,exec} w,
+audit deny change_profile,
+```
+
+(The `change_profile` line is belt and braces: a transition out of a confined profile is permitted
+only by a rule in the profile being left, so a profile with no `change_profile` rules already
+refuses. Reasoned from AppArmor's semantics, not measured — this repo's CI host has no loadable
+profile.)
 
 `BLASTBOX_APPARMOR_PROFILE` is what a deployed worker needs: the sandbox it uses comes from
 `select_sandbox`, which constructs the backend with no arguments, so passing `apparmor_profile=` to
@@ -157,14 +239,46 @@ argument wins over the variable).
 
 The profile must be loaded in **`enforce`** or **`kill`** mode. `complain` logs and allows,
 `unconfined` confines nothing, and prompt mode (which securityfs prints as `user`) refers the
-decision to an agent outside this system; none of those count as confinement. Under bwrap — and
-under an nsjail patched to support attachment — a profile in one of those modes is reported as
-`apparmor_missing` rather than silently attached. The mode is re-read on every launch, so switching
+decision to an agent outside this system; none of those count as confinement. Under either backend,
+a profile in one of those modes is reported as `apparmor_missing` rather than silently attached. The mode is re-read on every launch, so switching
 a profile to complain under a running worker stops the attachment and shows up in
 `insecurity_reasons` instead of going unnoticed.
 
 Attaching a profile that is **not** loaded is not a degraded mode — it fails the exec and breaks
 every run — which is why the profile is confirmed before it is attached.
+
+**AppArmor 3.x is enough for this one.** `blastbox-sandbox` declares `abi <abi/3.0>`, unlike the per-binary profiles here, which need `abi <abi/4.0>` for their `userns` rule. A 3.x parser (Ubuntu 22.04 LTS) has no `abi/4.0`, and this is the profile a host must load for any inner backend to be `secure` — so it stays loadable there.
+
+**Permit a file reader if you want the assertion checked.** The proof below runs
+`/bin/cat /proc/self/attr/current` inside the jail. A workload profile that permits only its
+parser and `/usr/bin/true` cannot run it — that is reported as *unverified* (a warning naming
+this), not as a disproof, so a correctly configured host is never rejected over a diagnostic.
+Reaching that state is itself evidence of enforcement, which is why `--proc_rw` is still
+attached there: the attach probe succeeded, so the profile exists and permits `/usr/bin/true`, and
+the reader then *failed* — but a complain-mode profile denies nothing, so its reader probe would
+have succeeded and reported `(complain)`, which disarms. An attaching profile that refuses the
+reader is an enforcing one. The residual gap, stated rather than papered over: the reader could
+fail for a reason that is not the profile (the seccomp filter blocking a syscall `cat` needs but
+`true` does not), which is why this state warns instead of reporting the profile as proven.
+
+Permit `/usr/bin/cat` to have the assertion actually checked — the `/usr` path, because on a
+merged-`/usr` host (`/bin` → `usr/bin`) that is what the kernel resolves the exec to and what
+AppArmor matches; a rule written as `/bin/cat` never fires.
+
+**An asserted profile is now proved before anything is traded for it.** Because securityfs is
+root-only, a non-root worker's only route to "the profile is enforcing" is the assertion below —
+and an assertion cannot tell `enforce` from `complain`, while arming on it buys `--proc_rw`. So
+when the evidence is an assertion, the backend runs one probe through the jail and reads
+`/proc/self/attr/current` from inside: the kernel naming the profile *and* its mode, which cannot
+be asserted away. A child that comes back `(complain)`, `unconfined`, or wearing another profile
+disarms the attachment and gets `apparmor_missing` instead. A profile the kernel itself reported is
+not re-probed.
+
+The proof is **re-measured on a 30-second TTL**, not once at startup: where securityfs is
+unreadable the assertion is a static environment variable, so a profile switched to `complain`
+under a running worker would otherwise stay "active" for the life of that worker while nothing
+enforced anything. One extra jail launch per half-minute is noise next to a detonation; what
+matters is that the staleness window is bounded.
 
 ### The `BLASTBOX_APPARMOR_PROFILES` escape hatch (plural)
 
