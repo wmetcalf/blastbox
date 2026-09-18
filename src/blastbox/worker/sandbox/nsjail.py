@@ -607,7 +607,7 @@ class NsjailSandbox:
         self._warned.add(msg)
         _log.warning(msg)
 
-    def note_admitted(self) -> None:
+    def note_admitted(self, *, armed: bool) -> None:
         """Called by the selector on the backend it actually admits.
 
         `_armed_at_admission` was captured in the CONSTRUCTOR, which is not when admission
@@ -615,8 +615,14 @@ class NsjailSandbox:
         security check gets the backend admitted as confined with the flag still False, and
         the regression guard is then inert for the life of that worker (codex, #177). The
         selector knows the real moment; this is it.
+
+        It takes the selector's OWN observation rather than re-reading the kernel. A fresh read
+        here could see confinement that vanished in the microseconds since the security check
+        passed, and would then record False -- admitting a backend the selector judged confined
+        while permanently disabling the guard that protects it, so every later job runs
+        unconfined with nothing to notice (codex, round 3 of #177).
         """
-        self._armed_at_admission = self.apparmor_active
+        self._armed_at_admission = armed
 
     def _refuse_if_confinement_regressed(self, attached: bool | None = None) -> None:
         """A worker outlives its jobs; `secure` is checked once, at selection.

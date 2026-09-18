@@ -687,20 +687,28 @@ def test_admission_is_recorded_when_the_selector_admits_not_at_construction(
     import blastbox.worker.sandbox.detect as detect_mod
 
     class _LateArming:
+        """Absent at construction, enforcing by the time the selector checks security -- so
+        what admission records is the selector's own observation, not either snapshot."""
+
         name = "nsjail"
-        insecurity_reasons: list[str] = []
         secure = True
 
         def __init__(self) -> None:
-            self.apparmor_active = False          # absent at construction ...
+            self.apparmor_active = False
             self._armed_at_admission = False
+            self._reasons = ["apparmor_missing"]
 
-        def note_admitted(self) -> None:
-            self._armed_at_admission = self.apparmor_active
+        @property
+        def insecurity_reasons(self) -> list[str]:
+            return list(self._reasons)
+
+        def note_admitted(self, *, armed: bool) -> None:
+            self._armed_at_admission = armed
 
         def run(self, req):
             from types import SimpleNamespace
-            self.apparmor_active = True            # ... enforcing by the time it is probed
+            self.apparmor_active = True            # the profile arrives during the smoketest
+            self._reasons = []
             return SimpleNamespace(exit_code=0, killed=False, stdout=b"", stderr=b"")
 
     sb = _LateArming()
@@ -746,8 +754,8 @@ class TestBothAdmissionPathsRecordAdmissionOnTheRealBackends:
             apparmor_active = False
             _armed_at_admission = False
 
-            def note_admitted(self) -> None:
-                self._armed_at_admission = self.apparmor_active
+            def note_admitted(self, *, armed: bool) -> None:
+                self._armed_at_admission = armed
 
             def run(self, req):
                 from types import SimpleNamespace
@@ -772,3 +780,41 @@ class TestBothAdmissionPathsRecordAdmissionOnTheRealBackends:
         """`BLASTBOX_SANDBOX` is the documented override and what the pre-#160 recipe told
         operators to set; it had no coverage at all."""
         assert self._armed(monkeypatch, tmp_path, forced=True) is True
+
+
+def test_admission_records_the_selectors_observation_not_a_fresh_read(
+        monkeypatch, tmp_path: Path) -> None:
+    """A fresh kernel read at admission time can see confinement that vanished in the
+    microseconds since the security check passed -- and would then record "never had any",
+    admitting a backend the selector judged CONFINED while permanently disabling the guard that
+    protects it. Every later job then runs unconfined with nothing to notice
+    (codex, round 3 of #177).
+    """
+    import blastbox.worker.sandbox.detect as detect_mod
+
+    class _VanishingProfile:
+        name = "nsjail"
+        secure = True
+        insecurity_reasons: list[str] = []            # the selector sees confinement
+        _armed_at_admission = False
+
+        @property
+        def apparmor_active(self) -> bool:
+            return False                              # ... and it is gone a moment later
+
+        def note_admitted(self, *, armed: bool) -> None:
+            self._armed_at_admission = armed
+
+        def run(self, req):
+            from types import SimpleNamespace
+            return SimpleNamespace(exit_code=0, killed=False, stdout=b"", stderr=b"")
+
+    sb = _VanishingProfile()
+    monkeypatch.delenv("BLASTBOX_SANDBOX", raising=False)
+    monkeypatch.setattr(detect_mod, "_in_container", lambda: False)
+    monkeypatch.setattr(detect_mod, "_make_backend", lambda name, **kw: sb)
+
+    assert select_sandbox(_status_path=_good_status_file(tmp_path)) is sb
+    assert sb._armed_at_admission is True, (
+        "admitted as confined but recorded as never armed -- the guard is now inert"
+    )

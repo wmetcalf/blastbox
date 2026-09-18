@@ -297,9 +297,7 @@ def select_sandbox(
         # against the confinement the selector accepted, and capturing that in __init__ made it
         # inert for a profile that became enforcing between construction and this point
         # (codex, #177).
-        note = getattr(sb, "note_admitted", None)
-        if note is not None:
-            note()
+        _note_admitted(sb, reasons)
         _log.info("sandbox backend selected", extra={"backend": name})
         return sb
 
@@ -307,6 +305,21 @@ def select_sandbox(
     raise SandboxUnavailable(
         "no sandbox backend available: " + "; ".join(rejections) + hint
     )
+
+
+def _note_admitted(sb: Sandbox, reasons: list[str]) -> None:
+    """Tell the backend what THIS selector observed when it admitted it.
+
+    The confinement-regression guard compares later launches against the admission state, so
+    the admission state has to be the selector's own judgement. Letting the backend re-read the
+    kernel here meant confinement that vanished in the microseconds after the security check
+    was recorded as "never had any" -- admitting a backend judged confined while permanently
+    disabling the guard protecting it (codex, round 3 of #177).
+    """
+    note = getattr(sb, "note_admitted", None)
+    if note is None:
+        return
+    note(armed="apparmor_missing" not in reasons)
 
 
 def _apparmor_remedy() -> str:
@@ -374,8 +387,6 @@ def _select_forced(
             extra={"backend": name, "reasons": reasons},
         )
 
-    note = getattr(sb, "note_admitted", None)
-    if note is not None:
-        note()
+    _note_admitted(sb, reasons)
     _log.info("sandbox backend selected (forced)", extra={"backend": name})
     return sb
