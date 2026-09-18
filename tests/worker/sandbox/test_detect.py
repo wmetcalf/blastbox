@@ -656,6 +656,7 @@ def test_the_diagnosis_survives_the_regression_guard_on_a_REAL_backend(monkeypat
     monkeypatch.setattr(nj, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
     monkeypatch.setattr(nj, "_supports_proc_rw", lambda _p: True)
     sb = NsjailSandbox(nsjail_path="/bin/sh")
+    sb.note_admitted(armed=True)          # admitted as confined, which is the premise
     assert sb._armed_at_admission and sb.apparmor_active
 
     def _run(self, req):

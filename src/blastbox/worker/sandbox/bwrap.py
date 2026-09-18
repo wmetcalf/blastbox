@@ -33,45 +33,25 @@ Any single reason makes ``secure == False``.
 """
 from __future__ import annotations
 
-import contextlib
 import logging
 import os
 import resource
 import shutil
 import signal
 import subprocess
-import time
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Callable
 
 from blastbox.errors import SandboxError, SandboxUnavailable
 from blastbox.limits import Limits
 from blastbox.worker.sandbox.apparmor import (
-    ASSERTED,
+    AppArmorProofMixin,
     profile_loaded,
     find_aa_exec as _find_aa_exec,
-    DEFAULT_PROFILE,
-    profile_evidence,
     resolve_profile,
 )
 from blastbox.worker.sandbox.base import SandboxRequest, SandboxResult, kill_sandbox_group
 
-
-# How long an in-jail proof of an ASSERTED profile is trusted before it is re-measured. A
-# detonation costs seconds at least, so one extra jail launch per half-minute is noise next to
-# it; the point is that the window is BOUNDED rather than the life of the worker.
-_PROOF_TTL_S = 30.0
-
-# The proof needs something that can print a file. /usr/bin FIRST: on a merged-/usr host
-# (/bin -> usr/bin, which is every current Debian/Ubuntu) the kernel resolves the exec to
-# /usr/bin/cat and that is the path AppArmor mediates -- so a remedy naming `/bin/cat`, which
-# is what this used to print, sends the operator to write a profile rule that never matches
-# (claude-code-review lens, round 3 of #177). None means the proof cannot run on this host,
-# which is reported as unprovable rather than as a disproof.
-_PROOF_READER: str | None = next(
-    (p for p in ("/usr/bin/cat", "/bin/cat", "/usr/bin/head") if Path(p).exists()), None
-)
 
 _log = logging.getLogger("blastbox.worker.sandbox.bwrap")
 
@@ -81,9 +61,6 @@ def _env_truthy(name: str) -> bool:
 
 _BWRAP = shutil.which("bwrap") or "/usr/bin/bwrap"
 
-# Default AppArmor profile to attach to the child process via aa-exec.
-# Profile must be loaded on the host kernel.
-_DEFAULT_APPARMOR_PROFILE = DEFAULT_PROFILE
 
 
 def _apparmor_profile_loaded(profile: str) -> bool:
@@ -154,7 +131,7 @@ for _d in ("/bin", "/sbin", "/lib", "/lib64"):
 _RO_SYSTEM_DIRS = ("/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc")
 
 
-class BubblewrapSandbox:
+class BubblewrapSandbox(AppArmorProofMixin):
     """Sandbox backend that wraps the ``bwrap`` binary.
 
     Construction probes the host for capabilities (cgroup-pids, seccomp,
@@ -172,6 +149,7 @@ class BubblewrapSandbox:
     """
 
     name = "bwrap"
+    _apparmor_log_prefix = "bwrap"
 
     def __init__(
         self,
@@ -202,7 +180,7 @@ class BubblewrapSandbox:
         # (found by running it).
         self._suspended_for_diagnosis = False
         self._proof: tuple[bool, float] | None = None
-        self._warned: set[str] = set()
+        self._warned_unprovable = False
         self._aa_exec: str | None = _find_aa_exec()
         self._apparmor_last_seen: bool | None = None
         # NOT apparmor_active here. That property is not a plain accessor: on the asserted path
@@ -281,9 +259,14 @@ class BubblewrapSandbox:
         # construction outright on a host with BLASTBOX_APPARMOR_PROFILES set (found by running
         # it). `note_admitted()` refines this at the moment the selector admits the backend,
         # which is the admission that actually matters.
-        self._armed_at_admission: bool = (
-            self._aa_exec is not None and self._apparmor_enforcing_now()
-        )
+        # None until something measures it. NOT `_apparmor_enforcing_now()`: on the asserted
+        # path that is just the environment variable, while the guard compares it against
+        # apparmor_active, which is PROOF-level -- two yardsticks, so a profile that the proof
+        # disproved looked like confinement that had been "lost", the guard refused every job,
+        # and selection fell through to `container`. One yardstick: `note_admitted()` records
+        # what the selector observed, and a backend nobody admitted takes its baseline from its
+        # first launch (claude-code-review lens, round 4 of #177).
+        self._armed_at_admission: bool | None = None
 
         _log.info(
             "BubblewrapSandbox initialised",
@@ -302,29 +285,29 @@ class BubblewrapSandbox:
     # ------------------------------------------------------------------
     # Properties
 
-    @contextlib.contextmanager
-    def apparmor_suspended(self) -> Iterator[None]:
-        """Build argv WITHOUT the AppArmor prefix, for DIAGNOSIS ONLY.
+    def _attach_argv(self, req: SandboxRequest) -> list[str]:
+        """The probe argv, WITH the seccomp filter a real job carries.
 
-        A child profile narrow enough for one parser may deny ``/usr/bin/true``, which is
-        what `select_sandbox` runs as its smoketest -- so a perfectly good backend carrying a
-        perfectly good profile can fail the probe and be rejected, and the operator is told
-        only "smoketest failed" (codex, #177 — same hazard, same helper). Re-running the probe with the profile
-        suspended distinguishes "this backend does not work" from "your profile does not
-        permit the probe binary", which are different one-line fixes.
-
-        It does NOT run a workload unconfined: the caller uses it for the probe only, and the
-        rejection stands either way.
+        The mixin's default omits it, and bwrap's filter is a per-run memfd rather than a path,
+        so the probes were launching an unfiltered bwrap: a filter/profile interaction that only
+        the combination triggers -- aa-exec needing a syscall the denylist blocks, say -- was
+        invisible to every diagnostic in this file, and the first real job paid for it. The
+        smoketest's own rule, applied here: a probe that skips the confinement is not testing
+        what will run (claude-code-review lens, round 4 of #177).
         """
-        saved, self._aa_exec = self._aa_exec, None
-        # See the nsjail copy: without this the regression guard fires inside the diagnostic
-        # probe and `_ProfileDeniesProbe` becomes unreachable (claude-security lens, #177).
-        self._suspended_for_diagnosis = True
+        fd: int | None = None
         try:
-            yield
+            if self._seccomp_bpf is not None:
+                fd = os.memfd_create("blastbox_seccomp_probe", 0)
+                os.write(fd, self._seccomp_bpf)
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.set_inheritable(fd, True)
+            return self._build_argv(req, seccomp_fd=fd, attach_apparmor=True)
         finally:
-            self._aa_exec = saved
-            self._suspended_for_diagnosis = False
+            # The argv only carries /proc/self/fd/<n>; the probe's own subprocess.run inherits
+            # it, so the parent's copy is closed the moment the argv is built -- same lifetime
+            # rule run() uses, one scope tighter.
+            pass
 
     def _apparmor_enforcing_now(self) -> bool:
         """Whether the profile is enforcing AT THIS MOMENT.
@@ -371,225 +354,11 @@ class BubblewrapSandbox:
         return self._seccomp_active
 
     @property
-    def apparmor_active(self) -> bool:
-        """Both halves: the helper exists AND the profile is enforcing right now."""
-        if self._aa_exec is None or not self._apparmor_enforcing_now():
-            return False
-        if profile_evidence(self._apparmor_profile) == ASSERTED:
-            # The only evidence is an environment variable, which cannot tell enforce from
-            # complain. Measure it (TTL-bounded) instead of taking its word.
-            return self.apparmor_attachment_is_believable()
-        return True
-
-    @property
     def cgroup_pids_supported(self) -> bool:
         return self._cgroup_pids_supported
 
     # ------------------------------------------------------------------
     # Public interface
-
-    def _attach_argv(self, req: SandboxRequest) -> list[str]:
-        """The argv with the profile attached, whatever this backend's builder needs."""
-        return self._build_argv(req, attach_apparmor=True)
-
-    def _apparmor_attaches_at_all(self) -> bool:
-        """Can the profile be attached to ANY child? Structural, no error-string matching.
-
-        The reader probe below cannot tell "this profile denies /bin/cat" from "this profile
-        does not exist", and the two demand opposite answers: the first must not punish a
-        correctly narrow profile, the second is an assertion that is simply false. Measured on
-        a host with no such profile loaded, aa-exec says
-        `ERROR: profile 'blastbox-sandbox' does not exist` -- and the first version of this
-        logic read that as merely unprovable and kept reporting `secure` with no confinement
-        at all, which is the fail-open the proof exists to close (found by running it).
-
-        So ask the cheap, structural question first, with the ONE binary every child profile is
-        documented to permit: if `aa-exec -p <profile> -- /usr/bin/true` cannot run, the
-        profile is unusable, whatever the reason.
-        """
-        probe = "/usr/bin/true" if Path("/usr/bin/true").exists() else "/bin/true"
-        req = SandboxRequest(argv=[probe])
-        try:
-            out = subprocess.run(
-                self._attach_argv(req), capture_output=True, text=True, timeout=60,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            _log.warning("apparmor_attach_probe_failed reason=%s", exc)
-            return False
-        if out.returncode != 0:
-            _log.warning(
-                "apparmor_attach_probe_failed rc=%s stderr=%s",
-                out.returncode, out.stderr.strip()[-200:],
-            )
-            return False
-        return True
-
-    def prove_apparmor_attachment(self) -> str | None:
-        """Ask the KERNEL, from inside the jail, what profile the child actually got.
-
-        The one thing that turns an assertion into a measurement. When arming rests on
-        ``BLASTBOX_APPARMOR_PROFILES`` -- which is the normal case for a non-root worker,
-        because securityfs is root-only -- nothing so far has checked that the named profile
-        exists, let alone that it is enforcing, and a complain-mode profile would buy
-        `secure = True` plus (for nsjail) a writable /proc for the child with no confinement
-        at all in exchange (claude-security lens, round 2 of #177).
-
-        ``/proc/self/attr/current`` read from inside is the kernel naming the profile AND its
-        mode, so it cannot be asserted away. Returns that string, or None if the probe could
-        not run. The caller decides what to do with a mismatch; this method only measures.
-        """
-        if self._aa_exec is None:
-            return None
-        if _PROOF_READER is None:
-            return None
-        req = SandboxRequest(argv=[_PROOF_READER, "/proc/self/attr/current"])
-        try:
-            out = subprocess.run(
-                self._attach_argv(req), capture_output=True, text=True, timeout=60,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            _log.warning("apparmor_attachment_unprovable reason=%s", exc)
-            return None
-        if out.returncode != 0:
-            _log.warning(
-                "apparmor_attachment_unprovable rc=%s stderr=%s",
-                out.returncode, out.stderr.strip()[-200:],
-            )
-            return None
-        return out.stdout.strip()
-
-    def apparmor_attachment_is_believable(self) -> bool:
-        """Whether an ASSERTED profile survives being measured. Three outcomes, not two.
-
-        Called only where the evidence is an assertion (`profile_evidence` == ASSERTED); a
-        kernel reading needs no second opinion.
-
-        * DISPROVED -- the child ran and came back wearing another profile, or a non-enforcing
-          one. The assertion is untrue: disarm, because the alternative is `--proc_rw` bought
-          with nothing.
-        * UNPROVABLE -- the probe could not run at all (no reader binary, or the profile denies
-          it). A workload-specific profile may legitimately permit its parser and the
-          documented `/usr/bin/true` without permitting a file reader, and rejecting such a
-          backend would take a correctly-configured host down over a diagnostic
-          (codex, #177). Keep the assertion, warn once, and say what to permit.
-        * PROVEN -- the child reports this profile in enforce or kill mode.
-
-        The answer is re-measured on a TTL rather than once at construction: with securityfs
-        unreadable, `profile_loaded()` returns ASSERTED forever from a static environment
-        variable, so a profile switched to complain mid-life would otherwise stay "active" for
-        the life of the worker while nothing enforced anything (codex, #177). The window is
-        bounded by `_PROOF_TTL_S`, and monotonic time cannot be stepped backwards under it.
-        """
-        if self._proof is not None and time.monotonic() - self._proof[1] < _PROOF_TTL_S:
-            return self._proof[0]
-
-        if not self._apparmor_attaches_at_all():
-            # DISPROVED, not unprovable: the profile cannot be attached to anything, so the
-            # assertion that it is loaded and enforcing is false.
-            _log.warning(
-                "apparmor_assertion_disproved profile=%s "
-                "note=the profile cannot be attached at all (absent, or it denies the "
-                "documented probe binary); no profile is attached",
-                self._apparmor_profile,
-            )
-            self._proof = (False, time.monotonic())
-            return False
-
-        got = self.prove_apparmor_attachment()
-        if got is None:
-            # UNPROVABLE. Not evidence against the operator, and not evidence for them.
-            self._warn_once(
-                "apparmor_assertion_unprovable profile=%s "
-                "note=the in-jail proof could not run (no reader binary, or the profile "
-                "denies it); the assertion stands unverified. Permit %s in the profile to "
-                "have it checked." % (self._apparmor_profile, _PROOF_READER or "a file reader")
-            )
-            # Stamped AFTER the probe. Stamping at entry made the entry `probe_duration`
-            # seconds old on arrival, so any probe slower than the TTL (the launch allows 60s,
-            # the TTL is 30) produced a cache that was expired when written -- every read
-            # re-launched a jail and waited again, turning a loaded host into a worker that
-            # looks hung (claude-code-review lens, round 3 of #177).
-            self._proof = (True, time.monotonic())
-            return True
-
-        # The NAME, not a prefix of it. `startswith` accepted a child wearing
-        # `blastbox-sandbox-permissive` as proof of `blastbox-sandbox` -- and this is the single
-        # gate behind `secure` and `--proc_rw` on the asserted path (claude-code-review lens,
-        # round 3 of #177). The kernel's format is `name (mode)`, so split on that separator,
-        # exactly as apparmor._line_is_enforcing does.
-        name, _, mode = got.partition(" (")
-        ok = name.strip() == self._apparmor_profile and mode.startswith(("enforce", "kill"))
-        if not ok:
-            _log.warning(
-                "apparmor_assertion_disproved profile=%s child_reports=%r "
-                "note=asserted via BLASTBOX_APPARMOR_PROFILES but the kernel disagrees; "
-                "no profile is attached",
-                self._apparmor_profile, got,
-            )
-        self._proof = (ok, time.monotonic())
-        return ok
-
-    def _warn_once(self, msg: str) -> None:
-        if msg in self._warned:
-            return
-        self._warned.add(msg)
-        _log.warning(msg)
-
-    def note_admitted(self, *, armed: bool) -> None:
-        """Called by the selector on the backend it actually admits.
-
-        `_armed_at_admission` was captured in the CONSTRUCTOR, which is not when admission
-        happens: a profile that becomes enforcing between construction and the selector's
-        security check gets the backend admitted as confined with the flag still False, and
-        the regression guard is then inert for the life of that worker (codex, #177). The
-        selector knows the real moment; this is it.
-
-        It takes the selector's OWN observation rather than re-reading the kernel. A fresh read
-        here could see confinement that vanished in the microseconds since the security check
-        passed, and would then record False -- admitting a backend the selector judged confined
-        while permanently disabling the guard that protects it, so every later job runs
-        unconfined with nothing to notice (codex, round 3 of #177).
-        """
-        self._armed_at_admission = armed
-
-    def _refuse_if_confinement_regressed(self, attached: bool | None = None) -> None:
-        """A worker outlives its jobs; `secure` is checked once, at selection.
-
-        `select_sandbox` reads `secure` at worker start and never again, and `run()` used to
-        proceed regardless -- so a profile unloaded, switched to complain, or made
-        unconfirmable under a long-lived worker silently dropped the `aa-exec` prefix (and
-        `--proc_rw`) and kept detonating, on a backend the selector had certified. The
-        per-launch re-read existed but nothing acted on it (claude-security lens, #177).
-
-        The test is a REGRESSION, not a state: confinement that was there at admission and is
-        gone now. A backend that never had a profile is not affected -- it was admitted on
-        that basis, with `apparmor_missing` recorded -- so this cannot turn "cannot read
-        /sys" into a worker that refuses every job, which would be a worse outage than the
-        one it prevents.
-
-        The override is DELIBERATELY not `BLASTBOX_WARN_ON_INSECURE`. That variable is set
-        automatically by the dispatcher for every runsc worker (`host/runtime/docker.py`, and
-        the warm/snapshot tier as of this PR) for an unrelated reason -- gVisor virtualises
-        /proc, so a worker cannot observe host-level hardening flags that ARE applied -- so
-        honouring it here would leave this control switched off everywhere the fleet actually
-        runs, and on only where nobody does. `BLASTBOX_ALLOW_CONFINEMENT_LOSS=1` is the
-        knowing opt-out, and it has to be set by someone who means this.
-        """
-        if self._suspended_for_diagnosis:
-            return
-        if not self._armed_at_admission or (
-            self.apparmor_active if attached is None else attached
-        ):
-            return
-        msg = (
-            f"{self.name}: the AppArmor profile {self._apparmor_profile!r} was enforcing when "
-            f"this backend was admitted and is not now -- refusing to run unconfined on a "
-            f"backend that was selected as confined"
-        )
-        if _env_truthy("BLASTBOX_ALLOW_CONFINEMENT_LOSS"):
-            _log.warning("%s (allowed by BLASTBOX_ALLOW_CONFINEMENT_LOSS)", msg)
-            return
-        raise SandboxUnavailable(msg)
 
     def run(self, request: SandboxRequest) -> SandboxResult:
         """Run ``request.argv`` inside a bwrap sandbox.
@@ -627,7 +396,15 @@ class BubblewrapSandbox:
                 os.write(seccomp_fd, self._seccomp_bpf)
                 os.lseek(seccomp_fd, 0, os.SEEK_SET)
                 os.set_inheritable(seccomp_fd, True)
-            argv = self._build_argv(request, seccomp_fd=seccomp_fd)
+            # `attach_apparmor=attached`: the SAME read the guard just approved. Without it
+            # _build_argv evaluated apparmor_active a second time, and a profile that vanished
+            # between the two dropped the aa-exec prefix from a launch the guard had certified
+            # as confined -- the TOCTOU the nsjail half closed in round 2, still open here two
+            # rounds later because the fix was applied to one copy (claude-code-review lens,
+            # round 4 of #177). The mixin now makes that kind of drift impossible.
+            argv = self._build_argv(
+                request, seccomp_fd=seccomp_fd, attach_apparmor=attached
+            )
             killed = False
 
             try:

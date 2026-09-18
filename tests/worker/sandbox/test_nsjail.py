@@ -762,7 +762,7 @@ def test_the_product_argv_really_transitions_the_child(monkeypatch) -> None:
     # kernel's own answer, and is still the only thing asserted.
     import blastbox.worker.sandbox.apparmor as aa
 
-    monkeypatch.setattr(mod, "profile_evidence", lambda _p: aa.KERNEL)
+    monkeypatch.setattr(aa, "profile_evidence", lambda _p: aa.KERNEL)
 
     from .conftest import nsjail_usable
 
@@ -843,6 +843,7 @@ class TestConfinementLostAfterAdmissionIsARefusal:
         monkeypatch.delenv("BLASTBOX_ALLOW_CONFINEMENT_LOSS", raising=False)
         state = {"on": True}
         sb = self._sb(tmp_path, monkeypatch, state)
+        sb.note_admitted(armed=True)
         assert sb._armed_at_admission is True
 
         state["on"] = False
@@ -855,6 +856,7 @@ class TestConfinementLostAfterAdmissionIsARefusal:
         monkeypatch.delenv("BLASTBOX_WARN_ON_INSECURE", raising=False)
         state = {"on": False}
         sb = self._sb(tmp_path, monkeypatch, state)
+        sb.note_admitted(armed=False)
         assert sb._armed_at_admission is False
         sb._refuse_if_confinement_regressed()          # must not raise
 
@@ -865,6 +867,7 @@ class TestConfinementLostAfterAdmissionIsARefusal:
         monkeypatch.setenv("BLASTBOX_ALLOW_CONFINEMENT_LOSS", "1")
         state = {"on": True}
         sb = self._sb(tmp_path, monkeypatch, state)
+        sb.note_admitted(armed=True)
         state["on"] = False
         with caplog.at_level(logging.WARNING, logger="blastbox.worker.sandbox.nsjail"):
             sb._refuse_if_confinement_regressed()      # must not raise
@@ -885,6 +888,7 @@ class TestConfinementLostAfterAdmissionIsARefusal:
         bwrap.write_text(_FAKE_NSJAIL)
         bwrap.chmod(0o755)
         sb = bw.BubblewrapSandbox(bwrap_path=str(bwrap))
+        sb.note_admitted(armed=True)
         assert sb._armed_at_admission is True
         state["on"] = False
         with pytest.raises(SandboxUnavailable, match="was enforcing"):
@@ -914,6 +918,7 @@ def test_the_dispatchers_blanket_leniency_does_not_switch_off_the_regression_gua
     nsjail.write_text(_FAKE_NSJAIL)
     nsjail.chmod(0o755)
     sb = mod.NsjailSandbox(nsjail_path=str(nsjail))
+    sb.note_admitted(armed=True)          # the selector admitted it as confined
     state["on"] = False
     with pytest.raises(SandboxUnavailable, match="was enforcing"):
         sb.run(SandboxRequest(argv=["/usr/bin/true"]))
@@ -947,6 +952,7 @@ def test_the_guard_and_the_argv_share_one_reading_of_the_profile(tmp_path, monke
     policy = tmp_path / "ok.policy"
     policy.write_text("POLICY ok { ERRNO(1) { } } USE ok DEFAULT ALLOW\n")
     sb = mod.NsjailSandbox(nsjail_path=str(nsjail), seccomp_policy=policy)
+    sb.note_admitted(armed=True)
     assert sb._armed_at_admission is True
 
     captured: dict[str, list[str]] = {}
@@ -1002,14 +1008,13 @@ class TestAnAssertedProfileIsMeasuredNotBelieved:
 
     def _sb(self, tmp_path, monkeypatch, *, child_reports: str, rc: int = 0,
             attaches: bool = True):
-        import subprocess
 
         import blastbox.worker.sandbox.apparmor as aa
         import blastbox.worker.sandbox.nsjail as mod
 
         monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
         monkeypatch.setattr(mod, "_supports_proc_rw", lambda _p: True)
-        monkeypatch.setattr(mod, "profile_evidence", lambda _p: aa.ASSERTED)
+        monkeypatch.setattr(aa, "profile_evidence", lambda _p: aa.ASSERTED)
         monkeypatch.setattr(mod, "profile_loaded", lambda _p: True)
 
         def _fake_run(argv, **kw):
@@ -1024,7 +1029,7 @@ class TestAnAssertedProfileIsMeasuredNotBelieved:
             return SimpleNamespace(returncode=0 if attaches else 1, stdout="",
                                    stderr="" if attaches else "profile does not exist")
 
-        monkeypatch.setattr(subprocess, "run", _fake_run)
+        monkeypatch.setattr(aa.subprocess, "run", _fake_run)
         nsjail = tmp_path / "nsjail"
         nsjail.write_text(_FAKE_NSJAIL)
         nsjail.chmod(0o755)
@@ -1112,8 +1117,10 @@ class TestAnAssertedProfileIsMeasuredNotBelieved:
         assert sb.apparmor_active is True, "the cached proof should still hold inside the TTL"
 
         # ... and the next launch after the TTL sees it.
-        clock = {"t": mod.time.monotonic() + mod._PROOF_TTL_S + 1}
-        monkeypatch.setattr(mod.time, "monotonic", lambda: clock["t"])
+        import blastbox.worker.sandbox.apparmor as aa
+
+        clock = {"t": aa.time.monotonic() + aa._PROOF_TTL_S + 1}
+        monkeypatch.setattr(aa.time, "monotonic", lambda: clock["t"])
         assert sb.apparmor_active is False
 
     def test_kill_mode_counts(self, tmp_path, monkeypatch) -> None:
@@ -1123,14 +1130,13 @@ class TestAnAssertedProfileIsMeasuredNotBelieved:
     def test_a_kernel_reading_is_not_re_probed(self, tmp_path, monkeypatch) -> None:
         """A profile the kernel itself reported needs no second opinion, and an extra jail
         launch per worker is not free."""
-        import subprocess
 
         import blastbox.worker.sandbox.apparmor as aa
         import blastbox.worker.sandbox.nsjail as mod
 
         monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
         monkeypatch.setattr(mod, "_supports_proc_rw", lambda _p: True)
-        monkeypatch.setattr(mod, "profile_evidence", lambda _p: aa.KERNEL)
+        monkeypatch.setattr(aa, "profile_evidence", lambda _p: aa.KERNEL)
         monkeypatch.setattr(mod, "profile_loaded", lambda _p: True)
         calls = {"n": 0}
 
@@ -1138,7 +1144,7 @@ class TestAnAssertedProfileIsMeasuredNotBelieved:
             calls["n"] += 1
             raise AssertionError("the kernel's answer was re-probed")
 
-        monkeypatch.setattr(subprocess, "run", _counting)
+        monkeypatch.setattr(aa.subprocess, "run", _counting)
         nsjail = tmp_path / "nsjail"
         nsjail.write_text(_FAKE_NSJAIL)
         nsjail.chmod(0o755)
@@ -1240,7 +1246,7 @@ def test_construction_never_calls_the_property_that_launches_a_jail(
 
     mod = nj if backend == "nsjail" else bw
     monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
-    monkeypatch.setattr(mod, "profile_evidence", lambda _p: aa.ASSERTED)
+    monkeypatch.setattr(aa, "profile_evidence", lambda _p: aa.ASSERTED)
     monkeypatch.setattr(mod, "profile_loaded", lambda _p: True)
     if backend == "nsjail":
         monkeypatch.setattr(mod, "_supports_proc_rw", lambda _p: True)
@@ -1277,7 +1283,7 @@ class TestTheProofCacheAndTheNameMatch:
 
         monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
         monkeypatch.setattr(mod, "_supports_proc_rw", lambda _p: True)
-        monkeypatch.setattr(mod, "profile_evidence", lambda _p: aa.ASSERTED)
+        monkeypatch.setattr(aa, "profile_evidence", lambda _p: aa.ASSERTED)
         monkeypatch.setattr(mod, "profile_loaded", lambda _p: True)
         monkeypatch.setattr(mod.NsjailSandbox, "_apparmor_attaches_at_all", lambda self: True)
         calls = {"n": 0}
@@ -1302,9 +1308,10 @@ class TestTheProofCacheAndTheNameMatch:
         jail and waited again, and a loaded host became a worker that looks hung
         (claude-code-review lens, round 3 of #177).
         """
-        import blastbox.worker.sandbox.nsjail as mod
+        import blastbox.worker.sandbox.apparmor as aa
+        import blastbox.worker.sandbox.nsjail as mod          # noqa: F401 - patched by _sb
 
-        monkeypatch.setattr(mod, "_PROOF_TTL_S", 0.5)
+        monkeypatch.setattr(aa, "_PROOF_TTL_S", 0.5)
         sb, calls = self._sb(tmp_path, monkeypatch, "blastbox-sandbox (enforce)",
                              probe_seconds=0.7)
         before = calls["n"]
@@ -1331,9 +1338,9 @@ class TestTheProofCacheAndTheNameMatch:
         """AppArmor mediates the resolved path. On a merged-/usr host (/bin -> usr/bin) that is
         /usr/bin/cat, so a remedy naming /bin/cat sends the operator to write a rule that never
         matches."""
-        import blastbox.worker.sandbox.nsjail as mod
+        import blastbox.worker.sandbox.apparmor as aa
 
-        if mod._PROOF_READER is None:
+        if aa._PROOF_READER is None:
             pytest.skip("no file reader on this host")
         if Path("/bin").is_symlink():
-            assert mod._PROOF_READER.startswith("/usr/"), mod._PROOF_READER
+            assert aa._PROOF_READER.startswith("/usr/"), aa._PROOF_READER
