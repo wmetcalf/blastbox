@@ -1,0 +1,100 @@
+<!--
+  bb-isolated — the libvirt network a blastbox VM worker attaches to by default.
+
+  THE ABSENCE OF <forward> IS THE WHOLE POINT. That is libvirt's isolated mode: guests on
+  this network reach each other and the host, and nothing is forwarded to the physical
+  NIC. There is no rule to get wrong and no daemon to fail open — a packet has nowhere to
+  go because no path exists, which is the same property the container tier gets from
+  docker's `internal` bridge flag.
+
+  DO NOT ADD <forward mode='nat'/>. libvirt's shipped `default` network has exactly that,
+  and VmConfig.network used to point at it: a worker with no egress_policy therefore had
+  working internet, from the defaults alone, with no host-side rules. VmRuntime refuses
+  to boot that pairing now (see _assert_egress_is_governed), and this file is the other
+  half of the fix.
+
+  A worker that NEEDS egress gets it the governed way — an egress_policy applied to its
+  IP by the rooter (blastbox.host.runtime.libvirt_egress) — not by being placed on a
+  network that forwards.
+
+  DHCP is offered because the guest agent is reached over this network and the IP
+  reservation scheme (net-update add ip-dhcp-host) writes into it. The range is the
+  tier's, not libvirt's default 192.168.122.0/24, so defining this cannot disturb an
+  existing `default` network on the same host.
+
+  Install:
+      virsh net-define deploy/libvirt/bb-isolated.xml
+      virsh net-start bb-isolated
+      virsh net-autostart bb-isolated
+  VERIFIED ON REAL LIBVIRT (genesis, libvirt 11.1.0, 2026-09-17). Defined, started, and
+  probed with a veth in a network namespace attached to the bridge, which is what a
+  guest's tap is topologically:
+      bridge address 192.168.221.1/24, namespace at .50
+      ping 192.168.221.1  -> YES     (the segment is LIVE; a negative below means something)
+      curl https://1.1.1.1 -> no answer
+      ping 1.1.1.1         -> unreachable
+  With a CONTROL, because "no internet" is worthless if the probe cannot detect internet:
+  the identical probe in a routed+masqueraded namespace on the same host reached
+  1.1.1.1 and reported the site's egress address. So the probe works, and this network
+  does not carry it.
+
+  MEASURED ON genesis, libvirt 11.1.0, with the agent path checked first every time:
+
+      A -> host bridge              YES     the guest agent must stay reachable
+      A -> sibling worker B         blocked  <- <port isolated='yes'/>
+      A -> internet                 blocked  <- no <forward> element
+      dnsmasq conf has port=0       yes      <- <dns enable='no'/>
+      listening on 192.168.221.1:53 nothing
+      dig from the guest            exit 9 (no server)
+      DHCP range still offered      yes
+
+  HOW THE ISOLATION IS ENFORCED, measured rather than assumed (genesis, libvirt 11.1.0):
+  libvirt installs NO FORWARD RULES AT ALL for this bridge. `iptables -S FORWARD | grep
+  bb-virbr0` is empty. Isolation here is the ABSENCE of a path, not the presence of a
+  DROP — which is the same property the container tier gets from an internal bridge, and
+  the reason a dead tunnel is a dead route rather than a rule someone can delete.
+
+  THAT HAS ONE CONSEQUENCE WORTH STATING, because a reader will otherwise assume a DROP:
+  anything that SUPPLIES a path gets traffic out. Verified on the same host — a worker on
+  this network has no internet, and after the rooter's host-side source routing is applied
+  (`ip rule from <worker> lookup <table>` + a default in that table + MASQUERADE) the same
+  worker reaches the internet. That is BY DESIGN: the rooter is the governed path, and it
+  is how a tunnel-tier worker (openvpn/wireguard) reaches its endpoint from here. A review
+  round suspected the isolated default broke those workers; it does not.
+
+  It also means bb-isolated is not a defence against a stray host-side rule. It is the
+  default-deny floor; the FORWARD chains in blastbox.host.runtime.libvirt_egress are what
+  police a worker that has been given a path.
+
+  Verify it does NOT forward:
+      virsh net-dumpxml bb-isolated | grep -c '<forward'     # must print 0
+-->
+<network>
+  <name>bb-isolated</name>
+  <!--
+    isolated='yes' — GUESTS CANNOT TALK TO EACH OTHER. Without it every worker on this
+    bridge can reach every other worker: a warm pool of analysis VMs is a flat L2 segment,
+    and a sample that moves laterally attacks its siblings, corrupting their verdicts as
+    well as escaping its own box. Omitting <forward> stops traffic leaving the HOST; this
+    stops it crossing between guests, which is a different question and was unanswered.
+    Guest-to-host still works, so the agent stays reachable. Needs libvirt >= 6.1.
+  -->
+  <bridge name='bb-virbr0' stp='on' delay='0'/>
+  <port isolated='yes'/>
+  <!--
+    DNS OFF. libvirt's generated conf for an isolated network happens to carry `no-resolv`,
+    so its dnsmasq has no upstream servers and external names return NO ANSWER — verified
+    on genesis. But that is libvirt's generation CHOICE, not a property of this file, and
+    this session's repeated lesson is not to rest a containment claim on another
+    component's default. Disabling the DNS service makes it structural: there is no
+    resolver on the segment to forward anything, so the classic TXT/NXDOMAIN exfiltration
+    channel is absent by construction rather than by configuration. DHCP is unaffected —
+    it is a separate service in the same dnsmasq.
+  -->
+  <dns enable='no'/>
+  <ip address='192.168.221.1' netmask='255.255.255.0'>
+    <dhcp>
+      <range start='192.168.221.2' end='192.168.221.254'/>
+    </dhcp>
+  </ip>
+</network>

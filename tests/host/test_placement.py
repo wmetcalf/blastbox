@@ -157,34 +157,91 @@ def test_an_unverified_node_is_not_also_reported_as_over_claiming():
     assert over_claiming_nodes(view, {}) == ()
 
 
-def test_the_module_says_plainly_that_nothing_calls_it_yet():
+def test_the_modules_say_accurately_which_half_is_wired():
     """THE ONE RULE is written in the present tense — "grants decide eligibility, full
-    stop" — and a reader can reasonably take that as a description of the running
-    system. It is not one: nothing in src/ consults this module when placing a job, so
-    a compromised node cannot in fact be stopped by it from electing itself for work it
-    is not granted. The docstring must say so until dispatch actually calls it, and
-    this test is the thing that notices when that stops being true."""
+    stop" — and for a while nothing in src/ consulted either module, so a reader could
+    reasonably take it as a description of the running system when it was not one.
+
+    Now the SELF-CHECK is wired (a dispatcher asks `refusal` about itself) and the
+    FLEET view is not (nothing builds a NodeRegistry). The docstrings must track that
+    split in both directions, so this asserts against what actually imports what rather
+    than against a banner someone remembered to update.
+
+    An earlier version of this test grepped a path that does not exist on this layout,
+    found no callers, and passed while asserting the opposite of the truth — hence the
+    assertion below that the directory being searched is real.
+    """
     import pathlib
     import subprocess
 
     from blastbox.host import node_registry, placement
 
-    root = pathlib.Path(placement.__file__).resolve().parents[3]
-    hits = subprocess.run(
-        ["grep", "-rIl", "-e", "host.placement", "-e", "host import placement",
-         "-e", "host.node_registry", "-e", "host import node_registry",
-         "--include=*.py", str(root / "blastbox")],
-        capture_output=True, text=True).stdout.split()
-    callers = {pathlib.Path(h).name for h in hits} - {"placement.py", "node_registry.py"}
+    pkg = pathlib.Path(placement.__file__).resolve().parents[1]
+    assert (pkg / "host" / "dispatch.py").exists(), f"{pkg} is not the blastbox package"
 
-    for mod in (placement, node_registry):
-        if callers:
-            assert "NOT YET WIRED" not in (mod.__doc__ or ""), (
-                f"{mod.__name__} IS now called from {sorted(callers)} — remove the "
-                "not-wired banner from both modules and from this test's premise"
-            )
-        else:
-            assert "NOT YET WIRED" in (mod.__doc__ or ""), (
-                f"{mod.__name__} is imported by nothing in src/, so its present-tense "
-                "guarantees describe a system that does not exist yet; say so"
-            )
+    def callers_of(*needles):
+        args = []
+        for n in needles:
+            args += ["-e", n]
+        hits = subprocess.run(
+            ["grep", "-rIl", *args, "--include=*.py", str(pkg)],
+            capture_output=True, text=True).stdout.split()
+        return {pathlib.Path(h).name for h in hits} - {"placement.py", "node_registry.py"}
+
+    placement_callers = callers_of("host.placement", "host import placement")
+    registry_callers = callers_of("host.node_registry", "host import node_registry")
+
+    assert "dispatch.py" in placement_callers, (
+        "the self-check is supposed to be wired; if it was removed, restore the "
+        "NOT-YET-WIRED banner to placement.py rather than leaving it claiming otherwise"
+    )
+    assert "WIRED INTO DISPATCH" in (placement.__doc__ or "")
+    assert "NOT YET WIRED" not in (placement.__doc__ or "")
+
+    if registry_callers:
+        assert "NOT YET WIRED" not in (node_registry.__doc__ or ""), (
+            f"node_registry IS now called from {sorted(registry_callers)} — update its "
+            "docstring; its present-tense guarantees are in force now"
+        )
+    else:
+        assert "NOT YET WIRED" in (node_registry.__doc__ or ""), (
+            "nothing builds a fleet view, so node_registry's present-tense guarantees "
+            "still describe a system that does not exist yet; say so"
+        )
+
+
+def test_the_self_check_and_the_fleet_filter_are_one_predicate():
+    """`eligible` (which nodes may run this) and a dispatcher's self-check (may I) must
+    not be two implementations of "what the grants permit". The spec's leaderless
+    convergence depends on every node deciding the same way from the same inputs."""
+    import inspect
+
+    from blastbox.host import placement
+
+    assert "refusal(" in inspect.getsource(placement.eligible), (
+        "eligible() has stopped going through the shared predicate"
+    )
+
+
+def test_an_unverifiable_certificate_refuses_rather_than_abstaining():
+    """`None` grants is a REFUSAL, not an absence of opinion. A node that registered but
+    whose certificate the reader could not verify — expired, foreign, unenrolled — may
+    not be given work; treating "I could not check" as "no objection" is how a lapsed
+    identity silently becomes an unrestricted one."""
+    from blastbox.host.placement import refusal
+
+    why = refusal(None, engine="boxjs")
+    assert why and "no verifiable node certificate" in why
+
+
+def test_the_refusal_names_what_was_granted_so_an_operator_can_act():
+    from blastbox.host.pki import NodeGrants
+    from blastbox.host.placement import refusal
+
+    g = NodeGrants(engines=("clamav",), tiers=("direct",), credentials=False)
+    assert refusal(g, engine="clamav", tier="direct") is None
+    assert "boxjs" in (refusal(g, engine="boxjs") or "")
+    assert "clamav" in (refusal(g, engine="boxjs") or ""), "say what IS granted too"
+    assert "wireguard" in (refusal(g, engine="clamav", tier="wireguard") or "")
+    assert "credentials=False" in (
+        refusal(g, engine="clamav", tier="direct", require_credentials=True) or "")

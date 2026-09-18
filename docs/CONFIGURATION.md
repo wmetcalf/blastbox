@@ -554,7 +554,7 @@ consumer sets** (often mapped from its *own* env, e.g. win-validator's `AUTHENTI
 | `nwfilter_ip_learning` | `dhcp` | `CTRL_IP_LEARNING` for the DHCP-learning path (`dhcp` or `any`; `none` is rejected here because it needs `worker_ip_pool`). Unused once `worker_ip_pool` is set. |
 | `dhcp_server` | `""` | `clean-traffic` `DHCPSERVER` parameter — the **trusted** dnsmasq a worker may accept leases from, so it can't rogue-DHCP itself a different one. `""` ⇒ derived as `subnet_prefix` + `.1`. |
 | `mac_prefix` | `52:54:00:bb` | OUI for assign-enforce MACs; the last 2 octets are the IP's 3rd+4th, giving a 1:1 MAC↔IP map within the /16. |
-| `subnet_prefix` | `192.168.122.` | The libvirt network's subnet, used for the `DHCPSERVER` default and pool sanity. |
+| `subnet_prefix` | `192.168.221.` | The libvirt network's subnet, used for the `DHCPSERVER` default and pool sanity. |
 | `egress` (`VmEgressPolicy`) / `routing` (`ExitRouting`) | `None` | Optional per-worker egress through `LibvirtEgress` (a CAPE-style per-IP `iptables` `BBVM_<ip>` chain + `FORWARD` jump): exit driver, port allowlist, `block_internal`, VPN/SOCKS routing. `None` ⇒ no egress wired. |
 
 ## Per-engine params (engine ↔ host boundary)
@@ -592,6 +592,66 @@ Any bridge `apply` relocates carries its pinned addresses with it, so after a
 reallocation **update every personality's `gateway=`** to the new
 `BLASTBOX_EGRESS_VPN_GATEWAY_IP` — they are separate sources of truth and nothing
 reconciles them.
+
+### Node grants (who this node may run work for)
+
+A dispatcher checks its OWN node certificate before running a claimed job: grants decide
+what it may run, and a job it is not granted is **released back to the fleet**, not
+failed — this node cannot see the fleet and has no standing to assert that no peer can
+run it.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BLASTBOX_NODE_CERT` | — | path to this node's cert from `pki issue-node`. **Setting it at all is what arms the gate** — even to an empty value, which counts as a configured-but-unproducible identity and refuses |
+| `BLASTBOX_PKI_DIR` | `/var/lib/blastbox/pki` | where `ca.crt` lives. Only the CA's **public** half is needed on a worker |
+| `BLASTBOX_NODE_GRANTS_GATE` | — | `0`/`false`/`no`/`off` force the gate off. **Any other non-empty value forces it on**, so a typo'd `enforce` hardens rather than silently disarms |
+
+**There is no cache and no TTL.** Every claimed job re-reads the certificate file and
+re-verifies it against the CA. An earlier version cached the verdict behind a TTL, and
+across five attempts that cache produced substantially every defect this feature has had
+— a timestamp published before the value, freshness measured on a settable clock, expiry
+enforced only at parse time, a deadline a rolled-back clock could push out forever, and
+then a ratchet fixing *that* which made one transient forward clock step refuse every job
+for the rest of the certificate's life. The cost of removing it is one file read and one
+ECDSA verify per job, against a job that is about to detonate malware in a VM. Two useful
+consequences: **renewal takes effect on the very next job** (it used to wait out the TTL
+with no way to force a re-read short of a restart), and so does revocation.
+
+`BLASTBOX_NODE_ID` is **not** part of this. It has meant "physical-host slug for share-dir
+scoping" since long before the gate existed (see the sizer section above), and an early
+version of this feature resolved a certificate path from it — so an operator setting it
+for the documented NFS reason armed a security control they had never heard of. A later
+version honoured it only when `<pki>/node-<id>.crt` existed, which was worse: `pki
+issue-node` writes exactly that filename by default and the issuing host holds one for
+every node it ever enrolled, so a host could arm itself with a **peer's identity**.
+
+It now **warns and does not arm**. If `BLASTBOX_NODE_ID` is set and a matching
+certificate exists, the log says so once and the node stays ungated. Arming the gate is
+explicit, or it is not arming.
+
+Both the container dispatcher and `VmJobDispatcher` (the AWS / static-pool / cascade
+path) consult the same gate object. There is no third door.
+
+Ask a node what it resolves to:
+
+```bash
+blastbox pki node-status            # is the gate armed? does the cert verify? what would it accept?
+blastbox pki node-status --engine clamav
+```
+
+It prints the resolved certificate path, the grants, and a per-tier verdict — including
+that a **sealed (`none`) job needs no tier grant at all**, which the grant list alone
+does not make obvious. Exit 1 when the gate is armed and the certificate does not verify.
+
+**Opt-in by design.** A node with no certificate configured runs unrestricted, exactly
+as before — making the gate mandatory would stop every existing first-party deployment
+dead on upgrade, and until third-party registration exists there is nothing for it to
+constrain.
+
+**An unverifiable certificate refuses; it does not abstain.** Expired, foreign or
+unreadable all mean "run nothing", because "revocation is stop renewing" bounds exposure
+only if something acts on the lapse. That is a different state from "no certificate
+configured", and the two must never collapse into one.
 
 Dispatcher-side knobs (not written to the file):
 

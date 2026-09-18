@@ -78,6 +78,19 @@ PUT_OUTPUT_RETRY_BACKOFF_S = 1.0
 
 logger = logging.getLogger(__name__)
 
+#: The tier of a pool that has not declared its provisioned egress. NOT "none": a libvirt
+#: VM with no declared policy is left on the UNRESTRICTED network (see `_process`), so
+#: calling it sealed put it in UNGOVERNED_TIERS and skipped both the tier and the
+#: credentials arm — on exactly the remote pools this control exists for.
+_UNDECLARED = "\x00undeclared"
+
+
+def _no_gate():
+    """placement.NO_GATE, imported lazily to keep this module's import graph unchanged."""
+    from blastbox.host.placement import NO_GATE
+
+    return NO_GATE
+
 
 class NoWarmSlot(RuntimeError):
     """No warm slot was available to run a claimed job. The dispatcher REQUEUES the job (it never ran)
@@ -115,6 +128,13 @@ class VmJobDispatcher:
                  put_output_max_attempts: int = PUT_OUTPUT_MAX_ATTEMPTS,
                  put_output_retry_backoff_s: float = PUT_OUTPUT_RETRY_BACKOFF_S) -> None:
         self._store = store
+        # The SAME grants gate the cold dispatcher uses — see
+        # blastbox.host.placement.SelfGrants. One implementation, or one of the two
+        # dispatch classes ends up with none, which is exactly what happened here.
+        from blastbox.host.placement import SelfGrants
+        self._grants_gate = SelfGrants(log=logger)
+        self._grants_defer_lock = threading.Lock()
+        self._grants_defer_n: dict[str, int] = {}
         self._job_root = Path(job_root)
         self._validate = validate
         # When the transport itself sealed + wrote output/metadata.json (the remote_http path: the
@@ -403,7 +423,139 @@ class VmJobDispatcher:
                                      status=JobStatus.QUEUED, claim_id=None, started_at=None)
         return False
 
+    def _effective_personality(self, job: Job, *, assume_sealed: bool = False):
+        """The personality this pool would actually run the job under.
+
+        Mirrors the effective-policy computation in :meth:`_process` (fixed → override →
+        engine default → "none"). A VM pool's egress is FIXED at spawn, so when
+        ``fixed_net_policy`` is declared that is what the job really gets — and it is
+        what the credentials grant must be judged against.
+        """
+        from blastbox.host.netpolicy import resolve_net_policy
+
+        # MIRROR `_process` EXACTLY, including the case-folding it does and the order it
+        # uses. The previous version put `fixed` FIRST and never normalised case, so with
+        # fixed_net_policy='VPN' the gate judged tier 'vpn' while _process's effective
+        # policy was 'none' — and a certificate lacking a 'vpn' tier then RELEASED that
+        # job forever instead of letting _process FAIL it terminally.
+        effective = (job.net_policy
+                     or self._engine_default_policy(job.engine)
+                     or "none").strip().lower()
+        fixed = (self._fixed_net_policy or "").strip().lower()
+        if self._fixed_net_policy is None:
+            # AN UNDECLARED POOL IS NOT A SEALED ONE. `_process`'s own comment says a
+            # libvirt VM with egress_policy=None "is left on the (unrestricted) libvirt
+            # network, NOT --network=none", which is exactly why it refuses to assume
+            # 'none' for the policy check. The gate must not assume it either: resolving
+            # to 'none' put the tier in UNGOVERNED_TIERS, so tier AND credentials were
+            # skipped and only the engine name was ever checked — on the aws/static/
+            # cascade pools this control exists for.
+            return type("_P", (), {"exit_driver": "none" if assume_sealed else _UNDECLARED})()
+        name = fixed or effective
+        # RESOLVE_NET_POLICY NEVER RAISES, and the first version of this leaned on an
+        # `except Exception` fallback that was therefore DEAD CODE with a comment
+        # claiming the opposite. Its documented behaviour is "an unknown name at any step
+        # collapses to `none` rather than erroring" — and `none` is in UNGOVERNED_TIERS,
+        # so EVERY personality this dispatcher saw was judged sealed: the tier check and
+        # the credentials check were both skipped and only the engine name was validated.
+        # A pool with no `fixed_net_policy` (the documented opt-out, which leaves a
+        # libvirt VM on the UNRESTRICTED network by this file's own comment) ran every
+        # job with full egress on a node the CA granted no egress tier at all.
+        #
+        # So: resolve against the registry, and if the name did not RESOLVE to itself,
+        # judge on the name. A tier this dispatcher cannot identify is not a sealed tier.
+        registry = self._net_policy_registry()
+        resolved = resolve_net_policy(job_net_policy=name, engine_default="none",
+                                      registry=registry, allow_override=True)
+        if name not in ("none", "drop", "") and resolved.name != name:
+            return type("_P", (), {"exit_driver": str(name).strip().lower()})()
+        return resolved
+
+    def _net_policy_registry(self):
+        """The declared personalities, parsed ONCE.
+
+        `Dispatcher` parses this in __init__; re-parsing per job scanned os.environ every
+        time and, worse, re-emitted `parse_personalities`' stderr warning for each
+        malformed declaration — one identical line per claimed job, burying the very
+        signal that would have told the operator about the typo.
+        """
+        from blastbox.host.netpolicy import parse_personalities
+
+        if getattr(self, "_net_policies_cached", None) is None:
+            self._net_policies_cached = parse_personalities(os.environ)
+        return self._net_policies_cached
+
     def _process(self, job: Job) -> None:
+        # MAY THIS NODE RUN THIS AT ALL? Grants decide; claims never widen.
+        #
+        # THIS CLASS HAD NO GRANTS CHECK OF ANY KIND, and it is the one that most needed
+        # one: cli.py routes every network-style pool (aws, static, cascade) here and
+        # returns before `Dispatcher` is ever constructed, so the REMOTE workers the
+        # federation design exists to constrain were the ones running entirely
+        # ungoverned. An operator could set BLASTBOX_NODE_CERT on such a node, see no
+        # refusals, and conclude the gate was working — the absence of enforcement is
+        # indistinguishable from "nothing was refused".
+        #
+        # RELEASED, NOT FAILED (CAS back to QUEUED, claim cleared): this node not being
+        # permitted to run a job says nothing about whether a peer is, and it cannot see
+        # the fleet.
+        #
+        # AND NOT PURGED. The net_policy branch below purges because it is TERMINAL —
+        # nothing will ever need those bytes again. This path is a RELEASE, and with no
+        # blob store configured (`job.input_sha256 is None`) the peer cannot
+        # re-materialise the sample, so deleting it makes that peer FAIL the job: the one
+        # contract this gate makes, turned into its opposite.
+        personality = self._effective_personality(job)
+        # BEFORE refuse(), NOT AFTER. The first version asked refuse() first and only
+        # substituted this message `if why is None` — but `_UNDECLARED` is not in
+        # UNGOVERNED_TIERS, so refuse() always rejected it as an ungranted tier and the
+        # nicer message was unreachable dead code. What an operator actually saw was
+        # `netpolicy tier '\x00undeclared' is not granted`: a sentinel with a NUL byte in
+        # it, which is worse than the message it replaced. Three reviewer families found
+        # it independently.
+        if personality.exit_driver is _UNDECLARED:
+            if self._grants_gate.grants() is _no_gate():
+                personality = self._effective_personality(job, assume_sealed=True)
+                why = self._grants_gate.refuse(engine=job.engine, personality=personality)
+            else:
+                why = ("this pool declares no fixed_net_policy, so this node cannot know "
+                       "what egress its VMs actually have and cannot check it against the "
+                       "certificate's tier or credentials grants — not even a certificate "
+                       "granting every tier helps, because the question is what this pool "
+                       "DOES, not what the node is allowed to do. Declare "
+                       "fixed_net_policy (the pool's provisioned egress), or run this "
+                       "pool ungated.")
+        else:
+            why = self._grants_gate.refuse(engine=job.engine, personality=personality)
+        if why is not None:
+            # DEFERRED AND THROTTLED. `_worker_loop` only backs off when `claim_next`
+            # returns None, so a refusal that simply returned re-claimed THE SAME JOB
+            # immediately: measured at 3070 full claim/CAS/warn cycles in 0.3s against an
+            # in-memory store, and against Postgres that is two round-trips per cycle
+            # from every worker in the pool, for as long as the certificate is lapsed —
+            # degrading the very peers the refusal is releasing the work to. That is
+            # worse than the flat-5s version the cold path already rejected as
+            # insufficient. `claimable_after` is the same mechanism the blob-retry path
+            # uses a few hundred lines below.
+            with self._grants_defer_lock:
+                n = self._grants_defer_n.get(job.job_id, 0) + 1
+                self._grants_defer_n[job.job_id] = n
+                if len(self._grants_defer_n) > 4096:
+                    for stale, _v in sorted(self._grants_defer_n.items(),
+                                            key=lambda kv: kv[1])[:1024]:
+                        if stale != job.job_id:
+                            self._grants_defer_n.pop(stale, None)
+            delay = min(300.0, 2.0 * (2 ** min(n - 1, 8)))
+            if n & (n - 1) == 0:          # powers of two only
+                logger.warning("vm_dispatch: node grants refuse job %s (%s) — releasing "
+                               "to the fleet (attempt %d, next eligible in %.0fs)",
+                               job.job_id, why, n, delay)
+            self._store.update_if_status(
+                job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
+                status=JobStatus.QUEUED, claim_id=None, started_at=None,
+                claimable_after=time.time() + delay)
+            return
+
         # Fail closed on an EFFECTIVE net_policy this warm tier can't honor — BEFORE detonation. A
         # warm VM's egress is FIXED at spawn and can't be re-steered per job like the cold container
         # path. Enforcement is OPT-IN via fixed_net_policy (the egress this pool is PROVISIONED with):

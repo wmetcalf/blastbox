@@ -63,6 +63,14 @@ from blastbox.host.canary import (
     check_store_coherence,
     describe_blob_store,
 )
+# NO_GATE is imported, never re-declared. This module used to define its own
+# `_NO_GATE = object()`, left behind when the gate was extracted — a second,
+# non-identical object. A reviewer flagged it as a trap ("any future code that
+# reaches for the local name gets an `is` comparison that is always False"), and
+# the very next change here did exactly that: a guard that was always true, so an
+# ungated node took the armed branch.
+from blastbox.host.placement import NO_GATE as _NO_GATE
+from blastbox.host.placement import SelfGrants
 from blastbox.host.jobs.base import Job, JobStatus, JobStore
 from blastbox.host.runtime.docker import (
     RuntimeSelection,
@@ -100,6 +108,7 @@ _GUEST_SEAM_ERRORS: tuple[type[BaseException], ...] = _guest_seam_errors()
 
 
 _JOB_ID_RE = re.compile(r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
+
 
 _log = logging.getLogger("blastbox.host.dispatch")
 
@@ -595,6 +604,15 @@ class Dispatcher:
         self._egress_shared_defer_s = max(
             1.0, float(os.environ.get("BLASTBOX_EGRESS_SHARED_DEFER_S", "5") or 5))
         self._egress_cooldown: dict[str, float] = {}
+        # ONE implementation, shared with VmJobDispatcher. Two dispatch classes with two
+        # copies of "may I run this" is how one of them ends up with no copy at all —
+        # which is exactly what happened before this was extracted.
+        self._grants_gate = SelfGrants(log=_log)
+        # Its OWN defer state, never the egress gate's — see the comment at the call site.
+        self._grants_defer_lock = threading.Lock()
+        self._grants_defer_n: dict[str, int] = {}
+        self._grants_defer_floor = 0
+        self._grants_cooldown: dict[str, float] = {}
         self._egress_defer_lock = threading.Lock()
         self._egress_defer_n: dict[str, int] = {}
         #: Attempt count a job re-enters at when its entry was evicted. Without it the
@@ -1228,6 +1246,136 @@ class Dispatcher:
                 self._release_warm_reservation()
             raise
 
+        # ------------------------------------------------------------------
+        # MAY THIS NODE RUN THIS AT ALL? Grants decide; claims never widen.
+        # ------------------------------------------------------------------
+        # BEFORE THE WARM/COLD BRANCH, AND THAT POSITION IS THE WHOLE POINT. This check
+        # first lived inside `_dispatch_inner`, which is only the COLD path —
+        # `_dispatch_warm` is called as its ALTERNATIVE a few lines below and never
+        # reaches it, so a node with an unverifiable certificate still ran every job
+        # that landed on an idle warm slot. An authority control with a second door is
+        # not an authority control.
+        #
+        # It is also ahead of the runsc/netns check inside `_dispatch_inner`, which
+        # `_fail_job`s. Judged after that, a job this node may not run was DESTROYED
+        # rather than released — and on the strength of a refusal it had no standing to
+        # make, since a granted runc peer could have run it.
+        #
+        # RELEASED, NOT FAILED. This node not being permitted to run a job says nothing
+        # about whether a peer is, and this node cannot see the fleet. Same reasoning,
+        # and the same short shared defer, as the egress health gate.
+        personality = self._resolve_personality(job)
+        # ONE COOLDOWN CHECK FOR BOTH REFUSAL PATHS. It used to sit below the
+        # engine-not-here guard, so that path WROTE a cooldown entry and never consulted
+        # it: the escalation lengthened a window nothing honoured, and the claim /
+        # requeue amplification carried on at the flat shared defer. Reading it here
+        # covers both, because neither refusal can be resolved by anything this node
+        # does — only by a renewed certificate or a different node.
+        if (until := self._grants_cooldown.get(job.job_id)) and time.monotonic() < until:
+                # RELEASE THE RESERVATION. This method is the SOLE owner of freeing the
+                # warm-slot gate reservation (issue #72); every other early return
+                # honours that and this one did not, so each visit leaked one. Once the
+                # leak reached the idle-slot count a warm-only sidecar stopped claiming
+                # ANY job, granted or not, and never recovered without a restart.
+                if warm_reserved:
+                    self._release_warm_reservation()
+                self._requeue_claimed(
+                    job, defer=True, defer_s=self._egress_shared_defer_s,
+                    reason=f"this node's certificate does not grant this work; in a local "
+                           f"cooldown for another {until - time.monotonic():.0f}s",
+                )
+                return
+            # AN UNKNOWN ENGINE, ON AN ARMED NODE, IS NOT THIS NODE'S CALL TO MAKE.
+        # `dispatch_once()` is unscoped by default, so on a shared store a node can claim
+        # a job for an engine a PEER has and it does not. Falling through to
+        # `_dispatch_inner`'s `unknown engine` failure destroys that work on exactly the
+        # assertion this gate refuses to let a node make everywhere else. An UNGATED node
+        # is the single-node deployment where `unknown engine` genuinely is terminal, and
+        # it still fails there.
+        #
+        # (Three superseded paragraphs used to sit here, two of them instructing the
+        # reader to delete the guard below. They were left behind across revisions and a
+        # maintainer reading top-down would have obeyed the last one.)
+        if job.engine not in self._engines and self._grants_gate.grants() is not _NO_GATE:
+            # AN ARMED NODE CANNOT INFER FLEET-WIDE ENGINE AVAILABILITY FROM ITS OWN
+            # REGISTRY. `dispatch_once()` is unscoped by default, so on a shared store a
+            # node can claim a job for an engine a PEER has and it does not. Falling
+            # through to `_dispatch_inner`'s `unknown engine` failure destroys that work
+            # on exactly the assertion this gate refuses to let a node make everywhere
+            # else — "no peer can run this". Release it instead.
+            #
+            # Only when ARMED. An ungated node is the single-node deployment where
+            # `unknown engine` genuinely is terminal, and changing that would turn a
+            # clear failure into a job that sits queued forever.
+            # THROUGH THE SAME MACHINERY AS THE GRANTS REFUSAL. This sat AHEAD of the
+            # block that owns `_grants_defer_n` / `_grants_cooldown` and the power-of-two
+            # log throttle, so it had none of them: a typo'd engine on an armed fleet
+            # meant claim, WARNING, CAS-requeue, every few seconds, on every node,
+            # forever — the exact store amplification and log flood the sibling path
+            # spent a review round removing, with `max_queued_age` off by default so
+            # nothing terminates it.
+            n, shared_defer = self._note_grants_refusal(job.job_id)
+            if n & (n - 1) == 0:          # powers of two only
+                _log.warning("engine %r is not on this node; releasing job=%s to the "
+                             "fleet rather than failing work a peer may support "
+                             "(attempt %d)", job.engine, job.job_id, n)
+            if warm_reserved:
+                self._release_warm_reservation()
+            self._requeue_claimed(
+                job, defer=True, defer_s=shared_defer,
+                reason=f"engine {job.engine!r} is not available on this node; releasing "
+                       "to the fleet",
+            )
+            return
+        if job.engine in self._engines:
+
+            # ITS OWN COOLDOWN, READ AS WELL AS WRITTEN. The first version reused the egress
+            # health gate's `_egress_defer_n` / `_egress_cooldown`, which was wrong three
+            # ways: that map's eviction lives inside the egress branch these jobs never
+            # reach, so it grew without bound; the egress gate READS the cooldown and would
+            # report "this node is in a local egress cooldown" for an outage that never
+            # happened, surviving certificate renewal; and the shared floor leaked between
+            # them. It also only ever WROTE the cooldown, so the escalation throttled the log
+            # and not the store — the claim/requeue amplification the comment claimed to fix
+            # carried on every few seconds, and the "will not reconsider for 300s" it printed
+            # was false.
+            why = self._grants_gate.refuse(engine=job.engine, personality=personality)
+            if why is not None:
+                # THROTTLED AND ESCALATING, like the egress health gate below — and more
+                # necessary here, not less. That gate guards a TRANSIENT condition and still
+                # escalates; a grants refusal is a STANDING one (a certificate does not renew
+                # itself), so a flat 5s defer with an unconditional log line meant a lapsed
+                # node claiming, logging and CAS-requeueing every queued job every five
+                # seconds, forever: store write amplification plus a log flood, with
+                # max_queued_age off by default so nothing terminates it.
+                n, shared_defer = self._note_grants_refusal(job.job_id)
+                if n & (n - 1) == 0:          # powers of two only
+                    _log.warning(
+                        "node grants refuse job=%s engine=%s tier=%s: %s. Releasing to the "
+                        "fleet; a granted peer may still run it. (attempt %d)",
+                        job.job_id, job.engine, personality.exit_driver, why, n)
+                if warm_reserved:
+                    self._release_warm_reservation()
+                self._requeue_claimed(
+                    job, defer=True, defer_s=shared_defer,
+                    reason=f"this node's certificate does not grant this work ({why}); "
+                           "releasing to the fleet",
+                )
+                return
+            # GRANTED — CLEAR THE STATE. The egress gate's shape was copied without its
+            # cleanup, so nothing reset these and a renewed certificate did not resume
+            # refused work: the cooldown is checked BEFORE `refuse()` is consulted, so
+            # every previously-refused job kept bouncing on the shared defer for the rest
+            # of its cooldown — up to the 300s cap — while the log still claimed the
+            # certificate did not grant it. The floor ratcheted up on every eviction and
+            # never came down, so the first refusal of an unrelated job a week later
+            # started at the cap.
+            with self._grants_defer_lock:
+                self._grants_defer_n.pop(job.job_id, None)
+                self._grants_cooldown.pop(job.job_id, None)
+                if not self._grants_defer_n:
+                    self._grants_defer_floor = 0
+
         # Try the warm path if a pool is configured. EXCEPTION: an egress personality needs the cold
         # path's netd netns-wiring + dispatcher network args/labels, which the warm tier can't apply
         # (warm-tier networking is a future phase) — so an egress job on a warm slot would silently
@@ -1359,6 +1507,44 @@ class Dispatcher:
     EGRESS_DEFER_MAX = 4096
     EGRESS_DEFER_EVICT = 1024
 
+    def _note_grants_refusal(self, job_id: str) -> "tuple[int, float]":
+        """Record one refusal for this job; return ``(attempt, store-side defer)``.
+
+        ONE IMPLEMENTATION, because there are two refusal paths — grants and
+        engine-not-here — and the second was written without this, so it had no cooldown,
+        no escalation and an unthrottled warning: a typo'd engine on an armed fleet meant
+        claim / WARNING / CAS-requeue every few seconds on every node, forever.
+
+        Its own state, never the egress health gate's. Sharing that map grew it without
+        bound (its eviction lives in a branch these jobs never reach) and let the egress
+        gate report "a local egress cooldown" for an outage that never happened.
+        """
+        with self._grants_defer_lock:
+            n = max(self._grants_defer_n.get(job_id, 0), self._grants_defer_floor) + 1
+            self._grants_defer_n[job_id] = n
+            shared_defer, local = self._egress_defer_plan(n)
+            # INSIDE the lock, with the counter it belongs to. Written outside, a write
+            # landing after another thread evicted this job left a cooldown with no
+            # counter — an entry no future eviction pass would consider, so the map grew
+            # without bound.
+            self._grants_cooldown[job_id] = time.monotonic() + local
+            if len(self._grants_defer_n) > self.EGRESS_DEFER_MAX:
+                now_m = time.monotonic()
+                # SWEEP THE ELAPSED ONES; never discard a LIVE cooldown. Popping both
+                # maps together destroyed ~1022 live cooldowns per pass and returned
+                # those jobs to the 5s floor — reinstating the spin the escalation exists
+                # to bound, continuously, because a lapsed certificate keeps the map
+                # pinned at the cap.
+                for k in [k for k, v in self._grants_cooldown.items() if v <= now_m]:
+                    self._grants_cooldown.pop(k, None)
+                for stale, stale_n in sorted(self._grants_defer_n.items(),
+                                             key=lambda kv: kv[1])[:self.EGRESS_DEFER_EVICT]:
+                    if stale == job_id:
+                        continue
+                    self._grants_defer_floor = max(self._grants_defer_floor, stale_n)
+                    self._grants_defer_n.pop(stale, None)
+            return n, shared_defer
+
     def _egress_defer_plan(self, n: int) -> tuple[float, float]:
         """``(what the STORE is told, how long THIS NODE stays away)`` for attempt ``n``.
 
@@ -1408,6 +1594,19 @@ class Dispatcher:
                     self._egress_defer_floor = max(self._egress_defer_floor, stale_n)
                     self._egress_defer_n.pop(stale, None)
             return n
+
+    def _self_grants(self):
+        """This node's own grants; see :class:`blastbox.host.placement.SelfGrants`."""
+        return self._grants_gate.grants()
+
+    def _node_cert_path(self):
+        return self._grants_gate.cert_path()
+
+    def _egress_mode(self) -> str:
+        return self._grants_gate.egress_mode()
+
+    def _holds_credentials(self, personality) -> bool:
+        return self._grants_gate.holds_credentials(personality)
 
     def _node_egress_health(self):
         """Cached verdict on whether THIS node can currently egress, or None to not gate.

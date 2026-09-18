@@ -153,8 +153,12 @@ def test_ip_pool_parse_and_mac_derivation():
 def test_dhcpserver_restricts_clean_traffic_dhcp_source(monkeypatch):
     # clean-traffic emits DHCPSERVER (trusted dnsmasq) so a rogue worker can't DHCP itself a different
     # lease that DHCP-learning would then pin. Derived from subnet_prefix; overridable; clean-traffic only.
-    x = _rt()._domain_xml("bbvm-x", "/o.qcow2")                       # learning default
-    assert "<parameter name='DHCPSERVER' value='192.168.122.1'/>" in x
+    rt = _rt()                                                        # learning default
+    x = rt._domain_xml("bbvm-x", "/o.qcow2")
+    # Derived from the CONFIG, not a literal: hardcoding the default subnet here is how
+    # `subnet_prefix` was left behind when `network` moved to bb-isolated — the test
+    # would have caught it and instead would have been "fixed" to match the regression.
+    assert f"<parameter name='DHCPSERVER' value='{rt.cfg.subnet_prefix}1'/>" in x
     x2 = _rt(dhcp_server="10.9.0.1")._domain_xml("bbvm-x", "/o.qcow2")
     assert "<parameter name='DHCPSERVER' value='10.9.0.1'/>" in x2
     # assign-enforce branch carries it too (alongside the explicit IP pin)
@@ -209,16 +213,17 @@ def test_spawn_reserves_and_assigns_then_reap_unreserves(monkeypatch):
     # removes the reservation + returns the IP to the pool.
     rt = _pooled_rt(monkeypatch, "192.168.122.200-192.168.122.201")
     calls: list[list[str]] = []
-    monkeypatch.setattr(rt, "_virsh", lambda *a, **k: calls.append(list(a)) or _OK())
+    monkeypatch.setattr(rt, "_virsh", _with_isolated_net(
+        lambda *a, **k: calls.append(list(a)) or _OK()))
     monkeypatch.setattr(rt, "_sh", _sh_ok_free_name)
     monkeypatch.setattr(rt, "_destroy_domain", lambda *a, **k: True)
     slot = rt.spawn()
     assert slot.ip in ("192.168.122.200", "192.168.122.201") and slot.mac
-    assert any(a[:3] == ["net-update", "default", "add"] and slot.ip in " ".join(a) for a in calls)
+    assert any(a[:3] == ["net-update", rt.cfg.network, "add"] and slot.ip in " ".join(a) for a in calls)
     held = slot.ip
     calls.clear()
     rt.reap(slot)
-    assert any(a[:3] == ["net-update", "default", "delete"] and held in " ".join(a) for a in calls)
+    assert any(a[:3] == ["net-update", rt.cfg.network, "delete"] and held in " ".join(a) for a in calls)
     assert held in rt._ip_free                       # IP returned to the pool after reap
 
 
@@ -229,18 +234,20 @@ def test_spawn_reserve_failure_does_not_delete_others_reservation(monkeypatch):
     calls: list[list[str]] = []
 
     def fake_virsh(*a, **k):
+        if (_x := _net_dumpxml_answer(a)) is not None:
+            return type("C", (), {"returncode": 0, "stdout": _x, "stderr": ""})()
         calls.append(list(a))
-        if a[:3] == ("net-update", "default", "add"):
+        if a[:3] == ("net-update", rt.cfg.network, "add"):
             return type("C", (), {"returncode": 1, "stdout": "", "stderr": "already in use"})()
         return _OK()
 
-    monkeypatch.setattr(rt, "_virsh", fake_virsh)
+    monkeypatch.setattr(rt, "_virsh", _with_isolated_net(fake_virsh))
     monkeypatch.setattr(rt, "_sh", _sh_ok_free_name)
     monkeypatch.setattr(rt, "_destroy_domain", lambda *a, **k: True)
     with pytest.raises(RuntimeError, match="reservation add failed"):
         rt.spawn()
     # the failed spawn's reap must NOT have issued a net-update delete (it never owned the reservation)
-    assert not any(a[:3] == ["net-update", "default", "delete"] for a in calls)
+    assert not any(a[:3] == ["net-update", rt.cfg.network, "delete"] for a in calls)
     # but our allocated IP is returned to the pool (no leak)
     assert len(rt._ip_free) == 2
 
@@ -279,7 +286,8 @@ def test_dhcp_learning_mode_no_reservation(monkeypatch):
     # without a pool, spawn() does NOT touch DHCP reservations (DHCP-learning mode); MAC is read back.
     rt = _rt()  # no worker_ip_pool
     calls: list[list[str]] = []
-    monkeypatch.setattr(rt, "_virsh", lambda *a, **k: calls.append(list(a)) or _OK())
+    monkeypatch.setattr(rt, "_virsh", _with_isolated_net(
+        lambda *a, **k: calls.append(list(a)) or _OK()))
     monkeypatch.setattr(rt, "_sh", _sh_ok_free_name)
     monkeypatch.setattr(rt, "_destroy_domain", lambda *a, **k: True)
     monkeypatch.setattr(rt, "_domain_mac", lambda name: "52:54:00:aa:bb:cc")
@@ -369,6 +377,33 @@ def test_ip_for_mac_none_when_no_mac():
 class _OK:
     returncode = 0
     stdout = "running"
+
+
+#: spawn() now refuses to boot an unpoliced worker onto a network that forwards (a
+#: VmConfig with nothing specified used to land on libvirt's NAT `default`). These tests
+#: are about reservation and spawn bookkeeping, so they answer the precondition with the
+#: isolated network the runtime expects rather than disabling the check.
+_ISOLATED_NET_XML = "<network><name>bb-isolated</name><bridge name='bb-virbr0'/></network>"
+
+
+def _net_dumpxml_answer(args):
+    """Isolated-network XML when `args` is a net-dumpxml call, else None."""
+    return _ISOLATED_NET_XML if args and args[0] == "net-dumpxml" else None
+
+
+def _with_isolated_net(stub):
+    """Wrap a _virsh stub so net-dumpxml answers with the isolated network.
+
+    spawn() refuses to boot an unpoliced worker onto a network it cannot read or that
+    forwards — a real precondition these tests are not about. Answering it is honest;
+    disabling the check in the tests that exercise spawn would put us back where two
+    review rounds found us.
+    """
+    def wrapped(*a, **k):
+        if (xml := _net_dumpxml_answer(a)) is not None:
+            return type("C", (), {"returncode": 0, "stdout": xml, "stderr": ""})()
+        return stub(*a, **k)
+    return wrapped
 
 
 def _stub_virsh(rt, monkeypatch, *, domtime_ok=False):

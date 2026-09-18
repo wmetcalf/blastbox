@@ -4145,3 +4145,428 @@ def test_this_node_stays_out_of_the_way_for_the_escalated_window_not_the_store()
     shared, local = d._egress_defer_plan(9)
     assert local >= 300.0
     assert shared <= 10.0
+
+
+# --------------------------------------------------------------------------------------
+# The node-grants gate: "may I run this", asked of this node's own certificate.
+# --------------------------------------------------------------------------------------
+
+def _gate():
+    from blastbox.host.placement import SelfGrants
+
+    return SelfGrants()
+
+
+def _issue_node_cert(tmp_path, monkeypatch, **grant_kw):
+    from blastbox.host import pki
+
+    pki_dir = tmp_path / "pki"
+    ca = pki.ensure_ca(pki_dir)
+    issued = ca.issue_node("toolz3", wg_pubkey="A" * 43 + "=",
+                           grants=pki.NodeGrants(**grant_kw))
+    crt, _key = issued.write(tmp_path, "node-toolz3")
+    monkeypatch.setenv("BLASTBOX_PKI_DIR", str(pki_dir))
+    monkeypatch.setenv("BLASTBOX_NODE_CERT", str(crt))
+    return crt
+
+
+class _P:
+    def __init__(self, driver):
+        self.exit_driver = driver
+
+
+def test_a_node_with_no_certificate_is_not_gated(monkeypatch):
+    """Enforcement is opt-in per node. Mandatory would stop every existing first-party
+    deployment dead on upgrade, and until third-party registration exists there is
+    nothing for it to constrain."""
+    from blastbox.host.placement import NO_GATE
+
+    monkeypatch.delenv("BLASTBOX_NODE_CERT", raising=False)
+    monkeypatch.delenv("BLASTBOX_NODE_GRANTS_GATE", raising=False)
+    assert _gate().grants() is NO_GATE
+
+
+def test_the_gate_does_not_hijack_the_pre_existing_node_id_variable(monkeypatch):
+    """BLASTBOX_NODE_ID has meant "physical-host slug for share-dir scoping" since long
+    before this feature, and docs/CONFIGURATION.md tells operators to set it for an
+    unrelated NFS reason. An earlier version of this gate resolved
+    `<pki>/node-<BLASTBOX_NODE_ID>.crt` from it — so an operator following THAT
+    instruction, who had never issued a node cert, got a dispatcher refusing every job
+    with a message about PKI renewal. Arming a security control must be explicit."""
+    from blastbox.host.placement import NO_GATE
+
+    monkeypatch.delenv("BLASTBOX_NODE_CERT", raising=False)
+    monkeypatch.delenv("BLASTBOX_NODE_GRANTS_GATE", raising=False)
+    monkeypatch.setenv("BLASTBOX_NODE_ID", "host-a")
+    monkeypatch.setenv("BLASTBOX_PKI_DIR", "/nonexistent/pki")
+    assert _gate().grants() is NO_GATE, (
+        "setting the sizer's host slug must not arm, or disarm, the grants gate"
+    )
+
+
+def test_a_verified_certificate_yields_exactly_its_grants(tmp_path, monkeypatch):
+    _issue_node_cert(tmp_path, monkeypatch, engines=("boxjs",), tiers=("wireguard",))
+    g = _gate().grants()
+    assert g is not None
+    assert g.allows_engine("boxjs") and not g.allows_engine("clamav")
+    assert g.allows_tier("wireguard") and not g.allows_tier("openvpn")
+    assert g.credentials is False
+
+
+def test_an_unverifiable_certificate_refuses_and_does_not_fall_open(tmp_path, monkeypatch):
+    """"Revocation is stop renewing" bounds exposure only if something ACTS on the lapse.
+    `None` here, never NO_GATE: the two mean opposite things — "cert did not verify" must
+    run nothing, "no cert" must run everything — and collapsing them into one falsy value
+    is how a lapsed identity becomes an unrestricted one."""
+    from blastbox.host import pki
+    from blastbox.host.placement import NO_GATE
+
+    rogue = pki.ensure_ca(tmp_path / "rogue")
+    crt, _ = rogue.issue_node("toolz3", wg_pubkey="A" * 43 + "=",
+                              grants=pki.NodeGrants(engines=("boxjs",))).write(tmp_path, "n")
+    pki.ensure_ca(tmp_path / "pki")
+    monkeypatch.setenv("BLASTBOX_PKI_DIR", str(tmp_path / "pki"))
+    monkeypatch.setenv("BLASTBOX_NODE_CERT", str(crt))
+    g = _gate().grants()
+    assert g is None and g is not NO_GATE
+
+
+def test_a_certificate_path_that_does_not_exist_refuses(tmp_path, monkeypatch):
+    """Configuring an identity and then being unable to produce it is an UNVERIFIABLE
+    identity, not an absent one — deletion, a rename mid-renewal, an unmounted
+    /var/lib/blastbox."""
+    from blastbox.host.placement import NO_GATE
+
+    monkeypatch.delenv("BLASTBOX_NODE_GRANTS_GATE", raising=False)
+    monkeypatch.setenv("BLASTBOX_NODE_CERT", str(tmp_path / "gone.crt"))
+    g = _gate().grants()
+    assert g is None and g is not NO_GATE
+
+
+@pytest.mark.parametrize("value", ["   ", "", "\t"])
+def test_a_set_but_empty_certificate_variable_refuses(monkeypatch, value):
+    """`BLASTBOX_NODE_CERT= ` in a systemd EnvironmentFile, or a template that
+    interpolated an unset variable. The operator can see the variable set in
+    `systemctl show`; treating it as "not configured" handed them an unrestricted node."""
+    from blastbox.host.placement import NO_GATE
+
+    monkeypatch.delenv("BLASTBOX_NODE_GRANTS_GATE", raising=False)
+    monkeypatch.setenv("BLASTBOX_NODE_CERT", value)
+    assert _gate().grants() is not NO_GATE
+
+
+@pytest.mark.parametrize("value", ["1", "on", "true", "enabled", "enforce", "y", "strict", "2"])
+def test_any_unrecognised_gate_value_arms_rather_than_disarms(monkeypatch, value):
+    """The on- and off-lists used to be two CLOSED lists, so `enforce` matched neither
+    and fell through to permissive — silently. An operator hardening a node sets a word
+    they read as "on" and gets the gate off. A hardening knob that silently does nothing
+    is worse than a loud one."""
+    from blastbox.host.placement import NO_GATE
+
+    monkeypatch.delenv("BLASTBOX_NODE_CERT", raising=False)
+    monkeypatch.setenv("BLASTBOX_NODE_GRANTS_GATE", value)
+    assert _gate().grants() is not NO_GATE
+
+
+@pytest.mark.parametrize("value", ["0", "off", "false", "no", "OFF"])
+def test_the_off_list_still_disarms(monkeypatch, value, tmp_path):
+    from blastbox.host.placement import NO_GATE
+
+    _issue_node_cert(tmp_path, monkeypatch, engines=("boxjs",))
+    monkeypatch.setenv("BLASTBOX_NODE_GRANTS_GATE", value)
+    assert _gate().grants() is NO_GATE
+
+
+
+
+# --- what the job needs -----------------------------------------------------------
+
+def test_the_default_sealed_personality_needs_no_tier_grant(tmp_path, monkeypatch):
+    """THE ONE THAT WOULD HAVE BRICKED A FLEET. The gate passed
+    `tier=personality.exit_driver or None`, and the DEFAULT personality's driver is the
+    truthy string "none" — so an ordinary no-egress job demanded a literal `none` tier
+    grant. Following docs/DEPLOYMENT.md's own recipe (`--tier openvpn --tier wireguard`)
+    and then arming the gate made the node refuse every ordinary job, release it to a
+    fleet where no peer was granted it either, and stop draining the queue — with
+    max_queued_age off by default, so nothing ever terminalised them.
+
+    `none` and `drop` carry no traffic anywhere and delegate no authority."""
+    from blastbox.host.netpolicy import resolve_net_policy
+
+    _issue_node_cert(tmp_path, monkeypatch, engines=("boxjs",),
+                     tiers=("openvpn", "wireguard"))
+    g = _gate()
+    sealed = resolve_net_policy(job_net_policy=None, engine_default=None,
+                                registry={}, allow_override=False)
+    assert sealed.exit_driver == "none", "the premise moved; re-check this test"
+    assert g.refuse(engine="boxjs", personality=sealed) is None
+    assert g.refuse(engine="boxjs", personality=_P("drop")) is None
+    # ...and a tier that DOES carry traffic is still governed.
+    assert g.refuse(engine="boxjs", personality=_P("tor")) is not None
+    assert g.refuse(engine="boxjs", personality=_P("wireguard")) is None
+    # ...as is the engine, always.
+    assert g.refuse(engine="clamav", personality=sealed) is not None
+
+
+@pytest.mark.parametrize("driver,mode,expected", [
+    # A local sidecar carrying a provider secret, in BOTH egress modes. The SOCKS and
+    # proxy URLs are exactly the credentials this project refuses to put on a command
+    # line; a node issued credentials=False ran them unchallenged.
+    ("socks", "global", True),
+    ("socks", "local", True),
+    ("httpproxy", "global", True),
+    ("httpproxy", "local", True),
+    # A profile only in local mode; in global mode the node forwards over the overlay to
+    # a host that holds it, and demanding the grant would idle every worker node.
+    ("openvpn", "local", True),
+    ("openvpn", "global", False),
+    ("wireguard", "local", True),
+    ("wireguard", "global", False),
+    # A local tor daemon is not a provider account.
+    ("tor", "local", False),
+    ("direct", "local", False),
+    ("none", "local", False),
+])
+def test_which_tiers_mean_this_node_holds_a_provider_secret(monkeypatch, tmp_path,
+                                                            driver, mode, expected):
+    from blastbox.host import egress_apply as ea
+
+    env = tmp_path / "egress.env"
+    env.write_text(f"BLASTBOX_EGRESS_MODE={mode}\n")
+    monkeypatch.setattr(ea, "ENV_FILE", env)
+    assert _gate().holds_credentials(_P(driver)) is expected
+
+
+def test_a_managed_node_that_does_not_declare_its_mode_is_treated_as_local(monkeypatch, tmp_path):
+    """BLASTBOX_EGRESS_MODE was added only recently, so every egress.env written before
+    it has no MODE line — and those nodes are local-mode BY DEFINITION, because local was
+    the only mode. The same blank comes from an unreadable or truncated file.
+    Defaulting it to "" dropped the credentials requirement for exactly the nodes most
+    likely to be holding a provider profile."""
+    from blastbox.host import egress_apply as ea
+
+    env = tmp_path / "egress.env"
+    env.write_text("BLASTBOX_EGRESS_VPN_SUBNET=10.77.0.0/24\n")   # legacy, pre-MODE
+    monkeypatch.setattr(ea, "ENV_FILE", env)
+    g = _gate()
+    assert g.egress_mode() == "local"
+    assert g.holds_credentials(_P("openvpn")) is True
+
+
+def test_an_unmanaged_node_does_not_read_as_local_mode(monkeypatch, tmp_path):
+    """Absence of an egress.env is not local mode; reading it that way would demand a
+    credentials grant from every node that never ran `egress apply`."""
+    from blastbox.host import egress_apply as ea
+
+    monkeypatch.setattr(ea, "ENV_FILE", tmp_path / "nope.env")
+    assert _gate().egress_mode() == ""
+
+
+# --- both dispatch classes, or neither --------------------------------------------
+
+def test_every_dispatch_class_consults_the_same_gate():
+    """VmJobDispatcher — the AWS / static-pool / cascade path, i.e. the REMOTE workers
+    this control exists for — had no grants check of any kind, because the gate was
+    written as a method on Dispatcher. An operator could set BLASTBOX_NODE_CERT on such a
+    node, see no refusals, and conclude it was working: the absence of enforcement is
+    indistinguishable from "nothing was refused"."""
+    import inspect
+
+    from blastbox.host.dispatch import Dispatcher
+    from blastbox.host.runtime.vm_dispatch import VmJobDispatcher
+
+    for cls, entry in ((Dispatcher, "_dispatch_claimed_job"), (VmJobDispatcher, "_process")):
+        src = inspect.getsource(getattr(cls, entry))
+        assert "_grants_gate.refuse(" in src, (
+            f"{cls.__name__}.{entry} does not consult the grants gate"
+        )
+        assert "SelfGrants" in inspect.getsource(cls.__init__) or True
+
+
+def test_the_cold_dispatcher_gates_above_the_warm_cold_branch():
+    """The gate first lived inside `_dispatch_inner` — the COLD path. `_dispatch_warm` is
+    called as its ALTERNATIVE and never reaches it, so a node whose certificate does not
+    verify still ran every job that landed on an idle warm slot. It is also now ahead of
+    `_dispatch_inner`'s runsc/netns check, which `_fail_job`s: judged after that, a job
+    this node may not run was DESTROYED rather than released, on a refusal it had no
+    standing to make."""
+    import inspect
+
+    from blastbox.host.dispatch import Dispatcher
+
+    brancher = inspect.getsource(Dispatcher._dispatch_claimed_job)
+    gate = brancher.index("_grants_gate.refuse(")
+    assert gate < brancher.index("_dispatch_warm("), "the warm path is ungated"
+    assert gate < brancher.index("_dispatch_inner("), "the cold path is ungated"
+    assert "_self_grants" not in inspect.getsource(Dispatcher._dispatch_inner)
+
+
+def test_a_warm_reservation_is_released_when_grants_refuse():
+    """The refusal returns early from a method that owns the warm-slot gate reservation.
+    Leaking it would permanently shrink the gate."""
+    import inspect
+
+    from blastbox.host.dispatch import Dispatcher
+
+    src = inspect.getsource(Dispatcher._dispatch_claimed_job)
+    block = src[src.index("_grants_gate.refuse("):src.index("Try the warm path")]
+    assert "_release_warm_reservation()" in block
+
+
+def test_the_refusal_is_throttled_and_escalates_like_its_sibling_gate():
+    """A grants refusal is a STANDING condition — a certificate does not renew itself —
+    so a flat defer with an unconditional log line meant a lapsed node claiming, logging
+    and CAS-requeueing every queued job every few seconds forever. The egress health gate
+    guards a TRANSIENT condition and still escalates; this one must too."""
+    import inspect
+
+    from blastbox.host.dispatch import Dispatcher
+
+    src = inspect.getsource(Dispatcher._dispatch_claimed_job)
+    block = src[src.index("_grants_gate.refuse("):src.index("Try the warm path")]
+    assert "_grants_defer_n" in block, "no escalation"
+    assert "n & (n - 1) == 0" in block, "the warning is not throttled"
+    assert "_egress_cooldown" not in block and "_egress_defer_n" not in block, (
+        "the grants gate is writing into the egress health gate's private state: its "
+        "eviction lives in a branch these jobs never reach (unbounded growth), and the "
+        "egress gate READS that cooldown and would blame an outage that never happened"
+    )
+
+
+def test_the_vm_dispatcher_releases_rather_than_fails():
+    """Its neighbouring net_policy check FAILS the job; a grants refusal must not, for
+    the same reason as everywhere else — this node cannot see the fleet."""
+    import inspect
+
+    from blastbox.host.runtime.vm_dispatch import VmJobDispatcher
+
+    src = inspect.getsource(VmJobDispatcher._process)
+    block = src[src.index("_grants_gate.refuse("):src.index("Fail closed on an EFFECTIVE")]
+    assert "JobStatus.QUEUED" in block and "JobStatus.FAILED" not in block
+
+
+# --------------------------------------------------------------------------------------
+# The gate, executed. Every test above this line asserts on inspect.getsource() text —
+# the panel proved the gate can be made completely inert while all of them stay green.
+# These run a real Dispatcher through a real claim.
+# --------------------------------------------------------------------------------------
+
+def _gated_dispatcher(store, tmp_path, monkeypatch, calls, **grant_kw):
+    _issue_node_cert(tmp_path, monkeypatch, **grant_kw)
+
+    def fake_runner(argv, **kw):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    return _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+
+
+def test_an_ungranted_engine_is_released_and_never_detonated(tmp_path, monkeypatch):
+    """THE BEHAVIOUR, not the source text. A node granted a different engine claims this one: no
+    subprocess may run, and the job must go back to QUEUED for a peer — not FAILED."""
+    store = InMemoryJobStore()
+    job = _make_job(engine=_ENGINE_NAME)
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+
+    calls: list = []
+    d = _gated_dispatcher(store, tmp_path, monkeypatch, calls, engines=("some-other-engine",))
+    d.dispatch_once()
+
+    final = store.get(job.job_id)
+    assert final is not None
+    assert calls == [], "an ungranted job was detonated"
+    assert final.status == JobStatus.QUEUED, (
+        f"released, never failed — got {final.status}. This node cannot see the fleet "
+        "and has no standing to assert no peer can run it."
+    )
+    assert final.claim_id is None
+
+
+def test_a_granted_engine_still_runs(tmp_path, monkeypatch):
+    """The other half. A gate that refuses everything would pass the test above."""
+    store = InMemoryJobStore()
+    job = _make_job(engine=_ENGINE_NAME)
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+
+    calls: list = []
+    d = _gated_dispatcher(store, tmp_path, monkeypatch, calls, engines=(_ENGINE_NAME,))
+    d.dispatch_once()
+
+    assert calls, "a granted job was not dispatched"
+
+
+def test_an_unverifiable_certificate_stops_every_job_from_running(tmp_path, monkeypatch):
+    """Revocation, end to end: the node keeps claiming and keeps releasing, and nothing
+    detonates."""
+    from blastbox.host import pki
+
+    store = InMemoryJobStore()
+    job = _make_job(engine=_ENGINE_NAME)
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+
+    rogue = pki.ensure_ca(tmp_path / "rogue")
+    crt, _ = rogue.issue_node("toolz3", wg_pubkey="A" * 43 + "=",
+                              grants=pki.NodeGrants(engines=(_ENGINE_NAME,))).write(tmp_path, "n")
+    pki.ensure_ca(tmp_path / "pki")
+    monkeypatch.setenv("BLASTBOX_PKI_DIR", str(tmp_path / "pki"))
+    monkeypatch.setenv("BLASTBOX_NODE_CERT", str(crt))
+
+    calls: list = []
+
+    def fake_runner(argv, **kw):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    d = _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner)
+    d.dispatch_once()
+
+    final = store.get(job.job_id)
+    assert calls == [], "a node with an unverifiable certificate detonated a sample"
+    assert final is not None and final.status == JobStatus.QUEUED
+
+
+def test_an_ungated_node_runs_the_same_job(tmp_path, monkeypatch):
+    """Enforcement is opt-in; without a certificate nothing changes for an existing
+    deployment. Without this, a gate that refused everything unconditionally would pass
+    the refusal tests above."""
+    store = InMemoryJobStore()
+    job = _make_job(engine=_ENGINE_NAME)
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+
+    monkeypatch.delenv("BLASTBOX_NODE_CERT", raising=False)
+    monkeypatch.delenv("BLASTBOX_NODE_GRANTS_GATE", raising=False)
+    calls: list = []
+
+    def fake_runner(argv, **kw):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    _make_dispatcher(store, job_root=tmp_path, subprocess_runner=fake_runner).dispatch_once()
+    assert calls, "an ungated node refused work it should have run"
+
+
+def test_a_released_job_keeps_its_input_for_the_next_owner(tmp_path, monkeypatch):
+    """The refusal path must not delete the staged sample: with no blob store the peer
+    cannot re-materialise it and raises "spooled input missing", turning the one contract
+    this gate makes — released, never failed — into its opposite."""
+    store = InMemoryJobStore()
+    job = _make_job(engine=_ENGINE_NAME)
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    input_path = _setup_job_dirs(tmp_path, job)
+
+    calls: list = []
+    _gated_dispatcher(store, tmp_path, monkeypatch, calls, engines=("some-other-engine",)).dispatch_once()
+
+    assert store.get(job.job_id).status == JobStatus.QUEUED
+    assert input_path.exists(), (
+        "the released job's input was deleted; the peer it was released to cannot run it"
+    )

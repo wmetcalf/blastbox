@@ -110,8 +110,24 @@ class LibvirtVmConfig:
 
     mem_mb: int = 4096
     vcpus: int = 2
-    network: str = "default"
-    """libvirt network the worker NIC attaches to."""
+    network: str = "bb-isolated"
+    """libvirt network the worker NIC attaches to.
+
+    NOT ``default``. libvirt's ``default`` network is ``<forward mode='nat'/>`` — it has
+    working internet — and this field's old default combined with ``egress_policy=None``
+    (whose docstring says "worker reaches whatever the libvirt network allows") meant a
+    VmConfig with nothing specified put a malware VM on NAT with no host-side rules at
+    all. Two independent defaults, each individually defensible, conspiring into direct
+    egress.
+
+    ``bb-isolated`` is libvirt's own idiom for "no internet": a ``<network>`` with NO
+    ``<forward>`` element, so the guest reaches the host and its peers and nothing
+    forwards to the physical NIC. Shipped in ``deploy/libvirt/bb-isolated.xml``.
+
+    THE DEFAULT IS NOT THE CONTROL. :meth:`_assert_egress_is_governed` verifies at spawn
+    that the network this VM actually attaches to does not forward whenever no
+    ``egress_policy`` is set — a default can be overridden by a config file, a check
+    cannot."""
 
     machine: str = "pc"
     emulator: str = ""
@@ -150,7 +166,14 @@ class LibvirtVmConfig:
     ``no-ip-spoofing`` learn an attacker-supplied lease (DHCP-learning mode), nor disturb a sibling's
     learning. "" auto-derives ``subnet_prefix + "1"`` (the libvirt default bridge/dnsmasq IP); set
     explicitly for a non-standard network gateway. Only emitted for the ``clean-traffic`` nwfilter."""
-    subnet_prefix: str = "192.168.122."
+    #: MUST TRACK `network`. This stayed at libvirt's `default` subnet when the network
+    #: default moved to bb-isolated (192.168.221.0/24) — so with pure defaults
+    #: `_domain_xml()` pinned DHCPSERVER to a bridge address that does not exist and
+    #: `_ip_for_mac()` rejected every neighbour on the real subnet, leaving the VM
+    #: undiscoverable. The same "second copy of a default" mistake as `network` itself,
+    #: one field over. `_assert_subnet_matches_network()` now checks it against what
+    #: libvirt reports rather than trusting either default.
+    subnet_prefix: str = "192.168.221."
     """DHCP subnet of ``network``; used to resolve the worker IP via the host neigh table."""
 
     boot_timeout_s: float = 240.0
@@ -162,8 +185,9 @@ class LibvirtVmConfig:
 
     egress_policy: VmEgressPolicy | None = None
     """Optional host-side egress policy applied to the worker's IP at spawn, removed at reap
-    (the rooter model — see libvirt_egress). None = no per-worker egress rules (worker reaches
-    whatever the libvirt network allows)."""
+    (the rooter model — see libvirt_egress). None = no per-worker egress rules, which is
+    safe ONLY on a non-forwarding network — see :meth:`_assert_egress_is_governed`, which
+    refuses to boot the pairing this docstring used to describe as normal."""
 
     gateway: str | None = None
     """Bridge/resolver IP exempted for DNS under ``block_internal``. Defaults to
@@ -388,11 +412,161 @@ class LibvirtVmRuntime:
         raise RuntimeError("could not allocate a unique VM overlay name after 8 attempts")
 
     # ---- SlotRuntime ---------------------------------------------------------
+    #: libvirt forward modes that reach the physical network. A network with NO
+    #: <forward> element at all is libvirt's isolated mode — guest-to-guest and
+    #: guest-to-host only — and is the one shape that is safe without per-worker rules.
+    #: `route` is included deliberately: it does not NAT, but it forwards, and a malware
+    #: VM on a routed network is on the LAN.
+    FORWARDING_MODES = ("nat", "route", "bridge", "private", "vepa", "passthrough",
+                        "hostdev", "open")
+
+    def _network_xml(self) -> "tuple[int, str]":
+        """``(returncode, xml)`` for this VM's libvirt network. One reader, two callers."""
+        proc = self._virsh("net-dumpxml", self.cfg.network)
+        rc = getattr(proc, "returncode", 1)
+        return rc, ((getattr(proc, "stdout", "") or "") if rc == 0 else "")
+
+    #: A `<forward>` ELEMENT, not the substring. `"<forward" in xml` also matches
+    #: `<forwarder`, and `<dns><forwarder addr='...'/></dns>` is perfectly ordinary on an
+    #: ISOLATED network — so adding split-DNS to bb-isolated used to invert this check in
+    #: both directions at once: an unpoliced worker was refused with a message claiming
+    #: the network was NAT, and a `direct` worker was allowed onto a network that cannot
+    #: carry it.
+    _FORWARD_EL = re.compile(r"<forward(?=[\s/>])", re.I)
+    _FORWARD_MODE = re.compile(r"<forward\b[^>]*\bmode=['\"]([^'\"]+)['\"]", re.I)
+
+    def _forward_mode(self, xml: str) -> "str | None":
+        """The network's forward mode, ``None`` if it has no ``<forward>`` element at all.
+
+        A modeless ``<forward/>`` is NAT, which is what libvirt does with it.
+        """
+        m = self._FORWARD_MODE.search(xml)
+        if m:
+            return m.group(1).strip().lower()
+        return "nat" if self._FORWARD_EL.search(xml) else None
+
+    def _forwards(self, xml: str) -> bool:
+        """Does this ALREADY-READ network definition reach the physical network?
+
+        Takes the xml rather than re-reading it: the caller has validated one read, and a
+        second `net-dumpxml` can fail or disagree — its error was ignored, so a transient
+        failure between the two calls made an unreadable network look non-forwarding and
+        skipped the isolation refusal entirely.
+        """
+        mode = self._forward_mode(xml)
+        if mode is None:
+            return False
+        # UNRECOGNISED MEANS FORWARDING. The old test was an allowlist of BAD modes, so
+        # any mode libvirt adds later, or any capitalisation, read as safe.
+        return True
+
+    def _network_forwards(self) -> bool:
+        """Does this network reach the physical network?
+
+        Callers must have already refused an unreadable network — see
+        :meth:`_assert_egress_is_governed`, which does that FIRST now. An earlier version
+        of this docstring claimed "the egress check refuses an unreadable network anyway",
+        which was false: that refusal lived below an unconditional `return` in the
+        has-a-policy branch, so an unreadable network produced no refusal at all for
+        tunnel drivers and the WRONG diagnosis for `direct` ("does not forward", telling
+        the operator to switch to a NAT network because libvirtd was down).
+        """
+        _rc, xml = self._network_xml()
+        return self._forwards(xml)
+
+    def _assert_subnet_matches_network(self) -> None:
+        """The configured subnet_prefix must be the one this libvirt network actually
+        serves, or the guest is undiscoverable in a way that looks like a boot failure.
+
+        `subnet_prefix` feeds DHCPSERVER in the domain XML and the neighbour filter in
+        `_ip_for_mac`. When the network default moved and this did not, both silently
+        pointed at an address range nothing was on — `virsh net-dumpxml` knows the truth,
+        so ask it instead of trusting two defaults to stay in step.
+
+        A MISMATCH IS A WARNING, NOT A REFUSAL. Being on the wrong subnet is an
+        availability bug, not a containment one, and an operator with a deliberate
+        split-horizon layout should not be blocked by it — unlike
+        :meth:`_assert_egress_is_governed`, where the failure mode is malware on the
+        internet.
+        """
+        proc = self._virsh("net-dumpxml", self.cfg.network)
+        if getattr(proc, "returncode", 1) != 0:
+            return          # the egress check already refuses on an unreadable network
+        m = re.search(r"<ip[^>]*\baddress=['\"]([0-9.]+)['\"]", getattr(proc, "stdout", "") or "")
+        if not m:
+            return          # no <ip> (a pure-L2 network); subnet_prefix is not used
+        actual = m.group(1).rsplit(".", 1)[0] + "."
+        want = (self.cfg.subnet_prefix or "").rstrip(".") + "."
+        if want != actual:
+            logger.warning(
+                "libvirt network %r serves %s0/24 but subnet_prefix is %r. The guest's "
+                "DHCPSERVER and the neighbour lookup both key on subnet_prefix, so this "
+                "worker will boot and then never be discovered as ready. Set "
+                "subnet_prefix=%r, or point `network` at the one matching it.",
+                self.cfg.network, actual, self.cfg.subnet_prefix, actual)
+
+    def _assert_egress_is_governed(self) -> None:
+        """Refuse to boot a VM whose egress this node cannot account for.
+
+        THE PAIRING THIS PREVENTS was reachable from the defaults alone: `network` was
+        `"default"` (libvirt's NAT network) and `egress_policy` was None, so a VmConfig
+        that specified nothing put a malware VM on working internet with no host-side
+        rules. Neither default was wrong by itself, which is why nothing caught it.
+
+        A default cannot be the control — a config file, an env var or a caller overrides
+        it silently. This reads what the guest will ACTUALLY be attached to, at spawn,
+        from libvirt itself.
+
+        FAILS CLOSED ON NOT KNOWING, AND THAT CHECK COMES FIRST. It used to sit below the
+        has-a-policy branch's unconditional `return`, so an unreadable network was only
+        refused for an unpoliced worker — every tunnel driver sailed past it and `direct`
+        got a refusal that misdiagnosed a down libvirtd as a wrong exit driver.
+        """
+        rc, xml = self._network_xml()
+        if rc != 0 or "<network" not in xml:
+            raise RuntimeError(
+                f"cannot read libvirt network {self.cfg.network!r}, so it is not known "
+                "whether this VM would have internet access. Refusing to boot. Define it "
+                "with `virsh net-define deploy/libvirt/bb-isolated.xml && virsh net-start "
+                "bb-isolated && virsh net-autostart bb-isolated`, and check that libvirtd "
+                "is running.")
+        forwards = self._forwards(xml)
+
+        if self.cfg.egress_policy is not None:
+            # `direct` means "go straight out" and `routing_commands()` deliberately
+            # emits no routing and no NAT for it — it relies on the NETWORK to provide a
+            # path. On an isolated network there is none, so the filter chain accepts the
+            # packet and it dies with no return route: the job loses connectivity and
+            # nothing says why. A policy that promises egress on a network that cannot
+            # carry it is a contradiction, and a loud one is better than a silent one.
+            if getattr(self.cfg.egress_policy, "exit_driver", None) == "direct" and not forwards:
+                raise RuntimeError(
+                    f"egress_policy.exit_driver is 'direct' but libvirt network "
+                    f"{self.cfg.network!r} does not forward, so there is no path out and "
+                    "no NAT to create one — the worker would accept packets that never "
+                    "get a reply. Use a forwarding network for direct egress, or an "
+                    "exit_driver that builds its own path (openvpn/wireguard/socks).")
+            return          # per-worker rules govern it; the network's own mode is moot
+
+        if forwards:
+            raise RuntimeError(
+                f"libvirt network {self.cfg.network!r} is <forward mode="
+                f"{self._forward_mode(xml)!r}>, which reaches the physical network, and "
+                "this worker has NO egress_policy — so it would detonate malware with "
+                "direct internet access. Either attach it to an isolated network "
+                "(deploy/libvirt/bb-isolated.xml, the default) or give it an "
+                "egress_policy.")
+
     def spawn(self) -> VmSlot:
         """Provision a COW overlay off the golden, define+start the domain, and return a WARMING
         slot IMMEDIATELY. Readiness (agent up) and the one-time finalize (egress + clean snapshot)
         happen in ``is_ready()`` so the ~60s guest boot never blocks the pool's tick loop —
         matching the async-spawn contract of the FC/gVisor runtimes."""
+        # BEFORE the overlay, the define, or the boot. The guest is reachable on the
+        # libvirt network from `start` onward, so a check after that races the thing it
+        # is checking.
+        self._assert_egress_is_governed()
+        self._assert_subnet_matches_network()
         sid, name, overlay = self._alloc_overlay_name()
         # Assign+enforce: hand this worker a fixed (MAC, IP) and pin it. Allocated BEFORE the try so a
         # pool-exhaustion error doesn't leave a half-built domain; the reservation + explicit pin go in

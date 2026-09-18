@@ -76,7 +76,11 @@ class VmWorkerSpec:
     # domain shape
     mem_mb: int = 4096
     vcpus: int = 2
-    network: str = "default"
+    #: MUST TRACK LibvirtVmConfig.network, and did not: this is the YAML-facing copy and
+    #: it overrides the runtime's default whenever compose is used, so fixing one and not
+    #: the other leaves the whole compose path on libvirt's NAT network. A test asserts
+    #: the two agree. Not `default` — that is libvirt's <forward mode='nat'/> network.
+    network: str = "bb-isolated"
     disk_bus: str = "sata"
     nic_model: str = "e1000"
     nwfilter: str = "clean-traffic"
@@ -85,7 +89,9 @@ class VmWorkerSpec:
     mac_prefix: str = "52:54:00:bb"     # OUI for assign-enforce MACs (last 2 octets derived from the IP)
     dhcp_server: str = ""               # clean-traffic DHCPSERVER (trusted dnsmasq); "" → subnet+".1"
     overlay_dir: str = "/dev/shm"
-    subnet_prefix: str = "192.168.122."
+    #: Tracks LibvirtVmConfig.subnet_prefix, which tracks `network`. Asserted by a test:
+    #: this is the YAML-facing copy and it WINS, so drift here is drift in production.
+    subnet_prefix: str = "192.168.221."
 
     # guest agent
     agent_port: int = 8765

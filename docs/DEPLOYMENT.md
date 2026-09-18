@@ -309,6 +309,66 @@ sudo blastbox egress check
 sudo scripts/test-egress-leak.sh --mode global
 ```
 
+**libvirt VM workers get no internet unless they are given it.** The VM tier attaches
+workers to `bb-isolated` — a libvirt network with **no `<forward>` element**, which is
+libvirt's own idiom for "guests reach each other and the host, nothing forwards to the
+physical NIC". Define it once per VM host:
+
+```bash
+sudo virsh net-define deploy/libvirt/bb-isolated.xml
+sudo virsh net-start bb-isolated
+sudo virsh net-autostart bb-isolated
+sudo virsh net-dumpxml bb-isolated | grep -c '<forward'    # must print 0
+```
+
+Verify against **`net-dumpxml`**, not the file. The shipped XML's comments mention
+`<forward>` several times (warning you not to add one), so `grep -c '<forward'` on
+`deploy/libvirt/bb-isolated.xml` prints 3 and proves nothing; `net-dumpxml` returns what
+libvirt actually parsed, comments stripped. Confirmed on a live host: the file greps 3,
+the dump greps 0.
+
+If `net-start` fails with `Unable to create: /var/lib/libvirt/dnsmasq/<bridge>.status`
+(`errno=13`), the cause is host ownership, not this definition: `/var/lib/libvirt/dnsmasq`
+must be `root:root`. dnsmasq drops to `nobody` and cannot create a new status file in a
+directory owned by someone else — and networks defined *before* the ownership changed keep
+working, because their status files already exist, so the breakage only ever shows up on
+the next new network.
+
+This replaces libvirt's shipped `default` network, which is `<forward mode='nat'/>` and
+has working internet. That was the previous default, and combined with `egress_policy`
+being optional it meant a VM worker configured with nothing at all detonated malware with
+direct NAT egress and no host-side rules — two individually reasonable defaults
+conspiring, which is why neither looked wrong.
+
+The default is not the control. `spawn()` reads the network the guest will **actually**
+attach to and refuses to boot a worker that has no `egress_policy` onto anything that
+forwards — including `route`, which does not translate addresses but still puts the guest
+on your LAN — and refuses just as firmly when it cannot read the network definition at
+all. A worker that *needs* egress gets it the governed way: a per-worker `egress_policy`
+applied to its IP by the rooter, not by being placed on a network that forwards.
+
+**Arming the grants gate on a worker (optional).** `pki issue-node` writes the cert on
+the host you ran it on — step 3 above runs on the EXIT HOST — so enabling enforcement on
+a worker means copying two files to it and pointing one variable at them:
+
+```bash
+# on the exit host
+scp /var/lib/blastbox/pki/node-toolz3.crt /var/lib/blastbox/pki/ca.crt toolz3:/var/lib/blastbox/pki/
+# on the worker, in the dispatcher's environment
+BLASTBOX_NODE_CERT=/var/lib/blastbox/pki/node-toolz3.crt
+```
+
+`ca.crt` is required and is easy to forget: verification needs the CA's **public** half
+on the worker (never `ca.key`, which stays on the issuing host). Then
+`blastbox pki node-status` on the worker says whether the gate is armed, whether the
+certificate verifies, and what it would accept. A node whose certificate does not verify
+**refuses all work** — that is revocation working, and it is also what an unnoticed
+missing `ca.crt` looks like, so check `node-status` before concluding the fleet is idle.
+
+Note that once the gate is armed, the paragraph below about the worker side looking fine
+no longer holds: an expired certificate stops the worker taking any job at all, not just
+its egress ones.
+
 **Step 3 RECURS.** `pki issue-node` defaults to a 7-day lifetime — that short lifetime is
 what makes "revocation is stop renewing" work without a CRL or any online check — and the
 exit host's `prune_expired_peers` runs on every `apply`, which now includes the reconcile

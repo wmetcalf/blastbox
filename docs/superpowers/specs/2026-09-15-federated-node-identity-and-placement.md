@@ -197,12 +197,21 @@ Honesty ahead of enthusiasm, because this bounds the product:
    nothing writes to.
 3. **Eligibility filtering** (`blastbox.host.placement`, NOT `plan_sizes` — see §4.3) —
    grants restrict which engines/tiers a node may be assigned. Still first-party nodes
-   only. **Written, NOT WIRED.** `eligible()`/`rank()` exist and are tested, and nothing
-   in `src/` calls them — no CLI subcommand, no dispatcher hook — so no code path
-   consults grants when placing a job. Steps 2 and 3 are libraries waiting for a caller,
-   and "Done" read as "in force", which is the exact confusion §5 is about. Both modules
-   carry a NOT-YET-WIRED banner, pinned by a test that fails once something imports
-   them.
+   only. **Half done, and the half that enforces.** A dispatcher now calls
+   `placement.refusal()` about ITSELF before running a claimed job — the leaderless
+   shape §4.2 argues for: no elected placer, every node applying the same deterministic
+   predicate. Opt-in per node (`BLASTBOX_NODE_CERT`), because mandatory would stop every
+   existing first-party install on upgrade; an unverifiable certificate refuses rather
+   than abstains, which is what makes "revocation is stop renewing" real at the
+   dispatcher as well as at the overlay. A job this node is not granted is RELEASED to
+   the fleet, never failed — it cannot see the fleet and has no standing to say no peer
+   can run it.
+
+   Still not wired: `eligible()`/`rank()` over a FLEET view, the "choose a node for this
+   job" half, because nothing builds that view (step 2). The docstrings track the split
+   in both directions and a test fails if either drifts — an earlier version of that
+   test grepped a path that does not exist and passed while asserting the opposite of
+   the truth, which is worth recording as the failure mode of tripwires generally.
 4. **External containment verification at the exit host** (§5). This is the gate that should
    precede any third-party node holding egress. **Done** — `blastbox.host.exit_attest`,
    `blastbox egress attest`.

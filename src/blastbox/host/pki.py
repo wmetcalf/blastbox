@@ -117,6 +117,12 @@ class NodeIdentity:
     wg_pubkey: str
     grants: NodeGrants
     not_after: datetime.datetime
+    #: The certificate's own start of validity. Carried because (not_after - not_before)
+    #: is the one bound on a certificate's life that a WRONG HOST CLOCK cannot inflate —
+    #: both instants come from the signed payload. `placement.SelfGrants` uses it to cap
+    #: the monotonic validity deadline, so a rolled-back clock cannot manufacture
+    #: validity the CA never granted.
+    not_before: datetime.datetime
 
     @property
     def expired(self) -> bool:
@@ -354,6 +360,7 @@ def node_identity(ca: "CertAuthority | TrustAnchor", cert_pem: bytes,
         raise ValueError(f"node certificate is not signed by this CA: {exc}") from exc
 
     not_after = cert.not_valid_after_utc
+    not_before = cert.not_valid_before_utc
     if not allow_expired and _now() >= not_after:
         raise ValueError(f"node certificate expired at {not_after.isoformat()}")
 
@@ -386,7 +393,7 @@ def node_identity(ca: "CertAuthority | TrustAnchor", cert_pem: bytes,
     if not _is_wg_key(wg):
         raise ValueError("node-info extension carries no valid WireGuard public key")
     return NodeIdentity(
-        node_id=node_id, wg_pubkey=wg, not_after=not_after,
+        node_id=node_id, wg_pubkey=wg, not_after=not_after, not_before=not_before,
         grants=NodeGrants(
             engines=tuple(info.get("engines") or ()),
             tiers=tuple(info.get("tiers") or ()),

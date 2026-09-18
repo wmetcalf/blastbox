@@ -1103,6 +1103,75 @@ def _pki_cmd(args: argparse.Namespace) -> int:
             "not_after": ident.not_after.isoformat(), "expired": ident.expired,
         }, indent=2))
         return 1 if ident.expired else 0
+    if args.pki_action == "node-status":
+        # THE QUESTION AN OPERATOR ACTUALLY HAS, which nothing could answer. `show-node
+        # --cert <path>` needs them to already know the path, so it cannot reveal what
+        # the environment RESOLVES to; it verifies with allow_expired=True, so it prints
+        # a healthy identity for a certificate the dispatcher refuses; and it says
+        # nothing about whether the gate is armed. A node quietly not draining its queue
+        # had no diagnostic at all.
+        from blastbox.host.placement import NO_GATE, SelfGrants
+
+        gate = SelfGrants()
+        cert_at = gate.cert_path()
+        value = gate.grants()
+        armed = value is not NO_GATE
+        status: dict[str, object] = {
+            "gate_armed": armed,
+            # EVERY ARM STATES ONLY WHAT WAS ACTUALLY CHECKED. Two were wrong:
+            #  * the forced-off arm asserted "DESPITE having a certificate at X" for a
+            #    path `cert_path()` deliberately never touches, and then said "unset it
+            #    to arm the gate" — which, for a path that does not exist, turns a node
+            #    reporting "runs unrestricted" into one that refuses every job. The
+            #    command telling the operator to make that edit is the worst place for it.
+            #  * with the gate forced ON and no certificate, `grants()` returns None, so
+            #    `armed` was True and it reported "certificate configured but DOES NOT
+            #    VERIFY" while `cert_path` in the same object was null — contradicting
+            #    its own log line a few milliseconds earlier.
+            "why": (
+                f"{SelfGrants.GATE_ENV} is off, so this node runs unrestricted. A "
+                f"certificate path IS configured ({cert_at}) — whether it is usable was "
+                f"not checked, because the gate is disabled. Unset {SelfGrants.GATE_ENV} "
+                "to arm it, and verify with this command afterwards."
+                if not armed and gate.gate_forced() == "off" and cert_at is not None
+                else f"{SelfGrants.GATE_ENV} is off, so this node runs unrestricted (no "
+                f"certificate is configured either)."
+                if not armed and gate.gate_forced() == "off"
+                else "no certificate configured — this node runs unrestricted "
+                f"(set {SelfGrants.CERT_ENV} to arm it)" if not armed
+                else f"{SelfGrants.GATE_ENV} is on but no certificate is configured, so "
+                f"this node refuses ALL work. Set {SelfGrants.CERT_ENV}."
+                if value is None and cert_at is None
+                else "certificate verified" if value is not None
+                else "certificate configured but DOES NOT VERIFY — this node refuses "
+                     "all work until it is renewed"),
+            "cert_path": str(cert_at) if cert_at else None,
+            "forced": gate.gate_forced() or None,
+            "egress_mode": gate.egress_mode() or None,
+        }
+        if armed and value is not None:
+            status["node_id"] = gate.node_id
+            status["engines"] = list(value.engines)
+            status["tiers"] = list(value.tiers)
+            status["credentials"] = value.credentials
+            # What this node would do with the COMMONEST job, which is the thing the
+            # grant list does not make obvious: a sealed job needs no tier at all.
+            # THROUGH THE GATE'S OWN PREDICATE, not a hand-rolled call that drops
+            # `require_credentials`. This printed would_run["socks"] = "yes" for a
+            # certificate with credentials=False while the dispatcher refused it — the
+            # diagnostic added for "a node quietly not draining its queue" actively
+            # contradicting the gate it exists to explain, on four of the eight tiers it
+            # lists.
+            status["would_run"] = {
+                name: (gate.refuse(engine=args.engine,
+                                   personality=type("_P", (), {"exit_driver": name})())
+                       or "yes")
+                for name in ("none", "direct", "tor", "socks", "httpproxy",
+                             "openvpn", "wireguard", "inetsim")
+            }
+            status["checked_engine"] = args.engine
+        print(json.dumps(status, indent=2))
+        return 0 if (not armed or value is not None) else 1
     if args.pki_action == "show-ca":
         print((pki_dir / "ca.crt").read_text(), end="")
         return 0
@@ -1487,6 +1556,13 @@ def build_parser() -> argparse.ArgumentParser:
              "stripped, so --out /tmp/toolz3.crt writes /tmp/toolz3.crt and .key rather "
              "than toolz3.crt.crt. Default: <pki-dir>/node-<node-id>.{crt,key} — this "
              "command ALWAYS writes a private key to disk, it never prints to stdout")
+    pk_ns = pks.add_parser(
+        "node-status",
+        help="what THIS node's environment resolves to: is the grants gate armed, does "
+             "its certificate verify, and what would it accept? Exit 1 if armed and the "
+             "certificate does not verify")
+    pk_ns.add_argument("--engine", default="boxjs",
+                       help="which engine to report the per-tier verdict for (default: boxjs)")
     pk_show = pks.add_parser("show-node", help="verify a node cert and print its identity")
     pk_show.add_argument("--cert", required=True)
     pks.add_parser("show-ca", help="print the CA cert (public trust anchor)")
