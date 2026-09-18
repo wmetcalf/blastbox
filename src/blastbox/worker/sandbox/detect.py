@@ -95,6 +95,20 @@ def _make_backend(
     raise SandboxUnavailable(f"unknown backend: {name!r}")
 
 
+class _ProfileDeniesProbe(SandboxUnavailable):
+    """The backend works; the child profile refuses the probe binary.
+
+    A distinct type because the SELECTION consequence is different. An ordinary smoketest
+    failure means "this backend does not work here, try the next one". This one means the
+    operator's own MAC policy is misconfigured -- and falling through to the next backend
+    walks straight past bwrap (same profile, same denial) to `container`, which on bare metal
+    is a plain subprocess on the host with no namespace, no seccomp and no MAC at all
+    (claude-security lens, #177). Demoting a malware detonation from nsjail to fork/exec
+    because a profile is too narrow is not a fallback, it is the worst possible reading of
+    the operator's intent. Selection stops instead.
+    """
+
+
 def _probe(sb: Sandbox, argv: list[str]) -> Exception | None:
     """Run ``argv`` through ``sb``; None on success, else why not."""
     try:
@@ -137,11 +151,11 @@ def _smoketest(sb: Sandbox) -> tuple[bool, Exception | None]:
                 "sandbox smoketest fails only WITH the AppArmor profile",
                 extra={"backend": sb.name, "profile": profile, "probe": true_path},
             )
-            return False, SandboxUnavailable(
+            return False, _ProfileDeniesProbe(
                 f"{sb.name} smoketest fails with AppArmor profile {profile!r} but passes "
                 f"without it: the profile denies the probe {true_path}. Permit it in the "
                 f"profile (it is also what a worker's own preflight runs), or unload the "
-                f"profile and accept apparmor_missing"
+                f"profile and accept the loss of confinement"
             )
     return False, err
 
@@ -197,25 +211,38 @@ def select_sandbox(
     # Auto-select: prefer container if we're already inside one.
     candidates = _CONTAINER_BACKENDS if _in_container() else _ALL_BACKENDS
 
-    last_error: Exception | None = None
     # EVERY rejection, not just the last one. When no backend survives, the reason the
     # operator needs is usually the FIRST candidate's (nsjail's) -- "last error" reported
     # whatever `container` said, which is a different subsystem and a misleading place to
     # start. One `apparmor_missing` across nsjail and bwrap is a one-command fix; reading it
     # off the container backend's complaint is an afternoon.
     rejections: list[str] = []
+    # Set only by a REJECTION whose structured reasons contain apparmor_missing -- never by
+    # matching text. The smoketest's own diagnosis ends with "...accept apparmor_missing", so
+    # a substring test fired on a host whose profile is loaded AND enforcing and then told the
+    # operator to load it, offering BLASTBOX_WARN_ON_INSECURE=1 as the alternative -- which
+    # cannot help, because the smoketest gate runs before the security gate and ignores that
+    # variable entirely (claude-code-review lens, #177).
+    apparmor_gap = False
     for name in candidates:
         try:
             sb = _make_backend(name, warn_on_insecure=warn_on_insecure, status_path=_status_path)
         except SandboxUnavailable as exc:
-            last_error = exc
             rejections.append(f"{name}: unavailable ({exc})")
             _log.debug("backend unavailable: %s — %s", name, exc)
             continue
 
         smoke_ok, smoke_err = _smoketest(sb)
         if not smoke_ok:
-            last_error = smoke_err
+            if isinstance(smoke_err, _ProfileDeniesProbe):
+                # NOT a fallback condition. Every remaining candidate is either weaker than
+                # this one or carries the same profile, so continuing can only end at a less
+                # confined backend chosen because confinement was misconfigured.
+                _log.error(
+                    "sandbox selection aborted: the child AppArmor profile denies the probe",
+                    extra={"backend": name, "detail": str(smoke_err)},
+                )
+                raise smoke_err
             rejections.append(f"{name}: smoketest failed ({smoke_err})")
             _log.debug("backend smoketest failed: %s — %s", name, smoke_err)
             continue
@@ -224,8 +251,9 @@ def select_sandbox(
         if not secure:
             detail = ", ".join(reasons) or "unspecified"
             if not warn_on_insecure:
-                last_error = SandboxUnavailable(f"{name} insecure: {detail}")
                 rejections.append(f"{name}: insecure ({detail})")
+                if "apparmor_missing" in reasons:
+                    apparmor_gap = True
                 _log.warning(
                     "sandbox backend rejected as insecure",
                     extra={"backend": name, "reasons": reasons},
@@ -239,29 +267,36 @@ def select_sandbox(
         _log.info("sandbox backend selected", extra={"backend": name})
         return sb
 
-    hint = ""
-    if any("apparmor_missing" in r for r in rejections):
-        # The likeliest cause of a fleet-wide "nothing is available" after #160: nsjail no
-        # longer calls itself secure without a MAC profile, which it never actually applied
-        # before either. Name the way out rather than making the operator find it -- and name
-        # the RIGHT one: `apparmor_missing` has two independent causes, and telling an
-        # operator with no `aa-exec` to load a profile sends them to fix the half that is
-        # already fine (codex, #177). The helper is checked here rather than remembered from
-        # a backend, because every backend that could have told us was already rejected.
-        remedy = (
-            "installing the aa-exec helper (the apparmor / apparmor-utils package)"
-            if shutil.which("aa-exec") is None
-            else "loading the child profile named by BLASTBOX_APPARMOR_PROFILE "
-                 "(default blastbox-sandbox) in enforce or kill mode"
-        )
-        hint = (
-            f"; apparmor_missing is satisfied by {remedy} — see deploy/apparmor/README.md — "
-            "or accepted knowingly with BLASTBOX_WARN_ON_INSECURE=1"
-        )
+    hint = _apparmor_remedy() if apparmor_gap else ""
     raise SandboxUnavailable(
-        "no sandbox backend available: "
-        + ("; ".join(rejections) if rejections else f"last error: {last_error}")
-        + hint
+        "no sandbox backend available: " + "; ".join(rejections) + hint
+    )
+
+
+def _apparmor_remedy() -> str:
+    """The way out of `apparmor_missing`, naming the half that is actually missing.
+
+    Two independent causes -- no `aa-exec` helper, or no enforcing profile -- and telling an
+    operator whose apparmor-utils package is absent to go load a profile sends them to fix
+    the half that is already fine (claude-code-review lens, #177). The helper is probed here
+    rather than remembered from a backend, because by the time this is needed every backend
+    that could have said has already been rejected.
+
+    Shared by the auto and FORCED paths. It was written for auto only, so an operator who
+    pinned `BLASTBOX_SANDBOX=bwrap` -- which the pre-#160 deployment recipe told them to do --
+    got `forced backend 'bwrap' is insecure: apparmor_missing` and none of the remedies,
+    while the operator who left it on auto got all of them (claude-blast-radius lens, #177).
+    """
+    remedy = (
+        "installing the aa-exec helper (the apparmor / apparmor-utils package)"
+        if shutil.which("aa-exec") is None
+        else "loading the child profile named by BLASTBOX_APPARMOR_PROFILE "
+             "(default blastbox-sandbox; this repo ships one in deploy/apparmor/) "
+             "in enforce or kill mode"
+    )
+    return (
+        f"; apparmor_missing is satisfied by {remedy} — see deploy/apparmor/README.md — "
+        "or accepted knowingly with BLASTBOX_WARN_ON_INSECURE=1"
     )
 
 
@@ -296,6 +331,7 @@ def _select_forced(
         if not warn_on_insecure:
             raise SandboxUnavailable(
                 f"forced backend {name!r} is insecure: {detail}"
+                + (_apparmor_remedy() if "apparmor_missing" in reasons else "")
             )
         _log.warning(
             "sandbox backend selected in insecure mode (forced)",

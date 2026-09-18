@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import shutil
 import signal
 import subprocess
@@ -48,6 +49,10 @@ from blastbox.worker.sandbox.base import SandboxRequest, SandboxResult, kill_san
 
 
 _log = logging.getLogger("blastbox.worker.sandbox.nsjail")
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
 
 _NSJAIL = shutil.which("nsjail") or "/usr/local/bin/nsjail"
 
@@ -124,6 +129,32 @@ def _find_aa_exec() -> str | None:
     return shutil.which("aa-exec")
 
 
+def _supports_proc_rw(nsjail_path: str) -> bool:
+    """Whether the INSTALLED nsjail accepts ``--proc_rw``.
+
+    aa-exec cannot transition without it (nsjail's default read-only /proc turns the write
+    to /proc/self/attr/exec into EROFS), so attaching the prefix to a build that rejects the
+    flag does not weaken confinement -- it kills every job with `Unknown argument`. Worse,
+    the failure looks exactly like a profile that denies the probe binary, so the operator is
+    sent to edit a profile that is correct (claude-code-review lens, #177).
+
+    Probing a flag that DOES exist upstream is not the mistake this module is recovering
+    from: the dead ``--proc_apparmor`` probe was wrong because the flag it looked for never
+    existed anywhere, so the answer was always False and the branch was dead. This one is
+    checked against the binary actually installed, and a False answer changes behaviour
+    (skip the attachment, report `apparmor_missing`) rather than silently doing nothing.
+    """
+    try:
+        out = subprocess.run(
+            [nsjail_path, "--help"], capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # Unreadable capability = not confirmed. Fail SAFE (no attachment, reported),
+        # never fail-open into an argv that cannot run.
+        return False
+    return "--proc_rw" in (out.stdout + out.stderr)
+
+
 class NsjailSandbox:
     """Sandbox backend that wraps the ``nsjail`` binary.
 
@@ -172,7 +203,23 @@ class NsjailSandbox:
         else:
             self._seccomp_policy = _find_seccomp_policy()
 
+        # Initialised before anything can call _apparmor_enforcing_now() (the log block
+        # below does): it only remembers the last answer so a change logs once.
+        self._apparmor_last_seen: bool | None = None
+
         self._aa_exec: str | None = _find_aa_exec()
+        self._proc_rw_supported = (
+            self._binary_present and _supports_proc_rw(nsjail_path)
+            if self._aa_exec is not None
+            else False
+        )
+        if self._aa_exec is not None and self._binary_present and not self._proc_rw_supported:
+            _log.warning(
+                "nsjail_apparmor_unavailable reason=installed_nsjail_has_no_--proc_rw "
+                "path=%s note=aa_exec_would_fail_with_EROFS_so_no_profile_is_attached",
+                nsjail_path,
+            )
+            self._aa_exec = None
 
         if self._seccomp_policy is None:
             _log.warning(
@@ -185,25 +232,38 @@ class NsjailSandbox:
                 str(self._seccomp_policy),
             )
 
+        # Log what will ACTUALLY happen, not what the binaries make possible. Branching on
+        # the helper alone announced `attach_enabled` on every host with apparmor-utils
+        # installed and no profile loaded -- while bwrap, from identical state, logged
+        # `attach_skipped ... run_proceeds_without_apparmor` at WARNING. That is the same
+        # two-backends-disagree-about-their-own-hardening asymmetry #160 exists to remove,
+        # one layer down, with the accurate line at the level that does NOT reach an alerting
+        # pipeline (claude-code-review lens, #177).
         if self._aa_exec is None:
             _log.warning(
                 "nsjail_apparmor_skipped reason=aa_exec_not_found "
                 "note=child_runs_without_an_apparmor_profile"
             )
+        elif not self._apparmor_enforcing_now():
+            _log.warning(
+                "nsjail_apparmor_attach_skipped reason=profile_not_confirmed_enforcing "
+                "profile=%s note=run_proceeds_without_apparmor",
+                self._apparmor_profile,
+            )
         else:
             _log.info("nsjail_apparmor_attach_enabled aa_exec=%s profile=%s",
                       self._aa_exec, self._apparmor_profile)
-
-        # The profile's MODE is read per launch, not cached here -- see
-        # _apparmor_enforcing_now(). This only remembers the last answer so a change can be
-        # logged once instead of every job.
-        self._apparmor_last_seen: bool | None = None
 
         self._static_insecurity_reasons: list[str] = []
         if not self._binary_present:
             self._static_insecurity_reasons.append("binary_missing")
         if self._seccomp_policy is None:
             self._static_insecurity_reasons.append("seccomp_policy_missing")
+
+        # What confinement looked like when the selector admitted this backend. A LOSS
+        # of it later is a refusal (see _refuse_if_confinement_regressed); never having
+        # had it is not.
+        self._armed_at_admission = self.apparmor_active
 
         _log.info(
             "NsjailSandbox initialised",
@@ -305,6 +365,36 @@ class NsjailSandbox:
     # ------------------------------------------------------------------
     # Public interface
 
+    def _refuse_if_confinement_regressed(self) -> None:
+        """A worker outlives its jobs; `secure` is checked once, at selection.
+
+        `select_sandbox` reads `secure` at worker start and never again, and `run()` used to
+        proceed regardless -- so a profile unloaded, switched to complain, or made
+        unconfirmable under a long-lived worker silently dropped the `aa-exec` prefix (and
+        `--proc_rw`) and kept detonating, on a backend the selector had certified. The
+        per-launch re-read existed but nothing acted on it (claude-security lens, #177).
+
+        The test is a REGRESSION, not a state: confinement that was there at admission and is
+        gone now. A backend that never had a profile is not affected -- it was admitted on
+        that basis, with `apparmor_missing` recorded -- so this cannot turn "cannot read
+        /sys" into a worker that refuses every job, which would be a worse outage than the
+        one it prevents.
+
+        `BLASTBOX_WARN_ON_INSECURE=1` downgrades it to a warning, the same knowing opt-out
+        that governs the rest of the security self-check.
+        """
+        if not self._armed_at_admission or self.apparmor_active:
+            return
+        msg = (
+            f"{self.name}: the AppArmor profile {self._apparmor_profile!r} was enforcing when "
+            f"this backend was admitted and is not now -- refusing to run unconfined on a "
+            f"backend that was selected as confined"
+        )
+        if _env_truthy("BLASTBOX_WARN_ON_INSECURE"):
+            _log.warning("%s (allowed by BLASTBOX_WARN_ON_INSECURE)", msg)
+            return
+        raise SandboxUnavailable(msg)
+
     def run(self, request: SandboxRequest) -> SandboxResult:
         """Run ``request.argv`` inside an nsjail one-shot sandbox.
 
@@ -322,6 +412,7 @@ class NsjailSandbox:
             raise SandboxError("argv must be a non-empty list of strings")
         if not self._binary_present:
             raise SandboxUnavailable(f"nsjail not found at {self._nsjail!r}")
+        self._refuse_if_confinement_regressed()
 
         argv = self._build_argv(request)
         killed = False
@@ -462,18 +553,36 @@ class NsjailSandbox:
         # as impossible for nsjail (deploy/apparmor/README.md, #160). aa-exec performs the
         # transition by writing /proc/self/attr/exec; nsjail mounts /proc read-only by
         # default, so that write returns EROFS and the execve fails -- every job, not just
-        # the confinement. Measured inside this exact argv on an AppArmor 4.x host:
+        # the confinement. Measured inside this argv on an AppArmor 4.x host:
         #
-        #   default   -> open('/proc/self/attr/exec','w').write(...) -> EROFS
-        #               aa-exec: ERROR: Read-only file system   (rc=1, nothing runs)
-        #   --proc_rw -> write succeeds; child reports the target profile
+        #   default    open('/proc/self/attr/exec', O_WRONLY) -> EROFS
+        #              aa-exec: ERROR: Read-only file system   (rc=1, nothing runs)
+        #   --proc_rw  the open succeeds; the child reports the profile the argv asked for
         #
-        # What it costs: nothing measurable at the uid we run as. Re-probed both ways from
-        # inside, /proc/sys/kernel/core_pattern, /proc/sys/vm/drop_caches, /proc/sysrq-trigger,
-        # /proc/self/oom_score_adj and /proc/1/oom_score_adj all stayed unwritable (uid 65534
-        # in a user namespace owns none of them, and /proc/sys is guarded separately), and the
-        # child saw the same 3 pids. Only /proc/self/attr became writable -- which is the
-        # point. It is therefore attached ONLY on the path that needs it, never by default.
+        # WHAT IT COSTS -- corrected, because the first measurement written here was wrong.
+        # It probed with `echo x > $f`, which fails with EINVAL on files that reject the
+        # content, and that was misread as "blocked"; the comment then claimed only
+        # /proc/self/attr became writable. Re-probed with open(O_WRONLY), which cannot lie
+        # about the errno, the real answer at uid 65534 in this jail is:
+        #
+        #   writable with --proc_rw: /proc/self/attr/*, /proc/self/mem, /proc/self/clear_refs,
+        #     /proc/self/coredump_filter, /proc/self/oom_score_adj, /proc/1/oom_score_adj,
+        #     /proc/self/{uid,gid}_map, /proc/self/timerslack_ns   (all EROFS without it)
+        #   still refused either way: /proc/sys/** and /proc/sysrq-trigger (EACCES -- a
+        #     different gate, ownership and the user namespace, not the mount flag)
+        #
+        # /proc/self/mem is the one that matters: a payload can rewrite its own read-only and
+        # executable mappings without mprotect. Cross-process /proc/<pid>/mem is still gated
+        # by ptrace_scope, so this is a widened surface inside the jail, not an escape from
+        # it -- but it IS wider than the pre-#160 child had, and the comment that said
+        # otherwise is exactly the kind of confident-and-disproved claim this repo keeps
+        # finding (claude-security lens, #177).
+        #
+        # The trade only closes because the two travel together: the flag is attached ONLY
+        # when an enforcing child profile is attached with it, and AppArmor mediates these
+        # paths, so the profile is what takes the surface back (deploy/apparmor/README.md
+        # lists the deny rules every child profile should carry). No profile => no --proc_rw
+        # => the child keeps the read-only /proc it always had.
         if aa_exec is not None:
             argv.append("--proc_rw")
 

@@ -425,7 +425,53 @@ class TestAProfileThatDeniesTheProbeSaysSo:
         that the workload can run, and running it anyway would be the 'configuration is
         present' answer to a question about whether it is in force."""
         _sb, msg = self._select(monkeypatch, tmp_path)
-        assert "no sandbox backend available" in msg
+        assert "passes without it" in msg
+
+    def test_selection_stops_here_instead_of_demoting_to_a_weaker_backend(
+            self, monkeypatch, tmp_path: Path) -> None:
+        """THE ONE THAT MATTERS. Falling through walks past bwrap (same profile, same
+        denial), past nono, to `container` -- a plain subprocess on the host with no
+        namespace, no seccomp and no MAC. Under BLASTBOX_WARN_ON_INSECURE=1, which this
+        change's own error message recommends, that backend is selectable, so a too-narrow
+        profile would silently move live malware from nsjail onto bare fork/exec
+        (claude-security lens, #177).
+        """
+        import blastbox.worker.sandbox.detect as detect_mod
+
+        seen: list[str] = []
+        real = detect_mod._make_backend
+
+        def _tracking(name, **kw):
+            seen.append(name)
+            if name == "nsjail":
+                return self._FakeSandbox()
+            return real(name, **kw)
+
+        monkeypatch.delenv("BLASTBOX_SANDBOX", raising=False)
+        monkeypatch.setenv("BLASTBOX_WARN_ON_INSECURE", "1")
+        monkeypatch.setattr(detect_mod, "_in_container", lambda: False)
+        monkeypatch.setattr(detect_mod, "_make_backend", _tracking)
+
+        with pytest.raises(SandboxUnavailable) as ei:
+            select_sandbox(_status_path=_good_status_file(tmp_path))
+        assert "denies the probe" in str(ei.value)
+        assert seen == ["nsjail"], f"selection continued past the misconfigured profile: {seen}"
+
+    def test_warn_on_insecure_does_not_unlock_it_either(
+            self, monkeypatch, tmp_path: Path) -> None:
+        """The variable relaxes the SECURITY gate, which this failure never reaches -- so
+        offering it here would send an operator to permanently disable that gate for no
+        benefit."""
+        import blastbox.worker.sandbox.detect as detect_mod
+
+        monkeypatch.setenv("BLASTBOX_WARN_ON_INSECURE", "1")
+        monkeypatch.delenv("BLASTBOX_SANDBOX", raising=False)
+        monkeypatch.setattr(detect_mod, "_in_container", lambda: False)
+        monkeypatch.setattr(detect_mod, "_make_backend",
+                            lambda name, **kw: self._FakeSandbox())
+        with pytest.raises(SandboxUnavailable) as ei:
+            select_sandbox(_status_path=_good_status_file(tmp_path))
+        assert "BLASTBOX_WARN_ON_INSECURE" not in str(ei.value)
 
     def test_the_second_probe_really_ran_unconfined(self, monkeypatch, tmp_path: Path) -> None:
         sb, _msg = self._select(monkeypatch, tmp_path)
@@ -443,10 +489,18 @@ class TestAProfileThatDeniesTheProbeSaysSo:
         monkeypatch.delenv("BLASTBOX_WARN_ON_INSECURE", raising=False)
         monkeypatch.delenv("BLASTBOX_SANDBOX", raising=False)
         monkeypatch.setattr(detect_mod, "_in_container", lambda: False)
-        monkeypatch.setattr(detect_mod, "_make_backend", lambda name, **kw: sb)
+
+        def _only_nsjail(name, **kw):
+            if name == "nsjail":
+                return sb
+            raise SandboxUnavailable(f"{name} not available in this test")
+
+        monkeypatch.setattr(detect_mod, "_make_backend", _only_nsjail)
         with pytest.raises(SandboxUnavailable):
             select_sandbox(_status_path=_good_status_file(tmp_path))
-        assert sb.runs == [True] * len(sb.runs)
+        # The COUNT is the claim. `all(confined)` was true for one probe, two or ten, so the
+        # test could not detect the doubling it is named for (claude-code-review lens, #177).
+        assert sb.runs == [True], f"the failing probe ran {len(sb.runs)} times"
 
 
 class TestTheRecoveryHintNamesTheHalfThatIsActuallyMissing:
@@ -489,3 +543,46 @@ class TestTheRecoveryHintNamesTheHalfThatIsActuallyMissing:
             msg = self._msg(monkeypatch, tmp_path, aa_exec=aa)
             assert "deploy/apparmor" in msg
             assert "BLASTBOX_WARN_ON_INSECURE" in msg
+
+
+def test_forced_mode_gets_the_same_remedy_as_auto(monkeypatch, tmp_path: Path) -> None:
+    """`BLASTBOX_SANDBOX` is the documented override, it is what the pre-#160 deployment
+    recipe told operators to set, and it is what the in-tree bench uses -- so the operator who
+    pinned a backend was the one who got `insecure: apparmor_missing` with none of the three
+    remedies named, while auto-mode handed over all of them (claude-blast-radius lens, #177).
+    """
+    import blastbox.worker.sandbox.detect as detect_mod
+
+    monkeypatch.delenv("BLASTBOX_WARN_ON_INSECURE", raising=False)
+
+    class _Insecure:
+        name = "nsjail"
+        secure = False
+        insecurity_reasons = ["apparmor_missing"]
+
+    monkeypatch.setattr(detect_mod, "_make_backend", lambda name, **kw: _Insecure())
+    monkeypatch.setattr(detect_mod, "_smoketest", lambda sb: (True, None))
+
+    with pytest.raises(SandboxUnavailable) as ei:
+        select_sandbox(backend="nsjail", _status_path=_good_status_file(tmp_path))
+    msg = str(ei.value)
+    assert "deploy/apparmor" in msg
+    assert "BLASTBOX_WARN_ON_INSECURE" in msg
+
+
+def test_forced_mode_does_not_bolt_the_hint_onto_unrelated_failures(
+        monkeypatch, tmp_path: Path) -> None:
+    import blastbox.worker.sandbox.detect as detect_mod
+
+    monkeypatch.delenv("BLASTBOX_WARN_ON_INSECURE", raising=False)
+
+    class _Insecure:
+        name = "container"
+        secure = False
+        insecurity_reasons = ["seccomp_off"]
+
+    monkeypatch.setattr(detect_mod, "_make_backend", lambda name, **kw: _Insecure())
+    monkeypatch.setattr(detect_mod, "_smoketest", lambda sb: (True, None))
+    with pytest.raises(SandboxUnavailable) as ei:
+        select_sandbox(backend="container", _status_path=_good_status_file(tmp_path))
+    assert "deploy/apparmor" not in str(ei.value)

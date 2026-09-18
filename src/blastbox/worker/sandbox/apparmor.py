@@ -16,9 +16,13 @@ same consequence.
 
 from __future__ import annotations
 
+import logging
 import os
 
 _PROFILES = "/sys/kernel/security/apparmor/profiles"
+
+_log = logging.getLogger("blastbox.worker.sandbox.apparmor")
+_WARNED_ASSERTED: set[str] = set()
 
 # The modes the kernel prints for a profile that actually DENIES. Measured against a real
 # AppArmor 4.0.1 host (toolz2) by loading a scratch profile under each `flags=(...)` and
@@ -59,21 +63,27 @@ def resolve_profile(explicit: str | None = None) -> str:
 
 
 def profile_loaded(profile: str) -> bool:
-    """True only if the named profile can be CONFIRMED loaded.
+    """True only if the named profile can be CONFIRMED enforcing.
 
     Any uncertainty -- securityfs unreadable, profile absent -- is False, so the caller skips
-    the confinement and records it rather than failing every run. An explicit
-    ``BLASTBOX_APPARMOR_PROFILES`` (comma list) assertion wins, for hosts where securityfs is
-    not readable by the worker but the operator knows what is loaded.
+    the confinement and records it rather than failing every run.
+
+    ORDER MATTERS, and it used to be the other way round. The ``BLASTBOX_APPARMOR_PROFILES``
+    assertion was checked FIRST and returned True before securityfs was opened, so an
+    operator naming a profile that is loaded in `complain` mode -- or not loaded at all --
+    got `secure = True`, `apparmor_active = True`, and (since #160) `--proc_rw` in the nsjail
+    argv: a child with no enforcement, a widened /proc, and a backend reporting itself fully
+    hardened. That is this repo's recurring defect class, configuration PRESENT standing in
+    for confinement IN FORCE (claude-security lens, #177).
+
+    The kernel is authoritative whenever it can be read. The assertion is a FALLBACK for the
+    case it was written for -- ``/sys/kernel/security/apparmor/profiles`` is root-only, and a
+    non-root worker cannot read it -- and it cannot contradict a reading that succeeded: an
+    operator who asserts a profile the kernel reports as `complain` is telling us something
+    untrue, and believing them over the kernel is how the complain-mode case above happens.
+    It remains ADDITIVE where it applies: an operator who lists A and B has said nothing
+    about C, so a C the kernel reports as enforcing is still enforcing.
     """
-    asserted = os.environ.get("BLASTBOX_APPARMOR_PROFILES", "").strip()
-    if profile in {p.strip() for p in asserted.split(",") if p.strip()}:
-        # An operator assertion for hosts where securityfs is unreadable by the worker. It
-        # asserts ENFORCEMENT, not mere presence -- naming a complain-mode profile here is the
-        # operator telling us something untrue. It is an ADDITIONAL source of evidence, not an
-        # override: an operator who lists A and B has said nothing about C, and refusing a C
-        # the kernel reports as enforcing would drop real confinement for no gain.
-        return True
     try:
         # `surrogateescape`, not `ascii`: an AppArmor profile name is usually a PATH, and a
         # path is bytes, so one profile with a non-UTF-8 byte -- belonging to some UNRELATED
@@ -82,12 +92,52 @@ def profile_loaded(profile: str) -> bool:
         # drop the `aa-exec` prefix and run the workload unconfined because of somebody else's
         # filename. Surrogates round-trip losslessly and never equal an ASCII profile name.
         with open(_PROFILES, encoding="utf-8", errors="surrogateescape") as fh:
-            return any(_line_is_enforcing(line, profile) for line in fh)
+            lines = fh.readlines()
     except (OSError, UnicodeDecodeError):
-        # This helper is called from a backend CONSTRUCTOR, and `select_sandbox` only treats
+        # Unreadable: the operator's assertion is the only evidence available. This helper is
+        # called from a backend CONSTRUCTOR, and `select_sandbox` only treats
         # `SandboxUnavailable` as "try the next backend" -- anything else aborts auto-selection
         # rather than falling through to bwrap. It must answer, never raise (codex, #159).
+        if profile in _asserted():
+            _warn_asserted(profile)
+            return True
         return False
+
+    if any(_line_is_enforcing(line, profile) for line in lines):
+        return True
+    if profile in _asserted():
+        # The kernel WAS readable and does not report this profile as enforcing. The assertion
+        # loses; it exists for the unreadable case, not to overrule an answer we have.
+        _log.warning(
+            "apparmor_assertion_contradicted profile=%s "
+            "note=BLASTBOX_APPARMOR_PROFILES names it but securityfs does not report it "
+            "enforcing; the kernel wins and no profile is attached",
+            profile,
+        )
+    return False
+
+
+def _asserted() -> set[str]:
+    raw = os.environ.get("BLASTBOX_APPARMOR_PROFILES", "").strip()
+    return {p.strip() for p in raw.split(",") if p.strip()}
+
+
+def _warn_asserted(profile: str) -> None:
+    """Say, once per process, that confinement is being taken on trust.
+
+    `secure = True` now rides on this answer, and so does `--proc_rw`. An operator reading
+    logs should be able to tell "the kernel says this profile is enforcing" from "someone set
+    an environment variable".
+    """
+    if profile in _WARNED_ASSERTED:
+        return
+    _WARNED_ASSERTED.add(profile)
+    _log.warning(
+        "apparmor_profile_asserted_not_verified profile=%s "
+        "note=securityfs unreadable; enforcement taken from BLASTBOX_APPARMOR_PROFILES, "
+        "which cannot distinguish enforce from complain",
+        profile,
+    )
 
 
 def _line_is_enforcing(line: str, profile: str) -> bool:

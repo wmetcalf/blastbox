@@ -348,6 +348,15 @@ def _oci_config(cfg: GvisorConfig, workdir: Path, *, in_ro: bool) -> dict:
     """A self-contained OCI spec (config.json) for the warm/restore container with
     per-slot bind mounts. Pure (no runsc spec needed) so it's unit-testable."""
     env = ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "HOME=/tmp"]
+    # Same reason docker.py:446 sets it for the runc/runsc path: gVisor virtualises /proc, so
+    # a worker's in-container hardening self-check cannot observe the host-level flags that
+    # ARE applied, and it aborts on its own self-check. This is the second dispatcher-managed
+    # runsc launch path and it never got the variable, while docs/DEPLOYMENT.md asserted that
+    # "workers launched by the dispatcher under runsc already get" it -- bounding the blast
+    # radius of a fail-closed with a claim that was true of one launcher out of two
+    # (claude-blast-radius lens, #177). An operator override in extra_env still wins: it is
+    # appended after this.
+    env.append("BLASTBOX_WARN_ON_INSECURE=1")
     if cfg.ld_preload:
         env.append(f"LD_PRELOAD={cfg.ld_preload}")
     env.extend(cfg.extra_env)

@@ -52,6 +52,10 @@ from blastbox.worker.sandbox.base import SandboxRequest, SandboxResult, kill_san
 
 _log = logging.getLogger("blastbox.worker.sandbox.bwrap")
 
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 _BWRAP = shutil.which("bwrap") or "/usr/bin/bwrap"
 
 # Default AppArmor profile to attach to the child process via aa-exec.
@@ -222,6 +226,11 @@ class BubblewrapSandbox:
         if not self._cgroup_pids_supported:
             self._static_insecurity_reasons.append("pid_limit_missing")
 
+        # What confinement looked like when the selector admitted this backend. A LOSS
+        # of it later is a refusal (see _refuse_if_confinement_regressed); never having
+        # had it is not.
+        self._armed_at_admission = self.apparmor_active
+
         _log.info(
             "BubblewrapSandbox initialised",
             extra={
@@ -311,6 +320,36 @@ class BubblewrapSandbox:
     # ------------------------------------------------------------------
     # Public interface
 
+    def _refuse_if_confinement_regressed(self) -> None:
+        """A worker outlives its jobs; `secure` is checked once, at selection.
+
+        `select_sandbox` reads `secure` at worker start and never again, and `run()` used to
+        proceed regardless -- so a profile unloaded, switched to complain, or made
+        unconfirmable under a long-lived worker silently dropped the `aa-exec` prefix (and
+        `--proc_rw`) and kept detonating, on a backend the selector had certified. The
+        per-launch re-read existed but nothing acted on it (claude-security lens, #177).
+
+        The test is a REGRESSION, not a state: confinement that was there at admission and is
+        gone now. A backend that never had a profile is not affected -- it was admitted on
+        that basis, with `apparmor_missing` recorded -- so this cannot turn "cannot read
+        /sys" into a worker that refuses every job, which would be a worse outage than the
+        one it prevents.
+
+        `BLASTBOX_WARN_ON_INSECURE=1` downgrades it to a warning, the same knowing opt-out
+        that governs the rest of the security self-check.
+        """
+        if not self._armed_at_admission or self.apparmor_active:
+            return
+        msg = (
+            f"{self.name}: the AppArmor profile {self._apparmor_profile!r} was enforcing when "
+            f"this backend was admitted and is not now -- refusing to run unconfined on a "
+            f"backend that was selected as confined"
+        )
+        if _env_truthy("BLASTBOX_WARN_ON_INSECURE"):
+            _log.warning("%s (allowed by BLASTBOX_WARN_ON_INSECURE)", msg)
+            return
+        raise SandboxUnavailable(msg)
+
     def run(self, request: SandboxRequest) -> SandboxResult:
         """Run ``request.argv`` inside a bwrap sandbox.
 
@@ -329,6 +368,7 @@ class BubblewrapSandbox:
             raise SandboxError("argv must be a non-empty list of strings")
         if not self._binary_present:
             raise SandboxUnavailable(f"bwrap not found at {self._bwrap!r}")
+        self._refuse_if_confinement_regressed()
 
         # A FRESH memfd per run holds the BPF program bwrap reads via --seccomp <fd>. pass_fds
         # keeps it open + inheritable across the close_fds=True fork; the parent closes its copy

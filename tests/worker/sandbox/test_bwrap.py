@@ -681,7 +681,7 @@ class TestKillModeIsEnforcement:
         for untrusted input; an operator who disagrees has BLASTBOX_APPARMOR_PROFILES."""
         assert self._loaded(tmp_path, monkeypatch, "blastbox-sandbox (user)\n") is False
 
-    def test_an_operator_assertion_is_additive_not_an_override(self, tmp_path, monkeypatch) -> None:
+    def test_an_operator_assertion_is_additive_where_it_applies(self, tmp_path, monkeypatch) -> None:
         """Listing A and B says nothing about C. Treating the list as an override would refuse
         a C the kernel reports as enforcing -- dropping real confinement for no gain."""
         import blastbox.worker.sandbox.apparmor as aa
@@ -691,8 +691,40 @@ class TestKillModeIsEnforcement:
         monkeypatch.setattr(aa, "_PROFILES", str(f))
         monkeypatch.setenv("BLASTBOX_APPARMOR_PROFILES", "some-other, and-another")
         assert aa.profile_loaded("blastbox-sandbox") is True
-        assert aa.profile_loaded("some-other") is True
         assert aa.profile_loaded("neither") is False
+
+    def test_the_kernel_outranks_the_assertion_when_it_can_be_read(
+            self, tmp_path, monkeypatch) -> None:
+        """The assertion used to be checked FIRST and returned True before securityfs was
+        opened, so naming a complain-mode -- or entirely absent -- profile produced
+        `secure = True`, `apparmor_active = True` and, for nsjail, `--proc_rw`: no
+        enforcement, a widened /proc, and a backend reporting itself hardened
+        (claude-security lens, #177). Where the kernel answers, the kernel wins."""
+        import blastbox.worker.sandbox.apparmor as aa
+
+        f = tmp_path / "profiles"
+        f.write_text("blastbox-sandbox (complain)\nsomething-else (enforce)\n")
+        monkeypatch.setattr(aa, "_PROFILES", str(f))
+        monkeypatch.setenv("BLASTBOX_APPARMOR_PROFILES", "blastbox-sandbox,not-loaded-at-all")
+        assert aa.profile_loaded("blastbox-sandbox") is False, "complain mode was asserted away"
+        assert aa.profile_loaded("not-loaded-at-all") is False, "an absent profile was asserted in"
+
+    def test_the_assertion_still_carries_an_unreadable_securityfs(
+            self, tmp_path, monkeypatch, caplog) -> None:
+        """The case it was written for: /sys/kernel/security/apparmor/profiles is root-only,
+        and a non-root worker cannot read it. There the assertion is the only evidence there
+        is -- and the log says so, because `secure` now rides on it."""
+        import logging
+
+        import blastbox.worker.sandbox.apparmor as aa
+
+        monkeypatch.setattr(aa, "_PROFILES", str(tmp_path / "does-not-exist"))
+        monkeypatch.setenv("BLASTBOX_APPARMOR_PROFILES", "blastbox-sandbox")
+        aa._WARNED_ASSERTED.clear()
+        with caplog.at_level(logging.WARNING, logger="blastbox.worker.sandbox.apparmor"):
+            assert aa.profile_loaded("blastbox-sandbox") is True
+            assert aa.profile_loaded("other") is False
+        assert "asserted_not_verified" in caplog.text
 
 
 class TestTheProfileModeIsReReadPerLaunch:

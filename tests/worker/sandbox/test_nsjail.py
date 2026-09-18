@@ -8,6 +8,7 @@ Structure
 """
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,12 @@ import pytest
 from blastbox.limits import Limits
 from blastbox.worker.sandbox.base import Mount, SandboxRequest
 from blastbox.worker.sandbox.nsjail import NsjailSandbox, _SECCOMP_POLICY_CANDIDATES
+
+
+# A stand-in nsjail for tests that only need the binary to EXIST. It answers --help the way
+# a real one does, because the backend now asks whether this build has `--proc_rw` before
+# attaching an AppArmor prefix that cannot execve without it.
+_FAKE_NSJAIL = "#!/bin/sh\ncase \"$1\" in --help) echo '  --proc_rw';; esac\nexit 0\n"
 
 
 # ---------------------------------------------------------------------------
@@ -427,7 +434,7 @@ class TestAppArmorIsAttachedWithAaExecBecauseNsjailHasNoFlagForIt:
         monkeypatch.setattr(mod.NsjailSandbox, "_apparmor_enforcing_now",
                             lambda self: enforcing)
         fake_nsjail = tmp_path / "nsjail"
-        fake_nsjail.write_text("#!/bin/sh\nexit 0\n")
+        fake_nsjail.write_text(_FAKE_NSJAIL)
         fake_nsjail.chmod(0o755)
         policy = tmp_path / "ok.policy"
         policy.write_text("POLICY ok { ERRNO(1) { } } USE ok DEFAULT ALLOW\n")
@@ -539,7 +546,7 @@ class TestAppArmorIsAttachedWithAaExecBecauseNsjailHasNoFlagForIt:
 
         monkeypatch.setattr(mod.NsjailSandbox, "_apparmor_enforcing_now", _counting)
         fake_nsjail = tmp_path / "nsjail"
-        fake_nsjail.write_text("#!/bin/sh\nexit 0\n")
+        fake_nsjail.write_text(_FAKE_NSJAIL)
         fake_nsjail.chmod(0o755)
         policy = tmp_path / "ok.policy"
         policy.write_text("POLICY ok { ERRNO(1) { } } USE ok DEFAULT ALLOW\n")
@@ -561,7 +568,7 @@ class TestAppArmorIsAttachedWithAaExecBecauseNsjailHasNoFlagForIt:
         monkeypatch.setattr(mod.NsjailSandbox, "_apparmor_enforcing_now",
                             lambda self: state["enforcing"])
         fake_nsjail = tmp_path / "nsjail"
-        fake_nsjail.write_text("#!/bin/sh\nexit 0\n")
+        fake_nsjail.write_text(_FAKE_NSJAIL)
         fake_nsjail.chmod(0o755)
         policy = tmp_path / "ok.policy"
         policy.write_text("POLICY ok { ERRNO(1) { } } USE ok DEFAULT ALLOW\n")
@@ -576,78 +583,300 @@ class TestAppArmorIsAttachedWithAaExecBecauseNsjailHasNoFlagForIt:
 
 
 
-def test_the_two_backends_agree_about_having_no_apparmor():
-    """The issue's core complaint: bwrap and nsjail in the SAME situation — no aa-exec —
-    gave opposite answers about their own hardening, and the silent one had no mechanism
-    at all. Whatever each reports, they must report the same thing for the same cause."""
-    import inspect
+def test_the_two_backends_apply_and_report_apparmor_the_same_way(tmp_path, monkeypatch) -> None:
+    """The issue's core complaint: bwrap and nsjail in the SAME state gave opposite answers
+    about their own hardening, and the silent one had no mechanism at all.
 
-    from blastbox.worker.sandbox import bwrap as bw
-    from blastbox.worker.sandbox import nsjail as nj
+    This asserted it by grepping each module's SOURCE for the strings "apparmor_missing" and
+    "aa-exec" -- which the PRE-FIX nsjail.py also contained (the reason string was there,
+    gated on the dead probe, and "aa-exec" appeared in a comment about what bwrap does). So
+    the test could not tell "nsjail attaches a profile" from "nsjail has a comment mentioning
+    that bwrap does", and passed against the exact code it was written to condemn
+    (claude-code-review lens, #177). Behaviour, not text, from here on.
+    """
+    import blastbox.worker.sandbox.bwrap as bw
+    import blastbox.worker.sandbox.nsjail as nj
 
-    for mod in (bw, nj):
-        src = inspect.getsource(mod)
-        assert "apparmor_missing" in src, f"{mod.__name__} cannot report the condition"
-        assert "aa-exec" in src, f"{mod.__name__} has no way to apply a profile"
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    for n in ("nsjail", "bwrap"):
+        (fake / n).write_text(_FAKE_NSJAIL)
+        (fake / n).chmod(0o755)
+    policy = tmp_path / "ok.policy"
+    policy.write_text("POLICY ok { ERRNO(1) { } } USE ok DEFAULT ALLOW\n")
+
+    for mod in (nj, bw):
+        monkeypatch.setattr(mod, "_find_aa_exec", lambda: None, raising=False)
+    monkeypatch.setattr(nj, "_supports_proc_rw", lambda _p: True)
+    without = [
+        nj.NsjailSandbox(nsjail_path=str(fake / "nsjail"), seccomp_policy=policy),
+        bw.BubblewrapSandbox(bwrap_path=str(fake / "bwrap")),
+    ]
+    for sb in without:
+        assert "apparmor_missing" in sb.insecurity_reasons, sb.name
+        assert sb.apparmor_active is False, sb.name
+        assert "aa-exec" not in " ".join(sb._build_argv(SandboxRequest(argv=["/bin/true"])))
+
+    for mod in (nj, bw):
+        monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec", raising=False)
+        monkeypatch.setattr(mod, "profile_loaded", lambda _n: True, raising=False)
+        monkeypatch.setattr(type(without[0]) if mod is nj else type(without[1]),
+                            "_apparmor_enforcing_now", lambda self: True)
+    with_profile = [
+        nj.NsjailSandbox(nsjail_path=str(fake / "nsjail"), seccomp_policy=policy),
+        bw.BubblewrapSandbox(bwrap_path=str(fake / "bwrap")),
+    ]
+    for sb in with_profile:
+        assert "apparmor_missing" not in sb.insecurity_reasons, sb.name
+        assert sb.apparmor_active is True, sb.name
+        argv = sb._build_argv(SandboxRequest(argv=["/bin/true"]))
+        assert "aa-exec" in " ".join(argv), f"{sb.name} claims a profile it does not attach"
+
+
+class TestTheInstalledNsjailIsAskedWhetherItHasProcRw:
+    """aa-exec needs ``--proc_rw``; a build without it turns the prefix into
+    `Unknown argument: --proc_rw` on every job.
+
+    Worse, that failure is indistinguishable at the selector from a profile that denies the
+    probe binary -- the diagnosis re-probes with the profile suspended, which ALSO drops
+    --proc_rw, so the second probe passes and the operator is told to go fix a profile that
+    is correct (claude-code-review lens, #177). So the flag is probed, and an nsjail without
+    it reports `apparmor_missing` instead of attaching an argv that cannot run.
+    """
+
+    def _sb(self, tmp_path, monkeypatch, *, supported: bool):
+        import blastbox.worker.sandbox.nsjail as mod
+
+        monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
+        monkeypatch.setattr(mod, "_supports_proc_rw", lambda _p: supported)
+        monkeypatch.setattr(mod.NsjailSandbox, "_apparmor_enforcing_now", lambda self: True)
+        nsjail = tmp_path / "nsjail"
+        nsjail.write_text(_FAKE_NSJAIL)
+        nsjail.chmod(0o755)
+        policy = tmp_path / "ok.policy"
+        policy.write_text("POLICY ok { ERRNO(1) { } } USE ok DEFAULT ALLOW\n")
+        return mod.NsjailSandbox(nsjail_path=str(nsjail), seccomp_policy=policy)
+
+    def test_no_proc_rw_means_no_attachment_and_an_honest_reason(
+            self, tmp_path, monkeypatch) -> None:
+        sb = self._sb(tmp_path, monkeypatch, supported=False)
+        argv = sb._build_argv(SandboxRequest(argv=["/usr/bin/true"]))
+        assert "aa-exec" not in " ".join(argv), "attached a prefix that cannot execve"
+        assert "--proc_rw" not in argv
+        assert "apparmor_missing" in sb.insecurity_reasons
+        assert sb.apparmor_active is False
+
+    def test_with_proc_rw_the_attachment_happens(self, tmp_path, monkeypatch) -> None:
+        sb = self._sb(tmp_path, monkeypatch, supported=True)
+        argv = sb._build_argv(SandboxRequest(argv=["/usr/bin/true"]))
+        assert "--proc_rw" in argv and "aa-exec" in " ".join(argv)
+        assert sb.apparmor_active is True
+
+    def test_an_unprobeable_binary_fails_safe(self, tmp_path, monkeypatch) -> None:
+        """An nsjail that cannot be asked is not an nsjail that can be trusted with an argv
+        that fails closed on every job."""
+        import blastbox.worker.sandbox.nsjail as mod
+
+        assert mod._supports_proc_rw(str(tmp_path / "does-not-exist")) is False
+
+    def test_the_real_installed_nsjail_is_measured_not_assumed(self) -> None:
+        import shutil
+
+        import blastbox.worker.sandbox.nsjail as mod
+
+        nsjail = shutil.which("nsjail")
+        if nsjail is None:
+            pytest.skip("nsjail not installed on this host")
+        assert mod._supports_proc_rw(nsjail) is True, (
+            "the installed nsjail rejects --proc_rw, so AppArmor cannot be attached here"
+        )
+
+
+class TestTheConstructorLogSaysWhatWillActuallyHappen:
+    """`attach_enabled` was logged whenever aa-exec existed, profile or no profile -- at INFO,
+    while bwrap logged `attach_skipped` at WARNING from identical state. Two backends
+    disagreeing about their own hardening in the logs, with the accurate one at the level
+    that does not page anyone (claude-code-review lens, #177)."""
+
+    def _logs(self, tmp_path, monkeypatch, caplog, *, enforcing: bool) -> str:
+        import logging
+
+        import blastbox.worker.sandbox.nsjail as mod
+
+        monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
+        monkeypatch.setattr(mod, "_supports_proc_rw", lambda _p: True)
+        monkeypatch.setattr(mod.NsjailSandbox, "_apparmor_enforcing_now",
+                            lambda self: enforcing)
+        nsjail = tmp_path / "nsjail"
+        nsjail.write_text(_FAKE_NSJAIL)
+        nsjail.chmod(0o755)
+        with caplog.at_level(logging.INFO, logger="blastbox.worker.sandbox.nsjail"):
+            mod.NsjailSandbox(nsjail_path=str(nsjail))
+        return caplog.text
+
+    def test_no_profile_logs_skipped_not_enabled(self, tmp_path, monkeypatch, caplog) -> None:
+        text = self._logs(tmp_path, monkeypatch, caplog, enforcing=False)
+        assert "attach_skipped" in text
+        assert "attach_enabled" not in text
+
+    def test_a_profile_logs_enabled(self, tmp_path, monkeypatch, caplog) -> None:
+        text = self._logs(tmp_path, monkeypatch, caplog, enforcing=True)
+        assert "attach_enabled" in text
 
 
 @pytest.mark.skipif(
-    not Path("/usr/local/bin/nsjail").exists() and not Path("/usr/bin/nsjail").exists(),
-    reason="nsjail not installed on this host",
+    shutil.which("nsjail") is None, reason="nsjail not installed on this host"
 )
 @pytest.mark.skipif(
-    not Path("/usr/bin/aa-exec").exists() and not Path("/usr/sbin/aa-exec").exists(),
-    reason="aa-exec not installed on this host",
+    shutil.which("aa-exec") is None, reason="aa-exec not installed on this host"
 )
 @pytest.mark.skipif(
     not Path("/sys/kernel/security/apparmor").is_dir(), reason="AppArmor not enabled"
 )
-def test_the_apparmor_transition_really_reaches_the_kernel_through_this_argv() -> None:
-    """Real run, real kernel: the unit tests above assert the argv SHAPE, which is exactly
-    the kind of check that passes while the product is broken. This one executes it.
+def test_the_product_argv_really_transitions_the_child(monkeypatch) -> None:
+    """END TO END, through the PRODUCT's own argv -- which the previous version of this test
+    did not do.
 
-    It writes /proc/self/attr/exec from INSIDE the jail -- the syscall aa-exec makes -- and
-    demands the read-only default fail with EROFS and the `--proc_rw` build succeed. If the
-    flag is ever dropped, the first assertion here reproduces the outage instead of a
-    reviewer rediscovering it in production. Skipped where the prerequisites are absent
-    (CI), so it is documentation there and a measurement on a sandbox host.
+    It built the argv, and if `--proc_rw` was absent it compared that argv against itself
+    plus the flag. That measures upstream nsjail's /proc semantics; it says nothing about
+    whether this backend attaches anything, and it PASSED against the pre-#160 nsjail.py
+    with the dead probe and no aa-exec anywhere (claude-code-review lens, #177 — verified by
+    reverting the file and watching it pass).
+
+    Here the sandbox is constructed the way a worker constructs it and `run()` is called.
+    `unconfined` is used as the profile because it is the one name always valid as a
+    transition target, so the test needs no root and no loaded profile: it asserts the child
+    reports the profile the argv asked for, which is only true if the transition reached the
+    kernel. Reverting the fix leaves the child reporting the host's own profile, and this
+    fails.
     """
-    import shutil
+    monkeypatch.setenv("BLASTBOX_APPARMOR_PROFILE", "unconfined")
+    monkeypatch.setenv("BLASTBOX_APPARMOR_PROFILES", "unconfined")
+
+    import blastbox.worker.sandbox.nsjail as mod
+
+    from .conftest import nsjail_usable
+
+    # Namespace creation, not just installation. Without this the test FAILS where the
+    # existing smoke-run tests skip -- nsjail exits 255 with "Couldn't initialize net
+    # namespace" on a host with restricted userns, and the assertions below then report an
+    # AppArmor problem that is really a kernel policy one (codex, #177).
+    why = nsjail_usable()
+    if why:
+        pytest.skip(f"nsjail not usable here: {why}")
+
+    nsjail = shutil.which("nsjail")
+    assert nsjail is not None                       # guarded by the skipif above
+    if not mod._supports_proc_rw(nsjail):
+        pytest.skip("this nsjail build has no --proc_rw, so no profile can be attached")
+
+    # NOT a skip. Every prerequisite is present and asserted above, so a backend that does
+    # not arm here is the product failing, and the reverted-code version of this test
+    # SKIPPED instead of failing -- which is how a test that cannot catch its own regression
+    # looks from the outside (it went green against pre-#160 nsjail.py).
+    sb = NsjailSandbox()
+    assert sb.apparmor_active is True, (
+        f"aa-exec, nsjail --proc_rw and an asserted enforcing profile are all present, yet "
+        f"the backend did not arm: {sb.insecurity_reasons}"
+    )
+
+    argv = sb._build_argv(SandboxRequest(argv=["/bin/sh", "-c", "cat /proc/self/attr/current"]))
+    assert "--proc_rw" in argv, argv
+    assert "aa-exec" in " ".join(argv), argv
+
+    res = sb.run(SandboxRequest(argv=["/bin/sh", "-c", "cat /proc/self/attr/current"]))
+    assert res.exit_code == 0, (res.exit_code, res.stderr[-300:])
+    assert res.stdout.decode().strip() == "unconfined", (
+        f"the child reports {res.stdout!r}, so the transition did not happen -- it is "
+        f"running under the host's own profile, not the one the argv asked for"
+    )
+
+    # ... and the flag is load-bearing, not decoration: the same argv without it is the
+    # EROFS outage that made this route look impossible for nsjail.
     import subprocess
 
-    nsjail = shutil.which("nsjail") or "/usr/local/bin/nsjail"
-    probe = (
-        "import errno\n"
-        "try:\n"
-        "    open('/proc/self/attr/exec','w').write('exec unconfined')\n"
-        "    print('WROTE')\n"
-        "except OSError as e:\n"
-        "    print(errno.errorcode.get(e.errno, e.errno))\n"
+    stripped = [a for a in argv if a not in ("--proc_rw", "--really_quiet")]
+    p = subprocess.run(stripped, capture_output=True, text=True, timeout=120)
+    assert p.returncode != 0 and "Read-only file system" in p.stderr, (
+        f"expected EROFS without --proc_rw, got rc={p.returncode} {p.stderr[-300:]!r}"
     )
-    python = shutil.which("python3")
-    if python is None:                                    # pragma: no cover - defensive
-        pytest.skip("no python3 to run inside the jail")
 
-    sb = NsjailSandbox(nsjail_path=nsjail)
-    base = [a for a in sb._build_argv(SandboxRequest(argv=[python, "-c", probe]))
-            if a != "--really_quiet"]
-    if "--proc_rw" in base:
-        # A host configured exactly as deploy/apparmor/README.md prescribes: the profile is
-        # enforcing, so the product ALREADY passes --proc_rw and there is no read-only build
-        # left to compare against. That is the good outcome, not a failure -- asserting here
-        # would fail the suite precisely on a correctly configured sandbox host (codex, #177).
-        # The other direction is still worth checking before leaving.
-        assert "aa-exec" in " ".join(base)
-        pytest.skip("profile is enforcing here, so the default build is already --proc_rw")
 
-    ro = subprocess.run(base, capture_output=True, text=True, timeout=120)
-    rw = subprocess.run(base[:1] + ["--proc_rw"] + base[1:],
-                        capture_output=True, text=True, timeout=120)
-    assert "EROFS" in ro.stdout, (
-        f"expected the read-only /proc default to refuse the transition: {ro.stdout!r} "
-        f"{ro.stderr[-300:]!r}"
-    )
-    assert "WROTE" in rw.stdout, (
-        f"--proc_rw did not make the transition possible: {rw.stdout!r} "
-        f"{rw.stderr[-300:]!r}"
-    )
+class TestConfinementLostAfterAdmissionIsARefusal:
+    """`secure` is read once, by `select_sandbox`, at worker start. `run()` never looked at it
+    again -- so a profile unloaded (or switched to complain, or made unconfirmable) under a
+    long-lived worker silently dropped the aa-exec prefix and kept detonating, on a backend
+    the selector had certified as confined. The per-launch re-read existed and nothing acted
+    on it (claude-security lens, #177).
+
+    The test is a REGRESSION, not a state: a backend that never had a profile was admitted on
+    that basis and keeps running, so this cannot turn an unreadable /sys into a worker that
+    refuses every job.
+    """
+
+    def _sb(self, tmp_path, monkeypatch, state):
+        import blastbox.worker.sandbox.nsjail as mod
+
+        monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
+        monkeypatch.setattr(mod, "_supports_proc_rw", lambda _p: True)
+        monkeypatch.setattr(mod.NsjailSandbox, "_apparmor_enforcing_now",
+                            lambda self: state["on"])
+        nsjail = tmp_path / "nsjail"
+        nsjail.write_text(_FAKE_NSJAIL)
+        nsjail.chmod(0o755)
+        policy = tmp_path / "ok.policy"
+        policy.write_text("POLICY ok { ERRNO(1) { } } USE ok DEFAULT ALLOW\n")
+        return mod.NsjailSandbox(nsjail_path=str(nsjail), seccomp_policy=policy)
+
+    def test_a_profile_that_disappears_stops_the_jobs(self, tmp_path, monkeypatch) -> None:
+        from blastbox.errors import SandboxUnavailable
+
+        monkeypatch.delenv("BLASTBOX_WARN_ON_INSECURE", raising=False)
+        state = {"on": True}
+        sb = self._sb(tmp_path, monkeypatch, state)
+        assert sb._armed_at_admission is True
+
+        state["on"] = False
+        with pytest.raises(SandboxUnavailable, match="was enforcing"):
+            sb.run(SandboxRequest(argv=["/usr/bin/true"]))
+
+    def test_a_backend_that_never_had_one_keeps_running(self, tmp_path, monkeypatch) -> None:
+        """The outage this must not become: 'cannot confirm a profile' is the same False as
+        'the profile went away', and only the second is a regression."""
+        monkeypatch.delenv("BLASTBOX_WARN_ON_INSECURE", raising=False)
+        state = {"on": False}
+        sb = self._sb(tmp_path, monkeypatch, state)
+        assert sb._armed_at_admission is False
+        sb._refuse_if_confinement_regressed()          # must not raise
+
+    def test_the_knowing_override_downgrades_it_to_a_warning(
+            self, tmp_path, monkeypatch, caplog) -> None:
+        import logging
+
+        monkeypatch.setenv("BLASTBOX_WARN_ON_INSECURE", "1")
+        state = {"on": True}
+        sb = self._sb(tmp_path, monkeypatch, state)
+        state["on"] = False
+        with caplog.at_level(logging.WARNING, logger="blastbox.worker.sandbox.nsjail"):
+            sb._refuse_if_confinement_regressed()      # must not raise
+        assert "was enforcing" in caplog.text
+
+    def test_bwrap_answers_the_same_way(self, tmp_path, monkeypatch) -> None:
+        """Both backends attach the profile the same way, so both must lose it the same way --
+        the asymmetry between them is the whole subject of #160."""
+        import blastbox.worker.sandbox.bwrap as bw
+        from blastbox.errors import SandboxUnavailable
+
+        monkeypatch.delenv("BLASTBOX_WARN_ON_INSECURE", raising=False)
+        state = {"on": True}
+        monkeypatch.setattr(bw, "_find_aa_exec", lambda: "/usr/sbin/aa-exec", raising=False)
+        monkeypatch.setattr(bw.BubblewrapSandbox, "_apparmor_enforcing_now",
+                            lambda self: state["on"])
+        bwrap = tmp_path / "bwrap"
+        bwrap.write_text(_FAKE_NSJAIL)
+        bwrap.chmod(0o755)
+        sb = bw.BubblewrapSandbox(bwrap_path=str(bwrap))
+        assert sb._armed_at_admission is True
+        state["on"] = False
+        with pytest.raises(SandboxUnavailable, match="was enforcing"):
+            sb.run(SandboxRequest(argv=["/usr/bin/true"]))

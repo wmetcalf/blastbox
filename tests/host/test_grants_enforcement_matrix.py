@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import subprocess
 
+import datetime
+
 import pytest
 
 from blastbox.host import pki
@@ -619,25 +621,91 @@ def test_a_renewal_takes_effect_on_the_very_next_job(tmp_path, monkeypatch):
     assert g.grants().allows_engine(_ENGINE_NAME), "a renewal did not take effect at once"
 
 
-def test_no_clock_manipulation_changes_the_verdict(tmp_path, monkeypatch):
-    """Both directions, because the cache failed open on a rollback and closed on a
-    forward step. With nothing retained between calls, neither can bite."""
-    import time as _time
+def test_the_clock_test_actually_reaches_the_clock_the_code_reads(tmp_path, monkeypatch):
+    """A guard against the way this test was written WRONG, which is how it shipped.
 
+    The previous version monkeypatched `time.time` and asserted the verdict never changed.
+    It could not fail: `pki._now()` is `datetime.datetime.now(UTC)`, which does not read
+    `time.time` at all, so the patched clock reached nothing and every assertion passed
+    against the real time. Proven in one line --
+
+        time.time = lambda: real() - 60*86400   ->   pki._now() unchanged
+
+    -- so a test named for clock manipulation was testing nothing, on the one property the
+    deleted monotonic cache had existed to protect. Anchor the seam itself: if `pki._now`
+    stops being the function expiry reads, this fails instead of going quietly green
+    (deepseek-oc, run-78, unread until now).
+    """
+    from blastbox.host import pki as _pki
+
+    marker = datetime.datetime(1999, 1, 1, tzinfo=datetime.timezone.utc)
+    monkeypatch.setattr(_pki, "_now", lambda: marker)
+    ident = _pki.NodeIdentity(node_id="x", wg_pubkey=WG, grants=pki.NodeGrants(),
+                              not_before=marker - datetime.timedelta(days=1),
+                              not_after=marker - datetime.timedelta(seconds=1))
+    assert ident.expired, "patching pki._now no longer moves the expiry check"
+
+
+def test_a_forward_clock_step_refuses_but_does_not_stick(tmp_path, monkeypatch):
+    """What deleting the cache actually bought.
+
+    The cache's failure mode was not the refusal -- it was the MEMORY of it: one transient
+    forward step ratcheted the deadline and the node stayed silently refused for the
+    certificate's whole life. With nothing retained between calls, the same step refuses
+    while it lasts and recovers the moment the clock does.
+    """
+    from blastbox.host import pki as _pki
     from blastbox.host import placement as pl
 
     _arm(tmp_path, monkeypatch, engines=(_ENGINE_NAME,))
     g = pl.SelfGrants()
     baseline = g.grants()
-    assert baseline is not None
+    assert baseline is not None and baseline is not pl.NO_GATE
 
-    real = _time.time
-    for offset in (-60 * 86400, +60 * 86400):
-        monkeypatch.setattr(_time, "time", lambda o=offset: real() + o)
-        v = g.grants()
-        assert v is not None and v.engines == baseline.engines, (
-            f"a wall-clock shift of {offset / 86400:.0f} days changed the verdict"
-        )
+    real_now = _pki._now
+    monkeypatch.setattr(_pki, "_now", lambda: real_now() + datetime.timedelta(days=3650))
+    assert g.grants() is None, "an expired certificate must not yield grants"
+
+    monkeypatch.setattr(_pki, "_now", real_now)
+    after = g.grants()
+    assert after is not None and after is not pl.NO_GATE, (
+        "the refusal outlived the clock step -- something is being retained between calls"
+    )
+    assert after.engines == baseline.engines
+
+
+def test_a_backward_clock_step_is_a_documented_limit_not_a_guarantee(tmp_path, monkeypatch):
+    """Pin the limit HONESTLY rather than implying a protection that is not there.
+
+    Expiry is exactly as honest as the host clock: step the clock back before `not_after`
+    and an expired certificate verifies again. The monotonic deadline that used to resist
+    this was deleted deliberately -- it produced five bugs of its own (a rolled-back clock
+    pushing the deadline out forever, a ratchet making one forward step permanent, a
+    lifetime cap that re-based on every refresh) -- and the trade was written down rather
+    than papered over. If someone reinstates clock-independent expiry, this test fails and
+    the docs get updated with it.
+
+    The real mitigation is not in this process: keep hosts on NTP, and keep certificate
+    lifetimes short enough that a rollback wide enough to matter is also wide enough to
+    notice.
+    """
+    from blastbox.host import pki as _pki
+    from blastbox.host import placement as pl
+
+    _arm(tmp_path, monkeypatch, engines=(_ENGINE_NAME,))
+    g = pl.SelfGrants()
+    assert g.grants() is not None
+
+    real_now = _pki._now
+    # Far enough forward that the certificate is expired ...
+    monkeypatch.setattr(_pki, "_now", lambda: real_now() + datetime.timedelta(days=3650))
+    assert g.grants() is None
+    # ... and back to a moment the certificate considers valid: it verifies again.
+    monkeypatch.setattr(_pki, "_now", real_now)
+    assert g.grants() is not None, (
+        "if this now refuses, expiry became clock-independent -- good news, but the "
+        "documented limit in placement.py and the spec must be updated to match"
+    )
 
 
 # --------------------------------------------------- the legacy route warns, never arms

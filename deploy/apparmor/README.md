@@ -125,12 +125,10 @@ knowingly.
 | **bwrap** | **Yes.** `aa-exec -p <profile> --` is prefixed to the inner argv; `/proc/self/attr/exec` is writable inside, so the transition reaches the kernel. It needs only a profile that exists. |
 | **nsjail** | **Yes, since [#160](https://github.com/wmetcalf/blastbox/issues/160).** `--proc_apparmor` does not exist in any upstream nsjail (checked against 3.6, the installed build, and a code search of the whole tree — `apparmor` appears zero times), so the profile is attached the same way bwrap attaches it: `aa-exec -p <profile> --` on the inner argv. That needs one thing from nsjail — `--proc_rw`. aa-exec transitions by writing `/proc/self/attr/exec`, nsjail mounts `/proc` read-only by default, and the write returns `EROFS`, which fails the **execve** — so the prefix without the flag is not weaker confinement, it is every job dying with `aa-exec: ERROR: Read-only file system`. Both are attached together, and only when the profile is confirmed enforcing. |
 
-The cost of `--proc_rw` was measured rather than assumed, by probing from inside this exact argv
-both ways. At the uid the child runs as (65534, inside a user namespace), nothing else became
-writable: `/proc/sys/kernel/core_pattern`, `/proc/sys/vm/drop_caches`, `/proc/sysrq-trigger`,
-`/proc/self/oom_score_adj` and `/proc/1/oom_score_adj` all stayed blocked, and the child saw the
-same three pids. Only `/proc/self/attr` became writable — the point of the exercise. It is still
-attached only on the path that needs it, never by default.
+`--proc_rw` widens `/proc` for the child by more than `/proc/self/attr` — `/proc/self/mem` among
+them. The measurement and the profile rules that take that surface back are in
+[Attaching a real child profile](#attaching-a-real-child-profile) below; the flag is attached only
+alongside an enforcing profile, never by default.
 
 So without a loaded profile the inner sandboxes rest on **namespaces, plus seccomp where its
 prerequisites are met** — kafel for nsjail, a BPF denylist for bwrap. Neither filter is
@@ -176,23 +174,41 @@ the profile denies the probe /usr/bin/true. Permit it in the profile ... or unlo
 
 — but the fix is yours: `/usr/bin/true ix,` plus whatever your base abstraction needs.
 
-**One rule your profile needs.** nsjail is launched with `--proc_rw` when a profile is attached (it
-has to be: aa-exec transitions by writing `/proc/self/attr/exec`, and nsjail's default read-only
-`/proc` makes that write fail with `EROFS`, killing the exec). A writable `/proc/self/attr` is the
-interface a confined task would use to ask for *another* profile. AppArmor governs that — a change
-from a confined profile is permitted only by a rule in the profile it is leaving, so an enforcing
-profile with no `change_profile` rules already refuses — but say it explicitly rather than relying
-on the absence of a rule:
+**The rules your profile needs, because `--proc_rw` widens /proc.** nsjail is launched with
+`--proc_rw` whenever a profile is attached, and it has to be: aa-exec transitions by writing
+`/proc/self/attr/exec`, and nsjail's default read-only `/proc` turns that into `EROFS`, killing the
+exec rather than weakening it.
+
+Measured inside the real argv at the child's uid (65534, user namespace), with `open(O_WRONLY)` —
+not `echo`, which fails with `EINVAL` on files that reject the content and reads as "blocked":
+
+| path | default | with `--proc_rw` |
+|---|---|---|
+| `/proc/self/attr/*`, `/proc/self/mem`, `/proc/self/clear_refs`, `/proc/self/coredump_filter`, `/proc/self/oom_score_adj`, `/proc/1/oom_score_adj`, `/proc/self/{uid,gid}_map` | `EROFS` | **writable** |
+| `/proc/sys/**`, `/proc/sysrq-trigger` | `EACCES` | `EACCES` (ownership + userns, not the mount flag) |
+
+`/proc/self/mem` is the one that matters: a payload can rewrite its own read-only and executable
+mappings without `mprotect`. Cross-process `/proc/<pid>/mem` is still gated by `ptrace_scope`, so
+this is a wider surface inside the jail, not an escape from it — but it is wider than the child had
+before, and the profile is what takes it back. The flag and the profile travel together by design:
+no profile, no `--proc_rw`, and the child keeps its read-only `/proc`.
+
+So a child profile is not optional hardening here; it is the mitigation for the flag it enables:
 
 ```
+deny /proc/*/mem rw,
+deny /proc/*/clear_refs w,
+deny /proc/*/coredump_filter w,
+deny /proc/*/oom_score_adj w,
+deny /proc/*/{uid,gid}_map w,
 deny /proc/*/attr/{current,exec} w,
 audit deny change_profile,
 ```
 
-(Verified: with `--proc_rw` and at the child's uid 65534 in a user namespace, `/proc/sys/**`,
-`/proc/sysrq-trigger`, `/proc/self/oom_score_adj` and `/proc/1/oom_score_adj` all remain unwritable,
-and the pid view is unchanged. The confined-transition case above is reasoned from AppArmor's
-semantics, not measured here — this repo's CI host has no loadable profile.)
+(The `change_profile` line is belt and braces: a transition out of a confined profile is permitted
+only by a rule in the profile being left, so a profile with no `change_profile` rules already
+refuses. Reasoned from AppArmor's semantics, not measured — this repo's CI host has no loadable
+profile.)
 
 `BLASTBOX_APPARMOR_PROFILE` is what a deployed worker needs: the sandbox it uses comes from
 `select_sandbox`, which constructs the backend with no arguments, so passing `apparmor_profile=` to
