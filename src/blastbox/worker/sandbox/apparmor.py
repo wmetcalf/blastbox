@@ -42,6 +42,18 @@ _PROOF_TTL_S = 30.0
 # backend recovers on its own the moment probes work again.
 _TRANSIENT_TTL_S = 2.0
 
+# A probe can be broken PERMANENTLY, not transiently: memfd unsupported, a wrapper binary that
+# always times out, a reader the profile always denies. The short TTL above then re-probes for
+# every job, and each launch waits out `_PROBE_TIMEOUT_S`. Measured on such a host: 3 launches
+# per job, forever. After this many consecutive failures the state is treated as SETTLED and
+# cached for the full TTL -- still fail-closed, just not re-measured per detonation (round 6).
+_TRANSIENT_SETTLED_AFTER = 3
+
+# A probe is `aa-exec -p <profile> -- /usr/bin/true` in a jail. It has no business taking
+# minutes, and the old 60s meant a broken probe cost 60s per launch on a path that runs before
+# every job. Generous, but bounded.
+_PROBE_TIMEOUT_S = 15.0
+
 # The proof needs something that can print a file. /usr/bin FIRST: on a merged-/usr host
 # (/bin -> usr/bin, which is every current Debian/Ubuntu) the kernel resolves the exec to
 # /usr/bin/cat and that is the path AppArmor mediates -- so a remedy naming `/bin/cat` sends the
@@ -227,6 +239,7 @@ class AppArmorProofMixin:
     _apparmor_last_seen: bool | None = None
     _proof: tuple[bool, float, float] | None = None
     _warned_unprovable: bool = False
+    _consecutive_transients: int = 0
     _suspended_for_diagnosis: bool = False
     _armed_at_admission: bool | None = None
 
@@ -253,7 +266,7 @@ class AppArmorProofMixin:
         """
         return subprocess.run(
             self._build_argv(req, attach_apparmor=True),
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, timeout=_PROBE_TIMEOUT_S,
         )
 
     def _apparmor_attaches_at_all(self) -> bool | None:
@@ -353,6 +366,7 @@ class AppArmorProofMixin:
 
         got = self.prove_apparmor_attachment()
         if got is not None:
+            self._consecutive_transients = 0
             name, _, mode = got.partition(" (")
             ok = name.strip() == self._apparmor_profile and mode.startswith(("enforce", "kill"))
             if not ok:
@@ -386,14 +400,29 @@ class AppArmorProofMixin:
             #
             # Cached only for `_TRANSIENT_TTL_S`, not the verdict TTL: long enough to stop the
             # probe storm, short enough that the backend re-arms itself the moment probes work.
+            self._consecutive_transients += 1
+            settled = self._consecutive_transients >= _TRANSIENT_SETTLED_AFTER
             self._warn_once_unprovable(
                 "apparmor_proof_unmeasurable backend=%s profile=%s "
                 "note=the probe failed transiently twice; confinement CANNOT be confirmed, so "
                 "this backend reports apparmor_missing until a probe succeeds"
                 % (self.name, self._apparmor_profile)
             )
-            self._proof = (False, time.monotonic(), _TRANSIENT_TTL_S)
+            if settled:
+                # Not transient any more, whatever the errno said: this probe is broken. Hold
+                # the fail-closed answer for the full TTL so the cost is once per window rather
+                # than three launches per job (measured), and still re-measure after it.
+                _log.warning(
+                    "apparmor_proof_unmeasurable_settled backend=%s profile=%s attempts=%d "
+                    "note=treating the probe as broken; re-measured every %.0fs",
+                    self.name, self._apparmor_profile, self._consecutive_transients,
+                    _PROOF_TTL_S,
+                )
+            self._proof = (
+                False, time.monotonic(), _PROOF_TTL_S if settled else _TRANSIENT_TTL_S,
+            )
             return False
+        self._consecutive_transients = 0
         if not attaches:
             _log.warning(
                 "apparmor_assertion_disproved backend=%s profile=%s "

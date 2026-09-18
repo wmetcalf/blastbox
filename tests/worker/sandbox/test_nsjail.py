@@ -1487,6 +1487,75 @@ class TestAProbeThatCannotRunFailsClosed:
         assert sb.apparmor_active is True
         assert "apparmor_missing" not in sb.insecurity_reasons
 
+    def test_a_permanently_broken_probe_settles_instead_of_re_probing_every_job(
+            self, tmp_path, monkeypatch) -> None:
+        """Fail-closed must not mean fail-slow-forever.
+
+        A probe can be broken PERMANENTLY, not transiently -- memfd unsupported, a wrapper
+        binary that always times out, a reader the profile always denies -- and the short TTL
+        then re-measures for every job. Measured before this: 3 launches per job, forever, each
+        waiting out the probe timeout. After `_TRANSIENT_SETTLED_AFTER` consecutive failures the
+        answer is held for the full TTL: still apparmor_missing, still re-measured, but once per
+        window rather than once per detonation (round 6 of #177).
+        """
+        import subprocess
+
+        import blastbox.worker.sandbox.apparmor as aa
+
+        def _always_transient(argv, n):
+            raise subprocess.TimeoutExpired(argv, 1)
+
+        sb, calls = self._sb(tmp_path, monkeypatch, _always_transient)
+
+        # Each read is a fresh window until the failures settle.
+        clock = {"t": aa.time.monotonic()}
+        monkeypatch.setattr(aa.time, "monotonic", lambda: clock["t"])
+        for _ in range(aa._TRANSIENT_SETTLED_AFTER):
+            assert sb.apparmor_active is False
+            clock["t"] += aa._TRANSIENT_TTL_S + 0.1
+
+        assert sb._proof is not None
+        assert sb._proof[2] == aa._PROOF_TTL_S, "a broken probe is still on the short TTL"
+
+        before = calls["n"]
+        clock["t"] += aa._TRANSIENT_TTL_S + 0.1        # past the SHORT ttl, inside the long one
+        assert sb.apparmor_active is False
+        assert calls["n"] == before, "it re-probed inside the settled window"
+
+    def test_a_settled_probe_still_recovers(self, tmp_path, monkeypatch) -> None:
+        """Settling bounds the cost; it must not make the state permanent."""
+        import subprocess
+        from types import SimpleNamespace
+
+        import blastbox.worker.sandbox.apparmor as aa
+
+        state = {"broken": True}
+
+        def _flaky(argv, n):
+            if state["broken"]:
+                raise subprocess.TimeoutExpired(argv, 1)
+            ok = "blastbox-sandbox (enforce)\n" if "attr/current" in " ".join(argv) else ""
+            return SimpleNamespace(returncode=0, stdout=ok, stderr="")
+
+        sb, _ = self._sb(tmp_path, monkeypatch, _flaky)
+        clock = {"t": aa.time.monotonic()}
+        monkeypatch.setattr(aa.time, "monotonic", lambda: clock["t"])
+        for _ in range(aa._TRANSIENT_SETTLED_AFTER):
+            sb.apparmor_active
+            clock["t"] += aa._TRANSIENT_TTL_S + 0.1
+
+        state["broken"] = False
+        clock["t"] += aa._PROOF_TTL_S + 0.1
+        assert sb.apparmor_active is True
+        assert sb._consecutive_transients == 0, "the failure count survived a success"
+
+    def test_the_probe_timeout_is_bounded(self) -> None:
+        """A probe is `aa-exec -p <profile> -- /usr/bin/true` in a jail. The old 60s meant a
+        broken probe cost a minute per launch on a path that runs before every job."""
+        import blastbox.worker.sandbox.apparmor as aa
+
+        assert aa._PROBE_TIMEOUT_S <= 30.0, aa._PROBE_TIMEOUT_S
+
     def test_the_short_ttl_is_much_shorter_than_a_verdict(self) -> None:
         import blastbox.worker.sandbox.apparmor as aa
 
