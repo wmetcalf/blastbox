@@ -1000,7 +1000,8 @@ class TestAnAssertedProfileIsMeasuredNotBelieved:
     kernel naming the profile and its mode, and it cannot be asserted away.
     """
 
-    def _sb(self, tmp_path, monkeypatch, *, child_reports: str, rc: int = 0):
+    def _sb(self, tmp_path, monkeypatch, *, child_reports: str, rc: int = 0,
+            attaches: bool = True):
         import subprocess
 
         import blastbox.worker.sandbox.apparmor as aa
@@ -1012,8 +1013,16 @@ class TestAnAssertedProfileIsMeasuredNotBelieved:
         monkeypatch.setattr(mod, "profile_loaded", lambda _p: True)
 
         def _fake_run(argv, **kw):
+            # TWO probes now, and the distinction is the point: the structural one attaches the
+            # profile to /usr/bin/true (can it be attached at all?), the reader one prints
+            # /proc/self/attr/current. A fake that answers both the same way cannot tell
+            # "absent profile" from "profile denies the reader".
             from types import SimpleNamespace
-            return SimpleNamespace(returncode=rc, stdout=child_reports, stderr="")
+            joined = " ".join(argv)
+            if "attr/current" in joined:
+                return SimpleNamespace(returncode=rc, stdout=child_reports, stderr="")
+            return SimpleNamespace(returncode=0 if attaches else 1, stdout="",
+                                   stderr="" if attaches else "profile does not exist")
 
         monkeypatch.setattr(subprocess, "run", _fake_run)
         nsjail = tmp_path / "nsjail"
@@ -1045,6 +1054,25 @@ class TestAnAssertedProfileIsMeasuredNotBelieved:
         assert sb.apparmor_active is False
         assert "apparmor_missing" in sb.insecurity_reasons
 
+    def test_a_profile_that_cannot_be_attached_at_all_is_a_DISPROOF(
+            self, tmp_path, monkeypatch, caplog) -> None:
+        """The fail-open I found by running the thing.
+
+        On a host where the asserted profile is simply absent, aa-exec says
+        `ERROR: profile 'blastbox-sandbox' does not exist` -- and the first version of this
+        logic could not tell that from "the profile denies the reader", so it kept the
+        assertion and reported `secure` with no confinement whatsoever. The structural probe
+        asks the cheap question first, with the one binary every child profile is documented to
+        permit: if the profile cannot be attached to /usr/bin/true, the assertion is false.
+        """
+        import logging
+
+        sb = self._sb(tmp_path, monkeypatch, child_reports="", attaches=False)
+        with caplog.at_level(logging.WARNING, logger="blastbox.worker.sandbox.nsjail"):
+            assert sb.apparmor_active is False
+        assert "apparmor_missing" in sb.insecurity_reasons
+        assert "disproved" in caplog.text
+
     def test_an_unprovable_probe_keeps_the_assertion_and_says_so(
             self, tmp_path, monkeypatch, caplog) -> None:
         """UNPROVABLE is not DISPROVED, and the difference decides whether a correctly
@@ -1058,9 +1086,9 @@ class TestAnAssertedProfileIsMeasuredNotBelieved:
         """
         import logging
 
+        sb = self._sb(tmp_path, monkeypatch, child_reports="", rc=1)
         with caplog.at_level(logging.WARNING, logger="blastbox.worker.sandbox.nsjail"):
-            sb = self._sb(tmp_path, monkeypatch, child_reports="", rc=1)
-        assert sb.apparmor_active is True
+            assert sb.apparmor_active is True
         assert "unprovable" in caplog.text
 
     def test_a_disproved_assertion_still_disarms(self, tmp_path, monkeypatch) -> None:
@@ -1192,3 +1220,49 @@ def test_both_backends_find_aa_exec_through_one_patchable_name(monkeypatch) -> N
 
     assert nj.NsjailSandbox(nsjail_path="/bin/sh")._aa_exec is None
     assert bw.BubblewrapSandbox(bwrap_path="/bin/sh")._aa_exec is None
+
+
+@pytest.mark.parametrize("backend", ["nsjail", "bwrap"])
+def test_construction_never_calls_the_property_that_launches_a_jail(
+        backend: str, monkeypatch, tmp_path) -> None:
+    """`apparmor_active` is not a plain accessor: on the asserted path it builds an argv and
+    launches a jail to measure the profile. Reading it from __init__ therefore needs state the
+    constructor has not built yet, and it crashed construction outright on any host with
+    BLASTBOX_APPARMOR_PROFILES set -- `AttributeError: 'BubblewrapSandbox' object has no
+    attribute '_cgroup_pids_supported'` (found by running it, not by reading it).
+
+    The measurement belongs on the first real read, which is the selector's security check and
+    still happens before any job.
+    """
+    import blastbox.worker.sandbox.apparmor as aa
+    import blastbox.worker.sandbox.bwrap as bw
+    import blastbox.worker.sandbox.nsjail as nj
+
+    mod = nj if backend == "nsjail" else bw
+    monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
+    monkeypatch.setattr(mod, "profile_evidence", lambda _p: aa.ASSERTED)
+    monkeypatch.setattr(mod, "profile_loaded", lambda _p: True)
+    if backend == "nsjail":
+        monkeypatch.setattr(mod, "_supports_proc_rw", lambda _p: True)
+
+    # Cheap capability probes (`--help`) are fine and expected from a constructor; what is
+    # forbidden is launching a JAIL to measure the profile, which needs state that does not
+    # exist yet.
+    launched: list[list[str]] = []
+    real_run = mod.subprocess.run
+
+    def _watch(argv, **kw):
+        launched.append(list(argv))
+        if any("aa-exec" in a for a in argv):
+            raise AssertionError(f"a profiled jail was launched from the constructor: {argv}")
+        return real_run(argv, **kw)
+
+    monkeypatch.setattr(mod.subprocess, "run", _watch)
+    binary = tmp_path / backend
+    binary.write_text(_FAKE_NSJAIL)
+    binary.chmod(0o755)
+    if backend == "nsjail":
+        mod.NsjailSandbox(nsjail_path=str(binary))
+    else:
+        mod.BubblewrapSandbox(bwrap_path=str(binary))
+    assert not any("aa-exec" in a for argv in launched for a in argv), launched

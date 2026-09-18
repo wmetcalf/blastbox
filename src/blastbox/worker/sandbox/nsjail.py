@@ -225,6 +225,14 @@ class NsjailSandbox:
         # below does): it only remembers the last answer so a change logs once.
         self._apparmor_last_seen: bool | None = None
 
+        # BEFORE the first apparmor_active read. That property is not a plain accessor: on
+        # the asserted path it launches a jail to measure the profile and caches the result
+        # here, and both constructors read it while deciding what to log -- so uninitialised
+        # state crashed construction outright on any host with BLASTBOX_APPARMOR_PROFILES set
+        # (found by running it).
+        self._suspended_for_diagnosis = False
+        self._proof: tuple[bool, float] | None = None
+        self._warned: set[str] = set()
         self._aa_exec: str | None = _find_aa_exec()
         self._proc_rw_supported = (
             self._binary_present and _supports_proc_rw(nsjail_path)
@@ -293,23 +301,40 @@ class NsjailSandbox:
         # What confinement looked like when the selector admitted this backend. A LOSS
         # of it later is a refusal (see _refuse_if_confinement_regressed); never having
         # had it is not.
-        self._suspended_for_diagnosis = False
-        self._proof: tuple[bool, float] | None = None
-        self._warned: set[str] = set()
         # An ASSERTED profile is not a confirmed one -- see apparmor_active, which measures it
-        # from inside the jail rather than believing it, on a TTL rather than once. Touched here
-        # only so a disproof is logged at startup instead of first launch.
-        if self._aa_exec is not None and self._binary_present:
-            self.apparmor_active
-        self._armed_at_admission = self.apparmor_active
+        # from inside the jail rather than believing it, on a TTL rather than once.
+        # It is deliberately NOT measured from this constructor. That property is not a plain accessor: on the asserted path
+        # it builds an argv and launches a jail, which needs constructor state that does not
+        # exist yet -- calling it from __init__ crashed construction outright (found by running
+        # it). The cheap facts are enough to log an intention; the measurement happens on the
+        # first real read, which is the selector's security check, still before any job.
+        # None = not recorded yet, and deliberately NOT measured here: the measurement can
+        # launch a jail (an asserted profile is proved, not believed), which a constructor
+        # cannot do -- it crashed construction outright on a host with BLASTBOX_APPARMOR_PROFILES
+        # set. `note_admitted()` records it when the selector admits this backend; a backend
+        # built directly by an engine and never passed through `select_sandbox` takes its
+        # baseline from its first launch instead.
+        # The CHEAP facts, which are all a constructor may consult: the helper exists and the
+        # profile reads as enforcing. Not apparmor_active -- that measures an asserted profile
+        # by launching a jail, needs state this constructor has not built yet, and crashed
+        # construction outright on a host with BLASTBOX_APPARMOR_PROFILES set (found by running
+        # it). `note_admitted()` refines this at the moment the selector admits the backend,
+        # which is the admission that actually matters.
+        self._armed_at_admission: bool = (
+            self._aa_exec is not None and self._apparmor_enforcing_now()
+        )
 
         _log.info(
             "NsjailSandbox initialised",
             extra={
                 "seccomp_policy": str(self._seccomp_policy),
                 "aa_exec": self._aa_exec,
-                "apparmor_attached": self.apparmor_active,
-                "insecurity_reasons": self.insecurity_reasons,
+                # The STATIC reasons only. `insecurity_reasons` derives the AppArmor one from
+                # apparmor_active, which measures an asserted profile by launching a jail --
+                # not something a constructor can do, and not something a log line should
+                # trigger. The live answer is what the selector reads a moment later.
+                "apparmor_helper": self._aa_exec,
+                "static_insecurity_reasons": list(self._static_insecurity_reasons),
             },
         )
 
@@ -431,6 +456,42 @@ class NsjailSandbox:
     # ------------------------------------------------------------------
     # Public interface
 
+    def _attach_argv(self, req: SandboxRequest) -> list[str]:
+        """The argv with the profile attached, whatever this backend's builder needs."""
+        return self._build_argv(req, attach_apparmor=True)
+
+    def _apparmor_attaches_at_all(self) -> bool:
+        """Can the profile be attached to ANY child? Structural, no error-string matching.
+
+        The reader probe below cannot tell "this profile denies /bin/cat" from "this profile
+        does not exist", and the two demand opposite answers: the first must not punish a
+        correctly narrow profile, the second is an assertion that is simply false. Measured on
+        a host with no such profile loaded, aa-exec says
+        `ERROR: profile 'blastbox-sandbox' does not exist` -- and the first version of this
+        logic read that as merely unprovable and kept reporting `secure` with no confinement
+        at all, which is the fail-open the proof exists to close (found by running it).
+
+        So ask the cheap, structural question first, with the ONE binary every child profile is
+        documented to permit: if `aa-exec -p <profile> -- /usr/bin/true` cannot run, the
+        profile is unusable, whatever the reason.
+        """
+        probe = "/usr/bin/true" if Path("/usr/bin/true").exists() else "/bin/true"
+        req = SandboxRequest(argv=[probe])
+        try:
+            out = subprocess.run(
+                self._attach_argv(req), capture_output=True, text=True, timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            _log.warning("apparmor_attach_probe_failed reason=%s", exc)
+            return False
+        if out.returncode != 0:
+            _log.warning(
+                "apparmor_attach_probe_failed rc=%s stderr=%s",
+                out.returncode, out.stderr.strip()[-200:],
+            )
+            return False
+        return True
+
     def prove_apparmor_attachment(self) -> str | None:
         """Ask the KERNEL, from inside the jail, what profile the child actually got.
 
@@ -450,9 +511,10 @@ class NsjailSandbox:
         if _PROOF_READER is None:
             return None
         req = SandboxRequest(argv=[_PROOF_READER, "/proc/self/attr/current"])
-        argv = self._build_argv(req, attach_apparmor=True)
         try:
-            out = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+            out = subprocess.run(
+                self._attach_argv(req), capture_output=True, text=True, timeout=60,
+            )
         except (OSError, subprocess.SubprocessError) as exc:
             _log.warning("apparmor_attachment_unprovable reason=%s", exc)
             return None
@@ -489,6 +551,18 @@ class NsjailSandbox:
         now = time.monotonic()
         if self._proof is not None and now - self._proof[1] < _PROOF_TTL_S:
             return self._proof[0]
+
+        if not self._apparmor_attaches_at_all():
+            # DISPROVED, not unprovable: the profile cannot be attached to anything, so the
+            # assertion that it is loaded and enforcing is false.
+            _log.warning(
+                "apparmor_assertion_disproved profile=%s "
+                "note=the profile cannot be attached at all (absent, or it denies the "
+                "documented probe binary); no profile is attached",
+                self._apparmor_profile,
+            )
+            self._proof = (False, now)
+            return False
 
         got = self.prove_apparmor_attachment()
         if got is None:
