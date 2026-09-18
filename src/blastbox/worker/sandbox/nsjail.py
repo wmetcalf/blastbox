@@ -44,7 +44,13 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from blastbox.errors import SandboxError, SandboxUnavailable
-from blastbox.worker.sandbox.apparmor import profile_loaded, resolve_profile
+from blastbox.worker.sandbox.apparmor import (
+    ASSERTED,
+    find_aa_exec,
+    profile_evidence,
+    profile_loaded,
+    resolve_profile,
+)
 from blastbox.worker.sandbox.base import SandboxRequest, SandboxResult, kill_sandbox_group
 
 
@@ -126,7 +132,7 @@ def _find_aa_exec() -> str | None:
     profile is confirmed enforcing. That keeps the hardening the old code intended rather
     than deleting the intent along with the dead flag.
     """
-    return shutil.which("aa-exec")
+    return find_aa_exec()
 
 
 def _supports_proc_rw(nsjail_path: str) -> bool:
@@ -213,7 +219,17 @@ class NsjailSandbox:
             if self._aa_exec is not None
             else False
         )
+        # A THIRD cause for apparmor_missing, kept distinct from the other two. Clearing
+        # `_aa_exec` made the log block below announce `reason=aa_exec_not_found` -- the helper
+        # was found -- and made the selector's remedy tell the operator to load a profile that
+        # is already loaded and enforcing, which is the very defect the remedy was added to fix
+        # (claude-code-review lens, round 2 of #177).
+        self._apparmor_blocked_reason: str | None = None
         if self._aa_exec is not None and self._binary_present and not self._proc_rw_supported:
+            self._apparmor_blocked_reason = (
+                f"the installed nsjail at {nsjail_path} has no --proc_rw, so aa-exec would "
+                f"fail with EROFS; no profile can be attached with this build"
+            )
             _log.warning(
                 "nsjail_apparmor_unavailable reason=installed_nsjail_has_no_--proc_rw "
                 "path=%s note=aa_exec_would_fail_with_EROFS_so_no_profile_is_attached",
@@ -239,7 +255,9 @@ class NsjailSandbox:
         # two-backends-disagree-about-their-own-hardening asymmetry #160 exists to remove,
         # one layer down, with the accurate line at the level that does NOT reach an alerting
         # pipeline (claude-code-review lens, #177).
-        if self._aa_exec is None:
+        if self._apparmor_blocked_reason is not None:
+            pass                    # already logged above, with the real cause
+        elif self._aa_exec is None:
             _log.warning(
                 "nsjail_apparmor_skipped reason=aa_exec_not_found "
                 "note=child_runs_without_an_apparmor_profile"
@@ -263,6 +281,17 @@ class NsjailSandbox:
         # What confinement looked like when the selector admitted this backend. A LOSS
         # of it later is a refusal (see _refuse_if_confinement_regressed); never having
         # had it is not.
+        self._suspended_for_diagnosis = False
+        # An ASSERTED profile is not a confirmed one. Measure it once, from inside the jail,
+        # before anything is traded for it -- and drop the attachment if the child does not
+        # come back wearing an enforcing profile of that name.
+        if (
+            self._aa_exec is not None
+            and self._binary_present
+            and profile_evidence(self._apparmor_profile) == ASSERTED
+            and not self.apparmor_attachment_is_believable()
+        ):
+            self._aa_exec = None
         self._armed_at_admission = self.apparmor_active
 
         _log.info(
@@ -290,10 +319,18 @@ class NsjailSandbox:
         rejection stands either way.
         """
         saved, self._aa_exec = self._aa_exec, None
+        # The regression guard reads exactly the state this suspension fakes -- armed at
+        # admission, not active now -- so without this flag the guard fires INSIDE the
+        # diagnostic probe, `_smoketest` sees the suspended probe fail too, and
+        # `_ProfileDeniesProbe` becomes unreachable from a real backend: the
+        # demote-to-container path reopens, and the two round-1 fixes cancel each other out
+        # (claude-security lens, round 2 of #177).
+        self._suspended_for_diagnosis = True
         try:
             yield
         finally:
             self._aa_exec = saved
+            self._suspended_for_diagnosis = False
 
     def _apparmor_enforcing_now(self) -> bool:
         """Whether the profile is enforcing AT THIS MOMENT.
@@ -353,6 +390,15 @@ class NsjailSandbox:
         return self._seccomp_policy is not None
 
     @property
+    def apparmor_blocked_reason(self) -> str | None:
+        """Why no profile can be attached on this host, when the cause is not the obvious two.
+
+        `apparmor_missing` has three causes -- no helper, no enforcing profile, and an nsjail
+        build without `--proc_rw` -- and the selector's remedy can only guess at the first two.
+        """
+        return self._apparmor_blocked_reason
+
+    @property
     def apparmor_active(self) -> bool:
         """Whether a profile is ACTUALLY attached, not merely whether nsjail could attach one.
 
@@ -365,7 +411,60 @@ class NsjailSandbox:
     # ------------------------------------------------------------------
     # Public interface
 
-    def _refuse_if_confinement_regressed(self) -> None:
+    def prove_apparmor_attachment(self) -> str | None:
+        """Ask the KERNEL, from inside the jail, what profile the child actually got.
+
+        The one thing that turns an assertion into a measurement. When arming rests on
+        ``BLASTBOX_APPARMOR_PROFILES`` -- which is the normal case for a non-root worker,
+        because securityfs is root-only -- nothing so far has checked that the named profile
+        exists, let alone that it is enforcing, and a complain-mode profile would buy
+        `secure = True` plus (for nsjail) a writable /proc for the child with no confinement
+        at all in exchange (claude-security lens, round 2 of #177).
+
+        ``/proc/self/attr/current`` read from inside is the kernel naming the profile AND its
+        mode, so it cannot be asserted away. Returns that string, or None if the probe could
+        not run. The caller decides what to do with a mismatch; this method only measures.
+        """
+        if self._aa_exec is None:
+            return None
+        req = SandboxRequest(argv=["/bin/cat", "/proc/self/attr/current"])
+        argv = self._build_argv(req, attach_apparmor=True)
+        try:
+            out = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as exc:
+            _log.warning("apparmor_attachment_unprovable reason=%s", exc)
+            return None
+        if out.returncode != 0:
+            _log.warning(
+                "apparmor_attachment_unprovable rc=%s stderr=%s",
+                out.returncode, out.stderr.strip()[-200:],
+            )
+            return None
+        return out.stdout.strip()
+
+    def apparmor_attachment_is_believable(self) -> bool:
+        """True when the child really comes back wearing an ENFORCING profile of that name.
+
+        Called only where the evidence is an assertion; a kernel reading needs no second
+        opinion. A False here drops the attachment rather than proceeding, because the
+        alternative is `--proc_rw` bought with nothing.
+        """
+        got = self.prove_apparmor_attachment()
+        if got is None:
+            return False
+        ok = got.startswith(self._apparmor_profile) and (
+            "(enforce)" in got or "(kill)" in got
+        )
+        if not ok:
+            _log.warning(
+                "apparmor_assertion_disproved profile=%s child_reports=%r "
+                "note=asserted via BLASTBOX_APPARMOR_PROFILES but the kernel disagrees; "
+                "no profile is attached",
+                self._apparmor_profile, got,
+            )
+        return ok
+
+    def _refuse_if_confinement_regressed(self, attached: bool | None = None) -> None:
         """A worker outlives its jobs; `secure` is checked once, at selection.
 
         `select_sandbox` reads `secure` at worker start and never again, and `run()` used to
@@ -388,7 +487,13 @@ class NsjailSandbox:
         runs, and on only where nobody does. `BLASTBOX_ALLOW_CONFINEMENT_LOSS=1` is the
         knowing opt-out, and it has to be set by someone who means this.
         """
-        if not self._armed_at_admission or self.apparmor_active:
+        if self._suspended_for_diagnosis:
+            # A probe, not a job. `_smoketest` suspends the profile deliberately to tell
+            # "your profile denies the probe binary" from "this backend does not work".
+            return
+        if not self._armed_at_admission or (
+            self.apparmor_active if attached is None else attached
+        ):
             return
         msg = (
             f"{self.name}: the AppArmor profile {self._apparmor_profile!r} was enforcing when "
@@ -417,9 +522,15 @@ class NsjailSandbox:
             raise SandboxError("argv must be a non-empty list of strings")
         if not self._binary_present:
             raise SandboxUnavailable(f"nsjail not found at {self._nsjail!r}")
-        self._refuse_if_confinement_regressed()
+        # ONE read of securityfs for this launch, shared by the guard and the argv. They
+        # used to read it independently, so a profile that stopped being confirmable between
+        # the two produced exactly what the guard exists to prevent -- an unconfined argv on
+        # a backend admitted as confined -- with no refusal and no error
+        # (claude-security lens, round 2 of #177).
+        attached = self._aa_exec is not None and self._apparmor_enforcing_now()
+        self._refuse_if_confinement_regressed(attached)
 
-        argv = self._build_argv(request)
+        argv = self._build_argv(request, attach_apparmor=attached)
         killed = False
 
         try:
@@ -470,7 +581,9 @@ class NsjailSandbox:
     # ------------------------------------------------------------------
     # Internal
 
-    def _build_argv(self, req: SandboxRequest) -> list[str]:
+    def _build_argv(
+        self, req: SandboxRequest, *, attach_apparmor: bool | None = None
+    ) -> list[str]:
         """Build the full nsjail argument vector for ``req``.
 
         All mount source/target paths are encoded as ``src:tgt`` in value
@@ -550,9 +663,15 @@ class NsjailSandbox:
         # of securityfs can disagree (the profile is re-read per launch, by design), and
         # either half alone is a broken run -- `--proc_rw` with no aa-exec needlessly
         # loosens /proc, aa-exec with no `--proc_rw` fails every execve (see below).
+        # `attach_apparmor` is run()'s single answer for this launch; None means "decide
+        # here", for the direct callers (tests, diagnostics) that have no launch context.
         aa_exec = self._aa_exec
-        if aa_exec is not None and not self._apparmor_enforcing_now():
-            aa_exec = None
+        if aa_exec is not None:
+            decided = (
+                self._apparmor_enforcing_now() if attach_apparmor is None else attach_apparmor
+            )
+            if not decided:
+                aa_exec = None
 
         # `--proc_rw` is REQUIRED for aa-exec, and is why the userspace route was written off
         # as impossible for nsjail (deploy/apparmor/README.md, #160). aa-exec performs the

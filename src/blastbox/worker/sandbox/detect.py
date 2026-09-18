@@ -122,6 +122,16 @@ def _probe(sb: Sandbox, argv: list[str]) -> Exception | None:
     return None
 
 
+def _looks_like_a_timeout(err: Exception | None) -> bool:
+    """A probe killed on the clock is a slow host, never an AppArmor denial.
+
+    `_probe` reports `killed` the same way it reports a non-zero exit, and the profile-denial
+    conclusion is the one that aborts selection with no fallback -- so the two must not be
+    confused.
+    """
+    return err is not None and "killed=True" in str(err)
+
+
 def _smoketest(sb: Sandbox) -> tuple[bool, Exception | None]:
     """Run ``/usr/bin/true`` through the backend's REAL argv; ``(True, None)`` on success.
 
@@ -143,9 +153,21 @@ def _smoketest(sb: Sandbox) -> tuple[bool, Exception | None]:
 
     suspend = getattr(sb, "apparmor_suspended", None)
     if suspend is not None and getattr(sb, "apparmor_active", False):
+        # CONFIRM the confined failure before blaming the profile for it. This conclusion
+        # aborts selection outright -- no bwrap, no container -- so a single flaky probe
+        # (memory pressure, a slow host, a transient mount error) would stop a worker from
+        # starting and send the operator to edit a profile that is correct. Two failures with
+        # the profile and a success without it is a much narrower claim than one of each
+        # (claude-code-review lens, round 2 of #177).
+        confirm_err = _probe(sb, [true_path])
         with suspend():
             unconfined_err = _probe(sb, [true_path])
-        if unconfined_err is None:
+        if (
+            confirm_err is not None
+            and unconfined_err is None
+            and not _looks_like_a_timeout(err)
+            and not _looks_like_a_timeout(confirm_err)
+        ):
             profile = getattr(sb, "_apparmor_profile", "the child profile")
             _log.warning(
                 "sandbox smoketest fails only WITH the AppArmor profile",
@@ -251,9 +273,16 @@ def select_sandbox(
         if not secure:
             detail = ", ".join(reasons) or "unspecified"
             if not warn_on_insecure:
-                rejections.append(f"{name}: insecure ({detail})")
-                if "apparmor_missing" in reasons:
-                    apparmor_gap = True
+                blocked = getattr(sb, "apparmor_blocked_reason", None)
+                if blocked and "apparmor_missing" in reasons:
+                    # The backend knows a cause the generic remedy cannot guess (an nsjail
+                    # build with no --proc_rw). Carry it instead of letting the hint send the
+                    # operator to load a profile that is already loaded.
+                    rejections.append(f"{name}: insecure ({detail}: {blocked})")
+                else:
+                    rejections.append(f"{name}: insecure ({detail})")
+                    if "apparmor_missing" in reasons:
+                        apparmor_gap = True
                 _log.warning(
                     "sandbox backend rejected as insecure",
                     extra={"backend": name, "reasons": reasons},

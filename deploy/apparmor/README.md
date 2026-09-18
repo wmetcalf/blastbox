@@ -225,6 +225,15 @@ a profile to complain under a running worker stops the attachment and shows up i
 Attaching a profile that is **not** loaded is not a degraded mode — it fails the exec and breaks
 every run — which is why the profile is confirmed before it is attached.
 
+**An asserted profile is now proved before anything is traded for it.** Because securityfs is
+root-only, a non-root worker's only route to "the profile is enforcing" is the assertion below —
+and an assertion cannot tell `enforce` from `complain`, while arming on it buys `--proc_rw`. So
+when the evidence is an assertion, the backend runs one probe through the jail and reads
+`/proc/self/attr/current` from inside: the kernel naming the profile *and* its mode, which cannot
+be asserted away. A child that comes back `(complain)`, `unconfined`, or wearing another profile
+disarms the attachment and gets `apparmor_missing` instead. A profile the kernel itself reported is
+not re-probed.
+
 ### The `BLASTBOX_APPARMOR_PROFILES` escape hatch (plural)
 
 On a host where the worker cannot read `/sys/kernel/security/apparmor/profiles`, assert what is

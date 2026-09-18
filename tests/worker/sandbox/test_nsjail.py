@@ -750,10 +750,19 @@ def test_the_product_argv_really_transitions_the_child(monkeypatch) -> None:
     kernel. Reverting the fix leaves the child reporting the host's own profile, and this
     fails.
     """
+    import blastbox.worker.sandbox.nsjail as mod
+
     monkeypatch.setenv("BLASTBOX_APPARMOR_PROFILE", "unconfined")
     monkeypatch.setenv("BLASTBOX_APPARMOR_PROFILES", "unconfined")
+    # `unconfined` is the one profile name always valid as a transition target, which is what
+    # lets this test run without root and without a loaded profile. It is deliberately NOT
+    # enforcing, so the assertion-believability check correctly refuses to arm on it -- and
+    # that check is not this test's subject. Tell the backend the kernel confirmed the
+    # profile, so the attach path under test runs; what the child reports back is still the
+    # kernel's own answer, and is still the only thing asserted.
+    import blastbox.worker.sandbox.apparmor as aa
 
-    import blastbox.worker.sandbox.nsjail as mod
+    monkeypatch.setattr(mod, "profile_evidence", lambda _p: aa.KERNEL)
 
     from .conftest import nsjail_usable
 
@@ -908,3 +917,240 @@ def test_the_dispatchers_blanket_leniency_does_not_switch_off_the_regression_gua
     state["on"] = False
     with pytest.raises(SandboxUnavailable, match="was enforcing"):
         sb.run(SandboxRequest(argv=["/usr/bin/true"]))
+
+
+def test_the_guard_and_the_argv_share_one_reading_of_the_profile(tmp_path, monkeypatch) -> None:
+    """They used to read securityfs independently, twice per launch.
+
+    `run()` asked the guard (read #1), then `_build_argv` asked again (read #2). A profile that
+    stopped being confirmable between them passed the guard on the stale True and produced an
+    argv with no aa-exec and no --proc_rw: the exact outcome the guard exists to prevent,
+    with no refusal and no error (claude-security lens, round 2 of #177).
+    """
+    import subprocess
+
+    import blastbox.worker.sandbox.nsjail as mod
+
+    reads = {"n": 0}
+    state = {"on": True}
+
+    def _counting(_profile: str) -> bool:
+        reads["n"] += 1
+        return state["on"]
+
+    monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
+    monkeypatch.setattr(mod, "_supports_proc_rw", lambda _p: True)
+    monkeypatch.setattr(mod, "profile_loaded", _counting)
+    nsjail = tmp_path / "nsjail"
+    nsjail.write_text(_FAKE_NSJAIL)
+    nsjail.chmod(0o755)
+    policy = tmp_path / "ok.policy"
+    policy.write_text("POLICY ok { ERRNO(1) { } } USE ok DEFAULT ALLOW\n")
+    sb = mod.NsjailSandbox(nsjail_path=str(nsjail), seccomp_policy=policy)
+    assert sb._armed_at_admission is True
+
+    captured: dict[str, list[str]] = {}
+
+    class _Popen:
+        def __init__(self, argv, *a, **k):
+            captured["argv"] = argv
+            self.args, self.returncode, self.pid = argv, 0, 1
+
+        def communicate(self, *a, **k):
+            return (b"", b"")
+
+    monkeypatch.setattr(subprocess, "Popen", _Popen)
+
+    # THE CASE THAT MATTERS: the profile is still there when the guard looks, and gone by the
+    # time the argv is built. With one shared reading the argv carries what the guard
+    # approved; with two, the guard passes and the child runs unconfined -- silently.
+    reads["n"] = 0
+    sb.run(SandboxRequest(argv=["/usr/bin/true"]))
+    assert reads["n"] == 1, (
+        f"securityfs was read {reads['n']} times for one launch -- the guard and the argv can "
+        f"disagree again"
+    )
+    argv = captured["argv"]
+    assert "aa-exec" in " ".join(argv), (
+        "the guard approved a confined launch and the argv dropped the profile anyway"
+    )
+    assert "--proc_rw" in argv
+
+    # And the refusal still works when the profile is gone BEFORE the guard looks.
+    from blastbox.errors import SandboxUnavailable
+
+    state["on"] = False
+    monkeypatch.delenv("BLASTBOX_ALLOW_CONFINEMENT_LOSS", raising=False)
+    captured.clear()
+    with pytest.raises(SandboxUnavailable, match="was enforcing"):
+        sb.run(SandboxRequest(argv=["/usr/bin/true"]))
+    assert "argv" not in captured, "an unconfined argv reached Popen"
+
+
+class TestAnAssertedProfileIsMeasuredNotBelieved:
+    """`/sys/kernel/security/apparmor/profiles` is root-only and a worker is not root, so on
+    the posture this mechanism is written for the kernel can NEVER be consulted and
+    `BLASTBOX_APPARMOR_PROFILES` is the sole authority. Making the kernel "authoritative where
+    readable" therefore changed nothing for the case that matters: a single environment
+    variable still bought `secure = True`, `apparmor_active = True` and `--proc_rw` -- a
+    measurably wider /proc for the child -- with no confinement in exchange
+    (claude-security lens, round 2 of #177).
+
+    So an asserted profile is now proved from inside the jail: /proc/self/attr/current is the
+    kernel naming the profile and its mode, and it cannot be asserted away.
+    """
+
+    def _sb(self, tmp_path, monkeypatch, *, child_reports: str, rc: int = 0):
+        import subprocess
+
+        import blastbox.worker.sandbox.apparmor as aa
+        import blastbox.worker.sandbox.nsjail as mod
+
+        monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
+        monkeypatch.setattr(mod, "_supports_proc_rw", lambda _p: True)
+        monkeypatch.setattr(mod, "profile_evidence", lambda _p: aa.ASSERTED)
+        monkeypatch.setattr(mod, "profile_loaded", lambda _p: True)
+
+        def _fake_run(argv, **kw):
+            from types import SimpleNamespace
+            return SimpleNamespace(returncode=rc, stdout=child_reports, stderr="")
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        nsjail = tmp_path / "nsjail"
+        nsjail.write_text(_FAKE_NSJAIL)
+        nsjail.chmod(0o755)
+        policy = tmp_path / "ok.policy"
+        policy.write_text("POLICY ok { ERRNO(1) { } } USE ok DEFAULT ALLOW\n")
+        return mod.NsjailSandbox(nsjail_path=str(nsjail), seccomp_policy=policy)
+
+    def test_a_child_wearing_the_enforcing_profile_arms_it(self, tmp_path, monkeypatch) -> None:
+        sb = self._sb(tmp_path, monkeypatch, child_reports="blastbox-sandbox (enforce)\n")
+        assert sb.apparmor_active is True
+        assert "apparmor_missing" not in sb.insecurity_reasons
+        assert "--proc_rw" in sb._build_argv(SandboxRequest(argv=["/usr/bin/true"]))
+
+    def test_complain_mode_is_not_confinement_and_does_not_arm(
+            self, tmp_path, monkeypatch) -> None:
+        """The case the assertion cannot see and this proof can."""
+        sb = self._sb(tmp_path, monkeypatch, child_reports="blastbox-sandbox (complain)\n")
+        assert sb.apparmor_active is False
+        assert "apparmor_missing" in sb.insecurity_reasons
+        assert "--proc_rw" not in sb._build_argv(SandboxRequest(argv=["/usr/bin/true"])), (
+            "/proc was widened for a profile that logs and allows"
+        )
+
+    def test_a_profile_that_is_not_there_at_all_does_not_arm(
+            self, tmp_path, monkeypatch) -> None:
+        sb = self._sb(tmp_path, monkeypatch, child_reports="blastbox-nsjail (unconfined)\n")
+        assert sb.apparmor_active is False
+        assert "apparmor_missing" in sb.insecurity_reasons
+
+    def test_an_unprovable_probe_does_not_arm(self, tmp_path, monkeypatch) -> None:
+        """Fail safe: a probe that cannot run is not evidence of confinement."""
+        sb = self._sb(tmp_path, monkeypatch, child_reports="", rc=1)
+        assert sb.apparmor_active is False
+
+    def test_kill_mode_counts(self, tmp_path, monkeypatch) -> None:
+        sb = self._sb(tmp_path, monkeypatch, child_reports="blastbox-sandbox (kill)\n")
+        assert sb.apparmor_active is True
+
+    def test_a_kernel_reading_is_not_re_probed(self, tmp_path, monkeypatch) -> None:
+        """A profile the kernel itself reported needs no second opinion, and an extra jail
+        launch per worker is not free."""
+        import subprocess
+
+        import blastbox.worker.sandbox.apparmor as aa
+        import blastbox.worker.sandbox.nsjail as mod
+
+        monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
+        monkeypatch.setattr(mod, "_supports_proc_rw", lambda _p: True)
+        monkeypatch.setattr(mod, "profile_evidence", lambda _p: aa.KERNEL)
+        monkeypatch.setattr(mod, "profile_loaded", lambda _p: True)
+        calls = {"n": 0}
+
+        def _counting(argv, **kw):
+            calls["n"] += 1
+            raise AssertionError("the kernel's answer was re-probed")
+
+        monkeypatch.setattr(subprocess, "run", _counting)
+        nsjail = tmp_path / "nsjail"
+        nsjail.write_text(_FAKE_NSJAIL)
+        nsjail.chmod(0o755)
+        sb = mod.NsjailSandbox(nsjail_path=str(nsjail))
+        assert sb.apparmor_active is True
+        assert calls["n"] == 0
+
+
+class TestAnNsjailWithoutProcRwNamesItself:
+    """`apparmor_missing` has THREE causes: no helper, no enforcing profile, and an nsjail
+    build without `--proc_rw`. Clearing `_aa_exec` for the third made the constructor log
+    `reason=aa_exec_not_found` -- the helper was right there -- and made the selector's remedy
+    tell the operator to load a profile that was already loaded and enforcing, which is the
+    defect that remedy was added to fix (claude-code-review lens, round 2 of #177).
+    """
+
+    def _sb(self, tmp_path, monkeypatch):
+        import blastbox.worker.sandbox.nsjail as mod
+
+        monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
+        monkeypatch.setattr(mod, "_supports_proc_rw", lambda _p: False)
+        monkeypatch.setattr(mod.NsjailSandbox, "_apparmor_enforcing_now", lambda self: True)
+        nsjail = tmp_path / "nsjail"
+        nsjail.write_text(_FAKE_NSJAIL)
+        nsjail.chmod(0o755)
+        return mod.NsjailSandbox(nsjail_path=str(nsjail))
+
+    def test_the_log_does_not_blame_the_helper(self, tmp_path, monkeypatch, caplog) -> None:
+        import logging
+
+        with caplog.at_level(logging.INFO, logger="blastbox.worker.sandbox.nsjail"):
+            self._sb(tmp_path, monkeypatch)
+        assert "aa_exec_not_found" not in caplog.text
+        assert "installed_nsjail_has_no_--proc_rw" in caplog.text
+
+    def test_the_backend_can_name_the_cause(self, tmp_path, monkeypatch) -> None:
+        sb = self._sb(tmp_path, monkeypatch)
+        assert "apparmor_missing" in sb.insecurity_reasons
+        assert sb.apparmor_blocked_reason is not None
+        assert "--proc_rw" in sb.apparmor_blocked_reason
+
+    def test_the_selector_passes_that_cause_through_instead_of_the_stock_remedy(
+            self, tmp_path, monkeypatch) -> None:
+        import blastbox.worker.sandbox.detect as detect_mod
+        from blastbox.errors import SandboxUnavailable
+
+        sb = self._sb(tmp_path, monkeypatch)
+        monkeypatch.delenv("BLASTBOX_WARN_ON_INSECURE", raising=False)
+        monkeypatch.delenv("BLASTBOX_SANDBOX", raising=False)
+        monkeypatch.setattr(detect_mod, "_in_container", lambda: False)
+        monkeypatch.setattr(detect_mod, "_smoketest", lambda _sb: (True, None))
+
+        def _only_nsjail(name, **kw):
+            if name == "nsjail":
+                return sb
+            raise SandboxUnavailable(f"{name} not available in this test")
+
+        monkeypatch.setattr(detect_mod, "_make_backend", _only_nsjail)
+        with pytest.raises(SandboxUnavailable) as ei:
+            detect_mod.select_sandbox(_status_path=tmp_path / "status")
+        msg = str(ei.value)
+        assert "--proc_rw" in msg, msg
+        assert "in enforce or kill mode" not in msg, (
+            "the stock remedy told the operator to load a profile that is already enforcing"
+        )
+
+
+def test_both_backends_find_aa_exec_through_one_patchable_name(monkeypatch) -> None:
+    """bwrap called `shutil.which("aa-exec")` inline while nsjail had a module-level finder,
+    so `monkeypatch.setattr(bwrap, "_find_aa_exec", ...)` created an unused attribute and the
+    bwrap half of every parity test silently read the HOST -- host-dependence of exactly the
+    kind those tests exist to remove (claude-code-review lens, round 2 of #177)."""
+    import blastbox.worker.sandbox.bwrap as bw
+    import blastbox.worker.sandbox.nsjail as nj
+
+    for mod in (nj, bw):
+        assert hasattr(mod, "_find_aa_exec"), f"{mod.__name__} has no patchable finder"
+        monkeypatch.setattr(mod, "_find_aa_exec", lambda: None)
+
+    assert nj.NsjailSandbox(nsjail_path="/bin/sh")._aa_exec is None
+    assert bw.BubblewrapSandbox(bwrap_path="/bin/sh")._aa_exec is None

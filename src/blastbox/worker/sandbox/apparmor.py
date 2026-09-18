@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 
 _PROFILES = "/sys/kernel/security/apparmor/profiles"
 
@@ -62,59 +63,68 @@ def resolve_profile(explicit: str | None = None) -> str:
     return os.environ.get("BLASTBOX_APPARMOR_PROFILE", "").strip() or DEFAULT_PROFILE
 
 
-def profile_loaded(profile: str) -> bool:
-    """True only if the named profile can be CONFIRMED enforcing.
+KERNEL = "kernel"
+ASSERTED = "asserted"
+NONE = "none"
 
-    Any uncertainty -- securityfs unreadable, profile absent -- is False, so the caller skips
-    the confinement and records it rather than failing every run.
 
-    ORDER MATTERS, and it used to be the other way round. The ``BLASTBOX_APPARMOR_PROFILES``
-    assertion was checked FIRST and returned True before securityfs was opened, so an
-    operator naming a profile that is loaded in `complain` mode -- or not loaded at all --
-    got `secure = True`, `apparmor_active = True`, and (since #160) `--proc_rw` in the nsjail
-    argv: a child with no enforcement, a widened /proc, and a backend reporting itself fully
-    hardened. That is this repo's recurring defect class, configuration PRESENT standing in
-    for confinement IN FORCE (claude-security lens, #177).
+def find_aa_exec() -> str | None:
+    """The ``aa-exec`` helper, or None -- for BOTH backends, under one name.
 
-    The kernel is authoritative whenever it can be read. The assertion is a FALLBACK for the
-    case it was written for -- ``/sys/kernel/security/apparmor/profiles`` is root-only, and a
-    non-root worker cannot read it -- and it cannot contradict a reading that succeeded: an
-    operator who asserts a profile the kernel reports as `complain` is telling us something
-    untrue, and believing them over the kernel is how the complain-mode case above happens.
-    It remains ADDITIVE where it applies: an operator who lists A and B has said nothing
-    about C, so a C the kernel reports as enforcing is still enforcing.
+    bwrap called `shutil.which("aa-exec")` inline while nsjail had a module-level
+    `_find_aa_exec`, so a test could pin nsjail's answer and silently could not pin bwrap's:
+    `monkeypatch.setattr(bwrap_module, "_find_aa_exec", ...)` created an unused attribute and
+    the bwrap half of every parity test quietly read the host instead -- host-dependence of
+    exactly the kind those tests were written to remove (claude-code-review lens, round 2 of
+    #177). One name, both modules, one thing to patch.
+    """
+    return shutil.which("aa-exec")
+
+
+def profile_evidence(profile: str) -> str:
+    """WHERE the answer came from: :data:`KERNEL`, :data:`ASSERTED` or :data:`NONE`.
+
+    Not decoration. ``/sys/kernel/security/apparmor/profiles`` is root-only and a worker is
+    not root, so on the deployment posture this mechanism is written for the kernel can NEVER
+    be consulted and ``BLASTBOX_APPARMOR_PROFILES`` is the sole authority -- an assertion that
+    cannot distinguish enforce from complain, now deciding `secure` and (for nsjail)
+    ``--proc_rw``. Making the kernel authoritative "where it can be read" therefore changed
+    nothing for the case that matters (claude-security lens, round 2 of #177).
+
+    Callers that are about to trade something for confinement can ask how the answer was
+    reached and go and MEASURE it instead of believing it -- see
+    ``Sandbox.prove_apparmor_attachment``.
     """
     try:
-        # `surrogateescape`, not `ascii`: an AppArmor profile name is usually a PATH, and a
-        # path is bytes, so one profile with a non-UTF-8 byte -- belonging to some UNRELATED
-        # program -- would abort the scan before reaching ours. Swallowing that error is not
-        # enough: it would answer False for a profile that IS enforcing, so both backends would
-        # drop the `aa-exec` prefix and run the workload unconfined because of somebody else's
-        # filename. Surrogates round-trip losslessly and never equal an ASCII profile name.
         with open(_PROFILES, encoding="utf-8", errors="surrogateescape") as fh:
             lines = fh.readlines()
     except (OSError, UnicodeDecodeError):
-        # Unreadable: the operator's assertion is the only evidence available. This helper is
-        # called from a backend CONSTRUCTOR, and `select_sandbox` only treats
-        # `SandboxUnavailable` as "try the next backend" -- anything else aborts auto-selection
-        # rather than falling through to bwrap. It must answer, never raise (codex, #159).
         if profile in _asserted():
             _warn_asserted(profile)
-            return True
-        return False
+            return ASSERTED
+        return NONE
 
     if any(_line_is_enforcing(line, profile) for line in lines):
-        return True
+        return KERNEL
     if profile in _asserted():
-        # The kernel WAS readable and does not report this profile as enforcing. The assertion
-        # loses; it exists for the unreadable case, not to overrule an answer we have.
         _log.warning(
             "apparmor_assertion_contradicted profile=%s "
             "note=BLASTBOX_APPARMOR_PROFILES names it but securityfs does not report it "
             "enforcing; the kernel wins and no profile is attached",
             profile,
         )
-    return False
+    return NONE
+
+
+def profile_loaded(profile: str) -> bool:
+    """True only if the named profile can be CONFIRMED enforcing.
+
+    Any uncertainty -- securityfs unreadable and nothing asserted, profile absent -- is False,
+    so the caller skips the confinement and records it rather than failing every run. See
+    :func:`profile_evidence` for the ordering (the kernel outranks the environment wherever it
+    can be read) and for why the caller should care which of the two answered.
+    """
+    return profile_evidence(profile) != NONE
 
 
 def _asserted() -> set[str]:

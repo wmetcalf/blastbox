@@ -41,20 +41,32 @@ profile blastbox-sandbox flags=(attach_disconnected,mediate_deleted) {
   /** rwlkmix,
 
   # ---- the /proc surface --proc_rw opens -------------------------------------------------
-  deny /proc/*/mem rwklx,
-  deny /proc/*/clear_refs w,
-  deny /proc/*/coredump_filter w,
-  deny /proc/*/oom_score_adj w,
-  deny /proc/*/uid_map w,
-  deny /proc/*/gid_map w,
-  deny /proc/*/setgroups w,
-  deny /proc/*/timerslack_ns w,
+  #
+  # `**`, NOT `*`. AppArmor's `*` does not cross a `/`: `deny /proc/*/mem` compiles to
+  # `/proc/[^/]+/mem` and therefore does NOT cover `/proc/self/task/<tid>/mem`, which is a
+  # real directory entry offering the same address-space write interface -- and which the
+  # blanket `/** rwlkmix,` above then allows. Measured: through that path a child under the
+  # first version of this profile wrote 8 bytes into a PROT_READ page and read them back.
+  # So the profile shipped with this PR would have left the child STRICTLY LESS confined than
+  # a child with no profile at all, which keeps a read-only /proc and no --proc_rw
+  # (claude-security lens, round 2 of #177). Every /proc deny below crosses `/` for that
+  # reason; tests/deploy/test_apparmor_profiles.py checks the COMPILED expressions, not this
+  # text, because the text is what looked right the first time.
+  deny /proc/**/mem rwklx,
+  deny /proc/**/clear_refs w,
+  deny /proc/**/coredump_filter w,
+  deny /proc/**/oom_score_adj w,
+  deny /proc/**/uid_map w,
+  deny /proc/**/gid_map w,
+  deny /proc/**/setgroups w,
+  deny /proc/**/timerslack_ns w,
   deny /proc/sys/** w,
   deny /proc/sysrq-trigger w,
 
   # Re-entering the attr interface is how a confined task asks for a different profile. A
   # profile with no change_profile rules already refuses; say it, and audit the attempt.
-  audit deny /proc/*/attr/{current,exec,prev} w,
+  # (Per-thread attr lives under /proc/<pid>/task/<tid>/attr/, hence `**` here too.)
+  audit deny /proc/**/attr/{current,exec,prev} w,
   audit deny change_profile,
 
   # ---- capabilities and operations a detonation never needs ------------------------------
@@ -72,7 +84,16 @@ profile blastbox-sandbox flags=(attach_disconnected,mediate_deleted) {
 
   # The backend governs egress (a sealed netns, or a rooter-routed one). Raw and packet
   # sockets are neither, and are a forgery surface for anything that does get a route.
-  audit deny network raw,
+  #
+  # PER FAMILY, not a bare `raw`. In AppArmor's network grammar `raw` is a socket TYPE, so
+  # `audit deny network raw,` denies SOCK_RAW in EVERY family -- including AF_NETLINK, which
+  # is what glibc opens for getaddrinfo(AI_ADDRCONFIG), getifaddrs() and if_nameindex(). It
+  # silently swallowed the `network netlink raw,` allow three lines below: compiling this
+  # profile with that allow deleted produced a byte-identical policy, so the allow was dead
+  # and every DNS lookup in the workload would have taken an audit denial
+  # (claude-code-review lens, round 2 of #177).
+  audit deny network inet raw,
+  audit deny network inet6 raw,
   audit deny network packet,
   network inet stream,
   network inet6 stream,

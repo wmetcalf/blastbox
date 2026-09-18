@@ -46,7 +46,13 @@ from typing import Callable
 
 from blastbox.errors import SandboxError, SandboxUnavailable
 from blastbox.limits import Limits
-from blastbox.worker.sandbox.apparmor import DEFAULT_PROFILE, resolve_profile
+from blastbox.worker.sandbox.apparmor import (
+    ASSERTED,
+    find_aa_exec as _find_aa_exec,
+    DEFAULT_PROFILE,
+    profile_evidence,
+    resolve_profile,
+)
 from blastbox.worker.sandbox.base import SandboxRequest, SandboxResult, kill_sandbox_group
 
 
@@ -171,7 +177,7 @@ class BubblewrapSandbox:
         # Two independent facts, and they were conflated: whether the HELPER exists (static,
         # a binary on disk) and whether the PROFILE is enforcing (dynamic, kernel state an
         # operator can change under a running worker). Only the first belongs in a constructor.
-        self._aa_exec: str | None = shutil.which("aa-exec")
+        self._aa_exec: str | None = _find_aa_exec()
         self._apparmor_last_seen: bool | None = None
         if self.apparmor_active:
             _log.info(
@@ -229,6 +235,17 @@ class BubblewrapSandbox:
         # What confinement looked like when the selector admitted this backend. A LOSS
         # of it later is a refusal (see _refuse_if_confinement_regressed); never having
         # had it is not.
+        self._suspended_for_diagnosis = False
+        # An ASSERTED profile is not a confirmed one. Measure it once, from inside the jail,
+        # before anything is traded for it -- and drop the attachment if the child does not
+        # come back wearing an enforcing profile of that name.
+        if (
+            self._aa_exec is not None
+            and self._binary_present
+            and profile_evidence(self._apparmor_profile) == ASSERTED
+            and not self.apparmor_attachment_is_believable()
+        ):
+            self._aa_exec = None
         self._armed_at_admission = self.apparmor_active
 
         _log.info(
@@ -259,10 +276,14 @@ class BubblewrapSandbox:
         rejection stands either way.
         """
         saved, self._aa_exec = self._aa_exec, None
+        # See the nsjail copy: without this the regression guard fires inside the diagnostic
+        # probe and `_ProfileDeniesProbe` becomes unreachable (claude-security lens, #177).
+        self._suspended_for_diagnosis = True
         try:
             yield
         finally:
             self._aa_exec = saved
+            self._suspended_for_diagnosis = False
 
     def _apparmor_enforcing_now(self) -> bool:
         """Whether the profile is enforcing AT THIS MOMENT.
@@ -320,6 +341,59 @@ class BubblewrapSandbox:
     # ------------------------------------------------------------------
     # Public interface
 
+    def prove_apparmor_attachment(self) -> str | None:
+        """Ask the KERNEL, from inside the jail, what profile the child actually got.
+
+        The one thing that turns an assertion into a measurement. When arming rests on
+        ``BLASTBOX_APPARMOR_PROFILES`` -- which is the normal case for a non-root worker,
+        because securityfs is root-only -- nothing so far has checked that the named profile
+        exists, let alone that it is enforcing, and a complain-mode profile would buy
+        `secure = True` plus (for nsjail) a writable /proc for the child with no confinement
+        at all in exchange (claude-security lens, round 2 of #177).
+
+        ``/proc/self/attr/current`` read from inside is the kernel naming the profile AND its
+        mode, so it cannot be asserted away. Returns that string, or None if the probe could
+        not run. The caller decides what to do with a mismatch; this method only measures.
+        """
+        if self._aa_exec is None:
+            return None
+        req = SandboxRequest(argv=["/bin/cat", "/proc/self/attr/current"])
+        argv = self._build_argv(req)
+        try:
+            out = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as exc:
+            _log.warning("apparmor_attachment_unprovable reason=%s", exc)
+            return None
+        if out.returncode != 0:
+            _log.warning(
+                "apparmor_attachment_unprovable rc=%s stderr=%s",
+                out.returncode, out.stderr.strip()[-200:],
+            )
+            return None
+        return out.stdout.strip()
+
+    def apparmor_attachment_is_believable(self) -> bool:
+        """True when the child really comes back wearing an ENFORCING profile of that name.
+
+        Called only where the evidence is an assertion; a kernel reading needs no second
+        opinion. A False here drops the attachment rather than proceeding, because the
+        alternative is `--proc_rw` bought with nothing.
+        """
+        got = self.prove_apparmor_attachment()
+        if got is None:
+            return False
+        ok = got.startswith(self._apparmor_profile) and (
+            "(enforce)" in got or "(kill)" in got
+        )
+        if not ok:
+            _log.warning(
+                "apparmor_assertion_disproved profile=%s child_reports=%r "
+                "note=asserted via BLASTBOX_APPARMOR_PROFILES but the kernel disagrees; "
+                "no profile is attached",
+                self._apparmor_profile, got,
+            )
+        return ok
+
     def _refuse_if_confinement_regressed(self) -> None:
         """A worker outlives its jobs; `secure` is checked once, at selection.
 
@@ -343,6 +417,8 @@ class BubblewrapSandbox:
         runs, and on only where nobody does. `BLASTBOX_ALLOW_CONFINEMENT_LOSS=1` is the
         knowing opt-out, and it has to be set by someone who means this.
         """
+        if self._suspended_for_diagnosis:
+            return
         if not self._armed_at_admission or self.apparmor_active:
             return
         msg = (

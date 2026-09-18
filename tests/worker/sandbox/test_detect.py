@@ -473,10 +473,54 @@ class TestAProfileThatDeniesTheProbeSaysSo:
             select_sandbox(_status_path=_good_status_file(tmp_path))
         assert "BLASTBOX_WARN_ON_INSECURE" not in str(ei.value)
 
-    def test_the_second_probe_really_ran_unconfined(self, monkeypatch, tmp_path: Path) -> None:
+    def test_the_confined_failure_is_confirmed_before_the_profile_is_blamed(
+            self, monkeypatch, tmp_path: Path) -> None:
+        """Three probes, in this order: confined (failed), confined again (confirm), then
+        suspended. The conclusion aborts selection with no fallback, so one flaky run must not
+        reach it (claude-code-review lens, round 2 of #177)."""
         sb, _msg = self._select(monkeypatch, tmp_path)
-        assert sb.runs[:2] == [True, False], sb.runs
+        assert sb.runs[:3] == [True, True, False], sb.runs
         assert sb.confined is True, "the suspension leaked past the probe"
+
+    def test_a_probe_that_fails_once_and_then_passes_is_not_blamed_on_the_profile(
+            self, monkeypatch, tmp_path: Path) -> None:
+        """The flaky-host case: fail, then succeed. That is not a denial, and treating it as
+        one stops a worker from starting on a host whose profile is fine."""
+        import blastbox.worker.sandbox.detect as detect_mod
+
+        sb = self._FakeSandbox()
+        calls = {"n": 0}
+
+        def _flaky(req):
+            from types import SimpleNamespace
+            calls["n"] += 1
+            sb.runs.append(sb.confined)
+            return SimpleNamespace(exit_code=(1 if calls["n"] == 1 else 0), killed=False,
+                                   stdout=b"", stderr=b"")
+
+        sb.run = _flaky                                  # type: ignore[method-assign]
+        ok, err = detect_mod._smoketest(sb)
+        assert not isinstance(err, detect_mod._ProfileDeniesProbe), (
+            "a transient failure was attributed to the AppArmor profile"
+        )
+
+    def test_a_timeout_is_never_a_denial(self, monkeypatch, tmp_path: Path) -> None:
+        """`killed` means the host was slow, and it arrives through the same failure channel
+        as a refused execve."""
+        import blastbox.worker.sandbox.detect as detect_mod
+
+        sb = self._FakeSandbox()
+
+        def _killed(req):
+            from types import SimpleNamespace
+            sb.runs.append(sb.confined)
+            # Killed while confined: a slow host, not a denial.
+            return SimpleNamespace(exit_code=-9, killed=sb.confined,
+                                   stdout=b"", stderr=b"")
+
+        sb.run = _killed                                 # type: ignore[method-assign]
+        ok, err = detect_mod._smoketest(sb)
+        assert not isinstance(err, detect_mod._ProfileDeniesProbe), str(err)
 
     def test_a_backend_with_no_profile_is_not_probed_twice(
             self, monkeypatch, tmp_path: Path) -> None:
@@ -586,3 +630,45 @@ def test_forced_mode_does_not_bolt_the_hint_onto_unrelated_failures(
     with pytest.raises(SandboxUnavailable) as ei:
         select_sandbox(backend="container", _status_path=_good_status_file(tmp_path))
     assert "deploy/apparmor" not in str(ei.value)
+
+
+def test_the_diagnosis_survives_the_regression_guard_on_a_REAL_backend(monkeypatch) -> None:
+    """Two fixes from the previous round cancelled each other out.
+
+    `apparmor_suspended()` fakes exactly the state the confinement-regression guard watches
+    for -- armed at admission, not active now -- so the guard fired INSIDE the diagnostic
+    probe, the suspended probe "failed" too, and `_ProfileDeniesProbe` became unreachable from
+    a real backend. The demote-to-`container` path reopened, and the tests passed because the
+    fake sandbox in this file has no guard: a mock talking to a mock
+    (claude-security lens, round 2 of #177).
+
+    So this one uses the REAL NsjailSandbox, with only the subprocess faked.
+    """
+    import logging
+
+    import blastbox.worker.sandbox.detect as detect_mod
+    import blastbox.worker.sandbox.nsjail as nj
+    from blastbox.worker.sandbox.base import SandboxResult
+    from blastbox.worker.sandbox.nsjail import NsjailSandbox
+
+    logging.disable(logging.CRITICAL)
+    monkeypatch.setattr(nj, "profile_loaded", lambda _p: True)
+    monkeypatch.setattr(nj, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
+    monkeypatch.setattr(nj, "_supports_proc_rw", lambda _p: True)
+    sb = NsjailSandbox(nsjail_path="/bin/sh")
+    assert sb._armed_at_admission and sb.apparmor_active
+
+    def _run(self, req):
+        # Confined: the profile denies the probe. Suspended: it runs.
+        self._refuse_if_confinement_regressed()
+        return SandboxResult(exit_code=(126 if self._aa_exec else 0),
+                             stdout=b"", stderr=b"", killed=False)
+
+    monkeypatch.setattr(NsjailSandbox, "run", _run)
+    ok, err = detect_mod._smoketest(sb)
+    logging.disable(logging.NOTSET)
+    assert ok is False
+    assert isinstance(err, detect_mod._ProfileDeniesProbe), (
+        f"the profile denial was not diagnosed: {type(err).__name__}: {err}"
+    )
+    assert sb._suspended_for_diagnosis is False, "the suspension leaked past the probe"
