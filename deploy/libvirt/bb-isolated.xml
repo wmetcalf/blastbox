@@ -38,6 +38,16 @@
   1.1.1.1 and reported the site's egress address. So the probe works, and this network
   does not carry it.
 
+  MEASURED ON genesis, libvirt 11.1.0, with the agent path checked first every time:
+
+      A -> host bridge              YES     the guest agent must stay reachable
+      A -> sibling worker B         blocked  <- <port isolated='yes'/>
+      A -> internet                 blocked  <- no <forward> element
+      dnsmasq conf has port=0       yes      <- <dns enable='no'/>
+      listening on 192.168.221.1:53 nothing
+      dig from the guest            exit 9 (no server)
+      DHCP range still offered      yes
+
   HOW THE ISOLATION IS ENFORCED, measured rather than assumed (genesis, libvirt 11.1.0):
   libvirt installs NO FORWARD RULES AT ALL for this bridge. `iptables -S FORWARD | grep
   bb-virbr0` is empty. Isolation here is the ABSENCE of a path, not the presence of a
@@ -61,7 +71,27 @@
 -->
 <network>
   <name>bb-isolated</name>
+  <!--
+    isolated='yes' — GUESTS CANNOT TALK TO EACH OTHER. Without it every worker on this
+    bridge can reach every other worker: a warm pool of analysis VMs is a flat L2 segment,
+    and a sample that moves laterally attacks its siblings, corrupting their verdicts as
+    well as escaping its own box. Omitting <forward> stops traffic leaving the HOST; this
+    stops it crossing between guests, which is a different question and was unanswered.
+    Guest-to-host still works, so the agent stays reachable. Needs libvirt >= 6.1.
+  -->
   <bridge name='bb-virbr0' stp='on' delay='0'/>
+  <port isolated='yes'/>
+  <!--
+    DNS OFF. libvirt's generated conf for an isolated network happens to carry `no-resolv`,
+    so its dnsmasq has no upstream servers and external names return NO ANSWER — verified
+    on genesis. But that is libvirt's generation CHOICE, not a property of this file, and
+    this session's repeated lesson is not to rest a containment claim on another
+    component's default. Disabling the DNS service makes it structural: there is no
+    resolver on the segment to forward anything, so the classic TXT/NXDOMAIN exfiltration
+    channel is absent by construction rather than by configuration. DHCP is unaffected —
+    it is a separate service in the same dnsmasq.
+  -->
+  <dns enable='no'/>
   <ip address='192.168.221.1' netmask='255.255.255.0'>
     <dhcp>
       <range start='192.168.221.2' end='192.168.221.254'/>

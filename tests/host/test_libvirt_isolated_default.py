@@ -301,3 +301,42 @@ def test_the_shipped_network_and_the_code_default_are_the_same_subnet():
     assert rng is not None and rng.get("start").startswith(shipped), (
         "the DHCP range is not on the network's own subnet"
     )
+
+
+def test_the_shipped_network_isolates_guests_from_each_other():
+    """Omitting <forward> stops traffic leaving the HOST. It says nothing about traffic
+    crossing between GUESTS — a warm pool on one bridge is a flat L2 segment, so a sample
+    that moves laterally attacks its siblings and corrupts their verdicts as well as
+    escaping its own box. That question was simply unanswered until a review round asked
+    it.
+
+    Verified live: with the flag set, A -> B and B -> A are blocked while both still reach
+    the host bridge, so the guest agent stays reachable."""
+    import xml.etree.ElementTree as ET
+    from pathlib import Path as _P
+
+    root = ET.parse(_P(__file__).resolve().parents[2] / "deploy/libvirt/bb-isolated.xml").getroot()
+    port = root.find("port")
+    assert port is not None and port.get("isolated") == "yes", (
+        "bb-isolated no longer isolates guests from each other"
+    )
+
+
+def test_the_shipped_network_runs_no_resolver():
+    """libvirt's generated conf for an isolated network happens to carry `no-resolv`, so
+    external names return NO ANSWER anyway — but that is libvirt's generation CHOICE, not
+    a property of this file, and resting a containment claim on another component's
+    default is this session's most repeated mistake.
+
+    `<dns enable='no'/>` makes it structural: it emits `port=0`, nothing listens on the
+    bridge's :53, and the classic TXT/NXDOMAIN exfiltration channel is absent by
+    construction. DHCP is a separate service in the same dnsmasq and is unaffected —
+    asserted here, because disabling DNS by deleting the <ip> block would take DHCP with
+    it and the guest would never get an address."""
+    import xml.etree.ElementTree as ET
+    from pathlib import Path as _P
+
+    root = ET.parse(_P(__file__).resolve().parents[2] / "deploy/libvirt/bb-isolated.xml").getroot()
+    dns = root.find("dns")
+    assert dns is not None and dns.get("enable") == "no", "bb-isolated runs a resolver again"
+    assert root.find("./ip/dhcp/range") is not None, "DHCP was lost with the resolver"
