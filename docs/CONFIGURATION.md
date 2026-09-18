@@ -166,7 +166,8 @@ registered a different one, in either boot order, including local-versus-remote.
 | `BLASTBOX_ALLOW_RUNC` | `0` | Explicit consent to run the worker under plain `runc` (no gVisor) in deliberate degraded mode. Without it, the dispatcher **fails closed** (`InsecureRuntimeRefused`) when no secure runtime exists. |
 | `BLASTBOX_REQUIRE_SECURE_RUNTIME` | `0` | Hard lockdown — refuse `runc` **even if** `ALLOW_RUNC` is set. |
 | `BLASTBOX_SECCOMP_JSON_HOST` | `""` | **Host** path to the worker seccomp profile (`--security-opt=seccomp=…`). Unset → docker-default seccomp applies (a warning is recorded). |
-| `BLASTBOX_APPARMOR_PROFILES` | `""` | Hint that the host AppArmor worker profile is available. |
+| `BLASTBOX_APPARMOR_PROFILE` | `blastbox-sandbox` | Name of the AppArmor profile attached to the **detonated child** (`aa-exec -p <name>`), for both the `nsjail` and `bwrap` backends. This repo ships no profile under the default name, so on a stock host it is absent — see `deploy/apparmor/README.md`. |
+| `BLASTBOX_APPARMOR_PROFILES` | `""` | Comma-separated profile names the operator **asserts are loaded and enforcing** on this host, for when `/sys/kernel/security/apparmor/profiles` is unreadable (it is root-only). It is additional evidence, never an override: naming a complain-mode profile here asserts something untrue, and a profile not named is simply not asserted. Affects `secure`: a child profile that cannot be confirmed means `apparmor_missing` on both `nsjail` and `bwrap`. |
 | `BLASTBOX_WARN_ON_INSECURE` | — | Set by the dispatcher into the worker (under runsc — `/proc` can't reflect host flags; or under opted-in runc) so the worker's sandbox self-check runs leniently instead of aborting. Not normally set by hand. |
 
 ## Worker resource caps

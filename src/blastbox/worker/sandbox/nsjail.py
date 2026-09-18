@@ -22,8 +22,15 @@ Security guarantees on every :meth:`run` call:
 
 * ``seccomp_policy_missing`` — the KAFEL policy file was not found in any
   of the standard search locations; nsjail will run without syscall filtering.
+* ``apparmor_missing`` — no ``aa-exec`` helper, or the profile is not enforcing right
+  now, so no MAC profile is attached to the child. Symmetric with bwrap, which has
+  always reported this; nsjail used to gate it on a probe for an nsjail flag that does
+  not exist, so it reported nothing at all (#160).
+* ``binary_missing`` — the nsjail binary itself was not found.
 
-Any single reason makes ``secure == False``.
+Any single reason makes ``secure == False`` — including ``apparmor_missing``, which means a
+host with no ``blastbox-sandbox`` profile loaded is skipped by ``select_sandbox`` unless
+``BLASTBOX_WARN_ON_INSECURE=1``. See ``deploy/apparmor/README.md``.
 """
 from __future__ import annotations
 
@@ -90,25 +97,38 @@ def _find_seccomp_policy() -> Path | None:
     return None
 
 
-def _probe_nsjail_proc_apparmor(nsjail_path: str) -> bool:
-    """Return True if this nsjail binary supports ``--proc_apparmor``."""
-    try:
-        r = subprocess.run(
-            [nsjail_path, "--help"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return False
-    return "--proc_apparmor" in r.stdout or "--proc_apparmor" in r.stderr
+def _find_aa_exec() -> str | None:
+    """The ``aa-exec`` helper, or None.
+
+    NSJAIL HAS NO APPARMOR SUPPORT AT ALL. This module used to probe for
+    ``--proc_apparmor`` and attach the profile with it, which meant an nsjail-sandboxed
+    child never got a profile and never said so: the flag does not exist in nsjail and
+    never has. Verified three ways against upstream — ``nsjail --help`` mentions apparmor
+    zero times, and a GitHub code search for both ``proc_apparmor`` and plain ``apparmor``
+    in google/nsjail returns 0 hits in the whole tree. So the probe was always False, the
+    branch never ran, and `insecurity_reasons` gated its `apparmor_missing` on that same
+    probe — reporting ``secure = True`` for a sandbox with no confinement mechanism, while
+    bwrap in the identical situation correctly reported itself insecure.
+
+    The confinement is applied the way bwrap applies it instead: by prefixing the child's
+    argv with ``aa-exec -p <profile> --``, a userspace helper. It needs exactly one thing
+    from nsjail — ``--proc_rw``, because aa-exec transitions by writing
+    ``/proc/self/attr/exec`` and nsjail mounts ``/proc`` read-only by default, so without it
+    the write returns EROFS and the **execve fails**: every job, not just the confinement.
+    Both are attached together in :meth:`NsjailSandbox._build_argv`, and only when the
+    profile is confirmed enforcing. That keeps the hardening the old code intended rather
+    than deleting the intent along with the dead flag.
+    """
+    return shutil.which("aa-exec")
 
 
 class NsjailSandbox:
     """Sandbox backend that wraps the ``nsjail`` binary.
 
-    Construction probes for the KAFEL policy file and AppArmor support,
-    and records any deficiencies in :attr:`insecurity_reasons`.  No
+    Construction probes for the KAFEL policy file and the ``aa-exec`` helper, and records
+    any deficiencies in :attr:`insecurity_reasons`. The AppArmor profile's MODE is NOT a
+    construction-time fact -- an operator can unload it under a running worker -- so it is
+    re-read per launch (see :meth:`_apparmor_enforcing_now`).  No
     exception is raised — callers inspect :attr:`secure` and
     :attr:`insecurity_reasons` to decide whether to proceed.
 
@@ -117,7 +137,7 @@ class NsjailSandbox:
     nsjail_path:
         Path to the ``nsjail`` binary.  Defaults to ``shutil.which("nsjail")``.
     apparmor_profile:
-        AppArmor profile name to attach via ``--proc_apparmor`` (if supported).
+        AppArmor profile name to attach to the child via ``aa-exec``.
     seccomp_policy:
         Explicit path to the KAFEL policy file.  If ``None``, the standard
         candidate paths are tried in order.
@@ -150,7 +170,7 @@ class NsjailSandbox:
         else:
             self._seccomp_policy = _find_seccomp_policy()
 
-        self._proc_apparmor_supported = _probe_nsjail_proc_apparmor(self._nsjail)
+        self._aa_exec: str | None = _find_aa_exec()
 
         if self._seccomp_policy is None:
             _log.warning(
@@ -163,10 +183,14 @@ class NsjailSandbox:
                 str(self._seccomp_policy),
             )
 
-        if not self._proc_apparmor_supported:
+        if self._aa_exec is None:
             _log.warning(
-                "nsjail_proc_apparmor_skipped reason=unsupported_by_installed_nsjail"
+                "nsjail_apparmor_skipped reason=aa_exec_not_found "
+                "note=child_runs_without_an_apparmor_profile"
             )
+        else:
+            _log.info("nsjail_apparmor_attach_enabled aa_exec=%s profile=%s",
+                      self._aa_exec, self._apparmor_profile)
 
         # The profile's MODE is read per launch, not cached here -- see
         # _apparmor_enforcing_now(). This only remembers the last answer so a change can be
@@ -183,8 +207,8 @@ class NsjailSandbox:
             "NsjailSandbox initialised",
             extra={
                 "seccomp_policy": str(self._seccomp_policy),
-                "proc_apparmor": self._proc_apparmor_supported,
-                "proc_apparmor_attached": self.apparmor_active,
+                "aa_exec": self._aa_exec,
+                "apparmor_attached": self.apparmor_active,
                 "insecurity_reasons": self.insecurity_reasons,
             },
         )
@@ -232,9 +256,13 @@ class NsjailSandbox:
         switched to complain mid-life is visible here instead of nowhere at all.
         """
         reasons = list(self._static_insecurity_reasons)
-        # SAY SO. Skipping the confinement quietly would report a sandbox as secure while the
-        # child runs unconfined -- the same reason bwrap records this.
-        if self._proc_apparmor_supported and not self._apparmor_enforcing_now():
+        # SAY SO. Skipping the confinement quietly would report a sandbox as secure while
+        # the child runs unconfined -- the same reason bwrap records this. The old
+        # condition gated this on a probe for a flag that does not exist, so it was
+        # ALWAYS False: nsjail reported secure=True with no confinement mechanism at all
+        # while bwrap, in the identical situation, correctly reported itself insecure.
+        # Two backends, opposite answers, and the silent one had nothing.
+        if self._aa_exec is None or not self._apparmor_enforcing_now():
             reasons.append("apparmor_missing")
         return reasons
 
@@ -250,7 +278,7 @@ class NsjailSandbox:
         while `_build_argv` was omitting the flag because the profile is not loaded (codex,
         #159).
         """
-        return self._proc_apparmor_supported and self._apparmor_enforcing_now()
+        return self._aa_exec is not None and self._apparmor_enforcing_now()
 
     # ------------------------------------------------------------------
     # Public interface
@@ -391,18 +419,44 @@ class NsjailSandbox:
         if self._seccomp_policy is not None:
             argv += ["--seccomp_policy", str(self._seccomp_policy)]
 
-        # AppArmor profile via nsjail's in-kernel AA_CHANGE_ONEXEC path.
+        # AppArmor: prefix the INNER argv with ``aa-exec -p <profile> --``, exactly as the
+        # bwrap backend does. nsjail has no apparmor flag of its own (see _find_aa_exec),
+        # and aa-exec is a userspace helper that needs nothing from it.
         #
-        # ONLY when the profile is confirmed loaded. AA_CHANGE_ONEXEC against an unloaded
-        # profile FAILS THE EXEC -- so attaching it unconditionally does not weaken the
-        # sandbox, it breaks every run. And the default names `blastbox-sandbox`, which this
-        # repository does not ship (issue #158), so the flag was being attached for a profile
-        # that is absent by default on any host whose nsjail advertises support.
+        # ONLY when the profile is confirmed ENFORCING. aa-exec against an unloaded profile
+        # fails the execve, which would break every run — so an unconfirmed profile means
+        # skip it and report `apparmor_missing`, keeping the sandbox working but honest
+        # about being less hardened.
         #
-        # bwrap has always checked before using aa-exec, for exactly this reason; nsjail did
-        # not. Same question, same consequence, now the same check.
-        if self._proc_apparmor_supported and self._apparmor_enforcing_now():
-            argv += ["--proc_apparmor", self._apparmor_profile]
+        # Evaluated ONCE: the flag below and the argv prefix must agree. Two separate reads
+        # of securityfs can disagree (the profile is re-read per launch, by design), and
+        # either half alone is a broken run -- `--proc_rw` with no aa-exec needlessly
+        # loosens /proc, aa-exec with no `--proc_rw` fails every execve (see below).
+        aa_exec = self._aa_exec
+        if aa_exec is not None and not self._apparmor_enforcing_now():
+            aa_exec = None
 
-        argv += ["--", *req.argv]
+        # `--proc_rw` is REQUIRED for aa-exec, and is why the userspace route was written off
+        # as impossible for nsjail (deploy/apparmor/README.md, #160). aa-exec performs the
+        # transition by writing /proc/self/attr/exec; nsjail mounts /proc read-only by
+        # default, so that write returns EROFS and the execve fails -- every job, not just
+        # the confinement. Measured inside this exact argv on an AppArmor 4.x host:
+        #
+        #   default   -> open('/proc/self/attr/exec','w').write(...) -> EROFS
+        #               aa-exec: ERROR: Read-only file system   (rc=1, nothing runs)
+        #   --proc_rw -> write succeeds; child reports the target profile
+        #
+        # What it costs: nothing measurable at the uid we run as. Re-probed both ways from
+        # inside, /proc/sys/kernel/core_pattern, /proc/sys/vm/drop_caches, /proc/sysrq-trigger,
+        # /proc/self/oom_score_adj and /proc/1/oom_score_adj all stayed unwritable (uid 65534
+        # in a user namespace owns none of them, and /proc/sys is guarded separately), and the
+        # child saw the same 3 pids. Only /proc/self/attr became writable -- which is the
+        # point. It is therefore attached ONLY on the path that needs it, never by default.
+        if aa_exec is not None:
+            argv.append("--proc_rw")
+
+        inner = list(req.argv)
+        if aa_exec is not None:
+            inner = [aa_exec, "-p", self._apparmor_profile, "--", *inner]
+        argv += ["--", *inner]
         return argv

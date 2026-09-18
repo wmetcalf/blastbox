@@ -161,17 +161,25 @@ def select_sandbox(
     candidates = _CONTAINER_BACKENDS if _in_container() else _ALL_BACKENDS
 
     last_error: Exception | None = None
+    # EVERY rejection, not just the last one. When no backend survives, the reason the
+    # operator needs is usually the FIRST candidate's (nsjail's) -- "last error" reported
+    # whatever `container` said, which is a different subsystem and a misleading place to
+    # start. One `apparmor_missing` across nsjail and bwrap is a one-command fix; reading it
+    # off the container backend's complaint is an afternoon.
+    rejections: list[str] = []
     for name in candidates:
         try:
             sb = _make_backend(name, warn_on_insecure=warn_on_insecure, status_path=_status_path)
         except SandboxUnavailable as exc:
             last_error = exc
+            rejections.append(f"{name}: unavailable ({exc})")
             _log.debug("backend unavailable: %s — %s", name, exc)
             continue
 
         smoke_ok, smoke_err = _smoketest(sb)
         if not smoke_ok:
             last_error = smoke_err
+            rejections.append(f"{name}: smoketest failed ({smoke_err})")
             _log.debug("backend smoketest failed: %s — %s", name, smoke_err)
             continue
 
@@ -180,6 +188,7 @@ def select_sandbox(
             detail = ", ".join(reasons) or "unspecified"
             if not warn_on_insecure:
                 last_error = SandboxUnavailable(f"{name} insecure: {detail}")
+                rejections.append(f"{name}: insecure ({detail})")
                 _log.warning(
                     "sandbox backend rejected as insecure",
                     extra={"backend": name, "reasons": reasons},
@@ -193,8 +202,20 @@ def select_sandbox(
         _log.info("sandbox backend selected", extra={"backend": name})
         return sb
 
+    hint = ""
+    if any("apparmor_missing" in r for r in rejections):
+        # The likeliest cause of a fleet-wide "nothing is available" after #160: nsjail no
+        # longer calls itself secure without a MAC profile, which it never actually applied
+        # before either. Name the two ways out rather than making the operator find them.
+        hint = (
+            "; apparmor_missing is satisfied by loading the child profile "
+            "(deploy/apparmor/README.md) or accepted knowingly with "
+            "BLASTBOX_WARN_ON_INSECURE=1"
+        )
     raise SandboxUnavailable(
-        f"no sandbox backend available; last error: {last_error}"
+        "no sandbox backend available: "
+        + ("; ".join(rejections) if rejections else f"last error: {last_error}")
+        + hint
     )
 
 

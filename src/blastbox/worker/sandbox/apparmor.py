@@ -4,12 +4,14 @@ Shared by the bwrap and nsjail backends because attaching an UNLOADED profile do
 degrade either of them -- it breaks them:
 
 * bwrap runs the child through ``aa-exec <profile>``, which fails the exec.
-* nsjail passes ``--proc_apparmor <profile>``, i.e. AA_CHANGE_ONEXEC, which fails the exec.
+* nsjail does the same: it has no AppArmor flag of its own (``--proc_apparmor`` exists in no
+  upstream build -- see :func:`blastbox.worker.sandbox.nsjail._find_aa_exec`), so the profile
+  is attached with the same userspace helper, and fails the same way.
 
-bwrap has always checked. nsjail did not, and attached the flag whenever the installed nsjail
-advertised support -- naming ``blastbox-sandbox``, a profile this repository does not ship
-(issue #158). One copy of the check, so the two backends cannot drift on a question with the
-same answer and the same consequence.
+bwrap has always checked. nsjail used to gate on a probe for that nonexistent flag, which was
+always False -- so it never attached anything, and never reported the lack either (#160). One
+copy of the check, so the two backends cannot drift on a question with the same answer and the
+same consequence.
 """
 
 from __future__ import annotations
@@ -76,8 +78,8 @@ def profile_loaded(profile: str) -> bool:
         # `surrogateescape`, not `ascii`: an AppArmor profile name is usually a PATH, and a
         # path is bytes, so one profile with a non-UTF-8 byte -- belonging to some UNRELATED
         # program -- would abort the scan before reaching ours. Swallowing that error is not
-        # enough: it would answer False for a profile that IS enforcing, so nsjail would drop
-        # `--proc_apparmor` and run the workload unconfined because of somebody else's
+        # enough: it would answer False for a profile that IS enforcing, so both backends would
+        # drop the `aa-exec` prefix and run the workload unconfined because of somebody else's
         # filename. Surrogates round-trip losslessly and never equal an ASCII profile name.
         with open(_PROFILES, encoding="utf-8", errors="surrogateescape") as fh:
             return any(_line_is_enforcing(line, profile) for line in fh)

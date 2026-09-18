@@ -645,7 +645,10 @@ class TestAnUndecodableProfileNameCannotBreakTheScan:
         f.write_bytes(b"/usr/bin/caf\xe9 (enforce)\n")
         monkeypatch.setattr(aa, "_PROFILES", str(f))
         monkeypatch.delenv("BLASTBOX_APPARMOR_PROFILES", raising=False)
-        monkeypatch.setattr(mod, "_probe_nsjail_proc_apparmor", lambda _p: True)
+        # aa-exec present, so the constructor actually reaches profile_loaded() and the
+        # undecodable byte is on the path under test. (Was _probe_nsjail_proc_apparmor,
+        # which nsjail never had a flag for -- see nsjail._find_aa_exec, #160.)
+        monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
 
         sb = mod.NsjailSandbox(nsjail_path=Path("/usr/bin/nsjail"))
         assert sb.apparmor_active is False

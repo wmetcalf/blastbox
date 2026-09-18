@@ -282,3 +282,79 @@ def test_in_container_returns_bool() -> None:
     """_in_container() always returns a bool (not None)."""
     result = _in_container()
     assert isinstance(result, bool)
+
+
+# ---------------------------------------------------------------------------
+# Test: the "nothing is available" message names every rejection, not the last
+# ---------------------------------------------------------------------------
+
+class TestTheNothingAvailableMessageIsDiagnosable:
+    """`last error` pointed at whichever backend happened to be LAST in the order.
+
+    After #160 the realistic total failure is `apparmor_missing` on nsjail and bwrap --
+    both of them, same cause, one command to fix. The old message reported `container`'s
+    complaint instead (a different subsystem entirely), so the operator would start
+    debugging container hardening for a problem in /sys/kernel/security/apparmor.
+    """
+
+    def _no_backend_at_all(self, monkeypatch, tmp_path: Path):
+        import blastbox.worker.sandbox.detect as detect_mod
+
+        monkeypatch.delenv("BLASTBOX_WARN_ON_INSECURE", raising=False)
+        monkeypatch.delenv("BLASTBOX_SANDBOX", raising=False)
+        monkeypatch.setattr(detect_mod, "_in_container", lambda: False)
+
+        class _Insecure:
+            def __init__(self, name: str, reasons: list[str]) -> None:
+                self._name, self.insecurity_reasons = name, reasons
+
+            @property
+            def secure(self) -> bool:
+                return not self.insecurity_reasons
+
+        reasons = {
+            "nsjail": ["apparmor_missing"],
+            "bwrap": ["seccomp_not_implemented", "apparmor_missing"],
+            "nono": ["landlock_missing"],
+            "container": ["network_egress_not_verified"],
+        }
+        monkeypatch.setattr(detect_mod, "_make_backend",
+                            lambda name, **kw: _Insecure(name, list(reasons[name])))
+        monkeypatch.setattr(detect_mod, "_smoketest", lambda sb: (True, None))
+        return _good_status_file(tmp_path)
+
+    def test_every_backend_is_named_with_its_own_reason(self, monkeypatch, tmp_path: Path) -> None:
+        status = self._no_backend_at_all(monkeypatch, tmp_path)
+        with pytest.raises(SandboxUnavailable) as ei:
+            select_sandbox(_status_path=status)
+        msg = str(ei.value)
+        for name in ("nsjail", "bwrap", "nono", "container"):
+            assert name in msg, msg
+        assert "apparmor_missing" in msg
+        assert "seccomp_not_implemented" in msg
+        assert "network_egress_not_verified" in msg
+
+    def test_the_apparmor_case_names_both_ways_out(self, monkeypatch, tmp_path: Path) -> None:
+        status = self._no_backend_at_all(monkeypatch, tmp_path)
+        with pytest.raises(SandboxUnavailable) as ei:
+            select_sandbox(_status_path=status)
+        msg = str(ei.value)
+        assert "deploy/apparmor" in msg, "no pointer to the profile that fixes it"
+        assert "BLASTBOX_WARN_ON_INSECURE" in msg, "no pointer to the knowing override"
+
+    def test_the_hint_is_absent_when_apparmor_is_not_the_problem(
+            self, monkeypatch, tmp_path: Path) -> None:
+        """A hint that appears on every failure is noise, and teaches operators to set the
+        override reflexively for problems it cannot fix."""
+        import blastbox.worker.sandbox.detect as detect_mod
+
+        self._no_backend_at_all(monkeypatch, tmp_path)
+
+        class _Broken:
+            secure = False
+            insecurity_reasons = ["seccomp_off"]
+
+        monkeypatch.setattr(detect_mod, "_make_backend", lambda name, **kw: _Broken())
+        with pytest.raises(SandboxUnavailable) as ei:
+            select_sandbox(_status_path=_good_status_file(tmp_path))
+        assert "deploy/apparmor" not in str(ei.value)
