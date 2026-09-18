@@ -907,6 +907,12 @@ def test_the_production_launch_passes_the_seccomp_descriptor_too(tmp_path, monke
     import blastbox.worker.sandbox.bwrap as bw
     from blastbox.worker.sandbox.base import SandboxRequest
 
+    import blastbox.worker.sandbox.apparmor as aa
+
+    # KERNEL evidence, pinned: otherwise the real environment decides whether the asserted proof
+    # path runs, and this test measures the host (lens, round 6 of #177).
+    monkeypatch.setattr(aa, "profile_evidence", lambda _p: aa.KERNEL)
+
     fake = tmp_path / "bwrap"
     fake.write_text("#!/bin/sh\nexit 0\n")
     fake.chmod(0o755)

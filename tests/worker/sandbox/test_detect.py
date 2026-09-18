@@ -652,6 +652,12 @@ def test_the_diagnosis_survives_the_regression_guard_on_a_REAL_backend(monkeypat
     from blastbox.worker.sandbox.nsjail import NsjailSandbox
 
     logging.disable(logging.CRITICAL)
+    import blastbox.worker.sandbox.apparmor as aa
+
+    # KERNEL evidence, pinned -- see the note in test_nsjail.py. Without it the asserted proof
+    # path runs whenever an operator has BLASTBOX_APPARMOR_PROFILES set, and this test measures
+    # the host instead of the selector.
+    monkeypatch.setattr(aa, "profile_evidence", lambda _p: aa.KERNEL)
     monkeypatch.setattr(nj, "profile_loaded", lambda _p: True)
     monkeypatch.setattr(nj, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
     monkeypatch.setattr(nj, "_supports_proc_rw", lambda _p: True)

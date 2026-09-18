@@ -176,6 +176,22 @@ jobs:
             | tee /tmp/e2e.txt
           grep -qE "^PASSED" /tmp/e2e.txt || {
             echo "::error::the end-to-end AppArmor transition test did not run" >&2; exit 1; }
+      - name: Pytest (sandbox backends, with the operator's AppArmor assertion set)
+        # The SAME suite with BLASTBOX_APPARMOR_PROFILES exported, because that is the documented
+        # production posture for a non-root worker (docs/CONFIGURATION.md) and it takes a
+        # DIFFERENT code path: `profile_evidence` answers ASSERTED, so the in-jail proof, the TTL
+        # cache and the exact-name match -- the subject of #160/#177 -- actually execute. Without
+        # this step, no run of the suite anywhere entered that path, and twelve tests were passing
+        # only because the variable happens to be unset on developer hosts and runners.
+        env:
+          BLASTBOX_APPARMOR_PROFILES: blastbox-sandbox
+        run: |
+          set -o pipefail
+          .venv/bin/pytest -q -rs tests/worker/sandbox/ | tee /tmp/asserted.txt
+          if grep -E "SKIPPED.*(not installed|not usable|probe failed)" /tmp/asserted.txt; then
+            echo "::error::a sandbox backend was not exercised on the asserted path" >&2
+            exit 1
+          fi
       - name: Pytest (shipped AppArmor profiles compile)
         # tests/deploy/ runs in the `test` job with no -rs and no tripwire, so the two tests that
         # compile every shipped profile would vanish without a trace if the runner image ever

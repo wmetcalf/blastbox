@@ -53,6 +53,13 @@ def _run_via_module_popen(make_backend, recording, monkeypatch):
     own process group, and the test fails on its own setup. Measured: it did.
     """
     backend = make_backend()
+    # ... and WARM the lazy probes too, for the same reason. The AppArmor proof deliberately
+    # does not run in the constructor (it launches a jail, which a constructor cannot do), so it
+    # fires inside `run()` -- after the recorder is installed -- and the recorder then captures
+    # the PROBE child again, correctly in our own process group, failing this test on its own
+    # setup exactly as construction-time probes used to (lens, round 6 of #177). Reading the
+    # property resolves and caches the verdict while the real Popen is still in place.
+    getattr(backend, "apparmor_active", None)
     monkeypatch.setattr(subprocess, "Popen", recording)
     return backend.run(
         SandboxRequest(argv=["/bin/true"], limits=Limits(timeout_s=20))

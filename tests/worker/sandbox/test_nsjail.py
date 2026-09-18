@@ -273,6 +273,13 @@ class TestNsjailInsecurityReasons:
         """
         import blastbox.worker.sandbox.nsjail as mod
 
+        import blastbox.worker.sandbox.apparmor as aa
+
+        # KERNEL evidence, pinned: `apparmor_active` asks both whether the profile is enforcing
+        # AND how that was learned. Leaving the second door open let the real environment decide,
+        # so this test measured the host whenever an operator had BLASTBOX_APPARMOR_PROFILES set
+        # (lens, round 6 of #177).
+        monkeypatch.setattr(aa, "profile_evidence", lambda _p: aa.KERNEL)
         monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
         monkeypatch.setattr(mod.NsjailSandbox, "_apparmor_enforcing_now", lambda self: True)
         policy = tmp_path / "ok.policy"
@@ -428,8 +435,14 @@ class TestAppArmorIsAttachedWithAaExecBecauseNsjailHasNoFlagForIt:
         on). A stand-in executable satisfies the binary_present probe so the only reasons
         left are the ones under test.
         """
+        import blastbox.worker.sandbox.apparmor as aa
         import blastbox.worker.sandbox.nsjail as mod
 
+        # KERNEL evidence, pinned: `apparmor_active` asks both whether the profile is enforcing
+        # AND how that was learned. Leaving the second door open let the real environment decide,
+        # so this test measured the host whenever an operator had BLASTBOX_APPARMOR_PROFILES set
+        # (lens, round 6 of #177).
+        monkeypatch.setattr(aa, "profile_evidence", lambda _p: aa.KERNEL)
         monkeypatch.setattr(mod, "_find_aa_exec", lambda: aa_exec)
         monkeypatch.setattr(mod.NsjailSandbox, "_apparmor_enforcing_now",
                             lambda self: enforcing)
@@ -563,6 +576,10 @@ class TestAppArmorIsAttachedWithAaExecBecauseNsjailHasNoFlagForIt:
         the mode cannot be cached at construction."""
         import blastbox.worker.sandbox.nsjail as mod
 
+        import blastbox.worker.sandbox.apparmor as aa
+
+        # KERNEL evidence, pinned -- see the note in _sb above.
+        monkeypatch.setattr(aa, "profile_evidence", lambda _p: aa.KERNEL)
         state = {"enforcing": True}
         monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
         monkeypatch.setattr(mod.NsjailSandbox, "_apparmor_enforcing_now",
@@ -594,6 +611,7 @@ def test_the_two_backends_apply_and_report_apparmor_the_same_way(tmp_path, monke
     that bwrap does", and passed against the exact code it was written to condemn
     (claude-code-review lens, #177). Behaviour, not text, from here on.
     """
+    import blastbox.worker.sandbox.apparmor as aa
     import blastbox.worker.sandbox.bwrap as bw
     import blastbox.worker.sandbox.nsjail as nj
 
@@ -619,6 +637,7 @@ def test_the_two_backends_apply_and_report_apparmor_the_same_way(tmp_path, monke
 
     for mod in (nj, bw):
         monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
+        monkeypatch.setattr(aa, "profile_evidence", lambda _p: aa.KERNEL)
         monkeypatch.setattr(mod, "profile_loaded", lambda _n: True)
         monkeypatch.setattr(type(without[0]) if mod is nj else type(without[1]),
                             "_apparmor_enforcing_now", lambda self: True)
@@ -647,6 +666,13 @@ class TestTheInstalledNsjailIsAskedWhetherItHasProcRw:
     def _sb(self, tmp_path, monkeypatch, *, supported: bool):
         import blastbox.worker.sandbox.nsjail as mod
 
+        import blastbox.worker.sandbox.apparmor as aa
+
+        # KERNEL evidence, pinned: `apparmor_active` asks both whether the profile is enforcing
+        # AND how that was learned. Leaving the second door open let the real environment decide,
+        # so this test measured the host whenever an operator had BLASTBOX_APPARMOR_PROFILES set
+        # (lens, round 6 of #177).
+        monkeypatch.setattr(aa, "profile_evidence", lambda _p: aa.KERNEL)
         monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
         monkeypatch.setattr(mod, "_supports_proc_rw", lambda _p: supported)
         monkeypatch.setattr(mod.NsjailSandbox, "_apparmor_enforcing_now", lambda self: True)
@@ -701,8 +727,14 @@ class TestTheConstructorLogSaysWhatWillActuallyHappen:
     def _logs(self, tmp_path, monkeypatch, caplog, *, enforcing: bool) -> str:
         import logging
 
+        import blastbox.worker.sandbox.apparmor as aa
         import blastbox.worker.sandbox.nsjail as mod
 
+        # KERNEL evidence, pinned: `apparmor_active` asks both whether the profile is enforcing
+        # AND how that was learned. Leaving the second door open let the real environment decide,
+        # so this test measured the host whenever an operator had BLASTBOX_APPARMOR_PROFILES set
+        # (lens, round 6 of #177).
+        monkeypatch.setattr(aa, "profile_evidence", lambda _p: aa.KERNEL)
         monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
         monkeypatch.setattr(mod, "_supports_proc_rw", lambda _p: True)
         monkeypatch.setattr(mod.NsjailSandbox, "_apparmor_enforcing_now",
@@ -934,6 +966,7 @@ def test_the_guard_and_the_argv_share_one_reading_of_the_profile(tmp_path, monke
     """
     import subprocess
 
+    import blastbox.worker.sandbox.apparmor as aa
     import blastbox.worker.sandbox.nsjail as mod
 
     reads = {"n": 0}
@@ -945,6 +978,7 @@ def test_the_guard_and_the_argv_share_one_reading_of_the_profile(tmp_path, monke
 
     monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
     monkeypatch.setattr(mod, "_supports_proc_rw", lambda _p: True)
+    monkeypatch.setattr(aa, "profile_evidence", lambda _p: aa.KERNEL)
     monkeypatch.setattr(mod, "profile_loaded", _counting)
     nsjail = tmp_path / "nsjail"
     nsjail.write_text(_FAKE_NSJAIL)

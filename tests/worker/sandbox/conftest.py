@@ -122,6 +122,14 @@ def _hermetic_apparmor_env(monkeypatch):
     So the default is hermetic: no assertion, no profile name. A test that wants the asserted
     path sets it explicitly and patches `apparmor.profile_evidence`, which is the seam that
     decides.
+
+    This fixture is now BELT AND BRACES, not the fix. It was, briefly: deleting the variable made
+    twelve tests pass that fail with it set, which hid them rather than fixing them (lens, round 6
+    of #177). Each of those has since been pinned at the seam it actually depends on -- the
+    evidence, not just the profile -- and the suite passes with the variable exported and this
+    fixture removed. The CI `sandbox` job runs it both ways to keep that true.
     """
     monkeypatch.delenv("BLASTBOX_APPARMOR_PROFILES", raising=False)
     monkeypatch.delenv("BLASTBOX_APPARMOR_PROFILE", raising=False)
+
+
