@@ -174,6 +174,28 @@ the profile denies the probe /usr/bin/true. Permit it in the profile ... or unlo
 
 — but the fix is yours: `/usr/bin/true ix,` plus whatever your base abstraction needs.
 
+### Measured on a real AppArmor 3.0.4 host
+
+Everything below was verified on Ubuntu 22.04.5 (AppArmor parser 3.0.4) by loading this profile
+and launching a child through `aa-exec -p blastbox-sandbox`, the way both backends do. Kernel
+answers, not reasoning:
+
+```
+profile (from /proc/self/attr/current):  blastbox-sandbox (enforce)
+  EACCES  /proc/self/mem
+  EACCES  /proc/self/task/<tid>/mem          <- the alias a single-star glob misses
+  EACCES  /proc/self/clear_refs
+  EACCES  /proc/self/attr/exec
+  EACCES  /proc/self/oom_score_adj
+getaddrinfo("localhost"):  OK               <- netlink still permitted
+```
+
+Both halves were proved, not just the good one. A variant profile carrying the original
+`deny /proc/*/mem` was loaded on the same host, and under it `/proc/self/task/<tid>/mem` came back
+**WRITABLE** — so the glob distinction is real and this profile closes it. And the same file
+declaring `abi <abi/4.0>` does not compile there at all (`Could not open 'abi/4.0'`), which is why
+this one pins 3.0.
+
 **The rules your profile needs, because `--proc_rw` widens /proc.** nsjail is launched with
 `--proc_rw` whenever a profile is attached, and it has to be: aa-exec transitions by writing
 `/proc/self/attr/exec`, and nsjail's default read-only `/proc` turns that into `EROFS`, killing the
