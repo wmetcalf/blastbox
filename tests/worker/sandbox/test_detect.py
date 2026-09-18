@@ -713,3 +713,62 @@ def test_admission_is_recorded_when_the_selector_admits_not_at_construction(
     assert sb._armed_at_admission is True, (
         "the backend was admitted as confined but the guard will treat it as never armed"
     )
+
+
+class TestBothAdmissionPathsRecordAdmissionOnTheRealBackends:
+    """`note_admitted` is called through `getattr`, so a backend that loses or renames it gets
+    no admission record and the regression guard silently falls back to the constructor
+    snapshot -- the bug the call exists to fix.
+
+    Verified that deleting the `_select_forced` call AND renaming `NsjailSandbox.note_admitted`
+    left 191/191 tests passing: the one existing test used a hand-rolled fake that implements
+    the method itself, so it pinned detect.py's auto path and nothing else
+    (claude-code-review lens, round 3 of #177).
+    """
+
+    @pytest.mark.parametrize("backend", ["nsjail", "bwrap"])
+    def test_the_real_backends_have_the_method(self, backend: str) -> None:
+        import blastbox.worker.sandbox.bwrap as bw
+        import blastbox.worker.sandbox.nsjail as nj
+
+        cls = nj.NsjailSandbox if backend == "nsjail" else bw.BubblewrapSandbox
+        assert callable(getattr(cls, "note_admitted", None)), (
+            f"{cls.__name__} has no note_admitted, so the selector silently records nothing"
+        )
+
+    def _armed(self, monkeypatch, tmp_path: Path, *, forced: bool) -> bool:
+        import blastbox.worker.sandbox.detect as detect_mod
+
+        class _LateArming:
+            name = "nsjail"
+            insecurity_reasons: list[str] = []
+            secure = True
+            apparmor_active = False
+            _armed_at_admission = False
+
+            def note_admitted(self) -> None:
+                self._armed_at_admission = self.apparmor_active
+
+            def run(self, req):
+                from types import SimpleNamespace
+                self.apparmor_active = True
+                return SimpleNamespace(exit_code=0, killed=False, stdout=b"", stderr=b"")
+
+        sb = _LateArming()
+        monkeypatch.delenv("BLASTBOX_SANDBOX", raising=False)
+        monkeypatch.setattr(detect_mod, "_in_container", lambda: False)
+        monkeypatch.setattr(detect_mod, "_make_backend", lambda name, **kw: sb)
+        status = _good_status_file(tmp_path)
+        if forced:
+            select_sandbox(backend="nsjail", _status_path=status)
+        else:
+            select_sandbox(_status_path=status)
+        return sb._armed_at_admission
+
+    def test_the_auto_path_records_it(self, monkeypatch, tmp_path: Path) -> None:
+        assert self._armed(monkeypatch, tmp_path, forced=False) is True
+
+    def test_the_forced_path_records_it_too(self, monkeypatch, tmp_path: Path) -> None:
+        """`BLASTBOX_SANDBOX` is the documented override and what the pre-#160 recipe told
+        operators to set; it had no coverage at all."""
+        assert self._armed(monkeypatch, tmp_path, forced=True) is True

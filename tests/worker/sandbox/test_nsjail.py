@@ -1266,3 +1266,74 @@ def test_construction_never_calls_the_property_that_launches_a_jail(
     else:
         mod.BubblewrapSandbox(bwrap_path=str(binary))
     assert not any("aa-exec" in a for argv in launched for a in argv), launched
+
+
+class TestTheProofCacheAndTheNameMatch:
+    """Two defects in the proof's bookkeeping, neither of which any behaviour test could see."""
+
+    def _sb(self, tmp_path, monkeypatch, reports: str, *, probe_seconds: float = 0.0):
+        import blastbox.worker.sandbox.apparmor as aa
+        import blastbox.worker.sandbox.nsjail as mod
+
+        monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
+        monkeypatch.setattr(mod, "_supports_proc_rw", lambda _p: True)
+        monkeypatch.setattr(mod, "profile_evidence", lambda _p: aa.ASSERTED)
+        monkeypatch.setattr(mod, "profile_loaded", lambda _p: True)
+        monkeypatch.setattr(mod.NsjailSandbox, "_apparmor_attaches_at_all", lambda self: True)
+        calls = {"n": 0}
+
+        def _prove(_self):
+            calls["n"] += 1
+            if probe_seconds:
+                import time as _t
+                _t.sleep(probe_seconds)
+            return reports
+
+        monkeypatch.setattr(mod.NsjailSandbox, "prove_apparmor_attachment", _prove)
+        nsjail = tmp_path / "nsjail"
+        nsjail.write_text(_FAKE_NSJAIL)
+        nsjail.chmod(0o755)
+        return mod.NsjailSandbox(nsjail_path=str(nsjail)), calls
+
+    def test_a_probe_slower_than_the_ttl_still_caches(self, tmp_path, monkeypatch) -> None:
+        """The timestamp was taken at ENTRY and written after the launch, so the entry was
+        `probe_duration` seconds old on arrival. The launch allows 60s and the TTL is 30, so a
+        slow probe produced a cache that was expired when written: every read re-launched a
+        jail and waited again, and a loaded host became a worker that looks hung
+        (claude-code-review lens, round 3 of #177).
+        """
+        import blastbox.worker.sandbox.nsjail as mod
+
+        monkeypatch.setattr(mod, "_PROOF_TTL_S", 0.5)
+        sb, calls = self._sb(tmp_path, monkeypatch, "blastbox-sandbox (enforce)",
+                             probe_seconds=0.7)
+        before = calls["n"]
+        for _ in range(4):
+            assert sb.apparmor_active is True
+        assert calls["n"] == before + 1, (
+            f"{calls['n'] - before} jail launches for four reads -- the entry was already "
+            f"expired when it was written"
+        )
+
+    def test_a_longer_profile_name_is_not_proof_of_this_one(self, tmp_path, monkeypatch) -> None:
+        """`startswith` accepted a child wearing `blastbox-sandbox-permissive` as proof of
+        `blastbox-sandbox` -- and this is the single gate behind `secure` and `--proc_rw` on the
+        asserted path (claude-code-review lens, round 3 of #177)."""
+        sb, _ = self._sb(tmp_path, monkeypatch, "blastbox-sandbox-permissive (enforce)")
+        assert sb.apparmor_active is False
+
+    def test_the_exact_name_in_enforce_or_kill_is(self, tmp_path, monkeypatch) -> None:
+        for reports in ("blastbox-sandbox (enforce)", "blastbox-sandbox (kill)"):
+            sb, _ = self._sb(tmp_path, monkeypatch, reports)
+            assert sb.apparmor_active is True, reports
+
+    def test_the_reader_is_the_usr_path_the_kernel_resolves(self) -> None:
+        """AppArmor mediates the resolved path. On a merged-/usr host (/bin -> usr/bin) that is
+        /usr/bin/cat, so a remedy naming /bin/cat sends the operator to write a rule that never
+        matches."""
+        import blastbox.worker.sandbox.nsjail as mod
+
+        if mod._PROOF_READER is None:
+            pytest.skip("no file reader on this host")
+        if Path("/bin").is_symlink():
+            assert mod._PROOF_READER.startswith("/usr/"), mod._PROOF_READER

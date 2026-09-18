@@ -60,10 +60,14 @@ from blastbox.worker.sandbox.base import SandboxRequest, SandboxResult, kill_san
 # it; the point is that the window is BOUNDED rather than the life of the worker.
 _PROOF_TTL_S = 30.0
 
-# The proof needs something that can print a file. Tried in order; None means the proof cannot
-# run on this host, which is reported as unprovable rather than as a disproof.
+# The proof needs something that can print a file. /usr/bin FIRST: on a merged-/usr host
+# (/bin -> usr/bin, which is every current Debian/Ubuntu) the kernel resolves the exec to
+# /usr/bin/cat and that is the path AppArmor mediates -- so a remedy naming `/bin/cat`, which
+# is what this used to print, sends the operator to write a profile rule that never matches
+# (claude-code-review lens, round 3 of #177). None means the proof cannot run on this host,
+# which is reported as unprovable rather than as a disproof.
 _PROOF_READER: str | None = next(
-    (p for p in ("/bin/cat", "/usr/bin/cat", "/usr/bin/head") if Path(p).exists()), None
+    (p for p in ("/usr/bin/cat", "/bin/cat", "/usr/bin/head") if Path(p).exists()), None
 )
 
 _log = logging.getLogger("blastbox.worker.sandbox.nsjail")
@@ -548,8 +552,7 @@ class NsjailSandbox:
         the life of the worker while nothing enforced anything (codex, #177). The window is
         bounded by `_PROOF_TTL_S`, and monotonic time cannot be stepped backwards under it.
         """
-        now = time.monotonic()
-        if self._proof is not None and now - self._proof[1] < _PROOF_TTL_S:
+        if self._proof is not None and time.monotonic() - self._proof[1] < _PROOF_TTL_S:
             return self._proof[0]
 
         if not self._apparmor_attaches_at_all():
@@ -561,7 +564,7 @@ class NsjailSandbox:
                 "documented probe binary); no profile is attached",
                 self._apparmor_profile,
             )
-            self._proof = (False, now)
+            self._proof = (False, time.monotonic())
             return False
 
         got = self.prove_apparmor_attachment()
@@ -573,12 +576,21 @@ class NsjailSandbox:
                 "denies it); the assertion stands unverified. Permit %s in the profile to "
                 "have it checked." % (self._apparmor_profile, _PROOF_READER or "a file reader")
             )
-            self._proof = (True, now)
+            # Stamped AFTER the probe. Stamping at entry made the entry `probe_duration`
+            # seconds old on arrival, so any probe slower than the TTL (the launch allows 60s,
+            # the TTL is 30) produced a cache that was expired when written -- every read
+            # re-launched a jail and waited again, turning a loaded host into a worker that
+            # looks hung (claude-code-review lens, round 3 of #177).
+            self._proof = (True, time.monotonic())
             return True
 
-        ok = got.startswith(self._apparmor_profile) and (
-            "(enforce)" in got or "(kill)" in got
-        )
+        # The NAME, not a prefix of it. `startswith` accepted a child wearing
+        # `blastbox-sandbox-permissive` as proof of `blastbox-sandbox` -- and this is the single
+        # gate behind `secure` and `--proc_rw` on the asserted path (claude-code-review lens,
+        # round 3 of #177). The kernel's format is `name (mode)`, so split on that separator,
+        # exactly as apparmor._line_is_enforcing does.
+        name, _, mode = got.partition(" (")
+        ok = name.strip() == self._apparmor_profile and mode.startswith(("enforce", "kill"))
         if not ok:
             _log.warning(
                 "apparmor_assertion_disproved profile=%s child_reports=%r "
@@ -586,7 +598,7 @@ class NsjailSandbox:
                 "no profile is attached",
                 self._apparmor_profile, got,
             )
-        self._proof = (ok, now)
+        self._proof = (ok, time.monotonic())
         return ok
 
     def _warn_once(self, msg: str) -> None:

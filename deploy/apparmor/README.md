@@ -229,7 +229,9 @@ every run — which is why the profile is confirmed before it is attached.
 `/bin/cat /proc/self/attr/current` inside the jail. A workload profile that permits only its
 parser and `/usr/bin/true` cannot run it — that is reported as *unverified* (a warning naming
 this), not as a disproof, so a correctly configured host is never rejected over a diagnostic.
-Permit `/bin/cat` (or `/usr/bin/cat`, `/usr/bin/head`) to have the assertion actually checked.
+Permit `/usr/bin/cat` to have the assertion actually checked — the `/usr` path, because on a
+merged-`/usr` host (`/bin` → `usr/bin`) that is what the kernel resolves the exec to and what
+AppArmor matches; a rule written as `/bin/cat` never fires.
 
 **An asserted profile is now proved before anything is traded for it.** Because securityfs is
 root-only, a non-root worker's only route to "the profile is enforcing" is the assertion below —
