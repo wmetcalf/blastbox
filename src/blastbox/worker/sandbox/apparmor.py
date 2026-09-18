@@ -231,13 +231,22 @@ class AppArmorProofMixin:
     # never uses.
     _build_argv: Any
 
-    def _attach_argv(self, req: SandboxRequest) -> list[str]:
-        """The argv with the profile attached, for the probes that establish belief.
+    def _run_probe(self, req: SandboxRequest) -> subprocess.CompletedProcess[str]:
+        """Run one probe with the profile ATTACHED, and hand back the finished process.
+
+        The seam is the whole execution, not just the argv. An argv-only seam let bwrap build a
+        command referring to a seccomp memfd that the probe's own `subprocess.run` never passed
+        to the child -- `bwrap: Can't read seccomp data: Bad file descriptor`, so every probe
+        failed and a correctly loaded profile was reported as unattachable. A backend whose
+        launch needs more than an argv can now say so in one place.
 
         `attach_apparmor=True` explicitly: these probes are what DECIDE whether the profile is
         believable, so they cannot wait on the answer they produce.
         """
-        return self._build_argv(req, attach_apparmor=True)   # type: ignore[attr-defined]
+        return subprocess.run(
+            self._build_argv(req, attach_apparmor=True),
+            capture_output=True, text=True, timeout=60,
+        )
 
     def _apparmor_attaches_at_all(self) -> bool | None:
         """Can the profile be attached to ANY child? Structural, no error-string matching.
@@ -257,9 +266,7 @@ class AppArmorProofMixin:
         probe = "/usr/bin/true" if Path("/usr/bin/true").exists() else "/bin/true"
         req = SandboxRequest(argv=[probe])
         try:
-            out = subprocess.run(
-                self._attach_argv(req), capture_output=True, text=True, timeout=60,
-            )
+            out = self._run_probe(req)
         except (OSError, subprocess.SubprocessError) as exc:
             _log.warning("apparmor_attach_probe_failed reason=%s", exc)
             return None
@@ -291,9 +298,7 @@ class AppArmorProofMixin:
             return None
         req = SandboxRequest(argv=[_PROOF_READER, "/proc/self/attr/current"])
         try:
-            out = subprocess.run(
-                self._attach_argv(req), capture_output=True, text=True, timeout=60,
-            )
+            out = self._run_probe(req)
         except (OSError, subprocess.SubprocessError) as exc:
             _log.warning("apparmor_attachment_unprovable reason=%s", exc)
             return None

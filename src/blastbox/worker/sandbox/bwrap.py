@@ -285,15 +285,19 @@ class BubblewrapSandbox(AppArmorProofMixin):
     # ------------------------------------------------------------------
     # Properties
 
-    def _attach_argv(self, req: SandboxRequest) -> list[str]:
-        """The probe argv, WITH the seccomp filter a real job carries.
+    def _run_probe(self, req: SandboxRequest) -> subprocess.CompletedProcess[str]:
+        """The probe, WITH the seccomp filter a real job carries -- fd and all.
 
-        The mixin's default omits it, and bwrap's filter is a per-run memfd rather than a path,
-        so the probes were launching an unfiltered bwrap: a filter/profile interaction that only
-        the combination triggers -- aa-exec needing a syscall the denylist blocks, say -- was
-        invisible to every diagnostic in this file, and the first real job paid for it. The
-        smoketest's own rule, applied here: a probe that skips the confinement is not testing
-        what will run (claude-code-review lens, round 4 of #177).
+        Two things the mixin's default cannot do for bwrap: the filter is a per-run memfd
+        rather than a path, and the child only sees it if the launch passes it. Building the
+        argv without doing both produced `bwrap: Can't read seccomp data: Bad file descriptor`
+        on every probe, which the proof then reported as "the profile cannot be attached at
+        all" -- a correctly loaded profile declared unusable by a broken diagnostic (CI, #177).
+
+        Without it the probes would launch an UNFILTERED bwrap, so a filter/profile interaction
+        -- aa-exec needing a syscall the denylist blocks -- would be invisible to every
+        diagnostic here and paid for by the first real job. The smoketest's own rule: a probe
+        that skips the confinement is not testing what will run.
         """
         fd: int | None = None
         try:
@@ -302,12 +306,15 @@ class BubblewrapSandbox(AppArmorProofMixin):
                 os.write(fd, self._seccomp_bpf)
                 os.lseek(fd, 0, os.SEEK_SET)
                 os.set_inheritable(fd, True)
-            return self._build_argv(req, seccomp_fd=fd, attach_apparmor=True)
+            return subprocess.run(
+                self._build_argv(req, seccomp_fd=fd, attach_apparmor=True),
+                capture_output=True, text=True, timeout=60,
+                close_fds=True, pass_fds=() if fd is None else (fd,),
+            )
         finally:
-            # The argv only carries /proc/self/fd/<n>; the probe's own subprocess.run inherits
-            # it, so the parent's copy is closed the moment the argv is built -- same lifetime
-            # rule run() uses, one scope tighter.
-            pass
+            if fd is not None:
+                os.close(fd)
+
 
     def _apparmor_enforcing_now(self) -> bool:
         """Whether the profile is enforcing AT THIS MOMENT.

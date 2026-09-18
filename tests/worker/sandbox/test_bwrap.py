@@ -805,3 +805,87 @@ class TestTheProfileNameCanActuallyBeSelected:
         argv = sb._build_argv(SandboxRequest(argv=["/usr/bin/true"]))
         assert "my-parser-profile" in argv
         assert "apparmor_missing" not in sb.insecurity_reasons
+
+
+class TestTheProbeCarriesTheSeccompFilterAndItsFileDescriptor:
+    """CI caught this; the local suite could not.
+
+    bwrap's seccomp filter is a per-run memfd, not a path, so a probe needs BOTH the
+    `--seccomp <fd>` argument and the fd itself passed to the child. Building only the argv
+    produced `bwrap: Can't read seccomp data: Bad file descriptor` on every probe, and the
+    proof reported that as "the profile cannot be attached at all" -- a correctly loaded,
+    enforcing profile declared unusable by a broken diagnostic.
+
+    It escaped locally because this host has no python3-seccomp, so `_seccomp_bpf` is None and
+    no fd is ever built. The filter is synthesised here rather than waiting for a runner.
+    """
+
+    def _sb(self, tmp_path):
+        from blastbox.worker.sandbox.bwrap import BubblewrapSandbox
+
+        fake = tmp_path / "bwrap"
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(0o755)
+        sb = BubblewrapSandbox(bwrap_path=str(fake))
+        sb._seccomp_bpf = b"\x00" * 16          # a filter exists on this host, as in production
+        sb._seccomp_active = True
+        return sb
+
+    def test_the_descriptor_is_passed_and_is_readable_at_launch(self, tmp_path, monkeypatch):
+        import os
+        import subprocess as sp
+
+        import blastbox.worker.sandbox.bwrap as bw
+        from blastbox.worker.sandbox.base import SandboxRequest
+
+        seen: dict = {}
+
+        def _capture(argv, **kw):
+            seen["argv"] = argv
+            seen["pass_fds"] = kw.get("pass_fds", ())
+            # The fd must be OPEN and hold the filter at the moment of launch -- the failure
+            # mode was a closed/never-passed descriptor, which only shows up in the child.
+            fd = seen["pass_fds"][0] if seen["pass_fds"] else None
+            if fd is not None:
+                os.lseek(fd, 0, os.SEEK_SET)
+                seen["contents"] = os.read(fd, 16)
+            from types import SimpleNamespace
+            return SimpleNamespace(returncode=0, stdout="blastbox-sandbox (enforce)\n", stderr="")
+
+        monkeypatch.setattr(bw.subprocess, "run", _capture)
+        sb = self._sb(tmp_path)
+        sb._run_probe(SandboxRequest(argv=["/usr/bin/true"]))
+
+        assert "--seccomp" in seen["argv"], "the probe ran an UNFILTERED bwrap"
+        assert seen["pass_fds"], "the --seccomp fd was never passed to the child"
+        assert seen["contents"] == b"\x00" * 16
+        idx = seen["argv"].index("--seccomp")
+        assert seen["argv"][idx + 1] == str(seen["pass_fds"][0]), (
+            "the argv names a different fd from the one passed"
+        )
+        assert sp is not None
+
+    def test_the_descriptor_does_not_leak(self, tmp_path, monkeypatch):
+        """One memfd per probe, closed by the probe -- a worker probes once per TTL for the
+        life of the process."""
+        import os
+
+        import blastbox.worker.sandbox.bwrap as bw
+        from blastbox.worker.sandbox.base import SandboxRequest
+
+        grabbed: list[int] = []
+
+        def _capture(argv, **kw):
+            grabbed.extend(kw.get("pass_fds", ()))
+            from types import SimpleNamespace
+            return SimpleNamespace(returncode=0, stdout="x\n", stderr="")
+
+        monkeypatch.setattr(bw.subprocess, "run", _capture)
+        sb = self._sb(tmp_path)
+        for _ in range(3):
+            sb._run_probe(SandboxRequest(argv=["/usr/bin/true"]))
+
+        assert grabbed, "no fd was passed at all"
+        for fd in grabbed:
+            with pytest.raises(OSError):
+                os.fstat(fd)                      # every probe closed its own
