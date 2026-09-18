@@ -245,6 +245,28 @@ class SelfGrants:
       Runs nothing. "Revocation is stop renewing" bounds exposure only if something acts
       on the lapse.
 
+    WHAT THIS CANNOT DO: EXPIRY IS ONLY AS HONEST AS THE HOST CLOCK.
+    ----------------------------------------------------------------
+    ``node_identity`` checks ``not_after`` against the wall clock, so a host whose clock
+    is rolled back far enough verifies a certificate the CA has already retired. Deleting
+    the cache did not fix that — it removed one of two causes. With a cache, one stale
+    verdict was reused; without one, every call is fooled afresh. Neither is worse; both
+    are wrong for the same reason.
+
+    IT IS NOT FIXABLE HERE, and the attempts are recorded because two of them shipped. A
+    monotonic deadline anchored at first sight bounds the exposure to one certificate
+    lifetime, which sounds like a fix and is not: it cannot survive a restart (the anchor
+    is process-local), and the two versions built to carry it produced a fail-open on a
+    backward step and then a permanent silent refusal on a forward one. Closing this
+    properly needs a time source the host cannot edit — a signed timestamp from the CA,
+    an OCSP-style freshness check, or a monotonic anchor persisted outside the node — and
+    each of those is a design change with its own failure modes, not a patch.
+
+    So it is a STATED LIMIT: a node whose clock an attacker controls can extend its own
+    authority up to the point the CA stops signing. That is bounded by the enrolment
+    process, not by this code, and an operator relying on short certificate lifetimes for
+    revocation should know that the lifetime is measured on the node's own clock.
+
     THERE IS NO CACHE, AND THAT IS THE DESIGN.
     -----------------------------------------
     An earlier version cached the verified grants behind a TTL. Across five attempts,
@@ -272,6 +294,9 @@ class SelfGrants:
     #: already taken by ``dispatcher_sizer`` for the physical-host slug, is documented
     #: for an unrelated NFS-share-scoping reason, and overloading it made a node that
     #: set it for THAT reason refuse every job with a message about PKI renewal.
+    #: Backstop on the warn-once set. See :meth:`_warn_once`.
+    WARN_CAP = 64
+
     CERT_ENV = "BLASTBOX_NODE_CERT"
     GATE_ENV = "BLASTBOX_NODE_GRANTS_GATE"
     PKI_ENV = "BLASTBOX_PKI_DIR"
@@ -292,8 +317,26 @@ class SelfGrants:
         inform anyone; it hides the line that would have. Keyed on the arguments too, so
         a value that CHANGES is reported again.
         """
-        stamp = (key, args)
+        # BOUNDED. The key used to include every argument, and one caller passes an
+        # EXCEPTION — whose text carries paths, errnos and addresses that vary per
+        # failure, so a flapping mount produced a new key per job and the set grew
+        # without bound in a long-lived dispatcher. Keying on the first two arguments
+        # keeps "the value changed, say so again" for configuration values while the
+        # variable tail of an exception cannot mint new entries, and the cap is a
+        # backstop for any caller that still varies within those.
+        stamp = (key, args[:2])
         if stamp in self._warned:
+            return
+        if len(self._warned) >= self.WARN_CAP:
+            # Not a cache to be clever with: at this point something is emitting far more
+            # distinct configuration warnings than a node can have problems, so stop
+            # growing and say so once.
+            if ("__capped__", ()) not in self._warned:
+                self._warned.add(("__capped__", ()))
+                self._log.warning(
+                    "suppressing further configuration warnings: %d distinct ones already "
+                    "reported, which is more than a correctly-configured node can have",
+                    len(self._warned))
             return
         self._warned.add(stamp)
         self._log.warning(msg, *args)

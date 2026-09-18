@@ -1265,7 +1265,27 @@ class Dispatcher:
         # about whether a peer is, and this node cannot see the fleet. Same reasoning,
         # and the same short shared defer, as the egress health gate.
         personality = self._resolve_personality(job)
-        # AN UNKNOWN ENGINE, ON AN ARMED NODE, IS NOT THIS NODE'S CALL TO MAKE.
+        # ONE COOLDOWN CHECK FOR BOTH REFUSAL PATHS. It used to sit below the
+        # engine-not-here guard, so that path WROTE a cooldown entry and never consulted
+        # it: the escalation lengthened a window nothing honoured, and the claim /
+        # requeue amplification carried on at the flat shared defer. Reading it here
+        # covers both, because neither refusal can be resolved by anything this node
+        # does — only by a renewed certificate or a different node.
+        if (until := self._grants_cooldown.get(job.job_id)) and time.monotonic() < until:
+                # RELEASE THE RESERVATION. This method is the SOLE owner of freeing the
+                # warm-slot gate reservation (issue #72); every other early return
+                # honours that and this one did not, so each visit leaked one. Once the
+                # leak reached the idle-slot count a warm-only sidecar stopped claiming
+                # ANY job, granted or not, and never recovered without a restart.
+                if warm_reserved:
+                    self._release_warm_reservation()
+                self._requeue_claimed(
+                    job, defer=True, defer_s=self._egress_shared_defer_s,
+                    reason=f"this node's certificate does not grant this work; in a local "
+                           f"cooldown for another {until - time.monotonic():.0f}s",
+                )
+                return
+            # AN UNKNOWN ENGINE, ON AN ARMED NODE, IS NOT THIS NODE'S CALL TO MAKE.
         # `dispatch_once()` is unscoped by default, so on a shared store a node can claim
         # a job for an engine a PEER has and it does not. Falling through to
         # `_dispatch_inner`'s `unknown engine` failure destroys that work on exactly the
@@ -1319,20 +1339,6 @@ class Dispatcher:
             # and not the store — the claim/requeue amplification the comment claimed to fix
             # carried on every few seconds, and the "will not reconsider for 300s" it printed
             # was false.
-            if (until := self._grants_cooldown.get(job.job_id)) and time.monotonic() < until:
-                # RELEASE THE RESERVATION. This method is the SOLE owner of freeing the
-                # warm-slot gate reservation (issue #72); every other early return
-                # honours that and this one did not, so each visit leaked one. Once the
-                # leak reached the idle-slot count a warm-only sidecar stopped claiming
-                # ANY job, granted or not, and never recovered without a restart.
-                if warm_reserved:
-                    self._release_warm_reservation()
-                self._requeue_claimed(
-                    job, defer=True, defer_s=self._egress_shared_defer_s,
-                    reason=f"this node's certificate does not grant this work; in a local "
-                           f"cooldown for another {until - time.monotonic():.0f}s",
-                )
-                return
             why = self._grants_gate.refuse(engine=job.engine, personality=personality)
             if why is not None:
                 # THROTTLED AND ESCALATING, like the egress health gate below — and more

@@ -121,6 +121,19 @@ PYEOF
     pass=$((pass+1))
   fi
   cp "$REPO/$file" "$file"          # restore before the next mutation
+  # ...AND PROVE IT. A reviewer called the loop cumulative — mutations piling up so that
+  # later "caught" verdicts ride on earlier mutations. Reading the loop says otherwise
+  # (each file is restored from the pristine original before AND after its own mutation),
+  # but I have been wrong about this harness's soundness once already today, so it is
+  # asserted rather than reasoned about. Any drift from the original tree, from any
+  # cause, stops the run.
+  if ! diff -rq --exclude=.git --exclude=.venv --exclude=__pycache__ \
+        --exclude='*.pyc' "$REPO/src" "src" >/dev/null 2>&1; then
+    echo "  WORKING COPY DIVERGED from the original after restoring $file — every" >&2
+    echo "  verdict after this point would ride on a leftover mutation." >&2
+    diff -rq --exclude=__pycache__ "$REPO/src" "src" 2>&1 | head -5 >&2
+    exit 1
+  fi
 done
 
 echo

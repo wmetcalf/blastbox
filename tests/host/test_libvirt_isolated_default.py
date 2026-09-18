@@ -340,3 +340,34 @@ def test_the_shipped_network_runs_no_resolver():
     dns = root.find("dns")
     assert dns is not None and dns.get("enable") == "no", "bb-isolated runs a resolver again"
     assert root.find("./ip/dhcp/range") is not None, "DHCP was lost with the resolver"
+
+
+def test_the_network_is_read_once_per_spawn_check(monkeypatch):
+    """A second `net-dumpxml` inside the forwarding check ignored its return code, so a
+    transient failure between the two reads made a FORWARDING network look
+    non-forwarding and skipped the isolation refusal entirely."""
+    rt = _runtime(monkeypatch, xml=NAT, network="default")
+    calls: list = []
+    real = rt._virsh
+    monkeypatch.setattr(rt, "_virsh", lambda *a, **k: calls.append(a) or real(*a, **k))
+    with pytest.raises(RuntimeError, match="reaches the physical network"):
+        rt._assert_egress_is_governed()
+    dumps = [a for a in calls if a and a[0] == "net-dumpxml"]
+    assert len(dumps) == 1, f"net-dumpxml called {len(dumps)} times; the second can disagree"
+
+
+def test_a_second_read_failing_cannot_downgrade_the_verdict(monkeypatch):
+    """The concrete failure: first read says NAT, second read fails, `_network_forwards`
+    returns False for the unreadable result, and an unpoliced worker boots onto NAT."""
+    import subprocess
+
+    from blastbox.host.runtime.libvirt_vm import LibvirtVmConfig, LibvirtVmRuntime
+
+    rt = LibvirtVmRuntime(LibvirtVmConfig(golden_base="/x", network="default",
+                                          egress_policy=None))
+    seq = [subprocess.CompletedProcess([], 0, NAT, ""),
+           subprocess.CompletedProcess([], 1, "", "transient failure")]
+    monkeypatch.setattr(rt, "_virsh", lambda *a, **k: seq.pop(0) if seq
+                        else subprocess.CompletedProcess([], 1, "", ""))
+    with pytest.raises(RuntimeError, match="reaches the physical network"):
+        rt._assert_egress_is_governed()

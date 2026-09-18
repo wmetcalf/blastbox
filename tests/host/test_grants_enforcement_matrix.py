@@ -723,3 +723,78 @@ def test_the_vm_tier_mirrors_process_including_case(monkeypatch):
     assert p.exit_driver == "openvpn", (
         f"tier judged {p.exit_driver!r}; _process folds case and would use 'vpn'"
     )
+
+
+# ------------------------------------------------- round 4: the fixes for the fixes
+
+def test_the_undeclared_pool_message_is_reachable_and_readable(tmp_path, monkeypatch):
+    """It was dead code. `_UNDECLARED` is not in UNGOVERNED_TIERS, so `refuse()` always
+    rejected it as an ungranted tier before the `if why is None` substitution could fire
+    — and what the operator actually saw was `netpolicy tier '\\x00undeclared' is not
+    granted`: a sentinel with a NUL byte in it, worse than the message it replaced.
+    Three reviewer families found it independently."""
+    store = InMemoryJobStore()
+    _vm_job(store, tmp_path, net_policy=None)
+    _arm(tmp_path, monkeypatch, engines=("authenticode",), tiers=("direct",))
+
+    validated: list = []
+    with monkeypatch.context() as m:
+        records: list = []
+        m.setattr("blastbox.host.runtime.vm_dispatch.logger",
+                  type("L", (), {"warning": lambda s, *a: records.append(a),
+                                 "info": lambda s, *a: None,
+                                 "error": lambda s, *a: None,
+                                 "exception": lambda s, *a: None})())
+        _vm(store, tmp_path, validated, fixed_net_policy=None)._process(store.claim_next())
+    assert validated == []
+    msg = " ".join(str(x) for r in records for x in r)
+    assert "fixed_net_policy" in msg, f"the actionable message never surfaced: {msg[:200]}"
+    assert "\x00" not in msg, "the raw sentinel leaked into an operator-facing message"
+
+
+def test_even_a_certificate_granting_everything_cannot_bless_an_undeclared_pool(
+        tmp_path, monkeypatch):
+    """A reviewer read the refusal as over-strict. It is not: the question is what this
+    POOL does, not what the node is permitted to do, and an undeclared pool's egress is
+    unknown to this node. The message says so."""
+    store = InMemoryJobStore()
+    _vm_job(store, tmp_path, net_policy=None)
+    _arm(tmp_path, monkeypatch, engines=("authenticode",), credentials=True,
+         tiers=("direct", "openvpn", "wireguard", "socks", "httpproxy", "tor", "none"))
+
+    validated: list = []
+    _vm(store, tmp_path, validated, fixed_net_policy=None)._process(store.claim_next())
+    assert validated == []
+
+
+def test_configuration_warnings_cannot_grow_without_bound(monkeypatch):
+    """The key included every argument, and one caller passes an EXCEPTION — whose text
+    carries paths and errnos that vary per failure, so a flapping mount minted a new key
+    per job and the set grew without bound in a long-lived dispatcher."""
+    from blastbox.host.placement import SelfGrants
+
+    g = SelfGrants()
+    for i in range(500):
+        g._warn_once("verify-failed", "cert %s failed: %s", "/same/path.crt",
+                     OSError(f"errno {i}: transient detail {i}"))
+    assert len(g._warned) <= g.WARN_CAP + 1, (
+        f"the warn-once set grew to {len(g._warned)} from one repeating condition"
+    )
+
+
+def test_both_refusal_paths_honour_the_cooldown_they_write():
+    """The engine-not-here path WROTE a cooldown entry and never consulted it, so its
+    escalation lengthened a window nothing honoured and the claim/requeue amplification
+    carried on at the flat shared defer. Neither refusal can be resolved by anything this
+    node does, so one check covers both — and it must come first."""
+    import inspect
+
+    from blastbox.host.dispatch import Dispatcher
+
+    src = inspect.getsource(Dispatcher._dispatch_claimed_job)
+    cooldown = src.index("_grants_cooldown.get(job.job_id)")
+    engine_guard = src.index("if job.engine not in self._engines")
+    grants_refuse = src.index("_grants_gate.refuse(")
+    assert cooldown < engine_guard < grants_refuse, (
+        "the cooldown check no longer dominates both refusal paths"
+    )

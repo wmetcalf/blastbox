@@ -423,7 +423,7 @@ class VmJobDispatcher:
                                      status=JobStatus.QUEUED, claim_id=None, started_at=None)
         return False
 
-    def _effective_personality(self, job: Job):
+    def _effective_personality(self, job: Job, *, assume_sealed: bool = False):
         """The personality this pool would actually run the job under.
 
         Mirrors the effective-policy computation in :meth:`_process` (fixed → override →
@@ -450,7 +450,7 @@ class VmJobDispatcher:
             # to 'none' put the tier in UNGOVERNED_TIERS, so tier AND credentials were
             # skipped and only the engine name was ever checked — on the aws/static/
             # cascade pools this control exists for.
-            return type("_P", (), {"exit_driver": _UNDECLARED})()
+            return type("_P", (), {"exit_driver": "none" if assume_sealed else _UNDECLARED})()
         name = fixed or effective
         # RESOLVE_NET_POLICY NEVER RAISES, and the first version of this leaned on an
         # `except Exception` fallback that was therefore DEAD CODE with a comment
@@ -506,16 +506,27 @@ class VmJobDispatcher:
         # re-materialise the sample, so deleting it makes that peer FAIL the job: the one
         # contract this gate makes, turned into its opposite.
         personality = self._effective_personality(job)
-        why = self._grants_gate.refuse(engine=job.engine, personality=personality)
-        if why is None and personality.exit_driver is _UNDECLARED \
-                and self._grants_gate.grants() is not _no_gate():
-            # An undeclared pool passed the engine check and had NOTHING to check its
-            # tier or credentials against. Rather than invent a tier name the operator
-            # would have to guess, say what to fix.
-            why = ("this pool declares no fixed_net_policy, so this node cannot know what "
-                   "egress its VMs actually have and cannot check it against the "
-                   "certificate's tier or credentials grants. Declare fixed_net_policy "
-                   "(the pool's provisioned egress), or run this pool ungated.")
+        # BEFORE refuse(), NOT AFTER. The first version asked refuse() first and only
+        # substituted this message `if why is None` — but `_UNDECLARED` is not in
+        # UNGOVERNED_TIERS, so refuse() always rejected it as an ungranted tier and the
+        # nicer message was unreachable dead code. What an operator actually saw was
+        # `netpolicy tier '\x00undeclared' is not granted`: a sentinel with a NUL byte in
+        # it, which is worse than the message it replaced. Three reviewer families found
+        # it independently.
+        if personality.exit_driver is _UNDECLARED:
+            if self._grants_gate.grants() is _no_gate():
+                personality = self._effective_personality(job, assume_sealed=True)
+                why = self._grants_gate.refuse(engine=job.engine, personality=personality)
+            else:
+                why = ("this pool declares no fixed_net_policy, so this node cannot know "
+                       "what egress its VMs actually have and cannot check it against the "
+                       "certificate's tier or credentials grants — not even a certificate "
+                       "granting every tier helps, because the question is what this pool "
+                       "DOES, not what the node is allowed to do. Declare "
+                       "fixed_net_policy (the pool's provisioned egress), or run this "
+                       "pool ungated.")
+        else:
+            why = self._grants_gate.refuse(engine=job.engine, personality=personality)
         if why is not None:
             # DEFERRED AND THROTTLED. `_worker_loop` only backs off when `claim_next`
             # returns None, so a refusal that simply returned re-claimed THE SAME JOB

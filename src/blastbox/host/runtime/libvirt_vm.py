@@ -445,6 +445,21 @@ class LibvirtVmRuntime:
             return m.group(1).strip().lower()
         return "nat" if self._FORWARD_EL.search(xml) else None
 
+    def _forwards(self, xml: str) -> bool:
+        """Does this ALREADY-READ network definition reach the physical network?
+
+        Takes the xml rather than re-reading it: the caller has validated one read, and a
+        second `net-dumpxml` can fail or disagree — its error was ignored, so a transient
+        failure between the two calls made an unreadable network look non-forwarding and
+        skipped the isolation refusal entirely.
+        """
+        mode = self._forward_mode(xml)
+        if mode is None:
+            return False
+        # UNRECOGNISED MEANS FORWARDING. The old test was an allowlist of BAD modes, so
+        # any mode libvirt adds later, or any capitalisation, read as safe.
+        return True
+
     def _network_forwards(self) -> bool:
         """Does this network reach the physical network?
 
@@ -457,14 +472,7 @@ class LibvirtVmRuntime:
         the operator to switch to a NAT network because libvirtd was down).
         """
         _rc, xml = self._network_xml()
-        mode = self._forward_mode(xml)
-        if mode is None:
-            return False
-        # UNRECOGNISED MEANS FORWARDING. The old test was `mode in FORWARDING_MODES` — an
-        # allowlist of bad modes — so any mode libvirt adds later, or any typo, read as
-        # safe. The one shape that is safe is "no <forward> element", and it is already
-        # handled above; everything else is presumed to reach the network.
-        return True
+        return self._forwards(xml)
 
     def _assert_subnet_matches_network(self) -> None:
         """The configured subnet_prefix must be the one this libvirt network actually
@@ -522,7 +530,7 @@ class LibvirtVmRuntime:
                 "with `virsh net-define deploy/libvirt/bb-isolated.xml && virsh net-start "
                 "bb-isolated && virsh net-autostart bb-isolated`, and check that libvirtd "
                 "is running.")
-        forwards = self._network_forwards()
+        forwards = self._forwards(xml)
 
         if self.cfg.egress_policy is not None:
             # `direct` means "go straight out" and `routing_commands()` deliberately
