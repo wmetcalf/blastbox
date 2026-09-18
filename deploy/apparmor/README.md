@@ -225,6 +225,12 @@ a profile to complain under a running worker stops the attachment and shows up i
 Attaching a profile that is **not** loaded is not a degraded mode — it fails the exec and breaks
 every run — which is why the profile is confirmed before it is attached.
 
+**Permit a file reader if you want the assertion checked.** The proof below runs
+`/bin/cat /proc/self/attr/current` inside the jail. A workload profile that permits only its
+parser and `/usr/bin/true` cannot run it — that is reported as *unverified* (a warning naming
+this), not as a disproof, so a correctly configured host is never rejected over a diagnostic.
+Permit `/bin/cat` (or `/usr/bin/cat`, `/usr/bin/head`) to have the assertion actually checked.
+
 **An asserted profile is now proved before anything is traded for it.** Because securityfs is
 root-only, a non-root worker's only route to "the profile is enforcing" is the assertion below —
 and an assertion cannot tell `enforce` from `complain`, while arming on it buys `--proc_rw`. So
@@ -233,6 +239,12 @@ when the evidence is an assertion, the backend runs one probe through the jail a
 be asserted away. A child that comes back `(complain)`, `unconfined`, or wearing another profile
 disarms the attachment and gets `apparmor_missing` instead. A profile the kernel itself reported is
 not re-probed.
+
+The proof is **re-measured on a 30-second TTL**, not once at startup: where securityfs is
+unreadable the assertion is a static environment variable, so a profile switched to `complain`
+under a running worker would otherwise stay "active" for the life of that worker while nothing
+enforced anything. One extra jail launch per half-minute is noise next to a detonation; what
+matters is that the staleness window is bounded.
 
 ### The `BLASTBOX_APPARMOR_PROFILES` escape hatch (plural)
 

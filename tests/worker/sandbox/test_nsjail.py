@@ -1045,9 +1045,47 @@ class TestAnAssertedProfileIsMeasuredNotBelieved:
         assert sb.apparmor_active is False
         assert "apparmor_missing" in sb.insecurity_reasons
 
-    def test_an_unprovable_probe_does_not_arm(self, tmp_path, monkeypatch) -> None:
-        """Fail safe: a probe that cannot run is not evidence of confinement."""
-        sb = self._sb(tmp_path, monkeypatch, child_reports="", rc=1)
+    def test_an_unprovable_probe_keeps_the_assertion_and_says_so(
+            self, tmp_path, monkeypatch, caplog) -> None:
+        """UNPROVABLE is not DISPROVED, and the difference decides whether a correctly
+        configured host runs.
+
+        A workload-specific profile may legitimately permit its parser and the documented
+        /usr/bin/true probe without permitting a file reader, and the probe then cannot run at
+        all. Treating that as a disproof rejected a valid confined backend over a diagnostic
+        (codex, #177). The operator keeps their assertion, and the log says it is unverified
+        and what to permit to have it checked.
+        """
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="blastbox.worker.sandbox.nsjail"):
+            sb = self._sb(tmp_path, monkeypatch, child_reports="", rc=1)
+        assert sb.apparmor_active is True
+        assert "unprovable" in caplog.text
+
+    def test_a_disproved_assertion_still_disarms(self, tmp_path, monkeypatch) -> None:
+        """The probe RAN and the kernel disagreed -- that is evidence, and it wins."""
+        sb = self._sb(tmp_path, monkeypatch, child_reports="something-else (enforce)\n")
+        assert sb.apparmor_active is False
+
+    def test_the_proof_is_re_measured_on_a_ttl_not_once_for_the_worker_life(
+            self, tmp_path, monkeypatch) -> None:
+        """With securityfs unreadable, `profile_loaded()` returns ASSERTED forever from a static
+        environment variable, so a profile switched to complain mid-life would stay "active" for
+        the life of the worker while nothing enforced anything (codex, #177)."""
+        import blastbox.worker.sandbox.nsjail as mod
+
+        sb = self._sb(tmp_path, monkeypatch, child_reports="blastbox-sandbox (enforce)\n")
+        assert sb.apparmor_active is True
+
+        # The profile is switched to complain under the running worker ...
+        monkeypatch.setattr(mod.NsjailSandbox, "prove_apparmor_attachment",
+                            lambda self: "blastbox-sandbox (complain)")
+        assert sb.apparmor_active is True, "the cached proof should still hold inside the TTL"
+
+        # ... and the next launch after the TTL sees it.
+        clock = {"t": mod.time.monotonic() + mod._PROOF_TTL_S + 1}
+        monkeypatch.setattr(mod.time, "monotonic", lambda: clock["t"])
         assert sb.apparmor_active is False
 
     def test_kill_mode_counts(self, tmp_path, monkeypatch) -> None:

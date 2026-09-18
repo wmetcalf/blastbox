@@ -293,6 +293,13 @@ def select_sandbox(
                 extra={"backend": name, "reasons": reasons},
             )
 
+        # ADMISSION HAPPENS HERE, not in the constructor. The regression guard compares
+        # against the confinement the selector accepted, and capturing that in __init__ made it
+        # inert for a profile that became enforcing between construction and this point
+        # (codex, #177).
+        note = getattr(sb, "note_admitted", None)
+        if note is not None:
+            note()
         _log.info("sandbox backend selected", extra={"backend": name})
         return sb
 
@@ -367,5 +374,8 @@ def _select_forced(
             extra={"backend": name, "reasons": reasons},
         )
 
+    note = getattr(sb, "note_admitted", None)
+    if note is not None:
+        note()
     _log.info("sandbox backend selected (forced)", extra={"backend": name})
     return sb

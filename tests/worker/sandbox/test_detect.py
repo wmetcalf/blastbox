@@ -672,3 +672,44 @@ def test_the_diagnosis_survives_the_regression_guard_on_a_REAL_backend(monkeypat
         f"the profile denial was not diagnosed: {type(err).__name__}: {err}"
     )
     assert sb._suspended_for_diagnosis is False, "the suspension leaked past the probe"
+
+
+def test_admission_is_recorded_when_the_selector_admits_not_at_construction(
+        monkeypatch, tmp_path: Path) -> None:
+    """`_armed_at_admission` was captured in the CONSTRUCTOR, which is not when admission
+    happens.
+
+    A profile that becomes enforcing between construction and the selector's security check
+    gets the backend admitted as confined with the flag still False -- and the
+    confinement-regression guard is then inert for the life of that worker (codex, #177). The
+    selector knows the real moment.
+    """
+    import blastbox.worker.sandbox.detect as detect_mod
+
+    class _LateArming:
+        name = "nsjail"
+        insecurity_reasons: list[str] = []
+        secure = True
+
+        def __init__(self) -> None:
+            self.apparmor_active = False          # absent at construction ...
+            self._armed_at_admission = False
+
+        def note_admitted(self) -> None:
+            self._armed_at_admission = self.apparmor_active
+
+        def run(self, req):
+            from types import SimpleNamespace
+            self.apparmor_active = True            # ... enforcing by the time it is probed
+            return SimpleNamespace(exit_code=0, killed=False, stdout=b"", stderr=b"")
+
+    sb = _LateArming()
+    monkeypatch.delenv("BLASTBOX_SANDBOX", raising=False)
+    monkeypatch.setattr(detect_mod, "_in_container", lambda: False)
+    monkeypatch.setattr(detect_mod, "_make_backend", lambda name, **kw: sb)
+
+    got = select_sandbox(_status_path=_good_status_file(tmp_path))
+    assert got is sb
+    assert sb._armed_at_admission is True, (
+        "the backend was admitted as confined but the guard will treat it as never armed"
+    )

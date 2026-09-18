@@ -40,6 +40,7 @@ import resource
 import shutil
 import signal
 import subprocess
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Callable
@@ -55,6 +56,17 @@ from blastbox.worker.sandbox.apparmor import (
 )
 from blastbox.worker.sandbox.base import SandboxRequest, SandboxResult, kill_sandbox_group
 
+
+# How long an in-jail proof of an ASSERTED profile is trusted before it is re-measured. A
+# detonation costs seconds at least, so one extra jail launch per half-minute is noise next to
+# it; the point is that the window is BOUNDED rather than the life of the worker.
+_PROOF_TTL_S = 30.0
+
+# The proof needs something that can print a file. Tried in order; None means the proof cannot
+# run on this host, which is reported as unprovable rather than as a disproof.
+_PROOF_READER: str | None = next(
+    (p for p in ("/bin/cat", "/usr/bin/cat", "/usr/bin/head") if Path(p).exists()), None
+)
 
 _log = logging.getLogger("blastbox.worker.sandbox.bwrap")
 
@@ -236,16 +248,13 @@ class BubblewrapSandbox:
         # of it later is a refusal (see _refuse_if_confinement_regressed); never having
         # had it is not.
         self._suspended_for_diagnosis = False
-        # An ASSERTED profile is not a confirmed one. Measure it once, from inside the jail,
-        # before anything is traded for it -- and drop the attachment if the child does not
-        # come back wearing an enforcing profile of that name.
-        if (
-            self._aa_exec is not None
-            and self._binary_present
-            and profile_evidence(self._apparmor_profile) == ASSERTED
-            and not self.apparmor_attachment_is_believable()
-        ):
-            self._aa_exec = None
+        self._proof: tuple[bool, float] | None = None
+        self._warned: set[str] = set()
+        # An ASSERTED profile is not a confirmed one -- see apparmor_active, which measures it
+        # from inside the jail rather than believing it, on a TTL rather than once. Touched here
+        # only so a disproof is logged at startup instead of first launch.
+        if self._aa_exec is not None and self._binary_present:
+            self.apparmor_active
         self._armed_at_admission = self.apparmor_active
 
         _log.info(
@@ -332,7 +341,13 @@ class BubblewrapSandbox:
     @property
     def apparmor_active(self) -> bool:
         """Both halves: the helper exists AND the profile is enforcing right now."""
-        return self._aa_exec is not None and self._apparmor_enforcing_now()
+        if self._aa_exec is None or not self._apparmor_enforcing_now():
+            return False
+        if profile_evidence(self._apparmor_profile) == ASSERTED:
+            # The only evidence is an environment variable, which cannot tell enforce from
+            # complain. Measure it (TTL-bounded) instead of taking its word.
+            return self.apparmor_attachment_is_believable()
+        return True
 
     @property
     def cgroup_pids_supported(self) -> bool:
@@ -357,7 +372,9 @@ class BubblewrapSandbox:
         """
         if self._aa_exec is None:
             return None
-        req = SandboxRequest(argv=["/bin/cat", "/proc/self/attr/current"])
+        if _PROOF_READER is None:
+            return None
+        req = SandboxRequest(argv=[_PROOF_READER, "/proc/self/attr/current"])
         argv = self._build_argv(req)
         try:
             out = subprocess.run(argv, capture_output=True, text=True, timeout=60)
@@ -373,15 +390,43 @@ class BubblewrapSandbox:
         return out.stdout.strip()
 
     def apparmor_attachment_is_believable(self) -> bool:
-        """True when the child really comes back wearing an ENFORCING profile of that name.
+        """Whether an ASSERTED profile survives being measured. Three outcomes, not two.
 
-        Called only where the evidence is an assertion; a kernel reading needs no second
-        opinion. A False here drops the attachment rather than proceeding, because the
-        alternative is `--proc_rw` bought with nothing.
+        Called only where the evidence is an assertion (`profile_evidence` == ASSERTED); a
+        kernel reading needs no second opinion.
+
+        * DISPROVED -- the child ran and came back wearing another profile, or a non-enforcing
+          one. The assertion is untrue: disarm, because the alternative is `--proc_rw` bought
+          with nothing.
+        * UNPROVABLE -- the probe could not run at all (no reader binary, or the profile denies
+          it). A workload-specific profile may legitimately permit its parser and the
+          documented `/usr/bin/true` without permitting a file reader, and rejecting such a
+          backend would take a correctly-configured host down over a diagnostic
+          (codex, #177). Keep the assertion, warn once, and say what to permit.
+        * PROVEN -- the child reports this profile in enforce or kill mode.
+
+        The answer is re-measured on a TTL rather than once at construction: with securityfs
+        unreadable, `profile_loaded()` returns ASSERTED forever from a static environment
+        variable, so a profile switched to complain mid-life would otherwise stay "active" for
+        the life of the worker while nothing enforced anything (codex, #177). The window is
+        bounded by `_PROOF_TTL_S`, and monotonic time cannot be stepped backwards under it.
         """
+        now = time.monotonic()
+        if self._proof is not None and now - self._proof[1] < _PROOF_TTL_S:
+            return self._proof[0]
+
         got = self.prove_apparmor_attachment()
         if got is None:
-            return False
+            # UNPROVABLE. Not evidence against the operator, and not evidence for them.
+            self._warn_once(
+                "apparmor_assertion_unprovable profile=%s "
+                "note=the in-jail proof could not run (no reader binary, or the profile "
+                "denies it); the assertion stands unverified. Permit %s in the profile to "
+                "have it checked." % (self._apparmor_profile, _PROOF_READER or "a file reader")
+            )
+            self._proof = (True, now)
+            return True
+
         ok = got.startswith(self._apparmor_profile) and (
             "(enforce)" in got or "(kill)" in got
         )
@@ -392,7 +437,25 @@ class BubblewrapSandbox:
                 "no profile is attached",
                 self._apparmor_profile, got,
             )
+        self._proof = (ok, now)
         return ok
+
+    def _warn_once(self, msg: str) -> None:
+        if msg in self._warned:
+            return
+        self._warned.add(msg)
+        _log.warning(msg)
+
+    def note_admitted(self) -> None:
+        """Called by the selector on the backend it actually admits.
+
+        `_armed_at_admission` was captured in the CONSTRUCTOR, which is not when admission
+        happens: a profile that becomes enforcing between construction and the selector's
+        security check gets the backend admitted as confined with the flag still False, and
+        the regression guard is then inert for the life of that worker (codex, #177). The
+        selector knows the real moment; this is it.
+        """
+        self._armed_at_admission = self.apparmor_active
 
     def _refuse_if_confinement_regressed(self) -> None:
         """A worker outlives its jobs; `secure` is checked once, at selection.
