@@ -238,7 +238,7 @@ class AppArmorProofMixin:
     # (claude-code-review lens, round 5 of #177).
     _apparmor_last_seen: bool | None = None
     _proof: tuple[bool, float, float] | None = None
-    _warned_unprovable: bool = False
+    _warned: frozenset[str] = frozenset()
     _consecutive_transients: int = 0
     _suspended_for_diagnosis: bool = False
     _armed_at_admission: bool | None = None
@@ -343,10 +343,20 @@ class AppArmorProofMixin:
           kill mode. Nothing can assert that away.
         * DISPROVED -- the reader could not report AND the profile cannot be attached to the
           documented probe binary at all: it is absent, or unusable. Disarm.
-        * UNPROVABLE -- the profile attaches, but the reader could not run (a workload profile
-          may legitimately permit its parser and `/usr/bin/true` without permitting a file
-          reader). Keep the operator's assertion, warn once, name what to permit -- rejecting a
-          correctly configured backend over a diagnostic is the worse error (codex, #177).
+        * UNPROVABLE -- the profile attaches, but the reader could not run. Keep the operator's
+          assertion, warn once, name what to permit.
+
+          This is not merely "trust the operator", and the reason matters because `--proc_rw`
+          rides on it: reaching this branch is itself evidence of ENFORCEMENT. The attach probe
+          succeeded, so the profile exists and permits `/usr/bin/true`; the reader then FAILED,
+          i.e. something denied it -- and a complain-mode profile denies nothing, it logs and
+          allows, so its reader probe would have succeeded and reported `(complain)`, which is a
+          DISPROOF above. An attaching profile that refuses the reader is an enforcing one.
+
+          The residual gap, stated rather than papered over: the reader could also fail for a
+          reason that is not the profile -- the seccomp filter blocking a syscall `cat` needs
+          but `/usr/bin/true` does not, say. That is why this branch warns and names the reader
+          to permit, instead of reporting the profile as proven (qwen, round 6 of #177).
         * TRANSIENT -- the probe itself failed (a 60s timeout, ENOMEM on fork). Not a verdict:
           answer from the last one if there is one, and write NO cache entry, because caching
           a transient failure refused every job for the whole TTL on a host that had already
@@ -402,7 +412,8 @@ class AppArmorProofMixin:
             # probe storm, short enough that the backend re-arms itself the moment probes work.
             self._consecutive_transients += 1
             settled = self._consecutive_transients >= _TRANSIENT_SETTLED_AFTER
-            self._warn_once_unprovable(
+            self._warn_once(
+                "unmeasurable",
                 "apparmor_proof_unmeasurable backend=%s profile=%s "
                 "note=the probe failed transiently twice; confinement CANNOT be confirmed, so "
                 "this backend reports apparmor_missing until a probe succeeds"
@@ -433,7 +444,8 @@ class AppArmorProofMixin:
             self._proof = (False, time.monotonic(), _PROOF_TTL_S)
             return False
 
-        self._warn_once_unprovable(
+        self._warn_once(
+            "reader-denied",
             "apparmor_assertion_unprovable backend=%s profile=%s "
             "note=the in-jail proof could not run (the profile denies %s); the assertion "
             "stands unverified. Permit it to have the assertion checked."
@@ -442,14 +454,18 @@ class AppArmorProofMixin:
         self._proof = (True, time.monotonic(), _PROOF_TTL_S)
         return True
 
-    def _warn_once_unprovable(self, msg: str) -> None:
-        """One flag, not a set: the message is built from two per-instance constants, so the set
-        could never hold more than one string -- and a set-shaped warn-once cache is the shape
-        that grows unbounded elsewhere in this repo (claude-code-review lens, round 4 of #177).
+    def _warn_once(self, key: str, msg: str) -> None:
+        """Once per CAUSE, not once per backend.
+
+        This was a single bool, on the reasoning that only one message could ever use it. Two
+        now do -- "the profile denies the reader" and "the probe will not run at all" -- and
+        they are different operator actions, so whichever fired first silenced the other for the
+        life of the worker (glm, round 6 of #177). Keyed instead, and bounded by the number of
+        call sites (two), not by anything an attacker or a busy host can grow.
         """
-        if self._warned_unprovable:
+        if key in self._warned:
             return
-        self._warned_unprovable = True
+        self._warned = self._warned | {key}
         _log.warning(msg)
 
     def note_admitted(self, *, armed: bool) -> None:

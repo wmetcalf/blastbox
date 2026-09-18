@@ -214,3 +214,34 @@ def test_every_network_allow_in_the_profile_actually_survives_compilation(
     assert _policy(profile) != _policy(stripped), (
         f"{allow_rule!r} compiles to nothing -- a deny rule is swallowing it"
     )
+
+
+def test_the_child_profile_loads_on_the_oldest_supported_apparmor() -> None:
+    """The child profile must compile on an AppArmor 3.x parser, and only it.
+
+    `blastbox-{bwrap,nsjail,runsc}` declare `abi <abi/4.0>` because they need the `userns` rule,
+    which exists only there. This profile needs nothing newer than 3.0 -- and an AppArmor 3.x
+    host (Ubuntu 22.04 LTS) has no `/etc/apparmor.d/abi/4.0`, so pinning 4.0 would make the ONE
+    profile a host must load for any inner backend to be `secure` fail to compile on a supported
+    LTS (glm, round 6 of #177).
+    """
+    text = (_PROFILE_DIR / "blastbox-sandbox").read_text()
+    assert "abi <abi/3.0>," in text, "the child profile pins an abi newer than 3.0"
+    # RULES, not prose: the file's comments discuss userns (explaining why the OTHER profiles
+    # need abi 4.0), and a substring check over the whole text would read those as a rule.
+    rules = [ln.split("#", 1)[0].strip() for ln in text.splitlines()]
+    assert not any("userns" in r for r in rules), (
+        "a userns rule needs abi 4.0; if this profile now needs one, the abi pin must change "
+        "with it and the LTS compatibility note above is no longer true"
+    )
+
+
+@pytest.mark.skipif(shutil.which("apparmor_parser") is None,
+                    reason="apparmor_parser not installed on this host")
+def test_the_per_binary_profiles_still_declare_the_abi_their_rules_need(tmp_path: Path) -> None:
+    """The converse: dropping THEIR abi to 3.0 would silently break the `userns` grant that is
+    the whole reason those profiles exist."""
+    for name in ("blastbox-bwrap", "blastbox-nsjail"):
+        text = (_PROFILE_DIR / name).read_text()
+        assert "userns" in text, f"{name} no longer grants userns -- why does it exist?"
+        assert "abi <abi/4.0>," in text, f"{name} needs abi 4.0 for its userns rule"

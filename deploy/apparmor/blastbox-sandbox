@@ -1,4 +1,10 @@
-abi <abi/4.0>,
+# abi 3.0, NOT 4.0 -- deliberately different from blastbox-{bwrap,nsjail,runsc} in this
+# directory. Those declare 4.0 because they need the `userns` rule, which only exists there. This
+# profile uses nothing newer than 3.0, and an AppArmor 3.x parser (Ubuntu 22.04 LTS) has no
+# /etc/apparmor.d/abi/4.0 -- so pinning 4.0 here would make the ONE profile a host must load for
+# any inner backend to be `secure` fail to compile on a supported LTS (glm, round 6 of #177).
+# Verified: compiles under both abi declarations on an AppArmor 4.x parser.
+abi <abi/3.0>,
 include <tunables/global>
 
 # blastbox-sandbox — the CHILD profile, attached to the detonated workload itself.

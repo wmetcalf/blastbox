@@ -225,10 +225,20 @@ a profile to complain under a running worker stops the attachment and shows up i
 Attaching a profile that is **not** loaded is not a degraded mode — it fails the exec and breaks
 every run — which is why the profile is confirmed before it is attached.
 
+**AppArmor 3.x is enough for this one.** `blastbox-sandbox` declares `abi <abi/3.0>`, unlike the per-binary profiles here, which need `abi <abi/4.0>` for their `userns` rule. A 3.x parser (Ubuntu 22.04 LTS) has no `abi/4.0`, and this is the profile a host must load for any inner backend to be `secure` — so it stays loadable there.
+
 **Permit a file reader if you want the assertion checked.** The proof below runs
 `/bin/cat /proc/self/attr/current` inside the jail. A workload profile that permits only its
 parser and `/usr/bin/true` cannot run it — that is reported as *unverified* (a warning naming
 this), not as a disproof, so a correctly configured host is never rejected over a diagnostic.
+Reaching that state is itself evidence of enforcement, which is why `--proc_rw` is still
+attached there: the attach probe succeeded, so the profile exists and permits `/usr/bin/true`, and
+the reader then *failed* — but a complain-mode profile denies nothing, so its reader probe would
+have succeeded and reported `(complain)`, which disarms. An attaching profile that refuses the
+reader is an enforcing one. The residual gap, stated rather than papered over: the reader could
+fail for a reason that is not the profile (the seccomp filter blocking a syscall `cat` needs but
+`true` does not), which is why this state warns instead of reporting the profile as proven.
+
 Permit `/usr/bin/cat` to have the assertion actually checked — the `/usr` path, because on a
 merged-`/usr` host (`/bin` → `usr/bin`) that is what the kernel resolves the exec to and what
 AppArmor matches; a rule written as `/bin/cat` never fires.

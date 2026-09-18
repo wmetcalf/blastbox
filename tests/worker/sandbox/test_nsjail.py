@@ -1562,3 +1562,50 @@ class TestAProbeThatCannotRunFailsClosed:
         assert aa._TRANSIENT_TTL_S < aa._PROOF_TTL_S / 5, (
             "an unmeasurable probe is cached nearly as long as a real verdict"
         )
+
+
+def test_two_different_unprovable_causes_both_get_said(tmp_path, monkeypatch, caplog) -> None:
+    """One warn-once slot was shared by two distinct causes, so whichever fired first silenced
+    the other for the life of the worker -- and they are different operator actions: "permit the
+    reader in your profile" versus "your probe will not run at all" (glm, round 6 of #177).
+    """
+    import logging
+    import subprocess
+    from types import SimpleNamespace
+
+    import blastbox.worker.sandbox.apparmor as aa
+    import blastbox.worker.sandbox.nsjail as mod
+
+    monkeypatch.setenv("BLASTBOX_APPARMOR_PROFILES", "blastbox-sandbox")
+    monkeypatch.setattr(aa, "_PROFILES", "/nonexistent")
+    monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
+    monkeypatch.setattr(mod, "_supports_proc_rw", lambda _p: True)
+    nsjail = tmp_path / "nsjail"
+    nsjail.write_text(_FAKE_NSJAIL)
+    nsjail.chmod(0o755)
+
+    mode = {"now": "reader-denied"}
+
+    def _run(argv, **kw):
+        joined = " ".join(argv)
+        if mode["now"] == "reader-denied":
+            if "attr/current" in joined:
+                return SimpleNamespace(returncode=1, stdout="", stderr="denied")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise subprocess.TimeoutExpired(argv, 1)
+
+    monkeypatch.setattr(aa.subprocess, "run", _run)
+    sb = mod.NsjailSandbox(nsjail_path=str(nsjail))
+
+    with caplog.at_level(logging.WARNING, logger="blastbox.worker.sandbox.apparmor"):
+        assert sb.apparmor_active is True                 # unprovable: reader denied
+        first = caplog.text
+        mode["now"] = "transient"
+        sb._proof = None
+        assert sb.apparmor_active is False                # unmeasurable: probe will not run
+        second = caplog.text[len(first):]
+
+    assert "assertion_unprovable" in first
+    assert "proof_unmeasurable" in second, (
+        "the second cause was silenced by the first cause's warn-once slot"
+    )
