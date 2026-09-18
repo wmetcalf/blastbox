@@ -342,6 +342,52 @@ def guest_kernel_version(vmlinux_path: str) -> tuple[int, int] | None:
     return None
 
 
+
+def rootfs_guest_problem(rootfs: str) -> str:
+    """Why this host must not boot ``rootfs``, or "" when it may.
+
+    Returns a complaint ONLY for a stamped rootfs whose guest blastbox disagrees
+    with this host. An unstamped rootfs, or one whose stamp cannot be read at
+    all, warns and returns "" -- "I could not look" is not "it is wrong", and
+    reading it as the latter would strand every deployment exported before
+    stamping existed.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    from blastbox.host import rootfs_stamp as _rfs
+
+    try:
+        stamp = _rfs.read(rootfs)
+    except _rfs.RootfsStampError as exc:
+        _log.warning(
+            "rootfs %s carries no readable blastbox stamp (%s); booting it anyway. "
+            "Rebuild it with `blastbox build-images` so guest/host drift is caught "
+            "here instead of as a 300s timeout on every warm job.",
+            rootfs,
+            exc,
+        )
+        return ""
+    except Exception as exc:  # noqa: BLE001 - never fail the tier on a diagnostic
+        _log.warning("could not read the rootfs stamp on %s: %s", rootfs, exc)
+        return ""
+
+    try:
+        host = version("blastbox")
+    except PackageNotFoundError:  # pragma: no cover
+        return ""
+    complaint = _rfs.compare_to_host(stamp, host)
+    if complaint:
+        return (
+            f"{rootfs}: {complaint} Rebuild the rootfs with `blastbox build-images` "
+            f"(the stamp says image={stamp.image or '?'} "
+            f"exported_at={stamp.exported_at or '?'})."
+        )
+    _log.info(
+        "rootfs %s guest blastbox %s matches this host", rootfs, stamp.blastbox_version
+    )
+    return ""
+
+
 def firecracker_available(cfg: FCConfig | None = None) -> bool:
     """Return True iff all FC prerequisites are present on this host.
 
@@ -384,6 +430,21 @@ def firecracker_available(cfg: FCConfig | None = None) -> bool:
         # Rootfs
         if not cfg.fc_rootfs or not Path(cfg.fc_rootfs).is_file():
             _log.debug("firecracker_available=False: rootfs %r not found", cfg.fc_rootfs)
+            return False
+
+        # Guest/host agreement. The rootfs EXISTING says nothing about whether the
+        # guest inside it can talk to this host: that is precisely the state three
+        # engines were in on toolz2 for two months, booting fine and timing out
+        # every job at 300s because the guest was a different blastbox.
+        #
+        # Severity is split deliberately. A rootfs with NO stamp predates this
+        # check -- refusing it would take every existing deployment offline on
+        # upgrade -- so it warns and is allowed. A rootfs that DOES carry a stamp
+        # and disagrees with this host is a definite fault with a known remedy,
+        # and failing the tier here costs one log line instead of 300s per job.
+        problem = rootfs_guest_problem(cfg.fc_rootfs)
+        if problem:
+            _log.error("firecracker_available=False: %s", problem)
             return False
 
         # Version (probe LAST — only spawn the subprocess once the cheap checks pass).

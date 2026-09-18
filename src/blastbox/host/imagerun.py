@@ -38,6 +38,8 @@ from pathlib import Path, PurePosixPath
 
 from blastbox.host import images as _images
 from blastbox.host.images import ImageSpec, Plan, RootfsSpec
+from blastbox.host import rootfs_stamp as _rootfs_stamp
+from blastbox.host.stamp import git_revision as _stamp_git_revision
 from blastbox.host.stamp import StampError
 from blastbox.host.stamp import repo_digest_ref as _repo_digest_ref
 from blastbox.host.stamp import build_args as _stamp_flags
@@ -1330,6 +1332,33 @@ class _Staged:
     published_identity: str = ""
 
 
+
+def _blastbox_version() -> str:
+    """The blastbox this exporter is running, as the guest will report it.
+
+    Read from the INSTALLED distribution, like `doctor` does: a dev wheel
+    carries a PEP 440 local suffix and that suffix is the point.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("blastbox")
+    except PackageNotFoundError:  # pragma: no cover - blastbox is always installed here
+        return ""
+
+
+def _source_revision(plan: "Plan") -> str:
+    """The engine repo revision, or "" when the tree is not a checkout.
+
+    Never raises: the stamp is diagnostic, and a rootfs that records no revision
+    is strictly better than an export that failed because it could not find one.
+    The build's own stamping already refuses an unrecorded revision.
+    """
+    try:
+        return _stamp_git_revision(plan.root)
+    except Exception:  # noqa: BLE001 - diagnostic only
+        return ""
+
 def stage_rootfs(
     plan: Plan,
     spec: RootfsSpec,
@@ -1419,6 +1448,22 @@ def stage_rootfs(
         _normalize_root(staging, priv, run)
         _check_requires(staging, spec, image)
         _check_no_setuid(staging, spec, image, priv, run)
+        # AFTER the audits and BEFORE the filesystem: the stamp describes a tree
+        # that has already been checked, and `docker export` drops image config
+        # so a label here would not survive. This is the only record that
+        # survives into the thing a warm tier actually boots.
+        _rootfs_stamp.write_into_tree(
+            staging,
+            _rootfs_stamp.RootfsStamp(
+                blastbox_version=_blastbox_version(),
+                image=image,
+                image_id=verified_id,
+                revision=_source_revision(plan),
+                exported_at=_rootfs_stamp.now_iso(),
+            ),
+            priv=priv,
+            run=run,
+        )
 
         staged_size = 0
         if spec.kind == "dir":
