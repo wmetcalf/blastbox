@@ -38,6 +38,24 @@
   1.1.1.1 and reported the site's egress address. So the probe works, and this network
   does not carry it.
 
+  HOW THE ISOLATION IS ENFORCED, measured rather than assumed (genesis, libvirt 11.1.0):
+  libvirt installs NO FORWARD RULES AT ALL for this bridge. `iptables -S FORWARD | grep
+  bb-virbr0` is empty. Isolation here is the ABSENCE of a path, not the presence of a
+  DROP — which is the same property the container tier gets from an internal bridge, and
+  the reason a dead tunnel is a dead route rather than a rule someone can delete.
+
+  THAT HAS ONE CONSEQUENCE WORTH STATING, because a reader will otherwise assume a DROP:
+  anything that SUPPLIES a path gets traffic out. Verified on the same host — a worker on
+  this network has no internet, and after the rooter's host-side source routing is applied
+  (`ip rule from <worker> lookup <table>` + a default in that table + MASQUERADE) the same
+  worker reaches the internet. That is BY DESIGN: the rooter is the governed path, and it
+  is how a tunnel-tier worker (openvpn/wireguard) reaches its endpoint from here. A review
+  round suspected the isolated default broke those workers; it does not.
+
+  It also means bb-isolated is not a defence against a stray host-side rule. It is the
+  default-deny floor; the FORWARD chains in blastbox.host.runtime.libvirt_egress are what
+  police a worker that has been given a path.
+
   Verify it does NOT forward:
       virsh net-dumpxml bb-isolated | grep -c '<forward'     # must print 0
 -->
