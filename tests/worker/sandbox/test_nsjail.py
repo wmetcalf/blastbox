@@ -831,7 +831,7 @@ class TestConfinementLostAfterAdmissionIsARefusal:
     def test_a_profile_that_disappears_stops_the_jobs(self, tmp_path, monkeypatch) -> None:
         from blastbox.errors import SandboxUnavailable
 
-        monkeypatch.delenv("BLASTBOX_WARN_ON_INSECURE", raising=False)
+        monkeypatch.delenv("BLASTBOX_ALLOW_CONFINEMENT_LOSS", raising=False)
         state = {"on": True}
         sb = self._sb(tmp_path, monkeypatch, state)
         assert sb._armed_at_admission is True
@@ -853,7 +853,7 @@ class TestConfinementLostAfterAdmissionIsARefusal:
             self, tmp_path, monkeypatch, caplog) -> None:
         import logging
 
-        monkeypatch.setenv("BLASTBOX_WARN_ON_INSECURE", "1")
+        monkeypatch.setenv("BLASTBOX_ALLOW_CONFINEMENT_LOSS", "1")
         state = {"on": True}
         sb = self._sb(tmp_path, monkeypatch, state)
         state["on"] = False
@@ -880,3 +880,31 @@ class TestConfinementLostAfterAdmissionIsARefusal:
         state["on"] = False
         with pytest.raises(SandboxUnavailable, match="was enforcing"):
             sb.run(SandboxRequest(argv=["/usr/bin/true"]))
+
+
+def test_the_dispatchers_blanket_leniency_does_not_switch_off_the_regression_guard(
+        tmp_path, monkeypatch) -> None:
+    """A control that is disabled everywhere the fleet runs is not a control.
+
+    `BLASTBOX_WARN_ON_INSECURE=1` is set automatically by the dispatcher for every runsc
+    worker -- for an unrelated reason (gVisor virtualises /proc, so the worker cannot see
+    host-level hardening that IS applied) -- and this PR adds it to the warm/snapshot tier
+    too. If the confinement-regression refusal honoured it, the refusal would exist only on
+    bare metal, which is the deployment tier this repo treats as the fallback.
+    """
+    import blastbox.worker.sandbox.nsjail as mod
+    from blastbox.errors import SandboxUnavailable
+
+    monkeypatch.setenv("BLASTBOX_WARN_ON_INSECURE", "1")
+    monkeypatch.delenv("BLASTBOX_ALLOW_CONFINEMENT_LOSS", raising=False)
+    state = {"on": True}
+    monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
+    monkeypatch.setattr(mod, "_supports_proc_rw", lambda _p: True)
+    monkeypatch.setattr(mod.NsjailSandbox, "_apparmor_enforcing_now", lambda self: state["on"])
+    nsjail = tmp_path / "nsjail"
+    nsjail.write_text(_FAKE_NSJAIL)
+    nsjail.chmod(0o755)
+    sb = mod.NsjailSandbox(nsjail_path=str(nsjail))
+    state["on"] = False
+    with pytest.raises(SandboxUnavailable, match="was enforcing"):
+        sb.run(SandboxRequest(argv=["/usr/bin/true"]))

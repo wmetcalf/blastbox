@@ -335,8 +335,13 @@ class BubblewrapSandbox:
         /sys" into a worker that refuses every job, which would be a worse outage than the
         one it prevents.
 
-        `BLASTBOX_WARN_ON_INSECURE=1` downgrades it to a warning, the same knowing opt-out
-        that governs the rest of the security self-check.
+        The override is DELIBERATELY not `BLASTBOX_WARN_ON_INSECURE`. That variable is set
+        automatically by the dispatcher for every runsc worker (`host/runtime/docker.py`, and
+        the warm/snapshot tier as of this PR) for an unrelated reason -- gVisor virtualises
+        /proc, so a worker cannot observe host-level hardening flags that ARE applied -- so
+        honouring it here would leave this control switched off everywhere the fleet actually
+        runs, and on only where nobody does. `BLASTBOX_ALLOW_CONFINEMENT_LOSS=1` is the
+        knowing opt-out, and it has to be set by someone who means this.
         """
         if not self._armed_at_admission or self.apparmor_active:
             return
@@ -345,8 +350,8 @@ class BubblewrapSandbox:
             f"this backend was admitted and is not now -- refusing to run unconfined on a "
             f"backend that was selected as confined"
         )
-        if _env_truthy("BLASTBOX_WARN_ON_INSECURE"):
-            _log.warning("%s (allowed by BLASTBOX_WARN_ON_INSECURE)", msg)
+        if _env_truthy("BLASTBOX_ALLOW_CONFINEMENT_LOSS"):
+            _log.warning("%s (allowed by BLASTBOX_ALLOW_CONFINEMENT_LOSS)", msg)
             return
         raise SandboxUnavailable(msg)
 
