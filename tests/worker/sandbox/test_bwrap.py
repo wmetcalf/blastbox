@@ -889,3 +889,60 @@ class TestTheProbeCarriesTheSeccompFilterAndItsFileDescriptor:
         for fd in grabbed:
             with pytest.raises(OSError):
                 os.fstat(fd)                      # every probe closed its own
+
+
+def test_the_production_launch_passes_the_seccomp_descriptor_too(tmp_path, monkeypatch) -> None:
+    """The PROBE's fd wiring is now pinned; `run()` builds the same memfd the same way and had
+    no local coverage at all.
+
+    Instrumenting `os.memfd_create` across the whole sandbox suite recorded four calls, every
+    one of them the probe's -- so on any host without python3-seccomp (this one, and the CI
+    `test` job) the production launch path was entirely unexecuted, and a dropped `pass_fds`
+    there would surface only as `bwrap: Can't read seccomp data` on real detonations. That is
+    the blind spot that already cost one CI round, left open on the hotter path
+    (claude-code-review lens, round 5 of #177).
+    """
+    import os
+
+    import blastbox.worker.sandbox.bwrap as bw
+    from blastbox.worker.sandbox.base import SandboxRequest
+
+    fake = tmp_path / "bwrap"
+    fake.write_text("#!/bin/sh\nexit 0\n")
+    fake.chmod(0o755)
+    sb = bw.BubblewrapSandbox(bwrap_path=str(fake))
+    sb._seccomp_bpf = b"\xde\xad\xbe\xef"          # synthesised: no python3-seccomp here
+    sb._seccomp_active = True
+
+    seen: dict = {}
+
+    class _Popen:
+        def __init__(self, argv, **kw):
+            seen["argv"] = argv
+            seen["pass_fds"] = kw.get("pass_fds", ())
+            fd = seen["pass_fds"][0] if seen["pass_fds"] else None
+            if fd is not None:
+                os.lseek(fd, 0, os.SEEK_SET)
+                seen["contents"] = os.read(fd, 4)
+            self.returncode = 0
+            self.pid = 4242
+
+        def communicate(self, timeout=None):
+            return (b"", b"")
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(bw.subprocess, "Popen", _Popen)
+    sb.run(SandboxRequest(argv=["/usr/bin/true"]))
+
+    assert "--seccomp" in seen["argv"], "the production launch ran an UNFILTERED bwrap"
+    assert seen["pass_fds"], "the --seccomp fd was never passed to the child"
+    assert seen["contents"] == b"\xde\xad\xbe\xef"
+    idx = seen["argv"].index("--seccomp")
+    assert seen["argv"][idx + 1] == str(seen["pass_fds"][0]), (
+        "the argv names a different fd from the one passed"
+    )

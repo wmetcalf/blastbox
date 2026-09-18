@@ -37,6 +37,11 @@ _PROFILES = "/sys/kernel/security/apparmor/profiles"
 # point is that the window is BOUNDED rather than the life of the worker.
 _PROOF_TTL_S = 30.0
 
+# A probe that could not RUN is cached far more briefly: long enough to stop a storm of 60s
+# launches (six per `insecurity_reasons` + `secure` read, measured), short enough that the
+# backend recovers on its own the moment probes work again.
+_TRANSIENT_TTL_S = 2.0
+
 # The proof needs something that can print a file. /usr/bin FIRST: on a merged-/usr host
 # (/bin -> usr/bin, which is every current Debian/Ubuntu) the kernel resolves the exec to
 # /usr/bin/cat and that is the path AppArmor mediates -- so a remedy naming `/bin/cat` sends the
@@ -209,18 +214,21 @@ class AppArmorProofMixin:
     # The contract a host class must satisfy. Declared rather than implied so the type checker
     # holds both sides of the seam -- the duplication this mixin replaces drifted precisely
     # because nothing checked that the two copies still fit their classes.
+    # What the HOST must provide (no default -- backend facts the mixin cannot invent):
     name: str
     _aa_exec: str | None
     _apparmor_profile: str
-    _binary_present: bool
-    _apparmor_last_seen: bool | None
-    _proof: tuple[bool, float] | None
-    _warned_unprovable: bool
-    _suspended_for_diagnosis: bool
-    _armed_at_admission: bool | None
 
-    # Overridden per backend only where the answer genuinely differs.
-    _apparmor_log_prefix = "sandbox"
+    # What the MIXIN owns, with class-level defaults. Annotation-only was a landmine: these are
+    # read by a property that can launch a jail, so a host class that sets them late -- or a
+    # third backend that does not know it must -- raised AttributeError out of a security check,
+    # which is exactly what happened once already. Defaults make that unrepeatable
+    # (claude-code-review lens, round 5 of #177).
+    _apparmor_last_seen: bool | None = None
+    _proof: tuple[bool, float, float] | None = None
+    _warned_unprovable: bool = False
+    _suspended_for_diagnosis: bool = False
+    _armed_at_admission: bool | None = None
 
     def _apparmor_enforcing_now(self) -> bool:
         raise NotImplementedError
@@ -272,8 +280,8 @@ class AppArmorProofMixin:
             return None
         if out.returncode != 0:
             _log.warning(
-                "apparmor_attach_probe_failed rc=%s stderr=%s",
-                out.returncode, out.stderr.strip()[-200:],
+                "apparmor_attach_probe_failed backend=%s rc=%s stderr=%s",
+                self.name, out.returncode, out.stderr.strip()[-200:],
             )
             return False
         return True
@@ -300,12 +308,12 @@ class AppArmorProofMixin:
         try:
             out = self._run_probe(req)
         except (OSError, subprocess.SubprocessError) as exc:
-            _log.warning("apparmor_attachment_unprovable reason=%s", exc)
+            _log.warning("apparmor_attachment_unprovable backend=%s reason=%s", self.name, exc)
             return None
         if out.returncode != 0:
             _log.warning(
-                "apparmor_attachment_unprovable rc=%s stderr=%s",
-                out.returncode, out.stderr.strip()[-200:],
+                "apparmor_attachment_unprovable backend=%s rc=%s stderr=%s",
+                self.name, out.returncode, out.stderr.strip()[-200:],
             )
             return None
         return out.stdout.strip()
@@ -340,7 +348,7 @@ class AppArmorProofMixin:
         the TTL produced a cache that was expired when written), on the monotonic clock, which
         cannot be stepped backwards.
         """
-        if self._proof is not None and time.monotonic() - self._proof[1] < _PROOF_TTL_S:
+        if self._proof is not None and time.monotonic() - self._proof[1] < self._proof[2]:
             return self._proof[0]
 
         got = self.prove_apparmor_attachment()
@@ -349,12 +357,12 @@ class AppArmorProofMixin:
             ok = name.strip() == self._apparmor_profile and mode.startswith(("enforce", "kill"))
             if not ok:
                 _log.warning(
-                    "apparmor_assertion_disproved profile=%s child_reports=%r "
+                    "apparmor_assertion_disproved backend=%s profile=%s child_reports=%r "
                     "note=asserted via BLASTBOX_APPARMOR_PROFILES but the kernel disagrees; "
                     "no profile is attached",
-                    self._apparmor_profile, got,
+                    self.name, self._apparmor_profile, got,
                 )
-            self._proof = (ok, time.monotonic())
+            self._proof = (ok, time.monotonic(), _PROOF_TTL_S)
             return ok
 
         attaches = self._apparmor_attaches_at_all()
@@ -367,32 +375,42 @@ class AppArmorProofMixin:
             # alternative -- refusing every job because one fork failed -- is the worse error.
             attaches = self._apparmor_attaches_at_all()
         if attaches is None:
-            if self._proof is not None:
-                return self._proof[0]
+            # TRANSIENT, twice. We know NOTHING about this profile -- not that it is absent, not
+            # that it is enforcing -- so this is the one branch that must not fall back on the
+            # operator's word. Before the round-4 refactor an exception here answered False and
+            # the backend reported `apparmor_missing`; the refactor turned it into "trust the
+            # assertion", so a host whose proof jail could not launch reported `secure = True`
+            # and attached `--proc_rw` on the strength of an environment variable that was never
+            # measured (claude-code-review lens, round 5 of #177 -- reproduced: reasons [],
+            # secure True, six 60s probes, nothing cached). Back to fail-closed.
+            #
+            # Cached only for `_TRANSIENT_TTL_S`, not the verdict TTL: long enough to stop the
+            # probe storm, short enough that the backend re-arms itself the moment probes work.
             self._warn_once_unprovable(
-                "apparmor_proof_unmeasurable profile=%s "
-                "note=the probe failed transiently twice and there is no earlier verdict; "
-                "the assertion stands UNVERIFIED for now and will be re-measured"
-                % self._apparmor_profile
+                "apparmor_proof_unmeasurable backend=%s profile=%s "
+                "note=the probe failed transiently twice; confinement CANNOT be confirmed, so "
+                "this backend reports apparmor_missing until a probe succeeds"
+                % (self.name, self._apparmor_profile)
             )
-            return True
+            self._proof = (False, time.monotonic(), _TRANSIENT_TTL_S)
+            return False
         if not attaches:
             _log.warning(
-                "apparmor_assertion_disproved profile=%s "
+                "apparmor_assertion_disproved backend=%s profile=%s "
                 "note=the profile cannot be attached at all (absent, or it denies the "
                 "documented probe binary); no profile is attached",
-                self._apparmor_profile,
+                self.name, self._apparmor_profile,
             )
-            self._proof = (False, time.monotonic())
+            self._proof = (False, time.monotonic(), _PROOF_TTL_S)
             return False
 
         self._warn_once_unprovable(
-            "apparmor_assertion_unprovable profile=%s "
+            "apparmor_assertion_unprovable backend=%s profile=%s "
             "note=the in-jail proof could not run (the profile denies %s); the assertion "
             "stands unverified. Permit it to have the assertion checked."
-            % (self._apparmor_profile, _PROOF_READER or "a file reader")
+            % (self.name, self._apparmor_profile, _PROOF_READER or "a file reader")
         )
-        self._proof = (True, time.monotonic())
+        self._proof = (True, time.monotonic(), _PROOF_TTL_S)
         return True
 
     def _warn_once_unprovable(self, msg: str) -> None:
@@ -445,6 +463,16 @@ class AppArmorProofMixin:
         runs, and on only where nobody does. `BLASTBOX_ALLOW_CONFINEMENT_LOSS=1` is the
         knowing opt-out, and it has to be set by someone who means this.
         """
+        if self._suspended_for_diagnosis:
+            # A probe, not a job. `_smoketest` suspends the profile deliberately to tell
+            # "your profile denies the probe binary" from "this backend does not work".
+            #
+            # CHECKED FIRST, before the baseline branch below: a suspended launch reports
+            # apparmor_active False by construction, so letting it define the baseline would
+            # record "never confined" and disarm the guard for the life of the worker. No caller
+            # reaches that order today; the guard's own reason for existing says it must not
+            # depend on that (claude-code-review lens, round 5 of #177).
+            return
         if self._armed_at_admission is None:
             # First launch of a backend nobody admitted through the selector (an engine building
             # one directly). This is its baseline, measured with the same yardstick the guard
@@ -452,10 +480,6 @@ class AppArmorProofMixin:
             self._armed_at_admission = (
                 self.apparmor_active if attached is None else attached
             )
-            return
-        if self._suspended_for_diagnosis:
-            # A probe, not a job. `_smoketest` suspends the profile deliberately to tell
-            # "your profile denies the probe binary" from "this backend does not work".
             return
         if not self._armed_at_admission or (
             self.apparmor_active if attached is None else attached
@@ -492,12 +516,15 @@ class AppArmorProofMixin:
         # `_ProfileDeniesProbe` becomes unreachable from a real backend: the
         # demote-to-container path reopens, and the two round-1 fixes cancel each other out
         # (claude-security lens, round 2 of #177).
+        was_suspended = self._suspended_for_diagnosis
         self._suspended_for_diagnosis = True
         try:
             yield
         finally:
             self._aa_exec = saved
-            self._suspended_for_diagnosis = False
+            # RESTORE, not clear: a nested suspension used to leave the outer one unprotected
+            # (claude-code-review lens, round 5 of #177).
+            self._suspended_for_diagnosis = was_suspended
 
     @property
     def apparmor_active(self) -> bool:

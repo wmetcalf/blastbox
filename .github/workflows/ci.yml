@@ -161,8 +161,31 @@ jobs:
         run: |
           set -o pipefail
           .venv/bin/pytest -q -rs tests/worker/sandbox/ | tee /tmp/sandbox.txt
-          if grep -E "SKIPPED.*(not installed|not usable|probe failed)" /tmp/sandbox.txt; then
+          if grep -E "SKIPPED.*(not installed|not usable|probe failed|no --proc_rw|AppArmor not enabled|no file reader|did not arm)" /tmp/sandbox.txt; then
             echo "::error::a sandbox backend was not exercised -- see the skips above" >&2
+            exit 1
+          fi
+          # The END-TO-END test by name. The pattern above is a denylist of known skip reasons,
+          # and the skips this job most needs to refuse are the ones a FUTURE change introduces:
+          # the one test that runs the real product argv and requires the child to report the
+          # attached profile can skip for "this nsjail build has no --proc_rw" or "AppArmor not
+          # enabled", and the job would have gone green having never proven the #160 mechanism
+          # at all (claude-code-review lens, round 5 of #177). Require it to have RUN.
+          .venv/bin/pytest -q -rA \
+            tests/worker/sandbox/test_nsjail.py::test_the_product_argv_really_transitions_the_child \
+            | tee /tmp/e2e.txt
+          grep -qE "^PASSED" /tmp/e2e.txt || {
+            echo "::error::the end-to-end AppArmor transition test did not run" >&2; exit 1; }
+      - name: Pytest (shipped AppArmor profiles compile)
+        # tests/deploy/ runs in the `test` job with no -rs and no tripwire, so the two tests that
+        # compile every shipped profile would vanish without a trace if the runner image ever
+        # dropped apparmor-utils -- and a syntax error in the child profile would then reach an
+        # operator instead of CI (claude-code-review lens, round 5 of #177).
+        run: |
+          set -o pipefail
+          .venv/bin/pytest -q -rs tests/deploy/ | tee /tmp/deploy.txt
+          if grep -E "SKIPPED.*apparmor_parser not installed" /tmp/deploy.txt; then
+            echo "::error::the shipped profiles were never compiled" >&2
             exit 1
           fi
 

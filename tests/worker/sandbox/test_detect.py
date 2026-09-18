@@ -656,8 +656,12 @@ def test_the_diagnosis_survives_the_regression_guard_on_a_REAL_backend(monkeypat
     monkeypatch.setattr(nj, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
     monkeypatch.setattr(nj, "_supports_proc_rw", lambda _p: True)
     sb = NsjailSandbox(nsjail_path="/bin/sh")
-    sb.note_admitted(armed=True)          # admitted as confined, which is the premise
-    assert sb._armed_at_admission and sb.apparmor_active
+    # NO note_admitted here: production runs _smoketest BEFORE admission (detect.py), so the
+    # baseline is still unset throughout the probe and the mixin's first-launch branch is what
+    # runs. Pre-arming it here tested an order the selector never produces
+    # (claude-code-review lens, round 5 of #177).
+    assert sb._armed_at_admission is None
+    assert sb.apparmor_active
 
     def _run(self, req):
         # Confined: the profile denies the probe. Suspended: it runs.

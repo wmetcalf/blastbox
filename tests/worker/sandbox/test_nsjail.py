@@ -606,7 +606,7 @@ def test_the_two_backends_apply_and_report_apparmor_the_same_way(tmp_path, monke
     policy.write_text("POLICY ok { ERRNO(1) { } } USE ok DEFAULT ALLOW\n")
 
     for mod in (nj, bw):
-        monkeypatch.setattr(mod, "_find_aa_exec", lambda: None, raising=False)
+        monkeypatch.setattr(mod, "_find_aa_exec", lambda: None)
     monkeypatch.setattr(nj, "_supports_proc_rw", lambda _p: True)
     without = [
         nj.NsjailSandbox(nsjail_path=str(fake / "nsjail"), seccomp_policy=policy),
@@ -618,8 +618,8 @@ def test_the_two_backends_apply_and_report_apparmor_the_same_way(tmp_path, monke
         assert "aa-exec" not in " ".join(sb._build_argv(SandboxRequest(argv=["/bin/true"])))
 
     for mod in (nj, bw):
-        monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec", raising=False)
-        monkeypatch.setattr(mod, "profile_loaded", lambda _n: True, raising=False)
+        monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
+        monkeypatch.setattr(mod, "profile_loaded", lambda _n: True)
         monkeypatch.setattr(type(without[0]) if mod is nj else type(without[1]),
                             "_apparmor_enforcing_now", lambda self: True)
     with_profile = [
@@ -881,7 +881,7 @@ class TestConfinementLostAfterAdmissionIsARefusal:
 
         monkeypatch.delenv("BLASTBOX_WARN_ON_INSECURE", raising=False)
         state = {"on": True}
-        monkeypatch.setattr(bw, "_find_aa_exec", lambda: "/usr/sbin/aa-exec", raising=False)
+        monkeypatch.setattr(bw, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
         monkeypatch.setattr(bw.BubblewrapSandbox, "_apparmor_enforcing_now",
                             lambda self: state["on"])
         bwrap = tmp_path / "bwrap"
@@ -1397,3 +1397,99 @@ def test_a_single_transient_probe_failure_is_retried_before_it_is_believed(
         "the recovered probe produced no verdict to cache"
     )
     assert subprocess is not None
+
+
+class TestAProbeThatCannotRunFailsClosed:
+    """The regression my own round-4 change introduced, and the fix.
+
+    Before the mixin refactor, an exception in the attach probe answered False: the backend
+    reported `apparmor_missing` and the selector rejected it. The refactor turned that into
+    "transient", and transient fell back to the operator's assertion -- so a host whose proof
+    jail could not launch at all reported `secure = True` and attached `--proc_rw` (a writable
+    /proc/self/mem for the child) on the strength of an environment variable that had never been
+    measured. Reproduced: `reasons [] secure True`, with SIX 60s probe launches for one read and
+    nothing cached (claude-code-review lens, round 5 of #177).
+    """
+
+    def _sb(self, tmp_path, monkeypatch, fail):
+        import blastbox.worker.sandbox.apparmor as aa
+        import blastbox.worker.sandbox.nsjail as mod
+
+        monkeypatch.setenv("BLASTBOX_APPARMOR_PROFILES", "blastbox-sandbox")
+        monkeypatch.setattr(aa, "_PROFILES", "/nonexistent")     # securityfs unreadable
+        monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
+        monkeypatch.setattr(mod, "_supports_proc_rw", lambda _p: True)
+        calls = {"n": 0}
+
+        def _run(argv, **kw):
+            calls["n"] += 1
+            return fail(argv, calls["n"])
+
+        monkeypatch.setattr(aa.subprocess, "run", _run)
+        nsjail = tmp_path / "nsjail"
+        nsjail.write_text(_FAKE_NSJAIL)
+        nsjail.chmod(0o755)
+        return mod.NsjailSandbox(nsjail_path=str(nsjail)), calls
+
+    def test_an_unlaunchable_probe_reports_apparmor_missing(self, tmp_path, monkeypatch) -> None:
+        import subprocess
+
+        def _always_transient(argv, n):
+            raise subprocess.TimeoutExpired(argv, 60)
+
+        sb, _ = self._sb(tmp_path, monkeypatch, _always_transient)
+        assert sb.apparmor_active is False
+        assert "apparmor_missing" in sb.insecurity_reasons
+        assert sb.secure is False
+        assert "--proc_rw" not in sb._build_argv(SandboxRequest(argv=["/usr/bin/true"])), (
+            "/proc was widened for confinement that was never measured"
+        )
+
+    def test_the_probe_storm_is_bounded(self, tmp_path, monkeypatch) -> None:
+        """Answering without caching turned a bounded wrong answer into an unbounded slow one:
+        each read paid up to 60s per launch, and the next read repeated it."""
+        import subprocess
+
+        def _always_transient(argv, n):
+            raise subprocess.TimeoutExpired(argv, 60)
+
+        sb, calls = self._sb(tmp_path, monkeypatch, _always_transient)
+        sb.apparmor_active
+        after_first = calls["n"]
+        for _ in range(5):
+            sb.apparmor_active
+        assert calls["n"] == after_first, (
+            f"{calls['n'] - after_first} extra probe launches for five reads inside the TTL"
+        )
+
+    def test_it_re_arms_itself_when_probes_work_again(self, tmp_path, monkeypatch) -> None:
+        """The short TTL is the point: an outage must not leave the backend disarmed once the
+        host recovers."""
+        import subprocess
+        from types import SimpleNamespace
+
+        import blastbox.worker.sandbox.apparmor as aa
+
+        state = {"broken": True}
+
+        def _flaky(argv, n):
+            if state["broken"]:
+                raise subprocess.TimeoutExpired(argv, 60)
+            ok = "blastbox-sandbox (enforce)\n" if "attr/current" in " ".join(argv) else ""
+            return SimpleNamespace(returncode=0, stdout=ok, stderr="")
+
+        sb, _ = self._sb(tmp_path, monkeypatch, _flaky)
+        assert sb.apparmor_active is False
+
+        state["broken"] = False
+        clock = {"t": aa.time.monotonic() + aa._TRANSIENT_TTL_S + 0.1}
+        monkeypatch.setattr(aa.time, "monotonic", lambda: clock["t"])
+        assert sb.apparmor_active is True
+        assert "apparmor_missing" not in sb.insecurity_reasons
+
+    def test_the_short_ttl_is_much_shorter_than_a_verdict(self) -> None:
+        import blastbox.worker.sandbox.apparmor as aa
+
+        assert aa._TRANSIENT_TTL_S < aa._PROOF_TTL_S / 5, (
+            "an unmeasurable probe is cached nearly as long as a real verdict"
+        )

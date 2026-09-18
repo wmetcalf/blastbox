@@ -149,7 +149,6 @@ class BubblewrapSandbox(AppArmorProofMixin):
     """
 
     name = "bwrap"
-    _apparmor_log_prefix = "bwrap"
 
     def __init__(
         self,
@@ -178,9 +177,6 @@ class BubblewrapSandbox(AppArmorProofMixin):
         # here, and both constructors read it while deciding what to log -- so uninitialised
         # state crashed construction outright on any host with BLASTBOX_APPARMOR_PROFILES set
         # (found by running it).
-        self._suspended_for_diagnosis = False
-        self._proof: tuple[bool, float] | None = None
-        self._warned_unprovable = False
         self._aa_exec: str | None = _find_aa_exec()
         self._apparmor_last_seen: bool | None = None
         # NOT apparmor_active here. That property is not a plain accessor: on the asserted path

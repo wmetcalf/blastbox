@@ -157,7 +157,6 @@ class NsjailSandbox(AppArmorProofMixin):
     """
 
     name = "nsjail"
-    _apparmor_log_prefix = "nsjail"
 
     def __init__(
         self,
@@ -193,9 +192,6 @@ class NsjailSandbox(AppArmorProofMixin):
         # here, and both constructors read it while deciding what to log -- so uninitialised
         # state crashed construction outright on any host with BLASTBOX_APPARMOR_PROFILES set
         # (found by running it).
-        self._suspended_for_diagnosis = False
-        self._proof: tuple[bool, float] | None = None
-        self._warned_unprovable = False
         self._aa_exec: str | None = _find_aa_exec()
         # A LOCAL, not an attribute: read once, on the next statement, and nothing else in the
         # repo touched it. A per-instance field that reads like a live capability flag but is
