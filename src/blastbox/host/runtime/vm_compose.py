@@ -26,6 +26,7 @@ provisioner scripts stay with the engine (e.g. the win-validator golden).
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import threading
 from collections.abc import Callable
@@ -115,6 +116,7 @@ class VmWorkerSpec:
     concurrent_ceiling: int = 16
     spawn_rate_limit: float = 1.0     # VM boots are heavy → throttle spawns
     sudo: bool = True
+    connect_uri: str = ""             # "" = inherit BLASTBOX_LIBVIRT_URI, else virsh's default
 
     # ---- construction ----
     @classmethod
@@ -200,6 +202,12 @@ class VmWorkerSpec:
             mac_prefix=self.mac_prefix,
             dhcp_server=self.dhcp_server,
             subnet_prefix=self.subnet_prefix,
+            # Spec wins over the environment, environment over virsh's default. A per-worker
+            # override matters on a host running more than one libvirt (measured: toolz3 has a
+            # root system instance serving the live network AND a leftover user-mode one).
+            connect_uri=(self.connect_uri
+                         or os.environ.get("BLASTBOX_LIBVIRT_URI", "").strip()
+                         or None),
             sudo=self.sudo,
             egress_policy=self.egress,
             exit_routing=self.routing,

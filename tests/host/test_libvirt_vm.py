@@ -678,3 +678,73 @@ def test_a_sub_second_claim_budget_declines_instead_of_rounding_up(monkeypatch):
     # a workable budget is passed through EXACTLY, not floored upward
     assert rt.is_alive_for_claim(slot, budget_s=3.0) is True
     assert seen == [3.0], f"budget was not passed through verbatim: {seen}"
+
+
+class TestTheLibvirtConnectionIsSayable:
+    """WHICH libvirt was previously unsayable.
+
+    `_virsh_argv` built `["virsh", ...]`, so blastbox could only ever reach whatever virsh
+    defaults to for the invoking user -- which is a property of who is running, not of the host.
+    Measured on toolz3: a root system libvirt owns and serves the live network, a leftover
+    user-mode libvirt owns /var/lib/libvirt, and virsh as the worker's user reaches neither
+    (`Failed to connect socket to '/var/run/libvirt/virtqemud-sock'`). There was no way to say
+    `qemu:///system`, `qemu:///session` or `qemu+ssh://host/system`.
+    """
+
+    def _cfg(self, **kw):
+        from blastbox.host.runtime.libvirt_vm import LibvirtVmConfig
+        base = dict(golden_base="/tmp/golden.qcow2")
+        base.update(kw)
+        return LibvirtVmConfig(**base)
+
+    def _runtime(self, cfg):
+        from blastbox.host.runtime.libvirt_vm import LibvirtVmRuntime
+        return LibvirtVmRuntime(cfg)
+
+    def test_the_uri_reaches_virsh(self) -> None:
+        rt = self._runtime(self._cfg(connect_uri="qemu+ssh://root@toolz3/system"))
+        argv = rt._virsh_argv("net-list", "--all")
+        assert "-c" in argv
+        assert argv[argv.index("-c") + 1] == "qemu+ssh://root@toolz3/system"
+
+    def test_the_uri_precedes_the_subcommand(self) -> None:
+        """virsh reads its own options only before the subcommand; a URI after it is passed to
+        the subcommand instead and silently ignored as a connection."""
+        rt = self._runtime(self._cfg(connect_uri="qemu:///session"))
+        argv = rt._virsh_argv("net-dumpxml", "bb-isolated")
+        assert argv.index("-c") < argv.index("net-dumpxml")
+
+    def test_no_uri_changes_nothing(self) -> None:
+        """A host that was working before this knob existed must keep working untouched."""
+        rt = self._runtime(self._cfg())
+        assert "-c" not in rt._virsh_argv("version")
+
+    def test_every_virsh_call_carries_it(self, monkeypatch) -> None:
+        """Threaded through `_virsh_argv`, not sprinkled at call sites: the runtime makes dozens
+        of virsh calls and one that forgot the URI would talk to a DIFFERENT libvirt."""
+        rt = self._runtime(self._cfg(connect_uri="qemu:///system"))
+        seen = []
+
+        def _capture(argv, **kw):
+            seen.append(argv)
+            from types import SimpleNamespace
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        import blastbox.host.runtime.libvirt_vm as mod
+
+        monkeypatch.setattr(mod, "_run", _capture)
+        rt._virsh("net-list")
+        rt._virsh("domiflist", "dom0")
+        rt._virsh("net-dumpxml", "bb-isolated")
+        assert seen, "no virsh calls were made"
+        for argv in seen:
+            assert "-c" in argv and argv[argv.index("-c") + 1] == "qemu:///system", argv
+
+    def test_the_environment_is_not_polluted(self) -> None:
+        """LIBVIRT_DEFAULT_URI would be inherited by everything else the host runs; this must
+        change only what blastbox talks to."""
+        import os
+
+        rt = self._runtime(self._cfg(connect_uri="qemu:///session"))
+        rt._virsh_argv("version")
+        assert "LIBVIRT_DEFAULT_URI" not in os.environ
