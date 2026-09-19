@@ -105,8 +105,16 @@ def resolve_profile(explicit: str | None = None) -> str:
 
 
 KERNEL = "kernel"
+HOST_OBSERVED = "host-observed"
 ASSERTED = "asserted"
 NONE = "none"
+
+# What the DISPATCHER saw when it launched this worker, as `<profile>:<mode>`. The dispatcher runs
+# on the host, where /sys/kernel/security/apparmor/profiles is readable; the worker does not.
+# Strictly better evidence than `BLASTBOX_APPARMOR_PROFILES`, which is a name a human typed and
+# cannot distinguish enforce from complain -- this carries the MODE the kernel reported. No new
+# trust: the dispatcher already chose the image, the runtime and the argv for this worker.
+OBSERVED_ENV = "BLASTBOX_APPARMOR_OBSERVED"
 
 
 def _env_truthy(name: str) -> bool:
@@ -127,7 +135,8 @@ def find_aa_exec() -> str | None:
 
 
 def profile_evidence(profile: str) -> str:
-    """WHERE the answer came from: :data:`KERNEL`, :data:`ASSERTED` or :data:`NONE`.
+    """WHERE the answer came from: :data:`KERNEL`, :data:`HOST_OBSERVED`, :data:`ASSERTED` or
+    :data:`NONE`, in descending order of how much it is worth.
 
     Not decoration. ``/sys/kernel/security/apparmor/profiles`` is root-only and a worker is
     not root, so on the deployment posture this mechanism is written for the kernel can NEVER
@@ -139,11 +148,22 @@ def profile_evidence(profile: str) -> str:
     Callers that are about to trade something for confinement can ask how the answer was
     reached and go and MEASURE it instead of believing it -- see
     ``Sandbox.prove_apparmor_attachment``.
+
+    :data:`HOST_OBSERVED` exists because the gap above is structural, not fixable in the worker:
+    the dispatcher runs on the host, where securityfs IS readable, so it can measure the mode and
+    hand the worker the answer. That replaces "an operator typed this name" with "the kernel
+    reported this mode", and it makes a complain-mode profile a positive DISPROOF on a host where
+    the worker itself could never have told.
     """
     try:
         with open(_PROFILES, encoding="utf-8", errors="surrogateescape") as fh:
             lines = fh.readlines()
     except (OSError, UnicodeDecodeError):
+        observed = _host_observed(profile)
+        if observed is not None:
+            # The host read the kernel. A mode it reports as NOT enforcing is a positive
+            # disproof, not a missing answer -- which an operator assertion can never be.
+            return HOST_OBSERVED if observed else NONE
         if profile in _asserted():
             _warn_asserted(profile)
             return ASSERTED
@@ -170,6 +190,42 @@ def profile_loaded(profile: str) -> bool:
     can be read) and for why the caller should care which of the two answered.
     """
     return profile_evidence(profile) != NONE
+
+
+def observed_mode(profile: str) -> str | None:
+    """The MODE the kernel reports for ``profile``, read from securityfs, or None.
+
+    For the DISPATCHER, which runs on the host and can read securityfs, to measure what the
+    worker cannot and pass it down via :data:`OBSERVED_ENV`. Returns the kernel's own word --
+    `enforce`, `kill`, `complain`, `unconfined`, `user` -- so the worker can tell "not enforcing"
+    from "unknown", which an operator assertion never allowed.
+    """
+    try:
+        with open(_PROFILES, encoding="utf-8", errors="surrogateescape") as fh:
+            lines = fh.readlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+    for line in lines:
+        name, sep, rest = line.strip().rpartition(" (")
+        if sep and name.strip() == profile:
+            return rest.rstrip().rstrip(")") or None
+    return None
+
+
+def _host_observed(profile: str) -> bool | None:
+    """What the dispatcher measured for THIS profile: True enforcing, False not, None unstated.
+
+    Parsed from ``BLASTBOX_APPARMOR_OBSERVED`` as ``<profile>:<mode>`` (comma-separated for
+    several). The mode vocabulary is the kernel's own, and the enforcing set is the one
+    :func:`_line_is_enforcing` already uses -- one definition of "counts as confinement", not two.
+    """
+    raw = os.environ.get(OBSERVED_ENV, "").strip()
+    for item in raw.split(","):
+        name, _, mode = item.strip().partition(":")
+        if name.strip() != profile:
+            continue
+        return mode.strip() in _ENFORCING_MODES
+    return None
 
 
 def _asserted() -> set[str]:
@@ -631,7 +687,11 @@ class AppArmorProofMixin:
         """
         if self._aa_exec is None or not self._apparmor_enforcing_now():
             return False
-        if profile_evidence(self._apparmor_profile) == ASSERTED:
+        if profile_evidence(self._apparmor_profile) in (ASSERTED, HOST_OBSERVED):
+            # A host observation carries the MODE the kernel reported, so it is far better
+            # evidence than a name a human typed -- but it is still the host's view of the
+            # HOST's profile table, not proof that THIS child got the profile. The in-jail
+            # proof supplies that, and it is cheap and TTL-bounded, so both go through it.
             # The only evidence is an environment variable, which cannot tell enforce from
             # complain. Measure it (TTL-bounded) instead of taking its word.
             return self.apparmor_attachment_is_believable()

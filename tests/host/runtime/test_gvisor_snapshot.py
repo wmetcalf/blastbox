@@ -1671,3 +1671,39 @@ def test_the_default_is_added_when_the_operator_says_nothing() -> None:
     env = _oci_config(cfg, Path("/tmp/x"), in_ro=True)["process"]["env"]
     hits = [e for e in env if e.startswith("BLASTBOX_WARN_ON_INSECURE=")]
     assert hits == ["BLASTBOX_WARN_ON_INSECURE=1"], hits
+
+
+def test_the_gvisor_tier_also_hands_down_the_measured_mode(monkeypatch) -> None:
+    """Both dispatcher-managed launchers, or the evidence is a property of which one you used.
+
+    That asymmetry has already cost this PR once: BLASTBOX_WARN_ON_INSECURE was set by docker.py
+    and not here, while the docs claimed "dispatcher-launched workers get it".
+    """
+    import blastbox.host.runtime.gvisor_snapshot as g
+    from blastbox.worker.sandbox.apparmor import OBSERVED_ENV
+
+    monkeypatch.setattr(g, "observed_mode", lambda _p: "enforce")
+    monkeypatch.setattr(g, "resolve_profile", lambda _x: "blastbox-sandbox")
+    env = _oci_config(_cfg(Path(tempfile.mkdtemp())), Path("/tmp/x"), in_ro=True)["process"]["env"]
+    assert f"{OBSERVED_ENV}=blastbox-sandbox:enforce" in env, env
+
+
+def test_an_operator_entry_still_wins_over_the_measurement(monkeypatch) -> None:
+    import blastbox.host.runtime.gvisor_snapshot as g
+    from blastbox.worker.sandbox.apparmor import OBSERVED_ENV
+
+    monkeypatch.setattr(g, "observed_mode", lambda _p: "enforce")
+    monkeypatch.setattr(g, "resolve_profile", lambda _x: "blastbox-sandbox")
+    cfg = _cfg(Path(tempfile.mkdtemp()), extra_env=[f"{OBSERVED_ENV}=blastbox-sandbox:complain"])
+    env = _oci_config(cfg, Path("/tmp/x"), in_ro=True)["process"]["env"]
+    hits = [e for e in env if e.startswith(f"{OBSERVED_ENV}=")]
+    assert hits == [f"{OBSERVED_ENV}=blastbox-sandbox:complain"], hits
+
+
+def test_nothing_is_claimed_when_nothing_can_be_measured(monkeypatch) -> None:
+    import blastbox.host.runtime.gvisor_snapshot as g
+    from blastbox.worker.sandbox.apparmor import OBSERVED_ENV
+
+    monkeypatch.setattr(g, "observed_mode", lambda _p: None)
+    env = _oci_config(_cfg(Path(tempfile.mkdtemp())), Path("/tmp/x"), in_ro=True)["process"]["env"]
+    assert not any(e.startswith(f"{OBSERVED_ENV}=") for e in env)

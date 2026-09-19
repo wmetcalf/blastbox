@@ -16,6 +16,12 @@ import subprocess
 import threading
 import time
 import uuid
+
+from blastbox.worker.sandbox.apparmor import (
+    OBSERVED_ENV,
+    observed_mode,
+    resolve_profile,
+)
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -371,6 +377,16 @@ def _oci_config(cfg: GvisorConfig, workdir: Path, *, in_ro: bool) -> dict:
     # #177).
     if not any(e.split("=", 1)[0] == _WARN_ON_INSECURE for e in env):
         env.append(f"{_WARN_ON_INSECURE}=1")
+
+    # The child profile's MODE, measured here on the host, for the same reason docker.py does it:
+    # inside the sandbox securityfs is unreadable, so the inner backends' only fallback is a name
+    # a human typed. The kernel's own word outranks that. Operator entries in extra_env still win
+    # (they were appended above, and this only fills an absent key).
+    if not any(e.split("=", 1)[0] == OBSERVED_ENV for e in env):
+        _child = resolve_profile(None)
+        _mode = observed_mode(_child)
+        if _mode:
+            env.append(f"{OBSERVED_ENV}={_child}:{_mode}")
     spec: dict = {
         "ociVersion": "1.0.0",
         "process": {

@@ -280,6 +280,20 @@ under a running worker would otherwise stay "active" for the life of that worker
 enforced anything. One extra jail launch per half-minute is noise next to a detonation; what
 matters is that the staleness window is bounded.
 
+### Better than the escape hatch: what the dispatcher measured
+
+A dispatcher-launched worker does not have to rely on the assertion below at all. The dispatcher
+runs on the host, where `/sys/kernel/security/apparmor/profiles` is readable, so it measures the
+child profile's mode at launch and passes it down as `BLASTBOX_APPARMOR_OBSERVED=<profile>:<mode>`
+(both launchers do this: `host/runtime/docker.py` and the gVisor warm/snapshot tier).
+
+That is strictly better evidence than a name a human typed, because it carries the kernel's own
+word: a profile the host sees in `complain` becomes a **disproof** in the worker, which an
+assertion could never express. It is still not proof that *this child* received the profile — the
+in-jail proof supplies that, and an observed profile goes through it exactly like an asserted one.
+
+Nothing to configure; it appears only when the dispatcher could actually read the kernel.
+
 ### The `BLASTBOX_APPARMOR_PROFILES` escape hatch (plural)
 
 On a host where the worker cannot read `/sys/kernel/security/apparmor/profiles`, assert what is
