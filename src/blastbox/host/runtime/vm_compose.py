@@ -45,6 +45,13 @@ _log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Image (the "build" half)
 # ---------------------------------------------------------------------------
+# DERIVED from ExitRouting's fields so the allowlist and the passthrough can never drift out of
+# sync with the dataclass (rule_priority_base was missed that way once). Module scope because it
+# is a constant: the dataclass does not gain fields at runtime, and computing it per call was
+# recomputing the same set for every egress block parsed.
+_ROUTING_KEYS = frozenset(ExitRouting.__dataclass_fields__)
+_ALLOWED_EGRESS_KEYS = frozenset({"exit", "egress_ports", "block_internal"}) | _ROUTING_KEYS
+
 @dataclass
 class VmImageSpec:
     """A golden qcow2 — prebuilt, or a recipe to bake one."""
@@ -140,8 +147,6 @@ class VmWorkerSpec:
             # egress instead of the intended policy. Fail closed like the malformed-value paths.
             # DERIVE the routing keys from ExitRouting's fields so the allowlist + passthrough can
             # never drift out of sync with the dataclass (e.g. rule_priority_base was missed before).
-            _ROUTING_KEYS = set(ExitRouting.__dataclass_fields__)
-            _ALLOWED_EGRESS_KEYS = {"exit", "egress_ports", "block_internal"} | _ROUTING_KEYS
             unknown = set(eg) - _ALLOWED_EGRESS_KEYS
             if unknown:
                 raise ValueError(f"{name}: unknown egress key(s) {sorted(unknown)} "
