@@ -245,3 +245,25 @@ def test_the_per_binary_profiles_still_declare_the_abi_their_rules_need(tmp_path
         text = (_PROFILE_DIR / name).read_text()
         assert "userns" in text, f"{name} no longer grants userns -- why does it exist?"
         assert "abi <abi/4.0>," in text, f"{name} needs abi 4.0 for its userns rule"
+
+
+def test_the_snake_case_rule_is_actually_enforced() -> None:
+    """AGENTS.md mandates snake_case and, until #168, nothing checked it -- the rule existed only
+    as prose a reviewer had to remember.
+
+    Pinned as a test rather than trusted to stay in pyproject.toml, because a `select` list is
+    exactly the kind of thing a later edit drops while tidying. The test exemption is asserted
+    too: the shouted words in test names are deliberate emphasis, and silently enforcing N802
+    there would rename ~70 tests to satisfy a linter by deleting information.
+    """
+    import tomllib
+
+    root = Path(__file__).resolve().parents[2]
+    with (root / "pyproject.toml").open("rb") as fh:
+        cfg = tomllib.load(fh)
+    selected = cfg["tool"]["ruff"]["lint"].get("extend-select", [])
+    assert "N802" in selected, "function names are no longer checked for snake_case"
+    assert "N806" in selected, "variable names are no longer checked for snake_case"
+
+    ignored = cfg["tool"]["ruff"]["lint"]["per-file-ignores"]["tests/**"]
+    assert "N802" in ignored, "the deliberate emphasis in test names lost its exemption"

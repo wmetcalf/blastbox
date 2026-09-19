@@ -112,8 +112,23 @@ markers = [
     "perf: performance benchmark gate; needs a benchmarkable host (skipped otherwise)",
 ]
 
+[tool.ruff.lint]
+# AGENTS.md mandates snake_case, and nothing enforced it (#168). N802 (function names) and N806
+# (variables in functions) are the codes that say exactly that; the rest of pep8-naming is opinion
+# this repo has not adopted and would churn deliberate names:
+#   * N818 wants every exception to end in `Error` -- `SandboxUnavailable`,
+#     `InsecureRuntimeRefused` and `DriftDetected` read better and were chosen.
+#   * N811/N812/N814/N817 are import-alias conventions, unrelated to the rule in AGENTS.md.
+# Selected additively so the default E/F set stays on.
+extend-select = ["N802", "N806"]
+
 [tool.ruff.lint.per-file-ignores]
+# The shouted words in test names are DELIBERATE emphasis and carry meaning --
+# `test_a_DECLARED_artifact_is_never_silently_skipped` says which half of the contract is under
+# test. Enforcing N802 here would rename ~70 tests to satisfy a linter by deleting information.
+# The rule applies to production code, which is where the AGENTS.md convention matters.
+"tests/**" = ["E402", "N802", "N806"]
 # E402 in tests is CORRECT, not debt. `pytest.importorskip("boto3")` has to run BEFORE the
 # imports it guards, otherwise the module raises at collection time on any machine without the
 # optional dependency instead of skipping. Moving those imports to the top would break the skip.
-"tests/**" = ["E402"]
+

@@ -114,7 +114,6 @@ class PoolConfig:
         #: they reach for it exactly when it hurts most: mid-incident. The internal default stands
         #: in instead. (Constructing WarmPool directly with 0 still means "no cooldown" -- the
         #: tests use it deliberately; this guards the ENV surface, which is what humans type.)
-        _ZERO_IS_NOT_OFF = {"BLASTBOX_POOL_MAINTAIN_INTERVAL_S"}
 
         def _float(key: str, default: float) -> float:
             raw = os.environ.get(key, "").strip()
@@ -233,6 +232,9 @@ class PoolConfig:
             raise ValueError("warm_size must be >= 0 and concurrent_ceiling >= 1")
         return cfg
 
+
+# Env knobs whose 0 means "use the default", not "off": see the note at the use site.
+_ZERO_IS_NOT_OFF = frozenset({"BLASTBOX_POOL_MAINTAIN_INTERVAL_S"})
 
 def select_runtime_by_name(
     name: str, *, warm_snapshot: bool = False, require_available: bool = True

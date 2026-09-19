@@ -1,6 +1,7 @@
 """Tests for blastbox.host.runtime.docker — runtime selection and argv builder."""
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -770,3 +771,61 @@ class TestDockerApparmorNeedsAnEnforcingProfile:
             "a complain-mode profile logs and allows; attaching it claims confinement"
         )
         assert any("apparmor" in w.lower() for w in warnings)
+
+
+def test_the_dispatcher_hands_the_worker_the_measured_child_profile_mode(monkeypatch) -> None:
+    """The worker cannot read securityfs; the dispatcher can.
+
+    Inside the container the inner backends' only fallback was BLASTBOX_APPARMOR_PROFILES -- a
+    name a human typed, which cannot distinguish `enforce` from `complain`. This process runs on
+    the host, so it measures the mode and passes it as `<profile>:<mode>`. One file read, strictly
+    better evidence, and no new trust: it already chose the image, runtime and argv.
+    """
+    import blastbox.host.runtime.docker as d
+    from blastbox.worker.sandbox.apparmor import OBSERVED_ENV
+
+    monkeypatch.setattr(d, "observed_mode", lambda _p: "enforce")
+    monkeypatch.setattr(d, "resolve_profile", lambda _x: "blastbox-sandbox")
+    argv = _argv(tmp_path=Path(tempfile.mkdtemp()))
+    joined = " ".join(argv)
+    assert f"{OBSERVED_ENV}=blastbox-sandbox:enforce" in joined, joined
+
+
+def test_no_measurement_means_no_claim(monkeypatch) -> None:
+    """A dispatcher that cannot read securityfs either (itself containerised, no
+    /sys/kernel/security mount) must pass nothing rather than a guess -- the worker then falls
+    back to the operator's assertion, as before."""
+    import blastbox.host.runtime.docker as d
+    from blastbox.worker.sandbox.apparmor import OBSERVED_ENV
+
+    monkeypatch.setattr(d, "observed_mode", lambda _p: None)
+    argv = _argv(tmp_path=Path(tempfile.mkdtemp()))
+    assert OBSERVED_ENV not in " ".join(argv)
+
+
+def test_a_complain_mode_profile_is_passed_down_as_complain(monkeypatch) -> None:
+    """Not filtered to only the good news: the worker turns a non-enforcing observation into a
+    positive disproof, which is the whole point of carrying the mode."""
+    import blastbox.host.runtime.docker as d
+    from blastbox.worker.sandbox.apparmor import OBSERVED_ENV
+
+    monkeypatch.setattr(d, "observed_mode", lambda _p: "complain")
+    monkeypatch.setattr(d, "resolve_profile", lambda _x: "blastbox-sandbox")
+    argv = _argv(tmp_path=Path(tempfile.mkdtemp()))
+    assert f"{OBSERVED_ENV}=blastbox-sandbox:complain" in " ".join(argv)
+
+
+def test_the_dispatcher_passes_an_absent_verdict_down(monkeypatch) -> None:
+    """`if mode:` dropped it -- a falsy check that made the STRONGEST verdict unsendable.
+
+    "The kernel read fine and this profile is not in it" is a stronger disproof than
+    "complain", and it was reported to the worker as silence, which the worker then filled
+    with the operator's assertion (lens on #179).
+    """
+    import blastbox.host.runtime.docker as d
+    from blastbox.worker.sandbox.apparmor import ABSENT, OBSERVED_ENV
+
+    monkeypatch.setattr(d, "observed_mode", lambda _p: ABSENT)
+    monkeypatch.setattr(d, "resolve_profile", lambda _x: "blastbox-sandbox")
+    argv = _argv(tmp_path=Path(tempfile.mkdtemp()))
+    assert f"{OBSERVED_ENV}=blastbox-sandbox:{ABSENT}" in " ".join(argv)

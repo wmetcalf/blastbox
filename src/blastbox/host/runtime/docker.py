@@ -46,6 +46,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
+from blastbox.worker.sandbox.apparmor import (
+    OBSERVED_ENV,
+    observed_mode,
+    resolve_profile,
+)
 from blastbox.errors import SandboxError
 
 
@@ -481,6 +486,24 @@ def build_worker_docker_run_argv(
         argv.extend(["--security-opt", f"apparmor={_WORKER_APPARMOR_PROFILE}"])
     else:
         runtime.warnings.append(_APPARMOR_WARNING)
+
+    # ------------------------------------------------------------------
+    # What WE can see about the worker's CHILD profile, handed down as evidence.
+    #
+    # The inner backends attach a profile to the detonated child and must decide whether it is
+    # enforcing. Inside the container they cannot: /sys/kernel/security/apparmor/profiles is
+    # root-only and not mounted there, so their only fallback is
+    # BLASTBOX_APPARMOR_PROFILES -- a name a human typed, which cannot tell `enforce` from
+    # `complain`. The dispatcher runs HERE, on the host, where the kernel will answer.
+    #
+    # So measure the mode and pass it: `<profile>:<mode>`, the kernel's own vocabulary. It costs
+    # one file read, it is strictly better than the assertion it outranks, and it introduces no
+    # new trust -- this process already chose the image, the runtime and the argv. A mode that is
+    # NOT enforcing becomes a positive disproof in the worker rather than an unknown.
+    _child_profile = resolve_profile(None)
+    _child_mode = observed_mode(_child_profile)
+    if _child_mode:
+        argv.extend(["-e", f"{OBSERVED_ENV}={_child_profile}:{_child_mode}"])
 
     # ------------------------------------------------------------------
     # Optional seccomp profile.
