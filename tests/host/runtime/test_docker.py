@@ -813,3 +813,19 @@ def test_a_complain_mode_profile_is_passed_down_as_complain(monkeypatch) -> None
     monkeypatch.setattr(d, "resolve_profile", lambda _x: "blastbox-sandbox")
     argv = _argv(tmp_path=Path(tempfile.mkdtemp()))
     assert f"{OBSERVED_ENV}=blastbox-sandbox:complain" in " ".join(argv)
+
+
+def test_the_dispatcher_passes_an_absent_verdict_down(monkeypatch) -> None:
+    """`if mode:` dropped it -- a falsy check that made the STRONGEST verdict unsendable.
+
+    "The kernel read fine and this profile is not in it" is a stronger disproof than
+    "complain", and it was reported to the worker as silence, which the worker then filled
+    with the operator's assertion (lens on #179).
+    """
+    import blastbox.host.runtime.docker as d
+    from blastbox.worker.sandbox.apparmor import ABSENT, OBSERVED_ENV
+
+    monkeypatch.setattr(d, "observed_mode", lambda _p: ABSENT)
+    monkeypatch.setattr(d, "resolve_profile", lambda _x: "blastbox-sandbox")
+    argv = _argv(tmp_path=Path(tempfile.mkdtemp()))
+    assert f"{OBSERVED_ENV}=blastbox-sandbox:{ABSENT}" in " ".join(argv)

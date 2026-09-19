@@ -1889,3 +1889,46 @@ class TestWhatTheHostMeasuredOutranksWhatAnOperatorTyped:
         sb = mod.NsjailSandbox(nsjail_path=str(nsjail))
         assert sb.apparmor_active is True
         assert probes["n"] >= 1, "a host observation was believed without the in-jail proof"
+
+
+class TestTheStrongestDisproofIsNotThrownAway:
+    """"The kernel says this profile is not loaded" was being reported as "I could not look".
+
+    `observed_mode` returned None for BOTH a securityfs it could not read AND a securityfs it
+    read fine that simply lacks the profile. The dispatcher then passed nothing, the worker fell
+    through to the operator's assertion, and the most definitive fact produced the weakest
+    verdict -- while the weaker `complain` was correctly treated as a disproof. The asymmetry ran
+    backwards (lens on #179).
+    """
+
+    def test_a_readable_securityfs_without_the_profile_says_absent(self, tmp_path) -> None:
+        import blastbox.worker.sandbox.apparmor as aa
+
+        f = tmp_path / "profiles"
+        f.write_text("docker-default (enforce)\nlibvirtd (complain)\n")
+        assert aa.observed_mode.__module__  # imported
+        import unittest.mock as _m
+
+        with _m.patch.object(aa, "_PROFILES", str(f)):
+            assert aa.observed_mode("blastbox-sandbox") == aa.ABSENT
+            assert aa.observed_mode("docker-default") == "enforce"
+
+    def test_an_unreadable_securityfs_still_says_nothing(self, tmp_path) -> None:
+        """The two must stay distinguishable: one is a measurement, the other is an absence of
+        one, and they demand opposite behaviour from the dispatcher."""
+        import unittest.mock as _m
+
+        import blastbox.worker.sandbox.apparmor as aa
+
+        with _m.patch.object(aa, "_PROFILES", str(tmp_path / "nope")):
+            assert aa.observed_mode("blastbox-sandbox") is None
+
+    def test_an_absent_observation_beats_the_operators_assertion(self, monkeypatch) -> None:
+        import blastbox.worker.sandbox.apparmor as aa
+
+        monkeypatch.setattr(aa, "_PROFILES", "/nonexistent")
+        monkeypatch.setenv("BLASTBOX_APPARMOR_PROFILES", "blastbox-sandbox")
+        monkeypatch.setenv(aa.OBSERVED_ENV, "blastbox-sandbox:absent")
+        assert aa.profile_evidence("blastbox-sandbox") == aa.NONE, (
+            "the host positively knew the profile was not loaded and the assertion won anyway"
+        )

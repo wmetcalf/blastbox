@@ -163,7 +163,28 @@ def profile_evidence(profile: str) -> str:
         if observed is not None:
             # The host read the kernel. A mode it reports as NOT enforcing is a positive
             # disproof, not a missing answer -- which an operator assertion can never be.
-            return HOST_OBSERVED if observed else NONE
+            #
+            # BOTH outcomes are logged. This tier outranks the operator's assertion, and it was
+            # silent in both directions: arming produced no counterpart to
+            # `apparmor_profile_asserted_not_verified`, so nobody could tell "the kernel reported
+            # this mode" from "someone set an environment variable" -- a distinction this
+            # module's own docstring says an operator must be able to make. And overriding an
+            # assertion logged nothing, while the identical contradiction reached through the
+            # kernel read emits `apparmor_assertion_contradicted` (lens on #179). The tier's name
+            # asserts a provenance it cannot verify; the log is what makes that auditable.
+            if observed:
+                _warn_once_observed(profile, "enforcing")
+                return HOST_OBSERVED
+            if profile in _asserted():
+                _log.warning(
+                    "apparmor_observation_overrides_assertion profile=%s "
+                    "note=BLASTBOX_APPARMOR_PROFILES names it, but the host measured it as NOT "
+                    "enforcing; the measurement wins and no profile is attached",
+                    profile,
+                )
+            else:
+                _warn_once_observed(profile, "not enforcing")
+            return NONE
         if profile in _asserted():
             _warn_asserted(profile)
             return ASSERTED
@@ -192,8 +213,17 @@ def profile_loaded(profile: str) -> bool:
     return profile_evidence(profile) != NONE
 
 
+ABSENT = "absent"
+
+
 def observed_mode(profile: str) -> str | None:
-    """The MODE the kernel reports for ``profile``, read from securityfs, or None.
+    """The MODE the kernel reports for ``profile``, :data:`ABSENT`, or None if unreadable.
+
+    THREE ANSWERS, and the third one was missing. `absent` -- securityfs read fine and this
+    profile is not in it -- is a STRONGER disproof than `complain`, and returning None for it
+    meant the dispatcher passed nothing, the worker fell through to the operator's assertion,
+    and the most definitive fact produced the weakest verdict. The asymmetry ran backwards:
+    complain disproved, not-loaded-at-all believed (lens on #179).
 
     For the DISPATCHER, which runs on the host and can read securityfs, to measure what the
     worker cannot and pass it down via :data:`OBSERVED_ENV`. Returns the kernel's own word --
@@ -209,7 +239,7 @@ def observed_mode(profile: str) -> str | None:
         name, sep, rest = line.strip().rpartition(" (")
         if sep and name.strip() == profile:
             return rest.rstrip().rstrip(")") or None
-    return None
+    return ABSENT
 
 
 def _host_observed(profile: str) -> bool | None:
@@ -220,6 +250,8 @@ def _host_observed(profile: str) -> bool | None:
     :func:`_line_is_enforcing` already uses -- one definition of "counts as confinement", not two.
     """
     raw = os.environ.get(OBSERVED_ENV, "").strip()
+    # A mode of `absent` (the dispatcher read securityfs and this profile was not in it) is not
+    # in _ENFORCING_MODES, so it answers False here -- a positive disproof, which is the point.
     for item in raw.split(","):
         name, _, mode = item.strip().partition(":")
         if name.strip() != profile:
@@ -231,6 +263,26 @@ def _host_observed(profile: str) -> bool | None:
 def _asserted() -> set[str]:
     raw = os.environ.get("BLASTBOX_APPARMOR_PROFILES", "").strip()
     return {p.strip() for p in raw.split(",") if p.strip()}
+
+
+_WARNED_OBSERVED: set[str] = set()
+
+
+def _warn_once_observed(profile: str, verdict: str) -> None:
+    """Say, once per process, that confinement rests on the DISPATCHER's measurement.
+
+    Better evidence than an assertion, and still not the worker's own read -- so an operator
+    reading logs can tell the three apart.
+    """
+    if profile in _WARNED_OBSERVED:
+        return
+    _WARNED_OBSERVED.add(profile)
+    _log.warning(
+        "apparmor_profile_host_observed profile=%s verdict=%s "
+        "note=securityfs unreadable here; the mode was measured by the dispatcher on the host "
+        "and passed in via %s",
+        profile, verdict, OBSERVED_ENV,
+    )
 
 
 def _warn_asserted(profile: str) -> None:

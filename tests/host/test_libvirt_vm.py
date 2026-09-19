@@ -740,11 +740,37 @@ class TestTheLibvirtConnectionIsSayable:
         for argv in seen:
             assert "-c" in argv and argv[argv.index("-c") + 1] == "qemu:///system", argv
 
-    def test_the_environment_is_not_polluted(self) -> None:
-        """LIBVIRT_DEFAULT_URI would be inherited by everything else the host runs; this must
-        change only what blastbox talks to."""
+    def test_the_environment_is_not_polluted(self, monkeypatch) -> None:
+        """LIBVIRT_DEFAULT_URI would be inherited by everything else the host runs, which is the
+        stated reason for threading `-c` instead of exporting it.
+
+        The first version of this test called the pure argv builder and then checked os.environ,
+        so it passed for any implementation -- including one that exported the variable inside
+        `_virsh`, where the subprocess is actually launched (lens on #179). It now drives the
+        call path that launches, with the launcher stubbed, and checks the environment the child
+        would inherit.
+        """
         import os
 
+        import blastbox.host.runtime.libvirt_vm as mod
+
+        before = dict(os.environ)
+        seen: dict = {}
+
+        def _capture(argv, **kw):
+            seen["env_at_launch"] = dict(os.environ)
+            seen["kwargs"] = kw
+            from types import SimpleNamespace
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(mod, "_run", _capture)
         rt = self._runtime(self._cfg(connect_uri="qemu:///session"))
-        rt._virsh_argv("version")
+        rt._virsh("version")
+
+        assert "LIBVIRT_DEFAULT_URI" not in seen["env_at_launch"], (
+            "the URI was exported into the environment the child inherits"
+        )
         assert "LIBVIRT_DEFAULT_URI" not in os.environ
+        assert os.environ == before, "the call mutated this process's environment"
+        # And it is not smuggled in as an explicit env= either.
+        assert "LIBVIRT_DEFAULT_URI" not in str(seen["kwargs"].get("env", ""))

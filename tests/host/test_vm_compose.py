@@ -552,3 +552,46 @@ def test_a_hung_agent_is_attributed_even_though_the_slot_is_retired():
         f"that hangs every VM would be rebuilt into forever"
     )
     assert pool.released == [], "a hung slot must NOT be released for reuse"
+
+
+class TestTheLibvirtUriReachesTheRuntimeFromConfig:
+    """The five argv tests drove `LibvirtVmConfig(connect_uri=...)` directly, so the only half an
+    operator actually configures -- the documented `BLASTBOX_LIBVIRT_URI` and the per-worker
+    `connect_uri` -- was untested. Deleting the plumbing left the suite green (lens on #179).
+    """
+
+    def _spec(self, **kw):
+        from blastbox.host.runtime.vm_compose import VmWorkerSpec
+
+        d = {"image": {"golden": "/tmp/g.qcow2"}}
+        d.update(kw)
+        return VmWorkerSpec.from_dict("w", d)
+
+    def test_the_env_var_reaches_the_runtime_config(self, monkeypatch) -> None:
+        monkeypatch.setenv("BLASTBOX_LIBVIRT_URI", "qemu+ssh://root@toolz3/system")
+        assert self._spec().to_vm_config().connect_uri == "qemu+ssh://root@toolz3/system"
+
+    def test_the_spec_field_wins_over_the_environment(self, monkeypatch) -> None:
+        """A host running more than one libvirt needs a per-worker answer, so the YAML must beat
+        the process-wide default."""
+        monkeypatch.setenv("BLASTBOX_LIBVIRT_URI", "qemu:///system")
+        cfg = self._spec(connect_uri="qemu:///session").to_vm_config()
+        assert cfg.connect_uri == "qemu:///session"
+
+    def test_unset_stays_none_so_nothing_changes(self, monkeypatch) -> None:
+        monkeypatch.delenv("BLASTBOX_LIBVIRT_URI", raising=False)
+        assert self._spec().to_vm_config().connect_uri is None
+
+    def test_whitespace_only_is_not_a_uri(self, monkeypatch) -> None:
+        monkeypatch.setenv("BLASTBOX_LIBVIRT_URI", "   ")
+        assert self._spec().to_vm_config().connect_uri is None
+
+    def test_it_actually_reaches_virsh_end_to_end(self, monkeypatch) -> None:
+        """The whole point: from the operator's environment variable to the argv virsh runs."""
+        from blastbox.host.runtime.libvirt_vm import LibvirtVmRuntime
+
+        monkeypatch.setenv("BLASTBOX_LIBVIRT_URI", "qemu+ssh://root@toolz3/system")
+        rt = LibvirtVmRuntime(self._spec().to_vm_config())
+        argv = rt._virsh_argv("net-list", "--all")
+        assert argv[argv.index("-c") + 1] == "qemu+ssh://root@toolz3/system"
+        assert argv.index("-c") < argv.index("net-list")

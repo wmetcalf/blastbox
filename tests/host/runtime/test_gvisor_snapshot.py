@@ -1673,37 +1673,38 @@ def test_the_default_is_added_when_the_operator_says_nothing() -> None:
     assert hits == ["BLASTBOX_WARN_ON_INSECURE=1"], hits
 
 
-def test_the_gvisor_tier_also_hands_down_the_measured_mode(monkeypatch) -> None:
-    """Both dispatcher-managed launchers, or the evidence is a property of which one you used.
+def test_the_gvisor_tier_deliberately_carries_no_apparmor_observation() -> None:
+    """The opposite of docker.py, for a reason this tier cannot avoid.
 
-    That asymmetry has already cost this PR once: BLASTBOX_WARN_ON_INSECURE was set by docker.py
-    and not here, while the docs claimed "dispatcher-launched workers get it".
+    `_write_oci_config` is written for `boot_base()` AND `restore_in()`, but a restored container
+    resumes with the environment that was in its memory at CHECKPOINT time -- warm.py says so
+    ("the warm process's environment is frozen at snapshot time"), which is why per-job params
+    reach a warm worker through os.environ instead of container `-e`. A mode measured at base
+    boot would therefore be frozen into every slot restored from that base, and the restore-time
+    rewrite could not correct it: an operator switching the profile to complain under a running
+    pool would leave every slot reporting `:enforce` forever.
+
+    "No measurement means no claim" is the rule, and a stale claim is worse than none -- the
+    worker then falls back to the operator's assertion, which is LOGGED as unverified, and the
+    in-jail proof still re-measures on its TTL (lens on #179).
     """
-    import blastbox.host.runtime.gvisor_snapshot as g
     from blastbox.worker.sandbox.apparmor import OBSERVED_ENV
 
-    monkeypatch.setattr(g, "observed_mode", lambda _p: "enforce")
-    monkeypatch.setattr(g, "resolve_profile", lambda _x: "blastbox-sandbox")
     env = _oci_config(_cfg(Path(tempfile.mkdtemp())), Path("/tmp/x"), in_ro=True)["process"]["env"]
-    assert f"{OBSERVED_ENV}=blastbox-sandbox:enforce" in env, env
+    assert not any(e.startswith(f"{OBSERVED_ENV}=") for e in env), (
+        "a frozen-at-checkpoint environment must not carry a measurement that claims to be "
+        "from launch time"
+    )
 
 
-def test_an_operator_entry_still_wins_over_the_measurement(monkeypatch) -> None:
+def test_the_frozen_environment_reason_is_recorded_where_someone_will_look() -> None:
+    """If a later change adds the observation here, it should have to delete this reasoning
+    first rather than discover the staleness in production."""
+    import inspect
+
     import blastbox.host.runtime.gvisor_snapshot as g
-    from blastbox.worker.sandbox.apparmor import OBSERVED_ENV
 
-    monkeypatch.setattr(g, "observed_mode", lambda _p: "enforce")
-    monkeypatch.setattr(g, "resolve_profile", lambda _x: "blastbox-sandbox")
-    cfg = _cfg(Path(tempfile.mkdtemp()), extra_env=[f"{OBSERVED_ENV}=blastbox-sandbox:complain"])
-    env = _oci_config(cfg, Path("/tmp/x"), in_ro=True)["process"]["env"]
-    hits = [e for e in env if e.startswith(f"{OBSERVED_ENV}=")]
-    assert hits == [f"{OBSERVED_ENV}=blastbox-sandbox:complain"], hits
-
-
-def test_nothing_is_claimed_when_nothing_can_be_measured(monkeypatch) -> None:
-    import blastbox.host.runtime.gvisor_snapshot as g
-    from blastbox.worker.sandbox.apparmor import OBSERVED_ENV
-
-    monkeypatch.setattr(g, "observed_mode", lambda _p: None)
-    env = _oci_config(_cfg(Path(tempfile.mkdtemp())), Path("/tmp/x"), in_ro=True)["process"]["env"]
-    assert not any(e.startswith(f"{OBSERVED_ENV}=") for e in env)
+    src = inspect.getsource(g._oci_config)
+    assert "frozen at snapshot time" in src or "CHECKPOINT time" in src, (
+        "the reason this tier carries no AppArmor observation is no longer written down"
+    )

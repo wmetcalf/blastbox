@@ -292,7 +292,13 @@ word: a profile the host sees in `complain` becomes a **disproof** in the worker
 assertion could never express. It is still not proof that *this child* received the profile — the
 in-jail proof supplies that, and an observed profile goes through it exactly like an asserted one.
 
-Nothing to configure; it appears only when the dispatcher could actually read the kernel.
+Nothing to configure; it appears only when the dispatcher could actually read the kernel — and
+`absent` counts as a reading, since "securityfs answered and your profile is not in it" is a
+stronger disproof than `complain`.
+
+The gVisor warm/snapshot tier deliberately carries none of this: a restored container resumes with
+the environment frozen into its checkpoint, so a mode measured at base boot would be reported
+forever regardless of what the host did afterwards. No measurement beats a stale one.
 
 ### The `BLASTBOX_APPARMOR_PROFILES` escape hatch (plural)
 

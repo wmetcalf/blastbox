@@ -17,11 +17,6 @@ import threading
 import time
 import uuid
 
-from blastbox.worker.sandbox.apparmor import (
-    OBSERVED_ENV,
-    observed_mode,
-    resolve_profile,
-)
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -378,15 +373,21 @@ def _oci_config(cfg: GvisorConfig, workdir: Path, *, in_ro: bool) -> dict:
     if not any(e.split("=", 1)[0] == _WARN_ON_INSECURE for e in env):
         env.append(f"{_WARN_ON_INSECURE}=1")
 
-    # The child profile's MODE, measured here on the host, for the same reason docker.py does it:
-    # inside the sandbox securityfs is unreadable, so the inner backends' only fallback is a name
-    # a human typed. The kernel's own word outranks that. Operator entries in extra_env still win
-    # (they were appended above, and this only fills an absent key).
-    if not any(e.split("=", 1)[0] == OBSERVED_ENV for e in env):
-        _child = resolve_profile(None)
-        _mode = observed_mode(_child)
-        if _mode:
-            env.append(f"{OBSERVED_ENV}={_child}:{_mode}")
+    # NO AppArmor observation on this tier, deliberately -- unlike host/runtime/docker.py.
+    #
+    # This config.json is written for `boot_base()` AND for `restore_in()`, but a restored
+    # container resumes with the environment that was in its memory at CHECKPOINT time: warm.py
+    # says so in as many words ("the warm process's environment is frozen at snapshot time"),
+    # which is why per-job params reach a warm worker through os.environ rather than container
+    # `-e`. So a mode measured when the base booted would be frozen into every slot restored
+    # from it, for the life of that base, and the restore-time rewrite here could not correct
+    # it. An operator switching the profile to complain under a running pool would leave every
+    # slot reporting `:enforce` -- a report about a host state that no longer exists, and
+    # exactly the staleness the per-launch securityfs re-read was written to remove (#159).
+    #
+    # "No measurement means no claim" is already the rule, and a stale claim is worse than
+    # none: without this the worker falls back to the operator's assertion, which is LOGGED as
+    # unverified, and the in-jail proof still re-measures on its TTL (lens on #179).
     spec: dict = {
         "ociVersion": "1.0.0",
         "process": {
