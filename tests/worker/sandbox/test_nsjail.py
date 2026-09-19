@@ -1793,3 +1793,142 @@ def test_both_backends_expose_the_blocked_reason(backend: str) -> None:
     assert isinstance(getattr(cls, "apparmor_blocked_reason", None), property), (
         f"{cls.__name__} does not expose apparmor_blocked_reason, so detect.py cannot read it"
     )
+
+
+class TestWhatTheHostMeasuredOutranksWhatAnOperatorTyped:
+    """The structural gap the in-jail proof could only narrow.
+
+    Inside a worker, `/sys/kernel/security/apparmor/profiles` is root-only and not mounted, so
+    the only fallback was `BLASTBOX_APPARMOR_PROFILES` -- a name a human typed, which cannot tell
+    `enforce` from `complain`. The DISPATCHER runs on the host, where the kernel answers, so it
+    measures the mode and passes it down as `<profile>:<mode>`.
+
+    No new trust: that process already chose this worker's image, runtime and argv.
+    """
+
+    def test_an_observed_enforcing_profile_is_better_than_an_assertion(self, monkeypatch) -> None:
+        import blastbox.worker.sandbox.apparmor as aa
+
+        monkeypatch.setattr(aa, "_PROFILES", "/nonexistent")     # securityfs unreadable, as in a worker
+        monkeypatch.setenv(aa.OBSERVED_ENV, "blastbox-sandbox:enforce")
+        monkeypatch.delenv("BLASTBOX_APPARMOR_PROFILES", raising=False)
+        assert aa.profile_evidence("blastbox-sandbox") == aa.HOST_OBSERVED
+
+    def test_kill_mode_counts_as_enforcing(self, monkeypatch) -> None:
+        import blastbox.worker.sandbox.apparmor as aa
+
+        monkeypatch.setattr(aa, "_PROFILES", "/nonexistent")
+        monkeypatch.setenv(aa.OBSERVED_ENV, "blastbox-sandbox:kill")
+        assert aa.profile_evidence("blastbox-sandbox") == aa.HOST_OBSERVED
+
+    def test_an_observed_complain_profile_is_a_DISPROOF_not_an_unknown(self, monkeypatch) -> None:
+        """This is what an assertion could never do. The host says the kernel has it in complain
+        mode, so it is NOT confinement -- and saying nothing would have let the operator's
+        assertion stand."""
+        import blastbox.worker.sandbox.apparmor as aa
+
+        monkeypatch.setattr(aa, "_PROFILES", "/nonexistent")
+        monkeypatch.setenv(aa.OBSERVED_ENV, "blastbox-sandbox:complain")
+        monkeypatch.setenv("BLASTBOX_APPARMOR_PROFILES", "blastbox-sandbox")
+        assert aa.profile_evidence("blastbox-sandbox") == aa.NONE, (
+            "the operator's assertion overrode what the host actually measured"
+        )
+
+    def test_an_observation_about_another_profile_says_nothing_about_this_one(
+            self, monkeypatch) -> None:
+        import blastbox.worker.sandbox.apparmor as aa
+
+        monkeypatch.setattr(aa, "_PROFILES", "/nonexistent")
+        monkeypatch.setenv(aa.OBSERVED_ENV, "some-other:enforce")
+        monkeypatch.setenv("BLASTBOX_APPARMOR_PROFILES", "blastbox-sandbox")
+        assert aa.profile_evidence("blastbox-sandbox") == aa.ASSERTED
+
+    def test_several_observations_are_carried_at_once(self, monkeypatch) -> None:
+        import blastbox.worker.sandbox.apparmor as aa
+
+        monkeypatch.setattr(aa, "_PROFILES", "/nonexistent")
+        monkeypatch.setenv(aa.OBSERVED_ENV, "a:complain,blastbox-sandbox:enforce,b:unconfined")
+        assert aa.profile_evidence("blastbox-sandbox") == aa.HOST_OBSERVED
+        assert aa.profile_evidence("a") == aa.NONE
+        assert aa.profile_evidence("b") == aa.NONE
+
+    def test_the_kernel_still_outranks_the_host_observation(self, tmp_path, monkeypatch) -> None:
+        """Where the worker CAN read securityfs, its own read wins -- an observation is a report
+        about a moment that has passed."""
+        import blastbox.worker.sandbox.apparmor as aa
+
+        f = tmp_path / "profiles"
+        f.write_text("blastbox-sandbox (complain)\n")
+        monkeypatch.setattr(aa, "_PROFILES", str(f))
+        monkeypatch.setenv(aa.OBSERVED_ENV, "blastbox-sandbox:enforce")
+        assert aa.profile_evidence("blastbox-sandbox") == aa.NONE
+
+    def test_an_observed_profile_is_still_proved_in_the_jail(self, tmp_path, monkeypatch) -> None:
+        """Better evidence, not proof of attachment: the host saw its own profile table, not this
+        child. The in-jail proof still runs."""
+        import blastbox.worker.sandbox.apparmor as aa
+        import blastbox.worker.sandbox.nsjail as mod
+
+        monkeypatch.setattr(aa, "_PROFILES", "/nonexistent")
+        monkeypatch.setenv(aa.OBSERVED_ENV, "blastbox-sandbox:enforce")
+        monkeypatch.setattr(mod, "_find_aa_exec", lambda: "/usr/sbin/aa-exec")
+        monkeypatch.setattr(mod, "_supports_proc_rw", lambda _p: True)
+        monkeypatch.setattr(mod, "profile_loaded", lambda _p: True)
+        probes = {"n": 0}
+
+        def _run(argv, **kw):
+            from types import SimpleNamespace
+            probes["n"] += 1
+            ok = "blastbox-sandbox (enforce)\n" if "attr/current" in " ".join(argv) else ""
+            return SimpleNamespace(returncode=0, stdout=ok, stderr="")
+
+        monkeypatch.setattr(aa.subprocess, "run", _run)
+        nsjail = tmp_path / "nsjail"
+        nsjail.write_text(_FAKE_NSJAIL)
+        nsjail.chmod(0o755)
+        sb = mod.NsjailSandbox(nsjail_path=str(nsjail))
+        assert sb.apparmor_active is True
+        assert probes["n"] >= 1, "a host observation was believed without the in-jail proof"
+
+
+class TestTheStrongestDisproofIsNotThrownAway:
+    """"The kernel says this profile is not loaded" was being reported as "I could not look".
+
+    `observed_mode` returned None for BOTH a securityfs it could not read AND a securityfs it
+    read fine that simply lacks the profile. The dispatcher then passed nothing, the worker fell
+    through to the operator's assertion, and the most definitive fact produced the weakest
+    verdict -- while the weaker `complain` was correctly treated as a disproof. The asymmetry ran
+    backwards (lens on #179).
+    """
+
+    def test_a_readable_securityfs_without_the_profile_says_absent(self, tmp_path) -> None:
+        import blastbox.worker.sandbox.apparmor as aa
+
+        f = tmp_path / "profiles"
+        f.write_text("docker-default (enforce)\nlibvirtd (complain)\n")
+        assert aa.observed_mode.__module__  # imported
+        import unittest.mock as _m
+
+        with _m.patch.object(aa, "_PROFILES", str(f)):
+            assert aa.observed_mode("blastbox-sandbox") == aa.ABSENT
+            assert aa.observed_mode("docker-default") == "enforce"
+
+    def test_an_unreadable_securityfs_still_says_nothing(self, tmp_path) -> None:
+        """The two must stay distinguishable: one is a measurement, the other is an absence of
+        one, and they demand opposite behaviour from the dispatcher."""
+        import unittest.mock as _m
+
+        import blastbox.worker.sandbox.apparmor as aa
+
+        with _m.patch.object(aa, "_PROFILES", str(tmp_path / "nope")):
+            assert aa.observed_mode("blastbox-sandbox") is None
+
+    def test_an_absent_observation_beats_the_operators_assertion(self, monkeypatch) -> None:
+        import blastbox.worker.sandbox.apparmor as aa
+
+        monkeypatch.setattr(aa, "_PROFILES", "/nonexistent")
+        monkeypatch.setenv("BLASTBOX_APPARMOR_PROFILES", "blastbox-sandbox")
+        monkeypatch.setenv(aa.OBSERVED_ENV, "blastbox-sandbox:absent")
+        assert aa.profile_evidence("blastbox-sandbox") == aa.NONE, (
+            "the host positively knew the profile was not loaded and the assertion won anyway"
+        )

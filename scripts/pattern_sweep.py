@@ -469,7 +469,7 @@ def find_p1(trees, tri, strict=False):
     # runtimes are worth reporting; anything else is skipped, at the cost of missing a call through
     # an unusually-named variable. A checker that cries wolf is worse than one with a known blind
     # spot, because you stop reading it.
-    OURS = ("self", "runtime", "_runtime", "rt", "tier", "engine", "slot_runtime")
+    ours = ("self", "runtime", "_runtime", "rt", "tier", "engine", "slot_runtime")
     ambiguous = plain_bool_defs(trees) & set(by_name)
     hits = []
     seen = set()
@@ -485,7 +485,7 @@ def find_p1(trees, tri, strict=False):
             if nm not in by_name:
                 continue
             recv = (receiver_of(n) or "").lower()
-            if recv not in OURS:
+            if recv not in ours:
                 continue        # not one of our runtimes -- Thread.is_alive and friends
             p = parents.get(n)
             # `ok, why = rt.is_ready(s), reason` puts the RHS Tuple between the call and the
@@ -745,7 +745,7 @@ def find_p3(trees):
     that outruns its own interval is eligible again the moment it finishes.
     """
     hits = []
-    STAMPY = {"last", "attempt", "since", "at", "stamp", "next", "prev"}
+    stampy = {"last", "attempt", "since", "at", "stamp", "next", "prev"}
     for path, tree in trees.items():
         for cls in ast.walk(tree):
             if not isinstance(cls, ast.ClassDef):
@@ -782,7 +782,7 @@ def find_p3(trees):
                     # (`ts = self._clock(); self._last_at = ts`), which the text match missed.
                     if not (is_clock(val) or any(is_clock(v) for v in local_clocks(fn, val))):
                         continue
-                    if key not in gated or not (name_tokens(key) & STAMPY):
+                    if key not in gated or not (name_tokens(key) & stampy):
                         continue
                     if id(n) in in_handler:
                         continue

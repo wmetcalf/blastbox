@@ -1,0 +1,55 @@
+# ClippyShot warm-UNO gVisor C/R rootfs — the KVM-less warm tier.
+#
+# The gVisor analogue of deploy/firecracker/Dockerfile.clippyshot. Built ON TOP OF
+# clippyshot-cold-worker, which already carries LibreOffice, the ClippyShot engine
+# adapter and blastbox core in the /opt/clippyshot venv. This overlay adds only the
+# blastbox gVisor warm agent and the accept-retry shim.
+#
+#   docker build --build-arg BASE=clippyshot-cold-worker:dev \
+#     -f deploy/gvisor/Dockerfile.clippyshot -t clippyshot-warm-gvisor:dev .
+#
+# Declared in clippyshot's blastbox-images.toml; `blastbox build-images` exports
+# it as the `dir` rootfs the runsc tier restores. Note base_arg = "BASE" here, not
+# BASE_IMAGE — the gVisor files use the shorter name and docker silently discards
+# a --build-arg the Dockerfile never declares.
+ARG BASE=clippyshot-cold-worker:dev
+FROM ${BASE}
+ARG ENGINE=clippyshot.engine:ClippyShotEngine
+USER root
+
+# accept(2) under runsc/systrap can return EAGAIN where the UNO bridge expects to
+# block, so soffice's listener drops the connection the engine is dialling. The
+# shim retries it. Preloaded by the host via BLASTBOX_GVISOR_LD_PRELOAD
+# (= /opt/clippyshot/accept-retry.so); built here because the compiler must not
+# remain in the shipped rootfs.
+COPY deploy/gvisor/accept_retry.c /tmp/accept_retry.c
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends gcc libc6-dev; \
+    mkdir -p /opt/clippyshot; \
+    gcc -shared -fPIC -O2 -o /opt/clippyshot/accept-retry.so /tmp/accept_retry.c -ldl; \
+    apt-get purge -y --auto-remove gcc libc6-dev; \
+    rm -rf /var/lib/apt/lists/* /tmp/accept_retry.c
+
+# blastbox gVisor warm agent. run_warm.py imports `engines` from its own dir
+# (sys.path[0]); the engine name is baked into a FILE because Docker ENV is dropped
+# by `docker export`. The bind-mount destinations (/in ro, /out rw, /ctrl rw) MUST
+# exist at build time — the rootfs is restored read-only, so runsc cannot create them.
+COPY deploy/gvisor/run_warm.py /opt/blastbox/run_warm.py
+COPY deploy/firecracker/engines.py /opt/blastbox/engines.py
+RUN printf '%s' "${ENGINE}" > /opt/blastbox/engine \
+    && mkdir -p /in /out /ctrl \
+    # Strip setuid/setgid: the warm worker runs soffice as a non-root uid.
+    && { find / -xdev -type f -perm /6000 -exec chmod a-s {} + 2>/dev/null || true; }
+    # The braces matter: `A && B || true` would apply the fallback to the WHOLE
+    # chain, swallowing a failed mkdir and shipping an image without a mountpoint
+    # the gVisor restore needs. Only the find is excused (it exits non-zero when
+    # it cannot read a path).
+
+# The warm entrypoint comes from the host via BLASTBOX_GVISOR_WARM_ARGV
+# (= ["/opt/clippyshot/bin/python3", "/opt/blastbox/run_warm.py"]); no
+# ENTRYPOINT/CMD is baked because `docker export` drops it and the OCI spec sets
+# args explicitly.
+LABEL org.opencontainers.image.title="clippyshot-warm-gvisor" \
+      org.opencontainers.image.description="ClippyShot warm-UNO gVisor C/R rootfs (runsc checkpoint/restore; KVM-less warm tier)" \
+      org.opencontainers.image.version="0.1.0"

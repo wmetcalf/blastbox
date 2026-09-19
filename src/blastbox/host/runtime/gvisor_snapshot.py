@@ -16,6 +16,7 @@ import subprocess
 import threading
 import time
 import uuid
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -371,6 +372,22 @@ def _oci_config(cfg: GvisorConfig, workdir: Path, *, in_ro: bool) -> dict:
     # #177).
     if not any(e.split("=", 1)[0] == _WARN_ON_INSECURE for e in env):
         env.append(f"{_WARN_ON_INSECURE}=1")
+
+    # NO AppArmor observation on this tier, deliberately -- unlike host/runtime/docker.py.
+    #
+    # This config.json is written for `boot_base()` AND for `restore_in()`, but a restored
+    # container resumes with the environment that was in its memory at CHECKPOINT time: warm.py
+    # says so in as many words ("the warm process's environment is frozen at snapshot time"),
+    # which is why per-job params reach a warm worker through os.environ rather than container
+    # `-e`. So a mode measured when the base booted would be frozen into every slot restored
+    # from it, for the life of that base, and the restore-time rewrite here could not correct
+    # it. An operator switching the profile to complain under a running pool would leave every
+    # slot reporting `:enforce` -- a report about a host state that no longer exists, and
+    # exactly the staleness the per-launch securityfs re-read was written to remove (#159).
+    #
+    # "No measurement means no claim" is already the rule, and a stale claim is worse than
+    # none: without this the worker falls back to the operator's assertion, which is LOGGED as
+    # unverified, and the in-jail proof still re-measures on its TTL (lens on #179).
     spec: dict = {
         "ociVersion": "1.0.0",
         "process": {

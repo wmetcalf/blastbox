@@ -26,6 +26,7 @@ provisioner scripts stay with the engine (e.g. the win-validator golden).
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import threading
 from collections.abc import Callable
@@ -44,6 +45,13 @@ _log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Image (the "build" half)
 # ---------------------------------------------------------------------------
+# DERIVED from ExitRouting's fields so the allowlist and the passthrough can never drift out of
+# sync with the dataclass (rule_priority_base was missed that way once). Module scope because it
+# is a constant: the dataclass does not gain fields at runtime, and computing it per call was
+# recomputing the same set for every egress block parsed.
+_ROUTING_KEYS = frozenset(ExitRouting.__dataclass_fields__)
+_ALLOWED_EGRESS_KEYS = frozenset({"exit", "egress_ports", "block_internal"}) | _ROUTING_KEYS
+
 @dataclass
 class VmImageSpec:
     """A golden qcow2 — prebuilt, or a recipe to bake one."""
@@ -115,6 +123,7 @@ class VmWorkerSpec:
     concurrent_ceiling: int = 16
     spawn_rate_limit: float = 1.0     # VM boots are heavy → throttle spawns
     sudo: bool = True
+    connect_uri: str = ""             # "" = inherit BLASTBOX_LIBVIRT_URI, else virsh's default
 
     # ---- construction ----
     @classmethod
@@ -138,8 +147,6 @@ class VmWorkerSpec:
             # egress instead of the intended policy. Fail closed like the malformed-value paths.
             # DERIVE the routing keys from ExitRouting's fields so the allowlist + passthrough can
             # never drift out of sync with the dataclass (e.g. rule_priority_base was missed before).
-            _ROUTING_KEYS = set(ExitRouting.__dataclass_fields__)
-            _ALLOWED_EGRESS_KEYS = {"exit", "egress_ports", "block_internal"} | _ROUTING_KEYS
             unknown = set(eg) - _ALLOWED_EGRESS_KEYS
             if unknown:
                 raise ValueError(f"{name}: unknown egress key(s) {sorted(unknown)} "
@@ -200,6 +207,12 @@ class VmWorkerSpec:
             mac_prefix=self.mac_prefix,
             dhcp_server=self.dhcp_server,
             subnet_prefix=self.subnet_prefix,
+            # Spec wins over the environment, environment over virsh's default. A per-worker
+            # override matters on a host running more than one libvirt (measured: toolz3 has a
+            # root system instance serving the live network AND a leftover user-mode one).
+            connect_uri=(self.connect_uri
+                         or os.environ.get("BLASTBOX_LIBVIRT_URI", "").strip()
+                         or None),
             sudo=self.sudo,
             egress_policy=self.egress,
             exit_routing=self.routing,

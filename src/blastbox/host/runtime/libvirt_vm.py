@@ -183,6 +183,21 @@ class LibvirtVmConfig:
     sudo: bool = True
     """Prefix virsh/qemu-img/rm with sudo (libvirt usually needs root)."""
 
+    connect_uri: str | None = None
+    """libvirt connection URI passed to virsh as ``-c``. None = let virsh choose.
+
+    WHICH libvirt was previously unsayable, and "whatever virsh defaults to for the invoking
+    user" is not a property of this host -- it is a property of who is running. Measured on a
+    real host (toolz3): a root system libvirt owns and serves the live network, a leftover
+    user-mode libvirt owns /var/lib/libvirt, and `virsh` as the worker's user reaches neither
+    (`Failed to connect socket to '/var/run/libvirt/virtqemud-sock'`). With no way to say
+    `qemu:///system`, `qemu:///session` or `qemu+ssh://...`, blastbox could not drive the
+    instance that actually exists there.
+
+    Set via ``BLASTBOX_LIBVIRT_URI``. It is threaded into EVERY virsh invocation rather than
+    exported into the environment, because `LIBVIRT_DEFAULT_URI` is inherited by anything else
+    the host runs and this must not change what other tools on the box talk to."""
+
     egress_policy: VmEgressPolicy | None = None
     """Optional host-side egress policy applied to the worker's IP at spawn, removed at reap
     (the rooter model — see libvirt_egress). None = no per-worker egress rules, which is
@@ -902,7 +917,10 @@ class LibvirtVmRuntime:
 
     # ---- internals -----------------------------------------------------------
     def _virsh_argv(self, *a: str) -> list[str]:
-        return (["sudo"] if self.cfg.sudo else []) + ["virsh", *a]
+        # `-c` FIRST, before the subcommand: virsh reads its own options only there, and a URI
+        # appended after the subcommand is silently passed to the subcommand instead.
+        uri = ["-c", self.cfg.connect_uri] if self.cfg.connect_uri else []
+        return (["sudo"] if self.cfg.sudo else []) + ["virsh", *uri, *a]
 
     def _virsh(self, *a: str, timeout: float = 90) -> subprocess.CompletedProcess:
         return _run(self._virsh_argv(*a), timeout=timeout)

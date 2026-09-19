@@ -245,6 +245,28 @@ class SelfGrants:
       Runs nothing. "Revocation is stop renewing" bounds exposure only if something acts
       on the lapse.
 
+    WHAT THIS IS, AND WHAT IT CANNOT BE: A NODE LIMITING ITSELF.
+    ------------------------------------------------------------
+    This gate is read and enforced by the node it constrains, so its strength is bounded by
+    that: it is a control against MISCONFIGURATION, and a good one -- a node that should not
+    run `clamav` does not, and says why. It is not, and cannot be, a control against a
+    compromised or curious operator on that node, who can point ``BLASTBOX_NODE_CERT`` at any
+    CA-signed certificate or simply delete this check. Adding a local key-binding test (derive
+    the WireGuard pubkey from the private key on this host and require it to match the
+    certificate) closes the copy-a-certificate path and nothing else -- the same person can copy
+    the key or patch the comparison.
+
+    Where identity actually AUTHORISES something, it is already sound and does not depend on
+    this: the exit host maps WireGuard pubkey to node id from its OWN copies of the
+    certificates, never from anything a node published, and using a tunnel requires the
+    matching private key.
+
+    Binding grants against a hostile node means binding them at the point work changes hands --
+    mTLS on the job store / control plane, with grants resolved by the READER from the peer
+    certificate ("grants decide, claims advise", the rule `node_registry` already states and
+    the federation spec already requires). That is issue #178, and it is deliberately not
+    attempted here. Keep this as defence-in-depth against a misconfigured dispatcher.
+
     WHAT THIS CANNOT DO: EXPIRY IS ONLY AS HONEST AS THE HOST CLOCK.
     ----------------------------------------------------------------
     ``node_identity`` checks ``not_after`` against the wall clock, so a host whose clock
