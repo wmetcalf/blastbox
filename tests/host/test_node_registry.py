@@ -306,3 +306,94 @@ def test_build_selects_the_redis_backend_from_a_redis_job_store():
         _r = _FakeRedis()
 
     assert isinstance(build_node_registry(FakeJobStore()), RedisNodeRegistry)
+
+
+class TestGrantsComeFromTheReadersOwnCertificates:
+    """`eligible()` needs a mapping of node_id -> NodeGrants. WHERE that mapping comes from is
+    the whole security property: built from the registry, a node could widen itself by writing a
+    bigger number; built from the reader's own certificate store, what a node claims cannot
+    influence what it is permitted (#178).
+    """
+
+    def _fleet(self, tmp_path, spec):
+        from blastbox.host import pki
+
+        ca = pki.ensure_ca(tmp_path / "pki")
+        wg = "A" * 42 + "B="
+        for nid, engines, tiers, cred in spec:
+            ca.issue_node(nid, wg_pubkey=wg,
+                          grants=pki.NodeGrants(engines=engines, tiers=tiers,
+                                                credentials=cred)).write(
+                tmp_path / "pki", f"node-{nid}")
+        return tmp_path / "pki"
+
+    def test_a_node_cannot_claim_an_engine_it_was_not_granted(self, tmp_path) -> None:
+        from blastbox.host.node_registry import NodeClaims, NodeRecord
+        from blastbox.host.placement import eligible, fleet_grants
+
+        pki_dir = self._fleet(tmp_path, [("a", ("clamav",), ("socks",), False)])
+        view = [NodeRecord(node_id="a",
+                           claims=NodeClaims(engines=("clamav", "authenticode"), slots=8))]
+        grants = fleet_grants(pki_dir)
+        assert [c.node_id for c in eligible(view, grants, engine="clamav")] == ["a"]
+        assert eligible(view, grants, engine="authenticode") == (), (
+            "the node's own claim widened what it may run"
+        )
+
+    def test_a_node_with_no_certificate_is_absent_not_permissive(self, tmp_path) -> None:
+        from blastbox.host.node_registry import NodeClaims, NodeRecord
+        from blastbox.host.placement import eligible, fleet_grants
+
+        pki_dir = self._fleet(tmp_path, [("a", ("clamav",), (), False)])
+        view = [NodeRecord(node_id="ghost", claims=NodeClaims(engines=("clamav",), slots=99))]
+        assert eligible(view, fleet_grants(pki_dir), engine="clamav") == ()
+
+    def test_a_certificate_named_anything_is_still_read(self, tmp_path) -> None:
+        """`pki issue-node --out` lets an operator name the file anything, and globbing a prefix
+        silently skipped those -- their node then read as unverifiable and was refused work, a
+        false accusation produced by a filename convention."""
+        from blastbox.host import pki
+        from blastbox.host.placement import fleet_grants
+
+        ca = pki.ensure_ca(tmp_path / "pki")
+        ca.issue_node("oddly-named", wg_pubkey="A" * 42 + "B=",
+                      grants=pki.NodeGrants(engines=("clamav",))).write(
+            tmp_path / "pki", "not-the-node-prefix")
+        assert "oddly-named" in fleet_grants(tmp_path / "pki")
+
+    def test_no_ca_means_nothing_is_eligible(self, tmp_path) -> None:
+        """Fail closed: a reader that cannot load its trust anchor verifies nobody, and must not
+        fall back to trusting the registry."""
+        from blastbox.host.placement import fleet_grants
+
+        assert fleet_grants(tmp_path / "empty") == {}
+
+    def test_two_disagreeing_certificates_take_the_intersection(self, tmp_path) -> None:
+        """Both exist during a re-issue. Filesystem order is not an authorisation decision, so
+        neither "first wins" nor "last wins" is defensible."""
+        from blastbox.host import pki
+        from blastbox.host.placement import fleet_grants
+
+        ca = pki.ensure_ca(tmp_path / "pki")
+        wg = "A" * 42 + "B="
+        ca.issue_node("a", wg_pubkey=wg, grants=pki.NodeGrants(
+            engines=("clamav", "authenticode"), tiers=("socks",), credentials=True)).write(
+            tmp_path / "pki", "aaa-first")
+        ca.issue_node("a", wg_pubkey=wg, grants=pki.NodeGrants(
+            engines=("clamav",), tiers=("socks", "openvpn"), credentials=False)).write(
+            tmp_path / "pki", "zzz-second")
+        g = fleet_grants(tmp_path / "pki")["a"]
+        assert g.engines == ("clamav",)
+        assert g.tiers == ("socks",)
+        assert g.credentials is False
+
+    def test_a_foreign_certificate_is_not_verifiable(self, tmp_path) -> None:
+        from blastbox.host import pki
+        from blastbox.host.placement import fleet_grants
+
+        pki.ensure_ca(tmp_path / "pki")
+        rogue = pki.ensure_ca(tmp_path / "rogue")
+        rogue.issue_node("impostor", wg_pubkey="A" * 42 + "B=",
+                         grants=pki.NodeGrants(engines=("clamav",), credentials=True)).write(
+            tmp_path / "pki", "node-impostor")
+        assert "impostor" not in fleet_grants(tmp_path / "pki")

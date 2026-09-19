@@ -1,12 +1,23 @@
 """Federated node registry: who is out there, what they have, and what they may run.
 
-NOT YET WIRED. Nothing in ``src/`` imports this module except its sibling
-:mod:`blastbox.host.placement`; `build_node_registry` is never called and
-`SqlNodeRegistry` creates a `nodes` table nothing writes to. The grants half of the
-design IS now enforced — a dispatcher checks its own certificate before running work,
-see :mod:`blastbox.host.placement` — but the MEMBERSHIP half here, a fleet view that
-something reads, is still step 5's work. Everything below is written in the present
-tense because it describes what the module does when called; nothing calls it.
+NOT YET WIRED. `build_node_registry` is never called and `SqlNodeRegistry` creates a `nodes`
+table nothing writes to, so the MEMBERSHIP half — a fleet view something publishes into and
+reads — is still step 5's work, and everything below is written in the present tense because
+it describes what the module does when called, not what runs today. (A test asserts this
+banner stays until something really does build a fleet view; it caught an attempt to soften it
+to "partly".)
+
+What IS in place: the grants half is enforced twice over. A dispatcher checks its own
+certificate before running work (:class:`blastbox.host.placement.SelfGrants`), and
+:func:`blastbox.host.placement.fleet_grants` resolves EVERY node's grants from the reader's
+own certificate store, so :func:`~blastbox.host.placement.eligible` can answer "who may run
+this" without consulting anything a node published. A node that claims an engine its
+certificate does not grant is refused — there is a test that asserts exactly that.
+
+What is still missing is the binding this module's own :class:`NodeRecord` docstring names:
+until the control plane authenticates the publisher (mTLS), a node can publish a record under
+another node's id and inherit that node's grants at the reader. That is issue #178, and it is
+why `fleet_grants` is a necessary half rather than a sufficient one.
 
 This is the MEMBERSHIP half of the federation design
 (``docs/superpowers/specs/2026-09-15-federated-node-identity-and-placement.md``). It is
