@@ -24,6 +24,10 @@ def build_job_store_from_env(env: dict[str, str] | None = None) -> JobStore:
                                       because ``serve`` + ``dispatch`` won't share it)
     - ``sqlite://`` / ``postgresql://`` (``postgres://``) -> ``SqlJobStore``
     - ``redis://`` / ``rediss://`` -> ``RedisJobStore``
+    - ``https://`` / ``http://``    -> ``HttpJobStore`` — a NODE with no database
+      credentials, claiming through the control plane, which authorises per engine from its
+      own certificate store (#178). This is the scheme a federated node should use: it is
+      not a faster database, it is a SMALLER surface (no create, no delete, no enumerate).
     """
     e = os.environ if env is None else env
     url = e.get("BLASTBOX_DATABASE_URL", "").strip()
@@ -40,6 +44,30 @@ def build_job_store_from_env(env: dict[str, str] | None = None) -> JobStore:
         return InMemoryJobStore()
 
     scheme = urlparse(url).scheme.lower()
+    if scheme in ("http", "https"):
+        # Deliberately the SAME variable rather than a new one. A node either talks to the
+        # database or to the control plane -- never both -- so making it a choice of value
+        # makes the exclusivity structural. A separate BLASTBOX_CONTROL_PLANE_URL could be
+        # set alongside a DSN, and then which one wins is a question with no good answer.
+        from blastbox.host.jobs.http_store import HttpJobStore
+
+        # Pass the identity from THIS env mapping rather than letting the store read
+        # os.environ: `env=` exists so a caller can inject configuration, and a store that
+        # ignored it would be configured from the ambient process in tests and in any
+        # embedder that builds two stores for two roles.
+        if scheme == "http":
+            _log.warning(
+                "BLASTBOX_DATABASE_URL is http:// -- the node's certificate authenticates "
+                "it to the control plane, but the LINK is unencrypted, so job records and "
+                "session tokens cross the network in clear. Use https:// outside a trusted "
+                "local socket.")
+        return HttpJobStore(
+            url,
+            cert_path=e.get("BLASTBOX_NODE_CERT") or None,
+            key_path=e.get("BLASTBOX_NODE_KEY") or None,
+            ca_path=e.get("BLASTBOX_NODE_CA") or None,
+        )
+
     if scheme in ("redis", "rediss"):
         import redis  # type: ignore[import-not-found]
 
