@@ -59,7 +59,7 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, Header, HTTPException, Response
 from pydantic import BaseModel, Field
 
 from blastbox.host import node_auth
@@ -83,16 +83,38 @@ DEFAULT_PKI_DIR = "/var/lib/blastbox/pki"
 _REFUSED = "not authorised to claim this work"
 
 
-class ClaimRequest(BaseModel):
-    """A node asking for work it is entitled to."""
+class SessionRequest(BaseModel):
+    """A node proving possession of its certificate's key, once per session."""
 
     cert_pem: str = Field(..., max_length=16384,
                           description="the node's certificate, PEM")
     challenge: str = Field(..., max_length=512)
     signature: str = Field(..., max_length=1024, description="base64 ECDSA over the payload")
+
+
+class ClaimRequest(BaseModel):
+    """A node asking for work it is entitled to, holding a session token."""
+
     engine: str = Field(..., max_length=64)
     tier: str | None = Field(None, max_length=64)
     require_credentials: bool = False
+
+
+class UpdateRequest(BaseModel):
+    """A node reporting on a job it holds the claim for.
+
+    ``claim_id`` is not decoration. It is the per-claim ownership token `claim_next` stamps,
+    and requiring it is what stops a node writing to a job another node now owns: a job that
+    was reclaimed after a timeout has a NEW token, so the old holder's write is refused
+    rather than clobbering the live run. The store's own ``update_if_status`` already CASes
+    on ``(status, claim_id)`` for exactly this reason; this carries it over the wire.
+    """
+
+    claim_id: str = Field(..., max_length=128)
+    receipt: str = Field(..., max_length=128,
+                         description="the claim receipt this server returned at hand-over")
+    fields: dict[str, Any] = Field(default_factory=dict)
+    expect_status: str | None = Field(None, max_length=32)
 
 
 def resolve_pki_dir(pki_dir: "Path | str | None" = None) -> Path | None:
@@ -157,41 +179,82 @@ def register_node_claim_routes(
             "scope": node_auth.SCOPE_CLAIM_NEXT,
         }
 
+    def _secret() -> bytes:
+        return node_auth.challenge_secret(resolved)
+
+    def _node_from_token(authorization: str | None) -> str:
+        """The node id this caller has already proved, or 403.
+
+        The token names the node and nothing more; what it MAY DO is resolved below from
+        this server's own certificate store, per request. See `node_auth.issue_session`.
+        """
+        scheme, _, token = (authorization or "").partition(" ")
+        if scheme.lower() != "node" or not token:
+            raise HTTPException(status_code=403, detail=_REFUSED)
+        try:
+            return node_auth.verify_session(token.strip(), secret=_secret())
+        except node_auth.ClaimRefused as exc:
+            _log.warning("node_claim: session refused: %s", exc)
+            raise HTTPException(status_code=403, detail=_REFUSED) from None
+
+    def _grants_now(node_id: str):
+        """What this node may do, read fresh from the certificates on THIS host.
+
+        Never from the token, and never from anything the node published. A certificate
+        that has lapsed or been removed since the token was issued resolves to absent here,
+        so the node is refused within the token's lifetime rather than at its expiry.
+        """
+        from blastbox.host.placement import fleet_grants
+
+        return fleet_grants(resolved).get(node_id)
+
+    @router.post("/session", response_model=None)
+    def session(req: SessionRequest) -> dict[str, Any]:
+        """Prove possession once; get a short-lived token for the requests that follow.
+
+        WHY NOT SIGN EVERY REQUEST. Binding a signature to each operation would cost a
+        challenge round trip plus a signature per call -- three requests to update one
+        job's status, on the path a dispatcher walks for every job. The handshake is paid
+        once per session instead.
+        """
+        try:
+            signature = base64.b64decode(req.signature, validate=True)
+        except (binascii.Error, ValueError):
+            _log.warning("node_claim: session refused, signature is not base64")
+            raise HTTPException(status_code=403, detail=_REFUSED) from None
+        try:
+            ident = node_auth.admit_identity(
+                _anchor(), req.cert_pem.encode(), challenge=req.challenge,
+                scope=node_auth.SCOPE_CLAIM_NEXT, signature=signature, secret=_secret())
+        except node_auth.ClaimRefused as exc:
+            _log.warning("node_claim: session refused: %s", exc)
+            raise HTTPException(status_code=403, detail=_REFUSED) from None
+        _log.info("node_claim: session opened for node=%s", ident.node_id)
+        return {
+            "token": node_auth.issue_session(ident.node_id, secret=_secret()),
+            "expires_in": node_auth.SESSION_TTL_S,
+            "node_id": ident.node_id,
+        }
+
     # response_model=None: the handler returns either a dict or a bare 204 Response, and
     # FastAPI cannot build a response model from that union (it raises at import).
     @router.post("/claim", response_model=None)
-    def claim(req: ClaimRequest, response: Response) -> dict[str, Any] | Response:
+    def claim(req: ClaimRequest, response: Response,
+              authorization: str | None = Header(None)) -> dict[str, Any] | Response:
         """Admit or refuse, THEN claim. Order is the whole point of this module.
 
         Nothing touches the queue until the caller is admitted, so a refused node does not
         move a job out of QUEUED and never learns it existed.
         """
-        try:
-            # validate=True is for a CLEAR LOG LINE, not a distinct security boundary:
-            # mutation-checked, and relaxing it fails no test because a non-base64 blob
-            # decodes to garbage that then fails the signature check anyway. Kept so the
-            # operator sees "not base64" instead of "does not prove possession", which
-            # points at the wrong thing entirely when a client is mis-encoding.
-            signature = base64.b64decode(req.signature, validate=True)
-        except (binascii.Error, ValueError):
-            _log.warning("node_claim: refused, signature is not base64")
-            raise HTTPException(status_code=403, detail=_REFUSED) from None
-        try:
-            ident = node_auth.admit(
-                _anchor(), req.cert_pem.encode(),
-                challenge=req.challenge,
-                scope=node_auth.SCOPE_CLAIM_NEXT,
-                signature=signature,
-                secret=node_auth.challenge_secret(resolved),
-                engine=req.engine,
-                tier=req.tier,
-                require_credentials=req.require_credentials,
-            )
-        except node_auth.ClaimRefused as exc:
-            # The reason is logged, never returned. See _REFUSED.
-            _log.warning("node_claim: refused engine=%s tier=%s: %s",
-                         req.engine, req.tier, exc)
-            raise HTTPException(status_code=403, detail=_REFUSED) from None
+        from blastbox.host.placement import refusal
+
+        node_id = _node_from_token(authorization)
+        why = refusal(_grants_now(node_id), engine=req.engine, tier=req.tier,
+                      require_credentials=req.require_credentials)
+        if why is not None:
+            _log.warning("node_claim: refused node=%s engine=%s tier=%s: %s",
+                         node_id, req.engine, req.tier, why)
+            raise HTTPException(status_code=403, detail=_REFUSED)
 
         job = job_store.claim_next(engine=req.engine)
         if job is None:
@@ -201,8 +264,93 @@ def register_node_claim_routes(
             response.status_code = 204
             return response
         _log.info("node_claim: handed job=%s engine=%s to node=%s",
-                  job.job_id, job.engine, ident.node_id)
-        return {"job": job.to_dict(), "node_id": ident.node_id}
+                  job.job_id, job.engine, node_id)
+        return {
+            "job": job.to_dict(),
+            "node_id": node_id,
+            # The receipt, not just the claim id: see node_auth.claim_receipt for why
+            # knowing a claim id must not be sufficient to write to a job.
+            "receipt": node_auth.claim_receipt(
+                job.job_id, job.claim_id or "", node_id, secret=_secret()),
+        }
+
+    def _owned_job(job_id: str, node_id: str, claim_id: str, receipt: str):
+        """The job, if this node may write to it. Otherwise 403 -- and 403 for "no such job"
+        too, so a node cannot enumerate the queue by probing ids it does not own.
+
+        THE RECEIPT IS THE OWNERSHIP PROOF, not the claim id. The claim id only says "a
+        claim exists"; the receipt says "this server gave this job to the node whose session
+        token you are holding". Checking the claim id alone was a bearer check, and a node
+        granted the same engine could write to a peer's job with it.
+        """
+        job = job_store.get(job_id)
+        if job is None or not job.claim_id or job.claim_id != claim_id:
+            _log.warning("node_claim: write refused node=%s job=%s (claim mismatch or "
+                         "no such job)", node_id, job_id)
+            raise HTTPException(status_code=403, detail=_REFUSED)
+        try:
+            node_auth.check_claim_receipt(receipt, job_id, job.claim_id, node_id,
+                                          secret=_secret())
+        except node_auth.ClaimRefused as exc:
+            _log.warning("node_claim: write refused node=%s job=%s: %s",
+                         node_id, job_id, exc)
+            raise HTTPException(status_code=403, detail=_REFUSED) from None
+        if refusal_for_job(node_id, job) is not None:
+            raise HTTPException(status_code=403, detail=_REFUSED)
+        return job
+
+    def refusal_for_job(node_id: str, job) -> str | None:
+        """Still granted this job's engine? Checked on WRITE as well as on claim.
+
+        A certificate can lapse, or an engine can be removed from it, while a job is in
+        flight. Re-checking here means the grant has to hold for the whole run rather than
+        only at the instant of the hand-over.
+        """
+        from blastbox.host.placement import refusal
+
+        return refusal(_grants_now(node_id), engine=job.engine)
+
+    @router.get("/jobs/{job_id}", response_model=None)
+    def get_job(job_id: str, claim_id: str, receipt: str,
+                authorization: str | None = Header(None)) -> dict[str, Any]:
+        node_id = _node_from_token(authorization)
+        return {"job": _owned_job(job_id, node_id, claim_id, receipt).to_dict()}
+
+    @router.post("/jobs/{job_id}", response_model=None)
+    def update_job(job_id: str, req: UpdateRequest,
+                   authorization: str | None = Header(None)) -> dict[str, Any]:
+        """Write to a job this node holds the claim for, and only that.
+
+        ``expect_status`` routes to the store's compare-and-swap form. That is not an
+        optimisation: the CAS on ``(status, claim_id)`` is what closes the ABA hole where a
+        job goes RUNNING -> QUEUED -> RUNNING under another node and a stale owner's
+        terminal write lands on the new run.
+        """
+        from blastbox.host.jobs.base import JobStatus
+
+        node_id = _node_from_token(authorization)
+        _owned_job(job_id, node_id, req.claim_id, req.receipt)
+        if req.expect_status is not None:
+            try:
+                expect = JobStatus(req.expect_status)
+            except ValueError:
+                raise HTTPException(status_code=400,
+                                    detail="unknown status") from None
+            # Returns a BOOL, not a Job, and the kwarg is expect_claim_id -- read from
+            # the protocol rather than assumed, because guessing either would have made
+            # every CAS write look like it had succeeded.
+            applied = job_store.update_if_status(
+                job_id, expect, expect_claim_id=req.claim_id, **req.fields)
+            if not applied:
+                # NOT an error: losing a CAS is the normal outcome of a race the caller is
+                # expected to handle. 409 says "somebody else got there", which is what the
+                # store's False means.
+                raise HTTPException(status_code=409, detail="status changed")
+            fresh = job_store.get(job_id)
+            if fresh is None:
+                raise HTTPException(status_code=409, detail="status changed")
+            return {"job": fresh.to_dict()}
+        return {"job": job_store.update(job_id, **req.fields).to_dict()}
 
     app.include_router(router)
     _log.info("node_claim: enforcing node grants at the hand-over (pki=%s)", resolved)

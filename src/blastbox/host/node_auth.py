@@ -148,6 +148,102 @@ class ClaimRefused(Exception):
     """
 
 
+#: How long a session token is good for. SHORT, because it is the window in which a
+#: revoked or expired certificate still buys access: grants are re-resolved from the
+#: server's own certificate store on every request, but the token itself is only re-checked
+#: against the CA when it is renewed. Ten minutes bounds that without making the
+#: challenge-response handshake a per-request cost.
+SESSION_TTL_S = 600.0
+
+_SESSION_DOMAIN = b"blastbox/node-session/v1"
+
+
+def issue_session(node_id: str, *, secret: bytes, now: float | None = None,
+                  ttl_s: float = SESSION_TTL_S) -> str:
+    """A bearer token naming an ALREADY-AUTHENTICATED node. ``<node_id>:<expiry>:<mac>``.
+
+    WHY A TOKEN AT ALL, given the challenge-response works. Because binding a signature to
+    each operation would mean a challenge round trip plus a signature per call -- three
+    requests to update one job's status, on the path a dispatcher walks for every job. The
+    handshake happens once per :data:`SESSION_TTL_S` instead, which is the shape every
+    comparable agent protocol settles on (kubelet, Nomad, Buildkite).
+
+    WHAT THE TOKEN DOES NOT CARRY: the grants. It names the node and nothing else, so the
+    server re-resolves what that node may do FROM ITS OWN CERTIFICATE STORE on every
+    request. Freezing grants into the token would make it a capability that outlives the
+    certificate it came from -- revocation here is "stop renewing the certificate", and a
+    token asserting last week's grants would quietly defeat it for its whole lifetime.
+    This is exactly what `placement.fleet_grants` exists to answer.
+
+    STATELESS, for the same reason the challenge is: ingress forks, and a session table in
+    one worker's memory would reject tokens it issued in another.
+    """
+    expires_at = (time.time() if now is None else now) + ttl_s
+    payload = b"\x00".join((_SESSION_DOMAIN, node_id.encode(), repr(expires_at).encode()))
+    mac = hmac.new(secret, payload, hashlib.sha256).hexdigest()
+    return f"{node_id}:{expires_at!r}:{mac}"
+
+
+def verify_session(token: str, *, secret: bytes, now: float | None = None) -> str:
+    """The node id this token names, or raise :class:`ClaimRefused`."""
+    # Cut from the RIGHT. Equivalent to cutting from the left TODAY -- mutation-checked,
+    # and no test distinguishes them -- because `pki._NODE_ID_RE` forbids ":" in a node id
+    # and a float's repr has none either, so both parses agree on every issuable token. It
+    # is written this way against the id shape loosening: the MAC is the last field and is
+    # fixed-shape hex, so anchoring there stays correct if an id ever gains a separator,
+    # whereas anchoring on the first ":" would silently mis-split. Not a live defence, and
+    # said so rather than implying one.
+    head, _, mac = token.rpartition(":")
+    node_id, _, raw = head.rpartition(":")
+    if not node_id or not raw or not mac:
+        raise ClaimRefused("malformed session token")
+    try:
+        expires_at = float(raw)
+    except ValueError:
+        raise ClaimRefused("malformed session token") from None
+    payload = b"\x00".join((_SESSION_DOMAIN, node_id.encode(), repr(expires_at).encode()))
+    expected = hmac.new(secret, payload, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(mac, expected):
+        raise ClaimRefused("session token was not issued by this server")
+    if (time.time() if now is None else now) > expires_at:
+        raise ClaimRefused("session token has expired")
+    return node_id
+
+
+_RECEIPT_DOMAIN = b"blastbox/claim-receipt/v1"
+
+
+def claim_receipt(job_id: str, claim_id: str, node_id: str, *, secret: bytes) -> str:
+    """Proof that THIS server handed THIS job to THIS node.
+
+    WHY A CLAIM ID IS NOT ENOUGH, and this was a real hole found by a test written only
+    because a mutation showed the previous test was weak. `claim_next` stamps a per-claim
+    ownership token, and checking "does the caller know the claim id" is a BEARER check: any
+    node that learns another's claim id inherits its write access. Worse, it is not even a
+    secret by construction -- it travels in job records and logs.
+
+    The receipt binds all three together under the server's key. A peer cannot forge one for
+    its own node id (no key), and cannot reuse the holder's receipt either, because the
+    server recomputes the expected value using the node id from the CALLER'S OWN session
+    token. So presenting somebody else's receipt computes a different MAC and is refused.
+
+    Stateless, for the same reason as the session token: ingress forks, and a table of
+    "which node holds which job" in one worker's memory would refuse writes another worker
+    authorised. It also needs no `Job` schema change across four store backends.
+    """
+    payload = b"\x00".join((_RECEIPT_DOMAIN, job_id.encode(), claim_id.encode(),
+                             node_id.encode()))
+    return hmac.new(secret, payload, hashlib.sha256).hexdigest()
+
+
+def check_claim_receipt(receipt: str, job_id: str, claim_id: str, node_id: str, *,
+                        secret: bytes) -> None:
+    """Raise :class:`ClaimRefused` unless *receipt* was issued to *node_id* for this claim."""
+    if not hmac.compare_digest(
+            receipt, claim_receipt(job_id, claim_id, node_id, secret=secret)):
+        raise ClaimRefused("this job was not handed to this node")
+
+
 def _mac(secret: bytes, scope: str, expires_at: float) -> str:
     payload = b"\x00".join((_MAC_DOMAIN, scope.encode(), repr(expires_at).encode()))
     return hmac.new(secret, payload, hashlib.sha256).hexdigest()
@@ -225,6 +321,60 @@ def sign_claim(key_pem: bytes, challenge: str, scope: str, node_id: str) -> byte
                     ec.ECDSA(hashes.SHA256()))
 
 
+def admit_identity(
+    anchor: "TrustAnchor",
+    cert_pem: bytes,
+    *,
+    challenge: str,
+    scope: str,
+    signature: bytes,
+    secret: bytes,
+    now: float | None = None,
+) -> "NodeIdentity":
+    """WHO this caller is, proved. Says nothing about what it may do.
+
+    Split out from :func:`admit` because identity and authorisation are checked at
+    different times in the control-plane flow: identity once per session, authorisation on
+    every request from the server's own certificate store. Deliberately ONE implementation
+    of the identity half rather than two -- `SelfGrants` records what this codebase paid
+    for having two copies of "may I run this".
+    """
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    from blastbox.host.pki import node_identity
+
+    _check_challenge(challenge, scope, secret=secret, now=now)
+
+    # NO SECOND EKU CHECK HERE. `node_identity` already requires OID_NODE_AUTH
+    # (pki.py, "it is a transport cert, not a node identity"), so the dispatcher's client
+    # cert and any other CA-signed non-node cert are refused by the call below. A copy of
+    # that check was written here first and mutation testing showed it dead: deleting it
+    # failed nothing, because nothing can reach it.
+    try:
+        ident = node_identity(anchor, cert_pem)
+    except Exception as exc:            # noqa: BLE001 - any verify problem is a refusal
+        raise ClaimRefused(f"certificate does not verify: {exc}") from None
+
+    public_key = x509.load_pem_x509_certificate(cert_pem).public_key()
+    if not isinstance(public_key, ec.EllipticCurvePublicKey):
+        # REFUSED, not crashed. The CA issues P-256 only, so a node cert with any other
+        # key type did not come from `issue_node`; verifying it would mean guessing which
+        # signature scheme the caller meant, and a scheme the CALLER chooses is not a
+        # check. Fail closed on the unexpected shape.
+        raise ClaimRefused("certificate does not carry an elliptic-curve key")
+    try:
+        # POSSESSION. The payload is rebuilt from the verified identity, so a signature can
+        # only verify for the node the certificate actually names.
+        public_key.verify(signature, signing_payload(challenge, scope, ident.node_id),
+                          ec.ECDSA(hashes.SHA256()))
+    except Exception:                   # noqa: BLE001 - InvalidSignature, or a bad blob
+        raise ClaimRefused(
+            "does not prove possession of this certificate's key") from None
+    return ident
+
+
 def admit(
     anchor: "TrustAnchor",
     cert_pem: bytes,
@@ -238,51 +388,17 @@ def admit(
     require_credentials: bool = False,
     now: float | None = None,
 ) -> "NodeIdentity":
-    """The whole decision, in the order that fails cheapest first. Raises or returns.
+    """Identity AND authorisation in one call, for a caller that does both at once.
 
-    Every step is a refusal, never a fall-through: a malformed certificate, an
-    unparseable signature and an ungranted engine all end in :class:`ClaimRefused`, so
-    there is no path that reaches the caller's input without having verified all of it.
+    The grants come from the certificate presented, which is correct for a single-shot
+    hand-over. A control plane holding a certificate STORE should prefer
+    :func:`admit_identity` plus `placement.fleet_grants`, so that a certificate removed or
+    lapsed since issuance stops authorising immediately rather than at session expiry.
     """
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.asymmetric import ec
-
-    from blastbox.host.pki import node_identity
     from blastbox.host.placement import refusal
 
-    _check_challenge(challenge, scope, secret=secret, now=now)
-
-    # CA signature, expiry, and CN/node_id agreement. This is the authorisation check.
-    try:
-        ident = node_identity(anchor, cert_pem)
-    except Exception as exc:            # noqa: BLE001 - any verify problem is a refusal
-        raise ClaimRefused(f"certificate does not verify: {exc}") from None
-
-    # NO SECOND EKU CHECK HERE. `node_identity` already requires OID_NODE_AUTH
-    # (pki.py, "it is a transport cert, not a node identity"), so the dispatcher's client
-    # cert and any other CA-signed non-node cert are refused by the call above. A copy of
-    # that check was written here first and mutation testing showed it dead: deleting it
-    # failed nothing, because nothing can reach it. Two copies of "is this a node" is how
-    # one of them ends up being the only one maintained -- `SelfGrants` has the same note
-    # about two dispatch classes each holding their own "may I run this".
-
-    # POSSESSION. The payload is rebuilt from the verified identity, so a signature can
-    # only verify for the node the certificate actually names.
-    public_key = x509.load_pem_x509_certificate(cert_pem).public_key()
-    if not isinstance(public_key, ec.EllipticCurvePublicKey):
-        # REFUSED, not crashed. The CA issues P-256 only, so a node cert with any other
-        # key type did not come from `issue_node`; verifying it would mean guessing which
-        # signature scheme the caller meant, and a scheme the CALLER chooses is not a
-        # check. Fail closed on the unexpected shape.
-        raise ClaimRefused("certificate does not carry an elliptic-curve key")
-    try:
-        public_key.verify(signature, signing_payload(challenge, scope, ident.node_id),
-                          ec.ECDSA(hashes.SHA256()))
-    except Exception:                   # noqa: BLE001 - InvalidSignature, or a bad blob
-        raise ClaimRefused(
-            "does not prove possession of this certificate's key") from None
-
+    ident = admit_identity(anchor, cert_pem, challenge=challenge, scope=scope,
+                           signature=signature, secret=secret, now=now)
     why = refusal(ident.grants, engine=engine, tier=tier,
                   require_credentials=require_credentials)
     if why is not None:

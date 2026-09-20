@@ -453,3 +453,72 @@ def test_a_node_cert_with_a_non_ec_key_is_refused_not_crashed(fleet):
     with pytest.raises(ClaimRefused, match="elliptic-curve"):
         admit(anchor, cert_pem, challenge=ch, scope="claim-next",
               signature=b"whatever", secret=SECRET, engine="clamav")
+
+
+class TestSessionTokens:
+    """A token so the challenge-response is not paid per request. It names the node and
+    NOTHING else -- the grants are re-resolved per request from the server's own
+    certificate store, because a token carrying grants outlives the certificate it came
+    from and quietly defeats "revocation is stop renewing"."""
+
+    SECRET = b"the server's challenge key, 32 bytes at least ok"
+
+    def test_a_token_round_trips_to_its_node_id(self):
+        from blastbox.host.node_auth import issue_session, verify_session
+
+        t = issue_session("alpha", secret=self.SECRET)
+        assert verify_session(t, secret=self.SECRET) == "alpha"
+
+    def test_a_token_from_another_server_is_refused(self):
+        from blastbox.host.node_auth import ClaimRefused, issue_session, verify_session
+
+        t = issue_session("alpha", secret=b"a different deployment's secret!!")
+        with pytest.raises(ClaimRefused, match="not issued by this server"):
+            verify_session(t, secret=self.SECRET)
+
+    def test_an_expired_token_is_refused(self):
+        from blastbox.host.node_auth import (
+            SESSION_TTL_S,
+            ClaimRefused,
+            issue_session,
+            verify_session,
+        )
+
+        t = issue_session("alpha", secret=self.SECRET, now=1000.0)
+        with pytest.raises(ClaimRefused, match="expired"):
+            verify_session(t, secret=self.SECRET, now=1000.0 + SESSION_TTL_S + 1)
+
+    def test_the_node_id_cannot_be_edited(self):
+        """The whole point: a node must not be able to rename itself into a peer's grants."""
+        from blastbox.host.node_auth import ClaimRefused, issue_session, verify_session
+
+        t = issue_session("alpha", secret=self.SECRET)
+        _alpha, _, rest = t.partition(":")
+        with pytest.raises(ClaimRefused):
+            verify_session("beta:" + rest, secret=self.SECRET)
+
+    def test_the_expiry_cannot_be_extended(self):
+        from blastbox.host.node_auth import ClaimRefused, issue_session, verify_session
+
+        t = issue_session("alpha", secret=self.SECRET, now=1000.0)
+        node_id, _, rest = t.partition(":")
+        _exp, _, mac = rest.partition(":")
+        with pytest.raises(ClaimRefused):
+            verify_session(f"{node_id}:{1e12!r}:{mac}", secret=self.SECRET)
+
+    def test_a_token_does_not_carry_grants(self):
+        """If the token ever starts carrying them, this test should fail and the design note
+        in `issue_session` should be re-read before changing it."""
+        from blastbox.host.node_auth import issue_session
+
+        t = issue_session("alpha", secret=self.SECRET)
+        for leak in ("clamav", "boxjs", "engine", "tier", "credential"):
+            assert leak not in t
+
+    @pytest.mark.parametrize("bad", ["", "nocolons", "a:b", "alpha::", ":1.0:mac",
+                                     "alpha:notafloat:mac"])
+    def test_a_malformed_token_is_a_refusal_not_a_crash(self, bad):
+        from blastbox.host.node_auth import ClaimRefused, verify_session
+
+        with pytest.raises(ClaimRefused):
+            verify_session(bad, secret=self.SECRET)
