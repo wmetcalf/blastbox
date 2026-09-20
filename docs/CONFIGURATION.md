@@ -608,6 +608,7 @@ run it.
 |---|---|---|
 | `BLASTBOX_NODE_CERT` | — | path to this node's cert from `pki issue-node`. **Setting it at all is what arms the gate** — even to an empty value, which counts as a configured-but-unproducible identity and refuses |
 | `BLASTBOX_PKI_DIR` | `/var/lib/blastbox/pki` | where `ca.crt` lives. Only the CA's **public** half is needed on a worker |
+| `BLASTBOX_PKI_DIR` (on the **ingress** host) | `/var/lib/blastbox/pki` | if a `ca.crt` is here, ingress also serves `GET /v1/nodes/challenge` + `POST /v1/nodes/claim`, which check a node's certificate and grants **before** handing over a job (#178). Nothing to switch on; no CA means the routes do not exist. A node holding `BLASTBOX_DATABASE_URL` can still claim from the store directly, so for such a node this is defence in depth, not a gate — see DEPLOYMENT.md |
 | `BLASTBOX_NODE_GRANTS_GATE` | — | `0`/`false`/`no`/`off` force the gate off. **Any other non-empty value forces it on**, so a typo'd `enforce` hardens rather than silently disarms |
 
 **There is no cache and no TTL.** Every claimed job re-reads the certificate file and

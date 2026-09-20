@@ -391,6 +391,44 @@ Note that once the gate is armed, the paragraph below about the worker side look
 no longer holds: an expired certificate stops the worker taking any job at all, not just
 its egress ones.
 
+**Enforcing grants at the hand-over, not only on the node (#178).** Everything above is
+the node checking *itself*: the gate runs on the machine it limits. It is the right control
+for a lapsed certificate or an operator mistake, and it is not a control against the node,
+because the node executes it.
+
+If the ingress host has a CA (`blastbox pki init`), ingress also serves two routes that
+move the decision to the *other* side of the hand-over:
+
+```
+GET  /v1/nodes/challenge   → a short-lived challenge
+POST /v1/nodes/claim       → cert + signature + engine → the job, or 403
+```
+
+A node signs the challenge with the private key beside its `node-*.crt`, ingress verifies
+the signature against the certificate, resolves that certificate's grants, and claims a job
+**only if the grants allow it**. A refused node does not move a job out of `QUEUED`.
+
+There is nothing to configure. The routes appear because a trust anchor exists; with no CA
+they are not registered at all and nodes claim from the store exactly as before. The
+challenge-signing key is created in the PKI directory on first use, `0600`.
+
+Three things an operator must know:
+
+* **A node that holds `BLASTBOX_DATABASE_URL` can bypass this entirely.** The dispatch
+  process claims from the job store directly, so for a node with store credentials these
+  routes are defence in depth and an audit trail, not a gate. They become real prevention
+  only for a node given a certificate and this endpoint and *no* store credentials — which
+  also needs the result path fronted by the control plane, and is not finished yet. Do not
+  plan around this as though it closed that gap today.
+* **With `BLASTBOX_API_KEY` set, these routes require it too.** They are not in the
+  always-public list. The API key is the *submitter's* credential, so giving it to every
+  node also lets every node submit jobs. Either accept that, or run nodes against a listener
+  with no API key and let the certificate be the only authentication — which is what it is
+  designed to be.
+* **A refusal never says why.** Wrong CA, unheld key, ungranted engine and expired challenge
+  all return the same message, so a caller cannot map the fleet's grants by probing. The
+  reason is in the ingress log (`node_claim: refused …`); look there, not at the response.
+
 **Step 3 RECURS.** `pki issue-node` defaults to a 7-day lifetime — that short lifetime is
 what makes "revocation is stop renewing" work without a CRL or any online check — and the
 exit host's `prune_expired_peers` runs on every `apply`, which now includes the reconcile

@@ -219,3 +219,29 @@ class TestItIsActuallyWiredIntoTheApp:
         monkeypatch.setenv("BLASTBOX_PKI_DIR", str(tmp_path / "absent"))
         c = TestClient(build_app(job_store=InMemoryJobStore(), job_root=tmp_path / "jobs"))
         assert c.get("/v1/nodes/challenge").status_code == 404
+
+
+def test_the_module_does_not_overstate_what_it_enforces():
+    """The docstring must keep saying that a node holding store credentials can walk around
+    this. `dispatch` requires BLASTBOX_DATABASE_URL and calls claim_next() directly, so for
+    such a node these routes are defence in depth, not a gate.
+
+    This repo already has this test shape (`test_the_modules_say_accurately_which_half_is_
+    wired`) because a banner nobody re-reads is how a partial control gets described as a
+    complete one -- the exact defect class this area keeps producing. So the accuracy of
+    the claim is asserted, not trusted."""
+    import inspect
+
+    from blastbox.host.ingress import node_claim
+
+    doc = inspect.getdoc(node_claim) or ""
+    assert "NOT PREVENTION FOR A NODE THAT HOLDS STORE CREDENTIALS" in doc, (
+        "the limit was softened; if it has genuinely been closed, this test should be "
+        "deleted in the same commit that closes it")
+    assert "DEFENCE IN DEPTH" in doc
+    # And the reason it is still true: nothing has removed the store from the claim path.
+    import blastbox.host.dispatch as dispatch
+
+    assert "claim_next" in inspect.getsource(dispatch), (
+        "dispatch no longer claims from the store directly -- if nodes now claim only over "
+        "HTTP, the limit above is closed and this test plus that docstring should change")

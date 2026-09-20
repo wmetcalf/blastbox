@@ -18,6 +18,31 @@ as it does today. That is deliberate: a route that exists but waves everyone thr
 indistinguishable from this feature working, which is the failure mode the whole issue is
 about. A 404 cannot be mistaken for an authorisation decision.
 
+WHAT THIS DOES NOT DO, AND IT MATTERS MORE THAN WHAT IT DOES
+------------------------------------------------------------
+THIS IS NOT PREVENTION FOR A NODE THAT HOLDS STORE CREDENTIALS. The dispatch process
+requires ``BLASTBOX_DATABASE_URL`` and talks to the job store directly, so a node running
+a dispatcher can call ``claim_next()`` itself and never come here at all. For such a node
+these routes are DEFENCE IN DEPTH and an audit trail -- not a gate it cannot walk around.
+
+Do not read "grants enforced at the hand-over" as more than that. Overstating it would be
+the same defect class this whole area keeps producing: a control that is PRESENT rather
+than IN FORCE, reported as though it were in force.
+
+What this DOES do is make a credential-less node possible: a node given only a certificate
+and this endpoint, and NO store credentials, cannot claim work it is not granted, because
+the only path it has is this one. Getting there needs the control plane to front the
+result/update path too, so that a node never needs the store at all. That is the remaining
+half of #178 and it is a topology change, not a patch.
+
+BEARER AUTH APPLIES WHEN ``BLASTBOX_API_KEY`` IS SET. These routes are not in
+``BearerAuthMiddleware._ALWAYS_PUBLIC``, so an API-keyed deployment requires nodes to
+present the API key as well as their certificate. That is deliberate belt-and-braces, but
+note what it means operationally: the API key is the SUBMITTER's credential, so handing it
+to every node also lets every node submit jobs. Either accept that, or run nodes against a
+listener without an API key and let the certificate be the only authentication -- which is
+what it is designed to be.
+
 WHY NOT mTLS. ``issue_node`` stamps a critical private EKU and never ``clientAuth``,
 because ``tls.py`` verifies the CA chain only -- a node cert carrying ``clientAuth`` would
 be accepted by every worker AS THE DISPATCHER'S. See :mod:`blastbox.host.node_auth`, which
