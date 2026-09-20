@@ -217,12 +217,25 @@ class TestSessionHandling:
             f"expected exactly one retry, got {attempts.count('/v1/nodes/claim')}")
 
 
-def test_claiming_without_naming_an_engine_is_refused(control_plane, fleet):
-    """The server authorises PER ENGINE, so "any engine" cannot be authorised. Better to say
-    so than to silently claim nothing and look like an empty queue."""
+def test_claiming_without_naming_an_engine_asks_for_whatever_is_granted(control_plane,
+                                                                        fleet, backing):
+    """`dispatch.py` calls claim_next(claimant_tier=...) with NO engine whenever engine
+    scoping is off -- which is the DEFAULT. An earlier version of this store raised here, so
+    a credential-less dispatcher on default configuration failed on every single claim.
+
+    Omitting the engine now asks the control plane for anything this certificate grants,
+    which it can answer because it holds the certificate store."""
+    queued(backing, engine="clamav")
     s = node_store(control_plane, fleet, "alpha")
-    with pytest.raises(ValueError, match="engine"):
-        s.claim_next()
+    job = s.claim_next()
+    assert job is not None and job.job_id == "job-1"
+
+
+def test_omitting_the_engine_does_not_widen_the_grant(control_plane, fleet, backing):
+    queued(backing, engine="clamav")
+    s = node_store(control_plane, fleet, "beta")
+    assert s.claim_next() is None
+    assert backing.get("job-1").status == JobStatus.QUEUED
 
 
 def test_one_refused_engine_does_not_abandon_the_granted_ones(control_plane, fleet,

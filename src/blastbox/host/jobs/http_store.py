@@ -180,10 +180,16 @@ class HttpJobStore:
         return self._token
 
     def _auth(self) -> dict[str, str]:
+        from blastbox.host.ingress.node_claim import SESSION_HEADER
+
         with self._lock:
             if self._token is None or time.time() >= self._token_expires_at - _RENEW_MARGIN_S:
                 self._handshake()
-            return {"Authorization": f"Node {self._token}"}
+            # A DEDICATED header, not Authorization: an API-keyed control plane needs
+            # `Authorization: Bearer <api key>` and rejects anything else with 401 before the
+            # request reaches the node routes at all. One header cannot carry both
+            # credentials, so they get one each and coexist.
+            return {SESSION_HEADER: self._token or ""}
 
     def _call(self, method: str, path: str, **kw) -> Response:
         """One retry on 403, and exactly one.
@@ -209,15 +215,22 @@ class HttpJobStore:
         """Claim work this node is granted. The control plane decides, not this process."""
         from blastbox.host.jobs.base import Job
 
-        engines = _as_engine_list(engine)
-        if not engines:
-            raise ValueError(
-                "a control-plane claim must name the engine(s) this node handles: the "
-                "server authorises per engine, so 'any engine' cannot be authorised")
+        # engine=None is LEGITIMATE and must not raise: `dispatch.py` calls
+        # claim_next(claimant_tier=...) with no engine whenever engine scoping is off, which
+        # is the DEFAULT -- an earlier version raised here, so a credential-less dispatcher
+        # on default configuration failed on every claim. Omitting the engine asks the
+        # control plane for anything this certificate grants, which it can answer because it
+        # holds the certificate store.
+        engines: list[str | None] = list(_as_engine_list(engine)) or [None]
         for name in engines:
-            body_out: dict[str, Any] = {"engine": name}
+            body_out: dict[str, Any] = {}
+            if name is not None:
+                body_out["engine"] = name
             if claimant_tier:
-                body_out["tier"] = claimant_tier
+                # claimant_tier is TARGET-TIER ROUTING (claim only jobs aimed at this
+                # dispatcher), not a netpolicy grant. Conflating the two sent a routing hint
+                # into the authorisation predicate and lost the routing entirely.
+                body_out["claimant_tier"] = claimant_tier
             status, body = self._call("POST", "/v1/nodes/claim", json=body_out)
             if status == 204:
                 continue                # entitled, nothing queued for this engine
@@ -267,7 +280,23 @@ class HttpJobStore:
         status, body = self._write(job_id, fields, expect_status=None)
         if status != 200 or not body:
             raise RuntimeError(f"control plane update failed (HTTP {status})")
-        return _job_from_dict(body["job"], Job)
+        job = _job_from_dict(body["job"], Job)
+        self._retire_if_settled(job_id, job)
+        return job
+
+    def _retire_if_settled(self, job_id: str, job: "Job | None") -> None:
+        """Forget a job we can no longer write to, so the claim map is bounded.
+
+        Nothing removed entries before, so a long-lived dispatcher accumulated one per job it
+        had ever claimed -- small each, unbounded in total, and precisely the shape of leak
+        that only shows up after weeks of uptime. A terminal status, or a release, means the
+        receipt is spent.
+        """
+        from blastbox.host.jobs.base import JobStatus
+
+        terminal = {JobStatus.DONE, JobStatus.FAILED, JobStatus.EXPIRED, JobStatus.QUEUED}
+        if job is None or job.status in terminal or not job.claim_id:
+            self._claims.pop(job_id, None)
 
     def update_if_status(self, job_id: str, expect_status: "JobStatus", *,
                          expect_claim_id: str | None = None, **fields) -> bool:
@@ -281,7 +310,22 @@ class HttpJobStore:
             return False                # no longer ours to write, which is also "did not apply"
         if status != 200:
             raise RuntimeError(f"control plane conditional update failed (HTTP {status})")
+        from blastbox.host.jobs.base import JobStatus
+
+        if isinstance(fields.get("status"), (str, JobStatus)):
+            raw = fields["status"]
+            settled = raw if isinstance(raw, JobStatus) else JobStatus(str(raw))
+            if settled in (JobStatus.DONE, JobStatus.FAILED, JobStatus.EXPIRED,
+                           JobStatus.QUEUED):
+                self._claims.pop(job_id, None)
         return True
+
+    @staticmethod
+    def _wire_fields(fields: dict) -> dict:
+        """Enums as their values. `json.dumps` cannot serialise a `JobStatus`, and `JobStatus`
+        subclasses `str` so it would silently encode as the enum's REPR on some paths -- the
+        control plane then rejects it as an unknown status, which reads as a server bug."""
+        return {k: (v.value if hasattr(v, "value") else v) for k, v in fields.items()}
 
     def _write(self, job_id: str, fields: dict, *, expect_status: str | None,
                claim_id: str | None = None) -> Response:
@@ -298,7 +342,7 @@ class HttpJobStore:
             # server would refuse for a different-looking reason.
             return 409, None
         payload: dict[str, Any] = {"claim_id": held_claim_id, "receipt": receipt,
-                                   "fields": fields}
+                                   "fields": self._wire_fields(fields)}
         if expect_status is not None:
             payload["expect_status"] = expect_status
         return self._call("POST", f"/v1/nodes/jobs/{job_id}", json=payload)

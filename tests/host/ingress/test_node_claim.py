@@ -26,7 +26,7 @@ def pki_dir(tmp_path):
     d = tmp_path / "pki"
     ca = pki.ensure_ca(d)
     ca.issue_node("alpha", wg_pubkey=WG, grants=pki.NodeGrants(
-        engines=("clamav",), tiers=("socks",))).write(d, "node-alpha")
+        engines=("clamav",), tiers=("socks",), credentials=True)).write(d, "node-alpha")
     ca.issue_node("beta", wg_pubkey=WG, grants=pki.NodeGrants(
         engines=("boxjs",))).write(d, "node-beta")
     # gamma is granted the SAME engine as alpha, deliberately: it is the only way to test
@@ -76,18 +76,25 @@ def token_for(c, pki_dir, who, **kw):
 
 
 def auth(token):
-    return {"Authorization": f"Node {token}"}
+    from blastbox.host.ingress.node_claim import SESSION_HEADER
+
+    # A DEDICATED header, not Authorization: BearerAuthMiddleware rejects anything that is
+    # not "Bearer <key>" with 401 before the request reaches these routes, so an API-keyed
+    # deployment could not authenticate a node at all if the two shared a header.
+    return {SESSION_HEADER: token}
 
 
-def _claim(c, pki_dir, who, *, engine, tier=None, token=None, **session_kw):
+def _claim(c, pki_dir, who, *, engine=None, claimant_tier=None, token=None, **session_kw):
     """Claim as *who*. The handshake is REAL unless a token is supplied: otherwise a test
     that means to check the grants gate would be satisfied by a missing token instead, and
     pass for the wrong reason (this happened -- the refusal tests kept passing after the
     grants check moved, because no token was being sent at all)."""
     tok = token if token is not None else token_for(c, pki_dir, who, **session_kw)
-    body: dict = {"engine": engine}
-    if tier is not None:
-        body["tier"] = tier
+    body: dict = {}
+    if engine is not None:
+        body["engine"] = engine
+    if claimant_tier is not None:
+        body["claimant_tier"] = claimant_tier
     return c.post("/v1/nodes/claim", json=body, headers=auth(tok))
 
 
@@ -197,12 +204,69 @@ def test_a_signature_that_is_not_base64_is_refused_not_a_500(store, pki_dir):
     assert store.get("job-1").status == JobStatus.QUEUED
 
 
-def test_a_tier_grant_is_enforced(store, pki_dir):
+def test_the_tier_grant_is_derived_from_the_job_not_asked_of_the_node(
+        store, pki_dir, monkeypatch):
+    """THE NODE MUST NOT CHOOSE WHAT IT IS CHECKED AGAINST.
+
+    `tier` used to be a request field, so a node granted no tiers simply omitted it and the
+    tier grant went unexamined -- a caller selecting its own authorisation predicate is not
+    an authorisation check. The requirement now comes from the JOB's network personality,
+    resolved on this host, and there is no request field to leave out.
+
+    alpha is granted the `socks` tier and not `wireguard`. A wireguard job must be refused
+    AND put back; a socks job must be handed over."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_VPN", "exit=wireguard")
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_PROX", "exit=socks")
     c = client(store, pki_dir)
-    queued(store)
-    assert _claim(c, pki_dir, "alpha", engine="clamav", tier="wireguard").status_code == 403
+
+    store.create(Job(job_id="wg", engine="clamav", filename="s.bin", net_policy="vpn",
+                     status=JobStatus.QUEUED, created_at=time.time()))
+    r = _claim(c, pki_dir, "alpha", engine="clamav")
+    assert r.status_code == 403, r.text
+    back = store.get("wg")
+    assert back.status == JobStatus.QUEUED, "a job the node may not run was left claimed"
+    assert back.claim_id is None, "the release did not clear ownership"
+
+    store.delete("wg")
+    store.create(Job(job_id="px", engine="clamav", filename="s.bin", net_policy="prox",
+                     status=JobStatus.QUEUED, created_at=time.time()))
+    assert _claim(c, pki_dir, "alpha", engine="clamav").status_code == 200
+
+
+def test_the_credentials_requirement_is_derived_too(store, pki_dir, monkeypatch):
+    """gamma is granted the clamav engine AND the socks tier, but NOT credentials. A socks
+    exit means a local sidecar holding a provider secret, so the job needs a node cleared to
+    hold one -- and gamma is not, whatever it says about itself.
+
+    This is the half a node could previously dodge entirely by omitting a boolean."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_PROX", "exit=socks")
+    c = client(store, pki_dir)
+    store.create(Job(job_id="px", engine="clamav", filename="s.bin", net_policy="prox",
+                     status=JobStatus.QUEUED, created_at=time.time()))
+    r = _claim(c, pki_dir, "gamma", engine="clamav")
+    assert r.status_code == 403, r.text
+    assert store.get("px").status == JobStatus.QUEUED
+    assert store.get("px").claim_id is None
+    # alpha holds the same engine and tier AND credentials=True, so the same job is fine.
+    assert _claim(c, pki_dir, "alpha", engine="clamav").status_code == 200
+
+
+def test_omitting_the_engine_asks_for_whatever_the_certificate_grants(store, pki_dir):
+    """`dispatch.py` claims with NO engine whenever scoping is off, which is the default. An
+    earlier version required one, so a credential-less dispatcher on default configuration
+    was refused on every claim."""
+    c = client(store, pki_dir)
+    queued(store, engine="clamav")
+    r = _claim(c, pki_dir, "alpha")
+    assert r.status_code == 200, r.text
+    assert r.json()["job"]["job_id"] == "job-1"
+
+
+def test_omitting_the_engine_still_does_not_widen_the_grant(store, pki_dir):
+    c = client(store, pki_dir)
+    queued(store, engine="clamav")
+    assert _claim(c, pki_dir, "beta").status_code in (204, 403)
     assert store.get("job-1").status == JobStatus.QUEUED
-    assert _claim(c, pki_dir, "alpha", engine="clamav", tier="socks").status_code == 200
 
 
 class TestWithoutAPkiNothingChanges:
@@ -445,3 +509,103 @@ class TestANodeCanOnlyTouchTheJobItHolds:
                          "fields": {"worker_runtime": "runc"}})
         assert r.status_code == 403
         assert store.get(job["job_id"]).worker_runtime is None
+
+
+class TestTheThingsReviewCaught:
+    """Each of these is a defect an upstream reviewer found that the local suite did not.
+    They are kept as named tests so the same gap cannot reopen quietly."""
+
+    def test_node_auth_coexists_with_the_api_bearer_key(self, store, pki_dir):
+        """THE FEATURE WAS BROKEN, not merely awkward, whenever BLASTBOX_API_KEY was set.
+
+        `BearerAuthMiddleware` rejects any Authorization header not starting with "Bearer "
+        with a 401 BEFORE the request reaches these routes, and the earlier design sent
+        `Authorization: Node <token>`. One header cannot carry both credentials. They now
+        get one each: the API key says this caller may talk to the service, the session says
+        which node it is."""
+        from blastbox.host.ingress.middleware import BearerAuthMiddleware
+        from blastbox.host.ingress.node_claim import SESSION_HEADER
+
+        app = FastAPI()
+        assert register_node_claim_routes(app, job_store=store, pki_dir=pki_dir) is True
+        app.add_middleware(BearerAuthMiddleware, api_key="the-submitters-key")
+        c = TestClient(app)
+        queued(store)
+
+        api = {"Authorization": "Bearer the-submitters-key"}
+        ch = c.get("/v1/nodes/challenge", headers=api)
+        assert ch.status_code == 200, ch.text
+        sig = base64.b64encode(node_auth.sign_claim(
+            (pki_dir / "node-alpha.key").read_bytes(), ch.json()["challenge"],
+            node_auth.SCOPE_CLAIM_NEXT, "alpha")).decode()
+        sess = c.post("/v1/nodes/session", headers=api, json={
+            "cert_pem": (pki_dir / "node-alpha.crt").read_text(),
+            "challenge": ch.json()["challenge"], "signature": sig})
+        assert sess.status_code == 200, sess.text
+        r = c.post("/v1/nodes/claim", json={"engine": "clamav"},
+                   headers={**api, SESSION_HEADER: sess.json()["token"]})
+        assert r.status_code == 200, r.text
+        assert store.get("job-1").status == JobStatus.RUNNING
+
+    def test_a_node_may_not_rewrite_the_result_directory(self, store, pki_dir):
+        """`JobStore.update` takes ANY Job field, so without an allowlist an authenticated
+        node chose where this host writes a result. That is escalation, not untidiness."""
+        c = client(store, pki_dir)
+        queued(store)
+        r = _claim(c, pki_dir, "alpha", engine="clamav")
+        job, rcpt = r.json()["job"], r.json()["receipt"]
+        tok = token_for(c, pki_dir, "alpha")
+        bad = c.post(f"/v1/nodes/jobs/{job['job_id']}", headers=auth(tok),
+                     json={"claim_id": job["claim_id"], "receipt": rcpt,
+                           "fields": {"result_dir": "/etc"}})
+        assert bad.status_code == 400, bad.text
+        assert store.get(job["job_id"]).result_dir is None
+
+    def test_a_node_may_not_restamp_ownership(self, store, pki_dir):
+        c = client(store, pki_dir)
+        queued(store)
+        r = _claim(c, pki_dir, "alpha", engine="clamav")
+        job, rcpt = r.json()["job"], r.json()["receipt"]
+        tok = token_for(c, pki_dir, "alpha")
+        bad = c.post(f"/v1/nodes/jobs/{job['job_id']}", headers=auth(tok),
+                     json={"claim_id": job["claim_id"], "receipt": rcpt,
+                           "fields": {"claim_id": "mine-now"}})
+        assert bad.status_code == 400, bad.text
+        assert store.get(job["job_id"]).claim_id == job["claim_id"]
+
+    def test_a_status_string_becomes_a_real_enum(self, store, pki_dir):
+        """JSON has no enums. Stored as a bare string, every terminal write from a node put
+        a str where the rest of the system compares against JobStatus."""
+        c = client(store, pki_dir)
+        queued(store)
+        r = _claim(c, pki_dir, "alpha", engine="clamav")
+        job, rcpt = r.json()["job"], r.json()["receipt"]
+        tok = token_for(c, pki_dir, "alpha")
+        done = c.post(f"/v1/nodes/jobs/{job['job_id']}", headers=auth(tok),
+                      json={"claim_id": job["claim_id"], "receipt": rcpt,
+                            "fields": {"status": "done"}})
+        assert done.status_code == 200, done.text
+        stored = store.get(job["job_id"]).status
+        assert stored is JobStatus.DONE, f"stored {stored!r}, not the enum"
+
+    def test_an_unknown_status_is_a_400_not_a_stored_string(self, store, pki_dir):
+        c = client(store, pki_dir)
+        queued(store)
+        r = _claim(c, pki_dir, "alpha", engine="clamav")
+        job, rcpt = r.json()["job"], r.json()["receipt"]
+        tok = token_for(c, pki_dir, "alpha")
+        bad = c.post(f"/v1/nodes/jobs/{job['job_id']}", headers=auth(tok),
+                     json={"claim_id": job["claim_id"], "receipt": rcpt,
+                           "fields": {"status": "nonsense"}})
+        assert bad.status_code == 400, bad.text
+
+    def test_an_empty_pki_dir_setting_is_not_the_current_directory(self, store, monkeypatch,
+                                                                   tmp_path):
+        """Deployment tooling emits `BLASTBOX_PKI_DIR=` from an unset compose variable, and
+        `Path("")` is the CURRENT DIRECTORY -- so a blank value had this hunting for a trust
+        anchor in whatever directory the process started in."""
+        monkeypatch.setenv("BLASTBOX_PKI_DIR", "")
+        monkeypatch.chdir(tmp_path)
+        pki.ensure_ca(tmp_path)          # a CA in the cwd, which must NOT arm the routes
+        app = FastAPI()
+        assert register_node_claim_routes(app, job_store=store) is False
