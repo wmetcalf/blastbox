@@ -1,0 +1,269 @@
+"""Authenticating a node AT THE HAND-OVER POINT (#178).
+
+The property under test throughout: the server decides whether this caller may run this
+job BEFORE the caller receives the input, and it decides from the caller's certificate
+plus a proof of key possession -- never from anything the caller asserts about itself.
+
+Why not mTLS: `issue_node` stamps a CRITICAL private EKU (``OID_NODE_AUTH``) and
+deliberately never ``clientAuth``, because `tls.py` verifies the CA chain only -- so a
+node cert carrying ``clientAuth`` would be accepted by every worker AS THE DISPATCHER'S.
+OpenSSL's client-purpose check rejects a node cert outright
+(``SSLV3_ALERT_UNSUPPORTED_CERTIFICATE``), which is the pki module working as designed.
+So possession is proved one layer up, and the EKU is checked here -- exactly what
+``OID_NODE_AUTH``'s own comment says the control plane should do.
+"""
+from __future__ import annotations
+
+import pytest
+
+from blastbox.host import pki
+from blastbox.host.node_auth import (
+    CHALLENGE_TTL_S,
+    ClaimRefused,
+    admit,
+    challenge_for,
+    sign_claim,
+)
+
+WG = "A" * 42 + "B="
+SECRET = b"a server secret, shared by every ingress worker"
+
+
+@pytest.fixture
+def fleet(tmp_path):
+    """A CA, and two nodes granted different engines."""
+    d = tmp_path / "pki"
+    ca = pki.ensure_ca(d)
+    ca.issue_node("alpha", wg_pubkey=WG, grants=pki.NodeGrants(
+        engines=("clamav",), tiers=("socks",))).write(d, "node-alpha")
+    ca.issue_node("beta", wg_pubkey=WG, grants=pki.NodeGrants(
+        engines=("boxjs",))).write(d, "node-beta")
+    return d, ca, pki.load_trust_anchor(d)
+
+
+def _claim(fleet, who, *, job_id="job-1", engine="clamav", sign_as=None,
+           challenge=None, secret=SECRET, now=None, **kw):
+    """Present *who*'s certificate, signed by *sign_as* (default: the same node)."""
+    d, _ca, anchor = fleet
+    ch = challenge if challenge is not None else challenge_for(job_id, secret=SECRET, now=now)
+    signer = sign_as or who
+    sig = sign_claim((d / f"node-{signer}.key").read_bytes(), ch, job_id, who)
+    return admit(anchor, (d / f"node-{who}.crt").read_bytes(), challenge=ch,
+                 job_id=job_id, signature=sig, secret=secret, engine=engine, now=now, **kw)
+
+
+def test_a_granted_node_is_admitted(fleet):
+    assert _claim(fleet, "alpha", engine="clamav").node_id == "alpha"
+
+
+def test_an_ungranted_engine_is_refused_before_the_input_moves(fleet):
+    with pytest.raises(ClaimRefused) as e:
+        _claim(fleet, "alpha", engine="boxjs")
+    assert "boxjs" in str(e.value) and "clamav" in str(e.value), "say what IS granted"
+
+
+def test_each_node_is_admitted_for_its_own_grant_only(fleet):
+    assert _claim(fleet, "beta", engine="boxjs").node_id == "beta"
+    with pytest.raises(ClaimRefused):
+        _claim(fleet, "beta", engine="clamav")
+
+
+def test_presenting_a_peers_certificate_without_its_key_is_refused(fleet):
+    """THE #178 PROPERTY. A node that can read another node's .crt -- they sit in the same
+    pki dir on the exit host -- must not inherit its grants. Only the key proves identity."""
+    with pytest.raises(ClaimRefused) as e:
+        _claim(fleet, "alpha", engine="clamav", sign_as="beta")
+    assert "possession" in str(e.value).lower() or "signature" in str(e.value).lower()
+
+
+def test_a_signature_is_bound_to_its_challenge(fleet):
+    d, _ca, anchor = fleet
+    good = challenge_for("job-1", secret=SECRET)
+    sig = sign_claim((d / "node-alpha.key").read_bytes(), good, "job-1", "alpha")
+    other = challenge_for("job-1", secret=SECRET, now=1.0)
+    with pytest.raises(ClaimRefused):
+        admit(anchor, (d / "node-alpha.crt").read_bytes(), challenge=other, job_id="job-1",
+              signature=sig, secret=SECRET, engine="clamav")
+
+
+def test_a_signature_harvested_for_one_job_cannot_claim_another(fleet):
+    """One admitted claim must not be a reusable ticket for every job the node is granted.
+
+    WHERE THIS IS ENFORCED: the challenge MAC covers the job id, so presenting job-1's
+    challenge for job-2 fails as unrecognised -- which is why removing job_id from
+    `signing_payload` does NOT fail this test (measured). The payload's job id is
+    redundant defence in depth for a future challenge that is not job-scoped;
+    `test_the_signed_payload_binds_all_three` is what defends it."""
+    d, _ca, anchor = fleet
+    ch = challenge_for("job-1", secret=SECRET)
+    sig = sign_claim((d / "node-alpha.key").read_bytes(), ch, "job-1", "alpha")
+    with pytest.raises(ClaimRefused):
+        admit(anchor, (d / "node-alpha.crt").read_bytes(), challenge=ch, job_id="job-2",
+              signature=sig, secret=SECRET, engine="clamav")
+
+
+def test_the_signed_payload_binds_all_three(fleet):
+    """challenge, job and node all inside the signature, and each one changes it."""
+    from blastbox.host.node_auth import signing_payload
+
+    base = signing_payload("chal", "job-1", "alpha")
+    assert base != signing_payload("other", "job-1", "alpha"), "challenge not bound"
+    assert base != signing_payload("chal", "job-2", "alpha"), "job not bound"
+    assert base != signing_payload("chal", "job-1", "beta"), "node not bound"
+    # Field separation: "a" + "bc" must not collide with "ab" + "c".
+    assert signing_payload("a", "bc", "n") != signing_payload("ab", "c", "n")
+
+
+def test_a_challenge_for_one_job_does_not_open_another(fleet):
+    with pytest.raises(ClaimRefused) as e:
+        _claim(fleet, "alpha", job_id="job-2",
+               challenge=challenge_for("job-1", secret=SECRET))
+    assert "challenge" in str(e.value).lower()
+
+
+def test_an_expired_challenge_is_refused(fleet):
+    ch = challenge_for("job-1", secret=SECRET, now=1000.0)
+    with pytest.raises(ClaimRefused) as e:
+        _claim(fleet, "alpha", challenge=ch, now=1000.0 + CHALLENGE_TTL_S + 1)
+    assert "expire" in str(e.value).lower()
+
+
+def test_a_challenge_this_server_did_not_issue_is_refused(fleet):
+    """Forged, or minted by a different deployment. The MAC is the whole check."""
+    forged = challenge_for("job-1", secret=b"not this server's secret")
+    with pytest.raises(ClaimRefused) as e:
+        _claim(fleet, "alpha", challenge=forged)
+    assert "challenge" in str(e.value).lower()
+
+
+def test_a_dispatcher_client_certificate_cannot_claim_as_a_node(fleet):
+    """A dispatcher CLIENT cert is CA-signed and unexpired. It is not a node."""
+    d, ca, anchor = fleet
+    client = ca.issue_client("dispatcher")
+    client.write(d, "dispatcher")
+    ch = challenge_for("job-1", secret=SECRET)
+    sig = sign_claim((d / "dispatcher.key").read_bytes(), ch, "job-1", "dispatcher")
+    with pytest.raises(ClaimRefused):
+        admit(anchor, client.cert_pem, challenge=ch, job_id="job-1", signature=sig,
+              secret=SECRET, engine="clamav")
+
+
+def test_a_node_shaped_cert_carrying_clientauth_is_refused(fleet):
+    """A cert that satisfies everything EXCEPT the node EKU is still refused.
+
+    This is the escalation shape OID_NODE_AUTH exists to prevent: the node-info extension
+    present (so it looks like a node) but stamped ``clientAuth`` (so it is ALSO usable as
+    a TLS client cert, and `tls.py` verifies the CA chain only -- every worker would
+    accept it as the dispatcher's). Nothing in the CA's public surface mints one today,
+    so it is built with the CA key directly.
+
+    WHERE IT IS ENFORCED: inside `pki.node_identity`, which requires OID_NODE_AUTH before
+    reading the grants. `admit` deliberately does NOT re-check it -- a copy of that check
+    was written into `admit` first and mutation testing proved it dead code (deleting it
+    failed nothing), so it was removed rather than left to rot as a second authority."""
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+    from blastbox.host.pki import OID_NODE_INFO, _node_info_bytes, load_ca
+
+    d, _ca, anchor = fleet
+    ca = load_ca(d)
+    key = ec.generate_private_key(ec.SECP256R1())
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "impostor")]))
+        .issuer_name(x509.load_pem_x509_certificate(ca.cert_pem).subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=5))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        # clientAuth, NOT the private node EKU: the escalation shape.
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]),
+                       critical=True)
+        .add_extension(x509.UnrecognizedExtension(
+            OID_NODE_INFO,
+            _node_info_bytes("impostor", WG, pki.NodeGrants(engines=("clamav",)))),
+            critical=False)
+        .sign(serialization.load_pem_private_key(ca.key_pem, password=None),
+              hashes.SHA256())
+    )
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+    key_pem = key.private_bytes(serialization.Encoding.PEM,
+                                serialization.PrivateFormat.PKCS8,
+                                serialization.NoEncryption())
+    # Signed by the real CA, unexpired, carries node-info: only the EKU is wrong.
+    with pytest.raises(ValueError, match="node extended key usage"):
+        pki.node_identity(anchor, cert_pem)
+    ch = challenge_for("job-1", secret=SECRET)
+    sig = sign_claim(key_pem, ch, "job-1", "impostor")
+    with pytest.raises(ClaimRefused) as e:
+        admit(anchor, cert_pem, challenge=ch, job_id="job-1", signature=sig,
+              secret=SECRET, engine="clamav")
+    assert "node" in str(e.value).lower()
+
+
+def test_a_foreign_cas_node_certificate_is_refused(fleet, tmp_path):
+    _d, _ca, anchor = fleet
+    rogue_dir = tmp_path / "rogue"
+    rogue = pki.ensure_ca(rogue_dir)
+    rogue.issue_node("alpha", wg_pubkey=WG, grants=pki.NodeGrants(
+        engines=("clamav", "boxjs"))).write(rogue_dir, "node-alpha")
+    ch = challenge_for("job-1", secret=SECRET)
+    sig = sign_claim((rogue_dir / "node-alpha.key").read_bytes(), ch, "job-1", "alpha")
+    with pytest.raises(ClaimRefused) as e:
+        admit(anchor, (rogue_dir / "node-alpha.crt").read_bytes(), challenge=ch,
+              job_id="job-1", signature=sig, secret=SECRET, engine="clamav")
+    assert "sign" in str(e.value).lower() or "ca" in str(e.value).lower()
+
+
+def test_the_node_id_comes_from_the_certificate_not_the_request(fleet):
+    """There is no request-supplied node id to disagree with the certificate: the payload
+    is rebuilt from the VERIFIED identity, so claiming to be someone else cannot verify."""
+    d, _ca, anchor = fleet
+    ch = challenge_for("job-1", secret=SECRET)
+    # beta signs a payload naming ALPHA, and presents beta's own (valid) certificate.
+    sig = sign_claim((d / "node-beta.key").read_bytes(), ch, "job-1", "alpha")
+    with pytest.raises(ClaimRefused):
+        admit(anchor, (d / "node-beta.crt").read_bytes(), challenge=ch, job_id="job-1",
+              signature=sig, secret=SECRET, engine="boxjs")
+
+
+def test_a_tier_grant_is_enforced_too(fleet):
+    assert _claim(fleet, "alpha", engine="clamav", tier="socks").node_id == "alpha"
+    with pytest.raises(ClaimRefused) as e:
+        _claim(fleet, "alpha", engine="clamav", tier="wireguard")
+    assert "wireguard" in str(e.value)
+
+
+def test_credentials_are_enforced_too(fleet):
+    with pytest.raises(ClaimRefused) as e:
+        _claim(fleet, "alpha", engine="clamav", require_credentials=True)
+    assert "credential" in str(e.value).lower()
+
+
+def test_a_malformed_signature_is_a_refusal_not_a_crash(fleet):
+    d, _ca, anchor = fleet
+    ch = challenge_for("job-1", secret=SECRET)
+    with pytest.raises(ClaimRefused):
+        admit(anchor, (d / "node-alpha.crt").read_bytes(), challenge=ch, job_id="job-1",
+              signature=b"not a signature", secret=SECRET, engine="clamav")
+
+
+def test_a_malformed_certificate_is_a_refusal_not_a_crash(fleet):
+    _d, _ca, anchor = fleet
+    ch = challenge_for("job-1", secret=SECRET)
+    with pytest.raises(ClaimRefused):
+        admit(anchor, b"-----BEGIN CERTIFICATE-----\nnope\n-----END CERTIFICATE-----\n",
+              challenge=ch, job_id="job-1", signature=b"x", secret=SECRET, engine="clamav")
+
+
+def test_a_malformed_challenge_is_a_refusal_not_a_crash(fleet):
+    for bad in ("", "no-separator", "abc:def", "1:", ":abc", "1e9:zz"):
+        with pytest.raises(ClaimRefused):
+            _claim(fleet, "alpha", challenge=bad)
