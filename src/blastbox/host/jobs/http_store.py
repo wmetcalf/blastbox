@@ -27,12 +27,23 @@ this class. Closing it properly means another authenticated route mirroring the
 compare-and-swap, which is follow-up work; until then the warning is the operator's signal
 and this paragraph is why it fires.
 
-WHAT A RESTART COSTS. The claim receipt (see `node_auth.claim_receipt`) is PROCESS-LOCAL by
-design -- it is the proof this server handed this job to this node, and the server keeps no
-table of that. So a node that restarts mid-job cannot report on its in-flight claims. That
-is correct rather than unfortunate: a restarted dispatcher has lost the worker that was
-running the job too, and the existing reclaim-on-timeout path is exactly what should pick
-those jobs up. Nothing here tries to be cleverer than that.
+WHAT A LOST CLAIM COSTS, AND WHY IT IS BOUNDED. The claim receipt (see
+`node_auth.claim_receipt`) is PROCESS-LOCAL by design -- it is the proof this server handed
+this job to this node, and the server keeps no table of that. Three situations end with a
+job claimed and no local receipt, and they are ALL the same situation:
+
+* the node restarts mid-job;
+* the claim response is lost in flight, so the job is RUNNING and this process never learned
+  its id -- a later claim then takes a DIFFERENT job while the first sits orphaned;
+* the process is killed between claiming and recording.
+
+None of them is recoverable here, and none should be. In every case the worker that was
+running the job is gone too, so "recovering" the claim would mean reporting on work nobody
+did. The existing reclaim-on-timeout path is exactly what picks these up, and it is the same
+path a crashed dispatcher has always relied on -- the bound on the damage is that timeout,
+not this module. Making the claim idempotent instead would need a server-side table of which
+node holds what, which is the stateful design the session and receipt were built to avoid.
+Nothing here tries to be cleverer than the reclaim path.
 """
 
 from __future__ import annotations
