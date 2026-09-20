@@ -414,12 +414,27 @@ challenge-signing key is created in the PKI directory on first use, `0600`.
 
 Three things an operator must know:
 
-* **A node that holds `BLASTBOX_DATABASE_URL` can bypass this entirely.** The dispatch
-  process claims from the job store directly, so for a node with store credentials these
-  routes are defence in depth and an audit trail, not a gate. They become real prevention
-  only for a node given a certificate and this endpoint and *no* store credentials — which
-  also needs the result path fronted by the control plane, and is not finished yet. Do not
-  plan around this as though it closed that gap today.
+* **Whether this is prevention or merely defence in depth is a configuration choice.** A
+  node pointed at a *database* claims from the store directly and walks around these routes
+  entirely; for that node they are an audit trail. A node pointed at the *control plane* has
+  no other path, and then a refusal here is prevention. Choose deliberately:
+
+  ```sh
+  # federated node — no database credential anywhere on the box
+  BLASTBOX_DATABASE_URL=https://control-plane.example:8443
+  BLASTBOX_NODE_CERT=/var/lib/blastbox/pki/node-toolz3.crt   # key is the sibling .key
+  BLASTBOX_NODE_CA=/var/lib/blastbox/pki/ca.crt              # PUBLIC half only
+  ```
+
+  That is the same variable, not a new one, because a node talks to one or the other and
+  never both. Such a node also loses capabilities it never needed: it cannot submit jobs,
+  delete records, or enumerate the queue — those raise rather than silently doing nothing, so
+  a process mis-deployed with this URL fails loudly instead of looking healthy.
+
+  **What a restart costs.** The proof that a job was handed to *this* node is held in memory
+  by the process that claimed it, so a node restarting mid-job cannot report on its in-flight
+  work. That is deliberate — a restarted dispatcher lost the worker running the job too — and
+  those jobs are picked up by the existing reclaim-on-timeout path.
 * **With `BLASTBOX_API_KEY` set, these routes require it too.** They are not in the
   always-public list. The API key is the *submitter's* credential, so giving it to every
   node also lets every node submit jobs. Either accept that, or run nodes against a listener

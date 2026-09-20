@@ -29,11 +29,16 @@ Do not read "grants enforced at the hand-over" as more than that. Overstating it
 the same defect class this whole area keeps producing: a control that is PRESENT rather
 than IN FORCE, reported as though it were in force.
 
-What this DOES do is make a credential-less node possible: a node given only a certificate
-and this endpoint, and NO store credentials, cannot claim work it is not granted, because
-the only path it has is this one. Getting there needs the control plane to front the
-result/update path too, so that a node never needs the store at all. That is the remaining
-half of #178 and it is a topology change, not a patch.
+THE CREDENTIAL-LESS NODE NOW EXISTS, and that is where the prevention lives. A node whose
+``BLASTBOX_DATABASE_URL`` is an ``https://`` control plane gets
+:class:`~blastbox.host.jobs.http_store.HttpJobStore` instead of a database handle, so these
+routes are the ONLY path it has -- and then a refusal here is prevention, not advice.
+``tests/host/jobs/test_credential_less_node.py`` asserts both halves: that such a node
+cannot obtain ungranted work, and that it has no second route to try.
+
+So the limit above is a statement about CONFIGURATION, not about this module: point a node
+at a DSN and it walks around these routes; point it at the control plane and it cannot.
+Which of those a deployment does is the operator's choice, and DEPLOYMENT.md says so.
 
 BEARER AUTH APPLIES WHEN ``BLASTBOX_API_KEY`` IS SET. These routes are not in
 ``BearerAuthMiddleware._ALWAYS_PUBLIC``, so an API-keyed deployment requires nodes to
