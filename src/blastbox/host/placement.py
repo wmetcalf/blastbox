@@ -39,7 +39,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Mapping, Sequence
+from typing import TYPE_CHECKING, Callable, Mapping, Sequence
 
 from blastbox.host.node_registry import NodeRecord
 
@@ -48,6 +48,7 @@ if TYPE_CHECKING:
 from blastbox.host.pki import NodeGrants
 
 __all__ = [
+    "fleet_grants",
     "Candidate",
     "eligible",
     "rank",
@@ -107,6 +108,72 @@ def refusal(
         return ("this work needs a node that may hold provider credentials, and this "
                 "certificate grants credentials=False")
     return None
+
+
+def fleet_grants(
+    pki_dir: Path | str,
+    *,
+    log: Callable[..., None] | None = None,
+) -> dict[str, NodeGrants]:
+    """Every node id this reader can verify, mapped to the grants its certificate carries.
+
+    THE READER'S OWN CERTIFICATES, and nothing a node published. That is the whole point:
+    :func:`eligible` needs a `Mapping[node_id, NodeGrants]`, and if that mapping came from the
+    registry then a node could widen itself by writing a bigger number. It comes from here
+    instead -- the certificates on this host, verified against this host's trust anchor -- so
+    what a node claims cannot influence what it is permitted.
+
+    EVERY ``*.crt``, not just ``node-*.crt``. `pki issue-node --out` lets an operator name the
+    file anything, and globbing a prefix silently skipped those: their node then read as
+    unverifiable and was refused work -- a false accusation produced by a filename convention.
+    `node_identity` is the filter; a transport cert simply fails it. (That lesson is already
+    recorded in `cli.py`'s attest path, which is why this one is written the same way.)
+
+    A certificate that does not verify -- expired, foreign, malformed -- is ABSENT from the
+    result, not present with empty grants. `eligible` treats absence as ineligible and
+    :func:`unverified_nodes` exists to tell an operator which of the two it was.
+
+    WHAT THIS DOES NOT DO. It answers "what is node X permitted", not "is this caller node X".
+    Binding a published record, or a claim, to the identity that authenticated is the
+    transport's job -- mTLS at the control plane, which `NodeRecord`'s docstring already says
+    and issue #178 tracks. Without that binding a node can publish under another node's id and
+    inherit its grants here, so this resolver is a necessary half, not a sufficient one.
+    """
+    from pathlib import Path as _Path
+
+    from blastbox.host.pki import load_trust_anchor, node_identity
+
+    d = _Path(pki_dir)
+    out: dict[str, NodeGrants] = {}
+    try:
+        ca = load_trust_anchor(d)
+    except Exception as exc:                      # noqa: BLE001 - any CA problem is "verify nothing"
+        if log:
+            log("placement_fleet_grants_no_ca pki_dir=%s err=%s note=no node can be verified, "
+                "so no node is eligible", d, exc)
+        return out
+    for crt in sorted(d.glob("*.crt")):
+        try:
+            ident = node_identity(ca, crt.read_bytes())
+        except Exception:                          # noqa: BLE001 - one bad file is not a fleet outage
+            continue
+        prior = out.get(ident.node_id)
+        if prior is not None and prior != ident.grants:
+            # TWO verifiable certificates for one node id, disagreeing about what it may do.
+            # Take the INTERSECTION rather than the first or the last: the filesystem order of
+            # two files is not an authorisation decision, and during a re-issue both exist.
+            merged = NodeGrants(
+                engines=tuple(sorted(set(prior.engines) & set(ident.grants.engines))),
+                tiers=tuple(sorted(set(prior.tiers) & set(ident.grants.tiers))),
+                credentials=prior.credentials and ident.grants.credentials,
+            )
+            if log:
+                log("placement_fleet_grants_conflict node_id=%s note=two verifiable certs "
+                    "disagree; taking the intersection", ident.node_id)
+            out[ident.node_id] = merged
+            continue
+        out[ident.node_id] = ident.grants
+    return out
 
 
 def eligible(
