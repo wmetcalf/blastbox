@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import os
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -61,6 +62,23 @@ _MAC_DOMAIN = b"blastbox/node-challenge/v1"
 #: already requires. Never an env var: a secret on a command line or in a unit file is
 #: exactly what this project refuses elsewhere (see the SOCKS/proxy URL handling).
 SECRET_FILE = "claim-challenge.key"
+
+#: Overrides where the key lives. A PATH, never the secret itself -- a secret on a command
+#: line or in a unit file is what this project refuses elsewhere.
+#:
+#: WHY IT EXISTS: MULTI-HOST INGRESS. Challenges and session tokens are MACs under this key,
+#: so two ingress hosts with their own PKI directories mint credentials the other rejects --
+#: behind a load balancer a node's handshake fails whenever the challenge and the session
+#: land on different hosts, which is most of the time. Workers FORKED on one host are fine
+#: (same file); separate hosts are not. Point every ingress host at the same key.
+#:
+#: THE PROPER FIX IS THE JOB STORE, not a file: the documented role-separated topology
+#: deliberately rejects a shared filesystem, and the queue is the only thing those processes
+#: share by definition -- which is exactly the argument `BlobTargetRegistry` already makes
+#: for proving two processes agree. That needs a compare-and-swap slot on all three store
+#: backends and is follow-up work; until then this knob is how a multi-host deployment is
+#: made correct, and `blastbox serve` says so when it cannot tell.
+SECRET_FILE_ENV = "BLASTBOX_CLAIM_SECRET_FILE"
 
 #: 32 bytes of HMAC key. Shorter is not rejected for being unfashionable -- it is rejected
 #: because a truncated file is the observable symptom of an interrupted first write, and
@@ -90,11 +108,11 @@ def challenge_secret(pki_dir: "Path | str") -> bytes:
     regenerated: regenerating would invalidate every challenge the other workers have
     already minted, and padding would serve a key an interrupted write chose.
     """
-    import os
     import secrets
     import threading
 
-    path = Path(pki_dir) / SECRET_FILE
+    override = os.environ.get(SECRET_FILE_ENV, "").strip()
+    path = Path(override) if override else Path(pki_dir) / SECRET_FILE
     try:
         data = path.read_bytes()
         if len(data) >= _SECRET_BYTES:

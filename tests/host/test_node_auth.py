@@ -522,3 +522,51 @@ class TestSessionTokens:
 
         with pytest.raises(ClaimRefused):
             verify_session(bad, secret=self.SECRET)
+
+
+class TestMultiHostIngress:
+    """Challenges and session tokens are MACs under one key, so two ingress hosts with their
+    own PKI directories mint credentials the other rejects. Behind a load balancer that is a
+    handshake failing most of the time, presenting as a node problem."""
+
+    def test_two_hosts_with_separate_keys_do_not_interoperate(self, tmp_path):
+        """The failure this knob exists to prevent, pinned so it cannot be forgotten."""
+        from blastbox.host.node_auth import (
+            SCOPE_CLAIM_NEXT,
+            ClaimRefused,
+            challenge_for,
+            challenge_secret,
+            issue_session,
+            verify_session,
+        )
+
+        a, b = tmp_path / "hostA", tmp_path / "hostB"
+        a.mkdir()
+        b.mkdir()
+        tok = issue_session("alpha", secret=challenge_secret(a))
+        with pytest.raises(ClaimRefused):
+            verify_session(tok, secret=challenge_secret(b))
+        assert challenge_for(SCOPE_CLAIM_NEXT, secret=challenge_secret(a)) != \
+            challenge_for(SCOPE_CLAIM_NEXT, secret=challenge_secret(b))
+
+    def test_pointing_both_hosts_at_one_key_makes_them_agree(self, tmp_path, monkeypatch):
+        from blastbox.host.node_auth import (
+            SECRET_FILE_ENV,
+            challenge_secret,
+            issue_session,
+            verify_session,
+        )
+
+        a, b = tmp_path / "hostA", tmp_path / "hostB"
+        a.mkdir()
+        b.mkdir()
+        monkeypatch.setenv(SECRET_FILE_ENV, str(tmp_path / "shared.key"))
+        tok = issue_session("alpha", secret=challenge_secret(a))
+        assert verify_session(tok, secret=challenge_secret(b)) == "alpha"
+
+    def test_the_override_is_a_path_not_a_secret(self):
+        """A secret on a command line or in a unit file is what this project refuses
+        elsewhere; the variable must name a FILE."""
+        from blastbox.host import node_auth
+
+        assert node_auth.SECRET_FILE_ENV.endswith("_FILE")

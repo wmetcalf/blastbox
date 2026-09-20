@@ -278,7 +278,16 @@ def register_node_claim_routes(
                 _anchor(), req.cert_pem.encode(), challenge=req.challenge,
                 scope=node_auth.SCOPE_CLAIM_NEXT, signature=signature, secret=_secret())
         except node_auth.ClaimRefused as exc:
-            _log.warning("node_claim: session refused: %s", exc)
+            # NAME THE LIKELIEST CAUSE. "challenge was not issued by this server" behind a
+            # load balancer almost always means the challenge was minted by a DIFFERENT
+            # ingress host with its own key -- a deployment fault that reads as a node
+            # problem, and would otherwise be debugged on the node for a long time.
+            hint = ""
+            if "not issued by this server" in str(exc):
+                hint = (f" -- if more than one ingress host serves this address, they must "
+                        f"share the claim key; set {node_auth.SECRET_FILE_ENV} to one "
+                        f"location on every host")
+            _log.warning("node_claim: session refused: %s%s", exc, hint)
             raise HTTPException(status_code=403, detail=_REFUSED) from None
         _log.info("node_claim: session opened for node=%s", ident.node_id)
         return {
