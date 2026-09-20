@@ -376,6 +376,10 @@ a worker means copying two files to it and pointing one variable at them:
 ```bash
 # on the exit host
 scp /var/lib/blastbox/pki/node-toolz3.crt /var/lib/blastbox/pki/ca.crt toolz3:/var/lib/blastbox/pki/
+# ...and the KEY, if this node will claim through the control plane (#178). The local
+# grants gate only VERIFIES and needs the cert alone; signing a claim needs the key.
+# It is 0600 and must stay that way on the far side.
+scp -p /var/lib/blastbox/pki/node-toolz3.key toolz3:/var/lib/blastbox/pki/
 # on the worker, in the dispatcher's environment
 BLASTBOX_NODE_CERT=/var/lib/blastbox/pki/node-toolz3.crt
 ```
@@ -400,13 +404,32 @@ If the ingress host has a CA (`blastbox pki init`), ingress also serves two rout
 move the decision to the *other* side of the hand-over:
 
 ```
-GET  /v1/nodes/challenge   → a short-lived challenge
-POST /v1/nodes/claim       → cert + signature + engine → the job, or 403
+GET  /v1/nodes/challenge        → a short-lived challenge
+POST /v1/nodes/session          → cert + signature → a session token (10 min)
+POST /v1/nodes/claim            → the job, or 403          }  both carry the token in
+GET  /v1/nodes/jobs/{id}        → read a job this node holds }  X-Blastbox-Node-Session
+POST /v1/nodes/jobs/{id}        → report on it              }
 ```
 
-A node signs the challenge with the private key beside its `node-*.crt`, ingress verifies
-the signature against the certificate, resolves that certificate's grants, and claims a job
-**only if the grants allow it**. A refused node does not move a job out of `QUEUED`.
+A node signs the challenge with the private key beside its `node-*.crt` **once per session**
+— signing every request would cost a challenge round trip and a signature per call. The
+token names the node and carries **no grants**: what it may do is re-resolved from this
+host's certificate store on every request, so removing or narrowing a certificate takes
+effect on the next call rather than at token expiry.
+
+The token travels in `X-Blastbox-Node-Session`, **not** `Authorization` — that header is the
+API key's, and one header cannot carry both credentials.
+
+The engine check happens before any job moves. Tier and credentials requirements are derived
+here from the job's own network personality, never asked of the node: a caller that could
+omit `tier` would be choosing its own authorisation check. Because a job's requirements are
+only knowable once one is picked, an unentitled job is claimed, refused and **released back
+to `QUEUED`** with its claim cleared — the node never receives the record.
+
+**TLS.** This protocol authenticates the node but assumes the channel is server-authenticated.
+`blastbox serve` now issues its own certificate from the local CA when a PKI is present, so
+the secure path needs no extra step; `--tls-cert/--tls-key` uses your own, and `--no-tls` is
+available for a listener behind a TLS-terminating proxy.
 
 There is nothing to configure. The routes appear because a trust anchor exists; with no CA
 they are not registered at all and nodes claim from the store exactly as before. The

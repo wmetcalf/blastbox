@@ -59,10 +59,63 @@ def _serve_workers(
     return n
 
 
+def _serve_tls(args: argparse.Namespace) -> dict:
+    """uvicorn TLS parameters, or {} for plaintext.
+
+    WHY THIS EXISTS. The node-claim protocol (#178) authenticates the NODE cryptographically
+    but assumes the CHANNEL is server-authenticated TLS: without it, the session token and
+    every job record cross the network in clear, and nothing stops an interposer answering
+    as the control plane. `serve` had no way to enable TLS at all, so an operator following
+    the deployment guide necessarily ran it plaintext -- a design assumption with no means
+    of being satisfied.
+
+    Auto-issued from the local CA when a PKI is present and no explicit cert is given, so
+    the secure path needs no extra operator step. An explicit --tls-cert always wins, for a
+    deployment terminating TLS with its own certificate.
+    """
+    _log = logging.getLogger("blastbox.host.cli")
+    cert = getattr(args, "tls_cert", None) or os.environ.get("BLASTBOX_TLS_CERT", "")
+    key = getattr(args, "tls_key", None) or os.environ.get("BLASTBOX_TLS_KEY", "")
+    if bool(cert) != bool(key):
+        raise SystemExit("serve: --tls-cert and --tls-key must be given together")
+    if cert:
+        return {"ssl_certfile": cert, "ssl_keyfile": key}
+    if getattr(args, "no_tls", False):
+        _log.warning(
+            "serve: --no-tls -- the ingress listener is PLAINTEXT. Node session tokens and "
+            "job records cross the network in clear and an interposer can answer as the "
+            "control plane. Acceptable only behind a TLS-terminating proxy or on a trusted "
+            "local socket.")
+        return {}
+    from blastbox.host.ingress.node_claim import resolve_pki_dir
+
+    pki_dir = resolve_pki_dir()
+    if pki_dir is None:
+        # No PKI means the node-claim routes are not mounted either, so there is no new
+        # secret on this listener and plaintext is exactly the status quo. Say so once
+        # rather than refusing to start a deployment that never opted in.
+        _log.info("serve: no PKI, serving plaintext as before")
+        return {}
+    from blastbox.host.pki import load_ca
+
+    try:
+        ca = load_ca(pki_dir)
+    except Exception as exc:            # noqa: BLE001 - verify-only host, no CA key here
+        raise SystemExit(
+            f"serve: {pki_dir} has a trust anchor but no usable CA key ({exc}), so a server "
+            "certificate cannot be issued here. Pass --tls-cert/--tls-key with a certificate "
+            "issued elsewhere, or --no-tls if this listener sits behind a TLS proxy.") from None
+    issued = ca.issue_server([args.host, "localhost", "127.0.0.1"], cn="blastbox-ingress")
+    crt, key_path = issued.write(pki_dir, "ingress-server")
+    _log.info("serve: TLS on, certificate auto-issued from the local CA (%s)", crt)
+    return {"ssl_certfile": str(crt), "ssl_keyfile": str(key_path)}
+
+
 def _serve_cmd(args: argparse.Namespace) -> int:
     import uvicorn
 
     workers = _serve_workers(getattr(args, "workers", None))
+    tls = _serve_tls(args)
 
     if workers and workers > 1:
         # uvicorn forks `workers` processes; each must build its own app, so we pass an
@@ -76,6 +129,7 @@ def _serve_cmd(args: argparse.Namespace) -> int:
             host=args.host,
             port=args.port,
             workers=workers,
+            **tls,
         )
         return 0
 
@@ -88,7 +142,7 @@ def _serve_cmd(args: argparse.Namespace) -> int:
 
     extension = load_ingress_extension(os.environ.get("BLASTBOX_INGRESS_EXTENSION"))
     app = build_app(allowed_engines=allowed or None, extension=extension)
-    uvicorn.run(app, host=args.host, port=args.port, workers=1)
+    uvicorn.run(app, host=args.host, port=args.port, workers=1, **tls)
     return 0
 
 
@@ -1459,6 +1513,14 @@ def build_parser() -> argparse.ArgumentParser:
     ps = sub.add_parser("serve", help="run the ingress HTTP API")
     ps.add_argument("--host", default="127.0.0.1")
     ps.add_argument("--port", type=int, default=8000)
+    ps.add_argument("--tls-cert", default=None,
+                    help="server certificate (PEM). With a PKI present one is auto-issued "
+                         "from the local CA, so this is only needed to use your own.")
+    ps.add_argument("--tls-key", default=None, help="private key for --tls-cert")
+    ps.add_argument("--no-tls", action="store_true",
+                    help="serve plaintext even with a PKI present. Only behind a "
+                         "TLS-terminating proxy: node session tokens and job records "
+                         "otherwise cross the network in clear.")
     ps.add_argument(
         "--workers",
         type=int,

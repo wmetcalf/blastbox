@@ -18,6 +18,15 @@ to ensure that is for the capability to be absent rather than merely unused. The
 loudly rather than returning empty, because a silent no-op would make a mis-deployed
 serve/retention process look healthy while doing nothing.
 
+KNOWN RESIDUAL: NO BLOB-TARGET AGREEMENT CHECK. `canary.check_blob_target_agreement` gates
+on ``isinstance(store, BlobTargetRegistry)`` and this store does not implement it, so a
+credential-less dispatcher loses the check that proves it writes results where the ingress
+reads them -- the protection added after a 17,626-job incident. It is NOT silent: the canary
+already logs ``canary.blob_target_unverified ... agreement is NOT being checked``, naming
+this class. Closing it properly means another authenticated route mirroring the
+compare-and-swap, which is follow-up work; until then the warning is the operator's signal
+and this paragraph is why it fires.
+
 WHAT A RESTART COSTS. The claim receipt (see `node_auth.claim_receipt`) is PROCESS-LOCAL by
 design -- it is the proof this server handed this job to this node, and the server keeps no
 table of that. So a node that restarts mid-job cannot report on its in-flight claims. That
