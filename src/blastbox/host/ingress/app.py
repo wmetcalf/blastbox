@@ -1145,6 +1145,14 @@ def build_app(
     # then 404s every artifact.
     check_read_access(_blob_store, role="ingress")
 
+    # #178: hand work to a node only after proving WHICH node it is. Mounted only when
+    # this deployment has a trust anchor; without one the routes do not exist and nodes
+    # claim directly from the store exactly as before. See node_claim's module docstring
+    # for why a route that waves everyone through would be worse than no route.
+    from blastbox.host.ingress.node_claim import register_node_claim_routes
+
+    register_node_claim_routes(app, job_store=_job_store)
+
     return app
 
 

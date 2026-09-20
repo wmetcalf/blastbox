@@ -289,7 +289,8 @@ class TestTheChallengeSecretIsSharedNotPerProcess:
         from blastbox.host.node_auth import challenge_secret
 
         a, b = tmp_path / "a", tmp_path / "b"
-        a.mkdir(); b.mkdir()
+        a.mkdir()
+        b.mkdir()
         assert challenge_secret(a) != challenge_secret(b)
 
     def test_it_is_not_world_readable(self, tmp_path):
@@ -393,7 +394,8 @@ class TestTheChallengeSecretIsSharedNotPerProcess:
 
         d, _ca, anchor = fleet
         a, b = tmp_path / "a", tmp_path / "b"
-        a.mkdir(); b.mkdir()
+        a.mkdir()
+        b.mkdir()
         ch = challenge_for(SCOPE_CLAIM_NEXT, secret=challenge_secret(a))
         sig = sign_claim((d / "node-alpha.key").read_bytes(), ch, SCOPE_CLAIM_NEXT, "alpha")
         with _pytest.raises(ClaimRefused):
