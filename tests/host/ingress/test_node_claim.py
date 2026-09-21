@@ -260,7 +260,11 @@ def test_the_credentials_requirement_is_derived_too(store, pki_dir, monkeypatch)
     assert r.status_code == 204, r.text
     assert store.get("px").status == JobStatus.QUEUED
     assert store.get("px").claim_id is None
-    # alpha holds the same engine and tier AND credentials=True, so the same job is fine.
+    # The refusal DEFERRED the job for everyone (see _REFUSAL_DEFER_S), which is what stops a
+    # refused job being re-selected on every poll. Lift it so the point of this test -- that a
+    # node holding the credentials grant IS handed the same job -- is what is asserted.
+    assert store.get("px").claimable_after is not None
+    store.update("px", claimable_after=None)
     assert _claim(c, pki_dir, "alpha", engine="clamav").status_code == 200
 
 
@@ -444,9 +448,11 @@ class TestANodeCanOnlyTouchTheJobItHolds:
     def test_the_holder_can_read_and_write_it(self, store, pki_dir):
         c = client(store, pki_dir)
         job, rcpt, tok = self._claimed(c, pki_dir, store)
+        # Ownership proof travels in HEADERS: a query string lands in every access and proxy
+        # log on the path, and the receipt is the proof of ownership.
         got = c.get(f"/v1/nodes/jobs/{job['job_id']}",
-                    params={"claim_id": job["claim_id"], "receipt": rcpt},
-                    headers=auth(tok))
+                    headers={**auth(tok), "x-blastbox-claim-id": job["claim_id"],
+                             "x-blastbox-receipt": rcpt})
         assert got.status_code == 200, got.text
         wrote = c.post(f"/v1/nodes/jobs/{job['job_id']}", headers=auth(tok),
                        json={"claim_id": job["claim_id"], "receipt": rcpt,
@@ -484,8 +490,8 @@ class TestANodeCanOnlyTouchTheJobItHolds:
         job, rcpt, _tok = self._claimed(c, pki_dir, store)
         gamma = token_for(c, pki_dir, "gamma")
         r = c.get(f"/v1/nodes/jobs/{job['job_id']}",
-                  params={"claim_id": job["claim_id"], "receipt": rcpt},
-                  headers=auth(gamma))
+                  headers={**auth(gamma), "x-blastbox-claim-id": job["claim_id"],
+                           "x-blastbox-receipt": rcpt})
         assert r.status_code == 403
 
     def test_a_job_it_does_not_own_reads_as_403_not_404(self, store, pki_dir):
@@ -493,7 +499,7 @@ class TestANodeCanOnlyTouchTheJobItHolds:
         c = client(store, pki_dir)
         _job, rcpt, tok = self._claimed(c, pki_dir, store)
         r = c.get("/v1/nodes/jobs/no-such-job",
-                  params={"claim_id": "x", "receipt": "y"}, headers=auth(tok))
+                  headers={**auth(tok), "x-blastbox-claim-id": "x", "x-blastbox-receipt": "y"})
         assert r.status_code == 403
 
     def test_losing_the_cas_is_a_409_not_a_silent_success(self, store, pki_dir):

@@ -170,25 +170,29 @@ def test_a_federated_node_counts_as_a_shared_queue(deployment):
     assert "shared" in str(e.value).lower() or "local" in str(e.value).lower(), e.value
 
 
-def test_a_node_cannot_assert_its_own_runtime_tier(deployment):
-    """`claim_next(claimant_tier=...)` decides which target_tier-PINNED jobs a caller may take,
-    and pinning is an operator containment control — dispatch pins work so a pool-runtime drift
-    cannot route it onto a worker with a different egress posture. Taken from the request it was
-    the very defect `ClaimRequest` says it fixed by deleting `tier`: a caller choosing its own
-    authorisation predicate. Measured: a node running a plain cold pool asked for
-    claimant_tier="firecracker" and received the hardware-isolated job.
+def test_the_dispatchers_default_tier_hint_does_not_break_the_node(deployment, caplog):
+    """`Dispatcher` passes claimant_tier on EVERY claim -- its default is the non-empty string
+    "cold" -- so an earlier version that RAISED on any claimant_tier broke every credential-less
+    dispatcher before its first claim. Reviewed and reproduced. The hint is dropped, said once,
+    and unpinned work flows."""
+    _d, backing, as_node = deployment
+    backing.create(Job(job_id="plain", engine="clamav", filename="s.bin",
+                       status=JobStatus.QUEUED, created_at=time.time()))
+    node = as_node("cleared")
+    with caplog.at_level("INFO"):
+        job = node.claim_next(engine="clamav", claimant_tier="cold")
+    assert job is not None and job.job_id == "plain"
+    assert any("claimant_tier" in r.message for r in caplog.records), caplog.text
 
-    It cannot be authorised either, because a node's RUNTIME tier is not in its certificate —
-    `NodeGrants` carries engines, netpolicy tiers and credentials, and none of them says "this
-    node runs firecracker". So it is refused with a reason rather than dropped silently, which
-    would leave a dispatcher believing it was routing when it was not."""
+
+def test_a_pinned_job_is_not_handed_over_even_with_the_hint(deployment):
+    """The hint is dropped, so the control plane passes no tier and the store skips pinned work.
+    A node running a plain cold pool must not receive the hardware-isolated job."""
     _d, backing, as_node = deployment
     backing.create(Job(job_id="pinned", engine="clamav", filename="s.bin",
                        status=JobStatus.QUEUED, created_at=time.time(),
                        target_tier="firecracker"))
-    node = as_node("cleared")
-    with pytest.raises(NodeStoreUnsupported, match="runtime tier"):
-        node.claim_next(engine="clamav", claimant_tier="firecracker")
+    assert as_node("cleared").claim_next(engine="clamav", claimant_tier="firecracker") is None
     assert backing.get("pinned").status == JobStatus.QUEUED
 
 

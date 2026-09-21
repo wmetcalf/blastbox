@@ -463,15 +463,38 @@ Three things an operator must know:
   delete records, or enumerate the queue — those raise rather than silently doing nothing, so
   a process mis-deployed with this URL fails loudly instead of looking healthy.
 
-  **What a restart costs.** The proof that a job was handed to *this* node is held in memory
-  by the process that claimed it, so a node restarting mid-job cannot report on its in-flight
-  work. That is deliberate — a restarted dispatcher lost the worker running the job too — and
-  those jobs are picked up by the existing reclaim-on-timeout path.
-* **With `BLASTBOX_API_KEY` set, these routes require it too.** They are not in the
-  always-public list. The API key is the *submitter's* credential, so giving it to every
-  node also lets every node submit jobs. Either accept that, or run nodes against a listener
-  with no API key and let the certificate be the only authentication — which is what it is
-  designed to be.
+  **What a restart costs, and the setting that is REQUIRED because of it.** The proof that a job
+  was handed to *this* node is held in memory by the process that claimed it, so a node
+  restarting mid-job cannot report on its in-flight work. That is deliberate — a restarted
+  dispatcher lost the worker running the job too. But such a node also **cannot run the
+  dispatcher's own orphan sweep** (its store refuses to enumerate the queue), so the control
+  plane must run one instead, and it is off until you set it:
+
+  ```sh
+  # on every ingress host: fail RUNNING jobs idle longer than this (seconds, >= 300)
+  BLASTBOX_NODE_CLAIM_RECLAIM_AFTER_S=1800
+  ```
+
+  Set it to the longest run a node may legitimately take. Abandoned jobs are **failed, not
+  requeued** — a requeue would let a second worker re-detonate the same untrusted input. Ingress
+  warns at startup if this is unset.
+
+  **Node certificates go to every ingress host too.** Grants are resolved from the certificates
+  in the *ingress* host's PKI directory, so a node whose certificate lives only on the exit host
+  opens a session (it chains to the CA) and then has every claim refused. Enrolment is therefore:
+
+  ```sh
+  scp /var/lib/blastbox/pki/node-toolz3.crt ingress-1:/var/lib/blastbox/pki/
+  scp /var/lib/blastbox/pki/node-toolz3.crt ingress-2:/var/lib/blastbox/pki/   # every replica
+  ```
+
+  The public certificate only — never the key. Renewals must be copied the same way.
+* **`BLASTBOX_API_KEY` does not apply to these routes, by design.** They authenticate with a
+  CA-issued certificate and a session bound to it — stronger than the key, and orthogonal to
+  it. Requiring the key too would put the *submitter's* credential on every node, letting
+  every node submit jobs; and the node client has no way to send it. The challenge route
+  grants nothing, the session route verifies a certificate, and everything after needs the
+  session.
 * **A refusal never says why.** Wrong CA, unheld key, ungranted engine and expired challenge
   all return the same message, so a caller cannot map the fleet's grants by probing. The
   reason is in the ingress log (`node_claim: refused …`); look there, not at the response.

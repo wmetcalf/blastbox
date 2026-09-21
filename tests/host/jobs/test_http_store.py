@@ -386,11 +386,31 @@ class TestTheScopedBacklog:
         """A number computed from a DIFFERENT question than the caller asked is worse than a
         refusal: a sizer acting on a silently-wrong backlog has no symptom."""
         s = node_store(control_plane, fleet, "alpha")
-        for kw in ({"q": "sample"}, {"claimant_tier": "cold"}, {"untargeted_only": True}):
-            with pytest.raises(NodeStoreUnsupported):
-                s.count(JobStatus.QUEUED, engine="clamav", **kw)
+        with pytest.raises(NodeStoreUnsupported):
+            s.count(JobStatus.QUEUED, engine="clamav", q="sample")
         with pytest.raises(NodeStoreUnsupported):
             s.count(JobStatus.RUNNING, engine="clamav")
+        # claimant_tier is DROPPED (the sizer always sends it) and untargeted_only is passed
+        # through (a subset, never a widening) -- neither is a refusal. See the next test.
+
+    def test_the_sizers_REAL_call_shape_works(self, control_plane, fleet, backing, caplog):
+        """cli.py builds local_backlog_fn(store, served, claimant_tier=tier) and a second one
+        with untargeted_only=True. My earlier test called it with NEITHER, so it passed while
+        the real caller raised on every tick and the sizer sat at its floors. This is the shape
+        the sizer actually uses."""
+        from blastbox.host.node_sizer import local_backlog_fn
+
+        for i in range(3):
+            queued(backing, job_id=f"c{i}", engine="clamav")
+        backing.create(Job(job_id="pinned", engine="clamav", filename="f",
+                           status=JobStatus.QUEUED, created_at=time.time(),
+                           target_tier="firecracker"))
+        s = node_store(control_plane, fleet, "alpha")
+        with caplog.at_level("INFO"):
+            tiered = local_backlog_fn(s, ["clamav"], claimant_tier="cold")()
+            unpinned = local_backlog_fn(s, ["clamav"], untargeted_only=True)()
+        assert tiered == 4 and unpinned == 3, (tiered, unpinned)
+        assert any("claimant_tier" in r.message for r in caplog.records)
 
     def test_it_still_cannot_enumerate(self, control_plane, fleet, backing):
         """The count must not become a crack in the same wall."""

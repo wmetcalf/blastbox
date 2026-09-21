@@ -153,6 +153,9 @@ class HttpJobStore:
         #: stale owner) and the receipt against this node's identity. Process-local; see the
         #: module docstring on what a restart costs.
         self._claims: dict[str, tuple[str, str]] = {}
+        #: job ids whose terminal write has gone through: evictable before live ones.
+        self._settled: set[str] = set()
+        self._tier_hint_noted = False
 
     # -- transport ---------------------------------------------------------------
     def _urllib_transport(self, method: str, path: str, *, json: dict | None = None,
@@ -271,17 +274,21 @@ class HttpJobStore:
             body_out: dict[str, Any] = {}
             if name is not None:
                 body_out["engine"] = name
-            if claimant_tier:
-                # NOT SENT. The control plane refuses it, because a node's runtime tier is not
-                # in its certificate and so cannot be authorised -- and a node asserting its own
-                # tier was able to take hardware-isolated work it does not run. Raise here rather
-                # than drop it silently: a dispatcher that believes it is routing by tier and is
-                # not would claim work meant for another pool.
-                raise NodeStoreUnsupported(
-                    f"claimant_tier={claimant_tier!r} cannot be used over a control-plane "
-                    "store: a node's runtime tier is not carried in its certificate, so the "
-                    "control plane cannot authorise it. Jobs pinned with target_tier stay with "
-                    "dispatchers that hold the queue.")
+            # claimant_tier is NOT SENT, and NOT an error either. `Dispatcher` passes it on
+            # EVERY claim -- its default is the non-empty string "cold" -- so raising here (as the
+            # previous version did) broke every credential-less dispatcher before its first
+            # claim. Reviewed and reproduced. What the hint means is "only give me jobs pinned to
+            # my runtime tier"; the control plane cannot authorise a runtime tier (it is not in
+            # the certificate), so it passes NO tier to claim_next and the store skips every
+            # target_tier-pinned job on its own. Unpinned work flows; pinned work stays with
+            # dispatchers that hold the queue. Said once, at INFO, so an operator who expected
+            # pinned routing over this path learns why it does not happen.
+            if claimant_tier and not self._tier_hint_noted:
+                self._tier_hint_noted = True
+                _log.info("http_store: claimant_tier=%r is not sent to the control plane -- a "
+                          "node's runtime tier is not in its certificate, so target_tier-pinned "
+                          "jobs are never handed over this path; unpinned work is unaffected",
+                          claimant_tier)
             status, body = self._call("POST", "/v1/nodes/claim", json=body_out)
             if status == 204:
                 continue                # entitled, nothing queued for this engine
@@ -323,8 +330,11 @@ class HttpJobStore:
                 f"no claim receipt for job {job_id}: this process did not claim it, or was "
                 "restarted since. Callers that delete on None must not be told None here.")
         claim_id, receipt = held
+        # HEADERS, not query parameters: a query string lands in every access log and proxy
+        # log on the path, and the receipt is the proof of ownership.
         status, body = self._call("GET", f"/v1/nodes/jobs/{job_id}",
-                                 params={"claim_id": claim_id, "receipt": receipt})
+                                 headers={"x-blastbox-claim-id": claim_id,
+                                          "x-blastbox-receipt": receipt})
         if status == 403:
             raise ClaimNotHeld(
                 f"the control plane will not confirm this node's claim on {job_id}; it was "
@@ -340,6 +350,11 @@ class HttpJobStore:
         if status != 200 or not body:
             raise RuntimeError(f"control plane update failed (HTTP {status})")
         job = _job_from_dict(body["job"], Job)
+        from blastbox.host.jobs.base import JobStatus
+
+        if job.status in (JobStatus.DONE, JobStatus.FAILED, JobStatus.EXPIRED,
+                          JobStatus.QUEUED):
+            self._settled.add(job_id)
         self._retire_if_settled(job_id, job)
         return job
 
@@ -357,8 +372,22 @@ class HttpJobStore:
         grow for the life of the process. Python dicts preserve insertion order, which is the
         eviction order wanted here.
         """
+        if job is not None or job_id in self._settled:
+            self._settled.add(job_id)
         while len(self._claims) > _MAX_TRACKED_CLAIMS:
-            self._claims.pop(next(iter(self._claims)))
+            # SETTLED FIRST. A status-blind oldest-first eviction could drop the receipt of a
+            # job that is still RUNNING once enough newer claims arrived, after which its own
+            # terminal write would be refused as "no claim receipt" -- a live job orphaned by
+            # bookkeeping. Settled entries are only kept for the post-terminal read-back, so they
+            # go first; a live entry is evicted only past the hard cap, and that is logged.
+            victim = next((k for k in self._claims if k in self._settled), None)
+            if victim is None:
+                victim = next(iter(self._claims))
+                _log.warning("http_store: evicting the receipt of a LIVE job %s (more than %d "
+                             "claims tracked); its terminal write will be refused", victim,
+                             _MAX_TRACKED_CLAIMS)
+            self._claims.pop(victim, None)
+            self._settled.discard(victim)
 
     def update_if_status(self, job_id: str, expect_status: "JobStatus", *,
                          expect_claim_id: str | None = None, **fields) -> bool:
@@ -372,6 +401,13 @@ class HttpJobStore:
             return False                # no longer ours to write, which is also "did not apply"
         if status != 200:
             raise RuntimeError(f"control plane conditional update failed (HTTP {status})")
+        from blastbox.host.jobs.base import JobStatus
+
+        if isinstance(fields.get("status"), (str, JobStatus)):
+            raw = fields["status"]
+            if (raw if isinstance(raw, JobStatus) else JobStatus(str(raw))) in (
+                    JobStatus.DONE, JobStatus.FAILED, JobStatus.EXPIRED, JobStatus.QUEUED):
+                self._settled.add(job_id)
         self._retire_if_settled(job_id, None)
         return True
 
@@ -461,14 +497,27 @@ class HttpJobStore:
             raise NodeStoreUnsupported(
                 f"a node may only count QUEUED work, not {status}: counting other states means "
                 "reading the fleet's queue, which is what it may not do")
-        if q is not None or claimant_tier is not None or untargeted_only:
+        if q is not None:
             raise NodeStoreUnsupported(
-                "a node's backlog count supports engine scoping only. q/claimant_tier/"
-                "untargeted_only would be filtered on something the control plane cannot "
-                "authorise, and a number computed from a different question than you asked is "
-                "worse than a refusal -- a sizer acting on a silently-wrong backlog has no "
+                "a node's backlog count cannot filter by filename: that is a search over the "
+                "fleet's queue, and a number computed from a different question than you asked "
+                "is worse than a refusal -- a sizer acting on a silently-wrong backlog has no "
                 "symptom")
-        params = [("engine", name) for name in _as_engine_list(engine)]
+        # claimant_tier is DROPPED, not refused. The sizer passes it on every call
+        # (cli.py builds local_backlog_fn(store, served, claimant_tier=tier)), so refusing it
+        # starved every credential-less node's sizer -- and my test passed only because it
+        # called local_backlog_fn WITHOUT the arguments the real caller uses. The control plane
+        # cannot authorise a runtime tier, so the count is of unpinned work for the granted
+        # engines, which is exactly what this node can claim. untargeted_only=True narrows to
+        # unpinned work explicitly and is passed through: it is a SUBSET, never a widening.
+        if claimant_tier and not self._tier_hint_noted:
+            self._tier_hint_noted = True
+            _log.info("http_store: claimant_tier=%r is not sent to the control plane for the "
+                      "backlog count either; the count is of unpinned work for granted engines",
+                      claimant_tier)
+        params: list[tuple[str, str]] = [("engine", name) for name in _as_engine_list(engine)]
+        if untargeted_only:
+            params.append(("untargeted_only", "1"))
         status_code, body = self._call("GET", "/v1/nodes/backlog",
                                        params=params or None)
         if status_code != 200 or not body:

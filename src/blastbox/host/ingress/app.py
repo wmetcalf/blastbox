@@ -285,6 +285,19 @@ def build_app(
 
     _job_store: JobStore = job_store or build_job_store_from_env()
 
+    # A SERVING process must hold the queue, not a proxy to it. A control-plane URL here builds an
+    # HttpJobStore, which cannot create, list or delete -- so serve would boot, answer 200 on
+    # /v1/healthz (a load balancer then takes it into rotation), and 500 on every submission. The
+    # earlier guard keyed on a BLASTBOX_ROLE variable that nothing ever set, so it never fired;
+    # this one keys on the store's TYPE, which is the fact that matters and cannot be forgotten.
+    from blastbox.host.jobs.http_store import HttpJobStore
+
+    if isinstance(_job_store, HttpJobStore):
+        raise ValueError(
+            "BLASTBOX_DATABASE_URL is a control-plane URL, but this process SERVES the queue. A "
+            "serving process needs the database itself; only a node claims through the control "
+            "plane. Point BLASTBOX_DATABASE_URL at the database on this host.")
+
     _job_root = job_root or Path(
         os.environ.get("BLASTBOX_JOB_ROOT", "/var/lib/blastbox/jobs")
     ).expanduser()
@@ -432,25 +445,37 @@ def build_app(
                 _log.info("ingress: stale-claim sweep on, failing RUNNING jobs idle >%.0fs",
                           reclaim_after)
 
-            # Only when this process is the one holding the queue. A serving process built on a
-            # control-plane store cannot enumerate either, and two ingresses both expiring is
-            # harmless but pointless -- the sweeper is CAS-fenced, so this is about not pretending.
+            # RETENTION ON THE CONTROL PLANE, gated on RETENTION's own setting -- the same
+            # BLASTBOX_JOB_RETENTION_SECONDS the dispatcher honours -- and NOT on the reclaim
+            # variable, which is unrelated and was a conflation. And WITH the blob store: the
+            # first version constructed the sweeper without one, so it stamped EXPIRED and
+            # left every durable result object in place, which is expiry in name only.
+            # Reviewed by two independent reviewers. A serving process built on a control-
+            # plane store never reaches here (build_app refuses it), so this is always the
+            # process holding the queue.
             _retention_here = None
-            if reclaim_after:
+            try:
+                _retention_s = float(os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS") or "0")
+            except ValueError:
+                _retention_s = 0.0
+            if _retention_s > 0:
                 try:
                     from blastbox.host.jobs.retention import JobRetentionSweeper
 
-                    _retention_here = JobRetentionSweeper(_job_root)
+                    _retention_here = JobRetentionSweeper(_job_root, blob_store=_blob_store)
+                    _log.info("ingress: job retention sweep on (retention %.0fs, blob store "
+                              "%s)", _retention_s, type(_blob_store).__name__)
                 except Exception:  # noqa: BLE001 -- optional; never block serving
                     _log.warning("ingress: could not start the retention sweeper",
                                  exc_info=True)
 
             while not stop.wait(_reap_interval_s):
-                try:
-                    reap_stale_scratch(_job_root, _scratch_max_age_s, _job_store, reap_log,
-                                       blob_store=_blob_store)
-                except Exception:  # noqa: BLE001 -- a sweep failure must not kill the server
-                    _log.warning("ingress: scratch reclaim failed", exc_info=True)
+                if _scratch_max_age_s > 0:
+                    try:
+                        reap_stale_scratch(_job_root, _scratch_max_age_s, _job_store, reap_log,
+                                           blob_store=_blob_store)
+                    except Exception:  # noqa: BLE001 -- a sweep failure must not kill the server
+                        _log.warning("ingress: scratch reclaim failed", exc_info=True)
                 if reclaim_after:
                     try:
                         reclaim_stale_claims(_job_store, after_s=reclaim_after)
@@ -470,7 +495,16 @@ def build_app(
                         _log.warning("ingress: job retention sweep failed", exc_info=True)
 
         thread = None
-        if _scratch_max_age_s > 0 and _reap_interval_s > 0:
+        # EITHER task keeps the thread alive. This used to be gated on scratch reaping alone, so
+        # the documented BLASTBOX_SCRATCH_MAX_AGE_S=0 (disable scratch reclamation only) also
+        # silently disabled the stale-claim sweep -- and on a credential-less fleet that sweep is
+        # the ONLY reclaim path, so every lost claim stayed RUNNING forever.
+        from blastbox.host.ingress.node_reclaim import reclaim_after_s as _reclaim_after_s
+
+        _retention_wanted = (os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS") or "0").strip()
+        if ((_scratch_max_age_s > 0 or _reclaim_after_s() > 0
+             or _retention_wanted not in ("", "0"))
+                and _reap_interval_s > 0):
             thread = threading.Thread(target=_reap_loop, name="blastbox-ingress-reap",
                                       daemon=True)
             thread.start()

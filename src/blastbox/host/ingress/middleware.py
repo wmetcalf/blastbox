@@ -124,6 +124,15 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
     """
 
     _ALWAYS_PUBLIC: frozenset[str] = frozenset({"/v1/healthz", "/v1/version"})
+    #: Routes that authenticate the caller THEMSELVES and are therefore exempt from the bearer
+    #: key. The node-claim routes (#178) prove identity with an ECDSA challenge-response over a
+    #: CA-issued certificate and a session token bound to it -- stronger than the API key, and
+    #: orthogonal to it. Requiring the key here would put the SUBMITTER's credential on every
+    #: node, letting every node submit jobs; and the node client had no way to send it anyway,
+    #: so an API-keyed control plane refused every node with a 401 before the routes were ever
+    #: reached. Reviewed and reproduced. The challenge route grants nothing; the session route
+    #: verifies a certificate; everything after needs the session.
+    _SELF_AUTHENTICATING_PREFIXES: tuple[str, ...] = ("/v1/nodes/",)
 
     def __init__(self, app, api_key: str, *, metrics_public: bool = True) -> None:
         super().__init__(app)
@@ -134,6 +143,8 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request, call_next):
         if request.url.path in self._public:
+            return await call_next(request)
+        if request.url.path.startswith(self._SELF_AUTHENTICATING_PREFIXES):
             return await call_next(request)
         header = request.headers.get("authorization", "")
         if not header.startswith("Bearer "):

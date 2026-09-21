@@ -46,27 +46,14 @@ def test_a_database_url_still_builds_a_database_store(tmp_path):
     assert not isinstance(store, HttpJobStore)
 
 
-def test_a_serving_process_refuses_a_control_plane_url(tmp_path):
-    """A serve process pointed at a control plane becomes a claim proxy nobody designed, and it
-    boots "healthy" -- /v1/healthz answers 200, so a load balancer takes it into rotation -- then
-    500s on /v1/jobs because create/list/count raise. The docs promise it "fails loudly instead
-    of looking healthy"; deferring the failure to request time is not loudly."""
-    cert = tmp_path / "node-alpha.crt"
-    cert.write_text("x")
-    with pytest.raises(ValueError, match="SERVES the queue"):
-        build_job_store_from_env({
-            "BLASTBOX_DATABASE_URL": "https://control-plane.example:8443",
-            "BLASTBOX_NODE_CERT": str(cert),
-            "BLASTBOX_ROLE": "serve",
-        })
-
-
-def test_a_node_is_unaffected_by_the_role_guard(tmp_path):
+def test_the_factory_itself_does_not_judge_the_role(tmp_path):
+    """The role guard lives in build_app, keyed on the store's TYPE. An earlier version keyed on
+    BLASTBOX_ROLE here -- which nothing ever set, so it never fired. The factory just builds."""
     cert = tmp_path / "node-alpha.crt"
     cert.write_text("x")
     store = build_job_store_from_env({
         "BLASTBOX_DATABASE_URL": "https://control-plane.example:8443",
         "BLASTBOX_NODE_CERT": str(cert),
-        "BLASTBOX_ROLE": "dispatch",
+        "BLASTBOX_ROLE": "serve",          # ignored: no such contract any more
     })
     assert isinstance(store, HttpJobStore)

@@ -59,6 +59,45 @@ def _serve_workers(
     return n
 
 
+def _serve_tls_sans(host: str) -> list[str]:
+    """Names the auto-issued certificate must answer to.
+
+    ``--host 0.0.0.0`` (or ``::``) is the common production bind, and the first version put
+    THAT in the SAN -- a name no client ever connects to. Nodes verify the hostname they were
+    given (`client_ssl_context` keeps hostname checking on), so every one of them refused the
+    control plane's certificate. Reviewed. For a wildcard bind the machine's own names and
+    non-loopback addresses go in; ``BLASTBOX_TLS_SANS`` (comma-separated) adds the names nodes
+    are actually configured with -- a load balancer's DNS name, typically -- and is the right
+    answer whenever this host is not reached by its own name.
+    """
+    import socket
+
+    sans: list[str] = []
+    extra = os.environ.get("BLASTBOX_TLS_SANS", "")
+    sans += [x.strip() for x in extra.split(",") if x.strip()]
+    if host and host not in ("0.0.0.0", "::", ""):
+        sans.append(host)
+    else:
+        try:
+            name = socket.gethostname()
+            sans.append(name)
+            fqdn = socket.getfqdn()
+            if fqdn and fqdn != name:
+                sans.append(fqdn)
+            for info in socket.getaddrinfo(name, None):
+                ip = str(info[4][0])
+                if ip and not ip.startswith(("127.", "::1")) and ip not in sans:
+                    sans.append(ip)
+        except OSError:
+            pass
+    sans += ["localhost", "127.0.0.1"]
+    seen: list[str] = []
+    for x in sans:
+        if x not in seen:
+            seen.append(x)
+    return seen
+
+
 def _serve_tls(args: argparse.Namespace) -> dict:
     """uvicorn TLS parameters, or {} for plaintext.
 
@@ -119,7 +158,7 @@ def _serve_tls(args: argparse.Namespace) -> dict:
             f"{existing_crt} and {existing_key} (this is the hardened arrangement -- the signing "
             f"key never reaches an internet-facing host), or pass --tls-cert/--tls-key, or "
             "--no-tls if this listener sits behind a TLS-terminating proxy.") from None
-    issued = ca.issue_server([args.host, "localhost", "127.0.0.1"], cn="blastbox-ingress")
+    issued = ca.issue_server(_serve_tls_sans(args.host), cn="blastbox-ingress")
     crt, key_path = issued.write(pki_dir, "ingress-server")
     _log.info("serve: TLS on, certificate auto-issued from the local CA (%s)", crt)
     return {"ssl_certfile": str(crt), "ssl_keyfile": str(key_path)}

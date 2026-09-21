@@ -60,6 +60,7 @@ from __future__ import annotations
 import base64
 import binascii
 import logging
+import math
 import os
 import time
 from pathlib import Path
@@ -128,10 +129,14 @@ STRICT_TIERS_ENV = "BLASTBOX_NODE_CLAIM_STRICT_TIERS"
 #: request can do while still letting a node reach work behind a job it may not run.
 _MAX_CLAIM_PROBES = 8
 
-#: How long a (node, job) refusal is remembered, so a node does not claim-and-release the same
-#: job on every poll. Short: grants can change, and a stale memo only costs a missed poll.
-_REFUSAL_MEMO_S = 30.0
-_MAX_REFUSAL_MEMO = 4096
+#: How long a job this node may NOT run is deferred for EVERYONE after a refusal. This replaced
+#: a per-process refusal memo, which review showed still starved the node: memoised jobs kept
+#: consuming the probe budget, so nine refusable jobs at the head of the queue blocked the tenth
+#: forever, and forked ingress workers each held their own memo anyway. A deferral is honoured by
+#: `claim_next` itself on every backend, so the walk simply does not see the job again for a
+#: while -- and neither does an adversary trying to flap it, which bounds that to once per
+#: window. The cost is that an ENTITLED peer also waits this long for it; short on purpose.
+_REFUSAL_DEFER_S = 20.0
 
 #: The furthest into the future a node may defer a job. `claimable_after` exists for short
 #: capacity deferrals, and `claim_next` SKIPS a job until it passes -- so an unbounded value let
@@ -142,10 +147,6 @@ _MAX_REFUSAL_MEMO = 4096
 #: honestly, which is what made it worth closing.
 MAX_DEFERRAL_S = 3600.0
 
-# The refusal memo lives in `register_node_claim_routes`'s closure, one per app -- NOT at module
-# scope. Module scope leaked between tests (a refusal remembered by one suite silently skipped a
-# job in another), and it would equally leak between two apps in one process, which is a shape
-# this codebase supports for embedders.
 
 #: What a refused caller is told. ONE message for every cause -- a wrong CA, an unheld key,
 #: an ungranted engine and an expired challenge are all simply "no". Distinguishing them
@@ -268,9 +269,6 @@ def register_node_claim_routes(
             "expires_in": node_auth.CHALLENGE_TTL_S,
             "scope": node_auth.SCOPE_CLAIM_NEXT,
         }
-
-    #: (node_id, job_id) -> when it was refused. Per-app and best-effort; see _remember_refusal.
-    _refusals: "dict[tuple[str, str], float]" = {}
 
     # Resolved ONCE, here, and raised if it cannot be: every ingress process must sign with the
     # key its peers verify against, and the job store is where they agree. See
@@ -405,11 +403,12 @@ def register_node_claim_routes(
             raise HTTPException(status_code=403, detail=_REFUSED)
 
         # KEEP LOOKING PAST A JOB THIS NODE MAY NOT RUN. `claim_next` always returns the
-        # OLDEST eligible job, and a refused job goes straight back to QUEUED -- so returning
-        # after one refusal meant the next poll re-selected the SAME job forever and the node
-        # NEVER reached newer work it was entitled to. Measured: five consecutive polls, five
-        # refusals, and an entitled job two places back never claimed. So refusals are skipped
-        # within this request, and remembered briefly so the next poll does not re-walk them.
+        # OLDEST eligible job, and a refused job goes back to QUEUED -- so returning after one
+        # refusal meant the next poll re-selected the SAME job forever and the node NEVER
+        # reached newer work it was entitled to. Refused jobs are now released with a short
+        # deferral (see _REFUSAL_DEFER_S), which `claim_next` honours on every backend, so each
+        # probe here sees a job it has not yet judged. The loop bound is a cost cap, not the
+        # mechanism.
         skipped: list[Any] = []
         job = None
         try:
@@ -417,9 +416,6 @@ def register_node_claim_routes(
                 candidate = job_store.claim_next(engine=frozenset(allowed))
                 if candidate is None:
                     break
-                if _recently_refused(node_id, candidate.job_id):
-                    skipped.append(candidate)
-                    continue
                 tier, needs_credentials, could_tell = _job_requirements(candidate)
                 why = refusal(grants, engine=candidate.engine, tier=tier,
                               require_credentials=needs_credentials)
@@ -433,7 +429,6 @@ def register_node_claim_routes(
                 if why is None:
                     job = candidate
                     break
-                _remember_refusal(node_id, candidate.job_id)
                 skipped.append(candidate)
                 _log.warning("node_claim: released job=%s from node=%s: %s",
                              candidate.job_id, node_id, why)
@@ -507,9 +502,17 @@ def register_node_claim_routes(
         #   falls back to "none", and THAT is the silent hole: an operator declared a policy
         #   this host cannot see, so the tier and credentials grants would go unchecked while
         #   looking exactly like an ungoverned job. Unknown, and it must not read as permissive.
-        can_tell = engine_default == "none" or engine_default in registry
         allow_override = (os.environ.get("BLASTBOX_ALLOW_NETPOLICY_OVERRIDE", "").strip()
                           .lower() in ("1", "true", "yes", "on"))
+        can_tell = engine_default == "none" or engine_default in registry
+        if allow_override and job.net_policy and job.net_policy not in registry:
+            # The job SELECTS a personality this host has not got. `resolve_net_policy` falls
+            # through to the engine default -- possibly "none" -- so it would look ungoverned
+            # here while a node whose registry DOES hold that name resolves it to a real exit
+            # driver and runs it with no tier or credentials check. An explicitly selected but
+            # undeclared override is unknown, and in strict mode refused, exactly like an
+            # undeclared engine default.
+            can_tell = False
         try:
             personality = resolve_net_policy(
                 job_net_policy=job.net_policy, engine_default=engine_default,
@@ -526,25 +529,6 @@ def register_node_claim_routes(
     def _strict_tiers() -> bool:
         return (os.environ.get(STRICT_TIERS_ENV, "").strip().lower()
                 in ("1", "true", "yes", "on"))
-
-    def _recently_refused(node_id: str, job_id: str) -> bool:
-        stamp = _refusals.get((node_id, job_id))
-        return stamp is not None and (time.time() - stamp) < _REFUSAL_MEMO_S
-
-    def _remember_refusal(node_id: str, job_id: str) -> None:
-        """Remember a refusal briefly, so a node does not re-claim-and-release the same job on
-        every poll. Best-effort and per-process: losing it costs one extra release, which is
-        why it can be a plain dict rather than shared state. Bounded so a large queue cannot
-        grow it without limit.
-        """
-        now = time.time()
-        _refusals[(node_id, job_id)] = now
-        if len(_refusals) > _MAX_REFUSAL_MEMO:
-            for key, stamp in list(_refusals.items()):
-                if now - stamp >= _REFUSAL_MEMO_S:
-                    _refusals.pop(key, None)
-            while len(_refusals) > _MAX_REFUSAL_MEMO:
-                _refusals.pop(next(iter(_refusals)))
 
     def _release(job) -> None:
         """Put a wrongly-offered job back, fenced on the claim we are releasing.
@@ -564,13 +548,16 @@ def register_node_claim_routes(
                                        expect_claim_id=job.claim_id,
                                        status=JobStatus.QUEUED, claim_id=None,
                                        started_at=None, worker_runtime=None,
-                                       worker_tier=None)
+                                       worker_tier=None,
+                                       # Deferred, not merely requeued: see _REFUSAL_DEFER_S.
+                                       claimable_after=time.time() + _REFUSAL_DEFER_S)
         except Exception:               # noqa: BLE001 - the reclaim sweep is the backstop
             _log.exception("node_claim: could not release job=%s; the reclaim path will "
                            "pick it up", job.job_id)
 
     @router.get("/backlog", response_model=None)
     def backlog(engine: "list[str] | None" = Query(None),
+                untargeted_only: bool = Query(False),
                 x_blastbox_node_session: str | None = Header(None)) -> dict[str, Any]:
         """How much QUEUED work is waiting for the engines this node is granted.
 
@@ -597,8 +584,11 @@ def register_node_claim_routes(
             return {"queued": 0, "engines": []}
         from blastbox.host.jobs.base import JobStatus
 
+        # untargeted_only narrows to jobs with no target_tier -- the only jobs this node can
+        # ever be handed -- so passing it through is a SUBSET of the granted count, never more.
         return {
-            "queued": int(job_store.count(JobStatus.QUEUED, engine=allowed)),
+            "queued": int(job_store.count(JobStatus.QUEUED, engine=allowed,
+                                          untargeted_only=untargeted_only)),
             "engines": allowed,
         }
 
@@ -638,6 +628,41 @@ def register_node_claim_routes(
 
         return refusal(_grants_now(node_id), engine=job.engine)
 
+    def _typed(out: dict[str, Any]) -> None:
+        """Reject a value whose type the store would accept and the readers would choke on."""
+        def bad(name: str, why: str) -> None:
+            raise HTTPException(status_code=400, detail=f"{name}: {why}")
+
+        for name in ("started_at", "finished_at", "expires_at"):
+            if name in out and out[name] is not None:
+                if isinstance(out[name], bool) or not isinstance(out[name], (int, float)):
+                    bad(name, "must be a numeric timestamp or null")
+                if not math.isfinite(float(out[name])) or float(out[name]) < 0:
+                    bad(name, "must be a finite, non-negative timestamp")
+                out[name] = float(out[name])
+        if "materialise_attempts" in out:
+            v = out["materialise_attempts"]
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0 or v > 1_000_000:
+                bad("materialise_attempts", "must be a non-negative integer")
+        for name, cap in (("error", 8192), ("worker_runtime", 64), ("worker_tier", 64),
+                          ("input_sha256", 64)):
+            if name in out and out[name] is not None:
+                if not isinstance(out[name], str) or len(out[name]) > cap:
+                    bad(name, f"must be a string of at most {cap} characters or null")
+        if out.get("input_sha256") is not None and (
+                len(out["input_sha256"]) != 64
+                or any(c not in "0123456789abcdef" for c in out["input_sha256"].lower())):
+            bad("input_sha256", "must be 64 hex characters")
+        if "result_summary" in out and out["result_summary"] is not None:
+            v = out["result_summary"]
+            if not isinstance(v, dict) or len(str(v)) > 65536:
+                bad("result_summary", "must be an object of at most 64 KiB")
+        if "security_warnings" in out and out["security_warnings"] is not None:
+            v = out["security_warnings"]
+            if (not isinstance(v, list) or len(v) > 256
+                    or any(not isinstance(x, str) or len(x) > 1024 for x in v)):
+                bad("security_warnings", "must be a list of at most 256 short strings")
+
     def _vetted_fields(fields: dict[str, Any]) -> dict[str, Any]:
         """Only what a node may write, with wire values converted to what the store expects.
 
@@ -660,6 +685,11 @@ def register_node_claim_routes(
                 status_code=400,
                 detail=f"a node may not write: {', '.join(rejected)}")
         out = dict(fields)
+        # TYPES, NOT JUST NAMES. The store writes whatever it is given: with SQLite,
+        # started_at="not-a-time" was stored, and every later read of that job raised while
+        # converting it back -- the reclaim sweep, the listing, the API, all of them. One write
+        # from one node made a row unreadable to the whole fleet. Reviewed and reproduced.
+        _typed(out)
         if "claim_id" in out and out["claim_id"] is not None:
             # Releasing a job (claim_id=None) is legitimate. Re-stamping ownership is not:
             # every fence in this module is built on the claim id, so a node that could set
@@ -673,6 +703,14 @@ def register_node_claim_routes(
             except (TypeError, ValueError):
                 raise HTTPException(status_code=400,
                                     detail="claimable_after must be a timestamp") from None
+            if not math.isfinite(deferred):
+                # NaN passes float() and fails EVERY comparison, so it slid under the ceiling
+                # below and then sat in the store as a value `claim_next` would never consider
+                # due -- the permanent bury, back through a different door. inf is the same
+                # bury without the disguise.
+                raise HTTPException(status_code=400,
+                                    detail="claimable_after must be a finite timestamp")
+            out["claimable_after"] = deferred        # store the normalised float, not the wire value
             ceiling = time.time() + MAX_DEFERRAL_S
             if deferred > ceiling:
                 # Clamped, not refused: a legitimate deferral near the boundary should still
@@ -690,10 +728,17 @@ def register_node_claim_routes(
         return out
 
     @router.get("/jobs/{job_id}", response_model=None)
-    def get_job(job_id: str, claim_id: str, receipt: str,
-                x_blastbox_node_session: str | None = Header(None)) -> dict[str, Any]:
+    def get_job(job_id: str,
+                x_blastbox_node_session: str | None = Header(None),
+                x_blastbox_claim_id: str | None = Header(None),
+                x_blastbox_receipt: str | None = Header(None)) -> dict[str, Any]:
+        """Ownership proof in HEADERS. It was in the query string, which lands in every access
+        and proxy log on the path -- and the receipt is the proof of ownership."""
         node_id = _node_from_token(x_blastbox_node_session)
-        return {"job": _owned_job(job_id, node_id, claim_id, receipt).to_dict()}
+        if not x_blastbox_claim_id or not x_blastbox_receipt:
+            raise HTTPException(status_code=403, detail=_REFUSED)
+        return {"job": _owned_job(job_id, node_id, x_blastbox_claim_id,
+                                  x_blastbox_receipt).to_dict()}
 
     @router.post("/jobs/{job_id}", response_model=None)
     def update_job(job_id: str, req: UpdateRequest,
@@ -745,4 +790,15 @@ def register_node_claim_routes(
 
     app.include_router(router)
     _log.info("node_claim: enforcing node grants at the hand-over (pki=%s)", resolved)
+    from blastbox.host.ingress.node_reclaim import RECLAIM_AFTER_ENV, reclaim_after_s
+
+    if not reclaim_after_s():
+        # A node that claims through these routes cannot run the dispatcher's own orphan sweep
+        # (its store refuses to enumerate). Without the control-plane sweep, every claim lost to a
+        # restart or a dropped response stays RUNNING forever. That is a deployment that will
+        # quietly fill with stuck jobs, so it is said at startup, where it can be acted on.
+        _log.warning("node_claim: %s is not set. Nodes claiming through this control plane have "
+                     "NO reclaim path for lost claims -- a restart mid-job leaves the job RUNNING "
+                     "forever. Set it (seconds; >= 300) to the longest run a node may take.",
+                     RECLAIM_AFTER_ENV)
     return True
