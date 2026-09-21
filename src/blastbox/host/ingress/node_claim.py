@@ -65,7 +65,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from fastapi import APIRouter, Header, HTTPException, Response
+from fastapi import APIRouter, Header, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
 from blastbox.host import node_auth
@@ -564,6 +564,39 @@ def register_node_claim_routes(
         except Exception:               # noqa: BLE001 - the reclaim sweep is the backstop
             _log.exception("node_claim: could not release job=%s; the reclaim path will "
                            "pick it up", job.job_id)
+
+    @router.get("/backlog", response_model=None)
+    def backlog(engine: "list[str] | None" = Query(None),
+                x_blastbox_node_session: str | None = Header(None)) -> dict[str, Any]:
+        """How much QUEUED work is waiting for the engines this node is granted.
+
+        A COUNT IS NOT AN ENUMERATION, which is why this can exist while `list` cannot. It
+        returns one integer, scoped to engines the caller's certificate already grants -- so it
+        reveals nothing the node did not already know it was entitled to, and no job ids, no
+        filenames, no peers' work.
+
+        WHY IT IS NEEDED. Without it a node's sizer cannot read a backlog at all, and the
+        failure is invisible: `DispatcherSizer` falls back to a last-known value that starts at
+        zero and never advances, so the warm pool sits at its floor and the cold gate at its
+        floor however deep the queue is. Raising on `count` was necessary but not sufficient --
+        a bare `except` downstream turned it into exactly the silent under-serving the raise was
+        meant to prevent.
+        """
+        node_id = _node_from_token(x_blastbox_node_session)
+        grants = _grants_now(node_id)
+        if grants is None:
+            raise HTTPException(status_code=403, detail=_REFUSED)
+        wanted = [e for e in (engine or []) if e] or list(grants.engines)
+        allowed = sorted({e for e in wanted if grants.allows_engine(e)})
+        if not allowed:
+            # Nothing granted is not an error: it is a backlog of zero, for this caller.
+            return {"queued": 0, "engines": []}
+        from blastbox.host.jobs.base import JobStatus
+
+        return {
+            "queued": int(job_store.count(JobStatus.QUEUED, engine=allowed)),
+            "engines": allowed,
+        }
 
     def _owned_job(job_id: str, node_id: str, claim_id: str, receipt: str):
         """The job, if this node may write to it. Otherwise 403 -- and 403 for "no such job"

@@ -422,38 +422,58 @@ class HttpJobStore:
         * `requeue_orphaned_jobs` / `_fail_stale_queued_jobs` -- the reclaim sweep. Moved to the
           control plane (`ingress.node_reclaim`), which is where the queue lives. Nothing to do
           here.
-        * `JobRetentionSweeper.expire_due` -- retention. This one is NOT a capability a node
-          should be denied: it deletes the node's OWN artifact trees and blob objects, and the
-          node is the only process holding those bytes. It is denied anyway, because expiring
-          needs to FIND candidates, and a node scanning the fleet's queue is the thing this
-          store exists to prevent. Until a scoped route exists, retention must run where the
-          database is -- and `raise` is how an operator finds that out instead of watching
-          detonation output accumulate under a policy that is quietly a no-op.
-        * the node sizer's backlog -- see :meth:`count`.
+        * `JobRetentionSweeper.expire_due` -- retention. Expiring needs to FIND candidates, and
+          a node scanning the fleet's queue is the thing this store exists to prevent. So it runs
+          on the CONTROL PLANE now (`ingress.app`'s maintenance thread), which is where the queue
+          is -- the same reasoning that moved the stale-claim sweep. The node keeps the half it
+          can do without enumerating: `reap_stale_scratch` walks its OWN job_root by age, and
+          since `get()` raises rather than returning None it now fails SAFE there, retaining a
+          sealed last copy instead of reclaiming it as a "genuine orphan".
+        * the node sizer's backlog -- answered by :meth:`count` over a scoped route.
         """
         raise NodeStoreUnsupported(
             "a node may not enumerate the queue; it claims what it is granted. Retention and "
             "the reclaim sweep must run where the database is (the control plane runs the "
             "stale-claim sweep; see BLASTBOX_NODE_CLAIM_RECLAIM_AFTER_S)")
 
-    def count(self, *args, **kw):
-        """Refused -- and the caller that matters SWALLOWS it, which is worse than the refusal.
+    def count(self, status: "JobStatus | None" = None, *, q: str | None = None,
+              engine: "str | Any | None" = None, claimant_tier: str | None = None,
+              untargeted_only: bool = False) -> int:
+        """QUEUED work waiting for the engines this node is granted, over the backlog route.
 
-        `DispatcherSizer._count` catches any store error and substitutes `_last_backlog`, with no
-        log line. That starts at 0 and can never advance, so a permanent refusal here is
-        indistinguishable from an empty queue: the warm pool sits at its floor and the cold gate
-        at its floor no matter how deep the queue is, silently. That is the exact "looks healthy
-        while doing nothing" failure the raise was supposed to prevent, inverted by a bare
-        `except`.
+        A COUNT IS NOT AN ENUMERATION -- one integer, scoped server-side to engines this
+        certificate already grants -- which is why this is answerable while `list` is not.
 
-        So this raise is necessary but NOT sufficient, and saying so here is the honest state:
-        a node with resource management on needs a scoped backlog route before its sizer means
-        anything. Until then the node under-serves rather than over-serves, which is the safe
-        direction of being wrong.
+        THE NARROW CONTRACT IS DELIBERATE. Only the sizer's question is supported: QUEUED, by
+        engine. `q`, `claimant_tier` and `untargeted_only` would each need the server to filter on
+        something it cannot authorise or does not expose, and returning a number computed from a
+        DIFFERENT question than the caller asked is worse than refusing -- a sizer acting on a
+        silently-wrong backlog has no symptom. So those raise.
+
+        And the reason this route had to exist rather than leaving `count` refused:
+        `DispatcherSizer` catches any store error and falls back to a last-known backlog that
+        starts at 0 and never advances, so a permanent refusal was indistinguishable from an
+        empty queue -- floors everywhere, silently. Raising was necessary and not sufficient.
         """
-        raise NodeStoreUnsupported(
-            "a node may not enumerate the queue; it claims what it is granted. A node sizer "
-            "needs a scoped backlog route, which does not exist yet -- see this method")
+        from blastbox.host.jobs.base import JobStatus
+
+        if status is not None and status is not JobStatus.QUEUED:
+            raise NodeStoreUnsupported(
+                f"a node may only count QUEUED work, not {status}: counting other states means "
+                "reading the fleet's queue, which is what it may not do")
+        if q is not None or claimant_tier is not None or untargeted_only:
+            raise NodeStoreUnsupported(
+                "a node's backlog count supports engine scoping only. q/claimant_tier/"
+                "untargeted_only would be filtered on something the control plane cannot "
+                "authorise, and a number computed from a different question than you asked is "
+                "worse than a refusal -- a sizer acting on a silently-wrong backlog has no "
+                "symptom")
+        params = [("engine", name) for name in _as_engine_list(engine)]
+        status_code, body = self._call("GET", "/v1/nodes/backlog",
+                                       params=params or None)
+        if status_code != 200 or not body:
+            raise RuntimeError(f"control plane backlog failed (HTTP {status_code})")
+        return int(body["queued"])
 
 
 def _node_id_from_cert(cert_pem: bytes) -> str:

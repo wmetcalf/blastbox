@@ -432,6 +432,19 @@ def build_app(
                 _log.info("ingress: stale-claim sweep on, failing RUNNING jobs idle >%.0fs",
                           reclaim_after)
 
+            # Only when this process is the one holding the queue. A serving process built on a
+            # control-plane store cannot enumerate either, and two ingresses both expiring is
+            # harmless but pointless -- the sweeper is CAS-fenced, so this is about not pretending.
+            _retention_here = None
+            if reclaim_after:
+                try:
+                    from blastbox.host.jobs.retention import JobRetentionSweeper
+
+                    _retention_here = JobRetentionSweeper(_job_root)
+                except Exception:  # noqa: BLE001 -- optional; never block serving
+                    _log.warning("ingress: could not start the retention sweeper",
+                                 exc_info=True)
+
             while not stop.wait(_reap_interval_s):
                 try:
                     reap_stale_scratch(_job_root, _scratch_max_age_s, _job_store, reap_log,
@@ -443,6 +456,18 @@ def build_app(
                         reclaim_stale_claims(_job_store, after_s=reclaim_after)
                     except Exception:  # noqa: BLE001 -- same contract as above
                         _log.warning("ingress: stale-claim sweep failed", exc_info=True)
+                if _retention_here:
+                    # #178: retention has to run where the queue is. `expire_due` finds its
+                    # candidates by ENUMERATING, and a credential-less node's store refuses that
+                    # by design -- so on such a fleet BLASTBOX_JOB_RETENTION_SECONDS was quietly
+                    # a no-op and detonation output accumulated under a policy nobody was
+                    # enforcing. The node still reaps its own local trees by age
+                    # (`reap_stale_scratch`, which needs no enumeration); this is the half that
+                    # needs the queue.
+                    try:
+                        _retention_here.expire_due(_job_store)
+                    except Exception:  # noqa: BLE001 -- same contract as above
+                        _log.warning("ingress: job retention sweep failed", exc_info=True)
 
         thread = None
         if _scratch_max_age_s > 0 and _reap_interval_s > 0:

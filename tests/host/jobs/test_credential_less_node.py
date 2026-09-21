@@ -95,8 +95,12 @@ def test_and_it_has_no_other_way_to_take_it(deployment):
     # ...cannot enumerate the queue to find out what else is there...
     with pytest.raises(NodeStoreUnsupported):
         restricted.list()
+    # ...and while it CAN read a backlog count (its sizer needs one, and a count is not an
+    # enumeration), that count is scoped to engines its own certificate grants -- so the work it
+    # was refused is invisible in the number too.
+    assert restricted.count(JobStatus.QUEUED, engine="clamav") == 0
     with pytest.raises(NodeStoreUnsupported):
-        restricted.count()
+        restricted.count(JobStatus.RUNNING)
     # ...cannot manufacture work for itself...
     with pytest.raises(NodeStoreUnsupported):
         restricted.create(Job(job_id="mine", engine="boxjs", filename="f",

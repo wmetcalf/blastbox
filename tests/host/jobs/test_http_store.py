@@ -199,12 +199,20 @@ class TestTheNodeSurfaceIsDeliberatelySmaller:
     """A node with database credentials can submit and delete jobs today. It has no business
     doing either, and the way to guarantee that is for the capability to be ABSENT."""
 
-    @pytest.mark.parametrize("op", ["create", "delete", "list", "count"])
+    @pytest.mark.parametrize("op", ["create", "delete", "list"])
     def test_it_raises_rather_than_silently_doing_nothing(self, control_plane, fleet, op):
+        """`count` is NOT in this list any more, deliberately.
+
+        It used to be, and that was the safe-looking answer that under-served invisibly: the
+        sizer catches any store error and falls back to a backlog that starts at 0 and never
+        advances, so refusing to count was indistinguishable from an empty queue. It now answers
+        exactly the sizer's question -- QUEUED, by granted engine, one integer -- and refuses
+        every other shape. See TestTheScopedBacklog.
+        """
         s = node_store(control_plane, fleet, "alpha")
         args = {"create": (Job(job_id="x", engine="clamav", filename="f",
                                status=JobStatus.QUEUED, created_at=0.0),),
-                "delete": ("x",), "list": (), "count": ()}[op]
+                "delete": ("x",), "list": ()}[op]
         with pytest.raises(NodeStoreUnsupported):
             getattr(s, op)(*args)
 
@@ -327,3 +335,65 @@ def test_a_control_plane_that_omits_the_receipt_is_refused_not_trusted(control_p
                      transport=strips_receipt)
     with pytest.raises(RuntimeError, match="receipt"):
         s.claim_next(engine="clamav")
+
+
+class TestTheScopedBacklog:
+    """A node's sizer must be able to read a backlog, or it under-serves invisibly.
+
+    `DispatcherSizer` catches any store error and falls back to a last-known value that starts at
+    0 and never advances — so a permanent refusal is indistinguishable from an empty queue and the
+    pool sits at its floor however deep the queue is. Raising on `count` was necessary and NOT
+    sufficient, which is why this route exists.
+
+    A COUNT IS NOT AN ENUMERATION: one integer, scoped server-side to engines the certificate
+    already grants. That is the whole reason it is answerable while `list` is not.
+    """
+
+    def test_it_counts_the_queue_for_a_granted_engine(self, control_plane, fleet, backing):
+        for i in range(3):
+            queued(backing, job_id=f"c{i}", engine="clamav")
+        assert node_store(control_plane, fleet, "alpha").count(
+            JobStatus.QUEUED, engine="clamav") == 3
+
+    def test_it_does_not_count_work_this_node_is_not_granted(self, control_plane, fleet,
+                                                             backing):
+        queued(backing, job_id="mine", engine="clamav")
+        for i in range(5):
+            queued(backing, job_id=f"theirs{i}", engine="boxjs")
+        s = node_store(control_plane, fleet, "alpha")     # granted clamav only
+        assert s.count(JobStatus.QUEUED, engine="clamav") == 1
+        # Asking about an engine it does not hold is a zero, not a peek at the real number.
+        assert s.count(JobStatus.QUEUED, engine="boxjs") == 0
+
+    def test_omitting_the_engine_counts_everything_granted(self, control_plane, fleet,
+                                                           backing):
+        queued(backing, job_id="a", engine="clamav")
+        queued(backing, job_id="b", engine="boxjs")
+        assert node_store(control_plane, fleet, "alpha").count(JobStatus.QUEUED) == 1
+
+    def test_the_sizer_gets_a_real_number_through_its_own_helper(self, control_plane, fleet,
+                                                                backing):
+        """Through `local_backlog_fn`, which is what the sizer actually calls — not the store
+        directly. A route the real caller cannot use is not a fix."""
+        from blastbox.host.node_sizer import local_backlog_fn
+
+        for i in range(4):
+            queued(backing, job_id=f"c{i}", engine="clamav")
+        fn = local_backlog_fn(node_store(control_plane, fleet, "alpha"), ["clamav"])
+        assert fn() == 4
+
+    def test_a_question_it_cannot_answer_truthfully_is_refused(self, control_plane, fleet):
+        """A number computed from a DIFFERENT question than the caller asked is worse than a
+        refusal: a sizer acting on a silently-wrong backlog has no symptom."""
+        s = node_store(control_plane, fleet, "alpha")
+        for kw in ({"q": "sample"}, {"claimant_tier": "cold"}, {"untargeted_only": True}):
+            with pytest.raises(NodeStoreUnsupported):
+                s.count(JobStatus.QUEUED, engine="clamav", **kw)
+        with pytest.raises(NodeStoreUnsupported):
+            s.count(JobStatus.RUNNING, engine="clamav")
+
+    def test_it_still_cannot_enumerate(self, control_plane, fleet, backing):
+        """The count must not become a crack in the same wall."""
+        queued(backing)
+        with pytest.raises(NodeStoreUnsupported):
+            node_store(control_plane, fleet, "alpha").list()

@@ -158,3 +158,17 @@ def test_it_is_wired_into_the_ingress_maintenance_thread():
     src = inspect.getsource(app)
     assert "reclaim_stale_claims" in src, "the sweep is not called from the ingress app"
     assert "reclaim_after_s" in src, "the sweep's gate is not read from the ingress app"
+
+
+def test_job_retention_also_runs_on_the_control_plane():
+    """`expire_due` finds its candidates by ENUMERATING, which a credential-less node's store
+    refuses by design — so BLASTBOX_JOB_RETENTION_SECONDS was quietly a no-op on such a fleet and
+    detonation output accumulated under a policy nobody enforced. It belongs where the queue is,
+    for the same reason the stale-claim sweep does."""
+    import inspect
+
+    from blastbox.host.ingress import app
+
+    src = inspect.getsource(app)
+    assert "expire_due" in src, "the control plane runs no job retention"
+    assert "JobRetentionSweeper" in src

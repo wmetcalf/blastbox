@@ -95,3 +95,47 @@ def test_metrics_do_not_mask_the_real_outcome_when_ownership_cannot_be_confirmed
         root = Path(d)
         (root / JID).mkdir()
         _dispatcher(node, root)._record_outcome(_stale_job(), path="cold", started=0.0)
+
+
+def test_a_sealed_last_copy_is_not_reaped_on_a_credential_less_node(tmp_path):
+    """The other half of the None-means-gone defect, and it was DATA LOSS of a different kind.
+
+    `reap_stale_scratch` keys its last-copy protection on the row: a pending-upload tree is
+    retained only while `get()` says the job is FAILED. With `get()` returning None for "not
+    mine", the comment "a job unknown to the store is a genuine orphan and IS reclaimable" fired
+    on a host-sealed, trust-gate-passed, unreproducible result — which the sweep's own docstring
+    calls "data loss, not hygiene".
+
+    It is fixed by the same change and for the same reason: the reaper already guards with "store
+    trouble must not turn into deletion", so a raise routes into the unconfirmed path instead of
+    the reclaimable one. The store telling the truth let an existing fail-safe do its job.
+    """
+    import logging
+    import os
+    import time
+    import uuid
+
+    from blastbox.host.jobs.retention import mark_pending_upload, reap_stale_scratch
+
+    log = logging.getLogger("test.reap")
+    p = tmp_path / "pki"
+    ca = pki.ensure_ca(p)
+    ca.issue_node("n1", wg_pubkey=WG, grants=pki.NodeGrants(
+        engines=("boxjs",), credentials=True)).write(p, "node-n1")
+    store = HttpJobStore("https://cp", cert_path=p / "node-n1.crt",
+                         transport=_refuses_everything)
+
+    job_id = str(uuid.uuid4())
+    root = tmp_path / "scratch"
+    root.mkdir()
+    tree = root / job_id
+    (tree / "output").mkdir(parents=True)
+    (tree / "output" / "metadata.json").write_text('{"sealed": true}')
+    mark_pending_upload(root, job_id, log, "claim-abc")
+
+    old = time.time() - 100_000
+    for f in list(tree.rglob("*"))[::-1] + [tree]:
+        os.utime(f, (old, old))
+
+    reap_stale_scratch(root, 60.0, store, log, blob_store=None, recovery_enabled=True)
+    assert tree.exists(), "deleted the only copy of a sealed detonation result"
