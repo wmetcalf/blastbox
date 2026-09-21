@@ -65,6 +65,10 @@ def build_job_store_from_env(env: dict[str, str] | None = None) -> JobStore:
             cert_path=e.get("BLASTBOX_NODE_CERT") or None,
             key_path=e.get("BLASTBOX_NODE_KEY") or None,
             ca_path=e.get("BLASTBOX_NODE_CA") or None,
+            # This mapping is the configuration. If it omits the key or the CA, they are
+            # derived from the certificate beside it -- never from the ambient process, which
+            # would pair an injected certificate with somebody else's key.
+            env_only=env is None,
         )
 
     if scheme in ("redis", "rediss"):

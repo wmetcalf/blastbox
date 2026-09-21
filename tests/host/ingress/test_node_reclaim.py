@@ -27,7 +27,9 @@ def store():
     return InMemoryJobStore()
 
 
-def running(store, job_id, *, started_at, claim_id="c1"):
+def running(store, job_id, *, started_at, claim_id="node:c1"):
+    # node: prefix -- the sweep only reclaims jobs the control plane handed to a node, never a
+    # DB-backed dispatcher's own claims (which its own sweep, aware of its worker_timeout, owns).
     store.create(Job(job_id=job_id, engine="clamav", filename="s.bin",
                      status=JobStatus.RUNNING, created_at=started_at,
                      started_at=started_at, claim_id=claim_id))
@@ -109,7 +111,7 @@ def test_a_re_claimed_job_gets_a_fresh_run_clock(store):
     """Why the case above is rare in practice: `claim_next` stamps started_at, so a job taken
     over by a peer is no longer stale and the sweep skips it on age alone."""
     now = time.time()
-    running(store, "taken", started_at=now - 10_000, claim_id="old")
+    running(store, "taken", started_at=now - 10_000, claim_id="node:old")
     store.update("taken", status=JobStatus.QUEUED, claim_id=None, started_at=None)
     again = store.claim_next()
     assert again is not None and again.job_id == "taken"
@@ -172,3 +174,15 @@ def test_job_retention_also_runs_on_the_control_plane():
     src = inspect.getsource(app)
     assert "expire_due" in src, "the control plane runs no job retention"
     assert "JobRetentionSweeper" in src
+
+
+def test_a_dispatchers_own_claim_is_never_touched(store):
+    """The mixed-fleet safety property. A claim WITHOUT the node: prefix belongs to a DB-backed
+    dispatcher, whose own sweep knows its worker_timeout -- and whose cold jobs have no time
+    bound at all by design. Failing those from here terminated healthy runs and discarded their
+    results when the owner's DONE write lost its CAS. Reproduced by review."""
+    store.create(Job(job_id="dispatcher-job", engine="clamav", filename="s.bin",
+                     status=JobStatus.RUNNING, created_at=time.time() - 10_000,
+                     started_at=time.time() - 10_000, claim_id="plain-dispatcher-claim"))
+    assert reclaim_stale_claims(store, after_s=900.0) == 0
+    assert store.get("dispatcher-job").status is JobStatus.RUNNING

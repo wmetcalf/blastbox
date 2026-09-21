@@ -123,10 +123,15 @@ class HttpJobStore:
         ca_path: "Path | str | None" = None,
         transport: Transport | None = None,
         timeout_s: float = DEFAULT_TIMEOUT_S,
+        env_only: bool = True,
     ) -> None:
         self._base = base_url.rstrip("/")
         self._timeout = timeout_s
-        cert = cert_path or os.environ.get("BLASTBOX_NODE_CERT", "")
+        # env_only=False means a caller passed an explicit mapping: do NOT reach for
+        # os.environ for the pieces it omitted. Pairing an injected certificate with the
+        # ambient key produced a signature that could not verify, and the server's
+        # deliberately-opaque 403 made it look like the node was simply ungranted.
+        cert = cert_path or (os.environ.get("BLASTBOX_NODE_CERT", "") if env_only else "")
         if not cert:
             raise ValueError(
                 "a control-plane JobStore needs this node's identity: set "
@@ -135,12 +140,12 @@ class HttpJobStore:
         # The key is the sibling of the cert, which is how `IssuedCert.write` puts it there.
         # Overridable because an operator may have split them across mounts.
         self._key_path = Path(
-            key_path or os.environ.get("BLASTBOX_NODE_KEY", "")
+            key_path or (os.environ.get("BLASTBOX_NODE_KEY", "") if env_only else "")
             or self._cert_path.with_suffix(".key"))
         self._ca_path = Path(
-            ca_path or os.environ.get("BLASTBOX_NODE_CA", "")
-            or (Path(os.environ.get("BLASTBOX_PKI_DIR", "/var/lib/blastbox/pki"))
-                / "ca.crt"))
+            ca_path or (os.environ.get("BLASTBOX_NODE_CA", "") if env_only else "")
+            or (Path(os.environ.get("BLASTBOX_PKI_DIR", "/var/lib/blastbox/pki")
+                     if env_only else self._cert_path.parent) / "ca.crt"))
         self._transport = transport or self._urllib_transport
         # ONE lock over the session, because a dispatcher claims from several threads and
         # an unsynchronised renew would have each of them open its own session -- N
@@ -326,9 +331,27 @@ class HttpJobStore:
 
         held = self._claims.get(job_id)
         if held is None:
-            raise ClaimNotHeld(
-                f"no claim receipt for job {job_id}: this process did not claim it, or was "
-                "restarted since. Callers that delete on None must not be told None here.")
+            # NO RECEIPT -- but "I cannot speak for this job" is not the same as "I know
+            # nothing about it". Raising for everything made the node's ONLY disk bound
+            # (`reap_stale_scratch`, which asks about each tree it finds) treat every job as
+            # unconfirmed after a restart, so nothing was ever reclaimed and job_root grew
+            # without bound with untrusted samples on disk. So ask the control plane for the
+            # disposition: a TRUTHFUL answer, which is what the original defect lacked.
+            # A real claim_id comes back, so dispatch's ownership gates still see the mismatch
+            # and still leave a peer's files alone; None still means genuinely gone.
+            status, body = self._call("GET", f"/v1/nodes/jobs/{job_id}/disposition")
+            if status == 403:
+                raise ClaimNotHeld(
+                    f"the control plane will not answer for job {job_id}")
+            if status != 200 or body is None:
+                raise RuntimeError(f"control plane disposition failed (HTTP {status})")
+            row = body.get("job")
+            if row is None:
+                return None
+            return _job_from_dict(
+                {"job_id": row["job_id"], "engine": "", "filename": "",
+                 "status": row["status"], "created_at": 0.0,
+                 "claim_id": row.get("claim_id"), "expires_at": row.get("expires_at")}, Job)
         claim_id, receipt = held
         # HEADERS, not query parameters: a query string lands in every access log and proxy
         # log on the path, and the receipt is the proof of ownership.

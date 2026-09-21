@@ -327,6 +327,14 @@ class DispatcherSizer:
                 long as nobody looks. One warning, then a running count in it.
                 """
                 self._backlog_failures += 1
+                if self._backlog_failures % 60 == 0:
+                    # A running count, not just the first line. One warning at the start of an
+                    # outage tells an operator who joined the log tail an hour later nothing;
+                    # this is the periodic proof the reads are STILL failing and the pool is
+                    # sitting at its floor for a reason.
+                    logging.getLogger("blastbox.node_sizer").warning(
+                        "sizer: the backlog has now failed to read %d times in a row; sizing "
+                        "is still pinned to %d", self._backlog_failures, self._last_backlog)
                 if not self._warned_backlog:
                     self._warned_backlog = True
                     logging.getLogger("blastbox.node_sizer").warning(

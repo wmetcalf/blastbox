@@ -19,6 +19,19 @@ reason: a requeue "would let a second worker re-detonate the same untrusted inpu
 sandboxes don't die with a crashed dispatcher". Terminal is the safe end for an abandoned
 detonation.
 
+TWO GAPS THIS SWEEP DOES NOT CLOSE, both found by review and left deliberately:
+
+* QUEUED work pinned with ``target_tier`` is unclaimable on an all-federated fleet -- the node
+  path passes no tier, so `claim_next` skips pinned rows by design -- and the counterpart that
+  fails stale QUEUED jobs (`_fail_stale_queued_jobs`) is list()-driven and stayed on the
+  dispatcher. Such a job sits QUEUED forever with its sample spooled under ingress. Closing it
+  means porting that sweep here too; it is not in this one because failing QUEUED work needs
+  the max-queued-age policy, which is a dispatcher setting.
+* With ``workers>1`` every forked ingress worker runs its own maintenance loop, so the sweeps
+  run N times per interval. Every write is CAS-fenced, so this is waste and lock contention
+  rather than corruption -- measured at ~150 ms of added worst-case API latency per sweep on a
+  50k-row table. A lease in the store would fix it and is the same shape as ClaimKeyRegistry.
+
 OPT-IN, because a cutoff this side cannot derive. The dispatcher knows its own
 ``worker_timeout_s``; the control plane does not, and failing a job a healthy node is still
 working on is worse than leaving it. So an operator sets the age explicitly, and a fleet whose
@@ -42,7 +55,7 @@ RECLAIM_AFTER_ENV = "BLASTBOX_NODE_CLAIM_RECLAIM_AFTER_S"
 #: Never sweep more aggressively than this, whatever the operator sets. A cutoff shorter than a
 #: long detonation would fail healthy jobs, which is the one outcome worse than leaving an
 #: orphan -- a rounding error in a unit file should not terminate live work.
-MIN_RECLAIM_AFTER_S = 300.0
+MIN_RECLAIM_AFTER_S = 900.0     # above the dispatcher's own warm cutoff (300 + 60 grace)
 
 
 def reclaim_after_s(env: "dict[str, str] | None" = None) -> float:
@@ -90,8 +103,17 @@ def reclaim_stale_claims(job_store: "JobStore", *, after_s: float,
         _log.warning("node_reclaim: could not list RUNNING jobs", exc_info=True)
         return 0
 
+    from blastbox.host.ingress.node_claim import NODE_CLAIM_PREFIX
+
     failed = 0
     for job in running:
+        if not (job.claim_id or "").startswith(NODE_CLAIM_PREFIX):
+            # NOT OURS TO JUDGE. Only jobs the control plane handed to a node carry the prefix.
+            # A DB-backed dispatcher's claim is recovered by that dispatcher's own sweep, which
+            # knows its worker_timeout and, for cold jobs, has no time bound at all by design.
+            # Failing those from here terminated healthy runs on a mixed fleet and discarded
+            # their results when the owner's DONE write lost its CAS. Reproduced.
+            continue
         # started_at, not created_at: a job that waited an hour in the queue has not been
         # running an hour, and failing on queue age would terminate work that just started.
         started = job.started_at

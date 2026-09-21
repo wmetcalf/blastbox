@@ -83,12 +83,13 @@ def test_and_it_has_no_other_way_to_take_it(deployment):
                        status=JobStatus.QUEUED, created_at=time.time()))
     restricted = as_node("restricted")
 
-    # It cannot read the job it was refused -- and is told so by an exception, never by a
-    # None that dispatch's delete gates would read as "nobody needs these bytes".
-    from blastbox.host.jobs.http_store import ClaimNotHeld
-
-    with pytest.raises(ClaimNotHeld):
-        restricted.get("sensitive")
+    # It CAN see a disposition -- status, claim holder, expiry -- and that is a deliberate,
+    # bounded widening: the node's only disk bound asks the store about each tree it finds, so
+    # without it nothing on a restarted node is ever reclaimable. What it must not get is
+    # CONTENT, and it does not: no filename, no engine, no result_dir, no params.
+    seen = restricted.get("sensitive")
+    assert seen is not None and seen.status == JobStatus.QUEUED
+    assert seen.filename == "" and seen.engine == "" and seen.result_dir is None
     # ...cannot write to it...
     with pytest.raises(PermissionError):
         restricted.update("sensitive", status=JobStatus.RUNNING)

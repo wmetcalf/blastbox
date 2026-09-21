@@ -475,9 +475,11 @@ Three things an operator must know:
   BLASTBOX_NODE_CLAIM_RECLAIM_AFTER_S=1800
   ```
 
-  Set it to the longest run a node may legitimately take. Abandoned jobs are **failed, not
-  requeued** — a requeue would let a second worker re-detonate the same untrusted input. Ingress
-  warns at startup if this is unset.
+  Set it to the longest run a node may legitimately take (floored at 900 s). Abandoned jobs are
+  **failed, not requeued** — a requeue would let a second worker re-detonate the same untrusted
+  input. Ingress warns at startup if this is unset. The sweep only touches jobs the control
+  plane itself handed to a node; a dispatcher that holds the database keeps recovering its own
+  claims exactly as before, so a mixed fleet is safe.
 
   **Node certificates go to every ingress host too.** Grants are resolved from the certificates
   in the *ingress* host's PKI directory, so a node whose certificate lives only on the exit host

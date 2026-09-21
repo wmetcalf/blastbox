@@ -129,7 +129,13 @@ STRICT_TIERS_ENV = "BLASTBOX_NODE_CLAIM_STRICT_TIERS"
 #: request can do while still letting a node reach work behind a job it may not run.
 _MAX_CLAIM_PROBES = 8
 
-#: How long a job this node may NOT run is deferred for EVERYONE after a refusal. This replaced
+#: How long a job this node may NOT run is deferred for EVERYONE after a refusal. This is ALSO
+#: the write-amplification bound the DoS finding wanted: a refused job flips RUNNING->QUEUED at
+#: most once per this window, so a node hammering /claim cannot churn the head of the queue --
+#: after the first walk everything it cannot run is deferred and later polls find nothing
+#: claimable and touch no rows. A node-level back-off was tried on top and removed: it 204'd the
+#: poll after an all-refused walk, which re-broke the very starvation the deferral fixes (a node
+#: could not reach entitled work sitting behind more than a probe-budget of refusable jobs). This replaced
 #: a per-process refusal memo, which review showed still starved the node: memoised jobs kept
 #: consuming the probe budget, so nine refusable jobs at the head of the queue blocked the tenth
 #: forever, and forked ingress workers each held their own memo anyway. A deferral is honoured by
@@ -137,6 +143,22 @@ _MAX_CLAIM_PROBES = 8
 #: while -- and neither does an adversary trying to flap it, which bounds that to once per
 #: window. The cost is that an ENTITLED peer also waits this long for it; short on purpose.
 _REFUSAL_DEFER_S = 20.0
+
+#: Prefix the control plane re-stamps onto the claim id of every job it hands to a node. It
+#: exists so the control-plane reclaim sweep can tell ITS claims from a DB-backed dispatcher's:
+#: on a mixed fleet the sweep otherwise failed healthy jobs those dispatchers were still running
+#: -- their cold jobs have NO time bound by design (docker-ps liveness), and the sweep's own floor
+#: sat below their warm cutoff -- and discarded the finished result when the owner's DONE write
+#: then lost its CAS. Reviewed and reproduced. claim_id is opaque everywhere (one log line
+#: slices it for display), so a prefix is safe; the node receives the re-stamped id and the
+#: receipt is minted over it, so every later fence still matches.
+NODE_CLAIM_PREFIX = "node:"
+
+#: Skew a node may be ahead of this host by when it reports a timestamp. Anything further into
+#: the future is refused: `started_at` is the ONE field the reclaim sweep judges by, and a node
+#: could write 9e18 into it and become permanently unreclaimable. Backwards is harmless -- it only
+#: makes the job MORE reclaimable.
+MAX_FUTURE_SKEW_S = 300.0
 
 #: The furthest into the future a node may defer a job. `claimable_after` exists for short
 #: capacity deferrals, and `claim_next` SKIPS a job until it passes -- so an unbounded value let
@@ -219,17 +241,28 @@ def resolve_pki_dir(pki_dir: "Path | str | None" = None) -> Path | None:
     if not str(raw).strip():
         raw = DEFAULT_PKI_DIR
     d = Path(raw).expanduser()
+    anchor = d / "ca.crt"
+    if not anchor.exists():
+        return None                     # genuinely not opted in
     try:
         from blastbox.host.pki import load_trust_anchor
 
         load_trust_anchor(d)
-    except Exception:                   # noqa: BLE001 - no CA, unreadable, malformed
-        return None
+    except Exception as exc:            # noqa: BLE001 - present but unreadable or malformed
+        # NOT None. A truncated ca.crt mid re-issue, or a permissions mistake, used to read as
+        # "no PKI": the routes silently vanished for the life of the process, DB-backed nodes
+        # fell back to unrestricted claim_next(), and the log said at INFO to run `pki init`
+        # -- a control that was in force and silently stopped being. A trust anchor that
+        # exists and cannot be loaded is an outage, and it is raised as one.
+        raise RuntimeError(
+            f"{anchor} exists but cannot be loaded ({exc}). Refusing to start without the "
+            "node-claim routes: a broken trust anchor is not the same as none.") from exc
     return d
 
 
 def register_node_claim_routes(
     app: "FastAPI", *, job_store: "JobStore", pki_dir: "Path | str | None" = None,
+    pepper: bytes | None = None,
 ) -> bool:
     """Mount the claim routes if this deployment has a PKI. Returns whether it did."""
     resolved = resolve_pki_dir(pki_dir)
@@ -273,7 +306,7 @@ def register_node_claim_routes(
     # Resolved ONCE, here, and raised if it cannot be: every ingress process must sign with the
     # key its peers verify against, and the job store is where they agree. See
     # node_auth.resolve_claim_secret for the precedence and why None fails closed.
-    _signing_key = node_auth.resolve_claim_secret(job_store, resolved)
+    _signing_key = node_auth.resolve_claim_secret(job_store, resolved, pepper=pepper)
 
     def _secret() -> bytes:
         return _signing_key
@@ -306,7 +339,11 @@ def register_node_claim_routes(
         """
         from blastbox.host.placement import fleet_grants
 
-        return fleet_grants(resolved).get(node_id)
+        sig = _pki_signature()
+        if sig != _grants_cache["sig"]:
+            _grants_cache["map"] = fleet_grants(resolved)
+            _grants_cache["sig"] = sig
+        return _grants_cache["map"].get(node_id)
 
     @router.post("/session", response_model=None)
     def session(req: SessionRequest) -> dict[str, Any]:
@@ -360,6 +397,7 @@ def register_node_claim_routes(
         withheld and the job goes back to QUEUED with its claim cleared, which is the same
         state a crashed dispatcher leaves behind and the reclaim path already handles.
         """
+        from blastbox.host.jobs.base import JobStatus
         from blastbox.host.placement import refusal
 
         node_id = _node_from_token(x_blastbox_node_session)
@@ -427,8 +465,20 @@ def register_node_claim_routes(
                     why = ("this host cannot resolve the job's network personality, so the "
                            "tier and credentials grants cannot be checked")
                 if why is None:
-                    job = candidate
-                    break
+                    # RE-STAMP the claim so the reclaim sweep can tell this hand-over from a
+                    # DB-backed dispatcher's own claim (see NODE_CLAIM_PREFIX). CAS-fenced on
+                    # the id claim_next gave us; losing it means a sweep took the job between
+                    # the two writes, and then it is simply not ours to hand over.
+                    stamped = NODE_CLAIM_PREFIX + (candidate.claim_id or "")
+                    if job_store.update_if_status(candidate.job_id, JobStatus.RUNNING,
+                                                  expect_claim_id=candidate.claim_id,
+                                                  claim_id=stamped):
+                        job = job_store.get(candidate.job_id)
+                        if job is None or job.claim_id != stamped:
+                            job = None
+                            continue
+                        break
+                    continue
                 skipped.append(candidate)
                 _log.warning("node_claim: released job=%s from node=%s: %s",
                              candidate.job_id, node_id, why)
@@ -525,6 +575,22 @@ def register_node_claim_routes(
             # is "unknown", and the caller must not read it as "unrestricted".
             return None, False, can_tell
         return driver, driver in ALWAYS_CREDENTIALED, True
+
+    #: fleet_grants is O(certificates) with a full X.509 verify per file, and it ran on EVERY
+    #: request -- 77 ms of ingress CPU per poll at 200 certificates, from a request a node can
+    #: issue for nothing. Cached on the DIRECTORY'S SIGNATURE (name, mtime, size of every
+    #: *.crt), which is what "freshness" actually means here: a certificate removed, replaced
+    #: or added changes the signature and the next request re-verifies. The revocation and
+    #: narrowing tests still pass against this, which is the proof it is not a stale cache.
+    _grants_cache: "dict[str, Any]" = {"sig": None, "map": {}}
+
+    def _pki_signature() -> tuple:
+        try:
+            return tuple(sorted(
+                (c.name, c.stat().st_mtime_ns, c.stat().st_size)
+                for c in resolved.glob("*.crt")))
+        except OSError:
+            return ("unreadable", time.time())
 
     def _strict_tiers() -> bool:
         return (os.environ.get(STRICT_TIERS_ENV, "").strip().lower()
@@ -630,15 +696,26 @@ def register_node_claim_routes(
 
     def _typed(out: dict[str, Any]) -> None:
         """Reject a value whose type the store would accept and the readers would choke on."""
+        from blastbox.host.jobs.base import JobStatus
+
         def bad(name: str, why: str) -> None:
             raise HTTPException(status_code=400, detail=f"{name}: {why}")
 
+        if "status" in out and not isinstance(out["status"], (str, JobStatus)):
+            # JSON also carries ints, bools, lists. `{"status": 7}` was written straight
+            # through and stored; from then on `get()` and the unfiltered `list()` raised
+            # "'7' is not a valid JobStatus" FOREVER -- GET /v1/jobs, and the retention sweep
+            # this branch added to ingress, both dead fleet-wide at WARNING. Reproduced.
+            bad("status", "must be a status name")
+        horizon = time.time() + MAX_FUTURE_SKEW_S
         for name in ("started_at", "finished_at", "expires_at"):
             if name in out and out[name] is not None:
                 if isinstance(out[name], bool) or not isinstance(out[name], (int, float)):
                     bad(name, "must be a numeric timestamp or null")
                 if not math.isfinite(float(out[name])) or float(out[name]) < 0:
                     bad(name, "must be a finite, non-negative timestamp")
+                if name != "expires_at" and float(out[name]) > horizon:
+                    bad(name, "must not be in the future")
                 out[name] = float(out[name])
         if "materialise_attempts" in out:
             v = out["materialise_attempts"]
@@ -697,6 +774,18 @@ def register_node_claim_routes(
             raise HTTPException(
                 status_code=400,
                 detail="claim_id may only be cleared, not set")
+        if "claim_id" in out and out.get("status") is not JobStatus.QUEUED:
+            # Clearing the claim WITHOUT queueing left a job RUNNING with no owner: unclaimable
+            # (claim_next sees only QUEUED), unwritable (_owned_job needs a claim id) and, with a
+            # future started_at, unreclaimable. A release is status=queued AND claim_id=null,
+            # together, and it gets the same deferral a refused job does.
+            raise HTTPException(
+                status_code=400,
+                detail="clearing claim_id is a release: status must be \"queued\" in the "
+                       "same write")
+        if "claim_id" in out:
+            out.setdefault("claimable_after", time.time() + _REFUSAL_DEFER_S)
+            out.setdefault("started_at", None)
         if out.get("claimable_after") is not None:
             try:
                 deferred = float(out["claimable_after"])
@@ -739,6 +828,32 @@ def register_node_claim_routes(
             raise HTTPException(status_code=403, detail=_REFUSED)
         return {"job": _owned_job(job_id, node_id, x_blastbox_claim_id,
                                   x_blastbox_receipt).to_dict()}
+
+    @router.get("/jobs/{job_id}/disposition", response_model=None)
+    def disposition(job_id: str,
+                    x_blastbox_node_session: str | None = Header(None)) -> dict[str, Any]:
+        """Is this job finished, and who holds it? THREE FIELDS, for a job the caller names.
+
+        WHY THIS HAD TO EXIST. A node's only disk bound is `reap_stale_scratch`, which walks its
+        OWN job_root and asks the store whether each tree's job is terminal. When `get()` raised
+        for everything the process had no receipt for -- which is EVERY job after a restart --
+        the reaper treated all of them as "unconfirmed" and skipped them. It fails safe, and
+        safe had become "never reclaim anything": job_root grew without bound with untrusted
+        samples still on disk. That is issue #84's class, on the topology this branch creates.
+
+        NOT AN ENUMERATION. The caller must already know the job id, and on the path that needs
+        this it knows it because the directory is on its own disk. It gets status, claim_id and
+        expires_at -- what retention decides with -- and nothing about content: no filename, no
+        engine, no result_dir, no params.
+        """
+        _node_from_token(x_blastbox_node_session)
+        job = job_store.get(job_id)
+        if job is None:
+            # Truthfully absent. The node's reaper reads this as "genuine orphan, reclaimable",
+            # which is correct: the row is gone, so nobody needs the tree.
+            return {"job": None}
+        return {"job": {"job_id": job.job_id, "status": job.status.value,
+                        "claim_id": job.claim_id, "expires_at": job.expires_at}}
 
     @router.post("/jobs/{job_id}", response_model=None)
     def update_job(job_id: str, req: UpdateRequest,

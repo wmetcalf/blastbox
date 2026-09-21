@@ -1229,7 +1229,10 @@ def build_app(
     # for why a route that waves everyone through would be worse than no route.
     from blastbox.host.ingress.node_claim import register_node_claim_routes
 
-    register_node_claim_routes(app, job_store=_job_store)
+    # The API key doubles as the pepper for the store-held node signing key: every ingress
+    # host already has it and a queue reader does not. See node_auth.resolve_claim_secret.
+    register_node_claim_routes(app, job_store=_job_store,
+                               pepper=_api_key.encode() if _api_key else None)
 
     return app
 

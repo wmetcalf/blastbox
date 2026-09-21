@@ -59,6 +59,11 @@ def _serve_workers(
     return n
 
 
+#: Re-issue the ingress certificate when this little of its life is left. `issue_server` mints
+#: 30 days; a week of warning is enough for a hardened host that must have one copied in.
+_TLS_RENEW_BEFORE_S = 7 * 86400.0
+
+
 def _serve_tls_sans(host: str) -> list[str]:
     """Names the auto-issued certificate must answer to.
 
@@ -144,14 +149,44 @@ def _serve_tls(args: argparse.Namespace) -> dict:
     # and this picks it up with no CA key present and no flags.
     existing_crt, existing_key = pki_dir / "ingress-server.crt", pki_dir / "ingress-server.key"
     if existing_crt.exists() and existing_key.exists():
-        _log.info("serve: TLS on, using the server certificate already in %s", pki_dir)
-        return {"ssl_certfile": str(existing_crt), "ssl_keyfile": str(existing_key)}
+        # CHECK THE CLOCK BEFORE REUSING IT. `issue_server` mints 30 days and nothing renewed
+        # it: a month after the first `serve`, every node in the fleet fails verification at
+        # once, restarting does not help, and recovery means knowing to delete two undocumented
+        # files. Reviewed. Inside the renewal window we re-issue if we can, and if we cannot
+        # (no CA key here) we serve it and say exactly how long is left.
+        import datetime
+
+        from cryptography import x509
+
+        try:
+            leaf = x509.load_pem_x509_certificate(existing_crt.read_bytes())
+            left = (leaf.not_valid_after_utc
+                    - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+        except Exception:               # noqa: BLE001 - unreadable: fall through and re-issue
+            left = -1.0
+        if left > _TLS_RENEW_BEFORE_S:
+            _log.info("serve: TLS on, using the server certificate already in %s (%.0f days "
+                      "left)", pki_dir, left / 86400)
+            return {"ssl_certfile": str(existing_crt), "ssl_keyfile": str(existing_key)}
+        _log.warning("serve: the ingress certificate in %s expires in %.1f days; re-issuing",
+                     pki_dir, max(0.0, left) / 86400)
+        _reissue_wanted = True
+    else:
+        _reissue_wanted = False
 
     from blastbox.host.pki import load_ca
 
     try:
         ca = load_ca(pki_dir)
     except Exception as exc:            # noqa: BLE001 - verify-only host, no CA key here
+        if _reissue_wanted:
+            # A hardened ingress holds no CA key, so it cannot renew its own certificate. Do
+            # not refuse to start over it -- serve the one we have and make the deadline loud.
+            _log.error("serve: the ingress certificate is expiring and this host has no CA key "
+                       "to re-issue it (%s). Issue a new pair on the CA host and copy it to "
+                       "%s / %s BEFORE it lapses, or every node will fail verification at "
+                       "once.", exc, existing_crt, existing_key)
+            return {"ssl_certfile": str(existing_crt), "ssl_keyfile": str(existing_key)}
         raise SystemExit(
             f"serve: {pki_dir} has a trust anchor but no usable CA key ({exc}), so a server "
             f"certificate cannot be issued here. Either issue one on the CA host and copy it to "
@@ -1124,9 +1159,30 @@ def _claim_key_cmd(args: argparse.Namespace) -> int:
     fleet is the multi-host divergence reintroduced by the tool meant to manage it.
     """
     import hashlib
+    import os as _os
 
     from blastbox.host.jobs.base import ClaimKeyRegistry
     from blastbox.host.jobs.factory import build_job_store_from_env
+    from blastbox.host.node_auth import SECRET_FILE_ENV
+
+    # THE OVERRIDE WINS AT RUNTIME, SO IT WINS HERE. `resolve_claim_secret` returns the file
+    # before it ever touches the store, so reporting the store's row on such a host answers a
+    # different question than the operator asked -- and the command exists precisely so two
+    # hosts can confirm they agree.
+    override = (_os.environ.get(SECRET_FILE_ENV) or "").strip()
+    if override:
+        print(f"{SECRET_FILE_ENV}={override} is set, so this host signs with that FILE and not "
+              f"with the job queue. Compare the file across hosts; the queue's row is unused "
+              f"here.")
+        return 1
+    # WITHOUT A DSN THE FACTORY HANDS BACK AN IN-MEMORY STORE, which satisfies the registry --
+    # so `reset --yes` printed success and mutated a throwaway object. An operator rotating a
+    # suspected-compromised key would restart the fleet onto the same key, told it had changed.
+    if not (_os.environ.get("BLASTBOX_DATABASE_URL") or "").strip():
+        print("BLASTBOX_DATABASE_URL is not set in this shell, so there is no fleet queue to "
+              "read. Set it to the same DSN the ingress processes use and re-run -- otherwise "
+              "this would report on a throwaway in-memory store.")
+        return 2
 
     store = build_job_store_from_env()
     if not isinstance(store, ClaimKeyRegistry):

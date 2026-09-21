@@ -150,7 +150,8 @@ def challenge_secret(pki_dir: "Path | str") -> bytes:
     return data
 
 
-def resolve_claim_secret(job_store: object, pki_dir: "Path | str") -> bytes:
+def resolve_claim_secret(job_store: object, pki_dir: "Path | str", *,
+                         pepper: bytes | None = None) -> bytes:
     """The key every ingress process must agree on, resolved ONCE at route registration.
 
     PRECEDENCE, and why it is in this order:
@@ -164,6 +165,15 @@ def resolve_claim_secret(job_store: object, pki_dir: "Path | str") -> bytes:
        has no database credentials, which is the point of #178.
     3. Otherwise -> the per-host file, with a warning that a second host will not interoperate.
        Only a third-party store lands here.
+
+    THE STORED VALUE IS NOT THE KEY WHEN A PEPPER IS GIVEN. Review made the point precisely:
+    a queue is read by more than ingress -- a read-only reporting credential, a replica, every
+    backup -- and a plaintext signing key there lets any of them mint a session for ANY node id
+    with no certificate and no challenge. "Widens nothing" was wrong for those. So the effective
+    key is HMAC(pepper, stored): the queue holds a random half, and the pepper is something every
+    ingress host already shares and a queue reader does not -- `build_app` passes the API key.
+    Without a pepper (no API key configured) the stored value IS the key and a warning says so:
+    then it is exactly as private as the queue, which the operator has chosen.
 
     NONE IS NOT AGREEMENT, so it RAISES. `claim_signing_key` returns None when the registry
     could not be read back -- a clear racing the claim, an eviction. Falling back to a locally
@@ -199,6 +209,14 @@ def resolve_claim_secret(job_store: object, pki_dir: "Path | str") -> bytes:
                 "the node signing key recorded in the job store is malformed "
                 f"({len(key)} bytes). Rotate it: `blastbox claim-key reset` on a stopped "
                 "fleet, then restart every ingress.")
+        if pepper:
+            return hmac.new(pepper, key, hashlib.sha256).digest()
+        logging.getLogger("blastbox.host.node_auth").warning(
+            "the node signing key is held on the job queue with no pepper (no BLASTBOX_API_KEY "
+            "configured), so it is exactly as private as the queue: any credential that can "
+            "read the queue -- a replica, a backup, a reporting login -- can mint node "
+            "sessions. Set BLASTBOX_API_KEY on every ingress, or hold the key in a file with "
+            "%s.", SECRET_FILE_ENV)
         return key
 
     logging.getLogger("blastbox.host.node_auth").warning(

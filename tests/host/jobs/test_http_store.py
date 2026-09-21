@@ -126,24 +126,34 @@ def test_a_stale_claim_id_loses_the_cas_rather_than_writing(control_plane, fleet
     assert backing.get(job.job_id).error is None
 
 
-def test_reading_a_job_this_node_does_not_hold_RAISES_rather_than_returning_none(
+def test_reading_a_job_this_node_does_not_hold_is_TRUTHFUL_not_none(
         control_plane, fleet, backing):
-    """NOT None, and the difference destroyed data before it was fixed.
+    """NOT None, and no longer a blanket raise either.
 
-    In every other store `get() -> None` means the row DOES NOT EXIST, and dispatch deletes on
-    that: `_delete_input_if_owned` and `_purge_job_dir_if_owned` both treat None as "nobody
-    needs these bytes". Returning None for "not mine" made them delete a peer's staged sample
-    and its whole job tree mid-detonation. Dispatch already fails SAFE on an exception, so this
-    raises into the contract it already has."""
-    from blastbox.host.jobs.http_store import ClaimNotHeld
+    None was the original data-destruction bug: in every other store it means "no such row",
+    and dispatch deletes on it — it removed a peer's staged sample and whole job tree. Raising
+    for everything fixed that and broke something else: the node's ONLY disk bound asks the
+    store about each tree it finds, so after a restart nothing was ever reclaimable and
+    job_root grew without bound with untrusted samples on disk.
+
+    The answer is to be truthful. An unheld job comes back with its REAL claim_id, so the
+    ownership gates still see a mismatch and still leave the files alone, and the reaper can
+    still tell terminal from live."""
+    import time as _t
 
     queued(backing)
+    backing.update("job-1", status=JobStatus.RUNNING, claim_id="node:someone-else",
+                   started_at=_t.time())
     s = node_store(control_plane, fleet, "alpha")
-    with pytest.raises(ClaimNotHeld):
-        s.get("job-1")
-    claimed = s.claim_next(engine="clamav")
-    assert claimed is not None
-    assert s.get(claimed.job_id) is not None
+    got = s.get("job-1")
+    assert got is not None, "told the caller a live job was gone"
+    assert got.claim_id == "node:someone-else"
+    assert got.status is JobStatus.RUNNING
+
+
+def test_a_job_that_really_is_gone_is_none(control_plane, fleet):
+    s = node_store(control_plane, fleet, "alpha")
+    assert s.get("no-such-job") is None
 
 
 def test_a_job_it_completed_is_still_readable_afterwards(control_plane, fleet, backing):
