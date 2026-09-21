@@ -107,15 +107,35 @@ def test_a_genuinely_absent_job_is_none(fleet):
     assert node.get(str(uuid.uuid4())) is None
 
 
-def test_the_disposition_leaks_no_content(fleet):
-    _d, backing, node = fleet
+def test_the_disposition_ROUTE_leaks_no_content(fleet, tmp_path):
+    """ASSERTS THE HTTP RESPONSE, not the client.
+
+    The first version of this test checked `node.get(...)` for empty engine/filename/result_dir
+    -- but `http_store.get` HARDCODES those three when it builds the sparse Job, so the assertion
+    held whatever the route returned. Widening the route's body to include engine, filename,
+    result_dir and params left the whole suite green (measured). The response is the real
+    boundary: a node holds a session token and can call the route directly."""
+    d, backing, _node = fleet
     backing.create(Job(job_id="secret", engine="clamav", filename="victim-sample.exe",
                        status=JobStatus.DONE, created_at=time.time(),
-                       result_dir="/srv/private/secret"))
-    got = node.get("secret")
-    assert got is not None
-    assert got.filename == "" and got.engine == "" and got.result_dir is None, (
-        "the disposition route leaked job content to a node that does not hold it")
+                       result_dir="/srv/private/secret", params={"key": "value"}))
+    app = FastAPI()
+    assert register_node_claim_routes(app, job_store=backing, pki_dir=d)
+    c = TestClient(app)
+    ch = c.get("/v1/nodes/challenge").json()["challenge"]
+    sig = base64.b64encode(node_auth.sign_claim(
+        (d / "node-n.key").read_bytes(), ch, node_auth.SCOPE_CLAIM_NEXT, "n")).decode()
+    tok = c.post("/v1/nodes/session", json={
+        "cert_pem": (d / "node-n.crt").read_text(), "challenge": ch, "signature": sig}
+    ).json()["token"]
+    r = c.get("/v1/nodes/jobs/secret/disposition", headers={SESSION_HEADER: tok})
+    assert r.status_code == 200, r.text
+    body = r.json()["job"]
+    assert set(body) == {"job_id", "status", "claim_id", "expires_at"}, (
+        f"the disposition route returned more than it promises: {sorted(body)}")
+    raw = r.text
+    for leak in ("victim-sample.exe", "/srv/private/secret", "clamav", "value"):
+        assert leak not in raw, f"the route body leaked {leak!r}"
 
 
 class TestTheSweepsAreWiredBEHAVIOURALLY:
@@ -379,3 +399,149 @@ class TestRoundFourAuthz:
         time.sleep(0)                        # the grants cache is keyed on the directory too
         r = c.get(f"/v1/nodes/jobs/{job['job_id']}/disposition", headers=h)
         assert r.status_code == 403, r.text
+
+
+class TestArmsThatHadNoCoverage:
+    """Each of these survived a mutation with the whole suite green. A destructive guard with no
+    test is the shape this branch has already paid for repeatedly."""
+
+    def test_a_handed_over_job_is_reclaimable_end_to_end(self, fleet, tmp_path):
+        """NODE_CLAIM_PREFIX appeared in NO test: deleting the re-stamp left the suite green
+        while disabling the entire reclaim path, because the sweep filters on that prefix alone.
+        The filter half was tested with hand-written prefixed ids; the stamping half was not, so
+        the end-to-end property — hand a job over, let the node vanish, the sweep reclaims it —
+        went unasserted in both directions."""
+        from blastbox.host.ingress.node_claim import NODE_CLAIM_PREFIX
+        from blastbox.host.ingress.node_reclaim import reclaim_stale_claims
+
+        d, backing, node = fleet
+        backing.create(Job(job_id="handed", engine="clamav", filename="f",
+                           status=JobStatus.QUEUED, created_at=time.time()))
+        job = node.claim_next(engine="clamav")
+        assert job is not None
+        assert (job.claim_id or "").startswith(NODE_CLAIM_PREFIX), (
+            "the hand-over did not stamp the prefix, so the sweep will never see this job")
+        backing.update("handed", started_at=time.time() - 10_000)      # the node vanishes
+        assert reclaim_stale_claims(backing, after_s=900.0) == 1
+        assert backing.get("handed").status is JobStatus.FAILED
+
+    def test_a_reclaimed_job_is_reapable_by_retention(self):
+        """Neither control-plane sweep stamped expires_at, and `expire_due` requires it. On a
+        credential-less fleet this is the NORMAL terminal state for a lost claim, so the rows and
+        the durable blob objects of jobs that actually ran outlived the retention policy."""
+        from blastbox.host.ingress.node_reclaim import reclaim_stale_claims
+
+        store = InMemoryJobStore()
+        store.create(Job(job_id="lost", engine="clamav", filename="f",
+                         status=JobStatus.RUNNING, created_at=time.time() - 10_000,
+                         started_at=time.time() - 10_000, claim_id="node:gone"))
+        assert reclaim_stale_claims(store, after_s=900.0, retention_s=86400.0) == 1
+        assert store.get("lost").expires_at is not None, "retention can never collect this"
+
+    def test_the_pepper_actually_changes_the_signing_key(self, tmp_path):
+        """The word 'pepper' appeared in no test: replacing `if pepper:` with `if False:` left
+        the suite green, so the control added because 'a plaintext signing key on the queue lets
+        anyone who can read the queue mint a session for ANY node id' was unverified."""
+        from blastbox.host.jobs.memory import InMemoryJobStore as Store
+
+        d = tmp_path / "pki"
+        pki.ensure_ca(d)
+        store = Store()
+        plain = node_auth.resolve_claim_secret(store, d, pepper=None)
+        k1 = node_auth.resolve_claim_secret(store, d, pepper=b"api-key-one")
+        k2 = node_auth.resolve_claim_secret(store, d, pepper=b"api-key-two")
+        assert len({plain, k1, k2}) == 3, "the pepper is not reaching the effective key"
+        stored = store.get_signing_key()
+        assert stored is not None
+        assert bytes.fromhex(stored) == plain, "the stored half should be the unpeppered key"
+
+    def test_a_session_does_not_cross_a_pepper_boundary(self, tmp_path):
+        """The operational consequence, asserted: two ingress hosts with DIFFERENT API keys on
+        one queue cannot honour each other's sessions. This is why the key must match fleet-wide
+        and why claim-key show fingerprints the effective key."""
+        from blastbox.host.jobs.memory import InMemoryJobStore as Store
+
+        d = tmp_path / "pki"
+        pki.ensure_ca(d)
+        store = Store()
+        a = node_auth.resolve_claim_secret(store, d, pepper=b"host-a-key")
+        b = node_auth.resolve_claim_secret(store, d, pepper=b"host-b-key")
+        tok = node_auth.issue_session("n", secret=a)
+        assert node_auth.verify_session(tok, secret=a) == "n"
+        with pytest.raises(node_auth.ClaimRefused):
+            node_auth.verify_session(tok, secret=b)
+
+
+class TestTheIngressCertificateRenewalWindow:
+    """Setting _TLS_RENEW_BEFORE_S to 0 — restoring the whole-fleet simultaneous-expiry defect —
+    left the suite green. Three behaviours were unprotected: re-issue inside the window, reuse
+    outside it, and the hardened-host fallback that logs rather than refusing to boot."""
+
+    def _args(self, **kw):
+        import argparse
+
+        base = {"host": "127.0.0.1", "tls_cert": None, "tls_key": None, "no_tls": False}
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def _place(self, d, days):
+        import datetime
+
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.x509.oid import NameOID
+
+        ca = pki.load_ca(d)
+        key = ec.generate_private_key(ec.SECP256R1())
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cert = (x509.CertificateBuilder()
+                .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "ing")]))
+                .issuer_name(x509.load_pem_x509_certificate(ca.cert_pem).subject)
+                .public_key(key.public_key()).serial_number(x509.random_serial_number())
+                .not_valid_before(now - datetime.timedelta(days=30))
+                .not_valid_after(now + datetime.timedelta(days=days))
+                .sign(serialization.load_pem_private_key(ca.key_pem, password=None),
+                      hashes.SHA256()))
+        (d / "ingress-server.crt").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+        (d / "ingress-server.key").write_bytes(key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption()))
+        return (d / "ingress-server.crt").read_bytes()
+
+    def test_a_certificate_near_expiry_is_re_issued(self, tmp_path, monkeypatch):
+        from blastbox.host.cli import _serve_tls
+
+        d = tmp_path / "pki"
+        pki.ensure_ca(d)
+        before = self._place(d, days=2)
+        monkeypatch.setenv("BLASTBOX_PKI_DIR", str(d))
+        _serve_tls(self._args())
+        assert (d / "ingress-server.crt").read_bytes() != before, (
+            "an expiring certificate was reused; the whole fleet fails verification at once")
+
+    def test_a_healthy_certificate_is_reused(self, tmp_path, monkeypatch):
+        from blastbox.host.cli import _serve_tls
+
+        d = tmp_path / "pki"
+        pki.ensure_ca(d)
+        before = self._place(d, days=29)
+        monkeypatch.setenv("BLASTBOX_PKI_DIR", str(d))
+        _serve_tls(self._args())
+        assert (d / "ingress-server.crt").read_bytes() == before, "re-issued needlessly"
+
+    def test_a_hardened_host_serves_the_expiring_pair_and_says_so(self, tmp_path, monkeypatch,
+                                                                 caplog):
+        """No CA key here, so it cannot renew. Refusing to boot over it would be worse than
+        serving a certificate with days left — but the deadline must be loud."""
+        from blastbox.host.cli import _serve_tls
+
+        d = tmp_path / "pki"
+        pki.ensure_ca(d)
+        self._place(d, days=2)
+        (d / "ca.key").unlink()
+        monkeypatch.setenv("BLASTBOX_PKI_DIR", str(d))
+        with caplog.at_level("ERROR"):
+            out = _serve_tls(self._args())
+        assert out["ssl_certfile"] == str(d / "ingress-server.crt")
+        assert any("no CA key" in r.message for r in caplog.records), caplog.text

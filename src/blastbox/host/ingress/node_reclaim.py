@@ -228,8 +228,15 @@ def _delete_input(input_path: "Path") -> None:
 
 
 def reclaim_stale_claims(job_store: "JobStore", *, after_s: float,
+                         retention_s: float = 0.0,
                          now: float | None = None) -> int:
     """Fail every RUNNING job whose owner has plainly gone. Returns how many.
+
+    IT STAMPS ``expires_at``, like both dispatcher siblings do on their own terminal writes.
+    Without it `expire_due` skips the row forever (it requires a non-null ``expires_at``), and on
+    a credential-less fleet THIS is the normal terminal state for every lost claim -- so the rows
+    and, worse, the durable blob objects of jobs that actually ran would outlive the operator's
+    retention policy permanently. `blob_store.delete_job` only ever runs from `_expire_job`.
 
     CAS-FENCED on (RUNNING, the claim_id observed in this pass), so it can never clobber a
     terminal status the owner wrote, and never touches a job that was reclaimed between the read
@@ -270,6 +277,7 @@ def reclaim_stale_claims(job_store: "JobStore", *, after_s: float,
             applied = job_store.update_if_status(
                 job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
                 status=JobStatus.FAILED, finished_at=stamp,
+                expires_at=(stamp + retention_s) if retention_s > 0 else None,
                 error=("abandoned: no progress for more than "
                        f"{after_s:.0f}s, so the claiming node is gone"))
         except Exception:               # noqa: BLE001 - one bad row is not a sweep outage

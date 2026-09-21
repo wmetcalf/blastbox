@@ -435,14 +435,22 @@ fingerprint (never the key) so two hosts can confirm they agree. To rotate: stop
 invalidated and nodes re-handshake on their own. `BLASTBOX_CLAIM_SECRET_FILE` remains as an
 explicit override for a store that cannot record it.
 
+**If you set `BLASTBOX_API_KEY`, it must be the SAME on every ingress host.** It is the pepper
+for the queue-held signing key, so two hosts with different keys derive different signing keys
+and a node's handshake fails whenever its challenge and session land on different hosts — with
+the deliberately opaque `not authorised to claim this work`, which reads like a certificate
+problem. `blastbox claim-key show` fingerprints the **effective** key, so differing fingerprints
+across hosts is exactly this fault.
+
 **TLS.** This protocol authenticates the node but assumes the channel is server-authenticated.
 `blastbox serve` now issues its own certificate from the local CA when a PKI is present, so
 the secure path needs no extra step; `--tls-cert/--tls-key` uses your own, and `--no-tls` is
 available for a listener behind a TLS-terminating proxy.
 
 There is nothing to configure. The routes appear because a trust anchor exists; with no CA
-they are not registered at all and nodes claim from the store exactly as before. The
-challenge-signing key is created in the PKI directory on first use, `0600`.
+they are not registered at all and nodes claim from the store exactly as before. The challenge-signing key is
+recorded on the **job queue**, not in a file — see the multi-host note below, and
+`blastbox claim-key show` to compare hosts.
 
 Three things an operator must know:
 

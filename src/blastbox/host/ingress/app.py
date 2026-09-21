@@ -497,7 +497,8 @@ def build_app(
                             _log.warning("ingress: scratch reclaim failed", exc_info=True)
                     if reclaim_after:
                         try:
-                            reclaim_stale_claims(_job_store, after_s=reclaim_after)
+                            reclaim_stale_claims(_job_store, after_s=reclaim_after,
+                                             retention_s=_retention_s)
                         except Exception:  # noqa: BLE001 -- same contract as above
                             _log.warning("ingress: stale-claim sweep failed", exc_info=True)
                     if queued_age:
