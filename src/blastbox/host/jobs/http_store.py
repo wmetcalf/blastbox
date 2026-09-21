@@ -73,10 +73,33 @@ Transport = Callable[..., Response]
 
 DEFAULT_TIMEOUT_S = 30.0
 
+#: How many claims to remember. Bounds the map while keeping a settled job readable long
+#: enough for dispatch's terminal `finally` to read it back three times. A dispatcher does not
+#: have hundreds of jobs in flight; this is headroom, not a working set.
+_MAX_TRACKED_CLAIMS = 512
+
 #: Renew a session this long before it actually expires, so a request never races the
 #: expiry it was authorised under. A clock skew between node and control plane inside this
 #: margin costs one extra handshake; outside it, a 403 triggers a renew-and-retry anyway.
 _RENEW_MARGIN_S = 30.0
+
+
+class ClaimNotHeld(RuntimeError):
+    """This node cannot speak for this job -- it never held the claim, or has lost it.
+
+    RAISED, NEVER RETURNED AS None, and that distinction destroyed data before it was fixed.
+    In every other store `get() -> None` means THE ROW DOES NOT EXIST, and `dispatch` relies
+    on exactly that: ``_delete_input_if_owned`` and ``_purge_job_dir_if_owned`` both treat
+    None as "nobody needs these bytes" and delete. Returning None for "not mine" made those
+    gates delete a PEER's staged malware sample and its whole job tree mid-detonation --
+    reproduced, not theorised.
+
+    Dispatch already has the correct path for this: both gates catch exceptions and leave the
+    bytes alone, because "if we cannot PROVE we still own the tree we leave it alone. A leaked
+    dir is recoverable; a job whose input vanished under it is not." So this raises into that
+    contract rather than inventing a new one, and a genuinely-deleted job leaks a directory
+    instead of destroying a live one. That is the safe direction of the same trade.
+    """
 
 
 class NodeStoreUnsupported(NotImplementedError):
@@ -278,18 +301,26 @@ class HttpJobStore:
         return None
 
     def get(self, job_id: str) -> "Job | None":
+        """The job, if this node can prove it holds it. Otherwise RAISE -- never None.
+
+        See :class:`ClaimNotHeld` for why the distinction is load-bearing: None means "no such
+        row" to every caller in this codebase, and two of them delete files on the strength of
+        it.
+        """
         from blastbox.host.jobs.base import Job
 
         held = self._claims.get(job_id)
         if held is None:
-            # A node may read only what it holds. Without the claim id and receipt there is
-            # nothing to ask with, and inventing them would just be a 403 from the server.
-            return None
+            raise ClaimNotHeld(
+                f"no claim receipt for job {job_id}: this process did not claim it, or was "
+                "restarted since. Callers that delete on None must not be told None here.")
         claim_id, receipt = held
         status, body = self._call("GET", f"/v1/nodes/jobs/{job_id}",
                                  params={"claim_id": claim_id, "receipt": receipt})
         if status == 403:
-            return None
+            raise ClaimNotHeld(
+                f"the control plane will not confirm this node's claim on {job_id}; it was "
+                "most likely reclaimed. Leaving its files to whoever owns them now.")
         if status != 200 or not body:
             raise RuntimeError(f"control plane get failed (HTTP {status})")
         return _job_from_dict(body["job"], Job)
@@ -305,18 +336,21 @@ class HttpJobStore:
         return job
 
     def _retire_if_settled(self, job_id: str, job: "Job | None") -> None:
-        """Forget a job we can no longer write to, so the claim map is bounded.
+        """Bound the claim map WITHOUT breaking the read-back that follows a terminal write.
 
-        Nothing removed entries before, so a long-lived dispatcher accumulated one per job it
-        had ever claimed -- small each, unbounded in total, and precisely the shape of leak
-        that only shows up after weeks of uptime. A terminal status, or a release, means the
-        receipt is spent.
+        The first version popped the entry the moment a terminal status was written. That is
+        wrong: dispatch reads the job back from its terminal `finally` three times -- for the
+        outcome metric and for both ownership gates -- so popping immediately made every
+        completed job unreadable by the process that had just completed it. The metric would
+        have recorded `outcome="failed"` for every successful job on a federated node.
+
+        So entries are EVICTED BY AGE, oldest first, once the map exceeds a bound. A settled
+        job stays readable for as long as anything plausibly looks at it, and the map cannot
+        grow for the life of the process. Python dicts preserve insertion order, which is the
+        eviction order wanted here.
         """
-        from blastbox.host.jobs.base import JobStatus
-
-        terminal = {JobStatus.DONE, JobStatus.FAILED, JobStatus.EXPIRED, JobStatus.QUEUED}
-        if job is None or job.status in terminal or not job.claim_id:
-            self._claims.pop(job_id, None)
+        while len(self._claims) > _MAX_TRACKED_CLAIMS:
+            self._claims.pop(next(iter(self._claims)))
 
     def update_if_status(self, job_id: str, expect_status: "JobStatus", *,
                          expect_claim_id: str | None = None, **fields) -> bool:
@@ -330,14 +364,7 @@ class HttpJobStore:
             return False                # no longer ours to write, which is also "did not apply"
         if status != 200:
             raise RuntimeError(f"control plane conditional update failed (HTTP {status})")
-        from blastbox.host.jobs.base import JobStatus
-
-        if isinstance(fields.get("status"), (str, JobStatus)):
-            raw = fields["status"]
-            settled = raw if isinstance(raw, JobStatus) else JobStatus(str(raw))
-            if settled in (JobStatus.DONE, JobStatus.FAILED, JobStatus.EXPIRED,
-                           JobStatus.QUEUED):
-                self._claims.pop(job_id, None)
+        self._retire_if_settled(job_id, None)
         return True
 
     @staticmethod

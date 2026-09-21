@@ -126,13 +126,52 @@ def test_a_stale_claim_id_loses_the_cas_rather_than_writing(control_plane, fleet
     assert backing.get(job.job_id).error is None
 
 
-def test_reading_a_job_this_node_does_not_hold_is_none(control_plane, fleet, backing):
+def test_reading_a_job_this_node_does_not_hold_RAISES_rather_than_returning_none(
+        control_plane, fleet, backing):
+    """NOT None, and the difference destroyed data before it was fixed.
+
+    In every other store `get() -> None` means the row DOES NOT EXIST, and dispatch deletes on
+    that: `_delete_input_if_owned` and `_purge_job_dir_if_owned` both treat None as "nobody
+    needs these bytes". Returning None for "not mine" made them delete a peer's staged sample
+    and its whole job tree mid-detonation. Dispatch already fails SAFE on an exception, so this
+    raises into the contract it already has."""
+    from blastbox.host.jobs.http_store import ClaimNotHeld
+
     queued(backing)
     s = node_store(control_plane, fleet, "alpha")
-    assert s.get("job-1") is None, "read a job it never claimed"
+    with pytest.raises(ClaimNotHeld):
+        s.get("job-1")
     claimed = s.claim_next(engine="clamav")
     assert claimed is not None
     assert s.get(claimed.job_id) is not None
+
+
+def test_a_job_it_completed_is_still_readable_afterwards(control_plane, fleet, backing):
+    """Dispatch reads the job back from its terminal `finally` THREE times -- the outcome
+    metric and both ownership gates. Retiring the receipt on the terminal write made every
+    completed job unreadable by the process that had just completed it, so the metric would
+    have recorded outcome="failed" for every successful job on a federated node."""
+    from blastbox.host.jobs.base import JobStatus
+
+    queued(backing)
+    s = node_store(control_plane, fleet, "alpha")
+    job = s.claim_next(engine="clamav")
+    assert job is not None
+    assert s.update_if_status(job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
+                              status=JobStatus.DONE) is True
+    back = s.get(job.job_id)
+    assert back is not None and back.status is JobStatus.DONE, (
+        "the node cannot read back the job it just completed")
+
+
+def test_the_claim_map_is_bounded(control_plane, fleet, backing):
+    from blastbox.host.jobs import http_store as hs
+
+    s = node_store(control_plane, fleet, "alpha")
+    for i in range(hs._MAX_TRACKED_CLAIMS + 50):
+        s._claims[f"job-{i}"] = ("c", "r")
+    s._retire_if_settled("job-0", None)
+    assert len(s._claims) <= hs._MAX_TRACKED_CLAIMS
 
 
 def test_writing_without_a_claim_refuses_loudly(control_plane, fleet, backing):

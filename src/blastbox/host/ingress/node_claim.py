@@ -95,9 +95,18 @@ SESSION_HEADER = "x-blastbox-node-session"
 #: result write somewhere of its choosing), ``engine``, ``target_tier`` or another node's
 #: ``claim_id``. Those are not untidy, they are privilege escalation. What remains is what a
 #: dispatcher legitimately reports about a run it is performing.
+#: DERIVED, NOT JUDGED. `tests/host/ingress/test_node_writable_fields.py` walks the AST of
+#: `dispatch` and `vm_dispatch` and fails if either writes a field missing from this set. It
+#: had to: I curated this list by hand and left out `expires_at` and `security_warnings`,
+#: which every terminal write carries -- so a credential-less node could not mark ANY job DONE
+#: or FAILED, and the whole feature was non-functional while the suite stayed green, because
+#: the tests only ever wrote the fields I had happened to allow.
 NODE_WRITABLE_FIELDS = frozenset({
     "status", "error", "started_at", "finished_at", "worker_runtime", "worker_tier",
     "result_summary", "input_sha256", "materialise_attempts", "claimable_after",
+    # Terminal writes carry these. Neither is an authorisation surface: expires_at is the
+    # retention clock for the node's own result, security_warnings is what the run observed.
+    "expires_at", "security_warnings",
     # claim_id is here for ONE value only -- None, which is releasing the job. Setting it to
     # anything else would let a node re-stamp ownership and defeat every fence built on it.
     "claim_id",

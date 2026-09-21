@@ -83,8 +83,12 @@ def test_and_it_has_no_other_way_to_take_it(deployment):
                        status=JobStatus.QUEUED, created_at=time.time()))
     restricted = as_node("restricted")
 
-    # It cannot read the job it was refused...
-    assert restricted.get("sensitive") is None
+    # It cannot read the job it was refused -- and is told so by an exception, never by a
+    # None that dispatch's delete gates would read as "nobody needs these bytes".
+    from blastbox.host.jobs.http_store import ClaimNotHeld
+
+    with pytest.raises(ClaimNotHeld):
+        restricted.get("sensitive")
     # ...cannot write to it...
     with pytest.raises(PermissionError):
         restricted.update("sensitive", status=JobStatus.RUNNING)
