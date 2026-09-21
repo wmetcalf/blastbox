@@ -61,6 +61,7 @@ import base64
 import binascii
 import logging
 import os
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -117,6 +118,23 @@ NODE_WRITABLE_FIELDS = frozenset({
 #: terminal write from a node would put a string where the rest of the system expects a
 #: `JobStatus`, and comparisons against the enum would quietly stop matching.
 _ENUM_FIELDS = ("status",)
+
+#: Set to refuse a claim this host cannot fully authorise, rather than warning. Off by
+#: default: an ingress with no netpolicy registry would otherwise refuse every ordinary job,
+#: which is the `UNGOVERNED_TIERS` outage all over again. On, it is real prevention.
+STRICT_TIERS_ENV = "BLASTBOX_NODE_CLAIM_STRICT_TIERS"
+
+#: How many jobs one claim request may walk past before giving up. Bounds the work a single
+#: request can do while still letting a node reach work behind a job it may not run.
+_MAX_CLAIM_PROBES = 8
+
+#: How long a (node, job) refusal is remembered, so a node does not claim-and-release the same
+#: job on every poll. Short: grants can change, and a stale memo only costs a missed poll.
+_REFUSAL_MEMO_S = 30.0
+_MAX_REFUSAL_MEMO = 4096
+
+#: (node_id, job_id) -> when it was refused. Per-process and best-effort; see _remember_refusal.
+_refusals: "dict[tuple[str, str], float]" = {}
 
 #: What a refused caller is told. ONE message for every cause -- a wrong CA, an unheld key,
 #: an ungranted engine and an expired challenge are all simply "no". Distinguishing them
@@ -337,23 +355,52 @@ def register_node_claim_routes(
                          node_id, wanted)
             raise HTTPException(status_code=403, detail=_REFUSED)
 
-        job = job_store.claim_next(claimant_tier=req.claimant_tier,
-                                   engine=frozenset(allowed))
+        # KEEP LOOKING PAST A JOB THIS NODE MAY NOT RUN. `claim_next` always returns the
+        # OLDEST eligible job, and a refused job goes straight back to QUEUED -- so returning
+        # after one refusal meant the next poll re-selected the SAME job forever and the node
+        # NEVER reached newer work it was entitled to. Measured: five consecutive polls, five
+        # refusals, and an entitled job two places back never claimed. So refusals are skipped
+        # within this request, and remembered briefly so the next poll does not re-walk them.
+        skipped: list[Any] = []
+        job = None
+        try:
+            for _ in range(_MAX_CLAIM_PROBES):
+                candidate = job_store.claim_next(claimant_tier=req.claimant_tier,
+                                                 engine=frozenset(allowed))
+                if candidate is None:
+                    break
+                if _recently_refused(node_id, candidate.job_id):
+                    skipped.append(candidate)
+                    continue
+                tier, needs_credentials, could_tell = _job_requirements(candidate)
+                why = refusal(grants, engine=candidate.engine, tier=tier,
+                              require_credentials=needs_credentials)
+                if why is None and not could_tell and _strict_tiers():
+                    # This host cannot see the job's personality, so it cannot prove the tier
+                    # and credentials grants are satisfied. In strict mode that is a refusal,
+                    # not a pass -- the same direction `SelfGrants.refuse` takes for an
+                    # unreadable driver ("Unreadable, not ungoverned").
+                    why = ("this host cannot resolve the job's network personality, so the "
+                           "tier and credentials grants cannot be checked")
+                if why is None:
+                    job = candidate
+                    break
+                _remember_refusal(node_id, candidate.job_id)
+                skipped.append(candidate)
+                _log.warning("node_claim: released job=%s from node=%s: %s",
+                             candidate.job_id, node_id, why)
+        finally:
+            # Put back everything not handed over, including on an exception: a job claimed
+            # inside this loop and not returned would otherwise be stranded RUNNING.
+            for other in skipped:
+                _release(other)
+
         if job is None:
-            # 204, not 404: the node is entitled to work and there is none right now.
-            # A 404 here would be indistinguishable from the routes not existing, which is
-            # how a node would decide to fall back to claiming directly from the store.
+            # 204, not 404: the node is entitled to work and there is none right now (or none
+            # it may run). A 404 would be indistinguishable from the routes not existing, which
+            # is how a node decides to fall back to claiming from the store directly.
             response.status_code = 204
             return response
-
-        tier, needs_credentials = _job_requirements(job)
-        why = refusal(grants, engine=job.engine, tier=tier,
-                      require_credentials=needs_credentials)
-        if why is not None:
-            _release(job)
-            _log.warning("node_claim: released job=%s from node=%s: %s",
-                         job.job_id, node_id, why)
-            raise HTTPException(status_code=403, detail=_REFUSED)
 
         _log.info("node_claim: handed job=%s engine=%s to node=%s",
                   job.job_id, job.engine, node_id)
@@ -366,41 +413,90 @@ def register_node_claim_routes(
                 job.job_id, job.claim_id or "", node_id, secret=_secret()),
         }
 
-    def _job_requirements(job) -> "tuple[str | None, bool]":
-        """(tier grant this job needs, whether running it means holding credentials).
+    def _job_requirements(job) -> "tuple[str | None, bool, bool]":
+        """(tier grant needed, credentials needed, whether this host could tell).
 
-        DERIVED HERE, never taken from the request. Resolved from the job's own network
-        personality, so a node cannot dodge a check by omitting a field.
+        DERIVED HERE, never taken from the request -- a caller choosing its own authorisation
+        predicate is not an authorisation check.
 
-        UNGOVERNED TIERS ARE NOT A GRANT REQUIREMENT, and that is a lesson already paid for
-        in `placement.UNGOVERNED_TIERS`: ``none`` is the DEFAULT personality and requiring a
-        grant for it made correctly-issued nodes refuse every ordinary job. Same here -- an
-        unresolvable or ungoverned personality asks for no tier grant.
+        THE ENGINE DEFAULT IS THE USUAL CASE, and getting it wrong made this whole check a
+        no-op. An earlier version hardcoded ``engine_default="none"``, but a job's personality
+        normally comes from ``BLASTBOX_ENGINE_<NAME>_NETPOLICY`` (cli.py reads exactly that
+        when it builds the dispatcher's EngineSpecs), and ``job.net_policy`` is only ever
+        stored when ``BLASTBOX_ALLOW_NETPOLICY_OVERRIDE`` is on -- which is OFF by default. So
+        every job resolved to ``none`` here, took the ungoverned branch, and neither the tier
+        nor the credentials grant was ever examined. The tests passed because they set a
+        per-job override, i.e. they exercised the one path that worked.
 
-        WHAT THIS CANNOT DERIVE: whether the node holds a provider secret for openvpn or
-        wireguard depends on that node's own egress MODE, which is a node-local fact this
-        host does not know. So credentials are required for the drivers that always imply
-        them (a local socks/httpproxy sidecar) and the mode-dependent pair is left to the
-        node's own `SelfGrants`. Stated rather than silently assumed.
+        THE THIRD RETURN VALUE IS "COULD I TELL". An ingress host with no
+        ``BLASTBOX_NETPOLICY_*`` registry cannot distinguish a genuinely ungoverned job from
+        one whose personality it simply cannot see, and quietly treating the second as the
+        first is how this became a no-op. It reports the doubt instead, and the caller decides.
+
+        UNGOVERNED TIERS REMAIN NO REQUIREMENT -- a lesson already paid for in
+        `placement.UNGOVERNED_TIERS`: ``none`` is the DEFAULT personality and demanding a grant
+        for it made correctly-issued nodes refuse every ordinary job.
+
+        WHAT IT STILL CANNOT DERIVE: whether openvpn/wireguard imply credentials depends on the
+        NODE's own egress mode, which is node-local. Those stay with the node's `SelfGrants`;
+        only the always-credentialed drivers are required here.
         """
         from blastbox.host.netpolicy import parse_personalities, resolve_net_policy
         from blastbox.host.placement import ALWAYS_CREDENTIALED, UNGOVERNED_TIERS
 
-        driver = ""
+        registry = parse_personalities(os.environ)
+        # The same env convention cli.py uses to build the dispatcher's EngineSpecs, so both
+        # sides resolve one job to one personality.
+        engine_default = (os.environ.get(
+            f"BLASTBOX_ENGINE_{job.engine.upper().replace('-', '_')}_NETPOLICY")
+            or "none").strip() or "none"
+        # CAN THIS HOST RESOLVE WHAT THIS JOB NEEDS? Precisely, not by counting entries.
+        #
+        # * engine_default "none" and no per-job override -> the job genuinely IS ungoverned,
+        #   which is the ordinary all-none deployment. Nothing to look up, nothing unknown.
+        # * engine_default names a personality this host HAS -> resolvable.
+        # * engine_default names one this host has NOT got -> `resolve_net_policy` silently
+        #   falls back to "none", and THAT is the silent hole: an operator declared a policy
+        #   this host cannot see, so the tier and credentials grants would go unchecked while
+        #   looking exactly like an ungoverned job. Unknown, and it must not read as permissive.
+        can_tell = engine_default == "none" or engine_default in registry
+        allow_override = (os.environ.get("BLASTBOX_ALLOW_NETPOLICY_OVERRIDE", "").strip()
+                          .lower() in ("1", "true", "yes", "on"))
         try:
-            # The registry is read from THIS host's environment, the same source the
-            # dispatcher reads, so both resolve a job to the same personality. Read per call
-            # rather than cached: `parse_personalities` is a dict comprehension over env, and
-            # a cached authorisation input is how this codebase has been bitten repeatedly.
             personality = resolve_net_policy(
-                job_net_policy=job.net_policy, engine_default="none",
-                registry=parse_personalities(os.environ), allow_override=True)
+                job_net_policy=job.net_policy, engine_default=engine_default,
+                registry=registry, allow_override=allow_override)
             driver = getattr(personality, "exit_driver", "") or ""
-        except Exception:               # noqa: BLE001 - unknown policy asks for no grant
-            driver = ""
+        except Exception:               # noqa: BLE001
+            return None, False, False
         if not driver or driver in UNGOVERNED_TIERS:
-            return None, False
-        return driver, driver in ALWAYS_CREDENTIALED
+            # Genuinely ungoverned IF this host could have told. If it could not, the answer
+            # is "unknown", and the caller must not read it as "unrestricted".
+            return None, False, can_tell
+        return driver, driver in ALWAYS_CREDENTIALED, True
+
+    def _strict_tiers() -> bool:
+        return (os.environ.get(STRICT_TIERS_ENV, "").strip().lower()
+                in ("1", "true", "yes", "on"))
+
+    def _recently_refused(node_id: str, job_id: str) -> bool:
+        stamp = _refusals.get((node_id, job_id))
+        return stamp is not None and (time.time() - stamp) < _REFUSAL_MEMO_S
+
+    def _remember_refusal(node_id: str, job_id: str) -> None:
+        """Remember a refusal briefly, so a node does not re-claim-and-release the same job on
+        every poll. Best-effort and per-process: losing it costs one extra release, which is
+        why it can be a plain dict rather than shared state. Bounded so a large queue cannot
+        grow it without limit.
+        """
+        now = time.time()
+        _refusals[(node_id, job_id)] = now
+        if len(_refusals) > _MAX_REFUSAL_MEMO:
+            for key, stamp in list(_refusals.items()):
+                if now - stamp >= _REFUSAL_MEMO_S:
+                    _refusals.pop(key, None)
+            while len(_refusals) > _MAX_REFUSAL_MEMO:
+                _refusals.pop(next(iter(_refusals)))
 
     def _release(job) -> None:
         """Put a wrongly-offered job back, fenced on the claim we are releasing.
@@ -412,9 +508,15 @@ def register_node_claim_routes(
         from blastbox.host.jobs.base import JobStatus
 
         try:
+            # started_at=None too, exactly as dispatch's own requeue does (dispatch.py clears
+            # it deliberately): `claim_next` stamps it, so a job refused here would otherwise
+            # go back to the queue carrying a start time for a run that never happened -- and
+            # that value is public on the job record.
             job_store.update_if_status(job.job_id, JobStatus.RUNNING,
                                        expect_claim_id=job.claim_id,
-                                       status=JobStatus.QUEUED, claim_id=None)
+                                       status=JobStatus.QUEUED, claim_id=None,
+                                       started_at=None, worker_runtime=None,
+                                       worker_tier=None)
         except Exception:               # noqa: BLE001 - the reclaim sweep is the backstop
             _log.exception("node_claim: could not release job=%s; the reclaim path will "
                            "pick it up", job.job_id)

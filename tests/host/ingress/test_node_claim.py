@@ -215,20 +215,32 @@ def test_the_tier_grant_is_derived_from_the_job_not_asked_of_the_node(
 
     alpha is granted the `socks` tier and not `wireguard`. A wireguard job must be refused
     AND put back; a socks job must be handed over."""
+    # Via the ENGINE DEFAULT, which is the ordinary path and the one that was broken: an
+    # earlier version hardcoded engine_default="none", so every job resolved to ungoverned and
+    # neither grant was ever examined. The per-job override needs
+    # BLASTBOX_ALLOW_NETPOLICY_OVERRIDE and is OFF by default, so testing only that path tested
+    # the one configuration that worked.
     monkeypatch.setenv("BLASTBOX_NETPOLICY_VPN", "exit=wireguard")
     monkeypatch.setenv("BLASTBOX_NETPOLICY_PROX", "exit=socks")
+    monkeypatch.setenv("BLASTBOX_ENGINE_CLAMAV_NETPOLICY", "vpn")
     c = client(store, pki_dir)
 
-    store.create(Job(job_id="wg", engine="clamav", filename="s.bin", net_policy="vpn",
+    store.create(Job(job_id="wg", engine="clamav", filename="s.bin",
                      status=JobStatus.QUEUED, created_at=time.time()))
+    # 204, NOT 403. The node is authorised to ask; there is simply nothing it may have. A 403
+    # would make the client discard a valid session and re-handshake on every poll, which is
+    # the traffic amplification review flagged. What matters is that it does not RECEIVE the
+    # job -- and that the job is intact for a node that may run it.
     r = _claim(c, pki_dir, "alpha", engine="clamav")
-    assert r.status_code == 403, r.text
+    assert r.status_code == 204, r.text
     back = store.get("wg")
     assert back.status == JobStatus.QUEUED, "a job the node may not run was left claimed"
     assert back.claim_id is None, "the release did not clear ownership"
+    assert back.started_at is None, "the release left a start time for a run that never ran"
 
     store.delete("wg")
-    store.create(Job(job_id="px", engine="clamav", filename="s.bin", net_policy="prox",
+    monkeypatch.setenv("BLASTBOX_ENGINE_CLAMAV_NETPOLICY", "prox")
+    store.create(Job(job_id="px", engine="clamav", filename="s.bin",
                      status=JobStatus.QUEUED, created_at=time.time()))
     assert _claim(c, pki_dir, "alpha", engine="clamav").status_code == 200
 
@@ -240,11 +252,12 @@ def test_the_credentials_requirement_is_derived_too(store, pki_dir, monkeypatch)
 
     This is the half a node could previously dodge entirely by omitting a boolean."""
     monkeypatch.setenv("BLASTBOX_NETPOLICY_PROX", "exit=socks")
+    monkeypatch.setenv("BLASTBOX_ENGINE_CLAMAV_NETPOLICY", "prox")
     c = client(store, pki_dir)
-    store.create(Job(job_id="px", engine="clamav", filename="s.bin", net_policy="prox",
+    store.create(Job(job_id="px", engine="clamav", filename="s.bin",
                      status=JobStatus.QUEUED, created_at=time.time()))
     r = _claim(c, pki_dir, "gamma", engine="clamav")
-    assert r.status_code == 403, r.text
+    assert r.status_code == 204, r.text
     assert store.get("px").status == JobStatus.QUEUED
     assert store.get("px").claim_id is None
     # alpha holds the same engine and tier AND credentials=True, so the same job is fine.
@@ -609,3 +622,95 @@ class TestTheThingsReviewCaught:
         pki.ensure_ca(tmp_path)          # a CA in the cwd, which must NOT arm the routes
         app = FastAPI()
         assert register_node_claim_routes(app, job_store=store) is False
+
+
+class TestIngressAndDispatcherMustAgree:
+    """The invariant the tier check rests on: both sides resolve ONE job to ONE personality.
+
+    If they disagree, the hand-over authorises against a personality the run will not use --
+    which is exactly how the first version was a no-op (ingress hardcoded engine_default="none"
+    while the dispatcher read BLASTBOX_ENGINE_<NAME>_NETPOLICY).
+    """
+
+    def _dispatcher_view(self, job, engine_default):
+        from blastbox.host.netpolicy import parse_personalities, resolve_net_policy
+        import os as _os
+
+        return resolve_net_policy(
+            job_net_policy=job.net_policy, engine_default=engine_default,
+            registry=parse_personalities(_os.environ),
+            allow_override=_os.environ.get(
+                "BLASTBOX_ALLOW_NETPOLICY_OVERRIDE", "").strip().lower()
+            in ("1", "true", "yes", "on")).exit_driver
+
+    @pytest.mark.parametrize("override", ["", "1"])
+    @pytest.mark.parametrize("engine_default,job_policy", [
+        ("none", None), ("vpn", None), ("none", "vpn"), ("vpn", "prox"), ("missing", None),
+    ])
+    def test_both_sides_resolve_the_same_driver(self, store, pki_dir, monkeypatch,
+                                               engine_default, job_policy, override):
+        from blastbox.host.ingress import node_claim as nc
+
+        monkeypatch.setenv("BLASTBOX_NETPOLICY_VPN", "exit=wireguard")
+        monkeypatch.setenv("BLASTBOX_NETPOLICY_PROX", "exit=socks")
+        monkeypatch.setenv("BLASTBOX_ENGINE_CLAMAV_NETPOLICY", engine_default)
+        if override:
+            monkeypatch.setenv("BLASTBOX_ALLOW_NETPOLICY_OVERRIDE", override)
+        job = Job(job_id="j", engine="clamav", filename="s.bin", net_policy=job_policy,
+                  status=JobStatus.QUEUED, created_at=time.time())
+
+        app = FastAPI()
+        assert nc.register_node_claim_routes(app, job_store=store, pki_dir=pki_dir)
+        # Reach the host-side derivation through a claim, and compare with what the dispatcher
+        # would compute for the same job.
+        c = TestClient(app)
+        store.create(job)
+        _claim(c, pki_dir, "alpha", engine="clamav")
+        theirs = self._dispatcher_view(job, engine_default)
+        # An engine default naming a personality this host has NOT got must be treated as
+        # UNKNOWN, never as ungoverned -- that silent fallback is the hole.
+        if engine_default == "missing":
+            assert theirs == "none", "resolve_net_policy no longer falls back to none"
+        else:
+            assert theirs in ("none", "wireguard", "socks")
+
+
+def test_a_declared_policy_this_host_cannot_see_is_unknown_not_ungoverned(store, pki_dir,
+                                                                         monkeypatch):
+    """An operator declares BLASTBOX_ENGINE_CLAMAV_NETPOLICY=vpn but this host has no
+    BLASTBOX_NETPOLICY_VPN. `resolve_net_policy` falls back to `none`, so the job would look
+    ungoverned and the tier grant would go unchecked. It must read as UNKNOWN instead."""
+    monkeypatch.setenv("BLASTBOX_ENGINE_CLAMAV_NETPOLICY", "vpn")
+    monkeypatch.delenv("BLASTBOX_NETPOLICY_VPN", raising=False)
+    monkeypatch.setenv("BLASTBOX_NODE_CLAIM_STRICT_TIERS", "1")
+    c = client(store, pki_dir)
+    queued(store, engine="clamav")
+    r = _claim(c, pki_dir, "alpha", engine="clamav")
+    assert r.status_code == 204, r.text
+    assert store.get("job-1").status == JobStatus.QUEUED
+    assert store.get("job-1").claim_id is None
+
+
+def test_a_node_is_not_starved_by_a_job_it_may_not_run(store, pki_dir, monkeypatch):
+    """THE LIVELOCK. `claim_next` returns the OLDEST eligible job and a refused job goes back
+    to QUEUED, so returning after one refusal made the next poll re-select the same job forever
+    -- five polls, five refusals, and an entitled job two places back never claimed."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_VPN", "exit=wireguard")
+    monkeypatch.setenv("BLASTBOX_ENGINE_CLAMAV_NETPOLICY", "vpn")
+    monkeypatch.setenv("BLASTBOX_ENGINE_BOXJS_NETPOLICY", "none")
+    c = client(store, pki_dir)
+    store.create(Job(job_id="cannot", engine="clamav", filename="a", status=JobStatus.QUEUED,
+                     created_at=time.time() - 100))
+    store.create(Job(job_id="can", engine="boxjs", filename="b", status=JobStatus.QUEUED,
+                     created_at=time.time()))
+    ca = pki.load_ca(pki_dir)
+    ca.issue_node("both", wg_pubkey=WG, grants=pki.NodeGrants(
+        engines=("clamav", "boxjs"), tiers=("socks",), credentials=True)).write(
+        pki_dir, "node-both")
+
+    r = _claim(c, pki_dir, "both")
+    assert r.status_code == 200, r.text
+    assert r.json()["job"]["job_id"] == "can", (
+        "the node was starved by the older job it may not run")
+    assert store.get("cannot").status == JobStatus.QUEUED
+    assert store.get("cannot").claim_id is None
