@@ -186,3 +186,104 @@ def test_a_dispatchers_own_claim_is_never_touched(store):
                      started_at=time.time() - 10_000, claim_id="plain-dispatcher-claim"))
     assert reclaim_stale_claims(store, after_s=900.0) == 0
     assert store.get("dispatcher-job").status is JobStatus.RUNNING
+
+
+class TestTheQueuedHalf:
+    """Work nobody can claim. On an all-federated fleet a target_tier-pinned job is claimable by
+    no node (the node path passes no tier, so `claim_next` skips pinned rows by design),
+    `reclaim_stale_claims` only looks at RUNNING, and retention only at terminal states — so it
+    sat QUEUED forever with its untrusted sample on the ingress's own disk."""
+
+    def test_a_job_nobody_can_claim_is_eventually_failed(self, store):
+        from blastbox.host.ingress.node_reclaim import fail_stale_queued
+
+        store.create(Job(job_id="pinned", engine="clamav", filename="s.bin",
+                         status=JobStatus.QUEUED, created_at=time.time() - 10_000,
+                         target_tier="firecracker"))
+        assert fail_stale_queued(store, max_age_s=3600.0) == 1
+        job = store.get("pinned")
+        assert job.status is JobStatus.FAILED
+        assert "QUEUED" in (job.error or "")
+
+    def test_a_fresh_job_is_left_alone(self, store):
+        from blastbox.host.ingress.node_reclaim import fail_stale_queued
+
+        store.create(Job(job_id="new", engine="clamav", filename="s.bin",
+                         status=JobStatus.QUEUED, created_at=time.time()))
+        assert fail_stale_queued(store, max_age_s=3600.0) == 0
+        assert store.get("new").status is JobStatus.QUEUED
+
+    def test_a_job_claimed_since_the_snapshot_is_not_failed(self, store):
+        """CAS on QUEUED. A job that went RUNNING between the list() and the write belongs to
+        whoever claimed it."""
+        from blastbox.host.ingress.node_reclaim import fail_stale_queued
+
+        now = time.time()
+        store.create(Job(job_id="taken", engine="clamav", filename="s.bin",
+                         status=JobStatus.QUEUED, created_at=now - 10_000))
+        snapshot = store.list(status=JobStatus.QUEUED)
+
+        class Stale(InMemoryJobStore):
+            def list(self, *a, **k):
+                return snapshot
+
+        racing = Stale()
+        racing.create(Job(job_id="taken", engine="clamav", filename="s.bin",
+                          status=JobStatus.RUNNING, created_at=now - 10_000,
+                          started_at=now, claim_id="node:someone"))
+        assert fail_stale_queued(racing, max_age_s=3600.0) == 0
+        assert racing.get("taken").status is JobStatus.RUNNING
+
+    def test_the_untrusted_input_is_deleted(self, store, tmp_path):
+        """Nothing else will: the scratch reaper needs the tree aged, and retention needs an
+        expires_at this job never got."""
+        from blastbox.host.ingress.node_reclaim import fail_stale_queued
+
+        root = tmp_path / "jobs"
+        sample = root / "pinned" / "input" / "s.bin"
+        sample.parent.mkdir(parents=True)
+        sample.write_text("untrusted")
+        store.create(Job(job_id="pinned", engine="clamav", filename="s.bin",
+                         status=JobStatus.QUEUED, created_at=time.time() - 10_000))
+        assert fail_stale_queued(store, max_age_s=3600.0, job_root=root) == 1
+        assert not sample.exists()
+        assert root.exists(), "the sweep removed more than the input"
+
+    def test_it_is_off_unless_the_policy_is_set(self, store, monkeypatch):
+        from blastbox.host.ingress.node_reclaim import fail_stale_queued, max_queued_age_s
+
+        monkeypatch.delenv("BLASTBOX_MAX_QUEUED_AGE_S", raising=False)
+        assert max_queued_age_s() == 0.0
+        store.create(Job(job_id="old", engine="clamav", filename="s.bin",
+                         status=JobStatus.QUEUED, created_at=time.time() - 10_000))
+        assert fail_stale_queued(store, max_age_s=max_queued_age_s()) == 0
+        assert store.get("old").status is JobStatus.QUEUED
+
+
+class TestOneSweeperPerHost:
+    """workers>1 forks, and every worker ran the whole sweep: N full scans per interval, each
+    holding the store's lock inside a process meant to be answering requests."""
+
+    def test_only_one_holder_at_a_time(self, tmp_path):
+        from blastbox.host.ingress.node_reclaim import sweeper_lock
+
+        with sweeper_lock(tmp_path) as first:
+            assert first is True
+            with sweeper_lock(tmp_path) as second:
+                assert second is False, "two workers swept the same tick"
+
+    def test_the_lock_is_released_for_the_next_tick(self, tmp_path):
+        from blastbox.host.ingress.node_reclaim import sweeper_lock
+
+        with sweeper_lock(tmp_path) as a:
+            assert a is True
+        with sweeper_lock(tmp_path) as b:
+            assert b is True, "a wedged holder would cost the fleet its sweep entirely"
+
+    def test_an_unlockable_root_still_sweeps(self, tmp_path):
+        """N sweeps is waste; ZERO sweeps loses the only reclaim path a credential-less fleet
+        has. So a filesystem that cannot lock errs towards sweeping."""
+        from blastbox.host.ingress.node_reclaim import sweeper_lock
+
+        with sweeper_lock(tmp_path / "nonexistent" / "\0bad") as ok:
+            assert ok is True

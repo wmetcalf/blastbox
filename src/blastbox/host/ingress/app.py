@@ -436,11 +436,18 @@ def build_app(
             # "reclaim on timeout" that the claim protocol relies on has nowhere else to live.
             # Off unless an operator sets the age; see node_reclaim.
             from blastbox.host.ingress.node_reclaim import (
+                fail_stale_queued,
+                max_queued_age_s,
                 reclaim_after_s,
                 reclaim_stale_claims,
+                sweeper_lock,
             )
 
             reclaim_after = reclaim_after_s()
+            queued_age = max_queued_age_s()
+            if queued_age:
+                _log.info("ingress: stale-QUEUED sweep on, failing jobs unclaimed >%.0fs",
+                          queued_age)
             if reclaim_after:
                 _log.info("ingress: stale-claim sweep on, failing RUNNING jobs idle >%.0fs",
                           reclaim_after)
@@ -470,6 +477,12 @@ def build_app(
                                  exc_info=True)
 
             while not stop.wait(_reap_interval_s):
+                # ONE SWEEPER PER HOST PER TICK. workers>1 forks, and every worker used to run
+                # the whole sweep: N full scans per interval, each holding the store's lock
+                # inside a process that is meant to be answering requests.
+                with sweeper_lock(_job_root) as _mine:
+                    if not _mine:
+                        continue
                 if _scratch_max_age_s > 0:
                     try:
                         reap_stale_scratch(_job_root, _scratch_max_age_s, _job_store, reap_log,
@@ -481,6 +494,15 @@ def build_app(
                         reclaim_stale_claims(_job_store, after_s=reclaim_after)
                     except Exception:  # noqa: BLE001 -- same contract as above
                         _log.warning("ingress: stale-claim sweep failed", exc_info=True)
+                if queued_age:
+                    # Work nobody can claim -- a target_tier with no matching dispatcher on an
+                    # all-federated fleet -- would otherwise sit QUEUED forever with its
+                    # untrusted sample on this host's disk.
+                    try:
+                        fail_stale_queued(_job_store, max_age_s=queued_age,
+                                          job_root=_job_root)
+                    except Exception:  # noqa: BLE001 -- same contract as above
+                        _log.warning("ingress: stale-QUEUED sweep failed", exc_info=True)
                 if _retention_here:
                     # #178: retention has to run where the queue is. `expire_due` finds its
                     # candidates by ENUMERATING, and a credential-less node's store refuses that
@@ -502,8 +524,9 @@ def build_app(
         from blastbox.host.ingress.node_reclaim import reclaim_after_s as _reclaim_after_s
 
         _retention_wanted = (os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS") or "0").strip()
+        _queued_wanted = (os.environ.get("BLASTBOX_MAX_QUEUED_AGE_S") or "0").strip()
         if ((_scratch_max_age_s > 0 or _reclaim_after_s() > 0
-             or _retention_wanted not in ("", "0"))
+             or _retention_wanted not in ("", "0") or _queued_wanted not in ("", "0"))
                 and _reap_interval_s > 0):
             thread = threading.Thread(target=_reap_loop, name="blastbox-ingress-reap",
                                       daemon=True)

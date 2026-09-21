@@ -19,18 +19,22 @@ reason: a requeue "would let a second worker re-detonate the same untrusted inpu
 sandboxes don't die with a crashed dispatcher". Terminal is the safe end for an abandoned
 detonation.
 
-TWO GAPS THIS SWEEP DOES NOT CLOSE, both found by review and left deliberately:
+THE QUEUED HALF IS HERE TOO (:func:`fail_stale_queued`). Work pinned with ``target_tier`` is
+unclaimable on an all-federated fleet -- the node path passes no tier, so `claim_next` skips
+pinned rows by design -- and the dispatcher's counterpart is list()-driven, so it stayed behind
+with the database. Such a job otherwise sits QUEUED forever with its untrusted sample spooled
+under the ingress's own job_root, which the scratch reaper will not touch while the row is
+non-terminal. Same policy variable as the dispatcher's (``BLASTBOX_MAX_QUEUED_AGE_S``), so a
+fleet that already set it gets the same behaviour wherever the queue lives.
 
-* QUEUED work pinned with ``target_tier`` is unclaimable on an all-federated fleet -- the node
-  path passes no tier, so `claim_next` skips pinned rows by design -- and the counterpart that
-  fails stale QUEUED jobs (`_fail_stale_queued_jobs`) is list()-driven and stayed on the
-  dispatcher. Such a job sits QUEUED forever with its sample spooled under ingress. Closing it
-  means porting that sweep here too; it is not in this one because failing QUEUED work needs
-  the max-queued-age policy, which is a dispatcher setting.
-* With ``workers>1`` every forked ingress worker runs its own maintenance loop, so the sweeps
-  run N times per interval. Every write is CAS-fenced, so this is waste and lock contention
-  rather than corruption -- measured at ~150 ms of added worst-case API latency per sweep on a
-  50k-row table. A lease in the store would fix it and is the same shape as ClaimKeyRegistry.
+ONE SWEEPER PER HOST (see :func:`sweeper_lock`). ``workers>1`` forks, and each worker ran its
+own maintenance loop: N full scans per interval, each holding the store's process lock, measured
+at ~150 ms of added worst-case API latency per sweep on a 50k-row table. Every write is
+CAS-fenced so it was waste rather than corruption, but it was waste in the request-serving
+process. A non-blocking ``flock`` on a sidecar file elects one sweeper per host per tick -- the
+same idiom `egress_apply` already uses, and it needs no new store method. RESIDUAL, stated: two
+ingress HOSTS still sweep independently. That is bounded by host count rather than worker count,
+and every write remains CAS-fenced.
 
 OPT-IN, because a cutoff this side cannot derive. The dispatcher knows its own
 ``worker_timeout_s``; the control plane does not, and failing a job a healthy node is still
@@ -42,6 +46,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:                       # pragma: no cover - typing only
@@ -78,6 +83,132 @@ def reclaim_after_s(env: "dict[str, str] | None" = None) -> float:
                      MIN_RECLAIM_AFTER_S)
         return MIN_RECLAIM_AFTER_S
     return value
+
+
+def sweeper_lock(job_root: "Path | str"):
+    """Elect ONE sweeper per host for this tick, or yield False.
+
+    ``workers>1`` forks the app, so without this every worker ran the full maintenance sweep
+    every interval -- N scans, each serialising on the store's lock inside a process that is
+    meant to be answering requests. A non-blocking flock on a sidecar file is the cheapest
+    correct election and is already this codebase's idiom for exactly this (`egress_apply`
+    locks a sidecar rather than the file it rewrites).
+
+    PER TICK, not for the process lifetime: if the holder is slow or wedged, the next tick is
+    simply taken by whoever gets the lock, rather than the fleet losing its sweep entirely
+    because one worker is stuck. Failure to lock at all (a read-only mount, an exotic
+    filesystem) yields True -- N sweeps is wasteful, zero sweeps loses the only reclaim path a
+    credential-less fleet has.
+    """
+    import contextlib
+    import fcntl
+    import os as _os
+
+    @contextlib.contextmanager
+    def _held():
+        path = Path(job_root) / ".blastbox-maintenance.lock"
+        fd = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd = _os.open(path, _os.O_CREAT | _os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                yield False             # another worker on this host has it this tick
+                return
+            yield True
+        except Exception:               # noqa: BLE001 - see below; never lose the sweep
+            # BROADER THAN OSError DELIBERATELY. A pathological job_root raises ValueError
+            # ("embedded null byte") rather than OSError, which escaped and would have killed
+            # the maintenance tick -- found by this module's own test. The contract of this
+            # helper is "never cost the fleet its sweep", so anything at all that goes wrong
+            # here errs towards sweeping: N sweeps is waste, zero sweeps is the only reclaim
+            # path a credential-less fleet has.
+            _log.debug("node_reclaim: cannot take the maintenance lock; sweeping anyway",
+                       exc_info=True)
+            yield True
+        finally:
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    _os.close(fd)
+
+    return _held()
+
+
+def max_queued_age_s(env: "dict[str, str] | None" = None) -> float:
+    """The dispatcher's own policy variable, read here too. 0 = the QUEUED sweep is off."""
+    e = os.environ if env is None else env
+    try:
+        return max(0.0, float((e.get("BLASTBOX_MAX_QUEUED_AGE_S") or "0").strip() or 0))
+    except ValueError:
+        _log.warning("BLASTBOX_MAX_QUEUED_AGE_S is not a number; the stale-QUEUED sweep is OFF")
+        return 0.0
+
+
+def fail_stale_queued(job_store: "JobStore", *, max_age_s: float,
+                      job_root: "Path | str | None" = None,
+                      now: float | None = None) -> int:
+    """FAIL jobs stuck QUEUED past *max_age_s*, and delete their untrusted input.
+
+    WHY IT HAS TO RUN HERE. A job pinned with ``target_tier`` is claimable by nobody on an
+    all-federated fleet, `reclaim_stale_claims` only looks at RUNNING, and retention only at
+    terminal states -- so it sits QUEUED forever with its sample on disk. The dispatcher's
+    version of this is list()-driven and cannot run on a node.
+
+    CAS ON QUEUED, so a job claimed since the snapshot (now RUNNING) is left entirely alone.
+    """
+    import time
+
+    from blastbox.host.jobs.base import JobStatus
+
+    if max_age_s <= 0:
+        return 0
+    stamp = time.time() if now is None else now
+    cutoff = stamp - max_age_s
+    try:
+        queued = job_store.list(status=JobStatus.QUEUED)
+    except Exception:                   # noqa: BLE001 - a sweep failure must not kill serving
+        _log.warning("node_reclaim: could not list QUEUED jobs", exc_info=True)
+        return 0
+
+    failed = 0
+    for job in queued:
+        if job.created_at > cutoff:
+            continue
+        try:
+            applied = job_store.update_if_status(
+                job.job_id, JobStatus.QUEUED, status=JobStatus.FAILED, finished_at=stamp,
+                error=(f"stuck QUEUED for more than {max_age_s:.0f}s: no dispatcher claimed "
+                       "it (a target_tier with no matching dispatcher, or an engine nobody "
+                       "serves)"))
+        except Exception:               # noqa: BLE001 - one bad row is not a sweep outage
+            _log.warning("node_reclaim: could not fail stale job=%s", job.job_id,
+                         exc_info=True)
+            continue
+        if not applied:
+            continue
+        failed += 1
+        _log.warning("node_reclaim: failed job=%s stuck QUEUED >%.0fs (target_tier=%r)",
+                     job.job_id, max_age_s, job.target_tier)
+        if job_root is not None and job.filename:
+            # The untrusted sample was spooled here at submission and nothing else will remove
+            # it now the row is terminal-but-never-run: the scratch reaper needs the tree aged,
+            # and retention needs an expires_at this job never got. Best-effort and narrow --
+            # the input FILE and its input/ directory, never the job tree, which may hold a
+            # partial result. Mirrors `Dispatcher._delete_input`.
+            _delete_input(Path(job_root) / job.job_id / "input" / Path(job.filename).name)
+    return failed
+
+
+def _delete_input(input_path: "Path") -> None:
+    """Delete an untrusted input file and its input/ directory. Swallows OSError, so a missing
+    file does not abort the rest of the sweep."""
+    import contextlib
+
+    with contextlib.suppress(OSError):
+        input_path.unlink()
+    with contextlib.suppress(OSError):
+        input_path.parent.rmdir()
 
 
 def reclaim_stale_claims(job_store: "JobStore", *, after_s: float,
