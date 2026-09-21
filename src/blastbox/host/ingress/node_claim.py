@@ -262,10 +262,9 @@ def register_node_claim_routes(
         recognise as its own, so that a signature cannot be replayed indefinitely. Handing
         one to an unauthenticated caller costs a MAC.
         """
-        secret = node_auth.challenge_secret(resolved)
         return {
             "challenge": node_auth.challenge_for(node_auth.SCOPE_CLAIM_NEXT,
-                                                 secret=secret),
+                                                 secret=_secret()),
             "expires_in": node_auth.CHALLENGE_TTL_S,
             "scope": node_auth.SCOPE_CLAIM_NEXT,
         }
@@ -273,8 +272,13 @@ def register_node_claim_routes(
     #: (node_id, job_id) -> when it was refused. Per-app and best-effort; see _remember_refusal.
     _refusals: "dict[tuple[str, str], float]" = {}
 
+    # Resolved ONCE, here, and raised if it cannot be: every ingress process must sign with the
+    # key its peers verify against, and the job store is where they agree. See
+    # node_auth.resolve_claim_secret for the precedence and why None fails closed.
+    _signing_key = node_auth.resolve_claim_secret(job_store, resolved)
+
     def _secret() -> bytes:
-        return node_auth.challenge_secret(resolved)
+        return _signing_key
 
     def _node_from_token(token: str | None) -> str:
         """The node id this caller has already proved, or 403.

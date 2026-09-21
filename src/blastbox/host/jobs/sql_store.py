@@ -229,9 +229,18 @@ class SqlJobStore:
             fingerprint TEXT NOT NULL
         )
         """
+        # Same one-row shape as blob_target, for the same reason: the fixed PK makes
+        # `INSERT ... ON CONFLICT DO NOTHING` a compare-and-swap the database performs.
+        signing_key_sql = """
+        CREATE TABLE IF NOT EXISTS claim_signing_key (
+            id  INTEGER PRIMARY KEY,
+            key TEXT NOT NULL
+        )
+        """
         with self._lock, self._connect() as conn:
             conn.execute(sql)
             conn.execute(blob_target_sql)
+            conn.execute(signing_key_sql)
             # page_hashes + its indexes are Postgres-only: perceptual-hash search
             # is Postgres + pg_bktree ONLY, so SQLite gets no page_hashes table
             # and supports_hash_search() stays False.
@@ -277,6 +286,27 @@ class SqlJobStore:
     def clear_blob_target(self) -> None:
         with self._lock, self._connect() as conn:
             conn.execute("DELETE FROM blob_target WHERE id = 1")
+
+    # -- ClaimKeyRegistry ---------------------------------------------------------------
+    def claim_signing_key(self, candidate: str) -> "str | None":
+        """Insert-if-absent then read back IN THE SAME TRANSACTION, exactly as claim_blob_target:
+        a loser must see the winner's key, and an empty read-back (a concurrent clear under READ
+        COMMITTED) is UNKNOWN, never our own candidate."""
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                f"INSERT INTO claim_signing_key (id, key) VALUES (1, {self._param}) "
+                f"ON CONFLICT (id) DO NOTHING", (candidate,))
+            row = conn.execute("SELECT key FROM claim_signing_key WHERE id = 1").fetchone()
+        return str(row[0]) if row else None
+
+    def get_signing_key(self) -> "str | None":
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT key FROM claim_signing_key WHERE id = 1").fetchone()
+        return str(row[0]) if row else None
+
+    def clear_signing_key(self) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM claim_signing_key WHERE id = 1")
 
     def _ensure_jobs_indexes(self) -> None:
         """Covering index for the hot claim + node-autosizer-backlog predicates

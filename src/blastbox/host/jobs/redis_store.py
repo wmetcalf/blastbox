@@ -69,6 +69,7 @@ class RedisJobStore:
 
     # -- BlobTargetRegistry -------------------------------------------------------------
     _BLOB_TARGET_KEY = "blastbox:blob_target"
+    _SIGNING_KEY_KEY = "blastbox:claim_signing_key"
 
     def claim_blob_target(self, fingerprint: str) -> "str | None":
         """SET NX then GET -- atomic on the server, so a boot storm has one winner.
@@ -95,6 +96,27 @@ class RedisJobStore:
 
     def clear_blob_target(self) -> None:
         self._r.delete(self._BLOB_TARGET_KEY)
+
+    # -- ClaimKeyRegistry ---------------------------------------------------------------
+    def claim_signing_key(self, candidate: str) -> "str | None":
+        """SET NX then GET. No TTL: the key must outlive every job and every idle stretch, or two
+        ingress hosts that restarted days apart would sign with different keys. Same nil-window
+        reasoning as claim_blob_target: a DEL between the two calls, or an eviction, leaves this
+        None, and None is reported as UNKNOWN rather than as our own candidate."""
+        self._r.set(self._SIGNING_KEY_KEY, candidate, nx=True)
+        cur = self._r.get(self._SIGNING_KEY_KEY)
+        if cur is None:
+            return None
+        return cur.decode() if isinstance(cur, (bytes, bytearray)) else str(cur)
+
+    def get_signing_key(self) -> "str | None":
+        cur = self._r.get(self._SIGNING_KEY_KEY)
+        if cur is None:
+            return None
+        return cur.decode() if isinstance(cur, (bytes, bytearray)) else str(cur)
+
+    def clear_signing_key(self) -> None:
+        self._r.delete(self._SIGNING_KEY_KEY)
 
     def _key(self, job_id: str) -> str:
         return _PREFIX + job_id

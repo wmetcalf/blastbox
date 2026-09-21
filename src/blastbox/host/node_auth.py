@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import os
 import time
 from pathlib import Path
@@ -63,21 +64,14 @@ _MAC_DOMAIN = b"blastbox/node-challenge/v1"
 #: exactly what this project refuses elsewhere (see the SOCKS/proxy URL handling).
 SECRET_FILE = "claim-challenge.key"
 
-#: Overrides where the key lives. A PATH, never the secret itself -- a secret on a command
+#: OVERRIDE for where the key lives. A PATH, never the secret itself -- a secret on a command
 #: line or in a unit file is what this project refuses elsewhere.
 #:
-#: WHY IT EXISTS: MULTI-HOST INGRESS. Challenges and session tokens are MACs under this key,
-#: so two ingress hosts with their own PKI directories mint credentials the other rejects --
-#: behind a load balancer a node's handshake fails whenever the challenge and the session
-#: land on different hosts, which is most of the time. Workers FORKED on one host are fine
-#: (same file); separate hosts are not. Point every ingress host at the same key.
-#:
-#: THE PROPER FIX IS THE JOB STORE, not a file: the documented role-separated topology
-#: deliberately rejects a shared filesystem, and the queue is the only thing those processes
-#: share by definition -- which is exactly the argument `BlobTargetRegistry` already makes
-#: for proving two processes agree. That needs a compare-and-swap slot on all three store
-#: backends and is follow-up work; until then this knob is how a multi-host deployment is
-#: made correct, and `blastbox serve` says so when it cannot tell.
+#: This is no longer how multi-host ingress is made correct; the job store is (see
+#: :func:`resolve_claim_secret` and `jobs.base.ClaimKeyRegistry`). It remains for two cases: a
+#: third-party store that does not implement the registry, and an operator who has a reason to
+#: hold the key outside the queue. When set, it wins -- an explicit instruction outranks an
+#: inferred one.
 SECRET_FILE_ENV = "BLASTBOX_CLAIM_SECRET_FILE"
 
 #: 32 bytes of HMAC key. Shorter is not rejected for being unfashionable -- it is rejected
@@ -154,6 +148,64 @@ def challenge_secret(pki_dir: "Path | str") -> bytes:
             "invalidated, which is correct, and they expire within "
             f"{CHALLENGE_TTL_S:.0f}s anyway.")
     return data
+
+
+def resolve_claim_secret(job_store: object, pki_dir: "Path | str") -> bytes:
+    """The key every ingress process must agree on, resolved ONCE at route registration.
+
+    PRECEDENCE, and why it is in this order:
+
+    1. ``BLASTBOX_CLAIM_SECRET_FILE`` set -> that file. An operator said so; an explicit
+       instruction outranks an inferred one.
+    2. The job store implements `ClaimKeyRegistry` -> claim through it. This is the design: the
+       documented role-separated topology rejects a shared filesystem, and the queue is the only
+       thing every ingress process shares by definition. Every store this repo ships implements
+       it, so a multi-host deployment now needs NOTHING configured. A node cannot read it -- it
+       has no database credentials, which is the point of #178.
+    3. Otherwise -> the per-host file, with a warning that a second host will not interoperate.
+       Only a third-party store lands here.
+
+    NONE IS NOT AGREEMENT, so it RAISES. `claim_signing_key` returns None when the registry
+    could not be read back -- a clear racing the claim, an eviction. Falling back to a locally
+    generated key there would make this process sign with a key no peer holds, which is exactly
+    the split this exists to prevent, produced by the machinery meant to prevent it. A serving
+    process that cannot read its own queue should not come up quietly.
+    """
+    import secrets
+
+    from blastbox.host.jobs.base import ClaimKeyRegistry
+
+    if os.environ.get(SECRET_FILE_ENV, "").strip():
+        return challenge_secret(pki_dir)
+
+    if isinstance(job_store, ClaimKeyRegistry):
+        candidate = secrets.token_hex(_SECRET_BYTES)
+        try:
+            recorded = job_store.claim_signing_key(candidate)
+        except Exception as exc:        # noqa: BLE001 - the queue is down; say so, do not guess
+            raise RuntimeError(
+                f"could not claim the node signing key from the job store: {exc}. Refusing to "
+                "generate a local one -- it would be a key no other ingress holds.") from exc
+        if recorded is None:
+            raise RuntimeError(
+                "the job store could not confirm the node signing key (a rotation may be "
+                "racing this boot). Refusing to guess; retry once the store settles.")
+        try:
+            key = bytes.fromhex(recorded)
+        except ValueError:
+            key = b""
+        if len(key) < _SECRET_BYTES:
+            raise RuntimeError(
+                "the node signing key recorded in the job store is malformed "
+                f"({len(key)} bytes). Rotate it: `blastbox claim-key reset` on a stopped "
+                "fleet, then restart every ingress.")
+        return key
+
+    logging.getLogger("blastbox.host.node_auth").warning(
+        "the job store (%s) does not implement ClaimKeyRegistry, so the node signing key is a "
+        "per-host file. A second ingress host will NOT interoperate unless %s points every host "
+        "at one file.", type(job_store).__name__, SECRET_FILE_ENV)
+    return challenge_secret(pki_dir)
 
 
 class ClaimRefused(Exception):

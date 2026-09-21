@@ -426,12 +426,14 @@ omit `tier` would be choosing its own authorisation check. Because a job's requi
 only knowable once one is picked, an unentitled job is claimed, refused and **released back
 to `QUEUED`** with its claim cleared — the node never receives the record.
 
-**More than one ingress host?** The key that signs challenges and session tokens lives in
-the PKI directory, and two hosts each generate their own — so behind a load balancer a node's
-handshake fails whenever the challenge and the session land on different hosts. Point every
-ingress host at one key with `BLASTBOX_CLAIM_SECRET_FILE`. Forked workers on a single host
-already share it and need nothing. When a challenge is rejected, the ingress log names this
-as the likely cause rather than leaving it to be debugged on the node.
+**More than one ingress host? Nothing to configure.** The key that signs challenges, sessions
+and receipts is recorded on the **job queue** — the one thing every ingress process already
+shares — the first time an ingress with a PKI starts; every later one adopts it. Nodes cannot
+read it, because nodes have no database credentials. `blastbox claim-key show` prints a
+fingerprint (never the key) so two hosts can confirm they agree. To rotate: stop every ingress,
+`blastbox claim-key reset --yes`, restart them all — in-flight node sessions (10 min) are
+invalidated and nodes re-handshake on their own. `BLASTBOX_CLAIM_SECRET_FILE` remains as an
+explicit override for a store that cannot record it.
 
 **TLS.** This protocol authenticates the node but assumes the channel is server-authenticated.
 `blastbox serve` now issues its own certificate from the local CA when a PKI is present, so

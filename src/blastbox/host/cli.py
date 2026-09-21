@@ -1075,6 +1075,56 @@ def _blob_target_cmd(args: argparse.Namespace) -> int:
     return 0
 
 
+def _claim_key_cmd(args: argparse.Namespace) -> int:
+    """Show whether a node signing key is recorded on the job queue, or rotate it.
+
+    NEVER PRINTS THE KEY. `show` reports presence and a short fingerprint so two ingress hosts
+    can confirm they resolved the same one; the value itself is a credential and this project
+    does not put those on terminals. Same stopped-fleet discipline as `blob-target reset`, for
+    the same reason: every ingress caches the key it resolved at boot, so clearing under a live
+    fleet is the multi-host divergence reintroduced by the tool meant to manage it.
+    """
+    import hashlib
+
+    from blastbox.host.jobs.base import ClaimKeyRegistry
+    from blastbox.host.jobs.factory import build_job_store_from_env
+
+    store = build_job_store_from_env()
+    if not isinstance(store, ClaimKeyRegistry):
+        print(f"{type(store).__name__} cannot record a node signing key; ingress hosts on this "
+              f"store use a per-host file (see BLASTBOX_CLAIM_SECRET_FILE).")
+        return 1
+    current = store.get_signing_key()
+    if args.claim_key_cmd == "reset":
+        if not getattr(args, "yes", False):
+            print(
+                "REFUSING: `claim-key reset` is only safe on a STOPPED fleet.\n"
+                f"  currently recorded: {'yes' if current else 'no'}\n"
+                "\n"
+                "Every ingress process resolves the key ONCE at startup and keeps it. Clearing\n"
+                "while any are running means the next one to start claims a NEW key while the\n"
+                "rest keep the old one -- node sessions minted on one host are then rejected by\n"
+                "another, which is the failure this key exists to prevent.\n"
+                "\n"
+                "Stop every ingress on this queue, then re-run with --yes and restart them all.\n"
+                "In-flight node sessions (10 min) and challenges (60 s) are invalidated; nodes\n"
+                "re-handshake on their own."
+            )
+            return 2
+        store.clear_signing_key()
+        print("node signing key cleared. Restart EVERY ingress; the first one up records the "
+              "new key and the rest adopt it.")
+        return 0
+    if not current:
+        print("(no node signing key recorded yet -- the first ingress to start with a PKI "
+              "records one)")
+        return 0
+    digest = hashlib.sha256(current.encode()).hexdigest()[:12]
+    print(f"recorded (fingerprint {digest}). Compare this across ingress hosts; the key itself "
+          f"is never printed.")
+    return 0
+
+
 def _version_cmd(_: argparse.Namespace) -> int:
     print(f"blastbox {__version__}")
     return 0
@@ -1672,6 +1722,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="report what would be uploaded without touching the blob store",
     )
     pm.set_defaults(func=_migrate_results_cmd)
+
+    pk = sub.add_parser(
+        "claim-key",
+        help="show whether the node signing key is recorded on the job queue, or rotate it",
+    )
+    pks = pk.add_subparsers(dest="claim_key_cmd", required=True)
+    pks.add_parser("show", help="report presence and a fingerprint; the key is never printed")
+    pk_reset = pks.add_parser(
+        "reset", help="rotate it; requires a STOPPED fleet and a restart of every ingress",
+    )
+    pk_reset.add_argument("--yes", action="store_true",
+                          help="confirm every ingress on this queue is stopped")
+    pk.set_defaults(func=_claim_key_cmd)
 
     pt = sub.add_parser(
         "blob-target",

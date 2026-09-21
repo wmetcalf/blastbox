@@ -368,6 +368,52 @@ class BlobTargetRegistry(Protocol):
 
 
 @runtime_checkable
+class ClaimKeyRegistry(Protocol):
+    """OPTIONAL registry holding the ONE key every ingress process signs node credentials with.
+
+    WHY THE JOB STORE. Node challenges, session tokens and claim receipts (#178) are MACs, and a
+    MAC is only worth anything if every process that verifies it holds the key that minted it.
+    Two ingress hosts behind a load balancer each generating their own key mint credentials the
+    other rejects -- a node's handshake fails whenever the challenge and the session land on
+    different hosts, which is most of the time. A shared FILE cannot fix that in the documented
+    role-separated topology, which deliberately rejects a shared filesystem. The queue is the only
+    thing those processes share by definition, so the key lives here -- exactly the argument
+    :class:`BlobTargetRegistry` already makes for proving two processes agree.
+
+    SAME SHAPE AS BlobTargetRegistry, ON PURPOSE. Separate Protocol that ``JobStore`` does not
+    inherit, so a third-party store is not broken by its absence (consumers fall back to a
+    per-host file and say so). Claim is a compare-and-swap, not get-then-put, because two ingress
+    hosts booting together would otherwise both read empty, both write, and each sign with its own
+    key while believing it agreed. And ``None`` from the claim means UNKNOWN, never "I won": a
+    caller that assumed it had won on an empty read-back would sign with a key nobody else holds,
+    which is the split this exists to prevent, produced by the registry.
+
+    WHO MAY READ IT. Ingress processes hold database credentials; nodes, by construction, do not
+    (`HttpJobStore` implements no part of this). So the key is exactly as private as the queue,
+    and the queue already holds every job and result. Storing it here widens nothing.
+
+    ROTATION is ``clear_signing_key`` then a restart of EVERY ingress process, so each re-claims
+    and the first one up wins. Live processes cache the key they resolved at boot, so clearing
+    without restarting them is the divergence again, for as long as they run. Sessions are
+    ten minutes and challenges one, so a rotation costs at most that.
+    """
+
+    def claim_signing_key(self, candidate: str) -> "str | None":
+        """Register ``candidate`` if none is recorded, and return what is NOW recorded --
+        ``candidate`` when this process won, the OTHER value when a peer got there first, and
+        ``None`` when the registry could not be read back at all. NONE IS NOT AGREEMENT."""
+        ...
+
+    def get_signing_key(self) -> "str | None":
+        """The recorded key, or None. READ-ONLY -- must never register anything."""
+        ...
+
+    def clear_signing_key(self) -> None:
+        """Forget the recorded key, for a deliberate rotation. Restart every ingress after."""
+        ...
+
+
+@runtime_checkable
 class PageHashSearch(Protocol):
     """OPTIONAL per-page perceptual-hash index + similarity search surface.
 
