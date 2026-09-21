@@ -128,6 +128,22 @@ def challenge_secret(pki_dir: "Path | str") -> bytes:
                 os.link(tmp, path)      # atomic CAS: fails if somebody already won
             except FileExistsError:
                 pass                    # a peer won; its bytes are what we will read
+            except OSError:
+                # SOME FILESYSTEMS HAVE NO HARD LINKS (assorted FUSE and network mounts).
+                # os.replace would work but is last-writer-wins, which is no CAS at all -- two
+                # hosts would each keep their own key believing they agreed. So publish
+                # exclusively instead and accept the narrow window the link was avoiding; the
+                # read-back below is already bounded and retried, and the STORE-backed key
+                # (ClaimKeyRegistry) is the supported multi-host path anyway.
+                try:
+                    fd2 = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                except FileExistsError:
+                    pass
+                else:
+                    with os.fdopen(fd2, "wb") as fh2:
+                        fh2.write(tmp.read_bytes())
+                        fh2.flush()
+                        os.fsync(fh2.fileno())
         finally:
             try:
                 os.unlink(tmp)
@@ -141,6 +157,14 @@ def challenge_secret(pki_dir: "Path | str") -> bytes:
                 f"cannot create the claim challenge key {path}: {exc}") from exc
 
     data = path.read_bytes()
+    if len(data) < _SECRET_BYTES:
+        # One bounded retry: on a filesystem without hard links the publish above is not
+        # atomic, so a reader can catch a partial write. Anything still short after this is a
+        # genuinely truncated key and must not be padded or regenerated.
+        import time as _t
+
+        _t.sleep(0.25)
+        data = path.read_bytes()
     if len(data) < _SECRET_BYTES:
         raise RuntimeError(
             f"the claim challenge key {path} is {len(data)} bytes, not {_SECRET_BYTES} -- "

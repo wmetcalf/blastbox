@@ -397,6 +397,14 @@ class HttpJobStore:
         """
         if job is not None or job_id in self._settled:
             self._settled.add(job_id)
+        # UNDER THE LOCK. A dispatcher claims and reports from several threads, and this scans
+        # _claims for a victim -- "dictionary changed size during iteration" would surface as a
+        # RuntimeError inside a terminal write, losing the job's result. The lock is the one
+        # already guarding the session, so this cannot deadlock with it.
+        with self._lock:
+            self._evict_locked()
+
+    def _evict_locked(self) -> None:
         while len(self._claims) > _MAX_TRACKED_CLAIMS:
             # SETTLED FIRST. A status-blind oldest-first eviction could drop the receipt of a
             # job that is still RUNNING once enough newer claims arrived, after which its own

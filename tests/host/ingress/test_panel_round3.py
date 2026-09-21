@@ -168,3 +168,91 @@ def test_ingress_retention_is_gated_on_retention_and_carries_the_blob_store():
     src = inspect.getsource(app)
     assert "JobRetentionSweeper(_job_root, blob_store=_blob_store)" in src
     assert 'BLASTBOX_JOB_RETENTION_SECONDS' in src
+
+
+class TestRoundFour:
+    """Round four. Two of these were mine, introduced by round three's own fixes."""
+
+    def test_a_node_can_actually_release_a_job(self, tmp_path, monkeypatch):
+        """THREE INDEPENDENT FAMILIES found this, and it broke the feature outright: the
+        release check compared the WIRE value -- the string "queued" -- against the JobStatus
+        enum, because it ran BEFORE the conversion. It never matched, so every release was a
+        400 and a node could never hand work back."""
+        c, store, h, job, rcpt = _rig(tmp_path, monkeypatch)
+        w = c.post(f"/v1/nodes/jobs/{job['job_id']}", headers=h,
+                   json={"claim_id": job["claim_id"], "receipt": rcpt,
+                         "fields": {"status": "queued", "claim_id": None}})
+        assert w.status_code == 200, w.text
+        back = store.get("j")
+        assert back.status is JobStatus.QUEUED
+        assert back.claim_id is None
+        assert back.claimable_after is not None, "a release must carry the deferral"
+
+    def test_clearing_the_claim_without_queueing_is_still_refused(self, tmp_path, monkeypatch):
+        """The release semantics must survive the reordering: claim_id=None on its own left a
+        job RUNNING with no owner -- unclaimable, unwritable and unreclaimable."""
+        c, store, h, job, rcpt = _rig(tmp_path, monkeypatch)
+        w = c.post(f"/v1/nodes/jobs/{job['job_id']}", headers=h,
+                   json={"claim_id": job["claim_id"], "receipt": rcpt,
+                         "fields": {"claim_id": None}})
+        assert w.status_code == 400, w.text
+        assert store.get("j").claim_id == job["claim_id"]
+
+    def test_the_grants_cache_cannot_outlive_certificate_expiry(self, tmp_path, monkeypatch):
+        """MY REGRESSION, from caching fleet_grants to stop a per-request CPU DoS. The cache key
+        was (name, mtime, size) of every *.crt -- and a certificate that EXPIRES changes none of
+        those, so a lapsed identity kept authorising indefinitely. Removal and replacement do
+        change the signature; expiry needs a clock, which is why the TTL is the correctness of
+        the cache and not a nicety."""
+        from blastbox.host.ingress import node_claim as nc
+
+        assert nc._GRANTS_CACHE_TTL_S > 0
+        src = __import__("inspect").getsource(nc)
+        assert 'now >= _grants_cache["until"]' in src, (
+            "the grants cache no longer has a deadline, so expiry stops being a revocation "
+            "mechanism")
+
+    def test_the_claim_map_is_evicted_under_the_lock(self):
+        """A dispatcher claims and reports from several threads; scanning _claims for a victim
+        unlocked raises "dictionary changed size during iteration" -- inside a terminal write,
+        which loses the job's result."""
+        import inspect
+
+        from blastbox.host.jobs import http_store as hs
+
+        src = inspect.getsource(hs.HttpJobStore._retire_if_settled)
+        assert "with self._lock:" in src
+        assert "for k in self._claims" not in src, "still iterating outside the lock"
+
+    def test_the_claim_map_survives_concurrent_claims(self, tmp_path):
+        """Exercise it rather than trusting the read: many threads settling while the map is at
+        its bound."""
+        import threading
+
+        from blastbox.host.jobs import http_store as hs
+
+        d = tmp_path / "pki"
+        ca = pki.ensure_ca(d)
+        ca.issue_node("n", wg_pubkey=WG, grants=pki.NodeGrants(engines=("clamav",))).write(
+            d, "node-n")
+        s = HttpJobStore("https://cp", cert_path=d / "node-n.crt",
+                         transport=lambda *a, **k: (500, None))
+        for i in range(hs._MAX_TRACKED_CLAIMS + 200):
+            s._claims[f"j{i}"] = ("c", "r")
+            s._settled.add(f"j{i}")
+        errors: list[BaseException] = []
+
+        def churn(base):
+            try:
+                for i in range(200):
+                    s._claims[f"new{base}-{i}"] = ("c", "r")
+                    s._retire_if_settled(f"new{base}-{i}", None)
+            except BaseException as exc:      # noqa: BLE001 - the failure IS the assertion
+                errors.append(exc)
+
+        threads = [threading.Thread(target=churn, args=(b,)) for b in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors, f"concurrent eviction raised: {errors[:1]!r}"

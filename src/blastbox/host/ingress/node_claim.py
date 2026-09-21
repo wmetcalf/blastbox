@@ -154,6 +154,12 @@ _REFUSAL_DEFER_S = 20.0
 #: receipt is minted over it, so every later fence still matches.
 NODE_CLAIM_PREFIX = "node:"
 
+#: How long resolved grants may be reused. Bounds how long an EXPIRED certificate keeps
+#: authorising: the file does not change when it lapses, so the directory signature cannot see
+#: it and only a clock can. Short enough that expiry is still a revocation mechanism, long
+#: enough that a node polling in a loop cannot force a full fleet re-verify per request.
+_GRANTS_CACHE_TTL_S = 15.0
+
 #: Skew a node may be ahead of this host by when it reports a timestamp. Anything further into
 #: the future is refused: `started_at` is the ONE field the reclaim sweep judges by, and a node
 #: could write 9e18 into it and become permanently unreclaimable. Backwards is harmless -- it only
@@ -340,9 +346,11 @@ def register_node_claim_routes(
         from blastbox.host.placement import fleet_grants
 
         sig = _pki_signature()
-        if sig != _grants_cache["sig"]:
+        now = time.time()
+        if sig != _grants_cache["sig"] or now >= _grants_cache["until"]:
             _grants_cache["map"] = fleet_grants(resolved)
             _grants_cache["sig"] = sig
+            _grants_cache["until"] = now + _GRANTS_CACHE_TTL_S
         return _grants_cache["map"].get(node_id)
 
     @router.post("/session", response_model=None)
@@ -578,11 +586,15 @@ def register_node_claim_routes(
 
     #: fleet_grants is O(certificates) with a full X.509 verify per file, and it ran on EVERY
     #: request -- 77 ms of ingress CPU per poll at 200 certificates, from a request a node can
-    #: issue for nothing. Cached on the DIRECTORY'S SIGNATURE (name, mtime, size of every
-    #: *.crt), which is what "freshness" actually means here: a certificate removed, replaced
-    #: or added changes the signature and the next request re-verifies. The revocation and
-    #: narrowing tests still pass against this, which is the proof it is not a stale cache.
-    _grants_cache: "dict[str, Any]" = {"sig": None, "map": {}}
+    #: issue for nothing. Cached on the directory's signature (name, mtime, size of every
+    #: *.crt) AND a short deadline.
+    #:
+    #: THE DEADLINE IS NOT BELT-AND-BRACES, it is the whole correctness of the cache. A
+    #: certificate that EXPIRES does not change its name, mtime or size -- so signature alone
+    #: kept authorising a lapsed identity indefinitely, which broke the one revocation
+    #: mechanism this design has ("stop renewing"). Removal and replacement do change the
+    #: signature and are caught immediately; expiry needs the clock. Reviewed and confirmed.
+    _grants_cache: "dict[str, Any]" = {"sig": None, "map": {}, "until": 0.0}
 
     def _pki_signature() -> tuple:
         try:
@@ -767,6 +779,13 @@ def register_node_claim_routes(
         # converting it back -- the reclaim sweep, the listing, the API, all of them. One write
         # from one node made a row unreadable to the whole fleet. Reviewed and reproduced.
         _typed(out)
+        for name in _ENUM_FIELDS:
+            if isinstance(out.get(name), str):
+                try:
+                    out[name] = JobStatus(out[name])
+                except ValueError:
+                    raise HTTPException(status_code=400,
+                                        detail=f"unknown {name}") from None
         if "claim_id" in out and out["claim_id"] is not None:
             # Releasing a job (claim_id=None) is legitimate. Re-stamping ownership is not:
             # every fence in this module is built on the claim id, so a node that could set
@@ -774,6 +793,10 @@ def register_node_claim_routes(
             raise HTTPException(
                 status_code=400,
                 detail="claim_id may only be cleared, not set")
+        # AFTER the enum conversion above, not before. This compared the WIRE value -- the
+        # string "queued" -- against the enum member, so it never matched and a node could
+        # NEVER release a job: every release was a 400. Three independent reviewers found it,
+        # and it was mine, introduced in the same change that added the release semantics.
         if "claim_id" in out and out.get("status") is not JobStatus.QUEUED:
             # Clearing the claim WITHOUT queueing left a job RUNNING with no owner: unclaimable
             # (claim_next sees only QUEUED), unwritable (_owned_job needs a claim id) and, with a
@@ -807,13 +830,6 @@ def register_node_claim_routes(
                 _log.warning("node_claim: clamped claimable_after from %.0f to %.0f",
                              deferred, ceiling)
                 out["claimable_after"] = ceiling
-        for name in _ENUM_FIELDS:
-            if isinstance(out.get(name), str):
-                try:
-                    out[name] = JobStatus(out[name])
-                except ValueError:
-                    raise HTTPException(status_code=400,
-                                        detail=f"unknown {name}") from None
         return out
 
     @router.get("/jobs/{job_id}", response_model=None)
