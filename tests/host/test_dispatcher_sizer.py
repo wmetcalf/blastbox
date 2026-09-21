@@ -1793,3 +1793,54 @@ def test_no_floor_warning_for_cold_only_dispatcher(tmp_path, caplog):
     cold_warns = [r.getMessage() for r in caplog.records
                   if "blastbox#68" in r.getMessage() and "engine=cold" in r.getMessage()]
     assert not cold_warns, cold_warns
+
+
+class TestABacklogThatCannotBeReadSaysSo:
+    """The whole of this file's #178 change is these two log lines, and nothing asserted them:
+    the call site could be replaced with `pass` and the suite stayed green.
+
+    Why they matter: falling back to `_last_backlog` is right for a transient store error and it
+    is also how a PERMANENT one hides -- `_last_backlog` starts at 0 and never advances without a
+    successful read, so "the store cannot answer" and "the queue is empty" size identically.
+    A credential-less node whose backlog route is refused is exactly that case."""
+
+    def _sizer(self, tmp_path, backlog_fn):
+        share = FileNodeShare(str(tmp_path))
+        cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                         vcpu_oversubscription=999, stale_after_s=60)
+        return DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=8), None,
+                               share, cfg, runtime="cold", backlog_fn=backlog_fn, node="n",
+                               instance="i", capacity_fn=_budget(8 * 1024, 999),
+                               clock=lambda: 1.0, cold_slot_ram_mib=1024)
+
+    def test_the_first_failure_is_reported(self, tmp_path, caplog):
+        def refuses():
+            raise RuntimeError("a node may not enumerate the queue")
+
+        ds = self._sizer(tmp_path, refuses)
+        with caplog.at_level("WARNING", logger="blastbox.node_sizer"):
+            ds.tick()
+        assert any("backlog could not be read" in r.message for r in caplog.records), (
+            "a permanently unreadable backlog pinned sizing to its floors with nothing in "
+            "the log -- indistinguishable from an empty queue")
+
+    def test_it_warns_once_and_then_keeps_a_running_count(self, tmp_path, caplog):
+        def refuses():
+            raise RuntimeError("a node may not enumerate the queue")
+
+        ds = self._sizer(tmp_path, refuses)
+        with caplog.at_level("WARNING", logger="blastbox.node_sizer"):
+            for _ in range(60):
+                ds.tick()
+        first = [r for r in caplog.records if "backlog could not be read" in r.message]
+        running = [r for r in caplog.records if "times in a row" in r.message]
+        assert len(first) == 1, f"the opening warning repeated {len(first)} times"
+        assert running, (
+            "no running count: an operator who joined the log tail after the outage started "
+            "sees nothing at all")
+
+    def test_a_backlog_that_answers_says_nothing(self, tmp_path, caplog):
+        ds = self._sizer(tmp_path, lambda: 5)
+        with caplog.at_level("WARNING", logger="blastbox.node_sizer"):
+            ds.tick()
+        assert not [r for r in caplog.records if "backlog" in r.message]

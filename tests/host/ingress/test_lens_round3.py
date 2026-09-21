@@ -355,11 +355,17 @@ class TestRoundFourAuthz:
         tok = c.post("/v1/nodes/session", json={
             "cert_pem": (d / "node-n.crt").read_text(), "challenge": ch, "signature": sig}
         ).json()["token"]
-        for _ in range(nc._MAX_REFUSAL_DEFERRALS + 2):
+        # Past MAX_TOTAL_DEFERRAL_S from submission, no number of refusals may defer it again --
+        # and that bound is on `created_at`, which every ingress worker and host reads the same
+        # way. The earlier count-based version was per forked worker and per host, and this test
+        # derived its loop count from the constant it was testing, so raising the cap raised the
+        # loop with it and the suite stayed green.
+        store.update("gov", created_at=time.time() - (nc.MAX_TOTAL_DEFERRAL_S + 1))
+        for _ in range(5):
             store.update("gov", claimable_after=None)        # the deferral lapses
             c.post("/v1/nodes/claim", json={}, headers={SESSION_HEADER: tok})
-        assert store.get("gov").claimable_after is None, (
-            "the node kept renewing the deferral, starving entitled peers")
+            assert store.get("gov").claimable_after is None, (
+                "the node kept renewing the deferral, starving entitled peers")
 
     def test_a_node_cannot_pin_or_destroy_a_result_with_expires_at(self, tmp_path, monkeypatch):
         """The one node-writable timestamp with no bound: 1e18 pinned a tenant's result beyond

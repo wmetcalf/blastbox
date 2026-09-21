@@ -316,9 +316,32 @@ class HttpJobStore:
                 raise RuntimeError(
                     "control plane handed over a job with no claim id; every write would "
                     "then be refused, so the job is declined rather than started")
-            self._claims[job.job_id] = (job.claim_id, receipt)
+            self._record_claim(job.job_id, job.claim_id, receipt)
             return job
         return None
+
+    def _record_claim(self, job_id: str, claim_id: str, receipt: str) -> None:
+        """Take ownership of a job, UNDER THE LOCK.
+
+        The lock is not about the two statements agreeing with each other. `_evict_locked`
+        SCANS `_claims` for a victim, and this insert used to run outside the lock -- so a
+        dispatcher's claiming thread could change the dict's size while a reporting thread was
+        iterating it, which surfaces as "dictionary changed size during iteration" raised from
+        `_evict_tracked` AFTER the terminal write already landed: the job is terminal in the
+        store and `dispatch_once` unwinds past every post-write step (page-hash indexing, the
+        pending-upload marker, the job-dir purge) with no CAS-fenced retry able to repair it.
+        Holding the lock for two dict operations costs nothing; there is no I/O in here, and
+        `_call`/`_auth` take the same lock, so nothing may hold it across a request.
+
+        AND THE SETTLED FLAG IS DISCARDED FIRST. A job released back to QUEUED and claimed
+        again -- an ordinary requeue, or a refusal deferral that expired -- was still in
+        `_settled` from its previous life, so the fresh receipt of a LIVE job was the preferred
+        eviction victim from the moment it was recorded. Membership describes the CLAIM, not
+        the job id.
+        """
+        with self._lock:
+            self._settled.discard(job_id)
+            self._claims[job_id] = (claim_id, receipt)
 
     def get(self, job_id: str) -> "Job | None":
         """The job, if this node can prove it holds it. Otherwise RAISE -- never None.
@@ -378,10 +401,10 @@ class HttpJobStore:
         if job.status in (JobStatus.DONE, JobStatus.FAILED, JobStatus.EXPIRED,
                           JobStatus.QUEUED):
             self._settled.add(job_id)
-        self._retire_if_settled(job_id, job)
+        self._evict_tracked()
         return job
 
-    def _retire_if_settled(self, job_id: str, job: "Job | None") -> None:
+    def _evict_tracked(self) -> None:
         """Bound the claim map WITHOUT breaking the read-back that follows a terminal write.
 
         The first version popped the entry the moment a terminal status was written. That is
@@ -395,8 +418,6 @@ class HttpJobStore:
         grow for the life of the process. Python dicts preserve insertion order, which is the
         eviction order wanted here.
         """
-        if job is not None or job_id in self._settled:
-            self._settled.add(job_id)
         # UNDER THE LOCK. A dispatcher claims and reports from several threads, and this scans
         # _claims for a victim -- "dictionary changed size during iteration" would surface as a
         # RuntimeError inside a terminal write, losing the job's result. The lock is the one
@@ -439,7 +460,7 @@ class HttpJobStore:
             if (raw if isinstance(raw, JobStatus) else JobStatus(str(raw))) in (
                     JobStatus.DONE, JobStatus.FAILED, JobStatus.EXPIRED, JobStatus.QUEUED):
                 self._settled.add(job_id)
-        self._retire_if_settled(job_id, None)
+        self._evict_tracked()
         return True
 
     @staticmethod
@@ -511,11 +532,20 @@ class HttpJobStore:
         A COUNT IS NOT AN ENUMERATION -- one integer, scoped server-side to engines this
         certificate already grants -- which is why this is answerable while `list` is not.
 
-        THE NARROW CONTRACT IS DELIBERATE. Only the sizer's question is supported: QUEUED, by
-        engine. `q`, `claimant_tier` and `untargeted_only` would each need the server to filter on
-        something it cannot authorise or does not expose, and returning a number computed from a
-        DIFFERENT question than the caller asked is worse than refusing -- a sizer acting on a
-        silently-wrong backlog has no symptom. So those raise.
+        THE NARROW CONTRACT IS DELIBERATE, and each unsupported argument is handled the way its
+        consequence deserves -- the earlier version of this paragraph said all three "raise",
+        which two of them do not:
+
+        * `q` (a filename search) and any status but QUEUED RAISE. Both would need the server to
+          search the fleet's queue, which is the thing a node may not do, and a number computed
+          from a DIFFERENT question than the caller asked is worse than a refusal -- a sizer
+          acting on a silently-wrong backlog has no symptom.
+        * `claimant_tier` is DROPPED with one INFO line: the sizer passes it on every call, so
+          raising starved every credential-less node, and the control plane cannot authorise a
+          runtime tier anyway (it is not in the certificate).
+        * `untargeted_only` is IGNORED because the count is ALWAYS of untargeted work -- see the
+          request below. A pinned job is never handed over this path, so counting one would be
+          reporting demand this node cannot drain.
 
         And the reason this route had to exist rather than leaving `count` refused:
         `DispatcherSizer` catches any store error and falls back to a last-known backlog that
@@ -546,9 +576,14 @@ class HttpJobStore:
             _log.info("http_store: claimant_tier=%r is not sent to the control plane for the "
                       "backlog count either; the count is of unpinned work for granted engines",
                       claimant_tier)
+        # ALWAYS untargeted, not only when the caller asks. `claim_next` over this path sends
+        # no tier, so the control plane never hands over a `target_tier`-pinned job -- and
+        # `DispatcherSizer` takes TWO backlog callables, of which only `untargeted_backlog_fn`
+        # passes the flag. The other one therefore counted pinned work this node can never be
+        # given, and sized a pool for a queue it could not drain. The comment above already
+        # claimed this property; now the request carries it.
         params: list[tuple[str, str]] = [("engine", name) for name in _as_engine_list(engine)]
-        if untargeted_only:
-            params.append(("untargeted_only", "1"))
+        params.append(("untargeted_only", "1"))
         status_code, body = self._call("GET", "/v1/nodes/backlog",
                                        params=params or None)
         if status_code != 200 or not body:

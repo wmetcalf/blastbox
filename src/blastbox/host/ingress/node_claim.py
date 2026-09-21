@@ -70,6 +70,7 @@ from fastapi import APIRouter, Header, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
 from blastbox.host import node_auth
+from blastbox.host.jobs.base import NODE_CLAIM_PREFIX as _NODE_CLAIM_PREFIX
 
 if TYPE_CHECKING:                       # pragma: no cover - typing only
     from fastapi import FastAPI
@@ -129,6 +130,22 @@ STRICT_TIERS_ENV = "BLASTBOX_NODE_CLAIM_STRICT_TIERS"
 #: request can do while still letting a node reach work behind a job it may not run.
 _MAX_CLAIM_PROBES = 8
 
+#: How long this control plane remembers that a given node may not run a given job, and how
+#: many such remembered jobs one claim walk will step over.
+#:
+#: WHY IT IS NEEDED. A refused job is deferred only while it is young (MAX_TOTAL_DEFERRAL_S) and
+#: is then released immediately claimable, so that an entitled peer can have it. On an all-federated
+#: fleet there IS no entitled peer, so it stays at the head of the queue permanently -- and
+#: `claim_next` returns the OLDEST eligible job, so each such job consumed one of
+#: `_MAX_CLAIM_PROBES` on EVERY later poll. Eight of them therefore starved the node of work it
+#: IS granted, for as long as they existed: the probe cap, which is only a cost cap, became the
+#: mechanism. The memo lets the walk step over that wall without re-paying to judge it.
+#:
+#: SHORT, because a certificate can be renewed with MORE grants while a job sits there; one
+#: minute bounds how long a newly-entitled node keeps stepping over work it can now run.
+_REFUSAL_MEMO_TTL_S = 60.0
+_MAX_CLAIM_SKIPS = 64
+
 #: How long a job this node may NOT run is deferred for EVERYONE after a refusal. This is ALSO
 #: the write-amplification bound the DoS finding wanted: a refused job flips RUNNING->QUEUED at
 #: most once per this window, so a node hammering /claim cannot churn the head of the queue --
@@ -152,14 +169,14 @@ _REFUSAL_DEFER_S = 20.0
 #: then lost its CAS. Reviewed and reproduced. claim_id is opaque everywhere (one log line
 #: slices it for display), so a prefix is safe; the node receives the re-stamped id and the
 #: receipt is minted over it, so every later fence still matches.
-NODE_CLAIM_PREFIX = "node:"
+#: ...and it is DEFINED in `jobs.base` so the dispatcher's recovery can read it without
+#: importing this module (which would drag FastAPI into the dispatcher). Re-exported here
+#: because this is where readers look for it.
+NODE_CLAIM_PREFIX = _NODE_CLAIM_PREFIX
 
-#: How many times ONE job may be deferred by refusals before it is released undeferred. The
-#: deferral stops a node re-claiming the same job every poll, but nothing bounded how OFTEN it
-#: could renew it -- so a restricted node could keep governed work perpetually deferred and
-#: starve the entitled peers the grants exist to route it to. Past this, the job goes back
-#: claimable immediately: the node can still churn it, but a peer polling at any point wins.
-_MAX_REFUSAL_DEFERRALS = 3
+#: The TOTAL time, from submission, over which refusals may keep one job deferred -- about
+#: three deferral windows, which is what the old per-process count was reaching for.
+MAX_TOTAL_DEFERRAL_S = 120.0
 
 #: The furthest ahead a node may set a result's retention deadline, and it must be in the
 #: future at all. This was the one node-writable timestamp with no bound: 1e18 pinned a
@@ -188,6 +205,35 @@ MAX_FUTURE_SKEW_S = 300.0
 #: opt-in and runs where the database is. Quieter than writing FAILED to achieve the same denial
 #: honestly, which is what made it worth closing.
 MAX_DEFERRAL_S = 3600.0
+
+class _RefusalMemo:
+    """Which (node, job) pairs this control plane has already judged, and for how long.
+
+    See _REFUSAL_MEMO_TTL_S: without it, a wall of jobs a node may not run consumed the whole
+    probe budget on every poll and the node never reached work it was granted.
+    """
+
+    def __init__(self, ttl_s: float = _REFUSAL_MEMO_TTL_S, limit: int = 8192) -> None:
+        self._until: dict[tuple[str, str], float] = {}
+        self._ttl_s = ttl_s
+        self._limit = limit
+
+    def remember(self, node_id: str, job_id: str) -> None:
+        self._until[(node_id, job_id)] = time.time() + self._ttl_s
+        if len(self._until) > self._limit:
+            for key in list(self._until)[: self._limit // 2]:
+                del self._until[key]
+
+    def remembers(self, node_id: str, job_id: str) -> bool:
+        until = self._until.get((node_id, job_id))
+        if until is None:
+            return False
+        if until <= time.time():
+            del self._until[(node_id, job_id)]
+            return False
+        return True
+
+
 
 
 #: What a refused caller is told. ONE message for every cause -- a wrong CA, an unheld key,
@@ -278,6 +324,83 @@ def resolve_pki_dir(pki_dir: "Path | str | None" = None) -> Path | None:
             f"{anchor} exists but cannot be loaded ({exc}). Refusing to start without the "
             "node-claim routes: a broken trust anchor is not the same as none.") from exc
     return d
+
+
+def _job_requirements(job) -> "tuple[str | None, bool, bool]":
+    """(tier grant needed, credentials needed, whether this host could tell).
+
+    DERIVED HERE, never taken from the request -- a caller choosing its own authorisation
+    predicate is not an authorisation check.
+
+    THE ENGINE DEFAULT IS THE USUAL CASE, and getting it wrong made this whole check a
+    no-op. An earlier version hardcoded ``engine_default="none"``, but a job's personality
+    normally comes from ``BLASTBOX_ENGINE_<NAME>_NETPOLICY`` (cli.py reads exactly that
+    when it builds the dispatcher's EngineSpecs), and ``job.net_policy`` is only ever
+    stored when ``BLASTBOX_ALLOW_NETPOLICY_OVERRIDE`` is on -- which is OFF by default. So
+    every job resolved to ``none`` here, took the ungoverned branch, and neither the tier
+    nor the credentials grant was ever examined. The tests passed because they set a
+    per-job override, i.e. they exercised the one path that worked.
+
+    THE THIRD RETURN VALUE IS "COULD I TELL". An ingress host with no
+    ``BLASTBOX_NETPOLICY_*`` registry cannot distinguish a genuinely ungoverned job from
+    one whose personality it simply cannot see, and quietly treating the second as the
+    first is how this became a no-op. It reports the doubt instead, and the caller decides.
+
+    UNGOVERNED TIERS REMAIN NO REQUIREMENT -- a lesson already paid for in
+    `placement.UNGOVERNED_TIERS`: ``none`` is the DEFAULT personality and demanding a grant
+    for it made correctly-issued nodes refuse every ordinary job.
+
+    WHAT IT STILL CANNOT DERIVE: whether openvpn/wireguard imply credentials depends on the
+    NODE's own egress mode, which is node-local. Those stay with the node's `SelfGrants`;
+    only the always-credentialed drivers are required here.
+    """
+    from blastbox.host.netpolicy import parse_personalities, resolve_net_policy
+    from blastbox.host.placement import ALWAYS_CREDENTIALED, UNGOVERNED_TIERS
+
+    registry = parse_personalities(os.environ)
+    # The same env convention cli.py uses to build the dispatcher's EngineSpecs, so both
+    # sides resolve one job to one personality.
+    engine_default = (os.environ.get(
+        f"BLASTBOX_ENGINE_{job.engine.upper().replace('-', '_')}_NETPOLICY")
+        or "none").strip() or "none"
+    # CAN THIS HOST RESOLVE WHAT THIS JOB NEEDS? Precisely, not by counting entries.
+    #
+    # * engine_default "none" and no per-job override -> the job genuinely IS ungoverned,
+    #   which is the ordinary all-none deployment. Nothing to look up, nothing unknown.
+    # * engine_default names a personality this host HAS -> resolvable.
+    # * engine_default names one this host has NOT got -> `resolve_net_policy` silently
+    #   falls back to "none", and THAT is the silent hole: an operator declared a policy
+    #   this host cannot see, so the tier and credentials grants would go unchecked while
+    #   looking exactly like an ungoverned job. Unknown, and it must not read as permissive.
+    allow_override = (os.environ.get("BLASTBOX_ALLOW_NETPOLICY_OVERRIDE", "").strip()
+                      .lower() in ("1", "true", "yes", "on"))
+    can_tell = engine_default == "none" or engine_default in registry
+    if allow_override and job.net_policy and job.net_policy not in registry:
+        # The job SELECTS a personality this host has not got. `resolve_net_policy` falls
+        # through to the engine default -- possibly "none" -- so it would look ungoverned
+        # here while a node whose registry DOES hold that name resolves it to a real exit
+        # driver and runs it with no tier or credentials check. An explicitly selected but
+        # undeclared override is unknown, and in strict mode refused, exactly like an
+        # undeclared engine default.
+        can_tell = False
+    try:
+        personality = resolve_net_policy(
+            job_net_policy=job.net_policy, engine_default=engine_default,
+            registry=registry, allow_override=allow_override)
+        driver = getattr(personality, "exit_driver", "") or ""
+    except Exception:               # noqa: BLE001
+        return None, False, False
+    if not driver or driver in UNGOVERNED_TIERS:
+        # Genuinely ungoverned IF this host could have told. If it could not, the answer
+        # is "unknown", and the caller must not read it as "unrestricted".
+        return None, False, can_tell
+    # can_tell, NOT a literal True. The arm above computes "this host cannot resolve the
+    # personality this job selected" and this return threw it away whenever the FALLBACK
+    # driver happened to be governed -- so the strict-mode refusal only ever fired for an
+    # ungoverned fallback, which is the case that needed it least. A node whose registry
+    # DOES hold that name would have run the job under a real exit driver with its tier and
+    # credentials grants unchecked.
+    return driver, driver in ALWAYS_CREDENTIALED, can_tell
 
 
 def register_node_claim_routes(
@@ -471,11 +594,38 @@ def register_node_claim_routes(
         # mechanism.
         skipped: list[Any] = []
         job = None
+        probes = 0
+        skips = 0
         try:
-            for _ in range(_MAX_CLAIM_PROBES):
+            while probes < _MAX_CLAIM_PROBES and skips < _MAX_CLAIM_SKIPS:
                 candidate = job_store.claim_next(engine=frozenset(allowed))
                 if candidate is None:
                     break
+                # STAMP THE PREFIX FIRST, before judging and before the memo check. The prefix
+                # is what tells `reclaim_stale_claims` "this claim is mine to judge", so every
+                # way this walk could leave a job behind -- a release that raises, a killed
+                # worker mid-`finally` -- used to produce a RUNNING row with an unprefixed claim
+                # id, which no sweep ever looks at again: not QUEUED (fail_stale_queued skips
+                # it), not terminal (retention and the scratch reaper skip it), not prefixed
+                # (the stale-claim sweep skips it). Immortal, with the untrusted sample on disk.
+                # CAS-fenced: losing it means a sweep took the job between the two writes.
+                stamped = NODE_CLAIM_PREFIX + (candidate.claim_id or "")
+                if not job_store.update_if_status(candidate.job_id, JobStatus.RUNNING,
+                                                  expect_claim_id=candidate.claim_id,
+                                                  claim_id=stamped):
+                    continue
+                candidate = job_store.get(candidate.job_id)
+                if candidate is None or candidate.claim_id != stamped:
+                    continue            # taken from under us; not ours to release either
+                if _refusals.remembers(node_id, candidate.job_id):
+                    # Judged already, and recently. Stepping over it costs a claim and a release
+                    # but NOT one of the eight probes -- see _REFUSAL_MEMO_TTL_S: charging the
+                    # probe budget for a wall of permanently-refused jobs meant the node never
+                    # reached anything behind it.
+                    skipped.append(candidate)
+                    skips += 1
+                    continue
+                probes += 1
                 tier, needs_credentials, could_tell = _job_requirements(candidate)
                 why = refusal(grants, engine=candidate.engine, tier=tier,
                               require_credentials=needs_credentials)
@@ -487,21 +637,10 @@ def register_node_claim_routes(
                     why = ("this host cannot resolve the job's network personality, so the "
                            "tier and credentials grants cannot be checked")
                 if why is None:
-                    # RE-STAMP the claim so the reclaim sweep can tell this hand-over from a
-                    # DB-backed dispatcher's own claim (see NODE_CLAIM_PREFIX). CAS-fenced on
-                    # the id claim_next gave us; losing it means a sweep took the job between
-                    # the two writes, and then it is simply not ours to hand over.
-                    stamped = NODE_CLAIM_PREFIX + (candidate.claim_id or "")
-                    if job_store.update_if_status(candidate.job_id, JobStatus.RUNNING,
-                                                  expect_claim_id=candidate.claim_id,
-                                                  claim_id=stamped):
-                        job = job_store.get(candidate.job_id)
-                        if job is None or job.claim_id != stamped:
-                            job = None
-                            continue
-                        break
-                    continue
+                    job = candidate     # already stamped and re-read above
+                    break
                 skipped.append(candidate)
+                _refusals.remember(node_id, candidate.job_id)
                 _log.warning("node_claim: released job=%s from node=%s: %s",
                              candidate.job_id, node_id, why)
         finally:
@@ -528,76 +667,6 @@ def register_node_claim_routes(
                 job.job_id, job.claim_id or "", node_id, secret=_secret()),
         }
 
-    def _job_requirements(job) -> "tuple[str | None, bool, bool]":
-        """(tier grant needed, credentials needed, whether this host could tell).
-
-        DERIVED HERE, never taken from the request -- a caller choosing its own authorisation
-        predicate is not an authorisation check.
-
-        THE ENGINE DEFAULT IS THE USUAL CASE, and getting it wrong made this whole check a
-        no-op. An earlier version hardcoded ``engine_default="none"``, but a job's personality
-        normally comes from ``BLASTBOX_ENGINE_<NAME>_NETPOLICY`` (cli.py reads exactly that
-        when it builds the dispatcher's EngineSpecs), and ``job.net_policy`` is only ever
-        stored when ``BLASTBOX_ALLOW_NETPOLICY_OVERRIDE`` is on -- which is OFF by default. So
-        every job resolved to ``none`` here, took the ungoverned branch, and neither the tier
-        nor the credentials grant was ever examined. The tests passed because they set a
-        per-job override, i.e. they exercised the one path that worked.
-
-        THE THIRD RETURN VALUE IS "COULD I TELL". An ingress host with no
-        ``BLASTBOX_NETPOLICY_*`` registry cannot distinguish a genuinely ungoverned job from
-        one whose personality it simply cannot see, and quietly treating the second as the
-        first is how this became a no-op. It reports the doubt instead, and the caller decides.
-
-        UNGOVERNED TIERS REMAIN NO REQUIREMENT -- a lesson already paid for in
-        `placement.UNGOVERNED_TIERS`: ``none`` is the DEFAULT personality and demanding a grant
-        for it made correctly-issued nodes refuse every ordinary job.
-
-        WHAT IT STILL CANNOT DERIVE: whether openvpn/wireguard imply credentials depends on the
-        NODE's own egress mode, which is node-local. Those stay with the node's `SelfGrants`;
-        only the always-credentialed drivers are required here.
-        """
-        from blastbox.host.netpolicy import parse_personalities, resolve_net_policy
-        from blastbox.host.placement import ALWAYS_CREDENTIALED, UNGOVERNED_TIERS
-
-        registry = parse_personalities(os.environ)
-        # The same env convention cli.py uses to build the dispatcher's EngineSpecs, so both
-        # sides resolve one job to one personality.
-        engine_default = (os.environ.get(
-            f"BLASTBOX_ENGINE_{job.engine.upper().replace('-', '_')}_NETPOLICY")
-            or "none").strip() or "none"
-        # CAN THIS HOST RESOLVE WHAT THIS JOB NEEDS? Precisely, not by counting entries.
-        #
-        # * engine_default "none" and no per-job override -> the job genuinely IS ungoverned,
-        #   which is the ordinary all-none deployment. Nothing to look up, nothing unknown.
-        # * engine_default names a personality this host HAS -> resolvable.
-        # * engine_default names one this host has NOT got -> `resolve_net_policy` silently
-        #   falls back to "none", and THAT is the silent hole: an operator declared a policy
-        #   this host cannot see, so the tier and credentials grants would go unchecked while
-        #   looking exactly like an ungoverned job. Unknown, and it must not read as permissive.
-        allow_override = (os.environ.get("BLASTBOX_ALLOW_NETPOLICY_OVERRIDE", "").strip()
-                          .lower() in ("1", "true", "yes", "on"))
-        can_tell = engine_default == "none" or engine_default in registry
-        if allow_override and job.net_policy and job.net_policy not in registry:
-            # The job SELECTS a personality this host has not got. `resolve_net_policy` falls
-            # through to the engine default -- possibly "none" -- so it would look ungoverned
-            # here while a node whose registry DOES hold that name resolves it to a real exit
-            # driver and runs it with no tier or credentials check. An explicitly selected but
-            # undeclared override is unknown, and in strict mode refused, exactly like an
-            # undeclared engine default.
-            can_tell = False
-        try:
-            personality = resolve_net_policy(
-                job_net_policy=job.net_policy, engine_default=engine_default,
-                registry=registry, allow_override=allow_override)
-            driver = getattr(personality, "exit_driver", "") or ""
-        except Exception:               # noqa: BLE001
-            return None, False, False
-        if not driver or driver in UNGOVERNED_TIERS:
-            # Genuinely ungoverned IF this host could have told. If it could not, the answer
-            # is "unknown", and the caller must not read it as "unrestricted".
-            return None, False, can_tell
-        return driver, driver in ALWAYS_CREDENTIALED, True
-
     #: fleet_grants is O(certificates) with a full X.509 verify per file, and it ran on EVERY
     #: request -- 77 ms of ingress CPU per poll at 200 certificates, from a request a node can
     #: issue for nothing. Cached on the directory's signature (name, mtime, size of every
@@ -622,17 +691,26 @@ def register_node_claim_routes(
         return (os.environ.get(STRICT_TIERS_ENV, "").strip().lower()
                 in ("1", "true", "yes", "on"))
 
-    #: job_id -> how many times a refusal has deferred it. Bounded; see _MAX_REFUSAL_DEFERRALS.
-    _defer_counts: "dict[str, int]" = {}
+    #: Per-app state for the two refusal controls. Classes rather than closures so a test can
+    #: drive the bounds directly: both were reverted in a mutation pass with the suite green,
+    #: because nothing could reach them without ~4000 requests.
+    _refusals = _RefusalMemo()
 
-    def _defer_until(job_id: str) -> "float | None":
-        n = _defer_counts.get(job_id, 0) + 1
-        _defer_counts[job_id] = n
-        if len(_defer_counts) > 4096:
-            _defer_counts.clear()       # best-effort and per-app; losing it costs one deferral
-        if n > _MAX_REFUSAL_DEFERRALS:
-            return None                 # let an entitled peer have it immediately
-        return time.time() + _REFUSAL_DEFER_S
+    def _defer_until(job) -> "float | None":
+        """How long to hold a wrongly-offered job back, or None for "claimable immediately".
+
+        AGE FROM SUBMISSION, not a per-process count. The count was the whole enforcement of the
+        old cap and it could not be enforced: the map is per forked ingress worker and per host,
+        so the real allowance was cap x workers x hosts, a restart reset it, and its own size
+        bound handed a spent allowance back. `created_at` is stamped by the submitting host,
+        shared by every ingress that can see the queue, and not in NODE_WRITABLE_FIELDS -- so
+        this bounds the TOTAL time any number of nodes can keep one job out of an entitled
+        peer's view, which is what the cap was trying to say.
+        """
+        now = time.time()
+        if now - getattr(job, "created_at", 0.0) > MAX_TOTAL_DEFERRAL_S:
+            return None                 # spent: an entitled peer wins from here on
+        return now + _REFUSAL_DEFER_S
 
     def _release(job) -> None:
         """Put a wrongly-offered job back, fenced on the claim we are releasing.
@@ -654,10 +732,10 @@ def register_node_claim_routes(
                                        started_at=None, worker_runtime=None,
                                        worker_tier=None,
                                        # Deferred, not merely requeued: see _REFUSAL_DEFER_S --
-                                       # but only up to _MAX_REFUSAL_DEFERRALS times, so a node
-                                       # cannot hold governed work away from entitled peers by
-                                       # renewing the deferral on every poll.
-                                       claimable_after=_defer_until(job.job_id))
+                                       # and only while the job is young (MAX_TOTAL_DEFERRAL_S),
+                                       # so no number of nodes can hold governed work away from
+                                       # an entitled peer by renewing the deferral on every poll.
+                                       claimable_after=_defer_until(job))
         except Exception:               # noqa: BLE001 - the reclaim sweep is the backstop
             _log.exception("node_claim: could not release job=%s; the reclaim path will "
                            "pick it up", job.job_id)
@@ -742,6 +820,14 @@ def register_node_claim_routes(
         def bad(name: str, why: str) -> None:
             raise HTTPException(status_code=400, detail=f"{name}: {why}")
 
+        if out.get("status") in (JobStatus.EXPIRED, "expired"):
+            # EXPIRED is written in exactly one place in this codebase -- the retention sweep,
+            # where the policy lives -- and it is not a status any dispatcher reports. A node
+            # that could write it hid the submitter's result (open_output is DONE-gated) AND made
+            # the row permanently uncollectable, because `expire_due` skips a row whose
+            # expires_at is null, so `_expire_job` and the blob delete never ran for it. That is
+            # the same outcome MAX_RESULT_TTL_S exists to prevent, through a different door.
+            bad("status", "a node may not expire a job: retention is the operator's policy")
         if "status" in out and not isinstance(out["status"], (str, JobStatus)):
             # JSON also carries ints, bools, lists. `{"status": 7}` was written straight
             # through and stored; from then on `get()` and the unfiltered `list()` raised
@@ -753,7 +839,7 @@ def register_node_claim_routes(
         if out.get("expires_at") is not None:
             try:
                 ttl = float(out["expires_at"])
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 bad("expires_at", "must be a numeric timestamp or null")
             if not math.isfinite(ttl) or ttl <= now_s:
                 bad("expires_at", "must be a timestamp in the future")
@@ -765,11 +851,19 @@ def register_node_claim_routes(
             if name in out and out[name] is not None:
                 if isinstance(out[name], bool) or not isinstance(out[name], (int, float)):
                     bad(name, "must be a numeric timestamp or null")
-                if not math.isfinite(float(out[name])) or float(out[name]) < 0:
+                try:
+                    # float() on a 400-digit JSON integer raises OverflowError, which is neither
+                    # TypeError nor ValueError -- so it escaped this validator entirely and the
+                    # contract's 400 became a 500 with a traceback, from an authenticated node's
+                    # ordinary report.
+                    value = float(out[name])
+                except OverflowError:
+                    bad(name, "must be a timestamp, not an arbitrarily large integer")
+                if not math.isfinite(value) or value < 0:
                     bad(name, "must be a finite, non-negative timestamp")
-                if name != "expires_at" and float(out[name]) > horizon:
+                if name != "expires_at" and value > horizon:
                     bad(name, "must not be in the future")
-                out[name] = float(out[name])
+                out[name] = value
         if "materialise_attempts" in out:
             v = out["materialise_attempts"]
             if isinstance(v, bool) or not isinstance(v, int) or v < 0 or v > 1_000_000:
@@ -847,13 +941,23 @@ def register_node_claim_routes(
                 status_code=400,
                 detail="clearing claim_id is a release: status must be \"queued\" in the "
                        "same write")
+        if "started_at" in out and out["started_at"] is None and "claim_id" not in out:
+            # `reclaim_stale_claims` judges a claim's age on started_at and SKIPS a row where it
+            # is None, so a node could write {"started_at": null} while staying RUNNING and hold
+            # the job -- and its staged sample on this host's disk -- forever. The field is
+            # writable because a RELEASE clears it (dispatch.py's requeue does), and a release
+            # says so: status=queued with claim_id=null, handled just above.
+            raise HTTPException(
+                status_code=400,
+                detail="started_at may only be cleared as part of a release (status "
+                       "\"queued\" with claim_id null)")
         if "claim_id" in out:
             out.setdefault("claimable_after", time.time() + _REFUSAL_DEFER_S)
             out.setdefault("started_at", None)
         if out.get("claimable_after") is not None:
             try:
                 deferred = float(out["claimable_after"])
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 raise HTTPException(status_code=400,
                                     detail="claimable_after must be a timestamp") from None
             if not math.isfinite(deferred):
@@ -978,6 +1082,6 @@ def register_node_claim_routes(
         # quietly fill with stuck jobs, so it is said at startup, where it can be acted on.
         _log.warning("node_claim: %s is not set. Nodes claiming through this control plane have "
                      "NO reclaim path for lost claims -- a restart mid-job leaves the job RUNNING "
-                     "forever. Set it (seconds; >= 300) to the longest run a node may take.",
+                     "forever. Set it (seconds; floored at 900) to the longest run a node may take.",
                      RECLAIM_AFTER_ENV)
     return True

@@ -140,7 +140,7 @@ class TestReceiptEvictionKeepsLiveJobs:
         for i in range(hs._MAX_TRACKED_CLAIMS + 5):
             s._claims[f"done-{i}"] = ("c", "r")
             s._settled.add(f"done-{i}")
-        s._retire_if_settled("done-0", None)
+        s._evict_tracked()
         assert "live-old" in s._claims, "a live job's receipt was evicted while settled ones stayed"
 
 
@@ -212,17 +212,65 @@ class TestRoundFour:
             "the grants cache no longer has a deadline, so expiry stops being a revocation "
             "mechanism")
 
-    def test_the_claim_map_is_evicted_under_the_lock(self):
-        """A dispatcher claims and reports from several threads; scanning _claims for a victim
-        unlocked raises "dictionary changed size during iteration" -- inside a terminal write,
-        which loses the job's result."""
-        import inspect
+    def test_a_claim_recorded_concurrently_cannot_break_the_eviction_scan(self, tmp_path):
+        """This was an `inspect.getsource` grep for `with self._lock` in the evictor -- and the
+        grep was TRUE while the invariant was false: `claim_next` inserted into `_claims`
+        outside the lock, so the scan could still be iterating a dict another thread resized.
+        The failure surfaces from `_evict_tracked` AFTER the terminal write has landed, which
+        loses every post-write step for a job the store already considers finished.
+
+        So: hold the eviction scan open and prove a concurrent claim BLOCKS rather than
+        mutating the dict under it."""
+        import threading
 
         from blastbox.host.jobs import http_store as hs
 
-        src = inspect.getsource(hs.HttpJobStore._retire_if_settled)
-        assert "with self._lock:" in src
-        assert "for k in self._claims" not in src, "still iterating outside the lock"
+        d = tmp_path / "pki"
+        ca = pki.ensure_ca(d)
+        ca.issue_node("n", wg_pubkey=WG, grants=pki.NodeGrants(engines=("clamav",))).write(
+            d, "node-n")
+        s = HttpJobStore("https://cp", cert_path=d / "node-n.crt",
+                         transport=lambda *a, **k: (500, None))
+        for i in range(hs._MAX_TRACKED_CLAIMS + 2):
+            s._claims[f"job-{i}"] = ("c", "r")      # nothing settled: the scan walks them all
+        scanning = threading.Event()
+        release = threading.Event()
+
+        class HoldsTheScanOpen(set):
+            def __contains__(self, key):            # called from inside the scan
+                scanning.set()
+                release.wait(2.0)
+                return False
+
+        s._settled = HoldsTheScanOpen()             # type: ignore[assignment]
+        failures: list[BaseException] = []
+
+        def evict():
+            try:
+                s._evict_tracked()
+            except BaseException as exc:            # noqa: BLE001 -- the thing under test
+                failures.append(exc)
+
+        recorded = threading.Event()
+
+        def claim():
+            s._record_claim("fresh", "c2", "r2")    # exactly what claim_next does
+            recorded.set()
+
+        t1 = threading.Thread(target=evict)
+        t1.start()
+        assert scanning.wait(2.0), "the eviction scan never started"
+        t2 = threading.Thread(target=claim)
+        t2.start()
+        blocked = not recorded.wait(0.3)
+        release.set()
+        t1.join(5)
+        t2.join(5)
+        assert blocked, (
+            "a claim was recorded while the eviction scan held the map: the scan and the "
+            "claimer are not mutually exclusive, so \"dictionary changed size during "
+            "iteration\" is reachable from inside a terminal write")
+        assert not failures, failures
 
     def test_the_claim_map_survives_concurrent_claims(self, tmp_path):
         """Exercise it rather than trusting the read: many threads settling while the map is at
@@ -245,8 +293,11 @@ class TestRoundFour:
         def churn(base):
             try:
                 for i in range(200):
-                    s._claims[f"new{base}-{i}"] = ("c", "r")
-                    s._retire_if_settled(f"new{base}-{i}", None)
+                    # `_record_claim`, not a bare dict insert: the real claim path, which is
+                    # where the lock has to be. Writing the insert out by hand here made the
+                    # test pass while the production insert was unlocked.
+                    s._record_claim(f"new{base}-{i}", "c", "r")
+                    s._evict_tracked()
             except BaseException as exc:      # noqa: BLE001 - the failure IS the assertion
                 errors.append(exc)
 

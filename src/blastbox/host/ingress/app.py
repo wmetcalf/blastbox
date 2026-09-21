@@ -506,8 +506,15 @@ def build_app(
                         # all-federated fleet -- would otherwise sit QUEUED forever with its
                         # untrusted sample on this host's disk.
                         try:
+                            # retention_s, like the sibling call above: this sweep WRITES
+                            # expires_at, and `expire_due` requires a non-null one. Without it
+                            # the sweep traded "a sample sitting QUEUED forever" for "a FAILED
+                            # row sitting forever", which its own docstring says it must not --
+                            # and a restricted node can drive that growth by re-deferring
+                            # governed work until it ages out.
                             fail_stale_queued(_job_store, max_age_s=queued_age,
-                                              job_root=_job_root)
+                                              job_root=_job_root,
+                                              retention_s=_retention_s)
                         except Exception:  # noqa: BLE001 -- same contract as above
                             _log.warning("ingress: stale-QUEUED sweep failed", exc_info=True)
                     if _retention_here:

@@ -676,12 +676,26 @@ class TestIngressAndDispatcherMustAgree:
         store.create(job)
         _claim(c, pki_dir, "alpha", engine="clamav")
         theirs = self._dispatcher_view(job, engine_default)
+        # THE INGRESS SIDE, which is the half this class is named for. The earlier version
+        # discarded the claim's result and asserted only on `theirs` -- true of
+        # `resolve_net_policy` by construction -- so restoring the original no-op (ingress
+        # hardcoding engine_default="none"), the exact defect the class exists to guard, left
+        # all twenty cases green.
+        ours, _needs_credentials, could_tell = nc._job_requirements(job)
         # An engine default naming a personality this host has NOT got must be treated as
         # UNKNOWN, never as ungoverned -- that silent fallback is the hole.
         if engine_default == "missing":
             assert theirs == "none", "resolve_net_policy no longer falls back to none"
+            assert could_tell is False, (
+                "an undeclared engine default read as a decided answer, so the tier and "
+                "credentials grants would go unchecked while looking ungoverned")
         else:
             assert theirs in ("none", "wireguard", "socks")
+            assert ours == (theirs if theirs not in ("none", "drop") else None), (
+                f"the two sides disagree: ingress says {ours!r}, the dispatcher will run "
+                f"{theirs!r}, so the hand-over authorised against a personality the run will "
+                "not use")
+            assert could_tell is True
 
 
 def test_a_declared_policy_this_host_cannot_see_is_unknown_not_ungoverned(store, pki_dir,

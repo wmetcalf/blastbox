@@ -315,7 +315,7 @@ def verify_session(token: str, *, secret: bytes, now: float | None = None) -> st
         raise ClaimRefused("malformed session token") from None
     payload = b"\x00".join((_SESSION_DOMAIN, node_id.encode(), repr(expires_at).encode()))
     expected = hmac.new(secret, payload, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(mac, expected):
+    if not _same(mac, expected):
         raise ClaimRefused("session token was not issued by this server")
     if (time.time() if now is None else now) > expires_at:
         raise ClaimRefused("session token has expired")
@@ -351,9 +351,21 @@ def claim_receipt(job_id: str, claim_id: str, node_id: str, *, secret: bytes) ->
 def check_claim_receipt(receipt: str, job_id: str, claim_id: str, node_id: str, *,
                         secret: bytes) -> None:
     """Raise :class:`ClaimRefused` unless *receipt* was issued to *node_id* for this claim."""
-    if not hmac.compare_digest(
-            receipt, claim_receipt(job_id, claim_id, node_id, secret=secret)):
+    if not _same(receipt, claim_receipt(job_id, claim_id, node_id, secret=secret)):
         raise ClaimRefused("this job was not handed to this node")
+
+
+def _same(given: str, expected: str) -> bool:
+    """Constant-time equality that cannot be turned into a 500.
+
+    `hmac.compare_digest` raises TypeError on a str containing non-ASCII -- and every value
+    it is given here comes off the wire, so `challenge="1000.0:\u00e9"` took the refusal path
+    and turned it into an unhandled exception plus a traceback per request, from an
+    unauthenticated caller. Comparing the UTF-8 BYTES is total, still constant-time, and
+    still a mismatch for anything that is not the expected hex digest.
+    """
+    return hmac.compare_digest(given.encode("utf-8", "surrogatepass"),
+                               expected.encode("utf-8", "surrogatepass"))
 
 
 def _mac(secret: bytes, scope: str, expires_at: float) -> str:
@@ -397,7 +409,7 @@ def _check_challenge(challenge: str, scope: str, *, secret: bytes,
     # compare_digest, not ==: the MAC is a secret-keyed value and a timing oracle on it
     # is a forgery oracle. Also computed over the CLAIMED scope, so a challenge minted
     # for one scope cannot be redeemed for another -- the MAC simply will not match.
-    if not hmac.compare_digest(mac, _mac(secret, scope, expires_at)):
+    if not _same(mac, _mac(secret, scope, expires_at)):
         raise ClaimRefused("challenge was not issued by this server for this scope")
     if (time.time() if now is None else now) > expires_at:
         raise ClaimRefused("challenge has expired")

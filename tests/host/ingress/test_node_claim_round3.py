@@ -40,9 +40,13 @@ def rig(tmp_path, monkeypatch):
 
 
 def test_many_refusable_jobs_at_the_head_do_not_block_entitled_work(rig):
-    """NINE jobs this node may not run, older than one it may. The first version memoised
-    refusals but each memoised row still consumed one of eight probes, so job 9 and beyond were
-    never reached. Refused jobs are now DEFERRED on release, so `claim_next` itself skips them."""
+    """NINE jobs this node may not run, older than one it may. Two mechanisms have to hold for
+    the tenth job to be reached: a young refused job is DEFERRED on release (so `claim_next`
+    skips it), and a job past its deferral window -- which these nine are, being older than
+    MAX_TOTAL_DEFERRAL_S -- goes back claimable and is stepped over from the per-node refusal
+    memo WITHOUT consuming one of the eight probes. The first version memoised refusals but
+    charged the probe budget for them, so job 9 and beyond were never reached; the second
+    deferred them, which worked only while they were young."""
     c, store, h = rig
     now = time.time()
     for i in range(9):
@@ -58,9 +62,11 @@ def test_many_refusable_jobs_at_the_head_do_not_block_entitled_work(rig):
     assert "ok" in seen, "the entitled job was never reached"
     for i in range(9):
         j = store.get(f"wg{i}")
-        assert j.status == JobStatus.QUEUED and j.claim_id is None
-        assert j.claimable_after is not None and j.claimable_after > now, (
-            "a refused job was put back without a deferral, so it would be re-selected at once")
+        assert j.status == JobStatus.QUEUED and j.claim_id is None, (
+            "a job this node may not run was left claimed")
+        assert j.claimable_after is None, (
+            "a job older than MAX_TOTAL_DEFERRAL_S was deferred again; past that window it must "
+            "go back claimable so an entitled peer can have it")
 
 
 def test_a_deferred_refusal_comes_back_for_an_entitled_peer(rig):

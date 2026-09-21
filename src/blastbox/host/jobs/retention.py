@@ -510,6 +510,20 @@ def retry_pending_uploads(
                     finished_at=now_ts,
                     expires_at=(now_ts + retention_seconds) if retention_seconds > 0 else None,
                 )
+            except PermissionError:
+                # A CREDENTIAL-LESS NODE AFTER A RESTART, specifically (#178). The repair is a
+                # CAS on the row, and this store may only write to a job it can prove it holds
+                # -- and a marker exists precisely because the process that sealed the result is
+                # gone, taking its claim receipt with it. NOT a traceback, and not "the store is
+                # broken": the bytes are durable, the tree is retained, and nothing is lost --
+                # but the row stays FAILED and the result is unfetchable until someone with
+                # queue access repairs it. Said plainly, every tick, because it stays true until
+                # someone acts. KNOWN RESIDUAL, recorded in docs/DEPLOYMENT.md.
+                log.warning(
+                    "pending-upload sweep: %s has a durable result but this node cannot repair "
+                    "its FAILED row -- it no longer holds the claim (restarted since), and a "
+                    "credential-less node may only write to jobs it holds. The result is safe "
+                    "in the blob store; the row needs repairing where the queue lives.", d.name)
             except Exception:  # noqa: BLE001 -- the bytes are safe; the status can retry
                 log.warning("pending-upload sweep: uploaded %s but could not repair its "
                             "status", d.name, exc_info=True)
@@ -1033,7 +1047,8 @@ class JobRetentionSweeper:
             if job.expires_at is None or job.expires_at > now:
                 continue
             try:
-                self._expire_job(job_store, job.job_id, job.result_dir)
+                self._expire_job(job_store, job.job_id, job.result_dir,
+                                 expect_status=job.status)
                 expired.append(job.job_id)
             except Exception:
                 _log.exception("failed to expire job %s", job.job_id)
@@ -1049,8 +1064,28 @@ class JobRetentionSweeper:
         job_store: JobStore,
         job_id: str,
         result_dir: str | None,
+        *,
+        expect_status: "JobStatus | None" = None,
     ) -> None:
-        """Delete artifacts and mark the job EXPIRED in the store."""
+        """Delete artifacts and mark the job EXPIRED in the store.
+
+        ``expect_status`` is the status this row had when the sweep SELECTED it, and the whole
+        of this method is fenced on it: re-checked before anything is destroyed, and used as the
+        CAS on the terminal write. #178 made this concurrent -- `expire_due` now runs on every
+        ingress host, against a queue whose rows a node's `retry_pending_uploads` repairs with a
+        FAILED->DONE CAS -- and unfenced, the losing sequence deleted a result that had just been
+        recovered and then clobbered DONE back to EXPIRED with a null `expires_at`, so the row
+        could never be selected again and its bytes were orphaned for good.
+        """
+        if expect_status is not None:
+            fresh = job_store.get(job_id)
+            if fresh is None or fresh.status is not expect_status or fresh.expires_at is None \
+                    or fresh.expires_at > self._clock():
+                # Repaired, re-dated, or already expired by a peer sweeper since selection.
+                # Nothing is destroyed on this path.
+                _log.info("retention: %s changed since the sweep selected it; leaving it alone",
+                          job_id)
+                return
         # NEVER delete a pending-upload tree. The reclaim two blocks earlier in this same
         # maintenance tick deliberately spares it as the only copy of a host-sealed result, and
         # this sweeper would then rmtree it a few lines later -- with the operator's own
@@ -1096,8 +1131,24 @@ class JobRetentionSweeper:
         if not blob_delete_ok:
             return
         job = job_store.get(job_id)
-        if job is not None:
-            job_store.update(job_id, status=JobStatus.EXPIRED, result_dir=None, expires_at=None)
+        if job is None:
+            return
+        # CAS ON THE STATUS WE JUST READ, not a plain update. This is the only terminal write in
+        # the retention/reclaim family that was unfenced, and #178 made it concurrent: expire_due
+        # now runs on EVERY ingress host, against a queue whose rows a node's
+        # `retry_pending_uploads` repairs with a FAILED->DONE CAS. Unfenced, the losing sequence
+        # was: this sweep deletes the durable bytes, the repair then uploads a fresh copy and
+        # wins its CAS to DONE, and this write clobbered DONE back to EXPIRED with expires_at
+        # NULL -- so the row could never be selected again and the freshly uploaded bytes were
+        # orphaned for good, while the client lost a result that had just been recovered. With
+        # the fence this sweep simply loses, which is the right outcome: the repaired result
+        # stands and the next sweep will expire it on its own schedule.
+        if not job_store.update_if_status(job_id, expect_status or job.status,
+                                         status=JobStatus.EXPIRED, result_dir=None,
+                                         expires_at=None):
+            _log.info("retention: job %s changed under the expiry sweep (now not %s); leaving "
+                      "it to the writer that won", job_id, getattr(job.status, "value",
+                                                                   job.status))
 
     def _safe_rmtree(self, job_id: str, result_dir: Path) -> None:
         """Delete the artifact tree, confined to ``job_root``.

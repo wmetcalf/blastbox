@@ -400,16 +400,24 @@ the node checking *itself*: the gate runs on the machine it limits. It is the ri
 for a lapsed certificate or an operator mistake, and it is not a control against the node,
 because the node executes it.
 
-If the ingress host has a CA (`blastbox pki init`), ingress also serves two routes that
-move the decision to the *other* side of the hand-over:
+If the ingress host has a CA (`blastbox pki init`), ingress also serves the routes that move
+the decision to the *other* side of the hand-over. **All seven**, because a reverse proxy or
+WAF allowlist written from a short list silently breaks two of them:
 
 ```
-GET  /v1/nodes/challenge        → a short-lived challenge
-POST /v1/nodes/session          → cert + signature → a session token (10 min)
-POST /v1/nodes/claim            → the job, or 403          }  both carry the token in
-GET  /v1/nodes/jobs/{id}        → read a job this node holds }  X-Blastbox-Node-Session
-POST /v1/nodes/jobs/{id}        → report on it              }
+GET  /v1/nodes/challenge             → a short-lived challenge
+POST /v1/nodes/session               → cert + signature → a session token (10 min)
+POST /v1/nodes/claim                 → the job, or 403            }
+GET  /v1/nodes/backlog               → how much granted work waits } all carry the token in
+GET  /v1/nodes/jobs/{id}             → read a job this node holds  } X-Blastbox-Node-Session
+POST /v1/nodes/jobs/{id}             → report on it                }
+GET  /v1/nodes/jobs/{id}/disposition → whose job is this?          }
 ```
+
+The last two of those are not optional extras. Without `/backlog` a node's sizer has no demand
+signal at all and sits at its floors however deep the queue is; without `/disposition` the
+node's only local disk bound stops working and `job_root` grows without bound with untrusted
+samples.
 
 A node signs the challenge with the private key beside its `node-*.crt` **once per session**
 — signing every request would cost a challenge round trip and a signature per call. The
@@ -447,10 +455,8 @@ across hosts is exactly this fault.
 the secure path needs no extra step; `--tls-cert/--tls-key` uses your own, and `--no-tls` is
 available for a listener behind a TLS-terminating proxy.
 
-There is nothing to configure. The routes appear because a trust anchor exists; with no CA
-they are not registered at all and nodes claim from the store exactly as before. The challenge-signing key is
-recorded on the **job queue**, not in a file — see the multi-host note below, and
-`blastbox claim-key show` to compare hosts.
+The routes appear because a trust anchor exists; with no CA they are not registered at all and
+nodes claim from the store exactly as before.
 
 Three things an operator must know:
 
@@ -464,7 +470,18 @@ Three things an operator must know:
   BLASTBOX_DATABASE_URL=https://control-plane.example:8443
   BLASTBOX_NODE_CERT=/var/lib/blastbox/pki/node-toolz3.crt   # key is the sibling .key
   BLASTBOX_NODE_CA=/var/lib/blastbox/pki/ca.crt              # PUBLIC half only
+  BLASTBOX_BLOB_URL=s3://blastbox-blobs                      # REQUIRED — see below
   ```
+
+  **`BLASTBOX_BLOB_URL` is not optional here, and omitting it fails every job.** A federated
+  node is cross-host by construction: the sample was spooled under the *ingress* host's
+  `job_root`, so the node cannot find it locally and must fetch it from the shared blob store.
+  With the variable unset the node falls back to a *local* blob store, every fetch raises, and
+  each job cycles release/reclaim until it is FAILED with `sample could not be materialised`.
+  The node boots clean and its handshake works, so the only signal is one startup WARNING —
+  and the cross-host check that exists for exactly this (`check_blob_target_agreement`) cannot
+  see it, because the control-plane store deliberately publishes no blob target. Set
+  `BLASTBOX_REQUIRE_SHARED_BLOB_STORE=1` to turn that warning into a refusal to start.
 
   That is the same variable, not a new one, because a node talks to one or the other and
   never both. Such a node also loses capabilities it never needed: it cannot submit jobs,
@@ -479,15 +496,17 @@ Three things an operator must know:
   plane must run one instead, and it is off until you set it:
 
   ```sh
-  # on every ingress host: fail RUNNING jobs idle longer than this (seconds, >= 300)
+  # on every ingress host: fail RUNNING jobs idle longer than this (seconds, floored at 900)
   BLASTBOX_NODE_CLAIM_RECLAIM_AFTER_S=1800
   ```
 
   Set it to the longest run a node may legitimately take (floored at 900 s). Abandoned jobs are
   **failed, not requeued** — a requeue would let a second worker re-detonate the same untrusted
   input. Ingress warns at startup if this is unset. The sweep only touches jobs the control
-  plane itself handed to a node; a dispatcher that holds the database keeps recovering its own
-  claims exactly as before, so a mixed fleet is safe.
+  plane itself handed to a node (their claim ids carry a `node:` prefix), and both dispatcher
+  recovery paths — the container dispatcher's requeue/warm-fail and the VM dispatcher's orphan
+  sweep — skip those same claims, because neither can attest a worker running on another host.
+  A mixed fleet is safe in both directions.
 
   **Node certificates go to every ingress host too.** Grants are resolved from the certificates
   in the *ingress* host's PKI directory, so a node whose certificate lives only on the exit host

@@ -180,7 +180,7 @@ def test_the_claim_map_is_bounded(control_plane, fleet, backing):
     s = node_store(control_plane, fleet, "alpha")
     for i in range(hs._MAX_TRACKED_CLAIMS + 50):
         s._claims[f"job-{i}"] = ("c", "r")
-    s._retire_if_settled("job-0", None)
+    s._evict_tracked()
     assert len(s._claims) <= hs._MAX_TRACKED_CLAIMS
 
 
@@ -419,7 +419,12 @@ class TestTheScopedBacklog:
         with caplog.at_level("INFO"):
             tiered = local_backlog_fn(s, ["clamav"], claimant_tier="cold")()
             unpinned = local_backlog_fn(s, ["clamav"], untargeted_only=True)()
-        assert tiered == 4 and unpinned == 3, (tiered, unpinned)
+        # BOTH are 3. The earlier version of this test asserted `tiered == 4` -- it wrote the
+        # defect down as the expectation: `count` only narrowed to unpinned work when the caller
+        # passed the flag, so the sizer's OTHER backlog callable counted a `target_tier`-pinned
+        # job that the claim path (which sends no tier) can never hand to this node. A backlog
+        # this store reports must be work it could actually be given.
+        assert tiered == 3 and unpinned == 3, (tiered, unpinned)
         assert any("claimant_tier" in r.message for r in caplog.records)
 
     def test_it_still_cannot_enumerate(self, control_plane, fleet, backing):

@@ -65,7 +65,7 @@ def test_queue_age_is_not_run_age(store):
     now = time.time()
     store.create(Job(job_id="waited", engine="clamav", filename="s.bin",
                      status=JobStatus.RUNNING, created_at=now - 10_000,
-                     started_at=now - 5, claim_id="c1"))
+                     started_at=now - 5, claim_id="node:c1"))   # prefixed: see the ABA test
     assert reclaim_stale_claims(store, after_s=600.0) == 0
     assert store.get("waited").status is JobStatus.RUNNING
 
@@ -89,7 +89,10 @@ def test_a_job_reclaimed_BETWEEN_the_read_and_the_write_is_not_clobbered(store):
     that is what is simulated: the listed snapshot carries the old claim, the row carries the new
     one, and the CAS must refuse."""
     now = time.time()
-    running(store, "aba", started_at=now - 10_000, claim_id="old")
+    # PREFIXED claim ids on both sides. Without the prefix the sweep drops the row before it ever
+    # reaches the CAS, so this test asserted 0 for the wrong reason -- deleting
+    # `expect_claim_id=job.claim_id` from the sweep left the whole suite green.
+    running(store, "aba", started_at=now - 10_000, claim_id="node:old")
     stale_snapshot = store.list(status=JobStatus.RUNNING)
 
     class ReclaimedUnderUs(InMemoryJobStore):
@@ -100,11 +103,11 @@ def test_a_job_reclaimed_BETWEEN_the_read_and_the_write_is_not_clobbered(store):
     racing = ReclaimedUnderUs()
     racing.create(Job(job_id="aba", engine="clamav", filename="s.bin",
                       status=JobStatus.RUNNING, created_at=now - 10_000,
-                      started_at=now - 1, claim_id="new-owner"))
+                      started_at=now - 1, claim_id="node:new-owner"))
     assert reclaim_stale_claims(racing, after_s=600.0) == 0, (
         "the sweep failed a job a peer had already re-claimed")
     fresh = racing.get("aba")
-    assert fresh.status is JobStatus.RUNNING and fresh.claim_id == "new-owner"
+    assert fresh.status is JobStatus.RUNNING and fresh.claim_id == "node:new-owner"
 
 
 def test_a_re_claimed_job_gets_a_fresh_run_clock(store):

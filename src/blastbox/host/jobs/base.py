@@ -179,6 +179,24 @@ def normalize_engine_filter(engine: "str | Collection[str] | None") -> tuple[str
 # Whitelist of fields ``list(sort=...)`` accepts. A whitelist (not a free column
 # name) keeps the SQL backend injection-safe and the in-memory/Redis backends
 # uniform. Anything else falls back to newest-first.
+#: Prefix the ingress control plane stamps onto the claim id of every job it claims on behalf
+#: of a federated node (#178). It lives HERE, not in the ingress package, because it is a
+#: contract between TWO reclaim paths that share one queue and neither may import the other:
+#: `node_reclaim.reclaim_stale_claims` (which must judge only its own claims) and
+#: `Dispatcher.requeue_orphaned_jobs` (which must leave a node's live claim alone -- it has no
+#: docker-ps liveness for a job running on another host, so on a mixed fleet it requeued a
+#: node's live job after `requeue_grace_s`, detonating one untrusted sample twice, and
+#: terminally FAILED a warm one, discarding the node's result when its own write lost the CAS).
+#: claim_id is opaque everywhere, so a prefix is safe.
+NODE_CLAIM_PREFIX = "node:"
+
+
+def is_node_claim(claim_id: "str | None") -> bool:
+    """True if this claim is held by a federated node through the control plane, not by a
+    dispatcher that shares this queue. Both reclaim paths gate on it, in opposite directions."""
+    return (claim_id or "").startswith(NODE_CLAIM_PREFIX)
+
+
 LISTABLE_SORT_FIELDS = ("created_at", "filename", "status", "finished_at")
 
 

@@ -101,6 +101,7 @@ def sweeper_lock(job_root: "Path | str"):
     credential-less fleet has.
     """
     import contextlib
+    import errno
     import fcntl
     import os as _os
 
@@ -108,25 +109,46 @@ def sweeper_lock(job_root: "Path | str"):
     def _held():
         path = Path(job_root) / ".blastbox-maintenance.lock"
         fd = None
+        mine = True
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             fd = _os.open(path, _os.O_CREAT | _os.O_RDWR, 0o600)
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                yield False             # another worker on this host has it this tick
-                return
-            yield True
-        except Exception:               # noqa: BLE001 - see below; never lose the sweep
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    # The ONLY errno that means a peer holds it.
+                    mine = False
+                else:
+                    # Everything else means nobody holds it and nobody ever will: ENOLCK (NFS
+                    # mounted -o nolock, lockd down, the kernel's lock table full),
+                    # EOPNOTSUPP/ENOSYS/EINVAL (assorted FUSE and network mounts). Treating
+                    # those as contention made every worker stand down on every tick, silently,
+                    # for the life of the process -- so on a shared job_root all four sweeps
+                    # stopped: no reclaim for a lost claim, no bound on stuck-QUEUED samples,
+                    # and BLASTBOX_JOB_RETENTION_SECONDS unenforced, while startup still printed
+                    # "stale-claim sweep on". This helper's contract is "never cost the fleet its
+                    # sweep"; it was implemented in the outer handler while this one swallowed
+                    # the exact case the contract names. Wasteful is the safe direction here --
+                    # every sweep's own write is CAS-fenced.
+                    _log.warning(
+                        "node_reclaim: %s cannot be locked (%s); sweeping WITHOUT the "
+                        "one-sweeper election, so every ingress worker on this host sweeps",
+                        path, exc)
+        except Exception:               # noqa: BLE001 - never lose the sweep
             # BROADER THAN OSError DELIBERATELY. A pathological job_root raises ValueError
             # ("embedded null byte") rather than OSError, which escaped and would have killed
-            # the maintenance tick -- found by this module's own test. The contract of this
-            # helper is "never cost the fleet its sweep", so anything at all that goes wrong
-            # here errs towards sweeping: N sweeps is waste, zero sweeps is the only reclaim
-            # path a credential-less fleet has.
+            # the maintenance tick -- found by this module's own test.
             _log.debug("node_reclaim: cannot take the maintenance lock; sweeping anyway",
                        exc_info=True)
-            yield True
+            mine = True
+        try:
+            # EXACTLY ONE yield, and outside every handler. Yielding from inside `except` meant
+            # an exception raised in the caller's `with` body was thrown back in here, swallowed
+            # by that same handler, and answered with a SECOND yield -- which contextlib turns
+            # into RuntimeError("generator didn't stop after throw()"), losing the real failure
+            # and pointing the operator at this lock helper instead of the sweep that broke.
+            yield mine
         finally:
             if fd is not None:
                 with contextlib.suppress(OSError):
@@ -270,8 +292,14 @@ def reclaim_stale_claims(job_store: "JobStore", *, after_s: float,
             continue
         # started_at, not created_at: a job that waited an hour in the queue has not been
         # running an hour, and failing on queue age would terminate work that just started.
-        started = job.started_at
-        if started is None or started >= cutoff:
+        # ...and FALL BACK to created_at when it is missing, rather than skipping the row.
+        # started_at is node-writable (a release clears it, so it has to be), and skipping on
+        # None made the one sweep that bounds a lost claim steerable by the claim holder: write
+        # {"started_at": null} while RUNNING and the job -- with its staged sample on this
+        # host's disk -- was never reclaimable again. A RUNNING row with no start time is
+        # anomalous by construction, since `claim_next` stamps one.
+        started = job.started_at if job.started_at is not None else job.created_at
+        if started >= cutoff:
             continue
         try:
             applied = job_store.update_if_status(

@@ -71,7 +71,7 @@ from blastbox.host.canary import (
 # ungated node took the armed branch.
 from blastbox.host.placement import NO_GATE as _NO_GATE
 from blastbox.host.placement import SelfGrants
-from blastbox.host.jobs.base import Job, JobStatus, JobStore
+from blastbox.host.jobs.base import Job, JobStatus, JobStore, is_node_claim
 from blastbox.host.runtime.docker import (
     RuntimeSelection,
     build_worker_docker_run_argv,
@@ -467,6 +467,9 @@ class Dispatcher:
         # the container is confirmed gone a peer may have reclaimed the job, and comparing
         # the store row against itself would pass trivially and delete the peer's tree.
         self._retained_cold_orphans: dict[str, tuple[str, str | None]] = {}
+        #: Sweeps this store refuses by design (a credential-less node's). Named once
+        #: at INFO, never as a per-tick ERROR traceback. See `_sweep_unsupported`.
+        self._unsupported_sweeps: set[str] = set()
         # Jobs whose result upload EXHAUSTED its retries: the durable copy never landed, so the
         # local tree is the ONLY copy and the terminal purge must spare it. Everything else in
         # this file assumes the blob store is the durable copy -- on this one branch that is
@@ -1062,6 +1065,8 @@ class Dispatcher:
         for job in running:
             if job.job_id in excluded or job.worker_runtime != "warm":
                 continue
+            if is_node_claim(job.claim_id):
+                continue                # see the NOT OURS TO JUDGE note below
             if job.started_at is None or job.started_at >= warm_stale_cutoff:
                 continue
             if self._fail_if_running(
@@ -1105,6 +1110,17 @@ class Dispatcher:
                 or job.job_id in active_job_ids
                 or job.worker_runtime == "warm"  # handled above
             ):
+                continue
+            # NOT OURS TO JUDGE. A `node:`-prefixed claim is held by a federated node through
+            # the ingress control plane (#178), on another host entirely -- so `docker ps` here
+            # can never attest it and BOTH passes above would have judged it dead: this one
+            # requeues it past `requeue_grace_s` (60 s by default), which puts the SAME untrusted
+            # sample in a second worker, and the warm pass FAILs it past `worker_timeout_s +
+            # grace`, after which the node's own DONE write loses its CAS and its result is
+            # discarded. `reclaim_stale_claims` owns these claims and has a 900 s floor; this is
+            # the other half of that deal, and `is_node_claim` is defined in `jobs.base` so both
+            # sides read one definition.
+            if is_node_claim(job.claim_id):
                 continue
             # Grace window: a just-claimed cold job's worker container may not appear in
             # `docker ps` yet, so requeuing it now would double-detonate the same (malicious)
@@ -3499,16 +3515,44 @@ class Dispatcher:
                 os.close(fd)
         self._write_sealed_metadata(envelope, dst_dir)
 
+    def _sweep_unsupported(self, what: str) -> bool:
+        """Say ONCE that a sweep does not run on this store, and stay quiet after that.
+
+        A credential-less node's store refuses every question that would enumerate the fleet's
+        queue (#178), and two of these sweeps begin with exactly that. They were caught by the
+        broad handlers below and reported with `_log.exception` -- an ERROR and a full traceback
+        per maintenance tick, forever, on every federated node. Alerting keyed on ERROR from
+        this logger then has to be suppressed, which is how the next real failure here goes
+        unseen. The sweeps themselves are not missing: they run on the control plane, where the
+        queue is (see `node_reclaim`).
+        """
+        seen = getattr(self, "_unsupported_sweeps", None)
+        if seen is None:
+            seen = self._unsupported_sweeps = set()
+        if what in seen:
+            return True
+        seen.add(what)
+        _log.info("%s does not run on a credential-less node: the control plane owns it "
+                  "(see BLASTBOX_NODE_CLAIM_RECLAIM_AFTER_S and BLASTBOX_MAX_QUEUED_AGE_S on "
+                  "the ingress)", what)
+        return True
+
     def _run_maintenance(self) -> None:
         """Periodic upkeep from run_forever: requeue jobs whose worker vanished (so a crash
         mid-dispatch doesn't strand a RUNNING zombie forever) and expire retention-due artifacts
         (so output of untrusted documents doesn't accumulate on disk forever)."""
+        from blastbox.host.jobs.http_store import NodeStoreUnsupported
+
         try:
             self.requeue_orphaned_jobs()
+        except NodeStoreUnsupported:
+            self._sweep_unsupported("requeue_orphaned_jobs")
         except Exception:  # noqa: BLE001
             _log.exception("requeue_orphaned_jobs failed")
         try:
             self._fail_stale_queued_jobs()
+        except NodeStoreUnsupported:
+            self._sweep_unsupported("the stale-queued sweep")
         except Exception:  # noqa: BLE001
             _log.exception("stale-queued sweep failed")
         # BEFORE the scratch reclaim, for two reasons. (1) It is cheap -- one `docker ps` and a
@@ -3543,6 +3587,8 @@ class Dispatcher:
                 ).expire_due(self._job_store)
                 if expired:
                     _log.info("retention_sweep_expired count=%d", len(expired))
+            except NodeStoreUnsupported:
+                self._sweep_unsupported("the retention sweep")
             except Exception:  # noqa: BLE001
                 _log.exception("retention sweep failed")
 
