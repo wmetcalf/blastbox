@@ -418,12 +418,31 @@ def build_app(
             # "%s" text rather than formatting it.
             reap_log = _logging.getLogger("blastbox.ingress.reap")
 
+            # #178: the control plane owns the queue, so it owns the stale-claim sweep too.
+            # A credential-less node cannot enumerate RUNNING jobs -- by design -- so the
+            # "reclaim on timeout" that the claim protocol relies on has nowhere else to live.
+            # Off unless an operator sets the age; see node_reclaim.
+            from blastbox.host.ingress.node_reclaim import (
+                reclaim_after_s,
+                reclaim_stale_claims,
+            )
+
+            reclaim_after = reclaim_after_s()
+            if reclaim_after:
+                _log.info("ingress: stale-claim sweep on, failing RUNNING jobs idle >%.0fs",
+                          reclaim_after)
+
             while not stop.wait(_reap_interval_s):
                 try:
                     reap_stale_scratch(_job_root, _scratch_max_age_s, _job_store, reap_log,
                                        blob_store=_blob_store)
                 except Exception:  # noqa: BLE001 -- a sweep failure must not kill the server
                     _log.warning("ingress: scratch reclaim failed", exc_info=True)
+                if reclaim_after:
+                    try:
+                        reclaim_stale_claims(_job_store, after_s=reclaim_after)
+                    except Exception:  # noqa: BLE001 -- same contract as above
+                        _log.warning("ingress: stale-claim sweep failed", exc_info=True)
 
         thread = None
         if _scratch_max_age_s > 0 and _reap_interval_s > 0:
