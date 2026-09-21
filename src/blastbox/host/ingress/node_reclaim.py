@@ -147,6 +147,7 @@ def max_queued_age_s(env: "dict[str, str] | None" = None) -> float:
 
 def fail_stale_queued(job_store: "JobStore", *, max_age_s: float,
                       job_root: "Path | str | None" = None,
+                      retention_s: float = 0.0,
                       now: float | None = None) -> int:
     """FAIL jobs stuck QUEUED past *max_age_s*, and delete their untrusted input.
 
@@ -156,6 +157,18 @@ def fail_stale_queued(job_store: "JobStore", *, max_age_s: float,
     version of this is list()-driven and cannot run on a node.
 
     CAS ON QUEUED, so a job claimed since the snapshot (now RUNNING) is left entirely alone.
+
+    A DELIBERATELY DEFERRED JOB IS NOT ABANDONED. Anything with ``claimable_after`` in the
+    future was put there on purpose -- by a dispatcher's capacity backoff, or by this control
+    plane releasing a job a node may not run -- and judging it on ``created_at`` alone let a
+    restricted node weaponise this sweep: poll until a governed job it cannot run is deferred
+    again and again, and once it aged past the policy THIS function marked it FAILED and deleted
+    another tenant's sample. Reviewed and reproduced. Deferred jobs are skipped.
+
+    AND IT WRITES ``expires_at``, which the dispatcher's counterpart computes on exactly this
+    transition. Without it `expire_due` skips the row forever (it requires a non-null
+    ``expires_at``), so this sweep would trade "a sample sitting QUEUED forever" for "a FAILED
+    row and its tree sitting forever" -- with the growth adversary-driven, per the above.
     """
     import time
 
@@ -175,9 +188,12 @@ def fail_stale_queued(job_store: "JobStore", *, max_age_s: float,
     for job in queued:
         if job.created_at > cutoff:
             continue
+        if job.claimable_after is not None and job.claimable_after > stamp:
+            continue                    # deferred on purpose; see the docstring
         try:
             applied = job_store.update_if_status(
                 job.job_id, JobStatus.QUEUED, status=JobStatus.FAILED, finished_at=stamp,
+                expires_at=(stamp + retention_s) if retention_s > 0 else None,
                 error=(f"stuck QUEUED for more than {max_age_s:.0f}s: no dispatcher claimed "
                        "it (a target_tier with no matching dispatcher, or an engine nobody "
                        "serves)"))

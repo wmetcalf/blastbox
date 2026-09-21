@@ -225,3 +225,157 @@ def test_a_failure_mid_walk_does_not_strand_claimed_jobs(tmp_path, monkeypatch):
     stranded = [j for j in (store.get(f"j{i}") for i in range(3))
                 if j.status is JobStatus.RUNNING]
     assert not stranded, f"{len(stranded)} job(s) left RUNNING with no owner after a mid-walk failure"
+
+
+class TestRoundFourAuthz:
+    """Round four's authorisation lens. The first of these was mine, and it failed in exactly
+    the way the tests it replaced did: I tested the helper and never the call site."""
+
+    def test_the_sweeps_run_INSIDE_the_held_lock(self):
+        """THE ELECTION WAS DECORATIVE. `with sweeper_lock(...) as mine: if not mine: continue`
+        closed the context -- releasing the flock -- before any sweep ran, so the exclusion
+        window was the few microseconds of open+flock+close and every worker swept anyway. My
+        test asserted only that the HELPER excludes a second holder, which it always did."""
+        import inspect
+        import re
+
+        from blastbox.host.ingress import app
+
+        src = inspect.getsource(app)
+        i = src.index("with sweeper_lock(_job_root) as _mine:")
+        with_indent = len(re.match(r"\s*", src[src.rindex("\n", 0, i) + 1:]).group(0))
+        for call in ("reap_stale_scratch(", "reclaim_stale_claims(", "fail_stale_queued(",
+                     "expire_due("):
+            j = src.index(call, i)
+            ls = src.rindex("\n", 0, j) + 1
+            indent = len(re.match(r"\s*", src[ls:]).group(0))
+            assert indent > with_indent, (
+                f"{call} runs OUTSIDE the held lock, so the election excludes nothing")
+
+    def test_only_one_of_many_concurrent_sweepers_proceeds(self, tmp_path):
+        """The call-site property, exercised rather than read: threads arriving while a sweep is
+        in progress must be turned away, not merely threads arriving in the same microsecond."""
+        import threading
+
+        from blastbox.host.ingress.node_reclaim import sweeper_lock
+
+        peak, live, errors = [0], [0], []
+        lock = threading.Lock()
+
+        def worker():
+            try:
+                with sweeper_lock(tmp_path) as mine:
+                    if not mine:
+                        return
+                    with lock:
+                        live[0] += 1
+                        peak[0] = max(peak[0], live[0])
+                    time.sleep(0.15)        # the sweep
+                    with lock:
+                        live[0] -= 1
+            except BaseException as exc:    # noqa: BLE001
+                errors.append(exc)
+
+        threads = []
+        for _ in range(4):
+            t = threading.Thread(target=worker)
+            t.start()
+            threads.append(t)
+            time.sleep(0.005)               # arrive 5 ms apart, mid-sweep
+        for t in threads:
+            t.join()
+        assert not errors, errors[:1]
+        assert peak[0] == 1, f"{peak[0]} workers swept concurrently"
+
+    def test_a_deliberately_deferred_job_is_not_failed_as_abandoned(self):
+        """A restricted node could poll until a governed job it cannot run was deferred over and
+        over, and once it aged past the policy this sweep marked it FAILED and deleted another
+        tenant's sample. Deferred means deliberate, not abandoned."""
+        from blastbox.host.ingress.node_reclaim import fail_stale_queued
+
+        store = InMemoryJobStore()
+        store.create(Job(job_id="deferred", engine="clamav", filename="s.bin",
+                         status=JobStatus.QUEUED, created_at=time.time() - 10_000,
+                         claimable_after=time.time() + 60))
+        assert fail_stale_queued(store, max_age_s=3600.0) == 0
+        assert store.get("deferred").status is JobStatus.QUEUED
+
+    def test_a_failed_queued_job_is_reapable(self):
+        """Without expires_at, `expire_due` skips the row forever -- trading a sample stuck
+        QUEUED for a FAILED row and its tree stuck instead."""
+        from blastbox.host.ingress.node_reclaim import fail_stale_queued
+
+        store = InMemoryJobStore()
+        store.create(Job(job_id="old", engine="clamav", filename="s.bin",
+                         status=JobStatus.QUEUED, created_at=time.time() - 10_000))
+        assert fail_stale_queued(store, max_age_s=3600.0, retention_s=86400.0) == 1
+        assert store.get("old").expires_at is not None, "retention can never see this row"
+
+    def test_the_refusal_deferral_cannot_be_renewed_without_bound(self, tmp_path, monkeypatch):
+        """Nothing bounded how OFTEN a node could re-defer one job, so a restricted node could
+        hold governed work away from the entitled peers the grants exist to route it to."""
+        from blastbox.host.ingress import node_claim as nc
+
+        monkeypatch.delenv(node_auth.SECRET_FILE_ENV, raising=False)
+        monkeypatch.setenv("BLASTBOX_NETPOLICY_VPN", "exit=wireguard")
+        monkeypatch.setenv("BLASTBOX_ENGINE_CLAMAV_NETPOLICY", "vpn")
+        d = tmp_path / "pki"
+        ca = pki.ensure_ca(d)
+        ca.issue_node("n", wg_pubkey=WG, grants=pki.NodeGrants(engines=("clamav",))).write(
+            d, "node-n")
+        store = InMemoryJobStore()
+        store.create(Job(job_id="gov", engine="clamav", filename="f",
+                         status=JobStatus.QUEUED, created_at=time.time()))
+        app = FastAPI()
+        assert register_node_claim_routes(app, job_store=store, pki_dir=d)
+        c = TestClient(app)
+        ch = c.get("/v1/nodes/challenge").json()["challenge"]
+        sig = base64.b64encode(node_auth.sign_claim(
+            (d / "node-n.key").read_bytes(), ch, node_auth.SCOPE_CLAIM_NEXT, "n")).decode()
+        tok = c.post("/v1/nodes/session", json={
+            "cert_pem": (d / "node-n.crt").read_text(), "challenge": ch, "signature": sig}
+        ).json()["token"]
+        for _ in range(nc._MAX_REFUSAL_DEFERRALS + 2):
+            store.update("gov", claimable_after=None)        # the deferral lapses
+            c.post("/v1/nodes/claim", json={}, headers={SESSION_HEADER: tok})
+        assert store.get("gov").claimable_after is None, (
+            "the node kept renewing the deferral, starving entitled peers")
+
+    def test_a_node_cannot_pin_or_destroy_a_result_with_expires_at(self, tmp_path, monkeypatch):
+        """The one node-writable timestamp with no bound: 1e18 pinned a tenant's result beyond
+        any policy, and a past value had the next retention tick delete it before the submitter
+        could fetch it while the API reported success."""
+        from blastbox.host.ingress.node_claim import MAX_RESULT_TTL_S
+
+        c, store, h, _d = _rig(tmp_path, monkeypatch)
+        store.create(Job(job_id="j", engine="clamav", filename="f",
+                         status=JobStatus.QUEUED, created_at=time.time()))
+        r = c.post("/v1/nodes/claim", json={}, headers=h)
+        assert r.status_code == 200, r.text
+        job, rcpt = r.json()["job"], r.json()["receipt"]
+        for bad in (1e18, time.time() - 10, 0):
+            w = c.post(f"/v1/nodes/jobs/{job['job_id']}", headers=h,
+                       json={"claim_id": job["claim_id"], "receipt": rcpt,
+                             "fields": {"expires_at": bad}})
+            assert w.status_code == 400, (bad, w.text)
+        ok = c.post(f"/v1/nodes/jobs/{job['job_id']}", headers=h,
+                    json={"claim_id": job["claim_id"], "receipt": rcpt,
+                          "fields": {"expires_at": time.time() + 3600}})
+        assert ok.status_code == 200, ok.text
+        assert MAX_RESULT_TTL_S > 86400
+
+    def test_the_disposition_route_authorises_like_every_other(self, tmp_path, monkeypatch):
+        """It was the one session-gated route that never called _grants_now, so a certificate
+        the operator had just deleted kept answering for the rest of the session TTL."""
+        c, store, h, d = _rig(tmp_path, monkeypatch)
+        store.create(Job(job_id="j", engine="clamav", filename="f",
+                         status=JobStatus.QUEUED, created_at=time.time()))
+        r = c.post("/v1/nodes/claim", json={}, headers=h)
+        assert r.status_code == 200, r.text
+        job = r.json()["job"]
+        assert c.get(f"/v1/nodes/jobs/{job['job_id']}/disposition",
+                     headers=h).status_code == 200
+        (d / "node-n.crt").unlink()          # revoked mid-session
+        time.sleep(0)                        # the grants cache is keyed on the directory too
+        r = c.get(f"/v1/nodes/jobs/{job['job_id']}/disposition", headers=h)
+        assert r.status_code == 403, r.text

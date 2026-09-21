@@ -477,44 +477,50 @@ def build_app(
                                  exc_info=True)
 
             while not stop.wait(_reap_interval_s):
-                # ONE SWEEPER PER HOST PER TICK. workers>1 forks, and every worker used to run
-                # the whole sweep: N full scans per interval, each holding the store's lock
-                # inside a process that is meant to be answering requests.
+                # ONE SWEEPER PER HOST, AND THE LOCK IS HELD ACROSS THE WORK. The first
+                # version tested the flag and closed the context immediately, so the lock
+                # lived for the few microseconds of open+flock+close and every worker swept
+                # anyway -- the election was decorative. My test exercised the HELPER and
+                # never the call site, which is the same mistake as the source-grep wiring
+                # tests it replaced.
                 with sweeper_lock(_job_root) as _mine:
                     if not _mine:
                         continue
-                if _scratch_max_age_s > 0:
-                    try:
-                        reap_stale_scratch(_job_root, _scratch_max_age_s, _job_store, reap_log,
-                                           blob_store=_blob_store)
-                    except Exception:  # noqa: BLE001 -- a sweep failure must not kill the server
-                        _log.warning("ingress: scratch reclaim failed", exc_info=True)
-                if reclaim_after:
-                    try:
-                        reclaim_stale_claims(_job_store, after_s=reclaim_after)
-                    except Exception:  # noqa: BLE001 -- same contract as above
-                        _log.warning("ingress: stale-claim sweep failed", exc_info=True)
-                if queued_age:
-                    # Work nobody can claim -- a target_tier with no matching dispatcher on an
-                    # all-federated fleet -- would otherwise sit QUEUED forever with its
-                    # untrusted sample on this host's disk.
-                    try:
-                        fail_stale_queued(_job_store, max_age_s=queued_age,
-                                          job_root=_job_root)
-                    except Exception:  # noqa: BLE001 -- same contract as above
-                        _log.warning("ingress: stale-QUEUED sweep failed", exc_info=True)
-                if _retention_here:
-                    # #178: retention has to run where the queue is. `expire_due` finds its
-                    # candidates by ENUMERATING, and a credential-less node's store refuses that
-                    # by design -- so on such a fleet BLASTBOX_JOB_RETENTION_SECONDS was quietly
-                    # a no-op and detonation output accumulated under a policy nobody was
-                    # enforcing. The node still reaps its own local trees by age
-                    # (`reap_stale_scratch`, which needs no enumeration); this is the half that
-                    # needs the queue.
-                    try:
-                        _retention_here.expire_due(_job_store)
-                    except Exception:  # noqa: BLE001 -- same contract as above
-                        _log.warning("ingress: job retention sweep failed", exc_info=True)
+                    # ONE SWEEPER PER HOST PER TICK. workers>1 forks, and every worker used to run
+                    # the whole sweep: N full scans per interval, each holding the store's lock
+                    # inside a process that is meant to be answering requests.
+                    if _scratch_max_age_s > 0:
+                        try:
+                            reap_stale_scratch(_job_root, _scratch_max_age_s, _job_store, reap_log,
+                                               blob_store=_blob_store)
+                        except Exception:  # noqa: BLE001 -- a sweep failure must not kill the server
+                            _log.warning("ingress: scratch reclaim failed", exc_info=True)
+                    if reclaim_after:
+                        try:
+                            reclaim_stale_claims(_job_store, after_s=reclaim_after)
+                        except Exception:  # noqa: BLE001 -- same contract as above
+                            _log.warning("ingress: stale-claim sweep failed", exc_info=True)
+                    if queued_age:
+                        # Work nobody can claim -- a target_tier with no matching dispatcher on an
+                        # all-federated fleet -- would otherwise sit QUEUED forever with its
+                        # untrusted sample on this host's disk.
+                        try:
+                            fail_stale_queued(_job_store, max_age_s=queued_age,
+                                              job_root=_job_root)
+                        except Exception:  # noqa: BLE001 -- same contract as above
+                            _log.warning("ingress: stale-QUEUED sweep failed", exc_info=True)
+                    if _retention_here:
+                        # #178: retention has to run where the queue is. `expire_due` finds its
+                        # candidates by ENUMERATING, and a credential-less node's store refuses that
+                        # by design -- so on such a fleet BLASTBOX_JOB_RETENTION_SECONDS was quietly
+                        # a no-op and detonation output accumulated under a policy nobody was
+                        # enforcing. The node still reaps its own local trees by age
+                        # (`reap_stale_scratch`, which needs no enumeration); this is the half that
+                        # needs the queue.
+                        try:
+                            _retention_here.expire_due(_job_store)
+                        except Exception:  # noqa: BLE001 -- same contract as above
+                            _log.warning("ingress: job retention sweep failed", exc_info=True)
 
         thread = None
         # EITHER task keeps the thread alive. This used to be gated on scratch reaping alone, so

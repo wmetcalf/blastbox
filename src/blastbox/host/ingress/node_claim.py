@@ -40,13 +40,13 @@ So the limit above is a statement about CONFIGURATION, not about this module: po
 at a DSN and it walks around these routes; point it at the control plane and it cannot.
 Which of those a deployment does is the operator's choice, and DEPLOYMENT.md says so.
 
-BEARER AUTH APPLIES WHEN ``BLASTBOX_API_KEY`` IS SET. These routes are not in
-``BearerAuthMiddleware._ALWAYS_PUBLIC``, so an API-keyed deployment requires nodes to
-present the API key as well as their certificate. That is deliberate belt-and-braces, but
-note what it means operationally: the API key is the SUBMITTER's credential, so handing it
-to every node also lets every node submit jobs. Either accept that, or run nodes against a
-listener without an API key and let the certificate be the only authentication -- which is
-what it is designed to be.
+THE API KEY DOES NOT APPLY TO THESE ROUTES. ``BearerAuthMiddleware`` exempts the
+``/v1/nodes/`` prefix, because these routes authenticate with a CA-issued certificate and a
+session bound to it -- stronger than the key and orthogonal to it -- and requiring the key too
+would put the SUBMITTER's credential on every node, letting every node submit jobs. An earlier
+version of this docstring advised running nodes against a keyless listener instead; that advice
+was stale AND actively harmful, because the API key is also the pepper for the store-held
+signing key, so a keyed and a keyless ingress on one queue sign with DIFFERENT keys.
 
 WHY NOT mTLS. ``issue_node`` stamps a critical private EKU and never ``clientAuth``,
 because ``tls.py`` verifies the CA chain only -- a node cert carrying ``clientAuth`` would
@@ -153,6 +153,20 @@ _REFUSAL_DEFER_S = 20.0
 #: slices it for display), so a prefix is safe; the node receives the re-stamped id and the
 #: receipt is minted over it, so every later fence still matches.
 NODE_CLAIM_PREFIX = "node:"
+
+#: How many times ONE job may be deferred by refusals before it is released undeferred. The
+#: deferral stops a node re-claiming the same job every poll, but nothing bounded how OFTEN it
+#: could renew it -- so a restricted node could keep governed work perpetually deferred and
+#: starve the entitled peers the grants exist to route it to. Past this, the job goes back
+#: claimable immediately: the node can still churn it, but a peer polling at any point wins.
+_MAX_REFUSAL_DEFERRALS = 3
+
+#: The furthest ahead a node may set a result's retention deadline, and it must be in the
+#: future at all. This was the one node-writable timestamp with no bound: 1e18 pinned a
+#: tenant's result and its blob beyond any policy's reach, and a value in the PAST had the next
+#: retention tick delete the result before the submitter could fetch it, while the API reported
+#: success. The job is a submitter's and the policy is the operator's; neither is the node's.
+MAX_RESULT_TTL_S = 400 * 86400.0
 
 #: How long resolved grants may be reused. Bounds how long an EXPIRED certificate keeps
 #: authorising: the file does not change when it lapses, so the directory signature cannot see
@@ -608,6 +622,18 @@ def register_node_claim_routes(
         return (os.environ.get(STRICT_TIERS_ENV, "").strip().lower()
                 in ("1", "true", "yes", "on"))
 
+    #: job_id -> how many times a refusal has deferred it. Bounded; see _MAX_REFUSAL_DEFERRALS.
+    _defer_counts: "dict[str, int]" = {}
+
+    def _defer_until(job_id: str) -> "float | None":
+        n = _defer_counts.get(job_id, 0) + 1
+        _defer_counts[job_id] = n
+        if len(_defer_counts) > 4096:
+            _defer_counts.clear()       # best-effort and per-app; losing it costs one deferral
+        if n > _MAX_REFUSAL_DEFERRALS:
+            return None                 # let an entitled peer have it immediately
+        return time.time() + _REFUSAL_DEFER_S
+
     def _release(job) -> None:
         """Put a wrongly-offered job back, fenced on the claim we are releasing.
 
@@ -627,8 +653,11 @@ def register_node_claim_routes(
                                        status=JobStatus.QUEUED, claim_id=None,
                                        started_at=None, worker_runtime=None,
                                        worker_tier=None,
-                                       # Deferred, not merely requeued: see _REFUSAL_DEFER_S.
-                                       claimable_after=time.time() + _REFUSAL_DEFER_S)
+                                       # Deferred, not merely requeued: see _REFUSAL_DEFER_S --
+                                       # but only up to _MAX_REFUSAL_DEFERRALS times, so a node
+                                       # cannot hold governed work away from entitled peers by
+                                       # renewing the deferral on every poll.
+                                       claimable_after=_defer_until(job.job_id))
         except Exception:               # noqa: BLE001 - the reclaim sweep is the backstop
             _log.exception("node_claim: could not release job=%s; the reclaim path will "
                            "pick it up", job.job_id)
@@ -719,7 +748,19 @@ def register_node_claim_routes(
             # "'7' is not a valid JobStatus" FOREVER -- GET /v1/jobs, and the retention sweep
             # this branch added to ingress, both dead fleet-wide at WARNING. Reproduced.
             bad("status", "must be a status name")
-        horizon = time.time() + MAX_FUTURE_SKEW_S
+        now_s = time.time()
+        horizon = now_s + MAX_FUTURE_SKEW_S
+        if out.get("expires_at") is not None:
+            try:
+                ttl = float(out["expires_at"])
+            except (TypeError, ValueError):
+                bad("expires_at", "must be a numeric timestamp or null")
+            if not math.isfinite(ttl) or ttl <= now_s:
+                bad("expires_at", "must be a timestamp in the future")
+            if ttl > now_s + MAX_RESULT_TTL_S:
+                bad("expires_at",
+                    f"must be within {MAX_RESULT_TTL_S / 86400:.0f} days: the retention policy "
+                    "is the operator's, not a node's")
         for name in ("started_at", "finished_at", "expires_at"):
             if name in out and out[name] is not None:
                 if isinstance(out[name], bool) or not isinstance(out[name], (int, float)):
@@ -862,7 +903,14 @@ def register_node_claim_routes(
         expires_at -- what retention decides with -- and nothing about content: no filename, no
         engine, no result_dir, no params.
         """
-        _node_from_token(x_blastbox_node_session)
+        node_id = _node_from_token(x_blastbox_node_session)
+        if _grants_now(node_id) is None:
+            # AUTHORISE, like every other route here. This was the one session-gated route that
+            # never called _grants_now, so a certificate the operator had just deleted kept
+            # answering for the rest of the session TTL -- and _grants_now is precisely the
+            # mechanism the design leans on for "revocation takes effect inside the token's
+            # lifetime". A node with no resolvable certificate gets nothing.
+            raise HTTPException(status_code=403, detail=_REFUSED)
         job = job_store.get(job_id)
         if job is None:
             # Truthfully absent. The node's reaper reads this as "genuine orphan, reclaimable",

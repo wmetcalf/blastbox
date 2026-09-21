@@ -1214,9 +1214,26 @@ def _claim_key_cmd(args: argparse.Namespace) -> int:
         print("(no node signing key recorded yet -- the first ingress to start with a PKI "
               "records one)")
         return 0
-    digest = hashlib.sha256(current.encode()).hexdigest()[:12]
-    print(f"recorded (fingerprint {digest}). Compare this across ingress hosts; the key itself "
-          f"is never printed.")
+    # FINGERPRINT THE EFFECTIVE KEY, not the stored half. BLASTBOX_API_KEY is the pepper
+    # (see node_auth.resolve_claim_secret), so the stored value is identical on every host by
+    # construction -- the command whose whole purpose is "confirm two hosts agree" could never
+    # report a difference, and would actively confirm a false agreement between a keyed and a
+    # keyless ingress, which is exactly the split that breaks node sessions.
+    import hmac as _hmac
+
+    api_key = (_os.environ.get("BLASTBOX_API_KEY") or "").strip()
+    if api_key:
+        effective = _hmac.new(api_key.encode(), bytes.fromhex(current),
+                              hashlib.sha256).digest()
+        digest = hashlib.sha256(effective).hexdigest()[:12]
+        print(f"recorded, peppered with BLASTBOX_API_KEY (effective fingerprint {digest}). "
+              f"Compare this across ingress hosts -- it differs if their API keys differ, "
+              f"which is what splits node sessions. The key itself is never printed.")
+    else:
+        digest = hashlib.sha256(current.encode()).hexdigest()[:12]
+        print(f"recorded, NOT peppered -- BLASTBOX_API_KEY is unset here (fingerprint "
+              f"{digest}). A host that HAS an API key resolves a different effective key, so "
+              f"compare this only against other unkeyed hosts. The key itself is never printed.")
     return 0
 
 
