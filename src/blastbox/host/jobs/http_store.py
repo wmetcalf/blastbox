@@ -414,12 +414,46 @@ class HttpJobStore:
             "a node may not delete jobs. Retention runs where the database is")
 
     def list(self, *args, **kw):
+        """Refused -- a node may not enumerate the queue.
+
+        WHAT THIS BREAKS, SAID OUT LOUD, because three consumers call it and each fails
+        differently:
+
+        * `requeue_orphaned_jobs` / `_fail_stale_queued_jobs` -- the reclaim sweep. Moved to the
+          control plane (`ingress.node_reclaim`), which is where the queue lives. Nothing to do
+          here.
+        * `JobRetentionSweeper.expire_due` -- retention. This one is NOT a capability a node
+          should be denied: it deletes the node's OWN artifact trees and blob objects, and the
+          node is the only process holding those bytes. It is denied anyway, because expiring
+          needs to FIND candidates, and a node scanning the fleet's queue is the thing this
+          store exists to prevent. Until a scoped route exists, retention must run where the
+          database is -- and `raise` is how an operator finds that out instead of watching
+          detonation output accumulate under a policy that is quietly a no-op.
+        * the node sizer's backlog -- see :meth:`count`.
+        """
         raise NodeStoreUnsupported(
-            "a node may not enumerate the queue; it claims what it is granted")
+            "a node may not enumerate the queue; it claims what it is granted. Retention and "
+            "the reclaim sweep must run where the database is (the control plane runs the "
+            "stale-claim sweep; see BLASTBOX_NODE_CLAIM_RECLAIM_AFTER_S)")
 
     def count(self, *args, **kw):
+        """Refused -- and the caller that matters SWALLOWS it, which is worse than the refusal.
+
+        `DispatcherSizer._count` catches any store error and substitutes `_last_backlog`, with no
+        log line. That starts at 0 and can never advance, so a permanent refusal here is
+        indistinguishable from an empty queue: the warm pool sits at its floor and the cold gate
+        at its floor no matter how deep the queue is, silently. That is the exact "looks healthy
+        while doing nothing" failure the raise was supposed to prevent, inverted by a bare
+        `except`.
+
+        So this raise is necessary but NOT sufficient, and saying so here is the honest state:
+        a node with resource management on needs a scoped backlog route before its sizer means
+        anything. Until then the node under-serves rather than over-serves, which is the safe
+        direction of being wrong.
+        """
         raise NodeStoreUnsupported(
-            "a node may not enumerate the queue; it claims what it is granted")
+            "a node may not enumerate the queue; it claims what it is granted. A node sizer "
+            "needs a scoped backlog route, which does not exist yet -- see this method")
 
 
 def _node_id_from_cert(cert_pem: bytes) -> str:

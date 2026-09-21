@@ -96,6 +96,18 @@ def _serve_tls(args: argparse.Namespace) -> dict:
         # rather than refusing to start a deployment that never opted in.
         _log.info("serve: no PKI, serving plaintext as before")
         return {}
+    # A CERTIFICATE ALREADY ISSUED ELSEWHERE WINS BEFORE WE ASK FOR THE CA KEY. The HARDENED
+    # ingress holds ca.crt and NOT ca.key -- which is exactly what DEPLOYMENT.md tells operators
+    # to copy -- so demanding the signing key here made `serve` refuse to start on the very host
+    # that is most careful, and the error message offered `--no-tls` as the way out. That turned
+    # the hardened deployment into the plaintext one, where a session header is a sniffable
+    # ten-minute bearer credential. So: issue on the CA host, drop the pair in beside the anchor,
+    # and this picks it up with no CA key present and no flags.
+    existing_crt, existing_key = pki_dir / "ingress-server.crt", pki_dir / "ingress-server.key"
+    if existing_crt.exists() and existing_key.exists():
+        _log.info("serve: TLS on, using the server certificate already in %s", pki_dir)
+        return {"ssl_certfile": str(existing_crt), "ssl_keyfile": str(existing_key)}
+
     from blastbox.host.pki import load_ca
 
     try:
@@ -103,8 +115,10 @@ def _serve_tls(args: argparse.Namespace) -> dict:
     except Exception as exc:            # noqa: BLE001 - verify-only host, no CA key here
         raise SystemExit(
             f"serve: {pki_dir} has a trust anchor but no usable CA key ({exc}), so a server "
-            "certificate cannot be issued here. Pass --tls-cert/--tls-key with a certificate "
-            "issued elsewhere, or --no-tls if this listener sits behind a TLS proxy.") from None
+            f"certificate cannot be issued here. Either issue one on the CA host and copy it to "
+            f"{existing_crt} and {existing_key} (this is the hardened arrangement -- the signing "
+            f"key never reaches an internet-facing host), or pass --tls-cert/--tls-key, or "
+            "--no-tls if this listener sits behind a TLS-terminating proxy.") from None
     issued = ca.issue_server([args.host, "localhost", "127.0.0.1"], cn="blastbox-ingress")
     crt, key_path = issued.write(pki_dir, "ingress-server")
     _log.info("serve: TLS on, certificate auto-issued from the local CA (%s)", crt)
