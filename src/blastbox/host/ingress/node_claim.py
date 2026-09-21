@@ -133,8 +133,19 @@ _MAX_CLAIM_PROBES = 8
 _REFUSAL_MEMO_S = 30.0
 _MAX_REFUSAL_MEMO = 4096
 
-#: (node_id, job_id) -> when it was refused. Per-process and best-effort; see _remember_refusal.
-_refusals: "dict[tuple[str, str], float]" = {}
+#: The furthest into the future a node may defer a job. `claimable_after` exists for short
+#: capacity deferrals, and `claim_next` SKIPS a job until it passes -- so an unbounded value let
+#: an authenticated node write {status: queued, claimable_after: 4102444800} and remove any job
+#: it was granted from every node's view PERMANENTLY. Nothing recovered it: the requeue sweep
+#: only looks at RUNNING, retention only at terminal states, and _fail_stale_queued_jobs is
+#: opt-in and runs where the database is. Quieter than writing FAILED to achieve the same denial
+#: honestly, which is what made it worth closing.
+MAX_DEFERRAL_S = 3600.0
+
+# The refusal memo lives in `register_node_claim_routes`'s closure, one per app -- NOT at module
+# scope. Module scope leaked between tests (a refusal remembered by one suite silently skipped a
+# job in another), and it would equally leak between two apps in one process, which is a shape
+# this codebase supports for embedders.
 
 #: What a refused caller is told. ONE message for every cause -- a wrong CA, an unheld key,
 #: an ungranted engine and an expired challenge are all simply "no". Distinguishing them
@@ -170,7 +181,8 @@ class ClaimRequest(BaseModel):
     engine: str | None = Field(None, max_length=64)
     claimant_tier: str | None = Field(
         None, max_length=64,
-        description="routing hint: claim only jobs whose target_tier matches (NOT a grant)")
+        description="NOT ACCEPTED over this path -- see the claim route. Present so a client "
+                    "sending it gets a reason rather than silence.")
 
 
 class UpdateRequest(BaseModel):
@@ -258,6 +270,9 @@ def register_node_claim_routes(
             "scope": node_auth.SCOPE_CLAIM_NEXT,
         }
 
+    #: (node_id, job_id) -> when it was refused. Per-app and best-effort; see _remember_refusal.
+    _refusals: "dict[tuple[str, str], float]" = {}
+
     def _secret() -> bytes:
         return node_auth.challenge_secret(resolved)
 
@@ -267,13 +282,18 @@ def register_node_claim_routes(
         The token names the node and nothing more; what it MAY DO is resolved below from
         this server's own certificate store, per request. See `node_auth.issue_session`.
         """
+        # 401, NOT 403, and the difference is a traffic control. 403 means "you may not have
+        # this"; 401 means "your session is no good, get another". The client re-handshakes only
+        # on 401, so a node that is simply not granted something stops paying a full
+        # challenge+session handshake on every refused request -- measured at 22 requests where
+        # 5 were correct, i.e. the amplification the retry was supposed to prevent.
         if not token or not token.strip():
-            raise HTTPException(status_code=403, detail=_REFUSED)
+            raise HTTPException(status_code=401, detail="node session required")
         try:
             return node_auth.verify_session(token.strip(), secret=_secret())
         except node_auth.ClaimRefused as exc:
-            _log.warning("node_claim: session refused: %s", exc)
-            raise HTTPException(status_code=403, detail=_REFUSED) from None
+            _log.warning("node_claim: session rejected: %s", exc)
+            raise HTTPException(status_code=401, detail="node session required") from None
 
     def _grants_now(node_id: str):
         """What this node may do, read fresh from the certificates on THIS host.
@@ -341,6 +361,31 @@ def register_node_claim_routes(
         from blastbox.host.placement import refusal
 
         node_id = _node_from_token(x_blastbox_node_session)
+        if req.claimant_tier:
+            # REFUSED, not ignored, and not honoured.
+            #
+            # `claim_next(claimant_tier=...)` decides which target_tier-PINNED jobs a caller may
+            # take, and pinning is an operator containment control -- dispatch pins work so "a
+            # BLASTBOX_POOL_RUNTIME drift can't silently route it onto a public-AWS/remote worker
+            # with a different egress posture". Taken from the request it was exactly the defect
+            # ClaimRequest's docstring says it fixed by deleting `tier`: a caller selecting its
+            # own authorisation predicate. Measured: a node running a plain cold pool asked for
+            # claimant_tier="firecracker" and received the hardware-isolated job.
+            #
+            # It cannot be authorised here either, because a node's RUNTIME tier is not in its
+            # certificate -- `NodeGrants` carries engines, netpolicy tiers and credentials, and
+            # none of those is "this node runs firecracker". So it is refused with a reason
+            # instead of silently dropped, which would leave a node believing it was routing.
+            # Binding runtime tier to identity needs a NodeGrants field and an issuance change;
+            # until then pinned work stays with dispatchers that hold the queue.
+            _log.warning("node_claim: refused node=%s claimant_tier=%r: a node cannot assert "
+                         "its own runtime tier", node_id, req.claimant_tier)
+            raise HTTPException(
+                status_code=400,
+                detail="claimant_tier is not accepted over the node claim path: a node's "
+                       "runtime tier is not carried in its certificate, so it cannot be "
+                       "authorised. Jobs pinned with target_tier stay with dispatchers that "
+                       "hold the queue.")
         grants = _grants_now(node_id)
         if grants is None:
             _log.warning("node_claim: refused node=%s: no verifiable certificate", node_id)
@@ -365,8 +410,7 @@ def register_node_claim_routes(
         job = None
         try:
             for _ in range(_MAX_CLAIM_PROBES):
-                candidate = job_store.claim_next(claimant_tier=req.claimant_tier,
-                                                 engine=frozenset(allowed))
+                candidate = job_store.claim_next(engine=frozenset(allowed))
                 if candidate is None:
                     break
                 if _recently_refused(node_id, candidate.job_id):
@@ -586,6 +630,19 @@ def register_node_claim_routes(
             raise HTTPException(
                 status_code=400,
                 detail="claim_id may only be cleared, not set")
+        if out.get("claimable_after") is not None:
+            try:
+                deferred = float(out["claimable_after"])
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400,
+                                    detail="claimable_after must be a timestamp") from None
+            ceiling = time.time() + MAX_DEFERRAL_S
+            if deferred > ceiling:
+                # Clamped, not refused: a legitimate deferral near the boundary should still
+                # work, and the only thing worth preventing is a job vanishing for a decade.
+                _log.warning("node_claim: clamped claimable_after from %.0f to %.0f",
+                             deferred, ceiling)
+                out["claimable_after"] = ceiling
         for name in _ENUM_FIELDS:
             if isinstance(out.get(name), str):
                 try:

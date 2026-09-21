@@ -235,17 +235,19 @@ class HttpJobStore:
             return {SESSION_HEADER: self._token or ""}
 
     def _call(self, method: str, path: str, **kw) -> Response:
-        """One retry on 403, and exactly one.
+        """One retry, and only when the SESSION is the problem.
 
-        A 403 is ambiguous: an expired session, or grants that no longer allow this. Retry
-        once with a fresh session to cover the first; do NOT loop, because the second case
-        is a permanent refusal and retrying it would turn a revoked certificate into a hot
-        loop against the control plane.
+        RETRY ON 401, NOT 403. The first version retried on 403, which conflates "your session
+        is no good" with "you may not have this" -- so a node that was simply not granted
+        something discarded a valid session and paid a full challenge+session handshake on
+        EVERY refused request. Measured at 22 requests where 5 were correct: the amplification
+        the retry was written to prevent. The control plane now answers 401 for a session
+        problem and 403 for an authorisation one, so this retries exactly the recoverable case.
         """
         headers = dict(kw.pop("headers", {}) or {})
         headers.update(self._auth())
         status, body = self._transport(method, path, headers=headers, **kw)
-        if status != 403:
+        if status != 401:
             return status, body
         with self._lock:
             self._token = None
@@ -270,10 +272,16 @@ class HttpJobStore:
             if name is not None:
                 body_out["engine"] = name
             if claimant_tier:
-                # claimant_tier is TARGET-TIER ROUTING (claim only jobs aimed at this
-                # dispatcher), not a netpolicy grant. Conflating the two sent a routing hint
-                # into the authorisation predicate and lost the routing entirely.
-                body_out["claimant_tier"] = claimant_tier
+                # NOT SENT. The control plane refuses it, because a node's runtime tier is not
+                # in its certificate and so cannot be authorised -- and a node asserting its own
+                # tier was able to take hardware-isolated work it does not run. Raise here rather
+                # than drop it silently: a dispatcher that believes it is routing by tier and is
+                # not would claim work meant for another pool.
+                raise NodeStoreUnsupported(
+                    f"claimant_tier={claimant_tier!r} cannot be used over a control-plane "
+                    "store: a node's runtime tier is not carried in its certificate, so the "
+                    "control plane cannot authorise it. Jobs pinned with target_tier stay with "
+                    "dispatchers that hold the queue.")
             status, body = self._call("POST", "/v1/nodes/claim", json=body_out)
             if status == 204:
                 continue                # entitled, nothing queued for this engine

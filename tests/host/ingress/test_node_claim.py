@@ -360,10 +360,13 @@ class TestTheSessionTokenIsNotACapability:
     "stop renewing the certificate"."""
 
     def test_no_token_is_refused(self, store, pki_dir):
+        """401, not 403: "your session is no good" is recoverable by re-handshaking, whereas
+        403 means "you may not have this" and must NOT provoke one. Conflating them made a
+        refused node pay a full handshake on every request."""
         c = client(store, pki_dir)
         queued(store)
         r = c.post("/v1/nodes/claim", json={"engine": "clamav"})
-        assert r.status_code == 403
+        assert r.status_code == 401
         assert store.get("job-1").status == JobStatus.QUEUED
 
     def test_a_token_from_another_deployment_is_refused(self, store, pki_dir):
@@ -371,7 +374,7 @@ class TestTheSessionTokenIsNotACapability:
         queued(store)
         forged = node_auth.issue_session("alpha", secret=b"another server's secret key!!!")
         r = _claim(c, pki_dir, "alpha", engine="clamav", token=forged)
-        assert r.status_code == 403
+        assert r.status_code == 401
         assert store.get("job-1").status == JobStatus.QUEUED
 
     def test_a_token_naming_a_node_it_did_not_authenticate_is_refused(self, store, pki_dir):
@@ -381,7 +384,7 @@ class TestTheSessionTokenIsNotACapability:
         alpha_token = token_for(c, pki_dir, "alpha")
         _name, _, rest = alpha_token.partition(":")
         r = _claim(c, pki_dir, "beta", engine="boxjs", token="beta:" + rest)
-        assert r.status_code == 403
+        assert r.status_code == 401
         assert store.get("job-1").status == JobStatus.QUEUED
 
     def test_an_expired_token_is_refused(self, store, pki_dir):
@@ -391,7 +394,7 @@ class TestTheSessionTokenIsNotACapability:
             "alpha", secret=node_auth.challenge_secret(pki_dir),
             now=time.time() - node_auth.SESSION_TTL_S - 5)
         assert _claim(c, pki_dir, "alpha", engine="clamav",
-                      token=stale).status_code == 403
+                      token=stale).status_code == 401
         assert store.get("job-1").status == JobStatus.QUEUED
 
     def test_revoking_the_certificate_takes_effect_WITHIN_the_session(self, store, pki_dir):
@@ -714,3 +717,43 @@ def test_a_node_is_not_starved_by_a_job_it_may_not_run(store, pki_dir, monkeypat
         "the node was starved by the older job it may not run")
     assert store.get("cannot").status == JobStatus.QUEUED
     assert store.get("cannot").claim_id is None
+
+
+def test_a_node_cannot_bury_a_job_forever(store, pki_dir):
+    """`claimable_after` is a SHORT capacity deferral, and `claim_next` skips a job until it
+    passes -- so an unbounded value let an authenticated node write
+    {status: queued, claimable_after: 4102444800} and remove any job it was granted from every
+    node's view permanently. Nothing recovered it: the requeue sweep only looks at RUNNING,
+    retention only at terminal states, and _fail_stale_queued_jobs is opt-in and runs where the
+    database is. Quieter than writing FAILED to achieve the same denial honestly."""
+    from blastbox.host.ingress.node_claim import MAX_DEFERRAL_S
+
+    c = client(store, pki_dir)
+    queued(store)
+    r = _claim(c, pki_dir, "alpha", engine="clamav")
+    job, rcpt = r.json()["job"], r.json()["receipt"]
+    tok = token_for(c, pki_dir, "alpha")
+    buried = c.post(f"/v1/nodes/jobs/{job['job_id']}", headers=auth(tok),
+                    json={"claim_id": job["claim_id"], "receipt": rcpt,
+                          "fields": {"status": "queued", "claimable_after": 4102444800}})
+    assert buried.status_code == 200, buried.text
+    back = store.get(job["job_id"])
+    assert back.claimable_after <= time.time() + MAX_DEFERRAL_S + 1, (
+        "the job was deferred beyond any recoverable window")
+    # And it comes back: the point is that the queue is not permanently poisoned.
+    store.update(job["job_id"], claimable_after=None)
+    assert store.claim_next() is not None
+
+
+def test_a_legitimate_short_deferral_still_works(store, pki_dir):
+    c = client(store, pki_dir)
+    queued(store)
+    r = _claim(c, pki_dir, "alpha", engine="clamav")
+    job, rcpt = r.json()["job"], r.json()["receipt"]
+    tok = token_for(c, pki_dir, "alpha")
+    soon = time.time() + 30
+    ok = c.post(f"/v1/nodes/jobs/{job['job_id']}", headers=auth(tok),
+                json={"claim_id": job["claim_id"], "receipt": rcpt,
+                      "fields": {"status": "queued", "claimable_after": soon}})
+    assert ok.status_code == 200, ok.text
+    assert abs(store.get(job["job_id"]).claimable_after - soon) < 1

@@ -51,6 +51,18 @@ def build_job_store_from_env(env: dict[str, str] | None = None) -> JobStore:
         # set alongside a DSN, and then which one wins is a question with no good answer.
         from blastbox.host.jobs.http_store import HttpJobStore
 
+        # A SERVING process must not build one of these. `serve` owns the queue; pointing it at
+        # a control plane makes it a claim PROXY nobody designed -- and it boots "healthy"
+        # (/v1/healthz is 200, so a load balancer takes it into rotation) and then 500s on
+        # /v1/jobs, because create/list/count raise. The docs say a mis-deployed process "fails
+        # loudly instead of looking healthy"; deferring that to request time is not loudly.
+        if (e.get("BLASTBOX_ROLE", "") or "").strip().lower() in ("serve", "ingress", "api"):
+            raise ValueError(
+                "BLASTBOX_DATABASE_URL is a control-plane URL, but BLASTBOX_ROLE says this "
+                "process SERVES the queue. A serving process needs the database itself; only a "
+                "node claims through the control plane. Set a DSN here, or unset BLASTBOX_ROLE "
+                "if this really is a node.")
+
         # Pass the identity from THIS env mapping rather than letting the store read
         # os.environ: `env=` exists so a caller can inject configuration, and a store that
         # ignored it would be configured from the ambient process in tests and in any

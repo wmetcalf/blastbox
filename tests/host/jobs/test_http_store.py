@@ -237,9 +237,14 @@ class TestSessionHandling:
         queued(backing, job_id="job-2")
         assert s.claim_next(engine="clamav") is not None
 
-    def test_a_permanent_refusal_does_not_loop(self, control_plane, fleet, backing):
-        """403 is ambiguous -- expired session, or revoked grants. Retry ONCE for the first;
-        looping on the second would turn a revoked certificate into a hot loop."""
+    def test_a_refused_node_does_not_re_handshake(self, control_plane, fleet, backing):
+        """COUNTS THE HANDSHAKES, which is what the earlier version of this test did not.
+
+        It asserted only that /claim was attempted twice, so it passed while the retry discarded
+        a valid session and re-handshaked on EVERY refused request -- measured at 22 requests
+        where 5 were correct, i.e. the amplification the retry was written to prevent. The
+        control plane now answers 401 for a session problem and 403 for an authorisation one, so
+        a refused node keeps its session and simply asks again next poll."""
         attempts = []
 
         def counting(method, path, *, json=None, params=None, headers=None):
@@ -251,9 +256,13 @@ class TestSessionHandling:
         queued(backing, engine="clamav")
         s = HttpJobStore("http://cp", cert_path=fleet / "node-beta.crt",
                          transport=counting)
-        assert s.claim_next(engine="clamav") is None
-        assert attempts.count("/v1/nodes/claim") == 2, (
-            f"expected exactly one retry, got {attempts.count('/v1/nodes/claim')}")
+        for _ in range(5):
+            assert s.claim_next(engine="clamav") is None
+        handshakes = attempts.count("/v1/nodes/session")
+        assert handshakes == 1, (
+            f"a refused node re-handshaked {handshakes} times across 5 polls; a 403 must not "
+            "discard a valid session")
+        assert attempts.count("/v1/nodes/claim") == 5, attempts
 
 
 def test_claiming_without_naming_an_engine_asks_for_whatever_is_granted(control_plane,

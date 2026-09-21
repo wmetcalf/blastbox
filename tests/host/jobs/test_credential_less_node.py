@@ -114,7 +114,7 @@ def test_a_cleared_node_is_not_impeded(deployment):
     backing.create(Job(job_id="ok", engine="clamav", filename="s.bin",
                        status=JobStatus.QUEUED, created_at=time.time()))
     cleared = as_node("cleared")
-    job = cleared.claim_next(engine="clamav", claimant_tier="socks")
+    job = cleared.claim_next(engine="clamav")
     assert job is not None and job.job_id == "ok"
     assert cleared.update_if_status(job.job_id, JobStatus.RUNNING,
                                     expect_claim_id=job.claim_id,
@@ -139,3 +139,60 @@ def test_one_node_cannot_interfere_with_anothers_running_job(deployment):
                                            "fields": {"error": "sabotaged"}})
     assert status == 403
     assert backing.get("ok").error is None
+
+
+def test_a_federated_node_counts_as_a_shared_queue(deployment):
+    """The 17,626-job protection must not be disarmed by the topology it most applies to.
+
+    `is_shared_job_store` gates `check_store_coherence` AND the operator's explicit
+    BLASTBOX_REQUIRE_SHARED_BLOB_STORE. It enumerated Redis and Postgres and answered False for
+    anything else -- so a federated node, whose queue is on ANOTHER HOST by construction, was
+    classified single-process and booted clean with a LocalBlobStore. That configuration is the
+    incident: results written to a host-local directory, every artifact 404ing on the ingress.
+    """
+    import pytest as _pytest
+
+    from blastbox.host.blobs.local import LocalBlobStore
+    from blastbox.host.canary import check_store_coherence, is_shared_job_store
+
+    d, _backing, as_node = deployment
+    store = as_node("cleared")
+    assert is_shared_job_store(store) is True
+
+    local = d.parent / "blobs"
+    local.mkdir(exist_ok=True)
+    with _pytest.raises(Exception) as e:
+        check_store_coherence(store, LocalBlobStore(local), local, require_shared=True)
+    assert "shared" in str(e.value).lower() or "local" in str(e.value).lower(), e.value
+
+
+def test_a_node_cannot_assert_its_own_runtime_tier(deployment):
+    """`claim_next(claimant_tier=...)` decides which target_tier-PINNED jobs a caller may take,
+    and pinning is an operator containment control — dispatch pins work so a pool-runtime drift
+    cannot route it onto a worker with a different egress posture. Taken from the request it was
+    the very defect `ClaimRequest` says it fixed by deleting `tier`: a caller choosing its own
+    authorisation predicate. Measured: a node running a plain cold pool asked for
+    claimant_tier="firecracker" and received the hardware-isolated job.
+
+    It cannot be authorised either, because a node's RUNTIME tier is not in its certificate —
+    `NodeGrants` carries engines, netpolicy tiers and credentials, and none of them says "this
+    node runs firecracker". So it is refused with a reason rather than dropped silently, which
+    would leave a dispatcher believing it was routing when it was not."""
+    _d, backing, as_node = deployment
+    backing.create(Job(job_id="pinned", engine="clamav", filename="s.bin",
+                       status=JobStatus.QUEUED, created_at=time.time(),
+                       target_tier="firecracker"))
+    node = as_node("cleared")
+    with pytest.raises(NodeStoreUnsupported, match="runtime tier"):
+        node.claim_next(engine="clamav", claimant_tier="firecracker")
+    assert backing.get("pinned").status == JobStatus.QUEUED
+
+
+def test_a_pinned_job_is_not_handed_to_a_node_that_asks_plainly_either(deployment):
+    """Without an asserted tier, `claim_next` skips target_tier-pinned jobs on its own."""
+    _d, backing, as_node = deployment
+    backing.create(Job(job_id="pinned", engine="clamav", filename="s.bin",
+                       status=JobStatus.QUEUED, created_at=time.time(),
+                       target_tier="firecracker"))
+    assert as_node("cleared").claim_next(engine="clamav") is None
+    assert backing.get("pinned").status == JobStatus.QUEUED
