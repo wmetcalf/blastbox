@@ -141,9 +141,17 @@ _MAX_CLAIM_PROBES = 8
 #: IS granted, for as long as they existed: the probe cap, which is only a cost cap, became the
 #: mechanism. The memo lets the walk step over that wall without re-paying to judge it.
 #:
-#: SHORT, because a certificate can be renewed with MORE grants while a job sits there; one
-#: minute bounds how long a newly-entitled node keeps stepping over work it can now run.
-_REFUSAL_MEMO_TTL_S = 60.0
+#: KEYED BY THE NODE'S GRANTS, SO THE TTL NEED NOT BE SHORT. It was 60 s, for one reason: a
+#: certificate can be re-issued with MORE grants while a job sits there, and the node should not
+#: keep stepping over work it can now run. But a short TTL raced the walk itself -- a poll judges
+#: at most eight fresh jobs and a dispatcher polls about once a second, so refusals from the head
+#: of a wall deeper than ~480 expired before the walk got past it, `claim_next` offered the
+#: oldest refused job again, and the node never crossed (measured on a simulated clock: 400 deep
+#: crossed in 51 polls, 700 never). The memo is now keyed by (node, grants fingerprint): a
+#: re-issued certificate changes the key and every refusal is re-judged on the very next poll,
+#: which is the newly-entitled case handled EXACTLY rather than approximately. The TTL is then
+#: only a backstop and can be long. What still bounds a wall is the memo's size, not the clock.
+_REFUSAL_MEMO_TTL_S = 3600.0
 #: How many already-judged jobs one walk will step over. SMALL, because stepping over one is
 #: not free: `claim_next` is the only way to see a job, so each skip costs a claim, the prefix
 #: stamp (which must happen before anything can go wrong -- see the stamp comment in the walk)
@@ -228,6 +236,19 @@ MAX_FUTURE_SKEW_S = 300.0
 #: honestly, which is what made it worth closing.
 MAX_DEFERRAL_S = 3600.0
 
+def _grants_fingerprint(grants) -> str:
+    """A stable key for WHAT a node is granted, so a refusal is remembered per grant set.
+
+    A refusal is a function of (the node's grants, the job's policy). Keying the memo by node
+    alone meant a certificate re-issued with the grant it lacked was still refused from memory
+    until the entry expired; keyed by this, the new certificate simply has no memory yet.
+    """
+    engines = ",".join(sorted(getattr(grants, "engines", ()) or ()))
+    tiers = ",".join(sorted(getattr(grants, "tiers", ()) or ()))
+    creds = "1" if getattr(grants, "credentials", False) else "0"
+    return f"e={engines};t={tiers};c={creds}"
+
+
 class _RefusalMemo:
     """Which (node, job) pairs this control plane has already judged, and for how long.
 
@@ -266,10 +287,18 @@ class _RefusalMemo:
         if limit is None:
             limit = self._limit
         now = time.time()
+        fresh = now + self._ttl_s
         out: list[str] = []
         for (nid, jid), until in list(self._until.items()):
             if nid == node_id and until > now:
                 out.append(jid)
+                # REFRESHED ON USE. An entry the walk is actively excluding is by definition
+                # still standing between this node and newer work; letting it lapse on a clock
+                # made the walk re-judge the head of the wall before it had crossed the tail, so
+                # any wall deeper than (judgements per poll x polls per TTL) was never crossed.
+                # While the node keeps polling with the same grants, its refusals stay live;
+                # a changed certificate changes the key (see _grants_fingerprint) instead.
+                self._until[(nid, jid)] = fresh
                 if len(out) >= limit:
                     break
         return frozenset(out)
@@ -667,6 +696,8 @@ def register_node_claim_routes(
         job = None
         probes = 0
         skips = 0
+        # The refusal memo is per (node, GRANTS): see _REFUSAL_MEMO_TTL_S.
+        memo_key = f"{node_id}#{_grants_fingerprint(grants)}"
         try:
             while probes < _MAX_CLAIM_PROBES and skips < _MAX_CLAIM_SKIPS:
                 # EXCLUDE WHAT THIS NODE HAS ALREADY BEEN REFUSED, in the store query itself.
@@ -677,7 +708,7 @@ def register_node_claim_routes(
                 # privilege. With the exclusion the store simply does not offer them: nothing
                 # to release, nothing to re-stamp, and nothing in the way.
                 candidate = job_store.claim_next(
-                    engine=frozenset(allowed), exclude=_refusals.remembered_for(node_id))
+                    engine=frozenset(allowed), exclude=_refusals.remembered_for(memo_key))
                 if candidate is None:
                     break
                 # STAMP THE PREFIX FIRST, before judging and before the memo check. The prefix
@@ -705,7 +736,7 @@ def register_node_claim_routes(
                     # not a cost cap.
                     probes += 1
                     continue            # taken from under us; not ours to release either
-                if _refusals.remembers(node_id, candidate.job_id):
+                if _refusals.remembers(memo_key, candidate.job_id):
                     # Judged already, and recently. Stepping over it costs a claim and a release
                     # but NOT one of the eight probes -- see _REFUSAL_MEMO_TTL_S: charging the
                     # probe budget for a wall of permanently-refused jobs meant the node never
@@ -728,7 +759,7 @@ def register_node_claim_routes(
                     job = candidate     # already stamped and re-read above
                     break
                 skipped.append(candidate)
-                _refusals.remember(node_id, candidate.job_id)
+                _refusals.remember(memo_key, candidate.job_id)
                 _log.warning("node_claim: released job=%s from node=%s: %s",
                              candidate.job_id, node_id, why)
         finally:

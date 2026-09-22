@@ -112,3 +112,64 @@ def test_when_every_url_fails_it_says_so_and_continues(tmp_path):
 @pytest.mark.parametrize("script", ["scripts/install-firecracker.sh", "scripts/lib/fc-kernel.sh"])
 def test_the_scripts_parse(script):
     assert subprocess.run(["bash", "-n", str(REPO / script)]).returncode == 0
+
+
+def test_a_missing_override_is_refused_not_fetched_into(tmp_path):
+    """BLASTBOX_FC_KERNEL pointing at nothing must stop, not fall through to fetching a kernel into
+    the operator's path or warning and carrying on."""
+    r = _run(tmp_path, override=str(tmp_path / "does-not-exist"), fetch_ok=True)
+    assert r.returncode == 1
+    assert "does not exist" in r.stdout
+    assert not (tmp_path / "does-not-exist").exists()
+
+
+@pytest.mark.parametrize("version,ok", [("4.19.0", False), ("5.17.0", False), ("5.18.0", True),
+                                        ("6.1.128", True)])
+def test_the_version_threshold_is_exactly_5_18(tmp_path, version, ok):
+    """Both edges: a 4.x kernel must not slip through (the major check), and a genuine 5.18 must
+    not be refused and moved aside (the minor check)."""
+    _kernel(tmp_path / "vmlinux", version)
+    r = _run(tmp_path)
+    assert (r.returncode == 0) is ok, f"{version}: rc={r.returncode} {r.stdout}"
+
+
+def test_the_real_installer_runs_the_kernel_step(tmp_path):
+    """End to end through install-firecracker.sh itself, hermetically: a stubbed curl serves the
+    release lookup, a fake firecracker tarball and a 6.1 kernel. Sourcing the lib directly cannot
+    notice the installer dropping its `fc_kernel_setup` call or sourcing the wrong path -- this can."""
+    import tarfile
+
+    home = tmp_path / "home"
+    fc_home = tmp_path / "fc"
+    stub = tmp_path / "stub"
+    for d in (home, fc_home, stub):
+        d.mkdir()
+    ver, arch = "v9.9.9", os.uname().machine
+    fake_fc = tmp_path / f"firecracker-{ver}-{arch}"
+    fake_fc.write_text("#!/usr/bin/env bash\necho 'Firecracker v9.9.9'\n")
+    fake_fc.chmod(0o755)
+    tgz = tmp_path / "fc.tgz"
+    with tarfile.open(tgz, "w:gz") as t:
+        t.add(fake_fc, arcname=f"release-{ver}-{arch}/firecracker-{ver}-{arch}")
+    kernel = _kernel(tmp_path / "k61", "6.1.128")
+    (stub / "curl").write_text(f'''#!/usr/bin/env bash
+out=""; url=""
+while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift;; http*) url="$1";; esac; shift; done
+case "$url" in
+  *api.github.com*) echo '{{"tag_name": "{ver}"}}' ;;
+  *releases/download*) cp "{tgz}" "$out" ;;
+  *) cp "{kernel}" "$out" ;;
+esac
+''')
+    (stub / "curl").chmod(0o755)
+    env = {**os.environ, "HOME": str(home), "BLASTBOX_FC_HOME": str(fc_home),
+           "PATH": f"{stub}:{os.environ['PATH']}"}
+    env.pop("BLASTBOX_FC_KERNEL", None)
+    r = subprocess.run(["bash", str(REPO / "scripts" / "install-firecracker.sh")],
+                       capture_output=True, text=True, env=env, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "guest kernel: Linux 6.1" in r.stdout, (
+        "the installer never reached its kernel step (was fc_kernel_setup dropped, or the lib "
+        f"sourced from the wrong place?): {r.stdout}")
+    assert (fc_home / "vmlinux").exists()
+    assert "Next:" in r.stdout

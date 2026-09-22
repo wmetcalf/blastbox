@@ -227,12 +227,13 @@ class TestTheRefusalMemoForgets:
         memo.remember("n", "j")
         assert memo.remembers("n", "j") is True
 
-    def test_the_ttl_is_short_enough_to_pick_up_a_new_grant(self):
-        """A literal, not the constant under test: the whole point of the value is that an
-        operator issuing a grant does not have to restart ingress to see it used."""
-        assert nc._REFUSAL_MEMO_TTL_S <= 300.0, (
-            f"the refusal memo remembers for {nc._REFUSAL_MEMO_TTL_S}s; a newly-entitled node "
-            "keeps refusing work it can now run for that long")
+    def test_the_ttl_is_a_backstop_not_the_grant_mechanism(self):
+        """It used to have to be short (<= 300 s) so a newly-granted node re-judged promptly. That
+        is now handled by keying the memo on the node's grants (see test_node_claim_round7), and a
+        short TTL was itself a defect: refusals expired before a deep wall was crossed. So the
+        TTL must be long enough to outlast walking a wall the size of the memo at eight judgements
+        per one-second poll."""
+        assert nc._REFUSAL_MEMO_TTL_S >= 8192 / 8, nc._REFUSAL_MEMO_TTL_S
 
     def test_the_memo_is_bounded(self):
         memo = nc._RefusalMemo(ttl_s=3600.0, limit=64)

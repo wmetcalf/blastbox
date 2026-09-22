@@ -271,3 +271,27 @@ def test_a_rotated_out_leaf_inside_the_renewal_window_still_refuses(tmp_path, mo
                               no_tls=False)
     with pytest.raises(SystemExit, match="rotated"):
         cli._serve_tls(args)
+
+
+def test_an_unreadable_leaf_is_not_blamed_on_a_ca_rotation(tmp_path, monkeypatch):
+    """Refusing to serve an unreadable leaf is right, but the message said 'the anchor was rotated'
+    -- and for a truncated file or a permissions problem, re-issuing on the CA host (the remedy it
+    gave) is the wrong fix."""
+    import argparse
+
+    import pytest
+
+    from blastbox.host import cli, pki
+
+    d = tmp_path / "pki"
+    pki.ensure_ca(d).issue_server(["127.0.0.1"], cn="blastbox-ingress").write(d, "ingress-server")
+    (d / "ca.key").unlink()
+    (d / "ingress-server.crt").write_text("not a certificate")
+    monkeypatch.setenv("BLASTBOX_PKI_DIR", str(d))
+    args = argparse.Namespace(host="127.0.0.1", port=8443, tls_cert=None, tls_key=None,
+                              no_tls=False)
+    with pytest.raises(SystemExit) as exc:
+        cli._serve_tls(args)
+    msg = str(exc.value)
+    assert "rotated" not in msg, f"an unreadable leaf was blamed on a CA rotation: {msg}"
+    assert "cannot be read" in msg

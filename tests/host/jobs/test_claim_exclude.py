@@ -86,9 +86,45 @@ def test_excluding_everything_is_simply_no_work(store):
 
 
 def test_a_large_exclusion_binds(store):
-    """The whole refusal memo can be passed (8192 ids). On postgres and modern sqlite that is
-    well inside the bound-parameter limit; the query must still return the one job not excluded."""
+    """The whole refusal memo can be passed (8192 ids), and on postgres and modern sqlite NONE of it
+    may be dropped. DETERMINISTIC: the noise ids start with '!', which sorts before every hex digit,
+    so the one real id sorts LAST -- exactly where any truncation cuts. The first version used
+    random uuid tags against 'absent-' noise and caught a truncation regression about one run in
+    three; a rerun turned the red build green."""
+    import sqlite3
+
+    from blastbox.host.jobs.sql_store import SqlJobStore
+
+    if isinstance(store, SqlJobStore) and store._driver == "sqlite" \
+            and sqlite3.sqlite_version_info < (3, 32, 0):
+        pytest.skip("old SQLite truncates the exclusion by design; see test_old_sqlite_*")
     engine, ids = _seed(store, 2)
-    noise = {f"absent-{i}" for i in range(8192)}
+    noise = {f"!noise-{i:05d}" for i in range(8192)}
     job = store.claim_next(engine=engine, exclude=noise | {ids[0]})
-    assert job is not None and job.job_id == ids[1]
+    assert job is not None and job.job_id == ids[1], (
+        "an excluded job was offered: the exclusion was truncated on a store that can bind it all")
+
+
+def test_old_sqlite_truncates_rather_than_failing_the_claim(tmp_path, monkeypatch):
+    """SQLite before 3.32 accepts 999 bound parameters. The store trims the exclusion to fit, so a
+    node with ~1000 remembered refusals gets a claim rather than a 500. This branch cannot run on a
+    modern SQLite, so the old limit is imposed on every connection and the version is pinned."""
+    import sqlite3
+
+    from blastbox.host.jobs.sql_store import SqlJobStore
+
+    real_connect = sqlite3.connect
+
+    def old_sqlite_connect(*a, **k):
+        conn = real_connect(*a, **k)
+        conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", old_sqlite_connect)
+    monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 31, 1))
+    store = SqlJobStore(f"sqlite:///{tmp_path / 'old.db'}")
+    engine, ids = _seed(store, 1)
+    noise = {f"!noise-{i:05d}" for i in range(5000)}
+    job = store.claim_next(engine=engine, exclude=noise)
+    assert job is not None and job.job_id == ids[0], (
+        "on old SQLite the claim failed instead of trimming the exclusion to the driver's limit")

@@ -269,3 +269,112 @@ def test_the_override_switch_reads_the_same_on_both_routes(tmp_path, monkeypatch
                      status=JobStatus.QUEUED, created_at=time.time(), net_policy="none"))
     assert c.get("/v1/nodes/backlog", headers=h).json()["queued"] >= 1
     assert c.post("/v1/nodes/claim", json={}, headers=h).status_code == 200
+
+
+class TestTheWallIsCrossedWhateverItsDepthInTime:
+    """Round eight: the starvation had a TEMPORAL cliff as well. Refusals were remembered for 60 s,
+    a poll judges at most eight fresh jobs, and a dispatcher polls about once a second -- so the
+    earliest refusals expired before a wall deeper than ~480 was crossed, `claim_next` offered the
+    oldest refused job again, and the walk never got past the prefix. Measured on a simulated
+    clock: 400 deep crossed in 51 polls, 700 deep never crossed in 700.
+
+    The short TTL existed only so a node whose certificate GAINS a grant re-judges promptly. The
+    memo is now keyed by a fingerprint of the node's grants, which handles that case exactly, so
+    the TTL no longer has to race the walk."""
+
+    @staticmethod
+    def _clocked(monkeypatch):
+        clock = [time.time()]
+        monkeypatch.setattr(time, "time", lambda: clock[0])
+        return clock
+
+    def test_a_wall_deeper_than_one_ttl_of_polling_is_still_crossed(self, tmp_path, monkeypatch):
+        clock = self._clocked(monkeypatch)
+        c, store, h = _rig(tmp_path, monkeypatch, grants=pki.NodeGrants(
+            engines=("clamav", "boxjs"), tiers=(), credentials=False), env=WALL_ENV)
+        t0 = clock[0]
+        depth = 700
+        for i in range(depth):
+            store.create(Job(job_id=f"w{i:04d}", engine="clamav", filename="f",
+                             status=JobStatus.QUEUED, created_at=t0 - 100_000 + i))
+        store.create(Job(job_id="behind", engine="boxjs", filename="f",
+                         status=JobStatus.QUEUED, created_at=t0))
+        got = None
+        for _ in range(depth // nc._MAX_CLAIM_PROBES + 20):
+            clock[0] += 1.0                      # the dispatcher's one-second idle poll
+            r = c.post("/v1/nodes/claim", json={}, headers=h)
+            if r.status_code == 200:
+                got = r.json()["job"]["job_id"]
+                break
+        assert got == "behind", (
+            f"a {depth}-deep wall was never crossed: refusals expired before the walk got past it")
+
+    def test_a_node_that_gains_the_missing_grant_gets_the_work_at_once(self, tmp_path,
+                                                                        monkeypatch):
+        """The property the old 60 s TTL protected, now held directly: re-issue the certificate
+        WITH the grant the node lacked and the work it was refused is handed over on the next
+        poll -- no waiting out a memo."""
+        monkeypatch.delenv(node_auth.SECRET_FILE_ENV, raising=False)
+        for k, v in WALL_ENV.items():
+            monkeypatch.setenv(k, v)
+        d = tmp_path / "pki"
+        ca = pki.ensure_ca(d)
+        ca.issue_node("n", wg_pubkey=WG, grants=pki.NodeGrants(
+            engines=("clamav",), tiers=(), credentials=False)).write(d, "node-n")
+        store = InMemoryJobStore()
+        store.create(Job(job_id="gov", engine="clamav", filename="f", status=JobStatus.QUEUED,
+                         created_at=time.time() - nc.MAX_TOTAL_DEFERRAL_S - 10))
+        app = FastAPI()
+        assert register_node_claim_routes(app, job_store=store, pki_dir=d)
+        c = TestClient(app)
+
+        def session():
+            ch = c.get("/v1/nodes/challenge").json()["challenge"]
+            sig = base64.b64encode(node_auth.sign_claim(
+                (d / "node-n.key").read_bytes(), ch, node_auth.SCOPE_CLAIM_NEXT, "n")).decode()
+            return {SESSION_HEADER: c.post("/v1/nodes/session", json={
+                "cert_pem": (d / "node-n.crt").read_text(), "challenge": ch,
+                "signature": sig}).json()["token"]}
+
+        assert c.post("/v1/nodes/claim", json={}, headers=session()).status_code == 204
+        store.update("gov", claimable_after=None)
+        # The operator re-issues the certificate WITH the socks tier and credentials.
+        ca.issue_node("n", wg_pubkey=WG, grants=pki.NodeGrants(
+            engines=("clamav",), tiers=("socks",), credentials=True)).write(d, "node-n")
+        r = c.post("/v1/nodes/claim", json={}, headers=session())
+        assert r.status_code == 200 and r.json()["job"]["job_id"] == "gov", (
+            "a node re-issued WITH the grant it lacked was still refused from memory")
+
+
+def test_a_slow_poller_still_crosses_a_deep_wall(tmp_path, monkeypatch):
+    """A long TTL alone only moves the temporal cliff: a node polling every 30 s needs 4,500 s to
+    walk a 1,200-deep wall, past a 3,600 s TTL, so its earliest refusals would expire mid-walk.
+    Refreshing a refusal's deadline whenever the walk USES it takes the clock out entirely; the
+    grants fingerprint already covers the only case the TTL was for."""
+    clock = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    c, store, h = _rig(tmp_path, monkeypatch, grants=pki.NodeGrants(
+        engines=("clamav", "boxjs"), tiers=(), credentials=False), env=WALL_ENV)
+    t0 = clock[0]
+    depth = 1200
+    for i in range(depth):
+        store.create(Job(job_id=f"w{i:05d}", engine="clamav", filename="f",
+                         status=JobStatus.QUEUED, created_at=t0 - 1_000_000 + i))
+    store.create(Job(job_id="behind", engine="boxjs", filename="f", status=JobStatus.QUEUED,
+                     created_at=t0))
+    got = None
+    for n in range(depth // nc._MAX_CLAIM_PROBES + 20):
+        clock[0] += 30.0
+        if n % 15 == 14:          # sessions last 10 minutes; a real node re-handshakes
+            ch = c.get("/v1/nodes/challenge").json()["challenge"]
+            d = tmp_path / "pki"
+            sig = base64.b64encode(node_auth.sign_claim(
+                (d / "node-n.key").read_bytes(), ch, node_auth.SCOPE_CLAIM_NEXT, "n")).decode()
+            h = {SESSION_HEADER: c.post("/v1/nodes/session", json={
+                "cert_pem": (d / "node-n.crt").read_text(), "challenge": ch,
+                "signature": sig}).json()["token"]}
+        r = c.post("/v1/nodes/claim", json={}, headers=h)
+        if r.status_code == 200:
+            got = r.json()["job"]["job_id"]
+            break
+    assert got == "behind", "a slow-polling node never crossed a wall its memo should hold"

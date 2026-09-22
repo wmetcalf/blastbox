@@ -519,10 +519,22 @@ Three things an operator must know:
   pending-upload sweep: <job> has a durable result but this node cannot repair its FAILED row
   ```
 
-  Nothing is lost — the bytes reach the blob store and the local tree is retained — but the row
-  stays FAILED and the result is unfetchable until someone with queue access moves it to DONE.
-  The message repeats each tick because it stays true until acted on. A dispatcher that holds
-  the database repairs its own rows exactly as before.
+  Nothing is lost *yet* — the bytes reach the blob store and the local tree is retained — but
+  the row stays FAILED and the result is unfetchable until someone with queue access repairs it.
+  The message repeats each tick because it stays true until acted on.
+
+  **Repair it before its retention deadline, and check before you do.** With
+  `BLASTBOX_JOB_RETENTION_SECONDS` set, the ingress retention sweep expires a FAILED row at its
+  deadline like any other and **deletes its result from the blob store**. After that, setting the
+  row to DONE creates a job that reports success and 404s on every fetch. So:
+
+  1. Confirm the row is still `failed` and its `expires_at` is in the future.
+  2. Confirm the result is actually in the blob store (`results/<job_id>/`).
+  3. Only then set the row to `done`.
+
+  If it has already expired, the node's retained local tree is the only copy left: re-upload the
+  result from that tree first, then repair the row. A dispatcher that holds the database repairs
+  its own rows automatically, exactly as before — this only applies to credential-less nodes.
 
   **Node certificates go to every ingress host too.** Grants are resolved from the certificates
   in the *ingress* host's PKI directory, so a node whose certificate lives only on the exit host
