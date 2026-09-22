@@ -34,7 +34,7 @@ from typing import Any
 from blastbox.host.pool import release_kwargs
 from blastbox.contract.envelope import atomic_write_confined
 from blastbox.host.blobs.base import BlobFetchError, BlobStore, upload_output_with_retry
-from blastbox.host.jobs.base import Job, JobStatus, JobStore
+from blastbox.host.jobs.base import Job, JobStatus, JobStore, is_node_claim
 from blastbox.host.jobs.retention import (
     RESULT_RETAINED_MARKER,
     clear_pending_upload,
@@ -1066,6 +1066,14 @@ class VmJobDispatcher:
                 # running, so failing it would be a cross-tier clobber. EXCEPT when sole_owner: then
                 # there's no cold dispatcher, so also reclaim an unmarked claim that crashed before the
                 # warm stamp (it would otherwise be stuck RUNNING forever).
+                if is_node_claim(job.claim_id):
+                    # NOT OURS TO JUDGE: a federated node holds this claim through the ingress
+                    # control plane, on another host, and `reclaim_stale_claims` owns it with a
+                    # 900 s floor. `sole_owner` reclaims "an unmarked claim" precisely to catch a
+                    # crash before the warm stamp -- which is exactly the shape a node's claim
+                    # has here -- so it would FAIL a live run at `orphan_timeout_s` (600 s by
+                    # default) and the node's own result write would then lose its CAS.
+                    continue
                 if not self._sole_owner and (
                         job.worker_runtime != "warm" or job.worker_tier != self._worker_tier):
                     continue

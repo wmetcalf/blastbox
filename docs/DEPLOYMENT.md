@@ -376,6 +376,10 @@ a worker means copying two files to it and pointing one variable at them:
 ```bash
 # on the exit host
 scp /var/lib/blastbox/pki/node-toolz3.crt /var/lib/blastbox/pki/ca.crt toolz3:/var/lib/blastbox/pki/
+# ...and the KEY, if this node will claim through the control plane (#178). The local
+# grants gate only VERIFIES and needs the cert alone; signing a claim needs the key.
+# It is 0600 and must stay that way on the far side.
+scp -p /var/lib/blastbox/pki/node-toolz3.key toolz3:/var/lib/blastbox/pki/
 # on the worker, in the dispatcher's environment
 BLASTBOX_NODE_CERT=/var/lib/blastbox/pki/node-toolz3.crt
 ```
@@ -390,6 +394,139 @@ missing `ca.crt` looks like, so check `node-status` before concluding the fleet 
 Note that once the gate is armed, the paragraph below about the worker side looking fine
 no longer holds: an expired certificate stops the worker taking any job at all, not just
 its egress ones.
+
+**Enforcing grants at the hand-over, not only on the node (#178).** Everything above is
+the node checking *itself*: the gate runs on the machine it limits. It is the right control
+for a lapsed certificate or an operator mistake, and it is not a control against the node,
+because the node executes it.
+
+If the ingress host has a CA (`blastbox pki init`), ingress also serves the routes that move
+the decision to the *other* side of the hand-over. **All seven**, because a reverse proxy or
+WAF allowlist written from a short list silently breaks two of them:
+
+```
+GET  /v1/nodes/challenge             → a short-lived challenge
+POST /v1/nodes/session               → cert + signature → a session token (10 min)
+POST /v1/nodes/claim                 → the job, or 403            }
+GET  /v1/nodes/backlog               → how much granted work waits } all carry the token in
+GET  /v1/nodes/jobs/{id}             → read a job this node holds  } X-Blastbox-Node-Session
+POST /v1/nodes/jobs/{id}             → report on it                }
+GET  /v1/nodes/jobs/{id}/disposition → whose job is this?          }
+```
+
+The last two of those are not optional extras. Without `/backlog` a node's sizer has no demand
+signal at all and sits at its floors however deep the queue is; without `/disposition` the
+node's only local disk bound stops working and `job_root` grows without bound with untrusted
+samples.
+
+A node signs the challenge with the private key beside its `node-*.crt` **once per session**
+— signing every request would cost a challenge round trip and a signature per call. The
+token names the node and carries **no grants**: what it may do is re-resolved from this
+host's certificate store on every request, so removing or narrowing a certificate takes
+effect on the next call rather than at token expiry.
+
+The token travels in `X-Blastbox-Node-Session`, **not** `Authorization` — that header is the
+API key's, and one header cannot carry both credentials.
+
+The engine check happens before any job moves. Tier and credentials requirements are derived
+here from the job's own network personality, never asked of the node: a caller that could
+omit `tier` would be choosing its own authorisation check. Because a job's requirements are
+only knowable once one is picked, an unentitled job is claimed, refused and **released back
+to `QUEUED`** with its claim cleared — the node never receives the record.
+
+**More than one ingress host? Nothing to configure.** The key that signs challenges, sessions
+and receipts is recorded on the **job queue** — the one thing every ingress process already
+shares — the first time an ingress with a PKI starts; every later one adopts it. Nodes cannot
+read it, because nodes have no database credentials. `blastbox claim-key show` prints a
+fingerprint (never the key) so two hosts can confirm they agree. To rotate: stop every ingress,
+`blastbox claim-key reset --yes`, restart them all — in-flight node sessions (10 min) are
+invalidated and nodes re-handshake on their own. `BLASTBOX_CLAIM_SECRET_FILE` remains as an
+explicit override for a store that cannot record it.
+
+**If you set `BLASTBOX_API_KEY`, it must be the SAME on every ingress host.** It is the pepper
+for the queue-held signing key, so two hosts with different keys derive different signing keys
+and a node's handshake fails whenever its challenge and session land on different hosts — with
+the deliberately opaque `not authorised to claim this work`, which reads like a certificate
+problem. `blastbox claim-key show` fingerprints the **effective** key, so differing fingerprints
+across hosts is exactly this fault.
+
+**TLS.** This protocol authenticates the node but assumes the channel is server-authenticated.
+`blastbox serve` now issues its own certificate from the local CA when a PKI is present, so
+the secure path needs no extra step; `--tls-cert/--tls-key` uses your own, and `--no-tls` is
+available for a listener behind a TLS-terminating proxy.
+
+The routes appear because a trust anchor exists; with no CA they are not registered at all and
+nodes claim from the store exactly as before.
+
+Three things an operator must know:
+
+* **Whether this is prevention or merely defence in depth is a configuration choice.** A
+  node pointed at a *database* claims from the store directly and walks around these routes
+  entirely; for that node they are an audit trail. A node pointed at the *control plane* has
+  no other path, and then a refusal here is prevention. Choose deliberately:
+
+  ```sh
+  # federated node — no database credential anywhere on the box
+  BLASTBOX_DATABASE_URL=https://control-plane.example:8443
+  BLASTBOX_NODE_CERT=/var/lib/blastbox/pki/node-toolz3.crt   # key is the sibling .key
+  BLASTBOX_NODE_CA=/var/lib/blastbox/pki/ca.crt              # PUBLIC half only
+  BLASTBOX_BLOB_URL=s3://blastbox-blobs                      # REQUIRED — see below
+  ```
+
+  **`BLASTBOX_BLOB_URL` is not optional here, and omitting it fails every job.** A federated
+  node is cross-host by construction: the sample was spooled under the *ingress* host's
+  `job_root`, so the node cannot find it locally and must fetch it from the shared blob store.
+  With the variable unset the node falls back to a *local* blob store, every fetch raises, and
+  each job cycles release/reclaim until it is FAILED with `sample could not be materialised`.
+  The node boots clean and its handshake works, so the only signal is one startup WARNING —
+  and the cross-host check that exists for exactly this (`check_blob_target_agreement`) cannot
+  see it, because the control-plane store deliberately publishes no blob target. Set
+  `BLASTBOX_REQUIRE_SHARED_BLOB_STORE=1` to turn that warning into a refusal to start.
+
+  That is the same variable, not a new one, because a node talks to one or the other and
+  never both. Such a node also loses capabilities it never needed: it cannot submit jobs,
+  delete records, or enumerate the queue — those raise rather than silently doing nothing, so
+  a process mis-deployed with this URL fails loudly instead of looking healthy.
+
+  **What a restart costs, and the setting that is REQUIRED because of it.** The proof that a job
+  was handed to *this* node is held in memory by the process that claimed it, so a node
+  restarting mid-job cannot report on its in-flight work. That is deliberate — a restarted
+  dispatcher lost the worker running the job too. But such a node also **cannot run the
+  dispatcher's own orphan sweep** (its store refuses to enumerate the queue), so the control
+  plane must run one instead, and it is off until you set it:
+
+  ```sh
+  # on every ingress host: fail RUNNING jobs idle longer than this (seconds, floored at 900)
+  BLASTBOX_NODE_CLAIM_RECLAIM_AFTER_S=1800
+  ```
+
+  Set it to the longest run a node may legitimately take (floored at 900 s). Abandoned jobs are
+  **failed, not requeued** — a requeue would let a second worker re-detonate the same untrusted
+  input. Ingress warns at startup if this is unset. The sweep only touches jobs the control
+  plane itself handed to a node (their claim ids carry a `node:` prefix), and both dispatcher
+  recovery paths — the container dispatcher's requeue/warm-fail and the VM dispatcher's orphan
+  sweep — skip those same claims, because neither can attest a worker running on another host.
+  A mixed fleet is safe in both directions.
+
+  **Node certificates go to every ingress host too.** Grants are resolved from the certificates
+  in the *ingress* host's PKI directory, so a node whose certificate lives only on the exit host
+  opens a session (it chains to the CA) and then has every claim refused. Enrolment is therefore:
+
+  ```sh
+  scp /var/lib/blastbox/pki/node-toolz3.crt ingress-1:/var/lib/blastbox/pki/
+  scp /var/lib/blastbox/pki/node-toolz3.crt ingress-2:/var/lib/blastbox/pki/   # every replica
+  ```
+
+  The public certificate only — never the key. Renewals must be copied the same way.
+* **`BLASTBOX_API_KEY` does not apply to these routes, by design.** They authenticate with a
+  CA-issued certificate and a session bound to it — stronger than the key, and orthogonal to
+  it. Requiring the key too would put the *submitter's* credential on every node, letting
+  every node submit jobs; and the node client has no way to send it. The challenge route
+  grants nothing, the session route verifies a certificate, and everything after needs the
+  session.
+* **A refusal never says why.** Wrong CA, unheld key, ungranted engine and expired challenge
+  all return the same message, so a caller cannot map the fleet's grants by probing. The
+  reason is in the ingress log (`node_claim: refused …`); look there, not at the response.
 
 **Step 3 RECURS.** `pki issue-node` defaults to a 7-day lifetime — that short lifetime is
 what makes "revocation is stop renewing" work without a CRL or any online check — and the

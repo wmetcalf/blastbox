@@ -59,10 +59,151 @@ def _serve_workers(
     return n
 
 
+#: Re-issue the ingress certificate when this little of its life is left. `issue_server` mints
+#: 30 days; a week of warning is enough for a hardened host that must have one copied in.
+_TLS_RENEW_BEFORE_S = 7 * 86400.0
+
+
+def _serve_tls_sans(host: str) -> list[str]:
+    """Names the auto-issued certificate must answer to.
+
+    ``--host 0.0.0.0`` (or ``::``) is the common production bind, and the first version put
+    THAT in the SAN -- a name no client ever connects to. Nodes verify the hostname they were
+    given (`client_ssl_context` keeps hostname checking on), so every one of them refused the
+    control plane's certificate. Reviewed. For a wildcard bind the machine's own names and
+    non-loopback addresses go in; ``BLASTBOX_TLS_SANS`` (comma-separated) adds the names nodes
+    are actually configured with -- a load balancer's DNS name, typically -- and is the right
+    answer whenever this host is not reached by its own name.
+    """
+    import socket
+
+    sans: list[str] = []
+    extra = os.environ.get("BLASTBOX_TLS_SANS", "")
+    sans += [x.strip() for x in extra.split(",") if x.strip()]
+    if host and host not in ("0.0.0.0", "::", ""):
+        sans.append(host)
+    else:
+        try:
+            name = socket.gethostname()
+            sans.append(name)
+            fqdn = socket.getfqdn()
+            if fqdn and fqdn != name:
+                sans.append(fqdn)
+            for info in socket.getaddrinfo(name, None):
+                ip = str(info[4][0])
+                if ip and not ip.startswith(("127.", "::1")) and ip not in sans:
+                    sans.append(ip)
+        except OSError:
+            pass
+    sans += ["localhost", "127.0.0.1"]
+    seen: list[str] = []
+    for x in sans:
+        if x not in seen:
+            seen.append(x)
+    return seen
+
+
+def _serve_tls(args: argparse.Namespace) -> dict:
+    """uvicorn TLS parameters, or {} for plaintext.
+
+    WHY THIS EXISTS. The node-claim protocol (#178) authenticates the NODE cryptographically
+    but assumes the CHANNEL is server-authenticated TLS: without it, the session token and
+    every job record cross the network in clear, and nothing stops an interposer answering
+    as the control plane. `serve` had no way to enable TLS at all, so an operator following
+    the deployment guide necessarily ran it plaintext -- a design assumption with no means
+    of being satisfied.
+
+    Auto-issued from the local CA when a PKI is present and no explicit cert is given, so
+    the secure path needs no extra operator step. An explicit --tls-cert always wins, for a
+    deployment terminating TLS with its own certificate.
+    """
+    _log = logging.getLogger("blastbox.host.cli")
+    cert = getattr(args, "tls_cert", None) or os.environ.get("BLASTBOX_TLS_CERT", "")
+    key = getattr(args, "tls_key", None) or os.environ.get("BLASTBOX_TLS_KEY", "")
+    if bool(cert) != bool(key):
+        raise SystemExit("serve: --tls-cert and --tls-key must be given together")
+    if cert:
+        return {"ssl_certfile": cert, "ssl_keyfile": key}
+    if getattr(args, "no_tls", False):
+        _log.warning(
+            "serve: --no-tls -- the ingress listener is PLAINTEXT. Node session tokens and "
+            "job records cross the network in clear and an interposer can answer as the "
+            "control plane. Acceptable only behind a TLS-terminating proxy or on a trusted "
+            "local socket.")
+        return {}
+    from blastbox.host.ingress.node_claim import resolve_pki_dir
+
+    pki_dir = resolve_pki_dir()
+    if pki_dir is None:
+        # No PKI means the node-claim routes are not mounted either, so there is no new
+        # secret on this listener and plaintext is exactly the status quo. Say so once
+        # rather than refusing to start a deployment that never opted in.
+        _log.info("serve: no PKI, serving plaintext as before")
+        return {}
+    # A CERTIFICATE ALREADY ISSUED ELSEWHERE WINS BEFORE WE ASK FOR THE CA KEY. The HARDENED
+    # ingress holds ca.crt and NOT ca.key -- which is exactly what DEPLOYMENT.md tells operators
+    # to copy -- so demanding the signing key here made `serve` refuse to start on the very host
+    # that is most careful, and the error message offered `--no-tls` as the way out. That turned
+    # the hardened deployment into the plaintext one, where a session header is a sniffable
+    # ten-minute bearer credential. So: issue on the CA host, drop the pair in beside the anchor,
+    # and this picks it up with no CA key present and no flags.
+    existing_crt, existing_key = pki_dir / "ingress-server.crt", pki_dir / "ingress-server.key"
+    if existing_crt.exists() and existing_key.exists():
+        # CHECK THE CLOCK BEFORE REUSING IT. `issue_server` mints 30 days and nothing renewed
+        # it: a month after the first `serve`, every node in the fleet fails verification at
+        # once, restarting does not help, and recovery means knowing to delete two undocumented
+        # files. Reviewed. Inside the renewal window we re-issue if we can, and if we cannot
+        # (no CA key here) we serve it and say exactly how long is left.
+        import datetime
+
+        from cryptography import x509
+
+        try:
+            leaf = x509.load_pem_x509_certificate(existing_crt.read_bytes())
+            left = (leaf.not_valid_after_utc
+                    - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+        except Exception:               # noqa: BLE001 - unreadable: fall through and re-issue
+            left = -1.0
+        if left > _TLS_RENEW_BEFORE_S:
+            _log.info("serve: TLS on, using the server certificate already in %s (%.0f days "
+                      "left)", pki_dir, left / 86400)
+            return {"ssl_certfile": str(existing_crt), "ssl_keyfile": str(existing_key)}
+        _log.warning("serve: the ingress certificate in %s expires in %.1f days; re-issuing",
+                     pki_dir, max(0.0, left) / 86400)
+        _reissue_wanted = True
+    else:
+        _reissue_wanted = False
+
+    from blastbox.host.pki import load_ca
+
+    try:
+        ca = load_ca(pki_dir)
+    except Exception as exc:            # noqa: BLE001 - verify-only host, no CA key here
+        if _reissue_wanted:
+            # A hardened ingress holds no CA key, so it cannot renew its own certificate. Do
+            # not refuse to start over it -- serve the one we have and make the deadline loud.
+            _log.error("serve: the ingress certificate is expiring and this host has no CA key "
+                       "to re-issue it (%s). Issue a new pair on the CA host and copy it to "
+                       "%s / %s BEFORE it lapses, or every node will fail verification at "
+                       "once.", exc, existing_crt, existing_key)
+            return {"ssl_certfile": str(existing_crt), "ssl_keyfile": str(existing_key)}
+        raise SystemExit(
+            f"serve: {pki_dir} has a trust anchor but no usable CA key ({exc}), so a server "
+            f"certificate cannot be issued here. Either issue one on the CA host and copy it to "
+            f"{existing_crt} and {existing_key} (this is the hardened arrangement -- the signing "
+            f"key never reaches an internet-facing host), or pass --tls-cert/--tls-key, or "
+            "--no-tls if this listener sits behind a TLS-terminating proxy.") from None
+    issued = ca.issue_server(_serve_tls_sans(args.host), cn="blastbox-ingress")
+    crt, key_path = issued.write(pki_dir, "ingress-server")
+    _log.info("serve: TLS on, certificate auto-issued from the local CA (%s)", crt)
+    return {"ssl_certfile": str(crt), "ssl_keyfile": str(key_path)}
+
+
 def _serve_cmd(args: argparse.Namespace) -> int:
     import uvicorn
 
     workers = _serve_workers(getattr(args, "workers", None))
+    tls = _serve_tls(args)
 
     if workers and workers > 1:
         # uvicorn forks `workers` processes; each must build its own app, so we pass an
@@ -76,6 +217,7 @@ def _serve_cmd(args: argparse.Namespace) -> int:
             host=args.host,
             port=args.port,
             workers=workers,
+            **tls,
         )
         return 0
 
@@ -88,7 +230,7 @@ def _serve_cmd(args: argparse.Namespace) -> int:
 
     extension = load_ingress_extension(os.environ.get("BLASTBOX_INGRESS_EXTENSION"))
     app = build_app(allowed_engines=allowed or None, extension=extension)
-    uvicorn.run(app, host=args.host, port=args.port, workers=1)
+    uvicorn.run(app, host=args.host, port=args.port, workers=1, **tls)
     return 0
 
 
@@ -1007,6 +1149,94 @@ def _blob_target_cmd(args: argparse.Namespace) -> int:
     return 0
 
 
+def _claim_key_cmd(args: argparse.Namespace) -> int:
+    """Show whether a node signing key is recorded on the job queue, or rotate it.
+
+    NEVER PRINTS THE KEY. `show` reports presence and a short fingerprint so two ingress hosts
+    can confirm they resolved the same one; the value itself is a credential and this project
+    does not put those on terminals. Same stopped-fleet discipline as `blob-target reset`, for
+    the same reason: every ingress caches the key it resolved at boot, so clearing under a live
+    fleet is the multi-host divergence reintroduced by the tool meant to manage it.
+    """
+    import hashlib
+    import os as _os
+
+    from blastbox.host.jobs.base import ClaimKeyRegistry
+    from blastbox.host.jobs.factory import build_job_store_from_env
+    from blastbox.host.node_auth import SECRET_FILE_ENV
+
+    # THE OVERRIDE WINS AT RUNTIME, SO IT WINS HERE. `resolve_claim_secret` returns the file
+    # before it ever touches the store, so reporting the store's row on such a host answers a
+    # different question than the operator asked -- and the command exists precisely so two
+    # hosts can confirm they agree.
+    override = (_os.environ.get(SECRET_FILE_ENV) or "").strip()
+    if override:
+        print(f"{SECRET_FILE_ENV}={override} is set, so this host signs with that FILE and not "
+              f"with the job queue. Compare the file across hosts; the queue's row is unused "
+              f"here.")
+        return 1
+    # WITHOUT A DSN THE FACTORY HANDS BACK AN IN-MEMORY STORE, which satisfies the registry --
+    # so `reset --yes` printed success and mutated a throwaway object. An operator rotating a
+    # suspected-compromised key would restart the fleet onto the same key, told it had changed.
+    if not (_os.environ.get("BLASTBOX_DATABASE_URL") or "").strip():
+        print("BLASTBOX_DATABASE_URL is not set in this shell, so there is no fleet queue to "
+              "read. Set it to the same DSN the ingress processes use and re-run -- otherwise "
+              "this would report on a throwaway in-memory store.")
+        return 2
+
+    store = build_job_store_from_env()
+    if not isinstance(store, ClaimKeyRegistry):
+        print(f"{type(store).__name__} cannot record a node signing key; ingress hosts on this "
+              f"store use a per-host file (see BLASTBOX_CLAIM_SECRET_FILE).")
+        return 1
+    current = store.get_signing_key()
+    if args.claim_key_cmd == "reset":
+        if not getattr(args, "yes", False):
+            print(
+                "REFUSING: `claim-key reset` is only safe on a STOPPED fleet.\n"
+                f"  currently recorded: {'yes' if current else 'no'}\n"
+                "\n"
+                "Every ingress process resolves the key ONCE at startup and keeps it. Clearing\n"
+                "while any are running means the next one to start claims a NEW key while the\n"
+                "rest keep the old one -- node sessions minted on one host are then rejected by\n"
+                "another, which is the failure this key exists to prevent.\n"
+                "\n"
+                "Stop every ingress on this queue, then re-run with --yes and restart them all.\n"
+                "In-flight node sessions (10 min) and challenges (60 s) are invalidated; nodes\n"
+                "re-handshake on their own."
+            )
+            return 2
+        store.clear_signing_key()
+        print("node signing key cleared. Restart EVERY ingress; the first one up records the "
+              "new key and the rest adopt it.")
+        return 0
+    if not current:
+        print("(no node signing key recorded yet -- the first ingress to start with a PKI "
+              "records one)")
+        return 0
+    # FINGERPRINT THE EFFECTIVE KEY, not the stored half. BLASTBOX_API_KEY is the pepper
+    # (see node_auth.resolve_claim_secret), so the stored value is identical on every host by
+    # construction -- the command whose whole purpose is "confirm two hosts agree" could never
+    # report a difference, and would actively confirm a false agreement between a keyed and a
+    # keyless ingress, which is exactly the split that breaks node sessions.
+    import hmac as _hmac
+
+    api_key = (_os.environ.get("BLASTBOX_API_KEY") or "").strip()
+    if api_key:
+        effective = _hmac.new(api_key.encode(), bytes.fromhex(current),
+                              hashlib.sha256).digest()
+        digest = hashlib.sha256(effective).hexdigest()[:12]
+        print(f"recorded, peppered with BLASTBOX_API_KEY (effective fingerprint {digest}). "
+              f"Compare this across ingress hosts -- it differs if their API keys differ, "
+              f"which is what splits node sessions. The key itself is never printed.")
+    else:
+        digest = hashlib.sha256(current.encode()).hexdigest()[:12]
+        print(f"recorded, NOT peppered -- BLASTBOX_API_KEY is unset here (fingerprint "
+              f"{digest}). A host that HAS an API key resolves a different effective key, so "
+              f"compare this only against other unkeyed hosts. The key itself is never printed.")
+    return 0
+
+
 def _version_cmd(_: argparse.Namespace) -> int:
     print(f"blastbox {__version__}")
     return 0
@@ -1459,6 +1689,14 @@ def build_parser() -> argparse.ArgumentParser:
     ps = sub.add_parser("serve", help="run the ingress HTTP API")
     ps.add_argument("--host", default="127.0.0.1")
     ps.add_argument("--port", type=int, default=8000)
+    ps.add_argument("--tls-cert", default=None,
+                    help="server certificate (PEM). With a PKI present one is auto-issued "
+                         "from the local CA, so this is only needed to use your own.")
+    ps.add_argument("--tls-key", default=None, help="private key for --tls-cert")
+    ps.add_argument("--no-tls", action="store_true",
+                    help="serve plaintext even with a PKI present. Only behind a "
+                         "TLS-terminating proxy: node session tokens and job records "
+                         "otherwise cross the network in clear.")
     ps.add_argument(
         "--workers",
         type=int,
@@ -1596,6 +1834,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="report what would be uploaded without touching the blob store",
     )
     pm.set_defaults(func=_migrate_results_cmd)
+
+    pk = sub.add_parser(
+        "claim-key",
+        help="show whether the node signing key is recorded on the job queue, or rotate it",
+    )
+    pks = pk.add_subparsers(dest="claim_key_cmd", required=True)
+    pks.add_parser("show", help="report presence and a fingerprint; the key is never printed")
+    pk_reset = pks.add_parser(
+        "reset", help="rotate it; requires a STOPPED fleet and a restart of every ingress",
+    )
+    pk_reset.add_argument("--yes", action="store_true",
+                          help="confirm every ingress on this queue is stopped")
+    pk.set_defaults(func=_claim_key_cmd)
 
     pt = sub.add_parser(
         "blob-target",

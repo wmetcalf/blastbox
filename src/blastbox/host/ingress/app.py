@@ -285,6 +285,19 @@ def build_app(
 
     _job_store: JobStore = job_store or build_job_store_from_env()
 
+    # A SERVING process must hold the queue, not a proxy to it. A control-plane URL here builds an
+    # HttpJobStore, which cannot create, list or delete -- so serve would boot, answer 200 on
+    # /v1/healthz (a load balancer then takes it into rotation), and 500 on every submission. The
+    # earlier guard keyed on a BLASTBOX_ROLE variable that nothing ever set, so it never fired;
+    # this one keys on the store's TYPE, which is the fact that matters and cannot be forgotten.
+    from blastbox.host.jobs.http_store import HttpJobStore
+
+    if isinstance(_job_store, HttpJobStore):
+        raise ValueError(
+            "BLASTBOX_DATABASE_URL is a control-plane URL, but this process SERVES the queue. A "
+            "serving process needs the database itself; only a node claims through the control "
+            "plane. Point BLASTBOX_DATABASE_URL at the database on this host.")
+
     _job_root = job_root or Path(
         os.environ.get("BLASTBOX_JOB_ROOT", "/var/lib/blastbox/jobs")
     ).expanduser()
@@ -418,15 +431,117 @@ def build_app(
             # "%s" text rather than formatting it.
             reap_log = _logging.getLogger("blastbox.ingress.reap")
 
-            while not stop.wait(_reap_interval_s):
+            # #178: the control plane owns the queue, so it owns the stale-claim sweep too.
+            # A credential-less node cannot enumerate RUNNING jobs -- by design -- so the
+            # "reclaim on timeout" that the claim protocol relies on has nowhere else to live.
+            # Off unless an operator sets the age; see node_reclaim.
+            from blastbox.host.ingress.node_reclaim import (
+                fail_stale_queued,
+                max_queued_age_s,
+                reclaim_after_s,
+                reclaim_stale_claims,
+                sweeper_lock,
+            )
+
+            reclaim_after = reclaim_after_s()
+            queued_age = max_queued_age_s()
+            if queued_age:
+                _log.info("ingress: stale-QUEUED sweep on, failing jobs unclaimed >%.0fs",
+                          queued_age)
+            if reclaim_after:
+                _log.info("ingress: stale-claim sweep on, failing RUNNING jobs idle >%.0fs",
+                          reclaim_after)
+
+            # RETENTION ON THE CONTROL PLANE, gated on RETENTION's own setting -- the same
+            # BLASTBOX_JOB_RETENTION_SECONDS the dispatcher honours -- and NOT on the reclaim
+            # variable, which is unrelated and was a conflation. And WITH the blob store: the
+            # first version constructed the sweeper without one, so it stamped EXPIRED and
+            # left every durable result object in place, which is expiry in name only.
+            # Reviewed by two independent reviewers. A serving process built on a control-
+            # plane store never reaches here (build_app refuses it), so this is always the
+            # process holding the queue.
+            _retention_here = None
+            try:
+                _retention_s = float(os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS") or "0")
+            except ValueError:
+                _retention_s = 0.0
+            if _retention_s > 0:
                 try:
-                    reap_stale_scratch(_job_root, _scratch_max_age_s, _job_store, reap_log,
-                                       blob_store=_blob_store)
-                except Exception:  # noqa: BLE001 -- a sweep failure must not kill the server
-                    _log.warning("ingress: scratch reclaim failed", exc_info=True)
+                    from blastbox.host.jobs.retention import JobRetentionSweeper
+
+                    _retention_here = JobRetentionSweeper(_job_root, blob_store=_blob_store)
+                    _log.info("ingress: job retention sweep on (retention %.0fs, blob store "
+                              "%s)", _retention_s, type(_blob_store).__name__)
+                except Exception:  # noqa: BLE001 -- optional; never block serving
+                    _log.warning("ingress: could not start the retention sweeper",
+                                 exc_info=True)
+
+            while not stop.wait(_reap_interval_s):
+                # ONE SWEEPER PER HOST, AND THE LOCK IS HELD ACROSS THE WORK. The first
+                # version tested the flag and closed the context immediately, so the lock
+                # lived for the few microseconds of open+flock+close and every worker swept
+                # anyway -- the election was decorative. My test exercised the HELPER and
+                # never the call site, which is the same mistake as the source-grep wiring
+                # tests it replaced.
+                with sweeper_lock(_job_root) as _mine:
+                    if not _mine:
+                        continue
+                    # ONE SWEEPER PER HOST PER TICK. workers>1 forks, and every worker used to run
+                    # the whole sweep: N full scans per interval, each holding the store's lock
+                    # inside a process that is meant to be answering requests.
+                    if _scratch_max_age_s > 0:
+                        try:
+                            reap_stale_scratch(_job_root, _scratch_max_age_s, _job_store, reap_log,
+                                               blob_store=_blob_store)
+                        except Exception:  # noqa: BLE001 -- a sweep failure must not kill the server
+                            _log.warning("ingress: scratch reclaim failed", exc_info=True)
+                    if reclaim_after:
+                        try:
+                            reclaim_stale_claims(_job_store, after_s=reclaim_after,
+                                             retention_s=_retention_s)
+                        except Exception:  # noqa: BLE001 -- same contract as above
+                            _log.warning("ingress: stale-claim sweep failed", exc_info=True)
+                    if queued_age:
+                        # Work nobody can claim -- a target_tier with no matching dispatcher on an
+                        # all-federated fleet -- would otherwise sit QUEUED forever with its
+                        # untrusted sample on this host's disk.
+                        try:
+                            # retention_s, like the sibling call above: this sweep WRITES
+                            # expires_at, and `expire_due` requires a non-null one. Without it
+                            # the sweep traded "a sample sitting QUEUED forever" for "a FAILED
+                            # row sitting forever", which its own docstring says it must not --
+                            # and a restricted node can drive that growth by re-deferring
+                            # governed work until it ages out.
+                            fail_stale_queued(_job_store, max_age_s=queued_age,
+                                              job_root=_job_root,
+                                              retention_s=_retention_s)
+                        except Exception:  # noqa: BLE001 -- same contract as above
+                            _log.warning("ingress: stale-QUEUED sweep failed", exc_info=True)
+                    if _retention_here:
+                        # #178: retention has to run where the queue is. `expire_due` finds its
+                        # candidates by ENUMERATING, and a credential-less node's store refuses that
+                        # by design -- so on such a fleet BLASTBOX_JOB_RETENTION_SECONDS was quietly
+                        # a no-op and detonation output accumulated under a policy nobody was
+                        # enforcing. The node still reaps its own local trees by age
+                        # (`reap_stale_scratch`, which needs no enumeration); this is the half that
+                        # needs the queue.
+                        try:
+                            _retention_here.expire_due(_job_store)
+                        except Exception:  # noqa: BLE001 -- same contract as above
+                            _log.warning("ingress: job retention sweep failed", exc_info=True)
 
         thread = None
-        if _scratch_max_age_s > 0 and _reap_interval_s > 0:
+        # EITHER task keeps the thread alive. This used to be gated on scratch reaping alone, so
+        # the documented BLASTBOX_SCRATCH_MAX_AGE_S=0 (disable scratch reclamation only) also
+        # silently disabled the stale-claim sweep -- and on a credential-less fleet that sweep is
+        # the ONLY reclaim path, so every lost claim stayed RUNNING forever.
+        from blastbox.host.ingress.node_reclaim import reclaim_after_s as _reclaim_after_s
+
+        _retention_wanted = (os.environ.get("BLASTBOX_JOB_RETENTION_SECONDS") or "0").strip()
+        _queued_wanted = (os.environ.get("BLASTBOX_MAX_QUEUED_AGE_S") or "0").strip()
+        if ((_scratch_max_age_s > 0 or _reclaim_after_s() > 0
+             or _retention_wanted not in ("", "0") or _queued_wanted not in ("", "0"))
+                and _reap_interval_s > 0):
             thread = threading.Thread(target=_reap_loop, name="blastbox-ingress-reap",
                                       daemon=True)
             thread.start()
@@ -1144,6 +1259,17 @@ def build_app(
     # prove reachability, so an API with stale credentials matches its dispatchers perfectly and
     # then 404s every artifact.
     check_read_access(_blob_store, role="ingress")
+
+    # #178: hand work to a node only after proving WHICH node it is. Mounted only when
+    # this deployment has a trust anchor; without one the routes do not exist and nodes
+    # claim directly from the store exactly as before. See node_claim's module docstring
+    # for why a route that waves everyone through would be worse than no route.
+    from blastbox.host.ingress.node_claim import register_node_claim_routes
+
+    # The API key doubles as the pepper for the store-held node signing key: every ingress
+    # host already has it and a queue reader does not. See node_auth.resolve_claim_secret.
+    register_node_claim_routes(app, job_store=_job_store,
+                               pepper=_api_key.encode() if _api_key else None)
 
     return app
 

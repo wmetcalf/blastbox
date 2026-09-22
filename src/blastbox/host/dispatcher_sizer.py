@@ -117,6 +117,8 @@ class DispatcherSizer:
         self._last_backlog = 0                # published as a heartbeat before the (slow) count
         self._stop_event: Optional[threading.Event] = None  # set in run(); fences the update-publish
         self._last_floor_warn = 0.0           # rate-limit the min_warm-starved warning (issue #68)
+        self._backlog_failures = 0            # counts consecutive backlog-read failures
+        self._warned_backlog = False          # one-shot: warn when the backlog stops answering
         self._warned_mixed_nodes = False      # one-shot: warn on an inconsistent node-id view
         self._warned_mixed_modes = False      # one-shot: warn on mixed balancing modes on a node
         self._last_view_ok = 0.0              # clock of the last tick that CONFIRMED we're visible
@@ -314,6 +316,35 @@ class DispatcherSizer:
             self._count_result = {}
             holder = self._count_result
 
+            def _warn_backlog_failed() -> None:
+                """Report a backlog read that failed, ONCE, and keep counting.
+
+                The fallback to `_last_backlog` is correct for a transient store error. It is
+                also how a PERMANENT one hides: `_last_backlog` starts at 0 and never advances
+                without a successful read, so "the store cannot answer" and "the queue is empty"
+                produce identical sizing -- floors everywhere, silently. A credential-less node
+                whose store refuses to count is exactly that case, and it under-serves for as
+                long as nobody looks. One warning, then a running count in it.
+                """
+                self._backlog_failures += 1
+                if self._backlog_failures % 60 == 0:
+                    # A running count, not just the first line. One warning at the start of an
+                    # outage tells an operator who joined the log tail an hour later nothing;
+                    # this is the periodic proof the reads are STILL failing and the pool is
+                    # sitting at its floor for a reason.
+                    logging.getLogger("blastbox.node_sizer").warning(
+                        "sizer: the backlog has now failed to read %d times in a row; sizing "
+                        "is still pinned to %d", self._backlog_failures, self._last_backlog)
+                if not self._warned_backlog:
+                    self._warned_backlog = True
+                    logging.getLogger("blastbox.node_sizer").warning(
+                        "sizer: the backlog could not be read, so sizing is using the "
+                        "last-known value (%d). If that is 0 this node will sit at its floors "
+                        "however deep the queue is. A node claiming through a control plane "
+                        "cannot count the queue -- it needs a scoped backlog route; anything "
+                        "else here is a store error worth chasing.", self._last_backlog,
+                        exc_info=True)
+
             def _count() -> None:
                 try:
                     holder["v"] = max(0, int(self._backlog_fn()))
@@ -323,6 +354,14 @@ class DispatcherSizer:
                     if self._untargeted_backlog_fn is not None:
                         holder["u"] = min(holder["v"], max(0, int(self._untargeted_backlog_fn())))
                 except Exception:
+                    # SAY SO. Falling back to the last-known backlog is right for a TRANSIENT
+                    # store error, but this arm used to be silent -- and `_last_backlog` starts
+                    # at 0 and can never advance, so a PERMANENT failure was indistinguishable
+                    # from an empty queue: the warm pool sat at its floor and the cold gate at
+                    # its floor however deep the queue was, with nothing in the log. A
+                    # credential-less node whose store cannot answer a backlog hits exactly that.
+                    # Warn-once-per-message so a flapping store does not drown the log.
+                    _warn_backlog_failed()
                     holder["v"] = self._last_backlog
             self._count_thread = threading.Thread(target=_count, name="node-sizer-count",
                                                   daemon=True)

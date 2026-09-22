@@ -179,6 +179,24 @@ def normalize_engine_filter(engine: "str | Collection[str] | None") -> tuple[str
 # Whitelist of fields ``list(sort=...)`` accepts. A whitelist (not a free column
 # name) keeps the SQL backend injection-safe and the in-memory/Redis backends
 # uniform. Anything else falls back to newest-first.
+#: Prefix the ingress control plane stamps onto the claim id of every job it claims on behalf
+#: of a federated node (#178). It lives HERE, not in the ingress package, because it is a
+#: contract between TWO reclaim paths that share one queue and neither may import the other:
+#: `node_reclaim.reclaim_stale_claims` (which must judge only its own claims) and
+#: `Dispatcher.requeue_orphaned_jobs` (which must leave a node's live claim alone -- it has no
+#: docker-ps liveness for a job running on another host, so on a mixed fleet it requeued a
+#: node's live job after `requeue_grace_s`, detonating one untrusted sample twice, and
+#: terminally FAILED a warm one, discarding the node's result when its own write lost the CAS).
+#: claim_id is opaque everywhere, so a prefix is safe.
+NODE_CLAIM_PREFIX = "node:"
+
+
+def is_node_claim(claim_id: "str | None") -> bool:
+    """True if this claim is held by a federated node through the control plane, not by a
+    dispatcher that shares this queue. Both reclaim paths gate on it, in opposite directions."""
+    return (claim_id or "").startswith(NODE_CLAIM_PREFIX)
+
+
 LISTABLE_SORT_FIELDS = ("created_at", "filename", "status", "finished_at")
 
 
@@ -364,6 +382,52 @@ class BlobTargetRegistry(Protocol):
 
     def clear_blob_target(self) -> None:
         """Forget the recorded target, for a deliberate migration. See ``blastbox blob-target``."""
+        ...
+
+
+@runtime_checkable
+class ClaimKeyRegistry(Protocol):
+    """OPTIONAL registry holding the ONE key every ingress process signs node credentials with.
+
+    WHY THE JOB STORE. Node challenges, session tokens and claim receipts (#178) are MACs, and a
+    MAC is only worth anything if every process that verifies it holds the key that minted it.
+    Two ingress hosts behind a load balancer each generating their own key mint credentials the
+    other rejects -- a node's handshake fails whenever the challenge and the session land on
+    different hosts, which is most of the time. A shared FILE cannot fix that in the documented
+    role-separated topology, which deliberately rejects a shared filesystem. The queue is the only
+    thing those processes share by definition, so the key lives here -- exactly the argument
+    :class:`BlobTargetRegistry` already makes for proving two processes agree.
+
+    SAME SHAPE AS BlobTargetRegistry, ON PURPOSE. Separate Protocol that ``JobStore`` does not
+    inherit, so a third-party store is not broken by its absence (consumers fall back to a
+    per-host file and say so). Claim is a compare-and-swap, not get-then-put, because two ingress
+    hosts booting together would otherwise both read empty, both write, and each sign with its own
+    key while believing it agreed. And ``None`` from the claim means UNKNOWN, never "I won": a
+    caller that assumed it had won on an empty read-back would sign with a key nobody else holds,
+    which is the split this exists to prevent, produced by the registry.
+
+    WHO MAY READ IT. Ingress processes hold database credentials; nodes, by construction, do not
+    (`HttpJobStore` implements no part of this). So the key is exactly as private as the queue,
+    and the queue already holds every job and result. Storing it here widens nothing.
+
+    ROTATION is ``clear_signing_key`` then a restart of EVERY ingress process, so each re-claims
+    and the first one up wins. Live processes cache the key they resolved at boot, so clearing
+    without restarting them is the divergence again, for as long as they run. Sessions are
+    ten minutes and challenges one, so a rotation costs at most that.
+    """
+
+    def claim_signing_key(self, candidate: str) -> "str | None":
+        """Register ``candidate`` if none is recorded, and return what is NOW recorded --
+        ``candidate`` when this process won, the OTHER value when a peer got there first, and
+        ``None`` when the registry could not be read back at all. NONE IS NOT AGREEMENT."""
+        ...
+
+    def get_signing_key(self) -> "str | None":
+        """The recorded key, or None. READ-ONLY -- must never register anything."""
+        ...
+
+    def clear_signing_key(self) -> None:
+        """Forget the recorded key, for a deliberate rotation. Restart every ingress after."""
         ...
 
 

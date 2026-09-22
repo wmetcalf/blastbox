@@ -423,6 +423,14 @@ def is_shared_job_store(job_store: Any) -> bool:
     name = type(job_store).__name__
     if name == "RedisJobStore":
         return True
+    if name == "HttpJobStore":
+        # A CONTROL PLANE IS SHARED BY DEFINITION -- the queue is on another host, which is the
+        # whole point of the store. Leaving it unrecognised disarmed this check AND the
+        # operator's explicit BLASTBOX_REQUIRE_SHARED_BLOB_STORE on the one topology that is
+        # cross-host by construction: a federated node with a LocalBlobStore is the 17,626-job
+        # incident exactly, and it booted clean. "Conservative default" is defensible for an
+        # unknown third-party store; it is not defensible for one this repo ships.
+        return True
     driver = getattr(job_store, "_driver", None)
     if driver is not None:
         return str(driver).lower() in ("postgres", "postgresql", "mysql")

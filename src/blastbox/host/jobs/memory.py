@@ -42,6 +42,7 @@ class InMemoryJobStore:
         self._jobs: dict[str, Job] = {}
         self._lock = threading.RLock()
         self._blob_target: str | None = None
+        self._signing_key: str | None = None
 
     # -- BlobTargetRegistry -------------------------------------------------------------
     def claim_blob_target(self, fingerprint: str) -> "str | None":
@@ -58,6 +59,22 @@ class InMemoryJobStore:
     def clear_blob_target(self) -> None:
         with self._lock:
             self._blob_target = None
+
+    # -- ClaimKeyRegistry ---------------------------------------------------------------
+    def claim_signing_key(self, candidate: str) -> "str | None":
+        """CAS under the same lock. See ClaimKeyRegistry."""
+        with self._lock:
+            if self._signing_key is None:
+                self._signing_key = candidate
+            return self._signing_key
+
+    def get_signing_key(self) -> "str | None":
+        with self._lock:
+            return self._signing_key
+
+    def clear_signing_key(self) -> None:
+        with self._lock:
+            self._signing_key = None
 
     def create(self, job: Job) -> None:
         with self._lock:
