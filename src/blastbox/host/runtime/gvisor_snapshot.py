@@ -47,6 +47,29 @@ class GvisorConfig:
     network: str                # "none" | "sandbox"
     warm_argv: list[str]        # the warm worker entrypoint argv (inside the container)
     ignore_cgroups: bool = True
+    # Drive runsc WITHOUT root (`-rootless`). OFF by default and deliberately so: the warm tier
+    # needs `checkpoint`/`restore`, and that pair is the part of gVisor most likely to want
+    # privileges a rootless sandbox has not got -- so this is an opt-in switch to be proved on a
+    # host, not a default to be assumed. On Ubuntu 24.04+ it ALSO needs the scoped AppArmor grant
+    # in deploy/apparmor/blastbox-runsc, or the sandbox creates its userns and then dies starting
+    # its gofer with a permission error that never mentions AppArmor.
+    rootless: bool = False
+    # ...and rootless FORCES the worker to guest uid 0 unless the caller says otherwise. Not a
+    # preference: gVisor's gofer runs as the calling user in rootless mode, so it cannot create a
+    # file owned by a guest uid the host userns does not map. Measured 2026-09-22 with uid 65532:
+    # the warm worker starts, warms its engine, and then dies on its own readiness file with
+    #
+    #   OSError: [Errno 22] Invalid argument: '/ctrl/.ready.tmp'
+    #
+    # on a bind mount that is already 0o777 -- EINVAL, not EACCES, so it does not read as a
+    # permissions problem at all. The same bundle as guest uid 0 comes up READY.
+    #
+    # THE SECURITY TRADE, stated rather than assumed: rootful keeps the in-sandbox uid drop
+    # (parity with the docker `--user` and FC `setpriv` tiers) but the runtime itself runs as
+    # host root, so a gVisor escape lands as root. Rootless gives up the in-sandbox drop -- guest
+    # uid 0 is NOT host root, it is the unprivileged user that launched runsc -- and an escape
+    # lands as that user instead. The isolation boundary is gVisor either way; this only moves
+    # what is on the far side of it.
     platform: str | None = None
     ld_preload: str | None = None                 # soffice tier: /opt/clippyshot/accept-retry.so
     cpu_features_annotation: str | None = None     # dev.gvisor.internal.cpufeatures (pinning)
@@ -338,6 +361,9 @@ def _with_runsc_stderr(exc: BaseException, what: str) -> BaseException:
 
 def _runsc(cfg: GvisorConfig) -> list[str]:
     a = [cfg.runsc_bin, "-root", str(cfg.root), f"-network={cfg.network}"]
+    if cfg.rootless:
+        # BEFORE the subcommand: -rootless is a global runsc flag, not a per-command one.
+        a.append("-rootless")
     if cfg.ignore_cgroups:
         a.append("-ignore-cgroups")
     if cfg.platform:
@@ -392,7 +418,11 @@ def _oci_config(cfg: GvisorConfig, workdir: Path, *, in_ro: bool) -> dict:
         "ociVersion": "1.0.0",
         "process": {
             "terminal": False,
-            "user": {"uid": cfg.uid, "gid": cfg.gid},
+            # ROOTLESS PINS THIS TO 0; see GvisorConfig.rootless for the measurement. A guest
+            # uid the host userns does not map cannot create files on a bind mount, and the
+            # failure is an EINVAL on the readiness file rather than anything that names a uid.
+            "user": ({"uid": 0, "gid": 0} if cfg.rootless
+                     else {"uid": cfg.uid, "gid": cfg.gid}),
             "args": list(cfg.warm_argv),
             "env": env,
             "cwd": "/",
@@ -984,6 +1014,22 @@ class GvisorSnapshotBackend:
         probe: Callable[[], bool] | None = None,
         cr_capable: Callable[[str], bool] = _default_cr_capable,
     ) -> None:
+        if cfg.rootless:
+            # REFUSE AT CONSTRUCTION, not at restore. gVisor supports rootless `run` and
+            # `checkpoint` but NOT `restore`; its own words, measured 2026-09-22:
+            #
+            #   runsc restore failed: Rootless mode not supported with "restore"
+            #
+            # This tier IS checkpoint/restore, so rootless can never work here -- and without
+            # this check it fails at the worst possible moment: the base boots, warms, signals
+            # READY and checkpoints successfully, and only the first RESTORE (the first actual
+            # job) dies, which reads like snapshot corruption rather than a config error. The
+            # flag stays valid for non-snapshot gVisor use; it is this tier that cannot take it.
+            raise GvisorCommandError(
+                "BLASTBOX_GVISOR_ROOTLESS is set, but the warm-snapshot tier needs runsc "
+                "`restore`, which gVisor does not support rootless (it fails with 'Rootless "
+                "mode not supported with \"restore\"'). Run this tier as root, or use a "
+                "non-snapshot gVisor tier.")
         self._cfg = cfg
         self._run = run
         self._run_text = run_text
