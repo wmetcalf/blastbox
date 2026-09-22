@@ -110,6 +110,19 @@ class BodySizeLimitMiddleware:
             raise
 
 
+def node_auth_same(given: str, expected: str) -> bool:
+    """Constant-time equality for a value that came off the wire.
+
+    `hmac.compare_digest` raises TypeError on a str containing non-ASCII, and Starlette decodes
+    a header as latin-1 -- so one non-ASCII byte in `Authorization: Bearer …` turned this gate,
+    which fronts every non-node route when BLASTBOX_API_KEY is set, into a 500 and an unhandled
+    traceback for an unauthenticated caller. Same fix and same reasoning as `node_auth._same`;
+    it lives here too because this module must not import the node-auth machinery.
+    """
+    return hmac.compare_digest(given.encode("utf-8", "surrogatepass"),
+                               expected.encode("utf-8", "surrogatepass"))
+
+
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     """Optional bearer-token authentication gate.
 
@@ -150,7 +163,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if not header.startswith("Bearer "):
             return PlainTextResponse("missing bearer token", status_code=401)
         provided = header.removeprefix("Bearer ").strip()
-        if not hmac.compare_digest(provided, self._key):
+        if not node_auth_same(provided, self._key):
             return PlainTextResponse("invalid bearer token", status_code=401)
         return await call_next(request)
 

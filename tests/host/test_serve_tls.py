@@ -155,3 +155,35 @@ def test_a_verify_only_host_with_no_certificate_is_told_all_three_options(tmp_pa
     assert "copy it to" in message, "the hardened route is not offered"
     assert message.index("copy it to") < message.index("--no-tls"), (
         "plaintext is offered before the secure route")
+
+
+def test_a_certificate_from_a_ROTATED_ca_is_not_reused(tmp_path, monkeypatch, caplog):
+    """The reuse branch checked only the clock. Rotate the fleet CA while `ingress-server.crt`
+    is still unexpired and ingress starts happily with a leaf that every newly-enrolled node --
+    which trusts the replacement CA -- rejects during the handshake. Worse, the re-issuance path
+    is never reached, so a host that HOLDS the new CA key cannot heal itself either."""
+    import argparse
+    import logging
+
+    from blastbox.host import cli, pki
+
+    d = tmp_path / "pki"
+    old_ca = pki.ensure_ca(d)
+    issued = old_ca.issue_server(["127.0.0.1"], cn="blastbox-ingress")
+    old_crt, _old_key = issued.write(d, "ingress-server")
+    old_bytes = old_crt.read_bytes()
+
+    # The operator rotates the CA in place (blastbox pki init after removing ca.*).
+    (d / "ca.crt").unlink()
+    (d / "ca.key").unlink()
+    pki.ensure_ca(d)
+
+    monkeypatch.setenv("BLASTBOX_PKI_DIR", str(d))
+    args = argparse.Namespace(host="127.0.0.1", port=8443, tls_cert=None, tls_key=None,
+                              no_tls=False)
+    with caplog.at_level(logging.WARNING):
+        out = cli._serve_tls(args)
+    assert out, "TLS was turned off entirely"
+    assert (d / "ingress-server.crt").read_bytes() != old_bytes, (
+        "ingress reused a leaf signed by the RETIRED CA; every node trusting the new anchor "
+        "will fail the handshake and this host never reaches re-issuance")

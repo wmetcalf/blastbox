@@ -103,6 +103,37 @@ def _serve_tls_sans(host: str) -> list[str]:
     return seen
 
 
+def _leaf_matches_ca(leaf_path, ca_path) -> bool:
+    """Was this leaf signed by the CA currently on disk? Unreadable either side -> False.
+
+    Fails CLOSED (towards re-issuing) on any doubt: re-issuing a certificate is cheap and
+    self-healing, whereas serving one the fleet no longer trusts looks exactly like a working
+    listener and breaks every node at once.
+    """
+    from cryptography import x509
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    try:
+        leaf = x509.load_pem_x509_certificate(leaf_path.read_bytes())
+        ca = x509.load_pem_x509_certificate(ca_path.read_bytes())
+    except Exception:                   # noqa: BLE001 - unreadable is not a match
+        return False
+    if leaf.issuer != ca.subject:
+        return False
+    try:
+        # This project's CAs are P-256 (see pki.ensure_ca), so the EC branch is the only one
+        # that can arise; anything else falls into the except below and reads as "not ours",
+        # which is the safe direction (re-issue).
+        public_key = ca.public_key()
+        algorithm = leaf.signature_hash_algorithm
+        if not isinstance(public_key, ec.EllipticCurvePublicKey) or algorithm is None:
+            return False
+        public_key.verify(leaf.signature, leaf.tbs_certificate_bytes, ec.ECDSA(algorithm))
+    except Exception:                   # noqa: BLE001 - InvalidSignature or anything else
+        return False
+    return True
+
+
 def _serve_tls(args: argparse.Namespace) -> dict:
     """uvicorn TLS parameters, or {} for plaintext.
 
@@ -163,6 +194,16 @@ def _serve_tls(args: argparse.Namespace) -> dict:
             left = (leaf.not_valid_after_utc
                     - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
         except Exception:               # noqa: BLE001 - unreadable: fall through and re-issue
+            left = -1.0
+        # ...AND CHECK IT STILL CHAINS TO THE CURRENT ANCHOR. The clock is not the only way a
+        # leaf goes stale: rotate the fleet CA while this certificate is unexpired and every
+        # newly-enrolled node -- which trusts the replacement anchor -- rejects it at the
+        # handshake, while this host reports TLS on and never reaches the re-issuance path
+        # below, so even a host holding the new CA key cannot heal itself.
+        if left > _TLS_RENEW_BEFORE_S and not _leaf_matches_ca(existing_crt, pki_dir / "ca.crt"):
+            _log.warning("serve: the ingress certificate in %s was not issued by the CA "
+                         "currently in ca.crt (the anchor was rotated); re-issuing rather than "
+                         "serving a leaf every node will reject", pki_dir)
             left = -1.0
         if left > _TLS_RENEW_BEFORE_S:
             _log.info("serve: TLS on, using the server certificate already in %s (%.0f days "

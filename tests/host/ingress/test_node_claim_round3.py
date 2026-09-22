@@ -95,7 +95,8 @@ def test_a_non_finite_deferral_is_refused(rig, bad):
     job, rcpt = r.json()["job"], r.json()["receipt"]
     w = c.post(f"/v1/nodes/jobs/{job['job_id']}", headers=h,
                json={"claim_id": job["claim_id"], "receipt": rcpt,
-                     "fields": {"status": "queued", "claimable_after": bad}})
+                     "fields": {"status": "queued", "claim_id": None,
+                                "claimable_after": bad}})
     assert w.status_code == 400, w.text
     assert store.get("b").status == JobStatus.RUNNING
 
@@ -109,7 +110,8 @@ def test_the_stored_deferral_is_the_normalised_float(rig):
     soon = time.time() + 30
     w = c.post(f"/v1/nodes/jobs/{job['job_id']}", headers=h,
                json={"claim_id": job["claim_id"], "receipt": rcpt,
-                     "fields": {"status": "queued", "claimable_after": str(soon)}})
+                     "fields": {"status": "queued", "claim_id": None,
+                                "claimable_after": str(soon)}})
     assert w.status_code == 200, w.text
     stored = store.get("b").claimable_after
     assert isinstance(stored, float) and abs(stored - soon) < 1

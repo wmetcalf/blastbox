@@ -144,7 +144,18 @@ _MAX_CLAIM_PROBES = 8
 #: SHORT, because a certificate can be renewed with MORE grants while a job sits there; one
 #: minute bounds how long a newly-entitled node keeps stepping over work it can now run.
 _REFUSAL_MEMO_TTL_S = 60.0
-_MAX_CLAIM_SKIPS = 64
+#: How many already-judged jobs one walk will step over. SMALL, because stepping over one is
+#: not free: `claim_next` is the only way to see a job, so each skip costs a claim, the prefix
+#: stamp (which must happen before anything can go wrong -- see the stamp comment in the walk)
+#: and a release. At 64 that was ~192 store writes for a single poll that then answered 204,
+#: and a node polls on a timer. 16 still steps over a wall deeper than the probe budget could
+#: reach while keeping the per-poll cost in the same order as the parent commit's.
+#:
+#: RESIDUAL, stated rather than hidden: a permanent wall of work no enrolled node can run still
+#: costs these writes on every poll. The real cure is to FAIL work no certificate in the fleet
+#: grants (the control plane can see every node's grants), not to walk past it forever; that is
+#: a separate change.
+_MAX_CLAIM_SKIPS = 16
 
 #: How long a job this node may NOT run is deferred for EVERYONE after a refusal. This is ALSO
 #: the write-amplification bound the DoS finding wanted: a refused job flips RUNNING->QUEUED at
@@ -159,6 +170,11 @@ _MAX_CLAIM_SKIPS = 64
 #: `claim_next` itself on every backend, so the walk simply does not see the job again for a
 #: while -- and neither does an adversary trying to flap it, which bounds that to once per
 #: window. The cost is that an ENTITLED peer also waits this long for it; short on purpose.
+#:
+#: AND IT ONLY BOUNDS THE CHURN WHILE THE JOB IS YOUNG. Past MAX_TOTAL_DEFERRAL_S a refused job
+#: is released claimable, so the "at most one flip per window" property above holds for its first
+#: two minutes and not after: from then on the walk steps over it from the memo instead, which
+#: costs writes but hands it to any entitled peer immediately. See _MAX_CLAIM_SKIPS.
 _REFUSAL_DEFER_S = 20.0
 
 #: Prefix the control plane re-stamps onto the claim id of every job it hands to a node. It
@@ -221,15 +237,23 @@ class _RefusalMemo:
     def remember(self, node_id: str, job_id: str) -> None:
         self._until[(node_id, job_id)] = time.time() + self._ttl_s
         if len(self._until) > self._limit:
+            # pop(), not del. FastAPI runs these handlers in a threadpool, so two claims for the
+            # same node run this eviction concurrently: the keys were listed before the loop, a
+            # peer removed some of them first, and `del` then raised KeyError from inside the
+            # claim walk -- a 500 for a request whose honest answer was "nothing for you".
             for key in list(self._until)[: self._limit // 2]:
-                del self._until[key]
+                self._until.pop(key, None)
 
     def remembers(self, node_id: str, job_id: str) -> bool:
-        until = self._until.get((node_id, job_id))
+        key = (node_id, job_id)
+        until = self._until.get(key)
         if until is None:
             return False
         if until <= time.time():
-            del self._until[(node_id, job_id)]
+            # Same race, same fix: two threads both see it expired and both drop it. No lock,
+            # because this memo is ADVISORY -- losing an entry costs one re-judgement of one
+            # job, which is exactly what it cost before the memo existed.
+            self._until.pop(key, None)
             return False
         return True
 
@@ -360,9 +384,16 @@ def _job_requirements(job) -> "tuple[str | None, bool, bool]":
     registry = parse_personalities(os.environ)
     # The same env convention cli.py uses to build the dispatcher's EngineSpecs, so both
     # sides resolve one job to one personality.
+    # .lower() LIKE cli.py DOES (it builds the dispatcher's EngineSpecs with
+    # `.strip().lower()`), because `parse_personalities` keys the registry in lower case.
+    # Without it `BLASTBOX_ENGINE_CLAMAV_NETPOLICY=VPN` read as a personality this host has
+    # not got: in non-strict mode that is "nothing to check", so the job was handed to a node
+    # with no tier or credentials grant -- and the node, lowercasing the same value, resolved
+    # it to a real wireguard exit. Both sides must normalise identically or the hand-over
+    # authorises against a personality the run will not use.
     engine_default = (os.environ.get(
         f"BLASTBOX_ENGINE_{job.engine.upper().replace('-', '_')}_NETPOLICY")
-        or "none").strip() or "none"
+        or "none").strip().lower() or "none"
     # CAN THIS HOST RESOLVE WHAT THIS JOB NEEDS? Precisely, not by counting entries.
     #
     # * engine_default "none" and no per-job override -> the job genuinely IS ungoverned,
@@ -375,7 +406,8 @@ def _job_requirements(job) -> "tuple[str | None, bool, bool]":
     allow_override = (os.environ.get("BLASTBOX_ALLOW_NETPOLICY_OVERRIDE", "").strip()
                       .lower() in ("1", "true", "yes", "on"))
     can_tell = engine_default == "none" or engine_default in registry
-    if allow_override and job.net_policy and job.net_policy not in registry:
+    job_policy = (job.net_policy or "").strip().lower() or None
+    if allow_override and job_policy and job_policy not in registry:
         # The job SELECTS a personality this host has not got. `resolve_net_policy` falls
         # through to the engine default -- possibly "none" -- so it would look ungoverned
         # here while a node whose registry DOES hold that name resolves it to a real exit
@@ -385,7 +417,8 @@ def _job_requirements(job) -> "tuple[str | None, bool, bool]":
         can_tell = False
     try:
         personality = resolve_net_policy(
-            job_net_policy=job.net_policy, engine_default=engine_default,
+            job_net_policy=(job.net_policy or "").strip().lower() or None,
+            engine_default=engine_default,
             registry=registry, allow_override=allow_override)
         driver = getattr(personality, "exit_driver", "") or ""
     except Exception:               # noqa: BLE001
@@ -613,9 +646,18 @@ def register_node_claim_routes(
                 if not job_store.update_if_status(candidate.job_id, JobStatus.RUNNING,
                                                   expect_claim_id=candidate.claim_id,
                                                   claim_id=stamped):
+                    probes += 1         # CHARGED: see below
                     continue
                 candidate = job_store.get(candidate.job_id)
                 if candidate is None or candidate.claim_id != stamped:
+                    # CHARGED TOO. These two paths replaced a `for _ in range(...)` with a
+                    # `while`, and neither counted -- so a store that keeps losing the stamp CAS
+                    # made the walk bounded by the QUEUE DEPTH rather than by eight probes: one
+                    # request against a 500-job queue issued 501 claims and left all 500 RUNNING
+                    # with unprefixed claim ids, which is the immortal-row state stamping early
+                    # exists to prevent. A cost cap that only counts the paths that succeed is
+                    # not a cost cap.
+                    probes += 1
                     continue            # taken from under us; not ours to release either
                 if _refusals.remembers(node_id, candidate.job_id):
                     # Judged already, and recently. Stepping over it costs a claim and a release
@@ -764,6 +806,19 @@ def register_node_claim_routes(
             raise HTTPException(status_code=403, detail=_REFUSED)
         wanted = [e for e in (engine or []) if e] or list(grants.engines)
         allowed = sorted({e for e in wanted if grants.allows_engine(e)})
+        # ENGINE GRANT IS NOT ELIGIBILITY. A node granted an engine but NOT the network tier
+        # (or the credentials) its queued jobs need has every such job REFUSED by /claim after
+        # `_job_requirements` -- while this route counted them, and that number goes straight
+        # into DispatcherSizer. The pool then grows to its ceiling for work it can never run
+        # and takes that share of the node budget from a sibling pool that could drain it.
+        #
+        # Resolved PER ENGINE, not per job, because that is what a count can afford: the tier
+        # requirement comes from the engine's default personality, so one probe per engine
+        # answers it without enumerating the queue (which is the thing a node may not do). A
+        # job carrying its own `net_policy` override can still be counted and then refused;
+        # that is a narrower over-count than the engine-wide one, and it is the same
+        # approximation `untargeted_only` makes.
+        allowed = [e for e in allowed if _engine_is_claimable(grants, e)]
         if not allowed:
             # Nothing granted is not an error: it is a backlog of zero, for this caller.
             return {"queued": 0, "engines": []}
@@ -776,6 +831,26 @@ def register_node_claim_routes(
                                           untargeted_only=untargeted_only)),
             "engines": allowed,
         }
+
+    def _engine_is_claimable(grants, engine_name: str) -> bool:
+        """Would a plain job for this engine survive the claim route's own refusal check?
+
+        The same `_job_requirements` + `refusal` pair the walk uses, so the backlog cannot
+        promise work the hand-over would refuse. A host that cannot resolve the engine's
+        personality answers "yes" here unless strict mode is on -- matching the walk exactly,
+        which is the property that matters: these two must agree or the sizer is lied to.
+        """
+        from blastbox.host.jobs.base import Job, JobStatus
+        from blastbox.host.placement import refusal
+
+        probe = Job(job_id="", engine=engine_name, filename="", status=JobStatus.QUEUED,
+                    created_at=0.0)
+        tier, needs_credentials, could_tell = _job_requirements(probe)
+        why = refusal(grants, engine=engine_name, tier=tier,
+                      require_credentials=needs_credentials)
+        if why is None and not could_tell and _strict_tiers():
+            return False
+        return why is None
 
     def _owned_job(job_id: str, node_id: str, claim_id: str, receipt: str):
         """The job, if this node may write to it. Otherwise 403 -- and 403 for "no such job"
@@ -932,6 +1007,18 @@ def register_node_claim_routes(
         # string "queued" -- against the enum member, so it never matched and a node could
         # NEVER release a job: every release was a 400. Three independent reviewers found it,
         # and it was mine, introduced in the same change that added the release semantics.
+        if out.get("status") is JobStatus.QUEUED and "claim_id" not in out:
+            # THE RULE HELD IN ONE DIRECTION ONLY. Clearing claim_id required status=queued,
+            # but queueing did not require clearing claim_id -- so a node could write
+            # {"status": "queued", "claimable_after": now+3600} while KEEPING ownership. A
+            # deferred row is invisible to `claim_next`, so no peer can take it, and the holder
+            # stays authorised (its claim id and receipt still match) to renew before each hour
+            # expires: indefinite burial of a job it is granted, straight through both the
+            # per-write deferral ceiling and the total-burial bound this branch added.
+            raise HTTPException(
+                status_code=400,
+                detail="a release must clear the claim: send claim_id null in the same write "
+                       "as status \"queued\"")
         if "claim_id" in out and out.get("status") is not JobStatus.QUEUED:
             # Clearing the claim WITHOUT queueing left a job RUNNING with no owner: unclaimable
             # (claim_next sees only QUEUED), unwritable (_owned_job needs a claim id) and, with a
