@@ -1023,8 +1023,13 @@ class GvisorSnapshotBackend:
             # This tier IS checkpoint/restore, so rootless can never work here -- and without
             # this check it fails at the worst possible moment: the base boots, warms, signals
             # READY and checkpoints successfully, and only the first RESTORE (the first actual
-            # job) dies, which reads like snapshot corruption rather than a config error. The
-            # flag stays valid for non-snapshot gVisor use; it is this tier that cannot take it.
+            # job) dies, which reads like snapshot corruption rather than a config error.
+            #
+            # AND THIS IS CURRENTLY THE ONLY CONSUMER. No other tier builds a GvisorConfig, and
+            # the docker `--runtime=runsc` worker path never reads BLASTBOX_GVISOR_ROOTLESS -- so
+            # today the switch's only effect is this refusal. The `-rootless` argv and the uid-0
+            # pin are groundwork for a future non-snapshot tier, measured and kept so that tier
+            # does not have to rediscover them; they are not in force anywhere yet.
             raise GvisorCommandError(
                 "BLASTBOX_GVISOR_ROOTLESS is set, but the warm-snapshot tier needs runsc "
                 "`restore`, which gVisor does not support rootless (it fails with 'Rootless "

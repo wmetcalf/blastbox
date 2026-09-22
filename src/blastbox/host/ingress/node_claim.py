@@ -151,10 +151,15 @@ _REFUSAL_MEMO_TTL_S = 60.0
 #: and a node polls on a timer. 16 still steps over a wall deeper than the probe budget could
 #: reach while keeping the per-poll cost in the same order as the parent commit's.
 #:
-#: RESIDUAL, stated rather than hidden: a permanent wall of work no enrolled node can run still
-#: costs these writes on every poll. The real cure is to FAIL work no certificate in the fleet
-#: grants (the control plane can see every node's grants), not to walk past it forever; that is
-#: a separate change.
+#: NOW ONLY A BACKSTOP. Since round seven the walk passes every job this node has already been
+#: refused to `claim_next(exclude=...)`, so the store never offers a remembered job and stepping
+#: over one costs nothing. This branch only runs for a refusal the memo no longer holds (evicted
+#: past its size bound) -- i.e. for walls deeper than the memo, thousands of jobs.
+#:
+#: RESIDUAL, stated rather than hidden: a wall of work no enrolled node can run is still WALKED
+#: once per memo TTL -- eight fresh judgements a poll -- by every node granted its engine. The
+#: real cure is to FAIL work no certificate in the fleet grants (the control plane can see every
+#: node's grants) rather than to keep re-judging it; that is a separate change.
 _MAX_CLAIM_SKIPS = 16
 
 #: How long a job this node may NOT run is deferred for EVERYONE after a refusal. This is ALSO
@@ -173,8 +178,9 @@ _MAX_CLAIM_SKIPS = 16
 #:
 #: AND IT ONLY BOUNDS THE CHURN WHILE THE JOB IS YOUNG. Past MAX_TOTAL_DEFERRAL_S a refused job
 #: is released claimable, so the "at most one flip per window" property above holds for its first
-#: two minutes and not after: from then on the walk steps over it from the memo instead, which
-#: costs writes but hands it to any entitled peer immediately. See _MAX_CLAIM_SKIPS.
+#: two minutes and not after: from then on the store EXCLUDES it for this node (the refusal memo
+#: is passed to `claim_next`), which costs no writes and still hands it to any entitled peer
+#: immediately. See _MAX_CLAIM_SKIPS.
 _REFUSAL_DEFER_S = 20.0
 
 #: Prefix the control plane re-stamps onto the claim id of every job it hands to a node. It
@@ -244,13 +250,21 @@ class _RefusalMemo:
             for key in list(self._until)[: self._limit // 2]:
                 self._until.pop(key, None)
 
-    def remembered_for(self, node_id: str, *, limit: int = 256) -> "frozenset[str]":
-        """The jobs this node has been refused and whose refusal is still fresh, capped.
+    def remembered_for(self, node_id: str, *, limit: "int | None" = None) -> "frozenset[str]":
+        """The jobs this node has been refused and whose refusal is still fresh.
 
         Handed to `claim_next(exclude=...)` so the STORE never offers them -- see
-        _MAX_CLAIM_SKIPS for why stepping over them afterwards could not work. Capped because it
-        becomes a query parameter list; past the cap the walk's own skip branch is the backstop.
+        _MAX_CLAIM_SKIPS for why stepping over them afterwards could not work.
+
+        NOT CAPPED BELOW THE MEMO ITSELF. The first version capped this at 256 with the skip
+        branch as the backstop, which only moved the cliff: every refusal past the cap had to be
+        stepped over by hand, 16 at most per poll, so a wall of ~272 refused jobs was crossed
+        and a wall of 300 never was (measured, 199 polls). The bound that matters is the memo's
+        own size, and that is also comfortably inside what the stores accept as bound
+        parameters (SQLite 3.45 takes 32,767; Postgres 65,535). `limit` exists for tests.
         """
+        if limit is None:
+            limit = self._limit
         now = time.time()
         out: list[str] = []
         for (nid, jid), until in list(self._until.items()):
@@ -426,8 +440,9 @@ def _job_requirements(job) -> "tuple[str | None, bool, bool]":
     #   falls back to "none", and THAT is the silent hole: an operator declared a policy
     #   this host cannot see, so the tier and credentials grants would go unchecked while
     #   looking exactly like an ungoverned job. Unknown, and it must not read as permissive.
-    allow_override = (os.environ.get("BLASTBOX_ALLOW_NETPOLICY_OVERRIDE", "").strip()
-                      .lower() in ("1", "true", "yes", "on"))
+    # _overrides_allowed(), not a second inline parse: /backlog decides from the same function,
+    # and two parsers that agree only by coincidence are how the two routes drift apart.
+    allow_override = _overrides_allowed()
     can_tell = engine_default == "none" or engine_default in registry
     job_policy = (job.net_policy or "").strip().lower() or None
     if allow_override and job_policy and job_policy not in registry:

@@ -216,3 +216,23 @@ def test_a_credential_less_nodes_maintenance_tick_is_quiet(tmp_path, caplog):
     said = [r for r in caplog.records if "does not run on a credential-less node" in r.message]
     assert len(said) == 2, (
         f"expected one INFO per refused sweep, said once in total, got {len(said)}")
+
+
+def test_a_transient_store_error_does_not_stop_vm_maintenance(tmp_path):
+    """Round six split the stale-QUEUED sweep's list() out from under its broad handler to
+    recognise NodeStoreUnsupported -- and caught ONLY that. A `database is locked` then escaped
+    the sweep, _run_maintenance and the maintenance loop, whose future nothing restarts:
+    retention, pending-upload retries and orphan recovery stopped for the life of the process."""
+    import sqlite3
+
+    from blastbox.host.runtime.vm_dispatch import VmJobDispatcher
+
+    class Flaky(InMemoryJobStore):
+        def list(self, *a, **k):
+            raise sqlite3.OperationalError("database is locked")
+
+    d = VmJobDispatcher.__new__(VmJobDispatcher)
+    d._store = Flaky()
+    d._max_queued_age_s = 3600.0
+    d._engine = None
+    d._fail_stale_queued_jobs()          # must return, not raise

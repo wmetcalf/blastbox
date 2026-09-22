@@ -1137,6 +1137,16 @@ class VmJobDispatcher:
         except NodeStoreUnsupported:
             self._sweep_unsupported("the stale-QUEUED sweep")
             return
+        except Exception:  # noqa: BLE001 — a store blip must not stop maintenance for good
+            # BROAD, like the handler this list() used to sit under. Splitting it out to
+            # recognise NodeStoreUnsupported (round six) caught ONLY that, so a transient
+            # `database is locked` or a dropped Postgres connection escaped the sweep, then
+            # _run_maintenance, then the maintenance loop -- whose executor future nothing
+            # watches or restarts. Retention, pending-upload retries and orphan recovery all
+            # stopped while jobs kept being processed, until the dispatcher was restarted.
+            logger.warning("vm_dispatch: stale-queued sweep could not list the queue",
+                           exc_info=True)
+            return
         try:
             for job in queued:
                 # Normally scope the sweep to OUR engine (a peer dispatcher owns the others). But when

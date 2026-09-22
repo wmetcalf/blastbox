@@ -342,3 +342,19 @@ def test_a_reclaimed_job_is_not_the_first_live_receipt_evicted(tmp_path):
     assert "recycled" in s._claims, (
         "the re-claimed job's live receipt was evicted before claims older than it; its terminal "
         "write will be refused as 'no claim receipt'")
+
+
+def test_one_sweep_finishes_an_expiry(tmp_path):
+    """After the reservation the sweep re-points its expectation at EXPIRED; drop that and the
+    final CAS (still expecting FAILED) fails every time, so every expiry needs a second tick, the
+    blob delete re-runs, and the row sits EXPIRED with a live deadline in between. Asserting only
+    the status could never see it -- the reservation had already set EXPIRED."""
+    blobs = TestTheRetentionRaceFenceIsReachedFromTheRealCallSite.Blobs()
+    store = InMemoryJobStore()
+    store.create(Job(job_id="r", engine="boxjs", filename="f", status=JobStatus.FAILED,
+                     created_at=time.time() - 100, expires_at=time.time() - 1))
+    JobRetentionSweeper(tmp_path, blob_store=blobs).expire_due(store)
+    row = store.get("r")
+    assert row.status is JobStatus.EXPIRED
+    assert row.expires_at is None, "the expiry was only half-applied in one sweep"
+    assert blobs.deleted == ["r"]

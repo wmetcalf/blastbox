@@ -727,6 +727,14 @@ class SqlJobStore:
         placeholders = ",".join([self._param] * len(engines))
         return f"AND engine IN ({placeholders}) ", list(engines)
 
+    def _max_exclude(self) -> int:
+        """How many ids one claim query may exclude, leaving headroom for its own parameters."""
+        if self._driver == "sqlite":
+            import sqlite3
+
+            return 32_000 if sqlite3.sqlite_version_info >= (3, 32, 0) else 900
+        return 60_000
+
     def _exclude_clause(self, exclude: "Collection[str]") -> tuple[str, _list[str]]:
         """``AND job_id NOT IN (?,?,..)`` for jobs this claimant must not be handed, or empty.
 
@@ -735,6 +743,14 @@ class SqlJobStore:
         ids = sorted({str(x) for x in exclude})
         if not ids:
             return "", []
+        # THE DRIVER'S LIMIT, NOT A GUESS. SQLite before 3.32 accepts only 999 bound parameters
+        # per statement, and the claim query binds a handful of its own; past that the claim
+        # route would 500 rather than skip. Modern SQLite (32,766) and Postgres (65,535) take
+        # the whole refusal memo. A truncated exclusion is safe -- the walk's skip branch steps
+        # over whatever the store still offers -- so trimming is the right failure.
+        cap = self._max_exclude()
+        if len(ids) > cap:
+            ids = ids[:cap]
         placeholders = ",".join([self._param] * len(ids))
         return f"AND job_id NOT IN ({placeholders}) ", ids
 

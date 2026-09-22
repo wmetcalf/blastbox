@@ -239,3 +239,35 @@ def test_an_expiring_leaf_without_a_ca_key_is_still_served(tmp_path, monkeypatch
                               no_tls=False)
     out = cli._serve_tls(args)
     assert out and out["ssl_certfile"].endswith("ingress-server.crt")
+
+
+def test_a_rotated_out_leaf_inside_the_renewal_window_still_refuses(tmp_path, monkeypatch):
+    """The first CA check ran only for leaves with MORE than the renewal window left, so a
+    rotated-out leaf with 5 days remaining -- a quarter of a 30-day leaf's life -- skipped it,
+    took the expiry fallback on a keyless host, and was served to nodes that all reject it."""
+    import argparse
+    import datetime
+
+    import pytest
+
+    from blastbox.host import cli, pki
+
+    d = tmp_path / "pki"
+    pki.ensure_ca(d).issue_server(["127.0.0.1"], cn="blastbox-ingress").write(d, "ingress-server")
+    (d / "ca.crt").unlink()
+    (d / "ca.key").unlink()
+    pki.ensure_ca(d)
+    (d / "ca.key").unlink()
+    real_now = datetime.datetime.now
+
+    class NearExpiry(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return real_now(tz) + datetime.timedelta(days=25)   # inside the 7-day window
+
+    monkeypatch.setattr(datetime, "datetime", NearExpiry)
+    monkeypatch.setenv("BLASTBOX_PKI_DIR", str(d))
+    args = argparse.Namespace(host="127.0.0.1", port=8443, tls_cert=None, tls_key=None,
+                              no_tls=False)
+    with pytest.raises(SystemExit, match="rotated"):
+        cli._serve_tls(args)

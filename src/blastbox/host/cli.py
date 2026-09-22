@@ -200,8 +200,13 @@ def _serve_tls(args: argparse.Namespace) -> dict:
         # newly-enrolled node -- which trusts the replacement anchor -- rejects it at the
         # handshake, while this host reports TLS on and never reaches the re-issuance path
         # below, so even a host holding the new CA key cannot heal itself.
+        # NOT GATED ON `left`. The first version checked only leaves with more than the
+        # renewal window remaining, so a rotated-out leaf with < 7 days left (a quarter of a
+        # 30-day leaf's life) kept `_ca_mismatch` False and took the EXPIRY fallback below --
+        # serving a certificate every node rejects, with a log line about expiry. Whether a
+        # leaf chains to the current anchor has nothing to do with its clock.
         _ca_mismatch = False
-        if left > _TLS_RENEW_BEFORE_S and not _leaf_matches_ca(existing_crt, pki_dir / "ca.crt"):
+        if not _leaf_matches_ca(existing_crt, pki_dir / "ca.crt"):
             _log.warning("serve: the ingress certificate in %s was not issued by the CA "
                          "currently in ca.crt (the anchor was rotated); re-issuing rather than "
                          "serving a leaf every node will reject", pki_dir)

@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import time
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -142,3 +143,129 @@ def test_without_overrides_the_backlog_still_hides_ineligible_engines(tmp_path, 
     store.create(Job(job_id="gov", engine="clamav", filename="f", status=JobStatus.QUEUED,
                      created_at=time.time()))
     assert c.get("/v1/nodes/backlog", headers=h).json()["queued"] == 0
+
+
+def test_a_wall_deeper_than_the_old_exclusion_cap_is_still_crossed(tmp_path, monkeypatch):
+    """The exclusion was first capped at 256 ids, with the skip branch (16) as the backstop -- which
+    only moved the cliff: measured, a 272-deep wall was crossed, a 300-deep one never was in 199
+    polls. The exclusion now covers everything the memo remembers, so the only bound is the memo
+    itself. 300 is the depth that failed."""
+    c, store, h = _rig(tmp_path, monkeypatch, grants=pki.NodeGrants(
+        engines=("clamav", "boxjs"), tiers=(), credentials=False), env=WALL_ENV)
+    now = time.time()
+    depth = 300
+    for i in range(depth):
+        store.create(Job(job_id=f"wall{i:04d}", engine="clamav", filename="f",
+                         status=JobStatus.QUEUED,
+                         created_at=now - nc.MAX_TOTAL_DEFERRAL_S - 5000 + i))
+    store.create(Job(job_id="behind", engine="boxjs", filename="f", status=JobStatus.QUEUED,
+                     created_at=now))
+    got = None
+    for _ in range(depth // nc._MAX_CLAIM_PROBES + 20):
+        r = c.post("/v1/nodes/claim", json={}, headers=h)
+        if r.status_code == 200:
+            got = r.json()["job"]["job_id"]
+            break
+    assert got == "behind", f"a {depth}-deep refusal wall starved the job behind it"
+
+
+def test_the_exclusion_never_truncates_what_the_memo_remembers():
+    memo = nc._RefusalMemo(ttl_s=60.0)
+    for i in range(1000):
+        memo.remember("n", f"j{i}")
+    assert len(memo.remembered_for("n")) == 1000, (
+        "the exclusion dropped live refusals; every one it drops is a job the walk must step "
+        "over by hand, and past the skip budget that is starvation again")
+
+
+class _IgnoresExclude(InMemoryJobStore):
+    """A store that drops `exclude` -- what the walk sees when the exclusion is truncated (an old
+    SQLite's parameter limit) or a refusal was evicted from the memo. The skip branch is then the
+    ONLY bound on a poll, so this is the one place it can be exercised at all."""
+
+    def claim_next(self, *, claimant_tier=None, engine=None, exclude=()):
+        return super().claim_next(claimant_tier=claimant_tier, engine=engine)
+
+
+def test_the_skip_backstop_bounds_a_poll_when_the_store_cannot_exclude(tmp_path, monkeypatch):
+    """A literal bound, not one derived from the constant under test: the previous cost-cap test
+    took both its depth and its bound from _MAX_CLAIM_SKIPS, and after the exclusion landed it
+    never reached the skip branch at all -- three mutations of it survived the suite."""
+    store = _IgnoresExclude()
+    c, store, h = _rig(tmp_path, monkeypatch, grants=pki.NodeGrants(
+        engines=("clamav",), tiers=(), credentials=False), env=WALL_ENV, store=store)
+    now = time.time()
+    for i in range(400):
+        store.create(Job(job_id=f"w{i:04d}", engine="clamav", filename="f",
+                         status=JobStatus.QUEUED,
+                         created_at=now - nc.MAX_TOTAL_DEFERRAL_S - 5000 + i))
+    for _ in range(60):                              # judge the whole wall
+        c.post("/v1/nodes/claim", json={}, headers=h)
+    calls = {"n": 0}
+    real = store.claim_next
+
+    def counted(**k):
+        calls["n"] += 1
+        return real(**k)
+
+    monkeypatch.setattr(store, "claim_next", counted)
+    c.post("/v1/nodes/claim", json={}, headers=h)
+    assert calls["n"] <= 40, (
+        f"one poll made {calls['n']} claims against a 400-job wall the store would not exclude: "
+        "the skip backstop is gone, so each poll pays a claim, a stamp and a release per job")
+
+
+def test_a_read_back_that_keeps_disagreeing_still_charges_the_budget(tmp_path, monkeypatch):
+    """The SECOND 'CHARGED TOO' path: the stamp CAS lands but the re-read shows a different claim
+    id (a racing sweeper, or replica lag). The first test only ever lost the CAS, so removing the
+    charge on THIS path survived -- and a poll became bounded by queue depth, not eight probes."""
+    class ReadBackDisagrees(InMemoryJobStore):
+        def get(self, job_id):
+            job = super().get(job_id)
+            if job is not None and (job.claim_id or "").startswith("node:"):
+                job.claim_id = "someone-else"
+            return job
+
+    store = ReadBackDisagrees()
+    c, store, h = _rig(tmp_path, monkeypatch, grants=pki.NodeGrants(engines=("boxjs",)),
+                       env={"BLASTBOX_ENGINE_BOXJS_NETPOLICY": "none"}, store=store)
+    for i in range(200):
+        store.create(Job(job_id=f"j{i:03d}", engine="boxjs", filename="f",
+                         status=JobStatus.QUEUED, created_at=time.time() - 1000 + i))
+    calls = {"n": 0}
+    real = store.claim_next
+
+    def counted(**k):
+        calls["n"] += 1
+        return real(**k)
+
+    monkeypatch.setattr(store, "claim_next", counted)
+    c.post("/v1/nodes/claim", json={}, headers=h)
+    assert calls["n"] <= 20, f"one poll made {calls['n']} claims against a 200-job queue"
+
+
+def test_strict_tiers_backlog_agrees_with_the_claim_route(tmp_path, monkeypatch):
+    """With strict tiers on and an engine default this host cannot resolve, /claim refuses every
+    such job. /backlog must say zero, or the sizer grows a pool for work that is never handed out.
+    The strict branch of _engine_is_claimable could be deleted with the suite green."""
+    c, store, h = _rig(tmp_path, monkeypatch, grants=pki.NodeGrants(engines=("clamav",)),
+                       env={"BLASTBOX_ENGINE_CLAMAV_NETPOLICY": "notconfiguredhere",
+                            "BLASTBOX_NODE_CLAIM_STRICT_TIERS": "1"})
+    store.create(Job(job_id="x", engine="clamav", filename="f", status=JobStatus.QUEUED,
+                     created_at=time.time()))
+    assert c.post("/v1/nodes/claim", json={}, headers=h).status_code == 204
+    assert c.get("/v1/nodes/backlog", headers=h).json()["queued"] == 0, (
+        "/backlog counted work /claim refuses under strict tiers")
+
+
+@pytest.mark.parametrize("spelling", ["1", "true", "yes", "on", "TRUE"])
+def test_the_override_switch_reads_the_same_on_both_routes(tmp_path, monkeypatch, spelling):
+    """One parser now, used by both the claim walk and the backlog. Two parsers that agreed only by
+    coincidence meant `=true` could hide runnable override work from the sizer."""
+    c, store, h = _rig(tmp_path, monkeypatch, grants=pki.NodeGrants(
+        engines=("clamav",), tiers=(), credentials=False), env={
+            **WALL_ENV, "BLASTBOX_ALLOW_NETPOLICY_OVERRIDE": spelling})
+    store.create(Job(job_id="picks-none", engine="clamav", filename="f",
+                     status=JobStatus.QUEUED, created_at=time.time(), net_policy="none"))
+    assert c.get("/v1/nodes/backlog", headers=h).json()["queued"] >= 1
+    assert c.post("/v1/nodes/claim", json={}, headers=h).status_code == 200
