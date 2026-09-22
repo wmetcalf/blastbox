@@ -187,3 +187,55 @@ def test_a_certificate_from_a_ROTATED_ca_is_not_reused(tmp_path, monkeypatch, ca
     assert (d / "ingress-server.crt").read_bytes() != old_bytes, (
         "ingress reused a leaf signed by the RETIRED CA; every node trusting the new anchor "
         "will fail the handshake and this host never reaches re-issuance")
+
+
+def test_a_rotated_ca_without_its_key_refuses_to_start(tmp_path, monkeypatch):
+    """The hardened layout: ca.crt present, ca.key deliberately absent. Rotate the anchor and the
+    old leaf is not merely expiring, it is unusable -- every node trusting the new CA rejects it.
+    The expiry fallback served it anyway, starting a control plane no federated node can reach
+    and logging an expiry warning, which is the one thing that was not wrong."""
+    import argparse
+
+    import pytest
+
+    from blastbox.host import cli, pki
+
+    d = tmp_path / "pki"
+    old_ca = pki.ensure_ca(d)
+    old_ca.issue_server(["127.0.0.1"], cn="blastbox-ingress").write(d, "ingress-server")
+    (d / "ca.crt").unlink()
+    (d / "ca.key").unlink()
+    pki.ensure_ca(d)                         # the rotation...
+    (d / "ca.key").unlink()                  # ...on a host that never holds the signing key
+    monkeypatch.setenv("BLASTBOX_PKI_DIR", str(d))
+    args = argparse.Namespace(host="127.0.0.1", port=8443, tls_cert=None, tls_key=None,
+                              no_tls=False)
+    with pytest.raises(SystemExit, match="rotated"):
+        cli._serve_tls(args)
+
+
+def test_an_expiring_leaf_without_a_ca_key_is_still_served(tmp_path, monkeypatch, caplog):
+    """The fallback the fix must NOT disturb: a leaf that merely nears its deadline still works,
+    so a hardened host keeps serving it and says loudly how long is left."""
+    import argparse
+    import datetime
+
+    from blastbox.host import cli, pki
+
+    d = tmp_path / "pki"
+    ca = pki.ensure_ca(d)
+    ca.issue_server(["127.0.0.1"], cn="blastbox-ingress").write(d, "ingress-server")
+    (d / "ca.key").unlink()
+    real_now = datetime.datetime.now
+
+    class Later(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return real_now(tz) + datetime.timedelta(days=29)
+
+    monkeypatch.setattr(datetime, "datetime", Later)
+    monkeypatch.setenv("BLASTBOX_PKI_DIR", str(d))
+    args = argparse.Namespace(host="127.0.0.1", port=8443, tls_cert=None, tls_key=None,
+                              no_tls=False)
+    out = cli._serve_tls(args)
+    assert out and out["ssl_certfile"].endswith("ingress-server.crt")

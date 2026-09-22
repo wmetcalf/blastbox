@@ -264,7 +264,10 @@ class HttpJobStore:
 
     # -- the JobStore surface a node needs ---------------------------------------
     def claim_next(self, *, claimant_tier: str | None = None,
-                   engine: "str | Any | None" = None) -> "Job | None":
+                   engine: "str | Any | None" = None,
+                   exclude: "Any" = ()) -> "Job | None":
+        # `exclude` is accepted for JobStore conformance and deliberately NOT sent: which jobs a
+        # node has been refused is the control plane's memory, not something a node may steer.
         """Claim work this node is granted. The control plane decides, not this process."""
         from blastbox.host.jobs.base import Job
 

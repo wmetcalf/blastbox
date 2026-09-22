@@ -63,7 +63,11 @@ fi
 # VERIFY WHAT IS ON DISK, whether we fetched it or found it already there: an operator who
 # ran this script months ago has whatever the URLs served THEN.
 if [[ -s "$kern" ]]; then
-  kver="$(strings "$kern" 2>/dev/null | grep -oE 'Linux version [0-9]+\.[0-9]+' | head -1 | awk '{print $3}')"
+  # grep -a, not `strings`: no binutils dependency. And `|| true`, because under
+  # `set -euo pipefail` a kernel with no matching banner made grep exit 1 and the whole
+  # installer ABORTED here -- after firecracker was already installed, and without printing
+  # either the kernel warning or the next steps.
+  kver="$(grep -aoE 'Linux version [0-9]+\.[0-9]+' "$kern" 2>/dev/null | head -1 | awk '{print $3}' || true)"
   if [[ -n "$kver" ]]; then
     kmaj="${kver%%.*}"; kmin="${kver#*.}"
     if (( kmaj < 5 || (kmaj == 5 && kmin < 18) )); then
@@ -74,6 +78,10 @@ if [[ -s "$kern" ]]; then
       exit 1
     fi
     echo "   guest kernel: Linux $kver"
+  else
+    echo "!! could not read a version banner from $kern, so it cannot be checked against the"
+    echo "   >= 5.18 requirement. If live FC tests then fail with 'guest never signalled READY',"
+    echo "   suspect the kernel first: run the VM by hand and read its console for a panic."
   fi
 else
   echo "!! kernel download failed — every published URL 404'd (they drift between firecracker"

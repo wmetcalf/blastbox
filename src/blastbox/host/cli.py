@@ -200,11 +200,13 @@ def _serve_tls(args: argparse.Namespace) -> dict:
         # newly-enrolled node -- which trusts the replacement anchor -- rejects it at the
         # handshake, while this host reports TLS on and never reaches the re-issuance path
         # below, so even a host holding the new CA key cannot heal itself.
+        _ca_mismatch = False
         if left > _TLS_RENEW_BEFORE_S and not _leaf_matches_ca(existing_crt, pki_dir / "ca.crt"):
             _log.warning("serve: the ingress certificate in %s was not issued by the CA "
                          "currently in ca.crt (the anchor was rotated); re-issuing rather than "
                          "serving a leaf every node will reject", pki_dir)
             left = -1.0
+            _ca_mismatch = True
         if left > _TLS_RENEW_BEFORE_S:
             _log.info("serve: TLS on, using the server certificate already in %s (%.0f days "
                       "left)", pki_dir, left / 86400)
@@ -214,12 +216,28 @@ def _serve_tls(args: argparse.Namespace) -> dict:
         _reissue_wanted = True
     else:
         _reissue_wanted = False
+        _ca_mismatch = False
 
     from blastbox.host.pki import load_ca
 
     try:
         ca = load_ca(pki_dir)
     except Exception as exc:            # noqa: BLE001 - verify-only host, no CA key here
+        if _reissue_wanted and _ca_mismatch:
+            # NOT THE EXPIRY FALLBACK BELOW. That one serves the existing leaf because it still
+            # WORKS until its deadline. A leaf from a rotated-out CA does not work at all: every
+            # node that trusts the replacement anchor rejects it at the handshake. Serving it
+            # would start a control plane that no federated node can reach, with a log line that
+            # talks about expiry -- the one thing that is not wrong. On the hardened layout
+            # (ca.crt present, ca.key deliberately absent) this host cannot fix it itself, so
+            # it says exactly what to do instead of pretending.
+            raise SystemExit(
+                f"serve: {existing_crt} was issued by a CA that is no longer the one in "
+                f"{pki_dir / 'ca.crt'} (the anchor was rotated), and this host has no CA key to "
+                f"re-issue it ({exc}). Every node that trusts the new anchor would reject this "
+                f"certificate, so ingress will not start with it. On the CA host run "
+                f"`blastbox pki issue-server` for this host's names and copy the pair to "
+                f"{existing_crt} / {existing_key}.") from None
         if _reissue_wanted:
             # A hardened ingress holds no CA key, so it cannot renew its own certificate. Do
             # not refuse to start over it -- serve the one we have and make the deadline loud.

@@ -244,6 +244,22 @@ class _RefusalMemo:
             for key in list(self._until)[: self._limit // 2]:
                 self._until.pop(key, None)
 
+    def remembered_for(self, node_id: str, *, limit: int = 256) -> "frozenset[str]":
+        """The jobs this node has been refused and whose refusal is still fresh, capped.
+
+        Handed to `claim_next(exclude=...)` so the STORE never offers them -- see
+        _MAX_CLAIM_SKIPS for why stepping over them afterwards could not work. Capped because it
+        becomes a query parameter list; past the cap the walk's own skip branch is the backstop.
+        """
+        now = time.time()
+        out: list[str] = []
+        for (nid, jid), until in list(self._until.items()):
+            if nid == node_id and until > now:
+                out.append(jid)
+                if len(out) >= limit:
+                    break
+        return frozenset(out)
+
     def remembers(self, node_id: str, job_id: str) -> bool:
         key = (node_id, job_id)
         until = self._until.get(key)
@@ -348,6 +364,13 @@ def resolve_pki_dir(pki_dir: "Path | str | None" = None) -> Path | None:
             f"{anchor} exists but cannot be loaded ({exc}). Refusing to start without the "
             "node-claim routes: a broken trust anchor is not the same as none.") from exc
     return d
+
+
+def _overrides_allowed() -> bool:
+    """Whether a job may select its own network personality (BLASTBOX_ALLOW_NETPOLICY_OVERRIDE).
+    One reading, shared by the claim walk and the backlog, so the two cannot disagree."""
+    return (os.environ.get("BLASTBOX_ALLOW_NETPOLICY_OVERRIDE", "").strip().lower()
+            in ("1", "true", "yes", "on"))
 
 
 def _job_requirements(job) -> "tuple[str | None, bool, bool]":
@@ -631,7 +654,15 @@ def register_node_claim_routes(
         skips = 0
         try:
             while probes < _MAX_CLAIM_PROBES and skips < _MAX_CLAIM_SKIPS:
-                candidate = job_store.claim_next(engine=frozenset(allowed))
+                # EXCLUDE WHAT THIS NODE HAS ALREADY BEEN REFUSED, in the store query itself.
+                # `claim_next` is strictly oldest-first, so stepping over refused jobs AFTER
+                # they were handed out meant a wall deeper than _MAX_CLAIM_SKIPS was the same
+                # prefix on every poll -- the walk stopped before reaching anything behind it,
+                # forever, and paid a claim, a stamp and a release per remembered job for the
+                # privilege. With the exclusion the store simply does not offer them: nothing
+                # to release, nothing to re-stamp, and nothing in the way.
+                candidate = job_store.claim_next(
+                    engine=frozenset(allowed), exclude=_refusals.remembered_for(node_id))
                 if candidate is None:
                     break
                 # STAMP THE PREFIX FIRST, before judging and before the memo check. The prefix
@@ -818,7 +849,15 @@ def register_node_claim_routes(
         # job carrying its own `net_policy` override can still be counted and then refused;
         # that is a narrower over-count than the engine-wide one, and it is the same
         # approximation `untargeted_only` makes.
-        allowed = [e for e in allowed if _engine_is_claimable(grants, e)]
+        # ...BUT ONLY WHEN A JOB CANNOT CHOOSE ITS OWN POLICY. With
+        # BLASTBOX_ALLOW_NETPOLICY_OVERRIDE on, a job may select a personality this node CAN
+        # run even though the engine's default needs a tier it lacks -- /claim hands that job
+        # over, and filtering the whole engine here reported zero for it, pinning the node's
+        # sizer at its floor with runnable work queued. Per-job eligibility would need the queue
+        # enumerated, which a node may not have; so with overrides on this falls back to the
+        # engine grant alone, which over-counts rather than hiding work that can run.
+        if not _overrides_allowed():
+            allowed = [e for e in allowed if _engine_is_claimable(grants, e)]
         if not allowed:
             # Nothing granted is not an error: it is a backlog of zero, for this caller.
             return {"queued": 0, "engines": []}

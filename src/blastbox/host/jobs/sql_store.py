@@ -727,21 +727,35 @@ class SqlJobStore:
         placeholders = ",".join([self._param] * len(engines))
         return f"AND engine IN ({placeholders}) ", list(engines)
 
+    def _exclude_clause(self, exclude: "Collection[str]") -> tuple[str, _list[str]]:
+        """``AND job_id NOT IN (?,?,..)`` for jobs this claimant must not be handed, or empty.
+
+        Bounded by the caller (the ingress refusal memo), so the parameter list cannot grow
+        without limit; an empty collection adds nothing to the query."""
+        ids = sorted({str(x) for x in exclude})
+        if not ids:
+            return "", []
+        placeholders = ",".join([self._param] * len(ids))
+        return f"AND job_id NOT IN ({placeholders}) ", ids
+
     def claim_next(self, *, claimant_tier: str | None = None,
-                   engine: "str | Collection[str] | None" = None) -> Job | None:
+                   engine: "str | Collection[str] | None" = None,
+                   exclude: "Collection[str]" = ()) -> Job | None:
         engines = normalize_engine_filter(engine)
         if self._driver == "sqlite":
-            return self._claim_next_sqlite(claimant_tier, engines)
-        return self._claim_next_postgres(claimant_tier, engines)
+            return self._claim_next_sqlite(claimant_tier, engines, exclude)
+        return self._claim_next_postgres(claimant_tier, engines, exclude)
 
     def _claim_next_sqlite(self, claimant_tier: str | None = None,
-                           engines: tuple[str, ...] | None = None) -> Job | None:
+                           engines: tuple[str, ...] | None = None,
+                           exclude: "Collection[str]" = ()) -> Job | None:
         # target_tier routing: claim a job only if it has no target, or its target matches
         # this claimant's tier. Binding claimant_tier=None makes `target_tier = NULL` (never
         # true in SQL), so the predicate collapses to `target_tier IS NULL` — an untiered
         # claimant takes only untargeted jobs. Existing rows are NULL → unchanged behaviour.
         # `engines`: when set, restrict to `engine IN (...)`; absent = no engine filter.
         eng_clause, eng_params = self._engine_clause(engines)
+        exc_clause, exc_params = self._exclude_clause(exclude)
         # Eligibility: skip jobs a dispatcher DEFERRED (claimable_after in the future) so a
         # capacity-blocked cold job doesn't get reclaimed in a loop ahead of claimable work.
         now = time.time()
@@ -751,6 +765,7 @@ class SqlJobStore:
             f"AND (target_tier IS NULL OR target_tier = {self._param}) "
             f"AND (claimable_after IS NULL OR claimable_after <= {self._param}) "
             f"{eng_clause}"
+            f"{exc_clause}"
             f"ORDER BY created_at ASC, job_id ASC LIMIT 1"
         )
         # The UPDATE is a compare-and-swap: it only fires if the row is STILL
@@ -767,7 +782,8 @@ class SqlJobStore:
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                select_sql, (JobStatus.QUEUED.value, claimant_tier, now, *eng_params)
+                select_sql, (JobStatus.QUEUED.value, claimant_tier, now, *eng_params,
+                             *exc_params)
             ).fetchone()
             if row is None:
                 return None
@@ -795,12 +811,14 @@ class SqlJobStore:
             return job
 
     def _claim_next_postgres(self, claimant_tier: str | None = None,
-                             engines: tuple[str, ...] | None = None) -> Job | None:
+                             engines: tuple[str, ...] | None = None,
+                             exclude: "Collection[str]" = ()) -> Job | None:
         cols_jobs = ", ".join(f"jobs.{col}" for col in _COLUMNS)
         # target_tier routing (see _claim_next_sqlite): only rows with no target or a target
         # matching this claimant are eligible; claimant_tier=None ⇒ target_tier IS NULL only.
         # `engines`: when set, restrict to `engine IN (...)`; absent = no engine filter.
         eng_clause, eng_params = self._engine_clause(engines)
+        exc_clause, exc_params = self._exclude_clause(exclude)
         # Eligibility: skip DEFERRED jobs (claimable_after in the future) — see _claim_next_sqlite.
         sql = f"""
         WITH next_job AS (
@@ -810,6 +828,7 @@ class SqlJobStore:
             AND (target_tier IS NULL OR target_tier = {self._param})
             AND (claimable_after IS NULL OR claimable_after <= {self._param})
             {eng_clause}
+            {exc_clause}
             ORDER BY created_at ASC, job_id ASC
             FOR UPDATE SKIP LOCKED
             LIMIT 1
@@ -825,6 +844,7 @@ class SqlJobStore:
             claimant_tier,
             time.time(),
             *eng_params,
+            *exc_params,
             JobStatus.RUNNING.value,
             time.time(),
             uuid.uuid4().hex,  # fresh ownership token per claim

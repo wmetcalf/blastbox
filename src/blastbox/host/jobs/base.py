@@ -314,13 +314,21 @@ class JobStore(Protocol):
         ...
 
     def claim_next(self, *, claimant_tier: str | None = None,
-                   engine: str | Collection[str] | None = None) -> Job | None:
+                   engine: str | Collection[str] | None = None,
+                   exclude: Collection[str] = ()) -> Job | None:
         """Atomically claim the oldest eligible QUEUED job → RUNNING. ``claimant_tier`` routes by
         ``target_tier``; ``engine`` (when set) restricts the claim to jobs for that engine — a single
         name OR the SET of engines this claimant handles. So a VM dispatcher (``engine="authenticode"``)
         and a cold dispatcher (``engine=set(self._engines)``) sharing one store each claim only their
         own jobs, instead of the cold one grabbing a VM-engine job first and failing it ``unknown
-        engine``. ``engine=None`` = any engine (default; unchanged behaviour)."""
+        engine``. ``engine=None`` = any engine (default; unchanged behaviour).
+
+        ``exclude`` names jobs this claimant must NOT be handed, even when they are the oldest
+        eligible. The ingress control plane passes the jobs a node has already been refused
+        (#178): `claim_next` is strictly oldest-first, so stepping over them AFTER they were
+        handed out meant a wall of refused jobs deeper than the walk's budget was the same
+        prefix on every poll, and nothing behind it was ever reached. Empty = no exclusion
+        (every existing caller; unchanged behaviour)."""
         ...
     def delete(self, job_id: str) -> None: ...
 

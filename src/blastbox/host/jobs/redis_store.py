@@ -256,7 +256,8 @@ class RedisJobStore:
         return n
 
     def claim_next(self, *, claimant_tier: str | None = None,
-                   engine: "str | Collection[str] | None" = None) -> Job | None:
+                   engine: "str | Collection[str] | None" = None,
+                   exclude: "Collection[str]" = ()) -> Job | None:
         """Atomically claim the oldest QUEUED job.
 
         Scans all keys with the store prefix, picks the oldest QUEUED job,
@@ -269,6 +270,7 @@ class RedisJobStore:
         this claimant handles) restricts the claim (shared multi-engine stores).
         """
         engines = normalize_engine_filter(engine)
+        excluded = frozenset(exclude)
         while True:
             now = time.time()
             candidates: list[tuple[float, str, str]] = []
@@ -280,6 +282,8 @@ class RedisJobStore:
                 if job is None:
                     continue
                 if job.target_tier is not None and job.target_tier != claimant_tier:
+                    continue
+                if job.job_id in excluded:
                     continue
                 if engines is not None and job.engine not in engines:
                     continue

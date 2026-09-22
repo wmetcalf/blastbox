@@ -162,7 +162,8 @@ class InMemoryJobStore:
         return len(jobs)
 
     def claim_next(self, *, claimant_tier: str | None = None,
-                   engine: "str | Collection[str] | None" = None) -> Job | None:
+                   engine: "str | Collection[str] | None" = None,
+                   exclude: "Collection[str]" = ()) -> Job | None:
         """Atomically claim the oldest QUEUED job and flip it to RUNNING.
 
         ``claimant_tier`` routes: a job with ``target_tier`` set is claimable only by a
@@ -170,6 +171,7 @@ class InMemoryJobStore:
         or the set of engines this claimant handles) restricts the claim (shared multi-engine stores).
         """
         engines = normalize_engine_filter(engine)
+        excluded = frozenset(exclude)
         now = time.time()
         with self._lock:
             queued = [
@@ -177,6 +179,7 @@ class InMemoryJobStore:
                 if job.status == JobStatus.QUEUED
                 and (job.target_tier is None or job.target_tier == claimant_tier)
                 and (engines is None or job.engine in engines)
+                and job.job_id not in excluded
                 # skip DEFERRED jobs (claimable_after in the future) so a capacity-blocked cold job
                 # isn't reclaimed ahead of claimable work
                 and (job.claimable_after is None or job.claimable_after <= now)
