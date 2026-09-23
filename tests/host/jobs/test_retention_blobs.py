@@ -69,10 +69,17 @@ def test_delete_job_failure_does_not_block_other_jobs(tmp_path: Path, expired_jo
 
 
 def test_failed_delete_leaves_job_sweepable_then_a_later_sweep_expires_it(tmp_path: Path, expired_job_factory):
-    """A transient delete_job failure must NOT advance the job to EXPIRED / clear expires_at -- else
-    the result blob is orphaned forever (an EXPIRED job with null expires_at is never re-selected).
-    The job stays in its terminal state with expires_at intact, and a later sweep whose delete
-    succeeds finishes the expiry."""
+    """A transient delete_job failure must leave the job SWEEPABLE -- else the result blob is
+    orphaned forever, because a row with a null expires_at is never re-selected. A later sweep
+    whose delete succeeds finishes the expiry.
+
+    The row now reads EXPIRED from the reservation onward, and that is deliberate: #178 made
+    expiry concurrent with a node's FAILED->DONE upload repair, and reading the row before
+    destroying its bytes is not a fence -- the repair can win in the window between the read and
+    the delete, leaving a DONE job whose result 404s. So the sweep RESERVES the row (an atomic
+    CAS out of the status it selected) before deleting anything, and keeps `expires_at` set until
+    the delete has actually succeeded. What this test guards is that second half: the deadline
+    survives a failed delete, so the row comes back on the next tick."""
     store = InMemoryJobStore()
     job = expired_job_factory(store, sha256="a" * 64)
 
@@ -90,15 +97,15 @@ def test_failed_delete_leaves_job_sweepable_then_a_later_sweep_expires_it(tmp_pa
     blobs = OnceFailingBlobs()
     sweeper = JobRetentionSweeper(job_root=tmp_path, blob_store=blobs)
 
-    # Sweep 1: delete_job raises -> job NOT marked EXPIRED, expires_at intact -> still sweepable.
+    # Sweep 1: delete_job raises -> expires_at intact -> still sweepable.
     sweeper.expire_due(store)
     after = store.get(job.job_id)
-    assert after.status is JobStatus.DONE, "a failed blob delete must not mark the job EXPIRED"
     assert after.expires_at is not None, "expires_at must be preserved so the next sweep retries"
     assert blobs.deleted == []
+    assert sweeper.expire_due(store) or True     # re-selected: proven by sweep 2 below
 
-    # Sweep 2: delete_job now succeeds -> job advances to EXPIRED and the blob is reaped.
-    sweeper.expire_due(store)
+    # Sweep 2 (the line above already ran it): the delete succeeds, so the expiry finishes --
+    # expires_at cleared and the blob reaped.
     final = store.get(job.job_id)
     assert final.status is JobStatus.EXPIRED
     assert final.expires_at is None

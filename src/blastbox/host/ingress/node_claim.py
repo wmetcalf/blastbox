@@ -141,10 +141,39 @@ _MAX_CLAIM_PROBES = 8
 #: IS granted, for as long as they existed: the probe cap, which is only a cost cap, became the
 #: mechanism. The memo lets the walk step over that wall without re-paying to judge it.
 #:
-#: SHORT, because a certificate can be renewed with MORE grants while a job sits there; one
-#: minute bounds how long a newly-entitled node keeps stepping over work it can now run.
-_REFUSAL_MEMO_TTL_S = 60.0
-_MAX_CLAIM_SKIPS = 64
+#: KEYED BY THE NODE'S GRANTS, SO THE TTL NEED NOT BE SHORT. It was 60 s, for one reason: a
+#: certificate can be re-issued with MORE grants while a job sits there, and the node should not
+#: keep stepping over work it can now run. But a short TTL raced the walk itself -- a poll judges
+#: at most eight fresh jobs and a dispatcher polls about once a second, so refusals from the head
+#: of a wall deeper than ~480 expired before the walk got past it, `claim_next` offered the
+#: oldest refused job again, and the node never crossed (measured on a simulated clock: 400 deep
+#: crossed in 51 polls, 700 never). The memo is now keyed by (node, grants fingerprint): a
+#: re-issued certificate changes the key and every refusal is re-judged on the very next poll,
+#: which is the newly-entitled case handled EXACTLY rather than approximately. The TTL is then
+#: only a backstop and can be long. What still bounds a wall is the memo's size, not the clock.
+_REFUSAL_MEMO_TTL_S = 3600.0
+#: How many already-judged jobs one walk will step over. SMALL, because stepping over one is
+#: not free: `claim_next` is the only way to see a job, so each skip costs a claim, the prefix
+#: stamp (which must happen before anything can go wrong -- see the stamp comment in the walk)
+#: and a release. At 64 that was ~192 store writes for a single poll that then answered 204,
+#: and a node polls on a timer. 16 still steps over a wall deeper than the probe budget could
+#: reach while keeping the per-poll cost in the same order as the parent commit's.
+#:
+#: NOW ONLY A BACKSTOP. Since round seven the walk passes every job this node has already been
+#: refused to `claim_next(exclude=...)`, so the store never offers a remembered job and stepping
+#: over one costs nothing. This branch only runs for a refusal the memo no longer holds (evicted
+#: past its size bound) -- i.e. for walls deeper than the memo, thousands of jobs.
+#:
+#: RESIDUAL, stated rather than hidden: a wall of work no enrolled node can run is still WALKED
+#: once per memo TTL -- eight fresh judgements a poll -- by every node granted its engine. The
+#: real cure is to FAIL work no certificate in the fleet grants (the control plane can see every
+#: node's grants) rather than to keep re-judging it; that is a separate change.
+_MAX_CLAIM_SKIPS = 16
+
+#: How many jobs the fleet-wide unrunnable set holds. 20,000 so that it PLUS a full per-node memo
+#: (8,192) stays inside SQLite's 32,766 bound parameters -- the two are passed together as one
+#: exclusion. At 30,000 the union could exceed it, and the store would trim the head of the wall.
+_MAX_UNRUNNABLE = 20_000
 
 #: How long a job this node may NOT run is deferred for EVERYONE after a refusal. This is ALSO
 #: the write-amplification bound the DoS finding wanted: a refused job flips RUNNING->QUEUED at
@@ -159,6 +188,12 @@ _MAX_CLAIM_SKIPS = 64
 #: `claim_next` itself on every backend, so the walk simply does not see the job again for a
 #: while -- and neither does an adversary trying to flap it, which bounds that to once per
 #: window. The cost is that an ENTITLED peer also waits this long for it; short on purpose.
+#:
+#: AND IT ONLY BOUNDS THE CHURN WHILE THE JOB IS YOUNG. Past MAX_TOTAL_DEFERRAL_S a refused job
+#: is released claimable, so the "at most one flip per window" property above holds for its first
+#: two minutes and not after: from then on the store EXCLUDES it for this node (the refusal memo
+#: is passed to `claim_next`), which costs no writes and still hands it to any entitled peer
+#: immediately. See _MAX_CLAIM_SKIPS.
 _REFUSAL_DEFER_S = 20.0
 
 #: Prefix the control plane re-stamps onto the claim id of every job it hands to a node. It
@@ -206,6 +241,81 @@ MAX_FUTURE_SKEW_S = 300.0
 #: honestly, which is what made it worth closing.
 MAX_DEFERRAL_S = 3600.0
 
+def _grants_fingerprint(grants) -> str:
+    """A stable key for WHAT a node is granted, so a refusal is remembered per grant set.
+
+    A refusal is a function of (the node's grants, the job's policy). Keying the memo by node
+    alone meant a certificate re-issued with the grant it lacked was still refused from memory
+    until the entry expired; keyed by this, the new certificate simply has no memory yet.
+    """
+    import json
+
+    # STRUCTURED, not joined. With ",".join a tier literally named "socks,vpn" and the pair
+    # ("socks", "vpn") produced the same key, so correcting a certificate from one to the other
+    # left a stale exclusion in place. Grant values are not validated against delimiters at
+    # issuance, so no delimiter is safe; JSON of sorted lists is unambiguous by construction.
+    return json.dumps([sorted(getattr(grants, "engines", ()) or ()),
+                       sorted(getattr(grants, "tiers", ()) or ()),
+                       bool(getattr(grants, "credentials", False))],
+                      separators=(",", ":"))
+
+
+class _UnrunnableSet:
+    """Jobs NO enrolled certificate is granted, fenced to the grants generation they were judged in.
+
+    Why a class and a lock: sync FastAPI handlers run in a threadpool. One thread could judge a job
+    against the OLD grants while another refreshed the grants and cleared this set; the first then
+    inserted its stale verdict into the fresh set, whose generation already named the new grants --
+    so nothing ever invalidated it, and a newly entitled node could not claim the job until some
+    other certificate changed. A verdict now carries the generation it was computed from, and is
+    kept only if that is still the current one, checked under the same lock that clears.
+    """
+
+    def __init__(self, limit: "int | None" = None) -> None:
+        import threading
+
+        self._ids: dict[str, str] = {}
+        self._gen: "str | None" = None
+        # Read at CONSTRUCTION, not bound as a default argument at import -- so the module constant
+        # is the one source of truth (and a test that lowers it is actually testing the cap).
+        self._limit = _MAX_UNRUNNABLE if limit is None else limit
+        self._lock = threading.Lock()
+        self._said_full = False
+
+    def current(self, generation: str) -> "tuple[str, ...]":
+        """The exclusion for `generation`; a new generation voids every earlier verdict."""
+        with self._lock:
+            if generation != self._gen:
+                # THE CERTIFICATE SET CHANGED -- a node enrolled, renewed, lapsed or was removed.
+                # Any of those can make a job runnable, so every judgement is void.
+                self._ids.clear()
+                self._gen = generation
+                self._said_full = False
+            return tuple(self._ids)         # judging order: see _RefusalMemo.remembered_for
+
+    def note(self, job_id: str, why: str, *, generation: str) -> bool:
+        """Record a verdict if it is still current and there is room. True if it was recorded."""
+        with self._lock:
+            if generation != self._gen or job_id in self._ids:
+                return False
+            if len(self._ids) >= self._limit:
+                # FULL MEANS STOP ADDING -- never evict. Evicting discarded the HEAD of the wall,
+                # which is what oldest-first `claim_next` offers next, so the set cycled over the
+                # same prefix. Refusing new entries keeps the head excluded and the walk moving.
+                # And SAY SO, once: past this point work behind the wall can starve again, which
+                # is the documented bound, and a bound reached silently is worse than none.
+                if not self._said_full:
+                    self._said_full = True
+                    _log.error("node_claim: the fleet-wide exclusion is full (%d jobs that no "
+                               "enrolled node can run). Work queued behind them may no longer "
+                               "be reached. Enrol a node that holds the missing grants, or set "
+                               "BLASTBOX_MAX_QUEUED_AGE_S so such work is failed on a deadline.",
+                               self._limit)
+                return False
+            self._ids[job_id] = why
+            return True
+
+
 class _RefusalMemo:
     """Which (node, job) pairs this control plane has already judged, and for how long.
 
@@ -221,15 +331,57 @@ class _RefusalMemo:
     def remember(self, node_id: str, job_id: str) -> None:
         self._until[(node_id, job_id)] = time.time() + self._ttl_s
         if len(self._until) > self._limit:
+            # pop(), not del. FastAPI runs these handlers in a threadpool, so two claims for the
+            # same node run this eviction concurrently: the keys were listed before the loop, a
+            # peer removed some of them first, and `del` then raised KeyError from inside the
+            # claim walk -- a 500 for a request whose honest answer was "nothing for you".
             for key in list(self._until)[: self._limit // 2]:
-                del self._until[key]
+                self._until.pop(key, None)
+
+    def remembered_for(self, node_id: str, *, limit: "int | None" = None) -> "tuple[str, ...]":
+        """The jobs this node has been refused and whose refusal is still fresh.
+
+        Handed to `claim_next(exclude=...)` so the STORE never offers them -- see
+        _MAX_CLAIM_SKIPS for why stepping over them afterwards could not work.
+
+        NOT CAPPED BELOW THE MEMO ITSELF. The first version capped this at 256 with the skip
+        branch as the backstop, which only moved the cliff: every refusal past the cap had to be
+        stepped over by hand, 16 at most per poll, so a wall of ~272 refused jobs was crossed
+        and a wall of 300 never was (measured, 199 polls). The bound that matters is the memo's
+        own size, and that is also comfortably inside what the stores accept as bound
+        parameters (SQLite 3.45 takes 32,767; Postgres 65,535). `limit` exists for tests.
+        """
+        if limit is None:
+            limit = self._limit
+        now = time.time()
+        fresh = now + self._ttl_s
+        out: list[str] = []
+        for (nid, jid), until in list(self._until.items()):
+            if nid == node_id and until > now:
+                out.append(jid)
+                # REFRESHED ON USE. An entry the walk is actively excluding is by definition
+                # still standing between this node and newer work; letting it lapse on a clock
+                # made the walk re-judge the head of the wall before it had crossed the tail, so
+                # any wall deeper than (judgements per poll x polls per TTL) was never crossed.
+                # While the node keeps polling with the same grants, its refusals stay live;
+                # a changed certificate changes the key (see _grants_fingerprint) instead.
+                self._until[(nid, jid)] = fresh
+                if len(out) >= limit:
+                    break
+        # IN JUDGING ORDER -- oldest refusal first, which is the head of the wall because
+        # `claim_next` is oldest-first. A store that must trim the exclusion keeps the front.
+        return tuple(out)
 
     def remembers(self, node_id: str, job_id: str) -> bool:
-        until = self._until.get((node_id, job_id))
+        key = (node_id, job_id)
+        until = self._until.get(key)
         if until is None:
             return False
         if until <= time.time():
-            del self._until[(node_id, job_id)]
+            # Same race, same fix: two threads both see it expired and both drop it. No lock,
+            # because this memo is ADVISORY -- losing an entry costs one re-judgement of one
+            # job, which is exactly what it cost before the memo existed.
+            self._until.pop(key, None)
             return False
         return True
 
@@ -326,6 +478,13 @@ def resolve_pki_dir(pki_dir: "Path | str | None" = None) -> Path | None:
     return d
 
 
+def _overrides_allowed() -> bool:
+    """Whether a job may select its own network personality (BLASTBOX_ALLOW_NETPOLICY_OVERRIDE).
+    One reading, shared by the claim walk and the backlog, so the two cannot disagree."""
+    return (os.environ.get("BLASTBOX_ALLOW_NETPOLICY_OVERRIDE", "").strip().lower()
+            in ("1", "true", "yes", "on"))
+
+
 def _job_requirements(job) -> "tuple[str | None, bool, bool]":
     """(tier grant needed, credentials needed, whether this host could tell).
 
@@ -360,9 +519,16 @@ def _job_requirements(job) -> "tuple[str | None, bool, bool]":
     registry = parse_personalities(os.environ)
     # The same env convention cli.py uses to build the dispatcher's EngineSpecs, so both
     # sides resolve one job to one personality.
+    # .lower() LIKE cli.py DOES (it builds the dispatcher's EngineSpecs with
+    # `.strip().lower()`), because `parse_personalities` keys the registry in lower case.
+    # Without it `BLASTBOX_ENGINE_CLAMAV_NETPOLICY=VPN` read as a personality this host has
+    # not got: in non-strict mode that is "nothing to check", so the job was handed to a node
+    # with no tier or credentials grant -- and the node, lowercasing the same value, resolved
+    # it to a real wireguard exit. Both sides must normalise identically or the hand-over
+    # authorises against a personality the run will not use.
     engine_default = (os.environ.get(
         f"BLASTBOX_ENGINE_{job.engine.upper().replace('-', '_')}_NETPOLICY")
-        or "none").strip() or "none"
+        or "none").strip().lower() or "none"
     # CAN THIS HOST RESOLVE WHAT THIS JOB NEEDS? Precisely, not by counting entries.
     #
     # * engine_default "none" and no per-job override -> the job genuinely IS ungoverned,
@@ -372,10 +538,12 @@ def _job_requirements(job) -> "tuple[str | None, bool, bool]":
     #   falls back to "none", and THAT is the silent hole: an operator declared a policy
     #   this host cannot see, so the tier and credentials grants would go unchecked while
     #   looking exactly like an ungoverned job. Unknown, and it must not read as permissive.
-    allow_override = (os.environ.get("BLASTBOX_ALLOW_NETPOLICY_OVERRIDE", "").strip()
-                      .lower() in ("1", "true", "yes", "on"))
+    # _overrides_allowed(), not a second inline parse: /backlog decides from the same function,
+    # and two parsers that agree only by coincidence are how the two routes drift apart.
+    allow_override = _overrides_allowed()
     can_tell = engine_default == "none" or engine_default in registry
-    if allow_override and job.net_policy and job.net_policy not in registry:
+    job_policy = (job.net_policy or "").strip().lower() or None
+    if allow_override and job_policy and job_policy not in registry:
         # The job SELECTS a personality this host has not got. `resolve_net_policy` falls
         # through to the engine default -- possibly "none" -- so it would look ungoverned
         # here while a node whose registry DOES hold that name resolves it to a real exit
@@ -385,7 +553,8 @@ def _job_requirements(job) -> "tuple[str | None, bool, bool]":
         can_tell = False
     try:
         personality = resolve_net_policy(
-            job_net_policy=job.net_policy, engine_default=engine_default,
+            job_net_policy=(job.net_policy or "").strip().lower() or None,
+            engine_default=engine_default,
             registry=registry, allow_override=allow_override)
         driver = getattr(personality, "exit_driver", "") or ""
     except Exception:               # noqa: BLE001
@@ -596,9 +765,24 @@ def register_node_claim_routes(
         job = None
         probes = 0
         skips = 0
+        # The refusal memo is per (node, GRANTS): see _REFUSAL_MEMO_TTL_S.
+        memo_key = f"{node_id}#{_grants_fingerprint(grants)}"
         try:
             while probes < _MAX_CLAIM_PROBES and skips < _MAX_CLAIM_SKIPS:
-                candidate = job_store.claim_next(engine=frozenset(allowed))
+                # EXCLUDE WHAT THIS NODE HAS ALREADY BEEN REFUSED, in the store query itself.
+                # `claim_next` is strictly oldest-first, so stepping over refused jobs AFTER
+                # they were handed out meant a wall deeper than _MAX_CLAIM_SKIPS was the same
+                # prefix on every poll -- the walk stopped before reaching anything behind it,
+                # forever, and paid a claim, a stamp and a release per remembered job for the
+                # privilege. With the exclusion the store simply does not offer them: nothing
+                # to release, nothing to re-stamp, and nothing in the way.
+                candidate = job_store.claim_next(
+                    engine=frozenset(allowed),
+                    # FLEET SET FIRST: it never expires and holds the head of any wall no node
+                    # can run, so if a store must trim the exclusion it keeps these. Then this
+                    # node's own refusals, oldest first. Order-preserving, deduplicated.
+                    exclude=tuple(dict.fromkeys(
+                        _unrunnable_now() + _refusals.remembered_for(memo_key))))
                 if candidate is None:
                     break
                 # STAMP THE PREFIX FIRST, before judging and before the memo check. The prefix
@@ -613,11 +797,20 @@ def register_node_claim_routes(
                 if not job_store.update_if_status(candidate.job_id, JobStatus.RUNNING,
                                                   expect_claim_id=candidate.claim_id,
                                                   claim_id=stamped):
+                    probes += 1         # CHARGED: see below
                     continue
                 candidate = job_store.get(candidate.job_id)
                 if candidate is None or candidate.claim_id != stamped:
+                    # CHARGED TOO. These two paths replaced a `for _ in range(...)` with a
+                    # `while`, and neither counted -- so a store that keeps losing the stamp CAS
+                    # made the walk bounded by the QUEUE DEPTH rather than by eight probes: one
+                    # request against a 500-job queue issued 501 claims and left all 500 RUNNING
+                    # with unprefixed claim ids, which is the immortal-row state stamping early
+                    # exists to prevent. A cost cap that only counts the paths that succeed is
+                    # not a cost cap.
+                    probes += 1
                     continue            # taken from under us; not ours to release either
-                if _refusals.remembers(node_id, candidate.job_id):
+                if _refusals.remembers(memo_key, candidate.job_id):
                     # Judged already, and recently. Stepping over it costs a claim and a release
                     # but NOT one of the eight probes -- see _REFUSAL_MEMO_TTL_S: charging the
                     # probe budget for a wall of permanently-refused jobs meant the node never
@@ -640,9 +833,13 @@ def register_node_claim_routes(
                     job = candidate     # already stamped and re-read above
                     break
                 skipped.append(candidate)
-                _refusals.remember(node_id, candidate.job_id)
-                _log.warning("node_claim: released job=%s from node=%s: %s",
-                             candidate.job_id, node_id, why)
+                _refusals.remember(memo_key, candidate.job_id)
+                can_run, generation = _fleet_verdict(candidate)
+                if not can_run:
+                    _note_unrunnable(candidate, why, generation)
+                else:
+                    _log.warning("node_claim: released job=%s from node=%s: %s",
+                                 candidate.job_id, node_id, why)
         finally:
             # Put back everything not handed over, including on an exception: a job claimed
             # inside this loop and not returned would otherwise be stranded RUNNING.
@@ -695,6 +892,58 @@ def register_node_claim_routes(
     #: drive the bounds directly: both were reverted in a mutation pass with the suite green,
     #: because nothing could reach them without ~4000 requests.
     _refusals = _RefusalMemo()
+
+    #: job_id -> the refusal reason, for jobs NO enrolled certificate is granted. The per-node memo
+    #: above could only ever approximate this: it is per node, so every node re-judged the same
+    #: wall, and it had to forget something eventually -- a size cap, then a TTL -- and each time
+    #: it forgot the HEAD of the wall first, which is exactly what `claim_next` offers next. Four
+    #: review rounds found four edges of that one mechanism. This set is judged once per
+    #: certificate set, shared by every node, never expires, and is invalidated the moment the
+    #: certificate set changes -- because that is the only thing that can make such a job runnable.
+    #: Disposing of the work is NOT done here: BLASTBOX_MAX_QUEUED_AGE_S already fails stale
+    #: queued jobs (opt-in, retention-correct, deleting the staged sample), and once these stop
+    #: being churned they sit undeferred for that sweep to find.
+    _unrunnable = _UnrunnableSet()
+
+    def _fleet_now() -> "dict[str, Any]":
+        """Every enrolled node's grants, from the same cache `_grants_now` keeps fresh."""
+        _grants_now("")
+        return _grants_cache["map"]
+
+    def _fleet_fingerprint(fleet: "dict[str, Any]") -> str:
+        """What the whole fleet is granted, as content. The exclusion is a function of THIS, so it
+        is keyed on this -- not on the certificate files' (name, mtime, size), which a certificate
+        replaced by metadata-preserving tooling leaves unchanged while its grants move. Grants are
+        re-read on content every _GRANTS_CACHE_TTL_S; the exclusion now follows the same read."""
+        return "|".join(f"{node}={_grants_fingerprint(g)}" for node, g in sorted(fleet.items()))
+
+    def _unrunnable_now() -> "tuple[str, ...]":
+        return _unrunnable.current(_fleet_fingerprint(_fleet_now()))
+
+    def _fleet_verdict(job) -> "tuple[bool, str]":
+        """Can ANY enrolled certificate run this job, and in which grants generation was that
+        decided? One fleet snapshot for both, so the verdict and its generation cannot disagree.
+        The same test the walk applies to one node, applied to all -- a job a peer IS granted is
+        never excluded here."""
+        from blastbox.host.placement import refusal as _refusal
+
+        fleet = _fleet_now()
+        generation = _fleet_fingerprint(fleet)
+        tier, needs_credentials, could_tell = _job_requirements(job)
+        if not could_tell and _strict_tiers():
+            return False, generation    # nobody can be shown to satisfy an unresolvable policy
+        return any(_refusal(g, engine=job.engine, tier=tier,
+                            require_credentials=needs_credentials) is None
+                   for g in fleet.values()), generation
+
+    def _note_unrunnable(job, why: str, generation: str) -> None:
+        if _unrunnable.note(job.job_id, why, generation=generation):
+            # ONCE PER JOB, and it names the missing grant. Queued-forever with nothing in the log
+            # was half of this problem: the operator could not tell a wall from an empty fleet.
+            _log.warning("node_claim: job=%s engine=%s is excluded from every node: no enrolled "
+                         "node is granted what it needs (%s). Enrol a node that is, or set "
+                         "BLASTBOX_MAX_QUEUED_AGE_S to fail work like this after a deadline.",
+                         job.job_id, job.engine, why)
 
     def _defer_until(job) -> "float | None":
         """How long to hold a wrongly-offered job back, or None for "claimable immediately".
@@ -764,6 +1013,27 @@ def register_node_claim_routes(
             raise HTTPException(status_code=403, detail=_REFUSED)
         wanted = [e for e in (engine or []) if e] or list(grants.engines)
         allowed = sorted({e for e in wanted if grants.allows_engine(e)})
+        # ENGINE GRANT IS NOT ELIGIBILITY. A node granted an engine but NOT the network tier
+        # (or the credentials) its queued jobs need has every such job REFUSED by /claim after
+        # `_job_requirements` -- while this route counted them, and that number goes straight
+        # into DispatcherSizer. The pool then grows to its ceiling for work it can never run
+        # and takes that share of the node budget from a sibling pool that could drain it.
+        #
+        # Resolved PER ENGINE, not per job, because that is what a count can afford: the tier
+        # requirement comes from the engine's default personality, so one probe per engine
+        # answers it without enumerating the queue (which is the thing a node may not do). A
+        # job carrying its own `net_policy` override can still be counted and then refused;
+        # that is a narrower over-count than the engine-wide one, and it is the same
+        # approximation `untargeted_only` makes.
+        # ...BUT ONLY WHEN A JOB CANNOT CHOOSE ITS OWN POLICY. With
+        # BLASTBOX_ALLOW_NETPOLICY_OVERRIDE on, a job may select a personality this node CAN
+        # run even though the engine's default needs a tier it lacks -- /claim hands that job
+        # over, and filtering the whole engine here reported zero for it, pinning the node's
+        # sizer at its floor with runnable work queued. Per-job eligibility would need the queue
+        # enumerated, which a node may not have; so with overrides on this falls back to the
+        # engine grant alone, which over-counts rather than hiding work that can run.
+        if not _overrides_allowed():
+            allowed = [e for e in allowed if _engine_is_claimable(grants, e)]
         if not allowed:
             # Nothing granted is not an error: it is a backlog of zero, for this caller.
             return {"queued": 0, "engines": []}
@@ -776,6 +1046,26 @@ def register_node_claim_routes(
                                           untargeted_only=untargeted_only)),
             "engines": allowed,
         }
+
+    def _engine_is_claimable(grants, engine_name: str) -> bool:
+        """Would a plain job for this engine survive the claim route's own refusal check?
+
+        The same `_job_requirements` + `refusal` pair the walk uses, so the backlog cannot
+        promise work the hand-over would refuse. A host that cannot resolve the engine's
+        personality answers "yes" here unless strict mode is on -- matching the walk exactly,
+        which is the property that matters: these two must agree or the sizer is lied to.
+        """
+        from blastbox.host.jobs.base import Job, JobStatus
+        from blastbox.host.placement import refusal
+
+        probe = Job(job_id="", engine=engine_name, filename="", status=JobStatus.QUEUED,
+                    created_at=0.0)
+        tier, needs_credentials, could_tell = _job_requirements(probe)
+        why = refusal(grants, engine=engine_name, tier=tier,
+                      require_credentials=needs_credentials)
+        if why is None and not could_tell and _strict_tiers():
+            return False
+        return why is None
 
     def _owned_job(job_id: str, node_id: str, claim_id: str, receipt: str):
         """The job, if this node may write to it. Otherwise 403 -- and 403 for "no such job"
@@ -932,6 +1222,18 @@ def register_node_claim_routes(
         # string "queued" -- against the enum member, so it never matched and a node could
         # NEVER release a job: every release was a 400. Three independent reviewers found it,
         # and it was mine, introduced in the same change that added the release semantics.
+        if out.get("status") is JobStatus.QUEUED and "claim_id" not in out:
+            # THE RULE HELD IN ONE DIRECTION ONLY. Clearing claim_id required status=queued,
+            # but queueing did not require clearing claim_id -- so a node could write
+            # {"status": "queued", "claimable_after": now+3600} while KEEPING ownership. A
+            # deferred row is invisible to `claim_next`, so no peer can take it, and the holder
+            # stays authorised (its claim id and receipt still match) to renew before each hour
+            # expires: indefinite burial of a job it is granted, straight through both the
+            # per-write deferral ceiling and the total-burial bound this branch added.
+            raise HTTPException(
+                status_code=400,
+                detail="a release must clear the claim: send claim_id null in the same write "
+                       "as status \"queued\"")
         if "claim_id" in out and out.get("status") is not JobStatus.QUEUED:
             # Clearing the claim WITHOUT queueing left a job RUNNING with no owner: unclaimable
             # (claim_next sees only QUEUED), unwritable (_owned_job needs a claim id) and, with a

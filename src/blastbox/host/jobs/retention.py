@@ -1086,6 +1086,23 @@ class JobRetentionSweeper:
                 _log.info("retention: %s changed since the sweep selected it; leaving it alone",
                           job_id)
                 return
+            # RESERVE THE ROW BEFORE DESTROYING ANYTHING. The read above is not a fence: a
+            # node's `retry_pending_uploads` can upload a fresh result and win its FAILED->DONE
+            # CAS in the window between that read and the delete below, and then this sweep had
+            # already destroyed the bytes -- a DONE job whose result 404s, which is worse than
+            # either outcome the race could have had. Taking the row out of `expect_status`
+            # atomically FIRST means the repair's CAS loses instead, and its own undo path
+            # ("expired while its result was uploading") removes the copy it just wrote.
+            #
+            # expires_at is DELIBERATELY LEFT SET here: EXPIRED is terminal, so a row whose
+            # blob delete then fails is re-selected on the next tick and retried. Only the
+            # final write clears it, once there is nothing left to retry.
+            if not job_store.update_if_status(job_id, expect_status,
+                                             status=JobStatus.EXPIRED):
+                _log.info("retention: %s was repaired or expired by a peer before this sweep "
+                          "could reserve it; nothing was destroyed", job_id)
+                return
+            expect_status = JobStatus.EXPIRED
         # NEVER delete a pending-upload tree. The reclaim two blocks earlier in this same
         # maintenance tick deliberately spares it as the only copy of a host-sealed result, and
         # this sweeper would then rmtree it a few lines later -- with the operator's own

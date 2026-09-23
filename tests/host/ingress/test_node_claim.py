@@ -755,7 +755,8 @@ def test_a_node_cannot_bury_a_job_forever(store, pki_dir):
     tok = token_for(c, pki_dir, "alpha")
     buried = c.post(f"/v1/nodes/jobs/{job['job_id']}", headers=auth(tok),
                     json={"claim_id": job["claim_id"], "receipt": rcpt,
-                          "fields": {"status": "queued", "claimable_after": 4102444800}})
+                          "fields": {"status": "queued", "claim_id": None,
+                                 "claimable_after": 4102444800}})
     assert buried.status_code == 200, buried.text
     back = store.get(job["job_id"])
     assert back.claimable_after <= time.time() + MAX_DEFERRAL_S + 1, (
@@ -774,6 +775,7 @@ def test_a_legitimate_short_deferral_still_works(store, pki_dir):
     soon = time.time() + 30
     ok = c.post(f"/v1/nodes/jobs/{job['job_id']}", headers=auth(tok),
                 json={"claim_id": job["claim_id"], "receipt": rcpt,
-                      "fields": {"status": "queued", "claimable_after": soon}})
+                      "fields": {"status": "queued", "claim_id": None,
+                             "claimable_after": soon}})
     assert ok.status_code == 200, ok.text
     assert abs(store.get(job["job_id"]).claimable_after - soon) < 1

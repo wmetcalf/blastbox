@@ -45,6 +45,7 @@ nodes still hold database credentials keeps using the dispatcher's own sweep unc
 from __future__ import annotations
 
 import logging
+import math
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -74,6 +75,16 @@ def reclaim_after_s(env: "dict[str, str] | None" = None) -> float:
     except ValueError:
         _log.warning("%s=%r is not a number; the stale-claim sweep stays OFF. A "
                      "credential-less fleet has no other reclaim path.", RECLAIM_AFTER_ENV, raw)
+        return 0.0
+    if not math.isfinite(value):
+        # NaN passes float() and EVERY comparison against it is False, so it flowed through
+        # the floor below and became the cutoff -- and `started >= cutoff` is then False for
+        # every row, so the next tick FAILED every node-held claim whatever its age. inf goes
+        # the other way and disables the sweep silently, which on a credential-less fleet
+        # removes the only reclaim path there is. Neither is a duration.
+        _log.warning("%s=%r is not a finite number of seconds; the stale-claim sweep stays "
+                     "OFF rather than failing live work or silently doing nothing.",
+                     RECLAIM_AFTER_ENV, raw)
         return 0.0
     if value <= 0:
         return 0.0

@@ -103,6 +103,49 @@ def _serve_tls_sans(host: str) -> list[str]:
     return seen
 
 
+def _readable_cert(path) -> bool:
+    """Whether `path` loads as a PEM certificate at all -- a separate question from whether it was
+    issued by the current CA, and one whose answer calls for a different remedy."""
+    from cryptography import x509
+
+    try:
+        x509.load_pem_x509_certificate(path.read_bytes())
+        return True
+    except Exception:                   # noqa: BLE001 - unreadable for any reason
+        return False
+
+
+def _leaf_matches_ca(leaf_path, ca_path) -> bool:
+    """Was this leaf signed by the CA currently on disk? Unreadable either side -> False.
+
+    Fails CLOSED (towards re-issuing) on any doubt: re-issuing a certificate is cheap and
+    self-healing, whereas serving one the fleet no longer trusts looks exactly like a working
+    listener and breaks every node at once.
+    """
+    from cryptography import x509
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    try:
+        leaf = x509.load_pem_x509_certificate(leaf_path.read_bytes())
+        ca = x509.load_pem_x509_certificate(ca_path.read_bytes())
+    except Exception:                   # noqa: BLE001 - unreadable is not a match
+        return False
+    if leaf.issuer != ca.subject:
+        return False
+    try:
+        # This project's CAs are P-256 (see pki.ensure_ca), so the EC branch is the only one
+        # that can arise; anything else falls into the except below and reads as "not ours",
+        # which is the safe direction (re-issue).
+        public_key = ca.public_key()
+        algorithm = leaf.signature_hash_algorithm
+        if not isinstance(public_key, ec.EllipticCurvePublicKey) or algorithm is None:
+            return False
+        public_key.verify(leaf.signature, leaf.tbs_certificate_bytes, ec.ECDSA(algorithm))
+    except Exception:                   # noqa: BLE001 - InvalidSignature or anything else
+        return False
+    return True
+
+
 def _serve_tls(args: argparse.Namespace) -> dict:
     """uvicorn TLS parameters, or {} for plaintext.
 
@@ -164,6 +207,27 @@ def _serve_tls(args: argparse.Namespace) -> dict:
                     - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
         except Exception:               # noqa: BLE001 - unreadable: fall through and re-issue
             left = -1.0
+        # ...AND CHECK IT STILL CHAINS TO THE CURRENT ANCHOR. The clock is not the only way a
+        # leaf goes stale: rotate the fleet CA while this certificate is unexpired and every
+        # newly-enrolled node -- which trusts the replacement anchor -- rejects it at the
+        # handshake, while this host reports TLS on and never reaches the re-issuance path
+        # below, so even a host holding the new CA key cannot heal itself.
+        # NOT GATED ON `left`. The first version checked only leaves with more than the
+        # renewal window remaining, so a rotated-out leaf with < 7 days left (a quarter of a
+        # 30-day leaf's life) kept `_ca_mismatch` False and took the EXPIRY fallback below --
+        # serving a certificate every node rejects, with a log line about expiry. Whether a
+        # leaf chains to the current anchor has nothing to do with its clock.
+        _ca_mismatch = False
+        _leaf_unreadable = left == -1.0 and not _readable_cert(existing_crt)
+        if _leaf_unreadable:
+            _log.warning("serve: the ingress certificate in %s cannot be read; it will be "
+                         "re-issued if this host can", pki_dir)
+        elif not _leaf_matches_ca(existing_crt, pki_dir / "ca.crt"):
+            _log.warning("serve: the ingress certificate in %s was not issued by the CA "
+                         "currently in ca.crt (the anchor was rotated); re-issuing rather than "
+                         "serving a leaf every node will reject", pki_dir)
+            left = -1.0
+            _ca_mismatch = True
         if left > _TLS_RENEW_BEFORE_S:
             _log.info("serve: TLS on, using the server certificate already in %s (%.0f days "
                       "left)", pki_dir, left / 86400)
@@ -173,12 +237,38 @@ def _serve_tls(args: argparse.Namespace) -> dict:
         _reissue_wanted = True
     else:
         _reissue_wanted = False
+        _ca_mismatch = False
+        _leaf_unreadable = False
 
     from blastbox.host.pki import load_ca
 
     try:
         ca = load_ca(pki_dir)
     except Exception as exc:            # noqa: BLE001 - verify-only host, no CA key here
+        if _reissue_wanted and _leaf_unreadable:
+            # Its own message, not the rotation one: for a truncated file or a permissions
+            # problem, "re-issue on the CA host" is the wrong remedy and the rotation claim is
+            # simply false. Refusing is still right -- uvicorn could not load it either.
+            raise SystemExit(
+                f"serve: {existing_crt} cannot be read as a certificate, and this host has no CA "
+                f"key to re-issue it ({exc}). Check the file and its permissions; if it is "
+                f"genuinely lost, issue a new pair on the CA host and copy it to {existing_crt} / "
+                f"{existing_key}.") from None
+        if _reissue_wanted and _ca_mismatch:
+            # NOT THE EXPIRY FALLBACK BELOW. That one serves the existing leaf because it still
+            # WORKS until its deadline. A leaf from a rotated-out CA does not work at all: every
+            # node that trusts the replacement anchor rejects it at the handshake. Serving it
+            # would start a control plane that no federated node can reach, with a log line that
+            # talks about expiry -- the one thing that is not wrong. On the hardened layout
+            # (ca.crt present, ca.key deliberately absent) this host cannot fix it itself, so
+            # it says exactly what to do instead of pretending.
+            raise SystemExit(
+                f"serve: {existing_crt} was issued by a CA that is no longer the one in "
+                f"{pki_dir / 'ca.crt'} (the anchor was rotated), and this host has no CA key to "
+                f"re-issue it ({exc}). Every node that trusts the new anchor would reject this "
+                f"certificate, so ingress will not start with it. On the CA host run "
+                f"`blastbox pki issue-server` for this host's names and copy the pair to "
+                f"{existing_crt} / {existing_key}.") from None
         if _reissue_wanted:
             # A hardened ingress holds no CA key, so it cannot renew its own certificate. Do
             # not refuse to start over it -- serve the one we have and make the deadline loud.

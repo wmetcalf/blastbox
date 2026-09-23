@@ -35,6 +35,7 @@ from blastbox.host.pool import release_kwargs
 from blastbox.contract.envelope import atomic_write_confined
 from blastbox.host.blobs.base import BlobFetchError, BlobStore, upload_output_with_retry
 from blastbox.host.jobs.base import Job, JobStatus, JobStore, is_node_claim
+from blastbox.host.jobs.http_store import NodeStoreUnsupported
 from blastbox.host.jobs.retention import (
     RESULT_RETAINED_MARKER,
     clear_pending_upload,
@@ -1029,6 +1030,28 @@ class VmJobDispatcher:
             except Exception:  # noqa: BLE001 — a crash in _process must not kill the claim thread
                 logger.warning("vm_dispatch: _process crashed for %s", job.job_id, exc_info=True)
 
+    def _sweep_unsupported(self, what: str) -> bool:
+        """Say ONCE that a sweep does not run on this store, and stay quiet after that.
+
+        Same reasoning as `Dispatcher._sweep_unsupported`, and the same reason it has to exist
+        here too: `cli.py` hands the SAME store object to the network-endpoint dispatchers, so a
+        credential-less node running an aws/static/cascade pool reaches these sweeps with an
+        `HttpJobStore` that refuses to enumerate the queue by design. Caught by the broad
+        handlers below, each one logged a WARNING and a full traceback per maintenance tick,
+        forever -- three of them per tick here.
+        """
+        seen: "set[str] | None" = getattr(self, "_unsupported_sweeps", None)
+        if seen is None:
+            seen = set()
+            self._unsupported_sweeps = seen
+        if what in seen:
+            return True
+        seen.add(what)
+        logger.info("vm_dispatch: %s does not run on a credential-less node: the control plane "
+                    "owns it (see the ingress's BLASTBOX_NODE_CLAIM_RECLAIM_AFTER_S and "
+                    "BLASTBOX_MAX_QUEUED_AGE_S)", what)
+        return True
+
     def _run_maintenance(self) -> None:
         """Periodic upkeep a VM-only deployment otherwise lacks (the container Dispatcher does its own):
         reclaim terminal job dirs past ``expires_at`` (retention), and FAIL orphaned RUNNING jobs whose
@@ -1038,6 +1061,8 @@ class VmJobDispatcher:
         would let a second worker re-detonate the same untrusted input."""
         try:
             self._retention.expire_due(self._store)
+        except NodeStoreUnsupported:
+            self._sweep_unsupported("the retention sweep")
         except Exception:  # noqa: BLE001 — a sweep failure must not kill maintenance
             logger.warning("vm_dispatch: retention sweep failed", exc_info=True)
         try:
@@ -1053,6 +1078,8 @@ class VmJobDispatcher:
                 blob_store=self._blobs, protect_paths=_blob_local_roots(),
                 recovery_enabled=self._pending_upload_retry,
             )
+        except NodeStoreUnsupported:
+            self._sweep_unsupported("the scratch reclaim's store lookup")
         except Exception:  # noqa: BLE001 — a sweep failure must not kill maintenance
             logger.warning("vm_dispatch: scratch reclaim failed", exc_info=True)
         try:
@@ -1090,6 +1117,8 @@ class VmJobDispatcher:
                         self._input_path(job).unlink()
                     except OSError:
                         pass
+        except NodeStoreUnsupported:
+            self._sweep_unsupported("orphan recovery")
         except Exception:  # noqa: BLE001
             logger.warning("vm_dispatch: orphan recovery failed", exc_info=True)
         self._fail_stale_queued_jobs()
@@ -1104,7 +1133,22 @@ class VmJobDispatcher:
             return
         cutoff = time.time() - self._max_queued_age_s
         try:
-            for job in self._store.list(status=JobStatus.QUEUED):
+            queued = self._store.list(status=JobStatus.QUEUED)
+        except NodeStoreUnsupported:
+            self._sweep_unsupported("the stale-QUEUED sweep")
+            return
+        except Exception:  # noqa: BLE001 — a store blip must not stop maintenance for good
+            # BROAD, like the handler this list() used to sit under. Splitting it out to
+            # recognise NodeStoreUnsupported (round six) caught ONLY that, so a transient
+            # `database is locked` or a dropped Postgres connection escaped the sweep, then
+            # _run_maintenance, then the maintenance loop -- whose executor future nothing
+            # watches or restarts. Retention, pending-upload retries and orphan recovery all
+            # stopped while jobs kept being processed, until the dispatcher was restarted.
+            logger.warning("vm_dispatch: stale-queued sweep could not list the queue",
+                           exc_info=True)
+            return
+        try:
+            for job in queued:
                 # Normally scope the sweep to OUR engine (a peer dispatcher owns the others). But when
                 # sole_owner (no other dispatcher on this store), also fail jobs for engines NOBODY
                 # serves -- a typo'd/mismatched engine would otherwise keep its untrusted input forever

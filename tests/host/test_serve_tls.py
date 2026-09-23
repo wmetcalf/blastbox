@@ -155,3 +155,143 @@ def test_a_verify_only_host_with_no_certificate_is_told_all_three_options(tmp_pa
     assert "copy it to" in message, "the hardened route is not offered"
     assert message.index("copy it to") < message.index("--no-tls"), (
         "plaintext is offered before the secure route")
+
+
+def test_a_certificate_from_a_ROTATED_ca_is_not_reused(tmp_path, monkeypatch, caplog):
+    """The reuse branch checked only the clock. Rotate the fleet CA while `ingress-server.crt`
+    is still unexpired and ingress starts happily with a leaf that every newly-enrolled node --
+    which trusts the replacement CA -- rejects during the handshake. Worse, the re-issuance path
+    is never reached, so a host that HOLDS the new CA key cannot heal itself either."""
+    import argparse
+    import logging
+
+    from blastbox.host import cli, pki
+
+    d = tmp_path / "pki"
+    old_ca = pki.ensure_ca(d)
+    issued = old_ca.issue_server(["127.0.0.1"], cn="blastbox-ingress")
+    old_crt, _old_key = issued.write(d, "ingress-server")
+    old_bytes = old_crt.read_bytes()
+
+    # The operator rotates the CA in place (blastbox pki init after removing ca.*).
+    (d / "ca.crt").unlink()
+    (d / "ca.key").unlink()
+    pki.ensure_ca(d)
+
+    monkeypatch.setenv("BLASTBOX_PKI_DIR", str(d))
+    args = argparse.Namespace(host="127.0.0.1", port=8443, tls_cert=None, tls_key=None,
+                              no_tls=False)
+    with caplog.at_level(logging.WARNING):
+        out = cli._serve_tls(args)
+    assert out, "TLS was turned off entirely"
+    assert (d / "ingress-server.crt").read_bytes() != old_bytes, (
+        "ingress reused a leaf signed by the RETIRED CA; every node trusting the new anchor "
+        "will fail the handshake and this host never reaches re-issuance")
+
+
+def test_a_rotated_ca_without_its_key_refuses_to_start(tmp_path, monkeypatch):
+    """The hardened layout: ca.crt present, ca.key deliberately absent. Rotate the anchor and the
+    old leaf is not merely expiring, it is unusable -- every node trusting the new CA rejects it.
+    The expiry fallback served it anyway, starting a control plane no federated node can reach
+    and logging an expiry warning, which is the one thing that was not wrong."""
+    import argparse
+
+    import pytest
+
+    from blastbox.host import cli, pki
+
+    d = tmp_path / "pki"
+    old_ca = pki.ensure_ca(d)
+    old_ca.issue_server(["127.0.0.1"], cn="blastbox-ingress").write(d, "ingress-server")
+    (d / "ca.crt").unlink()
+    (d / "ca.key").unlink()
+    pki.ensure_ca(d)                         # the rotation...
+    (d / "ca.key").unlink()                  # ...on a host that never holds the signing key
+    monkeypatch.setenv("BLASTBOX_PKI_DIR", str(d))
+    args = argparse.Namespace(host="127.0.0.1", port=8443, tls_cert=None, tls_key=None,
+                              no_tls=False)
+    with pytest.raises(SystemExit, match="rotated"):
+        cli._serve_tls(args)
+
+
+def test_an_expiring_leaf_without_a_ca_key_is_still_served(tmp_path, monkeypatch, caplog):
+    """The fallback the fix must NOT disturb: a leaf that merely nears its deadline still works,
+    so a hardened host keeps serving it and says loudly how long is left."""
+    import argparse
+    import datetime
+
+    from blastbox.host import cli, pki
+
+    d = tmp_path / "pki"
+    ca = pki.ensure_ca(d)
+    ca.issue_server(["127.0.0.1"], cn="blastbox-ingress").write(d, "ingress-server")
+    (d / "ca.key").unlink()
+    real_now = datetime.datetime.now
+
+    class Later(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return real_now(tz) + datetime.timedelta(days=29)
+
+    monkeypatch.setattr(datetime, "datetime", Later)
+    monkeypatch.setenv("BLASTBOX_PKI_DIR", str(d))
+    args = argparse.Namespace(host="127.0.0.1", port=8443, tls_cert=None, tls_key=None,
+                              no_tls=False)
+    out = cli._serve_tls(args)
+    assert out and out["ssl_certfile"].endswith("ingress-server.crt")
+
+
+def test_a_rotated_out_leaf_inside_the_renewal_window_still_refuses(tmp_path, monkeypatch):
+    """The first CA check ran only for leaves with MORE than the renewal window left, so a
+    rotated-out leaf with 5 days remaining -- a quarter of a 30-day leaf's life -- skipped it,
+    took the expiry fallback on a keyless host, and was served to nodes that all reject it."""
+    import argparse
+    import datetime
+
+    import pytest
+
+    from blastbox.host import cli, pki
+
+    d = tmp_path / "pki"
+    pki.ensure_ca(d).issue_server(["127.0.0.1"], cn="blastbox-ingress").write(d, "ingress-server")
+    (d / "ca.crt").unlink()
+    (d / "ca.key").unlink()
+    pki.ensure_ca(d)
+    (d / "ca.key").unlink()
+    real_now = datetime.datetime.now
+
+    class NearExpiry(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return real_now(tz) + datetime.timedelta(days=25)   # inside the 7-day window
+
+    monkeypatch.setattr(datetime, "datetime", NearExpiry)
+    monkeypatch.setenv("BLASTBOX_PKI_DIR", str(d))
+    args = argparse.Namespace(host="127.0.0.1", port=8443, tls_cert=None, tls_key=None,
+                              no_tls=False)
+    with pytest.raises(SystemExit, match="rotated"):
+        cli._serve_tls(args)
+
+
+def test_an_unreadable_leaf_is_not_blamed_on_a_ca_rotation(tmp_path, monkeypatch):
+    """Refusing to serve an unreadable leaf is right, but the message said 'the anchor was rotated'
+    -- and for a truncated file or a permissions problem, re-issuing on the CA host (the remedy it
+    gave) is the wrong fix."""
+    import argparse
+
+    import pytest
+
+    from blastbox.host import cli, pki
+
+    d = tmp_path / "pki"
+    pki.ensure_ca(d).issue_server(["127.0.0.1"], cn="blastbox-ingress").write(d, "ingress-server")
+    (d / "ca.key").unlink()
+    (d / "ingress-server.crt").write_text("not a certificate")
+    monkeypatch.setenv("BLASTBOX_PKI_DIR", str(d))
+    args = argparse.Namespace(host="127.0.0.1", port=8443, tls_cert=None, tls_key=None,
+                              no_tls=False)
+    with pytest.raises(SystemExit) as exc:
+        cli._serve_tls(args)
+    msg = str(exc.value)
+    assert "rotated" not in msg, f"an unreadable leaf was blamed on a CA rotation: {msg}"
+    assert "cannot be read" in msg

@@ -1708,3 +1708,83 @@ def test_the_frozen_environment_reason_is_recorded_where_someone_will_look() -> 
     assert "frozen at snapshot time" in src or "CHECKPOINT time" in src, (
         "the reason this tier carries no AppArmor observation is no longer written down"
     )
+
+
+class TestRootlessIsOptInAndPlacedCorrectly:
+    """`-rootless` lets the warm tier run without root, which is the better posture -- but the
+    flag is a global runsc option, so it has to precede the subcommand, and it is OFF by default
+    because checkpoint/restore under a rootless sandbox is unproven (see GvisorConfig.rootless)."""
+
+    def test_it_is_off_by_default(self, tmp_path):
+        from blastbox.host.runtime.gvisor_snapshot import _runsc
+
+        cfg = _cfg(tmp_path)
+        assert "-rootless" not in _runsc(cfg), "rootless became the default without being proved"
+
+    def test_it_precedes_the_subcommand_when_on(self, tmp_path):
+        import dataclasses
+
+        from blastbox.host.runtime.gvisor_snapshot import _runsc
+
+        argv = _runsc(dataclasses.replace(_cfg(tmp_path), rootless=True))
+        assert "-rootless" in argv, "the flag was dropped"
+        # Everything _runsc emits is a global flag; the subcommand is appended by the caller, so
+        # the flag must be inside this prefix -- runsc rejects it after the subcommand.
+        assert all(a.startswith("-") or a == argv[0] or argv[argv.index(a) - 1] == "-root"
+                   for a in argv), f"a non-flag slipped into the global prefix: {argv}"
+
+    def test_the_env_switch_reaches_the_config(self, monkeypatch, tmp_path):
+        from blastbox.host.runtime import gvisor_snapshot_runtime as gsr
+
+        env = {"BLASTBOX_GVISOR_ROOTLESS": "1", "BLASTBOX_GVISOR_ROOT": str(tmp_path / "r"),
+               "BLASTBOX_GVISOR_ROOTFS": str(tmp_path / "fs")}
+        assert gsr._gvisor_config_from_env(env).rootless is True
+        assert gsr._gvisor_config_from_env(
+            {**env, "BLASTBOX_GVISOR_ROOTLESS": "0"}).rootless is False
+
+    def test_rootless_pins_the_worker_to_guest_uid_zero(self, tmp_path):
+        """Not cosmetic: gVisor's gofer runs as the calling user when rootless, so a guest uid
+        the host userns does not map cannot create files on a bind mount. Measured with 65532 --
+        the worker warms its engine and then dies with `OSError: [Errno 22] Invalid argument:
+        '/ctrl/.ready.tmp'` on a directory that is already 0o777, which reads like anything but
+        a uid problem. Guest uid 0 here is NOT host root; it is the unprivileged user that
+        launched runsc."""
+        import dataclasses
+
+        from blastbox.host.runtime.gvisor_snapshot import _oci_config
+
+        spec = _oci_config(dataclasses.replace(_cfg(tmp_path), rootless=True),
+                           tmp_path / "b", in_ro=True)
+        assert spec["process"]["user"] == {"uid": 0, "gid": 0}, (
+            "rootless did not pin the worker to guest uid 0; the warm base dies on its "
+            "readiness file with an EINVAL that names no uid")
+
+    def test_rootful_still_drops_to_the_unprivileged_uid(self, tmp_path):
+        """The rootful tier keeps its in-sandbox drop -- parity with the docker `--user` and FC
+        `setpriv` tiers -- and rootless must not quietly take that away from it."""
+        from blastbox.host.runtime.gvisor_snapshot import _oci_config
+
+        spec = _oci_config(_cfg(tmp_path), tmp_path / "b", in_ro=True)
+        assert spec["process"]["user"] == {"uid": 65532, "gid": 65532}
+
+    def test_the_snapshot_tier_refuses_rootless_up_front(self, tmp_path):
+        """gVisor supports rootless `run` and `checkpoint` but NOT `restore` -- so this tier,
+        which IS checkpoint/restore, must say so when it is configured rather than after the
+        base has booted, warmed, signalled READY and checkpointed. Without the refusal the first
+        RESTORE is what fails, which reads like snapshot corruption rather than a config error."""
+        import dataclasses
+
+        import pytest as _pytest
+
+        from blastbox.host.runtime.gvisor_snapshot import (
+            GvisorCommandError,
+            GvisorSnapshotBackend,
+        )
+
+        with _pytest.raises(GvisorCommandError, match="restore"):
+            GvisorSnapshotBackend(dataclasses.replace(_cfg(tmp_path), rootless=True))
+
+    def test_the_snapshot_tier_still_builds_rootful(self, tmp_path):
+        from blastbox.host.runtime.gvisor_snapshot import GvisorSnapshotBackend
+
+        assert GvisorSnapshotBackend(_cfg(tmp_path)) is not None

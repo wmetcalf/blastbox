@@ -499,6 +499,8 @@ def _gvisor_config_from_env(env):
         root=Path(root),
         image_rootfs=Path(rootfs),
         network=env.get("BLASTBOX_GVISOR_NETWORK", "none"),
+        rootless=(env.get("BLASTBOX_GVISOR_ROOTLESS", "").strip().lower()
+                  in ("1", "true", "yes", "on")),
         warm_argv=warm_argv,
         extra_env=extra_env,
         ld_preload=env.get("BLASTBOX_GVISOR_LD_PRELOAD") or None,

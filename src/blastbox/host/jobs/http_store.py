@@ -264,7 +264,10 @@ class HttpJobStore:
 
     # -- the JobStore surface a node needs ---------------------------------------
     def claim_next(self, *, claimant_tier: str | None = None,
-                   engine: "str | Any | None" = None) -> "Job | None":
+                   engine: "str | Any | None" = None,
+                   exclude: "Any" = ()) -> "Job | None":
+        # `exclude` is accepted for JobStore conformance and deliberately NOT sent: which jobs a
+        # node has been refused is the control plane's memory, not something a node may steer.
         """Claim work this node is granted. The control plane decides, not this process."""
         from blastbox.host.jobs.base import Job
 
@@ -341,6 +344,12 @@ class HttpJobStore:
         """
         with self._lock:
             self._settled.discard(job_id)
+            # POP BEFORE INSERT. Assigning an existing key keeps its ORIGINAL insertion
+            # position, and `_evict_locked`'s live-entry fallback is `next(iter(self._claims))`
+            # -- documented as oldest-first. So a re-claimed job's fresh, LIVE receipt stayed at
+            # position 0 and was the first live entry thrown away, ahead of hundreds of older
+            # claims. Position describes the claim, exactly as membership does.
+            self._claims.pop(job_id, None)
             self._claims[job_id] = (claim_id, receipt)
 
     def get(self, job_id: str) -> "Job | None":
@@ -392,6 +401,7 @@ class HttpJobStore:
     def update(self, job_id: str, **fields) -> "Job":
         from blastbox.host.jobs.base import Job
 
+        generation = self._claims.get(job_id)
         status, body = self._write(job_id, fields, expect_status=None)
         if status != 200 or not body:
             raise RuntimeError(f"control plane update failed (HTTP {status})")
@@ -400,9 +410,27 @@ class HttpJobStore:
 
         if job.status in (JobStatus.DONE, JobStatus.FAILED, JobStatus.EXPIRED,
                           JobStatus.QUEUED):
-            self._settled.add(job_id)
+            self._mark_settled(job_id, generation)
         self._evict_tracked()
         return job
+
+    def _mark_settled(self, job_id: str, generation: "tuple[str, str] | None") -> None:
+        """Record that THIS claim is settled -- under the lock, and only if it is still current.
+
+        `_settled` membership decides which receipts eviction throws away first, so a marker
+        that lands on the WRONG claim is a live job orphaned by bookkeeping. Keying on the job
+        id alone (and adding outside the lock) made that reachable with two ordinary dispatcher
+        threads: A releases job J to QUEUED while B immediately reclaims it, and if A's marker
+        lands after B's `_record_claim` it settles B's brand-new live receipt. Eviction then
+        discards it first and B's terminal write is refused as "no claim receipt".
+
+        `generation` is the (claim_id, receipt) the caller's write actually used; a marker for a
+        superseded generation is dropped.
+        """
+        with self._lock:
+            if generation is not None and self._claims.get(job_id) != generation:
+                return
+            self._settled.add(job_id)
 
     def _evict_tracked(self) -> None:
         """Bound the claim map WITHOUT breaking the read-back that follows a terminal write.
@@ -443,6 +471,7 @@ class HttpJobStore:
 
     def update_if_status(self, job_id: str, expect_status: "JobStatus", *,
                          expect_claim_id: str | None = None, **fields) -> bool:
+        generation = self._claims.get(job_id)
         status, _body = self._write(job_id, fields,
                                    expect_status=getattr(expect_status, "value",
                                                          str(expect_status)),
@@ -459,7 +488,7 @@ class HttpJobStore:
             raw = fields["status"]
             if (raw if isinstance(raw, JobStatus) else JobStatus(str(raw))) in (
                     JobStatus.DONE, JobStatus.FAILED, JobStatus.EXPIRED, JobStatus.QUEUED):
-                self._settled.add(job_id)
+                self._mark_settled(job_id, generation)
         self._evict_tracked()
         return True
 

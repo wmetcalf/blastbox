@@ -337,6 +337,7 @@ jobs:
           pytest -q
           tests/host/jobs/test_page_hash_search.py
           tests/host/jobs/test_sql_store.py
+          tests/host/jobs/test_claim_exclude.py
           tests/host/ingress/test_similar.py
 
   profile-gate:

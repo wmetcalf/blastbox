@@ -414,8 +414,8 @@ POST /v1/nodes/jobs/{id}             → report on it                }
 GET  /v1/nodes/jobs/{id}/disposition → whose job is this?          }
 ```
 
-The last two of those are not optional extras. Without `/backlog` a node's sizer has no demand
-signal at all and sits at its floors however deep the queue is; without `/disposition` the
+`/backlog` and `/disposition` are not optional extras. Without `/backlog` a node's sizer has no
+demand signal at all and sits at its floors however deep the queue is; without `/disposition` the
 node's only local disk bound stops working and `job_root` grows without bound with untrusted
 samples.
 
@@ -507,6 +507,49 @@ Three things an operator must know:
   recovery paths — the container dispatcher's requeue/warm-fail and the VM dispatcher's orphan
   sweep — skip those same claims, because neither can attest a worker running on another host.
   A mixed fleet is safe in both directions.
+
+  **Work no node can run is set aside, not walked forever.** When a node is refused a job, the
+  control plane checks it against *every* enrolled certificate. If none is granted what it needs
+  — a tier, credentials, an engine — the job is excluded for the whole fleet and logged once:
+
+  ```
+  node_claim: job=<id> engine=clamav is excluded from every node: no enrolled node is granted
+  what it needs (netpolicy tier 'socks' is not granted ...)
+  ```
+
+  Nothing is failed by this. The job stays QUEUED, and the exclusion lifts the moment a node
+  holding that grant enrols (any change to the certificate set re-judges everything). To have
+  such work failed after a deadline instead, set `BLASTBOX_MAX_QUEUED_AGE_S`; that sweep also
+  deletes the job's staged sample. It is opt-in because the control plane can see enrolled nodes
+  but not a DB-backed dispatcher, which on a mixed fleet might still run the job.
+
+  **KNOWN RESIDUAL: a node cannot repair its own pending upload after a restart.** When a
+  detonation finishes but the result upload exhausts its retries, the host seals the result,
+  keeps the local tree as the only copy, and marks the row FAILED. The next maintenance tick
+  normally uploads it and repairs the row FAILED->DONE — but that repair is a compare-and-set on
+  the row, and a node may only write to a job it can prove it holds. After a restart the proof
+  is gone with the process that held it, so on a federated node the repair cannot complete:
+
+  ```
+  pending-upload sweep: <job> has a durable result but this node cannot repair its FAILED row
+  ```
+
+  Nothing is lost *yet* — the bytes reach the blob store and the local tree is retained — but
+  the row stays FAILED and the result is unfetchable until someone with queue access repairs it.
+  The message repeats each tick because it stays true until acted on.
+
+  **Repair it before its retention deadline, and check before you do.** With
+  `BLASTBOX_JOB_RETENTION_SECONDS` set, the ingress retention sweep expires a FAILED row at its
+  deadline like any other and **deletes its result from the blob store**. After that, setting the
+  row to DONE creates a job that reports success and 404s on every fetch. So:
+
+  1. Confirm the row is still `failed` and its `expires_at` is in the future.
+  2. Confirm the result is actually in the blob store (`results/<job_id>/`).
+  3. Only then set the row to `done`.
+
+  If it has already expired, the node's retained local tree is the only copy left: re-upload the
+  result from that tree first, then repair the row. A dispatcher that holds the database repairs
+  its own rows automatically, exactly as before — this only applies to credential-less nodes.
 
   **Node certificates go to every ingress host too.** Grants are resolved from the certificates
   in the *ingress* host's PKI directory, so a node whose certificate lives only on the exit host

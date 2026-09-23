@@ -165,7 +165,8 @@ class _Handler(BaseHTTPRequestHandler):
         if not got:
             auth = self.headers.get("Authorization", "")
             got = auth[7:] if auth.startswith("Bearer ") else ""
-        return hmac.compare_digest(got, self.token)
+        return hmac.compare_digest(got.encode("utf-8", "surrogatepass"),
+                               self.token.encode("utf-8", "surrogatepass"))
 
     def do_GET(self) -> None:
         if urlparse(self.path).path == "/healthz":
