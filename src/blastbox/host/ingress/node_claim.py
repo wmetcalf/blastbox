@@ -170,9 +170,10 @@ _REFUSAL_MEMO_TTL_S = 3600.0
 #: node's grants) rather than to keep re-judging it; that is a separate change.
 _MAX_CLAIM_SKIPS = 16
 
-#: How many jobs the fleet-wide unrunnable set holds -- inside every store's bound-parameter
-#: limit (SQLite 32,766; Postgres 65,535) with headroom for the claim's own parameters.
-_MAX_UNRUNNABLE = 30_000
+#: How many jobs the fleet-wide unrunnable set holds. 20,000 so that it PLUS a full per-node memo
+#: (8,192) stays inside SQLite's 32,766 bound parameters -- the two are passed together as one
+#: exclusion. At 30,000 the union could exceed it, and the store would trim the head of the wall.
+_MAX_UNRUNNABLE = 20_000
 
 #: How long a job this node may NOT run is deferred for EVERYONE after a refusal. This is ALSO
 #: the write-amplification bound the DoS finding wanted: a refused job flips RUNNING->QUEUED at
@@ -841,13 +842,20 @@ def register_node_claim_routes(
         _grants_now("")
         return _grants_cache["map"]
 
+    def _fleet_fingerprint(fleet: "dict[str, Any]") -> str:
+        """What the whole fleet is granted, as content. The exclusion is a function of THIS, so it
+        is keyed on this -- not on the certificate files' (name, mtime, size), which a certificate
+        replaced by metadata-preserving tooling leaves unchanged while its grants move. Grants are
+        re-read on content every _GRANTS_CACHE_TTL_S; the exclusion now follows the same read."""
+        return "|".join(f"{node}={_grants_fingerprint(g)}" for node, g in sorted(fleet.items()))
+
     def _unrunnable_now() -> "frozenset[str]":
-        _fleet_now()
-        if _grants_cache["sig"] != _unrunnable_sig[0]:
+        fingerprint = _fleet_fingerprint(_fleet_now())
+        if fingerprint != _unrunnable_sig[0]:
             # THE CERTIFICATE SET CHANGED -- a node enrolled, renewed, lapsed or was removed. Any
             # of those can make a job runnable, so every judgement is void and re-made on demand.
             _unrunnable.clear()
-            _unrunnable_sig[0] = _grants_cache["sig"]
+            _unrunnable_sig[0] = fingerprint
         return frozenset(_unrunnable)
 
     def _fleet_can_run(job) -> bool:
@@ -866,8 +874,12 @@ def register_node_claim_routes(
         if job.job_id in _unrunnable:
             return
         if len(_unrunnable) >= _MAX_UNRUNNABLE:
-            for key in list(_unrunnable)[: _MAX_UNRUNNABLE // 2]:
-                _unrunnable.pop(key, None)
+            # FULL MEANS STOP ADDING -- never evict. Evicting the oldest half discarded the HEAD
+            # of the wall, which is exactly what oldest-first `claim_next` offers next, so the set
+            # cycled over the same prefix and nothing behind it was ever reached: the very failure
+            # this set exists to end. Refusing new entries keeps the head excluded, so the walk
+            # still moves forward; the jobs past the cap fall back to the per-node memo.
+            return
         _unrunnable[job.job_id] = why
         # ONCE PER JOB, and it names the missing grant. Queued-forever with nothing in the log
         # was half of this problem: the operator could not tell a wall from an empty fleet.

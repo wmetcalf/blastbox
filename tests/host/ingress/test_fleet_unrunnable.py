@@ -157,3 +157,57 @@ def test_the_operator_is_told_why_the_work_sits(tmp_path, monkeypatch, caplog):
             f.c.post("/v1/nodes/claim", json={}, headers=h)
     said = [r for r in caplog.records if "no enrolled node" in r.message]
     assert len(said) == 2, f"expected one line per unrunnable job, got {len(said)}"
+
+
+def test_a_full_unrunnable_set_keeps_the_head_excluded(tmp_path, monkeypatch):
+    """When the fleet set filled, it evicted its OLDEST half -- the head of the wall, which is exactly
+    what oldest-first `claim_next` offers next -- so the exclusion cycled and the work behind it
+    was never reached: the same forget-the-front failure the set was added to end. Full now means
+    'stop adding', which keeps the head excluded and the walk moving forward."""
+    monkeypatch.setattr(nc, "_MAX_UNRUNNABLE", 50)
+    # The per-node memo must be small too, or it masks the fleet set: a real wall past the fleet
+    # cap is past the memo's 8,192 as well.
+    monkeypatch.setattr(nc._RefusalMemo.__init__, "__defaults__", (3600.0, 16))
+    f = Fleet(tmp_path, monkeypatch, {"a": NO_SOCKS})
+    # 60: past the fleet cap (50), inside cap + memo (66). Eviction cycles here; stop-adding
+    # crosses. A wall past cap + memo is a stated bound, not something this claims to remove --
+    # 28,000 jobs no node can run is what BLASTBOX_MAX_QUEUED_AGE_S is for.
+    f.wall(60)
+    f.store.create(Job(job_id="behind", engine="boxjs", filename="f", status=JobStatus.QUEUED,
+                       created_at=time.time()))
+    assert _poll_until(f, "a", "behind", 60 // nc._MAX_CLAIM_PROBES + 40), (
+        "a full unrunnable set forgot the head of the wall and never let the walk past it")
+
+
+def test_the_exclusion_follows_grant_CONTENT_not_file_metadata(tmp_path, monkeypatch):
+    """A certificate replaced with its filename, mtime AND SIZE preserved (metadata-preserving deploy
+    tooling) changes what a node is granted without changing the file signature the exclusion was
+    keyed on. Grants refresh on content every 15 s; the exclusion must follow the same content, or
+    the jobs a node can now run stay hidden until something unrelated changes. Built exactly: the
+    old certificate is padded with a long engine name, the new one padded to the same byte count."""
+    import os
+
+    pad = "e" + "x" * 400
+    f = Fleet(tmp_path, monkeypatch, {"a": pki.NodeGrants(
+        engines=("clamav", "boxjs", pad), tiers=(), credentials=False)})
+    f.wall(3)
+    h = f.headers("a")
+    for _ in range(3):
+        f.c.post("/v1/nodes/claim", json={}, headers=h)
+    crt = f.d / "node-a.crt"
+    old = os.stat(crt)
+    f.enrol("a", pki.NodeGrants(engines=("clamav", "boxjs"), tiers=("socks",), credentials=True))
+    body = crt.read_bytes()
+    assert len(body) < old.st_size, "the new certificate must be smaller for the padding to work"
+    crt.write_bytes(body + b"\n" * (old.st_size - len(body)))       # SAME size
+    os.utime(crt, ns=(old.st_atime_ns, old.st_mtime_ns))            # SAME mtime
+    assert os.stat(crt).st_size == old.st_size
+    # Past the grants cache's 15 s deadline, so the next request re-reads grant CONTENT. Before the
+    # fix that refresh changed the grants but not the exclusion, which stayed keyed on file
+    # metadata -- hidden forever. After it, the exclusion follows the same read.
+    real_time = time.time
+    monkeypatch.setattr(time, "time", lambda: real_time() + nc._GRANTS_CACHE_TTL_S + 5)
+    for i in range(3):
+        f.store.update(f"wall{i:05d}", claimable_after=None)
+    assert _poll_until(f, "a", "wall00000", 3), (
+        "a node whose grants changed in place still had the work hidden by a stale exclusion")
