@@ -170,6 +170,10 @@ _REFUSAL_MEMO_TTL_S = 3600.0
 #: node's grants) rather than to keep re-judging it; that is a separate change.
 _MAX_CLAIM_SKIPS = 16
 
+#: How many jobs the fleet-wide unrunnable set holds -- inside every store's bound-parameter
+#: limit (SQLite 32,766; Postgres 65,535) with headroom for the claim's own parameters.
+_MAX_UNRUNNABLE = 30_000
+
 #: How long a job this node may NOT run is deferred for EVERYONE after a refusal. This is ALSO
 #: the write-amplification bound the DoS finding wanted: a refused job flips RUNNING->QUEUED at
 #: most once per this window, so a node hammering /claim cannot churn the head of the queue --
@@ -708,7 +712,8 @@ def register_node_claim_routes(
                 # privilege. With the exclusion the store simply does not offer them: nothing
                 # to release, nothing to re-stamp, and nothing in the way.
                 candidate = job_store.claim_next(
-                    engine=frozenset(allowed), exclude=_refusals.remembered_for(memo_key))
+                    engine=frozenset(allowed),
+                    exclude=_refusals.remembered_for(memo_key) | _unrunnable_now())
                 if candidate is None:
                     break
                 # STAMP THE PREFIX FIRST, before judging and before the memo check. The prefix
@@ -760,8 +765,11 @@ def register_node_claim_routes(
                     break
                 skipped.append(candidate)
                 _refusals.remember(memo_key, candidate.job_id)
-                _log.warning("node_claim: released job=%s from node=%s: %s",
-                             candidate.job_id, node_id, why)
+                if not _fleet_can_run(candidate):
+                    _note_unrunnable(candidate, why)
+                else:
+                    _log.warning("node_claim: released job=%s from node=%s: %s",
+                                 candidate.job_id, node_id, why)
         finally:
             # Put back everything not handed over, including on an exception: a job claimed
             # inside this loop and not returned would otherwise be stranded RUNNING.
@@ -814,6 +822,59 @@ def register_node_claim_routes(
     #: drive the bounds directly: both were reverted in a mutation pass with the suite green,
     #: because nothing could reach them without ~4000 requests.
     _refusals = _RefusalMemo()
+
+    #: job_id -> the refusal reason, for jobs NO enrolled certificate is granted. The per-node memo
+    #: above could only ever approximate this: it is per node, so every node re-judged the same
+    #: wall, and it had to forget something eventually -- a size cap, then a TTL -- and each time
+    #: it forgot the HEAD of the wall first, which is exactly what `claim_next` offers next. Four
+    #: review rounds found four edges of that one mechanism. This set is judged once per
+    #: certificate set, shared by every node, never expires, and is invalidated the moment the
+    #: certificate set changes -- because that is the only thing that can make such a job runnable.
+    #: Disposing of the work is NOT done here: BLASTBOX_MAX_QUEUED_AGE_S already fails stale
+    #: queued jobs (opt-in, retention-correct, deleting the staged sample), and once these stop
+    #: being churned they sit undeferred for that sweep to find.
+    _unrunnable: "dict[str, str]" = {}
+    _unrunnable_sig: "list[Any]" = [None]
+
+    def _fleet_now() -> "dict[str, Any]":
+        """Every enrolled node's grants, from the same cache `_grants_now` keeps fresh."""
+        _grants_now("")
+        return _grants_cache["map"]
+
+    def _unrunnable_now() -> "frozenset[str]":
+        _fleet_now()
+        if _grants_cache["sig"] != _unrunnable_sig[0]:
+            # THE CERTIFICATE SET CHANGED -- a node enrolled, renewed, lapsed or was removed. Any
+            # of those can make a job runnable, so every judgement is void and re-made on demand.
+            _unrunnable.clear()
+            _unrunnable_sig[0] = _grants_cache["sig"]
+        return frozenset(_unrunnable)
+
+    def _fleet_can_run(job) -> bool:
+        """Does ANY enrolled certificate satisfy this job? The same test the walk applies to one
+        node, applied to all of them -- so a job a peer IS granted is never excluded here."""
+        from blastbox.host.placement import refusal as _refusal
+
+        tier, needs_credentials, could_tell = _job_requirements(job)
+        if not could_tell and _strict_tiers():
+            return False            # nobody can be shown to satisfy an unresolvable policy
+        return any(_refusal(g, engine=job.engine, tier=tier,
+                            require_credentials=needs_credentials) is None
+                   for g in _fleet_now().values())
+
+    def _note_unrunnable(job, why: str) -> None:
+        if job.job_id in _unrunnable:
+            return
+        if len(_unrunnable) >= _MAX_UNRUNNABLE:
+            for key in list(_unrunnable)[: _MAX_UNRUNNABLE // 2]:
+                _unrunnable.pop(key, None)
+        _unrunnable[job.job_id] = why
+        # ONCE PER JOB, and it names the missing grant. Queued-forever with nothing in the log
+        # was half of this problem: the operator could not tell a wall from an empty fleet.
+        _log.warning("node_claim: job=%s engine=%s is excluded from every node: no enrolled "
+                     "node is granted what it needs (%s). Enrol a node that is, or set "
+                     "BLASTBOX_MAX_QUEUED_AGE_S to fail work like this after a deadline.",
+                     job.job_id, job.engine, why)
 
     def _defer_until(job) -> "float | None":
         """How long to hold a wrongly-offered job back, or None for "claimable immediately".

@@ -508,6 +508,21 @@ Three things an operator must know:
   sweep — skip those same claims, because neither can attest a worker running on another host.
   A mixed fleet is safe in both directions.
 
+  **Work no node can run is set aside, not walked forever.** When a node is refused a job, the
+  control plane checks it against *every* enrolled certificate. If none is granted what it needs
+  — a tier, credentials, an engine — the job is excluded for the whole fleet and logged once:
+
+  ```
+  node_claim: job=<id> engine=clamav is excluded from every node: no enrolled node is granted
+  what it needs (netpolicy tier 'socks' is not granted ...)
+  ```
+
+  Nothing is failed by this. The job stays QUEUED, and the exclusion lifts the moment a node
+  holding that grant enrols (any change to the certificate set re-judges everything). To have
+  such work failed after a deadline instead, set `BLASTBOX_MAX_QUEUED_AGE_S`; that sweep also
+  deletes the job's staged sample. It is opt-in because the control plane can see enrolled nodes
+  but not a DB-backed dispatcher, which on a mixed fleet might still run the job.
+
   **KNOWN RESIDUAL: a node cannot repair its own pending upload after a restart.** When a
   detonation finishes but the result upload exhausts its retries, the host seals the result,
   keeps the local tree as the only copy, and marks the row FAILED. The next maintenance tick
