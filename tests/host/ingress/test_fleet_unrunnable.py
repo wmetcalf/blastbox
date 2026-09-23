@@ -211,3 +211,46 @@ def test_the_exclusion_follows_grant_CONTENT_not_file_metadata(tmp_path, monkeyp
         f.store.update(f"wall{i:05d}", claimable_after=None)
     assert _poll_until(f, "a", "wall00000", 3), (
         "a node whose grants changed in place still had the work hidden by a stale exclusion")
+
+
+def test_grant_fingerprints_cannot_collide_through_a_delimiter():
+    """Joined with commas, a tier literally named 'socks,vpn' and the pair ('socks', 'vpn') produced
+    the same key -- so correcting a certificate from one to the other kept a stale exclusion."""
+    a = nc._grants_fingerprint(pki.NodeGrants(engines=("clamav",), tiers=("socks,vpn",)))
+    b = nc._grants_fingerprint(pki.NodeGrants(engines=("clamav",), tiers=("socks", "vpn")))
+    assert a != b, "two different grant sets share one cache key"
+
+
+class TestTheUnrunnableSetIsFencedToItsGeneration:
+    """Under concurrent claims one thread can judge a job against the OLD grants while another
+    refreshes and clears the set; the first then inserted its stale verdict into the fresh set,
+    whose generation already named the new grants -- so nothing ever invalidated it, and a newly
+    entitled node could not claim the job until some other certificate changed. Forced here
+    deterministically rather than hoped for with threads."""
+
+    def test_a_verdict_from_a_superseded_generation_is_discarded(self):
+        s = nc._UnrunnableSet(limit=100)
+        s.current("grants-v1")                      # thread A reads the old fleet...
+        s.current("grants-v2")                      # ...thread B refreshes and clears
+        s.note("job", "old verdict", generation="grants-v1")   # A finishes, late
+        assert s.current("grants-v2") == frozenset(), (
+            "a verdict computed from superseded grants survived into the new generation")
+
+    def test_a_current_verdict_is_kept(self):
+        s = nc._UnrunnableSet(limit=100)
+        s.current("grants-v2")
+        assert s.note("job", "why", generation="grants-v2") is True
+        assert s.current("grants-v2") == frozenset({"job"})
+
+    def test_full_means_stop_adding_and_say_so_once(self, caplog):
+        import logging
+
+        s = nc._UnrunnableSet(limit=2)
+        s.current("g")
+        with caplog.at_level(logging.WARNING):
+            for i in range(5):
+                s.note(f"j{i}", "why", generation="g")
+        assert s.current("g") == frozenset({"j0", "j1"}), "the head was evicted, not kept"
+        full = [r for r in caplog.records if "fleet-wide exclusion is full" in r.message]
+        assert len(full) == 1, (
+            f"the bound was reached silently (or repeatedly): {len(full)} warnings")

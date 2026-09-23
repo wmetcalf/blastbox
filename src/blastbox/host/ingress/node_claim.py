@@ -248,10 +248,72 @@ def _grants_fingerprint(grants) -> str:
     alone meant a certificate re-issued with the grant it lacked was still refused from memory
     until the entry expired; keyed by this, the new certificate simply has no memory yet.
     """
-    engines = ",".join(sorted(getattr(grants, "engines", ()) or ()))
-    tiers = ",".join(sorted(getattr(grants, "tiers", ()) or ()))
-    creds = "1" if getattr(grants, "credentials", False) else "0"
-    return f"e={engines};t={tiers};c={creds}"
+    import json
+
+    # STRUCTURED, not joined. With ",".join a tier literally named "socks,vpn" and the pair
+    # ("socks", "vpn") produced the same key, so correcting a certificate from one to the other
+    # left a stale exclusion in place. Grant values are not validated against delimiters at
+    # issuance, so no delimiter is safe; JSON of sorted lists is unambiguous by construction.
+    return json.dumps([sorted(getattr(grants, "engines", ()) or ()),
+                       sorted(getattr(grants, "tiers", ()) or ()),
+                       bool(getattr(grants, "credentials", False))],
+                      separators=(",", ":"))
+
+
+class _UnrunnableSet:
+    """Jobs NO enrolled certificate is granted, fenced to the grants generation they were judged in.
+
+    Why a class and a lock: sync FastAPI handlers run in a threadpool. One thread could judge a job
+    against the OLD grants while another refreshed the grants and cleared this set; the first then
+    inserted its stale verdict into the fresh set, whose generation already named the new grants --
+    so nothing ever invalidated it, and a newly entitled node could not claim the job until some
+    other certificate changed. A verdict now carries the generation it was computed from, and is
+    kept only if that is still the current one, checked under the same lock that clears.
+    """
+
+    def __init__(self, limit: "int | None" = None) -> None:
+        import threading
+
+        self._ids: dict[str, str] = {}
+        self._gen: "str | None" = None
+        # Read at CONSTRUCTION, not bound as a default argument at import -- so the module constant
+        # is the one source of truth (and a test that lowers it is actually testing the cap).
+        self._limit = _MAX_UNRUNNABLE if limit is None else limit
+        self._lock = threading.Lock()
+        self._said_full = False
+
+    def current(self, generation: str) -> "frozenset[str]":
+        """The exclusion for `generation`; a new generation voids every earlier verdict."""
+        with self._lock:
+            if generation != self._gen:
+                # THE CERTIFICATE SET CHANGED -- a node enrolled, renewed, lapsed or was removed.
+                # Any of those can make a job runnable, so every judgement is void.
+                self._ids.clear()
+                self._gen = generation
+                self._said_full = False
+            return frozenset(self._ids)
+
+    def note(self, job_id: str, why: str, *, generation: str) -> bool:
+        """Record a verdict if it is still current and there is room. True if it was recorded."""
+        with self._lock:
+            if generation != self._gen or job_id in self._ids:
+                return False
+            if len(self._ids) >= self._limit:
+                # FULL MEANS STOP ADDING -- never evict. Evicting discarded the HEAD of the wall,
+                # which is what oldest-first `claim_next` offers next, so the set cycled over the
+                # same prefix. Refusing new entries keeps the head excluded and the walk moving.
+                # And SAY SO, once: past this point work behind the wall can starve again, which
+                # is the documented bound, and a bound reached silently is worse than none.
+                if not self._said_full:
+                    self._said_full = True
+                    _log.error("node_claim: the fleet-wide exclusion is full (%d jobs that no "
+                               "enrolled node can run). Work queued behind them may no longer "
+                               "be reached. Enrol a node that holds the missing grants, or set "
+                               "BLASTBOX_MAX_QUEUED_AGE_S so such work is failed on a deadline.",
+                               self._limit)
+                return False
+            self._ids[job_id] = why
+            return True
 
 
 class _RefusalMemo:
@@ -766,8 +828,9 @@ def register_node_claim_routes(
                     break
                 skipped.append(candidate)
                 _refusals.remember(memo_key, candidate.job_id)
-                if not _fleet_can_run(candidate):
-                    _note_unrunnable(candidate, why)
+                can_run, generation = _fleet_verdict(candidate)
+                if not can_run:
+                    _note_unrunnable(candidate, why, generation)
                 else:
                     _log.warning("node_claim: released job=%s from node=%s: %s",
                                  candidate.job_id, node_id, why)
@@ -834,8 +897,7 @@ def register_node_claim_routes(
     #: Disposing of the work is NOT done here: BLASTBOX_MAX_QUEUED_AGE_S already fails stale
     #: queued jobs (opt-in, retention-correct, deleting the staged sample), and once these stop
     #: being churned they sit undeferred for that sweep to find.
-    _unrunnable: "dict[str, str]" = {}
-    _unrunnable_sig: "list[Any]" = [None]
+    _unrunnable = _UnrunnableSet()
 
     def _fleet_now() -> "dict[str, Any]":
         """Every enrolled node's grants, from the same cache `_grants_now` keeps fresh."""
@@ -850,43 +912,32 @@ def register_node_claim_routes(
         return "|".join(f"{node}={_grants_fingerprint(g)}" for node, g in sorted(fleet.items()))
 
     def _unrunnable_now() -> "frozenset[str]":
-        fingerprint = _fleet_fingerprint(_fleet_now())
-        if fingerprint != _unrunnable_sig[0]:
-            # THE CERTIFICATE SET CHANGED -- a node enrolled, renewed, lapsed or was removed. Any
-            # of those can make a job runnable, so every judgement is void and re-made on demand.
-            _unrunnable.clear()
-            _unrunnable_sig[0] = fingerprint
-        return frozenset(_unrunnable)
+        return _unrunnable.current(_fleet_fingerprint(_fleet_now()))
 
-    def _fleet_can_run(job) -> bool:
-        """Does ANY enrolled certificate satisfy this job? The same test the walk applies to one
-        node, applied to all of them -- so a job a peer IS granted is never excluded here."""
+    def _fleet_verdict(job) -> "tuple[bool, str]":
+        """Can ANY enrolled certificate run this job, and in which grants generation was that
+        decided? One fleet snapshot for both, so the verdict and its generation cannot disagree.
+        The same test the walk applies to one node, applied to all -- a job a peer IS granted is
+        never excluded here."""
         from blastbox.host.placement import refusal as _refusal
 
+        fleet = _fleet_now()
+        generation = _fleet_fingerprint(fleet)
         tier, needs_credentials, could_tell = _job_requirements(job)
         if not could_tell and _strict_tiers():
-            return False            # nobody can be shown to satisfy an unresolvable policy
+            return False, generation    # nobody can be shown to satisfy an unresolvable policy
         return any(_refusal(g, engine=job.engine, tier=tier,
                             require_credentials=needs_credentials) is None
-                   for g in _fleet_now().values())
+                   for g in fleet.values()), generation
 
-    def _note_unrunnable(job, why: str) -> None:
-        if job.job_id in _unrunnable:
-            return
-        if len(_unrunnable) >= _MAX_UNRUNNABLE:
-            # FULL MEANS STOP ADDING -- never evict. Evicting the oldest half discarded the HEAD
-            # of the wall, which is exactly what oldest-first `claim_next` offers next, so the set
-            # cycled over the same prefix and nothing behind it was ever reached: the very failure
-            # this set exists to end. Refusing new entries keeps the head excluded, so the walk
-            # still moves forward; the jobs past the cap fall back to the per-node memo.
-            return
-        _unrunnable[job.job_id] = why
-        # ONCE PER JOB, and it names the missing grant. Queued-forever with nothing in the log
-        # was half of this problem: the operator could not tell a wall from an empty fleet.
-        _log.warning("node_claim: job=%s engine=%s is excluded from every node: no enrolled "
-                     "node is granted what it needs (%s). Enrol a node that is, or set "
-                     "BLASTBOX_MAX_QUEUED_AGE_S to fail work like this after a deadline.",
-                     job.job_id, job.engine, why)
+    def _note_unrunnable(job, why: str, generation: str) -> None:
+        if _unrunnable.note(job.job_id, why, generation=generation):
+            # ONCE PER JOB, and it names the missing grant. Queued-forever with nothing in the log
+            # was half of this problem: the operator could not tell a wall from an empty fleet.
+            _log.warning("node_claim: job=%s engine=%s is excluded from every node: no enrolled "
+                         "node is granted what it needs (%s). Enrol a node that is, or set "
+                         "BLASTBOX_MAX_QUEUED_AGE_S to fail work like this after a deadline.",
+                         job.job_id, job.engine, why)
 
     def _defer_until(job) -> "float | None":
         """How long to hold a wrongly-offered job back, or None for "claimable immediately".
