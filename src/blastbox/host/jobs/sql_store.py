@@ -740,7 +740,11 @@ class SqlJobStore:
 
         Bounded by the caller (the ingress refusal memo), so the parameter list cannot grow
         without limit; an empty collection adds nothing to the query."""
-        ids = sorted({str(x) for x in exclude})
+        # ORDER-PRESERVING DEDUPE, not sorted(). When the driver cannot bind them all, the trim
+        # below keeps the FIRST ids -- and callers pass refusals oldest-first, which is the head of
+        # a wall, exactly what oldest-first `claim_next` offers next. Sorting made the trim keep
+        # whatever sorted early and could drop the head, re-starving the work behind it.
+        ids = list(dict.fromkeys(str(x) for x in exclude))
         if not ids:
             return "", []
         # THE DRIVER'S LIMIT, NOT A GUESS. SQLite before 3.32 accepts only 999 bound parameters

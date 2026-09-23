@@ -233,14 +233,14 @@ class TestTheUnrunnableSetIsFencedToItsGeneration:
         s.current("grants-v1")                      # thread A reads the old fleet...
         s.current("grants-v2")                      # ...thread B refreshes and clears
         s.note("job", "old verdict", generation="grants-v1")   # A finishes, late
-        assert s.current("grants-v2") == frozenset(), (
+        assert s.current("grants-v2") == (), (
             "a verdict computed from superseded grants survived into the new generation")
 
     def test_a_current_verdict_is_kept(self):
         s = nc._UnrunnableSet(limit=100)
         s.current("grants-v2")
         assert s.note("job", "why", generation="grants-v2") is True
-        assert s.current("grants-v2") == frozenset({"job"})
+        assert s.current("grants-v2") == ("job",)
 
     def test_full_means_stop_adding_and_say_so_once(self, caplog):
         import logging
@@ -250,7 +250,7 @@ class TestTheUnrunnableSetIsFencedToItsGeneration:
         with caplog.at_level(logging.WARNING):
             for i in range(5):
                 s.note(f"j{i}", "why", generation="g")
-        assert s.current("g") == frozenset({"j0", "j1"}), "the head was evicted, not kept"
+        assert s.current("g") == ("j0", "j1"), "the head was evicted, not kept"
         full = [r for r in caplog.records if "fleet-wide exclusion is full" in r.message]
         assert len(full) == 1, (
             f"the bound was reached silently (or repeatedly): {len(full)} warnings")

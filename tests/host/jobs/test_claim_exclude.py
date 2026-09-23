@@ -55,14 +55,29 @@ def _seed(store, n):
     for i, jid in enumerate(ids):
         store.create(Job(job_id=jid, engine=engine, filename="f",
                          status=JobStatus.QUEUED, created_at=now - 1000 + i))
+        _CREATED.append((store, jid))
     return engine, ids
+
+
+_CREATED: "list[tuple[object, str]]" = []
 
 
 @pytest.fixture(params=["memory", "sqlite", "redis", "postgres"])
 def store(request, tmp_path):
+    """...and CLEANS UP what it created. The postgres case runs against a SHARED database, and
+    rows left QUEUED there were claimed by later tests that call `claim_next` without an engine
+    filter -- test_sql_store's target-tier test failed on a leftover row from this file whenever
+    this file happened to run first. CI's file order masked it."""
     for name, s in _stores(tmp_path):
         if name == request.param:
-            return s
+            yield s
+            while _CREATED:
+                st, jid = _CREATED.pop()
+                try:
+                    st.delete(jid)
+                except Exception:           # noqa: BLE001 - best-effort teardown
+                    pass
+            return
     pytest.skip(f"{request.param} backend unavailable (postgres needs BLASTBOX_TEST_PG_DSN)")
 
 
@@ -128,3 +143,20 @@ def test_old_sqlite_truncates_rather_than_failing_the_claim(tmp_path, monkeypatc
     job = store.claim_next(engine=engine, exclude=noise)
     assert job is not None and job.job_id == ids[0], (
         "on old SQLite the claim failed instead of trimming the exclusion to the driver's limit")
+
+
+def test_a_trimmed_exclusion_keeps_what_it_was_given_FIRST_not_what_sorts_first(tmp_path,
+                                                                              monkeypatch):
+    """When the driver cannot bind the whole exclusion (SQLite older than 3.32), the store trims it.
+    It trimmed by LEXICOGRAPHIC order, which can drop the OLDEST refusals -- the head of the wall,
+    exactly what oldest-first `claim_next` offers next -- and keep newer ones. The caller now passes
+    refusals in the order they were judged (oldest first), and the store keeps the first it is
+    given."""
+    from blastbox.host.jobs.sql_store import SqlJobStore
+
+    store = SqlJobStore(f"sqlite:///{tmp_path / 't.db'}")
+    monkeypatch.setattr(store, "_max_exclude", lambda: 3)
+    oldest_first = ("zz-old-1", "zz-old-2", "zz-old-3", "aa-new-1", "aa-new-2")
+    _clause, params = store._exclude_clause(oldest_first)
+    assert params == ["zz-old-1", "zz-old-2", "zz-old-3"], (
+        f"the trim kept {params}: it dropped the head of the wall because it sorts late")

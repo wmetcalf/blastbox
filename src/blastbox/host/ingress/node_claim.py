@@ -282,7 +282,7 @@ class _UnrunnableSet:
         self._lock = threading.Lock()
         self._said_full = False
 
-    def current(self, generation: str) -> "frozenset[str]":
+    def current(self, generation: str) -> "tuple[str, ...]":
         """The exclusion for `generation`; a new generation voids every earlier verdict."""
         with self._lock:
             if generation != self._gen:
@@ -291,7 +291,7 @@ class _UnrunnableSet:
                 self._ids.clear()
                 self._gen = generation
                 self._said_full = False
-            return frozenset(self._ids)
+            return tuple(self._ids)         # judging order: see _RefusalMemo.remembered_for
 
     def note(self, job_id: str, why: str, *, generation: str) -> bool:
         """Record a verdict if it is still current and there is room. True if it was recorded."""
@@ -338,7 +338,7 @@ class _RefusalMemo:
             for key in list(self._until)[: self._limit // 2]:
                 self._until.pop(key, None)
 
-    def remembered_for(self, node_id: str, *, limit: "int | None" = None) -> "frozenset[str]":
+    def remembered_for(self, node_id: str, *, limit: "int | None" = None) -> "tuple[str, ...]":
         """The jobs this node has been refused and whose refusal is still fresh.
 
         Handed to `claim_next(exclude=...)` so the STORE never offers them -- see
@@ -368,7 +368,9 @@ class _RefusalMemo:
                 self._until[(nid, jid)] = fresh
                 if len(out) >= limit:
                     break
-        return frozenset(out)
+        # IN JUDGING ORDER -- oldest refusal first, which is the head of the wall because
+        # `claim_next` is oldest-first. A store that must trim the exclusion keeps the front.
+        return tuple(out)
 
     def remembers(self, node_id: str, job_id: str) -> bool:
         key = (node_id, job_id)
@@ -776,7 +778,11 @@ def register_node_claim_routes(
                 # to release, nothing to re-stamp, and nothing in the way.
                 candidate = job_store.claim_next(
                     engine=frozenset(allowed),
-                    exclude=_refusals.remembered_for(memo_key) | _unrunnable_now())
+                    # FLEET SET FIRST: it never expires and holds the head of any wall no node
+                    # can run, so if a store must trim the exclusion it keeps these. Then this
+                    # node's own refusals, oldest first. Order-preserving, deduplicated.
+                    exclude=tuple(dict.fromkeys(
+                        _unrunnable_now() + _refusals.remembered_for(memo_key))))
                 if candidate is None:
                     break
                 # STAMP THE PREFIX FIRST, before judging and before the memo check. The prefix
@@ -911,7 +917,7 @@ def register_node_claim_routes(
         re-read on content every _GRANTS_CACHE_TTL_S; the exclusion now follows the same read."""
         return "|".join(f"{node}={_grants_fingerprint(g)}" for node, g in sorted(fleet.items()))
 
-    def _unrunnable_now() -> "frozenset[str]":
+    def _unrunnable_now() -> "tuple[str, ...]":
         return _unrunnable.current(_fleet_fingerprint(_fleet_now()))
 
     def _fleet_verdict(job) -> "tuple[bool, str]":

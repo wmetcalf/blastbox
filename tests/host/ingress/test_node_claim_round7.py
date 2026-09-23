@@ -105,11 +105,11 @@ def test_an_expired_refusal_is_offered_again(tmp_path, monkeypatch):
     missing grant never sees that work again."""
     memo = nc._RefusalMemo(ttl_s=-1.0)
     memo.remember("n", "j")
-    assert memo.remembered_for("n") == frozenset()
+    assert memo.remembered_for("n") == ()
     fresh = nc._RefusalMemo(ttl_s=60.0)
     fresh.remember("n", "j")
     fresh.remember("other", "k")
-    assert fresh.remembered_for("n") == frozenset({"j"}), "one node's refusals leaked to another"
+    assert fresh.remembered_for("n") == ("j",), "one node's refusals leaked to another"
 
 
 def test_the_exclusion_list_is_bounded():
