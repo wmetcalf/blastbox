@@ -2015,6 +2015,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="accept several blastbox versions across the fleet (separate products "
         "on one host); without it a mixed fleet is reported and exits 1",
     )
+    pdoc.add_argument(
+        "--rootfs",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="also read the stamp on a warm rootfs artifact (ext4 file or "
+        "exported directory). Repeatable. A rootfs is not a process, so it is "
+        "invisible to the container survey -- which is where three engines "
+        "drifted for two months",
+    )
+    pdoc.add_argument(
+        "--json",
+        action="store_true",
+        help="emit the whole fleet as one JSON object for monitoring: versions, "
+        "per-container and per-artifact detail, drift buckets, and any artifact "
+        "this host cannot boot. Exit code still reflects health",
+    )
     pdoc.set_defaults(func=_doctor_cmd)
 
     pst = sub.add_parser(
@@ -2543,15 +2560,46 @@ def _doctor_cmd(args: argparse.Namespace) -> int:
         survey,
     )
 
+    from blastbox.host.doctor import (  # noqa: PLC0415 -- CLI-only
+        artifact_problems,
+        fleet_report,
+        survey_rootfs,
+    )
+
+    artifacts = survey_rootfs(getattr(args, "rootfs", []) or [])
     try:
         containers = survey()
     except DockerUnavailable as exc:
-        print(f"cannot inspect anything: {exc}")
-        return 2
-    if not containers:
+        if artifacts:
+            # Docker being unreachable does not make the ARTIFACTS unreadable:
+            # they are files. Report what could be read rather than nothing.
+            containers = []
+        else:
+            print(f"cannot inspect anything: {exc}")
+            return 2
+
+    if getattr(args, "json", False):
+        report = fleet_report(containers, artifacts)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0 if report["ok"] else 1
+
+    if not containers and not artifacts:
         print("no running blastbox containers found")
         # With --expect, verifying nothing must not report success.
         return 1 if args.expect else 0
+
+    if artifacts:
+        awidth = max(len(a.path) for a in artifacts)
+        for a in artifacts:
+            where = f"{a.runtime or '?'}/{a.arch or '?'}"
+            note = f"  <- {a.detail}" if a.detail else ""
+            print(f"  {'rootfs':<18} {a.path:<{awidth}}  {where:<26} {a.version}{note}")
+        for art, why in artifact_problems(artifacts):
+            print(f"  UNBOOTABLE HERE: {art.path}: {why}")
+        if containers:
+            print()
+    if not containers:
+        return 1 if any(not a.known for a in artifacts) or artifact_problems(artifacts) else 0
 
     width = max(len(c.name) for c in containers)
     for c in sorted(containers, key=lambda c: (c.project, c.name)):
@@ -2598,7 +2646,30 @@ def _doctor_cmd(args: argparse.Namespace) -> int:
             )
             return 1
         return 0
-    print(f"OK: {len(containers)} container(s), blastbox {', '.join(sorted(versions))}")
+    # Artifacts count toward the verdict. Printing an UNBOOTABLE rootfs and then
+    # reporting OK is the precise shape of the failure this command exists for:
+    # a fleet that reads healthy and cannot serve a warm job.
+    bad_artifacts = artifact_problems(artifacts)
+    unknown_artifacts = [a for a in artifacts if not a.known]
+    if bad_artifacts or unknown_artifacts:
+        if unknown_artifacts:
+            print(f"UNKNOWN: {len(unknown_artifacts)} artifact(s) could not be read")
+        if bad_artifacts:
+            print(f"UNBOOTABLE: {len(bad_artifacts)} artifact(s) cannot run on this host")
+        return 1
+    art_versions = {a.version for a in artifacts if a.known}
+    if art_versions - versions and not args.allow_mixed:
+        print(
+            f"DRIFT: containers run {', '.join(sorted(versions))} but an artifact "
+            f"records {', '.join(sorted(art_versions - versions))} -- a guest that "
+            f"does not match its host boots and never signals READY"
+        )
+        return 1
+    tail = f", {len(artifacts)} artifact(s)" if artifacts else ""
+    print(
+        f"OK: {len(containers)} container(s){tail}, "
+        f"blastbox {', '.join(sorted(versions | art_versions))}"
+    )
     return 0
 
 

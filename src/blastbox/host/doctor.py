@@ -24,7 +24,7 @@ import re
 import shutil
 import subprocess
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
 
@@ -347,3 +347,113 @@ def drift(containers: list[Container]) -> dict[str, set[str]]:
         if c.known:
             by_project.setdefault(c.project, set()).add(c.version)
     return by_project
+
+@dataclass
+class Artifact:
+    """One warm rootfs and what it says about itself.
+
+    `Container` answers "what blastbox is this process running". This answers the
+    question `Container` structurally cannot: a rootfs is a FILE (or a directory
+    tree), not a process, and `docker export` drops the image config on the way
+    out -- so the labels `stamp.py` attaches never reach it. Three engines drifted
+    for two months inside exactly that blind spot.
+    """
+
+    path: str
+    version: str                      # or UNKNOWN
+    runtime: str = ""                 # firecracker | gvisor, from the stamp
+    arch: str = ""
+    cpu_vendor: str = ""
+    image: str = ""
+    exported_at: str = ""
+    detail: str = ""                  # why it is UNKNOWN, or what disagrees
+
+    @property
+    def known(self) -> bool:
+        return self.version != UNKNOWN
+
+
+def survey_rootfs(paths: Sequence[str]) -> list[Artifact]:
+    """Read the stamp on each warm artifact. Never raises on a bad path.
+
+    An artifact that cannot be read reports UNKNOWN with the reason, never a
+    version -- the same rule `_version_in` applies to a container that cannot be
+    exec'd: "I could not look" and "it is absent" must not collapse together.
+    """
+    from blastbox.host import rootfs_stamp as _rfs
+
+    out: list[Artifact] = []
+    for path in paths:
+        try:
+            stamp = _rfs.read(path)
+        except Exception as exc:  # noqa: BLE001 - a survey never dies on one row
+            out.append(Artifact(path=path, version=UNKNOWN, detail=str(exc).strip()))
+            continue
+        plat = _rfs.platform_of(stamp)
+        out.append(
+            Artifact(
+                path=path,
+                version=stamp.blastbox_version or UNKNOWN,
+                runtime=plat.runtime,
+                arch=plat.arch,
+                cpu_vendor=plat.cpu_vendor,
+                image=stamp.image,
+                exported_at=stamp.exported_at,
+                detail="" if stamp.blastbox_version else "stamp records no version",
+            )
+        )
+    return out
+
+
+def artifact_problems(artifacts: Sequence[Artifact]) -> list[tuple[Artifact, str]]:
+    """Each artifact that will not run on THIS host, with the reason.
+
+    Asked of the live machine rather than of the other artifacts: two rootfs
+    agreeing with each other and both disagreeing with the host is the fleet
+    state that reads as healthy and serves nothing.
+    """
+    from blastbox.host import platform_id as _plat
+
+    problems: list[tuple[Artifact, str]] = []
+    for art in artifacts:
+        if not art.known:
+            continue
+        recorded = _plat.HostPlatform(
+            arch=art.arch, cpu_vendor=art.cpu_vendor, runtime=art.runtime
+        )
+        live = _plat.host_platform(runtime=art.runtime)
+        fatal = _plat.refusals(_plat.compare(recorded, live))
+        if fatal:
+            problems.append((art, _plat.summarise(fatal)))
+    return problems
+
+
+def fleet_report(
+    containers: Sequence[Container], artifacts: Sequence[Artifact] = ()
+) -> dict:
+    """The whole fleet as one JSON-able object, for monitoring.
+
+    Everything a check needs without parsing the human output: per-container and
+    per-artifact versions, the drift buckets, and the artifacts this host cannot
+    boot. `ok` is false when anything is unknown, drifted, or unbootable --
+    deliberately strict, because the failure this exists for looked fine.
+    """
+    versions = sorted({c.version for c in containers if c.known} |
+                      {a.version for a in artifacts if a.known})
+    unknown = [c.name for c in containers if not c.known] + [
+        a.path for a in artifacts if not a.known
+    ]
+    mixed = {p: sorted(v) for p, v in drift(list(containers)).items() if len(v) > 1}
+    unbootable = [
+        {"path": a.path, "reason": why} for a, why in artifact_problems(artifacts)
+    ]
+    return {
+        "versions": versions,
+        "containers": [asdict(c) for c in containers],
+        "artifacts": [asdict(a) for a in artifacts],
+        "drift": mixed,
+        "unknown": unknown,
+        "unbootable": unbootable,
+        "ok": not (mixed or unknown or unbootable) and len(versions) <= 1,
+    }
+

@@ -30,9 +30,13 @@ import shutil
 import subprocess
 import tempfile
 from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from blastbox.host.platform_id import HostPlatform
 
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 
@@ -54,6 +58,10 @@ class RootfsStamp:
     image_id: str = ""
     revision: str = ""
     exported_at: str = ""
+    #: The machine this artifact was baked on. Empty for artifacts exported
+    #: before platform capture existed; see platform_id.compare for why that is
+    #: a warning and not a refusal.
+    platform: dict = field(default_factory=dict)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, sort_keys=True) + "\n"
@@ -66,8 +74,22 @@ class RootfsStamp:
             raise RootfsStampError(f"rootfs stamp is not JSON: {exc}") from exc
         if not isinstance(raw, dict):
             raise RootfsStampError("rootfs stamp is not a JSON object")
-        known = {f: raw.get(f, "") for f in cls.__dataclass_fields__}
-        return cls(**{k: ("" if v is None else str(v)) for k, v in known.items()})
+        plat = raw.get("platform")
+        # Named `fields`, not `text`: `text` is this method's own parameter, and
+        # shadowing it here hid the JSON body behind the parsed result.
+        fields: dict[str, str] = {
+            name: ("" if raw.get(name) is None else str(raw.get(name)))
+            for name in cls.__dataclass_fields__
+            if name != "platform"
+        }
+        return cls(**fields, platform=plat if isinstance(plat, dict) else {})
+
+
+def platform_of(stamp: "RootfsStamp") -> "HostPlatform":
+    """The stamp's platform block as a typed object (empty when unrecorded)."""
+    from blastbox.host.platform_id import HostPlatform
+
+    return HostPlatform.from_dict(stamp.platform)
 
 
 def now_iso() -> str:
@@ -212,6 +234,7 @@ def _default_runner(
 
 __all__ = [
     "STAMP_PATH",
+    "platform_of",
     "RootfsStamp",
     "RootfsStampError",
     "compare_to_host",

@@ -375,6 +375,21 @@ def rootfs_guest_problem(rootfs: str) -> str:
         host = version("blastbox")
     except PackageNotFoundError:  # pragma: no cover
         return ""
+    # The MACHINE, before the software. An arch or CPU-vendor mismatch cannot
+    # work whatever version is inside it, and saying "wrong blastbox" about an
+    # aarch64 rootfs on an x86_64 host sends the operator after the wrong thing.
+    from blastbox.host import platform_id as _plat
+
+    live = _plat.host_platform(
+        runtime="firecracker", runtime_version=_plat.firecracker_runtime_version()
+    )
+    findings = _plat.compare(_rfs.platform_of(stamp), live)
+    for warn in (f for f in findings if not f.fatal):
+        _log.warning("rootfs %s: %s: %s", rootfs, warn.field, warn.message)
+    fatal = _plat.refusals(findings)
+    if fatal:
+        return f"{rootfs}: {_plat.summarise(fatal)}"
+
     complaint = _rfs.compare_to_host(stamp, host)
     if complaint:
         return (

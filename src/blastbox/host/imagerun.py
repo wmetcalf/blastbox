@@ -38,6 +38,7 @@ from pathlib import Path, PurePosixPath
 
 from blastbox.host import images as _images
 from blastbox.host.images import ImageSpec, Plan, RootfsSpec
+from blastbox.host import platform_id as _platform_id
 from blastbox.host import rootfs_stamp as _rootfs_stamp
 from blastbox.host.stamp import git_revision as _stamp_git_revision
 from blastbox.host.stamp import StampError
@@ -1359,6 +1360,22 @@ def _source_revision(plan: "Plan") -> str:
     except Exception:  # noqa: BLE001 - diagnostic only
         return ""
 
+
+def _export_platform(spec: RootfsSpec) -> "_platform_id.HostPlatform":
+    """The machine this artifact is being baked on, tagged with its tier.
+
+    An ext4 is booted by Firecracker and a directory tree is restored by runsc,
+    so `kind` names the runtime the artifact is for -- which is what stops an FC
+    rootfs from being offered to a gVisor pool and failing as a restore error.
+    """
+    runtime = "firecracker" if spec.kind == "ext4" else "gvisor"
+    if runtime == "firecracker":
+        version = _platform_id.firecracker_runtime_version()
+    else:
+        version = _platform_id.runsc_runtime_version()
+    return _platform_id.host_platform(runtime=runtime, runtime_version=version)
+
+
 def stage_rootfs(
     plan: Plan,
     spec: RootfsSpec,
@@ -1460,6 +1477,7 @@ def stage_rootfs(
                 image_id=verified_id,
                 revision=_source_revision(plan),
                 exported_at=_rootfs_stamp.now_iso(),
+                platform=_export_platform(spec).to_dict(),
             ),
             priv=priv,
             run=run,
