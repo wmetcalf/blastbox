@@ -87,6 +87,40 @@ def _restore_left_process_running(exc: BaseException) -> bool:
     return False
 
 
+#: How long a published warm base may be restored before it is rebuilt. Six hours: a base
+#: checkpointed minutes earlier served 12/12, one five days old hung every job, and the
+#: earlier clock-jump investigation put the edge past 24h. A rebuild is one background base
+#: boot, so a margin this wide is cheap. ``BLASTBOX_SNAPSHOT_MAX_AGE_S`` overrides; 0 disables.
+DEFAULT_SNAPSHOT_MAX_AGE_S = 6 * 3600.0
+
+
+def idle_slot_usable(
+    slot_id: str, restored_at: "float | None", now: float, max_age_s: float
+) -> bool:
+    """The ``maintain_idle`` verdict for a restored warm slot: False once it is too old.
+
+    Rebuilding the BASE only helps new spawns. A slot restored long ago and never claimed goes
+    stale on its own -- measured on toolz2 2026-09-23: titanarum's two idle slots, restored five
+    days earlier and never used, hung the first job sent to them. Retiring such a slot through the
+    pool's maintain_idle path (CAS IDLE->ASSIGNED, then retire) replaces it from the current base
+    without racing a claimant.
+
+    A slot with no recorded restore time is USABLE: the absence of evidence never convicts,
+    the same rule the pool applies to its pre-guest signal.
+    """
+    if max_age_s <= 0 or restored_at is None:
+        return True
+    age = now - restored_at
+    if age < max_age_s:
+        return True
+    _log.info(
+        "snapshot.slot_aged_out slot_id=%s age_s=%.0f max_age_s=%.0f -- retiring an idle slot "
+        "before it serves a job (BLASTBOX_SNAPSHOT_MAX_AGE_S; 0 disables)",
+        slot_id, age, max_age_s,
+    )
+    return False
+
+
 class SnapshotManager:
     """Builds the warm snapshot once (first-boot), then serves restores to the pool.
 
@@ -106,11 +140,22 @@ class SnapshotManager:
         ready_timeout_s: float = 120.0,
         build_retry_backoff_s: float = 30.0,
         ack_capable: "_AckPublishable | None" = None,
+        max_age_s: float = 0.0,
     ) -> None:
         self._base_dir = Path(base_dir)
         self._backend = backend
         self._ready_timeout_s = ready_timeout_s
         self._build_retry_backoff_s = build_retry_backoff_s
+        # AGE, not failure, is what kills an idle warm tier. A base restored long after it was
+        # checkpointed stops serving: measured on toolz2 2026-09-23, redtusk's FC base from
+        # 09-18 hung every job while an identical base rebuilt minutes earlier served 12/12.
+        # Every other repair path here is REACTIVE -- it waits for failures, each costing the
+        # full worker timeout, and an idle tier produces none until the first real job pays.
+        # Age is predictable, so it is handled before anyone restores the stale base.
+        # 0 disables.
+        self._max_age_s = max(0.0, float(max_age_s))
+        # monotonic seconds at which the CURRENT artifact was published; None when unbuilt.
+        self._published_at: float | None = None
         self._artifact: object | None = None
         # Generation reference counting. Restored microVMs keep the memory file mapped as their
         # backing store for as long as they live, so a superseded generation cannot be unlinked
@@ -164,6 +209,16 @@ class SnapshotManager:
     @property
     def artifact(self) -> object | None:
         return self._artifact
+
+    def base_age_s(self) -> float | None:
+        """Seconds since the current base was published, or None when there is none."""
+        with self._build_lock:
+            born = self._published_at if self._artifact is not None else None
+        return None if born is None else max(0.0, time.monotonic() - born)
+
+    @property
+    def max_age_s(self) -> float:
+        return self._max_age_s
 
     def is_built(self) -> bool:
         """True once the snapshot artifact exists (atomic reference read)."""
@@ -250,6 +305,19 @@ class SnapshotManager:
         build is already running. Returns immediately so the caller (the pool's tick loop) never
         blocks on the boot+wait_ready. After a failure it waits ``build_retry_backoff_s`` before
         retrying, so a persistently-failing base boot doesn't churn the host every tick."""
+        age = self.base_age_s()
+        if age is not None and self._max_age_s > 0 and age >= self._max_age_s:
+            # Invalidate, then fall through to the normal start below. Taken OUTSIDE
+            # _build_lock because invalidate() acquires it and the lock is not reentrant.
+            # Slots already restored keep the old generation (refcounted, retired rather than
+            # unlinked); only NEW spawns wait for the rebuild, and they fall back to cold
+            # meanwhile, which costs a window of cold jobs instead of 300s hangs.
+            _log.info(
+                "snapshot.aged_out age_s=%.0f max_age_s=%.0f -- rebuilding the base before a job "
+                "restores it (BLASTBOX_SNAPSHOT_MAX_AGE_S; 0 disables)",
+                age, self._max_age_s,
+            )
+            self.invalidate()
         with self._build_lock:
             if self._artifact is not None:
                 return
@@ -462,6 +530,7 @@ class SnapshotManager:
                 rejected = epoch != self._build_epoch
                 if not rejected:
                     self._artifact = artifact
+                    self._published_at = time.monotonic()
                     if self._ack_capable is not None:
                         self._install_ack(epoch)
             if rejected:
@@ -527,6 +596,7 @@ class SnapshotManager:
                     # collection (no pins remain to release), and it would leak forever.
                     collect = self._artifact
             self._artifact = None
+            self._published_at = None
             self._build_error = None
             # Do not reuse the previous failure backoff: this is a deliberate rebuild request,
             # not a retry of a build that just failed.

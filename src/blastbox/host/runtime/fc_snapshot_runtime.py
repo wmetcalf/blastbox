@@ -26,7 +26,11 @@ import shutil
 import threading
 import time
 import uuid
-from blastbox.host.runtime.env_knobs import positive_float_env
+from blastbox.host.runtime.env_knobs import max_age_env, positive_float_env
+from blastbox.host.runtime.fc_snapshot import (
+    DEFAULT_SNAPSHOT_MAX_AGE_S,
+    idle_slot_usable,
+)
 from pathlib import Path
 from typing import Callable
 
@@ -303,6 +307,18 @@ class SnapshotSlotRuntime:
         _log.warning("snapshot.base_invalidated had_artifact=%s -- next spawn rebuilds the base",
                      bool(discarded))
 
+    def maintain_idle(self, slot: Slot, *, budget_s: "float | None" = None) -> bool:
+        """Retire an idle slot that has sat restored longer than the snapshot max-age.
+
+        Called by the pool's ``_maintain_idle`` with the slot already reserved (IDLE->ASSIGNED),
+        so returning False retires it without racing a claimant. Cheap: no I/O.
+        """
+        with self._lock:
+            born = self._restored_at.get(slot.slot_id)
+        return idle_slot_usable(
+            slot.slot_id, born, self._clock(), float(getattr(self._manager, "max_age_s", 0.0))
+        )
+
     def reap(self, slot: Slot) -> None:
         """Kill the restored microVM (if alive) and remove its per-slot workdir.
 
@@ -557,5 +573,7 @@ def select_snapshot_runtime(
     manager = SnapshotManager(
         base_dir, backend, ack_capable=ack_capable,
         ready_timeout_s=positive_float_env(os.environ, "BLASTBOX_SNAPSHOT_READY_S", 120.0),
+        # Rebuild the base before it ages out; see SnapshotManager. 0 disables.
+        max_age_s=max_age_env(os.environ, "BLASTBOX_SNAPSHOT_MAX_AGE_S", DEFAULT_SNAPSHOT_MAX_AGE_S),
     )
     return SnapshotSlotRuntime(cfg, manager, settle_s=settle_s, ack_capable=ack_capable)
