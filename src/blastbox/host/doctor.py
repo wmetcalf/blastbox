@@ -366,6 +366,10 @@ class Artifact:
     cpu_vendor: str = ""
     image: str = ""
     exported_at: str = ""
+    #: The compose project this rootfs serves, when given as `--rootfs PROJECT=PATH`. Paired,
+    #: it is checked against THAT project's containers; unpaired, only against the host's
+    #: versions as a whole -- where a stale rootfs passes if any product runs its version.
+    project: str = ""
     detail: str = ""                  # why it is UNKNOWN, or what disagrees
 
     @property
@@ -383,11 +387,13 @@ def survey_rootfs(paths: Sequence[str]) -> list[Artifact]:
     from blastbox.host import rootfs_stamp as _rfs
 
     out: list[Artifact] = []
-    for path in paths:
+    for spec in paths:
+        project, path = _pairing(spec)
         try:
             stamp = _rfs.read(path)
         except Exception as exc:  # noqa: BLE001 - a survey never dies on one row
-            out.append(Artifact(path=path, version=UNKNOWN, detail=str(exc).strip()))
+            out.append(Artifact(path=path, version=UNKNOWN, detail=str(exc).strip(),
+                                project=project))
             continue
         plat = _rfs.platform_of(stamp)
         # Every field below comes from an artifact this host did not create: stripped of
@@ -404,9 +410,38 @@ def survey_rootfs(paths: Sequence[str]) -> list[Artifact]:
                 image=_sanitise(stamp.image),
                 exported_at=_sanitise(stamp.exported_at),
                 detail="" if version else "stamp records no version",
+                project=project,
             )
         )
     return out
+
+
+def _pairing(spec: str) -> tuple[str, str]:
+    """`PROJECT=PATH` -> (project, path); a bare path is unpaired.
+
+    Only a leading `name=` with no path separator in `name` counts, so a path that merely
+    contains `=` is never split.
+    """
+    head, sep, tail = spec.partition("=")
+    if sep and head and "/" not in head and tail:
+        return head, tail
+    return "", spec
+
+
+def _release(version: str) -> object:
+    """A version as a comparable RELEASE: `+local` dropped, PEP 440 equality.
+
+    The tier's own guest check (rootfs_stamp.compare_to_host) compares releases, so doctor
+    must too -- or the two contradict each other about the same artifact (`0.1.42+gabc`
+    boots, and doctor calls it a guest that never signals READY).
+    """
+    base = (version or "").split("+", 1)[0].strip()
+    try:
+        from packaging.version import InvalidVersion, Version  # noqa: PLC0415
+
+        return Version(base)
+    except (ImportError, InvalidVersion):
+        return base
 
 
 def artifact_problems(artifacts: Sequence[Artifact]) -> list[tuple[Artifact, str]]:
@@ -438,15 +473,21 @@ def verdict(
     *,
     expect: str | None = None,
     allow_mixed: bool = False,
+    docker_error: str = "",
 ) -> list[str]:
     """Every reason the fleet is NOT ok under the given policy; empty means ok.
 
     The ONE place `--expect` and `--allow-mixed` are applied. The command used to decide
     through a chain of early returns, each seeing part of the policy: JSON mode ignored both
     flags, `--allow-mixed` returned before an unreadable artifact was judged, and a
-    rootfs-only fleet was never checked for versions at all.
+    rootfs-only fleet was never checked for versions at all. Versions are compared as
+    releases (see _release), the same way the tier's own guest check does.
     """
     problems: list[str] = []
+    if docker_error:
+        # "Could not look" is never "nothing is wrong": artifacts alone cannot vouch for
+        # containers nobody inspected.
+        problems.append(f"containers could not be inspected: {docker_error}")
     unknown_c = [c.name for c in containers if not c.known]
     unknown_a = [a.path for a in artifacts if not a.known]
     if unknown_c:
@@ -458,7 +499,7 @@ def verdict(
     for art, why in artifact_problems(artifacts):
         problems.append(f"unbootable here: {art.path}: {why}")
     for project, versions in sorted(drift(list(containers)).items()):
-        if len(versions) > 1:
+        if len({_release(v) for v in versions}) > 1:
             # Within ONE compose project there is no legitimate mix; --allow-mixed is for
             # separate products on one host.
             problems.append(f"compose project {project} runs {', '.join(sorted(versions))}")
@@ -466,25 +507,38 @@ def verdict(
         if expect:
             problems.append(f"expected {expect}, but found nothing to verify")
         return problems
-    c_versions = {c.version for c in containers if c.known}
-    a_versions = {a.version for a in artifacts if a.known}
+    known_c = [c for c in containers if c.known]
+    known_a = [a for a in artifacts if a.known]
     if expect:
-        wrong = sorted({c.name for c in containers if c.known and c.version != expect}
-                       | {a.path for a in artifacts if a.known and a.version != expect})
+        want = _release(expect)
+        wrong = sorted({c.name for c in known_c if _release(c.version) != want}
+                       | {a.path for a in known_a if _release(a.version) != want})
         if wrong:
             problems.append(f"expected {expect}, but: " + ", ".join(wrong))
-    if not allow_mixed:
-        if len(c_versions) > 1:
-            problems.append(f"containers run {len(c_versions)} versions: "
-                            + ", ".join(sorted(c_versions)))
-        if c_versions and a_versions - c_versions:
+    host_releases = {_release(c.version) for c in known_c}
+    # The GUEST CHECK applies whatever --allow-mixed says: that flag is exactly what a
+    # multi-product host passes, so it cannot also be what switches this off.
+    for art in known_a:
+        if art.project:
+            mine = {_release(c.version) for c in known_c if c.project == art.project}
+            if mine and _release(art.version) not in mine:
+                problems.append(
+                    f"{art.path} records {art.version} but project {art.project} runs "
+                    f"{', '.join(sorted(str(v) for v in mine))} -- a guest that does not "
+                    "match its host boots and never signals READY")
+        elif host_releases and _release(art.version) not in host_releases:
             problems.append(
-                f"containers run {', '.join(sorted(c_versions))} but an artifact records "
-                f"{', '.join(sorted(a_versions - c_versions))} -- a guest that does not "
-                "match its host boots and never signals READY")
-        if not c_versions and len(a_versions) > 1:
-            problems.append(f"artifacts record {len(a_versions)} versions: "
-                            + ", ".join(sorted(a_versions)))
+                f"{art.path} records {art.version} but no container here runs it "
+                f"({', '.join(sorted(str(v) for v in host_releases))}) -- a guest that does "
+                "not match its host boots and never signals READY")
+    if not allow_mixed:
+        if len(host_releases) > 1:
+            problems.append(f"containers run {len(host_releases)} versions: "
+                            + ", ".join(sorted(str(v) for v in host_releases)))
+        a_releases = {_release(a.version) for a in known_a}
+        if not host_releases and len(a_releases) > 1:
+            problems.append(f"artifacts record {len(a_releases)} versions: "
+                            + ", ".join(sorted(str(v) for v in a_releases)))
     return problems
 
 

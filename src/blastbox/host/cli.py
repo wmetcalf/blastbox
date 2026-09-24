@@ -2019,11 +2019,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--rootfs",
         action="append",
         default=[],
-        metavar="PATH",
+        metavar="[PROJECT=]PATH",
         help="also read the stamp on a warm rootfs artifact (ext4 file or "
-        "exported directory). Repeatable. A rootfs is not a process, so it is "
-        "invisible to the container survey -- which is where three engines "
-        "drifted for two months",
+        "exported directory). Repeatable. PROJECT=PATH checks it against that "
+        "compose project's containers rather than the host as a whole. A rootfs "
+        "is not a process, so it is invisible to the container survey -- which "
+        "is where three engines drifted for two months",
     )
     pdoc.add_argument(
         "--json",
@@ -2563,16 +2564,17 @@ def _doctor_cmd(args: argparse.Namespace) -> int:
     )
 
     artifacts = survey_rootfs(getattr(args, "rootfs", []) or [])
+    docker_error = ""
     try:
         containers = survey()
     except DockerUnavailable as exc:
-        if artifacts:
-            # Docker being unreachable does not make the ARTIFACTS unreadable:
-            # they are files. Report what could be read rather than nothing.
-            containers = []
-        else:
-            print(f"cannot inspect anything: {exc}")
-            return 2
+        # Docker being unreachable does not make the ARTIFACTS unreadable: they are files,
+        # so report what could be read -- but as a problem, never as a healthy fleet.
+        containers, docker_error = [], str(exc) or "docker unavailable"
+    as_json = bool(getattr(args, "json", False))
+    if docker_error and not artifacts and not as_json:
+        print(f"cannot inspect anything: {docker_error}")
+        return 2
 
     # ONE verdict, whatever the output format: the policy flags define success, so the JSON
     # report and the text report must never disagree about the exit code.
@@ -2581,15 +2583,18 @@ def _doctor_cmd(args: argparse.Namespace) -> int:
         artifacts,
         expect=args.expect,
         allow_mixed=bool(getattr(args, "allow_mixed", False)),
+        docker_error=docker_error,
     )
 
-    if getattr(args, "json", False):
+    if as_json:
         report = fleet_report(containers, artifacts)
         report["policy"] = {"expect": args.expect,
                             "allow_mixed": bool(getattr(args, "allow_mixed", False))}
         report["problems"] = problems
         report["ok"] = not problems
         print(json.dumps(report, indent=2, sort_keys=True))
+        if docker_error and not artifacts:
+            return 2       # nothing could be inspected at all, as in text mode
         return 0 if not problems else 1
 
     if not containers and not artifacts:
@@ -2625,6 +2630,11 @@ def _doctor_cmd(args: argparse.Namespace) -> int:
     versions = sorted({c.version for c in containers if c.known}
                       | {a.version for a in artifacts if a.known})
     tail = f", {len(artifacts)} artifact(s)" if artifacts else ""
+    if len({c.version for c in containers if c.known}) > 1:
+        # Never "OK" beside several versions: allowed is not the same as uniform.
+        print(f"MIXED (allowed by --allow-mixed): {len(containers)} container(s){tail}, "
+              f"blastbox {', '.join(versions)}")
+        return 0
     print(f"OK: {len(containers)} container(s){tail}, blastbox {', '.join(versions)}")
     return 0
 

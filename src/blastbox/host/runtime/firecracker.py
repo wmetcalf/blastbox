@@ -343,6 +343,21 @@ def guest_kernel_version(vmlinux_path: str) -> tuple[int, int] | None:
 
 
 
+def _guest_refusal(cfg: object) -> str:
+    """The rootfs guest problem behind a failed availability check, or "".
+
+    Re-read only on the failure path, so a tier refused for a stale guest says so in the
+    exception that reaches the crash-loop output -- not "check the binary and /dev/kvm".
+    """
+    rootfs = getattr(cfg, "fc_rootfs", "") or ""
+    if not rootfs or not Path(rootfs).is_file():
+        return ""
+    try:
+        return rootfs_guest_problem(rootfs)
+    except Exception:  # noqa: BLE001 - diagnostic only
+        return ""
+
+
 def rootfs_guest_problem(rootfs: str) -> str:
     """Why this host must not boot ``rootfs``, or "" when it may.
 
@@ -1529,7 +1544,9 @@ def select_fc_runtime(
 
     if not firecracker_available(cfg):
         if require_available:
+            guest = _guest_refusal(cfg)
             raise FCUnavailable(
+                f"Firecracker runtime refused: {guest}" if guest else
                 "Firecracker runtime required (BLASTBOX_WORKER_RUNTIME=firecracker) "
                 "but prerequisites missing: check firecracker binary, /dev/kvm, "
                 "BLASTBOX_FC_KERNEL, and BLASTBOX_FC_ROOTFS."

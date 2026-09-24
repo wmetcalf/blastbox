@@ -18,10 +18,10 @@ A warm artifact is a frozen machine state, so it is only valid for a
 * An ext4 Firecracker rootfs is not a runsc directory tree, and an aarch64
   rootfs will not boot on x86_64 at all.
 
-None of that is recorded today, so every one of those mismatches is discovered
-by running into it. This module captures the machine at export and compares it
-at restore, which turns `cpu_features.py` from a post-mortem parser into the
-formatter for a failure predicted before a slot is ever spawned.
+This module is the comparison. What a given ARTIFACT is bound to is the caller's
+call: a rootfs holds no CPU state (its snapshot is taken on the deploying host),
+so `rootfs_stamp.platform_of` passes only architecture and runtime, and the CPU
+fields are compared only for artifacts that carry checkpoint state.
 
 Severity is per field, because the fields differ in kind. An architecture or
 vendor mismatch cannot work and is refused. A runtime version difference usually
@@ -139,8 +139,8 @@ def compare(recorded: HostPlatform, live: HostPlatform) -> list[Finding]:
                 "platform",
                 WARN,
                 "this artifact records no platform, so it cannot be checked against "
-                "this host; rebuild it with `blastbox build-images` to pin the "
-                "architecture, CPU vendor and runtime it is valid on",
+                "this host; rebuild it with `blastbox build-images` to record the "
+                "architecture and runtime it is valid on",
             )
         ]
 

@@ -85,8 +85,12 @@ setsid nohup blastbox build-images … > /tmp/build.log 2>&1 < /dev/null &
 ## 3. What you get, and what checks it
 
 Every export writes `/opt/blastbox/rootfs-stamp.json` **into** the rootfs — a
-file, because labels do not survive `docker export`. It records the guest's
-blastbox version, the image and its id, the source revision, and the export time.
+file, because labels do not survive `docker export`. It records what the IMAGE
+says about itself — its blastbox version, revision and architecture, read from
+the verified image rather than from the exporting CLI — plus the image id, the
+tier it is for (`firecracker` for ext4, `gvisor` for a directory) and the export
+time. It deliberately records nothing about the exporting machine's CPU: a rootfs
+holds no CPU state; the snapshot is taken later, on the deploying host.
 
 Read it back without mounting anything:
 
@@ -95,9 +99,12 @@ from blastbox.host import rootfs_stamp
 rootfs_stamp.read("/var/lib/myengine-fc/rootfs.ext4")   # debugfs; no loop device
 ```
 
-`firecracker_available()` reads it at pool build and **refuses a rootfs whose
-guest disagrees with this host**, naming the remedy. The severity split is
-deliberate:
+Both warm tiers read it at tier selection — `firecracker_available()` for the
+cold and snapshot Firecracker tiers, `select_gvisor_snapshot_runtime()` for the
+gVisor tier — and **refuse a rootfs whose guest disagrees with this host** (a
+different blastbox release, another architecture, or the other tier's format),
+naming the remedy. Versions are compared as releases: `0.2`, `0.2.0` and
+`0.2.0+gabc` agree. The severity split is deliberate:
 
 | rootfs state | what happens | why |
 | --- | --- | --- |
@@ -106,6 +113,33 @@ deliberate:
 | unstamped / unreadable | warns, boots | every artifact exported before stamping is unstamped; refusing them would take a whole fleet offline on upgrade |
 
 "I could not look" is never reported as "it is wrong".
+
+The stamp comes out of an image, so it is treated as untrusted: it is read only
+from a regular file (never through a symlink, FIFO or device node), capped at
+64 KiB, and debugfs runs under a deadline.
+
+**Upgrade order.** The check runs when the tier is SELECTED, at dispatcher start;
+`build-images` publishes the new rootfs in place. So publish, then restart the
+dispatcher — a dispatcher left running across a publish boots the new guest
+unchecked on its next spawn or base rebuild. (Upgrading the dispatcher first
+instead makes every stamped tier refuse until the rootfs is rebuilt.)
+
+**Survey a host.** `blastbox doctor --rootfs PATH` adds each artifact to the
+container survey; `--json` emits the whole fleet for monitoring, with the same
+exit code as the text report. On a host running several products, pair each
+rootfs with its compose project so it is checked against *that* project's
+containers:
+
+```sh
+blastbox doctor --allow-mixed \
+  --rootfs clippyshot=/var/lib/clippyshot-fc/rootfs.ext4 \
+  --rootfs redtusk=/var/lib/redtusk-gvisor/rootfs
+```
+
+`--allow-mixed` allows separate products on different releases; it never
+excuses a rootfs that disagrees with its host, an unreadable artifact, or docker
+being unreachable. An unpaired rootfs is only checked against the host's
+versions as a whole.
 
 ## 4. Things that will bite you
 

@@ -1385,11 +1385,15 @@ def _image_provenance(plan: "Plan", source: str, run: Runner) -> tuple[str, str,
 
     version = revision = ""
     try:
-        img = _read_stamp(source, lambda argv: run(argv))  # type: ignore[arg-type]
+        # capture_output: this module's runner returns stdout only when asked. Without it
+        # stamp.read() saw None, and every production export silently fell back to the
+        # exporter's version -- the very substitution this function exists to prevent.
+        img = _read_stamp(source, lambda argv: run(argv, capture_output=True))  # type: ignore[arg-type]
         version = "" if img.blastbox in ("", _UNKNOWN) else img.blastbox
         revision = "" if img.revision in ("", _UNKNOWN) else img.revision
-    except Exception:  # noqa: BLE001 - diagnostic; verification already judged the image
-        pass
+    except Exception as exc:  # noqa: BLE001 - diagnostic; verification already judged the image
+        _log(f"   warning: could not read {source}'s own stamp ({exc}); the rootfs stamp "
+             "falls back to this exporter's version and revision")
     arch = ""
     proc = run(
         ["docker", "inspect", "--type", "image", source, "--format", "{{.Architecture}}"],

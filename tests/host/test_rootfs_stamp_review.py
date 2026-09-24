@@ -94,34 +94,155 @@ def test_an_oversized_ext4_stamp_is_refused(tmp_path: Path) -> None:
         rfs.read_from_ext4(img, run=run)
 
 
-def test_debugfs_is_bounded_in_time_and_output(tmp_path: Path, monkeypatch) -> None:
-    """A malformed filesystem must not hang doctor or firecracker_available()."""
+class _FakeDebugfs:
+    """A debugfs whose stdout streams forever (or blocks), recording what was asked of it."""
+
+    instances: list = []
+
+    def __init__(self, argv, **kw):
+        self.argv, self.kw = list(argv), kw
+        self.killed = False
+        self.requested = 0
+        self.block = _FakeDebugfs.block_next
+        self.stdout = self
+        self.stderr = None
+        self.returncode = None
+        _FakeDebugfs.instances.append(self)
+
+    block_next = False
+
+    def read(self, n=-1):
+        if self.block:
+            import time as _t
+            deadline = _t.monotonic() + 10
+            while not self.killed and _t.monotonic() < deadline:
+                _t.sleep(0.01)
+            return b""
+        assert n > 0, "an unbounded read() is exactly the defect"
+        self.requested += n
+        return b"x" * n
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self, timeout=None):
+        self.returncode = -9
+        return -9
+
+    def poll(self):
+        return self.returncode
+
+
+def _debugfs_env(tmp_path, monkeypatch, *, block=False):
     img = tmp_path / "rootfs.ext4"
     img.write_bytes(b"\0")
     monkeypatch.setattr(rfs.shutil, "which", lambda _n: "/usr/sbin/debugfs")
-    seen: dict = {}
+    _FakeDebugfs.instances = []
+    _FakeDebugfs.block_next = block
+    monkeypatch.setattr(rfs.subprocess, "Popen", _FakeDebugfs)
+    return img
 
-    class _Proc:
-        def __init__(self, argv, **kw):
-            seen.update(kw)
-            self.stdout = open(os.devnull, "rb")  # noqa: SIM115
-            self.returncode = 0
 
-        def communicate(self, timeout=None):
-            seen["timeout"] = timeout
-            raise subprocess.TimeoutExpired("debugfs", timeout)
+def test_debugfs_output_is_read_bounded_not_buffered_whole(tmp_path, monkeypatch) -> None:
+    """communicate() buffered ALL of it before slicing: a sparse 1 GiB stamp drove the
+    reader to 2 GB RSS (the dispatcher, in-process)."""
+    img = _debugfs_env(tmp_path, monkeypatch)
+    with pytest.raises(rfs.RootfsStampError, match="larger than"):
+        rfs.read_from_ext4(img)
+    (proc,) = _FakeDebugfs.instances
+    assert proc.requested <= rfs.MAX_STAMP_BYTES + 1
+    assert proc.killed
 
-        def kill(self):
-            seen["killed"] = True
 
-        def wait(self, timeout=None):
-            return 0
-
-    monkeypatch.setattr(rfs.subprocess, "Popen", _Proc)
+def test_debugfs_is_bounded_in_time(tmp_path, monkeypatch) -> None:
+    img = _debugfs_env(tmp_path, monkeypatch, block=True)
+    monkeypatch.setattr(rfs, "DEBUGFS_TIMEOUT_S", 0.2)
     with pytest.raises(rfs.RootfsStampError, match="timed out"):
         rfs.read_from_ext4(img)
-    assert seen["timeout"] and seen["timeout"] <= 60
-    assert seen.get("killed")
+    assert _FakeDebugfs.instances[0].killed
+
+
+def test_debugfs_cannot_take_the_image_path_as_an_option(tmp_path, monkeypatch) -> None:
+    img = _debugfs_env(tmp_path, monkeypatch)
+    with pytest.raises(rfs.RootfsStampError):
+        rfs.read_from_ext4(img)
+    argv = _FakeDebugfs.instances[0].argv
+    assert argv[-2:] == ["--", str(img)]
+
+
+def _within(seconds, fn):
+    """Run fn; fail (instead of hanging the suite) if it blocks."""
+    import threading
+
+    box: dict = {}
+
+    def go():
+        try:
+            box["ret"] = fn()
+        except BaseException as exc:  # noqa: BLE001
+            box["exc"] = exc
+
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    t.join(seconds)
+    assert not t.is_alive(), "blocked -- a FIFO or device node at the stamp path was opened"
+    if "exc" in box:
+        raise box["exc"]
+    return box.get("ret")
+
+
+def test_a_fifo_at_the_stamp_path_is_refused_on_read(tmp_path: Path) -> None:
+    (tmp_path / "opt" / "blastbox").mkdir(parents=True)
+    os.mkfifo(tmp_path / rfs.STAMP_PATH)
+    with pytest.raises(rfs.RootfsStampError, match="not a regular file"):
+        _within(5, lambda: rfs.read_from_dir(tmp_path))
+
+
+def test_a_fifo_at_the_stamp_path_is_refused_on_write(tmp_path: Path) -> None:
+    """As root the write took the plain-open branch: a FIFO hung the build, and a block
+    device node in the image would have had the stamp written into a HOST disk."""
+    (tmp_path / "opt" / "blastbox").mkdir(parents=True)
+    os.mkfifo(tmp_path / rfs.STAMP_PATH)
+    with pytest.raises(rfs.RootfsStampError, match="not a regular file"):
+        _within(5, lambda: rfs.write_into_tree(tmp_path, _stamp()))
+
+
+@pytest.mark.parametrize("privileged", [False, True])
+def test_a_directory_at_the_stamp_path_is_refused(tmp_path: Path, privileged) -> None:
+    """`install -D` into an existing directory writes INSIDE it and reports success -- a
+    rootfs that claims to be stamped and boots unchecked."""
+    (tmp_path / rfs.STAMP_PATH).mkdir(parents=True)
+    ran: list = []
+
+    def run(argv, **kw):  # type: ignore[no-untyped-def]
+        ran.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    kw = {"priv": ["sudo", "-n"], "run": run} if privileged else {}
+    with pytest.raises(rfs.RootfsStampError, match="not a regular file"):
+        rfs.write_into_tree(tmp_path, _stamp(), **kw)
+    assert ran == []
+
+
+def test_the_privileged_install_never_treats_the_target_as_a_directory(tmp_path) -> None:
+    ran: list = []
+
+    def run(argv, **kw):  # type: ignore[no-untyped-def]
+        ran.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    rfs.write_into_tree(tmp_path, _stamp(), priv=["sudo", "-n"], run=run)
+    assert "-T" in ran[0]
+
+
+def test_stamp_fields_are_sanitised_at_parse() -> None:
+    """guest_problem logs and raises with stamp fields; the dispatcher's log is not doctor."""
+    raw = json.dumps({"blastbox_version": "0.0.1\nINFO forged", "image": "x\x1b]0;t\x07",
+                      "platform": {"arch": "x86_64\r", "runtime": "gv\nERROR forged"}})
+    st = rfs.RootfsStamp.from_json(raw)
+    flat = [st.blastbox_version, st.image, *[str(v) for v in st.platform.values()]]
+    for value in flat:
+        assert not any(ord(ch) < 32 or ord(ch) == 127 for ch in value), repr(value)
 
 
 # --- a rootfs binds arch + runtime, not the exporter's CPU ---------------------------------
@@ -301,3 +422,110 @@ def test_allow_mixed_does_not_excuse_an_unbootable_artifact(monkeypatch, capsys,
     alien = _art("/r/alien", "0.1.42", arch="s390x")
     rc, _ = _doctor(monkeypatch, capsys, ctrs, [alien], allow_mixed=True, json=as_json)
     assert rc == 1
+
+
+# --- round 1 of the panel on #186 ----------------------------------------------------------
+
+
+def test_provenance_reads_the_label_through_the_production_runner_contract(tmp_path) -> None:
+    """The real runner returns stdout only when asked to capture it; the wrapper dropped
+    capture_output, stamp.read() crashed on None, and a bare except fell back to the
+    EXPORTER's version on every production export -- the exact bug b5872c9 claimed fixed."""
+    import blastbox.host.imagerun as mod
+
+    from blastbox.host import stamp as st
+
+    labels = {st.LABEL_BLASTBOX: "9.9.9", st.LABEL_REVISION: "c0ffee" * 6 + "abcd"}
+
+    def run(argv, *, cwd=None, capture_output=False, stdout=None):  # the real contract
+        out = None
+        if capture_output:
+            if "{{json .Config.Labels}}" in argv:
+                out = json.dumps(labels)
+            elif "{{.Architecture}}" in argv:
+                out = "amd64\n"
+        return subprocess.CompletedProcess(list(argv), 0, out, "")
+
+    version, revision, arch = mod._image_provenance(_plan(tmp_path), "sha256:x", run)
+    assert (version, revision, arch) == ("9.9.9", "c0ffee" * 6 + "abcd", "x86_64")
+
+
+@pytest.mark.parametrize(("guest", "host"), [("0.2.0-rc1", "0.2.0rc1"), ("0.2", "0.2.0"),
+                                             ("0.1.42+gdeadbee", "0.1.42")])
+def test_the_guest_check_compares_releases_not_spellings(guest, host) -> None:
+    assert rfs.compare_to_host(_stamp(blastbox_version=guest), host) == ""
+
+
+@pytest.mark.parametrize(("art", "ctr"), [("0.1.42+gdeadbee", "0.1.42"), ("0.2", "0.2.0")])
+def test_doctor_agrees_with_the_tier_about_equivalent_versions(art, ctr) -> None:
+    assert doctor.verdict([_ctr(version=ctr)], [_art(version=art)]) == []
+    assert doctor.verdict([_ctr(version=ctr)], [_art(version=art)], expect=art) == []
+
+
+def test_allow_mixed_does_not_switch_off_the_guest_check() -> None:
+    """--allow-mixed is for separate PRODUCTS; it is exactly what a multi-product host
+    passes, so it cannot also be what disables the rootfs check."""
+    ctrs = [_ctr("a", "p1", "0.1.42"), _ctr("b", "p2", "0.1.41")]
+    stale = _art("/stale", "0.1.30")
+    assert doctor.verdict(ctrs, [stale], allow_mixed=True)
+
+
+def test_a_paired_artifact_is_checked_against_its_own_project(tmp_path) -> None:
+    """Unpaired, a stale rootfs passes if ANY product on the host runs its version."""
+    rfs.write_into_tree(tmp_path / "a", _stamp(
+        blastbox_version="0.1.41",
+        platform={"arch": plat.host_platform().arch, "runtime": "firecracker"}))
+    (art,) = doctor.survey_rootfs([f"clippy={tmp_path / 'a'}"])
+    assert art.project == "clippy" and art.path == str(tmp_path / "a")
+    ctrs = [_ctr("a", "clippy", "0.1.42"), _ctr("b", "other", "0.1.41")]
+    assert any("clippy" in p for p in doctor.verdict(ctrs, [art], allow_mixed=True))
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_docker_down_is_not_healthy(monkeypatch, capsys, as_json) -> None:
+    from blastbox.host import cli
+
+    def down(*a, **k):
+        raise doctor.DockerUnavailable("docker ps failed")
+
+    monkeypatch.setattr(doctor, "survey", down)
+    monkeypatch.setattr(doctor, "survey_rootfs", lambda paths: [_art()])
+    ns = argparse.Namespace(rootfs=["/r/a"], expect=None, allow_mixed=False, json=as_json)
+    assert cli._doctor_cmd(ns) != 0
+    out = capsys.readouterr().out
+    if as_json:
+        assert json.loads(out)["ok"] is False
+
+
+def test_json_mode_speaks_json_even_when_docker_is_down(monkeypatch, capsys) -> None:
+    from blastbox.host import cli
+
+    def down(*a, **k):
+        raise doctor.DockerUnavailable("docker ps failed")
+
+    monkeypatch.setattr(doctor, "survey", down)
+    monkeypatch.setattr(doctor, "survey_rootfs", lambda paths: [])
+    ns = argparse.Namespace(rootfs=[], expect=None, allow_mixed=False, json=True)
+    assert cli._doctor_cmd(ns) == 2
+    assert json.loads(capsys.readouterr().out)["ok"] is False
+
+
+def test_allow_mixed_never_prints_ok_beside_several_versions(monkeypatch, capsys) -> None:
+    ctrs = [_ctr("a", "p1", "0.1.42"), _ctr("b", "p2", "0.1.41")]
+    rc, out = _doctor(monkeypatch, capsys, ctrs, [], allow_mixed=True)
+    assert rc == 0
+    assert "OK:" not in out and "MIXED" in out
+
+
+@pytest.mark.parametrize("which", ["cold", "snapshot"])
+def test_the_fc_tiers_name_the_guest_problem_when_they_refuse(monkeypatch, which) -> None:
+    from blastbox.host.runtime import fc_snapshot_runtime as sr
+    from blastbox.host.runtime import firecracker as fc
+
+    monkeypatch.setattr(fc, "firecracker_available", lambda cfg=None: False)
+    monkeypatch.setattr(sr, "firecracker_available", lambda cfg=None: False, raising=False)
+    monkeypatch.setattr(fc, "_guest_refusal", lambda cfg: "guest is blastbox 0.0.1")
+    cfg = type("C", (), {"fc_rootfs": "/r.ext4"})()
+    select = fc.select_fc_runtime if which == "cold" else sr.select_snapshot_runtime
+    with pytest.raises(fc.FCUnavailable, match="guest is blastbox 0.0.1"):
+        select(cfg=cfg, require_available=True)

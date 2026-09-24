@@ -27,9 +27,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
+import stat as _stat
 import subprocess
 import tempfile
+import threading
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -86,12 +89,26 @@ class RootfsStamp:
         plat = raw.get("platform")
         # Named `fields`, not `text`: `text` is this method's own parameter, and
         # shadowing it here hid the JSON body behind the parsed result.
+        # SANITISED HERE, once, for every consumer: the stamp is written by an image, and
+        # its fields reach the dispatcher's log and exception messages (guest_problem), not
+        # only doctor's output -- a newline or escape sequence there forges log lines.
         fields: dict[str, str] = {
-            name: ("" if raw.get(name) is None else str(raw.get(name)))
+            name: _clean(raw.get(name))
             for name in cls.__dataclass_fields__
             if name != "platform"
         }
-        return cls(**fields, platform=plat if isinstance(plat, dict) else {})
+        clean_plat = (
+            {_clean(k): _clean(v) for k, v in plat.items()} if isinstance(plat, dict) else {}
+        )
+        return cls(**fields, platform=clean_plat)
+
+
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _clean(value: object) -> str:
+    """A stamp field as display-safe text: no control characters, bounded length."""
+    return "" if value is None else _CONTROL.sub("", str(value))[:200]
 
 
 def platform_of(stamp: "RootfsStamp") -> "HostPlatform":
@@ -139,9 +156,18 @@ def write_into_tree(
     # /etc/sudoers, an `opt` pointing at /etc). The extracted tree is static while we write,
     # so checking every component first is sufficient; nothing below then follows a link.
     _refuse_links(tree, STAMP_PATH)
+    # ...and nothing but a regular file may already sit AT the path. As root the plain branch
+    # below would open whatever is there: a FIFO hangs the build, and a block device node the
+    # image planted would have the stamp written into a HOST disk. A directory makes
+    # `install -D` write INSIDE it and report success -- a rootfs that claims to be stamped
+    # and then boots unchecked.
+    _require_regular_or_absent(target)
     if not priv:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(body)
+        target.unlink(missing_ok=True)
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(body)
         return target
     if run is None:  # pragma: no cover - defensive
         raise RootfsStampError("a privileged write needs a runner")
@@ -158,6 +184,7 @@ def write_into_tree(
                 *priv,
                 "install",
                 "-D",
+                "-T",   # the target is a FILE: never "copy into" a directory
                 "-m",
                 "0644",
                 "-o",
@@ -192,6 +219,20 @@ def _refuse_links(tree: Path, rel: str) -> None:
             raise RootfsStampError(f"cannot inspect {cur}: {exc}") from exc
 
 
+def _require_regular_or_absent(path: Path) -> None:
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise RootfsStampError(f"cannot inspect {path}: {exc}") from exc
+    if not _stat.S_ISREG(st.st_mode):
+        raise RootfsStampError(
+            f"{path} exists and is not a regular file (mode {st.st_mode:o}); refusing it -- "
+            "the image put something else at the stamp path"
+        )
+
+
 def read_from_dir(tree: Path | str) -> RootfsStamp:
     """Read the stamp from an exported directory rootfs (the gVisor kind).
 
@@ -200,13 +241,22 @@ def read_from_dir(tree: Path | str) -> RootfsStamp:
     tree = Path(tree)
     path = tree / STAMP_PATH
     _refuse_links(tree, STAMP_PATH)
+    if not path.exists() and not path.is_symlink():
+        raise RootfsStampError(f"{path} is missing: this rootfs is unstamped")
+    # Regular files only, and opened so that nothing else can block or act: a FIFO blocks
+    # open() forever (gVisor tier selection never returns), and opening a device node can
+    # have side effects on the HOST. lstat first, O_NONBLOCK so a swapped-in FIFO cannot
+    # block, then fstat the descriptor to be sure it is the file we checked.
+    _require_regular_or_absent(path)
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError as exc:
         raise RootfsStampError(f"{path} is missing: this rootfs is unstamped") from exc
     except OSError as exc:
         raise RootfsStampError(f"cannot read {path}: {exc}") from exc
     with os.fdopen(fd, "rb") as fh:
+        if not _stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+            raise RootfsStampError(f"{path} is not a regular file; refusing it")
         raw = fh.read(MAX_STAMP_BYTES + 1)
     return RootfsStamp.from_json(_bounded(raw, path))
 
@@ -234,7 +284,8 @@ def read_from_ext4(image: Path | str, *, run: Runner | None = None) -> RootfsSta
             "debugfs (e2fsprogs) is not installed, so the rootfs stamp cannot be "
             "read without mounting the image; install e2fsprogs"
         )
-    argv = ["debugfs", "-R", f"cat /{STAMP_PATH}", str(image)]
+    # `--`: an image path starting with "-" must never be parsed as a debugfs option.
+    argv = ["debugfs", "-R", f"cat /{STAMP_PATH}", "--", str(image)]
     if run is not None:
         proc = run(argv, capture_output=True, text=True)
         out = proc.stdout or ""
@@ -268,7 +319,13 @@ def compare_to_host(stamp: RootfsStamp, host_version: str) -> str:
     host = _release_of(host_version)
     if not guest:
         return "the rootfs stamp records no blastbox version"
-    if guest != host:
+    # As RELEASES, not strings: the guest version is the image's label, spelled as the repo
+    # pinned it (`0.2.0-rc1`, `0.2`), while the host's comes normalised from installed
+    # metadata (`0.2.0rc1`, `0.2.0`). A string compare refused a correct guest forever --
+    # rebuilding re-stamps the same label.
+    from blastbox.host.stamp import _same_release
+
+    if not _same_release(guest, host):
         return (
             f"the rootfs guest is blastbox {stamp.blastbox_version} but this host "
             f"runs {host_version}. A guest that does not match its host is how a "
@@ -282,19 +339,45 @@ def _release_of(version: str) -> str:
 
 
 def _bounded_debugfs(argv: Sequence[str]) -> str:
-    """Run debugfs with a deadline, keeping at most MAX_STAMP_BYTES + 1 of its output."""
-    proc = subprocess.Popen(  # noqa: S603 -- fixed argv, no shell
-        list(argv), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-    )
-    try:
-        out, _ = proc.communicate(timeout=DEBUGFS_TIMEOUT_S)
-    except subprocess.TimeoutExpired as exc:
-        proc.kill()
+    """Run debugfs, keeping at most MAX_STAMP_BYTES + 1 of its output, within a deadline.
+
+    READ INCREMENTALLY. communicate() buffered the whole output before anything could be
+    sliced, so a sparse multi-GiB stamp in a small ext4 streamed gigabytes of zeros into the
+    reading process -- the dispatcher, in-process -- and an OOM kill is not an exception any
+    caller can catch. stderr goes to a bounded temp file so a real debugfs error (bad magic,
+    permission denied) can be told apart from "no stamp".
+    """
+    with tempfile.TemporaryFile() as err:
+        proc = subprocess.Popen(  # noqa: S603 -- fixed argv, no shell
+            list(argv), stdout=subprocess.PIPE, stderr=err
+        )
+        got: list[bytes] = []
+
+        def reader() -> None:
+            assert proc.stdout is not None
+            got.append(proc.stdout.read(MAX_STAMP_BYTES + 1))
+
+        t = threading.Thread(target=reader, daemon=True, name="rootfs-stamp-debugfs")
+        t.start()
+        t.join(DEBUGFS_TIMEOUT_S)
+        timed_out = t.is_alive()
+        # Always stop it: past the cap there is nothing we will read, and a blocked writer
+        # must not linger.
+        if proc.poll() is None:
+            proc.kill()
         proc.wait()
-        raise RootfsStampError(
-            f"debugfs timed out after {DEBUGFS_TIMEOUT_S:.0f}s reading {argv[-1]}"
-        ) from exc
-    return (out or b"")[: MAX_STAMP_BYTES + 1].decode("utf-8", "replace")
+        t.join(1.0)
+        if timed_out:
+            raise RootfsStampError(
+                f"debugfs timed out after {DEBUGFS_TIMEOUT_S:.0f}s reading {argv[-1]}"
+            )
+        out = got[0] if got else b""
+        if not out.strip():
+            err.seek(0)
+            detail = _clean(err.read(400).decode("utf-8", "replace"))
+            if detail and "not found" not in detail.lower():
+                raise RootfsStampError(f"debugfs could not read {argv[-1]}: {detail}")
+    return out.decode("utf-8", "replace")
 
 
 def guest_problem(rootfs: str, runtime: str) -> str:
