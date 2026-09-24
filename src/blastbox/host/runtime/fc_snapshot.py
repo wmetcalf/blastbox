@@ -822,9 +822,8 @@ class SnapshotManager:
     def _invalidate_locked(self) -> "list[object]":
         """Drop the published (and any staged) base. CALLER MUST HOLD ``_build_lock``.
 
-        Returns the artifacts to collect OUTSIDE the lock. A STAGED refresh is discarded rather
-        than adopted: the invalidator advances the pool's generation right now, and a base
-        appearing between that and a spawn's restore would carry the stamp of the one convicted.
+        Returns the artifacts to collect OUTSIDE the lock. A staged refresh is adopted on the
+        first invalidate after it staged, discarded on any later one.
         """
         self._build_epoch += 1        # reject any build already in flight
         collect: list[object] = []
@@ -833,8 +832,15 @@ class SnapshotManager:
             if retired is not None:
                 collect.append(retired)
         if self._staged is not None:
-            collect.append(self._staged)    # never published: nothing maps it
-            self._clear_staged_locked()
+            if self._staged_for is not None and self._staged_epoch == self._build_epoch:
+                # A FINISHED refresh this is the first repair to land on: adopt it, exactly as
+                # one still building would be. It stays staged -- the pool's drain cannot swap it
+                # in while drop() holds the pool's _invalidation_lock, so it cannot appear under
+                # the generation this repair is about to retire.
+                self._staged_for = None
+            else:
+                collect.append(self._staged)    # convicted again: never published, unmapped
+                self._clear_staged_locked()
         self._artifact = None
         self._published_at = None
         self._build_error = None

@@ -282,13 +282,31 @@ def test_a_second_invalidate_mid_refresh_rejects_it(tmp_path) -> None:
     assert mgr.artifact == "artifact-2"
 
 
-def test_an_invalidate_of_a_staged_refresh_discards_it(tmp_path) -> None:
-    """The pool convicted the base and bumps its generation itself; the staged artifact is not
-    trusted to appear under the pool's feet in the gap between its generation read and a spawn."""
+def test_an_invalidate_of_a_staged_refresh_adopts_it(tmp_path) -> None:
+    """A finished refresh is a fresh checkpoint -- what the repair would build. The drain cannot
+    swap it in while the pool's drop() holds _invalidation_lock, so adopting it is safe; throwing
+    it away cost a full cold rebuild whenever a failure beat the tick to it."""
+    ack = AckCapability(artifact_scoped=True)
+    backend = DistinctBackend()
+    backend.ack = ack
+    mgr, _ = _built(tmp_path, max_age_s=60.0, backend=backend, ack_capable=ack)
+    _age(mgr, 61.0)
+    mgr.ensure_build_started()
+    _stage(mgr)
+    mgr.invalidate()
+    assert not mgr.is_built()                     # nothing appears inside the pool's drop()
+    assert mgr.take_repaired() is True
+    assert mgr.artifact == "artifact-1"
+    assert backend.attempts == 2
+    assert ack.capable_for(mgr.build_epoch)
+
+
+def test_a_second_invalidate_discards_a_staged_refresh(tmp_path) -> None:
     mgr, backend = _built(tmp_path, max_age_s=60.0)
     _age(mgr, 61.0)
     mgr.ensure_build_started()
     _stage(mgr)
+    mgr.invalidate()
     mgr.invalidate()
     assert mgr._staged is None
     assert mgr.take_repaired() is False
@@ -523,7 +541,9 @@ def test_a_cascade_forwards_its_tiers_own_repairs_and_clears_their_streak() -> N
     reported = casc.take_repaired_tiers()
     assert reported == [casc._tier_identity(0)]
     assert casc._tier_failures[0] == 0            # the swapped-out base's streak goes with it
-    assert 0 not in casc._job_guilty
+    # ...but NOT the episode's guilt: a swap does not end a job-failure episode, and empty
+    # guilt makes a pending cascade repair fall back to rebuilding EVERY tier.
+    assert 0 in casc._job_guilty
     assert casc.take_repaired_tiers() == []
 
 
