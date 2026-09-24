@@ -422,6 +422,11 @@ def _pairing(spec: str) -> tuple[str, str]:
     Only a leading `name=` with no path separator in `name` counts, so a path that merely
     contains `=` is never split.
     """
+    # A path that exists as given is a path, however many `=` it contains.
+    from pathlib import Path  # noqa: PLC0415
+
+    if Path(spec).exists():
+        return "", spec
     head, sep, tail = spec.partition("=")
     if sep and head and "/" not in head and tail:
         return head, tail
@@ -521,7 +526,14 @@ def verdict(
     for art in known_a:
         if art.project:
             mine = {_release(c.version) for c in known_c if c.project == art.project}
-            if mine and _release(art.version) not in mine:
+            if not mine:
+                # Pairing asserts which containers vouch for this rootfs. None found --
+                # scaled to zero, or a project label that could not be read -- is "could not
+                # look", which this command never reports as healthy.
+                problems.append(
+                    f"{art.path} is paired with project {art.project}, but no inspectable "
+                    "container of that project is running to check it against")
+            elif _release(art.version) not in mine:
                 problems.append(
                     f"{art.path} records {art.version} but project {art.project} runs "
                     f"{', '.join(sorted(str(v) for v in mine))} -- a guest that does not "

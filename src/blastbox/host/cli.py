@@ -2630,8 +2630,14 @@ def _doctor_cmd(args: argparse.Namespace) -> int:
     versions = sorted({c.version for c in containers if c.known}
                       | {a.version for a in artifacts if a.known})
     tail = f", {len(artifacts)} artifact(s)" if artifacts else ""
-    if len({c.version for c in containers if c.known}) > 1:
-        # Never "OK" beside several versions: allowed is not the same as uniform.
+    from blastbox.host.doctor import _release  # noqa: PLC0415 -- CLI-only
+
+    c_rel = {_release(c.version) for c in containers if c.known}
+    a_rel = {_release(a.version) for a in artifacts if a.known}
+    if len(c_rel) > 1 or (not c_rel and len(a_rel) > 1):
+        # Never "OK" beside several RELEASES (spellings of one release are not a mix): allowed
+        # is not the same as uniform. Only reachable with --allow-mixed; verdict() refuses
+        # a mix otherwise.
         print(f"MIXED (allowed by --allow-mixed): {len(containers)} container(s){tail}, "
               f"blastbox {', '.join(versions)}")
         return 0

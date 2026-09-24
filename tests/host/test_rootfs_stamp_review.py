@@ -7,6 +7,7 @@ Each test pins one upstream review finding against the stamp/doctor change.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import subprocess
@@ -105,7 +106,7 @@ class _FakeDebugfs:
         self.requested = 0
         self.block = _FakeDebugfs.block_next
         self.stdout = self
-        self.stderr = None
+        self.stderr = io.BytesIO(b"")
         self.returncode = None
         _FakeDebugfs.instances.append(self)
 
@@ -529,3 +530,104 @@ def test_the_fc_tiers_name_the_guest_problem_when_they_refuse(monkeypatch, which
     select = fc.select_fc_runtime if which == "cold" else sr.select_snapshot_runtime
     with pytest.raises(fc.FCUnavailable, match="guest is blastbox 0.0.1"):
         select(cfg=cfg, require_available=True)
+
+
+def test_a_paired_rootfs_whose_project_cannot_be_found_is_a_problem() -> None:
+    """Pairing is the operator asserting which containers vouch for this rootfs. None found
+    -- scaled to zero, or a project label that could not be read -- is "could not look"."""
+    ctrs = [_ctr("x", "other", "0.1.42"), _ctr("y", "(unknown-project:dispatcher)", "0.1.42")]
+    art = doctor.Artifact(path="/r", version="0.1.17", runtime="firecracker",
+                          arch=plat.host_platform().arch, project="clippy")
+    problems = doctor.verdict(ctrs, [art], allow_mixed=True)
+    assert any("clippy" in p for p in problems)
+
+
+def test_equivalent_spellings_are_not_reported_as_mixed(monkeypatch, capsys) -> None:
+    ctrs = [_ctr("a", "p1", "0.2"), _ctr("b", "p2", "0.2.0")]
+    rc, out = _doctor(monkeypatch, capsys, ctrs, [])
+    assert rc == 0 and "MIXED" not in out and "OK:" in out
+
+
+def test_an_allowed_artifact_only_mix_is_not_ok(monkeypatch, capsys) -> None:
+    arts = [_art("/r/a", "0.1.17"), _art("/r/b", "0.2.0")]
+    rc, out = _doctor(monkeypatch, capsys, [], arts, allow_mixed=True)
+    assert rc == 0 and "OK:" not in out and "MIXED" in out
+
+
+def test_an_empty_ext4_stamp_says_unstamped_not_the_debugfs_banner(tmp_path, monkeypatch) -> None:
+    img = tmp_path / "rootfs.ext4"
+    img.write_bytes(b"\0")
+    monkeypatch.setattr(rfs.shutil, "which", lambda _n: "/usr/sbin/debugfs")
+
+    class _P:
+        def __init__(self, argv, stdout=None, stderr=None, **kw):
+            self.stderr = io.BytesIO(b"debugfs 1.47.0 (5-Feb-2023)\n")
+            self.stdout = self
+            self.returncode = 0
+
+        def read(self, n=-1):
+            return b"   \n"
+
+        def poll(self):
+            return 0
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(rfs.subprocess, "Popen", _P)
+    with pytest.raises(rfs.RootfsStampError, match="carries no"):
+        rfs.read_from_ext4(img)
+
+
+def test_a_real_debugfs_error_is_reported_past_the_banner(tmp_path, monkeypatch) -> None:
+    img = tmp_path / "rootfs.ext4"
+    img.write_bytes(b"\0")
+    monkeypatch.setattr(rfs.shutil, "which", lambda _n: "/usr/sbin/debugfs")
+
+    class _P:
+        def __init__(self, argv, stdout=None, stderr=None, **kw):
+            self.stderr = io.BytesIO(
+                b"debugfs 1.47.0 (5-Feb-2023)\nBad magic number in super-block\n")
+            self.stdout = self
+
+        def read(self, n=-1):
+            return b""
+
+        def poll(self):
+            return 1
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 1
+
+    monkeypatch.setattr(rfs.subprocess, "Popen", _P)
+    with pytest.raises(rfs.RootfsStampError, match="Bad magic"):
+        rfs.read_from_ext4(img)
+
+
+def test_a_failed_unprivileged_write_is_a_stamp_error(tmp_path, monkeypatch) -> None:
+    def denied(*a, **k):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(rfs.os, "open", denied)
+    with pytest.raises(rfs.RootfsStampError, match="could not write"):
+        rfs.write_into_tree(tmp_path, _stamp())
+
+
+def test_an_existing_path_containing_equals_is_never_split(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "build=2.ext4").write_bytes(b"\0")
+    assert doctor._pairing("build=2.ext4") == ("", "build=2.ext4")
+    assert doctor._pairing("clippy=/r/rootfs.ext4") == ("clippy", "/r/rootfs.ext4")
+
+
+def test_unicode_separators_and_bidi_are_stripped_at_parse() -> None:
+    st = rfs.RootfsStamp.from_json(json.dumps(
+        {"blastbox_version": "0.1.40‮ FAKE: ok ⁦​﻿"}))
+    assert st.blastbox_version == "0.1.40FAKE: ok"
+    assert len(rfs.compare_to_host(st, "0.1.41").splitlines()) == 1

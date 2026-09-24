@@ -25,6 +25,7 @@ and when it was exported.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -33,6 +34,7 @@ import stat as _stat
 import subprocess
 import tempfile
 import threading
+import unicodedata
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -107,8 +109,18 @@ _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
 def _clean(value: object) -> str:
-    """A stamp field as display-safe text: no control characters, bounded length."""
-    return "" if value is None else _CONTROL.sub("", str(value))[:200]
+    """A stamp field as display-safe text: no control characters, bounded length.
+
+    Beyond C0/C1: Unicode line and paragraph separators (which splitlines() and log viewers
+    break on) and every format character -- bidi overrides, zero-widths, BOM -- which can
+    forge or reorder what an operator reads.
+    """
+    if value is None:
+        return ""
+    text = _CONTROL.sub("", str(value))
+    return "".join(
+        ch for ch in text if unicodedata.category(ch) not in ("Cf", "Zl", "Zp")
+    )[:200]
 
 
 def platform_of(stamp: "RootfsStamp") -> "HostPlatform":
@@ -164,10 +176,13 @@ def write_into_tree(
     _require_regular_or_absent(target)
     if not priv:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.unlink(missing_ok=True)
-        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
-        with os.fdopen(fd, "w") as fh:
-            fh.write(body)
+        try:
+            target.unlink(missing_ok=True)
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(body)
+        except OSError as exc:
+            raise RootfsStampError(f"could not write {target}: {exc}") from exc
         return target
     if run is None:  # pragma: no cover - defensive
         raise RootfsStampError("a privileged write needs a runner")
@@ -338,45 +353,61 @@ def _release_of(version: str) -> str:
     return (version or "").split("+", 1)[0].strip()
 
 
+_DEBUGFS_BANNER = re.compile(r"^debugfs \d[^\n]*$", re.MULTILINE)
+
+
 def _bounded_debugfs(argv: Sequence[str]) -> str:
     """Run debugfs, keeping at most MAX_STAMP_BYTES + 1 of its output, within a deadline.
 
     READ INCREMENTALLY. communicate() buffered the whole output before anything could be
     sliced, so a sparse multi-GiB stamp in a small ext4 streamed gigabytes of zeros into the
     reading process -- the dispatcher, in-process -- and an OOM kill is not an exception any
-    caller can catch. stderr goes to a bounded temp file so a real debugfs error (bad magic,
-    permission denied) can be told apart from "no stamp".
+    caller can catch. stderr is drained the same way (first 4 KiB kept, the rest discarded)
+    so a real debugfs error (bad magic, permission denied) can be told apart from "no
+    stamp" without an unbounded buffer.
     """
-    with tempfile.TemporaryFile() as err:
-        proc = subprocess.Popen(  # noqa: S603 -- fixed argv, no shell
-            list(argv), stdout=subprocess.PIPE, stderr=err
+    proc = subprocess.Popen(  # noqa: S603 -- fixed argv, no shell
+        list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    got: list[bytes] = []
+    err: list[bytes] = []
+
+    def reader() -> None:
+        assert proc.stdout is not None
+        got.append(proc.stdout.read(MAX_STAMP_BYTES + 1))
+
+    def err_reader() -> None:
+        assert proc.stderr is not None
+        err.append(proc.stderr.read(4096))
+        while proc.stderr.read(65536):
+            pass
+
+    t = threading.Thread(target=reader, daemon=True, name="rootfs-stamp-debugfs")
+    te = threading.Thread(target=err_reader, daemon=True, name="rootfs-stamp-debugfs-err")
+    t.start()
+    te.start()
+    t.join(DEBUGFS_TIMEOUT_S)
+    timed_out = t.is_alive()
+    # Always stop it: past the cap there is nothing we will read, and a blocked writer must
+    # not linger. The wait is bounded too -- a debugfs in uninterruptible sleep (a hung NFS
+    # image) ignores SIGKILL, and the probe must not hang with it.
+    if proc.poll() is None:
+        proc.kill()
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=5.0)
+    t.join(1.0)
+    te.join(1.0)
+    if timed_out:
+        raise RootfsStampError(
+            f"debugfs timed out after {DEBUGFS_TIMEOUT_S:.0f}s reading {argv[-1]}"
         )
-        got: list[bytes] = []
-
-        def reader() -> None:
-            assert proc.stdout is not None
-            got.append(proc.stdout.read(MAX_STAMP_BYTES + 1))
-
-        t = threading.Thread(target=reader, daemon=True, name="rootfs-stamp-debugfs")
-        t.start()
-        t.join(DEBUGFS_TIMEOUT_S)
-        timed_out = t.is_alive()
-        # Always stop it: past the cap there is nothing we will read, and a blocked writer
-        # must not linger.
-        if proc.poll() is None:
-            proc.kill()
-        proc.wait()
-        t.join(1.0)
-        if timed_out:
-            raise RootfsStampError(
-                f"debugfs timed out after {DEBUGFS_TIMEOUT_S:.0f}s reading {argv[-1]}"
-            )
-        out = got[0] if got else b""
-        if not out.strip():
-            err.seek(0)
-            detail = _clean(err.read(400).decode("utf-8", "replace"))
-            if detail and "not found" not in detail.lower():
-                raise RootfsStampError(f"debugfs could not read {argv[-1]}: {detail}")
+    out = got[0] if got else b""
+    if not out.strip():
+        # debugfs ALWAYS prints its version banner on stderr; only what follows is an error.
+        detail = _clean(_DEBUGFS_BANNER.sub("", (err[0] if err else b"").decode(
+            "utf-8", "replace")).strip())
+        if detail and "not found" not in detail.lower():
+            raise RootfsStampError(f"debugfs could not read {argv[-1]}: {detail}")
     return out.decode("utf-8", "replace")
 
 
