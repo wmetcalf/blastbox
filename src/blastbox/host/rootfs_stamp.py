@@ -26,6 +26,7 @@ and when it was exported.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -43,6 +44,14 @@ Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 #: Inside the rootfs. Kept next to `/opt/blastbox/engine`, which exists for the
 #: same reason -- image config does not survive `docker export`.
 STAMP_PATH = "opt/blastbox/rootfs-stamp.json"
+
+#: A stamp is a few hundred bytes. It is read out of an artifact this host did not
+#: create, so the read is capped: a huge (or /dev/zero-backed) stamp must not
+#: exhaust the memory of `doctor` or of a tier's availability probe.
+MAX_STAMP_BYTES = 64 * 1024
+
+#: debugfs on a malformed filesystem can spin; the probe must not.
+DEBUGFS_TIMEOUT_S = 30.0
 
 
 class RootfsStampError(RuntimeError):
@@ -86,10 +95,18 @@ class RootfsStamp:
 
 
 def platform_of(stamp: "RootfsStamp") -> "HostPlatform":
-    """The stamp's platform block as a typed object (empty when unrecorded)."""
+    """What a ROOTFS is bound to: its architecture and the runtime tier it is for.
+
+    Only those two. A rootfs carries no CPU state -- the snapshot is taken later, on the
+    DEPLOYING host, by SnapshotManager.build -- so the CPU vendor, model, kernel and runtime
+    version of the machine that ran mkfs.ext4 say nothing about where it can boot. Stamps
+    exported before this recorded them; they are ignored here rather than refusing a correct
+    rootfs moved between an AMD build host and an Intel fleet.
+    """
     from blastbox.host.platform_id import HostPlatform
 
-    return HostPlatform.from_dict(stamp.platform)
+    full = HostPlatform.from_dict(stamp.platform)
+    return HostPlatform(arch=full.arch, runtime=full.runtime)
 
 
 def now_iso() -> str:
@@ -117,6 +134,11 @@ def write_into_tree(
     tree = Path(tree)
     target = tree / STAMP_PATH
     body = stamp.to_json()
+    # The TREE is the image's, and this write runs as root: a symlink anywhere on the stamp
+    # path would let the image create or truncate a file on the HOST (a final link to
+    # /etc/sudoers, an `opt` pointing at /etc). The extracted tree is static while we write,
+    # so checking every component first is sufficient; nothing below then follows a link.
+    _refuse_links(tree, STAMP_PATH)
     if not priv:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(body)
@@ -155,13 +177,46 @@ def write_into_tree(
     return target
 
 
+def _refuse_links(tree: Path, rel: str) -> None:
+    """Raise if any component of ``tree/rel`` that exists is a symlink."""
+    cur = tree
+    for part in Path(rel).parts:
+        cur = cur / part
+        try:
+            if cur.is_symlink():
+                raise RootfsStampError(
+                    f"{cur} is a symlink inside the image; refusing to follow it -- the "
+                    "stamp is written as root and must stay inside the tree"
+                )
+        except OSError as exc:
+            raise RootfsStampError(f"cannot inspect {cur}: {exc}") from exc
+
+
 def read_from_dir(tree: Path | str) -> RootfsStamp:
-    """Read the stamp from an exported directory rootfs (the gVisor kind)."""
-    path = Path(tree) / STAMP_PATH
+    """Read the stamp from an exported directory rootfs (the gVisor kind).
+
+    Bounded, and without following links: the tree is an image's, not ours.
+    """
+    tree = Path(tree)
+    path = tree / STAMP_PATH
+    _refuse_links(tree, STAMP_PATH)
     try:
-        return RootfsStamp.from_json(path.read_text())
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except FileNotFoundError as exc:
         raise RootfsStampError(f"{path} is missing: this rootfs is unstamped") from exc
+    except OSError as exc:
+        raise RootfsStampError(f"cannot read {path}: {exc}") from exc
+    with os.fdopen(fd, "rb") as fh:
+        raw = fh.read(MAX_STAMP_BYTES + 1)
+    return RootfsStamp.from_json(_bounded(raw, path))
+
+
+def _bounded(raw: bytes | str, where: object) -> str:
+    if len(raw) > MAX_STAMP_BYTES:
+        raise RootfsStampError(
+            f"the stamp in {where} is larger than {MAX_STAMP_BYTES} bytes; refusing it"
+        )
+    return raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
 
 
 def read_from_ext4(image: Path | str, *, run: Runner | None = None) -> RootfsStamp:
@@ -179,15 +234,15 @@ def read_from_ext4(image: Path | str, *, run: Runner | None = None) -> RootfsSta
             "debugfs (e2fsprogs) is not installed, so the rootfs stamp cannot be "
             "read without mounting the image; install e2fsprogs"
         )
-    runner = run or _default_runner
-    proc = runner(
-        ["debugfs", "-R", f"cat /{STAMP_PATH}", str(image)],
-        capture_output=True,
-        text=True,
-    )
+    argv = ["debugfs", "-R", f"cat /{STAMP_PATH}", str(image)]
+    if run is not None:
+        proc = run(argv, capture_output=True, text=True)
+        out = proc.stdout or ""
+    else:
+        out = _bounded_debugfs(argv)
     # debugfs reports a missing file on stderr and still exits 0, so the exit
     # code alone cannot be trusted here.
-    body = (proc.stdout or "").strip()
+    body = _bounded(out, image).strip()
     if not body:
         raise RootfsStampError(
             f"{image} carries no {STAMP_PATH}: it was exported by something that "
@@ -226,6 +281,69 @@ def _release_of(version: str) -> str:
     return (version or "").split("+", 1)[0].strip()
 
 
+def _bounded_debugfs(argv: Sequence[str]) -> str:
+    """Run debugfs with a deadline, keeping at most MAX_STAMP_BYTES + 1 of its output."""
+    proc = subprocess.Popen(  # noqa: S603 -- fixed argv, no shell
+        list(argv), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    try:
+        out, _ = proc.communicate(timeout=DEBUGFS_TIMEOUT_S)
+    except subprocess.TimeoutExpired as exc:
+        proc.kill()
+        proc.wait()
+        raise RootfsStampError(
+            f"debugfs timed out after {DEBUGFS_TIMEOUT_S:.0f}s reading {argv[-1]}"
+        ) from exc
+    return (out or b"")[: MAX_STAMP_BYTES + 1].decode("utf-8", "replace")
+
+
+def guest_problem(rootfs: str, runtime: str) -> str:
+    """Why this host must not boot ``rootfs`` on ``runtime``, or "" when it may.
+
+    Shared by both warm tiers. An unstamped or unreadable rootfs WARNS and returns "" --
+    "I could not look" is not "it is wrong", and refusing it would strand every deployment
+    exported before stamping existed.
+    """
+    import logging
+    from importlib.metadata import PackageNotFoundError, version
+
+    from blastbox.host import platform_id as _plat
+
+    log = logging.getLogger("blastbox.host.rootfs_stamp")
+    try:
+        stamp = read(rootfs)
+    except RootfsStampError as exc:
+        log.warning(
+            "rootfs %s carries no readable blastbox stamp (%s); booting it anyway. "
+            "Rebuild it with `blastbox build-images` so guest/host drift is caught "
+            "here instead of as a timeout on every warm job.",
+            rootfs, exc,
+        )
+        return ""
+    except Exception as exc:  # noqa: BLE001 - never fail the tier on a diagnostic
+        log.warning("could not read the rootfs stamp on %s: %s", rootfs, exc)
+        return ""
+    try:
+        host = version("blastbox")
+    except PackageNotFoundError:  # pragma: no cover
+        return ""
+    # The MACHINE, before the software: saying "wrong blastbox" about an aarch64 rootfs
+    # on an x86_64 host sends the operator after the wrong thing.
+    findings = _plat.compare(platform_of(stamp), _plat.host_platform(runtime=runtime))
+    fatal = _plat.refusals(findings)
+    if fatal:
+        return f"{rootfs}: {_plat.summarise(fatal)}"
+    complaint = compare_to_host(stamp, host)
+    if complaint:
+        return (
+            f"{rootfs}: {complaint} Rebuild the rootfs with `blastbox build-images` "
+            f"(the stamp says image={stamp.image or '?'} "
+            f"exported_at={stamp.exported_at or '?'})."
+        )
+    log.info("rootfs %s guest blastbox %s matches this host", rootfs, stamp.blastbox_version)
+    return ""
+
+
 def _default_runner(
     argv: Sequence[str], **kwargs: object
 ) -> "subprocess.CompletedProcess[str]":  # pragma: no cover - thin wrapper
@@ -233,7 +351,10 @@ def _default_runner(
 
 
 __all__ = [
+    "DEBUGFS_TIMEOUT_S",
+    "MAX_STAMP_BYTES",
     "STAMP_PATH",
+    "guest_problem",
     "platform_of",
     "RootfsStamp",
     "RootfsStampError",

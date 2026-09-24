@@ -346,61 +346,11 @@ def guest_kernel_version(vmlinux_path: str) -> tuple[int, int] | None:
 def rootfs_guest_problem(rootfs: str) -> str:
     """Why this host must not boot ``rootfs``, or "" when it may.
 
-    Returns a complaint ONLY for a stamped rootfs whose guest blastbox disagrees
-    with this host. An unstamped rootfs, or one whose stamp cannot be read at
-    all, warns and returns "" -- "I could not look" is not "it is wrong", and
-    reading it as the latter would strand every deployment exported before
-    stamping existed.
+    See :func:`blastbox.host.rootfs_stamp.guest_problem`, which the gVisor tier shares.
     """
-    from importlib.metadata import PackageNotFoundError, version
-
     from blastbox.host import rootfs_stamp as _rfs
 
-    try:
-        stamp = _rfs.read(rootfs)
-    except _rfs.RootfsStampError as exc:
-        _log.warning(
-            "rootfs %s carries no readable blastbox stamp (%s); booting it anyway. "
-            "Rebuild it with `blastbox build-images` so guest/host drift is caught "
-            "here instead of as a 300s timeout on every warm job.",
-            rootfs,
-            exc,
-        )
-        return ""
-    except Exception as exc:  # noqa: BLE001 - never fail the tier on a diagnostic
-        _log.warning("could not read the rootfs stamp on %s: %s", rootfs, exc)
-        return ""
-
-    try:
-        host = version("blastbox")
-    except PackageNotFoundError:  # pragma: no cover
-        return ""
-    # The MACHINE, before the software. An arch or CPU-vendor mismatch cannot
-    # work whatever version is inside it, and saying "wrong blastbox" about an
-    # aarch64 rootfs on an x86_64 host sends the operator after the wrong thing.
-    from blastbox.host import platform_id as _plat
-
-    live = _plat.host_platform(
-        runtime="firecracker", runtime_version=_plat.firecracker_runtime_version()
-    )
-    findings = _plat.compare(_rfs.platform_of(stamp), live)
-    for warn in (f for f in findings if not f.fatal):
-        _log.warning("rootfs %s: %s: %s", rootfs, warn.field, warn.message)
-    fatal = _plat.refusals(findings)
-    if fatal:
-        return f"{rootfs}: {_plat.summarise(fatal)}"
-
-    complaint = _rfs.compare_to_host(stamp, host)
-    if complaint:
-        return (
-            f"{rootfs}: {complaint} Rebuild the rootfs with `blastbox build-images` "
-            f"(the stamp says image={stamp.image or '?'} "
-            f"exported_at={stamp.exported_at or '?'})."
-        )
-    _log.info(
-        "rootfs %s guest blastbox %s matches this host", rootfs, stamp.blastbox_version
-    )
-    return ""
+    return _rfs.guest_problem(rootfs, "firecracker")
 
 
 def firecracker_available(cfg: FCConfig | None = None) -> bool:

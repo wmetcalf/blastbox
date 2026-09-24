@@ -390,16 +390,20 @@ def survey_rootfs(paths: Sequence[str]) -> list[Artifact]:
             out.append(Artifact(path=path, version=UNKNOWN, detail=str(exc).strip()))
             continue
         plat = _rfs.platform_of(stamp)
+        # Every field below comes from an artifact this host did not create: stripped of
+        # control characters, as container output is, so a stamp cannot forge the lines
+        # after it or drive the operator's terminal. `path` is the operator's own argument.
+        version = _sanitise(stamp.blastbox_version)
         out.append(
             Artifact(
                 path=path,
-                version=stamp.blastbox_version or UNKNOWN,
-                runtime=plat.runtime,
-                arch=plat.arch,
-                cpu_vendor=plat.cpu_vendor,
-                image=stamp.image,
-                exported_at=stamp.exported_at,
-                detail="" if stamp.blastbox_version else "stamp records no version",
+                version=version or UNKNOWN,
+                runtime=_sanitise(plat.runtime),
+                arch=_sanitise(plat.arch),
+                cpu_vendor=_sanitise(plat.cpu_vendor),
+                image=_sanitise(stamp.image),
+                exported_at=_sanitise(stamp.exported_at),
+                detail="" if version else "stamp records no version",
             )
         )
     return out
@@ -425,6 +429,62 @@ def artifact_problems(artifacts: Sequence[Artifact]) -> list[tuple[Artifact, str
         fatal = _plat.refusals(_plat.compare(recorded, live))
         if fatal:
             problems.append((art, _plat.summarise(fatal)))
+    return problems
+
+
+def verdict(
+    containers: Sequence[Container],
+    artifacts: Sequence[Artifact] = (),
+    *,
+    expect: str | None = None,
+    allow_mixed: bool = False,
+) -> list[str]:
+    """Every reason the fleet is NOT ok under the given policy; empty means ok.
+
+    The ONE place `--expect` and `--allow-mixed` are applied. The command used to decide
+    through a chain of early returns, each seeing part of the policy: JSON mode ignored both
+    flags, `--allow-mixed` returned before an unreadable artifact was judged, and a
+    rootfs-only fleet was never checked for versions at all.
+    """
+    problems: list[str] = []
+    unknown_c = [c.name for c in containers if not c.known]
+    unknown_a = [a.path for a in artifacts if not a.known]
+    if unknown_c:
+        problems.append(f"{len(unknown_c)} container(s) could not be inspected: "
+                        + ", ".join(unknown_c))
+    if unknown_a:
+        problems.append(f"{len(unknown_a)} artifact(s) could not be read: "
+                        + ", ".join(unknown_a))
+    for art, why in artifact_problems(artifacts):
+        problems.append(f"unbootable here: {art.path}: {why}")
+    for project, versions in sorted(drift(list(containers)).items()):
+        if len(versions) > 1:
+            # Within ONE compose project there is no legitimate mix; --allow-mixed is for
+            # separate products on one host.
+            problems.append(f"compose project {project} runs {', '.join(sorted(versions))}")
+    if not containers and not artifacts:
+        if expect:
+            problems.append(f"expected {expect}, but found nothing to verify")
+        return problems
+    c_versions = {c.version for c in containers if c.known}
+    a_versions = {a.version for a in artifacts if a.known}
+    if expect:
+        wrong = sorted({c.name for c in containers if c.known and c.version != expect}
+                       | {a.path for a in artifacts if a.known and a.version != expect})
+        if wrong:
+            problems.append(f"expected {expect}, but: " + ", ".join(wrong))
+    if not allow_mixed:
+        if len(c_versions) > 1:
+            problems.append(f"containers run {len(c_versions)} versions: "
+                            + ", ".join(sorted(c_versions)))
+        if c_versions and a_versions - c_versions:
+            problems.append(
+                f"containers run {', '.join(sorted(c_versions))} but an artifact records "
+                f"{', '.join(sorted(a_versions - c_versions))} -- a guest that does not "
+                "match its host boots and never signals READY")
+        if not c_versions and len(a_versions) > 1:
+            problems.append(f"artifacts record {len(a_versions)} versions: "
+                            + ", ".join(sorted(a_versions)))
     return problems
 
 

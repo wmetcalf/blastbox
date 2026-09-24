@@ -2554,16 +2554,12 @@ def _pins_cmd(args: argparse.Namespace) -> int:
 def _doctor_cmd(args: argparse.Namespace) -> int:
     """Report the blastbox version every running container is actually on."""
     from blastbox.host.doctor import (  # noqa: PLC0415 -- CLI-only
-        UNKNOWN,
         DockerUnavailable,
-        drift,
-        survey,
-    )
-
-    from blastbox.host.doctor import (  # noqa: PLC0415 -- CLI-only
         artifact_problems,
         fleet_report,
+        survey,
         survey_rootfs,
+        verdict,
     )
 
     artifacts = survey_rootfs(getattr(args, "rootfs", []) or [])
@@ -2578,15 +2574,29 @@ def _doctor_cmd(args: argparse.Namespace) -> int:
             print(f"cannot inspect anything: {exc}")
             return 2
 
+    # ONE verdict, whatever the output format: the policy flags define success, so the JSON
+    # report and the text report must never disagree about the exit code.
+    problems = verdict(
+        containers,
+        artifacts,
+        expect=args.expect,
+        allow_mixed=bool(getattr(args, "allow_mixed", False)),
+    )
+
     if getattr(args, "json", False):
         report = fleet_report(containers, artifacts)
+        report["policy"] = {"expect": args.expect,
+                            "allow_mixed": bool(getattr(args, "allow_mixed", False))}
+        report["problems"] = problems
+        report["ok"] = not problems
         print(json.dumps(report, indent=2, sort_keys=True))
-        return 0 if report["ok"] else 1
+        return 0 if not problems else 1
 
     if not containers and not artifacts:
         print("no running blastbox containers found")
-        # With --expect, verifying nothing must not report success.
-        return 1 if args.expect else 0
+        for p in problems:
+            print(f"PROBLEM: {p}")
+        return 1 if problems else 0
 
     if artifacts:
         awidth = max(len(a.path) for a in artifacts)
@@ -2598,78 +2608,24 @@ def _doctor_cmd(args: argparse.Namespace) -> int:
             print(f"  UNBOOTABLE HERE: {art.path}: {why}")
         if containers:
             print()
-    if not containers:
-        return 1 if any(not a.known for a in artifacts) or artifact_problems(artifacts) else 0
-
-    width = max(len(c.name) for c in containers)
-    for c in sorted(containers, key=lambda c: (c.project, c.name)):
-        note = f"  <- {c.detail}" if c.detail else ""
-        print(f"  {c.project:<18} {c.name:<{width}}  {c.image:<26} {c.version}{note}")
-
-    by_project = drift(containers)
-    mixed = {p: v for p, v in by_project.items() if len(v) > 1}
-    unknown = [c for c in containers if c.version == UNKNOWN]
+    if containers:
+        width = max(len(c.name) for c in containers)
+        for c in sorted(containers, key=lambda c: (c.project, c.name)):
+            note = f"  <- {c.detail}" if c.detail else ""
+            print(f"  {c.project:<18} {c.name:<{width}}  {c.image:<26} {c.version}{note}")
     print()
-    if unknown:
-        print(f"UNKNOWN: {len(unknown)} container(s) could not be inspected:")
-        for c in unknown:
-            print(f"  {c.name}: {c.detail}")
-        print("  (a container that cannot be read is not a container that agrees)")
-    if mixed:
-        print("DRIFT: a compose project is running more than one blastbox:")
-        for project, versions in sorted(mixed.items()):
-            print(f"  {project}: {', '.join(sorted(versions))}")
-    if args.expect:
-        wrong = [c for c in containers if c.known and c.version != args.expect]
-        if wrong:
-            print(f"EXPECTED {args.expect}, but:")
-            for c in wrong:
-                print(f"  {c.name}: {c.version}")
-            return 1
-    if mixed or unknown:
+    if problems:
+        for p in problems:
+            print(f"PROBLEM: {p}")
+        if not getattr(args, "allow_mixed", False) and any(
+            "versions:" in p for p in problems
+        ):
+            print("\n  (pass --allow-mixed if separate products on one host are expected)")
         return 1
-    versions = {c.version for c in containers if c.known}
-    if len(versions) > 1:
-        # Never print OK while listing several versions. Distinct compose
-        # projects may legitimately differ (two products on one host), so this
-        # is reported rather than assumed broken -- but it is not "OK", and
-        # --allow-mixed is how an operator states the difference is intended.
-        print(f"MIXED: {len(containers)} container(s) across {len(versions)} versions:")
-        for version in sorted(versions):
-            where = ", ".join(
-                sorted(c.name for c in containers if c.version == version)
-            )
-            print(f"  {version}: {where}")
-        if not args.allow_mixed:
-            print(
-                "\n  (pass --allow-mixed if separate products on one host are expected)"
-            )
-            return 1
-        return 0
-    # Artifacts count toward the verdict. Printing an UNBOOTABLE rootfs and then
-    # reporting OK is the precise shape of the failure this command exists for:
-    # a fleet that reads healthy and cannot serve a warm job.
-    bad_artifacts = artifact_problems(artifacts)
-    unknown_artifacts = [a for a in artifacts if not a.known]
-    if bad_artifacts or unknown_artifacts:
-        if unknown_artifacts:
-            print(f"UNKNOWN: {len(unknown_artifacts)} artifact(s) could not be read")
-        if bad_artifacts:
-            print(f"UNBOOTABLE: {len(bad_artifacts)} artifact(s) cannot run on this host")
-        return 1
-    art_versions = {a.version for a in artifacts if a.known}
-    if art_versions - versions and not args.allow_mixed:
-        print(
-            f"DRIFT: containers run {', '.join(sorted(versions))} but an artifact "
-            f"records {', '.join(sorted(art_versions - versions))} -- a guest that "
-            f"does not match its host boots and never signals READY"
-        )
-        return 1
+    versions = sorted({c.version for c in containers if c.known}
+                      | {a.version for a in artifacts if a.known})
     tail = f", {len(artifacts)} artifact(s)" if artifacts else ""
-    print(
-        f"OK: {len(containers)} container(s){tail}, "
-        f"blastbox {', '.join(sorted(versions | art_versions))}"
-    )
+    print(f"OK: {len(containers)} container(s){tail}, blastbox {', '.join(versions)}")
     return 0
 
 

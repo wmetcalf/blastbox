@@ -370,6 +370,16 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
                                     "set BLASTBOX_GVISOR_RUNSC / install runsc")
         _log.debug("select_gvisor_snapshot_runtime: runsc unavailable")
         return None
+    # The GUEST, before any base is booted -- the same check firecracker_available() makes.
+    # runsc being present says nothing about whether the directory rootfs it would restore can
+    # talk to this host; a stale guest otherwise burns the whole base-readiness timeout.
+    from blastbox.host import rootfs_stamp as _rfs
+    problem = _rfs.guest_problem(str(gcfg.image_rootfs), "gvisor")
+    if problem:
+        if require_available:
+            raise GvisorUnavailable(f"gVisor C/R warm tier refused: {problem}")
+        _log.error("select_gvisor_snapshot_runtime: %s", problem)
+        return None
     # RAM-preload (COW-image-to-RAM): the runsc checkpoint image holds the guest's memory pages
     # (~guest RAM with soffice live) and dominates restore cost. Holding the checkpoint dir on
     # tmpfs (/dev/shm) pins it in RAM, so every per-slot restore pages the COW-shared base in from

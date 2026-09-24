@@ -31,7 +31,10 @@ def test_survey_reads_version_and_platform(tmp_path: Path) -> None:
     assert len(got) == 1
     assert got[0].version == "0.1.42"
     assert got[0].runtime == "firecracker"
-    assert got[0].arch and got[0].cpu_vendor
+    assert got[0].arch
+    # A rootfs is bound to arch + runtime only; the exporter's CPU is not its property
+    # (the snapshot is taken on the deploying host), so it is not surveyed as one.
+    assert got[0].cpu_vendor == ""
     assert got[0].known
 
 
