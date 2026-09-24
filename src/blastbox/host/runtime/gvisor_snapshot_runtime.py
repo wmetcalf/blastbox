@@ -18,11 +18,7 @@ import threading
 import time
 import uuid
 
-from blastbox.host.runtime.env_knobs import max_age_env, positive_float_env
-from blastbox.host.runtime.fc_snapshot import (
-    DEFAULT_SNAPSHOT_MAX_AGE_S,
-    idle_slot_usable,
-)
+from blastbox.host.runtime.env_knobs import positive_float_env
 from pathlib import Path
 from typing import Callable
 
@@ -190,16 +186,24 @@ class GvisorSnapshotSlotRuntime:
         # identity; publish() decides what the replacement is capable of (issue #92).
 
     def maintain_idle(self, slot: Slot, *, budget_s: "float | None" = None) -> bool:
-        """Retire an idle slot that has sat restored longer than the snapshot max-age.
+        """Retire an idle slot whose checkpoint is past max-age once a newer base exists.
 
         Called by the pool's ``_maintain_idle`` with the slot already reserved (IDLE->ASSIGNED),
-        so returning False retires it without racing a claimant. Cheap: no I/O.
+        so returning False retires it without racing a claimant. Cheap: no I/O. The decision is
+        the manager's (``slot_should_retire``) because only it knows which base the slot restored
+        from and whether a replacement has been published.
         """
-        with self._lock:
-            born = self._restored_at.get(slot.slot_id)
-        return idle_slot_usable(
-            slot.slot_id, born, self._clock(), float(getattr(self._mgr, "max_age_s", 0.0))
-        )
+        retire = getattr(self._mgr, "slot_should_retire", None)
+        return not (callable(retire) and retire(slot.slot_id))
+
+    def take_repaired_tiers(self) -> "list[str]":
+        """Report an age-driven base swap once, so the pool advances this runtime's generation.
+
+        ``""`` names the whole runtime (the pool's key for a single-tier base). Without it, the
+        failures of slots from the superseded base kept counting against the new one.
+        """
+        take = getattr(self._mgr, "take_repaired", None)
+        return [""] if callable(take) and take() else []
 
     def reap(self, slot: Slot) -> None:
         with self._lock:
@@ -399,12 +403,7 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
     # reached, while the failure it produces tells the operator to raise a DIFFERENT
     # variable (issue #147). A slow-but-healthy base -- a cold OCR/soffice warm-up on a
     # loaded node -- could not be accommodated at all.
-    mgr = SnapshotManager(
-        base_dir, backend, ack_capable=ack_capable,
-        ready_timeout_s=positive_float_env(os.environ, "BLASTBOX_SNAPSHOT_READY_S", 120.0),
-        # Rebuild the base before it ages out; see SnapshotManager. 0 disables.
-        max_age_s=max_age_env(os.environ, "BLASTBOX_SNAPSHOT_MAX_AGE_S", DEFAULT_SNAPSHOT_MAX_AGE_S),
-    )
+    mgr = SnapshotManager.from_env(base_dir, backend, ack_capable=ack_capable)
     return GvisorSnapshotSlotRuntime(mgr, settle_s=_settle(), ack_capable=ack_capable)
 
 

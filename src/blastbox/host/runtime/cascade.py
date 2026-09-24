@@ -929,9 +929,20 @@ class CascadingRuntime:
         Drained, not read: each repair must retire its slots exactly once.
         """
         with self._lock:
-            out = sorted(self._repaired_unreported)
+            out = set(self._repaired_unreported)
             self._repaired_unreported.clear()
-        return out
+        # A tier can repair ITSELF (a snapshot base aged out and was swapped) without the
+        # cascade's invalidate path ever running; forward those under this tier's identity.
+        for i, tier in enumerate(self.tiers):
+            take = getattr(tier.runtime, "take_repaired_tiers", None)
+            if not callable(take):
+                continue
+            try:
+                if take():
+                    out.add(self._tier_identity(i))
+            except Exception as exc:  # noqa: BLE001 -- one tier's report must not stall the rest
+                _log.warning("cascade.take_repaired_failed tier=%s: %s", self._tier_identity(i), exc)
+        return sorted(out)
 
     def clear_job_guilt(self) -> None:
         """Forget which tiers a job-failure EPISODE implicated, because it recovered.
