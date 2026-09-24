@@ -257,12 +257,16 @@ def test_an_invalidate_mid_refresh_adopts_the_refresh_as_its_repair(tmp_path) ->
     assert mgr.invalidate() is True               # the pool convicts the base meanwhile
     assert not mgr.is_built()
     backend.gate.set()
-    assert _wait_until(mgr.is_built)
-    assert mgr.artifact == "artifact-1"           # published directly: the pool already repaired
+    _stage(mgr)                                   # staged like any refresh: the pool may still
+    assert not mgr.is_built()                     # be inside drop(), its generation unmoved
+    mgr.ensure_build_started()
+    time.sleep(0.05)
+    assert backend.attempts == 2                  # and nothing builds over it meanwhile
+    assert mgr.take_repaired() is True
+    assert mgr.artifact == "artifact-1"
     assert backend.attempts == 2                  # no second build
     assert mgr.build_epoch == epoch0 + 1
     assert ack.capable_for(mgr.build_epoch)       # observed under the epoch it now carries
-    assert mgr.take_repaired() is False           # the pool's own invalidate advanced the ledger
 
 
 def test_a_second_invalidate_mid_refresh_rejects_it(tmp_path) -> None:
@@ -393,7 +397,7 @@ def test_a_refresh_still_running_at_the_ceiling_becomes_the_repair(tmp_path) -> 
     mgr.ensure_build_started()
     assert not mgr.is_built()
     backend.gate.set()
-    assert _wait_until(mgr.is_built)
+    _swap(mgr)
     assert mgr.artifact == "artifact-1"
     assert backend.attempts == 2
 
@@ -521,3 +525,118 @@ def test_a_cascade_forwards_its_tiers_own_repairs_and_clears_their_streak() -> N
     assert casc._tier_failures[0] == 0            # the swapped-out base's streak goes with it
     assert 0 not in casc._job_guilty
     assert casc.take_repaired_tiers() == []
+
+
+# --- round 3: the refresh's epoch is fixed when it STARTS -------------------------------------
+
+
+def _refresh_blocked_before_boot(tmp_path):
+    """A refresh whose thread is running but has not reached boot_base() -- held in the
+    pre-boot housekeeping (undead-base retry, sweeps), which can take a runsc timeout."""
+    backend = DistinctBackend()
+    mgr, _ = _built(tmp_path, max_age_s=60.0, backend=backend)
+    hold, inside = threading.Event(), threading.Event()
+    real = mgr._sweep_retired
+
+    def slow_sweep() -> None:
+        inside.set()
+        hold.wait(5)
+        real()
+
+    mgr._sweep_retired = slow_sweep            # type: ignore[method-assign]
+    _age(mgr, 61.0)
+    mgr.ensure_build_started()
+    assert inside.wait(5)
+    return mgr, backend, hold
+
+
+def test_an_invalidate_before_the_refresh_boots_still_adopts_it(tmp_path) -> None:
+    mgr, backend, hold = _refresh_blocked_before_boot(tmp_path)
+    mgr.invalidate()
+    hold.set()
+    _swap(mgr)
+    assert mgr.artifact == "artifact-1"
+    assert backend.attempts == 2                  # no second full build
+
+
+def test_a_second_invalidate_rejects_the_refresh_whenever_the_first_landed(tmp_path) -> None:
+    mgr, backend, hold = _refresh_blocked_before_boot(tmp_path)
+    mgr.invalidate()                              # before the boot
+    backend.entered.clear()
+    backend.gate = threading.Event()
+    hold.set()
+    assert backend.entered.wait(5)
+    mgr.invalidate()                              # during it: this build is convicted too
+    backend.gate.set()
+    assert _wait_until(lambda: not mgr._build_thread.is_alive())
+    assert not mgr.is_built()
+
+
+def test_the_ceiling_leaves_a_staged_refresh_for_the_drain(tmp_path) -> None:
+    """tick() judges the ceiling (prepare) BEFORE it drains (the swap), so a refresh that staged
+    just as the base crossed the ceiling was thrown away for a whole new build. Swapping it in
+    from prepare() instead is no better: a cascade calls prepare() per spawn, mid-batch."""
+    mgr, backend = _built(tmp_path, max_age_s=60.0)
+    _age(mgr, 119.0)
+    mgr.ensure_build_started()
+    _stage(mgr)
+    _age(mgr, 2.0)
+    mgr.ensure_build_started()
+    assert mgr.is_built() and mgr.artifact == "artifact-0"   # at most one tick more
+    assert mgr._staged is not None
+    assert mgr.take_repaired() is True
+    assert mgr.artifact == "artifact-1"
+    assert backend.attempts == 2
+    assert mgr.take_repaired() is False           # reported once
+
+
+def test_the_drain_waits_out_a_pool_rebuild_in_flight() -> None:
+    """The pool advances the generation only after drop() returns. A swap drained inside that
+    window would let the tick stamp new-base slots with the generation about to be retired."""
+    from blastbox.host.pool import WarmPool
+
+    mgr = _Mgr()
+    pool = WarmPool(runtime=_runtimes(mgr)[0], warm_size=0, concurrent_ceiling=1)
+    mgr.repaired = True
+    with pool._invalidation_lock:
+        pool._drain_runtime_repairs()
+    assert mgr.repaired is True                   # not taken while the rebuild is in flight
+    pool._drain_runtime_repairs()
+    assert mgr.repaired is False
+
+
+def test_the_drain_swaps_and_advances_under_one_pool_lock() -> None:
+    """A failure report landing between the swap and the generation bump still matched the old
+    generation and could convict the base that had just been swapped in."""
+    from blastbox.host.pool import WarmPool
+
+    mgr = _Mgr()
+    pool = WarmPool(runtime=_runtimes(mgr)[0], warm_size=0, concurrent_ceiling=1)
+    held: list[bool] = []
+    real = mgr.take_repaired
+
+    def take() -> bool:
+        held.append(pool._lock.locked())
+        return real()
+
+    mgr.take_repaired = take                      # type: ignore[method-assign]
+    mgr.repaired = True
+    pool._drain_runtime_repairs()
+    assert held == [True]
+
+
+def test_a_retired_generation_slot_does_not_blame_its_tier() -> None:
+    """Old slots stay claimable after a swap; their failures must not rebuild the tier's
+    evidence against the base that replaced them."""
+    from blastbox.host.pool import WarmPool
+
+    mgr = _Mgr()
+    rt = _runtimes(mgr)[0]
+    blamed: list[str] = []
+    rt.blame_tier_for_slot = blamed.append        # type: ignore[attr-defined]
+    pool = WarmPool(runtime=rt, warm_size=0, concurrent_ceiling=1)
+    pool._base_generation["fc#0"] = 1
+    pool._slot_base["old"] = ("fc#0", 0)
+    pool._slot_base["new"] = ("fc#0", 1)
+    pool._blame_tiers(["old", "new", "unstamped"])
+    assert blamed == ["new", "unstamped"]

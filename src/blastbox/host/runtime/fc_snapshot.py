@@ -235,28 +235,40 @@ class SnapshotManager:
         The pool's drain calls this on its tick thread, BEFORE it stamps and spawns slots, so
         the swap and the generation it advances are one step as far as any slot can tell.
         """
-        collect: object | None = None
         with self._build_lock:
             out, self._repaired = self._repaired, False
-            if self._staged is not None:
-                if (self._artifact is self._staged_for
-                        and self._staged_epoch == self._build_epoch + 1):
-                    collect = self._retire_locked(self._artifact)
-                    self._build_epoch = self._staged_epoch
-                    self._artifact = self._staged
-                    self._published_at = self._staged_at
-                    self._build_error = None
-                    if self._ack_capable is not None:
-                        self._install_ack(self._build_epoch)
-                    _log.info("snapshot.refreshed epoch=%d -- the superseded base is retired",
-                              self._build_epoch)
-                    out = True
-                else:   # unreachable: invalidate() discards a staged refresh
-                    collect = self._staged
-                self._clear_staged_locked()
-        if collect is not None:
-            self._collect(collect)
-        return out
+            swapped, collect = self._swap_staged_locked()
+            if collect is not None:
+                # PARKED, not discarded here: the pool calls this under its own lock, and a
+                # discard is a RAM-sized unlink. The next release/_unpin/build sweeps it.
+                self._retired[id(collect)] = collect
+        return out or swapped
+
+    def _swap_staged_locked(self) -> "tuple[bool, object | None]":
+        """Swap a staged refresh in. CALLER MUST HOLD ``_build_lock``.
+
+        Returns (swapped, artifact to collect outside the lock).
+        """
+        if self._staged is None:
+            return False, None
+        swapped = False
+        adopted = self._staged_for is None
+        expected = self._build_epoch if adopted else self._build_epoch + 1
+        if self._artifact is self._staged_for and self._staged_epoch == expected:
+            collect = None if adopted else self._retire_locked(self._artifact)
+            self._build_epoch = self._staged_epoch
+            self._artifact = self._staged
+            self._published_at = self._staged_at
+            self._build_error = None
+            if self._ack_capable is not None:
+                self._install_ack(self._build_epoch)
+            _log.info("snapshot.refreshed epoch=%d -- the superseded base is retired",
+                      self._build_epoch)
+            swapped = True
+        else:   # unreachable: invalidate() discards a staged refresh
+            collect = self._staged
+        self._clear_staged_locked()
+        return swapped, collect
 
     def slot_should_retire(self, slot_id: object) -> bool:
         """Retire an idle slot whose CHECKPOINT is past the age ceiling.
@@ -344,7 +356,7 @@ class SnapshotManager:
         independently; the hazard is not worth keeping for a lock that buys nothing here.
         """
         staged = self._staging_epoch
-        return self._build_epoch if staged is None else max(staged, self._build_epoch)
+        return self._build_epoch if staged is None else staged
 
     def pinned_epoch(self, slot_id: object) -> "int | None":
         """The build epoch of the artifact ``restore()`` actually pinned for this slot.
@@ -405,6 +417,12 @@ class SnapshotManager:
                     if age is None or age < self._ceiling_s:
                         self._maybe_start_refresh_locked(age)
                         return
+                    if self._staged is not None:
+                        # The replacement is already in hand -- tick() judges the ceiling before
+                        # its drain swaps it in. Leave it for the drain (at most one tick):
+                        # swapping here would publish mid-batch, since a cascade calls
+                        # prepare() per spawn.
+                        return
                     # PAST THE CEILING. The refresh has failed (or is still booting) for a whole
                     # max-age; restores from here are expected to hang. Drop the base: a refresh
                     # still in flight is then adopted as the repair (see _build), otherwise the
@@ -418,6 +436,8 @@ class SnapshotManager:
                     self._repaired = True
                 if self._build_thread is not None and self._build_thread.is_alive():
                     return
+                if self._staged is not None:
+                    return        # an adopted refresh is waiting for the pool's drain
                 if time.monotonic() < self._retry_not_before:
                     return
                 self._build_thread = threading.Thread(
@@ -454,8 +474,16 @@ class SnapshotManager:
             "base keeps serving until it is ready (BLASTBOX_SNAPSHOT_MAX_AGE_S; 0 disables)",
             age, self._max_age_s,
         )
+        # The refresh's epoch is fixed HERE, not when _build() gets round to sampling it: the
+        # thread first runs housekeeping (undead-base retry, sweeps) that can take a runsc
+        # timeout, and an invalidate landing in that window must count as one that landed on
+        # the refresh -- adopted if it is the only one, rejecting it if a second follows. No other
+        # build runs while this thread is alive, so the staged epoch is also what its boot's ACK
+        # observation must name.
+        start = self._build_epoch
+        self._staging_epoch = start + 1
         self._build_thread = threading.Thread(
-            target=self._refresh_worker, args=(self._artifact,), daemon=True,
+            target=self._refresh_worker, args=(self._artifact, start), daemon=True,
             name="warm-snapshot-refresh",
         )
         self._build_thread.start()
@@ -582,17 +610,22 @@ class SnapshotManager:
         if (running is not None and running is not threading.current_thread()
                 and running.is_alive()):
             running.join()
+        with self._build_lock:
+            # build() is the synchronous, pool-less entry point (the pool spawns through
+            # acquire_built()), so there is no drain to wait for: take an adopted refresh here.
+            if self._artifact is None and self._staged is not None and self._staged_for is None:
+                self._swap_staged_locked()
             if self._artifact is not None:
                 return self._artifact
         return self._build()
 
-    def _refresh_worker(self, replacing: object) -> None:
+    def _refresh_worker(self, replacing: object, start_epoch: int) -> None:
         """Build a replacement for an aged base while it keeps serving; stage it on success."""
         # A full, idle pool never reaches acquire_built(), so this may be the only build path
         # running -- and each failed refresh can park another base whose teardown failed.
         self._retry_undead_bases()
         try:
-            self._build(replacing=replacing)
+            self._build(replacing=replacing, epoch=start_epoch)
         except SnapshotBuildInvalidated:
             _log.info("snapshot.refresh_superseded: a repair replaced the base while the "
                       "refresh was building; the next tick builds from that state")
@@ -604,7 +637,7 @@ class SnapshotManager:
                 self._build_retry_backoff_s, exc,
             )
 
-    def _build(self, replacing: object | None = None) -> object:
+    def _build(self, replacing: object | None = None, epoch: int | None = None) -> object:
         """Boot, checkpoint and publish a base. ``replacing`` makes it a refresh: the artifact
         it names keeps serving throughout and is swapped out only if it is still current when the
         replacement is ready."""
@@ -645,7 +678,8 @@ class SnapshotManager:
         # tears down its own sandbox on partial failure, so no handle/finally is
         # needed here — there is nothing to kill until it returns a BootHandle.
         with self._build_lock:
-            epoch = self._build_epoch
+            if epoch is None:           # a refresh brings the epoch it STARTED under
+                epoch = self._build_epoch
             if replacing is not None:
                 self._staging_epoch = epoch + 1
         try:
@@ -715,12 +749,13 @@ class SnapshotManager:
                         # what the repair would build -- and its ACK was observed under the very
                         # epoch the repair gave the next build, so it IS the repair. Rejecting it
                         # left the tier cold behind this thread and then for a second full build.
-                        # The invalidator (the pool, or the ceiling) already reported the repair.
-                        self._artifact = artifact
-                        self._published_at = time.monotonic()
-                        self._build_error = None
-                        if self._ack_capable is not None:
-                            self._install_ack(self._build_epoch)
+                        # STAGED like any refresh, never published from this thread: the pool
+                        # advances its generation only after drop() returns, and a base that
+                        # appeared inside that window would be restored under the old stamp.
+                        self._staged = artifact
+                        self._staged_for = None              # nothing is serving
+                        self._staged_epoch = self._build_epoch
+                        self._staged_at = time.monotonic()
                         outcome = "adopted"
                     else:
                         rejected = True    # convicted again, or replaced: stale
