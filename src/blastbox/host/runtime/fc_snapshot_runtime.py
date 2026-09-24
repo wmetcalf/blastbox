@@ -303,7 +303,7 @@ class SnapshotSlotRuntime:
                      bool(discarded))
 
     def maintain_idle(self, slot: Slot, *, budget_s: "float | None" = None) -> bool:
-        """Retire an idle slot whose checkpoint is past max-age once a newer base exists.
+        """Retire an idle slot whose checkpoint is past the snapshot age ceiling.
 
         Called by the pool's ``_maintain_idle`` with the slot already reserved (IDLE->ASSIGNED),
         so returning False retires it without racing a claimant. Cheap: no I/O. The decision is
@@ -314,10 +314,11 @@ class SnapshotSlotRuntime:
         return not (callable(retire) and retire(slot.slot_id))
 
     def take_repaired_tiers(self) -> "list[str]":
-        """Report an age-driven base swap once, so the pool advances this runtime's generation.
+        """Swap in a refreshed base and report it once, so the pool advances the generation.
 
-        ``""`` names the whole runtime (the pool's key for a single-tier base). Without it, the
-        failures of slots from the superseded base kept counting against the new one.
+        The swap happens HERE, inside the pool's drain and before it spawns, so no slot can be
+        restored from the new base under the old generation stamp. ``""`` names the whole runtime
+        (the pool's key for a single-tier base).
         """
         take = getattr(self._manager, "take_repaired", None)
         return [""] if callable(take) and take() else []

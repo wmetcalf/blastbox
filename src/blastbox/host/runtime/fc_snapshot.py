@@ -95,6 +95,12 @@ def _restore_left_process_running(exc: BaseException) -> bool:
 #: boot, so a margin this wide is cheap. ``BLASTBOX_SNAPSHOT_MAX_AGE_S`` overrides; 0 disables.
 DEFAULT_SNAPSHOT_MAX_AGE_S = 6 * 3600.0
 
+#: Past ``SNAPSHOT_AGE_CEILING_FACTOR`` x max-age a base is invalidated even if its refresh keeps
+#: failing, and idle slots whose checkpoint is that old are retired. Below it an aged base keeps
+#: serving while it is refreshed; past it, restores are expected to hang every job at the worker
+#: timeout, which is worse than the pool's cold fallback. 2 x 6h = 12h, half the measured edge.
+SNAPSHOT_AGE_CEILING_FACTOR = 2.0
+
 
 
 class SnapshotManager:
@@ -142,6 +148,14 @@ class SnapshotManager:
         # Set on a swap and drained by the runtime's take_repaired_tiers(), so the pool advances
         # its generation and old-generation failures stop being charged to the new base.
         self._repaired = False
+        # A finished refresh is STAGED, not published: only take_repaired() -- the pool's drain,
+        # on the thread that also stamps and spawns slots -- swaps it in. Published by the refresh
+        # thread at an arbitrary moment, a slot restored from the new base could carry the
+        # generation stamp the pool took just before, and be discarded as retired evidence.
+        self._staged: object | None = None
+        self._staged_for: object | None = None
+        self._staged_epoch: int | None = None
+        self._staged_at: float | None = None
         #: slot_id -> publish time of the artifact that slot restored from (its checkpoint age).
         self._pin_born: dict[str, float] = {}
         self._artifact: object | None = None
@@ -216,29 +230,50 @@ class SnapshotManager:
         return artifact
 
     def take_repaired(self) -> bool:
-        """True once per swap, for the runtime to report so the pool advances its generation."""
+        """Swap in a staged refresh and report it -- True once per repair the pool must record.
+
+        The pool's drain calls this on its tick thread, BEFORE it stamps and spawns slots, so
+        the swap and the generation it advances are one step as far as any slot can tell.
+        """
+        collect: object | None = None
         with self._build_lock:
             out, self._repaired = self._repaired, False
+            if self._staged is not None:
+                if (self._artifact is self._staged_for
+                        and self._staged_epoch == self._build_epoch + 1):
+                    collect = self._retire_locked(self._artifact)
+                    self._build_epoch = self._staged_epoch
+                    self._artifact = self._staged
+                    self._published_at = self._staged_at
+                    self._build_error = None
+                    if self._ack_capable is not None:
+                        self._install_ack(self._build_epoch)
+                    _log.info("snapshot.refreshed epoch=%d -- the superseded base is retired",
+                              self._build_epoch)
+                    out = True
+                else:   # unreachable: invalidate() discards a staged refresh
+                    collect = self._staged
+                self._clear_staged_locked()
+        if collect is not None:
+            self._collect(collect)
         return out
 
     def slot_should_retire(self, slot_id: object) -> bool:
-        """Retire an idle slot once a NEWER base exists and its own checkpoint is too old.
+        """Retire an idle slot whose CHECKPOINT is past the age ceiling.
 
-        Both conditions. Retiring on checkpoint age alone would empty the tier into a void while
-        the replacement is still building -- or indefinitely, if it fails -- so a slot is only
-        retired when there is something to replace it from. And age is measured from the
-        CHECKPOINT the slot restored, not from its own restore: a slot restored from a base just
-        under the limit would otherwise live another full max-age on a checkpoint nearly twice
-        that old. A young base superseded by a pool repair is the pool's business, not this one's.
+        Measured from the checkpoint the slot restored, not from its own restore: a slot restored
+        from a base just under the limit would otherwise live another full window on a checkpoint
+        nearly twice as old. Only past the ceiling -- below it an aged slot is still well inside the
+        safe window, and retiring every one at a swap emptied the claimable pool at once; they
+        turn over on use.
         """
         if self._max_age_s <= 0:
             return False
         with self._build_lock:
             born = self._pin_born.get(str(slot_id))
-            current = self._published_at if self._artifact is not None else None
-        if born is None or current is None or current <= born:
+        if born is None:
             return False
-        return time.monotonic() - born >= self._max_age_s
+        return time.monotonic() - born >= self._ceiling_s
 
     @classmethod
     def from_env(
@@ -309,7 +344,7 @@ class SnapshotManager:
         independently; the hazard is not worth keeping for a lock that buys nothing here.
         """
         staged = self._staging_epoch
-        return self._build_epoch if staged is None else staged
+        return self._build_epoch if staged is None else max(staged, self._build_epoch)
 
     def pinned_epoch(self, slot_id: object) -> "int | None":
         """The build epoch of the artifact ``restore()`` actually pinned for this slot.
@@ -358,40 +393,72 @@ class SnapshotManager:
         """Non-blocking: kick the (idempotent) build in a daemon thread if it isn't built and no
         build is already running. Returns immediately so the caller (the pool's tick loop) never
         blocks on the boot+wait_ready. After a failure it waits ``build_retry_backoff_s`` before
-        retrying, so a persistently-failing base boot doesn't churn the host every tick."""
-        with self._build_lock:
-            if self._artifact is not None:
-                # AGE is decided here, under the same lock that starts the build thread, so two
-                # ticks (or a cascade's concurrent prepare() calls) cannot both act on one aged
-                # base. It REFRESHES rather than invalidates: invalidate-then-build dropped the
-                # working base before its replacement existed, so a failed rebuild left the tier
-                # with nothing, and a second invalidation could reject the first one's build.
-                now = time.monotonic()
-                if (self._max_age_s > 0 and self._published_at is not None
-                        and now - self._published_at >= self._max_age_s
-                        and not (self._build_thread is not None
-                                 and self._build_thread.is_alive())
-                        and now >= self._refresh_not_before):
-                    _log.info(
-                        "snapshot.aged_out age_s=%.0f max_age_s=%.0f -- building a replacement; "
-                        "the current base keeps serving until it is ready "
-                        "(BLASTBOX_SNAPSHOT_MAX_AGE_S; 0 disables)",
-                        now - self._published_at, self._max_age_s,
+        retrying, so a persistently-failing base boot doesn't churn the host every tick.
+
+        Also where AGE is decided, under the same lock that starts the build thread, so two ticks
+        (or a cascade's concurrent prepare() calls) cannot both act on one aged base."""
+        collect: list[object] = []
+        try:
+            with self._build_lock:
+                if self._artifact is not None:
+                    age = self._age_locked()
+                    if age is None or age < self._ceiling_s:
+                        self._maybe_start_refresh_locked(age)
+                        return
+                    # PAST THE CEILING. The refresh has failed (or is still booting) for a whole
+                    # max-age; restores from here are expected to hang. Drop the base: a refresh
+                    # still in flight is then adopted as the repair (see _build), otherwise the
+                    # ordinary build below starts. Reported so the pool retires the generation.
+                    _log.error(
+                        "snapshot.aged_past_ceiling age_s=%.0f ceiling_s=%.0f -- the refresh has "
+                        "not replaced this base; dropping it rather than serving hangs",
+                        age, self._ceiling_s,
                     )
-                    self._build_thread = threading.Thread(
-                        target=self._refresh_worker, args=(self._artifact,), daemon=True,
-                        name="warm-snapshot-refresh",
-                    )
-                    self._build_thread.start()
-                return
-            if self._build_thread is not None and self._build_thread.is_alive():
-                return
-            if time.monotonic() < self._retry_not_before:
-                return
-            self._build_thread = threading.Thread(
-                target=self._build_worker, daemon=True, name="warm-snapshot-build"
-            )
-            self._build_thread.start()
+                    collect = self._invalidate_locked()
+                    self._repaired = True
+                if self._build_thread is not None and self._build_thread.is_alive():
+                    return
+                if time.monotonic() < self._retry_not_before:
+                    return
+                self._build_thread = threading.Thread(
+                    target=self._build_worker, daemon=True, name="warm-snapshot-build"
+                )
+                self._build_thread.start()
+        finally:
+            for artifact in collect:
+                self._collect(artifact)
+
+    def _age_locked(self) -> "float | None":
+        """Age of the published base, or None when max-age is off or nothing is published."""
+        if self._max_age_s <= 0 or self._published_at is None:
+            return None
+        return time.monotonic() - self._published_at
+
+    @property
+    def _ceiling_s(self) -> float:
+        return self._max_age_s * SNAPSHOT_AGE_CEILING_FACTOR
+
+    def _maybe_start_refresh_locked(self, age: "float | None") -> None:
+        """Start ONE background refresh of an aged base. CALLER MUST HOLD ``_build_lock``.
+
+        It REFRESHES rather than invalidates: invalidate-then-build dropped the working base
+        before its replacement existed, so a failed rebuild left the tier with nothing, and a
+        second invalidation could reject the first one's build.
+        """
+        if (age is None or age < self._max_age_s or self._staged is not None
+                or (self._build_thread is not None and self._build_thread.is_alive())
+                or time.monotonic() < self._refresh_not_before):
+            return
+        _log.info(
+            "snapshot.aged_out age_s=%.0f max_age_s=%.0f -- building a replacement; the current "
+            "base keeps serving until it is ready (BLASTBOX_SNAPSHOT_MAX_AGE_S; 0 disables)",
+            age, self._max_age_s,
+        )
+        self._build_thread = threading.Thread(
+            target=self._refresh_worker, args=(self._artifact,), daemon=True,
+            name="warm-snapshot-refresh",
+        )
+        self._build_thread.start()
 
     def _build_worker(self) -> None:
         try:
@@ -507,10 +574,23 @@ class SnapshotManager:
         self._retry_undead_bases()
         if self._artifact is not None:
             return self._artifact
+        # WAIT for a build already running rather than overlap it. A refresh adopted as the repair
+        # of an invalidation holds the very epoch a second build would sample, and begin_build()
+        # of one erases the other's ACK observation. Never join ourselves: the background build
+        # thread runs this method.
+        running = self._build_thread
+        if (running is not None and running is not threading.current_thread()
+                and running.is_alive()):
+            running.join()
+            if self._artifact is not None:
+                return self._artifact
         return self._build()
 
     def _refresh_worker(self, replacing: object) -> None:
-        """Build a replacement for an aged base while it keeps serving; swap on success."""
+        """Build a replacement for an aged base while it keeps serving; stage it on success."""
+        # A full, idle pool never reaches acquire_built(), so this may be the only build path
+        # running -- and each failed refresh can park another base whose teardown failed.
+        self._retry_undead_bases()
         try:
             self._build(replacing=replacing)
         except SnapshotBuildInvalidated:
@@ -612,7 +692,8 @@ class SnapshotManager:
             # discovered by invalidate() or the reference counting, and every async retry left another
             # generation-stamped, RAM-sized .mem behind. The snapshot is complete and usable here --
             # a failure tearing the BASE down says nothing about it.
-            collect: object | None = None
+            outcome = "published"
+            rejected = False
             with self._build_lock:
                 if replacing is None:
                     rejected = epoch != self._build_epoch
@@ -622,19 +703,27 @@ class SnapshotManager:
                         if self._ack_capable is not None:
                             self._install_ack(epoch)
                 else:
-                    # SWAP only if nothing moved while the replacement built: an invalidate()
-                    # (a pool repair) bumps the epoch, and publishing over it would reinstate a
-                    # base the repair had just decided against.
-                    rejected = (epoch != self._build_epoch or self._artifact is not replacing)
-                    if not rejected:
-                        collect = self._retire_locked(replacing)
-                        self._build_epoch = epoch + 1
+                    if epoch == self._build_epoch and self._artifact is replacing:
+                        # Nothing moved: STAGE it. take_repaired() swaps it in (see __init__).
+                        self._staged = artifact
+                        self._staged_for = replacing
+                        self._staged_epoch = epoch + 1
+                        self._staged_at = time.monotonic()
+                        outcome = "staged"
+                    elif self._artifact is None and self._build_epoch == epoch + 1:
+                        # ONE invalidate() landed mid-refresh. This is a fresh boot -- exactly
+                        # what the repair would build -- and its ACK was observed under the very
+                        # epoch the repair gave the next build, so it IS the repair. Rejecting it
+                        # left the tier cold behind this thread and then for a second full build.
+                        # The invalidator (the pool, or the ceiling) already reported the repair.
                         self._artifact = artifact
                         self._published_at = time.monotonic()
                         self._build_error = None
-                        self._repaired = True
                         if self._ack_capable is not None:
                             self._install_ack(self._build_epoch)
+                        outcome = "adopted"
+                    else:
+                        rejected = True    # convicted again, or replaced: stale
                     self._staging_epoch = None
             if rejected:
                 # invalidate() landed while this build was running. Publishing now would install the
@@ -653,12 +742,8 @@ class SnapshotManager:
             # sandbox we could not confirm gone must stay reachable for retry rather than be logged
             # and forgotten.
             self._kill_base(boot)
-            if collect is not None and not self._discard(collect):
-                with self._build_lock:
-                    self._retired[id(collect)] = collect     # retryable, not forgotten
             if replacing is not None:
-                _log.info("snapshot.refreshed epoch=%d -- the superseded base is retired",
-                          epoch + 1)
+                _log.info("snapshot.refresh_%s epoch=%d", outcome, epoch + 1)
             return artifact
         except BaseException as exc:
             # THE EPOCH TRAVELS WITH THE FAILURE. It used to be published to instance state and
@@ -694,20 +779,45 @@ class SnapshotManager:
         """
         with self._build_lock:
             had = self._artifact is not None
-            self._build_epoch += 1        # reject any build already in flight
-            collect = None
-            if self._artifact is not None:
-                collect = self._retire_locked(self._artifact)
-            self._artifact = None
-            self._published_at = None
-            self._build_error = None
-            # Do not reuse the previous failure backoff: this is a deliberate rebuild request,
-            # not a retry of a build that just failed.
-            self._retry_not_before = 0.0
-        if collect is not None and not self._discard(collect):
-            with self._build_lock:
-                self._retired[id(collect)] = collect     # retryable, not forgotten
+            collect = self._invalidate_locked()
+        for artifact in collect:
+            self._collect(artifact)
         return had
+
+    def _invalidate_locked(self) -> "list[object]":
+        """Drop the published (and any staged) base. CALLER MUST HOLD ``_build_lock``.
+
+        Returns the artifacts to collect OUTSIDE the lock. A STAGED refresh is discarded rather
+        than adopted: the invalidator advances the pool's generation right now, and a base
+        appearing between that and a spawn's restore would carry the stamp of the one convicted.
+        """
+        self._build_epoch += 1        # reject any build already in flight
+        collect: list[object] = []
+        if self._artifact is not None:
+            retired = self._retire_locked(self._artifact)
+            if retired is not None:
+                collect.append(retired)
+        if self._staged is not None:
+            collect.append(self._staged)    # never published: nothing maps it
+            self._clear_staged_locked()
+        self._artifact = None
+        self._published_at = None
+        self._build_error = None
+        # Do not reuse the previous failure backoff: this is a deliberate rebuild request,
+        # not a retry of a build that just failed.
+        self._retry_not_before = 0.0
+        return collect
+
+    def _clear_staged_locked(self) -> None:
+        self._staged = self._staged_for = None
+        self._staged_epoch = None
+        self._staged_at = None
+
+    def _collect(self, artifact: object) -> None:
+        """Discard a drained generation; on failure park it so the sweep retries."""
+        if not self._discard(artifact):
+            with self._build_lock:
+                self._retired[id(artifact)] = artifact     # retryable, not forgotten
 
     def release(self, slot_id: object) -> None:
         """Called when a restored slot is reaped: drop its pin and reclaim drained generations.

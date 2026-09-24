@@ -1374,6 +1374,13 @@ class WarmPool:
         with self._lock:
             for name in names:
                 self._base_generation[str(name)] = self._base_generation.get(str(name), 0) + 1
+                # ...and the retired base's evidence with it. Advancing the generation filters
+                # only failures reported AFTER this point; what the old base had already
+                # accumulated survived, so two old-slot hangs plus one from the fresh base
+                # convicted it -- as the pool's own repair commit says, a new generation starts
+                # with no inherited evidence.
+                self._pool_consecutive_failures.pop(str(name), None)
+                self._pool_pre_guest_failures.pop(str(name), None)
         logger.info("pool.runtime_repaired_bases tiers=%s -- their slots are now retired",
                     ",".join(str(n) for n in names))
 

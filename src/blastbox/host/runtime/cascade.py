@@ -940,6 +940,11 @@ class CascadingRuntime:
             try:
                 if take():
                     out.add(self._tier_identity(i))
+                    with self._lock:
+                        # The streak was counted against the base that was just swapped out;
+                        # carried over, the replacement's first failure could convict it.
+                        self._tier_failures[i] = 0
+                        self._job_guilty.discard(i)
             except Exception as exc:  # noqa: BLE001 -- one tier's report must not stall the rest
                 _log.warning("cascade.take_repaired_failed tier=%s: %s", self._tier_identity(i), exc)
         return sorted(out)

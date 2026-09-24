@@ -39,14 +39,22 @@ class DistinctBackend(FakeBackend):
         super().__init__()
         self._n = itertools.count()
         self.fail_next = False
+        self.fail_always = False
+        self.attempts = 0
+        #: set the moment a boot begins -- AFTER the manager sampled its epoch
+        self.entered = threading.Event()
         self.gate: threading.Event | None = None
         # The manager binds its epoch source here when this is None (see SnapshotManager).
         self._epoch_sampler = None
         self.ack: AckCapability | None = None
 
     def boot_base(self):
+        self.attempts += 1
+        self.entered.set()
         if self.gate is not None:
             self.gate.wait(5)
+        if self.fail_always:
+            raise RuntimeError("persistent boot failure")
         if self.fail_next:
             self.fail_next = False
             raise RuntimeError("transient boot failure")
@@ -131,6 +139,17 @@ def test_a_young_base_is_left_alone(tmp_path) -> None:
     assert 0.0 <= mgr.base_age_s() < 60
 
 
+def _stage(mgr: SnapshotManager) -> None:
+    """Wait for the refresh to finish building its replacement (staged, not yet visible)."""
+    assert _wait_until(lambda: mgr._staged is not None)
+
+
+def _swap(mgr: SnapshotManager) -> None:
+    """Stage, then acknowledge the way the pool's drain does -- which is what makes it visible."""
+    _stage(mgr)
+    assert mgr.take_repaired() is True
+
+
 def test_an_aged_base_keeps_serving_while_its_replacement_builds(tmp_path) -> None:
     """The old artifact is never dropped before the new one exists."""
     backend = DistinctBackend()
@@ -142,32 +161,58 @@ def test_an_aged_base_keeps_serving_while_its_replacement_builds(tmp_path) -> No
     assert mgr.is_built() and mgr.artifact == old  # still serving, mid-refresh
     mgr.restore("during-refresh")                  # and still restorable
     backend.gate.set()
-    assert _wait_until(lambda: mgr.artifact != old)
+    _swap(mgr)
+    assert mgr.artifact != old
     assert mgr.base_age_s() < 60
 
 
-def test_a_failed_refresh_leaves_the_old_base_serving(tmp_path) -> None:
-    """Previously: built=False and every restore refused until a rebuild succeeded."""
+def test_a_staged_replacement_is_invisible_until_the_pool_takes_it(tmp_path) -> None:
+    """The pool stamps a slot's generation BEFORE spawn() restores it, and drains repairs on the
+    same thread before spawning. A swap made visible by the refresh thread at an arbitrary moment
+    let a slot restored from the NEW base carry the OLD stamp -- and once the drain advanced the
+    generation, that slot's failures were discarded as retired-generation evidence."""
     backend = DistinctBackend()
     mgr, _ = _built(tmp_path, max_age_s=60.0, backend=backend)
     old = mgr.artifact
-    backend.fail_next = True
     _age(mgr, 61.0)
     mgr.ensure_build_started()
-    assert _wait_until(lambda: backend.boots and len(backend.boots) >= 1)
-    time.sleep(0.2)
+    _stage(mgr)
+    mgr.restore("between-stage-and-drain")
+    assert backend.restores[-1].artifact == old
+    assert mgr.artifact == old
+    assert mgr.take_repaired() is True
+    mgr.restore("after-drain")
+    assert backend.restores[-1].artifact != old
+
+
+def test_a_failed_refresh_leaves_the_old_base_serving_and_backs_off(tmp_path) -> None:
+    """Previously: built=False and every restore refused until a rebuild succeeded."""
+    backend = DistinctBackend()
+    mgr, _ = _built(tmp_path, max_age_s=60.0, backend=backend, build_retry_backoff_s=3600.0)
+    old = mgr.artifact
+    backend.fail_always = True
+    _age(mgr, 61.0)
+    mgr.ensure_build_started()
+    assert _wait_until(lambda: backend.attempts == 2)          # the refresh WAS attempted
+    assert _wait_until(lambda: mgr._build_thread is None or not mgr._build_thread.is_alive())
     assert mgr.is_built() and mgr.artifact == old
     mgr.restore("after-failed-refresh")           # no "snapshot not built"
+    for _ in range(5):                            # and no hot loop of full base boots
+        mgr.ensure_build_started()
+    time.sleep(0.1)
+    assert backend.attempts == 2
+    assert mgr.take_repaired() is False
 
 
-def test_the_age_path_never_invalidates(tmp_path, monkeypatch) -> None:
+def test_the_age_path_never_invalidates_below_the_ceiling(tmp_path, monkeypatch) -> None:
     """invalidate() on the age path is what let two ticks cancel each other's replacement."""
     mgr, _ = _built(tmp_path, max_age_s=60.0)
     calls: list[int] = []
     monkeypatch.setattr(mgr, "invalidate", lambda: calls.append(1) or True)
     _age(mgr, 61.0)
     mgr.ensure_build_started()
-    assert _wait_until(lambda: mgr.base_age_s() is not None and mgr.base_age_s() < 60)
+    _swap(mgr)
+    assert mgr.base_age_s() < 60
     assert calls == []
 
 
@@ -181,38 +226,108 @@ def test_concurrent_age_checks_start_exactly_one_refresh(tmp_path) -> None:
     [t.start() for t in threads]
     [t.join() for t in threads]
     backend.gate.set()
-    assert _wait_until(lambda: mgr.artifact != old)
+    _swap(mgr)
     time.sleep(0.1)
-    assert len(backend.boots) == 2                # the original build + ONE refresh
+    assert mgr.artifact != old
+    assert backend.attempts == 2                  # the original build + ONE refresh
     assert mgr.is_built()
 
 
-def test_an_invalidate_during_a_refresh_wins(tmp_path) -> None:
-    """A pool repair landing mid-refresh must not be overwritten by the stale replacement."""
-    backend = DistinctBackend()
-    mgr, _ = _built(tmp_path, max_age_s=60.0, backend=backend)    # artifact-0
+def _mid_refresh(tmp_path, **kw):
+    """A refresh that has sampled its epoch and is blocked inside boot_base()."""
+    backend = kw.pop("backend", None) or DistinctBackend()
+    mgr, _ = _built(tmp_path, max_age_s=60.0, backend=backend, **kw)    # artifact-0
+    backend.entered.clear()
     backend.gate = threading.Event()
     _age(mgr, 61.0)
-    mgr.ensure_build_started()                   # refresh boots artifact-1, held at the gate
-    assert _wait_until(lambda: len(backend.boots) == 2 or backend.gate is not None)
-    mgr.invalidate()                              # the pool convicts the base meanwhile
+    mgr.ensure_build_started()
+    assert backend.entered.wait(5)
+    return mgr, backend
+
+
+def test_an_invalidate_mid_refresh_adopts_the_refresh_as_its_repair(tmp_path) -> None:
+    """The refresh is a FRESH boot, exactly what the repair would build. Rejecting it left the
+    tier cold for the rest of the refresh (the repair build could not start behind it) and then
+    for a whole second build."""
+    ack = AckCapability(artifact_scoped=True)
+    backend = DistinctBackend()
+    backend.ack = ack
+    mgr, _ = _mid_refresh(tmp_path, backend=backend, ack_capable=ack)
+    epoch0 = mgr.build_epoch
+    assert mgr.invalidate() is True               # the pool convicts the base meanwhile
+    assert not mgr.is_built()
     backend.gate.set()
-    time.sleep(0.2)
-    assert mgr.artifact != "artifact-1"          # the staged build was NOT published
+    assert _wait_until(mgr.is_built)
+    assert mgr.artifact == "artifact-1"           # published directly: the pool already repaired
+    assert backend.attempts == 2                  # no second build
+    assert mgr.build_epoch == epoch0 + 1
+    assert ack.capable_for(mgr.build_epoch)       # observed under the epoch it now carries
+    assert mgr.take_repaired() is False           # the pool's own invalidate advanced the ledger
+
+
+def test_a_second_invalidate_mid_refresh_rejects_it(tmp_path) -> None:
+    mgr, backend = _mid_refresh(tmp_path)
+    mgr.invalidate()
+    mgr.invalidate()                              # the base convicted AGAIN: refresh is stale
+    backend.gate.set()
+    assert _wait_until(lambda: not mgr._build_thread.is_alive())
+    assert not mgr.is_built()
     backend.gate = None
     mgr.ensure_build_started()
     assert _wait_until(mgr.is_built)
-    assert mgr.artifact not in ("artifact-0", "artifact-1")
+    assert mgr.artifact == "artifact-2"
+
+
+def test_an_invalidate_of_a_staged_refresh_discards_it(tmp_path) -> None:
+    """The pool convicted the base and bumps its generation itself; the staged artifact is not
+    trusted to appear under the pool's feet in the gap between its generation read and a spawn."""
+    mgr, backend = _built(tmp_path, max_age_s=60.0)
+    _age(mgr, 61.0)
+    mgr.ensure_build_started()
+    _stage(mgr)
+    mgr.invalidate()
+    assert mgr._staged is None
+    assert mgr.take_repaired() is False
+    mgr.ensure_build_started()
+    assert _wait_until(mgr.is_built)
+    assert mgr.artifact == "artifact-2"
+
+
+def test_build_waits_for_a_live_refresh_instead_of_racing_it(tmp_path) -> None:
+    """A second _build overlapping the adopted refresh shares its epoch: begin_build() of one
+    erased the other's ACK observation, and a stale observation could certify the other base."""
+    mgr, backend = _mid_refresh(tmp_path)
+    mgr.invalidate()
+    got: list[object] = []
+    t = threading.Thread(target=lambda: got.append(mgr.build()))
+    t.start()
+    time.sleep(0.1)
+    backend.gate.set()
+    t.join(5)
+    assert got == ["artifact-1"]
+    assert backend.attempts == 2
+
+
+def test_a_refresh_retries_undead_bases_first(tmp_path, monkeypatch) -> None:
+    """A full, idle pool never calls acquire_built(), so a refresh is the only build path that
+    runs -- and each failed one could park another live base sandbox."""
+    mgr, _ = _built(tmp_path, max_age_s=60.0)
+    retried: list[str] = []
+    real = mgr._retry_undead_bases
+    monkeypatch.setattr(mgr, "_retry_undead_bases",
+                        lambda: retried.append(threading.current_thread().name) or real())
+    _age(mgr, 61.0)
+    mgr.ensure_build_started()
+    _stage(mgr)
+    assert "warm-snapshot-refresh" in retried
 
 
 def test_a_swap_is_reported_to_the_pool_exactly_once(tmp_path) -> None:
     mgr, _ = _built(tmp_path, max_age_s=60.0)
     assert mgr.take_repaired() is False           # the first build is not a repair
-    old = mgr.artifact
     _age(mgr, 61.0)
     mgr.ensure_build_started()
-    assert _wait_until(lambda: mgr.artifact != old)
-    assert mgr.take_repaired() is True
+    _swap(mgr)
     assert mgr.take_repaired() is False
 
 
@@ -225,12 +340,13 @@ def test_a_swap_gives_the_new_base_its_own_epoch_and_ack(tmp_path) -> None:
     mgr.restore("old-slot")
     assert mgr._pin_epoch["old-slot"] == old_epoch
     assert ack.capable_for(old_epoch)
-    old = mgr.artifact
     _age(mgr, 61.0)
     mgr.ensure_build_started()
-    assert _wait_until(lambda: mgr.artifact != old)
+    _stage(mgr)
+    assert ack.capable_for(old_epoch)             # staged is not published: old stays current
+    assert mgr.take_repaired() is True
     new_epoch = mgr.build_epoch
-    assert new_epoch != old_epoch
+    assert new_epoch == old_epoch + 1
     assert ack.capable_for(new_epoch)             # the replacement's own advertisement
     assert not ack.capable_for(old_epoch)         # old slots read UNKNOWN, which convicts nothing
     assert mgr._pin_epoch["old-slot"] == old_epoch
@@ -242,40 +358,72 @@ def test_the_superseded_generation_is_retired_not_pulled_from_a_live_slot(tmp_pa
     old = mgr.artifact
     _age(mgr, 61.0)
     mgr.ensure_build_started()
-    assert _wait_until(lambda: mgr.artifact != old)
+    _swap(mgr)
     assert backend.restores[0].artifact == old
     assert id(old) in mgr._retired
+
+
+# --- the ceiling -----------------------------------------------------------------------------
+
+
+def test_past_the_ceiling_a_base_whose_refresh_keeps_failing_is_invalidated(tmp_path) -> None:
+    """Keeping a base alive is right below the ceiling; past it, restores hang every job at the
+    worker timeout, which is worse than the pool's cold fallback."""
+    backend = DistinctBackend()
+    mgr, _ = _built(tmp_path, max_age_s=60.0, backend=backend)
+    backend.fail_always = True
+    _age(mgr, 119.0)
+    mgr.ensure_build_started()
+    assert _wait_until(lambda: backend.attempts == 2)
+    assert _wait_until(lambda: not mgr._build_thread.is_alive())
+    assert mgr.is_built()                         # below the ceiling: keep serving
+    _age(mgr, 2.0)                                # 121s > 2 x 60s
+    mgr.ensure_build_started()
+    assert not mgr.is_built()
+    assert mgr.take_repaired() is True            # the pool retires the old generation's slots
+    backend.fail_always = False
+    mgr._retry_not_before = 0.0
+    mgr.ensure_build_started()
+    assert _wait_until(mgr.is_built)
+
+
+def test_a_refresh_still_running_at_the_ceiling_becomes_the_repair(tmp_path) -> None:
+    mgr, backend = _mid_refresh(tmp_path)
+    _age(mgr, 60.0)                               # 121s: the refresh is still booting
+    mgr.ensure_build_started()
+    assert not mgr.is_built()
+    backend.gate.set()
+    assert _wait_until(mgr.is_built)
+    assert mgr.artifact == "artifact-1"
+    assert backend.attempts == 2
 
 
 # --- idle slots ------------------------------------------------------------------------------
 
 
-def test_slots_retire_only_once_a_newer_base_exists_and_their_checkpoint_is_old(tmp_path) -> None:
-    backend = DistinctBackend()
-    mgr, _ = _built(tmp_path, max_age_s=60.0, backend=backend)
-    mgr.restore("old")
-    _age(mgr, 61.0)
-    # Aged, but no replacement yet: keep serving rather than retire into a void.
-    backend.gate = threading.Event()
-    mgr.ensure_build_started()
-    assert mgr.slot_should_retire("old") is False
-    old = mgr.artifact
-    backend.gate.set()
-    assert _wait_until(lambda: mgr.artifact != old)
-    mgr.restore("new")
-    assert mgr.slot_should_retire("old") is True    # superseded AND its checkpoint is old
-    assert mgr.slot_should_retire("new") is False
+def test_slots_retire_by_checkpoint_age_not_restore_age(tmp_path) -> None:
+    """A slot restored late in its base's life is as old as the CHECKPOINT, not its restore."""
+    mgr, _ = _built(tmp_path, max_age_s=60.0)
+    _age(mgr, 50.0)
+    mgr.restore("late")                           # restored now, from a 50s-old checkpoint
+    _age(mgr, 69.0)
+    assert mgr.slot_should_retire("late") is False    # checkpoint 119s old
+    _age(mgr, 2.0)
+    assert mgr.slot_should_retire("late") is True     # 121s: past 2 x max-age, restored 71s ago
     assert mgr.slot_should_retire("never-seen") is False
 
 
-def test_a_young_superseded_slot_is_not_retired_by_age(tmp_path) -> None:
-    """A pool repair supersedes a young base; that is the pool's business, not the age limit's."""
-    mgr, _ = _built(tmp_path, max_age_s=3600.0)
-    mgr.restore("young")
-    mgr.invalidate()
+def test_a_swap_does_not_mass_retire_idle_slots_below_the_ceiling(tmp_path) -> None:
+    """Retiring every idle slot at the swap emptied the claimable pool at once for slots that
+    were still well inside the safe window; they turn over on use."""
+    mgr, _ = _built(tmp_path, max_age_s=60.0)
+    mgr.restore("old")
+    _age(mgr, 61.0)
     mgr.ensure_build_started()
-    assert _wait_until(mgr.is_built)
-    assert mgr.slot_should_retire("young") is False
+    _swap(mgr)
+    mgr.restore("new")
+    assert mgr.slot_should_retire("old") is False
+    assert mgr.slot_should_retire("new") is False
 
 
 def test_zero_disables_everything(tmp_path) -> None:
@@ -284,7 +432,8 @@ def test_zero_disables_everything(tmp_path) -> None:
     _age(mgr, 10 * 24 * 3600.0)
     mgr.ensure_build_started()
     time.sleep(0.05)
-    assert len(backend.boots) == 1
+    assert backend.attempts == 1
+    assert mgr.is_built()
     assert mgr.slot_should_retire("s") is False
 
 
@@ -338,27 +487,37 @@ def test_runtime_reports_a_swap_as_a_repair_of_its_base(which) -> None:
     assert rt.take_repaired_tiers() == []
 
 
-def test_the_pool_advances_the_generation_on_a_swap() -> None:
-    """End to end through the pool's own drain: old-generation failures stop counting."""
+def test_the_pool_drain_retires_the_old_bases_evidence_with_its_generation() -> None:
+    """Advancing the generation only filters failures reported AFTER the drain. Evidence the aged
+    base had already accumulated survived into its replacement, so two old-slot pre-guest hangs
+    plus ONE from the fresh base convicted the base the refresh had just built."""
     from blastbox.host.pool import WarmPool
 
     mgr = _Mgr()
     rt = _runtimes(mgr)[0]
     pool = WarmPool(runtime=rt, warm_size=0, concurrent_ceiling=1)
     before = pool._base_generation.get("", 0)
+    pool._pool_consecutive_failures[""] = 2
+    pool._pool_pre_guest_failures[""] = {"old-a", "old-b"}
     mgr.repaired = True
     pool._drain_runtime_repairs()
     assert pool._base_generation.get("", 0) == before + 1
+    assert "" not in pool._pool_consecutive_failures
+    assert "" not in pool._pool_pre_guest_failures
 
 
-def test_a_cascade_forwards_its_tiers_own_repairs() -> None:
+def test_a_cascade_forwards_its_tiers_own_repairs_and_clears_their_streak() -> None:
     from blastbox.host.runtime.cascade import CascadingRuntime, Tier
 
     mgr = _Mgr()
     inner = _runtimes(mgr)[0]
     casc = CascadingRuntime([Tier("firecracker", inner, 1)])
     assert casc.take_repaired_tiers() == []
+    casc._tier_failures[0] = 2
+    casc._job_guilty.add(0)
     mgr.repaired = True
     reported = casc.take_repaired_tiers()
     assert reported == [casc._tier_identity(0)]
+    assert casc._tier_failures[0] == 0            # the swapped-out base's streak goes with it
+    assert 0 not in casc._job_guilty
     assert casc.take_repaired_tiers() == []
