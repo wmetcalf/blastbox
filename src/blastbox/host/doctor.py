@@ -407,7 +407,10 @@ def survey_rootfs(paths: Sequence[str]) -> list[Artifact]:
                 runtime=_sanitise(plat.runtime),
                 arch=_sanitise(plat.arch),
                 cpu_vendor=_sanitise(plat.cpu_vendor),
-                image=_sanitise(stamp.image),
+                # Already display-safe (rootfs_stamp sanitises at parse). NOT _sanitise: its
+                # allowlist drops "/" and "@", which turns a digest reference into a name
+                # that points at no image.
+                image=stamp.image,
                 exported_at=_sanitise(stamp.exported_at),
                 detail="" if version else "stamp records no version",
                 project=project,
@@ -425,7 +428,13 @@ def _pairing(spec: str) -> tuple[str, str]:
     # A path that exists as given is a path, however many `=` it contains.
     from pathlib import Path  # noqa: PLC0415
 
-    if Path(spec).exists():
+    try:
+        exists = Path(spec).exists()
+    except OSError:
+        # EACCES / ENAMETOOLONG: unknowable here. Treat as a path; survey_rootfs then reports
+        # the real reason as an UNKNOWN row rather than dying before its own try.
+        return "", spec
+    if exists:
         return "", spec
     head, sep, tail = spec.partition("=")
     if sep and head and "/" not in head and tail:
@@ -527,9 +536,12 @@ def verdict(
         if art.project:
             mine = {_release(c.version) for c in known_c if c.project == art.project}
             if not mine:
+                if docker_error:
+                    continue
                 # Pairing asserts which containers vouch for this rootfs. None found --
                 # scaled to zero, or a project label that could not be read -- is "could not
-                # look", which this command never reports as healthy.
+                # look", which this command never reports as healthy. (With docker down that
+                # is already the one problem; repeating it per rootfs blames the pairing.)
                 problems.append(
                     f"{art.path} is paired with project {art.project}, but no inspectable "
                     "container of that project is running to check it against")

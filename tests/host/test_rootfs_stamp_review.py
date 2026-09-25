@@ -123,6 +123,11 @@ class _FakeDebugfs:
         self.requested += n
         return b"x" * n
 
+    closed = False
+
+    def close(self):
+        self.closed = True
+
     def kill(self):
         self.killed = True
 
@@ -561,7 +566,13 @@ def test_an_empty_ext4_stamp_says_unstamped_not_the_debugfs_banner(tmp_path, mon
 
     class _P:
         def __init__(self, argv, stdout=None, stderr=None, **kw):
-            self.stderr = io.BytesIO(b"debugfs 1.47.0 (5-Feb-2023)\n")
+            banner = b"debugfs 1.47.0 (5-Feb-2023)\n"
+            # Honour whatever stderr the caller chose -- a file (the pre-fix code) or a PIPE --
+            # so this test reproduces the original bug rather than only pinning the new path.
+            if hasattr(stderr, "write"):
+                stderr.write(banner)
+                stderr.flush()
+            self.stderr = io.BytesIO(banner)
             self.stdout = self
             self.returncode = 0
 
@@ -631,3 +642,41 @@ def test_unicode_separators_and_bidi_are_stripped_at_parse() -> None:
         {"blastbox_version": "0.1.40‮ FAKE: ok ⁦​﻿"}))
     assert st.blastbox_version == "0.1.40FAKE: ok"
     assert len(rfs.compare_to_host(st, "0.1.41").splitlines()) == 1
+
+
+def test_an_unreadable_rootfs_path_is_a_row_not_a_crash(monkeypatch) -> None:
+    """survey_rootfs never raises on a bad path; the pairing probe ran before its try."""
+    real = Path.exists
+
+    def denied(self, *a, **k):
+        if str(self).startswith("/denied"):
+            raise PermissionError(13, "Permission denied")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(Path, "exists", denied)
+    got = doctor.survey_rootfs(["/denied/rootfs.ext4", "/also/missing.ext4"])
+    assert [a.known for a in got] == [False, False]
+    assert got[0].path == "/denied/rootfs.ext4"
+
+
+def test_docker_down_does_not_also_blame_every_pairing() -> None:
+    art = doctor.Artifact(path="/r", version="0.1.42", runtime="firecracker",
+                          arch=plat.host_platform().arch, project="clippy")
+    problems = doctor.verdict([], [art], docker_error="permission denied on docker.sock")
+    assert len(problems) == 1 and "docker.sock" in problems[0]
+
+
+def test_an_image_digest_reference_survives_the_survey(tmp_path) -> None:
+    ref = "ghcr.io/x/y@sha256:" + "a" * 64
+    rfs.write_into_tree(tmp_path / "a", _stamp(image=ref, platform={
+        "arch": plat.host_platform().arch, "runtime": "firecracker"}))
+    (art,) = doctor.survey_rootfs([str(tmp_path / "a")])
+    assert art.image == ref
+
+
+def test_debugfs_pipes_are_closed(tmp_path, monkeypatch) -> None:
+    img = _debugfs_env(tmp_path, monkeypatch)
+    with pytest.raises(rfs.RootfsStampError):
+        rfs.read_from_ext4(img)
+    proc = _FakeDebugfs.instances[0]
+    assert proc.closed and proc.stderr.closed

@@ -397,6 +397,13 @@ def _bounded_debugfs(argv: Sequence[str]) -> str:
         proc.wait(timeout=5.0)
     t.join(1.0)
     te.join(1.0)
+    # Close the pipes once nothing reads them, or every probe leaks two fds until GC. A
+    # reader still blocked (a debugfs in D state that ignored the kill) keeps its pipe:
+    # closing a buffered stream under a blocked reader can deadlock on its lock.
+    for stream, reader_thread in ((proc.stdout, t), (proc.stderr, te)):
+        if stream is not None and not reader_thread.is_alive():
+            with contextlib.suppress(Exception):
+                stream.close()
     if timed_out:
         raise RootfsStampError(
             f"debugfs timed out after {DEBUGFS_TIMEOUT_S:.0f}s reading {argv[-1]}"
