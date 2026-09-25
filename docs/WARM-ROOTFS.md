@@ -129,6 +129,14 @@ pool rebuilds the base from the current rootfs. A newer guest than the dispatche
 is refused at boot until the dispatcher is upgraded, so upgrade the dispatcher and
 publish the rootfs together.
 
+**Exports made outside `build-images`.** `deploy/firecracker/build-rootfs.sh` and
+`redeploy-warm.sh`'s legacy rebuild stamp what they export with
+`python -m blastbox.host.rootfs_stamp write TREE IMAGE {firecracker|gvisor}`, which
+records the blastbox the image actually has installed (falling back to its label).
+They need a python that imports a blastbox with this CLI: set `BLASTBOX_PY` to it
+(an absolute path for `redeploy-warm.sh`, which runs it under sudo). Without one
+they warn and publish an unstamped rootfs, which the tiers warn about and boot.
+
 **Survey a host.** `blastbox doctor --rootfs PATH` adds each artifact to the
 container survey; `--json` emits the whole fleet for monitoring, with the same
 exit code as the text report. On a host running several products, pair each

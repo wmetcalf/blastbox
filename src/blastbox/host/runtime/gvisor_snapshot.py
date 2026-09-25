@@ -1166,12 +1166,12 @@ class GvisorSnapshotBackend:
         # A tree replaced since this checkpoint would pair the checkpointed memory with a
         # different filesystem (see rootfs_stamp.RootfsPin). Refused before anything runs.
         from blastbox.host.rootfs_stamp import RootfsStampError
-        from blastbox.host.runtime.fc_snapshot import SnapshotRestoreError
+        from blastbox.host.runtime.fc_snapshot import SnapshotStale
 
         try:
             self._rootfs_pin().check_restore(artifact)
         except RootfsStampError as exc:
-            raise SnapshotRestoreError(str(exc)) from exc
+            raise SnapshotStale(str(exc)) from exc
         wd = Path(slot_workdir)
         _prepare_slot_dirs(self._cfg, wd)
         cid = f"slot-{uuid.uuid4().hex[:12]}"

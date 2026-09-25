@@ -87,6 +87,14 @@ def _restore_left_process_running(exc: BaseException) -> bool:
     return False
 
 
+
+class SnapshotStale(SnapshotRestoreError):
+    """This artifact can never be restored again (its rootfs changed since the checkpoint).
+
+    Not a flaky restore: the manager drops the base at once rather than leave every later
+    spawn to fail until a statistical repair notices."""
+
+
 class SnapshotManager:
     """Builds the warm snapshot once (first-boot), then serves restores to the pool.
 
@@ -661,6 +669,17 @@ class SnapshotManager:
                 _keep_workdir = True
             if not _keep_workdir:
                 shutil.rmtree(slot_workdir, ignore_errors=True)
+            if isinstance(exc, SnapshotStale):
+                # CERTAIN, not statistical: every later restore of this artifact fails the same
+                # way. Waiting for the pool's repair drained the warm tier to zero -- and inside
+                # its rebuild cooldown, or with repair disabled, never recovered at all. Only if
+                # it is still the current artifact: a concurrent rebuild may already have won.
+                with self._build_lock:
+                    still_current = self._artifact is artifact
+                if still_current:
+                    _log.error("snapshot.stale_base_dropped: %s -- rebuilding from the current "
+                               "rootfs", exc)
+                    self.invalidate()
             raise
         except BaseException as exc:
             _keep_workdir = False

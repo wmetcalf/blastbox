@@ -51,7 +51,10 @@ echo ">> export rootfs -> $rootdir"
 # script is the hotfix path, where host/guest drift is most likely. BLASTBOX_PY names a python
 # that can import blastbox (default: python3).
 echo ">> stamp rootfs (image provenance)"
-if ! "${BLASTBOX_PY:-python3}" -m blastbox.host.rootfs_stamp write "$rootdir" "$TAG" firecracker; then
+# Verified by the FILE, not the exit status: a blastbox older than this CLI imports the module
+# and exits 0 having written nothing.
+if ! "${BLASTBOX_PY:-python3}" -m blastbox.host.rootfs_stamp write "$rootdir" "$TAG" firecracker \
+   || [ ! -s "$rootdir/opt/blastbox/rootfs-stamp.json" ]; then
     echo "!! could not stamp the rootfs (is blastbox importable by ${BLASTBOX_PY:-python3}?)." >&2
     echo "!! It will boot UNCHECKED against its host; rebuild with \`blastbox build-images\`." >&2
 fi

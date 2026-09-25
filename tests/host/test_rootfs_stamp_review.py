@@ -747,3 +747,52 @@ def test_both_legacy_export_scripts_stamp_what_they_export() -> None:
     root = Path(__file__).resolve().parents[2]
     for script in ("deploy/firecracker/build-rootfs.sh", "deploy/redeploy-warm.sh"):
         assert "-m blastbox.host.rootfs_stamp write" in (root / script).read_text(), script
+
+
+def test_stamp_tree_falls_back_to_the_label_for_any_non_version(tmp_path, monkeypatch) -> None:
+    """The probe answers sentinels like NOPKG; stamping one made every host refuse the rootfs
+    while the deploy script reported success."""
+    from blastbox.host import stamp as st
+
+    monkeypatch.setattr(doctor, "version_in_image", lambda image, runner=None: ("NOPKG", ""))
+
+    def run(argv, **kw):
+        out = (json.dumps({st.LABEL_BLASTBOX: "0.1.42"}) if "{{json .Config.Labels}}" in argv
+               else "amd64\n")
+        return subprocess.CompletedProcess(list(argv), 0, out, "")
+
+    rfs.stamp_tree(tmp_path, "eng-fc:1", "firecracker", run=run)
+    assert rfs.read_from_dir(tmp_path).blastbox_version == "0.1.42"
+
+
+def test_stamp_tree_bounds_every_docker_call(tmp_path, monkeypatch) -> None:
+    seen: list = []
+    monkeypatch.setattr(doctor, "version_in_image", lambda image, runner=None: ("0.1.42", ""))
+    monkeypatch.setattr(rfs.subprocess, "run", lambda argv, **kw: seen.append(kw) or
+                        subprocess.CompletedProcess(argv, 0, "{}", ""))
+    rfs.stamp_tree(tmp_path, "eng-fc:1", "firecracker")
+    assert seen and all(kw.get("timeout") for kw in seen)
+
+
+def test_stamp_tree_keeps_a_revision_only_when_the_label_describes_this_build(tmp_path,
+                                                                            monkeypatch) -> None:
+    """A derived image inherits its base's labels; their revision is not this build's."""
+    from blastbox.host import stamp as st
+
+    monkeypatch.setattr(doctor, "version_in_image", lambda image, runner=None: ("0.1.43", ""))
+
+    def run(argv, **kw):
+        out = (json.dumps({st.LABEL_BLASTBOX: "0.1.42", st.LABEL_REVISION: "a" * 40})
+               if "{{json .Config.Labels}}" in argv else "amd64\n")
+        return subprocess.CompletedProcess(list(argv), 0, out, "")
+
+    rfs.stamp_tree(tmp_path, "eng-fc:1", "firecracker", run=run)
+    assert rfs.read_from_dir(tmp_path).revision == ""
+
+
+def test_the_legacy_scripts_verify_the_stamp_was_written() -> None:
+    """An older blastbox without this CLI imports the module and exits 0 having written
+    nothing; the exit status alone cannot be trusted."""
+    root = Path(__file__).resolve().parents[2]
+    for script in ("deploy/firecracker/build-rootfs.sh", "deploy/redeploy-warm.sh"):
+        assert "opt/blastbox/rootfs-stamp.json" in (root / script).read_text(), script

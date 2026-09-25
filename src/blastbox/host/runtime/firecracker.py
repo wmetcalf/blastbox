@@ -1229,6 +1229,31 @@ class FirecrackerSlotRuntime:
                 with self._stranded_lock:
                     self._stranded_scratch.append(path)   # still stuck; retry next spawn
 
+    def _guest_problem(self) -> str:
+        """The cached rootfs guest check (one stat per call; re-read on a republish)."""
+        gate = getattr(self, "_guest_gate", None)
+        rootfs = getattr(self._cfg, "fc_rootfs", "") or ""
+        if gate is None and rootfs:
+            from blastbox.host.rootfs_stamp import GuestGate
+
+            gate = self._guest_gate = GuestGate(rootfs, "firecracker")
+        return gate.problem() if gate is not None else ""
+
+    def prepare(self) -> bool:
+        """Whether this tier can spawn this tick -- False while the rootfs guest is refused.
+
+        Refusing only inside spawn() spun the pool's spawn loop at the token-bucket rate with a
+        traceback per attempt (~690k error lines a day); "not ready" is the pool's quiet no.
+        Logged once per distinct refusal."""
+        problem = self._guest_problem()
+        self._refused_logged: str | None
+        if problem and getattr(self, "_refused_logged", None) != problem:
+            self._refused_logged = problem
+            _log.error("firecracker tier not ready: %s", problem)
+        elif not problem:
+            self._refused_logged = None
+        return not problem
+
     def spawn(self) -> Slot:
         """Create a scratch dir, write fc-config.json, launch Firecracker.
 
@@ -1243,26 +1268,20 @@ class FirecrackerSlotRuntime:
         """
         import uuid
 
-        # The GUEST, on every spawn: this tier boots the rootfs fresh each time, and a rootfs
-        # republished in place since tier selection would otherwise boot unchecked and time
-        # out every job. Cached on the file's identity, so it costs one stat() per spawn.
-        gate = getattr(self, "_guest_gate", None)
-        rootfs = getattr(self._cfg, "fc_rootfs", "") or ""
-        if gate is None and rootfs:
-            from blastbox.host.rootfs_stamp import GuestGate
-
-            gate = self._guest_gate = GuestGate(rootfs, "firecracker")
-        if gate is not None:
-            problem = gate.problem()
-            if problem:
-                from blastbox.host.rootfs_stamp import RootfsStampError
-
-                raise RootfsStampError(problem)
-
         # BEFORE anything else: retry scratch dirs whose cleanup failed on an earlier spawn.
         # A storage incident that stops mkfs also stops the rmtree that follows it, and
         # nothing else in this tier would ever come back for them.
         self._sweep_stranded_scratch()
+
+        # The GUEST, on every spawn -- AFTER the sweep, which must run whatever else refuses.
+        # This tier boots the rootfs fresh each time, and one republished in place since tier
+        # selection would otherwise boot unchecked and time out every job. prepare() reports
+        # the same verdict to the pool first, so a refusal here is the backstop, not the path.
+        problem = self._guest_problem()
+        if problem:
+            from blastbox.host.rootfs_stamp import RootfsStampError
+
+            raise RootfsStampError(problem)
 
         slot_id = str(uuid.uuid4())
         slot_dir = self._scratch_root / slot_id

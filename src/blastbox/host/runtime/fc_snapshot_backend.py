@@ -28,7 +28,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
-from blastbox.host.runtime.fc_snapshot import SnapshotBuildError, SnapshotRestoreError
+from blastbox.host.runtime.fc_snapshot import (
+    SnapshotBuildError,
+    SnapshotRestoreError,
+    SnapshotStale,
+)
 
 _log = logging.getLogger("blastbox.host.runtime.fc_snapshot_backend")
 
@@ -285,7 +289,7 @@ class FcSnapshotBackend:
             try:
                 pin.check_restore(artifact)
             except RootfsStampError as exc:
-                raise SnapshotRestoreError(str(exc)) from exc
+                raise SnapshotStale(str(exc)) from exc
         handle = self._launcher.restore_in(slot_workdir, outdisk_src=artifact.outdisk_path)
         try:
             _restore_from_snapshot(

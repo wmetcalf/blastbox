@@ -58,9 +58,20 @@ MAX_STAMP_BYTES = 64 * 1024
 #: debugfs on a malformed filesystem can spin; the probe must not.
 DEBUGFS_TIMEOUT_S = 30.0
 
+#: Each docker call stamp_tree makes (inspect, and the in-image version probe).
+STAMP_TREE_TIMEOUT_S = 120.0
+
 
 class RootfsStampError(RuntimeError):
     """The rootfs stamp could not be written, read, or trusted."""
+
+
+class RootfsUnstamped(RootfsStampError):
+    """The rootfs carries no stamp at all -- a definitive answer, unlike a failed read."""
+
+
+class RootfsStale(RootfsStampError):
+    """The rootfs changed since a snapshot was checkpointed against it."""
 
 
 @dataclass(frozen=True)
@@ -257,7 +268,7 @@ def read_from_dir(tree: Path | str) -> RootfsStamp:
     path = tree / STAMP_PATH
     _refuse_links(tree, STAMP_PATH)
     if not path.exists() and not path.is_symlink():
-        raise RootfsStampError(f"{path} is missing: this rootfs is unstamped")
+        raise RootfsUnstamped(f"{path} is missing: this rootfs is unstamped")
     # Regular files only, and opened so that nothing else can block or act: a FIFO blocks
     # open() forever (gVisor tier selection never returns), and opening a device node can
     # have side effects on the HOST. lstat first, O_NONBLOCK so a swapped-in FIFO cannot
@@ -266,7 +277,7 @@ def read_from_dir(tree: Path | str) -> RootfsStamp:
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError as exc:
-        raise RootfsStampError(f"{path} is missing: this rootfs is unstamped") from exc
+        raise RootfsUnstamped(f"{path} is missing: this rootfs is unstamped") from exc
     except OSError as exc:
         raise RootfsStampError(f"cannot read {path}: {exc}") from exc
     with os.fdopen(fd, "rb") as fh:
@@ -310,7 +321,7 @@ def read_from_ext4(image: Path | str, *, run: Runner | None = None) -> RootfsSta
     # code alone cannot be trusted here.
     body = _bounded(out, image).strip()
     if not body:
-        raise RootfsStampError(
+        raise RootfsUnstamped(
             f"{image} carries no {STAMP_PATH}: it was exported by something that "
             "did not stamp it (a hand-run `docker export`, or a blastbox older "
             "than this check). Rebuild it with `blastbox build-images`."
@@ -419,6 +430,11 @@ def _bounded_debugfs(argv: Sequence[str]) -> str:
 
 
 def guest_problem(rootfs: str, runtime: str) -> str:
+    """Why this host must not boot ``rootfs`` on ``runtime``, or "" when it may."""
+    return guest_verdict(rootfs, runtime)[0]
+
+
+def guest_verdict(rootfs: str, runtime: str) -> tuple[str, bool]:
     """Why this host must not boot ``rootfs`` on ``runtime``, or "" when it may.
 
     Shared by both warm tiers. An unstamped or unreadable rootfs WARNS and returns "" --
@@ -426,13 +442,19 @@ def guest_problem(rootfs: str, runtime: str) -> str:
     exported before stamping existed.
     """
     import logging
-    from importlib.metadata import PackageNotFoundError, version
-
     from blastbox.host import platform_id as _plat
 
     log = logging.getLogger("blastbox.host.rootfs_stamp")
     try:
         stamp = read(rootfs)
+    except RootfsUnstamped as exc:
+        log.warning(
+            "rootfs %s carries no blastbox stamp (%s); booting it anyway. "
+            "Rebuild it with `blastbox build-images` so guest/host drift is caught "
+            "here instead of as a timeout on every warm job.",
+            rootfs, exc,
+        )
+        return "", True        # definitively unstamped: nothing to re-read until it changes
     except RootfsStampError as exc:
         log.warning(
             "rootfs %s carries no readable blastbox stamp (%s); booting it anyway. "
@@ -440,29 +462,33 @@ def guest_problem(rootfs: str, runtime: str) -> str:
             "here instead of as a timeout on every warm job.",
             rootfs, exc,
         )
-        return ""
+        return "", False       # could NOT look: allowed, but must be looked at again
     except Exception as exc:  # noqa: BLE001 - never fail the tier on a diagnostic
         log.warning("could not read the rootfs stamp on %s: %s", rootfs, exc)
-        return ""
-    try:
-        host = version("blastbox")
-    except PackageNotFoundError:  # pragma: no cover
-        return ""
+        return "", False
+    # The RUNNING code's version, fixed at import -- not importlib.metadata, which re-reads
+    # dist-info from disk: a pip upgrade under a live dispatcher would otherwise admit a guest
+    # newer than the code actually serving it.
+    import blastbox
+
+    host = str(getattr(blastbox, "__version__", "") or "")
+    if not host:  # pragma: no cover
+        return "", False
     # The MACHINE, before the software: saying "wrong blastbox" about an aarch64 rootfs
     # on an x86_64 host sends the operator after the wrong thing.
     findings = _plat.compare(platform_of(stamp), _plat.host_platform(runtime=runtime))
     fatal = _plat.refusals(findings)
     if fatal:
-        return f"{rootfs}: {_plat.summarise(fatal)}"
+        return f"{rootfs}: {_plat.summarise(fatal)}", True
     complaint = compare_to_host(stamp, host)
     if complaint:
         return (
             f"{rootfs}: {complaint} Rebuild the rootfs with `blastbox build-images` "
             f"(the stamp says image={stamp.image or '?'} "
             f"exported_at={stamp.exported_at or '?'})."
-        )
+        ), True
     log.info("rootfs %s guest blastbox %s matches this host", rootfs, stamp.blastbox_version)
-    return ""
+    return "", True
 
 
 def file_identity(path: Path | str) -> "tuple[int, ...] | None":
@@ -476,14 +502,18 @@ def file_identity(path: Path | str) -> "tuple[int, ...] | None":
         st = os.stat(path)
     except OSError:
         return None
-    key: tuple[int, ...] = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
     if _stat.S_ISDIR(st.st_mode):
+        # A directory's own size/mtime move when anything inside is created -- `runsc run`
+        # makes /in, /out and /ctrl in a bare tree -- so only its inode (a republish moves a
+        # new tree into place) and the stamp file's own identity count.
+        key: tuple[int, ...] = (st.st_dev, st.st_ino)
         try:
             sst = os.lstat(Path(path) / STAMP_PATH)
             key += (sst.st_ino, sst.st_size, sst.st_mtime_ns)
         except OSError:
             key += (-1,)
-    return key
+        return key
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
 
 
 class GuestGate:
@@ -503,16 +533,23 @@ class GuestGate:
         self._problem = ""
 
     def problem(self) -> str:
+        return self.checked()[0]
+
+    def checked(self) -> "tuple[str, tuple[int, ...] | None]":
+        """(problem, the identity that verdict is for). Only a DEFINITIVE verdict -- a stamp
+        read, or genuinely absent -- is cached: a failed read (a debugfs timeout on a cold,
+        freshly published image) cached as "" switched the check off for that file for good."""
         key = file_identity(self.rootfs)
         if key is None:
-            return ""          # a missing rootfs fails loudly at boot; not this check's job
+            return "", None    # a missing rootfs fails loudly at boot; not this check's job
         with self._lock:
             if key == self._key:
-                return self._problem
-        found = guest_problem(self.rootfs, self.runtime)
-        with self._lock:
-            self._key, self._problem = key, found
-        return found
+                return self._problem, key
+        found, definitive = guest_verdict(self.rootfs, self.runtime)
+        if definitive:
+            with self._lock:
+                self._key, self._problem = key, found
+        return found, key
 
 
 class RootfsPin:
@@ -539,10 +576,17 @@ class RootfsPin:
         return str(getattr(artifact, "snapshot_path", artifact))
 
     def before_boot(self) -> "tuple[int, ...] | None":
-        problem = self.gate.problem()
+        problem, key = self.gate.checked()
         if problem:
             raise RootfsStampError(problem)
-        return file_identity(self.gate.rootfs)
+        # The identity pinned must be the one that was CHECKED. A republish landing between
+        # the check and a second stat would pin a file the gate never looked at.
+        if file_identity(self.gate.rootfs) != key:
+            raise RootfsStampError(
+                f"{self.gate.rootfs} changed while it was being checked; the next build "
+                "checks the new one"
+            )
+        return key
 
     def wrap(self, boot: object, key: "tuple[int, ...] | None") -> object:
         return _PinnedBoot(boot, key, self)
@@ -557,7 +601,7 @@ class RootfsPin:
                 return         # not built by this process (or before pinning): nothing to compare
             key = self._keys[self._akey(artifact)]
         if key is not None and file_identity(self.gate.rootfs) != key:
-            raise RootfsStampError(
+            raise RootfsStale(
                 f"{self.gate.rootfs} changed since this snapshot was checkpointed; restoring "
                 "it would pair the old memory image with a different disk. The base must be "
                 "rebuilt from the current rootfs."
@@ -598,18 +642,28 @@ def stamp_tree(tree: Path | str, image: str, runtime: str, *, run: Runner | None
     from blastbox.host.stamp import UNKNOWN, read as read_image_stamp  # noqa: PLC0415
 
     def runner(argv: Sequence[str]) -> "subprocess.CompletedProcess[str]":
+        # BOUNDED: the probe runs the image being stamped, and a hung image or daemon must not
+        # hang a deploy script forever.
         if run is not None:
-            return run(list(argv), capture_output=True, text=True)
-        return subprocess.run(list(argv), capture_output=True, text=True, check=False)
+            return run(list(argv), capture_output=True, text=True, timeout=STAMP_TREE_TIMEOUT_S)
+        return subprocess.run(list(argv), capture_output=True, text=True, check=False,
+                              timeout=STAMP_TREE_TIMEOUT_S)
 
     from blastbox.host.doctor import version_in_image  # noqa: PLC0415
 
     labels = read_image_stamp(image, runner)
     # What the image ACTUALLY has installed is the truth; the label is a self-report, and the
     # legacy scripts build with a plain `docker build` that writes no labels at all.
-    installed, detail = version_in_image(image, runner)
-    version = installed if installed not in ("", UNKNOWN) else labels.blastbox
-    if version in ("", UNKNOWN):
+    try:
+        installed, detail = version_in_image(image, runner)
+    except subprocess.TimeoutExpired:
+        installed, detail = UNKNOWN, f"probe timed out after {STAMP_TREE_TIMEOUT_S:.0f}s"
+    # Only a real VERSION counts: the probe answers sentinels (NOPKG, UNKNOWN), and stamping one
+    # makes every host refuse the rootfs while the deploy script reports success.
+    installed_ok = _is_version(installed)
+    label_ok = _is_version(labels.blastbox)
+    version = installed if installed_ok else (labels.blastbox if label_ok else "")
+    if not version:
         raise RootfsStampError(
             f"{image} has no blastbox version: nothing installed ({detail or 'unreadable'}) and "
             "no org.blastbox.version label; a rootfs stamped without one cannot be checked "
@@ -625,11 +679,30 @@ def stamp_tree(tree: Path | str, image: str, runtime: str, *, run: Runner | None
         blastbox_version=version,
         image=image,
         image_id=inspect("{{.Id}}"),
-        revision="" if labels.revision in ("", UNKNOWN) else labels.revision,
+        # The label's revision describes the build that WROTE the label. A derived image
+        # inherits its base's labels, so keep it only when the label speaks for this build.
+        revision=(labels.revision if labels.revision not in ("", UNKNOWN) and label_ok and (
+            not installed_ok or _same_release_str(installed, labels.blastbox)) else ""),
         exported_at=now_iso(),
         platform={"arch": _DOCKER_ARCH.get(arch_raw, arch_raw), "runtime": runtime},
     )
     return write_into_tree(tree, stamp)
+
+
+def _is_version(value: str) -> bool:
+    from packaging.version import InvalidVersion, Version  # noqa: PLC0415
+
+    try:
+        Version((value or "").split("+", 1)[0])
+    except InvalidVersion:
+        return False
+    return bool(value)
+
+
+def _same_release_str(a: str, b: str) -> bool:
+    from blastbox.host.stamp import _same_release  # noqa: PLC0415
+
+    return _same_release(a.split("+", 1)[0], b.split("+", 1)[0])
 
 
 def main(argv: Sequence[str]) -> int:
@@ -655,6 +728,9 @@ def _default_runner(
 __all__ = [
     "DEBUGFS_TIMEOUT_S",
     "GuestGate",
+    "RootfsStale",
+    "RootfsUnstamped",
+    "guest_verdict",
     "RootfsPin",
     "file_identity",
     "MAX_STAMP_BYTES",
