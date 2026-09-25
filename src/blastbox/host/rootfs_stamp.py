@@ -546,10 +546,13 @@ class GuestGate:
             if key == self._key:
                 return self._problem, key
         found, definitive = guest_verdict(self.rootfs, self.runtime)
-        if definitive:
+        # Cached only if the file did not change DURING the read: otherwise this verdict may
+        # describe a different file than the identity it would be stored under.
+        after = file_identity(self.rootfs)
+        if definitive and after == key:
             with self._lock:
                 self._key, self._problem = key, found
-        return found, key
+        return found, key          # the identity the check STARTED from; callers re-stat
 
 
 class RootfsPin:

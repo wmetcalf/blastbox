@@ -300,3 +300,25 @@ def test_the_plain_fc_gate_runs_after_the_stranded_scratch_sweep(tmp_path, monke
     with pytest.raises(rfs.RootfsStampError):
         rt.spawn()
     assert swept == [1]
+
+
+def test_a_verdict_read_across_a_republish_is_not_cached(tmp_path, monkeypatch) -> None:
+    """The identity was sampled BEFORE the read: a republish mid-read cached file B's verdict
+    under file A's identity."""
+    f = tmp_path / "rootfs.ext4"
+    f.write_bytes(b"one")
+    calls: list[int] = []
+
+    def verdict(path, runtime):
+        calls.append(1)
+        if len(calls) == 1:
+            _replace(f, b"two")                   # republished while this read ran
+        return "", True
+
+    monkeypatch.setattr(rfs, "guest_verdict", verdict)
+    gate = rfs.GuestGate(str(f), "firecracker")
+    gate.problem()
+    assert gate._key is None                      # nothing cached for a file that moved
+    gate.problem()
+    assert len(calls) == 2
+    assert gate._key == rfs.file_identity(f)      # a stable read IS cached
