@@ -87,6 +87,14 @@ def _restore_left_process_running(exc: BaseException) -> bool:
     return False
 
 
+
+class SnapshotStale(SnapshotRestoreError):
+    """This artifact can never be restored again (its rootfs changed since the checkpoint).
+
+    Not a flaky restore: the manager drops the base at once rather than leave every later
+    spawn to fail until a statistical repair notices."""
+
+
 class SnapshotManager:
     """Builds the warm snapshot once (first-boot), then serves restores to the pool.
 
@@ -498,7 +506,7 @@ class SnapshotManager:
                 exc.attempt_epoch = epoch          # type: ignore[attr-defined]
             raise
 
-    def invalidate(self) -> bool:
+    def invalidate(self, *, only_if: object | None = None) -> bool:
         """Discard the built artifact so the next ``build()`` captures a fresh one.
 
         The warm base is checkpointed from a live sandbox, so it can capture a guest that was
@@ -510,6 +518,11 @@ class SnapshotManager:
         invalidation must not take down the caller's failure-handling path.
         """
         with self._build_lock:
+            # CHECK AND ACT IN ONE HOLD. `only_if` names the artifact the caller found wrong: if it
+            # has already been superseded, this is a no-op -- two concurrent stale restores
+            # otherwise both invalidated, and the second rejected the first's replacement build.
+            if only_if is not None and self._artifact is not only_if:
+                return False
             had = self._artifact is not None
             self._build_epoch += 1        # reject any build already in flight
             collect = None
@@ -661,6 +674,14 @@ class SnapshotManager:
                 _keep_workdir = True
             if not _keep_workdir:
                 shutil.rmtree(slot_workdir, ignore_errors=True)
+            if isinstance(exc, SnapshotStale):
+                # CERTAIN, not statistical: every later restore of this artifact fails the same
+                # way. Waiting for the pool's repair drained the warm tier to zero -- and inside
+                # its rebuild cooldown, or with repair disabled, never recovered at all. Only if
+                # it is still the current artifact: a concurrent rebuild may already have won.
+                if self.invalidate(only_if=artifact):
+                    _log.error("snapshot.stale_base_dropped: %s -- rebuilding from the current "
+                               "rootfs", exc)
             raise
         except BaseException as exc:
             _keep_workdir = False

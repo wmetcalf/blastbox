@@ -1001,6 +1001,7 @@ class GvisorSnapshotBackend:
         shutil.rmtree(path, onerror=lambda fn, p, exc: errors.append(f"{p}: {exc[1]}"))
         if errors:
             raise OSError("could not remove checkpoint generation: " + "; ".join(errors))
+        self._rootfs_pin().forget(artifact)
 
     def __init__(
         self,
@@ -1068,6 +1069,15 @@ class GvisorSnapshotBackend:
         # cold permanently. Same fix as the FC launcher; a retry is worthless if the condition it
         # fixes is what stops you reaching it (upstream, PR #82).
         _retry_stranded_partials(self._stranded_partials)
+        # The rootfs is checked HERE, where it is booted -- not only at tier selection: a tree
+        # republished while the dispatcher runs is otherwise built into a base unchecked.
+        from blastbox.host.rootfs_stamp import RootfsStampError
+        from blastbox.host.runtime.fc_snapshot import SnapshotBuildError
+
+        try:
+            rootfs_key = self._rootfs_pin().before_boot()
+        except RootfsStampError as exc:
+            raise SnapshotBuildError(str(exc)) from exc
         # BEFORE `runsc run` -- see GvisorBootHandle.__init__. The generation that is current when
         # the build STARTS is the one this base can honestly speak for; anything sampled after the
         # launch may already belong to the base that replaced it.
@@ -1131,13 +1141,37 @@ class GvisorSnapshotBackend:
         # No success-path cleanup to do: there is no file. The drain thread keeps consuming
         # and discarding whatever the live sandbox writes, bounded at max_bytes, and ends by
         # itself when the sandbox exits and the last write fd closes.
-        return GvisorBootHandle(self._cfg, self._run, cid, base, ctrl, self._ready,
-                                run_text=self._run_text,
-                                ack_capable=self._ack_capable,
-                                ack_generation=ack_gen,
-                                stranded=self._stranded_partials)
+        return self._rootfs_pin().wrap(  # type: ignore[return-value]
+            GvisorBootHandle(self._cfg, self._run, cid, base, ctrl, self._ready,
+                             run_text=self._run_text,
+                             ack_capable=self._ack_capable,
+                             ack_generation=ack_gen,
+                             stranded=self._stranded_partials),
+            rootfs_key,
+        )
+
+    def _rootfs_pin(self) -> Any:
+        """The directory rootfs, pinned per checkpoint (see rootfs_stamp.RootfsPin). Lazy, so a
+        backend built without __init__ (tests, subclasses) still gets one."""
+        pin = self.__dict__.get("_pin")
+        if pin is None:
+            from blastbox.host.rootfs_stamp import RootfsPin
+
+            # "" (a config naming no rootfs) makes it a no-op: nothing to stat, nothing to pin.
+            pin = self._pin = RootfsPin(str(getattr(self._cfg, "image_rootfs", "") or ""),
+                                        "gvisor")
+        return pin
 
     def restore_in(self, slot_workdir: Path, artifact: object) -> GvisorRestoreHandle:
+        # A tree replaced since this checkpoint would pair the checkpointed memory with a
+        # different filesystem (see rootfs_stamp.RootfsPin). Refused before anything runs.
+        from blastbox.host.rootfs_stamp import RootfsStampError
+        from blastbox.host.runtime.fc_snapshot import SnapshotStale
+
+        try:
+            self._rootfs_pin().check_restore(artifact)
+        except RootfsStampError as exc:
+            raise SnapshotStale(str(exc)) from exc
         wd = Path(slot_workdir)
         _prepare_slot_dirs(self._cfg, wd)
         cid = f"slot-{uuid.uuid4().hex[:12]}"

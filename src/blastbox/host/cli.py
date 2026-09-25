@@ -2015,6 +2015,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="accept several blastbox versions across the fleet (separate products "
         "on one host); without it a mixed fleet is reported and exits 1",
     )
+    pdoc.add_argument(
+        "--rootfs",
+        action="append",
+        default=[],
+        metavar="[PROJECT=]PATH",
+        help="also read the stamp on a warm rootfs artifact (ext4 file or "
+        "exported directory). Repeatable. PROJECT=PATH checks it against that "
+        "compose project's containers rather than the host as a whole. A rootfs "
+        "is not a process, so it is invisible to the container survey -- which "
+        "is where three engines drifted for two months",
+    )
+    pdoc.add_argument(
+        "--json",
+        action="store_true",
+        help="emit the whole fleet as one JSON object for monitoring: versions, "
+        "per-container and per-artifact detail, drift buckets, and any artifact "
+        "this host cannot boot. Exit code still reflects health",
+    )
     pdoc.set_defaults(func=_doctor_cmd)
 
     pst = sub.add_parser(
@@ -2537,68 +2555,93 @@ def _pins_cmd(args: argparse.Namespace) -> int:
 def _doctor_cmd(args: argparse.Namespace) -> int:
     """Report the blastbox version every running container is actually on."""
     from blastbox.host.doctor import (  # noqa: PLC0415 -- CLI-only
-        UNKNOWN,
         DockerUnavailable,
-        drift,
+        artifact_problems,
+        fleet_report,
         survey,
+        survey_rootfs,
+        verdict,
     )
 
+    artifacts = survey_rootfs(getattr(args, "rootfs", []) or [])
+    docker_error = ""
     try:
         containers = survey()
     except DockerUnavailable as exc:
-        print(f"cannot inspect anything: {exc}")
+        # Docker being unreachable does not make the ARTIFACTS unreadable: they are files,
+        # so report what could be read -- but as a problem, never as a healthy fleet.
+        containers, docker_error = [], str(exc) or "docker unavailable"
+    as_json = bool(getattr(args, "json", False))
+    if docker_error and not artifacts and not as_json:
+        print(f"cannot inspect anything: {docker_error}")
         return 2
-    if not containers:
+
+    # ONE verdict, whatever the output format: the policy flags define success, so the JSON
+    # report and the text report must never disagree about the exit code.
+    problems = verdict(
+        containers,
+        artifacts,
+        expect=args.expect,
+        allow_mixed=bool(getattr(args, "allow_mixed", False)),
+        docker_error=docker_error,
+    )
+
+    if as_json:
+        report = fleet_report(containers, artifacts)
+        report["policy"] = {"expect": args.expect,
+                            "allow_mixed": bool(getattr(args, "allow_mixed", False))}
+        report["problems"] = problems
+        report["ok"] = not problems
+        print(json.dumps(report, indent=2, sort_keys=True))
+        if docker_error and not artifacts:
+            return 2       # nothing could be inspected at all, as in text mode
+        return 0 if not problems else 1
+
+    if not containers and not artifacts:
         print("no running blastbox containers found")
-        # With --expect, verifying nothing must not report success.
-        return 1 if args.expect else 0
+        for p in problems:
+            print(f"PROBLEM: {p}")
+        return 1 if problems else 0
 
-    width = max(len(c.name) for c in containers)
-    for c in sorted(containers, key=lambda c: (c.project, c.name)):
-        note = f"  <- {c.detail}" if c.detail else ""
-        print(f"  {c.project:<18} {c.name:<{width}}  {c.image:<26} {c.version}{note}")
-
-    by_project = drift(containers)
-    mixed = {p: v for p, v in by_project.items() if len(v) > 1}
-    unknown = [c for c in containers if c.version == UNKNOWN]
+    if artifacts:
+        awidth = max(len(a.path) for a in artifacts)
+        for a in artifacts:
+            where = f"{a.runtime or '?'}/{a.arch or '?'}"
+            note = f"  <- {a.detail}" if a.detail else ""
+            print(f"  {'rootfs':<18} {a.path:<{awidth}}  {where:<26} {a.version}{note}")
+        for art, why in artifact_problems(artifacts):
+            print(f"  UNBOOTABLE HERE: {art.path}: {why}")
+        if containers:
+            print()
+    if containers:
+        width = max(len(c.name) for c in containers)
+        for c in sorted(containers, key=lambda c: (c.project, c.name)):
+            note = f"  <- {c.detail}" if c.detail else ""
+            print(f"  {c.project:<18} {c.name:<{width}}  {c.image:<26} {c.version}{note}")
     print()
-    if unknown:
-        print(f"UNKNOWN: {len(unknown)} container(s) could not be inspected:")
-        for c in unknown:
-            print(f"  {c.name}: {c.detail}")
-        print("  (a container that cannot be read is not a container that agrees)")
-    if mixed:
-        print("DRIFT: a compose project is running more than one blastbox:")
-        for project, versions in sorted(mixed.items()):
-            print(f"  {project}: {', '.join(sorted(versions))}")
-    if args.expect:
-        wrong = [c for c in containers if c.known and c.version != args.expect]
-        if wrong:
-            print(f"EXPECTED {args.expect}, but:")
-            for c in wrong:
-                print(f"  {c.name}: {c.version}")
-            return 1
-    if mixed or unknown:
+    if problems:
+        for p in problems:
+            print(f"PROBLEM: {p}")
+        if not getattr(args, "allow_mixed", False) and any(
+            "versions:" in p for p in problems
+        ):
+            print("\n  (pass --allow-mixed if separate products on one host are expected)")
         return 1
-    versions = {c.version for c in containers if c.known}
-    if len(versions) > 1:
-        # Never print OK while listing several versions. Distinct compose
-        # projects may legitimately differ (two products on one host), so this
-        # is reported rather than assumed broken -- but it is not "OK", and
-        # --allow-mixed is how an operator states the difference is intended.
-        print(f"MIXED: {len(containers)} container(s) across {len(versions)} versions:")
-        for version in sorted(versions):
-            where = ", ".join(
-                sorted(c.name for c in containers if c.version == version)
-            )
-            print(f"  {version}: {where}")
-        if not args.allow_mixed:
-            print(
-                "\n  (pass --allow-mixed if separate products on one host are expected)"
-            )
-            return 1
+    versions = sorted({c.version for c in containers if c.known}
+                      | {a.version for a in artifacts if a.known})
+    tail = f", {len(artifacts)} artifact(s)" if artifacts else ""
+    from blastbox.host.doctor import _release  # noqa: PLC0415 -- CLI-only
+
+    c_rel = {_release(c.version) for c in containers if c.known}
+    a_rel = {_release(a.version) for a in artifacts if a.known}
+    if len(c_rel) > 1 or (not c_rel and len(a_rel) > 1):
+        # Never "OK" beside several RELEASES (spellings of one release are not a mix): allowed
+        # is not the same as uniform. Only reachable with --allow-mixed; verdict() refuses
+        # a mix otherwise.
+        print(f"MIXED (allowed by --allow-mixed): {len(containers)} container(s){tail}, "
+              f"blastbox {', '.join(versions)}")
         return 0
-    print(f"OK: {len(containers)} container(s), blastbox {', '.join(sorted(versions))}")
+    print(f"OK: {len(containers)} container(s){tail}, blastbox {', '.join(versions)}")
     return 0
 
 

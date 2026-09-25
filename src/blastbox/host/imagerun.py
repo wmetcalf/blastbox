@@ -38,6 +38,9 @@ from pathlib import Path, PurePosixPath
 
 from blastbox.host import images as _images
 from blastbox.host.images import ImageSpec, Plan, RootfsSpec
+from blastbox.host import platform_id as _platform_id
+from blastbox.host import rootfs_stamp as _rootfs_stamp
+from blastbox.host.stamp import git_revision as _stamp_git_revision
 from blastbox.host.stamp import StampError
 from blastbox.host.stamp import repo_digest_ref as _repo_digest_ref
 from blastbox.host.stamp import build_args as _stamp_flags
@@ -1330,6 +1333,94 @@ class _Staged:
     published_identity: str = ""
 
 
+
+def _blastbox_version() -> str:
+    """The blastbox this exporter is running, as the guest will report it.
+
+    Read from the INSTALLED distribution, like `doctor` does: a dev wheel
+    carries a PEP 440 local suffix and that suffix is the point.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("blastbox")
+    except PackageNotFoundError:  # pragma: no cover - blastbox is always installed here
+        return ""
+
+
+def _source_revision(plan: "Plan") -> str:
+    """The engine repo revision, or "" when the tree is not a checkout.
+
+    Never raises: the stamp is diagnostic, and a rootfs that records no revision
+    is strictly better than an export that failed because it could not find one.
+    The build's own stamping already refuses an unrecorded revision.
+    """
+    try:
+        return _stamp_git_revision(plan.root)
+    except Exception:  # noqa: BLE001 - diagnostic only
+        return ""
+
+
+#: `docker inspect .Architecture` -> the `uname -m` spelling the live host reports.
+_DOCKER_ARCH = {
+    "amd64": "x86_64",
+    "arm64": "aarch64",
+    "386": "i686",
+    "arm": "armv7l",
+}
+
+
+def _image_provenance(plan: "Plan", source: str, run: Runner) -> tuple[str, str, str]:
+    """(blastbox version, revision, architecture) as the IMAGE records them.
+
+    The rootfs is the image, so it is described by the image -- not by the process
+    exporting it. An older CLI building a newly pinned release (the normal upgrade path)
+    stamped its own version, and the upgraded host then refused a correctly built guest;
+    an image whose `source_repo` lies outside the plan root recorded the plan's commit,
+    one that need not contain its Dockerfile; and an arm64 image exported on x86_64 under
+    emulation was stamped x86_64. Falls back to the exporter's values only for a field the
+    image does not record.
+    """
+    from blastbox.host.stamp import UNKNOWN as _UNKNOWN
+
+    version = revision = ""
+    try:
+        # capture_output: this module's runner returns stdout only when asked. Without it
+        # stamp.read() saw None, and every production export silently fell back to the
+        # exporter's version -- the very substitution this function exists to prevent.
+        img = _read_stamp(source, lambda argv: run(argv, capture_output=True))  # type: ignore[arg-type]
+        version = "" if img.blastbox in ("", _UNKNOWN) else img.blastbox
+        revision = "" if img.revision in ("", _UNKNOWN) else img.revision
+    except Exception as exc:  # noqa: BLE001 - diagnostic; verification already judged the image
+        _log(f"   warning: could not read {source}'s own stamp ({exc}); the rootfs stamp "
+             "falls back to this exporter's version and revision")
+    arch = ""
+    proc = run(
+        ["docker", "inspect", "--type", "image", source, "--format", "{{.Architecture}}"],
+        capture_output=True,
+    )
+    if proc.returncode == 0:
+        raw = (proc.stdout or "").strip()
+        arch = _DOCKER_ARCH.get(raw, raw)
+    return (version or _blastbox_version(), revision or _source_revision(plan), arch)
+
+
+def _export_platform(spec: RootfsSpec, arch: str = "") -> "_platform_id.HostPlatform":
+    """What this artifact is bound to: the image's architecture and its tier.
+
+    An ext4 is booted by Firecracker and a directory tree is restored by runsc,
+    so `kind` names the runtime the artifact is for -- which is what stops an FC
+    rootfs from being offered to a gVisor pool and failing as a restore error.
+    NOTHING about the exporting machine: a rootfs holds no CPU state (the snapshot is
+    taken later, on the deploying host), so recording the exporter's CPU vendor made a
+    correct rootfs refuse to boot on a fleet of the other vendor.
+    """
+    runtime = "firecracker" if spec.kind == "ext4" else "gvisor"
+    return _platform_id.HostPlatform(
+        arch=arch or _platform_id.host_platform().arch, runtime=runtime
+    )
+
+
 def stage_rootfs(
     plan: Plan,
     spec: RootfsSpec,
@@ -1419,6 +1510,24 @@ def stage_rootfs(
         _normalize_root(staging, priv, run)
         _check_requires(staging, spec, image)
         _check_no_setuid(staging, spec, image, priv, run)
+        # AFTER the audits and BEFORE the filesystem: the stamp describes a tree
+        # that has already been checked, and `docker export` drops image config
+        # so a label here would not survive. This is the only record that
+        # survives into the thing a warm tier actually boots.
+        img_version, img_revision, img_arch = _image_provenance(plan, source, run)
+        _rootfs_stamp.write_into_tree(
+            staging,
+            _rootfs_stamp.RootfsStamp(
+                blastbox_version=img_version,
+                image=image,
+                image_id=verified_id,
+                revision=img_revision,
+                exported_at=_rootfs_stamp.now_iso(),
+                platform=_export_platform(spec, img_arch).to_dict(),
+            ),
+            priv=priv,
+            run=run,
+        )
 
         staged_size = 0
         if spec.kind == "dir":

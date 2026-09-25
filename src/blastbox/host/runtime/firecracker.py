@@ -342,6 +342,32 @@ def guest_kernel_version(vmlinux_path: str) -> tuple[int, int] | None:
     return None
 
 
+
+def _guest_refusal(cfg: object) -> str:
+    """The rootfs guest problem behind a failed availability check, or "".
+
+    Re-read only on the failure path, so a tier refused for a stale guest says so in the
+    exception that reaches the crash-loop output -- not "check the binary and /dev/kvm".
+    """
+    rootfs = getattr(cfg, "fc_rootfs", "") or ""
+    if not rootfs or not Path(rootfs).is_file():
+        return ""
+    try:
+        return rootfs_guest_problem(rootfs)
+    except Exception:  # noqa: BLE001 - diagnostic only
+        return ""
+
+
+def rootfs_guest_problem(rootfs: str) -> str:
+    """Why this host must not boot ``rootfs``, or "" when it may.
+
+    See :func:`blastbox.host.rootfs_stamp.guest_problem`, which the gVisor tier shares.
+    """
+    from blastbox.host import rootfs_stamp as _rfs
+
+    return _rfs.guest_problem(rootfs, "firecracker")
+
+
 def firecracker_available(cfg: FCConfig | None = None) -> bool:
     """Return True iff all FC prerequisites are present on this host.
 
@@ -384,6 +410,21 @@ def firecracker_available(cfg: FCConfig | None = None) -> bool:
         # Rootfs
         if not cfg.fc_rootfs or not Path(cfg.fc_rootfs).is_file():
             _log.debug("firecracker_available=False: rootfs %r not found", cfg.fc_rootfs)
+            return False
+
+        # Guest/host agreement. The rootfs EXISTING says nothing about whether the
+        # guest inside it can talk to this host: that is precisely the state three
+        # engines were in on toolz2 for two months, booting fine and timing out
+        # every job at 300s because the guest was a different blastbox.
+        #
+        # Severity is split deliberately. A rootfs with NO stamp predates this
+        # check -- refusing it would take every existing deployment offline on
+        # upgrade -- so it warns and is allowed. A rootfs that DOES carry a stamp
+        # and disagrees with this host is a definite fault with a known remedy,
+        # and failing the tier here costs one log line instead of 300s per job.
+        problem = rootfs_guest_problem(cfg.fc_rootfs)
+        if problem:
+            _log.error("firecracker_available=False: %s", problem)
             return False
 
         # Version (probe LAST — only spawn the subprocess once the cheap checks pass).
@@ -1188,6 +1229,31 @@ class FirecrackerSlotRuntime:
                 with self._stranded_lock:
                     self._stranded_scratch.append(path)   # still stuck; retry next spawn
 
+    def _guest_problem(self) -> str:
+        """The cached rootfs guest check (one stat per call; re-read on a republish)."""
+        gate = getattr(self, "_guest_gate", None)
+        rootfs = getattr(self._cfg, "fc_rootfs", "") or ""
+        if gate is None and rootfs:
+            from blastbox.host.rootfs_stamp import GuestGate
+
+            gate = self._guest_gate = GuestGate(rootfs, "firecracker")
+        return gate.problem() if gate is not None else ""
+
+    def prepare(self) -> bool:
+        """Whether this tier can spawn this tick -- False while the rootfs guest is refused.
+
+        Refusing only inside spawn() spun the pool's spawn loop at the token-bucket rate with a
+        traceback per attempt (~690k error lines a day); "not ready" is the pool's quiet no.
+        Logged once per distinct refusal."""
+        problem = self._guest_problem()
+        self._refused_logged: str | None
+        if problem and getattr(self, "_refused_logged", None) != problem:
+            self._refused_logged = problem
+            _log.error("firecracker tier not ready: %s", problem)
+        elif not problem:
+            self._refused_logged = None
+        return not problem
+
     def spawn(self) -> Slot:
         """Create a scratch dir, write fc-config.json, launch Firecracker.
 
@@ -1206,6 +1272,16 @@ class FirecrackerSlotRuntime:
         # A storage incident that stops mkfs also stops the rmtree that follows it, and
         # nothing else in this tier would ever come back for them.
         self._sweep_stranded_scratch()
+
+        # The GUEST, on every spawn -- AFTER the sweep, which must run whatever else refuses.
+        # This tier boots the rootfs fresh each time, and one republished in place since tier
+        # selection would otherwise boot unchecked and time out every job. prepare() reports
+        # the same verdict to the pool first, so a refusal here is the backstop, not the path.
+        problem = self._guest_problem()
+        if problem:
+            from blastbox.host.rootfs_stamp import RootfsStampError
+
+            raise RootfsStampError(problem)
 
         slot_id = str(uuid.uuid4())
         slot_dir = self._scratch_root / slot_id
@@ -1503,7 +1579,9 @@ def select_fc_runtime(
 
     if not firecracker_available(cfg):
         if require_available:
+            guest = _guest_refusal(cfg)
             raise FCUnavailable(
+                f"Firecracker runtime refused: {guest}" if guest else
                 "Firecracker runtime required (BLASTBOX_WORKER_RUNTIME=firecracker) "
                 "but prerequisites missing: check firecracker binary, /dev/kvm, "
                 "BLASTBOX_FC_KERNEL, and BLASTBOX_FC_ROOTFS."

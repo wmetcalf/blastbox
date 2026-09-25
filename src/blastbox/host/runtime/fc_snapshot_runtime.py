@@ -495,7 +495,11 @@ def select_snapshot_runtime(
 
     if not firecracker_available(cfg):  # type: ignore[arg-type]
         if require_available:
+            from blastbox.host.runtime.firecracker import _guest_refusal
+
+            guest = _guest_refusal(cfg)
             raise FCUnavailable(
+                f"snapshot warm tier refused: {guest}" if guest else
                 "snapshot warm tier required but prerequisites missing: check "
                 "firecracker binary, /dev/kvm, BLASTBOX_FC_KERNEL, BLASTBOX_FC_ROOTFS."
             )
