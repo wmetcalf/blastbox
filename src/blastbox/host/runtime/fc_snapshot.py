@@ -156,6 +156,9 @@ class SnapshotManager:
         self._staged_for: object | None = None
         self._staged_epoch: int | None = None
         self._staged_at: float | None = None
+        # Set when take_repaired() parks a superseded base nothing maps: the next
+        # ensure_build_started() -- outside the pool's lock -- sweeps it on its own thread.
+        self._sweep_due = False
         #: slot_id -> publish time of the artifact that slot restored from (its checkpoint age).
         self._pin_born: dict[str, float] = {}
         self._artifact: object | None = None
@@ -240,8 +243,11 @@ class SnapshotManager:
             swapped, collect = self._swap_staged_locked()
             if collect is not None:
                 # PARKED, not discarded here: the pool calls this under its own lock, and a
-                # discard is a RAM-sized unlink. The next release/_unpin/build sweeps it.
+                # discard is a RAM-sized unlink. Flag a sweep for the next tick's prepare():
+                # with no slot left to release it, nothing else would reclaim it until the
+                # next build, and an idle pool held two generations of snapshot memory.
                 self._retired[id(collect)] = collect
+                self._sweep_due = True
         return out or swapped
 
     def _swap_staged_locked(self) -> "tuple[bool, object | None]":
@@ -410,6 +416,12 @@ class SnapshotManager:
         Also where AGE is decided, under the same lock that starts the build thread, so two ticks
         (or a cascade's concurrent prepare() calls) cannot both act on one aged base."""
         collect: list[object] = []
+        with self._build_lock:
+            sweep, self._sweep_due = self._sweep_due, False
+        if sweep:
+            threading.Thread(
+                target=self._sweep_retired, daemon=True, name="warm-snapshot-sweep"
+            ).start()
         try:
             with self._build_lock:
                 if self._artifact is not None:

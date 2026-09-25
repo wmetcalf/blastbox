@@ -47,6 +47,10 @@ class DistinctBackend(FakeBackend):
         # The manager binds its epoch source here when this is None (see SnapshotManager).
         self._epoch_sampler = None
         self.ack: AckCapability | None = None
+        self.discarded: list[object] = []
+
+    def discard(self, artifact):
+        self.discarded.append(artifact)
 
     def boot_base(self):
         self.attempts += 1
@@ -660,3 +664,32 @@ def test_a_retired_generation_slot_does_not_blame_its_tier() -> None:
     pool._slot_base["new"] = ("fc#0", 1)
     pool._blame_tiers(["old", "new", "unstamped"])
     assert blamed == ["new", "unstamped"]
+
+
+def test_an_unpinned_superseded_base_is_reclaimed_after_the_swap(tmp_path) -> None:
+    """take_repaired() runs under the pool's lock, so it PARKS the old base rather than unlink
+    a RAM-sized file there -- but with no slot left to release it, nothing swept it until the
+    next build: an idle pool held two generations of snapshot memory for a whole max-age."""
+    mgr, backend = _built(tmp_path, max_age_s=60.0)
+    old = mgr.artifact
+    _age(mgr, 61.0)
+    mgr.ensure_build_started()
+    _swap(mgr)
+    assert old not in backend.discarded           # not unlinked under the pool's lock
+    mgr.ensure_build_started()                    # the next tick's prepare()
+    assert _wait_until(lambda: old in backend.discarded)
+    assert _wait_until(lambda: id(old) not in mgr._retired)
+
+
+def test_a_pinned_superseded_base_is_not_reclaimed_early(tmp_path) -> None:
+    mgr, backend = _built(tmp_path, max_age_s=60.0)
+    mgr.restore("live")
+    old = mgr.artifact
+    _age(mgr, 61.0)
+    mgr.ensure_build_started()
+    _swap(mgr)
+    mgr.ensure_build_started()
+    time.sleep(0.2)
+    assert old not in backend.discarded           # a slot still maps it
+    mgr.release("live")
+    assert old in backend.discarded
