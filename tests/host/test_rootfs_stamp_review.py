@@ -701,10 +701,10 @@ def test_stamp_tree_records_what_the_image_says(tmp_path, monkeypatch) -> None:
             return subprocess.CompletedProcess(list(argv), 0, "sha256:" + "f" * 64 + "\n", "")
         raise AssertionError(argv)
 
-    rfs.stamp_tree(tmp_path, "eng-fc:1", "firecracker", run=run)
+    rfs.stamp_tree(tmp_path, "eng-fc:1", "firecracker", run=run, revision="d" * 40)
     got = rfs.read_from_dir(tmp_path)
-    assert (got.blastbox_version, got.revision, got.image) == ("9.9.9", labels[st.LABEL_REVISION],
-                                                              "eng-fc:1")
+    # The revision is the caller's, never the (possibly inherited) label's.
+    assert (got.blastbox_version, got.revision, got.image) == ("9.9.9", "d" * 40, "eng-fc:1")
     assert got.image_id == "sha256:" + "f" * 64
     assert got.platform == {"arch": "aarch64", "runtime": "firecracker"}
 
@@ -796,3 +796,35 @@ def test_the_legacy_scripts_verify_the_stamp_was_written() -> None:
     root = Path(__file__).resolve().parents[2]
     for script in ("deploy/firecracker/build-rootfs.sh", "deploy/redeploy-warm.sh"):
         assert "opt/blastbox/rootfs-stamp.json" in (root / script).read_text(), script
+
+
+def test_stamp_tree_never_takes_a_revision_from_inherited_labels(tmp_path, monkeypatch) -> None:
+    """The legacy scripts derive images FROM a shipped image; its labels -- revision included
+    -- are inherited, and the hotfix wheel carries the same static version, so no version
+    check can tell whose revision it is. The caller names the revision explicitly."""
+    from blastbox.host import stamp as st
+
+    monkeypatch.setattr(doctor, "version_in_image", lambda image, runner=None: ("0.1.42", ""))
+
+    def run(argv, **kw):
+        out = (json.dumps({st.LABEL_BLASTBOX: "0.1.42", st.LABEL_REVISION: "a" * 40})
+               if "{{json .Config.Labels}}" in argv else "amd64\n")
+        return subprocess.CompletedProcess(list(argv), 0, out, "")
+
+    rfs.stamp_tree(tmp_path / "a", "eng:1", "firecracker", run=run)
+    assert rfs.read_from_dir(tmp_path / "a").revision == ""
+    rfs.stamp_tree(tmp_path / "b", "eng:1", "firecracker", run=run, revision="b" * 40)
+    assert rfs.read_from_dir(tmp_path / "b").revision == "b" * 40
+
+
+def test_the_entry_point_takes_an_optional_revision(tmp_path, monkeypatch) -> None:
+    seen: list = []
+    monkeypatch.setattr(rfs, "stamp_tree", lambda *a, **k: seen.append((a, k)))
+    assert rfs.main(["write", str(tmp_path), "eng:1", "gvisor", "c" * 40]) == 0
+    assert seen[-1][1].get("revision") == "c" * 40
+
+
+def test_the_legacy_scripts_pass_their_source_revision() -> None:
+    root = Path(__file__).resolve().parents[2]
+    for script in ("deploy/firecracker/build-rootfs.sh", "deploy/redeploy-warm.sh"):
+        assert "rev-parse HEAD" in (root / script).read_text(), script

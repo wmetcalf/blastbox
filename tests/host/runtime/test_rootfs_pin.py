@@ -200,8 +200,11 @@ def test_a_failed_stamp_read_is_not_cached_as_a_pass(tmp_path, monkeypatch) -> N
         return rfs.RootfsStamp(blastbox_version="0.0.1", platform={})
 
     monkeypatch.setattr(rfs, "read", read)
+    now = [1000.0]
+    monkeypatch.setattr(rfs.time, "monotonic", lambda: now[0])
     gate = rfs.GuestGate(str(f), "firecracker")
     assert gate.problem() == ""                   # could not look: allowed, as before...
+    now[0] += rfs.UNDECIDED_RETRY_S + 1
     assert "0.0.1" in gate.problem()              # ...but looked again, and refused
 
 
@@ -322,3 +325,40 @@ def test_a_verdict_read_across_a_republish_is_not_cached(tmp_path, monkeypatch) 
     gate.problem()
     assert len(calls) == 2
     assert gate._key == rfs.file_identity(f)      # a stable read IS cached
+
+
+# --- round 2 of review on the pin -----------------------------------------------------
+
+
+def test_an_undecidable_verdict_is_retried_at_most_once_per_interval(tmp_path,
+                                                                    monkeypatch) -> None:
+    """prepare() runs every tick. A failure that never changes for an unchanged file
+    (debugfs missing, a bad-magic image) re-ran debugfs and a WARNING ten times a second."""
+    f = tmp_path / "rootfs.ext4"
+    f.write_bytes(b"one")
+    calls: list[int] = []
+    monkeypatch.setattr(rfs, "guest_verdict", lambda p, r: calls.append(1) or ("", False))
+    now = [1000.0]
+    monkeypatch.setattr(rfs.time, "monotonic", lambda: now[0])
+    gate = rfs.GuestGate(str(f), "firecracker")
+    for _ in range(20):
+        gate.problem()
+    assert len(calls) == 1
+    now[0] += rfs.UNDECIDED_RETRY_S + 1
+    gate.problem()
+    assert len(calls) == 2
+
+
+def test_concurrent_stale_restores_invalidate_once(tmp_path, monkeypatch) -> None:
+    """The still-current check and the invalidate were separate lock holds: a second restore
+    seeing the same stale artifact invalidated again and rejected the replacement build."""
+    from blastbox.host.runtime.fc_snapshot import SnapshotManager
+
+    monkeypatch.setattr(rfs, "guest_verdict", lambda p, r: ("", True))
+    backend, _launcher, _rootfs, _base = _fc_backend(tmp_path)
+    mgr = SnapshotManager(tmp_path / "mgr", backend)
+    old = mgr.build()
+    epoch = mgr.build_epoch
+    assert mgr.invalidate(only_if=old) is True
+    assert mgr.invalidate(only_if=old) is False   # already superseded: a no-op
+    assert mgr.build_epoch == epoch + 1

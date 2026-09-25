@@ -34,6 +34,7 @@ import stat as _stat
 import subprocess
 import tempfile
 import threading
+import time
 import unicodedata
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
@@ -57,6 +58,11 @@ MAX_STAMP_BYTES = 64 * 1024
 
 #: debugfs on a malformed filesystem can spin; the probe must not.
 DEBUGFS_TIMEOUT_S = 30.0
+
+#: How long GuestGate trusts an UNDECIDABLE verdict (the stamp could not be read) for an
+#: unchanged file before reading again. Such failures rarely heal by themselves -- debugfs not
+#: installed, a bad-magic image -- and prepare() runs every pool tick.
+UNDECIDED_RETRY_S = 60.0
 
 #: Each docker call stamp_tree makes (inspect, and the in-image version probe).
 STAMP_TREE_TIMEOUT_S = 120.0
@@ -466,9 +472,9 @@ def guest_verdict(rootfs: str, runtime: str) -> tuple[str, bool]:
     except Exception as exc:  # noqa: BLE001 - never fail the tier on a diagnostic
         log.warning("could not read the rootfs stamp on %s: %s", rootfs, exc)
         return "", False
-    # The RUNNING code's version, fixed at import -- not importlib.metadata, which re-reads
-    # dist-info from disk: a pip upgrade under a live dispatcher would otherwise admit a guest
-    # newer than the code actually serving it.
+    # The version as this PROCESS loaded it (blastbox.__version__, read from metadata once at
+    # import) -- not importlib.metadata now, which re-reads dist-info from disk: a pip upgrade
+    # under a live dispatcher would otherwise admit a guest newer than the code serving it.
     import blastbox
 
     host = str(getattr(blastbox, "__version__", "") or "")
@@ -531,6 +537,9 @@ class GuestGate:
         self._lock = threading.Lock()
         self._key: "tuple[int, ...] | None" = None
         self._problem = ""
+        #: None for a definitive verdict (kept until the file changes); otherwise when an
+        #: undecidable one may be re-read.
+        self._retry_at: "float | None" = None
 
     def problem(self) -> str:
         return self.checked()[0]
@@ -543,15 +552,20 @@ class GuestGate:
         if key is None:
             return "", None    # a missing rootfs fails loudly at boot; not this check's job
         with self._lock:
-            if key == self._key:
+            if key == self._key and (self._retry_at is None
+                                     or time.monotonic() < self._retry_at):
                 return self._problem, key
         found, definitive = guest_verdict(self.rootfs, self.runtime)
         # Cached only if the file did not change DURING the read: otherwise this verdict may
-        # describe a different file than the identity it would be stored under.
+        # describe a different file than the identity it would be stored under. A definitive
+        # verdict holds until the file changes; an undecidable one (the stamp could not be
+        # read) only for UNDECIDED_RETRY_S -- re-reading it every tick re-ran debugfs and a
+        # WARNING ten times a second, and caching it forever switched the check off.
         after = file_identity(self.rootfs)
-        if definitive and after == key:
+        if after == key:
             with self._lock:
                 self._key, self._problem = key, found
+                self._retry_at = None if definitive else time.monotonic() + UNDECIDED_RETRY_S
         return found, key          # the identity the check STARTED from; callers re-stat
 
 
@@ -632,7 +646,14 @@ class _PinnedBoot:
         return getattr(self._inner, name)
 
 
-def stamp_tree(tree: Path | str, image: str, runtime: str, *, run: Runner | None = None) -> Path:
+def stamp_tree(
+    tree: Path | str,
+    image: str,
+    runtime: str,
+    *,
+    run: Runner | None = None,
+    revision: str = "",
+) -> Path:
     """Stamp an extracted tree from what IMAGE records about itself -- for exports made
     outside `build-images` (the legacy `deploy/` scripts).
 
@@ -682,10 +703,10 @@ def stamp_tree(tree: Path | str, image: str, runtime: str, *, run: Runner | None
         blastbox_version=version,
         image=image,
         image_id=inspect("{{.Id}}"),
-        # The label's revision describes the build that WROTE the label. A derived image
-        # inherits its base's labels, so keep it only when the label speaks for this build.
-        revision=(labels.revision if labels.revision not in ("", UNKNOWN) and label_ok and (
-            not installed_ok or _same_release_str(installed, labels.blastbox)) else ""),
+        # NEVER from the labels: these exports derive images FROM a shipped image, inheriting its
+        # labels (revision included), and a hotfix wheel carries the same static version -- so
+        # nothing here can tell whose revision a label names. The caller says it explicitly.
+        revision=revision,
         exported_at=now_iso(),
         platform={"arch": _DOCKER_ARCH.get(arch_raw, arch_raw), "runtime": runtime},
     )
@@ -702,20 +723,15 @@ def _is_version(value: str) -> bool:
     return bool(value)
 
 
-def _same_release_str(a: str, b: str) -> bool:
-    from blastbox.host.stamp import _same_release  # noqa: PLC0415
-
-    return _same_release(a.split("+", 1)[0], b.split("+", 1)[0])
-
-
 def main(argv: Sequence[str]) -> int:
     """`python -m blastbox.host.rootfs_stamp write TREE IMAGE {firecracker|gvisor}`."""
-    if len(argv) != 4 or argv[0] != "write" or argv[3] not in ("firecracker", "gvisor"):
+    if (len(argv) not in (4, 5) or argv[0] != "write"
+            or argv[3] not in ("firecracker", "gvisor")):
         print("usage: python -m blastbox.host.rootfs_stamp write TREE IMAGE "
-              "{firecracker|gvisor}")
+              "{firecracker|gvisor} [REVISION]")
         return 2
     try:
-        stamp_tree(argv[1], argv[2], argv[3])
+        stamp_tree(argv[1], argv[2], argv[3], revision=argv[4] if len(argv) == 5 else "")
     except RootfsStampError as exc:
         print(f"rootfs stamp: {exc}")
         return 1

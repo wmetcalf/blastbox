@@ -238,6 +238,7 @@ docker export "$cid" | sudo tar -x -C "$GVISOR_DIR/rootfs.${WARM_TAG}"; docker r
 # Verified by the FILE, not the exit status: an older blastbox exits 0 having written nothing.
 if ! sudo "${BLASTBOX_PY:-$(command -v python3)}" -m blastbox.host.rootfs_stamp write \
      "$GVISOR_DIR/rootfs.${WARM_TAG}" "${WARM_IMAGE%:*}-warm:gvisor-${WARM_TAG}" gvisor \
+     "$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)" \
    || ! sudo test -s "$GVISOR_DIR/rootfs.${WARM_TAG}/opt/blastbox/rootfs-stamp.json"; then
   log "WARNING: gVisor rootfs NOT stamped -- it will boot unchecked against its host"
 fi

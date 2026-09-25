@@ -54,6 +54,7 @@ echo ">> stamp rootfs (image provenance)"
 # Verified by the FILE, not the exit status: a blastbox older than this CLI imports the module
 # and exits 0 having written nothing.
 if ! "${BLASTBOX_PY:-python3}" -m blastbox.host.rootfs_stamp write "$rootdir" "$TAG" firecracker \
+     "$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)" \
    || [ ! -s "$rootdir/opt/blastbox/rootfs-stamp.json" ]; then
     echo "!! could not stamp the rootfs (is blastbox importable by ${BLASTBOX_PY:-python3}?)." >&2
     echo "!! It will boot UNCHECKED against its host; rebuild with \`blastbox build-images\`." >&2
