@@ -191,6 +191,9 @@ class FcSnapshotBackend:
                 _log.warning("fc_snapshot: could not unlink %s: %s", path, exc)
         if failed:
             raise OSError("could not unlink generation files: " + "; ".join(failed))
+        pin = getattr(self, "_pin", None)
+        if pin is not None:
+            pin.forget(artifact)
 
     def __init__(
         self,
@@ -234,9 +237,35 @@ class FcSnapshotBackend:
         # by the time a backend is constructed the FC prerequisites are present.
         return True
 
+    def _rootfs_pin(self) -> Any:
+        """The launcher's rootfs, pinned per checkpoint (None when the launcher names none)."""
+        pin = getattr(self, "_pin", None)
+        if pin is None:
+            rootfs = getattr(getattr(self._launcher, "_cfg", None), "fc_rootfs", "") or ""
+            if not rootfs:
+                return None
+            from blastbox.host.rootfs_stamp import RootfsPin
+
+            pin = self._pin = RootfsPin(str(rootfs), "firecracker")
+        return pin
+
     def boot_base(self) -> Any:
-        """Boot the base microVM (whose handle ``checkpoint(dest_dir)`` snapshots)."""
-        return self._launcher.boot_base()
+        """Boot the base microVM (whose handle ``checkpoint(dest_dir)`` snapshots).
+
+        The rootfs is checked HERE, where it is booted, and not only at tier selection: a
+        rootfs republished in place while the dispatcher runs is otherwise built into a base
+        unchecked (see rootfs_stamp.RootfsPin).
+        """
+        pin = self._rootfs_pin()
+        if pin is None:
+            return self._launcher.boot_base()
+        from blastbox.host.rootfs_stamp import RootfsStampError
+
+        try:
+            key = pin.before_boot()
+        except RootfsStampError as exc:
+            raise SnapshotBuildError(str(exc)) from exc
+        return pin.wrap(self._launcher.boot_base(), key)
 
     def restore_in(self, slot_workdir: Path, artifact: object) -> Any:
         """Spawn a fresh firecracker in ``slot_workdir`` and load+resume the FC
@@ -249,6 +278,14 @@ class FcSnapshotBackend:
                 f"FcSnapshotBackend.restore_in expected FcSnapshotArtifact, "
                 f"got {type(artifact).__name__}"
             )
+        pin = self._rootfs_pin()
+        if pin is not None:
+            from blastbox.host.rootfs_stamp import RootfsStampError
+
+            try:
+                pin.check_restore(artifact)
+            except RootfsStampError as exc:
+                raise SnapshotRestoreError(str(exc)) from exc
         handle = self._launcher.restore_in(slot_workdir, outdisk_src=artifact.outdisk_path)
         try:
             _restore_from_snapshot(

@@ -465,6 +465,126 @@ def guest_problem(rootfs: str, runtime: str) -> str:
     return ""
 
 
+def file_identity(path: Path | str) -> "tuple[int, ...] | None":
+    """What changes when a rootfs is republished: device, inode, size, mtime -- or None.
+
+    `build-images` publishes by renaming a new artifact over the old one, so the inode moves;
+    an in-place rewrite moves size or mtime. For a directory rootfs the stamp file's own
+    identity is folded in, since a tree can be refreshed without replacing its top directory.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key: tuple[int, ...] = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+    if _stat.S_ISDIR(st.st_mode):
+        try:
+            sst = os.lstat(Path(path) / STAMP_PATH)
+            key += (sst.st_ino, sst.st_size, sst.st_mtime_ns)
+        except OSError:
+            key += (-1,)
+    return key
+
+
+class GuestGate:
+    """guest_problem() for one rootfs, re-read only when the file changes.
+
+    Tier selection checks the guest once, at dispatcher start -- but `build-images` publishes
+    in place, and the dispatcher keeps booting from the same path. Called where the rootfs is
+    actually BOOTED (a plain FC spawn, a snapshot base build), this catches a republished
+    guest the moment it would be used, at the cost of one stat() per boot.
+    """
+
+    def __init__(self, rootfs: str, runtime: str) -> None:
+        self.rootfs = rootfs
+        self.runtime = runtime
+        self._lock = threading.Lock()
+        self._key: "tuple[int, ...] | None" = None
+        self._problem = ""
+
+    def problem(self) -> str:
+        key = file_identity(self.rootfs)
+        if key is None:
+            return ""          # a missing rootfs fails loudly at boot; not this check's job
+        with self._lock:
+            if key == self._key:
+                return self._problem
+        found = guest_problem(self.rootfs, self.runtime)
+        with self._lock:
+            self._key, self._problem = key, found
+        return found
+
+
+class RootfsPin:
+    """Bind each snapshot checkpoint to the rootfs it was taken against.
+
+    A snapshot restore attaches the rootfs by PATH, under a memory image whose page cache and
+    ext4 metadata describe the file that was there at checkpoint. Republished in place, the
+    restore pairs old memory with a new disk -- the corruption class generation-stamping the
+    outdisk already prevents, left open for the shared rootfs. Backends call:
+
+    * ``before_boot()`` -- the guest gate, then the identity this build boots;
+    * ``wrap(boot, key)`` -- records that identity against the artifact checkpoint() returns;
+    * ``check_restore(artifact)`` -- refuses a restore if the file changed since;
+    * ``forget(artifact)`` -- when the generation is discarded.
+    """
+
+    def __init__(self, rootfs: str, runtime: str) -> None:
+        self.gate = GuestGate(rootfs, runtime)
+        self._lock = threading.Lock()
+        self._keys: "dict[str, tuple[int, ...] | None]" = {}
+
+    @staticmethod
+    def _akey(artifact: object) -> str:
+        return str(getattr(artifact, "snapshot_path", artifact))
+
+    def before_boot(self) -> "tuple[int, ...] | None":
+        problem = self.gate.problem()
+        if problem:
+            raise RootfsStampError(problem)
+        return file_identity(self.gate.rootfs)
+
+    def wrap(self, boot: object, key: "tuple[int, ...] | None") -> object:
+        return _PinnedBoot(boot, key, self)
+
+    def record(self, artifact: object, key: "tuple[int, ...] | None") -> None:
+        with self._lock:
+            self._keys[self._akey(artifact)] = key
+
+    def check_restore(self, artifact: object) -> None:
+        with self._lock:
+            if self._akey(artifact) not in self._keys:
+                return         # not built by this process (or before pinning): nothing to compare
+            key = self._keys[self._akey(artifact)]
+        if key is not None and file_identity(self.gate.rootfs) != key:
+            raise RootfsStampError(
+                f"{self.gate.rootfs} changed since this snapshot was checkpointed; restoring "
+                "it would pair the old memory image with a different disk. The base must be "
+                "rebuilt from the current rootfs."
+            )
+
+    def forget(self, artifact: object) -> None:
+        with self._lock:
+            self._keys.pop(self._akey(artifact), None)
+
+
+class _PinnedBoot:
+    """A base boot handle whose checkpoint() records the rootfs identity it booted."""
+
+    def __init__(self, inner: object, key: "tuple[int, ...] | None", pin: RootfsPin) -> None:
+        self._inner = inner
+        self._key = key
+        self._pin = pin
+
+    def checkpoint(self, dest_dir: Path) -> object:
+        artifact = self._inner.checkpoint(dest_dir)  # type: ignore[attr-defined]
+        self._pin.record(artifact, self._key)
+        return artifact
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+
 def _default_runner(
     argv: Sequence[str], **kwargs: object
 ) -> "subprocess.CompletedProcess[str]":  # pragma: no cover - thin wrapper
@@ -473,6 +593,9 @@ def _default_runner(
 
 __all__ = [
     "DEBUGFS_TIMEOUT_S",
+    "GuestGate",
+    "RootfsPin",
+    "file_identity",
     "MAX_STAMP_BYTES",
     "STAMP_PATH",
     "guest_problem",

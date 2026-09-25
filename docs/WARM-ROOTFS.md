@@ -118,11 +118,16 @@ The stamp comes out of an image, so it is treated as untrusted: it is read only
 from a regular file (never through a symlink, FIFO or device node), capped at
 64 KiB, and debugfs runs under a deadline.
 
-**Upgrade order.** The check runs when the tier is SELECTED, at dispatcher start;
-`build-images` publishes the new rootfs in place. So publish, then restart the
-dispatcher — a dispatcher left running across a publish boots the new guest
-unchecked on its next spawn or base rebuild. (Upgrading the dispatcher first
-instead makes every stamped tier refuse until the rootfs is rebuilt.)
+**Republishing while a dispatcher runs.** `build-images` publishes the rootfs in
+place, so the check also runs where the rootfs is BOOTED, cached on the file's
+identity (one `stat` per boot): every plain Firecracker spawn, and every snapshot
+base build on both tiers. A snapshot also records the rootfs it was checkpointed
+against, and a restore refuses if the file has changed since — restoring would pair
+the old memory image with a different disk, the ext4-checksum corruption the
+per-generation outdisk already guards against. Those restores fail fast, and the
+pool rebuilds the base from the current rootfs. A newer guest than the dispatcher
+is refused at boot until the dispatcher is upgraded, so upgrade the dispatcher and
+publish the rootfs together.
 
 **Survey a host.** `blastbox doctor --rootfs PATH` adds each artifact to the
 container survey; `--json` emits the whole fleet for monitoring, with the same

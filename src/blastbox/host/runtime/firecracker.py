@@ -1243,6 +1243,22 @@ class FirecrackerSlotRuntime:
         """
         import uuid
 
+        # The GUEST, on every spawn: this tier boots the rootfs fresh each time, and a rootfs
+        # republished in place since tier selection would otherwise boot unchecked and time
+        # out every job. Cached on the file's identity, so it costs one stat() per spawn.
+        gate = getattr(self, "_guest_gate", None)
+        rootfs = getattr(self._cfg, "fc_rootfs", "") or ""
+        if gate is None and rootfs:
+            from blastbox.host.rootfs_stamp import GuestGate
+
+            gate = self._guest_gate = GuestGate(rootfs, "firecracker")
+        if gate is not None:
+            problem = gate.problem()
+            if problem:
+                from blastbox.host.rootfs_stamp import RootfsStampError
+
+                raise RootfsStampError(problem)
+
         # BEFORE anything else: retry scratch dirs whose cleanup failed on an earlier spawn.
         # A storage incident that stops mkfs also stops the rmtree that follows it, and
         # nothing else in this tier would ever come back for them.
