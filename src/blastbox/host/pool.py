@@ -1364,18 +1364,36 @@ class WarmPool:
         take = getattr(self._runtime, "take_repaired_tiers", None)
         if not callable(take):
             return
+        # NOT while a pool rebuild is in flight. The pool advances the generation only after
+        # drop() returns; a swap taken inside that window is stamped by this tick's spawns with a
+        # generation about to be retired. Non-blocking: a rebuild in progress just defers it.
+        if not self._invalidation_lock.acquire(blocking=False):
+            return
         try:
-            names = take()
-        except Exception as exc:  # noqa: BLE001 -- bookkeeping must never break the tick
-            logger.warning("pool.take_repaired_tiers_failed: %s", exc)
-            return
-        if not names:
-            return
-        with self._lock:
-            for name in names:
-                self._base_generation[str(name)] = self._base_generation.get(str(name), 0) + 1
-        logger.info("pool.runtime_repaired_bases tiers=%s -- their slots are now retired",
-                    ",".join(str(n) for n in names))
+            # The swap happens INSIDE take(), so it and the generation advance must be one step
+            # under the pool's lock: a failure report landing between them still matched the old
+            # generation and could convict the base that had just been swapped in. take() only
+            # flips references and parks what it retires, so holding the lock across it is cheap.
+            with self._lock:
+                try:
+                    names = take()
+                except Exception as exc:  # noqa: BLE001 -- bookkeeping must never break the tick
+                    logger.warning("pool.take_repaired_tiers_failed: %s", exc)
+                    return
+                for name in names or ():
+                    self._base_generation[str(name)] = self._base_generation.get(str(name), 0) + 1
+                    # ...and the retired base's evidence with it. Advancing the generation
+                    # filters only failures reported AFTER this point; what the old base had
+                    # already accumulated survived, so two old-slot hangs plus one from the fresh
+                    # base convicted it -- as the pool's own repair commit says, a new generation
+                    # starts with no inherited evidence.
+                    self._pool_consecutive_failures.pop(str(name), None)
+                    self._pool_pre_guest_failures.pop(str(name), None)
+        finally:
+            self._invalidation_lock.release()
+        if names:
+            logger.info("pool.runtime_repaired_bases tiers=%s -- their slots are now retired",
+                        ",".join(str(n) for n in names))
 
     def _reap_deferred(self) -> None:
         """Kick the DEDICATED reaper thread for slots claim() found dead and deferred (issue #75).
@@ -3407,6 +3425,15 @@ class WarmPool:
         blame = getattr(self._runtime, "blame_tier_for_slot", None)
         if not callable(blame):
             return
+        # Only slots of the tier's CURRENT generation. A superseded base's slots stay claimable
+        # until they turn over, and their failures re-armed the tier's streak against the base
+        # that replaced them -- the same rule the pool's own evidence follows.
+        with self._lock:
+            slot_ids = [
+                sid for sid in slot_ids
+                if (stamp := self._slot_base.get(sid)) is None
+                or stamp[1] == self._base_generation.get(stamp[0], 0)
+            ]
         for slot_id in slot_ids:
             try:
                 blame(slot_id)

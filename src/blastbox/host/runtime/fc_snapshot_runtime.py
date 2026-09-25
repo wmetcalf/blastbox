@@ -26,7 +26,6 @@ import shutil
 import threading
 import time
 import uuid
-from blastbox.host.runtime.env_knobs import positive_float_env
 from pathlib import Path
 from typing import Callable
 
@@ -303,6 +302,27 @@ class SnapshotSlotRuntime:
         _log.warning("snapshot.base_invalidated had_artifact=%s -- next spawn rebuilds the base",
                      bool(discarded))
 
+    def maintain_idle(self, slot: Slot, *, budget_s: "float | None" = None) -> bool:
+        """Retire an idle slot whose checkpoint is past the snapshot age ceiling.
+
+        Called by the pool's ``_maintain_idle`` with the slot already reserved (IDLE->ASSIGNED),
+        so returning False retires it without racing a claimant. Cheap: no I/O. The decision is
+        the manager's (``slot_should_retire``) because only it knows which base the slot restored
+        from and whether a replacement has been published.
+        """
+        retire = getattr(self._manager, "slot_should_retire", None)
+        return not (callable(retire) and retire(slot.slot_id))
+
+    def take_repaired_tiers(self) -> "list[str]":
+        """Swap in a refreshed base and report it once, so the pool advances the generation.
+
+        The swap happens HERE, inside the pool's drain and before it spawns, so no slot can be
+        restored from the new base under the old generation stamp. ``""`` names the whole runtime
+        (the pool's key for a single-tier base).
+        """
+        take = getattr(self._manager, "take_repaired", None)
+        return [""] if callable(take) and take() else []
+
     def reap(self, slot: Slot) -> None:
         """Kill the restored microVM (if alive) and remove its per-slot workdir.
 
@@ -554,8 +574,5 @@ def select_snapshot_runtime(
     backend = FcSnapshotBackend.from_env(base_dir, launcher, mem_dir=mem_dir)
     # Same knob as the gVisor tier: one shared SnapshotManager, one readiness budget,
     # and neither construction site used to pass one (issue #147).
-    manager = SnapshotManager(
-        base_dir, backend, ack_capable=ack_capable,
-        ready_timeout_s=positive_float_env(os.environ, "BLASTBOX_SNAPSHOT_READY_S", 120.0),
-    )
+    manager = SnapshotManager.from_env(base_dir, backend, ack_capable=ack_capable)
     return SnapshotSlotRuntime(cfg, manager, settle_s=settle_s, ack_capable=ack_capable)
