@@ -233,6 +233,12 @@ docker build -q --build-arg BASE="$WARM_IMAGE" -f "$REPO/deploy/gvisor/Dockerfil
 cid=$(docker create "${WARM_IMAGE%:*}-warm:gvisor-${WARM_TAG}")
 sudo rm -rf "$GVISOR_DIR/rootfs.${WARM_TAG}"; sudo mkdir -p "$GVISOR_DIR/rootfs.${WARM_TAG}"
 docker export "$cid" | sudo tar -x -C "$GVISOR_DIR/rootfs.${WARM_TAG}"; docker rm "$cid" >/dev/null
+# Stamped like build-images' output (the FC rootfs is stamped inside build-rootfs.sh). As root:
+# the tree was extracted as root. BLASTBOX_PY must be an absolute python that imports blastbox.
+if ! sudo "${BLASTBOX_PY:-$(command -v python3)}" -m blastbox.host.rootfs_stamp write \
+     "$GVISOR_DIR/rootfs.${WARM_TAG}" "${WARM_IMAGE%:*}-warm:gvisor-${WARM_TAG}" gvisor; then
+  log "WARNING: gVisor rootfs NOT stamped -- it will boot unchecked against its host"
+fi
 
 # --- 4. stage swaps (with backups) + optional FC binary -----------------------
 log "stage rootfs (backups -> *.$SUF)"

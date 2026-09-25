@@ -46,6 +46,16 @@ trap cleanup EXIT
 echo ">> export rootfs -> $rootdir"
 "$DOCKER" export "$cid" | tar -x -C "$rootdir"
 
+# STAMP it, as `blastbox build-images` does: the warm tiers check this file against their
+# host and refuse a mismatched guest. Unstamped, the tier only warns and boots it -- and this
+# script is the hotfix path, where host/guest drift is most likely. BLASTBOX_PY names a python
+# that can import blastbox (default: python3).
+echo ">> stamp rootfs (image provenance)"
+if ! "${BLASTBOX_PY:-python3}" -m blastbox.host.rootfs_stamp write "$rootdir" "$TAG" firecracker; then
+    echo "!! could not stamp the rootfs (is blastbox importable by ${BLASTBOX_PY:-python3}?)." >&2
+    echo "!! It will boot UNCHECKED against its host; rebuild with \`blastbox build-images\`." >&2
+fi
+
 echo ">> mke2fs -d (no mount, no root) -> $IMG (${SIZE_MIB} MiB)"
 rm -f "$IMG"
 truncate -s "${SIZE_MIB}M" "$IMG"

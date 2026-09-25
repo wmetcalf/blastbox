@@ -680,3 +680,70 @@ def test_debugfs_pipes_are_closed(tmp_path, monkeypatch) -> None:
         rfs.read_from_ext4(img)
     proc = _FakeDebugfs.instances[0]
     assert proc.closed and proc.stderr.closed
+
+
+# --- the legacy export scripts stamp too -----------------------------------------------
+
+
+def test_stamp_tree_records_what_the_image_says(tmp_path, monkeypatch) -> None:
+    from blastbox.host import stamp as st
+
+    monkeypatch.setattr(doctor, "version_in_image", lambda image, runner=None: ("9.9.9", ""))
+
+    labels = {st.LABEL_BLASTBOX: "9.9.9", st.LABEL_REVISION: "c0ffee" * 6 + "abcd"}
+
+    def run(argv, **kw):
+        if "{{json .Config.Labels}}" in argv:
+            return subprocess.CompletedProcess(list(argv), 0, json.dumps(labels), "")
+        if "{{.Architecture}}" in argv:
+            return subprocess.CompletedProcess(list(argv), 0, "arm64\n", "")
+        if "{{.Id}}" in argv:
+            return subprocess.CompletedProcess(list(argv), 0, "sha256:" + "f" * 64 + "\n", "")
+        raise AssertionError(argv)
+
+    rfs.stamp_tree(tmp_path, "eng-fc:1", "firecracker", run=run)
+    got = rfs.read_from_dir(tmp_path)
+    assert (got.blastbox_version, got.revision, got.image) == ("9.9.9", labels[st.LABEL_REVISION],
+                                                              "eng-fc:1")
+    assert got.image_id == "sha256:" + "f" * 64
+    assert got.platform == {"arch": "aarch64", "runtime": "firecracker"}
+
+
+def test_stamp_tree_prefers_the_installed_version_to_a_missing_label(tmp_path,
+                                                                     monkeypatch) -> None:
+    """The legacy scripts build with plain `docker build`: no labels at all. What the image
+    actually has installed is the truth anyway -- the label is only a self-report."""
+    monkeypatch.setattr(doctor, "version_in_image", lambda image, runner=None: ("0.1.42", ""))
+
+    def run(argv, **kw):
+        out = "{}" if "{{json .Config.Labels}}" in argv else "amd64\n"
+        return subprocess.CompletedProcess(list(argv), 0, out, "")
+
+    rfs.stamp_tree(tmp_path, "eng-fc:1", "firecracker", run=run)
+    assert rfs.read_from_dir(tmp_path).blastbox_version == "0.1.42"
+
+
+def test_stamp_tree_refuses_an_image_that_records_no_version(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(doctor, "version_in_image",
+                        lambda image, runner=None: (doctor.UNKNOWN, "no blastbox"))
+
+    def run(argv, **kw):
+        out = "{}" if "{{json .Config.Labels}}" in argv else "amd64\n"
+        return subprocess.CompletedProcess(list(argv), 0, out, "")
+
+    with pytest.raises(rfs.RootfsStampError, match="no blastbox version"):
+        rfs.stamp_tree(tmp_path, "eng-fc:1", "firecracker", run=run)
+
+
+def test_the_module_entry_point_writes_a_stamp(tmp_path, monkeypatch) -> None:
+    seen: list = []
+    monkeypatch.setattr(rfs, "stamp_tree", lambda *a, **k: seen.append(a))
+    assert rfs.main(["write", str(tmp_path), "eng-fc:1", "gvisor"]) == 0
+    assert seen == [(str(tmp_path), "eng-fc:1", "gvisor")]
+    assert rfs.main(["write", str(tmp_path), "eng-fc:1", "sparc"]) == 2
+
+
+def test_both_legacy_export_scripts_stamp_what_they_export() -> None:
+    root = Path(__file__).resolve().parents[2]
+    for script in ("deploy/firecracker/build-rootfs.sh", "deploy/redeploy-warm.sh"):
+        assert "-m blastbox.host.rootfs_stamp write" in (root / script).read_text(), script

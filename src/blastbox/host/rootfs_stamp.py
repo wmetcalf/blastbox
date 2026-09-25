@@ -585,6 +585,67 @@ class _PinnedBoot:
         return getattr(self._inner, name)
 
 
+def stamp_tree(tree: Path | str, image: str, runtime: str, *, run: Runner | None = None) -> Path:
+    """Stamp an extracted tree from what IMAGE records about itself -- for exports made
+    outside `build-images` (the legacy `deploy/` scripts).
+
+    Those scripts used to publish unstamped rootfs, which the tiers only warn about and boot:
+    exactly the hotfix path where a guest/host mismatch is most likely. The same provenance
+    `build-images` stamps -- the image's own blastbox label, revision and architecture -- and
+    the same hardened write.
+    """
+    from blastbox.host.imagerun import _DOCKER_ARCH  # noqa: PLC0415
+    from blastbox.host.stamp import UNKNOWN, read as read_image_stamp  # noqa: PLC0415
+
+    def runner(argv: Sequence[str]) -> "subprocess.CompletedProcess[str]":
+        if run is not None:
+            return run(list(argv), capture_output=True, text=True)
+        return subprocess.run(list(argv), capture_output=True, text=True, check=False)
+
+    from blastbox.host.doctor import version_in_image  # noqa: PLC0415
+
+    labels = read_image_stamp(image, runner)
+    # What the image ACTUALLY has installed is the truth; the label is a self-report, and the
+    # legacy scripts build with a plain `docker build` that writes no labels at all.
+    installed, detail = version_in_image(image, runner)
+    version = installed if installed not in ("", UNKNOWN) else labels.blastbox
+    if version in ("", UNKNOWN):
+        raise RootfsStampError(
+            f"{image} has no blastbox version: nothing installed ({detail or 'unreadable'}) and "
+            "no org.blastbox.version label; a rootfs stamped without one cannot be checked "
+            "against its host"
+        )
+
+    def inspect(fmt: str) -> str:
+        proc = runner(["docker", "inspect", "--type", "image", image, "--format", fmt])
+        return (proc.stdout or "").strip() if proc.returncode == 0 else ""
+
+    arch_raw = inspect("{{.Architecture}}")
+    stamp = RootfsStamp(
+        blastbox_version=version,
+        image=image,
+        image_id=inspect("{{.Id}}"),
+        revision="" if labels.revision in ("", UNKNOWN) else labels.revision,
+        exported_at=now_iso(),
+        platform={"arch": _DOCKER_ARCH.get(arch_raw, arch_raw), "runtime": runtime},
+    )
+    return write_into_tree(tree, stamp)
+
+
+def main(argv: Sequence[str]) -> int:
+    """`python -m blastbox.host.rootfs_stamp write TREE IMAGE {firecracker|gvisor}`."""
+    if len(argv) != 4 or argv[0] != "write" or argv[3] not in ("firecracker", "gvisor"):
+        print("usage: python -m blastbox.host.rootfs_stamp write TREE IMAGE "
+              "{firecracker|gvisor}")
+        return 2
+    try:
+        stamp_tree(argv[1], argv[2], argv[3])
+    except RootfsStampError as exc:
+        print(f"rootfs stamp: {exc}")
+        return 1
+    return 0
+
+
 def _default_runner(
     argv: Sequence[str], **kwargs: object
 ) -> "subprocess.CompletedProcess[str]":  # pragma: no cover - thin wrapper
@@ -607,5 +668,12 @@ __all__ = [
     "read",
     "read_from_dir",
     "read_from_ext4",
+    "stamp_tree",
     "write_into_tree",
 ]
+
+
+if __name__ == "__main__":  # pragma: no cover - thin CLI
+    import sys
+
+    sys.exit(main(sys.argv[1:]))
