@@ -205,6 +205,26 @@ def _default_runner(
     )
 
 
+def _probe_runner(run: Runner) -> Callable[[Sequence[str]], subprocess.CompletedProcess[str]]:
+    """``run`` for a probe that EXECUTES an image, bounded in time when it is the real runner.
+
+    The probe runs code whose provenance is the thing in question; _default_runner has no
+    timeout, so one that never exits hung staging with its temporary tree and container still
+    present. Bounded like the stamp module's own runner. A caller-supplied runner (a test
+    double, or a caller with its own policy) is used as given.
+    """
+    if run is not _default_runner:
+        return lambda argv: run(argv, capture_output=True)
+
+    def bounded(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(  # noqa: S603
+            list(argv), text=True, check=False, capture_output=True,
+            timeout=_rootfs_stamp.STAMP_TREE_TIMEOUT_S,
+        )
+
+    return bounded
+
+
 def _redact_argv(argv: Sequence[str]) -> list[str]:
     """``argv`` with secret --build-arg VALUES masked.
 
@@ -1565,7 +1585,13 @@ def stage_rootfs(
             # verification entirely; the verified path passes only the ID here, so verify_built()'s
             # "no package" (None) verdict never reached the stamp and the label was written as a
             # version the guest does not have.
-            agrees, detail = _verify_contents(source, lambda argv: run(argv, capture_output=True))  # type: ignore[arg-type]
+            try:
+                agrees, detail = _verify_contents(source, _probe_runner(run))  # type: ignore[arg-type]
+            except subprocess.TimeoutExpired as exc:
+                raise BuildError(
+                    f"{image}: the installed-blastbox probe timed out ({exc}); refusing to "
+                    "export an unchecked guest"
+                ) from exc
             # TRI-STATE, as verify_built() treats it: None means no blastbox package to compare
             # (a pure-JVM worker), which is valid -- and then the label (often inherited or set
             # at build time) describes nothing in the guest, so it is not stamped either.

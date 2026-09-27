@@ -625,21 +625,6 @@ def verdict(
     return problems
 
 
-def _versions_agree(containers: Sequence[Container], artifacts: Sequence[Artifact]) -> bool:
-    c_builds = {_build(c.version) for c in containers if c.known}
-    c_releases = {_release(c.version) for c in containers if c.known}
-    a_releases = {_release(a.version) for a in artifacts
-                  if a.known and a.version != NO_BLASTBOX}
-    if len(c_builds) > 1:
-        return False
-    if c_builds:
-        return a_releases <= c_releases
-    # Nothing running: judged against THIS host, as verdict() and the boot gate do.
-    import blastbox  # noqa: PLC0415
-
-    return a_releases <= {_release(str(getattr(blastbox, "__version__", "") or ""))}
-
-
 def fleet_report(
     containers: Sequence[Container], artifacts: Sequence[Artifact] = ()
 ) -> dict:
@@ -671,6 +656,9 @@ def fleet_report(
         "unbootable": unbootable,
         # Health judged as verdict() judges it: containers by BUILD, artifacts by RELEASE
         # (the guest check) -- not one raw string set.
-        "ok": not (mixed or unknown or unbootable) and _versions_agree(containers, artifacts),
+        # verdict() itself, at its strictest defaults: a second, hand-copied health rule drifted
+        # from it (it ignored --rootfs pairings, so an artifact no container of ITS project
+        # vouched for reported ok).
+        "ok": not verdict(containers, artifacts),
     }
 

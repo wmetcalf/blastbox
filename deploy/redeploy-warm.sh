@@ -231,6 +231,9 @@ log "gVisor rootfs -> $GVISOR_DIR/rootfs.${WARM_TAG}"
 docker build -q --build-arg BASE="$WARM_IMAGE" -f "$REPO/deploy/gvisor/Dockerfile.shim" \
   -t "${WARM_IMAGE%:*}-warm:gvisor-${WARM_TAG}" "$REPO" >/dev/null
 cid=$(docker create "${WARM_IMAGE%:*}-warm:gvisor-${WARM_TAG}")
+# Removed on ANY exit from here until the explicit rm: a failed inspect or export under set -e
+# otherwise left the container and its writable layer behind on every retry.
+trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
 sudo rm -rf "$GVISOR_DIR/rootfs.${WARM_TAG}"; sudo mkdir -p "$GVISOR_DIR/rootfs.${WARM_TAG}"
 gv_img=$(docker inspect --format '{{.Image}}' "$cid")   # immutable: the tag can be retagged
 # Checking out FETCH_HEAD leaves unrelated dirty or untracked files in place: mark them.
@@ -239,6 +242,7 @@ if [ -n "$gv_rev" ] && [ -n "$(git -C "$REPO" status --porcelain --untracked-fil
   gv_rev="${gv_rev}-dirty"
 fi
 docker export "$cid" | sudo tar -x -C "$GVISOR_DIR/rootfs.${WARM_TAG}"; docker rm "$cid" >/dev/null
+trap - EXIT
 # `|| true`: no python3 must reach the unstamped fallback below, not end the script (set -e).
 GV_PY="${BLASTBOX_PY:-$(command -v python3 || true)}"
 GV_PY="${GV_PY:-python3}"

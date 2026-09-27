@@ -1470,3 +1470,47 @@ def test_hung_debugfs_probes_are_capped_not_accumulated(tmp_path, monkeypatch) -
         assert rfs._ABANDONED_DEBUGFS == []
     finally:
         _UnkillableDebugfs.release = True
+
+
+# --- PR #186 codex (a408276) ----------------------------------------------------------------
+
+
+def test_the_staging_probe_runner_is_bounded_in_time(monkeypatch) -> None:
+    """The label probe EXECUTES the image; the default runner had no timeout, so a probe that
+    never exits hung staging with its tree and container still present."""
+    import blastbox.host.imagerun as mod
+
+    seen: dict = {}
+
+    def fake_run(argv, **kw):
+        seen.update(kw)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    mod._probe_runner(mod._default_runner)(["docker", "run", "img"])
+    assert seen.get("timeout") and seen["timeout"] <= rfs.STAMP_TREE_TIMEOUT_S
+    assert seen.get("capture_output") is True
+
+
+def test_a_staging_probe_timeout_is_a_build_error(tmp_path, monkeypatch) -> None:
+    mod = _direct(tmp_path, monkeypatch)
+    monkeypatch.setattr(mod, "_read_stamp", lambda ident, r=None: _ImgStamp())
+
+    def hangs(ident, r=None):
+        raise subprocess.TimeoutExpired("docker", 1)
+
+    monkeypatch.setattr(mod, "_verify_contents", hangs)
+    plan = _plan(tmp_path)
+    with pytest.raises(mod.BuildError, match="timed out"):
+        mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                         extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True)
+
+
+def test_report_health_honours_project_pairing() -> None:
+    """verdict() refuses an artifact paired to a project with no container to vouch for it;
+    the report's `ok` said healthy for the same input because another project matched."""
+    art = doctor.Artifact(path="/r/a", version="0.1.42", runtime="firecracker",
+                          arch=plat.host_platform().arch, project="pA")
+    ctrs = [_ctr(project="pB", version="0.1.42")]
+    assert doctor.verdict(ctrs, [art])
+    assert doctor.fleet_report(ctrs, [art])["ok"] is False
