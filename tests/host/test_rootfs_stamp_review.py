@@ -971,3 +971,33 @@ def test_platform_warnings_are_logged_before_an_unchecked_boot(tmp_path, caplog)
     with caplog.at_level("WARNING"):
         assert rfs.guest_problem(str(tree), "gvisor") == ""
     assert "records no platform" in caplog.text
+
+
+
+def test_a_direct_export_extracts_and_stamps_one_immutable_image(tmp_path, monkeypatch) -> None:
+    """export_rootfs() has no verified id: extracting the mutable TAG and then reading
+    provenance from it again let a retag in between pair image A's tree with image B's stamp."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_root_prefix", lambda: [])
+    monkeypatch.setattr(mod, "_can_be_root", lambda: False)
+    monkeypatch.setenv("DEMO_DIR", str(tmp_path / "out"))
+    read_from: list[str] = []
+    monkeypatch.setattr(mod, "_read_stamp",
+                        lambda ident, r=None: read_from.append(ident) or _ImgStamp())
+    captured: list = []
+    monkeypatch.setattr(mod._rootfs_stamp, "write_into_tree",
+                        lambda tree, stamp, **kw: captured.append(stamp))
+    extracted: list[str] = []
+    fake = _fake_extract({"/init": "x"})
+
+    def extract(source, dest):
+        extracted.append(source)
+        fake(source, dest)
+
+    plan = _plan(tmp_path)
+    mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                     extract=extract, extract_preserves_ownership=True)
+    ident = "sha256:" + "e" * 64                  # what FakeRunner resolves any tag to
+    assert extracted == [ident] and read_from == [ident]
+    assert captured[0].image_id == ident

@@ -439,4 +439,40 @@ def test_a_stale_gvisor_restore_that_cannot_be_deleted_is_kept_for_retry(tmp_pat
     with pytest.raises(SnapshotRestoreError, match="changed") as info:
         backend.restore_in(tmp_path / "slots" / "s1", art)
     assert getattr(info.value, "kill_failed", False) is True
-    assert str(tmp_path / "slots" / "s1") in backend._stranded_partials
+    # The SANDBOX is what must be retried: the directory sweep only rmtrees, and removing the
+    # bundle under a live sandbox is worse than leaving it. Kept as (cid, workdir).
+    (cid, wd), = backend._stranded_sandboxes
+    assert cid.startswith("slot-") and wd == str(tmp_path / "slots" / "s1")
+    assert wd not in backend._stranded_partials
+    # The next boot retries `runsc delete` first; only once the sandbox is gone does its
+    # bundle go to the directory sweep.
+    deleted: list[str] = []
+    monkeypatch.setattr(gs, "_best_effort_delete", lambda cfg, run, c: deleted.append(c) or True)
+    backend.boot_base()
+    assert cid in deleted
+    assert backend._stranded_sandboxes == []
+
+
+def test_a_failed_restore_that_cannot_be_deleted_retries_the_sandbox_too(tmp_path,
+                                                                         monkeypatch) -> None:
+    """The pre-existing failed-restore path recorded only the workdir, which the sweep can
+    rmtree but never `runsc delete` -- the sandbox itself was never retried."""
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    monkeypatch.setattr(rfs, "guest_verdict", lambda p, r: ("", True))
+    backend, rec = _gv_backend(tmp_path)
+    boot = backend.boot_base()
+    boot.wait_ready(5.0)
+    art = boot.checkpoint(tmp_path / "ckpt")
+    real_run = backend._run
+
+    def restore_fails(argv, **kw):
+        if "restore" in argv:
+            raise RuntimeError("runsc restore failed")
+        return real_run(argv, **kw)
+
+    backend._run = restore_fails
+    monkeypatch.setattr(gs, "_best_effort_delete", lambda cfg, run, cid: False)
+    with pytest.raises(Exception):
+        backend.restore_in(tmp_path / "slots" / "s2", art)
+    assert [wd for _cid, wd in backend._stranded_sandboxes] == [str(tmp_path / "slots" / "s2")]

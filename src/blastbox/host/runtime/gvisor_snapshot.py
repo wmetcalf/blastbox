@@ -1068,6 +1068,7 @@ class GvisorSnapshotBackend:
         # filesystem blocked the boot that would have reached the cleanup, and the tier stayed
         # cold permanently. Same fix as the FC launcher; a retry is worthless if the condition it
         # fixes is what stops you reaching it (upstream, PR #82).
+        self._retry_stranded_sandboxes()
         _retry_stranded_partials(self._stranded_partials)
         # The rootfs is checked HERE, where it is booted -- not only at tier selection: a tree
         # republished while the dispatcher runs is otherwise built into a base unchecked.
@@ -1150,6 +1151,35 @@ class GvisorSnapshotBackend:
             rootfs_key,
         )
 
+    def _strand_sandbox(self, cid: str, wd: Path) -> None:
+        """Record a sandbox whose teardown could not be confirmed, for retry."""
+        with _STRANDED_LOCK:
+            self.__dict__.setdefault("_stranded_sandboxes", []).append((cid, str(wd)))
+
+    def _retry_stranded_sandboxes(self) -> None:
+        """Retry `runsc delete` for sandboxes a failed restore could not tear down.
+
+        Only once one is confirmed gone does its bundle go to the directory sweep: removing the
+        bundle under a live sandbox is worse than leaving both.
+        """
+        with _STRANDED_LOCK:
+            batch = list(self.__dict__.get("_stranded_sandboxes", []))
+            self.__dict__["_stranded_sandboxes"] = []
+        still: list[tuple[str, str]] = []
+        for cid, wd in batch:
+            if _best_effort_delete(self._cfg, self._run, cid):
+                with _STRANDED_LOCK:
+                    self._stranded_partials.append(wd)
+            else:
+                still.append((cid, wd))
+        if still:
+            with _STRANDED_LOCK:
+                self.__dict__.setdefault("_stranded_sandboxes", []).extend(still)
+
+    @property
+    def _stranded_sandboxes(self) -> "list[tuple[str, str]]":
+        return self.__dict__.setdefault("_stranded_sandboxes", [])
+
     def _rootfs_pin(self) -> Any:
         """The directory rootfs, pinned per checkpoint (see rootfs_stamp.RootfsPin). Lazy, so a
         backend built without __init__ (tests, subclasses) still gets one."""
@@ -1163,6 +1193,9 @@ class GvisorSnapshotBackend:
         return pin
 
     def restore_in(self, slot_workdir: Path, artifact: object) -> GvisorRestoreHandle:
+        # A stranded sandbox otherwise waits for the next BASE build -- hours, on a busy tier.
+        # Free when the ledger is empty, which is almost always.
+        self._retry_stranded_sandboxes()
         # A tree replaced since this checkpoint would pair the checkpointed memory with a
         # different filesystem (see rootfs_stamp.RootfsPin). Refused before anything runs.
         from blastbox.host.rootfs_stamp import RootfsStampError
@@ -1217,9 +1250,9 @@ class GvisorSnapshotBackend:
                 # discards the cid and removes the slot workdir, so nothing could ever retry the
                 # teardown OR release that pin: repeated restores leaked sandbox/gofer processes
                 # and the checkpoint could never be reclaimed. Same retention the base-boot path
-                # now does (upstream, PR #82).
-                with _STRANDED_LOCK:
-                    self._stranded_partials.append(str(wd))
+                # now does (upstream, PR #82). The SANDBOX is what is retried -- the directory
+                # sweep only rmtrees, and could never `runsc delete` it.
+                self._strand_sandbox(cid, wd)
                 _log.warning("gvisor_snapshot: restore sandbox %s could not be confirmed deleted; "
                              "retaining its bundle for retry", cid)
             # Same treatment as the base boot: `CalledProcessError.__str__` does
@@ -1247,8 +1280,7 @@ class GvisorSnapshotBackend:
             # dropping the only handle stranded a sandbox until the dispatcher restarted.
             if not _best_effort_delete(self._cfg, self._run, cid):
                 stale.kill_failed = True  # type: ignore[attr-defined]
-                with _STRANDED_LOCK:
-                    self._stranded_partials.append(str(wd))
+                self._strand_sandbox(cid, wd)
                 _log.warning("gvisor_snapshot: stale restore sandbox %s could not be confirmed "
                              "deleted; retaining its bundle for retry", cid)
             raise stale from exc

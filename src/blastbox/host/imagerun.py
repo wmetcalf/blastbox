@@ -1452,7 +1452,10 @@ def stage_rootfs(
     image = f"{spec.image}:{tag}"
     # Extracted by the ID verification resolved, when there is one: a tag is
     # mutable, and re-resolving it here can hand us an image nothing checked.
-    source = verified_id or image
+    # ...and with no verified id (the direct export_rootfs() API), resolve the tag ONCE, here:
+    # extracting the mutable tag and then reading provenance from it again let a retag in
+    # between pair image A's tree with image B's stamp.
+    source = verified_id or _image_id(image, run) or image
     dest = Path(spec.resolved_dest(env))
     # Asked of the TEMPLATE, like the dry run and the plan validator. This is
     # the last of the three and the one that actually guards the write, so
@@ -1529,7 +1532,7 @@ def stage_rootfs(
                 _rootfs_stamp.RootfsStamp(
                     blastbox_version=img_version,
                     image=image,
-                    image_id=verified_id,
+                    image_id=verified_id or (source if source != image else ""),
                     revision=img_revision,
                     exported_at=_rootfs_stamp.now_iso(),
                     platform=_export_platform(spec, img_arch).to_dict(),
