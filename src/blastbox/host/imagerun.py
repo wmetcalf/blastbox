@@ -1455,7 +1455,14 @@ def stage_rootfs(
     # ...and with no verified id (the direct export_rootfs() API), resolve the tag ONCE, here:
     # extracting the mutable tag and then reading provenance from it again let a retag in
     # between pair image A's tree with image B's stamp.
-    source = verified_id or _image_id(image, run) or image
+    source = verified_id or _image_id(image, run)
+    if not source:
+        # NEVER fall back to the mutable tag: a transient inspect failure followed by a
+        # successful create reopened exactly the retag race this resolution closes.
+        raise BuildError(
+            f"cannot resolve {image} to an immutable image id; refusing to export from a "
+            "mutable tag"
+        )
     dest = Path(spec.resolved_dest(env))
     # Asked of the TEMPLATE, like the dry run and the plan validator. This is
     # the last of the three and the one that actually guards the write, so
@@ -1526,12 +1533,24 @@ def stage_rootfs(
         # so a label here would not survive. This is the only record that
         # survives into the thing a warm tier actually boots.
         img_version, img_revision, img_arch = _image_provenance(plan, source, run)
-        if img_version and not verified_id:
+        if not img_version and not verified_id:
+            # No label: probe what the image actually has installed and stamp THAT, rather
+            # than publish an artifact whose version is unknown.
+            from blastbox.host.doctor import version_in_image  # noqa: PLC0415
+
+            installed, _detail = version_in_image(
+                source, lambda argv: run(argv, capture_output=True)  # type: ignore[arg-type]
+            )
+            if _rootfs_stamp._is_version(installed):
+                img_version = installed
+        elif img_version and not verified_id:
             # The direct export_rootfs() path skipped run_plan's verification, so a stale or
             # wrong label would be stamped as-is. Check it against what the image ACTUALLY
             # has installed before it is written anywhere a host will trust.
             agrees, detail = _verify_contents(source, lambda argv: run(argv, capture_output=True))  # type: ignore[arg-type]
-            if agrees is not True:
+            # TRI-STATE, as verify_built() treats it: None means no blastbox package to compare
+            # (a pure-JVM worker), which is valid; only a contradiction is refused.
+            if agrees is False:
                 raise BuildError(
                     f"{image}: its blastbox label cannot be trusted for the rootfs stamp: "
                     f"{detail or 'the installed version could not be read'}"

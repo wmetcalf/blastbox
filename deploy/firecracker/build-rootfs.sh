@@ -54,6 +54,8 @@ echo ">> export rootfs -> $rootdir"
 # script is the hotfix path, where host/guest drift is most likely. BLASTBOX_PY names a python
 # that can import blastbox (default: python3).
 echo ">> stamp rootfs (image provenance)"
+# Never publish a stamp baked into the IMAGE: it would pass for this export's own.
+rm -f "$rootdir/opt/blastbox/rootfs-stamp.json"
 # The source revision, marked "-dirty" (the same suffix `blastbox stamp` uses) when tracked or
 # untracked changes could have entered the image: a clean commit must not claim a build it
 # cannot reproduce.
@@ -66,6 +68,7 @@ fi
 if ! "${BLASTBOX_PY:-python3}" -m blastbox.host.rootfs_stamp write "$rootdir" "$img_id" firecracker \
      "$src_rev" \
    || [ ! -s "$rootdir/opt/blastbox/rootfs-stamp.json" ]; then
+    rm -f "$rootdir/opt/blastbox/rootfs-stamp.json"     # no partial or inherited stamp survives
     echo "!! could not stamp the rootfs (is blastbox importable by ${BLASTBOX_PY:-python3}?)." >&2
     echo "!! It will boot UNCHECKED against its host; rebuild with \`blastbox build-images\`." >&2
 fi

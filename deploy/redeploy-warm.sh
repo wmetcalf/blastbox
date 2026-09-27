@@ -239,6 +239,7 @@ if [ -n "$gv_rev" ] && [ -n "$(git -C "$REPO" status --porcelain 2>/dev/null)" ]
   gv_rev="${gv_rev}-dirty"
 fi
 docker export "$cid" | sudo tar -x -C "$GVISOR_DIR/rootfs.${WARM_TAG}"; docker rm "$cid" >/dev/null
+sudo rm -f "$GVISOR_DIR/rootfs.${WARM_TAG}/opt/blastbox/rootfs-stamp.json"   # never an inherited one
 # Stamped like build-images' output (the FC rootfs is stamped inside build-rootfs.sh). As root:
 # the tree was extracted as root. BLASTBOX_PY must be an absolute python that imports blastbox.
 # Verified by the FILE, not the exit status: an older blastbox exits 0 having written nothing.
@@ -246,6 +247,7 @@ if ! sudo "${BLASTBOX_PY:-$(command -v python3)}" -m blastbox.host.rootfs_stamp 
      "$GVISOR_DIR/rootfs.${WARM_TAG}" "$gv_img" gvisor \
      "$gv_rev" \
    || ! sudo test -s "$GVISOR_DIR/rootfs.${WARM_TAG}/opt/blastbox/rootfs-stamp.json"; then
+  sudo rm -f "$GVISOR_DIR/rootfs.${WARM_TAG}/opt/blastbox/rootfs-stamp.json"
   log "WARNING: gVisor rootfs NOT stamped -- it will boot unchecked against its host"
 fi
 

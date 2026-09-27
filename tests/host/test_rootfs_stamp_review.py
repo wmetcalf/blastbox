@@ -1021,3 +1021,68 @@ def test_a_direct_export_verifies_the_label_against_the_installed_blastbox(tmp_p
     with pytest.raises(mod.BuildError, match="0.1.30"):
         mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
                          extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True)
+
+
+
+# --- codex bot, ninth pass ----------------------------------------------------------------
+
+
+def _direct(tmp_path, monkeypatch):
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_root_prefix", lambda: [])
+    monkeypatch.setattr(mod, "_can_be_root", lambda: False)
+    monkeypatch.setenv("DEMO_DIR", str(tmp_path / "out"))
+    return mod
+
+
+def test_a_direct_export_whose_image_id_cannot_be_resolved_fails(tmp_path, monkeypatch) -> None:
+    mod = _direct(tmp_path, monkeypatch)
+    monkeypatch.setattr(mod, "_image_id", lambda image, run: "")
+    plan = _plan(tmp_path)
+    with pytest.raises(mod.BuildError, match="immutable"):
+        mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                         extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True)
+
+
+def test_a_direct_export_accepts_an_image_without_blastbox(tmp_path, monkeypatch) -> None:
+    """verify_contents() -> None means "no blastbox package to compare" (a pure-JVM worker),
+    which verify_built() accepts; the direct path refused it."""
+    mod = _direct(tmp_path, monkeypatch)
+    monkeypatch.setattr(mod, "_read_stamp", lambda ident, r=None: _ImgStamp())
+    monkeypatch.setattr(mod, "_verify_contents", lambda ident, r=None: (None, "no blastbox"))
+    captured: list = []
+    monkeypatch.setattr(mod._rootfs_stamp, "write_into_tree",
+                        lambda tree, stamp, **kw: captured.append(stamp))
+    plan = _plan(tmp_path)
+    mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                     extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True)
+    assert captured and captured[0].blastbox_version == "9.9.9"
+
+
+def test_a_label_less_direct_export_stamps_the_installed_version(tmp_path, monkeypatch) -> None:
+    mod = _direct(tmp_path, monkeypatch)
+
+    class NoLabel:
+        blastbox = "unknown"
+        revision = "unknown"
+
+    monkeypatch.setattr(mod, "_read_stamp", lambda ident, r=None: NoLabel())
+    monkeypatch.setattr(doctor, "version_in_image", lambda image, runner=None: ("0.1.42", ""))
+    captured: list = []
+    monkeypatch.setattr(mod._rootfs_stamp, "write_into_tree",
+                        lambda tree, stamp, **kw: captured.append(stamp))
+    plan = _plan(tmp_path)
+    mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                     extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True)
+    assert captured[0].blastbox_version == "0.1.42"
+
+
+def test_the_legacy_scripts_never_publish_an_inherited_stamp() -> None:
+    """A stamp baked into the IMAGE survived a failed stamping step and was published as if
+    this export had been checked."""
+    root = Path(__file__).resolve().parents[2]
+    fc = (root / "deploy/firecracker/build-rootfs.sh").read_text()
+    gv = (root / "deploy/redeploy-warm.sh").read_text()
+    assert fc.count('rm -f "$rootdir/opt/blastbox/rootfs-stamp.json"') >= 2
+    assert gv.count('rootfs.${WARM_TAG}/opt/blastbox/rootfs-stamp.json"') >= 3

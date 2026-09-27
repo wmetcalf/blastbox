@@ -613,3 +613,71 @@ def test_restore_reclaimed_never_blocks_on_a_wedged_delete(tmp_path, monkeypatch
     assert backend.restore_reclaimed(str(tmp_path / "slots" / "s9")) is False
     assert _t.monotonic() - t0 < 1.0
     release.set()
+
+
+
+# --- codex bot, ninth pass ----------------------------------------------------------------
+
+
+def test_a_base_that_opened_a_different_rootfs_is_not_pinned(tmp_path, monkeypatch) -> None:
+    """A publish rolled back between before_boot() and the checkpoint left the PATH at A while
+    the base had opened B; the pin then recorded A and every restore passed."""
+    monkeypatch.setattr(rfs, "guest_verdict", lambda p, r: ("", True))
+    f = tmp_path / "rootfs.ext4"
+    f.write_bytes(b"A")
+    pin = rfs.RootfsPin(str(f), "firecracker")
+    key = pin.before_boot()
+    os.link(f, tmp_path / "A.bak")
+    _replace(f, b"B")
+    held = open(f, "rb")                          # the base booted B
+    try:
+        os.replace(tmp_path / "A.bak", f)         # rolled back before the checkpoint
+
+        class Base:
+            proc = type("P", (), {"pid": os.getpid()})()
+
+            def checkpoint(self, dest):
+                return "artifact-x"
+
+        with pytest.raises(rfs.RootfsStampError, match="different file"):
+            pin.wrap(Base(), key).checkpoint(tmp_path)
+    finally:
+        held.close()
+
+
+def test_a_plain_fc_slot_is_judged_by_the_inode_it_opened(tmp_path, monkeypatch) -> None:
+    from blastbox.host.runtime.firecracker import FCConfig, FirecrackerSlotRuntime
+
+    from .test_firecracker import _FakeReadySignal, _FakeSubprocessRunner
+
+    rootfs = tmp_path / "rootfs.ext4"
+    rootfs.write_bytes(b"A")
+    monkeypatch.setattr(rfs, "guest_verdict", lambda p, r: ("", True))
+    cfg = FCConfig(fc_bin="firecracker", fc_kernel="/mnt/vmlinux", fc_rootfs=str(rootfs),
+                   fc_vcpu_count=1, fc_mem_mib=256, fc_outdisk_mib=64,
+                   scratch_root=str(tmp_path / "scratch"))
+    rt = FirecrackerSlotRuntime(cfg, subprocess_runner=_FakeSubprocessRunner(),
+                                ready_signal=_FakeReadySignal(ready=True))
+    monkeypatch.setattr("blastbox.host.runtime.firecracker.make_ext4", lambda p, mib: p.touch())
+    slot = rt.spawn()
+    os.link(rootfs, tmp_path / "A.bak")
+    _replace(rootfs, b"B")
+    held = open(rootfs, "rb")                     # "firecracker" opened B
+    try:
+        os.replace(tmp_path / "A.bak", rootfs)    # path shows A again
+        monkeypatch.setattr(rt._procs[slot.slot_id], "kill", lambda: None)
+        monkeypatch.setattr(rt._procs[slot.slot_id], "pid", os.getpid(), raising=False)
+        assert rt.is_ready(slot) is False
+    finally:
+        held.close()
+
+
+def test_a_stamp_with_no_version_is_a_warning_not_a_refusal(tmp_path, caplog) -> None:
+    """A guest with no blastbox installed (a pure-JVM worker) is valid -- verify_built accepts
+    it -- so its version is unchecked, loudly, rather than refused; arch/runtime still apply."""
+    tree = tmp_path / "rootfs"
+    rfs.write_into_tree(tree, rfs.RootfsStamp(blastbox_version="", platform={
+        "arch": __import__("platform").machine(), "runtime": "gvisor"}))
+    with caplog.at_level("WARNING"):
+        assert rfs.guest_problem(str(tree), "gvisor") == ""
+    assert "no blastbox version" in caplog.text

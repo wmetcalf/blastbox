@@ -490,6 +490,12 @@ def guest_verdict(rootfs: str, runtime: str) -> tuple[str, bool]:
     fatal = _plat.refusals(findings)
     if fatal:
         return f"{rootfs}: {_plat.summarise(fatal)}", True
+    if not (stamp.blastbox_version or "").strip():
+        # A guest with no blastbox installed (a pure-JVM worker) is valid -- verify_built()
+        # accepts it -- so its VERSION is unchecked, said loudly; arch/runtime still applied.
+        log.warning("rootfs %s records no blastbox version, so its guest version is not "
+                    "checked against this host", rootfs)
+        return "", True
     complaint = compare_to_host(stamp, host)
     if complaint:
         return (
@@ -694,6 +700,15 @@ class _PinnedBoot:
         self._pin = pin
 
     def checkpoint(self, dest_dir: Path) -> object:
+        # The BASE, like a restore: a publish rolled back between before_boot() and here leaves
+        # the path at the checked file while the base opened another -- and the pin would then
+        # bless every restore of memory captured against the wrong disk.
+        pid = getattr(getattr(self._inner, "proc", None), "pid", None)
+        if pid and opened_matches(pid, self._pin.gate.rootfs, self._key) is False:
+            raise RootfsStale(
+                f"{self._pin.gate.rootfs}: the base opened a different file than the one that "
+                "was checked (a republish landed during the base boot); not checkpointing it"
+            )
         artifact = self._inner.checkpoint(dest_dir)  # type: ignore[attr-defined]
         self._pin.record(artifact, self._key)
         return artifact

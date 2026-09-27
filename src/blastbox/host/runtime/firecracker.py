@@ -1486,9 +1486,18 @@ class FirecrackerSlotRuntime:
         key = keys[slot_id]
         if key is None:
             return False
-        from blastbox.host.rootfs_stamp import file_identity
+        from blastbox.host.rootfs_stamp import file_identity, opened_matches
 
-        return file_identity(getattr(self._cfg, "fc_rootfs", "") or "") != key
+        rootfs = getattr(self._cfg, "fc_rootfs", "") or ""
+        # By the inode firecracker actually HOLDS when /proc can say -- a publish rolled back
+        # (A->B->A) leaves the path matching while the VM has B open -- else by the path.
+        with self._lock:
+            fc_proc = self._procs.get(slot_id)
+        pid = getattr(fc_proc, "pid", None) or getattr(getattr(fc_proc, "proc", None), "pid", None)
+        opened = opened_matches(pid, rootfs, key) if isinstance(pid, int) and pid > 0 else None
+        if opened is not None:
+            return not opened
+        return file_identity(rootfs) != key
 
     def is_alive(self, slot: Slot) -> bool:
         """Return True iff the Firecracker subprocess is still running."""

@@ -1469,6 +1469,10 @@ def test_a_staging_directory_that_was_never_named_is_refused(
 
     class SilentMktemp(FakeRunner):
         def __call__(self, argv, **kw):
+            if "{{.Id}}" in argv:
+                # Only mktemp is silent: the tag still resolves to an immutable id, or the
+                # export refuses on THAT before reaching the refusal this test is about.
+                return super().__call__(argv, **kw)
             self.calls.append(list(argv))
             return subprocess.CompletedProcess(list(argv), 0, stdout="", stderr="")
 
