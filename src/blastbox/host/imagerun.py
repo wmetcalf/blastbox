@@ -1405,10 +1405,10 @@ def _image_provenance(plan: "Plan", source: str, run: Runner) -> tuple[str, str,
 
     version = revision = ""
     try:
-        # capture_output: this module's runner returns stdout only when asked. Without it
-        # stamp.read() saw None, and every production export silently fell back to the
-        # exporter's version -- the very substitution this function exists to prevent.
-        img = _read_stamp(source, lambda argv: run(argv, capture_output=True))  # type: ignore[arg-type]
+        # _probe_runner: captured -- this module's runner returns stdout only when asked, and
+        # without it stamp.read() saw None and every production export silently fell back to the
+        # exporter's version -- and bounded in time, like every other probe of the image.
+        img = _read_stamp(source, _probe_runner(run))
         version = "" if img.blastbox in ("", _UNKNOWN) else img.blastbox
         revision = "" if img.revision in ("", _UNKNOWN) else img.revision
     except Exception as exc:  # noqa: BLE001 - any failure to read it is a failed export
@@ -1566,9 +1566,14 @@ def stage_rootfs(
             # than publish an artifact whose version is unknown.
             from blastbox.host.doctor import NOPKG, version_in_image  # noqa: PLC0415
 
-            installed, detail = version_in_image(
-                source, lambda argv: run(argv, capture_output=True)  # type: ignore[arg-type]
-            )
+            # Bounded like the labelled path: this EXECUTES the image's python.
+            try:
+                installed, detail = version_in_image(source, _probe_runner(run))
+            except subprocess.TimeoutExpired as exc:
+                raise BuildError(
+                    f"{image}: the installed-blastbox probe timed out ({exc}); refusing to "
+                    "export an unchecked guest"
+                ) from exc
             if _rootfs_stamp._is_version(installed):
                 img_version = installed
             elif installed != NOPKG:

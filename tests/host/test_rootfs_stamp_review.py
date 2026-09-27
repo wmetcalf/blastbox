@@ -1514,3 +1514,59 @@ def test_report_health_honours_project_pairing() -> None:
     ctrs = [_ctr(project="pB", version="0.1.42")]
     assert doctor.verdict(ctrs, [art])
     assert doctor.fleet_report(ctrs, [art])["ok"] is False
+
+
+def test_the_label_less_probe_uses_the_bounded_runner_too(tmp_path, monkeypatch) -> None:
+    """PR #186 codex (2dad9af): the label-free path still called version_in_image through an
+    untimed lambda, so a hanging sitecustomize in the image blocked staging indefinitely."""
+    mod = _direct(tmp_path, monkeypatch)
+
+    class NoLabel:
+        blastbox = "unknown"
+        revision = "unknown"
+
+    bounded = object()
+    monkeypatch.setattr(mod, "_read_stamp", lambda ident, r=None: NoLabel())
+    monkeypatch.setattr(mod, "_probe_runner", lambda run: bounded)
+    got: list = []
+    monkeypatch.setattr(doctor, "version_in_image",
+                        lambda image, runner=None: got.append(runner) or ("0.1.42", ""))
+    plan = _plan(tmp_path)
+    mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                     extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True)
+    assert got == [bounded]
+
+
+def test_a_label_less_probe_timeout_is_a_build_error(tmp_path, monkeypatch) -> None:
+    mod = _direct(tmp_path, monkeypatch)
+
+    class NoLabel:
+        blastbox = "unknown"
+        revision = "unknown"
+
+    def hangs(image, runner=None):
+        raise subprocess.TimeoutExpired("docker", 1)
+
+    monkeypatch.setattr(mod, "_read_stamp", lambda ident, r=None: NoLabel())
+    monkeypatch.setattr(doctor, "version_in_image", hangs)
+    plan = _plan(tmp_path)
+    with pytest.raises(mod.BuildError, match="timed out"):
+        mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                         extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True)
+
+
+def test_the_provenance_label_read_is_bounded_too(tmp_path, monkeypatch) -> None:
+    import blastbox.host.imagerun as mod
+
+    bounded = object()
+    got: list = []
+    monkeypatch.setattr(mod, "_probe_runner", lambda run: bounded)
+
+    def read(ident, r=None):
+        got.append(r)
+        raise subprocess.TimeoutExpired("docker", 1)
+
+    monkeypatch.setattr(mod, "_read_stamp", read)
+    with pytest.raises(mod.BuildError, match="provenance"):
+        mod._image_provenance(_plan(tmp_path), "sha256:" + "e" * 64, FakeRunner())
+    assert got == [bounded]
