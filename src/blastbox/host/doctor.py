@@ -46,6 +46,9 @@ _PROBE = (
 
 UNKNOWN = "unknown"
 NOPKG = "NOPKG"
+#: An artifact whose stamp was READ and records no blastbox (a pure-JVM guest). Known, but
+#: exempt from every version comparison -- there is no version to compare.
+NO_BLASTBOX = "(no blastbox)"
 _PROBEFAIL = "PROBEFAIL"
 # Probe output is attacker-influenced (a compromised worker controls stdout), so
 # it is never printed raw.
@@ -404,7 +407,9 @@ def survey_rootfs(paths: Sequence[str]) -> list[Artifact]:
         out.append(
             Artifact(
                 path=path,
-                version=version or UNKNOWN,
+                # READ, and definitively without blastbox (a pure-JVM worker): the boot gate
+                # admits it on arch/runtime, so doctor must not call it unreadable.
+                version=version or NO_BLASTBOX,
                 runtime=_sanitise(plat.runtime),
                 arch=_sanitise(plat.arch),
                 cpu_vendor=_sanitise(plat.cpu_vendor),
@@ -413,7 +418,7 @@ def survey_rootfs(paths: Sequence[str]) -> list[Artifact]:
                 # that points at no image.
                 image=stamp.image,
                 exported_at=_sanitise(stamp.exported_at),
-                detail="" if version else "stamp records no version",
+                detail="" if version else "no blastbox in the guest; version not checked",
                 project=project,
             )
         )
@@ -545,7 +550,7 @@ def verdict(
             problems.append(f"expected {expect}, but found nothing to verify")
         return problems
     known_c = [c for c in containers if c.known]
-    known_a = [a for a in artifacts if a.known]
+    known_a = [a for a in artifacts if a.known and a.version != NO_BLASTBOX]
     if expect:
         # Containers must be the exact BUILD named; an artifact is judged by release, the way
         # the tier boots it.
@@ -602,7 +607,7 @@ def fleet_report(
     deliberately strict, because the failure this exists for looked fine.
     """
     versions = sorted({c.version for c in containers if c.known} |
-                      {a.version for a in artifacts if a.known})
+                      {a.version for a in artifacts if a.known and a.version != NO_BLASTBOX})
     unknown = [c.name for c in containers if not c.known] + [
         a.path for a in artifacts if not a.known
     ]

@@ -162,6 +162,29 @@ class FcSnapshotBackend:
         sweep = getattr(self._launcher, "sweep_orphan_generations", None)
         return sweep() if callable(sweep) else 0
 
+    def restore_reclaimed(self, workdir: str) -> bool:
+        """Whether the firecracker of a failed restore whose kill failed is confirmed gone.
+
+        The manager holds that generation's pin until this says so (see
+        SnapshotManager._release_held_restores). Retries the kill; gone once the process has
+        exited. Unknown workdirs were never held here, so there is nothing to wait for.
+        """
+        unreaped = self.__dict__.setdefault("_unreaped", {})
+        handle = unreaped.get(str(workdir))
+        if handle is None:
+            return True
+        proc = getattr(handle, "proc", None)
+        gone = proc is not None and proc.poll() is not None
+        if not gone:
+            try:
+                handle.kill()
+                gone = proc is None or proc.poll() is not None
+            except Exception:  # noqa: BLE001 -- still alive; asked again next tick
+                return False
+        if gone:
+            unreaped.pop(str(workdir), None)
+        return gone
+
     def discard(self, artifact: object) -> None:
         """Unlink a fully drained generation's files.
 
@@ -322,5 +345,8 @@ class FcSnapshotBackend:
                 _log.warning("fc_snapshot: could not kill firecracker after a failed restore: %s",
                              kill_exc)
                 exc.kill_failed = True  # type: ignore[attr-defined]
+                # ...and KEEP the handle: the manager holds this generation's pin until
+                # restore_reclaimed() confirms the process is gone, and only the handle can.
+                self.__dict__.setdefault("_unreaped", {})[str(slot_workdir)] = handle
             raise
         return handle

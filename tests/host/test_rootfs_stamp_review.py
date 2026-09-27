@@ -1101,7 +1101,65 @@ def test_the_legacy_scripts_never_publish_an_inherited_stamp() -> None:
     """A stamp baked into the IMAGE survived a failed stamping step and was published as if
     this export had been checked."""
     root = Path(__file__).resolve().parents[2]
-    fc = (root / "deploy/firecracker/build-rootfs.sh").read_text()
-    gv = (root / "deploy/redeploy-warm.sh").read_text()
-    assert fc.count('rm -f "$rootdir/opt/blastbox/rootfs-stamp.json"') >= 2
-    assert gv.count('rootfs.${WARM_TAG}/opt/blastbox/rootfs-stamp.json"') >= 3
+    # Cleared before stamping AND again on failure, through the link-confined helper.
+    for script in ("deploy/firecracker/build-rootfs.sh", "deploy/redeploy-warm.sh"):
+        assert (root / script).read_text().count("rootfs_stamp clear") >= 2, script
+
+
+
+# --- codex bot, eleventh pass -------------------------------------------------------------
+
+
+def test_a_label_less_direct_export_refuses_an_unreadable_probe(tmp_path, monkeypatch) -> None:
+    """UNKNOWN (timeout, unreadable metadata) is not NOPKG: stamping it empty let a transient
+    failure publish an unchecked Python worker as a "pure-JVM" guest."""
+    mod = _direct(tmp_path, monkeypatch)
+
+    class NoLabel:
+        blastbox = "unknown"
+        revision = "unknown"
+
+    monkeypatch.setattr(mod, "_read_stamp", lambda ident, r=None: NoLabel())
+    monkeypatch.setattr(doctor, "version_in_image",
+                        lambda image, runner=None: (doctor.UNKNOWN, "probe timed out"))
+    plan = _plan(tmp_path)
+    with pytest.raises(mod.BuildError, match="could not be verified"):
+        mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                         extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True)
+
+
+def test_doctor_reads_a_versionless_stamp_as_a_guest_without_blastbox(tmp_path) -> None:
+    """The boot gate admits a NOPKG guest (arch/runtime checked); doctor called the same
+    artifact unreadable and exited nonzero."""
+    tree = tmp_path / "rootfs"
+    rfs.write_into_tree(tree, rfs.RootfsStamp(blastbox_version="", platform={
+        "arch": plat.host_platform().arch, "runtime": "gvisor"}))
+    (art,) = doctor.survey_rootfs([str(tree)])
+    assert art.known and art.version == doctor.NO_BLASTBOX
+    assert doctor.verdict([_ctr(version="0.1.42")], [art]) == []
+
+
+def test_clearing_an_inherited_stamp_never_follows_the_images_links(tmp_path) -> None:
+    """`sudo rm` of tree/opt/blastbox/rootfs-stamp.json followed an image-controlled
+    opt/blastbox symlink and deleted a stamp in a HOST directory."""
+    tree, host = tmp_path / "tree", tmp_path / "host"
+    (tree / "opt").mkdir(parents=True)
+    host.mkdir()
+    (host / "rootfs-stamp.json").write_text("the deployed rootfs's stamp")
+    (tree / "opt" / "blastbox").symlink_to(host)
+    with pytest.raises(rfs.RootfsStampError, match="symlink"):
+        rfs.clear_stamp(tree)
+    assert (host / "rootfs-stamp.json").exists()
+    assert rfs.main(["clear", str(tree)]) == 1
+    rfs.write_into_tree(tmp_path / "ok", _stamp())
+    rfs.clear_stamp(tmp_path / "ok")
+    assert not (tmp_path / "ok" / rfs.STAMP_PATH).exists()
+
+
+def test_the_legacy_scripts_clear_stamps_through_the_confined_helper() -> None:
+    root = Path(__file__).resolve().parents[2]
+    for script in ("deploy/firecracker/build-rootfs.sh", "deploy/redeploy-warm.sh"):
+        body = (root / script).read_text()
+        assert "rootfs_stamp clear" in body, script
+        stamp_lines = [ln for ln in body.splitlines() if "rootfs-stamp.json" in ln]
+        assert not any("rm -f" in ln for ln in stamp_lines), script

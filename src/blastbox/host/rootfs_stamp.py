@@ -805,8 +805,33 @@ def _is_version(value: str) -> bool:
     return bool(value)
 
 
+def clear_stamp(tree: Path | str) -> None:
+    """Remove a stamp baked into an extracted tree -- without following the image's links.
+
+    `rm tree/opt/blastbox/rootfs-stamp.json` (run as root for a gVisor tree) follows an
+    image-controlled `opt/blastbox` symlink and deletes a stamp in a HOST directory -- the
+    deployed rootfs's, say, sending it down the unchecked legacy path. Same confinement as the
+    write: no link on the path, and only a regular file is removed.
+    """
+    tree = Path(tree)
+    _refuse_links(tree, STAMP_PATH)
+    target = tree / STAMP_PATH
+    _require_regular_or_absent(target)
+    try:
+        target.unlink(missing_ok=True)
+    except OSError as exc:
+        raise RootfsStampError(f"could not remove {target}: {exc}") from exc
+
+
 def main(argv: Sequence[str]) -> int:
     """`python -m blastbox.host.rootfs_stamp write TREE IMAGE {firecracker|gvisor}`."""
+    if len(argv) == 2 and argv[0] == "clear":
+        try:
+            clear_stamp(argv[1])
+        except RootfsStampError as exc:
+            print(f"rootfs stamp: {exc}")
+            return 1
+        return 0
     if (len(argv) not in (4, 5) or argv[0] != "write"
             or argv[3] not in ("firecracker", "gvisor")):
         print("usage: python -m blastbox.host.rootfs_stamp write TREE IMAGE "
@@ -848,6 +873,7 @@ __all__ = [
     "read_from_dir",
     "read_from_ext4",
     "stamp_tree",
+    "clear_stamp",
     "write_into_tree",
 ]
 

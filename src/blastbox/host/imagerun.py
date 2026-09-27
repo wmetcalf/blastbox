@@ -1536,13 +1536,21 @@ def stage_rootfs(
         if not img_version and not verified_id:
             # No label: probe what the image actually has installed and stamp THAT, rather
             # than publish an artifact whose version is unknown.
-            from blastbox.host.doctor import version_in_image  # noqa: PLC0415
+            from blastbox.host.doctor import NOPKG, version_in_image  # noqa: PLC0415
 
-            installed, _detail = version_in_image(
+            installed, detail = version_in_image(
                 source, lambda argv: run(argv, capture_output=True)  # type: ignore[arg-type]
             )
             if _rootfs_stamp._is_version(installed):
                 img_version = installed
+            elif installed != NOPKG:
+                # NOPKG is definitive (no blastbox: a pure-JVM worker) and stamps none. Anything
+                # else means the probe could not LOOK -- stamping that empty would let a
+                # transient failure publish an unchecked Python worker as a "pure-JVM" guest.
+                raise BuildError(
+                    f"{image}: its installed blastbox version could not be verified "
+                    f"({detail or installed}); refusing to export an unchecked guest"
+                )
         elif img_version and not verified_id:
             # The direct export_rootfs() path skipped run_plan's verification, so a stale or
             # wrong label would be stamped as-is. Check it against what the image ACTUALLY

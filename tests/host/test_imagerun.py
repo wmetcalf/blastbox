@@ -147,6 +147,11 @@ class FakeRunner:
             out = subprocess.run(  # noqa: S603
                 bare, capture_output=True, text=True, check=False
             ).stdout
+        if rc == 0 and bare[:2] == ["docker", "run"] and "-lc" in bare:
+            # The in-image blastbox probe answers DEFINITIVELY, as a real image does: these
+            # fake images carry no blastbox. "" would read as "could not look", which a
+            # label-less export now refuses rather than publish an unchecked guest.
+            out = "NOPKG"
         if rc == 0 and bare[:2] == ["mktemp", "-d"]:
             # Behaves like the real thing: the code uses the path it prints, so
             # a double that returned "" would make every later step operate on

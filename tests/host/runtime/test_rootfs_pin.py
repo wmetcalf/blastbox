@@ -681,3 +681,39 @@ def test_a_stamp_with_no_version_is_a_warning_not_a_refusal(tmp_path, caplog) ->
     with caplog.at_level("WARNING"):
         assert rfs.guest_problem(str(tree), "gvisor") == ""
     assert "no blastbox version" in caplog.text
+
+
+
+def test_a_held_firecracker_restore_is_released_once_its_process_is_gone(tmp_path,
+                                                                        monkeypatch) -> None:
+    """Only gVisor answered restore_reclaimed(); an FC restore whose kill failed kept its pin
+    and workdir for the dispatcher's life."""
+    from blastbox.host.runtime.fc_snapshot import SnapshotManager
+
+    monkeypatch.setattr(rfs, "guest_verdict", lambda p, r: ("", True))
+    backend, launcher, _rootfs, _base = _fc_backend(tmp_path)
+    mgr = SnapshotManager(tmp_path / "mgr", backend)
+    art = mgr.build()
+    real = launcher.restore_in
+    alive = {"v": True}
+
+    def failing_restore(slot_workdir, **kw):
+        h = real(slot_workdir, **kw)
+        h.api._fail_on = ("PUT", "/snapshot/load")
+
+        def kill():
+            raise RuntimeError("could not kill firecracker")
+
+        h.kill = kill
+        h.proc = type("P", (), {"poll": lambda self: None if alive["v"] else 0, "pid": 0})()
+        return h
+
+    launcher.restore_in = failing_restore
+    with pytest.raises(Exception):
+        mgr.restore("s1")
+    assert mgr._refs.get(id(art), 0) == 1          # held: the VM may still map it
+    mgr.ensure_build_started()
+    assert mgr._refs.get(id(art), 0) == 1          # still alive: still held
+    alive["v"] = False                             # the process finally exits
+    mgr.ensure_build_started()
+    assert mgr._refs.get(id(art), 0) == 0
