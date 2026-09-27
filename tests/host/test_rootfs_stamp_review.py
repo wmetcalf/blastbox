@@ -471,7 +471,9 @@ def test_the_guest_check_compares_releases_not_spellings(guest, host) -> None:
 @pytest.mark.parametrize(("art", "ctr"), [("0.1.42+gdeadbee", "0.1.42"), ("0.2", "0.2.0")])
 def test_doctor_agrees_with_the_tier_about_equivalent_versions(art, ctr) -> None:
     assert doctor.verdict([_ctr(version=ctr)], [_art(version=art)]) == []
-    assert doctor.verdict([_ctr(version=ctr)], [_art(version=art)], expect=art) == []
+    # --expect names a BUILD: the containers must match it exactly (a local suffix is a
+    # different build), while the artifact is judged by release, as the tier boots it.
+    assert doctor.verdict([_ctr(version=ctr)], [_art(version=art)], expect=ctr) == []
 
 
 def test_allow_mixed_does_not_switch_off_the_guest_check() -> None:
@@ -906,3 +908,66 @@ def test_the_legacy_scripts_stamp_the_immutable_image_they_exported() -> None:
     root = Path(__file__).resolve().parents[2]
     for script in ("deploy/firecracker/build-rootfs.sh", "deploy/redeploy-warm.sh"):
         assert "{{.Image}}" in (root / script).read_text(), script
+
+
+# --- codex bot, third pass on #186 --------------------------------------------------------
+
+
+def test_containers_on_different_local_builds_are_drift() -> None:
+    """A local suffix identifies a different BUILD (the CLI help says so); only the guest
+    compatibility check may ignore it."""
+    ctrs = [_ctr("a", "p1", "0.1.42+ga"), _ctr("b", "p1", "0.1.42+gb")]
+    assert any("p1" in p for p in doctor.verdict(ctrs, []))
+    assert any("0.1.42" in p for p in doctor.verdict([_ctr(version="0.1.42+ga")], [],
+                                                      expect="0.1.42"))
+
+
+def test_build_images_fails_rather_than_stamping_exporter_provenance(tmp_path,
+                                                                    monkeypatch) -> None:
+    import blastbox.host.imagerun as mod
+
+    def unreadable(ident, r=None):
+        raise RuntimeError("docker inspect failed")
+
+    monkeypatch.setattr(mod, "_read_stamp", unreadable)
+    with pytest.raises(mod.BuildError, match="provenance"):
+        mod._image_provenance(_plan(tmp_path), "sha256:x", FakeRunner())
+
+
+def test_stamp_tree_honours_the_docker_override(tmp_path, monkeypatch) -> None:
+    seen: list[str] = []
+
+    def version_in_image(image, runner=None):
+        runner(["docker", "inspect", "--type", "image", image, "--format", "{{.Id}}"])
+        return "0.1.42", ""
+
+    monkeypatch.setattr(doctor, "version_in_image", version_in_image)
+    monkeypatch.setattr(rfs.subprocess, "run", lambda argv, **kw: seen.append(argv[0]) or
+                        subprocess.CompletedProcess(argv, 0, "{}", ""))
+    rfs.stamp_tree(tmp_path, "eng:1", "firecracker", docker="podman")
+    assert seen and set(seen) == {"podman"}
+
+
+def test_the_entry_point_takes_docker_from_the_environment(tmp_path, monkeypatch) -> None:
+    seen: list = []
+    monkeypatch.setattr(rfs, "stamp_tree", lambda *a, **k: seen.append(k))
+    monkeypatch.setenv("DOCKER", "podman")
+    assert rfs.main(["write", str(tmp_path), "eng:1", "gvisor"]) == 0
+    assert seen[-1]["docker"] == "podman"
+
+
+def test_the_legacy_scripts_mark_a_dirty_source_tree() -> None:
+    root = Path(__file__).resolve().parents[2]
+    for script in ("deploy/firecracker/build-rootfs.sh", "deploy/redeploy-warm.sh"):
+        body = (root / script).read_text()
+        assert "status --porcelain" in body and "-dirty" in body, script
+
+
+def test_platform_warnings_are_logged_before_an_unchecked_boot(tmp_path, caplog) -> None:
+    import blastbox
+
+    tree = tmp_path / "rootfs"
+    rfs.write_into_tree(tree, _stamp(blastbox_version=blastbox.__version__, platform={}))
+    with caplog.at_level("WARNING"):
+        assert rfs.guest_problem(str(tree), "gvisor") == ""
+    assert "records no platform" in caplog.text

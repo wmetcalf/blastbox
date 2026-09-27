@@ -362,3 +362,22 @@ def test_concurrent_stale_restores_invalidate_once(tmp_path, monkeypatch) -> Non
     assert mgr.invalidate(only_if=old) is True
     assert mgr.invalidate(only_if=old) is False   # already superseded: a no-op
     assert mgr.build_epoch == epoch + 1
+
+
+
+def test_a_rootfs_swapped_while_the_restore_opened_it_is_aborted(tmp_path, monkeypatch) -> None:
+    """The pre-check samples the PATH; the runtime opens it later. A publish in between paired
+    the old memory with the new disk. Re-checked once the runtime holds the file open."""
+    monkeypatch.setattr(rfs, "guest_verdict", lambda p, r: ("", True))
+    backend, launcher, rootfs, base = _fc_backend(tmp_path)
+    art = backend.boot_base().checkpoint(base)
+    real = launcher.restore_in
+
+    def restore_while_publishing(slot_workdir, **kw):
+        _replace(rootfs, b"gen-2")                # lands after the check, before the open
+        return real(slot_workdir, **kw)
+
+    launcher.restore_in = restore_while_publishing
+    with pytest.raises(SnapshotRestoreError, match="changed"):
+        backend.restore_in(tmp_path / "s1", art)
+    assert launcher.restores[-1].killed           # the restored VM is not left running

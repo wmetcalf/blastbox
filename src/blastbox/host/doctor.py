@@ -459,6 +459,21 @@ def _release(version: str) -> object:
         return base
 
 
+def _build(version: str) -> object:
+    """A version as a comparable BUILD: PEP 440 equality, local suffix KEPT.
+
+    `0.2` and `0.2.0` are one build; `0.1.42+ga` and `0.1.42+gb` are two (the CLI help says a
+    local suffix identifies a different build). Container drift and --expect compare builds;
+    only the guest-compatibility check drops the suffix (see _release).
+    """
+    try:
+        from packaging.version import InvalidVersion, Version  # noqa: PLC0415
+
+        return Version((version or "").strip())
+    except (ImportError, InvalidVersion):
+        return (version or "").strip()
+
+
 def artifact_problems(artifacts: Sequence[Artifact]) -> list[tuple[Artifact, str]]:
     """Each artifact that will not run on THIS host, with the reason.
 
@@ -521,7 +536,7 @@ def verdict(
     for art, why in artifact_problems(artifacts):
         problems.append(f"unbootable here: {art.path}: {why}")
     for project, versions in sorted(drift(list(containers)).items()):
-        if len({_release(v) for v in versions}) > 1:
+        if len({_build(v) for v in versions}) > 1:
             # Within ONE compose project there is no legitimate mix; --allow-mixed is for
             # separate products on one host.
             problems.append(f"compose project {project} runs {', '.join(sorted(versions))}")
@@ -532,9 +547,10 @@ def verdict(
     known_c = [c for c in containers if c.known]
     known_a = [a for a in artifacts if a.known]
     if expect:
-        want = _release(expect)
-        wrong = sorted({c.name for c in known_c if _release(c.version) != want}
-                       | {a.path for a in known_a if _release(a.version) != want})
+        # Containers must be the exact BUILD named; an artifact is judged by release, the way
+        # the tier boots it.
+        wrong = sorted({c.name for c in known_c if _build(c.version) != _build(expect)}
+                       | {a.path for a in known_a if _release(a.version) != _release(expect)})
         if wrong:
             problems.append(f"expected {expect}, but: " + ", ".join(wrong))
     host_releases = {_release(c.version) for c in known_c}
@@ -564,9 +580,10 @@ def verdict(
                 f"({', '.join(sorted(str(v) for v in host_releases))}) -- a guest that does "
                 "not match its host boots and never signals READY")
     if not allow_mixed:
-        if len(host_releases) > 1:
-            problems.append(f"containers run {len(host_releases)} versions: "
-                            + ", ".join(sorted(str(v) for v in host_releases)))
+        host_builds = {_build(c.version) for c in known_c}
+        if len(host_builds) > 1:
+            problems.append(f"containers run {len(host_builds)} versions: "
+                            + ", ".join(sorted(str(v) for v in host_builds)))
         a_releases = {_release(a.version) for a in known_a}
         if not host_releases and len(a_releases) > 1:
             problems.append(f"artifacts record {len(a_releases)} versions: "
@@ -592,7 +609,7 @@ def fleet_report(
     # By RELEASE, as verdict() judges it: "0.2" and "0.2.0" are one release, and reporting them
     # as drift beside ok=true gave monitoring a contradictory payload.
     mixed = {p: sorted(v) for p, v in drift(list(containers)).items()
-             if len({_release(x) for x in v}) > 1}
+             if len({_build(x) for x in v}) > 1}
     unbootable = [
         {"path": a.path, "reason": why} for a, why in artifact_problems(artifacts)
     ]

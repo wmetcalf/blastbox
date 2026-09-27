@@ -233,13 +233,18 @@ docker build -q --build-arg BASE="$WARM_IMAGE" -f "$REPO/deploy/gvisor/Dockerfil
 cid=$(docker create "${WARM_IMAGE%:*}-warm:gvisor-${WARM_TAG}")
 sudo rm -rf "$GVISOR_DIR/rootfs.${WARM_TAG}"; sudo mkdir -p "$GVISOR_DIR/rootfs.${WARM_TAG}"
 gv_img=$(docker inspect --format '{{.Image}}' "$cid")   # immutable: the tag can be retagged
+# Checking out FETCH_HEAD leaves unrelated dirty or untracked files in place: mark them.
+gv_rev="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)"
+if [ -n "$gv_rev" ] && [ -n "$(git -C "$REPO" status --porcelain 2>/dev/null)" ]; then
+  gv_rev="${gv_rev}-dirty"
+fi
 docker export "$cid" | sudo tar -x -C "$GVISOR_DIR/rootfs.${WARM_TAG}"; docker rm "$cid" >/dev/null
 # Stamped like build-images' output (the FC rootfs is stamped inside build-rootfs.sh). As root:
 # the tree was extracted as root. BLASTBOX_PY must be an absolute python that imports blastbox.
 # Verified by the FILE, not the exit status: an older blastbox exits 0 having written nothing.
 if ! sudo "${BLASTBOX_PY:-$(command -v python3)}" -m blastbox.host.rootfs_stamp write \
      "$GVISOR_DIR/rootfs.${WARM_TAG}" "$gv_img" gvisor \
-     "$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)" \
+     "$gv_rev" \
    || ! sudo test -s "$GVISOR_DIR/rootfs.${WARM_TAG}/opt/blastbox/rootfs-stamp.json"; then
   log "WARNING: gVisor rootfs NOT stamped -- it will boot unchecked against its host"
 fi

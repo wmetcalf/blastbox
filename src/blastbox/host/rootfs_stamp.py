@@ -483,6 +483,10 @@ def guest_verdict(rootfs: str, runtime: str) -> tuple[str, bool]:
     # The MACHINE, before the software: saying "wrong blastbox" about an aarch64 rootfs
     # on an x86_64 host sends the operator after the wrong thing.
     findings = _plat.compare(platform_of(stamp), _plat.host_platform(runtime=runtime))
+    # The non-fatal findings are what permit an UNCHECKED boot (a stamp that predates platform
+    # capture, say): say so, rather than log only that the guest matches.
+    for warn in (f for f in findings if not f.fatal):
+        log.warning("rootfs %s: %s: %s", rootfs, warn.field, warn.message)
     fatal = _plat.refusals(findings)
     if fatal:
         return f"{rootfs}: {_plat.summarise(fatal)}", True
@@ -653,6 +657,7 @@ def stamp_tree(
     *,
     run: Runner | None = None,
     revision: str = "",
+    docker: str = "docker",
 ) -> Path:
     """Stamp an extracted tree from what IMAGE records about itself -- for exports made
     outside `build-images` (the legacy `deploy/` scripts).
@@ -666,6 +671,9 @@ def stamp_tree(
     from blastbox.host.stamp import UNKNOWN, read as read_image_stamp  # noqa: PLC0415
 
     def runner(argv: Sequence[str]) -> "subprocess.CompletedProcess[str]":
+        # The SAME docker the export used (`DOCKER=podman` is supported by the scripts): the
+        # literal `docker` could fail, or describe an image in a different daemon.
+        argv = [docker, *argv[1:]] if argv and argv[0] == "docker" else list(argv)
         # BOUNDED: the probe runs the image being stamped, and a hung image or daemon must not
         # hang a deploy script forever.
         if run is not None:
@@ -731,7 +739,8 @@ def main(argv: Sequence[str]) -> int:
               "{firecracker|gvisor} [REVISION]")
         return 2
     try:
-        stamp_tree(argv[1], argv[2], argv[3], revision=argv[4] if len(argv) == 5 else "")
+        stamp_tree(argv[1], argv[2], argv[3], revision=argv[4] if len(argv) == 5 else "",
+                   docker=os.environ.get("DOCKER") or "docker")
     except RootfsStampError as exc:
         print(f"rootfs stamp: {exc}")
         return 1

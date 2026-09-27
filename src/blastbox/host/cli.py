@@ -2630,9 +2630,9 @@ def _doctor_cmd(args: argparse.Namespace) -> int:
     versions = sorted({c.version for c in containers if c.known}
                       | {a.version for a in artifacts if a.known})
     tail = f", {len(artifacts)} artifact(s)" if artifacts else ""
-    from blastbox.host.doctor import _release  # noqa: PLC0415 -- CLI-only
+    from blastbox.host.doctor import _build, _release  # noqa: PLC0415 -- CLI-only
 
-    c_rel = {_release(c.version) for c in containers if c.known}
+    c_rel = {_build(c.version) for c in containers if c.known}
     a_rel = {_release(a.version) for a in artifacts if a.known}
     if len(c_rel) > 1 or (not c_rel and len(a_rel) > 1):
         # Never "OK" beside several RELEASES (spellings of one release are not a mix): allowed

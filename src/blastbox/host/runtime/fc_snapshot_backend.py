@@ -295,6 +295,17 @@ class FcSnapshotBackend:
             _restore_from_snapshot(
                 handle.api, str(artifact.snapshot_path), str(artifact.mem_path)
             )
+            # AGAIN, now that firecracker holds the drive open: the check above samples the
+            # PATH, and a publish landing between it and the snapshot load paired the old
+            # memory with the new disk. From here the VM keeps the inode it opened, so a later
+            # publish cannot reach it.
+            if pin is not None:
+                from blastbox.host.rootfs_stamp import RootfsStampError
+
+                try:
+                    pin.check_restore(artifact)
+                except RootfsStampError as exc:
+                    raise SnapshotStale(f"{exc} (changed while this restore opened it)") from exc
         except BaseException as exc:
             # BaseException, not Exception: a KeyboardInterrupt, SystemExit or task cancellation
             # landing after the spawn skipped this cleanup entirely, leaving an unmanaged

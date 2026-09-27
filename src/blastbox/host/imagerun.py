@@ -1391,9 +1391,14 @@ def _image_provenance(plan: "Plan", source: str, run: Runner) -> tuple[str, str,
         img = _read_stamp(source, lambda argv: run(argv, capture_output=True))  # type: ignore[arg-type]
         version = "" if img.blastbox in ("", _UNKNOWN) else img.blastbox
         revision = "" if img.revision in ("", _UNKNOWN) else img.revision
-    except Exception as exc:  # noqa: BLE001 - diagnostic; verification already judged the image
-        _log(f"   warning: could not read {source}'s own stamp ({exc}); the rootfs stamp "
-             "falls back to this exporter's version and revision")
+    except Exception as exc:  # noqa: BLE001 - any failure to read it is a failed export
+        # FAIL, never manufacture. Falling back to this exporter's version and the plan's
+        # revision stamped an older CLI's version on a newer guest -- admitted by the old host,
+        # refused by the correctly upgraded one.
+        raise BuildError(
+            f"cannot read {source}'s own provenance (its blastbox label) to stamp the rootfs: "
+            f"{exc}"
+        ) from exc
     arch = ""
     proc = run(
         ["docker", "inspect", "--type", "image", source, "--format", "{{.Architecture}}"],
@@ -1402,7 +1407,9 @@ def _image_provenance(plan: "Plan", source: str, run: Runner) -> tuple[str, str,
     if proc.returncode == 0:
         raw = (proc.stdout or "").strip()
         arch = _DOCKER_ARCH.get(raw, raw)
-    return (version or _blastbox_version(), revision or _source_revision(plan), arch)
+    # An image that records no version gets none: the guest check then refuses it (fail
+    # closed) instead of trusting a version this exporter made up.
+    return (version, revision, arch)
 
 
 def _export_platform(spec: RootfsSpec, arch: str = "") -> "_platform_id.HostPlatform":

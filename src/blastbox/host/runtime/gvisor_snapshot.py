@@ -1235,4 +1235,18 @@ class GvisorSnapshotBackend:
             if getattr(exc, "kill_failed", False):
                 enriched.kill_failed = True  # type: ignore[attr-defined]
             raise enriched from exc
-        return GvisorRestoreHandle(self._cfg, self._run, cid, wd, self._run_text)
+        handle = GvisorRestoreHandle(self._cfg, self._run, cid, wd, self._run_text)
+        # AGAIN, now that runsc has the tree mounted: a publish between the pre-check and the
+        # restore paired the checkpointed memory with a different filesystem.
+        try:
+            self._rootfs_pin().check_restore(artifact)
+        except RootfsStampError as exc:
+            try:
+                handle.kill()
+            except Exception as kill_exc:  # noqa: BLE001
+                _log.warning("gvisor_snapshot: could not kill a stale restore: %s", kill_exc)
+                stale = SnapshotStale(f"{exc} (changed while this restore opened it)")
+                stale.kill_failed = True  # type: ignore[attr-defined]
+                raise stale from exc
+            raise SnapshotStale(f"{exc} (changed while this restore opened it)") from exc
+        return handle
