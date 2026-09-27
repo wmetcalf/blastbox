@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import threading
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -147,6 +148,17 @@ class FcSnapshotArtifact:
     outdisk_path: Path | None = None
 
 
+class _OrphanProc:
+    """A restore's firecracker process with no _Handle yet (it failed before one existed)."""
+
+    def __init__(self, proc: Any) -> None:
+        self.proc = proc
+
+    def kill(self) -> None:
+        self.proc.kill()
+        self.proc.wait(timeout=5)
+
+
 class FcSnapshotBackend:
     """Firecracker :class:`SnapshotBackend`.
 
@@ -163,27 +175,26 @@ class FcSnapshotBackend:
         sweep = getattr(self._launcher, "sweep_orphan_generations", None)
         return sweep() if callable(sweep) else 0
 
+    @property
+    def _unreaped(self) -> "dict[str, Any]":
+        """workdir -> the handle (or orphaned process) of a failed restore whose kill failed."""
+        return self.__dict__.setdefault("_unreaped_d", {})
+
     def restore_reclaimed(self, workdir: str) -> bool:
         """Whether the firecracker of a failed restore whose kill failed is confirmed gone.
 
-        The manager holds that generation's pin until this says so (see
-        SnapshotManager._release_held_restores). Retries the kill; gone once the process has
-        exited. Unknown workdirs were never held here, so there is nothing to wait for.
+        NON-BLOCKING: it runs on the pool tick, and a handle's kill() waits up to 5s after
+        terminate and 5s more after kill. The status is a poll(); the kill retry runs on its own
+        thread. An UNKNOWN workdir is not reclaimed -- the manager only asks about restores it
+        holds, and answering yes for one this backend never recorded released a pin under a
+        live VM.
         """
-        unreaped = self.__dict__.setdefault("_unreaped", {})
-        handle = unreaped.get(str(workdir))
+        handle = self._unreaped.get(str(workdir))
         if handle is None:
-            return True
+            return False
         proc = getattr(handle, "proc", None)
-        gone = proc is not None and proc.poll() is not None
-        if not gone:
-            try:
-                handle.kill()
-                gone = proc is None or proc.poll() is not None
-            except Exception:  # noqa: BLE001 -- still alive; asked again next tick
-                return False
-        if gone:
-            unreaped.pop(str(workdir), None)
+        if proc is not None and proc.poll() is not None:
+            self._unreaped.pop(str(workdir), None)
             # The manager kept this workdir while the VM might still use it; now it is ours to
             # remove -- or park with the launcher's retryable partials if that fails.
             errs: list[str] = []
@@ -192,7 +203,21 @@ class FcSnapshotBackend:
                 stranded = getattr(self._launcher, "_stranded_partials", None)
                 if isinstance(stranded, list):
                     stranded.append(str(workdir))
-        return gone
+            return True
+        reaping = self.__dict__.setdefault("_reaping", set())
+        if str(workdir) not in reaping:
+            reaping.add(str(workdir))
+
+            def retry_kill() -> None:
+                try:
+                    handle.kill()
+                except Exception as exc:  # noqa: BLE001 -- asked again on a later tick
+                    _log.warning("fc_snapshot: retrying the kill of %s failed: %s", workdir, exc)
+                finally:
+                    reaping.discard(str(workdir))
+
+            threading.Thread(target=retry_kill, daemon=True, name="fc-restore-reclaim").start()
+        return False
 
     def discard(self, artifact: object) -> None:
         """Unlink a fully drained generation's files.
@@ -322,7 +347,15 @@ class FcSnapshotBackend:
                 pin.check_restore(artifact)
             except RootfsStampError as exc:
                 raise SnapshotStale(str(exc)) from exc
-        handle = self._launcher.restore_in(slot_workdir, outdisk_src=artifact.outdisk_path)
+        try:
+            handle = self._launcher.restore_in(slot_workdir, outdisk_src=artifact.outdisk_path)
+        except BaseException as exc:
+            # A failure BEFORE any handle (the outdisk copy, say) whose terminate could not be
+            # confirmed: the manager holds the pin, so keep the process for restore_reclaimed().
+            orphan = getattr(exc, "orphan_proc", None)
+            if getattr(exc, "kill_failed", False) and orphan is not None:
+                self._unreaped[str(slot_workdir)] = _OrphanProc(orphan)
+            raise
         try:
             _restore_from_snapshot(
                 handle.api, str(artifact.snapshot_path), str(artifact.mem_path)
@@ -356,6 +389,6 @@ class FcSnapshotBackend:
                 exc.kill_failed = True  # type: ignore[attr-defined]
                 # ...and KEEP the handle: the manager holds this generation's pin until
                 # restore_reclaimed() confirms the process is gone, and only the handle can.
-                self.__dict__.setdefault("_unreaped", {})[str(slot_workdir)] = handle
+                self._unreaped[str(slot_workdir)] = handle
             raise
         return handle

@@ -295,6 +295,9 @@ def _stage_capturing(tmp_path, monkeypatch, *, arch_out="arm64"):
     monkeypatch.setattr(mod, "_blastbox_version", lambda: "0.0.1")      # the EXPORTER
     monkeypatch.setattr(mod, "_source_revision", lambda plan: "plan-root-rev")
     monkeypatch.setattr(mod, "_read_stamp", lambda ident, r=None: _ImgStamp())
+    # The label is now checked against the installed package on every export; these images do
+    # have the blastbox their label names.
+    monkeypatch.setattr(mod, "_verify_contents", lambda ident, r=None: (True, _ImgStamp.blastbox))
     captured: list[rfs.RootfsStamp] = []
     monkeypatch.setattr(mod._rootfs_stamp, "write_into_tree",
                         lambda tree, stamp, **kw: captured.append(stamp))
@@ -884,6 +887,9 @@ def test_an_unreadable_image_architecture_is_not_guessed(tmp_path, monkeypatch) 
     monkeypatch.setattr(mod, "_can_be_root", lambda: False)
     monkeypatch.setenv("DEMO_DIR", str(tmp_path / "out"))
     monkeypatch.setattr(mod, "_read_stamp", lambda ident, r=None: _ImgStamp())
+    # The label is now checked against the installed package on every export; these images do
+    # have the blastbox their label names.
+    monkeypatch.setattr(mod, "_verify_contents", lambda ident, r=None: (True, _ImgStamp.blastbox))
     captured: list = []
     monkeypatch.setattr(mod._rootfs_stamp, "write_into_tree",
                         lambda tree, stamp, **kw: captured.append(stamp))
@@ -910,6 +916,9 @@ def test_a_refused_stamp_write_is_a_build_error(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(mod, "_can_be_root", lambda: False)
     monkeypatch.setenv("DEMO_DIR", str(tmp_path / "out"))
     monkeypatch.setattr(mod, "_read_stamp", lambda ident, r=None: _ImgStamp())
+    # The label is now checked against the installed package on every export; these images do
+    # have the blastbox their label names.
+    monkeypatch.setattr(mod, "_verify_contents", lambda ident, r=None: (True, _ImgStamp.blastbox))
 
     def refuse(tree, stamp, **kw):
         raise rfs.RootfsStampError("opt/blastbox is a symlink inside the image")
@@ -1069,6 +1078,9 @@ def test_a_direct_export_accepts_an_image_without_blastbox(tmp_path, monkeypatch
     which verify_built() accepts; the direct path refused it."""
     mod = _direct(tmp_path, monkeypatch)
     monkeypatch.setattr(mod, "_read_stamp", lambda ident, r=None: _ImgStamp())
+    # The label is now checked against the installed package on every export; these images do
+    # have the blastbox their label names.
+    monkeypatch.setattr(mod, "_verify_contents", lambda ident, r=None: (True, _ImgStamp.blastbox))
     monkeypatch.setattr(mod, "_verify_contents", lambda ident, r=None: (None, "no blastbox"))
     captured: list = []
     monkeypatch.setattr(mod._rootfs_stamp, "write_into_tree",
@@ -1178,4 +1190,28 @@ def test_a_direct_export_without_blastbox_does_not_stamp_the_labels_version(tmp_
     plan = _plan(tmp_path)
     mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
                      extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True)
+    assert captured[0].blastbox_version == ""
+
+
+def test_a_package_free_artifact_is_not_a_mix(monkeypatch, capsys) -> None:
+    arts = [_art("/r/py", "0.1.42"), doctor.Artifact(path="/r/jvm", version=doctor.NO_BLASTBOX,
+                                                     runtime="firecracker",
+                                                     arch=plat.host_platform().arch)]
+    rc, out = _doctor(monkeypatch, capsys, [], arts)
+    assert rc == 0 and "MIXED" not in out and "(no blastbox)" not in out.split("OK:")[-1]
+
+
+def test_a_verified_package_free_export_does_not_stamp_the_label(tmp_path, monkeypatch) -> None:
+    """run_plan's verify_built() accepts None (no blastbox) and hands staging only the id --
+    so the build-time label was stamped as if that blastbox were installed."""
+    mod = _direct(tmp_path, monkeypatch)
+    monkeypatch.setattr(mod, "_read_stamp", lambda ident, r=None: _ImgStamp())      # 9.9.9
+    monkeypatch.setattr(mod, "_verify_contents", lambda ident, r=None: (None, "no blastbox"))
+    captured: list = []
+    monkeypatch.setattr(mod._rootfs_stamp, "write_into_tree",
+                        lambda tree, stamp, **kw: captured.append(stamp))
+    plan = _plan(tmp_path)
+    mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                     extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True,
+                     verified_id="sha256:" + "e" * 64)
     assert captured[0].blastbox_version == ""

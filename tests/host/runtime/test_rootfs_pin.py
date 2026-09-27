@@ -720,3 +720,53 @@ def test_a_held_firecracker_restore_is_released_once_its_process_is_gone(tmp_pat
     mgr.ensure_build_started()
     assert mgr._refs.get(id(art), 0) == 0
     assert not Path(held_wd).exists()              # ...and reclaimed with the pin
+
+
+# --- codex bot, thirteenth pass -----------------------------------------------------------
+
+
+def test_an_unknown_held_fc_restore_is_not_reported_reclaimed(tmp_path) -> None:
+    """A pre-handle failure (outdisk copy failed, terminate unconfirmed) is held by the manager
+    but was never recorded here; answering True released the pin under a live VM."""
+    backend, _launcher, _rootfs, _base = _fc_backend(tmp_path)
+    assert backend.restore_reclaimed(str(tmp_path / "never-seen")) is False
+
+
+def test_a_pre_handle_fc_failure_keeps_its_process_for_reclaim(tmp_path, monkeypatch) -> None:
+    backend, launcher, _rootfs, base = _fc_backend(tmp_path)
+    monkeypatch.setattr(rfs, "guest_verdict", lambda p, r: ("", True))
+    art = backend.boot_base().checkpoint(base)
+    alive = {"v": True}
+    orphan = type("P", (), {"poll": lambda self: None if alive["v"] else 0, "pid": 0,
+                            "kill": lambda self: None, "terminate": lambda self: None,
+                            "wait": lambda self, timeout=None: 0})()
+
+    def pre_handle_failure(slot_workdir, **kw):
+        exc = OSError("outdisk copy failed")
+        exc.kill_failed = True                    # type: ignore[attr-defined]
+        exc.orphan_proc = orphan                  # type: ignore[attr-defined]
+        raise exc
+
+    launcher.restore_in = pre_handle_failure
+    wd = tmp_path / "s1"
+    with pytest.raises(OSError):
+        backend.restore_in(wd, art)
+    assert backend.restore_reclaimed(str(wd)) is False
+    alive["v"] = False
+    assert _wait_until(lambda: backend.restore_reclaimed(str(wd)))
+
+
+def test_restore_reclaimed_never_waits_on_a_kill(tmp_path, monkeypatch) -> None:
+    """_Handle.kill() waits up to 5s after terminate and 5s after kill -- on the pool tick."""
+    import threading
+    import time as _t
+
+    backend, _launcher, _rootfs, _base = _fc_backend(tmp_path)
+    release = threading.Event()
+    slow = type("H", (), {"proc": type("P", (), {"poll": lambda self: None, "pid": 0})(),
+                          "kill": lambda self: release.wait(5)})()
+    backend._unreaped[str(tmp_path / "s9")] = slow
+    t0 = _t.monotonic()
+    assert backend.restore_reclaimed(str(tmp_path / "s9")) is False
+    assert _t.monotonic() - t0 < 1.0
+    release.set()

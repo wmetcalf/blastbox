@@ -850,6 +850,9 @@ class FcSnapshotLauncher:
                 # Same marker the gVisor restore path already sets (codex, #154).
                 with contextlib.suppress(Exception):
                     exc.kill_failed = True  # type: ignore[attr-defined]
+                    # ...and the process itself: there is no handle yet, and the backend needs
+                    # it to confirm the exit before the manager may release this pin.
+                    exc.orphan_proc = proc  # type: ignore[attr-defined]
                 _log.warning("fc_snapshot: firecracker for slot workdir %s could not be confirmed "
                              "gone; retaining it for the next sweep", slot_workdir)
             raise

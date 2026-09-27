@@ -1551,10 +1551,12 @@ def stage_rootfs(
                     f"{image}: its installed blastbox version could not be verified "
                     f"({detail or installed}); refusing to export an unchecked guest"
                 )
-        elif img_version and not verified_id:
-            # The direct export_rootfs() path skipped run_plan's verification, so a stale or
-            # wrong label would be stamped as-is. Check it against what the image ACTUALLY
-            # has installed before it is written anywhere a host will trust.
+        elif img_version:
+            # Checked against what the image ACTUALLY has installed before the label is written
+            # anywhere a host will trust. The direct export_rootfs() path skipped run_plan's
+            # verification entirely; the verified path passes only the ID here, so verify_built()'s
+            # "no package" (None) verdict never reached the stamp and the label was written as a
+            # version the guest does not have.
             agrees, detail = _verify_contents(source, lambda argv: run(argv, capture_output=True))  # type: ignore[arg-type]
             # TRI-STATE, as verify_built() treats it: None means no blastbox package to compare
             # (a pure-JVM worker), which is valid -- and then the label (often inherited or set
