@@ -584,6 +584,19 @@ def verdict(
                 f"{art.path} records {art.version} but no container here runs it "
                 f"({', '.join(sorted(str(v) for v in host_releases))}) -- a guest that does "
                 "not match its host boots and never signals READY")
+    if not known_c and not expect:
+        # Nothing running to compare with (a bare-metal/systemd dispatcher, a stack scaled to
+        # zero): compare with THIS host's blastbox, as the boot gate would -- not "no comparator,
+        # so OK" for a stale stamp.
+        import blastbox  # noqa: PLC0415
+
+        here = _release(str(getattr(blastbox, "__version__", "") or ""))
+        for art in known_a:
+            if not art.project and _release(art.version) != here:
+                problems.append(
+                    f"{art.path} records {art.version} but this host runs "
+                    f"{getattr(blastbox, '__version__', '?')} -- a guest that does not match its "
+                    "host boots and never signals READY")
     if not allow_mixed:
         host_builds = {_build(c.version) for c in known_c}
         if len(host_builds) > 1:
@@ -625,6 +638,7 @@ def fleet_report(
         "drift": mixed,
         "unknown": unknown,
         "unbootable": unbootable,
-        "ok": not (mixed or unknown or unbootable) and len(versions) <= 1,
+        # Health from NORMALISED builds, as verdict() judges: "0.2" and "0.2.0" are one.
+        "ok": not (mixed or unknown or unbootable) and len({_build(v) for v in versions}) <= 1,
     }
 

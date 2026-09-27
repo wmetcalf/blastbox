@@ -280,10 +280,11 @@ def test_a_refused_plain_fc_guest_makes_the_tier_not_ready(tmp_path, monkeypatch
                    scratch_root=str(tmp_path / "scratch"))
     rt = FirecrackerSlotRuntime(cfg, subprocess_runner=_FakeSubprocessRunner(),
                                 ready_signal=_FakeReadySignal(ready=False))
-    assert rt.prepare() is True
+    assert _wait_until(rt.prepare)                # checked (in the background), then ready
     verdict["now"] = "guest is blastbox 0.0.1"
     _replace(rootfs, b"gen-2")
-    assert rt.prepare() is False
+    assert _wait_until(lambda: rt.prepare() is False
+                       and rt._gate().problem_nowait() not in ("", rfs.PENDING))
 
 
 def test_the_plain_fc_gate_runs_after_the_stranded_scratch_sweep(tmp_path, monkeypatch) -> None:
@@ -770,3 +771,55 @@ def test_restore_reclaimed_never_waits_on_a_kill(tmp_path, monkeypatch) -> None:
     assert backend.restore_reclaimed(str(tmp_path / "s9")) is False
     assert _t.monotonic() - t0 < 1.0
     release.set()
+
+
+def test_fc_prepare_never_waits_on_a_stamp_read(tmp_path, monkeypatch) -> None:
+    """prepare() runs on the pool tick; a stalled debugfs held it for the full deadline."""
+    import threading
+    import time as _t
+
+    from blastbox.host.runtime.firecracker import FCConfig, FirecrackerSlotRuntime
+
+    from .test_firecracker import _FakeReadySignal, _FakeSubprocessRunner
+
+    rootfs = tmp_path / "rootfs.ext4"
+    rootfs.write_bytes(b"A")
+    release = threading.Event()
+    monkeypatch.setattr(rfs, "guest_verdict", lambda p, r: (release.wait(5), ("", True))[1])
+    cfg = FCConfig(fc_bin="firecracker", fc_kernel="/mnt/vmlinux", fc_rootfs=str(rootfs),
+                   fc_vcpu_count=1, fc_mem_mib=256, fc_outdisk_mib=64,
+                   scratch_root=str(tmp_path / "scratch"))
+    rt = FirecrackerSlotRuntime(cfg, subprocess_runner=_FakeSubprocessRunner(),
+                                ready_signal=_FakeReadySignal(ready=False))
+    t0 = _t.monotonic()
+    assert rt.prepare() is False                  # not ready until the guest has been checked
+    assert _t.monotonic() - t0 < 1.0
+    release.set()
+    assert _wait_until(rt.prepare)
+
+
+def test_a_held_restore_is_released_exactly_once(tmp_path, monkeypatch) -> None:
+    """Two concurrent ticks both copied the held entry and both unpinned it -- decrementing the
+    generation's refcount twice, under another slot still using it."""
+    import threading
+
+    from blastbox.host.runtime.fc_snapshot import SnapshotManager
+
+    monkeypatch.setattr(rfs, "guest_verdict", lambda p, r: ("", True))
+    backend, _launcher, _rootfs, _base = _fc_backend(tmp_path)
+    mgr = SnapshotManager(tmp_path / "mgr", backend)
+    art = mgr.build()
+    mgr.restore("live")                           # another slot uses this generation
+    mgr._refs[id(art)] += 1                        # the held (failed) restore's reference
+    mgr._hold_restore("held", art, tmp_path / "held")
+    gate = threading.Barrier(2)
+
+    def reclaimed(workdir):
+        gate.wait(5)                              # both ticks inside at once
+        return True
+
+    backend.restore_reclaimed = reclaimed
+    ts = [threading.Thread(target=mgr._release_held_restores) for _ in range(2)]
+    [t.start() for t in ts]
+    [t.join(5) for t in ts]
+    assert mgr._refs.get(id(art), 0) == 1         # only the held reference was released

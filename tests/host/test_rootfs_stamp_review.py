@@ -20,6 +20,15 @@ from blastbox.host import doctor, platform_id as plat, rootfs_stamp as rfs
 from .test_imagerun import FakeRunner, _fake_extract, _plan
 
 
+@pytest.fixture(autouse=True)
+def _this_host_runs_0_1_42(monkeypatch):
+    """doctor compares a rootfs-only survey with THIS host's blastbox; pin it, so the tests do
+    not depend on whatever metadata the test environment happens to carry."""
+    import blastbox
+
+    monkeypatch.setattr(blastbox, "__version__", "0.1.42")
+
+
 def _stamp(**kw) -> rfs.RootfsStamp:
     base = dict(blastbox_version="0.1.42", image="eng-fc:1", revision="deadbeef")
     base.update(kw)
@@ -425,7 +434,9 @@ def test_allow_mixed_does_not_excuse_a_bad_artifact(monkeypatch, capsys, as_json
 def test_rootfs_only_applies_version_policy(monkeypatch, capsys, as_json) -> None:
     arts = [_art("/r/a", "0.1.42"), _art("/r/b", "0.1.41")]
     assert _doctor(monkeypatch, capsys, [], arts, json=as_json)[0] == 1
-    assert _doctor(monkeypatch, capsys, [], arts, json=as_json, allow_mixed=True)[0] == 0
+    # With nothing running, each artifact is judged against THIS host (0.1.42): 0.1.41 cannot
+    # boot here, and --allow-mixed never excuses a guest/host mismatch.
+    assert _doctor(monkeypatch, capsys, [], arts, json=as_json, allow_mixed=True)[0] == 1
     one = [_art("/r/a", "0.1.42")]
     assert _doctor(monkeypatch, capsys, [], one, json=as_json)[0] == 0
     assert _doctor(monkeypatch, capsys, [], one, json=as_json, expect="0.1.43")[0] == 1
@@ -567,7 +578,8 @@ def test_equivalent_spellings_are_not_reported_as_mixed(monkeypatch, capsys) -> 
 def test_an_allowed_artifact_only_mix_is_not_ok(monkeypatch, capsys) -> None:
     arts = [_art("/r/a", "0.1.17"), _art("/r/b", "0.2.0")]
     rc, out = _doctor(monkeypatch, capsys, [], arts, allow_mixed=True)
-    assert rc == 0 and "OK:" not in out and "MIXED" in out
+    # Neither matches this host (0.1.42): refused, and never reported as OK.
+    assert rc == 1 and "OK:" not in out
 
 
 def test_an_empty_ext4_stamp_says_unstamped_not_the_debugfs_banner(tmp_path, monkeypatch) -> None:
@@ -1215,3 +1227,28 @@ def test_a_verified_package_free_export_does_not_stamp_the_label(tmp_path, monke
                      extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True,
                      verified_id="sha256:" + "e" * 64)
     assert captured[0].blastbox_version == ""
+
+
+# --- codex bot, fourteenth pass -----------------------------------------------------------
+
+
+def test_a_rootfs_only_survey_compares_against_this_host(monkeypatch) -> None:
+    """No containers and no --expect left nothing to compare, so a stale stamp read OK --
+    on bare-metal dispatchers and scaled-to-zero stacks the boot gate would refuse it."""
+    import blastbox
+
+    monkeypatch.setattr(blastbox, "__version__", "0.1.42")
+    assert any("0.1.30" in p for p in doctor.verdict([], [_art(version="0.1.30")]))
+    assert doctor.verdict([], [_art(version="0.1.42+gabc")]) == []
+
+
+def test_fleet_report_health_uses_normalised_versions() -> None:
+    report = doctor.fleet_report([_ctr("a", "p1", "0.2"), _ctr("b", "p1", "0.2.0")], [])
+    assert report["drift"] == {} and report["ok"] is True
+
+
+def test_the_legacy_dirty_checks_ignore_git_config() -> None:
+    root = Path(__file__).resolve().parents[2]
+    for script in ("deploy/firecracker/build-rootfs.sh", "deploy/redeploy-warm.sh"):
+        body = (root / script).read_text()
+        assert "status --porcelain --untracked-files=all" in body, script

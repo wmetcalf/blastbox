@@ -235,7 +235,7 @@ sudo rm -rf "$GVISOR_DIR/rootfs.${WARM_TAG}"; sudo mkdir -p "$GVISOR_DIR/rootfs.
 gv_img=$(docker inspect --format '{{.Image}}' "$cid")   # immutable: the tag can be retagged
 # Checking out FETCH_HEAD leaves unrelated dirty or untracked files in place: mark them.
 gv_rev="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)"
-if [ -n "$gv_rev" ] && [ -n "$(git -C "$REPO" status --porcelain 2>/dev/null)" ]; then
+if [ -n "$gv_rev" ] && [ -n "$(git -C "$REPO" status --porcelain --untracked-files=all 2>/dev/null)" ]; then
   gv_rev="${gv_rev}-dirty"
 fi
 docker export "$cid" | sudo tar -x -C "$GVISOR_DIR/rootfs.${WARM_TAG}"; docker rm "$cid" >/dev/null

@@ -61,7 +61,7 @@ echo ">> stamp rootfs (image provenance)"
 # untracked changes could have entered the image: a clean commit must not claim a build it
 # cannot reproduce.
 src_rev="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)"
-if [ -n "$src_rev" ] && [ -n "$(git -C "$REPO" status --porcelain 2>/dev/null)" ]; then
+if [ -n "$src_rev" ] && [ -n "$(git -C "$REPO" status --porcelain --untracked-files=all 2>/dev/null)" ]; then
     src_rev="${src_rev}-dirty"
 fi
 # Verified by the FILE, not the exit status: a blastbox older than this CLI imports the module

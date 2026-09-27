@@ -51,7 +51,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from blastbox.errors import HostDiskTimeout
-from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Callable, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from blastbox.worker.warm import WarmJobSpec
@@ -1229,20 +1229,24 @@ class FirecrackerSlotRuntime:
                 with self._stranded_lock:
                     self._stranded_scratch.append(path)   # still stuck; retry next spawn
 
-    def _guest_problem(self) -> str:
-        """The cached rootfs guest check (one stat per call; re-read on a republish)."""
+    def _gate(self) -> Any:
+        """The rootfs guest gate for this tier (built on first use; None without a rootfs)."""
         gate = getattr(self, "_guest_gate", None)
         rootfs = getattr(self._cfg, "fc_rootfs", "") or ""
         if gate is None and rootfs:
             from blastbox.host.rootfs_stamp import GuestGate
 
             gate = self._guest_gate = GuestGate(rootfs, "firecracker")
+        return gate
+
+    def _guest_problem(self) -> str:
+        """The cached rootfs guest check (one stat per call; re-read on a republish)."""
+        gate = self._gate()
         return gate.problem() if gate is not None else ""
 
     def _guest_checked(self) -> "tuple[str, tuple[int, ...] | None]":
         """(problem, the rootfs identity that verdict is for)."""
-        self._guest_problem()                     # builds the gate if needed
-        gate = getattr(self, "_guest_gate", None)
+        gate = self._gate()
         return gate.checked() if gate is not None else ("", None)
 
     def prepare(self) -> bool:
@@ -1251,7 +1255,14 @@ class FirecrackerSlotRuntime:
         Refusing only inside spawn() spun the pool's spawn loop at the token-bucket rate with a
         traceback per attempt (~690k error lines a day); "not ready" is the pool's quiet no.
         Logged once per distinct refusal."""
-        problem = self._guest_problem()
+        from blastbox.host.rootfs_stamp import PENDING
+
+        # NEVER blocks: prepare() runs on the pool tick, and the stamp read (debugfs) can take
+        # its whole deadline on a malformed image. Not ready until the verdict exists.
+        gate = self._gate()
+        problem = gate.problem_nowait() if gate is not None else ""
+        if problem == PENDING:
+            return False
         self._refused_logged: str | None
         if problem and getattr(self, "_refused_logged", None) != problem:
             self._refused_logged = problem

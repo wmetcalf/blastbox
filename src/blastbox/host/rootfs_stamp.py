@@ -613,6 +613,34 @@ class GuestGate:
         return found, key          # the identity the check STARTED from; callers re-stat
 
 
+PENDING = "pending"
+"""GuestGate.problem_nowait(): the verdict for the current file is still being established."""
+
+
+def _gate_problem_nowait(self: "GuestGate") -> str:
+    """The cached verdict for the current file, or PENDING while a background check runs.
+
+    For callers on the pool tick: a debugfs stalled on a malformed image held prepare() for the
+    full read deadline, freezing promotion, health checks and reaping. The check runs on its own
+    thread; the tick only ever reads a result.
+    """
+    key = file_identity(self.rootfs)
+    if key is None:
+        return ""
+    with self._lock:
+        if key == self._key and (self._retry_at is None or time.monotonic() < self._retry_at):
+            return self._problem
+        running = self.__dict__.get("_check_thread")
+        if running is None or not running.is_alive():
+            t = threading.Thread(target=self.checked, daemon=True, name="rootfs-guest-check")
+            self.__dict__["_check_thread"] = t
+            t.start()
+    return PENDING
+
+
+GuestGate.problem_nowait = _gate_problem_nowait  # type: ignore[attr-defined]
+
+
 class RootfsPin:
     """Bind each snapshot checkpoint to the rootfs it was taken against.
 
@@ -855,6 +883,7 @@ def _default_runner(
 __all__ = [
     "DEBUGFS_TIMEOUT_S",
     "GuestGate",
+    "PENDING",
     "RootfsStale",
     "RootfsUnstamped",
     "guest_verdict",

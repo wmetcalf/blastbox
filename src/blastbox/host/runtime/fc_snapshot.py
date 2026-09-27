@@ -741,11 +741,16 @@ class SnapshotManager:
                 _log.warning("snapshot.held_restore_check_failed sid=%s: %s", sid, exc)
                 continue
             if reclaimed:
+                # CLAIM it: two concurrent ticks (a cascade prepares per spawn) can both have
+                # copied this entry; only the one that removes it may unpin, or the generation's
+                # refcount drops twice under another slot still using it.
                 with self._build_lock:
-                    self._held_restores.pop(sid, None)
+                    claimed = self._held_restores.pop(sid, None)
+                if claimed is None:
+                    continue
                 _log.info("snapshot.held_restore_released sid=%s -- its process is confirmed "
                           "gone", sid)
-                self._unpin(sid, artifact)
+                self._unpin(sid, claimed[0])
 
     def _unpin(self, sid: str, artifact: object) -> None:
         """Undo a reservation whose restore never produced a handle.
