@@ -1474,7 +1474,7 @@ class FirecrackerSlotRuntime:
             return False
         # REGARDLESS of readiness: a mismatched guest may never signal READY at all, and gating
         # on it left that slot to the whole warm-up timeout instead of rejecting it at once.
-        if self._rootfs_changed_since_spawn(slot.slot_id):
+        if self._rootfs_changed_since_spawn(slot.slot_id, strict=ready):
             # We cannot tell whether the publish landed before or after firecracker opened the
             # disk, so do not promote a guest that may never have been checked: kill it, and
             # the pool reaps and respawns against the new (checked) rootfs.
@@ -1490,7 +1490,7 @@ class FirecrackerSlotRuntime:
             return False
         return ready
 
-    def _rootfs_changed_since_spawn(self, slot_id: str) -> bool:
+    def _rootfs_changed_since_spawn(self, slot_id: str, *, strict: bool = False) -> bool:
         keys = getattr(self, "_rootfs_keys", {})
         if slot_id not in keys:
             return False
@@ -1505,7 +1505,11 @@ class FirecrackerSlotRuntime:
         with self._lock:
             fc_proc = self._procs.get(slot_id)
         pid = getattr(fc_proc, "pid", None) or getattr(getattr(fc_proc, "proc", None), "pid", None)
-        opened = opened_matches(pid, rootfs, key) if isinstance(pid, int) and pid > 0 else None
+        # STRICT once READY: the guest booted, so firecracker certainly holds the disk and the
+        # checked file must be positively present (a symlink rolled back A->B->A otherwise
+        # hides B under a name that matches nothing).
+        opened = (opened_matches(pid, rootfs, key, strict=strict)
+                  if isinstance(pid, int) and pid > 0 else None)
         if opened is not None:
             return not opened
         return file_identity(rootfs) != key

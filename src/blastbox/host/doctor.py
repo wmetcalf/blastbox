@@ -374,11 +374,14 @@ class Artifact:
     #: it is checked against THAT project's containers; unpaired, only against the host's
     #: versions as a whole -- where a stale rootfs passes if any product runs its version.
     project: str = ""
+    #: The stamp was READ. Its version then stands as written -- even the literal "unknown",
+    #: which would otherwise collide with the UNKNOWN sentinel and read as "could not look".
+    stamped: bool = False
     detail: str = ""                  # why it is UNKNOWN, or what disagrees
 
     @property
     def known(self) -> bool:
-        return self.version != UNKNOWN
+        return self.stamped or self.version != UNKNOWN
 
 
 def survey_rootfs(paths: Sequence[str]) -> list[Artifact]:
@@ -403,15 +406,20 @@ def survey_rootfs(paths: Sequence[str]) -> list[Artifact]:
         # Every field below comes from an artifact this host did not create: stripped of
         # control characters, as container output is, so a stamp cannot forge the lines
         # after it or drive the operator's terminal. `path` is the operator's own argument.
-        version = _sanitise(stamp.blastbox_version)
+        # The values the BOOT GATE judges: already made display-safe at parse (control and
+        # format characters stripped). NOT _sanitise, whose allowlist DELETES characters and so
+        # changed what was compared -- "0.1.4/2" became "0.1.42" and read OK here while the
+        # gate refused the raw value. Whitespace-only means no blastbox, exactly as the gate
+        # treats it.
+        version = stamp.blastbox_version.strip()
         out.append(
             Artifact(
                 path=path,
                 # READ, and definitively without blastbox (a pure-JVM worker): the boot gate
                 # admits it on arch/runtime, so doctor must not call it unreadable.
                 version=version or NO_BLASTBOX,
-                runtime=_sanitise(plat.runtime),
-                arch=_sanitise(plat.arch),
+                runtime=plat.runtime,
+                arch=plat.arch,
                 cpu_vendor=_sanitise(plat.cpu_vendor),
                 # Already display-safe (rootfs_stamp sanitises at parse). NOT _sanitise: its
                 # allowlist drops "/" and "@", which turns a digest reference into a name
@@ -420,6 +428,7 @@ def survey_rootfs(paths: Sequence[str]) -> list[Artifact]:
                 exported_at=_sanitise(stamp.exported_at),
                 detail="" if version else "no blastbox in the guest; version not checked",
                 project=project,
+                stamped=True,
             )
         )
     return out
@@ -584,7 +593,14 @@ def verdict(
                 f"{art.path} records {art.version} but no container here runs it "
                 f"({', '.join(sorted(str(v) for v in host_releases))}) -- a guest that does "
                 "not match its host boots and never signals READY")
-    if not known_c and not expect:
+    if expect and not known_c and not known_a:
+        # Nothing VERSIONED was inspected (only package-free artifacts): --expect has nothing to
+        # hold to, and a vacuous pass would read as confirmation.
+        problems.append(f"expected {expect}, but nothing versioned was found to verify")
+    if not known_c:
+        # Regardless of --expect: that is the operator's target, not what this host runs --
+        # and the boot gate compares with the host. Asserting the new release with --expect
+        # before upgrading the host must not turn its refusal into OK.
         # Nothing running to compare with (a bare-metal/systemd dispatcher, a stack scaled to
         # zero): compare with THIS host's blastbox, as the boot gate would -- not "no comparator,
         # so OK" for a stale stamp.
@@ -616,7 +632,12 @@ def _versions_agree(containers: Sequence[Container], artifacts: Sequence[Artifac
                   if a.known and a.version != NO_BLASTBOX}
     if len(c_builds) > 1:
         return False
-    return a_releases <= c_releases if c_builds else len(a_releases) <= 1
+    if c_builds:
+        return a_releases <= c_releases
+    # Nothing running: judged against THIS host, as verdict() and the boot gate do.
+    import blastbox  # noqa: PLC0415
+
+    return a_releases <= {_release(str(getattr(blastbox, "__version__", "") or ""))}
 
 
 def fleet_report(

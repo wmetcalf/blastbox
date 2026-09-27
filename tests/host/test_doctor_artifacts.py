@@ -9,7 +9,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from blastbox.host import doctor, platform_id as plat, rootfs_stamp as rfs
+
+
+@pytest.fixture(autouse=True)
+def _this_host_runs_0_1_42(monkeypatch):
+    """A rootfs-only survey is judged against THIS host's blastbox; pin it."""
+    import blastbox
+
+    monkeypatch.setattr(blastbox, "__version__", "0.1.42")
 
 
 def _stamped(tmp: Path, name: str, **over) -> str:

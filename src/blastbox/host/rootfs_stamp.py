@@ -111,6 +111,13 @@ class RootfsStamp:
         # SANITISED HERE, once, for every consumer: the stamp is written by an image, and
         # its fields reach the dispatcher's log and exception messages (guest_problem), not
         # only doctor's output -- a newline or escape sequence there forges log lines.
+        # REQUIRED, and a string: the writer always emits it (possibly "", a verified guest
+        # without blastbox). `{}` or a null defaulted to "" and read as that verified state --
+        # an incomplete stamp from an untrusted artifact skipping every version comparison.
+        if not isinstance(raw.get("blastbox_version"), str):
+            raise RootfsStampError(
+                "rootfs stamp has no string blastbox_version; refusing an incomplete stamp"
+            )
         fields: dict[str, str] = {
             name: _clean(raw.get(name))
             for name in cls.__dataclass_fields__
@@ -532,13 +539,21 @@ def file_identity(path: Path | str) -> "tuple[int, ...] | None":
     return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
 
 
-def opened_matches(pid: int, path: str, key: "tuple[int, ...] | None") -> "bool | None":
-    """Whether process ``pid`` holds the PINNED file open -- by inode, not by path.
+def opened_matches(
+    pid: int, path: str, key: "tuple[int, ...] | None", *, strict: bool = False
+) -> "bool | None":
+    """Whether process ``pid`` holds the PINNED file open -- by the file, not by the path.
 
-    True: it has the pinned (dev, inode) open. False: it holds a DIFFERENT file at ``path``
-    (including one since unlinked, "(deleted)"). None: /proc could not answer. Path checks
-    alone cannot see an A->B->A republish (a publish rolled back while a restore opened B);
-    the descriptor the runtime actually holds can.
+    True: it holds the pinned (dev, inode) AND that file still has the pinned size/mtime -- a
+    `cp` over the same inode rewrites it in place, and (dev, inode) alone blessed the rewrite.
+    False: it holds the pinned inode rewritten, or a DIFFERENT file at ``path`` (including one
+    since unlinked, "(deleted)"), or -- ``strict`` -- anything but the pinned file.
+    None: /proc could not answer (or, not strict, nothing identifiable at all).
+
+    ``strict`` is for callers that KNOW the runtime has the disk open (a restore after the
+    snapshot load, a base after READY): the pinned inode must then be positively present. A
+    symlinked rootfs rolled back A->B->A leaves the runtime holding B under a name that is
+    neither the link nor its current target, which the lenient check cannot see.
     """
     if key is None:
         return None
@@ -556,6 +571,8 @@ def opened_matches(pid: int, path: str, key: "tuple[int, ...] | None") -> "bool 
         except OSError:
             continue
         if (st.st_dev, st.st_ino) == want:
+            if len(key) >= 4 and (st.st_size, st.st_mtime_ns) != (key[2], key[3]):
+                return False                      # the pinned inode, rewritten in place
             return True
         try:
             target = os.readlink(fd)
@@ -563,7 +580,9 @@ def opened_matches(pid: int, path: str, key: "tuple[int, ...] | None") -> "bool 
             continue
         if target in (path, real) or target in (f"{path} (deleted)", f"{real} (deleted)"):
             other = True
-    return False if other else None
+    if other or strict:
+        return False
+    return None
 
 
 class GuestGate:
@@ -635,13 +654,19 @@ def _gate_problem_nowait(self: "GuestGate") -> str:
     if key is None:
         return f"{self.rootfs} is missing (possibly mid-publish); not booting it"
     with self._lock:
-        if key == self._key and (self._retry_at is None or time.monotonic() < self._retry_at):
+        fresh = key == self._key and (self._retry_at is None or time.monotonic() < self._retry_at)
+        if fresh:
             return self._problem
         running = self.__dict__.get("_check_thread")
         if running is None or not running.is_alive():
             t = threading.Thread(target=self.checked, daemon=True, name="rootfs-guest-check")
             self.__dict__["_check_thread"] = t
             t.start()
+        if key == self._key:
+            # The SAME file, whose undecidable verdict is merely due a re-read: keep serving it
+            # while the re-read runs. PENDING here made a policy-allowed tier flap not-ready for
+            # the whole re-read, every interval, forever, on slow storage.
+            return self._problem
     return PENDING
 
 
@@ -712,7 +737,9 @@ class RootfsPin:
             key = self._keys.get(self._akey(artifact))
         if key is None:
             return
-        verdict = opened_matches(pid, self.gate.rootfs, key) if pid else None
+        # STRICT: after the snapshot load the drive is certainly open, so the pinned file must
+        # be positively held -- not merely "nothing wrong seen".
+        verdict = opened_matches(pid, self.gate.rootfs, key, strict=True) if pid else None
         if verdict is False:
             raise RootfsStale(
                 f"{self.gate.rootfs}: the runtime opened a different file than the one this "
@@ -739,7 +766,7 @@ class _PinnedBoot:
         # the path at the checked file while the base opened another -- and the pin would then
         # bless every restore of memory captured against the wrong disk.
         pid = getattr(getattr(self._inner, "proc", None), "pid", None)
-        if pid and opened_matches(pid, self._pin.gate.rootfs, self._key) is False:
+        if pid and opened_matches(pid, self._pin.gate.rootfs, self._key, strict=True) is False:
             raise RootfsStale(
                 f"{self._pin.gate.rootfs}: the base opened a different file than the one that "
                 "was checked (a republish landed during the base boot); not checkpointing it"
@@ -816,6 +843,13 @@ def stamp_tree(
         return (proc.stdout or "").strip() if proc.returncode == 0 else ""
 
     arch_raw = inspect("{{.Architecture}}")
+    if not arch_raw:
+        # As stage_rootfs: an empty arch is not compared at boot, so this rootfs would skip the
+        # arch check entirely. Refuse rather than publish it.
+        raise RootfsStampError(
+            f"cannot read the architecture of {image}; refusing to stamp a rootfs the boot "
+            "gate could not check"
+        )
     stamp = RootfsStamp(
         blastbox_version=version,
         image=image,

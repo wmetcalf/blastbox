@@ -202,7 +202,12 @@ class FcSnapshotBackend:
             if errs:
                 stranded = getattr(self._launcher, "_stranded_partials", None)
                 if isinstance(stranded, list):
-                    stranded.append(str(workdir))
+                    # Under the launcher ledger's lock: its sweep takes-and-clears the batch,
+                    # and an unlocked append racing that is silently erased.
+                    from blastbox.host.runtime.fc_snapshot_launcher import _STRANDED_LOCK
+
+                    with _STRANDED_LOCK:
+                        stranded.append(str(workdir))
             return True
         reaping = self.__dict__.setdefault("_reaping", set())
         if str(workdir) not in reaping:

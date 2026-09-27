@@ -840,8 +840,9 @@ class FcSnapshotLauncher:
                 # likely in the filesystem-stall case the copy timeout above exists for, since
                 # firecracker is then blocked on that same disk. Same rule boot_base already
                 # follows (codex, #154).
-                with _STRANDED_LOCK:
-                    self._stranded_partials.append(str(slot_workdir))
+                # NOT onto the path-only sweep: that would delete this workdir under the live
+                # firecracker. The backend keeps the process (orphan_proc, below) and removes the
+                # workdir once restore_reclaimed() confirms the exit.
                 # MARK THE EXCEPTION TOO. The sweep can only delete paths; it cannot terminate
                 # a process it has no handle for. SnapshotManager.restore() reads kill_failed
                 # to decide whether the artifact stays pinned and whether this workdir may be

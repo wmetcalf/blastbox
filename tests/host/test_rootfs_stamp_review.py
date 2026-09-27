@@ -1272,3 +1272,83 @@ def test_the_fc_export_script_cleans_up_before_its_first_inspect() -> None:
     root = Path(__file__).resolve().parents[2]
     body = (root / "deploy/firecracker/build-rootfs.sh").read_text()
     assert body.index("trap cleanup EXIT") < body.index("inspect --format '{{.Image}}'")
+
+
+# --- full-PR sweep (marla run-98) ---------------------------------------------------------
+
+
+def _dir_stamp(tmp_path, name, **fields):
+    tree = tmp_path / name
+    (tree / "opt" / "blastbox").mkdir(parents=True)
+    (tree / rfs.STAMP_PATH).write_text(json.dumps(fields))
+    return str(tree)
+
+
+@pytest.mark.parametrize("version", ["0.1.4/2", "/"])
+def test_doctor_judges_the_stamp_the_gate_judges(tmp_path, version) -> None:
+    """doctor sanitised the stamp BEFORE comparing it: '0.1.4/2' became '0.1.42' (OK) while the
+    gate refused the raw value."""
+    tree = _dir_stamp(tmp_path, "r", blastbox_version=version,
+                      platform={"arch": plat.host_platform().arch, "runtime": "gvisor"})
+    assert rfs.guest_problem(tree, "gvisor") != ""
+    assert doctor.verdict([], doctor.survey_rootfs([tree])) != []
+
+
+def test_a_whitespace_version_means_no_blastbox_in_both(tmp_path) -> None:
+    tree = _dir_stamp(tmp_path, "r", blastbox_version="   ",
+                      platform={"arch": plat.host_platform().arch, "runtime": "gvisor"})
+    assert rfs.guest_problem(tree, "gvisor") == ""
+    (art,) = doctor.survey_rootfs([tree])
+    assert art.version == doctor.NO_BLASTBOX and doctor.verdict([], [art]) == []
+
+
+def test_a_stamp_reading_unknown_is_still_a_readable_stamp(tmp_path) -> None:
+    tree = _dir_stamp(tmp_path, "r", blastbox_version="unknown",
+                      platform={"arch": plat.host_platform().arch, "runtime": "gvisor"})
+    (art,) = doctor.survey_rootfs([tree])
+    assert art.known
+
+
+def test_expect_does_not_switch_off_the_host_comparison() -> None:
+    problems = doctor.verdict([], [_art(version="0.1.43")], expect="0.1.43")
+    assert any("this host runs" in p for p in problems)
+
+
+def test_expect_with_nothing_versioned_is_a_problem() -> None:
+    jvm = doctor.Artifact(path="/r/jvm", version=doctor.NO_BLASTBOX, runtime="firecracker",
+                          arch=plat.host_platform().arch, stamped=True)
+    assert any("nothing" in p for p in doctor.verdict([], [jvm], expect="0.1.42"))
+
+
+def test_fleet_report_judges_a_rootfs_only_fleet_against_this_host() -> None:
+    assert doctor.fleet_report([], [_art(version="0.0.1")])["ok"] is False
+    assert doctor.fleet_report([], [_art(version="0.1.42")])["ok"] is True
+
+
+@pytest.mark.parametrize("body", [{}, {"blastbox_version": None}, {"blastbox_version": 42}])
+def test_an_incomplete_stamp_is_unreadable_not_package_free(body) -> None:
+    with pytest.raises(rfs.RootfsStampError, match="blastbox_version"):
+        rfs.RootfsStamp.from_json(json.dumps(body))
+
+
+def test_stamp_tree_refuses_an_unreadable_architecture(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(doctor, "version_in_image", lambda image, runner=None: ("0.1.42", ""))
+
+    def run(argv, **kw):
+        if "{{.Architecture}}" in argv or "{{.Id}}" in argv:
+            return subprocess.CompletedProcess(list(argv), 1, "", "daemon hiccup")
+        return subprocess.CompletedProcess(list(argv), 0, "{}", "")
+
+    with pytest.raises(rfs.RootfsStampError, match="architecture"):
+        rfs.stamp_tree(tmp_path, "eng:1", "firecracker", run=run)
+
+
+def test_the_legacy_scripts_fall_back_without_blastbox_but_fail_on_a_refusal() -> None:
+    """No importable blastbox: the documented unstamped fallback, with a shell-only link-safe
+    clear. blastbox present but the stamp REFUSED (an unverifiable guest): fail the build --
+    publishing it unstamped made the refusal weaker than stamping."""
+    root = Path(__file__).resolve().parents[2]
+    for script in ("deploy/firecracker/build-rootfs.sh", "deploy/redeploy-warm.sh"):
+        body = (root / script).read_text()
+        assert "import blastbox.host.rootfs_stamp" in body, script     # capability probe
+        assert "-L " in body, script                                   # link-safe shell clear

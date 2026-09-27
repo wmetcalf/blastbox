@@ -838,3 +838,78 @@ def test_a_rootfs_missing_mid_publish_is_not_a_pass(tmp_path, monkeypatch) -> No
     with pytest.raises(rfs.RootfsStampError, match="missing"):
         rfs.RootfsPin(str(missing), "firecracker").before_boot()
     assert rfs.GuestGate("", "firecracker").checked() == ("", None)   # none configured: no-op
+
+
+# --- full-PR sweep (marla run-98) ---------------------------------------------------------
+
+
+def test_an_in_place_rewrite_of_the_opened_inode_is_not_a_match(tmp_path) -> None:
+    """`cp new rootfs` rewrites the SAME inode: (dev, ino) alone matched, and a True verdict
+    skipped the path fallback that would have seen size/mtime move."""
+    f = tmp_path / "rootfs.ext4"
+    f.write_bytes(b"A" * 10)
+    key = rfs.file_identity(f)
+    with open(f, "r+b") as held:
+        held.write(b"BBBBBBBBBBBBBBBBBBBB")   # in place: same inode, new size
+        held.flush()
+        assert rfs.opened_matches(os.getpid(), str(f), key) is False
+
+
+def test_strict_mode_requires_the_pinned_inode_to_be_held(tmp_path) -> None:
+    """A symlink flipped A->B->A: the process holds B under a name that is neither the link
+    nor its current target, so the lenient check answered None and everything passed. Once the
+    disk is known to be open, the pinned inode must be positively present."""
+    releases = tmp_path / "releases"
+    releases.mkdir()
+    (releases / "A.ext4").write_bytes(b"A")
+    (releases / "B.ext4").write_bytes(b"BB")
+    link = tmp_path / "current.ext4"
+    link.symlink_to(releases / "A.ext4")
+    key = rfs.file_identity(link)
+    link.unlink()
+    link.symlink_to(releases / "B.ext4")
+    held = open(link, "rb")                       # the runtime opened B
+    try:
+        link.unlink()
+        link.symlink_to(releases / "A.ext4")      # rolled back
+        assert rfs.opened_matches(os.getpid(), str(link), key) is None      # lenient: blind
+        assert rfs.opened_matches(os.getpid(), str(link), key, strict=True) is False
+    finally:
+        held.close()
+
+
+def test_an_expired_undecidable_verdict_is_served_while_it_is_re_read(tmp_path,
+                                                                      monkeypatch) -> None:
+    """Returning PENDING on every retry made a policy-allowed tier flap not-ready for the whole
+    re-read (a third of the time, on storage where debugfs times out)."""
+    import threading
+
+    f = tmp_path / "rootfs.ext4"
+    f.write_bytes(b"A")
+    release = threading.Event()
+    calls: list[int] = []
+
+    def verdict(p, r):
+        calls.append(1)
+        if len(calls) > 1:
+            release.wait(5)
+        return "", False                          # undecidable, allowed
+
+    monkeypatch.setattr(rfs, "guest_verdict", verdict)
+    now = [1000.0]
+    monkeypatch.setattr(rfs.time, "monotonic", lambda: now[0])
+    gate = rfs.GuestGate(str(f), "firecracker")
+    gate.checked()
+    now[0] += rfs.UNDECIDED_RETRY_S + 1
+    assert gate.problem_nowait() == ""            # stale-while-revalidate, not PENDING
+    release.set()
+
+
+def test_the_fc_launcher_leaves_an_orphaned_restore_to_the_backend(tmp_path) -> None:
+    """The workdir was on TWO ledgers: the launcher's path-only sweep deleted it under the live
+    firecracker the backend was still waiting on."""
+    src = Path(__file__).resolve().parents[3] / "src/blastbox/host/runtime/fc_snapshot_launcher.py"
+    body = src.read_text()
+    i = body.index("exc.orphan_proc = proc")
+    window = body[body.rindex("if not _terminate_proc(proc):", 0, i):i]
+    assert "_stranded_partials.append" not in window

@@ -136,6 +136,10 @@ records the blastbox the image actually has installed (falling back to its label
 They need a python that imports a blastbox with this CLI: set `BLASTBOX_PY` to it
 (an absolute path for `redeploy-warm.sh`, which runs it under sudo). Without one
 they warn and publish an unstamped rootfs, which the tiers warn about and boot.
+With one, a stamping REFUSAL (the installed version could not be verified, the
+architecture could not be read) fails the export: publishing that guest unstamped
+would boot it with no check at all. Either way a stamp inherited from the image is
+removed first, without following any link the image controls.
 
 **Survey a host.** `blastbox doctor --rootfs PATH` adds each artifact to the
 container survey; `--json` emits the whole fleet for monitoring, with the same
