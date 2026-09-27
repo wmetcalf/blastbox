@@ -285,6 +285,12 @@ class _ImgStamp:
 def _stage_capturing(tmp_path, monkeypatch, *, arch_out="arm64"):
     import blastbox.host.imagerun as mod
 
+    # PIN the privilege path rather than let stage_rootfs probe the host. GitHub's runners have
+    # passwordless sudo, so there the privileged branch ran and its mkdir went to the fake
+    # runner (recorded, never created); a dev box without passwordless sudo took the real
+    # mkdir. Unpinned, the same test passed locally and failed in CI.
+    monkeypatch.setattr(mod, "_root_prefix", lambda: [])
+    monkeypatch.setattr(mod, "_can_be_root", lambda: False)
     monkeypatch.setenv("DEMO_DIR", str(tmp_path / "out"))
     monkeypatch.setattr(mod, "_blastbox_version", lambda: "0.0.1")      # the EXPORTER
     monkeypatch.setattr(mod, "_source_revision", lambda plan: "plan-root-rev")
