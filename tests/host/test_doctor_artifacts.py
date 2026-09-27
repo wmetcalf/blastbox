@@ -13,7 +13,9 @@ from blastbox.host import doctor, platform_id as plat, rootfs_stamp as rfs
 
 
 def _stamped(tmp: Path, name: str, **over) -> str:
-    p = plat.host_platform(runtime=over.pop("runtime", "firecracker")).to_dict()
+    # A stamped DIRECTORY is a gVisor rootfs; doctor now judges the tier by the artifact's shape,
+    # so a directory claiming "firecracker" is (correctly) unbootable.
+    p = plat.host_platform(runtime=over.pop("runtime", "gvisor")).to_dict()
     p.update(over.pop("platform", {}))
     rfs.write_into_tree(
         tmp / name,
@@ -30,7 +32,7 @@ def test_survey_reads_version_and_platform(tmp_path: Path) -> None:
     got = doctor.survey_rootfs([_stamped(tmp_path, "a")])
     assert len(got) == 1
     assert got[0].version == "0.1.42"
-    assert got[0].runtime == "firecracker"
+    assert got[0].runtime == "gvisor"
     assert got[0].arch
     # A rootfs is bound to arch + runtime only; the exporter's CPU is not its property
     # (the snapshot is taken on the deploying host), so it is not surveyed as one.

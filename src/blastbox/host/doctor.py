@@ -25,6 +25,7 @@ import shutil
 import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
 
@@ -474,7 +475,14 @@ def artifact_problems(artifacts: Sequence[Artifact]) -> list[tuple[Artifact, str
         recorded = _plat.HostPlatform(
             arch=art.arch, cpu_vendor=art.cpu_vendor, runtime=art.runtime
         )
-        live = _plat.host_platform(runtime=art.runtime)
+        # The tier this artifact would be booted BY, from its shape -- not from its own claim.
+        # A live platform built from the stamp's runtime compared that claim with itself, so a
+        # directory stamped "firecracker" passed here and was refused at boot.
+        try:
+            expected = "gvisor" if Path(art.path).is_dir() else "firecracker"
+        except OSError:
+            expected = art.runtime
+        live = _plat.host_platform(runtime=expected)
         fatal = _plat.refusals(_plat.compare(recorded, live))
         if fatal:
             problems.append((art, _plat.summarise(fatal)))
@@ -581,7 +589,10 @@ def fleet_report(
     unknown = [c.name for c in containers if not c.known] + [
         a.path for a in artifacts if not a.known
     ]
-    mixed = {p: sorted(v) for p, v in drift(list(containers)).items() if len(v) > 1}
+    # By RELEASE, as verdict() judges it: "0.2" and "0.2.0" are one release, and reporting them
+    # as drift beside ok=true gave monitoring a contradictory payload.
+    mixed = {p: sorted(v) for p, v in drift(list(containers)).items()
+             if len({_release(x) for x in v}) > 1}
     unbootable = [
         {"path": a.path, "reason": why} for a, why in artifact_problems(artifacts)
     ]

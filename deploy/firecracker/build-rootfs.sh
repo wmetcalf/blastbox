@@ -39,6 +39,9 @@ fi
 echo "   clean — no setuid/setgid binaries"
 
 cid="$("$DOCKER" create "$TAG")"
+# The IMMUTABLE image this container was created from: the stamp must describe what was
+# exported, and "$TAG" can be retagged by another build before the stamp step runs.
+img_id="$("$DOCKER" inspect --format '{{.Image}}' "$cid")"
 rootdir="$(mktemp -d)"
 cleanup() { "$DOCKER" rm -f "$cid" >/dev/null 2>&1 || true; rm -rf "$rootdir"; }
 trap cleanup EXIT
@@ -53,7 +56,7 @@ echo ">> export rootfs -> $rootdir"
 echo ">> stamp rootfs (image provenance)"
 # Verified by the FILE, not the exit status: a blastbox older than this CLI imports the module
 # and exits 0 having written nothing.
-if ! "${BLASTBOX_PY:-python3}" -m blastbox.host.rootfs_stamp write "$rootdir" "$TAG" firecracker \
+if ! "${BLASTBOX_PY:-python3}" -m blastbox.host.rootfs_stamp write "$rootdir" "$img_id" firecracker \
      "$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)" \
    || [ ! -s "$rootdir/opt/blastbox/rootfs-stamp.json" ]; then
     echo "!! could not stamp the rootfs (is blastbox importable by ${BLASTBOX_PY:-python3}?)." >&2

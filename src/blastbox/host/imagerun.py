@@ -1416,9 +1416,10 @@ def _export_platform(spec: RootfsSpec, arch: str = "") -> "_platform_id.HostPlat
     correct rootfs refuse to boot on a fleet of the other vendor.
     """
     runtime = "firecracker" if spec.kind == "ext4" else "gvisor"
-    return _platform_id.HostPlatform(
-        arch=arch or _platform_id.host_platform().arch, runtime=runtime
-    )
+    # "" when the image could not be inspected -- NEVER the export host's arch: an arm64 image
+    # exported under emulation on x86_64 was stamped x86_64, so the wrong fleet passed the
+    # check and the right one was refused. An unrecorded arch is simply not compared.
+    return _platform_id.HostPlatform(arch=arch, runtime=runtime)
 
 
 def stage_rootfs(
@@ -1515,19 +1516,25 @@ def stage_rootfs(
         # so a label here would not survive. This is the only record that
         # survives into the thing a warm tier actually boots.
         img_version, img_revision, img_arch = _image_provenance(plan, source, run)
-        _rootfs_stamp.write_into_tree(
-            staging,
-            _rootfs_stamp.RootfsStamp(
-                blastbox_version=img_version,
-                image=image,
-                image_id=verified_id,
-                revision=img_revision,
-                exported_at=_rootfs_stamp.now_iso(),
-                platform=_export_platform(spec, img_arch).to_dict(),
-            ),
-            priv=priv,
-            run=run,
-        )
+        try:
+            _rootfs_stamp.write_into_tree(
+                staging,
+                _rootfs_stamp.RootfsStamp(
+                    blastbox_version=img_version,
+                    image=image,
+                    image_id=verified_id,
+                    revision=img_revision,
+                    exported_at=_rootfs_stamp.now_iso(),
+                    platform=_export_platform(spec, img_arch).to_dict(),
+                ),
+                priv=priv,
+                run=run,
+            )
+        except _rootfs_stamp.RootfsStampError as exc:
+            # A BUILD failure, with its reason: the CLI reports BuildError, and a hostile image
+            # refused here (a symlink or device at the stamp path) otherwise surfaced as a
+            # traceback instead of the command's normal diagnostic.
+            raise BuildError(f"cannot stamp the rootfs exported from {image}: {exc}") from exc
 
         staged_size = 0
         if spec.kind == "dir":

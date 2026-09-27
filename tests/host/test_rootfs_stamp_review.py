@@ -834,3 +834,75 @@ def test_the_legacy_scripts_pass_their_source_revision() -> None:
     root = Path(__file__).resolve().parents[2]
     for script in ("deploy/firecracker/build-rootfs.sh", "deploy/redeploy-warm.sh"):
         assert "rev-parse HEAD" in (root / script).read_text(), script
+
+
+# --- codex bot, second pass on #186 -------------------------------------------------------
+
+
+def test_doctor_judges_the_tier_by_the_artifacts_shape_not_its_claim(tmp_path) -> None:
+    """A directory stamped runtime=firecracker compared against a live platform built from
+    that same claim always agreed -- doctor passed what the boot gate refuses."""
+    tree = tmp_path / "rootfs"
+    rfs.write_into_tree(tree, _stamp(platform={
+        "arch": plat.host_platform().arch, "runtime": "firecracker"}))
+    problems = doctor.artifact_problems(doctor.survey_rootfs([str(tree)]))
+    assert problems and "runtime" in problems[0][1]
+
+
+def test_json_drift_groups_equivalent_releases() -> None:
+    ctrs = [_ctr("a", "p1", "0.2"), _ctr("b", "p1", "0.2.0")]
+    report = doctor.fleet_report(ctrs, [])
+    assert report["drift"] == {}
+
+
+def test_an_unreadable_image_architecture_is_not_guessed(tmp_path, monkeypatch) -> None:
+    """Falling back to the export host's arch stamped an emulated arm64 image x86_64."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_root_prefix", lambda: [])
+    monkeypatch.setattr(mod, "_can_be_root", lambda: False)
+    monkeypatch.setenv("DEMO_DIR", str(tmp_path / "out"))
+    monkeypatch.setattr(mod, "_read_stamp", lambda ident, r=None: _ImgStamp())
+    captured: list = []
+    monkeypatch.setattr(mod._rootfs_stamp, "write_into_tree",
+                        lambda tree, stamp, **kw: captured.append(stamp))
+
+    class Run(FakeRunner):
+        def __call__(self, argv, **kw):
+            if "{{.Architecture}}" in argv:
+                return subprocess.CompletedProcess(list(argv), 1, "", "no such image")
+            return super().__call__(argv, **kw)
+
+    plan = _plan(tmp_path)
+    mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=Run(), log=lambda _: None,
+                     extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True,
+                     verified_id="sha256:" + "e" * 64)
+    assert captured[0].platform.get("arch", "") == ""
+
+
+def test_a_refused_stamp_write_is_a_build_error(tmp_path, monkeypatch) -> None:
+    """The CLI catches BuildError only; a hostile image's stamp refusal escaped as a
+    traceback instead of the command's normal diagnostic."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_root_prefix", lambda: [])
+    monkeypatch.setattr(mod, "_can_be_root", lambda: False)
+    monkeypatch.setenv("DEMO_DIR", str(tmp_path / "out"))
+    monkeypatch.setattr(mod, "_read_stamp", lambda ident, r=None: _ImgStamp())
+
+    def refuse(tree, stamp, **kw):
+        raise rfs.RootfsStampError("opt/blastbox is a symlink inside the image")
+
+    monkeypatch.setattr(mod._rootfs_stamp, "write_into_tree", refuse)
+    plan = _plan(tmp_path)
+    with pytest.raises(mod.BuildError, match="symlink"):
+        mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                         extract=_fake_extract({"/init": "x"}),
+                         extract_preserves_ownership=True, verified_id="sha256:" + "e" * 64)
+
+
+def test_the_legacy_scripts_stamp_the_immutable_image_they_exported() -> None:
+    """A retag between export and stamping made stamp_tree describe a DIFFERENT image."""
+    root = Path(__file__).resolve().parents[2]
+    for script in ("deploy/firecracker/build-rootfs.sh", "deploy/redeploy-warm.sh"):
+        assert "{{.Image}}" in (root / script).read_text(), script
