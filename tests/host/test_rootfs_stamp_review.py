@@ -1625,3 +1625,17 @@ def test_in_flight_debugfs_probes_count_against_the_cap(tmp_path, monkeypatch) -
         assert sum("still hung" in e or "in flight" in e for e in errors) >= n - rfs.MAX_ABANDONED_DEBUGFS
     finally:
         _UnkillableDebugfs.release = True
+
+
+# --- PR #186 codex (e63eaf7) ----------------------------------------------------------------
+
+
+def test_an_exhausted_probe_cap_refuses_rather_than_admits(tmp_path, monkeypatch) -> None:
+    """Hung probes elsewhere must not turn every new rootfs into an unchecked boot: the cap
+    being full is "could not look YET", refused and retried, not the legacy exception."""
+    img = tmp_path / "rootfs.ext4"
+    img.write_bytes(b"\0")
+    monkeypatch.setattr(rfs.shutil, "which", lambda _n: "/usr/sbin/debugfs")
+    monkeypatch.setattr(rfs, "_DEBUGFS_IN_FLIGHT", rfs.MAX_ABANDONED_DEBUGFS)
+    problem, definitive = rfs.guest_verdict(str(img), "firecracker")
+    assert problem and not definitive

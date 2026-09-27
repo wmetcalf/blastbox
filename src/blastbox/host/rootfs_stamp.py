@@ -85,6 +85,12 @@ class RootfsStampInvalid(RootfsStampError):
     """
 
 
+class RootfsProbeBusy(RootfsStampError):
+    """The debugfs probe cap is full: the stamp could not be looked at YET. Refused (and
+    retried), never the legacy "unreadable, boot anyway" exception -- or a few hung artifacts
+    would open the gate for every other rootfs."""
+
+
 class RootfsStale(RootfsStampError):
     """The rootfs changed since a snapshot was checkpointed against it."""
 
@@ -427,7 +433,7 @@ def _admit_debugfs() -> None:
                 _close_idle(proc, t, te)
         _ABANDONED_DEBUGFS[:] = live
         if len(live) + _DEBUGFS_IN_FLIGHT >= MAX_ABANDONED_DEBUGFS:
-            raise RootfsStampError(
+            raise RootfsProbeBusy(
                 f"{len(live)} earlier debugfs probes are still hung (ignoring SIGKILL) and "
                 f"{_DEBUGFS_IN_FLIGHT} are in flight; not starting another until they exit -- "
                 "is the rootfs on a stuck mount?"
@@ -537,6 +543,8 @@ def guest_verdict(rootfs: str, runtime: str) -> tuple[str, bool]:
             rootfs, exc,
         )
         return "", True        # definitively unstamped: nothing to re-read until it changes
+    except RootfsProbeBusy as exc:
+        return f"{rootfs}: its blastbox stamp cannot be checked yet ({exc})", False
     except RootfsStampInvalid as exc:
         # PRESENT but unusable: refused. The image wrote it, and a damaged stamp must not
         # buy the unchecked boot that only a genuinely absent one gets.
@@ -1012,6 +1020,7 @@ __all__ = [
     "RootfsStamp",
     "RootfsStampError",
     "RootfsStampInvalid",
+    "RootfsProbeBusy",
     "compare_to_host",
     "now_iso",
     "read",

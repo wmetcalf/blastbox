@@ -913,3 +913,67 @@ def test_the_fc_launcher_leaves_an_orphaned_restore_to_the_backend(tmp_path) -> 
     i = body.index("exc.orphan_proc = proc")
     window = body[body.rindex("if not _terminate_proc(proc):", 0, i):i]
     assert "_stranded_partials.append" not in window
+
+
+# --- PR #186 codex (e63eaf7) ----------------------------------------------------------------
+
+
+def _plain_fc(tmp_path, monkeypatch):
+    from blastbox.host.runtime.firecracker import FCConfig, FirecrackerSlotRuntime
+
+    from .test_firecracker import _FakeReadySignal, _FakeSubprocessRunner
+
+    rootfs = tmp_path / "rootfs.ext4"
+    rootfs.write_bytes(b"gen-1")
+    monkeypatch.setattr(rfs, "guest_verdict", lambda p, r: ("", True))
+    cfg = FCConfig(fc_bin="firecracker", fc_kernel="/mnt/vmlinux", fc_rootfs=str(rootfs),
+                   fc_vcpu_count=1, fc_mem_mib=256, fc_outdisk_mib=64,
+                   scratch_root=str(tmp_path / "scratch"))
+    rt = FirecrackerSlotRuntime(cfg, subprocess_runner=_FakeSubprocessRunner(),
+                                ready_signal=_FakeReadySignal(ready=False))
+    monkeypatch.setattr("blastbox.host.runtime.firecracker.make_ext4", lambda p, mib: p.touch())
+    slot = rt.spawn()
+    proc = rt._procs[slot.slot_id]
+    monkeypatch.setattr(proc, "pid", 4242, raising=False)
+    killed: list[str] = []
+    monkeypatch.setattr(proc, "kill", lambda: killed.append(slot.slot_id))
+    # A->B->A: firecracker holds B under a backup name; the path matches the pin again, so
+    # only a STRICT open-file check can see it.
+    monkeypatch.setattr(rfs, "opened_matches",
+                        lambda pid, path, key, *, strict=False: False if strict else None)
+    return rt, slot, killed
+
+
+def test_a_rolled_back_rootfs_is_caught_before_ready_once_the_disk_is_open(tmp_path,
+                                                                        monkeypatch) -> None:
+    import blastbox.host.runtime.firecracker as fcmod
+
+    rt, slot, killed = _plain_fc(tmp_path, monkeypatch)
+    monkeypatch.setattr(fcmod, "ROOTFS_OPEN_GRACE_S", 0.0)
+    assert rt.is_ready(slot) is False
+    assert killed == [slot.slot_id]
+
+
+def test_the_open_grace_tolerates_a_disk_not_yet_opened(tmp_path, monkeypatch) -> None:
+    import blastbox.host.runtime.firecracker as fcmod
+
+    rt, slot, killed = _plain_fc(tmp_path, monkeypatch)
+    monkeypatch.setattr(fcmod, "ROOTFS_OPEN_GRACE_S", 3600.0)
+    assert rt.is_ready(slot) is False             # simply not ready yet
+    assert killed == []
+
+
+def test_a_reclaimed_gvisor_restore_workdir_is_removed_without_a_rebuild(tmp_path,
+                                                                        monkeypatch) -> None:
+    """The recovered bundle went to the directory sweep, which only a base boot or checkpoint
+    runs: a healthy long-lived tier stranded every one until the next rebuild."""
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    backend, _rec = _gv_backend(tmp_path)
+    wd = tmp_path / "slots" / "s1"
+    (wd / "bundle").mkdir(parents=True)
+    backend._strand_sandbox("slot-aaa", wd)
+    monkeypatch.setattr(gs, "_best_effort_delete", lambda cfg, run, cid: True)
+    backend.restore_reclaimed(str(wd))            # kicks the background retry; no boot
+    assert _wait_until(lambda: not wd.exists())
+    assert str(wd) not in backend._stranded_partials

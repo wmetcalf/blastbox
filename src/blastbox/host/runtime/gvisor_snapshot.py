@@ -1177,6 +1177,9 @@ class GvisorSnapshotBackend:
                         if entry in self._stranded_sandboxes:
                             self._stranded_sandboxes.remove(entry)
                         self._stranded_partials.append(wd)
+            # Swept NOW: the directory sweep otherwise runs only on a base boot or checkpoint,
+            # so a healthy long-lived tier kept every recovered bundle until the next rebuild.
+            _retry_stranded_partials(self._stranded_partials)
         finally:
             lock.release()
 

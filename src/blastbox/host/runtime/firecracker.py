@@ -85,6 +85,11 @@ __all__ = [
 
 _log = logging.getLogger("blastbox.host.runtime.firecracker")
 
+#: Seconds after spawn by which firecracker has surely opened its drive (it does so from
+#: --config-file while building the VM). Past it, is_ready's rootfs check is strict even
+#: before READY. Generous: a false positive only kills and respawns a slot.
+ROOTFS_OPEN_GRACE_S = 5.0
+
 # ---------------------------------------------------------------------------
 # Environment variable keys
 # ---------------------------------------------------------------------------
@@ -1453,6 +1458,7 @@ class FirecrackerSlotRuntime:
             if not hasattr(self, "_rootfs_keys"):
                 self._rootfs_keys = {}
             self._rootfs_keys[slot_id] = checked_key
+            self.__dict__.setdefault("_rootfs_spawned_at", {})[slot_id] = time.monotonic()
 
         # Stamp the generation this slot was SPAWNED from; see Slot.ack_generation.
 
@@ -1474,7 +1480,12 @@ class FirecrackerSlotRuntime:
             return False
         # REGARDLESS of readiness: a mismatched guest may never signal READY at all, and gating
         # on it left that slot to the whole warm-up timeout instead of rejecting it at once.
-        if self._rootfs_changed_since_spawn(slot.slot_id, strict=ready):
+        # STRICT once READY -- or once firecracker has surely opened its drive: --config-file
+        # opens it while building the VM, well within the grace. Lenient before that, or a
+        # rollback A->B->A (B held under a backup name) hid B for the whole warm-up timeout.
+        spawned = getattr(self, "_rootfs_spawned_at", {}).get(slot.slot_id)
+        opened = spawned is not None and time.monotonic() - spawned >= ROOTFS_OPEN_GRACE_S
+        if self._rootfs_changed_since_spawn(slot.slot_id, strict=ready or opened):
             # We cannot tell whether the publish landed before or after firecracker opened the
             # disk, so do not promote a guest that may never have been checked: kill it, and
             # the pool reaps and respawns against the new (checked) rootfs.
@@ -1530,6 +1541,7 @@ class FirecrackerSlotRuntime:
         with self._lock:
             fc_proc = self._procs.pop(slot.slot_id, None)
             getattr(self, "_rootfs_keys", {}).pop(slot.slot_id, None)   # one entry per slot
+            getattr(self, "_rootfs_spawned_at", {}).pop(slot.slot_id, None)
 
         # Tear down the vsock READY listener (if any) before removing the dir.
         cleanup = getattr(self._ready_signal, "cleanup", None)
