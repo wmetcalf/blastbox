@@ -1526,6 +1526,16 @@ def stage_rootfs(
         # so a label here would not survive. This is the only record that
         # survives into the thing a warm tier actually boots.
         img_version, img_revision, img_arch = _image_provenance(plan, source, run)
+        if img_version and not verified_id:
+            # The direct export_rootfs() path skipped run_plan's verification, so a stale or
+            # wrong label would be stamped as-is. Check it against what the image ACTUALLY
+            # has installed before it is written anywhere a host will trust.
+            agrees, detail = _verify_contents(source, lambda argv: run(argv, capture_output=True))  # type: ignore[arg-type]
+            if agrees is not True:
+                raise BuildError(
+                    f"{image}: its blastbox label cannot be trusted for the rootfs stamp: "
+                    f"{detail or 'the installed version could not be read'}"
+                )
         try:
             _rootfs_stamp.write_into_tree(
                 staging,

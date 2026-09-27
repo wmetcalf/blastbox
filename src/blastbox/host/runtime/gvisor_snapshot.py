@@ -1159,22 +1159,26 @@ class GvisorSnapshotBackend:
     def _retry_stranded_sandboxes(self) -> None:
         """Retry `runsc delete` for sandboxes a failed restore could not tear down.
 
-        Only once one is confirmed gone does its bundle go to the directory sweep: removing the
-        bundle under a live sandbox is worse than leaving both.
+        Entries STAY in the ledger until their delete succeeds: emptying it before the slow
+        runsc calls let a concurrent restore_reclaimed() see nothing pending and release a pin
+        under a sandbox whose delete then failed. One retry at a time; a second caller returns.
+        Only once a sandbox is confirmed gone does its bundle go to the directory sweep.
         """
-        with _STRANDED_LOCK:
-            batch = list(self.__dict__.get("_stranded_sandboxes", []))
-            self.__dict__["_stranded_sandboxes"] = []
-        still: list[tuple[str, str]] = []
-        for cid, wd in batch:
-            if _best_effort_delete(self._cfg, self._run, cid):
-                with _STRANDED_LOCK:
-                    self._stranded_partials.append(wd)
-            else:
-                still.append((cid, wd))
-        if still:
+        lock = self.__dict__.setdefault("_sandbox_retry_lock", threading.Lock())
+        if not lock.acquire(blocking=False):
+            return
+        try:
             with _STRANDED_LOCK:
-                self.__dict__.setdefault("_stranded_sandboxes", []).extend(still)
+                batch = list(self._stranded_sandboxes)
+            for entry in batch:
+                cid, wd = entry
+                if _best_effort_delete(self._cfg, self._run, cid):
+                    with _STRANDED_LOCK:
+                        if entry in self._stranded_sandboxes:
+                            self._stranded_sandboxes.remove(entry)
+                        self._stranded_partials.append(wd)
+        finally:
+            lock.release()
 
     def restore_reclaimed(self, workdir: str) -> bool:
         """Whether a failed restore's sandbox is confirmed gone (SnapshotManager releases the

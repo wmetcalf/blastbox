@@ -988,6 +988,7 @@ def test_a_direct_export_extracts_and_stamps_one_immutable_image(tmp_path, monke
     captured: list = []
     monkeypatch.setattr(mod._rootfs_stamp, "write_into_tree",
                         lambda tree, stamp, **kw: captured.append(stamp))
+    monkeypatch.setattr(mod, "_verify_contents", lambda ident, r=None: (True, "9.9.9"))
     extracted: list[str] = []
     fake = _fake_extract({"/init": "x"})
 
@@ -1001,3 +1002,22 @@ def test_a_direct_export_extracts_and_stamps_one_immutable_image(tmp_path, monke
     ident = "sha256:" + "e" * 64                  # what FakeRunner resolves any tag to
     assert extracted == [ident] and read_from == [ident]
     assert captured[0].image_id == ident
+
+
+
+def test_a_direct_export_verifies_the_label_against_the_installed_blastbox(tmp_path,
+                                                                         monkeypatch) -> None:
+    """run_plan verifies every image; the direct export_rootfs() path trusted the label, so a
+    stale one could stamp a host-matching version onto a guest built from something else."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_root_prefix", lambda: [])
+    monkeypatch.setattr(mod, "_can_be_root", lambda: False)
+    monkeypatch.setenv("DEMO_DIR", str(tmp_path / "out"))
+    monkeypatch.setattr(mod, "_read_stamp", lambda ident, r=None: _ImgStamp())   # says 9.9.9
+    monkeypatch.setattr(mod, "_verify_contents",
+                        lambda ident, r=None: (False, "label says 9.9.9, image contains 0.1.30"))
+    plan = _plan(tmp_path)
+    with pytest.raises(mod.BuildError, match="0.1.30"):
+        mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                         extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True)

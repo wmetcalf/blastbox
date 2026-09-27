@@ -505,3 +505,58 @@ def test_a_held_pin_is_released_once_the_backend_reaps_its_sandbox(tmp_path, mon
     mgr.ensure_build_started()                    # the next pool tick
     assert mgr._refs.get(id(art), 0) == 0         # released once the sandbox is confirmed gone
     assert "s1" not in mgr._held_restores
+
+
+
+# --- codex bot, seventh pass --------------------------------------------------------------
+
+
+def test_a_plain_fc_slot_is_refused_before_ready_if_its_rootfs_changed(tmp_path,
+                                                                     monkeypatch) -> None:
+    """A mismatched guest may NEVER signal READY; gated on readiness, it survived the whole
+    warm-up timeout instead of being rejected at once."""
+    from blastbox.host.runtime.firecracker import FCConfig, FirecrackerSlotRuntime
+
+    from .test_firecracker import _FakeReadySignal, _FakeSubprocessRunner
+
+    rootfs = tmp_path / "rootfs.ext4"
+    rootfs.write_bytes(b"gen-1")
+    monkeypatch.setattr(rfs, "guest_verdict", lambda p, r: ("", True))
+    cfg = FCConfig(fc_bin="firecracker", fc_kernel="/mnt/vmlinux", fc_rootfs=str(rootfs),
+                   fc_vcpu_count=1, fc_mem_mib=256, fc_outdisk_mib=64,
+                   scratch_root=str(tmp_path / "scratch"))
+    rt = FirecrackerSlotRuntime(cfg, subprocess_runner=_FakeSubprocessRunner(),
+                                ready_signal=_FakeReadySignal(ready=False))
+    monkeypatch.setattr("blastbox.host.runtime.firecracker.make_ext4", lambda p, mib: p.touch())
+    slot = rt.spawn()
+    _replace(rootfs, b"gen-2")
+    killed: list[str] = []
+    monkeypatch.setattr(rt._procs[slot.slot_id], "kill", lambda: killed.append(slot.slot_id))
+    assert rt.is_ready(slot) is False
+    assert killed == [slot.slot_id]               # not left to time out
+
+
+def test_a_sandbox_being_retried_is_not_reported_reclaimed(tmp_path, monkeypatch) -> None:
+    """The retry emptied the ledger BEFORE its slow deletes finished, so a concurrent
+    restore_reclaimed() saw nothing pending and released the pin under a live sandbox."""
+    import threading
+
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    backend, _rec = _gv_backend(tmp_path)
+    backend._strand_sandbox("slot-aaa", tmp_path / "slots" / "s1")
+    entered, release = threading.Event(), threading.Event()
+
+    def slow_delete(cfg, run, cid):
+        entered.set()
+        release.wait(5)
+        return False                              # ...and it FAILS
+
+    monkeypatch.setattr(gs, "_best_effort_delete", slow_delete)
+    t = threading.Thread(target=backend._retry_stranded_sandboxes)
+    t.start()
+    assert entered.wait(5)
+    assert backend.restore_reclaimed(str(tmp_path / "slots" / "s1")) is False
+    release.set()
+    t.join(5)
+    assert [c for c, _wd in backend._stranded_sandboxes] == ["slot-aaa"]

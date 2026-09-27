@@ -1461,7 +1461,9 @@ class FirecrackerSlotRuntime:
         except Exception as exc:  # noqa: BLE001
             _log.debug("fc.is_ready error slot_id=%s: %s", slot.slot_id, exc)
             return False
-        if ready and self._rootfs_changed_since_spawn(slot.slot_id):
+        # REGARDLESS of readiness: a mismatched guest may never signal READY at all, and gating
+        # on it left that slot to the whole warm-up timeout instead of rejecting it at once.
+        if self._rootfs_changed_since_spawn(slot.slot_id):
             # We cannot tell whether the publish landed before or after firecracker opened the
             # disk, so do not promote a guest that may never have been checked: kill it, and
             # the pool reaps and respawns against the new (checked) rootfs.
