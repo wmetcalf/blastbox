@@ -739,7 +739,7 @@ def test_stamp_tree_refuses_an_image_that_records_no_version(tmp_path, monkeypat
         out = "{}" if "{{json .Config.Labels}}" in argv else "amd64\n"
         return subprocess.CompletedProcess(list(argv), 0, out, "")
 
-    with pytest.raises(rfs.RootfsStampError, match="no blastbox version"):
+    with pytest.raises(rfs.RootfsStampError, match="could not be verified"):
         rfs.stamp_tree(tmp_path, "eng-fc:1", "firecracker", run=run)
 
 
@@ -757,12 +757,14 @@ def test_both_legacy_export_scripts_stamp_what_they_export() -> None:
         assert "-m blastbox.host.rootfs_stamp write" in (root / script).read_text(), script
 
 
-def test_stamp_tree_falls_back_to_the_label_for_any_non_version(tmp_path, monkeypatch) -> None:
-    """The probe answers sentinels like NOPKG; stamping one made every host refuse the rootfs
-    while the deploy script reported success."""
+def test_stamp_tree_records_no_version_for_an_image_without_blastbox(tmp_path,
+                                                                   monkeypatch) -> None:
+    """NOPKG is DEFINITIVE: the guest has no blastbox (a pure-JVM worker). Its label -- often
+    inherited from a base -- must not stand in for it."""
     from blastbox.host import stamp as st
 
-    monkeypatch.setattr(doctor, "version_in_image", lambda image, runner=None: ("NOPKG", ""))
+    monkeypatch.setattr(doctor, "version_in_image",
+                        lambda image, runner=None: (doctor.NOPKG, "no blastbox package"))
 
     def run(argv, **kw):
         out = (json.dumps({st.LABEL_BLASTBOX: "0.1.42"}) if "{{json .Config.Labels}}" in argv
@@ -770,8 +772,25 @@ def test_stamp_tree_falls_back_to_the_label_for_any_non_version(tmp_path, monkey
         return subprocess.CompletedProcess(list(argv), 0, out, "")
 
     rfs.stamp_tree(tmp_path, "eng-fc:1", "firecracker", run=run)
-    assert rfs.read_from_dir(tmp_path).blastbox_version == "0.1.42"
+    assert rfs.read_from_dir(tmp_path).blastbox_version == ""
 
+
+def test_stamp_tree_fails_when_the_installed_version_cannot_be_checked(tmp_path,
+                                                                     monkeypatch) -> None:
+    """UNKNOWN (the probe timed out or could not look) is NOT "no blastbox": falling back to an
+    inherited label let a hotfix image claim a version nobody verified."""
+    from blastbox.host import stamp as st
+
+    monkeypatch.setattr(doctor, "version_in_image",
+                        lambda image, runner=None: (doctor.UNKNOWN, "probe timed out"))
+
+    def run(argv, **kw):
+        out = (json.dumps({st.LABEL_BLASTBOX: "0.1.42"}) if "{{json .Config.Labels}}" in argv
+               else "amd64\n")
+        return subprocess.CompletedProcess(list(argv), 0, out, "")
+
+    with pytest.raises(rfs.RootfsStampError, match="could not be verified"):
+        rfs.stamp_tree(tmp_path, "eng-fc:1", "firecracker", run=run)
 
 def test_stamp_tree_bounds_every_docker_call(tmp_path, monkeypatch) -> None:
     seen: list = []

@@ -735,7 +735,7 @@ def stamp_tree(
     the same hardened write.
     """
     from blastbox.host.imagerun import _DOCKER_ARCH  # noqa: PLC0415
-    from blastbox.host.stamp import UNKNOWN, read as read_image_stamp  # noqa: PLC0415
+    from blastbox.host.stamp import UNKNOWN  # noqa: PLC0415
 
     def runner(argv: Sequence[str]) -> "subprocess.CompletedProcess[str]":
         # The SAME docker the export used (`DOCKER=podman` is supported by the scripts): the
@@ -750,23 +750,30 @@ def stamp_tree(
 
     from blastbox.host.doctor import version_in_image  # noqa: PLC0415
 
-    labels = read_image_stamp(image, runner)
-    # What the image ACTUALLY has installed is the truth; the label is a self-report, and the
-    # legacy scripts build with a plain `docker build` that writes no labels at all.
     try:
         installed, detail = version_in_image(image, runner)
     except subprocess.TimeoutExpired:
         installed, detail = UNKNOWN, f"probe timed out after {STAMP_TREE_TIMEOUT_S:.0f}s"
     # Only a real VERSION counts: the probe answers sentinels (NOPKG, UNKNOWN), and stamping one
     # makes every host refuse the rootfs while the deploy script reports success.
-    installed_ok = _is_version(installed)
-    label_ok = _is_version(labels.blastbox)
-    version = installed if installed_ok else (labels.blastbox if label_ok else "")
-    if not version:
+    # The INSTALLED version, and nothing else. These exports derive images from a shipped
+    # image, so a label is usually inherited from the base and says nothing about the wheel
+    # this build installed.
+    #   a version -> stamp it
+    #   NOPKG     -> DEFINITIVE: no blastbox in the guest (a pure-JVM worker); stamp none
+    #   otherwise -> the probe could not look (timeout, inspect failure): refuse, rather than
+    #                let an inherited label vouch for an unverified guest
+    from blastbox.host.doctor import NOPKG  # noqa: PLC0415
+
+    if _is_version(installed):
+        version = installed
+    elif installed == NOPKG:
+        version = ""
+    else:
         raise RootfsStampError(
-            f"{image} has no blastbox version: nothing installed ({detail or 'unreadable'}) and "
-            "no org.blastbox.version label; a rootfs stamped without one cannot be checked "
-            "against its host"
+            f"{image}: its installed blastbox version could not be verified "
+            f"({detail or installed or 'unreadable'}); refusing to stamp a version nobody "
+            "checked"
         )
 
     def inspect(fmt: str) -> str:
