@@ -239,7 +239,9 @@ if [ -n "$gv_rev" ] && [ -n "$(git -C "$REPO" status --porcelain --untracked-fil
   gv_rev="${gv_rev}-dirty"
 fi
 docker export "$cid" | sudo tar -x -C "$GVISOR_DIR/rootfs.${WARM_TAG}"; docker rm "$cid" >/dev/null
-GV_PY="${BLASTBOX_PY:-$(command -v python3)}"
+# `|| true`: no python3 must reach the unstamped fallback below, not end the script (set -e).
+GV_PY="${BLASTBOX_PY:-$(command -v python3 || true)}"
+GV_PY="${GV_PY:-python3}"
 gv_tree="$GVISOR_DIR/rootfs.${WARM_TAG}"
 gv_stamp="$gv_tree/opt/blastbox/rootfs-stamp.json"
 if sudo "$GV_PY" -c 'import blastbox.host.rootfs_stamp' 2>/dev/null; then

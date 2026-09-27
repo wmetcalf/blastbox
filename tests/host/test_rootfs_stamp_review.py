@@ -1352,3 +1352,121 @@ def test_the_legacy_scripts_fall_back_without_blastbox_but_fail_on_a_refusal() -
         body = (root / script).read_text()
         assert "import blastbox.host.rootfs_stamp" in body, script     # capability probe
         assert "-L " in body, script                                   # link-safe shell clear
+
+
+# --- PR #186 codex (6be2a46): a PRESENT but malformed stamp is a refusal, not "legacy" ------
+
+
+def _stamp_file(tmp_path: Path) -> Path:
+    tree = tmp_path / "tree"
+    p = tree / rfs.STAMP_PATH
+    p.parent.mkdir(parents=True)
+    return p
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["{}", '{"blastbox_version": "0.1.', "[1, 2]", '{"blastbox_version": null}'],
+    ids=["empty-object", "truncated", "not-an-object", "null-version"],
+)
+def test_a_malformed_stamp_is_refused_not_booted_as_legacy(tmp_path: Path, body: str) -> None:
+    """Damaging the stamp must not be a way past the gate: only ABSENCE is legacy."""
+    p = _stamp_file(tmp_path)
+    p.write_text(body)
+    problem, definitive = rfs.guest_verdict(str(p.parents[2]), "gvisor")
+    assert problem and definitive
+    assert "stamp" in problem
+
+
+def test_an_oversized_stamp_is_refused_by_the_gate(tmp_path: Path) -> None:
+    p = _stamp_file(tmp_path)
+    p.write_bytes(b" " * (rfs.MAX_STAMP_BYTES + 1))
+    problem, definitive = rfs.guest_verdict(str(p.parents[2]), "gvisor")
+    assert "larger than" in problem and definitive
+
+
+def test_a_fifo_stamp_is_refused_by_the_gate(tmp_path: Path) -> None:
+    p = _stamp_file(tmp_path)
+    os.mkfifo(p)
+    problem, definitive = rfs.guest_verdict(str(p.parents[2]), "gvisor")
+    assert "not a regular file" in problem and definitive
+
+
+def test_a_symlinked_stamp_is_refused_by_the_gate(tmp_path: Path) -> None:
+    p = _stamp_file(tmp_path)
+    (tmp_path / "elsewhere.json").write_text('{"blastbox_version": "0.1.42"}')
+    p.symlink_to(tmp_path / "elsewhere.json")
+    problem, definitive = rfs.guest_verdict(str(p.parents[2]), "gvisor")
+    assert "symlink" in problem and definitive
+
+
+def test_an_absent_stamp_is_still_legacy_and_allowed(tmp_path: Path) -> None:
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    assert rfs.guest_verdict(str(tree), "gvisor") == ("", True)
+
+
+def test_a_failed_read_is_still_undecided_not_refused(tmp_path, monkeypatch) -> None:
+    """"I could not look" (debugfs timed out) is neither a refusal nor a verdict to cache."""
+    img = _debugfs_env(tmp_path, monkeypatch, block=True)
+    monkeypatch.setattr(rfs, "DEBUGFS_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(rfs, "_DEBUGFS_REAP_S", 0.01)
+    assert rfs.guest_verdict(str(img), "firecracker") == ("", False)
+
+
+# --- PR #186 codex (6be2a46): a debugfs that ignores SIGKILL is not re-spawned forever ------
+
+
+class _UnkillableDebugfs(_FakeDebugfs):
+    """debugfs in uninterruptible I/O: SIGKILL is ignored and its pipes never close."""
+
+    release = False
+
+    def read(self, n=-1):
+        import time as _t
+        deadline = _t.monotonic() + 10
+        while not _UnkillableDebugfs.release and _t.monotonic() < deadline:
+            _t.sleep(0.01)
+        return b""
+
+    def wait(self, timeout=None):
+        if _UnkillableDebugfs.release:
+            self.returncode = -9
+            return -9
+        raise subprocess.TimeoutExpired("debugfs", timeout or 0)
+
+    def poll(self):
+        return -9 if _UnkillableDebugfs.release else None
+
+
+def test_hung_debugfs_probes_are_capped_not_accumulated(tmp_path, monkeypatch) -> None:
+    img = tmp_path / "rootfs.ext4"
+    img.write_bytes(b"\0")
+    monkeypatch.setattr(rfs.shutil, "which", lambda _n: "/usr/sbin/debugfs")
+    monkeypatch.setattr(rfs, "DEBUGFS_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(rfs, "_DEBUGFS_REAP_S", 0.01)
+    monkeypatch.setattr(rfs, "_ABANDONED_DEBUGFS", [])
+    _FakeDebugfs.instances = []
+    _FakeDebugfs.block_next = False
+    _UnkillableDebugfs.release = False
+    monkeypatch.setattr(rfs.subprocess, "Popen", _UnkillableDebugfs)
+    try:
+        for _ in range(rfs.MAX_ABANDONED_DEBUGFS):
+            with pytest.raises(rfs.RootfsStampError, match="timed out"):
+                rfs.read_from_ext4(img)
+        # At the cap: refused WITHOUT starting another unreapable process.
+        with pytest.raises(rfs.RootfsStampError, match="still hung"):
+            rfs.read_from_ext4(img)
+        assert len(_FakeDebugfs.instances) == rfs.MAX_ABANDONED_DEBUGFS
+        # Once they finally exit, the slots are reclaimed and probing resumes.
+        _UnkillableDebugfs.release = True
+        for proc in _FakeDebugfs.instances:
+            proc.killed = True
+        import time as _t
+        _t.sleep(0.1)
+        monkeypatch.setattr(rfs.subprocess, "Popen", _FakeDebugfs)
+        with pytest.raises(rfs.RootfsStampError, match="larger than"):
+            rfs.read_from_ext4(img)
+        assert rfs._ABANDONED_DEBUGFS == []
+    finally:
+        _UnkillableDebugfs.release = True

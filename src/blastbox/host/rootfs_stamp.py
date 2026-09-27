@@ -26,6 +26,7 @@ and when it was exported.
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
 import re
@@ -40,7 +41,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from blastbox.host.platform_id import HostPlatform
@@ -76,6 +77,14 @@ class RootfsUnstamped(RootfsStampError):
     """The rootfs carries no stamp at all -- a definitive answer, unlike a failed read."""
 
 
+class RootfsStampInvalid(RootfsStampError):
+    """A stamp is PRESENT but malformed, oversized, linked, or not a regular file.
+
+    Definitive, and a refusal: only an absent stamp is legacy. Treating a damaged stamp like
+    a missing one let an untrusted guest past the gate by corrupting its own stamp.
+    """
+
+
 class RootfsStale(RootfsStampError):
     """The rootfs changed since a snapshot was checkpointed against it."""
 
@@ -102,9 +111,9 @@ class RootfsStamp:
         try:
             raw = json.loads(text)
         except ValueError as exc:
-            raise RootfsStampError(f"rootfs stamp is not JSON: {exc}") from exc
+            raise RootfsStampInvalid(f"rootfs stamp is not JSON: {exc}") from exc
         if not isinstance(raw, dict):
-            raise RootfsStampError("rootfs stamp is not a JSON object")
+            raise RootfsStampInvalid("rootfs stamp is not a JSON object")
         plat = raw.get("platform")
         # Named `fields`, not `text`: `text` is this method's own parameter, and
         # shadowing it here hid the JSON body behind the parsed result.
@@ -115,7 +124,7 @@ class RootfsStamp:
         # without blastbox). `{}` or a null defaulted to "" and read as that verified state --
         # an incomplete stamp from an untrusted artifact skipping every version comparison.
         if not isinstance(raw.get("blastbox_version"), str):
-            raise RootfsStampError(
+            raise RootfsStampInvalid(
                 "rootfs stamp has no string blastbox_version; refusing an incomplete stamp"
             )
         fields: dict[str, str] = {
@@ -250,7 +259,7 @@ def _refuse_links(tree: Path, rel: str) -> None:
         cur = cur / part
         try:
             if cur.is_symlink():
-                raise RootfsStampError(
+                raise RootfsStampInvalid(
                     f"{cur} is a symlink inside the image; refusing to follow it -- the "
                     "stamp is written as root and must stay inside the tree"
                 )
@@ -266,7 +275,7 @@ def _require_regular_or_absent(path: Path) -> None:
     except OSError as exc:
         raise RootfsStampError(f"cannot inspect {path}: {exc}") from exc
     if not _stat.S_ISREG(st.st_mode):
-        raise RootfsStampError(
+        raise RootfsStampInvalid(
             f"{path} exists and is not a regular file (mode {st.st_mode:o}); refusing it -- "
             "the image put something else at the stamp path"
         )
@@ -292,17 +301,19 @@ def read_from_dir(tree: Path | str) -> RootfsStamp:
     except FileNotFoundError as exc:
         raise RootfsUnstamped(f"{path} is missing: this rootfs is unstamped") from exc
     except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise RootfsStampInvalid(f"{path} is a symlink; refusing it") from exc
         raise RootfsStampError(f"cannot read {path}: {exc}") from exc
     with os.fdopen(fd, "rb") as fh:
         if not _stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
-            raise RootfsStampError(f"{path} is not a regular file; refusing it")
+            raise RootfsStampInvalid(f"{path} is not a regular file; refusing it")
         raw = fh.read(MAX_STAMP_BYTES + 1)
     return RootfsStamp.from_json(_bounded(raw, path))
 
 
 def _bounded(raw: bytes | str, where: object) -> str:
     if len(raw) > MAX_STAMP_BYTES:
-        raise RootfsStampError(
+        raise RootfsStampInvalid(
             f"the stamp in {where} is larger than {MAX_STAMP_BYTES} bytes; refusing it"
         )
     return raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
@@ -380,6 +391,44 @@ def _release_of(version: str) -> str:
 _DEBUGFS_BANNER = re.compile(r"^debugfs \d[^\n]*$", re.MULTILINE)
 
 
+#: debugfs probes that ignored SIGKILL (uninterruptible I/O on a hung image) and are still
+#: alive, with their reader threads. Capped: an undecidable verdict is retried every
+#: UNDECIDED_RETRY_S, and each retry against the same hung image would otherwise leave one
+#: more unreapable process, two threads and two pipes behind, until the dispatcher runs out.
+MAX_ABANDONED_DEBUGFS = 4
+_ABANDONED_DEBUGFS: list[tuple[Any, threading.Thread, threading.Thread]] = []
+_ABANDONED_LOCK = threading.Lock()
+#: How long to wait for a killed debugfs, and then for each reader thread, to finish.
+_DEBUGFS_REAP_S = 1.0
+
+
+def _close_idle(proc: Any, t: threading.Thread, te: threading.Thread) -> None:
+    # Close the pipes once nothing reads them, or every probe leaks two fds until GC. A
+    # reader still blocked keeps its pipe: closing a buffered stream under a blocked reader
+    # can deadlock on its lock.
+    for stream, reader_thread in ((proc.stdout, t), (proc.stderr, te)):
+        if stream is not None and not reader_thread.is_alive():
+            with contextlib.suppress(Exception):
+                stream.close()
+
+
+def _admit_debugfs() -> None:
+    """Reclaim abandoned probes that have finally exited; refuse a new one at the cap."""
+    with _ABANDONED_LOCK:
+        live = []
+        for proc, t, te in _ABANDONED_DEBUGFS:
+            if proc.poll() is None or t.is_alive() or te.is_alive():
+                live.append((proc, t, te))
+            else:
+                _close_idle(proc, t, te)
+        _ABANDONED_DEBUGFS[:] = live
+        if len(live) >= MAX_ABANDONED_DEBUGFS:
+            raise RootfsStampError(
+                f"{len(live)} earlier debugfs probes are still hung (ignoring SIGKILL); "
+                "not starting another until they exit -- is the rootfs on a stuck mount?"
+            )
+
+
 def _bounded_debugfs(argv: Sequence[str]) -> str:
     """Run debugfs, keeping at most MAX_STAMP_BYTES + 1 of its output, within a deadline.
 
@@ -390,6 +439,7 @@ def _bounded_debugfs(argv: Sequence[str]) -> str:
     so a real debugfs error (bad magic, permission denied) can be told apart from "no
     stamp" without an unbounded buffer.
     """
+    _admit_debugfs()
     proc = subprocess.Popen(  # noqa: S603 -- fixed argv, no shell
         list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
@@ -418,16 +468,14 @@ def _bounded_debugfs(argv: Sequence[str]) -> str:
     if proc.poll() is None:
         proc.kill()
     with contextlib.suppress(subprocess.TimeoutExpired):
-        proc.wait(timeout=5.0)
-    t.join(1.0)
-    te.join(1.0)
-    # Close the pipes once nothing reads them, or every probe leaks two fds until GC. A
-    # reader still blocked (a debugfs in D state that ignored the kill) keeps its pipe:
-    # closing a buffered stream under a blocked reader can deadlock on its lock.
-    for stream, reader_thread in ((proc.stdout, t), (proc.stderr, te)):
-        if stream is not None and not reader_thread.is_alive():
-            with contextlib.suppress(Exception):
-                stream.close()
+        proc.wait(timeout=_DEBUGFS_REAP_S * 5)
+    t.join(_DEBUGFS_REAP_S)
+    te.join(_DEBUGFS_REAP_S)
+    _close_idle(proc, t, te)
+    if proc.poll() is None or t.is_alive() or te.is_alive():
+        # Survived SIGKILL: remembered, so the next probe can reclaim it or refuse to add one.
+        with _ABANDONED_LOCK:
+            _ABANDONED_DEBUGFS.append((proc, t, te))
     if timed_out:
         raise RootfsStampError(
             f"debugfs timed out after {DEBUGFS_TIMEOUT_S:.0f}s reading {argv[-1]}"
@@ -450,9 +498,10 @@ def guest_problem(rootfs: str, runtime: str) -> str:
 def guest_verdict(rootfs: str, runtime: str) -> tuple[str, bool]:
     """Why this host must not boot ``rootfs`` on ``runtime``, or "" when it may.
 
-    Shared by both warm tiers. An unstamped or unreadable rootfs WARNS and returns "" --
-    "I could not look" is not "it is wrong", and refusing it would strand every deployment
-    exported before stamping existed.
+    Shared by both warm tiers. An UNSTAMPED rootfs (no stamp at all) or one that could not
+    be read WARNS and returns "" -- "I could not look" is not "it is wrong", and refusing it
+    would strand every deployment exported before stamping existed. A stamp that is PRESENT
+    but malformed is refused: only absence earns the legacy exception.
     """
     import logging
     from blastbox.host import platform_id as _plat
@@ -468,6 +517,11 @@ def guest_verdict(rootfs: str, runtime: str) -> tuple[str, bool]:
             rootfs, exc,
         )
         return "", True        # definitively unstamped: nothing to re-read until it changes
+    except RootfsStampInvalid as exc:
+        # PRESENT but unusable: refused. The image wrote it, and a damaged stamp must not
+        # buy the unchecked boot that only a genuinely absent one gets.
+        return f"{rootfs}: its blastbox stamp is unusable ({exc}); rebuild it with " \
+            "`blastbox build-images`", True
     except RootfsStampError as exc:
         log.warning(
             "rootfs %s carries no readable blastbox stamp (%s); booting it anyway. "
@@ -937,6 +991,7 @@ __all__ = [
     "platform_of",
     "RootfsStamp",
     "RootfsStampError",
+    "RootfsStampInvalid",
     "compare_to_host",
     "now_iso",
     "read",
