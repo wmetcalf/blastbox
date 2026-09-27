@@ -198,7 +198,12 @@ class FcSnapshotBackend:
             # The manager kept this workdir while the VM might still use it; now it is ours to
             # remove -- or park with the launcher's retryable partials if that fails.
             errs: list[str] = []
-            shutil.rmtree(workdir, onerror=lambda fn, p, exc: errs.append(str(p)))
+            try:
+                shutil.rmtree(workdir, onerror=lambda fn, p, exc: errs.append(str(p)))
+            except Exception as exc:  # noqa: BLE001 -- e.g. RecursionError on a deep worker tree
+                # The entry has left _unreaped: an escape here made every later ask an unknown
+                # workdir, holding the generation pin forever. Parked instead, like any failure.
+                errs.append(f"{workdir}: {exc}")
             if errs:
                 stranded = getattr(self._launcher, "_stranded_partials", None)
                 if isinstance(stranded, list):

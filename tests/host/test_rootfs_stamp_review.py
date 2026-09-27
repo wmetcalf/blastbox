@@ -1639,3 +1639,16 @@ def test_an_exhausted_probe_cap_refuses_rather_than_admits(tmp_path, monkeypatch
     monkeypatch.setattr(rfs, "_DEBUGFS_IN_FLIGHT", rfs.MAX_ABANDONED_DEBUGFS)
     problem, definitive = rfs.guest_verdict(str(img), "firecracker")
     assert problem and not definitive
+
+
+def test_a_busy_cap_is_reprobed_promptly_not_after_the_slow_backoff(tmp_path,
+                                                                   monkeypatch) -> None:
+    img = tmp_path / "rootfs.ext4"
+    img.write_bytes(b"\0")
+    monkeypatch.setattr(rfs.shutil, "which", lambda _n: "/usr/sbin/debugfs")
+    monkeypatch.setattr(rfs, "_DEBUGFS_IN_FLIGHT", rfs.MAX_ABANDONED_DEBUGFS)
+    gate = rfs.GuestGate(str(img), "firecracker")
+    assert gate.checked()[0]
+    import time as _t
+    assert gate._retry_at is not None
+    assert gate._retry_at - _t.monotonic() <= rfs.BUSY_RETRY_S

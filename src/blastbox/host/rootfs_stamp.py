@@ -65,6 +65,10 @@ DEBUGFS_TIMEOUT_S = 30.0
 #: installed, a bad-magic image -- and prepare() runs every pool tick.
 UNDECIDED_RETRY_S = 60.0
 
+#: How soon a check refused only because the debugfs probe cap was full is retried. That is
+#: transient -- the other probes may finish at once -- unlike an unreadable image.
+BUSY_RETRY_S = 1.0
+
 #: Each docker call stamp_tree makes (inspect, and the in-image version probe).
 STAMP_TREE_TIMEOUT_S = 120.0
 
@@ -89,6 +93,9 @@ class RootfsProbeBusy(RootfsStampError):
     """The debugfs probe cap is full: the stamp could not be looked at YET. Refused (and
     retried), never the legacy "unreadable, boot anyway" exception -- or a few hung artifacts
     would open the gate for every other rootfs."""
+
+
+_BUSY = "its blastbox stamp cannot be checked yet"
 
 
 class RootfsStale(RootfsStampError):
@@ -544,7 +551,7 @@ def guest_verdict(rootfs: str, runtime: str) -> tuple[str, bool]:
         )
         return "", True        # definitively unstamped: nothing to re-read until it changes
     except RootfsProbeBusy as exc:
-        return f"{rootfs}: its blastbox stamp cannot be checked yet ({exc})", False
+        return f"{rootfs}: {_BUSY} ({exc})", False
     except RootfsStampInvalid as exc:
         # PRESENT but unusable: refused. The image wrote it, and a damaged stamp must not
         # buy the unchecked boot that only a genuinely absent one gets.
@@ -705,17 +712,36 @@ class GuestGate:
             if key == self._key and (self._retry_at is None
                                      or time.monotonic() < self._retry_at):
                 return self._problem, key
-        found, definitive = guest_verdict(self.rootfs, self.runtime)
-        # Cached only if the file did not change DURING the read: otherwise this verdict may
-        # describe a different file than the identity it would be stored under. A definitive
-        # verdict holds until the file changes; an undecidable one (the stamp could not be
-        # read) only for UNDECIDED_RETRY_S -- re-reading it every tick re-ran debugfs and a
-        # WARNING ten times a second, and caching it forever switched the check off.
-        after = file_identity(self.rootfs)
-        if after == key:
+        # READ THROUGH A PINNED DESCRIPTOR. Two pathname samples around a pathname read could not
+        # see A->B->A: B was read, A was sampled both times, and B's verdict was cached under A.
+        # The descriptor is the file whose identity is compared; /proc/<pid>/fd/N names it for
+        # the in-process reader and for debugfs alike.
+        try:
+            fd = os.open(self.rootfs, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        except OSError as exc:
+            return f"{self.rootfs} could not be opened ({exc}); not booting it", None
+        try:
+            pinned = f"/proc/{os.getpid()}/fd/{fd}"
+            held = file_identity(pinned)
+            found, definitive = guest_verdict(pinned, self.runtime)
+            found = found.replace(pinned, self.rootfs)
+            held_after = file_identity(pinned)
+        finally:
+            os.close(fd)
+        # Cached only if what was READ is the identity it is stored under, unchanged through the
+        # read (an in-place rewrite, or a tree's stamp replaced), and the path still names it. A
+        # definitive verdict holds until the file changes; an undecidable one (the stamp could
+        # not be read) only for UNDECIDED_RETRY_S -- re-reading it every tick re-ran debugfs and
+        # a WARNING ten times a second, and caching it forever switched the check off. A full
+        # probe cap is transient, retried after BUSY_RETRY_S.
+        if held == key == held_after == file_identity(self.rootfs):
             with self._lock:
                 self._key, self._problem = key, found
-                self._retry_at = None if definitive else time.monotonic() + UNDECIDED_RETRY_S
+                wait = BUSY_RETRY_S if _BUSY in found else UNDECIDED_RETRY_S
+                self._retry_at = None if definitive else time.monotonic() + wait
+        elif held != key:
+            # Not the file that was sampled: say nothing about it, and look again next time.
+            return f"{self.rootfs} changed while it was being checked; not booting it", key
         return found, key          # the identity the check STARTED from; callers re-stat
 
 

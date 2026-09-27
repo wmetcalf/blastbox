@@ -949,18 +949,62 @@ def test_a_rolled_back_rootfs_is_caught_before_ready_once_the_disk_is_open(tmp_p
     import blastbox.host.runtime.firecracker as fcmod
 
     rt, slot, killed = _plain_fc(tmp_path, monkeypatch)
-    monkeypatch.setattr(fcmod, "ROOTFS_OPEN_GRACE_S", 0.0)
+    monkeypatch.setattr(fcmod, "_drive_opened", lambda pid, slot_dir, excluded: True)
     assert rt.is_ready(slot) is False
     assert killed == [slot.slot_id]
 
 
-def test_the_open_grace_tolerates_a_disk_not_yet_opened(tmp_path, monkeypatch) -> None:
+def test_a_slow_start_is_not_killed_before_the_drive_is_seen_open(tmp_path, monkeypatch) -> None:
+    """Strict only on a POSITIVE observation: elapsed wall time killed a slot that was merely
+    starved, and every replacement met the same load."""
     import blastbox.host.runtime.firecracker as fcmod
 
     rt, slot, killed = _plain_fc(tmp_path, monkeypatch)
-    monkeypatch.setattr(fcmod, "ROOTFS_OPEN_GRACE_S", 3600.0)
+    monkeypatch.setattr(fcmod, "_drive_opened", lambda pid, slot_dir, excluded: False)
     assert rt.is_ready(slot) is False             # simply not ready yet
     assert killed == []
+
+
+def _holder(path, log):
+    import subprocess as sp
+    import sys
+
+    proc = sp.Popen([sys.executable, "-c",
+                     "import sys,time; f=open(sys.argv[1],'rb'); print('ok',flush=True); "
+                     "time.sleep(30)", str(path)],
+                    stdin=sp.DEVNULL, stdout=sp.PIPE, stderr=open(log, "w"), close_fds=True)
+    assert proc.stdout is not None and proc.stdout.readline().strip() == b"ok"
+    return proc
+
+
+def test_drive_opened_sees_a_file_outside_the_slot_dir(tmp_path) -> None:
+    from blastbox.host.runtime.firecracker import _drive_opened
+
+    slot_dir = tmp_path / "slot"
+    slot_dir.mkdir()
+    disk = tmp_path / "rootfs.backup"             # a rolled-back B, under a backup name
+    disk.write_bytes(b"B")
+    proc = _holder(disk, slot_dir / "fc.log")
+    try:
+        assert _drive_opened(proc.pid, slot_dir, ()) is True
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_drive_opened_ignores_the_slots_own_files_and_the_kernel(tmp_path) -> None:
+    from blastbox.host.runtime.firecracker import _drive_opened
+
+    slot_dir = tmp_path / "slot"
+    slot_dir.mkdir()
+    kernel = tmp_path / "vmlinux"
+    kernel.write_bytes(b"k")
+    proc = _holder(kernel, slot_dir / "fc.log")   # holds only the kernel and its own log
+    try:
+        assert _drive_opened(proc.pid, slot_dir, (str(kernel),)) is False
+    finally:
+        proc.kill()
+        proc.wait()
 
 
 def test_a_reclaimed_gvisor_restore_workdir_is_removed_without_a_rebuild(tmp_path,
@@ -977,3 +1021,52 @@ def test_a_reclaimed_gvisor_restore_workdir_is_removed_without_a_rebuild(tmp_pat
     backend.restore_reclaimed(str(wd))            # kicks the background retry; no boot
     assert _wait_until(lambda: not wd.exists())
     assert str(wd) not in backend._stranded_partials
+
+
+def test_an_fc_workdir_whose_removal_raises_is_parked_not_forgotten(tmp_path,
+                                                                   monkeypatch) -> None:
+    """rmtree RAISING (a RecursionError on a deep worker-made tree) escaped after the entry left
+    _unreaped, so every later ask saw an unknown workdir and the pin was held forever."""
+    import blastbox.host.runtime.fc_snapshot_backend as fsb
+
+    backend, launcher, _rootfs, _base = _fc_backend(tmp_path)
+    launcher._stranded_partials = []              # the real launcher's retryable ledger
+    wd = tmp_path / "s1"
+    wd.mkdir()
+    gone = type("H", (), {"proc": type("P", (), {"poll": lambda self: 0, "pid": 0})(),
+                          "kill": lambda self: None})()
+    backend._unreaped[str(wd)] = gone
+
+    def boom(path, onerror=None):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(fsb.shutil, "rmtree", boom)
+    assert backend.restore_reclaimed(str(wd)) is True
+    assert str(wd) in launcher._stranded_partials
+
+
+# --- PR #186 codex (3853c64): the stamp read is bound to the identity it is cached under ------
+
+
+def test_a_verdict_is_read_from_the_file_it_is_cached_for(tmp_path, monkeypatch) -> None:
+    """A->B during the read, back to A before the second sample: B's verdict was cached under
+    A's identity. Read through a descriptor pinned to the sampled file instead."""
+    f = tmp_path / "rootfs.ext4"
+    f.write_bytes(b"A")
+    b = tmp_path / "rootfs.b"
+
+    def verdict(path, runtime):
+        os.rename(f, tmp_path / "rootfs.a")
+        b.write_bytes(b"B")
+        os.rename(b, f)                           # the path is B while it is read
+        body = Path(path).read_bytes()
+        os.rename(f, b)
+        os.rename(tmp_path / "rootfs.a", f)       # ...and A again by the second sample
+        return ("" if body == b"B" else f"{path}: A is incompatible"), True
+
+    monkeypatch.setattr(rfs, "guest_verdict", verdict)
+    gate = rfs.GuestGate(str(f), "firecracker")
+    problem, _key = gate.checked()
+    assert "A is incompatible" in problem
+    assert str(f) in problem and "/proc/" not in problem
+    assert "A is incompatible" in gate.checked()[0]
