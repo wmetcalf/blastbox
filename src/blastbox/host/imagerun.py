@@ -1557,7 +1557,10 @@ def stage_rootfs(
             # has installed before it is written anywhere a host will trust.
             agrees, detail = _verify_contents(source, lambda argv: run(argv, capture_output=True))  # type: ignore[arg-type]
             # TRI-STATE, as verify_built() treats it: None means no blastbox package to compare
-            # (a pure-JVM worker), which is valid; only a contradiction is refused.
+            # (a pure-JVM worker), which is valid -- and then the label (often inherited or set
+            # at build time) describes nothing in the guest, so it is not stamped either.
+            if agrees is None:
+                img_version = ""
             if agrees is False:
                 raise BuildError(
                     f"{image}: its blastbox label cannot be trusted for the rootfs stamp: "

@@ -23,6 +23,7 @@ snapshot→restore→convert round-trip is pixel-identical to cold (see the spec
 from __future__ import annotations
 
 import logging
+import shutil
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -183,6 +184,14 @@ class FcSnapshotBackend:
                 return False
         if gone:
             unreaped.pop(str(workdir), None)
+            # The manager kept this workdir while the VM might still use it; now it is ours to
+            # remove -- or park with the launcher's retryable partials if that fails.
+            errs: list[str] = []
+            shutil.rmtree(workdir, onerror=lambda fn, p, exc: errs.append(str(p)))
+            if errs:
+                stranded = getattr(self._launcher, "_stranded_partials", None)
+                if isinstance(stranded, list):
+                    stranded.append(str(workdir))
         return gone
 
     def discard(self, artifact: object) -> None:

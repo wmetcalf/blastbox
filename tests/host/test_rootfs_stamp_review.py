@@ -1076,7 +1076,7 @@ def test_a_direct_export_accepts_an_image_without_blastbox(tmp_path, monkeypatch
     plan = _plan(tmp_path)
     mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
                      extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True)
-    assert captured and captured[0].blastbox_version == "9.9.9"
+    assert captured and captured[0].blastbox_version == ""     # accepted, and version-free
 
 
 def test_a_label_less_direct_export_stamps_the_installed_version(tmp_path, monkeypatch) -> None:
@@ -1163,3 +1163,19 @@ def test_the_legacy_scripts_clear_stamps_through_the_confined_helper() -> None:
         assert "rootfs_stamp clear" in body, script
         stamp_lines = [ln for ln in body.splitlines() if "rootfs-stamp.json" in ln]
         assert not any("rm -f" in ln for ln in stamp_lines), script
+
+
+def test_a_direct_export_without_blastbox_does_not_stamp_the_labels_version(tmp_path,
+                                                                           monkeypatch) -> None:
+    """verify_contents() -> None: no blastbox installed. The (inherited) label's version then
+    describes nothing in the guest, and stamping it got a valid JVM guest refused at boot."""
+    mod = _direct(tmp_path, monkeypatch)
+    monkeypatch.setattr(mod, "_read_stamp", lambda ident, r=None: _ImgStamp())      # 9.9.9
+    monkeypatch.setattr(mod, "_verify_contents", lambda ident, r=None: (None, "no blastbox"))
+    captured: list = []
+    monkeypatch.setattr(mod._rootfs_stamp, "write_into_tree",
+                        lambda tree, stamp, **kw: captured.append(stamp))
+    plan = _plan(tmp_path)
+    mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                     extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True)
+    assert captured[0].blastbox_version == ""

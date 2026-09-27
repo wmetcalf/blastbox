@@ -714,6 +714,9 @@ def test_a_held_firecracker_restore_is_released_once_its_process_is_gone(tmp_pat
     assert mgr._refs.get(id(art), 0) == 1          # held: the VM may still map it
     mgr.ensure_build_started()
     assert mgr._refs.get(id(art), 0) == 1          # still alive: still held
+    held_wd = next(iter(mgr._held_restores.values()))[1]
+    assert Path(held_wd).exists()                  # kept while the VM may still use it
     alive["v"] = False                             # the process finally exits
     mgr.ensure_build_started()
     assert mgr._refs.get(id(art), 0) == 0
+    assert not Path(held_wd).exists()              # ...and reclaimed with the pin
