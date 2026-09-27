@@ -1239,6 +1239,12 @@ class FirecrackerSlotRuntime:
             gate = self._guest_gate = GuestGate(rootfs, "firecracker")
         return gate.problem() if gate is not None else ""
 
+    def _guest_checked(self) -> "tuple[str, tuple[int, ...] | None]":
+        """(problem, the rootfs identity that verdict is for)."""
+        self._guest_problem()                     # builds the gate if needed
+        gate = getattr(self, "_guest_gate", None)
+        return gate.checked() if gate is not None else ("", None)
+
     def prepare(self) -> bool:
         """Whether this tier can spawn this tick -- False while the rootfs guest is refused.
 
@@ -1277,7 +1283,7 @@ class FirecrackerSlotRuntime:
         # This tier boots the rootfs fresh each time, and one republished in place since tier
         # selection would otherwise boot unchecked and time out every job. prepare() reports
         # the same verdict to the pool first, so a refusal here is the backstop, not the path.
-        problem = self._guest_problem()
+        problem, checked_key = self._guest_checked()
         if problem:
             from blastbox.host.rootfs_stamp import RootfsStampError
 
@@ -1429,6 +1435,13 @@ class FirecrackerSlotRuntime:
 
         with self._lock:
             self._procs[slot_id] = fc_proc
+            # The identity that was CHECKED for this boot. Firecracker opens the rootfs after
+            # the check, so is_ready() -- READY is the first point the disk is known open --
+            # refuses a slot whose rootfs changed in between (see is_ready).
+            self._rootfs_keys: dict[str, "tuple[int, ...] | None"]
+            if not hasattr(self, "_rootfs_keys"):
+                self._rootfs_keys = {}
+            self._rootfs_keys[slot_id] = checked_key
 
         # Stamp the generation this slot was SPAWNED from; see Slot.ack_generation.
 
@@ -1441,12 +1454,39 @@ class FirecrackerSlotRuntime:
         return slot
 
     def is_ready(self, slot: Slot) -> bool:
-        """Delegate to the injected ReadySignal."""
+        """Delegate to the injected ReadySignal -- and refuse a slot whose rootfs changed
+        between its spawn-time check and the boot that opened it."""
         try:
-            return self._ready_signal.is_ready(slot)
+            ready = self._ready_signal.is_ready(slot)
         except Exception as exc:  # noqa: BLE001
             _log.debug("fc.is_ready error slot_id=%s: %s", slot.slot_id, exc)
             return False
+        if ready and self._rootfs_changed_since_spawn(slot.slot_id):
+            # We cannot tell whether the publish landed before or after firecracker opened the
+            # disk, so do not promote a guest that may never have been checked: kill it, and
+            # the pool reaps and respawns against the new (checked) rootfs.
+            _log.warning("fc.rootfs_changed_before_ready slot_id=%s: killing the slot rather "
+                         "than promote a guest that may not have been checked", slot.slot_id)
+            with self._lock:
+                fc_proc = self._procs.get(slot.slot_id)
+            if fc_proc is not None:
+                try:
+                    fc_proc.kill()
+                except Exception as exc:  # noqa: BLE001 -- reap retries teardown
+                    _log.warning("fc.kill_stale_slot failed slot_id=%s: %s", slot.slot_id, exc)
+            return False
+        return ready
+
+    def _rootfs_changed_since_spawn(self, slot_id: str) -> bool:
+        keys = getattr(self, "_rootfs_keys", {})
+        if slot_id not in keys:
+            return False
+        key = keys[slot_id]
+        if key is None:
+            return False
+        from blastbox.host.rootfs_stamp import file_identity
+
+        return file_identity(getattr(self._cfg, "fc_rootfs", "") or "") != key
 
     def is_alive(self, slot: Slot) -> bool:
         """Return True iff the Firecracker subprocess is still running."""
@@ -1463,6 +1503,7 @@ class FirecrackerSlotRuntime:
         """
         with self._lock:
             fc_proc = self._procs.pop(slot.slot_id, None)
+            getattr(self, "_rootfs_keys", {}).pop(slot.slot_id, None)   # one entry per slot
 
         # Tear down the vsock READY listener (if any) before removing the dir.
         cleanup = getattr(self._ready_signal, "cleanup", None)

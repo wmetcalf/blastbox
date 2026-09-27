@@ -381,3 +381,62 @@ def test_a_rootfs_swapped_while_the_restore_opened_it_is_aborted(tmp_path, monke
     with pytest.raises(SnapshotRestoreError, match="changed"):
         backend.restore_in(tmp_path / "s1", art)
     assert launcher.restores[-1].killed           # the restored VM is not left running
+
+
+# --- codex bot, fourth pass --------------------------------------------------------------
+
+
+def test_a_plain_fc_slot_whose_rootfs_changed_before_it_booted_is_not_promoted(
+        tmp_path, monkeypatch) -> None:
+    """The spawn-time check samples the PATH; firecracker opens it later. A publish in between
+    boots an unchecked guest. READY is the first moment the disk is known to be open, so a
+    rootfs that changed since the check is not promoted -- the slot is killed instead."""
+    from blastbox.host.runtime.firecracker import FCConfig, FirecrackerSlotRuntime
+
+    from .test_firecracker import _FakeReadySignal, _FakeSubprocessRunner
+
+    rootfs = tmp_path / "rootfs.ext4"
+    rootfs.write_bytes(b"gen-1")
+    monkeypatch.setattr(rfs, "guest_verdict", lambda p, r: ("", True))
+    cfg = FCConfig(fc_bin="firecracker", fc_kernel="/mnt/vmlinux", fc_rootfs=str(rootfs),
+                   fc_vcpu_count=1, fc_mem_mib=256, fc_outdisk_mib=64,
+                   scratch_root=str(tmp_path / "scratch"))
+    rt = FirecrackerSlotRuntime(cfg, subprocess_runner=_FakeSubprocessRunner(),
+                                ready_signal=_FakeReadySignal(ready=True))
+    monkeypatch.setattr("blastbox.host.runtime.firecracker.make_ext4", lambda p, mib: p.touch())
+    ok = rt.spawn()
+    assert rt.is_ready(ok) is True                # unchanged: promoted
+    stale = rt.spawn()
+    _replace(rootfs, b"gen-2")                    # published before this guest booted
+    killed: list[str] = []
+    monkeypatch.setattr(rt._procs[stale.slot_id], "kill", lambda: killed.append(stale.slot_id))
+    assert rt.is_ready(stale) is False
+    assert killed == [stale.slot_id]
+
+
+def test_a_stale_gvisor_restore_that_cannot_be_deleted_is_kept_for_retry(tmp_path,
+                                                                         monkeypatch) -> None:
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    monkeypatch.setattr(rfs, "guest_verdict", lambda p, r: ("", True))
+    backend, rec = _gv_backend(tmp_path)
+    boot = backend.boot_base()
+    boot.wait_ready(5.0)
+    art = boot.checkpoint(tmp_path / "ckpt")
+    real_run = backend._run
+
+    def run_then_republish(argv, **kw):
+        rc = real_run(argv, **kw)
+        if "restore" in argv:                     # the tree changes under the restore
+            new = tmp_path / "rootfs.new"
+            new.mkdir()
+            os.rename(tmp_path / "rootfs", tmp_path / "rootfs.old")
+            os.rename(new, tmp_path / "rootfs")
+        return rc
+
+    backend._run = run_then_republish
+    monkeypatch.setattr(gs, "_best_effort_delete", lambda cfg, run, cid: False)
+    with pytest.raises(SnapshotRestoreError, match="changed") as info:
+        backend.restore_in(tmp_path / "slots" / "s1", art)
+    assert getattr(info.value, "kill_failed", False) is True
+    assert str(tmp_path / "slots" / "s1") in backend._stranded_partials

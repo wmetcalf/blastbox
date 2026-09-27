@@ -1241,12 +1241,15 @@ class GvisorSnapshotBackend:
         try:
             self._rootfs_pin().check_restore(artifact)
         except RootfsStampError as exc:
-            try:
-                handle.kill()
-            except Exception as kill_exc:  # noqa: BLE001
-                _log.warning("gvisor_snapshot: could not kill a stale restore: %s", kill_exc)
-                stale = SnapshotStale(f"{exc} (changed while this restore opened it)")
+            stale = SnapshotStale(f"{exc} (changed while this restore opened it)")
+            # Same teardown and retention as a failed restore above: if the sandbox cannot be
+            # confirmed gone, keep the generation pinned AND keep its bundle for the sweep --
+            # dropping the only handle stranded a sandbox until the dispatcher restarted.
+            if not _best_effort_delete(self._cfg, self._run, cid):
                 stale.kill_failed = True  # type: ignore[attr-defined]
-                raise stale from exc
-            raise SnapshotStale(f"{exc} (changed while this restore opened it)") from exc
+                with _STRANDED_LOCK:
+                    self._stranded_partials.append(str(wd))
+                _log.warning("gvisor_snapshot: stale restore sandbox %s could not be confirmed "
+                             "deleted; retaining its bundle for retry", cid)
+            raise stale from exc
         return handle
