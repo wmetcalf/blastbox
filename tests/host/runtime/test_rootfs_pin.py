@@ -476,3 +476,32 @@ def test_a_failed_restore_that_cannot_be_deleted_retries_the_sandbox_too(tmp_pat
     with pytest.raises(Exception):
         backend.restore_in(tmp_path / "slots" / "s2", art)
     assert [wd for _cid, wd in backend._stranded_sandboxes] == [str(tmp_path / "slots" / "s2")]
+
+
+def test_a_held_pin_is_released_once_the_backend_reaps_its_sandbox(tmp_path, monkeypatch) -> None:
+    """kill_failed keeps the generation pinned -- right while a sandbox may still use it -- but
+    the failed restore returned no handle to reap, so once the backend's retry DID reap the
+    sandbox, nothing released the pin: the generation stayed referenced until restart."""
+    from blastbox.host.runtime import gvisor_snapshot as gs
+    from blastbox.host.runtime.fc_snapshot import SnapshotManager
+
+    monkeypatch.setattr(rfs, "guest_verdict", lambda p, r: ("", True))
+    backend, _rec = _gv_backend(tmp_path)
+    mgr = SnapshotManager(tmp_path / "mgr", backend)
+    art = mgr.build()
+    real_run = backend._run
+
+    def restore_fails(argv, **kw):
+        if "restore" in argv:
+            raise RuntimeError("runsc restore failed")
+        return real_run(argv, **kw)
+
+    backend._run = restore_fails
+    monkeypatch.setattr(gs, "_best_effort_delete", lambda cfg, run, cid: False)
+    with pytest.raises(Exception):
+        mgr.restore("s1")
+    assert mgr._refs.get(id(art), 0) == 1         # held: a sandbox may still map it
+    monkeypatch.setattr(gs, "_best_effort_delete", lambda cfg, run, cid: True)
+    mgr.ensure_build_started()                    # the next pool tick
+    assert mgr._refs.get(id(art), 0) == 0         # released once the sandbox is confirmed gone
+    assert "s1" not in mgr._held_restores

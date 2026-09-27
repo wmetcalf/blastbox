@@ -1176,6 +1176,13 @@ class GvisorSnapshotBackend:
             with _STRANDED_LOCK:
                 self.__dict__.setdefault("_stranded_sandboxes", []).extend(still)
 
+    def restore_reclaimed(self, workdir: str) -> bool:
+        """Whether a failed restore's sandbox is confirmed gone (SnapshotManager releases the
+        generation pin it held for it). Retries the stranded deletes first."""
+        self._retry_stranded_sandboxes()
+        with _STRANDED_LOCK:
+            return all(wd != str(workdir) for _cid, wd in self._stranded_sandboxes)
+
     @property
     def _stranded_sandboxes(self) -> "list[tuple[str, str]]":
         return self.__dict__.setdefault("_stranded_sandboxes", [])

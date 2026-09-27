@@ -258,6 +258,8 @@ class SnapshotManager:
         build is already running. Returns immediately so the caller (the pool's tick loop) never
         blocks on the boot+wait_ready. After a failure it waits ``build_retry_backoff_s`` before
         retrying, so a persistently-failing base boot doesn't churn the host every tick."""
+        # Every pool tick: hand back pins held for failed restores whose process is now gone.
+        self._release_held_restores()
         with self._build_lock:
             if self._artifact is not None:
                 return
@@ -666,6 +668,7 @@ class SnapshotManager:
                     "snapshot.restore_cleanup_unconfirmed sid=%s: could not confirm the "
                     "firecracker process is gone; retaining its generation pin", sid,
                 )
+                self._hold_restore(sid, artifact, slot_workdir)
                 # ...and DO NOT remove the workdir either. Retaining the pin but deleting the
                 # directory is half a rule: that firecracker may still have this slot's disk
                 # and sockets open, so removing it pulls them out from under a live microVM.
@@ -702,11 +705,47 @@ class SnapshotManager:
                     "the firecracker process is gone; retaining its generation pin", sid,
                 )
                 _keep_workdir = True    # same rule as the sibling handler above
+                self._hold_restore(sid, artifact, slot_workdir)
             if not _keep_workdir:
                 shutil.rmtree(slot_workdir, ignore_errors=True)
             if isinstance(exc, Exception):
                 raise SnapshotRestoreError(f"restore failed: {exc}") from exc
             raise
+
+    @property
+    def _held_restores(self) -> "dict[str, tuple[object, str]]":
+        """sid -> (artifact, workdir) for pins kept because a failed restore's teardown was
+        unconfirmed. The restore returned no handle, so no reap will ever release them."""
+        return self.__dict__.setdefault("_held_restores_d", {})
+
+    def _hold_restore(self, sid: str, artifact: object, slot_workdir: Path) -> None:
+        with self._build_lock:
+            self._held_restores[sid] = (artifact, str(slot_workdir))
+
+    def _release_held_restores(self) -> None:
+        """Release held pins whose sandbox/VM the backend has since confirmed gone.
+
+        Keeping the pin is right while a process may still map the generation -- but nothing
+        ever released it afterwards, so each such incident left a generation referenced until
+        restart. Optional backend hook ``restore_reclaimed(workdir)``; without it, unchanged.
+        """
+        check = getattr(self._backend, "restore_reclaimed", None)
+        if not callable(check):
+            return
+        with self._build_lock:
+            held = list(self._held_restores.items())
+        for sid, (artifact, workdir) in held:
+            try:
+                reclaimed = bool(check(workdir))
+            except Exception as exc:  # noqa: BLE001 -- retried next tick
+                _log.warning("snapshot.held_restore_check_failed sid=%s: %s", sid, exc)
+                continue
+            if reclaimed:
+                with self._build_lock:
+                    self._held_restores.pop(sid, None)
+                _log.info("snapshot.held_restore_released sid=%s -- its process is confirmed "
+                          "gone", sid)
+                self._unpin(sid, artifact)
 
     def _unpin(self, sid: str, artifact: object) -> None:
         """Undo a reservation whose restore never produced a handle.
