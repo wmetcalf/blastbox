@@ -1533,6 +1533,14 @@ def stage_rootfs(
         # so a label here would not survive. This is the only record that
         # survives into the thing a warm tier actually boots.
         img_version, img_revision, img_arch = _image_provenance(plan, source, run)
+        if not img_arch:
+            # REFUSE: an empty arch is not compared at boot (absent on one side), so this new
+            # artifact would skip the arch check entirely -- an emulated arm64 image exported on
+            # x86_64 selected for an incompatible host. Guessing the exporter's is worse.
+            raise BuildError(
+                f"cannot read the architecture of {image} ({source}); refusing to stamp a rootfs "
+                "the boot gate could not check"
+            )
         if not img_version and not verified_id:
             # No label: probe what the image actually has installed and stamp THAT, rather
             # than publish an artifact whose version is unknown.

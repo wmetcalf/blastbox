@@ -147,6 +147,10 @@ class FakeRunner:
             out = subprocess.run(  # noqa: S603
                 bare, capture_output=True, text=True, check=False
             ).stdout
+        if rc == 0 and bare[:2] == ["docker", "inspect"] and "{{.Architecture}}" in bare:
+            # A real daemon always answers this; an export now REFUSES an image whose
+            # architecture cannot be read rather than stamp one the boot gate cannot check.
+            out = "amd64"
         if rc == 0 and bare[:2] == ["docker", "run"] and "-lc" in bare:
             # The in-image blastbox probe answers DEFINITIVELY, as a real image does: these
             # fake images carry no blastbox. "" would read as "could not look", which a

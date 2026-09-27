@@ -823,3 +823,18 @@ def test_a_held_restore_is_released_exactly_once(tmp_path, monkeypatch) -> None:
     [t.start() for t in ts]
     [t.join(5) for t in ts]
     assert mgr._refs.get(id(art), 0) == 1         # only the held reference was released
+
+
+
+def test_a_rootfs_missing_mid_publish_is_not_a_pass(tmp_path, monkeypatch) -> None:
+    """Between removing the old file and installing the new, the rootfs does not exist; a
+    check answering "" with no identity let a spawn boot the new file unchecked and left the
+    snapshot unbound to any disk."""
+    monkeypatch.setattr(rfs, "guest_verdict", lambda p, r: ("", True))
+    missing = tmp_path / "rootfs.ext4"
+    gate = rfs.GuestGate(str(missing), "firecracker")
+    assert "missing" in gate.checked()[0]
+    assert gate.problem_nowait() not in ("", rfs.PENDING)
+    with pytest.raises(rfs.RootfsStampError, match="missing"):
+        rfs.RootfsPin(str(missing), "firecracker").before_boot()
+    assert rfs.GuestGate("", "firecracker").checked() == ("", None)   # none configured: no-op

@@ -913,10 +913,13 @@ def test_an_unreadable_image_architecture_is_not_guessed(tmp_path, monkeypatch) 
             return super().__call__(argv, **kw)
 
     plan = _plan(tmp_path)
-    mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=Run(), log=lambda _: None,
-                     extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True,
-                     verified_id="sha256:" + "e" * 64)
-    assert captured[0].platform.get("arch", "") == ""
+    # Neither guessed from the export host NOR left empty -- an empty arch skips the boot
+    # gate's arch check entirely. The export fails.
+    with pytest.raises(mod.BuildError, match="architecture"):
+        mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=Run(), log=lambda _: None,
+                         extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True,
+                         verified_id="sha256:" + "e" * 64)
+    assert captured == []
 
 
 def test_a_refused_stamp_write_is_a_build_error(tmp_path, monkeypatch) -> None:
@@ -1252,3 +1255,20 @@ def test_the_legacy_dirty_checks_ignore_git_config() -> None:
     for script in ("deploy/firecracker/build-rootfs.sh", "deploy/redeploy-warm.sh"):
         body = (root / script).read_text()
         assert "status --porcelain --untracked-files=all" in body, script
+
+
+
+# --- codex bot, fifteenth pass ------------------------------------------------------------
+
+
+def test_fleet_report_judges_artifacts_by_release() -> None:
+    """verdict() accepts a 0.1.42 guest under a 0.1.42+gabc container; the report called the
+    same fleet unhealthy with nothing in drift, unknown or unbootable."""
+    report = doctor.fleet_report([_ctr(version="0.1.42+gabc")], [_art(version="0.1.42")])
+    assert report["ok"] is True
+
+
+def test_the_fc_export_script_cleans_up_before_its_first_inspect() -> None:
+    root = Path(__file__).resolve().parents[2]
+    body = (root / "deploy/firecracker/build-rootfs.sh").read_text()
+    assert body.index("trap cleanup EXIT") < body.index("inspect --format '{{.Image}}'")

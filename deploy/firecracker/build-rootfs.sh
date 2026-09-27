@@ -39,12 +39,12 @@ fi
 echo "   clean — no setuid/setgid binaries"
 
 cid="$("$DOCKER" create "$TAG")"
-# The IMMUTABLE image this container was created from: the stamp must describe what was
-# exported, and "$TAG" can be retagged by another build before the stamp step runs.
-img_id="$("$DOCKER" inspect --format '{{.Image}}' "$cid")"
 rootdir="$(mktemp -d)"
 cleanup() { "$DOCKER" rm -f "$cid" >/dev/null 2>&1 || true; rm -rf "$rootdir"; }
 trap cleanup EXIT
+# The IMMUTABLE image this container was created from: the stamp must describe what was
+# exported, and "$TAG" can be retagged by another build before the stamp step runs.
+img_id="$("$DOCKER" inspect --format '{{.Image}}' "$cid")"
 
 echo ">> export rootfs -> $rootdir"
 "$DOCKER" export "$cid" | tar -x -C "$rootdir"

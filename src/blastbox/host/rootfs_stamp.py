@@ -592,9 +592,14 @@ class GuestGate:
         """(problem, the identity that verdict is for). Only a DEFINITIVE verdict -- a stamp
         read, or genuinely absent -- is cached: a failed read (a debugfs timeout on a cold,
         freshly published image) cached as "" switched the check off for that file for good."""
+        if not self.rootfs:
+            return "", None    # no rootfs configured: nothing to check
         key = file_identity(self.rootfs)
         if key is None:
-            return "", None    # a missing rootfs fails loudly at boot; not this check's job
+            # MISSING -- e.g. mid-publish, between the old file's removal and the new one's
+            # install. Not a pass: a spawn finishing after the new file appeared would boot it
+            # unchecked, and a snapshot would be pinned to no disk at all.
+            return f"{self.rootfs} is missing (possibly mid-publish); not booting it", None
         with self._lock:
             if key == self._key and (self._retry_at is None
                                      or time.monotonic() < self._retry_at):
@@ -624,9 +629,11 @@ def _gate_problem_nowait(self: "GuestGate") -> str:
     full read deadline, freezing promotion, health checks and reaping. The check runs on its own
     thread; the tick only ever reads a result.
     """
+    if not self.rootfs:
+        return ""
     key = file_identity(self.rootfs)
     if key is None:
-        return ""
+        return f"{self.rootfs} is missing (possibly mid-publish); not booting it"
     with self._lock:
         if key == self._key and (self._retry_at is None or time.monotonic() < self._retry_at):
             return self._problem

@@ -18,6 +18,13 @@ class _Rec:
         return 0
 
 
+@pytest.fixture(autouse=True)
+def _rootfs_exists(tmp_path: Path) -> None:
+    """Every config here names tmp_path/"rootfs". A missing rootfs is refused at boot (e.g.
+    mid-publish; see rootfs_stamp.GuestGate) -- these tests exercise runsc plumbing, not that."""
+    (tmp_path / "rootfs").mkdir(parents=True, exist_ok=True)
+
+
 def _cfg(tmp_path: Path, **kw: object) -> GvisorConfig:
     base: dict = dict(
         runsc_bin="runsc",

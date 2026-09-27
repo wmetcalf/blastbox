@@ -609,6 +609,16 @@ def verdict(
     return problems
 
 
+def _versions_agree(containers: Sequence[Container], artifacts: Sequence[Artifact]) -> bool:
+    c_builds = {_build(c.version) for c in containers if c.known}
+    c_releases = {_release(c.version) for c in containers if c.known}
+    a_releases = {_release(a.version) for a in artifacts
+                  if a.known and a.version != NO_BLASTBOX}
+    if len(c_builds) > 1:
+        return False
+    return a_releases <= c_releases if c_builds else len(a_releases) <= 1
+
+
 def fleet_report(
     containers: Sequence[Container], artifacts: Sequence[Artifact] = ()
 ) -> dict:
@@ -638,7 +648,8 @@ def fleet_report(
         "drift": mixed,
         "unknown": unknown,
         "unbootable": unbootable,
-        # Health from NORMALISED builds, as verdict() judges: "0.2" and "0.2.0" are one.
-        "ok": not (mixed or unknown or unbootable) and len({_build(v) for v in versions}) <= 1,
+        # Health judged as verdict() judges it: containers by BUILD, artifacts by RELEASE
+        # (the guest check) -- not one raw string set.
+        "ok": not (mixed or unknown or unbootable) and _versions_agree(containers, artifacts),
     }
 
