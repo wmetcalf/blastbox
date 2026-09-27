@@ -20,6 +20,8 @@ import pytest
 from blastbox.host import rootfs_stamp as rfs
 from blastbox.host.runtime.fc_snapshot import SnapshotBuildError, SnapshotRestoreError
 
+from .test_fc_snapshot import _wait_until
+
 
 def _replace(path: Path, body: bytes) -> None:
     """Publish in place the way build-images does: a new file renamed over the old."""
@@ -448,9 +450,8 @@ def test_a_stale_gvisor_restore_that_cannot_be_deleted_is_kept_for_retry(tmp_pat
     # bundle go to the directory sweep.
     deleted: list[str] = []
     monkeypatch.setattr(gs, "_best_effort_delete", lambda cfg, run, c: deleted.append(c) or True)
-    backend.boot_base()
-    assert cid in deleted
-    assert backend._stranded_sandboxes == []
+    backend.boot_base()                           # kicks the (background) retry
+    assert _wait_until(lambda: cid in deleted and backend._stranded_sandboxes == [])
 
 
 def test_a_failed_restore_that_cannot_be_deleted_retries_the_sandbox_too(tmp_path,
@@ -502,8 +503,12 @@ def test_a_held_pin_is_released_once_the_backend_reaps_its_sandbox(tmp_path, mon
         mgr.restore("s1")
     assert mgr._refs.get(id(art), 0) == 1         # held: a sandbox may still map it
     monkeypatch.setattr(gs, "_best_effort_delete", lambda cfg, run, cid: True)
-    mgr.ensure_build_started()                    # the next pool tick
-    assert mgr._refs.get(id(art), 0) == 0         # released once the sandbox is confirmed gone
+
+    def tick_released() -> bool:
+        mgr.ensure_build_started()                # pool ticks; the retry runs in the background
+        return mgr._refs.get(id(art), 0) == 0
+
+    assert _wait_until(tick_released)             # released once the sandbox is confirmed gone
     assert "s1" not in mgr._held_restores
 
 
@@ -560,3 +565,51 @@ def test_a_sandbox_being_retried_is_not_reported_reclaimed(tmp_path, monkeypatch
     release.set()
     t.join(5)
     assert [c for c, _wd in backend._stranded_sandboxes] == ["slot-aaa"]
+
+
+
+# --- codex bot, eighth pass ---------------------------------------------------------------
+
+
+def test_the_opened_inode_catches_an_aba_republish(tmp_path) -> None:
+    """A publish of B over A and a rollback to A before the post-open check: the PATH is A
+    again, but the process holds B. Only the inode actually opened can tell."""
+    f = tmp_path / "rootfs.ext4"
+    f.write_bytes(b"A")
+    key = rfs.file_identity(f)
+    os.link(f, tmp_path / "A.bak")                # the rollback's backup of A
+    _replace(f, b"B")
+    held = open(f, "rb")                          # "firecracker" opens B
+    try:
+        os.replace(tmp_path / "A.bak", f)         # rolled back: the path is A (same inode)
+        assert rfs.file_identity(f) == key        # the path check alone is fooled
+        assert rfs.opened_matches(os.getpid(), str(f), key) is False
+    finally:
+        held.close()
+
+
+def test_the_opened_inode_confirms_the_pinned_file(tmp_path) -> None:
+    f = tmp_path / "rootfs.ext4"
+    f.write_bytes(b"A")
+    key = rfs.file_identity(f)
+    with open(f, "rb"):
+        assert rfs.opened_matches(os.getpid(), str(f), key) is True
+    assert rfs.opened_matches(2**31 - 7, str(f), key) is None     # unknowable: no such pid
+
+
+def test_restore_reclaimed_never_blocks_on_a_wedged_delete(tmp_path, monkeypatch) -> None:
+    """It runs on the pool tick; runsc kill/delete are bounded only by cli_timeout_s (900s)
+    each, so a wedged sandbox held the maintenance thread for up to half an hour."""
+    import threading
+    import time as _t
+
+    from blastbox.host.runtime import gvisor_snapshot as gs
+
+    backend, _rec = _gv_backend(tmp_path)
+    backend._strand_sandbox("slot-bbb", tmp_path / "slots" / "s9")
+    release = threading.Event()
+    monkeypatch.setattr(gs, "_best_effort_delete", lambda cfg, run, cid: release.wait(5) and False)
+    t0 = _t.monotonic()
+    assert backend.restore_reclaimed(str(tmp_path / "slots" / "s9")) is False
+    assert _t.monotonic() - t0 < 1.0
+    release.set()

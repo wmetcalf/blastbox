@@ -303,7 +303,9 @@ class FcSnapshotBackend:
                 from blastbox.host.rootfs_stamp import RootfsStampError
 
                 try:
-                    pin.check_restore(artifact)
+                    # By the INODE firecracker actually holds, when /proc can say: a path check
+                    # cannot see a publish rolled back (A->B->A) while this restore opened B.
+                    pin.check_opened(artifact, getattr(getattr(handle, "proc", None), "pid", None))
                 except RootfsStampError as exc:
                     raise SnapshotStale(f"{exc} (changed while this restore opened it)") from exc
         except BaseException as exc:

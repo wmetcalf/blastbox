@@ -526,6 +526,40 @@ def file_identity(path: Path | str) -> "tuple[int, ...] | None":
     return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
 
 
+def opened_matches(pid: int, path: str, key: "tuple[int, ...] | None") -> "bool | None":
+    """Whether process ``pid`` holds the PINNED file open -- by inode, not by path.
+
+    True: it has the pinned (dev, inode) open. False: it holds a DIFFERENT file at ``path``
+    (including one since unlinked, "(deleted)"). None: /proc could not answer. Path checks
+    alone cannot see an A->B->A republish (a publish rolled back while a restore opened B);
+    the descriptor the runtime actually holds can.
+    """
+    if key is None:
+        return None
+    fd_dir = Path(f"/proc/{pid}/fd")
+    try:
+        fds = list(fd_dir.iterdir())
+    except OSError:
+        return None
+    want = (key[0], key[1])
+    real = os.path.realpath(path)
+    other = False
+    for fd in fds:
+        try:
+            st = os.stat(fd)
+        except OSError:
+            continue
+        if (st.st_dev, st.st_ino) == want:
+            return True
+        try:
+            target = os.readlink(fd)
+        except OSError:
+            continue
+        if target in (path, real) or target in (f"{path} (deleted)", f"{real} (deleted)"):
+            other = True
+    return False if other else None
+
+
 class GuestGate:
     """guest_problem() for one rootfs, re-read only when the file changes.
 
@@ -627,6 +661,24 @@ class RootfsPin:
                 "it would pair the old memory image with a different disk. The base must be "
                 "rebuilt from the current rootfs."
             )
+
+    def check_opened(self, artifact: object, pid: "int | None") -> None:
+        """After the runtime opened the rootfs: refuse unless it holds the PINNED inode.
+
+        Falls back to the path check when /proc cannot answer.
+        """
+        with self._lock:
+            key = self._keys.get(self._akey(artifact))
+        if key is None:
+            return
+        verdict = opened_matches(pid, self.gate.rootfs, key) if pid else None
+        if verdict is False:
+            raise RootfsStale(
+                f"{self.gate.rootfs}: the runtime opened a different file than the one this "
+                "snapshot was checkpointed against (a republish landed during the restore)"
+            )
+        if verdict is None:
+            self.check_restore(artifact)
 
     def forget(self, artifact: object) -> None:
         with self._lock:
@@ -761,6 +813,7 @@ __all__ = [
     "guest_verdict",
     "RootfsPin",
     "file_identity",
+    "opened_matches",
     "MAX_STAMP_BYTES",
     "STAMP_PATH",
     "guest_problem",

@@ -1068,7 +1068,7 @@ class GvisorSnapshotBackend:
         # filesystem blocked the boot that would have reached the cleanup, and the tier stayed
         # cold permanently. Same fix as the FC launcher; a retry is worthless if the condition it
         # fixes is what stops you reaching it (upstream, PR #82).
-        self._retry_stranded_sandboxes()
+        self._kick_sandbox_retry()
         _retry_stranded_partials(self._stranded_partials)
         # The rootfs is checked HERE, where it is booted -- not only at tier selection: a tree
         # republished while the dispatcher runs is otherwise built into a base unchecked.
@@ -1180,10 +1180,26 @@ class GvisorSnapshotBackend:
         finally:
             lock.release()
 
+    def _kick_sandbox_retry(self) -> None:
+        """Run the stranded-sandbox retry on its OWN thread. Its runsc kill/delete are bounded
+        only by cli_timeout_s (900s default) each, and every caller -- the pool tick, a spawn --
+        must not wait on a wedged sandbox."""
+        with _STRANDED_LOCK:
+            if not self._stranded_sandboxes:
+                return
+            running = self.__dict__.get("_sandbox_retry_thread")
+            if running is not None and running.is_alive():
+                return
+            t = threading.Thread(target=self._retry_stranded_sandboxes, daemon=True,
+                                 name="gvisor-stranded-sandbox-retry")
+            self.__dict__["_sandbox_retry_thread"] = t
+        t.start()
+
     def restore_reclaimed(self, workdir: str) -> bool:
         """Whether a failed restore's sandbox is confirmed gone (SnapshotManager releases the
-        generation pin it held for it). Retries the stranded deletes first."""
-        self._retry_stranded_sandboxes()
+        generation pin it held for it). A pure lookup: the retry itself runs in the background
+        (see _kick_sandbox_retry), and an entry leaves the ledger only once its delete worked."""
+        self._kick_sandbox_retry()
         with _STRANDED_LOCK:
             return all(wd != str(workdir) for _cid, wd in self._stranded_sandboxes)
 
@@ -1205,8 +1221,8 @@ class GvisorSnapshotBackend:
 
     def restore_in(self, slot_workdir: Path, artifact: object) -> GvisorRestoreHandle:
         # A stranded sandbox otherwise waits for the next BASE build -- hours, on a busy tier.
-        # Free when the ledger is empty, which is almost always.
-        self._retry_stranded_sandboxes()
+        # Kicked, never awaited: free when the ledger is empty, which is almost always.
+        self._kick_sandbox_retry()
         # A tree replaced since this checkpoint would pair the checkpointed memory with a
         # different filesystem (see rootfs_stamp.RootfsPin). Refused before anything runs.
         from blastbox.host.rootfs_stamp import RootfsStampError
