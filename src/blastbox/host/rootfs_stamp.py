@@ -398,6 +398,9 @@ _DEBUGFS_BANNER = re.compile(r"^debugfs \d[^\n]*$", re.MULTILINE)
 MAX_ABANDONED_DEBUGFS = 4
 _ABANDONED_DEBUGFS: list[tuple[Any, threading.Thread, threading.Thread]] = []
 _ABANDONED_LOCK = threading.Lock()
+#: Probes started and not yet finished. Counted against the cap WITH the abandoned ones: a hung
+#: probe joins the ledger only after its timeout, so N concurrent checks all passed admission.
+_DEBUGFS_IN_FLIGHT = 0
 #: How long to wait for a killed debugfs, and then for each reader thread, to finish.
 _DEBUGFS_REAP_S = 1.0
 
@@ -413,7 +416,8 @@ def _close_idle(proc: Any, t: threading.Thread, te: threading.Thread) -> None:
 
 
 def _admit_debugfs() -> None:
-    """Reclaim abandoned probes that have finally exited; refuse a new one at the cap."""
+    """Reclaim abandoned probes that have finally exited; reserve a slot or refuse at the cap."""
+    global _DEBUGFS_IN_FLIGHT
     with _ABANDONED_LOCK:
         live = []
         for proc, t, te in _ABANDONED_DEBUGFS:
@@ -422,11 +426,22 @@ def _admit_debugfs() -> None:
             else:
                 _close_idle(proc, t, te)
         _ABANDONED_DEBUGFS[:] = live
-        if len(live) >= MAX_ABANDONED_DEBUGFS:
+        if len(live) + _DEBUGFS_IN_FLIGHT >= MAX_ABANDONED_DEBUGFS:
             raise RootfsStampError(
-                f"{len(live)} earlier debugfs probes are still hung (ignoring SIGKILL); "
-                "not starting another until they exit -- is the rootfs on a stuck mount?"
+                f"{len(live)} earlier debugfs probes are still hung (ignoring SIGKILL) and "
+                f"{_DEBUGFS_IN_FLIGHT} are in flight; not starting another until they exit -- "
+                "is the rootfs on a stuck mount?"
             )
+        _DEBUGFS_IN_FLIGHT += 1
+
+
+def _release_debugfs(entry: tuple[Any, threading.Thread, threading.Thread] | None) -> None:
+    """Give back the slot _admit_debugfs reserved; a probe that survived SIGKILL keeps it."""
+    global _DEBUGFS_IN_FLIGHT
+    with _ABANDONED_LOCK:
+        _DEBUGFS_IN_FLIGHT -= 1
+        if entry is not None:
+            _ABANDONED_DEBUGFS.append(entry)
 
 
 def _bounded_debugfs(argv: Sequence[str]) -> str:
@@ -440,42 +455,47 @@ def _bounded_debugfs(argv: Sequence[str]) -> str:
     stamp" without an unbounded buffer.
     """
     _admit_debugfs()
-    proc = subprocess.Popen(  # noqa: S603 -- fixed argv, no shell
-        list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE
-    )
-    got: list[bytes] = []
-    err: list[bytes] = []
+    abandoned: tuple[Any, threading.Thread, threading.Thread] | None = None
+    try:
+        proc = subprocess.Popen(  # noqa: S603 -- fixed argv, no shell
+            list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        got: list[bytes] = []
+        err: list[bytes] = []
 
-    def reader() -> None:
-        assert proc.stdout is not None
-        got.append(proc.stdout.read(MAX_STAMP_BYTES + 1))
+        def reader() -> None:
+            assert proc.stdout is not None
+            got.append(proc.stdout.read(MAX_STAMP_BYTES + 1))
 
-    def err_reader() -> None:
-        assert proc.stderr is not None
-        err.append(proc.stderr.read(4096))
-        while proc.stderr.read(65536):
-            pass
+        def err_reader() -> None:
+            assert proc.stderr is not None
+            err.append(proc.stderr.read(4096))
+            while proc.stderr.read(65536):
+                pass
 
-    t = threading.Thread(target=reader, daemon=True, name="rootfs-stamp-debugfs")
-    te = threading.Thread(target=err_reader, daemon=True, name="rootfs-stamp-debugfs-err")
-    t.start()
-    te.start()
-    t.join(DEBUGFS_TIMEOUT_S)
-    timed_out = t.is_alive()
-    # Always stop it: past the cap there is nothing we will read, and a blocked writer must
-    # not linger. The wait is bounded too -- a debugfs in uninterruptible sleep (a hung NFS
-    # image) ignores SIGKILL, and the probe must not hang with it.
-    if proc.poll() is None:
-        proc.kill()
-    with contextlib.suppress(subprocess.TimeoutExpired):
-        proc.wait(timeout=_DEBUGFS_REAP_S * 5)
-    t.join(_DEBUGFS_REAP_S)
-    te.join(_DEBUGFS_REAP_S)
-    _close_idle(proc, t, te)
-    if proc.poll() is None or t.is_alive() or te.is_alive():
-        # Survived SIGKILL: remembered, so the next probe can reclaim it or refuse to add one.
-        with _ABANDONED_LOCK:
-            _ABANDONED_DEBUGFS.append((proc, t, te))
+        t = threading.Thread(target=reader, daemon=True, name="rootfs-stamp-debugfs")
+        te = threading.Thread(target=err_reader, daemon=True, name="rootfs-stamp-debugfs-err")
+        t.start()
+        te.start()
+        t.join(DEBUGFS_TIMEOUT_S)
+        timed_out = t.is_alive()
+        # Always stop it: past the cap there is nothing we will read, and a blocked writer must
+        # not linger. The wait is bounded too -- a debugfs in uninterruptible sleep (a hung NFS
+        # image) ignores SIGKILL, and the probe must not hang with it.
+        if proc.poll() is None:
+            proc.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=_DEBUGFS_REAP_S * 5)
+        t.join(_DEBUGFS_REAP_S)
+        te.join(_DEBUGFS_REAP_S)
+        _close_idle(proc, t, te)
+        if proc.poll() is None or t.is_alive() or te.is_alive():
+            # Survived SIGKILL: remembered, so the next probe can reclaim it or refuse to add one.
+            abandoned = (proc, t, te)
+    finally:
+        # The reserved slot is released on EVERY path (a Popen that raises included), or moved
+        # to the abandoned ledger when the probe could not be reaped.
+        _release_debugfs(abandoned)
     if timed_out:
         raise RootfsStampError(
             f"debugfs timed out after {DEBUGFS_TIMEOUT_S:.0f}s reading {argv[-1]}"

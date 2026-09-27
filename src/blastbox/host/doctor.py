@@ -377,6 +377,10 @@ class Artifact:
     #: The stamp was READ. Its version then stands as written -- even the literal "unknown",
     #: which would otherwise collide with the UNKNOWN sentinel and read as "could not look".
     stamped: bool = False
+    #: The stamp was read and records NO blastbox (a pure-JVM worker). A flag, not a version
+    #: string: the stamp is image-written text, and one literally reading NO_BLASTBOX must stay
+    #: a version -- compared, and refused as the boot gate refuses it.
+    no_blastbox: bool = False
     detail: str = ""                  # why it is UNKNOWN, or what disagrees
 
     @property
@@ -418,6 +422,7 @@ def survey_rootfs(paths: Sequence[str]) -> list[Artifact]:
                 # READ, and definitively without blastbox (a pure-JVM worker): the boot gate
                 # admits it on arch/runtime, so doctor must not call it unreadable.
                 version=version or NO_BLASTBOX,
+                no_blastbox=not version,
                 runtime=plat.runtime,
                 arch=plat.arch,
                 cpu_vendor=_sanitise(plat.cpu_vendor),
@@ -559,7 +564,7 @@ def verdict(
             problems.append(f"expected {expect}, but found nothing to verify")
         return problems
     known_c = [c for c in containers if c.known]
-    known_a = [a for a in artifacts if a.known and a.version != NO_BLASTBOX]
+    known_a = [a for a in artifacts if a.known and not a.no_blastbox]
     if expect:
         # Containers must be the exact BUILD named; an artifact is judged by release, the way
         # the tier boots it.
@@ -636,7 +641,7 @@ def fleet_report(
     deliberately strict, because the failure this exists for looked fine.
     """
     versions = sorted({c.version for c in containers if c.known} |
-                      {a.version for a in artifacts if a.known and a.version != NO_BLASTBOX})
+                      {a.version for a in artifacts if a.known and not a.no_blastbox})
     unknown = [c.name for c in containers if not c.known] + [
         a.path for a in artifacts if not a.known
     ]

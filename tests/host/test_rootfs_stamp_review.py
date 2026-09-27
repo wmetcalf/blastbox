@@ -1211,7 +1211,8 @@ def test_a_direct_export_without_blastbox_does_not_stamp_the_labels_version(tmp_
 def test_a_package_free_artifact_is_not_a_mix(monkeypatch, capsys) -> None:
     arts = [_art("/r/py", "0.1.42"), doctor.Artifact(path="/r/jvm", version=doctor.NO_BLASTBOX,
                                                      runtime="firecracker",
-                                                     arch=plat.host_platform().arch)]
+                                                     arch=plat.host_platform().arch,
+                                                     stamped=True, no_blastbox=True)]
     rc, out = _doctor(monkeypatch, capsys, [], arts)
     assert rc == 0 and "MIXED" not in out and "(no blastbox)" not in out.split("OK:")[-1]
 
@@ -1299,7 +1300,7 @@ def test_a_whitespace_version_means_no_blastbox_in_both(tmp_path) -> None:
                       platform={"arch": plat.host_platform().arch, "runtime": "gvisor"})
     assert rfs.guest_problem(tree, "gvisor") == ""
     (art,) = doctor.survey_rootfs([tree])
-    assert art.version == doctor.NO_BLASTBOX and doctor.verdict([], [art]) == []
+    assert art.no_blastbox and doctor.verdict([], [art]) == []
 
 
 def test_a_stamp_reading_unknown_is_still_a_readable_stamp(tmp_path) -> None:
@@ -1316,7 +1317,7 @@ def test_expect_does_not_switch_off_the_host_comparison() -> None:
 
 def test_expect_with_nothing_versioned_is_a_problem() -> None:
     jvm = doctor.Artifact(path="/r/jvm", version=doctor.NO_BLASTBOX, runtime="firecracker",
-                          arch=plat.host_platform().arch, stamped=True)
+                          arch=plat.host_platform().arch, stamped=True, no_blastbox=True)
     assert any("nothing" in p for p in doctor.verdict([], [jvm], expect="0.1.42"))
 
 
@@ -1570,3 +1571,57 @@ def test_the_provenance_label_read_is_bounded_too(tmp_path, monkeypatch) -> None
     with pytest.raises(mod.BuildError, match="provenance"):
         mod._image_provenance(_plan(tmp_path), "sha256:" + "e" * 64, FakeRunner())
     assert got == [bounded]
+
+
+# --- PR #186 codex (c2a2531) ----------------------------------------------------------------
+
+
+def test_stamp_text_cannot_forge_the_package_free_state(tmp_path) -> None:
+    """A stamp literally reading "(no blastbox)" is a VERSION the boot gate refuses, not the
+    package-free state -- doctor must not exempt it from every comparison."""
+    tree = _dir_stamp(tmp_path, "r", blastbox_version=doctor.NO_BLASTBOX,
+                      platform={"arch": plat.host_platform().arch, "runtime": "gvisor"})
+    assert rfs.guest_problem(tree, "gvisor")
+    (art,) = doctor.survey_rootfs([tree])
+    assert not art.no_blastbox
+    assert doctor.verdict([], [art])
+    assert doctor.fleet_report([], [art])["ok"] is False
+
+
+def test_in_flight_debugfs_probes_count_against_the_cap(tmp_path, monkeypatch) -> None:
+    """Hung probes joined the ledger only AFTER their timeout, so N concurrent checks all
+    passed admission and left N unreapable processes behind."""
+    import threading as _th
+
+    img = tmp_path / "rootfs.ext4"
+    img.write_bytes(b"\0")
+    monkeypatch.setattr(rfs.shutil, "which", lambda _n: "/usr/sbin/debugfs")
+    monkeypatch.setattr(rfs, "DEBUGFS_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(rfs, "_DEBUGFS_REAP_S", 0.01)
+    monkeypatch.setattr(rfs, "_ABANDONED_DEBUGFS", [])
+    monkeypatch.setattr(rfs, "_DEBUGFS_IN_FLIGHT", 0)
+    _FakeDebugfs.instances = []
+    _FakeDebugfs.block_next = False
+    _UnkillableDebugfs.release = False
+    monkeypatch.setattr(rfs.subprocess, "Popen", _UnkillableDebugfs)
+    n = rfs.MAX_ABANDONED_DEBUGFS * 2
+    barrier = _th.Barrier(n)
+    errors: list = []
+
+    def probe():
+        barrier.wait()
+        try:
+            rfs.read_from_ext4(img)
+        except rfs.RootfsStampError as exc:
+            errors.append(str(exc))
+
+    threads = [_th.Thread(target=probe) for _ in range(n)]
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        assert len(_FakeDebugfs.instances) <= rfs.MAX_ABANDONED_DEBUGFS
+        assert sum("still hung" in e or "in flight" in e for e in errors) >= n - rfs.MAX_ABANDONED_DEBUGFS
+    finally:
+        _UnkillableDebugfs.release = True
