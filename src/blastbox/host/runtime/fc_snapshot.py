@@ -102,6 +102,12 @@ DEFAULT_SNAPSHOT_MAX_AGE_S = 6 * 3600.0
 SNAPSHOT_AGE_CEILING_FACTOR = 2.0
 
 
+class SnapshotStale(SnapshotRestoreError):
+    """This artifact can never be restored again (its rootfs changed since the checkpoint).
+
+    Not a flaky restore: the manager drops the base at once rather than leave every later
+    spawn to fail until a statistical repair notices."""
+
 
 class SnapshotManager:
     """Builds the warm snapshot once (first-boot), then serves restores to the pool.
@@ -415,6 +421,8 @@ class SnapshotManager:
 
         Also where AGE is decided, under the same lock that starts the build thread, so two ticks
         (or a cascade's concurrent prepare() calls) cannot both act on one aged base."""
+        # Every pool tick: hand back pins held for failed restores whose process is now gone.
+        self._release_held_restores()
         collect: list[object] = []
         with self._build_lock:
             sweep, self._sweep_due = self._sweep_due, False
@@ -813,7 +821,7 @@ class SnapshotManager:
                     if self._staging_epoch == epoch + 1:
                         self._staging_epoch = None
 
-    def invalidate(self) -> bool:
+    def invalidate(self, *, only_if: object | None = None) -> bool:
         """Discard the built artifact so the next ``build()`` captures a fresh one.
 
         The warm base is checkpointed from a live sandbox, so it can capture a guest that was
@@ -825,6 +833,11 @@ class SnapshotManager:
         invalidation must not take down the caller's failure-handling path.
         """
         with self._build_lock:
+            # CHECK AND ACT IN ONE HOLD. `only_if` names the artifact the caller found wrong: if it
+            # has already been superseded, this is a no-op -- two concurrent stale restores
+            # otherwise both invalidated, and the second rejected the first's replacement build.
+            if only_if is not None and self._artifact is not only_if:
+                return False
             had = self._artifact is not None
             collect = self._invalidate_locked()
         for artifact in collect:
@@ -992,6 +1005,7 @@ class SnapshotManager:
                     "snapshot.restore_cleanup_unconfirmed sid=%s: could not confirm the "
                     "firecracker process is gone; retaining its generation pin", sid,
                 )
+                self._hold_restore(sid, artifact, slot_workdir)
                 # ...and DO NOT remove the workdir either. Retaining the pin but deleting the
                 # directory is half a rule: that firecracker may still have this slot's disk
                 # and sockets open, so removing it pulls them out from under a live microVM.
@@ -1000,6 +1014,14 @@ class SnapshotManager:
                 _keep_workdir = True
             if not _keep_workdir:
                 shutil.rmtree(slot_workdir, ignore_errors=True)
+            if isinstance(exc, SnapshotStale):
+                # CERTAIN, not statistical: every later restore of this artifact fails the same
+                # way. Waiting for the pool's repair drained the warm tier to zero -- and inside
+                # its rebuild cooldown, or with repair disabled, never recovered at all. Only if
+                # it is still the current artifact: a concurrent rebuild may already have won.
+                if self.invalidate(only_if=artifact):
+                    _log.error("snapshot.stale_base_dropped: %s -- rebuilding from the current "
+                               "rootfs", exc)
             raise
         except BaseException as exc:
             _keep_workdir = False
@@ -1020,11 +1042,52 @@ class SnapshotManager:
                     "the firecracker process is gone; retaining its generation pin", sid,
                 )
                 _keep_workdir = True    # same rule as the sibling handler above
+                self._hold_restore(sid, artifact, slot_workdir)
             if not _keep_workdir:
                 shutil.rmtree(slot_workdir, ignore_errors=True)
             if isinstance(exc, Exception):
                 raise SnapshotRestoreError(f"restore failed: {exc}") from exc
             raise
+
+    @property
+    def _held_restores(self) -> "dict[str, tuple[object, str]]":
+        """sid -> (artifact, workdir) for pins kept because a failed restore's teardown was
+        unconfirmed. The restore returned no handle, so no reap will ever release them."""
+        return self.__dict__.setdefault("_held_restores_d", {})
+
+    def _hold_restore(self, sid: str, artifact: object, slot_workdir: Path) -> None:
+        with self._build_lock:
+            self._held_restores[sid] = (artifact, str(slot_workdir))
+
+    def _release_held_restores(self) -> None:
+        """Release held pins whose sandbox/VM the backend has since confirmed gone.
+
+        Keeping the pin is right while a process may still map the generation -- but nothing
+        ever released it afterwards, so each such incident left a generation referenced until
+        restart. Optional backend hook ``restore_reclaimed(workdir)``; without it, unchanged.
+        """
+        check = getattr(self._backend, "restore_reclaimed", None)
+        if not callable(check):
+            return
+        with self._build_lock:
+            held = list(self._held_restores.items())
+        for sid, (artifact, workdir) in held:
+            try:
+                reclaimed = bool(check(workdir))
+            except Exception as exc:  # noqa: BLE001 -- retried next tick
+                _log.warning("snapshot.held_restore_check_failed sid=%s: %s", sid, exc)
+                continue
+            if reclaimed:
+                # CLAIM it: two concurrent ticks (a cascade prepares per spawn) can both have
+                # copied this entry; only the one that removes it may unpin, or the generation's
+                # refcount drops twice under another slot still using it.
+                with self._build_lock:
+                    claimed = self._held_restores.pop(sid, None)
+                if claimed is None:
+                    continue
+                _log.info("snapshot.held_restore_released sid=%s -- its process is confirmed "
+                          "gone", sid)
+                self._unpin(sid, claimed[0])
 
     def _unpin(self, sid: str, artifact: object) -> None:
         """Undo a reservation whose restore never produced a handle.

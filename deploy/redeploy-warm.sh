@@ -231,8 +231,49 @@ log "gVisor rootfs -> $GVISOR_DIR/rootfs.${WARM_TAG}"
 docker build -q --build-arg BASE="$WARM_IMAGE" -f "$REPO/deploy/gvisor/Dockerfile.shim" \
   -t "${WARM_IMAGE%:*}-warm:gvisor-${WARM_TAG}" "$REPO" >/dev/null
 cid=$(docker create "${WARM_IMAGE%:*}-warm:gvisor-${WARM_TAG}")
+# Removed on ANY exit from here until the explicit rm: a failed inspect or export under set -e
+# otherwise left the container and its writable layer behind on every retry.
+trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
 sudo rm -rf "$GVISOR_DIR/rootfs.${WARM_TAG}"; sudo mkdir -p "$GVISOR_DIR/rootfs.${WARM_TAG}"
+gv_img=$(docker inspect --format '{{.Image}}' "$cid")   # immutable: the tag can be retagged
+# Checking out FETCH_HEAD leaves unrelated dirty or untracked files in place: mark them.
+gv_rev="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)"
+if [ -n "$gv_rev" ] && [ -n "$(git -C "$REPO" status --porcelain --untracked-files=all 2>/dev/null)" ]; then
+  gv_rev="${gv_rev}-dirty"
+fi
 docker export "$cid" | sudo tar -x -C "$GVISOR_DIR/rootfs.${WARM_TAG}"; docker rm "$cid" >/dev/null
+trap - EXIT
+# `|| true`: no python3 must reach the unstamped fallback below, not end the script (set -e).
+GV_PY="${BLASTBOX_PY:-$(command -v python3 || true)}"
+GV_PY="${GV_PY:-python3}"
+gv_tree="$GVISOR_DIR/rootfs.${WARM_TAG}"
+gv_stamp="$gv_tree/opt/blastbox/rootfs-stamp.json"
+if sudo "$GV_PY" -c 'import blastbox.host.rootfs_stamp' 2>/dev/null; then
+  # Never an inherited stamp -- cleared through the confined helper, never a root `rm` that
+  # would follow an image-controlled opt/blastbox symlink onto the host.
+  sudo "$GV_PY" -m blastbox.host.rootfs_stamp clear "$gv_tree" \
+    || { log "refusing: could not clear an inherited stamp"; exit 1; }
+  # Stamped like build-images' output. As root: the tree was extracted as root. Verified by the
+  # FILE, not the exit status; a REFUSAL (an unverifiable guest) fails the redeploy rather than
+  # publish it unstamped, which would boot it with no check at all.
+  if ! sudo "$GV_PY" -m blastbox.host.rootfs_stamp write "$gv_tree" "$gv_img" gvisor "$gv_rev" \
+     || ! sudo test -s "$gv_stamp"; then
+    sudo "$GV_PY" -m blastbox.host.rootfs_stamp clear "$gv_tree" || true
+    log "refusing: the gVisor rootfs could not be stamped (see above)"
+    exit 1
+  fi
+else
+  # No importable blastbox: the documented fallback -- publish UNSTAMPED. An inherited stamp is
+  # still removed, as root, without following any link the image controls.
+  for p in "$gv_tree/opt" "$gv_tree/opt/blastbox" "$gv_stamp"; do
+    if sudo test -L "$p"; then log "refusing: $p is a symlink inside the image"; exit 1; fi
+  done
+  if sudo test -e "$gv_stamp" && ! sudo test -f "$gv_stamp"; then
+    log "refusing: $gv_stamp is not a regular file"; exit 1
+  fi
+  sudo rm -f -- "$gv_stamp"
+  log "WARNING: blastbox not importable by $GV_PY -- gVisor rootfs published UNSTAMPED; it will boot unchecked"
+fi
 
 # --- 4. stage swaps (with backups) + optional FC binary -----------------------
 log "stage rootfs (backups -> *.$SUF)"

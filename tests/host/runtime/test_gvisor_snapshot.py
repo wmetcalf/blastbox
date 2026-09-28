@@ -18,6 +18,13 @@ class _Rec:
         return 0
 
 
+@pytest.fixture(autouse=True)
+def _rootfs_exists(tmp_path: Path) -> None:
+    """Every config here names tmp_path/"rootfs". A missing rootfs is refused at boot (e.g.
+    mid-publish; see rootfs_stamp.GuestGate) -- these tests exercise runsc plumbing, not that."""
+    (tmp_path / "rootfs").mkdir(parents=True, exist_ok=True)
+
+
 def _cfg(tmp_path: Path, **kw: object) -> GvisorConfig:
     base: dict = dict(
         runsc_bin="runsc",
@@ -776,10 +783,13 @@ def test_an_unconfirmed_restore_teardown_retains_its_bundle(tmp_path):
         backend.restore_in(tmp_path / "slot", str(tmp_path / "checkpoint-x"))
 
     assert getattr(ei.value, "kill_failed", False) is True, "sanity: the pin must be retained"
-    assert backend._stranded_partials, (
-        "the bundle was forgotten, so nothing can retry the teardown and the checkpoint stays "
+    # Retained as (cid, bundle): the directory sweep alone can only rmtree, never `runsc
+    # delete`, so recording just the bundle could not retry the teardown either.
+    assert [wd for _cid, wd in backend._stranded_sandboxes] == [str(tmp_path / "slot")], (
+        "the sandbox was forgotten, so nothing can retry the teardown and the checkpoint stays "
         "pinned for the life of the dispatcher"
     )
+    assert str(tmp_path / "slot") not in backend._stranded_partials   # not rmtree'd while live
 
 
 # ---------------------------------------------------------------------------

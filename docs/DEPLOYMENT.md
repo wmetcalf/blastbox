@@ -159,6 +159,13 @@ See `deploy/docker/docker-compose.{firecracker,gvisor}.yml` for the exact servic
 sidecar **must** repeat `BLASTBOX_ENGINE_<NAME>_PARAM_KEYS` and its pool sizing
 (`BLASTBOX_DISPATCH_CONCURRENCY == BLASTBOX_POOL_WARM_SIZE`).
 
+**The rootfs a warm tier boots is a separate artifact from your image, and it is the
+part that rots.** `docker export` drops image config, so nothing in the image's labels
+survives into it. See **[WARM-ROOTFS.md](WARM-ROOTFS.md)** for declaring the image
+chain, building it with `blastbox build-images`, and the stamp that makes a
+guest/host mismatch fail at pool build instead of as a 300s timeout on every job.
+If cold works and warm times out at exactly 300s, start there.
+
 Tier-specific gotchas, captured here so they aren't re-discovered:
 - gVisor C/R sidecar: `BLASTBOX_GVISOR_PLATFORM=systrap` (ptrace is too slow — blows the OCR
   deadline); needs `SYS_ADMIN`/`SYS_PTRACE`/`NET_ADMIN` (not `cap_drop=ALL`) + a clean state

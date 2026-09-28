@@ -562,3 +562,47 @@ def test_the_printed_rollback_does_restore_when_a_backup_exists(tmp_path: Path) 
     )
     assert (gv_dir / "rootfs" / "init").read_text() == "the previous guest"
     assert (fc_dir / "rootfs.ext4").read_text() == "previous fc"
+
+
+def test_the_gvisor_stamp_step_survives_a_host_without_python3(tmp_path: Path) -> None:
+    """PR #186 codex: `$(command -v python3)` failing under `set -e` killed the script before
+    the documented no-interpreter fallback (publish unstamped) could run."""
+    line = "; ".join(ln for ln in SCRIPT.read_text().splitlines() if ln.startswith("GV_PY="))
+    assert line
+    empty = tmp_path / "bin"
+    empty.mkdir()
+    out = subprocess.run(
+        ["/bin/bash", "-euc", f"unset BLASTBOX_PY; PATH={empty}; {line}; echo \"reached $GV_PY\""],
+        capture_output=True, text=True,
+    )
+    assert out.returncode == 0, out.stderr
+    # Falls through to the importability probe, which then fails and picks the fallback.
+    assert out.stdout.strip() == "reached python3"
+
+
+def test_a_failed_gvisor_inspect_removes_the_created_container(tmp_path: Path) -> None:
+    """PR #186 codex: `docker inspect` failing after `docker create` exited under set -e with
+    no cleanup, leaving the container and its writable layer behind on every retry."""
+    lines = SCRIPT.read_text().splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.startswith("cid=$(docker create"))
+    end = next(i for i, ln in enumerate(lines) if 'docker rm "$cid"' in ln and i > start)
+    block = "\n".join(lines[start:end + 1])
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    log = tmp_path / "docker.log"
+    (bin_ / "docker").write_text(
+        "#!/bin/sh\n"
+        f'echo "$*" >> {log}\n'
+        'case "$1" in create) echo cid123;; inspect) exit 1;; esac\n'
+    )
+    (bin_ / "sudo").write_text('#!/bin/sh\nexec "$@"\n')
+    for f in ("docker", "sudo"):
+        (bin_ / f).chmod(0o755)
+    out = subprocess.run(
+        ["/bin/bash", "-euc", block],
+        env={"PATH": f"{bin_}:/usr/bin:/bin", "WARM_IMAGE": "img:1", "WARM_TAG": "t",
+             "GVISOR_DIR": str(tmp_path / "gv"), "REPO": str(tmp_path)},
+        capture_output=True, text=True,
+    )
+    assert out.returncode != 0
+    assert any(ln.startswith("rm") and "cid123" in ln for ln in log.read_text().splitlines())

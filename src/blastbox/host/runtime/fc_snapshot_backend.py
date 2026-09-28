@@ -23,12 +23,18 @@ snapshot→restore→convert round-trip is pixel-identical to cold (see the spec
 from __future__ import annotations
 
 import logging
+import shutil
+import threading
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
-from blastbox.host.runtime.fc_snapshot import SnapshotBuildError, SnapshotRestoreError
+from blastbox.host.runtime.fc_snapshot import (
+    SnapshotBuildError,
+    SnapshotRestoreError,
+    SnapshotStale,
+)
 
 _log = logging.getLogger("blastbox.host.runtime.fc_snapshot_backend")
 
@@ -142,6 +148,17 @@ class FcSnapshotArtifact:
     outdisk_path: Path | None = None
 
 
+class _OrphanProc:
+    """A restore's firecracker process with no _Handle yet (it failed before one existed)."""
+
+    def __init__(self, proc: Any) -> None:
+        self.proc = proc
+
+    def kill(self) -> None:
+        self.proc.kill()
+        self.proc.wait(timeout=5)
+
+
 class FcSnapshotBackend:
     """Firecracker :class:`SnapshotBackend`.
 
@@ -157,6 +174,60 @@ class FcSnapshotBackend:
         """Delegate to the launcher, which owns the on-disk layout."""
         sweep = getattr(self._launcher, "sweep_orphan_generations", None)
         return sweep() if callable(sweep) else 0
+
+    @property
+    def _unreaped(self) -> "dict[str, Any]":
+        """workdir -> the handle (or orphaned process) of a failed restore whose kill failed."""
+        return self.__dict__.setdefault("_unreaped_d", {})
+
+    def restore_reclaimed(self, workdir: str) -> bool:
+        """Whether the firecracker of a failed restore whose kill failed is confirmed gone.
+
+        NON-BLOCKING: it runs on the pool tick, and a handle's kill() waits up to 5s after
+        terminate and 5s more after kill. The status is a poll(); the kill retry runs on its own
+        thread. An UNKNOWN workdir is not reclaimed -- the manager only asks about restores it
+        holds, and answering yes for one this backend never recorded released a pin under a
+        live VM.
+        """
+        handle = self._unreaped.get(str(workdir))
+        if handle is None:
+            return False
+        proc = getattr(handle, "proc", None)
+        if proc is not None and proc.poll() is not None:
+            self._unreaped.pop(str(workdir), None)
+            # The manager kept this workdir while the VM might still use it; now it is ours to
+            # remove -- or park with the launcher's retryable partials if that fails.
+            errs: list[str] = []
+            try:
+                shutil.rmtree(workdir, onerror=lambda fn, p, exc: errs.append(str(p)))
+            except Exception as exc:  # noqa: BLE001 -- e.g. RecursionError on a deep worker tree
+                # The entry has left _unreaped: an escape here made every later ask an unknown
+                # workdir, holding the generation pin forever. Parked instead, like any failure.
+                errs.append(f"{workdir}: {exc}")
+            if errs:
+                stranded = getattr(self._launcher, "_stranded_partials", None)
+                if isinstance(stranded, list):
+                    # Under the launcher ledger's lock: its sweep takes-and-clears the batch,
+                    # and an unlocked append racing that is silently erased.
+                    from blastbox.host.runtime.fc_snapshot_launcher import _STRANDED_LOCK
+
+                    with _STRANDED_LOCK:
+                        stranded.append(str(workdir))
+            return True
+        reaping = self.__dict__.setdefault("_reaping", set())
+        if str(workdir) not in reaping:
+            reaping.add(str(workdir))
+
+            def retry_kill() -> None:
+                try:
+                    handle.kill()
+                except Exception as exc:  # noqa: BLE001 -- asked again on a later tick
+                    _log.warning("fc_snapshot: retrying the kill of %s failed: %s", workdir, exc)
+                finally:
+                    reaping.discard(str(workdir))
+
+            threading.Thread(target=retry_kill, daemon=True, name="fc-restore-reclaim").start()
+        return False
 
     def discard(self, artifact: object) -> None:
         """Unlink a fully drained generation's files.
@@ -191,6 +262,9 @@ class FcSnapshotBackend:
                 _log.warning("fc_snapshot: could not unlink %s: %s", path, exc)
         if failed:
             raise OSError("could not unlink generation files: " + "; ".join(failed))
+        pin = getattr(self, "_pin", None)
+        if pin is not None:
+            pin.forget(artifact)
 
     def __init__(
         self,
@@ -234,9 +308,35 @@ class FcSnapshotBackend:
         # by the time a backend is constructed the FC prerequisites are present.
         return True
 
+    def _rootfs_pin(self) -> Any:
+        """The launcher's rootfs, pinned per checkpoint (None when the launcher names none)."""
+        pin = getattr(self, "_pin", None)
+        if pin is None:
+            rootfs = getattr(getattr(self._launcher, "_cfg", None), "fc_rootfs", "") or ""
+            if not rootfs:
+                return None
+            from blastbox.host.rootfs_stamp import RootfsPin
+
+            pin = self._pin = RootfsPin(str(rootfs), "firecracker")
+        return pin
+
     def boot_base(self) -> Any:
-        """Boot the base microVM (whose handle ``checkpoint(dest_dir)`` snapshots)."""
-        return self._launcher.boot_base()
+        """Boot the base microVM (whose handle ``checkpoint(dest_dir)`` snapshots).
+
+        The rootfs is checked HERE, where it is booted, and not only at tier selection: a
+        rootfs republished in place while the dispatcher runs is otherwise built into a base
+        unchecked (see rootfs_stamp.RootfsPin).
+        """
+        pin = self._rootfs_pin()
+        if pin is None:
+            return self._launcher.boot_base()
+        from blastbox.host.rootfs_stamp import RootfsStampError
+
+        try:
+            key = pin.before_boot()
+        except RootfsStampError as exc:
+            raise SnapshotBuildError(str(exc)) from exc
+        return pin.wrap(self._launcher.boot_base(), key)
 
     def restore_in(self, slot_workdir: Path, artifact: object) -> Any:
         """Spawn a fresh firecracker in ``slot_workdir`` and load+resume the FC
@@ -249,11 +349,40 @@ class FcSnapshotBackend:
                 f"FcSnapshotBackend.restore_in expected FcSnapshotArtifact, "
                 f"got {type(artifact).__name__}"
             )
-        handle = self._launcher.restore_in(slot_workdir, outdisk_src=artifact.outdisk_path)
+        pin = self._rootfs_pin()
+        if pin is not None:
+            from blastbox.host.rootfs_stamp import RootfsStampError
+
+            try:
+                pin.check_restore(artifact)
+            except RootfsStampError as exc:
+                raise SnapshotStale(str(exc)) from exc
+        try:
+            handle = self._launcher.restore_in(slot_workdir, outdisk_src=artifact.outdisk_path)
+        except BaseException as exc:
+            # A failure BEFORE any handle (the outdisk copy, say) whose terminate could not be
+            # confirmed: the manager holds the pin, so keep the process for restore_reclaimed().
+            orphan = getattr(exc, "orphan_proc", None)
+            if getattr(exc, "kill_failed", False) and orphan is not None:
+                self._unreaped[str(slot_workdir)] = _OrphanProc(orphan)
+            raise
         try:
             _restore_from_snapshot(
                 handle.api, str(artifact.snapshot_path), str(artifact.mem_path)
             )
+            # AGAIN, now that firecracker holds the drive open: the check above samples the
+            # PATH, and a publish landing between it and the snapshot load paired the old
+            # memory with the new disk. From here the VM keeps the inode it opened, so a later
+            # publish cannot reach it.
+            if pin is not None:
+                from blastbox.host.rootfs_stamp import RootfsStampError
+
+                try:
+                    # By the INODE firecracker actually holds, when /proc can say: a path check
+                    # cannot see a publish rolled back (A->B->A) while this restore opened B.
+                    pin.check_opened(artifact, getattr(getattr(handle, "proc", None), "pid", None))
+                except RootfsStampError as exc:
+                    raise SnapshotStale(f"{exc} (changed while this restore opened it)") from exc
         except BaseException as exc:
             # BaseException, not Exception: a KeyboardInterrupt, SystemExit or task cancellation
             # landing after the spawn skipped this cleanup entirely, leaving an unmanaged
@@ -268,5 +397,8 @@ class FcSnapshotBackend:
                 _log.warning("fc_snapshot: could not kill firecracker after a failed restore: %s",
                              kill_exc)
                 exc.kill_failed = True  # type: ignore[attr-defined]
+                # ...and KEEP the handle: the manager holds this generation's pin until
+                # restore_reclaimed() confirms the process is gone, and only the handle can.
+                self._unreaped[str(slot_workdir)] = handle
             raise
         return handle

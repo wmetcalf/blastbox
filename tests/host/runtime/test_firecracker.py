@@ -139,6 +139,14 @@ class _FakePopen:
             self._returncode = -9
 
 
+
+@pytest.fixture(autouse=True)
+def _no_rootfs_gate(monkeypatch):
+    """These tests pin config/argv/state-machine plumbing with rootfs paths that do not exist
+    (and assert them literally). The per-boot rootfs gate refuses a missing rootfs, which is
+    covered in test_rootfs_pin.py; here it is out of scope."""
+    monkeypatch.setattr(FirecrackerSlotRuntime, "_gate", lambda self: None)
+
 class _FakeSubprocessRunner:
     """Injectable subprocess runner that returns _FakePopen instances."""
 

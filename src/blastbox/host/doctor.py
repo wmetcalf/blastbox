@@ -24,7 +24,8 @@ import re
 import shutil
 import subprocess
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from pathlib import Path
 
 Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
 
@@ -45,6 +46,9 @@ _PROBE = (
 
 UNKNOWN = "unknown"
 NOPKG = "NOPKG"
+#: An artifact whose stamp was READ and records no blastbox (a pure-JVM guest). Known, but
+#: exempt from every version comparison -- there is no version to compare.
+NO_BLASTBOX = "(no blastbox)"
 _PROBEFAIL = "PROBEFAIL"
 # Probe output is attacker-influenced (a compromised worker controls stdout), so
 # it is never printed raw.
@@ -347,3 +351,319 @@ def drift(containers: list[Container]) -> dict[str, set[str]]:
         if c.known:
             by_project.setdefault(c.project, set()).add(c.version)
     return by_project
+
+@dataclass
+class Artifact:
+    """One warm rootfs and what it says about itself.
+
+    `Container` answers "what blastbox is this process running". This answers the
+    question `Container` structurally cannot: a rootfs is a FILE (or a directory
+    tree), not a process, and `docker export` drops the image config on the way
+    out -- so the labels `stamp.py` attaches never reach it. Three engines drifted
+    for two months inside exactly that blind spot.
+    """
+
+    path: str
+    version: str                      # or UNKNOWN
+    runtime: str = ""                 # firecracker | gvisor, from the stamp
+    arch: str = ""
+    cpu_vendor: str = ""
+    image: str = ""
+    exported_at: str = ""
+    #: The compose project this rootfs serves, when given as `--rootfs PROJECT=PATH`. Paired,
+    #: it is checked against THAT project's containers; unpaired, only against the host's
+    #: versions as a whole -- where a stale rootfs passes if any product runs its version.
+    project: str = ""
+    #: The stamp was READ. Its version then stands as written -- even the literal "unknown",
+    #: which would otherwise collide with the UNKNOWN sentinel and read as "could not look".
+    stamped: bool = False
+    #: The stamp was read and records NO blastbox (a pure-JVM worker). A flag, not a version
+    #: string: the stamp is image-written text, and one literally reading NO_BLASTBOX must stay
+    #: a version -- compared, and refused as the boot gate refuses it.
+    no_blastbox: bool = False
+    detail: str = ""                  # why it is UNKNOWN, or what disagrees
+
+    @property
+    def known(self) -> bool:
+        return self.stamped or self.version != UNKNOWN
+
+
+def survey_rootfs(paths: Sequence[str]) -> list[Artifact]:
+    """Read the stamp on each warm artifact. Never raises on a bad path.
+
+    An artifact that cannot be read reports UNKNOWN with the reason, never a
+    version -- the same rule `_version_in` applies to a container that cannot be
+    exec'd: "I could not look" and "it is absent" must not collapse together.
+    """
+    from blastbox.host import rootfs_stamp as _rfs
+
+    out: list[Artifact] = []
+    for spec in paths:
+        project, path = _pairing(spec)
+        try:
+            stamp = _rfs.read(path)
+        except Exception as exc:  # noqa: BLE001 - a survey never dies on one row
+            out.append(Artifact(path=path, version=UNKNOWN, detail=str(exc).strip(),
+                                project=project))
+            continue
+        plat = _rfs.platform_of(stamp)
+        # Every field below comes from an artifact this host did not create: stripped of
+        # control characters, as container output is, so a stamp cannot forge the lines
+        # after it or drive the operator's terminal. `path` is the operator's own argument.
+        # The values the BOOT GATE judges: already made display-safe at parse (control and
+        # format characters stripped). NOT _sanitise, whose allowlist DELETES characters and so
+        # changed what was compared -- "0.1.4/2" became "0.1.42" and read OK here while the
+        # gate refused the raw value. Whitespace-only means no blastbox, exactly as the gate
+        # treats it.
+        version = stamp.blastbox_version.strip()
+        out.append(
+            Artifact(
+                path=path,
+                # READ, and definitively without blastbox (a pure-JVM worker): the boot gate
+                # admits it on arch/runtime, so doctor must not call it unreadable.
+                version=version or NO_BLASTBOX,
+                no_blastbox=not version,
+                runtime=plat.runtime,
+                arch=plat.arch,
+                cpu_vendor=_sanitise(plat.cpu_vendor),
+                # Already display-safe (rootfs_stamp sanitises at parse). NOT _sanitise: its
+                # allowlist drops "/" and "@", which turns a digest reference into a name
+                # that points at no image.
+                image=stamp.image,
+                exported_at=_sanitise(stamp.exported_at),
+                detail="" if version else "no blastbox in the guest; version not checked",
+                project=project,
+                stamped=True,
+            )
+        )
+    return out
+
+
+def _pairing(spec: str) -> tuple[str, str]:
+    """`PROJECT=PATH` -> (project, path); a bare path is unpaired.
+
+    Only a leading `name=` with no path separator in `name` counts, so a path that merely
+    contains `=` is never split.
+    """
+    # A path that exists as given is a path, however many `=` it contains.
+    from pathlib import Path  # noqa: PLC0415
+
+    try:
+        exists = Path(spec).exists()
+    except OSError:
+        # EACCES / ENAMETOOLONG: unknowable here. Treat as a path; survey_rootfs then reports
+        # the real reason as an UNKNOWN row rather than dying before its own try.
+        return "", spec
+    if exists:
+        return "", spec
+    head, sep, tail = spec.partition("=")
+    if sep and head and "/" not in head and tail:
+        return head, tail
+    return "", spec
+
+
+def _release(version: str) -> object:
+    """A version as a comparable RELEASE: `+local` dropped, PEP 440 equality.
+
+    The tier's own guest check (rootfs_stamp.compare_to_host) compares releases, so doctor
+    must too -- or the two contradict each other about the same artifact (`0.1.42+gabc`
+    boots, and doctor calls it a guest that never signals READY).
+    """
+    base = (version or "").split("+", 1)[0].strip()
+    try:
+        from packaging.version import InvalidVersion, Version  # noqa: PLC0415
+
+        return Version(base)
+    except (ImportError, InvalidVersion):
+        return base
+
+
+def _build(version: str) -> object:
+    """A version as a comparable BUILD: PEP 440 equality, local suffix KEPT.
+
+    `0.2` and `0.2.0` are one build; `0.1.42+ga` and `0.1.42+gb` are two (the CLI help says a
+    local suffix identifies a different build). Container drift and --expect compare builds;
+    only the guest-compatibility check drops the suffix (see _release).
+    """
+    try:
+        from packaging.version import InvalidVersion, Version  # noqa: PLC0415
+
+        return Version((version or "").strip())
+    except (ImportError, InvalidVersion):
+        return (version or "").strip()
+
+
+def artifact_problems(artifacts: Sequence[Artifact]) -> list[tuple[Artifact, str]]:
+    """Each artifact that will not run on THIS host, with the reason.
+
+    Asked of the live machine rather than of the other artifacts: two rootfs
+    agreeing with each other and both disagreeing with the host is the fleet
+    state that reads as healthy and serves nothing.
+    """
+    from blastbox.host import platform_id as _plat
+
+    problems: list[tuple[Artifact, str]] = []
+    for art in artifacts:
+        if not art.known:
+            continue
+        recorded = _plat.HostPlatform(
+            arch=art.arch, cpu_vendor=art.cpu_vendor, runtime=art.runtime
+        )
+        # The tier this artifact would be booted BY, from its shape -- not from its own claim.
+        # A live platform built from the stamp's runtime compared that claim with itself, so a
+        # directory stamped "firecracker" passed here and was refused at boot.
+        try:
+            expected = "gvisor" if Path(art.path).is_dir() else "firecracker"
+        except OSError:
+            expected = art.runtime
+        live = _plat.host_platform(runtime=expected)
+        fatal = _plat.refusals(_plat.compare(recorded, live))
+        if fatal:
+            problems.append((art, _plat.summarise(fatal)))
+    return problems
+
+
+def verdict(
+    containers: Sequence[Container],
+    artifacts: Sequence[Artifact] = (),
+    *,
+    expect: str | None = None,
+    allow_mixed: bool = False,
+    docker_error: str = "",
+) -> list[str]:
+    """Every reason the fleet is NOT ok under the given policy; empty means ok.
+
+    The ONE place `--expect` and `--allow-mixed` are applied. The command used to decide
+    through a chain of early returns, each seeing part of the policy: JSON mode ignored both
+    flags, `--allow-mixed` returned before an unreadable artifact was judged, and a
+    rootfs-only fleet was never checked for versions at all. Versions are compared as
+    releases (see _release), the same way the tier's own guest check does.
+    """
+    problems: list[str] = []
+    if docker_error:
+        # "Could not look" is never "nothing is wrong": artifacts alone cannot vouch for
+        # containers nobody inspected.
+        problems.append(f"containers could not be inspected: {docker_error}")
+    unknown_c = [c.name for c in containers if not c.known]
+    unknown_a = [a.path for a in artifacts if not a.known]
+    if unknown_c:
+        problems.append(f"{len(unknown_c)} container(s) could not be inspected: "
+                        + ", ".join(unknown_c))
+    if unknown_a:
+        problems.append(f"{len(unknown_a)} artifact(s) could not be read: "
+                        + ", ".join(unknown_a))
+    for art, why in artifact_problems(artifacts):
+        problems.append(f"unbootable here: {art.path}: {why}")
+    for project, versions in sorted(drift(list(containers)).items()):
+        if len({_build(v) for v in versions}) > 1:
+            # Within ONE compose project there is no legitimate mix; --allow-mixed is for
+            # separate products on one host.
+            problems.append(f"compose project {project} runs {', '.join(sorted(versions))}")
+    if not containers and not artifacts:
+        if expect:
+            problems.append(f"expected {expect}, but found nothing to verify")
+        return problems
+    known_c = [c for c in containers if c.known]
+    known_a = [a for a in artifacts if a.known and not a.no_blastbox]
+    if expect:
+        # Containers must be the exact BUILD named; an artifact is judged by release, the way
+        # the tier boots it.
+        wrong = sorted({c.name for c in known_c if _build(c.version) != _build(expect)}
+                       | {a.path for a in known_a if _release(a.version) != _release(expect)})
+        if wrong:
+            problems.append(f"expected {expect}, but: " + ", ".join(wrong))
+    host_releases = {_release(c.version) for c in known_c}
+    # The GUEST CHECK applies whatever --allow-mixed says: that flag is exactly what a
+    # multi-product host passes, so it cannot also be what switches this off.
+    for art in known_a:
+        if art.project:
+            mine = {_release(c.version) for c in known_c if c.project == art.project}
+            if not mine:
+                if docker_error:
+                    continue
+                # Pairing asserts which containers vouch for this rootfs. None found --
+                # scaled to zero, or a project label that could not be read -- is "could not
+                # look", which this command never reports as healthy. (With docker down that
+                # is already the one problem; repeating it per rootfs blames the pairing.)
+                problems.append(
+                    f"{art.path} is paired with project {art.project}, but no inspectable "
+                    "container of that project is running to check it against")
+            elif _release(art.version) not in mine:
+                problems.append(
+                    f"{art.path} records {art.version} but project {art.project} runs "
+                    f"{', '.join(sorted(str(v) for v in mine))} -- a guest that does not "
+                    "match its host boots and never signals READY")
+        elif host_releases and _release(art.version) not in host_releases:
+            problems.append(
+                f"{art.path} records {art.version} but no container here runs it "
+                f"({', '.join(sorted(str(v) for v in host_releases))}) -- a guest that does "
+                "not match its host boots and never signals READY")
+    if expect and not known_c and not known_a:
+        # Nothing VERSIONED was inspected (only package-free artifacts): --expect has nothing to
+        # hold to, and a vacuous pass would read as confirmation.
+        problems.append(f"expected {expect}, but nothing versioned was found to verify")
+    if not known_c:
+        # Regardless of --expect: that is the operator's target, not what this host runs --
+        # and the boot gate compares with the host. Asserting the new release with --expect
+        # before upgrading the host must not turn its refusal into OK.
+        # Nothing running to compare with (a bare-metal/systemd dispatcher, a stack scaled to
+        # zero): compare with THIS host's blastbox, as the boot gate would -- not "no comparator,
+        # so OK" for a stale stamp.
+        import blastbox  # noqa: PLC0415
+
+        here = _release(str(getattr(blastbox, "__version__", "") or ""))
+        for art in known_a:
+            if not art.project and _release(art.version) != here:
+                problems.append(
+                    f"{art.path} records {art.version} but this host runs "
+                    f"{getattr(blastbox, '__version__', '?')} -- a guest that does not match its "
+                    "host boots and never signals READY")
+    if not allow_mixed:
+        host_builds = {_build(c.version) for c in known_c}
+        if len(host_builds) > 1:
+            problems.append(f"containers run {len(host_builds)} versions: "
+                            + ", ".join(sorted(str(v) for v in host_builds)))
+        a_releases = {_release(a.version) for a in known_a}
+        if not host_releases and len(a_releases) > 1:
+            problems.append(f"artifacts record {len(a_releases)} versions: "
+                            + ", ".join(sorted(str(v) for v in a_releases)))
+    return problems
+
+
+def fleet_report(
+    containers: Sequence[Container], artifacts: Sequence[Artifact] = ()
+) -> dict:
+    """The whole fleet as one JSON-able object, for monitoring.
+
+    Everything a check needs without parsing the human output: per-container and
+    per-artifact versions, the drift buckets, and the artifacts this host cannot
+    boot. `ok` is false when anything is unknown, drifted, or unbootable --
+    deliberately strict, because the failure this exists for looked fine.
+    """
+    versions = sorted({c.version for c in containers if c.known} |
+                      {a.version for a in artifacts if a.known and not a.no_blastbox})
+    unknown = [c.name for c in containers if not c.known] + [
+        a.path for a in artifacts if not a.known
+    ]
+    # By RELEASE, as verdict() judges it: "0.2" and "0.2.0" are one release, and reporting them
+    # as drift beside ok=true gave monitoring a contradictory payload.
+    mixed = {p: sorted(v) for p, v in drift(list(containers)).items()
+             if len({_build(x) for x in v}) > 1}
+    unbootable = [
+        {"path": a.path, "reason": why} for a, why in artifact_problems(artifacts)
+    ]
+    return {
+        "versions": versions,
+        "containers": [asdict(c) for c in containers],
+        "artifacts": [asdict(a) for a in artifacts],
+        "drift": mixed,
+        "unknown": unknown,
+        "unbootable": unbootable,
+        # Health judged as verdict() judges it: containers by BUILD, artifacts by RELEASE
+        # (the guest check) -- not one raw string set.
+        # verdict() itself, at its strictest defaults: a second, hand-copied health rule drifted
+        # from it (it ignored --rootfs pairings, so an artifact no container of ITS project
+        # vouched for reported ok).
+        "ok": not verdict(containers, artifacts),
+    }
+

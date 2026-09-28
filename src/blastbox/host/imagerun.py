@@ -38,6 +38,9 @@ from pathlib import Path, PurePosixPath
 
 from blastbox.host import images as _images
 from blastbox.host.images import ImageSpec, Plan, RootfsSpec
+from blastbox.host import platform_id as _platform_id
+from blastbox.host import rootfs_stamp as _rootfs_stamp
+from blastbox.host.stamp import git_revision as _stamp_git_revision
 from blastbox.host.stamp import StampError
 from blastbox.host.stamp import repo_digest_ref as _repo_digest_ref
 from blastbox.host.stamp import build_args as _stamp_flags
@@ -200,6 +203,26 @@ def _default_runner(
         capture_output=capture_output,
         stdout=stdout,  # type: ignore[arg-type]
     )
+
+
+def _probe_runner(run: Runner) -> Callable[[Sequence[str]], subprocess.CompletedProcess[str]]:
+    """``run`` for a probe that EXECUTES an image, bounded in time when it is the real runner.
+
+    The probe runs code whose provenance is the thing in question; _default_runner has no
+    timeout, so one that never exits hung staging with its temporary tree and container still
+    present. Bounded like the stamp module's own runner. A caller-supplied runner (a test
+    double, or a caller with its own policy) is used as given.
+    """
+    if run is not _default_runner:
+        return lambda argv: run(argv, capture_output=True)
+
+    def bounded(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(  # noqa: S603
+            list(argv), text=True, check=False, capture_output=True,
+            timeout=_rootfs_stamp.STAMP_TREE_TIMEOUT_S,
+        )
+
+    return bounded
 
 
 def _redact_argv(argv: Sequence[str]) -> list[str]:
@@ -1330,6 +1353,102 @@ class _Staged:
     published_identity: str = ""
 
 
+
+def _blastbox_version() -> str:
+    """The blastbox this exporter is running, as the guest will report it.
+
+    Read from the INSTALLED distribution, like `doctor` does: a dev wheel
+    carries a PEP 440 local suffix and that suffix is the point.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("blastbox")
+    except PackageNotFoundError:  # pragma: no cover - blastbox is always installed here
+        return ""
+
+
+def _source_revision(plan: "Plan") -> str:
+    """The engine repo revision, or "" when the tree is not a checkout.
+
+    Never raises: the stamp is diagnostic, and a rootfs that records no revision
+    is strictly better than an export that failed because it could not find one.
+    The build's own stamping already refuses an unrecorded revision.
+    """
+    try:
+        return _stamp_git_revision(plan.root)
+    except Exception:  # noqa: BLE001 - diagnostic only
+        return ""
+
+
+#: `docker inspect .Architecture` -> the `uname -m` spelling the live host reports.
+_DOCKER_ARCH = {
+    "amd64": "x86_64",
+    "arm64": "aarch64",
+    "386": "i686",
+    "arm": "armv7l",
+}
+
+
+def _image_provenance(plan: "Plan", source: str, run: Runner) -> tuple[str, str, str]:
+    """(blastbox version, revision, architecture) as the IMAGE records them.
+
+    The rootfs is the image, so it is described by the image -- not by the process
+    exporting it. An older CLI building a newly pinned release (the normal upgrade path)
+    stamped its own version, and the upgraded host then refused a correctly built guest;
+    an image whose `source_repo` lies outside the plan root recorded the plan's commit,
+    one that need not contain its Dockerfile; and an arm64 image exported on x86_64 under
+    emulation was stamped x86_64. Falls back to the exporter's values only for a field the
+    image does not record.
+    """
+    from blastbox.host.stamp import UNKNOWN as _UNKNOWN
+
+    version = revision = ""
+    try:
+        # _probe_runner: captured -- this module's runner returns stdout only when asked, and
+        # without it stamp.read() saw None and every production export silently fell back to the
+        # exporter's version -- and bounded in time, like every other probe of the image.
+        img = _read_stamp(source, _probe_runner(run))
+        version = "" if img.blastbox in ("", _UNKNOWN) else img.blastbox
+        revision = "" if img.revision in ("", _UNKNOWN) else img.revision
+    except Exception as exc:  # noqa: BLE001 - any failure to read it is a failed export
+        # FAIL, never manufacture. Falling back to this exporter's version and the plan's
+        # revision stamped an older CLI's version on a newer guest -- admitted by the old host,
+        # refused by the correctly upgraded one.
+        raise BuildError(
+            f"cannot read {source}'s own provenance (its blastbox label) to stamp the rootfs: "
+            f"{exc}"
+        ) from exc
+    arch = ""
+    proc = run(
+        ["docker", "inspect", "--type", "image", source, "--format", "{{.Architecture}}"],
+        capture_output=True,
+    )
+    if proc.returncode == 0:
+        raw = (proc.stdout or "").strip()
+        arch = _DOCKER_ARCH.get(raw, raw)
+    # An image that records no version gets none: the guest check then refuses it (fail
+    # closed) instead of trusting a version this exporter made up.
+    return (version, revision, arch)
+
+
+def _export_platform(spec: RootfsSpec, arch: str = "") -> "_platform_id.HostPlatform":
+    """What this artifact is bound to: the image's architecture and its tier.
+
+    An ext4 is booted by Firecracker and a directory tree is restored by runsc,
+    so `kind` names the runtime the artifact is for -- which is what stops an FC
+    rootfs from being offered to a gVisor pool and failing as a restore error.
+    NOTHING about the exporting machine: a rootfs holds no CPU state (the snapshot is
+    taken later, on the deploying host), so recording the exporter's CPU vendor made a
+    correct rootfs refuse to boot on a fleet of the other vendor.
+    """
+    runtime = "firecracker" if spec.kind == "ext4" else "gvisor"
+    # "" when the image could not be inspected -- NEVER the export host's arch: an arm64 image
+    # exported under emulation on x86_64 was stamped x86_64, so the wrong fleet passed the
+    # check and the right one was refused. An unrecorded arch is simply not compared.
+    return _platform_id.HostPlatform(arch=arch, runtime=runtime)
+
+
 def stage_rootfs(
     plan: Plan,
     spec: RootfsSpec,
@@ -1353,7 +1472,17 @@ def stage_rootfs(
     image = f"{spec.image}:{tag}"
     # Extracted by the ID verification resolved, when there is one: a tag is
     # mutable, and re-resolving it here can hand us an image nothing checked.
-    source = verified_id or image
+    # ...and with no verified id (the direct export_rootfs() API), resolve the tag ONCE, here:
+    # extracting the mutable tag and then reading provenance from it again let a retag in
+    # between pair image A's tree with image B's stamp.
+    source = verified_id or _image_id(image, run)
+    if not source:
+        # NEVER fall back to the mutable tag: a transient inspect failure followed by a
+        # successful create reopened exactly the retag race this resolution closes.
+        raise BuildError(
+            f"cannot resolve {image} to an immutable image id; refusing to export from a "
+            "mutable tag"
+        )
     dest = Path(spec.resolved_dest(env))
     # Asked of the TEMPLATE, like the dry run and the plan validator. This is
     # the last of the three and the one that actually guards the write, so
@@ -1419,6 +1548,84 @@ def stage_rootfs(
         _normalize_root(staging, priv, run)
         _check_requires(staging, spec, image)
         _check_no_setuid(staging, spec, image, priv, run)
+        # AFTER the audits and BEFORE the filesystem: the stamp describes a tree
+        # that has already been checked, and `docker export` drops image config
+        # so a label here would not survive. This is the only record that
+        # survives into the thing a warm tier actually boots.
+        img_version, img_revision, img_arch = _image_provenance(plan, source, run)
+        if not img_arch:
+            # REFUSE: an empty arch is not compared at boot (absent on one side), so this new
+            # artifact would skip the arch check entirely -- an emulated arm64 image exported on
+            # x86_64 selected for an incompatible host. Guessing the exporter's is worse.
+            raise BuildError(
+                f"cannot read the architecture of {image} ({source}); refusing to stamp a rootfs "
+                "the boot gate could not check"
+            )
+        if not img_version and not verified_id:
+            # No label: probe what the image actually has installed and stamp THAT, rather
+            # than publish an artifact whose version is unknown.
+            from blastbox.host.doctor import NOPKG, version_in_image  # noqa: PLC0415
+
+            # Bounded like the labelled path: this EXECUTES the image's python.
+            try:
+                installed, detail = version_in_image(source, _probe_runner(run))
+            except subprocess.TimeoutExpired as exc:
+                raise BuildError(
+                    f"{image}: the installed-blastbox probe timed out ({exc}); refusing to "
+                    "export an unchecked guest"
+                ) from exc
+            if _rootfs_stamp._is_version(installed):
+                img_version = installed
+            elif installed != NOPKG:
+                # NOPKG is definitive (no blastbox: a pure-JVM worker) and stamps none. Anything
+                # else means the probe could not LOOK -- stamping that empty would let a
+                # transient failure publish an unchecked Python worker as a "pure-JVM" guest.
+                raise BuildError(
+                    f"{image}: its installed blastbox version could not be verified "
+                    f"({detail or installed}); refusing to export an unchecked guest"
+                )
+        elif img_version:
+            # Checked against what the image ACTUALLY has installed before the label is written
+            # anywhere a host will trust. The direct export_rootfs() path skipped run_plan's
+            # verification entirely; the verified path passes only the ID here, so verify_built()'s
+            # "no package" (None) verdict never reached the stamp and the label was written as a
+            # version the guest does not have.
+            try:
+                agrees, detail = _verify_contents(source, _probe_runner(run))  # type: ignore[arg-type]
+            except subprocess.TimeoutExpired as exc:
+                raise BuildError(
+                    f"{image}: the installed-blastbox probe timed out ({exc}); refusing to "
+                    "export an unchecked guest"
+                ) from exc
+            # TRI-STATE, as verify_built() treats it: None means no blastbox package to compare
+            # (a pure-JVM worker), which is valid -- and then the label (often inherited or set
+            # at build time) describes nothing in the guest, so it is not stamped either.
+            if agrees is None:
+                img_version = ""
+            if agrees is False:
+                raise BuildError(
+                    f"{image}: its blastbox label cannot be trusted for the rootfs stamp: "
+                    f"{detail or 'the installed version could not be read'}"
+                )
+        try:
+            _rootfs_stamp.write_into_tree(
+                staging,
+                _rootfs_stamp.RootfsStamp(
+                    blastbox_version=img_version,
+                    image=image,
+                    image_id=verified_id or (source if source != image else ""),
+                    revision=img_revision,
+                    exported_at=_rootfs_stamp.now_iso(),
+                    platform=_export_platform(spec, img_arch).to_dict(),
+                ),
+                priv=priv,
+                run=run,
+            )
+        except _rootfs_stamp.RootfsStampError as exc:
+            # A BUILD failure, with its reason: the CLI reports BuildError, and a hostile image
+            # refused here (a symlink or device at the stamp path) otherwise surfaced as a
+            # traceback instead of the command's normal diagnostic.
+            raise BuildError(f"cannot stamp the rootfs exported from {image}: {exc}") from exc
 
         staged_size = 0
         if spec.kind == "dir":

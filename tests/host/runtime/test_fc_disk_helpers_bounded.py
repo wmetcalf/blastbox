@@ -268,10 +268,14 @@ class TestWhatTheBoundsChanged:
 
         slot_wd = tmp_path / "slot"
         slot_wd.mkdir()
-        with pytest.raises(subprocess.TimeoutExpired):
+        with pytest.raises(subprocess.TimeoutExpired) as info:
             fl.FcSnapshotLauncher.restore_in(launcher, slot_wd)
 
-        assert str(slot_wd) in launcher._stranded_partials, (
+        # Retained by HANDING THE PROCESS to the backend (orphan_proc), which removes the workdir
+        # only once the exit is confirmed. NOT via the path-only sweep: that deleted the
+        # workdir under the live firecracker (marla run-98, ledger #1).
+        assert getattr(info.value, "kill_failed", False) is True
+        assert getattr(info.value, "orphan_proc", None) is not None, (
             "an unconfirmed firecracker was forgotten; nothing can account for or reap it"
         )
 

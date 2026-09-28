@@ -44,14 +44,16 @@ import re
 import selectors
 import shutil
 import socket
+import stat as _stat
 import subprocess
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from blastbox.errors import HostDiskTimeout
-from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Callable, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from blastbox.worker.warm import WarmJobSpec
@@ -84,6 +86,34 @@ __all__ = [
 
 
 _log = logging.getLogger("blastbox.host.runtime.firecracker")
+
+def _drive_opened(pid: int, slot_dir: "Path | str", excluded: "Sequence[str]") -> bool:
+    """Whether firecracker ``pid`` POSITIVELY holds its rootfs drive open.
+
+    Its only regular files outside the slot's own directory (config, log, outdisk, inputs) are
+    the kernel/initrd -- listed in ``excluded`` -- and the rootfs, whatever it is now called (a
+    rollback leaves it under a backup name). Observed, not inferred from elapsed time: a
+    starved start killed on a timer was killed again on every respawn under the same load.
+    """
+    base = os.path.realpath(str(slot_dir)) + os.sep
+    skip = {os.path.realpath(p) for p in excluded if p}
+    try:
+        fds = list(Path(f"/proc/{pid}/fd").iterdir())
+    except OSError:
+        return False
+    for fd in fds:
+        try:
+            if not _stat.S_ISREG(os.stat(fd).st_mode):
+                continue
+            target = os.readlink(fd)
+        except OSError:
+            continue
+        if target.endswith(" (deleted)"):
+            target = target[: -len(" (deleted)")]
+        if target.startswith(base) or target in skip:
+            continue
+        return True
+    return False
 
 # ---------------------------------------------------------------------------
 # Environment variable keys
@@ -342,6 +372,32 @@ def guest_kernel_version(vmlinux_path: str) -> tuple[int, int] | None:
     return None
 
 
+
+def _guest_refusal(cfg: object) -> str:
+    """The rootfs guest problem behind a failed availability check, or "".
+
+    Re-read only on the failure path, so a tier refused for a stale guest says so in the
+    exception that reaches the crash-loop output -- not "check the binary and /dev/kvm".
+    """
+    rootfs = getattr(cfg, "fc_rootfs", "") or ""
+    if not rootfs or not Path(rootfs).is_file():
+        return ""
+    try:
+        return rootfs_guest_problem(rootfs)
+    except Exception:  # noqa: BLE001 - diagnostic only
+        return ""
+
+
+def rootfs_guest_problem(rootfs: str) -> str:
+    """Why this host must not boot ``rootfs``, or "" when it may.
+
+    See :func:`blastbox.host.rootfs_stamp.guest_problem`, which the gVisor tier shares.
+    """
+    from blastbox.host import rootfs_stamp as _rfs
+
+    return _rfs.guest_problem(rootfs, "firecracker")
+
+
 def firecracker_available(cfg: FCConfig | None = None) -> bool:
     """Return True iff all FC prerequisites are present on this host.
 
@@ -384,6 +440,21 @@ def firecracker_available(cfg: FCConfig | None = None) -> bool:
         # Rootfs
         if not cfg.fc_rootfs or not Path(cfg.fc_rootfs).is_file():
             _log.debug("firecracker_available=False: rootfs %r not found", cfg.fc_rootfs)
+            return False
+
+        # Guest/host agreement. The rootfs EXISTING says nothing about whether the
+        # guest inside it can talk to this host: that is precisely the state three
+        # engines were in on toolz2 for two months, booting fine and timing out
+        # every job at 300s because the guest was a different blastbox.
+        #
+        # Severity is split deliberately. A rootfs with NO stamp predates this
+        # check -- refusing it would take every existing deployment offline on
+        # upgrade -- so it warns and is allowed. A rootfs that DOES carry a stamp
+        # and disagrees with this host is a definite fault with a known remedy,
+        # and failing the tier here costs one log line instead of 300s per job.
+        problem = rootfs_guest_problem(cfg.fc_rootfs)
+        if problem:
+            _log.error("firecracker_available=False: %s", problem)
             return False
 
         # Version (probe LAST — only spawn the subprocess once the cheap checks pass).
@@ -1188,6 +1259,48 @@ class FirecrackerSlotRuntime:
                 with self._stranded_lock:
                     self._stranded_scratch.append(path)   # still stuck; retry next spawn
 
+    def _gate(self) -> Any:
+        """The rootfs guest gate for this tier (built on first use; None without a rootfs)."""
+        gate = getattr(self, "_guest_gate", None)
+        rootfs = getattr(self._cfg, "fc_rootfs", "") or ""
+        if gate is None and rootfs:
+            from blastbox.host.rootfs_stamp import GuestGate
+
+            gate = self._guest_gate = GuestGate(rootfs, "firecracker")
+        return gate
+
+    def _guest_problem(self) -> str:
+        """The cached rootfs guest check (one stat per call; re-read on a republish)."""
+        gate = self._gate()
+        return gate.problem() if gate is not None else ""
+
+    def _guest_checked(self) -> "tuple[str, tuple[int, ...] | None]":
+        """(problem, the rootfs identity that verdict is for)."""
+        gate = self._gate()
+        return gate.checked() if gate is not None else ("", None)
+
+    def prepare(self) -> bool:
+        """Whether this tier can spawn this tick -- False while the rootfs guest is refused.
+
+        Refusing only inside spawn() spun the pool's spawn loop at the token-bucket rate with a
+        traceback per attempt (~690k error lines a day); "not ready" is the pool's quiet no.
+        Logged once per distinct refusal."""
+        from blastbox.host.rootfs_stamp import PENDING
+
+        # NEVER blocks: prepare() runs on the pool tick, and the stamp read (debugfs) can take
+        # its whole deadline on a malformed image. Not ready until the verdict exists.
+        gate = self._gate()
+        problem = gate.problem_nowait() if gate is not None else ""
+        if problem == PENDING:
+            return False
+        self._refused_logged: str | None
+        if problem and getattr(self, "_refused_logged", None) != problem:
+            self._refused_logged = problem
+            _log.error("firecracker tier not ready: %s", problem)
+        elif not problem:
+            self._refused_logged = None
+        return not problem
+
     def spawn(self) -> Slot:
         """Create a scratch dir, write fc-config.json, launch Firecracker.
 
@@ -1206,6 +1319,16 @@ class FirecrackerSlotRuntime:
         # A storage incident that stops mkfs also stops the rmtree that follows it, and
         # nothing else in this tier would ever come back for them.
         self._sweep_stranded_scratch()
+
+        # The GUEST, on every spawn -- AFTER the sweep, which must run whatever else refuses.
+        # This tier boots the rootfs fresh each time, and one republished in place since tier
+        # selection would otherwise boot unchecked and time out every job. prepare() reports
+        # the same verdict to the pool first, so a refusal here is the backstop, not the path.
+        problem, checked_key = self._guest_checked()
+        if problem:
+            from blastbox.host.rootfs_stamp import RootfsStampError
+
+            raise RootfsStampError(problem)
 
         slot_id = str(uuid.uuid4())
         slot_dir = self._scratch_root / slot_id
@@ -1353,6 +1476,13 @@ class FirecrackerSlotRuntime:
 
         with self._lock:
             self._procs[slot_id] = fc_proc
+            # The identity that was CHECKED for this boot. Firecracker opens the rootfs after
+            # the check, so is_ready() -- READY is the first point the disk is known open --
+            # refuses a slot whose rootfs changed in between (see is_ready).
+            self._rootfs_keys: dict[str, "tuple[int, ...] | None"]
+            if not hasattr(self, "_rootfs_keys"):
+                self._rootfs_keys = {}
+            self._rootfs_keys[slot_id] = checked_key
 
         # Stamp the generation this slot was SPAWNED from; see Slot.ack_generation.
 
@@ -1365,12 +1495,66 @@ class FirecrackerSlotRuntime:
         return slot
 
     def is_ready(self, slot: Slot) -> bool:
-        """Delegate to the injected ReadySignal."""
+        """Delegate to the injected ReadySignal -- and refuse a slot whose rootfs changed
+        between its spawn-time check and the boot that opened it."""
         try:
-            return self._ready_signal.is_ready(slot)
+            ready = self._ready_signal.is_ready(slot)
         except Exception as exc:  # noqa: BLE001
             _log.debug("fc.is_ready error slot_id=%s: %s", slot.slot_id, exc)
             return False
+        # REGARDLESS of readiness: a mismatched guest may never signal READY at all, and gating
+        # on it left that slot to the whole warm-up timeout instead of rejecting it at once.
+        # STRICT once READY -- or once firecracker is SEEN holding its drive. Lenient before
+        # that, or a rollback A->B->A (B held under a backup name) hid B for the whole warm-up
+        # timeout; but only a positive observation, never elapsed time, makes it strict.
+        opened = False
+        if not ready and getattr(self, "_rootfs_keys", {}).get(slot.slot_id) is not None:
+            with self._lock:
+                fc_proc = self._procs.get(slot.slot_id)
+            pid = (getattr(fc_proc, "pid", None)
+                   or getattr(getattr(fc_proc, "proc", None), "pid", None))
+            if isinstance(pid, int) and pid > 0:
+                opened = _drive_opened(pid, self._scratch_root / slot.slot_id,
+                                       (self._cfg.fc_kernel,))
+        if self._rootfs_changed_since_spawn(slot.slot_id, strict=ready or opened):
+            # We cannot tell whether the publish landed before or after firecracker opened the
+            # disk, so do not promote a guest that may never have been checked: kill it, and
+            # the pool reaps and respawns against the new (checked) rootfs.
+            _log.warning("fc.rootfs_changed_before_ready slot_id=%s: killing the slot rather "
+                         "than promote a guest that may not have been checked", slot.slot_id)
+            with self._lock:
+                fc_proc = self._procs.get(slot.slot_id)
+            if fc_proc is not None:
+                try:
+                    fc_proc.kill()
+                except Exception as exc:  # noqa: BLE001 -- reap retries teardown
+                    _log.warning("fc.kill_stale_slot failed slot_id=%s: %s", slot.slot_id, exc)
+            return False
+        return ready
+
+    def _rootfs_changed_since_spawn(self, slot_id: str, *, strict: bool = False) -> bool:
+        keys = getattr(self, "_rootfs_keys", {})
+        if slot_id not in keys:
+            return False
+        key = keys[slot_id]
+        if key is None:
+            return False
+        from blastbox.host.rootfs_stamp import file_identity, opened_matches
+
+        rootfs = getattr(self._cfg, "fc_rootfs", "") or ""
+        # By the inode firecracker actually HOLDS when /proc can say -- a publish rolled back
+        # (A->B->A) leaves the path matching while the VM has B open -- else by the path.
+        with self._lock:
+            fc_proc = self._procs.get(slot_id)
+        pid = getattr(fc_proc, "pid", None) or getattr(getattr(fc_proc, "proc", None), "pid", None)
+        # STRICT once READY: the guest booted, so firecracker certainly holds the disk and the
+        # checked file must be positively present (a symlink rolled back A->B->A otherwise
+        # hides B under a name that matches nothing).
+        opened = (opened_matches(pid, rootfs, key, strict=strict)
+                  if isinstance(pid, int) and pid > 0 else None)
+        if opened is not None:
+            return not opened
+        return file_identity(rootfs) != key
 
     def is_alive(self, slot: Slot) -> bool:
         """Return True iff the Firecracker subprocess is still running."""
@@ -1387,6 +1571,7 @@ class FirecrackerSlotRuntime:
         """
         with self._lock:
             fc_proc = self._procs.pop(slot.slot_id, None)
+            getattr(self, "_rootfs_keys", {}).pop(slot.slot_id, None)   # one entry per slot
 
         # Tear down the vsock READY listener (if any) before removing the dir.
         cleanup = getattr(self._ready_signal, "cleanup", None)
@@ -1503,7 +1688,9 @@ def select_fc_runtime(
 
     if not firecracker_available(cfg):
         if require_available:
+            guest = _guest_refusal(cfg)
             raise FCUnavailable(
+                f"Firecracker runtime refused: {guest}" if guest else
                 "Firecracker runtime required (BLASTBOX_WORKER_RUNTIME=firecracker) "
                 "but prerequisites missing: check firecracker binary, /dev/kvm, "
                 "BLASTBOX_FC_KERNEL, and BLASTBOX_FC_ROOTFS."

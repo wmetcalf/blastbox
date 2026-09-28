@@ -147,6 +147,15 @@ class FakeRunner:
             out = subprocess.run(  # noqa: S603
                 bare, capture_output=True, text=True, check=False
             ).stdout
+        if rc == 0 and bare[:2] == ["docker", "inspect"] and "{{.Architecture}}" in bare:
+            # A real daemon always answers this; an export now REFUSES an image whose
+            # architecture cannot be read rather than stamp one the boot gate cannot check.
+            out = "amd64"
+        if rc == 0 and bare[:2] == ["docker", "run"] and "-lc" in bare:
+            # The in-image blastbox probe answers DEFINITIVELY, as a real image does: these
+            # fake images carry no blastbox. "" would read as "could not look", which a
+            # label-less export now refuses rather than publish an unchecked guest.
+            out = "NOPKG"
         if rc == 0 and bare[:2] == ["mktemp", "-d"]:
             # Behaves like the real thing: the code uses the path it prints, so
             # a double that returned "" would make every later step operate on
@@ -1469,6 +1478,10 @@ def test_a_staging_directory_that_was_never_named_is_refused(
 
     class SilentMktemp(FakeRunner):
         def __call__(self, argv, **kw):
+            if "{{.Id}}" in argv:
+                # Only mktemp is silent: the tag still resolves to an immutable id, or the
+                # export refuses on THAT before reaching the refusal this test is about.
+                return super().__call__(argv, **kw)
             self.calls.append(list(argv))
             return subprocess.CompletedProcess(list(argv), 0, stdout="", stderr="")
 

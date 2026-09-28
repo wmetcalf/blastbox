@@ -15,6 +15,11 @@ ENGINE=probe deploy/firecracker/build-rootfs.sh /path/to/rootfs.ext4
 ENGINE=pdf   deploy/firecracker/build-rootfs.sh /path/to/rootfs-pdf.ext4   # ROOTFS_MIB=1024 default
 ```
 
+The export is stamped (`/opt/blastbox/rootfs-stamp.json`) so the warm tiers can check
+the guest against their host; that needs `BLASTBOX_PY` (default `python3`) to import a
+blastbox with the `rootfs_stamp` CLI, or the script warns and ships it unstamped. See
+`docs/WARM-ROOTFS.md`.
+
 The engine is baked in at build time (`BLASTBOX_FC_ENGINE`), so a rootfs is
 engine-specific — build one per engine. Example engines live in `engines.py`;
 real adopters bake their own (ClippyShot's LibreOffice, etc.).

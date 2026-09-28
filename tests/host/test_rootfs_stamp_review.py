@@ -1,0 +1,1654 @@
+"""PR #186 review: the rootfs stamp is untrusted input, describes the IMAGE, and every doctor
+verdict applies the whole policy.
+
+Each test pins one upstream review finding against the stamp/doctor change.
+"""
+
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import os
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from blastbox.host import doctor, platform_id as plat, rootfs_stamp as rfs
+
+from .test_imagerun import FakeRunner, _fake_extract, _plan
+
+
+@pytest.fixture(autouse=True)
+def _this_host_runs_0_1_42(monkeypatch):
+    """doctor compares a rootfs-only survey with THIS host's blastbox; pin it, so the tests do
+    not depend on whatever metadata the test environment happens to carry."""
+    import blastbox
+
+    monkeypatch.setattr(blastbox, "__version__", "0.1.42")
+
+
+def _stamp(**kw) -> rfs.RootfsStamp:
+    base = dict(blastbox_version="0.1.42", image="eng-fc:1", revision="deadbeef")
+    base.update(kw)
+    return rfs.RootfsStamp(**base)  # type: ignore[arg-type]
+
+
+# --- the stamp destination is inside an UNTRUSTED image ------------------------------------
+
+
+@pytest.mark.parametrize("link_at", ["opt", "opt/blastbox", rfs.STAMP_PATH])
+def test_a_symlink_on_the_stamp_path_is_refused_not_followed(tmp_path: Path, link_at) -> None:
+    """The image controls the tree; the write runs as root. A link anywhere on the path
+    would let it create or truncate a HOST file (e.g. /etc/sudoers)."""
+    tree, outside = tmp_path / "tree", tmp_path / "outside"
+    tree.mkdir()
+    outside.mkdir()
+    link = tree / link_at
+    link.parent.mkdir(parents=True, exist_ok=True)
+    target = outside / "victim"
+    if link_at == rfs.STAMP_PATH:
+        target.write_text("host file")
+    link.symlink_to(target if link_at == rfs.STAMP_PATH else outside)
+    with pytest.raises(rfs.RootfsStampError, match="symlink"):
+        rfs.write_into_tree(tree, _stamp())
+    assert list(outside.rglob("rootfs-stamp.json")) == []
+    if link_at == rfs.STAMP_PATH:
+        assert target.read_text() == "host file"
+
+
+def test_the_privileged_write_checks_links_before_running_anything(tmp_path: Path) -> None:
+    tree, outside = tmp_path / "tree", tmp_path / "outside"
+    (tree / "opt").mkdir(parents=True)
+    outside.mkdir()
+    (tree / "opt" / "blastbox").symlink_to(outside)
+    ran: list[list[str]] = []
+
+    def run(argv, **kw):  # type: ignore[no-untyped-def]
+        ran.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    with pytest.raises(rfs.RootfsStampError, match="symlink"):
+        rfs.write_into_tree(tree, _stamp(), priv=["sudo", "-n"], run=run)
+    assert ran == []
+
+
+# --- reading the stamp is bounded ----------------------------------------------------------
+
+
+def test_an_oversized_directory_stamp_is_refused(tmp_path: Path) -> None:
+    rfs.write_into_tree(tmp_path, _stamp())
+    (tmp_path / rfs.STAMP_PATH).write_text(" " * (rfs.MAX_STAMP_BYTES + 1))
+    with pytest.raises(rfs.RootfsStampError, match="larger than"):
+        rfs.read_from_dir(tmp_path)
+
+
+def test_a_symlinked_directory_stamp_is_not_followed(tmp_path: Path) -> None:
+    (tmp_path / "opt" / "blastbox").mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere.json"
+    elsewhere.write_text(_stamp().to_json())
+    (tmp_path / rfs.STAMP_PATH).symlink_to(elsewhere)
+    with pytest.raises(rfs.RootfsStampError, match="symlink"):
+        rfs.read_from_dir(tmp_path)
+
+
+def test_an_oversized_ext4_stamp_is_refused(tmp_path: Path) -> None:
+    img = tmp_path / "rootfs.ext4"
+    img.write_bytes(b"\0")
+
+    def run(argv, **kw):  # type: ignore[no-untyped-def]
+        return subprocess.CompletedProcess(argv, 0, "x" * (rfs.MAX_STAMP_BYTES + 1), "")
+
+    with pytest.raises(rfs.RootfsStampError, match="larger than"):
+        rfs.read_from_ext4(img, run=run)
+
+
+class _FakeDebugfs:
+    """A debugfs whose stdout streams forever (or blocks), recording what was asked of it."""
+
+    instances: list = []
+
+    def __init__(self, argv, **kw):
+        self.argv, self.kw = list(argv), kw
+        self.killed = False
+        self.requested = 0
+        self.block = _FakeDebugfs.block_next
+        self.stdout = self
+        self.stderr = io.BytesIO(b"")
+        self.returncode = None
+        _FakeDebugfs.instances.append(self)
+
+    block_next = False
+
+    def read(self, n=-1):
+        if self.block:
+            import time as _t
+            deadline = _t.monotonic() + 10
+            while not self.killed and _t.monotonic() < deadline:
+                _t.sleep(0.01)
+            return b""
+        assert n > 0, "an unbounded read() is exactly the defect"
+        self.requested += n
+        return b"x" * n
+
+    closed = False
+
+    def close(self):
+        self.closed = True
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self, timeout=None):
+        self.returncode = -9
+        return -9
+
+    def poll(self):
+        return self.returncode
+
+
+def _debugfs_env(tmp_path, monkeypatch, *, block=False):
+    img = tmp_path / "rootfs.ext4"
+    img.write_bytes(b"\0")
+    monkeypatch.setattr(rfs.shutil, "which", lambda _n: "/usr/sbin/debugfs")
+    _FakeDebugfs.instances = []
+    _FakeDebugfs.block_next = block
+    monkeypatch.setattr(rfs.subprocess, "Popen", _FakeDebugfs)
+    return img
+
+
+def test_debugfs_output_is_read_bounded_not_buffered_whole(tmp_path, monkeypatch) -> None:
+    """communicate() buffered ALL of it before slicing: a sparse 1 GiB stamp drove the
+    reader to 2 GB RSS (the dispatcher, in-process)."""
+    img = _debugfs_env(tmp_path, monkeypatch)
+    with pytest.raises(rfs.RootfsStampError, match="larger than"):
+        rfs.read_from_ext4(img)
+    (proc,) = _FakeDebugfs.instances
+    assert proc.requested <= rfs.MAX_STAMP_BYTES + 1
+    assert proc.killed
+
+
+def test_debugfs_is_bounded_in_time(tmp_path, monkeypatch) -> None:
+    img = _debugfs_env(tmp_path, monkeypatch, block=True)
+    monkeypatch.setattr(rfs, "DEBUGFS_TIMEOUT_S", 0.2)
+    with pytest.raises(rfs.RootfsStampError, match="timed out"):
+        rfs.read_from_ext4(img)
+    assert _FakeDebugfs.instances[0].killed
+
+
+def test_debugfs_cannot_take_the_image_path_as_an_option(tmp_path, monkeypatch) -> None:
+    img = _debugfs_env(tmp_path, monkeypatch)
+    with pytest.raises(rfs.RootfsStampError):
+        rfs.read_from_ext4(img)
+    argv = _FakeDebugfs.instances[0].argv
+    assert argv[-2:] == ["--", str(img)]
+
+
+def _within(seconds, fn):
+    """Run fn; fail (instead of hanging the suite) if it blocks."""
+    import threading
+
+    box: dict = {}
+
+    def go():
+        try:
+            box["ret"] = fn()
+        except BaseException as exc:  # noqa: BLE001
+            box["exc"] = exc
+
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    t.join(seconds)
+    assert not t.is_alive(), "blocked -- a FIFO or device node at the stamp path was opened"
+    if "exc" in box:
+        raise box["exc"]
+    return box.get("ret")
+
+
+def test_a_fifo_at_the_stamp_path_is_refused_on_read(tmp_path: Path) -> None:
+    (tmp_path / "opt" / "blastbox").mkdir(parents=True)
+    os.mkfifo(tmp_path / rfs.STAMP_PATH)
+    with pytest.raises(rfs.RootfsStampError, match="not a regular file"):
+        _within(5, lambda: rfs.read_from_dir(tmp_path))
+
+
+def test_a_fifo_at_the_stamp_path_is_refused_on_write(tmp_path: Path) -> None:
+    """As root the write took the plain-open branch: a FIFO hung the build, and a block
+    device node in the image would have had the stamp written into a HOST disk."""
+    (tmp_path / "opt" / "blastbox").mkdir(parents=True)
+    os.mkfifo(tmp_path / rfs.STAMP_PATH)
+    with pytest.raises(rfs.RootfsStampError, match="not a regular file"):
+        _within(5, lambda: rfs.write_into_tree(tmp_path, _stamp()))
+
+
+@pytest.mark.parametrize("privileged", [False, True])
+def test_a_directory_at_the_stamp_path_is_refused(tmp_path: Path, privileged) -> None:
+    """`install -D` into an existing directory writes INSIDE it and reports success -- a
+    rootfs that claims to be stamped and boots unchecked."""
+    (tmp_path / rfs.STAMP_PATH).mkdir(parents=True)
+    ran: list = []
+
+    def run(argv, **kw):  # type: ignore[no-untyped-def]
+        ran.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    kw = {"priv": ["sudo", "-n"], "run": run} if privileged else {}
+    with pytest.raises(rfs.RootfsStampError, match="not a regular file"):
+        rfs.write_into_tree(tmp_path, _stamp(), **kw)
+    assert ran == []
+
+
+def test_the_privileged_install_never_treats_the_target_as_a_directory(tmp_path) -> None:
+    ran: list = []
+
+    def run(argv, **kw):  # type: ignore[no-untyped-def]
+        ran.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    rfs.write_into_tree(tmp_path, _stamp(), priv=["sudo", "-n"], run=run)
+    assert "-T" in ran[0]
+
+
+def test_stamp_fields_are_sanitised_at_parse() -> None:
+    """guest_problem logs and raises with stamp fields; the dispatcher's log is not doctor."""
+    raw = json.dumps({"blastbox_version": "0.0.1\nINFO forged", "image": "x\x1b]0;t\x07",
+                      "platform": {"arch": "x86_64\r", "runtime": "gv\nERROR forged"}})
+    st = rfs.RootfsStamp.from_json(raw)
+    flat = [st.blastbox_version, st.image, *[str(v) for v in st.platform.values()]]
+    for value in flat:
+        assert not any(ord(ch) < 32 or ord(ch) == 127 for ch in value), repr(value)
+
+
+# --- a rootfs binds arch + runtime, not the exporter's CPU ---------------------------------
+
+
+def test_a_rootfs_is_not_bound_to_the_export_hosts_cpu() -> None:
+    """The snapshot is taken on the DEPLOYING host by SnapshotManager.build; the machine that
+    ran mkfs.ext4 leaves nothing CPU-specific in the rootfs."""
+    live = plat.host_platform(runtime="firecracker")
+    stamp = _stamp(platform={
+        "arch": live.arch, "runtime": "firecracker",
+        "cpu_vendor": "SomeOtherVendor", "cpu_model": "x", "kernel": "1.0",
+        "runtime_version": "0.0.1",
+    })
+    assert plat.compare(rfs.platform_of(stamp), live) == []
+
+
+def test_a_rootfs_for_another_arch_is_still_refused() -> None:
+    live = plat.host_platform(runtime="firecracker")
+    stamp = _stamp(platform={"arch": "s390x", "runtime": "firecracker"})
+    assert [f.field for f in plat.refusals(plat.compare(rfs.platform_of(stamp), live))] == [
+        "arch"
+    ]
+
+
+# --- the stamp describes the IMAGE, not the exporter ---------------------------------------
+
+
+class _ImgStamp:
+    blastbox = "9.9.9"
+    revision = "c0ffee" * 6 + "abcd"
+
+
+def _stage_capturing(tmp_path, monkeypatch, *, arch_out="arm64"):
+    import blastbox.host.imagerun as mod
+
+    # PIN the privilege path rather than let stage_rootfs probe the host. GitHub's runners have
+    # passwordless sudo, so there the privileged branch ran and its mkdir went to the fake
+    # runner (recorded, never created); a dev box without passwordless sudo took the real
+    # mkdir. Unpinned, the same test passed locally and failed in CI.
+    monkeypatch.setattr(mod, "_root_prefix", lambda: [])
+    monkeypatch.setattr(mod, "_can_be_root", lambda: False)
+    monkeypatch.setenv("DEMO_DIR", str(tmp_path / "out"))
+    monkeypatch.setattr(mod, "_blastbox_version", lambda: "0.0.1")      # the EXPORTER
+    monkeypatch.setattr(mod, "_source_revision", lambda plan: "plan-root-rev")
+    monkeypatch.setattr(mod, "_read_stamp", lambda ident, r=None: _ImgStamp())
+    # The label is now checked against the installed package on every export; these images do
+    # have the blastbox their label names.
+    monkeypatch.setattr(mod, "_verify_contents", lambda ident, r=None: (True, _ImgStamp.blastbox))
+    captured: list[rfs.RootfsStamp] = []
+    monkeypatch.setattr(mod._rootfs_stamp, "write_into_tree",
+                        lambda tree, stamp, **kw: captured.append(stamp))
+
+    class Run(FakeRunner):
+        def __call__(self, argv, **kw):
+            if "{{.Architecture}}" in argv:
+                self.calls.append(list(argv))
+                return subprocess.CompletedProcess(list(argv), 0, arch_out + "\n", "")
+            return super().__call__(argv, **kw)
+
+    plan = _plan(tmp_path)
+    mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=Run(), log=lambda _: None,
+                     extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True,
+                     verified_id="sha256:" + "e" * 64)
+    assert len(captured) == 1
+    return captured[0]
+
+
+def test_the_stamp_records_the_version_built_into_the_image(tmp_path, monkeypatch) -> None:
+    """An older CLI building a newly pinned version is the normal upgrade path; stamping the
+    exporter's version made the upgraded host refuse a correctly built guest."""
+    stamp = _stage_capturing(tmp_path, monkeypatch)
+    assert stamp.blastbox_version == "9.9.9"
+
+
+def test_the_stamp_records_the_images_own_revision(tmp_path, monkeypatch) -> None:
+    stamp = _stage_capturing(tmp_path, monkeypatch)
+    assert stamp.revision == _ImgStamp.revision
+
+
+def test_the_stamp_records_the_images_architecture(tmp_path, monkeypatch) -> None:
+    stamp = _stage_capturing(tmp_path, monkeypatch, arch_out="arm64")
+    assert stamp.platform["arch"] == "aarch64"
+    assert not stamp.platform.get("cpu_vendor")
+    assert not stamp.platform.get("cpu_model")
+
+
+# --- gVisor checks its directory rootfs too ------------------------------------------------
+
+
+def test_a_stale_gvisor_guest_is_refused_at_selection(tmp_path, monkeypatch) -> None:
+    from blastbox.host.runtime import gvisor_snapshot as gs
+    from blastbox.host.runtime import gvisor_snapshot_runtime as gr
+
+    monkeypatch.setattr(gs.GvisorSnapshotBackend, "available", lambda self: True)
+    tree = tmp_path / "rootfs"
+    rfs.write_into_tree(tree, _stamp(
+        blastbox_version="0.0.1",
+        platform={"arch": plat.host_platform().arch, "runtime": "gvisor"}))
+    cfg = gr._gvisor_config_from_env({
+        **os.environ, "BLASTBOX_GVISOR_ROOTFS": str(tree),
+        "BLASTBOX_GVISOR_RUNSC": "/bin/true",
+    })
+    assert gr.select_gvisor_snapshot_runtime(cfg=cfg) is None
+    with pytest.raises(gr.GvisorUnavailable, match="0.0.1"):
+        gr.select_gvisor_snapshot_runtime(cfg=cfg, require_available=True)
+
+
+# --- doctor: stamp text is untrusted, and the verdict applies the whole policy ----------
+
+
+def test_stamp_fields_are_sanitised_before_display(tmp_path: Path) -> None:
+    rfs.write_into_tree(tmp_path / "a", _stamp(
+        blastbox_version="0.1.42\x1b[2J\nOK: forged",
+        image="img\x07", platform={"arch": "x86\x1b]0;t\x07", "runtime": "fc\r"}))
+    (art,) = doctor.survey_rootfs([str(tmp_path / "a")])
+    for value in (art.version, art.image, art.arch, art.runtime):
+        assert not any(ord(ch) < 32 or ord(ch) == 127 for ch in value), repr(value)
+
+
+def _art(path="/r/a", version="0.1.42", **kw) -> doctor.Artifact:
+    return doctor.Artifact(path=path, version=version,
+                           runtime=kw.get("runtime", "firecracker"),
+                           arch=kw.get("arch", plat.host_platform().arch))
+
+
+def _ctr(name="c1", project="p1", version="0.1.42") -> doctor.Container:
+    return doctor.Container(name=name, image="i", project=project, status="Up",
+                            version=version)
+
+
+def _doctor(monkeypatch, capsys, containers, artifacts, **args):
+    from blastbox.host import cli
+
+    monkeypatch.setattr(doctor, "survey", lambda *a, **k: list(containers))
+    monkeypatch.setattr(doctor, "survey_rootfs", lambda paths: list(artifacts))
+    ns = argparse.Namespace(rootfs=[a.path for a in artifacts], expect=None,
+                            allow_mixed=False, json=False)
+    for k, v in args.items():
+        setattr(ns, k, v)
+    rc = cli._doctor_cmd(ns)
+    return rc, capsys.readouterr().out
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_expect_is_applied_in_both_output_modes(monkeypatch, capsys, as_json) -> None:
+    rc, _ = _doctor(monkeypatch, capsys, [_ctr()], [], expect="0.1.43", json=as_json)
+    assert rc == 1
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_allow_mixed_is_applied_in_both_output_modes(monkeypatch, capsys, as_json) -> None:
+    ctrs = [_ctr("a", "p1", "0.1.42"), _ctr("b", "p2", "0.1.41")]
+    assert _doctor(monkeypatch, capsys, ctrs, [], json=as_json)[0] == 1
+    assert _doctor(monkeypatch, capsys, ctrs, [], json=as_json, allow_mixed=True)[0] == 0
+
+
+def test_json_mode_reports_the_policy_verdict(monkeypatch, capsys) -> None:
+    rc, out = _doctor(monkeypatch, capsys, [_ctr()], [], expect="0.1.43", json=True)
+    report = json.loads(out)
+    assert report["ok"] is False and rc == 1
+    assert any("0.1.43" in p for p in report["problems"])
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_allow_mixed_does_not_excuse_a_bad_artifact(monkeypatch, capsys, as_json) -> None:
+    ctrs = [_ctr("a", "p1", "0.1.42"), _ctr("b", "p2", "0.1.41")]
+    bad = doctor.Artifact(path="/r/x", version=doctor.UNKNOWN, detail="unreadable")
+    rc, _ = _doctor(monkeypatch, capsys, ctrs, [bad], allow_mixed=True, json=as_json)
+    assert rc == 1
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_rootfs_only_applies_version_policy(monkeypatch, capsys, as_json) -> None:
+    arts = [_art("/r/a", "0.1.42"), _art("/r/b", "0.1.41")]
+    assert _doctor(monkeypatch, capsys, [], arts, json=as_json)[0] == 1
+    # With nothing running, each artifact is judged against THIS host (0.1.42): 0.1.41 cannot
+    # boot here, and --allow-mixed never excuses a guest/host mismatch.
+    assert _doctor(monkeypatch, capsys, [], arts, json=as_json, allow_mixed=True)[0] == 1
+    one = [_art("/r/a", "0.1.42")]
+    assert _doctor(monkeypatch, capsys, [], one, json=as_json)[0] == 0
+    assert _doctor(monkeypatch, capsys, [], one, json=as_json, expect="0.1.43")[0] == 1
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_allow_mixed_does_not_excuse_an_unbootable_artifact(monkeypatch, capsys, as_json) -> None:
+    ctrs = [_ctr("a", "p1", "0.1.42"), _ctr("b", "p2", "0.1.41")]
+    alien = _art("/r/alien", "0.1.42", arch="s390x")
+    rc, _ = _doctor(monkeypatch, capsys, ctrs, [alien], allow_mixed=True, json=as_json)
+    assert rc == 1
+
+
+# --- round 1 of the panel on #186 ----------------------------------------------------------
+
+
+def test_provenance_reads_the_label_through_the_production_runner_contract(tmp_path) -> None:
+    """The real runner returns stdout only when asked to capture it; the wrapper dropped
+    capture_output, stamp.read() crashed on None, and a bare except fell back to the
+    EXPORTER's version on every production export -- the exact bug b5872c9 claimed fixed."""
+    import blastbox.host.imagerun as mod
+
+    from blastbox.host import stamp as st
+
+    labels = {st.LABEL_BLASTBOX: "9.9.9", st.LABEL_REVISION: "c0ffee" * 6 + "abcd"}
+
+    def run(argv, *, cwd=None, capture_output=False, stdout=None):  # the real contract
+        out = None
+        if capture_output:
+            if "{{json .Config.Labels}}" in argv:
+                out = json.dumps(labels)
+            elif "{{.Architecture}}" in argv:
+                out = "amd64\n"
+        return subprocess.CompletedProcess(list(argv), 0, out, "")
+
+    version, revision, arch = mod._image_provenance(_plan(tmp_path), "sha256:x", run)
+    assert (version, revision, arch) == ("9.9.9", "c0ffee" * 6 + "abcd", "x86_64")
+
+
+@pytest.mark.parametrize(("guest", "host"), [("0.2.0-rc1", "0.2.0rc1"), ("0.2", "0.2.0"),
+                                             ("0.1.42+gdeadbee", "0.1.42")])
+def test_the_guest_check_compares_releases_not_spellings(guest, host) -> None:
+    assert rfs.compare_to_host(_stamp(blastbox_version=guest), host) == ""
+
+
+@pytest.mark.parametrize(("art", "ctr"), [("0.1.42+gdeadbee", "0.1.42"), ("0.2", "0.2.0")])
+def test_doctor_agrees_with_the_tier_about_equivalent_versions(art, ctr) -> None:
+    assert doctor.verdict([_ctr(version=ctr)], [_art(version=art)]) == []
+    # --expect names a BUILD: the containers must match it exactly (a local suffix is a
+    # different build), while the artifact is judged by release, as the tier boots it.
+    assert doctor.verdict([_ctr(version=ctr)], [_art(version=art)], expect=ctr) == []
+
+
+def test_allow_mixed_does_not_switch_off_the_guest_check() -> None:
+    """--allow-mixed is for separate PRODUCTS; it is exactly what a multi-product host
+    passes, so it cannot also be what disables the rootfs check."""
+    ctrs = [_ctr("a", "p1", "0.1.42"), _ctr("b", "p2", "0.1.41")]
+    stale = _art("/stale", "0.1.30")
+    assert doctor.verdict(ctrs, [stale], allow_mixed=True)
+
+
+def test_a_paired_artifact_is_checked_against_its_own_project(tmp_path) -> None:
+    """Unpaired, a stale rootfs passes if ANY product on the host runs its version."""
+    rfs.write_into_tree(tmp_path / "a", _stamp(
+        blastbox_version="0.1.41",
+        platform={"arch": plat.host_platform().arch, "runtime": "firecracker"}))
+    (art,) = doctor.survey_rootfs([f"clippy={tmp_path / 'a'}"])
+    assert art.project == "clippy" and art.path == str(tmp_path / "a")
+    ctrs = [_ctr("a", "clippy", "0.1.42"), _ctr("b", "other", "0.1.41")]
+    assert any("clippy" in p for p in doctor.verdict(ctrs, [art], allow_mixed=True))
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_docker_down_is_not_healthy(monkeypatch, capsys, as_json) -> None:
+    from blastbox.host import cli
+
+    def down(*a, **k):
+        raise doctor.DockerUnavailable("docker ps failed")
+
+    monkeypatch.setattr(doctor, "survey", down)
+    monkeypatch.setattr(doctor, "survey_rootfs", lambda paths: [_art()])
+    ns = argparse.Namespace(rootfs=["/r/a"], expect=None, allow_mixed=False, json=as_json)
+    assert cli._doctor_cmd(ns) != 0
+    out = capsys.readouterr().out
+    if as_json:
+        assert json.loads(out)["ok"] is False
+
+
+def test_json_mode_speaks_json_even_when_docker_is_down(monkeypatch, capsys) -> None:
+    from blastbox.host import cli
+
+    def down(*a, **k):
+        raise doctor.DockerUnavailable("docker ps failed")
+
+    monkeypatch.setattr(doctor, "survey", down)
+    monkeypatch.setattr(doctor, "survey_rootfs", lambda paths: [])
+    ns = argparse.Namespace(rootfs=[], expect=None, allow_mixed=False, json=True)
+    assert cli._doctor_cmd(ns) == 2
+    assert json.loads(capsys.readouterr().out)["ok"] is False
+
+
+def test_allow_mixed_never_prints_ok_beside_several_versions(monkeypatch, capsys) -> None:
+    ctrs = [_ctr("a", "p1", "0.1.42"), _ctr("b", "p2", "0.1.41")]
+    rc, out = _doctor(monkeypatch, capsys, ctrs, [], allow_mixed=True)
+    assert rc == 0
+    assert "OK:" not in out and "MIXED" in out
+
+
+@pytest.mark.parametrize("which", ["cold", "snapshot"])
+def test_the_fc_tiers_name_the_guest_problem_when_they_refuse(monkeypatch, which) -> None:
+    from blastbox.host.runtime import fc_snapshot_runtime as sr
+    from blastbox.host.runtime import firecracker as fc
+
+    monkeypatch.setattr(fc, "firecracker_available", lambda cfg=None: False)
+    monkeypatch.setattr(sr, "firecracker_available", lambda cfg=None: False, raising=False)
+    monkeypatch.setattr(fc, "_guest_refusal", lambda cfg: "guest is blastbox 0.0.1")
+    cfg = type("C", (), {"fc_rootfs": "/r.ext4"})()
+    select = fc.select_fc_runtime if which == "cold" else sr.select_snapshot_runtime
+    with pytest.raises(fc.FCUnavailable, match="guest is blastbox 0.0.1"):
+        select(cfg=cfg, require_available=True)
+
+
+def test_a_paired_rootfs_whose_project_cannot_be_found_is_a_problem() -> None:
+    """Pairing is the operator asserting which containers vouch for this rootfs. None found
+    -- scaled to zero, or a project label that could not be read -- is "could not look"."""
+    ctrs = [_ctr("x", "other", "0.1.42"), _ctr("y", "(unknown-project:dispatcher)", "0.1.42")]
+    art = doctor.Artifact(path="/r", version="0.1.17", runtime="firecracker",
+                          arch=plat.host_platform().arch, project="clippy")
+    problems = doctor.verdict(ctrs, [art], allow_mixed=True)
+    assert any("clippy" in p for p in problems)
+
+
+def test_equivalent_spellings_are_not_reported_as_mixed(monkeypatch, capsys) -> None:
+    ctrs = [_ctr("a", "p1", "0.2"), _ctr("b", "p2", "0.2.0")]
+    rc, out = _doctor(monkeypatch, capsys, ctrs, [])
+    assert rc == 0 and "MIXED" not in out and "OK:" in out
+
+
+def test_an_allowed_artifact_only_mix_is_not_ok(monkeypatch, capsys) -> None:
+    arts = [_art("/r/a", "0.1.17"), _art("/r/b", "0.2.0")]
+    rc, out = _doctor(monkeypatch, capsys, [], arts, allow_mixed=True)
+    # Neither matches this host (0.1.42): refused, and never reported as OK.
+    assert rc == 1 and "OK:" not in out
+
+
+def test_an_empty_ext4_stamp_says_unstamped_not_the_debugfs_banner(tmp_path, monkeypatch) -> None:
+    img = tmp_path / "rootfs.ext4"
+    img.write_bytes(b"\0")
+    monkeypatch.setattr(rfs.shutil, "which", lambda _n: "/usr/sbin/debugfs")
+
+    class _P:
+        def __init__(self, argv, stdout=None, stderr=None, **kw):
+            banner = b"debugfs 1.47.0 (5-Feb-2023)\n"
+            # Honour whatever stderr the caller chose -- a file (the pre-fix code) or a PIPE --
+            # so this test reproduces the original bug rather than only pinning the new path.
+            if hasattr(stderr, "write"):
+                stderr.write(banner)
+                stderr.flush()
+            self.stderr = io.BytesIO(banner)
+            self.stdout = self
+            self.returncode = 0
+
+        def read(self, n=-1):
+            return b"   \n"
+
+        def poll(self):
+            return 0
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(rfs.subprocess, "Popen", _P)
+    with pytest.raises(rfs.RootfsStampError, match="carries no"):
+        rfs.read_from_ext4(img)
+
+
+def test_a_real_debugfs_error_is_reported_past_the_banner(tmp_path, monkeypatch) -> None:
+    img = tmp_path / "rootfs.ext4"
+    img.write_bytes(b"\0")
+    monkeypatch.setattr(rfs.shutil, "which", lambda _n: "/usr/sbin/debugfs")
+
+    class _P:
+        def __init__(self, argv, stdout=None, stderr=None, **kw):
+            self.stderr = io.BytesIO(
+                b"debugfs 1.47.0 (5-Feb-2023)\nBad magic number in super-block\n")
+            self.stdout = self
+
+        def read(self, n=-1):
+            return b""
+
+        def poll(self):
+            return 1
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 1
+
+    monkeypatch.setattr(rfs.subprocess, "Popen", _P)
+    with pytest.raises(rfs.RootfsStampError, match="Bad magic"):
+        rfs.read_from_ext4(img)
+
+
+def test_a_failed_unprivileged_write_is_a_stamp_error(tmp_path, monkeypatch) -> None:
+    def denied(*a, **k):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(rfs.os, "open", denied)
+    with pytest.raises(rfs.RootfsStampError, match="could not write"):
+        rfs.write_into_tree(tmp_path, _stamp())
+
+
+def test_an_existing_path_containing_equals_is_never_split(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "build=2.ext4").write_bytes(b"\0")
+    assert doctor._pairing("build=2.ext4") == ("", "build=2.ext4")
+    assert doctor._pairing("clippy=/r/rootfs.ext4") == ("clippy", "/r/rootfs.ext4")
+
+
+def test_unicode_separators_and_bidi_are_stripped_at_parse() -> None:
+    st = rfs.RootfsStamp.from_json(json.dumps(
+        {"blastbox_version": "0.1.40‮ FAKE: ok ⁦​﻿"}))
+    assert st.blastbox_version == "0.1.40FAKE: ok"
+    assert len(rfs.compare_to_host(st, "0.1.41").splitlines()) == 1
+
+
+def test_an_unreadable_rootfs_path_is_a_row_not_a_crash(monkeypatch) -> None:
+    """survey_rootfs never raises on a bad path; the pairing probe ran before its try."""
+    real = Path.exists
+
+    def denied(self, *a, **k):
+        if str(self).startswith("/denied"):
+            raise PermissionError(13, "Permission denied")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(Path, "exists", denied)
+    got = doctor.survey_rootfs(["/denied/rootfs.ext4", "/also/missing.ext4"])
+    assert [a.known for a in got] == [False, False]
+    assert got[0].path == "/denied/rootfs.ext4"
+
+
+def test_docker_down_does_not_also_blame_every_pairing() -> None:
+    art = doctor.Artifact(path="/r", version="0.1.42", runtime="firecracker",
+                          arch=plat.host_platform().arch, project="clippy")
+    problems = doctor.verdict([], [art], docker_error="permission denied on docker.sock")
+    assert len(problems) == 1 and "docker.sock" in problems[0]
+
+
+def test_an_image_digest_reference_survives_the_survey(tmp_path) -> None:
+    ref = "ghcr.io/x/y@sha256:" + "a" * 64
+    rfs.write_into_tree(tmp_path / "a", _stamp(image=ref, platform={
+        "arch": plat.host_platform().arch, "runtime": "firecracker"}))
+    (art,) = doctor.survey_rootfs([str(tmp_path / "a")])
+    assert art.image == ref
+
+
+def test_debugfs_pipes_are_closed(tmp_path, monkeypatch) -> None:
+    img = _debugfs_env(tmp_path, monkeypatch)
+    with pytest.raises(rfs.RootfsStampError):
+        rfs.read_from_ext4(img)
+    proc = _FakeDebugfs.instances[0]
+    assert proc.closed and proc.stderr.closed
+
+
+# --- the legacy export scripts stamp too -----------------------------------------------
+
+
+def test_stamp_tree_records_what_the_image_says(tmp_path, monkeypatch) -> None:
+    from blastbox.host import stamp as st
+
+    monkeypatch.setattr(doctor, "version_in_image", lambda image, runner=None: ("9.9.9", ""))
+
+    labels = {st.LABEL_BLASTBOX: "9.9.9", st.LABEL_REVISION: "c0ffee" * 6 + "abcd"}
+
+    def run(argv, **kw):
+        if "{{json .Config.Labels}}" in argv:
+            return subprocess.CompletedProcess(list(argv), 0, json.dumps(labels), "")
+        if "{{.Architecture}}" in argv:
+            return subprocess.CompletedProcess(list(argv), 0, "arm64\n", "")
+        if "{{.Id}}" in argv:
+            return subprocess.CompletedProcess(list(argv), 0, "sha256:" + "f" * 64 + "\n", "")
+        raise AssertionError(argv)
+
+    rfs.stamp_tree(tmp_path, "eng-fc:1", "firecracker", run=run, revision="d" * 40)
+    got = rfs.read_from_dir(tmp_path)
+    # The revision is the caller's, never the (possibly inherited) label's.
+    assert (got.blastbox_version, got.revision, got.image) == ("9.9.9", "d" * 40, "eng-fc:1")
+    assert got.image_id == "sha256:" + "f" * 64
+    assert got.platform == {"arch": "aarch64", "runtime": "firecracker"}
+
+
+def test_stamp_tree_prefers_the_installed_version_to_a_missing_label(tmp_path,
+                                                                     monkeypatch) -> None:
+    """The legacy scripts build with plain `docker build`: no labels at all. What the image
+    actually has installed is the truth anyway -- the label is only a self-report."""
+    monkeypatch.setattr(doctor, "version_in_image", lambda image, runner=None: ("0.1.42", ""))
+
+    def run(argv, **kw):
+        out = "{}" if "{{json .Config.Labels}}" in argv else "amd64\n"
+        return subprocess.CompletedProcess(list(argv), 0, out, "")
+
+    rfs.stamp_tree(tmp_path, "eng-fc:1", "firecracker", run=run)
+    assert rfs.read_from_dir(tmp_path).blastbox_version == "0.1.42"
+
+
+def test_stamp_tree_refuses_an_image_that_records_no_version(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(doctor, "version_in_image",
+                        lambda image, runner=None: (doctor.UNKNOWN, "no blastbox"))
+
+    def run(argv, **kw):
+        out = "{}" if "{{json .Config.Labels}}" in argv else "amd64\n"
+        return subprocess.CompletedProcess(list(argv), 0, out, "")
+
+    with pytest.raises(rfs.RootfsStampError, match="could not be verified"):
+        rfs.stamp_tree(tmp_path, "eng-fc:1", "firecracker", run=run)
+
+
+def test_the_module_entry_point_writes_a_stamp(tmp_path, monkeypatch) -> None:
+    seen: list = []
+    monkeypatch.setattr(rfs, "stamp_tree", lambda *a, **k: seen.append(a))
+    assert rfs.main(["write", str(tmp_path), "eng-fc:1", "gvisor"]) == 0
+    assert seen == [(str(tmp_path), "eng-fc:1", "gvisor")]
+    assert rfs.main(["write", str(tmp_path), "eng-fc:1", "sparc"]) == 2
+
+
+def test_both_legacy_export_scripts_stamp_what_they_export() -> None:
+    root = Path(__file__).resolve().parents[2]
+    for script in ("deploy/firecracker/build-rootfs.sh", "deploy/redeploy-warm.sh"):
+        assert "-m blastbox.host.rootfs_stamp write" in (root / script).read_text(), script
+
+
+def test_stamp_tree_records_no_version_for_an_image_without_blastbox(tmp_path,
+                                                                   monkeypatch) -> None:
+    """NOPKG is DEFINITIVE: the guest has no blastbox (a pure-JVM worker). Its label -- often
+    inherited from a base -- must not stand in for it."""
+    from blastbox.host import stamp as st
+
+    monkeypatch.setattr(doctor, "version_in_image",
+                        lambda image, runner=None: (doctor.NOPKG, "no blastbox package"))
+
+    def run(argv, **kw):
+        out = (json.dumps({st.LABEL_BLASTBOX: "0.1.42"}) if "{{json .Config.Labels}}" in argv
+               else "amd64\n")
+        return subprocess.CompletedProcess(list(argv), 0, out, "")
+
+    rfs.stamp_tree(tmp_path, "eng-fc:1", "firecracker", run=run)
+    assert rfs.read_from_dir(tmp_path).blastbox_version == ""
+
+
+def test_stamp_tree_fails_when_the_installed_version_cannot_be_checked(tmp_path,
+                                                                     monkeypatch) -> None:
+    """UNKNOWN (the probe timed out or could not look) is NOT "no blastbox": falling back to an
+    inherited label let a hotfix image claim a version nobody verified."""
+    from blastbox.host import stamp as st
+
+    monkeypatch.setattr(doctor, "version_in_image",
+                        lambda image, runner=None: (doctor.UNKNOWN, "probe timed out"))
+
+    def run(argv, **kw):
+        out = (json.dumps({st.LABEL_BLASTBOX: "0.1.42"}) if "{{json .Config.Labels}}" in argv
+               else "amd64\n")
+        return subprocess.CompletedProcess(list(argv), 0, out, "")
+
+    with pytest.raises(rfs.RootfsStampError, match="could not be verified"):
+        rfs.stamp_tree(tmp_path, "eng-fc:1", "firecracker", run=run)
+
+def test_stamp_tree_bounds_every_docker_call(tmp_path, monkeypatch) -> None:
+    seen: list = []
+    monkeypatch.setattr(doctor, "version_in_image", lambda image, runner=None: ("0.1.42", ""))
+    monkeypatch.setattr(rfs.subprocess, "run", lambda argv, **kw: seen.append(kw) or
+                        subprocess.CompletedProcess(argv, 0, "{}", ""))
+    rfs.stamp_tree(tmp_path, "eng-fc:1", "firecracker")
+    assert seen and all(kw.get("timeout") for kw in seen)
+
+
+def test_stamp_tree_keeps_a_revision_only_when_the_label_describes_this_build(tmp_path,
+                                                                            monkeypatch) -> None:
+    """A derived image inherits its base's labels; their revision is not this build's."""
+    from blastbox.host import stamp as st
+
+    monkeypatch.setattr(doctor, "version_in_image", lambda image, runner=None: ("0.1.43", ""))
+
+    def run(argv, **kw):
+        out = (json.dumps({st.LABEL_BLASTBOX: "0.1.42", st.LABEL_REVISION: "a" * 40})
+               if "{{json .Config.Labels}}" in argv else "amd64\n")
+        return subprocess.CompletedProcess(list(argv), 0, out, "")
+
+    rfs.stamp_tree(tmp_path, "eng-fc:1", "firecracker", run=run)
+    assert rfs.read_from_dir(tmp_path).revision == ""
+
+
+def test_the_legacy_scripts_verify_the_stamp_was_written() -> None:
+    """An older blastbox without this CLI imports the module and exits 0 having written
+    nothing; the exit status alone cannot be trusted."""
+    root = Path(__file__).resolve().parents[2]
+    for script in ("deploy/firecracker/build-rootfs.sh", "deploy/redeploy-warm.sh"):
+        assert "opt/blastbox/rootfs-stamp.json" in (root / script).read_text(), script
+
+
+def test_stamp_tree_never_takes_a_revision_from_inherited_labels(tmp_path, monkeypatch) -> None:
+    """The legacy scripts derive images FROM a shipped image; its labels -- revision included
+    -- are inherited, and the hotfix wheel carries the same static version, so no version
+    check can tell whose revision it is. The caller names the revision explicitly."""
+    from blastbox.host import stamp as st
+
+    monkeypatch.setattr(doctor, "version_in_image", lambda image, runner=None: ("0.1.42", ""))
+
+    def run(argv, **kw):
+        out = (json.dumps({st.LABEL_BLASTBOX: "0.1.42", st.LABEL_REVISION: "a" * 40})
+               if "{{json .Config.Labels}}" in argv else "amd64\n")
+        return subprocess.CompletedProcess(list(argv), 0, out, "")
+
+    rfs.stamp_tree(tmp_path / "a", "eng:1", "firecracker", run=run)
+    assert rfs.read_from_dir(tmp_path / "a").revision == ""
+    rfs.stamp_tree(tmp_path / "b", "eng:1", "firecracker", run=run, revision="b" * 40)
+    assert rfs.read_from_dir(tmp_path / "b").revision == "b" * 40
+
+
+def test_the_entry_point_takes_an_optional_revision(tmp_path, monkeypatch) -> None:
+    seen: list = []
+    monkeypatch.setattr(rfs, "stamp_tree", lambda *a, **k: seen.append((a, k)))
+    assert rfs.main(["write", str(tmp_path), "eng:1", "gvisor", "c" * 40]) == 0
+    assert seen[-1][1].get("revision") == "c" * 40
+
+
+def test_the_legacy_scripts_pass_their_source_revision() -> None:
+    root = Path(__file__).resolve().parents[2]
+    for script in ("deploy/firecracker/build-rootfs.sh", "deploy/redeploy-warm.sh"):
+        assert "rev-parse HEAD" in (root / script).read_text(), script
+
+
+# --- codex bot, second pass on #186 -------------------------------------------------------
+
+
+def test_doctor_judges_the_tier_by_the_artifacts_shape_not_its_claim(tmp_path) -> None:
+    """A directory stamped runtime=firecracker compared against a live platform built from
+    that same claim always agreed -- doctor passed what the boot gate refuses."""
+    tree = tmp_path / "rootfs"
+    rfs.write_into_tree(tree, _stamp(platform={
+        "arch": plat.host_platform().arch, "runtime": "firecracker"}))
+    problems = doctor.artifact_problems(doctor.survey_rootfs([str(tree)]))
+    assert problems and "runtime" in problems[0][1]
+
+
+def test_json_drift_groups_equivalent_releases() -> None:
+    ctrs = [_ctr("a", "p1", "0.2"), _ctr("b", "p1", "0.2.0")]
+    report = doctor.fleet_report(ctrs, [])
+    assert report["drift"] == {}
+
+
+def test_an_unreadable_image_architecture_is_not_guessed(tmp_path, monkeypatch) -> None:
+    """Falling back to the export host's arch stamped an emulated arm64 image x86_64."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_root_prefix", lambda: [])
+    monkeypatch.setattr(mod, "_can_be_root", lambda: False)
+    monkeypatch.setenv("DEMO_DIR", str(tmp_path / "out"))
+    monkeypatch.setattr(mod, "_read_stamp", lambda ident, r=None: _ImgStamp())
+    # The label is now checked against the installed package on every export; these images do
+    # have the blastbox their label names.
+    monkeypatch.setattr(mod, "_verify_contents", lambda ident, r=None: (True, _ImgStamp.blastbox))
+    captured: list = []
+    monkeypatch.setattr(mod._rootfs_stamp, "write_into_tree",
+                        lambda tree, stamp, **kw: captured.append(stamp))
+
+    class Run(FakeRunner):
+        def __call__(self, argv, **kw):
+            if "{{.Architecture}}" in argv:
+                return subprocess.CompletedProcess(list(argv), 1, "", "no such image")
+            return super().__call__(argv, **kw)
+
+    plan = _plan(tmp_path)
+    # Neither guessed from the export host NOR left empty -- an empty arch skips the boot
+    # gate's arch check entirely. The export fails.
+    with pytest.raises(mod.BuildError, match="architecture"):
+        mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=Run(), log=lambda _: None,
+                         extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True,
+                         verified_id="sha256:" + "e" * 64)
+    assert captured == []
+
+
+def test_a_refused_stamp_write_is_a_build_error(tmp_path, monkeypatch) -> None:
+    """The CLI catches BuildError only; a hostile image's stamp refusal escaped as a
+    traceback instead of the command's normal diagnostic."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_root_prefix", lambda: [])
+    monkeypatch.setattr(mod, "_can_be_root", lambda: False)
+    monkeypatch.setenv("DEMO_DIR", str(tmp_path / "out"))
+    monkeypatch.setattr(mod, "_read_stamp", lambda ident, r=None: _ImgStamp())
+    # The label is now checked against the installed package on every export; these images do
+    # have the blastbox their label names.
+    monkeypatch.setattr(mod, "_verify_contents", lambda ident, r=None: (True, _ImgStamp.blastbox))
+
+    def refuse(tree, stamp, **kw):
+        raise rfs.RootfsStampError("opt/blastbox is a symlink inside the image")
+
+    monkeypatch.setattr(mod._rootfs_stamp, "write_into_tree", refuse)
+    plan = _plan(tmp_path)
+    with pytest.raises(mod.BuildError, match="symlink"):
+        mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                         extract=_fake_extract({"/init": "x"}),
+                         extract_preserves_ownership=True, verified_id="sha256:" + "e" * 64)
+
+
+def test_the_legacy_scripts_stamp_the_immutable_image_they_exported() -> None:
+    """A retag between export and stamping made stamp_tree describe a DIFFERENT image."""
+    root = Path(__file__).resolve().parents[2]
+    for script in ("deploy/firecracker/build-rootfs.sh", "deploy/redeploy-warm.sh"):
+        assert "{{.Image}}" in (root / script).read_text(), script
+
+
+# --- codex bot, third pass on #186 --------------------------------------------------------
+
+
+def test_containers_on_different_local_builds_are_drift() -> None:
+    """A local suffix identifies a different BUILD (the CLI help says so); only the guest
+    compatibility check may ignore it."""
+    ctrs = [_ctr("a", "p1", "0.1.42+ga"), _ctr("b", "p1", "0.1.42+gb")]
+    assert any("p1" in p for p in doctor.verdict(ctrs, []))
+    assert any("0.1.42" in p for p in doctor.verdict([_ctr(version="0.1.42+ga")], [],
+                                                      expect="0.1.42"))
+
+
+def test_build_images_fails_rather_than_stamping_exporter_provenance(tmp_path,
+                                                                    monkeypatch) -> None:
+    import blastbox.host.imagerun as mod
+
+    def unreadable(ident, r=None):
+        raise RuntimeError("docker inspect failed")
+
+    monkeypatch.setattr(mod, "_read_stamp", unreadable)
+    with pytest.raises(mod.BuildError, match="provenance"):
+        mod._image_provenance(_plan(tmp_path), "sha256:x", FakeRunner())
+
+
+def test_stamp_tree_honours_the_docker_override(tmp_path, monkeypatch) -> None:
+    seen: list[str] = []
+
+    def version_in_image(image, runner=None):
+        runner(["docker", "inspect", "--type", "image", image, "--format", "{{.Id}}"])
+        return "0.1.42", ""
+
+    monkeypatch.setattr(doctor, "version_in_image", version_in_image)
+    monkeypatch.setattr(rfs.subprocess, "run", lambda argv, **kw: seen.append(argv[0]) or
+                        subprocess.CompletedProcess(argv, 0, "{}", ""))
+    rfs.stamp_tree(tmp_path, "eng:1", "firecracker", docker="podman")
+    assert seen and set(seen) == {"podman"}
+
+
+def test_the_entry_point_takes_docker_from_the_environment(tmp_path, monkeypatch) -> None:
+    seen: list = []
+    monkeypatch.setattr(rfs, "stamp_tree", lambda *a, **k: seen.append(k))
+    monkeypatch.setenv("DOCKER", "podman")
+    assert rfs.main(["write", str(tmp_path), "eng:1", "gvisor"]) == 0
+    assert seen[-1]["docker"] == "podman"
+
+
+def test_the_legacy_scripts_mark_a_dirty_source_tree() -> None:
+    root = Path(__file__).resolve().parents[2]
+    for script in ("deploy/firecracker/build-rootfs.sh", "deploy/redeploy-warm.sh"):
+        body = (root / script).read_text()
+        assert "status --porcelain" in body and "-dirty" in body, script
+
+
+def test_platform_warnings_are_logged_before_an_unchecked_boot(tmp_path, caplog) -> None:
+    import blastbox
+
+    tree = tmp_path / "rootfs"
+    rfs.write_into_tree(tree, _stamp(blastbox_version=blastbox.__version__, platform={}))
+    with caplog.at_level("WARNING"):
+        assert rfs.guest_problem(str(tree), "gvisor") == ""
+    assert "records no platform" in caplog.text
+
+
+
+def test_a_direct_export_extracts_and_stamps_one_immutable_image(tmp_path, monkeypatch) -> None:
+    """export_rootfs() has no verified id: extracting the mutable TAG and then reading
+    provenance from it again let a retag in between pair image A's tree with image B's stamp."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_root_prefix", lambda: [])
+    monkeypatch.setattr(mod, "_can_be_root", lambda: False)
+    monkeypatch.setenv("DEMO_DIR", str(tmp_path / "out"))
+    read_from: list[str] = []
+    monkeypatch.setattr(mod, "_read_stamp",
+                        lambda ident, r=None: read_from.append(ident) or _ImgStamp())
+    captured: list = []
+    monkeypatch.setattr(mod._rootfs_stamp, "write_into_tree",
+                        lambda tree, stamp, **kw: captured.append(stamp))
+    monkeypatch.setattr(mod, "_verify_contents", lambda ident, r=None: (True, "9.9.9"))
+    extracted: list[str] = []
+    fake = _fake_extract({"/init": "x"})
+
+    def extract(source, dest):
+        extracted.append(source)
+        fake(source, dest)
+
+    plan = _plan(tmp_path)
+    mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                     extract=extract, extract_preserves_ownership=True)
+    ident = "sha256:" + "e" * 64                  # what FakeRunner resolves any tag to
+    assert extracted == [ident] and read_from == [ident]
+    assert captured[0].image_id == ident
+
+
+
+def test_a_direct_export_verifies_the_label_against_the_installed_blastbox(tmp_path,
+                                                                         monkeypatch) -> None:
+    """run_plan verifies every image; the direct export_rootfs() path trusted the label, so a
+    stale one could stamp a host-matching version onto a guest built from something else."""
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_root_prefix", lambda: [])
+    monkeypatch.setattr(mod, "_can_be_root", lambda: False)
+    monkeypatch.setenv("DEMO_DIR", str(tmp_path / "out"))
+    monkeypatch.setattr(mod, "_read_stamp", lambda ident, r=None: _ImgStamp())   # says 9.9.9
+    monkeypatch.setattr(mod, "_verify_contents",
+                        lambda ident, r=None: (False, "label says 9.9.9, image contains 0.1.30"))
+    plan = _plan(tmp_path)
+    with pytest.raises(mod.BuildError, match="0.1.30"):
+        mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                         extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True)
+
+
+
+# --- codex bot, ninth pass ----------------------------------------------------------------
+
+
+def _direct(tmp_path, monkeypatch):
+    import blastbox.host.imagerun as mod
+
+    monkeypatch.setattr(mod, "_root_prefix", lambda: [])
+    monkeypatch.setattr(mod, "_can_be_root", lambda: False)
+    monkeypatch.setenv("DEMO_DIR", str(tmp_path / "out"))
+    return mod
+
+
+def test_a_direct_export_whose_image_id_cannot_be_resolved_fails(tmp_path, monkeypatch) -> None:
+    mod = _direct(tmp_path, monkeypatch)
+    monkeypatch.setattr(mod, "_image_id", lambda image, run: "")
+    plan = _plan(tmp_path)
+    with pytest.raises(mod.BuildError, match="immutable"):
+        mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                         extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True)
+
+
+def test_a_direct_export_accepts_an_image_without_blastbox(tmp_path, monkeypatch) -> None:
+    """verify_contents() -> None means "no blastbox package to compare" (a pure-JVM worker),
+    which verify_built() accepts; the direct path refused it."""
+    mod = _direct(tmp_path, monkeypatch)
+    monkeypatch.setattr(mod, "_read_stamp", lambda ident, r=None: _ImgStamp())
+    # The label is now checked against the installed package on every export; these images do
+    # have the blastbox their label names.
+    monkeypatch.setattr(mod, "_verify_contents", lambda ident, r=None: (True, _ImgStamp.blastbox))
+    monkeypatch.setattr(mod, "_verify_contents", lambda ident, r=None: (None, "no blastbox"))
+    captured: list = []
+    monkeypatch.setattr(mod._rootfs_stamp, "write_into_tree",
+                        lambda tree, stamp, **kw: captured.append(stamp))
+    plan = _plan(tmp_path)
+    mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                     extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True)
+    assert captured and captured[0].blastbox_version == ""     # accepted, and version-free
+
+
+def test_a_label_less_direct_export_stamps_the_installed_version(tmp_path, monkeypatch) -> None:
+    mod = _direct(tmp_path, monkeypatch)
+
+    class NoLabel:
+        blastbox = "unknown"
+        revision = "unknown"
+
+    monkeypatch.setattr(mod, "_read_stamp", lambda ident, r=None: NoLabel())
+    monkeypatch.setattr(doctor, "version_in_image", lambda image, runner=None: ("0.1.42", ""))
+    captured: list = []
+    monkeypatch.setattr(mod._rootfs_stamp, "write_into_tree",
+                        lambda tree, stamp, **kw: captured.append(stamp))
+    plan = _plan(tmp_path)
+    mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                     extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True)
+    assert captured[0].blastbox_version == "0.1.42"
+
+
+def test_the_legacy_scripts_never_publish_an_inherited_stamp() -> None:
+    """A stamp baked into the IMAGE survived a failed stamping step and was published as if
+    this export had been checked."""
+    root = Path(__file__).resolve().parents[2]
+    # Cleared before stamping AND again on failure, through the link-confined helper.
+    for script in ("deploy/firecracker/build-rootfs.sh", "deploy/redeploy-warm.sh"):
+        assert (root / script).read_text().count("rootfs_stamp clear") >= 2, script
+
+
+
+# --- codex bot, eleventh pass -------------------------------------------------------------
+
+
+def test_a_label_less_direct_export_refuses_an_unreadable_probe(tmp_path, monkeypatch) -> None:
+    """UNKNOWN (timeout, unreadable metadata) is not NOPKG: stamping it empty let a transient
+    failure publish an unchecked Python worker as a "pure-JVM" guest."""
+    mod = _direct(tmp_path, monkeypatch)
+
+    class NoLabel:
+        blastbox = "unknown"
+        revision = "unknown"
+
+    monkeypatch.setattr(mod, "_read_stamp", lambda ident, r=None: NoLabel())
+    monkeypatch.setattr(doctor, "version_in_image",
+                        lambda image, runner=None: (doctor.UNKNOWN, "probe timed out"))
+    plan = _plan(tmp_path)
+    with pytest.raises(mod.BuildError, match="could not be verified"):
+        mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                         extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True)
+
+
+def test_doctor_reads_a_versionless_stamp_as_a_guest_without_blastbox(tmp_path) -> None:
+    """The boot gate admits a NOPKG guest (arch/runtime checked); doctor called the same
+    artifact unreadable and exited nonzero."""
+    tree = tmp_path / "rootfs"
+    rfs.write_into_tree(tree, rfs.RootfsStamp(blastbox_version="", platform={
+        "arch": plat.host_platform().arch, "runtime": "gvisor"}))
+    (art,) = doctor.survey_rootfs([str(tree)])
+    assert art.known and art.version == doctor.NO_BLASTBOX
+    assert doctor.verdict([_ctr(version="0.1.42")], [art]) == []
+
+
+def test_clearing_an_inherited_stamp_never_follows_the_images_links(tmp_path) -> None:
+    """`sudo rm` of tree/opt/blastbox/rootfs-stamp.json followed an image-controlled
+    opt/blastbox symlink and deleted a stamp in a HOST directory."""
+    tree, host = tmp_path / "tree", tmp_path / "host"
+    (tree / "opt").mkdir(parents=True)
+    host.mkdir()
+    (host / "rootfs-stamp.json").write_text("the deployed rootfs's stamp")
+    (tree / "opt" / "blastbox").symlink_to(host)
+    with pytest.raises(rfs.RootfsStampError, match="symlink"):
+        rfs.clear_stamp(tree)
+    assert (host / "rootfs-stamp.json").exists()
+    assert rfs.main(["clear", str(tree)]) == 1
+    rfs.write_into_tree(tmp_path / "ok", _stamp())
+    rfs.clear_stamp(tmp_path / "ok")
+    assert not (tmp_path / "ok" / rfs.STAMP_PATH).exists()
+
+
+def test_the_legacy_scripts_clear_stamps_through_the_confined_helper() -> None:
+    root = Path(__file__).resolve().parents[2]
+    for script in ("deploy/firecracker/build-rootfs.sh", "deploy/redeploy-warm.sh"):
+        body = (root / script).read_text()
+        assert "rootfs_stamp clear" in body, script
+        stamp_lines = [ln for ln in body.splitlines() if "rootfs-stamp.json" in ln]
+        assert not any("rm -f" in ln for ln in stamp_lines), script
+
+
+def test_a_direct_export_without_blastbox_does_not_stamp_the_labels_version(tmp_path,
+                                                                           monkeypatch) -> None:
+    """verify_contents() -> None: no blastbox installed. The (inherited) label's version then
+    describes nothing in the guest, and stamping it got a valid JVM guest refused at boot."""
+    mod = _direct(tmp_path, monkeypatch)
+    monkeypatch.setattr(mod, "_read_stamp", lambda ident, r=None: _ImgStamp())      # 9.9.9
+    monkeypatch.setattr(mod, "_verify_contents", lambda ident, r=None: (None, "no blastbox"))
+    captured: list = []
+    monkeypatch.setattr(mod._rootfs_stamp, "write_into_tree",
+                        lambda tree, stamp, **kw: captured.append(stamp))
+    plan = _plan(tmp_path)
+    mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                     extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True)
+    assert captured[0].blastbox_version == ""
+
+
+def test_a_package_free_artifact_is_not_a_mix(monkeypatch, capsys) -> None:
+    arts = [_art("/r/py", "0.1.42"), doctor.Artifact(path="/r/jvm", version=doctor.NO_BLASTBOX,
+                                                     runtime="firecracker",
+                                                     arch=plat.host_platform().arch,
+                                                     stamped=True, no_blastbox=True)]
+    rc, out = _doctor(monkeypatch, capsys, [], arts)
+    assert rc == 0 and "MIXED" not in out and "(no blastbox)" not in out.split("OK:")[-1]
+
+
+def test_a_verified_package_free_export_does_not_stamp_the_label(tmp_path, monkeypatch) -> None:
+    """run_plan's verify_built() accepts None (no blastbox) and hands staging only the id --
+    so the build-time label was stamped as if that blastbox were installed."""
+    mod = _direct(tmp_path, monkeypatch)
+    monkeypatch.setattr(mod, "_read_stamp", lambda ident, r=None: _ImgStamp())      # 9.9.9
+    monkeypatch.setattr(mod, "_verify_contents", lambda ident, r=None: (None, "no blastbox"))
+    captured: list = []
+    monkeypatch.setattr(mod._rootfs_stamp, "write_into_tree",
+                        lambda tree, stamp, **kw: captured.append(stamp))
+    plan = _plan(tmp_path)
+    mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                     extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True,
+                     verified_id="sha256:" + "e" * 64)
+    assert captured[0].blastbox_version == ""
+
+
+# --- codex bot, fourteenth pass -----------------------------------------------------------
+
+
+def test_a_rootfs_only_survey_compares_against_this_host(monkeypatch) -> None:
+    """No containers and no --expect left nothing to compare, so a stale stamp read OK --
+    on bare-metal dispatchers and scaled-to-zero stacks the boot gate would refuse it."""
+    import blastbox
+
+    monkeypatch.setattr(blastbox, "__version__", "0.1.42")
+    assert any("0.1.30" in p for p in doctor.verdict([], [_art(version="0.1.30")]))
+    assert doctor.verdict([], [_art(version="0.1.42+gabc")]) == []
+
+
+def test_fleet_report_health_uses_normalised_versions() -> None:
+    report = doctor.fleet_report([_ctr("a", "p1", "0.2"), _ctr("b", "p1", "0.2.0")], [])
+    assert report["drift"] == {} and report["ok"] is True
+
+
+def test_the_legacy_dirty_checks_ignore_git_config() -> None:
+    root = Path(__file__).resolve().parents[2]
+    for script in ("deploy/firecracker/build-rootfs.sh", "deploy/redeploy-warm.sh"):
+        body = (root / script).read_text()
+        assert "status --porcelain --untracked-files=all" in body, script
+
+
+
+# --- codex bot, fifteenth pass ------------------------------------------------------------
+
+
+def test_fleet_report_judges_artifacts_by_release() -> None:
+    """verdict() accepts a 0.1.42 guest under a 0.1.42+gabc container; the report called the
+    same fleet unhealthy with nothing in drift, unknown or unbootable."""
+    report = doctor.fleet_report([_ctr(version="0.1.42+gabc")], [_art(version="0.1.42")])
+    assert report["ok"] is True
+
+
+def test_the_fc_export_script_cleans_up_before_its_first_inspect() -> None:
+    root = Path(__file__).resolve().parents[2]
+    body = (root / "deploy/firecracker/build-rootfs.sh").read_text()
+    assert body.index("trap cleanup EXIT") < body.index("inspect --format '{{.Image}}'")
+
+
+# --- full-PR sweep (marla run-98) ---------------------------------------------------------
+
+
+def _dir_stamp(tmp_path, name, **fields):
+    tree = tmp_path / name
+    (tree / "opt" / "blastbox").mkdir(parents=True)
+    (tree / rfs.STAMP_PATH).write_text(json.dumps(fields))
+    return str(tree)
+
+
+@pytest.mark.parametrize("version", ["0.1.4/2", "/"])
+def test_doctor_judges_the_stamp_the_gate_judges(tmp_path, version) -> None:
+    """doctor sanitised the stamp BEFORE comparing it: '0.1.4/2' became '0.1.42' (OK) while the
+    gate refused the raw value."""
+    tree = _dir_stamp(tmp_path, "r", blastbox_version=version,
+                      platform={"arch": plat.host_platform().arch, "runtime": "gvisor"})
+    assert rfs.guest_problem(tree, "gvisor") != ""
+    assert doctor.verdict([], doctor.survey_rootfs([tree])) != []
+
+
+def test_a_whitespace_version_means_no_blastbox_in_both(tmp_path) -> None:
+    tree = _dir_stamp(tmp_path, "r", blastbox_version="   ",
+                      platform={"arch": plat.host_platform().arch, "runtime": "gvisor"})
+    assert rfs.guest_problem(tree, "gvisor") == ""
+    (art,) = doctor.survey_rootfs([tree])
+    assert art.no_blastbox and doctor.verdict([], [art]) == []
+
+
+def test_a_stamp_reading_unknown_is_still_a_readable_stamp(tmp_path) -> None:
+    tree = _dir_stamp(tmp_path, "r", blastbox_version="unknown",
+                      platform={"arch": plat.host_platform().arch, "runtime": "gvisor"})
+    (art,) = doctor.survey_rootfs([tree])
+    assert art.known
+
+
+def test_expect_does_not_switch_off_the_host_comparison() -> None:
+    problems = doctor.verdict([], [_art(version="0.1.43")], expect="0.1.43")
+    assert any("this host runs" in p for p in problems)
+
+
+def test_expect_with_nothing_versioned_is_a_problem() -> None:
+    jvm = doctor.Artifact(path="/r/jvm", version=doctor.NO_BLASTBOX, runtime="firecracker",
+                          arch=plat.host_platform().arch, stamped=True, no_blastbox=True)
+    assert any("nothing" in p for p in doctor.verdict([], [jvm], expect="0.1.42"))
+
+
+def test_fleet_report_judges_a_rootfs_only_fleet_against_this_host() -> None:
+    assert doctor.fleet_report([], [_art(version="0.0.1")])["ok"] is False
+    assert doctor.fleet_report([], [_art(version="0.1.42")])["ok"] is True
+
+
+@pytest.mark.parametrize("body", [{}, {"blastbox_version": None}, {"blastbox_version": 42}])
+def test_an_incomplete_stamp_is_unreadable_not_package_free(body) -> None:
+    with pytest.raises(rfs.RootfsStampError, match="blastbox_version"):
+        rfs.RootfsStamp.from_json(json.dumps(body))
+
+
+def test_stamp_tree_refuses_an_unreadable_architecture(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(doctor, "version_in_image", lambda image, runner=None: ("0.1.42", ""))
+
+    def run(argv, **kw):
+        if "{{.Architecture}}" in argv or "{{.Id}}" in argv:
+            return subprocess.CompletedProcess(list(argv), 1, "", "daemon hiccup")
+        return subprocess.CompletedProcess(list(argv), 0, "{}", "")
+
+    with pytest.raises(rfs.RootfsStampError, match="architecture"):
+        rfs.stamp_tree(tmp_path, "eng:1", "firecracker", run=run)
+
+
+def test_the_legacy_scripts_fall_back_without_blastbox_but_fail_on_a_refusal() -> None:
+    """No importable blastbox: the documented unstamped fallback, with a shell-only link-safe
+    clear. blastbox present but the stamp REFUSED (an unverifiable guest): fail the build --
+    publishing it unstamped made the refusal weaker than stamping."""
+    root = Path(__file__).resolve().parents[2]
+    for script in ("deploy/firecracker/build-rootfs.sh", "deploy/redeploy-warm.sh"):
+        body = (root / script).read_text()
+        assert "import blastbox.host.rootfs_stamp" in body, script     # capability probe
+        assert "-L " in body, script                                   # link-safe shell clear
+
+
+# --- PR #186 codex (6be2a46): a PRESENT but malformed stamp is a refusal, not "legacy" ------
+
+
+def _stamp_file(tmp_path: Path) -> Path:
+    tree = tmp_path / "tree"
+    p = tree / rfs.STAMP_PATH
+    p.parent.mkdir(parents=True)
+    return p
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["{}", '{"blastbox_version": "0.1.', "[1, 2]", '{"blastbox_version": null}'],
+    ids=["empty-object", "truncated", "not-an-object", "null-version"],
+)
+def test_a_malformed_stamp_is_refused_not_booted_as_legacy(tmp_path: Path, body: str) -> None:
+    """Damaging the stamp must not be a way past the gate: only ABSENCE is legacy."""
+    p = _stamp_file(tmp_path)
+    p.write_text(body)
+    problem, definitive = rfs.guest_verdict(str(p.parents[2]), "gvisor")
+    assert problem and definitive
+    assert "stamp" in problem
+
+
+def test_an_oversized_stamp_is_refused_by_the_gate(tmp_path: Path) -> None:
+    p = _stamp_file(tmp_path)
+    p.write_bytes(b" " * (rfs.MAX_STAMP_BYTES + 1))
+    problem, definitive = rfs.guest_verdict(str(p.parents[2]), "gvisor")
+    assert "larger than" in problem and definitive
+
+
+def test_a_fifo_stamp_is_refused_by_the_gate(tmp_path: Path) -> None:
+    p = _stamp_file(tmp_path)
+    os.mkfifo(p)
+    problem, definitive = rfs.guest_verdict(str(p.parents[2]), "gvisor")
+    assert "not a regular file" in problem and definitive
+
+
+def test_a_symlinked_stamp_is_refused_by_the_gate(tmp_path: Path) -> None:
+    p = _stamp_file(tmp_path)
+    (tmp_path / "elsewhere.json").write_text('{"blastbox_version": "0.1.42"}')
+    p.symlink_to(tmp_path / "elsewhere.json")
+    problem, definitive = rfs.guest_verdict(str(p.parents[2]), "gvisor")
+    assert "symlink" in problem and definitive
+
+
+def test_an_absent_stamp_is_still_legacy_and_allowed(tmp_path: Path) -> None:
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    assert rfs.guest_verdict(str(tree), "gvisor") == ("", True)
+
+
+def test_a_failed_read_is_still_undecided_not_refused(tmp_path, monkeypatch) -> None:
+    """"I could not look" (debugfs timed out) is neither a refusal nor a verdict to cache."""
+    img = _debugfs_env(tmp_path, monkeypatch, block=True)
+    monkeypatch.setattr(rfs, "DEBUGFS_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(rfs, "_DEBUGFS_REAP_S", 0.01)
+    assert rfs.guest_verdict(str(img), "firecracker") == ("", False)
+
+
+# --- PR #186 codex (6be2a46): a debugfs that ignores SIGKILL is not re-spawned forever ------
+
+
+class _UnkillableDebugfs(_FakeDebugfs):
+    """debugfs in uninterruptible I/O: SIGKILL is ignored and its pipes never close."""
+
+    release = False
+
+    def read(self, n=-1):
+        import time as _t
+        deadline = _t.monotonic() + 10
+        while not _UnkillableDebugfs.release and _t.monotonic() < deadline:
+            _t.sleep(0.01)
+        return b""
+
+    def wait(self, timeout=None):
+        if _UnkillableDebugfs.release:
+            self.returncode = -9
+            return -9
+        raise subprocess.TimeoutExpired("debugfs", timeout or 0)
+
+    def poll(self):
+        return -9 if _UnkillableDebugfs.release else None
+
+
+def test_hung_debugfs_probes_are_capped_not_accumulated(tmp_path, monkeypatch) -> None:
+    img = tmp_path / "rootfs.ext4"
+    img.write_bytes(b"\0")
+    monkeypatch.setattr(rfs.shutil, "which", lambda _n: "/usr/sbin/debugfs")
+    monkeypatch.setattr(rfs, "DEBUGFS_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(rfs, "_DEBUGFS_REAP_S", 0.01)
+    monkeypatch.setattr(rfs, "_ABANDONED_DEBUGFS", [])
+    _FakeDebugfs.instances = []
+    _FakeDebugfs.block_next = False
+    _UnkillableDebugfs.release = False
+    monkeypatch.setattr(rfs.subprocess, "Popen", _UnkillableDebugfs)
+    try:
+        for _ in range(rfs.MAX_ABANDONED_DEBUGFS):
+            with pytest.raises(rfs.RootfsStampError, match="timed out"):
+                rfs.read_from_ext4(img)
+        # At the cap: refused WITHOUT starting another unreapable process.
+        with pytest.raises(rfs.RootfsStampError, match="still hung"):
+            rfs.read_from_ext4(img)
+        assert len(_FakeDebugfs.instances) == rfs.MAX_ABANDONED_DEBUGFS
+        # Once they finally exit, the slots are reclaimed and probing resumes.
+        _UnkillableDebugfs.release = True
+        for proc in _FakeDebugfs.instances:
+            proc.killed = True
+        import time as _t
+        _t.sleep(0.1)
+        monkeypatch.setattr(rfs.subprocess, "Popen", _FakeDebugfs)
+        with pytest.raises(rfs.RootfsStampError, match="larger than"):
+            rfs.read_from_ext4(img)
+        assert rfs._ABANDONED_DEBUGFS == []
+    finally:
+        _UnkillableDebugfs.release = True
+
+
+# --- PR #186 codex (a408276) ----------------------------------------------------------------
+
+
+def test_the_staging_probe_runner_is_bounded_in_time(monkeypatch) -> None:
+    """The label probe EXECUTES the image; the default runner had no timeout, so a probe that
+    never exits hung staging with its tree and container still present."""
+    import blastbox.host.imagerun as mod
+
+    seen: dict = {}
+
+    def fake_run(argv, **kw):
+        seen.update(kw)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    mod._probe_runner(mod._default_runner)(["docker", "run", "img"])
+    assert seen.get("timeout") and seen["timeout"] <= rfs.STAMP_TREE_TIMEOUT_S
+    assert seen.get("capture_output") is True
+
+
+def test_a_staging_probe_timeout_is_a_build_error(tmp_path, monkeypatch) -> None:
+    mod = _direct(tmp_path, monkeypatch)
+    monkeypatch.setattr(mod, "_read_stamp", lambda ident, r=None: _ImgStamp())
+
+    def hangs(ident, r=None):
+        raise subprocess.TimeoutExpired("docker", 1)
+
+    monkeypatch.setattr(mod, "_verify_contents", hangs)
+    plan = _plan(tmp_path)
+    with pytest.raises(mod.BuildError, match="timed out"):
+        mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                         extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True)
+
+
+def test_report_health_honours_project_pairing() -> None:
+    """verdict() refuses an artifact paired to a project with no container to vouch for it;
+    the report's `ok` said healthy for the same input because another project matched."""
+    art = doctor.Artifact(path="/r/a", version="0.1.42", runtime="firecracker",
+                          arch=plat.host_platform().arch, project="pA")
+    ctrs = [_ctr(project="pB", version="0.1.42")]
+    assert doctor.verdict(ctrs, [art])
+    assert doctor.fleet_report(ctrs, [art])["ok"] is False
+
+
+def test_the_label_less_probe_uses_the_bounded_runner_too(tmp_path, monkeypatch) -> None:
+    """PR #186 codex (2dad9af): the label-free path still called version_in_image through an
+    untimed lambda, so a hanging sitecustomize in the image blocked staging indefinitely."""
+    mod = _direct(tmp_path, monkeypatch)
+
+    class NoLabel:
+        blastbox = "unknown"
+        revision = "unknown"
+
+    bounded = object()
+    monkeypatch.setattr(mod, "_read_stamp", lambda ident, r=None: NoLabel())
+    monkeypatch.setattr(mod, "_probe_runner", lambda run: bounded)
+    got: list = []
+    monkeypatch.setattr(doctor, "version_in_image",
+                        lambda image, runner=None: got.append(runner) or ("0.1.42", ""))
+    plan = _plan(tmp_path)
+    mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                     extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True)
+    assert got == [bounded]
+
+
+def test_a_label_less_probe_timeout_is_a_build_error(tmp_path, monkeypatch) -> None:
+    mod = _direct(tmp_path, monkeypatch)
+
+    class NoLabel:
+        blastbox = "unknown"
+        revision = "unknown"
+
+    def hangs(image, runner=None):
+        raise subprocess.TimeoutExpired("docker", 1)
+
+    monkeypatch.setattr(mod, "_read_stamp", lambda ident, r=None: NoLabel())
+    monkeypatch.setattr(doctor, "version_in_image", hangs)
+    plan = _plan(tmp_path)
+    with pytest.raises(mod.BuildError, match="timed out"):
+        mod.stage_rootfs(plan, plan.rootfs[0], "t1", run=FakeRunner(), log=lambda _: None,
+                         extract=_fake_extract({"/init": "x"}), extract_preserves_ownership=True)
+
+
+def test_the_provenance_label_read_is_bounded_too(tmp_path, monkeypatch) -> None:
+    import blastbox.host.imagerun as mod
+
+    bounded = object()
+    got: list = []
+    monkeypatch.setattr(mod, "_probe_runner", lambda run: bounded)
+
+    def read(ident, r=None):
+        got.append(r)
+        raise subprocess.TimeoutExpired("docker", 1)
+
+    monkeypatch.setattr(mod, "_read_stamp", read)
+    with pytest.raises(mod.BuildError, match="provenance"):
+        mod._image_provenance(_plan(tmp_path), "sha256:" + "e" * 64, FakeRunner())
+    assert got == [bounded]
+
+
+# --- PR #186 codex (c2a2531) ----------------------------------------------------------------
+
+
+def test_stamp_text_cannot_forge_the_package_free_state(tmp_path) -> None:
+    """A stamp literally reading "(no blastbox)" is a VERSION the boot gate refuses, not the
+    package-free state -- doctor must not exempt it from every comparison."""
+    tree = _dir_stamp(tmp_path, "r", blastbox_version=doctor.NO_BLASTBOX,
+                      platform={"arch": plat.host_platform().arch, "runtime": "gvisor"})
+    assert rfs.guest_problem(tree, "gvisor")
+    (art,) = doctor.survey_rootfs([tree])
+    assert not art.no_blastbox
+    assert doctor.verdict([], [art])
+    assert doctor.fleet_report([], [art])["ok"] is False
+
+
+def test_in_flight_debugfs_probes_count_against_the_cap(tmp_path, monkeypatch) -> None:
+    """Hung probes joined the ledger only AFTER their timeout, so N concurrent checks all
+    passed admission and left N unreapable processes behind."""
+    import threading as _th
+
+    img = tmp_path / "rootfs.ext4"
+    img.write_bytes(b"\0")
+    monkeypatch.setattr(rfs.shutil, "which", lambda _n: "/usr/sbin/debugfs")
+    monkeypatch.setattr(rfs, "DEBUGFS_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(rfs, "_DEBUGFS_REAP_S", 0.01)
+    monkeypatch.setattr(rfs, "_ABANDONED_DEBUGFS", [])
+    monkeypatch.setattr(rfs, "_DEBUGFS_IN_FLIGHT", 0)
+    _FakeDebugfs.instances = []
+    _FakeDebugfs.block_next = False
+    _UnkillableDebugfs.release = False
+    monkeypatch.setattr(rfs.subprocess, "Popen", _UnkillableDebugfs)
+    n = rfs.MAX_ABANDONED_DEBUGFS * 2
+    barrier = _th.Barrier(n)
+    errors: list = []
+
+    def probe():
+        barrier.wait()
+        try:
+            rfs.read_from_ext4(img)
+        except rfs.RootfsStampError as exc:
+            errors.append(str(exc))
+
+    threads = [_th.Thread(target=probe) for _ in range(n)]
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        assert len(_FakeDebugfs.instances) <= rfs.MAX_ABANDONED_DEBUGFS
+        assert sum("still hung" in e or "in flight" in e for e in errors) >= n - rfs.MAX_ABANDONED_DEBUGFS
+    finally:
+        _UnkillableDebugfs.release = True
+
+
+# --- PR #186 codex (e63eaf7) ----------------------------------------------------------------
+
+
+def test_an_exhausted_probe_cap_refuses_rather_than_admits(tmp_path, monkeypatch) -> None:
+    """Hung probes elsewhere must not turn every new rootfs into an unchecked boot: the cap
+    being full is "could not look YET", refused and retried, not the legacy exception."""
+    img = tmp_path / "rootfs.ext4"
+    img.write_bytes(b"\0")
+    monkeypatch.setattr(rfs.shutil, "which", lambda _n: "/usr/sbin/debugfs")
+    monkeypatch.setattr(rfs, "_DEBUGFS_IN_FLIGHT", rfs.MAX_ABANDONED_DEBUGFS)
+    problem, definitive = rfs.guest_verdict(str(img), "firecracker")
+    assert problem and not definitive
+
+
+def test_a_busy_cap_is_reprobed_promptly_not_after_the_slow_backoff(tmp_path,
+                                                                   monkeypatch) -> None:
+    img = tmp_path / "rootfs.ext4"
+    img.write_bytes(b"\0")
+    monkeypatch.setattr(rfs.shutil, "which", lambda _n: "/usr/sbin/debugfs")
+    monkeypatch.setattr(rfs, "_DEBUGFS_IN_FLIGHT", rfs.MAX_ABANDONED_DEBUGFS)
+    gate = rfs.GuestGate(str(img), "firecracker")
+    assert gate.checked()[0]
+    import time as _t
+    assert gate._retry_at is not None
+    assert gate._retry_at - _t.monotonic() <= rfs.BUSY_RETRY_S
