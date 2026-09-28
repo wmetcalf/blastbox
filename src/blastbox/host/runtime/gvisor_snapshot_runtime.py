@@ -185,6 +185,27 @@ class GvisorSnapshotSlotRuntime:
         # NO capability reset -- see the FC twin. invalidate() already moved the artifact's
         # identity; publish() decides what the replacement is capable of (issue #92).
 
+    def maintain_idle(self, slot: Slot, *, budget_s: "float | None" = None) -> bool:
+        """Retire an idle slot whose checkpoint is past the snapshot age ceiling.
+
+        Called by the pool's ``_maintain_idle`` with the slot already reserved (IDLE->ASSIGNED),
+        so returning False retires it without racing a claimant. Cheap: no I/O. The decision is
+        the manager's (``slot_should_retire``) because only it knows which base the slot restored
+        from and whether a replacement has been published.
+        """
+        retire = getattr(self._mgr, "slot_should_retire", None)
+        return not (callable(retire) and retire(slot.slot_id))
+
+    def take_repaired_tiers(self) -> "list[str]":
+        """Swap in a refreshed base and report it once, so the pool advances the generation.
+
+        The swap happens HERE, inside the pool's drain and before it spawns, so no slot can be
+        restored from the new base under the old generation stamp. ``""`` names the whole runtime
+        (the pool's key for a single-tier base).
+        """
+        take = getattr(self._mgr, "take_repaired", None)
+        return [""] if callable(take) and take() else []
+
     def reap(self, slot: Slot) -> None:
         with self._lock:
             handle = self._handles.pop(slot.slot_id, None)
@@ -383,10 +404,7 @@ def select_gvisor_snapshot_runtime(*, cfg=None, require_available=False, manager
     # reached, while the failure it produces tells the operator to raise a DIFFERENT
     # variable (issue #147). A slow-but-healthy base -- a cold OCR/soffice warm-up on a
     # loaded node -- could not be accommodated at all.
-    mgr = SnapshotManager(
-        base_dir, backend, ack_capable=ack_capable,
-        ready_timeout_s=positive_float_env(os.environ, "BLASTBOX_SNAPSHOT_READY_S", 120.0),
-    )
+    mgr = SnapshotManager.from_env(base_dir, backend, ack_capable=ack_capable)
     return GvisorSnapshotSlotRuntime(mgr, settle_s=_settle(), ack_capable=ack_capable)
 
 

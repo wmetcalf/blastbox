@@ -71,6 +71,12 @@ class TestBothFactoriesPassItOn:
             def __getattr__(self, name):
                 return lambda *a, **k: None
 
+        # The factories construct through SnapshotManager.from_env (the one place the knobs are
+        # read). Bind the REAL from_env to the recorder, so the knob-reading code under test runs
+        # unmodified and only the final construction is recorded.
+        from blastbox.host.runtime.fc_snapshot import SnapshotManager as _Real
+        _Mgr.from_env = classmethod(_Real.from_env.__func__)  # type: ignore[attr-defined]
+
         patched = 0
         for mod in modules:
             if hasattr(mod, "SnapshotManager"):
