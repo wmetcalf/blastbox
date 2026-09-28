@@ -40,3 +40,28 @@ def positive_float_env(env: Mapping[str, str], key: str, default: float) -> floa
         _log.warning("%s=%r must be a finite value > 0; using %g", key, raw, default)
         return default
     return value
+
+
+def max_age_env(env: Mapping[str, str], key: str, default: float) -> float:
+    """A max-age in seconds from ``env``: ``0`` DISABLES, a finite positive value is used.
+
+    The sibling of :func:`positive_float_env`, which refuses 0 because a zero TIMEOUT expires
+    every call instantly. For an age limit 0 has a different and useful meaning -- "never age
+    out" -- so it is accepted here and only here. ``inf``/``nan``/negatives are still refused
+    loudly and the default kept: ``nan`` compares false against every age, which would disable
+    the limit while the operator believed it was set.
+    """
+    raw = str(env.get(key, "")).strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        _log.warning("invalid %s=%r; using %g", key, raw, default)
+        return default
+    if not math.isfinite(value) or value < 0:
+        _log.warning("invalid %s=%r (need 0 to disable, or a finite positive); using %g",
+                     key, raw, default)
+        return default
+    return value
+
