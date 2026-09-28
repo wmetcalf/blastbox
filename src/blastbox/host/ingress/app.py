@@ -1001,6 +1001,81 @@ def build_app(
         return job.to_public_dict()
 
     # -------------------------------------------------------------------
+    # Host attestation (see blastbox.host.attest)
+    # -------------------------------------------------------------------
+
+    from blastbox.host import attest as _attest
+
+    # Resolved ONCE, at build time: which file (if any) holds the key. The key itself is loaded
+    # -- and generated on first use -- lazily, so a host whose PKI dir is unwritable still
+    # serves every other route, and says why on the attestation ones.
+    _attest_path = _attest.attest_key_path()
+    _attest_lock = threading.Lock()
+    _attest_cache: dict[str, _attest.AttestKey] = {}
+
+    def _attest_key() -> _attest.AttestKey:
+        if _attest_path is None:
+            raise HTTPException(
+                404, "attestation is not configured on this host "
+                     "(set BLASTBOX_ATTEST_KEY or BLASTBOX_PKI_DIR)")
+        with _attest_lock:
+            key = _attest_cache.get("key")
+            if key is None:
+                try:
+                    key = _attest.load_or_create_key(_attest_path)
+                except Exception as exc:  # noqa: BLE001 - reported, never signed around
+                    _log.error("attestation key unavailable at %s: %s", _attest_path, exc)
+                    raise HTTPException(503, "attestation key unavailable on this host")
+                _attest_cache["key"] = key
+            return key
+
+    def _served_metadata_sha256(job: Job) -> str | None:
+        """sha256 of EXACTLY what ``GET /v1/jobs/{id}/metadata`` streams, read through the same
+        BlobStore -- or None where that route serves nothing (not DONE, or no object)."""
+        if job.status != JobStatus.DONE:
+            return None
+        try:
+            fh = _blob_store.open_output(job.job_id, "metadata.json")
+        except Exception:
+            return None
+        h = hashlib.sha256()
+        try:
+            with fh:
+                while chunk := fh.read(_STREAM_CHUNK):
+                    h.update(chunk)
+        except Exception as exc:  # noqa: BLE001 - a partial hash must never be signed
+            _log.warning("attestation: could not read metadata for job=%s: %s", job.job_id, exc)
+            raise HTTPException(503, "could not read metadata.json to attest it")
+        return h.hexdigest()
+
+    @app.get("/v1/jobs/{job_id}/attestation")
+    def get_attestation(job_id: str):
+        """A statement, signed by this host, of what it observed about a TERMINAL job.
+
+        Built from the host's job row and the hash of the served metadata bytes only -- never
+        from the worker's envelope. 404 unknown job / attestation not configured; 409 while the
+        job is still queued or running. Failed and expired jobs are attested too; ``status``
+        says which.
+        """
+        _validate_job_id(job_id)
+        key = _attest_key()
+        job = _job_store.get(job_id)
+        if job is None:
+            raise HTTPException(404, "job not found")
+        if not _attest.is_terminal(job.status):
+            raise HTTPException(409, f"job not terminal (status={job.status.value})")
+        doc = _attest.build_attestation(
+            job, key_id=key.key_id, metadata_sha256=_served_metadata_sha256(job),
+            host=_attest.host_id())
+        return _attest.sign_attestation(key, doc)
+
+    @app.get("/v1/attestation/key")
+    def get_attestation_key():
+        """This host's attestation public key. A CONVENIENCE for an operator pinning it: a
+        verifier must never trust a key because the host served it."""
+        return _attest.public_key_body(_attest_key())
+
+    # -------------------------------------------------------------------
     # Artifact routes (all require DONE status)
     # -------------------------------------------------------------------
 

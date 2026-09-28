@@ -1239,6 +1239,29 @@ def _blob_target_cmd(args: argparse.Namespace) -> int:
     return 0
 
 
+def _attest_key_cmd(args: argparse.Namespace) -> int:
+    """Print the host attestation PUBLIC key and its key_id, generating the key if it is
+    configured and missing. This is what an operator pins in a verifier (e.g. Loadout's
+    LOADOUT_ATTESTATION_KEYS); the private half is never printed."""
+    from blastbox.host import attest
+
+    path = attest.attest_key_path()
+    if path is None:
+        print(f"attestation is not configured: set {attest.ATTEST_KEY_ENV} (a key file) or "
+              f"{attest.PKI_DIR_ENV} (uses <dir>/{attest.ATTEST_KEY_FILENAME})", file=sys.stderr)
+        return 2
+    try:
+        key = attest.load_or_create_key(path)
+    except (OSError, ValueError) as exc:
+        print(f"attestation key {path}: {exc}", file=sys.stderr)
+        return 1
+    print(f"key_id: {key.key_id}")
+    print(f"alg: {attest.ALG}")
+    print(f"path: {path}")
+    print(key.public_key_pem, end="")
+    return 0
+
+
 def _claim_key_cmd(args: argparse.Namespace) -> int:
     """Show whether a node signing key is recorded on the job queue, or rotate it.
 
@@ -1937,6 +1960,12 @@ def build_parser() -> argparse.ArgumentParser:
     pk_reset.add_argument("--yes", action="store_true",
                           help="confirm every ingress on this queue is stopped")
     pk.set_defaults(func=_claim_key_cmd)
+
+    pak = sub.add_parser(
+        "attest-key",
+        help="print the host attestation public key + key_id to pin (generates it if missing)",
+    )
+    pak.set_defaults(func=_attest_key_cmd)
 
     pt = sub.add_parser(
         "blob-target",
