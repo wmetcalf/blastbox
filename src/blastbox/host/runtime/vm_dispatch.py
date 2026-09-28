@@ -421,7 +421,8 @@ class VmJobDispatcher:
         if self._engine is None or job.engine == self._engine:
             return True
         self._store.update_if_status(job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
-                                     status=JobStatus.QUEUED, claim_id=None, started_at=None)
+                                     status=JobStatus.QUEUED, claim_id=None, started_at=None,
+                                     net_policy_effective=None)
         return False
 
     def _effective_personality(self, job: Job, *, assume_sealed: bool = False):
@@ -554,7 +555,7 @@ class VmJobDispatcher:
             self._store.update_if_status(
                 job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
                 status=JobStatus.QUEUED, claim_id=None, started_at=None,
-                claimable_after=time.time() + delay)
+                net_policy_effective=None, claimable_after=time.time() + delay)
             return
 
         # Fail closed on an EFFECTIVE net_policy this warm tier can't honor — BEFORE detonation. A
@@ -598,8 +599,13 @@ class VmJobDispatcher:
         # dead COLD Docker job and requeues it — doesn't re-detonate it under us. The CAS is also our
         # OWNERSHIP fence: if it returns False the job was reclaimed since we claimed it, so STOP here
         # (don't validate someone else's job / write output another owner now controls).
+        # net_policy_effective: the egress this pool is PROVISIONED with, and only when the
+        # operator declared it (fixed_net_policy) -- the check above just proved the job's
+        # effective policy equals it. Undeclared, this host does not know what network the VM
+        # is on, so it records nothing rather than guess (an attestation then omits it).
         if not self._store.update_if_status(job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
-                                            worker_runtime="warm", worker_tier=self._worker_tier):
+                                            worker_runtime="warm", worker_tier=self._worker_tier,
+                                            net_policy_effective=fixed_policy or None):
             logger.info("vm_dispatch: job %s reclaimed before validate; skipping", job.job_id)
             # Purge unconditionally (Task 9): this worker's involvement with the job ends here, and
             # the blob store (real in every mode, not just S3) can always re-materialise the sample
@@ -686,6 +692,7 @@ class VmJobDispatcher:
                         expect_claim_id=job.claim_id,
                         status=JobStatus.QUEUED,
                         claim_id=None,
+                        net_policy_effective=None,
                         claimable_after=time.time() + self._blob_retry_backoff_s,
                         materialise_attempts=attempts,
                     )
@@ -880,7 +887,7 @@ class VmJobDispatcher:
             owned = self._store.update_if_status(
                 job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
                 status=JobStatus.QUEUED, claim_id=None, started_at=None,
-                worker_runtime=None, worker_tier=None)
+                worker_runtime=None, worker_tier=None, net_policy_effective=None)
             owned = False   # requeued, not terminal -> don't delete the input in the finally
         except Exception as exc:  # noqa: BLE001 — one bad job must not sink the dispatcher
             logger.warning("vm_dispatch: job %s failed: %s", job.job_id, exc, exc_info=True)

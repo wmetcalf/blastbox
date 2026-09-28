@@ -1140,6 +1140,7 @@ class Dispatcher:
                 # inherits a stale one (defensive: this cold path skips warm jobs today, so the
                 # field is None here — but keep worker_runtime/worker_tier reset in lockstep).
                 worker_tier=None,
+                net_policy_effective=None,
                 claim_id=None,
                 security_warnings=[
                     *job.security_warnings,
@@ -1710,6 +1711,7 @@ class Dispatcher:
             started_at=None,
             worker_runtime=None,
             worker_tier=None,
+            net_policy_effective=None,
             claim_id=None,
             error=None,
         )
@@ -1908,6 +1910,10 @@ class Dispatcher:
                 # Disambiguate the two warm backends in the result (both else report just
                 # "warm"): self._tier is "firecracker"/"gvisor" on a warm dispatcher.
                 worker_tier=self._tier,
+                # The personality this run is held to, recorded NOW (what a host attestation
+                # signs). Warm slots never carry egress -- an egress personality bypassed the
+                # slot above -- so this is the resolved none/drop the slot enforces.
+                net_policy_effective=self._resolve_personality(job).name,
             ):
                 # RECLAIM RACE, not a bad worker: a peer owns the job now, so this worker either
                 # never ran or already finished cleanly. Attributing it burns out healthy slots and
@@ -1921,6 +1927,7 @@ class Dispatcher:
                 return
             job.worker_runtime = "warm"
             job.worker_tier = self._tier
+            job.net_policy_effective = self._resolve_personality(job).name
 
             # ------------------------------------------------------------------
             # Step 2b: Materialise the sample on demand (Finding E1) if this node never
@@ -2683,6 +2690,9 @@ class Dispatcher:
             JobStatus.RUNNING,
             expect_claim_id=job.claim_id,
             worker_runtime=runtime.runtime,
+            # What the network args below enforce, recorded at dispatch (never recomputed later:
+            # the registry or override flag may change before anyone asks what ran).
+            net_policy_effective=personality.name,
             security_warnings=list(job.security_warnings) + list(runtime.warnings),
         ):
             _log.warning(
@@ -2990,6 +3000,7 @@ class Dispatcher:
                     claim_id=None,
                     worker_runtime=None,
                     worker_tier=None,
+                    net_policy_effective=None,
                     claimable_after=time.time() + self._blob_retry_backoff_s,
                     materialise_attempts=attempts,
                 )
