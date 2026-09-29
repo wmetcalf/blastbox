@@ -1670,14 +1670,14 @@ def test_the_gate_logs_the_rootfs_path_not_its_pinned_descriptor(tmp_path, caplo
     assert tree in caplog.text and "/proc/" not in caplog.text
 
 
-def test_the_gate_names_the_rootfs_in_a_refusal_and_its_log(tmp_path, caplog) -> None:
+def test_the_unstamped_warning_names_the_rootfs_not_its_descriptor(tmp_path, caplog) -> None:
+    """The warning branches (unstamped, unreadable) log the rootfs AND the exception text, which
+    read_from_dir() builds from the pinned path -- both must name the rootfs."""
     import logging
 
-    tree = _dir_stamp(tmp_path, "r", blastbox_version="0.1.42",
-                      platform={"arch": plat.host_platform().arch, "runtime": "gvisor"})
-    p = Path(tree) / rfs.STAMP_PATH
-    p.write_text("{}")                            # present but malformed: refused, and logged
-    with caplog.at_level(logging.INFO, logger="blastbox.host.rootfs_stamp"):
-        problem = rfs.GuestGate(tree, "gvisor").checked()[0]
-    assert problem and tree in problem and "/proc/" not in problem
-    assert "/proc/" not in caplog.text
+    tree = tmp_path / "bare"
+    tree.mkdir()                                  # no stamp at all: the legacy warning branch
+    with caplog.at_level(logging.WARNING, logger="blastbox.host.rootfs_stamp"):
+        assert rfs.GuestGate(str(tree), "gvisor").checked()[0] == ""
+    assert "no blastbox stamp" in caplog.text
+    assert str(tree) in caplog.text and "/proc/" not in caplog.text
