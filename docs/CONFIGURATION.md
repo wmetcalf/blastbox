@@ -65,7 +65,7 @@ as zero; a scrape never fails because of it.
 | `blastbox_host_cpu_count` | -- | `os.cpu_count()` |
 | `blastbox_host_load1` / `load5` / `load15` | -- | `os.getloadavg()` |
 | `blastbox_host_memory_total_bytes` / `blastbox_host_memory_available_bytes` | -- | `/proc/meminfo` `MemTotal` / `MemAvailable` |
-| `blastbox_cgroup_memory_max_bytes` / `blastbox_cgroup_memory_current_bytes` | -- | cgroup v2 `memory.max` / `memory.current` of the serve process's cgroup. `max` (unlimited) is omitted; cgroup v1 omits all cgroup series |
+| `blastbox_cgroup_memory_max_bytes` / `blastbox_cgroup_memory_current_bytes` | -- | cgroup v2 `memory.max` / `memory.current` of the serve process's cgroup. `max` (unlimited) is omitted; cgroup v1 omits all cgroup series. A `/proc/self/cgroup` path with a `..` component is ignored (the mount root is used) |
 | `blastbox_cgroup_cpu_quota_cores` | -- | cgroup v2 `cpu.max` quota / period; `max` (unlimited) is omitted |
 | `blastbox_host_disk_total_bytes` / `blastbox_host_disk_free_bytes` | `role` = `jobs`, `blobs`, or `jobs+blobs` | `statvfs` of `BLASTBOX_JOB_ROOT` and of the local blob store's root (its `local_root`: `BLASTBOX_BLOB_LOCAL_ROOT`, default the `blobs` sibling of the job root; absent for an S3 store). Free = bytes available to non-root (`f_bavail`). Paths are never label values |
 | `blastbox_node_budget_bytes` / `blastbox_node_budget_vcpus` | -- | Node autosizer consensus budget (min of the budgets the dispatchers publish) |
@@ -75,12 +75,15 @@ as zero; a scrape never fails because of it.
 btrfs subvolumes or bind mounts of one pool can have distinct `st_dev`s and so appear as separate
 roles with identical totals -- **don't sum across roles**.
 
-**Hung storage never stalls the API:** the filesystem part (disk `statvfs`, node share dir) is
-refreshed by a single background thread at most every 10s; a scrape waits for it at most 1s, then
-serves the last good values until 60s after they were **read** (the refresh start) and after that
-omits them. A hung NFS mount pins at most one thread and `/v1/healthz` keeps answering. If the
-refresher thread cannot be started (e.g. `pids.max` exhausted) a WARNING is logged once and the next
-scrape retries.
+**Hung storage never stalls the API:** each filesystem source -- every disk root (`jobs`, `blobs`)
+and the node share dir -- has its own background refresher, run at most every 10s. A scrape waits
+for them at most 1s in total, then serves each source's last good values until 60s after they were
+**read** (the refresh start) and after that omits **that source's** series only; a hung blob mount
+does not hide the job-root or node series. At most one thread per source (so at most 3) can be stuck
+on a hung mount, and `/v1/healthz` keeps answering. A source whose refresh has been blocked longer
+than 60s logs one WARNING ("metrics refresh of <role> has been blocked for Ns"), re-armed once it
+recovers. If a refresher thread cannot be started (e.g. `pids.max` exhausted) a WARNING is logged
+once and the next scrape retries.
 
 **Containers:** `/proc/stat`, `/proc/meminfo` and the load average are not namespaced, so inside a
 plain container they describe the **host kernel** (all of the host's CPUs and RAM, not the
@@ -99,7 +102,9 @@ enough), and `BLASTBOX_NODE_ID` matches the host's if one is set. The dir is cre
 The node series are **omitted** (never reported as a partial number) when:
 
 - the share dir is unreadable (permission error) -- WARNING logged once;
-- it holds more than 256 candidate snapshot files -- WARNING logged once;
+- it holds more than 256 candidate snapshot files, or a candidate (regular, <= 64 KiB) snapshot
+  that cannot be parsed or validated -- WARNING logged once (a stale snapshot is skipped, as the
+  dispatchers skip it);
 - the matched snapshots mix node ids, where an empty id counts as distinct (the same condition on
   which the dispatchers themselves fail closed) -- WARNING logged once;
 - no live snapshot has published a budget, or the autosizer is not configured for `serve`.
