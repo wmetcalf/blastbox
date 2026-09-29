@@ -12,9 +12,14 @@ with the DSN) can write:
     net_policy_effective  the personality this dispatcher ITSELF enforced for this run (local
                           cold via netd/netns, local warm slots); OMITTED wherever it did not
                           enforce the posture itself -- every remote/VM tier
-    net_exit         the enforced personality's exit driver ("none", "direct", "socks", ...),
+    net_exit         the exit driver actually APPLIED ("none", "direct", "inetsim", ...),
                      present only with net_policy_effective: the NAME is operator-defined, so
-                     two hosts could sign one name for opposite postures
+                     two hosts could sign one name for opposite postures. A containment claim
+                     (anything but "direct") is signed only when the dispatcher VERIFIED that
+                     containment for this run; otherwise all network fields are omitted.
+    net_downgraded   true when the applied args failed the run closed to --network=none
+                     (net_exit is then "none"); absent otherwise
+    net_inspect      true when the run was routed through the TLS-MITM inspect gateway
     started_at_ms / finished_at_ms / issued_at_ms   integer epoch ms, its own clock
 
 The receipt is written as ``attestation.json`` beside ``metadata.json`` in the sealed output
@@ -241,24 +246,26 @@ def load_or_create_key(path: Path) -> AttestKey:
 
 
 def load_attest_key(env: Mapping[str, str] | None = None, *, create: bool = True,
-                    quiet_missing: bool = False) -> AttestKey | None:
+                    quiet: bool = False) -> AttestKey | None:
     """The configured key, or ``None`` -- attestation disabled, or the key refused/unloadable.
 
     Never raises: a dispatcher whose key is bad must keep running jobs (without receipts), so a
-    failure is logged LOUDLY here instead."""
+    failure is logged LOUDLY here. ``quiet`` is for a process that is NOT the signer (the ingress
+    key route): there a missing, foreign-owned or unreadable key is the normal case, so every
+    failure is logged at debug only."""
     path = attest_key_path(env)
     if path is None:
         _log.debug("attestation: %s not set; receipts are off", ATTEST_KEY_ENV)
         return None
+    log = _log.debug if quiet else _log.error
     try:
         return load_or_create_key(path) if create else load_existing_key(path)
     except FileNotFoundError:
-        (_log.debug if quiet_missing else _log.error)(
-            "attestation: no key at %s; receipts are DISABLED", path)
+        log("attestation: no key at %s; receipts are DISABLED", path)
     except AttestKeyRefused as exc:
-        _log.error("attestation: key refused (%s); receipts are DISABLED", exc)
+        log("attestation: key refused (%s); receipts are DISABLED", exc)
     except Exception as exc:  # noqa: BLE001 - never take the dispatcher down over a receipt
-        _log.error("attestation: key at %s unusable (%s); receipts are DISABLED", path, exc)
+        log("attestation: key at %s unusable (%s); receipts are DISABLED", path, exc)
     return None
 
 
@@ -289,11 +296,15 @@ class RunObservation:
     input_sha256: str
     worker_runtime: str | None
     worker_tier: str | None
-    # Only where THIS dispatcher enforced the posture itself; None everywhere else.
-    net_policy_effective: str | None
-    net_exit: str | None
     started_at_ms: int
     finished_at_ms: int
+    # Only where THIS dispatcher enforced -- and, for a containment claim, VERIFIED -- the
+    # posture for this run; None everywhere else.
+    net_policy_effective: str | None = None
+    net_exit: str | None = None
+    # The APPLIED posture differs from the personality's declaration:
+    net_downgraded: bool = False    # the network args failed the run closed to --network=none
+    net_inspect: bool = False       # the run was routed through the TLS-MITM inspect gateway
 
 
 def sha256_file(path: Path) -> str:
@@ -335,6 +346,11 @@ def build_receipt(obs: RunObservation, *, key_id: str, metadata_sha256: str,
     if obs.net_policy_effective is not None:
         doc["net_policy_effective"] = obs.net_policy_effective
         doc["net_exit"] = obs.net_exit
+        # Booleans, present only when true, so an ordinary receipt carries neither.
+        if obs.net_downgraded:
+            doc["net_downgraded"] = True
+        if obs.net_inspect:
+            doc["net_inspect"] = True
     return doc
 
 

@@ -174,7 +174,7 @@ def test_missing_key_can_be_quiet_for_non_signers(tmp_path, caplog):
 
     caplog.set_level(logging.INFO)
     env = {"BLASTBOX_ATTEST_KEY": str(tmp_path / "absent.key")}
-    assert attest.load_attest_key(env, create=False, quiet_missing=True) is None
+    assert attest.load_attest_key(env, create=False, quiet=True) is None
     assert caplog.records == []
 
 
@@ -252,13 +252,15 @@ def test_seal_writes_a_verifiable_receipt_over_the_exact_metadata_bytes(tmp_path
     ("job_id", "00000000-0000-0000-0000-000000000000"), ("engine", "other"),
     ("status", "failed"), ("input_sha256", "0" * 64), ("metadata_sha256", "0" * 64),
     ("executor", "node:x"), ("worker_runtime", "runc"), ("worker_tier", "firecracker"),
-    ("net_policy_effective", "direct"), ("net_exit", "direct"), ("finished_at_ms", 1), ("host", "evil"),
+    ("net_policy_effective", "direct"), ("net_exit", "direct"), ("net_downgraded", False),
+    ("net_inspect", False), ("finished_at_ms", 1), ("host", "evil"),
     ("key_id", "0" * 16), ("issued_at_ms", 7),
 ])
 def test_tampering_any_field_breaks_verification(tmp_path, field, value):
     out = _tree(tmp_path)
     key = attest.load_or_create_key(tmp_path / "k")
-    body = attest.seal_receipt(out, key=key, observation=_obs())
+    body = attest.seal_receipt(out, key=key, observation=_obs(net_downgraded=True,
+                                                              net_inspect=True))
     doc = dict(body["attestation"])
     assert field in doc
     doc[field] = value
@@ -351,3 +353,23 @@ def test_tree_receipt_verification(tmp_path):
     assert not attest.tree_receipt_is_ours(out, key=key, job_id="22222222-2222-2222-2222-222222222222")
     (out / "metadata.json").write_bytes(meta + b" ")      # metadata changed since signing
     assert not attest.tree_receipt_is_ours(out, key=key, job_id=jid)
+
+
+def test_downgrade_and_inspect_flags_are_present_only_when_true():
+    plain = attest.build_receipt(_obs(), key_id="k" * 16, metadata_sha256="c" * 64)
+    assert "net_downgraded" not in plain and "net_inspect" not in plain
+    flagged = attest.build_receipt(
+        _obs(net_policy_effective="mitm", net_exit="none", net_downgraded=True),
+        key_id="k" * 16, metadata_sha256="c" * 64)
+    assert flagged["net_downgraded"] is True and flagged["net_exit"] == "none"
+    assert flagged["net_policy_effective"] == "mitm"
+    inspected = attest.build_receipt(_obs(net_exit="direct", net_inspect=True),
+                                     key_id="k" * 16, metadata_sha256="c" * 64)
+    assert inspected["net_inspect"] is True
+
+
+def test_flags_never_appear_without_a_signed_policy():
+    doc = attest.build_receipt(_obs(net_policy_effective=None, net_exit=None,
+                                    net_downgraded=True, net_inspect=True),
+                               key_id="k" * 16, metadata_sha256="c" * 64)
+    assert not {"net_policy_effective", "net_exit", "net_downgraded", "net_inspect"} & set(doc)

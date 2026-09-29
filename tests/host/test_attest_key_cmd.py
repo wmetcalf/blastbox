@@ -81,3 +81,36 @@ def test_help_says_to_run_as_the_dispatchers_user(capsys):
         cli.main(["attest-key", "--help"])
     out = capsys.readouterr().out
     assert "service user" in out and "BLASTBOX_ATTEST_KEY" in out
+
+
+def test_key_option_overrides_the_env(monkeypatch, capsys, tmp_path):
+    """`sudo -u blastbox` resets the environment, so the path must be passable explicitly."""
+    path = tmp_path / "explicit.key"
+    rc, cap = _run(monkeypatch, capsys, {"BLASTBOX_ATTEST_KEY": str(tmp_path / "env.key")},
+                   "--key", str(path))
+    assert rc == 0
+    assert path.exists() and not (tmp_path / "env.key").exists()
+    assert attest.load_existing_key(path).key_id in cap.out
+
+
+def test_key_option_works_with_no_env(monkeypatch, capsys, tmp_path):
+    path = tmp_path / "explicit.key"
+    rc, _ = _run(monkeypatch, capsys, {}, "--key", str(path))
+    assert rc == 0 and path.exists()
+
+
+def test_every_hint_passes_the_key_explicitly(monkeypatch, capsys, tmp_path):
+    import os
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    rc, cap = _run(monkeypatch, capsys, {"BLASTBOX_ATTEST_KEY": str(tmp_path / "a.key")})
+    assert rc == 1 and f"--key {tmp_path / 'a.key'}" in cap.err
+
+
+def test_help_shows_the_key_option_in_the_sudo_example(capsys):
+    import pytest
+
+    with pytest.raises(SystemExit):
+        cli.main(["attest-key", "--help"])
+    out = " ".join(capsys.readouterr().out.split())
+    assert "--key" in out and "attest-key --key" in out

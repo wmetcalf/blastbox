@@ -435,3 +435,193 @@ def test_network_endpoint_tiers_sign_no_policy(tmp_path, key):
     assert store.get(job.job_id).status is JobStatus.DONE
     doc = _verify(key, json.loads(_receipt_path(tmp_path, job).read_bytes()))
     assert "net_policy_effective" not in doc and "net_exit" not in doc
+
+
+# ---------------------------------------------------------------------------
+# Cold path: a containment claim is signed only when verified for THIS run
+# ---------------------------------------------------------------------------
+
+
+def _posture_runner(tmp_path, job, *, internal: "dict[str, str | None]", calls=None):
+    """docker run -> valid output; docker network inspect <net> -> internal[net] (None = error)."""
+    out = tmp_path / "jobs" / job.job_id / "output"
+
+    def run(argv, **kw):
+        if argv[:3] == ["docker", "network", "inspect"]:
+            net = argv[-1]
+            if calls is not None:
+                calls.append(net)
+            val = internal.get(net)
+            if val is None:
+                return subprocess.CompletedProcess(argv, 1, "", "Error: No such network")
+            return subprocess.CompletedProcess(argv, 0, val + "\n", "")
+        if argv[:2] == ["docker", "run"]:
+            _make_valid_output_dir(out, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    return run
+
+
+def _cold_doc(tmp_path, key, monkeypatch, *, decl, internal, calls=None, health=None):
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_P", decl)
+    store = InMemoryJobStore()
+    job = _queue(tmp_path, store)
+    d = _dispatcher(tmp_path, store, attest_key=key, engine_policy="p",
+                    runner=_posture_runner(tmp_path, job, internal=internal, calls=calls))
+    if health is not None:
+        monkeypatch.setattr(d, "_node_egress_health", lambda: health)
+    assert d.dispatch_once() is True
+    assert store.get(job.job_id).status == JobStatus.DONE, store.get(job.job_id).error
+    return _verify(key, json.loads(_receipt_path(tmp_path, job).read_bytes()))
+
+
+def test_bridge_exit_signed_when_the_bridge_is_verified_internal(tmp_path, key, monkeypatch):
+    doc = _cold_doc(tmp_path, key, monkeypatch, decl="exit=inetsim",
+                    internal={"bb-fakenet": "true"})
+    assert doc["net_policy_effective"] == "p" and doc["net_exit"] == "inetsim"
+    assert "net_downgraded" not in doc and "net_inspect" not in doc
+
+
+@pytest.mark.parametrize("state", ["false", None, "garbage"])
+def test_bridge_exit_omitted_when_the_bridge_is_not_verified(tmp_path, key, monkeypatch,
+                                                            caplog, state):
+    """A hand-made/recreated non-internal bb-fakenet gives the sample real internet. Unless this
+    dispatcher verified the bridge is --internal, it must not sign 'inetsim'."""
+    doc = _cold_doc(tmp_path, key, monkeypatch, decl="exit=inetsim",
+                    internal={"bb-fakenet": state})
+    assert "net_policy_effective" not in doc and "net_exit" not in doc
+    assert "bb-fakenet" in caplog.text
+
+
+def test_bridge_verification_is_cached_briefly(tmp_path, key, monkeypatch):
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_P", "exit=inetsim")
+    store = InMemoryJobStore()
+    calls: list[str] = []
+    jobs = [_queue(tmp_path, store) for _ in range(2)]
+    outs = {j.job_id: tmp_path / "jobs" / j.job_id / "output" for j in jobs}
+
+    def run(argv, **kw):
+        if argv[:3] == ["docker", "network", "inspect"]:
+            calls.append(argv[-1])
+            return subprocess.CompletedProcess(argv, 0, "true\n", "")
+        if argv[:2] == ["docker", "run"]:
+            name = next(a for a in argv if a.startswith("--name")) if any(
+                a.startswith("--name") for a in argv) else ""
+            for jid, out in outs.items():
+                if jid in " ".join(argv):
+                    _make_valid_output_dir(out, input_sha256=_INPUT_SHA)
+            del name
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    d = _dispatcher(tmp_path, store, attest_key=key, engine_policy="p", runner=run)
+    assert d.dispatch_once() is True and d.dispatch_once() is True
+    assert calls == ["bb-fakenet"]
+
+
+def test_direct_makes_no_containment_claim_and_needs_no_check(tmp_path, key, monkeypatch):
+    calls: list[str] = []
+    doc = _cold_doc(tmp_path, key, monkeypatch, decl="exit=direct", internal={}, calls=calls)
+    assert doc["net_exit"] == "direct" and calls == []
+
+
+def test_none_is_always_verified(tmp_path, key, monkeypatch):
+    calls: list[str] = []
+    doc = _cold_doc(tmp_path, key, monkeypatch, decl="exit=drop", internal={}, calls=calls)
+    assert doc["net_exit"] == "drop" and calls == []
+    assert "net_downgraded" not in doc
+
+
+def test_a_downgrade_signs_what_was_applied(tmp_path, key, monkeypatch):
+    """exit=httpproxy,inspect=1 cannot be route-inspected, so the args fail closed to
+    --network=none. The receipt signs the APPLIED posture, flagged as a downgrade."""
+    calls: list[str] = []
+    doc = _cold_doc(tmp_path, key, monkeypatch, decl="exit=httpproxy,inspect=1,proxy=http://x:1",
+                    internal={}, calls=calls)
+    assert doc["net_policy_effective"] == "p"
+    assert doc["net_exit"] == "none" and doc["net_downgraded"] is True
+    assert "net_inspect" not in doc and calls == []
+
+
+def test_an_inspected_run_is_flagged_and_needs_bb_inspect_verified(tmp_path, key, monkeypatch):
+    doc = _cold_doc(tmp_path, key, monkeypatch, decl="exit=direct,inspect=1,gateway=172.30.9.1",
+                    internal={"bb-inspect": "true"})
+    assert doc["net_exit"] == "direct" and doc["net_inspect"] is True
+
+
+def test_an_inspected_run_on_an_unverified_bb_inspect_is_omitted(tmp_path, key, monkeypatch):
+    doc = _cold_doc(tmp_path, key, monkeypatch, decl="exit=direct,inspect=1,gateway=172.30.9.1",
+                    internal={"bb-inspect": "false"})
+    assert "net_policy_effective" not in doc and "net_inspect" not in doc
+
+
+def test_vpn_exit_needs_a_positive_gateway_health_verdict(tmp_path, key, monkeypatch):
+    from blastbox.host.egress import Health
+
+    doc = _cold_doc(tmp_path, key, monkeypatch, decl="exit=wireguard,gateway=172.30.9.1",
+                    internal={"bb-vpn": "true"}, health=Health(True, "ok"))
+    assert doc["net_exit"] == "wireguard"
+
+
+@pytest.mark.parametrize("health", ["gate-off", "bridge-open"])
+def test_vpn_exit_omitted_without_verification(tmp_path, key, monkeypatch, health):
+    from blastbox.host.egress import Health
+
+    if health == "gate-off":       # the health gate is not armed: nothing verified the gateway
+        doc = _cold_doc(tmp_path, key, monkeypatch, decl="exit=wireguard,gateway=172.30.9.1",
+                        internal={"bb-vpn": "true"})
+    else:
+        doc = _cold_doc(tmp_path, key, monkeypatch, decl="exit=wireguard,gateway=172.30.9.1",
+                        internal={"bb-vpn": "false"}, health=Health(True, "ok"))
+    assert "net_policy_effective" not in doc and "net_exit" not in doc
+
+
+# ---------------------------------------------------------------------------
+# Warm path on a local cascade: sign the member tier that owned the slot
+# ---------------------------------------------------------------------------
+
+
+def test_warm_cascade_signs_the_member_tier_that_ran_the_slot(tmp_path, key):
+    from tests.host.test_dispatch_warm import (
+        FakeWarmPool,
+        _make_slot,
+        _start_fake_worker,
+    )
+    from tests.host.test_dispatch_warm import _engine_spec as _warm_engine
+    from tests.host.test_dispatch_warm import _fake_runtime as _warm_runtime
+    from tests.host.test_dispatch_warm import _make_valid_output_dir as _warm_out
+
+    class _CascadeLike:
+        def slot_tier(self, slot):
+            return "firecracker"
+
+    store = InMemoryJobStore()
+    job = _queue(tmp_path, store)
+    slot = _make_slot(tmp_path)
+    _start_fake_worker(slot, output_fn=lambda o: _warm_out(o, input_sha256=_INPUT_SHA))
+    d = Dispatcher(
+        job_store=store, engines={_ENGINE_NAME: _warm_engine()}, limits=_limits(),
+        job_root=tmp_path / "jobs", runtime_selector=_warm_runtime,
+        subprocess_runner=lambda *a, **kw: subprocess.CompletedProcess(a[0], 0, "", ""),
+        worker_timeout_s=10, pool=FakeWarmPool(slot, runtime=_CascadeLike()), tier="cascade",
+        warm_claim_timeout_s=0.5, warm_requeue_backoff_s=0.0, blob_store=_blobs(tmp_path),
+        attest_key=key,
+    )
+    assert d.dispatch_once() is True
+    assert store.get(job.job_id).status == JobStatus.DONE
+    doc = _verify(key, json.loads(_receipt_path(tmp_path, job).read_bytes()))
+    assert doc["worker_tier"] == "firecracker"
+
+
+def test_cascade_runtime_reports_the_owning_tier():
+    import threading
+    import types
+
+    from blastbox.host.runtime.cascade import CascadingRuntime, Tier
+
+    rt = object.__new__(CascadingRuntime)
+    rt._lock = threading.RLock()
+    rt.tiers = [Tier(name="gvisor", runtime=object(), capacity=1),
+                Tier(name="firecracker", runtime=object(), capacity=1)]
+    rt._owner = {"s0": 0, "s1": 1}
+    assert rt.slot_tier(types.SimpleNamespace(slot_id="s1")) == "firecracker"
+    assert rt.slot_tier(types.SimpleNamespace(slot_id="s0")) == "gvisor"
+    assert rt.slot_tier(types.SimpleNamespace(slot_id="gone")) is None

@@ -1251,10 +1251,13 @@ def _attest_key_cmd(args: argparse.Namespace) -> int:
 
     from blastbox.host import attest
 
-    path = attest.attest_key_path()
+    # --key wins: `sudo -u <user>` resets the environment, so BLASTBOX_ATTEST_KEY does not
+    # survive into the command every hint below tells the operator to run.
+    explicit = (getattr(args, "key", None) or "").strip()
+    path = Path(explicit) if explicit else attest.attest_key_path()
     if path is None:
-        print(f"execution receipts are not enabled: set {attest.ATTEST_KEY_ENV} to the key file "
-              f"path (opt-in; one key per dispatcher host)", file=sys.stderr)
+        print(f"execution receipts are not enabled: set {attest.ATTEST_KEY_ENV} (or pass --key) "
+              f"to the key file path (opt-in; one key per dispatcher host)", file=sys.stderr)
         return 2
 
     def _user(uid: int) -> str:
@@ -1271,13 +1274,15 @@ def _attest_key_cmd(args: argparse.Namespace) -> int:
     if st is None and euid == 0 and not getattr(args, "allow_root", False):
         print(f"refusing to mint {path} as root: the dispatcher refuses a key it does not own. "
               f"Run this as the dispatcher's service user, e.g. `sudo -u blastbox blastbox "
-              f"attest-key`, or pass --allow-root if the dispatcher itself runs as root.",
+              f"attest-key --key {path}`, or pass --allow-root if the dispatcher itself runs "
+              f"as root.",
               file=sys.stderr)
         return 1
     if st is not None and st.st_uid != euid:
         owner = _user(st.st_uid)
         print(f"{path} is owned by {owner}, not {_user(euid)}; run this as the dispatcher's "
-              f"service user that owns it, e.g. `sudo -u {owner} blastbox attest-key`.",
+              f"service user that owns it, e.g. `sudo -u {owner} blastbox attest-key --key "
+              f"{path}`.",
               file=sys.stderr)
         return 1
     try:
@@ -1997,9 +2002,14 @@ def build_parser() -> argparse.ArgumentParser:
         description="Print the execution-receipt public key and key_id for a verifier to pin, "
                     "generating the key at BLASTBOX_ATTEST_KEY if it is missing. Opt-in: "
                     "nothing is signed unless BLASTBOX_ATTEST_KEY is set. Run it AS THE "
-                    "DISPATCHER'S SERVICE USER (e.g. `sudo -u blastbox blastbox attest-key`): "
-                    "the dispatcher refuses a key file it does not own.",
+                    "DISPATCHER'S SERVICE USER, passing the path explicitly because sudo resets "
+                    "the environment (e.g. `sudo -u blastbox blastbox attest-key --key "
+                    "/var/lib/blastbox/attest.key`): the dispatcher refuses a key file it does "
+                    "not own.",
     )
+    pak.add_argument("--key", metavar="PATH",
+                     help="the key file (overrides BLASTBOX_ATTEST_KEY; use it under sudo, "
+                          "which drops the environment)")
     pak.add_argument("--allow-root", action="store_true",
                      help="permit minting as root (only when the dispatcher itself runs as "
                           "root; otherwise run as the dispatcher's service user)")

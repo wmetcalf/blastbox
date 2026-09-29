@@ -2070,10 +2070,17 @@ class Dispatcher:
             # Warm slots never carry egress (an egress personality bypassed the slot in
             # _dispatch_claimed_job), so this is the resolved none/drop the slot runs under --
             # resolved from this dispatcher's own registry, same inputs as that routing decision.
+            # Containment is by construction of the local warm runtimes this dispatcher launched:
+            # Firecracker slots are booted with no network interface at all, and gVisor slots get
+            # a fresh, empty network namespace (only loopback) in their OCI spec.
             warm_personality = self._resolve_personality(job)
+            # The tier that owns THIS slot: a local cascade routes each slot to a member tier
+            # (firecracker / gvisor), and "cascade" names the router, not the sandbox.
+            slot_tier_fn = getattr(runtime, "slot_tier", None)
+            signed_tier = slot_tier_fn(slot) if callable(slot_tier_fn) else self._tier
             observation = None if receipt_input_sha256 is None else _attest.RunObservation(
                 job_id=job.job_id, engine=job.engine, input_sha256=receipt_input_sha256,
-                worker_runtime="warm", worker_tier=self._tier,
+                worker_runtime="warm", worker_tier=signed_tier,
                 net_policy_effective=warm_personality.name,
                 net_exit=warm_personality.exit_driver,
                 started_at_ms=started_at_ms, finished_at_ms=finished_at_ms)
@@ -2461,6 +2468,9 @@ class Dispatcher:
         # affect them. It also means a global-mode node running those tiers is not
         # actually credential-free for them — see docs/DEPLOYMENT.md.
         gated_by_gateway_health = personality.exit_driver in ("openvpn", "wireguard")
+        # The gateway verdict THIS dispatch relied on, kept for the execution receipt: a VPN
+        # exit is signed only when this was a positive verdict (None = the gate is off).
+        gateway_health = None
         if gated_by_gateway_health:
             # Still inside this node's own cooldown for this job: put it straight back
             # with the short shared defer and do NOT probe health again. Re-probing was
@@ -2473,6 +2483,7 @@ class Dispatcher:
                 )
                 return
             health = self._node_egress_health()
+            gateway_health = health
             if health is not None and not health.healthy:
                 n = self._bump_egress_defer(job.job_id)
                 shared_defer, delay = self._egress_defer_plan(n)
@@ -2767,9 +2778,8 @@ class Dispatcher:
         observation = None if receipt_input_sha256 is None else _attest.RunObservation(
             job_id=job.job_id, engine=job.engine, input_sha256=receipt_input_sha256,
             worker_runtime=runtime.runtime, worker_tier=None,
-            # Enforced HERE: the network args/labels above wire this personality (netd/netns).
-            net_policy_effective=personality.name, net_exit=personality.exit_driver,
-            started_at_ms=started_at_ms, finished_at_ms=finished_at_ms)
+            started_at_ms=started_at_ms, finished_at_ms=finished_at_ms,
+            **self._verified_net_claim(personality, network_args, gateway_health))
 
         # The worker's exit code is NOT the authority (the trust gate below is), but a non-zero
         # `docker run` (e.g. a malformed flag → RC 125 "invalid argument for --memory", or an
@@ -3050,6 +3060,71 @@ class Dispatcher:
                     materialise_attempts=0,
                 )
             return True
+
+    #: How long a `docker network inspect` verdict on a bridge's --internal flag is trusted.
+    BRIDGE_VERIFY_TTL_S = 60.0
+
+    def _bridge_is_internal(self, network: str) -> bool:
+        """Whether docker reports ``network`` as --internal, cached briefly. Any error or
+        unexpected answer is NOT verified -- this gates a signed containment claim."""
+        now = time.monotonic()
+        cache = self.__dict__.setdefault("_bridge_internal_cache", {})
+        hit = cache.get(network)
+        if hit is not None and now - hit[1] < self.BRIDGE_VERIFY_TTL_S:
+            return bool(hit[0])
+        try:
+            proc = self._subprocess_runner(
+                ["docker", "network", "inspect", "-f", "{{.Internal}}", network],
+                capture_output=True, text=True, check=False, timeout=10)
+            verdict = (getattr(proc, "returncode", 1) == 0
+                       and str(getattr(proc, "stdout", "") or "").strip().lower() == "true")
+        except Exception as exc:  # noqa: BLE001 - unknown is not verified
+            _log.debug("docker network inspect %s failed: %s", network, exc)
+            verdict = False
+        cache[network] = (verdict, now)
+        return verdict
+
+    def _verified_net_claim(self, personality, network_args: list[str],
+                            gateway_health) -> dict:
+        """The network fields a receipt may sign for this run, from the APPLIED args.
+
+        A claim more restrictive than ``direct`` is signed only when this dispatcher verified the
+        containment for this run: ``--network=none`` always is; a bridged exit needs docker to
+        report its bridge --internal (checked here, cached briefly); a netd gateway exit (VPN)
+        additionally needs a POSITIVE gateway health verdict from this dispatch. ``direct`` makes
+        no containment claim. Anything unverified omits every network field (and warns)."""
+        from blastbox.host.netapply import INSPECT_BRIDGE
+
+        driver = personality.exit_driver
+        base = {"net_policy_effective": personality.name}
+        if network_args == ["--network=none"]:
+            if driver in ("none", "drop"):
+                return {**base, "net_exit": driver}
+            # The args failed this run closed: sign what was APPLIED, flagged.
+            return {**base, "net_exit": "none", "net_downgraded": True}
+        bridge = network_args[1] if len(network_args) == 2 and network_args[0] == "--network" \
+            else None
+        if bridge is None:
+            _log.warning("attestation: unrecognised network args %r for job personality %r; "
+                         "receipt omits the network posture", network_args, personality.name)
+            return {}
+        inspect = bridge == INSPECT_BRIDGE
+        if driver == "direct" and not inspect:
+            return {**base, "net_exit": "direct"}           # no containment claim to verify
+        if not self._bridge_is_internal(bridge):
+            _log.warning("attestation: bridge %s is not verified --internal (docker network "
+                         "inspect); receipt omits the network posture for %r",
+                         bridge, personality.name)
+            return {}
+        if driver in ("openvpn", "wireguard") and not (
+                gateway_health is not None and getattr(gateway_health, "healthy", False)):
+            _log.warning("attestation: %s exit on %s had no positive gateway health verdict "
+                         "this dispatch; receipt omits the network posture", driver, bridge)
+            return {}
+        claim = {**base, "net_exit": driver}
+        if inspect:
+            claim["net_inspect"] = True
+        return claim
 
     def _receipt_input_sha256(self, job: Job, input_path: Path) -> str | None:
         """sha256 of the input file about to be handed to the sandbox, or None when receipts

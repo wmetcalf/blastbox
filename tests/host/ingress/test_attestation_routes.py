@@ -292,3 +292,41 @@ def test_key_route_with_a_configured_but_absent_key_is_quiet(tmp_path, monkeypat
     caplog.clear()
     assert client.get("/v1/attestation/key").status_code == 404
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+@pytest.mark.parametrize("why", ["foreign-owner", "unreadable"])
+def test_key_route_on_a_non_signer_is_quiet_when_the_key_is_not_ours(tmp_path, key, monkeypatch,
+                                                                    caplog, why):
+    """The ingress is not the signer: its euid commonly does not own the dispatcher's key. That is
+    a 404 at debug level, not an ERROR on every request."""
+    import logging
+    import os
+
+    path = tmp_path / "keys" / "attest.key"
+    monkeypatch.setenv("BLASTBOX_ATTEST_KEY", str(path))
+    if why == "foreign-owner":
+        owner = os.stat(path).st_uid
+        monkeypatch.setattr(attest.os, "geteuid", lambda: owner + 1)
+    else:
+        real_open = attest.os.open
+
+        def deny(p, *a, **kw):
+            if str(p) == str(path):
+                raise PermissionError(13, "Permission denied", str(p))
+            return real_open(p, *a, **kw)
+        monkeypatch.setattr(attest.os, "open", deny)
+    client, _ = _make_client(tmp_path)
+    caplog.set_level(logging.INFO)
+    caplog.clear()
+    assert client.get("/v1/attestation/key").status_code == 404
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_the_dispatchers_own_load_stays_loud(tmp_path, key, monkeypatch, caplog):
+    import os
+
+    path = tmp_path / "keys" / "attest.key"
+    owner = os.stat(path).st_uid
+    monkeypatch.setattr(attest.os, "geteuid", lambda: owner + 1)
+    assert attest.load_attest_key({"BLASTBOX_ATTEST_KEY": str(path)}) is None
+    assert "DISABLED" in caplog.text

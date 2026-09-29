@@ -1077,7 +1077,7 @@ def build_app(
         """The attestation public key configured for THIS process, if any. Never mints one --
         the ingress is not the signer. A CONVENIENCE for pinning: a verifier must never trust a
         key because a host served it."""
-        key = _attest.load_attest_key(create=False, quiet_missing=True)
+        key = _attest.load_attest_key(create=False, quiet=True)
         if key is None:
             raise HTTPException(404, "no attestation key is configured for this process "
                                      "(BLASTBOX_ATTEST_KEY; generate it with "
