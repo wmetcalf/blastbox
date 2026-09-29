@@ -711,3 +711,25 @@ def test_a_stale_drop_that_adopts_a_staged_refresh_is_reported_once(tmp_path) ->
     assert mgr.take_repaired() is False
     assert mgr.invalidate(only_if=old, repaired=True) is False   # superseded: nothing to report
     assert mgr.take_repaired() is False
+
+
+def test_a_stale_drop_on_an_in_flight_refresh_is_reported_once(tmp_path) -> None:
+    """Prosecution of #190: the drop lands while the refresh is still BOOTING. A drain in between
+    consumed the drop's report; the refresh then finished, was adopted as the repair, and its swap
+    reported the same episode again -- the pool advanced its generation twice for one repair."""
+    import threading
+
+    backend = DistinctBackend()
+    mgr, _ = _built(tmp_path, backend=backend, max_age_s=60.0)
+    old = mgr.artifact
+    _age(mgr, 61.0)
+    backend.gate = threading.Event()
+    backend.entered.clear()
+    mgr.ensure_build_started()
+    assert backend.entered.wait(5)                # the refresh is booting
+    assert mgr.invalidate(only_if=old, repaired=True) is True
+    assert mgr.take_repaired() is True            # the drop is the report
+    backend.gate.set()
+    _stage(mgr)                                   # the refresh finishes and is adopted
+    assert mgr.take_repaired() is False           # its swap is the SAME repair: not reported again
+    assert mgr.artifact == "artifact-1"

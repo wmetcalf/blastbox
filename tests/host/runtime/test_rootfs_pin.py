@@ -1092,3 +1092,21 @@ def test_a_stale_drop_is_reported_to_the_pool_as_a_repair(tmp_path, monkeypatch)
         mgr.restore("s2")
     assert mgr.take_repaired() is True
     assert mgr.take_repaired() is False           # once per repair
+
+
+def test_the_pools_own_repair_subsumes_a_pending_stale_report(tmp_path, monkeypatch) -> None:
+    """Prosecution of #190: a stale drop left its report pending, then the pool's own repair
+    (invalidate(), which advances the pool's generation itself) landed before the drain -- and the
+    leftover flag advanced it a second time."""
+    from blastbox.host.runtime.fc_snapshot import SnapshotManager
+
+    monkeypatch.setattr(rfs, "guest_verdict", lambda p, r: ("", True))
+    backend, _launcher, rootfs, _base = _fc_backend(tmp_path)
+    mgr = SnapshotManager(tmp_path / "mgr", backend)
+    mgr.build()
+    mgr.restore("s1")
+    _replace(rootfs, b"gen-2")
+    with pytest.raises(SnapshotRestoreError, match="changed since"):
+        mgr.restore("s2")
+    mgr.invalidate()                              # the pool's repair: it records the generation
+    assert mgr.take_repaired() is False

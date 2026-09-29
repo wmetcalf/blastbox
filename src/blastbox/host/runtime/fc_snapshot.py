@@ -154,6 +154,10 @@ class SnapshotManager:
         # Set on a swap and drained by the runtime's take_repaired_tiers(), so the pool advances
         # its generation and old-generation failures stop being charged to the new base.
         self._repaired = False
+        # The build epoch whose repair invalidate(repaired=True) already reported. The refresh that
+        # repair ADOPTS is staged under that same epoch, and its later swap is the same episode:
+        # counted once, or the pool advanced its generation twice for one repair.
+        self._reported_epoch: int | None = None
         # A finished refresh is STAGED, not published: only take_repaired() -- the pool's drain,
         # on the thread that also stamps and spawns slots -- swaps it in. Published by the refresh
         # thread at an arbitrary moment, a slot restored from the new base could carry the
@@ -246,7 +250,11 @@ class SnapshotManager:
         """
         with self._build_lock:
             out, self._repaired = self._repaired, False
+            adopted_epoch = (self._staged_epoch
+                             if self._staged is not None and self._staged_for is None else None)
             swapped, collect = self._swap_staged_locked()
+            if swapped and adopted_epoch is not None and adopted_epoch == self._reported_epoch:
+                swapped = False       # the adopted swap of a repair invalidate() already reported
             if collect is not None:
                 # PARKED, not discarded here: the pool calls this under its own lock, and a
                 # discard is a RAM-sized unlink. Flag a sweep for the next tick's prepare():
@@ -845,8 +853,15 @@ class SnapshotManager:
                 return False
             had = self._artifact is not None
             collect = self._invalidate_locked()
-            if had and repaired:
-                self._repaired = True
+            if repaired:
+                if had:
+                    self._repaired = True
+                    self._reported_epoch = self._build_epoch
+            else:
+                # The pool's own repair records its generation itself, which subsumes any drop
+                # still waiting to be reported: leaving the flag set advanced it a second time.
+                self._repaired = False
+                self._reported_epoch = None
         for artifact in collect:
             self._collect(artifact)
         return had
