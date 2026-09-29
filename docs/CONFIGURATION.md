@@ -73,9 +73,9 @@ those bytes — it signs nothing.
 |---|---|---|
 | `BLASTBOX_ATTEST_KEY` | unset (off) | Path to this dispatcher's EC P-256 signing key, generated `0600` on first use. **The only switch** — `BLASTBOX_PKI_DIR` does not enable it. An existing key that is a symlink, not owned by the dispatcher's euid, or has any group/other permission bit is refused (logged, receipts off); a refused or unloadable key never fails a job. |
 | `BLASTBOX_HOST_ID` | hostname | The `host` the receipt names. |
-| *(command)* `blastbox attest-key` | — | Prints the public key + `key_id` for a verifier to pin (generating the key if missing). **Run it as the dispatcher's service user** (`sudo -u blastbox blastbox attest-key`): the dispatcher refuses a key file it does not own. It refuses to mint as root unless `--allow-root` (only when the dispatcher itself runs as root). |
+| *(command)* `blastbox attest-key --key PATH` | — | Prints the public key + `key_id` for a verifier to pin (generating the key if missing). **Run it as the dispatcher's service user and pass the path explicitly** — `sudo` resets the environment, so `BLASTBOX_ATTEST_KEY` does not survive it: `sudo -u blastbox blastbox attest-key --key /var/lib/blastbox/attest.key`. The dispatcher refuses a key file it does not own; the command refuses to mint as root unless `--allow-root` (only when the dispatcher itself runs as root). |
 | `GET /v1/jobs/{id}/attestation` | — | The stored receipt, verbatim. `404` unknown job / no receipt (keyless dispatcher, `FAILED` job, pre-receipt result, or a *tombstone* — below); `409` queued/running; `410` expired; `503` blob-store read error. Same auth as `GET /v1/jobs/{id}`. |
-| `GET /v1/attestation/key` | — | This process's public key, only if `BLASTBOX_ATTEST_KEY` is set **and** the key already exists (the ingress never mints one). A convenience for pinning — a verifier must never trust a key because a host served it. |
+| `GET /v1/attestation/key` | — | This process's public key, only if `BLASTBOX_ATTEST_KEY` is set **and** the key already exists and is usable by this process (the ingress never mints one, and a key it cannot read or does not own is a quiet `404`). A convenience for pinning — a verifier must never trust a key because a host served it. |
 
 **One key per dispatcher host.** Each signing host — including every federated node that signs —
 has its own key, and the verifier pins each one it accepts, by `key_id`. When a finalize does not
@@ -83,13 +83,37 @@ sign (no key, signing failed, input could not be hashed), it writes a *tombstone
 (`{"attestation": null, "reason": "…"}`) instead, so a superseded attempt's receipt in the store is
 always overwritten; the route answers `404` for it.
 
+**Rotating the key:** rotate (or unset) `BLASTBOX_ATTEST_KEY` only when this host has **no
+retained pending uploads**. A retained result is re-uploaded later by the pending-upload sweep,
+which keeps its receipt only if it verifies against the host's *current* key — so results
+pending at a rotation are re-uploaded without a receipt (a tombstone).
+
 **What a receipt proves:** that the holder of the pinned key hashed *this* input
 (`input_sha256`, from the bytes it handed the sandbox), sealed *these* `metadata.json` bytes
-(`metadata_sha256`), launched it under `worker_runtime`/`worker_tier`, and — only where that
-dispatcher enforced the network posture itself (local cold via netd/netns, local warm slots) — ran
-it under `net_policy_effective` with exit driver `net_exit`. Every VM / network-endpoint tier
-(libvirt, AWS, static, cascade) omits the policy: their egress is a declaration, not something the
-dispatcher enforces. Timestamps are integer epoch milliseconds; the signed JSON contains no floats.
+(`metadata_sha256`), and launched it under `worker_runtime`/`worker_tier` (on a local cascade,
+the member tier that owned the slot — `firecracker`/`gvisor` — not `cascade`).
+
+**The network posture is signed only where it was enforced and verified.** `net_policy_effective`
+(the personality name) and `net_exit` (the exit driver actually *applied*) are signed only by the
+local cold and local warm paths (including a local, file-style cascade, which runs through the
+warm path), and a claim more restrictive than `direct` only when the dispatcher verified that
+containment for this run:
+
+- `--network=none` (none/drop, and warm slots) is always verified;
+- a bridged exit (`inetsim`, `socks`, `tor`, `httpproxy`, the `bb-inspect` gateway) needs
+  `docker network inspect` to report the bridge `--internal` (checked at dispatch, cached 60s;
+  any error counts as unverified);
+- a VPN exit (`wireguard`/`openvpn`) additionally needs a positive gateway health verdict from
+  this dispatch (the egress health gate must be armed);
+- `direct` makes no containment claim and is signed as-is.
+
+Unverified → every network field is omitted and a WARNING names the bridge. When the applied args
+fail a run closed (e.g. `exit=httpproxy,inspect=1` → `--network=none`) the receipt signs
+`net_exit: "none"` with `net_downgraded: true`; a run routed through the TLS-MITM inspect gateway
+adds `net_inspect: true`. **Every VM / network-endpoint tier** (libvirt, AWS, static, and a
+network-style cascade — all run by `VmJobDispatcher`) omits the posture: its egress is a
+declaration, not something the dispatcher enforces. Timestamps are integer epoch milliseconds;
+the signed JSON contains no floats.
 
 **What it does not prove:** that detections are true (the envelope is still the worker's account).
 And, plainly: **any pinned key whose holder can write the shared results prefix can attach a
