@@ -112,6 +112,10 @@ blastbox dispatch                                    # the worker dispatcher loo
 
 `POST /v1/jobs` (multipart `file` + `engine`) enqueues a job; the dispatcher launches a hardened
 disposable worker for it; `GET /v1/jobs/{id}/artifacts/{artifact_id}` serves validated output.
+Opt-in execution receipts: with `BLASTBOX_ATTEST_KEY` set, the dispatcher signs what it observed of
+each `DONE` run, served at `GET /v1/jobs/{id}/attestation` (pin the key printed by
+`blastbox attest-key`; see [docs/CONFIGURATION.md](docs/CONFIGURATION.md#execution-receipts-opt-in)
+for what a receipt does and does not prove).
 
 The defaults run a secure single-host deployment — you set almost nothing. For the warm-pool /
 runtime / sandbox tiers, **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** is the tier-decision guide

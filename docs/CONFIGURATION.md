@@ -61,6 +61,40 @@ The default CSP (`middleware.DEFAULT_CSP`) is `default-src 'self'; script-src 's
 | `BLASTBOX_ALLOW_TIER_ROUTING` | `0` | Allow a job to **request a specific warm backend** via a `target_tier` field at submit (claim-predicate honored by every store: memory / sql / redis). **Off (default) ⇒ `target_tier` is silently ignored** (like a per-job override that isn't permitted). The `worker_tier` label (e.g. `firecracker` / `gvisor` / `libvirt-vm`) is what a warm sidecar advertises and what UIs show. Gate this *with* `BLASTBOX_MAX_QUEUED_AGE_S` — a job pinned to a tier whose dispatcher is down would otherwise queue forever. |
 | `BLASTBOX_DISPATCH_SOLE_OWNER` | `0` | Network-endpoint dispatcher only. `1` ⇒ this is the **only** dispatcher on the store, so orphan recovery may also reclaim a claim that crashed before the `worker_runtime="warm"` stamp. Leave `0` on a **shared** store (a cold dispatcher for the same engine) — it would otherwise FAIL that peer's live jobs. |
 
+## Execution receipts (opt-in)
+
+A dispatcher holding a signing key signs an **execution receipt** for every job it completes, at
+the moment it seals the `DONE` result, from what *it* observed of that run. Nothing on the job row
+feeds it (nodes, peer dispatchers and anyone with the DSN can write the row). The receipt is
+written as `attestation.json` into the sealed output and uploaded with it; the ingress only serves
+those bytes — it signs nothing.
+
+| Var / command | Default | Notes |
+|---|---|---|
+| `BLASTBOX_ATTEST_KEY` | unset (off) | Path to this dispatcher's EC P-256 signing key, generated `0600` on first use. **The only switch** — `BLASTBOX_PKI_DIR` does not enable it. An existing key that is a symlink, not owned by the dispatcher's euid, or has any group/other permission bit is refused (logged, receipts off); a refused or unloadable key never fails a job. |
+| `BLASTBOX_HOST_ID` | hostname | The `host` the receipt names. |
+| *(command)* `blastbox attest-key` | — | Prints the public key + `key_id` for a verifier to pin (generating the key if missing). **Run it as the dispatcher's service user** (`sudo -u blastbox blastbox attest-key`): the dispatcher refuses a key file it does not own. It refuses to mint as root unless `--allow-root` (only when the dispatcher itself runs as root). |
+| `GET /v1/jobs/{id}/attestation` | — | The stored receipt, verbatim. `404` unknown job / no receipt (keyless dispatcher, `FAILED` job, pre-receipt result, or a *tombstone* — below); `409` queued/running; `410` expired; `503` blob-store read error. Same auth as `GET /v1/jobs/{id}`. |
+| `GET /v1/attestation/key` | — | This process's public key, only if `BLASTBOX_ATTEST_KEY` is set **and** the key already exists (the ingress never mints one). A convenience for pinning — a verifier must never trust a key because a host served it. |
+
+**One key per dispatcher host.** Each signing host — including every federated node that signs —
+has its own key, and the verifier pins each one it accepts, by `key_id`. When a finalize does not
+sign (no key, signing failed, input could not be hashed), it writes a *tombstone*
+(`{"attestation": null, "reason": "…"}`) instead, so a superseded attempt's receipt in the store is
+always overwritten; the route answers `404` for it.
+
+**What a receipt proves:** that the holder of the pinned key hashed *this* input
+(`input_sha256`, from the bytes it handed the sandbox), sealed *these* `metadata.json` bytes
+(`metadata_sha256`), launched it under `worker_runtime`/`worker_tier`, and — only where that
+dispatcher enforced the network posture itself (local cold via netd/netns, local warm slots) — ran
+it under `net_policy_effective` with exit driver `net_exit`. Every VM / network-endpoint tier
+(libvirt, AWS, static, cascade) omits the policy: their egress is a declaration, not something the
+dispatcher enforces. Timestamps are integer epoch milliseconds; the signed JSON contains no floats.
+
+**What it does not prove:** that detections are true (the envelope is still the worker's account).
+And, plainly: **any pinned key whose holder can write the shared results prefix can attach a
+receipt to a job it never ran.** Pin only keys of hosts you trust as much as the control plane.
+
 ## Startup store canary
 
 Before a dispatcher claims its first job it proves it can actually **store and serve a result**:
