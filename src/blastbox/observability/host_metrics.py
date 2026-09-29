@@ -408,21 +408,28 @@ class HostResourceCollector(Collector):
                                     value=mem["MemAvailable"])
 
     def _cgroup_dir(self) -> Optional[Path]:
+        """This process's OWN cgroup v2 dir under the mount, or None. Never a guess: the mount
+        root is used only when /proc/self/cgroup says the process IS in it (``0::/``, e.g. under
+        a cgroup namespace). If the path is unreadable, missing, escapes the mount (``..``) or
+        doesn't exist under it, the mount root is SOME OTHER cgroup (an ancestor / the ns root),
+        and publishing its values as ours is exactly the misreport these series exist to avoid —
+        so they are omitted."""
         root = self._cgroup_root
         if not (root / "cgroup.controllers").is_file():
             return None  # cgroup v1 (or no cgroupfs): omitted
-        text = _read_small(self._proc_self_cgroup) or ""
+        text = _read_small(self._proc_self_cgroup)
+        if text is None:
+            return None
         for line in text.splitlines():
             if line.startswith("0::"):
                 rel = line[3:].strip().lstrip("/")
-                # the path is data: a `..` component must not walk out of the cgroup mount
-                if any(part == ".." for part in rel.split("/")):
+                if not rel:
                     return root
-                cand = root / rel if rel else root
-                # without a cgroup namespace the recorded path may not exist under this mount;
-                # the mount root is then the process's own cgroup (container) — use it
-                return cand if cand.is_dir() else root
-        return root
+                if any(part in ("..", ".") for part in rel.split("/")):
+                    return None
+                cand = root / rel
+                return cand if cand.is_dir() else None
+        return None
 
     def _cgroup(self) -> Iterable[GaugeMetricFamily]:
         d = self._cgroup_dir()

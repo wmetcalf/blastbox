@@ -65,7 +65,7 @@ as zero; a scrape never fails because of it.
 | `blastbox_host_cpu_count` | -- | `os.cpu_count()` |
 | `blastbox_host_load1` / `load5` / `load15` | -- | `os.getloadavg()` |
 | `blastbox_host_memory_total_bytes` / `blastbox_host_memory_available_bytes` | -- | `/proc/meminfo` `MemTotal` / `MemAvailable` |
-| `blastbox_cgroup_memory_max_bytes` / `blastbox_cgroup_memory_current_bytes` | -- | cgroup v2 `memory.max` / `memory.current` of the serve process's cgroup. `max` (unlimited) is omitted; cgroup v1 omits all cgroup series. A `/proc/self/cgroup` path with a `..` component is ignored (the mount root is used) |
+| `blastbox_cgroup_memory_max_bytes` / `blastbox_cgroup_memory_current_bytes` | -- | cgroup v2 `memory.max` / `memory.current` of the serve process's cgroup. `max` (unlimited) is omitted; cgroup v1 omits all cgroup series. Omitted too when the process's own cgroup can't be resolved under `/sys/fs/cgroup` (`/proc/self/cgroup` unreadable, no `0::` line, a `..` component, or a path that doesn't exist under the mount) -- the mount root is used only when the process is in it (`0::/`, e.g. under a cgroup namespace) |
 | `blastbox_cgroup_cpu_quota_cores` | -- | cgroup v2 `cpu.max` quota / period; `max` (unlimited) is omitted |
 | `blastbox_host_disk_total_bytes` / `blastbox_host_disk_free_bytes` | `role` = `jobs`, `blobs`, or `jobs+blobs` | `statvfs` of `BLASTBOX_JOB_ROOT` and of the local blob store's root (its `local_root`: `BLASTBOX_BLOB_LOCAL_ROOT`, default the `blobs` sibling of the job root; absent for an S3 store). Free = bytes available to non-root (`f_bavail`). Paths are never label values |
 | `blastbox_node_budget_bytes` / `blastbox_node_budget_vcpus` | -- | Node autosizer consensus budget (min of the budgets the dispatchers publish) |

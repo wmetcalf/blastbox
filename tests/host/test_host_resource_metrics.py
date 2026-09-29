@@ -768,18 +768,65 @@ def test_blocked_warning_rearms_after_recovery(caplog):
     assert len(blocked) == 2
 
 
-def test_cgroup_path_escape_falls_back_to_mount_root(tmp_path):
+def _cg_root_with_values(tmp_path: Path) -> Path:
     root = tmp_path / "cg"
     root.mkdir()
     (root / "cgroup.controllers").write_text("memory\n")
     (root / "memory.max").write_text("1000\n")
+    (root / "memory.current").write_text("500\n")
+    return root
+
+
+@pytest.mark.parametrize("self_cgroup", [
+    None,                    # /proc/self/cgroup unreadable
+    "1:net_cls:/\n",         # no v2 `0::` line
+    "0::/docker/missing\n",  # recorded path not under this mount
+    "0::/../evil\n",         # escapes the mount (cgroupns: cgroup outside the ns root)
+])
+def test_cgroup_unresolvable_own_cgroup_is_omitted_not_root(tmp_path, self_cgroup):
+    # The mount root is SOME OTHER cgroup (an ancestor / the ns root): reporting its values as
+    # "this process's cgroup" is the misreport the cgroup series exist to prevent.
+    root = _cg_root_with_values(tmp_path)
     evil = tmp_path / "evil"
     evil.mkdir()
     (evil / "memory.max").write_text("999999\n")
     selfcg = tmp_path / "self_cgroup"
-    selfcg.write_text("0::/../evil\n")
+    if self_cgroup is not None:
+        selfcg.write_text(self_cgroup)
+    names = _names(_collector(tmp_path, cgroup_root=root, proc_self_cgroup=selfcg))
+    assert not any(n.startswith("blastbox_cgroup") for n in names)
+
+
+def test_cgroup_process_in_root_cgroup_uses_root(tmp_path):
+    root = _cg_root_with_values(tmp_path)
+    selfcg = tmp_path / "self_cgroup"
+    selfcg.write_text("0::/\n")
     s = _samples(_collector(tmp_path, cgroup_root=root, proc_self_cgroup=selfcg))
     assert s[("blastbox_cgroup_memory_max_bytes", ())] == 1000
+    assert s[("blastbox_cgroup_memory_current_bytes", ())] == 500
+
+
+def test_node_view_staleness_window_matches_dispatchers(tmp_path):
+    """The observer and the dispatchers apply the SAME (publisher-declared) staleness window: a
+    snapshot declaring a 60s window, aged 40s, is live for both even though the observer's own
+    configured window is 20s — and one aged past its declared window is dropped by both."""
+    d = tmp_path / "node"
+    share = FileNodeShare(str(d))
+    now = time.time()
+    live = DemandSnapshot(**{**_snap("aa", assigned=2, ram=100, vcpus=1, budget_ram=1000,
+                                     budget_vcpus=4).__dict__, "stale_after_s": 60.0,
+                             "ts": now - 40})
+    dead = DemandSnapshot(**{**_snap("bb", assigned=3, ram=100, vcpus=1, budget_ram=1000,
+                                     budget_vcpus=4).__dict__, "stale_after_s": 30.0,
+                             "ts": now - 40})
+    share.publish(live)
+    share.publish(dead)
+    ro = read_snapshots_readonly(str(d), max_age_s=20.0, now=now)
+    disp = FileNodeShare(str(d)).read_all(max_age_s=20.0, now=now)
+    assert ro is not None
+    assert sorted(x.engine for x in ro) == sorted(x.engine for x in disp) == ["aa"]
+    view = read_node_view(str(d), stale_after_s=20.0, node="")
+    assert view is not None and view.allocated_ram_mib == 200
 
 
 def test_readonly_reader_survives_short_reads(tmp_path, monkeypatch):
