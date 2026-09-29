@@ -1,10 +1,11 @@
 """Host resource gauges on the ingress ``/metrics`` (CPU / RAM / disk / node budget).
 
 ``/proc`` and cgroupfs are read inline on every scrape; the filesystem part (``os.statvfs`` of the
-job/blob roots, the node share dir) comes from a single-flight background refresher with a TTL and a
-staleness bound, so a hung mount can never block a request thread. The proc root, statvfs, loadavg,
-clock and the node view are injectable so these tests never depend on the machine running them. The contract under test: a series that cannot be read truthfully is
-OMITTED — a scrape never raises and never emits a fabricated zero.
+job/blob roots, the node share dir) comes from one single-flight background refresher PER SOURCE
+with a TTL and a staleness bound, so a hung mount can never block a request thread nor blank another
+source's series. The proc root, statvfs, loadavg, clock and the node view are injectable so these
+tests never depend on the machine running them. The contract under test: a series that cannot be
+read truthfully is OMITTED — a scrape never raises and never emits a fabricated zero.
 """
 from __future__ import annotations
 
@@ -363,7 +364,7 @@ def test_two_apps_in_one_process_do_not_collide(tmp_path):
 
 
 def test_hung_filesystem_cannot_starve_the_ingress(tmp_path):
-    """A statvfs that never returns (hard NFS mount) must pin AT MOST one thread; every scrape
+    """A statvfs that never returns (hard NFS mount) must pin AT MOST one thread (for that source); every scrape
     still returns promptly and healthz keeps answering."""
     import asyncio
     import threading
@@ -516,6 +517,9 @@ def test_read_node_view_over_cap_is_omitted_with_warning(tmp_path, monkeypatch, 
 
     import blastbox.host.node_share as ns
 
+    import blastbox.observability.host_metrics as hm
+
+    monkeypatch.setattr(hm, "_warned_over_cap", False)
     d = tmp_path / "node"
     _publish_n(d, 10)
     monkeypatch.setattr(ns, "_RO_MAX_FILES", 4)
@@ -545,7 +549,7 @@ def test_fs_cache_recovers_when_thread_start_fails(monkeypatch):
     import blastbox.observability.host_metrics as hm
 
     t = [0.0]
-    cache = hm._FsCache(lambda: hm._FsValues(disk=(("jobs", 1, 1),), node=None),
+    cache = hm._FsCache(lambda: ("jobs", 1, 1),
                         clock=lambda: t[0], ttl_s=10, max_stale_s=60, wait_s=1)
     assert cache.get() is not None
     real = hm.threading.Thread.start
@@ -574,7 +578,7 @@ def test_fs_cache_refresh_exception_clears_inflight():
         n[0] += 1
         if n[0] == 1:
             raise OSError("boom")
-        return hm._FsValues(disk=(("jobs", 1, 1),), node=None)
+        return ("jobs", 1, 1)
 
     cache = hm._FsCache(refresh, clock=lambda: t[0], ttl_s=10, max_stale_s=60, wait_s=1)
     assert cache.get() is None
@@ -589,7 +593,7 @@ def test_fs_cache_staleness_counts_from_refresh_start():
 
     def slow_refresh():
         t[0] += 50  # the read took 50s (slow mount) — values are as old as its START
-        return hm._FsValues(disk=(("jobs", 1, 1),), node=None)
+        return ("jobs", 1, 1)
 
     cache = hm._FsCache(slow_refresh, clock=lambda: t[0], ttl_s=100, max_stale_s=60, wait_s=1)
     assert cache.get() is not None   # age 50 <= 60
@@ -615,7 +619,7 @@ def test_share_dir_permission_error_is_logged_once(tmp_path, caplog):
     c = _collector(tmp_path, node_view_fn=denied)
     with caplog.at_level(logging.WARNING):
         _names(c)
-        c._fs.force_stale()  # next scrape refreshes again
+        c._node_cache.force_stale()  # next scrape refreshes again
         _names(c)
     warns = [r for r in caplog.records if "node" in r.getMessage().lower()
              and r.levelno == logging.WARNING]
@@ -658,3 +662,147 @@ def test_cgroup_v1_is_omitted(tmp_path):
     (root / "memory" / "memory.limit_in_bytes").write_text("123\n")
     names = _names(_collector(tmp_path, cgroup_root=root))
     assert not any(n.startswith("blastbox_cgroup") for n in names)
+
+
+# ---------------------------------------------------------------------------
+# review round 3
+# ---------------------------------------------------------------------------
+
+
+def test_hung_node_share_does_not_blank_disk_series(tmp_path):
+    import threading
+
+    hang = threading.Event()
+
+    def node_fn():
+        hang.wait()
+        return None
+
+    t = [0.0]
+    c = _collector(tmp_path, disk_roots={"jobs": tmp_path}, node_view_fn=node_fn,
+                   clock=lambda: t[0], refresh_wait_s=0.1)
+    try:
+        assert "blastbox_host_disk_free_bytes" in _names(c)
+        t[0] = 61
+        assert "blastbox_host_disk_free_bytes" in _names(c)
+    finally:
+        hang.set()
+
+
+def test_blocked_disk_root_only_omits_its_own_role(tmp_path, caplog):
+    import logging
+    import threading
+
+    jobs, blobs = tmp_path / "jobs", tmp_path / "blobs"
+    jobs.mkdir()
+    blobs.mkdir()
+    hang = threading.Event()
+
+    class _St:
+        f_blocks, f_frsize, f_bavail = 100, 4096, 50
+
+    def statvfs(p):
+        if str(p) == str(blobs):
+            hang.wait()
+        return _St()
+
+    view = NodeView(budget_ram_mib=1, budget_vcpus=1, allocated_ram_mib=0, allocated_vcpus=0)
+    t = [0.0]
+    c = _collector(tmp_path, disk_roots={"jobs": jobs, "blobs": blobs}, statvfs_fn=statvfs,
+                   dev_fn=lambda p: 1 if str(p) == str(jobs) else 2, node_view_fn=lambda: view,
+                   clock=lambda: t[0], refresh_wait_s=0.1)
+    try:
+        with caplog.at_level(logging.WARNING):
+            s = _samples(c)
+            assert ("blastbox_host_disk_total_bytes", (("role", "jobs"),)) in s
+            assert ("blastbox_host_disk_total_bytes", (("role", "blobs"),)) not in s
+            assert ("blastbox_node_budget_bytes", ()) in s
+            t[0] = 61
+            s = _samples(c)
+            _samples(c)
+            assert ("blastbox_host_disk_total_bytes", (("role", "jobs"),)) in s
+            assert ("blastbox_node_budget_bytes", ()) in s
+        blocked = [r for r in caplog.records if r.levelno == logging.WARNING
+                   and "blocked" in r.getMessage()]
+        assert len(blocked) == 1 and "blobs" in blocked[0].getMessage()
+    finally:
+        hang.set()
+
+
+def test_blocked_warning_rearms_after_recovery(caplog):
+    import logging
+    import threading
+
+    import blastbox.observability.host_metrics as hm
+
+    t = [0.0]
+    gate = threading.Event()
+    hang = [True]
+
+    def refresh():
+        if hang[0]:
+            gate.wait()
+        return 1
+
+    cache = hm._FsCache(refresh, clock=lambda: t[0], ttl_s=10, max_stale_s=60, wait_s=0.05,
+                        name="jobs")
+    with caplog.at_level(logging.WARNING):
+        cache.get()
+        t[0] = 61
+        cache.get()
+        cache.get()
+        hang[0] = False
+        gate.set()
+        for _ in range(100):  # let the released refresh finish
+            if cache._inflight is None:
+                break
+            time.sleep(0.01)
+        hang[0] = True
+        gate.clear()
+        t[0] = 80
+        cache.get()          # new refresh, hangs again
+        t[0] = 150
+        cache.get()
+    gate.set()
+    blocked = [r for r in caplog.records if "blocked" in r.getMessage()]
+    assert len(blocked) == 2
+
+
+def test_cgroup_path_escape_falls_back_to_mount_root(tmp_path):
+    root = tmp_path / "cg"
+    root.mkdir()
+    (root / "cgroup.controllers").write_text("memory\n")
+    (root / "memory.max").write_text("1000\n")
+    evil = tmp_path / "evil"
+    evil.mkdir()
+    (evil / "memory.max").write_text("999999\n")
+    selfcg = tmp_path / "self_cgroup"
+    selfcg.write_text("0::/../evil\n")
+    s = _samples(_collector(tmp_path, cgroup_root=root, proc_self_cgroup=selfcg))
+    assert s[("blastbox_cgroup_memory_max_bytes", ())] == 1000
+
+
+def test_readonly_reader_survives_short_reads(tmp_path, monkeypatch):
+    d = tmp_path / "node"
+    _publish_n(d, 3)
+    real_read = os.read
+    monkeypatch.setattr(os, "read", lambda fd, n: real_read(fd, min(n, 7)))
+    got = read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time())
+    assert got is not None and len(got) == 3
+
+
+def test_readonly_reader_unparseable_candidate_voids_the_view(tmp_path):
+    d = tmp_path / "node"
+    _publish_n(d, 3)
+    (d / "e999.json").write_text('{"engine": "e999", "backl')  # torn/corrupt candidate
+    assert read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time()) is None
+
+
+def test_readonly_reader_still_skips_stale_snapshots(tmp_path):
+    d = tmp_path / "node"
+    share = FileNodeShare(str(d))
+    share.publish(_snap("aa", assigned=1, ram=100, vcpus=1, budget_ram=1000, budget_vcpus=4))
+    old = _snap("bb", assigned=1, ram=100, vcpus=1, budget_ram=1000, budget_vcpus=4)
+    share.publish(DemandSnapshot(**{**old.__dict__, "ts": time.time() - 3600}))
+    got = read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time())
+    assert got is not None and [s.engine for s in got] == ["aa"]

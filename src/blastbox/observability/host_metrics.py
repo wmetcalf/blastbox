@@ -2,10 +2,10 @@
 
 A custom Prometheus collector. ``/proc`` (stat, meminfo), ``os.getloadavg`` and cgroupfs are read
 inline on every ``GET /metrics``, so those numbers are as current as the scrape. The FILESYSTEM part
-(``os.statvfs`` of the job/blob roots, the node share dir) is NOT read on the request thread: a
-single-flight background refresher re-reads it at most every ``refresh_ttl_s`` (10s), a scrape waits
-for it at most ``refresh_wait_s`` (1s), and cached values are served until ``max_stale_s`` (60s)
-after they were read, then omitted. No new dependency (no psutil) — ``/proc`` + ``os`` only.
+(``os.statvfs`` of each job/blob root, the node share dir) is NOT read on the request thread: each
+SOURCE has its own single-flight background refresher that re-reads it at most every
+``refresh_ttl_s`` (10s); a scrape waits for them at most ``refresh_wait_s`` (1s) in total, and each
+source's cached values are served until ``max_stale_s`` (60s) after they were read, then omitted. No new dependency (no psutil) — ``/proc`` + ``os`` only.
 
 Truthfulness rule: a series that cannot be read is OMITTED. On a non-Linux host, a container with
 ``/proc`` masked, a missing job root, etc. the affected series simply vanish from the exposition;
@@ -19,19 +19,22 @@ series show the container's own ceiling.
 
 Filesystem work (statvfs of the job/blob roots, the node share dir) can block uninterruptibly on a
 hung network mount, and ``/metrics`` shares the ingress's sync-route thread pool with ``/v1/healthz``.
-So that part is NEVER done on the request thread without a bound: a single-flight background refresh
-fills a cache, the scrape waits for it only briefly, serves the last good values up to a staleness
-bound, and then omits them. At most ONE thread can ever be stuck on a hung filesystem.
+So that part is NEVER done on the request thread without a bound: per source, a single-flight
+background refresh fills a cache, the scrape waits for it only briefly, serves the last good values
+up to a staleness bound, and then omits that source's series only. At most one thread PER SOURCE
+(each disk root + the node share, so <= 3) can ever be stuck on a hung filesystem, and a source
+blocked longer than the staleness bound logs one WARNING.
 """
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 from prometheus_client.registry import Collector
@@ -127,9 +130,9 @@ def read_node_view(share_dir: str, *, stale_after_s: float, node: str) -> Option
     if listed is None:
         if not _warned_over_cap:
             _warned_over_cap = True
-            _log.warning("node share dir %s holds more snapshot files than the read cap; "
-                         "omitting blastbox_node_* series rather than reporting a partial "
-                         "(undercounted) view", share_dir)
+            _log.warning("node share dir %s holds more snapshot files than the read cap, or a "
+                         "snapshot file that cannot be parsed; omitting blastbox_node_* series "
+                         "rather than reporting a partial (undercounted) view", share_dir)
         return None
     snaps = [
         s for s in listed
@@ -174,12 +177,6 @@ def node_view_fn_from_env() -> Optional[Callable[[], Optional[NodeView]]]:
     return lambda: read_node_view(share_dir, stale_after_s=stale, node=node)
 
 
-@dataclass(frozen=True)
-class _FsValues:
-    disk: "tuple[tuple[str, int, int], ...]"   # (role label, total bytes, free bytes)
-    node: Optional[NodeView]
-
-
 def _warn_thread_start_once(exc: BaseException) -> None:
     global _warned_thread_start
     if not _warned_thread_start:
@@ -189,52 +186,73 @@ def _warn_thread_start_once(exc: BaseException) -> None:
 
 
 class _FsCache:
-    """Single-flight, TTL'd cache of the filesystem-derived values.
+    """Single-flight, TTL'd cache of ONE filesystem-derived source (one disk root, or the node
+    view). The collector keeps one per source, so a hung source ages out only its own series.
 
     A refresh runs on its own daemon thread, and a new one is started only when none is in flight,
-    so a hung mount pins at most one thread no matter how many scrapes arrive. The scrape that
-    started a refresh waits for it up to ``wait_s``; values older than ``max_stale_s`` (measured
-    from when they were read) are not served at all."""
+    so a hung mount pins at most one thread PER SOURCE no matter how many scrapes arrive. The
+    scrape that started a refresh waits for it up to ``wait_s``; values older than ``max_stale_s``
+    (measured from when they were read) are not served at all. A refresh that raises keeps the
+    last good value; one that RETURNS (including ``None``) replaces it. A refresh in flight longer
+    than ``max_stale_s`` logs one WARNING, re-armed once it completes."""
 
-    def __init__(self, refresh: "Callable[[], _FsValues]", *, clock: Callable[[], float],
-                 ttl_s: float, max_stale_s: float, wait_s: float) -> None:
+    def __init__(self, refresh: "Callable[[], Any]", *, clock: Callable[[], float],
+                 ttl_s: float, max_stale_s: float, wait_s: float, name: str = "fs") -> None:
         self._refresh = refresh
         self._clock = clock
         self._ttl_s = ttl_s
         self._max_stale_s = max_stale_s
         self._wait_s = wait_s
+        self._name = name
         self._lock = threading.Lock()
-        self._values: Optional[_FsValues] = None
-        self._done_at: Optional[float] = None   # when the served values were READ
+        self._has_value = False
+        self._value: Any = None
+        self._done_at: Optional[float] = None   # when the served value was READ
         self._started_at: Optional[float] = None
         self._inflight: Optional[threading.Event] = None
+        self._warned_blocked = False
 
-    def get(self) -> Optional[_FsValues]:
-        started: Optional[threading.Event] = None
+    def kick(self) -> Optional[threading.Event]:
+        """Start a refresh if one is due and none is in flight; return its completion event."""
         with self._lock:
             now = self._clock()
-            due = self._started_at is None or now - self._started_at >= self._ttl_s
-            if self._inflight is None and due:
-                started = self._inflight = threading.Event()
-                self._started_at = now
-                try:
-                    threading.Thread(target=self._run, args=(started, now), daemon=True,
-                                     name="blastbox-metrics-fs-refresh").start()
-                except Exception as exc:  # noqa: BLE001 - e.g. pids.max / RLIMIT_NPROC
-                    # Un-wedge: nothing will ever clear _inflight for a thread that never ran,
-                    # so clear it here and let the NEXT scrape retry.
-                    self._inflight = None
-                    self._started_at = None
-                    started = None
-                    _warn_thread_start_once(exc)
-        if started is not None:
-            started.wait(self._wait_s)
+            if self._inflight is not None:
+                if (self._started_at is not None and not self._warned_blocked
+                        and now - self._started_at > self._max_stale_s):
+                    self._warned_blocked = True
+                    _log.warning("metrics refresh of %s has been blocked for %.0fs; its series "
+                                 "are omitted", self._name, now - self._started_at)
+                return None
+            if self._started_at is not None and now - self._started_at < self._ttl_s:
+                return None
+            started = self._inflight = threading.Event()
+            self._started_at = now
+            try:
+                threading.Thread(target=self._run, args=(started, now), daemon=True,
+                                 name=f"blastbox-metrics-refresh-{self._name}").start()
+            except Exception as exc:  # noqa: BLE001 - e.g. pids.max / RLIMIT_NPROC
+                # Un-wedge: nothing will ever clear _inflight for a thread that never ran,
+                # so clear it here and let the NEXT scrape retry.
+                self._inflight = None
+                self._started_at = None
+                _warn_thread_start_once(exc)
+                return None
+            return started
+
+    def peek(self) -> Any:
+        """The cached value if it is fresh enough, else ``None``. Never blocks on the source."""
         with self._lock:
-            if self._values is None or self._done_at is None:
+            if not self._has_value or self._done_at is None:
                 return None
             if self._clock() - self._done_at > self._max_stale_s:
                 return None
-            return self._values
+            return self._value
+
+    def get(self) -> Any:
+        started = self.kick()
+        if started is not None:
+            started.wait(self._wait_s)
+        return self.peek()
 
     def force_stale(self) -> None:
         """Make the next ``get`` start a refresh (if none is in flight). For tests."""
@@ -242,19 +260,22 @@ class _FsCache:
             self._started_at = None
 
     def _run(self, done: threading.Event, read_at: float) -> None:
-        values: Optional[_FsValues] = None
+        ok, value = False, None
         try:
-            values = self._refresh()
-        except Exception:  # noqa: BLE001 - keep the last good values
-            values = None
+            value, ok = self._refresh(), True
+        except Exception:  # noqa: BLE001 - keep the last good value
+            ok = False
         finally:
             with self._lock:
-                if values is not None:
-                    self._values = values
-                    # stamped with the refresh START: the values are as old as when they were
-                    # read, so a slow mount can't stretch max_stale_s
+                if ok:
+                    self._has_value, self._value = True, value
+                    # stamped with the refresh START: the value is as old as when it was read,
+                    # so a slow mount can't stretch max_stale_s
                     self._done_at = read_at
                 self._inflight = None
+                if self._warned_blocked:
+                    self._warned_blocked = False
+                    _log.info("metrics refresh of %s recovered", self._name)
             done.set()
 
 
@@ -300,8 +321,19 @@ class HostResourceCollector(Collector):
         self._proc_self_cgroup = (Path(proc_self_cgroup) if proc_self_cgroup is not None
                                   else self._proc / "self" / "cgroup")
         self._warned_node_perm = False
-        self._fs = _FsCache(self._refresh_fs, clock=clock, ttl_s=refresh_ttl_s,
-                            max_stale_s=max_stale_s, wait_s=refresh_wait_s)
+        self._wait_s = refresh_wait_s
+
+        def cache(refresh: "Callable[[], Any]", name: str) -> _FsCache:
+            return _FsCache(refresh, clock=clock, ttl_s=refresh_ttl_s, max_stale_s=max_stale_s,
+                            wait_s=refresh_wait_s, name=name)
+
+        # ONE independent cache per filesystem source: a hung blob mount must not blank the job
+        # root's series or the node view (at most one stuck thread per source).
+        self._disk_caches: dict[str, _FsCache] = {
+            role: cache(functools.partial(self._read_disk, str(root)), role)
+            for role, root in self._disk_roots.items() if root is not None
+        }
+        self._node_cache = cache(self._read_node, "node share")
 
     def collect(self) -> Iterable[GaugeMetricFamily | CounterMetricFamily]:
         for section in (self._info, self._cpu, self._load, self._memory, self._cgroup,
@@ -383,6 +415,9 @@ class HostResourceCollector(Collector):
         for line in text.splitlines():
             if line.startswith("0::"):
                 rel = line[3:].strip().lstrip("/")
+                # the path is data: a `..` component must not walk out of the cgroup mount
+                if any(part == ".." for part in rel.split("/")):
+                    return root
                 cand = root / rel if rel else root
                 # without a cgroup namespace the recorded path may not exist under this mount;
                 # the mount root is then the process's own cgroup (container) — use it
@@ -424,35 +459,13 @@ class HostResourceCollector(Collector):
 
     # -- filesystem (cached, single-flight, off the request thread) ----------
 
-    def _refresh_fs(self) -> _FsValues:
-        return _FsValues(disk=self._read_disks(), node=self._read_node())
-
-    def _read_disks(self) -> "tuple[tuple[str, int, int], ...]":
-        # group roles by filesystem (st_dev) so a shared filesystem is reported ONCE — summing
-        # per-role series on a dashboard must not double-count one disk.
-        groups: dict[int, tuple[list[str], str]] = {}
-        for role, root in self._disk_roots.items():
-            if root is None:
-                continue
-            path = str(root)
-            try:
-                dev = self._dev_fn(path)
-            except Exception:  # noqa: BLE001 - missing/unreadable root → omitted
-                continue
-            if dev in groups:
-                groups[dev][0].append(role)
-            else:
-                groups[dev] = ([role], path)
-        out: list[tuple[str, int, int]] = []
-        for roles, path in groups.values():
-            try:
-                st = self._statvfs_fn(path)
-                t = int(st.f_blocks) * int(st.f_frsize)  # type: ignore[attr-defined]
-                f = int(st.f_bavail) * int(st.f_frsize)  # type: ignore[attr-defined]
-            except Exception:  # noqa: BLE001
-                continue
-            out.append(("+".join(roles), t, f))
-        return tuple(out)
+    def _read_disk(self, path: str) -> "tuple[int, int, int]":
+        """(st_dev, total bytes, free bytes) of one root. Raises if unreadable."""
+        dev = self._dev_fn(path)
+        st = self._statvfs_fn(path)
+        return (dev,
+                int(st.f_blocks) * int(st.f_frsize),  # type: ignore[attr-defined]
+                int(st.f_bavail) * int(st.f_frsize))  # type: ignore[attr-defined]
 
     def _read_node(self) -> Optional[NodeView]:
         if self._node_view_fn is None:
@@ -471,22 +484,38 @@ class HostResourceCollector(Collector):
             return None
 
     def _fs_sections(self) -> Iterable[GaugeMetricFamily]:
-        vals = self._fs.get()
-        if vals is None:
-            return
-        if vals.disk:
+        caches = [*self._disk_caches.values(), self._node_cache]
+        # kick every due refresh FIRST, then wait on them under ONE shared deadline, so a scrape
+        # waits at most refresh_wait_s in total however many sources are slow
+        events = [e for e in (c.kick() for c in caches) if e is not None]
+        deadline = time.monotonic() + self._wait_s
+        for ev in events:
+            ev.wait(max(0.0, deadline - time.monotonic()))
+        # group roles by filesystem (st_dev) so a shared filesystem is reported ONCE — summing
+        # per-role series on a dashboard must not double-count one disk.
+        groups: dict[int, tuple[list[str], int, int]] = {}
+        for role, c in self._disk_caches.items():
+            got = c.peek()
+            if got is None:
+                continue
+            dev, t, f = got
+            if dev in groups:
+                groups[dev][0].append(role)
+            else:
+                groups[dev] = ([role], t, f)
+        if groups:
             total = GaugeMetricFamily("blastbox_host_disk_total_bytes",
                                       "Size of the filesystem backing a blastbox storage role",
                                       labels=["role"])
             free = GaugeMetricFamily("blastbox_host_disk_free_bytes",
                                      "Bytes available to non-root on that filesystem (f_bavail)",
                                      labels=["role"])
-            for label, t, f in vals.disk:
-                total.add_metric([label], t)
-                free.add_metric([label], f)
+            for roles, t, f in groups.values():
+                total.add_metric(["+".join(roles)], t)
+                free.add_metric(["+".join(roles)], f)
             yield total
             yield free
-        view = vals.node
+        view = self._node_cache.peek()
         if view is None:
             return
         yield GaugeMetricFamily("blastbox_node_budget_bytes",

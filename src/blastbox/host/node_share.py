@@ -242,6 +242,15 @@ class FileNodeShare:
                 now: float) -> "DemandSnapshot | None":
         """Parse + validate one snapshot file's content; None if it must not contribute. May
         raise on a torn/poisoned payload (callers skip the file)."""
+        status, snap = cls._classify(name, text, max_age_s=max_age_s, now=now)
+        return snap if status == "ok" else None
+
+    @classmethod
+    def _classify(cls, name: str, text: str, *, max_age_s: float,
+                  now: float) -> "tuple[str, DemandSnapshot | None]":
+        """("ok", snap) | ("stale", None) — well-formed but outside its freshness window |
+        ("invalid", None) — torn, poisoned, or not the file its name claims. May raise on a
+        payload that doesn't even parse."""
         data = json.loads(text)
         # Drop UNKNOWN keys before constructing: during a rolling upgrade a NEWER
         # peer may add a DemandSnapshot field, and an OLDER reader passing it to the
@@ -275,11 +284,13 @@ class FileNodeShare:
             snap.refresh_s * 2.0 if _finite_in(snap.refresh_s, 0, _MAX_TS) else 0.0,
             snap.stale_after_s if _finite_in(snap.stale_after_s, 0, _MAX_TS) else 0.0)
         eff = min(declared, cls._GC_AGE_FLOOR_S) if declared > 0 else max_age_s
-        ok = (_valid(snap)
-              and name == cls._filename(snap.engine, snap.tier, snap.node, snap.instance)
-              and _finite_in(snap.ts, -_MAX_TS, _MAX_TS)
-              and -eff <= (now - snap.ts) <= eff)
-        return snap if ok else None
+        if not (_valid(snap)
+                and name == cls._filename(snap.engine, snap.tier, snap.node, snap.instance)
+                and _finite_in(snap.ts, -_MAX_TS, _MAX_TS)):
+            return "invalid", None
+        if not (-eff <= (now - snap.ts) <= eff):
+            return "stale", None
+        return "ok", snap
 
     def _gc(self, older_than_s: float) -> None:
         """Sweep long-abandoned files by FILESYSTEM mtime — both stale `*.json` snapshots a
@@ -379,9 +390,10 @@ def read_snapshots_readonly(
     and re-checked with ``fstat`` (the entry can be swapped between lstat and open), and read at
     most ``max_bytes``.
 
-    Returns ``None`` — NOT a partial list — when there are more candidates than ``max_files``: a
-    truncated view would undercount the node's reservations and disagree with the dispatchers, and
-    a wrong number is worse than a gap. A missing dir → ``[]``; a permission error on the dir
+    Returns ``None`` — NOT a partial list — when there are more candidates than ``max_files`` or a
+    candidate cannot be parsed/validated: a shrunken view would undercount the node's reservations
+    and disagree with the dispatchers, and a wrong number is worse than a gap. Well-formed but
+    STALE snapshots are skipped, as the dispatchers skip them. A missing dir → ``[]``; a permission error on the dir
     propagates so the caller can say why the view is missing."""
     import stat as _stat
 
@@ -416,14 +428,32 @@ def read_snapshots_readonly(
             st = os.fstat(fd)
             if not _stat.S_ISREG(st.st_mode) or st.st_size > size_cap:
                 continue
-            raw = os.read(fd, size_cap + 1)
-            if len(raw) > size_cap:
+            # loop: NFS/FUSE may return short reads, and one os.read() would hand a truncated
+            # (unparseable) payload to the parser
+            chunks: list[bytes] = []
+            got = 0
+            while got <= size_cap:
+                chunk = os.read(fd, size_cap + 1 - got)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                got += len(chunk)
+            if got > size_cap:
                 continue                        # grew past the cap between fstat and read
-            snap = FileNodeShare._accept(name, raw.decode("utf-8"), max_age_s=max_age_s, now=now)
-        except Exception:
-            continue
+            try:
+                status, snap = FileNodeShare._classify(
+                    name, b"".join(chunks).decode("utf-8"), max_age_s=max_age_s, now=now)
+            except Exception:
+                status, snap = "invalid", None
+        except OSError:
+            continue                            # vanished / unreadable mid-read
         finally:
             os.close(fd)
+        if status == "invalid":
+            # A regular, in-size candidate we cannot interpret: skipping it would silently
+            # SHRINK the view (dispatchers publish atomically, so this is not a benign torn
+            # write). Report the view as unreadable instead of undercounting.
+            return None
         if snap is not None:
             out.append(snap)
     return out
