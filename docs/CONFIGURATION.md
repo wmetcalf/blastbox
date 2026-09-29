@@ -77,8 +77,10 @@ roles with identical totals -- **don't sum across roles**.
 
 **Hung storage never stalls the API:** the filesystem part (disk `statvfs`, node share dir) is
 refreshed by a single background thread at most every 10s; a scrape waits for it at most 1s, then
-serves the last good values for up to 60s and after that omits them. A hung NFS mount pins at most
-one thread and `/v1/healthz` keeps answering.
+serves the last good values until 60s after they were **read** (the refresh start) and after that
+omits them. A hung NFS mount pins at most one thread and `/v1/healthz` keeps answering. If the
+refresher thread cannot be started (e.g. `pids.max` exhausted) a WARNING is logged once and the next
+scrape retries.
 
 **Containers:** `/proc/stat`, `/proc/meminfo` and the load average are not namespaced, so inside a
 plain container they describe the **host kernel** (all of the host's CPUs and RAM, not the
@@ -88,13 +90,19 @@ series describe the filesystems **mounted into the container** at the job/blob r
 
 **Node budget series** come from the autosizer, which runs in the `dispatch` processes, not in
 `serve`. The ingress reads the dispatchers' shared node dir **read-only** -- it never creates,
-chmods or garbage-collects it, reads only regular files (<= 64 KiB each, <= 256 files), and omits
-the series if the matched snapshots mix different `BLASTBOX_NODE_ID`s. The four series appear only
-when the `serve` process has the same `BLASTBOX_NODE_*` config (the autosizer must be active),
-`BLASTBOX_NODE_SHARE_DIR` is mounted into it (read-only is enough), and `BLASTBOX_NODE_ID` matches
-the host's if one is set. The dir is created `0770`, so the **ingress uid needs read+execute on it**
-(e.g. membership of the dispatchers' group); on a permission error the series are omitted and a
-WARNING is logged once.
+chmods or garbage-collects it, and reads only regular files (not symlinks, FIFOs or devices) of at
+most 64 KiB. The four series appear only when the `serve` process has the same `BLASTBOX_NODE_*`
+config (the autosizer must be active), `BLASTBOX_NODE_SHARE_DIR` is mounted into it (read-only is
+enough), and `BLASTBOX_NODE_ID` matches the host's if one is set. The dir is created `0770`, so the
+**ingress uid needs read+execute on it** (e.g. membership of the dispatchers' group).
+
+The node series are **omitted** (never reported as a partial number) when:
+
+- the share dir is unreadable (permission error) -- WARNING logged once;
+- it holds more than 256 candidate snapshot files -- WARNING logged once;
+- the matched snapshots mix node ids, where an empty id counts as distinct (the same condition on
+  which the dispatchers themselves fail closed) -- WARNING logged once;
+- no live snapshot has published a budget, or the autosizer is not configured for `serve`.
 
 **Exposure:** with `BLASTBOX_METRICS_PUBLIC=true` (the default) anyone who can reach `/metrics`
 sees these values. On a shared node, blob-disk free bytes moving between scrapes leak the size of
