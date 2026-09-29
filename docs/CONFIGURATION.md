@@ -54,31 +54,52 @@ The default CSP (`middleware.DEFAULT_CSP`) is `default-src 'self'; script-src 's
 ### Host resource metrics on `/metrics`
 
 `GET /metrics` on the ingress also serves host utilization gauges, computed **at scrape time** from
-`/proc` and `os.statvfs` (no background thread, no extra dependency). A series that cannot be read
-truthfully -- non-Linux host, masked `/proc`, a root that does not exist yet -- is **omitted**, never
-reported as zero; a scrape never fails because of it.
+`/proc`, cgroupfs and `os.statvfs` (no extra dependency). A series that cannot be read truthfully
+-- non-Linux host, masked `/proc`, a root that does not exist yet -- is **omitted**, never reported
+as zero; a scrape never fails because of it.
 
 | Series | Labels | Source |
 |---|---|---|
-| `blastbox_host_info` (=1) | `hostname`, `version` | `BLASTBOX_HOST_ID` if set, else the hostname; blastbox version |
+| `blastbox_host_info` (=1) | `version`, plus `hostname` **only when `BLASTBOX_HOST_ID` is set** | The machine hostname is never published (`/metrics` is unauthenticated by default); set `BLASTBOX_HOST_ID` to the public name a dashboard should show |
 | `blastbox_host_cpu_seconds_total` (counter) | `mode` = `user,nice,system,idle,iowait,irq,softirq,steal` | `/proc/stat` aggregate `cpu` line, all CPUs summed; `rate()` it. Modes an old kernel lacks are absent |
 | `blastbox_host_cpu_count` | -- | `os.cpu_count()` |
 | `blastbox_host_load1` / `load5` / `load15` | -- | `os.getloadavg()` |
 | `blastbox_host_memory_total_bytes` / `blastbox_host_memory_available_bytes` | -- | `/proc/meminfo` `MemTotal` / `MemAvailable` |
-| `blastbox_host_disk_total_bytes` / `blastbox_host_disk_free_bytes` | `role` = `jobs`, `blobs`, or `jobs+blobs` | `statvfs` of `BLASTBOX_JOB_ROOT` and the local blob root (`BLASTBOX_BLOB_LOCAL_ROOT`, local store only). Roles on ONE filesystem (same `st_dev`) are reported once under a joined role, so summing never double-counts. Free = bytes available to non-root (`f_bavail`). Paths are never label values |
+| `blastbox_cgroup_memory_max_bytes` / `blastbox_cgroup_memory_current_bytes` | -- | cgroup v2 `memory.max` / `memory.current` of the serve process's cgroup. `max` (unlimited) is omitted; cgroup v1 omits all cgroup series |
+| `blastbox_cgroup_cpu_quota_cores` | -- | cgroup v2 `cpu.max` quota / period; `max` (unlimited) is omitted |
+| `blastbox_host_disk_total_bytes` / `blastbox_host_disk_free_bytes` | `role` = `jobs`, `blobs`, or `jobs+blobs` | `statvfs` of `BLASTBOX_JOB_ROOT` and of the local blob store's root (its `local_root`: `BLASTBOX_BLOB_LOCAL_ROOT`, default the `blobs` sibling of the job root; absent for an S3 store). Free = bytes available to non-root (`f_bavail`). Paths are never label values |
 | `blastbox_node_budget_bytes` / `blastbox_node_budget_vcpus` | -- | Node autosizer consensus budget (min of the budgets the dispatchers publish) |
 | `blastbox_node_allocated_bytes` / `blastbox_node_allocated_vcpus` | -- | Sum of the pools' published reservations (resident + in-flight slots x per-slot footprint) |
 
-**Containers:** `/proc/stat`, `/proc/meminfo` and the load average are not namespaced, so inside
-the ingress container they describe the **host kernel** (all of the host's CPUs and RAM, not the
-container's cgroup limit). The disk series describe the filesystems **mounted into the container**
-at the job/blob roots.
+**Disk roles:** roles on the same `st_dev` are reported once under a joined role (`jobs+blobs`).
+btrfs subvolumes or bind mounts of one pool can have distinct `st_dev`s and so appear as separate
+roles with identical totals -- **don't sum across roles**.
+
+**Hung storage never stalls the API:** the filesystem part (disk `statvfs`, node share dir) is
+refreshed by a single background thread at most every 10s; a scrape waits for it at most 1s, then
+serves the last good values for up to 60s and after that omits them. A hung NFS mount pins at most
+one thread and `/v1/healthz` keeps answering.
+
+**Containers:** `/proc/stat`, `/proc/meminfo` and the load average are not namespaced, so inside a
+plain container they describe the **host kernel** (all of the host's CPUs and RAM, not the
+container's limit -- see the `blastbox_cgroup_*` series for that). Under **LXCFS**, or when the serve
+container itself runs under **gVisor**, `/proc` reflects the container's slice instead. The disk
+series describe the filesystems **mounted into the container** at the job/blob roots.
 
 **Node budget series** come from the autosizer, which runs in the `dispatch` processes, not in
-`serve`. The ingress reads the dispatchers' shared node dir **read-only** (it never creates or
-garbage-collects it), so these four series appear only when the `serve` process has the same
-`BLASTBOX_NODE_*` config (the autosizer must be active) and `BLASTBOX_NODE_SHARE_DIR` is mounted
-into it (read-only is enough), plus `BLASTBOX_NODE_ID` if the host sets one.
+`serve`. The ingress reads the dispatchers' shared node dir **read-only** -- it never creates,
+chmods or garbage-collects it, reads only regular files (<= 64 KiB each, <= 256 files), and omits
+the series if the matched snapshots mix different `BLASTBOX_NODE_ID`s. The four series appear only
+when the `serve` process has the same `BLASTBOX_NODE_*` config (the autosizer must be active),
+`BLASTBOX_NODE_SHARE_DIR` is mounted into it (read-only is enough), and `BLASTBOX_NODE_ID` matches
+the host's if one is set. The dir is created `0770`, so the **ingress uid needs read+execute on it**
+(e.g. membership of the dispatchers' group); on a permission error the series are omitted and a
+WARNING is logged once.
+
+**Exposure:** with `BLASTBOX_METRICS_PUBLIC=true` (the default) anyone who can reach `/metrics`
+sees these values. On a shared node, blob-disk free bytes moving between scrapes leak the size of
+other tenants' uploads/results (a side channel). Set `BLASTBOX_METRICS_PUBLIC=false` (with
+`BLASTBOX_API_KEY`) where that matters.
 
 ## Dispatch
 
