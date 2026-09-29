@@ -29,9 +29,17 @@ def _verify(public_pem: str, doc: dict, sig: str) -> None:
 def _obs(**kw) -> attest.RunObservation:
     base = dict(job_id="11111111-1111-1111-1111-111111111111", engine="clippyshot",
                 input_sha256="b" * 64, worker_runtime="runsc", worker_tier=None,
-                net_policy_effective="none", started_at_ms=1_000_250, finished_at_ms=1_010_500)
+                net_policy_effective="none", net_exit="none", started_at_ms=1_000_250,
+                finished_at_ms=1_010_500)
     base.update(kw)
     return attest.RunObservation(**base)
+
+
+def _tombstone(out) -> dict:
+    body = json.loads((out / attest.RECEIPT_NAME).read_bytes())
+    assert body["attestation"] is None and isinstance(body["reason"], str)
+    assert set(body) == {"attestation", "reason"}
+    return body
 
 
 def _tree(tmp_path, meta: bytes = b'{"engine":"clippyshot"}'):
@@ -46,11 +54,12 @@ def _tree(tmp_path, meta: bytes = b'{"engine":"clippyshot"}'):
 # ---------------------------------------------------------------------------
 
 
-def test_key_path_prefers_explicit_env_then_pki_dir_else_disabled(tmp_path):
+def test_only_an_explicit_attest_key_enables_receipts(tmp_path):
+    """STRICTLY OPT-IN. BLASTBOX_PKI_DIR is the mTLS/CA dir; it must not silently mint a signing
+    key on every node (or log errors on a read-only CA dir)."""
     assert attest.attest_key_path({"BLASTBOX_ATTEST_KEY": str(tmp_path / "k"),
                                    "BLASTBOX_PKI_DIR": str(tmp_path / "pki")}) == tmp_path / "k"
-    assert attest.attest_key_path({"BLASTBOX_PKI_DIR": str(tmp_path / "pki")}) == (
-        tmp_path / "pki" / "attest.key")
+    assert attest.attest_key_path({"BLASTBOX_PKI_DIR": str(tmp_path / "pki")}) is None
     assert attest.attest_key_path({}) is None
     assert attest.attest_key_path({"BLASTBOX_ATTEST_KEY": "", "BLASTBOX_PKI_DIR": " "}) is None
 
@@ -149,7 +158,24 @@ def test_load_attest_key_returns_none_and_logs_when_refused(tmp_path, caplog):
     path.chmod(0o644)
     assert attest.load_attest_key({"BLASTBOX_ATTEST_KEY": str(path)}) is None
     assert "refus" in caplog.text.lower()
-    assert attest.load_attest_key({}) is None
+
+
+def test_unconfigured_is_silent_above_debug(tmp_path, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO)
+    assert attest.load_attest_key({"BLASTBOX_PKI_DIR": str(tmp_path / "pki")}) is None
+    assert caplog.records == []
+    assert not (tmp_path / "pki").exists()
+
+
+def test_missing_key_can_be_quiet_for_non_signers(tmp_path, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO)
+    env = {"BLASTBOX_ATTEST_KEY": str(tmp_path / "absent.key")}
+    assert attest.load_attest_key(env, create=False, quiet_missing=True) is None
+    assert caplog.records == []
 
 
 # ---------------------------------------------------------------------------
@@ -188,14 +214,14 @@ def test_receipt_doc_fields(tmp_path, monkeypatch):
         "status": "done", "executor": "local",
         "input_sha256": "b" * 64, "metadata_sha256": "c" * 64,
         "worker_runtime": "runsc", "worker_tier": None, "net_policy_effective": "none",
-        "started_at_ms": 1_000_250, "finished_at_ms": 1_010_500, "issued_at_ms": 2_000_000,
+        "net_exit": "none", "started_at_ms": 1_000_250, "finished_at_ms": 1_010_500, "issued_at_ms": 2_000_000,
     }
 
 
 def test_unknown_policy_is_omitted_not_guessed():
-    doc = attest.build_receipt(_obs(net_policy_effective=None), key_id="k" * 16,
+    doc = attest.build_receipt(_obs(net_policy_effective=None, net_exit=None), key_id="k" * 16,
                                metadata_sha256="c" * 64)
-    assert "net_policy_effective" not in doc
+    assert "net_policy_effective" not in doc and "net_exit" not in doc
     assert isinstance(doc["issued_at_ms"], int)
 
 
@@ -226,7 +252,7 @@ def test_seal_writes_a_verifiable_receipt_over_the_exact_metadata_bytes(tmp_path
     ("job_id", "00000000-0000-0000-0000-000000000000"), ("engine", "other"),
     ("status", "failed"), ("input_sha256", "0" * 64), ("metadata_sha256", "0" * 64),
     ("executor", "node:x"), ("worker_runtime", "runc"), ("worker_tier", "firecracker"),
-    ("net_policy_effective", "direct"), ("finished_at_ms", 1), ("host", "evil"),
+    ("net_policy_effective", "direct"), ("net_exit", "direct"), ("finished_at_ms", 1), ("host", "evil"),
     ("key_id", "0" * 16), ("issued_at_ms", 7),
 ])
 def test_tampering_any_field_breaks_verification(tmp_path, field, value):
@@ -241,7 +267,7 @@ def test_tampering_any_field_breaks_verification(tmp_path, field, value):
 
 
 @pytest.mark.parametrize("planted", ["file", "dir", "symlink"])
-def test_a_worker_planted_receipt_is_removed_even_without_a_key(tmp_path, planted):
+def test_a_worker_planted_receipt_becomes_a_tombstone_without_a_key(tmp_path, planted):
     out = _tree(tmp_path)
     target = out / attest.RECEIPT_NAME
     if planted == "file":
@@ -253,7 +279,8 @@ def test_a_worker_planted_receipt_is_removed_even_without_a_key(tmp_path, plante
         (tmp_path / "elsewhere").write_text("keep me")
         target.symlink_to(tmp_path / "elsewhere")
     assert attest.seal_receipt(out, key=None, observation=_obs()) is None
-    assert not os.path.lexists(target)
+    assert not target.is_symlink() and target.is_file()
+    assert _tombstone(out)["reason"] == "no attestation key"
     if planted == "symlink":
         assert (tmp_path / "elsewhere").read_text() == "keep me"   # never followed
 
@@ -273,7 +300,7 @@ def test_no_receipt_when_metadata_is_not_a_regular_file(tmp_path):
     (out / "metadata.json").symlink_to(tmp_path / "real.json")
     key = attest.load_or_create_key(tmp_path / "k")
     assert attest.seal_receipt(out, key=key, observation=_obs()) is None
-    assert not (out / attest.RECEIPT_NAME).exists()
+    assert "metadata" in _tombstone(out)["reason"]
 
 
 def test_sha256_file_is_the_sha256_of_the_bytes(tmp_path):
@@ -288,4 +315,39 @@ def test_no_receipt_when_the_envelope_declares_the_reserved_name(tmp_path):
         {"id": "r", "path": "./attestation.json"}]}).encode())
     key = attest.load_or_create_key(tmp_path / "k")
     assert attest.seal_receipt(out, key=key, observation=_obs()) is None
-    assert not (out / attest.RECEIPT_NAME).exists()
+    assert "reserved" in _tombstone(out)["reason"]
+
+
+def test_no_observation_writes_a_tombstone(tmp_path):
+    out = _tree(tmp_path)
+    key = attest.load_or_create_key(tmp_path / "k")
+    assert attest.seal_receipt(out, key=key, observation=None, reason="input not hashed") is None
+    assert _tombstone(out)["reason"] == "input not hashed"
+
+
+def test_write_tombstone_replaces_whatever_is_there(tmp_path):
+    out = _tree(tmp_path)
+    (out / attest.RECEIPT_NAME).mkdir()
+    attest.write_tombstone(out, "signing failed")
+    assert _tombstone(out)["reason"] == "signing failed"
+    assert attest.is_tombstone((out / attest.RECEIPT_NAME).read_bytes())
+
+
+# ---------------------------------------------------------------------------
+# Verifying a tree's receipt against this host's own key (retained-tree re-upload)
+# ---------------------------------------------------------------------------
+
+
+def test_tree_receipt_verification(tmp_path):
+    meta = b'{"engine":"clippyshot"}'
+    out = _tree(tmp_path, meta)
+    key = attest.load_or_create_key(tmp_path / "k")
+    other = attest.load_or_create_key(tmp_path / "other")
+    jid = "11111111-1111-1111-1111-111111111111"
+    attest.seal_receipt(out, key=key, observation=_obs())
+    assert attest.tree_receipt_is_ours(out, key=key, job_id=jid)
+    assert not attest.tree_receipt_is_ours(out, key=other, job_id=jid)
+    assert not attest.tree_receipt_is_ours(out, key=None, job_id=jid)
+    assert not attest.tree_receipt_is_ours(out, key=key, job_id="22222222-2222-2222-2222-222222222222")
+    (out / "metadata.json").write_bytes(meta + b" ")      # metadata changed since signing
+    assert not attest.tree_receipt_is_ours(out, key=key, job_id=jid)

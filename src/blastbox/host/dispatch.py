@@ -454,7 +454,7 @@ class Dispatcher:
         attest_key: object = _attest.FROM_ENV,
     ) -> None:
         # Execution-receipt signing key (host/attest.py): an AttestKey, None (no receipts), or
-        # FROM_ENV (BLASTBOX_ATTEST_KEY / $BLASTBOX_PKI_DIR/attest.key; unset = no receipts). A
+        # FROM_ENV (BLASTBOX_ATTEST_KEY only -- strictly opt-in; unset = no receipts). A
         # key that cannot be loaded is logged loudly and disables receipts -- never jobs.
         self._attest_key = _attest.resolve_key(attest_key)
         # Optional live cold-admission cap driven by the node autosizer. ONLY the cold path
@@ -2070,10 +2070,12 @@ class Dispatcher:
             # Warm slots never carry egress (an egress personality bypassed the slot in
             # _dispatch_claimed_job), so this is the resolved none/drop the slot runs under --
             # resolved from this dispatcher's own registry, same inputs as that routing decision.
+            warm_personality = self._resolve_personality(job)
             observation = None if receipt_input_sha256 is None else _attest.RunObservation(
                 job_id=job.job_id, engine=job.engine, input_sha256=receipt_input_sha256,
                 worker_runtime="warm", worker_tier=self._tier,
-                net_policy_effective=self._resolve_personality(job).name,
+                net_policy_effective=warm_personality.name,
+                net_exit=warm_personality.exit_driver,
                 started_at_ms=started_at_ms, finished_at_ms=finished_at_ms)
 
             # The guest is done; the sealing phase below (rdump materialize, output-cap, validate,
@@ -2765,7 +2767,8 @@ class Dispatcher:
         observation = None if receipt_input_sha256 is None else _attest.RunObservation(
             job_id=job.job_id, engine=job.engine, input_sha256=receipt_input_sha256,
             worker_runtime=runtime.runtime, worker_tier=None,
-            net_policy_effective=personality.name,
+            # Enforced HERE: the network args/labels above wire this personality (netd/netns).
+            net_policy_effective=personality.name, net_exit=personality.exit_driver,
             started_at_ms=started_at_ms, finished_at_ms=finished_at_ms)
 
         # The worker's exit code is NOT the authority (the trust gate below is), but a non-zero
@@ -3062,19 +3065,21 @@ class Dispatcher:
 
     def _seal_receipt(self, job: Job, output_dir: Path,
                       observation: "_attest.RunObservation | None") -> None:
-        """Strip any worker-planted attestation.json from the tree about to be uploaded and,
-        with a key and an observation of this run, write this dispatcher's signed receipt.
+        """Replace whatever sits at attestation.json in the tree about to be uploaded with this
+        dispatcher's signed receipt, or a tombstone saying why it did not sign.
         Never raises: a receipt problem is logged and the job completes without one."""
         try:
-            _attest.seal_receipt(output_dir, key=self._attest_key, observation=observation)
+            _attest.seal_receipt(output_dir, key=self._attest_key, observation=observation,
+                                 reason="input could not be hashed")
         except Exception as exc:  # noqa: BLE001
             _log.error("attestation: could not write the receipt for job %s (%s); the job "
                        "completes without one", job.job_id, exc)
             try:
-                _attest.strip_receipt(output_dir)   # never ship a half-written or planted one
+                # Never ship a planted or half-written one, and overwrite a superseded attempt's.
+                _attest.write_tombstone(output_dir, "signing failed")
             except Exception:  # noqa: BLE001
-                _log.exception("attestation: could not remove %s for job %s",
-                               _attest.RECEIPT_NAME, job.job_id)
+                _log.exception("attestation: could not write a tombstone for job %s",
+                               job.job_id)
 
     def _upload_output(self, job: Job, output_dir: Path) -> bool:
         """Upload *output_dir* (already sealed) to the blob store, with a bounded inline
@@ -3633,7 +3638,8 @@ class Dispatcher:
             if self._pending_upload_retry:
                 retry_pending_uploads(self._job_root, self._blobs, self._job_store, _log,
                                       on_repaired=self._index_repaired_result,
-                                      retention_seconds=self._job_retention_seconds)
+                                      retention_seconds=self._job_retention_seconds,
+                                      attest_key=self._attest_key)
         except Exception:  # noqa: BLE001
             _log.exception("pending-upload sweep failed")
         try:

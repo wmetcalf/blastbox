@@ -1613,3 +1613,62 @@ def test_legacy_migration_never_ships_a_worker_planted_receipt(tmp_path):
     blobs = _FakeBlobs()
     assert migrate_legacy_results(tmp_path, blobs, store, logging.getLogger("t"))[0] == 1
     assert RECEIPT_NAME not in blobs.stored[_JID]
+
+
+class TestRetainedTreeReceipts:
+    """A retained tree is re-uploaded later by the sweep. Its attestation.json must be a receipt
+    THIS host's key signed for this job over this metadata -- anything else (a worker-planted file
+    in a pre-upgrade tree, another key's receipt, a stale one) becomes a tombstone first."""
+
+    class _CapturingBlobs(_FakeBlobs):
+        def __init__(self):
+            super().__init__()
+            self.receipt: bytes | None = None
+
+        def put_output(self, job_id, out_dir):
+            p = Path(out_dir) / "attestation.json"
+            self.receipt = p.read_bytes() if p.is_file() else None
+            super().put_output(job_id, out_dir)
+
+    def _retained(self, tmp_path):
+        store = InMemoryJobStore()
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = _JID
+        job.status = JobStatus.FAILED
+        job.error = f"result upload failed after 3 attempts; {RESULT_RETAINED_MARKER}"
+        store.create(job)
+        d = _sealed_tree(tmp_path, _JID)
+        return store, d / "output"
+
+    def test_a_planted_receipt_is_replaced_by_a_tombstone(self, tmp_path):
+        from blastbox.host import attest
+
+        store, out = self._retained(tmp_path)
+        (out / "attestation.json").write_text('{"attestation": {"forged": 1}, "signature": "x"}')
+        blobs = self._CapturingBlobs()
+        key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t"),
+                                     attest_key=key) == 1
+        assert attest.is_tombstone(blobs.receipt)
+
+    def test_no_receipt_at_all_uploads_a_tombstone(self, tmp_path):
+        from blastbox.host import attest
+
+        store, _ = self._retained(tmp_path)
+        blobs = self._CapturingBlobs()
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 1
+        assert attest.is_tombstone(blobs.receipt)
+
+    def test_our_own_valid_receipt_is_kept(self, tmp_path):
+        from blastbox.host import attest
+
+        store, out = self._retained(tmp_path)
+        key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+        body = attest.seal_receipt(out, key=key, observation=attest.RunObservation(
+            job_id=_JID, engine="redtusk", input_sha256="1" * 64, worker_runtime="runc",
+            worker_tier=None, net_policy_effective="none", net_exit="none", started_at_ms=1,
+            finished_at_ms=2))
+        blobs = self._CapturingBlobs()
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t"),
+                                     attest_key=key) == 1
+        assert blobs.receipt == attest.canonical(body)

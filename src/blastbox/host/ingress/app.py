@@ -1044,16 +1044,12 @@ def build_app(
             raise HTTPException(410, "result expired")
         if job.status != JobStatus.DONE:
             raise HTTPException(404, "no execution receipt: only DONE results carry one")
-        from blastbox.host.blobs.local import LocalBlobStore
-
-        if isinstance(_blob_store, LocalBlobStore) and not _blob_store.has_output(job_id):
-            # LocalBlobStore.open_output falls back to the LEGACY on-disk tree for results that
-            # predate the blob store -- trees no dispatcher ever stripped, so an
-            # attestation.json there is whatever the worker wrote. Those results carry no
-            # receipt by construction; never serve one from the fallback.
-            raise HTTPException(404, "no execution receipt for this job (it predates receipts)")
+        # ONLY the durable results prefix. LocalBlobStore.open_output falls back to the LEGACY
+        # on-disk tree, which no dispatcher ever sanitised -- an attestation.json there is whatever
+        # the worker wrote -- so a store offering a no-fallback read is always read through it.
+        opener = getattr(_blob_store, "open_result_only", None) or _blob_store.open_output
         try:
-            fh = _blob_store.open_output(job_id, _attest.RECEIPT_NAME)
+            fh = opener(job_id, _attest.RECEIPT_NAME)
         except Exception as exc:
             if _is_missing_blob(exc):
                 raise HTTPException(404, "no execution receipt for this job (its dispatcher "
@@ -1066,6 +1062,14 @@ def build_app(
         except Exception as exc:  # noqa: BLE001 - a partial receipt must never be served
             _log.warning("attestation: receipt read failed for job=%s: %s", job_id, exc)
             raise HTTPException(503, "could not read the execution receipt")
+        if _attest.is_tombstone(data):
+            # The finalizing dispatcher did not sign (no key, signing failed, ...) and said so,
+            # overwriting any superseded attempt's receipt. Absent, not an error.
+            try:
+                why = str(json.loads(data).get("reason") or "unspecified")[:200]
+            except Exception:  # noqa: BLE001
+                why = "unspecified"
+            raise HTTPException(404, f"no execution receipt for this job: {why}")
         return Response(content=data, media_type="application/json")
 
     @app.get("/v1/attestation/key")
@@ -1073,10 +1077,10 @@ def build_app(
         """The attestation public key configured for THIS process, if any. Never mints one --
         the ingress is not the signer. A CONVENIENCE for pinning: a verifier must never trust a
         key because a host served it."""
-        key = _attest.load_attest_key(create=False)
+        key = _attest.load_attest_key(create=False, quiet_missing=True)
         if key is None:
             raise HTTPException(404, "no attestation key is configured for this process "
-                                     "(BLASTBOX_ATTEST_KEY / BLASTBOX_PKI_DIR; generate it with "
+                                     "(BLASTBOX_ATTEST_KEY; generate it with "
                                      "`blastbox attest-key` on the signing host)")
         return _attest.public_key_body(key)
 

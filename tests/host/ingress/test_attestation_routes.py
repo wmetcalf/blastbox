@@ -37,7 +37,8 @@ def _done_with_receipt(tmp_path, store, key):
     job, out = _make_done_job(tmp_path, store)
     body = attest.seal_receipt(out, key=key, observation=attest.RunObservation(
         job_id=job.job_id, engine=job.engine, input_sha256="d" * 64, worker_runtime="runsc",
-        worker_tier=None, net_policy_effective="none", started_at_ms=1, finished_at_ms=2))
+        worker_tier=None, net_policy_effective="none", net_exit="none", started_at_ms=1,
+        finished_at_ms=2))
     _push_to_blob(tmp_path, job.job_id, out)
     return job, out, body
 
@@ -142,6 +143,8 @@ class _FlakyBlobs(LocalBlobStore):
                 raise OSError("connection reset")
         return _Broken()
 
+    open_result_only = open_output      # the route's no-legacy read path fails the same way
+
 
 @pytest.mark.parametrize("mode", ["open", "read"])
 def test_blob_errors_are_503_never_a_synthesized_receipt(tmp_path, key, mode):
@@ -168,6 +171,8 @@ def test_s3_style_missing_object_is_404_not_503(tmp_path):
             if name == attest.RECEIPT_NAME:
                 raise BlobFetchError("result fetch failed") from _NoSuchKey()
             return super().open_output(job_id, name)
+
+        open_result_only = open_output
 
     store = InMemoryJobStore()
     job, _ = _make_done_job(tmp_path, store)
@@ -241,3 +246,49 @@ def test_a_legacy_on_disk_tree_never_supplies_a_receipt(tmp_path):
     (out / "metadata.json").write_text("{}")
     (out / attest.RECEIPT_NAME).write_text('{"attestation": {"forged": 1}, "signature": "x"}')
     assert client.get(f"/v1/jobs/{job.job_id}/attestation").status_code == 404
+
+
+def test_a_tombstone_is_404_never_served(tmp_path):
+    client, store = _make_client(tmp_path)
+    job, out = _make_done_job(tmp_path, store)
+    attest.write_tombstone(out, "no attestation key")
+    _push_to_blob(tmp_path, job.job_id, out)
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404
+    assert "no attestation key" in r.json()["detail"]
+
+
+def test_legacy_tree_is_never_read_even_when_the_result_is_durable(tmp_path, key):
+    """has_output() True (the durable result exists) but the durable copy has NO receipt, while
+    the legacy on-disk tree has a planted one. open_output would fall back to it; the route must
+    read the receipt only from the blob results prefix."""
+    client, store = _make_client(tmp_path)
+    job, out = _make_done_job(tmp_path, store)          # durable copy, no receipt
+    legacy = tmp_path / "jobs" / job.job_id / "output"
+    (legacy / attest.RECEIPT_NAME).write_text('{"attestation": {"forged": 1}, "signature": "x"}')
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404
+
+
+def test_key_route_without_attest_key_is_quiet(tmp_path, monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setenv("BLASTBOX_PKI_DIR", str(tmp_path / "pki"))    # the CA dir: NOT opt-in
+    caplog.set_level(logging.INFO)
+    client, _ = _make_client(tmp_path)
+    caplog.clear()
+    assert client.get("/v1/attestation/key").status_code == 404
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING
+                and "attest" in r.getMessage().lower()]
+    assert not (tmp_path / "pki" / "attest.key").exists()
+
+
+def test_key_route_with_a_configured_but_absent_key_is_quiet(tmp_path, monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setenv("BLASTBOX_ATTEST_KEY", str(tmp_path / "absent.key"))
+    client, _ = _make_client(tmp_path)
+    caplog.set_level(logging.INFO)
+    caplog.clear()
+    assert client.get("/v1/attestation/key").status_code == 404
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]

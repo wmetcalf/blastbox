@@ -1240,16 +1240,46 @@ def _blob_target_cmd(args: argparse.Namespace) -> int:
 
 
 def _attest_key_cmd(args: argparse.Namespace) -> int:
-    """Print the host attestation PUBLIC key and its key_id, generating the key if it is
-    configured and missing. This is what an operator pins in a verifier (e.g. Loadout's
-    LOADOUT_ATTESTATION_KEYS); the private half is never printed."""
+    """Print the execution-receipt PUBLIC key and its key_id, generating the key if configured
+    and missing. This is what an operator pins in a verifier (e.g. Loadout's
+    LOADOUT_ATTESTATION_KEYS); the private half is never printed.
+
+    Run it AS THE DISPATCHER'S SERVICE USER: the dispatcher refuses a key file it does not own,
+    so a key minted by root (or anyone else) is one it will never sign with."""
+    import os
+    import pwd
+
     from blastbox.host import attest
 
     path = attest.attest_key_path()
     if path is None:
-        print(f"attestation is not configured: set {attest.ATTEST_KEY_ENV} (a key file) or "
-              f"{attest.PKI_DIR_ENV} (uses <dir>/{attest.ATTEST_KEY_FILENAME})", file=sys.stderr)
+        print(f"execution receipts are not enabled: set {attest.ATTEST_KEY_ENV} to the key file "
+              f"path (opt-in; one key per dispatcher host)", file=sys.stderr)
         return 2
+
+    def _user(uid: int) -> str:
+        try:
+            return pwd.getpwuid(uid).pw_name
+        except KeyError:
+            return str(uid)
+
+    euid = os.geteuid()
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        st = None
+    if st is None and euid == 0 and not getattr(args, "allow_root", False):
+        print(f"refusing to mint {path} as root: the dispatcher refuses a key it does not own. "
+              f"Run this as the dispatcher's service user, e.g. `sudo -u blastbox blastbox "
+              f"attest-key`, or pass --allow-root if the dispatcher itself runs as root.",
+              file=sys.stderr)
+        return 1
+    if st is not None and st.st_uid != euid:
+        owner = _user(st.st_uid)
+        print(f"{path} is owned by {owner}, not {_user(euid)}; run this as the dispatcher's "
+              f"service user that owns it, e.g. `sudo -u {owner} blastbox attest-key`.",
+              file=sys.stderr)
+        return 1
     try:
         key = attest.load_or_create_key(path)
     except (OSError, ValueError) as exc:
@@ -1963,8 +1993,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     pak = sub.add_parser(
         "attest-key",
-        help="print the host attestation public key + key_id to pin (generates it if missing)",
+        help="print the execution-receipt public key + key_id to pin (generates it if missing)",
+        description="Print the execution-receipt public key and key_id for a verifier to pin, "
+                    "generating the key at BLASTBOX_ATTEST_KEY if it is missing. Opt-in: "
+                    "nothing is signed unless BLASTBOX_ATTEST_KEY is set. Run it AS THE "
+                    "DISPATCHER'S SERVICE USER (e.g. `sudo -u blastbox blastbox attest-key`): "
+                    "the dispatcher refuses a key file it does not own.",
     )
+    pak.add_argument("--allow-root", action="store_true",
+                     help="permit minting as root (only when the dispatcher itself runs as "
+                          "root; otherwise run as the dispatcher's service user)")
     pak.set_defaults(func=_attest_key_cmd)
 
     pt = sub.add_parser(

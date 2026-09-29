@@ -722,10 +722,14 @@ class VmJobDispatcher:
             observation = None if receipt_input_sha256 is None else _attest.RunObservation(
                 job_id=job.job_id, engine=job.engine, input_sha256=receipt_input_sha256,
                 worker_runtime="warm", worker_tier=self._worker_tier,
-                # A VM's egress is fixed at spawn. Only a DECLARED pool egress is known -- and the
-                # check above just proved the job's effective policy equals it. Undeclared, this
-                # worker does not know what network the VM is on, so the receipt omits it.
-                net_policy_effective=fixed_policy or None,
+                # OMITTED on every VM/remote tier. fixed_net_policy is the pool's DECLARED egress
+                # (build_remote_vm_dispatcher takes it from the engine spec); the check above only
+                # proves the job asked for the same name. Nothing here enforces it -- on the
+                # network-endpoint tiers the most there is is BLASTBOX_NET_EGRESS=0 in the untrusted
+                # remote worker's env, and Lambda with default egress, a static endpoint on an open
+                # network or a permissive EC2 security group all run with internet regardless. A
+                # receipt signs only a posture its signer enforced itself.
+                net_policy_effective=None, net_exit=None,
                 started_at_ms=started_at_ms, finished_at_ms=finished_at_ms)
             summary = self._bounded_summary(summary)   # cap untrusted summary before store/metadata
             err: str | None = None
@@ -985,15 +989,16 @@ class VmJobDispatcher:
                       observation: "_attest.RunObservation | None") -> None:
         """Strip a planted attestation.json and, with a key, write ours. Never raises."""
         try:
-            _attest.seal_receipt(out_dir, key=self._attest_key, observation=observation)
+            _attest.seal_receipt(out_dir, key=self._attest_key, observation=observation,
+                                 reason="input could not be hashed")
         except Exception as exc:  # noqa: BLE001
             logger.error("attestation: could not write the receipt for job %s (%s); the job "
                          "completes without one", job.job_id, exc)
             try:
-                _attest.strip_receipt(out_dir)
+                _attest.write_tombstone(out_dir, "signing failed")
             except Exception:  # noqa: BLE001
-                logger.exception("attestation: could not remove %s for job %s",
-                                 _attest.RECEIPT_NAME, job.job_id)
+                logger.exception("attestation: could not write a tombstone for job %s",
+                                 job.job_id)
 
     def _sealed_envelope(self, job: Job) -> Any:
         """Parse the HOST-SEALED metadata.json (the Envelope the trust gate wrote) for the remote path,
@@ -1114,7 +1119,8 @@ class VmJobDispatcher:
             if self._pending_upload_retry:
                 retry_pending_uploads(self._job_root, self._blobs, self._store, logger,
                                       on_repaired=self._index_repaired_result,
-                                      retention_seconds=self._retention_s)
+                                      retention_seconds=self._retention_s,
+                                      attest_key=self._attest_key)
         except Exception:  # noqa: BLE001 — a sweep failure must not kill maintenance
             logger.warning("vm_dispatch: pending-upload sweep failed", exc_info=True)
         try:
@@ -1581,7 +1587,9 @@ def build_remote_vm_dispatcher(
     remote_http transport: claim a warm slot -> POST the job to its http_agent -> HOST-TRUST-GATE the
     extracted output (re-seal + verify engine/input-SHA/caps) -> DONE. The runtime's client (m)TLS
     context flows through; per-job params are gated through the engine's allowlist and forwarded; the
-    engine's egress personality is enforced fail-closed. Selection is capability-based
+    engine's egress personality is CHECKED fail-closed against the pool's declared egress (a
+    declaration match, not host-side enforcement -- see _process, and why the execution receipt
+    omits the policy on this tier). Selection is capability-based
     (``runtime.dispatch_style``), not tier-name matching -- this is the single typed CLI seam."""
     from blastbox.host.runtime.remote_http import make_remote_validate
 

@@ -9,13 +9,27 @@ with the DSN) can write:
     metadata_sha256  sha256 of the exact metadata.json bytes it uploads
     worker_runtime   } as it launched them
     worker_tier      }
-    net_policy_effective  the personality it resolved and enforced for this run; OMITTED when the
-                          dispatcher does not know (e.g. a VM tier whose egress is undeclared)
+    net_policy_effective  the personality this dispatcher ITSELF enforced for this run (local
+                          cold via netd/netns, local warm slots); OMITTED wherever it did not
+                          enforce the posture itself -- every remote/VM tier
+    net_exit         the enforced personality's exit driver ("none", "direct", "socks", ...),
+                     present only with net_policy_effective: the NAME is operator-defined, so
+                     two hosts could sign one name for opposite postures
     started_at_ms / finished_at_ms / issued_at_ms   integer epoch ms, its own clock
 
 The receipt is written as ``attestation.json`` beside ``metadata.json`` in the sealed output
 tree, so it reaches the blob store through the same ``put_output`` as the result it vouches for.
-The ingress only SERVES those bytes; nothing in the ingress signs anything.
+The ingress only SERVES those bytes; nothing in the ingress signs anything. When a finalize does
+NOT sign (no key, signing failed, ...), it writes a TOMBSTONE there instead --
+``{"attestation": null, "reason": "..."}`` -- because the store never deletes a single object,
+so a superseded attempt's receipt would otherwise survive. The ingress answers 404 for one.
+
+Opt-in: only an explicit ``BLASTBOX_ATTEST_KEY`` enables receipts.
+
+What it does NOT prove: that detections are true (the envelope is still the worker's account),
+or that the signer ran the job at all when the signer can also write the shared results prefix
+-- any pinned key whose holder can write there can attach a receipt to a job it never ran. Pin
+only keys of hosts you trust as much as the control plane.
 
 Wire contract (shared with verifiers, e.g. Loadout):
 
@@ -53,9 +67,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 _log = logging.getLogger("blastbox.host.attest")
 
 ATTEST_KEY_ENV = "BLASTBOX_ATTEST_KEY"
-PKI_DIR_ENV = "BLASTBOX_PKI_DIR"
 HOST_ID_ENV = "BLASTBOX_HOST_ID"
-ATTEST_KEY_FILENAME = "attest.key"
 
 #: The receipt's name in the sealed output tree and in the blob store's results prefix.
 RECEIPT_NAME = "attestation.json"
@@ -108,15 +120,14 @@ def _env_value(env: Mapping[str, str], name: str) -> str | None:
 
 
 def attest_key_path(env: Mapping[str, str] | None = None) -> Path | None:
-    """``BLASTBOX_ATTEST_KEY``, else ``$BLASTBOX_PKI_DIR/attest.key``, else ``None`` (disabled).
+    """``BLASTBOX_ATTEST_KEY``, else ``None`` (disabled). STRICTLY OPT-IN.
 
-    No built-in default: a host that never chose to attest must not start minting a key."""
+    Deliberately NOT derived from ``BLASTBOX_PKI_DIR``: that is the mTLS/CA directory, set on
+    every node, and deriving from it silently minted a signing key on each of them (or logged
+    errors on a read-only CA dir). A host that never chose to attest must not start minting."""
     env = os.environ if env is None else env
     explicit = _env_value(env, ATTEST_KEY_ENV)
-    if explicit:
-        return Path(explicit)
-    pki = _env_value(env, PKI_DIR_ENV)
-    return Path(pki) / ATTEST_KEY_FILENAME if pki else None
+    return Path(explicit) if explicit else None
 
 
 def host_id(env: Mapping[str, str] | None = None) -> str:
@@ -229,19 +240,21 @@ def load_or_create_key(path: Path) -> AttestKey:
     return load_existing_key(path)
 
 
-def load_attest_key(env: Mapping[str, str] | None = None, *, create: bool = True
-                    ) -> AttestKey | None:
+def load_attest_key(env: Mapping[str, str] | None = None, *, create: bool = True,
+                    quiet_missing: bool = False) -> AttestKey | None:
     """The configured key, or ``None`` -- attestation disabled, or the key refused/unloadable.
 
     Never raises: a dispatcher whose key is bad must keep running jobs (without receipts), so a
     failure is logged LOUDLY here instead."""
     path = attest_key_path(env)
     if path is None:
+        _log.debug("attestation: %s not set; receipts are off", ATTEST_KEY_ENV)
         return None
     try:
         return load_or_create_key(path) if create else load_existing_key(path)
     except FileNotFoundError:
-        _log.error("attestation: no key at %s; receipts are DISABLED", path)
+        (_log.debug if quiet_missing else _log.error)(
+            "attestation: no key at %s; receipts are DISABLED", path)
     except AttestKeyRefused as exc:
         _log.error("attestation: key refused (%s); receipts are DISABLED", exc)
     except Exception as exc:  # noqa: BLE001 - never take the dispatcher down over a receipt
@@ -276,7 +289,9 @@ class RunObservation:
     input_sha256: str
     worker_runtime: str | None
     worker_tier: str | None
+    # Only where THIS dispatcher enforced the posture itself; None everywhere else.
     net_policy_effective: str | None
+    net_exit: str | None
     started_at_ms: int
     finished_at_ms: int
 
@@ -305,7 +320,9 @@ def build_receipt(obs: RunObservation, *, key_id: str, metadata_sha256: str,
         "job_id": obs.job_id,
         "engine": obs.engine,
         "status": "done",
-        # Kept for wire compatibility. By construction the signer IS the executor.
+        # Kept for wire compatibility. The signer claims it executed the run; that claim is only
+        # as good as the signer -- any pinned key whose holder can write the shared results prefix
+        # can attach a receipt to a job it never ran.
         "executor": "local",
         "input_sha256": obs.input_sha256,
         "metadata_sha256": metadata_sha256,
@@ -317,13 +334,13 @@ def build_receipt(obs: RunObservation, *, key_id: str, metadata_sha256: str,
     }
     if obs.net_policy_effective is not None:
         doc["net_policy_effective"] = obs.net_policy_effective
+        doc["net_exit"] = obs.net_exit
     return doc
 
 
 def strip_receipt(out_dir: Path) -> None:
-    """Remove whatever sits at ``<out_dir>/attestation.json`` -- a worker can write into its
-    output tree, and an upload ships the whole tree, so a planted receipt must never ride along.
-    Never follows a symlink."""
+    """Remove whatever sits at ``<out_dir>/attestation.json`` (file, directory or symlink)
+    without following a symlink. A worker can write into its output tree."""
     target = Path(out_dir) / RECEIPT_NAME
     try:
         st = os.lstat(target)
@@ -333,6 +350,38 @@ def strip_receipt(out_dir: Path) -> None:
         shutil.rmtree(target)
     else:
         os.unlink(target)
+
+
+def _write_atomic(out_dir: Path, data: bytes) -> None:
+    tmp = out_dir / f".{RECEIPT_NAME}.{uuid.uuid4().hex}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        strip_receipt(out_dir)          # os.replace cannot replace a directory
+        os.replace(tmp, out_dir / RECEIPT_NAME)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def tombstone_body(reason: str) -> dict:
+    return {"attestation": None, "reason": reason}
+
+
+def write_tombstone(out_dir: Path, reason: str) -> None:
+    """Write the "no receipt for this run" marker. Uploaded like a receipt, so it OVERWRITES a
+    superseded attempt's receipt in the store (which never deletes a single object)."""
+    _write_atomic(Path(out_dir), canonical(tombstone_body(reason)))
+
+
+def is_tombstone(data: bytes) -> bool:
+    try:
+        body = json.loads(data)
+    except Exception:  # noqa: BLE001
+        return False
+    return isinstance(body, dict) and body.get("attestation", 0) is None
 
 
 def _declares_receipt_name(seal: Path) -> bool:
@@ -345,39 +394,70 @@ def _declares_receipt_name(seal: Path) -> bool:
 
 
 def seal_receipt(out_dir: Path, *, key: AttestKey | None,
-                 observation: RunObservation | None) -> dict | None:
-    """Strip any planted receipt, then (with a key) sign and write ours. Returns the body written,
-    or None when no receipt was written. Call it IMMEDIATELY before uploading ``out_dir``: the
-    metadata hash is of the bytes on disk at this moment, which are the bytes put_output ships."""
+                 observation: RunObservation | None, reason: str | None = None) -> dict | None:
+    """Replace whatever sits at ``attestation.json`` with this dispatcher's signed receipt, or,
+    when it does not sign, a tombstone saying why. Returns the SIGNED body, or None when a
+    tombstone was written. Call it IMMEDIATELY before uploading ``out_dir``: the metadata hash is
+    of the bytes on disk at this moment, which are the bytes put_output ships."""
     out_dir = Path(out_dir)
-    strip_receipt(out_dir)
-    if key is None or observation is None:
+    if key is None:
+        write_tombstone(out_dir, "no attestation key")
+        return None
+    if observation is None:
+        write_tombstone(out_dir, reason or "run not observed")
         return None
     try:
         metadata_sha256 = sha256_file(out_dir / _SEAL_NAME)
     except (OSError, ValueError) as exc:
         _log.error("attestation: job %s has no regular metadata.json to vouch for (%s); "
                    "no receipt", observation.job_id, exc)
+        write_tombstone(out_dir, "metadata.json is not a regular file")
         return None
     if _declares_receipt_name(out_dir / _SEAL_NAME):
-        # The trust gate refuses this; never paper over a declared artifact regardless.
+        # The trust gate refuses this; never let a declared artifact stand in for a receipt.
         _log.error("attestation: job %s declares %s as an artifact; no receipt",
                    observation.job_id, RECEIPT_NAME)
+        write_tombstone(out_dir, f"envelope declares the reserved path {RECEIPT_NAME}")
         return None
     doc = build_receipt(observation, key_id=key.key_id, metadata_sha256=metadata_sha256)
     body = {"attestation": doc, "signature": key.sign(doc)}
-    data = canonical(body)
-    tmp = out_dir / f".{RECEIPT_NAME}.{uuid.uuid4().hex}.tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(data)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, out_dir / RECEIPT_NAME)
-    finally:
-        tmp.unlink(missing_ok=True)
+    _write_atomic(out_dir, canonical(body))
     return body
+
+
+def verify_body(key: AttestKey, body: object) -> bool:
+    """Whether ``body`` is a receipt validly signed by ``key``."""
+    try:
+        assert isinstance(body, dict)
+        doc, sig = body["attestation"], body["signature"]
+        assert isinstance(doc, dict) and isinstance(sig, str)
+        key.private_key.public_key().verify(
+            base64.urlsafe_b64decode(sig), canonical(doc), ec.ECDSA(hashes.SHA256()))
+    except Exception:  # noqa: BLE001 - anything short of a clean verify is "no"
+        return False
+    return True
+
+
+def tree_receipt_is_ours(out_dir: Path, *, key: AttestKey | None, job_id: str) -> bool:
+    """True only if ``<out_dir>/attestation.json`` is a receipt THIS key signed, for ``job_id``,
+    over the metadata.json bytes currently in the tree."""
+    if key is None:
+        return False
+    out_dir = Path(out_dir)
+    try:
+        fd = os.open(out_dir / RECEIPT_NAME, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return False
+            body = json.loads(os.read(fd, 1 << 20))
+        finally:
+            os.close(fd)
+        doc = body["attestation"]
+        return (verify_body(key, body) and doc.get("key_id") == key.key_id
+                and doc.get("job_id") == job_id
+                and doc.get("metadata_sha256") == sha256_file(out_dir / _SEAL_NAME))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def public_key_body(key: AttestKey) -> dict:
