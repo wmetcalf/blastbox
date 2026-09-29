@@ -355,6 +355,75 @@ def test_tree_receipt_verification(tmp_path):
     assert not attest.tree_receipt_is_ours(out, key=key, job_id=jid)
 
 
+def _valid_tree(tmp_path):
+    out = _tree(tmp_path, b'{"engine":"clippyshot"}')
+    key = attest.load_or_create_key(tmp_path / "k")
+    attest.seal_receipt(out, key=key, observation=_obs())
+    return out, key, "11111111-1111-1111-1111-111111111111"
+
+
+@pytest.mark.parametrize("where", ["open", "read", "metadata"])
+def test_a_transient_read_error_is_not_a_verdict(tmp_path, monkeypatch, where):
+    """EIO/EAGAIN on a VALID receipt must not read as "not ours": the sweep would tombstone a
+    genuine receipt permanently. It raises ReceiptUnreadable (an OSError) instead."""
+    import errno as _errno
+
+    out, key, jid = _valid_tree(tmp_path)
+    real_open, real_read = attest.os.open, attest.os.read
+    receipt = str(out / attest.RECEIPT_NAME)
+    meta = str(out / "metadata.json")
+    fds: set[int] = set()
+
+    def fake_open(p, *a, **kw):
+        if where == "open" and str(p) == receipt:
+            raise OSError(_errno.EIO, "Input/output error", str(p))
+        if where == "metadata" and str(p) == meta:
+            raise OSError(_errno.EAGAIN, "Resource temporarily unavailable", str(p))
+        fd = real_open(p, *a, **kw)
+        if str(p) == receipt:
+            fds.add(fd)
+        return fd
+
+    def fake_read(fd, n):
+        if where == "read" and fd in fds:
+            raise OSError(_errno.EIO, "Input/output error")
+        return real_read(fd, n)
+
+    monkeypatch.setattr(attest.os, "open", fake_open)
+    monkeypatch.setattr(attest.os, "read", fake_read)
+    with pytest.raises(attest.ReceiptUnreadable):
+        attest.tree_receipt_is_ours(out, key=key, job_id=jid)
+
+
+def test_a_short_read_does_not_truncate_a_valid_receipt(tmp_path, monkeypatch):
+    """NFS/FUSE/signals can return fewer bytes than asked; one os.read truncated the receipt."""
+    out, key, jid = _valid_tree(tmp_path)
+    real_read = attest.os.read
+    monkeypatch.setattr(attest.os, "read", lambda fd, n: real_read(fd, min(n, 7)))
+    assert attest.tree_receipt_is_ours(out, key=key, job_id=jid)
+
+
+def test_an_oversized_receipt_is_definitely_not_ours(tmp_path):
+    out, key, jid = _valid_tree(tmp_path)
+    (out / attest.RECEIPT_NAME).write_bytes(b" " * ((1 << 20) + 1))
+    assert attest.tree_receipt_is_ours(out, key=key, job_id=jid) is False
+
+
+@pytest.mark.parametrize("kind", ["missing", "symlink", "dir", "garbage"])
+def test_definite_non_receipts_are_false_not_errors(tmp_path, kind):
+    out, key, jid = _valid_tree(tmp_path)
+    target = out / attest.RECEIPT_NAME
+    target.unlink()
+    if kind == "symlink":
+        (tmp_path / "x").write_text("{}")
+        target.symlink_to(tmp_path / "x")
+    elif kind == "dir":
+        target.mkdir()
+    elif kind == "garbage":
+        target.write_text("not json")
+    assert attest.tree_receipt_is_ours(out, key=key, job_id=jid) is False
+
+
 def test_downgrade_and_inspect_flags_are_present_only_when_true():
     plain = attest.build_receipt(_obs(), key_id="k" * 16, metadata_sha256="c" * 64)
     assert "net_downgraded" not in plain and "net_inspect" not in plain

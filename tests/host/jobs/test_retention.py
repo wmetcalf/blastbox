@@ -1672,3 +1672,46 @@ class TestRetainedTreeReceipts:
         assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t"),
                                      attest_key=key) == 1
         assert blobs.receipt == attest.canonical(body)
+
+
+def test_a_transient_receipt_read_error_leaves_the_tree_retained_and_intact(tmp_path,
+                                                                          monkeypatch):
+    """A momentary EIO reading a VALID receipt used to read as "not ours": the sweep tombstoned
+    it and uploaded -- destroying a genuine receipt for good. It must retry next sweep instead."""
+    import errno as _errno
+
+    from blastbox.host import attest
+
+    store = InMemoryJobStore()
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.job_id = _JID
+    job.status = JobStatus.FAILED
+    job.error = f"result upload failed after 3 attempts; {RESULT_RETAINED_MARKER}"
+    store.create(job)
+    out = _sealed_tree(tmp_path, _JID) / "output"
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    attest.seal_receipt(out, key=key, observation=attest.RunObservation(
+        job_id=_JID, engine="redtusk", input_sha256="1" * 64, worker_runtime="runc",
+        worker_tier=None, started_at_ms=1, finished_at_ms=2))
+    genuine = (out / "attestation.json").read_bytes()
+
+    real_open = attest.os.open
+    receipt = str(out / "attestation.json")
+    flaky = {"on": True}
+
+    def fake_open(p, *a, **kw):
+        if flaky["on"] and str(p) == receipt:
+            raise OSError(_errno.EIO, "Input/output error", str(p))
+        return real_open(p, *a, **kw)
+
+    monkeypatch.setattr(attest.os, "open", fake_open)
+    blobs = _FakeBlobs()
+    assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t"),
+                                 attest_key=key) == 0
+    assert blobs.put_calls == 0, "uploaded on an unreadable receipt"
+    assert (out / "attestation.json").read_bytes() == genuine, "a genuine receipt was destroyed"
+
+    flaky["on"] = False                              # next sweep: the read works again
+    assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t"),
+                                 attest_key=key) == 1
+    assert (out / "attestation.json").read_bytes() == genuine

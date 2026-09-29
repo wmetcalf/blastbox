@@ -454,26 +454,76 @@ def verify_body(key: AttestKey, body: object) -> bool:
     return True
 
 
+#: A receipt is a few hundred bytes; anything past this is not one of ours.
+_RECEIPT_MAX_BYTES = 1 << 20
+
+
+class ReceiptUnreadable(OSError):
+    """The receipt (or the metadata it vouches for) could not be READ right now -- EIO, EAGAIN, a
+    permission flap. Not a verdict: the caller must neither tombstone nor upload, and retry later.
+    An OSError subclass so a sweep's existing "leave it retained" OSError path handles it."""
+
+
+def _read_capped(fd: int, cap: int) -> bytes | None:
+    """Read to EOF in a loop (a single os.read may legitimately return a SHORT read on NFS/FUSE
+    or after a signal). None when the file is larger than ``cap``."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = os.read(fd, min(65536, cap + 1 - total))
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > cap:
+            return None
+
+
 def tree_receipt_is_ours(out_dir: Path, *, key: AttestKey | None, job_id: str) -> bool:
     """True only if ``<out_dir>/attestation.json`` is a receipt THIS key signed, for ``job_id``,
-    over the metadata.json bytes currently in the tree."""
+    over the metadata.json bytes currently in the tree.
+
+    Three outcomes, and the difference matters to the caller: True; False = DEFINITELY not ours
+    (absent, a symlink or non-regular file, oversized, unparseable, or a signature/key/job/metadata
+    mismatch) -- safe to replace with a tombstone; ReceiptUnreadable = could not read it right
+    now -- replacing it would destroy a genuine receipt over a transient error."""
     if key is None:
         return False
     out_dir = Path(out_dir)
     try:
         fd = os.open(out_dir / RECEIPT_NAME, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:                # a symlink: never ours
+            return False
+        raise ReceiptUnreadable(exc.errno, f"cannot open {RECEIPT_NAME}: {exc}") from exc
+    try:
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 return False
-            body = json.loads(os.read(fd, 1 << 20))
-        finally:
-            os.close(fd)
-        doc = body["attestation"]
-        return (verify_body(key, body) and doc.get("key_id") == key.key_id
-                and doc.get("job_id") == job_id
-                and doc.get("metadata_sha256") == sha256_file(out_dir / _SEAL_NAME))
-    except Exception:  # noqa: BLE001
+            data = _read_capped(fd, _RECEIPT_MAX_BYTES)
+        except OSError as exc:
+            raise ReceiptUnreadable(exc.errno, f"cannot read {RECEIPT_NAME}: {exc}") from exc
+    finally:
+        os.close(fd)
+    if data is None:
         return False
+    try:
+        body = json.loads(data)
+        doc = body["attestation"]
+        if not (verify_body(key, body) and doc.get("key_id") == key.key_id
+                and doc.get("job_id") == job_id):
+            return False
+    except Exception:  # noqa: BLE001 - parsed bytes that are not our receipt: a verdict
+        return False
+    try:
+        metadata_sha256 = sha256_file(out_dir / _SEAL_NAME)
+    except ValueError:                              # not a regular file: a verdict
+        return False
+    except OSError as exc:
+        raise ReceiptUnreadable(exc.errno, f"cannot read {_SEAL_NAME}: {exc}") from exc
+    return doc.get("metadata_sha256") == metadata_sha256
 
 
 def public_key_body(key: AttestKey) -> dict:
