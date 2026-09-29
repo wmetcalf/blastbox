@@ -1,8 +1,9 @@
 """Host resource gauges on the ingress ``/metrics`` (CPU / RAM / disk / node budget).
 
-Everything is computed at SCRAPE time from ``/proc`` + ``os.statvfs`` by a custom collector; the
-proc root, statvfs, loadavg and the node view are injectable so these tests never depend on the
-machine running them. The contract under test: a series that cannot be read truthfully is
+``/proc`` and cgroupfs are read inline on every scrape; the filesystem part (``os.statvfs`` of the
+job/blob roots, the node share dir) comes from a single-flight background refresher with a TTL and a
+staleness bound, so a hung mount can never block a request thread. The proc root, statvfs, loadavg,
+clock and the node view are injectable so these tests never depend on the machine running them. The contract under test: a series that cannot be read truthfully is
 OMITTED — a scrape never raises and never emits a fabricated zero.
 """
 from __future__ import annotations
@@ -463,17 +464,137 @@ def test_readonly_reader_skips_fifo_symlink_and_oversize(tmp_path):
     os.mkfifo(d / "fifo.json")                      # would block a plain open()
     (d / "zero.json").symlink_to("/dev/zero")        # would read forever
     (d / "big.json").write_text("{" + " " * (128 * 1024) + "}")
+    # a VALID snapshot outside the dir, linked in under its canonical name: only O_NOFOLLOW (or
+    # the lstat prefilter) keeps it out — S_ISREG on the target would accept it
+    outside = tmp_path / "outside"
+    FileNodeShare(str(outside)).publish(
+        _snap("cc", assigned=1, ram=100, vcpus=1, budget_ram=1000, budget_vcpus=4))
+    (d / "cc@firecracker@abc123.json").symlink_to(outside / "cc@firecracker@abc123.json")
     got = read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time())
-    assert [s.engine for s in got] == ["aa"]
+    assert got is not None and [s.engine for s in got] == ["aa"]
 
 
-def test_readonly_reader_caps_file_count(tmp_path):
+def _publish_n(d: Path, n: int) -> None:
+    share = FileNodeShare(str(d))
+    for i in range(n):
+        share.publish(_snap(f"e{i:03d}", assigned=1, ram=100, vcpus=1, budget_ram=100000,
+                            budget_vcpus=400))
+
+
+def test_readonly_reader_over_cap_is_omitted_not_truncated(tmp_path, monkeypatch):
     d = tmp_path / "node"
-    d.mkdir()
-    for i in range(20):
-        (d / f"junk{i:02d}.json").write_text("{}")
-    # must not raise; just stops after max_files entries
-    assert read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time(), max_files=5) == []
+    _publish_n(d, 20)
+    opens = []
+    real_open = os.open
+
+    def counting_open(path, *a, **k):
+        if str(path).startswith(str(d)):
+            opens.append(path)
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(os, "open", counting_open)
+    # more live candidates than the cap: a partial view would UNDERCOUNT → omitted instead
+    assert read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time(), max_files=5) is None
+    assert len(opens) <= 5
+    opens.clear()
+    got = read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time(), max_files=20)
+    assert got is not None and len(got) == 20
+
+
+def test_readonly_reader_junk_does_not_consume_the_cap(tmp_path):
+    d = tmp_path / "node"
+    _publish_n(d, 3)
+    for i in range(10):
+        os.mkfifo(d / f"fifo{i}.json")
+        (d / f"link{i}.json").symlink_to("/dev/zero")
+    got = read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time(), max_files=5)
+    assert got is not None and len(got) == 3
+
+
+def test_read_node_view_over_cap_is_omitted_with_warning(tmp_path, monkeypatch, caplog):
+    import logging
+
+    import blastbox.host.node_share as ns
+
+    d = tmp_path / "node"
+    _publish_n(d, 10)
+    monkeypatch.setattr(ns, "_RO_MAX_FILES", 4)
+    with caplog.at_level(logging.WARNING):
+        assert read_node_view(str(d), stale_after_s=20.0, node="") is None
+    assert any("cap" in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+
+
+def test_mixed_node_omission_warns(tmp_path, caplog):
+    import logging
+
+    import blastbox.observability.host_metrics as hm
+
+    hm._warned_mixed_nodes = False
+    share = FileNodeShare(str(tmp_path / "node"))
+    share.publish(_snap("aa", assigned=1, ram=100, vcpus=1, budget_ram=8192, budget_vcpus=4,
+                        node="h1"))
+    share.publish(_snap("bb", assigned=1, ram=100, vcpus=1, budget_ram=8192, budget_vcpus=4))
+    with caplog.at_level(logging.WARNING):
+        # "" counts as a distinct id — exact parity with DispatcherSizer.tick
+        assert read_node_view(str(tmp_path / "node"), stale_after_s=20.0, node="") is None
+    assert any("node id" in r.getMessage() for r in caplog.records
+               if r.levelno == logging.WARNING)
+
+
+def test_fs_cache_recovers_when_thread_start_fails(monkeypatch):
+    import blastbox.observability.host_metrics as hm
+
+    t = [0.0]
+    cache = hm._FsCache(lambda: hm._FsValues(disk=(("jobs", 1, 1),), node=None),
+                        clock=lambda: t[0], ttl_s=10, max_stale_s=60, wait_s=1)
+    assert cache.get() is not None
+    real = hm.threading.Thread.start
+
+    def boom(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(hm.threading.Thread, "start", boom)
+    t[0] = 11
+    assert cache.get() is not None  # never raises; last good values still within max_stale
+    monkeypatch.setattr(hm.threading.Thread, "start", real)
+    t[0] = 20
+    got = cache.get()                # the NEXT scrape retries (not wedged on a phantom refresh)
+    assert got is not None
+    t[0] = 75                        # 55s after the retry read the values: still fresh
+    assert cache.get() is not None
+
+
+def test_fs_cache_refresh_exception_clears_inflight():
+    import blastbox.observability.host_metrics as hm
+
+    t = [0.0]
+    n = [0]
+
+    def refresh():
+        n[0] += 1
+        if n[0] == 1:
+            raise OSError("boom")
+        return hm._FsValues(disk=(("jobs", 1, 1),), node=None)
+
+    cache = hm._FsCache(refresh, clock=lambda: t[0], ttl_s=10, max_stale_s=60, wait_s=1)
+    assert cache.get() is None
+    t[0] = 11
+    assert cache.get() is not None and n[0] == 2
+
+
+def test_fs_cache_staleness_counts_from_refresh_start():
+    import blastbox.observability.host_metrics as hm
+
+    t = [1000.0]
+
+    def slow_refresh():
+        t[0] += 50  # the read took 50s (slow mount) — values are as old as its START
+        return hm._FsValues(disk=(("jobs", 1, 1),), node=None)
+
+    cache = hm._FsCache(slow_refresh, clock=lambda: t[0], ttl_s=100, max_stale_s=60, wait_s=1)
+    assert cache.get() is not None   # age 50 <= 60
+    t[0] += 15                       # age 65 from start (only 15 from completion)
+    assert cache.get() is None
 
 
 def test_readonly_reader_never_creates_dir(tmp_path, monkeypatch):

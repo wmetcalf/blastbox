@@ -367,44 +367,57 @@ def read_snapshots_readonly(
     *,
     max_age_s: float,
     now: float,
-    max_files: int = _RO_MAX_FILES,
-    max_bytes: int = _RO_MAX_BYTES,
-) -> list[DemandSnapshot]:
+    max_files: "int | None" = None,
+    max_bytes: "int | None" = None,
+) -> "list[DemandSnapshot] | None":
     """The node view for an OBSERVER (e.g. the ingress ``/metrics`` scrape), strictly read-only.
 
     Unlike ``FileNodeShare`` it never creates, chmods or GCs the dir, and it treats the dir as
-    untrusted input: only REGULAR files are read (opened ``O_NOFOLLOW|O_NONBLOCK`` then checked
-    with ``fstat`` — a FIFO, a symlink to ``/dev/zero`` or a device is skipped, never blocked on
-    or streamed), each read is capped at ``max_bytes`` (a larger file is skipped), and at most
-    ``max_files`` ``*.json`` entries are considered. A missing dir → ``[]``; a permission error
-    on the dir propagates so the caller can say why the view is missing."""
+    untrusted input. The WHOLE listing is walked; entries that are not regular files per ``lstat``
+    (FIFOs, symlinks, devices) or are larger than ``max_bytes`` are skipped without being opened
+    and do not count against the cap. Each remaining candidate is opened ``O_NOFOLLOW|O_NONBLOCK``
+    and re-checked with ``fstat`` (the entry can be swapped between lstat and open), and read at
+    most ``max_bytes``.
+
+    Returns ``None`` — NOT a partial list — when there are more candidates than ``max_files``: a
+    truncated view would undercount the node's reservations and disagree with the dispatchers, and
+    a wrong number is worse than a gap. A missing dir → ``[]``; a permission error on the dir
+    propagates so the caller can say why the view is missing."""
     import stat as _stat
 
+    cap = _RO_MAX_FILES if max_files is None else max_files
+    size_cap = _RO_MAX_BYTES if max_bytes is None else max_bytes
     try:
         it = os.scandir(directory)
     except FileNotFoundError:
         return []
-    names: list[str] = []
+    candidates: list[str] = []
     with it:
         for entry in it:
             if not entry.name.endswith(".json"):
                 continue
-            names.append(entry.name)
-            if len(names) >= max_files:
-                break
+            try:
+                st = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if not _stat.S_ISREG(st.st_mode) or st.st_size > size_cap:
+                continue
+            candidates.append(entry.name)
+    if len(candidates) > cap:
+        return None
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     out: list[DemandSnapshot] = []
-    for name in sorted(names):
+    for name in candidates:
         try:
             fd = os.open(os.path.join(directory, name), flags)
         except OSError:
-            continue                            # symlink (ELOOP) / vanished / unreadable
+            continue                            # swapped for a symlink (ELOOP) / vanished
         try:
             st = os.fstat(fd)
-            if not _stat.S_ISREG(st.st_mode) or st.st_size > max_bytes:
+            if not _stat.S_ISREG(st.st_mode) or st.st_size > size_cap:
                 continue
-            raw = os.read(fd, max_bytes + 1)
-            if len(raw) > max_bytes:
+            raw = os.read(fd, size_cap + 1)
+            if len(raw) > size_cap:
                 continue                        # grew past the cap between fstat and read
             snap = FileNodeShare._accept(name, raw.decode("utf-8"), max_age_s=max_age_s, now=now)
         except Exception:

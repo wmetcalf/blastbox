@@ -1,8 +1,11 @@
 """Host resource gauges (CPU / RAM / disk / node budget) computed at SCRAPE time.
 
-A custom Prometheus collector, not a background thread: every ``GET /metrics`` reads ``/proc``,
-``os.getloadavg`` and ``os.statvfs`` fresh, so the numbers are as current as the scrape and cost
-nothing between scrapes. No new dependency (no psutil) — ``/proc`` + ``os`` only.
+A custom Prometheus collector. ``/proc`` (stat, meminfo), ``os.getloadavg`` and cgroupfs are read
+inline on every ``GET /metrics``, so those numbers are as current as the scrape. The FILESYSTEM part
+(``os.statvfs`` of the job/blob roots, the node share dir) is NOT read on the request thread: a
+single-flight background refresher re-reads it at most every ``refresh_ttl_s`` (10s), a scrape waits
+for it at most ``refresh_wait_s`` (1s), and cached values are served until ``max_stale_s`` (60s)
+after they were read, then omitted. No new dependency (no psutil) — ``/proc`` + ``os`` only.
 
 Truthfulness rule: a series that cannot be read is OMITTED. On a non-Linux host, a container with
 ``/proc`` masked, a missing job root, etc. the affected series simply vanish from the exposition;
@@ -101,6 +104,8 @@ class NodeView:
 
 _log = logging.getLogger("blastbox.observability.host_metrics")
 _warned_mixed_nodes = False
+_warned_over_cap = False
+_warned_thread_start = False
 
 
 def read_node_view(share_dir: str, *, stale_after_s: float, node: str) -> Optional[NodeView]:
@@ -115,19 +120,30 @@ def read_node_view(share_dir: str, *, stale_after_s: float, node: str) -> Option
     regular files. ``None`` when the dir is absent, no live snapshot published a budget, or the
     matched snapshots MIX node ids (the same fail-closed condition as ``DispatcherSizer.tick`` —
     summing two hosts' pools into one budget would be a lie). A permission error propagates."""
-    global _warned_mixed_nodes
+    global _warned_mixed_nodes, _warned_over_cap
     from blastbox.host.node_share import read_snapshots_readonly
 
+    listed = read_snapshots_readonly(share_dir, max_age_s=stale_after_s, now=time.time())
+    if listed is None:
+        if not _warned_over_cap:
+            _warned_over_cap = True
+            _log.warning("node share dir %s holds more snapshot files than the read cap; "
+                         "omitting blastbox_node_* series rather than reporting a partial "
+                         "(undercounted) view", share_dir)
+        return None
     snaps = [
-        s for s in read_snapshots_readonly(share_dir, max_age_s=stale_after_s, now=time.time())
+        s for s in listed
         # same symmetric node filter the dispatchers apply
         if s.node == "" or node == "" or s.node == node
     ]
+    # Exact parity with DispatcherSizer.tick: "" counts as a distinct id, so tagged + untagged
+    # snapshots in one view is "mixed" too — the dispatchers fail closed on that same view.
     if len({s.node for s in snaps}) > 1:
         if not _warned_mixed_nodes:
             _warned_mixed_nodes = True
-            _log.debug("node view mixes distinct node ids %s; omitting blastbox_node_* series "
-                       "(set a consistent BLASTBOX_NODE_ID)", sorted({s.node for s in snaps}))
+            _log.warning("node view mixes distinct node ids %s; omitting blastbox_node_* series "
+                         "(set a CONSISTENT BLASTBOX_NODE_ID on every co-located dispatcher)",
+                         sorted({s.node for s in snaps}))
         return None
     ram = [s.budget_ram_mib for s in snaps if s.budget_ram_mib > 0]
     vcpu = [s.budget_vcpus for s in snaps if s.budget_vcpus > 0]
@@ -164,6 +180,14 @@ class _FsValues:
     node: Optional[NodeView]
 
 
+def _warn_thread_start_once(exc: BaseException) -> None:
+    global _warned_thread_start
+    if not _warned_thread_start:
+        _warned_thread_start = True
+        _log.warning("could not start the metrics filesystem refresher (%s); disk/node series "
+                     "will be retried on the next scrape", exc)
+
+
 class _FsCache:
     """Single-flight, TTL'd cache of the filesystem-derived values.
 
@@ -181,7 +205,7 @@ class _FsCache:
         self._wait_s = wait_s
         self._lock = threading.Lock()
         self._values: Optional[_FsValues] = None
-        self._done_at: Optional[float] = None
+        self._done_at: Optional[float] = None   # when the served values were READ
         self._started_at: Optional[float] = None
         self._inflight: Optional[threading.Event] = None
 
@@ -193,8 +217,16 @@ class _FsCache:
             if self._inflight is None and due:
                 started = self._inflight = threading.Event()
                 self._started_at = now
-                threading.Thread(target=self._run, args=(started,), daemon=True,
-                                 name="blastbox-metrics-fs-refresh").start()
+                try:
+                    threading.Thread(target=self._run, args=(started, now), daemon=True,
+                                     name="blastbox-metrics-fs-refresh").start()
+                except Exception as exc:  # noqa: BLE001 - e.g. pids.max / RLIMIT_NPROC
+                    # Un-wedge: nothing will ever clear _inflight for a thread that never ran,
+                    # so clear it here and let the NEXT scrape retry.
+                    self._inflight = None
+                    self._started_at = None
+                    started = None
+                    _warn_thread_start_once(exc)
         if started is not None:
             started.wait(self._wait_s)
         with self._lock:
@@ -209,17 +241,21 @@ class _FsCache:
         with self._lock:
             self._started_at = None
 
-    def _run(self, done: threading.Event) -> None:
+    def _run(self, done: threading.Event, read_at: float) -> None:
+        values: Optional[_FsValues] = None
         try:
-            values: Optional[_FsValues] = self._refresh()
+            values = self._refresh()
         except Exception:  # noqa: BLE001 - keep the last good values
             values = None
-        with self._lock:
-            if values is not None:
-                self._values = values
-                self._done_at = self._clock()
-            self._inflight = None
-        done.set()
+        finally:
+            with self._lock:
+                if values is not None:
+                    self._values = values
+                    # stamped with the refresh START: the values are as old as when they were
+                    # read, so a slow mount can't stretch max_stale_s
+                    self._done_at = read_at
+                self._inflight = None
+            done.set()
 
 
 def _read_small(path: Path) -> Optional[str]:
