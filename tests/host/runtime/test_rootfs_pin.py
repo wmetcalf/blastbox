@@ -1070,3 +1070,38 @@ def test_a_verdict_is_read_from_the_file_it_is_cached_for(tmp_path, monkeypatch)
     assert "A is incompatible" in problem
     assert str(f) in problem and "/proc/" not in problem
     assert "A is incompatible" in gate.checked()[0]
+
+
+# --- follow-up to #185 + #186: a stale drop is a repair the pool must record ------------------
+
+
+def test_a_stale_drop_is_reported_to_the_pool_as_a_repair(tmp_path, monkeypatch) -> None:
+    """The manager dropped a stale base but never told the pool, so the pool kept its old
+    generation and charged the new base's slots with the old one's failures. Reported through
+    take_repaired() exactly like #185's past-the-ceiling drop, once."""
+    from blastbox.host.runtime.fc_snapshot import SnapshotManager
+
+    monkeypatch.setattr(rfs, "guest_verdict", lambda p, r: ("", True))
+    backend, _launcher, rootfs, _base = _fc_backend(tmp_path)
+    mgr = SnapshotManager(tmp_path / "mgr", backend)
+    mgr.build()
+    mgr.restore("s1")
+    assert mgr.take_repaired() is False
+    _replace(rootfs, b"gen-2")
+    with pytest.raises(SnapshotRestoreError, match="changed since"):
+        mgr.restore("s2")
+    assert mgr.take_repaired() is True
+    assert mgr.take_repaired() is False           # once per repair
+
+
+def test_a_superseded_stale_restore_reports_no_second_repair(tmp_path, monkeypatch) -> None:
+    from blastbox.host.runtime.fc_snapshot import SnapshotManager
+
+    monkeypatch.setattr(rfs, "guest_verdict", lambda p, r: ("", True))
+    backend, _launcher, _rootfs, _base = _fc_backend(tmp_path)
+    mgr = SnapshotManager(tmp_path / "mgr", backend)
+    old = mgr.build()
+    assert mgr.invalidate(only_if=old, repaired=True) is True
+    assert mgr.take_repaired() is True
+    assert mgr.invalidate(only_if=old, repaired=True) is False   # already superseded
+    assert mgr.take_repaired() is False

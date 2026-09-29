@@ -821,7 +821,7 @@ class SnapshotManager:
                     if self._staging_epoch == epoch + 1:
                         self._staging_epoch = None
 
-    def invalidate(self, *, only_if: object | None = None) -> bool:
+    def invalidate(self, *, only_if: object | None = None, repaired: bool = False) -> bool:
         """Discard the built artifact so the next ``build()`` captures a fresh one.
 
         The warm base is checkpointed from a live sandbox, so it can capture a guest that was
@@ -831,6 +831,11 @@ class SnapshotManager:
 
         Returns True if a built artifact was actually discarded. Never raises: a failed
         invalidation must not take down the caller's failure-handling path.
+
+        ``repaired``: report the drop through take_repaired(), in the SAME hold, so the pool
+        advances its generation -- a drop the pool never hears of left the old generation
+        current, charging its failures to the replacement's slots. The pool's own repair path
+        records its generation itself and leaves this False.
         """
         with self._build_lock:
             # CHECK AND ACT IN ONE HOLD. `only_if` names the artifact the caller found wrong: if it
@@ -840,6 +845,8 @@ class SnapshotManager:
                 return False
             had = self._artifact is not None
             collect = self._invalidate_locked()
+            if had and repaired:
+                self._repaired = True
         for artifact in collect:
             self._collect(artifact)
         return had
@@ -1019,7 +1026,7 @@ class SnapshotManager:
                 # way. Waiting for the pool's repair drained the warm tier to zero -- and inside
                 # its rebuild cooldown, or with repair disabled, never recovered at all. Only if
                 # it is still the current artifact: a concurrent rebuild may already have won.
-                if self.invalidate(only_if=artifact):
+                if self.invalidate(only_if=artifact, repaired=True):
                     _log.error("snapshot.stale_base_dropped: %s -- rebuilding from the current "
                                "rootfs", exc)
             raise
