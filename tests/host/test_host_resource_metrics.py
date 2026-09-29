@@ -26,6 +26,7 @@ from blastbox.observability.host_metrics import (
     parse_proc_stat,
     read_node_view,
 )
+from blastbox.host.node_share import read_snapshots_readonly
 
 _STAT = """\
 cpu  1000 20 300 50000 400 5 6 7 0 0
@@ -112,6 +113,8 @@ def _collector(tmp_path: Path, **kw) -> HostResourceCollector:
     kw.setdefault("loadavg_fn", lambda: (0.5, 0.25, 0.125))
     kw.setdefault("cpu_count_fn", lambda: 8)
     kw.setdefault("clk_tck", 100)
+    kw.setdefault("cgroup_root", tmp_path / "no-cgroup")
+    kw.setdefault("proc_self_cgroup", tmp_path / "no-self-cgroup")
     return HostResourceCollector(**kw)
 
 
@@ -131,6 +134,15 @@ def test_collector_emits_cpu_load_memory_info(tmp_path):
     assert labels["hostname"] == "bb-host-1"
     assert labels["version"]
     assert s[info[0]] == 1
+
+
+def test_no_hostname_label_unless_host_id_set(tmp_path, monkeypatch):
+    # /metrics is unauthenticated by default: the machine's real hostname must not leak there.
+    # Only an operator-chosen BLASTBOX_HOST_ID is published.
+    monkeypatch.delenv("BLASTBOX_HOST_ID", raising=False)
+    c = _collector(tmp_path, hostname=None)
+    info = [dict(k[1]) for k in _samples(c) if k[0] == "blastbox_host_info"]
+    assert len(info) == 1 and set(info[0]) == {"version"}
 
 
 def test_hostname_prefers_blastbox_host_id(tmp_path, monkeypatch):
@@ -245,7 +257,8 @@ def test_collect_never_raises_even_if_everything_fails(tmp_path):
     c = HostResourceCollector(
         proc_root=tmp_path / "nope", disk_roots={"jobs": tmp_path}, hostname="h",
         loadavg_fn=boom, cpu_count_fn=boom, statvfs_fn=boom, dev_fn=boom,
-        node_view_fn=boom, clk_tck=100,
+        node_view_fn=boom, clk_tck=100, cgroup_root=tmp_path / "nope",
+        proc_self_cgroup=tmp_path / "nope",
     )
     assert _names(c) == {"blastbox_host_info"}
 
@@ -341,3 +354,186 @@ def test_two_apps_in_one_process_do_not_collide(tmp_path):
         app = build_app(job_store=InMemoryJobStore(), job_root=root, allowed_engines={"x"})
         body = TestClient(app).get("/metrics").text
         assert body.count("# TYPE blastbox_host_info gauge") == 1
+
+
+# ---------------------------------------------------------------------------
+# review round 1
+# ---------------------------------------------------------------------------
+
+
+def test_hung_filesystem_cannot_starve_the_ingress(tmp_path):
+    """A statvfs that never returns (hard NFS mount) must pin AT MOST one thread; every scrape
+    still returns promptly and healthz keeps answering."""
+    import asyncio
+    import threading
+
+    import httpx
+    from fastapi import FastAPI
+    from fastapi.responses import Response
+
+    gate = threading.Event()
+    blocked = []
+
+    def hung_statvfs(_p):
+        blocked.append(threading.current_thread().name)
+        gate.wait()
+        raise OSError("nfs")
+
+    reg = CollectorRegistry(auto_describe=False)
+    reg.register(_collector(tmp_path, disk_roots={"blobs": tmp_path}, statvfs_fn=hung_statvfs,
+                            refresh_wait_s=0.05))
+    app = FastAPI()
+
+    @app.get("/metrics")
+    def metrics():
+        return Response(generate_latest(reg))
+
+    @app.get("/v1/healthz")
+    def healthz():
+        return {"ok": True}
+
+    async def main():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://x") as c:
+            scrapes = [asyncio.create_task(c.get("/metrics")) for _ in range(50)]
+            done = await asyncio.wait_for(asyncio.gather(*scrapes), 10)
+            assert all(r.status_code == 200 for r in done)
+            assert all("blastbox_host_disk" not in r.text for r in done)  # omitted, not faked
+            r = await asyncio.wait_for(c.get("/v1/healthz"), 3)
+            assert r.status_code == 200
+
+    try:
+        asyncio.run(main())
+        assert len(blocked) == 1  # single-flight: only ONE refresher ever entered statvfs
+    finally:
+        gate.set()
+
+
+def test_disk_values_served_from_cache_then_omitted_when_too_stale(tmp_path):
+    now = [1000.0]
+    calls = []
+    gate_hang = [False]
+    import threading
+    release = threading.Event()
+
+    class _St:
+        f_blocks, f_frsize, f_bavail = 100, 4096, 50
+
+    def statvfs(_p):
+        calls.append(1)
+        if gate_hang[0]:
+            release.wait()
+        return _St()
+
+    c = _collector(tmp_path, disk_roots={"jobs": tmp_path}, statvfs_fn=statvfs,
+                   clock=lambda: now[0], refresh_ttl_s=10.0, max_stale_s=60.0,
+                   refresh_wait_s=0.05)
+    try:
+        assert ("blastbox_host_disk_total_bytes", (("role", "jobs"),)) in _samples(c)
+        # within TTL: served from cache, no new filesystem call
+        now[0] += 5
+        _samples(c)
+        assert len(calls) == 1
+        # past TTL, refresh hangs: last good values still served (within max_stale)
+        gate_hang[0] = True
+        now[0] += 20
+        assert ("blastbox_host_disk_total_bytes", (("role", "jobs"),)) in _samples(c)
+        # hung beyond max_stale: series omitted, scrape still returns
+        now[0] += 60
+        assert not any(n.startswith("blastbox_host_disk") for n in _names(c))
+        assert len(calls) == 2  # still only the one hung refresh in flight
+    finally:
+        release.set()
+
+
+def test_read_node_view_refuses_mixed_node_ids(tmp_path):
+    share = FileNodeShare(str(tmp_path / "node"))
+    share.publish(_snap("aa", assigned=1, ram=100, vcpus=1, budget_ram=8192, budget_vcpus=4,
+                        node="h1"))
+    share.publish(_snap("bb", assigned=1, ram=100, vcpus=1, budget_ram=8192, budget_vcpus=4,
+                        node="h2"))
+    # an untagged reader matches both hosts; summing them would be a lie → omitted
+    assert read_node_view(str(tmp_path / "node"), stale_after_s=20.0, node="") is None
+
+
+def test_readonly_reader_skips_fifo_symlink_and_oversize(tmp_path):
+    d = tmp_path / "node"
+    share = FileNodeShare(str(d))
+    share.publish(_snap("aa", assigned=1, ram=100, vcpus=1, budget_ram=1000, budget_vcpus=4))
+    os.mkfifo(d / "fifo.json")                      # would block a plain open()
+    (d / "zero.json").symlink_to("/dev/zero")        # would read forever
+    (d / "big.json").write_text("{" + " " * (128 * 1024) + "}")
+    got = read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time())
+    assert [s.engine for s in got] == ["aa"]
+
+
+def test_readonly_reader_caps_file_count(tmp_path):
+    d = tmp_path / "node"
+    d.mkdir()
+    for i in range(20):
+        (d / f"junk{i:02d}.json").write_text("{}")
+    # must not raise; just stops after max_files entries
+    assert read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time(), max_files=5) == []
+
+
+def test_readonly_reader_never_creates_dir(tmp_path, monkeypatch):
+    d = tmp_path / "absent"
+    calls = []
+    monkeypatch.setattr(FileNodeShare, "__init__",
+                        lambda *a, **k: calls.append(a) or None)
+    assert read_node_view(str(d), stale_after_s=20.0, node="") is None
+    assert not d.exists() and calls == []
+
+
+def test_share_dir_permission_error_is_logged_once(tmp_path, caplog):
+    import logging
+
+    def denied():
+        raise PermissionError("EACCES")
+
+    c = _collector(tmp_path, node_view_fn=denied)
+    with caplog.at_level(logging.WARNING):
+        _names(c)
+        c._fs.force_stale()  # next scrape refreshes again
+        _names(c)
+    warns = [r for r in caplog.records if "node" in r.getMessage().lower()
+             and r.levelno == logging.WARNING]
+    assert len(warns) == 1
+
+
+def _cgroup(tmp_path: Path, files: dict[str, str], *, rel: str = "/") -> dict:
+    root = tmp_path / "cg"
+    target = root / rel.strip("/") if rel.strip("/") else root
+    target.mkdir(parents=True, exist_ok=True)
+    (root / "cgroup.controllers").write_text("cpu memory\n")
+    for k, v in files.items():
+        (target / k).write_text(v)
+    selfcg = tmp_path / "self_cgroup"
+    selfcg.write_text(f"0::{rel}\n")
+    return {"cgroup_root": root, "proc_self_cgroup": selfcg}
+
+
+def test_cgroup_v2_limits(tmp_path):
+    kw = _cgroup(tmp_path, {"memory.max": "2147483648\n", "memory.current": "1048576\n",
+                            "cpu.max": "200000 100000\n"}, rel="/docker/abc")
+    s = _samples(_collector(tmp_path, **kw))
+    assert s[("blastbox_cgroup_memory_max_bytes", ())] == 2147483648
+    assert s[("blastbox_cgroup_memory_current_bytes", ())] == 1048576
+    assert s[("blastbox_cgroup_cpu_quota_cores", ())] == 2.0
+
+
+def test_cgroup_unlimited_is_omitted(tmp_path):
+    kw = _cgroup(tmp_path, {"memory.max": "max\n", "memory.current": "5\n",
+                            "cpu.max": "max 100000\n"})
+    names = _names(_collector(tmp_path, **kw))
+    assert "blastbox_cgroup_memory_max_bytes" not in names
+    assert "blastbox_cgroup_cpu_quota_cores" not in names
+    assert "blastbox_cgroup_memory_current_bytes" in names
+
+
+def test_cgroup_v1_is_omitted(tmp_path):
+    root = tmp_path / "cg"
+    (root / "memory").mkdir(parents=True)
+    (root / "memory" / "memory.limit_in_bytes").write_text("123\n")
+    names = _names(_collector(tmp_path, cgroup_root=root))
+    assert not any(n.startswith("blastbox_cgroup") for n in names)

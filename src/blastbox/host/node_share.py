@@ -225,57 +225,61 @@ class FileNodeShare:
         except (OSError, ValueError):
             pass                                # already gone / unsafe / not ours to worry about
 
-    def read_all(self, *, max_age_s: float, now: float, gc: bool = True) -> list[DemandSnapshot]:
-        """Every fresh, valid snapshot in the dir. ``gc=False`` makes the read side-effect free
-        (no mtime sweep) — for OBSERVERS such as the ingress ``/metrics`` scrape, which is not a
-        member of the dispatcher trust domain and must never delete a dispatcher's file."""
+    def read_all(self, *, max_age_s: float, now: float) -> list[DemandSnapshot]:
         out: list[DemandSnapshot] = []
         for f in sorted(self._dir.glob("*.json")):
             try:
-                data = json.loads(f.read_text())
-                # Drop UNKNOWN keys before constructing: during a rolling upgrade a NEWER
-                # peer may add a DemandSnapshot field, and an OLDER reader passing it to the
-                # constructor would raise TypeError (unexpected kwarg) → the file is skipped
-                # → that peer silently drops out of this node's view → oversubscription. So
-                # tolerate extra fields. (The reverse direction — an older writer omitting a
-                # field a newer reader needs — is handled by giving new fields defaults, as
-                # `node`/`tier` do.) A non-dict payload makes .items() raise → skipped.
-                snap = DemandSnapshot(**{k: v for k, v in data.items()
-                                         if k in DemandSnapshot.__dataclass_fields__})
-                # Anti-impersonation: the filename must be EXACTLY the canonical slug of the
-                # snapshot's self-declared (engine, tier, node, instance). A file can't claim
-                # another unit's identity, and one unit can't masquerade as another's pool.
-                # validate INSIDE the try: an untyped dataclass accepts wrong-typed fields
-                # (e.g. slot_ram_mib=null), so `_valid`'s comparisons can raise TypeError —
-                # that must skip the poisoned file, not propagate out and kill the sizer.
-                # ts is bounded via _finite_in (NOT bare math.isfinite, which OVERFLOWS on a
-                # huge-int ts out of json and would crash-skip — the same reason every other
-                # numeric field uses _finite_in). Age bounded BOTH ways: a snapshot more than
-                # one staleness window in the FUTURE (bad clock) is rejected too, or its
-                # negative age would read as fresh forever.
-                # Effective staleness window is PUBLISHER-DECLARED so every reader agrees on when this
-                # unit is stale: the LARGER of its refresh period (×2, one missed beat) and its own
-                # configured stale_after_s. Both come from the SNAPSHOT, not the reader, so two
-                # readers with different local cadence/config can't disagree about a peer's liveness
-                # (which would split the node into divergent plans → oversubscription). Falls back
-                # to the reader's own max_age_s only when the publisher declared neither (a
-                # pre-upgrade snapshot). Capped at the GC floor so a spoofed window can't keep a
-                # phantom past the mtime sweep.
-                declared = max(
-                    snap.refresh_s * 2.0 if _finite_in(snap.refresh_s, 0, _MAX_TS) else 0.0,
-                    snap.stale_after_s if _finite_in(snap.stale_after_s, 0, _MAX_TS) else 0.0)
-                eff = min(declared, self._GC_AGE_FLOOR_S) if declared > 0 else max_age_s
-                ok = (_valid(snap)
-                      and f.name == self._filename(snap.engine, snap.tier, snap.node, snap.instance)
-                      and _finite_in(snap.ts, -_MAX_TS, _MAX_TS)
-                      and -eff <= (now - snap.ts) <= eff)
+                snap = self._accept(f.name, f.read_text(), max_age_s=max_age_s, now=now)
             except Exception:
                 continue                        # torn / foreign / type-poisoned → doesn't contribute
-            if ok:
+            if snap is not None:
                 out.append(snap)
-        if gc:
-            self._gc(max(self._GC_AGE_FLOOR_S, max_age_s * self._GC_AGE_MULT))
+        self._gc(max(self._GC_AGE_FLOOR_S, max_age_s * self._GC_AGE_MULT))
         return out
+
+    @classmethod
+    def _accept(cls, name: str, text: str, *, max_age_s: float,
+                now: float) -> "DemandSnapshot | None":
+        """Parse + validate one snapshot file's content; None if it must not contribute. May
+        raise on a torn/poisoned payload (callers skip the file)."""
+        data = json.loads(text)
+        # Drop UNKNOWN keys before constructing: during a rolling upgrade a NEWER
+        # peer may add a DemandSnapshot field, and an OLDER reader passing it to the
+        # constructor would raise TypeError (unexpected kwarg) → the file is skipped
+        # → that peer silently drops out of this node's view → oversubscription. So
+        # tolerate extra fields. (The reverse direction — an older writer omitting a
+        # field a newer reader needs — is handled by giving new fields defaults, as
+        # `node`/`tier` do.) A non-dict payload makes .items() raise → skipped.
+        snap = DemandSnapshot(**{k: v for k, v in data.items()
+                                 if k in DemandSnapshot.__dataclass_fields__})
+        # Anti-impersonation: the filename must be EXACTLY the canonical slug of the
+        # snapshot's self-declared (engine, tier, node, instance). A file can't claim
+        # another unit's identity, and one unit can't masquerade as another's pool.
+        # Callers invoke this INSIDE a try: an untyped dataclass accepts wrong-typed fields
+        # (e.g. slot_ram_mib=null), so `_valid`'s comparisons can raise TypeError —
+        # that must skip the poisoned file, not propagate out and kill the sizer.
+        # ts is bounded via _finite_in (NOT bare math.isfinite, which OVERFLOWS on a
+        # huge-int ts out of json and would crash-skip — the same reason every other
+        # numeric field uses _finite_in). Age bounded BOTH ways: a snapshot more than
+        # one staleness window in the FUTURE (bad clock) is rejected too, or its
+        # negative age would read as fresh forever.
+        # Effective staleness window is PUBLISHER-DECLARED so every reader agrees on when this
+        # unit is stale: the LARGER of its refresh period (×2, one missed beat) and its own
+        # configured stale_after_s. Both come from the SNAPSHOT, not the reader, so two
+        # readers with different local cadence/config can't disagree about a peer's liveness
+        # (which would split the node into divergent plans → oversubscription). Falls back
+        # to the reader's own max_age_s only when the publisher declared neither (a
+        # pre-upgrade snapshot). Capped at the GC floor so a spoofed window can't keep a
+        # phantom past the mtime sweep.
+        declared = max(
+            snap.refresh_s * 2.0 if _finite_in(snap.refresh_s, 0, _MAX_TS) else 0.0,
+            snap.stale_after_s if _finite_in(snap.stale_after_s, 0, _MAX_TS) else 0.0)
+        eff = min(declared, cls._GC_AGE_FLOOR_S) if declared > 0 else max_age_s
+        ok = (_valid(snap)
+              and name == cls._filename(snap.engine, snap.tier, snap.node, snap.instance)
+              and _finite_in(snap.ts, -_MAX_TS, _MAX_TS)
+              and -eff <= (now - snap.ts) <= eff)
+        return snap if ok else None
 
     def _gc(self, older_than_s: float) -> None:
         """Sweep long-abandoned files by FILESYSTEM mtime — both stale `*.json` snapshots a
@@ -352,3 +356,61 @@ def _valid(snap: DemandSnapshot) -> bool:
         and _finite_in(snap.stale_after_s, 0, _MAX_TS)
         and _finite_in(snap.untargeted_backlog, 0, _MAX_COUNT)
     )
+
+
+_RO_MAX_FILES = 256
+_RO_MAX_BYTES = 64 * 1024
+
+
+def read_snapshots_readonly(
+    directory: str,
+    *,
+    max_age_s: float,
+    now: float,
+    max_files: int = _RO_MAX_FILES,
+    max_bytes: int = _RO_MAX_BYTES,
+) -> list[DemandSnapshot]:
+    """The node view for an OBSERVER (e.g. the ingress ``/metrics`` scrape), strictly read-only.
+
+    Unlike ``FileNodeShare`` it never creates, chmods or GCs the dir, and it treats the dir as
+    untrusted input: only REGULAR files are read (opened ``O_NOFOLLOW|O_NONBLOCK`` then checked
+    with ``fstat`` — a FIFO, a symlink to ``/dev/zero`` or a device is skipped, never blocked on
+    or streamed), each read is capped at ``max_bytes`` (a larger file is skipped), and at most
+    ``max_files`` ``*.json`` entries are considered. A missing dir → ``[]``; a permission error
+    on the dir propagates so the caller can say why the view is missing."""
+    import stat as _stat
+
+    try:
+        it = os.scandir(directory)
+    except FileNotFoundError:
+        return []
+    names: list[str] = []
+    with it:
+        for entry in it:
+            if not entry.name.endswith(".json"):
+                continue
+            names.append(entry.name)
+            if len(names) >= max_files:
+                break
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    out: list[DemandSnapshot] = []
+    for name in sorted(names):
+        try:
+            fd = os.open(os.path.join(directory, name), flags)
+        except OSError:
+            continue                            # symlink (ELOOP) / vanished / unreadable
+        try:
+            st = os.fstat(fd)
+            if not _stat.S_ISREG(st.st_mode) or st.st_size > max_bytes:
+                continue
+            raw = os.read(fd, max_bytes + 1)
+            if len(raw) > max_bytes:
+                continue                        # grew past the cap between fstat and read
+            snap = FileNodeShare._accept(name, raw.decode("utf-8"), max_age_s=max_age_s, now=now)
+        except Exception:
+            continue
+        finally:
+            os.close(fd)
+        if snap is not None:
+            out.append(snap)
+    return out
