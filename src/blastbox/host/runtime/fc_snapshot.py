@@ -154,9 +154,10 @@ class SnapshotManager:
         # Set on a swap and drained by the runtime's take_repaired_tiers(), so the pool advances
         # its generation and old-generation failures stop being charged to the new base.
         self._repaired = False
-        # The build epoch whose repair invalidate(repaired=True) already reported. The refresh that
-        # repair ADOPTS is staged under that same epoch, and its later swap is the same episode:
-        # counted once, or the pool advanced its generation twice for one repair.
+        # The build epoch of the last drop -- reported by invalidate(repaired=True) or the ceiling,
+        # or recorded by the pool's own repair. The refresh a drop ADOPTS is staged under that same
+        # epoch, and its later swap is the same episode: counted once, or the pool advanced its
+        # generation twice for one repair. Epochs only rise, so it never matches a later episode.
         self._reported_epoch: int | None = None
         # A finished refresh is STAGED, not published: only take_repaired() -- the pool's drain,
         # on the thread that also stamps and spawns slots -- swaps it in. Published by the refresh
@@ -462,6 +463,7 @@ class SnapshotManager:
                     )
                     collect = self._invalidate_locked()
                     self._repaired = True
+                    self._reported_epoch = self._build_epoch   # its adopted refresh: same episode
                 if self._build_thread is not None and self._build_thread.is_alive():
                     return
                 if self._staged is not None:
@@ -859,9 +861,10 @@ class SnapshotManager:
                     self._reported_epoch = self._build_epoch
             else:
                 # The pool's own repair records its generation itself, which subsumes any drop
-                # still waiting to be reported: leaving the flag set advanced it a second time.
+                # still waiting to be reported (leaving the flag set advanced it a second time) --
+                # and the refresh it adopts, whose later swap is this same episode.
                 self._repaired = False
-                self._reported_epoch = None
+                self._reported_epoch = self._build_epoch
         for artifact in collect:
             self._collect(artifact)
         return had
