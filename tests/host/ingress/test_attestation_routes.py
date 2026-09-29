@@ -1,163 +1,243 @@
-"""GET /v1/jobs/{id}/attestation and GET /v1/attestation/key."""
+"""GET /v1/jobs/{id}/attestation serves the executing dispatcher's receipt; it signs nothing.
+
+GET /v1/attestation/key returns this process's key only if it has one configured.
+"""
 from __future__ import annotations
 
-import base64
 import hashlib
+import io
 import json
 
 import pytest
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
+from fastapi.testclient import TestClient
 
+from blastbox.host.blobs.base import BlobFetchError
 from blastbox.host import attest
+from blastbox.host.blobs.local import LocalBlobStore
+from blastbox.host.ingress.app import build_app
 from blastbox.host.jobs.base import Job, JobStatus
+from blastbox.host.jobs.memory import InMemoryJobStore
+from blastbox.limits import Limits
 from tests.host.ingress.test_app import _make_client, _make_done_job, _push_to_blob
 
 
-@pytest.fixture
-def key_env(tmp_path, monkeypatch):
-    path = tmp_path / "attest.key"
-    monkeypatch.setenv("BLASTBOX_ATTEST_KEY", str(path))
+@pytest.fixture(autouse=True)
+def _no_key_env(monkeypatch):
+    monkeypatch.delenv("BLASTBOX_ATTEST_KEY", raising=False)
     monkeypatch.delenv("BLASTBOX_PKI_DIR", raising=False)
-    monkeypatch.setenv("BLASTBOX_HOST_ID", "toolz-test")
-    return path
 
 
-def _verify(pem: str, doc: dict, sig: str) -> None:
-    pub = serialization.load_pem_public_key(pem.encode())
-    assert isinstance(pub, ec.EllipticCurvePublicKey)
-    pub.verify(base64.urlsafe_b64decode(sig), attest.canonical(doc), ec.ECDSA(hashes.SHA256()))
+@pytest.fixture
+def key(tmp_path):
+    return attest.load_or_create_key(tmp_path / "keys" / "attest.key")
 
 
-def _done(tmp_path, store, **row):
+def _done_with_receipt(tmp_path, store, key):
+    """A DONE job whose sealed tree was uploaded WITH a dispatcher receipt."""
     job, out = _make_done_job(tmp_path, store)
-    fields = {"input_sha256": "d" * 64, "started_at": 100.0, "finished_at": 105.0,
-              "worker_runtime": "runsc", "claim_id": "local-claim", **row}
-    store.update(job.job_id, **fields)
-    return store.get(job.job_id), out
+    body = attest.seal_receipt(out, key=key, observation=attest.RunObservation(
+        job_id=job.job_id, engine=job.engine, input_sha256="d" * 64, worker_runtime="runsc",
+        worker_tier=None, net_policy_effective="none", started_at_ms=1, finished_at_ms=2))
+    _push_to_blob(tmp_path, job.job_id, out)
+    return job, out, body
 
 
-def test_key_route_and_signature_verify_end_to_end(tmp_path, key_env):
+def test_serves_the_stored_receipt_bytes_verbatim(tmp_path, key):
     client, store = _make_client(tmp_path)
-    job, _ = _done(tmp_path, store, net_policy_effective="none")
-    k = client.get("/v1/attestation/key")
-    assert k.status_code == 200
-    kb = k.json()
-    assert set(kb) == {"key_id", "alg", "public_key_pem"} and kb["alg"] == "ES256"
-    assert key_env.exists()
-
+    job, out, body = _done_with_receipt(tmp_path, store, key)
     r = client.get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 200, r.text
-    body = r.json()
-    doc, sig = body["attestation"], body["signature"]
-    _verify(kb["public_key_pem"], doc, sig)
-    assert doc["key_id"] == kb["key_id"]
-    assert doc["host"] == "toolz-test"
-    assert doc["job_id"] == job.job_id and doc["status"] == "done"
-    assert doc["input_sha256"] == "d" * 64
-    assert doc["executor"] == "local"
-    assert doc["worker_runtime"] == "runsc" and doc["net_policy_effective"] == "none"
-
-    doc["status"] = "failed"
-    with pytest.raises(InvalidSignature):
-        _verify(kb["public_key_pem"], doc, sig)
+    assert r.headers["content-type"].startswith("application/json")
+    assert r.content == (out / attest.RECEIPT_NAME).read_bytes()
+    assert r.json() == body
 
 
-def test_metadata_sha256_is_the_hash_of_the_served_bytes(tmp_path, key_env):
+def test_receipt_matches_served_metadata_until_someone_swaps_it(tmp_path, key):
     client, store = _make_client(tmp_path)
-    job, _ = _done(tmp_path, store)
-    served = client.get(f"/v1/jobs/{job.job_id}/metadata")
-    assert served.status_code == 200
-    doc = client.get(f"/v1/jobs/{job.job_id}/attestation").json()["attestation"]
-    assert doc["metadata_sha256"] == hashlib.sha256(served.content).hexdigest()
-
-
-def test_worker_written_claims_in_metadata_change_nothing(tmp_path, key_env):
-    """A hostile worker writes attestation-shaped keys into its own envelope. The doc is built
-    from the host's row, so none of them surface -- only the hash of the bytes changes."""
-    client, store = _make_client(tmp_path)
-    job, out = _done(tmp_path, store, worker_runtime="runsc", worker_tier=None,
-                     net_policy_effective="none")
-    meta = json.loads((out / "metadata.json").read_bytes())
-    meta.update({"net_policy_effective": "direct", "attested": True, "worker_runtime": "none",
-                 "worker_tier": "firecracker", "executor": "local", "status": "done",
-                 "host": "evil", "input_sha256": "0" * 64})
-    (out / "metadata.json").write_bytes(json.dumps(meta).encode())
-    _push_to_blob(tmp_path, job.job_id, out)
-
-    doc = client.get(f"/v1/jobs/{job.job_id}/attestation").json()["attestation"]
-    assert doc["net_policy_effective"] == "none"
-    assert doc["worker_runtime"] == "runsc"
-    assert doc["worker_tier"] is None
-    assert doc["host"] == "toolz-test"
-    assert doc["input_sha256"] == "d" * 64
-    assert "attested" not in doc
+    job, out, _ = _done_with_receipt(tmp_path, store, key)
     served = client.get(f"/v1/jobs/{job.job_id}/metadata").content
+    doc = client.get(f"/v1/jobs/{job.job_id}/attestation").json()["attestation"]
     assert doc["metadata_sha256"] == hashlib.sha256(served).hexdigest()
 
+    # A shared-bucket writer swaps metadata.json after DONE. The receipt was fixed at the seal,
+    # so a verifier comparing it to what it collected now sees the mismatch.
+    meta = json.loads((out / "metadata.json").read_bytes())
+    meta["engine"] = "tampered"
+    (out / "metadata.json").write_bytes(json.dumps(meta).encode())
+    _push_to_blob(tmp_path, job.job_id, out)
+    served2 = client.get(f"/v1/jobs/{job.job_id}/metadata").content
+    doc2 = client.get(f"/v1/jobs/{job.job_id}/attestation").json()["attestation"]
+    assert doc2 == doc
+    assert doc2["metadata_sha256"] != hashlib.sha256(served2).hexdigest()
 
-def test_node_executed_job_omits_runtime_tier_policy(tmp_path, key_env):
+
+def test_row_writes_do_not_change_what_is_served(tmp_path, key):
     client, store = _make_client(tmp_path)
-    job, _ = _done(tmp_path, store, claim_id="node:xyz", executor_node="node-7",
-                   worker_runtime="warm", worker_tier="firecracker",
-                   net_policy_effective="none")
-    doc = client.get(f"/v1/jobs/{job.job_id}/attestation").json()["attestation"]
-    assert doc["executor"] == "node:node-7"
-    for k in ("worker_runtime", "worker_tier", "net_policy_effective"):
-        assert k not in doc
+    job, _, body = _done_with_receipt(tmp_path, store, key)
+    store.update(job.job_id, worker_runtime="none", worker_tier="firecracker",
+                 claim_id="node:x", input_sha256="0" * 64, net_policy="direct")
+    assert client.get(f"/v1/jobs/{job.job_id}/attestation").json() == body
+
+
+def test_done_without_a_receipt_is_404(tmp_path):
+    client, store = _make_client(tmp_path)
+    job, _ = _make_done_job(tmp_path, store)
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404
+    assert "receipt" in r.json()["detail"].lower()
 
 
 @pytest.mark.parametrize("status", [JobStatus.QUEUED, JobStatus.RUNNING])
-def test_non_terminal_is_409(tmp_path, key_env, status):
+def test_non_terminal_is_409(tmp_path, status):
     client, store = _make_client(tmp_path)
     job = Job.new(engine="clippyshot", filename="a.docx")
     job.status = status
     store.create(job)
-    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
-    assert r.status_code == 409
+    assert client.get(f"/v1/jobs/{job.job_id}/attestation").status_code == 409
 
 
-def test_failed_job_is_attested_with_no_metadata(tmp_path, key_env):
+def test_failed_job_has_no_receipt(tmp_path):
     client, store = _make_client(tmp_path)
     job = Job.new(engine="clippyshot", filename="a.docx")
     job.status = JobStatus.FAILED
-    job.input_sha256 = "e" * 64
-    job.error = "worker died"
     store.create(job)
-    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
-    assert r.status_code == 200, r.text
-    doc = r.json()["attestation"]
-    assert doc["status"] == "failed"
-    assert doc["metadata_sha256"] is None     # the metadata route serves nothing for it
+    assert client.get(f"/v1/jobs/{job.job_id}/attestation").status_code == 404
 
 
-def test_unknown_and_malformed_job_ids_are_404(tmp_path, key_env):
+def test_expired_is_410_like_the_other_result_routes(tmp_path):
+    client, store = _make_client(tmp_path)
+    job = Job.new(engine="clippyshot", filename="a.docx")
+    job.status = JobStatus.EXPIRED
+    store.create(job)
+    assert client.get(f"/v1/jobs/{job.job_id}/attestation").status_code == 410
+
+
+def test_unknown_and_malformed_job_ids_are_404(tmp_path):
     client, _ = _make_client(tmp_path)
     assert client.get("/v1/jobs/00000000-0000-0000-0000-000000000000/attestation"
                       ).status_code == 404
     assert client.get("/v1/jobs/not-a-uuid/attestation").status_code == 404
 
 
-def test_disabled_when_no_key_is_configured(tmp_path, monkeypatch):
-    monkeypatch.delenv("BLASTBOX_ATTEST_KEY", raising=False)
-    monkeypatch.delenv("BLASTBOX_PKI_DIR", raising=False)
-    client, store = _make_client(tmp_path)
-    job, _ = _done(tmp_path, store)
+class _FlakyBlobs(LocalBlobStore):
+    """Serves everything except the receipt, which fails like an object-store outage."""
+
+    def __init__(self, *a, mode: str, **kw):
+        super().__init__(*a, **kw)
+        self._mode = mode
+
+    def open_output(self, job_id, name):
+        if name != attest.RECEIPT_NAME:
+            return super().open_output(job_id, name)
+        if self._mode == "open":
+            raise BlobFetchError("result fetch failed") from ConnectionError("s3 down")
+        fh = super().open_output(job_id, name)
+
+        class _Broken(io.RawIOBase):
+            def readable(self):
+                return True
+
+            def readinto(self, b):
+                fh.close()
+                raise OSError("connection reset")
+        return _Broken()
+
+
+@pytest.mark.parametrize("mode", ["open", "read"])
+def test_blob_errors_are_503_never_a_synthesized_receipt(tmp_path, key, mode):
+    store = InMemoryJobStore()
+    job, _, _ = _done_with_receipt(tmp_path, store, key)
+    app = build_app(job_store=store, job_root=tmp_path / "jobs", allowed_engines={"clippyshot"},
+                    limits=Limits(), api_workers=2, zip_password="",
+                    blob_store=_FlakyBlobs(tmp_path / "jobs", blob_root=tmp_path / "blobs",
+                                           mode=mode))
+    client = TestClient(app, raise_server_exceptions=False)
     r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 503
+
+
+def test_s3_style_missing_object_is_404_not_503(tmp_path):
+    """S3BlobStore wraps a NoSuchKey in BlobFetchError too. A missing receipt is absent, not an
+    outage."""
+
+    class _NoSuchKey(Exception):
+        response = {"Error": {"Code": "NoSuchKey"}}
+
+    class _S3ishBlobs(LocalBlobStore):
+        def open_output(self, job_id, name):
+            if name == attest.RECEIPT_NAME:
+                raise BlobFetchError("result fetch failed") from _NoSuchKey()
+            return super().open_output(job_id, name)
+
+    store = InMemoryJobStore()
+    job, _ = _make_done_job(tmp_path, store)
+    app = build_app(job_store=store, job_root=tmp_path / "jobs", allowed_engines={"clippyshot"},
+                    limits=Limits(), api_workers=2, zip_password="",
+                    blob_store=_S3ishBlobs(tmp_path / "jobs", blob_root=tmp_path / "blobs"))
+    client = TestClient(app, raise_server_exceptions=False)
+    assert client.get(f"/v1/jobs/{job.job_id}/attestation").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# /v1/attestation/key
+# ---------------------------------------------------------------------------
+
+
+def test_key_route_404_when_not_configured(tmp_path):
+    client, _ = _make_client(tmp_path)
+    r = client.get("/v1/attestation/key")
     assert r.status_code == 404
     assert "attestation" in r.json()["detail"].lower()
-    k = client.get("/v1/attestation/key")
-    assert k.status_code == 404
-    assert "attestation" in k.json()["detail"].lower()
 
 
-def test_routes_require_the_api_key_like_job_status(tmp_path, key_env):
+def test_key_route_serves_the_configured_key(tmp_path, key, monkeypatch):
+    monkeypatch.setenv("BLASTBOX_ATTEST_KEY", str(tmp_path / "keys" / "attest.key"))
+    client, _ = _make_client(tmp_path)
+    r = client.get("/v1/attestation/key")
+    assert r.status_code == 200
+    assert r.json() == {"key_id": key.key_id, "alg": "ES256",
+                        "public_key_pem": key.public_key_pem}
+
+
+def test_key_route_never_mints_a_key(tmp_path, monkeypatch):
+    """The ingress is not the signer. Minting a key here would advertise one no dispatcher
+    signs with."""
+    path = tmp_path / "keys" / "attest.key"
+    monkeypatch.setenv("BLASTBOX_ATTEST_KEY", str(path))
+    client, _ = _make_client(tmp_path)
+    assert client.get("/v1/attestation/key").status_code == 404
+    assert not path.exists()
+
+
+def test_key_route_refuses_an_unsafe_key(tmp_path, key, monkeypatch):
+    path = tmp_path / "keys" / "attest.key"
+    path.chmod(0o644)
+    monkeypatch.setenv("BLASTBOX_ATTEST_KEY", str(path))
+    client, _ = _make_client(tmp_path)
+    assert client.get("/v1/attestation/key").status_code == 404
+
+
+def test_routes_require_the_api_key_like_job_status(tmp_path, key, monkeypatch):
+    monkeypatch.setenv("BLASTBOX_ATTEST_KEY", str(tmp_path / "keys" / "attest.key"))
     client, store = _make_client(tmp_path, api_key="s3cret")
-    job, _ = _done(tmp_path, store)
+    job, _, _ = _done_with_receipt(tmp_path, store, key)
     assert client.get(f"/v1/jobs/{job.job_id}").status_code == 401
     assert client.get(f"/v1/jobs/{job.job_id}/attestation").status_code == 401
     assert client.get("/v1/attestation/key").status_code == 401
     h = {"Authorization": "Bearer s3cret"}
     assert client.get(f"/v1/jobs/{job.job_id}/attestation", headers=h).status_code == 200
     assert client.get("/v1/attestation/key", headers=h).status_code == 200
+
+
+def test_a_legacy_on_disk_tree_never_supplies_a_receipt(tmp_path):
+    """LocalBlobStore falls back to <job_root>/<id>/output for pre-blob-store results. A worker
+    could have left attestation.json there; it must not be served as a receipt."""
+    client, store = _make_client(tmp_path)
+    job = Job.new(engine="clippyshot", filename="a.docx")
+    job.status = JobStatus.DONE
+    store.create(job)
+    out = tmp_path / "jobs" / job.job_id / "output"
+    out.mkdir(parents=True)
+    (out / "metadata.json").write_text("{}")
+    (out / attest.RECEIPT_NAME).write_text('{"attestation": {"forged": 1}, "signature": "x"}')
+    assert client.get(f"/v1/jobs/{job.job_id}/attestation").status_code == 404

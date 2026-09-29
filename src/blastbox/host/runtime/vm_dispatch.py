@@ -33,6 +33,7 @@ from typing import Any
 
 from blastbox.host.pool import release_kwargs
 from blastbox.contract.envelope import atomic_write_confined
+from blastbox.host import attest as _attest
 from blastbox.host.blobs.base import BlobFetchError, BlobStore, upload_output_with_retry
 from blastbox.host.jobs.base import Job, JobStatus, JobStore, is_node_claim
 from blastbox.host.jobs.http_store import NodeStoreUnsupported
@@ -127,8 +128,12 @@ class VmJobDispatcher:
                  blob_store: BlobStore | None = None,
                  blob_retry_backoff_s: float = 30.0,
                  put_output_max_attempts: int = PUT_OUTPUT_MAX_ATTEMPTS,
-                 put_output_retry_backoff_s: float = PUT_OUTPUT_RETRY_BACKOFF_S) -> None:
+                 put_output_retry_backoff_s: float = PUT_OUTPUT_RETRY_BACKOFF_S,
+                 attest_key: object = _attest.FROM_ENV) -> None:
         self._store = store
+        # Execution-receipt signing key (host/attest.py); see Dispatcher. A bad key disables
+        # receipts, never jobs.
+        self._attest_key = _attest.resolve_key(attest_key)
         # The SAME grants gate the cold dispatcher uses — see
         # blastbox.host.placement.SelfGrants. One implementation, or one of the two
         # dispatch classes ends up with none, which is exactly what happened here.
@@ -421,8 +426,7 @@ class VmJobDispatcher:
         if self._engine is None or job.engine == self._engine:
             return True
         self._store.update_if_status(job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
-                                     status=JobStatus.QUEUED, claim_id=None, started_at=None,
-                                     net_policy_effective=None)
+                                     status=JobStatus.QUEUED, claim_id=None, started_at=None)
         return False
 
     def _effective_personality(self, job: Job, *, assume_sealed: bool = False):
@@ -555,7 +559,7 @@ class VmJobDispatcher:
             self._store.update_if_status(
                 job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
                 status=JobStatus.QUEUED, claim_id=None, started_at=None,
-                net_policy_effective=None, claimable_after=time.time() + delay)
+                claimable_after=time.time() + delay)
             return
 
         # Fail closed on an EFFECTIVE net_policy this warm tier can't honor — BEFORE detonation. A
@@ -599,13 +603,8 @@ class VmJobDispatcher:
         # dead COLD Docker job and requeues it — doesn't re-detonate it under us. The CAS is also our
         # OWNERSHIP fence: if it returns False the job was reclaimed since we claimed it, so STOP here
         # (don't validate someone else's job / write output another owner now controls).
-        # net_policy_effective: the egress this pool is PROVISIONED with, and only when the
-        # operator declared it (fixed_net_policy) -- the check above just proved the job's
-        # effective policy equals it. Undeclared, this host does not know what network the VM
-        # is on, so it records nothing rather than guess (an attestation then omits it).
         if not self._store.update_if_status(job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
-                                            worker_runtime="warm", worker_tier=self._worker_tier,
-                                            net_policy_effective=fixed_policy or None):
+                                            worker_runtime="warm", worker_tier=self._worker_tier):
             logger.info("vm_dispatch: job %s reclaimed before validate; skipping", job.job_id)
             # Purge unconditionally (Task 9): this worker's involvement with the job ends here, and
             # the blob store (real in every mode, not just S3) can always re-materialise the sample
@@ -692,7 +691,6 @@ class VmJobDispatcher:
                         expect_claim_id=job.claim_id,
                         status=JobStatus.QUEUED,
                         claim_id=None,
-                        net_policy_effective=None,
                         claimable_after=time.time() + self._blob_retry_backoff_s,
                         materialise_attempts=attempts,
                     )
@@ -715,7 +713,20 @@ class VmJobDispatcher:
                             expect_claim_id=job.claim_id,
                             materialise_attempts=0,
                         )
+            # Execution receipt: hash the exact file this worker hands the VM transport (not the
+            # row's input_sha256, which other parties can write), and time the run on our clock.
+            receipt_input_sha256 = self._receipt_input_sha256(job, in_path)
+            started_at_ms = _attest.now_ms()
             summary, ok = self._validate_with_heartbeat(job, in_path)
+            finished_at_ms = _attest.now_ms()
+            observation = None if receipt_input_sha256 is None else _attest.RunObservation(
+                job_id=job.job_id, engine=job.engine, input_sha256=receipt_input_sha256,
+                worker_runtime="warm", worker_tier=self._worker_tier,
+                # A VM's egress is fixed at spawn. Only a DECLARED pool egress is known -- and the
+                # check above just proved the job's effective policy equals it. Undeclared, this
+                # worker does not know what network the VM is on, so the receipt omits it.
+                net_policy_effective=fixed_policy or None,
+                started_at_ms=started_at_ms, finished_at_ms=finished_at_ms)
             summary = self._bounded_summary(summary)   # cap untrusted summary before store/metadata
             err: str | None = None
             sealed_env: Any = None
@@ -795,6 +806,9 @@ class VmJobDispatcher:
                 # unconditional `finally` purge (below) handles it.
                 return
             if ok:
+                # The receipt goes INTO the sealed tree immediately before it ships (see
+                # Dispatcher._upload_output): same put_output, same results prefix.
+                self._seal_receipt(job, self._job_dir(job) / "output", observation)
                 upload_exc = upload_output_with_retry(
                     self._blobs, job.job_id, self._job_dir(job) / "output",
                     attempts=self._put_output_max_attempts,
@@ -887,7 +901,7 @@ class VmJobDispatcher:
             owned = self._store.update_if_status(
                 job.job_id, JobStatus.RUNNING, expect_claim_id=job.claim_id,
                 status=JobStatus.QUEUED, claim_id=None, started_at=None,
-                worker_runtime=None, worker_tier=None, net_policy_effective=None)
+                worker_runtime=None, worker_tier=None)
             owned = False   # requeued, not terminal -> don't delete the input in the finally
         except Exception as exc:  # noqa: BLE001 — one bad job must not sink the dispatcher
             logger.warning("vm_dispatch: job %s failed: %s", job.job_id, exc, exc_info=True)
@@ -956,6 +970,30 @@ class VmJobDispatcher:
                     outcome="done" if terminal_status is JobStatus.DONE else "failed",
                 )
                 observe_job_duration(path=self._worker_tier, seconds=time.monotonic() - t0)
+
+    def _receipt_input_sha256(self, job: Job, in_path: Path) -> str | None:
+        if self._attest_key is None:
+            return None
+        try:
+            return _attest.sha256_file(in_path)
+        except Exception as exc:  # noqa: BLE001 - a receipt must never fail a job
+            logger.error("attestation: could not hash input for job %s (%s); no receipt",
+                         job.job_id, exc)
+            return None
+
+    def _seal_receipt(self, job: Job, out_dir: Path,
+                      observation: "_attest.RunObservation | None") -> None:
+        """Strip a planted attestation.json and, with a key, write ours. Never raises."""
+        try:
+            _attest.seal_receipt(out_dir, key=self._attest_key, observation=observation)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("attestation: could not write the receipt for job %s (%s); the job "
+                         "completes without one", job.job_id, exc)
+            try:
+                _attest.strip_receipt(out_dir)
+            except Exception:  # noqa: BLE001
+                logger.exception("attestation: could not remove %s for job %s",
+                                 _attest.RECEIPT_NAME, job.job_id)
 
     def _sealed_envelope(self, job: Job) -> Any:
         """Parse the HOST-SEALED metadata.json (the Envelope the trust gate wrote) for the remote path,

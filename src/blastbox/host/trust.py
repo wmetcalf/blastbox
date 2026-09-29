@@ -10,6 +10,8 @@ is scrubbed through ``sanitize_public_error`` before being surfaced.
 """
 from __future__ import annotations
 
+import posixpath
+
 import logging
 from pathlib import Path
 
@@ -107,6 +109,18 @@ def validate_worker_output(
         raise OutputTrustError(
             f"engine mismatch: expected {engine!r}, worker reported {parsed.engine!r}"
         )
+
+    # ------------------------------------------------------------------
+    # Step 3b: reserved names. <output>/attestation.json is where the dispatcher writes its
+    # SIGNED execution receipt (host/attest.py). A declared artifact there would be served as
+    # the host's receipt -- or, once the dispatcher strips it, go missing from the upload.
+    # ------------------------------------------------------------------
+    from blastbox.host.attest import RECEIPT_NAME
+
+    for a in parsed.artifacts:
+        if posixpath.normpath(str(a.path).strip()) == RECEIPT_NAME:
+            raise OutputTrustError(
+                f"artifact {a.id!r} declares the reserved path {RECEIPT_NAME!r}")
 
     # ------------------------------------------------------------------
     # Step 4: re-seal from disk (do NOT trust worker-reported sha256/bytes)

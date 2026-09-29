@@ -1001,79 +1001,84 @@ def build_app(
         return job.to_public_dict()
 
     # -------------------------------------------------------------------
-    # Host attestation (see blastbox.host.attest)
+    # Execution receipts (see blastbox.host.attest). The ingress SIGNS NOTHING: it serves the
+    # receipt the executing dispatcher signed at the seal, verbatim, from the blob store.
     # -------------------------------------------------------------------
 
     from blastbox.host import attest as _attest
 
-    # Resolved ONCE, at build time: which file (if any) holds the key. The key itself is loaded
-    # -- and generated on first use -- lazily, so a host whose PKI dir is unwritable still
-    # serves every other route, and says why on the attestation ones.
-    _attest_path = _attest.attest_key_path()
-    _attest_lock = threading.Lock()
-    _attest_cache: dict[str, _attest.AttestKey] = {}
+    def _is_missing_blob(exc: BaseException) -> bool:
+        """A receipt that is absent (404) vs a store that failed (503). S3BlobStore wraps both in
+        BlobFetchError, so look at the cause: a missing file, or an S3 NoSuchKey/404.
+        LocalBlobStore raises a CAUSELESS BlobFetchError for an absent object (every real I/O
+        failure there carries its OSError as the cause)."""
+        from blastbox.host.blobs.base import BlobFetchError
 
-    def _attest_key() -> _attest.AttestKey:
-        if _attest_path is None:
-            raise HTTPException(
-                404, "attestation is not configured on this host "
-                     "(set BLASTBOX_ATTEST_KEY or BLASTBOX_PKI_DIR)")
-        with _attest_lock:
-            key = _attest_cache.get("key")
-            if key is None:
-                try:
-                    key = _attest.load_or_create_key(_attest_path)
-                except Exception as exc:  # noqa: BLE001 - reported, never signed around
-                    _log.error("attestation key unavailable at %s: %s", _attest_path, exc)
-                    raise HTTPException(503, "attestation key unavailable on this host")
-                _attest_cache["key"] = key
-            return key
-
-    def _served_metadata_sha256(job: Job) -> str | None:
-        """sha256 of EXACTLY what ``GET /v1/jobs/{id}/metadata`` streams, read through the same
-        BlobStore -- or None where that route serves nothing (not DONE, or no object)."""
-        if job.status != JobStatus.DONE:
-            return None
-        try:
-            fh = _blob_store.open_output(job.job_id, "metadata.json")
-        except Exception:
-            return None
-        h = hashlib.sha256()
-        try:
-            with fh:
-                while chunk := fh.read(_STREAM_CHUNK):
-                    h.update(chunk)
-        except Exception as exc:  # noqa: BLE001 - a partial hash must never be signed
-            _log.warning("attestation: could not read metadata for job=%s: %s", job.job_id, exc)
-            raise HTTPException(503, "could not read metadata.json to attest it")
-        return h.hexdigest()
+        if isinstance(exc, BlobFetchError) and exc.__cause__ is None:
+            return True
+        seen: set[int] = set()
+        cur: BaseException | None = exc
+        while cur is not None and id(cur) not in seen:
+            seen.add(id(cur))
+            if isinstance(cur, FileNotFoundError):
+                return True
+            code = str(((getattr(cur, "response", None) or {}).get("Error") or {}).get("Code", ""))
+            if code in ("NoSuchKey", "404", "NotFound"):
+                return True
+            cur = cur.__cause__ or cur.__context__
+        return False
 
     @app.get("/v1/jobs/{job_id}/attestation")
     def get_attestation(job_id: str):
-        """A statement, signed by this host, of what it observed about a TERMINAL job.
-
-        Built from the host's job row and the hash of the served metadata bytes only -- never
-        from the worker's envelope. 404 unknown job / attestation not configured; 409 while the
-        job is still queued or running. Failed and expired jobs are attested too; ``status``
-        says which.
-        """
+        """The execution receipt the dispatcher that ran this job signed when it sealed the DONE
+        result -- served byte-for-byte, never synthesized. 404 unknown job or no receipt (no key
+        on that dispatcher, a failed job, a pre-receipt result); 409 queued/running; 410 expired;
+        503 when the blob store cannot be read."""
         _validate_job_id(job_id)
-        key = _attest_key()
         job = _job_store.get(job_id)
         if job is None:
             raise HTTPException(404, "job not found")
-        if not _attest.is_terminal(job.status):
+        if job.status in (JobStatus.QUEUED, JobStatus.RUNNING):
             raise HTTPException(409, f"job not terminal (status={job.status.value})")
-        doc = _attest.build_attestation(
-            job, key_id=key.key_id, metadata_sha256=_served_metadata_sha256(job),
-            host=_attest.host_id())
-        return _attest.sign_attestation(key, doc)
+        if job.status == JobStatus.EXPIRED:
+            raise HTTPException(410, "result expired")
+        if job.status != JobStatus.DONE:
+            raise HTTPException(404, "no execution receipt: only DONE results carry one")
+        from blastbox.host.blobs.local import LocalBlobStore
+
+        if isinstance(_blob_store, LocalBlobStore) and not _blob_store.has_output(job_id):
+            # LocalBlobStore.open_output falls back to the LEGACY on-disk tree for results that
+            # predate the blob store -- trees no dispatcher ever stripped, so an
+            # attestation.json there is whatever the worker wrote. Those results carry no
+            # receipt by construction; never serve one from the fallback.
+            raise HTTPException(404, "no execution receipt for this job (it predates receipts)")
+        try:
+            fh = _blob_store.open_output(job_id, _attest.RECEIPT_NAME)
+        except Exception as exc:
+            if _is_missing_blob(exc):
+                raise HTTPException(404, "no execution receipt for this job (its dispatcher "
+                                         "had no attestation key, or it predates receipts)")
+            _log.warning("attestation: receipt read failed for job=%s: %s", job_id, exc)
+            raise HTTPException(503, "could not read the execution receipt")
+        try:
+            with fh:
+                data = fh.read()
+        except Exception as exc:  # noqa: BLE001 - a partial receipt must never be served
+            _log.warning("attestation: receipt read failed for job=%s: %s", job_id, exc)
+            raise HTTPException(503, "could not read the execution receipt")
+        return Response(content=data, media_type="application/json")
 
     @app.get("/v1/attestation/key")
     def get_attestation_key():
-        """This host's attestation public key. A CONVENIENCE for an operator pinning it: a
-        verifier must never trust a key because the host served it."""
-        return _attest.public_key_body(_attest_key())
+        """The attestation public key configured for THIS process, if any. Never mints one --
+        the ingress is not the signer. A CONVENIENCE for pinning: a verifier must never trust a
+        key because a host served it."""
+        key = _attest.load_attest_key(create=False)
+        if key is None:
+            raise HTTPException(404, "no attestation key is configured for this process "
+                                     "(BLASTBOX_ATTEST_KEY / BLASTBOX_PKI_DIR; generate it with "
+                                     "`blastbox attest-key` on the signing host)")
+        return _attest.public_key_body(key)
 
     # -------------------------------------------------------------------
     # Artifact routes (all require DONE status)

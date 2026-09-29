@@ -802,3 +802,19 @@ def test_a_host_error_wrapped_by_the_caps_check_is_seen_through(tmp_path, monkey
     with pytest.raises(OutputTrustUnknown):
         validate_worker_output(output_dir=out, input_sha256=_INPUT_SHA, engine=_ENGINE,
                                limits=_limits())
+
+
+@pytest.mark.parametrize("path", ["attestation.json", "./attestation.json", "attestation.json/"])
+def test_declaring_the_receipt_name_as_an_artifact_is_refused(tmp_path, path):
+    """attestation.json at the tree root is where the dispatcher writes its signed execution
+    receipt. A worker that DECLARES it would get its bytes served as the host's receipt (or,
+    once stripped, a declared artifact goes missing), so the name is reserved."""
+    outdir, _ = _make_output_dir(tmp_path, artifact_path="attestation.json",
+                                 artifact_id="receipt")
+    meta = json.loads((outdir / "metadata.json").read_bytes())
+    meta["artifacts"][0]["path"] = path
+    (outdir / "metadata.json").write_bytes(json.dumps(meta).encode())
+    (outdir / "x").mkdir()
+    with pytest.raises(OutputTrustError, match="reserved"):
+        validate_worker_output(output_dir=outdir, input_sha256=_INPUT_SHA, engine=_ENGINE,
+                               limits=_limits())

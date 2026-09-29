@@ -1596,3 +1596,20 @@ def test_a_protected_ancestor_does_not_disable_the_whole_reclaim(tmp_path):
     )
     assert removed == 1, "an ancestor in protect_paths disabled the reclaim entirely"
     assert not scratch.exists()
+
+
+def test_legacy_migration_never_ships_a_worker_planted_receipt(tmp_path):
+    """A pre-blob-store tree was never stripped by a dispatcher, so an attestation.json in it is
+    whatever the worker wrote. Uploading it would make it servable as an execution receipt."""
+    from blastbox.host.attest import RECEIPT_NAME
+
+    store = InMemoryJobStore()
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.job_id = _JID
+    job.status = JobStatus.DONE
+    store.create(job)
+    d = _sealed_tree(tmp_path, _JID, pending=False)
+    (d / "output" / RECEIPT_NAME).write_text('{"attestation": {"forged": 1}, "signature": "x"}')
+    blobs = _FakeBlobs()
+    assert migrate_legacy_results(tmp_path, blobs, store, logging.getLogger("t"))[0] == 1
+    assert RECEIPT_NAME not in blobs.stored[_JID]

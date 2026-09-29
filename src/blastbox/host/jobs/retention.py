@@ -654,6 +654,17 @@ def migrate_legacy_results(
         if dry_run:
             migrated += 1
             continue
+        # A pre-blob-store tree was never stripped by a dispatcher, so an attestation.json in it
+        # is whatever the worker wrote; these results carry no execution receipt by construction.
+        try:
+            from blastbox.host.attest import strip_receipt
+
+            strip_receipt(out_dir)
+        except OSError as exc:
+            failed += 1
+            log.warning("legacy migration: %s: could not remove a worker-written receipt (%s); "
+                        "leaving it in place", d.name, exc)
+            continue
         up_exc = upload_output_with_retry(blob_store, d.name, out_dir, attempts=2)
         if up_exc is None:
             migrated += 1

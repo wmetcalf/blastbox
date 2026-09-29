@@ -54,6 +54,7 @@ from blastbox.contract.envelope import (
     open_confined_regular_fd,
 )
 from blastbox.errors import HOST_RESOURCE_ERRNOS, OutputTrustError, OutputTrustUnknown, WarmTimeout, sanitize_public_error
+from blastbox.host import attest as _attest
 from blastbox.host.blobs.base import BlobFetchError, BlobStore, upload_output_with_retry
 from blastbox.host.canary import (
     CanaryFailure,
@@ -450,7 +451,12 @@ class Dispatcher:
         put_output_max_attempts: int = _PUT_OUTPUT_MAX_ATTEMPTS,
         put_output_retry_backoff_s: float = _PUT_OUTPUT_RETRY_BACKOFF_S,
         blob_retry_backoff_s: float = _BLOB_RETRY_BACKOFF_S,
+        attest_key: object = _attest.FROM_ENV,
     ) -> None:
+        # Execution-receipt signing key (host/attest.py): an AttestKey, None (no receipts), or
+        # FROM_ENV (BLASTBOX_ATTEST_KEY / $BLASTBOX_PKI_DIR/attest.key; unset = no receipts). A
+        # key that cannot be loaded is logged loudly and disables receipts -- never jobs.
+        self._attest_key = _attest.resolve_key(attest_key)
         # Optional live cold-admission cap driven by the node autosizer. ONLY the cold path
         # acquires a permit (see _dispatch_claimed_job): a cold worker spawns footprint OUTSIDE
         # the warm pool, so the sizer sets the gate limit to the budget's cold headroom
@@ -1140,7 +1146,6 @@ class Dispatcher:
                 # inherits a stale one (defensive: this cold path skips warm jobs today, so the
                 # field is None here — but keep worker_runtime/worker_tier reset in lockstep).
                 worker_tier=None,
-                net_policy_effective=None,
                 claim_id=None,
                 security_warnings=[
                     *job.security_warnings,
@@ -1711,7 +1716,6 @@ class Dispatcher:
             started_at=None,
             worker_runtime=None,
             worker_tier=None,
-            net_policy_effective=None,
             claim_id=None,
             error=None,
         )
@@ -1910,10 +1914,6 @@ class Dispatcher:
                 # Disambiguate the two warm backends in the result (both else report just
                 # "warm"): self._tier is "firecracker"/"gvisor" on a warm dispatcher.
                 worker_tier=self._tier,
-                # The personality this run is held to, recorded NOW (what a host attestation
-                # signs). Warm slots never carry egress -- an egress personality bypassed the
-                # slot above -- so this is the resolved none/drop the slot enforces.
-                net_policy_effective=self._resolve_personality(job).name,
             ):
                 # RECLAIM RACE, not a bad worker: a peer owns the job now, so this worker either
                 # never ran or already finished cleanly. Attributing it burns out healthy slots and
@@ -1927,7 +1927,6 @@ class Dispatcher:
                 return
             job.worker_runtime = "warm"
             job.worker_tier = self._tier
-            job.net_policy_effective = self._resolve_personality(job).name
 
             # ------------------------------------------------------------------
             # Step 2b: Materialise the sample on demand (Finding E1) if this node never
@@ -2007,6 +2006,10 @@ class Dispatcher:
             # pin dispatch. NOTE: the post-wait sealing phase (Step 5b+) is NOT under this
             # deadline; its staleness is covered separately by refreshing started_at below.
             warm_deadline = time.monotonic() + self._worker_timeout_s
+            # Execution receipt: the bytes named in the spec this slot is handed (FC sends them
+            # over vsock from this path at signal_go; gVisor/file seams read the slot copy).
+            receipt_input_sha256 = self._receipt_input_sha256(job, input_path)
+            started_at_ms = _attest.now_ms()
             try:
                 control.signal_go(spec, deadline=warm_deadline)
             except Exception as exc:  # noqa: BLE001
@@ -2063,6 +2066,15 @@ class Dispatcher:
             # of running it in a disposable sandbox; if the rest outweighs this, tuning the
             # engine is the wrong lever.
             phases.mark("guest")
+            finished_at_ms = _attest.now_ms()
+            # Warm slots never carry egress (an egress personality bypassed the slot in
+            # _dispatch_claimed_job), so this is the resolved none/drop the slot runs under --
+            # resolved from this dispatcher's own registry, same inputs as that routing decision.
+            observation = None if receipt_input_sha256 is None else _attest.RunObservation(
+                job_id=job.job_id, engine=job.engine, input_sha256=receipt_input_sha256,
+                worker_runtime="warm", worker_tier=self._tier,
+                net_policy_effective=self._resolve_personality(job).name,
+                started_at_ms=started_at_ms, finished_at_ms=finished_at_ms)
 
             # The guest is done; the sealing phase below (rdump materialize, output-cap, validate,
             # re-seal of up to max_total_artifact_bytes) is real wall-clock work NOT bounded by
@@ -2235,6 +2247,9 @@ class Dispatcher:
                     "it now)", job.job_id,
                 )
                 return
+            # The receipt goes INTO the sealed tree immediately before it ships: its metadata
+            # hash is then of exactly the bytes put_output uploads, into the same prefix.
+            self._seal_receipt(job, output_dir, observation)
             if not self._upload_output(job, output_dir):
                 # The worker RAN and its output passed the trust gate; the upload is OUR side
                 # failing. Attribute the demonstrated success so the streaks reset -- the default
@@ -2690,9 +2705,6 @@ class Dispatcher:
             JobStatus.RUNNING,
             expect_claim_id=job.claim_id,
             worker_runtime=runtime.runtime,
-            # What the network args below enforce, recorded at dispatch (never recomputed later:
-            # the registry or override flag may change before anyone asks what ran).
-            net_policy_effective=personality.name,
             security_warnings=list(job.security_warnings) + list(runtime.warnings),
         ):
             _log.warning(
@@ -2724,6 +2736,10 @@ class Dispatcher:
         if resolv_conf_src and resolv_conf_content:
             Path(resolv_conf_src).write_text(resolv_conf_content, encoding="ascii")
 
+        # Execution receipt: what THIS dispatcher hands the sandbox, hashed from the file it
+        # bind-mounts (read-only) -- not the row's input_sha256, which other parties can write.
+        receipt_input_sha256 = self._receipt_input_sha256(job, input_path)
+        started_at_ms = _attest.now_ms()
         try:
             # Run to completion (or timeout). The worker's exit code is not the
             # authority — the trust gate below decides DONE/FAILED from the
@@ -2745,6 +2761,12 @@ class Dispatcher:
         except Exception as exc:  # noqa: BLE001
             self._fail_job(job, f"docker launch failed: {exc}")
             return
+        finished_at_ms = _attest.now_ms()
+        observation = None if receipt_input_sha256 is None else _attest.RunObservation(
+            job_id=job.job_id, engine=job.engine, input_sha256=receipt_input_sha256,
+            worker_runtime=runtime.runtime, worker_tier=None,
+            net_policy_effective=personality.name,
+            started_at_ms=started_at_ms, finished_at_ms=finished_at_ms)
 
         # The worker's exit code is NOT the authority (the trust gate below is), but a non-zero
         # `docker run` (e.g. a malformed flag → RC 125 "invalid argument for --memory", or an
@@ -2856,6 +2878,8 @@ class Dispatcher:
                 "now)", job.job_id,
             )
             return
+        # The receipt goes INTO the sealed tree immediately before it ships (see the warm twin).
+        self._seal_receipt(job, output_dir, observation)
         if not self._upload_output(job, output_dir):
             # The durable copy never landed, so do NOT purge this tree -- it is the only copy.
             self._upload_failed_job_ids.add(job.job_id)
@@ -3000,7 +3024,6 @@ class Dispatcher:
                     claim_id=None,
                     worker_runtime=None,
                     worker_tier=None,
-                    net_policy_effective=None,
                     claimable_after=time.time() + self._blob_retry_backoff_s,
                     materialise_attempts=attempts,
                 )
@@ -3024,6 +3047,34 @@ class Dispatcher:
                     materialise_attempts=0,
                 )
             return True
+
+    def _receipt_input_sha256(self, job: Job, input_path: Path) -> str | None:
+        """sha256 of the input file about to be handed to the sandbox, or None when receipts
+        are off (no key) or the file can't be hashed -- the run goes ahead either way."""
+        if self._attest_key is None:
+            return None
+        try:
+            return _attest.sha256_file(input_path)
+        except Exception as exc:  # noqa: BLE001 - a receipt must never fail a job
+            _log.error("attestation: could not hash input for job %s (%s); no receipt",
+                       job.job_id, exc)
+            return None
+
+    def _seal_receipt(self, job: Job, output_dir: Path,
+                      observation: "_attest.RunObservation | None") -> None:
+        """Strip any worker-planted attestation.json from the tree about to be uploaded and,
+        with a key and an observation of this run, write this dispatcher's signed receipt.
+        Never raises: a receipt problem is logged and the job completes without one."""
+        try:
+            _attest.seal_receipt(output_dir, key=self._attest_key, observation=observation)
+        except Exception as exc:  # noqa: BLE001
+            _log.error("attestation: could not write the receipt for job %s (%s); the job "
+                       "completes without one", job.job_id, exc)
+            try:
+                _attest.strip_receipt(output_dir)   # never ship a half-written or planted one
+            except Exception:  # noqa: BLE001
+                _log.exception("attestation: could not remove %s for job %s",
+                               _attest.RECEIPT_NAME, job.job_id)
 
     def _upload_output(self, job: Job, output_dir: Path) -> bool:
         """Upload *output_dir* (already sealed) to the blob store, with a bounded inline

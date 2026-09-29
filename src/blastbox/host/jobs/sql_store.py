@@ -52,8 +52,6 @@ _COLUMNS = (
     "worker_tier",
     "target_tier",
     "net_policy",
-    "net_policy_effective",
-    "executor_node",
     "claimable_after",
     "materialise_attempts",
     "error",
@@ -185,8 +183,6 @@ class SqlJobStore:
             worker_tier       TEXT,
             target_tier       TEXT,
             net_policy        TEXT,
-            net_policy_effective TEXT,
-            executor_node     TEXT,
             claimable_after   DOUBLE PRECISION,
             materialise_attempts INTEGER NOT NULL DEFAULT 0,
             error             TEXT,
@@ -376,8 +372,7 @@ class SqlJobStore:
         """Add any columns that don't exist yet (forward-compat migrations)."""
         existing = self._existing_columns(conn)
         for col in ("engine", "params", "result_summary", "claim_id",
-                    "worker_tier", "target_tier", "net_policy",
-                    "net_policy_effective", "executor_node"):
+                    "worker_tier", "target_tier", "net_policy"):
             if col not in existing:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} TEXT")
         # claimable_after is NUMERIC (compared against wall-clock in claim_next), not TEXT — a text

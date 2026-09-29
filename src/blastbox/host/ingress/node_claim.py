@@ -106,9 +106,6 @@ SESSION_HEADER = "x-blastbox-node-session"
 #: the tests only ever wrote the fields I had happened to allow.
 NODE_WRITABLE_FIELDS = frozenset({
     "status", "error", "started_at", "finished_at", "worker_runtime", "worker_tier",
-    # A node's dispatcher stamps what it resolved, exactly as a local one does -- the same code
-    # runs on both. It is the NODE's report: a host attestation omits it for node-executed jobs.
-    "net_policy_effective",
     "result_summary", "input_sha256", "materialise_attempts", "claimable_after",
     # Terminal writes carry these. Neither is an authorisation surface: expires_at is the
     # retention clock for the node's own result, security_warnings is what the run observed.
@@ -799,11 +796,7 @@ def register_node_claim_routes(
                 stamped = NODE_CLAIM_PREFIX + (candidate.claim_id or "")
                 if not job_store.update_if_status(candidate.job_id, JobStatus.RUNNING,
                                                   expect_claim_id=candidate.claim_id,
-                                                  claim_id=stamped,
-                                                  # WHO it was handed to, host-recorded in the
-                                                  # same CAS: a host attestation names this node
-                                                  # as the executor. Not node-writable.
-                                                  executor_node=node_id):
+                                                  claim_id=stamped):
                     probes += 1         # CHARGED: see below
                     continue
                 candidate = job_store.get(candidate.job_id)
@@ -986,8 +979,7 @@ def register_node_claim_routes(
                                        expect_claim_id=job.claim_id,
                                        status=JobStatus.QUEUED, claim_id=None,
                                        started_at=None, worker_runtime=None,
-                                       worker_tier=None, net_policy_effective=None,
-                                       executor_node=None,
+                                       worker_tier=None,
                                        # Deferred, not merely requeued: see _REFUSAL_DEFER_S --
                                        # and only while the job is young (MAX_TOTAL_DEFERRAL_S),
                                        # so no number of nodes can hold governed work away from
@@ -1167,7 +1159,6 @@ def register_node_claim_routes(
             if isinstance(v, bool) or not isinstance(v, int) or v < 0 or v > 1_000_000:
                 bad("materialise_attempts", "must be a non-negative integer")
         for name, cap in (("error", 8192), ("worker_runtime", 64), ("worker_tier", 64),
-                          ("net_policy_effective", 64),
                           ("input_sha256", 64)):
             if name in out and out[name] is not None:
                 if not isinstance(out[name], str) or len(out[name]) > cap:

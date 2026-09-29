@@ -59,16 +59,6 @@ class Job:
     # honored at submit when BLASTBOX_ALLOW_NETPOLICY_OVERRIDE is on; resolved fail-closed at
     # dispatch. Mirrors target_tier.
     net_policy: str | None = None
-    # The personality the dispatcher RESOLVED and enforced for this run (fail-closed, engine
-    # default, override rules applied), stamped AT DISPATCH -- not recomputed later, because the
-    # registry or the override flag could have changed since. ``net_policy`` above stays the
-    # REQUEST. Host-written only: never taken from worker output or a request field. Cleared on
-    # every requeue alongside worker_runtime so a stale value can't describe a run that never ran.
-    net_policy_effective: str | None = None
-    # The node id the ingress control plane handed this job to (#178), stamped by the HOST at
-    # hand-over in the same CAS as the ``node:`` claim prefix. Not node-writable. Lets a host
-    # attestation name which node executed a job without trusting anything the node reported.
-    executor_node: str | None = None
     # Eligibility timestamp: a job is only CLAIMABLE once wall-clock >= claimable_after (None =
     # immediately, the default). Set when a dispatcher DEFERS a job it can't run right now (e.g. a
     # cold job with no node-budget headroom) so it moves temporarily behind claimable work WITHOUT
@@ -129,7 +119,6 @@ class Job:
         d.pop("claim_id", None)
         d.pop("claimable_after", None)   # internal capacity-deferral scheduling detail
         d.pop("materialise_attempts", None)   # internal bounded-retry scheduling counter
-        d.pop("executor_node", None)   # internal fleet identity (like claim_id); attestation names it
         if isinstance(d.get("error"), str):
             d["error"] = sanitize_public_error(d["error"])
         return d
@@ -151,8 +140,6 @@ class Job:
             worker_tier=d.get("worker_tier"),
             target_tier=d.get("target_tier"),
             net_policy=d.get("net_policy"),
-            net_policy_effective=d.get("net_policy_effective"),
-            executor_node=d.get("executor_node"),
             claimable_after=float(d["claimable_after"]) if d.get("claimable_after") else None,
             materialise_attempts=int(d.get("materialise_attempts") or 0),
             error=d.get("error"),
