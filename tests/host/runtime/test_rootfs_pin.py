@@ -1092,16 +1092,3 @@ def test_a_stale_drop_is_reported_to_the_pool_as_a_repair(tmp_path, monkeypatch)
         mgr.restore("s2")
     assert mgr.take_repaired() is True
     assert mgr.take_repaired() is False           # once per repair
-
-
-def test_a_superseded_stale_restore_reports_no_second_repair(tmp_path, monkeypatch) -> None:
-    from blastbox.host.runtime.fc_snapshot import SnapshotManager
-
-    monkeypatch.setattr(rfs, "guest_verdict", lambda p, r: ("", True))
-    backend, _launcher, _rootfs, _base = _fc_backend(tmp_path)
-    mgr = SnapshotManager(tmp_path / "mgr", backend)
-    old = mgr.build()
-    assert mgr.invalidate(only_if=old, repaired=True) is True
-    assert mgr.take_repaired() is True
-    assert mgr.invalidate(only_if=old, repaired=True) is False   # already superseded
-    assert mgr.take_repaired() is False

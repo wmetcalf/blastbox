@@ -693,3 +693,21 @@ def test_a_pinned_superseded_base_is_not_reclaimed_early(tmp_path) -> None:
     assert old not in backend.discarded           # a slot still maps it
     mgr.release("live")
     assert old in backend.discarded
+
+
+def test_a_stale_drop_that_adopts_a_staged_refresh_is_reported_once(tmp_path) -> None:
+    """A stale restore's drop (invalidate(repaired=True)) landing on a staged refresh adopts it,
+    and BOTH halves claim a repair: the drop's flag and the adopted swap. take_repaired() must
+    report it exactly ONCE -- a second report double-advances the pool's generation and retires
+    the adopted base's first slots as if they were the stale one's."""
+    mgr, _ = _built(tmp_path, max_age_s=60.0)
+    old = mgr.artifact
+    _age(mgr, 61.0)
+    mgr.ensure_build_started()
+    _stage(mgr)
+    assert mgr.invalidate(only_if=old, repaired=True) is True
+    assert mgr.take_repaired() is True
+    assert mgr.artifact == "artifact-1"           # the refresh was adopted, not discarded
+    assert mgr.take_repaired() is False
+    assert mgr.invalidate(only_if=old, repaired=True) is False   # superseded: nothing to report
+    assert mgr.take_repaired() is False
