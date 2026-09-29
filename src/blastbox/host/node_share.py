@@ -225,7 +225,10 @@ class FileNodeShare:
         except (OSError, ValueError):
             pass                                # already gone / unsafe / not ours to worry about
 
-    def read_all(self, *, max_age_s: float, now: float) -> list[DemandSnapshot]:
+    def read_all(self, *, max_age_s: float, now: float, gc: bool = True) -> list[DemandSnapshot]:
+        """Every fresh, valid snapshot in the dir. ``gc=False`` makes the read side-effect free
+        (no mtime sweep) — for OBSERVERS such as the ingress ``/metrics`` scrape, which is not a
+        member of the dispatcher trust domain and must never delete a dispatcher's file."""
         out: list[DemandSnapshot] = []
         for f in sorted(self._dir.glob("*.json")):
             try:
@@ -270,7 +273,8 @@ class FileNodeShare:
                 continue                        # torn / foreign / type-poisoned → doesn't contribute
             if ok:
                 out.append(snap)
-        self._gc(max(self._GC_AGE_FLOOR_S, max_age_s * self._GC_AGE_MULT))
+        if gc:
+            self._gc(max(self._GC_AGE_FLOOR_S, max_age_s * self._GC_AGE_MULT))
         return out
 
     def _gc(self, older_than_s: float) -> None:

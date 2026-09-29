@@ -36,7 +36,7 @@ from pathlib import Path, PurePosixPath
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
-from prometheus_client import CONTENT_TYPE_LATEST
+from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry
 
 from blastbox import __version__
 from blastbox.errors import sanitize_public_error
@@ -52,6 +52,7 @@ from blastbox.observability import (
     record_rejection,
     JOBS_IN_FLIGHT,
 )
+from blastbox.observability.host_metrics import HostResourceCollector, node_view_fn_from_env
 from .extension import IngressExtension, StaticUI
 from .middleware import (
     DEFAULT_CSP,
@@ -331,6 +332,21 @@ def build_app(
             describe_blob_store(_blob_store))
     except Exception:  # noqa: BLE001 - a LOG LINE must never stop the API booting
         pass
+
+    # Host resource gauges (CPU/RAM/disk/node budget), computed at SCRAPE time by a collector on a
+    # PER-APP registry: it is configured with THIS app's job/blob roots, and a second build_app in
+    # the same process (tests) must neither collide with nor inherit the first one's roots. The
+    # blob root is only a local filesystem for LocalBlobStore; an object store has no disk here.
+    _blob_local_root = getattr(_blob_store, "local_root", None)
+    if callable(_blob_local_root):
+        _blob_local_root = None  # a method-shaped test double, not a real root
+    _host_registry = CollectorRegistry(auto_describe=False)
+    _host_registry.register(HostResourceCollector(
+        disk_roots={"jobs": _job_root,
+                    "blobs": _blob_local_root if isinstance(_blob_local_root, (str, Path))
+                    else None},
+        node_view_fn=node_view_fn_from_env(),
+    ))
 
 
     # Engine allowlist
@@ -767,7 +783,10 @@ def build_app(
 
     @app.get("/metrics")
     def metrics():
-        return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+        # process metrics (default registry) + this app's scrape-time host gauges; the two
+        # registries hold disjoint metric names, so the concatenation is one valid exposition.
+        return Response(generate_latest() + generate_latest(_host_registry),
+                        media_type=CONTENT_TYPE_LATEST)
 
     # -------------------------------------------------------------------
     # Job submission
