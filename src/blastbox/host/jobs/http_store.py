@@ -265,11 +265,24 @@ class HttpJobStore:
     # -- the JobStore surface a node needs ---------------------------------------
     def claim_next(self, *, claimant_tier: str | None = None,
                    engine: "str | Any | None" = None,
-                   exclude: "Any" = ()) -> "Job | None":
+                   exclude: "Any" = (),
+                   untargeted_min_age_s: float = 0.0) -> "Job | None":
         # `exclude` is accepted for JobStore conformance and deliberately NOT sent: which jobs a
         # node has been refused is the control plane's memory, not something a node may steer.
         """Claim work this node is granted. The control plane decides, not this process."""
-        from blastbox.host.jobs.base import Job
+        from blastbox.host.jobs.base import Job, untargeted_cutoff
+
+        # `untargeted_min_age_s` (BLASTBOX_CLAIM_UNTARGETED_AFTER_S) is REFUSED, not dropped.
+        # /v1/nodes/claim does not carry it, so this store cannot honour it -- and silently
+        # ignoring it would hand an overflow-only claimant exactly the fresh work it was
+        # configured to leave for a warm slot, while it looked configured. The CLI refuses the
+        # combination at startup; this is the backstop for embedders. Validated first so nan/inf
+        # get the same message every store gives.
+        if untargeted_cutoff(untargeted_min_age_s, 0.0) is not None:
+            raise ValueError(
+                "untargeted_min_age_s is not supported by the control-plane node store: "
+                "/v1/nodes/claim does not carry it. Unset BLASTBOX_CLAIM_UNTARGETED_AFTER_S on a "
+                "credential-less dispatcher.")
 
         # engine=None is LEGITIMATE and must not raise: `dispatch.py` calls
         # claim_next(claimant_tier=...) with no engine whenever engine scoping is off, which

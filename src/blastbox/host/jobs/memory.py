@@ -10,7 +10,13 @@ import threading
 import time
 import uuid
 
-from blastbox.host.jobs.base import Job, JobStatus, filter_sort_window, normalize_engine_filter
+from blastbox.host.jobs.base import (
+    Job,
+    JobStatus,
+    filter_sort_window,
+    normalize_engine_filter,
+    untargeted_cutoff,
+)
 
 # Allowlist of Job fields that update() may set — mirrors RedisJobStore._JOB_FIELDS and
 # SqlJobStore._COLUMNS so all three backends fail closed identically on an unknown field
@@ -163,16 +169,19 @@ class InMemoryJobStore:
 
     def claim_next(self, *, claimant_tier: str | None = None,
                    engine: "str | Collection[str] | None" = None,
-                   exclude: "Collection[str]" = ()) -> Job | None:
+                   exclude: "Collection[str]" = (),
+                   untargeted_min_age_s: float = 0.0) -> Job | None:
         """Atomically claim the oldest QUEUED job and flip it to RUNNING.
 
         ``claimant_tier`` routes: a job with ``target_tier`` set is claimable only by a
         claimant whose tier matches; an untargeted job (the default) by anyone. ``engine`` (a name
         or the set of engines this claimant handles) restricts the claim (shared multi-engine stores).
+        ``untargeted_min_age_s`` delays UNTARGETED jobs only (see ``JobStore.claim_next``).
         """
         engines = normalize_engine_filter(engine)
         excluded = frozenset(exclude)
         now = time.time()
+        cutoff = untargeted_cutoff(untargeted_min_age_s, now)
         with self._lock:
             queued = [
                 job for job in self._jobs.values()
@@ -183,6 +192,9 @@ class InMemoryJobStore:
                 # skip DEFERRED jobs (claimable_after in the future) so a capacity-blocked cold job
                 # isn't reclaimed ahead of claimable work
                 and (job.claimable_after is None or job.claimable_after <= now)
+                # delayed claimant: an UNTARGETED job must have aged past the cutoff; a job pinned
+                # to this claimant's tier (the only targeted kind that got this far) is exempt
+                and (cutoff is None or job.target_tier is not None or job.created_at <= cutoff)
             ]
             if not queued:
                 return None
