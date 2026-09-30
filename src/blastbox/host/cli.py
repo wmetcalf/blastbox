@@ -673,11 +673,12 @@ def _start_node_sizer(
             concurrency_gate=concurrency_gate,  # sizer drives its live limit on each resize
             cold_slot_ram_mib=cold_slot_ram_mib,  # price cold permits by the cold worker footprint
             # a claim delay makes this pool OVERFLOW-ONLY for untargeted work: published so the
-            # planner sizes the engine's prompt pools for the untargeted backlog, not this one.
+            # planner seats the engine's untargeted backlog on its prompt pools first and
+            # spills only what they cannot take to this one.
             # SINGLE-ENGINE dispatchers only: a multi-engine one publishes its COMBINED backlog
             # under mine[0]'s name, and a prompt peer of that engine may not run the others — so
-            # excluding it could leave their untargeted jobs unsized. It publishes False (never
-            # excluded, the pre-flag split), which only ever over-sizes it.
+            # spilling on it could leave their untargeted jobs unsized. It publishes False (the
+            # pre-flag even split), which only ever over-sizes it.
             overflow_only=claim_untargeted_after_s > 0 and len(served) == 1,
             # published as `engines`: an engine with a multi-engine pool is never spill-split
             served_engines=len(served),

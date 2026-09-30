@@ -123,7 +123,8 @@ class DispatcherSizer:
         overflow_only: bool = False,          # this dispatcher declines fresh UNTARGETED jobs
                                               # (BLASTBOX_CLAIM_UNTARGETED_AFTER_S > 0). Published so
                                               # the engine's untargeted backlog is sized onto its
-                                              # prompt pools, not this one.
+                                              # prompt pools first; this pool gets what they
+                                              # cannot take (the spill residue).
     ) -> None:
         self._engine = engine
         self._pool = pool
