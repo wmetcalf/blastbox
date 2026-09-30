@@ -4855,3 +4855,42 @@ def test_the_runtime_is_closed_only_after_its_slots_have_been_reaped() -> None:
     assert orphans == 0, f"slots were leaked as orphans ({orphans}) because reap failed after close"
     # ...and the LATCH still runs first: this must not undo the earlier shutdown-ordering fix.
     assert events[0] == "latch", f"the shutdown latch no longer runs first ({events})"
+
+
+# --- is_serving: the node sizer's "can this warm pool take untargeted work" signal ---------------
+
+class _FailingSpawnRuntime(_FakeRuntime):
+    def spawn(self) -> Slot:
+        raise RuntimeError("restore failed")
+
+
+def test_is_serving_false_while_spawns_fail_and_nothing_is_ready() -> None:
+    pool = WarmPool(runtime=_FailingSpawnRuntime(), warm_size=2, spawn_rate_limit=100.0)
+    for _ in range(3):
+        pool.tick()
+    assert pool.slot_count == 0 and pool._spawn_consecutive_failures > 0
+    assert pool.is_serving() is False
+
+
+def test_is_serving_true_while_healthily_warming() -> None:
+    rt = _FakeRuntime()
+    rt.set_default_ready_after(50)                  # slots stay WARMING
+    pool = WarmPool(runtime=rt, warm_size=2, spawn_rate_limit=100.0)
+    pool.tick()
+    assert pool.slot_count > 0 and pool.idle_count == 0
+    assert pool.is_serving() is True
+
+
+def test_is_serving_true_with_a_ready_slot_despite_a_failure_streak() -> None:
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+    for _ in range(3):
+        pool.tick()
+    assert pool.idle_count >= 1
+    pool._spawn_consecutive_failures = 3            # a later spawn failed; the ready slot still serves
+    assert pool.is_serving() is True
+
+
+def test_is_serving_true_for_an_empty_pool_without_failures() -> None:
+    pool = WarmPool(runtime=_FakeRuntime(), warm_size=0, spawn_rate_limit=100.0)
+    assert pool.is_serving() is True

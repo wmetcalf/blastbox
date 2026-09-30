@@ -1950,6 +1950,20 @@ class WarmPool:
         with self._lock:
             return self._burst_active
 
+    def is_serving(self) -> bool:
+        """Whether this pool can take queued work now — the node sizer's signal for sizing it
+        for an engine's UNTARGETED spill. False only while the pool is in a FAILURE STREAK (spawn/
+        restore failures, or a base failing) AND has no slot that is ready or running a job: a
+        warm-only pool whose spawns keep failing can't claim anything, so work sized onto it would
+        wait (and, with a queued TTL, expire) while a delayed peer could run it. A pool that is
+        healthily warming, ready, busy, or simply empty with no failures counts as serving."""
+        with self._lock:
+            if any(s.state in (SlotState.IDLE, SlotState.ASSIGNED) for s in self._slots.values()):
+                return True
+            streak = (self._spawn_consecutive_failures > 0
+                      or any(n > 0 for n in self._pool_consecutive_failures.values()))
+            return not streak
+
     def is_healthy(self) -> bool:
         """True if ≥1 IDLE slot exists, or a slot was idle recently, or within warmup grace."""
         with self._lock:

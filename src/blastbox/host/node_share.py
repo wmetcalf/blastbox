@@ -129,7 +129,7 @@ class DemandSnapshot:
                                  # reader drops the key and treats the lease as it always did.
                                  # VERSION-GATE INVARIANT: the overflow exclusion (DispatcherSizer.
                                  # tick) is enabled only when every snapshot on the node carries ALL
-                                 # of `overflow_only`, `lease`, `running` and `engines` — they came in one
+                                 # of `overflow_only`, `lease`, `running`, `engines` and `serving` — they came in one
                                  # change (#193), and a binary that published one without
                                  # understanding the others would plan differently (e.g. read a
                                  # current lease as a prompt pool). Keying on all of them ENFORCES
@@ -147,6 +147,11 @@ class DemandSnapshot:
                                  # engine's name, so an engine with a multi-engine pool (> 1) is never
                                  # split with the spill rules (that would hand another engine's jobs
                                  # to single-engine peers). None = the key was ABSENT (older peer).
+    serving: Optional[bool] = None
+                                 # whether the pool can take queued work now (WarmPool.is_serving:
+                                 # False only in a failure streak with no ready or busy slot). A prompt
+                                 # pool that isn't serving is given no untargeted capacity, so the
+                                 # spill goes to the overflow pools. None = the key was ABSENT.
 
 
 class NodeShare(Protocol):
@@ -411,6 +416,7 @@ def _valid(snap: DemandSnapshot) -> bool:
         and (snap.running is None or _finite_in(snap.running, 0, _MAX_COUNT))
         and (snap.engines is None or (isinstance(snap.engines, int)
                                       and _finite_in(snap.engines, 1, _MAX_CEILING_SANE)))
+        and (snap.serving is None or isinstance(snap.serving, bool))
     )
 
 

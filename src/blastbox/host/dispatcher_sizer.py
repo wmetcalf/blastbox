@@ -309,6 +309,15 @@ class DispatcherSizer:
             cif = int(getattr(self._gate, "in_flight", 0)) if self._gate is not None else 0
             return max(aw, res) + math.ceil(cif * cold_units)
 
+        def _serving() -> bool:
+            # WarmPool.is_serving; a pool-less (cold) dispatcher or a pool type without the
+            # signal is taken as serving (today's behaviour)
+            fn = getattr(self._pool, "is_serving", None)
+            try:
+                return bool(fn()) if callable(fn) else True
+            except Exception:
+                return True
+
         def _running() -> int:
             # of the reservation, the part actually RUNNING jobs (busy warm slots + cold in flight,
             # in warm-slot units) — idle/warming resident slots excluded: they can still take work
@@ -336,7 +345,7 @@ class DispatcherSizer:
                 stale_after_s=self._config.stale_after_s,
                 untargeted_backlog=min(backlog, self._last_untargeted),
                 overflow_only=self._overflow_only, lease=False, running=_running(),
-                engines=self._served_engines)
+                engines=self._served_engines, serving=_serving())
 
         # HEARTBEAT before the (possibly-slow) count: publish a fresh-ts snapshot with the last
         # tick's backlog so peers keep seeing us alive even when THIS count — a huge shared-
@@ -555,15 +564,16 @@ class DispatcherSizer:
         # PROMPT pools first, each up to its CAPACITY = its planner cap − the jobs it is actually
         # RUNNING (`running`, NOT the reservation `assigned`: idle/warming resident slots can still
         # take a queued job; counting them as used would spill the work and REAP ready warm slots)
-        # − the jobs queued TARGETED at its tier. A prompt pool's untargeted demand is the LARGER
+        # − the jobs queued TARGETED at its tier; 0 while it is not SERVING (a failure streak with
+        # nothing ready or busy — it can't claim). A prompt pool's untargeted demand is the LARGER
         # of that capacity fill and its legacy share (so it never weighs less than before); the
         # overflow pools get the residue, count − Σ min(prompt demand, prompt capacity) — which is
         # all of it when the prompt pools are at their cap. Orphan leases (lease=True) claim
         # nothing and get 0. An engine with only overflow pools splits the count evenly over them.
         #
         # VERSION GATE (NODE-wide): spilling applies only when EVERY snapshot in the view — every
-        # engine's pools, leases included — CARRIES all of `overflow_only`, `lease`, `running` and
-        # `engines` (presence, not value; they came in one change, and a binary knowing some but
+        # engine's pools, leases included — CARRIES all of `overflow_only`, `lease`, `running`,
+        # `engines` and `serving` (presence, not value; they came in one change, and a binary knowing some but
         # not all would plan differently — see DemandSnapshot.lease). The budget is node-wide: each
         # planner plans ALL engines' pools and takes its own slice, so while any snapshot lacks a
         # field every planner (old and new) uses the legacy split everywhere and their plans agree.
@@ -584,7 +594,8 @@ class DispatcherSizer:
             node_all_carry = (node_all_carry and getattr(s, "overflow_only", None) is not None
                               and getattr(s, "lease", None) is not None
                               and getattr(s, "running", None) is not None
-                              and getattr(s, "engines", None) is not None)
+                              and getattr(s, "engines", None) is not None
+                              and getattr(s, "serving", None) is not None)
         # LEGACY split: every pool of the engine, sorted (deterministic rank)
         untargeted_insts: dict[str, list[tuple[str, str]]] = {
             eng: sorted(insts) for eng, insts in engine_insts.items()}
@@ -610,6 +621,9 @@ class DispatcherSizer:
         def _live(s) -> bool:
             return getattr(s, "lease", False) is not True
 
+        def _serving_of(s) -> bool:
+            return getattr(s, "serving", True) is not False
+
         # the SPILLING engines (see above)
         spilling: set[str] = set()
         if node_all_carry:
@@ -634,14 +648,20 @@ class DispatcherSizer:
             if prompt:
                 def _running_of(s) -> int:
                     return int(getattr(s, "running", None) or 0)
+                # a prompt pool that is NOT SERVING (a failure streak, nothing ready or busy)
+                # can't claim: no capacity, so its share spills to the overflow pools
                 caps_f = [max(0.0, _cap(s) - _running_of(s)
-                              - _share(_split(s)[0], eng, s.tier)) for s in prompt]
+                              - _share(_split(s)[0], eng, s.tier)) if _serving_of(s) else 0.0
+                          for s in prompt]
                 caps_i = [max(0, _cap(s) - _running_of(s)
                               - _int_share(_split(s)[0], eng, s.tier, s.instance))
-                          for s in prompt]
+                          if _serving_of(s) else 0 for s in prompt]
                 pf, _ = _fill_float(count, caps_f)
                 pi, _ = _fill_int(count_i, caps_i)
-                pf = [max(f, _legacy_f(s)) for s, f in zip(prompt, pf)]
+                # the legacy floor on DEMAND only for a serving pool (a broken one gets no budget
+                # priority for work it can't claim); the integer warm share keeps it, so the broken
+                # pool still targets a warm slot and keeps retrying — that is how it recovers
+                pf = [max(f, _legacy_f(s)) if _serving_of(s) else f for s, f in zip(prompt, pf)]
                 pi = [max(i, _legacy_i(s)) for s, i in zip(prompt, pi)]
                 rest_f = max(0.0, count - sum(min(f, c) for f, c in zip(pf, caps_f)))
                 rest_i = max(0, count_i - sum(min(i, c) for i, c in zip(pi, caps_i)))
@@ -735,14 +755,16 @@ class DispatcherSizer:
         # of another — below what the pre-#193 split gives it on the same view. So plan the legacy
         # split too (the same plan_sizes, the same view) and hold every non-overflow pool at
         # least at its legacy ceiling, as a reservation floor. Σ of those legacy ceilings fits the
-        # budget by construction, so they all seat; only overflow-only pools can plan lower than
-        # before. (On an over-committed node — reservations that don't all fit — the legacy plan
+        # budget by construction, so they all seat; only overflow-only pools (and prompt pools
+        # that are not serving) can plan lower than before. (On an over-committed node — reservations that don't all fit — the legacy plan
         # never grows a pool past max(its reservation, its 1-slot baseline), so the floor changes
         # nothing there: reservations keep plan_sizes' demand-priority seating.)
         if spilling:
             legacy_plan = plan_sizes(_specs(legacy=True), budget)  # type: ignore[arg-type]
+            # (not for a prompt pool that isn't SERVING: it can't use the slots, and the untargeted
+            # work it would have taken has spilled to the overflow pools, which need the budget)
             specs = [
-                sp if getattr(s, "overflow_only", None) is True else replace(
+                sp if (getattr(s, "overflow_only", None) is True or not _serving_of(s)) else replace(
                     sp, reserved=max(sp.reserved, legacy_plan[sp.name].concurrent_ceiling))
                 for s, sp in zip(snaps, specs)]
         plan = plan_sizes(specs, budget)  # type: ignore[arg-type]
@@ -898,7 +920,7 @@ class DispatcherSizer:
             # carry the field so a current lease never switches its engine's version gate off the
             # way a pre-field peer does; `lease` keeps it out of the untargeted split
             overflow_only=self._overflow_only, lease=True, running=reserved,
-            engines=self._served_engines)
+            engines=self._served_engines, serving=False)
         self._locked_final(lambda: self._share.publish(snap))
 
     def _locked_final(self, fn: Callable[[], None]) -> None:
