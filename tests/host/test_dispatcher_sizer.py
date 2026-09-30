@@ -1680,14 +1680,14 @@ def test_adaptive_never_exceeds_physical_ram(tmp_path):
 
 
 def test_demand_snapshot_field_order_is_append_only():
-    """Regression: new fields are APPENDED (`untargeted_backlog`, then `overflow_only`), so adding
+    """Regression: new fields are APPENDED (`untargeted_backlog`, `overflow_only`, `lease`), so adding
     one never reinterprets an existing POSITIONAL constructor arg. A caller that passed the
     consensus fields positionally (…, balancing, stale_after_s, budget_ram_mib, budget_vcpus)
     must keep binding them to those fields — not silently absorb one into a newer field."""
     import dataclasses
 
     fields = [f.name for f in dataclasses.fields(DemandSnapshot)]
-    assert fields[-2:] == ["untargeted_backlog", "overflow_only"], (
+    assert fields[-3:] == ["untargeted_backlog", "overflow_only", "lease"], (
         f"new fields must be appended in order (append-only); order is {fields}")
 
     # Positional construction through `balancing` still lands each value on its field.
@@ -1699,7 +1699,7 @@ def test_demand_snapshot_field_order_is_append_only():
     assert (snap.node == "node-x" and snap.tier == "firecracker"
             and snap.refresh_s == 5.0 and snap.instance == "inst-1" and snap.balancing is True)
     # The consensus/budget/untargeted fields keep their defaults — none was shifted by the append.
-    assert snap.untargeted_backlog == 0 and snap.overflow_only is None
+    assert snap.untargeted_backlog == 0 and snap.overflow_only is None and snap.lease is False
     assert snap.budget_ram_mib == 0.0 and snap.budget_vcpus == 0.0 and snap.stale_after_s == 0.0
 
 
@@ -1932,7 +1932,7 @@ def test_overflow_only_is_per_engine(tmp_path, monkeypatch):
     # fallback is decided per engine.
     specs = _capture_specs(monkeypatch)
     share = FileNodeShare(str(tmp_path))
-    share.publish(_peer("firecracker", "r", 10, 10, engine="red"))
+    share.publish(_peer("firecracker", "r", 10, 10, engine="red", overflow_only=False))
     mine = _fc_sizer(share, backlog=16, untargeted=16, overflow_only=True).tick()
     assert mine.warm_size == 16
     assert specs["clip@firecracker@f"].queued == 16
@@ -2146,11 +2146,232 @@ def test_mixed_version_overflow_pool_keeps_its_warm_share(tmp_path, monkeypatch)
     assert mine.warm_size == 8
 
 
-def test_gate_is_per_engine(tmp_path, monkeypatch):
-    # an old pool of ANOTHER engine doesn't switch this engine's exclusion off
+def test_gate_is_node_wide(tmp_path, monkeypatch):
+    # The budget is NODE-wide: every planner plans every engine's pools and takes its own slice. An
+    # old pool of ANOTHER engine (red) plans clip with the even split, so clip's exclusion must be
+    # off too while red is old — else red's slice and clip's slices come from different plans.
     specs = _capture_specs(monkeypatch)
     share = FileNodeShare(str(tmp_path))
     _write_old(tmp_path, "firecracker", "r", 10, 10, engine="red")
     share.publish(_peer("cold", "c", 16, 16, overflow_only=True))
     _fc_sizer(share, backlog=16, untargeted=16).tick()
+    assert specs["clip@cold@c"].queued == 8 and specs["clip@firecracker@f"].queued == 8
+
+
+def test_legacy_pool_of_another_engine_cannot_oversubscribe(tmp_path, monkeypatch):
+    # codex repro: 8 GiB node, 1 GiB slots. New clip prompt fc + new overflow-only clip cold each
+    # report 16 untargeted; a LEGACY red pool reports 4. Before the node-wide gate the new planners
+    # gave clip 6 + 1 while the legacy planner (even clip split) gave red 2 → 9 slots on an 8-slot
+    # node. Each pool takes its slice from its OWN planner; the joint must fit.
+    mixed = tmp_path / "mixed"
+    share = FileNodeShare(str(mixed))
+    _write_old(mixed, "firecracker", "r", 4, 4, engine="red")
+    share.publish(_peer("cold", "c", 16, 16, overflow_only=True))
+    new_fc, _ = _own_plan(monkeypatch, share, _fc_sizer(
+        share, backlog=16, untargeted=16, ram_budget=8 * 1024))
+    new_cold, _ = _own_plan(monkeypatch, share, _fc_sizer(
+        share, backlog=16, untargeted=16, ram_budget=8 * 1024, overflow_only=True,
+        tier="cold", instance="c"))
+    # the legacy red planner: the even split, i.e. what a view where nobody is overflow computes
+    even = tmp_path / "even"
+    eshare = FileNodeShare(str(even))
+    eshare.publish(_peer("firecracker", "r", 4, 4, engine="red", overflow_only=False))
+    eshare.publish(_peer("cold", "c", 16, 16, overflow_only=False))
+    legacy, _ = _own_plan(monkeypatch, eshare, _fc_sizer(
+        eshare, backlog=16, untargeted=16, ram_budget=8 * 1024))
+    assert new_fc == new_cold == legacy
+    joint = new_fc["clip@firecracker@f"] + new_cold["clip@cold@c"] + legacy["red@firecracker@r"]
+    assert joint * 1024 <= 8 * 1024
+
+
+def test_exclusion_on_once_every_engine_is_current(tmp_path, monkeypatch):
+    # the same node with red upgraded: the exclusion applies
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    share.publish(_peer("firecracker", "r", 4, 4, engine="red", overflow_only=False))
+    share.publish(_peer("cold", "c", 16, 16, overflow_only=True))
+    _fc_sizer(share, backlog=16, untargeted=16, ram_budget=8 * 1024).tick()
     assert specs["clip@cold@c"].queued == 0 and specs["clip@firecracker@f"].queued == 16
+
+
+def test_current_lease_does_not_switch_the_node_gate_off(tmp_path, monkeypatch):
+    # a lease of another engine published by current code carries the field
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    _lease(share, engine="red", instance="y")
+    share.publish(_peer("cold", "c", 16, 16, overflow_only=True))
+    _fc_sizer(share, backlog=16, untargeted=16).tick()
+    assert specs["clip@cold@c"].queued == 0
+
+
+def test_legacy_lease_switches_the_node_gate_off(tmp_path, monkeypatch):
+    # a lease from a pre-field dispatcher looks like an old pool (no key): stay on the even split,
+    # the conservative reading — an old planner may still be live on the node.
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    _write_old(tmp_path, "firecracker", "y", 0, 0, assigned=2, engine="red")
+    share.publish(_peer("cold", "c", 16, 16, overflow_only=True))
+    _fc_sizer(share, backlog=16, untargeted=16).tick()
+    assert specs["clip@cold@c"].queued == 8
+
+
+def test_multi_engine_dispatcher_never_publishes_overflow_only(tmp_path, monkeypatch):
+    # A dispatcher serving several engines publishes its COMBINED backlog under its first engine's
+    # name; a prompt peer of that engine can't run the others, so excluding it could leave their
+    # untargeted jobs unsized. Only a single-engine dispatcher publishes overflow_only=True.
+    from blastbox.host.cli import _start_node_sizer
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINES", "aa,bb")
+    monkeypatch.setenv("BLASTBOX_NODE_RESOURCE_MANAGEMENT", "1")
+    monkeypatch.setenv("BLASTBOX_NODE_SHARE_DIR", str(tmp_path))
+    for served, want in ((["aa", "bb"], False), (["aa"], True)):
+        res = _start_node_sizer(_Pool(), served, InMemoryJobStore(), "firecracker",
+                                claim_untargeted_after_s=3.0)
+        assert res is not None
+        stop, thread, sizer = res
+        try:
+            snaps = FileNodeShare(str(tmp_path)).read_all(max_age_s=60, now=time.time())
+            assert [s.overflow_only for s in snaps] == [want], served
+        finally:
+            stop.set()
+            thread.join(2.0)
+            sizer.remove_own_snapshot()
+
+
+# --- orphan leases never drain the queue -------------------------------------------------------
+# A crashed/stopping dispatcher's orphan lease holds its still-running slots' reservation, but no
+# process behind it claims anything. It must never be counted as an untargeted drainer: not as the
+# prompt pool that turns an engine's overflow exclusion on, and not as a recipient of a share.
+
+def _lease(share, *, tier="firecracker", instance="w", warm_orphans=2, overflow_only=False,
+           engine="clip"):
+    """Publish the lease a real DispatcherSizer leaves behind (the exact production snapshot)."""
+    ds = DispatcherSizer(EngineNode(engine, "-", slot_ram_mib=1024, max_ceiling=64),
+                         None if tier == "cold" else _Pool(), share, _OVF_CFG, runtime=tier,
+                         backlog_fn=lambda: 0, node="n", instance=instance,
+                         capacity_fn=_budget(10 * 1024, 999), clock=lambda: 1.0,
+                         overflow_only=overflow_only)
+    ds.publish_orphan_lease(warm_orphans)
+
+
+def test_orphan_lease_is_marked(tmp_path):
+    share = FileNodeShare(str(tmp_path))
+    _lease(share)
+    (snap,) = share.read_all(max_age_s=60, now=1.0)
+    assert snap.lease is True and snap.overflow_only is False
+    share2 = FileNodeShare(str(tmp_path / "live"))
+    _fc_sizer(share2, backlog=0, untargeted=0).tick()
+    (live,) = share2.read_all(max_age_s=60, now=1.0)
+    assert live.lease is False
+
+
+def test_overflow_cold_takes_untargeted_while_warm_is_only_a_lease(tmp_path, monkeypatch):
+    # Reviewer's repro: budget 10, warm fc W of clip crashed leaving a lease (2 slots); cold C of
+    # clip is overflow-only with 20 untargeted queued; engine red has 20 queued. The lease can't
+    # claim, so C is the engine's only drainer and must be sized for all 20 — not demand 0.
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    _lease(share, instance="w", warm_orphans=2)
+    share.publish(_peer("firecracker", "y", 20, 20, engine="red", overflow_only=False))
+    mine = _fc_sizer(share, backlog=20, untargeted=20, overflow_only=True, tier="cold",
+                     instance="c", ram_budget=10 * 1024).tick()
+    assert specs["clip@cold@c"].queued == 20 and specs["clip@cold@c"].demand == 20
+    assert specs["clip@firecracker@w"].queued == 0                 # the lease: reservation only
+    assert specs["clip@firecracker@w"].reserved == 2
+    assert mine.concurrent_ceiling >= 3                            # not starved to the baseline
+    from blastbox.host.node_sizer import NodeBudget, plan_sizes
+    plan = plan_sizes(list(specs.values()), NodeBudget(ram_mib=10 * 1024, vcpus=999))
+    assert plan["clip@firecracker@w"].concurrent_ceiling == 2
+    assert sum(p.concurrent_ceiling * 1024 for p in plan.values()) <= 10 * 1024
+
+
+def test_lease_beside_live_prompt_pool_gets_no_untargeted_share(tmp_path, monkeypatch):
+    # live prompt fc F + a lease of a crashed fc replica + overflow-only cold C: the exclusion stays
+    # on (F is a live prompt pool), F takes the whole untargeted count, lease and C take none.
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    _lease(share, instance="w", warm_orphans=2)
+    share.publish(_peer("cold", "c", 16, 16, overflow_only=True))
+    mine = _fc_sizer(share, backlog=16, untargeted=16).tick()
+    assert specs["clip@firecracker@f"].queued == 16
+    assert specs["clip@firecracker@w"].queued == 0
+    assert specs["clip@cold@c"].queued == 0
+    assert mine.warm_size == 16
+
+
+def test_overflow_lease_does_not_count_as_a_live_drainer(tmp_path, monkeypatch):
+    # a lease left by an OVERFLOW-only pool beside a live overflow-only pool: the live one takes it
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    _lease(share, tier="cold", instance="old", warm_orphans=1, overflow_only=True)
+    mine = _fc_sizer(share, backlog=16, untargeted=16, overflow_only=True).tick()
+    assert specs["clip@firecracker@f"].queued == 16
+    assert specs["clip@cold@old"].queued == 0
+    assert mine.warm_size == 16
+
+
+def test_lease_only_engine_keeps_only_its_reservation(tmp_path, monkeypatch):
+    # an engine whose only pool is a lease: nobody can drain its queue, so nothing is sized for it;
+    # the lease holds exactly its reservation and the budget goes to the live engine.
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    _lease(share, engine="red", instance="y", warm_orphans=2)
+    _fc_sizer(share, backlog=4, untargeted=4, ram_budget=10 * 1024).tick()
+    lease = specs["red@firecracker@y"]
+    assert lease.queued == 0 and lease.reserved == 2 and lease.max_ceiling == 2
+    from blastbox.host.node_sizer import NodeBudget, plan_sizes
+    plan = plan_sizes(list(specs.values()), NodeBudget(ram_mib=10 * 1024, vcpus=999))
+    assert plan["red@firecracker@y"].concurrent_ceiling == 2
+    assert plan["clip@firecracker@f"].concurrent_ceiling == 8
+
+
+def test_lease_cannot_switch_the_version_gate_off(tmp_path, monkeypatch):
+    # a current lease carries overflow_only, so it never looks like a pre-field peer: live prompt fc
+    # + overflow-only cold + a lease → the exclusion applies.
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    _lease(share, instance="w")
+    share.publish(_peer("cold", "c", 16, 16, overflow_only=True))
+    _fc_sizer(share, backlog=16, untargeted=16).tick()
+    assert specs["clip@cold@c"].queued == 0
+
+
+def test_lease_in_a_mixed_version_engine_keeps_the_old_split(tmp_path, monkeypatch):
+    # An OLD reader drops the unknown `lease` key and divides the untargeted count by EVERY pool,
+    # the lease included (the lease itself reports 0 queued, so its own share is 0 and each live
+    # pool gets count/3). While any pool of the engine is old, new planners must compute that same
+    # split, so a lease can't switch the gate ON either: old gvisor + lease + overflow cold.
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    _write_old(tmp_path, "gvisor", "g", 15, 15)
+    _lease(share, instance="w")
+    mine = _fc_sizer(share, backlog=15, untargeted=15, overflow_only=True, tier="cold",
+                     instance="c").tick()
+    assert mine is not None
+    assert {k: s.queued for k, s in specs.items()} == {
+        "clip@gvisor@g": 5, "clip@firecracker@w": 0, "clip@cold@c": 5}
+
+
+def test_untargeted_shares_sum_over_live_pools_with_leases(tmp_path, monkeypatch):
+    # Invariant with leases in the view: when the engine has a live pool, the untargeted shares sum
+    # to the count and every lease gets 0; each lease's ceiling is its reservation; budget holds.
+    import itertools
+    from blastbox.host.node_sizer import NodeBudget, plan_sizes
+    specs = _capture_specs(monkeypatch)
+    for flags in itertools.product([False, True], repeat=2):
+        for n_leases in (1, 2):
+            for u in (0, 1, 5, 16):
+                d = tmp_path / f"{flags}-{n_leases}-{u}"
+                share = FileNodeShare(str(d))
+                for i in range(n_leases):
+                    _lease(share, instance=f"l{i}", warm_orphans=1 + i, overflow_only=flags[i % 2])
+                share.publish(_peer("gvisor", "g", u, u, overflow_only=flags[1]))
+                mine = _fc_sizer(share, backlog=u, untargeted=u, overflow_only=flags[0],
+                                 ram_budget=10 * 1024).tick()
+                assert mine is not None
+                assert abs(sum(s.queued for s in specs.values()) - u) < 1e-9, (flags, n_leases, u)
+                plan = plan_sizes(list(specs.values()), NodeBudget(ram_mib=10 * 1024, vcpus=999))
+                for i in range(n_leases):
+                    assert specs[f"clip@firecracker@l{i}"].queued == 0
+                    assert plan[f"clip@firecracker@l{i}"].concurrent_ceiling == 1 + i
+                assert sum(p.concurrent_ceiling * 1024 for p in plan.values()) <= 10 * 1024

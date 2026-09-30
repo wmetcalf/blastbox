@@ -501,28 +501,46 @@ class DispatcherSizer:
         # every pool of it is an untargeted drainer again (the plain split) so the work is never
         # left unsized. Decided per engine from the shared view, so every dispatcher derives the
         # same membership.
-        # VERSION GATE: the exclusion applies to an engine only when EVERY pool of it in the view
-        # CARRIES the field (overflow_only is not None — presence, not value). A dispatcher from
-        # before the field splits the untargeted count evenly and cannot be told otherwise; if the
-        # new planners excluded a pool while it did not, each pool would take its slice from a
-        # DIFFERENT plan and the slices could sum past the budget. So while any pool of an engine
-        # lacks the field, every planner (old and new) uses the even split for that engine.
+        # VERSION GATE (NODE-wide): the exclusion applies only when EVERY snapshot in the view —
+        # every engine's pools, leases included — CARRIES the field (overflow_only is not None:
+        # presence, not value). The budget is node-wide: each planner plans ALL engines' pools and
+        # takes its own slice. A dispatcher from before the field (of ANY engine) plans every engine
+        # with the even split and cannot be told otherwise; if new planners excluded a pool while it
+        # did not, the slices would come from DIFFERENT plans and could sum past the budget. So while
+        # any snapshot lacks the field, every planner (old and new) uses the even split everywhere.
+        # A current lease always carries the field, so it can't switch the gate off; a pre-field
+        # lease can (conservatively: an old planner may still be live on the node) — and neither
+        # can switch it ON, since that needs every snapshot to carry it.
+        # ORPHAN LEASES (lease=True, a stopped dispatcher's final reservation) claim nothing, so
+        # once every pool of the engine is current they are never drainers: not the prompt pool
+        # that turns the exclusion on, not a recipient of a share. They keep their reservation.
+        # So for a current engine the drainers are its live prompt pools; if it has none, its live
+        # overflow-only pools (the plain split among them); if it has only leases, nobody — the
+        # queue has no claimant on this node, and a lease's ceiling is capped at its reservation.
+        # A lease is published by current code, so it carries `overflow_only` and never switches
+        # the gate off; in a LEGACY engine (some pool predates the field) it stays a pool of the
+        # even split exactly as an older reader — which drops the `lease` key — counts it.
         engine_insts: dict[str, list[tuple[str, str]]] = {}
+        engine_live: dict[str, list[tuple[str, str]]] = {}
         engine_prompt: dict[str, list[tuple[str, str]]] = {}
-        engine_all_carry: dict[str, bool] = {}
+        node_all_carry = True
         for s in snaps:
-            engine_insts.setdefault(s.engine, []).append((s.tier, s.instance))
+            key = (s.tier, s.instance)
+            engine_insts.setdefault(s.engine, []).append(key)
             flag = getattr(s, "overflow_only", None)
-            engine_all_carry[s.engine] = engine_all_carry.get(s.engine, True) and flag is not None
+            node_all_carry = node_all_carry and flag is not None
+            if getattr(s, "lease", False) is True:
+                continue
+            engine_live.setdefault(s.engine, []).append(key)
             if flag is not True:
-                engine_prompt.setdefault(s.engine, []).append((s.tier, s.instance))
-        # engines whose overflow-only pools are excluded: every pool carries the field, and there
-        # is at least one prompt pool to take the untargeted work instead
-        engine_excluding = {eng for eng in engine_insts
-                            if engine_all_carry.get(eng) and engine_prompt.get(eng)}
+                engine_prompt.setdefault(s.engine, []).append(key)
+        # on a CURRENT node (every snapshot carries the field) every engine uses the drainer rule
+        # above; otherwise every engine keeps the legacy even split over all its pools
+        engine_current = set(engine_insts) if node_all_carry else set()
         # the pools that take a share of each engine's untargeted count (sorted: deterministic rank)
         untargeted_insts: dict[str, list[tuple[str, str]]] = {
-            eng: sorted(engine_prompt[eng] if eng in engine_excluding else insts)
+            eng: sorted((engine_prompt.get(eng) or engine_live.get(eng, []))
+                        if eng in engine_current else insts)
             for eng, insts in engine_insts.items()}
 
         def _split(s) -> tuple[int, int]:
@@ -540,20 +558,17 @@ class DispatcherSizer:
             return (_share(targeted, s.engine, s.tier)                  # tier-scoped, per replica
                     + u_share)                                          # engine-wide, per drainer
 
-        def _engine_int_share(total: int, engine: str, tier: str, instance: str,
-                              overflow_only: bool) -> int:
+        def _engine_int_share(total: int, engine: str, tier: str, instance: str) -> int:
             # like _int_share, but over the engine's untargeted DRAINERS (every tier; overflow-only
             # pools excluded while a prompt pool exists) — for splitting the UNTARGETED count so the
-            # shares still SUM to it across the engine's drainers. A pool absent from the list gets
-            # the base share, unless it is overflow-only and the engine is excluding (then 0).
+            # shares still SUM to it across the engine's drainers. In a current engine a pool that
+            # is not a drainer gets 0; otherwise (not in the view at all) the base share.
             lst = untargeted_insts.get(engine, [(tier, instance)])
             n = max(1, len(lst))
             base, rem = divmod(max(0, total), n)
             if (tier, instance) in lst:
                 return base + (1 if lst.index((tier, instance)) < rem else 0)
-            if overflow_only and engine in engine_excluding:
-                return 0
-            return base
+            return 0 if engine in engine_current else base
 
         specs = [
             PoolSpec(
@@ -667,8 +682,7 @@ class DispatcherSizer:
             my_targeted = max(0, backlog - min(backlog, self._last_untargeted))
             my_backlog = (_int_share(my_targeted, e.name, self._runtime, self._instance)
                           + _engine_int_share(min(backlog, self._last_untargeted),
-                                              e.name, self._runtime, self._instance,
-                                              self._overflow_only))
+                                              e.name, self._runtime, self._instance))
             # the warm FLOOR is also split across same-queue replicas — else two overlapping
             # replicas each hold the full min_warm hot (aggregate 2× the configured floor).
             my_min_warm = _int_share(e.min_warm, e.name, self._runtime, self._instance)
@@ -756,9 +770,9 @@ class DispatcherSizer:
             ts=self._clock(), node=self._node, tier=self._runtime, instance=self._instance,
             refresh_s=0.0, balancing=self._config.balancing,
             stale_after_s=FileNodeShare._GC_AGE_FLOOR_S,
-            # carry the field (value irrelevant at backlog 0) so a current lease never switches
-            # its engine's overflow exclusion off the way a pre-field peer does
-            overflow_only=self._overflow_only)
+            # carry the field so a current lease never switches its engine's version gate off the
+            # way a pre-field peer does; `lease` keeps it out of the untargeted drainers
+            overflow_only=self._overflow_only, lease=True)
         self._locked_final(lambda: self._share.publish(snap))
 
     def _locked_final(self, fn: Callable[[], None]) -> None:

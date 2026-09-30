@@ -673,7 +673,11 @@ def _start_node_sizer(
             cold_slot_ram_mib=cold_slot_ram_mib,  # price cold permits by the cold worker footprint
             # a claim delay makes this pool OVERFLOW-ONLY for untargeted work: published so the
             # planner sizes the engine's prompt pools for the untargeted backlog, not this one.
-            overflow_only=claim_untargeted_after_s > 0,
+            # SINGLE-ENGINE dispatchers only: a multi-engine one publishes its COMBINED backlog
+            # under mine[0]'s name, and a prompt peer of that engine may not run the others — so
+            # excluding it could leave their untargeted jobs unsized. It publishes False (never
+            # excluded, the pre-flag split), which only ever over-sizes it.
+            overflow_only=claim_untargeted_after_s > 0 and len(served) == 1,
         )
         # Print the status FIRST, then start the thread LAST — otherwise if this print raises
         # (broken pipe / closed stderr) the except below returns None while the thread is
