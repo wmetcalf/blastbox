@@ -73,6 +73,106 @@ def _fill_int(total: int, caps: list[int]) -> tuple[list[int], int]:
     return alloc, rest
 
 
+def _plan_node(specs: list[PoolSpec], budget: NodeBudget,
+               spill_groups: dict[str, tuple[list[str], list[str]]]) -> dict[str, PoolSize]:
+    """plan_sizes, with the PROMPT pools of each spilling engine seated before its overflow pools.
+
+    `spill_groups` maps an engine to (prompt pool names, overflow pool names) for every engine whose
+    untargeted count spills (it has live pools of both kinds on a current node). Such an engine
+    competes with the OTHER engines as ONE pool — its members' demands, caps, reservations and
+    floors summed, priced at the members' LARGEST footprint — so the engine-vs-engine water-fill
+    is what it was before the split (the engine's whole demand counts, however it is divided).
+    (Its members' extra 1-slot baselines are seated outside the water-fill — see below.)
+    Its allotment is then divided INSIDE the engine by priority (_split_allotment): the prompt
+    pools are seated up to their demand before the overflow pools get any of theirs, so the spill
+    can never hold its own prompt pool below what it can absorb (the overflow pool claims only
+    after the delay: a slot moved to it is a slower slot). Pure + deterministic: every planner
+    computes the identical plan from the identical view. Σ ceiling·footprint ≤ budget holds: the
+    division spends at most the allotment's RAM/vCPU (members are no bigger than the price)."""
+    by_name = {s.name: s for s in specs}
+    merged: dict[str, list[PoolSpec]] = {}
+    for eng in sorted(spill_groups):
+        prompt, ovf = spill_groups[eng]
+        members = [by_name[n] for n in [*prompt, *ovf] if n in by_name]
+        if len({m.name for m in members}) >= 2:
+            merged[eng] = members
+    if not merged:
+        return plan_sizes(specs, budget)
+    in_group = {m.name for ms in merged.values() for m in ms}
+    plan_specs = [s for s in specs if s.name not in in_group]
+    virtual: dict[str, PoolSpec] = {}
+    # Every member keeps its own unconditional 1-slot baseline (as plan_sizes gives every pool).
+    # The virtual pool carries ONE of them; the other members' baselines are taken off the budget
+    # up front, so the virtual pool's water-fill score starts where a single pool's would — the
+    # engine is not penalised for being split into several pools.
+    ram, vcpus = budget.ram_mib, budget.vcpus
+    for eng, ms in merged.items():
+        v = PoolSpec(
+            name=f"{eng}\x00spill",         # cannot collide with a pool key (no NUL in them)
+            slot_ram_mib=max(m.slot_ram_mib for m in ms),
+            slot_vcpus=max(m.slot_vcpus for m in ms),
+            demand=sum(m.demand for m in ms),
+            min_warm=sum(min(m.min_warm, m.max_ceiling) for m in ms),
+            max_ceiling=sum(m.max_ceiling for m in ms) - (len(ms) - 1),
+            # the members' in-use reservations beyond their (separately seated) baselines
+            reserved=1 + sum(max(0, min(m.reserved, m.max_ceiling) - 1) for m in ms),
+            queued=sum(m.queued for m in ms))
+        virtual[eng] = v
+        plan_specs.append(v)
+        ram -= sum(m.slot_ram_mib for m in ms) - v.slot_ram_mib
+        vcpus -= sum(m.slot_vcpus for m in ms) - v.slot_vcpus
+    plan = plan_sizes(plan_specs, NodeBudget(ram_mib=ram, vcpus=vcpus))
+    out = {k: p for k, p in plan.items() if k not in {v.name for v in virtual.values()}}
+    for eng, ms in merged.items():
+        v = virtual[eng]
+        extra = plan[v.name].concurrent_ceiling - 1        # the allotment past its one baseline
+        ceilings = _split_allotment(ms, set(spill_groups[eng][0]),
+                                    extra * v.slot_ram_mib + sum(m.slot_ram_mib for m in ms),
+                                    extra * v.slot_vcpus + sum(m.slot_vcpus for m in ms))
+        for m in ms:
+            c = ceilings[m.name]
+            out[m.name] = PoolSize(warm_size=max(0, min(c, max(m.min_warm, math.ceil(m.demand)))),
+                                   concurrent_ceiling=c)
+    return out
+
+
+def _split_allotment(members: list[PoolSpec], prompt: set[str], ram: float,
+                     vcpu: float) -> dict[str, int]:
+    """Divide one spilling engine's planned allotment (`ram` MiB / `vcpu`, baselines included)
+    among its pools, by priority stage: every pool its 1-slot baseline (unconditional, as in
+    plan_sizes); then reservations; then min_warm floors; then the PROMPT pools up to their demand;
+    then the OVERFLOW pools up to theirs; then the leftover to the prompt pools, then the overflow
+    pools, up to their caps. Round-robin in name order within a stage. Never spends more RAM/vCPU
+    than the allotment beyond the unconditional baselines."""
+    order = sorted(members, key=lambda m: m.name)
+    alloc = {m.name: 1 for m in order}
+    ram -= sum(m.slot_ram_mib for m in order)
+    vcpu -= sum(m.slot_vcpus for m in order)
+
+    def grow(pools: list[PoolSpec], target: Callable[[PoolSpec], int]) -> None:
+        nonlocal ram, vcpu
+        progress = True
+        while progress:
+            progress = False
+            for m in pools:
+                if (alloc[m.name] < min(target(m), m.max_ceiling)
+                        and m.slot_ram_mib <= ram + 1e-6 and m.slot_vcpus <= vcpu + 1e-6):
+                    alloc[m.name] += 1
+                    ram -= m.slot_ram_mib
+                    vcpu -= m.slot_vcpus
+                    progress = True
+
+    p_pools = [m for m in order if m.name in prompt]
+    o_pools = [m for m in order if m.name not in prompt]
+    grow(order, lambda m: m.reserved)
+    grow(order, lambda m: m.min_warm)
+    grow(p_pools, lambda m: math.ceil(m.demand))
+    grow(o_pools, lambda m: math.ceil(m.demand))
+    grow(p_pools, lambda m: m.max_ceiling)
+    grow(o_pools, lambda m: m.max_ceiling)
+    return alloc
+
+
 def _fill_float(total: float, caps: list[float]) -> tuple[list[float], float]:
     """The float twin of _fill_int, for the planner's (fractional) demand."""
     alloc = [0.0] * len(caps)
@@ -305,6 +405,13 @@ class DispatcherSizer:
             cif = int(getattr(self._gate, "in_flight", 0)) if self._gate is not None else 0
             return max(aw, res) + math.ceil(cif * cold_units)
 
+        def _running() -> int:
+            # of the reservation, the part actually RUNNING jobs (busy warm slots + cold in flight,
+            # in warm-slot units) — idle/warming resident slots excluded: they can still take work
+            aw = int(getattr(self._pool, "assigned_count", 0))
+            cif = int(getattr(self._gate, "in_flight", 0)) if self._gate is not None else 0
+            return aw + math.ceil(cif * cold_units)
+
         # Compute OUR view of the node budget up front so we can PUBLISH it: readers reconcile to
         # one budget (the elementwise MIN across the view), so a dispatcher with a different
         # headroom/vcpu config or adaptive scale can't plan against a bigger budget than a peer
@@ -324,7 +431,7 @@ class DispatcherSizer:
                 budget_ram_mib=my_budget.ram_mib, budget_vcpus=my_budget.vcpus,
                 stale_after_s=self._config.stale_after_s,
                 untargeted_backlog=min(backlog, self._last_untargeted),
-                overflow_only=self._overflow_only, lease=False)
+                overflow_only=self._overflow_only, lease=False, running=_running())
 
         # HEARTBEAT before the (possibly-slow) count: publish a fresh-ts snapshot with the last
         # tick's backlog so peers keep seeing us alive even when THIS count — a huge shared-
@@ -568,9 +675,11 @@ class DispatcherSizer:
         node_all_carry = True
         for s in snaps:
             engine_insts.setdefault(s.engine, []).append((s.tier, s.instance))
-            # BOTH fields present (see DemandSnapshot.lease: the gate's version invariant)
+            # ALL of this change's fields present (see DemandSnapshot.lease: the gate's version
+            # invariant)
             node_all_carry = (node_all_carry and getattr(s, "overflow_only", None) is not None
-                              and getattr(s, "lease", None) is not None)
+                              and getattr(s, "lease", None) is not None
+                              and getattr(s, "running", None) is not None)
         # on a CURRENT node (every snapshot carries the field) every engine uses the drainer rule
         # above; otherwise every engine keeps the legacy even split over all its pools
         engine_current = set(engine_insts) if node_all_carry else set()
@@ -589,33 +698,46 @@ class DispatcherSizer:
 
         # CURRENT engines: each live pool's untargeted share (float → demand, int → warm target),
         # keyed (engine, tier, instance). Leases and absent pools get 0. The engine's count is the
-        # largest any live pool reports (they count one queue; a lagging count must not shrink it).
+        # MEAN of what its live pools report (each contributes its own count / the number of live
+        # pools, as the legacy split does), so one stale-high report can't inflate the engine; the
+        # integer split uses it rounded half-up.
+        # A prompt pool's CAPACITY for untargeted work = its planner cap − the jobs it is actually
+        # RUNNING (`running`, NOT the reservation `assigned`: idle/warming resident slots can still
+        # take a queued job, and counting them as used would spill the work to the overflow pool and
+        # REAP ready warm slots) − the jobs queued TARGETED at its tier.
         u_float: dict[tuple[str, str, str], float] = {}
         u_int: dict[tuple[str, str, str], int] = {}
+        spill_groups: dict[str, tuple[list[str], list[str]]] = {}
         for eng in sorted(engine_current):
             live = sorted((s for s in snaps if s.engine == eng
                            and getattr(s, "lease", False) is not True),
                           key=lambda s: (s.tier, s.instance))
             if not live:
                 continue                      # leases only: nothing here can claim the queue
-            count = max(_split(s)[1] for s in live)
+            total_u = sum(_split(s)[1] for s in live)
+            count = total_u / len(live)
+            count_i = (2 * total_u + len(live)) // (2 * len(live))
             prompt = [s for s in live if getattr(s, "overflow_only", None) is not True]
             ovf = [s for s in live if getattr(s, "overflow_only", None) is True]
             if prompt and ovf:
+                def _running_of(s) -> int:
+                    return int(getattr(s, "running", None) or 0)
                 pf, rest_f = _fill_float(count, [
-                    max(0.0, _cap(s) - s.assigned - _share(_split(s)[0], eng, s.tier))
+                    max(0.0, _cap(s) - _running_of(s) - _share(_split(s)[0], eng, s.tier))
                     for s in prompt])
-                pi, rest_i = _fill_int(count, [
-                    max(0, _cap(s) - s.assigned
+                pi, rest_i = _fill_int(count_i, [
+                    max(0, _cap(s) - _running_of(s)
                         - _int_share(_split(s)[0], eng, s.tier, s.instance))
                     for s in prompt])
                 of = [rest_f / len(ovf)] * len(ovf)
                 oi = _even_int(rest_i, len(ovf))
                 groups = [(prompt, pf, pi), (ovf, of, oi)]
+                spill_groups[eng] = ([_pool_key(eng, s.tier, s.instance) for s in prompt],
+                                     [_pool_key(eng, s.tier, s.instance) for s in ovf])
             else:
                 drainers = prompt or ovf
                 groups = [(drainers, [count / len(drainers)] * len(drainers),
-                           _even_int(count, len(drainers)))]
+                           _even_int(count_i, len(drainers)))]
             for pools, fl, it in groups:
                 for s, f, i in zip(pools, fl, it):
                     u_float[(eng, s.tier, s.instance)] = f
@@ -694,7 +816,7 @@ class DispatcherSizer:
         budget = NodeBudget(
             ram_mib=min([my_budget.ram_mib, *peer_budget_ram]),
             vcpus=min([my_budget.vcpus, *peer_budget_vcpus]))
-        plan = plan_sizes(specs, budget)  # type: ignore[arg-type]
+        plan = _plan_node(specs, budget, spill_groups)  # type: ignore[arg-type]
         my_key = _pool_key(e.name, self._runtime, self._instance)
         mine = plan.get(my_key)
         # issue #68: when the node budget can't seat every co-located engine's min_warm floor,
@@ -845,7 +967,7 @@ class DispatcherSizer:
             stale_after_s=FileNodeShare._GC_AGE_FLOOR_S,
             # carry the field so a current lease never switches its engine's version gate off the
             # way a pre-field peer does; `lease` keeps it out of the untargeted drainers
-            overflow_only=self._overflow_only, lease=True)
+            overflow_only=self._overflow_only, lease=True, running=reserved)
         self._locked_final(lambda: self._share.publish(snap))
 
     def _locked_final(self, fn: Callable[[], None]) -> None:

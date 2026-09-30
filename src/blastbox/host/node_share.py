@@ -128,12 +128,19 @@ class DemandSnapshot:
                                  # live pool publishes False; None = the key was ABSENT. An older
                                  # reader drops the key and treats the lease as it always did.
                                  # VERSION-GATE INVARIANT: the overflow exclusion (DispatcherSizer.
-                                 # tick) is enabled only when every snapshot on the node carries BOTH
-                                 # `overflow_only` and `lease` — both arrived in one change (#193),
-                                 # and a binary that published overflow_only without understanding
-                                 # lease would read a current lease as a prompt pool and plan
-                                 # differently. Keying on both ENFORCES that. Any FUTURE field that
-                                 # changes the split must be added to that presence check too.
+                                 # tick) is enabled only when every snapshot on the node carries ALL
+                                 # of `overflow_only`, `lease` and `running` — they arrived in one
+                                 # change (#193), and a binary that published one without
+                                 # understanding the others would plan differently (e.g. read a
+                                 # current lease as a prompt pool). Keying on all of them ENFORCES
+                                 # that. Any FUTURE field that changes the split must be added to
+                                 # that presence check too.
+    running: Optional[int] = None
+                                 # of `assigned` (the RESERVATION: resident slots, idle and warming
+                                 # included, + cold in flight), the part actually RUNNING jobs, in the
+                                 # same warm-slot units (busy warm slots + cold in flight). The spill
+                                 # capacity reads it: an idle ready slot can still absorb a queued
+                                 # job, a busy one can't. None = the key was ABSENT (older peer).
 
 
 class NodeShare(Protocol):
@@ -395,6 +402,7 @@ def _valid(snap: DemandSnapshot) -> bool:
         and _finite_in(snap.untargeted_backlog, 0, _MAX_COUNT)
         and (snap.overflow_only is None or isinstance(snap.overflow_only, bool))
         and (snap.lease is None or isinstance(snap.lease, bool))
+        and (snap.running is None or _finite_in(snap.running, 0, _MAX_COUNT))
     )
 
 
