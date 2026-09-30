@@ -182,6 +182,14 @@ class DispatcherSizer:
         self._count_result: dict = {}                           # count (a wedged one mustn't spawn
                                                                 # a new thread every tick)
 
+    def _pool_needs_probe(self) -> bool:
+        """WarmPool.needs_recovery_probe(); False for a pool without the signal."""
+        fn = getattr(self._pool, "needs_recovery_probe", None)
+        try:
+            return bool(fn()) if callable(fn) else False
+        except Exception:
+            return False
+
     def _cold_only(self) -> bool:
         """A pool-less cold dispatcher: no warm pool to resize, just a gate + a cold reservation.
         Requires BOTH no pool AND the cold tier — so a directly-constructed sizer for some other
@@ -884,6 +892,13 @@ class DispatcherSizer:
             # replicas each hold the full min_warm hot (aggregate 2× the configured floor).
             my_min_warm = _int_share(e.min_warm, e.name, self._runtime, self._instance)
             if my_key3 in probe:                    # the recovery probe (see above)
+                my_min_warm = max(1, my_min_warm)
+            elif my_key3 in tgt_int and self._warm_only and self._pool_needs_probe():
+                # ...and it is KEPT while the pool is unproven: once the probe slot promotes the
+                # pool publishes serving=True (no shared probe floor any more), but until a job on
+                # it proves the base, dropping it would reap the slot, flip the pool back to not
+                # serving and restore a fresh probe every cycle while idle. Local only (the shared
+                # plan's 1-slot baseline already covers it); gate-on spilling prompt pools only.
                 my_min_warm = max(1, my_min_warm)
             warm = min(mine.concurrent_ceiling, max(my_min_warm, my_backlog + assigned_warm))
             # CASCADE cap: an all-local cascade can only spawn Σ surviving-tier capacity slots — an

@@ -1985,6 +1985,15 @@ class WarmPool:
     # consecutive restore-path failures after which a pool with nothing ready counts as not serving
     SERVING_RESTORE_FAILURES = 3
 
+    def needs_recovery_probe(self) -> bool:
+        """True while the pool is UNPROVEN: at least SERVING_RESTORE_FAILURES restore failures
+        since a slot of the current base last served a job. The node sizer then keeps one warm slot
+        targeted for it (its local warm floor) even while that probe slot sits IDLE and makes the
+        pool serving — otherwise an idle healed pool would drop the slot, stop serving and restore
+        a new probe every cycle. A served job proves the base and the floor goes."""
+        with self._lock:
+            return self._restore_failure_streak >= self.SERVING_RESTORE_FAILURES
+
     def is_serving(self) -> bool:
         """Whether this pool's WARM path can take queued work — the node sizer's signal (combined
         there with the dispatcher's warm_only) for sizing it for an engine's UNTARGETED spill.

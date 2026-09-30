@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from blastbox.host.dispatcher_sizer import DispatcherSizer
 from blastbox.host.node_config import EngineNode, NodeConfig
 from blastbox.host.node_share import DemandSnapshot, FileNodeShare
@@ -3482,3 +3484,138 @@ def test_closed_loop_liveness_fuzz(tmp_path, monkeypatch):
             after = [serving for _b, serving, _s, _nn in h[end:]]
             assert any(after[:5]), (u, extra, mw, budget, sched, h)
             assert h[-1][1] and h[-1][2] == 0, (u, extra, mw, budget, sched, h)
+
+
+def test_idle_healed_pool_keeps_its_probe_until_a_job_proves_it(tmp_path, monkeypatch):
+    # codex: at u=0 a healed pool cycled probe restore → IDLE → serving → warm 0 → surplus reap →
+    # not serving → probe again, a restore every cycle forever while idle. While the pool is
+    # UNPROVEN (streak ≥ K since its last served current-generation job) its own warm floor stays 1:
+    # the idle probe is kept. A served job proves it; then the floor goes and it scales to 0.
+    import logging
+    import sys
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
+    from test_pool import _FakeRuntime
+    from blastbox.host.pool import WarmPool
+    logging.disable(logging.CRITICAL)
+    _capture_specs(monkeypatch)
+
+    class _RT(_FakeRuntime):
+        broken = True
+        spawns = 0
+
+        def spawn(self):
+            self.spawns += 1
+            if self.broken:
+                raise RuntimeError("restore fails")
+            return super().spawn()
+
+        def reap(self, slot):
+            self.reaps = getattr(self, "reaps", 0) + 1
+            super().reap(slot)
+    rt = _RT()
+    pool = WarmPool(runtime=rt, warm_size=0, spawn_rate_limit=1000.0,
+                    snapshot_rebuild_after=10**6)
+    u = {"n": 2}
+    share = FileNodeShare(str(tmp_path))
+    share.publish(_het_snapshot(("clip", "cold", "c", 1024, 0, 0, 64, 0, 0, True)))
+    sizer = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=8), pool,
+                            share, _OVF_CFG, runtime="firecracker",
+                            backlog_fn=lambda: u["n"], untargeted_backlog_fn=lambda: u["n"],
+                            node="n", instance="w", capacity_fn=_budget(8 * 1024, 999),
+                            clock=lambda: 1.0, warm_only=True)
+
+    def step():
+        sizer.tick()
+        pool.tick()
+    try:
+        for _ in range(6):                          # broken: K+ failures, not serving
+            step()
+        assert pool.is_serving() is False and pool.needs_recovery_probe() is True
+        rt.broken, u["n"] = False, 0                # heals, and the queue is empty
+        for _ in range(3):
+            step()
+        assert pool.is_serving() is True
+        spawns, reaps = rt.spawns, getattr(rt, "reaps", 0)
+        for _ in range(12):                         # idle: the probe is kept, no churn
+            step()
+            assert pool.is_serving() is True
+        assert (rt.spawns, getattr(rt, "reaps", 0)) == (spawns, reaps)
+        assert pool.slot_count == 1
+        u["n"] = 1                                  # a job arrives and is served
+        step()
+        slot = pool.claim(timeout_s=0.05)
+        assert slot is not None
+        pool.release(slot)
+        assert pool._restore_failure_streak == 0 and pool.needs_recovery_probe() is False
+        u["n"] = 0
+        for _ in range(6):
+            step()
+        assert pool.slot_count == 0 and pool.is_serving() is True   # proven: scales to 0
+    finally:
+        logging.disable(logging.NOTSET)
+
+
+def test_still_broken_pool_keeps_failing_its_probe_when_idle(tmp_path, monkeypatch):
+    # broken with work queued (K+ failures), then the queue empties: the probe keeps restoring
+    # (and failing) — the pool stays not serving, the streak keeps climbing
+    import logging
+    import sys
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
+    from test_pool import _FakeRuntime
+    from blastbox.host.pool import WarmPool
+    logging.disable(logging.CRITICAL)
+    _capture_specs(monkeypatch)
+
+    class _RT(_FakeRuntime):
+        def spawn(self):
+            raise RuntimeError("restore fails")
+    pool = WarmPool(runtime=_RT(), warm_size=0, spawn_rate_limit=1000.0,
+                    snapshot_rebuild_after=10**6)
+    u = {"n": 2}
+    share = FileNodeShare(str(tmp_path))
+    share.publish(_het_snapshot(("clip", "cold", "c", 1024, 0, 0, 64, 0, 0, True)))
+    sizer = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=8), pool,
+                            share, _OVF_CFG, runtime="firecracker",
+                            backlog_fn=lambda: u["n"], untargeted_backlog_fn=lambda: u["n"],
+                            node="n", instance="w", capacity_fn=_budget(8 * 1024, 999),
+                            clock=lambda: 1.0, warm_only=True)
+    try:
+        for _ in range(5):
+            sizer.tick()
+            pool.tick()
+        u["n"] = 0
+        before = pool._restore_failure_streak
+        for _ in range(10):
+            sizer.tick()
+            pool.tick()
+            assert pool.is_serving() is False
+        assert pool._restore_failure_streak >= before + 5
+    finally:
+        logging.disable(logging.NOTSET)
+
+
+class _UnprovenPool(_ServingPool):
+    """A serving pool whose restore path is unproven (WarmPool.needs_recovery_probe() True)."""
+
+    def needs_recovery_probe(self):
+        return True
+
+
+@pytest.mark.parametrize(("warm_only", "spilling", "want"), [
+    (True, True, 1),      # the case the floor exists for
+    (False, True, 0),     # falls back to cold: no probe, scales to 0
+    (True, False, 0),     # no overflow pool: not spilling, a929-exact
+])
+def test_unproven_probe_floor_is_gated(tmp_path, warm_only, spilling, want):
+    share = FileNodeShare(str(tmp_path))
+    if spilling:
+        share.publish(_het_snapshot(("clip", "cold", "c", 1024, 0, 0, 64, 0, 0, True)))
+    else:
+        share.publish(_het_snapshot(("clip", "gvisor", "g", 1024, 0, 0, 64, 0, 0, False)))
+    pool = _UnprovenPool(serving=True)
+    mine = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=8), pool,
+                           share, _OVF_CFG, runtime="firecracker", backlog_fn=lambda: 0,
+                           untargeted_backlog_fn=lambda: 0, node="n", instance="w",
+                           capacity_fn=_budget(8 * 1024, 999), clock=lambda: 1.0,
+                           warm_only=warm_only).tick()
+    assert mine.warm_size == want
