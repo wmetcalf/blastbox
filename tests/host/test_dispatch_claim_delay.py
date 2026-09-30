@@ -1,0 +1,200 @@
+"""BLASTBOX_CLAIM_UNTARGETED_AFTER_S: a dispatcher that leaves fresh untargeted work to its peers.
+
+Measured on a production host: a warm Firecracker dispatcher and a cold dispatcher share one
+store, untargeted jobs are claimable by both, and the cold one took 2-8 of 16 while warm slots
+were free. Setting the knob on the COLD dispatcher only (e.g. 3) makes it decline an untargeted
+job until it is that old, so a warm dispatcher with a free slot gets it first and cold is the
+overflow. The store-side semantics are tested per backend in
+tests/host/jobs/test_claim_untargeted_after.py; this file covers the Dispatcher and CLI wiring.
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import math
+import time
+
+import pytest
+
+from blastbox.host.dispatch import Dispatcher
+from blastbox.host.jobs.base import JobStatus
+from blastbox.host.jobs.memory import InMemoryJobStore
+from tests.host.test_dispatch import (
+    _ENGINE_NAME,
+    _engine_spec,
+    _fake_runtime,
+    _limits,
+    _make_job,
+)
+
+
+def _dispatcher(store, tmp_path, **kw) -> Dispatcher:
+    return Dispatcher(job_store=store, engines={_ENGINE_NAME: _engine_spec()}, limits=_limits(),
+                      job_root=tmp_path, runtime_selector=_fake_runtime, **kw)
+
+
+class _Recording(InMemoryJobStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[dict] = []
+
+    def claim_next(self, **kw):  # type: ignore[override]
+        self.calls.append(kw)
+        return super().claim_next(**kw)
+
+
+# --- Dispatcher --------------------------------------------------------------------------------
+
+def test_default_dispatcher_does_not_pass_the_kwarg(tmp_path):
+    store = _Recording()
+    assert _dispatcher(store, tmp_path).dispatch_once() is False
+    assert store.calls == [{"claimant_tier": "cold"}]
+
+
+def test_zero_delay_keeps_a_legacy_store_working(tmp_path):
+    # A store implementing only the original claim_next(*, claimant_tier=) shape must not get a
+    # TypeError from a dispatcher that has the knob at its default.
+    store = InMemoryJobStore()
+    orig = store.claim_next
+
+    def legacy(*, claimant_tier=None):
+        return orig(claimant_tier=claimant_tier)
+
+    store.claim_next = legacy  # type: ignore[method-assign]
+    assert _dispatcher(store, tmp_path, claim_untargeted_after_s=0.0).dispatch_once() is False
+
+
+def test_nonzero_delay_is_passed_to_the_store(tmp_path):
+    store = _Recording()
+    _dispatcher(store, tmp_path, claim_untargeted_after_s=3.0).dispatch_once()
+    assert store.calls == [{"claimant_tier": "cold", "untargeted_min_age_s": 3.0}]
+
+
+def test_delay_composes_with_engine_scoping(tmp_path, monkeypatch):
+    monkeypatch.setenv("BLASTBOX_DISPATCHER_ENGINE_SCOPED", "1")
+    store = _Recording()
+    _dispatcher(store, tmp_path, claim_untargeted_after_s=3.0).dispatch_once()
+    assert store.calls == [{"claimant_tier": "cold", "engine": frozenset({_ENGINE_NAME}),
+                            "untargeted_min_age_s": 3.0}]
+
+
+def test_delayed_dispatcher_leaves_a_fresh_untargeted_job_queued(tmp_path):
+    store = InMemoryJobStore()
+    job = _make_job()
+    store.create(job)
+    assert _dispatcher(store, tmp_path, claim_untargeted_after_s=30.0).dispatch_once() is False
+    assert store.get(job.job_id).status == JobStatus.QUEUED
+
+
+def test_delayed_dispatcher_takes_an_aged_untargeted_job(tmp_path):
+    store = _Recording()
+    job = _make_job()
+    job.created_at = time.time() - 60
+    store.create(job)
+    d = _dispatcher(store, tmp_path, claim_untargeted_after_s=30.0)
+    d._dispatch_claimed_job = lambda j, **kw: None  # type: ignore[method-assign]
+    assert d.dispatch_once() is True
+    assert store.get(job.job_id).status == JobStatus.RUNNING
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -1.0])
+def test_dispatcher_refuses_a_nonsense_delay(tmp_path, bad):
+    with pytest.raises(ValueError, match="claim_untargeted_after_s"):
+        _dispatcher(InMemoryJobStore(), tmp_path, claim_untargeted_after_s=bad)
+
+
+# --- CLI env parsing ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(("raw", "want"), [
+    (None, 0.0), ("", 0.0), ("  ", 0.0), ("0", 0.0), ("3", 3.0), ("2.5", 2.5),
+])
+def test_env_parsing_valid(monkeypatch, raw, want):
+    from blastbox.host.cli import _claim_untargeted_after_s
+    if raw is None:
+        monkeypatch.delenv("BLASTBOX_CLAIM_UNTARGETED_AFTER_S", raising=False)
+    else:
+        monkeypatch.setenv("BLASTBOX_CLAIM_UNTARGETED_AFTER_S", raw)
+    assert _claim_untargeted_after_s() == want
+
+
+@pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "-1", "soon"])
+def test_env_parsing_refuses_nonsense_loudly_and_keeps_zero(monkeypatch, caplog, raw):
+    from blastbox.host.cli import _claim_untargeted_after_s
+    monkeypatch.setenv("BLASTBOX_CLAIM_UNTARGETED_AFTER_S", raw)
+    with caplog.at_level(logging.WARNING):
+        assert _claim_untargeted_after_s() == 0.0
+    assert "BLASTBOX_CLAIM_UNTARGETED_AFTER_S" in caplog.text
+
+
+class _Built(Exception):
+    pass
+
+
+def _run_dispatch_cmd(monkeypatch, store):
+    """Drive `_dispatch_cmd` up to Dispatcher construction and return the kwargs it used."""
+    import blastbox.host.dispatch as dispatch_mod
+    import blastbox.host.jobs.factory as factory
+
+    seen: dict = {}
+
+    def fake_dispatcher(**kw):
+        seen.update(kw)
+        raise _Built
+
+    monkeypatch.setattr(factory, "build_job_store_from_env", lambda: store)
+    monkeypatch.setattr(dispatch_mod, "Dispatcher", fake_dispatcher)
+    monkeypatch.delenv("BLASTBOX_POOL_RUNTIME", raising=False)
+    from blastbox.host.cli import _dispatch_cmd
+    with pytest.raises(_Built):
+        _dispatch_cmd(argparse.Namespace(engines=f"{_ENGINE_NAME}=img:tag"))
+    return seen
+
+
+def test_dispatch_cmd_threads_the_env_value_into_the_dispatcher(monkeypatch):
+    monkeypatch.setenv("BLASTBOX_CLAIM_UNTARGETED_AFTER_S", "3")
+    assert _run_dispatch_cmd(monkeypatch, InMemoryJobStore())["claim_untargeted_after_s"] == 3.0
+
+
+def test_dispatch_cmd_default_is_zero(monkeypatch):
+    monkeypatch.delenv("BLASTBOX_CLAIM_UNTARGETED_AFTER_S", raising=False)
+    assert _run_dispatch_cmd(monkeypatch, InMemoryJobStore())["claim_untargeted_after_s"] == 0.0
+
+
+def test_dispatch_cmd_refuses_the_knob_on_a_control_plane_store(monkeypatch, tmp_path):
+    """The node route cannot carry the delay, so the combination fails at startup rather than
+    on every claim."""
+    import blastbox.host.dispatch as dispatch_mod
+    import blastbox.host.jobs.factory as factory
+    from blastbox.host.cli import _dispatch_cmd
+    from blastbox.host.jobs.http_store import HttpJobStore
+
+    def built(**kw):
+        raise _Built
+
+    store = HttpJobStore.__new__(HttpJobStore)   # never contacted: refused before any claim
+    monkeypatch.setattr(factory, "build_job_store_from_env", lambda: store)
+    monkeypatch.setattr(dispatch_mod, "Dispatcher", built)
+    monkeypatch.delenv("BLASTBOX_POOL_RUNTIME", raising=False)
+    monkeypatch.setenv("BLASTBOX_CLAIM_UNTARGETED_AFTER_S", "3")
+    with pytest.raises(ValueError, match="BLASTBOX_CLAIM_UNTARGETED_AFTER_S"):
+        _dispatch_cmd(argparse.Namespace(engines=f"{_ENGINE_NAME}=img:tag"))
+
+
+def test_dispatch_cmd_refuses_the_knob_on_a_network_endpoint_tier(monkeypatch):
+    """VmJobDispatcher (aws/static/cascade) does not implement the delay; refuse, don't ignore."""
+    import types
+
+    import blastbox.host.jobs.factory as factory
+    import blastbox.host.pool_config as pool_config
+    from blastbox.host.cli import _dispatch_cmd
+
+    started: list = []
+    pool = types.SimpleNamespace(runtime=types.SimpleNamespace(dispatch_style="network"),
+                                 start=lambda: started.append(True))
+    monkeypatch.setattr(factory, "build_job_store_from_env", lambda: InMemoryJobStore())
+    monkeypatch.setattr(pool_config, "build_warm_pool", lambda: pool)
+    monkeypatch.setenv("BLASTBOX_POOL_RUNTIME", "static")
+    monkeypatch.setenv("BLASTBOX_CLAIM_UNTARGETED_AFTER_S", "3")
+    with pytest.raises(ValueError, match="network-endpoint"):
+        _dispatch_cmd(argparse.Namespace(engines=f"{_ENGINE_NAME}=img:tag"))
+    assert started == []                        # refused before any slot was spawned

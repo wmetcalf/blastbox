@@ -754,6 +754,20 @@ def _canary_settings() -> "tuple[bool, float]":
     return enabled, interval
 
 
+def _claim_untargeted_after_s() -> float:
+    """``BLASTBOX_CLAIM_UNTARGETED_AFTER_S``: seconds this dispatcher leaves an UNTARGETED job to
+    its peers before it will claim it (see ``JobStore.claim_next(untargeted_min_age_s=)``).
+
+    Set on the COLD dispatcher of a warm+cold pair (e.g. ``3``) so a warm dispatcher with a free
+    slot takes fresh work first and cold is the overflow. Unset/empty/``0`` = no delay (default).
+    Parsed like every other age knob (``max_age_env``): ``nan``/``inf``/negatives/garbage are
+    refused with a warning and the default (no delay) kept -- ``nan`` would otherwise compare false
+    against every age and stop the dispatcher ever taking untargeted work."""
+    from blastbox.host.runtime.env_knobs import max_age_env
+
+    return max_age_env(os.environ, "BLASTBOX_CLAIM_UNTARGETED_AFTER_S", 0.0)
+
+
 def _require_shared_blob_store() -> bool:
     """Has the operator declared this a fleet whose results MUST be shared?
 
@@ -822,6 +836,24 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         tier = _pool_rt
     else:
         tier = "cold"
+
+    # Opt-in claim delay for UNTARGETED jobs (overflow posture for a cold dispatcher sharing a
+    # store with a warm one). Refused up front where it cannot be honoured, rather than on every
+    # claim or -- worse -- silently: a delay that is dropped hands the overflow dispatcher exactly
+    # the fresh work it was configured to leave alone.
+    claim_untargeted_after_s = _claim_untargeted_after_s()
+    if claim_untargeted_after_s:
+        from blastbox.host.jobs.http_store import HttpJobStore
+
+        if isinstance(store, HttpJobStore):
+            raise ValueError(
+                "BLASTBOX_CLAIM_UNTARGETED_AFTER_S is not supported with a control-plane job "
+                "store (BLASTBOX_DATABASE_URL=https://...): /v1/nodes/claim does not carry it. "
+                "Unset it on this dispatcher.")
+        if pool is not None and getattr(pool.runtime, "dispatch_style", "file") == "network":
+            raise ValueError(
+                "BLASTBOX_CLAIM_UNTARGETED_AFTER_S is supported by the container dispatcher only, "
+                "not the network-endpoint tiers (aws/static/cascade). Unset it on this dispatcher.")
 
     warm_only = os.environ.get("BLASTBOX_DISPATCH_WARM_ONLY", "").strip().lower() in (
         "1",
@@ -1046,6 +1078,9 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         # live COLD-admission cap driven by the node autosizer (None when unmanaged) — bounds
         # concurrent cold workers to the budget's cold headroom (ceiling − warm reservation).
         concurrency_gate=concurrency_gate,
+        # Opt-in (0 = off): leave UNTARGETED jobs younger than this to a warm peer
+        # (BLASTBOX_CLAIM_UNTARGETED_AFTER_S; parsed and validated above).
+        claim_untargeted_after_s=claim_untargeted_after_s,
     )
     # Opt-in node self-sizer started INSIDE the try below, so pool.stop() in the finally
     # always runs — even if sizer setup raises (bad BLASTBOX_NODE_* / unwritable share_dir)

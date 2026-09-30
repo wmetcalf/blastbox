@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import contextlib
 import logging
+import math
 import os
 import re
 import shutil
@@ -452,6 +453,7 @@ class Dispatcher:
         put_output_retry_backoff_s: float = _PUT_OUTPUT_RETRY_BACKOFF_S,
         blob_retry_backoff_s: float = _BLOB_RETRY_BACKOFF_S,
         attest_key: object = _attest.FROM_ENV,
+        claim_untargeted_after_s: float = 0.0,
     ) -> None:
         # Execution-receipt signing key (host/attest.py): an AttestKey, None (no receipts), or
         # FROM_ENV (BLASTBOX_ATTEST_KEY only -- strictly opt-in; unset = no receipts). A
@@ -681,6 +683,17 @@ class Dispatcher:
         # would otherwise sit QUEUED forever). Enable this only when peers handle the other engines.
         self._engine_scoped = os.environ.get(
             "BLASTBOX_DISPATCHER_ENGINE_SCOPED", "").strip().lower() in ("1", "true", "yes", "on")
+        # OPT-IN overflow posture (BLASTBOX_CLAIM_UNTARGETED_AFTER_S, read by the CLI): decline an
+        # UNTARGETED job until it is this many seconds old, so a co-resident warm dispatcher with a
+        # free slot claims it first and this one only takes what is left over. Jobs pinned to this
+        # dispatcher's tier are unaffected. Meant for the COLD dispatcher of a warm+cold pair; 0
+        # (default) = claim untargeted work immediately, the original behaviour. Refused here, not
+        # coerced, when nonsense: nan would silently stop this dispatcher ever taking untargeted work.
+        if not math.isfinite(claim_untargeted_after_s) or claim_untargeted_after_s < 0:
+            raise ValueError(
+                f"claim_untargeted_after_s must be a finite value >= 0, got "
+                f"{claim_untargeted_after_s!r}")
+        self._claim_untargeted_after_s = float(claim_untargeted_after_s)
 
         # Personality registry built ONCE from the operator env (does not change per job).
         from blastbox.host.netpolicy import parse_personalities
@@ -774,12 +787,15 @@ class Dispatcher:
         # _dispatch_claimed_job path FAILs a genuinely-unknown engine fast. Only pass engine= when
         # scoping is on, so the default path keeps the original claim_next(*, claimant_tier=) shape an
         # injected/legacy JobStore double may implement (no new keyword forced on it).
+        # The claim delay follows the same rule: passed ONLY when non-zero, so the default claim
+        # stays in the shape a legacy store double implements.
+        claim_kw: dict[str, Any] = {"claimant_tier": self._tier}
+        if self._engine_scoped:
+            claim_kw["engine"] = frozenset(self._engines)
+        if self._claim_untargeted_after_s:
+            claim_kw["untargeted_min_age_s"] = self._claim_untargeted_after_s
         try:
-            if self._engine_scoped:
-                job = self._job_store.claim_next(claimant_tier=self._tier,
-                                                 engine=frozenset(self._engines))
-            else:
-                job = self._job_store.claim_next(claimant_tier=self._tier)
+            job = self._job_store.claim_next(**claim_kw)
         except BaseException:
             if reserved:
                 self._release_warm_reservation()
