@@ -243,7 +243,7 @@ def test_a_store_that_declares_but_refuses_the_delay_is_refused_at_construction(
     from blastbox.host.jobs.http_store import HttpJobStore
 
     store = HttpJobStore.__new__(HttpJobStore)
-    with pytest.raises(ValueError, match="untargeted"):
+    with pytest.raises(ValueError, match="cannot honour"):
         _dispatcher(store, tmp_path, claim_untargeted_after_s=5.0)
 
 

@@ -716,12 +716,16 @@ class Dispatcher:
             # A store with only the original claim_next(*, claimant_tier=) shape would raise
             # TypeError on EVERY poll -- a dispatcher that never claims. Refuse it here instead.
             # Explicit capability first: a store may DECLARE the kwarg only to refuse it
-            # (HttpJobStore), which a signature check passes. Signature for unflagged doubles.
-            if getattr(self._job_store, "supports_untargeted_delay", None) is False or \
-                    not _accepts_kwarg(self._job_store.claim_next, "untargeted_min_age_s"):
+            # (HttpJobStore), which a signature check passes. Then the signature, for any store.
+            store_name = type(self._job_store).__name__
+            if getattr(self._job_store, "supports_untargeted_delay", None) is False:
                 raise ValueError(
-                    f"claim_untargeted_after_s is set but {type(self._job_store).__name__}"
-                    ".claim_next() does not accept untargeted_min_age_s")
+                    f"claim_untargeted_after_s is set but {store_name} cannot honour an "
+                    "untargeted claim delay (it states supports_untargeted_delay = False)")
+            if not _accepts_kwarg(self._job_store.claim_next, "untargeted_min_age_s"):
+                raise ValueError(
+                    f"claim_untargeted_after_s is set but {store_name}.claim_next() does not "
+                    "accept untargeted_min_age_s")
 
         # Personality registry built ONCE from the operator env (does not change per job).
         from blastbox.host.netpolicy import parse_personalities
