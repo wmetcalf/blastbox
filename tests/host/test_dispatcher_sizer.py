@@ -3619,3 +3619,57 @@ def test_unproven_probe_floor_is_gated(tmp_path, warm_only, spilling, want):
                            capacity_fn=_budget(8 * 1024, 999), clock=lambda: 1.0,
                            warm_only=warm_only).tick()
     assert mine.warm_size == want
+
+
+def test_hanging_restores_converge_to_the_probe(tmp_path, monkeypatch):
+    # opus: restores HANG (WARMING until the timeout). The not-serving warm-only pool kept its full
+    # legacy INTEGER warm share, its warming slots were published as reserved, and that fed back:
+    # fc 5/5, cold 3/3, a stream of wasted restores. A not-serving pool's warm share is only its
+    # (zero) capacity fill — the recovery probe keeps it alive — so it converges to fc 1/1, cold 7.
+    import logging
+    import sys
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
+    from test_pool import _FakeRuntime
+    from blastbox.host.pool import WarmPool
+    logging.disable(logging.CRITICAL)
+    _capture_specs(monkeypatch)
+    now = [0.0]
+
+    def clk():
+        return now[0]
+
+    class _Hang(_FakeRuntime):
+        def spawn(self):
+            s = super().spawn()
+            s.spawned_at = now[0]
+            return s
+    rt = _Hang()
+    rt.set_default_ready_after(10**9)
+    pool = WarmPool(runtime=rt, warm_size=0, spawn_rate_limit=1000.0,
+                    base_rebuild_cooldown_s=1e9, clock=clk, warming_timeout_s=5.0,
+                    spawn_concurrency=8, max_evictions_per_window=10**6)
+    pool.resize(warm_size=0, concurrent_ceiling=8)
+    cfg = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                     vcpu_oversubscription=999, stale_after_s=1e9)
+    share = FileNodeShare(str(tmp_path))
+    w = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=8), pool, share,
+                        cfg, runtime="firecracker", backlog_fn=lambda: 16,
+                        untargeted_backlog_fn=lambda: 16, node="n", instance="w",
+                        capacity_fn=_budget(8 * 1024, 999), clock=clk, warm_only=True)
+    c = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=8), None, share,
+                        cfg, runtime="cold", backlog_fn=lambda: 16,
+                        untargeted_backlog_fn=lambda: 16, node="n", instance="c",
+                        capacity_fn=_budget(8 * 1024, 999), clock=clk,
+                        concurrency_gate=_FixedGate(0), overflow_only=True)
+    try:
+        for _ in range(60):
+            now[0] += 1.0
+            c.tick()
+            mine = w.tick()
+            pool.tick()
+        cold = c.tick()
+    finally:
+        logging.disable(logging.NOTSET)
+    assert pool.is_serving() is False
+    assert (mine.warm_size, mine.concurrent_ceiling) == (1, 1)
+    assert cold.concurrent_ceiling == 7

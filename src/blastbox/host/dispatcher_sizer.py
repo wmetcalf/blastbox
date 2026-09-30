@@ -581,8 +581,10 @@ class DispatcherSizer:
         # RUNNING (`running`, NOT the reservation `assigned`: idle/warming resident slots can still
         # take a queued job; counting them as used would spill the work and REAP ready warm slots)
         # − the jobs queued TARGETED at its tier; 0 while it is not SERVING (a failure streak with
-        # nothing ready or busy — it can't claim). A prompt pool's untargeted demand is the LARGER
-        # of that capacity fill and its legacy share (so it never weighs less than before); the
+        # nothing ready or busy — it can't claim). A SERVING prompt pool's untargeted demand and
+        # warm share are the LARGER of that capacity fill and its legacy share (so it never weighs
+        # less than before); a not-serving one gets only its (zero) fill plus the one-slot
+        # recovery probe below; the
         # overflow pools get the residue, count − Σ min(prompt demand, prompt capacity) — which is
         # all of it when the prompt pools are at their cap. Orphan leases (lease=True) claim
         # nothing and get 0. An engine with only overflow pools splits the count evenly over them.
@@ -712,11 +714,13 @@ class DispatcherSizer:
                         probe.add((eng, s.tier, s.instance))
                 pf, _ = _fill_float(count, caps_f)
                 pi, _ = _fill_int(count_i, caps_i)
-                # the legacy floor on DEMAND only for a serving pool (a broken one gets no budget
-                # priority for work it can't claim); the integer warm share keeps it, so the broken
-                # pool still targets a warm slot and keeps retrying — that is how it recovers
+                # the legacy floor — on demand AND on the integer warm share — only for a SERVING
+                # pool. A broken one gets neither budget priority nor warm slots for work it can't
+                # claim (its restores may hang: warming slots are published as reserved and would
+                # hold a full legacy share in place). It recovers through the RECOVERY PROBE: one
+                # warm slot kept targeted (see `probe` above), not through its legacy share.
                 pf = [max(f, _legacy_f(s)) if _serving_of(s) else f for s, f in zip(prompt, pf)]
-                pi = [max(i, _legacy_i(s)) for s, i in zip(prompt, pi)]
+                pi = [max(i, _legacy_i(s)) if _serving_of(s) else i for s, i in zip(prompt, pi)]
                 rest_f = max(0.0, count - sum(min(f, c) for f, c in zip(pf, caps_f)))
                 rest_i = max(0, count_i - sum(min(i, c) for i, c in zip(pi, caps_i)))
                 groups = [(prompt, pf, pi),
@@ -876,8 +880,9 @@ class DispatcherSizer:
             #      exactly a prompt cold dispatcher's purpose; it reserves its own cold-footprint
             #      budget separately. An OVERFLOW-ONLY cold (BLASTBOX_CLAIM_UNTARGETED_AFTER_S) of a
             #      SPILLING engine takes only the residue the prompt pools can't (see the spill
-            #      rules above), so the warm tiers warm for what they can take — at least their
-            #      legacy share; it still sizes for jobs targeted at the cold tier.
+            #      rules above), so the serving warm tiers warm for what they can take — at least
+            #      their legacy share (a not-serving one keeps only the recovery probe); it still
+            #      sizes for jobs targeted at the cold tier.
             #  (b) the untargeted warm target uses _engine_int_share's (tier,instance)-rank remainder
             #      bias while the ceiling water-fill breaks ties by snaps order, so under a tight
             #      budget + non-divisible untargeted one warmable job can stay QUEUED a tick (served
