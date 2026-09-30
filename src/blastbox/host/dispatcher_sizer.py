@@ -653,6 +653,10 @@ class DispatcherSizer:
         # (engine, tier, instance). Leases and absent pools get 0.
         u_float: dict[tuple[str, str, str], float] = {}
         u_int: dict[tuple[str, str, str], int] = {}
+        # a spilling engine's prompt pools: their integer share of the TARGETED work, over live
+        # same-tier replicas (leases excluded) — the same term the capacity used, reused by the
+        # warm target so the two agree
+        tgt_int: dict[tuple[str, str, str], int] = {}
         for eng in sorted(spilling):
             live = sorted((s for s in snaps if s.engine == eng and _live(s)),
                           key=lambda s: (s.tier, s.instance))
@@ -684,6 +688,8 @@ class DispatcherSizer:
                           else 0.0 for s in prompt]
                 caps_i = [max(0, _cap(s) - _running_of(s) - _tgt_i(s)) if _serving_of(s)
                           else 0 for s in prompt]
+                for s in prompt:
+                    tgt_int[(eng, s.tier, s.instance)] = _tgt_i(s)
                 pf, _ = _fill_float(count, caps_f)
                 pi, _ = _fill_int(count_i, caps_i)
                 # the legacy floor on DEMAND only for a serving pool (a broken one gets no budget
@@ -855,7 +861,9 @@ class DispatcherSizer:
             #      budget + non-divisible untargeted one warmable job can stay QUEUED a tick (served
             #      when a slot frees or via cold). No job loss, Σwarm ≤ Σceiling ≤ budget always.
             my_targeted = max(0, backlog - min(backlog, self._last_untargeted))
-            my_backlog = (_int_share(my_targeted, e.name, self._runtime, self._instance)
+            my_key3 = (e.name, self._runtime, self._instance)
+            my_backlog = ((tgt_int[my_key3] if my_key3 in tgt_int  # spilling prompt pool: live split
+                           else _int_share(my_targeted, e.name, self._runtime, self._instance))
                           + _engine_int_share(min(backlog, self._last_untargeted),
                                               e.name, self._runtime, self._instance))
             # the warm FLOOR is also split across same-queue replicas — else two overlapping

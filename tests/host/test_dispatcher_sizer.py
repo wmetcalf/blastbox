@@ -3292,3 +3292,20 @@ def test_lease_does_not_dilute_targeted_work_in_prompt_capacity(tmp_path, monkey
                     capacity_fn=_budget(12 * 1024, 999), clock=lambda: 1.0).tick()
     assert specs["clip@firecracker@w"].max_ceiling == 10
     assert specs["clip@cold@c"].queued == 6
+
+
+def test_lease_does_not_dilute_targeted_work_in_the_warm_target(tmp_path, monkeypatch):
+    # probe_int: a same-tier orphan lease beside the live prompt fc; 8 jobs targeted at fc, 4
+    # untargeted. All 8 targeted jobs are the live pool's (a lease claims nothing), plus the 2
+    # untargeted its capacity (10 − 8) takes: warm 8 at ceiling 8, not 6 (the targeted term split
+    # 4/4 with the lease). Fails if either the capacity or the warm-target half counts the lease.
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    share.publish(_het_snapshot(("clip", "cold", "c", 1024, 4, 4, 64, 0, 0, True)))
+    _lease(share, instance="old", warm_orphans=1)
+    mine = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=20), _Pool(),
+                           share, _OVF_CFG, runtime="firecracker", backlog_fn=lambda: 12,
+                           untargeted_backlog_fn=lambda: 4, node="n", instance="w",
+                           capacity_fn=_budget(12 * 1024, 999), clock=lambda: 1.0).tick()
+    assert specs["clip@cold@c"].queued == 2                    # 4 − the 2 that fit
+    assert (mine.warm_size, mine.concurrent_ceiling) == (8, 8)

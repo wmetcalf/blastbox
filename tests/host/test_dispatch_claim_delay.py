@@ -282,9 +282,9 @@ def test_dispatch_cmd_refuses_a_delay_past_the_ttl_before_spawning_slots(monkeyp
 # --- review round 9 (#193) ---------------------------------------------------------------------
 
 def test_a_store_that_does_not_state_delay_support_is_refused(tmp_path):
-    """Fail closed: a wrapper whose claim_next takes **kw passed the signature check and silently
-    DROPPED the delay (a fresh untargeted job was claimed at once). A store must state
-    supports_untargeted_delay = True."""
+    """A store that does not DECLARE supports_untargeted_delay = True is refused: this wrapper hides
+    the attribute, and its **kw claim_next would silently drop the delay (a fresh untargeted job
+    was claimed at once). (A proxy that forwards the flag but drops the kwarg is undetectable.)"""
     class _Wrapper:
         def __init__(self):
             self.inner = InMemoryJobStore()

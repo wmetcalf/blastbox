@@ -713,13 +713,15 @@ class Dispatcher:
                     f"claim_untargeted_after_s ({self._claim_untargeted_after_s:g}s) must be below "
                     f"max_queued_age_s ({self._max_queued_age_s:g}s): the queued-job reaper would "
                     "expire untargeted work before this dispatcher may claim it")
-            # FAIL CLOSED: the store must STATE that it honours the delay
-            # (supports_untargeted_delay = True, as the memory / SQL / Redis stores do). Neither a
-            # missing attribute nor the signature is proof: HttpJobStore declares the kwarg only to
-            # refuse it, and a wrapper whose claim_next takes **kw passes a signature check while
-            # silently DROPPING the delay -- this dispatcher would then race its warm peer for every
-            # untargeted job. The signature check stays as a second guard: a legacy
-            # claim_next(*, claimant_tier=) would raise TypeError on EVERY poll.
+            # The store must DECLARE that it honours the delay (supports_untargeted_delay = True, as
+            # the memory / SQL / Redis stores do); a store that doesn't declare it — a custom store,
+            # or a wrapper that doesn't expose the attribute — is refused, since neither the
+            # signature nor a missing attribute is proof (HttpJobStore declares the kwarg only to
+            # refuse it; a **kw claim_next accepts it and may drop it). What this CANNOT detect: a
+            # delegating proxy that forwards the flag from the store it wraps but drops the kwarg in
+            # its own claim_next. Honouring the declared contract is that wrapper author's job. The
+            # signature check stays as a second guard: a legacy claim_next(*, claimant_tier=) would
+            # raise TypeError on EVERY poll.
             store_name = type(self._job_store).__name__
             if getattr(self._job_store, "supports_untargeted_delay", False) is not True:
                 raise ValueError(
