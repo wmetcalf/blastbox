@@ -678,6 +678,8 @@ def _start_node_sizer(
             # excluding it could leave their untargeted jobs unsized. It publishes False (never
             # excluded, the pre-flag split), which only ever over-sizes it.
             overflow_only=claim_untargeted_after_s > 0 and len(served) == 1,
+            # published as `engines`: an engine with a multi-engine pool is never spill-split
+            served_engines=len(served),
         )
         # Print the status FIRST, then start the thread LAST — otherwise if this print raises
         # (broken pipe / closed stderr) the except below returns None while the thread is

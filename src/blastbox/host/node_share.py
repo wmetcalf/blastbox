@@ -129,7 +129,7 @@ class DemandSnapshot:
                                  # reader drops the key and treats the lease as it always did.
                                  # VERSION-GATE INVARIANT: the overflow exclusion (DispatcherSizer.
                                  # tick) is enabled only when every snapshot on the node carries ALL
-                                 # of `overflow_only`, `lease` and `running` — they arrived in one
+                                 # of `overflow_only`, `lease`, `running` and `engines` — they came in one
                                  # change (#193), and a binary that published one without
                                  # understanding the others would plan differently (e.g. read a
                                  # current lease as a prompt pool). Keying on all of them ENFORCES
@@ -141,6 +141,12 @@ class DemandSnapshot:
                                  # same warm-slot units (busy warm slots + cold in flight). The spill
                                  # capacity reads it: an idle ready slot can still absorb a queued
                                  # job, a busy one can't. None = the key was ABSENT (older peer).
+    engines: Optional[int] = None
+                                 # how many engines the publishing dispatcher SERVES. Its backlog is
+                                 # the combined count of all of them, published under its first
+                                 # engine's name, so an engine with a multi-engine pool (> 1) is never
+                                 # split with the spill rules (that would hand another engine's jobs
+                                 # to single-engine peers). None = the key was ABSENT (older peer).
 
 
 class NodeShare(Protocol):
@@ -403,6 +409,8 @@ def _valid(snap: DemandSnapshot) -> bool:
         and (snap.overflow_only is None or isinstance(snap.overflow_only, bool))
         and (snap.lease is None or isinstance(snap.lease, bool))
         and (snap.running is None or _finite_in(snap.running, 0, _MAX_COUNT))
+        and (snap.engines is None or (isinstance(snap.engines, int)
+                                      and _finite_in(snap.engines, 1, _MAX_CEILING_SANE)))
     )
 
 

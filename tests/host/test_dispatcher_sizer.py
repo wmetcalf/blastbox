@@ -1687,7 +1687,8 @@ def test_demand_snapshot_field_order_is_append_only():
     import dataclasses
 
     fields = [f.name for f in dataclasses.fields(DemandSnapshot)]
-    assert fields[-4:] == ["untargeted_backlog", "overflow_only", "lease", "running"], (
+    assert fields[-5:] == ["untargeted_backlog", "overflow_only", "lease", "running",
+                           "engines"], (
         f"new fields must be appended in order (append-only); order is {fields}")
 
     # Positional construction through `balancing` still lands each value on its field.
@@ -1880,7 +1881,8 @@ def _capture_specs(monkeypatch):
 def _peer(tier, instance, backlog, untargeted, *, overflow_only=None, max_ceiling=64,
           engine="clip", ram=1024):
     kw = ({} if overflow_only is None
-          else {"overflow_only": overflow_only, "lease": False, "running": 0})
+          else {"overflow_only": overflow_only, "lease": False, "running": 0,
+                "engines": 1})
     return DemandSnapshot(engine, backlog, 0, ram, 1, 0, max_ceiling, 1.0, ts=1.0, node="n",
                           tier=tier, instance=instance, untargeted_backlog=untargeted,
                           balancing=True, **kw)
@@ -1958,6 +1960,7 @@ def test_snapshot_without_overflow_field_is_not_overflow_only(tmp_path, monkeypa
     old.pop("overflow_only", None)
     old.pop("lease", None)
     old.pop("running", None)
+    old.pop("engines", None)
     (tmp_path / FileNodeShare._filename("clip", "cold", "n", "c")).write_text(json.dumps(old))
     mine = _fc_sizer(share, backlog=16, untargeted=16).tick()
     assert "clip@cold@c" in specs                     # the old snapshot was accepted
@@ -2024,7 +2027,7 @@ def test_overflow_pool_keeps_its_reservation_and_floor(tmp_path, monkeypatch):
     share = FileNodeShare(str(tmp_path))
     share.publish(DemandSnapshot("clip", 16, 3, 1024, 1, 0, 64, 1.0, ts=1.0, node="n", tier="cold",
                                  instance="c", untargeted_backlog=16, overflow_only=True,
-                                 balancing=True, lease=False, running=3))
+                                 balancing=True, lease=False, running=3, engines=1))
     _fc_sizer(share, backlog=16, untargeted=16, ram_budget=8 * 1024).tick()
     cold = specs["clip@cold@c"]
     assert cold.reserved == 3 and cold.demand == 3 and cold.queued == 0
@@ -2078,6 +2081,7 @@ def _write_old(tmp_path_dir, tier, instance, backlog, untargeted, *, assigned=0,
     raw.pop("overflow_only", None)
     raw.pop("lease", None)
     raw.pop("running", None)
+    raw.pop("engines", None)
     raw["assigned"] = assigned
     (tmp_path_dir / FileNodeShare._filename(engine, tier, "n", instance)).write_text(
         json.dumps(raw))
@@ -2358,8 +2362,10 @@ def test_lease_in_a_mixed_version_engine_keeps_the_old_split(tmp_path, monkeypat
 
 
 def test_untargeted_shares_sum_over_live_pools_with_leases(tmp_path, monkeypatch):
-    # Invariant with leases in the view: when the engine has a live pool, the untargeted shares sum
-    # to the count and every lease gets 0; each lease's ceiling is its reservation; budget holds.
+    # Invariant with leases in the view: a SPILLING engine (a live overflow pool) sums its shares
+    # to the count with every lease at 0 (at least the count: a capped prompt pool keeps its legacy
+    # share); without an overflow pool it is the legacy split (own count over every pool, leases
+    # included). Each lease's ceiling is its reservation; budget holds.
     import itertools
     specs = _capture_specs(monkeypatch)
     for flags in itertools.product([False, True], repeat=2):
@@ -2373,7 +2379,12 @@ def test_untargeted_shares_sum_over_live_pools_with_leases(tmp_path, monkeypatch
                 mine = _fc_sizer(share, backlog=u, untargeted=u, overflow_only=flags[0],
                                  ram_budget=10 * 1024).tick()
                 assert mine is not None
-                assert abs(sum(s.queued for s in specs.values()) - u) < 1e-9, (flags, n_leases, u)
+                live = 2                                          # fc (me) + gvisor g
+                if flags[0] or flags[1]:
+                    assert sum(s.queued for s in specs.values()) >= u - 1e-9, (flags, n_leases, u)
+                else:                                             # legacy: u / all pools each
+                    want = live * u / (live + n_leases)
+                    assert abs(sum(s.queued for s in specs.values()) - want) < 1e-9
                 plan = dict(_PLAN)
                 for i in range(n_leases):
                     assert specs[f"clip@firecracker@l{i}"].queued == 0
@@ -2394,7 +2405,7 @@ def _cpeer(tier, instance, backlog, untargeted, *, overflow_only, max_ceiling=64
     return DemandSnapshot(engine, backlog, assigned, 1024, 1, 0, max_ceiling, 1.0, ts=1.0,
                           node="n", tier=tier, instance=instance, untargeted_backlog=untargeted,
                           balancing=True, overflow_only=overflow_only, lease=False,
-                          running=assigned if running is None else running)
+                          running=assigned if running is None else running, engines=1)
 
 
 def test_capped_prompt_pool_spills_untargeted_to_overflow(tmp_path, monkeypatch):
@@ -2410,7 +2421,10 @@ def test_capped_prompt_pool_spills_untargeted_to_overflow(tmp_path, monkeypatch)
                     untargeted_backlog_fn=lambda: 20, node="n", instance="y",
                     capacity_fn=_budget(10 * 1024, 999), clock=lambda: 1.0,
                     overflow_only=False).tick()
-    assert specs["clip@firecracker@w"].queued == 0      # capacity 2 − 2 running = 0
+    # W is at its cap (2 − 2 running = 0 capacity): it keeps its legacy share as DEMAND (20/2; it
+    # can't seat it — max_ceiling 2 caps it) and ALL 20 spill to cold, since the residue counts
+    # only what the prompt pools can take: 20 − min(10, 0).
+    assert specs["clip@firecracker@w"].queued == 10
     assert specs["clip@cold@c"].queued == 20
     plan = dict(_PLAN)
     assert plan["clip@cold@c"].concurrent_ceiling >= 3   # not the self-locking 1
@@ -2425,8 +2439,8 @@ def test_partly_capped_prompt_pool_keeps_its_capacity_and_spills_the_rest(tmp_pa
     share = FileNodeShare(str(tmp_path))
     share.publish(_cpeer("cold", "c", 20, 20, overflow_only=True))
     mine = _fc_sizer(share, backlog=20, untargeted=20, max_ceiling=6).tick()
-    assert specs["clip@firecracker@f"].queued == 6
-    assert specs["clip@cold@c"].queued == 14
+    assert specs["clip@firecracker@f"].queued == 10        # max(capacity 6, old share 20/2)
+    assert specs["clip@cold@c"].queued == 14               # 20 − min(10, 6)
     assert mine.warm_size == 6
 
 
@@ -2437,7 +2451,8 @@ def test_targeted_work_uses_up_prompt_capacity(tmp_path, monkeypatch):
     share = FileNodeShare(str(tmp_path))
     share.publish(_cpeer("cold", "c", 20, 20, overflow_only=True))
     mine = _fc_sizer(share, backlog=22, untargeted=20, max_ceiling=6).tick()
-    assert specs["clip@firecracker@f"].queued == 6            # 2 targeted + 4 untargeted
+    # 2 targeted + max(4 that fit, legacy share 20/2); cold gets 20 − min(10, 4)
+    assert specs["clip@firecracker@f"].queued == 12
     assert specs["clip@cold@c"].queued == 16
     assert mine.warm_size == 6
 
@@ -2472,19 +2487,24 @@ def test_spill_shares_sum_to_the_count_over_a_grid(tmp_path, monkeypatch):
             mine = _fc_sizer(share, backlog=u, untargeted=u, max_ceiling=cap, instance=inst,
                              tier=tier).tick()
             q = specs[f"clip@{tier}@{inst}"].queued
-            if ovf:
-                assert q <= cap + 1e-9, (cap_a, cap_b, n_ovf, u)
-            assert abs(sum(s.queued for s in specs.values()) - u) < 1e-9, (cap_a, cap_b, n_ovf, u)
+            n_all = len(prompt) + len(ovf)
+            if ovf:                    # ≥ the legacy share, and ≥ what fits (≤ cap) of the count
+                assert q >= u / n_all - 1e-9, (cap_a, cap_b, n_ovf, u)
+                assert sum(s.queued for s in specs.values()) >= u - 1e-9
+            else:
+                assert abs(sum(s.queued for s in specs.values()) - u * len(prompt) / n_all
+                           ) < 1e-9, (cap_a, cap_b, n_ovf, u)
             warm_total += mine.warm_size
         prompt_cap = sum(c for _, _, c in prompt)
         if ovf:
-            # the prompt pools warm exactly what they can absorb; the rest is the overflow's
-            assert warm_total == min(u, prompt_cap), (cap_a, cap_b, n_ovf, u)
+            # the prompt pools warm at least what they can absorb (their legacy share too), never
+            # past their caps; the overflow pools' share is exactly what the prompt pools can't take
+            assert min(u, prompt_cap) <= warm_total <= prompt_cap, (cap_a, cap_b, n_ovf, u)
             for tier, inst in ovf:
                 share_u = specs[f"clip@{tier}@{inst}"].queued
                 assert abs(share_u - (u - min(u, prompt_cap)) / n_ovf) < 1e-9
         else:
-            assert warm_total == min(u, prompt_cap) or warm_total <= u
+            assert warm_total <= u
 
 
 def test_gate_requires_lease_field_too(tmp_path, monkeypatch):
@@ -2526,12 +2546,12 @@ def test_gate_requires_running_field_too(tmp_path, monkeypatch):
     assert specs["clip@cold@c"].queued == 8 and specs["clip@firecracker@f"].queued == 8
 
 
-# --- starve scenarios: prompt-first is expressed ONLY in the untargeted demand split -------------
-# (maintainer decision) Every real pool is planned by plain plan_sizes at its true footprint; the
-# prompt pools' priority lives only in how the untargeted count is divided before planning (each
-# prompt pool up to its capacity, the true residue to the overflow pools). The proportional
-# water-fill may still give an overflow pool budget ahead of its idle prompt pool — see the
-# numbers pinned below.
+# --- starve scenarios: prompt-first in the untargeted demand split, never below the old share ---
+# Every real pool is planned by plain plan_sizes at its true footprint. The prompt pools' priority
+# lives only in how the untargeted count is divided before planning: a prompt pool's untargeted
+# demand is the LARGER of its capacity fill and its OLD even share (what the legacy / a929bc9 split
+# gives it), and the overflow pools get the residue the prompt pools can't take. So a warm pool is
+# never planned below what it had before; the engine may weigh a little more than its queue.
 
 def _starve_view(tmp_path, *, w_cap, w_assigned=0, w_running=None, red_backlog=None):
     share = FileNodeShare(str(tmp_path))
@@ -2554,28 +2574,37 @@ def _plan_from(share, engine, tier, instance, backlog, untargeted, budget=10):
     return {k: p.concurrent_ceiling for k, p in _PLAN.items()}
 
 
-def test_starve_scenarios_split_demand_prompt_first_and_plan_plainly(tmp_path, monkeypatch):
-    # starve.py's three cases. The untargeted DEMAND is split prompt-first (W's queued share = its
-    # capacity, cold the residue) and the plan is plain plan_sizes of those specs — no second
-    # allocator. The resulting ceilings are pinned as the known behaviour of this design (the
-    # proportional water-fill holds an idle capped W below its capacity: W4 → W2, see #193).
-    from blastbox.host.node_sizer import NodeBudget, plan_sizes
+def _starve_pools(w_cap, red=None, w_res=0):
+    pools = {"W": ("clip", "firecracker", "w", 1024, 20, 20, w_cap, w_res, w_res, False),
+             "C": ("clip", "cold", "c", 1024, 20, 20, 64, 0, 0, True)}
+    if red is not None:
+        pools["Y"] = ("red", "firecracker", "y", 1024, red, red, 64, 0, 0, False)
+    return pools
+
+
+def test_starve_scenarios(tmp_path, monkeypatch):
+    # starve.py. W4: W (cap 4, idle) gets its capacity and cold the rest: W4 C6 (was W2 C8). In every
+    # case W is planned no lower than the legacy (a929bc9) path plans it on the same view; the other
+    # engine pays at most the pinned delta.
     specs = _capture_specs(monkeypatch)
-    cases = [
-        ("W4", dict(w_cap=4), ("clip", "cold", "c", 20, 20), 4, 16,
-         {"clip@firecracker@w": 2, "clip@cold@c": 8}),
-        ("W4Y", dict(w_cap=4, red_backlog=40), ("red", "firecracker", "y", 40, 40), 4, 16,
-         {"clip@firecracker@w": 1, "clip@cold@c": 2, "red@firecracker@y": 7}),
-        ("W0", dict(w_cap=2, red_backlog=20), ("red", "firecracker", "y", 20, 20), 2, 18,
-         {"clip@firecracker@w": 1, "clip@cold@c": 4, "red@firecracker@y": 5}),
-    ]
-    for i, (name, view, who, w_q, c_q, want) in enumerate(cases):
-        plan = _plan_from(_starve_view(tmp_path / name, **view), *who)
-        assert specs["clip@firecracker@w"].queued == w_q, name
-        assert specs["clip@cold@c"].queued == c_q, name
-        plain = plan_sizes(list(specs.values()), NodeBudget(ram_mib=10 * 1024, vcpus=999))
-        assert plan == {k: p.concurrent_ceiling for k, p in plain.items()}, name
-        assert plan == want, (name, plan)
+    cases = [("W4", _starve_pools(4), 10, 16,
+              {"clip@firecracker@w": 4, "clip@cold@c": 6}),
+             ("W4Y", _starve_pools(4, red=40), 10, 16, None),
+             ("W0", _starve_pools(2, red=20), 10, 18, None)]
+    for name, pools, w_q, c_q, want in cases:
+        cur = _het_plan(tmp_path / name, pools, 10 * 1024)
+        assert specs["clip@firecracker@w"].queued == w_q, name   # max(capacity, old share 20/2)
+        assert specs["clip@cold@c"].queued == c_q, name          # 20 − min(10, capacity)
+        leg = _legacy_plan(tmp_path / (name + "-legacy"), pools, 10 * 1024)
+        assert cur["clip@firecracker@w"] >= leg["clip@firecracker@w"], (name, cur, leg)
+        assert sum(cur.values()) <= 10
+        if want is not None:
+            assert cur == want, (name, cur)
+    # W4Y / W0: exactly the legacy plan; red pays nothing (7 and 5, as before)
+    assert _het_plan(tmp_path / "W4Y2", _starve_pools(4, red=40), 10 * 1024) == {
+        "clip@firecracker@w": 1, "clip@cold@c": 2, "red@firecracker@y": 7}
+    assert _het_plan(tmp_path / "W02", _starve_pools(2, red=20), 10 * 1024) == {
+        "clip@firecracker@w": 2, "clip@cold@c": 3, "red@firecracker@y": 5}
 
 
 def test_full_prompt_pool_still_spills_to_cold_against_another_engine(tmp_path, monkeypatch):
@@ -2623,8 +2652,8 @@ def test_idle_warm_slots_count_as_capacity_not_as_running(tmp_path, monkeypatch)
                          untargeted_backlog_fn=lambda: 20, node="n", instance="w",
                          capacity_fn=_budget(10 * 1024, 999), clock=lambda: 1.0)
     mine = ds.tick()
-    assert specs["clip@firecracker@w"].queued == 6
-    assert specs["clip@cold@c"].queued == 14
+    assert specs["clip@firecracker@w"].queued == 10        # max(6 idle-slot capacity, 20/2)
+    assert specs["clip@cold@c"].queued == 14               # 20 − min(10, 6)
     assert mine.warm_size == 6 and pool.warm_size == 6
 
 
@@ -2638,7 +2667,9 @@ def test_prompt_pool_running_at_cap_spills_everything(tmp_path, monkeypatch):
                     _OVF_CFG, runtime="firecracker", backlog_fn=lambda: 20,
                     untargeted_backlog_fn=lambda: 20, node="n", instance="w",
                     capacity_fn=_budget(10 * 1024, 999), clock=lambda: 1.0).tick()
-    assert specs["clip@firecracker@w"].queued == 0
+    # all 6 busy → capacity 0: W keeps its legacy share as demand (capped by max_ceiling 6), and
+    # the whole count spills to cold: 20 − min(10, 0)
+    assert specs["clip@firecracker@w"].queued == 10
     assert specs["clip@cold@c"].queued == 20
 
 
@@ -2662,8 +2693,9 @@ def test_one_stale_high_count_does_not_inflate_the_engine(tmp_path, monkeypatch)
     share = FileNodeShare(str(tmp_path))
     share.publish(_cpeer("gvisor", "g", 40, 40, overflow_only=False))
     mine = _fc_sizer(share, backlog=0, untargeted=0).tick()
+    # no overflow pool → the legacy split, each pool's OWN count over the pools: 0 and 40/2
     assert abs(sum(s.queued for s in specs.values()) - 20) < 1e-9
-    assert mine.warm_size == 10                     # its half of 20 (the warm split), not of 40
+    assert mine.warm_size == 0
     share2 = FileNodeShare(str(tmp_path / "ovf"))
     share2.publish(_cpeer("cold", "c", 40, 40, overflow_only=True))
     _fc_sizer(share2, backlog=0, untargeted=0, max_ceiling=4).tick()
@@ -2700,7 +2732,7 @@ def test_spill_plans_agree_and_fit_the_budget_randomized(tmp_path, monkeypatch):
             share.publish(DemandSnapshot(eng, b, asg, ram, 1, 0, cap, 1.0, ts=1.0, node="n",
                                          tier=tier, instance=inst, untargeted_backlog=un,
                                          balancing=True, overflow_only=ovf, lease=False,
-                                         running=run))
+                                         running=run, engines=1))
         plans = []
         class _Gate:                                 # cold in flight = its reservation/running
             def __init__(self, n):
@@ -2759,7 +2791,8 @@ def _het_sizer(share, pool, budget_mib, budget_vcpus):
         None if cold else _Pool(assigned=run, slot_count=res), share, _OVF_CFG, runtime=tier,
         backlog_fn=lambda: b, untargeted_backlog_fn=lambda: u, node="n", instance=inst,
         capacity_fn=_budget(budget_mib, budget_vcpus), clock=lambda: 1.0, overflow_only=ovf,
-        concurrency_gate=_FixedGate(res) if cold else None)
+        concurrency_gate=_FixedGate(res) if cold else None,
+        served_engines=rest[1] if len(rest) > 1 else 1)
 
 
 def _het_snapshot(pool):
@@ -2767,7 +2800,8 @@ def _het_snapshot(pool):
     return DemandSnapshot(eng, b, res, ram, rest[0] if rest else 1, 0, cap, 1.0, ts=1.0,
                           node="n", tier=tier, instance=inst, untargeted_backlog=u,
                           balancing=True, overflow_only=ovf, lease=False,
-                          running=res if tier == "cold" else run)
+                          running=res if tier == "cold" else run,
+                          engines=rest[1] if len(rest) > 1 else 1)
 
 
 def _het_plan(tmp_path, pools, budget_mib, budget_vcpus=999):
@@ -2836,7 +2870,7 @@ def test_member_floors_are_not_double_counted(tmp_path, monkeypatch):
                                      ("red", "firecracker", "y", 2, False)):
         share.publish(DemandSnapshot(eng, 5, 0, 1024, 1, mw, 64, 1.0, ts=1.0, node="n",
                                      tier=tier, instance=inst, untargeted_backlog=5,
-                                     balancing=True, overflow_only=ovf, lease=False, running=0))
+                                     balancing=True, overflow_only=ovf, lease=False, running=0, engines=1))
     DispatcherSizer(EngineNode("red", "-", slot_ram_mib=1024, max_ceiling=64, min_warm=2),
                     _Pool(), share, _OVF_CFG, runtime="firecracker", backlog_fn=lambda: 5,
                     untargeted_backlog_fn=lambda: 5, node="n", instance="y",
@@ -2865,7 +2899,7 @@ def _legacy_plan(tmp_path, pools, budget_mib, budget_vcpus=999):
     share = FileNodeShare(str(tmp_path))
     for pool in pools.values():
         raw = asdict(_het_snapshot(pool))
-        for k in ("overflow_only", "lease", "running"):
+        for k in ("overflow_only", "lease", "running", "engines"):
             raw.pop(k, None)
         (tmp_path / FileNodeShare._filename(pool[0], pool[1], "n", pool[2])).write_text(
             json.dumps(raw))
@@ -2915,3 +2949,150 @@ def test_heterogeneous_footprint_property_fuzz(tmp_path, monkeypatch):
             assert sum(cur[name[k]] * p[3] for k, p in pools.items()) <= budget, (case, pools, cur)
             assert sum(cur[name[k]] * p[10] for k, p in pools.items()) <= vcpus, (case, pools, cur)
     assert seated >= 80 and fitted >= 70, (seated, fitted)       # the net actually bit
+
+
+def _own_sizes(tmp_path, pools, budget_mib, budget_vcpus, legacy):
+    """Each pool's OWN PoolSize from its own tick, on the current view or on a legacy one (every
+    other pool's snapshot stripped of the new fields — the a929bc9-equivalent path)."""
+    import json
+    from dataclasses import asdict
+    out = {}
+    for key, pool in pools.items():
+        d = tmp_path / key
+        d.mkdir(parents=True, exist_ok=True)
+        share = FileNodeShare(str(d))
+        for other in pools.values():
+            raw = asdict(_het_snapshot(other))
+            if legacy:
+                for k in ("overflow_only", "lease", "running", "engines"):
+                    raw.pop(k, None)
+            (d / FileNodeShare._filename(other[0], other[1], "n", other[2])).write_text(
+                json.dumps(raw))
+        out[f"{pool[0]}@{pool[1]}@{pool[2]}"] = _het_sizer(share, pool, budget_mib,
+                                                            budget_vcpus).tick()
+    return out
+
+
+def test_prompt_pool_never_below_legacy_fuzz(tmp_path, monkeypatch):
+    # On random heterogeneous views, every PROMPT pool's own planned ceiling AND warm target are
+    # never below what the legacy (a929bc9-equivalent) path gives it on the same view.
+    import random
+    rng = random.Random(0xA929)
+    _capture_specs(monkeypatch)
+    compared = exact = 0
+    for case in range(250):
+        pools = {}
+        for e in range(rng.randint(1, 3)):
+            n_p, n_o = rng.randint(1, 2), rng.choice([0, 1, 1, 2])
+            u = rng.choice([0, 4, 20, 50])
+            for i in range(n_p + n_o):
+                cap = rng.choice([1, 2, 4, 8, 64])
+                res = rng.randint(0, min(cap, 5))
+                tier = ("firecracker", "gvisor", "cold")[i % 3]
+                pools[f"{e}{i}"] = (f"e{e}", tier, f"i{i}", rng.choice([512, 1024, 2048, 4096]),
+                                    u + rng.choice([0, 0, 3]), u, cap, res,
+                                    res if tier == "cold" else rng.randint(0, res), i >= n_p,
+                                    rng.choice([0.5, 1, 2, 4]))
+        budget, vcpus = rng.choice([4, 8, 12, 24, 64]) * 1024, rng.choice([4, 8, 16, 999])
+        cur = _own_sizes(tmp_path / f"c{case}", pools, budget, vcpus, legacy=False)
+        leg = _own_sizes(tmp_path / f"l{case}", pools, budget, vcpus, legacy=True)
+        spilling = {p[0] for p in pools.values() if p[9]}
+        names = {k: f"{p[0]}@{p[1]}@{p[2]}" for k, p in pools.items()}
+        if not spilling:
+            # no overflow pool anywhere: EXACTLY the legacy (a929bc9-equivalent) plan and warm
+            assert {n: (cur[n].concurrent_ceiling, cur[n].warm_size) for n in cur} == {
+                n: (leg[n].concurrent_ceiling, leg[n].warm_size) for n in leg}, (case, pools)
+            exact += 1
+        if not all(leg[names[k]].concurrent_ceiling >= min(p[7], p[6]) for k, p in pools.items()):
+            continue      # over-committed node: reservations are seated by demand priority, which
+                          # legitimately moves with the split — no per-pool guarantee there
+        for k, p in pools.items():
+            if p[9] or p[0] not in spilling:
+                continue          # the guarantee is for the PROMPT pools of an engine with overflow
+            name = f"{p[0]}@{p[1]}@{p[2]}"
+            compared += 1
+            assert cur[name].concurrent_ceiling >= leg[name].concurrent_ceiling, (
+                case, name, pools, cur, leg)
+            assert cur[name].warm_size >= leg[name].warm_size, (case, name, pools, cur, leg)
+    assert compared >= 80 and exact >= 10, (compared, exact)
+
+
+def test_multi_engine_pool_without_overflow_plans_as_legacy(tmp_path, monkeypatch):
+    # codex: a warm pool serving aa+bb reports 8 untargeted (bb) jobs under aa; a second warm pool
+    # serves only aa and reports 0; 4 slots. No overflow pool → exactly the legacy plan and warm
+    # targets (the shared pool warms for its own count; the aa-only pool is not sized for bb jobs).
+    _capture_specs(monkeypatch)
+    pools = {"A": ("aa", "firecracker", "a", 1024, 8, 8, 64, 0, 0, False, 1, 2),
+             "B": ("aa", "gvisor", "b", 1024, 0, 0, 64, 0, 0, False, 1, 1)}
+    cur = _own_sizes(tmp_path / "cur", pools, 4 * 1024, 999, legacy=False)
+    leg = _own_sizes(tmp_path / "leg", pools, 4 * 1024, 999, legacy=True)
+    assert cur == leg
+    assert cur["aa@gvisor@b"].warm_size == 0
+
+
+def test_engine_with_a_multi_engine_pool_never_spills(tmp_path, monkeypatch):
+    # a spilling layout (prompt + overflow cold), but the prompt pool serves two engines: its count
+    # is combined, so the engine keeps the legacy split rather than redistributing it
+    specs = _capture_specs(monkeypatch)
+    pools = {"A": ("aa", "firecracker", "a", 1024, 16, 16, 64, 0, 0, False, 1, 2),
+             "C": ("aa", "cold", "c", 1024, 16, 16, 64, 0, 0, True, 1, 1)}
+    cur = _own_sizes(tmp_path / "cur", pools, 8 * 1024, 999, legacy=False)
+    leg = _own_sizes(tmp_path / "leg", pools, 8 * 1024, 999, legacy=True)
+    assert cur == leg
+    assert specs["aa@cold@c"].queued == 8                    # the even split, not the residue
+
+
+def test_gate_requires_engines_field_too(tmp_path, monkeypatch):
+    # a pool of ANOTHER engine without `engines` switches the node gate off: clip keeps the legacy
+    # split although its own pools carry every field
+    import json
+    from dataclasses import asdict
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    share.publish(_peer("cold", "c", 16, 16, overflow_only=True))
+    raw = asdict(_peer("firecracker", "y", 4, 4, overflow_only=False, engine="red"))
+    raw.pop("engines", None)
+    (tmp_path / FileNodeShare._filename("red", "firecracker", "n", "y")).write_text(
+        json.dumps(raw))
+    _fc_sizer(share, backlog=16, untargeted=16).tick()
+    assert specs["clip@cold@c"].queued == 8 and specs["clip@firecracker@f"].queued == 8
+
+
+def test_legacy_floor_not_applied_on_an_over_committed_node(tmp_path, monkeypatch):
+    # reservations that don't all fit (4 slots, 6 resident): the legacy plan grows no pool past
+    # its reservation there, so the floors raise nothing — reservations keep plain plan_sizes'
+    # demand-priority seating and an overflow pool's resident workers aren't displaced by a floor
+    specs = _capture_specs(monkeypatch)
+    pools = {"W": ("clip", "firecracker", "w", 1024, 20, 20, 64, 1, 1, False),
+             "C": ("clip", "cold", "c", 1024, 20, 20, 64, 3, 3, True),
+             "Y": ("red", "firecracker", "y", 1024, 20, 20, 64, 2, 2, False)}
+    _het_plan(tmp_path, pools, 4 * 1024)
+    assert {k: sp.reserved for k, sp in specs.items()} == {
+        "clip@firecracker@w": 1, "clip@cold@c": 3, "red@firecracker@y": 2}
+
+
+def test_legacy_floor_is_a_reservation_floor(tmp_path, monkeypatch):
+    # on a node that fits, a non-overflow pool's reservation is raised to its legacy ceiling
+    # (starve W4: W's legacy ceiling is 4); the overflow pool's is left alone
+    specs = _capture_specs(monkeypatch)
+    _het_plan(tmp_path, _starve_pools(4), 10 * 1024)
+    assert specs["clip@firecracker@w"].reserved == 4
+    assert specs["clip@cold@c"].reserved == 0
+
+
+def test_sizer_publishes_served_engine_count(tmp_path, monkeypatch):
+    from blastbox.host.cli import _start_node_sizer
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINES", "aa,bb")
+    monkeypatch.setenv("BLASTBOX_NODE_RESOURCE_MANAGEMENT", "1")
+    monkeypatch.setenv("BLASTBOX_NODE_SHARE_DIR", str(tmp_path))
+    for served in (["aa", "bb"], ["aa"]):
+        stop, thread, sizer = _start_node_sizer(_Pool(), served, InMemoryJobStore(),
+                                                "firecracker")
+        try:
+            (snap,) = FileNodeShare(str(tmp_path)).read_all(max_age_s=60, now=time.time())
+            assert snap.engines == len(served)
+        finally:
+            stop.set()
+            thread.join(2.0)
+            sizer.remove_own_snapshot()
