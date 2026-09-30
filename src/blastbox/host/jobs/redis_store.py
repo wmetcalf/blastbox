@@ -17,7 +17,13 @@ import uuid
 
 from redis.exceptions import WatchError
 
-from blastbox.host.jobs.base import Job, JobStatus, filter_sort_window, normalize_engine_filter
+from blastbox.host.jobs.base import (
+    Job,
+    JobStatus,
+    filter_sort_window,
+    normalize_engine_filter,
+    untargeted_cutoff,
+)
 
 _log = logging.getLogger("blastbox.host.jobs.redis_store")
 
@@ -62,6 +68,10 @@ class RedisJobStore:
     (it must also cover ``claim_next`` to move the bottleneck, and stay byte-identical
     to the scan path under the backend-uniform pagination tests).
     """
+
+    #: Honours ``claim_next(untargeted_min_age_s=)`` (checked by the Dispatcher at construction).
+    supports_untargeted_delay = True
+
 
     def __init__(self, client, *, ttl_seconds: int = _TTL_SECONDS) -> None:
         self._r = client
@@ -257,7 +267,8 @@ class RedisJobStore:
 
     def claim_next(self, *, claimant_tier: str | None = None,
                    engine: "str | Collection[str] | None" = None,
-                   exclude: "Collection[str]" = ()) -> Job | None:
+                   exclude: "Collection[str]" = (),
+                   untargeted_min_age_s: float = 0.0) -> Job | None:
         """Atomically claim the oldest QUEUED job.
 
         Scans all keys with the store prefix, picks the oldest QUEUED job,
@@ -273,6 +284,9 @@ class RedisJobStore:
         excluded = frozenset(exclude)
         while True:
             now = time.time()
+            # delayed claimant (see JobStore.claim_next): an UNTARGETED job must be at least this
+            # old; epoch created_at vs the same time.time() claimable_after is compared against.
+            cutoff = untargeted_cutoff(untargeted_min_age_s, now)
             candidates: list[tuple[float, str, str]] = []
             for k in self._r.scan_iter(match=_PREFIX + "*", count=200):
                 raw = self._r.get(k)
@@ -290,6 +304,8 @@ class RedisJobStore:
                 # skip DEFERRED jobs (claimable_after in the future) — a capacity-blocked cold job
                 # must not be reclaimed ahead of claimable work
                 if job.claimable_after is not None and job.claimable_after > now:
+                    continue
+                if cutoff is not None and job.target_tier is None and job.created_at > cutoff:
                     continue
                 if job.status == JobStatus.QUEUED:
                     # Decode key to str for comparison; fakeredis may return bytes
@@ -319,6 +335,9 @@ class RedisJobStore:
                     if job.target_tier is not None and job.target_tier != claimant_tier:
                         continue
                     if job.claimable_after is not None and job.claimable_after > now:
+                        continue
+                    if (cutoff is not None and job.target_tier is None
+                            and job.created_at > cutoff):
                         continue
                     if engines is not None and job.engine not in engines:
                         continue

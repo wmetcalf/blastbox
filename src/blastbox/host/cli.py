@@ -529,6 +529,8 @@ def _start_node_sizer(
     concurrency=1,
     concurrency_gate=None,
     cold_slot_ram_mib=0.0,
+    claim_untargeted_after_s=0.0,
+    warm_only=False,
 ):
     """Start the opt-in node self-sizer for this dispatcher's warm pool, or return None.
 
@@ -670,6 +672,18 @@ def _start_node_sizer(
             untargeted_backlog_fn=local_backlog_fn(store, served, untargeted_only=True),
             concurrency_gate=concurrency_gate,  # sizer drives its live limit on each resize
             cold_slot_ram_mib=cold_slot_ram_mib,  # price cold permits by the cold worker footprint
+            # a claim delay makes this pool OVERFLOW-ONLY for untargeted work: published so the
+            # planner seats the engine's untargeted backlog on its prompt pools first and
+            # spills only what they cannot take to this one.
+            # SINGLE-ENGINE dispatchers only: a multi-engine one publishes its COMBINED backlog
+            # under mine[0]'s name, and a prompt peer of that engine may not run the others — so
+            # spilling on it could leave their untargeted jobs unsized. It publishes False (the
+            # pre-flag even split), which only ever over-sizes it.
+            overflow_only=claim_untargeted_after_s > 0 and len(served) == 1,
+            # published as `engines`: an engine with a multi-engine pool is never spill-split
+            served_engines=len(served),
+            # a warm-only dispatcher (no cold fallback) with a broken warm path stops serving
+            warm_only=warm_only,
         )
         # Print the status FIRST, then start the thread LAST — otherwise if this print raises
         # (broken pipe / closed stderr) the except below returns None while the thread is
@@ -754,6 +768,30 @@ def _canary_settings() -> "tuple[bool, float]":
     return enabled, interval
 
 
+def _claim_untargeted_after_s() -> float:
+    """``BLASTBOX_CLAIM_UNTARGETED_AFTER_S``: seconds this dispatcher leaves an UNTARGETED job to
+    its peers before it will claim it (see ``JobStore.claim_next(untargeted_min_age_s=)``).
+
+    Set on the COLD dispatcher of a warm+cold pair (e.g. ``3``) so a warm dispatcher with a free
+    slot takes fresh work first and cold is the overflow. Unset/empty/``0`` = no delay (default).
+    Unlike the other age knobs, a value that doesn't parse as a finite number >= 0 (``nan``,
+    ``inf``, negatives, garbage) REFUSES startup (ValueError, before the pool spawns anything)
+    rather than falling back to 0: a typo'd delay silently becoming "no delay" would turn an
+    overflow-only cold dispatcher back into one racing its warm peer for every untargeted job."""
+    raw = (os.environ.get("BLASTBOX_CLAIM_UNTARGETED_AFTER_S") or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(
+            f"BLASTBOX_CLAIM_UNTARGETED_AFTER_S={raw!r} is not a finite number of seconds >= 0; "
+            "unset it (or 0) for no delay.")
+    return value
+
+
 def _require_shared_blob_store() -> bool:
     """Has the operator declared this a fleet whose results MUST be shared?
 
@@ -822,6 +860,37 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         tier = _pool_rt
     else:
         tier = "cold"
+
+    # Opt-in claim delay for UNTARGETED jobs (overflow posture for a cold dispatcher sharing a
+    # store with a warm one). Refused up front where it cannot be honoured, rather than on every
+    # claim or -- worse -- silently: a delay that is dropped hands the overflow dispatcher exactly
+    # the fresh work it was configured to leave alone.
+    claim_untargeted_after_s = _claim_untargeted_after_s()
+    if claim_untargeted_after_s:
+        from blastbox.host.jobs.http_store import HttpJobStore
+
+        if isinstance(store, HttpJobStore):
+            raise ValueError(
+                "BLASTBOX_CLAIM_UNTARGETED_AFTER_S is not supported with a control-plane job "
+                "store (BLASTBOX_DATABASE_URL=https://...): /v1/nodes/claim does not carry it. "
+                "Unset it on this dispatcher.")
+        # BEFORE pool.start(): the Dispatcher refuses this too, but only after the pool has spawned
+        # warm slots, and the CLI's pool.stop() does not cover construction -- orphaned slots.
+        ttl = float(os.environ.get("BLASTBOX_MAX_QUEUED_AGE_S") or "0")
+        if 0 < ttl <= claim_untargeted_after_s:
+            raise ValueError(
+                f"BLASTBOX_CLAIM_UNTARGETED_AFTER_S ({claim_untargeted_after_s:g}) must be below "
+                f"BLASTBOX_MAX_QUEUED_AGE_S ({ttl:g}): the queued-job reaper would expire untargeted "
+                "work before this dispatcher may claim it.")
+        if pool is not None and getattr(pool.runtime, "dispatch_style", "file") == "network":
+            raise ValueError(
+                "BLASTBOX_CLAIM_UNTARGETED_AFTER_S is supported by the container dispatcher only, "
+                "not the network-endpoint tiers (aws/static/cascade). Unset it on this dispatcher.")
+        # the store's capability — the Dispatcher checks it too, but only after pool.start(),
+        # outside the pool's cleanup: a refused store would orphan the warm workers it spawned
+        from blastbox.host.dispatch import require_untargeted_delay_support
+
+        require_untargeted_delay_support(store)
 
     warm_only = os.environ.get("BLASTBOX_DISPATCH_WARM_ONLY", "").strip().lower() in (
         "1",
@@ -1046,6 +1115,9 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
         # live COLD-admission cap driven by the node autosizer (None when unmanaged) — bounds
         # concurrent cold workers to the budget's cold headroom (ceiling − warm reservation).
         concurrency_gate=concurrency_gate,
+        # Opt-in (0 = off): leave UNTARGETED jobs younger than this to a warm peer
+        # (BLASTBOX_CLAIM_UNTARGETED_AFTER_S; parsed and validated above).
+        claim_untargeted_after_s=claim_untargeted_after_s,
     )
     # Opt-in node self-sizer started INSIDE the try below, so pool.stop() in the finally
     # always runs — even if sizer setup raises (bad BLASTBOX_NODE_* / unwritable share_dir)
@@ -1066,6 +1138,8 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
                 dispatch_concurrency,
                 concurrency_gate,
                 cold_slot_ram_mib,
+                claim_untargeted_after_s,
+                warm_only,
             )
         # If we pre-shrank the pool for the autosizer but the sizer did NOT start (incomplete
         # inventory, unwritable share_dir, setup error), nothing will ever size it — restore

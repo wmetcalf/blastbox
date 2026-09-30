@@ -39,7 +39,7 @@ import tempfile
 import time as _time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Optional, Protocol
 
 
 @dataclass(frozen=True)
@@ -107,6 +107,53 @@ class DemandSnapshot:
                                  # engine's tier-pools (fc+gvisor of one engine drain the same
                                  # untargeted jobs) instead of once per tier — else that engine's
                                  # demand doubles. 0 = all backlog is tier-targeted (no dedup).
+    overflow_only: Optional[bool] = None
+                                 # this pool DECLINES fresh untargeted work (a claim delay,
+                                 # BLASTBOX_CLAIM_UNTARGETED_AFTER_S > 0): it only takes an untargeted
+                                 # job once the prompt pools have left it long enough. Published so
+                                 # the planner can SPILL: the engine's untargeted count goes to its
+                                 # prompt pools up to their capacity (never below their legacy even
+                                 # share, which is also a ceiling floor), and only the residue to the
+                                 # overflow-only pools (DispatcherSizer.tick). A current publisher
+                                 # ALWAYS sets True/False; None = the key was ABSENT (a peer from
+                                 # before the field). Presence matters, not just value: an older
+                                 # planner splits evenly, so spilling applies only while EVERY
+                                 # snapshot on the NODE carries all five of this change's fields (see
+                                 # `lease` below) — else old and new planners would compute
+                                 # different plans for one node.
+    lease: Optional[bool] = None
+                                 # an ORPHAN LEASE (DispatcherSizer.publish_orphan_lease) = True: a
+                                 # stopped dispatcher's final snapshot, reserving slots it could not
+                                 # reap. Nothing behind it claims work, so the planner never counts
+                                 # it as an untargeted drainer — it keeps only its reservation. A
+                                 # live pool publishes False; None = the key was ABSENT. An older
+                                 # reader drops the key and treats the lease as it always did.
+                                 # VERSION-GATE INVARIANT: spilling (DispatcherSizer.tick) is
+                                 # enabled only when every snapshot on the node carries ALL of
+                                 # `overflow_only`, `lease`, `running`, `engines` and `serving` —
+                                 # they came in one change (#193), and a binary that published one without
+                                 # understanding the others would plan differently (e.g. read a
+                                 # current lease as a prompt pool). Keying on all of them ENFORCES
+                                 # that. Any FUTURE field that changes the split must be added to
+                                 # that presence check too.
+    running: Optional[int] = None
+                                 # of `assigned` (the RESERVATION: resident slots, idle and warming
+                                 # included, + cold in flight), the part actually RUNNING jobs, in the
+                                 # same warm-slot units (busy warm slots + cold in flight). The spill
+                                 # capacity reads it: an idle ready slot can still absorb a queued
+                                 # job, a busy one can't. None = the key was ABSENT (older peer).
+    engines: Optional[int] = None
+                                 # how many engines the publishing dispatcher SERVES. Its backlog is
+                                 # the combined count of all of them, published under its first
+                                 # engine's name, so an engine with a multi-engine pool (> 1) is never
+                                 # split with the spill rules (that would hand another engine's jobs
+                                 # to single-engine peers). None = the key was ABSENT (older peer).
+    serving: Optional[bool] = None
+                                 # whether the dispatcher can take queued work now: False only when
+                                 # it is warm-only (no cold fallback) and its pool can't serve
+                                 # (WarmPool.is_serving: restores failing, nothing ready or busy). A prompt
+                                 # pool that isn't serving is given no untargeted capacity, so the
+                                 # spill goes to the overflow pools. None = the key was ABSENT.
 
 
 class NodeShare(Protocol):
@@ -366,6 +413,12 @@ def _valid(snap: DemandSnapshot) -> bool:
         and _finite_in(snap.budget_vcpus, 0, 1024 * _MAX_CEILING_SANE)
         and _finite_in(snap.stale_after_s, 0, _MAX_TS)
         and _finite_in(snap.untargeted_backlog, 0, _MAX_COUNT)
+        and (snap.overflow_only is None or isinstance(snap.overflow_only, bool))
+        and (snap.lease is None or isinstance(snap.lease, bool))
+        and (snap.running is None or _finite_in(snap.running, 0, _MAX_COUNT))
+        and (snap.engines is None or (isinstance(snap.engines, int)
+                                      and _finite_in(snap.engines, 1, _MAX_CEILING_SANE)))
+        and (snap.serving is None or isinstance(snap.serving, bool))
     )
 
 

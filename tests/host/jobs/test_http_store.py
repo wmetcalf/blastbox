@@ -432,3 +432,28 @@ class TestTheScopedBacklog:
         queued(backing)
         with pytest.raises(NodeStoreUnsupported):
             node_store(control_plane, fleet, "alpha").list()
+
+
+# --- untargeted_min_age_s over the node path ---------------------------------------------------
+
+@pytest.mark.parametrize("delay", [3.0, 0.5])
+def test_a_claim_delay_is_refused_not_silently_dropped(control_plane, fleet, backing, delay):
+    """The node route does not carry `untargeted_min_age_s`, so the node store cannot honour it.
+    Dropping it would hand a delayed (overflow) claimant exactly the fresh work it was configured
+    to leave for a warm slot, while looking configured. Refuse before any request is made."""
+    queued(backing)
+    calls: list = []
+    s = node_store(control_plane, fleet, "alpha")
+    real = s._transport
+    s._transport = lambda *a, **kw: (calls.append(a), real(*a, **kw))[1]
+    with pytest.raises(ValueError, match="untargeted_min_age_s"):
+        s.claim_next(engine="clamav", untargeted_min_age_s=delay)
+    assert calls == []
+    assert backing.get("job-1").status == JobStatus.QUEUED
+
+
+def test_a_zero_claim_delay_is_the_ordinary_node_claim(control_plane, fleet, backing):
+    queued(backing)
+    s = node_store(control_plane, fleet, "alpha")
+    job = s.claim_next(engine="clamav", untargeted_min_age_s=0.0)
+    assert job is not None and job.job_id == "job-1"

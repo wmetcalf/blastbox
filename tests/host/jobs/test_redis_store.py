@@ -279,3 +279,30 @@ def test_claim_rechecks_engine_inside_watch(monkeypatch):
     # "other" → no candidate → None. Without the watched engine re-check this would claim a foreign job.
     assert store.claim_next(engine="mine") is None
     assert store.get(job.job_id).status is JobStatus.QUEUED   # never claimed
+
+
+def test_claim_rechecks_untargeted_age_inside_watch(monkeypatch):
+    # The delayed-claimant predicate (untargeted_min_age_s) must be re-validated in the watched
+    # section like every other one: the scan saw the job pinned to this claimant's tier (exempt
+    # from the delay), and by the watched re-read it is a YOUNG UNTARGETED job -- not claimable.
+    import time
+
+    import blastbox.host.jobs.redis_store as rs
+    store = _make_store()
+    job = _make_job(filename="young.docx")
+    job.created_at = time.time()
+    store.create(job)
+
+    real_decode = rs._decode_job
+    calls = {"n": 0}
+
+    def flaky_decode(raw):
+        j = real_decode(raw)
+        calls["n"] += 1
+        if j is not None and calls["n"] == 1:   # only the first scan sees it pinned to "cold"
+            j.target_tier = "cold"
+        return j
+
+    monkeypatch.setattr(rs, "_decode_job", flaky_decode)
+    assert store.claim_next(claimant_tier="cold", untargeted_min_age_s=30.0) is None
+    assert store.get(job.job_id).status is JobStatus.QUEUED

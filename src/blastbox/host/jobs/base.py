@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import enum
+import math
 import time
 import uuid
 from builtins import list as _list  # explicit ref: JobStore.list shadows the builtin
@@ -176,6 +177,30 @@ def normalize_engine_filter(engine: "str | Collection[str] | None") -> tuple[str
     return tuple(engine) or None
 
 
+def untargeted_cutoff(untargeted_min_age_s: float, now: float) -> float | None:
+    """The ``created_at`` an UNTARGETED job must be at or before for a delayed claimant to take it,
+    or None when there is no delay (``0`` -- every store's default, and the old behaviour).
+
+    ``now`` is the claiming host's epoch ``time.time()`` (what each store compares
+    ``claimable_after`` against); ``created_at`` is epoch seconds stamped by the SUBMITTING host
+    (``Job.new``). Those are two hosts' clocks, unlike ``claimable_after`` (written by dispatchers):
+    submitter-vs-claimant skew shifts the effective delay by the skew, and a submitter running
+    N seconds behind cancels it. Keep hosts NTP-synced. Never host-monotonic time.
+
+    Raises ValueError for ``nan``/``inf``/negatives rather than coercing: ``nan`` compares false
+    against every age, so it would silently stop the claimant from ever taking an untargeted job,
+    and ``inf`` does the same on purpose-looking terms. The CLI refuses such an env value at
+    startup too (before the pool spawns anything); a direct caller passing nonsense is a bug and
+    should hear about it."""
+    value = float(untargeted_min_age_s)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(
+            f"untargeted_min_age_s must be a finite value >= 0, got {untargeted_min_age_s!r}")
+    if value == 0:
+        return None
+    return now - value
+
+
 # Whitelist of fields ``list(sort=...)`` accepts. A whitelist (not a free column
 # name) keeps the SQL backend injection-safe and the in-memory/Redis backends
 # uniform. Anything else falls back to newest-first.
@@ -315,7 +340,8 @@ class JobStore(Protocol):
 
     def claim_next(self, *, claimant_tier: str | None = None,
                    engine: str | Collection[str] | None = None,
-                   exclude: Collection[str] = ()) -> Job | None:
+                   exclude: Collection[str] = (),
+                   untargeted_min_age_s: float = 0.0) -> Job | None:
         """Atomically claim the oldest eligible QUEUED job → RUNNING. ``claimant_tier`` routes by
         ``target_tier``; ``engine`` (when set) restricts the claim to jobs for that engine — a single
         name OR the SET of engines this claimant handles. So a VM dispatcher (``engine="authenticode"``)
@@ -328,7 +354,16 @@ class JobStore(Protocol):
         (#178): `claim_next` is strictly oldest-first, so stepping over them AFTER they were
         handed out meant a wall of refused jobs deeper than the walk's budget was the same
         prefix on every poll, and nothing behind it was ever reached. Empty = no exclusion
-        (every existing caller; unchanged behaviour)."""
+        (every existing caller; unchanged behaviour).
+
+        ``untargeted_min_age_s`` makes this claimant DECLINE an UNTARGETED job (``target_tier``
+        NULL) until it is at least that many seconds old, measured from ``created_at`` against the
+        same epoch clock the store compares ``claimable_after`` with (see ``untargeted_cutoff``).
+        Jobs targeted at ``claimant_tier`` are claimable immediately regardless; jobs targeted at
+        another tier stay unclaimable as always; ``claimable_after`` and ``engine`` still apply
+        (all conditions must hold). It lets a cold dispatcher sharing a store with a warm one leave
+        fresh work for a free warm slot and take it only as overflow. ``0`` (default) = no delay,
+        unchanged behaviour. ``nan``/``inf``/negative raise ValueError."""
         ...
     def delete(self, job_id: str) -> None: ...
 

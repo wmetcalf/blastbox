@@ -23,6 +23,7 @@ import os
 import secrets
 import threading
 import time
+from dataclasses import replace
 from typing import Callable, Optional
 
 from .node_config import EngineNode, NodeConfig, _is_safe_slug
@@ -51,6 +52,43 @@ def _pool_key(engine: str, tier: str, instance: str = "") -> str:
     return "@".join([engine, *([tier] if tier else []), *([instance] if instance else [])])
 
 
+def _even_int(total: int, n: int) -> list[int]:
+    """Split an integer count over n ranked pools, the remainder to the lowest ranks (sums to it)."""
+    base, rem = divmod(max(0, total), max(1, n))
+    return [base + (1 if rank < rem else 0) for rank in range(n)]
+
+
+def _fill_int(total: int, caps: list[int]) -> tuple[list[int], int]:
+    """Split `total` evenly over ranked pools, none past its cap; the surplus moves to the pools
+    with room left (same remainder rule each round). Returns (shares, what did not fit).
+    Terminates in ≤ len(caps)+1 rounds: a round either places everything or saturates a pool."""
+    alloc = [0] * len(caps)
+    rest = max(0, total)
+    active = [i for i, c in enumerate(caps) if c > 0]
+    while rest > 0 and active:
+        for i, give in zip(active, _even_int(rest, len(active))):
+            take = min(give, caps[i] - alloc[i])
+            alloc[i] += take
+            rest -= take
+        active = [i for i in active if alloc[i] < caps[i]]
+    return alloc, rest
+
+
+def _fill_float(total: float, caps: list[float]) -> tuple[list[float], float]:
+    """The float twin of _fill_int, for the planner's (fractional) demand."""
+    alloc = [0.0] * len(caps)
+    rest = max(0.0, float(total))
+    active = [i for i, c in enumerate(caps) if c > 0]
+    while rest > 1e-9 and active:
+        each = rest / len(active)
+        for i in active:
+            take = min(each, caps[i] - alloc[i])
+            alloc[i] += take
+            rest -= take
+        active = [i for i in active if caps[i] - alloc[i] > 1e-9]
+    return alloc, max(0.0, rest)
+
+
 class DispatcherSizer:
     def __init__(
         self,
@@ -77,11 +115,24 @@ class DispatcherSizer:
                                               # never exceed the budget-allocated ceiling.
         cold_slot_ram_mib: float = 0.0,       # cold worker footprint (BLASTBOX_WORKER_MEMORY) in
                                               # MiB; prices cold permits. 0 = unknown → warm 1:1.
+        warm_only: bool = False,              # BLASTBOX_DISPATCH_WARM_ONLY: no cold fallback on a
+                                              # warm miss — only then can a broken warm path stop
+                                              # this dispatcher serving (published as `serving`)
+        served_engines: int = 1,              # how many engines this dispatcher serves (its backlog
+                                              # is their combined count, published as `engines`)
+        overflow_only: bool = False,          # this dispatcher declines fresh UNTARGETED jobs
+                                              # (BLASTBOX_CLAIM_UNTARGETED_AFTER_S > 0). Published so
+                                              # the engine's untargeted backlog is sized onto its
+                                              # prompt pools first; this pool gets what they
+                                              # cannot take (the spill residue).
     ) -> None:
         self._engine = engine
         self._pool = pool
         self._gate = concurrency_gate
         self._cold_slot_ram_mib = max(0.0, float(cold_slot_ram_mib))
+        self._overflow_only = bool(overflow_only)
+        self._served_engines = max(1, int(served_engines))
+        self._warm_only = bool(warm_only)
         self._share = share
         self._config = config
         self._runtime = (runtime or "").strip().lower()
@@ -131,6 +182,14 @@ class DispatcherSizer:
         self._count_thread: Optional[threading.Thread] = None   # the single outstanding backlog
         self._count_result: dict = {}                           # count (a wedged one mustn't spawn
                                                                 # a new thread every tick)
+
+    def _pool_needs_probe(self) -> bool:
+        """WarmPool.needs_recovery_probe(); False for a pool without the signal."""
+        fn = getattr(self._pool, "needs_recovery_probe", None)
+        try:
+            return bool(fn()) if callable(fn) else False
+        except Exception:
+            return False
 
     def _cold_only(self) -> bool:
         """A pool-less cold dispatcher: no warm pool to resize, just a gate + a cold reservation.
@@ -263,6 +322,26 @@ class DispatcherSizer:
             cif = int(getattr(self._gate, "in_flight", 0)) if self._gate is not None else 0
             return max(aw, res) + math.ceil(cif * cold_units)
 
+        def _serving() -> bool:
+            # NOT serving only when this dispatcher is WARM-ONLY (no cold fallback on a warm miss)
+            # AND its pool can't serve (WarmPool.is_serving: restores failing, nothing ready or
+            # busy). A dispatcher that falls back to cold still claims and runs untargeted work; a
+            # pool-less (cold) dispatcher or a pool type without the signal counts as serving.
+            if not self._warm_only:
+                return True
+            fn = getattr(self._pool, "is_serving", None)
+            try:
+                return bool(fn()) if callable(fn) else True
+            except Exception:
+                return True
+
+        def _running() -> int:
+            # of the reservation, the part actually RUNNING jobs (busy warm slots + cold in flight,
+            # in warm-slot units) — idle/warming resident slots excluded: they can still take work
+            aw = int(getattr(self._pool, "assigned_count", 0))
+            cif = int(getattr(self._gate, "in_flight", 0)) if self._gate is not None else 0
+            return aw + math.ceil(cif * cold_units)
+
         # Compute OUR view of the node budget up front so we can PUBLISH it: readers reconcile to
         # one budget (the elementwise MIN across the view), so a dispatcher with a different
         # headroom/vcpu config or adaptive scale can't plan against a bigger budget than a peer
@@ -281,7 +360,9 @@ class DispatcherSizer:
                 refresh_s=refresh_s, balancing=self._config.balancing,
                 budget_ram_mib=my_budget.ram_mib, budget_vcpus=my_budget.vcpus,
                 stale_after_s=self._config.stale_after_s,
-                untargeted_backlog=min(backlog, self._last_untargeted))
+                untargeted_backlog=min(backlog, self._last_untargeted),
+                overflow_only=self._overflow_only, lease=False, running=_running(),
+                engines=self._served_engines, serving=_serving())
 
         # HEARTBEAT before the (possibly-slow) count: publish a fresh-ts snapshot with the last
         # tick's backlog so peers keep seeing us alive even when THIS count — a huge shared-
@@ -486,74 +567,238 @@ class DispatcherSizer:
             return base + (1 if rank < rem else 0)
 
         # UNTARGETED jobs (target_tier IS NULL) are drained by EVERY tier of the engine, so their
-        # demand is counted ONCE across ALL the engine's pools (fc + gvisor + replicas), not per
+        # demand is counted ONCE across the engine's pools (fc + gvisor + replicas), not per
         # tier. TARGETED jobs stay tier-scoped (split across same-(engine,tier) replicas only).
-        engine_pools: dict[str, int] = {}
+        #
+        # LEGACY split (every engine, unless it SPILLS — below): each pool's own untargeted count
+        # divided evenly over every pool of the engine (leases included), the integer one with the
+        # remainder to the lowest-ranked pools. Exactly the pre-#193 plan.
+        #
+        # SPILLING engines (BLASTBOX_CLAIM_UNTARGETED_AFTER_S): an engine with a live OVERFLOW-ONLY
+        # pool, which declines fresh untargeted work, on a node where the version gate is on and
+        # every live pool of the engine serves that engine alone. Its untargeted count — the MEAN
+        # of its live pools' reports, so one stale-high report can't inflate it — goes to its
+        # PROMPT pools first, each up to its CAPACITY = its planner cap − the jobs it is actually
+        # RUNNING (`running`, NOT the reservation `assigned`: idle/warming resident slots can still
+        # take a queued job; counting them as used would spill the work and REAP ready warm slots)
+        # − the jobs queued TARGETED at its tier; 0 while it is not SERVING (a failure streak with
+        # nothing ready or busy — it can't claim). A SERVING prompt pool's untargeted demand and
+        # warm share are the LARGER of that capacity fill and its legacy share (so it never weighs
+        # less than before); a not-serving one gets only its (zero) fill plus the one-slot
+        # recovery probe below; the
+        # overflow pools get the residue, count − Σ min(prompt demand, prompt capacity) — which is
+        # all of it when the prompt pools are at their cap. Orphan leases (lease=True) claim
+        # nothing and get 0. An engine with only overflow pools splits the count evenly over them.
+        #
+        # VERSION GATE (NODE-wide): spilling applies only when EVERY snapshot in the view — every
+        # engine's pools, leases included — CARRIES all of `overflow_only`, `lease`, `running`,
+        # `engines` and `serving` (presence, not value; they came in one change, and a binary knowing some but
+        # not all would plan differently — see DemandSnapshot.lease). The budget is node-wide: each
+        # planner plans ALL engines' pools and takes its own slice, so while any snapshot lacks a
+        # field every planner (old and new) uses the legacy split everywhere and their plans agree.
+        # A current lease carries the fields, so it can't switch the gate off; a pre-field lease
+        # can (conservatively: an old planner may still be live on the node).
+        #
+        # MULTI-ENGINE pools: a dispatcher serving several engines publishes its COMBINED backlog
+        # under its first engine's name (`engines` > 1). Averaging or redistributing that count to
+        # single-engine peers would size them for jobs they can't claim, so an engine with such a
+        # live pool never spills (legacy split). Such a dispatcher also never publishes
+        # overflow_only=True (cli).
         engine_insts: dict[str, list[tuple[str, str]]] = {}
+        node_all_carry = True
         for s in snaps:
-            engine_pools[s.engine] = engine_pools.get(s.engine, 0) + 1
             engine_insts.setdefault(s.engine, []).append((s.tier, s.instance))
-        for _elst in engine_insts.values():
-            _elst.sort()
+            # ALL of this change's fields present (see DemandSnapshot.lease: the gate's version
+            # invariant)
+            node_all_carry = (node_all_carry and getattr(s, "overflow_only", None) is not None
+                              and getattr(s, "lease", None) is not None
+                              and getattr(s, "running", None) is not None
+                              and getattr(s, "engines", None) is not None
+                              and getattr(s, "serving", None) is not None)
+        # LEGACY split: every pool of the engine, sorted (deterministic rank). On a CURRENT node
+        # (gate on — every planner reads `lease`) orphan leases are left out: a lease claims
+        # nothing, so counting it in the denominator sized the live pools for only part of the
+        # queue (a929bc9 does count it; on a mixed-version node we must too, so plans agree).
+        untargeted_insts: dict[str, list[tuple[str, str]]] = {
+            eng: sorted(insts) for eng, insts in engine_insts.items()}
+        if node_all_carry:
+            untargeted_insts = {
+                eng: sorted((s.tier, s.instance) for s in snaps
+                            if s.engine == eng and getattr(s, "lease", False) is not True)
+                for eng in engine_insts}
 
         def _split(s) -> tuple[int, int]:
             """(targeted-to-this-tier, untargeted) from a snapshot's backlog."""
             u = max(0, min(s.backlog, int(getattr(s, "untargeted_backlog", 0))))
             return s.backlog - u, u
 
-        def _backlog_demand(s) -> float:
-            targeted, untargeted = _split(s)
-            return (_share(targeted, s.engine, s.tier)                  # tier-scoped, per replica
-                    + untargeted / max(1, engine_pools.get(s.engine, 1)))  # engine-wide, per pool
+        def _cap(s) -> int:
+            # the pool's planner cap, exactly as its PoolSpec.max_ceiling below
+            return max(1, _int_share(s.max_ceiling, s.engine, s.tier, s.instance), s.assigned)
+
+        def _legacy_f(s) -> float:
+            return _split(s)[1] / max(1, len(untargeted_insts.get(s.engine, [None])))
+
+        def _legacy_i(s) -> int:
+            lst = untargeted_insts.get(s.engine, [])
+            if (s.tier, s.instance) not in lst:
+                return _split(s)[1] // max(1, len(lst))
+            return _even_int(_split(s)[1], len(lst))[lst.index((s.tier, s.instance))]
+
+        def _live(s) -> bool:
+            return getattr(s, "lease", False) is not True
+
+        def _serving_of(s) -> bool:
+            return getattr(s, "serving", True) is not False
+
+        # the SPILLING engines (see above)
+        spilling: set[str] = set()
+        if node_all_carry:
+            for eng in engine_insts:
+                live = [s for s in snaps if s.engine == eng and _live(s)]
+                if (any(getattr(s, "overflow_only", None) is True for s in live)
+                        and all(getattr(s, "engines", 1) == 1 for s in live)):
+                    spilling.add(eng)
+
+        # SPILLING engines: each pool's untargeted share (float → demand, int → warm target), keyed
+        # (engine, tier, instance). Leases and absent pools get 0.
+        u_float: dict[tuple[str, str, str], float] = {}
+        u_int: dict[tuple[str, str, str], int] = {}
+        # a spilling engine's prompt pools: their integer share of the TARGETED work, over live
+        # same-tier replicas (leases excluded) — the same term the capacity used, reused by the
+        # warm target so the two agree
+        tgt_int: dict[tuple[str, str, str], int] = {}
+        # RECOVERY PROBE: a spilling engine's prompt pool that is NOT serving (warm-only, restores
+        # failing, nothing ready) gets no untargeted capacity — and with a small queue its legacy
+        # integer share can be 0, leaving it at warm 0: it would never spawn, never prove the base
+        # healed, never serve again. So the shared plan reserves exactly ONE warm slot for it (a
+        # min_warm floor, seated by plan_sizes under the budget like every floor, computed from the
+        # published snapshot so every planner agrees) and its own warm target is at least 1. On a
+        # still-broken base the probe keeps failing and the pool stays not serving; once the base
+        # heals it promotes, the pool is serving (a ready slot), claims, serves → streak reset.
+        # This also bounds stale failures (they count from any generation): at worst one restore.
+        probe: set[tuple[str, str, str]] = set()
+        for eng in sorted(spilling):
+            live = sorted((s for s in snaps if s.engine == eng and _live(s)),
+                          key=lambda s: (s.tier, s.instance))
+            total_u = sum(_split(s)[1] for s in live)
+            count = total_u / len(live)
+            count_i = (2 * total_u + len(live)) // (2 * len(live))
+            prompt = [s for s in live if getattr(s, "overflow_only", None) is not True]
+            ovf = [s for s in live if getattr(s, "overflow_only", None) is True]
+            if prompt:
+                def _running_of(s) -> int:
+                    return int(getattr(s, "running", None) or 0)
+                # a prompt pool that is NOT SERVING (a failure streak, nothing ready or busy)
+                # can't claim: no capacity, so its share spills to the overflow pools
+                # the TARGETED work that occupies a prompt pool is split over its LIVE same-tier
+                # replicas only: an orphan lease can't claim targeted jobs, so counting it would
+                # make the live pool look roomier than it is (the plain targeted DEMAND split keeps
+                # a929bc9's replica list; only this capacity term leaves leases out)
+                def _live_reps(s) -> list[str]:
+                    return sorted(x.instance for x in live
+                                  if x.engine == s.engine and x.tier == s.tier)
+
+                def _tgt_f(s) -> float:
+                    return _split(s)[0] / max(1, len(_live_reps(s)))
+
+                def _tgt_i(s) -> int:
+                    reps = _live_reps(s)
+                    return _even_int(_split(s)[0], len(reps))[reps.index(s.instance)]
+                caps_f = [max(0.0, _cap(s) - _running_of(s) - _tgt_f(s)) if _serving_of(s)
+                          else 0.0 for s in prompt]
+                caps_i = [max(0, _cap(s) - _running_of(s) - _tgt_i(s)) if _serving_of(s)
+                          else 0 for s in prompt]
+                for s in prompt:
+                    tgt_int[(eng, s.tier, s.instance)] = _tgt_i(s)
+                    if not _serving_of(s):
+                        probe.add((eng, s.tier, s.instance))
+                pf, _ = _fill_float(count, caps_f)
+                pi, _ = _fill_int(count_i, caps_i)
+                # the legacy floor — on demand AND on the integer warm share — only for a SERVING
+                # pool. A broken one gets neither budget priority nor warm slots for work it can't
+                # claim (its restores may hang: warming slots are published as reserved and would
+                # hold a full legacy share in place). It recovers through the RECOVERY PROBE: one
+                # warm slot kept targeted (see `probe` above), not through its legacy share.
+                pf = [max(f, _legacy_f(s)) if _serving_of(s) else f for s, f in zip(prompt, pf)]
+                pi = [max(i, _legacy_i(s)) if _serving_of(s) else i for s, i in zip(prompt, pi)]
+                rest_f = max(0.0, count - sum(min(f, c) for f, c in zip(pf, caps_f)))
+                rest_i = max(0, count_i - sum(min(i, c) for i, c in zip(pi, caps_i)))
+                groups = [(prompt, pf, pi),
+                          (ovf, [rest_f / len(ovf)] * len(ovf), _even_int(rest_i, len(ovf)))]
+            else:
+                groups = [(ovf, [count / len(ovf)] * len(ovf), _even_int(count_i, len(ovf)))]
+            for pools, fl, it in groups:
+                for s, f, i in zip(pools, fl, it):
+                    u_float[(eng, s.tier, s.instance)] = f
+                    u_int[(eng, s.tier, s.instance)] = i
+
+        def _untargeted_demand(s, legacy: bool = False) -> float:
+            if s.engine in spilling and not legacy:
+                return u_float.get((s.engine, s.tier, s.instance), 0.0)
+            return _legacy_f(s)
+
+        def _backlog_demand(s, legacy: bool = False) -> float:
+            return (_share(_split(s)[0], s.engine, s.tier)              # tier-scoped, per replica
+                    + _untargeted_demand(s, legacy))                    # engine-wide
 
         def _engine_int_share(total: int, engine: str, tier: str, instance: str) -> int:
-            # like _int_share, but over ALL of the engine's pools (every tier) — for splitting the
-            # UNTARGETED count so the shares still SUM to it across the engine's tiers + replicas.
-            lst = engine_insts.get(engine, [(tier, instance)])
+            # this pool's integer share of the engine's UNTARGETED count: the spill split for a
+            # spilling engine, else the legacy remainder split over every pool (a pool absent from
+            # the view gets the base share).
+            if engine in spilling:
+                return u_int.get((engine, tier, instance), 0)
+            lst = untargeted_insts.get(engine, [(tier, instance)])
             n = max(1, len(lst))
             base, rem = divmod(max(0, total), n)
-            rank = lst.index((tier, instance)) if (tier, instance) in lst else n
-            return base + (1 if rank < rem else 0)
+            if (tier, instance) in lst:
+                return base + (1 if lst.index((tier, instance)) < rem else 0)
+            return base
 
-        specs = [
-            PoolSpec(
-                # key each pool by (engine, tier, instance): the same engine on two node-
-                # managed tiers, or two replicas of one engine/tier (rolling-deploy overlap),
-                # are distinct pools competing for the budget — keying by engine alone would
-                # collapse them and each would size to the whole budget. `_pool_key` matches
-                # what THIS dispatcher looks up for itself below.
-                name=_pool_key(s.engine, s.tier, s.instance),
-                slot_ram_mib=s.slot_ram_mib, slot_vcpus=s.slot_vcpus,
-                # ceiling water-fill: live backlog (balancing) or the static WEIGHT share — split
-                # across same-queue replicas (and, for backlog, untargeted split engine-wide across
-                # tiers) so a rolling overlap OR a multi-tier engine doesn't double its node share.
-                demand=(_backlog_demand(s) + s.assigned) if balancing
-                else _share(s.weight, s.engine, s.tier),
-                # QUEUED backlog only (no `assigned`) — drives the min_warm floor demand-tier so a
-                # pool running a job but with an empty queue doesn't out-tier a backlogged neighbour
-                # (issue #68, escalation review). Uses the real backlog in BOTH modes: static mode
-                # sizes the CEILING by weight but still HAS a live queue (the warm target below uses
-                # it too), so a backlogged weight>0 pool must keep its floor priority.
-                queued=_backlog_demand(s),
-                # PER-ENGINE floor + cap are also split across same-queue replicas — else two
-                # replicas of a cap-8 engine could each be allocated 8 (aggregate 16) and a floor
-                # of 4 becomes an aggregate 8. Deterministic remainder so the shares sum to the
-                # configured value; max_ceiling floored at 1 (a pool needs a runnable slot).
-                min_warm=_int_share(s.min_warm, s.engine, s.tier, s.instance),
-                # cap = the split share, but NEVER below this pool's own reservation — else
-                # splitting a joining replica's cap would clip the INCUMBENT's hard `reserved`
-                # floor (plan_sizes seats min(reserved, max_ceiling)) and a newcomer could grow
-                # into slots the incumbent's still-resident VMs occupy (residency > budget until
-                # they reap). Keeping cap >= reserved lets the incumbent hold its residency and
-                # starves the newcomer's growth until the incumbent actually drains.
-                max_ceiling=max(1, _int_share(s.max_ceiling, s.engine, s.tier, s.instance),
-                                s.assigned),
-                # the pool's published reservation (resident warm + cold in flight) is a HARD
-                # ceiling floor — a peer must not be handed slots this pool is still running.
-                reserved=s.assigned,
-            )
-            for s in snaps
-        ]
+        def _specs(legacy: bool) -> list[PoolSpec]:
+            return [
+                PoolSpec(
+                    # key each pool by (engine, tier, instance): the same engine on two node-
+                    # managed tiers, or two replicas of one engine/tier (rolling-deploy overlap),
+                    # are distinct pools competing for the budget — keying by engine alone would
+                    # collapse them and each would size to the whole budget. `_pool_key` matches
+                    # what THIS dispatcher looks up for itself below.
+                    name=_pool_key(s.engine, s.tier, s.instance),
+                    slot_ram_mib=s.slot_ram_mib, slot_vcpus=s.slot_vcpus,
+                    # ceiling water-fill: live backlog (balancing) or the static WEIGHT share — split
+                    # across same-queue replicas (and, for backlog, untargeted split engine-wide across
+                    # tiers) so a rolling overlap OR a multi-tier engine doesn't double its node share.
+                    demand=(_backlog_demand(s, legacy) + s.assigned) if balancing
+                    else _share(s.weight, s.engine, s.tier),
+                    # QUEUED backlog only (no `assigned`) — drives the min_warm floor demand-tier so a
+                    # pool running a job but with an empty queue doesn't out-tier a backlogged neighbour
+                    # (issue #68, escalation review). Uses the real backlog in BOTH modes: static mode
+                    # sizes the CEILING by weight but still HAS a live queue (the warm target below uses
+                    # it too), so a backlogged weight>0 pool must keep its floor priority.
+                    queued=_backlog_demand(s, legacy),
+                    # PER-ENGINE floor + cap are also split across same-queue replicas — else two
+                    # replicas of a cap-8 engine could each be allocated 8 (aggregate 16) and a floor
+                    # of 4 becomes an aggregate 8. Deterministic remainder so the shares sum to the
+                    # configured value; max_ceiling floored at 1 (a pool needs a runnable slot).
+                    min_warm=(max(1, _int_share(s.min_warm, s.engine, s.tier, s.instance))
+                              if not legacy and (s.engine, s.tier, s.instance) in probe
+                              else _int_share(s.min_warm, s.engine, s.tier, s.instance)),
+                    # cap = the split share, but NEVER below this pool's own reservation — else
+                    # splitting a joining replica's cap would clip the INCUMBENT's hard `reserved`
+                    # floor (plan_sizes seats min(reserved, max_ceiling)) and a newcomer could grow
+                    # into slots the incumbent's still-resident VMs occupy (residency > budget until
+                    # they reap). Keeping cap >= reserved lets the incumbent hold its residency and
+                    # starves the newcomer's growth until the incumbent actually drains.
+                    max_ceiling=max(1, _int_share(s.max_ceiling, s.engine, s.tier, s.instance),
+                                    s.assigned),
+                    # the pool's published reservation (resident warm + cold in flight) is a HARD
+                    # ceiling floor — a peer must not be handed slots this pool is still running.
+                    reserved=s.assigned,
+                )
+                for s in snaps
+            ]
+
+        specs = _specs(legacy=False)
         # CONSENSUS budget: reconcile to the elementwise MINIMUM budget across the view (our own
         # + every peer that published one). Dispatchers with a different headroom/vcpu config or a
         # different per-process adaptive scale otherwise each plan against their OWN budget and
@@ -566,6 +811,23 @@ class DispatcherSizer:
         budget = NodeBudget(
             ram_mib=min([my_budget.ram_mib, *peer_budget_ram]),
             vcpus=min([my_budget.vcpus, *peer_budget_vcpus]))
+        # NEVER BELOW THE LEGACY PLAN: when an engine spills, its split moves demand between
+        # pools, and the proportional water-fill can then plan a PROMPT pool — of this engine or
+        # of another — below what the pre-#193 split gives it on the same view. So plan the legacy
+        # split too (the same plan_sizes, the same view) and hold every non-overflow pool at
+        # least at its legacy ceiling, as a reservation floor. Σ of those legacy ceilings fits the
+        # budget by construction, so they all seat; only overflow-only pools (and prompt pools
+        # that are not serving) can plan lower than before. (On an over-committed node — reservations that don't all fit — the legacy plan
+        # never grows a pool past max(its reservation, its 1-slot baseline), so the floor changes
+        # nothing there: reservations keep plan_sizes' demand-priority seating.)
+        if spilling:
+            legacy_plan = plan_sizes(_specs(legacy=True), budget)  # type: ignore[arg-type]
+            # (not for a prompt pool that isn't SERVING: it can't use the slots, and the untargeted
+            # work it would have taken has spilled to the overflow pools, which need the budget)
+            specs = [
+                sp if (getattr(s, "overflow_only", None) is True or not _serving_of(s)) else replace(
+                    sp, reserved=max(sp.reserved, legacy_plan[sp.name].concurrent_ceiling))
+                for s, sp in zip(snaps, specs)]
         plan = plan_sizes(specs, budget)  # type: ignore[arg-type]
         my_key = _pool_key(e.name, self._runtime, self._instance)
         mine = plan.get(my_key)
@@ -611,23 +873,39 @@ class DispatcherSizer:
             # across tiers — so a multi-tier engine doesn't warm each tier for the whole untargeted
             # queue. Both use the deterministic remainder split so the shares still SUM to the count.
             # Two intentional, SAFE-DIRECTION approximations here (never over-warm / oversubscribe):
-            #  (a) COLD tiers are in `engine_insts` (they publish snapshots and DO claim untargeted
-            #      target_tier-IS-NULL jobs via cold detonation), so they take a share of the
-            #      untargeted WARM split too — a cold-only pool warms 0, letting its share fall to
-            #      cold detonation rather than pre-warming it on the warm tiers. That under-warms the
-            #      warm tiers by cold's share (latency onto the cold path), which is exactly a cold-
-            #      only dispatcher's purpose; it reserves its own cold-footprint budget separately.
+            #  (a) a PROMPT cold tier is an untargeted drainer (it publishes a snapshot and DOES
+            #      claim untargeted target_tier-IS-NULL jobs via cold detonation), so it takes a
+            #      share of the untargeted WARM split too — a cold-only pool warms 0, letting its
+            #      share fall to cold detonation rather than pre-warming it on the warm tiers. That
+            #      under-warms the warm tiers by cold's share (latency onto the cold path), which is
+            #      exactly a prompt cold dispatcher's purpose; it reserves its own cold-footprint
+            #      budget separately. An OVERFLOW-ONLY cold (BLASTBOX_CLAIM_UNTARGETED_AFTER_S) of a
+            #      SPILLING engine takes only the residue the prompt pools can't (see the spill
+            #      rules above), so the serving warm tiers warm for what they can take — at least
+            #      their legacy share (a not-serving one keeps only the recovery probe); it still
+            #      sizes for jobs targeted at the cold tier.
             #  (b) the untargeted warm target uses _engine_int_share's (tier,instance)-rank remainder
             #      bias while the ceiling water-fill breaks ties by snaps order, so under a tight
             #      budget + non-divisible untargeted one warmable job can stay QUEUED a tick (served
             #      when a slot frees or via cold). No job loss, Σwarm ≤ Σceiling ≤ budget always.
             my_targeted = max(0, backlog - min(backlog, self._last_untargeted))
-            my_backlog = (_int_share(my_targeted, e.name, self._runtime, self._instance)
+            my_key3 = (e.name, self._runtime, self._instance)
+            my_backlog = ((tgt_int[my_key3] if my_key3 in tgt_int  # spilling prompt pool: live split
+                           else _int_share(my_targeted, e.name, self._runtime, self._instance))
                           + _engine_int_share(min(backlog, self._last_untargeted),
                                               e.name, self._runtime, self._instance))
             # the warm FLOOR is also split across same-queue replicas — else two overlapping
             # replicas each hold the full min_warm hot (aggregate 2× the configured floor).
             my_min_warm = _int_share(e.min_warm, e.name, self._runtime, self._instance)
+            if my_key3 in probe:                    # the recovery probe (see above)
+                my_min_warm = max(1, my_min_warm)
+            elif my_key3 in tgt_int and self._warm_only and self._pool_needs_probe():
+                # ...and it is KEPT while the pool is unproven: once the probe slot promotes the
+                # pool publishes serving=True (no shared probe floor any more), but until a job on
+                # it proves the base, dropping it would reap the slot, flip the pool back to not
+                # serving and restore a fresh probe every cycle while idle. Local only (the shared
+                # plan's 1-slot baseline already covers it); gate-on spilling prompt pools only.
+                my_min_warm = max(1, my_min_warm)
             warm = min(mine.concurrent_ceiling, max(my_min_warm, my_backlog + assigned_warm))
             # CASCADE cap: an all-local cascade can only spawn Σ surviving-tier capacity slots — an
             # overflow tier unavailable at boot is skipped, so that can be FEWER than the configured
@@ -711,7 +989,11 @@ class DispatcherSizer:
             min_warm=min(e.min_warm, capped), max_ceiling=capped, weight=e.weight,
             ts=self._clock(), node=self._node, tier=self._runtime, instance=self._instance,
             refresh_s=0.0, balancing=self._config.balancing,
-            stale_after_s=FileNodeShare._GC_AGE_FLOOR_S)
+            stale_after_s=FileNodeShare._GC_AGE_FLOOR_S,
+            # carry the field so a current lease never switches its engine's version gate off the
+            # way a pre-field peer does; `lease` keeps it out of the untargeted split
+            overflow_only=self._overflow_only, lease=True, running=reserved,
+            engines=self._served_engines, serving=False)
         self._locked_final(lambda: self._share.publish(snap))
 
     def _locked_final(self, fn: Callable[[], None]) -> None:
