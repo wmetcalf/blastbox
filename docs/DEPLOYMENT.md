@@ -159,6 +159,12 @@ See `deploy/docker/docker-compose.{firecracker,gvisor}.yml` for the exact servic
 sidecar **must** repeat `BLASTBOX_ENGINE_<NAME>_PARAM_KEYS` and its pool sizing
 (`BLASTBOX_DISPATCH_CONCURRENCY == BLASTBOX_POOL_WARM_SIZE`).
 
+To make the cold dispatcher genuinely overflow-only, set `BLASTBOX_CLAIM_UNTARGETED_AFTER_S`
+(e.g. `3`) on it. Without it the cold dispatcher and the warm sidecars poll the same queue and
+whichever polls first wins an untargeted job -- measured: cold took 2-8 of 16 untargeted jobs
+while warm Firecracker slots sat free. See CONFIGURATION.md for its cost (work only cold can take
+waits the full delay) and its limits.
+
 **The rootfs a warm tier boots is a separate artifact from your image, and it is the
 part that rots.** `docker export` drops image config, so nothing in the image's labels
 survives into it. See **[WARM-ROOTFS.md](WARM-ROOTFS.md)** for declaring the image

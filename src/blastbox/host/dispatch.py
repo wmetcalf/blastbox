@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import contextlib
 import logging
+import inspect
 import math
 import os
 import re
@@ -421,6 +422,15 @@ def enforce_allowed_runtimes(engines: Mapping[str, "EngineSpec"], reachable: Col
             )
 
 
+def _accepts_kwarg(fn: Any, name: str) -> bool:
+    """Whether callable ``fn`` accepts keyword ``name`` (explicitly or via ``**kwargs``)."""
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return True          # not introspectable: let the call itself decide
+    return any(p.name == name or p.kind is inspect.Parameter.VAR_KEYWORD for p in params)
+
+
 class Dispatcher:
     """Claim queued jobs and execute each in a disposable worker container.
 
@@ -694,6 +704,21 @@ class Dispatcher:
                 f"claim_untargeted_after_s must be a finite value >= 0, got "
                 f"{claim_untargeted_after_s!r}")
         self._claim_untargeted_after_s = float(claim_untargeted_after_s)
+        if self._claim_untargeted_after_s:
+            # The stale-QUEUED reaper FAILs a job still queued past its TTL and deletes its input:
+            # with the delay at or past the TTL, every job only this dispatcher would take (the
+            # work no warm peer claims) is expired before it is ever eligible here.
+            if 0 < self._max_queued_age_s <= self._claim_untargeted_after_s:
+                raise ValueError(
+                    f"claim_untargeted_after_s ({self._claim_untargeted_after_s:g}s) must be below "
+                    f"max_queued_age_s ({self._max_queued_age_s:g}s): the queued-job reaper would "
+                    "expire untargeted work before this dispatcher may claim it")
+            # A store with only the original claim_next(*, claimant_tier=) shape would raise
+            # TypeError on EVERY poll -- a dispatcher that never claims. Refuse it here instead.
+            if not _accepts_kwarg(self._job_store.claim_next, "untargeted_min_age_s"):
+                raise ValueError(
+                    f"claim_untargeted_after_s is set but {type(self._job_store).__name__}"
+                    ".claim_next() does not accept untargeted_min_age_s")
 
         # Personality registry built ONCE from the operator env (does not change per job).
         from blastbox.host.netpolicy import parse_personalities

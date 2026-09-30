@@ -181,9 +181,11 @@ def untargeted_cutoff(untargeted_min_age_s: float, now: float) -> float | None:
     """The ``created_at`` an UNTARGETED job must be at or before for a delayed claimant to take it,
     or None when there is no delay (``0`` -- every store's default, and the old behaviour).
 
-    ``now`` is the same epoch ``time.time()`` each store already compares ``claimable_after``
-    against, and ``created_at`` is epoch seconds stamped at submit -- so the delay lives in the
-    clock domain the store already uses for eligibility. Never host-monotonic time.
+    ``now`` is the claiming host's epoch ``time.time()`` (what each store compares
+    ``claimable_after`` against); ``created_at`` is epoch seconds stamped by the SUBMITTING host
+    (``Job.new``). Those are two hosts' clocks, unlike ``claimable_after`` (written by dispatchers):
+    submitter-vs-claimant skew shifts the effective delay by the skew, and a submitter running
+    N seconds behind cancels it. Keep hosts NTP-synced. Never host-monotonic time.
 
     Raises ValueError for ``nan``/``inf``/negatives rather than coercing: ``nan`` compares false
     against every age, so it would silently stop the claimant from ever taking an untargeted job,

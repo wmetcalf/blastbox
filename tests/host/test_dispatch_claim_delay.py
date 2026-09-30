@@ -198,3 +198,38 @@ def test_dispatch_cmd_refuses_the_knob_on_a_network_endpoint_tier(monkeypatch):
     with pytest.raises(ValueError, match="network-endpoint"):
         _dispatch_cmd(argparse.Namespace(engines=f"{_ENGINE_NAME}=img:tag"))
     assert started == []                        # refused before any slot was spawned
+
+
+# --- review round 1 (#193) ---------------------------------------------------------------------
+
+def test_a_nonzero_delay_refuses_a_store_that_cannot_take_it(tmp_path):
+    """A store with only the original claim_next(*, claimant_tier=) shape would raise TypeError on
+    EVERY poll once the delay is on -- a dispatcher that never claims. Refused at construction."""
+    store = InMemoryJobStore()
+    orig = store.claim_next
+
+    def legacy(*, claimant_tier=None):
+        return orig(claimant_tier=claimant_tier)
+
+    store.claim_next = legacy  # type: ignore[method-assign]
+    with pytest.raises(ValueError, match="untargeted_min_age_s"):
+        _dispatcher(store, tmp_path, claim_untargeted_after_s=3.0)
+
+
+def test_a_store_taking_kwargs_is_accepted(tmp_path):
+    assert _dispatcher(_Recording(), tmp_path, claim_untargeted_after_s=3.0) is not None
+
+
+@pytest.mark.parametrize(("delay", "ttl"), [(3.0, 3.0), (10.0, 5.0)])
+def test_a_delay_at_or_past_the_queued_ttl_is_refused(tmp_path, delay, ttl):
+    """BLASTBOX_MAX_QUEUED_AGE_S fails any job still QUEUED past its TTL (and deletes its input).
+    With the delay >= the TTL, every job only this dispatcher would take is expired first."""
+    with pytest.raises(ValueError, match="max_queued_age"):
+        _dispatcher(InMemoryJobStore(), tmp_path, claim_untargeted_after_s=delay,
+                    max_queued_age_s=ttl)
+
+
+@pytest.mark.parametrize(("delay", "ttl"), [(3.0, 0.0), (3.0, 60.0)])
+def test_a_delay_below_the_ttl_or_with_no_ttl_is_fine(tmp_path, delay, ttl):
+    assert _dispatcher(InMemoryJobStore(), tmp_path, claim_untargeted_after_s=delay,
+                       max_queued_age_s=ttl) is not None

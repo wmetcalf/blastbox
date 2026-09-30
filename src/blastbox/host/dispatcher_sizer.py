@@ -617,6 +617,9 @@ class DispatcherSizer:
             #      cold detonation rather than pre-warming it on the warm tiers. That under-warms the
             #      warm tiers by cold's share (latency onto the cold path), which is exactly a cold-
             #      only dispatcher's purpose; it reserves its own cold-footprint budget separately.
+            #      NOT aware of BLASTBOX_CLAIM_UNTARGETED_AFTER_S: a delayed (overflow-only) cold
+            #      dispatcher still takes an equal share here although it declines fresh untargeted
+            #      work, so a burst past the warm share lands cold, late. Known gap (see #193).
             #  (b) the untargeted warm target uses _engine_int_share's (tier,instance)-rank remainder
             #      bias while the ceiling water-fill breaks ties by snaps order, so under a tight
             #      budget + non-divisible untargeted one warmable job can stay QUEUED a tick (served
