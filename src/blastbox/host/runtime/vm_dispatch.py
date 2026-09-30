@@ -33,6 +33,7 @@ from typing import Any
 
 from blastbox.host.pool import release_kwargs
 from blastbox.contract.envelope import atomic_write_confined
+from blastbox.host import attest as _attest
 from blastbox.host.blobs.base import BlobFetchError, BlobStore, upload_output_with_retry
 from blastbox.host.jobs.base import Job, JobStatus, JobStore, is_node_claim
 from blastbox.host.jobs.http_store import NodeStoreUnsupported
@@ -127,8 +128,12 @@ class VmJobDispatcher:
                  blob_store: BlobStore | None = None,
                  blob_retry_backoff_s: float = 30.0,
                  put_output_max_attempts: int = PUT_OUTPUT_MAX_ATTEMPTS,
-                 put_output_retry_backoff_s: float = PUT_OUTPUT_RETRY_BACKOFF_S) -> None:
+                 put_output_retry_backoff_s: float = PUT_OUTPUT_RETRY_BACKOFF_S,
+                 attest_key: object = _attest.FROM_ENV) -> None:
         self._store = store
+        # Execution-receipt signing key (host/attest.py); see Dispatcher. A bad key disables
+        # receipts, never jobs.
+        self._attest_key = _attest.resolve_key(attest_key)
         # The SAME grants gate the cold dispatcher uses — see
         # blastbox.host.placement.SelfGrants. One implementation, or one of the two
         # dispatch classes ends up with none, which is exactly what happened here.
@@ -708,7 +713,24 @@ class VmJobDispatcher:
                             expect_claim_id=job.claim_id,
                             materialise_attempts=0,
                         )
+            # Execution receipt: hash the exact file this worker hands the VM transport (not the
+            # row's input_sha256, which other parties can write), and time the run on our clock.
+            receipt_input_sha256 = self._receipt_input_sha256(job, in_path)
+            started_at_ms = _attest.now_ms()
             summary, ok = self._validate_with_heartbeat(job, in_path)
+            finished_at_ms = _attest.now_ms()
+            observation = None if receipt_input_sha256 is None else _attest.RunObservation(
+                job_id=job.job_id, engine=job.engine, input_sha256=receipt_input_sha256,
+                worker_runtime="warm", worker_tier=self._worker_tier,
+                # OMITTED on every VM/remote tier. fixed_net_policy is the pool's DECLARED egress
+                # (build_remote_vm_dispatcher takes it from the engine spec); the check above only
+                # proves the job asked for the same name. Nothing here enforces it -- on the
+                # network-endpoint tiers the most there is is BLASTBOX_NET_EGRESS=0 in the untrusted
+                # remote worker's env, and Lambda with default egress, a static endpoint on an open
+                # network or a permissive EC2 security group all run with internet regardless. A
+                # receipt signs only a posture its signer enforced itself.
+                net_policy_effective=None, net_exit=None,
+                started_at_ms=started_at_ms, finished_at_ms=finished_at_ms)
             summary = self._bounded_summary(summary)   # cap untrusted summary before store/metadata
             err: str | None = None
             sealed_env: Any = None
@@ -788,6 +810,9 @@ class VmJobDispatcher:
                 # unconditional `finally` purge (below) handles it.
                 return
             if ok:
+                # The receipt goes INTO the sealed tree immediately before it ships (see
+                # Dispatcher._upload_output): same put_output, same results prefix.
+                self._seal_receipt(job, self._job_dir(job) / "output", observation)
                 upload_exc = upload_output_with_retry(
                     self._blobs, job.job_id, self._job_dir(job) / "output",
                     attempts=self._put_output_max_attempts,
@@ -950,6 +975,31 @@ class VmJobDispatcher:
                 )
                 observe_job_duration(path=self._worker_tier, seconds=time.monotonic() - t0)
 
+    def _receipt_input_sha256(self, job: Job, in_path: Path) -> str | None:
+        if self._attest_key is None:
+            return None
+        try:
+            return _attest.sha256_file(in_path)
+        except Exception as exc:  # noqa: BLE001 - a receipt must never fail a job
+            logger.error("attestation: could not hash input for job %s (%s); no receipt",
+                         job.job_id, exc)
+            return None
+
+    def _seal_receipt(self, job: Job, out_dir: Path,
+                      observation: "_attest.RunObservation | None") -> None:
+        """Strip a planted attestation.json and, with a key, write ours. Never raises."""
+        try:
+            _attest.seal_receipt(out_dir, key=self._attest_key, observation=observation,
+                                 reason="input could not be hashed")
+        except Exception as exc:  # noqa: BLE001
+            logger.error("attestation: could not write the receipt for job %s (%s); the job "
+                         "completes without one", job.job_id, exc)
+            try:
+                _attest.write_tombstone(out_dir, "signing failed")
+            except Exception:  # noqa: BLE001
+                logger.exception("attestation: could not write a tombstone for job %s",
+                                 job.job_id)
+
     def _sealed_envelope(self, job: Job) -> Any:
         """Parse the HOST-SEALED metadata.json (the Envelope the trust gate wrote) for the remote path,
         or None if absent/unparseable. Used to build a COMPACT result_summary + index page hashes."""
@@ -1069,7 +1119,8 @@ class VmJobDispatcher:
             if self._pending_upload_retry:
                 retry_pending_uploads(self._job_root, self._blobs, self._store, logger,
                                       on_repaired=self._index_repaired_result,
-                                      retention_seconds=self._retention_s)
+                                      retention_seconds=self._retention_s,
+                                      attest_key=self._attest_key)
         except Exception:  # noqa: BLE001 — a sweep failure must not kill maintenance
             logger.warning("vm_dispatch: pending-upload sweep failed", exc_info=True)
         try:
@@ -1536,7 +1587,9 @@ def build_remote_vm_dispatcher(
     remote_http transport: claim a warm slot -> POST the job to its http_agent -> HOST-TRUST-GATE the
     extracted output (re-seal + verify engine/input-SHA/caps) -> DONE. The runtime's client (m)TLS
     context flows through; per-job params are gated through the engine's allowlist and forwarded; the
-    engine's egress personality is enforced fail-closed. Selection is capability-based
+    engine's egress personality is CHECKED fail-closed against the pool's declared egress (a
+    declaration match, not host-side enforcement -- see _process, and why the execution receipt
+    omits the policy on this tier). Selection is capability-based
     (``runtime.dispatch_style``), not tier-name matching -- this is the single typed CLI seam."""
     from blastbox.host.runtime.remote_http import make_remote_validate
 

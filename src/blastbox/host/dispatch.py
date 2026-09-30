@@ -54,6 +54,7 @@ from blastbox.contract.envelope import (
     open_confined_regular_fd,
 )
 from blastbox.errors import HOST_RESOURCE_ERRNOS, OutputTrustError, OutputTrustUnknown, WarmTimeout, sanitize_public_error
+from blastbox.host import attest as _attest
 from blastbox.host.blobs.base import BlobFetchError, BlobStore, upload_output_with_retry
 from blastbox.host.canary import (
     CanaryFailure,
@@ -450,7 +451,12 @@ class Dispatcher:
         put_output_max_attempts: int = _PUT_OUTPUT_MAX_ATTEMPTS,
         put_output_retry_backoff_s: float = _PUT_OUTPUT_RETRY_BACKOFF_S,
         blob_retry_backoff_s: float = _BLOB_RETRY_BACKOFF_S,
+        attest_key: object = _attest.FROM_ENV,
     ) -> None:
+        # Execution-receipt signing key (host/attest.py): an AttestKey, None (no receipts), or
+        # FROM_ENV (BLASTBOX_ATTEST_KEY only -- strictly opt-in; unset = no receipts). A
+        # key that cannot be loaded is logged loudly and disables receipts -- never jobs.
+        self._attest_key = _attest.resolve_key(attest_key)
         # Optional live cold-admission cap driven by the node autosizer. ONLY the cold path
         # acquires a permit (see _dispatch_claimed_job): a cold worker spawns footprint OUTSIDE
         # the warm pool, so the sizer sets the gate limit to the budget's cold headroom
@@ -2000,6 +2006,10 @@ class Dispatcher:
             # pin dispatch. NOTE: the post-wait sealing phase (Step 5b+) is NOT under this
             # deadline; its staleness is covered separately by refreshing started_at below.
             warm_deadline = time.monotonic() + self._worker_timeout_s
+            # Execution receipt: the bytes named in the spec this slot is handed (FC sends them
+            # over vsock from this path at signal_go; gVisor/file seams read the slot copy).
+            receipt_input_sha256 = self._receipt_input_sha256(job, input_path)
+            started_at_ms = _attest.now_ms()
             try:
                 control.signal_go(spec, deadline=warm_deadline)
             except Exception as exc:  # noqa: BLE001
@@ -2056,6 +2066,24 @@ class Dispatcher:
             # of running it in a disposable sandbox; if the rest outweighs this, tuning the
             # engine is the wrong lever.
             phases.mark("guest")
+            finished_at_ms = _attest.now_ms()
+            # Warm slots never carry egress (an egress personality bypassed the slot in
+            # _dispatch_claimed_job), so this is the resolved none/drop the slot runs under --
+            # resolved from this dispatcher's own registry, same inputs as that routing decision.
+            # Containment is by construction of the local warm runtimes this dispatcher launched:
+            # Firecracker slots are booted with no network interface at all, and gVisor slots get
+            # a fresh, empty network namespace (only loopback) in their OCI spec.
+            warm_personality = self._resolve_personality(job)
+            # The tier that owns THIS slot: a local cascade routes each slot to a member tier
+            # (firecracker / gvisor), and "cascade" names the router, not the sandbox.
+            slot_tier_fn = getattr(runtime, "slot_tier", None)
+            signed_tier = slot_tier_fn(slot) if callable(slot_tier_fn) else self._tier
+            observation = None if receipt_input_sha256 is None else _attest.RunObservation(
+                job_id=job.job_id, engine=job.engine, input_sha256=receipt_input_sha256,
+                worker_runtime="warm", worker_tier=signed_tier,
+                net_policy_effective=warm_personality.name,
+                net_exit=warm_personality.exit_driver,
+                started_at_ms=started_at_ms, finished_at_ms=finished_at_ms)
 
             # The guest is done; the sealing phase below (rdump materialize, output-cap, validate,
             # re-seal of up to max_total_artifact_bytes) is real wall-clock work NOT bounded by
@@ -2228,6 +2256,9 @@ class Dispatcher:
                     "it now)", job.job_id,
                 )
                 return
+            # The receipt goes INTO the sealed tree immediately before it ships: its metadata
+            # hash is then of exactly the bytes put_output uploads, into the same prefix.
+            self._seal_receipt(job, output_dir, observation)
             if not self._upload_output(job, output_dir):
                 # The worker RAN and its output passed the trust gate; the upload is OUR side
                 # failing. Attribute the demonstrated success so the streaks reset -- the default
@@ -2437,6 +2468,9 @@ class Dispatcher:
         # affect them. It also means a global-mode node running those tiers is not
         # actually credential-free for them — see docs/DEPLOYMENT.md.
         gated_by_gateway_health = personality.exit_driver in ("openvpn", "wireguard")
+        # The gateway verdict THIS dispatch relied on, kept for the execution receipt: a VPN
+        # exit is signed only when this was a positive verdict (None = the gate is off).
+        gateway_health = None
         if gated_by_gateway_health:
             # Still inside this node's own cooldown for this job: put it straight back
             # with the short shared defer and do NOT probe health again. Re-probing was
@@ -2449,6 +2483,7 @@ class Dispatcher:
                 )
                 return
             health = self._node_egress_health()
+            gateway_health = health
             if health is not None and not health.healthy:
                 n = self._bump_egress_defer(job.job_id)
                 shared_defer, delay = self._egress_defer_plan(n)
@@ -2714,6 +2749,10 @@ class Dispatcher:
         if resolv_conf_src and resolv_conf_content:
             Path(resolv_conf_src).write_text(resolv_conf_content, encoding="ascii")
 
+        # Execution receipt: what THIS dispatcher hands the sandbox, hashed from the file it
+        # bind-mounts (read-only) -- not the row's input_sha256, which other parties can write.
+        receipt_input_sha256 = self._receipt_input_sha256(job, input_path)
+        started_at_ms = _attest.now_ms()
         try:
             # Run to completion (or timeout). The worker's exit code is not the
             # authority — the trust gate below decides DONE/FAILED from the
@@ -2735,6 +2774,12 @@ class Dispatcher:
         except Exception as exc:  # noqa: BLE001
             self._fail_job(job, f"docker launch failed: {exc}")
             return
+        finished_at_ms = _attest.now_ms()
+        observation = None if receipt_input_sha256 is None else _attest.RunObservation(
+            job_id=job.job_id, engine=job.engine, input_sha256=receipt_input_sha256,
+            worker_runtime=runtime.runtime, worker_tier=None,
+            started_at_ms=started_at_ms, finished_at_ms=finished_at_ms,
+            **self._verified_net_claim(personality, network_args, gateway_health))
 
         # The worker's exit code is NOT the authority (the trust gate below is), but a non-zero
         # `docker run` (e.g. a malformed flag → RC 125 "invalid argument for --memory", or an
@@ -2846,6 +2891,8 @@ class Dispatcher:
                 "now)", job.job_id,
             )
             return
+        # The receipt goes INTO the sealed tree immediately before it ships (see the warm twin).
+        self._seal_receipt(job, output_dir, observation)
         if not self._upload_output(job, output_dir):
             # The durable copy never landed, so do NOT purge this tree -- it is the only copy.
             self._upload_failed_job_ids.add(job.job_id)
@@ -3013,6 +3060,101 @@ class Dispatcher:
                     materialise_attempts=0,
                 )
             return True
+
+    #: How long a `docker network inspect` verdict on a bridge's --internal flag is trusted.
+    BRIDGE_VERIFY_TTL_S = 60.0
+
+    def _bridge_is_internal(self, network: str) -> bool:
+        """Whether docker reports ``network`` as --internal, cached briefly. Any error or
+        unexpected answer is NOT verified -- this gates a signed containment claim."""
+        now = time.monotonic()
+        cache = self.__dict__.setdefault("_bridge_internal_cache", {})
+        hit = cache.get(network)
+        if hit is not None and now - hit[1] < self.BRIDGE_VERIFY_TTL_S:
+            return bool(hit[0])
+        try:
+            proc = self._subprocess_runner(
+                ["docker", "network", "inspect", "-f", "{{.Internal}}", network],
+                capture_output=True, text=True, check=False, timeout=10)
+            verdict = (getattr(proc, "returncode", 1) == 0
+                       and str(getattr(proc, "stdout", "") or "").strip().lower() == "true")
+        except Exception as exc:  # noqa: BLE001 - unknown is not verified
+            _log.debug("docker network inspect %s failed: %s", network, exc)
+            verdict = False
+        cache[network] = (verdict, now)
+        return verdict
+
+    def _verified_net_claim(self, personality, network_args: list[str],
+                            gateway_health) -> dict:
+        """The network fields a receipt may sign for this run, from the APPLIED args.
+
+        A claim more restrictive than ``direct`` is signed only when this dispatcher verified the
+        containment for this run: ``--network=none`` always is; a bridged exit needs docker to
+        report its bridge --internal (checked here, cached briefly); a netd gateway exit (VPN)
+        additionally needs a POSITIVE gateway health verdict from this dispatch. ``direct`` makes
+        no containment claim. Anything unverified omits every network field (and warns)."""
+        from blastbox.host.netapply import INSPECT_BRIDGE
+
+        driver = personality.exit_driver
+        base = {"net_policy_effective": personality.name}
+        if network_args == ["--network=none"]:
+            if driver in ("none", "drop"):
+                return {**base, "net_exit": driver}
+            # The args failed this run closed: sign what was APPLIED, flagged.
+            return {**base, "net_exit": "none", "net_downgraded": True}
+        bridge = network_args[1] if len(network_args) == 2 and network_args[0] == "--network" \
+            else None
+        if bridge is None:
+            _log.warning("attestation: unrecognised network args %r for job personality %r; "
+                         "receipt omits the network posture", network_args, personality.name)
+            return {}
+        inspect = bridge == INSPECT_BRIDGE
+        if driver == "direct" and not inspect:
+            return {**base, "net_exit": "direct"}           # no containment claim to verify
+        if not self._bridge_is_internal(bridge):
+            _log.warning("attestation: bridge %s is not verified --internal (docker network "
+                         "inspect); receipt omits the network posture for %r",
+                         bridge, personality.name)
+            return {}
+        if driver in ("openvpn", "wireguard") and not (
+                gateway_health is not None and getattr(gateway_health, "healthy", False)):
+            _log.warning("attestation: %s exit on %s had no positive gateway health verdict "
+                         "this dispatch; receipt omits the network posture", driver, bridge)
+            return {}
+        claim = {**base, "net_exit": driver}
+        if inspect:
+            claim["net_inspect"] = True
+        return claim
+
+    def _receipt_input_sha256(self, job: Job, input_path: Path) -> str | None:
+        """sha256 of the input file about to be handed to the sandbox, or None when receipts
+        are off (no key) or the file can't be hashed -- the run goes ahead either way."""
+        if self._attest_key is None:
+            return None
+        try:
+            return _attest.sha256_file(input_path)
+        except Exception as exc:  # noqa: BLE001 - a receipt must never fail a job
+            _log.error("attestation: could not hash input for job %s (%s); no receipt",
+                       job.job_id, exc)
+            return None
+
+    def _seal_receipt(self, job: Job, output_dir: Path,
+                      observation: "_attest.RunObservation | None") -> None:
+        """Replace whatever sits at attestation.json in the tree about to be uploaded with this
+        dispatcher's signed receipt, or a tombstone saying why it did not sign.
+        Never raises: a receipt problem is logged and the job completes without one."""
+        try:
+            _attest.seal_receipt(output_dir, key=self._attest_key, observation=observation,
+                                 reason="input could not be hashed")
+        except Exception as exc:  # noqa: BLE001
+            _log.error("attestation: could not write the receipt for job %s (%s); the job "
+                       "completes without one", job.job_id, exc)
+            try:
+                # Never ship a planted or half-written one, and overwrite a superseded attempt's.
+                _attest.write_tombstone(output_dir, "signing failed")
+            except Exception:  # noqa: BLE001
+                _log.exception("attestation: could not write a tombstone for job %s",
+                               job.job_id)
 
     def _upload_output(self, job: Job, output_dir: Path) -> bool:
         """Upload *output_dir* (already sealed) to the blob store, with a bounded inline
@@ -3571,7 +3713,8 @@ class Dispatcher:
             if self._pending_upload_retry:
                 retry_pending_uploads(self._job_root, self._blobs, self._job_store, _log,
                                       on_repaired=self._index_repaired_result,
-                                      retention_seconds=self._job_retention_seconds)
+                                      retention_seconds=self._job_retention_seconds,
+                                      attest_key=self._attest_key)
         except Exception:  # noqa: BLE001
             _log.exception("pending-upload sweep failed")
         try:

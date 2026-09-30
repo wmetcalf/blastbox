@@ -1596,3 +1596,122 @@ def test_a_protected_ancestor_does_not_disable_the_whole_reclaim(tmp_path):
     )
     assert removed == 1, "an ancestor in protect_paths disabled the reclaim entirely"
     assert not scratch.exists()
+
+
+def test_legacy_migration_never_ships_a_worker_planted_receipt(tmp_path):
+    """A pre-blob-store tree was never stripped by a dispatcher, so an attestation.json in it is
+    whatever the worker wrote. Uploading it would make it servable as an execution receipt."""
+    from blastbox.host.attest import RECEIPT_NAME
+
+    store = InMemoryJobStore()
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.job_id = _JID
+    job.status = JobStatus.DONE
+    store.create(job)
+    d = _sealed_tree(tmp_path, _JID, pending=False)
+    (d / "output" / RECEIPT_NAME).write_text('{"attestation": {"forged": 1}, "signature": "x"}')
+    blobs = _FakeBlobs()
+    assert migrate_legacy_results(tmp_path, blobs, store, logging.getLogger("t"))[0] == 1
+    assert RECEIPT_NAME not in blobs.stored[_JID]
+
+
+class TestRetainedTreeReceipts:
+    """A retained tree is re-uploaded later by the sweep. Its attestation.json must be a receipt
+    THIS host's key signed for this job over this metadata -- anything else (a worker-planted file
+    in a pre-upgrade tree, another key's receipt, a stale one) becomes a tombstone first."""
+
+    class _CapturingBlobs(_FakeBlobs):
+        def __init__(self):
+            super().__init__()
+            self.receipt: bytes | None = None
+
+        def put_output(self, job_id, out_dir):
+            p = Path(out_dir) / "attestation.json"
+            self.receipt = p.read_bytes() if p.is_file() else None
+            super().put_output(job_id, out_dir)
+
+    def _retained(self, tmp_path):
+        store = InMemoryJobStore()
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = _JID
+        job.status = JobStatus.FAILED
+        job.error = f"result upload failed after 3 attempts; {RESULT_RETAINED_MARKER}"
+        store.create(job)
+        d = _sealed_tree(tmp_path, _JID)
+        return store, d / "output"
+
+    def test_a_planted_receipt_is_replaced_by_a_tombstone(self, tmp_path):
+        from blastbox.host import attest
+
+        store, out = self._retained(tmp_path)
+        (out / "attestation.json").write_text('{"attestation": {"forged": 1}, "signature": "x"}')
+        blobs = self._CapturingBlobs()
+        key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t"),
+                                     attest_key=key) == 1
+        assert attest.is_tombstone(blobs.receipt)
+
+    def test_no_receipt_at_all_uploads_a_tombstone(self, tmp_path):
+        from blastbox.host import attest
+
+        store, _ = self._retained(tmp_path)
+        blobs = self._CapturingBlobs()
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 1
+        assert attest.is_tombstone(blobs.receipt)
+
+    def test_our_own_valid_receipt_is_kept(self, tmp_path):
+        from blastbox.host import attest
+
+        store, out = self._retained(tmp_path)
+        key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+        body = attest.seal_receipt(out, key=key, observation=attest.RunObservation(
+            job_id=_JID, engine="redtusk", input_sha256="1" * 64, worker_runtime="runc",
+            worker_tier=None, net_policy_effective="none", net_exit="none", started_at_ms=1,
+            finished_at_ms=2))
+        blobs = self._CapturingBlobs()
+        assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t"),
+                                     attest_key=key) == 1
+        assert blobs.receipt == attest.canonical(body)
+
+
+def test_a_transient_receipt_read_error_leaves_the_tree_retained_and_intact(tmp_path,
+                                                                          monkeypatch):
+    """A momentary EIO reading a VALID receipt used to read as "not ours": the sweep tombstoned
+    it and uploaded -- destroying a genuine receipt for good. It must retry next sweep instead."""
+    import errno as _errno
+
+    from blastbox.host import attest
+
+    store = InMemoryJobStore()
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.job_id = _JID
+    job.status = JobStatus.FAILED
+    job.error = f"result upload failed after 3 attempts; {RESULT_RETAINED_MARKER}"
+    store.create(job)
+    out = _sealed_tree(tmp_path, _JID) / "output"
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    attest.seal_receipt(out, key=key, observation=attest.RunObservation(
+        job_id=_JID, engine="redtusk", input_sha256="1" * 64, worker_runtime="runc",
+        worker_tier=None, started_at_ms=1, finished_at_ms=2))
+    genuine = (out / "attestation.json").read_bytes()
+
+    real_open = attest.os.open
+    receipt = str(out / "attestation.json")
+    flaky = {"on": True}
+
+    def fake_open(p, *a, **kw):
+        if flaky["on"] and str(p) == receipt:
+            raise OSError(_errno.EIO, "Input/output error", str(p))
+        return real_open(p, *a, **kw)
+
+    monkeypatch.setattr(attest.os, "open", fake_open)
+    blobs = _FakeBlobs()
+    assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t"),
+                                 attest_key=key) == 0
+    assert blobs.put_calls == 0, "uploaded on an unreadable receipt"
+    assert (out / "attestation.json").read_bytes() == genuine, "a genuine receipt was destroyed"
+
+    flaky["on"] = False                              # next sweep: the read works again
+    assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t"),
+                                 attest_key=key) == 1
+    assert (out / "attestation.json").read_bytes() == genuine

@@ -974,6 +974,14 @@ class CascadingRuntime:
         """
         return f"{self.tiers[idx].name}#{idx}"
 
+    def slot_tier(self, slot: object) -> str | None:
+        """The NAME of the member tier that produced this slot ("firecracker", "gvisor", ...), or
+        None if no tier owns it. What an execution receipt signs as worker_tier: "cascade" names
+        the router, not the sandbox that ran the job."""
+        with self._lock:
+            idx = self._owner.get(str(getattr(slot, "slot_id", "") or ""))
+        return None if idx is None else self.tiers[idx].name
+
     def base_identity(self, slot: object) -> str | None:
         """Which TIER's base produced this slot -- a cascade has one per tier, not one overall."""
         with self._lock:

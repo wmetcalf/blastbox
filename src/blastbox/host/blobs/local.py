@@ -181,6 +181,17 @@ class LocalBlobStore:
                 _log.warning("put_output_skipped_unstorable_name", job_id=job_id,
                              path=str(rel), error=str(exc))
 
+    def open_result_only(self, job_id: str, name: str) -> BinaryIO:
+        """Like :meth:`open_output`, but ONLY from the durable results prefix -- never the legacy
+        ``<job_root>/<id>/output`` fallback. For files whose authority comes from the host having
+        written them into the uploaded tree (the execution receipt): a legacy tree was never
+        sanitised, so a file of that name there is whatever the worker wrote. Raises a causeless
+        BlobFetchError when absent, like open_output."""
+        fh = self._contained_open(self._results_dir(job_id), name, job_id)
+        if fh is None:
+            raise BlobFetchError(f"result fetch failed: {job_id}/{name}")
+        return fh
+
     def open_output(self, job_id: str, name: str) -> BinaryIO:
         # put_output stores nested rel paths (results/<job_id>/<foo/bar.png>), so open_output must
         # read at the SAME key -- collapsing to the basename would 404 (or silently omit) a nested

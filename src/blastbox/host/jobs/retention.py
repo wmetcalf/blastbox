@@ -24,10 +24,13 @@ import shutil
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from blastbox.host.blobs.base import BlobStore, upload_output_with_retry
 from blastbox.host.jobs.base import JobStatus, JobStore
+
+if TYPE_CHECKING:
+    from blastbox.host.attest import AttestKey
 
 _log = logging.getLogger("blastbox.host.jobs.retention")
 
@@ -374,6 +377,7 @@ def retry_pending_uploads(
     on_repaired: "Callable[[str, Path, str], None] | None" = None,
     retention_seconds: float = 0.0,
     max_per_sweep: int = 2000,
+    attest_key: "AttestKey | None" = None,
 ) -> int:
     """Re-attempt ``put_output`` for every local tree holding a sealed result with no durable copy.
 
@@ -481,6 +485,21 @@ def retry_pending_uploads(
             seal_text = (out_dir / "metadata.json").read_text()
         except OSError:
             seal_text = ""
+        if not durable:
+            # The receipt in a retained tree ships with it. Keep it only if it is one THIS host's
+            # key signed for this job over this metadata; anything else (a worker-planted file in
+            # a tree retained by pre-receipt code, a stale or foreign receipt) becomes a tombstone,
+            # which also overwrites any superseded receipt already in the store.
+            try:
+                from blastbox.host import attest as _attest
+
+                if not _attest.tree_receipt_is_ours(out_dir, key=attest_key, job_id=d.name):
+                    _attest.write_tombstone(out_dir, "retained result re-uploaded without a "
+                                                     "receipt from this host")
+            except OSError as exc:
+                log.warning("pending-upload sweep: %s: cannot sanitise its receipt (%s); "
+                            "leaving it retained", d.name, exc)
+                continue
         upload_exc = None if durable else upload_output_with_retry(
             blob_store, d.name, out_dir, attempts=attempts)
         if upload_exc is None:
@@ -653,6 +672,17 @@ def migrate_legacy_results(
             pass
         if dry_run:
             migrated += 1
+            continue
+        # A pre-blob-store tree was never stripped by a dispatcher, so an attestation.json in it
+        # is whatever the worker wrote; these results carry no execution receipt by construction.
+        try:
+            from blastbox.host.attest import strip_receipt
+
+            strip_receipt(out_dir)
+        except OSError as exc:
+            failed += 1
+            log.warning("legacy migration: %s: could not remove a worker-written receipt (%s); "
+                        "leaving it in place", d.name, exc)
             continue
         up_exc = upload_output_with_retry(blob_store, d.name, out_dir, attempts=2)
         if up_exc is None:

@@ -1239,6 +1239,64 @@ def _blob_target_cmd(args: argparse.Namespace) -> int:
     return 0
 
 
+def _attest_key_cmd(args: argparse.Namespace) -> int:
+    """Print the execution-receipt PUBLIC key and its key_id, generating the key if configured
+    and missing. This is what an operator pins in a verifier (e.g. Loadout's
+    LOADOUT_ATTESTATION_KEYS); the private half is never printed.
+
+    Run it AS THE DISPATCHER'S SERVICE USER: the dispatcher refuses a key file it does not own,
+    so a key minted by root (or anyone else) is one it will never sign with."""
+    import os
+    import pwd
+
+    from blastbox.host import attest
+
+    # --key wins: `sudo -u <user>` resets the environment, so BLASTBOX_ATTEST_KEY does not
+    # survive into the command every hint below tells the operator to run.
+    explicit = (getattr(args, "key", None) or "").strip()
+    path = Path(explicit) if explicit else attest.attest_key_path()
+    if path is None:
+        print(f"execution receipts are not enabled: set {attest.ATTEST_KEY_ENV} (or pass --key) "
+              f"to the key file path (opt-in; one key per dispatcher host)", file=sys.stderr)
+        return 2
+
+    def _user(uid: int) -> str:
+        try:
+            return pwd.getpwuid(uid).pw_name
+        except KeyError:
+            return str(uid)
+
+    euid = os.geteuid()
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        st = None
+    if st is None and euid == 0 and not getattr(args, "allow_root", False):
+        print(f"refusing to mint {path} as root: the dispatcher refuses a key it does not own. "
+              f"Run this as the dispatcher's service user, e.g. `sudo -u blastbox blastbox "
+              f"attest-key --key {path}`, or pass --allow-root if the dispatcher itself runs "
+              f"as root.",
+              file=sys.stderr)
+        return 1
+    if st is not None and st.st_uid != euid:
+        owner = _user(st.st_uid)
+        print(f"{path} is owned by {owner}, not {_user(euid)}; run this as the dispatcher's "
+              f"service user that owns it, e.g. `sudo -u {owner} blastbox attest-key --key "
+              f"{path}`.",
+              file=sys.stderr)
+        return 1
+    try:
+        key = attest.load_or_create_key(path)
+    except (OSError, ValueError) as exc:
+        print(f"attestation key {path}: {exc}", file=sys.stderr)
+        return 1
+    print(f"key_id: {key.key_id}")
+    print(f"alg: {attest.ALG}")
+    print(f"path: {path}")
+    print(key.public_key_pem, end="")
+    return 0
+
+
 def _claim_key_cmd(args: argparse.Namespace) -> int:
     """Show whether a node signing key is recorded on the job queue, or rotate it.
 
@@ -1937,6 +1995,25 @@ def build_parser() -> argparse.ArgumentParser:
     pk_reset.add_argument("--yes", action="store_true",
                           help="confirm every ingress on this queue is stopped")
     pk.set_defaults(func=_claim_key_cmd)
+
+    pak = sub.add_parser(
+        "attest-key",
+        help="print the execution-receipt public key + key_id to pin (generates it if missing)",
+        description="Print the execution-receipt public key and key_id for a verifier to pin, "
+                    "generating the key at BLASTBOX_ATTEST_KEY if it is missing. Opt-in: "
+                    "nothing is signed unless BLASTBOX_ATTEST_KEY is set. Run it AS THE "
+                    "DISPATCHER'S SERVICE USER, passing the path explicitly because sudo resets "
+                    "the environment (e.g. `sudo -u blastbox blastbox attest-key --key "
+                    "/var/lib/blastbox/attest.key`): the dispatcher refuses a key file it does "
+                    "not own.",
+    )
+    pak.add_argument("--key", metavar="PATH",
+                     help="the key file (overrides BLASTBOX_ATTEST_KEY; use it under sudo, "
+                          "which drops the environment)")
+    pak.add_argument("--allow-root", action="store_true",
+                     help="permit minting as root (only when the dispatcher itself runs as "
+                          "root; otherwise run as the dispatcher's service user)")
+    pak.set_defaults(func=_attest_key_cmd)
 
     pt = sub.add_parser(
         "blob-target",
