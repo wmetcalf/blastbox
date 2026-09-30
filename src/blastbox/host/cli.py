@@ -850,6 +850,14 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
                 "BLASTBOX_CLAIM_UNTARGETED_AFTER_S is not supported with a control-plane job "
                 "store (BLASTBOX_DATABASE_URL=https://...): /v1/nodes/claim does not carry it. "
                 "Unset it on this dispatcher.")
+        # BEFORE pool.start(): the Dispatcher refuses this too, but only after the pool has spawned
+        # warm slots, and the CLI's pool.stop() does not cover construction -- orphaned slots.
+        ttl = float(os.environ.get("BLASTBOX_MAX_QUEUED_AGE_S") or "0")
+        if 0 < ttl <= claim_untargeted_after_s:
+            raise ValueError(
+                f"BLASTBOX_CLAIM_UNTARGETED_AFTER_S ({claim_untargeted_after_s:g}) must be below "
+                f"BLASTBOX_MAX_QUEUED_AGE_S ({ttl:g}): the queued-job reaper would expire untargeted "
+                "work before this dispatcher may claim it.")
         if pool is not None and getattr(pool.runtime, "dispatch_style", "file") == "network":
             raise ValueError(
                 "BLASTBOX_CLAIM_UNTARGETED_AFTER_S is supported by the container dispatcher only, "

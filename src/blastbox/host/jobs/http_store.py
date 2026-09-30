@@ -114,6 +114,11 @@ class NodeStoreUnsupported(NotImplementedError):
 class HttpJobStore:
     """A node's view of the queue: only what it is entitled to, over an authenticated link."""
 
+    #: DECLARES claim_next(untargeted_min_age_s=) only to refuse a non-zero value: /v1/nodes/claim
+    #: cannot carry it. Stated here so the Dispatcher refuses at construction, not on every poll.
+    supports_untargeted_delay = False
+
+
     def __init__(
         self,
         base_url: str,

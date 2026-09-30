@@ -44,6 +44,10 @@ class InMemoryJobStore:
     calls are serialised by a reentrant lock so no job is ever double-claimed.
     """
 
+    #: Honours ``claim_next(untargeted_min_age_s=)`` (checked by the Dispatcher at construction).
+    supports_untargeted_delay = True
+
+
     def __init__(self) -> None:
         self._jobs: dict[str, Job] = {}
         self._lock = threading.RLock()

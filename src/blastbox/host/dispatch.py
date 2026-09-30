@@ -715,7 +715,10 @@ class Dispatcher:
                     "expire untargeted work before this dispatcher may claim it")
             # A store with only the original claim_next(*, claimant_tier=) shape would raise
             # TypeError on EVERY poll -- a dispatcher that never claims. Refuse it here instead.
-            if not _accepts_kwarg(self._job_store.claim_next, "untargeted_min_age_s"):
+            # Explicit capability first: a store may DECLARE the kwarg only to refuse it
+            # (HttpJobStore), which a signature check passes. Signature for unflagged doubles.
+            if getattr(self._job_store, "supports_untargeted_delay", None) is False or \
+                    not _accepts_kwarg(self._job_store.claim_next, "untargeted_min_age_s"):
                 raise ValueError(
                     f"claim_untargeted_after_s is set but {type(self._job_store).__name__}"
                     ".claim_next() does not accept untargeted_min_age_s")

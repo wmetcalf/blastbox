@@ -69,6 +69,10 @@ class RedisJobStore:
     to the scan path under the backend-uniform pagination tests).
     """
 
+    #: Honours ``claim_next(untargeted_min_age_s=)`` (checked by the Dispatcher at construction).
+    supports_untargeted_delay = True
+
+
     def __init__(self, client, *, ttl_seconds: int = _TTL_SECONDS) -> None:
         self._r = client
         self._ttl_seconds = ttl_seconds

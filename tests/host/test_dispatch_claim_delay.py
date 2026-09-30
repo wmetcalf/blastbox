@@ -233,3 +233,47 @@ def test_a_delay_at_or_past_the_queued_ttl_is_refused(tmp_path, delay, ttl):
 def test_a_delay_below_the_ttl_or_with_no_ttl_is_fine(tmp_path, delay, ttl):
     assert _dispatcher(InMemoryJobStore(), tmp_path, claim_untargeted_after_s=delay,
                        max_queued_age_s=ttl) is not None
+
+
+# --- review round 2 (#193) ---------------------------------------------------------------------
+
+def test_a_store_that_declares_but_refuses_the_delay_is_refused_at_construction(tmp_path):
+    """HttpJobStore DECLARES untargeted_min_age_s only to raise on it: a signature check passed it,
+    and every poll then failed. Stores state support explicitly."""
+    from blastbox.host.jobs.http_store import HttpJobStore
+
+    store = HttpJobStore.__new__(HttpJobStore)
+    with pytest.raises(ValueError, match="untargeted"):
+        _dispatcher(store, tmp_path, claim_untargeted_after_s=5.0)
+
+
+@pytest.mark.parametrize("store_name", ["InMemoryJobStore", "SqlJobStore", "RedisJobStore"])
+def test_the_stores_that_honour_the_delay_say_so(store_name):
+    import blastbox.host.jobs as jobs_pkg  # noqa: F401
+    from blastbox.host.jobs import memory, redis_store, sql_store
+
+    cls = {"InMemoryJobStore": memory.InMemoryJobStore, "SqlJobStore": sql_store.SqlJobStore,
+           "RedisJobStore": redis_store.RedisJobStore}[store_name]
+    assert getattr(cls, "supports_untargeted_delay", False) is True
+
+
+def test_dispatch_cmd_refuses_a_delay_past_the_ttl_before_spawning_slots(monkeypatch):
+    """The Dispatcher refused this only AFTER pool.start(): the warm slots it had spawned were never
+    stopped (orphaned VMs/containers on every restart)."""
+    import types
+
+    import blastbox.host.jobs.factory as factory
+    import blastbox.host.pool_config as pool_config
+    from blastbox.host.cli import _dispatch_cmd
+
+    started: list = []
+    pool = types.SimpleNamespace(runtime=types.SimpleNamespace(dispatch_style="file"),
+                                 start=lambda: started.append(True))
+    monkeypatch.setattr(factory, "build_job_store_from_env", lambda: InMemoryJobStore())
+    monkeypatch.setattr(pool_config, "build_warm_pool", lambda: pool)
+    monkeypatch.setenv("BLASTBOX_POOL_RUNTIME", "firecracker")
+    monkeypatch.setenv("BLASTBOX_CLAIM_UNTARGETED_AFTER_S", "300")
+    monkeypatch.setenv("BLASTBOX_MAX_QUEUED_AGE_S", "300")
+    with pytest.raises(ValueError, match="MAX_QUEUED_AGE_S"):
+        _dispatch_cmd(argparse.Namespace(engines=f"{_ENGINE_NAME}=img:tag"))
+    assert started == []

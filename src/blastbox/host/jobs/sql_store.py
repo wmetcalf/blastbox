@@ -87,6 +87,10 @@ class SqlJobStore:
       for lock-free concurrent dispatch.
     """
 
+    #: Honours ``claim_next(untargeted_min_age_s=)`` (checked by the Dispatcher at construction).
+    supports_untargeted_delay = True
+
+
     def __init__(self, database_url: str) -> None:
         self._database_url = database_url
         self._lock = threading.RLock()
