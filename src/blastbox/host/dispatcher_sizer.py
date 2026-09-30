@@ -666,12 +666,24 @@ class DispatcherSizer:
                     return int(getattr(s, "running", None) or 0)
                 # a prompt pool that is NOT SERVING (a failure streak, nothing ready or busy)
                 # can't claim: no capacity, so its share spills to the overflow pools
-                caps_f = [max(0.0, _cap(s) - _running_of(s)
-                              - _share(_split(s)[0], eng, s.tier)) if _serving_of(s) else 0.0
-                          for s in prompt]
-                caps_i = [max(0, _cap(s) - _running_of(s)
-                              - _int_share(_split(s)[0], eng, s.tier, s.instance))
-                          if _serving_of(s) else 0 for s in prompt]
+                # the TARGETED work that occupies a prompt pool is split over its LIVE same-tier
+                # replicas only: an orphan lease can't claim targeted jobs, so counting it would
+                # make the live pool look roomier than it is (the plain targeted DEMAND split keeps
+                # a929bc9's replica list; only this capacity term leaves leases out)
+                def _live_reps(s) -> list[str]:
+                    return sorted(x.instance for x in live
+                                  if x.engine == s.engine and x.tier == s.tier)
+
+                def _tgt_f(s) -> float:
+                    return _split(s)[0] / max(1, len(_live_reps(s)))
+
+                def _tgt_i(s) -> int:
+                    reps = _live_reps(s)
+                    return _even_int(_split(s)[0], len(reps))[reps.index(s.instance)]
+                caps_f = [max(0.0, _cap(s) - _running_of(s) - _tgt_f(s)) if _serving_of(s)
+                          else 0.0 for s in prompt]
+                caps_i = [max(0, _cap(s) - _running_of(s) - _tgt_i(s)) if _serving_of(s)
+                          else 0 for s in prompt]
                 pf, _ = _fill_float(count, caps_f)
                 pi, _ = _fill_int(count_i, caps_i)
                 # the legacy floor on DEMAND only for a serving pool (a broken one gets no budget

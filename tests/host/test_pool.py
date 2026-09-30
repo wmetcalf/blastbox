@@ -4945,6 +4945,7 @@ def test_a_successful_promotion_resets_the_restore_streak() -> None:
         pool.tick()
     assert pool.slot_count == 0
     assert pool.is_serving() is True
+    assert pool._streak_at_promotion == {}                  # the reaped slot's record is gone
 
 
 def test_is_serving_false_when_restores_time_out_even_with_a_slot_warming() -> None:
@@ -4961,3 +4962,42 @@ def test_is_serving_false_when_restores_time_out_even_with_a_slot_warming() -> N
         pool.tick()
     assert any(s.state == SlotState.WARMING for s in pool._slots.values())
     assert pool.is_serving() is False
+
+
+def test_promote_then_die_unproven_does_not_keep_the_pool_serving() -> None:
+    # codex: every restored slot passes is_ready, is promoted, then dies before serving a job. Each
+    # promotion is only PROVISIONAL evidence; its unproven death revokes it, so the streak keeps
+    # growing and the pool stops serving (it printed `1 5 True`).
+    class _DiesAfterReady(_FakeRuntime):
+        def is_alive(self, slot: Slot) -> bool:
+            return False
+    pool = WarmPool(runtime=_DiesAfterReady(), warm_size=1, spawn_rate_limit=1000.0,
+                    snapshot_rebuild_after=99)
+    for _ in range(6):
+        pool.tick()
+    assert pool._restore_failure_streak >= WarmPool.SERVING_RESTORE_FAILURES
+    assert pool.is_serving() is False
+
+
+def test_a_served_job_proves_the_restore_path() -> None:
+    # after failing restores, a slot that promotes AND serves a clean job clears the streak for good
+    class _Flaky(_FakeRuntime):
+        fails = 4
+
+        def spawn(self) -> Slot:
+            if self.fails > 0:
+                self.fails -= 1
+                raise RuntimeError("transient restore failure")
+            return super().spawn()
+    pool = WarmPool(runtime=_Flaky(), warm_size=1, spawn_rate_limit=100.0)
+    for _ in range(8):
+        pool.tick()
+    s = pool.claim(timeout_s=0.1)
+    assert s is not None
+    pool.release(s)
+    assert pool._restore_failure_streak == 0
+    assert s.slot_id not in pool._streak_at_promotion       # proven: no revocation record left
+    pool.resize(warm_size=0, concurrent_ceiling=4)
+    for _ in range(6):
+        pool.tick()
+    assert pool.slot_count == 0 and pool.is_serving() is True

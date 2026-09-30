@@ -3276,3 +3276,19 @@ def test_lease_denominator_unchanged_on_the_legacy_path(tmp_path, monkeypatch):
                      ram_budget=17 * 1024).tick()
     assert specs["clip@firecracker@f"].queued == 8
     assert mine.warm_size == 8
+
+
+def test_lease_does_not_dilute_targeted_work_in_prompt_capacity(tmp_path, monkeypatch):
+    # codex: an orphan lease of the SAME engine+tier sits beside the live prompt fc. The 8 jobs
+    # targeted at fc can only go to the live pool, so its untargeted capacity is its cap (10, as
+    # planned) − 8, and cold gets the other 6 of the 8 untargeted — not 2.
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    share.publish(_het_snapshot(("clip", "cold", "c", 1024, 8, 8, 64, 0, 0, True)))
+    _lease(share, instance="old", warm_orphans=1)
+    DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=20), _Pool(), share,
+                    _OVF_CFG, runtime="firecracker", backlog_fn=lambda: 16,
+                    untargeted_backlog_fn=lambda: 8, node="n", instance="w",
+                    capacity_fn=_budget(12 * 1024, 999), clock=lambda: 1.0).tick()
+    assert specs["clip@firecracker@w"].max_ceiling == 10
+    assert specs["clip@cold@c"].queued == 6
