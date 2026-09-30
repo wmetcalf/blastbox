@@ -5235,9 +5235,48 @@ def test_a_job_that_returned_an_engine_error_on_a_retired_base_does_not_reset() 
     assert pool._restore_failure_streak == before
 
 
-def test_a_new_base_generation_resets_the_streak() -> None:
-    # the old base's restore failures are not evidence about the replacement: when the runtime
-    # reports a repaired tier (a new base installed), the streak starts over
+class _BrokenBase(_FakeRuntime):
+    """Restores always fail; the base 'repair' succeeds (committed) or partially raises, but the base
+    it builds is just as broken."""
+
+    def __init__(self, partial: bool) -> None:
+        super().__init__()
+        self.partial = partial
+        self.drops = 0
+
+    def spawn(self) -> Slot:
+        raise RuntimeError("restore fails")
+
+    def invalidate_base(self, **kw):
+        self.drops += 1
+        if self.partial:
+            e = RuntimeError("partial repair")
+            e.repaired = [""]  # type: ignore[attr-defined]
+            raise e
+        return None
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_a_base_repair_is_not_proof(partial: bool) -> None:
+    # opus: the partial-repair path advanced the generation on every failing spawn (no cooldown)
+    # and a committed rebuild reset before any new base existed: a permanently broken warm-only
+    # pool read serving 39/40 ticks. A generation bump is not proof — only a served job is.
+    rt = _BrokenBase(partial)
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=1000.0,
+                    base_rebuild_cooldown_s=0.0, snapshot_rebuild_after=2)
+    pool.resize(warm_size=1, concurrent_ceiling=2)
+    serving = 0
+    for _ in range(40):
+        pool.tick()
+        serving += pool.is_serving()
+    assert rt.drops > 0                                   # the repair path really ran
+    assert serving <= WarmPool.SERVING_RESTORE_FAILURES   # only before K failures accrued
+    assert pool.is_serving() is False
+
+
+def test_a_new_base_generation_does_not_reset_the_streak() -> None:
+    # a repaired tier reported by the runtime installs a new base, but nothing has been served
+    # from it yet: the streak stands (the recovery probe, not a reset, gets it back to serving)
     class _Reporting:
         def __init__(self) -> None:
             self.taken = 0
@@ -5256,6 +5295,8 @@ def test_a_new_base_generation_resets_the_streak() -> None:
             self.taken += 1
             return ["fc"] if self.taken == 1 else []
     pool = WarmPool(runtime=_Reporting(), warm_size=0, concurrent_ceiling=2)
+    before = pool._base_generation.get("fc", 0)
     pool._restore_failure_streak = 5
     pool.tick()
-    assert pool._restore_failure_streak == 0
+    assert pool._base_generation.get("fc", 0) == before + 1
+    assert pool._restore_failure_streak == 5

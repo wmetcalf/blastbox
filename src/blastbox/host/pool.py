@@ -405,11 +405,12 @@ class WarmPool:
         # slot timing out in WARMING, a promoted slot dying unproven — at the health tick or at
         # claim time), for is_serving() only, counted in the order they happen. It resets ONLY on
         # PROOF that the CURRENT base restores usable workers — a slot of the current base
-        # generation completing a served job (clean, or a valid engine error) — or when a new base
-        # is installed (the old base's failures say nothing about it). Promotion and a quiet
-        # surplus reap are not proof: a poisoned restore passes is_ready() and the health tick and
-        # only fails the claim probe. A ready slot already makes the pool serving, so neither
-        # needs a reset. Kept apart from _spawn_consecutive_failures so the base-repair logic's
+        # generation completing a served job (clean, or a valid engine error). Failures count from
+        # any generation. Promotion, a quiet surplus reap and a base repair are not proof: a
+        # poisoned restore passes is_ready() and the health tick and only fails the claim probe,
+        # and a repair can build an equally broken base. A ready slot already makes the pool
+        # serving, and the node sizer keeps one warm "recovery probe" slot targeted for a pool
+        # that isn't, so a healed base gets back to serving within one restore. Kept apart from _spawn_consecutive_failures so the base-repair logic's
         # own counter and its resets are untouched.
         self._restore_failure_streak = 0
         # Keyed by slot_id, NOT stored on the slot: runtimes supply their own slot types (e.g.
@@ -1974,11 +1975,12 @@ class WarmPool:
             return self._burst_active
 
     def _advance_base_generation_unlocked(self, name: str) -> None:
-        """A NEW base was installed for `name` (a repair swapped or rebuilt it): advance its
-        generation, and restart the restore-failure streak — the old base's failures are not
-        evidence about the new one (is_serving)."""
+        """A repair swapped or rebuilt the base for `name`: advance its generation. This does NOT
+        touch the restore-failure streak — a generation bump is not proof the new base restores
+        usable workers (the partial-repair path bumps on every failing spawn, and a committed
+        rebuild bumps before any new base exists). Only a served job on the current generation
+        resets it; getting a not-serving pool back is the node sizer's recovery probe."""
         self._base_generation[name] = self._base_generation.get(name, 0) + 1
-        self._restore_failure_streak = 0
 
     # consecutive restore-path failures after which a pool with nothing ready counts as not serving
     SERVING_RESTORE_FAILURES = 3
@@ -1989,10 +1991,11 @@ class WarmPool:
 
         False only when BOTH hold: no slot is ready (IDLE) or busy (ASSIGNED), and the RESTORE
         path is failing — at least SERVING_RESTORE_FAILURES restore failures (spawn raising, a slot
-        timing out in WARMING, a promoted slot dying unproven) since the last PROOF the current base
-        works — a served job by a slot of the current base generation — or since a new base was
-        installed. Promotion and a quiet scale-down reap are not proof; a ready slot already makes
-        the pool serving. WARMING slots are not evidence either way: a pool whose
+        timing out in WARMING, a promoted slot dying unproven; any generation) since the last PROOF
+        the current base works — a served job by a slot of the current base generation. Promotion,
+        a quiet scale-down reap and a base repair are not proof; a ready slot already makes the
+        pool serving (and the node sizer's recovery probe keeps one slot warming for a pool that
+        isn't, so a healed base is serving again within one restore). WARMING slots are not evidence either way: a pool whose
         restores keep failing always has some slot warming, and a healthy respawn has no failure
         count. Job/worker faults (a dirty release) never count: a burst of bad samples recycles
         slots, it doesn't break the pool. Everything else — ready, busy, healthily warming, empty

@@ -657,6 +657,16 @@ class DispatcherSizer:
         # same-tier replicas (leases excluded) — the same term the capacity used, reused by the
         # warm target so the two agree
         tgt_int: dict[tuple[str, str, str], int] = {}
+        # RECOVERY PROBE: a spilling engine's prompt pool that is NOT serving (warm-only, restores
+        # failing, nothing ready) gets no untargeted capacity — and with a small queue its legacy
+        # integer share can be 0, leaving it at warm 0: it would never spawn, never prove the base
+        # healed, never serve again. So the shared plan reserves exactly ONE warm slot for it (a
+        # min_warm floor, seated by plan_sizes under the budget like every floor, computed from the
+        # published snapshot so every planner agrees) and its own warm target is at least 1. On a
+        # still-broken base the probe keeps failing and the pool stays not serving; once the base
+        # heals it promotes, the pool is serving (a ready slot), claims, serves → streak reset.
+        # This also bounds stale failures (they count from any generation): at worst one restore.
+        probe: set[tuple[str, str, str]] = set()
         for eng in sorted(spilling):
             live = sorted((s for s in snaps if s.engine == eng and _live(s)),
                           key=lambda s: (s.tier, s.instance))
@@ -690,6 +700,8 @@ class DispatcherSizer:
                           else 0 for s in prompt]
                 for s in prompt:
                     tgt_int[(eng, s.tier, s.instance)] = _tgt_i(s)
+                    if not _serving_of(s):
+                        probe.add((eng, s.tier, s.instance))
                 pf, _ = _fill_float(count, caps_f)
                 pi, _ = _fill_int(count_i, caps_i)
                 # the legacy floor on DEMAND only for a serving pool (a broken one gets no budget
@@ -755,7 +767,9 @@ class DispatcherSizer:
                     # replicas of a cap-8 engine could each be allocated 8 (aggregate 16) and a floor
                     # of 4 becomes an aggregate 8. Deterministic remainder so the shares sum to the
                     # configured value; max_ceiling floored at 1 (a pool needs a runnable slot).
-                    min_warm=_int_share(s.min_warm, s.engine, s.tier, s.instance),
+                    min_warm=(max(1, _int_share(s.min_warm, s.engine, s.tier, s.instance))
+                              if not legacy and (s.engine, s.tier, s.instance) in probe
+                              else _int_share(s.min_warm, s.engine, s.tier, s.instance)),
                     # cap = the split share, but NEVER below this pool's own reservation — else
                     # splitting a joining replica's cap would clip the INCUMBENT's hard `reserved`
                     # floor (plan_sizes seats min(reserved, max_ceiling)) and a newcomer could grow
@@ -869,6 +883,8 @@ class DispatcherSizer:
             # the warm FLOOR is also split across same-queue replicas — else two overlapping
             # replicas each hold the full min_warm hot (aggregate 2× the configured floor).
             my_min_warm = _int_share(e.min_warm, e.name, self._runtime, self._instance)
+            if my_key3 in probe:                    # the recovery probe (see above)
+                my_min_warm = max(1, my_min_warm)
             warm = min(mine.concurrent_ceiling, max(my_min_warm, my_backlog + assigned_warm))
             # CASCADE cap: an all-local cascade can only spawn Σ surviving-tier capacity slots — an
             # overflow tier unavailable at boot is skipped, so that can be FEWER than the configured

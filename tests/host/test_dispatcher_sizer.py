@@ -3309,3 +3309,176 @@ def test_lease_does_not_dilute_targeted_work_in_the_warm_target(tmp_path, monkey
                            capacity_fn=_budget(12 * 1024, 999), clock=lambda: 1.0).tick()
     assert specs["clip@cold@c"].queued == 2                    # 4 − the 2 that fit
     assert (mine.warm_size, mine.concurrent_ceiling) == (8, 8)
+
+
+# --- recovery probe: a not-serving prompt pool keeps one warm slot targeted ----------------------
+# A warm-only prompt pool that isn't serving gets no untargeted capacity; without more, a small
+# queue (its legacy integer share 0) left it at warm 0 — it never spawned, never proved itself,
+# never came back. The shared plan gives it a 1-slot warm reservation (min_warm floor, seated under
+# the budget like any floor); a healed base promotes that slot, the pool serves again.
+
+def test_not_serving_prompt_pool_gets_a_one_slot_recovery_probe(tmp_path, monkeypatch):
+    specs = _capture_specs(monkeypatch)
+    pools = {"W": ("clip", "firecracker", "w", 1024, 1, 1, 8, 0, 0, False, 1, 1, False),
+             "C": ("clip", "cold", "c", 1024, 1, 1, 64, 0, 0, True, 1, 1, True)}
+    plan = _het_plan(tmp_path / "p", pools, 8 * 1024)            # every planner agrees
+    assert specs["clip@firecracker@w"].min_warm == 1
+    assert specs["clip@firecracker@w"].queued == 0                # still no untargeted capacity
+    own = _own_sizes(tmp_path / "own", pools, 8 * 1024, 999, legacy=False)
+    assert own["clip@firecracker@w"].warm_size == 1
+    assert plan["clip@firecracker@w"] >= 1
+
+
+def test_serving_prompt_pool_gets_no_probe_floor(tmp_path, monkeypatch):
+    specs = _capture_specs(monkeypatch)
+    pools = {"W": ("clip", "firecracker", "w", 1024, 1, 1, 8, 0, 0, False, 1, 1, True),
+             "C": ("clip", "cold", "c", 1024, 1, 1, 64, 0, 0, True, 1, 1, True)}
+    _het_plan(tmp_path, pools, 8 * 1024)
+    assert specs["clip@firecracker@w"].min_warm == 0
+
+
+def test_recovery_probe_respects_a_tiny_budget(tmp_path, monkeypatch):
+    # 3 slots of budget, three pools with baselines: the probe floor can't push past it
+    _capture_specs(monkeypatch)
+    pools = {"W": ("clip", "firecracker", "w", 1024, 1, 1, 8, 0, 0, False, 1, 1, False),
+             "C": ("clip", "cold", "c", 1024, 1, 1, 64, 1, 1, True, 1, 1, True),
+             "Y": ("red", "firecracker", "y", 1024, 5, 5, 64, 1, 1, False, 1, 1, True)}
+    plan = _het_plan(tmp_path, pools, 3 * 1024)
+    assert sum(plan.values()) <= 3
+
+
+def test_mixed_version_node_gets_no_probe_floor(tmp_path, monkeypatch):
+    # a pre-field peer on the node: legacy path, a929-exact — no probe floor
+    import json
+    from dataclasses import asdict
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    share.publish(_het_snapshot(("clip", "cold", "c", 1024, 1, 1, 64, 0, 0, True)))
+    raw = asdict(_peer("firecracker", "y", 0, 0, engine="red"))
+    for k in ("overflow_only", "lease", "running", "engines", "serving"):
+        raw.pop(k, None)
+    (tmp_path / FileNodeShare._filename("red", "firecracker", "n", "y")).write_text(
+        json.dumps(raw))
+    DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=8),
+                    _ServingPool(serving=False), share, _OVF_CFG, runtime="firecracker",
+                    backlog_fn=lambda: 1, untargeted_backlog_fn=lambda: 1, node="n",
+                    instance="w", capacity_fn=_budget(8 * 1024, 999), clock=lambda: 1.0,
+                    warm_only=True).tick()
+    assert specs["clip@firecracker@w"].min_warm == 0
+
+
+# --- closed loop: a REAL warm-only WarmPool driven by its own sizer ------------------------------
+
+def _closed_loop(tmp_path, *, u, schedule, extra_prompt=False, min_warm=0, budget=8,
+                 stale_streak_at=None):
+    """Run a warm-only fc prompt pool (real WarmPool + DispatcherSizer) beside a delayed cold peer
+    (and optionally a second, healthy prompt peer). `schedule[t]` = restores fail at tick t. Each
+    tick: sizer tick (resizes the pool), pool tick, then one untargeted job is served on a ready
+    slot if any. Returns per-tick (broken, serving, streak, served_so_far)."""
+    import logging
+    import sys
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
+    from test_pool import _FakeRuntime
+    from blastbox.host.pool import SlotState, WarmPool
+    logging.disable(logging.CRITICAL)
+
+    class _RT(_FakeRuntime):
+        broken = False
+
+        def spawn(self):
+            if self.broken:
+                raise RuntimeError("restore fails")
+            return super().spawn()
+    rt = _RT()
+    pool = WarmPool(runtime=rt, warm_size=0, spawn_rate_limit=1000.0,
+                    snapshot_rebuild_after=10**6)
+    share = FileNodeShare(str(tmp_path))
+    share.publish(_het_snapshot(("clip", "cold", "c", 1024, u, u, 64, 0, 0, True)))
+    if extra_prompt:
+        share.publish(_het_snapshot(("clip", "gvisor", "g", 1024, u, u, 8, 0, 0, False)))
+    sizer = DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=8,
+                                       min_warm=min_warm), pool, share, _OVF_CFG,
+                            runtime="firecracker", backlog_fn=lambda: u,
+                            untargeted_backlog_fn=lambda: u, node="n", instance="w",
+                            capacity_fn=_budget(budget * 1024, 999), clock=lambda: 1.0,
+                            warm_only=True)
+    out, served = [], 0
+    try:
+        for t, broken in enumerate(schedule):
+            rt.broken = broken
+            if stale_streak_at == t:
+                pool._restore_failure_streak = WarmPool.SERVING_RESTORE_FAILURES
+            sizer.tick()
+            pool.tick()
+            if u > 0 and any(s.state == SlotState.IDLE for s in pool._slots.values()):
+                slot = pool.claim(timeout_s=0.05)
+                if slot is not None:
+                    pool.release(slot)
+                    served += 1
+            out.append((broken, pool.is_serving(), pool._restore_failure_streak, served))
+    finally:
+        logging.disable(logging.NOTSET)
+    return out
+
+
+def test_closed_loop_u1_recovers_after_heal_and_stays_down_while_broken(tmp_path, monkeypatch):
+    # probe_liveness u=1: 3 transient failures then heal. Before the probe the fc pool's legacy
+    # integer share was 0 (cold sorts first): warm 0, never spawned, not serving forever.
+    _capture_specs(monkeypatch)
+    sched = [True] * 6 + [False] * 10
+    h = _closed_loop(tmp_path, u=1, schedule=sched)
+    assert all(not serving for broken, serving, _s, _n in h[3:6])      # down while broken
+    healed = [serving for broken, serving, _s, _n in h[6:]]
+    assert any(healed[:4])                                            # back within a few ticks
+    assert h[-1][1] is True and h[-1][3] >= 1 and h[-1][2] == 0        # served → streak reset
+
+
+def test_closed_loop_stays_not_serving_while_every_restore_fails(tmp_path, monkeypatch):
+    _capture_specs(monkeypatch)
+    h = _closed_loop(tmp_path, u=4, schedule=[True] * 30)
+    assert all(not serving for _b, serving, _s, _n in h[WarmPool_K():])
+    assert h[-1][3] == 0
+
+
+def test_stale_failures_after_a_served_job_recover_via_the_probe(tmp_path, monkeypatch):
+    # codex: failures are not generation-guarded, so old-generation WARMING timeouts landing after
+    # a new-generation served job can push the streak back to K (simulated here at tick 6 on a
+    # healthy base). Accepted, bounded: the probe slot restores on the healthy base, promotes, and
+    # the pool is serving again within one restore.
+    _capture_specs(monkeypatch)
+    h = _closed_loop(tmp_path, u=1, schedule=[False] * 12, stale_streak_at=6)
+    assert h[5][1] is True
+    assert any(serving for _b, serving, _s, _n in h[6:9])
+    assert h[-1][1] is True
+
+
+def WarmPool_K():
+    from blastbox.host.pool import WarmPool
+    return WarmPool.SERVING_RESTORE_FAILURES
+
+
+def test_closed_loop_liveness_fuzz(tmp_path, monkeypatch):
+    # over (u, a second prompt peer, min_warm, budget, fail/heal schedules): once restores heal the
+    # pool is serving again within a bounded number of ticks and serves a job (streak 0); while
+    # every restore fails (after K of them) it is never serving
+    import itertools
+    import random
+    _capture_specs(monkeypatch)
+    rng = random.Random(1313)
+    n = 0
+    for u, extra, mw, budget in itertools.product((1, 2, 5), (False, True), (0, 1), (3, 8)):
+        for lead in (0, rng.randint(1, 4)):
+            broken_len = rng.randint(4, 8)
+            sched = [False] * lead + [True] * broken_len + [False] * 10
+            n += 1
+            h = _closed_loop(tmp_path / str(n), u=u, schedule=sched, extra_prompt=extra,
+                             min_warm=mw, budget=budget)
+            end = lead + broken_len
+            if lead == 0:
+                # broken from the start (no slot ever ready): after K failures, never serving
+                assert not any(serving for _b, serving, streak, _nn in h[:end]
+                               if streak >= WarmPool_K()), (u, extra, mw, budget, sched, h)
+                assert not h[end - 1][1], (u, extra, mw, budget, sched, h)
+            after = [serving for _b, serving, _s, _nn in h[end:]]
+            assert any(after[:5]), (u, extra, mw, budget, sched, h)
+            assert h[-1][1] and h[-1][2] == 0, (u, extra, mw, budget, sched, h)
