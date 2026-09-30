@@ -51,6 +51,43 @@ def _pool_key(engine: str, tier: str, instance: str = "") -> str:
     return "@".join([engine, *([tier] if tier else []), *([instance] if instance else [])])
 
 
+def _even_int(total: int, n: int) -> list[int]:
+    """Split an integer count over n ranked pools, the remainder to the lowest ranks (sums to it)."""
+    base, rem = divmod(max(0, total), max(1, n))
+    return [base + (1 if rank < rem else 0) for rank in range(n)]
+
+
+def _fill_int(total: int, caps: list[int]) -> tuple[list[int], int]:
+    """Split `total` evenly over ranked pools, none past its cap; the surplus moves to the pools
+    with room left (same remainder rule each round). Returns (shares, what did not fit).
+    Terminates in ≤ len(caps)+1 rounds: a round either places everything or saturates a pool."""
+    alloc = [0] * len(caps)
+    rest = max(0, total)
+    active = [i for i, c in enumerate(caps) if c > 0]
+    while rest > 0 and active:
+        for i, give in zip(active, _even_int(rest, len(active))):
+            take = min(give, caps[i] - alloc[i])
+            alloc[i] += take
+            rest -= take
+        active = [i for i in active if alloc[i] < caps[i]]
+    return alloc, rest
+
+
+def _fill_float(total: float, caps: list[float]) -> tuple[list[float], float]:
+    """The float twin of _fill_int, for the planner's (fractional) demand."""
+    alloc = [0.0] * len(caps)
+    rest = max(0.0, float(total))
+    active = [i for i, c in enumerate(caps) if c > 0]
+    while rest > 1e-9 and active:
+        each = rest / len(active)
+        for i in active:
+            take = min(each, caps[i] - alloc[i])
+            alloc[i] += take
+            rest -= take
+        active = [i for i in active if caps[i] - alloc[i] > 1e-9]
+    return alloc, max(0.0, rest)
+
+
 class DispatcherSizer:
     def __init__(
         self,
@@ -287,7 +324,7 @@ class DispatcherSizer:
                 budget_ram_mib=my_budget.ram_mib, budget_vcpus=my_budget.vcpus,
                 stale_after_s=self._config.stale_after_s,
                 untargeted_backlog=min(backlog, self._last_untargeted),
-                overflow_only=self._overflow_only)
+                overflow_only=self._overflow_only, lease=False)
 
         # HEARTBEAT before the (possibly-slow) count: publish a fresh-ts snapshot with the last
         # tick's backlog so peers keep seeing us alive even when THIS count — a huge shared-
@@ -495,15 +532,22 @@ class DispatcherSizer:
         # demand is counted ONCE across the engine's pools (fc + gvisor + replicas), not per
         # tier. TARGETED jobs stay tier-scoped (split across same-(engine,tier) replicas only).
         # OVERFLOW-ONLY pools (a claim delay, BLASTBOX_CLAIM_UNTARGETED_AFTER_S) decline fresh
-        # untargeted work, so the untargeted count is split over the engine's PROMPT pools only;
-        # an overflow pool keeps its targeted share, reservation and floors, but no untargeted
-        # share (and so no budget priority for work it refuses). If an engine has NO prompt pool,
-        # every pool of it is an untargeted drainer again (the plain split) so the work is never
-        # left unsized. Decided per engine from the shared view, so every dispatcher derives the
-        # same membership.
+        # untargeted work, so the untargeted count goes to the engine's PROMPT pools FIRST, up to
+        # what they can take, and only the REST SPILLS to its overflow-only pools. A prompt pool's
+        # untargeted CAPACITY = its planner cap (the per-replica max_ceiling, as in its spec) minus
+        # what already occupies it — its running jobs (`assigned`) and the jobs queued TARGETED at
+        # its tier. Anything past that would be clipped by the water-fill; handing it to the prompt
+        # pool anyway strands it, and the overflow pool (demand = only its own `assigned`) would
+        # self-lock at its 1-slot baseline. Within each group the split is the even remainder rule
+        # (prompt: capped, surplus to the pools with room). An overflow pool keeps its targeted
+        # share, reservation and floors either way. If an engine has NO prompt pool, or no overflow
+        # pool to spill to, it is the plain even split over its live pools — so the shares always
+        # SUM to the untargeted count and the work is never left unsized. Decided per engine from
+        # the shared view, so every dispatcher derives the same shares.
         # VERSION GATE (NODE-wide): the exclusion applies only when EVERY snapshot in the view —
-        # every engine's pools, leases included — CARRIES the field (overflow_only is not None:
-        # presence, not value). The budget is node-wide: each planner plans ALL engines' pools and
+        # every engine's pools, leases included — CARRIES the fields (`overflow_only` AND `lease`
+        # not None: presence, not value; both came in one change, and a binary knowing one but not
+        # the other would plan differently — see DemandSnapshot.lease). The budget is node-wide: each planner plans ALL engines' pools and
         # takes its own slice. A dispatcher from before the field (of ANY engine) plans every engine
         # with the even split and cannot be told otherwise; if new planners excluded a pool while it
         # did not, the slices would come from DIFFERENT plans and could sum past the budget. So while
@@ -514,61 +558,90 @@ class DispatcherSizer:
         # ORPHAN LEASES (lease=True, a stopped dispatcher's final reservation) claim nothing, so
         # once every pool of the engine is current they are never drainers: not the prompt pool
         # that turns the exclusion on, not a recipient of a share. They keep their reservation.
-        # So for a current engine the drainers are its live prompt pools; if it has none, its live
-        # overflow-only pools (the plain split among them); if it has only leases, nobody — the
-        # queue has no claimant on this node, and a lease's ceiling is capped at its reservation.
+        # So for a current engine the shares go to its live pools (prompt first, spill to overflow,
+        # as above); if it has only leases, nobody — the queue has no claimant on this node, and a
+        # lease's ceiling is capped at its reservation.
         # A lease is published by current code, so it carries `overflow_only` and never switches
         # the gate off; in a LEGACY engine (some pool predates the field) it stays a pool of the
         # even split exactly as an older reader — which drops the `lease` key — counts it.
         engine_insts: dict[str, list[tuple[str, str]]] = {}
-        engine_live: dict[str, list[tuple[str, str]]] = {}
-        engine_prompt: dict[str, list[tuple[str, str]]] = {}
         node_all_carry = True
         for s in snaps:
-            key = (s.tier, s.instance)
-            engine_insts.setdefault(s.engine, []).append(key)
-            flag = getattr(s, "overflow_only", None)
-            node_all_carry = node_all_carry and flag is not None
-            if getattr(s, "lease", False) is True:
-                continue
-            engine_live.setdefault(s.engine, []).append(key)
-            if flag is not True:
-                engine_prompt.setdefault(s.engine, []).append(key)
+            engine_insts.setdefault(s.engine, []).append((s.tier, s.instance))
+            # BOTH fields present (see DemandSnapshot.lease: the gate's version invariant)
+            node_all_carry = (node_all_carry and getattr(s, "overflow_only", None) is not None
+                              and getattr(s, "lease", None) is not None)
         # on a CURRENT node (every snapshot carries the field) every engine uses the drainer rule
         # above; otherwise every engine keeps the legacy even split over all its pools
         engine_current = set(engine_insts) if node_all_carry else set()
-        # the pools that take a share of each engine's untargeted count (sorted: deterministic rank)
+        # LEGACY split: every pool of the engine, sorted (deterministic rank)
         untargeted_insts: dict[str, list[tuple[str, str]]] = {
-            eng: sorted((engine_prompt.get(eng) or engine_live.get(eng, []))
-                        if eng in engine_current else insts)
-            for eng, insts in engine_insts.items()}
+            eng: sorted(insts) for eng, insts in engine_insts.items()}
 
         def _split(s) -> tuple[int, int]:
             """(targeted-to-this-tier, untargeted) from a snapshot's backlog."""
             u = max(0, min(s.backlog, int(getattr(s, "untargeted_backlog", 0))))
             return s.backlog - u, u
 
-        def _drains_untargeted(engine: str, tier: str, instance: str) -> bool:
-            return (tier, instance) in untargeted_insts.get(engine, [(tier, instance)])
+        def _cap(s) -> int:
+            # the pool's planner cap, exactly as its PoolSpec.max_ceiling below
+            return max(1, _int_share(s.max_ceiling, s.engine, s.tier, s.instance), s.assigned)
+
+        # CURRENT engines: each live pool's untargeted share (float → demand, int → warm target),
+        # keyed (engine, tier, instance). Leases and absent pools get 0. The engine's count is the
+        # largest any live pool reports (they count one queue; a lagging count must not shrink it).
+        u_float: dict[tuple[str, str, str], float] = {}
+        u_int: dict[tuple[str, str, str], int] = {}
+        for eng in sorted(engine_current):
+            live = sorted((s for s in snaps if s.engine == eng
+                           and getattr(s, "lease", False) is not True),
+                          key=lambda s: (s.tier, s.instance))
+            if not live:
+                continue                      # leases only: nothing here can claim the queue
+            count = max(_split(s)[1] for s in live)
+            prompt = [s for s in live if getattr(s, "overflow_only", None) is not True]
+            ovf = [s for s in live if getattr(s, "overflow_only", None) is True]
+            if prompt and ovf:
+                pf, rest_f = _fill_float(count, [
+                    max(0.0, _cap(s) - s.assigned - _share(_split(s)[0], eng, s.tier))
+                    for s in prompt])
+                pi, rest_i = _fill_int(count, [
+                    max(0, _cap(s) - s.assigned
+                        - _int_share(_split(s)[0], eng, s.tier, s.instance))
+                    for s in prompt])
+                of = [rest_f / len(ovf)] * len(ovf)
+                oi = _even_int(rest_i, len(ovf))
+                groups = [(prompt, pf, pi), (ovf, of, oi)]
+            else:
+                drainers = prompt or ovf
+                groups = [(drainers, [count / len(drainers)] * len(drainers),
+                           _even_int(count, len(drainers)))]
+            for pools, fl, it in groups:
+                for s, f, i in zip(pools, fl, it):
+                    u_float[(eng, s.tier, s.instance)] = f
+                    u_int[(eng, s.tier, s.instance)] = i
 
         def _backlog_demand(s) -> float:
             targeted, untargeted = _split(s)
-            u_share = (untargeted / max(1, len(untargeted_insts.get(s.engine, [None])))
-                       if _drains_untargeted(s.engine, s.tier, s.instance) else 0.0)
+            if s.engine in engine_current:
+                u_share = u_float.get((s.engine, s.tier, s.instance), 0.0)
+            else:                                                       # legacy: even over all
+                u_share = untargeted / max(1, len(untargeted_insts.get(s.engine, [None])))
             return (_share(targeted, s.engine, s.tier)                  # tier-scoped, per replica
-                    + u_share)                                          # engine-wide, per drainer
+                    + u_share)                                          # engine-wide
 
         def _engine_int_share(total: int, engine: str, tier: str, instance: str) -> int:
-            # like _int_share, but over the engine's untargeted DRAINERS (every tier; overflow-only
-            # pools excluded while a prompt pool exists) — for splitting the UNTARGETED count so the
-            # shares still SUM to it across the engine's drainers. In a current engine a pool that
-            # is not a drainer gets 0; otherwise (not in the view at all) the base share.
+            # this pool's integer share of the engine's UNTARGETED count, so the shares SUM to it
+            # across the engine's pools: the spill-over split on a current node, else the legacy
+            # remainder split over every pool (a pool absent from the view gets the base share).
+            if engine in engine_current:
+                return u_int.get((engine, tier, instance), 0)
             lst = untargeted_insts.get(engine, [(tier, instance)])
             n = max(1, len(lst))
             base, rem = divmod(max(0, total), n)
             if (tier, instance) in lst:
                 return base + (1 if lst.index((tier, instance)) < rem else 0)
-            return 0 if engine in engine_current else base
+            return base
 
         specs = [
             PoolSpec(

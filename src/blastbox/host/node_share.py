@@ -120,11 +120,20 @@ class DemandSnapshot:
                                  # older planner splits evenly, so the exclusion is applied to an
                                  # engine only while EVERY pool of it carries the field — else the
                                  # old and new planners would compute different plans for one node.
-    lease: bool = False          # an ORPHAN LEASE (DispatcherSizer.publish_orphan_lease): a stopped
-                                 # dispatcher's final snapshot, reserving slots it could not reap.
-                                 # Nothing behind it claims work, so the planner never counts it as
-                                 # an untargeted drainer — it keeps only its reservation. An older
+    lease: Optional[bool] = None
+                                 # an ORPHAN LEASE (DispatcherSizer.publish_orphan_lease) = True: a
+                                 # stopped dispatcher's final snapshot, reserving slots it could not
+                                 # reap. Nothing behind it claims work, so the planner never counts
+                                 # it as an untargeted drainer — it keeps only its reservation. A
+                                 # live pool publishes False; None = the key was ABSENT. An older
                                  # reader drops the key and treats the lease as it always did.
+                                 # VERSION-GATE INVARIANT: the overflow exclusion (DispatcherSizer.
+                                 # tick) is enabled only when every snapshot on the node carries BOTH
+                                 # `overflow_only` and `lease` — both arrived in one change (#193),
+                                 # and a binary that published overflow_only without understanding
+                                 # lease would read a current lease as a prompt pool and plan
+                                 # differently. Keying on both ENFORCES that. Any FUTURE field that
+                                 # changes the split must be added to that presence check too.
 
 
 class NodeShare(Protocol):
@@ -385,7 +394,7 @@ def _valid(snap: DemandSnapshot) -> bool:
         and _finite_in(snap.stale_after_s, 0, _MAX_TS)
         and _finite_in(snap.untargeted_backlog, 0, _MAX_COUNT)
         and (snap.overflow_only is None or isinstance(snap.overflow_only, bool))
-        and isinstance(snap.lease, bool)
+        and (snap.lease is None or isinstance(snap.lease, bool))
     )
 
 

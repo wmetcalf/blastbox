@@ -1699,7 +1699,7 @@ def test_demand_snapshot_field_order_is_append_only():
     assert (snap.node == "node-x" and snap.tier == "firecracker"
             and snap.refresh_s == 5.0 and snap.instance == "inst-1" and snap.balancing is True)
     # The consensus/budget/untargeted fields keep their defaults — none was shifted by the append.
-    assert snap.untargeted_backlog == 0 and snap.overflow_only is None and snap.lease is False
+    assert snap.untargeted_backlog == 0 and snap.overflow_only is None and snap.lease is None
     assert snap.budget_ram_mib == 0.0 and snap.budget_vcpus == 0.0 and snap.stale_after_s == 0.0
 
 
@@ -1872,7 +1872,7 @@ def _capture_specs(monkeypatch):
 
 def _peer(tier, instance, backlog, untargeted, *, overflow_only=None, max_ceiling=64,
           engine="clip", ram=1024):
-    kw = {} if overflow_only is None else {"overflow_only": overflow_only}
+    kw = {} if overflow_only is None else {"overflow_only": overflow_only, "lease": False}
     return DemandSnapshot(engine, backlog, 0, ram, 1, 0, max_ceiling, 1.0, ts=1.0, node="n",
                           tier=tier, instance=instance, untargeted_backlog=untargeted,
                           balancing=True, **kw)
@@ -1948,6 +1948,7 @@ def test_snapshot_without_overflow_field_is_not_overflow_only(tmp_path, monkeypa
     share = FileNodeShare(str(tmp_path))
     old = asdict(_peer("cold", "c", 16, 16))
     old.pop("overflow_only", None)
+    old.pop("lease", None)
     (tmp_path / FileNodeShare._filename("clip", "cold", "n", "c")).write_text(json.dumps(old))
     mine = _fc_sizer(share, backlog=16, untargeted=16).tick()
     assert "clip@cold@c" in specs                     # the old snapshot was accepted
@@ -2015,7 +2016,7 @@ def test_overflow_pool_keeps_its_reservation_and_floor(tmp_path, monkeypatch):
     share = FileNodeShare(str(tmp_path))
     share.publish(DemandSnapshot("clip", 16, 3, 1024, 1, 0, 64, 1.0, ts=1.0, node="n", tier="cold",
                                  instance="c", untargeted_backlog=16, overflow_only=True,
-                                 balancing=True))
+                                 balancing=True, lease=False))
     _fc_sizer(share, backlog=16, untargeted=16, ram_budget=8 * 1024).tick()
     cold = specs["clip@cold@c"]
     assert cold.reserved == 3 and cold.demand == 3 and cold.queued == 0
@@ -2068,6 +2069,7 @@ def _write_old(tmp_path_dir, tier, instance, backlog, untargeted, *, assigned=0,
     from dataclasses import asdict
     raw = asdict(_peer(tier, instance, backlog, untargeted, engine=engine))
     raw.pop("overflow_only", None)
+    raw.pop("lease", None)
     raw["assigned"] = assigned
     (tmp_path_dir / FileNodeShare._filename(engine, tier, "n", instance)).write_text(
         json.dumps(raw))
@@ -2375,3 +2377,133 @@ def test_untargeted_shares_sum_over_live_pools_with_leases(tmp_path, monkeypatch
                     assert specs[f"clip@firecracker@l{i}"].queued == 0
                     assert plan[f"clip@firecracker@l{i}"].concurrent_ceiling == 1 + i
                 assert sum(p.concurrent_ceiling * 1024 for p in plan.values()) <= 10 * 1024
+
+
+# --- spill-over: what the prompt pools can't take goes to the overflow pools ---------------------
+# The prompt pools absorb the untargeted count only up to their CAPACITY — max_ceiling (the
+# planner's per-replica cap) minus what is already running there (assigned) and what is queued
+# targeted at that tier. The rest spills to the live overflow-only pools, so a capped warm pool
+# beside an overflow cold doesn't strand the burst (cold was pinned at ceiling 1 forever).
+
+def _cpeer(tier, instance, backlog, untargeted, *, overflow_only, max_ceiling=64, assigned=0,
+           engine="clip"):
+    return DemandSnapshot(engine, backlog, assigned, 1024, 1, 0, max_ceiling, 1.0, ts=1.0,
+                          node="n", tier=tier, instance=instance, untargeted_backlog=untargeted,
+                          balancing=True, overflow_only=overflow_only, lease=False)
+
+
+def test_capped_prompt_pool_spills_untargeted_to_overflow(tmp_path, monkeypatch):
+    # reviewer's cap.py: budget 10; clip warm W capped at 2 and running 2; clip cold C overflow-only
+    # with 20 untargeted; red Y 20 queued. W can take no more, so C is sized for the burst.
+    from blastbox.host.node_sizer import NodeBudget, plan_sizes
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    share.publish(_cpeer("firecracker", "w", 20, 20, overflow_only=False, max_ceiling=2,
+                         assigned=2))
+    share.publish(_cpeer("cold", "c", 20, 20, overflow_only=True))
+    DispatcherSizer(EngineNode("red", "-", slot_ram_mib=1024, max_ceiling=64), _Pool(), share,
+                    _OVF_CFG, runtime="firecracker", backlog_fn=lambda: 20,
+                    untargeted_backlog_fn=lambda: 20, node="n", instance="y",
+                    capacity_fn=_budget(10 * 1024, 999), clock=lambda: 1.0,
+                    overflow_only=False).tick()
+    assert specs["clip@firecracker@w"].queued == 0      # capacity 2 − 2 running = 0
+    assert specs["clip@cold@c"].queued == 20
+    plan = plan_sizes(list(specs.values()), NodeBudget(ram_mib=10 * 1024, vcpus=999))
+    assert plan["clip@cold@c"].concurrent_ceiling >= 3   # not the self-locking 1
+    assert plan["clip@firecracker@w"].concurrent_ceiling == 2
+    assert sum(p.concurrent_ceiling * 1024 for p in plan.values()) <= 10 * 1024
+
+
+def test_partly_capped_prompt_pool_keeps_its_capacity_and_spills_the_rest(tmp_path, monkeypatch):
+    # prompt fc capped at 6 (nothing running, nothing targeted): it is sized and warmed for 6, the
+    # overflow cold for the other 14.
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    share.publish(_cpeer("cold", "c", 20, 20, overflow_only=True))
+    mine = _fc_sizer(share, backlog=20, untargeted=20, max_ceiling=6).tick()
+    assert specs["clip@firecracker@f"].queued == 6
+    assert specs["clip@cold@c"].queued == 14
+    assert mine.warm_size == 6
+
+
+def test_targeted_work_uses_up_prompt_capacity(tmp_path, monkeypatch):
+    # prompt fc capped at 6 with 2 jobs targeted at it (backlog 22, 20 untargeted): 4 untargeted
+    # fit, 16 spill.
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    share.publish(_cpeer("cold", "c", 20, 20, overflow_only=True))
+    mine = _fc_sizer(share, backlog=22, untargeted=20, max_ceiling=6).tick()
+    assert specs["clip@firecracker@f"].queued == 6            # 2 targeted + 4 untargeted
+    assert specs["clip@cold@c"].queued == 16
+    assert mine.warm_size == 6
+
+
+def test_uncapped_prompt_pools_still_leave_overflow_nothing(tmp_path, monkeypatch):
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    share.publish(_cpeer("cold", "c", 20, 20, overflow_only=True))
+    _fc_sizer(share, backlog=20, untargeted=20, max_ceiling=20).tick()
+    assert specs["clip@firecracker@f"].queued == 20 and specs["clip@cold@c"].queued == 0
+
+
+def test_spill_shares_sum_to_the_count_over_a_grid(tmp_path, monkeypatch):
+    # Σ untargeted shares == count for every mix of prompt caps × overflow pools × counts, in both
+    # the float demand and the integer warm split; no prompt pool is handed more than its capacity
+    # while an overflow pool exists.
+    import itertools
+    specs = _capture_specs(monkeypatch)
+    n = 0
+    for cap_a, cap_b, n_ovf, u in itertools.product((1, 3, 8, 64), (None, 2, 64), (0, 1, 2),
+                                                     (0, 1, 5, 13, 40)):
+        n += 1
+        share = FileNodeShare(str(tmp_path / str(n)))
+        prompt = [("firecracker", "a", cap_a)] + ([("gvisor", "b", cap_b)] if cap_b else [])
+        ovf = [("cold", f"c{i}") for i in range(n_ovf)]
+        for tier, inst, cap in prompt:
+            share.publish(_cpeer(tier, inst, u, u, overflow_only=False, max_ceiling=cap))
+        for tier, inst in ovf:
+            share.publish(_cpeer(tier, inst, u, u, overflow_only=True))
+        warm_total = 0
+        for tier, inst, cap in prompt:
+            mine = _fc_sizer(share, backlog=u, untargeted=u, max_ceiling=cap, instance=inst,
+                             tier=tier).tick()
+            q = specs[f"clip@{tier}@{inst}"].queued
+            if ovf:
+                assert q <= cap + 1e-9, (cap_a, cap_b, n_ovf, u)
+            assert abs(sum(s.queued for s in specs.values()) - u) < 1e-9, (cap_a, cap_b, n_ovf, u)
+            warm_total += mine.warm_size
+        prompt_cap = sum(c for _, _, c in prompt)
+        if ovf:
+            # the prompt pools warm exactly what they can absorb; the rest is the overflow's
+            assert warm_total == min(u, prompt_cap), (cap_a, cap_b, n_ovf, u)
+            for tier, inst in ovf:
+                share_u = specs[f"clip@{tier}@{inst}"].queued
+                assert abs(share_u - (u - min(u, prompt_cap)) / n_ovf) < 1e-9
+        else:
+            assert warm_total == min(u, prompt_cap) or warm_total <= u
+
+
+def test_gate_requires_lease_field_too(tmp_path, monkeypatch):
+    # The gate keys on BOTH fields: a snapshot with `overflow_only` but no `lease` key comes from a
+    # binary that would read a current lease as a prompt pool and plan differently, so the node
+    # stays on the even split while one is in view.
+    import json
+    from dataclasses import asdict
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    raw = asdict(_peer("cold", "c", 16, 16, overflow_only=True))
+    raw.pop("lease", None)
+    (tmp_path / FileNodeShare._filename("clip", "cold", "n", "c")).write_text(json.dumps(raw))
+    _fc_sizer(share, backlog=16, untargeted=16).tick()
+    assert "clip@cold@c" in specs
+    assert specs["clip@cold@c"].queued == 8 and specs["clip@firecracker@f"].queued == 8
+
+
+def test_spilled_share_warms_an_overflow_pool(tmp_path, monkeypatch):
+    # the INTEGER (warm-target) split spills too: prompt fc capped at 6 with 2 targeted at it can
+    # take 4 untargeted, so an overflow-only gvisor pool warms the other 16.
+    share = FileNodeShare(str(tmp_path))
+    share.publish(_cpeer("firecracker", "f", 22, 20, overflow_only=False, max_ceiling=6))
+    mine = _fc_sizer(share, backlog=20, untargeted=20, overflow_only=True, tier="gvisor",
+                     instance="g").tick()
+    assert mine.warm_size == 16
