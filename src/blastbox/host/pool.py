@@ -401,18 +401,15 @@ class WarmPool:
         # failures must feed base invalidation too: "cannot restore the base" is even stronger
         # evidence the base is bad than "jobs restored from it fail".
         self._spawn_consecutive_failures = 0
-        # A SEPARATE count of consecutive restore-path failures (the same events as above: spawn
-        # raising, a slot timing out in WARMING, a promoted slot dying unproven), for is_serving()
-        # only. Unlike _spawn_consecutive_failures — whose resets the base-repair logic relies on
-        # and which a clean served release clears — it is reset by any successful PROMOTION (a
-        # slot became ready), so one transient failure can't mark an idle pool unserving forever.
+        # A SEPARATE count of restore-path failures (the same events as above: spawn raising, a
+        # slot timing out in WARMING, a promoted slot dying unproven — at the health tick or at
+        # claim time), for is_serving() only, counted in the order they happen. It resets ONLY on
+        # PROOF that the restore path works: a slot completing a clean served job, or a live IDLE
+        # slot leaving healthy (surplus reap on a scale-down). Promotion alone is not proof — a
+        # poisoned restore can pass is_ready() and die — and needs no reset: a ready slot already
+        # makes the pool serving. Kept apart from _spawn_consecutive_failures so the base-repair
+        # logic's own counter and its resets are untouched.
         self._restore_failure_streak = 0
-        # A PROMOTION resets that streak only provisionally: the value it cleared is kept here per
-        # promoted-unproven slot, and if the slot then dies before serving a job (the promotion was
-        # refuted) the streak resumes from it. A served job — or the slot leaving healthy — makes
-        # the reset stick. Without this, promote-then-die cycles reset the streak every time and a
-        # pool that never serves a job kept reporting is_serving().
-        self._streak_at_promotion: dict[str, int] = {}
         # Keyed by slot_id, NOT stored on the slot: runtimes supply their own slot types (e.g.
         # AwsWorkerSlot) that duck-type the Slot protocol without inheriting its dataclass fields,
         # so attributes added to Slot are not universally present.
@@ -1010,7 +1007,7 @@ class WarmPool:
                 # a successfully validated engine run still counted as consecutive (PR #82).
                 self._spawn_consecutive_failures = 0
                 self._promoted_unproven.discard(slot.slot_id)
-                self._streak_at_promotion.pop(slot.slot_id, None)   # its promotion is proven
+                self._restore_failure_streak = 0     # a served job proves the restore path
                 # GENERATION-GUARDED, like the evidence it arbitrates -- and BOTH counters, not
                 # just the per-base one. A long-running slot from a retired generation succeeding
                 # late still bumped the pool-wide counter, which is the fallback token for a
@@ -1094,7 +1091,7 @@ class WarmPool:
                 # so it — not promotion — is what clears the restore-failure streak.
                 self._spawn_consecutive_failures = 0
                 self._promoted_unproven.discard(slot.slot_id)
-                self._streak_at_promotion.pop(slot.slot_id, None)   # its promotion is proven
+                self._restore_failure_streak = 0     # a served job proves the restore path
             if tracked:
                 slot_failures = self._slot_failures.get(hkey, 0)
                 last_success = self._slot_last_success.get(hkey, 0.0)
@@ -1700,6 +1697,10 @@ class WarmPool:
             if surplus <= 0:
                 return
             victims = [s for s in self._slots.values() if s.state == SlotState.IDLE][:surplus]
+            if victims:
+                # a live IDLE slot leaving healthy (not found dead by the health check, which
+                # demotes dead ones) proves the restore path worked for it (is_serving)
+                self._restore_failure_streak = 0
             # Flip to DRAINING HERE, still under the selection lock, so a concurrent
             # claim() (which only takes IDLE) cannot grab a victim between selection and
             # reap — otherwise we'd destroy a slot mid-job. (stop() takes the same care.)
@@ -1972,9 +1973,10 @@ class WarmPool:
         there with the dispatcher's warm_only) for sizing it for an engine's UNTARGETED spill.
 
         False only when BOTH hold: no slot is ready (IDLE) or busy (ASSIGNED), and the RESTORE
-        path is failing — at least SERVING_RESTORE_FAILURES consecutive spawn/restore failures
-        (spawn raising, a slot timing out in WARMING, a promoted slot dying unproven), a count any
-        successful promotion resets. WARMING slots are not evidence either way: a pool whose
+        path is failing — at least SERVING_RESTORE_FAILURES restore failures (spawn raising, a slot
+        timing out in WARMING, a promoted slot dying unproven) since the last PROOF the path works:
+        a clean served job, or a live idle slot leaving healthy. Promotion alone is not proof, and
+        needs no reset since a ready slot already makes the pool serving. WARMING slots are not evidence either way: a pool whose
         restores keep failing always has some slot warming, and a healthy respawn has no failure
         count. Job/worker faults (a dirty release) never count: a burst of bad samples recycles
         slots, it doesn't break the pool. Everything else — ready, busy, healthily warming, empty
@@ -2185,9 +2187,7 @@ class WarmPool:
                 if candidate.slot_id in self._promoted_unproven:
                     self._promoted_unproven.discard(candidate.slot_id)
                     self._spawn_consecutive_failures += 1
-                    self._restore_failure_streak = max(
-                        self._restore_failure_streak,
-                        self._streak_at_promotion.pop(candidate.slot_id, 0)) + 1
+                    self._restore_failure_streak += 1
                     claim_unproven_death = True
                     warm_failures = self._spawn_consecutive_failures
                 # The probe above takes seconds, so stop() can land mid-probe; the chokepoint
@@ -2282,9 +2282,6 @@ class WarmPool:
                     if slot.slot_id in self._slots and slot.state == SlotState.WARMING:
                         slot.state = SlotState.IDLE
                         newly_idle.append(slot.slot_id)
-                        # provisional: kept for revocation if it dies unproven (is_serving)
-                        self._streak_at_promotion[slot.slot_id] = self._restore_failure_streak
-                        self._restore_failure_streak = 0
                         # The slot has now been READY. Both of these are WARMING-scoped: the credit
                         # exists only to offset the warming timeout, and leaving it behind turned a
                         # timeout ledger into a permanent state-history flag that the undo path
@@ -2945,8 +2942,6 @@ class WarmPool:
         # workload with recurring failures or resizes grows this set without bound, and none of its
         # entries can ever be consulted again (PR #82).
         self._promoted_unproven.discard(slot_id)
-        # the slot is gone without a refuting death (e.g. a healthy surplus reap): keep the reset
-        self._streak_at_promotion.pop(slot_id, None)
 
     def _current_failure_streak(self) -> int:
         """The pool-wide consecutive-failure streak, read NOW under the lock.
@@ -3756,7 +3751,6 @@ class WarmPool:
         # see _promote_warming. Collected here so the streak reflects them before the rebuild
         # decision below.
         unproven_deaths = 0
-        revoked_streak = 0          # the streak the refuted promotions had provisionally cleared
         # Slot ids whose post-promotion death should be attributed to their owning tier: the
         # spawn SUCCEEDED, so the cascade has no guilt recorded and would otherwise fall back to
         # invalidating every tier (PR #82).
@@ -3961,8 +3955,6 @@ class WarmPool:
                             and cur.slot_id not in suspected):
                         self._promoted_unproven.discard(cur.slot_id)
                         unproven_deaths += 1
-                        revoked_streak = max(revoked_streak,
-                                             self._streak_at_promotion.pop(cur.slot_id, 0))
                         blamed.append(cur.slot_id)
                     if slot.slot_id in suspected:
                         self._suspected_unknown.add(slot.slot_id)
@@ -3984,8 +3976,7 @@ class WarmPool:
         if unproven_deaths:
             with self._lock:
                 self._spawn_consecutive_failures += unproven_deaths
-                self._restore_failure_streak = (max(self._restore_failure_streak, revoked_streak)
-                                                + unproven_deaths)
+                self._restore_failure_streak += unproven_deaths
                 warm_failures = self._spawn_consecutive_failures
             if self._maybe_rebuild_base(warm_failures, reason="spawn"):
                 self._rebuilt_this_tick = True

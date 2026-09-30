@@ -4858,9 +4858,9 @@ def test_the_runtime_is_closed_only_after_its_slots_have_been_reaped() -> None:
 
 
 # --- is_serving: the node sizer's "can this warm pool take untargeted work" signal ---------------
-# False only while the RESTORE path is failing (>= WarmPool.SERVING_RESTORE_FAILURES consecutive
-# spawn/restore failures, reset by any successful promotion) AND no slot is ready or busy. Job /
-# worker faults never count.
+# False only while the RESTORE path is failing (>= WarmPool.SERVING_RESTORE_FAILURES restore
+# failures since the last PROOF — a clean served job, or a live idle slot leaving healthy) AND no
+# slot is ready or busy. Promotion is not proof. Job / worker faults never count.
 
 class _FailingSpawnRuntime(_FakeRuntime):
     def spawn(self) -> Slot:
@@ -4921,9 +4921,10 @@ def test_worker_faults_do_not_make_a_pool_unserving() -> None:
         assert pool.is_serving() is True
 
 
-def test_a_successful_promotion_resets_the_restore_streak() -> None:
-    # probe_pool: failing restores, then a healthy one — the promotion ends the streak, so a pool
-    # later scaled to warm 0 is serving (not stuck not-serving until a job runs)
+def test_a_healthy_slot_leaving_resets_the_restore_streak() -> None:
+    # probe_pool: failing restores, then a healthy one (serving while it is ready); scaled to warm
+    # 0, the live idle slot leaves healthy — that is proof, so the empty pool is serving (not stuck
+    # not-serving until a job runs)
     class _Flaky(_FakeRuntime):
         fails = 4
 
@@ -4945,7 +4946,6 @@ def test_a_successful_promotion_resets_the_restore_streak() -> None:
         pool.tick()
     assert pool.slot_count == 0
     assert pool.is_serving() is True
-    assert pool._streak_at_promotion == {}                  # the reaped slot's record is gone
 
 
 def test_is_serving_false_when_restores_time_out_even_with_a_slot_warming() -> None:
@@ -4996,8 +4996,119 @@ def test_a_served_job_proves_the_restore_path() -> None:
     assert s is not None
     pool.release(s)
     assert pool._restore_failure_streak == 0
-    assert s.slot_id not in pool._streak_at_promotion       # proven: no revocation record left
     pool.resize(warm_size=0, concurrent_ceiling=4)
     for _ in range(6):
         pool.tick()
     assert pool.slot_count == 0 and pool.is_serving() is True
+
+
+class _ClaimDeadRuntime(_FakeRuntime):
+    """Restores fail `fails` times, then succeed; `claim_dead` slots are found dead at claim."""
+
+    def __init__(self, fails: int = 0) -> None:
+        super().__init__()
+        self.fails = fails
+        self.claim_dead: set[str] = set()
+
+    def spawn(self) -> Slot:
+        if self.fails > 0:
+            self.fails -= 1
+            raise RuntimeError("restore fail")
+        return super().spawn()
+
+    def is_alive_for_claim(self, slot: Slot, budget_s: float | None = None) -> bool:
+        return slot.slot_id not in self.claim_dead
+
+
+def _tick_until_idle(pool: WarmPool, n: int) -> list:
+    for _ in range(12):
+        pool.tick()
+        idle = [s for s in pool._slots.values() if s.state == SlotState.IDLE]
+        if len(idle) >= n:
+            return idle
+    raise AssertionError("slots never became ready")
+
+
+def test_promotion_does_not_reset_the_streak() -> None:
+    rt = _ClaimDeadRuntime(fails=2)
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=1000.0, snapshot_rebuild_after=99)
+    _tick_until_idle(pool, 1)
+    assert pool._restore_failure_streak == 2        # promoted, but not proof
+    assert pool.is_serving() is True               # the ready slot is what makes it serving
+
+
+def test_claim_probe_unproven_death_counts() -> None:
+    # the CLAIM path finds a promoted, never-used slot dead: that is a restore failure
+    rt = _ClaimDeadRuntime(fails=2)
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=1000.0, snapshot_rebuild_after=99)
+    idle = _tick_until_idle(pool, 1)
+    before = pool._restore_failure_streak
+    rt.claim_dead.add(idle[0].slot_id)
+    rt.fails = 99                                   # and restores keep failing
+    assert pool.claim(timeout_s=0.05) is None
+    assert pool._restore_failure_streak == before + 1 == 3
+    assert pool.is_serving() is False
+
+
+def test_health_tick_unproven_death_counts() -> None:
+    # the HEALTH TICK finds a promoted, never-used slot dead: that is a restore failure
+    rt = _ClaimDeadRuntime(fails=2)
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=1000.0, snapshot_rebuild_after=99)
+    idle = _tick_until_idle(pool, 1)
+    before = pool._restore_failure_streak
+    rt.fails = 99
+    rt.set_alive(idle[0].slot_id, False)
+    pool.tick()
+    assert pool._restore_failure_streak >= before + 1
+    assert pool.is_serving() is False
+
+
+def test_out_of_order_unproven_deaths_are_each_counted() -> None:
+    # codex: warm 2, one restore failure, A then B promote, B dies, then A dies — 3 failures, no
+    # usable slot → not serving (the old max()-based revocation lost one and stayed serving)
+    rt = _ClaimDeadRuntime(fails=1)
+    pool = WarmPool(runtime=rt, warm_size=2, spawn_rate_limit=1000.0, snapshot_rebuild_after=99)
+    a, b = _tick_until_idle(pool, 2)[:2]
+    rt.fails = 99
+    rt.claim_dead.update({a.slot_id, b.slot_id})
+    pool._slots[a.slot_id].state = SlotState.ASSIGNED      # hold A back so B is probed first
+    assert pool.claim(timeout_s=0.05) is None             # B found dead
+    pool._slots[a.slot_id].state = SlotState.IDLE
+    assert pool.claim(timeout_s=0.05) is None             # then A found dead
+    assert pool._restore_failure_streak == 3
+    assert not any(s.state in (SlotState.IDLE, SlotState.ASSIGNED) for s in pool._slots.values())
+    assert pool.is_serving() is False
+
+
+def test_a_served_job_is_not_undone_by_an_older_promotion_dying() -> None:
+    # opus: after failing restores, B serves a clean job (proof: streak 0); then A — promoted
+    # before that proof — is found dead unproven. That is ONE new failure (streak 1, serving),
+    # not a revival of the old count.
+    rt = _ClaimDeadRuntime(fails=3)
+    pool = WarmPool(runtime=rt, warm_size=2, spawn_rate_limit=1000.0, snapshot_rebuild_after=99)
+    a, b = _tick_until_idle(pool, 2)[:2]
+    pool._slots[a.slot_id].state = SlotState.ASSIGNED
+    s = pool.claim(timeout_s=0.05)
+    assert s is not None and s.slot_id == b.slot_id
+    pool._slots[a.slot_id].state = SlotState.IDLE
+    pool.release(s)
+    assert pool._restore_failure_streak == 0
+    rt.claim_dead.add(a.slot_id)
+    for other in pool._slots.values():                     # probe A only (B may be recycled)
+        if other.slot_id != a.slot_id and other.state == SlotState.IDLE:
+            other.state = SlotState.ASSIGNED
+    assert pool.claim(timeout_s=0.05) is None
+    assert pool._restore_failure_streak == 1
+
+
+def test_a_job_that_returned_an_engine_error_proves_the_restore_path() -> None:
+    # a dirty release with fault="job" (the worker RAN and returned a valid engine_error) is proof
+    # the restored worker is responsive, like a clean release
+    rt = _ClaimDeadRuntime(fails=3)
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=1000.0, snapshot_rebuild_after=99)
+    _tick_until_idle(pool, 1)
+    assert pool._restore_failure_streak == 3
+    s = pool.claim(timeout_s=0.05)
+    assert s is not None
+    pool.release(s, dirty=True, fault="job")
+    assert pool._restore_failure_streak == 0
