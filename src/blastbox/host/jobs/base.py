@@ -189,8 +189,9 @@ def untargeted_cutoff(untargeted_min_age_s: float, now: float) -> float | None:
 
     Raises ValueError for ``nan``/``inf``/negatives rather than coercing: ``nan`` compares false
     against every age, so it would silently stop the claimant from ever taking an untargeted job,
-    and ``inf`` does the same on purpose-looking terms. The CLI parses the env var leniently (warn
-    and keep 0); a direct caller passing nonsense is a bug and should hear about it."""
+    and ``inf`` does the same on purpose-looking terms. The CLI refuses such an env value at
+    startup too (before the pool spawns anything); a direct caller passing nonsense is a bug and
+    should hear about it."""
     value = float(untargeted_min_age_s)
     if not math.isfinite(value) or value < 0:
         raise ValueError(

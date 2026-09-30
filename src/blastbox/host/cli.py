@@ -885,6 +885,11 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
             raise ValueError(
                 "BLASTBOX_CLAIM_UNTARGETED_AFTER_S is supported by the container dispatcher only, "
                 "not the network-endpoint tiers (aws/static/cascade). Unset it on this dispatcher.")
+        # the store's capability — the Dispatcher checks it too, but only after pool.start(),
+        # outside the pool's cleanup: a refused store would orphan the warm workers it spawned
+        from blastbox.host.dispatch import require_untargeted_delay_support
+
+        require_untargeted_delay_support(store)
 
     warm_only = os.environ.get("BLASTBOX_DISPATCH_WARM_ONLY", "").strip().lower() in (
         "1",

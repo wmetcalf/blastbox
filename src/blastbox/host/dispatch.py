@@ -431,6 +431,30 @@ def _accepts_kwarg(fn: Any, name: str) -> bool:
     return any(p.name == name or p.kind is inspect.Parameter.VAR_KEYWORD for p in params)
 
 
+def require_untargeted_delay_support(store: Any) -> None:
+    """Refuse (ValueError) a job store that can't honour an untargeted claim delay
+    (BLASTBOX_CLAIM_UNTARGETED_AFTER_S). Shared by the Dispatcher constructor and the CLI, which
+    calls it BEFORE pool.start() so a refused store never leaves warm workers behind.
+
+    The store must DECLARE that it honours the delay (supports_untargeted_delay = True, as the
+    memory / SQL / Redis stores do); a store that doesn't declare it — a custom store, or a wrapper
+    that doesn't expose the attribute — is refused, since neither the signature nor a missing
+    attribute is proof (HttpJobStore declares the kwarg only to refuse it; a **kw claim_next
+    accepts it and may drop it). What this CANNOT detect: a delegating proxy that forwards the flag
+    from the store it wraps but drops the kwarg in its own claim_next. Honouring the declared
+    contract is that wrapper author's job. The signature check stays as a second guard: a legacy
+    claim_next(*, claimant_tier=) would raise TypeError on EVERY poll."""
+    store_name = type(store).__name__
+    if getattr(store, "supports_untargeted_delay", False) is not True:
+        raise ValueError(
+            f"claim_untargeted_after_s is set but {store_name} does not state that it "
+            "honours an untargeted claim delay (supports_untargeted_delay is not True)")
+    if not _accepts_kwarg(store.claim_next, "untargeted_min_age_s"):
+        raise ValueError(
+            f"claim_untargeted_after_s is set but {store_name}.claim_next() does not "
+            "accept untargeted_min_age_s")
+
+
 class Dispatcher:
     """Claim queued jobs and execute each in a disposable worker container.
 
@@ -713,24 +737,7 @@ class Dispatcher:
                     f"claim_untargeted_after_s ({self._claim_untargeted_after_s:g}s) must be below "
                     f"max_queued_age_s ({self._max_queued_age_s:g}s): the queued-job reaper would "
                     "expire untargeted work before this dispatcher may claim it")
-            # The store must DECLARE that it honours the delay (supports_untargeted_delay = True, as
-            # the memory / SQL / Redis stores do); a store that doesn't declare it — a custom store,
-            # or a wrapper that doesn't expose the attribute — is refused, since neither the
-            # signature nor a missing attribute is proof (HttpJobStore declares the kwarg only to
-            # refuse it; a **kw claim_next accepts it and may drop it). What this CANNOT detect: a
-            # delegating proxy that forwards the flag from the store it wraps but drops the kwarg in
-            # its own claim_next. Honouring the declared contract is that wrapper author's job. The
-            # signature check stays as a second guard: a legacy claim_next(*, claimant_tier=) would
-            # raise TypeError on EVERY poll.
-            store_name = type(self._job_store).__name__
-            if getattr(self._job_store, "supports_untargeted_delay", False) is not True:
-                raise ValueError(
-                    f"claim_untargeted_after_s is set but {store_name} does not state that it "
-                    "honours an untargeted claim delay (supports_untargeted_delay is not True)")
-            if not _accepts_kwarg(self._job_store.claim_next, "untargeted_min_age_s"):
-                raise ValueError(
-                    f"claim_untargeted_after_s is set but {store_name}.claim_next() does not "
-                    "accept untargeted_min_age_s")
+            require_untargeted_delay_support(self._job_store)
 
         # Personality registry built ONCE from the operator env (does not change per job).
         from blastbox.host.netpolicy import parse_personalities

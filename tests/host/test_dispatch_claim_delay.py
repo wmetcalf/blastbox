@@ -329,3 +329,34 @@ def test_dispatch_cmd_refuses_an_invalid_delay_before_spawning_slots(monkeypatch
     with pytest.raises(ValueError, match="BLASTBOX_CLAIM_UNTARGETED_AFTER_S"):
         _dispatch_cmd(argparse.Namespace(engines=f"{_ENGINE_NAME}=img:tag"))
     assert started == []
+
+
+def test_dispatch_cmd_refuses_a_store_without_delay_support_before_spawning_slots(monkeypatch):
+    """codex: the store capability check ran in Dispatcher's constructor, AFTER pool.start() and
+    outside its cleanup — a custom store lacking supports_untargeted_delay orphaned warm workers."""
+    import types
+
+    import blastbox.host.jobs.factory as factory
+    import blastbox.host.pool_config as pool_config
+    from blastbox.host.cli import _dispatch_cmd
+
+    class _Undeclared:
+        def __init__(self):
+            self.inner = InMemoryJobStore()
+
+        def __getattr__(self, name):
+            if name == "supports_untargeted_delay":
+                raise AttributeError(name)
+            return getattr(self.inner, name)
+
+    started: list = []
+    pool = types.SimpleNamespace(runtime=types.SimpleNamespace(dispatch_style="file"),
+                                 start=lambda: started.append(True))
+    monkeypatch.setattr(factory, "build_job_store_from_env", lambda: _Undeclared())
+    monkeypatch.setattr(pool_config, "build_warm_pool", lambda: pool)
+    monkeypatch.setenv("BLASTBOX_POOL_RUNTIME", "firecracker")
+    monkeypatch.setenv("BLASTBOX_CLAIM_UNTARGETED_AFTER_S", "3")
+    monkeypatch.delenv("BLASTBOX_MAX_QUEUED_AGE_S", raising=False)
+    with pytest.raises(ValueError, match="supports_untargeted_delay"):
+        _dispatch_cmd(argparse.Namespace(engines=f"{_ENGINE_NAME}=img:tag"))
+    assert started == []

@@ -111,15 +111,16 @@ class DemandSnapshot:
                                  # this pool DECLINES fresh untargeted work (a claim delay,
                                  # BLASTBOX_CLAIM_UNTARGETED_AFTER_S > 0): it only takes an untargeted
                                  # job once the prompt pools have left it long enough. Published so
-                                 # the planner splits the engine's untargeted backlog over the PROMPT
-                                 # pools only (falling back to all pools when the engine has none) —
-                                 # else a delayed cold pool holds a share of work it refuses and the
-                                 # warm pools are sized for a fraction of the burst. A current
-                                 # publisher ALWAYS sets True/False; None = the key was ABSENT (a
-                                 # peer from before the field). Presence matters, not just value: an
-                                 # older planner splits evenly, so the exclusion is applied to an
-                                 # engine only while EVERY pool of it carries the field — else the
-                                 # old and new planners would compute different plans for one node.
+                                 # the planner can SPILL: the engine's untargeted count goes to its
+                                 # prompt pools up to their capacity (never below their legacy even
+                                 # share, which is also a ceiling floor), and only the residue to the
+                                 # overflow-only pools (DispatcherSizer.tick). A current publisher
+                                 # ALWAYS sets True/False; None = the key was ABSENT (a peer from
+                                 # before the field). Presence matters, not just value: an older
+                                 # planner splits evenly, so spilling applies only while EVERY
+                                 # snapshot on the NODE carries all five of this change's fields (see
+                                 # `lease` below) — else old and new planners would compute
+                                 # different plans for one node.
     lease: Optional[bool] = None
                                  # an ORPHAN LEASE (DispatcherSizer.publish_orphan_lease) = True: a
                                  # stopped dispatcher's final snapshot, reserving slots it could not
@@ -127,10 +128,10 @@ class DemandSnapshot:
                                  # it as an untargeted drainer — it keeps only its reservation. A
                                  # live pool publishes False; None = the key was ABSENT. An older
                                  # reader drops the key and treats the lease as it always did.
-                                 # VERSION-GATE INVARIANT: the overflow exclusion (DispatcherSizer.
-                                 # tick) is enabled only when every snapshot on the node carries ALL
-                                 # of `overflow_only`, `lease`, `running`, `engines` and `serving` — they came in one
-                                 # change (#193), and a binary that published one without
+                                 # VERSION-GATE INVARIANT: spilling (DispatcherSizer.tick) is
+                                 # enabled only when every snapshot on the node carries ALL of
+                                 # `overflow_only`, `lease`, `running`, `engines` and `serving` —
+                                 # they came in one change (#193), and a binary that published one without
                                  # understanding the others would plan differently (e.g. read a
                                  # current lease as a prompt pool). Keying on all of them ENFORCES
                                  # that. Any FUTURE field that changes the split must be added to
