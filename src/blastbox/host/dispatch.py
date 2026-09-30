@@ -713,15 +713,18 @@ class Dispatcher:
                     f"claim_untargeted_after_s ({self._claim_untargeted_after_s:g}s) must be below "
                     f"max_queued_age_s ({self._max_queued_age_s:g}s): the queued-job reaper would "
                     "expire untargeted work before this dispatcher may claim it")
-            # A store with only the original claim_next(*, claimant_tier=) shape would raise
-            # TypeError on EVERY poll -- a dispatcher that never claims. Refuse it here instead.
-            # Explicit capability first: a store may DECLARE the kwarg only to refuse it
-            # (HttpJobStore), which a signature check passes. Then the signature, for any store.
+            # FAIL CLOSED: the store must STATE that it honours the delay
+            # (supports_untargeted_delay = True, as the memory / SQL / Redis stores do). Neither a
+            # missing attribute nor the signature is proof: HttpJobStore declares the kwarg only to
+            # refuse it, and a wrapper whose claim_next takes **kw passes a signature check while
+            # silently DROPPING the delay -- this dispatcher would then race its warm peer for every
+            # untargeted job. The signature check stays as a second guard: a legacy
+            # claim_next(*, claimant_tier=) would raise TypeError on EVERY poll.
             store_name = type(self._job_store).__name__
-            if getattr(self._job_store, "supports_untargeted_delay", None) is False:
+            if getattr(self._job_store, "supports_untargeted_delay", False) is not True:
                 raise ValueError(
-                    f"claim_untargeted_after_s is set but {store_name} cannot honour an "
-                    "untargeted claim delay (it states supports_untargeted_delay = False)")
+                    f"claim_untargeted_after_s is set but {store_name} does not state that it "
+                    "honours an untargeted claim delay (supports_untargeted_delay is not True)")
             if not _accepts_kwarg(self._job_store.claim_next, "untargeted_min_age_s"):
                 raise ValueError(
                     f"claim_untargeted_after_s is set but {store_name}.claim_next() does not "

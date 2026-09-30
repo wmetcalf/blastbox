@@ -773,12 +773,22 @@ def _claim_untargeted_after_s() -> float:
 
     Set on the COLD dispatcher of a warm+cold pair (e.g. ``3``) so a warm dispatcher with a free
     slot takes fresh work first and cold is the overflow. Unset/empty/``0`` = no delay (default).
-    Parsed like every other age knob (``max_age_env``): ``nan``/``inf``/negatives/garbage are
-    refused with a warning and the default (no delay) kept -- ``nan`` would otherwise compare false
-    against every age and stop the dispatcher ever taking untargeted work."""
-    from blastbox.host.runtime.env_knobs import max_age_env
-
-    return max_age_env(os.environ, "BLASTBOX_CLAIM_UNTARGETED_AFTER_S", 0.0)
+    Unlike the other age knobs, a value that doesn't parse as a finite number >= 0 (``nan``,
+    ``inf``, negatives, garbage) REFUSES startup (ValueError, before the pool spawns anything)
+    rather than falling back to 0: a typo'd delay silently becoming "no delay" would turn an
+    overflow-only cold dispatcher back into one racing its warm peer for every untargeted job."""
+    raw = (os.environ.get("BLASTBOX_CLAIM_UNTARGETED_AFTER_S") or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(
+            f"BLASTBOX_CLAIM_UNTARGETED_AFTER_S={raw!r} is not a finite number of seconds >= 0; "
+            "unset it (or 0) for no delay.")
+    return value
 
 
 def _require_shared_blob_store() -> bool:

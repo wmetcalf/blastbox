@@ -10,7 +10,6 @@ tests/host/jobs/test_claim_untargeted_after.py; this file covers the Dispatcher 
 from __future__ import annotations
 
 import argparse
-import logging
 import math
 import time
 
@@ -118,12 +117,13 @@ def test_env_parsing_valid(monkeypatch, raw, want):
 
 
 @pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "-1", "soon"])
-def test_env_parsing_refuses_nonsense_loudly_and_keeps_zero(monkeypatch, caplog, raw):
+def test_env_parsing_refuses_nonsense(monkeypatch, raw):
+    # refuse, don't drop: a typo'd delay silently becoming 0 would turn an overflow-only cold
+    # dispatcher back into one racing its warm peer for every untargeted job
     from blastbox.host.cli import _claim_untargeted_after_s
     monkeypatch.setenv("BLASTBOX_CLAIM_UNTARGETED_AFTER_S", raw)
-    with caplog.at_level(logging.WARNING):
-        assert _claim_untargeted_after_s() == 0.0
-    assert "BLASTBOX_CLAIM_UNTARGETED_AFTER_S" in caplog.text
+    with pytest.raises(ValueError, match="BLASTBOX_CLAIM_UNTARGETED_AFTER_S"):
+        _claim_untargeted_after_s()
 
 
 class _Built(Exception):
@@ -243,7 +243,7 @@ def test_a_store_that_declares_but_refuses_the_delay_is_refused_at_construction(
     from blastbox.host.jobs.http_store import HttpJobStore
 
     store = HttpJobStore.__new__(HttpJobStore)
-    with pytest.raises(ValueError, match="cannot honour"):
+    with pytest.raises(ValueError, match="supports_untargeted_delay"):
         _dispatcher(store, tmp_path, claim_untargeted_after_s=5.0)
 
 
@@ -275,5 +275,57 @@ def test_dispatch_cmd_refuses_a_delay_past_the_ttl_before_spawning_slots(monkeyp
     monkeypatch.setenv("BLASTBOX_CLAIM_UNTARGETED_AFTER_S", "300")
     monkeypatch.setenv("BLASTBOX_MAX_QUEUED_AGE_S", "300")
     with pytest.raises(ValueError, match="MAX_QUEUED_AGE_S"):
+        _dispatch_cmd(argparse.Namespace(engines=f"{_ENGINE_NAME}=img:tag"))
+    assert started == []
+
+
+# --- review round 9 (#193) ---------------------------------------------------------------------
+
+def test_a_store_that_does_not_state_delay_support_is_refused(tmp_path):
+    """Fail closed: a wrapper whose claim_next takes **kw passed the signature check and silently
+    DROPPED the delay (a fresh untargeted job was claimed at once). A store must state
+    supports_untargeted_delay = True."""
+    class _Wrapper:
+        def __init__(self):
+            self.inner = InMemoryJobStore()
+
+        def __getattr__(self, name):
+            if name == "supports_untargeted_delay":
+                raise AttributeError(name)
+            return getattr(self.inner, name)
+
+        def claim_next(self, *, claimant_tier=None, **kw):
+            return self.inner.claim_next(claimant_tier=claimant_tier)
+
+    with pytest.raises(ValueError, match="supports_untargeted_delay"):
+        _dispatcher(_Wrapper(), tmp_path, claim_untargeted_after_s=30.0)
+
+
+def test_a_wrapper_without_a_delay_is_still_fine(tmp_path):
+    class _Wrapper:
+        def __init__(self):
+            self.inner = InMemoryJobStore()
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+    assert _dispatcher(_Wrapper(), tmp_path, claim_untargeted_after_s=0.0) is not None
+
+
+@pytest.mark.parametrize("raw", ["nan", "-1", "soon"])
+def test_dispatch_cmd_refuses_an_invalid_delay_before_spawning_slots(monkeypatch, raw):
+    import types
+
+    import blastbox.host.jobs.factory as factory
+    import blastbox.host.pool_config as pool_config
+    from blastbox.host.cli import _dispatch_cmd
+
+    started: list = []
+    pool = types.SimpleNamespace(runtime=types.SimpleNamespace(dispatch_style="file"),
+                                 start=lambda: started.append(True))
+    monkeypatch.setattr(factory, "build_job_store_from_env", lambda: InMemoryJobStore())
+    monkeypatch.setattr(pool_config, "build_warm_pool", lambda: pool)
+    monkeypatch.setenv("BLASTBOX_POOL_RUNTIME", "firecracker")
+    monkeypatch.setenv("BLASTBOX_CLAIM_UNTARGETED_AFTER_S", raw)
+    with pytest.raises(ValueError, match="BLASTBOX_CLAIM_UNTARGETED_AFTER_S"):
         _dispatch_cmd(argparse.Namespace(engines=f"{_ENGINE_NAME}=img:tag"))
     assert started == []
