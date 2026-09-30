@@ -530,6 +530,7 @@ def _start_node_sizer(
     concurrency_gate=None,
     cold_slot_ram_mib=0.0,
     claim_untargeted_after_s=0.0,
+    warm_only=False,
 ):
     """Start the opt-in node self-sizer for this dispatcher's warm pool, or return None.
 
@@ -680,6 +681,8 @@ def _start_node_sizer(
             overflow_only=claim_untargeted_after_s > 0 and len(served) == 1,
             # published as `engines`: an engine with a multi-engine pool is never spill-split
             served_engines=len(served),
+            # a warm-only dispatcher (no cold fallback) with a broken warm path stops serving
+            warm_only=warm_only,
         )
         # Print the status FIRST, then start the thread LAST — otherwise if this print raises
         # (broken pipe / closed stderr) the except below returns None while the thread is
@@ -1120,6 +1123,7 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
                 concurrency_gate,
                 cold_slot_ram_mib,
                 claim_untargeted_after_s,
+                warm_only,
             )
         # If we pre-shrank the pool for the autosizer but the sizer did NOT start (incomplete
         # inventory, unwritable share_dir, setup error), nothing will ever size it — restore

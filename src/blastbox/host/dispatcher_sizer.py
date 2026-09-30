@@ -115,6 +115,9 @@ class DispatcherSizer:
                                               # never exceed the budget-allocated ceiling.
         cold_slot_ram_mib: float = 0.0,       # cold worker footprint (BLASTBOX_WORKER_MEMORY) in
                                               # MiB; prices cold permits. 0 = unknown → warm 1:1.
+        warm_only: bool = False,              # BLASTBOX_DISPATCH_WARM_ONLY: no cold fallback on a
+                                              # warm miss — only then can a broken warm path stop
+                                              # this dispatcher serving (published as `serving`)
         served_engines: int = 1,              # how many engines this dispatcher serves (its backlog
                                               # is their combined count, published as `engines`)
         overflow_only: bool = False,          # this dispatcher declines fresh UNTARGETED jobs
@@ -128,6 +131,7 @@ class DispatcherSizer:
         self._cold_slot_ram_mib = max(0.0, float(cold_slot_ram_mib))
         self._overflow_only = bool(overflow_only)
         self._served_engines = max(1, int(served_engines))
+        self._warm_only = bool(warm_only)
         self._share = share
         self._config = config
         self._runtime = (runtime or "").strip().lower()
@@ -310,8 +314,12 @@ class DispatcherSizer:
             return max(aw, res) + math.ceil(cif * cold_units)
 
         def _serving() -> bool:
-            # WarmPool.is_serving; a pool-less (cold) dispatcher or a pool type without the
-            # signal is taken as serving (today's behaviour)
+            # NOT serving only when this dispatcher is WARM-ONLY (no cold fallback on a warm miss)
+            # AND its pool can't serve (WarmPool.is_serving: restores failing, nothing ready or
+            # busy). A dispatcher that falls back to cold still claims and runs untargeted work; a
+            # pool-less (cold) dispatcher or a pool type without the signal counts as serving.
+            if not self._warm_only:
+                return True
             fn = getattr(self._pool, "is_serving", None)
             try:
                 return bool(fn()) if callable(fn) else True
@@ -596,9 +604,17 @@ class DispatcherSizer:
                               and getattr(s, "running", None) is not None
                               and getattr(s, "engines", None) is not None
                               and getattr(s, "serving", None) is not None)
-        # LEGACY split: every pool of the engine, sorted (deterministic rank)
+        # LEGACY split: every pool of the engine, sorted (deterministic rank). On a CURRENT node
+        # (gate on — every planner reads `lease`) orphan leases are left out: a lease claims
+        # nothing, so counting it in the denominator sized the live pools for only part of the
+        # queue (a929bc9 does count it; on a mixed-version node we must too, so plans agree).
         untargeted_insts: dict[str, list[tuple[str, str]]] = {
             eng: sorted(insts) for eng, insts in engine_insts.items()}
+        if node_all_carry:
+            untargeted_insts = {
+                eng: sorted((s.tier, s.instance) for s in snaps
+                            if s.engine == eng and getattr(s, "lease", False) is not True)
+                for eng in engine_insts}
 
         def _split(s) -> tuple[int, int]:
             """(targeted-to-this-tier, untargeted) from a snapshot's backlog."""

@@ -148,8 +148,9 @@ class DemandSnapshot:
                                  # split with the spill rules (that would hand another engine's jobs
                                  # to single-engine peers). None = the key was ABSENT (older peer).
     serving: Optional[bool] = None
-                                 # whether the pool can take queued work now (WarmPool.is_serving:
-                                 # False only in a failure streak with no ready or busy slot). A prompt
+                                 # whether the dispatcher can take queued work now: False only when
+                                 # it is warm-only (no cold fallback) and its pool can't serve
+                                 # (WarmPool.is_serving: restores failing, nothing ready or busy). A prompt
                                  # pool that isn't serving is given no untargeted capacity, so the
                                  # spill goes to the overflow pools. None = the key was ABSENT.
 

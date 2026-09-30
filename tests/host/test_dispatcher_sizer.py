@@ -2366,8 +2366,8 @@ def test_lease_in_a_mixed_version_engine_keeps_the_old_split(tmp_path, monkeypat
 def test_untargeted_shares_sum_over_live_pools_with_leases(tmp_path, monkeypatch):
     # Invariant with leases in the view: a SPILLING engine (a live overflow pool) sums its shares
     # to the count with every lease at 0 (at least the count: a capped prompt pool keeps its legacy
-    # share); without an overflow pool it is the legacy split (own count over every pool, leases
-    # included). Each lease's ceiling is its reservation; budget holds.
+    # share); without an overflow pool it is the legacy split, which on a current node leaves the
+    # leases out of the denominator. Each lease's ceiling is its reservation; budget holds.
     import itertools
     specs = _capture_specs(monkeypatch)
     for flags in itertools.product([False, True], repeat=2):
@@ -2381,12 +2381,10 @@ def test_untargeted_shares_sum_over_live_pools_with_leases(tmp_path, monkeypatch
                 mine = _fc_sizer(share, backlog=u, untargeted=u, overflow_only=flags[0],
                                  ram_budget=10 * 1024).tick()
                 assert mine is not None
-                live = 2                                          # fc (me) + gvisor g
                 if flags[0] or flags[1]:
                     assert sum(s.queued for s in specs.values()) >= u - 1e-9, (flags, n_leases, u)
-                else:                                             # legacy: u / all pools each
-                    want = live * u / (live + n_leases)
-                    assert abs(sum(s.queued for s in specs.values()) - want) < 1e-9
+                else:          # legacy split, leases out of the denominator on a current node
+                    assert abs(sum(s.queued for s in specs.values()) - u) < 1e-9
                 plan = dict(_PLAN)
                 for i in range(n_leases):
                     assert specs[f"clip@firecracker@l{i}"].queued == 0
@@ -2807,7 +2805,8 @@ def _het_sizer(share, pool, budget_mib, budget_vcpus):
         backlog_fn=lambda: b, untargeted_backlog_fn=lambda: u, node="n", instance=inst,
         capacity_fn=_budget(budget_mib, budget_vcpus), clock=lambda: 1.0, overflow_only=ovf,
         concurrency_gate=_FixedGate(res) if cold else None,
-        served_engines=rest[1] if len(rest) > 1 else 1)
+        served_engines=rest[1] if len(rest) > 1 else 1,
+        warm_only=True)                     # warm-only: a broken warm path can't fall back to cold
 
 
 def _het_snapshot(pool):
@@ -3169,11 +3168,111 @@ def test_gate_requires_serving_field_too(tmp_path, monkeypatch):
 
 
 def test_sizer_publishes_pool_serving_state(tmp_path):
-    for serving in (True, False):
-        share = FileNodeShare(str(tmp_path / str(serving)))
+    # not serving only when the dispatcher is WARM-ONLY and its pool can't serve: a dispatcher that
+    # falls back to cold on a warm miss (the node-managed default) still runs untargeted work
+    for warm_only, pool_serving, want in ((True, True, True), (True, False, False),
+                                          (False, False, True), (False, True, True)):
+        share = FileNodeShare(str(tmp_path / f"{warm_only}-{pool_serving}"))
         DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=64),
-                        _ServingPool(serving=serving), share, _OVF_CFG, runtime="firecracker",
-                        backlog_fn=lambda: 0, node="n", instance="f",
-                        capacity_fn=_budget(8 * 1024, 999), clock=lambda: 1.0).tick()
+                        _ServingPool(serving=pool_serving), share, _OVF_CFG,
+                        runtime="firecracker", backlog_fn=lambda: 0, node="n", instance="f",
+                        capacity_fn=_budget(8 * 1024, 999), clock=lambda: 1.0,
+                        warm_only=warm_only).tick()
         (snap,) = share.read_all(max_age_s=60, now=1.0)
-        assert snap.serving is serving
+        assert snap.serving is want, (warm_only, pool_serving)
+
+
+def test_broken_warm_base_with_cold_fallback_keeps_its_share(tmp_path, monkeypatch):
+    # probe sc.py: warm_only=False — the broken warm path falls back to cold, so the dispatcher is
+    # serving and keeps its capacity + floors (no spill away from it)
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    share.publish(_het_snapshot(("clip", "cold", "c", 1024, 20, 20, 64, 0, 0, True)))
+    DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=4),
+                    _ServingPool(serving=False), share, _OVF_CFG, runtime="firecracker",
+                    backlog_fn=lambda: 20, untargeted_backlog_fn=lambda: 20, node="n",
+                    instance="w", capacity_fn=_budget(8 * 1024, 999), clock=lambda: 1.0,
+                    warm_only=False).tick()
+    assert specs["clip@cold@c"].queued == 16                   # 20 − min(10, 4): normal spill
+
+
+def test_start_node_sizer_threads_warm_only(tmp_path, monkeypatch):
+    from blastbox.host.cli import _start_node_sizer
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINES", "clip")
+    monkeypatch.setenv("BLASTBOX_NODE_RESOURCE_MANAGEMENT", "1")
+    monkeypatch.setenv("BLASTBOX_NODE_SHARE_DIR", str(tmp_path))
+    for warm_only, want in ((True, False), (False, True)):
+        stop, thread, sizer = _start_node_sizer(_ServingPool(serving=False), ["clip"],
+                                                InMemoryJobStore(), "firecracker",
+                                                warm_only=warm_only)
+        try:
+            (snap,) = FileNodeShare(str(tmp_path)).read_all(max_age_s=60, now=time.time())
+            assert snap.serving is want
+        finally:
+            stop.set()
+            thread.join(2.0)
+            sizer.remove_own_snapshot()
+
+
+def test_worker_fault_burst_does_not_churn_the_plan(tmp_path, monkeypatch):
+    # probe_flap end to end: a REAL WarmPool whose 4 slots were all recycled by worker faults (all
+    # WARMING, respawning) stays serving, so its plan is the serving plan — no floor drop, no reap
+    from blastbox.host.pool import WarmPool
+    import sys
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
+    from test_pool import _FakeRuntime
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=4, spawn_rate_limit=100.0)
+    pool.resize(warm_size=4, concurrent_ceiling=7)
+    for _ in range(4):
+        pool.tick()
+    rt.set_default_ready_after(2)
+    for sl in [pool.claim(timeout_s=0.1) for _ in range(4)]:
+        pool.release(sl, dirty=True, fault="worker")
+    pool.tick()
+    assert pool.idle_count == 0 and pool.is_serving() is True
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    share.publish(_het_snapshot(("clip", "cold", "c", 1024, 20, 20, 64, 0, 0, True)))
+    DispatcherSizer(EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=7), pool, share,
+                    _OVF_CFG, runtime="firecracker", backlog_fn=lambda: 20,
+                    untargeted_backlog_fn=lambda: 20, node="n", instance="w",
+                    capacity_fn=_budget(12 * 1024, 999), clock=lambda: 1.0,
+                    warm_only=True).tick()
+    (snap,) = [x for x in share.read_all(max_age_s=60, now=1.0) if x.instance == "w"]
+    assert snap.serving is True
+    assert specs["clip@firecracker@w"].queued == 10            # max(capacity 7, legacy 10)
+
+
+def test_lease_takes_no_untargeted_share_on_a_current_node(tmp_path, monkeypatch):
+    # codex: the delayed cold peer stopped with 1 job in flight, leaving an overflow-only LEASE; the
+    # engine then has no live overflow pool (no spill) and falls to the even split — whose
+    # denominator counted the lease, so the live warm pool warmed for only half of the 16 queued.
+    # On a current (gate-on) node a lease takes no share and isn't in the denominator.
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path / "cur"))
+    _lease(share, tier="cold", instance="c", warm_orphans=1, overflow_only=True)
+    mine = _fc_sizer(share, backlog=16, untargeted=16, max_ceiling=16,
+                     ram_budget=17 * 1024).tick()
+    assert specs["clip@firecracker@f"].queued == 16
+    assert mine.warm_size == 16 and mine.concurrent_ceiling == 16
+
+
+def test_lease_denominator_unchanged_on_the_legacy_path(tmp_path, monkeypatch):
+    # the same view with a pre-field peer on the node (gate off): exactly the a929bc9 split, lease
+    # counted, 8 each — every planner on a mixed node must agree
+    import json
+    from dataclasses import asdict
+    specs = _capture_specs(monkeypatch)
+    d = tmp_path / "old"
+    share = FileNodeShare(str(d))
+    _lease(share, tier="cold", instance="c", warm_orphans=1, overflow_only=True)
+    raw = asdict(_peer("firecracker", "y", 0, 0, engine="red"))
+    for k in ("overflow_only", "lease", "running", "engines", "serving"):
+        raw.pop(k, None)
+    (d / FileNodeShare._filename("red", "firecracker", "n", "y")).write_text(json.dumps(raw))
+    mine = _fc_sizer(share, backlog=16, untargeted=16, max_ceiling=16,
+                     ram_budget=17 * 1024).tick()
+    assert specs["clip@firecracker@f"].queued == 8
+    assert mine.warm_size == 8

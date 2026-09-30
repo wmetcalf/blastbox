@@ -401,6 +401,12 @@ class WarmPool:
         # failures must feed base invalidation too: "cannot restore the base" is even stronger
         # evidence the base is bad than "jobs restored from it fail".
         self._spawn_consecutive_failures = 0
+        # A SEPARATE count of consecutive restore-path failures (the same events as above: spawn
+        # raising, a slot timing out in WARMING, a promoted slot dying unproven), for is_serving()
+        # only. Unlike _spawn_consecutive_failures — whose resets the base-repair logic relies on
+        # and which a clean served release clears — it is reset by any successful PROMOTION (a
+        # slot became ready), so one transient failure can't mark an idle pool unserving forever.
+        self._restore_failure_streak = 0
         # Keyed by slot_id, NOT stored on the slot: runtimes supply their own slot types (e.g.
         # AwsWorkerSlot) that duck-type the Slot protocol without inheriting its dataclass fields,
         # so attributes added to Slot are not universally present.
@@ -1950,19 +1956,25 @@ class WarmPool:
         with self._lock:
             return self._burst_active
 
+    # consecutive restore-path failures after which a pool with nothing ready counts as not serving
+    SERVING_RESTORE_FAILURES = 3
+
     def is_serving(self) -> bool:
-        """Whether this pool can take queued work now — the node sizer's signal for sizing it
-        for an engine's UNTARGETED spill. False only while the pool is in a FAILURE STREAK (spawn/
-        restore failures, or a base failing) AND has no slot that is ready or running a job: a
-        warm-only pool whose spawns keep failing can't claim anything, so work sized onto it would
-        wait (and, with a queued TTL, expire) while a delayed peer could run it. A pool that is
-        healthily warming, ready, busy, or simply empty with no failures counts as serving."""
+        """Whether this pool's WARM path can take queued work — the node sizer's signal (combined
+        there with the dispatcher's warm_only) for sizing it for an engine's UNTARGETED spill.
+
+        False only when BOTH hold: no slot is ready (IDLE) or busy (ASSIGNED), and the RESTORE
+        path is failing — at least SERVING_RESTORE_FAILURES consecutive spawn/restore failures
+        (spawn raising, a slot timing out in WARMING, a promoted slot dying unproven), a count any
+        successful promotion resets. WARMING slots are not evidence either way: a pool whose
+        restores keep failing always has some slot warming, and a healthy respawn has no failure
+        count. Job/worker faults (a dirty release) never count: a burst of bad samples recycles
+        slots, it doesn't break the pool. Everything else — ready, busy, healthily warming, empty
+        with a working restore path — is serving."""
         with self._lock:
             if any(s.state in (SlotState.IDLE, SlotState.ASSIGNED) for s in self._slots.values()):
                 return True
-            streak = (self._spawn_consecutive_failures > 0
-                      or any(n > 0 for n in self._pool_consecutive_failures.values()))
-            return not streak
+            return self._restore_failure_streak < self.SERVING_RESTORE_FAILURES
 
     def is_healthy(self) -> bool:
         """True if ≥1 IDLE slot exists, or a slot was idle recently, or within warmup grace."""
@@ -2165,6 +2177,7 @@ class WarmPool:
                 if candidate.slot_id in self._promoted_unproven:
                     self._promoted_unproven.discard(candidate.slot_id)
                     self._spawn_consecutive_failures += 1
+                    self._restore_failure_streak += 1
                     claim_unproven_death = True
                     warm_failures = self._spawn_consecutive_failures
                 # The probe above takes seconds, so stop() can land mid-probe; the chokepoint
@@ -2259,6 +2272,7 @@ class WarmPool:
                     if slot.slot_id in self._slots and slot.state == SlotState.WARMING:
                         slot.state = SlotState.IDLE
                         newly_idle.append(slot.slot_id)
+                        self._restore_failure_streak = 0      # the restore path works (is_serving)
                         # The slot has now been READY. Both of these are WARMING-scoped: the credit
                         # exists only to offset the warming timeout, and leaving it behind turned a
                         # timeout ledger into a permanent state-history flag that the undo path
@@ -2472,6 +2486,7 @@ class WarmPool:
         logger.error("pool.spawn_failed", exc_info=exc)
         with self._lock:
             self._spawn_consecutive_failures += 1
+            self._restore_failure_streak += 1
             spawn_failures = self._spawn_consecutive_failures
         if rebuild_attempted:
             # A rebuild already landed in this batch. Serial would have broken out entirely;
@@ -2698,6 +2713,7 @@ class WarmPool:
                 logger.exception("pool.spawn_failed")
                 with self._lock:
                     self._spawn_consecutive_failures += 1
+                    self._restore_failure_streak += 1
                     spawn_failures = self._spawn_consecutive_failures
                 rebuilt = self._maybe_rebuild_base(spawn_failures, reason="spawn")
                 if rebuilt:
@@ -3782,6 +3798,7 @@ class WarmPool:
             self._blame_tiers([s.slot_id for s in confirmed])
             with self._lock:
                 self._spawn_consecutive_failures += len(confirmed)
+                self._restore_failure_streak += len(confirmed)
                 warm_failures = self._spawn_consecutive_failures
             if self._maybe_rebuild_base(warm_failures, reason="spawn"):
                 # HALT THE TICK. The artifact is gone, so the very next runtime.spawn() runs
@@ -3950,6 +3967,7 @@ class WarmPool:
         if unproven_deaths:
             with self._lock:
                 self._spawn_consecutive_failures += unproven_deaths
+                self._restore_failure_streak += unproven_deaths
                 warm_failures = self._spawn_consecutive_failures
             if self._maybe_rebuild_base(warm_failures, reason="spawn"):
                 self._rebuilt_this_tick = True

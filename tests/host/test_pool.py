@@ -4858,17 +4858,22 @@ def test_the_runtime_is_closed_only_after_its_slots_have_been_reaped() -> None:
 
 
 # --- is_serving: the node sizer's "can this warm pool take untargeted work" signal ---------------
+# False only while the RESTORE path is failing (>= WarmPool.SERVING_RESTORE_FAILURES consecutive
+# spawn/restore failures, reset by any successful promotion) AND no slot is ready or busy. Job /
+# worker faults never count.
 
 class _FailingSpawnRuntime(_FakeRuntime):
     def spawn(self) -> Slot:
         raise RuntimeError("restore failed")
 
 
-def test_is_serving_false_while_spawns_fail_and_nothing_is_ready() -> None:
+def test_is_serving_false_once_restores_keep_failing_and_nothing_is_ready() -> None:
     pool = WarmPool(runtime=_FailingSpawnRuntime(), warm_size=2, spawn_rate_limit=100.0)
-    for _ in range(3):
+    pool.tick()
+    assert pool.is_serving() is True                # one failure is not a failing restore path
+    for _ in range(5):
         pool.tick()
-    assert pool.slot_count == 0 and pool._spawn_consecutive_failures > 0
+    assert pool.slot_count == 0
     assert pool.is_serving() is False
 
 
@@ -4881,16 +4886,78 @@ def test_is_serving_true_while_healthily_warming() -> None:
     assert pool.is_serving() is True
 
 
-def test_is_serving_true_with_a_ready_slot_despite_a_failure_streak() -> None:
+def test_is_serving_true_with_a_ready_slot_despite_failing_restores() -> None:
     rt = _FakeRuntime()
     pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
     for _ in range(3):
         pool.tick()
     assert pool.idle_count >= 1
-    pool._spawn_consecutive_failures = 3            # a later spawn failed; the ready slot still serves
+    pool._restore_failure_streak = 10               # later restores failed; the ready slot serves
     assert pool.is_serving() is True
 
 
 def test_is_serving_true_for_an_empty_pool_without_failures() -> None:
     pool = WarmPool(runtime=_FakeRuntime(), warm_size=0, spawn_rate_limit=100.0)
     assert pool.is_serving() is True
+
+
+def test_worker_faults_do_not_make_a_pool_unserving() -> None:
+    # probe_flap: a burst of bad samples — 4 jobs released dirty with fault=worker — recycles all 4
+    # slots, which respawn WARMING. That is a healthy respawn, not a failing restore path.
+    rt = _FakeRuntime()
+    pool = WarmPool(runtime=rt, warm_size=4, spawn_rate_limit=100.0)
+    pool.resize(warm_size=4, concurrent_ceiling=7)
+    for _ in range(4):
+        pool.tick()
+    rt.set_default_ready_after(2)
+    slots = [pool.claim(timeout_s=0.1) for _ in range(4)]
+    for s in slots:
+        pool.release(s, dirty=True, fault="worker")
+    pool.tick()
+    assert pool.idle_count == 0
+    assert pool.is_serving() is True
+    for _ in range(6):                              # and it stays serving while they come back
+        pool.tick()
+        assert pool.is_serving() is True
+
+
+def test_a_successful_promotion_resets_the_restore_streak() -> None:
+    # probe_pool: failing restores, then a healthy one — the promotion ends the streak, so a pool
+    # later scaled to warm 0 is serving (not stuck not-serving until a job runs)
+    class _Flaky(_FakeRuntime):
+        fails = 4
+
+        def spawn(self) -> Slot:
+            if self.fails > 0:
+                self.fails -= 1
+                raise RuntimeError("transient restore failure")
+            return super().spawn()
+    rt = _Flaky()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=100.0)
+    for _ in range(4):
+        pool.tick()
+    assert pool.is_serving() is False
+    for _ in range(4):
+        pool.tick()
+    assert pool.idle_count >= 1 and pool.is_serving() is True
+    pool.resize(warm_size=0, concurrent_ceiling=4)
+    for _ in range(6):
+        pool.tick()
+    assert pool.slot_count == 0
+    assert pool.is_serving() is True
+
+
+def test_is_serving_false_when_restores_time_out_even_with_a_slot_warming() -> None:
+    # the restore path fails by TIMING OUT in WARMING: there is always a fresh WARMING slot, and it
+    # is no evidence the pool can serve — after K timeouts with nothing ready, it isn't
+    clock = _FakeClock()
+    rt = _FakeRuntime()
+    rt.set_default_ready_after(10**9)               # never becomes ready
+    pool = WarmPool(runtime=rt, warm_size=1, clock=clock, spawn_rate_limit=100.0,
+                    warming_timeout_s=60.0)
+    pool.tick()
+    for _ in range(WarmPool.SERVING_RESTORE_FAILURES + 1):
+        clock.advance(1000.0)                       # past the timeout AND the eviction budget
+        pool.tick()
+    assert any(s.state == SlotState.WARMING for s in pool._slots.values())
+    assert pool.is_serving() is False
