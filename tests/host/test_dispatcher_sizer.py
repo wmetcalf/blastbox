@@ -1680,15 +1680,15 @@ def test_adaptive_never_exceeds_physical_ram(tmp_path):
 
 
 def test_demand_snapshot_field_order_is_append_only():
-    """Regression: `untargeted_backlog` must be the LAST dataclass field, so adding it never
-    reinterprets an existing POSITIONAL constructor arg. A caller that passed the consensus
-    fields positionally (…, balancing, stale_after_s, budget_ram_mib, budget_vcpus) must keep
-    binding them to those fields — not silently absorb one into untargeted_backlog."""
+    """Regression: new fields are APPENDED (`untargeted_backlog`, then `overflow_only`), so adding
+    one never reinterprets an existing POSITIONAL constructor arg. A caller that passed the
+    consensus fields positionally (…, balancing, stale_after_s, budget_ram_mib, budget_vcpus)
+    must keep binding them to those fields — not silently absorb one into a newer field."""
     import dataclasses
 
     fields = [f.name for f in dataclasses.fields(DemandSnapshot)]
-    assert fields[-1] == "untargeted_backlog", (
-        f"untargeted_backlog must stay last (append-only); order is {fields}")
+    assert fields[-2:] == ["untargeted_backlog", "overflow_only"], (
+        f"new fields must be appended in order (append-only); order is {fields}")
 
     # Positional construction through `balancing` still lands each value on its field.
     snap = DemandSnapshot(
@@ -1699,7 +1699,7 @@ def test_demand_snapshot_field_order_is_append_only():
     assert (snap.node == "node-x" and snap.tier == "firecracker"
             and snap.refresh_s == 5.0 and snap.instance == "inst-1" and snap.balancing is True)
     # The consensus/budget/untargeted fields keep their defaults — none was shifted by the append.
-    assert snap.untargeted_backlog == 0
+    assert snap.untargeted_backlog == 0 and snap.overflow_only is False
     assert snap.budget_ram_mib == 0.0 and snap.budget_vcpus == 0.0 and snap.stale_after_s == 0.0
 
 
@@ -1844,3 +1844,211 @@ class TestABacklogThatCannotBeReadSaysSo:
         with caplog.at_level("WARNING", logger="blastbox.node_sizer"):
             ds.tick()
         assert not [r for r in caplog.records if "backlog" in r.message]
+
+
+# --- overflow-only pools (BLASTBOX_CLAIM_UNTARGETED_AFTER_S) -------------------------------------
+# A dispatcher with a claim delay declines UNTARGETED work until it has aged, so a co-resident
+# warm dispatcher claims it first. The planner must therefore not hand that pool a share of the
+# engine's untargeted backlog: the warm pools are sized for all of it, the overflow pool keeps
+# only what is targeted at its own tier.
+
+_OVF_CFG = NodeConfig(balancing=True, resource_management=True, ram_headroom_frac=1.0,
+                      vcpu_oversubscription=999, stale_after_s=60)
+
+
+def _capture_specs(monkeypatch):
+    """Record the PoolSpecs every tick hands the planner, keyed by pool name."""
+    from blastbox.host import dispatcher_sizer as mod
+    seen: dict = {}
+    real = mod.plan_sizes
+
+    def _spy(specs, budget):
+        seen.clear()
+        seen.update({s.name: s for s in specs})
+        return real(specs, budget)
+    monkeypatch.setattr(mod, "plan_sizes", _spy)
+    return seen
+
+
+def _peer(tier, instance, backlog, untargeted, *, overflow_only=None, max_ceiling=64,
+          engine="clip", ram=1024):
+    kw = {} if overflow_only is None else {"overflow_only": overflow_only}
+    return DemandSnapshot(engine, backlog, 0, ram, 1, 0, max_ceiling, 1.0, ts=1.0, node="n",
+                          tier=tier, instance=instance, untargeted_backlog=untargeted,
+                          balancing=True, **kw)
+
+
+def _fc_sizer(share, *, backlog, untargeted, overflow_only=False, ram_budget=64 * 1024,
+              max_ceiling=64, instance="f", tier="firecracker"):
+    return DispatcherSizer(
+        EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=max_ceiling), _Pool(), share,
+        _OVF_CFG, runtime=tier, backlog_fn=lambda: backlog,
+        untargeted_backlog_fn=lambda: untargeted, node="n", instance=instance,
+        capacity_fn=_budget(ram_budget, 999), clock=lambda: 1.0, overflow_only=overflow_only)
+
+
+def test_overflow_only_cold_takes_no_untargeted_share(tmp_path, monkeypatch):
+    # warm fc + cold (overflow-only) of one engine, 16 untargeted queued: fc is sized for all 16,
+    # cold for none of them — not 8/8, which left the burst past the warm share landing cold, late.
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    share.publish(_peer("cold", "c", 16, 16, overflow_only=True))
+    mine = _fc_sizer(share, backlog=16, untargeted=16).tick()
+    assert mine.warm_size == 16
+    assert specs["clip@firecracker@f"].queued == 16
+    assert specs["clip@cold@c"].queued == 0
+    assert specs["clip@cold@c"].demand == 0          # no budget priority for work it declines
+
+
+def test_overflow_only_cold_still_sizes_for_jobs_targeted_at_it(tmp_path, monkeypatch):
+    # cold's backlog is 20 of which 16 untargeted → 4 targeted at the cold tier. The exclusion only
+    # drops the untargeted share; the tier-targeted demand is untouched.
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    share.publish(_peer("cold", "c", 20, 16, overflow_only=True))
+    _fc_sizer(share, backlog=16, untargeted=16).tick()
+    assert specs["clip@cold@c"].queued == 4
+    assert specs["clip@firecracker@f"].queued == 16
+
+
+def test_engine_with_only_overflow_pools_gets_whole_untargeted_share(tmp_path, monkeypatch):
+    # Fallback: no pool of the engine claims untargeted work promptly, so the overflow pools still
+    # split it (today's behaviour) — work is never left unsized.
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    mine = _fc_sizer(share, backlog=16, untargeted=16, overflow_only=True).tick()
+    assert mine.warm_size == 16
+    assert specs["clip@firecracker@f"].queued == 16
+    # two overflow-only pools, no prompt one: they split it like any two pools
+    share.publish(_peer("cold", "c", 16, 16, overflow_only=True))
+    mine = _fc_sizer(share, backlog=16, untargeted=16, overflow_only=True).tick()
+    assert specs["clip@firecracker@f"].queued == 8 and specs["clip@cold@c"].queued == 8
+    assert mine.warm_size == 8
+
+
+def test_overflow_only_is_per_engine(tmp_path, monkeypatch):
+    # Another engine's prompt pool doesn't make this engine's overflow pool drop its share: the
+    # fallback is decided per engine.
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    share.publish(_peer("firecracker", "r", 10, 10, engine="red"))
+    mine = _fc_sizer(share, backlog=16, untargeted=16, overflow_only=True).tick()
+    assert mine.warm_size == 16
+    assert specs["clip@firecracker@f"].queued == 16
+    assert specs["red@firecracker@r"].queued == 10
+
+
+def test_snapshot_without_overflow_field_is_not_overflow_only(tmp_path, monkeypatch):
+    # Mixed-version: an older cold dispatcher's snapshot has no `overflow_only` key. It is treated
+    # as prompt (today's even split), never as overflow.
+    import json
+    from dataclasses import asdict
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    old = asdict(_peer("cold", "c", 16, 16))
+    old.pop("overflow_only", None)
+    (tmp_path / FileNodeShare._filename("clip", "cold", "n", "c")).write_text(json.dumps(old))
+    mine = _fc_sizer(share, backlog=16, untargeted=16).tick()
+    assert "clip@cold@c" in specs                     # the old snapshot was accepted
+    assert specs["clip@cold@c"].queued == 8
+    assert specs["clip@firecracker@f"].queued == 8
+    assert mine.warm_size == 8
+
+
+def test_poisoned_overflow_flag_is_rejected(tmp_path):
+    # Like `balancing`, the flag steers every reader's plan, so a non-bool is dropped, not coerced.
+    import json
+    from dataclasses import asdict
+    share = FileNodeShare(str(tmp_path))
+    bad = asdict(_peer("cold", "c", 16, 16, overflow_only=True))
+    bad["overflow_only"] = "yes"
+    (tmp_path / FileNodeShare._filename("clip", "cold", "n", "c")).write_text(json.dumps(bad))
+    assert share.read_all(max_age_s=60, now=1.0) == []
+
+
+def test_untargeted_shares_sum_to_the_count_with_overflow_pools(tmp_path, monkeypatch):
+    # Invariant: however the engine's pools are flagged, the untargeted shares (float demand AND the
+    # integer warm split) sum to the untargeted count — nothing double-counted, nothing dropped.
+    import itertools
+    specs = _capture_specs(monkeypatch)
+    pools = [("firecracker", "a"), ("firecracker", "b"), ("gvisor", "g")]
+    for flags in itertools.product([False, True], repeat=len(pools)):
+        for u in (0, 1, 2, 3, 7, 16):
+            d = tmp_path / f"{''.join('1' if f else '0' for f in flags)}-{u}"
+            share = FileNodeShare(str(d))
+            for (tier, inst), f in zip(pools, flags):
+                share.publish(_peer(tier, inst, u, u, overflow_only=f))
+            warm_total = 0
+            for (tier, inst), f in zip(pools, flags):
+                mine = _fc_sizer(share, backlog=u, untargeted=u, overflow_only=f,
+                                 instance=inst, tier=tier).tick()
+                warm_total += mine.warm_size
+                assert abs(sum(s.queued for s in specs.values()) - u) < 1e-9, (flags, u)
+                if any(not x for x in flags):
+                    # overflow pools take nothing while a prompt pool exists
+                    for (t2, i2), f2 in zip(pools, flags):
+                        if f2:
+                            assert specs[f"clip@{t2}@{i2}"].queued == 0, (flags, u)
+            assert warm_total == u, (flags, u)
+
+
+def test_budget_no_longer_reserved_for_colds_declined_untargeted_share(tmp_path, monkeypatch):
+    # Tight budget (8 slots): fc wants 16 untargeted, cold is overflow-only with only untargeted
+    # queued. Before the fix cold's equal demand split the budget 4/4; now fc outranks it and takes
+    # everything above cold's 1-slot baseline. Σ ceiling·footprint still ≤ budget.
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    share.publish(_peer("cold", "c", 16, 16, overflow_only=True))
+    mine = _fc_sizer(share, backlog=16, untargeted=16, ram_budget=8 * 1024).tick()
+    assert mine.concurrent_ceiling == 7
+    from blastbox.host.node_sizer import NodeBudget, plan_sizes
+    plan = plan_sizes(list(specs.values()), NodeBudget(ram_mib=8 * 1024, vcpus=999))
+    assert plan["clip@cold@c"].concurrent_ceiling == 1
+    assert sum(p.concurrent_ceiling * 1024 for p in plan.values()) <= 8 * 1024
+
+
+def test_overflow_pool_keeps_its_reservation_and_floor(tmp_path, monkeypatch):
+    # Dropping the untargeted share must not drop what cold is RUNNING (its reservation stays a
+    # hard ceiling floor) — only its priority for work it declines.
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    share.publish(DemandSnapshot("clip", 16, 3, 1024, 1, 0, 64, 1.0, ts=1.0, node="n", tier="cold",
+                                 instance="c", untargeted_backlog=16, overflow_only=True,
+                                 balancing=True))
+    _fc_sizer(share, backlog=16, untargeted=16, ram_budget=8 * 1024).tick()
+    cold = specs["clip@cold@c"]
+    assert cold.reserved == 3 and cold.demand == 3 and cold.queued == 0
+    from blastbox.host.node_sizer import NodeBudget, plan_sizes
+    plan = plan_sizes(list(specs.values()), NodeBudget(ram_mib=8 * 1024, vcpus=999))
+    assert plan["clip@cold@c"].concurrent_ceiling >= 3
+
+
+def test_sizer_publishes_overflow_flag(tmp_path):
+    share = FileNodeShare(str(tmp_path))
+    _fc_sizer(share, backlog=0, untargeted=0, overflow_only=True).tick()
+    (snap,) = share.read_all(max_age_s=60, now=1.0)
+    assert snap.overflow_only is True
+    share2 = FileNodeShare(str(tmp_path / "b"))
+    _fc_sizer(share2, backlog=0, untargeted=0).tick()
+    (snap2,) = share2.read_all(max_age_s=60, now=1.0)
+    assert snap2.overflow_only is False
+
+
+def test_start_node_sizer_threads_claim_delay_into_overflow_flag(tmp_path, monkeypatch):
+    from blastbox.host.cli import _start_node_sizer
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    monkeypatch.setenv("BLASTBOX_NODE_ENGINES", "clip")
+    monkeypatch.setenv("BLASTBOX_NODE_RESOURCE_MANAGEMENT", "1")
+    monkeypatch.setenv("BLASTBOX_NODE_SHARE_DIR", str(tmp_path))
+    for delay, want in ((3.0, True), (0.0, False)):
+        res = _start_node_sizer(_Pool(), ["clip"], InMemoryJobStore(), "firecracker",
+                                claim_untargeted_after_s=delay)
+        assert res is not None
+        stop, thread, sizer = res
+        try:
+            snaps = FileNodeShare(str(tmp_path)).read_all(max_age_s=60, now=time.time())
+            assert [s.overflow_only for s in snaps] == [want]
+        finally:
+            stop.set()
+            thread.join(2.0)
+            sizer.remove_own_snapshot()

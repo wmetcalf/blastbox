@@ -529,6 +529,7 @@ def _start_node_sizer(
     concurrency=1,
     concurrency_gate=None,
     cold_slot_ram_mib=0.0,
+    claim_untargeted_after_s=0.0,
 ):
     """Start the opt-in node self-sizer for this dispatcher's warm pool, or return None.
 
@@ -670,6 +671,9 @@ def _start_node_sizer(
             untargeted_backlog_fn=local_backlog_fn(store, served, untargeted_only=True),
             concurrency_gate=concurrency_gate,  # sizer drives its live limit on each resize
             cold_slot_ram_mib=cold_slot_ram_mib,  # price cold permits by the cold worker footprint
+            # a claim delay makes this pool OVERFLOW-ONLY for untargeted work: published so the
+            # planner sizes the engine's prompt pools for the untargeted backlog, not this one.
+            overflow_only=claim_untargeted_after_s > 0,
         )
         # Print the status FIRST, then start the thread LAST — otherwise if this print raises
         # (broken pipe / closed stderr) the except below returns None while the thread is
@@ -1109,6 +1113,7 @@ def _dispatch_cmd(args: argparse.Namespace) -> int:
                 dispatch_concurrency,
                 concurrency_gate,
                 cold_slot_ram_mib,
+                claim_untargeted_after_s,
             )
         # If we pre-shrank the pool for the autosizer but the sizer did NOT start (incomplete
         # inventory, unwritable share_dir, setup error), nothing will ever size it — restore

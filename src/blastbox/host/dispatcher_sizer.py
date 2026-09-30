@@ -77,11 +77,16 @@ class DispatcherSizer:
                                               # never exceed the budget-allocated ceiling.
         cold_slot_ram_mib: float = 0.0,       # cold worker footprint (BLASTBOX_WORKER_MEMORY) in
                                               # MiB; prices cold permits. 0 = unknown → warm 1:1.
+        overflow_only: bool = False,          # this dispatcher declines fresh UNTARGETED jobs
+                                              # (BLASTBOX_CLAIM_UNTARGETED_AFTER_S > 0). Published so
+                                              # the engine's untargeted backlog is sized onto its
+                                              # prompt pools, not this one.
     ) -> None:
         self._engine = engine
         self._pool = pool
         self._gate = concurrency_gate
         self._cold_slot_ram_mib = max(0.0, float(cold_slot_ram_mib))
+        self._overflow_only = bool(overflow_only)
         self._share = share
         self._config = config
         self._runtime = (runtime or "").strip().lower()
@@ -281,7 +286,8 @@ class DispatcherSizer:
                 refresh_s=refresh_s, balancing=self._config.balancing,
                 budget_ram_mib=my_budget.ram_mib, budget_vcpus=my_budget.vcpus,
                 stale_after_s=self._config.stale_after_s,
-                untargeted_backlog=min(backlog, self._last_untargeted))
+                untargeted_backlog=min(backlog, self._last_untargeted),
+                overflow_only=self._overflow_only)
 
         # HEARTBEAT before the (possibly-slow) count: publish a fresh-ts snapshot with the last
         # tick's backlog so peers keep seeing us alive even when THIS count — a huge shared-
@@ -486,34 +492,54 @@ class DispatcherSizer:
             return base + (1 if rank < rem else 0)
 
         # UNTARGETED jobs (target_tier IS NULL) are drained by EVERY tier of the engine, so their
-        # demand is counted ONCE across ALL the engine's pools (fc + gvisor + replicas), not per
+        # demand is counted ONCE across the engine's pools (fc + gvisor + replicas), not per
         # tier. TARGETED jobs stay tier-scoped (split across same-(engine,tier) replicas only).
-        engine_pools: dict[str, int] = {}
+        # OVERFLOW-ONLY pools (a claim delay, BLASTBOX_CLAIM_UNTARGETED_AFTER_S) decline fresh
+        # untargeted work, so the untargeted count is split over the engine's PROMPT pools only;
+        # an overflow pool keeps its targeted share, reservation and floors, but no untargeted
+        # share (and so no budget priority for work it refuses). If an engine has NO prompt pool,
+        # every pool of it is an untargeted drainer again (the plain split) so the work is never
+        # left unsized. A snapshot without the field (older peer) is prompt. Decided per engine
+        # from the shared view, so every dispatcher derives the same membership.
         engine_insts: dict[str, list[tuple[str, str]]] = {}
+        engine_prompt: dict[str, list[tuple[str, str]]] = {}
         for s in snaps:
-            engine_pools[s.engine] = engine_pools.get(s.engine, 0) + 1
             engine_insts.setdefault(s.engine, []).append((s.tier, s.instance))
-        for _elst in engine_insts.values():
-            _elst.sort()
+            if getattr(s, "overflow_only", False) is not True:
+                engine_prompt.setdefault(s.engine, []).append((s.tier, s.instance))
+        # the pools that take a share of each engine's untargeted count (sorted: deterministic rank)
+        untargeted_insts: dict[str, list[tuple[str, str]]] = {
+            eng: sorted(engine_prompt.get(eng) or insts) for eng, insts in engine_insts.items()}
 
         def _split(s) -> tuple[int, int]:
             """(targeted-to-this-tier, untargeted) from a snapshot's backlog."""
             u = max(0, min(s.backlog, int(getattr(s, "untargeted_backlog", 0))))
             return s.backlog - u, u
 
+        def _drains_untargeted(engine: str, tier: str, instance: str) -> bool:
+            return (tier, instance) in untargeted_insts.get(engine, [(tier, instance)])
+
         def _backlog_demand(s) -> float:
             targeted, untargeted = _split(s)
+            u_share = (untargeted / max(1, len(untargeted_insts.get(s.engine, [None])))
+                       if _drains_untargeted(s.engine, s.tier, s.instance) else 0.0)
             return (_share(targeted, s.engine, s.tier)                  # tier-scoped, per replica
-                    + untargeted / max(1, engine_pools.get(s.engine, 1)))  # engine-wide, per pool
+                    + u_share)                                          # engine-wide, per drainer
 
-        def _engine_int_share(total: int, engine: str, tier: str, instance: str) -> int:
-            # like _int_share, but over ALL of the engine's pools (every tier) — for splitting the
-            # UNTARGETED count so the shares still SUM to it across the engine's tiers + replicas.
-            lst = engine_insts.get(engine, [(tier, instance)])
+        def _engine_int_share(total: int, engine: str, tier: str, instance: str,
+                              overflow_only: bool) -> int:
+            # like _int_share, but over the engine's untargeted DRAINERS (every tier; overflow-only
+            # pools excluded while a prompt pool exists) — for splitting the UNTARGETED count so the
+            # shares still SUM to it across the engine's drainers. A pool absent from the view gets
+            # the base share, unless it is overflow-only behind a prompt pool (then 0).
+            lst = untargeted_insts.get(engine, [(tier, instance)])
             n = max(1, len(lst))
             base, rem = divmod(max(0, total), n)
-            rank = lst.index((tier, instance)) if (tier, instance) in lst else n
-            return base + (1 if rank < rem else 0)
+            if (tier, instance) in lst:
+                return base + (1 if lst.index((tier, instance)) < rem else 0)
+            if overflow_only and engine_prompt.get(engine):
+                return 0
+            return base
 
         specs = [
             PoolSpec(
@@ -611,15 +637,15 @@ class DispatcherSizer:
             # across tiers — so a multi-tier engine doesn't warm each tier for the whole untargeted
             # queue. Both use the deterministic remainder split so the shares still SUM to the count.
             # Two intentional, SAFE-DIRECTION approximations here (never over-warm / oversubscribe):
-            #  (a) COLD tiers are in `engine_insts` (they publish snapshots and DO claim untargeted
-            #      target_tier-IS-NULL jobs via cold detonation), so they take a share of the
-            #      untargeted WARM split too — a cold-only pool warms 0, letting its share fall to
-            #      cold detonation rather than pre-warming it on the warm tiers. That under-warms the
-            #      warm tiers by cold's share (latency onto the cold path), which is exactly a cold-
-            #      only dispatcher's purpose; it reserves its own cold-footprint budget separately.
-            #      NOT aware of BLASTBOX_CLAIM_UNTARGETED_AFTER_S: a delayed (overflow-only) cold
-            #      dispatcher still takes an equal share here although it declines fresh untargeted
-            #      work, so a burst past the warm share lands cold, late. Known gap (see #193).
+            #  (a) a PROMPT cold tier is an untargeted drainer (it publishes a snapshot and DOES
+            #      claim untargeted target_tier-IS-NULL jobs via cold detonation), so it takes a
+            #      share of the untargeted WARM split too — a cold-only pool warms 0, letting its
+            #      share fall to cold detonation rather than pre-warming it on the warm tiers. That
+            #      under-warms the warm tiers by cold's share (latency onto the cold path), which is
+            #      exactly a prompt cold dispatcher's purpose; it reserves its own cold-footprint
+            #      budget separately. An OVERFLOW-ONLY cold (BLASTBOX_CLAIM_UNTARGETED_AFTER_S) is
+            #      not a drainer while the engine has a prompt pool, so the warm tiers are sized for
+            #      the whole untargeted burst; it still sizes for jobs targeted at the cold tier.
             #  (b) the untargeted warm target uses _engine_int_share's (tier,instance)-rank remainder
             #      bias while the ceiling water-fill breaks ties by snaps order, so under a tight
             #      budget + non-divisible untargeted one warmable job can stay QUEUED a tick (served
@@ -627,7 +653,8 @@ class DispatcherSizer:
             my_targeted = max(0, backlog - min(backlog, self._last_untargeted))
             my_backlog = (_int_share(my_targeted, e.name, self._runtime, self._instance)
                           + _engine_int_share(min(backlog, self._last_untargeted),
-                                              e.name, self._runtime, self._instance))
+                                              e.name, self._runtime, self._instance,
+                                              self._overflow_only))
             # the warm FLOOR is also split across same-queue replicas — else two overlapping
             # replicas each hold the full min_warm hot (aggregate 2× the configured floor).
             my_min_warm = _int_share(e.min_warm, e.name, self._runtime, self._instance)
