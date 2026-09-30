@@ -154,6 +154,11 @@ class SnapshotManager:
         # Set on a swap and drained by the runtime's take_repaired_tiers(), so the pool advances
         # its generation and old-generation failures stop being charged to the new base.
         self._repaired = False
+        # The build epoch of the last drop -- reported by invalidate(repaired=True) or the ceiling,
+        # or recorded by the pool's own repair. The refresh a drop ADOPTS is staged under that same
+        # epoch, and its later swap is the same episode: counted once, or the pool advanced its
+        # generation twice for one repair. Epochs only rise, so it never matches a later episode.
+        self._reported_epoch: int | None = None
         # A finished refresh is STAGED, not published: only take_repaired() -- the pool's drain,
         # on the thread that also stamps and spawns slots -- swaps it in. Published by the refresh
         # thread at an arbitrary moment, a slot restored from the new base could carry the
@@ -246,7 +251,11 @@ class SnapshotManager:
         """
         with self._build_lock:
             out, self._repaired = self._repaired, False
+            adopted_epoch = (self._staged_epoch
+                             if self._staged is not None and self._staged_for is None else None)
             swapped, collect = self._swap_staged_locked()
+            if swapped and adopted_epoch is not None and adopted_epoch == self._reported_epoch:
+                swapped = False       # the adopted swap of a repair invalidate() already reported
             if collect is not None:
                 # PARKED, not discarded here: the pool calls this under its own lock, and a
                 # discard is a RAM-sized unlink. Flag a sweep for the next tick's prepare():
@@ -454,6 +463,7 @@ class SnapshotManager:
                     )
                     collect = self._invalidate_locked()
                     self._repaired = True
+                    self._reported_epoch = self._build_epoch   # its adopted refresh: same episode
                 if self._build_thread is not None and self._build_thread.is_alive():
                     return
                 if self._staged is not None:
@@ -821,7 +831,7 @@ class SnapshotManager:
                     if self._staging_epoch == epoch + 1:
                         self._staging_epoch = None
 
-    def invalidate(self, *, only_if: object | None = None) -> bool:
+    def invalidate(self, *, only_if: object | None = None, repaired: bool = False) -> bool:
         """Discard the built artifact so the next ``build()`` captures a fresh one.
 
         The warm base is checkpointed from a live sandbox, so it can capture a guest that was
@@ -831,6 +841,11 @@ class SnapshotManager:
 
         Returns True if a built artifact was actually discarded. Never raises: a failed
         invalidation must not take down the caller's failure-handling path.
+
+        ``repaired``: report the drop through take_repaired(), in the SAME hold, so the pool
+        advances its generation -- a drop the pool never hears of left the old generation
+        current, charging its failures to the replacement's slots. The pool's own repair path
+        records its generation itself and leaves this False.
         """
         with self._build_lock:
             # CHECK AND ACT IN ONE HOLD. `only_if` names the artifact the caller found wrong: if it
@@ -840,6 +855,16 @@ class SnapshotManager:
                 return False
             had = self._artifact is not None
             collect = self._invalidate_locked()
+            if repaired:
+                if had:
+                    self._repaired = True
+                    self._reported_epoch = self._build_epoch
+            else:
+                # The pool's own repair records its generation itself, which subsumes any drop
+                # still waiting to be reported (leaving the flag set advanced it a second time) --
+                # and the refresh it adopts, whose later swap is this same episode.
+                self._repaired = False
+                self._reported_epoch = self._build_epoch
         for artifact in collect:
             self._collect(artifact)
         return had
@@ -1019,7 +1044,7 @@ class SnapshotManager:
                 # way. Waiting for the pool's repair drained the warm tier to zero -- and inside
                 # its rebuild cooldown, or with repair disabled, never recovered at all. Only if
                 # it is still the current artifact: a concurrent rebuild may already have won.
-                if self.invalidate(only_if=artifact):
+                if self.invalidate(only_if=artifact, repaired=True):
                     _log.error("snapshot.stale_base_dropped: %s -- rebuilding from the current "
                                "rootfs", exc)
             raise

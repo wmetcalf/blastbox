@@ -266,7 +266,7 @@ def test_an_invalidate_mid_refresh_adopts_the_refresh_as_its_repair(tmp_path) ->
     mgr.ensure_build_started()
     time.sleep(0.05)
     assert backend.attempts == 2                  # and nothing builds over it meanwhile
-    assert mgr.take_repaired() is True
+    assert mgr.take_repaired() is False   # swapped in, but the same episode the pool's drop recorded
     assert mgr.artifact == "artifact-1"
     assert backend.attempts == 2                  # no second build
     assert mgr.build_epoch == epoch0 + 1
@@ -299,7 +299,7 @@ def test_an_invalidate_of_a_staged_refresh_adopts_it(tmp_path) -> None:
     _stage(mgr)
     mgr.invalidate()
     assert not mgr.is_built()                     # nothing appears inside the pool's drop()
-    assert mgr.take_repaired() is True
+    assert mgr.take_repaired() is False   # swapped in, but the same episode the pool's drop recorded
     assert mgr.artifact == "artifact-1"
     assert backend.attempts == 2
     assert ack.capable_for(mgr.build_epoch)
@@ -578,7 +578,8 @@ def test_an_invalidate_before_the_refresh_boots_still_adopts_it(tmp_path) -> Non
     mgr, backend, hold = _refresh_blocked_before_boot(tmp_path)
     mgr.invalidate()
     hold.set()
-    _swap(mgr)
+    _stage(mgr)
+    assert mgr.take_repaired() is False   # swapped in, but the same episode the pool's drop recorded
     assert mgr.artifact == "artifact-1"
     assert backend.attempts == 2                  # no second full build
 
@@ -693,3 +694,65 @@ def test_a_pinned_superseded_base_is_not_reclaimed_early(tmp_path) -> None:
     assert old not in backend.discarded           # a slot still maps it
     mgr.release("live")
     assert old in backend.discarded
+
+
+def test_a_stale_drop_that_adopts_a_staged_refresh_is_reported_once(tmp_path) -> None:
+    """A stale restore's drop (invalidate(repaired=True)) landing on a staged refresh adopts it,
+    and BOTH halves claim a repair: the drop's flag and the adopted swap. take_repaired() must
+    report it exactly ONCE -- a second report double-advances the pool's generation and retires
+    the adopted base's first slots as if they were the stale one's."""
+    mgr, _ = _built(tmp_path, max_age_s=60.0)
+    old = mgr.artifact
+    _age(mgr, 61.0)
+    mgr.ensure_build_started()
+    _stage(mgr)
+    assert mgr.invalidate(only_if=old, repaired=True) is True
+    assert mgr.take_repaired() is True
+    assert mgr.artifact == "artifact-1"           # the refresh was adopted, not discarded
+    assert mgr.take_repaired() is False
+    assert mgr.invalidate(only_if=old, repaired=True) is False   # superseded: nothing to report
+    assert mgr.take_repaired() is False
+
+
+def test_a_stale_drop_on_an_in_flight_refresh_is_reported_once(tmp_path) -> None:
+    """Prosecution of #190: the drop lands while the refresh is still BOOTING. A drain in between
+    consumed the drop's report; the refresh then finished, was adopted as the repair, and its swap
+    reported the same episode again -- the pool advanced its generation twice for one repair."""
+    import threading
+
+    backend = DistinctBackend()
+    mgr, _ = _built(tmp_path, backend=backend, max_age_s=60.0)
+    old = mgr.artifact
+    _age(mgr, 61.0)
+    backend.gate = threading.Event()
+    backend.entered.clear()
+    mgr.ensure_build_started()
+    assert backend.entered.wait(5)                # the refresh is booting
+    assert mgr.invalidate(only_if=old, repaired=True) is True
+    assert mgr.take_repaired() is True            # the drop is the report
+    backend.gate.set()
+    _stage(mgr)                                   # the refresh finishes and is adopted
+    assert mgr.take_repaired() is False           # its swap is the SAME repair: not reported again
+    assert mgr.artifact == "artifact-1"
+
+
+def test_a_ceiling_drop_on_a_booting_refresh_is_reported_once(tmp_path) -> None:
+    """Round 2 of #190: the past-the-ceiling drop set the report but not its episode, so the
+    refresh it adopted reported the same repair again at the swap."""
+    import threading
+
+    backend = DistinctBackend()
+    mgr, _ = _built(tmp_path, backend=backend, max_age_s=60.0)
+    _age(mgr, 61.0)
+    backend.gate = threading.Event()
+    backend.entered.clear()
+    mgr.ensure_build_started()
+    assert backend.entered.wait(5)                # the refresh is booting
+    _age(mgr, 70.0)                               # ...and the base passes the ceiling meanwhile
+    mgr.ensure_build_started()
+    assert not mgr.is_built()
+    assert mgr.take_repaired() is True            # the ceiling drop is the report
+    backend.gate.set()
+    _stage(mgr)
+    assert mgr.take_repaired() is False           # its adopted refresh is the same repair
+    assert mgr.artifact == "artifact-1"
