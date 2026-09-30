@@ -404,11 +404,13 @@ class WarmPool:
         # A SEPARATE count of restore-path failures (the same events as above: spawn raising, a
         # slot timing out in WARMING, a promoted slot dying unproven — at the health tick or at
         # claim time), for is_serving() only, counted in the order they happen. It resets ONLY on
-        # PROOF that the restore path works: a slot completing a clean served job, or a live IDLE
-        # slot leaving healthy (surplus reap on a scale-down). Promotion alone is not proof — a
-        # poisoned restore can pass is_ready() and die — and needs no reset: a ready slot already
-        # makes the pool serving. Kept apart from _spawn_consecutive_failures so the base-repair
-        # logic's own counter and its resets are untouched.
+        # PROOF that the CURRENT base restores usable workers — a slot of the current base
+        # generation completing a served job (clean, or a valid engine error) — or when a new base
+        # is installed (the old base's failures say nothing about it). Promotion and a quiet
+        # surplus reap are not proof: a poisoned restore passes is_ready() and the health tick and
+        # only fails the claim probe. A ready slot already makes the pool serving, so neither
+        # needs a reset. Kept apart from _spawn_consecutive_failures so the base-repair logic's
+        # own counter and its resets are untouched.
         self._restore_failure_streak = 0
         # Keyed by slot_id, NOT stored on the slot: runtimes supply their own slot types (e.g.
         # AwsWorkerSlot) that duck-type the Slot protocol without inheriting its dataclass fields,
@@ -1007,7 +1009,12 @@ class WarmPool:
                 # a successfully validated engine run still counted as consecutive (PR #82).
                 self._spawn_consecutive_failures = 0
                 self._promoted_unproven.discard(slot.slot_id)
-                self._restore_failure_streak = 0     # a served job proves the restore path
+                # a served job proves the restore path — for the CURRENT base only (same
+                # generation guard as the counters around it: a late success from a retired base
+                # says nothing about the one now failing to restore)
+                _st = self._slot_base.get(slot.slot_id)
+                if _st is None or _st[1] == self._base_generation.get(_st[0], 0):
+                    self._restore_failure_streak = 0
                 # GENERATION-GUARDED, like the evidence it arbitrates -- and BOTH counters, not
                 # just the per-base one. A long-running slot from a retired generation succeeding
                 # late still bumped the pool-wide counter, which is the fallback token for a
@@ -1091,7 +1098,12 @@ class WarmPool:
                 # so it — not promotion — is what clears the restore-failure streak.
                 self._spawn_consecutive_failures = 0
                 self._promoted_unproven.discard(slot.slot_id)
-                self._restore_failure_streak = 0     # a served job proves the restore path
+                # a served job proves the restore path — for the CURRENT base only (same
+                # generation guard as the counters around it: a late success from a retired base
+                # says nothing about the one now failing to restore)
+                _st = self._slot_base.get(slot.slot_id)
+                if _st is None or _st[1] == self._base_generation.get(_st[0], 0):
+                    self._restore_failure_streak = 0
             if tracked:
                 slot_failures = self._slot_failures.get(hkey, 0)
                 last_success = self._slot_last_success.get(hkey, 0.0)
@@ -1392,7 +1404,7 @@ class WarmPool:
                     logger.warning("pool.take_repaired_tiers_failed: %s", exc)
                     return
                 for name in names or ():
-                    self._base_generation[str(name)] = self._base_generation.get(str(name), 0) + 1
+                    self._advance_base_generation_unlocked(str(name))
                     # ...and the retired base's evidence with it. Advancing the generation
                     # filters only failures reported AFTER this point; what the old base had
                     # already accumulated survived, so two old-slot hangs plus one from the fresh
@@ -1697,10 +1709,6 @@ class WarmPool:
             if surplus <= 0:
                 return
             victims = [s for s in self._slots.values() if s.state == SlotState.IDLE][:surplus]
-            if victims:
-                # a live IDLE slot leaving healthy (not found dead by the health check, which
-                # demotes dead ones) proves the restore path worked for it (is_serving)
-                self._restore_failure_streak = 0
             # Flip to DRAINING HERE, still under the selection lock, so a concurrent
             # claim() (which only takes IDLE) cannot grab a victim between selection and
             # reap — otherwise we'd destroy a slot mid-job. (stop() takes the same care.)
@@ -1965,6 +1973,13 @@ class WarmPool:
         with self._lock:
             return self._burst_active
 
+    def _advance_base_generation_unlocked(self, name: str) -> None:
+        """A NEW base was installed for `name` (a repair swapped or rebuilt it): advance its
+        generation, and restart the restore-failure streak — the old base's failures are not
+        evidence about the new one (is_serving)."""
+        self._base_generation[name] = self._base_generation.get(name, 0) + 1
+        self._restore_failure_streak = 0
+
     # consecutive restore-path failures after which a pool with nothing ready counts as not serving
     SERVING_RESTORE_FAILURES = 3
 
@@ -1974,9 +1989,10 @@ class WarmPool:
 
         False only when BOTH hold: no slot is ready (IDLE) or busy (ASSIGNED), and the RESTORE
         path is failing — at least SERVING_RESTORE_FAILURES restore failures (spawn raising, a slot
-        timing out in WARMING, a promoted slot dying unproven) since the last PROOF the path works:
-        a clean served job, or a live idle slot leaving healthy. Promotion alone is not proof, and
-        needs no reset since a ready slot already makes the pool serving. WARMING slots are not evidence either way: a pool whose
+        timing out in WARMING, a promoted slot dying unproven) since the last PROOF the current base
+        works — a served job by a slot of the current base generation — or since a new base was
+        installed. Promotion and a quiet scale-down reap are not proof; a ready slot already makes
+        the pool serving. WARMING slots are not evidence either way: a pool whose
         restores keep failing always has some slot warming, and a healthy respawn has no failure
         count. Job/worker faults (a dirty release) never count: a burst of bad samples recycles
         slots, it doesn't break the pool. Everything else — ready, busy, healthily warming, empty
@@ -3354,7 +3370,7 @@ class WarmPool:
             if isinstance(_repaired, (list, tuple, set, frozenset)) and _repaired:
                 with self._lock:
                     for _name in {str(n) for n in _repaired}:
-                        self._base_generation[_name] = self._base_generation.get(_name, 0) + 1
+                        self._advance_base_generation_unlocked(_name)
                         # ...and their evidence goes with them. The generation advances here, so
                         # these tiers HAVE been replaced -- but the success-path cleanup never
                         # runs on this branch, so below-threshold evidence recorded against the
@@ -3430,7 +3446,7 @@ class WarmPool:
             else:
                 names = {ident for ident, _ in self._slot_base.values()} | {""}
             for _name in names:
-                self._base_generation[_name] = self._base_generation.get(_name, 0) + 1
+                self._advance_base_generation_unlocked(_name)
             self._last_base_rebuild_at = now
             # Defer this tick's spawning wherever the rebuild came from. tick() captured `ready`
             # before release() could run, and a JOB-triggered rebuild races it: both snapshot

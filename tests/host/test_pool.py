@@ -4921,10 +4921,10 @@ def test_worker_faults_do_not_make_a_pool_unserving() -> None:
         assert pool.is_serving() is True
 
 
-def test_a_healthy_slot_leaving_resets_the_restore_streak() -> None:
-    # probe_pool: failing restores, then a healthy one (serving while it is ready); scaled to warm
-    # 0, the live idle slot leaves healthy — that is proof, so the empty pool is serving (not stuck
-    # not-serving until a job runs)
+def test_scaling_down_an_unproven_pool_is_not_proof() -> None:
+    # K+ restore failures, then a slot promotes (serving while it is ready) but never serves a job;
+    # scaled to warm 0 and reaped, the empty pool has no proof its restore path works: NOT
+    # serving. (Promotion and a quiet reap were never evidence — a poisoned restore passes both.)
     class _Flaky(_FakeRuntime):
         fails = 4
 
@@ -4945,7 +4945,26 @@ def test_a_healthy_slot_leaving_resets_the_restore_streak() -> None:
     for _ in range(6):
         pool.tick()
     assert pool.slot_count == 0
-    assert pool.is_serving() is True
+    assert pool._restore_failure_streak >= WarmPool.SERVING_RESTORE_FAILURES
+    assert pool.is_serving() is False
+
+
+def test_idle_pool_with_fewer_than_k_failures_scaled_to_zero_is_serving() -> None:
+    class _Flaky(_FakeRuntime):
+        fails = 1
+
+        def spawn(self) -> Slot:
+            if self.fails > 0:
+                self.fails -= 1
+                raise RuntimeError("transient restore failure")
+            return super().spawn()
+    pool = WarmPool(runtime=_Flaky(), warm_size=1, spawn_rate_limit=100.0)
+    for _ in range(4):
+        pool.tick()
+    pool.resize(warm_size=0, concurrent_ceiling=4)
+    for _ in range(6):
+        pool.tick()
+    assert pool.slot_count == 0 and pool.is_serving() is True
 
 
 def test_is_serving_false_when_restores_time_out_even_with_a_slot_warming() -> None:
@@ -5111,4 +5130,132 @@ def test_a_job_that_returned_an_engine_error_proves_the_restore_path() -> None:
     s = pool.claim(timeout_s=0.05)
     assert s is not None
     pool.release(s, dirty=True, fault="job")
+    assert pool._restore_failure_streak == 0
+
+
+def test_reaping_a_surplus_slot_does_not_reset_even_if_the_reap_raises() -> None:
+    # codex: the surplus reap zeroed the streak when it SELECTED an idle victim, before the reap —
+    # with the reap raising, the slot sat DRAINING with streak 0: serving with no usable slot
+    class _ReapRaises(_ClaimDeadRuntime):
+        def reap(self, slot: Slot) -> None:
+            raise RuntimeError("destroy failed")
+    rt = _ReapRaises(fails=3)
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=1000.0, snapshot_rebuild_after=99)
+    _tick_until_idle(pool, 1)
+    assert pool._restore_failure_streak == 3
+    pool.resize(warm_size=0, concurrent_ceiling=4)
+    pool.tick()
+    assert pool._restore_failure_streak == 3
+    assert not any(s.state in (SlotState.IDLE, SlotState.ASSIGNED) for s in pool._slots.values())
+    assert pool.is_serving() is False
+
+
+def test_poisoned_base_burst_and_scale_down_cycles_end_not_serving() -> None:
+    # opus: every restore passes is_ready and the health tick but is dead at the claim probe; burst
+    # (claims find them dead) then scale-down (the rest reaped quietly). No job is ever served, so
+    # once K failures accrue the empty pool is not serving — cycles no longer reset it.
+    class _Poisoned(_FakeRuntime):
+        def is_alive_for_claim(self, slot: Slot, budget_s: float | None = None) -> bool:
+            return False
+    pool = WarmPool(runtime=_Poisoned(), warm_size=2, spawn_rate_limit=1000.0,
+                    snapshot_rebuild_after=99)
+    served = 0
+    for _ in range(10):
+        pool.resize(warm_size=2, concurrent_ceiling=4)
+        pool.tick()
+        pool.tick()
+        for _ in range(2):
+            s = pool.claim(timeout_s=0.05)
+            if s is not None:
+                served += 1
+                pool.release(s)
+        pool.tick()
+        pool.resize(warm_size=0, concurrent_ceiling=4)
+        pool.tick()
+    assert served == 0
+    assert pool._restore_failure_streak >= WarmPool.SERVING_RESTORE_FAILURES
+    assert pool.slot_count == 0 or not any(
+        s.state in (SlotState.IDLE, SlotState.ASSIGNED) for s in pool._slots.values())
+    assert pool.is_serving() is False
+
+
+def test_a_job_served_by_a_retired_base_generation_does_not_reset() -> None:
+    # opus: a long job from a slot restored off a base that has since been RETIRED completes
+    # cleanly; that proves nothing about the current base (whose restores are failing) — same
+    # generation guard as the adjacent clean-release counters
+    class _RT(_FakeRuntime):
+        fail = False
+
+        def spawn(self) -> Slot:
+            if self.fail:
+                raise RuntimeError("restore of new base fails")
+            return super().spawn()
+    rt = _RT()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=1000.0, snapshot_rebuild_after=99)
+    pool.resize(warm_size=1, concurrent_ceiling=1)
+    pool.tick()
+    pool.tick()
+    s = pool.claim(timeout_s=0.05)
+    assert s is not None
+    ident, gen = pool._slot_base[s.slot_id]
+    pool._base_generation[ident] = gen + 1          # retired while the long job runs
+    rt.fail = True
+    pool.resize(warm_size=2, concurrent_ceiling=3)
+    for _ in range(4):
+        pool.tick()
+    before = pool._restore_failure_streak
+    assert before >= WarmPool.SERVING_RESTORE_FAILURES
+    pool.release(s)
+    assert pool._restore_failure_streak == before
+
+
+def test_a_job_that_returned_an_engine_error_on_a_retired_base_does_not_reset() -> None:
+    class _RT(_FakeRuntime):
+        fail = False
+
+        def spawn(self) -> Slot:
+            if self.fail:
+                raise RuntimeError("restore of new base fails")
+            return super().spawn()
+    rt = _RT()
+    pool = WarmPool(runtime=rt, warm_size=1, spawn_rate_limit=1000.0, snapshot_rebuild_after=99)
+    pool.resize(warm_size=1, concurrent_ceiling=1)
+    pool.tick()
+    pool.tick()
+    s = pool.claim(timeout_s=0.05)
+    assert s is not None
+    ident, gen = pool._slot_base[s.slot_id]
+    pool._base_generation[ident] = gen + 1
+    rt.fail = True
+    pool.resize(warm_size=2, concurrent_ceiling=3)
+    for _ in range(4):
+        pool.tick()
+    before = pool._restore_failure_streak
+    pool.release(s, dirty=True, fault="job")
+    assert pool._restore_failure_streak == before
+
+
+def test_a_new_base_generation_resets_the_streak() -> None:
+    # the old base's restore failures are not evidence about the replacement: when the runtime
+    # reports a repaired tier (a new base installed), the streak starts over
+    class _Reporting:
+        def __init__(self) -> None:
+            self.taken = 0
+
+        def prepare(self) -> bool:
+            return True
+
+        def spawn(self):
+            raise RuntimeError("not used")
+
+        def is_ready(self, s): return True
+        def is_alive(self, s): return True
+        def reap(self, s): pass
+
+        def take_repaired_tiers(self):
+            self.taken += 1
+            return ["fc"] if self.taken == 1 else []
+    pool = WarmPool(runtime=_Reporting(), warm_size=0, concurrent_ceiling=2)
+    pool._restore_failure_streak = 5
+    pool.tick()
     assert pool._restore_failure_streak == 0
