@@ -523,6 +523,15 @@ def _bounded_debugfs(argv: Sequence[str]) -> str:
     return out.decode("utf-8", "replace")
 
 
+_SHOWN = threading.local()
+
+
+def _shown_as(path: str) -> str:
+    """The name to report for ``path``: the rootfs GuestGate pinned it from, else ``path``."""
+    names = getattr(_SHOWN, "names", None)
+    return names.get(path, path) if names else path
+
+
 def guest_problem(rootfs: str, runtime: str) -> str:
     """Why this host must not boot ``rootfs`` on ``runtime``, or "" when it may."""
     return guest_verdict(rootfs, runtime)[0]
@@ -540,33 +549,40 @@ def guest_verdict(rootfs: str, runtime: str) -> tuple[str, bool]:
     from blastbox.host import platform_id as _plat
 
     log = logging.getLogger("blastbox.host.rootfs_stamp")
+    # GuestGate reads through a pinned descriptor (/proc/<pid>/fd/N); operators need the FILE.
+    pinned, shown = rootfs, _shown_as(rootfs)
+    rootfs = shown
+
+    def say(exc: BaseException) -> str:
+        return str(exc).replace(pinned, shown)
+
     try:
-        stamp = read(rootfs)
+        stamp = read(pinned)
     except RootfsUnstamped as exc:
         log.warning(
             "rootfs %s carries no blastbox stamp (%s); booting it anyway. "
             "Rebuild it with `blastbox build-images` so guest/host drift is caught "
             "here instead of as a timeout on every warm job.",
-            rootfs, exc,
+            rootfs, say(exc),
         )
         return "", True        # definitively unstamped: nothing to re-read until it changes
     except RootfsProbeBusy as exc:
-        return f"{rootfs}: {_BUSY} ({exc})", False
+        return f"{rootfs}: {_BUSY} ({say(exc)})", False
     except RootfsStampInvalid as exc:
         # PRESENT but unusable: refused. The image wrote it, and a damaged stamp must not
         # buy the unchecked boot that only a genuinely absent one gets.
-        return f"{rootfs}: its blastbox stamp is unusable ({exc}); rebuild it with " \
+        return f"{rootfs}: its blastbox stamp is unusable ({say(exc)}); rebuild it with " \
             "`blastbox build-images`", True
     except RootfsStampError as exc:
         log.warning(
             "rootfs %s carries no readable blastbox stamp (%s); booting it anyway. "
             "Rebuild it with `blastbox build-images` so guest/host drift is caught "
             "here instead of as a timeout on every warm job.",
-            rootfs, exc,
+            rootfs, say(exc),
         )
         return "", False       # could NOT look: allowed, but must be looked at again
     except Exception as exc:  # noqa: BLE001 - never fail the tier on a diagnostic
-        log.warning("could not read the rootfs stamp on %s: %s", rootfs, exc)
+        log.warning("could not read the rootfs stamp on %s: %s", rootfs, say(exc))
         return "", False
     # The version as this PROCESS loaded it (blastbox.__version__, read from metadata once at
     # import) -- not importlib.metadata now, which re-reads dist-info from disk: a pip upgrade
@@ -723,7 +739,14 @@ class GuestGate:
         try:
             pinned = f"/proc/{os.getpid()}/fd/{fd}"
             held = file_identity(pinned)
-            found, definitive = guest_verdict(pinned, self.runtime)
+            names = getattr(_SHOWN, "names", None)
+            if names is None:
+                names = _SHOWN.names = {}
+            names[pinned] = self.rootfs
+            try:
+                found, definitive = guest_verdict(pinned, self.runtime)
+            finally:
+                names.pop(pinned, None)
             found = found.replace(pinned, self.rootfs)
             held_after = file_identity(pinned)
         finally:

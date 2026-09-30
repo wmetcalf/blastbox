@@ -1652,3 +1652,32 @@ def test_a_busy_cap_is_reprobed_promptly_not_after_the_slow_backoff(tmp_path,
     import time as _t
     assert gate._retry_at is not None
     assert gate._retry_at - _t.monotonic() <= rfs.BUSY_RETRY_S
+
+
+# --- 0.1.43 in production: the gate named the pinned descriptor, not the rootfs ---------------
+
+
+def test_the_gate_logs_the_rootfs_path_not_its_pinned_descriptor(tmp_path, caplog) -> None:
+    """toolz2 logged "rootfs /proc/7/fd/7 guest blastbox 0.1.43 matches this host": the check
+    reads through a pinned fd, and every message named that instead of the file."""
+    import logging
+
+    tree = _dir_stamp(tmp_path, "r", blastbox_version="0.1.42",
+                      platform={"arch": plat.host_platform().arch, "runtime": "gvisor"})
+    with caplog.at_level(logging.INFO, logger="blastbox.host.rootfs_stamp"):
+        assert rfs.GuestGate(tree, "gvisor").checked()[0] == ""
+    assert "matches this host" in caplog.text
+    assert tree in caplog.text and "/proc/" not in caplog.text
+
+
+def test_the_unstamped_warning_names_the_rootfs_not_its_descriptor(tmp_path, caplog) -> None:
+    """The warning branches (unstamped, unreadable) log the rootfs AND the exception text, which
+    read_from_dir() builds from the pinned path -- both must name the rootfs."""
+    import logging
+
+    tree = tmp_path / "bare"
+    tree.mkdir()                                  # no stamp at all: the legacy warning branch
+    with caplog.at_level(logging.WARNING, logger="blastbox.host.rootfs_stamp"):
+        assert rfs.GuestGate(str(tree), "gvisor").checked()[0] == ""
+    assert "no blastbox stamp" in caplog.text
+    assert str(tree) in caplog.text and "/proc/" not in caplog.text
