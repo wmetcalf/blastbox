@@ -1699,7 +1699,7 @@ def test_demand_snapshot_field_order_is_append_only():
     assert (snap.node == "node-x" and snap.tier == "firecracker"
             and snap.refresh_s == 5.0 and snap.instance == "inst-1" and snap.balancing is True)
     # The consensus/budget/untargeted fields keep their defaults — none was shifted by the append.
-    assert snap.untargeted_backlog == 0 and snap.overflow_only is False
+    assert snap.untargeted_backlog == 0 and snap.overflow_only is None
     assert snap.budget_ram_mib == 0.0 and snap.budget_vcpus == 0.0 and snap.stale_after_s == 0.0
 
 
@@ -1881,7 +1881,8 @@ def _peer(tier, instance, backlog, untargeted, *, overflow_only=None, max_ceilin
 def _fc_sizer(share, *, backlog, untargeted, overflow_only=False, ram_budget=64 * 1024,
               max_ceiling=64, instance="f", tier="firecracker"):
     return DispatcherSizer(
-        EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=max_ceiling), _Pool(), share,
+        EngineNode("clip", "-", slot_ram_mib=1024, max_ceiling=max_ceiling),
+        None if tier == "cold" else _Pool(), share,   # a cold-only dispatcher has no warm pool
         _OVF_CFG, runtime=tier, backlog_fn=lambda: backlog,
         untargeted_backlog_fn=lambda: untargeted, node="n", instance=instance,
         capacity_fn=_budget(ram_budget, 999), clock=lambda: 1.0, overflow_only=overflow_only)
@@ -2052,3 +2053,104 @@ def test_start_node_sizer_threads_claim_delay_into_overflow_flag(tmp_path, monke
             stop.set()
             thread.join(2.0)
             sizer.remove_own_snapshot()
+
+
+# --- version gate: the exclusion applies only when EVERY pool of the engine carries the field ----
+# Pools plan independently from the shared view; the node stays within budget only because they
+# all compute the SAME plan. A dispatcher from before `overflow_only` splits untargeted evenly, so
+# while one of an engine's pools is on that version every planner must split that engine evenly
+# too, or the old pool's slice and the new pools' slices come from different plans and can sum
+# past the budget.
+
+def _write_old(tmp_path_dir, tier, instance, backlog, untargeted, *, assigned=0, engine="clip"):
+    """A pre-`overflow_only` peer: the key is absent from the file, not False."""
+    import json
+    from dataclasses import asdict
+    raw = asdict(_peer(tier, instance, backlog, untargeted, engine=engine))
+    raw.pop("overflow_only", None)
+    raw["assigned"] = assigned
+    (tmp_path_dir / FileNodeShare._filename(engine, tier, "n", instance)).write_text(
+        json.dumps(raw))
+
+
+def _own_plan(monkeypatch, share, sizer):
+    """What `sizer`'s planner computes for the node: {pool: ceiling}, plus the specs."""
+    specs = _capture_specs(monkeypatch)
+    sizer.tick()
+    from blastbox.host.node_sizer import NodeBudget, plan_sizes
+    got = dict(specs)
+    budget = NodeBudget(ram_mib=8 * 1024, vcpus=999)
+    return {k: p.concurrent_ceiling for k, p in plan_sizes(list(got.values()), budget).items()}, got
+
+
+def test_mixed_version_engine_keeps_the_even_split(tmp_path, monkeypatch):
+    # (a) fc is new and prompt, cold is new and overflow-only, gvisor is OLD (no key). The new
+    # planners must compute exactly what the old gvisor planner does — the even three-way split —
+    # so each pool's own slice, taken from its own planner, stays within the budget jointly.
+    mixed = tmp_path / "mixed"
+    share = FileNodeShare(str(mixed))
+    _write_old(mixed, "gvisor", "g", 16, 16)
+    share.publish(_peer("cold", "c", 16, 16, overflow_only=True))
+    new_fc, fc_specs = _own_plan(monkeypatch, share, _fc_sizer(
+        share, backlog=16, untargeted=16, ram_budget=8 * 1024))
+    cold_sizer = _fc_sizer(
+        share, backlog=16, untargeted=16, ram_budget=8 * 1024, overflow_only=True,
+        tier="cold", instance="c")
+    assert cold_sizer._active()                         # it really plans (pool-less cold-only)
+    new_cold, cold_specs = _own_plan(monkeypatch, share, cold_sizer)
+
+    # what the OLD gvisor planner computes: the even split, i.e. no pool treated as overflow
+    even = tmp_path / "even"
+    eshare = FileNodeShare(str(even))
+    eshare.publish(_peer("gvisor", "g", 16, 16, overflow_only=False))
+    eshare.publish(_peer("cold", "c", 16, 16, overflow_only=False))
+    old, old_specs = _own_plan(monkeypatch, eshare, _fc_sizer(
+        eshare, backlog=16, untargeted=16, ram_budget=8 * 1024))
+
+    for got in (fc_specs, cold_specs):
+        assert {k: (s.queued, s.demand) for k, s in got.items()} == \
+            {k: (s.queued, s.demand) for k, s in old_specs.items()}
+        assert got["clip@cold@c"].queued == 16 / 3          # not excluded while gvisor is old
+    assert new_fc == new_cold == old
+    joint = (new_fc["clip@firecracker@f"] + new_cold["clip@cold@c"] + old["clip@gvisor@g"])
+    assert joint * 1024 <= 8 * 1024
+
+
+def test_exclusion_applies_once_every_pool_carries_the_field(tmp_path, monkeypatch):
+    # (b) the same three pools, all upgraded: cold (overflow-only) is excluded.
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    share.publish(_peer("gvisor", "g", 16, 16, overflow_only=False))
+    share.publish(_peer("cold", "c", 16, 16, overflow_only=True))
+    _fc_sizer(share, backlog=16, untargeted=16).tick()
+    assert specs["clip@cold@c"].queued == 0
+    assert specs["clip@firecracker@f"].queued == 8 and specs["clip@gvisor@g"].queued == 8
+
+
+def test_old_pool_forces_even_split_even_without_an_overflow_pool(tmp_path, monkeypatch):
+    # (c) a new prompt pool carrying the field + an old pool without it → the old split.
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    _write_old(tmp_path, "cold", "c", 16, 16)
+    mine = _fc_sizer(share, backlog=16, untargeted=16).tick()
+    assert specs["clip@cold@c"].queued == 8 and specs["clip@firecracker@f"].queued == 8
+    assert mine.warm_size == 8
+
+
+def test_mixed_version_overflow_pool_keeps_its_warm_share(tmp_path, monkeypatch):
+    # The warm-target split is gated too: a new overflow-only fc beside an OLD fc replica warms its
+    # even share (the old replica warms only its own half), so the burst is still fully warmed.
+    share = FileNodeShare(str(tmp_path))
+    _write_old(tmp_path, "gvisor", "g", 16, 16)
+    mine = _fc_sizer(share, backlog=16, untargeted=16, overflow_only=True).tick()
+    assert mine.warm_size == 8
+
+
+def test_gate_is_per_engine(tmp_path, monkeypatch):
+    # an old pool of ANOTHER engine doesn't switch this engine's exclusion off
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    _write_old(tmp_path, "firecracker", "r", 10, 10, engine="red")
+    share.publish(_peer("cold", "c", 16, 16, overflow_only=True))
+    _fc_sizer(share, backlog=16, untargeted=16).tick()
+    assert specs["clip@cold@c"].queued == 0 and specs["clip@firecracker@f"].queued == 16

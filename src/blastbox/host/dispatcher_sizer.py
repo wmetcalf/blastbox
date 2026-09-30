@@ -499,17 +499,31 @@ class DispatcherSizer:
         # an overflow pool keeps its targeted share, reservation and floors, but no untargeted
         # share (and so no budget priority for work it refuses). If an engine has NO prompt pool,
         # every pool of it is an untargeted drainer again (the plain split) so the work is never
-        # left unsized. A snapshot without the field (older peer) is prompt. Decided per engine
-        # from the shared view, so every dispatcher derives the same membership.
+        # left unsized. Decided per engine from the shared view, so every dispatcher derives the
+        # same membership.
+        # VERSION GATE: the exclusion applies to an engine only when EVERY pool of it in the view
+        # CARRIES the field (overflow_only is not None — presence, not value). A dispatcher from
+        # before the field splits the untargeted count evenly and cannot be told otherwise; if the
+        # new planners excluded a pool while it did not, each pool would take its slice from a
+        # DIFFERENT plan and the slices could sum past the budget. So while any pool of an engine
+        # lacks the field, every planner (old and new) uses the even split for that engine.
         engine_insts: dict[str, list[tuple[str, str]]] = {}
         engine_prompt: dict[str, list[tuple[str, str]]] = {}
+        engine_all_carry: dict[str, bool] = {}
         for s in snaps:
             engine_insts.setdefault(s.engine, []).append((s.tier, s.instance))
-            if getattr(s, "overflow_only", False) is not True:
+            flag = getattr(s, "overflow_only", None)
+            engine_all_carry[s.engine] = engine_all_carry.get(s.engine, True) and flag is not None
+            if flag is not True:
                 engine_prompt.setdefault(s.engine, []).append((s.tier, s.instance))
+        # engines whose overflow-only pools are excluded: every pool carries the field, and there
+        # is at least one prompt pool to take the untargeted work instead
+        engine_excluding = {eng for eng in engine_insts
+                            if engine_all_carry.get(eng) and engine_prompt.get(eng)}
         # the pools that take a share of each engine's untargeted count (sorted: deterministic rank)
         untargeted_insts: dict[str, list[tuple[str, str]]] = {
-            eng: sorted(engine_prompt.get(eng) or insts) for eng, insts in engine_insts.items()}
+            eng: sorted(engine_prompt[eng] if eng in engine_excluding else insts)
+            for eng, insts in engine_insts.items()}
 
         def _split(s) -> tuple[int, int]:
             """(targeted-to-this-tier, untargeted) from a snapshot's backlog."""
@@ -530,14 +544,14 @@ class DispatcherSizer:
                               overflow_only: bool) -> int:
             # like _int_share, but over the engine's untargeted DRAINERS (every tier; overflow-only
             # pools excluded while a prompt pool exists) — for splitting the UNTARGETED count so the
-            # shares still SUM to it across the engine's drainers. A pool absent from the view gets
-            # the base share, unless it is overflow-only behind a prompt pool (then 0).
+            # shares still SUM to it across the engine's drainers. A pool absent from the list gets
+            # the base share, unless it is overflow-only and the engine is excluding (then 0).
             lst = untargeted_insts.get(engine, [(tier, instance)])
             n = max(1, len(lst))
             base, rem = divmod(max(0, total), n)
             if (tier, instance) in lst:
                 return base + (1 if lst.index((tier, instance)) < rem else 0)
-            if overflow_only and engine_prompt.get(engine):
+            if overflow_only and engine in engine_excluding:
                 return 0
             return base
 
@@ -741,7 +755,10 @@ class DispatcherSizer:
             min_warm=min(e.min_warm, capped), max_ceiling=capped, weight=e.weight,
             ts=self._clock(), node=self._node, tier=self._runtime, instance=self._instance,
             refresh_s=0.0, balancing=self._config.balancing,
-            stale_after_s=FileNodeShare._GC_AGE_FLOOR_S)
+            stale_after_s=FileNodeShare._GC_AGE_FLOOR_S,
+            # carry the field (value irrelevant at backlog 0) so a current lease never switches
+            # its engine's overflow exclusion off the way a pre-field peer does
+            overflow_only=self._overflow_only)
         self._locked_final(lambda: self._share.publish(snap))
 
     def _locked_final(self, fn: Callable[[], None]) -> None:

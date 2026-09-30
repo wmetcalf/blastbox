@@ -39,7 +39,7 @@ import tempfile
 import time as _time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Optional, Protocol
 
 
 @dataclass(frozen=True)
@@ -107,14 +107,19 @@ class DemandSnapshot:
                                  # engine's tier-pools (fc+gvisor of one engine drain the same
                                  # untargeted jobs) instead of once per tier — else that engine's
                                  # demand doubles. 0 = all backlog is tier-targeted (no dedup).
-    overflow_only: bool = False  # this pool DECLINES fresh untargeted work (a claim delay,
+    overflow_only: Optional[bool] = None
+                                 # this pool DECLINES fresh untargeted work (a claim delay,
                                  # BLASTBOX_CLAIM_UNTARGETED_AFTER_S > 0): it only takes an untargeted
                                  # job once the prompt pools have left it long enough. Published so
                                  # the planner splits the engine's untargeted backlog over the PROMPT
                                  # pools only (falling back to all pools when the engine has none) —
                                  # else a delayed cold pool holds a share of work it refuses and the
-                                 # warm pools are sized for a fraction of the burst. Absent (older
-                                 # peer) → False, the even split every pool computed before.
+                                 # warm pools are sized for a fraction of the burst. A current
+                                 # publisher ALWAYS sets True/False; None = the key was ABSENT (a
+                                 # peer from before the field). Presence matters, not just value: an
+                                 # older planner splits evenly, so the exclusion is applied to an
+                                 # engine only while EVERY pool of it carries the field — else the
+                                 # old and new planners would compute different plans for one node.
 
 
 class NodeShare(Protocol):
@@ -374,7 +379,7 @@ def _valid(snap: DemandSnapshot) -> bool:
         and _finite_in(snap.budget_vcpus, 0, 1024 * _MAX_CEILING_SANE)
         and _finite_in(snap.stale_after_s, 0, _MAX_TS)
         and _finite_in(snap.untargeted_backlog, 0, _MAX_COUNT)
-        and isinstance(snap.overflow_only, bool)
+        and (snap.overflow_only is None or isinstance(snap.overflow_only, bool))
     )
 
 
