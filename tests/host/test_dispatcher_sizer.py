@@ -1860,20 +1860,20 @@ _PLAN: dict = {}     # the last node plan a tick computed (every pool's PoolSize
 
 
 def _capture_specs(monkeypatch):
-    """Record the per-pool PoolSpecs every tick hands the node planner (keyed by pool name), and
-    the plan it returned in _PLAN."""
+    """Record the PoolSpecs every tick hands plan_sizes (keyed by pool name), and the plan it
+    returned in _PLAN."""
     from blastbox.host import dispatcher_sizer as mod
     seen: dict = {}
-    real = mod._plan_node
+    real = mod.plan_sizes
 
-    def _spy(specs, budget, spill_groups):
+    def _spy(specs, budget):
         seen.clear()
         seen.update({s.name: s for s in specs})
-        plan = real(specs, budget, spill_groups)
+        plan = real(specs, budget)
         _PLAN.clear()
         _PLAN.update(plan)
         return plan
-    monkeypatch.setattr(mod, "_plan_node", _spy)
+    monkeypatch.setattr(mod, "plan_sizes", _spy)
     return seen
 
 
@@ -2526,11 +2526,12 @@ def test_gate_requires_running_field_too(tmp_path, monkeypatch):
     assert specs["clip@cold@c"].queued == 8 and specs["clip@firecracker@f"].queued == 8
 
 
-# --- the prompt pool has PRIORITY over its own engine's spill ----------------------------------
-# The spilled remainder is real demand against OTHER engines, but must never hold the engine's own
-# prompt pool below what it can absorb: the overflow pool only claims after the delay, so a slot
-# moved from the prompt pool to it is a slower slot. Engine-vs-engine the engine competes with its
-# whole demand; inside the engine the prompt pools are seated first.
+# --- starve scenarios: prompt-first is expressed ONLY in the untargeted demand split -------------
+# (maintainer decision) Every real pool is planned by plain plan_sizes at its true footprint; the
+# prompt pools' priority lives only in how the untargeted count is divided before planning (each
+# prompt pool up to its capacity, the true residue to the overflow pools). The proportional
+# water-fill may still give an overflow pool budget ahead of its idle prompt pool — see the
+# numbers pinned below.
 
 def _starve_view(tmp_path, *, w_cap, w_assigned=0, w_running=None, red_backlog=None):
     share = FileNodeShare(str(tmp_path))
@@ -2553,34 +2554,28 @@ def _plan_from(share, engine, tier, instance, backlog, untargeted, budget=10):
     return {k: p.concurrent_ceiling for k, p in _PLAN.items()}
 
 
-def test_idle_prompt_pool_gets_its_full_capacity_before_the_spill(tmp_path, monkeypatch):
-    # starve.py W4: budget 10, only clip. W (cap 4, idle) must be planned 4 — not 2 with cold 8.
-    _capture_specs(monkeypatch)
-    plan = _plan_from(_starve_view(tmp_path, w_cap=4), "clip", "cold", "c", 20, 20)
-    assert plan["clip@firecracker@w"] == 4
-    assert plan["clip@cold@c"] == 6                          # the residue
-
-
-def test_prompt_priority_with_a_competing_engine(tmp_path, monkeypatch):
-    # starve.py W4Y: + red with 40 queued. W gets at least what it got before the spill (3), cold
-    # only the residue of clip's share.
-    _capture_specs(monkeypatch)
-    plan = _plan_from(_starve_view(tmp_path, w_cap=4, red_backlog=40), "red", "firecracker", "y",
-                      40, 40)
-    assert plan["clip@firecracker@w"] == 3                  # 3e97db9 / pre-spill: W3 C1 Y6
-    assert plan["clip@cold@c"] == 1
-    assert plan["red@firecracker@y"] == 6
-    assert sum(plan.values()) <= 10
-
-
-def test_small_idle_prompt_pool_is_filled_first(tmp_path, monkeypatch):
-    # starve.py W0: W capped at 2 and idle, red 20 queued → W 2 (was 1 with cold 4)
-    _capture_specs(monkeypatch)
-    plan = _plan_from(_starve_view(tmp_path, w_cap=2, red_backlog=20), "red", "firecracker", "y",
-                      20, 20)
-    assert plan["clip@firecracker@w"] == 2
-    assert plan["clip@cold@c"] >= 2                          # the spill still competes with red
-    assert sum(plan.values()) <= 10
+def test_starve_scenarios_split_demand_prompt_first_and_plan_plainly(tmp_path, monkeypatch):
+    # starve.py's three cases. The untargeted DEMAND is split prompt-first (W's queued share = its
+    # capacity, cold the residue) and the plan is plain plan_sizes of those specs — no second
+    # allocator. The resulting ceilings are pinned as the known behaviour of this design (the
+    # proportional water-fill holds an idle capped W below its capacity: W4 → W2, see #193).
+    from blastbox.host.node_sizer import NodeBudget, plan_sizes
+    specs = _capture_specs(monkeypatch)
+    cases = [
+        ("W4", dict(w_cap=4), ("clip", "cold", "c", 20, 20), 4, 16,
+         {"clip@firecracker@w": 2, "clip@cold@c": 8}),
+        ("W4Y", dict(w_cap=4, red_backlog=40), ("red", "firecracker", "y", 40, 40), 4, 16,
+         {"clip@firecracker@w": 1, "clip@cold@c": 2, "red@firecracker@y": 7}),
+        ("W0", dict(w_cap=2, red_backlog=20), ("red", "firecracker", "y", 20, 20), 2, 18,
+         {"clip@firecracker@w": 1, "clip@cold@c": 4, "red@firecracker@y": 5}),
+    ]
+    for i, (name, view, who, w_q, c_q, want) in enumerate(cases):
+        plan = _plan_from(_starve_view(tmp_path / name, **view), *who)
+        assert specs["clip@firecracker@w"].queued == w_q, name
+        assert specs["clip@cold@c"].queued == c_q, name
+        plain = plan_sizes(list(specs.values()), NodeBudget(ram_mib=10 * 1024, vcpus=999))
+        assert plan == {k: p.concurrent_ceiling for k, p in plain.items()}, name
+        assert plan == want, (name, plan)
 
 
 def test_full_prompt_pool_still_spills_to_cold_against_another_engine(tmp_path, monkeypatch):
@@ -2693,8 +2688,8 @@ def test_spill_plans_agree_and_fit_the_budget_randomized(tmp_path, monkeypatch):
             cap = rng.choice([1, 2, 4, 64])
             asg = rng.randint(0, cap)
             tgt = rng.choice([0, 0, 3])
-            pools.append(("clip", "firecracker", inst, 1024, u + tgt, u, cap, asg,
-                          rng.randint(0, asg), False))
+            pools.append(("clip", "firecracker", inst, rng.choice([512, 1024, 4096]), u + tgt,
+                          u, cap, asg, rng.randint(0, asg), False))
         c_asg = rng.choice([0, 1, 3])
         pools.append(("clip", "cold", "c", rng.choice([1024, 2048]), u, u, 64, c_asg, c_asg,
                       True))
@@ -2735,4 +2730,188 @@ def test_spill_plans_agree_and_fit_the_budget_randomized(tmp_path, monkeypatch):
                 assert used <= budget * 1024, (case, pools, plans[0])
                 checked += 1
         spilled += plans[0]["clip@cold@c"] > 1
-    assert checked >= 90 and spilled >= 20, (checked, spilled)     # the net actually bit
+    assert checked >= 80 and spilled >= 20, (checked, spilled)     # the net actually bit
+
+
+# --- mixed footprints inside a spilling engine --------------------------------------------------
+# The engine's pools can have different slot sizes (one engine on two tiers). Every member's
+# reservation must be seated at its TRUE footprint (as plan_sizes does), and the engine's extra
+# capacity charged per member at its true footprint — never priced as the largest member.
+
+class _FixedGate:
+    """A cold dispatcher's concurrency gate with a fixed number of workers in flight."""
+
+    def __init__(self, n):
+        self.in_flight = n
+
+    def set_limit(self, n):
+        pass
+
+
+def _het_sizer(share, pool, budget_mib, budget_vcpus):
+    """The DispatcherSizer for one pool tuple (engine, tier, inst, ram, backlog, untargeted, cap,
+    reserved, running, ovf[, vcpus]). A cold pool is pool-less with `reserved` workers in flight."""
+    eng, tier, inst, ram, b, u, cap, res, run, ovf, *rest = pool
+    cold = tier == "cold"
+    return DispatcherSizer(
+        EngineNode(eng, "-", slot_ram_mib=ram, slot_vcpus=rest[0] if rest else 1,
+                   max_ceiling=cap),
+        None if cold else _Pool(assigned=run, slot_count=res), share, _OVF_CFG, runtime=tier,
+        backlog_fn=lambda: b, untargeted_backlog_fn=lambda: u, node="n", instance=inst,
+        capacity_fn=_budget(budget_mib, budget_vcpus), clock=lambda: 1.0, overflow_only=ovf,
+        concurrency_gate=_FixedGate(res) if cold else None)
+
+
+def _het_snapshot(pool):
+    eng, tier, inst, ram, b, u, cap, res, run, ovf, *rest = pool
+    return DemandSnapshot(eng, b, res, ram, rest[0] if rest else 1, 0, cap, 1.0, ts=1.0,
+                          node="n", tier=tier, instance=inst, untargeted_backlog=u,
+                          balancing=True, overflow_only=ovf, lease=False,
+                          running=res if tier == "cold" else run)
+
+
+def _het_plan(tmp_path, pools, budget_mib, budget_vcpus=999):
+    """pools: name → (engine, tier, inst, ram, backlog, untargeted, cap, reserved, running, ovf
+    [, vcpus]). Every pool ticks its own planner on the shared view; returns the (identical) plan."""
+    share = FileNodeShare(str(tmp_path))
+    for pool in pools.values():
+        share.publish(_het_snapshot(pool))
+    plans = []
+    for pool in pools.values():
+        _PLAN.clear()
+        assert _het_sizer(share, pool, budget_mib, budget_vcpus).tick() is not None
+        plans.append({k: p.concurrent_ceiling for k, p in _PLAN.items()})
+    assert all(p == plans[0] for p in plans), plans
+    return plans[0]
+
+
+def test_small_member_reservation_is_seated_at_its_true_footprint(tmp_path, monkeypatch):
+    # het.py: 12 GiB. engine a: prompt W (1 GiB, cap 8, 6 RESIDENT and running, 6 untargeted),
+    # overflow C (4 GiB, cap 4, 1 resident); engine b: Y (1 GiB, 4 queued). W's six resident VMs
+    # must keep their slots: W6 C1 Y2 = 12 GiB. Pricing W's reservation at C's 4 GiB unseated it
+    # (W2 C1 Y3 → 13 GiB physically in use on a 12 GiB node).
+    _capture_specs(monkeypatch)
+    plan = _het_plan(tmp_path, {
+        "W": ("a", "firecracker", "w", 1024, 6, 6, 8, 6, 6, False),
+        "C": ("a", "gvisor", "c", 4096, 6, 6, 4, 1, 1, True),
+        "Y": ("b", "firecracker", "y", 1024, 4, 4, 64, 0, 0, False)}, 12 * 1024)
+    assert plan == {"a@firecracker@w": 6, "a@gvisor@c": 1, "b@firecracker@y": 2}
+
+
+def test_mixed_footprints_do_not_strand_budget(tmp_path, monkeypatch):
+    # vcap.py: 32 GiB. W (1 GiB, cap 8, 8 untargeted) + overflow C (4 GiB, cap 1); Y (1 GiB, cap 8,
+    # 8 queued). Everything fits: W8 C1 Y8 — W must not stop at 5 with 15 GiB idle.
+    _capture_specs(monkeypatch)
+    plan = _het_plan(tmp_path, {
+        "W": ("a", "firecracker", "w", 1024, 8, 8, 8, 0, 0, False),
+        "C": ("a", "gvisor", "c", 4096, 8, 8, 1, 0, 0, True),
+        "Y": ("b", "firecracker", "y", 1024, 8, 8, 8, 0, 0, False)}, 32 * 1024)
+    assert plan == {"a@firecracker@w": 8, "a@gvisor@c": 1, "b@firecracker@y": 8}
+
+
+
+
+# --- codex regressions on the (removed) virtual spill pool ---------------------------------------
+
+def test_targeted_only_load_is_plain_plan_sizes(tmp_path, monkeypatch):
+    # prompt warm + overflow cold each with 20 jobs TARGETED at their own tier, 0 untargeted, equal
+    # 1 GiB, 10 GiB: nothing spills, so the plan is exactly the plain one (5/5), identical to what
+    # the same view plans on the legacy (pre-field) path.
+    _capture_specs(monkeypatch)
+    pools = {"W": ("clip", "firecracker", "w", 1024, 20, 0, 64, 0, 0, False),
+             "C": ("clip", "gvisor", "c", 1024, 20, 0, 64, 0, 0, True)}
+    plan = _het_plan(tmp_path / "cur", pools, 10 * 1024)
+    assert plan == {"clip@firecracker@w": 5, "clip@gvisor@c": 5}
+    assert plan == _legacy_plan(tmp_path / "old", pools, 10 * 1024)
+
+
+def test_member_floors_are_not_double_counted(tmp_path, monkeypatch):
+    # two clip pools (prompt + overflow) with min_warm 1 each and queued work, red min_warm 2, all
+    # 1 GiB, 4 GiB: every floor is feasible (1 + 1 + 2) and is seated; unseatable_floors agrees.
+    from blastbox.host.node_sizer import NodeBudget, unseatable_floors
+    specs = _capture_specs(monkeypatch)
+    share = FileNodeShare(str(tmp_path))
+    for eng, tier, inst, mw, ovf in (("clip", "firecracker", "w", 1, False),
+                                     ("clip", "gvisor", "c", 1, True),
+                                     ("red", "firecracker", "y", 2, False)):
+        share.publish(DemandSnapshot(eng, 5, 0, 1024, 1, mw, 64, 1.0, ts=1.0, node="n",
+                                     tier=tier, instance=inst, untargeted_backlog=5,
+                                     balancing=True, overflow_only=ovf, lease=False, running=0))
+    DispatcherSizer(EngineNode("red", "-", slot_ram_mib=1024, max_ceiling=64, min_warm=2),
+                    _Pool(), share, _OVF_CFG, runtime="firecracker", backlog_fn=lambda: 5,
+                    untargeted_backlog_fn=lambda: 5, node="n", instance="y",
+                    capacity_fn=_budget(4 * 1024, 999), clock=lambda: 1.0).tick()
+    assert {k: p.concurrent_ceiling for k, p in _PLAN.items()} == {
+        "clip@firecracker@w": 1, "clip@gvisor@c": 1, "red@firecracker@y": 2}
+    assert unseatable_floors(list(specs.values()), NodeBudget(4 * 1024, 999)) == {}
+
+
+def test_smaller_prompt_footprint_is_not_stranded(tmp_path, monkeypatch):
+    # prompt 2 GiB/slot, overflow 4 GiB/slot, 8 GiB node: a second prompt slot fits and is used
+    # (no 2 GiB left idle).
+    _capture_specs(monkeypatch)
+    plan = _het_plan(tmp_path, {
+        "W": ("clip", "firecracker", "w", 2048, 10, 10, 4, 0, 0, False),
+        "C": ("clip", "gvisor", "c", 4096, 10, 10, 4, 0, 0, True)}, 8 * 1024)
+    assert plan == {"clip@firecracker@w": 2, "clip@gvisor@c": 1}
+
+
+def _legacy_plan(tmp_path, pools, budget_mib, budget_vcpus=999):
+    """What the pre-field (a929bc9-equivalent) path plans for the same pools: every OTHER pool's
+    snapshot lacks the new fields, so the node is legacy for the planner."""
+    import json
+    from dataclasses import asdict
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    share = FileNodeShare(str(tmp_path))
+    for pool in pools.values():
+        raw = asdict(_het_snapshot(pool))
+        for k in ("overflow_only", "lease", "running"):
+            raw.pop(k, None)
+        (tmp_path / FileNodeShare._filename(pool[0], pool[1], "n", pool[2])).write_text(
+            json.dumps(raw))
+    _PLAN.clear()
+    assert _het_sizer(share, next(iter(pools.values())), budget_mib,
+                      budget_vcpus).tick() is not None
+    return {k: p.concurrent_ceiling for k, p in _PLAN.items()}
+
+
+def test_heterogeneous_footprint_property_fuzz(tmp_path, monkeypatch):
+    # Random heterogeneous nodes (1–3 engines, prompt/overflow pools on fc/gvisor/cold, 512 MiB–4 GiB
+    # and 0.5–4 vCPU slots, caps, resident reservations, running jobs, targeted work):
+    # (a) whenever the legacy (a929bc9-equivalent) plan seats every reservation, the current does;
+    # (b) Σ ceiling·footprint ≤ budget per dimension whenever the reservations fit;
+    # (c) every pool's planner computes the identical plan.
+    import random
+    rng = random.Random(0x193)
+    _capture_specs(monkeypatch)
+    seated = fitted = 0
+    for case in range(300):
+        pools = {}
+        for e in range(rng.randint(1, 3)):
+            n_p, n_o = rng.randint(1, 2), rng.choice([0, 1, 1, 2])
+            u = rng.choice([0, 4, 20])
+            for i in range(n_p + n_o):
+                ovf = i >= n_p
+                cap = rng.choice([1, 2, 4, 8, 64])
+                res = rng.randint(0, min(cap, 5))
+                tier = ("firecracker", "gvisor", "cold")[i % 3]
+                pools[f"{e}{i}"] = (f"e{e}", tier, f"i{i}", rng.choice([512, 1024, 2048, 4096]),
+                                    u + rng.choice([0, 0, 3]), u, cap, res,
+                                    res if tier == "cold" else rng.randint(0, res), ovf,
+                                    rng.choice([0.5, 1, 2, 4]))
+        budget = rng.choice([4, 8, 12, 24, 64]) * 1024
+        vcpus = rng.choice([4, 8, 16, 999])
+        cur = _het_plan(tmp_path / f"c{case}", pools, budget, vcpus)     # asserts (c)
+        leg = _legacy_plan(tmp_path / f"l{case}", pools, budget, vcpus)
+        name = {k: f"{p[0]}@{p[1]}@{p[2]}" for k, p in pools.items()}
+        if all(leg[name[k]] >= min(p[7], p[6]) for k, p in pools.items()):
+            seated += 1
+            for k, p in pools.items():
+                assert cur[name[k]] >= min(p[7], p[6]), (case, pools, cur, leg)
+        floors = {k: max(1, min(p[7], p[6])) for k, p in pools.items()}
+        if (sum(floors[k] * p[3] for k, p in pools.items()) <= budget
+                and sum(floors[k] * p[10] for k, p in pools.items()) <= vcpus):
+            fitted += 1
+            assert sum(cur[name[k]] * p[3] for k, p in pools.items()) <= budget, (case, pools, cur)
+            assert sum(cur[name[k]] * p[10] for k, p in pools.items()) <= vcpus, (case, pools, cur)
+    assert seated >= 80 and fitted >= 70, (seated, fitted)       # the net actually bit
