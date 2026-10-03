@@ -1067,6 +1067,20 @@ def build_app(
         # on-disk tree, which no dispatcher ever sanitised -- an attestation.json there is whatever
         # the worker wrote -- so a store offering a no-fallback read is always read through it.
         opener = getattr(_blob_store, "open_result_only", None) or _blob_store.open_output
+        # A result accepted before the trust gate reserved the name can DECLARE an artifact at
+        # (or under) attestation.json, recovered as-is by the retention sweeps. Those bytes are
+        # analysis output: never serve them as a receipt (nor read them as a tombstone).
+        try:
+            with opener(job_id, "metadata.json") as mfh:
+                envelope = mfh.read()
+        except Exception as exc:
+            if not _is_missing_blob(exc):
+                _log.warning("attestation: envelope read failed for job=%s: %s", job_id, exc)
+                raise HTTPException(503, "could not read the execution receipt")
+            envelope = None
+        if envelope is not None and _attest.envelope_declares_receipt_path(envelope):
+            raise HTTPException(404, "no execution receipt for this job: "
+                                     f"{_attest.RECEIPT_PATH_DECLARED_REASON}")
         try:
             fh = opener(job_id, _attest.RECEIPT_NAME)
         except Exception as exc:

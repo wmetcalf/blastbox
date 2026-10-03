@@ -390,11 +390,40 @@ def _envelope_artifact_paths(seal: Path) -> list[str] | None:
         os.close(fd)
     if data is None:
         return None
+    return _artifact_paths_of(data)
+
+
+def _artifact_paths_of(data: bytes) -> list[str] | None:
+    """The artifact paths an envelope's bytes declare, or None when they cannot be parsed."""
     try:
         env = json.loads(data)
         return [str(a.get("path", "")) for a in env.get("artifacts") or []]
     except Exception:  # noqa: BLE001 - unparseable: cannot rule anything out
         return None
+
+
+#: Why a result whose envelope declares an artifact at the receipt name has no receipt.
+RECEIPT_PATH_DECLARED_REASON = ("receipt path is occupied by a declared artifact of a result "
+                                "accepted before the name was reserved")
+
+
+def envelope_declares_receipt_path(data: bytes) -> bool:
+    """Whether envelope bytes DEFINITELY declare an artifact at or under the receipt name. Then
+    whatever sits at attestation.json is accepted analysis output, never a receipt or tombstone.
+    Unparseable bytes are False: "cannot rule it out" is not a declaration."""
+    paths = _artifact_paths_of(data)
+    return paths is not None and any(is_reserved_path(p) for p in paths)
+
+
+def tree_declares_receipt_path(out_dir: Path) -> bool:
+    """:func:`envelope_declares_receipt_path` for ``<out_dir>/metadata.json``. Only possible in a
+    tree accepted before the trust gate reserved the name. False when the envelope is absent or
+    cannot be read -- the caller's ordinary (fail-closed) receipt handling then applies."""
+    try:
+        paths = _envelope_artifact_paths(Path(out_dir) / _SEAL_NAME)
+    except OSError:
+        return False
+    return paths is not None and any(is_reserved_path(p) for p in paths)
 
 
 def _may_hold_declared_artifacts(out_dir: Path) -> bool:

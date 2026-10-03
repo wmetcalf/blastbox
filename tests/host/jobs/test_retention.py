@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import json
 import os
 import pathlib
 import shutil
@@ -1717,10 +1718,91 @@ def test_a_transient_receipt_read_error_leaves_the_tree_retained_and_intact(tmp_
     assert (out / "attestation.json").read_bytes() == genuine
 
 
-def test_a_retained_tree_with_an_artifact_under_the_receipt_name_is_left_intact(tmp_path):
-    """A tree retained by pre-fix code could hold an ACCEPTED artifact under attestation.json/.
-    The sweep used to tombstone it by rmtree-ing that directory and then upload the tree minus the
-    artifact. It must leave the tree retained and intact instead."""
+_DECLARED_AT_RECEIPT_NAME = {
+    # A top-level FILE at exactly attestation.json, and an artifact INSIDE attestation.json/.
+    "file": ("attestation.json", b"ACCEPTED ARTIFACT BYTES"),
+    "dir": ("attestation.json/page.png", b"accepted artifact"),
+}
+
+
+def _tree_with_declared_receipt_name(job_root: Path, kind: str, *, pending: bool = True):
+    """A tree accepted by pre-#188 code whose envelope declares an artifact at the (later
+    reserved) receipt name, with the envelope's sha256 for that artifact."""
+    import hashlib
+
+    rel, data = _DECLARED_AT_RECEIPT_NAME[kind]
+    out = _sealed_tree(job_root, _JID, pending=pending) / "output"
+    (out / rel).parent.mkdir(parents=True, exist_ok=True)
+    (out / rel).write_bytes(data)
+    (out / "metadata.json").write_text(json.dumps({"artifacts": [
+        {"id": "a", "path": rel, "sha256": hashlib.sha256(data).hexdigest()}]}))
+    return out, rel, data
+
+
+@pytest.mark.parametrize("kind", ["file", "dir"])
+def test_a_retained_tree_with_a_declared_artifact_at_the_receipt_name_is_recovered_intact(
+        tmp_path, kind):
+    """A tree retained by pre-#188 code can hold an ACCEPTED artifact at attestation.json (a
+    file) or under attestation.json/ (a directory). Tombstoning over it destroyed the artifact;
+    refusing (ReceiptPathOccupied) stranded the job FAILED every tick until the reaper reclaimed
+    the whole tree -- total result loss. The sweep must upload the tree AS-IS (no receipt, no
+    tombstone, nothing deleted) and repair the job to DONE like any other recovery."""
+    import hashlib
+
+    from blastbox.host import attest
+    from blastbox.host.blobs.local import LocalBlobStore
+
+    job_root = tmp_path / "jobs"
+    store = InMemoryJobStore()
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.job_id = _JID
+    job.status = JobStatus.FAILED
+    job.error = f"result upload failed after 3 attempts; {RESULT_RETAINED_MARKER}"
+    store.create(job)
+    out, rel, data = _tree_with_declared_receipt_name(job_root, kind)
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
+
+    assert retry_pending_uploads(job_root, blobs, store, logging.getLogger("t"),
+                                 attest_key=key) == 1
+    assert (out / rel).read_bytes() == data, "the accepted artifact was touched on disk"
+    with blobs.open_result_only(_JID, rel) as fh:
+        stored = fh.read()
+    want = json.loads((out / "metadata.json").read_text())["artifacts"][0]["sha256"]
+    assert hashlib.sha256(stored).hexdigest() == want
+    assert store.get(_JID).status is JobStatus.DONE
+
+    # Durable and DONE: the reaper may reclaim the local tree, but never as an unreachable
+    # last copy -- the result stays servable from the store.
+    reap_stale_scratch(job_root, 0.0, store, logging.getLogger("t"), blob_store=blobs)
+    with blobs.open_result_only(_JID, rel) as fh:
+        assert fh.read() == data
+
+
+@pytest.mark.parametrize("kind", ["file", "dir"])
+def test_legacy_migration_uploads_a_declared_artifact_at_the_receipt_name_as_is(tmp_path, kind):
+    """The legacy migration strips a worker-written attestation.json -- but one the envelope
+    DECLARES is an accepted artifact. Counting it failed forever leaves it un-migrated; it must
+    be uploaded as-is, artifact intact."""
+    from blastbox.host.blobs.local import LocalBlobStore
+
+    job_root = tmp_path / "jobs"
+    store = InMemoryJobStore()
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.job_id = _JID
+    job.status = JobStatus.DONE
+    store.create(job)
+    out, rel, data = _tree_with_declared_receipt_name(job_root, kind, pending=False)
+    blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
+    assert migrate_legacy_results(job_root, blobs, store, logging.getLogger("t")) == (1, 0, 0)
+    assert (out / rel).read_bytes() == data
+    with blobs.open_result_only(_JID, rel) as fh:
+        assert fh.read() == data
+
+
+def test_a_retained_tree_whose_envelope_cannot_rule_out_an_artifact_stays_retained(tmp_path):
+    """Only a DEFINITE declaration licenses uploading as-is. An envelope that cannot be parsed
+    cannot rule an artifact in or out: nothing is deleted, nothing is uploaded, retry later."""
     from blastbox.host import attest
 
     store = InMemoryJobStore()
@@ -1730,8 +1812,7 @@ def test_a_retained_tree_with_an_artifact_under_the_receipt_name_is_left_intact(
     job.error = f"result upload failed after 3 attempts; {RESULT_RETAINED_MARKER}"
     store.create(job)
     out = _sealed_tree(tmp_path, _JID) / "output"
-    (out / "metadata.json").write_text(
-        '{"artifacts": [{"id": "p", "path": "attestation.json/page.png"}]}')
+    (out / "metadata.json").write_text("not json")
     (out / "attestation.json").mkdir()
     (out / "attestation.json" / "page.png").write_bytes(b"accepted artifact")
     key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
@@ -1739,4 +1820,4 @@ def test_a_retained_tree_with_an_artifact_under_the_receipt_name_is_left_intact(
     assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t"),
                                  attest_key=key) == 0
     assert (out / "attestation.json" / "page.png").read_bytes() == b"accepted artifact"
-    assert blobs.put_calls == 0, "uploaded a tree whose receipt could not be sanitised"
+    assert blobs.put_calls == 0

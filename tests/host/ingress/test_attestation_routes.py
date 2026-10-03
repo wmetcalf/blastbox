@@ -258,6 +258,32 @@ def test_a_tombstone_is_404_never_served(tmp_path):
     assert "no attestation key" in r.json()["detail"]
 
 
+@pytest.mark.parametrize("rel,data", [
+    ("attestation.json", b'{"attestation": {"looks": "signed"}, "signature": "x"}'),
+    ("attestation.json/page.png", b"accepted artifact"),
+])
+def test_a_declared_artifact_at_the_receipt_name_is_never_served_as_a_receipt(tmp_path, rel,
+                                                                             data):
+    """A result accepted before the name was reserved (and recovered as-is by the sweep) can hold
+    a DECLARED artifact at attestation.json. Its bytes are the analysis output, not a receipt:
+    the route answers "no receipt", in the tombstone's 404 shape, with the reason."""
+    client, store = _make_client(tmp_path)
+    job = Job.new(engine="clippyshot", filename="a.docx")
+    job.status = JobStatus.DONE
+    store.create(job)
+    out = tmp_path / "work" / job.job_id / "output"
+    (out / rel).parent.mkdir(parents=True, exist_ok=True)
+    (out / rel).write_bytes(data)
+    (out / "metadata.json").write_text(json.dumps({"artifacts": [
+        {"id": "a", "path": rel, "sha256": hashlib.sha256(data).hexdigest()}]}))
+    _push_to_blob(tmp_path, job.job_id, out)
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    detail = r.json()["detail"]
+    assert detail.startswith("no execution receipt for this job: ")
+    assert "occupied by a declared artifact" in detail
+
+
 def test_legacy_tree_is_never_read_even_when_the_result_is_durable(tmp_path, key):
     """has_output() True (the durable result exists) but the durable copy has NO receipt, while
     the legacy on-disk tree has a planted one. open_output would fall back to it; the route must
