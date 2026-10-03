@@ -445,7 +445,8 @@ def read_snapshots_readonly(
     most ``max_bytes``.
 
     Returns ``None`` — NOT a partial list — when there are more candidates than ``max_files`` or a
-    candidate cannot be opened (other than vanishing or turning into a symlink), read, or
+    listed entry cannot be lstat'd or a candidate cannot be opened (other than vanishing or
+    turning into a symlink), read, or
     parsed/validated: a shrunken view would undercount the node's reservations
     and disagree with the dispatchers, and a wrong number is worse than a gap. Well-formed but
     STALE snapshots are skipped, as the dispatchers skip them. A missing dir → ``[]``; a permission error on the dir
@@ -465,8 +466,12 @@ def read_snapshots_readonly(
                 continue
             try:
                 st = entry.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue                # removed since the listing: it holds no reservation
             except OSError:
-                continue
+                # EACCES, EIO, ...: a snapshot the view cannot see. Skipping it would publish
+                # totals from the rest -- an undercount. Fail closed, as open/read errors do.
+                return None
             if not _stat.S_ISREG(st.st_mode) or st.st_size > size_cap:
                 continue
             candidates.append(entry.name)

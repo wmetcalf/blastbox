@@ -917,3 +917,52 @@ def test_readonly_reader_a_snapshot_removed_after_listing_is_skipped(tmp_path, m
     monkeypatch.setattr(os, "open", vanishing_open)
     got = read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time())
     assert got is not None and [s.engine for s in got] == ["aa"]
+
+
+class _StatFailingScandir:
+    """os.scandir whose DirEntry.stat raises ``err`` for the entry named ``victim``."""
+
+    def __init__(self, real, victim: str, err: int):
+        self._real, self._victim, self._err = real, victim, err
+
+    def __call__(self, path):
+        real_it, victim, err = self._real(path), self._victim, self._err
+
+        class _Entry:
+            def __init__(self, e):
+                self._e, self.name = e, e.name
+
+            def stat(self, follow_symlinks=True):
+                if self.name == victim:
+                    raise OSError(err, os.strerror(err))
+                return self._e.stat(follow_symlinks=follow_symlinks)
+
+        class _It:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                real_it.close()
+
+            def __iter__(self):
+                return (_Entry(e) for e in real_it)
+
+        return _It()
+
+
+@pytest.mark.parametrize("err", [errno.EACCES, errno.EIO])
+def test_readonly_reader_listing_stat_error_is_omitted_not_partial(tmp_path, monkeypatch, err):
+    """The listing's lstat failing for any reason other than ENOENT is a snapshot the view cannot
+    see -- skipping it publishes totals from the rest. Fail closed, as open/read errors do."""
+    d, victim = _two_snapshots(tmp_path)
+    monkeypatch.setattr(os, "scandir", _StatFailingScandir(os.scandir, victim.name, err))
+    assert read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time()) is None
+
+
+def test_readonly_reader_listing_stat_enoent_is_skipped(tmp_path, monkeypatch):
+    """Removed between the listing and its lstat: it holds no reservation, so skip it."""
+    d, victim = _two_snapshots(tmp_path)
+    monkeypatch.setattr(os, "scandir", _StatFailingScandir(os.scandir, victim.name,
+                                                           errno.ENOENT))
+    got = read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time())
+    assert got is not None and [s.engine for s in got] == ["aa"]
