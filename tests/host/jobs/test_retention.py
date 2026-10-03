@@ -1928,3 +1928,34 @@ def test_legacy_migration_strips_a_planted_receipt_beside_a_symlinked_seal(tmp_p
     assert not (out / "attestation.json").exists(), "the planted receipt was kept"
     with pytest.raises(BlobFetchError):
         blobs.open_result_only(_JID, "attestation.json")
+
+
+def test_legacy_migration_leaves_a_tree_in_place_on_a_transient_envelope_error(
+        tmp_path, monkeypatch):
+    """EIO reading a legacy tree's metadata.json is no verdict on its envelope: neither strip the
+    attestation.json there (it may be a declared artifact) nor upload the tree as-is (it may be a
+    planted receipt). Count it failed and leave it for the next run."""
+    import errno as _errno
+
+    from blastbox.host import attest
+
+    store = InMemoryJobStore()
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.job_id = _JID
+    job.status = JobStatus.DONE
+    store.create(job)
+    out = _sealed_tree(tmp_path, _JID, pending=False) / "output"
+    (out / "attestation.json").write_bytes(_FORGED)
+    seal = str(out / "metadata.json")
+    real_open = attest.os.open
+
+    def flaky_open(p, *a, **kw):
+        if str(p) == seal:
+            raise OSError(_errno.EIO, "Input/output error", str(p))
+        return real_open(p, *a, **kw)
+
+    monkeypatch.setattr(attest.os, "open", flaky_open)
+    blobs = _FakeBlobs()
+    assert migrate_legacy_results(tmp_path, blobs, store, logging.getLogger("t")) == (0, 0, 1)
+    assert blobs.put_calls == 0, "uploaded on a transient envelope error"
+    assert (out / "attestation.json").read_bytes() == _FORGED

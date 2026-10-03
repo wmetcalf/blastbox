@@ -650,3 +650,46 @@ def test_strip_receipt_refuses_exactly_when_the_tree_protects_the_receipt_path(t
     assert isinstance(exc, attest.ReceiptPathOccupied) is protected, exc
     assert (out / attest.RECEIPT_NAME).exists() is protected
     assert protected is (kind in ("declares", "garbage"))
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed branches of the receipt-path test, pinned (round-2 review F3)
+# ---------------------------------------------------------------------------
+
+
+def test_a_transient_envelope_error_never_licenses_stripping(tmp_path, monkeypatch):
+    """EIO opening metadata.json is no verdict. tree_receipt_path_protection propagates it (the
+    sweeps retry), and the deletion guard reads it as "cannot rule out": strip_receipt refuses
+    and the file at attestation.json -- possibly a declared artifact -- survives."""
+    import errno as _errno
+
+    out = _tree(tmp_path, json.dumps({"artifacts": [{"id": "a", "path": "page.png"}]}).encode())
+    (out / attest.RECEIPT_NAME).write_bytes(b"maybe an artifact")
+    seal = str(out / "metadata.json")
+    real_open = attest.os.open
+
+    def flaky_open(p, *a, **kw):
+        if str(p) == seal:
+            raise OSError(_errno.EIO, "Input/output error", str(p))
+        return real_open(p, *a, **kw)
+
+    monkeypatch.setattr(attest.os, "open", flaky_open)
+    exc = _attempt(lambda: attest.tree_receipt_path_protection(out))
+    assert isinstance(exc, OSError) and exc.errno == _errno.EIO
+    exc = _attempt(lambda: attest.strip_receipt(out))
+    assert isinstance(exc, attest.ReceiptPathOccupied)
+    assert (out / attest.RECEIPT_NAME).read_bytes() == b"maybe an artifact"
+
+
+def test_an_oversized_envelope_cannot_rule_out_the_receipt_path(tmp_path, monkeypatch):
+    """A shipped envelope past ENVELOPE_MAX_BYTES is not parsed, so it cannot rule out a declared
+    artifact at attestation.json -- even when the bytes, read whole, would declare nothing."""
+    env = json.dumps({"artifacts": [{"id": "a", "path": "page.png"}]}).encode()
+    out = _tree(tmp_path, env)
+    (out / attest.RECEIPT_NAME).write_bytes(b"maybe an artifact")
+    assert attest.tree_receipt_path_protection(out) is None         # within the cap: clean
+    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", len(env) - 1)
+    assert (attest.tree_receipt_path_protection(out)
+            == attest.RECEIPT_PATH_UNDECIDABLE_REASON)
+    assert isinstance(_attempt(lambda: attest.strip_receipt(out)), attest.ReceiptPathOccupied)
+    assert (out / attest.RECEIPT_NAME).read_bytes() == b"maybe an artifact"

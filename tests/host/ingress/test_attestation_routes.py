@@ -440,3 +440,60 @@ def test_a_partial_legacy_upload_never_serves_a_declared_artifact_as_the_receipt
     r = client.get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 404, r.text
     assert r.json()["detail"].startswith("no execution receipt for this job: ")
+
+
+# ---------------------------------------------------------------------------
+# Envelope-read branches of the route, pinned (round-2 review F3)
+# ---------------------------------------------------------------------------
+
+
+class _FlakyEnvelopeBlobs(LocalBlobStore):
+    """Serves everything except metadata.json, which fails like an object-store outage."""
+
+    def __init__(self, *a, mode: str, **kw):
+        super().__init__(*a, **kw)
+        self._mode = mode
+
+    def open_result_only(self, job_id, name):
+        if name != "metadata.json":
+            return super().open_result_only(job_id, name)
+        if self._mode == "open":
+            raise BlobFetchError("result fetch failed") from ConnectionError("s3 down")
+        fh = super().open_result_only(job_id, name)
+
+        class _Broken(io.RawIOBase):
+            def readable(self):
+                return True
+
+            def readinto(self, b):
+                fh.close()
+                raise OSError("connection reset")
+        return _Broken()
+
+
+@pytest.mark.parametrize("mode", ["open", "read"])
+def test_an_envelope_read_error_is_503_not_a_verdict(tmp_path, key, mode):
+    """A transient error reading the envelope is neither "absent" nor "nothing declared": the
+    route answers 503 (retry), never a 404 that says no receipt exists, never the receipt."""
+    store = InMemoryJobStore()
+    job, _, _ = _done_with_receipt(tmp_path, store, key)
+    app = build_app(job_store=store, job_root=tmp_path / "jobs", allowed_engines={"clippyshot"},
+                    limits=Limits(), api_workers=2, zip_password="",
+                    blob_store=_FlakyEnvelopeBlobs(tmp_path / "jobs",
+                                                   blob_root=tmp_path / "blobs", mode=mode))
+    client = TestClient(app, raise_server_exceptions=False)
+    assert client.get(f"/v1/jobs/{job.job_id}/attestation").status_code == 503
+
+
+def test_an_envelope_over_the_cap_serves_no_receipt(tmp_path, key, monkeypatch):
+    """The route reads at most ENVELOPE_MAX_BYTES + 1 bytes; an envelope past the cap cannot be
+    parsed whole, so it cannot rule out a declared artifact at attestation.json: 404, even when
+    the bytes read happen to parse."""
+    client, store = _make_client(tmp_path)
+    job, out, _ = _done_with_receipt(tmp_path, store, key)
+    assert client.get(f"/v1/jobs/{job.job_id}/attestation").status_code == 200   # control
+    size = len((out / "metadata.json").read_bytes())
+    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", size - 1)   # read cap+1 = the whole file
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert attest.RECEIPT_PATH_UNDECIDABLE_REASON in r.json()["detail"]
