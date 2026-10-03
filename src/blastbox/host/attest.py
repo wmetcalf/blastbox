@@ -469,7 +469,7 @@ def _may_hold_declared_artifacts(out_dir: Path) -> bool:
         return True
 
 
-def strip_receipt(out_dir: Path) -> None:
+def strip_receipt(out_dir: Path, *, gate_verified: bool = False) -> None:
     """Remove whatever sits at ``<out_dir>/attestation.json`` (file, directory or symlink)
     without following a symlink. A worker can write into its output tree.
 
@@ -477,14 +477,19 @@ def strip_receipt(out_dir: Path) -> None:
     UNDER that name -- a top-level file named attestation.json or a directory of artifacts
     (possible only in a tree accepted before the trust gate reserved the whole name), or when the
     envelope cannot be read to rule that out: never destroy accepted output to make room for a
-    receipt. Anything undeclared there (worker-planted junk, a stale receipt) is replaced."""
+    receipt. Anything undeclared there (worker-planted junk, a stale receipt) is replaced.
+
+    ``gate_verified``: the caller is the dispatcher sealing a tree the trust gate JUST validated,
+    and the gate refuses any artifact at or under the reserved name -- so nothing there can be
+    accepted output and the envelope is not re-read. That makes the strip unconditional: a
+    transient envelope read error can never leave a worker-planted receipt in a tree that ships."""
     out_dir = Path(out_dir)
     target = out_dir / RECEIPT_NAME
     try:
         st = os.lstat(target)
     except FileNotFoundError:
         return
-    if _may_hold_declared_artifacts(out_dir):
+    if not gate_verified and _may_hold_declared_artifacts(out_dir):
         raise ReceiptPathOccupied(
             errno.EEXIST, f"{RECEIPT_NAME} holds a declared artifact (or the envelope cannot "
                           f"rule that out); refusing to replace it")
@@ -494,7 +499,7 @@ def strip_receipt(out_dir: Path) -> None:
         os.unlink(target)
 
 
-def _write_atomic(out_dir: Path, data: bytes) -> None:
+def _write_atomic(out_dir: Path, data: bytes, *, gate_verified: bool = False) -> None:
     tmp = out_dir / f".{RECEIPT_NAME}.{uuid.uuid4().hex}.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
     try:
@@ -502,7 +507,7 @@ def _write_atomic(out_dir: Path, data: bytes) -> None:
             fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
-        strip_receipt(out_dir)          # os.replace cannot replace a directory
+        strip_receipt(out_dir, gate_verified=gate_verified)   # os.replace cannot replace a dir
         os.replace(tmp, out_dir / RECEIPT_NAME)
     finally:
         tmp.unlink(missing_ok=True)
@@ -512,10 +517,11 @@ def tombstone_body(reason: str) -> dict:
     return {"attestation": None, "reason": reason}
 
 
-def write_tombstone(out_dir: Path, reason: str) -> None:
+def write_tombstone(out_dir: Path, reason: str, *, gate_verified: bool = False) -> None:
     """Write the "no receipt for this run" marker. Uploaded like a receipt, so it OVERWRITES a
-    superseded attempt's receipt in the store (which never deletes a single object)."""
-    _write_atomic(Path(out_dir), canonical(tombstone_body(reason)))
+    superseded attempt's receipt in the store (which never deletes a single object).
+    ``gate_verified`` as for :func:`strip_receipt`."""
+    _write_atomic(Path(out_dir), canonical(tombstone_body(reason)), gate_verified=gate_verified)
 
 
 def is_tombstone(data: bytes) -> bool:
@@ -527,29 +533,33 @@ def is_tombstone(data: bytes) -> bool:
 
 
 def seal_receipt(out_dir: Path, *, key: AttestKey | None,
-                 observation: RunObservation | None, reason: str | None = None) -> dict | None:
+                 observation: RunObservation | None, reason: str | None = None,
+                 gate_verified: bool = False) -> dict | None:
     """Replace whatever sits at ``attestation.json`` with this dispatcher's signed receipt, or,
     when it does not sign, a tombstone saying why. Returns the SIGNED body, or None when a
     tombstone was written. Call it IMMEDIATELY before uploading ``out_dir``: the metadata hash is
     of the bytes on disk at this moment, which are the bytes put_output ships.
 
     Raises ReceiptPathOccupied, writing nothing, when attestation.json is a directory holding
-    declared artifacts: no receipt rather than a wrong one, and never at the artifacts' expense."""
+    declared artifacts: no receipt rather than a wrong one, and never at the artifacts' expense.
+    ``gate_verified`` (the fresh-dispatch seal, see :func:`strip_receipt`): the gate already
+    ruled that out, so the envelope is not re-read for it and the strip is unconditional."""
     out_dir = Path(out_dir)
     if key is None:
-        write_tombstone(out_dir, "no attestation key")
+        write_tombstone(out_dir, "no attestation key", gate_verified=gate_verified)
         return None
     if observation is None:
-        write_tombstone(out_dir, reason or "run not observed")
+        write_tombstone(out_dir, reason or "run not observed", gate_verified=gate_verified)
         return None
     try:
         metadata_sha256 = sha256_file(out_dir / _SEAL_NAME)
     except (OSError, ValueError) as exc:
         _log.error("attestation: job %s has no regular metadata.json to vouch for (%s); "
                    "no receipt", observation.job_id, exc)
-        write_tombstone(out_dir, "metadata.json is not a regular file")
+        write_tombstone(out_dir, "metadata.json is not a regular file",
+                        gate_verified=gate_verified)
         return None
-    if _may_hold_declared_artifacts(out_dir):
+    if not gate_verified and _may_hold_declared_artifacts(out_dir):
         # The trust gate refuses this; never let a declared artifact stand in for a receipt.
         _log.error("attestation: job %s declares %s as an artifact; no receipt",
                    observation.job_id, RECEIPT_NAME)
@@ -557,8 +567,41 @@ def seal_receipt(out_dir: Path, *, key: AttestKey | None,
         return None
     doc = build_receipt(observation, key_id=key.key_id, metadata_sha256=metadata_sha256)
     body = {"attestation": doc, "signature": key.sign(doc)}
-    _write_atomic(out_dir, canonical(body))
+    _write_atomic(out_dir, canonical(body), gate_verified=gate_verified)
     return body
+
+
+def seal_fresh_receipt(out_dir: Path, *, key: AttestKey | None,
+                       observation: RunObservation | None, job_id: str,
+                       reason: str | None = None) -> bool:
+    """The dispatchers' seal of a tree the trust gate has JUST validated, immediately before it
+    ships. Writes our receipt or, failing that, a "signing failed" tombstone -- both with
+    ``gate_verified`` so neither depends on re-reading the envelope. Never raises.
+
+    Returns whether the tree is SAFE TO UPLOAD: True once a receipt or tombstone is at
+    attestation.json. False when neither could be written (ENOSPC, EIO on the write...): a
+    worker-planted receipt may still be sitting there, and without a tombstone a superseded
+    attempt's receipt in the store would not be overwritten either. The caller must then NOT
+    upload and takes its ordinary upload-failure path -- FAILED, tree retained for the
+    pending-upload sweep, which sanitises attestation.json before it uploads. Failing closed
+    this way reuses the one path an object-store outage already takes, rather than inventing a
+    third outcome (e.g. shipping with nothing at the name)."""
+    try:
+        seal_receipt(out_dir, key=key, observation=observation, reason=reason,
+                     gate_verified=True)
+        return True
+    except Exception as exc:  # noqa: BLE001 - a receipt problem must never fail a job by itself
+        _log.error("attestation: could not write the receipt for job %s (%s); the job "
+                   "completes without one", job_id, exc)
+    try:
+        # Never ship a planted or half-written one, and overwrite a superseded attempt's.
+        write_tombstone(out_dir, "signing failed", gate_verified=True)
+        return True
+    except Exception:  # noqa: BLE001
+        _log.exception("attestation: could not write a tombstone for job %s either; NOT "
+                       "uploading a tree that may still hold a worker-planted %s",
+                       job_id, RECEIPT_NAME)
+    return False
 
 
 def verify_body(key: AttestKey, body: object) -> bool:

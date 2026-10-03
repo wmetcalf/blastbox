@@ -2318,8 +2318,8 @@ class Dispatcher:
                 return
             # The receipt goes INTO the sealed tree immediately before it ships: its metadata
             # hash is then of exactly the bytes put_output uploads, into the same prefix.
-            self._seal_receipt(job, output_dir, observation)
-            if not self._upload_output(job, output_dir):
+            sealed = self._seal_receipt(job, output_dir, observation)
+            if not self._upload_output(job, output_dir, sealed=sealed):
                 # The worker RAN and its output passed the trust gate; the upload is OUR side
                 # failing. Attribute the demonstrated success so the streaks reset -- the default
                 # would convict the worker for this dispatcher's storage problem, and an upload
@@ -2952,8 +2952,8 @@ class Dispatcher:
             )
             return
         # The receipt goes INTO the sealed tree immediately before it ships (see the warm twin).
-        self._seal_receipt(job, output_dir, observation)
-        if not self._upload_output(job, output_dir):
+        sealed = self._seal_receipt(job, output_dir, observation)
+        if not self._upload_output(job, output_dir, sealed=sealed):
             # The durable copy never landed, so do NOT purge this tree -- it is the only copy.
             self._upload_failed_job_ids.add(job.job_id)
             # BEFORE the terminal write, not after: a crash in between would otherwise lose the
@@ -3199,24 +3199,16 @@ class Dispatcher:
             return None
 
     def _seal_receipt(self, job: Job, output_dir: Path,
-                      observation: "_attest.RunObservation | None") -> None:
+                      observation: "_attest.RunObservation | None") -> bool:
         """Replace whatever sits at attestation.json in the tree about to be uploaded with this
-        dispatcher's signed receipt, or a tombstone saying why it did not sign.
-        Never raises: a receipt problem is logged and the job completes without one."""
-        try:
-            _attest.seal_receipt(output_dir, key=self._attest_key, observation=observation,
-                                 reason="input could not be hashed")
-        except Exception as exc:  # noqa: BLE001
-            _log.error("attestation: could not write the receipt for job %s (%s); the job "
-                       "completes without one", job.job_id, exc)
-            try:
-                # Never ship a planted or half-written one, and overwrite a superseded attempt's.
-                _attest.write_tombstone(output_dir, "signing failed")
-            except Exception:  # noqa: BLE001
-                _log.exception("attestation: could not write a tombstone for job %s",
-                               job.job_id)
+        dispatcher's signed receipt, or a tombstone saying why it did not sign. Never raises: a
+        receipt problem is logged and the job completes without one. Returns False only when
+        NEITHER could be written -- the tree must then not ship (see seal_fresh_receipt)."""
+        return _attest.seal_fresh_receipt(output_dir, key=self._attest_key,
+                                          observation=observation, job_id=job.job_id,
+                                          reason="input could not be hashed")
 
-    def _upload_output(self, job: Job, output_dir: Path) -> bool:
+    def _upload_output(self, job: Job, output_dir: Path, *, sealed: bool = True) -> bool:
         """Upload *output_dir* (already sealed) to the blob store, with a bounded inline
         retry (Finding P1/D1). Called from BOTH the cold and warm success paths, BEFORE
         their DONE write — the API's result routes read ONLY through
@@ -3231,7 +3223,11 @@ class Dispatcher:
         ever re-runs a RUNNING job, so preserving one for a retry that never comes would
         only leak the job dir forever.
         """
-        exc = upload_output_with_retry(
+        # ``sealed`` False: nothing could be written at attestation.json, so a worker-planted
+        # receipt may still be there. Refuse the upload and take the ordinary failure path.
+        exc: Exception | None = RuntimeError(
+            f"refusing to upload: no receipt or tombstone could be written at "
+            f"{_attest.RECEIPT_NAME}") if not sealed else upload_output_with_retry(
             self._blobs, job.job_id, output_dir,
             attempts=self._put_output_max_attempts,
             backoff_s=self._put_output_retry_backoff_s,

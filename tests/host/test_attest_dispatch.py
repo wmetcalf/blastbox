@@ -625,3 +625,90 @@ def test_cascade_runtime_reports_the_owning_tier():
     assert rt.slot_tier(types.SimpleNamespace(slot_id="s1")) == "firecracker"
     assert rt.slot_tier(types.SimpleNamespace(slot_id="s0")) == "gvisor"
     assert rt.slot_tier(types.SimpleNamespace(slot_id="gone")) is None
+
+
+# ---------------------------------------------------------------------------
+# A planted receipt never ships, even when the envelope cannot be re-read at the seal
+# ---------------------------------------------------------------------------
+
+_FORGED = b'{"attestation": {"attested": true, "worker_runtime": "none"}, "signature": "x"}'
+
+
+def _envelope_reads_fail(monkeypatch):
+    """A transient error (EIO) on every receipt-path envelope read at the seal."""
+    def eio(*a, **kw):
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(attest, "tree_receipt_path_protection", eio)
+
+
+def _vm_run_planted(tmp_path, key):
+    from blastbox.host.runtime.vm_dispatch import VmJobDispatcher
+    from tests.host.test_vm_dispatch import _queue_job
+
+    store = InMemoryJobStore()
+    job = _queue_job(store, tmp_path / "jobs", body=b"MZ-real-bytes")
+
+    def validate(path):
+        out = tmp_path / "jobs" / job.job_id / "output"
+        out.mkdir(parents=True, exist_ok=True)
+        (out / attest.RECEIPT_NAME).write_bytes(_FORGED)
+        return ({"verdict": "ok"}, True)
+
+    d = VmJobDispatcher(store, str(tmp_path / "jobs"), validate, worker_tier="libvirt-vm",
+                        blob_store=_blobs(tmp_path), attest_key=key)
+    d._process(store.claim_next())
+    return store, job
+
+
+@pytest.mark.parametrize("with_key", [True, False])
+@pytest.mark.parametrize("tier", ["cold", "vm"])
+def test_a_planted_receipt_never_ships_when_the_envelope_cannot_be_reread(
+        tmp_path, key, monkeypatch, with_key, tier):
+    """The trust gate already validated this envelope and refused any artifact at the reserved
+    name, so the fresh seal must not re-read it to decide whether to strip. With every such read
+    failing (EIO), the old path raised ReceiptPathOccupied for the receipt AND the fallback
+    tombstone, and the upload shipped the worker's forged file, which the route serves 200."""
+    _envelope_reads_fail(monkeypatch)
+    k = key if with_key else None
+    if tier == "cold":
+        store = InMemoryJobStore()
+        job = _queue(tmp_path, store)
+        d = _dispatcher(tmp_path, store, attest_key=k,
+                        runner=_runner(tmp_path, job, plant=_FORGED))
+        assert d.dispatch_once() is True
+    else:
+        store, job = _vm_run_planted(tmp_path, k)
+    assert store.get(job.job_id).status == JobStatus.DONE
+    shipped = _receipt_path(tmp_path, job).read_bytes()
+    assert shipped != _FORGED
+    if with_key:
+        _verify(key, json.loads(shipped))
+    else:
+        assert _tombstone_reason(tmp_path, job) == "no attestation key"
+
+
+@pytest.mark.parametrize("tier", ["cold", "vm"])
+def test_when_neither_receipt_nor_tombstone_lands_the_tree_is_not_uploaded(
+        tmp_path, key, monkeypatch, tier):
+    """Fail closed: if NOTHING can be written at attestation.json, a worker-planted file may still
+    be sitting there, so the tree must not ship. It takes the upload-failure path -- FAILED,
+    retained for the pending-upload sweep, which sanitises the receipt before it uploads."""
+    def enospc(*a, **kw):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(attest, "_write_atomic", enospc)
+    if tier == "cold":
+        store = InMemoryJobStore()
+        job = _queue(tmp_path, store)
+        d = _dispatcher(tmp_path, store, attest_key=key,
+                        runner=_runner(tmp_path, job, plant=_FORGED))
+        assert d.dispatch_once() is True
+    else:
+        store, job = _vm_run_planted(tmp_path, key)
+    from blastbox.host.jobs.retention import PENDING_UPLOAD_SENTINEL
+
+    assert store.get(job.job_id).status == JobStatus.FAILED
+    assert not _receipt_path(tmp_path, job).exists()
+    assert not (tmp_path / "blobs" / "results" / job.job_id / "metadata.json").exists()
+    assert (tmp_path / "jobs" / job.job_id / PENDING_UPLOAD_SENTINEL).exists()

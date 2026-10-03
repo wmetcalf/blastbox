@@ -812,8 +812,13 @@ class VmJobDispatcher:
             if ok:
                 # The receipt goes INTO the sealed tree immediately before it ships (see
                 # Dispatcher._upload_output): same put_output, same results prefix.
-                self._seal_receipt(job, self._job_dir(job) / "output", observation)
-                upload_exc = upload_output_with_retry(
+                sealed = self._seal_receipt(job, self._job_dir(job) / "output", observation)
+                # Not sealed = nothing could be written at attestation.json, so a worker-planted
+                # receipt may still be there: refuse the upload, taking the ordinary
+                # upload-failure path below (FAILED, retained for the pending-upload sweep).
+                upload_exc: Exception | None = RuntimeError(
+                    f"refusing to upload: no receipt or tombstone could be written at "
+                    f"{_attest.RECEIPT_NAME}") if not sealed else upload_output_with_retry(
                     self._blobs, job.job_id, self._job_dir(job) / "output",
                     attempts=self._put_output_max_attempts,
                     backoff_s=self._put_output_retry_backoff_s,
@@ -986,19 +991,12 @@ class VmJobDispatcher:
             return None
 
     def _seal_receipt(self, job: Job, out_dir: Path,
-                      observation: "_attest.RunObservation | None") -> None:
-        """Strip a planted attestation.json and, with a key, write ours. Never raises."""
-        try:
-            _attest.seal_receipt(out_dir, key=self._attest_key, observation=observation,
-                                 reason="input could not be hashed")
-        except Exception as exc:  # noqa: BLE001
-            logger.error("attestation: could not write the receipt for job %s (%s); the job "
-                         "completes without one", job.job_id, exc)
-            try:
-                _attest.write_tombstone(out_dir, "signing failed")
-            except Exception:  # noqa: BLE001
-                logger.exception("attestation: could not write a tombstone for job %s",
-                                 job.job_id)
+                      observation: "_attest.RunObservation | None") -> bool:
+        """Strip a planted attestation.json and write ours (or a tombstone). Never raises.
+        False only when nothing could be written there: the tree must then not ship."""
+        return _attest.seal_fresh_receipt(out_dir, key=self._attest_key,
+                                          observation=observation, job_id=job.job_id,
+                                          reason="input could not be hashed")
 
     def _sealed_envelope(self, job: Job) -> Any:
         """Parse the HOST-SEALED metadata.json (the Envelope the trust gate wrote) for the remote path,
