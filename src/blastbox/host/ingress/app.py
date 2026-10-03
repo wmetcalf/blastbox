@@ -1075,9 +1075,11 @@ def build_app(
         # stores metadata.json LAST -- so a prefix without it is a partial upload (possibly of an
         # as-is tree whose declared artifact at attestation.json already landed) or a seal
         # put_output would not ship. Absent envelope = no receipt, never "nothing declared".
+        # The same ceiling the attest-side decisions apply, from THIS app's configured limits.
+        envelope_cap = _attest.envelope_cap(_limits)
         try:
             with opener(job_id, "metadata.json") as mfh:
-                envelope = mfh.read(_attest.ENVELOPE_MAX_BYTES + 1)
+                envelope = mfh.read(envelope_cap + 1)
         except Exception as exc:
             if not _is_missing_blob(exc):
                 _log.warning("attestation: envelope read failed for job=%s: %s", job_id, exc)
@@ -1085,7 +1087,7 @@ def build_app(
             raise HTTPException(404, "no execution receipt for this job: "
                                      f"{_attest.RECEIPT_ENVELOPE_ABSENT_REASON}")
         why_not = _attest.envelope_receipt_path_protection(
-            None if len(envelope) > _attest.ENVELOPE_MAX_BYTES else envelope)
+            None if len(envelope) > envelope_cap else envelope)
         if why_not is not None:
             raise HTTPException(404, f"no execution receipt for this job: {why_not}")
         try:

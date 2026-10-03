@@ -703,8 +703,42 @@ def test_an_oversized_envelope_cannot_rule_out_the_receipt_path(tmp_path, monkey
     out = _tree(tmp_path, env)
     (out / attest.RECEIPT_NAME).write_bytes(b"maybe an artifact")
     assert attest.tree_receipt_path_protection(out) is None         # within the cap: clean
+    # Past BOTH the floor and the configured metadata limit (envelope_cap is their max).
     monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", len(env) - 1)
+    monkeypatch.setenv("BLASTBOX_MAX_METADATA", str(len(env) - 1))
     assert (attest.tree_receipt_path_protection(out)
             == attest.RECEIPT_PATH_UNDECIDABLE_REASON)
     assert isinstance(_attempt(lambda: attest.strip_receipt(out)), attest.ReceiptPathOccupied)
     assert (out / attest.RECEIPT_NAME).read_bytes() == b"maybe an artifact"
+
+
+# ---------------------------------------------------------------------------
+# The envelope cap follows the configured metadata limit
+# ---------------------------------------------------------------------------
+
+
+def _padded_envelope(size: int) -> bytes:
+    """A valid envelope declaring nothing at the receipt name, padded to ``size`` bytes."""
+    base = b'{"artifacts": [{"id": "a", "path": "page-001.png"}], "pad": ""}'
+    return base[:-2] + b"x" * (size - len(base)) + base[-2:]
+
+
+def test_an_envelope_within_the_configured_metadata_limit_is_parsed(tmp_path, monkeypatch):
+    """BLASTBOX_MAX_METADATA may be configured above the fixed cap, and the dispatcher then seals
+    (and signs over) an envelope that large. Judging it "cannot rule out" hid its genuine receipt
+    and recovered its tree as-is. The cap is scaled down here to keep the test cheap."""
+    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 1024)
+    monkeypatch.setenv("BLASTBOX_MAX_METADATA", str(1 << 20))
+    out = _tree(tmp_path, _padded_envelope(4096))
+    json.loads((out / "metadata.json").read_bytes())          # valid, and over the fixed cap
+    (out / attest.RECEIPT_NAME).write_bytes(b"planted")
+    assert attest.tree_receipt_path_protection(out) is None
+    attest.strip_receipt(out)
+    assert not (out / attest.RECEIPT_NAME).exists()
+
+
+def test_an_envelope_over_both_caps_still_cannot_rule_it_out(tmp_path, monkeypatch):
+    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 1024)
+    monkeypatch.setenv("BLASTBOX_MAX_METADATA", "2048")
+    out = _tree(tmp_path, _padded_envelope(4096))
+    assert attest.tree_receipt_path_protection(out) == attest.RECEIPT_PATH_UNDECIDABLE_REASON

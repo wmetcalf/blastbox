@@ -494,6 +494,33 @@ def test_an_envelope_over_the_cap_serves_no_receipt(tmp_path, key, monkeypatch):
     assert client.get(f"/v1/jobs/{job.job_id}/attestation").status_code == 200   # control
     size = len((out / "metadata.json").read_bytes())
     monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", size - 1)   # read cap+1 = the whole file
-    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    # ...and the app's configured metadata limit no higher (envelope_cap is their max).
+    app = build_app(job_store=store, job_root=tmp_path / "jobs", allowed_engines={"clippyshot"},
+                    limits=Limits(max_metadata_bytes=size - 1), api_workers=2, zip_password="",
+                    blob_store=LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs"))
+    r = TestClient(app).get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 404, r.text
     assert attest.RECEIPT_PATH_UNDECIDABLE_REASON in r.json()["detail"]
+
+
+def test_an_envelope_within_the_configured_metadata_limit_serves_its_receipt(
+        tmp_path, key, monkeypatch):
+    """BLASTBOX_MAX_METADATA above the fixed cap: the dispatcher sealed and signed over that
+    envelope, so the route must parse it and serve the genuine receipt, not 404 it as
+    undecidable. The fixed cap is scaled down to keep the test cheap."""
+    store = InMemoryJobStore()
+    job, out = _make_done_job(tmp_path, store)
+    meta = json.loads((out / "metadata.json").read_bytes())
+    meta["pad"] = "x" * 4096
+    (out / "metadata.json").write_bytes(json.dumps(meta).encode())
+    body = attest.seal_receipt(out, key=key, observation=attest.RunObservation(
+        job_id=job.job_id, engine=job.engine, input_sha256="d" * 64, worker_runtime="runsc",
+        worker_tier=None, started_at_ms=1, finished_at_ms=2))
+    _push_to_blob(tmp_path, job.job_id, out)
+    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 1024)
+    app = build_app(job_store=store, job_root=tmp_path / "jobs", allowed_engines={"clippyshot"},
+                    limits=Limits(max_metadata_bytes=1 << 20), api_workers=2, zip_password="",
+                    blob_store=LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs"))
+    r = TestClient(app).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 200, r.text
+    assert r.json() == body

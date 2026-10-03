@@ -69,6 +69,8 @@ from pathlib import Path, PurePosixPath
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
+from blastbox.limits import Limits
+
 _log = logging.getLogger("blastbox.host.attest")
 
 ATTEST_KEY_ENV = "BLASTBOX_ATTEST_KEY"
@@ -377,8 +379,25 @@ def is_reserved_path(path: str) -> bool:
 
 
 #: metadata.json is capped at 4 MiB by default (Limits.max_metadata_bytes); this is only the
-#: ceiling past which the envelope is "cannot rule it out", never a trust verdict.
+#: FLOOR of the ceiling past which the envelope is "cannot rule it out", never a trust verdict.
+#: The ceiling actually applied is :func:`envelope_cap`.
 ENVELOPE_MAX_BYTES = 64 << 20
+
+
+def envelope_cap(limits: Limits | None = None) -> int:
+    """The largest envelope parsed for a receipt-path decision: the configured metadata limit
+    (``limits``, else BLASTBOX_MAX_METADATA via Limits.from_env -- the one the dispatchers and
+    the trust gate enforce), never below ENVELOPE_MAX_BYTES. A host configured to accept larger
+    envelopes seals and signs over them, so a fixed cap would judge a genuine one "cannot rule
+    out" -- hiding its receipt. The floor keeps an envelope sealed by a peer with a larger limit
+    than this process parseable up to the old fixed size. An unparseable env setting (which
+    fails the dispatchers loudly at startup) falls back to the floor here."""
+    if limits is None:
+        try:
+            limits = Limits.from_env()
+        except ValueError:
+            return ENVELOPE_MAX_BYTES
+    return max(ENVELOPE_MAX_BYTES, int(limits.max_metadata_bytes))
 
 
 class ReceiptPathOccupied(OSError):
@@ -451,7 +470,7 @@ def tree_receipt_path_protection(out_dir: Path) -> str | None:
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             return None                 # a FIFO/directory/...: put_output never ships it
-        data = _read_capped(fd, ENVELOPE_MAX_BYTES)
+        data = _read_capped(fd, envelope_cap())
     finally:
         os.close(fd)
     return envelope_receipt_path_protection(data)
