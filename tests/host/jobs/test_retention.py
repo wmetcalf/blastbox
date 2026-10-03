@@ -2031,3 +2031,106 @@ def test_a_flap_inside_strip_leaves_a_legacy_tree_for_the_next_run(tmp_path, mon
     # Nothing recorded the failure: the operator's next run migrates it.
     assert migrate_legacy_results(tmp_path, blobs, store, log) == (1, 0, 0)
     assert not (out / "attestation.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# A worker-built DEEP chain at the receipt path (round-3 review H1)
+# ---------------------------------------------------------------------------
+
+_POISON = "11111111-1111-4111-8111-111111111111"
+_GOOD = "99999999-9999-4999-8999-999999999999"
+
+
+def _deep_receipt_dir(out: Path, depth: int = 1100) -> None:
+    """attestation.json/a/a/... `depth` levels down -- past Python's recursion limit, 0 bytes and
+    ~depth entries (far under the gate's entry cap), so the trust gate passes it (undeclared)."""
+    p = out / "attestation.json"
+    os.mkdir(p)
+    fd = os.open(p, os.O_RDONLY)
+    for _ in range(depth):
+        os.mkdir("a", dir_fd=fd)
+        nfd = os.open("a", os.O_RDONLY, dir_fd=fd)
+        os.close(fd)
+        fd = nfd
+    os.close(fd)
+
+
+def test_the_fresh_seal_removes_a_deep_undeclared_receipt_path_dir(tmp_path):
+    """shutil.rmtree recurses, so a ~1100-deep chain raised RecursionError: no receipt AND no
+    tombstone, the job FAILED and the tree went to the pending-upload sweep (which then tripped
+    on it every tick). The chain is undeclared worker junk: remove it and seal."""
+    from blastbox.host import attest
+
+    out = tmp_path / "o"
+    out.mkdir()
+    (out / "metadata.json").write_text('{"artifacts": []}')
+    _deep_receipt_dir(out)
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    assert attest.seal_fresh_receipt(out, key=key, observation=None, job_id="j") is True
+    assert (out / "attestation.json").is_file()
+    assert json.loads((out / "attestation.json").read_bytes())["attestation"] is None
+    assert sorted(p.name for p in out.iterdir()) == ["attestation.json", "metadata.json"]
+
+
+def test_a_deep_receipt_path_dir_in_a_retained_tree_is_sanitised_by_the_sweep(tmp_path):
+    from blastbox.host import attest
+
+    store = InMemoryJobStore()
+    for jid in (_POISON, _GOOD):
+        _retained_failed_job(store, jid)
+        (_sealed_tree(tmp_path, jid) / "output" / "metadata.json").write_text('{"artifacts": []}')
+    _deep_receipt_dir(tmp_path / _POISON / "output")
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    assert retry_pending_uploads(tmp_path, _FakeBlobs(), store, logging.getLogger("t"),
+                                 attest_key=key) == 2
+    assert store.get(_POISON).status is JobStatus.DONE
+    assert store.get(_GOOD).status is JobStatus.DONE
+    assert (tmp_path / _POISON / "output" / "attestation.json").is_file()
+
+
+def test_one_poison_tree_never_aborts_the_pending_upload_sweep(tmp_path, monkeypatch):
+    """Whatever one tree raises -- not only OSError -- the sweep logs it and carries on: a single
+    tree a worker shaped must never starve every other retained result (rotation can make that
+    permanent when the tree count divides the window)."""
+    from blastbox.host import attest
+
+    store = InMemoryJobStore()
+    for jid in (_POISON, _GOOD):
+        _retained_failed_job(store, jid)
+        _sealed_tree(tmp_path, jid)
+    real = attest.tree_receipt_path_protection
+
+    def poisoned(out_dir, **kw):
+        if Path(out_dir).parent.name == _POISON:
+            raise RecursionError("maximum recursion depth exceeded")
+        return real(out_dir, **kw)
+
+    monkeypatch.setattr(attest, "tree_receipt_path_protection", poisoned)
+    blobs = _FakeBlobs()
+    assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 1
+    assert store.get(_GOOD).status is JobStatus.DONE
+    assert store.get(_POISON).status is JobStatus.FAILED          # left retained for next tick
+    assert (tmp_path / _POISON / PENDING_UPLOAD_SENTINEL).exists()
+
+
+def test_one_poison_tree_never_aborts_the_legacy_migration(tmp_path, monkeypatch):
+    from blastbox.host import attest
+
+    store = InMemoryJobStore()
+    for jid in (_POISON, _GOOD):
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = jid
+        job.status = JobStatus.DONE
+        store.create(job)
+        _sealed_tree(tmp_path, jid, pending=False)
+    real = attest.tree_receipt_path_protection
+
+    def poisoned(out_dir, **kw):
+        if Path(out_dir).parent.name == _POISON:
+            raise RecursionError("maximum recursion depth exceeded")
+        return real(out_dir, **kw)
+
+    monkeypatch.setattr(attest, "tree_receipt_path_protection", poisoned)
+    blobs = _FakeBlobs()
+    assert migrate_legacy_results(tmp_path, blobs, store, logging.getLogger("t")) == (1, 0, 1)
+    assert blobs.has_output(_GOOD) and not blobs.has_output(_POISON)

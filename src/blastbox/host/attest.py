@@ -57,7 +57,6 @@ import json
 import logging
 import os
 import posixpath
-import shutil
 import socket
 import stat
 import time
@@ -524,7 +523,14 @@ def strip_receipt(out_dir: Path, *, gate_verified: bool = False) -> None:
                 errno.EEXIST, f"{RECEIPT_NAME} holds a declared artifact (or the envelope "
                               f"cannot be parsed to rule that out); refusing to replace it")
     if stat.S_ISDIR(st.st_mode):
-        shutil.rmtree(target)
+        # NOT shutil.rmtree: its fd walk RECURSES, so a worker-built chain ~1000 dirs deep (0
+        # bytes, far under the gate's entry cap) raised RecursionError -- not an OSError -- and
+        # no receipt or tombstone could ever be written over it. The bounded iterative walk
+        # purge_job_dir already uses for the same attack: openat/unlinkat under O_NOFOLLOW (a
+        # symlink is never followed, at the top or below), a fixed fd budget, no PATH_MAX.
+        from blastbox.host.jobs.retention import _rmtree_iterative
+
+        _rmtree_iterative(target)
     else:
         os.unlink(target)
 
