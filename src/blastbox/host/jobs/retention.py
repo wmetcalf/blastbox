@@ -31,6 +31,7 @@ from blastbox.host.jobs.base import JobStatus, JobStore
 
 if TYPE_CHECKING:
     from blastbox.host.attest import AttestKey
+    from blastbox.limits import Limits
 
 _log = logging.getLogger("blastbox.host.jobs.retention")
 
@@ -661,6 +662,7 @@ def migrate_legacy_results(
     *,
     limit: int = 0,
     dry_run: bool = False,
+    limits: "Limits | None" = None,
 ) -> "tuple[int, int, int]":
     """Upload the results of DONE jobs that predate the blob store, so the reclaim can free them.
 
@@ -678,7 +680,19 @@ def migrate_legacy_results(
     OPT-IN and offline by design: this is an operator action with real I/O cost against the object
     store, not something a maintenance tick should start doing unannounced. Returns
     (migrated, skipped, failed).
+
+    ``limits``: the SERVICE's limits (``--max-metadata``), else BLASTBOX_MAX_METADATA when this
+    process has it. The receipt-path decision must use the same envelope ceiling as the
+    attestation route: an envelope this run cannot parse whole is uploaded as-is, and a route
+    with a larger ceiling would parse it, see nothing declared, and serve the worker's
+    attestation.json as the receipt. So with NEITHER known, an envelope past the fixed floor
+    (ENVELOPE_MAX_BYTES, which every ceiling is at least) is refused -- left in place, counted
+    failed -- rather than judged against a limit the service may not share.
     """
+    if limits is None and os.environ.get("BLASTBOX_MAX_METADATA") is not None:
+        from blastbox.limits import Limits as _Limits
+
+        limits = _Limits.from_env()
     migrated = skipped = failed = 0
     try:
         entries = sorted(job_root.iterdir(), key=lambda p: p.name)
@@ -692,7 +706,8 @@ def migrate_legacy_results(
         # ISOLATED per tree, as in retry_pending_uploads: whatever one worker-shaped tree raises,
         # it is counted failed and left in place, and the run carries on.
         try:
-            outcome = _migrate_legacy_one(d, blob_store, job_store, log, dry_run=dry_run)
+            outcome = _migrate_legacy_one(d, blob_store, job_store, log, dry_run=dry_run,
+                                          limits=limits)
         except Exception:  # noqa: BLE001 -- one tree must never abort the migration
             log.exception("legacy migration: %s: unexpected error; leaving it in place", d.name)
             outcome = "failed"
@@ -714,6 +729,7 @@ def _migrate_legacy_one(
     log: logging.Logger,
     *,
     dry_run: bool,
+    limits: "Limits | None",
 ) -> str | None:
     """One tree of :func:`migrate_legacy_results`: "migrated", "skipped", "failed", or None when
     it is not a legacy DONE result at all."""
@@ -746,10 +762,19 @@ def _migrate_legacy_one(
     # reserved) or cannot be parsed to rule that out: then it may be accepted output, uploaded
     # as-is; the attestation route applies the same test and never serves it as a receipt.
     try:
-        from blastbox.host.attest import strip_receipt, tree_receipt_path_protection
+        from blastbox.host import attest as _attest
 
-        if tree_receipt_path_protection(out_dir) is None:
-            strip_receipt(out_dir)
+        if limits is None and _attest.ENVELOPE_MAX_BYTES < os.stat(
+                out_dir / "metadata.json", follow_symlinks=False).st_size:
+            # Unknown service limit: only the floor is common to every ceiling, and this run's
+            # "cannot rule out" may be the route's "nothing declared" (see the docstring).
+            log.warning("legacy migration: %s: its envelope is larger than %d bytes and the "
+                        "service's metadata limit is unknown; rerun with --max-metadata set to "
+                        "the service's BLASTBOX_MAX_METADATA. Leaving it in place", d.name,
+                        _attest.ENVELOPE_MAX_BYTES)
+            return "failed"
+        if _attest.tree_receipt_path_protection(out_dir, limits=limits) is None:
+            _attest.strip_receipt(out_dir, limits=limits)
     except OSError as exc:
         log.warning("legacy migration: %s: could not remove a worker-written receipt (%s); "
                     "leaving it in place", d.name, exc)

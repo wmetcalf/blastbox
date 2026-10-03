@@ -524,3 +524,118 @@ def test_an_envelope_within_the_configured_metadata_limit_serves_its_receipt(
     r = TestClient(app).get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 200, r.text
     assert r.json() == body
+
+
+# ---------------------------------------------------------------------------
+# The migration and the route judge the envelope against the SAME limit (round-3 review H2)
+# ---------------------------------------------------------------------------
+
+_FORGED_RECEIPT = b'{"attestation":{"forged":true},"signature":"AAAA"}'
+
+
+def _legacy_tree_with_big_envelope(tmp_path, store):
+    """A legacy DONE tree: an envelope past the fixed floor that declares nothing, plus a
+    worker-written attestation.json. The floor is scaled down to keep the test cheap."""
+    job_root = tmp_path / "jobs"
+    job = Job.new(engine="clippyshot", filename="a.docx")
+    job.status = JobStatus.DONE
+    store.create(job)
+    out = job_root / job.job_id / "output"
+    out.mkdir(parents=True)
+    (out / "metadata.json").write_text(json.dumps({"artifacts": [], "pad": "x" * 4096}))
+    (out / attest.RECEIPT_NAME).write_bytes(_FORGED_RECEIPT)
+    return job_root, job
+
+
+def _route_with_limit(tmp_path, store, max_metadata):
+    app = build_app(job_store=store, job_root=tmp_path / "jobs", allowed_engines={"clippyshot"},
+                    limits=Limits(max_metadata_bytes=max_metadata), api_workers=2,
+                    zip_password="",
+                    blob_store=LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs"))
+    return TestClient(app)
+
+
+def test_a_migration_without_the_service_limit_never_ships_a_forged_receipt(
+        tmp_path, monkeypatch):
+    """The reviewer's capdiv repro. The operator's CLI shell lacks the service's
+    BLASTBOX_MAX_METADATA, so the migration judged the envelope "cannot rule out" and uploaded
+    the worker's attestation.json as-is; the ingress, with the larger limit, parsed the envelope,
+    saw nothing declared, and served the forged bytes 200. Without a known limit, an envelope
+    past the floor is refused (left in place, counted failed), never shipped as-is."""
+    import logging
+
+    from blastbox.host.jobs.retention import migrate_legacy_results
+
+    monkeypatch.delenv("BLASTBOX_MAX_METADATA", raising=False)
+    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 1024)
+    store = InMemoryJobStore()
+    job_root, job = _legacy_tree_with_big_envelope(tmp_path, store)
+    blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
+    assert migrate_legacy_results(job_root, blobs, store, logging.getLogger("t")) == (0, 0, 1)
+    assert not blobs.has_output(job.job_id)
+    assert (job_root / job.job_id / "output" / attest.RECEIPT_NAME).read_bytes() \
+        == _FORGED_RECEIPT                                    # nothing deleted either
+    r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert r.content != _FORGED_RECEIPT
+
+
+def test_a_migration_given_the_service_limit_strips_the_forged_receipt(tmp_path, monkeypatch):
+    """With the service's limit the migration parses the envelope exactly as the route will,
+    sees nothing declared, and removes the worker's file before it ships."""
+    import logging
+
+    from blastbox.host.jobs.retention import migrate_legacy_results
+
+    monkeypatch.delenv("BLASTBOX_MAX_METADATA", raising=False)
+    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 1024)
+    store = InMemoryJobStore()
+    job_root, job = _legacy_tree_with_big_envelope(tmp_path, store)
+    blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
+    assert migrate_legacy_results(job_root, blobs, store, logging.getLogger("t"),
+                                  limits=Limits(max_metadata_bytes=1 << 20)) == (1, 0, 0)
+    assert not (job_root / job.job_id / "output" / attest.RECEIPT_NAME).exists()
+    r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert r.content != _FORGED_RECEIPT
+
+
+def test_a_migration_reads_the_limit_from_the_service_env_when_set(tmp_path, monkeypatch):
+    import logging
+
+    from blastbox.host.jobs.retention import migrate_legacy_results
+
+    monkeypatch.setenv("BLASTBOX_MAX_METADATA", str(1 << 20))
+    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 1024)
+    store = InMemoryJobStore()
+    job_root, job = _legacy_tree_with_big_envelope(tmp_path, store)
+    blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
+    assert migrate_legacy_results(job_root, blobs, store, logging.getLogger("t")) == (1, 0, 0)
+    assert not (job_root / job.job_id / "output" / attest.RECEIPT_NAME).exists()
+
+
+def test_migrate_results_cli_threads_max_metadata(tmp_path, monkeypatch):
+    """`blastbox migrate-results --max-metadata N` is how an operator hands the migration the
+    service's limit when the shell does not carry BLASTBOX_MAX_METADATA."""
+    from blastbox.host import cli
+    from blastbox.host.jobs import retention
+
+    seen = {}
+
+    def fake(job_root, blobs, store, log, **kw):
+        seen.update(kw)
+        return (0, 0, 0)
+
+    monkeypatch.delenv("BLASTBOX_MAX_METADATA", raising=False)
+    monkeypatch.setattr(retention, "migrate_legacy_results", fake)
+    monkeypatch.setattr("blastbox.host.blobs.factory.build_blob_store_from_env",
+                        lambda env: object())
+    monkeypatch.setattr("blastbox.host.jobs.factory.build_job_store_from_env", lambda: object())
+    parser = cli.build_parser()
+    args = parser.parse_args(["migrate-results", "--job-root", str(tmp_path),
+                              "--max-metadata", str(128 << 20)])
+    assert args.func(args) == 0
+    assert seen["limits"] == Limits(max_metadata_bytes=128 << 20)
+    args = parser.parse_args(["migrate-results", "--job-root", str(tmp_path)])
+    assert args.func(args) == 0
+    assert seen["limits"] is None

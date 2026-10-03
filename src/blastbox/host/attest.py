@@ -444,7 +444,7 @@ def envelope_receipt_path_protection(data: bytes | None) -> str | None:
     return None
 
 
-def tree_receipt_path_protection(out_dir: Path) -> str | None:
+def tree_receipt_path_protection(out_dir: Path, *, limits: Limits | None = None) -> str | None:
     """:func:`envelope_receipt_path_protection` for ``<out_dir>/metadata.json`` -- THE single
     envelope test behind every receipt-path decision (the sweeps' as-is choice, strip_receipt,
     seal_receipt), so they cannot diverge.
@@ -456,7 +456,9 @@ def tree_receipt_path_protection(out_dir: Path) -> str | None:
     junk to strip or tombstone. A shipped envelope that is over the cap or unparseable is
     "cannot rule out" (protect). Opened O_NOFOLLOW|O_NONBLOCK and judged on the descriptor, so a
     FIFO never blocks. Any other OSError -- EIO, EACCES, a flap -- is no verdict and propagates,
-    so the caller retries rather than acting on it."""
+    so the caller retries rather than acting on it. ``limits`` as for :func:`envelope_cap`: a
+    caller outside the service (the migration CLI) passes the service's, so it judges the
+    envelope exactly as the attestation route will."""
     seal = Path(out_dir) / _SEAL_NAME
     try:
         fd = os.open(seal, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -469,7 +471,7 @@ def tree_receipt_path_protection(out_dir: Path) -> str | None:
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             return None                 # a FIFO/directory/...: put_output never ships it
-        data = _read_capped(fd, envelope_cap())
+        data = _read_capped(fd, envelope_cap(limits))
     finally:
         os.close(fd)
     return envelope_receipt_path_protection(data)
@@ -487,7 +489,8 @@ def _may_hold_declared_artifacts(out_dir: Path) -> bool:
         return True
 
 
-def strip_receipt(out_dir: Path, *, gate_verified: bool = False) -> None:
+def strip_receipt(out_dir: Path, *, gate_verified: bool = False,
+                  limits: Limits | None = None) -> None:
     """Remove whatever sits at ``<out_dir>/attestation.json`` (file, directory or symlink)
     without following a symlink. A worker can write into its output tree.
 
@@ -502,7 +505,8 @@ def strip_receipt(out_dir: Path, *, gate_verified: bool = False) -> None:
     ``gate_verified``: the caller is the dispatcher sealing a tree the trust gate JUST validated,
     and the gate refuses any artifact at or under the reserved name -- so nothing there can be
     accepted output and the envelope is not re-read. That makes the strip unconditional: a
-    transient envelope read error can never leave a worker-planted receipt in a tree that ships."""
+    transient envelope read error can never leave a worker-planted receipt in a tree that ships.
+    ``limits`` as for :func:`tree_receipt_path_protection`."""
     out_dir = Path(out_dir)
     target = out_dir / RECEIPT_NAME
     try:
@@ -511,7 +515,7 @@ def strip_receipt(out_dir: Path, *, gate_verified: bool = False) -> None:
         return
     if not gate_verified:
         try:
-            why = tree_receipt_path_protection(out_dir)
+            why = tree_receipt_path_protection(out_dir, limits=limits)
         except OSError as exc:
             # No verdict either way: a retry-later error, never the permanent-looking
             # ReceiptPathOccupied. Both sweeps leave the tree in place and retry it.

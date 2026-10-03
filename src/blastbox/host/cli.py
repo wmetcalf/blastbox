@@ -1655,6 +1655,14 @@ def _migrate_results_cmd(args) -> int:
     )
     store = build_job_store_from_env()
     log = _logging.getLogger("blastbox.migrate")
+    # The service's metadata limit, so the receipt-path decision matches the attestation route's
+    # (see migrate_legacy_results). None = unknown: BLASTBOX_MAX_METADATA from this shell if set,
+    # else envelopes past the fixed floor are refused rather than judged against the wrong limit.
+    limits = None
+    if args.max_metadata is not None:
+        from blastbox.limits import Limits as _Limits
+
+        limits = _Limits(max_metadata_bytes=args.max_metadata)
     migrated, skipped, failed = migrate_legacy_results(
         job_root,
         blobs,
@@ -1662,6 +1670,7 @@ def _migrate_results_cmd(args) -> int:
         log,
         limit=args.limit,
         dry_run=args.dry_run,
+        limits=limits,
     )
     print(
         f"migrated={migrated} already-durable={skipped} failed={failed}"
@@ -2054,6 +2063,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="report what would be uploaded without touching the blob store",
+    )
+    pm.add_argument(
+        "--max-metadata",
+        type=int,
+        default=None,
+        metavar="BYTES",
+        help="the service's BLASTBOX_MAX_METADATA (default: this shell's, if set). Without "
+             "either, a result whose envelope exceeds 64 MiB is left in place, not uploaded",
     )
     pm.set_defaults(func=_migrate_results_cmd)
 
