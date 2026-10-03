@@ -430,6 +430,21 @@ def test_tree_receipt_verification(tmp_path):
     assert not attest.tree_receipt_is_ours(out, key=other, job_id=jid)
     assert not attest.tree_receipt_is_ours(out, key=None, job_id=jid)
     assert not attest.tree_receipt_is_ours(out, key=key, job_id="22222222-2222-2222-2222-222222222222")
+
+
+def test_a_symlinked_seal_beside_our_receipt_is_a_verdict_not_unreadable(tmp_path):
+    """put_output never ships a symlinked seal, so a receipt over it vouches for nothing that
+    will be stored: answer "not ours" (the sweep tombstones it) rather than ReceiptUnreadable,
+    which would leave the tree retained on every tick until the reaper took the whole result."""
+    meta = b'{"engine":"clippyshot"}'
+    out = _tree(tmp_path, meta)
+    key = attest.load_or_create_key(tmp_path / "k")
+    jid = "11111111-1111-1111-1111-111111111111"
+    attest.seal_receipt(out, key=key, observation=_obs())
+    (tmp_path / "real.json").write_bytes(meta)
+    (out / "metadata.json").unlink()
+    (out / "metadata.json").symlink_to(tmp_path / "real.json")
+    assert attest.tree_receipt_is_ours(out, key=key, job_id=jid) is False
     (out / "metadata.json").write_bytes(meta + b" ")      # metadata changed since signing
     assert not attest.tree_receipt_is_ours(out, key=key, job_id=jid)
 

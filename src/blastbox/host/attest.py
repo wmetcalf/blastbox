@@ -645,6 +645,8 @@ def tree_receipt_is_ours(out_dir: Path, *, key: AttestKey | None, job_id: str) -
     except ValueError:                              # not a regular file: a verdict
         return False
     except OSError as exc:
+        if exc.errno == errno.ELOOP:                # a symlinked seal is never shipped: a verdict
+            return False
         raise ReceiptUnreadable(exc.errno, f"cannot read {_SEAL_NAME}: {exc}") from exc
     return doc.get("metadata_sha256") == metadata_sha256
 
