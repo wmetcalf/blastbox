@@ -366,7 +366,7 @@ def is_reserved_path(path: str) -> bool:
 
 #: metadata.json is capped at 4 MiB by default (Limits.max_metadata_bytes); this is only the
 #: ceiling past which the envelope is "cannot rule it out", never a trust verdict.
-_ENVELOPE_MAX_BYTES = 64 << 20
+ENVELOPE_MAX_BYTES = 64 << 20
 
 
 class ReceiptPathOccupied(OSError):
@@ -385,7 +385,7 @@ def _envelope_artifact_paths(seal: Path) -> list[str] | None:
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             return None
-        data = _read_capped(fd, _ENVELOPE_MAX_BYTES)
+        data = _read_capped(fd, ENVELOPE_MAX_BYTES)
     finally:
         os.close(fd)
     if data is None:
@@ -405,25 +405,48 @@ def _artifact_paths_of(data: bytes) -> list[str] | None:
 #: Why a result whose envelope declares an artifact at the receipt name has no receipt.
 RECEIPT_PATH_DECLARED_REASON = ("receipt path is occupied by a declared artifact of a result "
                                 "accepted before the name was reserved")
+#: Why a result whose envelope cannot be parsed has no receipt: nothing rules out that whatever
+#: sits at attestation.json is accepted output, and no dispatcher signs over such an envelope.
+RECEIPT_PATH_UNDECIDABLE_REASON = ("the result's envelope cannot be read to rule out a declared "
+                                   "artifact at the receipt path")
 
 
-def envelope_declares_receipt_path(data: bytes) -> bool:
-    """Whether envelope bytes DEFINITELY declare an artifact at or under the receipt name. Then
-    whatever sits at attestation.json is accepted analysis output, never a receipt or tombstone.
-    Unparseable bytes are False: "cannot rule it out" is not a declaration."""
-    paths = _artifact_paths_of(data)
-    return paths is not None and any(is_reserved_path(p) for p in paths)
+def envelope_receipt_path_protection(data: bytes | None) -> str | None:
+    """Why whatever sits at attestation.json in a result with these envelope bytes must be left
+    alone and never presented as a receipt or tombstone -- or None when the envelope rules that
+    out. ``data`` None = the envelope was not a regular file within the cap.
+
+    Two verdicts: the envelope DECLARES an artifact at or under the name (only possible in a tree
+    accepted before the trust gate reserved it), or it cannot be parsed, so nothing rules that
+    out. seal_receipt never signs over either, so no genuine receipt is lost by refusing."""
+    paths = None if data is None else _artifact_paths_of(data)
+    if paths is None:
+        return RECEIPT_PATH_UNDECIDABLE_REASON
+    if any(is_reserved_path(p) for p in paths):
+        return RECEIPT_PATH_DECLARED_REASON
+    return None
 
 
-def tree_declares_receipt_path(out_dir: Path) -> bool:
-    """:func:`envelope_declares_receipt_path` for ``<out_dir>/metadata.json``. Only possible in a
-    tree accepted before the trust gate reserved the name. False when the envelope is absent or
-    cannot be read -- the caller's ordinary (fail-closed) receipt handling then applies."""
+def tree_receipt_path_protection(out_dir: Path) -> str | None:
+    """:func:`envelope_receipt_path_protection` for ``<out_dir>/metadata.json``. None when the
+    envelope is absent. A symlinked envelope is a verdict (undecidable); any other OSError --
+    EIO, EACCES, a flap -- is NOT, and propagates so the caller retries rather than acting on it.
+    """
+    seal = Path(out_dir) / _SEAL_NAME
     try:
-        paths = _envelope_artifact_paths(Path(out_dir) / _SEAL_NAME)
-    except OSError:
-        return False
-    return paths is not None and any(is_reserved_path(p) for p in paths)
+        fd = os.open(seal, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            return RECEIPT_PATH_UNDECIDABLE_REASON
+        raise
+    try:
+        data = (_read_capped(fd, ENVELOPE_MAX_BYTES)
+                if stat.S_ISREG(os.fstat(fd).st_mode) else None)
+    finally:
+        os.close(fd)
+    return envelope_receipt_path_protection(data)
 
 
 def _may_hold_declared_artifacts(out_dir: Path) -> bool:

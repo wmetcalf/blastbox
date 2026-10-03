@@ -1068,19 +1068,22 @@ def build_app(
         # the worker wrote -- so a store offering a no-fallback read is always read through it.
         opener = getattr(_blob_store, "open_result_only", None) or _blob_store.open_output
         # A result accepted before the trust gate reserved the name can DECLARE an artifact at
-        # (or under) attestation.json, recovered as-is by the retention sweeps. Those bytes are
-        # analysis output: never serve them as a receipt (nor read them as a tombstone).
+        # (or under) attestation.json, and one whose envelope cannot be parsed cannot rule that
+        # out; the retention sweeps recover both as-is. Those bytes may be analysis output: never
+        # serve them as a receipt (nor read them as a tombstone). No dispatcher signs over either.
         try:
             with opener(job_id, "metadata.json") as mfh:
-                envelope = mfh.read()
+                envelope: bytes | None = mfh.read(_attest.ENVELOPE_MAX_BYTES + 1)
         except Exception as exc:
             if not _is_missing_blob(exc):
                 _log.warning("attestation: envelope read failed for job=%s: %s", job_id, exc)
                 raise HTTPException(503, "could not read the execution receipt")
-            envelope = None
-        if envelope is not None and _attest.envelope_declares_receipt_path(envelope):
-            raise HTTPException(404, "no execution receipt for this job: "
-                                     f"{_attest.RECEIPT_PATH_DECLARED_REASON}")
+            envelope = None                 # absent: no envelope declares anything
+        if envelope is not None:
+            why_not = _attest.envelope_receipt_path_protection(
+                None if len(envelope) > _attest.ENVELOPE_MAX_BYTES else envelope)
+            if why_not is not None:
+                raise HTTPException(404, f"no execution receipt for this job: {why_not}")
         try:
             fh = opener(job_id, _attest.RECEIPT_NAME)
         except Exception as exc:

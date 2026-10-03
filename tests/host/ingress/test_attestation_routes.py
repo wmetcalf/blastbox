@@ -284,6 +284,26 @@ def test_a_declared_artifact_at_the_receipt_name_is_never_served_as_a_receipt(tm
     assert "occupied by a declared artifact" in detail
 
 
+def test_an_envelope_that_cannot_rule_out_an_artifact_at_the_receipt_name_serves_no_receipt(
+        tmp_path):
+    """A result recovered as-is because its envelope could not be parsed: whatever sits at
+    attestation.json cannot be ruled out as analysis output (and no dispatcher ever signs over an
+    unparseable envelope), so it is never served as a receipt."""
+    client, store = _make_client(tmp_path)
+    job = Job.new(engine="clippyshot", filename="a.docx")
+    job.status = JobStatus.DONE
+    store.create(job)
+    out = tmp_path / "work" / job.job_id / "output"
+    out.mkdir(parents=True)
+    (out / attest.RECEIPT_NAME).write_bytes(b'{"attestation": {"looks": "signed"}, '
+                                            b'"signature": "x"}')
+    (out / "metadata.json").write_text('{"artifacts": [{"id": "a", "pa')
+    _push_to_blob(tmp_path, job.job_id, out)
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert r.json()["detail"].startswith("no execution receipt for this job: ")
+
+
 def test_legacy_tree_is_never_read_even_when_the_result_is_durable(tmp_path, key):
     """has_output() True (the durable result exists) but the durable copy has NO receipt, while
     the legacy on-disk tree has a planted one. open_output would fall back to it; the route must

@@ -491,18 +491,20 @@ def retry_pending_uploads(
             # a tree retained by pre-receipt code, a stale or foreign receipt) becomes a tombstone,
             # which also overwrites any superseded receipt already in the store.
             #
-            # EXCEPT a tree accepted before the trust gate reserved the name, whose envelope
-            # DECLARES an artifact at attestation.json (a file, or a directory of them). That is
-            # accepted output: a tombstone would destroy it, and refusing strands the job FAILED
-            # until the reaper reclaims the whole tree. Upload it AS-IS -- no receipt, no
-            # tombstone, nothing deleted; the attestation route reads the envelope and never
-            # presents that artifact as a receipt.
+            # EXCEPT a tree whose envelope DECLARES an artifact at attestation.json (a file, or a
+            # directory of them -- only possible if accepted before the trust gate reserved the
+            # name) or cannot be parsed to rule that out. Whatever is there may be accepted
+            # output: a tombstone would destroy it, and refusing strands the job FAILED until the
+            # reaper reclaims the whole tree. Upload it AS-IS -- no receipt, no tombstone, nothing
+            # deleted; the attestation route applies the same envelope test and never presents
+            # it as a receipt. A transient envelope read error is no verdict: it raises below.
             try:
                 from blastbox.host import attest as _attest
 
-                if _attest.tree_declares_receipt_path(out_dir):
+                as_is = _attest.tree_receipt_path_protection(out_dir)
+                if as_is is not None:
                     log.warning("pending-upload sweep: %s: %s; uploading it as-is, with no "
-                                "receipt", d.name, _attest.RECEIPT_PATH_DECLARED_REASON)
+                                "receipt", d.name, as_is)
                 elif not _attest.tree_receipt_is_ours(out_dir, key=attest_key, job_id=d.name):
                     _attest.write_tombstone(out_dir, "retained result re-uploaded without a "
                                                      "receipt from this host")
@@ -686,12 +688,12 @@ def migrate_legacy_results(
         # A pre-blob-store tree was never stripped by a dispatcher, so an attestation.json in it
         # is whatever the worker wrote; these results carry no execution receipt by construction.
         # Unless the envelope DECLARES an artifact there (a tree accepted before the name was
-        # reserved): that is accepted output, uploaded as-is; the attestation route reads the
-        # envelope and never serves it as a receipt.
+        # reserved) or cannot be parsed to rule that out: then it may be accepted output, uploaded
+        # as-is; the attestation route applies the same test and never serves it as a receipt.
         try:
-            from blastbox.host.attest import strip_receipt, tree_declares_receipt_path
+            from blastbox.host.attest import strip_receipt, tree_receipt_path_protection
 
-            if not tree_declares_receipt_path(out_dir):
+            if tree_receipt_path_protection(out_dir) is None:
                 strip_receipt(out_dir)
         except OSError as exc:
             failed += 1

@@ -1800,24 +1800,74 @@ def test_legacy_migration_uploads_a_declared_artifact_at_the_receipt_name_as_is(
         assert fh.read() == data
 
 
-def test_a_retained_tree_whose_envelope_cannot_rule_out_an_artifact_stays_retained(tmp_path):
-    """Only a DEFINITE declaration licenses uploading as-is. An envelope that cannot be parsed
-    cannot rule an artifact in or out: nothing is deleted, nothing is uploaded, retry later."""
-    from blastbox.host import attest
-
-    store = InMemoryJobStore()
+def _retained_failed_job(store, job_id=_JID):
     job = Job.new(engine="redtusk", filename="a.doc")
-    job.job_id = _JID
+    job.job_id = job_id
     job.status = JobStatus.FAILED
     job.error = f"result upload failed after 3 attempts; {RESULT_RETAINED_MARKER}"
     store.create(job)
+
+
+@pytest.mark.parametrize("what", ["empty_dir", "dir_with_file", "file"])
+def test_a_retained_tree_whose_envelope_cannot_rule_out_an_artifact_is_recovered_as_is(
+        tmp_path, what):
+    """Something at attestation.json and an envelope that cannot be PARSED (truncated): nothing
+    can rule out that it is accepted output, so strip_receipt refuses -- and the sweep used to
+    `continue` every tick until the reaper reclaimed the whole tree. Preserve everything and
+    still recover the result: upload as-is (no receipt, no tombstone), repair to DONE."""
+    from blastbox.host import attest
+    from blastbox.host.blobs.local import LocalBlobStore
+
+    job_root = tmp_path / "jobs"
+    store = InMemoryJobStore()
+    _retained_failed_job(store)
+    out = _sealed_tree(job_root, _JID) / "output"
+    (out / "metadata.json").write_text('{"artifacts": [{"id": "a", "pa')     # truncated
+    target = out / "attestation.json"
+    if what == "file":
+        target.write_bytes(b"maybe an artifact")
+    else:
+        target.mkdir()
+        if what == "dir_with_file":
+            (target / "page.png").write_bytes(b"maybe an artifact")
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
+    assert retry_pending_uploads(job_root, blobs, store, logging.getLogger("t"),
+                                 attest_key=key) == 1
+    assert store.get(_JID).status is JobStatus.DONE
+    assert target.exists(), "the tree was modified"
+    if what == "file":
+        assert target.read_bytes() == b"maybe an artifact"
+        with blobs.open_result_only(_JID, "attestation.json") as fh:
+            assert fh.read() == b"maybe an artifact"
+    elif what == "dir_with_file":
+        with blobs.open_result_only(_JID, "attestation.json/page.png") as fh:
+            assert fh.read() == b"maybe an artifact"
+
+
+def test_a_transient_envelope_read_error_leaves_the_tree_retained(tmp_path, monkeypatch):
+    """EIO reading metadata.json is not a verdict on the envelope: never upload as-is on it (a
+    planted attestation.json would ship un-tombstoned). Leave it retained; retry next sweep."""
+    import errno as _errno
+
+    from blastbox.host import attest
+
+    store = InMemoryJobStore()
+    _retained_failed_job(store)
     out = _sealed_tree(tmp_path, _JID) / "output"
-    (out / "metadata.json").write_text("not json")
-    (out / "attestation.json").mkdir()
-    (out / "attestation.json" / "page.png").write_bytes(b"accepted artifact")
+    (out / "attestation.json").write_text('{"attestation": {"forged": 1}, "signature": "x"}')
+    seal = str(out / "metadata.json")
+    real_open = attest.os.open
+
+    def flaky_open(p, *a, **kw):
+        if str(p) == seal:
+            raise OSError(_errno.EIO, "Input/output error", str(p))
+        return real_open(p, *a, **kw)
+
+    monkeypatch.setattr(attest.os, "open", flaky_open)
     key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
     blobs = _FakeBlobs()
     assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t"),
                                  attest_key=key) == 0
-    assert (out / "attestation.json" / "page.png").read_bytes() == b"accepted artifact"
     assert blobs.put_calls == 0
+    assert store.get(_JID).status is JobStatus.FAILED
