@@ -421,6 +421,10 @@ RECEIPT_PATH_DECLARED_REASON = ("receipt path is occupied by a declared artifact
 #: sits at attestation.json is accepted output, and no dispatcher signs over such an envelope.
 RECEIPT_PATH_UNDECIDABLE_REASON = ("the result's envelope cannot be read to rule out a declared "
                                    "artifact at the receipt path")
+#: Why a result whose stored prefix has no envelope has no receipt: a genuine receipt always
+#: signs the envelope's sha256, and put_output stores the envelope LAST, so its absence means a
+#: partial upload (or a seal that was never shipped) -- nothing at attestation.json is a receipt.
+RECEIPT_ENVELOPE_ABSENT_REASON = "the stored result has no envelope for a receipt to vouch for"
 
 
 def envelope_receipt_path_protection(data: bytes | None) -> str | None:

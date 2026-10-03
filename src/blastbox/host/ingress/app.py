@@ -1071,19 +1071,23 @@ def build_app(
         # (or under) attestation.json, and one whose envelope cannot be parsed cannot rule that
         # out; the retention sweeps recover both as-is. Those bytes may be analysis output: never
         # serve them as a receipt (nor read them as a tombstone). No dispatcher signs over either.
+        # Nor over NO envelope: a genuine receipt always signs metadata_sha256, and put_output
+        # stores metadata.json LAST -- so a prefix without it is a partial upload (possibly of an
+        # as-is tree whose declared artifact at attestation.json already landed) or a seal
+        # put_output would not ship. Absent envelope = no receipt, never "nothing declared".
         try:
             with opener(job_id, "metadata.json") as mfh:
-                envelope: bytes | None = mfh.read(_attest.ENVELOPE_MAX_BYTES + 1)
+                envelope = mfh.read(_attest.ENVELOPE_MAX_BYTES + 1)
         except Exception as exc:
             if not _is_missing_blob(exc):
                 _log.warning("attestation: envelope read failed for job=%s: %s", job_id, exc)
                 raise HTTPException(503, "could not read the execution receipt")
-            envelope = None                 # absent: no envelope declares anything
-        if envelope is not None:
-            why_not = _attest.envelope_receipt_path_protection(
-                None if len(envelope) > _attest.ENVELOPE_MAX_BYTES else envelope)
-            if why_not is not None:
-                raise HTTPException(404, f"no execution receipt for this job: {why_not}")
+            raise HTTPException(404, "no execution receipt for this job: "
+                                     f"{_attest.RECEIPT_ENVELOPE_ABSENT_REASON}")
+        why_not = _attest.envelope_receipt_path_protection(
+            None if len(envelope) > _attest.ENVELOPE_MAX_BYTES else envelope)
+        if why_not is not None:
+            raise HTTPException(404, f"no execution receipt for this job: {why_not}")
         try:
             fh = opener(job_id, _attest.RECEIPT_NAME)
         except Exception as exc:

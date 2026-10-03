@@ -376,3 +376,67 @@ def test_the_dispatchers_own_load_stays_loud(tmp_path, key, monkeypatch, caplog)
     monkeypatch.setattr(attest.os, "geteuid", lambda: owner + 1)
     assert attest.load_attest_key({"BLASTBOX_ATTEST_KEY": str(path)}) is None
     assert "DISABLED" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# No stored envelope => no receipt (round-2 review F1)
+# ---------------------------------------------------------------------------
+
+_LOOKS_SIGNED = b'{"attestation": {"status": "done", "job_id": "x"}, "signature": "AAAA"}'
+
+
+def test_a_result_with_no_stored_envelope_serves_no_receipt(tmp_path):
+    """put_output uploads metadata.json LAST, so a result prefix without it is a partial upload
+    (or a seal put_output refused to ship). A genuine receipt always signs metadata_sha256, so
+    with no envelope there is nothing it could vouch for -- and nothing rules out that the bytes
+    at attestation.json are a DECLARED artifact of a pre-reservation tree. Never serve them."""
+    client, store = _make_client(tmp_path)
+    job = Job.new(engine="clippyshot", filename="a.docx")
+    job.status = JobStatus.DONE
+    store.create(job)
+    out = tmp_path / "work" / job.job_id / "output"
+    out.mkdir(parents=True)
+    (out / attest.RECEIPT_NAME).write_bytes(_LOOKS_SIGNED)
+    _push_to_blob(tmp_path, job.job_id, out)               # no metadata.json in the tree
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert r.json()["detail"].startswith("no execution receipt for this job: ")
+
+
+def test_a_partial_legacy_upload_never_serves_a_declared_artifact_as_the_receipt(
+        tmp_path, monkeypatch):
+    """The reviewer's repro: a legacy tree DECLARES an artifact at attestation.json, so the
+    migration uploads it as-is; a blip on a later artifact aborts the upload before the seal
+    lands. The results prefix then holds the declared artifact and no envelope to say so."""
+    import logging
+
+    from blastbox.host.jobs.retention import migrate_legacy_results
+
+    client, store = _make_client(tmp_path)
+    job_root = tmp_path / "jobs"
+    job = Job.new(engine="clippyshot", filename="a.docx")
+    job.status = JobStatus.DONE
+    store.create(job)
+    out = job_root / job.job_id / "output"
+    out.mkdir(parents=True)
+    (out / attest.RECEIPT_NAME).write_bytes(_LOOKS_SIGNED)
+    (out / "page.png").write_bytes(b"png")
+    (out / "metadata.json").write_text(json.dumps({"artifacts": [
+        {"id": "a", "path": attest.RECEIPT_NAME,
+         "sha256": hashlib.sha256(_LOOKS_SIGNED).hexdigest()},
+        {"id": "b", "path": "page.png"}]}))
+    real = LocalBlobStore._atomic_copy
+
+    def flaky(src, dst):
+        if src.name == "page.png":
+            raise OSError(5, "EIO: object store blip")
+        return real(src, dst)
+
+    monkeypatch.setattr(LocalBlobStore, "_atomic_copy", staticmethod(flaky))
+    blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
+    assert migrate_legacy_results(job_root, blobs, store, logging.getLogger("t")) == (0, 0, 1)
+    with blobs.open_result_only(job.job_id, attest.RECEIPT_NAME) as fh:
+        assert fh.read() == _LOOKS_SIGNED                  # the declared artifact did land
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert r.json()["detail"].startswith("no execution receipt for this job: ")
