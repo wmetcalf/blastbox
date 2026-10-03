@@ -308,8 +308,10 @@ class RunObservation:
 
 
 def sha256_file(path: Path) -> str:
-    """sha256 of a regular file's bytes, opened without following a final symlink."""
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    """sha256 of a regular file's bytes, opened without following a final symlink.
+    O_NONBLOCK so a FIFO planted in its place is opened (then refused by fstat) rather than
+    blocking the caller forever; it changes nothing for a regular file."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ValueError(f"{path} is not a regular file")
@@ -354,15 +356,76 @@ def build_receipt(obs: RunObservation, *, key_id: str, metadata_sha256: str,
     return doc
 
 
+def is_reserved_path(path: str) -> bool:
+    """Whether an envelope artifact path is, or lies under, the reserved receipt name. The whole
+    name is the dispatcher's: an artifact at ``attestation.json/x`` lives in a directory that the
+    receipt (or tombstone) write has to replace."""
+    p = posixpath.normpath(path.strip())
+    return p == RECEIPT_NAME or p.startswith(RECEIPT_NAME + "/")
+
+
+#: metadata.json is capped at 4 MiB by default (Limits.max_metadata_bytes); this is only the
+#: ceiling past which the envelope is "cannot rule it out", never a trust verdict.
+_ENVELOPE_MAX_BYTES = 64 << 20
+
+
+class ReceiptPathOccupied(OSError):
+    """``attestation.json`` is a directory the envelope declares artifacts under (or the envelope
+    cannot be read to rule that out). Replacing it would delete accepted artifacts, so nothing is
+    written there: no receipt and no tombstone. An OSError so the sweeps' existing "leave it
+    retained" OSError path handles it."""
+
+
+def _envelope_artifact_paths(seal: Path) -> list[str] | None:
+    """The artifact paths ``metadata.json`` declares, or None when it cannot be read as a regular
+    file within the cap or parsed. Opened O_NOFOLLOW|O_NONBLOCK and judged on the open descriptor
+    (a FIFO must not block the dispatcher). FileNotFoundError propagates: the caller decides what
+    an absent envelope means."""
+    fd = os.open(seal, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        data = _read_capped(fd, _ENVELOPE_MAX_BYTES)
+    finally:
+        os.close(fd)
+    if data is None:
+        return None
+    try:
+        env = json.loads(data)
+        return [str(a.get("path", "")) for a in env.get("artifacts") or []]
+    except Exception:  # noqa: BLE001 - unparseable: cannot rule anything out
+        return None
+
+
+def _may_hold_declared_artifacts(out_dir: Path) -> bool:
+    """Whether the envelope declares (or might declare) an artifact under attestation.json/."""
+    try:
+        paths = _envelope_artifact_paths(out_dir / _SEAL_NAME)
+    except FileNotFoundError:
+        return False                    # no envelope: nothing in the tree was ever accepted
+    except OSError:
+        return True                     # a symlink (ELOOP) or an I/O error: cannot rule it out
+    return paths is None or any(is_reserved_path(p) for p in paths)
+
+
 def strip_receipt(out_dir: Path) -> None:
     """Remove whatever sits at ``<out_dir>/attestation.json`` (file, directory or symlink)
-    without following a symlink. A worker can write into its output tree."""
-    target = Path(out_dir) / RECEIPT_NAME
+    without following a symlink. A worker can write into its output tree.
+
+    Raises ReceiptPathOccupied, deleting nothing, when it is a DIRECTORY the envelope declares
+    artifacts under (possible only in a tree accepted before the trust gate reserved the whole
+    name): never destroy accepted output to make room for a receipt."""
+    out_dir = Path(out_dir)
+    target = out_dir / RECEIPT_NAME
     try:
         st = os.lstat(target)
     except FileNotFoundError:
         return
     if stat.S_ISDIR(st.st_mode):
+        if _may_hold_declared_artifacts(out_dir):
+            raise ReceiptPathOccupied(
+                errno.EEXIST, f"{RECEIPT_NAME} is a directory holding declared artifacts (or the "
+                              f"envelope cannot rule that out); refusing to replace it")
         shutil.rmtree(target)
     else:
         os.unlink(target)
@@ -402,11 +465,10 @@ def is_tombstone(data: bytes) -> bool:
 
 def _declares_receipt_name(seal: Path) -> bool:
     try:
-        env = json.loads(seal.read_bytes())
-        paths = [str(a.get("path", "")) for a in env.get("artifacts") or []]
-    except Exception:  # noqa: BLE001 - unparseable: cannot rule it out
+        paths = _envelope_artifact_paths(seal)
+    except OSError:                     # unreadable: cannot rule it out
         return True
-    return any(posixpath.normpath(p.strip()) == RECEIPT_NAME for p in paths)
+    return paths is None or any(is_reserved_path(p) for p in paths)
 
 
 def seal_receipt(out_dir: Path, *, key: AttestKey | None,
@@ -414,7 +476,10 @@ def seal_receipt(out_dir: Path, *, key: AttestKey | None,
     """Replace whatever sits at ``attestation.json`` with this dispatcher's signed receipt, or,
     when it does not sign, a tombstone saying why. Returns the SIGNED body, or None when a
     tombstone was written. Call it IMMEDIATELY before uploading ``out_dir``: the metadata hash is
-    of the bytes on disk at this moment, which are the bytes put_output ships."""
+    of the bytes on disk at this moment, which are the bytes put_output ships.
+
+    Raises ReceiptPathOccupied, writing nothing, when attestation.json is a directory holding
+    declared artifacts: no receipt rather than a wrong one, and never at the artifacts' expense."""
     out_dir = Path(out_dir)
     if key is None:
         write_tombstone(out_dir, "no attestation key")
@@ -491,7 +556,10 @@ def tree_receipt_is_ours(out_dir: Path, *, key: AttestKey | None, job_id: str) -
         return False
     out_dir = Path(out_dir)
     try:
-        fd = os.open(out_dir / RECEIPT_NAME, os.O_RDONLY | os.O_NOFOLLOW)
+        # O_NONBLOCK: a worker-planted FIFO must not block the sweep in open(); fstat below
+        # refuses it (and anything else that is not a regular file) on the open descriptor, and
+        # the read is capped -- as read_snapshots_readonly does for the node-share dir.
+        fd = os.open(out_dir / RECEIPT_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         return False
     except OSError as exc:

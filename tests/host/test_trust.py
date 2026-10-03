@@ -818,3 +818,19 @@ def test_declaring_the_receipt_name_as_an_artifact_is_refused(tmp_path, path):
     with pytest.raises(OutputTrustError, match="reserved"):
         validate_worker_output(output_dir=outdir, input_sha256=_INPUT_SHA, engine=_ENGINE,
                                limits=_limits())
+
+
+def test_an_artifact_nested_under_the_receipt_name_is_refused(tmp_path):
+    """A directory named attestation.json/ holding a declared artifact collides with the receipt
+    blob: the dispatcher must replace that path with its receipt or tombstone, which would delete
+    an ACCEPTED artifact. The whole name is reserved, so the nested declaration is refused at the
+    gate and never accepted in the first place."""
+    outdir, _ = _make_output_dir(tmp_path)
+    (outdir / "attestation.json").mkdir()
+    (outdir / "attestation.json" / "page.png").write_bytes(b"PNG_DATA_HERE")
+    meta = json.loads((outdir / "metadata.json").read_bytes())
+    meta["artifacts"][0]["path"] = "attestation.json/page.png"
+    (outdir / "metadata.json").write_bytes(json.dumps(meta).encode())
+    with pytest.raises(OutputTrustError, match="reserved"):
+        validate_worker_output(output_dir=outdir, input_sha256=_INPUT_SHA, engine=_ENGINE,
+                               limits=_limits())

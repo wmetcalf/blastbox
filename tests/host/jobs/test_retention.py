@@ -1715,3 +1715,28 @@ def test_a_transient_receipt_read_error_leaves_the_tree_retained_and_intact(tmp_
     assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t"),
                                  attest_key=key) == 1
     assert (out / "attestation.json").read_bytes() == genuine
+
+
+def test_a_retained_tree_with_an_artifact_under_the_receipt_name_is_left_intact(tmp_path):
+    """A tree retained by pre-fix code could hold an ACCEPTED artifact under attestation.json/.
+    The sweep used to tombstone it by rmtree-ing that directory and then upload the tree minus the
+    artifact. It must leave the tree retained and intact instead."""
+    from blastbox.host import attest
+
+    store = InMemoryJobStore()
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.job_id = _JID
+    job.status = JobStatus.FAILED
+    job.error = f"result upload failed after 3 attempts; {RESULT_RETAINED_MARKER}"
+    store.create(job)
+    out = _sealed_tree(tmp_path, _JID) / "output"
+    (out / "metadata.json").write_text(
+        '{"artifacts": [{"id": "p", "path": "attestation.json/page.png"}]}')
+    (out / "attestation.json").mkdir()
+    (out / "attestation.json" / "page.png").write_bytes(b"accepted artifact")
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    blobs = _FakeBlobs()
+    assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t"),
+                                 attest_key=key) == 0
+    assert (out / "attestation.json" / "page.png").read_bytes() == b"accepted artifact"
+    assert blobs.put_calls == 0, "uploaded a tree whose receipt could not be sanitised"

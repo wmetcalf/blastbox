@@ -320,6 +320,51 @@ def test_no_receipt_when_the_envelope_declares_the_reserved_name(tmp_path):
     assert "reserved" in _tombstone(out)["reason"]
 
 
+def _nested_artifact_tree(tmp_path, meta: bytes | None = None):
+    """A tree (e.g. one retained by pre-fix code) whose envelope declares an artifact INSIDE a
+    directory named attestation.json/."""
+    out = _tree(tmp_path, meta if meta is not None else json.dumps({"artifacts": [
+        {"id": "p", "path": "attestation.json/page.png"}]}).encode())
+    (out / attest.RECEIPT_NAME).mkdir()
+    (out / attest.RECEIPT_NAME / "page.png").write_bytes(b"accepted artifact")
+    return out
+
+
+def _attempt(fn):
+    try:
+        fn()
+    except Exception as exc:  # noqa: BLE001
+        return exc
+    return None
+
+
+@pytest.mark.parametrize("op", ["seal_keyed", "seal_keyless", "tombstone", "strip"])
+def test_receipt_writes_never_delete_a_declared_artifact_under_the_receipt_name(tmp_path, op):
+    """Receipt AND tombstone writes replace whatever sits at attestation.json -- which, for a
+    directory, was an rmtree, taking declared artifacts with it. Fail closed instead: refuse
+    (no receipt, no tombstone) and leave the artifact alone."""
+    out = _nested_artifact_tree(tmp_path)
+    key = attest.load_or_create_key(tmp_path / "k")
+    fn = {
+        "seal_keyed": lambda: attest.seal_receipt(out, key=key, observation=_obs()),
+        "seal_keyless": lambda: attest.seal_receipt(out, key=None, observation=_obs()),
+        "tombstone": lambda: attest.write_tombstone(out, "retained result re-uploaded"),
+        "strip": lambda: attest.strip_receipt(out),
+    }[op]
+    exc = _attempt(fn)
+    assert (out / attest.RECEIPT_NAME / "page.png").read_bytes() == b"accepted artifact"
+    assert isinstance(exc, attest.ReceiptPathOccupied)
+    assert isinstance(exc, OSError)        # the sweeps' "leave it retained" path handles it
+
+
+def test_an_unreadable_envelope_never_licenses_deleting_a_receipt_directory(tmp_path):
+    """If the envelope cannot be parsed we cannot rule out a declared artifact in there."""
+    out = _nested_artifact_tree(tmp_path, b"not json")
+    exc = _attempt(lambda: attest.write_tombstone(out, "x"))
+    assert (out / attest.RECEIPT_NAME / "page.png").read_bytes() == b"accepted artifact"
+    assert isinstance(exc, attest.ReceiptPathOccupied)
+
+
 def test_no_observation_writes_a_tombstone(tmp_path):
     out = _tree(tmp_path)
     key = attest.load_or_create_key(tmp_path / "k")
@@ -422,6 +467,54 @@ def test_definite_non_receipts_are_false_not_errors(tmp_path, kind):
     elif kind == "garbage":
         target.write_text("not json")
     assert attest.tree_receipt_is_ours(out, key=key, job_id=jid) is False
+
+
+def _without_blocking(fn, fifo, timeout=3.0):
+    """Run fn in a thread; if it is still stuck after ``timeout`` (blocked opening a FIFO), free
+    it by opening the write end so the test cannot hang the suite, and report it stuck."""
+    result: dict = {}
+
+    def run():
+        try:
+            result["value"] = fn()
+        except BaseException as exc:  # noqa: BLE001
+            result["exc"] = exc
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout)
+    stuck = t.is_alive()
+    if stuck:
+        wfd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)   # a reader is waiting, so this opens
+        os.close(wfd)
+        t.join(timeout)
+    return stuck, result
+
+
+def test_a_fifo_receipt_does_not_block_verification(tmp_path):
+    """The retry/sweep path verifies a retained tree's receipt. A worker-planted FIFO at
+    attestation.json blocked os.open forever (no O_NONBLOCK), wedging the sweep. It is not a
+    regular file, so it is definitely not ours: False, promptly."""
+    out, key, jid = _valid_tree(tmp_path)
+    target = out / attest.RECEIPT_NAME
+    target.unlink()
+    os.mkfifo(target)
+    stuck, result = _without_blocking(
+        lambda: attest.tree_receipt_is_ours(out, key=key, job_id=jid), target)
+    assert not stuck, "tree_receipt_is_ours blocked opening a FIFO receipt"
+    assert result == {"value": False}
+
+
+def test_a_fifo_metadata_does_not_block_verification(tmp_path):
+    """Same for the metadata.json the receipt vouches for: a FIFO there is a verdict, not a hang."""
+    out, key, jid = _valid_tree(tmp_path)
+    meta = out / "metadata.json"
+    meta.unlink()
+    os.mkfifo(meta)
+    stuck, result = _without_blocking(
+        lambda: attest.tree_receipt_is_ours(out, key=key, job_id=jid), meta)
+    assert not stuck, "tree_receipt_is_ours blocked opening a FIFO metadata.json"
+    assert result == {"value": False}
 
 
 def test_downgrade_and_inspect_flags_are_present_only_when_true():
