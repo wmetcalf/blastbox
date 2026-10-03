@@ -2134,3 +2134,79 @@ def test_one_poison_tree_never_aborts_the_legacy_migration(tmp_path, monkeypatch
     blobs = _FakeBlobs()
     assert migrate_legacy_results(tmp_path, blobs, store, logging.getLogger("t")) == (1, 0, 1)
     assert blobs.has_output(_GOOD) and not blobs.has_output(_POISON)
+
+
+# ---------------------------------------------------------------------------
+# No withheld marker, no as-is upload (round-4 review H1)
+# ---------------------------------------------------------------------------
+
+
+def _refuse_marker(monkeypatch):
+    import errno as _errno
+
+    from blastbox.host import attest
+
+    def boom(*a, **kw):
+        raise OSError(_errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(attest, "write_withheld_marker", boom)
+
+
+def test_the_sweep_never_ships_as_is_without_the_withheld_marker(tmp_path, monkeypatch):
+    from blastbox.host import attest
+
+    store = InMemoryJobStore()
+    _retained_failed_job(store)
+    out = _sealed_tree(tmp_path, _JID) / "output"
+    (out / "metadata.json").write_text('{"artifacts": [{"id": "a", "pa')     # undecidable
+    (out / "attestation.json").write_bytes(_FORGED)
+    _refuse_marker(monkeypatch)
+    blobs = _FakeBlobs()
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t"),
+                                 attest_key=key) == 0
+    assert blobs.put_calls == 0
+    assert store.get(_JID).status is JobStatus.FAILED
+    assert (out / "attestation.json").read_bytes() == _FORGED
+
+
+def test_the_migration_never_ships_as_is_without_the_withheld_marker(tmp_path, monkeypatch):
+    store = InMemoryJobStore()
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.job_id = _JID
+    job.status = JobStatus.DONE
+    store.create(job)
+    out = _sealed_tree(tmp_path, _JID, pending=False) / "output"
+    (out / "metadata.json").write_text('{"artifacts": [{"id": "a", "pa')
+    (out / "attestation.json").write_bytes(_FORGED)
+    _refuse_marker(monkeypatch)
+    blobs = _FakeBlobs()
+    assert migrate_legacy_results(tmp_path, blobs, store, logging.getLogger("t")) == (0, 0, 1)
+    assert blobs.put_calls == 0
+
+
+def test_the_sweep_strips_a_planted_withheld_marker_beside_its_own_receipt(tmp_path):
+    """A retained tree whose receipt THIS host signed ships with it; a planted marker would
+    withhold that genuine receipt at the route, so it is removed before the upload."""
+    from blastbox.host import attest
+    from blastbox.host.blobs.base import BlobFetchError
+    from blastbox.host.blobs.local import LocalBlobStore
+
+    job_root = tmp_path / "jobs"
+    store = InMemoryJobStore()
+    _retained_failed_job(store)
+    out = _sealed_tree(job_root, _JID) / "output"
+    (out / "metadata.json").write_text(json.dumps({"artifacts": []}))
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    obs = attest.RunObservation(job_id=_JID, engine="redtusk", input_sha256="d" * 64,
+                                worker_runtime="runsc", worker_tier=None, started_at_ms=1,
+                                finished_at_ms=2)
+    body = attest.seal_receipt(out, key=key, observation=obs)
+    (out / attest.WITHHELD_NAME).write_bytes(attest.canonical(attest.tombstone_body("planted")))
+    blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
+    assert retry_pending_uploads(job_root, blobs, store, logging.getLogger("t"),
+                                 attest_key=key) == 1
+    with pytest.raises(BlobFetchError):
+        blobs.open_result_only(_JID, attest.WITHHELD_NAME)
+    with blobs.open_result_only(_JID, attest.RECEIPT_NAME) as fh:
+        assert json.loads(fh.read()) == body

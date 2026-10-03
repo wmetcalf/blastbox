@@ -767,3 +767,107 @@ def test_a_transient_envelope_error_in_strip_is_unreadable_not_occupied(tmp_path
     assert not isinstance(exc, attest.ReceiptPathOccupied)
     assert exc.errno == errno.EIO
     assert (out / attest.RECEIPT_NAME).read_bytes() == b"planted"
+
+
+# ---------------------------------------------------------------------------
+# The withheld marker (round-4 review H1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("path", [
+    "attestation.withheld.json", "./attestation.withheld.json", "attestation.withheld.json/x",
+    "/attestation.withheld.json",
+])
+def test_the_withheld_marker_name_is_reserved(path):
+    assert attest.is_reserved_path(path)
+    assert not attest.is_reserved_path(path, (attest.RECEIPT_NAME,))
+
+
+@pytest.mark.parametrize("kind", ["file", "dir"])
+def test_a_fresh_seal_strips_a_planted_withheld_marker(tmp_path, kind):
+    """A worker can write anything into its output tree. A planted marker could only cause a
+    404 (fail-closed), but it would withhold the genuine receipt this seal writes: the
+    gate-verified strip removes it with the planted receipt."""
+    out = tmp_path / "output"
+    out.mkdir()
+    (out / "metadata.json").write_text(json.dumps({"artifacts": []}))
+    marker = out / attest.WITHHELD_NAME
+    if kind == "file":
+        marker.write_bytes(attest.canonical(attest.tombstone_body("planted")))
+    else:
+        (marker / "deep").mkdir(parents=True)
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    assert attest.seal_fresh_receipt(out, key=key, observation=_obs(), job_id=_obs().job_id)
+    assert not os.path.lexists(marker)
+    assert not attest.is_tombstone((out / attest.RECEIPT_NAME).read_bytes())
+
+
+def test_strip_receipt_removes_an_undeclared_withheld_marker(tmp_path):
+    out = tmp_path / "output"
+    out.mkdir()
+    (out / "metadata.json").write_text(json.dumps({"artifacts": []}))
+    (out / attest.WITHHELD_NAME).write_bytes(b"planted")
+    attest.strip_receipt(out)
+    assert not (out / attest.WITHHELD_NAME).exists()
+
+
+def _withheld_tree(tmp_path, envelope: str):
+    out = tmp_path / "output"
+    out.mkdir()
+    (out / "metadata.json").write_text(envelope)
+    (out / attest.RECEIPT_NAME).write_bytes(b"maybe an artifact")
+    return out
+
+
+_GARBAGE = '{"artifacts": [{"id": "a", "pa'
+
+
+def test_write_withheld_marker_writes_the_tombstone_shape_and_touches_no_receipt(tmp_path):
+    out = _withheld_tree(tmp_path, _GARBAGE)
+    attest.write_withheld_marker(out, "why")
+    assert json.loads((out / attest.WITHHELD_NAME).read_bytes()) == attest.tombstone_body("why")
+    assert (out / attest.RECEIPT_NAME).read_bytes() == b"maybe an artifact"
+    assert sorted(p.name for p in out.iterdir()) == sorted(
+        ["metadata.json", attest.RECEIPT_NAME, attest.WITHHELD_NAME])      # no tmp left
+
+
+@pytest.mark.parametrize("kind", ["file", "dir", "symlink"])
+def test_write_withheld_marker_replaces_undeclared_junk(tmp_path, kind):
+    """The envelope parses and declares nothing at the marker name: whatever is there is the
+    worker's, so the marker replaces it."""
+    out = _withheld_tree(tmp_path, json.dumps({"artifacts": [{"id": "a", "path": attest.RECEIPT_NAME}]}))
+    marker = out / attest.WITHHELD_NAME
+    if kind == "file":
+        marker.write_bytes(b"junk")
+    elif kind == "dir":
+        (marker / "x").mkdir(parents=True)
+    else:
+        marker.symlink_to(tmp_path / "elsewhere")
+    attest.write_withheld_marker(out, "declared")
+    assert not marker.is_symlink()
+    assert json.loads(marker.read_bytes()) == attest.tombstone_body("declared")
+
+
+@pytest.mark.parametrize("envelope", [
+    _GARBAGE, json.dumps({"artifacts": [{"id": "a", "path": "attestation.withheld.json"}]})])
+def test_write_withheld_marker_never_destroys_a_possibly_declared_regular_file(
+        tmp_path, envelope):
+    """An old tree may DECLARE an artifact at the marker's name (or its envelope cannot rule it
+    out). Never destroyed: a regular file there ships at the marker's key, and its presence
+    alone makes the route withhold -- the fail-closed outcome."""
+    out = _withheld_tree(tmp_path, envelope)
+    (out / attest.WITHHELD_NAME).write_bytes(b"an accepted artifact")
+    attest.write_withheld_marker(out, "why")
+    assert (out / attest.WITHHELD_NAME).read_bytes() == b"an accepted artifact"
+
+
+def test_write_withheld_marker_refuses_a_possibly_declared_directory(tmp_path):
+    """A directory at the marker's name would not be stored AT that key, so it cannot stand in
+    for the marker -- and it may be accepted output, so it is not destroyed either: refuse, so
+    the caller never ships the tree as-is without a marker."""
+    out = _withheld_tree(tmp_path, _GARBAGE)
+    (out / attest.WITHHELD_NAME / "page.png").parent.mkdir()
+    (out / attest.WITHHELD_NAME / "page.png").write_bytes(b"x")
+    with pytest.raises(attest.ReceiptPathOccupied):
+        attest.write_withheld_marker(out, "why")
+    assert (out / attest.WITHHELD_NAME / "page.png").read_bytes() == b"x"

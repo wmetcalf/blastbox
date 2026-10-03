@@ -847,3 +847,20 @@ def test_a_name_that_only_looks_like_the_receipt_after_stripping_is_accepted(tmp
     (outdir / "metadata.json").write_bytes(json.dumps(meta).encode())
     validate_worker_output(output_dir=outdir, input_sha256=_INPUT_SHA, engine=_ENGINE,
                            limits=_limits())
+
+
+@pytest.mark.parametrize("path", ["attestation.withheld.json", "./attestation.withheld.json",
+                                  "attestation.withheld.json/page.png"])
+def test_declaring_the_withheld_marker_name_is_refused(tmp_path, path):
+    """attestation.withheld.json is the uploader's "no receipt" marker; its presence alone makes
+    the attestation route withhold. A fresh worker must not be able to declare it any more than
+    it can declare attestation.json."""
+    outdir, _ = _make_output_dir(tmp_path)
+    (outdir / "attestation.withheld.json").mkdir()
+    (outdir / "attestation.withheld.json" / "page.png").write_bytes(b"PNG_DATA_HERE")
+    meta = json.loads((outdir / "metadata.json").read_bytes())
+    meta["artifacts"][0]["path"] = path
+    (outdir / "metadata.json").write_bytes(json.dumps(meta).encode())
+    with pytest.raises(OutputTrustError, match="reserved path 'attestation.withheld.json'"):
+        validate_worker_output(output_dir=outdir, input_sha256=_INPUT_SHA, engine=_ENGINE,
+                               limits=_limits())

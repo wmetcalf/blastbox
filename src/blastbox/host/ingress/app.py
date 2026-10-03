@@ -1067,6 +1067,27 @@ def build_app(
         # on-disk tree, which no dispatcher ever sanitised -- an attestation.json there is whatever
         # the worker wrote -- so a store offering a no-fallback read is always read through it.
         opener = getattr(_blob_store, "open_result_only", None) or _blob_store.open_output
+        # FIRST, the uploader's durable verdict. A tree the retention sweeps shipped AS-IS (its
+        # envelope declared, or -- under THAT process's ceiling -- could not rule out, an
+        # artifact at attestation.json) carries the withheld marker. Its presence alone decides:
+        # re-deriving the verdict here under this app's own ceiling is how a larger ingress
+        # limit parsed an envelope the uploader could not, saw nothing declared, and served a
+        # planted attestation.json 200. A marker that cannot be checked is no verdict: 503.
+        try:
+            with opener(job_id, _attest.WITHHELD_NAME) as wfh:
+                withheld: bytes | None = wfh.read(4096)
+        except Exception as exc:
+            if not _is_missing_blob(exc):
+                _log.warning("attestation: withheld-marker read failed for job=%s: %s",
+                             job_id, exc)
+                raise HTTPException(503, "could not read the execution receipt")
+            withheld = None
+        if withheld is not None:
+            why = _attest.RECEIPT_WITHHELD_REASON
+            if _attest.is_tombstone(withheld):
+                with contextlib.suppress(Exception):
+                    why = str(json.loads(withheld).get("reason") or why)[:200]
+            raise HTTPException(404, f"no execution receipt for this job: {why}")
         # A result accepted before the trust gate reserved the name can DECLARE an artifact at
         # (or under) attestation.json, and one whose envelope cannot be parsed cannot rule that
         # out; the retention sweeps recover both as-is. Those bytes may be analysis output: never

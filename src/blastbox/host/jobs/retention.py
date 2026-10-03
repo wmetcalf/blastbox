@@ -529,16 +529,23 @@ def _retry_pending_one(
         # name) or cannot be parsed to rule that out. Whatever is there may be accepted
         # output: a tombstone would destroy it, and refusing strands the job FAILED until the
         # reaper reclaims the whole tree. Upload it AS-IS -- no receipt, no tombstone, nothing
-        # deleted; the attestation route applies the same envelope test and never presents
-        # it as a receipt. A transient envelope read error is no verdict: it raises below.
+        # deleted -- WITH the withheld marker: this verdict is THIS process's, under ITS
+        # envelope ceiling, and the attestation route must never re-derive it under another
+        # (an ingress with a larger limit would parse the envelope, see nothing declared and
+        # serve a planted attestation.json). No marker, no as-is upload: it stays retained.
+        # A transient envelope read error is no verdict: it raises below.
         try:
             from blastbox.host import attest as _attest
 
             as_is = _attest.tree_receipt_path_protection(out_dir)
             if as_is is not None:
+                _attest.write_withheld_marker(out_dir, as_is)
                 log.warning("pending-upload sweep: %s: %s; uploading it as-is, with no "
                             "receipt", d.name, as_is)
-            elif not _attest.tree_receipt_is_ours(out_dir, key=attest_key, job_id=d.name):
+            elif _attest.tree_receipt_is_ours(out_dir, key=attest_key, job_id=d.name):
+                # Ours ships; a planted withheld marker must not hide it.
+                _attest.strip_withheld_marker(out_dir)
+            else:
                 _attest.write_tombstone(out_dir, "retained result re-uploaded without a "
                                                  "receipt from this host")
         except OSError as exc:
@@ -682,10 +689,11 @@ def migrate_legacy_results(
     (migrated, skipped, failed).
 
     ``limits``: the SERVICE's limits (``--max-metadata``), else BLASTBOX_MAX_METADATA when this
-    process has it. The receipt-path decision must use the same envelope ceiling as the
-    attestation route: an envelope this run cannot parse whole is uploaded as-is, and a route
-    with a larger ceiling would parse it, see nothing declared, and serve the worker's
-    attestation.json as the receipt. So with NEITHER known, an envelope past the fixed floor
+    process has it. An envelope this run cannot parse whole is uploaded as-is with the withheld
+    marker, which the attestation route honours before anything else -- so a ceiling mismatch
+    can no longer make the route serve the worker's attestation.json as a receipt; it can only
+    ship a tree as-is (planted file and all, withheld) that the service's limit would have
+    stripped. To avoid that, with NEITHER limit known an envelope past the fixed floor
     (ENVELOPE_MAX_BYTES, which every ceiling is at least) is refused -- left in place, counted
     failed -- rather than judged against a limit the service may not share.
     """
@@ -760,7 +768,8 @@ def _migrate_legacy_one(
     # is whatever the worker wrote; these results carry no execution receipt by construction.
     # Unless the envelope DECLARES an artifact there (a tree accepted before the name was
     # reserved) or cannot be parsed to rule that out: then it may be accepted output, uploaded
-    # as-is; the attestation route applies the same test and never serves it as a receipt.
+    # as-is WITH the withheld marker, so the route never re-derives this run's verdict under
+    # its own ceiling. No marker, no upload.
     try:
         from blastbox.host import attest as _attest
 
@@ -773,8 +782,13 @@ def _migrate_legacy_one(
                         "the service's BLASTBOX_MAX_METADATA. Leaving it in place", d.name,
                         _attest.ENVELOPE_MAX_BYTES)
             return "failed"
-        if _attest.tree_receipt_path_protection(out_dir, limits=limits) is None:
+        as_is = _attest.tree_receipt_path_protection(out_dir, limits=limits)
+        if as_is is None:
             _attest.strip_receipt(out_dir, limits=limits)
+        else:
+            _attest.write_withheld_marker(out_dir, as_is, limits=limits)
+            log.warning("legacy migration: %s: %s; uploading it as-is, with no receipt",
+                        d.name, as_is)
     except OSError as exc:
         log.warning("legacy migration: %s: could not remove a worker-written receipt (%s); "
                     "leaving it in place", d.name, exc)

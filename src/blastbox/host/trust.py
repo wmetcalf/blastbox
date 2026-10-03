@@ -116,12 +116,15 @@ def validate_worker_output(
     # ------------------------------------------------------------------
     # The WHOLE name is reserved, nested paths included: an artifact at attestation.json/x lives
     # in a directory the receipt write would have to replace, deleting an accepted artifact.
-    from blastbox.host.attest import RECEIPT_NAME, is_reserved_path
+    # attestation.withheld.json is the uploader's "no receipt" marker (its presence alone makes
+    # the attestation route withhold), reserved the same way.
+    from blastbox.host.attest import RESERVED_NAMES, is_reserved_path
 
     for a in parsed.artifacts:
-        if is_reserved_path(str(a.path)):
-            raise OutputTrustError(
-                f"artifact {a.id!r} declares the reserved path {RECEIPT_NAME!r}")
+        for name in RESERVED_NAMES:
+            if is_reserved_path(str(a.path), (name,)):
+                raise OutputTrustError(
+                    f"artifact {a.id!r} declares the reserved path {name!r}")
 
     # ------------------------------------------------------------------
     # Step 4: re-seal from disk (do NOT trust worker-reported sha256/bytes)

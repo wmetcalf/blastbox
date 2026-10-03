@@ -639,3 +639,189 @@ def test_migrate_results_cli_threads_max_metadata(tmp_path, monkeypatch):
     args = parser.parse_args(["migrate-results", "--job-root", str(tmp_path)])
     assert args.func(args) == 0
     assert seen["limits"] is None
+
+
+# ---------------------------------------------------------------------------
+# The uploader's as-is verdict is DURABLE: the route never re-derives it (round-4 review H1)
+# ---------------------------------------------------------------------------
+
+
+def _retained_tree_with_big_envelope(tmp_path, store):
+    """A FAILED, retained tree (pending-upload sentinel, claim-less) whose envelope is past the
+    (scaled-down) floor and declares nothing, plus a worker-planted UNDECLARED attestation.json."""
+    from blastbox.host.jobs.retention import PENDING_UPLOAD_SENTINEL, RESULT_RETAINED_MARKER
+
+    job_root = tmp_path / "jobs"
+    job = Job.new(engine="clippyshot", filename="a.docx")
+    job.status = JobStatus.FAILED
+    job.error = f"result upload failed after 3 attempts; {RESULT_RETAINED_MARKER}"
+    store.create(job)
+    out = job_root / job.job_id / "output"
+    out.mkdir(parents=True)
+    (out / "metadata.json").write_text(json.dumps({"artifacts": [], "pad": "x" * 4096}))
+    (out / attest.RECEIPT_NAME).write_bytes(_FORGED_RECEIPT)
+    (job_root / job.job_id / PENDING_UPLOAD_SENTINEL).write_text("")
+    return job_root, job, out
+
+
+def test_a_sweep_with_a_smaller_limit_than_the_ingress_never_serves_a_forged_receipt(
+        tmp_path, monkeypatch):
+    """Codex's scenario. The pending-upload sweep runs with the default ceiling (no
+    BLASTBOX_MAX_METADATA), judges an envelope between its ceiling and the ingress's
+    "cannot rule out" and uploads the tree as-is with the worker's UNDECLARED attestation.json;
+    the ingress, configured larger, parsed the envelope, saw nothing declared and served the
+    forged bytes 200. The sweep's verdict must travel with the tree."""
+    import logging
+
+    from blastbox.host.jobs.retention import retry_pending_uploads
+
+    # The dispatcher's ceiling (scaled: the 64 MiB floor over the 4 MiB default limit) is BELOW
+    # the ingress's configured one (scaled: BLASTBOX_MAX_METADATA=80 MiB there).
+    monkeypatch.setenv("BLASTBOX_MAX_METADATA", "1024")
+    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 1024)
+    store = InMemoryJobStore()
+    job_root, job, out = _retained_tree_with_big_envelope(tmp_path, store)
+    blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    assert retry_pending_uploads(job_root, blobs, store, logging.getLogger("t"),
+                                 attest_key=key) == 1
+    assert store.get(job.job_id).status is JobStatus.DONE
+    r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert r.content != _FORGED_RECEIPT
+    assert attest.RECEIPT_PATH_UNDECIDABLE_REASON in r.json()["detail"]
+    with blobs.open_result_only(job.job_id, attest.WITHHELD_NAME) as fh:
+        marker = json.loads(fh.read())
+    assert marker == attest.tombstone_body(attest.RECEIPT_PATH_UNDECIDABLE_REASON)
+    assert (out / attest.RECEIPT_NAME).read_bytes() == _FORGED_RECEIPT   # nothing deleted
+
+
+def test_a_migration_with_a_smaller_limit_than_the_ingress_never_serves_a_forged_receipt(
+        tmp_path, monkeypatch):
+    """The migration variant: given a limit LOWER than the service's (a stale --max-metadata),
+    the run judges the envelope undecidable and ships the tree as-is; the withheld marker it
+    writes keeps the route from serving the planted file."""
+    import logging
+
+    from blastbox.host.jobs.retention import migrate_legacy_results
+
+    monkeypatch.delenv("BLASTBOX_MAX_METADATA", raising=False)
+    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 1024)
+    store = InMemoryJobStore()
+    job_root, job = _legacy_tree_with_big_envelope(tmp_path, store)
+    blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
+    assert migrate_legacy_results(job_root, blobs, store, logging.getLogger("t"),
+                                  limits=Limits(max_metadata_bytes=1024)) == (1, 0, 0)
+    r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert r.content != _FORGED_RECEIPT
+
+
+def test_a_genuine_receipt_beside_a_large_envelope_still_serves(tmp_path, key, monkeypatch):
+    """Control: a fresh seal over an envelope past the floor writes no marker, so the ingress
+    (configured to accept it) serves the genuine receipt."""
+    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 1024)
+    store = InMemoryJobStore()
+    job, out = _make_done_job(tmp_path, store)
+    meta = json.loads((out / "metadata.json").read_bytes())
+    meta["pad"] = "x" * 4096
+    (out / "metadata.json").write_bytes(json.dumps(meta).encode())
+    assert attest.seal_fresh_receipt(out, key=key, job_id=job.job_id,
+                                     observation=attest.RunObservation(
+        job_id=job.job_id, engine=job.engine, input_sha256="d" * 64, worker_runtime="runsc",
+        worker_tier=None, started_at_ms=1, finished_at_ms=2))
+    assert not (out / attest.WITHHELD_NAME).exists()
+    _push_to_blob(tmp_path, job.job_id, out)
+    r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 200, r.text
+    assert r.content == (out / attest.RECEIPT_NAME).read_bytes()
+
+
+def test_a_stored_withheld_marker_withholds_even_a_parseable_envelope(tmp_path, key):
+    """The marker alone decides: a result stored with it answers the no-receipt 404 (with its
+    reason) whatever the route's own reading of the envelope would be."""
+    client, store = _make_client(tmp_path)
+    job, out = _make_done_job(tmp_path, store)
+    (out / attest.RECEIPT_NAME).write_bytes(_FORGED_RECEIPT)
+    (out / attest.WITHHELD_NAME).write_bytes(
+        attest.canonical(attest.tombstone_body("some uploader reason")))
+    _push_to_blob(tmp_path, job.job_id, out)
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert "some uploader reason" in r.json()["detail"]
+
+
+def test_a_withheld_marker_read_error_is_503_never_the_receipt(tmp_path, key):
+    """A marker that cannot be checked is no verdict: 503, never fall through to serving."""
+    store = InMemoryJobStore()
+    job, out = _make_done_job(tmp_path, store)
+    (out / attest.RECEIPT_NAME).write_bytes(_FORGED_RECEIPT)
+    _push_to_blob(tmp_path, job.job_id, out)
+
+    class _Blobs(LocalBlobStore):
+        def open_result_only(self, job_id, name):
+            if name == attest.WITHHELD_NAME:
+                raise BlobFetchError("boom") from OSError(5, "EIO")
+            return super().open_result_only(job_id, name)
+
+    app = build_app(job_store=store, job_root=tmp_path / "jobs", allowed_engines={"clippyshot"},
+                    limits=Limits(), api_workers=2, zip_password="",
+                    blob_store=_Blobs(tmp_path / "jobs", blob_root=tmp_path / "blobs"))
+    r = TestClient(app, raise_server_exceptions=False).get(
+        f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 503, r.text
+
+
+def _s3_store(tmp_path, request):
+    boto3 = pytest.importorskip("boto3")
+    moto = pytest.importorskip("moto")
+    ctx = moto.mock_aws()
+    ctx.start()
+    request.addfinalizer(ctx.stop)
+    boto3.client("s3", region_name="us-east-1").create_bucket(Bucket="withheld")
+    from blastbox.host.blobs.s3 import S3BlobStore
+
+    return S3BlobStore("s3://withheld", job_root=tmp_path / "jobs", env={})
+
+
+@pytest.mark.parametrize("backend", ["local", "s3"])
+def test_the_withheld_marker_round_trips_through_each_blob_store(
+        tmp_path, monkeypatch, request, backend):
+    """put_output must actually store the marker, and the route's opener must read it -- and,
+    on S3, an ABSENT marker (NoSuchKey) must read as absent, so a genuine receipt still
+    serves 200 rather than 503."""
+    import logging
+
+    from blastbox.host.jobs.retention import retry_pending_uploads
+
+    monkeypatch.setenv("BLASTBOX_MAX_METADATA", "1024")
+    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 1024)
+    blobs = (LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+             if backend == "local" else _s3_store(tmp_path, request))
+    store = InMemoryJobStore()
+    job_root, job, out = _retained_tree_with_big_envelope(tmp_path, store)
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    assert retry_pending_uploads(job_root, blobs, store, logging.getLogger("t"),
+                                 attest_key=key) == 1
+
+    genuine = Job.new(engine="clippyshot", filename="b.docx")
+    genuine.status = JobStatus.DONE
+    store.create(genuine)
+    gout = tmp_path / "genuine" / "output"
+    gout.mkdir(parents=True)
+    (gout / "metadata.json").write_text(json.dumps({"artifacts": []}))
+    body = attest.seal_receipt(gout, key=key, observation=attest.RunObservation(
+        job_id=genuine.job_id, engine="clippyshot", input_sha256="d" * 64,
+        worker_runtime="runsc", worker_tier=None, started_at_ms=1, finished_at_ms=2))
+    blobs.put_output(genuine.job_id, gout)
+
+    app = build_app(job_store=store, job_root=job_root, allowed_engines={"clippyshot"},
+                    limits=Limits(max_metadata_bytes=1 << 20), api_workers=2, zip_password="",
+                    blob_store=blobs)
+    client = TestClient(app, raise_server_exceptions=False)
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert attest.RECEIPT_PATH_UNDECIDABLE_REASON in r.json()["detail"]
+    r = client.get(f"/v1/jobs/{genuine.job_id}/attestation")
+    assert r.status_code == 200, r.text
+    assert r.json() == body

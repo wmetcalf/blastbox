@@ -51,6 +51,7 @@ nothing on its own.
 from __future__ import annotations
 
 import base64
+import contextlib
 import errno
 import hashlib
 import json
@@ -77,6 +78,15 @@ HOST_ID_ENV = "BLASTBOX_HOST_ID"
 
 #: The receipt's name in the sealed output tree and in the blob store's results prefix.
 RECEIPT_NAME = "attestation.json"
+#: The uploader's durable "no receipt" verdict for a tree it shipped AS-IS (its envelope declares,
+#: or cannot rule out, an artifact at the receipt name -- see :func:`write_withheld_marker`). Its
+#: mere presence in a stored result makes the attestation route answer the no-receipt 404 before
+#: it reads anything at RECEIPT_NAME, so a ceiling mismatch between uploader and route can never
+#: turn the uploader's "cannot rule out" into the route's "nothing declared, serve it".
+WITHHELD_NAME = "attestation.withheld.json"
+#: Every name the dispatchers own in a sealed tree; the trust gate refuses an artifact at or
+#: under any of them.
+RESERVED_NAMES = (RECEIPT_NAME, WITHHELD_NAME)
 _SEAL_NAME = "metadata.json"
 
 VERSION = 1
@@ -357,10 +367,11 @@ def build_receipt(obs: RunObservation, *, key_id: str, metadata_sha256: str,
     return doc
 
 
-def is_reserved_path(path: str) -> bool:
-    """Whether an envelope artifact path is, or lies under, the reserved receipt name. The whole
-    name is the dispatcher's: an artifact at ``attestation.json/x`` lives in a directory that the
-    receipt (or tombstone) write has to replace.
+def is_reserved_path(path: str, names: tuple[str, ...] = RESERVED_NAMES) -> bool:
+    """Whether an envelope artifact path is, or lies under, a reserved name (by default any of
+    RESERVED_NAMES: the receipt and the withheld marker). The whole name is the dispatcher's: an
+    artifact at ``attestation.json/x`` lives in a directory that the receipt (or tombstone) write
+    has to replace.
 
     Compared the way the trust gate RESOLVES an artifact path (``Path(relpath).parts``, walked
     segment by segment under the output dir) -- never whitespace-stripped: ``' attestation.json'``
@@ -371,10 +382,10 @@ def is_reserved_path(path: str) -> bool:
     parts = PurePosixPath(path).parts
     if parts and parts[0] in ("/", "//"):
         parts = parts[1:]
-    if parts and parts[0] == RECEIPT_NAME:
+    if parts and parts[0] in names:
         return True
     p = posixpath.normpath(path)
-    return p == RECEIPT_NAME or p.startswith(RECEIPT_NAME + "/")
+    return any(p == n or p.startswith(n + "/") for n in names)
 
 
 #: metadata.json is capped at 4 MiB by default (Limits.max_metadata_bytes); this is only the
@@ -459,22 +470,29 @@ def tree_receipt_path_protection(out_dir: Path, *, limits: Limits | None = None)
     so the caller retries rather than acting on it. ``limits`` as for :func:`envelope_cap`: a
     caller outside the service (the migration CLI) passes the service's, so it judges the
     envelope exactly as the attestation route will."""
+    shipped, data = _shipped_envelope(out_dir, limits)
+    return envelope_receipt_path_protection(data) if shipped else None
+
+
+def _shipped_envelope(out_dir: Path, limits: Limits | None) -> tuple[bool, bytes | None]:
+    """(whether put_output would ship ``<out_dir>/metadata.json``, its bytes -- None when over
+    :func:`envelope_cap`). See :func:`tree_receipt_path_protection`; any OSError other than the
+    not-shipped verdicts propagates."""
     seal = Path(out_dir) / _SEAL_NAME
     try:
         fd = os.open(seal, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
-        return None                     # absent: never shipped
+        return False, None              # absent: never shipped
     except OSError as exc:
         if exc.errno == errno.ELOOP:
-            return None                 # a symlink: put_output never ships it
+            return False, None          # a symlink: put_output never ships it
         raise
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return None                 # a FIFO/directory/...: put_output never ships it
-        data = _read_capped(fd, envelope_cap(limits))
+            return False, None          # a FIFO/directory/...: put_output never ships it
+        return True, _read_capped(fd, envelope_cap(limits))
     finally:
         os.close(fd)
-    return envelope_receipt_path_protection(data)
 
 
 def _may_hold_declared_artifacts(out_dir: Path) -> bool:
@@ -490,9 +508,12 @@ def _may_hold_declared_artifacts(out_dir: Path) -> bool:
 
 
 def strip_receipt(out_dir: Path, *, gate_verified: bool = False,
-                  limits: Limits | None = None) -> None:
-    """Remove whatever sits at ``<out_dir>/attestation.json`` (file, directory or symlink)
-    without following a symlink. A worker can write into its output tree.
+                  limits: Limits | None = None,
+                  names: tuple[str, ...] = RESERVED_NAMES) -> None:
+    """Remove whatever sits at ``<out_dir>/attestation.json`` -- and at the withheld marker's
+    name, ``names`` by default being every reserved one -- (file, directory or symlink) without
+    following a symlink. A worker can write into its output tree, and a planted withheld marker
+    would hide the receipt this tree is about to carry.
 
     Raises ReceiptPathOccupied, deleting nothing, when the envelope declares an artifact AT or
     UNDER that name -- a top-level file named attestation.json or a directory of artifacts
@@ -508,10 +529,13 @@ def strip_receipt(out_dir: Path, *, gate_verified: bool = False,
     transient envelope read error can never leave a worker-planted receipt in a tree that ships.
     ``limits`` as for :func:`tree_receipt_path_protection`."""
     out_dir = Path(out_dir)
-    target = out_dir / RECEIPT_NAME
-    try:
-        st = os.lstat(target)
-    except FileNotFoundError:
+    present = []
+    for name in names:
+        try:
+            present.append((out_dir / name, os.lstat(out_dir / name)))
+        except FileNotFoundError:
+            continue
+    if not present:
         return
     if not gate_verified:
         try:
@@ -526,6 +550,12 @@ def strip_receipt(out_dir: Path, *, gate_verified: bool = False,
             raise ReceiptPathOccupied(
                 errno.EEXIST, f"{RECEIPT_NAME} holds a declared artifact (or the envelope "
                               f"cannot be parsed to rule that out); refusing to replace it")
+    for target, st in present:
+        _remove_entry(target, st)
+
+
+def _remove_entry(target: Path, st: os.stat_result) -> None:
+    """Remove ``target`` (lstat ``st``) without following a symlink; already gone is fine."""
     if stat.S_ISDIR(st.st_mode):
         # NOT shutil.rmtree: its fd walk RECURSES, so a worker-built chain ~1000 dirs deep (0
         # bytes, far under the gate's entry cap) raised RecursionError -- not an OSError -- and
@@ -536,7 +566,8 @@ def strip_receipt(out_dir: Path, *, gate_verified: bool = False,
 
         _rmtree_iterative(target)
     else:
-        os.unlink(target)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(target)
 
 
 def _write_atomic(out_dir: Path, data: bytes, *, gate_verified: bool = False) -> None:
@@ -549,6 +580,69 @@ def _write_atomic(out_dir: Path, data: bytes, *, gate_verified: bool = False) ->
             os.fsync(fh.fileno())
         strip_receipt(out_dir, gate_verified=gate_verified)   # os.replace cannot replace a dir
         os.replace(tmp, out_dir / RECEIPT_NAME)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def strip_withheld_marker(out_dir: Path, *, limits: Limits | None = None) -> None:
+    """Remove a planted withheld marker (only that name) from a tree that is about to ship WITH
+    its receipt, e.g. a retained tree whose receipt this host signed. Refuses exactly as
+    :func:`strip_receipt` does when the envelope protects the reserved names."""
+    strip_receipt(out_dir, limits=limits, names=(WITHHELD_NAME,))
+
+
+#: The reason a withheld marker that is not tombstone-shaped (a declared artifact of an old tree
+#: sitting at the marker's name) is reported with.
+RECEIPT_WITHHELD_REASON = "the uploader withheld the receipt for this result"
+
+
+def write_withheld_marker(out_dir: Path, reason: str, *, limits: Limits | None = None) -> None:
+    """Record, IN the tree, that it is shipped as-is with no receipt: a tombstone-shaped
+    ``{"attestation": null, "reason": reason}`` at WITHHELD_NAME. Call it immediately before
+    uploading a tree the receipt-path test protects (``reason`` = its verdict); the attestation
+    route answers the no-receipt 404 whenever the stored result holds that name, BEFORE it reads
+    the receipt name, so the uploader's verdict is never re-derived under another ceiling.
+
+    Nothing at RECEIPT_NAME is touched. Raises OSError -- never ships without it -- when the
+    marker cannot be written; the caller must then NOT upload as-is (leave the tree retained /
+    count it failed).
+
+    Something already at WITHHELD_NAME (only in a tree accepted before the name was reserved,
+    or planted by its worker):
+
+    * the envelope rules out that it is accepted output (parseable, nothing declared at or under
+      the name): worker junk -- replaced by the marker;
+    * otherwise it may be a declared artifact and is never destroyed. A REGULAR file there is
+      left in place: put_output ships it at the marker's key, and its mere presence makes the
+      route answer the 404 -- the fail-closed outcome, whatever its bytes. Anything else (a
+      directory, symlink, FIFO) would not be stored at that key, so it cannot stand in for the
+      marker: ReceiptPathOccupied, and the tree is not shipped as-is.
+
+    A transient envelope read error propagates (no verdict; retry)."""
+    out_dir = Path(out_dir)
+    target = out_dir / WITHHELD_NAME
+    try:
+        st: os.stat_result | None = os.lstat(target)
+    except FileNotFoundError:
+        st = None
+    if st is not None:
+        shipped, data = _shipped_envelope(out_dir, limits)
+        paths = (None if data is None else _artifact_paths_of(data)) if shipped else []
+        if paths is None or any(is_reserved_path(p, (WITHHELD_NAME,)) for p in paths):
+            if stat.S_ISREG(st.st_mode):
+                return              # possibly accepted output; its presence withholds
+            raise ReceiptPathOccupied(
+                errno.EEXIST, f"{WITHHELD_NAME} may hold a declared artifact that is not a "
+                              f"regular file; refusing to replace it or ship without it")
+        _remove_entry(target, st)
+    tmp = out_dir / f".{WITHHELD_NAME}.{uuid.uuid4().hex}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(canonical(tombstone_body(reason)))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, target)
     finally:
         tmp.unlink(missing_ok=True)
 
