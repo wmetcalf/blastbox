@@ -459,13 +459,12 @@ def test_read_node_view_refuses_mixed_node_ids(tmp_path):
     assert read_node_view(str(tmp_path / "node"), stale_after_s=20.0, node="") is None
 
 
-def test_readonly_reader_skips_fifo_symlink_and_oversize(tmp_path):
+def test_readonly_reader_skips_fifo_and_symlink(tmp_path):
     d = tmp_path / "node"
     share = FileNodeShare(str(d))
     share.publish(_snap("aa", assigned=1, ram=100, vcpus=1, budget_ram=1000, budget_vcpus=4))
     os.mkfifo(d / "fifo.json")                      # would block a plain open()
     (d / "zero.json").symlink_to("/dev/zero")        # would read forever
-    (d / "big.json").write_text("{" + " " * (128 * 1024) + "}")
     # a VALID snapshot outside the dir, linked in under its canonical name: only O_NOFOLLOW (or
     # the lstat prefilter) keeps it out — S_ISREG on the target would accept it
     outside = tmp_path / "outside"
@@ -474,6 +473,10 @@ def test_readonly_reader_skips_fifo_symlink_and_oversize(tmp_path):
     (d / "cc@firecracker@abc123.json").symlink_to(outside / "cc@firecracker@abc123.json")
     got = read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time())
     assert got is not None and [s.engine for s in got] == ["aa"]
+    # An oversize REGULAR file is never read, but it is not skipped either: it may be a
+    # reservation, so the view is omitted rather than published without it.
+    (d / "big.json").write_text("{" + " " * (128 * 1024) + "}")
+    assert read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time()) is None
 
 
 def _publish_n(d: Path, n: int) -> None:
@@ -1010,5 +1013,15 @@ def test_readonly_reader_snapshot_growing_past_cap_mid_read_is_omitted_not_parti
 
     monkeypatch.setattr(os, "open", tracking_open)
     monkeypatch.setattr(os, "fstat", growing_fstat)
+    assert read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time(),
+                                   max_bytes=4096) is None
+
+
+def test_readonly_reader_snapshot_over_cap_at_listing_is_omitted_not_partial(tmp_path):
+    """Already over the cap when the dir is listed: still a regular snapshot whose reservation
+    the view cannot read. Skipping it unopened publishes totals from the rest; fail closed,
+    exactly as when it outgrows the cap after the listing."""
+    d, victim = _two_snapshots(tmp_path)
+    _grow(victim)
     assert read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time(),
                                    max_bytes=4096) is None

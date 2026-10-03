@@ -439,14 +439,14 @@ def read_snapshots_readonly(
 
     Unlike ``FileNodeShare`` it never creates, chmods or GCs the dir, and it treats the dir as
     untrusted input. The WHOLE listing is walked; entries that are not regular files per ``lstat``
-    (FIFOs, symlinks, devices) or are larger than ``max_bytes`` are skipped without being opened
-    and do not count against the cap. Each remaining candidate is opened ``O_NOFOLLOW|O_NONBLOCK``
+    (FIFOs, symlinks, devices) are skipped without being opened and do not count against the
+    cap. Each remaining candidate is opened ``O_NOFOLLOW|O_NONBLOCK``
     and re-checked with ``fstat`` (the entry can be swapped between lstat and open), and read at
     most ``max_bytes``.
 
     Returns ``None`` — NOT a partial list — when there are more candidates than ``max_files`` or a
     listed entry cannot be lstat'd or a candidate cannot be opened (other than vanishing or
-    turning into a symlink), grows past ``max_bytes`` after the listing, read, or
+    turning into a symlink), is larger than ``max_bytes`` at any point, read, or
     parsed/validated: a shrunken view would undercount the node's reservations
     and disagree with the dispatchers, and a wrong number is worse than a gap. Well-formed but
     STALE snapshots are skipped, as the dispatchers skip them. A missing dir → ``[]``; a permission error on the dir
@@ -472,8 +472,10 @@ def read_snapshots_readonly(
                 # EACCES, EIO, ...: a snapshot the view cannot see. Skipping it would publish
                 # totals from the rest -- an undercount. Fail closed, as open/read errors do.
                 return None
-            if not _stat.S_ISREG(st.st_mode) or st.st_size > size_cap:
+            if not _stat.S_ISREG(st.st_mode):
                 continue
+            if st.st_size > size_cap:
+                return None             # a regular snapshot the view cannot read: no partial view
             candidates.append(entry.name)
     if len(candidates) > cap:
         return None
