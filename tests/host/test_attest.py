@@ -569,3 +569,22 @@ def test_flags_never_appear_without_a_signed_policy():
                                     net_downgraded=True, net_inspect=True),
                                key_id="k" * 16, metadata_sha256="c" * 64)
     assert not {"net_policy_effective", "net_exit", "net_downgraded", "net_inspect"} & set(doc)
+
+
+@pytest.mark.parametrize("path", [
+    "attestation.json", "./attestation.json", "attestation.json/", "attestation.json/x",
+    "attestation.json//x", ".//attestation.json/./x", "/attestation.json", "//attestation.json",
+    "x/../attestation.json",
+])
+def test_is_reserved_path_refuses_what_lands_at_or_under_the_receipt(path):
+    assert attest.is_reserved_path(path)
+
+
+@pytest.mark.parametrize("path", [
+    " attestation.json/page.png", "attestation.json /x", " attestation.json",
+    "attestation.json\t", "attestation.jsonx", "x/attestation.json", "attestation.json.bak",
+])
+def test_is_reserved_path_allows_names_that_are_different_files(path):
+    """The filesystem does not strip whitespace: ' attestation.json' is a different file, and the
+    gate must not refuse it any more than it refuses 'attestation.json.bak'."""
+    assert not attest.is_reserved_path(path)

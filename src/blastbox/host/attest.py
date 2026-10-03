@@ -64,7 +64,7 @@ import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -359,8 +359,20 @@ def build_receipt(obs: RunObservation, *, key_id: str, metadata_sha256: str,
 def is_reserved_path(path: str) -> bool:
     """Whether an envelope artifact path is, or lies under, the reserved receipt name. The whole
     name is the dispatcher's: an artifact at ``attestation.json/x`` lives in a directory that the
-    receipt (or tombstone) write has to replace."""
-    p = posixpath.normpath(path.strip())
+    receipt (or tombstone) write has to replace.
+
+    Compared the way the trust gate RESOLVES an artifact path (``Path(relpath).parts``, walked
+    segment by segment under the output dir) -- never whitespace-stripped: ``' attestation.json'``
+    is a different file on disk and is not refused. ``.``/``//``/trailing-slash spellings collapse
+    exactly as the walk collapses them. Two spellings the gate rejects outright as unsafe (a root
+    anchor, ``..``) are judged on their anchor-stripped / normalised form, so the answer only ever
+    errs towards refusing a path that lands nowhere."""
+    parts = PurePosixPath(path).parts
+    if parts and parts[0] in ("/", "//"):
+        parts = parts[1:]
+    if parts and parts[0] == RECEIPT_NAME:
+        return True
+    p = posixpath.normpath(path)
     return p == RECEIPT_NAME or p.startswith(RECEIPT_NAME + "/")
 
 

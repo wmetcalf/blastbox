@@ -834,3 +834,16 @@ def test_an_artifact_nested_under_the_receipt_name_is_refused(tmp_path):
     with pytest.raises(OutputTrustError, match="reserved"):
         validate_worker_output(output_dir=outdir, input_sha256=_INPUT_SHA, engine=_ENGINE,
                                limits=_limits())
+
+
+def test_a_name_that_only_looks_like_the_receipt_after_stripping_is_accepted(tmp_path):
+    """' attestation.json/page.png' lives in a directory named ' attestation.json' -- a different
+    path from <out>/attestation.json on disk, so it never collides with the receipt."""
+    outdir, _ = _make_output_dir(tmp_path)
+    (outdir / " attestation.json").mkdir()
+    (outdir / " attestation.json" / "page.png").write_bytes(b"PNG_DATA_HERE")
+    meta = json.loads((outdir / "metadata.json").read_bytes())
+    meta["artifacts"][0]["path"] = " attestation.json/page.png"
+    (outdir / "metadata.json").write_bytes(json.dumps(meta).encode())
+    validate_worker_output(output_dir=outdir, input_sha256=_INPUT_SHA, engine=_ENGINE,
+                           limits=_limits())
