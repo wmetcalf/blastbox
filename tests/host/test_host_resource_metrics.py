@@ -966,3 +966,49 @@ def test_readonly_reader_listing_stat_enoent_is_skipped(tmp_path, monkeypatch):
                                                            errno.ENOENT))
     got = read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time())
     assert got is not None and [s.engine for s in got] == ["aa"]
+
+
+def _grow(path, by: int = 1 << 16) -> None:
+    with open(path, "ab") as fh:
+        fh.write(b" " * by)
+
+
+def test_readonly_reader_snapshot_over_cap_at_fstat_is_omitted_not_partial(tmp_path,
+                                                                           monkeypatch):
+    """In-size at the listing's lstat, over the cap by the time it is opened and fstat'd: a
+    regular snapshot the view cannot read. Skipping it publishes partial totals; fail closed."""
+    d, victim = _two_snapshots(tmp_path)
+    real_open = os.open
+
+    def growing_open(path, *a, **k):
+        if str(path) == str(victim):
+            _grow(victim)
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(os, "open", growing_open)
+    assert read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time(),
+                                   max_bytes=4096) is None
+
+
+def test_readonly_reader_snapshot_growing_past_cap_mid_read_is_omitted_not_partial(
+        tmp_path, monkeypatch):
+    d, victim = _two_snapshots(tmp_path)
+    real_open, real_fstat = os.open, os.fstat
+    fds: set[int] = set()
+
+    def tracking_open(path, *a, **k):
+        fd = real_open(path, *a, **k)
+        if str(path) == str(victim):
+            fds.add(fd)
+        return fd
+
+    def growing_fstat(fd, *a, **k):
+        st = real_fstat(fd, *a, **k)
+        if fd in fds:
+            _grow(victim)                   # after the fstat check, before the read
+        return st
+
+    monkeypatch.setattr(os, "open", tracking_open)
+    monkeypatch.setattr(os, "fstat", growing_fstat)
+    assert read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time(),
+                                   max_bytes=4096) is None

@@ -446,7 +446,7 @@ def read_snapshots_readonly(
 
     Returns ``None`` — NOT a partial list — when there are more candidates than ``max_files`` or a
     listed entry cannot be lstat'd or a candidate cannot be opened (other than vanishing or
-    turning into a symlink), read, or
+    turning into a symlink), grows past ``max_bytes`` after the listing, read, or
     parsed/validated: a shrunken view would undercount the node's reservations
     and disagree with the dispatchers, and a wrong number is worse than a gap. Well-formed but
     STALE snapshots are skipped, as the dispatchers skip them. A missing dir → ``[]``; a permission error on the dir
@@ -492,8 +492,12 @@ def read_snapshots_readonly(
             return None
         try:
             st = os.fstat(fd)
-            if not _stat.S_ISREG(st.st_mode) or st.st_size > size_cap:
-                continue
+            if not _stat.S_ISREG(st.st_mode):
+                continue                # swapped for a FIFO/device: skipped at lstat too
+            if st.st_size > size_cap:
+                # In-size at the listing, over the cap now: a regular snapshot the view cannot
+                # read. Skipping it would publish partial totals. Fail closed.
+                return None
             # loop: NFS/FUSE may return short reads, and one os.read() would hand a truncated
             # (unparseable) payload to the parser
             chunks: list[bytes] = []
@@ -505,7 +509,7 @@ def read_snapshots_readonly(
                 chunks.append(chunk)
                 got += len(chunk)
             if got > size_cap:
-                continue                        # grew past the cap between fstat and read
+                return None             # grew past the cap between fstat and read: fail closed
             try:
                 status, snap = FileNodeShare._classify(
                     name, b"".join(chunks).decode("utf-8"), max_age_s=max_age_s, now=now)
