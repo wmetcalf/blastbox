@@ -688,7 +688,39 @@ def test_a_planted_receipt_never_ships_when_the_envelope_cannot_be_reread(
         assert _tombstone_reason(tmp_path, job) == "no attestation key"
 
 
-@pytest.mark.parametrize("tier", ["cold", "vm"])
+def _warm_run_planted(tmp_path, key):
+    """A warm (pool slot) dispatch whose worker plants a receipt in its output."""
+    from tests.host.test_dispatch_warm import (
+        FakeWarmPool,
+        _make_slot,
+        _start_fake_worker,
+    )
+    from tests.host.test_dispatch_warm import _engine_spec as _warm_engine
+    from tests.host.test_dispatch_warm import _fake_runtime as _warm_runtime
+    from tests.host.test_dispatch_warm import _make_valid_output_dir as _warm_out
+
+    store = InMemoryJobStore()
+    job = _queue(tmp_path, store, net_policy="undeclared")
+    slot = _make_slot(tmp_path)
+
+    def output(o):
+        _warm_out(o, input_sha256=_INPUT_SHA)
+        (o / attest.RECEIPT_NAME).write_bytes(_FORGED)
+
+    _start_fake_worker(slot, output_fn=output)
+    d = Dispatcher(
+        job_store=store, engines={_ENGINE_NAME: _warm_engine()}, limits=_limits(),
+        job_root=tmp_path / "jobs", runtime_selector=_warm_runtime,
+        subprocess_runner=lambda *a, **kw: subprocess.CompletedProcess(a[0], 0, "", ""),
+        worker_timeout_s=10, pool=FakeWarmPool(slot), tier="gvisor",
+        warm_claim_timeout_s=0.5, warm_requeue_backoff_s=0.0, blob_store=_blobs(tmp_path),
+        put_output_max_attempts=1, put_output_retry_backoff_s=0.0, attest_key=key,
+    )
+    assert d.dispatch_once() is True
+    return store, job
+
+
+@pytest.mark.parametrize("tier", ["cold", "warm", "vm"])
 def test_when_neither_receipt_nor_tombstone_lands_the_tree_is_not_uploaded(
         tmp_path, key, monkeypatch, tier):
     """Fail closed: if NOTHING can be written at attestation.json, a worker-planted file may still
@@ -704,6 +736,8 @@ def test_when_neither_receipt_nor_tombstone_lands_the_tree_is_not_uploaded(
         d = _dispatcher(tmp_path, store, attest_key=key,
                         runner=_runner(tmp_path, job, plant=_FORGED))
         assert d.dispatch_once() is True
+    elif tier == "warm":
+        store, job = _warm_run_planted(tmp_path, key)
     else:
         store, job = _vm_run_planted(tmp_path, key)
     from blastbox.host.jobs.retention import PENDING_UPLOAD_SENTINEL
