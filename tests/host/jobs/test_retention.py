@@ -1871,3 +1871,60 @@ def test_a_transient_envelope_read_error_leaves_the_tree_retained(tmp_path, monk
                                  attest_key=key) == 0
     assert blobs.put_calls == 0
     assert store.get(_JID).status is JobStatus.FAILED
+
+
+# ---------------------------------------------------------------------------
+# A seal put_output would not ship protects nothing (round-2 review F2)
+# ---------------------------------------------------------------------------
+
+_FORGED = b'{"attestation": {"forged": true, "status": "done"}, "signature": "AAAA"}'
+
+
+def test_a_retained_tree_with_a_symlinked_seal_tombstones_a_planted_receipt(tmp_path):
+    """put_output never ships a symlinked metadata.json, so nothing in the tree can be accepted
+    output under it: a planted attestation.json is worker junk. The sweep read the symlink as
+    "envelope cannot rule out a declared artifact" and uploaded the planted file as-is."""
+    from blastbox.host import attest
+    from blastbox.host.blobs.local import LocalBlobStore
+
+    job_root = tmp_path / "jobs"
+    store = InMemoryJobStore()
+    _retained_failed_job(store)
+    d = job_root / _JID
+    out = d / "output"
+    out.mkdir(parents=True)
+    (d / "sealed.json").write_text(json.dumps({"artifacts": []}))
+    os.symlink(d / "sealed.json", out / "metadata.json")
+    (out / "attestation.json").write_bytes(_FORGED)
+    (d / PENDING_UPLOAD_SENTINEL).write_text("")
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
+    retry_pending_uploads(job_root, blobs, store, logging.getLogger("t"), attest_key=key)
+    with blobs.open_result_only(_JID, "attestation.json") as fh:
+        stored = fh.read()
+    assert stored != _FORGED, "the planted receipt was uploaded as-is"
+    assert attest.is_tombstone(stored)
+
+
+def test_legacy_migration_strips_a_planted_receipt_beside_a_symlinked_seal(tmp_path):
+    """Same for the legacy migration: a symlinked seal is never shipped, so the planted
+    attestation.json is stripped, as before the as-is recovery existed."""
+    from blastbox.host.blobs.base import BlobFetchError
+    from blastbox.host.blobs.local import LocalBlobStore
+
+    job_root = tmp_path / "jobs"
+    store = InMemoryJobStore()
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.job_id = _JID
+    job.status = JobStatus.DONE
+    store.create(job)
+    out = job_root / _JID / "output"
+    (out / "sub").mkdir(parents=True)
+    (out / "sub" / "real.json").write_text(json.dumps({"artifacts": []}))
+    os.symlink("sub/real.json", out / "metadata.json")
+    (out / "attestation.json").write_bytes(_FORGED)
+    blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
+    migrate_legacy_results(job_root, blobs, store, logging.getLogger("t"))
+    assert not (out / "attestation.json").exists(), "the planted receipt was kept"
+    with pytest.raises(BlobFetchError):
+        blobs.open_result_only(_JID, "attestation.json")

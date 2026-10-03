@@ -388,23 +388,6 @@ class ReceiptPathOccupied(OSError):
     retained" OSError path handles it."""
 
 
-def _envelope_artifact_paths(seal: Path) -> list[str] | None:
-    """The artifact paths ``metadata.json`` declares, or None when it cannot be read as a regular
-    file within the cap or parsed. Opened O_NOFOLLOW|O_NONBLOCK and judged on the open descriptor
-    (a FIFO must not block the dispatcher). FileNotFoundError propagates: the caller decides what
-    an absent envelope means."""
-    fd = os.open(seal, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return None
-        data = _read_capped(fd, ENVELOPE_MAX_BYTES)
-    finally:
-        os.close(fd)
-    if data is None:
-        return None
-    return _artifact_paths_of(data)
-
-
 def _artifact_paths_of(data: bytes) -> list[str] | None:
     """The artifact paths an envelope's bytes declare, or None when they cannot be parsed."""
     try:
@@ -430,7 +413,7 @@ RECEIPT_ENVELOPE_ABSENT_REASON = "the stored result has no envelope for a receip
 def envelope_receipt_path_protection(data: bytes | None) -> str | None:
     """Why whatever sits at attestation.json in a result with these envelope bytes must be left
     alone and never presented as a receipt or tombstone -- or None when the envelope rules that
-    out. ``data`` None = the envelope was not a regular file within the cap.
+    out. ``data`` None = the envelope is larger than ENVELOPE_MAX_BYTES (cannot be parsed whole).
 
     Two verdicts: the envelope DECLARES an artifact at or under the name (only possible in a tree
     accepted before the trust gate reserved it), or it cannot be parsed, so nothing rules that
@@ -444,36 +427,46 @@ def envelope_receipt_path_protection(data: bytes | None) -> str | None:
 
 
 def tree_receipt_path_protection(out_dir: Path) -> str | None:
-    """:func:`envelope_receipt_path_protection` for ``<out_dir>/metadata.json``. None when the
-    envelope is absent. A symlinked envelope is a verdict (undecidable); any other OSError --
-    EIO, EACCES, a flap -- is NOT, and propagates so the caller retries rather than acting on it.
-    """
+    """:func:`envelope_receipt_path_protection` for ``<out_dir>/metadata.json`` -- THE single
+    envelope test behind every receipt-path decision (the sweeps' as-is choice, strip_receipt,
+    seal_receipt), so they cannot diverge.
+
+    Judged on the envelope put_output would SHIP. It ships ``metadata.json`` only as a regular,
+    non-symlink file; anything else (absent, a symlink -- ELOOP under O_NOFOLLOW, dangling or not
+    -- a FIFO, a directory) never reaches the store, so no envelope accepted anything at
+    attestation.json and there is nothing to protect: None, and whatever sits there is worker
+    junk to strip or tombstone. A shipped envelope that is over the cap or unparseable is
+    "cannot rule out" (protect). Opened O_NOFOLLOW|O_NONBLOCK and judged on the descriptor, so a
+    FIFO never blocks. Any other OSError -- EIO, EACCES, a flap -- is no verdict and propagates,
+    so the caller retries rather than acting on it."""
     seal = Path(out_dir) / _SEAL_NAME
     try:
         fd = os.open(seal, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
-        return None
+        return None                     # absent: never shipped
     except OSError as exc:
         if exc.errno == errno.ELOOP:
-            return RECEIPT_PATH_UNDECIDABLE_REASON
+            return None                 # a symlink: put_output never ships it
         raise
     try:
-        data = (_read_capped(fd, ENVELOPE_MAX_BYTES)
-                if stat.S_ISREG(os.fstat(fd).st_mode) else None)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None                 # a FIFO/directory/...: put_output never ships it
+        data = _read_capped(fd, ENVELOPE_MAX_BYTES)
     finally:
         os.close(fd)
     return envelope_receipt_path_protection(data)
 
 
 def _may_hold_declared_artifacts(out_dir: Path) -> bool:
-    """Whether the envelope declares (or might declare) an artifact at or under attestation.json."""
+    """Whether the envelope declares (or might declare) an artifact at or under attestation.json:
+    :func:`tree_receipt_path_protection`, with a transient read error (EIO, EACCES...) read as
+    "cannot rule it out" -- the deletion paths fail closed where the sweeps' as-is choice would
+    instead retry. An envelope put_output would not ship (absent, symlinked, non-regular) is a
+    VERDICT there, not an error, so it protects nothing here either."""
     try:
-        paths = _envelope_artifact_paths(out_dir / _SEAL_NAME)
-    except FileNotFoundError:
-        return False                    # no envelope: nothing in the tree was ever accepted
+        return tree_receipt_path_protection(out_dir) is not None
     except OSError:
-        return True                     # a symlink (ELOOP) or an I/O error: cannot rule it out
-    return paths is None or any(is_reserved_path(p) for p in paths)
+        return True
 
 
 def strip_receipt(out_dir: Path) -> None:
@@ -533,14 +526,6 @@ def is_tombstone(data: bytes) -> bool:
     return isinstance(body, dict) and body.get("attestation", 0) is None
 
 
-def _declares_receipt_name(seal: Path) -> bool:
-    try:
-        paths = _envelope_artifact_paths(seal)
-    except OSError:                     # unreadable: cannot rule it out
-        return True
-    return paths is None or any(is_reserved_path(p) for p in paths)
-
-
 def seal_receipt(out_dir: Path, *, key: AttestKey | None,
                  observation: RunObservation | None, reason: str | None = None) -> dict | None:
     """Replace whatever sits at ``attestation.json`` with this dispatcher's signed receipt, or,
@@ -564,7 +549,7 @@ def seal_receipt(out_dir: Path, *, key: AttestKey | None,
                    "no receipt", observation.job_id, exc)
         write_tombstone(out_dir, "metadata.json is not a regular file")
         return None
-    if _declares_receipt_name(out_dir / _SEAL_NAME):
+    if _may_hold_declared_artifacts(out_dir):
         # The trust gate refuses this; never let a declared artifact stand in for a receipt.
         _log.error("attestation: job %s declares %s as an artifact; no receipt",
                    observation.job_id, RECEIPT_NAME)

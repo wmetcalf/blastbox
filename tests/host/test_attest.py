@@ -588,3 +588,65 @@ def test_is_reserved_path_allows_names_that_are_different_files(path):
     """The filesystem does not strip whitespace: ' attestation.json' is a different file, and the
     gate must not refuse it any more than it refuses 'attestation.json.bak'."""
     assert not attest.is_reserved_path(path)
+
+
+# ---------------------------------------------------------------------------
+# Receipt-path protection follows what put_output SHIPS (round-2 review F2)
+# ---------------------------------------------------------------------------
+
+
+def _seal_of_kind(tmp_path, kind: str):
+    """An output tree with a planted attestation.json and metadata.json of ``kind``."""
+    out = tmp_path / "output"
+    out.mkdir()
+    seal = out / "metadata.json"
+    if kind == "symlink":
+        (tmp_path / "real.json").write_text(json.dumps({"artifacts": []}))
+        seal.symlink_to(tmp_path / "real.json")
+    elif kind == "dangling_symlink":
+        seal.symlink_to(tmp_path / "nowhere.json")
+    elif kind == "fifo":
+        os.mkfifo(seal)
+    elif kind == "dir":
+        seal.mkdir()
+        (seal / "x.json").write_text("{}")
+    elif kind == "clean":
+        seal.write_text(json.dumps({"artifacts": [{"id": "a", "path": "page.png"}]}))
+    elif kind == "declares":
+        seal.write_text(json.dumps({"artifacts": [{"id": "a", "path": "attestation.json"}]}))
+    elif kind == "garbage":
+        seal.write_text('{"artifacts": [{"id": "a", "pa')
+    else:
+        assert kind == "absent"
+    (out / attest.RECEIPT_NAME).write_bytes(b"planted")
+    return out
+
+
+@pytest.mark.parametrize("kind", ["symlink", "dangling_symlink", "fifo", "dir"])
+def test_a_seal_put_output_would_not_ship_protects_nothing(tmp_path, kind):
+    """put_output skips a symlinked or non-regular metadata.json, so the result never carries
+    it: no envelope accepted anything at attestation.json, and the planted file there is junk
+    to tombstone/strip -- not "cannot rule out", which uploaded it as-is."""
+    out = _seal_of_kind(tmp_path, kind)
+    seal = out / "metadata.json"
+    stuck, result = (_without_blocking(lambda: attest.tree_receipt_path_protection(out), seal)
+                     if kind == "fifo" else
+                     (False, {"value": attest.tree_receipt_path_protection(out)}))
+    assert not stuck
+    assert result == {"value": None}
+    attest.strip_receipt(out)
+    assert not (out / attest.RECEIPT_NAME).exists()
+
+
+@pytest.mark.parametrize("kind", ["absent", "symlink", "dangling_symlink", "fifo", "dir",
+                                  "clean", "declares", "garbage"])
+def test_strip_receipt_refuses_exactly_when_the_tree_protects_the_receipt_path(tmp_path, kind):
+    """The sweeps decide "as-is" with tree_receipt_path_protection and then strip/tombstone with
+    strip_receipt; the two must never disagree, or a tree is neither recovered as-is nor
+    strippable (ReceiptPathOccupied every tick) -- or worse, stripped while 'protected'."""
+    out = _seal_of_kind(tmp_path, kind)
+    protected = attest.tree_receipt_path_protection(out) is not None
+    exc = _attempt(lambda: attest.strip_receipt(out))
+    assert isinstance(exc, attest.ReceiptPathOccupied) is protected, exc
+    assert (out / attest.RECEIPT_NAME).exists() is protected
+    assert protected is (kind in ("declares", "garbage"))
