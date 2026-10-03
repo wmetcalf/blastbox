@@ -402,7 +402,7 @@ def envelope_cap(limits: Limits | None = None) -> int:
 
 class ReceiptPathOccupied(OSError):
     """``attestation.json`` holds an artifact the envelope declares (or the envelope
-    cannot be read to rule that out). Replacing it would delete accepted artifacts, so nothing is
+    cannot be parsed to rule that out -- a transient READ error is ReceiptUnreadable instead). Replacing it would delete accepted artifacts, so nothing is
     written there: no receipt and no tombstone. An OSError so the sweeps' existing "leave it
     retained" OSError path handles it."""
 
@@ -495,8 +495,10 @@ def strip_receipt(out_dir: Path, *, gate_verified: bool = False) -> None:
     Raises ReceiptPathOccupied, deleting nothing, when the envelope declares an artifact AT or
     UNDER that name -- a top-level file named attestation.json or a directory of artifacts
     (possible only in a tree accepted before the trust gate reserved the whole name), or when the
-    envelope cannot be read to rule that out: never destroy accepted output to make room for a
-    receipt. Anything undeclared there (worker-planted junk, a stale receipt) is replaced.
+    envelope cannot be PARSED to rule that out: never destroy accepted output to make room for a
+    receipt. Raises ReceiptUnreadable, deleting nothing, when the envelope cannot be READ right
+    now (EIO, EACCES...) -- no verdict, retry later. Anything undeclared there (worker-planted
+    junk, a stale receipt) is replaced.
 
     ``gate_verified``: the caller is the dispatcher sealing a tree the trust gate JUST validated,
     and the gate refuses any artifact at or under the reserved name -- so nothing there can be
@@ -508,10 +510,19 @@ def strip_receipt(out_dir: Path, *, gate_verified: bool = False) -> None:
         st = os.lstat(target)
     except FileNotFoundError:
         return
-    if not gate_verified and _may_hold_declared_artifacts(out_dir):
-        raise ReceiptPathOccupied(
-            errno.EEXIST, f"{RECEIPT_NAME} holds a declared artifact (or the envelope cannot "
-                          f"rule that out); refusing to replace it")
+    if not gate_verified:
+        try:
+            why = tree_receipt_path_protection(out_dir)
+        except OSError as exc:
+            # No verdict either way: a retry-later error, never the permanent-looking
+            # ReceiptPathOccupied. Both sweeps leave the tree in place and retry it.
+            raise ReceiptUnreadable(
+                exc.errno, f"cannot read the envelope to rule out a declared artifact at "
+                           f"{RECEIPT_NAME} ({exc}); leaving it in place") from exc
+        if why is not None:
+            raise ReceiptPathOccupied(
+                errno.EEXIST, f"{RECEIPT_NAME} holds a declared artifact (or the envelope "
+                              f"cannot be parsed to rule that out); refusing to replace it")
     if stat.S_ISDIR(st.st_mode):
         shutil.rmtree(target)
     else:

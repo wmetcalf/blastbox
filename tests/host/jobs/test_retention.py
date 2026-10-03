@@ -1959,3 +1959,75 @@ def test_legacy_migration_leaves_a_tree_in_place_on_a_transient_envelope_error(
     assert migrate_legacy_results(tmp_path, blobs, store, logging.getLogger("t")) == (0, 0, 1)
     assert blobs.put_calls == 0, "uploaded on a transient envelope error"
     assert (out / "attestation.json").read_bytes() == _FORGED
+
+
+# ---------------------------------------------------------------------------
+# A transient envelope error INSIDE strip_receipt is retried, never a permanent verdict
+# ---------------------------------------------------------------------------
+
+
+def _fail_seal_reads_inside_strip_once(monkeypatch, seal: Path) -> None:
+    """EIO on the envelope read strip_receipt makes for itself, once -- after the sweep's own
+    as-is read of the same envelope SUCCEEDED (a flap between the two)."""
+    import errno as _errno
+
+    from blastbox.host import attest
+
+    real_open, real_strip = attest.os.open, attest.strip_receipt
+    state = {"in_strip": False, "left": 1}
+
+    def flaky_open(p, *a, **kw):
+        if state["in_strip"] and state["left"] and str(p) == str(seal):
+            state["left"] -= 1
+            raise OSError(_errno.EIO, "Input/output error", str(p))
+        return real_open(p, *a, **kw)
+
+    def strip(out_dir, **kw):
+        state["in_strip"] = True
+        try:
+            return real_strip(out_dir, **kw)
+        finally:
+            state["in_strip"] = False
+
+    monkeypatch.setattr(attest.os, "open", flaky_open)
+    monkeypatch.setattr(attest, "strip_receipt", strip)
+
+
+def test_a_flap_inside_strip_leaves_the_retained_tree_for_the_next_tick(tmp_path, monkeypatch):
+    from blastbox.host import attest
+
+    store = InMemoryJobStore()
+    _retained_failed_job(store)
+    out = _sealed_tree(tmp_path, _JID) / "output"
+    (out / "attestation.json").write_bytes(_FORGED)
+    _fail_seal_reads_inside_strip_once(monkeypatch, out / "metadata.json")
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    blobs = _FakeBlobs()
+    log = logging.getLogger("t")
+    assert retry_pending_uploads(tmp_path, blobs, store, log, attest_key=key) == 0
+    assert blobs.put_calls == 0
+    assert (out / "attestation.json").read_bytes() == _FORGED
+    assert store.get(_JID).status is JobStatus.FAILED
+    # Next tick: the flap is over -- the planted receipt is tombstoned and the result recovered.
+    assert retry_pending_uploads(tmp_path, blobs, store, log, attest_key=key) == 1
+    assert json.loads((out / "attestation.json").read_bytes())["attestation"] is None
+    assert store.get(_JID).status is JobStatus.DONE
+
+
+def test_a_flap_inside_strip_leaves_a_legacy_tree_for_the_next_run(tmp_path, monkeypatch):
+    store = InMemoryJobStore()
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.job_id = _JID
+    job.status = JobStatus.DONE
+    store.create(job)
+    out = _sealed_tree(tmp_path, _JID, pending=False) / "output"
+    (out / "attestation.json").write_bytes(_FORGED)
+    _fail_seal_reads_inside_strip_once(monkeypatch, out / "metadata.json")
+    blobs = _FakeBlobs()
+    log = logging.getLogger("t")
+    assert migrate_legacy_results(tmp_path, blobs, store, log) == (0, 0, 1)
+    assert blobs.put_calls == 0
+    assert (out / "attestation.json").read_bytes() == _FORGED
+    # Nothing recorded the failure: the operator's next run migrates it.
+    assert migrate_legacy_results(tmp_path, blobs, store, log) == (1, 0, 0)
+    assert not (out / "attestation.json").exists()

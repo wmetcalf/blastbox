@@ -6,6 +6,7 @@ from its own in-memory observation of that run. Nothing on the job row feeds it.
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import json
 import os
@@ -674,8 +675,9 @@ def test_strip_receipt_refuses_exactly_when_the_tree_protects_the_receipt_path(t
 
 def test_a_transient_envelope_error_never_licenses_stripping(tmp_path, monkeypatch):
     """EIO opening metadata.json is no verdict. tree_receipt_path_protection propagates it (the
-    sweeps retry), and the deletion guard reads it as "cannot rule out": strip_receipt refuses
-    and the file at attestation.json -- possibly a declared artifact -- survives."""
+    sweeps retry), and strip_receipt refuses with the retry-later ReceiptUnreadable (not the
+    permanent-looking ReceiptPathOccupied): the file at attestation.json -- possibly a declared
+    artifact -- survives."""
     import errno as _errno
 
     out = _tree(tmp_path, json.dumps({"artifacts": [{"id": "a", "path": "page.png"}]}).encode())
@@ -692,7 +694,7 @@ def test_a_transient_envelope_error_never_licenses_stripping(tmp_path, monkeypat
     exc = _attempt(lambda: attest.tree_receipt_path_protection(out))
     assert isinstance(exc, OSError) and exc.errno == _errno.EIO
     exc = _attempt(lambda: attest.strip_receipt(out))
-    assert isinstance(exc, attest.ReceiptPathOccupied)
+    assert isinstance(exc, attest.ReceiptUnreadable) and exc.errno == _errno.EIO
     assert (out / attest.RECEIPT_NAME).read_bytes() == b"maybe an artifact"
 
 
@@ -742,3 +744,26 @@ def test_an_envelope_over_both_caps_still_cannot_rule_it_out(tmp_path, monkeypat
     monkeypatch.setenv("BLASTBOX_MAX_METADATA", "2048")
     out = _tree(tmp_path, _padded_envelope(4096))
     assert attest.tree_receipt_path_protection(out) == attest.RECEIPT_PATH_UNDECIDABLE_REASON
+
+
+# ---------------------------------------------------------------------------
+# A transient envelope read inside strip_receipt is not a verdict
+# ---------------------------------------------------------------------------
+
+
+def test_a_transient_envelope_error_in_strip_is_unreadable_not_occupied(tmp_path, monkeypatch):
+    """EIO re-reading the envelope inside strip_receipt says nothing about what sits at
+    attestation.json. ReceiptPathOccupied is the permanent-looking "a declared artifact is
+    there"; this must be the retry-later ReceiptUnreadable, deleting nothing."""
+    out = _tree(tmp_path, b'{"artifacts": []}')
+    (out / attest.RECEIPT_NAME).write_bytes(b"planted")
+
+    def eio(*a, **kw):
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(attest, "tree_receipt_path_protection", eio)
+    exc = _attempt(lambda: attest.strip_receipt(out))
+    assert isinstance(exc, attest.ReceiptUnreadable), exc
+    assert not isinstance(exc, attest.ReceiptPathOccupied)
+    assert exc.errno == errno.EIO
+    assert (out / attest.RECEIPT_NAME).read_bytes() == b"planted"
