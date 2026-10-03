@@ -9,6 +9,7 @@ read truthfully is OMITTED — a scrape never raises and never emits a fabricate
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import time
@@ -851,5 +852,68 @@ def test_readonly_reader_still_skips_stale_snapshots(tmp_path):
     share.publish(_snap("aa", assigned=1, ram=100, vcpus=1, budget_ram=1000, budget_vcpus=4))
     old = _snap("bb", assigned=1, ram=100, vcpus=1, budget_ram=1000, budget_vcpus=4)
     share.publish(DemandSnapshot(**{**old.__dict__, "ts": time.time() - 3600}))
+    got = read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time())
+    assert got is not None and [s.engine for s in got] == ["aa"]
+
+
+def _two_snapshots(tmp_path):
+    d = tmp_path / "node"
+    share = FileNodeShare(str(d))
+    share.publish(_snap("aa", assigned=1, ram=100, vcpus=1, budget_ram=1000, budget_vcpus=4))
+    share.publish(_snap("bb", assigned=1, ram=100, vcpus=1, budget_ram=1000, budget_vcpus=4))
+    victim = next(p for p in sorted(d.glob("*.json")) if p.name.startswith("bb"))
+    return d, victim
+
+
+@pytest.mark.parametrize("err", [errno.EACCES, errno.EIO, errno.EMFILE])
+def test_readonly_reader_open_error_is_omitted_not_partial(tmp_path, monkeypatch, err):
+    """A regular, in-size snapshot that fails to OPEN (permission, EIO, fd exhaustion) is a
+    reservation the view cannot see: publishing totals from the rest would undercount the node.
+    Fail closed, like the over-cap and invalid-snapshot cases: None, not a partial list."""
+    d, victim = _two_snapshots(tmp_path)
+    real_open = os.open
+
+    def failing_open(path, *a, **k):
+        if str(path) == str(victim):
+            raise OSError(err, os.strerror(err), str(path))
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(os, "open", failing_open)
+    assert read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time()) is None
+
+
+def test_readonly_reader_read_error_is_omitted_not_partial(tmp_path, monkeypatch):
+    d, victim = _two_snapshots(tmp_path)
+    real_open, real_read = os.open, os.read
+    fds: set[int] = set()
+
+    def tracking_open(path, *a, **k):
+        fd = real_open(path, *a, **k)
+        if str(path) == str(victim):
+            fds.add(fd)
+        return fd
+
+    def failing_read(fd, n):
+        if fd in fds:
+            raise OSError(errno.EIO, "Input/output error")
+        return real_read(fd, n)
+
+    monkeypatch.setattr(os, "open", tracking_open)
+    monkeypatch.setattr(os, "read", failing_read)
+    assert read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time()) is None
+
+
+def test_readonly_reader_a_snapshot_removed_after_listing_is_skipped(tmp_path, monkeypatch):
+    """ENOENT is not a gap in the view: the dispatcher removed (or GC'd) its snapshot, which is
+    the same view a listing taken a moment later would show."""
+    d, victim = _two_snapshots(tmp_path)
+    real_open = os.open
+
+    def vanishing_open(path, *a, **k):
+        if str(path) == str(victim):
+            os.unlink(victim)
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(os, "open", vanishing_open)
     got = read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time())
     assert got is not None and [s.engine for s in got] == ["aa"]

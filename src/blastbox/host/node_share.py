@@ -31,6 +31,7 @@ share dir on a surface writable by anything outside the dispatcher trust domain.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -444,7 +445,8 @@ def read_snapshots_readonly(
     most ``max_bytes``.
 
     Returns ``None`` — NOT a partial list — when there are more candidates than ``max_files`` or a
-    candidate cannot be parsed/validated: a shrunken view would undercount the node's reservations
+    candidate cannot be opened (other than vanishing or turning into a symlink), read, or
+    parsed/validated: a shrunken view would undercount the node's reservations
     and disagree with the dispatchers, and a wrong number is worse than a gap. Well-formed but
     STALE snapshots are skipped, as the dispatchers skip them. A missing dir → ``[]``; a permission error on the dir
     propagates so the caller can say why the view is missing."""
@@ -475,8 +477,14 @@ def read_snapshots_readonly(
     for name in candidates:
         try:
             fd = os.open(os.path.join(directory, name), flags)
-        except OSError:
-            continue                            # swapped for a symlink (ELOOP) / vanished
+        except OSError as exc:
+            if exc.errno in (errno.ENOENT, errno.ELOOP):
+                # vanished (removed/GC'd: the view a moment-later listing shows) or swapped for
+                # a symlink (skipped at lstat above too) -- neither is a reservation we can't see
+                continue
+            # EACCES/EIO/EMFILE/...: a regular snapshot we cannot read is a reservation missing
+            # from the view; totals from the rest would undercount the node. Fail closed.
+            return None
         try:
             st = os.fstat(fd)
             if not _stat.S_ISREG(st.st_mode) or st.st_size > size_cap:
@@ -499,7 +507,9 @@ def read_snapshots_readonly(
             except Exception:
                 status, snap = "invalid", None
         except OSError:
-            continue                            # vanished / unreadable mid-read
+            # The file is open, so it cannot have vanished: an EIO mid-read is an unreadable
+            # reservation, and dropping it would publish partial totals. Fail closed.
+            return None
         finally:
             os.close(fd)
         if status == "invalid":
