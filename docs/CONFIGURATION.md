@@ -145,7 +145,12 @@ those bytes — it signs nothing.
 has its own key, and the verifier pins each one it accepts, by `key_id`. When a finalize does not
 sign (no key, signing failed, input could not be hashed), it writes a *tombstone*
 (`{"attestation": null, "reason": "…"}`) instead, so a superseded attempt's receipt in the store is
-always overwritten; the route answers `404` for it.
+always overwritten; the route answers `404` for it. A result the retention sweeps upload *as-is*
+(its envelope declares, or cannot rule out, an artifact at `attestation.json`) carries an
+`attestation.withheld.json` marker of the same shape instead; the route answers `404` whenever
+it is stored, and also when the result has no stored `metadata.json`. The route never parses
+the envelope, so `BLASTBOX_MAX_METADATA` on the ingress cannot hide a genuine receipt or serve a
+forged one. Both names are reserved: a worker cannot declare an artifact at either.
 
 **Rotating the key:** rotate (or unset) `BLASTBOX_ATTEST_KEY` only when this host has **no
 retained pending uploads**. A retained result is re-uploaded later by the pending-upload sweep,

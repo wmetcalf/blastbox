@@ -468,8 +468,9 @@ def tree_receipt_path_protection(out_dir: Path, *, limits: Limits | None = None)
     "cannot rule out" (protect). Opened O_NOFOLLOW|O_NONBLOCK and judged on the descriptor, so a
     FIFO never blocks. Any other OSError -- EIO, EACCES, a flap -- is no verdict and propagates,
     so the caller retries rather than acting on it. ``limits`` as for :func:`envelope_cap`: a
-    caller outside the service (the migration CLI) passes the service's, so it judges the
-    envelope exactly as the attestation route will."""
+    caller outside the service (the migration CLI) passes the service's, so it strips what the
+    service would. The attestation route never repeats this test: an as-is verdict travels with
+    the tree as the withheld marker (:func:`write_withheld_marker`)."""
     shipped, data = _shipped_envelope(out_dir, limits)
     return envelope_receipt_path_protection(data) if shipped else None
 

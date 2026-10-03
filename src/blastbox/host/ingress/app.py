@@ -1067,12 +1067,14 @@ def build_app(
         # on-disk tree, which no dispatcher ever sanitised -- an attestation.json there is whatever
         # the worker wrote -- so a store offering a no-fallback read is always read through it.
         opener = getattr(_blob_store, "open_result_only", None) or _blob_store.open_output
-        # FIRST, the uploader's durable verdict. A tree the retention sweeps shipped AS-IS (its
-        # envelope declared, or -- under THAT process's ceiling -- could not rule out, an
-        # artifact at attestation.json) carries the withheld marker. Its presence alone decides:
-        # re-deriving the verdict here under this app's own ceiling is how a larger ingress
-        # limit parsed an envelope the uploader could not, saw nothing declared, and served a
-        # planted attestation.json 200. A marker that cannot be checked is no verdict: 503.
+        # THE UPLOADER'S VERDICT, never re-derived here. A tree the retention sweeps shipped
+        # AS-IS (its envelope declared, or under THAT process's ceiling could not rule out, an
+        # artifact at attestation.json) carries the withheld marker, and its presence alone
+        # decides. The route reads no envelope and applies no ceiling of its own: judging the
+        # envelope under this app's limit is how a larger ingress limit served a planted
+        # attestation.json 200 that the uploader had shipped as undecidable, and how a smaller
+        # one 404'd a genuine receipt a peer had signed over a larger envelope. A marker that
+        # cannot be checked is no verdict: 503.
         try:
             with opener(job_id, _attest.WITHHELD_NAME) as wfh:
                 withheld: bytes | None = wfh.read(4096)
@@ -1088,29 +1090,18 @@ def build_app(
                 with contextlib.suppress(Exception):
                     why = str(json.loads(withheld).get("reason") or why)[:200]
             raise HTTPException(404, f"no execution receipt for this job: {why}")
-        # A result accepted before the trust gate reserved the name can DECLARE an artifact at
-        # (or under) attestation.json, and one whose envelope cannot be parsed cannot rule that
-        # out; the retention sweeps recover both as-is. Those bytes may be analysis output: never
-        # serve them as a receipt (nor read them as a tombstone). No dispatcher signs over either.
-        # Nor over NO envelope: a genuine receipt always signs metadata_sha256, and put_output
-        # stores metadata.json LAST -- so a prefix without it is a partial upload (possibly of an
-        # as-is tree whose declared artifact at attestation.json already landed) or a seal
-        # put_output would not ship. Absent envelope = no receipt, never "nothing declared".
-        # The same ceiling the attest-side decisions apply, from THIS app's configured limits.
-        envelope_cap = _attest.envelope_cap(_limits)
+        # NO ENVELOPE, NO RECEIPT -- an existence check only, nothing is read or parsed. A
+        # genuine receipt always signs metadata_sha256, and put_output stores metadata.json
+        # LAST, so a prefix without it is a partial upload (possibly of an as-is tree whose
+        # attestation.json landed before its marker did) or a seal put_output would not ship.
         try:
-            with opener(job_id, "metadata.json") as mfh:
-                envelope = mfh.read(envelope_cap + 1)
+            opener(job_id, "metadata.json").close()
         except Exception as exc:
             if not _is_missing_blob(exc):
-                _log.warning("attestation: envelope read failed for job=%s: %s", job_id, exc)
+                _log.warning("attestation: envelope check failed for job=%s: %s", job_id, exc)
                 raise HTTPException(503, "could not read the execution receipt")
             raise HTTPException(404, "no execution receipt for this job: "
                                      f"{_attest.RECEIPT_ENVELOPE_ABSENT_REASON}")
-        why_not = _attest.envelope_receipt_path_protection(
-            None if len(envelope) > envelope_cap else envelope)
-        if why_not is not None:
-            raise HTTPException(404, f"no execution receipt for this job: {why_not}")
         try:
             fh = opener(job_id, _attest.RECEIPT_NAME)
         except Exception as exc:

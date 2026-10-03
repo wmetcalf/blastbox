@@ -258,25 +258,53 @@ def test_a_tombstone_is_404_never_served(tmp_path):
     assert "no attestation key" in r.json()["detail"]
 
 
+def _migrate_as_is(tmp_path, store, out_setup):
+    """Ship a legacy DONE tree through the REAL uploader (the migration), which uploads it as-is
+    with the withheld marker; returns (job, blobs)."""
+    import logging
+
+    from blastbox.host.jobs.retention import migrate_legacy_results
+
+    job_root = tmp_path / "jobs"
+    job = Job.new(engine="clippyshot", filename="a.docx")
+    job.status = JobStatus.DONE
+    store.create(job)
+    out = job_root / job.job_id / "output"
+    out.mkdir(parents=True)
+    out_setup(out)
+    blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
+    assert migrate_legacy_results(job_root, blobs, store, logging.getLogger("t")) == (1, 0, 0)
+    return job, blobs
+
+
+def _stored_marker(blobs, job_id):
+    with blobs.open_result_only(job_id, attest.WITHHELD_NAME) as fh:
+        return json.loads(fh.read())
+
+
 @pytest.mark.parametrize("rel,data", [
     ("attestation.json", b'{"attestation": {"looks": "signed"}, "signature": "x"}'),
     ("attestation.json/page.png", b"accepted artifact"),
 ])
 def test_a_declared_artifact_at_the_receipt_name_is_never_served_as_a_receipt(tmp_path, rel,
                                                                              data):
-    """A result accepted before the name was reserved (and recovered as-is by the sweep) can hold
-    a DECLARED artifact at attestation.json. Its bytes are the analysis output, not a receipt:
-    the route answers "no receipt", in the tombstone's 404 shape, with the reason."""
+    """A result accepted before the name was reserved can hold a DECLARED artifact at
+    attestation.json. The uploader ships it as-is, artifact intact, WITH the withheld marker
+    (in the stored result), and the route answers "no receipt" with the uploader's reason. The
+    route used to re-derive this from the envelope; the marker now carries it (D1/D2)."""
     client, store = _make_client(tmp_path)
-    job = Job.new(engine="clippyshot", filename="a.docx")
-    job.status = JobStatus.DONE
-    store.create(job)
-    out = tmp_path / "work" / job.job_id / "output"
-    (out / rel).parent.mkdir(parents=True, exist_ok=True)
-    (out / rel).write_bytes(data)
-    (out / "metadata.json").write_text(json.dumps({"artifacts": [
-        {"id": "a", "path": rel, "sha256": hashlib.sha256(data).hexdigest()}]}))
-    _push_to_blob(tmp_path, job.job_id, out)
+
+    def setup(out):
+        (out / rel).parent.mkdir(parents=True, exist_ok=True)
+        (out / rel).write_bytes(data)
+        (out / "metadata.json").write_text(json.dumps({"artifacts": [
+            {"id": "a", "path": rel, "sha256": hashlib.sha256(data).hexdigest()}]}))
+
+    job, blobs = _migrate_as_is(tmp_path, store, setup)
+    assert _stored_marker(blobs, job.job_id) == attest.tombstone_body(
+        attest.RECEIPT_PATH_DECLARED_REASON)
+    with blobs.open_result_only(job.job_id, rel) as fh:
+        assert fh.read() == data                             # the artifact shipped intact
     r = client.get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 404, r.text
     detail = r.json()["detail"]
@@ -286,22 +314,22 @@ def test_a_declared_artifact_at_the_receipt_name_is_never_served_as_a_receipt(tm
 
 def test_an_envelope_that_cannot_rule_out_an_artifact_at_the_receipt_name_serves_no_receipt(
         tmp_path):
-    """A result recovered as-is because its envelope could not be parsed: whatever sits at
-    attestation.json cannot be ruled out as analysis output (and no dispatcher ever signs over an
-    unparseable envelope), so it is never served as a receipt."""
+    """A result shipped as-is because its envelope could not be parsed: whatever sits at
+    attestation.json cannot be ruled out as analysis output, so the uploader stores the marker
+    and the route never serves those bytes as a receipt."""
     client, store = _make_client(tmp_path)
-    job = Job.new(engine="clippyshot", filename="a.docx")
-    job.status = JobStatus.DONE
-    store.create(job)
-    out = tmp_path / "work" / job.job_id / "output"
-    out.mkdir(parents=True)
-    (out / attest.RECEIPT_NAME).write_bytes(b'{"attestation": {"looks": "signed"}, '
-                                            b'"signature": "x"}')
-    (out / "metadata.json").write_text('{"artifacts": [{"id": "a", "pa')
-    _push_to_blob(tmp_path, job.job_id, out)
+
+    def setup(out):
+        (out / attest.RECEIPT_NAME).write_bytes(b'{"attestation": {"looks": "signed"}, '
+                                                b'"signature": "x"}')
+        (out / "metadata.json").write_text('{"artifacts": [{"id": "a", "pa')
+
+    job, blobs = _migrate_as_is(tmp_path, store, setup)
+    assert _stored_marker(blobs, job.job_id) == attest.tombstone_body(
+        attest.RECEIPT_PATH_UNDECIDABLE_REASON)
     r = client.get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 404, r.text
-    assert r.json()["detail"].startswith("no execution receipt for this job: ")
+    assert attest.RECEIPT_PATH_UNDECIDABLE_REASON in r.json()["detail"]
 
 
 def test_legacy_tree_is_never_read_even_when_the_result_is_durable(tmp_path, key):
@@ -471,10 +499,11 @@ class _FlakyEnvelopeBlobs(LocalBlobStore):
         return _Broken()
 
 
-@pytest.mark.parametrize("mode", ["open", "read"])
+@pytest.mark.parametrize("mode", ["open"])
 def test_an_envelope_read_error_is_503_not_a_verdict(tmp_path, key, mode):
-    """A transient error reading the envelope is neither "absent" nor "nothing declared": the
-    route answers 503 (retry), never a 404 that says no receipt exists, never the receipt."""
+    """A transient error checking the envelope exists is not "absent": the route answers 503
+    (retry), never a 404 that says no receipt exists, never the receipt. (The route only checks
+    that metadata.json exists and reads none of it, so a mid-read failure no longer applies.)"""
     store = InMemoryJobStore()
     job, _, _ = _done_with_receipt(tmp_path, store, key)
     app = build_app(job_store=store, job_root=tmp_path / "jobs", allowed_engines={"clippyshot"},
@@ -485,22 +514,25 @@ def test_an_envelope_read_error_is_503_not_a_verdict(tmp_path, key, mode):
     assert client.get(f"/v1/jobs/{job.job_id}/attestation").status_code == 503
 
 
-def test_an_envelope_over_the_cap_serves_no_receipt(tmp_path, key, monkeypatch):
-    """The route reads at most ENVELOPE_MAX_BYTES + 1 bytes; an envelope past the cap cannot be
-    parsed whole, so it cannot rule out a declared artifact at attestation.json: 404, even when
-    the bytes read happen to parse."""
-    client, store = _make_client(tmp_path)
-    job, out, _ = _done_with_receipt(tmp_path, store, key)
-    assert client.get(f"/v1/jobs/{job.job_id}/attestation").status_code == 200   # control
-    size = len((out / "metadata.json").read_bytes())
-    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", size - 1)   # read cap+1 = the whole file
-    # ...and the app's configured metadata limit no higher (envelope_cap is their max).
-    app = build_app(job_store=store, job_root=tmp_path / "jobs", allowed_engines={"clippyshot"},
-                    limits=Limits(max_metadata_bytes=size - 1), api_workers=2, zip_password="",
-                    blob_store=LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs"))
-    r = TestClient(app).get(f"/v1/jobs/{job.job_id}/attestation")
-    assert r.status_code == 404, r.text
-    assert attest.RECEIPT_PATH_UNDECIDABLE_REASON in r.json()["detail"]
+def test_a_genuine_receipt_over_this_ingress_cap_still_serves(tmp_path, key, monkeypatch):
+    """A peer dispatcher configured with a larger BLASTBOX_MAX_METADATA sealed and signed over
+    an envelope past THIS ingress's ceiling. The route used to read the envelope under its own
+    cap, judge it undecidable and 404 the genuine receipt (round-3 review D1). The uploader's
+    as-is verdict now travels as the withheld marker, so the route reads no envelope: with no
+    marker the receipt is served."""
+    store = InMemoryJobStore()
+    job, out = _make_done_job(tmp_path, store)
+    meta = json.loads((out / "metadata.json").read_bytes())
+    meta["pad"] = "x" * 4096
+    (out / "metadata.json").write_bytes(json.dumps(meta).encode())
+    body = attest.seal_receipt(out, key=key, observation=attest.RunObservation(
+        job_id=job.job_id, engine=job.engine, input_sha256="d" * 64, worker_runtime="runsc",
+        worker_tier=None, started_at_ms=1, finished_at_ms=2))
+    _push_to_blob(tmp_path, job.job_id, out)
+    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 1024)
+    r = _route_with_limit(tmp_path, store, 1024).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 200, r.text
+    assert r.json() == body
 
 
 def test_an_envelope_within_the_configured_metadata_limit_serves_its_receipt(
@@ -715,6 +747,8 @@ def test_a_migration_with_a_smaller_limit_than_the_ingress_never_serves_a_forged
     r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 404, r.text
     assert r.content != _FORGED_RECEIPT
+    assert _stored_marker(blobs, job.job_id) == attest.tombstone_body(
+        attest.RECEIPT_PATH_UNDECIDABLE_REASON)                 # in the STORED result
 
 
 def test_a_genuine_receipt_beside_a_large_envelope_still_serves(tmp_path, key, monkeypatch):
