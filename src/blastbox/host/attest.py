@@ -370,7 +370,7 @@ _ENVELOPE_MAX_BYTES = 64 << 20
 
 
 class ReceiptPathOccupied(OSError):
-    """``attestation.json`` is a directory the envelope declares artifacts under (or the envelope
+    """``attestation.json`` holds an artifact the envelope declares (or the envelope
     cannot be read to rule that out). Replacing it would delete accepted artifacts, so nothing is
     written there: no receipt and no tombstone. An OSError so the sweeps' existing "leave it
     retained" OSError path handles it."""
@@ -398,7 +398,7 @@ def _envelope_artifact_paths(seal: Path) -> list[str] | None:
 
 
 def _may_hold_declared_artifacts(out_dir: Path) -> bool:
-    """Whether the envelope declares (or might declare) an artifact under attestation.json/."""
+    """Whether the envelope declares (or might declare) an artifact at or under attestation.json."""
     try:
         paths = _envelope_artifact_paths(out_dir / _SEAL_NAME)
     except FileNotFoundError:
@@ -412,20 +412,22 @@ def strip_receipt(out_dir: Path) -> None:
     """Remove whatever sits at ``<out_dir>/attestation.json`` (file, directory or symlink)
     without following a symlink. A worker can write into its output tree.
 
-    Raises ReceiptPathOccupied, deleting nothing, when it is a DIRECTORY the envelope declares
-    artifacts under (possible only in a tree accepted before the trust gate reserved the whole
-    name): never destroy accepted output to make room for a receipt."""
+    Raises ReceiptPathOccupied, deleting nothing, when the envelope declares an artifact AT or
+    UNDER that name -- a top-level file named attestation.json or a directory of artifacts
+    (possible only in a tree accepted before the trust gate reserved the whole name), or when the
+    envelope cannot be read to rule that out: never destroy accepted output to make room for a
+    receipt. Anything undeclared there (worker-planted junk, a stale receipt) is replaced."""
     out_dir = Path(out_dir)
     target = out_dir / RECEIPT_NAME
     try:
         st = os.lstat(target)
     except FileNotFoundError:
         return
+    if _may_hold_declared_artifacts(out_dir):
+        raise ReceiptPathOccupied(
+            errno.EEXIST, f"{RECEIPT_NAME} holds a declared artifact (or the envelope cannot "
+                          f"rule that out); refusing to replace it")
     if stat.S_ISDIR(st.st_mode):
-        if _may_hold_declared_artifacts(out_dir):
-            raise ReceiptPathOccupied(
-                errno.EEXIST, f"{RECEIPT_NAME} is a directory holding declared artifacts (or the "
-                              f"envelope cannot rule that out); refusing to replace it")
         shutil.rmtree(target)
     else:
         os.unlink(target)

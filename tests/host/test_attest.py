@@ -357,6 +357,40 @@ def test_receipt_writes_never_delete_a_declared_artifact_under_the_receipt_name(
     assert isinstance(exc, OSError)        # the sweeps' "leave it retained" path handles it
 
 
+@pytest.mark.parametrize("op", ["seal_keyed", "seal_keyless", "tombstone", "strip"])
+def test_receipt_writes_never_delete_a_declared_top_level_artifact_file(tmp_path, op):
+    """A tree accepted before the name was reserved can declare a top-level ARTIFACT at exactly
+    attestation.json -- a regular file. strip_receipt only checked the envelope for a directory
+    and unlinked a file unconditionally, destroying the accepted artifact (and the upload then
+    shipped bytes that no longer match the sealed envelope)."""
+    out = _tree(tmp_path, json.dumps({"artifacts": [
+        {"id": "a", "path": "attestation.json"}]}).encode())
+    (out / attest.RECEIPT_NAME).write_bytes(b"ACCEPTED ARTIFACT BYTES")
+    key = attest.load_or_create_key(tmp_path / "k")
+    fn = {
+        "seal_keyed": lambda: attest.seal_receipt(out, key=key, observation=_obs()),
+        "seal_keyless": lambda: attest.seal_receipt(out, key=None, observation=_obs()),
+        "tombstone": lambda: attest.write_tombstone(out, "retained result re-uploaded"),
+        "strip": lambda: attest.strip_receipt(out),
+    }[op]
+    exc = _attempt(fn)
+    assert (out / attest.RECEIPT_NAME).read_bytes() == b"ACCEPTED ARTIFACT BYTES"
+    assert isinstance(exc, attest.ReceiptPathOccupied)
+
+
+def test_an_undeclared_file_at_the_receipt_name_is_still_replaced(tmp_path):
+    """Worker-planted junk (or a stale receipt) the envelope does not declare is not protected."""
+    out = _tree(tmp_path, json.dumps({"artifacts": [{"id": "a", "path": "page.png"}]}).encode())
+    (out / attest.RECEIPT_NAME).write_bytes(b"planted")
+    attest.strip_receipt(out)
+    assert not (out / attest.RECEIPT_NAME).exists()
+    attest.write_tombstone(out, "x")
+    assert _tombstone(out)["reason"] == "x"
+    key = attest.load_or_create_key(tmp_path / "k")
+    (out / attest.RECEIPT_NAME).write_bytes(b"planted again")
+    assert attest.seal_receipt(out, key=key, observation=_obs()) is not None
+
+
 def test_an_unreadable_envelope_never_licenses_deleting_a_receipt_directory(tmp_path):
     """If the envelope cannot be parsed we cannot rule out a declared artifact in there."""
     out = _nested_artifact_tree(tmp_path, b"not json")
