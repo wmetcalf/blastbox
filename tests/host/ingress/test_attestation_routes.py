@@ -2384,3 +2384,30 @@ def test_attest_key_output_is_a_usable_verify_key_as_is(tmp_path, monkeypatch, c
     printed = capsys.readouterr().out.encode()
     assert (attest.VerifyKey.parse(printed).key_id
             == attest.load_existing_key(path).key_id)
+
+
+@pytest.mark.parametrize("argv,env", [
+    (["--max-metadata", "0"], None),
+    ([], "junk"),
+    (["--remark", "--max-metadata", "0"], None),
+    (["--remark"], "junk"),
+], ids=["flag-zero", "env-junk", "remark-flag-zero", "remark-env-junk"])
+def test_migrate_results_refuses_a_bad_metadata_limit_as_a_usage_error(
+        tmp_path, monkeypatch, capsys, key, argv, env):
+    """A bad --max-metadata or BLASTBOX_MAX_METADATA is a usage error (exit 2, one line), not
+    a traceback with the 'something failed, rerun it' exit 1."""
+    from blastbox.host import cli
+
+    if env is None:
+        monkeypatch.delenv("BLASTBOX_MAX_METADATA", raising=False)
+    else:
+        monkeypatch.setenv("BLASTBOX_MAX_METADATA", env)
+    monkeypatch.setenv("BLASTBOX_ATTEST_KEY", str(tmp_path / "keys" / "attest.key"))
+    monkeypatch.setattr("blastbox.host.blobs.factory.build_blob_store_from_env",
+                        lambda env: object())
+    monkeypatch.setattr("blastbox.host.jobs.factory.build_job_store_from_env", lambda: object())
+    parser = cli.build_parser()
+    args = parser.parse_args(["migrate-results", "--job-root", str(tmp_path), *argv])
+    assert args.func(args) == 2
+    err = capsys.readouterr().err
+    assert "metadata" in err.lower() and "Traceback" not in err

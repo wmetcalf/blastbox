@@ -145,8 +145,8 @@ storing anything; `--limit N` re-marks (or replaces) in batches.
 
 10. **`/metrics` node totals fail closed.** The ingress's `node_*` series are omitted, not
     undercounted, when any dispatcher snapshot cannot be stat'd, opened or read, or exceeds the
-    size cap (at listing, at `fstat`, or while being read). The omission warning names the
-    unreadable snapshots. A snapshot removed after the listing still just drops out.
+    size cap (at listing, at `fstat`, or while being read). The ingress logs one warning naming
+    the share directory (once per process) — not the individual snapshot. A snapshot removed after the listing still just drops out.
 
 ## Key rotation
 

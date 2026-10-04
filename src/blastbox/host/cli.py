@@ -1650,6 +1650,14 @@ def _migrate_results_cmd(args) -> int:
     if args.verify_key and not args.remark:
         print("error: --verify-key applies only with --remark", file=sys.stderr)
         return 2
+    # The service's metadata limit, so the receipt-path decision matches the attestation route's
+    # (see migrate_legacy_results). None = unknown: envelopes past the fixed floor are refused
+    # rather than judged against the wrong limit. A bad value is a usage error, never a traceback.
+    try:
+        limits = _migration_limits(args)
+    except ValueError as exc:
+        print(f"error: metadata limit: {exc}", file=sys.stderr)
+        return 2
     key = _verify_keys_for_remark(args.verify_key) if args.remark else None
     if args.remark and key is None:
         return 2
@@ -1662,15 +1670,7 @@ def _migrate_results_cmd(args) -> int:
     store = build_job_store_from_env()
     log = _logging.getLogger("blastbox.migrate")
     if key is not None:
-        return _remark_receipts(args, blobs, store, log, key)
-    # The service's metadata limit, so the receipt-path decision matches the attestation route's
-    # (see migrate_legacy_results). None = unknown: BLASTBOX_MAX_METADATA from this shell if set,
-    # else envelopes past the fixed floor are refused rather than judged against the wrong limit.
-    limits = None
-    if args.max_metadata is not None:
-        from blastbox.limits import Limits as _Limits
-
-        limits = _Limits(max_metadata_bytes=args.max_metadata)
+        return _remark_receipts(args, blobs, store, log, key, limits)
     migrated, skipped, failed = migrate_legacy_results(
         job_root,
         blobs,
@@ -1732,16 +1732,25 @@ def _attest_key_for_remark():
     return key
 
 
-def _remark_receipts(args, blobs, store, log, keys) -> int:
+def _migration_limits(args):
+    """--max-metadata, else BLASTBOX_MAX_METADATA from this shell, else None. Raises
+    ValueError on a value Limits refuses."""
+    import os as _os
+
+    from blastbox.limits import Limits as _Limits
+
+    if args.max_metadata is not None:
+        return _Limits(max_metadata_bytes=args.max_metadata)
+    if _os.environ.get("BLASTBOX_MAX_METADATA") is not None:
+        return _Limits.from_env()
+    return None
+
+
+def _remark_receipts(args, blobs, store, log, keys, limits) -> int:
     """``migrate-results --remark``: store the cleared marker beside each genuine receipt one of
     ``keys`` signed that a 0.1.44/0.1.45 upload left unmarked (see remark_stored_receipts)."""
     from blastbox.host.jobs.retention import JobEnumerationFailed, remark_stored_receipts
 
-    limits = None
-    if args.max_metadata is not None:
-        from blastbox.limits import Limits as _Limits
-
-        limits = _Limits(max_metadata_bytes=args.max_metadata)
     try:
         remarked, already, unverified, failed, replaced = remark_stored_receipts(
             blobs, store, keys, log, limit=args.limit, dry_run=args.dry_run, limits=limits)
