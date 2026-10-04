@@ -704,7 +704,7 @@ def migrate_legacy_results(
     marker, which the attestation route honours before anything else -- so a ceiling mismatch
     can no longer make the route serve the worker's attestation.json as a receipt; it can only
     ship a tree as-is (planted file and all, withheld) that the service's limit would have
-    stripped. To avoid that, with NEITHER limit known an envelope past the fixed floor
+    tombstoned. To avoid that, with NEITHER limit known an envelope past the fixed floor
     (ENVELOPE_MAX_BYTES, which every ceiling is at least) is refused -- left in place, counted
     failed -- rather than judged against a limit the service may not share.
     """

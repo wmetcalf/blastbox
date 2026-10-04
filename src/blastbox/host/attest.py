@@ -480,7 +480,8 @@ RECEIPT_LEGACY_MIGRATED_REASON = "a legacy result migrated to the store carries 
 def envelope_receipt_path_protection(data: bytes | None) -> str | None:
     """Why whatever sits at attestation.json in a result with these envelope bytes must be left
     alone and never presented as a receipt or tombstone -- or None when the envelope rules that
-    out. ``data`` None = the envelope is larger than ENVELOPE_MAX_BYTES (cannot be parsed whole).
+    out. ``data`` None = the envelope is larger than the caller's :func:`envelope_cap` (cannot be
+    parsed whole).
 
     Two verdicts: the envelope DECLARES an artifact at or under the name (only possible in a tree
     accepted before the trust gate reserved it), or it cannot be parsed, so nothing rules that
@@ -506,9 +507,13 @@ def tree_receipt_path_protection(out_dir: Path, *, limits: Limits | None = None)
     "cannot rule out" (protect). Opened O_NOFOLLOW|O_NONBLOCK and judged on the descriptor, so a
     FIFO never blocks. Any other OSError -- EIO, EACCES, a flap -- is no verdict and propagates,
     so the caller retries rather than acting on it. ``limits`` as for :func:`envelope_cap`: a
-    caller outside the service (the migration CLI) passes the service's, so it strips what the
-    service would. The attestation route never repeats this test: an as-is verdict travels with
-    the tree as the withheld marker (:func:`write_withheld_marker`)."""
+    caller outside the service (the migration CLI) passes the service's, so it judges as the
+    service would. An as-is verdict travels with the tree as the withheld marker
+    (:func:`write_withheld_marker`), and the attestation route ALSO runs
+    :func:`envelope_receipt_path_protection` on the STORED envelope, under its own
+    :func:`envelope_cap`, for every result without a withheld body (unmarked or cleared) -- a
+    cleared marker cannot vouch, because a pre-#188 dispatcher shipped a worker's tree verbatim.
+    Do not remove that route check as redundant."""
     shipped, data = _shipped_envelope(out_dir, limits)
     return envelope_receipt_path_protection(data) if shipped else None
 
