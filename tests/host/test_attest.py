@@ -312,13 +312,25 @@ def test_sha256_file_is_the_sha256_of_the_bytes(tmp_path):
     assert attest.sha256_file(p) == hashlib.sha256(b"malware" * 100_000).hexdigest()
 
 
-def test_no_receipt_when_the_envelope_declares_the_reserved_name(tmp_path):
-    """Defence in depth behind the trust gate: never write a receipt over a declared artifact."""
-    out = _tree(tmp_path, json.dumps({"artifacts": [
-        {"id": "r", "path": "./attestation.json"}]}).encode())
-    key = attest.load_or_create_key(tmp_path / "k")
-    assert attest.seal_receipt(out, key=key, observation=_obs()) is None
-    assert "reserved" in _tombstone(out)["reason"]
+@pytest.mark.parametrize("keyed", [True, False], ids=["keyed", "keyless"])
+def test_the_seal_strips_the_reserved_names_without_re_reading_the_envelope(tmp_path, keyed):
+    """seal_receipt runs only on a tree the trust gate just validated (lens r7 F5: the envelope-
+    re-reading branch was dead in production and is gone). Its strip is unconditional: even an
+    envelope that could not be parsed to rule out a declared artifact -- which the gate would
+    have refused -- never leaves a worker-planted receipt or marker in a tree that ships."""
+    out = _tree(tmp_path, b"not json")
+    (out / attest.RECEIPT_NAME).write_bytes(b"planted receipt")
+    (out / attest.WITHHELD_NAME).write_bytes(b"planted marker")
+    key = attest.load_or_create_key(tmp_path / "k") if keyed else None
+    body = attest.seal_receipt(out, key=key, observation=_obs())
+    stored = (out / attest.RECEIPT_NAME).read_bytes()
+    assert stored != b"planted receipt"
+    if keyed:
+        assert body is not None and attest.verify_body(key, json.loads(stored))
+    else:
+        assert body is None and _tombstone(out)["reason"] == "no attestation key"
+    meta_sha = hashlib.sha256(b"not json").hexdigest()
+    assert attest.is_cleared_marker((out / attest.WITHHELD_NAME).read_bytes(), meta_sha)
 
 
 def _nested_artifact_tree(tmp_path, meta: bytes | None = None):
@@ -339,16 +351,13 @@ def _attempt(fn):
     return None
 
 
-@pytest.mark.parametrize("op", ["seal_keyed", "seal_keyless", "tombstone", "strip"])
+@pytest.mark.parametrize("op", ["tombstone", "strip"])
 def test_receipt_writes_never_delete_a_declared_artifact_under_the_receipt_name(tmp_path, op):
     """Receipt AND tombstone writes replace whatever sits at attestation.json -- which, for a
     directory, was an rmtree, taking declared artifacts with it. Fail closed instead: refuse
     (no receipt, no tombstone) and leave the artifact alone."""
     out = _nested_artifact_tree(tmp_path)
-    key = attest.load_or_create_key(tmp_path / "k")
     fn = {
-        "seal_keyed": lambda: attest.seal_receipt(out, key=key, observation=_obs()),
-        "seal_keyless": lambda: attest.seal_receipt(out, key=None, observation=_obs()),
         "tombstone": lambda: attest.write_tombstone(out, "retained result re-uploaded"),
         "strip": lambda: attest.strip_receipt(out),
     }[op]
@@ -358,7 +367,7 @@ def test_receipt_writes_never_delete_a_declared_artifact_under_the_receipt_name(
     assert isinstance(exc, OSError)        # the sweeps' "leave it retained" path handles it
 
 
-@pytest.mark.parametrize("op", ["seal_keyed", "seal_keyless", "tombstone", "strip"])
+@pytest.mark.parametrize("op", ["tombstone", "strip"])
 def test_receipt_writes_never_delete_a_declared_top_level_artifact_file(tmp_path, op):
     """A tree accepted before the name was reserved can declare a top-level ARTIFACT at exactly
     attestation.json -- a regular file. strip_receipt only checked the envelope for a directory
@@ -367,10 +376,7 @@ def test_receipt_writes_never_delete_a_declared_top_level_artifact_file(tmp_path
     out = _tree(tmp_path, json.dumps({"artifacts": [
         {"id": "a", "path": "attestation.json"}]}).encode())
     (out / attest.RECEIPT_NAME).write_bytes(b"ACCEPTED ARTIFACT BYTES")
-    key = attest.load_or_create_key(tmp_path / "k")
     fn = {
-        "seal_keyed": lambda: attest.seal_receipt(out, key=key, observation=_obs()),
-        "seal_keyless": lambda: attest.seal_receipt(out, key=None, observation=_obs()),
         "tombstone": lambda: attest.write_tombstone(out, "retained result re-uploaded"),
         "strip": lambda: attest.strip_receipt(out),
     }[op]

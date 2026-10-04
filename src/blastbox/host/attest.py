@@ -485,7 +485,8 @@ def envelope_receipt_path_protection(data: bytes | None) -> str | None:
 
     Two verdicts: the envelope DECLARES an artifact at or under the name (only possible in a tree
     accepted before the trust gate reserved it), or it cannot be parsed, so nothing rules that
-    out. seal_receipt never signs over either, so no genuine receipt is lost by refusing."""
+    out. The trust gate refuses either before a dispatcher seals, so no genuine receipt is lost
+    by refusing."""
     paths = None if data is None else _artifact_paths_of(data)
     if paths is None:
         return RECEIPT_PATH_UNDECIDABLE_REASON
@@ -496,8 +497,9 @@ def envelope_receipt_path_protection(data: bytes | None) -> str | None:
 
 def tree_receipt_path_protection(out_dir: Path, *, limits: Limits | None = None) -> str | None:
     """:func:`envelope_receipt_path_protection` for ``<out_dir>/metadata.json`` -- THE single
-    envelope test behind every receipt-path decision (the sweeps' as-is choice, strip_receipt,
-    seal_receipt), so they cannot diverge.
+    envelope test behind every receipt-path decision on a tree that did not just pass the trust
+    gate (the sweeps' as-is choice, strip_receipt without ``gate_verified``, the migration), so
+    they cannot diverge.
 
     Judged on the envelope put_output would SHIP. It ships ``metadata.json`` only as a regular,
     non-symlink file; anything else (absent, a symlink -- ELOOP under O_NOFOLLOW, dangling or not
@@ -537,18 +539,6 @@ def _shipped_envelope(out_dir: Path, limits: Limits | None) -> tuple[bool, bytes
         return True, _read_capped(fd, envelope_cap(limits))
     finally:
         os.close(fd)
-
-
-def _may_hold_declared_artifacts(out_dir: Path) -> bool:
-    """Whether the envelope declares (or might declare) an artifact at or under attestation.json:
-    :func:`tree_receipt_path_protection`, with a transient read error (EIO, EACCES...) read as
-    "cannot rule it out" -- the deletion paths fail closed where the sweeps' as-is choice would
-    instead retry. An envelope put_output would not ship (absent, symlinked, non-regular) is a
-    VERDICT there, not an error, so it protects nothing here either."""
-    try:
-        return tree_receipt_path_protection(out_dir) is not None
-    except OSError:
-        return True
 
 
 def strip_receipt(out_dir: Path, *, gate_verified: bool = False,
@@ -900,42 +890,34 @@ def is_tombstone(data: bytes) -> bool:
 
 
 def seal_receipt(out_dir: Path, *, key: AttestKey | None,
-                 observation: RunObservation | None, reason: str | None = None,
-                 gate_verified: bool = False) -> dict | None:
+                 observation: RunObservation | None, reason: str | None = None) -> dict | None:
     """Replace whatever sits at ``attestation.json`` with this dispatcher's signed receipt, or,
     when it does not sign, a tombstone saying why. Returns the SIGNED body, or None when a
     tombstone was written. Call it IMMEDIATELY before uploading ``out_dir``: the metadata hash is
     of the bytes on disk at this moment, which are the bytes put_output ships.
 
-    Raises ReceiptPathOccupied, writing nothing, when attestation.json is a directory holding
-    declared artifacts: no receipt rather than a wrong one, and never at the artifacts' expense.
-    ``gate_verified`` (the fresh-dispatch seal, see :func:`strip_receipt`): the gate already
-    ruled that out, so the envelope is not re-read for it and the strip is unconditional."""
+    ONLY for a tree the trust gate has just validated (the dispatchers' seal, through
+    :func:`seal_fresh_receipt`): the gate refuses any artifact at or under a reserved name, so
+    the envelope is not re-read and the strip is unconditional (``gate_verified``, see
+    :func:`strip_receipt`). A retained or legacy tree is never sealed here -- the sweeps judge
+    its envelope and write a tombstone or the withheld marker instead."""
     out_dir = Path(out_dir)
     if key is None:
-        write_tombstone(out_dir, "no attestation key", gate_verified=gate_verified)
+        write_tombstone(out_dir, "no attestation key", gate_verified=True)
         return None
     if observation is None:
-        write_tombstone(out_dir, reason or "run not observed", gate_verified=gate_verified)
+        write_tombstone(out_dir, reason or "run not observed", gate_verified=True)
         return None
     try:
         metadata_sha256 = sha256_file(out_dir / _SEAL_NAME)
     except (OSError, ValueError) as exc:
         _log.error("attestation: job %s has no regular metadata.json to vouch for (%s); "
                    "no receipt", observation.job_id, exc)
-        write_tombstone(out_dir, "metadata.json is not a regular file",
-                        gate_verified=gate_verified)
-        return None
-    if not gate_verified and _may_hold_declared_artifacts(out_dir):
-        # The trust gate refuses this; never let a declared artifact stand in for a receipt.
-        _log.error("attestation: job %s declares %s as an artifact; no receipt",
-                   observation.job_id, RECEIPT_NAME)
-        write_tombstone(out_dir, f"envelope declares the reserved path {RECEIPT_NAME}")
+        write_tombstone(out_dir, "metadata.json is not a regular file", gate_verified=True)
         return None
     doc = build_receipt(observation, key_id=key.key_id, metadata_sha256=metadata_sha256)
     body = {"attestation": doc, "signature": key.sign(doc)}
-    _write_atomic(out_dir, canonical(body), gate_verified=gate_verified,
-                  metadata_sha256=metadata_sha256)
+    _write_atomic(out_dir, canonical(body), gate_verified=True, metadata_sha256=metadata_sha256)
     return body
 
 
@@ -958,8 +940,7 @@ def seal_fresh_receipt(out_dir: Path, *, key: AttestKey | None,
     this way reuses the one path an object-store outage already takes, rather than inventing a
     third outcome (e.g. shipping with nothing at the name)."""
     try:
-        seal_receipt(out_dir, key=key, observation=observation, reason=reason,
-                     gate_verified=True)
+        seal_receipt(out_dir, key=key, observation=observation, reason=reason)
         return True
     except ReceiptMarkerUnwritten as exc:
         # Ours landed at RECEIPT_NAME (a genuine receipt, or seal_receipt's own tombstone); only
