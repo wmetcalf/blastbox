@@ -446,6 +446,12 @@ class S3BlobStore:
                     if not raw:
                         if inflater is not None:
                             out += inflater.flush()[: max_bytes - len(out)]
+                            if not inflater.eof and len(out) < max_bytes:
+                                # The body ended mid-stream short of the bound: a malformed
+                                # object, not a short prefix to judge. Caused, never "missing".
+                                raise BlobFetchError(
+                                    f"result fetch failed: {job_id}/{name}: truncated gzip "
+                                    f"stream") from ValueError("truncated gzip stream")
                         break
                 if inflater is None:
                     out += raw

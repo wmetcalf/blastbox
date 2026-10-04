@@ -661,3 +661,25 @@ def test_read_result_prefix_refuses_a_gzip_stream_that_never_decodes_toward_its_
         Bucket=BUCKET, Key="pfx/results/jz/metadata.json", Body=body, ContentEncoding="gzip")
     with pytest.raises(BlobFetchError, match="outgrew"):
         store.read_result_prefix("jz", "metadata.json", 1024)
+
+
+def test_read_result_prefix_refuses_a_truncated_gzip_object(store):
+    """A gzip object cut short before the bound is reached is a malformed stored object: a read
+    error (caused, so never "missing"), not a short but valid prefix to judge."""
+    import gzip as _gzip
+
+    body = _gzip.compress(b'{"artifacts": []}')[:-8]          # trailer removed
+    boto3.client("s3", region_name="us-east-1").put_object(
+        Bucket=BUCKET, Key="pfx/results/jt/metadata.json", Body=body, ContentEncoding="gzip")
+    with pytest.raises(BlobFetchError, match="truncated") as ei:
+        store.read_result_prefix("jt", "metadata.json", 1024)
+    assert ei.value.__cause__ is not None
+
+
+def test_read_result_prefix_accepts_a_complete_gzip_object_shorter_than_the_bound(store):
+    import gzip as _gzip
+
+    boto3.client("s3", region_name="us-east-1").put_object(
+        Bucket=BUCKET, Key="pfx/results/jc/metadata.json",
+        Body=_gzip.compress(b'{"artifacts": []}'), ContentEncoding="gzip")
+    assert store.read_result_prefix("jc", "metadata.json", 1024) == b'{"artifacts": []}'
