@@ -2246,7 +2246,10 @@ def test_a_legacy_migration_dry_run_counts_what_the_real_run_does(tmp_path, monk
     from blastbox.host.blobs.local import LocalBlobStore
 
     monkeypatch.delenv("BLASTBOX_MAX_METADATA", raising=False)
-    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 64)
+    if case == "oversized-unknown-limit":
+        # Only this case may hit the size refusal: with the floor lowered for every case, the
+        # marker-path envelope was refused for its SIZE and never reached the marker check.
+        monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 64)
     root = tmp_path / "jobs"
     store = InMemoryJobStore()
     job = Job.new(engine="clippyshot", filename="x")
