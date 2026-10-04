@@ -765,7 +765,7 @@ def _marker_write_fails_once(monkeypatch):
 
 @pytest.mark.parametrize("tier", ["cold", "warm", "vm"])
 def test_a_marker_failure_after_the_receipt_landed_keeps_the_genuine_receipt(
-        tmp_path, key, monkeypatch, tier):
+        tmp_path, key, monkeypatch, tier, caplog):
     """seal_receipt wrote OUR receipt, then the cleared-marker write failed (ENOSPC once). The
     fallback used to overwrite the genuine receipt with a "signing failed" tombstone and ship it:
     the receipt was lost for a wrong reason. A marker-only failure must instead refuse the upload
@@ -776,8 +776,13 @@ def test_a_marker_failure_after_the_receipt_landed_keeps_the_genuine_receipt(
     from fastapi.testclient import TestClient
 
     from blastbox.host.ingress.app import build_app
-    from blastbox.host.jobs.retention import PENDING_UPLOAD_SENTINEL, retry_pending_uploads
+    from blastbox.host.jobs.retention import (
+        PENDING_UPLOAD_SENTINEL,
+        RESULT_RETAINED_MARKER,
+        retry_pending_uploads,
+    )
 
+    caplog.set_level(logging.INFO)
     calls = _marker_write_fails_once(monkeypatch)
     if tier == "cold":
         store = InMemoryJobStore()
@@ -793,6 +798,14 @@ def test_a_marker_failure_after_the_receipt_landed_keeps_the_genuine_receipt(
     # Nothing uploaded at the seal: no tombstone in the store, the tree is retained.
     assert not _receipt_path(tmp_path, job).exists()
     assert store.get(job.job_id).status == JobStatus.FAILED
+    # lens r7 F3: the store was never contacted and the receipt WAS written, so the job's error
+    # must not report an upload failure, nor the log a missing receipt or a discarded result.
+    error = store.get(job.job_id).error or ""
+    assert "upload failed" not in error and "receipt seal incomplete" in error, error
+    assert RESULT_RETAINED_MARKER in error
+    logged = caplog.text
+    assert "no receipt or tombstone could be written" not in logged
+    assert "result discarded" not in logged
     assert (tmp_path / "jobs" / job.job_id / PENDING_UPLOAD_SENTINEL).exists()
     local = tmp_path / "jobs" / job.job_id / "output" / attest.RECEIPT_NAME
     _verify(key, json.loads(local.read_bytes()))          # the genuine receipt, kept

@@ -744,6 +744,12 @@ def write_cleared_marker(out_dir: Path, *, limits: Limits | None = None) -> None
 #: the cleared body) is reported with.
 RECEIPT_WITHHELD_REASON = "the uploader withheld the receipt for this result"
 
+# A dispatcher whose seal_fresh_receipt returned False never contacts the result store: what is
+# at attestation.json (our receipt, a tombstone, or possibly a worker-planted file when nothing
+# could be written) lacks its cleared marker. The job is FAILED with this in its error and the
+# tree retained for the pending-upload sweep -- not an upload failure.
+SEAL_INCOMPLETE_REASON = "receipt seal incomplete"
+
 
 def write_withheld_marker(out_dir: Path, reason: str, *, limits: Limits | None = None) -> None:
     """Record, IN the tree, that it is shipped as-is with no receipt: a tombstone-shaped
@@ -938,9 +944,10 @@ def seal_fresh_receipt(out_dir: Path, *, key: AttestKey | None,
     Returns whether the tree is SAFE TO UPLOAD: True once a receipt or tombstone is at
     attestation.json WITH its cleared marker. False when our receipt landed but its marker did
     not (ReceiptMarkerUnwritten: the receipt is kept, never tombstoned over, and the sweep below
-    ships it with its marker), or when a tombstone's marker failed, or when neither could be written (ENOSPC, EIO on the write...): a
-    worker-planted receipt may still be sitting there, and without a tombstone a superseded
-    attempt's receipt in the store would not be overwritten either. The caller must then NOT
+    ships it with its marker), or when a tombstone's marker failed, or when neither could be
+    written (ENOSPC, EIO on the write...): a worker-planted receipt may then still be sitting
+    there, and without a tombstone a superseded attempt's receipt in the store would not be
+    overwritten either. The caller must then NOT
     upload and takes its ordinary upload-failure path -- FAILED, tree retained for the
     pending-upload sweep, which sanitises attestation.json before it uploads. Failing closed
     this way reuses the one path an object-store outage already takes, rather than inventing a
@@ -958,9 +965,9 @@ def seal_fresh_receipt(out_dir: Path, *, key: AttestKey | None,
                    "uploading -- the pending-upload sweep ships it with its marker",
                    job_id, WITHHELD_NAME, exc)
         return False
-    except Exception as exc:  # noqa: BLE001 - a receipt problem must never fail a job by itself
-        _log.error("attestation: could not write the receipt for job %s (%s); the job "
-                   "completes without one", job_id, exc)
+    except Exception as exc:  # noqa: BLE001 - fall back to a tombstone; only its failure refuses
+        _log.error("attestation: could not write the receipt for job %s (%s); writing a "
+                   "\"signing failed\" tombstone instead", job_id, exc)
     try:
         # Never ship a planted or half-written one, and overwrite a superseded attempt's. A
         # tombstone whose marker then fails raises ReceiptMarkerUnwritten here: not shipped.
