@@ -1164,7 +1164,11 @@ def build_app(
         # (deny-only: the deny paths above never need it). The envelope is not re-read: the
         # first marker was checked BOUND to the envelope we read, and an upload that replaces
         # the envelope replaces the marker first (metadata.json is stored LAST), so an unchanged
-        # marker means no upload since the first read has reached either object.
+        # marker means no WITHHOLDING upload has reached the receipt since the first read. A
+        # CLEARED re-upload can: it stores its receipt before its marker, so the receipt read may
+        # already see its bytes while the marker re-read still matches. Those bytes are that
+        # upload's genuine host receipt (or tombstone), not a worker's, so serving them is not a
+        # forgery -- at worst a genuine receipt bound to a sibling envelope of the same job.
         try:
             again = _read_result_prefix(_blob_store, job_id, _attest.WITHHELD_NAME, cap + 1)
         except Exception as exc:  # noqa: BLE001 - absent or unreadable: no stable verdict

@@ -544,8 +544,10 @@ class S3BlobStore:
         )
         return [{"Key": o["Key"]} for o in page.get("Contents", [])]
 
-    def _next_delete_page(self, prefix: str) -> list[dict[str, str]]:
-        """One page of delete targets under ``prefix``, newest-listing first.
+    def _next_delete_page(
+        self, prefix: str
+    ) -> tuple[list[dict[str, str]], list[dict[str, str]], bool]:
+        """One page of delete targets under ``prefix``: ``(noncurrent, current, full)``.
 
         Deliberately ONE page, re-listed from scratch on each call rather than
         paginated. Two reasons:
@@ -563,14 +565,23 @@ class S3BlobStore:
         tombstone for a job whose bytes are gone, and a marker left by an earlier
         keyless delete is exactly the residue this fixes.
 
-        Noncurrent versions and delete markers are ordered BEFORE the current
-        version. If a delete partially fails (Object Lock, an IAM condition), the
-        object stays visible in an ordinary listing instead of the current version
-        vanishing while older bytes remain -- the state that looks deleted but is
-        not.
+        Noncurrent versions (and noncurrent delete markers) are returned APART from
+        the current ones, and the caller deletes them in their own calls first: the
+        current version of a key goes only once it is that key's last. DeleteObjects
+        reports per-key Errors independently, so one batch holding both could delete
+        the current version while an older one failed -- and S3 then promotes that
+        older version to current: bytes this store had overwritten (a worker's
+        attestation.json under its tombstone) resurrected as the live object. Kept
+        apart, a partial failure instead leaves the object visible and unchanged.
+
+        On a truncated page the current version of the LAST listed key is held back:
+        that key's older versions may continue on the next page, unseen here.
+
+        ``full`` is whether the listing filled a page (more may lie past it).
         """
         if not self._bucket_is_versioned():
-            return self._current_keys_page(prefix)
+            keys = self._current_keys_page(prefix)
+            return [], keys, len(keys) >= _DELETE_BATCH
 
         try:
             page = self._s3.list_object_versions(
@@ -599,10 +610,18 @@ class S3BlobStore:
                 "s3:ListBucketVersions + s3:DeleteObjectVersion.",
                 self._bucket, type(exc).__name__,
             )
-            return self._current_keys_page(prefix)
+            keys = self._current_keys_page(prefix)
+            return [], keys, len(keys) >= _DELETE_BATCH
         entries = [*page.get("Versions", []), *page.get("DeleteMarkers", [])]
-        entries.sort(key=lambda e: bool(e.get("IsLatest")))
-        return [{"Key": e["Key"], "VersionId": e["VersionId"]} for e in entries]
+        truncated = bool(page.get("IsTruncated"))
+        # Keys list in order, each key's versions together; only the last key can spill over.
+        last_key = page.get("NextKeyMarker") or max((e["Key"] for e in entries), default=None)
+        noncurrent = [{"Key": e["Key"], "VersionId": e["VersionId"]}
+                      for e in entries if not e.get("IsLatest")]
+        current = [{"Key": e["Key"], "VersionId": e["VersionId"]}
+                   for e in entries
+                   if e.get("IsLatest") and not (truncated and e["Key"] == last_key)]
+        return noncurrent, current, truncated or len(entries) >= _DELETE_BATCH
 
     def delete_job(self, job_id: str) -> None:
         """Drop this job's RESULTS only.
@@ -640,11 +659,17 @@ class S3BlobStore:
         # _next_delete_page for why this is not a paginate-and-delete loop. The pass
         # stops as soon as one makes no progress, so an undeletable object cannot
         # spin here -- it lands in `errors` and the raise below reports it.
+        #
+        # Noncurrent versions FIRST, in calls of their own, and a page's current versions only
+        # when it lists no noncurrent one (see _next_delete_page): a current version deleted
+        # beside a noncurrent one that failed lets S3 promote the older bytes to current.
         while True:
-            page = self._next_delete_page(prefix)
-            targets = [t for t in page if t["Key"] != keep]
+            noncurrent, current, full = self._next_delete_page(prefix)
+            noncurrent = [t for t in noncurrent if t["Key"] != keep]
+            current = [t for t in current if t["Key"] != keep]
+            targets = noncurrent or current
             if not targets:
-                if len(page) >= _DELETE_BATCH:
+                if full:
                     # A whole page of `keep`'s versions: what lies past it cannot be listed
                     # without deleting `keep` first, which the ordering forbids. Retryable.
                     raise BlobFetchError(
@@ -660,7 +685,8 @@ class S3BlobStore:
                 for err in failed:
                     errors[(err.get("Key"), err.get("VersionId"))] = err
                 deleted += len(batch) - len(failed)
-            if deleted == 0:
+            if deleted == 0 or (errors and targets is noncurrent):
+                # A noncurrent version left behind: stop before ANY current version is deleted.
                 break
         if errors:
             first = next(iter(errors.values()))

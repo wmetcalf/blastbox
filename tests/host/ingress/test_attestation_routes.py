@@ -2655,3 +2655,64 @@ def test_a_marker_that_vanishes_or_fails_on_the_re_read_is_503(tmp_path, request
     r = _client_on(tmp_path, store, blobs).get(f"/v1/jobs/{job.job_id}/attestation")
     assert len(count) == 2
     assert r.status_code == 503, r.text
+
+
+# ---------------------------------------------------------------------------
+# A versioned partial delete never resurrects a noncurrent receipt (round-15 review)
+# ---------------------------------------------------------------------------
+
+
+def _fail_noncurrent_deletes(blobs, s3, key):
+    """delete_objects with a per-key error on every NONCURRENT version of ``key``: S3 deletes the
+    rest of the batch and reports only those in Errors (HTTP 200)."""
+    real = blobs._s3.delete_objects
+    old = {v["VersionId"] for v in s3.list_object_versions(Bucket="withheld", Prefix=key)
+           .get("Versions", []) if not v["IsLatest"] and v["Key"] == key}
+    assert old
+
+    def delete_objects(Bucket, Delete):  # noqa: N803 — boto3's parameter names
+        fail = [o for o in Delete["Objects"] if o.get("VersionId") in old]
+        rest = [o for o in Delete["Objects"] if o.get("VersionId") not in old]
+        resp = real(Bucket=Bucket, Delete={"Objects": rest}) if rest else {}
+        resp["Errors"] = [{"Key": o["Key"], "VersionId": o["VersionId"], "Code": "InternalError"}
+                          for o in fail]
+        return resp
+    blobs._s3.delete_objects = delete_objects
+
+
+def test_a_versioned_partial_delete_never_resurrects_the_worker_receipt(tmp_path, request):
+    """Versioned bucket: an as-is upload died before its envelope (withheld marker + worker
+    attestation.json), then a migration tombstoned it (tombstone + cleared marker + envelope), so
+    the worker bytes live on as a NONCURRENT version under the tombstone. A delete_job whose
+    per-key error hits that old version while the current tombstone version is deleted made the
+    worker bytes current again beside the cleared marker, and the route served them 200."""
+    import boto3
+
+    blobs = _s3_store(tmp_path, request)
+    s3 = boto3.client("s3", region_name="us-east-1")
+    s3.put_bucket_versioning(Bucket="withheld", VersioningConfiguration={"Status": "Enabled"})
+    store = InMemoryJobStore()
+    job = Job.new(engine="clippyshot", filename="x")
+    job.status = JobStatus.DONE
+    store.create(job)
+    early = tmp_path / "early"
+    early.mkdir()
+    (early / attest.RECEIPT_NAME).write_bytes(_FORGED_RECEIPT)
+    attest.write_withheld_marker(early, attest.RECEIPT_PATH_DECLARED_REASON)
+    for name in (attest.WITHHELD_NAME, attest.RECEIPT_NAME):  # partial: no metadata.json
+        s3.put_object(Bucket="withheld", Key=blobs._key("results", job.job_id, name),
+                      Body=(early / name).read_bytes())
+    later = tmp_path / "later"
+    later.mkdir()
+    (later / "metadata.json").write_bytes(b'{"artifacts":[]}')
+    attest.write_tombstone(later, attest.RECEIPT_LEGACY_MIGRATED_REASON)
+    blobs.put_output(job.job_id, later)
+    client = _client_on(tmp_path, store, blobs)
+    assert client.get(f"/v1/jobs/{job.job_id}/attestation").status_code == 404
+
+    _fail_noncurrent_deletes(blobs, s3, blobs._key("results", job.job_id, attest.RECEIPT_NAME))
+    with pytest.raises(BlobFetchError):
+        blobs.delete_job(job.job_id)
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code in (404, 503), r.content
+    assert b"forged" not in r.content

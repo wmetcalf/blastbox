@@ -706,3 +706,67 @@ def test_read_result_prefix_refuses_a_multi_member_gzip_object(store, monkeypatc
     with pytest.raises(BlobFetchError, match="after its gzip stream") as ei:
         store.read_result_prefix("jm", "attestation.withheld.json", 1024)
     assert ei.value.__cause__ is not None
+
+
+def _latest_by_key(prefix):
+    versions, markers = _surviving_versions(prefix)
+    return {v["Key"]: v["VersionId"] for v in [*versions, *markers] if v.get("IsLatest")}
+
+
+def test_a_failed_noncurrent_delete_never_promotes_an_older_version(versioned_store, tmp_path):
+    """Per-key Errors are independent: a noncurrent version that fails to delete while its
+    key's current version is deleted in the SAME batch becomes current again -- older bytes
+    resurrected under the key (round-15: a worker attestation.json back over its tombstone).
+    Noncurrent versions go in their own call(s) and the current one only once they are gone."""
+    out = tmp_path / "jr" / "output"
+    out.mkdir(parents=True)
+    for body in (b"old", b"new"):
+        (out / "metadata.json").write_bytes(body)
+        (out / "attestation.withheld.json").write_bytes(body)
+        versioned_store.put_output("jr", out)
+    before = _latest_by_key("pfx/results/jr/")
+    old = {v["VersionId"] for v in _surviving_versions("pfx/results/jr/")[0]
+           if not v["IsLatest"]}
+    real = versioned_store._s3.delete_objects
+
+    def delete_objects(Bucket, Delete):  # noqa: N803 — boto3's parameter names
+        fail = [o for o in Delete["Objects"] if o.get("VersionId") in old]
+        rest = [o for o in Delete["Objects"] if o.get("VersionId") not in old]
+        resp = real(Bucket=Bucket, Delete={"Objects": rest}) if rest else {}
+        resp["Errors"] = [{"Key": o["Key"], "VersionId": o["VersionId"], "Code": "InternalError"}
+                          for o in fail]
+        return resp
+
+    versioned_store._s3.delete_objects = delete_objects
+    with pytest.raises(BlobFetchError):
+        versioned_store.delete_job("jr")
+    assert _latest_by_key("pfx/results/jr/") == before
+
+
+def test_a_current_version_is_deleted_only_once_it_is_the_keys_last(
+        versioned_store, tmp_path, monkeypatch):
+    """Even across listing pages: a key whose noncurrent versions spill past the page must not
+    lose its current version while any of them remain."""
+    import blastbox.host.blobs.s3 as s3mod
+
+    monkeypatch.setattr(s3mod, "_DELETE_BATCH", 3)
+    out = tmp_path / "jp" / "output"
+    out.mkdir(parents=True)
+    for i in range(5):
+        (out / "a.json").write_bytes(b"a%d" % i)
+        (out / "b.json").write_bytes(b"b%d" % i)
+        versioned_store.put_output("jp", out)
+    real = versioned_store._s3.delete_objects
+    s3 = boto3.client("s3", region_name="us-east-1")
+
+    def delete_objects(Bucket, Delete):  # noqa: N803 — boto3's parameter names
+        for o in Delete["Objects"]:
+            vs = s3.list_object_versions(Bucket=BUCKET, Prefix=o["Key"]).get("Versions", [])
+            vs = [v for v in vs if v["Key"] == o["Key"]]
+            if any(v["IsLatest"] and v["VersionId"] == o["VersionId"] for v in vs):
+                assert len(vs) == 1, f"current {o['Key']} deleted with {len(vs) - 1} older left"
+        return real(Bucket=Bucket, Delete=Delete)
+
+    versioned_store._s3.delete_objects = delete_objects
+    versioned_store.delete_job("jp")
+    assert _surviving_versions("pfx/results/jp/") == ([], [])
