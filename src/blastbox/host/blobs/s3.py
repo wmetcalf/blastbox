@@ -454,9 +454,12 @@ class S3BlobStore:
                     if inflater.eof:
                         break
                 if transferred > transfer_limit and len(out) < max_bytes:
+                    # Caused, so callers never read it as a missing key (a causeless
+                    # BlobFetchError is the "absent" convention).
                     raise BlobFetchError(
                         f"result fetch failed: {job_id}/{name}: compressed stream outgrew "
-                        f"its decoded bound ({transferred} bytes for < {max_bytes})")
+                        f"its decoded bound ({transferred} bytes for < {max_bytes})"
+                    ) from ValueError("compressed stream outgrew its decoded bound")
         except BlobFetchError:
             raise
         except Exception as exc:

@@ -1765,3 +1765,24 @@ def test_a_marker_reason_this_host_writes_is_still_named(tmp_path, key):
     r = client.get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 404
     assert attest.RECEIPT_PATH_DECLARED_REASON in r.json()["detail"]
+
+
+def test_a_refused_s3_stream_is_a_503_not_an_absent_envelope(tmp_path, request, monkeypatch):
+    """A stored object whose gzip stream outgrows its decoded bound is a read failure, not a
+    missing key: the route answers 503, never the 'no envelope' verdict."""
+    import boto3
+
+    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 1024)
+    blobs = _s3_store(tmp_path, request)
+    store = InMemoryJobStore()
+    job, _ = _make_done_job(tmp_path, store)
+    header = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff"
+    body = header + b"\x00\x00\x00\xff\xff" * 200_000 + b"\x03\x00" + b"\x00" * 8
+    boto3.client("s3", region_name="us-east-1").put_object(
+        Bucket="withheld", Key=f"results/{job.job_id}/metadata.json", Body=body,
+        ContentEncoding="gzip")
+    app = build_app(job_store=store, job_root=tmp_path / "jobs", allowed_engines={"clippyshot"},
+                    limits=Limits(max_metadata_bytes=1024), api_workers=2, zip_password="",
+                    blob_store=blobs)
+    r = TestClient(app).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 503, r.text
