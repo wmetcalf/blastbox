@@ -871,26 +871,45 @@ def write_withheld_marker(out_dir: Path, reason: str, *, limits: Limits | None =
 
     A transient envelope read error propagates (no verdict; retry)."""
     out_dir = Path(out_dir)
+    keep, st = _withheld_marker_plan(out_dir, limits)
+    if keep:
+        return
+    if st is not None:
+        _remove_entry(out_dir / WITHHELD_NAME, st)
+    _write_marker(out_dir, canonical(tombstone_body(reason)))
+
+
+def check_withheld_marker_writable(out_dir: Path, *, limits: Limits | None = None) -> None:
+    """Raise exactly what :func:`write_withheld_marker` would raise before writing anything
+    (ReceiptPathOccupied, or a transient envelope read error), writing and removing nothing --
+    so a dry run reaches the same verdict as the real one."""
+    _withheld_marker_plan(Path(out_dir), limits)
+
+
+def _withheld_marker_plan(out_dir: Path,
+                          limits: Limits | None) -> tuple[bool, os.stat_result | None]:
+    """:func:`write_withheld_marker`'s decision, with no side effects: (True, _) keeps the
+    existing host-written marker; (False, st) writes the marker after removing the entry ``st``
+    describes (None: nothing there). Raises ReceiptPathOccupied when it must refuse."""
     target = out_dir / WITHHELD_NAME
     try:
         st: os.stat_result | None = os.lstat(target)
     except FileNotFoundError:
         st = None
     if st is not None and stat.S_ISREG(st.st_mode) and _is_host_withheld_marker(target):
-        return
+        return True, st
     if st is not None:
         shipped, data = _shipped_envelope(out_dir, limits)
         paths = (None if data is None else _artifact_paths_of(data)) if shipped else []
         if paths is None and stat.S_ISREG(st.st_mode) and _is_host_cleared_marker(out_dir, target):
-            pass        # this host's own cleared marker from an earlier attempt: replaced below
+            pass        # this host's own cleared marker from an earlier attempt: replaced
         elif paths is None or any(is_reserved_path(p, (WITHHELD_NAME,)) for p in paths):
             raise ReceiptPathOccupied(
                 errno.EEXIST,
                 f"{WITHHELD_NAME} holds an entry this host did not write, and the envelope "
                 f"{'cannot be read to rule out' if paths is None else 'declares'} an artifact "
                 f"there; refusing to replace it or ship without it")
-        _remove_entry(target, st)
-    _write_marker(out_dir, canonical(tombstone_body(reason)))
+    return False, st
 
 
 #: Every reason :func:`write_withheld_marker` is called with: the as-is verdicts of

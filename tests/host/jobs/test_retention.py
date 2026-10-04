@@ -2223,3 +2223,53 @@ def test_the_sweep_clears_a_planted_withheld_marker_beside_its_own_receipt(tmp_p
         assert attest.is_cleared_marker(fh.read(), attest.sha256_file(out / "metadata.json"))
     with blobs.open_result_only(_JID, attest.RECEIPT_NAME) as fh:
         assert json.loads(fh.read()) == body
+
+
+# ---------------------------------------------------------------------------
+# codex r139 P3: a dry run reaches the same verdict as the real run
+# ---------------------------------------------------------------------------
+
+
+def _snapshot(root: Path) -> dict:
+    return {p.relative_to(root).as_posix(): (p.read_bytes() if p.is_file() else None)
+            for p in sorted(root.rglob("*"))}
+
+
+@pytest.mark.parametrize("case", ["oversized-unknown-limit", "marker-path-declared", "normal"])
+def test_a_legacy_migration_dry_run_counts_what_the_real_run_does(tmp_path, monkeypatch, case):
+    """codex r139: the dry run returned "migrated" before the unknown-limit refusal and the
+    reserved-marker-path checks, so its count included trees the real run leaves behind. It
+    must evaluate every refusal and verdict and only skip the writes."""
+    import hashlib
+
+    from blastbox.host import attest
+    from blastbox.host.blobs.local import LocalBlobStore
+
+    monkeypatch.delenv("BLASTBOX_MAX_METADATA", raising=False)
+    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 64)
+    root = tmp_path / "jobs"
+    store = InMemoryJobStore()
+    job = Job.new(engine="clippyshot", filename="x")
+    job.status = JobStatus.DONE
+    store.create(job)
+    out = root / job.job_id / "output"
+    out.mkdir(parents=True)
+    if case == "oversized-unknown-limit":
+        (out / "metadata.json").write_bytes(b'{"artifacts":[],"pad":"' + b"x" * 100 + b'"}')
+    elif case == "marker-path-declared":
+        planted = attest.canonical(attest.cleared_marker_body("a" * 64))
+        (out / attest.WITHHELD_NAME).write_bytes(planted)
+        (out / "metadata.json").write_bytes(json.dumps({"artifacts": [
+            {"id": "a", "path": attest.WITHHELD_NAME,
+             "sha256": hashlib.sha256(planted).hexdigest()}]}).encode())
+    else:
+        (out / "metadata.json").write_bytes(b'{"artifacts":[]}')
+    blobs = LocalBlobStore(root, blob_root=tmp_path / "blobs")
+    log = logging.getLogger("t")
+    before = _snapshot(root)
+    dry = migrate_legacy_results(root, blobs, store, log, dry_run=True)
+    assert _snapshot(root) == before, "the dry run wrote into the tree"
+    assert not blobs.has_output(job.job_id), "the dry run uploaded"
+    live = migrate_legacy_results(root, blobs, store, log)
+    assert dry == live, (dry, live)
+    assert live == ((1, 0, 0) if case == "normal" else (0, 0, 1))

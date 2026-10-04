@@ -772,8 +772,6 @@ def _migrate_legacy_one(
             return "skipped"                      # already durable; the reclaim will collect it
     except Exception:  # noqa: BLE001 -- unknown is NOT durable, so try the upload
         pass
-    if dry_run:
-        return "migrated"
     # A pre-blob-store tree was never stripped by a dispatcher, so an attestation.json in it
     # is whatever the worker wrote; these results carry no execution receipt by construction.
     # Unless the envelope DECLARES an artifact there (a tree accepted before the name was
@@ -793,6 +791,14 @@ def _migrate_legacy_one(
                         _attest.ENVELOPE_MAX_BYTES)
             return "failed"
         as_is = _attest.tree_receipt_path_protection(out_dir, limits=limits)
+        if dry_run:
+            # Every refusal above and below, none of the writes (codex r139 P3): the same
+            # verdict as the real run, so the dry run's counts are the real run's. A tombstone
+            # refuses only where the as-is verdict is not None; a withheld marker refuses
+            # exactly where check_withheld_marker_writable does.
+            if as_is is not None:
+                _attest.check_withheld_marker_writable(out_dir, limits=limits)
+            return "migrated"
         if as_is is None:
             # A TOMBSTONE over whatever the worker left at attestation.json, never a local
             # strip: the store never deletes a single object, so an earlier run that shipped
