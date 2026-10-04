@@ -123,8 +123,9 @@ def _assert_declared_landed(job_id: str, out_dir: Path, stored: "set[str]") -> N
 
 def _upload_tiers(out_dir: Path) -> list[list[Path]]:
     """Every artifact under *out_dir*, in the tiers put_output must store one after another:
-    everything else, then the receipt (``attestation.json``), then the withheld marker
-    (``attestation.withheld.json``), then the seal LAST. Each tier lands only after the previous
+    everything else, then the receipt (``attestation.json``) and the withheld marker
+    (``attestation.withheld.json``) in the order the marker's verdict requires (below), then
+    the seal LAST. Each tier lands only after the previous
     one fully landed.
 
     Plain sorted order puts metadata.json first ('m' < 'r'), so an upload that died partway
@@ -136,12 +137,26 @@ def _upload_tiers(out_dir: Path) -> list[list[Path]]:
     marker before the receipt or tombstone that replaces it, or the route briefly reads the old
     file as vouched for. Only the top-level names are tiered; a nested ``x/attestation.json``
     is an ordinary artifact.
+
+    The marker before the receipt when the marker WITHHOLDS (codex r139 P2): an as-is upload
+    (any marker but the cleared body) re-uploaded over a prefix that still holds an earlier
+    cleared marker and clean envelope must replace that marker BEFORE its worker-written
+    attestation.json lands, or the route briefly serves the worker's bytes under the old
+    marker. So the order depends on the marker being uploaded: the cleared body lands after
+    the receipt (above), anything else -- including a marker that cannot be read (a symlink,
+    not a regular file, over the marker cap, an error) -- lands before it. The seal stays last.
     """
-    from blastbox.host.attest import RECEIPT_NAME, WITHHELD_NAME
+    from blastbox.host.attest import (RECEIPT_NAME, WITHHELD_NAME, _read_marker_file,
+                                      bound_cleared_marker_sha256)
+
+    marker = _read_marker_file(out_dir / WITHHELD_NAME)
+    cleared = marker is not None and bound_cleared_marker_sha256(marker) is not None
+    ranks = ({RECEIPT_NAME: 1, WITHHELD_NAME: 2, _SEAL_NAME: 3} if cleared
+             else {WITHHELD_NAME: 1, RECEIPT_NAME: 2, _SEAL_NAME: 3})
 
     def tier(p: Path) -> int:
         rel = p.relative_to(out_dir).as_posix()
-        return {RECEIPT_NAME: 1, WITHHELD_NAME: 2, _SEAL_NAME: 3}.get(rel, 0)
+        return ranks.get(rel, 0)
 
     tiers: list[list[Path]] = [[], [], [], []]
     for p in sorted(out_dir.rglob("*")):

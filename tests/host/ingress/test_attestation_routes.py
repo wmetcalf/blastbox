@@ -445,8 +445,9 @@ def test_a_partial_legacy_upload_never_serves_a_declared_artifact_as_the_receipt
     """The reviewer's repro: a legacy tree DECLARES an artifact at attestation.json, so the
     migration uploads it as-is; a blip on a later artifact aborts the upload before the seal
     lands. The results prefix then holds the declared artifact and no envelope to say so.
-    (put_output stores attestation.json after every other artifact and before its marker, so
-    the blip that leaves it stored without an envelope is on the marker.)"""
+    (put_output stores an as-is upload's WITHHELD marker, then attestation.json, then the
+    envelope -- codex r139 P2 -- so the blip that leaves it stored without an envelope is on
+    the envelope itself.)"""
     import logging
 
     from blastbox.host.jobs.retention import migrate_legacy_results
@@ -467,13 +468,15 @@ def test_a_partial_legacy_upload_never_serves_a_declared_artifact_as_the_receipt
     real = LocalBlobStore._atomic_copy
 
     def flaky(src, dst):
-        if src.name == attest.WITHHELD_NAME:
+        if src.name == "metadata.json":
             raise OSError(5, "EIO: object store blip")
         return real(src, dst)
 
     monkeypatch.setattr(LocalBlobStore, "_atomic_copy", staticmethod(flaky))
     blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
     assert migrate_legacy_results(job_root, blobs, store, logging.getLogger("t")) == (0, 0, 1)
+    with blobs.open_result_only(job.job_id, attest.WITHHELD_NAME) as fh:
+        assert attest.bound_cleared_marker_sha256(fh.read()) is None    # withheld, stored
     with blobs.open_result_only(job.job_id, attest.RECEIPT_NAME) as fh:
         assert fh.read() == _LOOKS_SIGNED                  # the declared artifact did land
     r = client.get(f"/v1/jobs/{job.job_id}/attestation")
@@ -2469,3 +2472,71 @@ def test_a_genuine_fresh_result_still_serves_its_receipt(tmp_path, key):
     r = client.get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 200, r.text
     assert r.json() == body
+
+
+# ---------------------------------------------------------------------------
+# codex r139 P2: an as-is re-upload never pairs the old cleared marker with the new receipt
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("backend", ["local", "s3"])
+def test_an_as_is_reupload_never_serves_the_worker_receipt_between_tiers(
+        tmp_path, request, backend):
+    """codex r139's check_command: the prefix holds an earlier tombstone + CLEARED marker + clean
+    envelope; an as-is re-upload of a worker tree (withheld marker, worker attestation.json)
+    must never let the route 200 on the worker's bytes at ANY point of the upload."""
+    store = InMemoryJobStore()
+    job = Job.new(engine="clippyshot", filename="x")
+    job.status = JobStatus.DONE
+    store.create(job)
+    if backend == "s3":
+        blobs = _s3_store(tmp_path, request)
+    else:
+        blobs = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    old = tmp_path / "old"
+    old.mkdir()
+    (old / "metadata.json").write_bytes(b'{"artifacts":[]}')
+    attest.write_tombstone(old, attest.NO_ATTEST_KEY_REASON)
+    blobs.put_output(job.job_id, old)
+    app = build_app(job_store=store, job_root=tmp_path / "jobs", allowed_engines={"clippyshot"},
+                    limits=Limits(), api_workers=1, zip_password="", blob_store=blobs)
+    route = next(x for x in app.routes if x.path == "/v1/jobs/{job_id}/attestation").endpoint
+
+    new = tmp_path / "new"
+    new.mkdir()
+    (new / "metadata.json").write_bytes(b'{"artifacts":[{"path":"attestation.json"}]}')
+    (new / attest.RECEIPT_NAME).write_bytes(_FORGED_RECEIPT)
+    (new / attest.WITHHELD_NAME).write_bytes(attest.canonical(
+        attest.tombstone_body(attest.RECEIPT_PATH_DECLARED_REASON)))
+
+    seen = []
+
+    def probe():
+        try:
+            r = route(job.job_id)
+            seen.append((r.status_code, bytes(r.body)))
+        except Exception as exc:   # HTTPException: the route refused
+            seen.append((getattr(exc, "status_code", None), b""))
+
+    if backend == "s3":
+        real = blobs._put_one
+
+        def put_one(job_id, path, out_dir, declared, **kw):
+            probe()
+            rel = real(job_id, path, out_dir, declared, **kw)
+            probe()
+            return rel
+        blobs._put_one = put_one
+        blobs._upload_concurrency = 1
+    else:
+        real = blobs._atomic_copy
+
+        def copy(src, dst):
+            probe()
+            out = real(src, dst)
+            probe()
+            return out
+        blobs._atomic_copy = copy
+    blobs.put_output(job.job_id, new)
+    probe()
+    assert seen
+    assert not [s for s in seen if s[0] == 200 or b"forged" in s[1]], seen

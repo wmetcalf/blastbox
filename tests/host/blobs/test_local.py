@@ -447,15 +447,47 @@ def test_a_declared_path_with_no_file_behind_it_does_not_fail_the_upload(tmp_pat
     assert store.has_output("j-phantom") is True
 
 
-def test_the_upload_order_puts_the_receipt_then_the_marker_before_the_seal(tmp_path):
-    """C2 (codex r134): everything else -> attestation.json -> attestation.withheld.json ->
-    metadata.json, so the cleared marker never lands before the receipt/tombstone it vouches
+def test_the_upload_order_puts_the_receipt_then_a_cleared_marker_before_the_seal(tmp_path):
+    """C2 (codex r134): everything else -> attestation.json -> CLEARED attestation.withheld.json
+    -> metadata.json, so the cleared marker never lands before the receipt/tombstone it vouches
     for (the local store uploads serially in this order)."""
+    from blastbox.host import attest
+
     out = tmp_path / "out"
     (out / "sub").mkdir(parents=True)
-    for name in ("metadata.json", "attestation.json", "attestation.withheld.json", "a.png",
-                 "zz.png", "sub/attestation.json"):
+    for name in ("metadata.json", "attestation.json", "a.png", "zz.png", "sub/attestation.json"):
         (out / name).write_text("{}")
+    (out / attest.WITHHELD_NAME).write_bytes(attest.canonical(attest.cleared_marker_body(
+        hashlib.sha256(b"{}").hexdigest())))
     order = [p.relative_to(out).as_posix() for p in _upload_order(out) if p.is_file()]
     assert order[-3:] == ["attestation.json", "attestation.withheld.json", "metadata.json"], order
     assert set(order[:-3]) == {"a.png", "zz.png", "sub/attestation.json"}
+
+
+@pytest.mark.parametrize("marker", ["withheld", "junk", "oversize", "symlink", "absent-target"])
+def test_the_upload_order_puts_a_withheld_marker_before_the_receipt(tmp_path, marker):
+    """codex r139 P2: an AS-IS upload (any marker but the cleared body, or one that cannot be
+    read) stores the marker BEFORE attestation.json, so a re-upload over a prefix still holding
+    an earlier cleared marker never pairs it with the new worker-written attestation.json."""
+    from blastbox.host import attest
+
+    out = tmp_path / "out"
+    (out / "sub").mkdir(parents=True)
+    for name in ("metadata.json", "attestation.json", "a.png", "sub/attestation.json"):
+        (out / name).write_text("{}")
+    m = out / attest.WITHHELD_NAME
+    if marker == "withheld":
+        m.write_bytes(attest.canonical(attest.tombstone_body(attest.RECEIPT_PATH_DECLARED_REASON)))
+    elif marker == "junk":
+        m.write_bytes(b"junk")
+    elif marker == "oversize":
+        m.write_bytes(attest.canonical(attest.cleared_marker_body("0" * 64))
+                      + b" " * attest.WITHHELD_MARKER_MAX_BYTES)
+    else:   # a symlink -- to a CLEARED body, or dangling -- is never read as cleared
+        target = tmp_path / "cleared"
+        if marker == "symlink":
+            target.write_bytes(attest.canonical(attest.cleared_marker_body("0" * 64)))
+        m.symlink_to(target)
+    order = [p.relative_to(out).as_posix() for p in _upload_order(out)
+             if p.is_file() or p.is_symlink()]
+    assert order[-3:] == ["attestation.withheld.json", "attestation.json", "metadata.json"], order

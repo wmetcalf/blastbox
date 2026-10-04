@@ -318,7 +318,10 @@ MARKER = "attestation.withheld.json"
 def _out_dir_with_receipt(tmp_path, n_artifacts: int):
     out = _out_dir(tmp_path, n_artifacts)
     (out / RECEIPT).write_text('{"attestation": null, "reason": "signing failed"}')
-    (out / MARKER).write_text('{"cleared": true}')
+    from blastbox.host import attest
+
+    # the CLEARED body: it lands after the receipt (a withholding marker lands before it)
+    (out / MARKER).write_bytes(attest.canonical(attest.cleared_marker_body("0" * 64)))
     (out / "zz-after-the-markers.png").write_bytes(b"PNG")   # sorts after both names
     return out
 
@@ -340,6 +343,23 @@ def test_the_receipt_lands_before_the_marker_and_both_before_the_seal(tmp_path):
         "j", _out_dir_with_receipt(tmp_path, 20))
     names = _names(s3.calls)
     assert names[-3:] == [RECEIPT, MARKER, SEAL], names
+
+
+def test_a_withholding_marker_lands_before_the_receipt_and_both_before_the_seal(tmp_path):
+    """codex r139 P2. An as-is upload's WITHHELD marker must land before its (worker-written)
+    attestation.json, so a re-upload over a prefix still holding an older cleared marker never
+    pairs that marker with the new receipt -- a barrier even under concurrency.
+
+    MUTATION: always tier the receipt before the marker -> names end RECEIPT, MARKER, SEAL."""
+    from blastbox.host import attest
+
+    out = _out_dir_with_receipt(tmp_path, 20)
+    (out / MARKER).write_bytes(attest.canonical(
+        attest.tombstone_body(attest.RECEIPT_PATH_DECLARED_REASON)))
+    s3 = _RecordingS3(delay=0.2, delay_on=MARKER)
+    _store(tmp_path, s3, BLASTBOX_BLOB_UPLOAD_CONCURRENCY="8").put_output("j", out)
+    names = _names(s3.calls)
+    assert names[-3:] == [MARKER, RECEIPT, SEAL], names
 
 
 def test_a_failed_receipt_put_never_stores_the_marker(tmp_path):

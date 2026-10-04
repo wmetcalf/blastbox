@@ -250,9 +250,11 @@ class S3BlobStore:
         *tiers, seals = _upload_tiers(out_dir)      # seal LAST, by construction
 
         # PHASE 1 -- every artifact, fanned out, tier by tier: everything else, then
-        # attestation.json, then attestation.withheld.json (see _upload_tiers). Each tier is a
-        # barrier: the next starts only once every PUT of this one succeeded, so the cleared
-        # marker is never stored before the receipt/tombstone it vouches for. The seal is
+        # attestation.json and attestation.withheld.json in the order the marker requires (a
+        # cleared marker after the receipt, a withholding one before it -- see _upload_tiers).
+        # Each tier is a barrier: the next starts only once every PUT of this one succeeded, so
+        # the cleared marker is never stored before the receipt/tombstone it vouches for, and a
+        # new worker receipt never lands under an older cleared marker. The seal is
         # deliberately NOT in these: its whole meaning is "everything else already landed", so
         # it cannot share a barrier with the things it vouches for.
         for rest in tiers:
