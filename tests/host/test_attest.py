@@ -1229,10 +1229,24 @@ def test_a_verify_key_file_with_several_pem_blocks_is_refused(tmp_path):
 
 
 def test_a_json_verify_key_with_a_non_string_pem_is_refused_even_under_O(tmp_path):
-    with pytest.raises(attest.VerifyKeyRefused):
-        attest.VerifyKey.parse(b'{"public_key_pem": 5}')
-    with pytest.raises(attest.VerifyKeyRefused):
-        attest.VerifyKey.parse(b'[1, 2]')
+    """Run under ``python -O`` in a child process: the suite itself never strips asserts, so an
+    in-process check could not tell an explicit refusal from a stripped assert."""
+    import subprocess
+    import sys
+
+    probe = (
+        "from blastbox.host import attest\n"
+        "for body in (b'{\"public_key_pem\": 5}', b'[1, 2]'):\n"
+        "    try:\n"
+        "        attest.VerifyKey.parse(body)\n"
+        "    except attest.VerifyKeyRefused:\n"
+        "        continue\n"
+        "    raise SystemExit('accepted')\n"
+    )
+    src = __import__("pathlib").Path(attest.__file__).resolve().parents[2]
+    r = subprocess.run([sys.executable, "-O", "-c", probe], capture_output=True, text=True,
+                       env={**os.environ, "PYTHONPATH": str(src)}, timeout=60)
+    assert r.returncode == 0, r.stderr
 
 
 def test_a_json_verify_key_with_the_wrong_alg_is_refused(tmp_path):
