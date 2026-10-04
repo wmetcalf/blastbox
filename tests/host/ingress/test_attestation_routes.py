@@ -441,7 +441,9 @@ def test_a_partial_legacy_upload_never_serves_a_declared_artifact_as_the_receipt
         tmp_path, monkeypatch):
     """The reviewer's repro: a legacy tree DECLARES an artifact at attestation.json, so the
     migration uploads it as-is; a blip on a later artifact aborts the upload before the seal
-    lands. The results prefix then holds the declared artifact and no envelope to say so."""
+    lands. The results prefix then holds the declared artifact and no envelope to say so.
+    (put_output stores attestation.json after every other artifact and before its marker, so
+    the blip that leaves it stored without an envelope is on the marker.)"""
     import logging
 
     from blastbox.host.jobs.retention import migrate_legacy_results
@@ -462,7 +464,7 @@ def test_a_partial_legacy_upload_never_serves_a_declared_artifact_as_the_receipt
     real = LocalBlobStore._atomic_copy
 
     def flaky(src, dst):
-        if src.name == "page.png":
+        if src.name == attest.WITHHELD_NAME:
             raise OSError(5, "EIO: object store blip")
         return real(src, dst)
 

@@ -121,16 +121,37 @@ def _assert_declared_landed(job_id: str, out_dir: Path, stored: "set[str]") -> N
             f"not stored, so the seal was not committed: {missing[:3]}")
 
 
-def _upload_order(out_dir: Path) -> list[Path]:
-    """Every artifact under *out_dir*, with the seal LAST.
+def _upload_tiers(out_dir: Path) -> list[list[Path]]:
+    """Every artifact under *out_dir*, in the tiers put_output must store one after another:
+    everything else, then the receipt (``attestation.json``), then the withheld marker
+    (``attestation.withheld.json``), then the seal LAST. Each tier lands only after the previous
+    one fully landed.
 
     Plain sorted order puts metadata.json first ('m' < 'r'), so an upload that died partway
     left the marker present with artifacts missing -- and the age reclaim would then read that
     as "durable copy exists" and delete the complete local tree.
+
+    The receipt before the marker (codex r134 C2): a re-upload over a prefix that still holds an
+    older attestation.json (a worker's, from a verbatim upload) must never store the CLEARED
+    marker before the receipt or tombstone that replaces it, or the route briefly reads the old
+    file as vouched for. Only the top-level names are tiered; a nested ``x/attestation.json``
+    is an ordinary artifact.
     """
-    paths = sorted(out_dir.rglob("*"))
-    return ([p for p in paths if not _is_seal(p, out_dir)]
-            + [p for p in paths if _is_seal(p, out_dir)])
+    from blastbox.host.attest import RECEIPT_NAME, WITHHELD_NAME
+
+    def tier(p: Path) -> int:
+        rel = p.relative_to(out_dir).as_posix()
+        return {RECEIPT_NAME: 1, WITHHELD_NAME: 2, _SEAL_NAME: 3}.get(rel, 0)
+
+    tiers: list[list[Path]] = [[], [], [], []]
+    for p in sorted(out_dir.rglob("*")):
+        tiers[tier(p)].append(p)
+    return tiers
+
+
+def _upload_order(out_dir: Path) -> list[Path]:
+    """Every artifact under *out_dir* in :func:`_upload_tiers` order (the seal LAST)."""
+    return [p for t in _upload_tiers(out_dir) for p in t]
 
 
 @runtime_checkable

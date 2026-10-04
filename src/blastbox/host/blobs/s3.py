@@ -29,10 +29,9 @@ from blastbox.host.blobs.base import (
     _SEAL_NAME,
     _assert_declared_landed,
     _declared_paths,
-    _is_seal,
     BlobFetchError,
     BlobIntegrityError,
-    _upload_order,
+    _upload_tiers,
 )
 from blastbox.host.attest import RECEIPT_NAME, WITHHELD_NAME
 from blastbox.observability import get_logger
@@ -248,39 +247,16 @@ class S3BlobStore:
         declared = _declared_paths(out_dir)
         stored: set[str] = set()
 
-        paths = _upload_order(out_dir)          # seal LAST, by construction
-        seals = [p for p in paths if _is_seal(p, out_dir)]
-        rest = [p for p in paths if not _is_seal(p, out_dir)]
+        *tiers, seals = _upload_tiers(out_dir)      # seal LAST, by construction
 
-        # PHASE 1 — every artifact, fanned out. The seal is deliberately NOT in this set: its
-        # whole meaning is "everything else already landed", so it cannot share a barrier with
-        # the things it vouches for.
-        results: list[tuple[str | None, Exception | None]] = []
-        if self._upload_concurrency <= 1:
-            for path in rest:
-                results.append((self._put_one(job_id, path, out_dir, declared), None))
-        else:
-            pool = self._pool_for_uploads()
-            futures = [pool.submit(self._put_one, job_id, p, out_dir, declared) for p in rest]
-            # Drained in SUBMISSION order, so the exception that surfaces is deterministic: the
-            # same tree must fail the same way every time, or the bounded retry wrapped around
-            # this call is chasing a moving target. EVERY future is drained even after one fails
-            # -- the pool is shared and long-lived, so abandoning futures would leave another
-            # job's uploads racing ours, and a half-read result set is how `stored` silently
-            # loses entries that really did land.
-            for fut in futures:
-                try:
-                    results.append((fut.result(), None))
-                except Exception as exc:  # noqa: BLE001 -- re-raised in order below
-                    results.append((None, exc))
-
-        for rel, err in results:
-            if err is not None:
-                # A real outage MUST fail the upload rather than ship a partial result: the
-                # caller fails the job and retains the local tree instead of purging it.
-                raise err
-            if rel is not None:
-                stored.add(rel)
+        # PHASE 1 -- every artifact, fanned out, tier by tier: everything else, then
+        # attestation.json, then attestation.withheld.json (see _upload_tiers). Each tier is a
+        # barrier: the next starts only once every PUT of this one succeeded, so the cleared
+        # marker is never stored before the receipt/tombstone it vouches for. The seal is
+        # deliberately NOT in these: its whole meaning is "everything else already landed", so
+        # it cannot share a barrier with the things it vouches for.
+        for rest in tiers:
+            self._put_tier(job_id, rest, out_dir, declared, stored)
 
         # PHASE 2 — the commit. Only now, with every artifact confirmed stored, may the seal
         # exist: its presence under results/<job_id> is what has_output() reports as durable, and
@@ -302,6 +278,37 @@ class S3BlobStore:
                 self._pool_for_uploads().submit(
                     self._put_one, job_id, path, out_dir, declared, before_put=_precondition,
                 ).result()
+
+    def _put_tier(self, job_id: str, paths: list[Path], out_dir: Path,
+                  declared: "set[str] | None", stored: set[str]) -> None:
+        """Store every path of one tier, fanned out; return only once ALL landed (adding each
+        stored rel to *stored*), else raise the first failure in submission order."""
+        results: list[tuple[str | None, Exception | None]] = []
+        if self._upload_concurrency <= 1:
+            for path in paths:
+                results.append((self._put_one(job_id, path, out_dir, declared), None))
+        else:
+            pool = self._pool_for_uploads()
+            futures = [pool.submit(self._put_one, job_id, p, out_dir, declared) for p in paths]
+            # Drained in SUBMISSION order, so the exception that surfaces is deterministic: the
+            # same tree must fail the same way every time, or the bounded retry wrapped around
+            # this call is chasing a moving target. EVERY future is drained even after one fails
+            # -- the pool is shared and long-lived, so abandoning futures would leave another
+            # job's uploads racing ours, and a half-read result set is how `stored` silently
+            # loses entries that really did land.
+            for fut in futures:
+                try:
+                    results.append((fut.result(), None))
+                except Exception as exc:  # noqa: BLE001 -- re-raised in order below
+                    results.append((None, exc))
+
+        for rel, err in results:
+            if err is not None:
+                # A real outage MUST fail the upload rather than ship a partial result: the
+                # caller fails the job and retains the local tree instead of purging it.
+                raise err
+            if rel is not None:
+                stored.add(rel)
 
     def _pool_for_uploads(self) -> ThreadPoolExecutor:
         """The dispatcher-wide upload pool, created on first use.

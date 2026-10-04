@@ -445,3 +445,17 @@ def test_a_declared_path_with_no_file_behind_it_does_not_fail_the_upload(tmp_pat
 
     store.put_output("j-phantom", out)          # must not raise
     assert store.has_output("j-phantom") is True
+
+
+def test_the_upload_order_puts_the_receipt_then_the_marker_before_the_seal(tmp_path):
+    """C2 (codex r134): everything else -> attestation.json -> attestation.withheld.json ->
+    metadata.json, so the cleared marker never lands before the receipt/tombstone it vouches
+    for (the local store uploads serially in this order)."""
+    out = tmp_path / "out"
+    (out / "sub").mkdir(parents=True)
+    for name in ("metadata.json", "attestation.json", "attestation.withheld.json", "a.png",
+                 "zz.png", "sub/attestation.json"):
+        (out / name).write_text("{}")
+    order = [p.relative_to(out).as_posix() for p in _upload_order(out) if p.is_file()]
+    assert order[-3:] == ["attestation.json", "attestation.withheld.json", "metadata.json"], order
+    assert set(order[:-3]) == {"a.png", "zz.png", "sub/attestation.json"}
