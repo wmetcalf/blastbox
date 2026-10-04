@@ -876,7 +876,7 @@ def remark_stored_receipts(
       to re-mark its receipts). Writing a withheld marker there would make that permanent.
     * a read or write error is counted failed (no verdict), and the run carries on.
 
-    ``limit`` stops after that many re-marked (0 = all)."""
+    ``limit`` stops after that many re-marked plus replaced (0 = all)."""
     import hashlib
     import json
     import tempfile
