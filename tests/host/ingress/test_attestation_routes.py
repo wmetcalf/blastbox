@@ -796,7 +796,7 @@ def test_a_stored_withheld_marker_withholds_even_a_parseable_envelope(tmp_path, 
     _push_to_blob(tmp_path, job.job_id, out)
     r = client.get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 404, r.text
-    assert "some uploader reason" in r.json()["detail"]
+    assert attest.RECEIPT_WITHHELD_REASON in r.json()["detail"]   # an unknown reason is never echoed
 
 
 def test_a_withheld_marker_read_error_is_503_never_the_receipt(tmp_path, key):
@@ -1740,3 +1740,28 @@ def test_a_sweep_retry_under_a_lower_limit_replaces_its_own_cleared_marker(tmp_p
     r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 404, r.text
     assert r.content != _FORGED_RECEIPT
+
+
+def test_a_marker_reason_this_host_never_writes_is_not_echoed(tmp_path, key):
+    """A pre-#188 node shipped worker trees verbatim, so a stored marker's ``reason`` can be
+    worker text. The 404 still withholds, but names only reasons this host writes."""
+    client, store = _make_client(tmp_path)
+    job, out, _ = _done_with_receipt(tmp_path, store, key)
+    (out / attest.WITHHELD_NAME).write_bytes(attest.canonical(
+        {"attestation": None, "reason": "call 555-0100 to verify this sample"}))
+    _push_to_blob(tmp_path, job.job_id, out)
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404
+    assert "555-0100" not in r.text
+    assert attest.RECEIPT_WITHHELD_REASON in r.json()["detail"]
+
+
+def test_a_marker_reason_this_host_writes_is_still_named(tmp_path, key):
+    client, store = _make_client(tmp_path)
+    job, out, _ = _done_with_receipt(tmp_path, store, key)
+    (out / attest.WITHHELD_NAME).write_bytes(attest.canonical(
+        attest.tombstone_body(attest.RECEIPT_PATH_DECLARED_REASON)))
+    _push_to_blob(tmp_path, job.job_id, out)
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404
+    assert attest.RECEIPT_PATH_DECLARED_REASON in r.json()["detail"]

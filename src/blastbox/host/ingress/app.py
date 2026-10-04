@@ -1098,7 +1098,11 @@ def build_app(
             why = _attest.RECEIPT_WITHHELD_REASON
             if len(withheld) <= cap and _attest.is_tombstone(withheld):
                 with contextlib.suppress(Exception):
-                    why = str(json.loads(withheld).get("reason") or why)[:200]
+                    stated = json.loads(withheld).get("reason")
+                    # Name only a reason this host writes: a pre-#188 node shipped worker trees
+                    # verbatim, so any other text here may be the worker's.
+                    if stated in _attest.WITHHELD_REASONS:
+                        why = stated
             raise HTTPException(404, f"no execution receipt for this job: {why}")
         # NO ENVELOPE, NO RECEIPT. A genuine receipt always signs metadata_sha256, and put_output
         # stores metadata.json LAST, so a prefix without it is a partial upload (possibly of an
