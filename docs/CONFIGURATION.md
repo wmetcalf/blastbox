@@ -150,7 +150,10 @@ always overwritten; the route answers `404` for it. A result the retention sweep
 `attestation.withheld.json` marker of the same shape instead; the route answers `404` whenever
 it is stored, and also when the result has no stored `metadata.json`. The route never parses
 the envelope, so `BLASTBOX_MAX_METADATA` on the ingress cannot hide a genuine receipt or serve a
-forged one. Both names are reserved: a worker cannot declare an artifact at either.
+forged one. Both names are reserved: a worker cannot declare an artifact at either. Deleting a
+result (`DELETE /v1/jobs/{id}`, retention) removes `attestation.json` first and the marker last,
+so a delete that fails partway (a `503`, the job left `DONE` for a retry) never leaves a stored
+`attestation.json` without the marker that withholds it.
 
 **Rotating the key:** rotate (or unset) `BLASTBOX_ATTEST_KEY` only when this host has **no
 retained pending uploads**. A retained result is re-uploaded later by the pending-upload sweep,

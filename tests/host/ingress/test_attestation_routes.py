@@ -859,3 +859,145 @@ def test_the_withheld_marker_round_trips_through_each_blob_store(
     r = client.get(f"/v1/jobs/{genuine.job_id}/attestation")
     assert r.status_code == 200, r.text
     assert r.json() == body
+
+
+# ---------------------------------------------------------------------------
+# A partial delete never leaves a servable receipt unmasked (round-5 review M1)
+# ---------------------------------------------------------------------------
+
+
+def _as_is_result(tmp_path, blobs, store):
+    """A DONE result stored AS-IS: a worker-written attestation.json, the withheld marker and the
+    envelope -- the state the route answers 404 for only while the marker is stored."""
+    job, out = _make_done_job(tmp_path, store)
+    (out / attest.RECEIPT_NAME).write_bytes(_FORGED_RECEIPT)
+    attest.write_withheld_marker(out, attest.RECEIPT_PATH_DECLARED_REASON)
+    blobs.put_output(job.job_id, out)
+    return job
+
+
+def _client_on(tmp_path, store, blobs):
+    app = build_app(job_store=store, job_root=tmp_path / "jobs", allowed_engines={"clippyshot"},
+                    limits=Limits(), api_workers=2, zip_password="", blob_store=blobs)
+    return TestClient(app, raise_server_exceptions=False)
+
+
+class _Ordered:
+    """os.scandir's result, re-ordered: an rmtree that removes in scandir order then meets the
+    marker first."""
+
+    def __init__(self, it, key):
+        with it:
+            self._entries = sorted(it, key=key)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def __iter__(self):
+        return iter(self._entries)
+
+    def close(self):
+        pass
+
+
+@pytest.mark.parametrize("fail_name", [attest.RECEIPT_NAME, "metadata.json"])
+def test_a_partial_local_delete_never_unmasks_an_as_is_receipt(tmp_path, monkeypatch, fail_name):
+    """DELETE removes the stored result before the row; on failure it answers 503 and the row
+    stays DONE so the delete can be retried. A removal in scandir order that met the marker first
+    and then failed left attestation.json + metadata.json stored without it: the route then
+    served the worker's bytes 200. Whatever fails, the marker must outlive every servable name."""
+    import os as _os
+
+    store = InMemoryJobStore()
+    blobs = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    job = _as_is_result(tmp_path, blobs, store)
+    client = _client_on(tmp_path, store, blobs)
+    assert client.get(f"/v1/jobs/{job.job_id}/attestation").status_code == 404
+
+    real_scandir, real_unlink = _os.scandir, _os.unlink
+
+    def scandir(*a, **kw):
+        return _Ordered(real_scandir(*a, **kw),
+                        key=lambda e: (e.name != attest.WITHHELD_NAME, e.name != fail_name,
+                                       e.name))
+
+    def unlink(path, *a, **kw):
+        if _os.path.basename(_os.fsdecode(path)) == fail_name:
+            raise OSError(5, "Input/output error")
+        return real_unlink(path, *a, **kw)
+
+    monkeypatch.setattr(_os, "scandir", scandir)
+    monkeypatch.setattr(_os, "unlink", unlink)
+    assert client.delete(f"/v1/jobs/{job.job_id}").status_code == 503
+    monkeypatch.undo()
+    assert store.get(job.job_id).status is JobStatus.DONE
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert r.content != _FORGED_RECEIPT
+
+
+def _failing_delete_objects(blobs, fail_names, calls):
+    """delete_objects that reports per-key Errors (and deletes nothing) for ``fail_names`` and
+    really deletes every other key in the batch -- S3's independent per-key outcome."""
+    real = blobs._s3.delete_objects
+
+    def delete_objects(Bucket, Delete):  # noqa: N803 -- boto3's parameter names
+        objs = Delete["Objects"]
+        calls.append([o["Key"].rsplit("/", 1)[-1] for o in objs])
+        bad = [o for o in objs if o["Key"].rsplit("/", 1)[-1] in fail_names]
+        good = [o for o in objs if o not in bad]
+        resp = real(Bucket=Bucket, Delete={"Objects": good}) if good else {}
+        resp["Errors"] = [{"Key": o["Key"], "Code": "InternalError", "Message": "x"}
+                          for o in bad]
+        return resp
+
+    return delete_objects
+
+
+@pytest.mark.parametrize("fail_names", [
+    {attest.RECEIPT_NAME, "metadata.json"}, {attest.RECEIPT_NAME}, {"metadata.json"}])
+def test_a_partial_s3_delete_never_unmasks_an_as_is_receipt(tmp_path, request, fail_names):
+    """S3 delete_job was one DeleteObjects batch whose per-key Errors are independent: the
+    marker could go while attestation.json and metadata.json stayed, and the route served the
+    worker's bytes 200 on a still-DONE job."""
+    store = InMemoryJobStore()
+    blobs = _s3_store(tmp_path, request)
+    job = _as_is_result(tmp_path, blobs, store)
+    client = _client_on(tmp_path, store, blobs)
+    calls: list[list[str]] = []
+    blobs._s3.delete_objects = _failing_delete_objects(blobs, fail_names, calls)
+    assert client.delete(f"/v1/jobs/{job.job_id}").status_code == 503
+    assert store.get(job.job_id).status is JobStatus.DONE
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert r.content != _FORGED_RECEIPT
+    with blobs.open_output(job.job_id, attest.WITHHELD_NAME) as fh:   # the marker survives
+        assert attest.is_tombstone(fh.read())
+
+
+def test_s3_delete_removes_the_receipt_first_and_the_marker_last(tmp_path, request):
+    """The order every partial failure relies on: attestation.json in a call of its own before
+    anything else, the marker in a call of its own after everything else."""
+    store = InMemoryJobStore()
+    blobs = _s3_store(tmp_path, request)
+    job = _as_is_result(tmp_path, blobs, store)
+    calls: list[list[str]] = []
+    blobs._s3.delete_objects = _failing_delete_objects(blobs, set(), calls)
+    blobs.delete_job(job.job_id)
+    assert calls[0] == [attest.RECEIPT_NAME]
+    assert calls[-1] == [attest.WITHHELD_NAME]
+    assert all(attest.RECEIPT_NAME not in c and attest.WITHHELD_NAME not in c
+               for c in calls[1:-1])
+    with pytest.raises(Exception):
+        blobs.open_output(job.job_id, "metadata.json")
+
+
+def test_local_delete_removes_everything_when_nothing_fails(tmp_path):
+    store = InMemoryJobStore()
+    blobs = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    job = _as_is_result(tmp_path, blobs, store)
+    blobs.delete_job(job.job_id)
+    assert not (tmp_path / "blobs" / "results" / job.job_id).exists()

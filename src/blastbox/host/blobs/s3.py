@@ -32,6 +32,7 @@ from blastbox.host.blobs.base import (
     BlobIntegrityError,
     _upload_order,
 )
+from blastbox.host.attest import RECEIPT_NAME, WITHHELD_NAME
 from blastbox.observability import get_logger
 
 _log = get_logger("blastbox.blobs.s3")
@@ -533,14 +534,34 @@ class S3BlobStore:
         or the ingress DELETE route) leaves the job retryable instead.
         """
         prefix = self._key("results", job_id) + "/"
+        # ORDERED, each step only after the previous one fully succeeded, so a delete that fails
+        # partway never leaves a servable receipt unmasked: attestation.json FIRST, then every
+        # other key, and the withheld marker LAST. One batch let S3's independent per-key Errors
+        # remove the marker while attestation.json and metadata.json stayed, and the attestation
+        # route then served an as-is result's worker-written attestation.json 200 on a job DELETE
+        # had left DONE (503, retryable).
+        self._delete_prefix(job_id, prefix + RECEIPT_NAME)
+        self._delete_prefix(job_id, prefix, keep=prefix + WITHHELD_NAME)
+        self._delete_prefix(job_id, prefix)
+
+    def _delete_prefix(self, job_id: str, prefix: str, *, keep: str | None = None) -> None:
+        """Delete every object (and version) under ``prefix`` except the key ``keep``; raise
+        BlobFetchError when any is left undeleted (see :meth:`delete_job`)."""
         errors: dict[tuple, dict] = {}
         # Take one page, delete it, then LIST AGAIN from the start. See
         # _next_delete_page for why this is not a paginate-and-delete loop. The pass
         # stops as soon as one makes no progress, so an undeletable object cannot
         # spin here -- it lands in `errors` and the raise below reports it.
         while True:
-            targets = self._next_delete_page(prefix)
+            page = self._next_delete_page(prefix)
+            targets = [t for t in page if t["Key"] != keep]
             if not targets:
+                if len(page) >= _DELETE_BATCH:
+                    # A whole page of `keep`'s versions: what lies past it cannot be listed
+                    # without deleting `keep` first, which the ordering forbids. Retryable.
+                    raise BlobFetchError(
+                        f"delete_job for {job_id}: a full listing page holds only {keep!r}; "
+                        "expire its noncurrent versions and retry")
                 break
             deleted = 0
             for batch in _batched(targets, _DELETE_BATCH):

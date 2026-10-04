@@ -20,6 +20,7 @@ import errno
 import hashlib
 import os
 import shutil
+import stat
 import uuid
 from pathlib import Path
 from typing import BinaryIO
@@ -33,9 +34,26 @@ from blastbox.host.blobs.base import (
     BlobIntegrityError,
     _upload_order,
 )
+from blastbox.host.attest import RECEIPT_NAME, WITHHELD_NAME
 from blastbox.observability import get_logger
 
 _log = get_logger("blastbox.blobs.local")
+
+
+def _remove_path(path: Path) -> None:
+    """Remove ``path`` -- a directory tree, or anything else without following a symlink.
+    Already gone is fine; any other error propagates."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return
+    try:
+        if stat.S_ISDIR(st.st_mode):
+            shutil.rmtree(path)
+        else:
+            os.unlink(path)
+    except FileNotFoundError:
+        pass
 
 _CHUNK = 1024 * 1024
 
@@ -268,9 +286,25 @@ class LocalBlobStore:
         transient failure is retried by a later sweep. Blanket
         ``ignore_errors=True`` would defeat that guard by making every failure mode
         indistinguishable from success.
+
+        ORDERED, so a removal that fails partway never leaves a servable receipt unmasked:
+        attestation.json FIRST (a failure there raises with everything else intact), then
+        every other name, and the withheld marker (attestation.withheld.json) LAST, with the
+        directory. The attestation route serves attestation.json whenever the marker is absent
+        and metadata.json present, and DELETE answers 503 with the row still DONE on a failure
+        -- an rmtree in scandir order could remove the marker, fail, and leave a worker-written
+        attestation.json of an as-is result served 200 as the receipt.
         """
         results_dir = self._results_dir(job_id)
+        _remove_path(results_dir / RECEIPT_NAME)
         try:
-            shutil.rmtree(results_dir)
+            with os.scandir(results_dir) as it:
+                rest = [e.name for e in it if e.name != WITHHELD_NAME]
+        except FileNotFoundError:
+            return
+        for name in rest:
+            _remove_path(results_dir / name)
+        try:
+            shutil.rmtree(results_dir)          # the marker, last
         except FileNotFoundError:
             pass
