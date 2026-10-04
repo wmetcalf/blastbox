@@ -570,3 +570,28 @@ def test_delete_job_all_success_path_does_not_raise(store, tmp_path):
 
     s3 = boto3.client("s3", region_name="us-east-1")
     assert s3.list_objects_v2(Bucket=BUCKET, Prefix="pfx/results/j7/")["KeyCount"] == 0
+
+
+def test_a_listing_page_of_only_the_markers_versions_refuses_rather_than_deleting_it_early(
+        versioned_store, tmp_path, monkeypatch):
+    """delete_job removes the withheld marker LAST. In a versioned bucket one listing page can
+    hold nothing but the marker's versions (it sorts before metadata.json); what lies past that
+    page cannot be listed without deleting the marker first. Stopping the keep-pass there and
+    moving on deleted the marker while metadata.json was still stored: it must raise instead,
+    leaving the marker (and the rest) in place for a retry."""
+    from blastbox.host import attest
+    from blastbox.host.blobs import s3 as s3mod
+
+    monkeypatch.setattr(s3mod, "_DELETE_BATCH", 3)
+    out = tmp_path / "jm" / "output"
+    out.mkdir(parents=True)
+    (out / "metadata.json").write_bytes(b"{}")
+    for i in range(3):                                   # three versions of the marker
+        (out / attest.WITHHELD_NAME).write_bytes(b"marker %d" % i)
+        versioned_store.put_output("jm", out)
+    with pytest.raises(BlobFetchError, match="holds only"):
+        versioned_store.delete_job("jm")
+    with versioned_store.open_output("jm", attest.WITHHELD_NAME) as fh:
+        assert fh.read() == b"marker 2"                  # the marker was not deleted early
+    with versioned_store.open_output("jm", "metadata.json") as fh:
+        assert fh.read() == b"{}"
