@@ -65,7 +65,6 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -94,20 +93,22 @@ WITHHELD_NAME = "attestation.withheld.json"
 #: stripping it locally, which would leave the stored marker hiding the receipt forever. EVERY
 #: upload that ships a receipt or a tombstone carries it -- the fresh seals (written with the
 #: receipt/tombstone, over whatever a worker planted there: the gate refused declaring the name),
-#: the sweep's receipt and tombstone branches and the migration's tombstone branch -- so the
-#: route trusts the host's own envelope verdict and never re-judges a new result under its
-#: ceiling. A cleared marker is only ever written in the same upload as an attestation.json this
+#: the sweep's receipt and tombstone branches and the migration's tombstone branch. The route
+#: does NOT take it as a verdict (round 7, O1): a well-formed cleared body only means "not
+#: withheld", and the stored envelope is still judged under the route's ceiling -- over it, the
+#: receipt is withheld. A cleared marker is only ever written in the same upload as an attestation.json this
 #: host wrote (a receipt or a tombstone), never with nothing at that name. A result with NO marker
 #: is legacy (pre-receipt, or an as-is upload by an earlier build) and the route still judges its
 #: envelope.
 #:
 #: BOUND TO THE ENVELOPE. The body names the sha256 of the metadata.json shipped in the same
-#: upload, and the route accepts it only for the sha256 of the STORED metadata.json. A result
+#: upload. That is how write_withheld_marker recognises this host's own marker in a retained tree
+#: (and replaces it when a retry under a lower limit ships as-is). A result
 #: uploaded by older code (no reserved names) could DECLARE an artifact at WITHHELD_NAME; the
 #: sealed envelope commits to every declared artifact's sha256 (seal_envelope re-hashes them from
 #: disk), so that artifact's bytes would have to contain the hash of an envelope that contains
 #: the hash of those bytes -- a sha256 cycle. A pre-binding body, or one bound to any other
-#: envelope, never vouches.
+#: envelope, is never taken for the host's own.
 CLEARED_MARKER_ATTESTATION = "not-withheld"
 #: The most of a stored marker the route reads; anything longer is withheld, never truncated.
 WITHHELD_MARKER_MAX_BYTES = 4096
@@ -464,6 +465,13 @@ RECEIPT_PATH_UNDECIDABLE_REASON = ("the result's envelope cannot be read to rule
 #: signs the envelope's sha256, and put_output stores the envelope LAST, so its absence means a
 #: partial upload (or a seal that was never shipped) -- nothing at attestation.json is a receipt.
 RECEIPT_ENVELOPE_ABSENT_REASON = "the stored result has no envelope for a receipt to vouch for"
+#: The route's answer for an envelope larger than its own ceiling (:func:`envelope_cap`): it
+#: cannot be parsed to rule out a declared artifact at attestation.json, and no marker vouches
+#: for an envelope the ingress cannot judge, so the receipt is withheld. Names the fix.
+RECEIPT_ENVELOPE_OVER_LIMIT_REASON = (
+    "the result's envelope is larger than this ingress's metadata limit, so it cannot rule out a "
+    "declared artifact at attestation.json; set BLASTBOX_MAX_METADATA on the ingress at least as "
+    "high as on the dispatchers that seal results")
 #: The tombstone the legacy migration ships in place of whatever the worker left at
 #: attestation.json: a pre-blob-store result carries no receipt by construction.
 RECEIPT_LEGACY_MIGRATED_REASON = "a legacy result migrated to the store carries no receipt"
@@ -617,9 +625,8 @@ def _write_atomic(out_dir: Path, data: bytes, *, gate_verified: bool = False,
     finally:
         tmp.unlink(missing_ok=True)
     # Every receipt or tombstone ships with the CLEARED marker, bound to the envelope in the tree
-    # (``metadata_sha256``: the one the receipt signed): the host vouching that it judged this
-    # tree's envelope itself, so the route never re-judges it under another ceiling, and an
-    # overwrite of any marker an earlier upload of the job stored. strip_receipt above already
+    # (``metadata_sha256``: the one the receipt signed): an overwrite of any withheld marker an
+    # earlier upload of the job stored, and recognisable as this host's own on a retry. strip_receipt above already
     # cleared (or refused for) everything at the reserved names. Every caller writes metadata.json
     # BEFORE this and never after (the dispatchers seal it first; the sweeps never rewrite it). A
     # failure here raises, so the caller never ships a receipt without it.
@@ -634,7 +641,7 @@ def cleared_marker_body(metadata_sha256: str) -> dict:
 
 def is_cleared_marker(data: bytes, metadata_sha256: str) -> bool:
     """Whether bytes stored at WITHHELD_NAME are EXACTLY the canonical cleared body for the
-    envelope whose sha256 is ``metadata_sha256`` -- the only marker content that vouches. Byte
+    envelope whose sha256 is ``metadata_sha256`` -- this host's own cleared marker for it. Byte
     equality, not a parse."""
     return data == canonical(cleared_marker_body(metadata_sha256))
 
@@ -643,8 +650,9 @@ def bound_cleared_marker_sha256(data: bytes) -> str | None:
     """The envelope sha256 ``data`` is the canonical cleared body for, or None when it is not
     exactly a cleared body for any 64-hex sha256 (a tombstone, unparseable bytes, a near-miss such
     as ``"withheld": 0``, extra keys, the pre-binding body). The route answers None with the
-    no-receipt 404; a cleared body bound to ANOTHER envelope (metadata.json swapped after the
-    upload) vouches for nothing and the result is judged as legacy."""
+    no-receipt 404; for any well-formed cleared body it lets the envelope decide (the binding
+    does not vouch there). The binding identifies this host's own marker to
+    :func:`write_withheld_marker`."""
     try:
         body = json.loads(data)
         sha = body["metadata_sha256"]
@@ -654,20 +662,6 @@ def bound_cleared_marker_sha256(data: bytes) -> str | None:
             and all(c in "0123456789abcdef" for c in sha)):
         return None
     return sha if is_cleared_marker(data, sha) else None
-
-
-def sha256_stream_with_prefix(fh: Any, keep: int) -> tuple[str, bytes]:
-    """(sha256 of everything ``fh.read`` yields, its first ``keep`` bytes). Read in chunks: the
-    hash has no cap, and at most ``keep`` bytes are held."""
-    h = hashlib.sha256()
-    head: list[bytes] = []
-    held = 0
-    while chunk := fh.read(_READ_CHUNK):
-        h.update(chunk)
-        if held < keep:
-            head.append(chunk[:keep - held])
-            held += len(head[-1])
-    return h.hexdigest(), b"".join(head)
 
 
 def _shipped_metadata_sha256(out_dir: Path) -> str | None:

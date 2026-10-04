@@ -520,12 +520,13 @@ def test_an_envelope_read_error_is_503_not_a_verdict(tmp_path, key, mode):
     assert client.get(f"/v1/jobs/{job.job_id}/attestation").status_code == 503
 
 
-def test_a_genuine_receipt_over_this_ingress_cap_still_serves(tmp_path, key, monkeypatch):
+def test_a_genuine_receipt_over_this_ingress_cap_is_withheld(tmp_path, key, monkeypatch):
     """A peer dispatcher configured with a larger BLASTBOX_MAX_METADATA sealed and signed over
-    an envelope past THIS ingress's ceiling. The route used to read the envelope under its own
-    cap, judge it undecidable and 404 the genuine receipt (round-3 review D1). The uploader's
-    as-is verdict now travels as the withheld marker, so the route reads no envelope: with no
-    marker the receipt is served."""
+    an envelope past THIS ingress's ceiling. Round-3 D1 (and 5f731d4) served it unjudged; round
+    7 (O1) fails closed instead: an envelope this ingress cannot parse cannot rule out a declared
+    artifact at attestation.json, whatever the marker says (a pre-#188 worker can predict and bind
+    a cleared marker to its own sealed envelope). The 404 tells the operator to raise the
+    ingress's limit to the dispatchers'."""
     store = InMemoryJobStore()
     job, out = _make_done_job(tmp_path, store)
     meta = json.loads((out / "metadata.json").read_bytes())
@@ -537,6 +538,11 @@ def test_a_genuine_receipt_over_this_ingress_cap_still_serves(tmp_path, key, mon
     _push_to_blob(tmp_path, job.job_id, out)
     monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 1024)
     r = _route_with_limit(tmp_path, store, 1024).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert attest.RECEIPT_ENVELOPE_OVER_LIMIT_REASON in r.json()["detail"]
+    assert "BLASTBOX_MAX_METADATA" in r.json()["detail"]
+    # The same result under an ingress configured like the dispatcher that sealed it: served.
+    r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 200, r.text
     assert r.json() == body
 
@@ -1227,7 +1233,7 @@ def test_an_unmarked_legacy_result_over_this_ingress_cap_is_404(tmp_path, monkey
                        envelope=json.dumps({"artifacts": [], "pad": "x" * 4096}).encode())
     r = _route_with_limit(tmp_path, store, 1024).get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 404, r.text
-    assert attest.RECEIPT_PATH_UNDECIDABLE_REASON in r.json()["detail"]
+    assert attest.RECEIPT_ENVELOPE_OVER_LIMIT_REASON in r.json()["detail"]
 
 
 def test_an_unmarked_legacy_result_with_a_genuine_receipt_still_serves(tmp_path, key):
@@ -1238,10 +1244,11 @@ def test_an_unmarked_legacy_result_with_a_genuine_receipt_still_serves(tmp_path,
     assert r.json() == body
 
 
-def test_a_fresh_result_over_this_ingress_cap_serves_via_the_cleared_marker(
+def test_a_fresh_result_over_this_ingress_cap_is_withheld_despite_its_cleared_marker(
         tmp_path, key, monkeypatch):
-    """The fresh seal's cleared marker is the host vouching for its own envelope: an ingress
-    with a SMALLER ceiling than the signer's never re-judges it (deepseek D1 stays fixed)."""
+    """Round 7 (O1) supersedes deepseek D1: an ingress with a SMALLER ceiling than the signer's
+    withholds even a fresh seal's receipt -- a cleared marker cannot vouch for an envelope this
+    ingress cannot judge -- and says which limit to raise."""
     monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 1024)
     store = InMemoryJobStore()
     job, out = _make_done_job(tmp_path, store)
@@ -1254,6 +1261,9 @@ def test_a_fresh_result_over_this_ingress_cap_serves_via_the_cleared_marker(
         worker_tier=None, started_at_ms=1, finished_at_ms=2))
     _push_to_blob(tmp_path, job.job_id, out)
     r = _route_with_limit(tmp_path, store, 1024).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert attest.RECEIPT_ENVELOPE_OVER_LIMIT_REASON in r.json()["detail"]
+    r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 200, r.text
     assert r.content == (out / attest.RECEIPT_NAME).read_bytes()
 
@@ -1533,16 +1543,63 @@ def test_an_unbound_cleared_lookalike_never_unmasks_a_receipt_over_the_ceiling(
     assert r.content != _FORGED_RECEIPT
 
 
-def test_a_genuine_vouched_result_over_the_ceiling_is_served(tmp_path, monkeypatch, key):
-    """The other half of L1: a fresh seal's cleared marker IS bound to its stored envelope, so
-    over this ingress's ceiling the receipt is served without parsing the envelope (deepseek D1)."""
+@pytest.mark.parametrize("declared", [attest.RECEIPT_NAME, "attestation.json/p.png"])
+def test_a_bound_marker_never_unmasks_a_declared_receipt_over_the_ceiling(
+        tmp_path, monkeypatch, declared):
+    """O1 (codex, deepseek, qwen-next): bfe1eae's residual. A pre-#188 dispatcher ships a
+    worker's tree verbatim; the worker predicts its sealed envelope's sha256 and plants an
+    UNDECLARED cleared marker bound to it beside a DECLARED artifact at the receipt name, with
+    the envelope over this ingress's ceiling. Served 200 before; now the over-limit 404."""
     monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 64)
     store = InMemoryJobStore()
-    job, out, body = _done_with_receipt(tmp_path, store, key)
-    assert (out / "metadata.json").stat().st_size > 64
+    job, out = _make_done_job(tmp_path, store)
+    if declared == attest.RECEIPT_NAME:
+        (out / attest.RECEIPT_NAME).write_bytes(_FORGED_RECEIPT)
+    else:
+        (out / attest.RECEIPT_NAME).mkdir()
+        (out / declared).write_bytes(b"page")
+    (out / "metadata.json").write_text(json.dumps({"artifacts": [
+        {"id": "a", "path": declared, "sha256": "0" * 64}], "pad": "x" * 256}))
+    (out / attest.WITHHELD_NAME).write_bytes(_cleared_for(out))
+    _push_to_blob(tmp_path, job.job_id, out)
     r = _route_with_limit(tmp_path, store, 64).get(f"/v1/jobs/{job.job_id}/attestation")
-    assert r.status_code == 200, r.text
-    assert r.json() == body
+    assert r.status_code == 404, r.text
+    assert attest.RECEIPT_ENVELOPE_OVER_LIMIT_REASON in r.json()["detail"]
+
+
+def test_the_route_never_reads_an_envelope_past_its_ceiling(tmp_path, monkeypatch, key):
+    """deepseek LOW: the route hashed the stored metadata.json whole on every request when a
+    cleared marker was present. It now reads at most the ingress's ceiling plus one byte."""
+    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 1024)
+    store = InMemoryJobStore()
+    job, out = _make_done_job(tmp_path, store)
+    (out / "metadata.json").write_text(json.dumps({"artifacts": [], "pad": "x" * (1 << 20)}))
+    attest.seal_receipt(out, key=key, observation=attest.RunObservation(
+        job_id=job.job_id, engine=job.engine, input_sha256="d" * 64, worker_runtime="runsc",
+        worker_tier=None, started_at_ms=1, finished_at_ms=2))
+    _push_to_blob(tmp_path, job.job_id, out)
+    read = {"n": 0}
+
+    class _Counting(LocalBlobStore):
+        def open_result_only(self, job_id, name):
+            fh = super().open_result_only(job_id, name)
+            if name != "metadata.json":
+                return fh
+            raw_read = fh.read
+
+            def counted(n=-1):
+                chunk = raw_read(n)
+                read["n"] += len(chunk)
+                return chunk
+            fh.read = counted
+            return fh
+
+    app = build_app(job_store=store, job_root=tmp_path / "jobs", allowed_engines={"clippyshot"},
+                    limits=Limits(max_metadata_bytes=1024), api_workers=2, zip_password="",
+                    blob_store=_Counting(tmp_path / "jobs", blob_root=tmp_path / "blobs"))
+    r = TestClient(app).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert 0 < read["n"] <= 1025
 
 
 @pytest.mark.parametrize("backend", ["local", "s3"])

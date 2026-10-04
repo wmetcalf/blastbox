@@ -150,31 +150,29 @@ tombstone (the dispatchers' seals, the pending-upload sweep, and the legacy migr
 a tombstone over a worker-written `attestation.json` rather than stripping it) also stores an
 `attestation.withheld.json` marker holding the *cleared* body bound to the envelope it shipped
 with (`{"attestation":"not-withheld","metadata_sha256":"<sha256 of that metadata.json>","withheld":false}`,
-canonical bytes): the host vouching for its own envelope verdict, so the route never re-judges
-that result under its own `BLASTBOX_MAX_METADATA`. A cleared marker only ever ships beside an
-`attestation.json` the host wrote in the same upload. A result the retention sweeps upload
-*as-is* (its envelope declares, or cannot rule out, an artifact at `attestation.json`) stores the
-marker in the tombstone shape instead; an as-is retry after a failed upload ships the marker its
-earlier attempt wrote, and when an earlier attempt vouched instead (its cleared marker bound to
-the same `metadata.json`) and a lowered limit now makes the retry as-is, that marker is replaced
-by the withheld body. The route: a cleared marker bound to the sha256 of the **stored**
-`metadata.json` (hashed whole, uncapped) serves the receipt — unless that envelope, when it fits
-under the ingress's limit, declares (or cannot be parsed around) a reserved name, which no
-genuine result does; one bound to another envelope (a
-`metadata.json` swapped after the upload) vouches for nothing and the result is judged as legacy;
-any other marker (or one over 4 KiB) answers `404`; no stored `metadata.json` answers `404`; a
-result with **no** marker is legacy (uploaded before receipts, or as-is by an earlier build), so
-its envelope is parsed under the ingress's limit and a declared, unparseable or over-limit
-envelope answers `404`. The binding makes the marker unforgeable by a result older code stored
-verbatim: a declared artifact at the marker's name has its sha256 in the sealed envelope, so its
-bytes cannot also name that envelope's sha256. The store never deletes a single object, so a
+canonical bytes). A cleared marker only ever ships beside an `attestation.json` the host wrote in
+the same upload. A result the retention sweeps upload *as-is* (its envelope declares, or cannot
+rule out, an artifact at `attestation.json`) stores the marker in the tombstone shape instead; an
+as-is retry after a failed upload ships the marker its earlier attempt wrote, and when an earlier
+attempt vouched instead (its cleared marker bound to the same `metadata.json`) and a lowered limit
+now makes the retry as-is, that marker is replaced by the withheld body. The route: any marker but
+a well-formed cleared body (the withheld body, a near-miss, one over 4 KiB) answers `404`; no
+stored `metadata.json` answers `404`; otherwise — a cleared marker or none (a legacy result,
+uploaded before receipts or as-is by an earlier build) — the stored envelope decides, read under
+the **ingress's** `BLASTBOX_MAX_METADATA` and never past it. An envelope that declares (or cannot
+be parsed around) a reserved name answers `404`, which no genuine result does. **An envelope
+larger than the ingress's limit answers `404` too, even for a genuine receipt**: the ingress
+cannot rule out a declared artifact at `attestation.json`, and a cleared marker cannot vouch for
+it (a pre-receipt dispatcher shipped a worker's tree verbatim, and the worker can predict its
+sealed envelope's hash). The `404` says so. **Set `BLASTBOX_MAX_METADATA` on every ingress at
+least as high as on every dispatcher that seals results**, or receipts over the ingress's limit
+are withheld, not served. The store never deletes a single object, so a
 later receipt-carrying upload of the same job overwrites an earlier as-is marker with the cleared
 body rather than leaving it to withhold the receipt forever. A legacy tree whose envelope declares
 (or cannot rule out) an artifact at the marker's own name is never shipped as-is or with a receipt
 — its bytes could be the cleared body — so it stays retained (sweep) or is counted failed
-(migration), logged as an error with its job id. So a ceiling mismatch can withhold a legacy
-result's receipt, but cannot hide a new genuine receipt or serve a
-forged one. Both names are reserved: a worker cannot declare an artifact at either. Deleting a
+(migration), logged as an error with its job id. So a ceiling mismatch can withhold a receipt
+(fail closed), but cannot serve a forged one. Both names are reserved: a worker cannot declare an artifact at either. Deleting a
 result (`DELETE /v1/jobs/{id}`, retention) removes `attestation.json` first and the marker last,
 so a delete that fails partway (a `503`, the job left `DONE` for a retry) never leaves a stored
 `attestation.json` without the marker that withholds it.
@@ -344,7 +342,7 @@ registered a different one, in either boot order, including local-versus-remote.
 | Var | Default | Notes |
 |---|---|---|
 | `BLASTBOX_MAX_INPUT` | `104857600` (100 MiB) | Max accepted input-file size (also enforced pre-spool by the ingress 413 body guard). |
-| `BLASTBOX_MAX_METADATA` | `4194304` (4 MiB) | Max size of the worker's `metadata.json`. |
+| `BLASTBOX_MAX_METADATA` | `4194304` (4 MiB) | Max size of the worker's `metadata.json`. Set it on every ingress at least as high as on every dispatcher: the attestation route withholds (`404`) the receipt of a result whose envelope exceeds the ingress's value. |
 | `BLASTBOX_MAX_ARTIFACT` | `52428800` (50 MiB) | Max size of a **single** output artifact. |
 | `BLASTBOX_MAX_TOTAL_ARTIFACTS` | `524288000` (500 MiB) | Max **total bytes** across all artifacts (a byte cap, despite the name — not a count). |
 | `BLASTBOX_MAX_ARTIFACTS` | `1000` | Max **number** of artifacts. |

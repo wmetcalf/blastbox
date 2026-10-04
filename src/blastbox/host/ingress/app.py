@@ -1067,26 +1067,21 @@ def build_app(
         # on-disk tree, which no dispatcher ever sanitised -- an attestation.json there is whatever
         # the worker wrote -- so a store offering a no-fallback read is always read through it.
         opener = getattr(_blob_store, "open_result_only", None) or _blob_store.open_output
-        # THE UPLOADER'S VERDICT FIRST. Every upload that ships a receipt or tombstone stores a
-        # CLEARED marker bound to the envelope it shipped -- the host vouching for its own
-        # envelope verdict -- and every as-is upload (its envelope declared, or under THAT
+        # THE UPLOADER'S VERDICT FIRST. Every as-is upload (its envelope declared, or under THAT
         # process's ceiling could not rule out, an artifact at attestation.json) stores the
-        # withheld one:
-        #   * a cleared body bound to the STORED metadata.json's sha256 (hashed by streaming
-        #     the blob: no parse, no cap): trusted, the envelope is NOT re-judged here (judging
-        #     it under this app's ceiling is how a smaller ingress limit 404'd a genuine receipt
-        #     a peer had signed over a larger envelope);
-        #   * a cleared body bound to ANOTHER envelope (metadata.json swapped after the upload):
-        #     it vouches for nothing, and the result is judged as legacy, below -- exactly as if
-        #     there were no marker. No result is served that an unmarked one would not be;
-        #   * anything else -- the withheld body, unparseable, a near-miss, over the read cap,
-        #     the pre-binding cleared body: 404;
-        #   * no marker: LEGACY (a pre-receipt upload, or an as-is one by an earlier build) --
-        #     unmarked is not safe, so its envelope is judged below as it always was.
-        # The binding is what makes the marker unforgeable by a result older code uploaded
-        # verbatim: a DECLARED artifact at the marker's name is committed to by its sha256 in the
-        # sealed envelope, so it cannot also contain that envelope's sha256.
-        # A marker or envelope that cannot be checked is no verdict: 503.
+        # WITHHELD marker, and every upload that ships a receipt or tombstone stores the CLEARED
+        # body bound to the envelope it shipped:
+        #   * anything but a well-formed cleared body -- the withheld body, unparseable, a
+        #     near-miss, over the read cap, the pre-binding cleared body: 404;
+        #   * a cleared body (bound to any envelope) or no marker at all: the envelope decides,
+        #     below. A cleared marker does NOT vouch here. It cannot make the route serve what
+        #     the envelope judgement would refuse: a pre-#188 dispatcher shipped a worker's tree
+        #     verbatim, and the worker can predict its sealed envelope's sha256 and plant a
+        #     marker bound to it. Under the ceiling the judgement below already refuses any
+        #     reserved-name declaration, so a binding check there changes no answer (round 7,
+        #     O1 -- the dead `vouched` branch is gone; the binding still identifies the host's
+        #     own marker to write_withheld_marker).
+        # A marker that cannot be read is no verdict: 503.
         cap = _attest.WITHHELD_MARKER_MAX_BYTES
         try:
             with opener(job_id, _attest.WITHHELD_NAME) as wfh:
@@ -1097,9 +1092,8 @@ def build_app(
                              job_id, exc)
                 raise HTTPException(503, "could not read the execution receipt")
             withheld = None
-        bound = (None if withheld is None or len(withheld) > cap
-                 else _attest.bound_cleared_marker_sha256(withheld))
-        if withheld is not None and bound is None:
+        if withheld is not None and (len(withheld) > cap
+                                     or _attest.bound_cleared_marker_sha256(withheld) is None):
             why = _attest.RECEIPT_WITHHELD_REASON
             if len(withheld) <= cap and _attest.is_tombstone(withheld):
                 with contextlib.suppress(Exception):
@@ -1108,37 +1102,32 @@ def build_app(
         # NO ENVELOPE, NO RECEIPT. A genuine receipt always signs metadata_sha256, and put_output
         # stores metadata.json LAST, so a prefix without it is a partial upload (possibly of an
         # as-is tree whose attestation.json landed before its marker did) or a seal put_output
-        # would not ship. Cleared marker: the stored envelope is hashed, whole and uncapped, to
-        # check the binding. Otherwise (legacy, or bound elsewhere): read under THIS app's
-        # ceiling and judged -- a declared (or undecidable, or over-cap) artifact at
-        # attestation.json is never served as the receipt.
+        # would not ship.
         #
-        # A vouched result's envelope is still judged while it fits under this app's ceiling,
-        # as a deny only: no genuine vouched result declares (or fails to parse around) a
-        # reserved name -- the trust gate refuses one, and the sweeps vouch only when the
-        # envelope rules both names out -- but a tree a PRE-#188 dispatcher shipped verbatim can
-        # carry an UNDECLARED marker the worker bound to its own predictable sealed envelope.
-        # Over the ceiling a vouched result is served without it (deepseek D1 stays fixed).
+        # THE ENVELOPE DECIDES, read under THIS app's ceiling and never past it (no uncapped
+        # hash per request). Over the ceiling it cannot be parsed to rule out a declared
+        # artifact at attestation.json, so the receipt is withheld -- fail closed, even for a
+        # genuine receipt a dispatcher with a larger limit signed (round 7 supersedes
+        # 5f731d4 / deepseek D1): the 404 names BLASTBOX_MAX_METADATA so the operator aligns
+        # the ingress's limit with the dispatchers'. Within it, a declared or unparseable
+        # reserved path answers 404, which no genuine result has (the trust gate refuses a
+        # declaration at either name).
         envelope_cap = _attest.envelope_cap(_limits)
-        vouched = False
         try:
             with opener(job_id, "metadata.json") as mfh:
-                if bound is not None:
-                    digest, envelope = _attest.sha256_stream_with_prefix(mfh, envelope_cap + 1)
-                    vouched = bound == digest
-                else:
-                    envelope = mfh.read(envelope_cap + 1)
+                envelope = mfh.read(envelope_cap + 1)
         except Exception as exc:
             if not _is_missing_blob(exc):
                 _log.warning("attestation: envelope read failed for job=%s: %s", job_id, exc)
                 raise HTTPException(503, "could not read the execution receipt")
             raise HTTPException(404, "no execution receipt for this job: "
                                      f"{_attest.RECEIPT_ENVELOPE_ABSENT_REASON}")
-        if len(envelope) <= envelope_cap or not vouched:
-            why_not = _attest.envelope_receipt_path_protection(
-                None if len(envelope) > envelope_cap else envelope)
-            if why_not is not None:
-                raise HTTPException(404, f"no execution receipt for this job: {why_not}")
+        if len(envelope) > envelope_cap:
+            raise HTTPException(404, "no execution receipt for this job: "
+                                     f"{_attest.RECEIPT_ENVELOPE_OVER_LIMIT_REASON}")
+        why_not = _attest.envelope_receipt_path_protection(envelope)
+        if why_not is not None:
+            raise HTTPException(404, f"no execution receipt for this job: {why_not}")
         try:
             fh = opener(job_id, _attest.RECEIPT_NAME)
         except Exception as exc:
