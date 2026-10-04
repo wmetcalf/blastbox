@@ -1743,7 +1743,7 @@ def _remark_receipts(args, blobs, store, log, keys) -> int:
 
         limits = _Limits(max_metadata_bytes=args.max_metadata)
     try:
-        remarked, already, unverified, failed = remark_stored_receipts(
+        remarked, already, unverified, failed, replaced = remark_stored_receipts(
             blobs, store, keys, log, limit=args.limit, dry_run=args.dry_run, limits=limits)
     except JobEnumerationFailed as exc:
         print(f"error: {exc}; run --remark where the job store can be enumerated (the control "
@@ -1752,6 +1752,7 @@ def _remark_receipts(args, blobs, store, log, keys) -> int:
         return 2
     print(
         f"remarked={remarked} already-marked={already} unverified={unverified} failed={failed}"
+        f" replaced={replaced}"
         + (" (dry run — nothing was stored)" if args.dry_run else "")
     )
     return 1 if failed else 0
@@ -2154,7 +2155,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--remark",
         action="store_true",
         help="instead of migrating: store the receipt marker beside each genuine receipt that "
-             "a 0.1.44/0.1.45 upload left unmarked, verified against the --verify-key public "
+             "a 0.1.44/0.1.45 upload left unmarked (or beside a marker this host never "
+             "writes, which it replaces), verified against the --verify-key public "
              "keys (default: this host's BLASTBOX_ATTEST_KEY); the ingress withholds unmarked "
              "receipts. Run once after upgrading where the job store can be enumerated (the "
              "control plane; a federated node cannot), passing every signing host's public key. "

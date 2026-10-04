@@ -840,21 +840,32 @@ def remark_stored_receipts(
     limit: int = 0,
     dry_run: bool = False,
     limits: "Limits | None" = None,
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int, int, int, int]:
     """Store the cleared marker beside every genuine receipt signed by one of ``keys`` that
-    sits in the store unmarked (uploaded by 0.1.44/0.1.45, before markers). The attestation
+    sits in the store unmarked (uploaded by 0.1.44/0.1.45, before markers), or beside a marker
+    this host never writes (planted by a worker under a 0.1.45 dispatcher during the rollout). The attestation
     route answers 404 for an unmarked result (codex r134 C1): it cannot tell a host-written
     attestation.json from a worker's in a tree a pre-#188 node shipped verbatim. Verifying
     needs only PUBLIC keys, so run it once where the job store can be enumerated (the control
     plane; a federated node's store refuses list()) with every signing host's public key.
     ``keys`` is one key or several (private AttestKey or public VerifyKey); a receipt is checked
     only against the key its own key_id names. Raises JobEnumerationFailed when the DONE jobs
-    cannot be listed. Returns (remarked, already_marked, unverified, failed).
+    cannot be listed. Returns (remarked, already_marked, unverified, failed, replaced).
 
     For each DONE job, all reads bounded (read_result_prefix):
 
-    * a marker already stored (any bytes): already marked -- never touched, so a rerun is a
-      no-op and an as-is upload's withheld marker is never overwritten;
+    * a marker this host writes already stored -- exactly the canonical cleared body bound to
+      the sha256 of the stored metadata.json, or exactly the canonical withheld body for one of
+      MARKER_REASONS: already marked, never touched, so a rerun is a no-op and an as-is upload's
+      withheld verdict is never overwritten;
+    * any OTHER marker is foreign: a 0.1.45 dispatcher neither reserved nor stripped the name,
+      so its worker could plant bytes there beside a genuine receipt, which the upgraded route
+      then withholds. It is judged exactly like a missing marker below, and REPLACED by the
+      cleared marker (counted ``replaced``) only when the receipt verifies -- which also requires
+      an envelope that parses and declares nothing at either reserved name, so the stored bytes
+      cannot be a declared artifact. Otherwise it is left alone (unverified), never destroyed.
+      An exact copy of a host-written withheld body cannot be told from the host's own and stays
+      (it can only suppress that job's receipt, never get one served);
     * else the stored attestation.json must be a receipt whose key_id names one of ``keys``
       and that verifies under that key, for this job_id, whose metadata_sha256 is the sha256 of the STORED metadata.json (read
       under the envelope ceiling, and not declaring or hiding an artifact at a reserved name).
@@ -881,7 +892,8 @@ def remark_stored_receipts(
     if isinstance(keys, (_attest.AttestKey, _attest.VerifyKey)):
         keys = [keys]
     by_id = {k.key_id: k for k in keys}
-    remarked = already = unverified = failed = 0
+    remarked = already = unverified = failed = replaced = 0
+    host_withheld = {_attest.canonical(_attest.tombstone_body(r)) for r in _attest.MARKER_REASONS}
 
     def fetch(job_id: str, name: str, cap: int) -> bytes | None:
         """At most cap + 1 bytes, or None when absent; raises on a read error."""
@@ -898,15 +910,21 @@ def remark_stored_receipts(
         raise JobEnumerationFailed(
             f"cannot enumerate the job store's DONE jobs ({type(exc).__name__}: {exc})") from exc
     for job in done_jobs:
-        if limit and remarked >= limit:
+        if limit and remarked + replaced >= limit:
             break
         job_id = job.job_id
         try:
-            if fetch(job_id, _attest.WITHHELD_NAME, _attest.WITHHELD_MARKER_MAX_BYTES) is not None:
+            marker = fetch(job_id, _attest.WITHHELD_NAME, _attest.WITHHELD_MARKER_MAX_BYTES)
+            if marker is not None and marker in host_withheld:
+                already += 1
+                continue
+            envelope = fetch(job_id, "metadata.json", envelope_cap)
+            if (marker is not None and envelope is not None and len(envelope) <= envelope_cap
+                    and _attest.is_cleared_marker(marker,
+                                                  hashlib.sha256(envelope).hexdigest())):
                 already += 1
                 continue
             receipt = fetch(job_id, _attest.RECEIPT_NAME, _attest._RECEIPT_MAX_BYTES)
-            envelope = fetch(job_id, "metadata.json", envelope_cap)
         except Exception as exc:  # noqa: BLE001 -- one result must never abort the run
             log.warning("receipt re-mark: %s: read failed (%s); not re-marked", job_id, exc)
             failed += 1
@@ -933,7 +951,8 @@ def remark_stored_receipts(
             if not ok:
                 why = "not a receipt a listed key signed for this job and envelope"
         if why is not None:
-            log.info("receipt re-mark: %s: %s; left unmarked", job_id, why)
+            log.info("receipt re-mark: %s: %s; left %s", job_id, why,
+                     "unmarked" if marker is None else "with its foreign marker")
             unverified += 1
             continue
         if not dry_run:
@@ -946,11 +965,16 @@ def remark_stored_receipts(
                 log.warning("receipt re-mark: %s: could not store the marker (%s)", job_id, exc)
                 failed += 1
                 continue
-            log.info("receipt re-mark: %s: genuine receipt re-marked", job_id)
-        remarked += 1
-    log.info("receipt re-mark: %d re-marked, %d already marked, %d unverified, %d failed%s",
-             remarked, already, unverified, failed, " (dry run)" if dry_run else "")
-    return (remarked, already, unverified, failed)
+            log.info("receipt re-mark: %s: genuine receipt re-marked%s", job_id,
+                     "" if marker is None else " (foreign marker replaced)")
+        if marker is None:
+            remarked += 1
+        else:
+            replaced += 1
+    log.info("receipt re-mark: %d re-marked, %d already marked, %d unverified, %d failed, "
+             "%d foreign markers replaced%s", remarked, already, unverified, failed, replaced,
+             " (dry run)" if dry_run else "")
+    return (remarked, already, unverified, failed, replaced)
 
 
 def reap_stale_scratch(

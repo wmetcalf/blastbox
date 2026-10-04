@@ -27,13 +27,16 @@ re-marked against their signing host's public key (below).
 A 0.1.45 dispatcher also neither reserves nor strips `attestation.withheld.json`, so a worker
 running under a not-yet-upgraded dispatcher can plant a file at that name beside its job's
 genuine receipt. The upgraded ingress reads any marker but the cleared body as the uploader's
-verdict and withholds that job's receipt (`404`) permanently, under a reason worded as this
-host's own (the worker can copy one), and `--remark` leaves an already-marked result alone.
-Nothing is forged: a worker can only suppress its own job's receipt, never get a receipt served.
-The order is still ingress first because the opposite order allows forgery: a 0.1.45 ingress
-serves an as-is upload's worker-written `attestation.json` as a receipt (above). The window closes
-once every dispatcher runs this release, so keep the rollout short: upgrade the dispatchers
-promptly after the ingresses.
+verdict and withholds that job's receipt (`404`), under a reason worded as this host's own (the
+worker can copy one). Nothing is forged: a worker can only suppress its own job's receipt, never
+get a receipt served. Running `--remark` (below) **after the rollout completes** undoes this: it
+replaces any stored marker this host never writes with the cleared marker, when the receipt
+beside it verifies. The one exception is a worker that planted an exact copy of a withheld body
+this host writes: that cannot be told from the host's own verdict, so it stays withheld. The
+order is still ingress first because the opposite order allows forgery: a 0.1.45 ingress serves
+an as-is upload's worker-written `attestation.json` as a receipt (above). The window closes once
+every dispatcher runs this release, so keep the rollout short: upgrade the dispatchers promptly
+after the ingresses.
 
 ### After upgrading: re-mark genuine receipts (once, on the control plane)
 
@@ -58,9 +61,18 @@ For each `DONE` result stored without a marker, it reads the stored `attestation
 one of the given keys and it verifies under that key, for that job, over the sha256 of the stored
 `metadata.json`, and the envelope declares nothing at a reserved name. Anything else (a receipt
 from a key you did not pass, a tombstone, worker bytes) is left unmarked and counted `unverified`;
-rerun with the missing host's key to re-mark its receipts. Already-marked results are never
-touched, so reruns are safe. It prints `remarked=N already-marked=N unverified=N failed=N` and
-exits `1` if any read or write failed (rerun it). `--limit N` re-marks in batches.
+rerun with the missing host's key to re-mark its receipts.
+
+A result whose stored marker is one this host writes — the cleared body bound to the sha256 of the
+stored `metadata.json`, or the exact withheld body for one of the host's own reasons — is already
+marked and never touched, so reruns are safe. Any other stored marker (planted by a worker under a
+0.1.45 dispatcher during the rollout) gets the same checks as a missing one, and is overwritten
+with the cleared marker only when the receipt verifies and the stored envelope parses and declares
+nothing at a reserved name, so it cannot be a declared artifact; otherwise it is left as it is and
+counted `unverified`. Overwriting replaces only that one object in the store. It prints
+`remarked=N already-marked=N unverified=N failed=N replaced=N` (`replaced` = foreign markers
+overwritten) and exits `1` if any read or write failed (rerun it). `--dry-run` counts without
+storing anything; `--limit N` re-marks (or replaces) in batches.
 
 ## Changes
 

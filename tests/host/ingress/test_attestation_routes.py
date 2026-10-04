@@ -1972,13 +1972,13 @@ def test_remark_restores_a_genuine_unmarked_receipt_idempotently(tmp_path, key):
     client = _route_with_limit(tmp_path, store, 1 << 20)
     assert client.get(f"/v1/jobs/{job.job_id}/attestation").status_code == 404
     # dry run: counted, nothing stored
-    assert _remark(tmp_path, store, key, dry_run=True) == (1, 0, 0, 0)
+    assert _remark(tmp_path, store, key, dry_run=True) == (1, 0, 0, 0, 0)
     assert client.get(f"/v1/jobs/{job.job_id}/attestation").status_code == 404
-    assert _remark(tmp_path, store, key) == (1, 0, 0, 0)
+    assert _remark(tmp_path, store, key) == (1, 0, 0, 0, 0)
     r = client.get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 200, r.text
     assert r.json() == body
-    assert _remark(tmp_path, store, key) == (0, 1, 0, 0)          # already marked: untouched
+    assert _remark(tmp_path, store, key) == (0, 1, 0, 0, 0)          # already marked: untouched
 
 
 @pytest.mark.parametrize("case", ["other-key", "worker-written", "tombstone", "other-job",
@@ -2021,7 +2021,7 @@ def test_remark_leaves_anything_but_this_hosts_verified_receipt_alone(tmp_path, 
         _push_to_blob(tmp_path, job.job_id, out)
     else:
         job, _ = _unmarked(tmp_path, store, receipt=b"{" + b" " * (2 << 20) + b"}")
-    assert _remark(tmp_path, store, key) == (0, 0, 1, 0)
+    assert _remark(tmp_path, store, key) == (0, 0, 1, 0, 0)
     blobs = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
     with pytest.raises(BlobFetchError):
         blobs.open_result_only(job.job_id, attest.WITHHELD_NAME)
@@ -2041,7 +2041,7 @@ def test_remark_counts_a_read_error_failed_and_carries_on(tmp_path, key):
             return super().read_result_prefix(job_id, name, max_bytes)
 
     blobs = _Flaky(tmp_path / "jobs", blob_root=tmp_path / "blobs")
-    assert _remark(tmp_path, store, key, blobs=blobs) == (1, 0, 0, 1)
+    assert _remark(tmp_path, store, key, blobs=blobs) == (1, 0, 0, 1, 0)
     client = _route_with_limit(tmp_path, store, 1 << 20)
     assert client.get(f"/v1/jobs/{good.job_id}/attestation").status_code == 200
     assert client.get(f"/v1/jobs/{bad.job_id}/attestation").status_code == 404
@@ -2053,8 +2053,8 @@ def test_remark_skips_jobs_that_are_not_done_and_honours_the_limit(tmp_path, key
     b, _ = _unmarked(tmp_path, store, key=key)
     _unmarked(tmp_path, store, key=key)
     store.update(b.job_id, status=JobStatus.EXPIRED)
-    assert _remark(tmp_path, store, key, limit=1) == (1, 0, 0, 0)
-    assert _remark(tmp_path, store, key) == (1, 1, 0, 0)
+    assert _remark(tmp_path, store, key, limit=1) == (1, 0, 0, 0, 0)
+    assert _remark(tmp_path, store, key) == (1, 1, 0, 0, 0)
 
 
 @pytest.mark.parametrize("backend", ["s3"])
@@ -2072,7 +2072,7 @@ def test_remark_round_trips_through_s3(tmp_path, request, key, backend):
                     blob_store=blobs)
     client = TestClient(app)
     assert client.get(f"/v1/jobs/{job.job_id}/attestation").status_code == 404
-    assert _remark(tmp_path, store, key, blobs=blobs) == (1, 0, 0, 0)
+    assert _remark(tmp_path, store, key, blobs=blobs) == (1, 0, 0, 0, 0)
     r = client.get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 200, r.text
     assert r.json() == body
@@ -2091,9 +2091,11 @@ def test_migrate_results_remark_cli(tmp_path, key, monkeypatch, capsys):
     monkeypatch.setattr("blastbox.host.jobs.factory.build_job_store_from_env",
                         lambda *a, **k: store)
     assert cli.main(["migrate-results", "--remark", "--dry-run"]) == 0
-    assert "remarked=1 already-marked=0 unverified=0 failed=0 (dry run" in capsys.readouterr().out
+    assert ("remarked=1 already-marked=0 unverified=0 failed=0 replaced=0 (dry run"
+            in capsys.readouterr().out)
     assert cli.main(["migrate-results", "--remark"]) == 0
-    assert "remarked=1 already-marked=0 unverified=0 failed=0" in capsys.readouterr().out
+    assert ("remarked=1 already-marked=0 unverified=0 failed=0 replaced=0"
+            in capsys.readouterr().out)
     r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 200, r.text
 
@@ -2208,7 +2210,7 @@ def test_remark_matches_the_receipts_key_id_not_any_listed_key(tmp_path):
     (out / attest.WITHHELD_NAME).unlink(missing_ok=True)
     _push_to_blob(tmp_path, job.job_id, out)
     keys = [attest.VerifyKey.from_attest_key(a), attest.VerifyKey.from_attest_key(c)]
-    assert _remark(tmp_path, store, keys) == (0, 0, 1, 0)
+    assert _remark(tmp_path, store, keys) == (0, 0, 1, 0, 0)
 
 
 def test_remark_raises_a_named_error_when_the_store_cannot_enumerate(tmp_path, key):
@@ -2217,6 +2219,159 @@ def test_remark_raises_a_named_error_when_the_store_cannot_enumerate(tmp_path, k
 
     with pytest.raises(JobEnumerationFailed):
         _remark(tmp_path, HttpJobStore.__new__(HttpJobStore), key)
+
+
+# ---------------------------------------------------------------------------
+# deepseek: a 0.1.45 dispatcher neither reserves nor strips attestation.withheld.json, so during
+# the rollout a worker can plant one beside its job's GENUINE receipt. --remark treats a stored
+# marker as already marked only when it is one this host writes (and consistent); a foreign one
+# beside a receipt that verifies -- in an envelope that declares nothing there -- is replaced.
+# ---------------------------------------------------------------------------
+
+
+def _stored(blobs, job_id, name):
+    with blobs.open_result_only(job_id, name) as fh:
+        return fh.read()
+
+
+def _plant_marker(tmp_path, job_id, data, blobs=None):
+    d = tmp_path / f"plant-{job_id}"
+    d.mkdir()
+    (d / attest.WITHHELD_NAME).write_bytes(data)
+    if blobs is None:
+        _push_to_blob(tmp_path, job_id, d)
+    else:
+        blobs.put_output(job_id, d)
+
+
+_PLANTED = {
+    "junk": b"junk",
+    "worker-reason": attest.canonical(attest.tombstone_body("the worker says so")),
+    "cleared-other-envelope": attest.canonical(attest.cleared_marker_body("0" * 64)),
+    "near-miss-cleared": b'{"attestation":"not-withheld","withheld":0}',
+    "oversize": b"x" * (attest.WITHHELD_MARKER_MAX_BYTES + 1),
+}
+
+
+@pytest.mark.parametrize("planted", sorted(_PLANTED))
+def test_remark_replaces_a_planted_marker_beside_a_genuine_receipt(tmp_path, key, planted):
+    store = InMemoryJobStore()
+    job, body = _unmarked(tmp_path, store, key=key)
+    _plant_marker(tmp_path, job.job_id, _PLANTED[planted])
+    client = _route_with_limit(tmp_path, store, 1 << 20)
+    # (a well-formed cleared body bound to another envelope does not withhold: the route lets
+    # the envelope decide; it is still not this host's marker for THIS envelope)
+    assert client.get(f"/v1/jobs/{job.job_id}/attestation").status_code == (
+        200 if planted == "cleared-other-envelope" else 404)
+    blobs = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    envelope = _stored(blobs, job.job_id, "metadata.json")
+    receipt = _stored(blobs, job.job_id, attest.RECEIPT_NAME)
+    assert _remark(tmp_path, store, key, dry_run=True) == (0, 0, 0, 0, 1)
+    assert _stored(blobs, job.job_id, attest.WITHHELD_NAME) == _PLANTED[planted]
+    assert _remark(tmp_path, store, key) == (0, 0, 0, 0, 1)
+    assert _stored(blobs, job.job_id, attest.WITHHELD_NAME) == attest.canonical(
+        attest.cleared_marker_body(hashlib.sha256(envelope).hexdigest()))
+    assert _stored(blobs, job.job_id, "metadata.json") == envelope       # only the marker key
+    assert _stored(blobs, job.job_id, attest.RECEIPT_NAME) == receipt
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 200, r.text
+    assert r.json() == body
+    assert _remark(tmp_path, store, key) == (0, 1, 0, 0, 0)          # now this host's own
+
+
+@pytest.mark.parametrize("case", ["worker-written", "other-key", "envelope-declares-marker",
+                                  "envelope-undecidable"])
+def test_remark_leaves_a_planted_marker_alone_unless_the_receipt_verifies(tmp_path, key, case):
+    """Replacing a foreign marker needs a receipt that verifies AND an envelope that rules out
+    an artifact at the marker's name; otherwise it may be a declared artifact (or the worker's
+    whole story) and is never destroyed."""
+    store = InMemoryJobStore()
+    if case == "worker-written":
+        job, _ = _unmarked(tmp_path, store, receipt=_FORGED_RECEIPT)
+    elif case == "other-key":
+        job, _ = _unmarked(tmp_path, store, key=_new_key())
+    elif case == "envelope-declares-marker":        # a receipt that verifies over that envelope
+        job, _ = _unmarked(tmp_path, store, key=key, envelope=json.dumps(
+            {"artifacts": [{"id": "a", "path": attest.WITHHELD_NAME}]}).encode())
+    else:
+        job, _ = _unmarked(tmp_path, store, key=key, envelope=b'{"artifacts": [{"id": "a", "pa')
+    _plant_marker(tmp_path, job.job_id, b"junk")
+    assert _remark(tmp_path, store, key) == (0, 0, 1, 0, 0)
+    blobs = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    assert _stored(blobs, job.job_id, attest.WITHHELD_NAME) == b"junk"
+    r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+
+
+@pytest.mark.parametrize("reason", attest.MARKER_REASONS)
+def test_remark_counts_a_host_withheld_marker_already_marked(tmp_path, key, reason):
+    """A canonical withheld body is this host's verdict (e.g. an as-is retry under a lower
+    limit, beside a genuine receipt): kept, never overridden."""
+    store = InMemoryJobStore()
+    job, _ = _unmarked(tmp_path, store, key=key)
+    marker = attest.canonical(attest.tombstone_body(reason))
+    _plant_marker(tmp_path, job.job_id, marker)
+    assert _remark(tmp_path, store, key) == (0, 1, 0, 0, 0)
+    blobs = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    assert _stored(blobs, job.job_id, attest.WITHHELD_NAME) == marker
+
+
+def test_remark_counts_a_host_cleared_marker_already_marked(tmp_path, key):
+    store = InMemoryJobStore()
+    job, _ = _unmarked(tmp_path, store, key=key, cleared=True)
+    assert _remark(tmp_path, store, key) == (0, 1, 0, 0, 0)
+    assert _route_with_limit(tmp_path, store, 1 << 20).get(
+        f"/v1/jobs/{job.job_id}/attestation").status_code == 200
+
+
+def test_remark_limit_counts_replaced_markers(tmp_path, key):
+    store = InMemoryJobStore()
+    for _ in range(2):
+        job, _ = _unmarked(tmp_path, store, key=key)
+        _plant_marker(tmp_path, job.job_id, b"junk")
+    assert _remark(tmp_path, store, key, limit=1) == (0, 0, 0, 0, 1)
+    assert _remark(tmp_path, store, key) == (0, 1, 0, 0, 1)
+
+
+def test_remark_replaces_a_planted_marker_through_s3(tmp_path, request, key):
+    blobs = _s3_store(tmp_path, request)
+    store = InMemoryJobStore()
+    job, out = _make_done_job(tmp_path, store)
+    body = attest.seal_receipt(out, key=key, observation=attest.RunObservation(
+        job_id=job.job_id, engine=job.engine, input_sha256="d" * 64, worker_runtime="runsc",
+        worker_tier=None, started_at_ms=1, finished_at_ms=2))
+    (out / attest.WITHHELD_NAME).write_bytes(b"junk")
+    blobs.put_output(job.job_id, out)
+    app = build_app(job_store=store, job_root=tmp_path / "jobs", allowed_engines={"clippyshot"},
+                    limits=Limits(max_metadata_bytes=1 << 20), api_workers=2, zip_password="",
+                    blob_store=blobs)
+    client = TestClient(app)
+    assert client.get(f"/v1/jobs/{job.job_id}/attestation").status_code == 404
+    assert _remark(tmp_path, store, key, blobs=blobs, dry_run=True) == (0, 0, 0, 0, 1)
+    assert client.get(f"/v1/jobs/{job.job_id}/attestation").status_code == 404
+    assert _remark(tmp_path, store, key, blobs=blobs) == (0, 0, 0, 0, 1)
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 200, r.text
+    assert r.json() == body
+    assert _remark(tmp_path, store, key, blobs=blobs) == (0, 1, 0, 0, 0)
+
+
+def test_migrate_results_remark_cli_reports_replaced(tmp_path, key, monkeypatch, capsys):
+    from blastbox.host import cli
+
+    store = InMemoryJobStore()
+    job, _ = _unmarked(tmp_path, store, key=key)
+    _plant_marker(tmp_path, job.job_id, b"junk")
+    monkeypatch.setenv("BLASTBOX_ATTEST_KEY", str(tmp_path / "keys" / "attest.key"))
+    _cli_env(tmp_path, monkeypatch, store)
+    assert cli.main(["migrate-results", "--remark", "--dry-run"]) == 0
+    assert ("remarked=0 already-marked=0 unverified=0 failed=0 replaced=1 (dry run"
+            in capsys.readouterr().out)
+    assert cli.main(["migrate-results", "--remark"]) == 0
+    assert ("remarked=0 already-marked=0 unverified=0 failed=0 replaced=1"
+            in capsys.readouterr().out)
+    r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 200, r.text
 
 
 def test_attest_key_output_is_a_usable_verify_key_as_is(tmp_path, monkeypatch, capsys):
