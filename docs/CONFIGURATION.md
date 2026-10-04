@@ -141,6 +141,10 @@ those bytes — it signs nothing.
 | `GET /v1/jobs/{id}/attestation` | — | The stored receipt, verbatim. `404` unknown job / no receipt (keyless dispatcher, `FAILED` job, pre-receipt result, or a *tombstone* — below); `409` queued/running; `410` expired; `503` blob-store read error. Same auth as `GET /v1/jobs/{id}`. |
 | `GET /v1/attestation/key` | — | This process's public key, only if `BLASTBOX_ATTEST_KEY` is set **and** the key already exists and is usable by this process (the ingress never mints one, and a key it cannot read or does not own is a quiet `404`). A convenience for pinning — a verifier must never trust a key because a host served it. |
 
+**Upgrading from 0.1.45:** upgrade every ingress before any dispatcher or `migrate-results`, and
+never roll an ingress back past this release once results have been uploaded by it — see
+[upgrading-attestation.md](upgrading-attestation.md).
+
 **One key per dispatcher host.** Each signing host — including every federated node that signs —
 has its own key, and the verifier pins each one it accepts, by `key_id`. When a finalize does not
 sign (no key, signing failed, input could not be hashed), it writes a *tombstone*
