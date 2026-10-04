@@ -1196,3 +1196,19 @@ def test_every_tombstone_reason_written_in_src_is_a_named_constant():
         seen.append(name)
     assert len(seen) >= 7, seen
 
+
+def test_the_largest_receipt_build_receipt_can_produce_is_under_the_read_cap():
+    """S2: the route answers 404 past _RECEIPT_MAX_BYTES, so no genuine receipt may reach it.
+    Every variable field is bounded: job_id is a UUID, engine an allowlisted name, runtime/tier/
+    posture host-chosen, and host the hostname (<= 64 bytes) or BLASTBOX_HOST_ID -- an
+    environment string, at most MAX_ARG_STRLEN (128 KiB) through execve. ensure_ascii escapes a
+    control byte to six bytes, the worst expansion."""
+    key = attest.AttestKey(ec.generate_private_key(ec.SECP256R1()))
+    obs = attest.RunObservation(
+        job_id="0" * 36, engine="e" * 255, input_sha256="d" * 64, worker_runtime="r" * 64,
+        worker_tier="t" * 64, started_at_ms=2 ** 63, finished_at_ms=2 ** 63,
+        net_policy_effective="n" * 64, net_exit="x" * 64, net_downgraded=True, net_inspect=True)
+    doc = attest.build_receipt(obs, key_id=key.key_id, metadata_sha256="f" * 64,
+                               issued_at_ms=2 ** 63, host="\x01" * (128 << 10))
+    body = attest.canonical({"attestation": doc, "signature": key.sign(doc)})
+    assert len(body) <= attest._RECEIPT_MAX_BYTES, len(body)

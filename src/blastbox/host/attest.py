@@ -891,6 +891,9 @@ TOMBSTONE_REASONS = (NO_ATTEST_KEY_REASON, RUN_NOT_OBSERVED_REASON, INPUT_UNHASH
                      LEGACY_RESERVED_PATH_DECLARED_REASON)
 #: The reason a stored tombstone whose reason is not one of TOMBSTONE_REASONS is reported with.
 RECEIPT_TOMBSTONE_REASON = "the uploader stored no receipt for this result"
+#: The reason a stored attestation.json past _RECEIPT_MAX_BYTES is reported with: no receipt
+#: build_receipt produces comes near that size, so it is not one.
+RECEIPT_OVERSIZE_REASON = "the stored receipt is larger than any receipt this host writes"
 
 
 def tombstone_body(reason: str) -> dict:

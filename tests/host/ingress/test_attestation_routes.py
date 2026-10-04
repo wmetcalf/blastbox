@@ -1828,3 +1828,71 @@ def test_every_tombstone_reason_this_host_writes_is_still_named(tmp_path, reason
     assert r.status_code == 404, r.text
     assert r.json()["detail"] == f"no execution receipt for this job: {reason}"
 
+
+def _oversize_receipt():
+    import os
+
+    # Random hex so a gzip-encoded S3 object stays large: an unbounded read transfers it all.
+    return (b'{"attestation":{},"signature":"'
+            + os.urandom(4 * attest._RECEIPT_MAX_BYTES).hex().encode() + b'"}')
+
+
+@pytest.mark.parametrize("backend", ["local", "s3"])
+def test_an_oversize_receipt_is_404_and_read_only_to_the_cap(tmp_path, request, backend):
+    """S2 (prosecutor r134). The receipt was read with an unbounded fh.read() (S3 downloaded and
+    gunzipped the whole object first). No receipt build_receipt produces is anywhere near
+    _RECEIPT_MAX_BYTES, so anything past it is no receipt: 404 with a constant reason, fetched
+    only to the cap."""
+    blobs = (LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+             if backend == "local" else _s3_store(tmp_path, request))
+    store = InMemoryJobStore()
+    job, out = _make_done_job(tmp_path, store)
+    (out / attest.RECEIPT_NAME).write_bytes(_oversize_receipt())
+    blobs.put_output(job.job_id, out)
+    fetched: dict[str, int] = {}
+    if backend == "s3":
+        real = blobs._s3.get_object
+
+        def counting(**kw):
+            obj = real(**kw)
+            raw = obj["Body"].read
+            name = kw["Key"].rsplit("/", 1)[-1]
+
+            def rd(*a):
+                d = raw(*a)
+                fetched[name] = fetched.get(name, 0) + len(d)
+                return d
+            obj["Body"].read = rd
+            return obj
+        blobs._s3.get_object = counting
+    app = build_app(job_store=store, job_root=tmp_path / "jobs", allowed_engines={"clippyshot"},
+                    limits=Limits(max_metadata_bytes=1 << 20), api_workers=2, zip_password="",
+                    blob_store=blobs)
+    r = TestClient(app).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.status_code
+    assert r.json()["detail"] == ("no execution receipt for this job: "
+                                  f"{attest.RECEIPT_OVERSIZE_REASON}")
+    if backend == "s3":
+        assert 0 < fetched[attest.RECEIPT_NAME] <= 2 * (attest._RECEIPT_MAX_BYTES + 1)
+
+
+def test_a_receipt_read_error_is_503(tmp_path):
+    """The bounded receipt read keeps the other reads' rule: an error is no verdict."""
+    store = InMemoryJobStore()
+    job, out = _make_done_job(tmp_path, store)
+    (out / attest.RECEIPT_NAME).write_bytes(b'{"attestation":{},"signature":"x"}')
+
+    class _Blobs(LocalBlobStore):
+        def read_result_prefix(self, job_id, name, max_bytes):
+            if name == attest.RECEIPT_NAME:
+                raise OSError(5, "EIO")
+            return super().read_result_prefix(job_id, name, max_bytes)
+
+    blobs = _Blobs(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    blobs.put_output(job.job_id, out)
+    app = build_app(job_store=store, job_root=tmp_path / "jobs", allowed_engines={"clippyshot"},
+                    limits=Limits(max_metadata_bytes=1 << 20), api_workers=2, zip_password="",
+                    blob_store=blobs)
+    r = TestClient(app, raise_server_exceptions=False).get(
+        f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 503, r.text

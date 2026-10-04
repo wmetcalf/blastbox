@@ -1066,8 +1066,8 @@ def build_app(
             raise HTTPException(404, "no execution receipt: only DONE results carry one")
         # ONLY the durable results prefix. LocalBlobStore.open_output falls back to the LEGACY
         # on-disk tree, which no dispatcher ever sanitised -- an attestation.json there is whatever
-        # the worker wrote -- so a store offering a no-fallback read is always read through it.
-        opener = getattr(_blob_store, "open_result_only", None) or _blob_store.open_output
+        # the worker wrote -- so every read below goes through read_result_prefix, which uses a
+        # store's no-fallback read whenever it offers one.
         # THE UPLOADER'S VERDICT FIRST. Every as-is upload (its envelope declared, or under THAT
         # process's ceiling could not rule out, an artifact at attestation.json) stores the
         # WITHHELD marker, and every upload that ships a receipt or tombstone stores the CLEARED
@@ -1134,20 +1134,22 @@ def build_app(
         why_not = _attest.envelope_receipt_path_protection(envelope)
         if why_not is not None:
             raise HTTPException(404, f"no execution receipt for this job: {why_not}")
+        # The receipt itself, read only to the cap like the marker and the envelope (an S3
+        # object is streamed and the fetch stops). No receipt build_receipt produces comes near
+        # _RECEIPT_MAX_BYTES, so anything past it is not one: 404, never read in full.
+        receipt_cap = _attest._RECEIPT_MAX_BYTES
         try:
-            fh = opener(job_id, _attest.RECEIPT_NAME)
-        except Exception as exc:
+            data = _read_result_prefix(_blob_store, job_id, _attest.RECEIPT_NAME,
+                                       receipt_cap + 1)
+        except Exception as exc:  # noqa: BLE001 - a partial receipt must never be served
             if _is_missing_blob(exc):
                 raise HTTPException(404, "no execution receipt for this job (its dispatcher "
                                          "had no attestation key, or it predates receipts)")
             _log.warning("attestation: receipt read failed for job=%s: %s", job_id, exc)
             raise HTTPException(503, "could not read the execution receipt")
-        try:
-            with fh:
-                data = fh.read()
-        except Exception as exc:  # noqa: BLE001 - a partial receipt must never be served
-            _log.warning("attestation: receipt read failed for job=%s: %s", job_id, exc)
-            raise HTTPException(503, "could not read the execution receipt")
+        if len(data) > receipt_cap:
+            raise HTTPException(404, "no execution receipt for this job: "
+                                     f"{_attest.RECEIPT_OVERSIZE_REASON}")
         if _attest.is_tombstone(data):
             # The finalizing dispatcher did not sign (no key, signing failed, ...) and said so,
             # overwriting any superseded attempt's receipt. Absent, not an error. Name only a
