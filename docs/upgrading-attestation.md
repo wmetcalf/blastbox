@@ -21,8 +21,8 @@ upgrade: any later ingress rollback to 0.1.45 serves them too.
 An upgraded ingress answers `404` for any stored result with **no** `attestation.withheld.json`
 marker — everything uploaded by 0.1.45 or earlier, including the dispatchers' uploads during the
 rollout. It cannot tell a host-written `attestation.json` there from a worker's: a node before
-0.1.44 shipped worker trees verbatim. Genuine 0.1.44/0.1.45 receipts come back once their signing
-host re-marks them (below).
+0.1.44 shipped worker trees verbatim. Genuine 0.1.44/0.1.45 receipts come back once they are
+re-marked against their signing host's public key (below).
 
 A 0.1.45 dispatcher also neither reserves nor strips `attestation.withheld.json`, so a worker
 running under a not-yet-upgraded dispatcher can plant a file at that name beside its job's
@@ -35,25 +35,32 @@ serves an as-is upload's worker-written `attestation.json` as a receipt (above).
 once every dispatcher runs this release, so keep the rollout short: upgrade the dispatchers
 promptly after the ingresses.
 
-### After upgrading: re-mark genuine receipts (each signing host)
+### After upgrading: re-mark genuine receipts (once, on the control plane)
 
-Once a dispatcher host runs this release, run, as its service user and with its own
-`BLASTBOX_ATTEST_KEY` (and the service's blob-store, job-store and `BLASTBOX_MAX_METADATA`
-environment):
+Once the dispatchers run this release, run it **once, where the job store can be enumerated** —
+the control plane, with the service's blob-store, job-store and `BLASTBOX_MAX_METADATA`
+environment — passing every signing host's **public** key. Re-marking only verifies, so no
+private key leaves its host. Collect each key with `blastbox attest-key --key PATH` on that host
+(its output works as-is) or from that host's `GET /v1/attestation/key` (the JSON body works
+as-is; its stated `key_id` must match its PEM):
 
 ```
-blastbox migrate-results --remark --dry-run    # counts only
-blastbox migrate-results --remark
+blastbox migrate-results --remark --verify-key node-a.pem --verify-key node-b.json --dry-run
+blastbox migrate-results --remark --verify-key node-a.pem --verify-key node-b.json
 ```
+
+Without `--verify-key` it verifies with this host's own `BLASTBOX_ATTEST_KEY`. A federated node
+(`BLASTBOX_DATABASE_URL=https://…`) may not enumerate the queue, so running it there exits `2`
+with an error naming the control plane — run it there instead.
 
 For each `DONE` result stored without a marker, it reads the stored `attestation.json` and
-`metadata.json` (bounded) and stores the cleared marker only when the receipt verifies under this
-host's key, for that job, over the sha256 of the stored `metadata.json`, and the envelope
-declares nothing at a reserved name. Anything else (another host's receipt, a tombstone, worker
-bytes) is left unmarked and counted `unverified`; another host's receipts are re-marked when that
-host runs it. Already-marked results are never touched, so reruns are safe. It prints
-`remarked=N already-marked=N unverified=N failed=N` and exits `1` if any read or write failed
-(rerun it). `--limit N` re-marks in batches.
+`metadata.json` (bounded) and stores the cleared marker only when the receipt's `key_id` names
+one of the given keys and it verifies under that key, for that job, over the sha256 of the stored
+`metadata.json`, and the envelope declares nothing at a reserved name. Anything else (a receipt
+from a key you did not pass, a tombstone, worker bytes) is left unmarked and counted `unverified`;
+rerun with the missing host's key to re-mark its receipts. Already-marked results are never
+touched, so reruns are safe. It prints `remarked=N already-marked=N unverified=N failed=N` and
+exits `1` if any read or write failed (rerun it). `--limit N` re-marks in batches.
 
 ## Changes
 

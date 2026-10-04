@@ -1058,8 +1058,9 @@ def build_app(
         #     wrote an unmarked result's attestation.json -- a pre-#188 node shipped worker trees
         #     verbatim, clean envelope and all -- and every receipt-bearing upload since this
         #     release stores a cleared marker. Genuine 0.1.44/0.1.45 receipts are re-marked by
-        #     their signing host (`blastbox migrate-results --remark`, which verifies each one
-        #     with that host's key before storing its cleared marker).
+        #     `blastbox migrate-results --remark` (run where the job store can be enumerated),
+        #     which verifies each one against its signing host's PUBLIC key before storing its
+        #     cleared marker.
         #   * a cleared body (bound to any envelope): the envelope decides, below (deny-only).
         #     A cleared marker does NOT vouch here. It cannot make the route serve what
         #     the envelope judgement would refuse: a pre-#188 dispatcher shipped a worker's tree

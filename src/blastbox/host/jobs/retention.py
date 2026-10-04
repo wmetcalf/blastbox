@@ -22,7 +22,7 @@ import os
 import re
 import shutil
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -30,7 +30,7 @@ from blastbox.host.blobs.base import BlobStore, upload_output_with_retry
 from blastbox.host.jobs.base import JobStatus, JobStore
 
 if TYPE_CHECKING:
-    from blastbox.host.attest import AttestKey
+    from blastbox.host.attest import AttestKey, VerifyKey
     from blastbox.limits import Limits
 
 _log = logging.getLogger("blastbox.host.jobs.retention")
@@ -825,34 +825,44 @@ def _migrate_legacy_one(
     return "failed"
 
 
+class JobEnumerationFailed(RuntimeError):
+    """``remark_stored_receipts`` could not list the job store's DONE jobs -- e.g. a federated
+    node's HttpJobStore, which may not enumerate the queue. Run it where the store can be
+    enumerated (the control plane), with each signing node's public key."""
+
+
 def remark_stored_receipts(
     blob_store: BlobStore,
     job_store: JobStore,
-    key: "AttestKey",
+    keys: "AttestKey | VerifyKey | Iterable[AttestKey | VerifyKey]",
     log: logging.Logger,
     *,
     limit: int = 0,
     dry_run: bool = False,
     limits: "Limits | None" = None,
 ) -> tuple[int, int, int, int]:
-    """Store the cleared marker beside every genuine receipt THIS host signed that sits in the
-    store unmarked (uploaded by 0.1.44/0.1.45, before markers). The attestation route answers
-    404 for an unmarked result (codex r134 C1): it cannot tell a host-written attestation.json
-    from a worker's in a tree a pre-#188 node shipped verbatim. Run on each signing host, with
-    its own key, after upgrading. Returns (remarked, already_marked, unverified, failed).
+    """Store the cleared marker beside every genuine receipt signed by one of ``keys`` that
+    sits in the store unmarked (uploaded by 0.1.44/0.1.45, before markers). The attestation
+    route answers 404 for an unmarked result (codex r134 C1): it cannot tell a host-written
+    attestation.json from a worker's in a tree a pre-#188 node shipped verbatim. Verifying
+    needs only PUBLIC keys, so run it once where the job store can be enumerated (the control
+    plane; a federated node's store refuses list()) with every signing host's public key.
+    ``keys`` is one key or several (private AttestKey or public VerifyKey); a receipt is checked
+    only against the key its own key_id names. Raises JobEnumerationFailed when the DONE jobs
+    cannot be listed. Returns (remarked, already_marked, unverified, failed).
 
     For each DONE job, all reads bounded (read_result_prefix):
 
     * a marker already stored (any bytes): already marked -- never touched, so a rerun is a
       no-op and an as-is upload's withheld marker is never overwritten;
-    * else the stored attestation.json must be a receipt that verifies under ``key``, for this
-      job_id and key_id, whose metadata_sha256 is the sha256 of the STORED metadata.json (read
+    * else the stored attestation.json must be a receipt whose key_id names one of ``keys``
+      and that verifies under that key, for this job_id, whose metadata_sha256 is the sha256 of the STORED metadata.json (read
       under the envelope ceiling, and not declaring or hiding an artifact at a reserved name).
       Only then is the cleared marker bound to that metadata stored (not with ``dry_run``);
     * anything else -- another host's receipt, a tombstone, worker bytes, no receipt or
       envelope, over a cap -- is LEFT ALONE and counted unverified: the result stays unmarked,
-      which the route already answers with the no-receipt 404, and another host's receipt is
-      that host's to re-mark. Writing a withheld marker there would make that permanent.
+      which the route already answers with the no-receipt 404 (pass that host's public key
+      to re-mark its receipts). Writing a withheld marker there would make that permanent.
     * a read or write error is counted failed (no verdict), and the run carries on.
 
     ``limit`` stops after that many re-marked (0 = all)."""
@@ -868,6 +878,9 @@ def remark_stored_receipts(
 
         limits = _Limits.from_env()
     envelope_cap = _attest.envelope_cap(limits)
+    if isinstance(keys, (_attest.AttestKey, _attest.VerifyKey)):
+        keys = [keys]
+    by_id = {k.key_id: k for k in keys}
     remarked = already = unverified = failed = 0
 
     def fetch(job_id: str, name: str, cap: int) -> bytes | None:
@@ -879,7 +892,12 @@ def remark_stored_receipts(
                 return None
             raise
 
-    for job in job_store.list(status=JobStatus.DONE):
+    try:
+        done_jobs = job_store.list(status=JobStatus.DONE)
+    except Exception as exc:  # noqa: BLE001 -- surfaced as one named, reportable failure
+        raise JobEnumerationFailed(
+            f"cannot enumerate the job store's DONE jobs ({type(exc).__name__}: {exc})") from exc
+    for job in done_jobs:
         if limit and remarked >= limit:
             break
         job_id = job.job_id
@@ -906,13 +924,14 @@ def remark_stored_receipts(
             try:
                 body = json.loads(receipt)
                 doc = body["attestation"]
-                ok = (_attest.verify_body(key, body) and doc.get("key_id") == key.key_id
+                signer = by_id.get(doc.get("key_id"))
+                ok = (signer is not None and _attest.verify_body(signer, body)
                       and doc.get("job_id") == job_id
                       and doc.get("metadata_sha256") == metadata_sha256)
             except Exception:  # noqa: BLE001 -- bytes that are not our receipt: a verdict
                 ok = False
             if not ok:
-                why = "not a receipt this host's key signed for this job and envelope"
+                why = "not a receipt a listed key signed for this job and envelope"
         if why is not None:
             log.info("receipt re-mark: %s: %s; left unmarked", job_id, why)
             unverified += 1

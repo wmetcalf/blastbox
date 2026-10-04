@@ -2104,3 +2104,128 @@ def test_migrate_results_remark_refuses_without_a_key(tmp_path, monkeypatch, cap
     monkeypatch.delenv("BLASTBOX_ATTEST_KEY", raising=False)
     assert cli.main(["migrate-results", "--remark"]) == 2
     assert "BLASTBOX_ATTEST_KEY" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# r135: --remark verifies with PUBLIC keys, so the control plane (which can enumerate the job
+# store) re-marks a federated node's receipts; a node that cannot enumerate fails cleanly.
+# ---------------------------------------------------------------------------
+
+
+def _new_key():
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    return attest.AttestKey(ec.generate_private_key(ec.SECP256R1()))
+
+
+def _cli_env(tmp_path, monkeypatch, store):
+    monkeypatch.setenv("BLASTBOX_JOB_ROOT", str(tmp_path / "jobs"))
+    monkeypatch.setattr("blastbox.host.blobs.factory.build_blob_store_from_env",
+                        lambda env=None: LocalBlobStore(tmp_path / "jobs",
+                                                        blob_root=tmp_path / "blobs"))
+    monkeypatch.setattr("blastbox.host.jobs.factory.build_job_store_from_env",
+                        lambda *a, **k: store)
+
+
+def test_remark_on_a_node_that_cannot_enumerate_is_a_clean_error(tmp_path, key, monkeypatch,
+                                                                  capsys):
+    """A federated node's HttpJobStore refuses list(): --remark must say where to run it
+    instead (the control plane, with --verify-key per node) and exit 2 -- no traceback."""
+    from blastbox.host import cli
+    from blastbox.host.jobs.http_store import HttpJobStore
+
+    _cli_env(tmp_path, monkeypatch, HttpJobStore.__new__(HttpJobStore))
+    monkeypatch.setenv("BLASTBOX_ATTEST_KEY", str(tmp_path / "keys" / "attest.key"))
+    assert cli.main(["migrate-results", "--remark"]) == 2
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    lines = [ln for ln in err.splitlines() if ln.strip()]
+    assert len(lines) == 1, err
+    assert "control plane" in lines[0] and "--verify-key" in lines[0]
+
+
+def test_remark_with_node_public_keys_on_the_control_plane(tmp_path, monkeypatch, capsys):
+    """No private key here: two nodes' PUBLIC keys (one as a PEM, one as the JSON body
+    GET /v1/attestation/key serves) re-mark both nodes' receipts; a third node's stay 404."""
+    from blastbox.host import cli
+
+    a, b, c = _new_key(), _new_key(), _new_key()
+    store = InMemoryJobStore()
+    ja, _ = _unmarked(tmp_path, store, key=a)
+    jb, _ = _unmarked(tmp_path, store, key=b)
+    jc, _ = _unmarked(tmp_path, store, key=c)
+    (tmp_path / "a.pem").write_text(a.public_key_pem)
+    (tmp_path / "b.json").write_text(json.dumps(attest.public_key_body(b)))
+    _cli_env(tmp_path, monkeypatch, store)
+    monkeypatch.delenv("BLASTBOX_ATTEST_KEY", raising=False)
+    assert cli.main(["migrate-results", "--remark", "--verify-key", str(tmp_path / "a.pem"),
+                     "--verify-key", str(tmp_path / "b.json")]) == 0
+    assert "remarked=2 already-marked=0 unverified=1 failed=0" in capsys.readouterr().out
+    client = _route_with_limit(tmp_path, store, 1 << 20)
+    assert client.get(f"/v1/jobs/{ja.job_id}/attestation").status_code == 200
+    assert client.get(f"/v1/jobs/{jb.job_id}/attestation").status_code == 200
+    assert client.get(f"/v1/jobs/{jc.job_id}/attestation").status_code == 404
+
+
+def test_a_verify_key_whose_stated_key_id_does_not_match_its_pem_is_refused(tmp_path,
+                                                                             monkeypatch,
+                                                                             capsys):
+    from blastbox.host import cli
+
+    a = _new_key()
+    (tmp_path / "a.json").write_text(json.dumps(dict(attest.public_key_body(a),
+                                                     key_id="0" * 16)))
+    _cli_env(tmp_path, monkeypatch, InMemoryJobStore())
+    monkeypatch.delenv("BLASTBOX_ATTEST_KEY", raising=False)
+    assert cli.main(["migrate-results", "--remark", "--verify-key",
+                     str(tmp_path / "a.json")]) == 2
+    err = capsys.readouterr().err
+    assert "key_id" in err and "Traceback" not in err
+
+
+@pytest.mark.parametrize("bad", ["not a key", '{"public_key_pem": "nope"}'])
+def test_an_unreadable_verify_key_is_refused(tmp_path, monkeypatch, capsys, bad):
+    from blastbox.host import cli
+
+    (tmp_path / "k").write_text(bad)
+    _cli_env(tmp_path, monkeypatch, InMemoryJobStore())
+    assert cli.main(["migrate-results", "--remark", "--verify-key", str(tmp_path / "k")]) == 2
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_remark_matches_the_receipts_key_id_not_any_listed_key(tmp_path):
+    """A receipt signed by listed key C but CLAIMING listed key A's key_id is not a receipt A
+    signed: verification picks the key by key_id, so it is left unverified."""
+    a, c = _new_key(), _new_key()
+    store = InMemoryJobStore()
+    job, out = _make_done_job(tmp_path, store)
+    body = attest.seal_receipt(out, key=c, observation=attest.RunObservation(
+        job_id=job.job_id, engine=job.engine, input_sha256="d" * 64, worker_runtime="runsc",
+        worker_tier=None, started_at_ms=1, finished_at_ms=2))
+    doc = dict(body["attestation"], key_id=a.key_id)
+    forged = {"attestation": doc, "signature": c.sign(doc)}
+    (out / attest.RECEIPT_NAME).write_bytes(attest.canonical(forged))
+    (out / attest.WITHHELD_NAME).unlink(missing_ok=True)
+    _push_to_blob(tmp_path, job.job_id, out)
+    keys = [attest.VerifyKey.from_attest_key(a), attest.VerifyKey.from_attest_key(c)]
+    assert _remark(tmp_path, store, keys) == (0, 0, 1, 0)
+
+
+def test_remark_raises_a_named_error_when_the_store_cannot_enumerate(tmp_path, key):
+    from blastbox.host.jobs.http_store import HttpJobStore
+    from blastbox.host.jobs.retention import JobEnumerationFailed
+
+    with pytest.raises(JobEnumerationFailed):
+        _remark(tmp_path, HttpJobStore.__new__(HttpJobStore), key)
+
+
+def test_attest_key_output_is_a_usable_verify_key_as_is(tmp_path, monkeypatch, capsys):
+    """The docs say `blastbox attest-key`'s output can be passed to --verify-key unedited."""
+    from blastbox.host import cli
+
+    path = tmp_path / "keys" / "attest.key"
+    monkeypatch.setenv("BLASTBOX_ATTEST_KEY", str(path))
+    assert cli.main(["attest-key", "--key", str(path)]) == 0
+    printed = capsys.readouterr().out.encode()
+    assert (attest.VerifyKey.parse(printed).key_id
+            == attest.load_existing_key(path).key_id)
