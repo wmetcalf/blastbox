@@ -551,8 +551,7 @@ def _retry_pending_one(
                 # attestation.json it could unmask came from this same tree, untouched since.
                 _attest.write_cleared_marker(out_dir)
             else:
-                _attest.write_tombstone(out_dir, "retained result re-uploaded without a "
-                                                 "receipt from this host")
+                _attest.write_tombstone(out_dir, _attest.RETAINED_REUPLOAD_REASON)
         except OSError as exc:
             if isinstance(exc, _attest.ReceiptPathOccupied):
                 # The accepted strand (write_withheld_marker): an old tree that may declare an

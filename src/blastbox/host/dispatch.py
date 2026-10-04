@@ -3200,7 +3200,7 @@ class Dispatcher:
         for the pending-upload sweep (see seal_fresh_receipt)."""
         return _attest.seal_fresh_receipt(output_dir, key=self._attest_key,
                                           observation=observation, job_id=job.job_id,
-                                          reason="input could not be hashed")
+                                          reason=_attest.INPUT_UNHASHED_REASON)
 
     def _retained_reason(self, sealed: bool) -> str:
         """The FAILED job's error when its tree is retained for the pending-upload sweep: an

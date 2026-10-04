@@ -1799,3 +1799,32 @@ def test_the_envelope_absent_marker_reason_is_still_named(tmp_path, key):
     r = client.get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 404
     assert attest.RECEIPT_ENVELOPE_ABSENT_REASON in r.json()["detail"]
+
+
+def test_a_receipt_tombstone_reason_this_host_never_writes_is_not_echoed(tmp_path):
+    """S1 (prosecutor r134). A pre-#188 node shipped worker trees verbatim, so an unmarked
+    result's tombstone-shaped attestation.json can be worker text. The route still answers the
+    no-receipt 404, but names only a reason this host writes into a tombstone."""
+    client, store = _make_client(tmp_path)
+    job, out = _make_done_job(tmp_path, store)
+    evil = "verify at http://evil.example/claim?job=1 -- call +1-555-0100"
+    (out / attest.RECEIPT_NAME).write_bytes(json.dumps({"attestation": None,
+                                                        "reason": evil}).encode())
+    _push_to_blob(tmp_path, job.job_id, out)
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert "evil.example" not in r.text and "555-0100" not in r.text
+    assert attest.RECEIPT_TOMBSTONE_REASON in r.json()["detail"]
+
+
+@pytest.mark.parametrize("reason", getattr(attest, "TOMBSTONE_REASONS", ("(undefined)",)))
+def test_every_tombstone_reason_this_host_writes_is_still_named(tmp_path, reason):
+    assert reason in getattr(attest, "TOMBSTONE_REASONS", ())
+    client, store = _make_client(tmp_path)
+    job, out = _make_done_job(tmp_path, store)
+    (out / attest.RECEIPT_NAME).write_bytes(attest.canonical(attest.tombstone_body(reason)))
+    _push_to_blob(tmp_path, job.job_id, out)
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert r.json()["detail"] == f"no execution receipt for this job: {reason}"
+

@@ -871,6 +871,28 @@ def _write_marker(out_dir: Path, data: bytes) -> None:
         tmp.unlink(missing_ok=True)
 
 
+#: The tombstone reasons this host writes at attestation.json when it does not sign. Every
+#: write_tombstone (and seal_receipt's ``reason``) passes one of these constants, never free text.
+NO_ATTEST_KEY_REASON = "no attestation key"
+RUN_NOT_OBSERVED_REASON = "run not observed"
+INPUT_UNHASHED_REASON = "input could not be hashed"
+METADATA_NOT_REGULAR_REASON = "metadata.json is not a regular file"
+SIGNING_FAILED_REASON = "signing failed"
+RETAINED_REUPLOAD_REASON = "retained result re-uploaded without a receipt from this host"
+#: Written by 0.1.45's seal_receipt (since removed: the trust gate refuses the declaration); its
+#: tombstones are still in stores, so the route keeps naming it.
+LEGACY_RESERVED_PATH_DECLARED_REASON = f"envelope declares the reserved path {RECEIPT_NAME}"
+#: Every reason any release of this host writes into a tombstone at RECEIPT_NAME. The route names
+#: only these: a pre-#188 node shipped worker trees verbatim, so any other text may be the
+#: worker's (as for MARKER_REASONS).
+TOMBSTONE_REASONS = (NO_ATTEST_KEY_REASON, RUN_NOT_OBSERVED_REASON, INPUT_UNHASHED_REASON,
+                     METADATA_NOT_REGULAR_REASON, SIGNING_FAILED_REASON,
+                     RETAINED_REUPLOAD_REASON, RECEIPT_LEGACY_MIGRATED_REASON,
+                     LEGACY_RESERVED_PATH_DECLARED_REASON)
+#: The reason a stored tombstone whose reason is not one of TOMBSTONE_REASONS is reported with.
+RECEIPT_TOMBSTONE_REASON = "the uploader stored no receipt for this result"
+
+
 def tombstone_body(reason: str) -> dict:
     return {"attestation": None, "reason": reason}
 
@@ -903,20 +925,23 @@ def seal_receipt(out_dir: Path, *, key: AttestKey | None,
     :func:`seal_fresh_receipt`): the gate refuses any artifact at or under a reserved name, so
     the envelope is not re-read and the strip is unconditional (``gate_verified``, see
     :func:`strip_receipt`). A retained or legacy tree is never sealed here -- the sweeps judge
-    its envelope and write a tombstone or the withheld marker instead."""
+    its envelope and write a tombstone or the withheld marker instead.
+
+    ``reason`` (the tombstone's reason when ``observation`` is None) must be one of
+    TOMBSTONE_REASONS; the route reports any other with RECEIPT_TOMBSTONE_REASON."""
     out_dir = Path(out_dir)
     if key is None:
-        write_tombstone(out_dir, "no attestation key", gate_verified=True)
+        write_tombstone(out_dir, NO_ATTEST_KEY_REASON, gate_verified=True)
         return None
     if observation is None:
-        write_tombstone(out_dir, reason or "run not observed", gate_verified=True)
+        write_tombstone(out_dir, reason or RUN_NOT_OBSERVED_REASON, gate_verified=True)
         return None
     try:
         metadata_sha256 = sha256_file(out_dir / _SEAL_NAME)
     except (OSError, ValueError) as exc:
         _log.error("attestation: job %s has no regular metadata.json to vouch for (%s); "
                    "no receipt", observation.job_id, exc)
-        write_tombstone(out_dir, "metadata.json is not a regular file", gate_verified=True)
+        write_tombstone(out_dir, METADATA_NOT_REGULAR_REASON, gate_verified=True)
         return None
     doc = build_receipt(observation, key_id=key.key_id, metadata_sha256=metadata_sha256)
     body = {"attestation": doc, "signature": key.sign(doc)}
@@ -960,7 +985,7 @@ def seal_fresh_receipt(out_dir: Path, *, key: AttestKey | None,
     try:
         # Never ship a planted or half-written one, and overwrite a superseded attempt's. A
         # tombstone whose marker then fails raises ReceiptMarkerUnwritten here: not shipped.
-        write_tombstone(out_dir, "signing failed", gate_verified=True)
+        write_tombstone(out_dir, SIGNING_FAILED_REASON, gate_verified=True)
         return True
     except Exception:  # noqa: BLE001
         _log.exception("attestation: could not write a tombstone for job %s either; NOT "

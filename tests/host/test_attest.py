@@ -1148,3 +1148,51 @@ def test_a_tombstone_fallback_whose_marker_fails_is_not_safe_to_upload(tmp_path,
     assert attest.seal_fresh_receipt(out, key=key, observation=_obs(),
                                      job_id=_obs().job_id) is False
     assert not (out / attest.WITHHELD_NAME).exists()
+
+
+def _tombstone_reason_exprs():
+    """(file:line, reason expression) for every reason this host can write into a tombstone at
+    attestation.json: write_tombstone's reason argument, and seal_receipt/seal_fresh_receipt's
+    reason= (written when the run was not observed)."""
+    import ast
+    from pathlib import Path
+
+    src = Path(attest.__file__).resolve().parents[1]
+    for path in sorted(src.rglob("*.py")):
+        tree = ast.parse(path.read_text(), str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(
+                node.func, "id", None)
+            exprs = []
+            if fn == "write_tombstone" and len(node.args) >= 2:
+                exprs.append(node.args[1])
+            if fn in ("write_tombstone", "seal_receipt", "seal_fresh_receipt"):
+                exprs += [k.value for k in node.keywords if k.arg == "reason"]
+            for e in exprs:
+                yield f"{path.name}:{node.lineno}", e
+
+
+def test_every_tombstone_reason_written_in_src_is_a_named_constant():
+    """S1 (prosecutor r134). The route names a stored tombstone's reason only when it is in
+    TOMBSTONE_REASONS, so every reason src writes must be one of them -- a literal or an
+    f-string here would be reported with the generic reason."""
+    import ast
+
+    seen = []
+    for where, e in _tombstone_reason_exprs():
+        if isinstance(e, ast.BoolOp):
+            # seal_receipt's ``reason or RUN_NOT_OBSERVED_REASON``: the fallback is checked
+            # here, the forwarded parameter at its callers.
+            assert isinstance(e.values[0], ast.Name) and e.values[0].id == "reason", where
+            e = e.values[-1]
+        if isinstance(e, ast.Name) and e.id == "reason":
+            continue        # a forwarded parameter: checked at its callers
+        assert isinstance(e, (ast.Name, ast.Attribute)), \
+            f"{where}: tombstone reason is not a named constant"
+        name = e.id if isinstance(e, ast.Name) else e.attr
+        assert getattr(attest, name) in attest.TOMBSTONE_REASONS, f"{where}: {name}"
+        seen.append(name)
+    assert len(seen) >= 7, seen
+

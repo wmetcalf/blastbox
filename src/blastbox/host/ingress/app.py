@@ -1150,11 +1150,14 @@ def build_app(
             raise HTTPException(503, "could not read the execution receipt")
         if _attest.is_tombstone(data):
             # The finalizing dispatcher did not sign (no key, signing failed, ...) and said so,
-            # overwriting any superseded attempt's receipt. Absent, not an error.
-            try:
-                why = str(json.loads(data).get("reason") or "unspecified")[:200]
-            except Exception:  # noqa: BLE001
-                why = "unspecified"
+            # overwriting any superseded attempt's receipt. Absent, not an error. Name only a
+            # reason this host writes: a pre-#188 node shipped worker trees verbatim, so any
+            # other text here may be the worker's (as for the marker above).
+            why = _attest.RECEIPT_TOMBSTONE_REASON
+            with contextlib.suppress(Exception):
+                stated = json.loads(data).get("reason")
+                if stated in _attest.TOMBSTONE_REASONS:
+                    why = stated
             raise HTTPException(404, f"no execution receipt for this job: {why}")
         return Response(content=data, media_type="application/json")
 

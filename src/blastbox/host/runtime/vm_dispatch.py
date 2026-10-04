@@ -1009,7 +1009,7 @@ class VmJobDispatcher:
         tree must then not ship -- the job is FAILED and the tree retained for the sweep."""
         return _attest.seal_fresh_receipt(out_dir, key=self._attest_key,
                                           observation=observation, job_id=job.job_id,
-                                          reason="input could not be hashed")
+                                          reason=_attest.INPUT_UNHASHED_REASON)
 
     def _sealed_envelope(self, job: Job) -> Any:
         """Parse the HOST-SEALED metadata.json (the Envelope the trust gate wrote) for the remote path,
