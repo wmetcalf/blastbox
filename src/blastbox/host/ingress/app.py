@@ -1112,14 +1112,21 @@ def build_app(
         # check the binding. Otherwise (legacy, or bound elsewhere): read under THIS app's
         # ceiling and judged -- a declared (or undecidable, or over-cap) artifact at
         # attestation.json is never served as the receipt.
+        #
+        # A vouched result's envelope is still judged while it fits under this app's ceiling,
+        # as a deny only: no genuine vouched result declares (or fails to parse around) a
+        # reserved name -- the trust gate refuses one, and the sweeps vouch only when the
+        # envelope rules both names out -- but a tree a PRE-#188 dispatcher shipped verbatim can
+        # carry an UNDECLARED marker the worker bound to its own predictable sealed envelope.
+        # Over the ceiling a vouched result is served without it (deepseek D1 stays fixed).
+        envelope_cap = _attest.envelope_cap(_limits)
         vouched = False
         try:
-            if bound is not None:
-                with opener(job_id, "metadata.json") as mfh:
-                    vouched = bound == _attest.sha256_stream(mfh)
-            if not vouched:
-                envelope_cap = _attest.envelope_cap(_limits)
-                with opener(job_id, "metadata.json") as mfh:
+            with opener(job_id, "metadata.json") as mfh:
+                if bound is not None:
+                    digest, envelope = _attest.sha256_stream_with_prefix(mfh, envelope_cap + 1)
+                    vouched = bound == digest
+                else:
                     envelope = mfh.read(envelope_cap + 1)
         except Exception as exc:
             if not _is_missing_blob(exc):
@@ -1127,7 +1134,7 @@ def build_app(
                 raise HTTPException(503, "could not read the execution receipt")
             raise HTTPException(404, "no execution receipt for this job: "
                                      f"{_attest.RECEIPT_ENVELOPE_ABSENT_REASON}")
-        if not vouched:
+        if len(envelope) <= envelope_cap or not vouched:
             why_not = _attest.envelope_receipt_path_protection(
                 None if len(envelope) > envelope_cap else envelope)
             if why_not is not None:

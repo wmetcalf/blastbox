@@ -656,12 +656,18 @@ def bound_cleared_marker_sha256(data: bytes) -> str | None:
     return sha if is_cleared_marker(data, sha) else None
 
 
-def sha256_stream(fh: Any) -> str:
-    """sha256 of everything ``fh.read`` yields, read in chunks -- no cap, nothing held whole."""
+def sha256_stream_with_prefix(fh: Any, keep: int) -> tuple[str, bytes]:
+    """(sha256 of everything ``fh.read`` yields, its first ``keep`` bytes). Read in chunks: the
+    hash has no cap, and at most ``keep`` bytes are held."""
     h = hashlib.sha256()
+    head: list[bytes] = []
+    held = 0
     while chunk := fh.read(_READ_CHUNK):
         h.update(chunk)
-    return h.hexdigest()
+        if held < keep:
+            head.append(chunk[:keep - held])
+            held += len(head[-1])
+    return h.hexdigest(), b"".join(head)
 
 
 def _shipped_metadata_sha256(out_dir: Path) -> str | None:

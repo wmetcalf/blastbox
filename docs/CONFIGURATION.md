@@ -156,7 +156,9 @@ that result under its own `BLASTBOX_MAX_METADATA`. A cleared marker only ever sh
 *as-is* (its envelope declares, or cannot rule out, an artifact at `attestation.json`) stores the
 marker in the tombstone shape instead; an as-is retry after a failed upload ships the marker its
 earlier attempt wrote. The route: a cleared marker bound to the sha256 of the **stored**
-`metadata.json` (hashed whole, uncapped) serves the receipt; one bound to another envelope (a
+`metadata.json` (hashed whole, uncapped) serves the receipt — unless that envelope, when it fits
+under the ingress's limit, declares (or cannot be parsed around) a reserved name, which no
+genuine result does; one bound to another envelope (a
 `metadata.json` swapped after the upload) vouches for nothing and the result is judged as legacy;
 any other marker (or one over 4 KiB) answers `404`; no stored `metadata.json` answers `404`; a
 result with **no** marker is legacy (uploaded before receipts, or as-is by an earlier build), so

@@ -1480,3 +1480,27 @@ def test_a_migration_as_is_upload_that_fails_once_is_not_stranded_by_its_own_mar
     r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 404, r.text
     assert r.content != _FORGED_RECEIPT
+
+
+@pytest.mark.parametrize("declared", [attest.RECEIPT_NAME, "attestation.json/p.png"])
+def test_an_undeclared_bound_marker_never_unmasks_a_declared_receipt(tmp_path, declared):
+    """A pre-#188 dispatcher (no reserved names, nothing written at attestation.json) ships a
+    worker's tree verbatim. The sealed envelope is derived from the worker's own output, so the
+    worker can predict its sha256 and plant an UNDECLARED marker bound to it beside a DECLARED
+    artifact at the receipt name. No genuine vouched result ever declares one (the gate refuses
+    it; the sweeps vouch only when the envelope rules both names out), so a bound marker never
+    overrides that declaration while the envelope is within this ingress's ceiling."""
+    store = InMemoryJobStore()
+    job, out = _make_done_job(tmp_path, store)
+    if declared == attest.RECEIPT_NAME:
+        (out / attest.RECEIPT_NAME).write_bytes(_FORGED_RECEIPT)
+    else:
+        (out / attest.RECEIPT_NAME).mkdir()
+        (out / declared).write_bytes(b"page")
+    (out / "metadata.json").write_text(json.dumps({"artifacts": [
+        {"id": "a", "path": declared, "sha256": "0" * 64}]}))
+    (out / attest.WITHHELD_NAME).write_bytes(_cleared_for(out))
+    _push_to_blob(tmp_path, job.job_id, out)
+    r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert attest.RECEIPT_PATH_DECLARED_REASON in r.json()["detail"]
