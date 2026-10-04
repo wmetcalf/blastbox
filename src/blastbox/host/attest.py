@@ -769,6 +769,15 @@ def write_withheld_marker(out_dir: Path, reason: str, *, limits: Limits | None =
     retry forever -- the undecidable verdict can never rule the name out. Keeping it is safe even
     for a worker-written lookalike: its presence alone withholds, and nothing is destroyed.
 
+    And a regular file holding exactly the CLEARED body bound to the sha256 of the tree's current
+    metadata.json (:func:`_is_host_cleared_marker`), while the envelope is undecidable: an earlier
+    attempt vouched (a receipt or tombstone plus that marker), its upload failed, and this retry
+    runs under a lower limit. It is REPLACED by the withheld body; refusing it stranded the retry
+    on every tick or rerun. It cannot be a declared artifact: the sealed envelope commits to every
+    declared artifact's sha256, so an artifact holding that envelope's sha256 is a hash cycle
+    (the same argument the route's binding rests on). A parseable envelope that declares the name
+    never sat beside a marker this host wrote (every writer refuses there), so it is refused.
+
     A transient envelope read error propagates (no verdict; retry)."""
     out_dir = Path(out_dir)
     target = out_dir / WITHHELD_NAME
@@ -781,10 +790,14 @@ def write_withheld_marker(out_dir: Path, reason: str, *, limits: Limits | None =
     if st is not None:
         shipped, data = _shipped_envelope(out_dir, limits)
         paths = (None if data is None else _artifact_paths_of(data)) if shipped else []
-        if paths is None or any(is_reserved_path(p, (WITHHELD_NAME,)) for p in paths):
+        if paths is None and stat.S_ISREG(st.st_mode) and _is_host_cleared_marker(out_dir, target):
+            pass        # this host's own cleared marker from an earlier attempt: replaced below
+        elif paths is None or any(is_reserved_path(p, (WITHHELD_NAME,)) for p in paths):
             raise ReceiptPathOccupied(
-                errno.EEXIST, f"{WITHHELD_NAME} may hold a declared artifact; refusing to "
-                              f"replace it or ship without it")
+                errno.EEXIST,
+                f"{WITHHELD_NAME} holds an entry this host did not write, and the envelope "
+                f"{'cannot be read to rule out' if paths is None else 'declares'} an artifact "
+                f"there; refusing to replace it or ship without it")
         _remove_entry(target, st)
     _write_marker(out_dir, canonical(tombstone_body(reason)))
 
@@ -794,24 +807,44 @@ def write_withheld_marker(out_dir: Path, reason: str, *, limits: Limits | None =
 WITHHELD_REASONS = (RECEIPT_PATH_DECLARED_REASON, RECEIPT_PATH_UNDECIDABLE_REASON)
 
 
-def _is_host_withheld_marker(path: Path) -> bool:
-    """Whether ``path`` is a regular file whose bytes are exactly the canonical withheld body for
-    one of WITHHELD_REASONS. Opened O_NOFOLLOW|O_NONBLOCK, judged on the descriptor and read
-    under WITHHELD_MARKER_MAX_BYTES; anything else (a symlink, a FIFO, an error) is False."""
+def _read_marker_file(path: Path) -> bytes | None:
+    """``path``'s bytes when it is a regular file of at most WITHHELD_MARKER_MAX_BYTES. Opened
+    O_NOFOLLOW|O_NONBLOCK and judged on the descriptor; anything else (a symlink, a FIFO, a
+    directory, oversized, an error) is None."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
-        return False
+        return None
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return False
-        data = _read_capped(fd, WITHHELD_MARKER_MAX_BYTES)
+            return None
+        return _read_capped(fd, WITHHELD_MARKER_MAX_BYTES)
     except OSError:
-        return False
+        return None
     finally:
         os.close(fd)
+
+
+def _is_host_withheld_marker(path: Path) -> bool:
+    """Whether ``path`` is a regular file whose bytes are exactly the canonical withheld body for
+    one of WITHHELD_REASONS (read as :func:`_read_marker_file`)."""
+    data = _read_marker_file(path)
     return data is not None and any(data == canonical(tombstone_body(r))
                                     for r in WITHHELD_REASONS)
+
+
+def _is_host_cleared_marker(out_dir: Path, path: Path) -> bool:
+    """Whether ``path`` is a regular file whose bytes are exactly the canonical cleared body bound
+    to the sha256 of the metadata.json put_output would ship from ``out_dir`` now. An envelope
+    that cannot be hashed (absent, not shippable, unreadable) is False."""
+    data = _read_marker_file(path)
+    if data is None:
+        return False
+    try:
+        metadata_sha256 = _shipped_metadata_sha256(out_dir)
+    except OSError:
+        return False
+    return metadata_sha256 is not None and is_cleared_marker(data, metadata_sha256)
 
 
 def _write_marker(out_dir: Path, data: bytes) -> None:

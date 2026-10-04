@@ -1054,3 +1054,43 @@ def test_a_cleared_marker_that_cannot_hash_the_envelope_is_not_written(tmp_path,
     with pytest.raises(attest.ReceiptUnreadable):
         attest.write_cleared_marker(out)
     assert not (out / attest.WITHHELD_NAME).exists()
+
+
+@pytest.mark.parametrize("bound_to", ["other-envelope", "pre-binding"])
+def test_write_withheld_marker_refuses_a_cleared_body_not_bound_to_this_envelope(tmp_path,
+                                                                                bound_to):
+    """L3's limit: only a cleared body bound to the tree's CURRENT metadata.json is this host's
+    own (a declared artifact cannot be: the sealed envelope commits to its sha256). Any other
+    cleared-looking body may be accepted output: refused, nothing destroyed."""
+    out = _withheld_tree(tmp_path, _GARBAGE)
+    data = (attest.canonical(attest.cleared_marker_body("ab" * 32)) if bound_to == "other-envelope"
+            else b'{"attestation":"not-withheld","withheld":false}')
+    (out / attest.WITHHELD_NAME).write_bytes(data)
+    with pytest.raises(attest.ReceiptPathOccupied, match="this host did not write"):
+        attest.write_withheld_marker(out, attest.RECEIPT_PATH_UNDECIDABLE_REASON)
+    assert (out / attest.WITHHELD_NAME).read_bytes() == data
+
+
+def test_write_withheld_marker_replaces_its_own_cleared_marker(tmp_path):
+    """L3: an earlier attempt vouched (tombstone or receipt + the cleared marker bound to this
+    envelope) and its upload failed; a retry under a lower limit ships as-is and must replace
+    that marker with the withheld body rather than refuse forever."""
+    out = _withheld_tree(tmp_path, _GARBAGE)
+    (out / attest.WITHHELD_NAME).write_bytes(attest.canonical(attest.cleared_marker_body(
+        attest.sha256_file(out / "metadata.json"))))
+    attest.write_withheld_marker(out, attest.RECEIPT_PATH_UNDECIDABLE_REASON)
+    assert (out / attest.WITHHELD_NAME).read_bytes() == attest.canonical(
+        attest.tombstone_body(attest.RECEIPT_PATH_UNDECIDABLE_REASON))
+    assert (out / attest.RECEIPT_NAME).read_bytes() == b"maybe an artifact"
+
+
+def test_write_withheld_marker_never_replaces_a_bound_body_the_envelope_declares(tmp_path):
+    """A parseable envelope that DECLARES the marker's name never sat beside a cleared marker
+    this host wrote (every writer refuses there), so even a body bound to it is kept."""
+    out = _withheld_tree(tmp_path, json.dumps(
+        {"artifacts": [{"id": "a", "path": "attestation.withheld.json"}]}))
+    data = attest.canonical(attest.cleared_marker_body(attest.sha256_file(out / "metadata.json")))
+    (out / attest.WITHHELD_NAME).write_bytes(data)
+    with pytest.raises(attest.ReceiptPathOccupied):
+        attest.write_withheld_marker(out, attest.RECEIPT_PATH_DECLARED_REASON)
+    assert (out / attest.WITHHELD_NAME).read_bytes() == data

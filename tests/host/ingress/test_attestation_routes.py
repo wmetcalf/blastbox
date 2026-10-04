@@ -1574,3 +1574,63 @@ def test_a_directory_at_the_marker_name_answers_like_s3(tmp_path, request, backe
     else:
         # Nothing declared, nothing at attestation.json: an unmarked pre-receipt result.
         assert "predates receipts" in r.json()["detail"]
+
+
+def test_a_migration_rerun_under_a_lower_limit_replaces_its_own_cleared_marker(
+        tmp_path, monkeypatch, caplog):
+    """L3 (lens r6). Run 1 (the service's limit) writes a tombstone and the cleared marker bound
+    to the tree's envelope, then the store is down. Run 2 (a stale, lower --max-metadata) finds
+    the envelope undecidable and must ship as-is: the cleared marker there is this host's own
+    (bound to the tree's CURRENT metadata.json, which a declared artifact cannot be), so it is
+    replaced by the withheld body instead of stranding the tree forever."""
+    import logging
+
+    from blastbox.host.jobs.retention import migrate_legacy_results
+
+    monkeypatch.delenv("BLASTBOX_MAX_METADATA", raising=False)
+    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 1024)
+    store = InMemoryJobStore()
+    job_root, job = _legacy_tree_with_big_envelope(tmp_path, store)
+    out = job_root / job.job_id / "output"
+    assert migrate_legacy_results(job_root, _StoreDown(job_root, blob_root=tmp_path / "blobs"),
+                                  store, logging.getLogger("t"),
+                                  limits=Limits(max_metadata_bytes=1 << 20)) == (0, 0, 1)
+    assert attest.is_cleared_marker((out / attest.WITHHELD_NAME).read_bytes(),
+                                    attest.sha256_file(out / "metadata.json"))
+    assert migrate_legacy_results(job_root, LocalBlobStore(job_root, blob_root=tmp_path / "blobs"),
+                                  store, logging.getLogger("t"),
+                                  limits=Limits(max_metadata_bytes=1024)) == (1, 0, 0)
+    assert (out / attest.WITHHELD_NAME).read_bytes() == attest.canonical(
+        attest.tombstone_body(attest.RECEIPT_PATH_UNDECIDABLE_REASON))
+    r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert r.content != _FORGED_RECEIPT
+
+
+def test_a_sweep_retry_under_a_lower_limit_replaces_its_own_cleared_marker(tmp_path, monkeypatch):
+    """L3 / O2, the pending-upload sweep's side. Tick 1 (BLASTBOX_MAX_METADATA large) tombstones
+    the worker's file and writes the cleared marker, then the store is down. Tick 2 runs after
+    the limit was lowered: the envelope is undecidable, so the tree ships as-is with the withheld
+    body in place of this host's own cleared marker -- not left FAILED every tick."""
+    import logging
+
+    from blastbox.host.jobs.retention import retry_pending_uploads
+
+    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 1024)
+    store = InMemoryJobStore()
+    job_root, job, out = _retained_tree_with_big_envelope(tmp_path, store)
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    monkeypatch.setenv("BLASTBOX_MAX_METADATA", str(1 << 20))
+    assert retry_pending_uploads(job_root, _StoreDown(job_root, blob_root=tmp_path / "blobs"),
+                                 store, logging.getLogger("t"), attest_key=key) == 0
+    assert attest.is_cleared_marker((out / attest.WITHHELD_NAME).read_bytes(),
+                                    attest.sha256_file(out / "metadata.json"))
+    monkeypatch.setenv("BLASTBOX_MAX_METADATA", "1024")
+    assert retry_pending_uploads(job_root, LocalBlobStore(job_root, blob_root=tmp_path / "blobs"),
+                                 store, logging.getLogger("t"), attest_key=key) == 1
+    assert store.get(job.job_id).status is JobStatus.DONE
+    assert (out / attest.WITHHELD_NAME).read_bytes() == attest.canonical(
+        attest.tombstone_body(attest.RECEIPT_PATH_UNDECIDABLE_REASON))
+    r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert r.content != _FORGED_RECEIPT

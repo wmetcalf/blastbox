@@ -155,7 +155,9 @@ that result under its own `BLASTBOX_MAX_METADATA`. A cleared marker only ever sh
 `attestation.json` the host wrote in the same upload. A result the retention sweeps upload
 *as-is* (its envelope declares, or cannot rule out, an artifact at `attestation.json`) stores the
 marker in the tombstone shape instead; an as-is retry after a failed upload ships the marker its
-earlier attempt wrote. The route: a cleared marker bound to the sha256 of the **stored**
+earlier attempt wrote, and when an earlier attempt vouched instead (its cleared marker bound to
+the same `metadata.json`) and a lowered limit now makes the retry as-is, that marker is replaced
+by the withheld body. The route: a cleared marker bound to the sha256 of the **stored**
 `metadata.json` (hashed whole, uncapped) serves the receipt — unless that envelope, when it fits
 under the ingress's limit, declares (or cannot be parsed around) a reserved name, which no
 genuine result does; one bound to another envelope (a
