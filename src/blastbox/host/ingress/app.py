@@ -1067,17 +1067,26 @@ def build_app(
         # on-disk tree, which no dispatcher ever sanitised -- an attestation.json there is whatever
         # the worker wrote -- so a store offering a no-fallback read is always read through it.
         opener = getattr(_blob_store, "open_result_only", None) or _blob_store.open_output
-        # THE UPLOADER'S VERDICT FIRST. Every upload that ships a receipt or tombstone stores the
-        # canonical CLEARED marker -- the host vouching for its own envelope verdict -- and every
-        # as-is upload (its envelope declared, or under THAT process's ceiling could not rule
-        # out, an artifact at attestation.json) stores the withheld one:
-        #   * exactly the cleared bytes: trusted, the envelope is NOT re-judged here (judging it
-        #     under this app's ceiling is how a smaller ingress limit 404'd a genuine receipt a
-        #     peer had signed over a larger envelope);
-        #   * anything else -- the withheld body, unparseable, over the read cap: 404;
+        # THE UPLOADER'S VERDICT FIRST. Every upload that ships a receipt or tombstone stores a
+        # CLEARED marker bound to the envelope it shipped -- the host vouching for its own
+        # envelope verdict -- and every as-is upload (its envelope declared, or under THAT
+        # process's ceiling could not rule out, an artifact at attestation.json) stores the
+        # withheld one:
+        #   * a cleared body bound to the STORED metadata.json's sha256 (hashed by streaming
+        #     the blob: no parse, no cap): trusted, the envelope is NOT re-judged here (judging
+        #     it under this app's ceiling is how a smaller ingress limit 404'd a genuine receipt
+        #     a peer had signed over a larger envelope);
+        #   * a cleared body bound to ANOTHER envelope (metadata.json swapped after the upload):
+        #     it vouches for nothing, and the result is judged as legacy, below -- exactly as if
+        #     there were no marker. No result is served that an unmarked one would not be;
+        #   * anything else -- the withheld body, unparseable, a near-miss, over the read cap,
+        #     the pre-binding cleared body: 404;
         #   * no marker: LEGACY (a pre-receipt upload, or an as-is one by an earlier build) --
         #     unmarked is not safe, so its envelope is judged below as it always was.
-        # A marker that cannot be checked is no verdict: 503.
+        # The binding is what makes the marker unforgeable by a result older code uploaded
+        # verbatim: a DECLARED artifact at the marker's name is committed to by its sha256 in the
+        # sealed envelope, so it cannot also contain that envelope's sha256.
+        # A marker or envelope that cannot be checked is no verdict: 503.
         cap = _attest.WITHHELD_MARKER_MAX_BYTES
         try:
             with opener(job_id, _attest.WITHHELD_NAME) as wfh:
@@ -1088,8 +1097,9 @@ def build_app(
                              job_id, exc)
                 raise HTTPException(503, "could not read the execution receipt")
             withheld = None
-        vouched = withheld is not None and _attest.is_cleared_marker(withheld)
-        if withheld is not None and not vouched:
+        bound = (None if withheld is None or len(withheld) > cap
+                 else _attest.bound_cleared_marker_sha256(withheld))
+        if withheld is not None and bound is None:
             why = _attest.RECEIPT_WITHHELD_REASON
             if len(withheld) <= cap and _attest.is_tombstone(withheld):
                 with contextlib.suppress(Exception):
@@ -1098,13 +1108,16 @@ def build_app(
         # NO ENVELOPE, NO RECEIPT. A genuine receipt always signs metadata_sha256, and put_output
         # stores metadata.json LAST, so a prefix without it is a partial upload (possibly of an
         # as-is tree whose attestation.json landed before its marker did) or a seal put_output
-        # would not ship. Vouched: an existence check only. Legacy: read under THIS app's
+        # would not ship. Cleared marker: the stored envelope is hashed, whole and uncapped, to
+        # check the binding. Otherwise (legacy, or bound elsewhere): read under THIS app's
         # ceiling and judged -- a declared (or undecidable, or over-cap) artifact at
         # attestation.json is never served as the receipt.
+        vouched = False
         try:
-            if vouched:
-                opener(job_id, "metadata.json").close()
-            else:
+            if bound is not None:
+                with opener(job_id, "metadata.json") as mfh:
+                    vouched = bound == _attest.sha256_stream(mfh)
+            if not vouched:
                 envelope_cap = _attest.envelope_cap(_limits)
                 with opener(job_id, "metadata.json") as mfh:
                     envelope = mfh.read(envelope_cap + 1)

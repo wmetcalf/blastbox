@@ -65,6 +65,7 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -80,23 +81,34 @@ HOST_ID_ENV = "BLASTBOX_HOST_ID"
 RECEIPT_NAME = "attestation.json"
 #: The uploader's durable "no receipt" verdict for a tree it shipped AS-IS (its envelope declares,
 #: or cannot rule out, an artifact at the receipt name -- see :func:`write_withheld_marker`). Stored
-#: with any content but the cleared body (:data:`WITHHELD_CLEARED_BODY`), or over
+#: with any content but a cleared body (:func:`cleared_marker_body`), or over
 #: WITHHELD_MARKER_MAX_BYTES, it makes the attestation route answer the no-receipt 404 before it
 #: reads anything at RECEIPT_NAME, so a ceiling mismatch between uploader and route can never turn
 #: the uploader's "cannot rule out" into the route's "nothing declared, serve it".
 WITHHELD_NAME = "attestation.withheld.json"
-#: The ONE body at WITHHELD_NAME that means "NOT withheld", in its canonical bytes (see
-#: :func:`is_cleared_marker`). The store never deletes a single object, so an upload that ships a
+#: A CLEARED marker (:func:`cleared_marker_body`) means "NOT withheld", and only for the
+#: envelope it names (:func:`is_cleared_marker`). The store never deletes a single object, so an
+#: upload that ships a
 #: receipt for a tree whose results prefix may already hold a marker -- an earlier as-is upload of
 #: the same job -- OVERWRITES it with this body (:func:`write_cleared_marker`) rather than
 #: stripping it locally, which would leave the stored marker hiding the receipt forever. EVERY
 #: upload that ships a receipt or a tombstone carries it -- the fresh seals (written with the
 #: receipt/tombstone, over whatever a worker planted there: the gate refused declaring the name),
-#: the sweep's receipt and tombstone branches and the migration's strip branch -- so the route
-#: trusts the host's own envelope verdict and never re-judges a new result under its ceiling. A
-#: result with NO marker is legacy (pre-receipt, or an as-is upload by an earlier build) and the
-#: route still judges its envelope.
-WITHHELD_CLEARED_BODY: dict = {"attestation": "not-withheld", "withheld": False}
+#: the sweep's receipt and tombstone branches and the migration's tombstone branch -- so the
+#: route trusts the host's own envelope verdict and never re-judges a new result under its
+#: ceiling. A cleared marker is only ever written in the same upload as an attestation.json this
+#: host wrote (a receipt or a tombstone), never with nothing at that name. A result with NO marker
+#: is legacy (pre-receipt, or an as-is upload by an earlier build) and the route still judges its
+#: envelope.
+#:
+#: BOUND TO THE ENVELOPE. The body names the sha256 of the metadata.json shipped in the same
+#: upload, and the route accepts it only for the sha256 of the STORED metadata.json. A result
+#: uploaded by older code (no reserved names) could DECLARE an artifact at WITHHELD_NAME; the
+#: sealed envelope commits to every declared artifact's sha256 (seal_envelope re-hashes them from
+#: disk), so that artifact's bytes would have to contain the hash of an envelope that contains
+#: the hash of those bytes -- a sha256 cycle. A pre-binding body, or one bound to any other
+#: envelope, never vouches.
+CLEARED_MARKER_ATTESTATION = "not-withheld"
 #: The most of a stored marker the route reads; anything longer is withheld, never truncated.
 WITHHELD_MARKER_MAX_BYTES = 4096
 #: Every name the dispatchers own in a sealed tree; the trust gate refuses an artifact at or
@@ -591,7 +603,7 @@ def _remove_entry(target: Path, st: os.stat_result) -> None:
 
 
 def _write_atomic(out_dir: Path, data: bytes, *, gate_verified: bool = False,
-                  limits: Limits | None = None) -> None:
+                  limits: Limits | None = None, metadata_sha256: str | None = None) -> None:
     tmp = out_dir / f".{RECEIPT_NAME}.{uuid.uuid4().hex}.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
     try:
@@ -604,25 +616,87 @@ def _write_atomic(out_dir: Path, data: bytes, *, gate_verified: bool = False,
         os.replace(tmp, out_dir / RECEIPT_NAME)
     finally:
         tmp.unlink(missing_ok=True)
-    # Every receipt or tombstone ships with the CLEARED marker: the host vouching that it judged
-    # this tree's envelope itself, so the route never re-judges it under another ceiling, and an
+    # Every receipt or tombstone ships with the CLEARED marker, bound to the envelope in the tree
+    # (``metadata_sha256``: the one the receipt signed): the host vouching that it judged this
+    # tree's envelope itself, so the route never re-judges it under another ceiling, and an
     # overwrite of any marker an earlier upload of the job stored. strip_receipt above already
-    # cleared (or refused for) everything at the reserved names. A failure here raises, so the
-    # caller never ships a receipt without it.
-    _write_marker(out_dir, canonical(WITHHELD_CLEARED_BODY))
+    # cleared (or refused for) everything at the reserved names. Every caller writes metadata.json
+    # BEFORE this and never after (the dispatchers seal it first; the sweeps never rewrite it). A
+    # failure here raises, so the caller never ships a receipt without it.
+    _write_vouching_marker(out_dir, metadata_sha256)
 
 
-def is_cleared_marker(data: bytes) -> bool:
-    """Whether bytes stored at WITHHELD_NAME are EXACTLY the canonical cleared body -- the only
-    marker content that does not withhold. Byte equality, not a parse: anything else (a tombstone,
-    unparseable bytes, a near-miss such as ``"withheld": 0``) withholds."""
-    return data == canonical(WITHHELD_CLEARED_BODY)
+def cleared_marker_body(metadata_sha256: str) -> dict:
+    """The cleared marker for a result whose shipped metadata.json has this sha256."""
+    return {"attestation": CLEARED_MARKER_ATTESTATION, "withheld": False,
+            "metadata_sha256": metadata_sha256}
+
+
+def is_cleared_marker(data: bytes, metadata_sha256: str) -> bool:
+    """Whether bytes stored at WITHHELD_NAME are EXACTLY the canonical cleared body for the
+    envelope whose sha256 is ``metadata_sha256`` -- the only marker content that vouches. Byte
+    equality, not a parse."""
+    return data == canonical(cleared_marker_body(metadata_sha256))
+
+
+def bound_cleared_marker_sha256(data: bytes) -> str | None:
+    """The envelope sha256 ``data`` is the canonical cleared body for, or None when it is not
+    exactly a cleared body for any 64-hex sha256 (a tombstone, unparseable bytes, a near-miss such
+    as ``"withheld": 0``, extra keys, the pre-binding body). The route answers None with the
+    no-receipt 404; a cleared body bound to ANOTHER envelope (metadata.json swapped after the
+    upload) vouches for nothing and the result is judged as legacy."""
+    try:
+        body = json.loads(data)
+        sha = body["metadata_sha256"]
+    except Exception:  # noqa: BLE001 - not a cleared body
+        return None
+    if not (isinstance(sha, str) and len(sha) == 64
+            and all(c in "0123456789abcdef" for c in sha)):
+        return None
+    return sha if is_cleared_marker(data, sha) else None
+
+
+def sha256_stream(fh: Any) -> str:
+    """sha256 of everything ``fh.read`` yields, read in chunks -- no cap, nothing held whole."""
+    h = hashlib.sha256()
+    while chunk := fh.read(_READ_CHUNK):
+        h.update(chunk)
+    return h.hexdigest()
+
+
+def _shipped_metadata_sha256(out_dir: Path) -> str | None:
+    """sha256 of the metadata.json put_output would ship from ``out_dir`` NOW, or None when it
+    would ship none (absent, a symlink, not a regular file). Any other OSError propagates."""
+    try:
+        return sha256_file(out_dir / _SEAL_NAME)
+    except FileNotFoundError:
+        return None
+    except ValueError:                              # not a regular file: never shipped
+        return None
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:                # a symlink: never shipped
+            return None
+        raise
+
+
+def _write_vouching_marker(out_dir: Path, metadata_sha256: str | None) -> None:
+    """The marker that ships beside an attestation.json this host has just written: the cleared
+    body bound to ``metadata_sha256`` (hashed from the tree now when None). With no shippable
+    envelope there is nothing to bind: the withheld body, which the route answers like the
+    missing envelope it will find."""
+    if metadata_sha256 is None:
+        metadata_sha256 = _shipped_metadata_sha256(out_dir)
+    if metadata_sha256 is None:
+        _write_marker(out_dir, canonical(tombstone_body(RECEIPT_ENVELOPE_ABSENT_REASON)))
+    else:
+        _write_marker(out_dir, canonical(cleared_marker_body(metadata_sha256)))
 
 
 def write_cleared_marker(out_dir: Path, *, limits: Limits | None = None) -> None:
-    """Put the canonical CLEARED body at WITHHELD_NAME in a tree that is about to ship with its
-    receipt (or, from the migration, with nothing at the receipt name), replacing whatever the
-    worker left there. Receipt and tombstone writes do this themselves. An overwrite, not a strip: the store never
+    """Put the canonical CLEARED body, bound to the tree's metadata.json, at WITHHELD_NAME in a
+    tree that is about to ship with the receipt THIS host signed and the caller just verified
+    (:func:`tree_receipt_is_ours`) -- never in a tree with nothing of this host's at the receipt
+    name. Receipt and tombstone writes do this themselves. An overwrite, not a strip: the store never
     deletes a single object, so a marker an earlier as-is upload of this job stored would
     otherwise survive the upload and withhold the receipt forever.
 
@@ -641,9 +715,17 @@ def write_cleared_marker(out_dir: Path, *, limits: Limits | None = None) -> None
         raise ReceiptPathOccupied(
             errno.EEXIST, f"{WITHHELD_NAME} may hold a declared artifact; refusing to "
                           f"replace it ({why})")
+    try:
+        # Bound to the envelope the receipt kept here signed: tree_receipt_is_ours checked that
+        # its metadata_sha256 is this file's.
+        metadata_sha256 = sha256_file(out_dir / _SEAL_NAME)
+    except (OSError, ValueError) as exc:
+        raise ReceiptUnreadable(
+            getattr(exc, "errno", None) or errno.EIO,
+            f"cannot hash {_SEAL_NAME} to bind the cleared marker ({exc})") from exc
     # The verdict is taken above: nothing there is accepted output.
     strip_receipt(out_dir, gate_verified=True, names=(WITHHELD_NAME,))
-    _write_marker(out_dir, canonical(WITHHELD_CLEARED_BODY))
+    _write_marker(out_dir, canonical(cleared_marker_body(metadata_sha256)))
 
 
 #: The reason a withheld marker that is not tombstone-shaped (unparseable, or anything else but
@@ -796,7 +878,8 @@ def seal_receipt(out_dir: Path, *, key: AttestKey | None,
         return None
     doc = build_receipt(observation, key_id=key.key_id, metadata_sha256=metadata_sha256)
     body = {"attestation": doc, "signature": key.sign(doc)}
-    _write_atomic(out_dir, canonical(body), gate_verified=gate_verified)
+    _write_atomic(out_dir, canonical(body), gate_verified=gate_verified,
+                  metadata_sha256=metadata_sha256)
     return body
 
 

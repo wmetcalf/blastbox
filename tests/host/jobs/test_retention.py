@@ -2220,6 +2220,6 @@ def test_the_sweep_clears_a_planted_withheld_marker_beside_its_own_receipt(tmp_p
     assert retry_pending_uploads(job_root, blobs, store, logging.getLogger("t"),
                                  attest_key=key) == 1
     with blobs.open_result_only(_JID, attest.WITHHELD_NAME) as fh:
-        assert attest.is_cleared_marker(fh.read())
+        assert attest.is_cleared_marker(fh.read(), attest.sha256_file(out / "metadata.json"))
     with blobs.open_result_only(_JID, attest.RECEIPT_NAME) as fh:
         assert json.loads(fh.read()) == body

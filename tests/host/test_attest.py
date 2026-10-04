@@ -798,7 +798,8 @@ def test_a_fresh_seal_overwrites_a_planted_withheld_marker_with_the_cleared_body
         (marker / "deep").mkdir(parents=True)
     key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
     assert attest.seal_fresh_receipt(out, key=key, observation=_obs(), job_id=_obs().job_id)
-    assert not marker.is_symlink() and attest.is_cleared_marker(marker.read_bytes())
+    assert not marker.is_symlink() and attest.is_cleared_marker(
+        marker.read_bytes(), attest.sha256_file(out / "metadata.json"))
     assert not attest.is_tombstone((out / attest.RECEIPT_NAME).read_bytes())
 
 
@@ -816,7 +817,8 @@ def test_every_receipt_or_tombstone_write_carries_the_cleared_marker(tmp_path, s
         assert attest.seal_fresh_receipt(out, key=None, observation=_obs(), job_id="j")
     else:
         attest.write_tombstone(out, "why")
-    assert attest.is_cleared_marker((out / attest.WITHHELD_NAME).read_bytes())
+    assert attest.is_cleared_marker((out / attest.WITHHELD_NAME).read_bytes(),
+                                    attest.sha256_file(out / "metadata.json"))
     assert sorted(p.name for p in out.iterdir()) == sorted(
         ["metadata.json", attest.RECEIPT_NAME, attest.WITHHELD_NAME])      # no tmp left
 
@@ -911,15 +913,23 @@ def test_write_withheld_marker_refuses_a_possibly_declared_regular_file(tmp_path
     assert (out / attest.WITHHELD_NAME).read_bytes() == data
 
 
-def test_the_cleared_marker_is_exactly_one_canonical_body():
-    cleared = attest.canonical(attest.WITHHELD_CLEARED_BODY)
-    assert attest.is_cleared_marker(cleared)
+def test_the_cleared_marker_is_exactly_one_canonical_body_per_envelope():
+    sha = "ab" * 32
+    cleared = attest.canonical(attest.cleared_marker_body(sha))
+    assert attest.is_cleared_marker(cleared, sha)
+    assert attest.bound_cleared_marker_sha256(cleared) == sha
+    assert not attest.is_cleared_marker(cleared, "cd" * 32)
     assert not attest.is_tombstone(cleared)
     for other in (cleared + b" ", cleared[:-1], b" " + cleared,
-                  json.dumps(attest.WITHHELD_CLEARED_BODY, indent=1).encode(),
-                  b'{"attestation":"not-withheld","withheld":0}',
+                  json.dumps(attest.cleared_marker_body(sha), indent=1).encode(),
+                  b'{"attestation":"not-withheld","withheld":false}',     # pre-binding body
+                  attest.canonical({**attest.cleared_marker_body(sha), "withheld": 0}),
+                  attest.canonical({**attest.cleared_marker_body(sha), "x": 1}),
+                  attest.canonical(attest.cleared_marker_body(sha.upper())),
+                  attest.canonical(attest.cleared_marker_body(sha[:-1])),
                   attest.canonical(attest.tombstone_body("x")), b"", b"garbage"):
-        assert not attest.is_cleared_marker(other), other
+        assert not attest.is_cleared_marker(other, sha), other
+        assert attest.bound_cleared_marker_sha256(other) is None, other
 
 
 @pytest.mark.parametrize("kind", ["none", "file", "dir", "symlink"])
@@ -934,7 +944,7 @@ def test_write_cleared_marker_overwrites_whatever_is_undeclared_there(tmp_path, 
         marker.symlink_to(tmp_path / "elsewhere")
     attest.write_cleared_marker(out)
     assert not marker.is_symlink()
-    assert attest.is_cleared_marker(marker.read_bytes())
+    assert attest.is_cleared_marker(marker.read_bytes(), attest.sha256_file(out / "metadata.json"))
     assert (out / attest.RECEIPT_NAME).read_bytes() == b"maybe an artifact"
     assert sorted(p.name for p in out.iterdir()) == sorted(
         ["metadata.json", attest.RECEIPT_NAME, attest.WITHHELD_NAME])      # no tmp left
@@ -999,3 +1009,48 @@ def test_write_withheld_marker_never_keeps_a_symlink_to_a_marker_body(tmp_path):
     (out / attest.WITHHELD_NAME).symlink_to(target)
     with pytest.raises(attest.ReceiptPathOccupied):
         attest.write_withheld_marker(out, attest.RECEIPT_PATH_UNDECIDABLE_REASON)
+
+
+@pytest.mark.parametrize("seal", ["absent", "symlink", "dir"])
+def test_a_tombstone_with_no_shippable_envelope_ships_the_withheld_marker(tmp_path, seal):
+    """K2: the cleared marker binds the metadata.json shipped beside it. With none put_output
+    would ship there is nothing to bind: the marker is the withheld body (the route would find no
+    envelope and 404 anyway), never a cleared body bound to nothing."""
+    out = tmp_path / "output"
+    out.mkdir()
+    if seal == "symlink":
+        (tmp_path / "real.json").write_text(json.dumps({"artifacts": []}))
+        (out / "metadata.json").symlink_to(tmp_path / "real.json")
+    elif seal == "dir":
+        (out / "metadata.json").mkdir()
+    attest.write_tombstone(out, "why")
+    assert (out / attest.WITHHELD_NAME).read_bytes() == attest.canonical(
+        attest.tombstone_body(attest.RECEIPT_ENVELOPE_ABSENT_REASON))
+    assert attest.is_tombstone((out / attest.RECEIPT_NAME).read_bytes())
+
+
+def test_a_receipt_and_its_cleared_marker_bind_the_same_envelope(tmp_path):
+    out = tmp_path / "output"
+    out.mkdir()
+    (out / "metadata.json").write_text(json.dumps({"artifacts": []}))
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    body = attest.seal_receipt(out, key=key, observation=_obs())
+    assert attest.bound_cleared_marker_sha256(
+        (out / attest.WITHHELD_NAME).read_bytes()) == body["attestation"]["metadata_sha256"]
+
+
+def test_a_cleared_marker_that_cannot_hash_the_envelope_is_not_written(tmp_path, monkeypatch):
+    """write_cleared_marker binds the envelope; when it cannot be hashed right now the sweep
+    must retry (ReceiptUnreadable), not ship an unbound or stale marker."""
+    out = _withheld_tree(tmp_path, json.dumps({"artifacts": []}))
+    real = attest.sha256_file
+
+    def eio(path):
+        if os.path.basename(path) == "metadata.json":
+            raise OSError(errno.EIO, "Input/output error")
+        return real(path)
+
+    monkeypatch.setattr(attest, "sha256_file", eio)
+    with pytest.raises(attest.ReceiptUnreadable):
+        attest.write_cleared_marker(out)
+    assert not (out / attest.WITHHELD_NAME).exists()

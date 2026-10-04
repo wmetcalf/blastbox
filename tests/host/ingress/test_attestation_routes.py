@@ -32,6 +32,12 @@ def key(tmp_path):
     return attest.load_or_create_key(tmp_path / "keys" / "attest.key")
 
 
+def _cleared_for(out):
+    """The cleared marker bound to the metadata.json in ``out``."""
+    return attest.canonical(attest.cleared_marker_body(
+        hashlib.sha256((out / "metadata.json").read_bytes()).hexdigest()))
+
+
 def _done_with_receipt(tmp_path, store, key):
     """A DONE job whose sealed tree was uploaded WITH a dispatcher receipt."""
     job, out = _make_done_job(tmp_path, store)
@@ -499,11 +505,11 @@ class _FlakyEnvelopeBlobs(LocalBlobStore):
         return _Broken()
 
 
-@pytest.mark.parametrize("mode", ["open"])
+@pytest.mark.parametrize("mode", ["open", "read"])
 def test_an_envelope_read_error_is_503_not_a_verdict(tmp_path, key, mode):
-    """A transient error checking the envelope exists is not "absent": the route answers 503
-    (retry), never a 404 that says no receipt exists, never the receipt. (The route only checks
-    that metadata.json exists and reads none of it, so a mid-read failure no longer applies.)"""
+    """A transient error opening or hashing the stored envelope (to check the cleared marker's
+    binding) is not "absent" and not "bound elsewhere": the route answers 503 (retry), never a
+    404 that says no receipt exists, never the receipt."""
     store = InMemoryJobStore()
     job, _, _ = _done_with_receipt(tmp_path, store, key)
     app = build_app(job_store=store, job_root=tmp_path / "jobs", allowed_engines={"clippyshot"},
@@ -766,7 +772,7 @@ def test_a_genuine_receipt_beside_a_large_envelope_still_serves(tmp_path, key, m
                                      observation=attest.RunObservation(
         job_id=job.job_id, engine=job.engine, input_sha256="d" * 64, worker_runtime="runsc",
         worker_tier=None, started_at_ms=1, finished_at_ms=2))
-    assert attest.is_cleared_marker((out / attest.WITHHELD_NAME).read_bytes())
+    assert (out / attest.WITHHELD_NAME).read_bytes() == _cleared_for(out)
     _push_to_blob(tmp_path, job.job_id, out)
     r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 200, r.text
@@ -1069,7 +1075,7 @@ def _stored_result(tmp_path, store, files: dict[str, bytes]):
 def test_a_cleared_marker_serves_the_receipt(tmp_path, key):
     client, store = _make_client(tmp_path)
     job, out, body = _done_with_receipt(tmp_path, store, key)
-    (out / attest.WITHHELD_NAME).write_bytes(attest.canonical(attest.WITHHELD_CLEARED_BODY))
+    (out / attest.WITHHELD_NAME).write_bytes(_cleared_for(out))
     _push_to_blob(tmp_path, job.job_id, out)
     r = client.get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 200, r.text
@@ -1078,9 +1084,10 @@ def test_a_cleared_marker_serves_the_receipt(tmp_path, key):
 
 def test_a_cleared_marker_still_answers_the_tombstone_404(tmp_path):
     client, store = _make_client(tmp_path)
-    job, _ = _stored_result(tmp_path, store, {
-        attest.WITHHELD_NAME: attest.canonical(attest.WITHHELD_CLEARED_BODY),
+    job, out = _stored_result(tmp_path, store, {
         attest.RECEIPT_NAME: attest.canonical(attest.tombstone_body("no attestation key"))})
+    (out / attest.WITHHELD_NAME).write_bytes(_cleared_for(out))
+    _push_to_blob(tmp_path, job.job_id, out)
     r = client.get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 404
     assert "no attestation key" in r.json()["detail"]
@@ -1096,6 +1103,11 @@ def test_a_cleared_marker_still_answers_the_tombstone_404(tmp_path):
     b'{"withheld": false}',
     b'["attestation", "not-withheld"]',
     b'{"attestation": null, "reason": "not-withheld"}',
+    b'{"attestation":"not-withheld","withheld":false}',                # the pre-binding body
+    attest.canonical({**attest.cleared_marker_body("0" * 64), "x": 1}),
+    attest.canonical(attest.cleared_marker_body("0" * 63)),
+    attest.canonical(attest.cleared_marker_body("A" * 64)),
+    json.dumps(attest.cleared_marker_body("0" * 64)).encode(),         # not canonical
 ])
 def test_any_marker_but_the_cleared_body_withholds(tmp_path, marker):
     """Only the ONE canonical cleared body unmasks; anything else stored at the marker's name
@@ -1108,10 +1120,13 @@ def test_any_marker_but_the_cleared_body_withholds(tmp_path, marker):
     assert r.content != _FORGED_RECEIPT
 
 
+_LOOKALIKE = attest.canonical(attest.cleared_marker_body("a" * 64))
+
+
 def _legacy_with_declared_marker_lookalike(out):
     """A tree accepted before the marker's name was reserved, DECLARING an artifact there whose
     (untrusted) bytes equal the cleared body, beside a worker-written attestation.json."""
-    lookalike = attest.canonical(attest.WITHHELD_CLEARED_BODY)
+    lookalike = _LOOKALIKE
     (out / attest.WITHHELD_NAME).write_bytes(lookalike)
     (out / attest.RECEIPT_NAME).write_bytes(_FORGED_RECEIPT)
     (out / "metadata.json").write_text(json.dumps({"artifacts": [
@@ -1135,8 +1150,7 @@ def test_a_declared_cleared_body_lookalike_is_never_shipped_as_is_by_the_migrati
     blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
     assert migrate_legacy_results(job_root, blobs, store, logging.getLogger("t")) == (0, 0, 1)
     assert not blobs.has_output(job.job_id)
-    assert (out / attest.WITHHELD_NAME).read_bytes() == attest.canonical(
-        attest.WITHHELD_CLEARED_BODY)                                  # nothing destroyed
+    assert (out / attest.WITHHELD_NAME).read_bytes() == _LOOKALIKE    # nothing destroyed
     r = client.get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 404 and r.content != _FORGED_RECEIPT
 
@@ -1245,16 +1259,16 @@ def test_a_fresh_result_over_this_ingress_cap_serves_via_the_cleared_marker(
 
 
 @pytest.mark.parametrize("marker", [
-    attest.canonical(attest.tombstone_body("r" * 5000)),             # 5000+ bytes, tombstone
-    attest.canonical(attest.WITHHELD_CLEARED_BODY) + b" " * 5000,     # cleared, then padding
-    attest.canonical(attest.WITHHELD_CLEARED_BODY) + b" ",            # one byte past cleared
+    lambda c: attest.canonical(attest.tombstone_body("r" * 5000)),  # 5000+ bytes, tombstone
+    lambda c: c + b" " * 5000,                                      # cleared, then padding
+    lambda c: c + b" ",                                             # one byte past cleared
 ])
 def test_an_oversize_or_padded_marker_withholds(tmp_path, key, marker):
     """A marker is read under a small cap; anything over it (or a near-miss of the cleared
     bytes) is withheld, never truncated into a verdict."""
     client, store = _make_client(tmp_path)
     job, out, _ = _done_with_receipt(tmp_path, store, key)
-    (out / attest.WITHHELD_NAME).write_bytes(marker)
+    (out / attest.WITHHELD_NAME).write_bytes(marker(_cleared_for(out)))
     _push_to_blob(tmp_path, job.job_id, out)
     r = client.get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 404, r.text
@@ -1280,7 +1294,7 @@ def test_the_migration_strip_branch_stores_the_cleared_marker(tmp_path):
     blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
     assert migrate_legacy_results(job_root, blobs, store, logging.getLogger("t")) == (1, 0, 0)
     with blobs.open_result_only(job.job_id, attest.WITHHELD_NAME) as fh:
-        assert attest.is_cleared_marker(fh.read())
+        assert fh.read() == _cleared_for(out)
     r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 404 and r.content != _FORGED_RECEIPT
 
@@ -1351,6 +1365,73 @@ def test_a_migration_rerun_never_unmasks_a_worker_receipt_an_earlier_partial_upl
     r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 404, r.text
     assert r.content != _FORGED_RECEIPT
+
+
+_PRE_BINDING_CLEARED = b'{"attestation":"not-withheld","withheld":false}'
+
+
+def _legacy_declaring_both_names(tmp_path, store, marker_for):
+    """K2 (codex). A result uploaded by OLDER code (no reserved names) whose envelope DECLARES an
+    artifact at attestation.json (forged) AND one at attestation.withheld.json, whose bytes are
+    ``marker_for(envelope-without-that-artifact)``. Stored as the old uploader did: verbatim."""
+    job, out = _make_done_job(tmp_path, store)
+    (out / attest.RECEIPT_NAME).write_bytes(_FORGED_RECEIPT)
+    base = {"artifacts": [{"id": "r", "path": attest.RECEIPT_NAME,
+                           "sha256": hashlib.sha256(_FORGED_RECEIPT).hexdigest()}]}
+    marker = marker_for(json.dumps(base).encode())
+    base["artifacts"].append({"id": "m", "path": attest.WITHHELD_NAME,
+                              "sha256": hashlib.sha256(marker).hexdigest()})
+    (out / attest.WITHHELD_NAME).write_bytes(marker)
+    (out / "metadata.json").write_text(json.dumps(base))
+    _push_to_blob(tmp_path, job.job_id, out)
+    return job
+
+
+@pytest.mark.parametrize("marker_for", [
+    # The cleared body as it was before it was bound to the envelope.
+    lambda envelope: _PRE_BINDING_CLEARED,
+    # The best an attacker can do with the binding: the body for the envelope as it was BEFORE
+    # it declared the marker artifact (declaring it changes the envelope's hash).
+    lambda envelope: attest.canonical({"attestation": "not-withheld", "withheld": False,
+                                       "metadata_sha256": hashlib.sha256(envelope).hexdigest()}),
+], ids=["pre-binding-body", "bound-to-the-envelope-before-declaring"])
+def test_a_declared_cleared_lookalike_never_unmasks_a_declared_receipt(tmp_path, marker_for):
+    store = InMemoryJobStore()
+    job = _legacy_declaring_both_names(tmp_path, store, marker_for)
+    r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert r.content != _FORGED_RECEIPT
+
+
+def test_the_cleared_marker_binds_the_envelope_it_shipped_with(tmp_path, key):
+    """The cleared marker names the sha256 of the metadata.json shipped in the same upload."""
+    client, store = _make_client(tmp_path)
+    job, out, _ = _done_with_receipt(tmp_path, store, key)
+    meta_sha = hashlib.sha256((out / "metadata.json").read_bytes()).hexdigest()
+    with LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs").open_result_only(
+            job.job_id, attest.WITHHELD_NAME) as fh:
+        stored = fh.read()
+    assert stored == attest.canonical({"attestation": "not-withheld", "withheld": False,
+                                       "metadata_sha256": meta_sha})
+    assert attest.bound_cleared_marker_sha256(stored) == meta_sha
+    assert attest.is_cleared_marker(stored, meta_sha)
+    assert not attest.is_cleared_marker(stored, "0" * 64)
+
+
+def test_a_swapped_envelope_falls_back_to_the_legacy_judgement(tmp_path, key):
+    """After a post-DONE swap of metadata.json the marker no longer matches the stored envelope,
+    so it vouches for nothing and the route judges the envelope it actually serves: a swap to an
+    envelope that declares attestation.json answers 404 (a benign swap still serves the receipt,
+    whose metadata_sha256 then shows the mismatch -- see
+    test_receipt_matches_served_metadata_until_someone_swaps_it)."""
+    client, store = _make_client(tmp_path)
+    job, out, _ = _done_with_receipt(tmp_path, store, key)
+    (out / "metadata.json").write_text(json.dumps({"artifacts": [
+        {"id": "a", "path": attest.RECEIPT_NAME}]}))
+    _push_to_blob(tmp_path, job.job_id, out)
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert attest.RECEIPT_PATH_DECLARED_REASON in r.json()["detail"]
 
 
 def test_a_sweep_as_is_upload_that_fails_once_is_not_stranded_by_its_own_marker(

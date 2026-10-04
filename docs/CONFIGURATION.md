@@ -146,21 +146,28 @@ has its own key, and the verifier pins each one it accepts, by `key_id`. When a 
 sign (no key, signing failed, input could not be hashed), it writes a *tombstone*
 (`{"attestation": null, "reason": "…"}`) instead, so a superseded attempt's receipt in the store is
 always overwritten; the route answers `404` for it. Every upload that ships a receipt or a
-tombstone (the dispatchers' seals, the pending-upload sweep) — and every legacy migration that
-strips a worker-written `attestation.json` — also stores an
-`attestation.withheld.json` marker holding the one *cleared* body
-(`{"attestation":"not-withheld","withheld":false}`, byte for byte): the host vouching for its own
-envelope verdict, so the route never re-judges that result under its own `BLASTBOX_MAX_METADATA`.
-A result the retention sweeps upload *as-is* (its envelope declares, or cannot rule out, an
-artifact at `attestation.json`) stores the marker in the tombstone shape instead. The route:
-any marker but the cleared body (or one over 4 KiB) answers `404`; no stored `metadata.json`
-answers `404`; a result with **no** marker is legacy (uploaded before receipts, or as-is by an
-earlier build), so its envelope is parsed under the ingress's limit and a declared, unparseable
-or over-limit envelope answers `404`. The store never deletes a single object, so a later
-receipt-carrying upload of the same job overwrites an earlier as-is marker with the cleared body
-rather than leaving it to withhold the receipt forever. A legacy tree whose envelope declares (or
-cannot rule out) an artifact at the marker's own name is never shipped as-is or with a receipt —
-its bytes could be the cleared body — so it stays retained (sweep) or is counted failed
+tombstone (the dispatchers' seals, the pending-upload sweep, and the legacy migration, which ships
+a tombstone over a worker-written `attestation.json` rather than stripping it) also stores an
+`attestation.withheld.json` marker holding the *cleared* body bound to the envelope it shipped
+with (`{"attestation":"not-withheld","metadata_sha256":"<sha256 of that metadata.json>","withheld":false}`,
+canonical bytes): the host vouching for its own envelope verdict, so the route never re-judges
+that result under its own `BLASTBOX_MAX_METADATA`. A cleared marker only ever ships beside an
+`attestation.json` the host wrote in the same upload. A result the retention sweeps upload
+*as-is* (its envelope declares, or cannot rule out, an artifact at `attestation.json`) stores the
+marker in the tombstone shape instead; an as-is retry after a failed upload ships the marker its
+earlier attempt wrote. The route: a cleared marker bound to the sha256 of the **stored**
+`metadata.json` (hashed whole, uncapped) serves the receipt; one bound to another envelope (a
+`metadata.json` swapped after the upload) vouches for nothing and the result is judged as legacy;
+any other marker (or one over 4 KiB) answers `404`; no stored `metadata.json` answers `404`; a
+result with **no** marker is legacy (uploaded before receipts, or as-is by an earlier build), so
+its envelope is parsed under the ingress's limit and a declared, unparseable or over-limit
+envelope answers `404`. The binding makes the marker unforgeable by a result older code stored
+verbatim: a declared artifact at the marker's name has its sha256 in the sealed envelope, so its
+bytes cannot also name that envelope's sha256. The store never deletes a single object, so a
+later receipt-carrying upload of the same job overwrites an earlier as-is marker with the cleared
+body rather than leaving it to withhold the receipt forever. A legacy tree whose envelope declares
+(or cannot rule out) an artifact at the marker's own name is never shipped as-is or with a receipt
+— its bytes could be the cleared body — so it stays retained (sweep) or is counted failed
 (migration), logged as an error with its job id. So a ceiling mismatch can withhold a legacy
 result's receipt, but cannot hide a new genuine receipt or serve a
 forged one. Both names are reserved: a worker cannot declare an artifact at either. Deleting a
