@@ -159,6 +159,22 @@ class BlobStore(Protocol):
         """
 
 
+def read_result_prefix(store: object, job_id: str, name: str, max_bytes: int) -> bytes:
+    """At most *max_bytes* of *job_id*'s stored *name*, read from the results prefix only.
+
+    A store offering ``read_result_prefix`` bounds the fetch itself (S3 streams and stops; a
+    whole-object ``open_output`` there downloads and decompresses everything before a caller's
+    ``read(n)`` truncates it). Any other store is read through ``open_result_only`` (or
+    ``open_output``) with ``read(max_bytes)``. Errors propagate as the store raises them.
+    """
+    bounded = getattr(store, "read_result_prefix", None)
+    if bounded is not None:
+        return bytes(bounded(job_id, name, max_bytes))
+    opener = getattr(store, "open_result_only", None) or getattr(store, "open_output")
+    with opener(job_id, name) as fh:
+        return bytes(fh.read(max_bytes))
+
+
 def upload_output_with_retry(
     store: "BlobStore",
     job_id: str,

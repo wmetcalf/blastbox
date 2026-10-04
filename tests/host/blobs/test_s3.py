@@ -595,3 +595,69 @@ def test_a_listing_page_of_only_the_markers_versions_refuses_rather_than_deletin
         assert fh.read() == b"marker 2"                  # the marker was not deleted early
     with versioned_store.open_output("jm", "metadata.json") as fh:
         assert fh.read() == b"{}"
+
+
+@pytest.mark.parametrize("compress", [True, False], ids=["gzip", "plain"])
+def test_read_result_prefix_never_fetches_past_its_bound(tmp_path, compress):
+    """lens r7 F2. open_output downloads and decompresses the WHOLE object before the caller can
+    truncate, so a capped reader on S3 still pulled every byte. read_result_prefix streams the
+    body and stops at the bound: neither the bytes transferred nor the bytes decompressed run
+    far past it, and the prefix it returns is exact."""
+    import os
+
+    with moto.mock_aws():
+        boto3.client("s3", region_name="us-east-1").create_bucket(Bucket=BUCKET)
+        env = {} if compress else {"BLASTBOX_BLOB_COMPRESS": "0"}
+        store = S3BlobStore(f"s3://{BUCKET}/pfx", job_root=tmp_path, env=env)
+        out = tmp_path / "jp" / "output"
+        out.mkdir(parents=True)
+        payload = os.urandom(1 << 19).hex().encode()      # 1 MiB, ~2:1 compressible
+        (out / "metadata.json").write_bytes(payload)
+        store.put_output("jp", out)
+
+        fetched = {"n": 0}
+        real = store._s3.get_object
+
+        def counting(**kw):
+            obj = real(**kw)
+            raw = obj["Body"].read
+
+            def rd(*a):
+                d = raw(*a)
+                fetched["n"] += len(d)
+                return d
+            obj["Body"].read = rd
+            return obj
+        store._s3.get_object = counting
+
+        got = store.read_result_prefix("jp", "metadata.json", 1025)
+        assert got == payload[:1025]
+        assert 0 < fetched["n"] <= 2 * 1025, fetched["n"]
+
+        # A bound past the object's end returns the whole object.
+        assert store.read_result_prefix("jp", "metadata.json", len(payload) + 10) == payload
+
+
+def test_read_result_prefix_missing_and_unsafe_names(store):
+    with pytest.raises(BlobFetchError) as ei:
+        store.read_result_prefix("nope", "metadata.json", 10)
+    code = ei.value.__cause__.response["Error"]["Code"]
+    assert code in ("NoSuchKey", "404")
+    with pytest.raises(BlobFetchError):
+        store.read_result_prefix("j", "../x", 10)
+
+
+def test_read_result_prefix_refuses_a_gzip_stream_that_never_decodes_toward_its_bound(store):
+    """A gzip-encoded object our encoder could not have written (empty stored blocks, forever)
+    decodes nothing while it streams. The bounded read refuses once the compressed bytes run past
+    the bound's allowance, rather than following the stream to its end."""
+    import zlib as _zlib
+
+    header = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff"
+    empty_block = b"\x00\x00\x00\xff\xff"          # BFINAL=0, stored, LEN=0
+    body = header + empty_block * 200_000 + b"\x03\x00" + (0).to_bytes(4, "little") * 2
+    assert _zlib.decompress(body, wbits=31) == b""
+    boto3.client("s3", region_name="us-east-1").put_object(
+        Bucket=BUCKET, Key="pfx/results/jz/metadata.json", Body=body, ContentEncoding="gzip")
+    with pytest.raises(BlobFetchError, match="outgrew"):
+        store.read_result_prefix("jz", "metadata.json", 1024)

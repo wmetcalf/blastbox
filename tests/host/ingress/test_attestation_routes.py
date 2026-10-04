@@ -1602,6 +1602,55 @@ def test_the_route_never_reads_an_envelope_past_its_ceiling(tmp_path, monkeypatc
     assert 0 < read["n"] <= 1025
 
 
+def test_the_s3_route_never_fetches_an_envelope_or_marker_past_its_ceiling(
+        tmp_path, monkeypatch, request, key):
+    """lens r7 F2. The ceiling held only on the local store: S3BlobStore.open_output downloads
+    and gunzips the whole object before the route's read(cap + 1) truncates it. The route reads
+    the envelope and the marker through a bounded read that streams the body and stops."""
+    import os
+
+    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 1024)
+    blobs = _s3_store(tmp_path, request)
+    store = InMemoryJobStore()
+    job, out = _make_done_job(tmp_path, store)
+    (out / "metadata.json").write_text(json.dumps(
+        {"artifacts": [], "pad": os.urandom(1 << 19).hex()}))
+    attest.seal_receipt(out, key=key, observation=attest.RunObservation(
+        job_id=job.job_id, engine=job.engine, input_sha256="d" * 64, worker_runtime="runsc",
+        worker_tier=None, started_at_ms=1, finished_at_ms=2))
+    # An oversized (undecodable) marker, so its read is bounded too.
+    (out / attest.WITHHELD_NAME).write_bytes(os.urandom(1 << 19).hex().encode())
+    blobs.put_output(job.job_id, out)
+    fetched: dict[str, int] = {}
+    real = blobs._s3.get_object
+
+    def counting(**kw):
+        obj = real(**kw)
+        raw = obj["Body"].read
+        name = kw["Key"].rsplit("/", 1)[-1]
+
+        def rd(*a):
+            d = raw(*a)
+            fetched[name] = fetched.get(name, 0) + len(d)
+            return d
+        obj["Body"].read = rd
+        return obj
+    blobs._s3.get_object = counting
+    app = build_app(job_store=store, job_root=tmp_path / "jobs", allowed_engines={"clippyshot"},
+                    limits=Limits(max_metadata_bytes=1024), api_workers=2, zip_password="",
+                    blob_store=blobs)
+    client = TestClient(app)
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text          # the oversized marker withholds
+    assert 0 < fetched[attest.WITHHELD_NAME] <= 2 * (attest.WITHHELD_MARKER_MAX_BYTES + 1)
+    blobs._s3.delete_object(Bucket="withheld",
+                            Key=f"results/{job.job_id}/{attest.WITHHELD_NAME}")
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text          # the envelope is over the ceiling
+    assert attest.RECEIPT_ENVELOPE_OVER_LIMIT_REASON in r.json()["detail"]
+    assert 0 < fetched["metadata.json"] <= 2 * 1025, fetched["metadata.json"]
+
+
 @pytest.mark.parametrize("backend", ["local", "s3"])
 @pytest.mark.parametrize("declared", [True, False], ids=["declared", "undeclared"])
 def test_a_directory_at_the_marker_name_answers_like_s3(tmp_path, request, backend, declared):

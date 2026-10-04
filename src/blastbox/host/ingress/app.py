@@ -41,6 +41,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry
 from blastbox import __version__
 from blastbox.errors import sanitize_public_error
 from blastbox.host.blobs.base import BlobStore
+from blastbox.host.blobs.base import read_result_prefix as _read_result_prefix
 from blastbox.host.jobs.base import VALID_TIERS, Job, JobStatus, JobStore
 from blastbox.host.jobs.factory import build_job_store_from_env
 from blastbox.limits import Limits
@@ -1084,8 +1085,8 @@ def build_app(
         # A marker that cannot be read is no verdict: 503.
         cap = _attest.WITHHELD_MARKER_MAX_BYTES
         try:
-            with opener(job_id, _attest.WITHHELD_NAME) as wfh:
-                withheld: bytes | None = wfh.read(cap + 1)
+            withheld: bytes | None = _read_result_prefix(
+                _blob_store, job_id, _attest.WITHHELD_NAME, cap + 1)
         except Exception as exc:
             if not _is_missing_blob(exc):
                 _log.warning("attestation: withheld-marker read failed for job=%s: %s",
@@ -1105,7 +1106,8 @@ def build_app(
         # would not ship.
         #
         # THE ENVELOPE DECIDES, read under THIS app's ceiling and never past it (no uncapped
-        # hash per request). Over the ceiling it cannot be parsed to rule out a declared
+        # hash per request) -- on every store: read_result_prefix streams an S3 body and stops,
+        # where open_output would download and gunzip the whole object first (lens r7 F2). Over the ceiling it cannot be parsed to rule out a declared
         # artifact at attestation.json, so the receipt is withheld -- fail closed, even for a
         # genuine receipt a dispatcher with a larger limit signed (round 7 supersedes
         # 5f731d4 / deepseek D1): the 404 names BLASTBOX_MAX_METADATA so the operator aligns
@@ -1114,8 +1116,8 @@ def build_app(
         # declaration at either name).
         envelope_cap = _attest.envelope_cap(_limits)
         try:
-            with opener(job_id, "metadata.json") as mfh:
-                envelope = mfh.read(envelope_cap + 1)
+            envelope = _read_result_prefix(_blob_store, job_id, "metadata.json",
+                                           envelope_cap + 1)
         except Exception as exc:
             if not _is_missing_blob(exc):
                 _log.warning("attestation: envelope read failed for job=%s: %s", job_id, exc)

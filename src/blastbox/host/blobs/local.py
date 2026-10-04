@@ -210,6 +210,13 @@ class LocalBlobStore:
             raise BlobFetchError(f"result fetch failed: {job_id}/{name}")
         return fh
 
+    def read_result_prefix(self, job_id: str, name: str, max_bytes: int) -> bytes:
+        """At most *max_bytes* of one artifact from the durable results prefix (no legacy
+        fallback, like :meth:`open_result_only`). A file read stops at the bound on its own;
+        the method exists so a bounded reader is bounded on every store (see the S3 one)."""
+        with self.open_result_only(job_id, name) as fh:
+            return fh.read(max_bytes)
+
     def open_output(self, job_id: str, name: str) -> BinaryIO:
         # put_output stores nested rel paths (results/<job_id>/<foo/bar.png>), so open_output must
         # read at the SAME key -- collapsing to the basename would 404 (or silently omit) a nested

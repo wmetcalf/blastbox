@@ -9,6 +9,7 @@ Key layout:
 """
 from __future__ import annotations
 
+import contextlib
 import errno
 
 import gzip
@@ -16,6 +17,7 @@ import hashlib
 import io
 import os
 import time
+import zlib
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 import threading
@@ -38,6 +40,11 @@ from blastbox.observability import get_logger
 _log = get_logger("blastbox.blobs.s3")
 
 _CHUNK = 1024 * 1024
+
+# read_result_prefix: the largest single body read, and the compressed-stream allowance over the
+# decoded bound (gzip header/trailer and per-block framing).
+_PREFIX_CHUNK = 64 * 1024
+_PREFIX_SLACK = 4096
 
 # DeleteObjects accepts at most 1000 keys per call. list_objects_v2 pages happened to
 # respect that on their own; list_object_versions returns versions AND delete markers,
@@ -402,6 +409,62 @@ class S3BlobStore:
         if obj.get("ContentEncoding") == "gzip":
             data = gzip.decompress(data)
         return io.BytesIO(data)
+
+    def read_result_prefix(self, job_id: str, name: str, max_bytes: int) -> bytes:
+        """At most *max_bytes* of one stored artifact, decoded -- WITHOUT fetching the rest.
+
+        open_output downloads and decompresses the whole object before its caller sees a byte,
+        so a reader that truncates at a ceiling (the attestation route's envelope and marker
+        reads) still pulled every byte through this process (lens r7 F2). This streams the
+        body instead, reading no more than what is still needed, and inflates a gzip-encoded
+        object incrementally with the output capped at *max_bytes*. The body is closed as soon
+        as the bound is reached. Errors are raised exactly as open_output raises them (a
+        missing key is a BlobFetchError caused by the NoSuchKey).
+        """
+        key = self._key("results", job_id, self._safe_rel(name))
+        try:
+            obj = self._s3.get_object(Bucket=self._bucket, Key=key)
+        except Exception as exc:
+            raise BlobFetchError(f"result fetch failed: {job_id}/{name}") from exc
+        body = obj["Body"]
+        inflater = (zlib.decompressobj(wbits=31) if obj.get("ContentEncoding") == "gzip"
+                    else None)
+        # Our own gzip encoder never grows its input by more than a few bytes per 16 KiB
+        # block, so a stream still short of the bound past this many compressed bytes is not
+        # one we wrote: refuse it rather than keep reading.
+        transfer_limit = max_bytes + max_bytes // 64 + _PREFIX_SLACK
+        out = bytearray()
+        transferred = 0
+        try:
+            while len(out) < max_bytes:
+                want = min(_PREFIX_CHUNK, max(max_bytes - len(out), 1))
+                if inflater is not None and inflater.unconsumed_tail:
+                    raw = inflater.unconsumed_tail
+                else:
+                    raw = body.read(want)
+                    transferred += len(raw)
+                    if not raw:
+                        if inflater is not None:
+                            out += inflater.flush()[: max_bytes - len(out)]
+                        break
+                if inflater is None:
+                    out += raw
+                else:
+                    out += inflater.decompress(raw, max_bytes - len(out))
+                    if inflater.eof:
+                        break
+                if transferred > transfer_limit and len(out) < max_bytes:
+                    raise BlobFetchError(
+                        f"result fetch failed: {job_id}/{name}: compressed stream outgrew "
+                        f"its decoded bound ({transferred} bytes for < {max_bytes})")
+        except BlobFetchError:
+            raise
+        except Exception as exc:
+            raise BlobFetchError(f"result fetch failed: {job_id}/{name}") from exc
+        finally:
+            with contextlib.suppress(Exception):
+                body.close()
+        return bytes(out[:max_bytes])
 
     def has_output(self, job_id: str) -> bool:
         """Positively observed durable result bytes for *job_id*. Any error -> False: the age
