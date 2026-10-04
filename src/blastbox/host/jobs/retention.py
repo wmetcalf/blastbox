@@ -795,7 +795,10 @@ def _migrate_legacy_one(
             return "failed"
         as_is = _attest.tree_receipt_path_protection(out_dir, limits=limits)
         if as_is is None:
+            # No receipt ships, but the result still vouches with the CLEARED marker (over any
+            # undeclared one the worker left), so the route never re-judges its envelope.
             _attest.strip_receipt(out_dir, limits=limits)
+            _attest.write_cleared_marker(out_dir, limits=limits)
         else:
             _attest.write_withheld_marker(out_dir, as_is, limits=limits)
             log.warning("legacy migration: %s: %s; uploading it as-is, with no receipt",

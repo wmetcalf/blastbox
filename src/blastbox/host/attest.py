@@ -80,20 +80,25 @@ HOST_ID_ENV = "BLASTBOX_HOST_ID"
 RECEIPT_NAME = "attestation.json"
 #: The uploader's durable "no receipt" verdict for a tree it shipped AS-IS (its envelope declares,
 #: or cannot rule out, an artifact at the receipt name -- see :func:`write_withheld_marker`). Stored
-#: with any content but the cleared body (:data:`WITHHELD_CLEARED_BODY`), it makes the attestation
-#: route answer the no-receipt 404 before it reads anything at RECEIPT_NAME, so a ceiling mismatch
-#: between uploader and route can never turn the uploader's "cannot rule out" into the route's
-#: "nothing declared, serve it".
+#: with any content but the cleared body (:data:`WITHHELD_CLEARED_BODY`), or over
+#: WITHHELD_MARKER_MAX_BYTES, it makes the attestation route answer the no-receipt 404 before it
+#: reads anything at RECEIPT_NAME, so a ceiling mismatch between uploader and route can never turn
+#: the uploader's "cannot rule out" into the route's "nothing declared, serve it".
 WITHHELD_NAME = "attestation.withheld.json"
 #: The ONE body at WITHHELD_NAME that means "NOT withheld", in its canonical bytes (see
 #: :func:`is_cleared_marker`). The store never deletes a single object, so an upload that ships a
 #: receipt for a tree whose results prefix may already hold a marker -- an earlier as-is upload of
 #: the same job -- OVERWRITES it with this body (:func:`write_cleared_marker`) rather than
-#: stripping it locally, which would leave the stored marker hiding the receipt forever. A fresh
-#: dispatcher seal still just strips a planted marker: only the retention sweeps ever store one,
-#: for a FAILED (pending-upload) or DONE (legacy) row, and neither is ever dispatched again, so a
-#: fresh upload never lands on a marked prefix.
+#: stripping it locally, which would leave the stored marker hiding the receipt forever. EVERY
+#: upload that ships a receipt or a tombstone carries it -- the fresh seals (written with the
+#: receipt/tombstone, over whatever a worker planted there: the gate refused declaring the name),
+#: the sweep's receipt and tombstone branches and the migration's strip branch -- so the route
+#: trusts the host's own envelope verdict and never re-judges a new result under its ceiling. A
+#: result with NO marker is legacy (pre-receipt, or an as-is upload by an earlier build) and the
+#: route still judges its envelope.
 WITHHELD_CLEARED_BODY: dict = {"attestation": "not-withheld", "withheld": False}
+#: The most of a stored marker the route reads; anything longer is withheld, never truncated.
+WITHHELD_MARKER_MAX_BYTES = 4096
 #: Every name the dispatchers own in a sealed tree; the trust gate refuses an artifact at or
 #: under any of them.
 RESERVED_NAMES = (RECEIPT_NAME, WITHHELD_NAME)
@@ -558,9 +563,10 @@ def strip_receipt(out_dir: Path, *, gate_verified: bool = False,
                 exc.errno, f"cannot read the envelope to rule out a declared artifact at "
                            f"{RECEIPT_NAME} ({exc}); leaving it in place") from exc
         if why is not None:
+            occupied = ", ".join(t.name for t, _ in present)
             raise ReceiptPathOccupied(
-                errno.EEXIST, f"{RECEIPT_NAME} holds a declared artifact (or the envelope "
-                              f"cannot be parsed to rule that out); refusing to replace it")
+                errno.EEXIST, f"{occupied} may hold a declared artifact ({why}); refusing to "
+                              f"replace it")
     for target, st in present:
         _remove_entry(target, st)
 
@@ -593,6 +599,12 @@ def _write_atomic(out_dir: Path, data: bytes, *, gate_verified: bool = False) ->
         os.replace(tmp, out_dir / RECEIPT_NAME)
     finally:
         tmp.unlink(missing_ok=True)
+    # Every receipt or tombstone ships with the CLEARED marker: the host vouching that it judged
+    # this tree's envelope itself, so the route never re-judges it under another ceiling, and an
+    # overwrite of any marker an earlier upload of the job stored. strip_receipt above already
+    # cleared (or refused for) everything at the reserved names. A failure here raises, so the
+    # caller never ships a receipt without it.
+    _write_marker(out_dir, canonical(WITHHELD_CLEARED_BODY))
 
 
 def is_cleared_marker(data: bytes) -> bool:
@@ -603,8 +615,9 @@ def is_cleared_marker(data: bytes) -> bool:
 
 
 def write_cleared_marker(out_dir: Path, *, limits: Limits | None = None) -> None:
-    """Put the canonical CLEARED body at WITHHELD_NAME in a tree that is about to ship WITH its
-    receipt, replacing whatever the worker left there. An overwrite, not a strip: the store never
+    """Put the canonical CLEARED body at WITHHELD_NAME in a tree that is about to ship with its
+    receipt (or, from the migration, with nothing at the receipt name), replacing whatever the
+    worker left there. Receipt and tombstone writes do this themselves. An overwrite, not a strip: the store never
     deletes a single object, so a marker an earlier as-is upload of this job stored would
     otherwise survive the upload and withhold the receipt forever.
 

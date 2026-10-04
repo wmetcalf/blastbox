@@ -1067,43 +1067,58 @@ def build_app(
         # on-disk tree, which no dispatcher ever sanitised -- an attestation.json there is whatever
         # the worker wrote -- so a store offering a no-fallback read is always read through it.
         opener = getattr(_blob_store, "open_result_only", None) or _blob_store.open_output
-        # THE UPLOADER'S VERDICT, never re-derived here. A tree the retention sweeps shipped
-        # AS-IS (its envelope declared, or under THAT process's ceiling could not rule out, an
-        # artifact at attestation.json) carries the withheld marker, and it alone decides: any
-        # content but the ONE canonical cleared body (written by an upload that ships a receipt
-        # over a prefix an earlier as-is upload may have marked -- the store never deletes a
-        # single object) withholds, unparseable bytes included. The route reads no envelope and applies no ceiling of its own: judging the
-        # envelope under this app's limit is how a larger ingress limit served a planted
-        # attestation.json 200 that the uploader had shipped as undecidable, and how a smaller
-        # one 404'd a genuine receipt a peer had signed over a larger envelope. A marker that
-        # cannot be checked is no verdict: 503.
+        # THE UPLOADER'S VERDICT FIRST. Every upload that ships a receipt or tombstone stores the
+        # canonical CLEARED marker -- the host vouching for its own envelope verdict -- and every
+        # as-is upload (its envelope declared, or under THAT process's ceiling could not rule
+        # out, an artifact at attestation.json) stores the withheld one:
+        #   * exactly the cleared bytes: trusted, the envelope is NOT re-judged here (judging it
+        #     under this app's ceiling is how a smaller ingress limit 404'd a genuine receipt a
+        #     peer had signed over a larger envelope);
+        #   * anything else -- the withheld body, unparseable, over the read cap: 404;
+        #   * no marker: LEGACY (a pre-receipt upload, or an as-is one by an earlier build) --
+        #     unmarked is not safe, so its envelope is judged below as it always was.
+        # A marker that cannot be checked is no verdict: 503.
+        cap = _attest.WITHHELD_MARKER_MAX_BYTES
         try:
             with opener(job_id, _attest.WITHHELD_NAME) as wfh:
-                withheld: bytes | None = wfh.read(4096)
+                withheld: bytes | None = wfh.read(cap + 1)
         except Exception as exc:
             if not _is_missing_blob(exc):
                 _log.warning("attestation: withheld-marker read failed for job=%s: %s",
                              job_id, exc)
                 raise HTTPException(503, "could not read the execution receipt")
             withheld = None
-        if withheld is not None and not _attest.is_cleared_marker(withheld):
+        vouched = withheld is not None and _attest.is_cleared_marker(withheld)
+        if withheld is not None and not vouched:
             why = _attest.RECEIPT_WITHHELD_REASON
-            if _attest.is_tombstone(withheld):
+            if len(withheld) <= cap and _attest.is_tombstone(withheld):
                 with contextlib.suppress(Exception):
                     why = str(json.loads(withheld).get("reason") or why)[:200]
             raise HTTPException(404, f"no execution receipt for this job: {why}")
-        # NO ENVELOPE, NO RECEIPT -- an existence check only, nothing is read or parsed. A
-        # genuine receipt always signs metadata_sha256, and put_output stores metadata.json
-        # LAST, so a prefix without it is a partial upload (possibly of an as-is tree whose
-        # attestation.json landed before its marker did) or a seal put_output would not ship.
+        # NO ENVELOPE, NO RECEIPT. A genuine receipt always signs metadata_sha256, and put_output
+        # stores metadata.json LAST, so a prefix without it is a partial upload (possibly of an
+        # as-is tree whose attestation.json landed before its marker did) or a seal put_output
+        # would not ship. Vouched: an existence check only. Legacy: read under THIS app's
+        # ceiling and judged -- a declared (or undecidable, or over-cap) artifact at
+        # attestation.json is never served as the receipt.
         try:
-            opener(job_id, "metadata.json").close()
+            if vouched:
+                opener(job_id, "metadata.json").close()
+            else:
+                envelope_cap = _attest.envelope_cap(_limits)
+                with opener(job_id, "metadata.json") as mfh:
+                    envelope = mfh.read(envelope_cap + 1)
         except Exception as exc:
             if not _is_missing_blob(exc):
-                _log.warning("attestation: envelope check failed for job=%s: %s", job_id, exc)
+                _log.warning("attestation: envelope read failed for job=%s: %s", job_id, exc)
                 raise HTTPException(503, "could not read the execution receipt")
             raise HTTPException(404, "no execution receipt for this job: "
                                      f"{_attest.RECEIPT_ENVELOPE_ABSENT_REASON}")
+        if not vouched:
+            why_not = _attest.envelope_receipt_path_protection(
+                None if len(envelope) > envelope_cap else envelope)
+            if why_not is not None:
+                raise HTTPException(404, f"no execution receipt for this job: {why_not}")
         try:
             fh = opener(job_id, _attest.RECEIPT_NAME)
         except Exception as exc:

@@ -764,7 +764,7 @@ def test_a_genuine_receipt_beside_a_large_envelope_still_serves(tmp_path, key, m
                                      observation=attest.RunObservation(
         job_id=job.job_id, engine=job.engine, input_sha256="d" * 64, worker_runtime="runsc",
         worker_tier=None, started_at_ms=1, finished_at_ms=2))
-    assert not (out / attest.WITHHELD_NAME).exists()
+    assert attest.is_cleared_marker((out / attest.WITHHELD_NAME).read_bytes())
     _push_to_blob(tmp_path, job.job_id, out)
     r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 200, r.text
@@ -1159,3 +1159,144 @@ def test_a_declared_cleared_body_lookalike_is_never_shipped_as_is_by_the_sweep(t
                                  attest_key=key) == 0
     assert not blobs.has_output(job.job_id)
     assert store.get(job.job_id).status is JobStatus.FAILED            # left retained
+
+
+
+# ---------------------------------------------------------------------------
+# Unmarked is LEGACY, not safe: the route judges its envelope (round-5 panel P1)
+# ---------------------------------------------------------------------------
+
+
+def _unmarked(tmp_path, store, *, envelope: bytes | None = None, receipt: bytes | None = None,
+              key=None):
+    """A stored DONE result with NO marker -- what pre-upgrade uploaders left in the store."""
+    job, out = _make_done_job(tmp_path, store)
+    if envelope is not None:
+        (out / "metadata.json").write_bytes(envelope)
+    body = None
+    if key is not None:
+        body = attest.seal_receipt(out, key=key, observation=attest.RunObservation(
+            job_id=job.job_id, engine=job.engine, input_sha256="d" * 64,
+            worker_runtime="runsc", worker_tier=None, started_at_ms=1, finished_at_ms=2))
+    if receipt is not None:
+        (out / attest.RECEIPT_NAME).write_bytes(receipt)
+    (out / attest.WITHHELD_NAME).unlink(missing_ok=True)
+    _push_to_blob(tmp_path, job.job_id, out)
+    return job, body
+
+
+@pytest.mark.parametrize("envelope,reason", [
+    (json.dumps({"artifacts": [{"id": "a", "path": attest.RECEIPT_NAME}]}).encode(),
+     attest.RECEIPT_PATH_DECLARED_REASON),
+    (json.dumps({"artifacts": [{"id": "a", "path": "attestation.json/p.png"}]}).encode(),
+     attest.RECEIPT_PATH_DECLARED_REASON),
+    (b'{"artifacts": [{"id": "a", "pa', attest.RECEIPT_PATH_UNDECIDABLE_REASON),
+])
+def test_an_unmarked_legacy_result_whose_envelope_protects_the_receipt_name_is_404(
+        tmp_path, envelope, reason):
+    """Pre-#188 results (attestation.json never reserved) and as-is uploads by earlier builds
+    carry no marker. Their envelope still decides: a declared (or undecidable) artifact at
+    attestation.json is never served as the receipt."""
+    store = InMemoryJobStore()
+    job, _ = _unmarked(tmp_path, store, envelope=envelope, receipt=_FORGED_RECEIPT)
+    r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert reason in r.json()["detail"]
+
+
+def test_an_unmarked_legacy_result_over_this_ingress_cap_is_404(tmp_path, monkeypatch):
+    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 1024)
+    store = InMemoryJobStore()
+    job, _ = _unmarked(tmp_path, store, receipt=_FORGED_RECEIPT,
+                       envelope=json.dumps({"artifacts": [], "pad": "x" * 4096}).encode())
+    r = _route_with_limit(tmp_path, store, 1024).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert attest.RECEIPT_PATH_UNDECIDABLE_REASON in r.json()["detail"]
+
+
+def test_an_unmarked_legacy_result_with_a_genuine_receipt_still_serves(tmp_path, key):
+    store = InMemoryJobStore()
+    job, body = _unmarked(tmp_path, store, key=key)
+    r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 200, r.text
+    assert r.json() == body
+
+
+def test_a_fresh_result_over_this_ingress_cap_serves_via_the_cleared_marker(
+        tmp_path, key, monkeypatch):
+    """The fresh seal's cleared marker is the host vouching for its own envelope: an ingress
+    with a SMALLER ceiling than the signer's never re-judges it (deepseek D1 stays fixed)."""
+    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 1024)
+    store = InMemoryJobStore()
+    job, out = _make_done_job(tmp_path, store)
+    meta = json.loads((out / "metadata.json").read_bytes())
+    meta["pad"] = "x" * 4096
+    (out / "metadata.json").write_bytes(json.dumps(meta).encode())
+    assert attest.seal_fresh_receipt(out, key=key, job_id=job.job_id,
+                                     observation=attest.RunObservation(
+        job_id=job.job_id, engine=job.engine, input_sha256="d" * 64, worker_runtime="runsc",
+        worker_tier=None, started_at_ms=1, finished_at_ms=2))
+    _push_to_blob(tmp_path, job.job_id, out)
+    r = _route_with_limit(tmp_path, store, 1024).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 200, r.text
+    assert r.content == (out / attest.RECEIPT_NAME).read_bytes()
+
+
+@pytest.mark.parametrize("marker", [
+    attest.canonical(attest.tombstone_body("r" * 5000)),             # 5000+ bytes, tombstone
+    attest.canonical(attest.WITHHELD_CLEARED_BODY) + b" " * 5000,     # cleared, then padding
+    attest.canonical(attest.WITHHELD_CLEARED_BODY) + b" ",            # one byte past cleared
+])
+def test_an_oversize_or_padded_marker_withholds(tmp_path, key, marker):
+    """A marker is read under a small cap; anything over it (or a near-miss of the cleared
+    bytes) is withheld, never truncated into a verdict."""
+    client, store = _make_client(tmp_path)
+    job, out, _ = _done_with_receipt(tmp_path, store, key)
+    (out / attest.WITHHELD_NAME).write_bytes(marker)
+    _push_to_blob(tmp_path, job.job_id, out)
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+
+
+def test_the_migration_strip_branch_stores_the_cleared_marker(tmp_path):
+    """The migration ships a result whose envelope rules the names out WITHOUT a receipt; it
+    still vouches with the cleared marker, so the route never re-judges it."""
+    import logging
+
+    from blastbox.host.jobs.retention import migrate_legacy_results
+
+    store = InMemoryJobStore()
+    job_root = tmp_path / "jobs"
+    job = Job.new(engine="clippyshot", filename="a.docx")
+    job.status = JobStatus.DONE
+    store.create(job)
+    out = job_root / job.job_id / "output"
+    out.mkdir(parents=True)
+    (out / "metadata.json").write_text(json.dumps({"artifacts": []}))
+    (out / attest.RECEIPT_NAME).write_bytes(_FORGED_RECEIPT)
+    blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
+    assert migrate_legacy_results(job_root, blobs, store, logging.getLogger("t")) == (1, 0, 0)
+    with blobs.open_result_only(job.job_id, attest.WITHHELD_NAME) as fh:
+        assert attest.is_cleared_marker(fh.read())
+    r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404 and r.content != _FORGED_RECEIPT
+
+
+def test_the_sweep_receipt_branch_with_a_declared_marker_artifact_stays_retained(tmp_path, key):
+    """P2: a pre-upgrade retained tree carrying OUR receipt but DECLARING an artifact at the
+    marker's name: the cleared marker cannot be written without destroying it, so the tree is
+    not shipped (the accepted strand) and the artifact is intact."""
+    import logging
+
+    from blastbox.host.jobs.retention import retry_pending_uploads
+
+    store = InMemoryJobStore()
+    job_root, job, out, _ = _retained_tree_with_our_receipt(tmp_path, store, key)
+    (out / attest.WITHHELD_NAME).write_bytes(b"accepted")
+    (out / "metadata.json").write_text(json.dumps({"artifacts": [
+        {"id": "a", "path": attest.WITHHELD_NAME}]}))
+    blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
+    assert retry_pending_uploads(job_root, blobs, store, logging.getLogger("t"),
+                                 attest_key=key) == 0
+    assert not blobs.has_output(job.job_id)
+    assert (out / attest.WITHHELD_NAME).read_bytes() == b"accepted"

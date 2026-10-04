@@ -1277,6 +1277,10 @@ class TestLegacyMigration:
             tmp_path, blobs, store, logging.getLogger("t"))
         assert (migrated, failed) == (1, 0)
         assert blobs.has_output(_JID), "the legacy result is durable now"
+        # The migration wrote the cleared withheld marker into the tree (fresh mtime); age it
+        # again, as the next ticks past the scratch age would see it.
+        for pth in sorted(d.rglob("*"), reverse=True) + [d]:
+            os.utime(pth, (old, old))
 
         # After: it is redundant, so the sweep collects it — the disk finally comes back.
         assert reap_stale_scratch(tmp_path, 60.0, store, logging.getLogger("t"),
@@ -2069,7 +2073,8 @@ def test_the_fresh_seal_removes_a_deep_undeclared_receipt_path_dir(tmp_path):
     assert attest.seal_fresh_receipt(out, key=key, observation=None, job_id="j") is True
     assert (out / "attestation.json").is_file()
     assert json.loads((out / "attestation.json").read_bytes())["attestation"] is None
-    assert sorted(p.name for p in out.iterdir()) == ["attestation.json", "metadata.json"]
+    assert sorted(p.name for p in out.iterdir()) == [
+        "attestation.json", attest.WITHHELD_NAME, "metadata.json"]
 
 
 def test_a_deep_receipt_path_dir_in_a_retained_tree_is_sanitised_by_the_sweep(tmp_path):

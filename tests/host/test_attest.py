@@ -784,10 +784,10 @@ def test_the_withheld_marker_name_is_reserved(path):
 
 
 @pytest.mark.parametrize("kind", ["file", "dir"])
-def test_a_fresh_seal_strips_a_planted_withheld_marker(tmp_path, kind):
-    """A worker can write anything into its output tree. A planted marker could only cause a
-    404 (fail-closed), but it would withhold the genuine receipt this seal writes: the
-    gate-verified strip removes it with the planted receipt."""
+def test_a_fresh_seal_overwrites_a_planted_withheld_marker_with_the_cleared_body(tmp_path, kind):
+    """A worker can write anything into its output tree. A planted marker would withhold the
+    genuine receipt this seal writes: the gate-verified seal replaces it with the CLEARED body,
+    the host's own word that this result is not withheld."""
     out = tmp_path / "output"
     out.mkdir()
     (out / "metadata.json").write_text(json.dumps({"artifacts": []}))
@@ -798,8 +798,55 @@ def test_a_fresh_seal_strips_a_planted_withheld_marker(tmp_path, kind):
         (marker / "deep").mkdir(parents=True)
     key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
     assert attest.seal_fresh_receipt(out, key=key, observation=_obs(), job_id=_obs().job_id)
-    assert not os.path.lexists(marker)
+    assert not marker.is_symlink() and attest.is_cleared_marker(marker.read_bytes())
     assert not attest.is_tombstone((out / attest.RECEIPT_NAME).read_bytes())
+
+
+@pytest.mark.parametrize("seal", ["receipt", "no_key", "tombstone"])
+def test_every_receipt_or_tombstone_write_carries_the_cleared_marker(tmp_path, seal):
+    """Every upload that ships a receipt or a tombstone vouches for itself with the cleared
+    marker, so the route never re-judges a new result's envelope under its own ceiling."""
+    out = tmp_path / "output"
+    out.mkdir()
+    (out / "metadata.json").write_text(json.dumps({"artifacts": []}))
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    if seal == "receipt":
+        attest.seal_receipt(out, key=key, observation=_obs())
+    elif seal == "no_key":
+        assert attest.seal_fresh_receipt(out, key=None, observation=_obs(), job_id="j")
+    else:
+        attest.write_tombstone(out, "why")
+    assert attest.is_cleared_marker((out / attest.WITHHELD_NAME).read_bytes())
+    assert sorted(p.name for p in out.iterdir()) == sorted(
+        ["metadata.json", attest.RECEIPT_NAME, attest.WITHHELD_NAME])      # no tmp left
+
+
+def test_strip_receipt_never_destroys_a_declared_artifact_at_the_marker_name(tmp_path):
+    """P2: the envelope gate covers EVERY reserved name: a pre-upgrade tree declaring an
+    artifact at attestation.withheld.json keeps it, and the refusal names that path."""
+    out = tmp_path / "output"
+    out.mkdir()
+    (out / "metadata.json").write_text(json.dumps({"artifacts": [
+        {"id": "a", "path": attest.WITHHELD_NAME}]}))
+    (out / attest.WITHHELD_NAME).write_bytes(b"accepted")
+    for call in (lambda: attest.strip_receipt(out), lambda: attest.write_cleared_marker(out),
+                 lambda: attest.write_tombstone(out, "why")):
+        with pytest.raises(attest.ReceiptPathOccupied) as ei:
+            call()
+        assert attest.WITHHELD_NAME in str(ei.value)
+        assert (out / attest.WITHHELD_NAME).read_bytes() == b"accepted"
+
+
+def test_strip_receipt_names_the_occupied_receipt_path(tmp_path):
+    out = tmp_path / "output"
+    out.mkdir()
+    (out / "metadata.json").write_text(json.dumps({"artifacts": [
+        {"id": "a", "path": attest.RECEIPT_NAME}]}))
+    (out / attest.RECEIPT_NAME).write_bytes(b"accepted")
+    with pytest.raises(attest.ReceiptPathOccupied) as ei:
+        attest.strip_receipt(out)
+    assert attest.RECEIPT_NAME in str(ei.value)
+    assert attest.WITHHELD_NAME not in str(ei.value)
 
 
 def test_strip_receipt_removes_an_undeclared_withheld_marker(tmp_path):
