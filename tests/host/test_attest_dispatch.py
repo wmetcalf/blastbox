@@ -746,3 +746,65 @@ def test_when_neither_receipt_nor_tombstone_lands_the_tree_is_not_uploaded(
     assert not _receipt_path(tmp_path, job).exists()
     assert not (tmp_path / "blobs" / "results" / job.job_id / "metadata.json").exists()
     assert (tmp_path / "jobs" / job.job_id / PENDING_UPLOAD_SENTINEL).exists()
+
+
+def _marker_write_fails_once(monkeypatch):
+    """ENOSPC on the FIRST marker write only -- the one right after our receipt landed."""
+    real = attest._write_marker
+    calls = {"n": 0}
+
+    def flaky(out_dir, data):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(28, "No space left on device")
+        return real(out_dir, data)
+
+    monkeypatch.setattr(attest, "_write_marker", flaky)
+    return calls
+
+
+@pytest.mark.parametrize("tier", ["cold", "warm", "vm"])
+def test_a_marker_failure_after_the_receipt_landed_keeps_the_genuine_receipt(
+        tmp_path, key, monkeypatch, tier):
+    """seal_receipt wrote OUR receipt, then the cleared-marker write failed (ENOSPC once). The
+    fallback used to overwrite the genuine receipt with a "signing failed" tombstone and ship it:
+    the receipt was lost for a wrong reason. A marker-only failure must instead refuse the upload
+    (FAILED, retained), and the pending-upload sweep -- which recognises the receipt as ours and
+    writes its cleared marker -- ships the genuine receipt, which the route serves 200."""
+    import logging
+
+    from fastapi.testclient import TestClient
+
+    from blastbox.host.ingress.app import build_app
+    from blastbox.host.jobs.retention import PENDING_UPLOAD_SENTINEL, retry_pending_uploads
+
+    calls = _marker_write_fails_once(monkeypatch)
+    if tier == "cold":
+        store = InMemoryJobStore()
+        job = _queue(tmp_path, store)
+        d = _dispatcher(tmp_path, store, attest_key=key,
+                        runner=_runner(tmp_path, job, plant=_FORGED))
+        assert d.dispatch_once() is True
+    elif tier == "warm":
+        store, job = _warm_run_planted(tmp_path, key)
+    else:
+        store, job = _vm_run_planted(tmp_path, key)
+    assert calls["n"] >= 1
+    # Nothing uploaded at the seal: no tombstone in the store, the tree is retained.
+    assert not _receipt_path(tmp_path, job).exists()
+    assert store.get(job.job_id).status == JobStatus.FAILED
+    assert (tmp_path / "jobs" / job.job_id / PENDING_UPLOAD_SENTINEL).exists()
+    local = tmp_path / "jobs" / job.job_id / "output" / attest.RECEIPT_NAME
+    _verify(key, json.loads(local.read_bytes()))          # the genuine receipt, kept
+
+    assert retry_pending_uploads(tmp_path / "jobs", _blobs(tmp_path), store,
+                                 logging.getLogger("t"), attest_key=key) == 1
+    assert store.get(job.job_id).status == JobStatus.DONE
+    app = build_app(job_store=store, job_root=tmp_path / "jobs", allowed_engines={_ENGINE_NAME},
+                    limits=_limits(), api_workers=2, zip_password="", blob_store=_blobs(tmp_path))
+    r = TestClient(app).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 200, r.text
+    assert _verify(key, r.json())["job_id"] == job.job_id
+    meta = (tmp_path / "blobs" / "results" / job.job_id / "metadata.json").read_bytes()
+    marker = (tmp_path / "blobs" / "results" / job.job_id / attest.WITHHELD_NAME).read_bytes()
+    assert attest.is_cleared_marker(marker, hashlib.sha256(meta).hexdigest())

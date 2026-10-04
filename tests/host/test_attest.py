@@ -1094,3 +1094,51 @@ def test_write_withheld_marker_never_replaces_a_bound_body_the_envelope_declares
     with pytest.raises(attest.ReceiptPathOccupied):
         attest.write_withheld_marker(out, attest.RECEIPT_PATH_DECLARED_REASON)
     assert (out / attest.WITHHELD_NAME).read_bytes() == data
+
+
+def _sealable(tmp_path):
+    out = tmp_path / "output"
+    out.mkdir()
+    (out / "metadata.json").write_text(json.dumps({"artifacts": []}))
+    return out, attest.load_or_create_key(tmp_path / "k" / "attest.key")
+
+
+def test_a_marker_only_failure_keeps_the_receipt_and_refuses_the_upload(tmp_path, monkeypatch):
+    """Our receipt landed; only its marker failed. Not safe to upload (no marker), and the
+    genuine receipt must NOT be replaced by a "signing failed" tombstone."""
+    out, key = _sealable(tmp_path)
+    real = attest._write_marker
+    calls = {"n": 0}
+
+    def flaky(out_dir, data):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(28, "No space left on device")
+        return real(out_dir, data)
+
+    monkeypatch.setattr(attest, "_write_marker", flaky)
+    assert attest.seal_fresh_receipt(out, key=key, observation=_obs(),
+                                     job_id=_obs().job_id) is False
+    body = json.loads((out / attest.RECEIPT_NAME).read_bytes())
+    assert not attest.is_tombstone(attest.canonical(body))
+    assert attest.verify_body(key, body)
+    assert not (out / attest.WITHHELD_NAME).exists()
+    assert attest.tree_receipt_is_ours(out, key=key, job_id=_obs().job_id)
+
+
+def test_a_tombstone_fallback_whose_marker_fails_is_not_safe_to_upload(tmp_path, monkeypatch):
+    """The receipt write failed outright, so the fallback writes a tombstone -- whose marker then
+    fails too. Nothing at attestation.json may ship without its marker: False."""
+    out, key = _sealable(tmp_path)
+
+    def receipt_fails(*a, **kw):
+        raise OSError(5, "Input/output error")
+
+    def marker_fails(*a, **kw):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(attest, "seal_receipt", receipt_fails)
+    monkeypatch.setattr(attest, "_write_marker", marker_fails)
+    assert attest.seal_fresh_receipt(out, key=key, observation=_obs(),
+                                     job_id=_obs().job_id) is False
+    assert not (out / attest.WITHHELD_NAME).exists()

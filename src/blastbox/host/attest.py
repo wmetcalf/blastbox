@@ -629,8 +629,20 @@ def _write_atomic(out_dir: Path, data: bytes, *, gate_verified: bool = False,
     # earlier upload of the job stored, and recognisable as this host's own on a retry. strip_receipt above already
     # cleared (or refused for) everything at the reserved names. Every caller writes metadata.json
     # BEFORE this and never after (the dispatchers seal it first; the sweeps never rewrite it). A
-    # failure here raises, so the caller never ships a receipt without it.
-    _write_vouching_marker(out_dir, metadata_sha256)
+    # failure here raises ReceiptMarkerUnwritten, so the caller never ships a receipt without it
+    # -- and can tell that what it wrote at RECEIPT_NAME DID land.
+    try:
+        _write_vouching_marker(out_dir, metadata_sha256)
+    except Exception as exc:  # noqa: BLE001 - re-raised, typed
+        raise ReceiptMarkerUnwritten(
+            getattr(exc, "errno", None) or errno.EIO,
+            f"{RECEIPT_NAME} was written but its {WITHHELD_NAME} marker was not ({exc})") from exc
+
+
+class ReceiptMarkerUnwritten(OSError):
+    """What :func:`_write_atomic` wrote at RECEIPT_NAME LANDED, but the marker that must ship
+    beside it could not be written. The tree must not ship as it stands -- and the receipt must
+    not be replaced either: it is genuine, only its marker is missing."""
 
 
 def cleared_marker_body(metadata_sha256: str) -> dict:
@@ -924,7 +936,9 @@ def seal_fresh_receipt(out_dir: Path, *, key: AttestKey | None,
     ``gate_verified`` so neither depends on re-reading the envelope. Never raises.
 
     Returns whether the tree is SAFE TO UPLOAD: True once a receipt or tombstone is at
-    attestation.json. False when neither could be written (ENOSPC, EIO on the write...): a
+    attestation.json WITH its cleared marker. False when our receipt landed but its marker did
+    not (ReceiptMarkerUnwritten: the receipt is kept, never tombstoned over, and the sweep below
+    ships it with its marker), or when a tombstone's marker failed, or when neither could be written (ENOSPC, EIO on the write...): a
     worker-planted receipt may still be sitting there, and without a tombstone a superseded
     attempt's receipt in the store would not be overwritten either. The caller must then NOT
     upload and takes its ordinary upload-failure path -- FAILED, tree retained for the
@@ -935,11 +949,21 @@ def seal_fresh_receipt(out_dir: Path, *, key: AttestKey | None,
         seal_receipt(out_dir, key=key, observation=observation, reason=reason,
                      gate_verified=True)
         return True
+    except ReceiptMarkerUnwritten as exc:
+        # Ours landed at RECEIPT_NAME (a genuine receipt, or seal_receipt's own tombstone); only
+        # its marker is missing. A "signing failed" tombstone over it would destroy a genuine
+        # receipt for a wrong reason. Refuse the upload instead: the pending-upload sweep finds
+        # the receipt ours (tree_receipt_is_ours) and ships it with its cleared marker.
+        _log.error("attestation: wrote the receipt for job %s but not its %s marker (%s); NOT "
+                   "uploading -- the pending-upload sweep ships it with its marker",
+                   job_id, WITHHELD_NAME, exc)
+        return False
     except Exception as exc:  # noqa: BLE001 - a receipt problem must never fail a job by itself
         _log.error("attestation: could not write the receipt for job %s (%s); the job "
                    "completes without one", job_id, exc)
     try:
-        # Never ship a planted or half-written one, and overwrite a superseded attempt's.
+        # Never ship a planted or half-written one, and overwrite a superseded attempt's. A
+        # tombstone whose marker then fails raises ReceiptMarkerUnwritten here: not shipped.
         write_tombstone(out_dir, "signing failed", gate_verified=True)
         return True
     except Exception:  # noqa: BLE001
