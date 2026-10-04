@@ -458,6 +458,13 @@ class S3BlobStore:
                 else:
                     out += inflater.decompress(raw, max_bytes - len(out))
                     if inflater.eof:
+                        # Our encoder writes ONE gzip member. open_output's gzip.decompress
+                        # decodes every member, so bytes after the first would make this
+                        # prefix differ from what the object decodes to: malformed, refused.
+                        if inflater.unused_data or body.read(1):
+                            raise BlobFetchError(
+                                f"result fetch failed: {job_id}/{name}: data after its gzip "
+                                f"stream") from ValueError("data after the gzip stream")
                         break
                 if transferred > transfer_limit and len(out) < max_bytes:
                     # Caused, so callers never read it as a missing key (a causeless

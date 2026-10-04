@@ -1896,3 +1896,25 @@ def test_a_receipt_read_error_is_503(tmp_path):
     r = TestClient(app, raise_server_exceptions=False).get(
         f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 503, r.text
+
+
+def test_a_multi_member_gzip_marker_is_a_503_not_a_cleared_body(tmp_path, request, key):
+    """C3 (codex r134). gzip(cleared) + gzip(b"x") decodes to the exact cleared body if the
+    read stops at the first member, but to something else in full (open_output). The bounded
+    read refuses it as malformed, so the route answers 503 rather than judge a prefix."""
+    import gzip as _gzip
+
+    import boto3
+
+    blobs = _s3_store(tmp_path, request)
+    store = InMemoryJobStore()
+    job, out, _ = _done_with_receipt(tmp_path, store, key)
+    blobs.put_output(job.job_id, out)
+    boto3.client("s3", region_name="us-east-1").put_object(
+        Bucket="withheld", Key=f"results/{job.job_id}/{attest.WITHHELD_NAME}",
+        Body=_gzip.compress(_cleared_for(out)) + _gzip.compress(b"x"), ContentEncoding="gzip")
+    app = build_app(job_store=store, job_root=tmp_path / "jobs", allowed_engines={"clippyshot"},
+                    limits=Limits(max_metadata_bytes=1 << 20), api_workers=2, zip_password="",
+                    blob_store=blobs)
+    r = TestClient(app).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 503, r.text

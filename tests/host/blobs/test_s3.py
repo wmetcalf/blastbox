@@ -683,3 +683,26 @@ def test_read_result_prefix_accepts_a_complete_gzip_object_shorter_than_the_boun
         Bucket=BUCKET, Key="pfx/results/jc/metadata.json",
         Body=_gzip.compress(b'{"artifacts": []}'), ContentEncoding="gzip")
     assert store.read_result_prefix("jc", "metadata.json", 1024) == b'{"artifacts": []}'
+
+
+@pytest.mark.parametrize("split", [False, True], ids=["one-chunk", "member-at-chunk-edge"])
+def test_read_result_prefix_refuses_a_multi_member_gzip_object(store, monkeypatch, split):
+    """C3 (codex r134). open_output's gzip.decompress decodes EVERY member; the bounded read
+    stopped at the first, so gzip(a) + gzip(b) read as ``a`` here and ``ab`` there -- a stored
+    marker could look like the exact cleared body to the route only. Our encoder writes one
+    member, so anything after it is a malformed object: a caused read error, never a prefix."""
+    import gzip as _gzip
+
+    import blastbox.host.blobs.s3 as s3mod
+
+    first = _gzip.compress(b'{"cleared": true}')
+    body = first + _gzip.compress(b"x")
+    if split:       # the first member ends exactly at a body read: no unused_data left over
+        monkeypatch.setattr(s3mod, "_PREFIX_CHUNK", len(first))
+    boto3.client("s3", region_name="us-east-1").put_object(
+        Bucket=BUCKET, Key="pfx/results/jm/attestation.withheld.json", Body=body,
+        ContentEncoding="gzip")
+    assert store.open_output("jm", "attestation.withheld.json").read() == b'{"cleared": true}x'
+    with pytest.raises(BlobFetchError, match="after its gzip stream") as ei:
+        store.read_result_prefix("jm", "attestation.withheld.json", 1024)
+    assert ei.value.__cause__ is not None
