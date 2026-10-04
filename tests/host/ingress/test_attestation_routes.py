@@ -1001,3 +1001,161 @@ def test_local_delete_removes_everything_when_nothing_fails(tmp_path):
     job = _as_is_result(tmp_path, blobs, store)
     blobs.delete_job(job.job_id)
     assert not (tmp_path / "blobs" / "results" / job.job_id).exists()
+
+
+# ---------------------------------------------------------------------------
+# A stored withheld marker is OVERWRITTEN, never stranded (round-5 review L2)
+# ---------------------------------------------------------------------------
+
+
+def _retained_tree_with_our_receipt(tmp_path, store, key):
+    """A FAILED, retained tree whose receipt THIS host's key signed (the sweep ships it)."""
+    from blastbox.host.jobs.retention import PENDING_UPLOAD_SENTINEL, RESULT_RETAINED_MARKER
+
+    job_root = tmp_path / "jobs"
+    job = Job.new(engine="clippyshot", filename="a.docx")
+    job.status = JobStatus.FAILED
+    job.error = f"result upload failed after 3 attempts; {RESULT_RETAINED_MARKER}"
+    store.create(job)
+    out = job_root / job.job_id / "output"
+    out.mkdir(parents=True)
+    (out / "metadata.json").write_text(json.dumps({"artifacts": []}))
+    body = attest.seal_receipt(out, key=key, observation=attest.RunObservation(
+        job_id=job.job_id, engine="clippyshot", input_sha256="d" * 64, worker_runtime="runsc",
+        worker_tier=None, started_at_ms=1, finished_at_ms=2))
+    (job_root / job.job_id / PENDING_UPLOAD_SENTINEL).write_text("")
+    return job_root, job, out, body
+
+
+@pytest.mark.parametrize("backend", ["local", "s3"])
+def test_a_marker_an_earlier_as_is_upload_stored_never_hides_a_later_genuine_receipt(
+        tmp_path, request, backend):
+    """Reviewer's L2: an earlier sweep tick shipped the tree as-is and its marker landed in the
+    store (the store never deletes a single object); a later tick, now able to rule the envelope
+    out, ships it WITH this host's receipt. Stripping the marker locally left the stored one in
+    place and the route 404'd the genuine receipt forever: the later upload must OVERWRITE it."""
+    import logging
+
+    from blastbox.host.jobs.retention import retry_pending_uploads
+
+    blobs = (LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+             if backend == "local" else _s3_store(tmp_path, request))
+    store = InMemoryJobStore()
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    job_root, job, out, body = _retained_tree_with_our_receipt(tmp_path, store, key)
+    earlier = tmp_path / "earlier"
+    earlier.mkdir()
+    (earlier / attest.WITHHELD_NAME).write_bytes(
+        attest.canonical(attest.tombstone_body(attest.RECEIPT_PATH_UNDECIDABLE_REASON)))
+    blobs.put_output(job.job_id, earlier)                 # tick 1's partial as-is upload
+    assert retry_pending_uploads(job_root, blobs, store, logging.getLogger("t"),
+                                 attest_key=key) == 1
+    client = _client_on(tmp_path, store, blobs)
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 200, r.text
+    assert r.json() == body
+
+
+def _stored_result(tmp_path, store, files: dict[str, bytes]):
+    job, out = _make_done_job(tmp_path, store)
+    for name, data in files.items():
+        (out / name).write_bytes(data)
+    _push_to_blob(tmp_path, job.job_id, out)
+    return job, out
+
+
+def test_a_cleared_marker_serves_the_receipt(tmp_path, key):
+    client, store = _make_client(tmp_path)
+    job, out, body = _done_with_receipt(tmp_path, store, key)
+    (out / attest.WITHHELD_NAME).write_bytes(attest.canonical(attest.WITHHELD_CLEARED_BODY))
+    _push_to_blob(tmp_path, job.job_id, out)
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 200, r.text
+    assert r.json() == body
+
+
+def test_a_cleared_marker_still_answers_the_tombstone_404(tmp_path):
+    client, store = _make_client(tmp_path)
+    job, _ = _stored_result(tmp_path, store, {
+        attest.WITHHELD_NAME: attest.canonical(attest.WITHHELD_CLEARED_BODY),
+        attest.RECEIPT_NAME: attest.canonical(attest.tombstone_body("no attestation key"))})
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404
+    assert "no attestation key" in r.json()["detail"]
+
+
+@pytest.mark.parametrize("marker", [
+    b"",
+    b"not json at all",
+    b'{"attestation": "not-withheld", "wit',
+    b'{"attestation": "not-withheld", "withheld": 0}',
+    b'{"attestation": "not-withheld", "withheld": false, "x": 1}',
+    b'{"attestation": "not-withheld"}',
+    b'{"withheld": false}',
+    b'["attestation", "not-withheld"]',
+    b'{"attestation": null, "reason": "not-withheld"}',
+])
+def test_any_marker_but_the_cleared_body_withholds(tmp_path, marker):
+    """Only the ONE canonical cleared body unmasks; anything else stored at the marker's name
+    -- unparseable, a tombstone, a near-miss -- answers the no-receipt 404."""
+    client, store = _make_client(tmp_path)
+    job, _ = _stored_result(tmp_path, store, {attest.WITHHELD_NAME: marker,
+                                              attest.RECEIPT_NAME: _FORGED_RECEIPT})
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert r.content != _FORGED_RECEIPT
+
+
+def _legacy_with_declared_marker_lookalike(out):
+    """A tree accepted before the marker's name was reserved, DECLARING an artifact there whose
+    (untrusted) bytes equal the cleared body, beside a worker-written attestation.json."""
+    lookalike = attest.canonical(attest.WITHHELD_CLEARED_BODY)
+    (out / attest.WITHHELD_NAME).write_bytes(lookalike)
+    (out / attest.RECEIPT_NAME).write_bytes(_FORGED_RECEIPT)
+    (out / "metadata.json").write_text(json.dumps({"artifacts": [
+        {"id": "a", "path": attest.WITHHELD_NAME,
+         "sha256": hashlib.sha256(lookalike).hexdigest()}]}))
+
+
+def test_a_declared_cleared_body_lookalike_is_never_shipped_as_is_by_the_migration(tmp_path):
+    import logging
+
+    from blastbox.host.jobs.retention import migrate_legacy_results
+
+    client, store = _make_client(tmp_path)
+    job_root = tmp_path / "jobs"
+    job = Job.new(engine="clippyshot", filename="a.docx")
+    job.status = JobStatus.DONE
+    store.create(job)
+    out = job_root / job.job_id / "output"
+    out.mkdir(parents=True)
+    _legacy_with_declared_marker_lookalike(out)
+    blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
+    assert migrate_legacy_results(job_root, blobs, store, logging.getLogger("t")) == (0, 0, 1)
+    assert not blobs.has_output(job.job_id)
+    assert (out / attest.WITHHELD_NAME).read_bytes() == attest.canonical(
+        attest.WITHHELD_CLEARED_BODY)                                  # nothing destroyed
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404 and r.content != _FORGED_RECEIPT
+
+
+def test_a_declared_cleared_body_lookalike_is_never_shipped_as_is_by_the_sweep(tmp_path):
+    import logging
+
+    from blastbox.host.jobs.retention import PENDING_UPLOAD_SENTINEL, retry_pending_uploads
+
+    store = InMemoryJobStore()
+    job_root = tmp_path / "jobs"
+    job = Job.new(engine="clippyshot", filename="a.docx")
+    job.status = JobStatus.FAILED
+    store.create(job)
+    out = job_root / job.job_id / "output"
+    out.mkdir(parents=True)
+    _legacy_with_declared_marker_lookalike(out)
+    (job_root / job.job_id / PENDING_UPLOAD_SENTINEL).write_text("")
+    blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    assert retry_pending_uploads(job_root, blobs, store, logging.getLogger("t"),
+                                 attest_key=key) == 0
+    assert not blobs.has_output(job.job_id)
+    assert store.get(job.job_id).status is JobStatus.FAILED            # left retained

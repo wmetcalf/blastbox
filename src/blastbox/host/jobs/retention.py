@@ -534,23 +534,34 @@ def _retry_pending_one(
         # (an ingress with a larger limit would parse the envelope, see nothing declared and
         # serve a planted attestation.json). No marker, no as-is upload: it stays retained.
         # A transient envelope read error is no verdict: it raises below.
-        try:
-            from blastbox.host import attest as _attest
+        from blastbox.host import attest as _attest
 
+        try:
             as_is = _attest.tree_receipt_path_protection(out_dir)
             if as_is is not None:
                 _attest.write_withheld_marker(out_dir, as_is)
                 log.warning("pending-upload sweep: %s: %s; uploading it as-is, with no "
                             "receipt", d.name, as_is)
             elif _attest.tree_receipt_is_ours(out_dir, key=attest_key, job_id=d.name):
-                # Ours ships; a planted withheld marker must not hide it.
-                _attest.strip_withheld_marker(out_dir)
+                # Ours ships, with the CLEARED marker written over whatever is at the marker's
+                # name. An overwrite, not a strip: an earlier tick may already have stored a
+                # marker for this job (an as-is upload under a lower limit, interrupted before
+                # its envelope landed), and the store never deletes a single object -- a local
+                # strip left that marker withholding this genuine receipt forever. Any stored
+                # attestation.json it could unmask came from this same tree, untouched since.
+                _attest.write_cleared_marker(out_dir)
             else:
                 _attest.write_tombstone(out_dir, "retained result re-uploaded without a "
                                                  "receipt from this host")
         except OSError as exc:
-            log.warning("pending-upload sweep: %s: cannot sanitise its receipt (%s); "
-                        "leaving it retained", d.name, exc)
+            if isinstance(exc, _attest.ReceiptPathOccupied):
+                # The accepted strand (write_withheld_marker): an old tree that may declare an
+                # artifact at the marker's name. Never shipped in the marker's place.
+                log.error("pending-upload sweep: job %s: %s; NOT uploading it, leaving it "
+                          "retained", d.name, exc)
+            else:
+                log.warning("pending-upload sweep: %s: cannot sanitise its receipt (%s); "
+                            "leaving it retained", d.name, exc)
             return 0
     upload_exc = None if durable else upload_output_with_retry(
         blob_store, d.name, out_dir, attempts=attempts)
@@ -770,9 +781,9 @@ def _migrate_legacy_one(
     # reserved) or cannot be parsed to rule that out: then it may be accepted output, uploaded
     # as-is WITH the withheld marker, so the route never re-derives this run's verdict under
     # its own ceiling. No marker, no upload.
-    try:
-        from blastbox.host import attest as _attest
+    from blastbox.host import attest as _attest
 
+    try:
         if limits is None and _attest.ENVELOPE_MAX_BYTES < os.stat(
                 out_dir / "metadata.json", follow_symlinks=False).st_size:
             # Unknown service limit: only the floor is common to every ceiling, and this run's
@@ -790,8 +801,14 @@ def _migrate_legacy_one(
             log.warning("legacy migration: %s: %s; uploading it as-is, with no receipt",
                         d.name, as_is)
     except OSError as exc:
-        log.warning("legacy migration: %s: could not remove a worker-written receipt (%s); "
-                    "leaving it in place", d.name, exc)
+        if isinstance(exc, _attest.ReceiptPathOccupied):
+            # The accepted strand (write_withheld_marker): it may declare an artifact at the
+            # marker's name, whose bytes must never stand in for the marker.
+            log.error("legacy migration: job %s: %s; NOT uploading it, leaving it in place",
+                      d.name, exc)
+        else:
+            log.warning("legacy migration: %s: could not remove a worker-written receipt "
+                        "(%s); leaving it in place", d.name, exc)
         return "failed"
     up_exc = upload_output_with_retry(blob_store, d.name, out_dir, attempts=2)
     if up_exc is None:

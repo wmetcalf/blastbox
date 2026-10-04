@@ -2185,11 +2185,11 @@ def test_the_migration_never_ships_as_is_without_the_withheld_marker(tmp_path, m
     assert blobs.put_calls == 0
 
 
-def test_the_sweep_strips_a_planted_withheld_marker_beside_its_own_receipt(tmp_path):
+def test_the_sweep_clears_a_planted_withheld_marker_beside_its_own_receipt(tmp_path):
     """A retained tree whose receipt THIS host signed ships with it; a planted marker would
-    withhold that genuine receipt at the route, so it is removed before the upload."""
+    withhold that genuine receipt at the route, so it is OVERWRITTEN with the cleared body
+    before the upload -- which also overwrites a marker an earlier as-is upload stored."""
     from blastbox.host import attest
-    from blastbox.host.blobs.base import BlobFetchError
     from blastbox.host.blobs.local import LocalBlobStore
 
     job_root = tmp_path / "jobs"
@@ -2206,7 +2206,7 @@ def test_the_sweep_strips_a_planted_withheld_marker_beside_its_own_receipt(tmp_p
     blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
     assert retry_pending_uploads(job_root, blobs, store, logging.getLogger("t"),
                                  attest_key=key) == 1
-    with pytest.raises(BlobFetchError):
-        blobs.open_result_only(_JID, attest.WITHHELD_NAME)
+    with blobs.open_result_only(_JID, attest.WITHHELD_NAME) as fh:
+        assert attest.is_cleared_marker(fh.read())
     with blobs.open_result_only(_JID, attest.RECEIPT_NAME) as fh:
         assert json.loads(fh.read()) == body

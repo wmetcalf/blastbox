@@ -79,11 +79,21 @@ HOST_ID_ENV = "BLASTBOX_HOST_ID"
 #: The receipt's name in the sealed output tree and in the blob store's results prefix.
 RECEIPT_NAME = "attestation.json"
 #: The uploader's durable "no receipt" verdict for a tree it shipped AS-IS (its envelope declares,
-#: or cannot rule out, an artifact at the receipt name -- see :func:`write_withheld_marker`). Its
-#: mere presence in a stored result makes the attestation route answer the no-receipt 404 before
-#: it reads anything at RECEIPT_NAME, so a ceiling mismatch between uploader and route can never
-#: turn the uploader's "cannot rule out" into the route's "nothing declared, serve it".
+#: or cannot rule out, an artifact at the receipt name -- see :func:`write_withheld_marker`). Stored
+#: with any content but the cleared body (:data:`WITHHELD_CLEARED_BODY`), it makes the attestation
+#: route answer the no-receipt 404 before it reads anything at RECEIPT_NAME, so a ceiling mismatch
+#: between uploader and route can never turn the uploader's "cannot rule out" into the route's
+#: "nothing declared, serve it".
 WITHHELD_NAME = "attestation.withheld.json"
+#: The ONE body at WITHHELD_NAME that means "NOT withheld", in its canonical bytes (see
+#: :func:`is_cleared_marker`). The store never deletes a single object, so an upload that ships a
+#: receipt for a tree whose results prefix may already hold a marker -- an earlier as-is upload of
+#: the same job -- OVERWRITES it with this body (:func:`write_cleared_marker`) rather than
+#: stripping it locally, which would leave the stored marker hiding the receipt forever. A fresh
+#: dispatcher seal still just strips a planted marker: only the retention sweeps ever store one,
+#: for a FAILED (pending-upload) or DONE (legacy) row, and neither is ever dispatched again, so a
+#: fresh upload never lands on a marked prefix.
+WITHHELD_CLEARED_BODY: dict = {"attestation": "not-withheld", "withheld": False}
 #: Every name the dispatchers own in a sealed tree; the trust gate refuses an artifact at or
 #: under any of them.
 RESERVED_NAMES = (RECEIPT_NAME, WITHHELD_NAME)
@@ -585,15 +595,41 @@ def _write_atomic(out_dir: Path, data: bytes, *, gate_verified: bool = False) ->
         tmp.unlink(missing_ok=True)
 
 
-def strip_withheld_marker(out_dir: Path, *, limits: Limits | None = None) -> None:
-    """Remove a planted withheld marker (only that name) from a tree that is about to ship WITH
-    its receipt, e.g. a retained tree whose receipt this host signed. Refuses exactly as
-    :func:`strip_receipt` does when the envelope protects the reserved names."""
-    strip_receipt(out_dir, limits=limits, names=(WITHHELD_NAME,))
+def is_cleared_marker(data: bytes) -> bool:
+    """Whether bytes stored at WITHHELD_NAME are EXACTLY the canonical cleared body -- the only
+    marker content that does not withhold. Byte equality, not a parse: anything else (a tombstone,
+    unparseable bytes, a near-miss such as ``"withheld": 0``) withholds."""
+    return data == canonical(WITHHELD_CLEARED_BODY)
 
 
-#: The reason a withheld marker that is not tombstone-shaped (a declared artifact of an old tree
-#: sitting at the marker's name) is reported with.
+def write_cleared_marker(out_dir: Path, *, limits: Limits | None = None) -> None:
+    """Put the canonical CLEARED body at WITHHELD_NAME in a tree that is about to ship WITH its
+    receipt, replacing whatever the worker left there. An overwrite, not a strip: the store never
+    deletes a single object, so a marker an earlier as-is upload of this job stored would
+    otherwise survive the upload and withhold the receipt forever.
+
+    Refuses exactly as :func:`strip_receipt` does -- ReceiptPathOccupied when the envelope
+    declares (or cannot rule out) an artifact at a reserved name, ReceiptUnreadable when it
+    cannot be read right now -- writing nothing. Raises OSError when the marker cannot be
+    written; the caller must then NOT upload (a stored marker would hide the receipt)."""
+    out_dir = Path(out_dir)
+    try:
+        why = tree_receipt_path_protection(out_dir, limits=limits)
+    except OSError as exc:
+        raise ReceiptUnreadable(
+            exc.errno, f"cannot read the envelope to rule out a declared artifact at "
+                       f"{WITHHELD_NAME} ({exc}); leaving it in place") from exc
+    if why is not None:
+        raise ReceiptPathOccupied(
+            errno.EEXIST, f"{WITHHELD_NAME} may hold a declared artifact; refusing to "
+                          f"replace it ({why})")
+    # The verdict is taken above: nothing there is accepted output.
+    strip_receipt(out_dir, gate_verified=True, names=(WITHHELD_NAME,))
+    _write_marker(out_dir, canonical(WITHHELD_CLEARED_BODY))
+
+
+#: The reason a withheld marker that is not tombstone-shaped (unparseable, or anything else but
+#: the cleared body) is reported with.
 RECEIPT_WITHHELD_REASON = "the uploader withheld the receipt for this result"
 
 
@@ -601,8 +637,9 @@ def write_withheld_marker(out_dir: Path, reason: str, *, limits: Limits | None =
     """Record, IN the tree, that it is shipped as-is with no receipt: a tombstone-shaped
     ``{"attestation": null, "reason": reason}`` at WITHHELD_NAME. Call it immediately before
     uploading a tree the receipt-path test protects (``reason`` = its verdict); the attestation
-    route answers the no-receipt 404 whenever the stored result holds that name, BEFORE it reads
-    the receipt name, so the uploader's verdict is never re-derived under another ceiling.
+    route answers the no-receipt 404 whenever the stored result holds that name with anything
+    but the cleared body (:func:`is_cleared_marker`), BEFORE it reads the receipt name, so the
+    uploader's verdict is never re-derived under another ceiling.
 
     Nothing at RECEIPT_NAME is touched. Raises OSError -- never ships without it -- when the
     marker cannot be written; the caller must then NOT upload as-is (leave the tree retained /
@@ -613,11 +650,12 @@ def write_withheld_marker(out_dir: Path, reason: str, *, limits: Limits | None =
 
     * the envelope rules out that it is accepted output (parseable, nothing declared at or under
       the name): worker junk -- replaced by the marker;
-    * otherwise it may be a declared artifact and is never destroyed. A REGULAR file there is
-      left in place: put_output ships it at the marker's key, and its mere presence makes the
-      route answer the 404 -- the fail-closed outcome, whatever its bytes. Anything else (a
-      directory, symlink, FIFO) would not be stored at that key, so it cannot stand in for the
-      marker: ReceiptPathOccupied, and the tree is not shipped as-is.
+    * otherwise it may be a declared artifact: ReceiptPathOccupied, nothing destroyed, and the
+      tree is NOT shipped as-is. Its bytes are the worker's: shipped at the marker's key they
+      could be exactly the cleared body and unmask the worker-written attestation.json beside
+      it, and a non-regular entry would not be stored there at all. ACCEPTED STRAND: such a
+      tree (an envelope declaring, or unparseable beside, a file at a name reserved since
+      before it was accepted) stays retained / counted failed, and the callers log it loudly.
 
     A transient envelope read error propagates (no verdict; retry)."""
     out_dir = Path(out_dir)
@@ -630,20 +668,23 @@ def write_withheld_marker(out_dir: Path, reason: str, *, limits: Limits | None =
         shipped, data = _shipped_envelope(out_dir, limits)
         paths = (None if data is None else _artifact_paths_of(data)) if shipped else []
         if paths is None or any(is_reserved_path(p, (WITHHELD_NAME,)) for p in paths):
-            if stat.S_ISREG(st.st_mode):
-                return              # possibly accepted output; its presence withholds
             raise ReceiptPathOccupied(
-                errno.EEXIST, f"{WITHHELD_NAME} may hold a declared artifact that is not a "
-                              f"regular file; refusing to replace it or ship without it")
+                errno.EEXIST, f"{WITHHELD_NAME} may hold a declared artifact; refusing to "
+                              f"replace it or ship without it")
         _remove_entry(target, st)
+    _write_marker(out_dir, canonical(tombstone_body(reason)))
+
+
+def _write_marker(out_dir: Path, data: bytes) -> None:
+    """Atomically put ``data`` at WITHHELD_NAME (nothing may be there but a regular file)."""
     tmp = out_dir / f".{WITHHELD_NAME}.{uuid.uuid4().hex}.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
     try:
         with os.fdopen(fd, "wb") as fh:
-            fh.write(canonical(tombstone_body(reason)))
+            fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, target)
+        os.replace(tmp, out_dir / WITHHELD_NAME)
     finally:
         tmp.unlink(missing_ok=True)
 

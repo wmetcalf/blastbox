@@ -1069,8 +1069,10 @@ def build_app(
         opener = getattr(_blob_store, "open_result_only", None) or _blob_store.open_output
         # THE UPLOADER'S VERDICT, never re-derived here. A tree the retention sweeps shipped
         # AS-IS (its envelope declared, or under THAT process's ceiling could not rule out, an
-        # artifact at attestation.json) carries the withheld marker, and its presence alone
-        # decides. The route reads no envelope and applies no ceiling of its own: judging the
+        # artifact at attestation.json) carries the withheld marker, and it alone decides: any
+        # content but the ONE canonical cleared body (written by an upload that ships a receipt
+        # over a prefix an earlier as-is upload may have marked -- the store never deletes a
+        # single object) withholds, unparseable bytes included. The route reads no envelope and applies no ceiling of its own: judging the
         # envelope under this app's limit is how a larger ingress limit served a planted
         # attestation.json 200 that the uploader had shipped as undecidable, and how a smaller
         # one 404'd a genuine receipt a peer had signed over a larger envelope. A marker that
@@ -1084,7 +1086,7 @@ def build_app(
                              job_id, exc)
                 raise HTTPException(503, "could not read the execution receipt")
             withheld = None
-        if withheld is not None:
+        if withheld is not None and not _attest.is_cleared_marker(withheld):
             why = _attest.RECEIPT_WITHHELD_REASON
             if _attest.is_tombstone(withheld):
                 with contextlib.suppress(Exception):

@@ -850,14 +850,56 @@ def test_write_withheld_marker_replaces_undeclared_junk(tmp_path, kind):
 
 @pytest.mark.parametrize("envelope", [
     _GARBAGE, json.dumps({"artifacts": [{"id": "a", "path": "attestation.withheld.json"}]})])
-def test_write_withheld_marker_never_destroys_a_possibly_declared_regular_file(
-        tmp_path, envelope):
+@pytest.mark.parametrize("data", [b"an accepted artifact",
+                                  b'{"attestation":"not-withheld","withheld":false}'])
+def test_write_withheld_marker_refuses_a_possibly_declared_regular_file(tmp_path, envelope, data):
     """An old tree may DECLARE an artifact at the marker's name (or its envelope cannot rule it
-    out). Never destroyed: a regular file there ships at the marker's key, and its presence
-    alone makes the route withhold -- the fail-closed outcome."""
+    out). Never destroyed -- and never shipped in the marker's place either: its bytes are the
+    worker's and could be exactly the CLEARED body, which would unmask the worker-written
+    attestation.json beside it. Refuse, so the tree is not shipped as-is (an accepted strand)."""
+    out = _withheld_tree(tmp_path, envelope)
+    (out / attest.WITHHELD_NAME).write_bytes(data)
+    with pytest.raises(attest.ReceiptPathOccupied):
+        attest.write_withheld_marker(out, "why")
+    assert (out / attest.WITHHELD_NAME).read_bytes() == data
+
+
+def test_the_cleared_marker_is_exactly_one_canonical_body():
+    cleared = attest.canonical(attest.WITHHELD_CLEARED_BODY)
+    assert attest.is_cleared_marker(cleared)
+    assert not attest.is_tombstone(cleared)
+    for other in (cleared + b" ", cleared[:-1], b" " + cleared,
+                  json.dumps(attest.WITHHELD_CLEARED_BODY, indent=1).encode(),
+                  b'{"attestation":"not-withheld","withheld":0}',
+                  attest.canonical(attest.tombstone_body("x")), b"", b"garbage"):
+        assert not attest.is_cleared_marker(other), other
+
+
+@pytest.mark.parametrize("kind", ["none", "file", "dir", "symlink"])
+def test_write_cleared_marker_overwrites_whatever_is_undeclared_there(tmp_path, kind):
+    out = _withheld_tree(tmp_path, json.dumps({"artifacts": []}))
+    marker = out / attest.WITHHELD_NAME
+    if kind == "file":
+        marker.write_bytes(attest.canonical(attest.tombstone_body("planted")))
+    elif kind == "dir":
+        (marker / "x").mkdir(parents=True)
+    elif kind == "symlink":
+        marker.symlink_to(tmp_path / "elsewhere")
+    attest.write_cleared_marker(out)
+    assert not marker.is_symlink()
+    assert attest.is_cleared_marker(marker.read_bytes())
+    assert (out / attest.RECEIPT_NAME).read_bytes() == b"maybe an artifact"
+    assert sorted(p.name for p in out.iterdir()) == sorted(
+        ["metadata.json", attest.RECEIPT_NAME, attest.WITHHELD_NAME])      # no tmp left
+
+
+@pytest.mark.parametrize("envelope", [
+    _GARBAGE, json.dumps({"artifacts": [{"id": "a", "path": "attestation.withheld.json"}]})])
+def test_write_cleared_marker_never_destroys_a_possibly_declared_artifact(tmp_path, envelope):
     out = _withheld_tree(tmp_path, envelope)
     (out / attest.WITHHELD_NAME).write_bytes(b"an accepted artifact")
-    attest.write_withheld_marker(out, "why")
+    with pytest.raises(attest.ReceiptPathOccupied):
+        attest.write_cleared_marker(out)
     assert (out / attest.WITHHELD_NAME).read_bytes() == b"an accepted artifact"
 
 
