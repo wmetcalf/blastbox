@@ -2540,3 +2540,118 @@ def test_an_as_is_reupload_never_serves_the_worker_receipt_between_tiers(
     probe()
     assert seen
     assert not [s for s in seen if s[0] == 200 or b"forged" in s[1]], seen
+
+
+# ---------------------------------------------------------------------------
+# codex r140: the route's separate reads never pair the OLD cleared marker and envelope with a
+# receipt an as-is re-upload landed between them (read sandwich on the marker)
+# ---------------------------------------------------------------------------
+
+def _cleared_prefix_and_as_is_tree(tmp_path, request, backend):
+    """A DONE job whose prefix holds a clean envelope M0 + CLEARED marker bound to M0 + a tombstone
+    receipt, and a worker tree ready to be re-uploaded as-is over it (withheld marker, worker
+    attestation.json, an envelope declaring it)."""
+    store = InMemoryJobStore()
+    job = Job.new(engine="clippyshot", filename="x")
+    job.status = JobStatus.DONE
+    store.create(job)
+    blobs = (_s3_store(tmp_path, request) if backend == "s3"
+             else LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs"))
+    old = tmp_path / "old"
+    old.mkdir()
+    (old / "metadata.json").write_bytes(b'{"artifacts":[]}')
+    attest.write_tombstone(old, attest.NO_ATTEST_KEY_REASON)
+    blobs.put_output(job.job_id, old)
+    assert attest.bound_cleared_marker_sha256(blobs.read_result_prefix(
+        job.job_id, attest.WITHHELD_NAME, 4096)) is not None
+    new = tmp_path / "new"
+    new.mkdir()
+    (new / "metadata.json").write_bytes(b'{"artifacts":[{"path":"attestation.json"}]}')
+    (new / attest.RECEIPT_NAME).write_bytes(_FORGED_RECEIPT)
+    (new / attest.WITHHELD_NAME).write_bytes(attest.canonical(
+        attest.tombstone_body(attest.RECEIPT_PATH_DECLARED_REASON)))
+    return store, blobs, job, new
+
+
+@pytest.mark.parametrize("backend", ["local", "s3"])
+def test_an_as_is_reupload_between_the_marker_and_receipt_reads_never_serves_forged_bytes(
+        tmp_path, request, backend):
+    """codex r140: the route reads the CLEARED marker bound to M0, then M0, then -- after an as-is
+    re-upload landed its withheld marker and the worker's attestation.json -- the receipt. The
+    marker re-read after the receipt observes the change: 503 (retry), never the worker's bytes."""
+    store, blobs, job, new = _cleared_prefix_and_as_is_tree(tmp_path, request, backend)
+    real = blobs.read_result_prefix
+    raced = []
+
+    def read(job_id, name, max_bytes):
+        if name == attest.RECEIPT_NAME and not raced:
+            raced.append(name)
+            blobs.put_output(job_id, new)       # the whole as-is re-upload lands here
+        return real(job_id, name, max_bytes)
+    blobs.read_result_prefix = read
+    r = _client_on(tmp_path, store, blobs).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert raced
+    assert b"forged" not in r.content, r.content
+    assert r.status_code == 503, r.text
+    assert "changed while" in r.json()["detail"]
+
+
+@pytest.mark.parametrize("backend", ["local", "s3"])
+def test_the_marker_re_read_passes_when_nothing_changed(tmp_path, request, backend, key):
+    """The control: no concurrent upload -- the marker read twice is byte-identical, 200 genuine."""
+    store = InMemoryJobStore()
+    job = Job.new(engine="clippyshot", filename="x")
+    job.status = JobStatus.DONE
+    store.create(job)
+    blobs = (_s3_store(tmp_path, request) if backend == "s3"
+             else LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs"))
+    out = tmp_path / "genuine"
+    out.mkdir()
+    (out / "metadata.json").write_bytes(b'{"artifacts":[]}')
+    body = attest.seal_receipt(out, key=key, observation=attest.RunObservation(
+        job_id=job.job_id, engine="clippyshot", input_sha256="d" * 64, worker_runtime="runsc",
+        worker_tier=None, started_at_ms=1, finished_at_ms=2))
+    blobs.put_output(job.job_id, out)
+    real = blobs.read_result_prefix
+    names = []
+
+    def read(job_id, name, max_bytes):
+        names.append(name)
+        return real(job_id, name, max_bytes)
+    blobs.read_result_prefix = read
+    r = _client_on(tmp_path, store, blobs).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 200, r.text
+    assert r.json() == body
+    assert names == [attest.WITHHELD_NAME, "metadata.json", attest.RECEIPT_NAME,
+                     attest.WITHHELD_NAME]
+
+
+@pytest.mark.parametrize("gone", ["missing", "error"])
+def test_a_marker_that_vanishes_or_fails_on_the_re_read_is_503(tmp_path, request, key, gone):
+    store = InMemoryJobStore()
+    job = Job.new(engine="clippyshot", filename="x")
+    job.status = JobStatus.DONE
+    store.create(job)
+    blobs = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    out = tmp_path / "genuine"
+    out.mkdir()
+    (out / "metadata.json").write_bytes(b'{"artifacts":[]}')
+    attest.seal_receipt(out, key=key, observation=attest.RunObservation(
+        job_id=job.job_id, engine="clippyshot", input_sha256="d" * 64, worker_runtime="runsc",
+        worker_tier=None, started_at_ms=1, finished_at_ms=2))
+    blobs.put_output(job.job_id, out)
+    real = blobs.read_result_prefix
+    count = []
+
+    def read(job_id, name, max_bytes):
+        if name == attest.WITHHELD_NAME:
+            count.append(1)
+            if len(count) == 2:
+                if gone == "missing":
+                    raise FileNotFoundError(name)
+                raise OSError("store down")
+        return real(job_id, name, max_bytes)
+    blobs.read_result_prefix = read
+    r = _client_on(tmp_path, store, blobs).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert len(count) == 2
+    assert r.status_code == 503, r.text

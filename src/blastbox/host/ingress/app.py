@@ -1033,7 +1033,7 @@ def build_app(
         """The execution receipt the dispatcher that ran this job signed when it sealed the DONE
         result -- served byte-for-byte, never synthesized. 404 unknown job or no receipt (no key
         on that dispatcher, a failed job, a pre-receipt result); 409 queued/running; 410 expired;
-        503 when the blob store cannot be read."""
+        503 when the blob store cannot be read or the result changed while being read."""
         _validate_job_id(job_id)
         job = _job_store.get(job_id)
         if job is None:
@@ -1153,6 +1153,26 @@ def build_app(
                 if stated in _attest.TOMBSTONE_REASONS:
                     why = stated
             raise HTTPException(404, f"no execution receipt for this job: {why}")
+        # THE READ SANDWICH (codex r140). The marker, the envelope and the receipt are three
+        # separate reads, so a re-upload of this prefix can land between them: the request read
+        # the old CLEARED marker bound to M0 and M0 itself, then an as-is re-upload stored its
+        # WITHHELD marker and the worker's attestation.json, and the read above returned the
+        # worker's bytes. put_output always stores a withholding marker BEFORE the receipt it
+        # withholds, so any receipt read that observed replaced bytes is followed by a marker
+        # read that observes the replaced marker. Re-read it under the same bound and serve only
+        # if it is byte-identical to the first read; changed, gone or unreadable: 503, retry
+        # (deny-only: the deny paths above never need it). The envelope is not re-read: the
+        # first marker was checked BOUND to the envelope we read, and an upload that replaces
+        # the envelope replaces the marker first (metadata.json is stored LAST), so an unchanged
+        # marker means no upload since the first read has reached either object.
+        try:
+            again = _read_result_prefix(_blob_store, job_id, _attest.WITHHELD_NAME, cap + 1)
+        except Exception as exc:  # noqa: BLE001 - absent or unreadable: no stable verdict
+            _log.warning("attestation: withheld-marker re-read failed for job=%s: %s",
+                         job_id, exc)
+            again = None
+        if again != withheld:
+            raise HTTPException(503, "the result changed while being read; retry")
         return Response(content=data, media_type="application/json")
 
     @app.get("/v1/attestation/key")
