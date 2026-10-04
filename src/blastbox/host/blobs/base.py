@@ -180,6 +180,26 @@ class BlobStore(Protocol):
         """
 
 
+def is_missing_blob(exc: BaseException) -> bool:
+    """An absent object vs a store that failed. S3BlobStore wraps both in BlobFetchError, so look
+    at the cause: a missing file, or an S3 NoSuchKey/404. LocalBlobStore raises a CAUSELESS
+    BlobFetchError for an absent object (every real I/O failure there carries its OSError as
+    the cause)."""
+    if isinstance(exc, BlobFetchError) and exc.__cause__ is None:
+        return True
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, FileNotFoundError):
+            return True
+        code = str(((getattr(cur, "response", None) or {}).get("Error") or {}).get("Code", ""))
+        if code in ("NoSuchKey", "404", "NotFound"):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
 def read_result_prefix(store: object, job_id: str, name: str, max_bytes: int) -> bytes:
     """At most *max_bytes* of *job_id*'s stored *name*, read from the results prefix only.
 

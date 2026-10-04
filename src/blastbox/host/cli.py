@@ -1647,6 +1647,9 @@ def _migrate_results_cmd(args) -> int:
     from blastbox.host.jobs.factory import build_job_store_from_env
     from blastbox.host.jobs.retention import migrate_legacy_results
 
+    key = _attest_key_for_remark() if args.remark else None
+    if args.remark and key is None:
+        return 2
     job_root = _Path(
         args.job_root or _os.environ.get("BLASTBOX_JOB_ROOT", "/var/lib/blastbox/jobs")
     )
@@ -1655,6 +1658,8 @@ def _migrate_results_cmd(args) -> int:
     )
     store = build_job_store_from_env()
     log = _logging.getLogger("blastbox.migrate")
+    if key is not None:
+        return _remark_receipts(args, blobs, store, log, key)
     # The service's metadata limit, so the receipt-path decision matches the attestation route's
     # (see migrate_legacy_results). None = unknown: BLASTBOX_MAX_METADATA from this shell if set,
     # else envelopes past the fixed floor are refused rather than judged against the wrong limit.
@@ -1675,6 +1680,40 @@ def _migrate_results_cmd(args) -> int:
     print(
         f"migrated={migrated} already-durable={skipped} failed={failed}"
         + (" (dry run — nothing was uploaded)" if args.dry_run else "")
+    )
+    return 1 if failed else 0
+
+
+def _attest_key_for_remark():
+    """This host's existing attest key for ``migrate-results --remark``, or None (reported)."""
+    from blastbox.host import attest as _attest
+
+    if _attest.attest_key_path() is None:
+        print(f"error: --remark verifies receipts with this host's key: set "
+              f"{_attest.ATTEST_KEY_ENV} as the dispatcher does", file=sys.stderr)
+        return None
+    key = _attest.load_attest_key(create=False)
+    if key is None:
+        print(f"error: the key at {_attest.ATTEST_KEY_ENV} could not be loaded (see the log); "
+              "run as the dispatcher's service user", file=sys.stderr)
+    return key
+
+
+def _remark_receipts(args, blobs, store, log, key) -> int:
+    """``migrate-results --remark``: store the cleared marker beside each genuine receipt this
+    host signed that a 0.1.44/0.1.45 upload left unmarked (see remark_stored_receipts)."""
+    from blastbox.host.jobs.retention import remark_stored_receipts
+
+    limits = None
+    if args.max_metadata is not None:
+        from blastbox.limits import Limits as _Limits
+
+        limits = _Limits(max_metadata_bytes=args.max_metadata)
+    remarked, already, unverified, failed = remark_stored_receipts(
+        blobs, store, key, log, limit=args.limit, dry_run=args.dry_run, limits=limits)
+    print(
+        f"remarked={remarked} already-marked={already} unverified={unverified} failed={failed}"
+        + (" (dry run — nothing was stored)" if args.dry_run else "")
     )
     return 1 if failed else 0
 
@@ -2071,6 +2110,14 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="BYTES",
         help="the service's BLASTBOX_MAX_METADATA (default: this shell's, if set). Without "
              "either, a result whose envelope exceeds 64 MiB is left in place, not uploaded",
+    )
+    pm.add_argument(
+        "--remark",
+        action="store_true",
+        help="instead of migrating: store the receipt marker beside each genuine receipt THIS "
+             "host signed that a 0.1.44/0.1.45 upload left unmarked (verified with "
+             "BLASTBOX_ATTEST_KEY); the ingress withholds unmarked receipts. Run on every "
+             "signing host after upgrading. --dry-run, --limit and --max-metadata apply",
     )
     pm.set_defaults(func=_migrate_results_cmd)
 

@@ -41,6 +41,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry
 from blastbox import __version__
 from blastbox.errors import sanitize_public_error
 from blastbox.host.blobs.base import BlobStore
+from blastbox.host.blobs.base import is_missing_blob as _blob_is_missing
 from blastbox.host.blobs.base import read_result_prefix as _read_result_prefix
 from blastbox.host.jobs.base import VALID_TIERS, Job, JobStatus, JobStore
 from blastbox.host.jobs.factory import build_job_store_from_env
@@ -1027,27 +1028,6 @@ def build_app(
 
     from blastbox.host import attest as _attest
 
-    def _is_missing_blob(exc: BaseException) -> bool:
-        """A receipt that is absent (404) vs a store that failed (503). S3BlobStore wraps both in
-        BlobFetchError, so look at the cause: a missing file, or an S3 NoSuchKey/404.
-        LocalBlobStore raises a CAUSELESS BlobFetchError for an absent object (every real I/O
-        failure there carries its OSError as the cause)."""
-        from blastbox.host.blobs.base import BlobFetchError
-
-        if isinstance(exc, BlobFetchError) and exc.__cause__ is None:
-            return True
-        seen: set[int] = set()
-        cur: BaseException | None = exc
-        while cur is not None and id(cur) not in seen:
-            seen.add(id(cur))
-            if isinstance(cur, FileNotFoundError):
-                return True
-            code = str(((getattr(cur, "response", None) or {}).get("Error") or {}).get("Code", ""))
-            if code in ("NoSuchKey", "404", "NotFound"):
-                return True
-            cur = cur.__cause__ or cur.__context__
-        return False
-
     @app.get("/v1/jobs/{job_id}/attestation")
     def get_attestation(job_id: str):
         """The execution receipt the dispatcher that ran this job signed when it sealed the DONE
@@ -1094,7 +1074,7 @@ def build_app(
             withheld = _read_result_prefix(
                 _blob_store, job_id, _attest.WITHHELD_NAME, cap + 1)
         except Exception as exc:
-            if not _is_missing_blob(exc):
+            if not _blob_is_missing(exc):
                 _log.warning("attestation: withheld-marker read failed for job=%s: %s",
                              job_id, exc)
                 raise HTTPException(503, "could not read the execution receipt")
@@ -1129,7 +1109,7 @@ def build_app(
             envelope = _read_result_prefix(_blob_store, job_id, "metadata.json",
                                            envelope_cap + 1)
         except Exception as exc:
-            if not _is_missing_blob(exc):
+            if not _blob_is_missing(exc):
                 _log.warning("attestation: envelope read failed for job=%s: %s", job_id, exc)
                 raise HTTPException(503, "could not read the execution receipt")
             raise HTTPException(404, "no execution receipt for this job: "
@@ -1148,7 +1128,7 @@ def build_app(
             data = _read_result_prefix(_blob_store, job_id, _attest.RECEIPT_NAME,
                                        receipt_cap + 1)
         except Exception as exc:  # noqa: BLE001 - a partial receipt must never be served
-            if _is_missing_blob(exc):
+            if _blob_is_missing(exc):
                 # A cleared marker with nothing at attestation.json: a delete that stopped
                 # partway (it removes attestation.json first, the marker last).
                 raise HTTPException(404, "no execution receipt for this job: "

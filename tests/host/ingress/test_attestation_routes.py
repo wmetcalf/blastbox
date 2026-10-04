@@ -1948,3 +1948,159 @@ def test_an_unmarked_result_serves_no_receipt(tmp_path, key, receipt):
     assert r.status_code == 404, r.text
     assert r.json()["detail"] == ("no execution receipt for this job: "
                                   f"{attest.RECEIPT_UNMARKED_REASON}")
+
+
+# ---------------------------------------------------------------------------
+# C1: `blastbox migrate-results --remark` -- the signing host re-marks its genuine receipts
+# ---------------------------------------------------------------------------
+
+
+def _remark(tmp_path, store, key, **kw):
+    import logging
+
+    from blastbox.host.jobs.retention import remark_stored_receipts
+
+    blobs = kw.pop("blobs", None) or LocalBlobStore(tmp_path / "jobs",
+                                                    blob_root=tmp_path / "blobs")
+    return remark_stored_receipts(blobs, store, key, logging.getLogger("t"),
+                                  limits=Limits(max_metadata_bytes=1 << 20), **kw)
+
+
+def test_remark_restores_a_genuine_unmarked_receipt_idempotently(tmp_path, key):
+    store = InMemoryJobStore()
+    job, body = _unmarked(tmp_path, store, key=key)
+    client = _route_with_limit(tmp_path, store, 1 << 20)
+    assert client.get(f"/v1/jobs/{job.job_id}/attestation").status_code == 404
+    # dry run: counted, nothing stored
+    assert _remark(tmp_path, store, key, dry_run=True) == (1, 0, 0, 0)
+    assert client.get(f"/v1/jobs/{job.job_id}/attestation").status_code == 404
+    assert _remark(tmp_path, store, key) == (1, 0, 0, 0)
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 200, r.text
+    assert r.json() == body
+    assert _remark(tmp_path, store, key) == (0, 1, 0, 0)          # already marked: untouched
+
+
+@pytest.mark.parametrize("case", ["other-key", "worker-written", "tombstone", "other-job",
+                                  "envelope-swapped", "no-receipt", "oversize", "tampered"])
+def test_remark_leaves_anything_but_this_hosts_verified_receipt_alone(tmp_path, key, case):
+    """Only a receipt that verifies under THIS host's key, for this job, over the stored
+    metadata.json bytes is re-marked. Anything else stays unmarked (404) and is counted
+    unverified -- another host's receipt is that host's to re-mark."""
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    store = InMemoryJobStore()
+    other = attest.AttestKey(ec.generate_private_key(ec.SECP256R1()))
+    if case == "other-key":
+        job, _ = _unmarked(tmp_path, store, key=other)
+    elif case == "worker-written":
+        job, _ = _unmarked(tmp_path, store, receipt=_FORGED_RECEIPT)
+    elif case == "tombstone":
+        job, _ = _unmarked(tmp_path, store, key=None,
+                           receipt=attest.canonical(attest.tombstone_body("signing failed")))
+    elif case == "other-job":
+        donor, _ = _unmarked(tmp_path / "d", InMemoryJobStore(), key=key)
+        stored = LocalBlobStore(tmp_path / "d" / "jobs", blob_root=tmp_path / "d" / "blobs")
+        with stored.open_result_only(donor.job_id, attest.RECEIPT_NAME) as fh:
+            job, _ = _unmarked(tmp_path, store, receipt=fh.read())
+    elif case == "envelope-swapped":
+        job, _ = _unmarked(tmp_path, store, key=key)
+        out = tmp_path / "x"
+        out.mkdir()
+        (out / "metadata.json").write_text('{"artifacts": [], "swapped": true}')
+        _push_to_blob(tmp_path, job.job_id, out)
+    elif case == "no-receipt":
+        job, _ = _unmarked(tmp_path, store)
+    elif case == "tampered":        # key_id, job_id, metadata_sha256 intact; signature not
+        _, body = _unmarked(tmp_path / "p", InMemoryJobStore(), key=key)
+        job, out = _make_done_job(tmp_path, store)
+        body = dict(body, attestation=dict(body["attestation"], job_id=job.job_id,
+                                           metadata_sha256=attest.sha256_file(
+                                               out / "metadata.json")))
+        (out / attest.RECEIPT_NAME).write_bytes(attest.canonical(body))
+        _push_to_blob(tmp_path, job.job_id, out)
+    else:
+        job, _ = _unmarked(tmp_path, store, receipt=b"{" + b" " * (2 << 20) + b"}")
+    assert _remark(tmp_path, store, key) == (0, 0, 1, 0)
+    blobs = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    with pytest.raises(BlobFetchError):
+        blobs.open_result_only(job.job_id, attest.WITHHELD_NAME)
+    r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+
+
+def test_remark_counts_a_read_error_failed_and_carries_on(tmp_path, key):
+    store = InMemoryJobStore()
+    bad, _ = _unmarked(tmp_path, store, key=key)
+    good, _ = _unmarked(tmp_path, store, key=key)
+
+    class _Flaky(LocalBlobStore):
+        def read_result_prefix(self, job_id, name, max_bytes):
+            if job_id == bad.job_id and name == attest.RECEIPT_NAME:
+                raise OSError(5, "EIO")
+            return super().read_result_prefix(job_id, name, max_bytes)
+
+    blobs = _Flaky(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    assert _remark(tmp_path, store, key, blobs=blobs) == (1, 0, 0, 1)
+    client = _route_with_limit(tmp_path, store, 1 << 20)
+    assert client.get(f"/v1/jobs/{good.job_id}/attestation").status_code == 200
+    assert client.get(f"/v1/jobs/{bad.job_id}/attestation").status_code == 404
+
+
+def test_remark_skips_jobs_that_are_not_done_and_honours_the_limit(tmp_path, key):
+    store = InMemoryJobStore()
+    a, _ = _unmarked(tmp_path, store, key=key)
+    b, _ = _unmarked(tmp_path, store, key=key)
+    _unmarked(tmp_path, store, key=key)
+    store.update(b.job_id, status=JobStatus.EXPIRED)
+    assert _remark(tmp_path, store, key, limit=1) == (1, 0, 0, 0)
+    assert _remark(tmp_path, store, key) == (1, 1, 0, 0)
+
+
+@pytest.mark.parametrize("backend", ["s3"])
+def test_remark_round_trips_through_s3(tmp_path, request, key, backend):
+    blobs = _s3_store(tmp_path, request)
+    store = InMemoryJobStore()
+    job, out = _make_done_job(tmp_path, store)
+    body = attest.seal_receipt(out, key=key, observation=attest.RunObservation(
+        job_id=job.job_id, engine=job.engine, input_sha256="d" * 64, worker_runtime="runsc",
+        worker_tier=None, started_at_ms=1, finished_at_ms=2))
+    (out / attest.WITHHELD_NAME).unlink()
+    blobs.put_output(job.job_id, out)
+    app = build_app(job_store=store, job_root=tmp_path / "jobs", allowed_engines={"clippyshot"},
+                    limits=Limits(max_metadata_bytes=1 << 20), api_workers=2, zip_password="",
+                    blob_store=blobs)
+    client = TestClient(app)
+    assert client.get(f"/v1/jobs/{job.job_id}/attestation").status_code == 404
+    assert _remark(tmp_path, store, key, blobs=blobs) == (1, 0, 0, 0)
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 200, r.text
+    assert r.json() == body
+
+
+def test_migrate_results_remark_cli(tmp_path, key, monkeypatch, capsys):
+    from blastbox.host import cli
+
+    store = InMemoryJobStore()
+    job, _ = _unmarked(tmp_path, store, key=key)
+    monkeypatch.setenv("BLASTBOX_ATTEST_KEY", str(tmp_path / "keys" / "attest.key"))
+    monkeypatch.setenv("BLASTBOX_JOB_ROOT", str(tmp_path / "jobs"))
+    monkeypatch.setattr("blastbox.host.blobs.factory.build_blob_store_from_env",
+                        lambda env=None: LocalBlobStore(tmp_path / "jobs",
+                                                        blob_root=tmp_path / "blobs"))
+    monkeypatch.setattr("blastbox.host.jobs.factory.build_job_store_from_env",
+                        lambda *a, **k: store)
+    assert cli.main(["migrate-results", "--remark", "--dry-run"]) == 0
+    assert "remarked=1 already-marked=0 unverified=0 failed=0 (dry run" in capsys.readouterr().out
+    assert cli.main(["migrate-results", "--remark"]) == 0
+    assert "remarked=1 already-marked=0 unverified=0 failed=0" in capsys.readouterr().out
+    r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 200, r.text
+
+
+def test_migrate_results_remark_refuses_without_a_key(tmp_path, monkeypatch, capsys):
+    from blastbox.host import cli
+
+    monkeypatch.delenv("BLASTBOX_ATTEST_KEY", raising=False)
+    assert cli.main(["migrate-results", "--remark"]) == 2
+    assert "BLASTBOX_ATTEST_KEY" in capsys.readouterr().err

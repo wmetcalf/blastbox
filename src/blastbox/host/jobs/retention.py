@@ -825,6 +825,115 @@ def _migrate_legacy_one(
     return "failed"
 
 
+def remark_stored_receipts(
+    blob_store: BlobStore,
+    job_store: JobStore,
+    key: "AttestKey",
+    log: logging.Logger,
+    *,
+    limit: int = 0,
+    dry_run: bool = False,
+    limits: "Limits | None" = None,
+) -> tuple[int, int, int, int]:
+    """Store the cleared marker beside every genuine receipt THIS host signed that sits in the
+    store unmarked (uploaded by 0.1.44/0.1.45, before markers). The attestation route answers
+    404 for an unmarked result (codex r134 C1): it cannot tell a host-written attestation.json
+    from a worker's in a tree a pre-#188 node shipped verbatim. Run on each signing host, with
+    its own key, after upgrading. Returns (remarked, already_marked, unverified, failed).
+
+    For each DONE job, all reads bounded (read_result_prefix):
+
+    * a marker already stored (any bytes): already marked -- never touched, so a rerun is a
+      no-op and an as-is upload's withheld marker is never overwritten;
+    * else the stored attestation.json must be a receipt that verifies under ``key``, for this
+      job_id and key_id, whose metadata_sha256 is the sha256 of the STORED metadata.json (read
+      under the envelope ceiling, and not declaring or hiding an artifact at a reserved name).
+      Only then is the cleared marker bound to that metadata stored (not with ``dry_run``);
+    * anything else -- another host's receipt, a tombstone, worker bytes, no receipt or
+      envelope, over a cap -- is LEFT ALONE and counted unverified: the result stays unmarked,
+      which the route already answers with the no-receipt 404, and another host's receipt is
+      that host's to re-mark. Writing a withheld marker there would make that permanent.
+    * a read or write error is counted failed (no verdict), and the run carries on.
+
+    ``limit`` stops after that many re-marked (0 = all)."""
+    import hashlib
+    import json
+    import tempfile
+
+    from blastbox.host import attest as _attest
+    from blastbox.host.blobs.base import is_missing_blob, read_result_prefix
+
+    if limits is None and os.environ.get("BLASTBOX_MAX_METADATA") is not None:
+        from blastbox.limits import Limits as _Limits
+
+        limits = _Limits.from_env()
+    envelope_cap = _attest.envelope_cap(limits)
+    remarked = already = unverified = failed = 0
+
+    def fetch(job_id: str, name: str, cap: int) -> bytes | None:
+        """At most cap + 1 bytes, or None when absent; raises on a read error."""
+        try:
+            return read_result_prefix(blob_store, job_id, name, cap + 1)
+        except Exception as exc:
+            if is_missing_blob(exc):
+                return None
+            raise
+
+    for job in job_store.list(status=JobStatus.DONE):
+        if limit and remarked >= limit:
+            break
+        job_id = job.job_id
+        try:
+            if fetch(job_id, _attest.WITHHELD_NAME, _attest.WITHHELD_MARKER_MAX_BYTES) is not None:
+                already += 1
+                continue
+            receipt = fetch(job_id, _attest.RECEIPT_NAME, _attest._RECEIPT_MAX_BYTES)
+            envelope = fetch(job_id, "metadata.json", envelope_cap)
+        except Exception as exc:  # noqa: BLE001 -- one result must never abort the run
+            log.warning("receipt re-mark: %s: read failed (%s); not re-marked", job_id, exc)
+            failed += 1
+            continue
+        why = None
+        metadata_sha256 = ""
+        if receipt is None or len(receipt) > _attest._RECEIPT_MAX_BYTES:
+            why = "no receipt of a receipt's size"
+        elif envelope is None or len(envelope) > envelope_cap:
+            why = "no envelope within the ceiling"
+        elif _attest.envelope_receipt_path_protection(envelope) is not None:
+            why = "its envelope declares (or cannot rule out) an artifact at a reserved name"
+        else:
+            metadata_sha256 = hashlib.sha256(envelope).hexdigest()
+            try:
+                body = json.loads(receipt)
+                doc = body["attestation"]
+                ok = (_attest.verify_body(key, body) and doc.get("key_id") == key.key_id
+                      and doc.get("job_id") == job_id
+                      and doc.get("metadata_sha256") == metadata_sha256)
+            except Exception:  # noqa: BLE001 -- bytes that are not our receipt: a verdict
+                ok = False
+            if not ok:
+                why = "not a receipt this host's key signed for this job and envelope"
+        if why is not None:
+            log.info("receipt re-mark: %s: %s; left unmarked", job_id, why)
+            unverified += 1
+            continue
+        if not dry_run:
+            try:
+                with tempfile.TemporaryDirectory(prefix="bb-remark-") as tmp:
+                    (Path(tmp) / _attest.WITHHELD_NAME).write_bytes(
+                        _attest.canonical(_attest.cleared_marker_body(metadata_sha256)))
+                    blob_store.put_output(job_id, Path(tmp))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("receipt re-mark: %s: could not store the marker (%s)", job_id, exc)
+                failed += 1
+                continue
+            log.info("receipt re-mark: %s: genuine receipt re-marked", job_id)
+        remarked += 1
+    log.info("receipt re-mark: %d re-marked, %d already marked, %d unverified, %d failed%s",
+             remarked, already, unverified, failed, " (dry run)" if dry_run else "")
+    return (remarked, already, unverified, failed)
+
+
 def reap_stale_scratch(
     job_root: Path,
     max_age_s: float,

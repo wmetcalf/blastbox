@@ -18,17 +18,42 @@ reads the marker. A 0.1.45 ingress opens `attestation.json` and serves it `200` 
 tombstone. The stored bytes are durable, so this is not limited to the window of a rolling
 upgrade: any later ingress rollback to 0.1.45 serves them too.
 
-An upgraded ingress serving results uploaded by 0.1.45 dispatchers treats them as unmarked
-(legacy) results and judges their stored envelope before serving. That is **not** fully safe
-during the rollout: a 0.1.45 dispatcher neither reserves nor strips `attestation.withheld.json`,
-so a worker running under a not-yet-upgraded dispatcher can plant a file at that name beside its
-job's genuine receipt. The upgraded ingress reads any marker but the cleared body as the
-uploader's verdict and withholds that job's receipt (`404`) permanently, under a reason worded as
-this host's own (the worker can copy one). Nothing is forged: a worker can only suppress its own
-job's receipt, never get a receipt served. The order is still ingress first because the opposite
-order allows forgery: a 0.1.45 ingress serves an as-is upload's worker-written `attestation.json`
-as a receipt (above). The window closes once every dispatcher runs this release, so keep the
-rollout short: upgrade the dispatchers promptly after the ingresses.
+An upgraded ingress answers `404` for any stored result with **no** `attestation.withheld.json`
+marker — everything uploaded by 0.1.45 or earlier, including the dispatchers' uploads during the
+rollout. It cannot tell a host-written `attestation.json` there from a worker's: a node before
+0.1.44 shipped worker trees verbatim. Genuine 0.1.44/0.1.45 receipts come back once their signing
+host re-marks them (below).
+
+A 0.1.45 dispatcher also neither reserves nor strips `attestation.withheld.json`, so a worker
+running under a not-yet-upgraded dispatcher can plant a file at that name beside its job's
+genuine receipt. The upgraded ingress reads any marker but the cleared body as the uploader's
+verdict and withholds that job's receipt (`404`) permanently, under a reason worded as this
+host's own (the worker can copy one), and `--remark` leaves an already-marked result alone.
+Nothing is forged: a worker can only suppress its own job's receipt, never get a receipt served.
+The order is still ingress first because the opposite order allows forgery: a 0.1.45 ingress
+serves an as-is upload's worker-written `attestation.json` as a receipt (above). The window closes
+once every dispatcher runs this release, so keep the rollout short: upgrade the dispatchers
+promptly after the ingresses.
+
+### After upgrading: re-mark genuine receipts (each signing host)
+
+Once a dispatcher host runs this release, run, as its service user and with its own
+`BLASTBOX_ATTEST_KEY` (and the service's blob-store, job-store and `BLASTBOX_MAX_METADATA`
+environment):
+
+```
+blastbox migrate-results --remark --dry-run    # counts only
+blastbox migrate-results --remark
+```
+
+For each `DONE` result stored without a marker, it reads the stored `attestation.json` and
+`metadata.json` (bounded) and stores the cleared marker only when the receipt verifies under this
+host's key, for that job, over the sha256 of the stored `metadata.json`, and the envelope
+declares nothing at a reserved name. Anything else (another host's receipt, a tombstone, worker
+bytes) is left unmarked and counted `unverified`; another host's receipts are re-marked when that
+host runs it. Already-marked results are never touched, so reruns are safe. It prints
+`remarked=N already-marked=N unverified=N failed=N` and exits `1` if any read or write failed
+(rerun it). `--limit N` re-marks in batches.
 
 ## Changes
 
@@ -43,11 +68,15 @@ rollout short: upgrade the dispatchers promptly after the ingresses.
    `metadata.json` it shipped with. An as-is upload stores the *withheld* body (tombstone-shaped,
    with the reason) instead. Expect one extra small object per result in the store.
 
-3. **The attestation route judges what it serves.** In order: any marker other than a
-   well-formed cleared body (the withheld body, a near-miss, over 4 KiB) answers `404`; no stored
-   `metadata.json` answers `404`; otherwise the stored envelope is read under the ingress's
-   ceiling and a declared or unparseable reserved path answers `404`. A cleared marker never
-   vouches on its own. A blob-store read error is `503`, never a verdict.
+3. **The attestation route judges what it serves.** In order: no marker answers `404` (an
+   unmarked result: see above); any marker other than a well-formed cleared body (the withheld
+   body, a near-miss, over 4 KiB) answers `404`; no stored `metadata.json` answers `404`;
+   otherwise the stored envelope is read under the ingress's ceiling and a declared or
+   unparseable reserved path answers `404`. A cleared marker never vouches on its own. The
+   receipt itself is read only up to 1 MiB (no receipt comes near it): a larger one answers
+   `404`. A tombstone's reason is named only when it is one this host writes. A blob-store read
+   error is `503`, never a verdict; so is an S3 object holding more than one gzip member (our
+   encoder writes one).
 
 4. **A receipt whose envelope exceeds the ingress's ceiling is withheld (`404`), even if it is
    genuine.** The ceiling is the ingress's `BLASTBOX_MAX_METADATA`, never below 64 MiB. The `404`
@@ -55,6 +84,11 @@ rollout short: upgrade the dispatchers promptly after the ingresses.
    dispatcher that seals results** (a mismatch only matters for envelopes past 64 MiB). The route
    reads the envelope and the marker only up to the ceiling, on S3 as well as the local store (the
    S3 read streams and stops, inflating a gzip-encoded object incrementally).
+
+   Uploads store `attestation.json` after every other artifact, then the marker, then
+   `metadata.json`, each step only after the previous one fully landed (on S3 too, where the
+   rest is uploaded in parallel). A re-upload over a prefix that still holds an older
+   `attestation.json` never stores the cleared marker before the file that replaces it.
 
 5. **Retained trees that used to be stuck now upload.** The pending-upload sweep and
    `migrate-results` used to leave a tree retained forever when its envelope declared, or could
