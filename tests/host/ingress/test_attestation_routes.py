@@ -1543,3 +1543,34 @@ def test_a_genuine_vouched_result_over_the_ceiling_is_served(tmp_path, monkeypat
     r = _route_with_limit(tmp_path, store, 64).get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 200, r.text
     assert r.json() == body
+
+
+@pytest.mark.parametrize("backend", ["local", "s3"])
+@pytest.mark.parametrize("declared", [True, False], ids=["declared", "undeclared"])
+def test_a_directory_at_the_marker_name_answers_like_s3(tmp_path, request, backend, declared):
+    """L2 (lens r6). A result stored before the name was reserved can hold
+    attestation.withheld.json/<x> (a declared artifact, or an undeclared dir a pre-#188 node
+    shipped verbatim). S3 has no object AT the marker's key, so the result is judged as legacy.
+    LocalBlobStore opened the directory, got IsADirectoryError and the route answered 503 on
+    every request. A directory is no object at that key, so local answers what S3 does."""
+    blobs = (LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+             if backend == "local" else _s3_store(tmp_path, request))
+    store = InMemoryJobStore()
+    job, out = _make_done_job(tmp_path, store)
+    (out / attest.WITHHELD_NAME).mkdir()
+    (out / attest.WITHHELD_NAME / "x.png").write_bytes(b"page")
+    arts = ([{"id": "a", "path": "attestation.withheld.json/x.png", "sha256": "0" * 64}]
+            if declared else [])
+    (out / "metadata.json").write_text(json.dumps({"artifacts": arts}))
+    blobs.put_output(job.job_id, out)
+    app = build_app(job_store=store, job_root=tmp_path / "jobs", allowed_engines={"clippyshot"},
+                    limits=Limits(max_metadata_bytes=1 << 20), api_workers=2, zip_password="",
+                    blob_store=blobs)
+    r = TestClient(app, raise_server_exceptions=False).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    if declared:
+        # The legacy judgement: an artifact declared under a reserved name is never unmasked.
+        assert attest.RECEIPT_PATH_DECLARED_REASON in r.json()["detail"]
+    else:
+        # Nothing declared, nothing at attestation.json: an unmarked pre-receipt result.
+        assert "predates receipts" in r.json()["detail"]

@@ -265,7 +265,12 @@ class LocalBlobStore:
             ) from exc
         try:
             return open(candidate, "rb")
-        except FileNotFoundError:
+        except (FileNotFoundError, IsADirectoryError):
+            # A directory is no object AT this key, exactly as on S3, where results/<id>/x/y
+            # stores no object at results/<id>/x. Raising it as an I/O failure made the
+            # attestation route answer 503, on every request, for a legacy result holding a
+            # directory at attestation.withheld.json -- one S3 judges as unmarked (404 when it
+            # declares that name). Absent keeps both stores' answers identical.
             return None
         except OSError as exc:
             raise BlobFetchError(f"result fetch failed: {job_id}/{name}") from exc
