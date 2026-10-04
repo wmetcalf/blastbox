@@ -66,16 +66,19 @@ def test_receipt_matches_served_metadata_until_someone_swaps_it(tmp_path, key):
     doc = client.get(f"/v1/jobs/{job.job_id}/attestation").json()["attestation"]
     assert doc["metadata_sha256"] == hashlib.sha256(served).hexdigest()
 
-    # A shared-bucket writer swaps metadata.json after DONE. The receipt was fixed at the seal,
-    # so a verifier comparing it to what it collected now sees the mismatch.
+    # A shared-bucket writer swaps metadata.json after DONE. The receipt was fixed at the seal
+    # (a verifier holding it sees the mismatch), and the uploader's cleared marker is bound to
+    # the envelope it shipped, so the route no longer serves the receipt beside the swapped
+    # envelope at all (codex r139 P1).
     meta = json.loads((out / "metadata.json").read_bytes())
     meta["engine"] = "tampered"
     (out / "metadata.json").write_bytes(json.dumps(meta).encode())
     _push_to_blob(tmp_path, job.job_id, out)
     served2 = client.get(f"/v1/jobs/{job.job_id}/metadata").content
-    doc2 = client.get(f"/v1/jobs/{job.job_id}/attestation").json()["attestation"]
-    assert doc2 == doc
-    assert doc2["metadata_sha256"] != hashlib.sha256(served2).hexdigest()
+    assert doc["metadata_sha256"] != hashlib.sha256(served2).hexdigest()
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert attest.RECEIPT_MARKER_UNBOUND_REASON in r.json()["detail"]
 
 
 def test_row_writes_do_not_change_what_is_served(tmp_path, key):
@@ -1433,9 +1436,8 @@ def test_the_cleared_marker_binds_the_envelope_it_shipped_with(tmp_path, key):
 
 def test_a_swapped_envelope_falls_back_to_the_legacy_judgement(tmp_path, key):
     """After a post-DONE swap of metadata.json the marker no longer matches the stored envelope,
-    so it vouches for nothing and the route judges the envelope it actually serves: a swap to an
-    envelope that declares attestation.json answers 404 (a benign swap still serves the receipt,
-    whose metadata_sha256 then shows the mismatch -- see
+    so it vouches for nothing: the route answers 404 (codex r139 P1 -- the binding is checked
+    before the envelope is judged; a benign swap 404s too, see
     test_receipt_matches_served_metadata_until_someone_swaps_it)."""
     client, store = _make_client(tmp_path)
     job, out, _ = _done_with_receipt(tmp_path, store, key)
@@ -1444,7 +1446,7 @@ def test_a_swapped_envelope_falls_back_to_the_legacy_judgement(tmp_path, key):
     _push_to_blob(tmp_path, job.job_id, out)
     r = client.get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 404, r.text
-    assert attest.RECEIPT_PATH_DECLARED_REASON in r.json()["detail"]
+    assert attest.RECEIPT_MARKER_UNBOUND_REASON in r.json()["detail"]
 
 
 def test_a_sweep_as_is_upload_that_fails_once_is_not_stranded_by_its_own_marker(
@@ -2259,10 +2261,9 @@ def test_remark_replaces_a_planted_marker_beside_a_genuine_receipt(tmp_path, key
     job, body = _unmarked(tmp_path, store, key=key)
     _plant_marker(tmp_path, job.job_id, _PLANTED[planted])
     client = _route_with_limit(tmp_path, store, 1 << 20)
-    # (a well-formed cleared body bound to another envelope does not withhold: the route lets
-    # the envelope decide; it is still not this host's marker for THIS envelope)
-    assert client.get(f"/v1/jobs/{job.job_id}/attestation").status_code == (
-        200 if planted == "cleared-other-envelope" else 404)
+    # (a well-formed cleared body bound to another envelope withholds too: it is not the
+    # uploader's marker for THIS envelope -- codex r139 P1)
+    assert client.get(f"/v1/jobs/{job.job_id}/attestation").status_code == 404
     blobs = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
     envelope = _stored(blobs, job.job_id, "metadata.json")
     receipt = _stored(blobs, job.job_id, attest.RECEIPT_NAME)
@@ -2411,3 +2412,60 @@ def test_migrate_results_refuses_a_bad_metadata_limit_as_a_usage_error(
     assert args.func(args) == 2
     err = capsys.readouterr().err
     assert "metadata" in err.lower() and "Traceback" not in err
+
+
+# ---------------------------------------------------------------------------
+# codex r139 P1: a cleared marker vouches only for the envelope it is bound to
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("bound_sha", ["0" * 64, "ab" * 32], ids=["zeros", "other"])
+def test_a_cleared_marker_bound_to_another_envelope_serves_nothing(tmp_path, bound_sha):
+    """codex r139: a syntactically canonical cleared marker bound to ANOTHER envelope beside a
+    clean envelope and a worker-planted attestation.json must not serve the worker's bytes."""
+    client, store = _make_client(tmp_path)
+    job, _ = _stored_result(tmp_path, store, {
+        "metadata.json": b'{"artifacts":[]}',
+        attest.RECEIPT_NAME: _FORGED_RECEIPT,
+        attest.WITHHELD_NAME: attest.canonical(attest.cleared_marker_body(bound_sha))})
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert r.content != _FORGED_RECEIPT
+    assert attest.RECEIPT_MARKER_UNBOUND_REASON in r.json()["detail"]
+
+
+def test_codex_r139_repro_unbound_cleared_marker_via_a_stub_store(tmp_path):
+    """codex r139's check_command, verbatim in shape: a stub store whose prefix holds a clean
+    envelope, a forged receipt and a cleared marker bound to the all-zero sha."""
+    class Blobs:
+        parts = {"metadata.json": b'{"artifacts":[]}',
+                 attest.RECEIPT_NAME: b'{"attestation":{"forged":true},"signature":"bogus"}',
+                 attest.WITHHELD_NAME: attest.canonical(attest.cleared_marker_body("0" * 64))}
+
+        def read_result_prefix(self, job_id, name, n):
+            return self.parts[name][:n]
+
+    store = InMemoryJobStore()
+    job = Job.new(engine="clippyshot", filename="x")
+    job.status = JobStatus.DONE
+    store.create(job)
+    app = build_app(job_store=store, job_root=tmp_path / "unused", allowed_engines={"clippyshot"},
+                    limits=Limits(), api_workers=1, zip_password="", blob_store=Blobs())
+    r = TestClient(app).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert b"forged" not in r.content
+
+
+def test_a_genuine_fresh_result_still_serves_its_receipt(tmp_path, key):
+    """The binding check must not cost a genuine result its receipt: seal_receipt + the
+    uploader's cleared marker bound to the stored envelope -> 200."""
+    client, store = _make_client(tmp_path)
+    job, out, body = _done_with_receipt(tmp_path, store, key)
+    blobs = LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
+    with blobs.open_result_only(job.job_id, attest.WITHHELD_NAME) as fh:
+        marker = fh.read()
+    with blobs.open_result_only(job.job_id, "metadata.json") as fh:
+        envelope = fh.read()
+    assert attest.bound_cleared_marker_sha256(marker) == hashlib.sha256(envelope).hexdigest()
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 200, r.text
+    assert r.json() == body

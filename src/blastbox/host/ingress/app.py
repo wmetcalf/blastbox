@@ -1061,14 +1061,13 @@ def build_app(
         #     `blastbox migrate-results --remark` (run where the job store can be enumerated),
         #     which verifies each one against its signing host's PUBLIC key before storing its
         #     cleared marker.
-        #   * a cleared body (bound to any envelope): the envelope decides, below (deny-only).
-        #     A cleared marker does NOT vouch here. It cannot make the route serve what
-        #     the envelope judgement would refuse: a pre-#188 dispatcher shipped a worker's tree
-        #     verbatim, and the worker can predict its sealed envelope's sha256 and plant a
-        #     marker bound to it. Under the ceiling the judgement below already refuses any
-        #     reserved-name declaration, so a binding check there changes no answer (round 7,
-        #     O1 -- the dead `vouched` branch is gone; the binding still identifies the host's
-        #     own marker to write_withheld_marker).
+        #   * a cleared body: it must be BOUND to the stored envelope (checked below, against
+        #     the sha256 of the bytes read under the ceiling); bound to any other envelope it is
+        #     not the uploader's marker for THIS result: 404 (codex r139 P1). Then the envelope
+        #     still decides (deny-only) -- a cleared marker never makes the route serve what
+        #     the envelope judgement would refuse. The binding NARROWS but does not close the
+        #     known residual: a pre-#188 dispatcher shipped a worker's tree verbatim, and that
+        #     worker can predict its own sealed envelope's sha256 and plant a marker bound to it.
         # A marker that cannot be read is no verdict: 503.
         cap = _attest.WITHHELD_MARKER_MAX_BYTES
         try:
@@ -1081,7 +1080,8 @@ def build_app(
                 raise HTTPException(503, "could not read the execution receipt")
             raise HTTPException(404, "no execution receipt for this job: "
                                      f"{_attest.RECEIPT_UNMARKED_REASON}")
-        if len(withheld) > cap or _attest.bound_cleared_marker_sha256(withheld) is None:
+        bound_sha = None if len(withheld) > cap else _attest.bound_cleared_marker_sha256(withheld)
+        if bound_sha is None:
             why = _attest.RECEIPT_WITHHELD_REASON
             if len(withheld) <= cap and _attest.is_tombstone(withheld):
                 with contextlib.suppress(Exception):
@@ -1118,6 +1118,9 @@ def build_app(
         if len(envelope) > envelope_cap:
             raise HTTPException(404, "no execution receipt for this job: "
                                      f"{_attest.RECEIPT_ENVELOPE_OVER_LIMIT_REASON}")
+        if hashlib.sha256(envelope).hexdigest() != bound_sha:
+            raise HTTPException(404, "no execution receipt for this job: "
+                                     f"{_attest.RECEIPT_MARKER_UNBOUND_REASON}")
         why_not = _attest.envelope_receipt_path_protection(envelope)
         if why_not is not None:
             raise HTTPException(404, f"no execution receipt for this job: {why_not}")

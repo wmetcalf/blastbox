@@ -819,6 +819,9 @@ RECEIPT_UNMARKED_REASON = (
     "key>`, run where the job store can be enumerated")
 #: The reason a marked result with nothing stored at RECEIPT_NAME is reported with.
 RECEIPT_ABSENT_REASON = "the stored result has no attestation.json"
+#: The reason a CLEARED marker bound to an envelope other than the stored metadata.json is
+#: reported with. Constant: the bound sha is untrusted and is never echoed.
+RECEIPT_MARKER_UNBOUND_REASON = "the receipt marker does not vouch for the stored envelope"
 
 # A dispatcher whose seal_fresh_receipt returned False never contacts the result store: what is
 # at attestation.json (our receipt, a tombstone, or possibly a worker-planted file when nothing
