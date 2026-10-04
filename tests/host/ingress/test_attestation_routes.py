@@ -1504,3 +1504,42 @@ def test_an_undeclared_bound_marker_never_unmasks_a_declared_receipt(tmp_path, d
     r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 404, r.text
     assert attest.RECEIPT_PATH_DECLARED_REASON in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Round-6 lens: the cleared marker's binding where it matters -- over the ingress's ceiling
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("marker_for", [
+    lambda envelope: attest.canonical({"attestation": "not-withheld", "withheld": False,
+                                       "metadata_sha256": hashlib.sha256(envelope).hexdigest()}),
+    lambda envelope: attest.canonical(attest.cleared_marker_body("ab" * 32)),
+], ids=["bound-to-the-envelope-before-declaring", "bound-to-a-fake-sha"])
+def test_an_unbound_cleared_lookalike_never_unmasks_a_receipt_over_the_ceiling(
+        tmp_path, monkeypatch, marker_for):
+    """L1 (lens r6). Under the ceiling the deny-only parse 404s a declared receipt whether or not
+    the marker is bound, so only an envelope OVER the ceiling exercises the binding: there the
+    route serves a vouched result without parsing it. A well-formed cleared body bound to any
+    envelope but the stored one must vouch for nothing, and the legacy judgement (over the cap:
+    undecidable) answers 404."""
+    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 64)
+    store = InMemoryJobStore()
+    job = _legacy_declaring_both_names(tmp_path, store, marker_for)
+    with LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs").open_result_only(
+            job.job_id, "metadata.json") as fh:
+        assert len(fh.read()) > 64                                # over the ingress's ceiling
+    r = _route_with_limit(tmp_path, store, 64).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert r.content != _FORGED_RECEIPT
+
+
+def test_a_genuine_vouched_result_over_the_ceiling_is_served(tmp_path, monkeypatch, key):
+    """The other half of L1: a fresh seal's cleared marker IS bound to its stored envelope, so
+    over this ingress's ceiling the receipt is served without parsing the envelope (deepseek D1)."""
+    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 64)
+    store = InMemoryJobStore()
+    job, out, body = _done_with_receipt(tmp_path, store, key)
+    assert (out / "metadata.json").stat().st_size > 64
+    r = _route_with_limit(tmp_path, store, 64).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 200, r.text
+    assert r.json() == body
