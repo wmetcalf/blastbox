@@ -1074,8 +1074,14 @@ def build_app(
         # body bound to the envelope it shipped:
         #   * anything but a well-formed cleared body -- the withheld body, unparseable, a
         #     near-miss, over the read cap, the pre-binding cleared body: 404;
-        #   * a cleared body (bound to any envelope) or no marker at all: the envelope decides,
-        #     below. A cleared marker does NOT vouch here. It cannot make the route serve what
+        #   * NO marker at all: 404 (codex r134 C1). The route cannot establish that a host
+        #     wrote an unmarked result's attestation.json -- a pre-#188 node shipped worker trees
+        #     verbatim, clean envelope and all -- and every receipt-bearing upload since this
+        #     release stores a cleared marker. Genuine 0.1.44/0.1.45 receipts are re-marked by
+        #     their signing host (`blastbox migrate-results --remark`, which verifies each one
+        #     with that host's key before storing its cleared marker).
+        #   * a cleared body (bound to any envelope): the envelope decides, below (deny-only).
+        #     A cleared marker does NOT vouch here. It cannot make the route serve what
         #     the envelope judgement would refuse: a pre-#188 dispatcher shipped a worker's tree
         #     verbatim, and the worker can predict its sealed envelope's sha256 and plant a
         #     marker bound to it. Under the ceiling the judgement below already refuses any
@@ -1085,16 +1091,16 @@ def build_app(
         # A marker that cannot be read is no verdict: 503.
         cap = _attest.WITHHELD_MARKER_MAX_BYTES
         try:
-            withheld: bytes | None = _read_result_prefix(
+            withheld = _read_result_prefix(
                 _blob_store, job_id, _attest.WITHHELD_NAME, cap + 1)
         except Exception as exc:
             if not _is_missing_blob(exc):
                 _log.warning("attestation: withheld-marker read failed for job=%s: %s",
                              job_id, exc)
                 raise HTTPException(503, "could not read the execution receipt")
-            withheld = None
-        if withheld is not None and (len(withheld) > cap
-                                     or _attest.bound_cleared_marker_sha256(withheld) is None):
+            raise HTTPException(404, "no execution receipt for this job: "
+                                     f"{_attest.RECEIPT_UNMARKED_REASON}")
+        if len(withheld) > cap or _attest.bound_cleared_marker_sha256(withheld) is None:
             why = _attest.RECEIPT_WITHHELD_REASON
             if len(withheld) <= cap and _attest.is_tombstone(withheld):
                 with contextlib.suppress(Exception):
@@ -1143,8 +1149,10 @@ def build_app(
                                        receipt_cap + 1)
         except Exception as exc:  # noqa: BLE001 - a partial receipt must never be served
             if _is_missing_blob(exc):
-                raise HTTPException(404, "no execution receipt for this job (its dispatcher "
-                                         "had no attestation key, or it predates receipts)")
+                # A cleared marker with nothing at attestation.json: a delete that stopped
+                # partway (it removes attestation.json first, the marker last).
+                raise HTTPException(404, "no execution receipt for this job: "
+                                         f"{_attest.RECEIPT_ABSENT_REASON}")
             _log.warning("attestation: receipt read failed for job=%s: %s", job_id, exc)
             raise HTTPException(503, "could not read the execution receipt")
         if len(data) > receipt_cap:

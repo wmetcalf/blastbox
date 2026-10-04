@@ -738,6 +738,15 @@ def write_cleared_marker(out_dir: Path, *, limits: Limits | None = None) -> None
 #: The reason a withheld marker that is not tombstone-shaped (unparseable, or anything else but
 #: the cleared body) is reported with.
 RECEIPT_WITHHELD_REASON = "the uploader withheld the receipt for this result"
+#: The reason a stored result with NO marker at WITHHELD_NAME is reported with. Every upload
+#: that ships a receipt or tombstone since this release stores the cleared marker, so an
+#: unmarked result (uploaded by 0.1.45 or earlier, possibly a worker tree shipped verbatim)
+#: carries no receipt the route can attribute to a host until its signing host re-marks it.
+RECEIPT_UNMARKED_REASON = (
+    "the stored result has no receipt marker (stored by 0.1.45 or earlier); the host that signed "
+    "it can re-mark a genuine receipt with `blastbox migrate-results --remark`")
+#: The reason a marked result with nothing stored at RECEIPT_NAME is reported with.
+RECEIPT_ABSENT_REASON = "the stored result has no attestation.json"
 
 # A dispatcher whose seal_fresh_receipt returned False never contacts the result store: what is
 # at attestation.json (our receipt, a tombstone, or possibly a worker-planted file when nothing

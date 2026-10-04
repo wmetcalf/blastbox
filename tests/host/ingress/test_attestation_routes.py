@@ -1187,13 +1187,16 @@ def test_a_declared_cleared_body_lookalike_is_never_shipped_as_is_by_the_sweep(t
 
 
 # ---------------------------------------------------------------------------
-# Unmarked is LEGACY, not safe: the route judges its envelope (round-5 panel P1)
+# Unmarked results carry no receipt (codex r134 C1, superseding round-5 panel P1's legacy
+# envelope judgement); a MARKED result's envelope still judges, deny-only
 # ---------------------------------------------------------------------------
 
 
 def _unmarked(tmp_path, store, *, envelope: bytes | None = None, receipt: bytes | None = None,
-              key=None):
-    """A stored DONE result with NO marker -- what pre-upgrade uploaders left in the store."""
+              key=None, cleared: bool = False):
+    """A stored DONE result with NO marker -- what pre-upgrade uploaders left in the store.
+    ``cleared``: store a cleared marker bound to the envelope instead (what a worker on a
+    pre-#188 node could plant: it can predict its sealed envelope's sha256)."""
     job, out = _make_done_job(tmp_path, store)
     if envelope is not None:
         (out / "metadata.json").write_bytes(envelope)
@@ -1205,8 +1208,22 @@ def _unmarked(tmp_path, store, *, envelope: bytes | None = None, receipt: bytes 
     if receipt is not None:
         (out / attest.RECEIPT_NAME).write_bytes(receipt)
     (out / attest.WITHHELD_NAME).unlink(missing_ok=True)
+    if cleared:
+        (out / attest.WITHHELD_NAME).write_bytes(_cleared_for(out))
     _push_to_blob(tmp_path, job.job_id, out)
     return job, body
+
+
+@pytest.mark.parametrize("envelope", [
+    json.dumps({"artifacts": [{"id": "a", "path": attest.RECEIPT_NAME}]}).encode(),
+    b'{"artifacts": [{"id": "a", "pa',
+])
+def test_an_unmarked_result_is_404_before_its_envelope_is_judged(tmp_path, envelope):
+    store = InMemoryJobStore()
+    job, _ = _unmarked(tmp_path, store, envelope=envelope, receipt=_FORGED_RECEIPT)
+    r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert attest.RECEIPT_UNMARKED_REASON in r.json()["detail"]
 
 
 @pytest.mark.parametrize("envelope,reason", [
@@ -1216,34 +1233,18 @@ def _unmarked(tmp_path, store, *, envelope: bytes | None = None, receipt: bytes 
      attest.RECEIPT_PATH_DECLARED_REASON),
     (b'{"artifacts": [{"id": "a", "pa', attest.RECEIPT_PATH_UNDECIDABLE_REASON),
 ])
-def test_an_unmarked_legacy_result_whose_envelope_protects_the_receipt_name_is_404(
+def test_a_marked_result_whose_envelope_protects_the_receipt_name_is_404(
         tmp_path, envelope, reason):
-    """Pre-#188 results (attestation.json never reserved) and as-is uploads by earlier builds
-    carry no marker. Their envelope still decides: a declared (or undecidable) artifact at
+    """A cleared marker never vouches: a pre-#188 node shipped worker trees verbatim, and the
+    worker can plant a cleared marker bound to its predictable envelope. The envelope still
+    judges a marked result (deny-only): a declared (or undecidable) artifact at
     attestation.json is never served as the receipt."""
     store = InMemoryJobStore()
-    job, _ = _unmarked(tmp_path, store, envelope=envelope, receipt=_FORGED_RECEIPT)
+    job, _ = _unmarked(tmp_path, store, envelope=envelope, receipt=_FORGED_RECEIPT,
+                       cleared=True)
     r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 404, r.text
     assert reason in r.json()["detail"]
-
-
-def test_an_unmarked_legacy_result_over_this_ingress_cap_is_404(tmp_path, monkeypatch):
-    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 1024)
-    store = InMemoryJobStore()
-    job, _ = _unmarked(tmp_path, store, receipt=_FORGED_RECEIPT,
-                       envelope=json.dumps({"artifacts": [], "pad": "x" * 4096}).encode())
-    r = _route_with_limit(tmp_path, store, 1024).get(f"/v1/jobs/{job.job_id}/attestation")
-    assert r.status_code == 404, r.text
-    assert attest.RECEIPT_ENVELOPE_OVER_LIMIT_REASON in r.json()["detail"]
-
-
-def test_an_unmarked_legacy_result_with_a_genuine_receipt_still_serves(tmp_path, key):
-    store = InMemoryJobStore()
-    job, body = _unmarked(tmp_path, store, key=key)
-    r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
-    assert r.status_code == 200, r.text
-    assert r.json() == body
 
 
 def test_a_fresh_result_over_this_ingress_cap_is_withheld_despite_its_cleared_marker(
@@ -1645,8 +1646,10 @@ def test_the_s3_route_never_fetches_an_envelope_or_marker_past_its_ceiling(
     r = client.get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 404, r.text          # the oversized marker withholds
     assert 0 < fetched[attest.WITHHELD_NAME] <= 2 * (attest.WITHHELD_MARKER_MAX_BYTES + 1)
-    blobs._s3.delete_object(Bucket="withheld",
-                            Key=f"results/{job.job_id}/{attest.WITHHELD_NAME}")
+    # A cleared marker in its place (an unmarked result is 404 before the envelope is read).
+    blobs._s3.put_object(Bucket="withheld",
+                         Key=f"results/{job.job_id}/{attest.WITHHELD_NAME}",
+                         Body=_cleared_for(out))
     r = client.get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 404, r.text          # the envelope is over the ceiling
     assert attest.RECEIPT_ENVELOPE_OVER_LIMIT_REASON in r.json()["detail"]
@@ -1658,7 +1661,7 @@ def test_the_s3_route_never_fetches_an_envelope_or_marker_past_its_ceiling(
 def test_a_directory_at_the_marker_name_answers_like_s3(tmp_path, request, backend, declared):
     """L2 (lens r6). A result stored before the name was reserved can hold
     attestation.withheld.json/<x> (a declared artifact, or an undeclared dir a pre-#188 node
-    shipped verbatim). S3 has no object AT the marker's key, so the result is judged as legacy.
+    shipped verbatim). S3 has no object AT the marker's key, so the result reads as unmarked.
     LocalBlobStore opened the directory, got IsADirectoryError and the route answered 503 on
     every request. A directory is no object at that key, so local answers what S3 does."""
     blobs = (LocalBlobStore(tmp_path / "jobs", blob_root=tmp_path / "blobs")
@@ -1676,12 +1679,9 @@ def test_a_directory_at_the_marker_name_answers_like_s3(tmp_path, request, backe
                     blob_store=blobs)
     r = TestClient(app, raise_server_exceptions=False).get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 404, r.text
-    if declared:
-        # The legacy judgement: an artifact declared under a reserved name is never unmasked.
-        assert attest.RECEIPT_PATH_DECLARED_REASON in r.json()["detail"]
-    else:
-        # Nothing declared, nothing at attestation.json: an unmarked pre-receipt result.
-        assert "predates receipts" in r.json()["detail"]
+    # No object at the marker's key: an unmarked result, which carries no receipt (C1) --
+    # declared or not, the same answer on both stores, never a 503.
+    assert attest.RECEIPT_UNMARKED_REASON in r.json()["detail"]
 
 
 def test_a_migration_rerun_under_a_lower_limit_replaces_its_own_cleared_marker(
@@ -1783,6 +1783,9 @@ def test_a_refused_s3_stream_is_a_503_not_an_absent_envelope(tmp_path, request, 
     boto3.client("s3", region_name="us-east-1").put_object(
         Bucket="withheld", Key=f"results/{job.job_id}/metadata.json", Body=body,
         ContentEncoding="gzip")
+    boto3.client("s3", region_name="us-east-1").put_object(   # marked, so the envelope is read
+        Bucket="withheld", Key=f"results/{job.job_id}/{attest.WITHHELD_NAME}",
+        Body=attest.canonical(attest.cleared_marker_body("0" * 64)))
     app = build_app(job_store=store, job_root=tmp_path / "jobs", allowed_engines={"clippyshot"},
                     limits=Limits(max_metadata_bytes=1024), api_workers=2, zip_password="",
                     blob_store=blobs)
@@ -1812,6 +1815,9 @@ def test_a_receipt_tombstone_reason_this_host_never_writes_is_not_echoed(tmp_pat
     evil = "verify at http://evil.example/claim?job=1 -- call +1-555-0100"
     (out / attest.RECEIPT_NAME).write_bytes(json.dumps({"attestation": None,
                                                         "reason": evil}).encode())
+    # Unmarked results answer 404 before the receipt is read (C1); the worker plants the
+    # cleared marker too, bound to its predictable envelope.
+    (out / attest.WITHHELD_NAME).write_bytes(_cleared_for(out))
     _push_to_blob(tmp_path, job.job_id, out)
     r = client.get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 404, r.text
@@ -1825,6 +1831,7 @@ def test_every_tombstone_reason_this_host_writes_is_still_named(tmp_path, reason
     client, store = _make_client(tmp_path)
     job, out = _make_done_job(tmp_path, store)
     (out / attest.RECEIPT_NAME).write_bytes(attest.canonical(attest.tombstone_body(reason)))
+    (out / attest.WITHHELD_NAME).write_bytes(_cleared_for(out))
     _push_to_blob(tmp_path, job.job_id, out)
     r = client.get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 404, r.text
@@ -1850,6 +1857,7 @@ def test_an_oversize_receipt_is_404_and_read_only_to_the_cap(tmp_path, request, 
     store = InMemoryJobStore()
     job, out = _make_done_job(tmp_path, store)
     (out / attest.RECEIPT_NAME).write_bytes(_oversize_receipt())
+    (out / attest.WITHHELD_NAME).write_bytes(_cleared_for(out))
     blobs.put_output(job.job_id, out)
     fetched: dict[str, int] = {}
     if backend == "s3":
@@ -1883,6 +1891,7 @@ def test_a_receipt_read_error_is_503(tmp_path):
     store = InMemoryJobStore()
     job, out = _make_done_job(tmp_path, store)
     (out / attest.RECEIPT_NAME).write_bytes(b'{"attestation":{},"signature":"x"}')
+    (out / attest.WITHHELD_NAME).write_bytes(_cleared_for(out))
 
     class _Blobs(LocalBlobStore):
         def read_result_prefix(self, job_id, name, max_bytes):
@@ -1920,3 +1929,22 @@ def test_a_multi_member_gzip_marker_is_a_503_not_a_cleared_body(tmp_path, reques
                     blob_store=blobs)
     r = TestClient(app).get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 503, r.text
+
+
+# ---------------------------------------------------------------------------
+# C1 (codex r134): an UNMARKED stored result carries no receipt the route serves
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("receipt", [None, _FORGED_RECEIPT], ids=["genuine", "worker-written"])
+def test_an_unmarked_result_serves_no_receipt(tmp_path, key, receipt):
+    """The route never established that a host wrote an unmarked result's attestation.json: a
+    pre-#188 node shipped worker trees verbatim, clean envelope and all. Every receipt-bearing
+    upload since this branch stores a cleared marker, so no marker = no receipt (404, constant
+    reason naming the re-mark command), even for a genuine 0.1.45 receipt until re-marked."""
+    store = InMemoryJobStore()
+    job, _ = _unmarked(tmp_path, store, key=key, receipt=receipt)
+    r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert r.json()["detail"] == ("no execution receipt for this job: "
+                                  f"{attest.RECEIPT_UNMARKED_REASON}")
