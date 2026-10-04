@@ -18,8 +18,17 @@ reads the marker. A 0.1.45 ingress opens `attestation.json` and serves it `200` 
 tombstone. The stored bytes are durable, so this is not limited to the window of a rolling
 upgrade: any later ingress rollback to 0.1.45 serves them too.
 
-The other direction is safe: an upgraded ingress serving results uploaded by 0.1.45 dispatchers
-treats them as unmarked (legacy) results and judges their stored envelope before serving.
+An upgraded ingress serving results uploaded by 0.1.45 dispatchers treats them as unmarked
+(legacy) results and judges their stored envelope before serving. That is **not** fully safe
+during the rollout: a 0.1.45 dispatcher neither reserves nor strips `attestation.withheld.json`,
+so a worker running under a not-yet-upgraded dispatcher can plant a file at that name beside its
+job's genuine receipt. The upgraded ingress reads any marker but the cleared body as the
+uploader's verdict and withholds that job's receipt (`404`) permanently, under a reason worded as
+this host's own (the worker can copy one). Nothing is forged: a worker can only suppress its own
+job's receipt, never get a receipt served. The order is still ingress first because the opposite
+order allows forgery: a 0.1.45 ingress serves an as-is upload's worker-written `attestation.json`
+as a receipt (above). The window closes once every dispatcher runs this release, so keep the
+rollout short: upgrade the dispatchers promptly after the ingresses.
 
 ## Changes
 
