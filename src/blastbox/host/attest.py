@@ -232,15 +232,20 @@ class VerifyKey:
         stated: dict = {}
         text = data.strip()
         if text.startswith(b"{"):
+            # Explicit checks, not asserts: they must survive python -O.
             try:
                 stated = json.loads(text)
-                assert isinstance(stated, dict)
-                pem = stated["public_key_pem"]
-                assert isinstance(pem, str)
-            except Exception as exc:  # noqa: BLE001 -- any shape problem is a refusal
+            except Exception as exc:  # noqa: BLE001 -- any parse problem is a refusal
                 raise VerifyKeyRefused(
                     f"{source}: not a JSON key body with a public_key_pem") from exc
+            pem = stated.get("public_key_pem") if isinstance(stated, dict) else None
+            if not isinstance(pem, str):
+                raise VerifyKeyRefused(f"{source}: not a JSON key body with a public_key_pem")
             text = pem.encode()
+        if text.count(b"-----BEGIN ") != 1:
+            # load_pem_public_key reads the first block and silently drops the rest.
+            raise VerifyKeyRefused(f"{source}: must hold exactly one PEM public key (one "
+                                   "--verify-key per signing host)")
         try:
             pub = serialization.load_pem_public_key(text)
         except (ValueError, TypeError) as exc:

@@ -1212,3 +1212,39 @@ def test_the_largest_receipt_build_receipt_can_produce_is_under_the_read_cap():
                                issued_at_ms=2 ** 63, host="\x01" * (128 << 10))
     body = attest.canonical({"attestation": doc, "signature": key.sign(doc)})
     assert len(body) <= attest._RECEIPT_MAX_BYTES, len(body)
+
+
+def _pub_pem(tmp_path, name):
+    k = attest.load_or_create_key(tmp_path / name)
+    return attest.VerifyKey.from_attest_key(k).public_key.public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+
+
+def test_a_verify_key_file_with_several_pem_blocks_is_refused(tmp_path):
+    """load_pem_public_key reads the first block and drops the rest; a bundled file would
+    silently verify one host and leave the others' receipts unmarked."""
+    bundle = _pub_pem(tmp_path, "a") + _pub_pem(tmp_path, "b")
+    with pytest.raises(attest.VerifyKeyRefused, match="exactly one"):
+        attest.VerifyKey.parse(bundle)
+
+
+def test_a_json_verify_key_with_a_non_string_pem_is_refused_even_under_O(tmp_path):
+    with pytest.raises(attest.VerifyKeyRefused):
+        attest.VerifyKey.parse(b'{"public_key_pem": 5}')
+    with pytest.raises(attest.VerifyKeyRefused):
+        attest.VerifyKey.parse(b'[1, 2]')
+
+
+def test_a_json_verify_key_with_the_wrong_alg_is_refused(tmp_path):
+    body = json.dumps({"alg": "RS256", "public_key_pem": _pub_pem(tmp_path, "a").decode()})
+    with pytest.raises(attest.VerifyKeyRefused, match="alg"):
+        attest.VerifyKey.parse(body.encode())
+
+
+def test_a_verify_key_on_another_curve_is_refused():
+    from cryptography.hazmat.primitives.asymmetric import ec as _ec
+
+    pem = _ec.generate_private_key(_ec.SECP384R1()).public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+    with pytest.raises(attest.VerifyKeyRefused, match="P-256"):
+        attest.VerifyKey.parse(pem)
