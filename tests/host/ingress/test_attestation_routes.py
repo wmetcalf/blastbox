@@ -1786,3 +1786,16 @@ def test_a_refused_s3_stream_is_a_503_not_an_absent_envelope(tmp_path, request, 
                     blob_store=blobs)
     r = TestClient(app).get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 503, r.text
+
+
+def test_the_envelope_absent_marker_reason_is_still_named(tmp_path, key):
+    """_write_vouching_marker writes RECEIPT_ENVELOPE_ABSENT_REASON too; the reason filter must
+    keep naming every reason this host writes, not only write_withheld_marker's."""
+    client, store = _make_client(tmp_path)
+    job, out, _ = _done_with_receipt(tmp_path, store, key)
+    (out / attest.WITHHELD_NAME).write_bytes(attest.canonical(
+        attest.tombstone_body(attest.RECEIPT_ENVELOPE_ABSENT_REASON)))
+    _push_to_blob(tmp_path, job.job_id, out)
+    r = client.get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404
+    assert attest.RECEIPT_ENVELOPE_ABSENT_REASON in r.json()["detail"]

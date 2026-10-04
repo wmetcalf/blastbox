@@ -812,6 +812,9 @@ def write_withheld_marker(out_dir: Path, reason: str, *, limits: Limits | None =
 #: Every reason :func:`write_withheld_marker` is called with: the as-is verdicts of
 #: :func:`tree_receipt_path_protection`.
 WITHHELD_REASONS = (RECEIPT_PATH_DECLARED_REASON, RECEIPT_PATH_UNDECIDABLE_REASON)
+# Every reason this host ever writes into a withheld marker (write_withheld_marker's, plus
+# _write_vouching_marker's no-envelope body). The route names only these.
+MARKER_REASONS = (*WITHHELD_REASONS, RECEIPT_ENVELOPE_ABSENT_REASON)
 
 
 def _read_marker_file(path: Path) -> bytes | None:

@@ -1101,7 +1101,7 @@ def build_app(
                     stated = json.loads(withheld).get("reason")
                     # Name only a reason this host writes: a pre-#188 node shipped worker trees
                     # verbatim, so any other text here may be the worker's.
-                    if stated in _attest.WITHHELD_REASONS:
+                    if stated in _attest.MARKER_REASONS:
                         why = stated
             raise HTTPException(404, f"no execution receipt for this job: {why}")
         # NO ENVELOPE, NO RECEIPT. A genuine receipt always signs metadata_sha256, and put_output
