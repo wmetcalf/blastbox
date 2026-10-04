@@ -241,7 +241,10 @@ class VerifyKey:
             pem = stated.get("public_key_pem") if isinstance(stated, dict) else None
             if not isinstance(pem, str):
                 raise VerifyKeyRefused(f"{source}: not a JSON key body with a public_key_pem")
-            text = pem.encode()
+            try:
+                text = pem.encode()
+            except UnicodeEncodeError as exc:
+                raise VerifyKeyRefused(f"{source}: public_key_pem is not valid text") from exc
         if text.count(b"-----BEGIN ") != 1:
             # load_pem_public_key reads the first block and silently drops the rest.
             raise VerifyKeyRefused(f"{source}: must hold exactly one PEM public key (one "

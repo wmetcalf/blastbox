@@ -1703,6 +1703,16 @@ def _verify_keys_for_remark(paths):
         except _attest.VerifyKeyRefused as exc:
             print(f"error: --verify-key {exc}", file=sys.stderr)
             return None
+    # A receipt names its signer by key_id: two different keys under one id would leave one
+    # host's receipts silently unverified. The same key passed twice is harmless.
+    seen: dict = {}
+    for k in keys:
+        pem = k.public_key.public_bytes(_attest.serialization.Encoding.PEM,
+                                        _attest.serialization.PublicFormat.SubjectPublicKeyInfo)
+        if seen.setdefault(k.key_id, pem) != pem:
+            print(f"error: --verify-key: two different keys share key_id {k.key_id}; pass one "
+                  "per run", file=sys.stderr)
+            return None
     return keys
 
 

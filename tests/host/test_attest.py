@@ -1248,3 +1248,23 @@ def test_a_verify_key_on_another_curve_is_refused():
         serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
     with pytest.raises(attest.VerifyKeyRefused, match="P-256"):
         attest.VerifyKey.parse(pem)
+
+
+def test_a_json_verify_key_whose_pem_cannot_encode_is_refused():
+    """An escaped lone surrogate survives json.loads but not str.encode: a refusal, not a
+    traceback."""
+    with pytest.raises(attest.VerifyKeyRefused):
+        attest.VerifyKey.parse(b'{"public_key_pem": "\\ud800"}')
+
+
+def test_two_distinct_verify_keys_sharing_a_key_id_are_refused(tmp_path, monkeypatch):
+    """A receipt names its signer by key_id; two different keys under one id would leave one
+    host's receipts silently unverified."""
+    from blastbox.host import cli
+
+    a, b = tmp_path / "a.pem", tmp_path / "b.pem"
+    a.write_bytes(_pub_pem(tmp_path, "ka"))
+    b.write_bytes(_pub_pem(tmp_path, "kb"))
+    monkeypatch.setattr(attest.VerifyKey, "key_id", property(lambda self: "same"))
+    assert cli._verify_keys_for_remark([a, b]) is None
+    assert cli._verify_keys_for_remark([a, a]) is not None      # the same key twice is fine
