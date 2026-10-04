@@ -614,7 +614,7 @@ def test_a_migration_without_the_service_limit_never_ships_a_forged_receipt(
 
 def test_a_migration_given_the_service_limit_strips_the_forged_receipt(tmp_path, monkeypatch):
     """With the service's limit the migration parses the envelope exactly as the route will,
-    sees nothing declared, and removes the worker's file before it ships."""
+    sees nothing declared, and replaces the worker's file with a tombstone before it ships."""
     import logging
 
     from blastbox.host.jobs.retention import migrate_legacy_results
@@ -626,7 +626,8 @@ def test_a_migration_given_the_service_limit_strips_the_forged_receipt(tmp_path,
     blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
     assert migrate_legacy_results(job_root, blobs, store, logging.getLogger("t"),
                                   limits=Limits(max_metadata_bytes=1 << 20)) == (1, 0, 0)
-    assert not (job_root / job.job_id / "output" / attest.RECEIPT_NAME).exists()
+    assert attest.is_tombstone(
+        (job_root / job.job_id / "output" / attest.RECEIPT_NAME).read_bytes())
     r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 404, r.text
     assert r.content != _FORGED_RECEIPT
@@ -643,7 +644,8 @@ def test_a_migration_reads_the_limit_from_the_service_env_when_set(tmp_path, mon
     job_root, job = _legacy_tree_with_big_envelope(tmp_path, store)
     blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
     assert migrate_legacy_results(job_root, blobs, store, logging.getLogger("t")) == (1, 0, 0)
-    assert not (job_root / job.job_id / "output" / attest.RECEIPT_NAME).exists()
+    assert attest.is_tombstone(
+        (job_root / job.job_id / "output" / attest.RECEIPT_NAME).read_bytes())
 
 
 def test_migrate_results_cli_threads_max_metadata(tmp_path, monkeypatch):
@@ -1259,8 +1261,9 @@ def test_an_oversize_or_padded_marker_withholds(tmp_path, key, marker):
 
 
 def test_the_migration_strip_branch_stores_the_cleared_marker(tmp_path):
-    """The migration ships a result whose envelope rules the names out WITHOUT a receipt; it
-    still vouches with the cleared marker, so the route never re-judges it."""
+    """The migration ships a result whose envelope rules the names out with a TOMBSTONE at
+    attestation.json (never nothing there: round-6 K1); the tombstone write vouches with the
+    cleared marker, so the route never re-judges it."""
     import logging
 
     from blastbox.host.jobs.retention import migrate_legacy_results
@@ -1300,3 +1303,51 @@ def test_the_sweep_receipt_branch_with_a_declared_marker_artifact_stays_retained
                                  attest_key=key) == 0
     assert not blobs.has_output(job.job_id)
     assert (out / attest.WITHHELD_NAME).read_bytes() == b"accepted"
+
+
+# ---------------------------------------------------------------------------
+# A cleared marker only ever ships beside an attestation.json this host wrote, and it is bound
+# to the envelope it shipped with (round-6 review K1/K2/K3)
+# ---------------------------------------------------------------------------
+
+
+class _DiesBeforeSeal(LocalBlobStore):
+    """put_output stores metadata.json LAST; this store fails exactly there, so everything else
+    of the tree -- attestation.json and the withheld marker included -- is already stored."""
+
+    def _atomic_copy(self, src, dest):
+        if dest.name == "metadata.json":
+            raise OSError(28, "No space left on device")
+        return super()._atomic_copy(src, dest)
+
+
+class _StoreDown(LocalBlobStore):
+    def _atomic_copy(self, src, dest):
+        raise OSError(5, "Input/output error")
+
+
+def test_a_migration_rerun_never_unmasks_a_worker_receipt_an_earlier_partial_upload_stored(
+        tmp_path, monkeypatch):
+    """K1 (lens). Run 1 (a stale --max-metadata) ships the tree as-is and dies before the
+    envelope lands: the worker's attestation.json is stored. Run 2 (the service's limit) strips
+    it LOCALLY and vouched with the cleared marker, shipping nothing at attestation.json -- so the
+    stored worker file was served 200 as the receipt. The strip branch must OVERWRITE it."""
+    import logging
+
+    from blastbox.host.jobs.retention import migrate_legacy_results
+
+    monkeypatch.delenv("BLASTBOX_MAX_METADATA", raising=False)
+    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 1024)
+    store = InMemoryJobStore()
+    job_root, job = _legacy_tree_with_big_envelope(tmp_path, store)
+    bad = _DiesBeforeSeal(job_root, blob_root=tmp_path / "blobs")
+    assert migrate_legacy_results(job_root, bad, store, logging.getLogger("t"),
+                                  limits=Limits(max_metadata_bytes=1024)) == (0, 0, 1)
+    with bad.open_result_only(job.job_id, attest.RECEIPT_NAME) as fh:
+        assert fh.read() == _FORGED_RECEIPT                   # the partial upload stored it
+    good = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
+    assert migrate_legacy_results(job_root, good, store, logging.getLogger("t"),
+                                  limits=Limits(max_metadata_bytes=1 << 20)) == (1, 0, 0)
+    r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert r.content != _FORGED_RECEIPT

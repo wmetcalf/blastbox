@@ -452,6 +452,9 @@ RECEIPT_PATH_UNDECIDABLE_REASON = ("the result's envelope cannot be read to rule
 #: signs the envelope's sha256, and put_output stores the envelope LAST, so its absence means a
 #: partial upload (or a seal that was never shipped) -- nothing at attestation.json is a receipt.
 RECEIPT_ENVELOPE_ABSENT_REASON = "the stored result has no envelope for a receipt to vouch for"
+#: The tombstone the legacy migration ships in place of whatever the worker left at
+#: attestation.json: a pre-blob-store result carries no receipt by construction.
+RECEIPT_LEGACY_MIGRATED_REASON = "a legacy result migrated to the store carries no receipt"
 
 
 def envelope_receipt_path_protection(data: bytes | None) -> str | None:
@@ -587,7 +590,8 @@ def _remove_entry(target: Path, st: os.stat_result) -> None:
             os.unlink(target)
 
 
-def _write_atomic(out_dir: Path, data: bytes, *, gate_verified: bool = False) -> None:
+def _write_atomic(out_dir: Path, data: bytes, *, gate_verified: bool = False,
+                  limits: Limits | None = None) -> None:
     tmp = out_dir / f".{RECEIPT_NAME}.{uuid.uuid4().hex}.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
     try:
@@ -595,7 +599,8 @@ def _write_atomic(out_dir: Path, data: bytes, *, gate_verified: bool = False) ->
             fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
-        strip_receipt(out_dir, gate_verified=gate_verified)   # os.replace cannot replace a dir
+        # os.replace cannot replace a dir
+        strip_receipt(out_dir, gate_verified=gate_verified, limits=limits)
         os.replace(tmp, out_dir / RECEIPT_NAME)
     finally:
         tmp.unlink(missing_ok=True)
@@ -706,11 +711,13 @@ def tombstone_body(reason: str) -> dict:
     return {"attestation": None, "reason": reason}
 
 
-def write_tombstone(out_dir: Path, reason: str, *, gate_verified: bool = False) -> None:
+def write_tombstone(out_dir: Path, reason: str, *, gate_verified: bool = False,
+                    limits: Limits | None = None) -> None:
     """Write the "no receipt for this run" marker. Uploaded like a receipt, so it OVERWRITES a
     superseded attempt's receipt in the store (which never deletes a single object).
-    ``gate_verified`` as for :func:`strip_receipt`."""
-    _write_atomic(Path(out_dir), canonical(tombstone_body(reason)), gate_verified=gate_verified)
+    ``gate_verified`` and ``limits`` as for :func:`strip_receipt`."""
+    _write_atomic(Path(out_dir), canonical(tombstone_body(reason)), gate_verified=gate_verified,
+                  limits=limits)
 
 
 def is_tombstone(data: bytes) -> bool:

@@ -795,10 +795,14 @@ def _migrate_legacy_one(
             return "failed"
         as_is = _attest.tree_receipt_path_protection(out_dir, limits=limits)
         if as_is is None:
-            # No receipt ships, but the result still vouches with the CLEARED marker (over any
-            # undeclared one the worker left), so the route never re-judges its envelope.
-            _attest.strip_receipt(out_dir, limits=limits)
-            _attest.write_cleared_marker(out_dir, limits=limits)
+            # A TOMBSTONE over whatever the worker left at attestation.json, never a local
+            # strip: the store never deletes a single object, so an earlier run that shipped
+            # this tree as-is and died before its envelope landed left the worker's
+            # attestation.json stored, and an upload carrying nothing at that name would leave
+            # it there beside the cleared marker the tombstone write vouches with -- served 200.
+            # The tombstone OVERWRITES it; the cleared marker ships only beside it.
+            _attest.write_tombstone(out_dir, _attest.RECEIPT_LEGACY_MIGRATED_REASON,
+                                    limits=limits)
         else:
             _attest.write_withheld_marker(out_dir, as_is, limits=limits)
             log.warning("legacy migration: %s: %s; uploading it as-is, with no receipt",

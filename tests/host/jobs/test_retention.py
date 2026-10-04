@@ -1605,8 +1605,10 @@ def test_a_protected_ancestor_does_not_disable_the_whole_reclaim(tmp_path):
 
 def test_legacy_migration_never_ships_a_worker_planted_receipt(tmp_path):
     """A pre-blob-store tree was never stripped by a dispatcher, so an attestation.json in it is
-    whatever the worker wrote. Uploading it would make it servable as an execution receipt."""
-    from blastbox.host.attest import RECEIPT_NAME
+    whatever the worker wrote. Uploading it would make it servable as an execution receipt. It
+    ships a TOMBSTONE there instead -- an overwrite, so a copy an earlier partial upload of the
+    same tree stored is replaced too (round-6 K1), never left behind a local strip."""
+    from blastbox.host.attest import RECEIPT_NAME, is_tombstone
 
     store = InMemoryJobStore()
     job = Job.new(engine="redtusk", filename="a.doc")
@@ -1617,7 +1619,8 @@ def test_legacy_migration_never_ships_a_worker_planted_receipt(tmp_path):
     (d / "output" / RECEIPT_NAME).write_text('{"attestation": {"forged": 1}, "signature": "x"}')
     blobs = _FakeBlobs()
     assert migrate_legacy_results(tmp_path, blobs, store, logging.getLogger("t"))[0] == 1
-    assert RECEIPT_NAME not in blobs.stored[_JID]
+    assert RECEIPT_NAME in blobs.stored[_JID]
+    assert is_tombstone((d / "output" / RECEIPT_NAME).read_bytes())
 
 
 class TestRetainedTreeReceipts:
@@ -1913,6 +1916,7 @@ def test_a_retained_tree_with_a_symlinked_seal_tombstones_a_planted_receipt(tmp_
 def test_legacy_migration_strips_a_planted_receipt_beside_a_symlinked_seal(tmp_path):
     """Same for the legacy migration: a symlinked seal is never shipped, so the planted
     attestation.json is stripped, as before the as-is recovery existed."""
+    from blastbox.host import attest
     from blastbox.host.blobs.base import BlobFetchError
     from blastbox.host.blobs.local import LocalBlobStore
 
@@ -1929,9 +1933,11 @@ def test_legacy_migration_strips_a_planted_receipt_beside_a_symlinked_seal(tmp_p
     (out / "attestation.json").write_bytes(_FORGED)
     blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
     migrate_legacy_results(job_root, blobs, store, logging.getLogger("t"))
-    assert not (out / "attestation.json").exists(), "the planted receipt was kept"
-    with pytest.raises(BlobFetchError):
-        blobs.open_result_only(_JID, "attestation.json")
+    assert (out / "attestation.json").read_bytes() != _FORGED, "the planted receipt was kept"
+    with blobs.open_result_only(_JID, "attestation.json") as fh:   # a tombstone overwrote it
+        assert attest.is_tombstone(fh.read())
+    with pytest.raises(BlobFetchError):                            # the symlinked seal never ships
+        blobs.open_result_only(_JID, "metadata.json")
 
 
 def test_legacy_migration_leaves_a_tree_in_place_on_a_transient_envelope_error(
@@ -2019,6 +2025,8 @@ def test_a_flap_inside_strip_leaves_the_retained_tree_for_the_next_tick(tmp_path
 
 
 def test_a_flap_inside_strip_leaves_a_legacy_tree_for_the_next_run(tmp_path, monkeypatch):
+    from blastbox.host import attest
+
     store = InMemoryJobStore()
     job = Job.new(engine="redtusk", filename="a.doc")
     job.job_id = _JID
@@ -2034,7 +2042,7 @@ def test_a_flap_inside_strip_leaves_a_legacy_tree_for_the_next_run(tmp_path, mon
     assert (out / "attestation.json").read_bytes() == _FORGED
     # Nothing recorded the failure: the operator's next run migrates it.
     assert migrate_legacy_results(tmp_path, blobs, store, log) == (1, 0, 0)
-    assert not (out / "attestation.json").exists()
+    assert attest.is_tombstone((out / "attestation.json").read_bytes())
 
 
 # ---------------------------------------------------------------------------
