@@ -675,6 +675,12 @@ def write_withheld_marker(out_dir: Path, reason: str, *, limits: Limits | None =
       tree (an envelope declaring, or unparseable beside, a file at a name reserved since
       before it was accepted) stays retained / counted failed, and the callers log it loudly.
 
+    EXCEPT a regular file holding exactly a withheld body this function writes
+    (:func:`_is_host_withheld_marker`): an earlier attempt's own marker, left in a tree whose
+    upload then failed. It is kept and the tree ships with it. Refusing it stranded every such
+    retry forever -- the undecidable verdict can never rule the name out. Keeping it is safe even
+    for a worker-written lookalike: its presence alone withholds, and nothing is destroyed.
+
     A transient envelope read error propagates (no verdict; retry)."""
     out_dir = Path(out_dir)
     target = out_dir / WITHHELD_NAME
@@ -682,6 +688,8 @@ def write_withheld_marker(out_dir: Path, reason: str, *, limits: Limits | None =
         st: os.stat_result | None = os.lstat(target)
     except FileNotFoundError:
         st = None
+    if st is not None and stat.S_ISREG(st.st_mode) and _is_host_withheld_marker(target):
+        return
     if st is not None:
         shipped, data = _shipped_envelope(out_dir, limits)
         paths = (None if data is None else _artifact_paths_of(data)) if shipped else []
@@ -691,6 +699,31 @@ def write_withheld_marker(out_dir: Path, reason: str, *, limits: Limits | None =
                               f"replace it or ship without it")
         _remove_entry(target, st)
     _write_marker(out_dir, canonical(tombstone_body(reason)))
+
+
+#: Every reason :func:`write_withheld_marker` is called with: the as-is verdicts of
+#: :func:`tree_receipt_path_protection`.
+WITHHELD_REASONS = (RECEIPT_PATH_DECLARED_REASON, RECEIPT_PATH_UNDECIDABLE_REASON)
+
+
+def _is_host_withheld_marker(path: Path) -> bool:
+    """Whether ``path`` is a regular file whose bytes are exactly the canonical withheld body for
+    one of WITHHELD_REASONS. Opened O_NOFOLLOW|O_NONBLOCK, judged on the descriptor and read
+    under WITHHELD_MARKER_MAX_BYTES; anything else (a symlink, a FIFO, an error) is False."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return False
+        data = _read_capped(fd, WITHHELD_MARKER_MAX_BYTES)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return data is not None and any(data == canonical(tombstone_body(r))
+                                    for r in WITHHELD_REASONS)
 
 
 def _write_marker(out_dir: Path, data: bytes) -> None:

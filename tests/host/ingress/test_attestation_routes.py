@@ -1351,3 +1351,51 @@ def test_a_migration_rerun_never_unmasks_a_worker_receipt_an_earlier_partial_upl
     r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
     assert r.status_code == 404, r.text
     assert r.content != _FORGED_RECEIPT
+
+
+def test_a_sweep_as_is_upload_that_fails_once_is_not_stranded_by_its_own_marker(
+        tmp_path, monkeypatch):
+    """K3 (lens/codex/agy). Tick 1 writes the withheld marker into the tree, then the store is
+    down: the tree stays retained WITH the host's marker. Tick 2 saw an entry at the marker's
+    name, could not parse the envelope to rule it out and refused, every tick, forever."""
+    import logging
+
+    from blastbox.host.jobs.retention import retry_pending_uploads
+
+    monkeypatch.setenv("BLASTBOX_MAX_METADATA", "1024")
+    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 1024)
+    store = InMemoryJobStore()
+    job_root, job, out = _retained_tree_with_big_envelope(tmp_path, store)
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    down = _StoreDown(job_root, blob_root=tmp_path / "blobs")
+    assert retry_pending_uploads(job_root, down, store, logging.getLogger("t"),
+                                 attest_key=key) == 0
+    assert (out / attest.WITHHELD_NAME).exists()
+    assert store.get(job.job_id).status is JobStatus.FAILED
+    good = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
+    assert retry_pending_uploads(job_root, good, store, logging.getLogger("t"),
+                                 attest_key=key) == 1
+    assert store.get(job.job_id).status is JobStatus.DONE
+    r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert attest.RECEIPT_PATH_UNDECIDABLE_REASON in r.json()["detail"]
+
+
+def test_a_migration_as_is_upload_that_fails_once_is_not_stranded_by_its_own_marker(
+        tmp_path, monkeypatch):
+    import logging
+
+    from blastbox.host.jobs.retention import migrate_legacy_results
+
+    monkeypatch.delenv("BLASTBOX_MAX_METADATA", raising=False)
+    monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 1024)
+    store = InMemoryJobStore()
+    job_root, job = _legacy_tree_with_big_envelope(tmp_path, store)
+    lim = Limits(max_metadata_bytes=1024)
+    assert migrate_legacy_results(job_root, _StoreDown(job_root, blob_root=tmp_path / "blobs"),
+                                  store, logging.getLogger("t"), limits=lim) == (0, 0, 1)
+    assert migrate_legacy_results(job_root, LocalBlobStore(job_root, blob_root=tmp_path / "blobs"),
+                                  store, logging.getLogger("t"), limits=lim) == (1, 0, 0)
+    r = _route_with_limit(tmp_path, store, 1 << 20).get(f"/v1/jobs/{job.job_id}/attestation")
+    assert r.status_code == 404, r.text
+    assert r.content != _FORGED_RECEIPT

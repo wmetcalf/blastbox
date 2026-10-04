@@ -960,3 +960,42 @@ def test_write_withheld_marker_refuses_a_possibly_declared_directory(tmp_path):
     with pytest.raises(attest.ReceiptPathOccupied):
         attest.write_withheld_marker(out, "why")
     assert (out / attest.WITHHELD_NAME / "page.png").read_bytes() == b"x"
+
+
+@pytest.mark.parametrize("existing", attest.WITHHELD_REASONS)
+@pytest.mark.parametrize("envelope", [
+    _GARBAGE, json.dumps({"artifacts": [{"id": "a", "path": "attestation.withheld.json"}]})])
+def test_write_withheld_marker_keeps_a_marker_an_earlier_attempt_wrote(tmp_path, envelope,
+                                                                      existing):
+    """Round-6 K3: an as-is attempt writes the marker, then its upload fails and the tree stays
+    retained WITH it. The retry must not read it as a possibly-declared artifact (stranded
+    forever); exactly a withheld body this code writes is kept, and the tree ships with it."""
+    out = _withheld_tree(tmp_path, envelope)
+    body = attest.canonical(attest.tombstone_body(existing))
+    (out / attest.WITHHELD_NAME).write_bytes(body)
+    attest.write_withheld_marker(out, attest.RECEIPT_PATH_UNDECIDABLE_REASON)
+    assert (out / attest.WITHHELD_NAME).read_bytes() == body
+    assert (out / attest.RECEIPT_NAME).read_bytes() == b"maybe an artifact"
+
+
+@pytest.mark.parametrize("data", [
+    attest.canonical(attest.tombstone_body("some other reason")),
+    attest.canonical(attest.tombstone_body(attest.RECEIPT_PATH_UNDECIDABLE_REASON)) + b" ",
+    json.dumps(attest.tombstone_body(attest.RECEIPT_PATH_UNDECIDABLE_REASON)).encode(),
+])
+def test_write_withheld_marker_keeps_only_its_exact_canonical_bodies(tmp_path, data):
+    out = _withheld_tree(tmp_path, _GARBAGE)
+    (out / attest.WITHHELD_NAME).write_bytes(data)
+    with pytest.raises(attest.ReceiptPathOccupied):
+        attest.write_withheld_marker(out, attest.RECEIPT_PATH_UNDECIDABLE_REASON)
+    assert (out / attest.WITHHELD_NAME).read_bytes() == data
+
+
+def test_write_withheld_marker_never_keeps_a_symlink_to_a_marker_body(tmp_path):
+    out = _withheld_tree(tmp_path, _GARBAGE)
+    target = tmp_path / "elsewhere"
+    target.write_bytes(attest.canonical(attest.tombstone_body(
+        attest.RECEIPT_PATH_UNDECIDABLE_REASON)))
+    (out / attest.WITHHELD_NAME).symlink_to(target)
+    with pytest.raises(attest.ReceiptPathOccupied):
+        attest.write_withheld_marker(out, attest.RECEIPT_PATH_UNDECIDABLE_REASON)
