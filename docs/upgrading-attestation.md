@@ -153,3 +153,26 @@ storing anything; `--limit N` re-marks (or replaces) in batches.
 Unchanged, and still important: rotate or unset `BLASTBOX_ATTEST_KEY` only when the host has
 no retained pending uploads. The sweep keeps a retained receipt only if it verifies against the
 host's current key; results pending at a rotation ship with a tombstone instead.
+
+## Known limits (verify receipts; the route is a transport)
+
+The ingress holds no dispatcher keys, so `GET /v1/jobs/{id}/attestation` decides what to serve
+from the stored marker, envelope and upload order, never from the signature. Every case below
+serves bytes that are **not** a valid receipt from a pinned key, so a verifier that pins its
+dispatchers' public keys (as Loadout does) rejects them. Always verify; never treat a 200 from
+this route as proof by itself.
+
+- **Results shipped verbatim by a node older than 0.1.44.** Such a node uploaded worker trees
+  as-is, and the worker controlled the envelope, so it could plant a cleared marker bound to its
+  own envelope beside a forged `attestation.json`. The route cannot tell that apart from a host
+  marker.
+- **Two concurrent uploads of the same finished job.** No path in this release uploads a DONE
+  job's prefix twice at once, short of an unfenced re-run by a peer dispatcher. If one ever
+  does, a withholding upload and a clean one can interleave so the route's marker re-read sees
+  identical bytes while the receipt it read belonged to the withholding upload.
+- **A planted exact copy of a host-written withheld body** (during a mixed-version rollout) can
+  only withhold that job's own receipt; `migrate-results --remark` cannot tell it from the
+  host's own verdict.
+
+Closing these at the route would mean pinning dispatcher public keys on the ingress and
+verifying before serving; that is not part of this release.
