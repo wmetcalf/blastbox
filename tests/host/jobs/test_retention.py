@@ -1715,3 +1715,119 @@ def test_a_transient_receipt_read_error_leaves_the_tree_retained_and_intact(tmp_
     assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t"),
                                  attest_key=key) == 1
     assert (out / "attestation.json").read_bytes() == genuine
+
+
+# --- a DONE tree with no local seal is not a "last copy" ------------------------
+#
+# The last-copy rule retains a DONE job's tree when the blob store has no durable copy, on the
+# premise that the tree IS the result. A tree whose output/ holds no sealed metadata.json is not
+# a result at all: the bytes were lost elsewhere, migrate_legacy_results skips it (it needs
+# output/metadata.json), and retaining it made it immortal -- measured on a dev node: 46,407
+# input-only trees, ~19 GB, re-walked every tick under a warning that called them "a sealed
+# result".
+
+
+class TestDoneTreeWithoutALocalSeal:
+
+    _ID = "55555555-5555-4555-8555-555555555555"
+
+    def _done(self, root: Path, *, seal: str | None) -> tuple[InMemoryJobStore, Path]:
+        store = InMemoryJobStore()
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = self._ID
+        job.status = JobStatus.DONE
+        store.create(job)
+        d = root / self._ID
+        (d / "input").mkdir(parents=True)
+        (d / "input" / "a.doc").write_bytes(b"sample")
+        (d / "output").mkdir()
+        if seal == "file":
+            (d / "output" / "metadata.json").write_text('{"sealed": true}')
+        elif seal == "symlink":
+            real = root.parent / "elsewhere.json"
+            real.write_text('{"sealed": true}')
+            (d / "output" / "metadata.json").symlink_to(real)
+        old = time.time() - 99_999
+        for p in sorted(d.rglob("*"), reverse=True) + [d]:
+            os.utime(p, (old, old), follow_symlinks=False)
+        return store, d
+
+    def _reap(self, root: Path, store, blobs) -> int:
+        return reap_stale_scratch(root, 60.0, store, logging.getLogger("t"), blob_store=blobs)
+
+    def test_a_sealed_result_with_no_durable_copy_is_still_retained(self, tmp_path, caplog):
+        root = tmp_path / "jobs"
+        root.mkdir()
+        store, d = self._done(root, seal="file")
+        with caplog.at_level(logging.WARNING):
+            assert self._reap(root, store, _FakeBlobs()) == 0
+        assert (d / "output" / "metadata.json").is_file(), "destroyed the last copy"
+        assert "holding a sealed result" in caplog.text
+        assert "exists nowhere" not in caplog.text
+
+    def test_an_unsealed_done_tree_with_no_durable_copy_is_reclaimed_and_reported_once(
+            self, tmp_path, caplog):
+        root = tmp_path / "jobs"
+        root.mkdir()
+        store, d = self._done(root, seal=None)
+        with caplog.at_level(logging.WARNING):
+            assert self._reap(root, store, _FakeBlobs()) == 1
+        assert not d.exists(), "an input-only tree was retained as if it held a result"
+        lines = [r for r in caplog.records if "exists nowhere" in r.getMessage()]
+        assert len(lines) == 1 and lines[0].levelno == logging.WARNING
+        assert self._ID in lines[0].getMessage()
+        assert "holding a sealed result" not in caplog.text
+
+    def test_a_durable_done_tree_is_reclaimed_as_before(self, tmp_path):
+        root = tmp_path / "jobs"
+        root.mkdir()
+        store, d = self._done(root, seal="file")
+        blobs = _FakeBlobs()
+        blobs.stored[self._ID] = ["metadata.json"]
+        assert self._reap(root, store, blobs) == 1
+        assert not d.exists()
+
+    def test_a_symlinked_metadata_json_is_not_a_seal(self, tmp_path):
+        """The host writes the seal with a confined atomic rename, so it is always a regular
+        file. A symlink in its place was planted by the worker (output/ is its bind mount) and
+        must not buy the tree immortality."""
+        root = tmp_path / "jobs"
+        root.mkdir()
+        store, d = self._done(root, seal="symlink")
+        assert self._reap(root, store, _FakeBlobs()) == 1
+        assert not d.exists()
+        assert (tmp_path / "elsewhere.json").is_file(), "followed the link out of the tree"
+
+    def test_a_symlinked_output_dir_is_not_a_seal(self, tmp_path):
+        root = tmp_path / "jobs"
+        root.mkdir()
+        store, d = self._done(root, seal=None)
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "metadata.json").write_text('{"sealed": true}')
+        (d / "output").rmdir()
+        (d / "output").symlink_to(elsewhere)
+        old = time.time() - 99_999
+        for p in (d / "output", d):
+            os.utime(p, (old, old), follow_symlinks=False)
+        assert self._reap(root, store, _FakeBlobs()) == 1
+        assert not d.exists()
+        assert (elsewhere / "metadata.json").is_file()
+
+    def test_an_unreadable_seal_is_kept_not_reclaimed(self, tmp_path, monkeypatch):
+        """Only "not there" may answer no-seal. An lstat that fails any other way cannot rule
+        the last copy out, so the tree stays."""
+        root = tmp_path / "jobs"
+        root.mkdir()
+        store, d = self._done(root, seal="file")
+        real_lstat = Path.lstat
+
+        def lstat(self, *a, **kw):
+            if self.name == "metadata.json":
+                raise PermissionError("denied")
+            return real_lstat(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "lstat", lstat)
+        assert self._reap(root, store, _FakeBlobs()) == 0
+        monkeypatch.undo()
+        assert (d / "output" / "metadata.json").is_file()

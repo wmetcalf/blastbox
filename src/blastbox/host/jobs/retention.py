@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -44,6 +45,27 @@ _upload_cursor: dict[str, int] = {}
 
 _JOB_ID_RE = re.compile(
     r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
+
+
+def _holds_local_seal(d: Path) -> bool:
+    """Whether job tree ``d`` holds a sealed result on local disk: ``output/`` a real directory and
+    ``output/metadata.json`` a real file in it.
+
+    lstat, never stat: the host writes the seal with a confined atomic rename, so it is always a
+    regular file in a regular directory, and a symlink in either place was planted by the worker
+    (output/ is its 0o777 bind mount). Following it would let a sample buy its tree immortality.
+    Only "it is not there" answers False; any other error cannot rule a seal out, so it answers
+    True and the caller keeps the tree.
+    """
+    try:
+        if not stat.S_ISDIR((d / "output").lstat().st_mode):
+            return False
+        return stat.S_ISREG((d / "output" / "metadata.json").lstat().st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        return True
+
 
 # Only these statuses are eligible for expiry.
 _TERMINAL = frozenset({JobStatus.DONE, JobStatus.FAILED, JobStatus.EXPIRED})
@@ -802,6 +824,7 @@ def reap_stale_scratch(
             pass
     retained_last_copy: list[str] = []
     unreachable_last_copy: list[str] = []
+    unsealed_done: list[str] = []
     unconfirmed: list[str] = []
     clock_suspect: list[str] = []
     # Counts WORK, not deletions. Capping on removals alone never bounded anything in the state
@@ -994,8 +1017,16 @@ def reap_stale_scratch(
             # AGGREGATED, not per-tree: a fleet mid-migration can hold thousands of these, and one
             # WARNING each per tick buries every other line. One count per sweep says it.
             if not durable:
-                retained_last_copy.append(d.name)
-                continue
+                # ...and only if this tree actually IS that copy. A DONE tree with no local seal
+                # holds no result at all (its bytes were lost elsewhere; typically just input/ and
+                # an empty output/), migrate_legacy_results cannot ship it (it needs
+                # output/metadata.json), and retaining it made it immortal: 46,407 such trees on
+                # one dev node, re-walked every tick under a warning calling them "a sealed
+                # result". Nothing to preserve, so it is reclaimed -- and said so, once.
+                if pending or _holds_local_seal(d):
+                    retained_last_copy.append(d.name)
+                    continue
+                unsealed_done.append(d.name)
             # Durable, but the job is still not DONE: the status repair has not landed (a store
             # blip mid-sweep). Deleting now strands the job FAILED forever with bytes it can
             # never serve, because the repair's fall-through needs this tree next tick.
@@ -1022,6 +1053,10 @@ def reap_stale_scratch(
                   "whose job row is gone or expired — nothing can upload them and nothing can "
                   "serve them, so this is data loss, not hygiene (e.g. %s)",
                   len(unreachable_last_copy), ", ".join(sorted(unreachable_last_copy)[:3]))
+    if unsealed_done:
+        log.warning("scratch reclaim: removing %d tree(s) whose DONE job's result exists nowhere "
+                    "(no local seal, no durable copy) — nothing to preserve (e.g. %s)",
+                    len(unsealed_done), ", ".join(sorted(unsealed_done)[:3]))
     if retained_last_copy:
         log.warning("scratch reclaim: retained %d tree(s) holding a sealed result with no durable "
                     "copy in the blob store — deleting them would destroy the last copy (e.g. %s)",
