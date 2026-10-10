@@ -362,7 +362,7 @@ registered a different one, in either boot order, including local-versus-remote.
 
 | Var | Default | Notes |
 |---|---|---|
-| `BLASTBOX_SANDBOX` | auto | Force the inner backend: `nsjail` → `bwrap` → `nono` → `container`. Auto picks the best available; `container` is chosen inside an OCI host. |
+| `BLASTBOX_SANDBOX` | auto | Force the inner backend. Linux: `nsjail` → `bwrap` → `nono` → `container` (auto picks the best available; `container` is chosen inside an OCI host). **macOS:** `seatbelt` → `appsandbox` (see below); `container` is never auto-selected there. A backend forced on the wrong OS is refused, not substituted. |
 | `BLASTBOX_NONO_BIN` | `nono` on PATH | nono binary for the standalone `NonoSandbox` backend. |
 | `BLASTBOX_NONO_STATE_DIR` | `/var/lib/blastbox/nono-state` | nono's relocated `$HOME/.nono` state root (must be **off** the grants). |
 | `BLASTBOX_WORKER_NONO_WRAP` | off | **Outer** nono-wrap of the *whole worker command* (cold path). Landlock-gated: applied under `runc`, **skipped+warned under `runsc`** (gVisor Sentry has no Landlock — see DEPLOYMENT). |
@@ -370,6 +370,25 @@ registered a different one, in either boot order, including local-versus-remote.
 | `BLASTBOX_WORKER_NONO_PROFILE` | `""` | nono profile JSON (e.g. a `blastbox.profile`-generated policy) for the outer wrap; preferred over the coarse baseline grants. |
 | `BLASTBOX_WORKER_NONO_STATE_DIR` | `/run/nono` | Dedicated writable tmpfs for the outer wrap's nono state (off the grants). |
 | `BLASTBOX_ENGINE` | `""` | Worker-side engine selector breadcrumb (reserved; not client-settable). |
+
+### macOS backends (`seatbelt`, `appsandbox`)
+
+Both confine the child with the kernel's Sandbox.kext; design + measurements in
+[specs/2026-10-10-macos-sandbox-design.md](superpowers/specs/2026-10-10-macos-sandbox-design.md).
+`seatbelt` (default) needs no setup. `appsandbox` needs `blastbox macos prepare` once. Check both
+with `blastbox macos doctor [-- <engine self-test>]`. Network is always denied on macOS, even
+when a netpolicy grants egress: there is no netd/rooter there to steer it.
+
+| Var | Default | Notes |
+|---|---|---|
+| `BLASTBOX_MACOS_SCRATCH_DIR` | `$TMPDIR` | Parent of each run's fresh 0700 scratch dir (the child's `HOME`, `TMPDIR`, `CFFIXED_USER_HOME` → framework caches). Deleted after every run. |
+| `BLASTBOX_APPSANDBOX_ROOT` | `~/Library/Application Support/blastbox/appsandbox` | Slot root written by `blastbox macos prepare` (manifest, signed launcher bundles, per-slot `io/`, locks). Must not overlap any `--ro` path. |
+| `BLASTBOX_APPSANDBOX_SLOT_WAIT_S` | `30` | How long a run waits for a free slot before failing. Concurrency == `prepare --slots`. |
+
+`SandboxRequest.accelerators` (`{"gpu", "ane"}`) is default-deny: `seatbelt` opens exactly the
+Metal / Neural Engine driver clients and services each needs; `appsandbox` (Apple's application
+profile) already permits both. Memory: Darwin does not enforce `RLIMIT_AS`, so
+`Limits.memory_bytes` is enforced by polling the sandbox's process-group RSS (SIGKILL when over).
 
 ## Warm pool
 

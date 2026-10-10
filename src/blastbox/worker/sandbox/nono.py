@@ -38,7 +38,9 @@ from typing import Callable
 
 from blastbox.errors import SandboxError, SandboxUnavailable
 from blastbox.limits import Limits
-from blastbox.worker.sandbox.base import SandboxRequest, SandboxResult, kill_sandbox_group
+from blastbox.worker.sandbox.base import (
+    SandboxRequest, SandboxResult, host_platform, kill_sandbox_group,
+)
 
 _MINIMAL_ENV: dict[str, str] = {
     "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -109,7 +111,16 @@ class NonoSandbox:
         nono_bin: str | None = None,
         state_dir: str | os.PathLike[str] | None = None,
         popen: Callable[..., "subprocess.Popen[bytes]"] = subprocess.Popen,
+        platform: str | None = None,
     ) -> None:
+        if (platform or host_platform()) == "darwin":
+            # nono itself runs on macOS (via Seatbelt), but THIS backend's grants are Linux
+            # paths (/proc, /sys, /lib64) and its guarantees are Landlock's. Use the native
+            # `seatbelt` backend there instead of a mis-specified one.
+            raise SandboxUnavailable(
+                "the nono backend is Landlock/Linux-only; on macOS use "
+                "BLASTBOX_SANDBOX=seatbelt (default) or appsandbox"
+            )
         # Resolve a path OR a bare command name (BLASTBOX_NONO_BIN=nono), and validate
         # it is an existing file — so `secure`/binary_missing is accurate and a bare
         # name on PATH doesn't read as missing.

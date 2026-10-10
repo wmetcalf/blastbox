@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import signal
+import sys
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,6 +13,15 @@ from typing import Protocol, runtime_checkable
 from blastbox.limits import Limits  # noqa: F401 — re-exported for convenience
 
 _log = logging.getLogger("blastbox.worker.sandbox")
+
+
+def host_platform() -> str:
+    """``"darwin"`` or ``"linux"`` -- the one place backend selection asks which OS it is on.
+
+    A function (not a constant) so tests can exercise either platform's selection logic on
+    any host, and so the Linux and macOS backends agree on a single answer.
+    """
+    return "darwin" if sys.platform == "darwin" else "linux"
 
 
 def kill_sandbox_group(proc) -> None:
@@ -102,6 +112,15 @@ class SandboxRequest:
 
     The subprocess never inherits ``os.environ``; it receives only a clean
     ``PATH`` + ``HOME=/tmp`` plus these explicit additions.
+    """
+
+    accelerators: frozenset[str] = frozenset()
+    """Hardware the child needs beyond the CPU: ``"gpu"`` (Metal) and/or ``"ane"`` (Neural Engine).
+
+    Default-deny: an empty set grants no accelerator. Honoured by the macOS ``seatbelt``
+    backend, which opens exactly the driver user clients and services each one needs; the
+    ``appsandbox`` backend (Apple's own profile) already permits both. The Linux backends
+    ignore it.
     """
 
 

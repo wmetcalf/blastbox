@@ -5,6 +5,7 @@ Public API::
     from blastbox.worker.sandbox import (
         Sandbox, SandboxRequest, SandboxResult, Mount,
         ContainerSandbox, BubblewrapSandbox, NsjailSandbox,
+        SeatbeltSandbox, AppSandboxSandbox,
         select_sandbox,
     )
 """
@@ -14,10 +15,12 @@ from blastbox.worker.sandbox.base import (
     SandboxRequest,
     SandboxResult,
 )
+from blastbox.worker.sandbox.appsandbox import AppSandboxSandbox
 from blastbox.worker.sandbox.bwrap import BubblewrapSandbox
 from blastbox.worker.sandbox.container import ContainerSandbox
 from blastbox.worker.sandbox.detect import select_sandbox
 from blastbox.worker.sandbox.nsjail import NsjailSandbox
+from blastbox.worker.sandbox.seatbelt import SeatbeltSandbox
 
 __all__ = [
     "Mount",
@@ -27,5 +30,7 @@ __all__ = [
     "BubblewrapSandbox",
     "ContainerSandbox",
     "NsjailSandbox",
+    "SeatbeltSandbox",
+    "AppSandboxSandbox",
     "select_sandbox",
 ]

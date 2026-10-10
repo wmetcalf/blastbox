@@ -133,3 +133,19 @@ def _hermetic_apparmor_env(monkeypatch):
     monkeypatch.delenv("BLASTBOX_APPARMOR_PROFILE", raising=False)
 
 
+
+
+@pytest.fixture(autouse=True)
+def _simulate_linux_unless_marked(request, monkeypatch):
+    """Run the Linux-backend tests as Linux on every host, including a Mac.
+
+    The nsjail/bwrap/nono/container suites are mocked unit tests of Linux selection logic;
+    they ran on macOS before the Seatbelt backends existed and must keep doing so. A module
+    that tests the REAL host platform (the macOS backends) opts out with
+    ``pytestmark = pytest.mark.host_platform``.
+    """
+    if request.node.get_closest_marker("host_platform") is not None:
+        return
+    monkeypatch.setattr("blastbox.worker.sandbox.base.host_platform", lambda: "linux")
+    monkeypatch.setattr("blastbox.worker.sandbox.detect.host_platform", lambda: "linux")
+    monkeypatch.setattr("blastbox.worker.sandbox.nono.host_platform", lambda: "linux")

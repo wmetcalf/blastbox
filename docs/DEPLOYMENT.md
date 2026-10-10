@@ -215,6 +215,52 @@ Source one, add a tier slice, done. The only non-config difference between engin
 worker image (ClippyShot bakes LibreOffice+PDFium; RedTusk bakes JDK+the Tika jar). Both are
 live-proven on the `aws-ec2` disposable tier.
 
+### 3a. macOS workers (Apple frameworks: Vision, the Neural Engine, PDFKit, …)
+
+Some engines only make sense on a Mac: they exist *because* they use Apple's own parsers or ML (a
+QR decoder that must behave exactly like an iPhone, for example). There's no Docker, gVisor or
+Firecracker per job on macOS, and macOS VMs don't get the Neural Engine. So the Mac runs the generic
+`http_agent`, and each job's engine subprocess runs in a **per-run Seatbelt sandbox**:
+
+```
+dispatcher ──remote_http──▶ Mac: http_agent ──▶ engine.detonate() ──▶ select_sandbox()
+                                                                      ├─ seatbelt   (default)
+                                                                      └─ appsandbox (opt-in)
+```
+
+Nothing new on the host side. A Mac is a `static` (or `cascade`) worker like any other box. A
+Mac-only deployment points its own dispatcher at a local agent:
+
+```sh
+# on the Mac
+BLASTBOX_ENGINE=william_tells.blastbox_engine:WilliamTellsEngine \
+BLASTBOX_WORKER_AGENT_TOKEN=... python -m blastbox.worker.http_agent       # :8765
+
+# Mac-only: dispatcher on the same Mac            # or a Linux dispatcher on the LAN
+BLASTBOX_POOL_RUNTIME=static                       BLASTBOX_POOL_RUNTIME=static
+BLASTBOX_STATIC_WORKERS=127.0.0.1:8765             BLASTBOX_STATIC_WORKERS=mac1:8765,mac2:8765
+```
+
+`deploy/macos/` has a launchd agent for this. **Per-job isolation lives in the sandbox, not the
+agent.** The agent is long-lived and only spools bytes and seals output; every engine subprocess
+gets a fresh profile, a fresh scratch `HOME`/`TMPDIR`/cache dir, no network, and only the paths it
+was granted.
+
+**Which macOS backend?**
+
+| | `seatbelt` (default) | `appsandbox` |
+|---|---|---|
+| Profile | per-run, deny-default, built from the request | Apple's application profile (+ per-slot path exceptions) |
+| Mach services / drivers | only what `accelerators` asks for | whatever App Sandbox allows apps (much broader) |
+| Applied by | `sandbox-exec` (deprecated CLI, same kernel mechanism) | the kernel at launch, from the launcher's signature |
+| Setup | none | `blastbox macos prepare --slots N --ro <engine dirs>` |
+| Paths | real (identity mounts) | mounts staged into the slot (APFS clone) and copied back |
+| Cost | free | free (ad-hoc signing, no Apple Developer account) |
+
+Run `blastbox macos doctor -- <engine self-test>` after install and after every macOS update. If a
+Neural Engine or GPU grant goes missing, an engine like Vision usually doesn't crash; it just
+returns **no result**. Only a known-positive self-test catches that.
+
 ### 4. Auto-sizing a multi-worker host (node pool autosizer)
 
 Shapes 2 and 3 hand-tune `BLASTBOX_POOL_CEILING`/`WARM_SIZE` per dispatcher. On a host that runs
