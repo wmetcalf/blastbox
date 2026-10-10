@@ -56,3 +56,17 @@ def test_detected_without_label_does_not_raise():
     env = types.SimpleNamespace(status="ok", artifacts=[], warnings=[],
                                 detected=object(), payload=None)
     assert _build_result_summary(env)["detected"] is None
+
+
+def test_bare_record_payload_surfaces_its_own_scalar_fields():
+    # An engine whose whole result is one Record (no EmbeddedResource wrapper) gets
+    # the same list-view meta; nested Records and long strings stay out.
+    from blastbox.contract import Record
+
+    env = types.SimpleNamespace(
+        status="ok", artifacts=[], warnings=[], detected=None,
+        payload=Record(fields={"schema": "wtqrk.scan/1", "detection_count": 2,
+                               "payloads": ["https://x"], "first": "y" * 500,
+                               "detections": Record(fields={})}))
+    s = _build_result_summary(env)
+    assert s["meta"] == {"schema": "wtqrk.scan/1", "detection_count": 2}

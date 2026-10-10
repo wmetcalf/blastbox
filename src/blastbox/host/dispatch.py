@@ -168,7 +168,10 @@ def _build_result_summary(envelope) -> dict:
         "detected": getattr(det, "label", None),
     }
     try:
-        pm = envelope.payload.metadata
+        # An EmbeddedResource payload carries its fields in `.metadata`; a bare Record
+        # payload (engines whose result is one structured record) IS the fields.
+        payload = envelope.payload
+        pm = payload if getattr(payload, "type", None) == "record" else payload.metadata
         if pm and pm.fields:
             meta = {
                 k: v

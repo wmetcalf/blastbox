@@ -241,7 +241,14 @@ BLASTBOX_POOL_RUNTIME=static                       BLASTBOX_POOL_RUNTIME=static
 BLASTBOX_STATIC_WORKERS=127.0.0.1:8765             BLASTBOX_STATIC_WORKERS=mac1:8765,mac2:8765
 ```
 
-`deploy/macos/` has a launchd agent for this. **Per-job isolation lives in the sandbox, not the
+`deploy/macos/` has launchd agents for all three processes: `io.blastbox.worker-agent` on every
+Mac, plus `io.blastbox.ingress` and `io.blastbox.dispatcher` for a Mac-only deployment. The last
+two source **one** env file, so `serve` and `dispatch` can't disagree on the queue, the job root or
+an engine's `PARAM_KEYS`. A `static` dispatcher refuses to start until an agent answers `/healthz`,
+and the agent runs its engine's self-test first, so the dispatcher plist restarts on a throttle
+until the agent is up. Measured on a Mac with the William Tells engine (`williamtells`): ingress,
+SQLite queue, dispatcher and agent on one host, about 270 ms per image end to end, with signed
+attestation. **Per-job isolation lives in the sandbox, not the
 agent.** The agent is long-lived and only spools bytes and seals output; every engine subprocess
 gets a fresh profile, a fresh scratch `HOME`/`TMPDIR`/cache dir, no network, and only the paths it
 was granted.

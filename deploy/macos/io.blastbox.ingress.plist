@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd agent for the shared ingress (blastbox serve) with the engine's extension, for a Mac-only deployment
+  (ingress + dispatcher + worker agent on one Mac). On a mixed fleet run these on Linux instead
+  and keep only io.blastbox.worker-agent on the Macs.
+
+  Configuration comes from ONE env file (KEY=value lines, sourced with `set -a`), so serve and
+  dispatch can't drift apart -- they must agree on BLASTBOX_DATABASE_URL, BLASTBOX_JOB_ROOT and
+  every BLASTBOX_ENGINE_<NAME>_* knob. Keep it 0600: it holds the worker-agent token.
+
+    cp io.blastbox.ingress.plist ~/Library/LaunchAgents/
+    # edit the two REPLACE_ME paths below
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.blastbox.ingress.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.blastbox.ingress</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>set -a; . "$BLASTBOX_ENV_FILE"; set +a; exec "$BLASTBOX_BIN" serve --host "${BLASTBOX_SERVE_HOST:-127.0.0.1}" --port "${BLASTBOX_SERVE_PORT:-8000}"</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>BLASTBOX_ENV_FILE</key>
+    <string>REPLACE_ME/blastbox-host.env</string>
+    <key>BLASTBOX_BIN</key>
+    <string>REPLACE_ME/venv/bin/blastbox</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/blastbox-ingress.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/blastbox-ingress.log</string>
+</dict>
+</plist>
