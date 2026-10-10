@@ -1,6 +1,6 @@
-# Upgrading: execution-receipt hardening (unreleased, after 0.1.45)
+# Upgrading to 0.1.46: execution-receipt hardening
 
-This branch hardens the execution receipt (`attestation.json`, `GET /v1/jobs/{id}/attestation`)
+Release 0.1.46 hardens the execution receipt (`attestation.json`, `GET /v1/jobs/{id}/attestation`)
 and the node-share metrics view. Read **Upgrade order** before rolling it out: the ingress must be
 upgraded first, and must not be rolled back past this release afterwards.
 
