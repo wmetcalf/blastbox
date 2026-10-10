@@ -41,6 +41,8 @@ from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry
 from blastbox import __version__
 from blastbox.errors import sanitize_public_error
 from blastbox.host.blobs.base import BlobStore
+from blastbox.host.blobs.base import is_missing_blob as _blob_is_missing
+from blastbox.host.blobs.base import read_result_prefix as _read_result_prefix
 from blastbox.host.jobs.base import VALID_TIERS, Job, JobStatus, JobStore
 from blastbox.host.jobs.factory import build_job_store_from_env
 from blastbox.limits import Limits
@@ -1026,33 +1028,12 @@ def build_app(
 
     from blastbox.host import attest as _attest
 
-    def _is_missing_blob(exc: BaseException) -> bool:
-        """A receipt that is absent (404) vs a store that failed (503). S3BlobStore wraps both in
-        BlobFetchError, so look at the cause: a missing file, or an S3 NoSuchKey/404.
-        LocalBlobStore raises a CAUSELESS BlobFetchError for an absent object (every real I/O
-        failure there carries its OSError as the cause)."""
-        from blastbox.host.blobs.base import BlobFetchError
-
-        if isinstance(exc, BlobFetchError) and exc.__cause__ is None:
-            return True
-        seen: set[int] = set()
-        cur: BaseException | None = exc
-        while cur is not None and id(cur) not in seen:
-            seen.add(id(cur))
-            if isinstance(cur, FileNotFoundError):
-                return True
-            code = str(((getattr(cur, "response", None) or {}).get("Error") or {}).get("Code", ""))
-            if code in ("NoSuchKey", "404", "NotFound"):
-                return True
-            cur = cur.__cause__ or cur.__context__
-        return False
-
     @app.get("/v1/jobs/{job_id}/attestation")
     def get_attestation(job_id: str):
         """The execution receipt the dispatcher that ran this job signed when it sealed the DONE
         result -- served byte-for-byte, never synthesized. 404 unknown job or no receipt (no key
         on that dispatcher, a failed job, a pre-receipt result); 409 queued/running; 410 expired;
-        503 when the blob store cannot be read."""
+        503 when the blob store cannot be read or the result changed while being read."""
         _validate_job_id(job_id)
         job = _job_store.get(job_id)
         if job is None:
@@ -1065,30 +1046,137 @@ def build_app(
             raise HTTPException(404, "no execution receipt: only DONE results carry one")
         # ONLY the durable results prefix. LocalBlobStore.open_output falls back to the LEGACY
         # on-disk tree, which no dispatcher ever sanitised -- an attestation.json there is whatever
-        # the worker wrote -- so a store offering a no-fallback read is always read through it.
-        opener = getattr(_blob_store, "open_result_only", None) or _blob_store.open_output
+        # the worker wrote -- so every read below goes through read_result_prefix, which uses a
+        # store's no-fallback read whenever it offers one.
+        # THE UPLOADER'S VERDICT FIRST. Every as-is upload (its envelope declared, or under THAT
+        # process's ceiling could not rule out, an artifact at attestation.json) stores the
+        # WITHHELD marker, and every upload that ships a receipt or tombstone stores the CLEARED
+        # body bound to the envelope it shipped:
+        #   * anything but a well-formed cleared body -- the withheld body, unparseable, a
+        #     near-miss, over the read cap, the pre-binding cleared body: 404;
+        #   * NO marker at all: 404 (codex r134 C1). The route cannot establish that a host
+        #     wrote an unmarked result's attestation.json -- a pre-#188 node shipped worker trees
+        #     verbatim, clean envelope and all -- and every receipt-bearing upload since this
+        #     release stores a cleared marker. Genuine 0.1.44/0.1.45 receipts are re-marked by
+        #     `blastbox migrate-results --remark` (run where the job store can be enumerated),
+        #     which verifies each one against its signing host's PUBLIC key before storing its
+        #     cleared marker.
+        #   * a cleared body: it must be BOUND to the stored envelope (checked below, against
+        #     the sha256 of the bytes read under the ceiling); bound to any other envelope it is
+        #     not the uploader's marker for THIS result: 404 (codex r139 P1). Then the envelope
+        #     still decides (deny-only) -- a cleared marker never makes the route serve what
+        #     the envelope judgement would refuse. The binding NARROWS but does not close the
+        #     known residual: a pre-#188 dispatcher shipped a worker's tree verbatim, and that
+        #     worker can predict its own sealed envelope's sha256 and plant a marker bound to it.
+        # A marker that cannot be read is no verdict: 503.
+        cap = _attest.WITHHELD_MARKER_MAX_BYTES
         try:
-            fh = opener(job_id, _attest.RECEIPT_NAME)
+            withheld = _read_result_prefix(
+                _blob_store, job_id, _attest.WITHHELD_NAME, cap + 1)
         except Exception as exc:
-            if _is_missing_blob(exc):
-                raise HTTPException(404, "no execution receipt for this job (its dispatcher "
-                                         "had no attestation key, or it predates receipts)")
-            _log.warning("attestation: receipt read failed for job=%s: %s", job_id, exc)
-            raise HTTPException(503, "could not read the execution receipt")
+            if not _blob_is_missing(exc):
+                _log.warning("attestation: withheld-marker read failed for job=%s: %s",
+                             job_id, exc)
+                raise HTTPException(503, "could not read the execution receipt")
+            raise HTTPException(404, "no execution receipt for this job: "
+                                     f"{_attest.RECEIPT_UNMARKED_REASON}")
+        bound_sha = None if len(withheld) > cap else _attest.bound_cleared_marker_sha256(withheld)
+        if bound_sha is None:
+            why = _attest.RECEIPT_WITHHELD_REASON
+            if len(withheld) <= cap and _attest.is_tombstone(withheld):
+                with contextlib.suppress(Exception):
+                    stated = json.loads(withheld).get("reason")
+                    # Name only a reason this host writes: a pre-#188 node shipped worker trees
+                    # verbatim, so any other text here may be the worker's.
+                    if stated in _attest.MARKER_REASONS:
+                        why = stated
+            raise HTTPException(404, f"no execution receipt for this job: {why}")
+        # NO ENVELOPE, NO RECEIPT. A genuine receipt always signs metadata_sha256, and put_output
+        # stores metadata.json LAST, so a prefix without it is a partial upload (possibly of an
+        # as-is tree whose attestation.json landed before its marker did) or a seal put_output
+        # would not ship.
+        #
+        # THE ENVELOPE DECIDES, read under THIS app's ceiling and never past it (no uncapped
+        # hash per request) -- on every store: read_result_prefix streams an S3 body and stops,
+        # where open_output would download and gunzip the whole object first (lens r7 F2). Over the ceiling it cannot be parsed to rule out a declared
+        # artifact at attestation.json, so the receipt is withheld -- fail closed, even for a
+        # genuine receipt a dispatcher with a larger limit signed (round 7 supersedes
+        # 5f731d4 / deepseek D1): the 404 names BLASTBOX_MAX_METADATA so the operator aligns
+        # the ingress's limit with the dispatchers'. Within it, a declared or unparseable
+        # reserved path answers 404, which no genuine result has (the trust gate refuses a
+        # declaration at either name).
+        envelope_cap = _attest.envelope_cap(_limits)
         try:
-            with fh:
-                data = fh.read()
+            envelope = _read_result_prefix(_blob_store, job_id, "metadata.json",
+                                           envelope_cap + 1)
+        except Exception as exc:
+            if not _blob_is_missing(exc):
+                _log.warning("attestation: envelope read failed for job=%s: %s", job_id, exc)
+                raise HTTPException(503, "could not read the execution receipt")
+            raise HTTPException(404, "no execution receipt for this job: "
+                                     f"{_attest.RECEIPT_ENVELOPE_ABSENT_REASON}")
+        if len(envelope) > envelope_cap:
+            raise HTTPException(404, "no execution receipt for this job: "
+                                     f"{_attest.RECEIPT_ENVELOPE_OVER_LIMIT_REASON}")
+        if hashlib.sha256(envelope).hexdigest() != bound_sha:
+            raise HTTPException(404, "no execution receipt for this job: "
+                                     f"{_attest.RECEIPT_MARKER_UNBOUND_REASON}")
+        why_not = _attest.envelope_receipt_path_protection(envelope)
+        if why_not is not None:
+            raise HTTPException(404, f"no execution receipt for this job: {why_not}")
+        # The receipt itself, read only to the cap like the marker and the envelope (an S3
+        # object is streamed and the fetch stops). No receipt build_receipt produces comes near
+        # _RECEIPT_MAX_BYTES, so anything past it is not one: 404, never read in full.
+        receipt_cap = _attest._RECEIPT_MAX_BYTES
+        try:
+            data = _read_result_prefix(_blob_store, job_id, _attest.RECEIPT_NAME,
+                                       receipt_cap + 1)
         except Exception as exc:  # noqa: BLE001 - a partial receipt must never be served
+            if _blob_is_missing(exc):
+                # A cleared marker with nothing at attestation.json: a delete that stopped
+                # partway (it removes attestation.json first, the marker last).
+                raise HTTPException(404, "no execution receipt for this job: "
+                                         f"{_attest.RECEIPT_ABSENT_REASON}")
             _log.warning("attestation: receipt read failed for job=%s: %s", job_id, exc)
             raise HTTPException(503, "could not read the execution receipt")
+        if len(data) > receipt_cap:
+            raise HTTPException(404, "no execution receipt for this job: "
+                                     f"{_attest.RECEIPT_OVERSIZE_REASON}")
         if _attest.is_tombstone(data):
             # The finalizing dispatcher did not sign (no key, signing failed, ...) and said so,
-            # overwriting any superseded attempt's receipt. Absent, not an error.
-            try:
-                why = str(json.loads(data).get("reason") or "unspecified")[:200]
-            except Exception:  # noqa: BLE001
-                why = "unspecified"
+            # overwriting any superseded attempt's receipt. Absent, not an error. Name only a
+            # reason this host writes: a pre-#188 node shipped worker trees verbatim, so any
+            # other text here may be the worker's (as for the marker above).
+            why = _attest.RECEIPT_TOMBSTONE_REASON
+            with contextlib.suppress(Exception):
+                stated = json.loads(data).get("reason")
+                if stated in _attest.TOMBSTONE_REASONS:
+                    why = stated
             raise HTTPException(404, f"no execution receipt for this job: {why}")
+        # THE READ SANDWICH (codex r140). The marker, the envelope and the receipt are three
+        # separate reads, so a re-upload of this prefix can land between them: the request read
+        # the old CLEARED marker bound to M0 and M0 itself, then an as-is re-upload stored its
+        # WITHHELD marker and the worker's attestation.json, and the read above returned the
+        # worker's bytes. put_output always stores a withholding marker BEFORE the receipt it
+        # withholds, so any receipt read that observed replaced bytes is followed by a marker
+        # read that observes the replaced marker. Re-read it under the same bound and serve only
+        # if it is byte-identical to the first read; changed, gone or unreadable: 503, retry
+        # (deny-only: the deny paths above never need it). The envelope is not re-read: the
+        # first marker was checked BOUND to the envelope we read, and an upload that replaces
+        # the envelope replaces the marker first (metadata.json is stored LAST), so an unchanged
+        # marker means no WITHHOLDING upload has reached the receipt since the first read. A
+        # CLEARED re-upload can: it stores its receipt before its marker, so the receipt read may
+        # already see its bytes while the marker re-read still matches. Those bytes are that
+        # upload's genuine host receipt (or tombstone), not a worker's, so serving them is not a
+        # forgery -- at worst a genuine receipt bound to a sibling envelope of the same job.
+        try:
+            again = _read_result_prefix(_blob_store, job_id, _attest.WITHHELD_NAME, cap + 1)
+        except Exception as exc:  # noqa: BLE001 - absent or unreadable: no stable verdict
+            _log.warning("attestation: withheld-marker re-read failed for job=%s: %s",
+                         job_id, exc)
+            again = None
+        if again != withheld:
+            raise HTTPException(503, "the result changed while being read; retry")
         return Response(content=data, media_type="application/json")
 
     @app.get("/v1/attestation/key")

@@ -812,8 +812,15 @@ class VmJobDispatcher:
             if ok:
                 # The receipt goes INTO the sealed tree immediately before it ships (see
                 # Dispatcher._upload_output): same put_output, same results prefix.
-                self._seal_receipt(job, self._job_dir(job) / "output", observation)
-                upload_exc = upload_output_with_retry(
+                sealed = self._seal_receipt(job, self._job_dir(job) / "output", observation)
+                # Not sealed = what is at attestation.json lacks its cleared marker (our receipt
+                # without it, a tombstone without it, or nothing written at all, so a
+                # worker-planted file may still be there): refuse the upload -- put_output is
+                # never called -- taking the ordinary failure path below (FAILED, retained for
+                # the pending-upload sweep).
+                upload_exc: Exception | None = RuntimeError(
+                    f"{_attest.SEAL_INCOMPLETE_REASON} at {_attest.RECEIPT_NAME}; nothing was "
+                    f"uploaded") if not sealed else upload_output_with_retry(
                     self._blobs, job.job_id, self._job_dir(job) / "output",
                     attempts=self._put_output_max_attempts,
                     backoff_s=self._put_output_retry_backoff_s,
@@ -836,14 +843,23 @@ class VmJobDispatcher:
                     # a sealed result looking like ordinary scratch. The marker carries our claim,
                     # so the finally can withdraw it if this attempt turns out not to own the job.
                     mark_pending_upload(self._job_root, job.job_id, logger, job.claim_id)
-                    logger.error(
-                        "vm_dispatch: result upload failed for %s after %d attempt(s) (%s); "
-                        "failing the job and RETAINING its output for the pending-upload sweep",
-                        job.job_id, self._put_output_max_attempts, upload_exc,
-                    )
+                    if sealed:
+                        logger.error(
+                            "vm_dispatch: result upload failed for %s after %d attempt(s) (%s); "
+                            "failing the job and RETAINING its output for the pending-upload "
+                            "sweep", job.job_id, self._put_output_max_attempts, upload_exc,
+                        )
+                        err = (f"result upload failed after {self._put_output_max_attempts} "
+                               f"attempts; {RESULT_RETAINED_MARKER}")
+                    else:
+                        logger.error(
+                            "vm_dispatch: result for %s NOT uploaded: %s (see the attestation "
+                            "error above); failing the job and RETAINING its output for the "
+                            "pending-upload sweep", job.job_id, upload_exc,
+                        )
+                        err = (f"result not uploaded: {_attest.SEAL_INCOMPLETE_REASON}; "
+                               f"{RESULT_RETAINED_MARKER}")
                     ok = False
-                    err = (f"result upload failed after {self._put_output_max_attempts} "
-                           f"attempts; {RESULT_RETAINED_MARKER}")
                     # Finding S1: a partial result may already be sitting under
                     # results/<job_id> (some of put_output's per-file writes may have landed
                     # before a later one failed). This attempt marks the job FAILED (never
@@ -986,19 +1002,14 @@ class VmJobDispatcher:
             return None
 
     def _seal_receipt(self, job: Job, out_dir: Path,
-                      observation: "_attest.RunObservation | None") -> None:
-        """Strip a planted attestation.json and, with a key, write ours. Never raises."""
-        try:
-            _attest.seal_receipt(out_dir, key=self._attest_key, observation=observation,
-                                 reason="input could not be hashed")
-        except Exception as exc:  # noqa: BLE001
-            logger.error("attestation: could not write the receipt for job %s (%s); the job "
-                         "completes without one", job.job_id, exc)
-            try:
-                _attest.write_tombstone(out_dir, "signing failed")
-            except Exception:  # noqa: BLE001
-                logger.exception("attestation: could not write a tombstone for job %s",
-                                 job.job_id)
+                      observation: "_attest.RunObservation | None") -> bool:
+        """Strip a planted attestation.json and write ours (or a tombstone). Never raises.
+        False when what is at attestation.json lacks its cleared marker (our receipt landed but
+        its marker did not, a tombstone's marker failed, or nothing could be written there): the
+        tree must then not ship -- the job is FAILED and the tree retained for the sweep."""
+        return _attest.seal_fresh_receipt(out_dir, key=self._attest_key,
+                                          observation=observation, job_id=job.job_id,
+                                          reason=_attest.INPUT_UNHASHED_REASON)
 
     def _sealed_envelope(self, job: Job) -> Any:
         """Parse the HOST-SEALED metadata.json (the Envelope the trust gate wrote) for the remote path,

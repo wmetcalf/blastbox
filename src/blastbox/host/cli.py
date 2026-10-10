@@ -1647,6 +1647,20 @@ def _migrate_results_cmd(args) -> int:
     from blastbox.host.jobs.factory import build_job_store_from_env
     from blastbox.host.jobs.retention import migrate_legacy_results
 
+    if args.verify_key and not args.remark:
+        print("error: --verify-key applies only with --remark", file=sys.stderr)
+        return 2
+    # The service's metadata limit, so the receipt-path decision matches the attestation route's
+    # (see migrate_legacy_results). None = unknown: envelopes past the fixed floor are refused
+    # rather than judged against the wrong limit. A bad value is a usage error, never a traceback.
+    try:
+        limits = _migration_limits(args)
+    except ValueError as exc:
+        print(f"error: metadata limit: {exc}", file=sys.stderr)
+        return 2
+    key = _verify_keys_for_remark(args.verify_key) if args.remark else None
+    if args.remark and key is None:
+        return 2
     job_root = _Path(
         args.job_root or _os.environ.get("BLASTBOX_JOB_ROOT", "/var/lib/blastbox/jobs")
     )
@@ -1655,6 +1669,8 @@ def _migrate_results_cmd(args) -> int:
     )
     store = build_job_store_from_env()
     log = _logging.getLogger("blastbox.migrate")
+    if key is not None:
+        return _remark_receipts(args, blobs, store, log, key, limits)
     migrated, skipped, failed = migrate_legacy_results(
         job_root,
         blobs,
@@ -1662,10 +1678,91 @@ def _migrate_results_cmd(args) -> int:
         log,
         limit=args.limit,
         dry_run=args.dry_run,
+        limits=limits,
     )
     print(
         f"migrated={migrated} already-durable={skipped} failed={failed}"
         + (" (dry run — nothing was uploaded)" if args.dry_run else "")
+    )
+    return 1 if failed else 0
+
+
+def _verify_keys_for_remark(paths):
+    """The keys ``migrate-results --remark`` verifies with: each ``--verify-key`` (a public key,
+    PEM or the GET /v1/attestation/key JSON body), else this host's own attest key. None =
+    refused (reported)."""
+    from blastbox.host import attest as _attest
+
+    if not paths:
+        own = _attest_key_for_remark()
+        return None if own is None else [own]
+    keys = []
+    for path in paths:
+        try:
+            keys.append(_attest.load_verify_key(path))
+        except _attest.VerifyKeyRefused as exc:
+            print(f"error: --verify-key {exc}", file=sys.stderr)
+            return None
+    # A receipt names its signer by key_id: two different keys under one id would leave one
+    # host's receipts silently unverified. The same key passed twice is harmless.
+    seen: dict = {}
+    for k in keys:
+        pem = k.public_key.public_bytes(_attest.serialization.Encoding.PEM,
+                                        _attest.serialization.PublicFormat.SubjectPublicKeyInfo)
+        if seen.setdefault(k.key_id, pem) != pem:
+            print(f"error: --verify-key: two different keys share key_id {k.key_id}; pass one "
+                  "per run", file=sys.stderr)
+            return None
+    return keys
+
+
+def _attest_key_for_remark():
+    """This host's existing attest key for ``migrate-results --remark``, or None (reported)."""
+    from blastbox.host import attest as _attest
+
+    if _attest.attest_key_path() is None:
+        print(f"error: --remark verifies receipts with each signing host's public key: pass "
+              f"--verify-key PATH per host, or set {_attest.ATTEST_KEY_ENV} to use this host's "
+              f"own key", file=sys.stderr)
+        return None
+    key = _attest.load_attest_key(create=False)
+    if key is None:
+        print(f"error: the key at {_attest.ATTEST_KEY_ENV} could not be loaded (see the log); "
+              "run as the dispatcher's service user", file=sys.stderr)
+    return key
+
+
+def _migration_limits(args):
+    """--max-metadata, else BLASTBOX_MAX_METADATA from this shell, else None. Raises
+    ValueError on a value Limits refuses."""
+    import os as _os
+
+    from blastbox.limits import Limits as _Limits
+
+    if args.max_metadata is not None:
+        return _Limits(max_metadata_bytes=args.max_metadata)
+    if _os.environ.get("BLASTBOX_MAX_METADATA") is not None:
+        return _Limits.from_env()
+    return None
+
+
+def _remark_receipts(args, blobs, store, log, keys, limits) -> int:
+    """``migrate-results --remark``: store the cleared marker beside each genuine receipt one of
+    ``keys`` signed that a 0.1.44/0.1.45 upload left unmarked (see remark_stored_receipts)."""
+    from blastbox.host.jobs.retention import JobEnumerationFailed, remark_stored_receipts
+
+    try:
+        remarked, already, unverified, failed, replaced = remark_stored_receipts(
+            blobs, store, keys, log, limit=args.limit, dry_run=args.dry_run, limits=limits)
+    except JobEnumerationFailed as exc:
+        print(f"error: {exc}; run --remark where the job store can be enumerated (the control "
+              "plane), with --verify-key PATH for each signing node's public key",
+              file=sys.stderr)
+        return 2
+    print(
+        f"remarked={remarked} already-marked={already} unverified={unverified} failed={failed}"
+        f" replaced={replaced}"
+        + (" (dry run — nothing was stored)" if args.dry_run else "")
     )
     return 1 if failed else 0
 
@@ -2054,6 +2151,34 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="report what would be uploaded without touching the blob store",
+    )
+    pm.add_argument(
+        "--max-metadata",
+        type=int,
+        default=None,
+        metavar="BYTES",
+        help="the service's BLASTBOX_MAX_METADATA (default: this shell's, if set). Without "
+             "either, a result whose envelope exceeds 64 MiB is left in place, not uploaded",
+    )
+    pm.add_argument(
+        "--remark",
+        action="store_true",
+        help="instead of migrating: store the receipt marker beside each genuine receipt that "
+             "a 0.1.44/0.1.45 upload left unmarked (or beside a marker this host never "
+             "writes, which it replaces), verified against the --verify-key public "
+             "keys (default: this host's BLASTBOX_ATTEST_KEY); the ingress withholds unmarked "
+             "receipts. Run once after upgrading where the job store can be enumerated (the "
+             "control plane; a federated node cannot), passing every signing host's public key. "
+             "--dry-run, --limit and --max-metadata apply",
+    )
+    pm.add_argument(
+        "--verify-key",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="with --remark: a signing host's PUBLIC key -- a PEM, or the JSON body GET "
+             "/v1/attestation/key serves (`blastbox attest-key` prints it). Repeat once per "
+             "host; each receipt is checked only against the key its key_id names",
     )
     pm.set_defaults(func=_migrate_results_cmd)
 

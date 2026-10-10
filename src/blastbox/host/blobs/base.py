@@ -121,16 +121,52 @@ def _assert_declared_landed(job_id: str, out_dir: Path, stored: "set[str]") -> N
             f"not stored, so the seal was not committed: {missing[:3]}")
 
 
-def _upload_order(out_dir: Path) -> list[Path]:
-    """Every artifact under *out_dir*, with the seal LAST.
+def _upload_tiers(out_dir: Path) -> list[list[Path]]:
+    """Every artifact under *out_dir*, in the tiers put_output must store one after another:
+    everything else, then the receipt (``attestation.json``) and the withheld marker
+    (``attestation.withheld.json``) in the order the marker's verdict requires (below), then
+    the seal LAST. Each tier lands only after the previous
+    one fully landed.
 
     Plain sorted order puts metadata.json first ('m' < 'r'), so an upload that died partway
     left the marker present with artifacts missing -- and the age reclaim would then read that
     as "durable copy exists" and delete the complete local tree.
+
+    The receipt before the marker (codex r134 C2): a re-upload over a prefix that still holds an
+    older attestation.json (a worker's, from a verbatim upload) must never store the CLEARED
+    marker before the receipt or tombstone that replaces it, or the route briefly reads the old
+    file as vouched for. Only the top-level names are tiered; a nested ``x/attestation.json``
+    is an ordinary artifact.
+
+    The marker before the receipt when the marker WITHHOLDS (codex r139 P2): an as-is upload
+    (any marker but the cleared body) re-uploaded over a prefix that still holds an earlier
+    cleared marker and clean envelope must replace that marker BEFORE its worker-written
+    attestation.json lands, or the route briefly serves the worker's bytes under the old
+    marker. So the order depends on the marker being uploaded: the cleared body lands after
+    the receipt (above), anything else -- including a marker that cannot be read (a symlink,
+    not a regular file, over the marker cap, an error) -- lands before it. The seal stays last.
     """
-    paths = sorted(out_dir.rglob("*"))
-    return ([p for p in paths if not _is_seal(p, out_dir)]
-            + [p for p in paths if _is_seal(p, out_dir)])
+    from blastbox.host.attest import (RECEIPT_NAME, WITHHELD_NAME, _read_marker_file,
+                                      bound_cleared_marker_sha256)
+
+    marker = _read_marker_file(out_dir / WITHHELD_NAME)
+    cleared = marker is not None and bound_cleared_marker_sha256(marker) is not None
+    ranks = ({RECEIPT_NAME: 1, WITHHELD_NAME: 2, _SEAL_NAME: 3} if cleared
+             else {WITHHELD_NAME: 1, RECEIPT_NAME: 2, _SEAL_NAME: 3})
+
+    def tier(p: Path) -> int:
+        rel = p.relative_to(out_dir).as_posix()
+        return ranks.get(rel, 0)
+
+    tiers: list[list[Path]] = [[], [], [], []]
+    for p in sorted(out_dir.rglob("*")):
+        tiers[tier(p)].append(p)
+    return tiers
+
+
+def _upload_order(out_dir: Path) -> list[Path]:
+    """Every artifact under *out_dir* in :func:`_upload_tiers` order (the seal LAST)."""
+    return [p for t in _upload_tiers(out_dir) for p in t]
 
 
 @runtime_checkable
@@ -157,6 +193,42 @@ class BlobStore(Protocol):
         implementation MUST NOT return True on an error or an unknown -- it may only say
         True when it has positively observed the bytes.
         """
+
+
+def is_missing_blob(exc: BaseException) -> bool:
+    """An absent object vs a store that failed. S3BlobStore wraps both in BlobFetchError, so look
+    at the cause: a missing file, or an S3 NoSuchKey/404. LocalBlobStore raises a CAUSELESS
+    BlobFetchError for an absent object (every real I/O failure there carries its OSError as
+    the cause)."""
+    if isinstance(exc, BlobFetchError) and exc.__cause__ is None:
+        return True
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, FileNotFoundError):
+            return True
+        code = str(((getattr(cur, "response", None) or {}).get("Error") or {}).get("Code", ""))
+        if code in ("NoSuchKey", "404", "NotFound"):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def read_result_prefix(store: object, job_id: str, name: str, max_bytes: int) -> bytes:
+    """At most *max_bytes* of *job_id*'s stored *name*, read from the results prefix only.
+
+    A store offering ``read_result_prefix`` bounds the fetch itself (S3 streams and stops; a
+    whole-object ``open_output`` there downloads and decompresses everything before a caller's
+    ``read(n)`` truncates it). Any other store is read through ``open_result_only`` (or
+    ``open_output``) with ``read(max_bytes)``. Errors propagate as the store raises them.
+    """
+    bounded = getattr(store, "read_result_prefix", None)
+    if bounded is not None:
+        return bytes(bounded(job_id, name, max_bytes))
+    opener = getattr(store, "open_result_only", None) or getattr(store, "open_output")
+    with opener(job_id, name) as fh:
+        return bytes(fh.read(max_bytes))
 
 
 def upload_output_with_retry(

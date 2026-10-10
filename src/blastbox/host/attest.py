@@ -51,23 +51,25 @@ nothing on its own.
 from __future__ import annotations
 
 import base64
+import contextlib
 import errno
 import hashlib
 import json
 import logging
 import os
 import posixpath
-import shutil
 import socket
 import stat
 import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
+
+from blastbox.limits import Limits
 
 _log = logging.getLogger("blastbox.host.attest")
 
@@ -76,6 +78,43 @@ HOST_ID_ENV = "BLASTBOX_HOST_ID"
 
 #: The receipt's name in the sealed output tree and in the blob store's results prefix.
 RECEIPT_NAME = "attestation.json"
+#: The uploader's durable "no receipt" verdict for a tree it shipped AS-IS (its envelope declares,
+#: or cannot rule out, an artifact at the receipt name -- see :func:`write_withheld_marker`). Stored
+#: with any content but a cleared body (:func:`cleared_marker_body`), or over
+#: WITHHELD_MARKER_MAX_BYTES, it makes the attestation route answer the no-receipt 404 before it
+#: reads anything at RECEIPT_NAME, so a ceiling mismatch between uploader and route can never turn
+#: the uploader's "cannot rule out" into the route's "nothing declared, serve it".
+WITHHELD_NAME = "attestation.withheld.json"
+#: A CLEARED marker (:func:`cleared_marker_body`) means "NOT withheld", and only for the
+#: envelope it names (:func:`is_cleared_marker`). The store never deletes a single object, so an
+#: upload that ships a
+#: receipt for a tree whose results prefix may already hold a marker -- an earlier as-is upload of
+#: the same job -- OVERWRITES it with this body (:func:`write_cleared_marker`) rather than
+#: stripping it locally, which would leave the stored marker hiding the receipt forever. EVERY
+#: upload that ships a receipt or a tombstone carries it -- the fresh seals (written with the
+#: receipt/tombstone, over whatever a worker planted there: the gate refused declaring the name),
+#: the sweep's receipt and tombstone branches and the migration's tombstone branch. The route
+#: does NOT take it as a verdict (round 7, O1): a well-formed cleared body only means "not
+#: withheld", and the stored envelope is still judged under the route's ceiling -- over it, the
+#: receipt is withheld. A cleared marker is only ever written in the same upload as an attestation.json this
+#: host wrote (a receipt or a tombstone), never with nothing at that name. A result with NO marker
+#: is legacy (pre-receipt, or an as-is upload by an earlier build) and the route still judges its
+#: envelope.
+#:
+#: BOUND TO THE ENVELOPE. The body names the sha256 of the metadata.json shipped in the same
+#: upload. That is how write_withheld_marker recognises this host's own marker in a retained tree
+#: (and replaces it when a retry under a lower limit ships as-is). A result
+#: uploaded by older code (no reserved names) could DECLARE an artifact at WITHHELD_NAME; the
+#: sealed envelope commits to every declared artifact's sha256 (seal_envelope re-hashes them from
+#: disk), so that artifact's bytes would have to contain the hash of an envelope that contains
+#: the hash of those bytes -- a sha256 cycle. A pre-binding body, or one bound to any other
+#: envelope, is never taken for the host's own.
+CLEARED_MARKER_ATTESTATION = "not-withheld"
+#: The most of a stored marker the route reads; anything longer is withheld, never truncated.
+WITHHELD_MARKER_MAX_BYTES = 4096
+#: Every name the dispatchers own in a sealed tree; the trust gate refuses an artifact at or
+#: under any of them.
+RESERVED_NAMES = (RECEIPT_NAME, WITHHELD_NAME)
 _SEAL_NAME = "metadata.json"
 
 VERSION = 1
@@ -154,13 +193,84 @@ class AttestKey:
 
     @property
     def key_id(self) -> str:
-        spki = self.private_key.public_key().public_bytes(
-            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
-        return hashlib.sha256(spki).hexdigest()[:16]
+        return _spki_key_id(self.private_key.public_key())
 
     def sign(self, doc: Mapping[str, object]) -> str:
         der = self.private_key.sign(canonical(doc), ec.ECDSA(hashes.SHA256()))
         return base64.urlsafe_b64encode(der).decode()
+
+
+def _spki_key_id(public_key: ec.EllipticCurvePublicKey) -> str:
+    spki = public_key.public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+    return hashlib.sha256(spki).hexdigest()[:16]
+
+
+class VerifyKeyRefused(ValueError):
+    """A ``--verify-key`` file is not a usable EC P-256 public key (or states a wrong key_id)."""
+
+
+@dataclass(frozen=True)
+class VerifyKey:
+    """The PUBLIC half of an attest key: verifies receipts, cannot sign. What a host that does
+    not hold a node's private key (the control plane) checks that node's receipts with."""
+
+    public_key: ec.EllipticCurvePublicKey
+
+    @property
+    def key_id(self) -> str:
+        return _spki_key_id(self.public_key)
+
+    @classmethod
+    def from_attest_key(cls, key: AttestKey) -> VerifyKey:
+        return cls(key.private_key.public_key())
+
+    @classmethod
+    def parse(cls, data: bytes, source: str = "verify key") -> VerifyKey:
+        """A PEM SubjectPublicKeyInfo, or the JSON body ``GET /v1/attestation/key`` serves
+        (``{"key_id", "alg", "public_key_pem"}``; a stated key_id/alg must match the PEM)."""
+        stated: dict = {}
+        text = data.strip()
+        if text.startswith(b"{"):
+            # Explicit checks, not asserts: they must survive python -O.
+            try:
+                stated = json.loads(text)
+            except Exception as exc:  # noqa: BLE001 -- any parse problem is a refusal
+                raise VerifyKeyRefused(
+                    f"{source}: not a JSON key body with a public_key_pem") from exc
+            pem = stated.get("public_key_pem") if isinstance(stated, dict) else None
+            if not isinstance(pem, str):
+                raise VerifyKeyRefused(f"{source}: not a JSON key body with a public_key_pem")
+            try:
+                text = pem.encode()
+            except UnicodeEncodeError as exc:
+                raise VerifyKeyRefused(f"{source}: public_key_pem is not valid text") from exc
+        if text.count(b"-----BEGIN ") != 1:
+            # load_pem_public_key reads the first block and silently drops the rest.
+            raise VerifyKeyRefused(f"{source}: must hold exactly one PEM public key (one "
+                                   "--verify-key per signing host)")
+        try:
+            pub = serialization.load_pem_public_key(text)
+        except (ValueError, TypeError) as exc:
+            raise VerifyKeyRefused(f"{source}: not a readable PEM public key") from exc
+        if not isinstance(pub, ec.EllipticCurvePublicKey) or pub.curve.name != "secp256r1":
+            raise VerifyKeyRefused(f"{source}: not an EC P-256 public key (alg is fixed at {ALG})")
+        key = cls(pub)
+        if "alg" in stated and stated["alg"] != ALG:
+            raise VerifyKeyRefused(f"{source}: alg {stated['alg']!r} is not {ALG}")
+        if "key_id" in stated and stated["key_id"] != key.key_id:
+            raise VerifyKeyRefused(f"{source}: stated key_id {stated['key_id']!r} does not match "
+                                   f"its public key (key_id {key.key_id})")
+        return key
+
+
+def load_verify_key(path: Path) -> VerifyKey:
+    """Read a public verify key file (PEM or the /v1/attestation/key JSON body)."""
+    try:
+        data = Path(path).read_bytes()
+    except OSError as exc:
+        raise VerifyKeyRefused(f"{path}: cannot read ({exc.strerror or exc})") from exc
+    return VerifyKey.parse(data, str(path))
 
 
 def _read_hardened(path: Path) -> bytes:
@@ -308,8 +418,10 @@ class RunObservation:
 
 
 def sha256_file(path: Path) -> str:
-    """sha256 of a regular file's bytes, opened without following a final symlink."""
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    """sha256 of a regular file's bytes, opened without following a final symlink.
+    O_NONBLOCK so a FIFO planted in its place is opened (then refused by fstat) rather than
+    blocking the caller forever; it changes nothing for a regular file."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ValueError(f"{path} is not a regular file")
@@ -354,21 +466,218 @@ def build_receipt(obs: RunObservation, *, key_id: str, metadata_sha256: str,
     return doc
 
 
-def strip_receipt(out_dir: Path) -> None:
-    """Remove whatever sits at ``<out_dir>/attestation.json`` (file, directory or symlink)
-    without following a symlink. A worker can write into its output tree."""
-    target = Path(out_dir) / RECEIPT_NAME
+def is_reserved_path(path: str, names: tuple[str, ...] = RESERVED_NAMES) -> bool:
+    """Whether an envelope artifact path is, or lies under, a reserved name (by default any of
+    RESERVED_NAMES: the receipt and the withheld marker). The whole name is the dispatcher's: an
+    artifact at ``attestation.json/x`` lives in a directory that the receipt (or tombstone) write
+    has to replace.
+
+    Compared the way the trust gate RESOLVES an artifact path (``Path(relpath).parts``, walked
+    segment by segment under the output dir) -- never whitespace-stripped: ``' attestation.json'``
+    is a different file on disk and is not refused. ``.``/``//``/trailing-slash spellings collapse
+    exactly as the walk collapses them. Two spellings the gate rejects outright as unsafe (a root
+    anchor, ``..``) are judged on their anchor-stripped / normalised form, so the answer only ever
+    errs towards refusing a path that lands nowhere."""
+    parts = PurePosixPath(path).parts
+    if parts and parts[0] in ("/", "//"):
+        parts = parts[1:]
+    if parts and parts[0] in names:
+        return True
+    p = posixpath.normpath(path)
+    return any(p == n or p.startswith(n + "/") for n in names)
+
+
+#: metadata.json is capped at 4 MiB by default (Limits.max_metadata_bytes); this is only the
+#: FLOOR of the ceiling past which the envelope is "cannot rule it out", never a trust verdict.
+#: The ceiling actually applied is :func:`envelope_cap`.
+ENVELOPE_MAX_BYTES = 64 << 20
+
+
+def envelope_cap(limits: Limits | None = None) -> int:
+    """The largest envelope parsed for a receipt-path decision: the configured metadata limit
+    (``limits``, else BLASTBOX_MAX_METADATA via Limits.from_env -- the one the dispatchers and
+    the trust gate enforce), never below ENVELOPE_MAX_BYTES. A host configured to accept larger
+    envelopes seals and signs over them, so a fixed cap would judge a genuine one "cannot rule
+    out" -- hiding its receipt. The floor keeps an envelope sealed by a peer with a larger limit
+    than this process parseable up to the old fixed size. An unparseable env setting (which
+    fails the dispatchers loudly at startup) falls back to the floor here."""
+    if limits is None:
+        try:
+            limits = Limits.from_env()
+        except ValueError:
+            return ENVELOPE_MAX_BYTES
+    return max(ENVELOPE_MAX_BYTES, int(limits.max_metadata_bytes))
+
+
+class ReceiptPathOccupied(OSError):
+    """``attestation.json`` holds an artifact the envelope declares (or the envelope
+    cannot be parsed to rule that out -- a transient READ error is ReceiptUnreadable instead). Replacing it would delete accepted artifacts, so nothing is
+    written there: no receipt and no tombstone. An OSError so the sweeps' existing "leave it
+    retained" OSError path handles it."""
+
+
+def _artifact_paths_of(data: bytes) -> list[str] | None:
+    """The artifact paths an envelope's bytes declare, or None when they cannot be parsed."""
     try:
-        st = os.lstat(target)
+        env = json.loads(data)
+        return [str(a.get("path", "")) for a in env.get("artifacts") or []]
+    except Exception:  # noqa: BLE001 - unparseable: cannot rule anything out
+        return None
+
+
+#: Why a result whose envelope declares an artifact at the receipt name has no receipt.
+RECEIPT_PATH_DECLARED_REASON = ("receipt path is occupied by a declared artifact of a result "
+                                "accepted before the name was reserved")
+#: Why a result whose envelope cannot be parsed has no receipt: nothing rules out that whatever
+#: sits at attestation.json is accepted output, and no dispatcher signs over such an envelope.
+RECEIPT_PATH_UNDECIDABLE_REASON = ("the result's envelope cannot be read to rule out a declared "
+                                   "artifact at the receipt path")
+#: Why a result whose stored prefix has no envelope has no receipt: a genuine receipt always
+#: signs the envelope's sha256, and put_output stores the envelope LAST, so its absence means a
+#: partial upload (or a seal that was never shipped) -- nothing at attestation.json is a receipt.
+RECEIPT_ENVELOPE_ABSENT_REASON = "the stored result has no envelope for a receipt to vouch for"
+#: The route's answer for an envelope larger than its own ceiling (:func:`envelope_cap`): it
+#: cannot be parsed to rule out a declared artifact at attestation.json, and no marker vouches
+#: for an envelope the ingress cannot judge, so the receipt is withheld. Names the fix.
+RECEIPT_ENVELOPE_OVER_LIMIT_REASON = (
+    "the result's envelope is larger than this ingress's metadata limit, so it cannot rule out a "
+    "declared artifact at attestation.json; set BLASTBOX_MAX_METADATA on the ingress at least as "
+    "high as on the dispatchers that seal results")
+#: The tombstone the legacy migration ships in place of whatever the worker left at
+#: attestation.json: a pre-blob-store result carries no receipt by construction.
+RECEIPT_LEGACY_MIGRATED_REASON = "a legacy result migrated to the store carries no receipt"
+
+
+def envelope_receipt_path_protection(data: bytes | None) -> str | None:
+    """Why whatever sits at attestation.json in a result with these envelope bytes must be left
+    alone and never presented as a receipt or tombstone -- or None when the envelope rules that
+    out. ``data`` None = the envelope is larger than the caller's :func:`envelope_cap` (cannot be
+    parsed whole).
+
+    Two verdicts: the envelope DECLARES an artifact at or under the name (only possible in a tree
+    accepted before the trust gate reserved it), or it cannot be parsed, so nothing rules that
+    out. The trust gate refuses either before a dispatcher seals, so no genuine receipt is lost
+    by refusing."""
+    paths = None if data is None else _artifact_paths_of(data)
+    if paths is None:
+        return RECEIPT_PATH_UNDECIDABLE_REASON
+    if any(is_reserved_path(p) for p in paths):
+        return RECEIPT_PATH_DECLARED_REASON
+    return None
+
+
+def tree_receipt_path_protection(out_dir: Path, *, limits: Limits | None = None) -> str | None:
+    """:func:`envelope_receipt_path_protection` for ``<out_dir>/metadata.json`` -- THE single
+    envelope test behind every receipt-path decision on a tree that did not just pass the trust
+    gate (the sweeps' as-is choice, strip_receipt without ``gate_verified``, the migration), so
+    they cannot diverge.
+
+    Judged on the envelope put_output would SHIP. It ships ``metadata.json`` only as a regular,
+    non-symlink file; anything else (absent, a symlink -- ELOOP under O_NOFOLLOW, dangling or not
+    -- a FIFO, a directory) never reaches the store, so no envelope accepted anything at
+    attestation.json and there is nothing to protect: None, and whatever sits there is worker
+    junk to strip or tombstone. A shipped envelope that is over the cap or unparseable is
+    "cannot rule out" (protect). Opened O_NOFOLLOW|O_NONBLOCK and judged on the descriptor, so a
+    FIFO never blocks. Any other OSError -- EIO, EACCES, a flap -- is no verdict and propagates,
+    so the caller retries rather than acting on it. ``limits`` as for :func:`envelope_cap`: a
+    caller outside the service (the migration CLI) passes the service's, so it judges as the
+    service would. An as-is verdict travels with the tree as the withheld marker
+    (:func:`write_withheld_marker`), and the attestation route ALSO runs
+    :func:`envelope_receipt_path_protection` on the STORED envelope, under its own
+    :func:`envelope_cap`, for every result without a withheld body (unmarked or cleared) -- a
+    cleared marker cannot vouch, because a pre-#188 dispatcher shipped a worker's tree verbatim.
+    Do not remove that route check as redundant."""
+    shipped, data = _shipped_envelope(out_dir, limits)
+    return envelope_receipt_path_protection(data) if shipped else None
+
+
+def _shipped_envelope(out_dir: Path, limits: Limits | None) -> tuple[bool, bytes | None]:
+    """(whether put_output would ship ``<out_dir>/metadata.json``, its bytes -- None when over
+    :func:`envelope_cap`). See :func:`tree_receipt_path_protection`; any OSError other than the
+    not-shipped verdicts propagates."""
+    seal = Path(out_dir) / _SEAL_NAME
+    try:
+        fd = os.open(seal, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
+        return False, None              # absent: never shipped
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            return False, None          # a symlink: put_output never ships it
+        raise
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return False, None          # a FIFO/directory/...: put_output never ships it
+        return True, _read_capped(fd, envelope_cap(limits))
+    finally:
+        os.close(fd)
+
+
+def strip_receipt(out_dir: Path, *, gate_verified: bool = False,
+                  limits: Limits | None = None,
+                  names: tuple[str, ...] = RESERVED_NAMES) -> None:
+    """Remove whatever sits at ``<out_dir>/attestation.json`` -- and at the withheld marker's
+    name, ``names`` by default being every reserved one -- (file, directory or symlink) without
+    following a symlink. A worker can write into its output tree, and a planted withheld marker
+    would hide the receipt this tree is about to carry.
+
+    Raises ReceiptPathOccupied, deleting nothing, when the envelope declares an artifact AT or
+    UNDER that name -- a top-level file named attestation.json or a directory of artifacts
+    (possible only in a tree accepted before the trust gate reserved the whole name), or when the
+    envelope cannot be PARSED to rule that out: never destroy accepted output to make room for a
+    receipt. Raises ReceiptUnreadable, deleting nothing, when the envelope cannot be READ right
+    now (EIO, EACCES...) -- no verdict, retry later. Anything undeclared there (worker-planted
+    junk, a stale receipt) is replaced.
+
+    ``gate_verified``: the caller is the dispatcher sealing a tree the trust gate JUST validated,
+    and the gate refuses any artifact at or under the reserved name -- so nothing there can be
+    accepted output and the envelope is not re-read. That makes the strip unconditional: a
+    transient envelope read error can never leave a worker-planted receipt in a tree that ships.
+    ``limits`` as for :func:`tree_receipt_path_protection`."""
+    out_dir = Path(out_dir)
+    present = []
+    for name in names:
+        try:
+            present.append((out_dir / name, os.lstat(out_dir / name)))
+        except FileNotFoundError:
+            continue
+    if not present:
         return
+    if not gate_verified:
+        try:
+            why = tree_receipt_path_protection(out_dir, limits=limits)
+        except OSError as exc:
+            # No verdict either way: a retry-later error, never the permanent-looking
+            # ReceiptPathOccupied. Both sweeps leave the tree in place and retry it.
+            raise ReceiptUnreadable(
+                exc.errno, f"cannot read the envelope to rule out a declared artifact at "
+                           f"{RECEIPT_NAME} ({exc}); leaving it in place") from exc
+        if why is not None:
+            occupied = ", ".join(t.name for t, _ in present)
+            raise ReceiptPathOccupied(
+                errno.EEXIST, f"{occupied} may hold a declared artifact ({why}); refusing to "
+                              f"replace it")
+    for target, st in present:
+        _remove_entry(target, st)
+
+
+def _remove_entry(target: Path, st: os.stat_result) -> None:
+    """Remove ``target`` (lstat ``st``) without following a symlink; already gone is fine."""
     if stat.S_ISDIR(st.st_mode):
-        shutil.rmtree(target)
+        # NOT shutil.rmtree: its fd walk RECURSES, so a worker-built chain ~1000 dirs deep (0
+        # bytes, far under the gate's entry cap) raised RecursionError -- not an OSError -- and
+        # no receipt or tombstone could ever be written over it. The bounded iterative walk
+        # purge_job_dir already uses for the same attack: openat/unlinkat under O_NOFOLLOW (a
+        # symlink is never followed, at the top or below), a fixed fd budget, no PATH_MAX.
+        from blastbox.host.jobs.retention import _rmtree_iterative
+
+        _rmtree_iterative(target)
     else:
-        os.unlink(target)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(target)
 
 
-def _write_atomic(out_dir: Path, data: bytes) -> None:
+def _write_atomic(out_dir: Path, data: bytes, *, gate_verified: bool = False,
+                  limits: Limits | None = None, metadata_sha256: str | None = None) -> None:
     tmp = out_dir / f".{RECEIPT_NAME}.{uuid.uuid4().hex}.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
     try:
@@ -376,20 +685,331 @@ def _write_atomic(out_dir: Path, data: bytes) -> None:
             fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
-        strip_receipt(out_dir)          # os.replace cannot replace a directory
+        # os.replace cannot replace a dir
+        strip_receipt(out_dir, gate_verified=gate_verified, limits=limits)
         os.replace(tmp, out_dir / RECEIPT_NAME)
     finally:
         tmp.unlink(missing_ok=True)
+    # Every receipt or tombstone ships with the CLEARED marker, bound to the envelope in the tree
+    # (``metadata_sha256``: the one the receipt signed): an overwrite of any withheld marker an
+    # earlier upload of the job stored, and recognisable as this host's own on a retry. strip_receipt above already
+    # cleared (or refused for) everything at the reserved names. Every caller writes metadata.json
+    # BEFORE this and never after (the dispatchers seal it first; the sweeps never rewrite it). A
+    # failure here raises ReceiptMarkerUnwritten, so the caller never ships a receipt without it
+    # -- and can tell that what it wrote at RECEIPT_NAME DID land.
+    try:
+        _write_vouching_marker(out_dir, metadata_sha256)
+    except Exception as exc:  # noqa: BLE001 - re-raised, typed
+        raise ReceiptMarkerUnwritten(
+            getattr(exc, "errno", None) or errno.EIO,
+            f"{RECEIPT_NAME} was written but its {WITHHELD_NAME} marker was not ({exc})") from exc
+
+
+class ReceiptMarkerUnwritten(OSError):
+    """What :func:`_write_atomic` wrote at RECEIPT_NAME LANDED, but the marker that must ship
+    beside it could not be written. The tree must not ship as it stands -- and the receipt must
+    not be replaced either: it is genuine, only its marker is missing."""
+
+
+def cleared_marker_body(metadata_sha256: str) -> dict:
+    """The cleared marker for a result whose shipped metadata.json has this sha256."""
+    return {"attestation": CLEARED_MARKER_ATTESTATION, "withheld": False,
+            "metadata_sha256": metadata_sha256}
+
+
+def is_cleared_marker(data: bytes, metadata_sha256: str) -> bool:
+    """Whether bytes stored at WITHHELD_NAME are EXACTLY the canonical cleared body for the
+    envelope whose sha256 is ``metadata_sha256`` -- this host's own cleared marker for it. Byte
+    equality, not a parse."""
+    return data == canonical(cleared_marker_body(metadata_sha256))
+
+
+def bound_cleared_marker_sha256(data: bytes) -> str | None:
+    """The envelope sha256 ``data`` is the canonical cleared body for, or None when it is not
+    exactly a cleared body for any 64-hex sha256 (a tombstone, unparseable bytes, a near-miss such
+    as ``"withheld": 0``, extra keys, the pre-binding body). The route answers None with the
+    no-receipt 404; for any well-formed cleared body it lets the envelope decide (the binding
+    does not vouch there). The binding identifies this host's own marker to
+    :func:`write_withheld_marker`."""
+    try:
+        body = json.loads(data)
+        sha = body["metadata_sha256"]
+    except Exception:  # noqa: BLE001 - not a cleared body
+        return None
+    if not (isinstance(sha, str) and len(sha) == 64
+            and all(c in "0123456789abcdef" for c in sha)):
+        return None
+    return sha if is_cleared_marker(data, sha) else None
+
+
+def _shipped_metadata_sha256(out_dir: Path) -> str | None:
+    """sha256 of the metadata.json put_output would ship from ``out_dir`` NOW, or None when it
+    would ship none (absent, a symlink, not a regular file). Any other OSError propagates."""
+    try:
+        return sha256_file(out_dir / _SEAL_NAME)
+    except FileNotFoundError:
+        return None
+    except ValueError:                              # not a regular file: never shipped
+        return None
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:                # a symlink: never shipped
+            return None
+        raise
+
+
+def _write_vouching_marker(out_dir: Path, metadata_sha256: str | None) -> None:
+    """The marker that ships beside an attestation.json this host has just written: the cleared
+    body bound to ``metadata_sha256`` (hashed from the tree now when None). With no shippable
+    envelope there is nothing to bind: the withheld body, which the route answers like the
+    missing envelope it will find."""
+    if metadata_sha256 is None:
+        metadata_sha256 = _shipped_metadata_sha256(out_dir)
+    if metadata_sha256 is None:
+        _write_marker(out_dir, canonical(tombstone_body(RECEIPT_ENVELOPE_ABSENT_REASON)))
+    else:
+        _write_marker(out_dir, canonical(cleared_marker_body(metadata_sha256)))
+
+
+def write_cleared_marker(out_dir: Path, *, limits: Limits | None = None) -> None:
+    """Put the canonical CLEARED body, bound to the tree's metadata.json, at WITHHELD_NAME in a
+    tree that is about to ship with the receipt THIS host signed and the caller just verified
+    (:func:`tree_receipt_is_ours`) -- never in a tree with nothing of this host's at the receipt
+    name. Receipt and tombstone writes do this themselves. An overwrite, not a strip: the store never
+    deletes a single object, so a marker an earlier as-is upload of this job stored would
+    otherwise survive the upload and withhold the receipt forever.
+
+    Refuses exactly as :func:`strip_receipt` does -- ReceiptPathOccupied when the envelope
+    declares (or cannot rule out) an artifact at a reserved name, ReceiptUnreadable when it
+    cannot be read right now -- writing nothing. Raises OSError when the marker cannot be
+    written; the caller must then NOT upload (a stored marker would hide the receipt)."""
+    out_dir = Path(out_dir)
+    try:
+        why = tree_receipt_path_protection(out_dir, limits=limits)
+    except OSError as exc:
+        raise ReceiptUnreadable(
+            exc.errno, f"cannot read the envelope to rule out a declared artifact at "
+                       f"{WITHHELD_NAME} ({exc}); leaving it in place") from exc
+    if why is not None:
+        raise ReceiptPathOccupied(
+            errno.EEXIST, f"{WITHHELD_NAME} may hold a declared artifact; refusing to "
+                          f"replace it ({why})")
+    try:
+        # Bound to the envelope the receipt kept here signed: tree_receipt_is_ours checked that
+        # its metadata_sha256 is this file's.
+        metadata_sha256 = sha256_file(out_dir / _SEAL_NAME)
+    except (OSError, ValueError) as exc:
+        raise ReceiptUnreadable(
+            getattr(exc, "errno", None) or errno.EIO,
+            f"cannot hash {_SEAL_NAME} to bind the cleared marker ({exc})") from exc
+    # The verdict is taken above: nothing there is accepted output.
+    strip_receipt(out_dir, gate_verified=True, names=(WITHHELD_NAME,))
+    _write_marker(out_dir, canonical(cleared_marker_body(metadata_sha256)))
+
+
+#: The reason a withheld marker that is not tombstone-shaped (unparseable, or anything else but
+#: the cleared body) is reported with.
+RECEIPT_WITHHELD_REASON = "the uploader withheld the receipt for this result"
+#: The reason a stored result with NO marker at WITHHELD_NAME is reported with. Every upload
+#: that ships a receipt or tombstone since this release stores the cleared marker, so an
+#: unmarked result (uploaded by 0.1.45 or earlier, possibly a worker tree shipped verbatim)
+#: carries no receipt the route can attribute to a host until it is re-marked.
+RECEIPT_UNMARKED_REASON = (
+    "the stored result has no receipt marker (stored by 0.1.45 or earlier); a genuine receipt "
+    "is re-marked with `blastbox migrate-results --remark --verify-key <signing host's public "
+    "key>`, run where the job store can be enumerated")
+#: The reason a marked result with nothing stored at RECEIPT_NAME is reported with.
+RECEIPT_ABSENT_REASON = "the stored result has no attestation.json"
+#: The reason a CLEARED marker bound to an envelope other than the stored metadata.json is
+#: reported with. Constant: the bound sha is untrusted and is never echoed.
+RECEIPT_MARKER_UNBOUND_REASON = "the receipt marker does not vouch for the stored envelope"
+
+# A dispatcher whose seal_fresh_receipt returned False never contacts the result store: what is
+# at attestation.json (our receipt, a tombstone, or possibly a worker-planted file when nothing
+# could be written) lacks its cleared marker. The job is FAILED with this in its error and the
+# tree retained for the pending-upload sweep -- not an upload failure.
+SEAL_INCOMPLETE_REASON = "receipt seal incomplete"
+
+
+def write_withheld_marker(out_dir: Path, reason: str, *, limits: Limits | None = None) -> None:
+    """Record, IN the tree, that it is shipped as-is with no receipt: a tombstone-shaped
+    ``{"attestation": null, "reason": reason}`` at WITHHELD_NAME. Call it immediately before
+    uploading a tree the receipt-path test protects (``reason`` = its verdict); the attestation
+    route answers the no-receipt 404 whenever the stored result holds that name with anything
+    but the cleared body (:func:`is_cleared_marker`), BEFORE it reads the receipt name, so the
+    uploader's verdict is never re-derived under another ceiling.
+
+    Nothing at RECEIPT_NAME is touched. Raises OSError -- never ships without it -- when the
+    marker cannot be written; the caller must then NOT upload as-is (leave the tree retained /
+    count it failed).
+
+    Something already at WITHHELD_NAME (only in a tree accepted before the name was reserved,
+    or planted by its worker):
+
+    * the envelope rules out that it is accepted output (parseable, nothing declared at or under
+      the name): worker junk -- replaced by the marker;
+    * otherwise it may be a declared artifact: ReceiptPathOccupied, nothing destroyed, and the
+      tree is NOT shipped as-is. Its bytes are the worker's: shipped at the marker's key they
+      could be exactly the cleared body and unmask the worker-written attestation.json beside
+      it, and a non-regular entry would not be stored there at all. ACCEPTED STRAND: such a
+      tree (an envelope declaring, or unparseable beside, a file at a name reserved since
+      before it was accepted) stays retained / counted failed, and the callers log it loudly.
+
+    EXCEPT a regular file holding exactly a withheld body this function writes
+    (:func:`_is_host_withheld_marker`): an earlier attempt's own marker, left in a tree whose
+    upload then failed. It is kept and the tree ships with it. Refusing it stranded every such
+    retry forever -- the undecidable verdict can never rule the name out. Keeping it is safe even
+    for a worker-written lookalike: its presence alone withholds, and nothing is destroyed.
+
+    And a regular file holding exactly the CLEARED body bound to the sha256 of the tree's current
+    metadata.json (:func:`_is_host_cleared_marker`), while the envelope is undecidable: an earlier
+    attempt vouched (a receipt or tombstone plus that marker), its upload failed, and this retry
+    runs under a lower limit. It is REPLACED by the withheld body; refusing it stranded the retry
+    on every tick or rerun. It cannot be a declared artifact: the sealed envelope commits to every
+    declared artifact's sha256, so an artifact holding that envelope's sha256 is a hash cycle
+    (the same argument the route's binding rests on). A parseable envelope that declares the name
+    never sat beside a marker this host wrote (every writer refuses there), so it is refused.
+
+    A transient envelope read error propagates (no verdict; retry)."""
+    out_dir = Path(out_dir)
+    keep, st = _withheld_marker_plan(out_dir, limits)
+    if keep:
+        return
+    if st is not None:
+        _remove_entry(out_dir / WITHHELD_NAME, st)
+    _write_marker(out_dir, canonical(tombstone_body(reason)))
+
+
+def check_withheld_marker_writable(out_dir: Path, *, limits: Limits | None = None) -> None:
+    """Raise exactly what :func:`write_withheld_marker` would raise before writing anything
+    (ReceiptPathOccupied, or a transient envelope read error), writing and removing nothing --
+    so a dry run reaches the same verdict as the real one."""
+    _withheld_marker_plan(Path(out_dir), limits)
+
+
+def _withheld_marker_plan(out_dir: Path,
+                          limits: Limits | None) -> tuple[bool, os.stat_result | None]:
+    """:func:`write_withheld_marker`'s decision, with no side effects: (True, _) keeps the
+    existing host-written marker; (False, st) writes the marker after removing the entry ``st``
+    describes (None: nothing there). Raises ReceiptPathOccupied when it must refuse."""
+    target = out_dir / WITHHELD_NAME
+    try:
+        st: os.stat_result | None = os.lstat(target)
+    except FileNotFoundError:
+        st = None
+    if st is not None and stat.S_ISREG(st.st_mode) and _is_host_withheld_marker(target):
+        return True, st
+    if st is not None:
+        shipped, data = _shipped_envelope(out_dir, limits)
+        paths = (None if data is None else _artifact_paths_of(data)) if shipped else []
+        if paths is None and stat.S_ISREG(st.st_mode) and _is_host_cleared_marker(out_dir, target):
+            pass        # this host's own cleared marker from an earlier attempt: replaced
+        elif paths is None or any(is_reserved_path(p, (WITHHELD_NAME,)) for p in paths):
+            raise ReceiptPathOccupied(
+                errno.EEXIST,
+                f"{WITHHELD_NAME} holds an entry this host did not write, and the envelope "
+                f"{'cannot be read to rule out' if paths is None else 'declares'} an artifact "
+                f"there; refusing to replace it or ship without it")
+    return False, st
+
+
+#: Every reason :func:`write_withheld_marker` is called with: the as-is verdicts of
+#: :func:`tree_receipt_path_protection`.
+WITHHELD_REASONS = (RECEIPT_PATH_DECLARED_REASON, RECEIPT_PATH_UNDECIDABLE_REASON)
+# Every reason this host ever writes into a withheld marker (write_withheld_marker's, plus
+# _write_vouching_marker's no-envelope body). The route names only these.
+MARKER_REASONS = (*WITHHELD_REASONS, RECEIPT_ENVELOPE_ABSENT_REASON)
+
+
+def _read_marker_file(path: Path) -> bytes | None:
+    """``path``'s bytes when it is a regular file of at most WITHHELD_MARKER_MAX_BYTES. Opened
+    O_NOFOLLOW|O_NONBLOCK and judged on the descriptor; anything else (a symlink, a FIFO, a
+    directory, oversized, an error) is None."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        return _read_capped(fd, WITHHELD_MARKER_MAX_BYTES)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _is_host_withheld_marker(path: Path) -> bool:
+    """Whether ``path`` is a regular file whose bytes are exactly the canonical withheld body for
+    one of WITHHELD_REASONS (read as :func:`_read_marker_file`)."""
+    data = _read_marker_file(path)
+    return data is not None and any(data == canonical(tombstone_body(r))
+                                    for r in WITHHELD_REASONS)
+
+
+def _is_host_cleared_marker(out_dir: Path, path: Path) -> bool:
+    """Whether ``path`` is a regular file whose bytes are exactly the canonical cleared body bound
+    to the sha256 of the metadata.json put_output would ship from ``out_dir`` now. An envelope
+    that cannot be hashed (absent, not shippable, unreadable) is False."""
+    data = _read_marker_file(path)
+    if data is None:
+        return False
+    try:
+        metadata_sha256 = _shipped_metadata_sha256(out_dir)
+    except OSError:
+        return False
+    return metadata_sha256 is not None and is_cleared_marker(data, metadata_sha256)
+
+
+def _write_marker(out_dir: Path, data: bytes) -> None:
+    """Atomically put ``data`` at WITHHELD_NAME (nothing may be there but a regular file)."""
+    tmp = out_dir / f".{WITHHELD_NAME}.{uuid.uuid4().hex}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, out_dir / WITHHELD_NAME)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+#: The tombstone reasons this host writes at attestation.json when it does not sign. Every
+#: write_tombstone (and seal_receipt's ``reason``) passes one of these constants, never free text.
+NO_ATTEST_KEY_REASON = "no attestation key"
+RUN_NOT_OBSERVED_REASON = "run not observed"
+INPUT_UNHASHED_REASON = "input could not be hashed"
+METADATA_NOT_REGULAR_REASON = "metadata.json is not a regular file"
+SIGNING_FAILED_REASON = "signing failed"
+RETAINED_REUPLOAD_REASON = "retained result re-uploaded without a receipt from this host"
+#: Written by 0.1.45's seal_receipt (since removed: the trust gate refuses the declaration); its
+#: tombstones are still in stores, so the route keeps naming it.
+LEGACY_RESERVED_PATH_DECLARED_REASON = f"envelope declares the reserved path {RECEIPT_NAME}"
+#: Every reason any release of this host writes into a tombstone at RECEIPT_NAME. The route names
+#: only these: a pre-#188 node shipped worker trees verbatim, so any other text may be the
+#: worker's (as for MARKER_REASONS).
+TOMBSTONE_REASONS = (NO_ATTEST_KEY_REASON, RUN_NOT_OBSERVED_REASON, INPUT_UNHASHED_REASON,
+                     METADATA_NOT_REGULAR_REASON, SIGNING_FAILED_REASON,
+                     RETAINED_REUPLOAD_REASON, RECEIPT_LEGACY_MIGRATED_REASON,
+                     LEGACY_RESERVED_PATH_DECLARED_REASON)
+#: The reason a stored tombstone whose reason is not one of TOMBSTONE_REASONS is reported with.
+RECEIPT_TOMBSTONE_REASON = "the uploader stored no receipt for this result"
+#: The reason a stored attestation.json past _RECEIPT_MAX_BYTES is reported with: no receipt
+#: build_receipt produces comes near that size, so it is not one.
+RECEIPT_OVERSIZE_REASON = "the stored receipt is larger than any receipt this host writes"
 
 
 def tombstone_body(reason: str) -> dict:
     return {"attestation": None, "reason": reason}
 
 
-def write_tombstone(out_dir: Path, reason: str) -> None:
+def write_tombstone(out_dir: Path, reason: str, *, gate_verified: bool = False,
+                    limits: Limits | None = None) -> None:
     """Write the "no receipt for this run" marker. Uploaded like a receipt, so it OVERWRITES a
-    superseded attempt's receipt in the store (which never deletes a single object)."""
-    _write_atomic(Path(out_dir), canonical(tombstone_body(reason)))
+    superseded attempt's receipt in the store (which never deletes a single object).
+    ``gate_verified`` and ``limits`` as for :func:`strip_receipt`."""
+    _write_atomic(Path(out_dir), canonical(tombstone_body(reason)), gate_verified=gate_verified,
+                  limits=limits)
 
 
 def is_tombstone(data: bytes) -> bool:
@@ -400,54 +1020,94 @@ def is_tombstone(data: bytes) -> bool:
     return isinstance(body, dict) and body.get("attestation", 0) is None
 
 
-def _declares_receipt_name(seal: Path) -> bool:
-    try:
-        env = json.loads(seal.read_bytes())
-        paths = [str(a.get("path", "")) for a in env.get("artifacts") or []]
-    except Exception:  # noqa: BLE001 - unparseable: cannot rule it out
-        return True
-    return any(posixpath.normpath(p.strip()) == RECEIPT_NAME for p in paths)
-
-
 def seal_receipt(out_dir: Path, *, key: AttestKey | None,
                  observation: RunObservation | None, reason: str | None = None) -> dict | None:
     """Replace whatever sits at ``attestation.json`` with this dispatcher's signed receipt, or,
     when it does not sign, a tombstone saying why. Returns the SIGNED body, or None when a
     tombstone was written. Call it IMMEDIATELY before uploading ``out_dir``: the metadata hash is
-    of the bytes on disk at this moment, which are the bytes put_output ships."""
+    of the bytes on disk at this moment, which are the bytes put_output ships.
+
+    ONLY for a tree the trust gate has just validated (the dispatchers' seal, through
+    :func:`seal_fresh_receipt`): the gate refuses any artifact at or under a reserved name, so
+    the envelope is not re-read and the strip is unconditional (``gate_verified``, see
+    :func:`strip_receipt`). A retained or legacy tree is never sealed here -- the sweeps judge
+    its envelope and write a tombstone or the withheld marker instead.
+
+    ``reason`` (the tombstone's reason when ``observation`` is None) must be one of
+    TOMBSTONE_REASONS; the route reports any other with RECEIPT_TOMBSTONE_REASON."""
     out_dir = Path(out_dir)
     if key is None:
-        write_tombstone(out_dir, "no attestation key")
+        write_tombstone(out_dir, NO_ATTEST_KEY_REASON, gate_verified=True)
         return None
     if observation is None:
-        write_tombstone(out_dir, reason or "run not observed")
+        write_tombstone(out_dir, reason or RUN_NOT_OBSERVED_REASON, gate_verified=True)
         return None
     try:
         metadata_sha256 = sha256_file(out_dir / _SEAL_NAME)
     except (OSError, ValueError) as exc:
         _log.error("attestation: job %s has no regular metadata.json to vouch for (%s); "
                    "no receipt", observation.job_id, exc)
-        write_tombstone(out_dir, "metadata.json is not a regular file")
-        return None
-    if _declares_receipt_name(out_dir / _SEAL_NAME):
-        # The trust gate refuses this; never let a declared artifact stand in for a receipt.
-        _log.error("attestation: job %s declares %s as an artifact; no receipt",
-                   observation.job_id, RECEIPT_NAME)
-        write_tombstone(out_dir, f"envelope declares the reserved path {RECEIPT_NAME}")
+        write_tombstone(out_dir, METADATA_NOT_REGULAR_REASON, gate_verified=True)
         return None
     doc = build_receipt(observation, key_id=key.key_id, metadata_sha256=metadata_sha256)
     body = {"attestation": doc, "signature": key.sign(doc)}
-    _write_atomic(out_dir, canonical(body))
+    _write_atomic(out_dir, canonical(body), gate_verified=True, metadata_sha256=metadata_sha256)
     return body
 
 
-def verify_body(key: AttestKey, body: object) -> bool:
-    """Whether ``body`` is a receipt validly signed by ``key``."""
+def seal_fresh_receipt(out_dir: Path, *, key: AttestKey | None,
+                       observation: RunObservation | None, job_id: str,
+                       reason: str | None = None) -> bool:
+    """The dispatchers' seal of a tree the trust gate has JUST validated, immediately before it
+    ships. Writes our receipt or, failing that, a "signing failed" tombstone -- both with
+    ``gate_verified`` so neither depends on re-reading the envelope. Never raises.
+
+    Returns whether the tree is SAFE TO UPLOAD: True once a receipt or tombstone is at
+    attestation.json WITH its cleared marker. False when our receipt landed but its marker did
+    not (ReceiptMarkerUnwritten: the receipt is kept, never tombstoned over, and the sweep below
+    ships it with its marker), or when a tombstone's marker failed, or when neither could be
+    written (ENOSPC, EIO on the write...): a worker-planted receipt may then still be sitting
+    there, and without a tombstone a superseded attempt's receipt in the store would not be
+    overwritten either. The caller must then NOT
+    upload and takes its ordinary upload-failure path -- FAILED, tree retained for the
+    pending-upload sweep, which sanitises attestation.json before it uploads. Failing closed
+    this way reuses the one path an object-store outage already takes, rather than inventing a
+    third outcome (e.g. shipping with nothing at the name)."""
+    try:
+        seal_receipt(out_dir, key=key, observation=observation, reason=reason)
+        return True
+    except ReceiptMarkerUnwritten as exc:
+        # Ours landed at RECEIPT_NAME (a genuine receipt, or seal_receipt's own tombstone); only
+        # its marker is missing. A "signing failed" tombstone over it would destroy a genuine
+        # receipt for a wrong reason. Refuse the upload instead: the pending-upload sweep finds
+        # the receipt ours (tree_receipt_is_ours) and ships it with its cleared marker.
+        _log.error("attestation: wrote the receipt for job %s but not its %s marker (%s); NOT "
+                   "uploading -- the pending-upload sweep ships it with its marker",
+                   job_id, WITHHELD_NAME, exc)
+        return False
+    except Exception as exc:  # noqa: BLE001 - fall back to a tombstone; only its failure refuses
+        _log.error("attestation: could not write the receipt for job %s (%s); writing a "
+                   "\"signing failed\" tombstone instead", job_id, exc)
+    try:
+        # Never ship a planted or half-written one, and overwrite a superseded attempt's. A
+        # tombstone whose marker then fails raises ReceiptMarkerUnwritten here: not shipped.
+        write_tombstone(out_dir, SIGNING_FAILED_REASON, gate_verified=True)
+        return True
+    except Exception:  # noqa: BLE001
+        _log.exception("attestation: could not write a tombstone for job %s either; NOT "
+                       "uploading a tree that may still hold a worker-planted %s",
+                       job_id, RECEIPT_NAME)
+    return False
+
+
+def verify_body(key: AttestKey | VerifyKey, body: object) -> bool:
+    """Whether ``body`` is a receipt validly signed by ``key`` (either half)."""
+    pub = key.public_key if isinstance(key, VerifyKey) else key.private_key.public_key()
     try:
         assert isinstance(body, dict)
         doc, sig = body["attestation"], body["signature"]
         assert isinstance(doc, dict) and isinstance(sig, str)
-        key.private_key.public_key().verify(
+        pub.verify(
             base64.urlsafe_b64decode(sig), canonical(doc), ec.ECDSA(hashes.SHA256()))
     except Exception:  # noqa: BLE001 - anything short of a clean verify is "no"
         return False
@@ -491,7 +1151,10 @@ def tree_receipt_is_ours(out_dir: Path, *, key: AttestKey | None, job_id: str) -
         return False
     out_dir = Path(out_dir)
     try:
-        fd = os.open(out_dir / RECEIPT_NAME, os.O_RDONLY | os.O_NOFOLLOW)
+        # O_NONBLOCK: a worker-planted FIFO must not block the sweep in open(); fstat below
+        # refuses it (and anything else that is not a regular file) on the open descriptor, and
+        # the read is capped -- as read_snapshots_readonly does for the node-share dir.
+        fd = os.open(out_dir / RECEIPT_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         return False
     except OSError as exc:
@@ -522,6 +1185,8 @@ def tree_receipt_is_ours(out_dir: Path, *, key: AttestKey | None, job_id: str) -
     except ValueError:                              # not a regular file: a verdict
         return False
     except OSError as exc:
+        if exc.errno == errno.ELOOP:                # a symlinked seal is never shipped: a verdict
+            return False
         raise ReceiptUnreadable(exc.errno, f"cannot read {_SEAL_NAME}: {exc}") from exc
     return doc.get("metadata_sha256") == metadata_sha256
 

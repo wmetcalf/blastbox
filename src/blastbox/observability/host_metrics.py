@@ -131,7 +131,7 @@ def read_node_view(share_dir: str, *, stale_after_s: float, node: str) -> Option
         if not _warned_over_cap:
             _warned_over_cap = True
             _log.warning("node share dir %s holds more snapshot files than the read cap, or a "
-                         "snapshot file that cannot be parsed; omitting blastbox_node_* series "
+                         "snapshot file that cannot be opened, read or parsed; omitting blastbox_node_* series "
                          "rather than reporting a partial (undercounted) view", share_dir)
         return None
     snaps = [

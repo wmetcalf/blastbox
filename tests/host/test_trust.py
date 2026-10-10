@@ -818,3 +818,49 @@ def test_declaring_the_receipt_name_as_an_artifact_is_refused(tmp_path, path):
     with pytest.raises(OutputTrustError, match="reserved"):
         validate_worker_output(output_dir=outdir, input_sha256=_INPUT_SHA, engine=_ENGINE,
                                limits=_limits())
+
+
+def test_an_artifact_nested_under_the_receipt_name_is_refused(tmp_path):
+    """A directory named attestation.json/ holding a declared artifact collides with the receipt
+    blob: the dispatcher must replace that path with its receipt or tombstone, which would delete
+    an ACCEPTED artifact. The whole name is reserved, so the nested declaration is refused at the
+    gate and never accepted in the first place."""
+    outdir, _ = _make_output_dir(tmp_path)
+    (outdir / "attestation.json").mkdir()
+    (outdir / "attestation.json" / "page.png").write_bytes(b"PNG_DATA_HERE")
+    meta = json.loads((outdir / "metadata.json").read_bytes())
+    meta["artifacts"][0]["path"] = "attestation.json/page.png"
+    (outdir / "metadata.json").write_bytes(json.dumps(meta).encode())
+    with pytest.raises(OutputTrustError, match="reserved"):
+        validate_worker_output(output_dir=outdir, input_sha256=_INPUT_SHA, engine=_ENGINE,
+                               limits=_limits())
+
+
+def test_a_name_that_only_looks_like_the_receipt_after_stripping_is_accepted(tmp_path):
+    """' attestation.json/page.png' lives in a directory named ' attestation.json' -- a different
+    path from <out>/attestation.json on disk, so it never collides with the receipt."""
+    outdir, _ = _make_output_dir(tmp_path)
+    (outdir / " attestation.json").mkdir()
+    (outdir / " attestation.json" / "page.png").write_bytes(b"PNG_DATA_HERE")
+    meta = json.loads((outdir / "metadata.json").read_bytes())
+    meta["artifacts"][0]["path"] = " attestation.json/page.png"
+    (outdir / "metadata.json").write_bytes(json.dumps(meta).encode())
+    validate_worker_output(output_dir=outdir, input_sha256=_INPUT_SHA, engine=_ENGINE,
+                           limits=_limits())
+
+
+@pytest.mark.parametrize("path", ["attestation.withheld.json", "./attestation.withheld.json",
+                                  "attestation.withheld.json/page.png"])
+def test_declaring_the_withheld_marker_name_is_refused(tmp_path, path):
+    """attestation.withheld.json is the uploader's "no receipt" marker; its presence alone makes
+    the attestation route withhold. A fresh worker must not be able to declare it any more than
+    it can declare attestation.json."""
+    outdir, _ = _make_output_dir(tmp_path)
+    (outdir / "attestation.withheld.json").mkdir()
+    (outdir / "attestation.withheld.json" / "page.png").write_bytes(b"PNG_DATA_HERE")
+    meta = json.loads((outdir / "metadata.json").read_bytes())
+    meta["artifacts"][0]["path"] = path
+    (outdir / "metadata.json").write_bytes(json.dumps(meta).encode())
+    with pytest.raises(OutputTrustError, match="reserved path 'attestation.withheld.json'"):
+        validate_worker_output(output_dir=outdir, input_sha256=_INPUT_SHA, engine=_ENGINE,
+                               limits=_limits())
