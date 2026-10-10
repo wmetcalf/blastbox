@@ -9,6 +9,7 @@ Key layout:
 """
 from __future__ import annotations
 
+import contextlib
 import errno
 
 import gzip
@@ -16,6 +17,7 @@ import hashlib
 import io
 import os
 import time
+import zlib
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 import threading
@@ -27,16 +29,21 @@ from blastbox.host.blobs.base import (
     _SEAL_NAME,
     _assert_declared_landed,
     _declared_paths,
-    _is_seal,
     BlobFetchError,
     BlobIntegrityError,
-    _upload_order,
+    _upload_tiers,
 )
+from blastbox.host.attest import RECEIPT_NAME, WITHHELD_NAME
 from blastbox.observability import get_logger
 
 _log = get_logger("blastbox.blobs.s3")
 
 _CHUNK = 1024 * 1024
+
+# read_result_prefix: the largest single body read, and the compressed-stream allowance over the
+# decoded bound (gzip header/trailer and per-block framing).
+_PREFIX_CHUNK = 64 * 1024
+_PREFIX_SLACK = 4096
 
 # DeleteObjects accepts at most 1000 keys per call. list_objects_v2 pages happened to
 # respect that on their own; list_object_versions returns versions AND delete markers,
@@ -240,39 +247,18 @@ class S3BlobStore:
         declared = _declared_paths(out_dir)
         stored: set[str] = set()
 
-        paths = _upload_order(out_dir)          # seal LAST, by construction
-        seals = [p for p in paths if _is_seal(p, out_dir)]
-        rest = [p for p in paths if not _is_seal(p, out_dir)]
+        *tiers, seals = _upload_tiers(out_dir)      # seal LAST, by construction
 
-        # PHASE 1 — every artifact, fanned out. The seal is deliberately NOT in this set: its
-        # whole meaning is "everything else already landed", so it cannot share a barrier with
-        # the things it vouches for.
-        results: list[tuple[str | None, Exception | None]] = []
-        if self._upload_concurrency <= 1:
-            for path in rest:
-                results.append((self._put_one(job_id, path, out_dir, declared), None))
-        else:
-            pool = self._pool_for_uploads()
-            futures = [pool.submit(self._put_one, job_id, p, out_dir, declared) for p in rest]
-            # Drained in SUBMISSION order, so the exception that surfaces is deterministic: the
-            # same tree must fail the same way every time, or the bounded retry wrapped around
-            # this call is chasing a moving target. EVERY future is drained even after one fails
-            # -- the pool is shared and long-lived, so abandoning futures would leave another
-            # job's uploads racing ours, and a half-read result set is how `stored` silently
-            # loses entries that really did land.
-            for fut in futures:
-                try:
-                    results.append((fut.result(), None))
-                except Exception as exc:  # noqa: BLE001 -- re-raised in order below
-                    results.append((None, exc))
-
-        for rel, err in results:
-            if err is not None:
-                # A real outage MUST fail the upload rather than ship a partial result: the
-                # caller fails the job and retains the local tree instead of purging it.
-                raise err
-            if rel is not None:
-                stored.add(rel)
+        # PHASE 1 -- every artifact, fanned out, tier by tier: everything else, then
+        # attestation.json and attestation.withheld.json in the order the marker requires (a
+        # cleared marker after the receipt, a withholding one before it -- see _upload_tiers).
+        # Each tier is a barrier: the next starts only once every PUT of this one succeeded, so
+        # the cleared marker is never stored before the receipt/tombstone it vouches for, and a
+        # new worker receipt never lands under an older cleared marker. The seal is
+        # deliberately NOT in these: its whole meaning is "everything else already landed", so
+        # it cannot share a barrier with the things it vouches for.
+        for rest in tiers:
+            self._put_tier(job_id, rest, out_dir, declared, stored)
 
         # PHASE 2 — the commit. Only now, with every artifact confirmed stored, may the seal
         # exist: its presence under results/<job_id> is what has_output() reports as durable, and
@@ -294,6 +280,37 @@ class S3BlobStore:
                 self._pool_for_uploads().submit(
                     self._put_one, job_id, path, out_dir, declared, before_put=_precondition,
                 ).result()
+
+    def _put_tier(self, job_id: str, paths: list[Path], out_dir: Path,
+                  declared: "set[str] | None", stored: set[str]) -> None:
+        """Store every path of one tier, fanned out; return only once ALL landed (adding each
+        stored rel to *stored*), else raise the first failure in submission order."""
+        results: list[tuple[str | None, Exception | None]] = []
+        if self._upload_concurrency <= 1:
+            for path in paths:
+                results.append((self._put_one(job_id, path, out_dir, declared), None))
+        else:
+            pool = self._pool_for_uploads()
+            futures = [pool.submit(self._put_one, job_id, p, out_dir, declared) for p in paths]
+            # Drained in SUBMISSION order, so the exception that surfaces is deterministic: the
+            # same tree must fail the same way every time, or the bounded retry wrapped around
+            # this call is chasing a moving target. EVERY future is drained even after one fails
+            # -- the pool is shared and long-lived, so abandoning futures would leave another
+            # job's uploads racing ours, and a half-read result set is how `stored` silently
+            # loses entries that really did land.
+            for fut in futures:
+                try:
+                    results.append((fut.result(), None))
+                except Exception as exc:  # noqa: BLE001 -- re-raised in order below
+                    results.append((None, exc))
+
+        for rel, err in results:
+            if err is not None:
+                # A real outage MUST fail the upload rather than ship a partial result: the
+                # caller fails the job and retains the local tree instead of purging it.
+                raise err
+            if rel is not None:
+                stored.add(rel)
 
     def _pool_for_uploads(self) -> ThreadPoolExecutor:
         """The dispatcher-wide upload pool, created on first use.
@@ -402,6 +419,78 @@ class S3BlobStore:
             data = gzip.decompress(data)
         return io.BytesIO(data)
 
+    def read_result_prefix(self, job_id: str, name: str, max_bytes: int) -> bytes:
+        """At most *max_bytes* of one stored artifact, decoded -- WITHOUT fetching the rest.
+
+        open_output downloads and decompresses the whole object before its caller sees a byte,
+        so a reader that truncates at a ceiling (the attestation route's envelope and marker
+        reads) still pulled every byte through this process (lens r7 F2). This streams the
+        body instead, reading no more than what is still needed, and inflates a gzip-encoded
+        object incrementally with the output capped at *max_bytes*. The body is closed as soon
+        as the bound is reached. Errors are raised exactly as open_output raises them (a
+        missing key is a BlobFetchError caused by the NoSuchKey).
+        """
+        key = self._key("results", job_id, self._safe_rel(name))
+        try:
+            obj = self._s3.get_object(Bucket=self._bucket, Key=key)
+        except Exception as exc:
+            raise BlobFetchError(f"result fetch failed: {job_id}/{name}") from exc
+        body = obj["Body"]
+        inflater = (zlib.decompressobj(wbits=31) if obj.get("ContentEncoding") == "gzip"
+                    else None)
+        # Our own gzip encoder never grows its input by more than a few bytes per 16 KiB
+        # block, so a stream still short of the bound past this many compressed bytes is not
+        # one we wrote: refuse it rather than keep reading.
+        transfer_limit = max_bytes + max_bytes // 64 + _PREFIX_SLACK
+        out = bytearray()
+        transferred = 0
+        try:
+            while len(out) < max_bytes:
+                want = min(_PREFIX_CHUNK, max(max_bytes - len(out), 1))
+                if inflater is not None and inflater.unconsumed_tail:
+                    raw = inflater.unconsumed_tail
+                else:
+                    raw = body.read(want)
+                    transferred += len(raw)
+                    if not raw:
+                        if inflater is not None:
+                            out += inflater.flush()[: max_bytes - len(out)]
+                            if not inflater.eof and len(out) < max_bytes:
+                                # The body ended mid-stream short of the bound: a malformed
+                                # object, not a short prefix to judge. Caused, never "missing".
+                                raise BlobFetchError(
+                                    f"result fetch failed: {job_id}/{name}: truncated gzip "
+                                    f"stream") from ValueError("truncated gzip stream")
+                        break
+                if inflater is None:
+                    out += raw
+                else:
+                    out += inflater.decompress(raw, max_bytes - len(out))
+                    if inflater.eof:
+                        # Our encoder writes ONE gzip member. open_output's gzip.decompress
+                        # decodes every member, so bytes after the first would make this
+                        # prefix differ from what the object decodes to: malformed, refused.
+                        if inflater.unused_data or body.read(1):
+                            raise BlobFetchError(
+                                f"result fetch failed: {job_id}/{name}: data after its gzip "
+                                f"stream") from ValueError("data after the gzip stream")
+                        break
+                if transferred > transfer_limit and len(out) < max_bytes:
+                    # Caused, so callers never read it as a missing key (a causeless
+                    # BlobFetchError is the "absent" convention).
+                    raise BlobFetchError(
+                        f"result fetch failed: {job_id}/{name}: compressed stream outgrew "
+                        f"its decoded bound ({transferred} bytes for < {max_bytes})"
+                    ) from ValueError("compressed stream outgrew its decoded bound")
+        except BlobFetchError:
+            raise
+        except Exception as exc:
+            raise BlobFetchError(f"result fetch failed: {job_id}/{name}") from exc
+        finally:
+            with contextlib.suppress(Exception):
+                body.close()
+        return bytes(out[:max_bytes])
+
     def has_output(self, job_id: str) -> bool:
         """Positively observed durable result bytes for *job_id*. Any error -> False: the age
         reclaim deletes the local tree on the strength of this answer, so a transient object-store
@@ -455,8 +544,10 @@ class S3BlobStore:
         )
         return [{"Key": o["Key"]} for o in page.get("Contents", [])]
 
-    def _next_delete_page(self, prefix: str) -> list[dict[str, str]]:
-        """One page of delete targets under ``prefix``, newest-listing first.
+    def _next_delete_page(
+        self, prefix: str
+    ) -> tuple[list[dict[str, str]], list[dict[str, str]], bool]:
+        """One page of delete targets under ``prefix``: ``(noncurrent, current, full)``.
 
         Deliberately ONE page, re-listed from scratch on each call rather than
         paginated. Two reasons:
@@ -474,14 +565,23 @@ class S3BlobStore:
         tombstone for a job whose bytes are gone, and a marker left by an earlier
         keyless delete is exactly the residue this fixes.
 
-        Noncurrent versions and delete markers are ordered BEFORE the current
-        version. If a delete partially fails (Object Lock, an IAM condition), the
-        object stays visible in an ordinary listing instead of the current version
-        vanishing while older bytes remain -- the state that looks deleted but is
-        not.
+        Noncurrent versions (and noncurrent delete markers) are returned APART from
+        the current ones, and the caller deletes them in their own calls first: the
+        current version of a key goes only once it is that key's last. DeleteObjects
+        reports per-key Errors independently, so one batch holding both could delete
+        the current version while an older one failed -- and S3 then promotes that
+        older version to current: bytes this store had overwritten (a worker's
+        attestation.json under its tombstone) resurrected as the live object. Kept
+        apart, a partial failure instead leaves the object visible and unchanged.
+
+        On a truncated page the current version of the LAST listed key is held back:
+        that key's older versions may continue on the next page, unseen here.
+
+        ``full`` is whether the listing filled a page (more may lie past it).
         """
         if not self._bucket_is_versioned():
-            return self._current_keys_page(prefix)
+            keys = self._current_keys_page(prefix)
+            return [], keys, len(keys) >= _DELETE_BATCH
 
         try:
             page = self._s3.list_object_versions(
@@ -510,10 +610,18 @@ class S3BlobStore:
                 "s3:ListBucketVersions + s3:DeleteObjectVersion.",
                 self._bucket, type(exc).__name__,
             )
-            return self._current_keys_page(prefix)
+            keys = self._current_keys_page(prefix)
+            return [], keys, len(keys) >= _DELETE_BATCH
         entries = [*page.get("Versions", []), *page.get("DeleteMarkers", [])]
-        entries.sort(key=lambda e: bool(e.get("IsLatest")))
-        return [{"Key": e["Key"], "VersionId": e["VersionId"]} for e in entries]
+        truncated = bool(page.get("IsTruncated"))
+        # Keys list in order, each key's versions together; only the last key can spill over.
+        last_key = page.get("NextKeyMarker") or max((e["Key"] for e in entries), default=None)
+        noncurrent = [{"Key": e["Key"], "VersionId": e["VersionId"]}
+                      for e in entries if not e.get("IsLatest")]
+        current = [{"Key": e["Key"], "VersionId": e["VersionId"]}
+                   for e in entries
+                   if e.get("IsLatest") and not (truncated and e["Key"] == last_key)]
+        return noncurrent, current, truncated or len(entries) >= _DELETE_BATCH
 
     def delete_job(self, job_id: str) -> None:
         """Drop this job's RESULTS only.
@@ -533,14 +641,40 @@ class S3BlobStore:
         or the ingress DELETE route) leaves the job retryable instead.
         """
         prefix = self._key("results", job_id) + "/"
+        # ORDERED, each step only after the previous one fully succeeded, so a delete that fails
+        # partway never leaves a servable receipt unmasked: attestation.json FIRST, then every
+        # other key, and the withheld marker LAST. One batch let S3's independent per-key Errors
+        # remove the marker while attestation.json and metadata.json stayed, and the attestation
+        # route then served an as-is result's worker-written attestation.json 200 on a job DELETE
+        # had left DONE (503, retryable).
+        self._delete_prefix(job_id, prefix + RECEIPT_NAME)
+        self._delete_prefix(job_id, prefix, keep=prefix + WITHHELD_NAME)
+        self._delete_prefix(job_id, prefix)
+
+    def _delete_prefix(self, job_id: str, prefix: str, *, keep: str | None = None) -> None:
+        """Delete every object (and version) under ``prefix`` except the key ``keep``; raise
+        BlobFetchError when any is left undeleted (see :meth:`delete_job`)."""
         errors: dict[tuple, dict] = {}
         # Take one page, delete it, then LIST AGAIN from the start. See
         # _next_delete_page for why this is not a paginate-and-delete loop. The pass
         # stops as soon as one makes no progress, so an undeletable object cannot
         # spin here -- it lands in `errors` and the raise below reports it.
+        #
+        # Noncurrent versions FIRST, in calls of their own, and a page's current versions only
+        # when it lists no noncurrent one (see _next_delete_page): a current version deleted
+        # beside a noncurrent one that failed lets S3 promote the older bytes to current.
         while True:
-            targets = self._next_delete_page(prefix)
+            noncurrent, current, full = self._next_delete_page(prefix)
+            noncurrent = [t for t in noncurrent if t["Key"] != keep]
+            current = [t for t in current if t["Key"] != keep]
+            targets = noncurrent or current
             if not targets:
+                if full:
+                    # A whole page of `keep`'s versions: what lies past it cannot be listed
+                    # without deleting `keep` first, which the ordering forbids. Retryable.
+                    raise BlobFetchError(
+                        f"delete_job for {job_id}: a full listing page holds only {keep!r}; "
+                        "expire its noncurrent versions and retry")
                 break
             deleted = 0
             for batch in _batched(targets, _DELETE_BATCH):
@@ -551,7 +685,8 @@ class S3BlobStore:
                 for err in failed:
                     errors[(err.get("Key"), err.get("VersionId"))] = err
                 deleted += len(batch) - len(failed)
-            if deleted == 0:
+            if deleted == 0 or (errors and targets is noncurrent):
+                # A noncurrent version left behind: stop before ANY current version is deleted.
                 break
         if errors:
             first = next(iter(errors.values()))

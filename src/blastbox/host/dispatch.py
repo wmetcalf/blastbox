@@ -2318,8 +2318,8 @@ class Dispatcher:
                 return
             # The receipt goes INTO the sealed tree immediately before it ships: its metadata
             # hash is then of exactly the bytes put_output uploads, into the same prefix.
-            self._seal_receipt(job, output_dir, observation)
-            if not self._upload_output(job, output_dir):
+            sealed = self._seal_receipt(job, output_dir, observation)
+            if not self._upload_output(job, output_dir, sealed=sealed):
                 # The worker RAN and its output passed the trust gate; the upload is OUR side
                 # failing. Attribute the demonstrated success so the streaks reset -- the default
                 # would convict the worker for this dispatcher's storage problem, and an upload
@@ -2329,11 +2329,7 @@ class Dispatcher:
                 # spare this tree rather than destroy the only copy.
                 self._upload_failed_job_ids.add(job.job_id)
                 # Same ordering and same fence as the cold path above.
-                self._retain_for_upload_retry(
-                    job,
-                    f"result upload failed after {self._put_output_max_attempts} attempts; "
-                    f"{RESULT_RETAINED_MARKER}",
-                )
+                self._retain_for_upload_retry(job, self._retained_reason(sealed))
                 return
             phases.mark("upload")
 
@@ -2952,8 +2948,8 @@ class Dispatcher:
             )
             return
         # The receipt goes INTO the sealed tree immediately before it ships (see the warm twin).
-        self._seal_receipt(job, output_dir, observation)
-        if not self._upload_output(job, output_dir):
+        sealed = self._seal_receipt(job, output_dir, observation)
+        if not self._upload_output(job, output_dir, sealed=sealed):
             # The durable copy never landed, so do NOT purge this tree -- it is the only copy.
             self._upload_failed_job_ids.add(job.job_id)
             # BEFORE the terminal write, not after: a crash in between would otherwise lose the
@@ -2962,11 +2958,7 @@ class Dispatcher:
             # act on one whose claim no longer matches the row, so writing it early cannot let a
             # superseded attempt publish over a peer. If we then lose the CAS we clear it anyway,
             # so the common case leaves nothing behind (#85 review).
-            self._retain_for_upload_retry(
-                job,
-                f"result upload failed after {self._put_output_max_attempts} attempts; "
-                f"{RESULT_RETAINED_MARKER}",
-            )
+            self._retain_for_upload_retry(job, self._retained_reason(sealed))
             return
 
         # ------------------------------------------------------------------
@@ -3199,24 +3191,26 @@ class Dispatcher:
             return None
 
     def _seal_receipt(self, job: Job, output_dir: Path,
-                      observation: "_attest.RunObservation | None") -> None:
+                      observation: "_attest.RunObservation | None") -> bool:
         """Replace whatever sits at attestation.json in the tree about to be uploaded with this
-        dispatcher's signed receipt, or a tombstone saying why it did not sign.
-        Never raises: a receipt problem is logged and the job completes without one."""
-        try:
-            _attest.seal_receipt(output_dir, key=self._attest_key, observation=observation,
-                                 reason="input could not be hashed")
-        except Exception as exc:  # noqa: BLE001
-            _log.error("attestation: could not write the receipt for job %s (%s); the job "
-                       "completes without one", job.job_id, exc)
-            try:
-                # Never ship a planted or half-written one, and overwrite a superseded attempt's.
-                _attest.write_tombstone(output_dir, "signing failed")
-            except Exception:  # noqa: BLE001
-                _log.exception("attestation: could not write a tombstone for job %s",
-                               job.job_id)
+        dispatcher's signed receipt, or a tombstone saying why it did not sign. Never raises.
+        Returns False when what is at attestation.json lacks its cleared marker -- our receipt
+        landed but its marker did not, a fallback tombstone's marker failed, or nothing could be
+        written there at all. The tree must then not ship: the job is FAILED and the tree retained
+        for the pending-upload sweep (see seal_fresh_receipt)."""
+        return _attest.seal_fresh_receipt(output_dir, key=self._attest_key,
+                                          observation=observation, job_id=job.job_id,
+                                          reason=_attest.INPUT_UNHASHED_REASON)
 
-    def _upload_output(self, job: Job, output_dir: Path) -> bool:
+    def _retained_reason(self, sealed: bool) -> str:
+        """The FAILED job's error when its tree is retained for the pending-upload sweep: an
+        upload that exhausted its attempts, or one refused because the seal was incomplete."""
+        if not sealed:
+            return f"result not uploaded: {_attest.SEAL_INCOMPLETE_REASON}; {RESULT_RETAINED_MARKER}"
+        return (f"result upload failed after {self._put_output_max_attempts} attempts; "
+                f"{RESULT_RETAINED_MARKER}")
+
+    def _upload_output(self, job: Job, output_dir: Path, *, sealed: bool = True) -> bool:
         """Upload *output_dir* (already sealed) to the blob store, with a bounded inline
         retry (Finding P1/D1). Called from BOTH the cold and warm success paths, BEFORE
         their DONE write — the API's result routes read ONLY through
@@ -3231,18 +3225,29 @@ class Dispatcher:
         ever re-runs a RUNNING job, so preserving one for a retry that never comes would
         only leak the job dir forever.
         """
-        exc = upload_output_with_retry(
-            self._blobs, job.job_id, output_dir,
-            attempts=self._put_output_max_attempts,
-            backoff_s=self._put_output_retry_backoff_s,
-        )
-        if exc is None:
-            return True
-        _log.error(
-            "result upload failed for job %s after %d attempt(s) (%s); failing the job "
-            "(result discarded, not stored)",
-            job.job_id, self._put_output_max_attempts, exc,
-        )
+        # ``sealed`` False: what is at attestation.json lacks its cleared marker (see
+        # _seal_receipt). Refuse the upload -- put_output is never called -- and take the
+        # ordinary failure path, which retains the tree for the pending-upload sweep.
+        if not sealed:
+            _log.error(
+                "result for job %s NOT uploaded: %s at %s (see the attestation error above); "
+                "nothing was uploaded -- failing the job and RETAINING its output "
+                "for the pending-upload sweep",
+                job.job_id, _attest.SEAL_INCOMPLETE_REASON, _attest.RECEIPT_NAME,
+            )
+        else:
+            exc = upload_output_with_retry(
+                self._blobs, job.job_id, output_dir,
+                attempts=self._put_output_max_attempts,
+                backoff_s=self._put_output_retry_backoff_s,
+            )
+            if exc is None:
+                return True
+            _log.error(
+                "result upload failed for job %s after %d attempt(s) (%s); failing the job "
+                "and RETAINING its output for the pending-upload sweep",
+                job.job_id, self._put_output_max_attempts, exc,
+            )
         # Finding S1: a partial result may already be sitting under results/<job_id> (e.g.
         # some of put_output's per-file put_object calls landed before a later one failed).
         # The caller below marks the job FAILED via _fail_job, never DONE, so this job will

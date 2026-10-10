@@ -9,6 +9,7 @@ read truthfully is OMITTED — a scrape never raises and never emits a fabricate
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import time
@@ -458,13 +459,12 @@ def test_read_node_view_refuses_mixed_node_ids(tmp_path):
     assert read_node_view(str(tmp_path / "node"), stale_after_s=20.0, node="") is None
 
 
-def test_readonly_reader_skips_fifo_symlink_and_oversize(tmp_path):
+def test_readonly_reader_skips_fifo_and_symlink(tmp_path):
     d = tmp_path / "node"
     share = FileNodeShare(str(d))
     share.publish(_snap("aa", assigned=1, ram=100, vcpus=1, budget_ram=1000, budget_vcpus=4))
     os.mkfifo(d / "fifo.json")                      # would block a plain open()
     (d / "zero.json").symlink_to("/dev/zero")        # would read forever
-    (d / "big.json").write_text("{" + " " * (128 * 1024) + "}")
     # a VALID snapshot outside the dir, linked in under its canonical name: only O_NOFOLLOW (or
     # the lstat prefilter) keeps it out — S_ISREG on the target would accept it
     outside = tmp_path / "outside"
@@ -473,6 +473,10 @@ def test_readonly_reader_skips_fifo_symlink_and_oversize(tmp_path):
     (d / "cc@firecracker@abc123.json").symlink_to(outside / "cc@firecracker@abc123.json")
     got = read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time())
     assert got is not None and [s.engine for s in got] == ["aa"]
+    # An oversize REGULAR file is never read, but it is not skipped either: it may be a
+    # reservation, so the view is omitted rather than published without it.
+    (d / "big.json").write_text("{" + " " * (128 * 1024) + "}")
+    assert read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time()) is None
 
 
 def _publish_n(d: Path, n: int) -> None:
@@ -853,3 +857,171 @@ def test_readonly_reader_still_skips_stale_snapshots(tmp_path):
     share.publish(DemandSnapshot(**{**old.__dict__, "ts": time.time() - 3600}))
     got = read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time())
     assert got is not None and [s.engine for s in got] == ["aa"]
+
+
+def _two_snapshots(tmp_path):
+    d = tmp_path / "node"
+    share = FileNodeShare(str(d))
+    share.publish(_snap("aa", assigned=1, ram=100, vcpus=1, budget_ram=1000, budget_vcpus=4))
+    share.publish(_snap("bb", assigned=1, ram=100, vcpus=1, budget_ram=1000, budget_vcpus=4))
+    victim = next(p for p in sorted(d.glob("*.json")) if p.name.startswith("bb"))
+    return d, victim
+
+
+@pytest.mark.parametrize("err", [errno.EACCES, errno.EIO, errno.EMFILE])
+def test_readonly_reader_open_error_is_omitted_not_partial(tmp_path, monkeypatch, err):
+    """A regular, in-size snapshot that fails to OPEN (permission, EIO, fd exhaustion) is a
+    reservation the view cannot see: publishing totals from the rest would undercount the node.
+    Fail closed, like the over-cap and invalid-snapshot cases: None, not a partial list."""
+    d, victim = _two_snapshots(tmp_path)
+    real_open = os.open
+
+    def failing_open(path, *a, **k):
+        if str(path) == str(victim):
+            raise OSError(err, os.strerror(err), str(path))
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(os, "open", failing_open)
+    assert read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time()) is None
+
+
+def test_readonly_reader_read_error_is_omitted_not_partial(tmp_path, monkeypatch):
+    d, victim = _two_snapshots(tmp_path)
+    real_open, real_read = os.open, os.read
+    fds: set[int] = set()
+
+    def tracking_open(path, *a, **k):
+        fd = real_open(path, *a, **k)
+        if str(path) == str(victim):
+            fds.add(fd)
+        return fd
+
+    def failing_read(fd, n):
+        if fd in fds:
+            raise OSError(errno.EIO, "Input/output error")
+        return real_read(fd, n)
+
+    monkeypatch.setattr(os, "open", tracking_open)
+    monkeypatch.setattr(os, "read", failing_read)
+    assert read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time()) is None
+
+
+def test_readonly_reader_a_snapshot_removed_after_listing_is_skipped(tmp_path, monkeypatch):
+    """ENOENT is not a gap in the view: the dispatcher removed (or GC'd) its snapshot, which is
+    the same view a listing taken a moment later would show."""
+    d, victim = _two_snapshots(tmp_path)
+    real_open = os.open
+
+    def vanishing_open(path, *a, **k):
+        if str(path) == str(victim):
+            os.unlink(victim)
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(os, "open", vanishing_open)
+    got = read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time())
+    assert got is not None and [s.engine for s in got] == ["aa"]
+
+
+class _StatFailingScandir:
+    """os.scandir whose DirEntry.stat raises ``err`` for the entry named ``victim``."""
+
+    def __init__(self, real, victim: str, err: int):
+        self._real, self._victim, self._err = real, victim, err
+
+    def __call__(self, path):
+        real_it, victim, err = self._real(path), self._victim, self._err
+
+        class _Entry:
+            def __init__(self, e):
+                self._e, self.name = e, e.name
+
+            def stat(self, follow_symlinks=True):
+                if self.name == victim:
+                    raise OSError(err, os.strerror(err))
+                return self._e.stat(follow_symlinks=follow_symlinks)
+
+        class _It:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                real_it.close()
+
+            def __iter__(self):
+                return (_Entry(e) for e in real_it)
+
+        return _It()
+
+
+@pytest.mark.parametrize("err", [errno.EACCES, errno.EIO])
+def test_readonly_reader_listing_stat_error_is_omitted_not_partial(tmp_path, monkeypatch, err):
+    """The listing's lstat failing for any reason other than ENOENT is a snapshot the view cannot
+    see -- skipping it publishes totals from the rest. Fail closed, as open/read errors do."""
+    d, victim = _two_snapshots(tmp_path)
+    monkeypatch.setattr(os, "scandir", _StatFailingScandir(os.scandir, victim.name, err))
+    assert read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time()) is None
+
+
+def test_readonly_reader_listing_stat_enoent_is_skipped(tmp_path, monkeypatch):
+    """Removed between the listing and its lstat: it holds no reservation, so skip it."""
+    d, victim = _two_snapshots(tmp_path)
+    monkeypatch.setattr(os, "scandir", _StatFailingScandir(os.scandir, victim.name,
+                                                           errno.ENOENT))
+    got = read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time())
+    assert got is not None and [s.engine for s in got] == ["aa"]
+
+
+def _grow(path, by: int = 1 << 16) -> None:
+    with open(path, "ab") as fh:
+        fh.write(b" " * by)
+
+
+def test_readonly_reader_snapshot_over_cap_at_fstat_is_omitted_not_partial(tmp_path,
+                                                                           monkeypatch):
+    """In-size at the listing's lstat, over the cap by the time it is opened and fstat'd: a
+    regular snapshot the view cannot read. Skipping it publishes partial totals; fail closed."""
+    d, victim = _two_snapshots(tmp_path)
+    real_open = os.open
+
+    def growing_open(path, *a, **k):
+        if str(path) == str(victim):
+            _grow(victim)
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(os, "open", growing_open)
+    assert read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time(),
+                                   max_bytes=4096) is None
+
+
+def test_readonly_reader_snapshot_growing_past_cap_mid_read_is_omitted_not_partial(
+        tmp_path, monkeypatch):
+    d, victim = _two_snapshots(tmp_path)
+    real_open, real_fstat = os.open, os.fstat
+    fds: set[int] = set()
+
+    def tracking_open(path, *a, **k):
+        fd = real_open(path, *a, **k)
+        if str(path) == str(victim):
+            fds.add(fd)
+        return fd
+
+    def growing_fstat(fd, *a, **k):
+        st = real_fstat(fd, *a, **k)
+        if fd in fds:
+            _grow(victim)                   # after the fstat check, before the read
+        return st
+
+    monkeypatch.setattr(os, "open", tracking_open)
+    monkeypatch.setattr(os, "fstat", growing_fstat)
+    assert read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time(),
+                                   max_bytes=4096) is None
+
+
+def test_readonly_reader_snapshot_over_cap_at_listing_is_omitted_not_partial(tmp_path):
+    """Already over the cap when the dir is listed: still a regular snapshot whose reservation
+    the view cannot read. Skipping it unopened publishes totals from the rest; fail closed,
+    exactly as when it outgrows the cap after the listing."""
+    d, victim = _two_snapshots(tmp_path)
+    _grow(victim)
+    assert read_snapshots_readonly(str(d), max_age_s=20.0, now=time.time(),
+                                   max_bytes=4096) is None

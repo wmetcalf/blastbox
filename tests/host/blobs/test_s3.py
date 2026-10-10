@@ -570,3 +570,203 @@ def test_delete_job_all_success_path_does_not_raise(store, tmp_path):
 
     s3 = boto3.client("s3", region_name="us-east-1")
     assert s3.list_objects_v2(Bucket=BUCKET, Prefix="pfx/results/j7/")["KeyCount"] == 0
+
+
+def test_a_listing_page_of_only_the_markers_versions_refuses_rather_than_deleting_it_early(
+        versioned_store, tmp_path, monkeypatch):
+    """delete_job removes the withheld marker LAST. In a versioned bucket one listing page can
+    hold nothing but the marker's versions (it sorts before metadata.json); what lies past that
+    page cannot be listed without deleting the marker first. Stopping the keep-pass there and
+    moving on deleted the marker while metadata.json was still stored: it must raise instead,
+    leaving the marker (and the rest) in place for a retry."""
+    from blastbox.host import attest
+    from blastbox.host.blobs import s3 as s3mod
+
+    monkeypatch.setattr(s3mod, "_DELETE_BATCH", 3)
+    out = tmp_path / "jm" / "output"
+    out.mkdir(parents=True)
+    (out / "metadata.json").write_bytes(b"{}")
+    for i in range(3):                                   # three versions of the marker
+        (out / attest.WITHHELD_NAME).write_bytes(b"marker %d" % i)
+        versioned_store.put_output("jm", out)
+    with pytest.raises(BlobFetchError, match="holds only"):
+        versioned_store.delete_job("jm")
+    with versioned_store.open_output("jm", attest.WITHHELD_NAME) as fh:
+        assert fh.read() == b"marker 2"                  # the marker was not deleted early
+    with versioned_store.open_output("jm", "metadata.json") as fh:
+        assert fh.read() == b"{}"
+
+
+@pytest.mark.parametrize("compress", [True, False], ids=["gzip", "plain"])
+def test_read_result_prefix_never_fetches_past_its_bound(tmp_path, compress):
+    """lens r7 F2. open_output downloads and decompresses the WHOLE object before the caller can
+    truncate, so a capped reader on S3 still pulled every byte. read_result_prefix streams the
+    body and stops at the bound: neither the bytes transferred nor the bytes decompressed run
+    far past it, and the prefix it returns is exact."""
+    import os
+
+    with moto.mock_aws():
+        boto3.client("s3", region_name="us-east-1").create_bucket(Bucket=BUCKET)
+        env = {} if compress else {"BLASTBOX_BLOB_COMPRESS": "0"}
+        store = S3BlobStore(f"s3://{BUCKET}/pfx", job_root=tmp_path, env=env)
+        out = tmp_path / "jp" / "output"
+        out.mkdir(parents=True)
+        payload = os.urandom(1 << 19).hex().encode()      # 1 MiB, ~2:1 compressible
+        (out / "metadata.json").write_bytes(payload)
+        store.put_output("jp", out)
+
+        fetched = {"n": 0}
+        real = store._s3.get_object
+
+        def counting(**kw):
+            obj = real(**kw)
+            raw = obj["Body"].read
+
+            def rd(*a):
+                d = raw(*a)
+                fetched["n"] += len(d)
+                return d
+            obj["Body"].read = rd
+            return obj
+        store._s3.get_object = counting
+
+        got = store.read_result_prefix("jp", "metadata.json", 1025)
+        assert got == payload[:1025]
+        assert 0 < fetched["n"] <= 2 * 1025, fetched["n"]
+
+        # A bound past the object's end returns the whole object.
+        assert store.read_result_prefix("jp", "metadata.json", len(payload) + 10) == payload
+
+
+def test_read_result_prefix_missing_and_unsafe_names(store):
+    with pytest.raises(BlobFetchError) as ei:
+        store.read_result_prefix("nope", "metadata.json", 10)
+    code = ei.value.__cause__.response["Error"]["Code"]
+    assert code in ("NoSuchKey", "404")
+    with pytest.raises(BlobFetchError):
+        store.read_result_prefix("j", "../x", 10)
+
+
+def test_read_result_prefix_refuses_a_gzip_stream_that_never_decodes_toward_its_bound(store):
+    """A gzip-encoded object our encoder could not have written (empty stored blocks, forever)
+    decodes nothing while it streams. The bounded read refuses once the compressed bytes run past
+    the bound's allowance, rather than following the stream to its end."""
+    import zlib as _zlib
+
+    header = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff"
+    empty_block = b"\x00\x00\x00\xff\xff"          # BFINAL=0, stored, LEN=0
+    body = header + empty_block * 200_000 + b"\x03\x00" + (0).to_bytes(4, "little") * 2
+    assert _zlib.decompress(body, wbits=31) == b""
+    boto3.client("s3", region_name="us-east-1").put_object(
+        Bucket=BUCKET, Key="pfx/results/jz/metadata.json", Body=body, ContentEncoding="gzip")
+    with pytest.raises(BlobFetchError, match="outgrew"):
+        store.read_result_prefix("jz", "metadata.json", 1024)
+
+
+def test_read_result_prefix_refuses_a_truncated_gzip_object(store):
+    """A gzip object cut short before the bound is reached is a malformed stored object: a read
+    error (caused, so never "missing"), not a short but valid prefix to judge."""
+    import gzip as _gzip
+
+    body = _gzip.compress(b'{"artifacts": []}')[:-8]          # trailer removed
+    boto3.client("s3", region_name="us-east-1").put_object(
+        Bucket=BUCKET, Key="pfx/results/jt/metadata.json", Body=body, ContentEncoding="gzip")
+    with pytest.raises(BlobFetchError, match="truncated") as ei:
+        store.read_result_prefix("jt", "metadata.json", 1024)
+    assert ei.value.__cause__ is not None
+
+
+def test_read_result_prefix_accepts_a_complete_gzip_object_shorter_than_the_bound(store):
+    import gzip as _gzip
+
+    boto3.client("s3", region_name="us-east-1").put_object(
+        Bucket=BUCKET, Key="pfx/results/jc/metadata.json",
+        Body=_gzip.compress(b'{"artifacts": []}'), ContentEncoding="gzip")
+    assert store.read_result_prefix("jc", "metadata.json", 1024) == b'{"artifacts": []}'
+
+
+@pytest.mark.parametrize("split", [False, True], ids=["one-chunk", "member-at-chunk-edge"])
+def test_read_result_prefix_refuses_a_multi_member_gzip_object(store, monkeypatch, split):
+    """C3 (codex r134). open_output's gzip.decompress decodes EVERY member; the bounded read
+    stopped at the first, so gzip(a) + gzip(b) read as ``a`` here and ``ab`` there -- a stored
+    marker could look like the exact cleared body to the route only. Our encoder writes one
+    member, so anything after it is a malformed object: a caused read error, never a prefix."""
+    import gzip as _gzip
+
+    import blastbox.host.blobs.s3 as s3mod
+
+    first = _gzip.compress(b'{"cleared": true}')
+    body = first + _gzip.compress(b"x")
+    if split:       # the first member ends exactly at a body read: no unused_data left over
+        monkeypatch.setattr(s3mod, "_PREFIX_CHUNK", len(first))
+    boto3.client("s3", region_name="us-east-1").put_object(
+        Bucket=BUCKET, Key="pfx/results/jm/attestation.withheld.json", Body=body,
+        ContentEncoding="gzip")
+    assert store.open_output("jm", "attestation.withheld.json").read() == b'{"cleared": true}x'
+    with pytest.raises(BlobFetchError, match="after its gzip stream") as ei:
+        store.read_result_prefix("jm", "attestation.withheld.json", 1024)
+    assert ei.value.__cause__ is not None
+
+
+def _latest_by_key(prefix):
+    versions, markers = _surviving_versions(prefix)
+    return {v["Key"]: v["VersionId"] for v in [*versions, *markers] if v.get("IsLatest")}
+
+
+def test_a_failed_noncurrent_delete_never_promotes_an_older_version(versioned_store, tmp_path):
+    """Per-key Errors are independent: a noncurrent version that fails to delete while its
+    key's current version is deleted in the SAME batch becomes current again -- older bytes
+    resurrected under the key (round-15: a worker attestation.json back over its tombstone).
+    Noncurrent versions go in their own call(s) and the current one only once they are gone."""
+    out = tmp_path / "jr" / "output"
+    out.mkdir(parents=True)
+    for body in (b"old", b"new"):
+        (out / "metadata.json").write_bytes(body)
+        (out / "attestation.withheld.json").write_bytes(body)
+        versioned_store.put_output("jr", out)
+    before = _latest_by_key("pfx/results/jr/")
+    old = {v["VersionId"] for v in _surviving_versions("pfx/results/jr/")[0]
+           if not v["IsLatest"]}
+    real = versioned_store._s3.delete_objects
+
+    def delete_objects(Bucket, Delete):  # noqa: N803 — boto3's parameter names
+        fail = [o for o in Delete["Objects"] if o.get("VersionId") in old]
+        rest = [o for o in Delete["Objects"] if o.get("VersionId") not in old]
+        resp = real(Bucket=Bucket, Delete={"Objects": rest}) if rest else {}
+        resp["Errors"] = [{"Key": o["Key"], "VersionId": o["VersionId"], "Code": "InternalError"}
+                          for o in fail]
+        return resp
+
+    versioned_store._s3.delete_objects = delete_objects
+    with pytest.raises(BlobFetchError):
+        versioned_store.delete_job("jr")
+    assert _latest_by_key("pfx/results/jr/") == before
+
+
+def test_a_current_version_is_deleted_only_once_it_is_the_keys_last(
+        versioned_store, tmp_path, monkeypatch):
+    """Even across listing pages: a key whose noncurrent versions spill past the page must not
+    lose its current version while any of them remain."""
+    import blastbox.host.blobs.s3 as s3mod
+
+    monkeypatch.setattr(s3mod, "_DELETE_BATCH", 3)
+    out = tmp_path / "jp" / "output"
+    out.mkdir(parents=True)
+    for i in range(5):
+        (out / "a.json").write_bytes(b"a%d" % i)
+        (out / "b.json").write_bytes(b"b%d" % i)
+        versioned_store.put_output("jp", out)
+    real = versioned_store._s3.delete_objects
+    s3 = boto3.client("s3", region_name="us-east-1")
+
+    def delete_objects(Bucket, Delete):  # noqa: N803 — boto3's parameter names
+        for o in Delete["Objects"]:
+            vs = s3.list_object_versions(Bucket=BUCKET, Prefix=o["Key"]).get("Versions", [])
+            vs = [v for v in vs if v["Key"] == o["Key"]]
+            if any(v["IsLatest"] and v["VersionId"] == o["VersionId"] for v in vs):
+                assert len(vs) == 1, f"current {o['Key']} deleted with {len(vs) - 1} older left"
+        return real(Bucket=Bucket, Delete=Delete)
+
+    versioned_store._s3.delete_objects = delete_objects
+    versioned_store.delete_job("jp")
+    assert _surviving_versions("pfx/results/jp/") == ([], [])

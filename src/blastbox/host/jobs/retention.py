@@ -22,7 +22,7 @@ import os
 import re
 import shutil
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -30,7 +30,8 @@ from blastbox.host.blobs.base import BlobStore, upload_output_with_retry
 from blastbox.host.jobs.base import JobStatus, JobStore
 
 if TYPE_CHECKING:
-    from blastbox.host.attest import AttestKey
+    from blastbox.host.attest import AttestKey, VerifyKey
+    from blastbox.limits import Limits
 
 _log = logging.getLogger("blastbox.host.jobs.retention")
 
@@ -415,200 +416,259 @@ def retry_pending_uploads(
         _upload_cursor[str(job_root)] = (start + max_per_sweep) % len(entries)
         entries = entries[:max_per_sweep]
     for d in entries:
+        # ISOLATED per tree. A worker shapes everything under output/, and anything one tree
+        # raises that is not an OSError (a RecursionError from a deep chain, say) used to leave
+        # this function and abort the whole tick -- starving every retained result after it in
+        # the window, permanently when the rotation step divides the tree count. Log it, leave
+        # that tree retained for the next tick, and carry on.
         try:
-            if d.is_symlink() or not d.is_dir() or not _JOB_ID_RE.match(d.name):
-                continue
-            out_dir = d / "output"
-            # The host-only sentinel FIRST: it is one stat, it is unforgeable by the worker, and
-            # it means almost no directory reaches the store round-trip below.
-            if not (d / PENDING_UPLOAD_SENTINEL).is_file():
-                continue
-            if not (out_dir / "metadata.json").is_file():
-                continue          # sentinel without a result: nothing to upload
-        except OSError:
-            continue
-        # THE GATE: the JOB ROW must say this tree is a host-sealed result whose upload failed.
-        #
-        # A root metadata.json does NOT prove that. The WORKER writes output/metadata.json
-        # (worker/harness.py) and the host only OVERWRITES it when the trust gate passes, so a
-        # tree abandoned before sealing -- gate rejection, worker timeout, a dispatcher killed
-        # between worker exit and _write_sealed_metadata -- still has one, full of
-        # worker-controlled bytes. Uploading that would publish untrusted output into the
-        # results namespace under a job id (upstream review of #85).
-        #
-        # RESULT_RETAINED_MARKER is written by the dispatcher ONLY after the seal, when the
-        # upload exhausted, so it is a host-only fact. It also subsumes the claim fence: a peer
-        # that reclaimed and finished the job overwrites the row, marker gone. And a row that is
-        # missing or unreadable -- a peer's delete, a Redis key past its 24h TTL, a store outage
-        # -- yields no marker and no upload, which is the safe direction.
-        try:
-            row = job_store.get(d.name)
-        except Exception:  # noqa: BLE001 -- store trouble must not turn into a bad upload
-            log.warning("pending-upload sweep: cannot confirm %s is ours; skipping", d.name)
-            continue
-        # The row must still be the FAILED job we retained. Not DONE (a peer won it, and its
-        # result is authoritative at the same prefix), not EXPIRED (retention deleted the result
-        # on an operator's instruction -- re-uploading would silently undo that, and with
-        # expires_at cleared nothing would ever collect it again), and not missing.
-        if row is None or row.status is not JobStatus.FAILED:
-            continue
-        # OWNERSHIP. The marker is written before the terminal CAS (so a crash cannot lose it),
-        # which means one can survive an attempt that LOST that CAS. It records the claim it was
-        # written under; if the row has moved to a different claim, this tree is a stale attempt
-        # and its bytes must never be published over the current owner's result. An empty marker
-        # is from a caller that had no claim to record and is accepted as before.
-        try:
-            marker_claim = (d / PENDING_UPLOAD_SENTINEL).read_text().strip()
-        except OSError:
-            continue
-        # A claim-bound marker requires an EXACT match, and `row.claim_id is None` is not a
-        # wildcard -- it is a row that was REQUEUED (_requeue_claimed clears the claim). Treating
-        # it as "no objection" meant: our attempt marks under claim A, loses, the job is requeued
-        # (claim cleared) and later fails for an unrelated reason, and the sweep then publishes
-        # our superseded bytes over that job. Only a marker with no claim recorded at all -- from
-        # a caller that had none -- is accepted without a match (#85 review).
-        if marker_claim and marker_claim != (row.claim_id or ""):
-            log.warning("pending-upload sweep: %s was marked under claim %s but the row now has "
-                        "%s; leaving it to its owner", d.name, marker_claim[:8],
-                        (row.claim_id or "none")[:8])
-            continue
-        try:
-            durable = blob_store.has_output(d.name)
-        except Exception:  # noqa: BLE001 -- unknown is NOT durable, so try the upload
-            durable = False
-        # Already durable but still FAILED: a previous sweep uploaded the bytes and then could
-        # not write the status (store blip), or the dispatcher's own upload landed after it had
-        # given up. Skipping here would strand that job FAILED forever with its result sitting
-        # in the store -- so fall through to the repair with no upload (upstream review of #85).
-        # Read the seal while the tree is still definitely ours, for the post-repair hook below.
-        try:
-            seal_text = (out_dir / "metadata.json").read_text()
-        except OSError:
-            seal_text = ""
-        if not durable:
-            # The receipt in a retained tree ships with it. Keep it only if it is one THIS host's
-            # key signed for this job over this metadata; anything else (a worker-planted file in
-            # a tree retained by pre-receipt code, a stale or foreign receipt) becomes a tombstone,
-            # which also overwrites any superseded receipt already in the store.
-            try:
-                from blastbox.host import attest as _attest
-
-                if not _attest.tree_receipt_is_ours(out_dir, key=attest_key, job_id=d.name):
-                    _attest.write_tombstone(out_dir, "retained result re-uploaded without a "
-                                                     "receipt from this host")
-            except OSError as exc:
-                log.warning("pending-upload sweep: %s: cannot sanitise its receipt (%s); "
-                            "leaving it retained", d.name, exc)
-                continue
-        upload_exc = None if durable else upload_output_with_retry(
-            blob_store, d.name, out_dir, attempts=attempts)
-        if upload_exc is None:
-            if not durable:
-                n += 1
-                log.info("pending-upload sweep: result for %s is now durably stored", d.name)
-
-            # REPAIR THE JOB. Uploading the bytes is only half of it: the job was FAILED because
-            # its upload exhausted, and open_output is DONE-gated, so a recovered result stays
-            # unreachable -- from a client's view the outcome is identical to having discarded it.
-            # The analysis DID finish and its result is now durable, so DONE is the honest status.
-            # CAS-fenced on FAILED and gated on OUR marker, so it can only ever repair the failure
-            # this sweep just undid -- never a job that failed for any other reason, and never a
-            # peer's terminal state (#85, found by end-to-end testing: the sweep reported success
-            # while the API still answered 409).
-            repaired = False
-            try:
-                # finished_at/expires_at are re-stamped from NOW. The row still carried the
-                # clock _fail_job set at the ORIGINAL failure, so after any outage longer than
-                # job_retention_seconds the repaired job was already past its expiry: expire_due
-                # would delete the freshly recovered result later in this same tick, before any
-                # client could fetch it (it was never servable while FAILED). Recovery has to
-                # restart the retention clock, not inherit a dead one (#85 review).
-                now_ts = time.time()
-                repaired = job_store.update_if_status(
-                    d.name, JobStatus.FAILED, status=JobStatus.DONE, error=None,
-                    finished_at=now_ts,
-                    expires_at=(now_ts + retention_seconds) if retention_seconds > 0 else None,
-                )
-            except PermissionError:
-                # A CREDENTIAL-LESS NODE AFTER A RESTART, specifically (#178). The repair is a
-                # CAS on the row, and this store may only write to a job it can prove it holds
-                # -- and a marker exists precisely because the process that sealed the result is
-                # gone, taking its claim receipt with it. NOT a traceback, and not "the store is
-                # broken": the bytes are durable, the tree is retained, and nothing is lost --
-                # but the row stays FAILED and the result is unfetchable until someone with
-                # queue access repairs it. Said plainly, every tick, because it stays true until
-                # someone acts. KNOWN RESIDUAL, recorded in docs/DEPLOYMENT.md.
-                log.warning(
-                    "pending-upload sweep: %s has a durable result but this node cannot repair "
-                    "its FAILED row -- it no longer holds the claim (restarted since), and a "
-                    "credential-less node may only write to jobs it holds. The result is safe "
-                    "in the blob store; the row needs repairing where the queue lives.", d.name)
-            except Exception:  # noqa: BLE001 -- the bytes are safe; the status can retry
-                log.warning("pending-upload sweep: uploaded %s but could not repair its "
-                            "status", d.name, exc_info=True)
-            if repaired:
-                log.info("pending-upload sweep: job %s repaired to DONE (its result is "
-                         "durable now)", d.name)
-            # SEPARATE boundary, deliberately outside the store's. Nesting the hook inside the
-            # update's try meant a hook failure was reported as "could not repair its status"
-            # when the status HAD been repaired -- an operator chasing a store problem that does
-            # not exist. Different failure, different message.
-            #
-            # This is everything the job's own DONE path would have done and never got to:
-            # page-hash indexing for similarity search, keyed off the sealed envelope. Without
-            # it a recovered job is DONE and servable but permanently invisible to /similar,
-            # because nothing re-walks DONE jobs (upstream review of #85). Best-effort -- an
-            # indexing problem must never undo a good repair.
-            # Only NOW is the tree redundant. Clearing the sentinel on upload alone meant a
-            # failed status CAS left no marker for the next sweep to find, so the job stayed
-            # FAILED forever with its result durable and every result route answering 409 -- the
-            # fall-through repair exists precisely for that case and could never run (#85 review).
-            if repaired and on_repaired is not None:
-                try:
-                    # seal_text was read BEFORE the CAS. Once the row is DONE the tree is no
-                    # longer held by the last-copy rule, so another dispatcher sharing job_root
-                    # can reclaim it between the CAS and this call -- and then the hook reads a
-                    # tree that is already gone. Handing it the bytes removes the dependency
-                    # entirely (#85 review).
-                    on_repaired(d.name, out_dir, seal_text)
-                except Exception:  # noqa: BLE001
-                    # ACCEPTED RESIDUAL, stated plainly rather than papered over. Keeping the
-                    # sentinel here would NOT buy a retry: this sweep only looks at FAILED rows,
-                    # and the row is DONE now, so no later tick would act on the marker -- it
-                    # would just hold a stat forever and read like a mechanism that does not
-                    # exist. The result itself is durable and servable; what is lost is the
-                    # /similar index entry and the artifact/warning counts, which are cosmetic
-                    # and separately rebuildable. Logged at WARNING so it is visible (#85 review).
-                    log.warning("pending-upload sweep: %s was repaired and its result is durable, "
-                                "but post-repair indexing failed; the job is servable with a null "
-                                "summary and no /similar entry", d.name, exc_info=True)
-            # LAST: after the CAS and after the hook, so a crash mid-recovery leaves the marker
-            # (and therefore the tree, and therefore another attempt) rather than a half-done job.
-            if not repaired:
-                # The CAS lost. Either a peer repaired it first (fine), or retention EXPIRED the
-                # row while we were uploading -- and in THAT case we have just re-created the
-                # result bytes the operator's retention policy deleted, under a row with
-                # expires_at cleared, so nothing will ever select it for deletion again. Undo our
-                # own write rather than leave permanently orphaned bytes in the store (#85 review).
-                try:
-                    after = job_store.get(d.name)
-                except Exception:  # noqa: BLE001
-                    after = None
-                if after is not None and after.status is JobStatus.EXPIRED:
-                    log.warning("pending-upload sweep: %s expired while its result was uploading; "
-                                "removing the bytes we just wrote so they are not orphaned",
-                                d.name)
-                    with contextlib.suppress(Exception):
-                        blob_store.delete_job(d.name)
-                    clear_pending_upload(job_root, d.name)
-            if repaired:
-                clear_pending_upload(job_root, d.name)
-        else:
-            log.warning("pending-upload sweep: %s still has no durable copy (%s); retaining "
-                        "the local tree", d.name, upload_exc)
+            n += _retry_pending_one(
+                job_root, d, blob_store, job_store, log, attempts=attempts,
+                on_repaired=on_repaired, retention_seconds=retention_seconds,
+                attest_key=attest_key)
+        except Exception:  # noqa: BLE001 -- one tree must never abort the sweep
+            log.exception("pending-upload sweep: %s: unexpected error; leaving it retained",
+                          d.name)
     if n:
         log.info("pending-upload sweep: uploaded %d retained result(s)", n)
     return n
+
+
+def _retry_pending_one(
+    job_root: Path,
+    d: Path,
+    blob_store: BlobStore,
+    job_store: JobStore,
+    log: logging.Logger,
+    *,
+    attempts: int,
+    on_repaired: "Callable[[str, Path, str], None] | None",
+    retention_seconds: float,
+    attest_key: "AttestKey | None",
+) -> int:
+    """One tree of :func:`retry_pending_uploads`: 1 when it uploaded a result, else 0."""
+    uploaded = 0
+    try:
+        if d.is_symlink() or not d.is_dir() or not _JOB_ID_RE.match(d.name):
+            return 0
+        out_dir = d / "output"
+        # The host-only sentinel FIRST: it is one stat, it is unforgeable by the worker, and
+        # it means almost no directory reaches the store round-trip below.
+        if not (d / PENDING_UPLOAD_SENTINEL).is_file():
+            return 0
+        if not (out_dir / "metadata.json").is_file():
+            return 0          # sentinel without a result: nothing to upload
+    except OSError:
+        return 0
+    # THE GATE: the JOB ROW must say this tree is a host-sealed result whose upload failed.
+    #
+    # A root metadata.json does NOT prove that. The WORKER writes output/metadata.json
+    # (worker/harness.py) and the host only OVERWRITES it when the trust gate passes, so a
+    # tree abandoned before sealing -- gate rejection, worker timeout, a dispatcher killed
+    # between worker exit and _write_sealed_metadata -- still has one, full of
+    # worker-controlled bytes. Uploading that would publish untrusted output into the
+    # results namespace under a job id (upstream review of #85).
+    #
+    # RESULT_RETAINED_MARKER is written by the dispatcher ONLY after the seal, when the
+    # upload exhausted, so it is a host-only fact. It also subsumes the claim fence: a peer
+    # that reclaimed and finished the job overwrites the row, marker gone. And a row that is
+    # missing or unreadable -- a peer's delete, a Redis key past its 24h TTL, a store outage
+    # -- yields no marker and no upload, which is the safe direction.
+    try:
+        row = job_store.get(d.name)
+    except Exception:  # noqa: BLE001 -- store trouble must not turn into a bad upload
+        log.warning("pending-upload sweep: cannot confirm %s is ours; skipping", d.name)
+        return 0
+    # The row must still be the FAILED job we retained. Not DONE (a peer won it, and its
+    # result is authoritative at the same prefix), not EXPIRED (retention deleted the result
+    # on an operator's instruction -- re-uploading would silently undo that, and with
+    # expires_at cleared nothing would ever collect it again), and not missing.
+    if row is None or row.status is not JobStatus.FAILED:
+        return 0
+    # OWNERSHIP. The marker is written before the terminal CAS (so a crash cannot lose it),
+    # which means one can survive an attempt that LOST that CAS. It records the claim it was
+    # written under; if the row has moved to a different claim, this tree is a stale attempt
+    # and its bytes must never be published over the current owner's result. An empty marker
+    # is from a caller that had no claim to record and is accepted as before.
+    try:
+        marker_claim = (d / PENDING_UPLOAD_SENTINEL).read_text().strip()
+    except OSError:
+        return 0
+    # A claim-bound marker requires an EXACT match, and `row.claim_id is None` is not a
+    # wildcard -- it is a row that was REQUEUED (_requeue_claimed clears the claim). Treating
+    # it as "no objection" meant: our attempt marks under claim A, loses, the job is requeued
+    # (claim cleared) and later fails for an unrelated reason, and the sweep then publishes
+    # our superseded bytes over that job. Only a marker with no claim recorded at all -- from
+    # a caller that had none -- is accepted without a match (#85 review).
+    if marker_claim and marker_claim != (row.claim_id or ""):
+        log.warning("pending-upload sweep: %s was marked under claim %s but the row now has "
+                    "%s; leaving it to its owner", d.name, marker_claim[:8],
+                    (row.claim_id or "none")[:8])
+        return 0
+    try:
+        durable = blob_store.has_output(d.name)
+    except Exception:  # noqa: BLE001 -- unknown is NOT durable, so try the upload
+        durable = False
+    # Already durable but still FAILED: a previous sweep uploaded the bytes and then could
+    # not write the status (store blip), or the dispatcher's own upload landed after it had
+    # given up. Skipping here would strand that job FAILED forever with its result sitting
+    # in the store -- so fall through to the repair with no upload (upstream review of #85).
+    # Read the seal while the tree is still definitely ours, for the post-repair hook below.
+    try:
+        seal_text = (out_dir / "metadata.json").read_text()
+    except OSError:
+        seal_text = ""
+    if not durable:
+        # The receipt in a retained tree ships with it. Keep it only if it is one THIS host's
+        # key signed for this job over this metadata; anything else (a worker-planted file in
+        # a tree retained by pre-receipt code, a stale or foreign receipt) becomes a tombstone,
+        # which also overwrites any superseded receipt already in the store.
+        #
+        # EXCEPT a tree whose envelope DECLARES an artifact at attestation.json (a file, or a
+        # directory of them -- only possible if accepted before the trust gate reserved the
+        # name) or cannot be parsed to rule that out. Whatever is there may be accepted
+        # output: a tombstone would destroy it, and refusing strands the job FAILED until the
+        # reaper reclaims the whole tree. Upload it AS-IS -- no receipt, no tombstone, nothing
+        # deleted -- WITH the withheld marker: this verdict is THIS process's, under ITS
+        # envelope ceiling, and the attestation route must never re-derive it under another
+        # (an ingress with a larger limit would parse the envelope, see nothing declared and
+        # serve a planted attestation.json). No marker, no as-is upload: it stays retained.
+        # A transient envelope read error is no verdict: it raises below.
+        from blastbox.host import attest as _attest
+
+        try:
+            as_is = _attest.tree_receipt_path_protection(out_dir)
+            if as_is is not None:
+                _attest.write_withheld_marker(out_dir, as_is)
+                log.warning("pending-upload sweep: %s: %s; uploading it as-is, with no "
+                            "receipt", d.name, as_is)
+            elif _attest.tree_receipt_is_ours(out_dir, key=attest_key, job_id=d.name):
+                # Ours ships, with the CLEARED marker written over whatever is at the marker's
+                # name. An overwrite, not a strip: an earlier tick may already have stored a
+                # marker for this job (an as-is upload under a lower limit, interrupted before
+                # its envelope landed), and the store never deletes a single object -- a local
+                # strip left that marker withholding this genuine receipt forever. Any stored
+                # attestation.json it could unmask came from this same tree, untouched since.
+                _attest.write_cleared_marker(out_dir)
+            else:
+                _attest.write_tombstone(out_dir, _attest.RETAINED_REUPLOAD_REASON)
+        except OSError as exc:
+            if isinstance(exc, _attest.ReceiptPathOccupied):
+                # The accepted strand (write_withheld_marker): an old tree that may declare an
+                # artifact at the marker's name. Never shipped in the marker's place.
+                log.error("pending-upload sweep: job %s: %s; NOT uploading it, leaving it "
+                          "retained", d.name, exc)
+            else:
+                log.warning("pending-upload sweep: %s: cannot sanitise its receipt (%s); "
+                            "leaving it retained", d.name, exc)
+            return 0
+    upload_exc = None if durable else upload_output_with_retry(
+        blob_store, d.name, out_dir, attempts=attempts)
+    if upload_exc is None:
+        if not durable:
+            uploaded = 1
+            log.info("pending-upload sweep: result for %s is now durably stored", d.name)
+
+        # REPAIR THE JOB. Uploading the bytes is only half of it: the job was FAILED because
+        # its upload exhausted, and open_output is DONE-gated, so a recovered result stays
+        # unreachable -- from a client's view the outcome is identical to having discarded it.
+        # The analysis DID finish and its result is now durable, so DONE is the honest status.
+        # CAS-fenced on FAILED and gated on OUR marker, so it can only ever repair the failure
+        # this sweep just undid -- never a job that failed for any other reason, and never a
+        # peer's terminal state (#85, found by end-to-end testing: the sweep reported success
+        # while the API still answered 409).
+        repaired = False
+        try:
+            # finished_at/expires_at are re-stamped from NOW. The row still carried the
+            # clock _fail_job set at the ORIGINAL failure, so after any outage longer than
+            # job_retention_seconds the repaired job was already past its expiry: expire_due
+            # would delete the freshly recovered result later in this same tick, before any
+            # client could fetch it (it was never servable while FAILED). Recovery has to
+            # restart the retention clock, not inherit a dead one (#85 review).
+            now_ts = time.time()
+            repaired = job_store.update_if_status(
+                d.name, JobStatus.FAILED, status=JobStatus.DONE, error=None,
+                finished_at=now_ts,
+                expires_at=(now_ts + retention_seconds) if retention_seconds > 0 else None,
+            )
+        except PermissionError:
+            # A CREDENTIAL-LESS NODE AFTER A RESTART, specifically (#178). The repair is a
+            # CAS on the row, and this store may only write to a job it can prove it holds
+            # -- and a marker exists precisely because the process that sealed the result is
+            # gone, taking its claim receipt with it. NOT a traceback, and not "the store is
+            # broken": the bytes are durable, the tree is retained, and nothing is lost --
+            # but the row stays FAILED and the result is unfetchable until someone with
+            # queue access repairs it. Said plainly, every tick, because it stays true until
+            # someone acts. KNOWN RESIDUAL, recorded in docs/DEPLOYMENT.md.
+            log.warning(
+                "pending-upload sweep: %s has a durable result but this node cannot repair "
+                "its FAILED row -- it no longer holds the claim (restarted since), and a "
+                "credential-less node may only write to jobs it holds. The result is safe "
+                "in the blob store; the row needs repairing where the queue lives.", d.name)
+        except Exception:  # noqa: BLE001 -- the bytes are safe; the status can retry
+            log.warning("pending-upload sweep: uploaded %s but could not repair its "
+                        "status", d.name, exc_info=True)
+        if repaired:
+            log.info("pending-upload sweep: job %s repaired to DONE (its result is "
+                     "durable now)", d.name)
+        # SEPARATE boundary, deliberately outside the store's. Nesting the hook inside the
+        # update's try meant a hook failure was reported as "could not repair its status"
+        # when the status HAD been repaired -- an operator chasing a store problem that does
+        # not exist. Different failure, different message.
+        #
+        # This is everything the job's own DONE path would have done and never got to:
+        # page-hash indexing for similarity search, keyed off the sealed envelope. Without
+        # it a recovered job is DONE and servable but permanently invisible to /similar,
+        # because nothing re-walks DONE jobs (upstream review of #85). Best-effort -- an
+        # indexing problem must never undo a good repair.
+        # Only NOW is the tree redundant. Clearing the sentinel on upload alone meant a
+        # failed status CAS left no marker for the next sweep to find, so the job stayed
+        # FAILED forever with its result durable and every result route answering 409 -- the
+        # fall-through repair exists precisely for that case and could never run (#85 review).
+        if repaired and on_repaired is not None:
+            try:
+                # seal_text was read BEFORE the CAS. Once the row is DONE the tree is no
+                # longer held by the last-copy rule, so another dispatcher sharing job_root
+                # can reclaim it between the CAS and this call -- and then the hook reads a
+                # tree that is already gone. Handing it the bytes removes the dependency
+                # entirely (#85 review).
+                on_repaired(d.name, out_dir, seal_text)
+            except Exception:  # noqa: BLE001
+                # ACCEPTED RESIDUAL, stated plainly rather than papered over. Keeping the
+                # sentinel here would NOT buy a retry: this sweep only looks at FAILED rows,
+                # and the row is DONE now, so no later tick would act on the marker -- it
+                # would just hold a stat forever and read like a mechanism that does not
+                # exist. The result itself is durable and servable; what is lost is the
+                # /similar index entry and the artifact/warning counts, which are cosmetic
+                # and separately rebuildable. Logged at WARNING so it is visible (#85 review).
+                log.warning("pending-upload sweep: %s was repaired and its result is durable, "
+                            "but post-repair indexing failed; the job is servable with a null "
+                            "summary and no /similar entry", d.name, exc_info=True)
+        # LAST: after the CAS and after the hook, so a crash mid-recovery leaves the marker
+        # (and therefore the tree, and therefore another attempt) rather than a half-done job.
+        if not repaired:
+            # The CAS lost. Either a peer repaired it first (fine), or retention EXPIRED the
+            # row while we were uploading -- and in THAT case we have just re-created the
+            # result bytes the operator's retention policy deleted, under a row with
+            # expires_at cleared, so nothing will ever select it for deletion again. Undo our
+            # own write rather than leave permanently orphaned bytes in the store (#85 review).
+            try:
+                after = job_store.get(d.name)
+            except Exception:  # noqa: BLE001
+                after = None
+            if after is not None and after.status is JobStatus.EXPIRED:
+                log.warning("pending-upload sweep: %s expired while its result was uploading; "
+                            "removing the bytes we just wrote so they are not orphaned",
+                            d.name)
+                with contextlib.suppress(Exception):
+                    blob_store.delete_job(d.name)
+                clear_pending_upload(job_root, d.name)
+        if repaired:
+            clear_pending_upload(job_root, d.name)
+    else:
+        log.warning("pending-upload sweep: %s still has no durable copy (%s); retaining "
+                    "the local tree", d.name, upload_exc)
+    return uploaded
 
 
 def migrate_legacy_results(
@@ -619,6 +679,7 @@ def migrate_legacy_results(
     *,
     limit: int = 0,
     dry_run: bool = False,
+    limits: "Limits | None" = None,
 ) -> "tuple[int, int, int]":
     """Upload the results of DONE jobs that predate the blob store, so the reclaim can free them.
 
@@ -636,7 +697,20 @@ def migrate_legacy_results(
     OPT-IN and offline by design: this is an operator action with real I/O cost against the object
     store, not something a maintenance tick should start doing unannounced. Returns
     (migrated, skipped, failed).
+
+    ``limits``: the SERVICE's limits (``--max-metadata``), else BLASTBOX_MAX_METADATA when this
+    process has it. An envelope this run cannot parse whole is uploaded as-is with the withheld
+    marker, which the attestation route honours before anything else -- so a ceiling mismatch
+    can no longer make the route serve the worker's attestation.json as a receipt; it can only
+    ship a tree as-is (planted file and all, withheld) that the service's limit would have
+    tombstoned. To avoid that, with NEITHER limit known an envelope past the fixed floor
+    (ENVELOPE_MAX_BYTES, which every ceiling is at least) is refused -- left in place, counted
+    failed -- rather than judged against a limit the service may not share.
     """
+    if limits is None and os.environ.get("BLASTBOX_MAX_METADATA") is not None:
+        from blastbox.limits import Limits as _Limits
+
+        limits = _Limits.from_env()
     migrated = skipped = failed = 0
     try:
         entries = sorted(job_root.iterdir(), key=lambda p: p.name)
@@ -647,54 +721,266 @@ def migrate_legacy_results(
     for d in entries:
         if limit and migrated + failed >= limit:
             break
+        # ISOLATED per tree, as in retry_pending_uploads: whatever one worker-shaped tree raises,
+        # it is counted failed and left in place, and the run carries on.
         try:
-            if d.is_symlink() or not d.is_dir() or not _JOB_ID_RE.match(d.name):
-                continue
-            out_dir = d / "output"
-            if not (out_dir / "metadata.json").is_file():
-                continue
-        except OSError:
-            continue
-        try:
-            row = job_store.get(d.name)
-        except Exception:  # noqa: BLE001
+            outcome = _migrate_legacy_one(d, blob_store, job_store, log, dry_run=dry_run,
+                                          limits=limits)
+        except Exception:  # noqa: BLE001 -- one tree must never abort the migration
+            log.exception("legacy migration: %s: unexpected error; leaving it in place", d.name)
+            outcome = "failed"
+        if outcome == "migrated":
+            migrated += 1
+        elif outcome == "skipped":
             skipped += 1
-            continue
-        # ONLY a DONE job. A FAILED one is the recovery sweep's business (it owns the marker and
-        # the claim fence), and anything else has no result worth publishing.
-        if row is None or row.status is not JobStatus.DONE:
-            continue
-        try:
-            if blob_store.has_output(d.name):
-                skipped += 1                      # already durable; the reclaim will collect it
-                continue
-        except Exception:  # noqa: BLE001 -- unknown is NOT durable, so try the upload
-            pass
-        if dry_run:
-            migrated += 1
-            continue
-        # A pre-blob-store tree was never stripped by a dispatcher, so an attestation.json in it
-        # is whatever the worker wrote; these results carry no execution receipt by construction.
-        try:
-            from blastbox.host.attest import strip_receipt
-
-            strip_receipt(out_dir)
-        except OSError as exc:
+        elif outcome == "failed":
             failed += 1
-            log.warning("legacy migration: %s: could not remove a worker-written receipt (%s); "
-                        "leaving it in place", d.name, exc)
-            continue
-        up_exc = upload_output_with_retry(blob_store, d.name, out_dir, attempts=2)
-        if up_exc is None:
-            migrated += 1
-            log.info("legacy migration: %s is now durably stored", d.name)
-        else:
-            failed += 1
-            log.warning("legacy migration: %s could not be uploaded (%s); leaving it in place",
-                        d.name, up_exc)
     log.info("legacy migration: %d migrated, %d already durable, %d failed%s",
              migrated, skipped, failed, " (dry run)" if dry_run else "")
     return (migrated, skipped, failed)
+
+
+def _migrate_legacy_one(
+    d: Path,
+    blob_store: BlobStore,
+    job_store: JobStore,
+    log: logging.Logger,
+    *,
+    dry_run: bool,
+    limits: "Limits | None",
+) -> str | None:
+    """One tree of :func:`migrate_legacy_results`: "migrated", "skipped", "failed", or None when
+    it is not a legacy DONE result at all."""
+    try:
+        if d.is_symlink() or not d.is_dir() or not _JOB_ID_RE.match(d.name):
+            return None
+        out_dir = d / "output"
+        if not (out_dir / "metadata.json").is_file():
+            return None
+    except OSError:
+        return None
+    try:
+        row = job_store.get(d.name)
+    except Exception:  # noqa: BLE001
+        return "skipped"
+    # ONLY a DONE job. A FAILED one is the recovery sweep's business (it owns the marker and
+    # the claim fence), and anything else has no result worth publishing.
+    if row is None or row.status is not JobStatus.DONE:
+        return None
+    try:
+        if blob_store.has_output(d.name):
+            return "skipped"                      # already durable; the reclaim will collect it
+    except Exception:  # noqa: BLE001 -- unknown is NOT durable, so try the upload
+        pass
+    # A pre-blob-store tree was never stripped by a dispatcher, so an attestation.json in it
+    # is whatever the worker wrote; these results carry no execution receipt by construction.
+    # Unless the envelope DECLARES an artifact there (a tree accepted before the name was
+    # reserved) or cannot be parsed to rule that out: then it may be accepted output, uploaded
+    # as-is WITH the withheld marker, so the route never re-derives this run's verdict under
+    # its own ceiling. No marker, no upload.
+    from blastbox.host import attest as _attest
+
+    try:
+        if limits is None and _attest.ENVELOPE_MAX_BYTES < os.stat(
+                out_dir / "metadata.json", follow_symlinks=False).st_size:
+            # Unknown service limit: only the floor is common to every ceiling, and this run's
+            # "cannot rule out" may be the route's "nothing declared" (see the docstring).
+            log.warning("legacy migration: %s: its envelope is larger than %d bytes and the "
+                        "service's metadata limit is unknown; rerun with --max-metadata set to "
+                        "the service's BLASTBOX_MAX_METADATA. Leaving it in place", d.name,
+                        _attest.ENVELOPE_MAX_BYTES)
+            return "failed"
+        as_is = _attest.tree_receipt_path_protection(out_dir, limits=limits)
+        if dry_run:
+            # Every refusal above and below, none of the writes (codex r139 P3): the same
+            # verdict as the real run, so the dry run's counts are the real run's. A tombstone
+            # refuses only where the as-is verdict is not None; a withheld marker refuses
+            # exactly where check_withheld_marker_writable does.
+            if as_is is not None:
+                _attest.check_withheld_marker_writable(out_dir, limits=limits)
+            return "migrated"
+        if as_is is None:
+            # A TOMBSTONE over whatever the worker left at attestation.json, never a local
+            # strip: the store never deletes a single object, so an earlier run that shipped
+            # this tree as-is and died before its envelope landed left the worker's
+            # attestation.json stored, and an upload carrying nothing at that name would leave
+            # it there beside the cleared marker the tombstone write vouches with -- served 200.
+            # The tombstone OVERWRITES it; the cleared marker ships only beside it.
+            _attest.write_tombstone(out_dir, _attest.RECEIPT_LEGACY_MIGRATED_REASON,
+                                    limits=limits)
+        else:
+            _attest.write_withheld_marker(out_dir, as_is, limits=limits)
+            log.warning("legacy migration: %s: %s; uploading it as-is, with no receipt",
+                        d.name, as_is)
+    except OSError as exc:
+        if isinstance(exc, _attest.ReceiptPathOccupied):
+            # The accepted strand (write_withheld_marker): it may declare an artifact at the
+            # marker's name, whose bytes must never stand in for the marker.
+            log.error("legacy migration: job %s: %s; NOT uploading it, leaving it in place",
+                      d.name, exc)
+        else:
+            log.warning("legacy migration: %s: could not remove a worker-written receipt "
+                        "(%s); leaving it in place", d.name, exc)
+        return "failed"
+    up_exc = upload_output_with_retry(blob_store, d.name, out_dir, attempts=2)
+    if up_exc is None:
+        log.info("legacy migration: %s is now durably stored", d.name)
+        return "migrated"
+    log.warning("legacy migration: %s could not be uploaded (%s); leaving it in place",
+                d.name, up_exc)
+    return "failed"
+
+
+class JobEnumerationFailed(RuntimeError):
+    """``remark_stored_receipts`` could not list the job store's DONE jobs -- e.g. a federated
+    node's HttpJobStore, which may not enumerate the queue. Run it where the store can be
+    enumerated (the control plane), with each signing node's public key."""
+
+
+def remark_stored_receipts(
+    blob_store: BlobStore,
+    job_store: JobStore,
+    keys: "AttestKey | VerifyKey | Iterable[AttestKey | VerifyKey]",
+    log: logging.Logger,
+    *,
+    limit: int = 0,
+    dry_run: bool = False,
+    limits: "Limits | None" = None,
+) -> tuple[int, int, int, int, int]:
+    """Store the cleared marker beside every genuine receipt signed by one of ``keys`` that
+    sits in the store unmarked (uploaded by 0.1.44/0.1.45, before markers), or beside a marker
+    this host never writes (planted by a worker under a 0.1.45 dispatcher during the rollout). The attestation
+    route answers 404 for an unmarked result (codex r134 C1): it cannot tell a host-written
+    attestation.json from a worker's in a tree a pre-#188 node shipped verbatim. Verifying
+    needs only PUBLIC keys, so run it once where the job store can be enumerated (the control
+    plane; a federated node's store refuses list()) with every signing host's public key.
+    ``keys`` is one key or several (private AttestKey or public VerifyKey); a receipt is checked
+    only against the key its own key_id names. Raises JobEnumerationFailed when the DONE jobs
+    cannot be listed. Returns (remarked, already_marked, unverified, failed, replaced).
+
+    For each DONE job, all reads bounded (read_result_prefix):
+
+    * a marker this host writes already stored -- exactly the canonical cleared body bound to
+      the sha256 of the stored metadata.json, or exactly the canonical withheld body for one of
+      MARKER_REASONS: already marked, never touched, so a rerun is a no-op and an as-is upload's
+      withheld verdict is never overwritten;
+    * any OTHER marker is foreign: a 0.1.45 dispatcher neither reserved nor stripped the name,
+      so its worker could plant bytes there beside a genuine receipt, which the upgraded route
+      then withholds. It is judged exactly like a missing marker below, and REPLACED by the
+      cleared marker (counted ``replaced``) only when the receipt verifies -- which also requires
+      an envelope that parses and declares nothing at either reserved name, so the stored bytes
+      cannot be a declared artifact. Otherwise it is left alone (unverified), never destroyed.
+      An exact copy of a host-written withheld body cannot be told from the host's own and stays
+      (it can only suppress that job's receipt, never get one served);
+    * else the stored attestation.json must be a receipt whose key_id names one of ``keys``
+      and that verifies under that key, for this job_id, whose metadata_sha256 is the sha256 of the STORED metadata.json (read
+      under the envelope ceiling, and not declaring or hiding an artifact at a reserved name).
+      Only then is the cleared marker bound to that metadata stored (not with ``dry_run``);
+    * anything else -- another host's receipt, a tombstone, worker bytes, no receipt or
+      envelope, over a cap -- is LEFT ALONE and counted unverified: the result stays unmarked,
+      which the route already answers with the no-receipt 404 (pass that host's public key
+      to re-mark its receipts). Writing a withheld marker there would make that permanent.
+    * a read or write error is counted failed (no verdict), and the run carries on.
+
+    ``limit`` stops after that many re-marked plus replaced (0 = all)."""
+    import hashlib
+    import json
+    import tempfile
+
+    from blastbox.host import attest as _attest
+    from blastbox.host.blobs.base import is_missing_blob, read_result_prefix
+
+    if limits is None and os.environ.get("BLASTBOX_MAX_METADATA") is not None:
+        from blastbox.limits import Limits as _Limits
+
+        limits = _Limits.from_env()
+    envelope_cap = _attest.envelope_cap(limits)
+    if isinstance(keys, (_attest.AttestKey, _attest.VerifyKey)):
+        keys = [keys]
+    by_id = {k.key_id: k for k in keys}
+    remarked = already = unverified = failed = replaced = 0
+    host_withheld = {_attest.canonical(_attest.tombstone_body(r)) for r in _attest.MARKER_REASONS}
+
+    def fetch(job_id: str, name: str, cap: int) -> bytes | None:
+        """At most cap + 1 bytes, or None when absent; raises on a read error."""
+        try:
+            return read_result_prefix(blob_store, job_id, name, cap + 1)
+        except Exception as exc:
+            if is_missing_blob(exc):
+                return None
+            raise
+
+    try:
+        done_jobs = job_store.list(status=JobStatus.DONE)
+    except Exception as exc:  # noqa: BLE001 -- surfaced as one named, reportable failure
+        raise JobEnumerationFailed(
+            f"cannot enumerate the job store's DONE jobs ({type(exc).__name__}: {exc})") from exc
+    for job in done_jobs:
+        if limit and remarked + replaced >= limit:
+            break
+        job_id = job.job_id
+        try:
+            marker = fetch(job_id, _attest.WITHHELD_NAME, _attest.WITHHELD_MARKER_MAX_BYTES)
+            if marker is not None and marker in host_withheld:
+                already += 1
+                continue
+            envelope = fetch(job_id, "metadata.json", envelope_cap)
+            if (marker is not None and envelope is not None and len(envelope) <= envelope_cap
+                    and _attest.is_cleared_marker(marker,
+                                                  hashlib.sha256(envelope).hexdigest())):
+                already += 1
+                continue
+            receipt = fetch(job_id, _attest.RECEIPT_NAME, _attest._RECEIPT_MAX_BYTES)
+        except Exception as exc:  # noqa: BLE001 -- one result must never abort the run
+            log.warning("receipt re-mark: %s: read failed (%s); not re-marked", job_id, exc)
+            failed += 1
+            continue
+        why = None
+        metadata_sha256 = ""
+        if receipt is None or len(receipt) > _attest._RECEIPT_MAX_BYTES:
+            why = "no receipt of a receipt's size"
+        elif envelope is None or len(envelope) > envelope_cap:
+            why = "no envelope within the ceiling"
+        elif _attest.envelope_receipt_path_protection(envelope) is not None:
+            why = "its envelope declares (or cannot rule out) an artifact at a reserved name"
+        else:
+            metadata_sha256 = hashlib.sha256(envelope).hexdigest()
+            try:
+                body = json.loads(receipt)
+                doc = body["attestation"]
+                signer = by_id.get(doc.get("key_id"))
+                ok = (signer is not None and _attest.verify_body(signer, body)
+                      and doc.get("job_id") == job_id
+                      and doc.get("metadata_sha256") == metadata_sha256)
+            except Exception:  # noqa: BLE001 -- bytes that are not our receipt: a verdict
+                ok = False
+            if not ok:
+                why = "not a receipt a listed key signed for this job and envelope"
+        if why is not None:
+            log.info("receipt re-mark: %s: %s; left %s", job_id, why,
+                     "unmarked" if marker is None else "with its foreign marker")
+            unverified += 1
+            continue
+        if not dry_run:
+            try:
+                with tempfile.TemporaryDirectory(prefix="bb-remark-") as tmp:
+                    (Path(tmp) / _attest.WITHHELD_NAME).write_bytes(
+                        _attest.canonical(_attest.cleared_marker_body(metadata_sha256)))
+                    blob_store.put_output(job_id, Path(tmp))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("receipt re-mark: %s: could not store the marker (%s)", job_id, exc)
+                failed += 1
+                continue
+            log.info("receipt re-mark: %s: genuine receipt re-marked%s", job_id,
+                     "" if marker is None else " (foreign marker replaced)")
+        if marker is None:
+            remarked += 1
+        else:
+            replaced += 1
+    log.info("receipt re-mark: %d re-marked, %d already marked, %d unverified, %d failed, "
+             "%d foreign markers replaced%s", remarked, already, unverified, failed, replaced,
+             " (dry run)" if dry_run else "")
+    return (remarked, already, unverified, failed, replaced)
 
 
 def reap_stale_scratch(

@@ -1605,7 +1605,7 @@ def test_an_upload_failure_is_not_blamed_on_the_worker(tmp_path):
         store, job_root=tmp_path / "jobs", pool=pool, worker_timeout_s=10,
     )
     # The blob store rejects the upload; the worker did nothing wrong.
-    dispatcher._upload_output = lambda job, output_dir: False  # type: ignore[method-assign]
+    dispatcher._upload_output = lambda job, output_dir, **kw: False  # type: ignore[method-assign]
 
     dispatcher.dispatch_once()
 

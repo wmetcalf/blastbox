@@ -10,7 +10,6 @@ is scrubbed through ``sanitize_public_error`` before being surfaced.
 """
 from __future__ import annotations
 
-import posixpath
 
 import logging
 from pathlib import Path
@@ -115,12 +114,17 @@ def validate_worker_output(
     # SIGNED execution receipt (host/attest.py). A declared artifact there would be served as
     # the host's receipt -- or, once the dispatcher strips it, go missing from the upload.
     # ------------------------------------------------------------------
-    from blastbox.host.attest import RECEIPT_NAME
+    # The WHOLE name is reserved, nested paths included: an artifact at attestation.json/x lives
+    # in a directory the receipt write would have to replace, deleting an accepted artifact.
+    # attestation.withheld.json is the uploader's "no receipt" marker (its presence alone makes
+    # the attestation route withhold), reserved the same way.
+    from blastbox.host.attest import RESERVED_NAMES, is_reserved_path
 
     for a in parsed.artifacts:
-        if posixpath.normpath(str(a.path).strip()) == RECEIPT_NAME:
-            raise OutputTrustError(
-                f"artifact {a.id!r} declares the reserved path {RECEIPT_NAME!r}")
+        for name in RESERVED_NAMES:
+            if is_reserved_path(str(a.path), (name,)):
+                raise OutputTrustError(
+                    f"artifact {a.id!r} declares the reserved path {name!r}")
 
     # ------------------------------------------------------------------
     # Step 4: re-seal from disk (do NOT trust worker-reported sha256/bytes)

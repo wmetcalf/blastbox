@@ -31,6 +31,7 @@ share dir on a surface writable by anything outside the dispatcher trust domain.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -438,13 +439,15 @@ def read_snapshots_readonly(
 
     Unlike ``FileNodeShare`` it never creates, chmods or GCs the dir, and it treats the dir as
     untrusted input. The WHOLE listing is walked; entries that are not regular files per ``lstat``
-    (FIFOs, symlinks, devices) or are larger than ``max_bytes`` are skipped without being opened
-    and do not count against the cap. Each remaining candidate is opened ``O_NOFOLLOW|O_NONBLOCK``
+    (FIFOs, symlinks, devices) are skipped without being opened and do not count against the
+    cap. Each remaining candidate is opened ``O_NOFOLLOW|O_NONBLOCK``
     and re-checked with ``fstat`` (the entry can be swapped between lstat and open), and read at
     most ``max_bytes``.
 
     Returns ``None`` — NOT a partial list — when there are more candidates than ``max_files`` or a
-    candidate cannot be parsed/validated: a shrunken view would undercount the node's reservations
+    listed entry cannot be lstat'd or a candidate cannot be opened (other than vanishing or
+    turning into a symlink), is larger than ``max_bytes`` at any point, read, or
+    parsed/validated: a shrunken view would undercount the node's reservations
     and disagree with the dispatchers, and a wrong number is worse than a gap. Well-formed but
     STALE snapshots are skipped, as the dispatchers skip them. A missing dir → ``[]``; a permission error on the dir
     propagates so the caller can say why the view is missing."""
@@ -463,10 +466,16 @@ def read_snapshots_readonly(
                 continue
             try:
                 st = entry.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue                # removed since the listing: it holds no reservation
             except OSError:
+                # EACCES, EIO, ...: a snapshot the view cannot see. Skipping it would publish
+                # totals from the rest -- an undercount. Fail closed, as open/read errors do.
+                return None
+            if not _stat.S_ISREG(st.st_mode):
                 continue
-            if not _stat.S_ISREG(st.st_mode) or st.st_size > size_cap:
-                continue
+            if st.st_size > size_cap:
+                return None             # a regular snapshot the view cannot read: no partial view
             candidates.append(entry.name)
     if len(candidates) > cap:
         return None
@@ -475,12 +484,22 @@ def read_snapshots_readonly(
     for name in candidates:
         try:
             fd = os.open(os.path.join(directory, name), flags)
-        except OSError:
-            continue                            # swapped for a symlink (ELOOP) / vanished
+        except OSError as exc:
+            if exc.errno in (errno.ENOENT, errno.ELOOP):
+                # vanished (removed/GC'd: the view a moment-later listing shows) or swapped for
+                # a symlink (skipped at lstat above too) -- neither is a reservation we can't see
+                continue
+            # EACCES/EIO/EMFILE/...: a regular snapshot we cannot read is a reservation missing
+            # from the view; totals from the rest would undercount the node. Fail closed.
+            return None
         try:
             st = os.fstat(fd)
-            if not _stat.S_ISREG(st.st_mode) or st.st_size > size_cap:
-                continue
+            if not _stat.S_ISREG(st.st_mode):
+                continue                # swapped for a FIFO/device: skipped at lstat too
+            if st.st_size > size_cap:
+                # In-size at the listing, over the cap now: a regular snapshot the view cannot
+                # read. Skipping it would publish partial totals. Fail closed.
+                return None
             # loop: NFS/FUSE may return short reads, and one os.read() would hand a truncated
             # (unparseable) payload to the parser
             chunks: list[bytes] = []
@@ -492,14 +511,16 @@ def read_snapshots_readonly(
                 chunks.append(chunk)
                 got += len(chunk)
             if got > size_cap:
-                continue                        # grew past the cap between fstat and read
+                return None             # grew past the cap between fstat and read: fail closed
             try:
                 status, snap = FileNodeShare._classify(
                     name, b"".join(chunks).decode("utf-8"), max_age_s=max_age_s, now=now)
             except Exception:
                 status, snap = "invalid", None
         except OSError:
-            continue                            # vanished / unreadable mid-read
+            # The file is open, so it cannot have vanished: an EIO mid-read is an unreadable
+            # reservation, and dropping it would publish partial totals. Fail closed.
+            return None
         finally:
             os.close(fd)
         if status == "invalid":

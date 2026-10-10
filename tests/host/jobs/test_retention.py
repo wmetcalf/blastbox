@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import json
 import os
 import pathlib
 import shutil
@@ -1276,6 +1277,10 @@ class TestLegacyMigration:
             tmp_path, blobs, store, logging.getLogger("t"))
         assert (migrated, failed) == (1, 0)
         assert blobs.has_output(_JID), "the legacy result is durable now"
+        # The migration wrote the cleared withheld marker into the tree (fresh mtime); age it
+        # again, as the next ticks past the scratch age would see it.
+        for pth in sorted(d.rglob("*"), reverse=True) + [d]:
+            os.utime(pth, (old, old))
 
         # After: it is redundant, so the sweep collects it — the disk finally comes back.
         assert reap_stale_scratch(tmp_path, 60.0, store, logging.getLogger("t"),
@@ -1600,8 +1605,10 @@ def test_a_protected_ancestor_does_not_disable_the_whole_reclaim(tmp_path):
 
 def test_legacy_migration_never_ships_a_worker_planted_receipt(tmp_path):
     """A pre-blob-store tree was never stripped by a dispatcher, so an attestation.json in it is
-    whatever the worker wrote. Uploading it would make it servable as an execution receipt."""
-    from blastbox.host.attest import RECEIPT_NAME
+    whatever the worker wrote. Uploading it would make it servable as an execution receipt. It
+    ships a TOMBSTONE there instead -- an overwrite, so a copy an earlier partial upload of the
+    same tree stored is replaced too (round-6 K1), never left behind a local strip."""
+    from blastbox.host.attest import RECEIPT_NAME, is_tombstone
 
     store = InMemoryJobStore()
     job = Job.new(engine="redtusk", filename="a.doc")
@@ -1612,7 +1619,8 @@ def test_legacy_migration_never_ships_a_worker_planted_receipt(tmp_path):
     (d / "output" / RECEIPT_NAME).write_text('{"attestation": {"forged": 1}, "signature": "x"}')
     blobs = _FakeBlobs()
     assert migrate_legacy_results(tmp_path, blobs, store, logging.getLogger("t"))[0] == 1
-    assert RECEIPT_NAME not in blobs.stored[_JID]
+    assert RECEIPT_NAME in blobs.stored[_JID]
+    assert is_tombstone((d / "output" / RECEIPT_NAME).read_bytes())
 
 
 class TestRetainedTreeReceipts:
@@ -1715,3 +1723,556 @@ def test_a_transient_receipt_read_error_leaves_the_tree_retained_and_intact(tmp_
     assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t"),
                                  attest_key=key) == 1
     assert (out / "attestation.json").read_bytes() == genuine
+
+
+_DECLARED_AT_RECEIPT_NAME = {
+    # A top-level FILE at exactly attestation.json, and an artifact INSIDE attestation.json/.
+    "file": ("attestation.json", b"ACCEPTED ARTIFACT BYTES"),
+    "dir": ("attestation.json/page.png", b"accepted artifact"),
+}
+
+
+def _tree_with_declared_receipt_name(job_root: Path, kind: str, *, pending: bool = True):
+    """A tree accepted by pre-#188 code whose envelope declares an artifact at the (later
+    reserved) receipt name, with the envelope's sha256 for that artifact."""
+    import hashlib
+
+    rel, data = _DECLARED_AT_RECEIPT_NAME[kind]
+    out = _sealed_tree(job_root, _JID, pending=pending) / "output"
+    (out / rel).parent.mkdir(parents=True, exist_ok=True)
+    (out / rel).write_bytes(data)
+    (out / "metadata.json").write_text(json.dumps({"artifacts": [
+        {"id": "a", "path": rel, "sha256": hashlib.sha256(data).hexdigest()}]}))
+    return out, rel, data
+
+
+@pytest.mark.parametrize("kind", ["file", "dir"])
+def test_a_retained_tree_with_a_declared_artifact_at_the_receipt_name_is_recovered_intact(
+        tmp_path, kind):
+    """A tree retained by pre-#188 code can hold an ACCEPTED artifact at attestation.json (a
+    file) or under attestation.json/ (a directory). Tombstoning over it destroyed the artifact;
+    refusing (ReceiptPathOccupied) stranded the job FAILED every tick until the reaper reclaimed
+    the whole tree -- total result loss. The sweep must upload the tree AS-IS (no receipt, no
+    tombstone, nothing deleted) and repair the job to DONE like any other recovery."""
+    import hashlib
+
+    from blastbox.host import attest
+    from blastbox.host.blobs.local import LocalBlobStore
+
+    job_root = tmp_path / "jobs"
+    store = InMemoryJobStore()
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.job_id = _JID
+    job.status = JobStatus.FAILED
+    job.error = f"result upload failed after 3 attempts; {RESULT_RETAINED_MARKER}"
+    store.create(job)
+    out, rel, data = _tree_with_declared_receipt_name(job_root, kind)
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
+
+    assert retry_pending_uploads(job_root, blobs, store, logging.getLogger("t"),
+                                 attest_key=key) == 1
+    assert (out / rel).read_bytes() == data, "the accepted artifact was touched on disk"
+    with blobs.open_result_only(_JID, rel) as fh:
+        stored = fh.read()
+    want = json.loads((out / "metadata.json").read_text())["artifacts"][0]["sha256"]
+    assert hashlib.sha256(stored).hexdigest() == want
+    assert store.get(_JID).status is JobStatus.DONE
+
+    # Durable and DONE: the reaper may reclaim the local tree, but never as an unreachable
+    # last copy -- the result stays servable from the store.
+    reap_stale_scratch(job_root, 0.0, store, logging.getLogger("t"), blob_store=blobs)
+    with blobs.open_result_only(_JID, rel) as fh:
+        assert fh.read() == data
+
+
+@pytest.mark.parametrize("kind", ["file", "dir"])
+def test_legacy_migration_uploads_a_declared_artifact_at_the_receipt_name_as_is(tmp_path, kind):
+    """The legacy migration strips a worker-written attestation.json -- but one the envelope
+    DECLARES is an accepted artifact. Counting it failed forever leaves it un-migrated; it must
+    be uploaded as-is, artifact intact."""
+    from blastbox.host.blobs.local import LocalBlobStore
+
+    job_root = tmp_path / "jobs"
+    store = InMemoryJobStore()
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.job_id = _JID
+    job.status = JobStatus.DONE
+    store.create(job)
+    out, rel, data = _tree_with_declared_receipt_name(job_root, kind, pending=False)
+    blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
+    assert migrate_legacy_results(job_root, blobs, store, logging.getLogger("t")) == (1, 0, 0)
+    assert (out / rel).read_bytes() == data
+    with blobs.open_result_only(_JID, rel) as fh:
+        assert fh.read() == data
+
+
+def _retained_failed_job(store, job_id=_JID):
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.job_id = job_id
+    job.status = JobStatus.FAILED
+    job.error = f"result upload failed after 3 attempts; {RESULT_RETAINED_MARKER}"
+    store.create(job)
+
+
+@pytest.mark.parametrize("what", ["empty_dir", "dir_with_file", "file"])
+def test_a_retained_tree_whose_envelope_cannot_rule_out_an_artifact_is_recovered_as_is(
+        tmp_path, what):
+    """Something at attestation.json and an envelope that cannot be PARSED (truncated): nothing
+    can rule out that it is accepted output, so strip_receipt refuses -- and the sweep used to
+    `continue` every tick until the reaper reclaimed the whole tree. Preserve everything and
+    still recover the result: upload as-is (no receipt, no tombstone), repair to DONE."""
+    from blastbox.host import attest
+    from blastbox.host.blobs.local import LocalBlobStore
+
+    job_root = tmp_path / "jobs"
+    store = InMemoryJobStore()
+    _retained_failed_job(store)
+    out = _sealed_tree(job_root, _JID) / "output"
+    (out / "metadata.json").write_text('{"artifacts": [{"id": "a", "pa')     # truncated
+    target = out / "attestation.json"
+    if what == "file":
+        target.write_bytes(b"maybe an artifact")
+    else:
+        target.mkdir()
+        if what == "dir_with_file":
+            (target / "page.png").write_bytes(b"maybe an artifact")
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
+    assert retry_pending_uploads(job_root, blobs, store, logging.getLogger("t"),
+                                 attest_key=key) == 1
+    assert store.get(_JID).status is JobStatus.DONE
+    assert target.exists(), "the tree was modified"
+    if what == "file":
+        assert target.read_bytes() == b"maybe an artifact"
+        with blobs.open_result_only(_JID, "attestation.json") as fh:
+            assert fh.read() == b"maybe an artifact"
+    elif what == "dir_with_file":
+        with blobs.open_result_only(_JID, "attestation.json/page.png") as fh:
+            assert fh.read() == b"maybe an artifact"
+
+
+def test_a_transient_envelope_read_error_leaves_the_tree_retained(tmp_path, monkeypatch):
+    """EIO reading metadata.json is not a verdict on the envelope: never upload as-is on it (a
+    planted attestation.json would ship un-tombstoned). Leave it retained; retry next sweep."""
+    import errno as _errno
+
+    from blastbox.host import attest
+
+    store = InMemoryJobStore()
+    _retained_failed_job(store)
+    out = _sealed_tree(tmp_path, _JID) / "output"
+    (out / "attestation.json").write_text('{"attestation": {"forged": 1}, "signature": "x"}')
+    seal = str(out / "metadata.json")
+    real_open = attest.os.open
+
+    def flaky_open(p, *a, **kw):
+        if str(p) == seal:
+            raise OSError(_errno.EIO, "Input/output error", str(p))
+        return real_open(p, *a, **kw)
+
+    monkeypatch.setattr(attest.os, "open", flaky_open)
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    blobs = _FakeBlobs()
+    assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t"),
+                                 attest_key=key) == 0
+    assert blobs.put_calls == 0
+    assert store.get(_JID).status is JobStatus.FAILED
+
+
+# ---------------------------------------------------------------------------
+# A seal put_output would not ship protects nothing (round-2 review F2)
+# ---------------------------------------------------------------------------
+
+_FORGED = b'{"attestation": {"forged": true, "status": "done"}, "signature": "AAAA"}'
+
+
+def test_a_retained_tree_with_a_symlinked_seal_tombstones_a_planted_receipt(tmp_path):
+    """put_output never ships a symlinked metadata.json, so nothing in the tree can be accepted
+    output under it: a planted attestation.json is worker junk. The sweep read the symlink as
+    "envelope cannot rule out a declared artifact" and uploaded the planted file as-is."""
+    from blastbox.host import attest
+    from blastbox.host.blobs.local import LocalBlobStore
+
+    job_root = tmp_path / "jobs"
+    store = InMemoryJobStore()
+    _retained_failed_job(store)
+    d = job_root / _JID
+    out = d / "output"
+    out.mkdir(parents=True)
+    (d / "sealed.json").write_text(json.dumps({"artifacts": []}))
+    os.symlink(d / "sealed.json", out / "metadata.json")
+    (out / "attestation.json").write_bytes(_FORGED)
+    (d / PENDING_UPLOAD_SENTINEL).write_text("")
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
+    retry_pending_uploads(job_root, blobs, store, logging.getLogger("t"), attest_key=key)
+    with blobs.open_result_only(_JID, "attestation.json") as fh:
+        stored = fh.read()
+    assert stored != _FORGED, "the planted receipt was uploaded as-is"
+    assert attest.is_tombstone(stored)
+
+
+def test_legacy_migration_strips_a_planted_receipt_beside_a_symlinked_seal(tmp_path):
+    """Same for the legacy migration: a symlinked seal is never shipped, so the planted
+    attestation.json is stripped, as before the as-is recovery existed."""
+    from blastbox.host import attest
+    from blastbox.host.blobs.base import BlobFetchError
+    from blastbox.host.blobs.local import LocalBlobStore
+
+    job_root = tmp_path / "jobs"
+    store = InMemoryJobStore()
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.job_id = _JID
+    job.status = JobStatus.DONE
+    store.create(job)
+    out = job_root / _JID / "output"
+    (out / "sub").mkdir(parents=True)
+    (out / "sub" / "real.json").write_text(json.dumps({"artifacts": []}))
+    os.symlink("sub/real.json", out / "metadata.json")
+    (out / "attestation.json").write_bytes(_FORGED)
+    blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
+    migrate_legacy_results(job_root, blobs, store, logging.getLogger("t"))
+    assert (out / "attestation.json").read_bytes() != _FORGED, "the planted receipt was kept"
+    with blobs.open_result_only(_JID, "attestation.json") as fh:   # a tombstone overwrote it
+        assert attest.is_tombstone(fh.read())
+    with pytest.raises(BlobFetchError):                            # the symlinked seal never ships
+        blobs.open_result_only(_JID, "metadata.json")
+
+
+def test_legacy_migration_leaves_a_tree_in_place_on_a_transient_envelope_error(
+        tmp_path, monkeypatch):
+    """EIO reading a legacy tree's metadata.json is no verdict on its envelope: neither strip the
+    attestation.json there (it may be a declared artifact) nor upload the tree as-is (it may be a
+    planted receipt). Count it failed and leave it for the next run."""
+    import errno as _errno
+
+    from blastbox.host import attest
+
+    store = InMemoryJobStore()
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.job_id = _JID
+    job.status = JobStatus.DONE
+    store.create(job)
+    out = _sealed_tree(tmp_path, _JID, pending=False) / "output"
+    (out / "attestation.json").write_bytes(_FORGED)
+    seal = str(out / "metadata.json")
+    real_open = attest.os.open
+
+    def flaky_open(p, *a, **kw):
+        if str(p) == seal:
+            raise OSError(_errno.EIO, "Input/output error", str(p))
+        return real_open(p, *a, **kw)
+
+    monkeypatch.setattr(attest.os, "open", flaky_open)
+    blobs = _FakeBlobs()
+    assert migrate_legacy_results(tmp_path, blobs, store, logging.getLogger("t")) == (0, 0, 1)
+    assert blobs.put_calls == 0, "uploaded on a transient envelope error"
+    assert (out / "attestation.json").read_bytes() == _FORGED
+
+
+# ---------------------------------------------------------------------------
+# A transient envelope error INSIDE strip_receipt is retried, never a permanent verdict
+# ---------------------------------------------------------------------------
+
+
+def _fail_seal_reads_inside_strip_once(monkeypatch, seal: Path) -> None:
+    """EIO on the envelope read strip_receipt makes for itself, once -- after the sweep's own
+    as-is read of the same envelope SUCCEEDED (a flap between the two)."""
+    import errno as _errno
+
+    from blastbox.host import attest
+
+    real_open, real_strip = attest.os.open, attest.strip_receipt
+    state = {"in_strip": False, "left": 1}
+
+    def flaky_open(p, *a, **kw):
+        if state["in_strip"] and state["left"] and str(p) == str(seal):
+            state["left"] -= 1
+            raise OSError(_errno.EIO, "Input/output error", str(p))
+        return real_open(p, *a, **kw)
+
+    def strip(out_dir, **kw):
+        state["in_strip"] = True
+        try:
+            return real_strip(out_dir, **kw)
+        finally:
+            state["in_strip"] = False
+
+    monkeypatch.setattr(attest.os, "open", flaky_open)
+    monkeypatch.setattr(attest, "strip_receipt", strip)
+
+
+def test_a_flap_inside_strip_leaves_the_retained_tree_for_the_next_tick(tmp_path, monkeypatch):
+    from blastbox.host import attest
+
+    store = InMemoryJobStore()
+    _retained_failed_job(store)
+    out = _sealed_tree(tmp_path, _JID) / "output"
+    (out / "attestation.json").write_bytes(_FORGED)
+    _fail_seal_reads_inside_strip_once(monkeypatch, out / "metadata.json")
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    blobs = _FakeBlobs()
+    log = logging.getLogger("t")
+    assert retry_pending_uploads(tmp_path, blobs, store, log, attest_key=key) == 0
+    assert blobs.put_calls == 0
+    assert (out / "attestation.json").read_bytes() == _FORGED
+    assert store.get(_JID).status is JobStatus.FAILED
+    # Next tick: the flap is over -- the planted receipt is tombstoned and the result recovered.
+    assert retry_pending_uploads(tmp_path, blobs, store, log, attest_key=key) == 1
+    assert json.loads((out / "attestation.json").read_bytes())["attestation"] is None
+    assert store.get(_JID).status is JobStatus.DONE
+
+
+def test_a_flap_inside_strip_leaves_a_legacy_tree_for_the_next_run(tmp_path, monkeypatch):
+    from blastbox.host import attest
+
+    store = InMemoryJobStore()
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.job_id = _JID
+    job.status = JobStatus.DONE
+    store.create(job)
+    out = _sealed_tree(tmp_path, _JID, pending=False) / "output"
+    (out / "attestation.json").write_bytes(_FORGED)
+    _fail_seal_reads_inside_strip_once(monkeypatch, out / "metadata.json")
+    blobs = _FakeBlobs()
+    log = logging.getLogger("t")
+    assert migrate_legacy_results(tmp_path, blobs, store, log) == (0, 0, 1)
+    assert blobs.put_calls == 0
+    assert (out / "attestation.json").read_bytes() == _FORGED
+    # Nothing recorded the failure: the operator's next run migrates it.
+    assert migrate_legacy_results(tmp_path, blobs, store, log) == (1, 0, 0)
+    assert attest.is_tombstone((out / "attestation.json").read_bytes())
+
+
+# ---------------------------------------------------------------------------
+# A worker-built DEEP chain at the receipt path (round-3 review H1)
+# ---------------------------------------------------------------------------
+
+_POISON = "11111111-1111-4111-8111-111111111111"
+_GOOD = "99999999-9999-4999-8999-999999999999"
+
+
+def _deep_receipt_dir(out: Path, depth: int = 1100) -> None:
+    """attestation.json/a/a/... `depth` levels down -- past Python's recursion limit, 0 bytes and
+    ~depth entries (far under the gate's entry cap), so the trust gate passes it (undeclared)."""
+    p = out / "attestation.json"
+    os.mkdir(p)
+    fd = os.open(p, os.O_RDONLY)
+    for _ in range(depth):
+        os.mkdir("a", dir_fd=fd)
+        nfd = os.open("a", os.O_RDONLY, dir_fd=fd)
+        os.close(fd)
+        fd = nfd
+    os.close(fd)
+
+
+def test_the_fresh_seal_removes_a_deep_undeclared_receipt_path_dir(tmp_path):
+    """shutil.rmtree recurses, so a ~1100-deep chain raised RecursionError: no receipt AND no
+    tombstone, the job FAILED and the tree went to the pending-upload sweep (which then tripped
+    on it every tick). The chain is undeclared worker junk: remove it and seal."""
+    from blastbox.host import attest
+
+    out = tmp_path / "o"
+    out.mkdir()
+    (out / "metadata.json").write_text('{"artifacts": []}')
+    _deep_receipt_dir(out)
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    assert attest.seal_fresh_receipt(out, key=key, observation=None, job_id="j") is True
+    assert (out / "attestation.json").is_file()
+    assert json.loads((out / "attestation.json").read_bytes())["attestation"] is None
+    assert sorted(p.name for p in out.iterdir()) == [
+        "attestation.json", attest.WITHHELD_NAME, "metadata.json"]
+
+
+def test_a_deep_receipt_path_dir_in_a_retained_tree_is_sanitised_by_the_sweep(tmp_path):
+    from blastbox.host import attest
+
+    store = InMemoryJobStore()
+    for jid in (_POISON, _GOOD):
+        _retained_failed_job(store, jid)
+        (_sealed_tree(tmp_path, jid) / "output" / "metadata.json").write_text('{"artifacts": []}')
+    _deep_receipt_dir(tmp_path / _POISON / "output")
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    assert retry_pending_uploads(tmp_path, _FakeBlobs(), store, logging.getLogger("t"),
+                                 attest_key=key) == 2
+    assert store.get(_POISON).status is JobStatus.DONE
+    assert store.get(_GOOD).status is JobStatus.DONE
+    assert (tmp_path / _POISON / "output" / "attestation.json").is_file()
+
+
+def test_one_poison_tree_never_aborts_the_pending_upload_sweep(tmp_path, monkeypatch):
+    """Whatever one tree raises -- not only OSError -- the sweep logs it and carries on: a single
+    tree a worker shaped must never starve every other retained result (rotation can make that
+    permanent when the tree count divides the window)."""
+    from blastbox.host import attest
+
+    store = InMemoryJobStore()
+    for jid in (_POISON, _GOOD):
+        _retained_failed_job(store, jid)
+        _sealed_tree(tmp_path, jid)
+    real = attest.tree_receipt_path_protection
+
+    def poisoned(out_dir, **kw):
+        if Path(out_dir).parent.name == _POISON:
+            raise RecursionError("maximum recursion depth exceeded")
+        return real(out_dir, **kw)
+
+    monkeypatch.setattr(attest, "tree_receipt_path_protection", poisoned)
+    blobs = _FakeBlobs()
+    assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t")) == 1
+    assert store.get(_GOOD).status is JobStatus.DONE
+    assert store.get(_POISON).status is JobStatus.FAILED          # left retained for next tick
+    assert (tmp_path / _POISON / PENDING_UPLOAD_SENTINEL).exists()
+
+
+def test_one_poison_tree_never_aborts_the_legacy_migration(tmp_path, monkeypatch):
+    from blastbox.host import attest
+
+    store = InMemoryJobStore()
+    for jid in (_POISON, _GOOD):
+        job = Job.new(engine="redtusk", filename="a.doc")
+        job.job_id = jid
+        job.status = JobStatus.DONE
+        store.create(job)
+        _sealed_tree(tmp_path, jid, pending=False)
+    real = attest.tree_receipt_path_protection
+
+    def poisoned(out_dir, **kw):
+        if Path(out_dir).parent.name == _POISON:
+            raise RecursionError("maximum recursion depth exceeded")
+        return real(out_dir, **kw)
+
+    monkeypatch.setattr(attest, "tree_receipt_path_protection", poisoned)
+    blobs = _FakeBlobs()
+    assert migrate_legacy_results(tmp_path, blobs, store, logging.getLogger("t")) == (1, 0, 1)
+    assert blobs.has_output(_GOOD) and not blobs.has_output(_POISON)
+
+
+# ---------------------------------------------------------------------------
+# No withheld marker, no as-is upload (round-4 review H1)
+# ---------------------------------------------------------------------------
+
+
+def _refuse_marker(monkeypatch):
+    import errno as _errno
+
+    from blastbox.host import attest
+
+    def boom(*a, **kw):
+        raise OSError(_errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(attest, "write_withheld_marker", boom)
+
+
+def test_the_sweep_never_ships_as_is_without_the_withheld_marker(tmp_path, monkeypatch):
+    from blastbox.host import attest
+
+    store = InMemoryJobStore()
+    _retained_failed_job(store)
+    out = _sealed_tree(tmp_path, _JID) / "output"
+    (out / "metadata.json").write_text('{"artifacts": [{"id": "a", "pa')     # undecidable
+    (out / "attestation.json").write_bytes(_FORGED)
+    _refuse_marker(monkeypatch)
+    blobs = _FakeBlobs()
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    assert retry_pending_uploads(tmp_path, blobs, store, logging.getLogger("t"),
+                                 attest_key=key) == 0
+    assert blobs.put_calls == 0
+    assert store.get(_JID).status is JobStatus.FAILED
+    assert (out / "attestation.json").read_bytes() == _FORGED
+
+
+def test_the_migration_never_ships_as_is_without_the_withheld_marker(tmp_path, monkeypatch):
+    store = InMemoryJobStore()
+    job = Job.new(engine="redtusk", filename="a.doc")
+    job.job_id = _JID
+    job.status = JobStatus.DONE
+    store.create(job)
+    out = _sealed_tree(tmp_path, _JID, pending=False) / "output"
+    (out / "metadata.json").write_text('{"artifacts": [{"id": "a", "pa')
+    (out / "attestation.json").write_bytes(_FORGED)
+    _refuse_marker(monkeypatch)
+    blobs = _FakeBlobs()
+    assert migrate_legacy_results(tmp_path, blobs, store, logging.getLogger("t")) == (0, 0, 1)
+    assert blobs.put_calls == 0
+
+
+def test_the_sweep_clears_a_planted_withheld_marker_beside_its_own_receipt(tmp_path):
+    """A retained tree whose receipt THIS host signed ships with it; a planted marker would
+    withhold that genuine receipt at the route, so it is OVERWRITTEN with the cleared body
+    before the upload -- which also overwrites a marker an earlier as-is upload stored."""
+    from blastbox.host import attest
+    from blastbox.host.blobs.local import LocalBlobStore
+
+    job_root = tmp_path / "jobs"
+    store = InMemoryJobStore()
+    _retained_failed_job(store)
+    out = _sealed_tree(job_root, _JID) / "output"
+    (out / "metadata.json").write_text(json.dumps({"artifacts": []}))
+    key = attest.load_or_create_key(tmp_path / "k" / "attest.key")
+    obs = attest.RunObservation(job_id=_JID, engine="redtusk", input_sha256="d" * 64,
+                                worker_runtime="runsc", worker_tier=None, started_at_ms=1,
+                                finished_at_ms=2)
+    body = attest.seal_receipt(out, key=key, observation=obs)
+    (out / attest.WITHHELD_NAME).write_bytes(attest.canonical(attest.tombstone_body("planted")))
+    blobs = LocalBlobStore(job_root, blob_root=tmp_path / "blobs")
+    assert retry_pending_uploads(job_root, blobs, store, logging.getLogger("t"),
+                                 attest_key=key) == 1
+    with blobs.open_result_only(_JID, attest.WITHHELD_NAME) as fh:
+        assert attest.is_cleared_marker(fh.read(), attest.sha256_file(out / "metadata.json"))
+    with blobs.open_result_only(_JID, attest.RECEIPT_NAME) as fh:
+        assert json.loads(fh.read()) == body
+
+
+# ---------------------------------------------------------------------------
+# codex r139 P3: a dry run reaches the same verdict as the real run
+# ---------------------------------------------------------------------------
+
+
+def _snapshot(root: Path) -> dict:
+    return {p.relative_to(root).as_posix(): (p.read_bytes() if p.is_file() else None)
+            for p in sorted(root.rglob("*"))}
+
+
+@pytest.mark.parametrize("case", ["oversized-unknown-limit", "marker-path-declared", "normal"])
+def test_a_legacy_migration_dry_run_counts_what_the_real_run_does(tmp_path, monkeypatch, case):
+    """codex r139: the dry run returned "migrated" before the unknown-limit refusal and the
+    reserved-marker-path checks, so its count included trees the real run leaves behind. It
+    must evaluate every refusal and verdict and only skip the writes."""
+    import hashlib
+
+    from blastbox.host import attest
+    from blastbox.host.blobs.local import LocalBlobStore
+
+    monkeypatch.delenv("BLASTBOX_MAX_METADATA", raising=False)
+    if case == "oversized-unknown-limit":
+        # Only this case may hit the size refusal: with the floor lowered for every case, the
+        # marker-path envelope was refused for its SIZE and never reached the marker check.
+        monkeypatch.setattr(attest, "ENVELOPE_MAX_BYTES", 64)
+    root = tmp_path / "jobs"
+    store = InMemoryJobStore()
+    job = Job.new(engine="clippyshot", filename="x")
+    job.status = JobStatus.DONE
+    store.create(job)
+    out = root / job.job_id / "output"
+    out.mkdir(parents=True)
+    if case == "oversized-unknown-limit":
+        (out / "metadata.json").write_bytes(b'{"artifacts":[],"pad":"' + b"x" * 100 + b'"}')
+    elif case == "marker-path-declared":
+        planted = attest.canonical(attest.cleared_marker_body("a" * 64))
+        (out / attest.WITHHELD_NAME).write_bytes(planted)
+        (out / "metadata.json").write_bytes(json.dumps({"artifacts": [
+            {"id": "a", "path": attest.WITHHELD_NAME,
+             "sha256": hashlib.sha256(planted).hexdigest()}]}).encode())
+    else:
+        (out / "metadata.json").write_bytes(b'{"artifacts":[]}')
+    blobs = LocalBlobStore(root, blob_root=tmp_path / "blobs")
+    log = logging.getLogger("t")
+    before = _snapshot(root)
+    dry = migrate_legacy_results(root, blobs, store, log, dry_run=True)
+    assert _snapshot(root) == before, "the dry run wrote into the tree"
+    assert not blobs.has_output(job.job_id), "the dry run uploaded"
+    live = migrate_legacy_results(root, blobs, store, log)
+    assert dry == live, (dry, live)
+    assert live == ((1, 0, 0) if case == "normal" else (0, 0, 1))
