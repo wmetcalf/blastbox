@@ -54,6 +54,17 @@ class TestProfile:
                                accelerators=frozenset({"ane"}))
         assert "appleneuralengine" in ane and "AGXDeviceUserClient" not in ane
 
+    def test_ane_extension_issue_is_scoped_to_scratch_read(self):
+        text, params = build_profile(exec_paths=["/x"], ro_paths=[], rw_paths=["/s"],
+                                     accelerators=frozenset({"ane"}), scratch="/s")
+        assert params["SCRATCH_EXT"] == "/s"
+        ext = [ln for ln in text.splitlines() if "file-issue-extension" in ln]
+        assert ext == ['(allow file-issue-extension (require-all (extension-class '
+                       '"com.apple.app-sandbox.read") (subpath (param "SCRATCH_EXT"))))']
+        gpu_only, _ = build_profile(exec_paths=["/x"], ro_paths=[], rw_paths=["/s"],
+                                    accelerators=frozenset({"gpu"}), scratch="/s")
+        assert "file-issue-extension" not in gpu_only
+
     def test_unknown_accelerator_refused(self):
         with pytest.raises(SandboxError, match="unknown accelerator"):
             build_profile(exec_paths=["/x"], ro_paths=[], rw_paths=[],
@@ -179,3 +190,21 @@ def test_selected_by_default_on_macos(monkeypatch):
     monkeypatch.delenv("BLASTBOX_SANDBOX", raising=False)
     assert select_sandbox().name == "seatbelt"
 
+
+
+@needs_darwin
+def test_a_child_cannot_modify_its_seed(tmp_path):
+    sb = SeatbeltSandbox()
+    seed = tmp_path / "seed"
+    sb.run(SandboxRequest(
+        argv=["/bin/sh", "-c", 'mkdir -p "$HOME/Library/Caches/x" && echo plan > "$HOME/Library/Caches/x/p"'],
+        capture_home=seed))
+    assert (seed / "Library" / "Caches" / "x" / "p").read_text() == "plan\n"
+    hostile = sb.run(SandboxRequest(
+        argv=["/bin/sh", "-c", 'cat "$HOME/Library/Caches/x/p" && echo poisoned > "$HOME/Library/Caches/x/p"'],
+        seed_home=seed))
+    assert hostile.stdout == b"plan\n"
+    assert (seed / "Library" / "Caches" / "x" / "p").read_text() == "plan\n"   # seed untouched
+    nxt = sb.run(SandboxRequest(
+        argv=["/bin/sh", "-c", 'cat "$HOME/Library/Caches/x/p"'], seed_home=seed))
+    assert nxt.stdout == b"plan\n"                                            # next run clean

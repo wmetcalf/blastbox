@@ -219,3 +219,20 @@ class TestRealAppSandbox:
         raw = sb.manifest.root / "build" / asb.LAUNCHER_EXE
         r = subprocess.run([str(raw), "/usr/bin/true"], capture_output=True)
         assert r.returncode == 70 and b"not sandboxed" in r.stderr
+
+
+@needs_real
+def test_seed_and_capture_use_the_container_and_cannot_be_poisoned(real_sb, tmp_path):
+    sb = real_sb
+    write = 'mkdir -p "$HOME/Library/Caches/x" && echo plan > "$HOME/Library/Caches/x/p"'
+    sb.run(SandboxRequest(argv=["/usr/bin/true"]))       # first launch creates the container
+    seed = tmp_path / "seed"
+    r = sb.run(SandboxRequest(argv=["/bin/sh", "-c", write], capture_home=seed))
+    assert r.exit_code == 0, r.stderr
+    assert (seed / "Library" / "Caches" / "x" / "p").read_text() == "plan\n"
+    poison = 'cat "$HOME/Library/Caches/x/p" && echo poisoned > "$HOME/Library/Caches/x/p"'
+    r = sb.run(SandboxRequest(argv=["/bin/sh", "-c", poison], seed_home=seed))
+    assert r.stdout == b"plan\n"
+    assert (seed / "Library" / "Caches" / "x" / "p").read_text() == "plan\n"
+    r = sb.run(SandboxRequest(argv=["/bin/sh", "-c", 'cat "$HOME/Library/Caches/x/p"'], seed_home=seed))
+    assert r.stdout == b"plan\n"

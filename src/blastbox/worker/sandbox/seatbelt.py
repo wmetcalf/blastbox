@@ -10,7 +10,8 @@ request and applied by the kernel's Sandbox.kext before the child execs:
 - Network: denied (``Limits.net_egress`` is NOT honoured -- see below).
 - Accelerators (``SandboxRequest.accelerators``), default-deny:
   ``gpu`` -> the Metal user clients + the Metal compiler-cache service;
-  ``ane`` -> the Neural Engine service + its user clients.
+  ``ane`` -> the Neural Engine service + its user clients, and issuing READ sandbox extensions
+  for the scratch dir (the out-of-process ANE compiler reads the plan the child cached there).
 
 Everything else -- LaunchServices, TCC, Contacts, the window server, the shared per-user
 Metal shader cache, the real home directory -- stays denied. Measured with Vision barcode
@@ -82,6 +83,7 @@ def build_profile(
     ro_paths: list[str],
     rw_paths: list[str],
     accelerators: frozenset[str],
+    scratch: str | None = None,
 ) -> tuple[str, dict[str, str]]:
     """Return ``(profile_text, params)`` for one run.
 
@@ -128,6 +130,17 @@ def build_profile(
         lines.append("(allow file-read* file-write* " + refs("RW", rw_paths, "subpath") + ")")
     for accel in sorted(accelerators):
         lines.extend(_ACCEL_RULES[accel])
+    if "ane" in accelerators and scratch:
+        # Vision compiles its ANE plan into the per-run cache, then hands the out-of-process
+        # ANECompilerService a sandbox READ extension for it. Without this the first compile
+        # fails ("Cannot load network ...") and Vision returns nothing. Scope: read-class
+        # extensions, for the scratch dir only -- it lets a system service read files this run
+        # wrote; it grants the child itself nothing.
+        params["SCRATCH_EXT"] = scratch
+        lines.append(
+            '(allow file-issue-extension (require-all '
+            '(extension-class "com.apple.app-sandbox.read") (subpath (param "SCRATCH_EXT"))))'
+        )
     lines.append("(deny network*)")
     return "\n".join(lines) + "\n", params
 
@@ -187,21 +200,26 @@ class SeatbeltSandbox:
 
         scratch = mc.make_scratch(self._scratch_base)
         try:
+            mc.seed_scratch(scratch, request.seed_home, request.limits.tmpfs_bytes)
             profile, params = build_profile(
                 exec_paths=sorted({str(exe), str(exe_real)}),
                 ro_paths=ro,
                 rw_paths=[*rw, str(scratch)],
                 accelerators=request.accelerators,
+                scratch=str(scratch),
             )
             argv = [self._sandbox_exec, "-p", profile]
             for key, val in params.items():
                 argv += ["-D", f"{key}={val}"]
             argv += ["--", str(exe), *request.argv[1:]]
             env = mc.build_child_env(scratch, request.env)
-            return mc.run_confined(
+            result = mc.run_confined(
                 argv, env=env, limits=request.limits, cwd=scratch,
                 popen=self._popen, rss_fn=self._rss_fn,
             )
+            if result.exit_code == 0 and not result.killed:
+                mc.capture_scratch(scratch, request.capture_home, request.limits.tmpfs_bytes)
+            return result
         finally:
             mc.remove_tree(scratch)
 

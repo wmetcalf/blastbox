@@ -389,6 +389,9 @@ when a netpolicy grants egress: there is no netd/rooter there to steer it.
 Metal / Neural Engine driver clients and services each needs; `appsandbox` (Apple's application
 profile) already permits both. Memory: Darwin does not enforce `RLIMIT_AS`, so
 `Limits.memory_bytes` is enforced by polling the sandbox's process-group RSS (SIGKILL when over).
+`SandboxRequest.seed_home` / `capture_home` (macOS only) clone a warm cache into each fresh run and
+capture one from a **trusted** run. Vision's Neural Engine plan drops from ~1.1 s to ~0.1–0.15 s per
+image, with no state flowing back between jobs.
 
 ## Warm pool
 

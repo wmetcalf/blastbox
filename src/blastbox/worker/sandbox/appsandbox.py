@@ -398,6 +398,14 @@ class AppSandboxSandbox:
         (home / "tmp").mkdir(parents=True)
         (home / "Library" / "Caches").mkdir(parents=True)
         budget = request.limits.tmpfs_bytes
+        # Under App Sandbox the frameworks resolve "home" to the slot's CONTAINER (HOME and
+        # CFFIXED_USER_HOME are ignored for caches -- measured: Vision's E5RT cache lands in
+        # ~/Library/Containers/<id>/Data/Library/Caches). So that is what seed/capture target.
+        # It is wiped before and after every run like io/. Before the slot's first launch the
+        # container doesn't exist yet; containermanagerd creates it, so seeding waits until then.
+        container = slot.container_data(self._home)
+        if request.seed_home is not None and container.is_dir():
+            mc.seed_scratch(container, request.seed_home, budget)
 
         mapping: list[tuple[str, str]] = []
         rw_staged: list[tuple[Path, Path]] = []
@@ -423,6 +431,8 @@ class AppSandboxSandbox:
 
         for src, staged in rw_staged:
             self._copy_back(staged, src, budget)
+        if result.exit_code == 0 and not result.killed and container.is_dir():
+            mc.capture_scratch(container, request.capture_home, budget)
 
         if result.exit_code in _SIGTRAP_CODES and not result.killed:
             result.stderr += (

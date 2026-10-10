@@ -95,6 +95,50 @@ def make_scratch(base: Path | None = None) -> Path:
     return scratch
 
 
+def seed_scratch(scratch: Path, seed: Path | None, budget_bytes: int) -> None:
+    """Clone ``seed``'s contents into ``scratch`` (no-follow, size-capped). Never written back."""
+    if seed is None:
+        return
+    if not seed.is_dir():
+        raise SandboxError(f"seed_home {seed} is not a directory")
+    used = 0
+    for child in seed.iterdir():
+        if child.name == "tmp":
+            continue
+        dest = scratch / child.name
+        if dest.is_dir() and child.is_dir() and not child.is_symlink():
+            # Merge into the dirs make_scratch pre-created (Library/Caches).
+            for sub in child.iterdir():
+                used += _merge_into(sub, dest / sub.name, budget_bytes - used)
+        else:
+            remove_tree(dest)
+            used += copy_no_follow(child, dest, budget_bytes=budget_bytes - used)
+
+
+def _merge_into(src: Path, dest: Path, budget: int) -> int:
+    if dest.is_dir() and src.is_dir() and not src.is_symlink():
+        used = 0
+        for sub in src.iterdir():
+            used += _merge_into(sub, dest / sub.name, budget - used)
+        return used
+    remove_tree(dest)
+    return copy_no_follow(src, dest, budget_bytes=budget)
+
+
+def capture_scratch(scratch: Path, dest: Path | None, budget_bytes: int) -> None:
+    """Replace ``dest``'s contents with the scratch HOME (minus ``tmp/``). Trusted runs only."""
+    if dest is None:
+        return
+    dest.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for child in dest.iterdir():
+        remove_tree(child)
+    used = 0
+    for child in scratch.iterdir():
+        if child.name == "tmp":
+            continue
+        used += copy_no_follow(child, dest / child.name, budget_bytes=budget_bytes - used)
+
+
 def remove_tree(path: Path) -> None:
     """Best-effort recursive delete that never follows a symlink out of ``path``."""
     try:

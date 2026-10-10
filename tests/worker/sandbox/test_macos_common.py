@@ -153,3 +153,38 @@ class TestLifecycle:
     def test_group_rss_parses_ps(self):
         fake = subprocess.CompletedProcess([], 0, stdout="  42  100\n  42  50\n  7 9999\n")
         assert mc.group_rss_bytes(42, ps_runner=lambda *a, **k: fake) == 150 * 1024
+
+
+class TestSeedAndCapture:
+    def test_seed_merges_into_prebuilt_scratch_and_skips_tmp(self, tmp_path):
+        seed = tmp_path / "seed"
+        (seed / "Library" / "Caches" / "app").mkdir(parents=True)
+        (seed / "Library" / "Caches" / "app" / "plan").write_text("compiled")
+        (seed / "tmp").mkdir()
+        (seed / "tmp" / "junk").write_text("x")
+        scratch = mc.make_scratch(tmp_path / "base")
+        mc.seed_scratch(scratch, seed, budget_bytes=1000)
+        assert (scratch / "Library" / "Caches" / "app" / "plan").read_text() == "compiled"
+        assert list((scratch / "tmp").iterdir()) == []
+
+    def test_seed_budget(self, tmp_path):
+        seed = tmp_path / "seed"
+        seed.mkdir()
+        (seed / "big").write_bytes(b"x" * 50)
+        with pytest.raises(SandboxError, match="budget"):
+            mc.seed_scratch(mc.make_scratch(tmp_path / "b"), seed, budget_bytes=10)
+
+    def test_capture_replaces_dest_and_excludes_tmp(self, tmp_path):
+        scratch = mc.make_scratch(tmp_path / "b")
+        (scratch / "Library" / "Caches" / "c").write_text("new")
+        (scratch / "tmp" / "t").write_text("t")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        (dest / "stale").write_text("old")
+        mc.capture_scratch(scratch, dest, budget_bytes=1000)
+        assert (dest / "Library" / "Caches" / "c").read_text() == "new"
+        assert not (dest / "stale").exists() and not (dest / "tmp").exists()
+
+    def test_none_is_a_no_op(self, tmp_path):
+        mc.seed_scratch(tmp_path, None, 0)
+        mc.capture_scratch(tmp_path, None, 0)

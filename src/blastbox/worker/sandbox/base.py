@@ -123,6 +123,23 @@ class SandboxRequest:
     ignore it.
     """
 
+    seed_home: Path | None = None
+    """A directory cloned into the per-run scratch HOME before the child starts (macOS backends).
+
+    For warm framework caches: Vision recompiles its Neural Engine plan into an empty cache on
+    every run (~1 s); cloning a cache built by a TRUSTED run makes it ~0.15 s. The child gets
+    its own APFS copy-on-write clone; nothing it writes ever flows back into the seed, so jobs
+    cannot poison each other. Ignored by the Linux backends.
+    """
+
+    capture_home: Path | None = None
+    """After the run, replace this directory's contents with the scratch HOME (minus ``tmp/``).
+
+    How a ``seed_home`` is produced. **Only for trusted runs** -- a self-test on a generated
+    input, never a job: whatever the child leaves in HOME becomes the seed every later run is
+    cloned from. Ignored by the Linux backends.
+    """
+
 
 @dataclass
 class SandboxResult:

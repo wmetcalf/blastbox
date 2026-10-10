@@ -50,6 +50,7 @@ is strictly narrower. This is what Vision needs on the Neural Engine, measured w
 | `gpu`: user clients `IOSurfaceRootUserClient`, `AGXDeviceUserClient`; service `com.apple.cvmsServ` | Metal / CoreImage |
 | `ane`: service `com.apple.appleneuralengine`; user clients `H11ANEIn*`, `H1xANELoadBalancerDirectPathClient`, … | Neural Engine |
 | read on the executable's **directory** (a listing, not the subtree) | CFBundle resolves the main bundle; without it Vision fails with "Null bundleID" |
+| `ane` also: `file-issue-extension`, read class only, for the scratch dir only | Vision compiles its ANE plan into the per-run cache, then gives the **out-of-process** `ANECompilerService` a read extension for it. Without this, a cold compile fails ("Cannot load network …"). It lets a system service read files this run wrote, and grants the child nothing. |
 | a fresh scratch dir as `HOME` / `CFFIXED_USER_HOME` / `TMPDIR` | Vision's E5RT model cache goes there, not into the shared `~/Library/Caches` |
 
 Still denied while decoding works: LaunchServices, TCC, Contacts, DiskArbitration, the window
@@ -74,6 +75,39 @@ look like a clean result. Hence:
   it fails.
 - `ANE_USER_CLIENTS` is per chip generation. A new Apple silicon generation with a new class name
   shows up as a self-test failure, not as quietly wrong results.
+
+## Warm caches without cross-job state: `seed_home` / `capture_home`
+
+Per-run isolation means every run starts with an empty cache, so Vision **recompiles its Neural
+Engine plan for every image**. Two optional `SandboxRequest` fields recover that cost without
+sharing writable state:
+
+- `capture_home=DIR`: after a successful run, `DIR` gets the run's scratch HOME (minus `tmp/`).
+  **Trusted runs only.** The engine uses it for its self-test on a generated QR code, never on
+  job input.
+- `seed_home=DIR`: before a run, `DIR` is cloned (APFS copy-on-write, no-follow, size-capped)
+  into the fresh scratch. The child can change its copy, but nothing flows back. A real-sandbox
+  test on each backend has a child overwrite a seeded file and checks that the seed and the next
+  run still see the original.
+- On `appsandbox` the frameworks put caches in the slot **container**
+  (`~/Library/Containers/<id>/Data`), ignoring `HOME`/`CFFIXED_USER_HOME`, so both fields target
+  the container there.
+
+Measured per-image latency, `wtqrk-scan scan` of a QR PNG, median of 8 runs (M4 Pro, macOS 26.6):
+
+| | ms / image |
+|---|---|
+| unsandboxed CLI (persistent user cache) | 87 |
+| `seatbelt`, empty cache per run | 1147 |
+| `seatbelt`, seeded | 153 |
+| `appsandbox`, empty cache per run | 1051 |
+| `appsandbox`, seeded | 95 |
+
+## Engine-side lesson: frameworks write to stdout
+
+Apple's E5RT runtime prints diagnostics to **fd 1**, which corrupted the CLI's JSON (`Extra data`)
+during development. An engine CLI that reports on stdout should duplicate the real stdout at
+startup, point fd 1 at stderr, and write its result only to the duplicate. `wtqrk-scan` does this.
 
 ## Mechanics shared by both backends (`macos_common.py`)
 
