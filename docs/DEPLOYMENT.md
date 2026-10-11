@@ -258,8 +258,10 @@ was granted.
 - `BLASTBOX_SANDBOX` only picks the backend an engine *may* use through `select_sandbox()`; it
   confines nothing on its own. So the agent refuses to start an engine that doesn't declare
   `sandboxed_parsing = True`, and refuses to serve an `ok` result produced without a single
-  confined run (500, the job fails); a run counts only once a sandboxed process was actually
-  launched. `BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE=1` is the explicit escape hatch.
+  confined run (500, the job fails). A run counts only when it proves it ran confined: under
+  `seatbelt` the target is started through a `/bin/sh` shim that sandbox-exec execs only after
+  the profile attached, and the shim writes a per-run nonce into the scratch dir (a profile
+  sandbox-exec rejects never gets there); under `appsandbox`, a launch the launcher didn't refuse. `BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE=1` is the explicit escape hatch.
 - The engine's optional `detect()` isn't called in the agent (it would parse the input outside
   any sandbox) unless the engine declares `sandboxed_detect = True`.
 - A failed `warmup()` (where an engine runs its known-positive self-test), or an engine with no
@@ -267,24 +269,28 @@ was granted.
   the default (on for macOS, off elsewhere).
 - Each run's limits: an rlimit launcher sets `FSIZE`/`NOFILE`/`CPU`/`CORE` and a per-run
   `NPROC` allowance (no `preexec_fn` in the threaded agent); a watchdog caps the summed RSS of
-  the run's whole process family and the bytes/entries in its writable dirs (`tmpfs_bytes`);
+  the run's whole process family and the bytes/entries in its writable dirs (`tmpfs_bytes`) --
+  a writable dir it can't read (a child `chmod 000`'d it) counts as over budget, not empty;
   captured output is capped per stream; and every process the run started is killed when it
   ends, including one that outlived a normal exit or left its process group.
-- Escapees are found by their sandbox, not their ancestry: a child can fork, `setsid()` and let
-  the leader exit before the watchdog's first sample. After each run the agent kills every
-  process of its uid that is sandboxed and either has the slot's container (`appsandbox`, exact:
+- Processes are also found by their sandbox, not only their ancestry: a child can fork,
+  `setsid()` and let the leader (or a short-lived intermediate) exit between two watchdog
+  samples. Every sample, and a sweep after each run, also take in every process of the
+  agent's uid that is sandboxed and either has the slot's container (`appsandbox`, exact:
   the kernel reports it per process) or started during the run and may write the run's private
   scratch dir (`seatbelt`, which only that run's profile grants). Sandboxes are inherited and
   can't be dropped, so an escapee stays matchable. Residual risk: the `seatbelt` match is a
   heuristic (start time + `sandbox_check`), so a same-uid sandboxed process that started during
   the run and whose own profile can write the worker's temp dir would be killed too; the
-  `appsandbox` container match is exact. Either way an escapee lives until its run ends (bounded
-  by the run's timeout), and a sweep that can't empty the set fails the run.
+  `appsandbox` container match is exact. Such processes are metered and killed during the run;
+  a sweep that can't empty the set fails the run.
 - `DYLD_*` / `LD_*` keys in a request env are dropped, and the request env is handed to the
   target only by the rlimit launcher's `execve`; the launcher interpreter itself (which runs
   before any sandbox) gets just `PATH`.
-- An `appsandbox` slot whose `io/` or container can't be proven empty after a run, whose
-  container was swapped for a symlink, or whose processes can't all be killed is retired until
+- A `seatbelt` run's scratch dir gets the same unlock-and-verify wipe; if it can't be removed
+  the run fails. An `appsandbox` slot whose `io/` or container can't be proven empty after a
+  run (including a root the child locked or `chmod 000`'d), whose container was swapped for a
+  symlink, or whose processes can't all be killed is retired until
   `blastbox macos prepare` is re-run. A seeded run on a never-launched slot primes the
   container with a no-op launch first, so the seed always applies (or the run fails).
 

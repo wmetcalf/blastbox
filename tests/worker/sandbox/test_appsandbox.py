@@ -343,3 +343,34 @@ def test_an_escapee_is_swept_from_the_slot_container(real_sb, tmp_path, monkeypa
     out = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(pid)], capture_output=True,
                          text=True).stdout.strip()
     assert not out or out.startswith("Z"), f"escapee {pid} survived the run"
+
+
+
+def test_a_root_locked_by_the_child_retires_the_slot_instead_of_crashing(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    asb.prepare(root, slots=1, ro_paths=[], runner=_fake_runner([]))
+    sb = asb.AppSandboxSandbox(root=root, popen=_Popen(), home=tmp_path / "home",
+                               platform_ok=True, verify=False, slot_wait_s=0)
+    slot = sb.manifest.slots[0]
+    real_iterdir = mc.Path.iterdir
+
+    def denied(self):
+        if self == slot.io_dir:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_iterdir(self)
+    monkeypatch.setattr(mc.Path, "iterdir", denied)
+    with pytest.raises(SandboxError, match="could not empty"):
+        sb.run(SandboxRequest(argv=["/usr/bin/true"]))
+    assert asb.AppSandboxSandbox.retired_marker(slot).exists()
+
+
+@needs_real
+def test_a_hidden_grandchild_is_metered_and_killed_during_the_run(real_sb, monkeypatch):
+    import time
+    monkeypatch.setattr(mc.RssWatchdog, "_ancestry", lambda self, table: {self._proc.pid})
+    from tests.worker.sandbox.test_seatbelt import _HIDDEN_HOG as hog
+    t0 = time.monotonic()
+    r = real_sb.run(SandboxRequest(argv=["/usr/bin/perl", "-e", hog, "400"],
+                                   limits=Limits(timeout_s=40, memory_bytes=150 * 1024 * 1024)))
+    assert r.killed and b"RSS" in r.stderr, r.stderr
+    assert time.monotonic() - t0 < 30

@@ -463,6 +463,7 @@ class AppSandboxSandbox:
             argv, env=env, limits=request.limits, cwd=home,
             popen=self._popen, rss_fn=self._rss_fn, watch_dirs=[io, container],
             sweep=lambda: self._sweep_slot(slot),
+            member_fn=mc.container_matcher(container),
         )
         if result.exit_code != 70:
             # A sandboxed process ran (70 = the launcher refused because it wasn't sandboxed).

@@ -33,9 +33,12 @@ disappears, :func:`select_sandbox` falls back to the ``appsandbox`` backend (or 
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
+import secrets
 import shutil
+import stat
 import subprocess
 import time
 from collections.abc import Callable
@@ -146,6 +149,17 @@ def build_profile(
     return "\n".join(lines) + "\n", params
 
 
+#: Runs INSIDE the profile: sandbox-exec execs it only after the profile attached, so the nonce it
+#: writes to the scratch dir proves this run was confined. A rejected profile (bad SBPL, a
+#: failed sandbox_init) never gets here. It then execs the target, which keeps its own argv[0].
+HANDSHAKE_SHIM = 'printf %s "$1" > "$2" || exit 125; shift 2; exec "$@"'
+HANDSHAKE_NAME = ".bb-handshake"
+
+
+def shim_argv(nonce: str, marker: str, target: list[str]) -> list[str]:
+    return ["/bin/sh", "-c", HANDSHAKE_SHIM, "bb-handshake", nonce, marker, *target]
+
+
 class SeatbeltSandbox:
     """:class:`~blastbox.worker.sandbox.base.Sandbox` backed by ``sandbox-exec`` (macOS)."""
 
@@ -212,24 +226,55 @@ class SeatbeltSandbox:
             argv = [self._sandbox_exec, "-p", profile]
             for key, val in params.items():
                 argv += ["-D", f"{key}={val}"]
-            argv += ["--", str(exe), *request.argv[1:]]
+            nonce = secrets.token_hex(16)
+            marker = scratch / HANDSHAKE_NAME
+            argv += ["--", *shim_argv(nonce, str(marker), [str(exe), *request.argv[1:]])]
             env = mc.build_child_env(scratch, request.env)
-            # Slack for clock granularity; the scratch-write check is what scopes the sweep.
+            # Slack for clock granularity; the scratch-write check is what scopes the match.
             launched = time.time() - 1.0
             result = mc.run_confined(
                 argv, env=env, limits=request.limits, cwd=scratch,
                 popen=self._popen, rss_fn=self._rss_fn,
                 watch_dirs=[scratch, *(Path(p) for p in rw)],
                 sweep=lambda: mc.sweep_writers(scratch, started_after=launched),
+                member_fn=mc.writer_matcher(scratch, started_after=launched),
             )
-            # Counted only once a sandboxed process actually ran: a failure before this point
-            # (bad seed, Popen error) must not let an engine's in-process fallback pass as confined.
-            note_confined_run()
+            # Counted only when the handshake proves a process ran under the profile: not for a
+            # failure before launch (bad seed, Popen error) nor a profile sandbox-exec rejected,
+            # so an engine's in-process fallback can't pass as confined.
+            if self._handshake_ok(marker, nonce):
+                note_confined_run()
+            else:
+                _log.warning("seatbelt: no handshake from inside the profile; run not counted "
+                             "as confined (exit %s)", result.exit_code)
             if result.exit_code == 0 and not result.killed:
                 mc.capture_scratch(scratch, request.capture_home, request.limits.tmpfs_bytes)
             return result
         finally:
-            mc.remove_tree(scratch)
+            # The same unlock-and-verify wipe as a reused slot: a child can lock files or dirs
+            # in its scratch. If it can't be removed, the run fails rather than leaving it.
+            try:
+                mc.wipe_dir(scratch)
+                os.rmdir(scratch)
+            except (SandboxError, OSError) as exc:
+                raise SandboxError(
+                    f"seatbelt: could not remove the run's scratch {scratch}: {exc}") from exc
+
+    @staticmethod
+    def _handshake_ok(marker: Path, nonce: str) -> bool:
+        try:
+            fd = os.open(marker, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            return False
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return False
+            got = os.read(fd, 64)
+        finally:
+            os.close(fd)
+            with contextlib.suppress(OSError):
+                os.unlink(marker)       # never captured into a seed
+        return got == nonce.encode()
 
 
 def sandbox_exec_available() -> bool:

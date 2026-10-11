@@ -201,12 +201,24 @@ def wipe_dir(path: Path) -> None:
     if not stat.S_ISDIR(st.st_mode):
         kind = "a symlink" if stat.S_ISLNK(st.st_mode) else "not a directory"
         raise SandboxError(f"refusing to wipe {path}: it is {kind}")
-    for child in list(path.iterdir()):
-        remove_tree(child)
-        if os.path.lexists(child):
-            unlock_tree(child)
+    # The child owns the root too and may have locked it (chflags uchg, chmod 000). It is a real
+    # directory (checked above), so undo that on the root itself, never following a link.
+    if hasattr(os, "lchflags"):
+        with contextlib.suppress(OSError):
+            os.lchflags(path, 0)
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o700, follow_symlinks=False)
+    try:
+        for child in list(path.iterdir()):
             remove_tree(child)
-    left = sorted(c.name for c in path.iterdir())
+            if os.path.lexists(child):
+                unlock_tree(child)
+                remove_tree(child)
+        left = sorted(c.name for c in path.iterdir())
+    except OSError as exc:
+        # Anything the worker can't enumerate or remove is "not proven clean", and callers
+        # retire on SandboxError -- a bare OSError would hand the slot out again.
+        raise SandboxError(f"could not empty {path}: {exc}") from exc
     if left:
         raise SandboxError(f"could not empty {path}: {left[:5]}")
 
@@ -329,30 +341,46 @@ def process_table(ps_runner: Callable[..., subprocess.CompletedProcess] = subpro
     return rows
 
 
-def dir_usage(paths: Iterable[Path], max_entries: int) -> tuple[int, int]:
-    """(bytes, entries) under ``paths`` without following symlinks; stops counting at
-    ``max_entries`` + 1 so a directory bomb can't make the measurement itself expensive."""
+def dir_usage(paths: Iterable[Path], max_entries: int) -> tuple[int, int, bool]:
+    """(bytes, entries, complete) under ``paths`` without following symlinks; stops counting at
+    ``max_entries`` + 1 so a directory bomb can't make the measurement itself expensive.
+
+    ``complete`` is False when part of the tree could not be read (a child can ``chmod 000`` a
+    full subdirectory to hide it): the caller must treat that as over budget, never as empty. A
+    path that vanished mid-walk (deleted by the run) is simply gone, not unmeasured."""
     total = entries = 0
+    complete = True
     stack = [str(p) for p in paths]
     while stack:
         top = stack.pop()
         try:
             it = os.scandir(top)
+        except FileNotFoundError:
+            continue
         except OSError:
+            complete = False
             continue
         with it:
-            for e in it:
-                entries += 1
-                if entries > max_entries:
-                    return total, entries
-                try:
-                    st = e.stat(follow_symlinks=False)
-                except OSError:
-                    continue
-                total += st.st_blocks * 512 if hasattr(st, "st_blocks") else st.st_size
-                if stat.S_ISDIR(st.st_mode):
-                    stack.append(e.path)
-    return total, entries
+            try:
+                for e in it:
+                    entries += 1
+                    if entries > max_entries:
+                        return total, entries, complete
+                    try:
+                        st = e.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    except OSError:
+                        complete = False
+                        continue
+                    total += st.st_blocks * 512 if hasattr(st, "st_blocks") else st.st_size
+                    if stat.S_ISDIR(st.st_mode):
+                        stack.append(e.path)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                complete = False
+    return total, entries, complete
 
 
 class RssWatchdog:
@@ -382,8 +410,10 @@ class RssWatchdog:
         watch_dirs: Iterable[Path] = (),
         disk_limit_bytes: int | None = None,
         table_fn: Callable[[], list[_Proc]] = process_table,
+        member_fn: Callable[[int], bool] | None = None,
     ) -> None:
         self._proc = proc
+        self._member_fn = member_fn
         self._limit = limit_bytes
         self._interval = interval_s
         self._rss_fn = rss_fn
@@ -410,10 +440,25 @@ class RssWatchdog:
         self._stop.set()
         self._thread.join(timeout=2.0)
 
+    def _ancestry(self, table: list[_Proc]) -> set[int]:
+        """The run's group, its leader and every member seen before."""
+        return {r.pid for r in table if r.pgid == self._pgid} | {self._proc.pid} | self.seen
+
+    def _by_identity(self, table: list[_Proc]) -> set[int]:
+        """Processes that carry the run's sandbox (``member_fn``), wherever they sit in the
+        process tree: a grandchild that left through a short-lived intermediate and setsid()
+        between two samples is still found, metered and killed while the run is going."""
+        if self._member_fn is None:
+            return set()
+        me = os.getpid()
+        mine = set(uid_pids())
+        return {r.pid for r in table
+                if r.pid in mine and r.pid != me and is_sandboxed(r.pid) and self._member_fn(r.pid)}
+
     def _family(self, table: list[_Proc]) -> list[_Proc]:
         if self._pgid is None:
             return []
-        members = {r.pid for r in table if r.pgid == self._pgid} | {self._proc.pid} | self.seen
+        members = self._ancestry(table) | self._by_identity(table)
         by_parent: dict[int, list[_Proc]] = {}
         for r in table:
             by_parent.setdefault(r.ppid, []).append(r)
@@ -435,8 +480,12 @@ class RssWatchdog:
             self._trip("memory", f"RSS {rss} > limit {self._limit}")
             return
         if self._watch and self._disk_limit is not None:
-            used, entries = dir_usage(self._watch, MAX_SCRATCH_ENTRIES)
-            if used > self._disk_limit or entries > MAX_SCRATCH_ENTRIES:
+            used, entries, complete = dir_usage(self._watch, MAX_SCRATCH_ENTRIES)
+            if not complete:
+                # Fail closed: what can't be measured can't be shown to be under budget.
+                self._trip("disk", "part of the writable dirs could not be read "
+                                   "(permissions changed under the run?)")
+            elif used > self._disk_limit or entries > MAX_SCRATCH_ENTRIES:
                 self._trip("disk", f"writable dirs hold {used} bytes / {entries} entries "
                                    f"(limit {self._disk_limit} bytes / {MAX_SCRATCH_ENTRIES} entries)")
 
@@ -509,6 +558,8 @@ def run_confined(
     watch_dirs: Iterable[Path] = (),
     max_output_bytes: int = MAX_CAPTURE_BYTES,
     sweep: Callable[[], object] | None = None,
+    member_fn: Callable[[int], bool] | None = None,
+    pass_fds: tuple[int, ...] = (),
 ) -> SandboxResult:
     """Launch an already-confining ``argv`` with the shared lifecycle.
 
@@ -518,6 +569,8 @@ def run_confined(
     ``max_output_bytes`` per stream; and the whole family killed before returning, even when
     the leader exited normally. ``sweep`` then kills whatever escaped the family (see
     :func:`sweep_sandboxed`); it raises ``SandboxError`` if it can't, failing the run.
+    ``member_fn`` (pid -> carries this run's sandbox) lets the watchdog meter and kill such
+    processes during the run too, not only after it.
 
     ``env`` is the TARGET's environment: the launcher (an unsandboxed interpreter) runs with
     :data:`LAUNCHER_ENV` and installs ``env`` only when it execs ``argv``.
@@ -529,6 +582,7 @@ def run_confined(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             close_fds=True,
+            pass_fds=pass_fds,
             env=dict(LAUNCHER_ENV),
             cwd=str(cwd),
             start_new_session=True,
@@ -542,7 +596,7 @@ def run_confined(
     err.start()
     killed = False
     with RssWatchdog(proc, limits.memory_bytes, rss_fn=rss_fn, watch_dirs=watch_dirs,
-                     disk_limit_bytes=limits.tmpfs_bytes) as dog:
+                     disk_limit_bytes=limits.tmpfs_bytes, member_fn=member_fn) as dog:
         try:
             exit_code = proc.wait(timeout=limits.timeout_s)
         except subprocess.TimeoutExpired:
@@ -715,26 +769,35 @@ def _alive(pid: int) -> bool:
     return bool(out) and not out.startswith("Z")
 
 
-def sweep_writers(path: Path, *, started_after: float) -> int:
-    """Kill every sandboxed process that started at/after ``started_after`` and may write
-    ``path`` (a seatbelt run's scratch dir, which only that run's profile grants). The start
+def writer_matcher(path: Path, *, started_after: float) -> Callable[[int], bool]:
+    """Matches a (sandboxed) process that started at/after ``started_after`` and may write
+    ``path`` -- a seatbelt run's scratch dir, which only that run's profile grants. The start
     time keeps out a long-running same-uid agent whose own profile happens to allow the
     user's temp dir."""
-    if not os.path.isdir(path):
-        return 0
-
     def match(p: int) -> bool:
         t = proc_start_time(p)
-        return t is not None and t >= started_after and sandbox_may_write(p, path)
-    return sweep_sandboxed(match, what=f"the run in {path}")
+        return (t is not None and t >= started_after and os.path.isdir(path)
+                and sandbox_may_write(p, path))
+    return match
+
+
+def container_matcher(container: Path) -> Callable[[int], bool]:
+    """Matches a process whose App Sandbox container is ``container`` (an appsandbox slot)."""
+    want = os.path.realpath(container)
+    return lambda p: (c := container_of(p)) is not None and os.path.realpath(c) == want
+
+
+def sweep_writers(path: Path, *, started_after: float) -> int:
+    """Kill every sandboxed process :func:`writer_matcher` matches."""
+    if not os.path.isdir(path):
+        return 0
+    return sweep_sandboxed(writer_matcher(path, started_after=started_after),
+                           what=f"the run in {path}")
 
 
 def sweep_container(container: Path) -> int:
-    """Kill every process whose App Sandbox container is ``container`` (an appsandbox slot)."""
-    want = os.path.realpath(container)
-    return sweep_sandboxed(
-        lambda p: (c := container_of(p)) is not None and os.path.realpath(c) == want,
-        what=f"container {container}")
+    """Kill every process whose App Sandbox container is ``container``."""
+    return sweep_sandboxed(container_matcher(container), what=f"container {container}")
 
 
 # --------------------------------------------------------------------------------------------

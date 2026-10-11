@@ -18,7 +18,7 @@ from blastbox.errors import SandboxError, SandboxUnavailable
 from blastbox.limits import Limits
 from blastbox.worker.sandbox.base import Mount, SandboxRequest
 from blastbox.worker.sandbox import macos_common as mc
-from blastbox.worker.sandbox.seatbelt import SeatbeltSandbox, build_profile
+from blastbox.worker.sandbox.seatbelt import HANDSHAKE_SHIM, SeatbeltSandbox, build_profile
 
 pytestmark = pytest.mark.host_platform
 
@@ -75,10 +75,14 @@ class TestProfile:
 
 
 class _FakeProc:
-    def __init__(self, argv, **kwargs):
+    def __init__(self, argv, handshake=True, **kwargs):
         self.launched = argv
         self.argv = mc.unwrap_launcher(argv)    # the command inside the rlimit launcher
         self.kwargs = kwargs
+        if handshake and HANDSHAKE_SHIM in self.argv:
+            # what the shim does once sandbox-exec has attached the profile
+            i = self.argv.index(HANDSHAKE_SHIM)
+            Path(self.argv[i + 3]).write_text(self.argv[i + 2])
         self.pid = os.getpid()      # the watchdog refuses to touch our own group
         self.returncode = 0
         self.stdout = io.BytesIO(b"out")
@@ -111,7 +115,9 @@ class TestRunShape:
         argv = calls[0].argv
         assert argv[:2] == ["/bin/sh", "-p"]
         dashdash = argv.index("--")
-        assert argv[dashdash + 2:] == ["hi"]
+        # sandbox-exec runs the handshake shim, which execs the target with its own argv
+        assert argv[dashdash + 1:dashdash + 4] == ["/bin/sh", "-c", HANDSHAKE_SHIM]
+        assert argv[dashdash + 7:] == ["/bin/echo", "hi"]
         params = dict(a.split("=", 1) for a in argv[3:dashdash] if a != "-D")
         assert str(data.resolve()) in params.values()
         # the request env reaches the target through the launcher, never the launcher itself
@@ -280,3 +286,72 @@ def test_an_escapee_the_watchdog_never_saw_is_swept(tmp_path, monkeypatch):
     while not _gone(pid) and time.monotonic() < deadline:
         time.sleep(0.05)
     assert _gone(pid), f"escapee {pid} survived the run"
+
+
+def test_a_launch_without_the_handshake_is_not_counted(tmp_path):
+    # sandbox-exec ran but never exec'd the shim (what a rejected profile looks like).
+    from blastbox.worker.sandbox.base import confined_runs
+    before = confined_runs()
+    sb = SeatbeltSandbox(popen=lambda argv, **kw: _FakeProc(argv, handshake=False, **kw),
+                         platform_ok=True, sandbox_exec="/bin/sh", scratch_base=tmp_path / "s")
+    sb.run(SandboxRequest(argv=["/bin/echo"]))
+    assert confined_runs() == before
+
+
+@needs_darwin
+def test_a_rejected_profile_is_not_counted_as_confined(monkeypatch):
+    from blastbox.worker.sandbox import seatbelt as sbmod
+    from blastbox.worker.sandbox.base import confined_runs
+    real = sbmod.build_profile
+
+    def bad(**kw):
+        text, params = real(**kw)
+        return text + "(allow no-such-operation)\n", params
+    monkeypatch.setattr(sbmod, "build_profile", bad)
+    before = confined_runs()
+    r = SeatbeltSandbox().run(SandboxRequest(argv=["/usr/bin/true"]))
+    assert r.exit_code != 0
+    assert confined_runs() == before
+    monkeypatch.setattr(sbmod, "build_profile", real)
+    assert SeatbeltSandbox().run(SandboxRequest(argv=["/usr/bin/true"])).exit_code == 0
+    assert confined_runs() == before + 1
+
+
+@needs_darwin
+def test_a_scratch_the_worker_cannot_remove_fails_the_run(monkeypatch, tmp_path):
+    def stuck(path):
+        raise SandboxError(f"could not empty {path}: ['locked']")
+    monkeypatch.setattr(mc, "wipe_dir", stuck)
+    with pytest.raises(SandboxError, match="could not remove the run's scratch"):
+        SeatbeltSandbox(scratch_base=tmp_path / "s").run(SandboxRequest(argv=["/usr/bin/true"]))
+
+
+@needs_darwin
+def test_a_locked_scratch_is_unlocked_and_removed(tmp_path):
+    base = tmp_path / "s"
+    r = SeatbeltSandbox(scratch_base=base).run(SandboxRequest(argv=[
+        "/bin/sh", "-c", 'mkdir "$HOME/d" && touch "$HOME/d/f" && chflags uchg "$HOME/d/f" '
+                         '&& chmod 000 "$HOME/d"']))
+    assert r.exit_code == 0, r.stderr
+    assert list(base.iterdir()) == []
+
+
+# A grandchild that leaves through a short-lived intermediate + setsid, waits until it is
+# reparented, then allocates (the size is a runtime value: perl would constant-fold a literal
+# into the LEADER at compile time).
+_HIDDEN_HOG = ("use POSIX; my $p = fork(); if ($p == 0) { my $q = fork(); "
+               "if ($q == 0) { POSIX::setsid(); close STDIN; close STDOUT; close STDERR; "
+               "select(undef, undef, undef, 0.5); my $x = 'a' x ($ARGV[0] * 1048576); sleep 60; "
+               "POSIX::_exit(0) } POSIX::_exit(0) } sleep 60;")
+
+
+@needs_darwin
+def test_a_hidden_grandchild_is_metered_and_killed_during_the_run(monkeypatch):
+    # Blind the ancestry tracking entirely: only the sandbox-identity match can see the hog.
+    monkeypatch.setattr(mc.RssWatchdog, "_ancestry", lambda self, table: {self._proc.pid})
+    t0 = time.monotonic()
+    r = SeatbeltSandbox().run(SandboxRequest(
+        argv=["/usr/bin/perl", "-e", _HIDDEN_HOG, "400"],
+        limits=Limits(timeout_s=40, memory_bytes=150 * 1024 * 1024)))
+    assert r.killed and b"RSS" in r.stderr, r.stderr
+    assert time.monotonic() - t0 < 30          # killed for memory, not by the timeout

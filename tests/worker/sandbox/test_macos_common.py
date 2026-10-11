@@ -349,3 +349,47 @@ class TestSweep:
 
     def test_the_worker_itself_is_not_sandboxed(self):
         assert not mc.is_sandboxed(os.getpid())
+
+
+
+class TestFailClosedMeasurement:
+    def test_an_unreadable_subdir_makes_usage_incomplete(self, tmp_path):
+        d = tmp_path / "w"
+        (d / "hidden").mkdir(parents=True)
+        (d / "hidden" / "big").write_bytes(b"x" * 100_000)
+        os.chmod(d / "hidden", 0)
+        try:
+            _, _, complete = mc.dir_usage([d], 1000)
+            assert complete is False
+        finally:
+            os.chmod(d / "hidden", 0o700)
+        assert mc.dir_usage([d], 1000)[2] is True
+        assert mc.dir_usage([tmp_path / "missing"], 1000) == (0, 0, True)
+
+    def test_the_watchdog_trips_on_what_it_cannot_measure(self, tmp_path):
+        w = tmp_path / "w"
+        w.mkdir()
+        r = mc.run_confined(["/bin/sh", "-c", f'mkdir "{w}/h" && chmod 000 "{w}/h" && sleep 20'],
+                            env={"PATH": mc.MINIMAL_PATH}, limits=Limits(timeout_s=30),
+                            cwd=tmp_path, watch_dirs=[w])
+        os.chmod(w / "h", 0o700)
+        assert r.killed and b"writable dirs" in r.stderr
+
+
+class TestWipeDirLockedRoot:
+    def test_a_root_chmodded_000_is_unlocked_and_emptied(self, tmp_path):
+        d = tmp_path / "Data"
+        (d / "sub").mkdir(parents=True)
+        (d / "sub" / "f").write_text("x")
+        os.chmod(d, 0)
+        os.chflags(d, stat.UF_IMMUTABLE)       # locked after the chmod (uchg blocks chmod)
+        mc.wipe_dir(d)
+        assert list(d.iterdir()) == []
+
+    def test_an_enumeration_failure_is_a_sandbox_error(self, tmp_path, monkeypatch):
+        d = tmp_path / "Data"
+        d.mkdir()
+        monkeypatch.setattr(mc.Path, "iterdir",
+                            lambda self: (_ for _ in ()).throw(PermissionError(13, "denied")))
+        with pytest.raises(SandboxError, match="could not empty"):
+            mc.wipe_dir(d)
