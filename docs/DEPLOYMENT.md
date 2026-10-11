@@ -253,6 +253,13 @@ agent.** The agent is long-lived and only spools bytes and seals output; every e
 gets a fresh profile, a fresh scratch `HOME`/`TMPDIR`/cache dir, no network, and only the paths it
 was granted.
 
+**The agent can be native.** The dispatcher only sees the protocol: `GET /healthz`, and
+`POST /detonate` answered with a tar holding a `metadata.json` that passes the host trust gate.
+Any process that serves it is a `static` worker. William Tells ships `wtqrk-worker`, a Swift agent
+that runs each image in a fresh process the kernel App-Sandboxes at exec (no `sandbox-exec`, no
+Python), and its tests run the agent's output through `validate_worker_output`. That's the shape
+for an engine that is itself native code; the backends below are for Python engines.
+
 **Which macOS backend?**
 
 | | `seatbelt` (default) | `appsandbox` |

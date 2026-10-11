@@ -162,3 +162,25 @@ that simulates Linux; macOS tests opt out with `@pytest.mark.host_platform`.
 - Stacking both backends (sandbox-exec inside App Sandbox): untested.
 - Running under a LaunchDaemon (no GUI session) hasn't been verified for Metal/ANE access.
 - EC2 `mac2*` hosts: not yet verified (expected to match: same macOS, bare metal).
+
+
+## Addendum: native agents, and why not XPC (measured 2026-10-10)
+
+An engine that is native code can skip both backends and the Python agent: serve the worker
+protocol itself and spawn its parser App-Sandboxed (William Tells' `wtqrk-worker`). Measured on an
+M4 Pro, macOS 26.6:
+
+- **A directly spawned, App-Sandboxed tool works per image.** Sign it ad hoc with
+  `com.apple.security.app-sandbox` and an embedded Info.plist; the kernel sandboxes it at exec,
+  whoever launches it. Hand it the input as an inherited fd (stdin) and it needs no path
+  exception at all. About 105 ms per image with a warm plan cache, on the Neural Engine.
+- **The container is keyed by the signing identifier**, not the Info.plist bundle id: re-sign a
+  clone with `codesign -i <id>.slotN` to give each concurrent slot its own container.
+- **App Sandbox lets a program read its own executable's directory.** Keep slot directories free
+  of anything but the binary, and never stage input there. A confinement probe with a canary
+  beside the binary caught this.
+- **XPC can't do one-process-per-image.** An app-sandboxed XPC service decodes fine (fd passing
+  works), but launchd delays relaunching any service that exited (cleanly or by SIGKILL) within
+  10 s of starting: every image after the first took 10.1 s. Reusing one service process across
+  images would avoid that and give up the per-image process. Only private API
+  (`_MultipleInstances` + `xpc_connection_set_instance`) gets around it.
