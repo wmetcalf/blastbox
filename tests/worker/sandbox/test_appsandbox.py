@@ -94,15 +94,19 @@ class TestPrepare:
 
 
 class _Popen:
-    """Runs the TARGET (argv[1:]) unsandboxed, standing in for the signed launcher."""
+    """Runs the TARGET (argv[3:]) unsandboxed, standing in for the signed launcher -- including
+    its handshake (``handshake=False``: a chain that dies before the sandboxed launcher)."""
 
-    def __init__(self):
+    def __init__(self, handshake=True):
         self.calls = []
+        self.handshake = handshake
 
     def __call__(self, argv, **kw):
         inner = mc.unwrap_launcher(argv)
         self.calls.append((inner, kw))
-        return subprocess.Popen(inner[1:], **kw)
+        if self.handshake:
+            Path(inner[1]).write_text(inner[2])
+        return subprocess.Popen(inner[3:], **kw)
 
 
 class TestRunStaging:
@@ -215,11 +219,13 @@ class TestRealAppSandbox:
         assert r.exit_code == 0, r.stderr
         assert (out / "copy").read_text() == "payload"
 
-    def test_unsigned_launcher_fails_closed(self, sb):
+    def test_unsigned_launcher_fails_closed(self, sb, tmp_path):
         # Run the launcher binary OUTSIDE its bundle (no App Sandbox applied): it must refuse.
         raw = sb.manifest.root / "build" / asb.LAUNCHER_EXE
-        r = subprocess.run([str(raw), "/usr/bin/true"], capture_output=True)
+        marker = tmp_path / "marker"
+        r = subprocess.run([str(raw), str(marker), "n", "/usr/bin/true"], capture_output=True)
         assert r.returncode == 70 and b"not sandboxed" in r.stderr
+        assert not marker.exists()          # no handshake from an unsandboxed launcher
 
 
 @needs_real
@@ -269,7 +275,7 @@ class _PrimingPopen(_Popen):
         self.container = container
 
     def __call__(self, argv, **kw):
-        if mc.unwrap_launcher(argv)[1:] == ["/usr/bin/true"]:
+        if mc.unwrap_launcher(argv)[3:] == ["/usr/bin/true"]:
             self.container.mkdir(parents=True, exist_ok=True)
         return super().__call__(argv, **kw)
 
@@ -294,7 +300,7 @@ def test_a_fresh_slot_is_primed_so_the_first_run_gets_its_seed(tmp_path):
     r = sb.run(SandboxRequest(argv=["/bin/sh", "-c", f'cat "{container}/Library/Caches/x/p"'],
                               seed_home=_seed(tmp_path)))
     assert r.stdout == b"plan\n", r.stderr
-    assert popen.calls[0][0][1:] == ["/usr/bin/true"]     # the priming launch came first
+    assert popen.calls[0][0][3:] == ["/usr/bin/true"]     # the priming launch came first
 
 
 def test_a_seed_that_cannot_be_applied_fails_the_run_loudly(tmp_path):
@@ -374,3 +380,68 @@ def test_a_hidden_grandchild_is_metered_and_killed_during_the_run(real_sb, monke
                                    limits=Limits(timeout_s=40, memory_bytes=150 * 1024 * 1024)))
     assert r.killed and b"RSS" in r.stderr, r.stderr
     assert time.monotonic() - t0 < 30
+
+
+
+def _fake_root(tmp_path, name="root", prefix=None):
+    root = tmp_path / name
+    asb.prepare(root, slots=1, ro_paths=[], bundle_prefix=prefix, runner=_fake_runner([]))
+    return root
+
+
+def test_only_a_handshake_from_the_sandboxed_launcher_credits_the_run(tmp_path):
+    from blastbox.worker.sandbox.base import confined_runs
+    root = _fake_root(tmp_path)
+    home = tmp_path / "home"
+    before = confined_runs()
+    sb = asb.AppSandboxSandbox(root=root, popen=_Popen(), home=home, platform_ok=True,
+                               verify=False, slot_wait_s=0)
+    assert sb.run(SandboxRequest(argv=["/usr/bin/true"])).exit_code == 0
+    assert confined_runs() == before + 1
+    # The chain dies before the sandboxed launcher: here the "launcher" is prepare's fake bytes,
+    # so the rlimit launcher's execve fails. Nothing ran confined; nothing is credited.
+    sb = asb.AppSandboxSandbox(root=root, home=home, platform_ok=True, verify=False,
+                               slot_wait_s=0)
+    r = sb.run(SandboxRequest(argv=["/usr/bin/true"]))
+    assert r.exit_code != 0
+    assert confined_runs() == before + 1
+    sb = asb.AppSandboxSandbox(root=root, popen=_Popen(handshake=False), home=home,
+                               platform_ok=True, verify=False, slot_wait_s=0)
+    sb.run(SandboxRequest(argv=["/usr/bin/true"]))
+    assert confined_runs() == before + 1
+
+
+def test_env_with_nul_is_refused_up_front(tmp_path):
+    sb = asb.AppSandboxSandbox(root=_fake_root(tmp_path), popen=_Popen(), home=tmp_path / "home",
+                               platform_ok=True, verify=False, slot_wait_s=0)
+    for env in ({"K": "a\0b"}, {"K\0": "v"}, {"A=B": "v"}):
+        with pytest.raises(SandboxError, match="invalid env entry"):
+            sb.run(SandboxRequest(argv=["/usr/bin/true"], env=env))
+
+
+def test_roots_sharing_a_bundle_prefix_share_one_container_lock(tmp_path):
+    home = tmp_path / "home"
+    a = asb.AppSandboxSandbox(root=_fake_root(tmp_path, "a", prefix="io.blastbox.pytest.same"),
+                              popen=_Popen(), home=home, platform_ok=True, verify=False,
+                              slot_wait_s=0)
+    b = asb.AppSandboxSandbox(root=_fake_root(tmp_path, "b", prefix="io.blastbox.pytest.same"),
+                              popen=_Popen(), home=home, platform_ok=True, verify=False,
+                              slot_wait_s=0)
+    c = asb.AppSandboxSandbox(root=_fake_root(tmp_path, "c", prefix="io.blastbox.pytest.other"),
+                              popen=_Popen(), home=home, platform_ok=True, verify=False,
+                              slot_wait_s=0)
+    assert a.manifest.slots[0].bundle_id == b.manifest.slots[0].bundle_id
+    with a._acquire_slot():
+        # b's own slot lock is free, but its container (same bundle id) is in use
+        with pytest.raises(SandboxError, match="busy"):
+            b.run(SandboxRequest(argv=["/usr/bin/true"]))
+        assert c.run(SandboxRequest(argv=["/usr/bin/true"])).exit_code == 0
+    assert b.run(SandboxRequest(argv=["/usr/bin/true"])).exit_code == 0
+
+
+@needs_real
+def test_a_real_sandboxed_launch_is_credited(real_sb):
+    from blastbox.worker.sandbox.base import confined_runs
+    before = confined_runs()
+    assert real_sb.run(SandboxRequest(argv=["/usr/bin/true"])).exit_code == 0
+    assert confined_runs() == before + 1

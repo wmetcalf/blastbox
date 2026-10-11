@@ -20,7 +20,9 @@ private ``io/`` dir only, plus the operator's read-only engine paths. A run:
 1. locks a free slot (``flock``; concurrency == slot count);
 2. **stages** each mount into ``io/`` (APFS clone, never following links) and rewrites argv /
    env tokens naming a mount to its staged path;
-3. execs ``launcher <exe> args...`` with the shared lifecycle (timeout, RSS watchdog, rlimits);
+3. execs ``launcher <marker> <nonce> <exe> args...`` with the shared lifecycle (timeout, RSS
+   watchdog, rlimits); once sandboxed, the launcher writes the run's nonce to ``<marker>`` in
+   ``io/`` -- the proof the run was confined -- and execs the target;
 4. copies rw mounts back (no-follow, size-capped; FIFOs/devices skipped);
 5. wipes ``io/`` AND the slot's container ``Data/`` -- so nothing a job wrote survives into
    the next job on that slot.
@@ -49,6 +51,8 @@ import logging
 import os
 import plistlib
 import pwd
+import secrets
+import stat
 import subprocess
 import time
 from collections.abc import Callable, Iterator
@@ -63,7 +67,7 @@ from blastbox.worker.sandbox import macos_common as mc
 _log = logging.getLogger("blastbox.worker.sandbox.appsandbox")
 
 MANIFEST_NAME = "manifest.json"
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2          # 2: the launcher takes <marker> <nonce> before the target
 LAUNCHER_EXE = "bb-launcher"
 _APP_SANDBOX = "com.apple.security.app-sandbox"
 _RW_EXCEPTION = "com.apple.security.temporary-exception.files.absolute-path.read-write"
@@ -71,30 +75,60 @@ _RO_EXCEPTION = "com.apple.security.temporary-exception.files.absolute-path.read
 _SIGTRAP_CODES = (133, -5)
 
 #: The launcher. Refuses to exec anything unless the kernel reports it sandboxed, so a slot
-#: whose signature was stripped or whose entitlement was lost fails CLOSED (exit 70).
+#: whose signature was stripped or whose entitlement was lost fails CLOSED (exit 70). Once it
+#: is sandboxed it writes the run's nonce to the marker (a new file in the slot's io/, never
+#: following a link): that handshake, made from inside the sandbox, is what credits the run
+#: as confined -- a chain that fails before this point (a missing launcher, an execve error in
+#: the rlimit launcher) leaves no marker.
 LAUNCHER_C = r"""
+#include <fcntl.h>
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 #include <sys/types.h>
 int sandbox_check(pid_t pid, const char *operation, int type, ...);
 int main(int argc, char **argv) {
-    if (argc < 2 || argv[1][0] != '/') {
-        fprintf(stderr, "bb-launcher: usage: bb-launcher /abs/exe [args...]\n");
+    if (argc < 4 || argv[1][0] != '/' || argv[3][0] != '/') {
+        fprintf(stderr, "bb-launcher: usage: bb-launcher /abs/marker nonce /abs/exe [args...]\n");
         return 64;
     }
     if (sandbox_check(getpid(), NULL, 0) != 1) {
         fprintf(stderr, "bb-launcher: not sandboxed; refusing to exec (re-run prepare)\n");
         return 70;
     }
-    execv(argv[1], argv + 1);
+    int fd = open(argv[1], O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    size_t n = strlen(argv[2]);
+    if (fd < 0 || write(fd, argv[2], n) != (ssize_t)n || close(fd) != 0) {
+        perror("bb-launcher: handshake");
+        return 72;
+    }
+    execv(argv[3], argv + 3);
     perror("bb-launcher: execv");
     return 71;
 }
 """
+HANDSHAKE_NAME = ".bb-handshake"
 
 
 class AppSandboxNotPrepared(SandboxUnavailable):
     """No manifest at the root: ``blastbox macos prepare`` was never run there."""
+
+
+def _handshake_ok(marker: Path, nonce: str) -> bool:
+    """The marker is a regular file (not followed) holding exactly ``nonce``; it is removed."""
+    try:
+        fd = os.open(marker, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return False
+        got = os.read(fd, 64)
+    finally:
+        os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(marker)
+    return got == nonce.encode()
 
 
 @dataclass(frozen=True)
@@ -359,17 +393,22 @@ class AppSandboxSandbox:
                     "every appsandbox slot is retired (a run left state that could not be "
                     "removed); inspect them, then re-run `blastbox macos prepare`")
             for slot in usable:
-                fd = os.open(slot.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    os.close(fd)
+                fd = self._try_lock(slot.lock_path)
+                if fd is None:
+                    continue
+                # The container is keyed by bundle id, not by root: two roots prepared with the
+                # same --bundle-prefix share ~/Library/Containers/<id>. A per-user lock on the id,
+                # held for the run and both wipes, keeps them from running in (and wiping) one
+                # container at once.
+                bfd = self._try_lock(self.bundle_lock_path(slot))
+                if bfd is None:
+                    self._unlock(fd)
                     continue
                 try:
                     yield slot
                 finally:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-                    os.close(fd)
+                    self._unlock(bfd)
+                    self._unlock(fd)
                 return
             if time.monotonic() >= deadline:
                 raise SandboxError(
@@ -382,6 +421,27 @@ class AppSandboxSandbox:
         """Kill every process still in the slot's container -- including a forked, setsid()'d
         orphan that left the run's process family -- before the slot is wiped or reused."""
         mc.sweep_container(slot.container_data(self._home))
+
+    def bundle_lock_path(self, slot: Slot) -> Path:
+        """Per-user lock for ``slot``'s bundle id (and so its container), shared by every root."""
+        d = self._home / "Library" / "Caches" / "blastbox" / "appsandbox-locks"
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+        return d / f"{slot.bundle_id}.lock"
+
+    @staticmethod
+    def _try_lock(path: Path) -> int | None:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            return None
+        return fd
+
+    @staticmethod
+    def _unlock(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
     def _wipe_slot(self, slot: Slot) -> None:
         """Kill what is left in the slot, then empty its io/ and container, or retire the slot
@@ -458,17 +518,22 @@ class AppSandboxSandbox:
         args = mc.rewrite_path_args(request.argv[1:], mapping)
         extra_env = {k: mc.rewrite_path_args([v], mapping)[0] for k, v in request.env.items()}
         env = mc.build_child_env(home, extra_env)
-        argv = [str(slot.launcher), str(exe), *args]
+        nonce = secrets.token_hex(16)
+        marker = io / HANDSHAKE_NAME
+        argv = [str(slot.launcher), str(marker), nonce, str(exe), *args]
         result = mc.run_confined(
             argv, env=env, limits=request.limits, cwd=home,
             popen=self._popen, rss_fn=self._rss_fn, watch_dirs=[io, container],
             sweep=lambda: self._sweep_slot(slot),
             member_fn=mc.container_matcher(container),
         )
-        if result.exit_code != 70:
-            # A sandboxed process ran (70 = the launcher refused because it wasn't sandboxed).
-            # Counted only now: a failure before launch must not pass as a confined run.
+        # Credited only on the handshake the launcher writes once it is sandboxed: a failure
+        # anywhere before that must not pass as a confined run.
+        if _handshake_ok(marker, nonce):
             note_confined_run()
+        else:
+            _log.warning("appsandbox: no handshake from the sandboxed launcher; run not counted "
+                         "as confined (exit %s)", result.exit_code)
 
         for src, staged in rw_staged:
             self._copy_back(staged, src, budget)
@@ -488,13 +553,15 @@ class AppSandboxSandbox:
     def _prime_container(self, slot: Slot, home: Path) -> None:
         """Launch the slot once with ``/usr/bin/true`` so its container exists, or raise."""
         container = slot.container_data(self._home)
-        mc.run_confined([str(slot.launcher), "/usr/bin/true"],
+        marker = slot.io_dir / HANDSHAKE_NAME
+        mc.run_confined([str(slot.launcher), str(marker), secrets.token_hex(16), "/usr/bin/true"],
                         env=mc.build_child_env(home, {}), limits=Limits(timeout_s=30),
                         cwd=home, popen=self._popen)
         if not container.is_dir():
             raise SandboxError(
                 f"appsandbox slot {slot.index}: container {container} was not created by a "
                 "priming launch, so seed_home cannot be applied; check the slot signature")
+        mc.remove_tree(marker)
         mc.wipe_dir(container)
 
     @staticmethod

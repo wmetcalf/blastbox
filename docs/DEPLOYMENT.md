@@ -261,7 +261,9 @@ was granted.
   confined run (500, the job fails). A run counts only when it proves it ran confined: under
   `seatbelt` the target is started through a `/bin/sh` shim that sandbox-exec execs only after
   the profile attached, and the shim writes a per-run nonce into the scratch dir (a profile
-  sandbox-exec rejects never gets there); under `appsandbox`, a launch the launcher didn't refuse.
+  sandbox-exec rejects never gets there); under `appsandbox`, the signed launcher writes the
+  nonce into the slot's `io/` once it has checked it is sandboxed, before it execs the target.
+  (Slots prepared before this need `blastbox macos prepare` again: manifest version 2.)
   `select_sandbox()`'s own `/usr/bin/true` probe never counts, so an engine that selects its
   backend mid-job gets no credit before its parser has run. `BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE=1` is the explicit escape hatch.
 - The engine's optional `detect()` isn't called in the agent (it would parse the input outside
@@ -288,9 +290,13 @@ was granted.
   the run and whose own profile can write the worker's temp dir would be killed too; the
   `appsandbox` container match is exact. Such processes are metered and killed during the run;
   a sweep that can't empty the set fails the run.
-- `DYLD_*` / `LD_*` keys in a request env are dropped, and the request env is handed to the
+- An env entry with a NUL, an `=` in its key, or an empty key is refused up front (`execve`
+  would fail on it after the launcher started). `DYLD_*` / `LD_*` keys in a request env are dropped, and the request env is handed to the
   target only by the rlimit launcher's `execve`; the launcher interpreter itself (which runs
   before any sandbox) gets just `PATH`.
+- App Sandbox containers are keyed by bundle id, so two `appsandbox` roots prepared with the same
+  `--bundle-prefix` would share them; a per-user lock per bundle id
+  (`~/Library/Caches/blastbox/appsandbox-locks/`) is held for each run and its wipes.
 - A `seatbelt` run's scratch dir gets the same unlock-and-verify wipe; if it can't be removed
   the run fails. An `appsandbox` slot whose `io/` or container can't be proven empty after a
   run (including a root the child locked or `chmod 000`'d), whose container was swapped for a

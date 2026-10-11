@@ -70,3 +70,20 @@ def test_bare_record_payload_surfaces_its_own_scalar_fields():
                                "detections": Record(fields={})}))
     s = _build_result_summary(env)
     assert s["meta"] == {"schema": "wtqrk.scan/1", "detection_count": 2}
+
+
+
+def test_a_huge_bare_record_is_bounded():
+    import json
+    fields = {f"field_{i:04d}": "v" * 64 for i in range(4096)}
+    env = types.SimpleNamespace(status="ok", artifacts=[], warnings=[], detected=None,
+                                payload=types.SimpleNamespace(type="record", fields=fields))
+    s = _build_result_summary(env)
+    assert 0 < len(s["meta"]) <= 64
+    assert len(json.dumps(s["meta"])) <= 8 * 1024
+    assert len(json.dumps(s)) < 16 * 1024          # far under node_claim's 64 KiB
+
+
+def test_long_keys_are_skipped():
+    s = _build_result_summary(_env({"k" * 65: 1, "ok": 2}))
+    assert s["meta"] == {"ok": 2}

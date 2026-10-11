@@ -393,3 +393,25 @@ class TestWipeDirLockedRoot:
                             lambda self: (_ for _ in ()).throw(PermissionError(13, "denied")))
         with pytest.raises(SandboxError, match="could not empty"):
             mc.wipe_dir(d)
+
+
+
+class TestDirUsageRoots:
+    def test_a_file_root_is_counted_not_incomplete(self, tmp_path):
+        f = tmp_path / "rw-file"
+        f.write_bytes(b"x" * 50_000)
+        used, entries, complete = mc.dir_usage([f], 1000)
+        assert complete is True and entries == 1 and used >= 50_000
+
+    def test_a_symlink_root_counts_the_link_not_its_target(self, tmp_path):
+        big = tmp_path / "big"
+        big.mkdir()
+        (big / "f").write_bytes(b"x" * 200_000)
+        link = tmp_path / "link"
+        link.symlink_to(big)
+        used, entries, complete = mc.dir_usage([link], 1000)
+        assert complete is True and entries == 1 and used < 200_000
+
+    def test_env_nul_is_refused(self, tmp_path):
+        with pytest.raises(SandboxError, match="invalid env entry"):
+            mc.build_child_env(tmp_path, {"K": "a\0b"})

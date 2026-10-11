@@ -75,6 +75,10 @@ def build_child_env(scratch: Path, extra: Mapping[str, str]) -> dict[str, str]:
     """
     env: dict[str, str] = {}
     for key, val in extra.items():
+        if "\0" in key or "\0" in val or "=" in key or not key:
+            # execve would fail on it -- after the launcher started, before any sandbox
+            raise SandboxError(f"invalid env entry {key!r}: empty, '=' or NUL in the key, or NUL "
+                               "in the value")
         if key in _RESERVED_ENV:
             _log.warning("macos sandbox: ignoring reserved env key %s from the request", key)
             continue
@@ -350,7 +354,22 @@ def dir_usage(paths: Iterable[Path], max_entries: int) -> tuple[int, int, bool]:
     path that vanished mid-walk (deleted by the run) is simply gone, not unmeasured."""
     total = entries = 0
     complete = True
-    stack = [str(p) for p in paths]
+    stack: list[str] = []
+    for root in paths:
+        # A root can be a file (an rw FILE mount) or a symlink: count it, never follow it. Only
+        # a directory is walked.
+        try:
+            st = os.lstat(root)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            complete = False
+            continue
+        if stat.S_ISDIR(st.st_mode):
+            stack.append(str(root))
+        else:
+            entries += 1
+            total += st.st_blocks * 512 if hasattr(st, "st_blocks") else st.st_size
     while stack:
         top = stack.pop()
         try:
