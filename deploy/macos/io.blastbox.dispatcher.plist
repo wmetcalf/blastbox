@@ -6,7 +6,7 @@
   and keep only io.blastbox.worker-agent on the Macs.
 
   Configuration comes from ONE env file (KEY=value lines, sourced with `set -a`), so serve and
-  dispatch can't drift apart -- they must agree on BLASTBOX_DATABASE_URL, BLASTBOX_JOB_ROOT and
+  dispatch can't drift apart: they must agree on BLASTBOX_DATABASE_URL, BLASTBOX_JOB_ROOT and
   every BLASTBOX_ENGINE_<NAME>_* knob. Keep it 0600: it holds the worker-agent token.
 
     cp io.blastbox.dispatcher.plist ~/Library/LaunchAgents/

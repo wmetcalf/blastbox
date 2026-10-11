@@ -242,7 +242,11 @@ BLASTBOX_STATIC_WORKERS=127.0.0.1:8765             BLASTBOX_STATIC_WORKERS=mac1:
 ```
 
 `deploy/macos/` has launchd agents for all three processes: `io.blastbox.worker-agent` on every
-Mac, plus `io.blastbox.ingress` and `io.blastbox.dispatcher` for a Mac-only deployment. The last
+Mac, plus `io.blastbox.ingress` and `io.blastbox.dispatcher` for a Mac-only deployment. They are
+per-user agents, not LaunchDaemons: App Sandbox (the `appsandbox` backend) only initializes in a
+per-user launchd domain (`gui/<uid>` or, with no GUI login, `user/<uid>` with
+`LimitLoadToSessionType` `Background`); from the system domain `secinitd` refuses to register the
+sandboxed process. The worker-agent plist's header has the headless commands. The last
 two source **one** env file, so `serve` and `dispatch` can't disagree on the queue, the job root or
 an engine's `PARAM_KEYS`. A `static` dispatcher refuses to start until an agent answers `/healthz`,
 and the agent's `/healthz` waits on its engine's self-test (`warmup()`), so the dispatcher plist

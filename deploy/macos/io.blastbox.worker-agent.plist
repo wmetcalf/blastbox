@@ -8,9 +8,16 @@
     # edit the REPLACE_ME values below
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.blastbox.worker-agent.plist
 
-  A per-user agent, not a LaunchDaemon: Metal / Neural Engine access has only been verified
-  from a logged-in user session (a daemon context is untested). Run it as a dedicated user that
-  owns nothing else; per-job confinement is the seatbelt/appsandbox backend, not this agent.
+  A per-user agent, not a LaunchDaemon. App Sandbox (the appsandbox backend) only initializes in
+  a per-user launchd domain: from the system domain secinitd refuses to register the sandboxed
+  process (seen with William Tells' App-Sandboxed scanner); gui/<uid> and user/<uid> work. Metal
+  and the Neural Engine have been verified from those domains only. Run it as a dedicated user
+  that owns nothing else; per-job confinement is the seatbelt/appsandbox backend, not this agent.
+
+  Headless (no GUI login): add <key>LimitLoadToSessionType</key><string>Background</string> and
+    sudo launchctl bootstrap user/$(id -u worker) /Users/worker/Library/LaunchAgents/io.blastbox.worker-agent.plist
+  plus a one-shot RunAtLoad LaunchDaemon running that command at boot (the user domain isn't
+  started until something bootstraps into it).
 -->
 <plist version="1.0">
 <dict>
