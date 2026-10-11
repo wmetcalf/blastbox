@@ -175,3 +175,90 @@ def test_detect_still_runs_off_macos(monkeypatch):
         assert eng.detect_calls == 1
     finally:
         _stop(httpd)
+
+
+def test_a_selector_probe_during_a_job_is_not_confinement_credit(monkeypatch):
+    # An engine that calls select_sandbox() inside detonate() and then parses in-process: the
+    # selector's /usr/bin/true smoketest must not count as its confined run.
+    from blastbox.worker.sandbox import detect
+    from blastbox.worker.sandbox.base import SandboxResult, confined_runs
+
+    class _Counting:
+        name = "probe"
+        secure = True
+        insecurity_reasons: list[str] = []
+
+        def run(self, request):
+            note_confined_run()         # what seatbelt/appsandbox do for a real launch
+            return SandboxResult(exit_code=0, stdout=b"", stderr=b"")
+
+    before = confined_runs()
+    assert detect._smoketest(_Counting()) == (True, None)
+    assert confined_runs() == before
+
+    class SelectsThenParsesInProcess(_Engine):
+        def detonate(self, input, outdir, limits):
+            detect._smoketest(_Counting())
+            return super().detonate(input, outdir, limits)
+    httpd, port = _agent(SelectsThenParsesInProcess(confine=False))
+    try:
+        assert _detonate(port) == 500
+    finally:
+        _stop(httpd)
+
+
+def test_a_failed_required_warmup_is_retried_until_it_passes():
+    import time
+
+    class Flaky(_Engine):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def warmup(self):
+            self.calls += 1
+            if self.calls < 3:
+                raise RuntimeError("ANE busy")
+    eng = Flaky()
+    err = ha._warmup(eng, require_warmup=True)
+    httpd, port = _agent(eng, warmup_error=err)
+    stop = threading.Event()
+    try:
+        url = f"http://127.0.0.1:{port}/healthz"
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(url, timeout=10)
+        assert exc.value.code == 503
+        ha.retry_warmup(eng, httpd.RequestHandlerClass, first_s=0.05, max_s=0.1, stop=stop)
+        deadline = time.monotonic() + 10
+        while httpd.RequestHandlerClass.warmup_error is not None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert eng.calls == 3
+        with urllib.request.urlopen(url, timeout=10) as r:
+            assert r.status == 200
+    finally:
+        stop.set()
+        _stop(httpd)
+
+
+@pytest.mark.parametrize("name", ["BLASTBOX_WORKER_AGENT_REQUIRE_WARMUP",
+                                  "BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE"])
+def test_security_flags_are_parsed_strictly(monkeypatch, name):
+    for raw, want in (("1", True), ("YES", True), ("true", True), ("0", False), ("No", False),
+                      ("FALSE", False)):
+        monkeypatch.setenv(name, raw)
+        assert ha._env_flag(name, default=not want) is want
+    for raw in ("", "  "):
+        monkeypatch.setenv(name, raw)
+        assert ha._env_flag(name, default=True) is True
+    for raw in ("on", "enabled", "flase", "2"):
+        monkeypatch.setenv(name, raw)
+        with pytest.raises(SystemExit, match=name):
+            ha._env_flag(name, default=False)
+
+
+def test_a_mistyped_escape_hatch_stops_startup(monkeypatch):
+    class Plain(_Engine):
+        sandboxed_parsing = False
+    monkeypatch.setenv("BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE", "ture")
+    with pytest.raises(SystemExit, match="ALLOW_UNSANDBOXED_ENGINE"):
+        ha.serve(Plain(), bind="127.0.0.1", port=0)

@@ -442,8 +442,22 @@ def _guard_exposure(bind: str, port: int, *, token, client_ca, allow_cidrs, allo
                  where)
 
 
-def _truthy(raw: str | None) -> bool:
-    return (raw or "").strip().lower() in ("1", "true", "yes", "on")
+_TRUE_WORDS = ("1", "true", "yes")
+_FALSE_WORDS = ("0", "false", "no")
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """A security switch from the environment: 0/1/true/false/yes/no (any case); unset or empty
+    keeps ``default``. Anything else stops startup -- a typo must not silently pick a side."""
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in _TRUE_WORDS:
+        return True
+    if raw in _FALSE_WORDS:
+        return False
+    raise SystemExit(f"http_agent: {name}={os.environ.get(name)!r} is not one of "
+                     "0/1/true/false/yes/no; refusing to start")
 
 
 def _guard_unsandboxed_engine(engine: Engine) -> bool:
@@ -459,7 +473,7 @@ def _guard_unsandboxed_engine(engine: Engine) -> bool:
     """
     if host_platform() != "darwin":
         return False
-    if _truthy(os.environ.get("BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE")):
+    if _env_flag("BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE", False):
         _log.warning("http_agent: macOS with BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE=1 -- engine "
                      "%s may parse untrusted input in this unconfined process", engine.name)
         return False
@@ -489,6 +503,34 @@ def _warmup(engine: Engine, require_warmup: bool) -> str | None:
             return str(exc)[:500]
         _log.warning("http_agent: warmup failed (continuing cold): %s", exc)
     return None
+
+
+WARMUP_RETRY_FIRST_S = 30.0
+WARMUP_RETRY_MAX_S = 300.0
+
+
+def retry_warmup(engine: Engine, handler: type[_Handler], *,
+                 first_s: float = WARMUP_RETRY_FIRST_S, max_s: float = WARMUP_RETRY_MAX_S,
+                 stop: threading.Event | None = None) -> threading.Thread:
+    """While ``handler.warmup_error`` is set, rerun the required warmup with backoff
+    (``first_s`` doubling to ``max_s``); success clears it and /healthz turns 200. Runs under the
+    job lock, so a retry never overlaps a detonation."""
+    stop = stop or threading.Event()
+
+    def loop() -> None:
+        delay = first_s
+        while handler.warmup_error is not None and not stop.wait(delay):
+            with _JOB_LOCK:
+                err = _warmup(engine, require_warmup=True)
+            handler.warmup_error = err
+            if err is None:
+                _log.info("http_agent: warmup passed on retry; /healthz reports ready")
+                return
+            delay = min(max_s, delay * 2)
+
+    t = threading.Thread(target=loop, name="bb-warmup-retry", daemon=True)
+    t.start()
+    return t
 
 
 def serve(engine: Engine, *, bind: str = "0.0.0.0", port: int = 8765,
@@ -550,8 +592,7 @@ def main(argv: list[str] | None = None) -> int:
     # On macOS warmup is where an engine runs its known-positive self-test, and a failed one means
     # results can't be trusted, so it gates /healthz there by default
     # (BLASTBOX_WORKER_AGENT_REQUIRE_WARMUP=0/1 overrides on any platform).
-    raw_req = os.environ.get("BLASTBOX_WORKER_AGENT_REQUIRE_WARMUP")
-    require_warmup = _truthy(raw_req) if raw_req is not None else host_platform() == "darwin"
+    require_warmup = _env_flag("BLASTBOX_WORKER_AGENT_REQUIRE_WARMUP", host_platform() == "darwin")
     warmup_error = _warmup(engine, require_warmup)
     port = int(os.environ.get("BLASTBOX_WORKER_AGENT_PORT", "8765"))
     bind = os.environ.get("BLASTBOX_WORKER_AGENT_BIND", "0.0.0.0")
@@ -568,6 +609,10 @@ def main(argv: list[str] | None = None) -> int:
     httpd = serve(engine, bind=bind, port=port, token=token, max_bytes=max_bytes,
                   tls_cert=tls_cert, tls_key=tls_key, client_ca=client_ca, allow_cidrs=allow_cidrs,
                   timeout_s=timeout_s, warmup_error=warmup_error)
+    if warmup_error is not None and hasattr(engine, "warmup"):
+        # launchd/KeepAlive won't restart a live process, so a transient failure (a busy ANE, a
+        # slow first compile) would otherwise keep this Mac out of the pool until someone notices.
+        retry_warmup(engine, httpd.RequestHandlerClass)  # type: ignore[arg-type]  # serve() binds a _Handler subclass
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

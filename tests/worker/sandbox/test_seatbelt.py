@@ -355,3 +355,14 @@ def test_a_hidden_grandchild_is_metered_and_killed_during_the_run(monkeypatch):
         limits=Limits(timeout_s=40, memory_bytes=150 * 1024 * 1024)))
     assert r.killed and b"RSS" in r.stderr, r.stderr
     assert time.monotonic() - t0 < 30          # killed for memory, not by the timeout
+
+
+@needs_darwin
+def test_selecting_a_sandbox_is_not_a_confined_run(monkeypatch):
+    # select_sandbox()'s smoketest really launches /usr/bin/true under the profile; that probe
+    # must not give an engine confinement credit before its parser runs.
+    from blastbox.worker.sandbox.base import confined_runs
+    from blastbox.worker.sandbox.detect import select_sandbox
+    before = confined_runs()
+    assert select_sandbox(backend="seatbelt").name == "seatbelt"
+    assert confined_runs() == before

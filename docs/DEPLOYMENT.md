@@ -261,11 +261,15 @@ was granted.
   confined run (500, the job fails). A run counts only when it proves it ran confined: under
   `seatbelt` the target is started through a `/bin/sh` shim that sandbox-exec execs only after
   the profile attached, and the shim writes a per-run nonce into the scratch dir (a profile
-  sandbox-exec rejects never gets there); under `appsandbox`, a launch the launcher didn't refuse. `BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE=1` is the explicit escape hatch.
+  sandbox-exec rejects never gets there); under `appsandbox`, a launch the launcher didn't refuse.
+  `select_sandbox()`'s own `/usr/bin/true` probe never counts, so an engine that selects its
+  backend mid-job gets no credit before its parser has run. `BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE=1` is the explicit escape hatch.
 - The engine's optional `detect()` isn't called in the agent (it would parse the input outside
   any sandbox) unless the engine declares `sandboxed_detect = True`.
 - A failed `warmup()` (where an engine runs its known-positive self-test), or an engine with no
-  `warmup()` at all, makes `/healthz` answer 503, so the static pool skips that Mac. `BLASTBOX_WORKER_AGENT_REQUIRE_WARMUP=0/1` overrides
+  `warmup()` at all, makes `/healthz` answer 503, so the static pool skips that Mac. A failed
+  warmup is retried in the background (30 s, doubling to 5 min, never during a job) and `/healthz`
+  turns 200 once it passes; launchd's `KeepAlive` wouldn't restart a process that is still up. `BLASTBOX_WORKER_AGENT_REQUIRE_WARMUP=0/1` overrides
   the default (on for macOS, off elsewhere).
 - Each run's limits: an rlimit launcher sets `FSIZE`/`NOFILE`/`CPU`/`CORE` and a per-run
   `NPROC` allowance (no `preexec_fn` in the threaded agent); a watchdog caps the summed RSS of

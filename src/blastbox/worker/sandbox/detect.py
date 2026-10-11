@@ -38,7 +38,7 @@ import os
 import shutil
 from pathlib import Path
 from blastbox.errors import SandboxUnavailable
-from blastbox.worker.sandbox.base import Sandbox, SandboxRequest, host_platform
+from blastbox.worker.sandbox.base import Sandbox, SandboxRequest, host_platform, not_counted
 from blastbox.worker.sandbox.container import ContainerSandbox
 
 
@@ -175,6 +175,11 @@ def _smoketest(sb: Sandbox) -> tuple[bool, Exception | None]:
     to fix, not one to quietly bypass -- but "fix your profile" and "this backend does not
     work here" are different afternoons.
     """
+    with not_counted():         # a probe is not an engine's confined parse
+        return _smoketest_inner(sb)
+
+
+def _smoketest_inner(sb: Sandbox) -> tuple[bool, Exception | None]:
     # Prefer /usr/bin/true which works on merged-usr systems.
     true_path = "/usr/bin/true" if Path("/usr/bin/true").exists() else "/bin/true"
     err = _probe(sb, [true_path])

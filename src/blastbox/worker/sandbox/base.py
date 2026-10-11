@@ -5,7 +5,10 @@ import logging
 import os
 import signal
 import sys
+import contextlib
+import contextvars
 import threading
+from collections.abc import Iterator
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,6 +30,19 @@ def host_platform() -> str:
 
 _CONFINED_RUNS = 0
 _CONFINED_LOCK = threading.Lock()
+# Set while a run is a probe (select_sandbox's smoketest), not an engine's parse.
+_NOT_COUNTED: contextvars.ContextVar[bool] = contextvars.ContextVar("bb_not_counted", default=False)
+
+
+@contextlib.contextmanager
+def not_counted() -> Iterator[None]:
+    """Runs inside this block don't count as confined parses (a backend probe running
+    ``/usr/bin/true`` must not give an engine credit before its parser has run)."""
+    token = _NOT_COUNTED.set(True)
+    try:
+        yield
+    finally:
+        _NOT_COUNTED.reset(token)
 
 
 def note_confined_run() -> None:
@@ -34,6 +50,8 @@ def note_confined_run() -> None:
     outer isolation boundary (macOS), the agent uses the count to prove an ``ok`` result came
     from a sandboxed parse rather than from the engine's own (unconfined) process."""
     global _CONFINED_RUNS
+    if _NOT_COUNTED.get():
+        return
     with _CONFINED_LOCK:
         _CONFINED_RUNS += 1
 
