@@ -20,6 +20,7 @@ import pytest
 from blastbox.errors import SandboxError, SandboxUnavailable
 from blastbox.limits import Limits
 from blastbox.worker.sandbox import appsandbox as asb
+from blastbox.worker.sandbox import macos_common as mc
 from blastbox.worker.sandbox.base import Mount, SandboxRequest
 
 pytestmark = pytest.mark.host_platform
@@ -99,9 +100,9 @@ class _Popen:
         self.calls = []
 
     def __call__(self, argv, **kw):
-        self.calls.append((argv, kw))
-        kw.pop("preexec_fn", None)
-        return subprocess.Popen(argv[1:], **kw)
+        inner = mc.unwrap_launcher(argv)
+        self.calls.append((inner, kw))
+        return subprocess.Popen(inner[1:], **kw)
 
 
 class TestRunStaging:
@@ -236,3 +237,24 @@ def test_seed_and_capture_use_the_container_and_cannot_be_poisoned(real_sb, tmp_
     assert (seed / "Library" / "Caches" / "x" / "p").read_text() == "plan\n"
     r = sb.run(SandboxRequest(argv=["/bin/sh", "-c", 'cat "$HOME/Library/Caches/x/p"'], seed_home=seed))
     assert r.stdout == b"plan\n"
+
+
+def test_a_slot_that_cannot_be_wiped_is_retired(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    asb.prepare(root, slots=1, ro_paths=[], runner=_fake_runner([]))
+    sb = asb.AppSandboxSandbox(root=root, popen=_Popen(), home=tmp_path / "home", platform_ok=True,
+                               verify=False, slot_wait_s=0)
+    slot = sb.manifest.slots[0]
+
+    def stuck(path):
+        raise SandboxError(f"could not empty {path}: ['planted']")
+    monkeypatch.setattr(mc, "wipe_dir", stuck)
+    with pytest.raises(SandboxError, match="could not empty"):
+        sb.run(SandboxRequest(argv=["/bin/echo", "x"]))
+    assert asb.AppSandboxSandbox.retired_marker(slot).exists()
+    monkeypatch.undo()
+    # Never handed out again -- until `prepare` is re-run.
+    with pytest.raises(SandboxError, match="every appsandbox slot is retired"):
+        sb.run(SandboxRequest(argv=["/bin/echo", "x"]))
+    asb.prepare(root, slots=1, ro_paths=[], runner=_fake_runner([]))
+    assert not asb.AppSandboxSandbox.retired_marker(slot).exists()

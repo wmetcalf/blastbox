@@ -20,8 +20,10 @@ Darwin realities this module encodes (all measured on macOS 26 / Apple silicon):
 """
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import ctypes.util
+import json
 import logging
 import os
 import resource
@@ -150,6 +152,102 @@ def remove_tree(path: Path) -> None:
         _log.warning("macos sandbox: could not remove %s: %s", path, exc)
 
 
+def unlock_tree(path: Path) -> None:
+    """Clear user flags (``uchg``) and restore owner permissions under ``path``, never following
+    a symlink. A sandboxed child owns its files and can lock them; the worker (same uid) can undo
+    that, which is what makes a fail-closed wipe possible."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return
+    if hasattr(os, "lchflags"):
+        with contextlib.suppress(OSError):
+            os.lchflags(path, 0)
+    if stat.S_ISLNK(st.st_mode):
+        return
+    if stat.S_ISDIR(st.st_mode):
+        with contextlib.suppress(OSError):
+            os.chmod(path, 0o700)
+        with contextlib.suppress(OSError):
+            for child in os.listdir(path):
+                unlock_tree(path / child)
+    else:
+        with contextlib.suppress(OSError):
+            os.chmod(path, 0o600)
+
+
+def wipe_dir(path: Path) -> None:
+    """Empty ``path`` (keeping ``path`` itself) and PROVE it is empty, or raise ``SandboxError``.
+
+    For directories a later run reuses (an App Sandbox slot's ``io/`` and container): a run that
+    left something undeletable must not hand its state to the next one. A missing ``path`` is
+    clean."""
+    if not path.is_dir():
+        return
+    for child in list(path.iterdir()):
+        remove_tree(child)
+        if os.path.lexists(child):
+            unlock_tree(child)
+            remove_tree(child)
+    left = sorted(c.name for c in path.iterdir())
+    if left:
+        raise SandboxError(f"could not empty {path}: {left[:5]}")
+
+
+# Launches the child: a fresh, single-threaded interpreter applies the rlimits and execs.
+# Setting rlimits from a ``preexec_fn`` in the threaded worker agent is unsafe (the forked child
+# can deadlock on a lock another thread held), so the limits are applied here instead.
+_LIMITS_LAUNCHER = r"""
+import ctypes, ctypes.util, json, os, resource, sys
+cfg = json.loads(sys.argv[1])
+argv = sys.argv[2:]
+def setlim(res, val):
+    try:
+        soft, hard = resource.getrlimit(res)
+        v = val if hard == resource.RLIM_INFINITY else min(val, hard)
+        resource.setrlimit(res, (v, v))
+    except (ValueError, OSError):
+        pass
+setlim(resource.RLIMIT_FSIZE, cfg["fsize"])
+setlim(resource.RLIMIT_NOFILE, cfg["nofile"])
+setlim(resource.RLIMIT_CPU, cfg["cpu"])
+setlim(resource.RLIMIT_CORE, 0)
+# RLIMIT_NPROC is per-UID on Darwin: cap the uid at what it runs now plus this job's allowance.
+try:
+    lib = ctypes.CDLL(ctypes.util.find_library("proc") or "/usr/lib/libproc.dylib")
+    n = lib.proc_listpids(4, os.getuid(), None, 0)          # PROC_UID_ONLY -> bytes needed
+    if n > 0:
+        buf = (ctypes.c_int * (n // 4 + 64))()
+        got = lib.proc_listpids(4, os.getuid(), buf, ctypes.sizeof(buf))
+        if got > 0:
+            setlim(resource.RLIMIT_NPROC, got // 4 + cfg["nproc"])
+except OSError:
+    pass
+os.execve(argv[0], argv, os.environ)
+"""
+
+# Processes a run may create on top of the uid's current count (Darwin's NPROC is per-UID).
+NPROC_ALLOWANCE = 64
+# Per-stream cap on captured child output held in the worker's memory.
+MAX_CAPTURE_BYTES = 16 * 1024 * 1024
+# A run may create at most this many files/dirs in its writable dirs (inode-exhaustion guard).
+MAX_SCRATCH_ENTRIES = 200_000
+
+
+def limits_launcher_argv(limits: Limits, argv: list[str]) -> list[str]:
+    """``argv`` wrapped in the rlimit launcher (FSIZE, NOFILE, CPU, CORE, NPROC)."""
+    cfg = {"fsize": int(limits.tmpfs_bytes), "nofile": 4096, "cpu": int(limits.timeout_s) + 30,
+           "nproc": NPROC_ALLOWANCE}
+    return [sys.executable, "-I", "-S", "-c", _LIMITS_LAUNCHER, json.dumps(cfg), *argv]
+
+
+def unwrap_launcher(argv: list[str]) -> list[str]:
+    """The command inside a :func:`limits_launcher_argv` wrapper (for tests and diagnostics)."""
+    if len(argv) > 5 and argv[1:4] == ["-I", "-S", "-c"] and argv[4] == _LIMITS_LAUNCHER:
+        return argv[6:]
+    return argv
+
+
 def make_apply_rlimits(limits: Limits) -> Callable[[], None]:
     """``preexec_fn`` applying the rlimits Darwin enforces (not AS, not NPROC -- see module doc)."""
     tmpfs_bytes = limits.tmpfs_bytes
@@ -172,26 +270,75 @@ def make_apply_rlimits(limits: Limits) -> Callable[[], None]:
 
 def group_rss_bytes(pgid: int, ps_runner: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> int:
     """Sum RSS (bytes) of every live process in group ``pgid``; 0 when unknown."""
+    return sum(r.rss for r in process_table(ps_runner) if r.pgid == pgid)
+
+
+class _Proc:
+    __slots__ = ("pid", "ppid", "pgid", "rss")
+
+    def __init__(self, pid: int, ppid: int, pgid: int, rss: int) -> None:
+        self.pid, self.ppid, self.pgid, self.rss = pid, ppid, pgid, rss
+
+
+def process_table(ps_runner: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> list[_Proc]:
+    """Every process's pid, ppid, pgid and RSS (bytes); empty when ``ps`` fails."""
     try:
         out = ps_runner(
-            ["/bin/ps", "-A", "-o", "pgid=,rss="],
+            ["/bin/ps", "-A", "-o", "pid=,ppid=,pgid=,rss="],
             capture_output=True, text=True, timeout=5, check=False,
         ).stdout
     except (OSError, subprocess.SubprocessError):
-        return 0
-    total_kib = 0
+        return []
+    rows: list[_Proc] = []
     for line in out.splitlines():
         parts = line.split()
-        if len(parts) == 2 and parts[0] == str(pgid) and parts[1].isdigit():
-            total_kib += int(parts[1])
-    return total_kib * 1024
+        if len(parts) == 4 and all(p.isdigit() for p in parts):
+            pid, ppid, pgid, rss = (int(p) for p in parts)
+            rows.append(_Proc(pid, ppid, pgid, rss * 1024))
+    return rows
+
+
+def dir_usage(paths: Iterable[Path], max_entries: int) -> tuple[int, int]:
+    """(bytes, entries) under ``paths`` without following symlinks; stops counting at
+    ``max_entries`` + 1 so a directory bomb can't make the measurement itself expensive."""
+    total = entries = 0
+    stack = [str(p) for p in paths]
+    while stack:
+        top = stack.pop()
+        try:
+            it = os.scandir(top)
+        except OSError:
+            continue
+        with it:
+            for e in it:
+                entries += 1
+                if entries > max_entries:
+                    return total, entries
+                try:
+                    st = e.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                total += st.st_blocks * 512 if hasattr(st, "st_blocks") else st.st_size
+                if stat.S_ISDIR(st.st_mode):
+                    stack.append(e.path)
+    return total, entries
 
 
 class RssWatchdog:
-    """Poll a sandbox's process-group RSS and SIGKILL the group over ``limit_bytes``.
+    """Polls one sandboxed run and SIGKILLs everything it started when it goes over budget.
 
-    Darwin's stand-in for ``RLIMIT_AS`` / a cgroup memory cap. Polling means a burst between
-    samples can overshoot; it bounds a runaway decoder, it is not a hard ceiling.
+    Darwin has no cgroups and doesn't enforce ``RLIMIT_AS``, so this is the stand-in:
+
+    - **memory**: summed RSS of the run's *family* -- its process group plus every descendant,
+      including one that called ``setsid`` -- against ``limit_bytes``;
+    - **disk**: bytes and entries under ``watch_dirs`` (the run's writable dirs) against
+      ``disk_limit_bytes`` / ``MAX_SCRATCH_ENTRIES``. ``RLIMIT_FSIZE`` caps one file; this caps
+      the run;
+    - it records every family member it ever saw, so :meth:`kill_family` can reap descendants
+      that outlive the leader (reparented to launchd, or in their own session).
+
+    Polling means a burst between samples can overshoot; it bounds a runaway run, it is not a
+    hard ceiling.
     """
 
     def __init__(
@@ -199,16 +346,29 @@ class RssWatchdog:
         proc: subprocess.Popen[bytes],
         limit_bytes: int,
         *,
-        interval_s: float = 0.5,
-        rss_fn: Callable[[int], int] = group_rss_bytes,
+        interval_s: float = 0.25,
+        rss_fn: Callable[[int], int] | None = None,
+        watch_dirs: Iterable[Path] = (),
+        disk_limit_bytes: int | None = None,
+        table_fn: Callable[[], list[_Proc]] = process_table,
     ) -> None:
         self._proc = proc
         self._limit = limit_bytes
         self._interval = interval_s
         self._rss_fn = rss_fn
+        self._table_fn = table_fn
+        self._watch = list(watch_dirs)
+        self._disk_limit = disk_limit_bytes
         self._stop = threading.Event()
-        self.tripped = False
+        self.tripped: str | None = None     # "memory" / "disk" / None
         self.peak_bytes = 0
+        self.seen: set[int] = set()
+        try:
+            self._pgid = os.getpgid(proc.pid)
+        except (ProcessLookupError, OSError):
+            self._pgid = None
+        if self._pgid is not None and self._pgid == os.getpgid(0):
+            self._pgid = None   # never measure (or kill) the worker's own group
         self._thread = threading.Thread(target=self._loop, name="bb-rss-watchdog", daemon=True)
 
     def __enter__(self) -> RssWatchdog:
@@ -219,26 +379,87 @@ class RssWatchdog:
         self._stop.set()
         self._thread.join(timeout=2.0)
 
-    def _loop(self) -> None:
-        try:
-            pgid = os.getpgid(self._proc.pid)
-        except (ProcessLookupError, OSError):
+    def _family(self, table: list[_Proc]) -> list[_Proc]:
+        if self._pgid is None:
+            return []
+        members = {r.pid for r in table if r.pgid == self._pgid} | {self._proc.pid} | self.seen
+        by_parent: dict[int, list[_Proc]] = {}
+        for r in table:
+            by_parent.setdefault(r.ppid, []).append(r)
+        frontier = list(members)
+        while frontier:
+            for c in by_parent.get(frontier.pop(), []):
+                if c.pid not in members:
+                    members.add(c.pid)
+                    frontier.append(c.pid)
+        return [r for r in table if r.pid in members]
+
+    def _sample(self) -> None:
+        table = self._table_fn()
+        family = self._family(table)
+        self.seen.update(r.pid for r in family)
+        rss = self._rss_fn(self._pgid) if self._rss_fn else sum(r.rss for r in family)
+        self.peak_bytes = max(self.peak_bytes, rss)
+        if rss > self._limit:
+            self._trip("memory", f"RSS {rss} > limit {self._limit}")
             return
-        if pgid == os.getpgid(0):
-            return  # never measure (or kill) the worker's own group
+        if self._watch and self._disk_limit is not None:
+            used, entries = dir_usage(self._watch, MAX_SCRATCH_ENTRIES)
+            if used > self._disk_limit or entries > MAX_SCRATCH_ENTRIES:
+                self._trip("disk", f"writable dirs hold {used} bytes / {entries} entries "
+                                   f"(limit {self._disk_limit} bytes / {MAX_SCRATCH_ENTRIES} entries)")
+
+    def _trip(self, why: str, detail: str) -> None:
+        self.tripped = why
+        _log.warning("macos sandbox: %s; killing the run", detail)
+        self.kill_family()
+
+    def _loop(self) -> None:
+        if self._pgid is None:
+            return
         while not self._stop.wait(self._interval):
             if self._proc.poll() is not None:
                 return
-            rss = self._rss_fn(pgid)
-            self.peak_bytes = max(self.peak_bytes, rss)
-            if rss > self._limit:
-                self.tripped = True
-                _log.warning(
-                    "macos sandbox: RSS %d > limit %d; killing process group %d",
-                    rss, self._limit, pgid,
-                )
-                kill_sandbox_group(self._proc)
+            self._sample()
+            if self.tripped:
                 return
+
+    def kill_family(self) -> None:
+        """SIGKILL the run's process group and every family member still alive -- also after the
+        leader exited normally (a forked child that closed its pipes must not outlive the run)."""
+        if self._pgid is None:
+            return
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(self._pgid, signal.SIGKILL)
+        table = self._table_fn()
+        live = {r.pid for r in self._family(table)} - {os.getpid()}
+        for pid in live:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(pid, signal.SIGKILL)
+
+
+class _CappedReader(threading.Thread):
+    """Drains one pipe, keeping at most ``cap`` bytes; the rest is read and dropped so the child
+    never blocks on a full pipe and the worker's memory stays bounded."""
+
+    def __init__(self, stream, cap: int) -> None:
+        super().__init__(daemon=True, name="bb-capped-reader")
+        self._stream = stream
+        self._cap = cap
+        self.data = bytearray()
+        self.truncated = False
+
+    def run(self) -> None:
+        with contextlib.suppress(OSError, ValueError):
+            while True:
+                chunk = self._stream.read1(65536) if hasattr(self._stream, "read1") else self._stream.read(65536)
+                if not chunk:
+                    break
+                room = self._cap - len(self.data)
+                if room > 0:
+                    self.data += chunk[:room]
+                if len(chunk) > room:
+                    self.truncated = True
 
 
 def run_confined(
@@ -248,50 +469,65 @@ def run_confined(
     limits: Limits,
     cwd: Path,
     popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
-    rss_fn: Callable[[int], int] = group_rss_bytes,
+    rss_fn: Callable[[int], int] | None = None,
+    watch_dirs: Iterable[Path] = (),
+    max_output_bytes: int = MAX_CAPTURE_BYTES,
 ) -> SandboxResult:
     """Launch an already-confining ``argv`` with the shared lifecycle.
 
-    New session (so the timeout/RSS kill hits only the sandbox's group), stdin closed, every
-    inherited fd closed, rlimits in the child, wall-clock timeout, RSS watchdog.
+    New session; stdin closed; every inherited fd closed; rlimits (FSIZE, NOFILE, CPU, CORE,
+    NPROC) applied by a single-threaded launcher, not a ``preexec_fn``; wall-clock timeout;
+    memory + disk watchdog over the run's whole process family; output captured up to
+    ``max_output_bytes`` per stream; and the whole family killed before returning, even when
+    the leader exited normally.
     """
     try:
         proc = popen(
-            argv,
+            limits_launcher_argv(limits, argv),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             close_fds=True,
             env=dict(env),
             cwd=str(cwd),
-            preexec_fn=make_apply_rlimits(limits),
             start_new_session=True,
         )
     except (FileNotFoundError, PermissionError) as exc:
         raise SandboxError(f"failed to start sandboxed child: {exc}") from exc
 
+    out = _CappedReader(proc.stdout, max_output_bytes)
+    err = _CappedReader(proc.stderr, max_output_bytes)
+    out.start()
+    err.start()
     killed = False
-    with RssWatchdog(proc, limits.memory_bytes, rss_fn=rss_fn) as dog:
+    with RssWatchdog(proc, limits.memory_bytes, rss_fn=rss_fn, watch_dirs=watch_dirs,
+                     disk_limit_bytes=limits.tmpfs_bytes) as dog:
         try:
-            stdout, stderr = proc.communicate(timeout=limits.timeout_s)
-            exit_code = proc.returncode
+            exit_code = proc.wait(timeout=limits.timeout_s)
         except subprocess.TimeoutExpired:
             killed = True
+            dog.kill_family()
             kill_sandbox_group(proc)
             try:
-                stdout, stderr = proc.communicate(timeout=2.0)
+                proc.wait(timeout=5.0)
             except subprocess.TimeoutExpired:
-                stdout, stderr = b"", b""
+                pass
             exit_code = -int(signal.SIGKILL)
+    dog.kill_family()
+    out.join(timeout=5.0)
+    err.join(timeout=5.0)
+    stdout, stderr = bytes(out.data), bytes(err.data)
     if dog.tripped:
         killed = True
-        stderr = (stderr or b"") + (
-            f"\n[blastbox] killed: process-group RSS exceeded "
-            f"{limits.memory_bytes} bytes\n".encode()
-        )
-    return SandboxResult(
-        exit_code=exit_code, stdout=stdout or b"", stderr=stderr or b"", killed=killed,
-    )
+        what = ("process-family RSS exceeded " + str(limits.memory_bytes) + " bytes"
+                if dog.tripped == "memory" else
+                "writable dirs exceeded " + str(limits.tmpfs_bytes) + " bytes or "
+                + str(MAX_SCRATCH_ENTRIES) + " entries")
+        stderr += f"\n[blastbox] killed: {what}\n".encode()
+    for name, reader in (("stdout", out), ("stderr", err)):
+        if reader.truncated:
+            stderr += f"\n[blastbox] {name} truncated at {max_output_bytes} bytes\n".encode()
+    return SandboxResult(exit_code=exit_code, stdout=stdout, stderr=stderr, killed=killed)
 
 
 # --------------------------------------------------------------------------------------------

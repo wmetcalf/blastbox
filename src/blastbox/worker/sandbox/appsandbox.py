@@ -56,7 +56,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from blastbox.errors import SandboxError, SandboxUnavailable
-from blastbox.worker.sandbox.base import SandboxRequest, SandboxResult
+from blastbox.worker.sandbox.base import SandboxRequest, SandboxResult, note_confined_run
 from blastbox.worker.sandbox import macos_common as mc
 
 _log = logging.getLogger("blastbox.worker.sandbox.appsandbox")
@@ -223,6 +223,8 @@ def prepare(
         io_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         bundle = slot_dir / f"bb-slot-{i}.app"
         mc.remove_tree(bundle)
+        # A fresh prepare is the operator's "I inspected it": clear any retirement.
+        (root / "locks" / f"{i}.lock.retired").unlink(missing_ok=True)
         macos = bundle / "Contents" / "MacOS"
         macos.mkdir(parents=True)
         exe = macos / LAUNCHER_EXE
@@ -301,7 +303,7 @@ class AppSandboxSandbox:
         root: str | os.PathLike[str] | None = None,
         popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
         runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
-        rss_fn: Callable[[int], int] = mc.group_rss_bytes,
+        rss_fn: Callable[[int], int] | None = None,
         home: Path | None = None,
         slot_wait_s: float | None = None,
         platform_ok: bool = mc.IS_DARWIN,
@@ -337,11 +339,21 @@ class AppSandboxSandbox:
         return self._manifest
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def retired_marker(slot: Slot) -> Path:
+        """Present when a slot could not be proven clean; `blastbox macos prepare` clears it."""
+        return slot.lock_path.with_name(slot.lock_path.name + ".retired")
+
     @contextlib.contextmanager
     def _acquire_slot(self) -> Iterator[Slot]:
         deadline = time.monotonic() + self._slot_wait_s
         while True:
-            for slot in self._manifest.slots:
+            usable = [s for s in self._manifest.slots if not self.retired_marker(s).exists()]
+            if not usable:
+                raise SandboxError(
+                    "every appsandbox slot is retired (a run left state that could not be "
+                    "removed); inspect them, then re-run `blastbox macos prepare`")
+            for slot in usable:
                 fd = os.open(slot.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -362,11 +374,15 @@ class AppSandboxSandbox:
             time.sleep(0.05)
 
     def _wipe_slot(self, slot: Slot) -> None:
-        for d in (slot.io_dir, slot.container_data(self._home)):
-            if not d.is_dir():
-                continue
-            for child in d.iterdir():
-                mc.remove_tree(child)
+        """Empty the slot's io/ and container, or retire the slot and raise: a run that left
+        undeletable state (a ``uchg`` file, a locked dir) must not hand it to the next run."""
+        try:
+            for d in (slot.io_dir, slot.container_data(self._home)):
+                mc.wipe_dir(d)
+        except SandboxError as exc:
+            self.retired_marker(slot).write_text(f"{exc}\n")
+            _log.error("appsandbox: retired slot %s: %s", slot.bundle_id, exc)
+            raise
 
     def _check_exec_allowed(self, exe: Path) -> None:
         roots = [Path(d) for d in mc.SYSTEM_EXEC_DIRS] + list(self._manifest.ro_paths)
@@ -385,6 +401,7 @@ class AppSandboxSandbox:
         self._check_exec_allowed(exe)
         self._check_exec_allowed(exe_real)
 
+        note_confined_run()
         with self._acquire_slot() as slot:
             self._wipe_slot(slot)
             try:
@@ -426,7 +443,7 @@ class AppSandboxSandbox:
         argv = [str(slot.launcher), str(exe), *args]
         result = mc.run_confined(
             argv, env=env, limits=request.limits, cwd=home,
-            popen=self._popen, rss_fn=self._rss_fn,
+            popen=self._popen, rss_fn=self._rss_fn, watch_dirs=[io, container],
         )
 
         for src, staged in rw_staged:

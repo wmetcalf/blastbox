@@ -245,13 +245,31 @@ BLASTBOX_STATIC_WORKERS=127.0.0.1:8765             BLASTBOX_STATIC_WORKERS=mac1:
 Mac, plus `io.blastbox.ingress` and `io.blastbox.dispatcher` for a Mac-only deployment. The last
 two source **one** env file, so `serve` and `dispatch` can't disagree on the queue, the job root or
 an engine's `PARAM_KEYS`. A `static` dispatcher refuses to start until an agent answers `/healthz`,
-and the agent runs its engine's self-test first, so the dispatcher plist restarts on a throttle
-until the agent is up. Measured on a Mac with the William Tells engine (`williamtells`): ingress,
+and the agent's `/healthz` waits on its engine's self-test (`warmup()`), so the dispatcher plist
+restarts on a throttle until the agent is ready. Measured on a Mac with the William Tells engine (`williamtells`): ingress,
 SQLite queue, dispatcher and agent on one host, about 270 ms per image end to end, with signed
 attestation. **Per-job isolation lives in the sandbox, not the
 agent.** The agent is long-lived and only spools bytes and seals output; every engine subprocess
 gets a fresh profile, a fresh scratch `HOME`/`TMPDIR`/cache dir, no network, and only the paths it
 was granted.
+
+**What the agent enforces on macOS** (there is no runsc/Firecracker boundary around it):
+
+- `BLASTBOX_SANDBOX` only picks the backend an engine *may* use through `select_sandbox()`; it
+  confines nothing on its own. So the agent refuses to start an engine that doesn't declare
+  `sandboxed_parsing = True`, and refuses to serve an `ok` result produced without a single
+  confined run (500, the job fails). `BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE=1` is the
+  explicit escape hatch.
+- A failed `warmup()` (where an engine runs its known-positive self-test) makes `/healthz` answer
+  503, so the static pool skips that Mac. `BLASTBOX_WORKER_AGENT_REQUIRE_WARMUP=0/1` overrides
+  the default (on for macOS, off elsewhere).
+- Each run's limits: an rlimit launcher sets `FSIZE`/`NOFILE`/`CPU`/`CORE` and a per-run
+  `NPROC` allowance (no `preexec_fn` in the threaded agent); a watchdog caps the summed RSS of
+  the run's whole process family and the bytes/entries in its writable dirs (`tmpfs_bytes`);
+  captured output is capped per stream; and every process the run started is killed when it
+  ends, including one that outlived a normal exit or left its process group.
+- An `appsandbox` slot whose `io/` or container can't be proven empty after a run is retired
+  until `blastbox macos prepare` is re-run.
 
 **The agent can be native.** The dispatcher only sees the protocol: `GET /healthz`, and
 `POST /detonate` answered with a tar holding a `metadata.json` that passes the host trust gate.

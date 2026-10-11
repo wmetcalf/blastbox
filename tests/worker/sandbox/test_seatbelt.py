@@ -5,6 +5,7 @@ platform-independent.
 """
 from __future__ import annotations
 
+import io
 import os
 import subprocess
 import sys
@@ -15,6 +16,7 @@ import pytest
 from blastbox.errors import SandboxError, SandboxUnavailable
 from blastbox.limits import Limits
 from blastbox.worker.sandbox.base import Mount, SandboxRequest
+from blastbox.worker.sandbox import macos_common as mc
 from blastbox.worker.sandbox.seatbelt import SeatbeltSandbox, build_profile
 
 pytestmark = pytest.mark.host_platform
@@ -73,12 +75,16 @@ class TestProfile:
 
 class _FakeProc:
     def __init__(self, argv, **kwargs):
-        self.argv, self.kwargs = argv, kwargs
+        self.launched = argv
+        self.argv = mc.unwrap_launcher(argv)    # the command inside the rlimit launcher
+        self.kwargs = kwargs
         self.pid = os.getpid()      # the watchdog refuses to touch our own group
         self.returncode = 0
+        self.stdout = io.BytesIO(b"out")
+        self.stderr = io.BytesIO(b"")
 
-    def communicate(self, timeout=None):
-        return b"out", b""
+    def wait(self, timeout=None):
+        return 0
 
     def poll(self):
         return 0
@@ -110,6 +116,9 @@ class TestRunShape:
         env = calls[0].kwargs["env"]
         assert env["K"] == "v" and env["HOME"].startswith(str((tmp_path / "scratch").resolve()))
         assert calls[0].kwargs["start_new_session"] is True
+        # rlimits come from a single-threaded launcher, never a preexec_fn in the threaded agent
+        assert "preexec_fn" not in calls[0].kwargs
+        assert calls[0].launched[1:4] == ["-I", "-S", "-c"]
         assert calls[0].kwargs["stdin"] == subprocess.DEVNULL
         assert not any((tmp_path / "scratch").iterdir())   # scratch removed after the run
 

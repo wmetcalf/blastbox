@@ -5,6 +5,7 @@ Pure-logic tests run on any POSIX host; nothing here needs Seatbelt.
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 import sys
 import time
@@ -150,8 +151,70 @@ class TestLifecycle:
                             limits=Limits(timeout_s=10), cwd=tmp_path)
         assert r.exit_code == 0 and r.stdout == b"done\n"
 
+    def _alive(self, pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    def test_a_forked_child_does_not_outlive_a_normal_exit(self, tmp_path):
+        pidfile = tmp_path / "pid"
+        r = mc.run_confined(["/bin/sh", "-c", f'sleep 60 </dev/null >/dev/null 2>&1 & echo $! > {pidfile}; exit 0'],
+                            env={"PATH": mc.MINIMAL_PATH}, limits=Limits(timeout_s=10), cwd=tmp_path)
+        assert r.exit_code == 0 and not r.killed
+        pid = int(pidfile.read_text())
+        time.sleep(0.2)
+        assert not self._alive(pid)
+
+    def test_a_setsid_escapee_is_reaped(self, tmp_path):
+        # Leaves the process group, so only the watchdog's family tracking can find it.
+        pidfile = tmp_path / "pid"
+        code = (f"import os,time\npid=os.fork()\nif pid==0:\n os.setsid(); time.sleep(60)\n"
+                f"else:\n open({str(pidfile)!r},'w').write(str(pid)); time.sleep(1)\n")
+        r = mc.run_confined([sys.executable, "-I", "-c", code], env={"PATH": mc.MINIMAL_PATH},
+                            limits=Limits(timeout_s=10), cwd=tmp_path)
+        assert r.exit_code == 0
+        pid = int(pidfile.read_text())
+        time.sleep(0.2)
+        assert not self._alive(pid)
+
+    def test_captured_output_is_bounded(self, tmp_path):
+        r = mc.run_confined(["/bin/sh", "-c", "head -c 5000000 /dev/zero"], env={"PATH": mc.MINIMAL_PATH},
+                            limits=Limits(timeout_s=10), cwd=tmp_path, max_output_bytes=1000)
+        assert len(r.stdout) == 1000
+        assert b"stdout truncated at 1000 bytes" in r.stderr
+
+    def test_disk_watchdog_caps_the_whole_run(self, tmp_path):
+        # Many files, each under RLIMIT_FSIZE, adding up past tmpfs_bytes.
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        r = mc.run_confined(["/bin/sh", "-c", "i=0; while [ $i -lt 400 ]; do head -c 200000 /dev/zero > f$i; i=$((i+1)); done; sleep 30"],
+                            env={"PATH": mc.MINIMAL_PATH}, limits=Limits(timeout_s=20, tmpfs_bytes=10_000_000),
+                            cwd=scratch, watch_dirs=[scratch])
+        assert r.killed
+        assert b"writable dirs exceeded" in r.stderr
+
+    def test_process_count_is_capped(self, tmp_path):
+        r = mc.run_confined(["/bin/sh", "-c", "i=0; while [ $i -lt 300 ]; do sleep 5 & i=$((i+1)); done; wait"],
+                            env={"PATH": mc.MINIMAL_PATH}, limits=Limits(timeout_s=20), cwd=tmp_path)
+        assert b"fork" in r.stderr.lower() or b"resource temporarily unavailable" in r.stderr.lower()
+
+    def test_rlimits_come_from_the_launcher_not_preexec_fn(self, tmp_path):
+        seen = {}
+
+        def popen(argv, **kw):
+            seen.update(kw)
+            return subprocess.Popen(argv, **kw)
+        r = mc.run_confined([sys.executable, "-I", "-c",
+                             "import resource; print(resource.getrlimit(resource.RLIMIT_FSIZE)[0])"],
+                            env={"PATH": mc.MINIMAL_PATH}, limits=Limits(timeout_s=10, tmpfs_bytes=12345678),
+                            cwd=tmp_path, popen=popen)
+        assert "preexec_fn" not in seen
+        assert r.stdout.strip() == b"12345678"
+
     def test_group_rss_parses_ps(self):
-        fake = subprocess.CompletedProcess([], 0, stdout="  42  100\n  42  50\n  7 9999\n")
+        fake = subprocess.CompletedProcess([], 0, stdout="  1 0 42  100\n  2 1 42  50\n  3 1 7 9999\n")
         assert mc.group_rss_bytes(42, ps_runner=lambda *a, **k: fake) == 150 * 1024
 
 
@@ -188,3 +251,28 @@ class TestSeedAndCapture:
     def test_none_is_a_no_op(self, tmp_path):
         mc.seed_scratch(tmp_path, None, 0)
         mc.capture_scratch(tmp_path, None, 0)
+
+
+class TestWipeDir:
+    def test_unlocks_and_empties(self, tmp_path):
+        d = tmp_path / "slot"
+        (d / "locked").mkdir(parents=True)
+        f = d / "locked" / "immutable"
+        f.write_text("x")
+        os.chflags(f, stat.UF_IMMUTABLE)
+        os.chmod(d / "locked", 0)
+        (d / "link").symlink_to("/etc/hosts")
+        mc.wipe_dir(d)
+        assert list(d.iterdir()) == []
+        assert os.path.exists("/etc/hosts")
+
+    def test_missing_is_clean(self, tmp_path):
+        mc.wipe_dir(tmp_path / "nope")
+
+    def test_what_cannot_be_removed_raises(self, tmp_path, monkeypatch):
+        d = tmp_path / "slot"
+        d.mkdir()
+        (d / "stuck").write_text("x")
+        monkeypatch.setattr(mc, "remove_tree", lambda p: None)
+        with pytest.raises(SandboxError, match="could not empty"):
+            mc.wipe_dir(d)

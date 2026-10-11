@@ -384,11 +384,13 @@ when a netpolicy grants egress: there is no netd/rooter there to steer it.
 | `BLASTBOX_MACOS_SCRATCH_DIR` | `$TMPDIR` | Parent of each run's fresh 0700 scratch dir (the child's `HOME`, `TMPDIR`, `CFFIXED_USER_HOME` → framework caches). Deleted after every run. |
 | `BLASTBOX_APPSANDBOX_ROOT` | `~/Library/Application Support/blastbox/appsandbox` | Slot root written by `blastbox macos prepare` (manifest, signed launcher bundles, per-slot `io/`, locks). Must not overlap any `--ro` path. |
 | `BLASTBOX_APPSANDBOX_SLOT_WAIT_S` | `30` | How long a run waits for a free slot before failing. Concurrency == `prepare --slots`. |
+| `BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE` | `0` | macOS only: let the agent serve an engine that doesn't declare `sandboxed_parsing = True` (it may then parse hostile input inside the agent). |
+| `BLASTBOX_WORKER_AGENT_REQUIRE_WARMUP` | `1` on macOS, `0` elsewhere | A failed `engine.warmup()` makes `/healthz` 503 instead of continuing cold. |
 
 `SandboxRequest.accelerators` (`{"gpu", "ane"}`) is default-deny: `seatbelt` opens exactly the
 Metal / Neural Engine driver clients and services each needs; `appsandbox` (Apple's application
 profile) already permits both. Memory: Darwin does not enforce `RLIMIT_AS`, so
-`Limits.memory_bytes` is enforced by polling the sandbox's process-group RSS (SIGKILL when over).
+`Limits.memory_bytes` is enforced by polling the summed RSS of the run's whole process family, and `tmpfs_bytes` by polling its writable dirs (SIGKILL when over).
 `SandboxRequest.seed_home` / `capture_home` (macOS only) clone a warm cache into each fresh run and
 capture one from a **trusted** run. Vision's Neural Engine plan drops from ~1.1 s to ~0.1–0.15 s per
 image, with no state flowing back between jobs.

@@ -5,6 +5,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +23,24 @@ def host_platform() -> str:
     any host, and so the Linux and macOS backends agree on a single answer.
     """
     return "darwin" if sys.platform == "darwin" else "linux"
+
+
+_CONFINED_RUNS = 0
+_CONFINED_LOCK = threading.Lock()
+
+
+def note_confined_run() -> None:
+    """Called by a backend that confines a run itself (seatbelt, appsandbox): on a host with no
+    outer isolation boundary (macOS), the agent uses the count to prove an ``ok`` result came
+    from a sandboxed parse rather than from the engine's own (unconfined) process."""
+    global _CONFINED_RUNS
+    with _CONFINED_LOCK:
+        _CONFINED_RUNS += 1
+
+
+def confined_runs() -> int:
+    with _CONFINED_LOCK:
+        return _CONFINED_RUNS
 
 
 def kill_sandbox_group(proc) -> None:

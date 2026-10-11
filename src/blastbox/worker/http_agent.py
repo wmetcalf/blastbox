@@ -45,6 +45,7 @@ from blastbox.limits import Limits
 from blastbox.worker.engine import Engine
 from blastbox.worker.harness import run_detonation
 from blastbox.worker.load import load_engine
+from blastbox.worker.sandbox.base import confined_runs, host_platform
 
 _log = logging.getLogger("blastbox.worker.http_agent")
 
@@ -129,6 +130,10 @@ def _on_hard_deadline(hard_s: float) -> None:
 class _Handler(BaseHTTPRequestHandler):
     engine: Engine = None  # type: ignore[assignment]  # set on the server
     token: str | None = None
+    # macOS (no outer isolation boundary): an `ok` result must come from a sandboxed run.
+    require_confined: bool = False
+    # Set when warmup (an engine's known-positive self-test) failed and health is gated on it.
+    warmup_error: str | None = None
     max_bytes: int = _DEFAULT_MAX_BYTES
     allow_nets: list = []  # peer-IP allowlist (empty = allow any; mTLS is the stronger gate)
     # Socket read timeout (StreamRequestHandler.setup() applies it): a stalled/slowloris request body
@@ -177,6 +182,12 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if not self._authed():
                 self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+                return
+            if self.warmup_error is not None:
+                # Not ready: a static pool skips this box instead of feeding it jobs whose
+                # results can't be trusted (e.g. a sandbox that silently lost a grant).
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                           {"ok": False, "engine": self.engine.name, "warmup": "failed"})
                 return
             self._json(HTTPStatus.OK, {"ok": True, "engine": self.engine.name})
         else:
@@ -294,6 +305,7 @@ class _Handler(BaseHTTPRequestHandler):
                 if _wd is not None:
                     _wd.daemon = True
                     _wd.start()
+                confined_before = confined_runs()
                 try:
                     rc = run_detonation(self.engine, input_path=in_path, output_dir=out_dir, limits=limits)
                 finally:
@@ -302,6 +314,15 @@ class _Handler(BaseHTTPRequestHandler):
             if rc != 0:
                 # harness could not seal metadata.json -- surface as a job failure, not a silent 200
                 raise RuntimeError(f"harness failed (rc={rc}); metadata.json not sealed")
+            if self.require_confined and confined_runs() == confined_before:
+                # No outer boundary on this host: an `ok` result produced without a single
+                # sandboxed run means the engine parsed the input in this (unconfined) process.
+                try:
+                    status = json.loads((out_dir / "metadata.json").read_bytes()).get("status")
+                except (OSError, ValueError):
+                    status = None
+                if status == "ok":
+                    raise RuntimeError("engine returned ok without a confined run; refusing the result")
             # tar the sealed output dir (metadata.json + artifacts) into a SPOOLED file (spills to disk
             # past 64MB) rather than a full in-memory BytesIO, and CAP the total so a buggy engine that
             # leaves huge undeclared files in out_dir can't OOM the agent. The host re-enforces its own
@@ -409,11 +430,42 @@ def _guard_exposure(bind: str, port: int, *, token, client_ca, allow_cidrs, allo
                  where)
 
 
+def _truthy(raw: str | None) -> bool:
+    return (raw or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _guard_unsandboxed_engine(engine: Engine) -> bool:
+    """On macOS, refuse an engine that doesn't sandbox its parsing; return whether each job must
+    prove a confined run.
+
+    A Linux agent sits inside a runsc/Firecracker boundary, so an engine that parses in-process is
+    still contained. A Mac has no outer boundary: ``BLASTBOX_SANDBOX`` only selects the backend an
+    engine *may* use through ``select_sandbox()``, it confines nothing by itself. So an engine must
+    declare ``sandboxed_parsing = True`` (it runs every untrusted parse through ``select_sandbox()``)
+    and each ``ok`` result must coincide with a confined run.
+    ``BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE=1`` is the explicit, logged escape hatch.
+    """
+    if host_platform() != "darwin":
+        return False
+    if _truthy(os.environ.get("BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE")):
+        _log.warning("http_agent: macOS with BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE=1 -- engine "
+                     "%s may parse untrusted input in this unconfined process", engine.name)
+        return False
+    if not getattr(engine, "sandboxed_parsing", False):
+        raise SystemExit(
+            f"http_agent: refusing engine {engine.name!r} on macOS: it does not declare "
+            "sandboxed_parsing = True. There is no outer isolation boundary here, so an engine that "
+            "parses in-process would run hostile input in this long-lived agent. Run every parse "
+            "through select_sandbox() and declare it, or set "
+            "BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE=1 to accept the risk.")
+    return True
+
+
 def serve(engine: Engine, *, bind: str = "0.0.0.0", port: int = 8765,
           token: str | None = None, max_bytes: int = _DEFAULT_MAX_BYTES,
           tls_cert: str | None = None, tls_key: str | None = None,
           client_ca: str | None = None, allow_cidrs: str | None = None,
-          timeout_s: float = 300.0) -> ThreadingHTTPServer:
+          timeout_s: float = 300.0, warmup_error: str | None = None) -> ThreadingHTTPServer:
     """Serve the engine. ``tls_cert``/``tls_key`` enable HTTPS; adding ``client_ca`` requires a
     CA-signed **client** cert (mTLS). ``allow_cidrs`` restricts which peer IPs may POST /detonate.
     ``timeout_s`` bounds a request's socket reads so a slowloris body can't hold the job lock forever."""
@@ -431,9 +483,11 @@ def serve(engine: Engine, *, bind: str = "0.0.0.0", port: int = 8765,
         "1", "true", "yes", "on")
     _guard_exposure(bind, port, token=token, client_ca=client_ca, allow_cidrs=allow_cidrs,
                     allow_insecure=allow_insecure)
+    require_confined = _guard_unsandboxed_engine(engine)
     handler = type("_BoundHandler", (_Handler,),
                    {"engine": engine, "token": token, "max_bytes": max_bytes,
-                    "allow_nets": _parse_cidrs(allow_cidrs), "timeout": timeout_s})
+                    "allow_nets": _parse_cidrs(allow_cidrs), "timeout": timeout_s,
+                    "require_confined": require_confined, "warmup_error": warmup_error})
     httpd = ThreadingHTTPServer((bind, port), handler)
     if tls_cert and tls_key:
         from blastbox.tls import server_ssl_context
@@ -463,11 +517,21 @@ def main(argv: list[str] | None = None) -> int:
     if not spec:
         raise SystemExit("BLASTBOX_ENGINE=module:Class is required")
     engine = load_engine(spec)
+    # On macOS warmup is where an engine runs its known-positive self-test, and a failed one means
+    # results can't be trusted, so it gates /healthz there by default
+    # (BLASTBOX_WORKER_AGENT_REQUIRE_WARMUP=0/1 overrides on any platform).
+    raw_req = os.environ.get("BLASTBOX_WORKER_AGENT_REQUIRE_WARMUP")
+    require_warmup = _truthy(raw_req) if raw_req is not None else host_platform() == "darwin"
+    warmup_error: str | None = None
     if hasattr(engine, "warmup"):
         try:
             engine.warmup()
         except Exception as exc:  # noqa: BLE001 -- warmup is best-effort (fail-open to cold)
-            _log.warning("http_agent: warmup failed (continuing cold): %s", exc)
+            if require_warmup:
+                warmup_error = str(exc)[:500]
+                _log.error("http_agent: warmup failed; /healthz reports NOT ready: %s", exc)
+            else:
+                _log.warning("http_agent: warmup failed (continuing cold): %s", exc)
     port = int(os.environ.get("BLASTBOX_WORKER_AGENT_PORT", "8765"))
     bind = os.environ.get("BLASTBOX_WORKER_AGENT_BIND", "0.0.0.0")
     token = os.environ.get("BLASTBOX_WORKER_AGENT_TOKEN") or None
@@ -482,7 +546,7 @@ def main(argv: list[str] | None = None) -> int:
     timeout_s = float(os.environ.get("BLASTBOX_WORKER_AGENT_TIMEOUT_S") or "300")
     httpd = serve(engine, bind=bind, port=port, token=token, max_bytes=max_bytes,
                   tls_cert=tls_cert, tls_key=tls_key, client_ca=client_ca, allow_cidrs=allow_cidrs,
-                  timeout_s=timeout_s)
+                  timeout_s=timeout_s, warmup_error=warmup_error)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

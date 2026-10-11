@@ -41,7 +41,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from blastbox.errors import SandboxError, SandboxUnavailable
-from blastbox.worker.sandbox.base import SandboxRequest, SandboxResult
+from blastbox.worker.sandbox.base import SandboxRequest, SandboxResult, note_confined_run
 from blastbox.worker.sandbox import macos_common as mc
 
 _log = logging.getLogger("blastbox.worker.sandbox.seatbelt")
@@ -156,7 +156,7 @@ class SeatbeltSandbox:
         sandbox_exec: str = _SANDBOX_EXEC,
         scratch_base: str | os.PathLike[str] | None = None,
         popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
-        rss_fn: Callable[[int], int] = mc.group_rss_bytes,
+        rss_fn: Callable[[int], int] | None = None,
         platform_ok: bool = mc.IS_DARWIN,
     ) -> None:
         if not platform_ok:
@@ -198,6 +198,7 @@ class SeatbeltSandbox:
                     f"seatbelt supports identity mounts only (source == target): {m}"
                 )
 
+        note_confined_run()
         scratch = mc.make_scratch(self._scratch_base)
         try:
             mc.seed_scratch(scratch, request.seed_home, request.limits.tmpfs_bytes)
@@ -216,6 +217,7 @@ class SeatbeltSandbox:
             result = mc.run_confined(
                 argv, env=env, limits=request.limits, cwd=scratch,
                 popen=self._popen, rss_fn=self._rss_fn,
+                watch_dirs=[scratch, *(Path(p) for p in rw)],
             )
             if result.exit_code == 0 and not result.killed:
                 mc.capture_scratch(scratch, request.capture_home, request.limits.tmpfs_bytes)

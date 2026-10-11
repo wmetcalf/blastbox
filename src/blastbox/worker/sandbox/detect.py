@@ -60,8 +60,10 @@ def _all_backends() -> tuple[str, ...]:
     return _DARWIN_BACKENDS if host_platform() == "darwin" else _LINUX_BACKENDS
 
 
+# `container` means "trust the enclosing OCI boundary (runsc / Firecracker)": there is none on a
+# Mac, where it would be a plain host subprocess, so it is Linux-only too.
 _PLATFORM_OF = {
-    **{name: "linux" for name in ("nsjail", "bwrap", "nono")},
+    **{name: "linux" for name in ("nsjail", "bwrap", "nono", "container")},
     **{name: "darwin" for name in _DARWIN_BACKENDS},
 }
 

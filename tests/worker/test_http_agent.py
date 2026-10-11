@@ -23,6 +23,14 @@ from blastbox.worker.engine import DetonationResult
 from blastbox.worker.http_agent import serve
 
 
+@pytest.fixture(autouse=True)
+def _linux_agent(monkeypatch):
+    """These tests cover the platform-neutral agent: simulate a Linux worker (inside its
+    runsc/Firecracker boundary) even on a Mac dev box. test_http_agent_darwin.py covers macOS."""
+    import blastbox.worker.http_agent as ha
+    monkeypatch.setattr(ha, "host_platform", lambda: "linux")
+
+
 class _NoopEngine:
     name = "test-noop"
     formats = frozenset({"*"})
