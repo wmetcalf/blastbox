@@ -25,6 +25,7 @@ from pathlib import Path
 
 from blastbox.errors import SandboxError, SandboxUnavailable
 from blastbox.limits import Limits
+from blastbox.worker.sandbox.appsandbox import AppSandboxNotPrepared
 from blastbox.worker.sandbox.base import Mount, Sandbox, SandboxRequest
 
 
@@ -34,6 +35,9 @@ class Check:
     name: str
     ok: bool
     detail: str = ""
+    # Set on an appsandbox "backend available" failure that only means "not prepared" (no
+    # manifest): not a failure unless the backend was asked for explicitly.
+    unprepared: bool = False
 
 
 def _probe_backend(sb: Sandbox, self_test: list[str] | None,
@@ -108,7 +112,8 @@ def doctor(*, backends: list[str], self_test: list[str] | None, accelerators: fr
         try:
             sb = (make or _make)(name)
         except (SandboxUnavailable, SandboxError) as exc:
-            checks.append(Check(name, "backend available", False, str(exc)))
+            checks.append(Check(name, "backend available", False, str(exc),
+                                unprepared=isinstance(exc, AppSandboxNotPrepared)))
             continue
         checks.append(Check(name, "backend available", True))
         checks.extend(_probe_backend(sb, self_test, accelerators, ro))
@@ -150,9 +155,9 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             if c.detail and not c.ok:
                 line += f"\n         {c.detail}"
             print(line)
-    # A backend that is merely not prepared is not a failure unless it was asked for.
-    failed = [c for c in checks if not c.ok and not (
-        not args.backend and c.name == "backend available" and c.backend == "appsandbox")]
+    # An appsandbox that is merely not prepared is not a failure unless it was asked for; a
+    # prepared one that is broken (launcher missing, bad signature, old manifest) always is.
+    failed = [c for c in checks if not c.ok and not (not args.backend and c.unprepared)]
     return 1 if failed else 0
 
 

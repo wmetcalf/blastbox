@@ -56,3 +56,36 @@ def test_non_darwin_reports_instead_of_crashing(monkeypatch):
     checks = macos_tool.doctor(backends=["seatbelt"], self_test=None,
                                accelerators=frozenset(), ro=[])
     assert len(checks) == 1 and not checks[0].ok
+
+
+def _doctor_exit(monkeypatch, exc):
+    def fake_doctor(**kw):
+        return [macos_tool.Check("seatbelt", "backend available", True),
+                macos_tool.Check("appsandbox", "backend available", False, str(exc),
+                                 unprepared=isinstance(exc, macos_tool.AppSandboxNotPrepared))]
+    monkeypatch.setattr(macos_tool, "doctor", fake_doctor)
+    return macos_tool.main(["doctor"])
+
+
+def test_an_unprepared_appsandbox_does_not_fail_the_default_doctor(monkeypatch, capsys):
+    assert _doctor_exit(monkeypatch, macos_tool.AppSandboxNotPrepared("not prepared")) == 0
+
+
+def test_a_broken_prepared_appsandbox_fails_the_default_doctor(monkeypatch, capsys):
+    from blastbox.errors import SandboxUnavailable
+    assert _doctor_exit(monkeypatch, SandboxUnavailable("slot 0: signature invalid")) == 1
+
+
+def test_doctor_marks_only_a_missing_manifest_as_unprepared(tmp_path):
+    import json
+    from blastbox.worker.sandbox import appsandbox as asb
+    if sys.platform != "darwin":
+        pytest.skip("needs macOS")
+    missing = macos_tool.doctor(backends=["appsandbox"], self_test=None, accelerators=frozenset(),
+                                ro=[], appsandbox_root=tmp_path / "none")
+    assert missing[0].unprepared is True
+    (tmp_path / "old").mkdir()
+    (tmp_path / "old" / asb.MANIFEST_NAME).write_text(json.dumps({"version": 999}))
+    old = macos_tool.doctor(backends=["appsandbox"], self_test=None, accelerators=frozenset(),
+                            ro=[], appsandbox_root=tmp_path / "old")
+    assert old[0].ok is False and old[0].unprepared is False

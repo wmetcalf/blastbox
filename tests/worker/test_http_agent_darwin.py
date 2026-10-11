@@ -118,3 +118,60 @@ def test_failed_warmup_makes_healthz_not_ready():
         assert json.loads(exc.value.read())["warmup"] == "failed"
     finally:
         _stop(httpd)
+
+
+def test_a_required_warmup_that_the_engine_lacks_is_not_ready():
+    # _Engine has no warmup(): when the self-test gate is on, that is "not ready", not "passed".
+    assert ha._warmup(_Engine(), require_warmup=True) == "engine has no warmup self-test"
+    assert ha._warmup(_Engine(), require_warmup=False) is None
+
+
+def test_warmup_errors_gate_only_when_required():
+    class Boom(_Engine):
+        def warmup(self):
+            raise RuntimeError("self-test decoded nothing")
+    assert "decoded nothing" in ha._warmup(Boom(), require_warmup=True)
+    assert ha._warmup(Boom(), require_warmup=False) is None
+
+
+class _Detecting(_Engine):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.detect_calls = 0
+
+    def detect(self, input_path: Path):
+        self.detect_calls += 1
+        return None
+
+
+def test_optional_detect_is_not_run_in_the_agent_on_macos():
+    eng = _Detecting()
+    httpd, port = _agent(eng)
+    try:
+        assert _detonate(port) == 200
+        assert eng.detect_calls == 0
+    finally:
+        _stop(httpd)
+
+
+def test_an_engine_may_declare_its_detect_sandboxed():
+    class Declared(_Detecting):
+        sandboxed_detect = True
+    eng = Declared()
+    httpd, port = _agent(eng)
+    try:
+        assert _detonate(port) == 200
+        assert eng.detect_calls == 1
+    finally:
+        _stop(httpd)
+
+
+def test_detect_still_runs_off_macos(monkeypatch):
+    monkeypatch.setattr(ha, "host_platform", lambda: "linux")
+    eng = _Detecting()
+    httpd, port = _agent(eng)
+    try:
+        assert _detonate(port) == 200
+        assert eng.detect_calls == 1
+    finally:
+        _stop(httpd)

@@ -9,6 +9,7 @@ import io
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -113,8 +114,10 @@ class TestRunShape:
         assert argv[dashdash + 2:] == ["hi"]
         params = dict(a.split("=", 1) for a in argv[3:dashdash] if a != "-D")
         assert str(data.resolve()) in params.values()
-        env = calls[0].kwargs["env"]
+        # the request env reaches the target through the launcher, never the launcher itself
+        env = mc.launcher_child_env(calls[0].launched)
         assert env["K"] == "v" and env["HOME"].startswith(str((tmp_path / "scratch").resolve()))
+        assert calls[0].kwargs["env"] == mc.LAUNCHER_ENV
         assert calls[0].kwargs["start_new_session"] is True
         # rlimits come from a single-threaded launcher, never a preexec_fn in the threaded agent
         assert "preexec_fn" not in calls[0].kwargs
@@ -217,3 +220,63 @@ def test_a_child_cannot_modify_its_seed(tmp_path):
     nxt = sb.run(SandboxRequest(
         argv=["/bin/sh", "-c", 'cat "$HOME/Library/Caches/x/p"'], seed_home=seed))
     assert nxt.stdout == b"plan\n"                                            # next run clean
+
+
+class TestConfinedRunCounter:
+    def _sb(self, tmp_path, popen):
+        return SeatbeltSandbox(popen=popen, platform_ok=True, sandbox_exec="/bin/sh",
+                               scratch_base=tmp_path / "scratch")
+
+    def test_counted_after_a_launch(self, tmp_path):
+        from blastbox.worker.sandbox.base import confined_runs
+        before = confined_runs()
+        self._sb(tmp_path, lambda argv, **kw: _FakeProc(argv, **kw)).run(
+            SandboxRequest(argv=["/bin/echo"]))
+        assert confined_runs() == before + 1
+
+    def test_not_counted_when_nothing_was_launched(self, tmp_path):
+        # An engine that catches this and parses in-process must not look confined.
+        from blastbox.worker.sandbox.base import confined_runs
+        before = confined_runs()
+
+        def no_popen(argv, **kw):
+            raise PermissionError("denied")
+        with pytest.raises(SandboxError):
+            self._sb(tmp_path, no_popen).run(SandboxRequest(argv=["/bin/echo"]))
+        not_a_dir = tmp_path / "seed-file"
+        not_a_dir.write_text("x")
+        with pytest.raises(SandboxError):
+            self._sb(tmp_path, lambda argv, **kw: _FakeProc(argv, **kw)).run(
+                SandboxRequest(argv=["/bin/echo"], seed_home=not_a_dir))
+        assert confined_runs() == before
+
+
+# fork, setsid, close every inherited fd, let the leader exit at once, then linger
+_ESCAPE = ("use POSIX; my $pid = fork(); "
+           "if ($pid) { select(undef, undef, undef, 0.01) until -s $ARGV[0]; exit 0 } "
+           "POSIX::setsid(); close STDIN; close STDOUT; close STDERR; "
+           "open(my $f, '>', $ARGV[0] . '.tmp') or die; print $f $$; close $f; "
+           "rename($ARGV[0] . '.tmp', $ARGV[0]); sleep 30;")
+
+
+def _gone(pid: int) -> bool:
+    out = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(pid)], capture_output=True,
+                         text=True).stdout.strip()
+    return not out or out.startswith("Z")
+
+
+@needs_darwin
+def test_an_escapee_the_watchdog_never_saw_is_swept(tmp_path, monkeypatch):
+    # Blind the watchdog entirely: only the post-run sandbox sweep can find the orphan.
+    monkeypatch.setattr(mc.RssWatchdog, "_sample", lambda self: None)
+    rw = tmp_path / "rw"
+    rw.mkdir()
+    pidfile = rw / "pid"
+    r = SeatbeltSandbox().run(SandboxRequest(argv=["/usr/bin/perl", "-e", _ESCAPE, str(pidfile)],
+                                             rw_mounts=[Mount(rw, rw)]))
+    assert r.exit_code == 0, r.stderr
+    pid = int(pidfile.read_text())
+    deadline = time.monotonic() + 5
+    while not _gone(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert _gone(pid), f"escapee {pid} survived the run"

@@ -135,6 +135,17 @@ class _Handler(BaseHTTPRequestHandler):
     # Set when warmup (an engine's known-positive self-test) failed and health is gated on it.
     warmup_error: str | None = None
     max_bytes: int = _DEFAULT_MAX_BYTES
+
+    def _pre_detect(self) -> bool:
+        """Whether to call the engine's optional ``detect()`` in this process. Not on macOS:
+        nothing contains this agent there, and ``sandboxed_parsing`` covers ``detonate()``, not a
+        detector that may parse the hostile file itself -- unless the engine declares
+        ``sandboxed_detect = True`` (its detect() also goes through the sandbox, or reads no
+        input bytes)."""
+        if host_platform() != "darwin":
+            return True
+        return bool(getattr(self.engine, "sandboxed_detect", False))
+
     allow_nets: list = []  # peer-IP allowlist (empty = allow any; mTLS is the stronger gate)
     # Socket read timeout (StreamRequestHandler.setup() applies it): a stalled/slowloris request body
     # would otherwise hold the single-flight _JOB_LOCK forever and wedge the whole worker. Overridable
@@ -307,7 +318,8 @@ class _Handler(BaseHTTPRequestHandler):
                     _wd.start()
                 confined_before = confined_runs()
                 try:
-                    rc = run_detonation(self.engine, input_path=in_path, output_dir=out_dir, limits=limits)
+                    rc = run_detonation(self.engine, input_path=in_path, output_dir=out_dir, limits=limits,
+                                        pre_detect=self._pre_detect())
                 finally:
                     if _wd is not None:
                         _wd.cancel()
@@ -461,6 +473,24 @@ def _guard_unsandboxed_engine(engine: Engine) -> bool:
     return True
 
 
+def _warmup(engine: Engine, require_warmup: bool) -> str | None:
+    """Run the engine's warmup; the error that keeps /healthz at 503, or None when ready."""
+    if not hasattr(engine, "warmup"):
+        if require_warmup:
+            # The gate is "a known-positive self-test passed": an engine without one isn't ready.
+            _log.error("http_agent: engine has no warmup self-test; /healthz reports NOT ready")
+            return "engine has no warmup self-test"
+        return None
+    try:
+        engine.warmup()
+    except Exception as exc:  # noqa: BLE001 -- warmup is best-effort (fail-open to cold)
+        if require_warmup:
+            _log.error("http_agent: warmup failed; /healthz reports NOT ready: %s", exc)
+            return str(exc)[:500]
+        _log.warning("http_agent: warmup failed (continuing cold): %s", exc)
+    return None
+
+
 def serve(engine: Engine, *, bind: str = "0.0.0.0", port: int = 8765,
           token: str | None = None, max_bytes: int = _DEFAULT_MAX_BYTES,
           tls_cert: str | None = None, tls_key: str | None = None,
@@ -522,16 +552,7 @@ def main(argv: list[str] | None = None) -> int:
     # (BLASTBOX_WORKER_AGENT_REQUIRE_WARMUP=0/1 overrides on any platform).
     raw_req = os.environ.get("BLASTBOX_WORKER_AGENT_REQUIRE_WARMUP")
     require_warmup = _truthy(raw_req) if raw_req is not None else host_platform() == "darwin"
-    warmup_error: str | None = None
-    if hasattr(engine, "warmup"):
-        try:
-            engine.warmup()
-        except Exception as exc:  # noqa: BLE001 -- warmup is best-effort (fail-open to cold)
-            if require_warmup:
-                warmup_error = str(exc)[:500]
-                _log.error("http_agent: warmup failed; /healthz reports NOT ready: %s", exc)
-            else:
-                _log.warning("http_agent: warmup failed (continuing cold): %s", exc)
+    warmup_error = _warmup(engine, require_warmup)
     port = int(os.environ.get("BLASTBOX_WORKER_AGENT_PORT", "8765"))
     bind = os.environ.get("BLASTBOX_WORKER_AGENT_BIND", "0.0.0.0")
     token = os.environ.get("BLASTBOX_WORKER_AGENT_TOKEN") or None

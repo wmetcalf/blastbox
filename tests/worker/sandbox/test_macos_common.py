@@ -276,3 +276,76 @@ class TestWipeDir:
         monkeypatch.setattr(mc, "remove_tree", lambda p: None)
         with pytest.raises(SandboxError, match="could not empty"):
             mc.wipe_dir(d)
+
+
+class TestLoaderEnv:
+    def test_loader_control_vars_are_dropped(self, tmp_path):
+        env = mc.build_child_env(tmp_path, {"DYLD_INSERT_LIBRARIES": "/x.dylib",
+                                            "DYLD_LIBRARY_PATH": "/x", "LD_PRELOAD": "/x", "K": "v"})
+        assert not [k for k in env if k.startswith(("DYLD_", "LD_"))]
+        assert env["K"] == "v"
+
+    def test_the_launcher_runs_with_its_own_env_and_execs_the_child_with_the_requested_one(
+            self, tmp_path):
+        seen = {}
+
+        def popen(argv, **kw):
+            seen["env"] = kw["env"]
+            return subprocess.Popen(argv, **kw)
+        r = mc.run_confined(["/bin/sh", "-c", 'echo "$MARK"'], env={"PATH": mc.MINIMAL_PATH,
+                                                                   "MARK": "child-env"},
+                            limits=Limits(timeout_s=10), cwd=tmp_path, popen=popen)
+        assert r.stdout == b"child-env\n"
+        # the unsandboxed launcher interpreter never sees the request's env
+        assert seen["env"] == mc.LAUNCHER_ENV
+
+
+class TestWipeDirRoot:
+    def test_a_root_swapped_for_a_symlink_is_refused_not_followed(self, tmp_path):
+        victim = tmp_path / "engine"
+        victim.mkdir()
+        (victim / "keep").write_text("x")
+        data = tmp_path / "Data"
+        data.symlink_to(victim)
+        with pytest.raises(SandboxError, match="symlink"):
+            mc.wipe_dir(data)
+        assert (victim / "keep").read_text() == "x"
+
+    def test_a_root_that_is_a_file_is_refused(self, tmp_path):
+        f = tmp_path / "Data"
+        f.write_text("x")
+        with pytest.raises(SandboxError, match="not a directory"):
+            mc.wipe_dir(f)
+
+
+@pytest.mark.skipif(sys.platform != "darwin" or not os.path.exists("/usr/bin/sandbox-exec"),
+                    reason="needs macOS")
+class TestSweep:
+    def _sandboxed_sleeper(self, rw):
+        prof = (f'(version 1)(allow default)(deny file-write*)'
+                f'(allow file-write* (subpath "{rw}"))')
+        return subprocess.Popen(["/usr/bin/sandbox-exec", "-p", prof, "/bin/sleep", "30"],
+                                start_new_session=True)
+
+    def test_kills_only_sandboxed_processes_that_may_write_the_run_dir(self, tmp_path):
+        mine, other = (tmp_path / "mine").resolve(), (tmp_path / "other").resolve()
+        mine.mkdir()
+        other.mkdir()
+        t0 = time.time() - 1
+        a, b = self._sandboxed_sleeper(mine), self._sandboxed_sleeper(other)
+        plain = subprocess.Popen(["/bin/sleep", "30"])     # unsandboxed: never matched
+        try:
+            time.sleep(0.5)
+            assert mc.sweep_writers(mine, started_after=t0) == 1
+            assert a.wait(5) == -9
+            assert b.poll() is None and plain.poll() is None
+            # a process older than the run is left alone even if it could write the dir
+            assert mc.sweep_writers(other, started_after=time.time() + 60) == 0
+            assert b.poll() is None
+        finally:
+            for p in (a, b, plain):
+                p.kill()
+                p.wait()
+
+    def test_the_worker_itself_is_not_sandboxed(self):
+        assert not mc.is_sandboxed(os.getpid())

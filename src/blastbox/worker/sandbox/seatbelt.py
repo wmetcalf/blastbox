@@ -37,6 +37,7 @@ import logging
 import os
 import shutil
 import subprocess
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -198,7 +199,6 @@ class SeatbeltSandbox:
                     f"seatbelt supports identity mounts only (source == target): {m}"
                 )
 
-        note_confined_run()
         scratch = mc.make_scratch(self._scratch_base)
         try:
             mc.seed_scratch(scratch, request.seed_home, request.limits.tmpfs_bytes)
@@ -214,11 +214,17 @@ class SeatbeltSandbox:
                 argv += ["-D", f"{key}={val}"]
             argv += ["--", str(exe), *request.argv[1:]]
             env = mc.build_child_env(scratch, request.env)
+            # Slack for clock granularity; the scratch-write check is what scopes the sweep.
+            launched = time.time() - 1.0
             result = mc.run_confined(
                 argv, env=env, limits=request.limits, cwd=scratch,
                 popen=self._popen, rss_fn=self._rss_fn,
                 watch_dirs=[scratch, *(Path(p) for p in rw)],
+                sweep=lambda: mc.sweep_writers(scratch, started_after=launched),
             )
+            # Counted only once a sandboxed process actually ran: a failure before this point
+            # (bad seed, Popen error) must not let an engine's in-process fallback pass as confined.
+            note_confined_run()
             if result.exit_code == 0 and not result.killed:
                 mc.capture_scratch(scratch, request.capture_home, request.limits.tmpfs_bytes)
             return result

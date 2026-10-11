@@ -56,6 +56,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from blastbox.errors import SandboxError, SandboxUnavailable
+from blastbox.limits import Limits
 from blastbox.worker.sandbox.base import SandboxRequest, SandboxResult, note_confined_run
 from blastbox.worker.sandbox import macos_common as mc
 
@@ -90,6 +91,10 @@ int main(int argc, char **argv) {
     return 71;
 }
 """
+
+
+class AppSandboxNotPrepared(SandboxUnavailable):
+    """No manifest at the root: ``blastbox macos prepare`` was never run there."""
 
 
 @dataclass(frozen=True)
@@ -133,7 +138,7 @@ class Manifest:
         try:
             raw = json.loads(path.read_text())
         except FileNotFoundError as exc:
-            raise SandboxUnavailable(
+            raise AppSandboxNotPrepared(
                 f"appsandbox not prepared: {path} missing (run `blastbox macos prepare`)"
             ) from exc
         except (OSError, ValueError) as exc:
@@ -373,11 +378,22 @@ class AppSandboxSandbox:
                 )
             time.sleep(0.05)
 
+    def _sweep_slot(self, slot: Slot) -> None:
+        """Kill every process still in the slot's container -- including a forked, setsid()'d
+        orphan that left the run's process family -- before the slot is wiped or reused."""
+        mc.sweep_container(slot.container_data(self._home))
+
     def _wipe_slot(self, slot: Slot) -> None:
-        """Empty the slot's io/ and container, or retire the slot and raise: a run that left
-        undeletable state (a ``uchg`` file, a locked dir) must not hand it to the next run."""
+        """Kill what is left in the slot, then empty its io/ and container, or retire the slot
+        and raise: a run that left a process or undeletable state (a ``uchg`` file, a locked dir,
+        a container swapped for a symlink) must not hand it to the next run."""
         try:
-            for d in (slot.io_dir, slot.container_data(self._home)):
+            self._sweep_slot(slot)
+            container = slot.container_data(self._home)
+            parent = container.parent
+            if os.path.lexists(parent) and os.path.islink(parent):
+                raise SandboxError(f"refusing to wipe {container}: {parent} is a symlink")
+            for d in (slot.io_dir, container):
                 mc.wipe_dir(d)
         except SandboxError as exc:
             self.retired_marker(slot).write_text(f"{exc}\n")
@@ -401,7 +417,6 @@ class AppSandboxSandbox:
         self._check_exec_allowed(exe)
         self._check_exec_allowed(exe_real)
 
-        note_confined_run()
         with self._acquire_slot() as slot:
             self._wipe_slot(slot)
             try:
@@ -419,9 +434,12 @@ class AppSandboxSandbox:
         # CFFIXED_USER_HOME are ignored for caches -- measured: Vision's E5RT cache lands in
         # ~/Library/Containers/<id>/Data/Library/Caches). So that is what seed/capture target.
         # It is wiped before and after every run like io/. Before the slot's first launch the
-        # container doesn't exist yet; containermanagerd creates it, so seeding waits until then.
+        # container doesn't exist yet (containermanagerd creates it at launch), so a seeded run
+        # on a fresh slot first primes it with a no-op launch -- the seed is never dropped.
         container = slot.container_data(self._home)
-        if request.seed_home is not None and container.is_dir():
+        if request.seed_home is not None:
+            if not container.is_dir():
+                self._prime_container(slot, home)
             mc.seed_scratch(container, request.seed_home, budget)
 
         mapping: list[tuple[str, str]] = []
@@ -444,7 +462,12 @@ class AppSandboxSandbox:
         result = mc.run_confined(
             argv, env=env, limits=request.limits, cwd=home,
             popen=self._popen, rss_fn=self._rss_fn, watch_dirs=[io, container],
+            sweep=lambda: self._sweep_slot(slot),
         )
+        if result.exit_code != 70:
+            # A sandboxed process ran (70 = the launcher refused because it wasn't sandboxed).
+            # Counted only now: a failure before launch must not pass as a confined run.
+            note_confined_run()
 
         for src, staged in rw_staged:
             self._copy_back(staged, src, budget)
@@ -460,6 +483,18 @@ class AppSandboxSandbox:
         elif result.exit_code == 70:
             result.stderr += b"\n[blastbox] launcher was not sandboxed; slot signature broken\n"
         return result
+
+    def _prime_container(self, slot: Slot, home: Path) -> None:
+        """Launch the slot once with ``/usr/bin/true`` so its container exists, or raise."""
+        container = slot.container_data(self._home)
+        mc.run_confined([str(slot.launcher), "/usr/bin/true"],
+                        env=mc.build_child_env(home, {}), limits=Limits(timeout_s=30),
+                        cwd=home, popen=self._popen)
+        if not container.is_dir():
+            raise SandboxError(
+                f"appsandbox slot {slot.index}: container {container} was not created by a "
+                "priming launch, so seed_home cannot be applied; check the slot signature")
+        mc.wipe_dir(container)
 
     @staticmethod
     def _copy_back(staged: Path, dest: Path, budget: int) -> None:

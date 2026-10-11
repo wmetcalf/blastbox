@@ -385,7 +385,7 @@ when a netpolicy grants egress: there is no netd/rooter there to steer it.
 | `BLASTBOX_APPSANDBOX_ROOT` | `~/Library/Application Support/blastbox/appsandbox` | Slot root written by `blastbox macos prepare` (manifest, signed launcher bundles, per-slot `io/`, locks). Must not overlap any `--ro` path. |
 | `BLASTBOX_APPSANDBOX_SLOT_WAIT_S` | `30` | How long a run waits for a free slot before failing. Concurrency == `prepare --slots`. |
 | `BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE` | `0` | macOS only: let the agent serve an engine that doesn't declare `sandboxed_parsing = True` (it may then parse hostile input inside the agent). |
-| `BLASTBOX_WORKER_AGENT_REQUIRE_WARMUP` | `1` on macOS, `0` elsewhere | A failed `engine.warmup()` makes `/healthz` 503 instead of continuing cold. |
+| `BLASTBOX_WORKER_AGENT_REQUIRE_WARMUP` | `1` on macOS, `0` elsewhere | A failed `engine.warmup()` (or an engine with none) makes `/healthz` 503 instead of continuing cold. |
 
 `SandboxRequest.accelerators` (`{"gpu", "ane"}`) is default-deny: `seatbelt` opens exactly the
 Metal / Neural Engine driver clients and services each needs; `appsandbox` (Apple's application

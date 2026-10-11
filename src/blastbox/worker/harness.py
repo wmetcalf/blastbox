@@ -172,8 +172,12 @@ def run_detonation(
     input_path: Path,
     output_dir: Path,
     limits: Limits,
+    pre_detect: bool = True,
 ) -> int:
     """Run one detonation; write ``output_dir/metadata.json``; return exit code.
+
+    ``pre_detect=False`` skips the engine's optional in-process ``detect()`` (the macOS agent,
+    which has no outer boundary to contain a detector parsing hostile input).
 
     Always returns 0 — the ``status`` field in the envelope encodes the
     semantic outcome (``"ok"``, ``"rejected"``, ``"engine_error"``).
@@ -186,7 +190,7 @@ def run_detonation(
 
     # Step 2: optional pre-detection
     detected: Detection | None = None
-    if hasattr(engine, "detect"):
+    if pre_detect and hasattr(engine, "detect"):
         try:
             detected = engine.detect(input_path)
         except Exception as exc:  # noqa: BLE001

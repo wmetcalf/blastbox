@@ -60,6 +60,12 @@ KNOWN_ACCELERATORS = frozenset({"gpu", "ane"})
 # home / temp / caches at the per-run scratch dir, which is the whole cross-job guarantee).
 _RESERVED_ENV = frozenset({"HOME", "CFFIXED_USER_HOME", "TMPDIR", "PATH"})
 
+# Loader-control prefixes a request may not set. dyld honours ``DYLD_*`` (e.g.
+# ``DYLD_INSERT_LIBRARIES``) in any process that isn't hardened, so a request env carrying one
+# must never reach a process that runs before the sandbox is attached. Dropped outright: a
+# sandboxed target has no legitimate need to re-point its own loader.
+_LOADER_ENV_PREFIXES = ("DYLD_", "LD_")
+
 
 def build_child_env(scratch: Path, extra: Mapping[str, str]) -> dict[str, str]:
     """A from-scratch env: minimal PATH, scratch HOME/TMPDIR, plus the request's additions.
@@ -71,6 +77,9 @@ def build_child_env(scratch: Path, extra: Mapping[str, str]) -> dict[str, str]:
     for key, val in extra.items():
         if key in _RESERVED_ENV:
             _log.warning("macos sandbox: ignoring reserved env key %s from the request", key)
+            continue
+        if key.startswith(_LOADER_ENV_PREFIXES):
+            _log.warning("macos sandbox: dropping loader-control env key %s from the request", key)
             continue
         env[key] = val
     env.update({
@@ -181,9 +190,17 @@ def wipe_dir(path: Path) -> None:
 
     For directories a later run reuses (an App Sandbox slot's ``io/`` and container): a run that
     left something undeletable must not hand its state to the next one. A missing ``path`` is
-    clean."""
-    if not path.is_dir():
+    clean. ``path`` itself must be a real directory: a sandboxed child owns its container and
+    could swap it for a symlink to a host directory, which a following wipe would then empty, so
+    a symlink (or any non-directory) raises instead of being followed. Children are removed
+    without following links (:func:`remove_tree`)."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
         return
+    if not stat.S_ISDIR(st.st_mode):
+        kind = "a symlink" if stat.S_ISLNK(st.st_mode) else "not a directory"
+        raise SandboxError(f"refusing to wipe {path}: it is {kind}")
     for child in list(path.iterdir()):
         remove_tree(child)
         if os.path.lexists(child):
@@ -223,7 +240,7 @@ try:
             setlim(resource.RLIMIT_NPROC, got // 4 + cfg["nproc"])
 except OSError:
     pass
-os.execve(argv[0], argv, os.environ)
+os.execve(argv[0], argv, cfg["env"])
 """
 
 # Processes a run may create on top of the uid's current count (Darwin's NPROC is per-UID).
@@ -234,10 +251,17 @@ MAX_CAPTURE_BYTES = 16 * 1024 * 1024
 MAX_SCRATCH_ENTRIES = 200_000
 
 
-def limits_launcher_argv(limits: Limits, argv: list[str]) -> list[str]:
-    """``argv`` wrapped in the rlimit launcher (FSIZE, NOFILE, CPU, CORE, NPROC)."""
+#: The launcher's OWN environment. The launcher is an unsandboxed interpreter, so the request's
+#: env (which the target needs) is carried in its config and installed only by ``execve``.
+LAUNCHER_ENV = {"PATH": MINIMAL_PATH}
+
+
+def limits_launcher_argv(limits: Limits, argv: list[str],
+                         env: Mapping[str, str] | None = None) -> list[str]:
+    """``argv`` wrapped in the rlimit launcher (FSIZE, NOFILE, CPU, CORE, NPROC); ``env`` is
+    what ``argv`` is exec'd with."""
     cfg = {"fsize": int(limits.tmpfs_bytes), "nofile": 4096, "cpu": int(limits.timeout_s) + 30,
-           "nproc": NPROC_ALLOWANCE}
+           "nproc": NPROC_ALLOWANCE, "env": dict(env or {})}
     return [sys.executable, "-I", "-S", "-c", _LIMITS_LAUNCHER, json.dumps(cfg), *argv]
 
 
@@ -246,6 +270,13 @@ def unwrap_launcher(argv: list[str]) -> list[str]:
     if len(argv) > 5 and argv[1:4] == ["-I", "-S", "-c"] and argv[4] == _LIMITS_LAUNCHER:
         return argv[6:]
     return argv
+
+
+def launcher_child_env(argv: list[str]) -> dict[str, str] | None:
+    """The env a :func:`limits_launcher_argv` wrapper execs its command with (tests/diagnostics)."""
+    if len(argv) > 5 and argv[1:4] == ["-I", "-S", "-c"] and argv[4] == _LIMITS_LAUNCHER:
+        return dict(json.loads(argv[5])["env"])
+    return None
 
 
 def make_apply_rlimits(limits: Limits) -> Callable[[], None]:
@@ -415,14 +446,19 @@ class RssWatchdog:
         self.kill_family()
 
     def _loop(self) -> None:
+        # Sample at once and then fast (5 ms, doubling up to ``interval``): a child that forks,
+        # setsid()s and lets the leader exit is only findable while it is still parented under
+        # the run. One more sample after the leader exits picks up whatever is left. What a
+        # sample can still miss, the backends' post-run sweep (:func:`sweep_sandboxed`) catches.
         if self._pgid is None:
             return
-        while not self._stop.wait(self._interval):
-            if self._proc.poll() is not None:
-                return
+        delay = 0.0
+        while not self._stop.wait(delay):
+            exited = self._proc.poll() is not None
             self._sample()
-            if self.tripped:
+            if self.tripped or exited:
                 return
+            delay = min(self._interval, max(0.005, delay * 2))
 
     def kill_family(self) -> None:
         """SIGKILL the run's process group and every family member still alive -- also after the
@@ -472,6 +508,7 @@ def run_confined(
     rss_fn: Callable[[int], int] | None = None,
     watch_dirs: Iterable[Path] = (),
     max_output_bytes: int = MAX_CAPTURE_BYTES,
+    sweep: Callable[[], object] | None = None,
 ) -> SandboxResult:
     """Launch an already-confining ``argv`` with the shared lifecycle.
 
@@ -479,16 +516,20 @@ def run_confined(
     NPROC) applied by a single-threaded launcher, not a ``preexec_fn``; wall-clock timeout;
     memory + disk watchdog over the run's whole process family; output captured up to
     ``max_output_bytes`` per stream; and the whole family killed before returning, even when
-    the leader exited normally.
+    the leader exited normally. ``sweep`` then kills whatever escaped the family (see
+    :func:`sweep_sandboxed`); it raises ``SandboxError`` if it can't, failing the run.
+
+    ``env`` is the TARGET's environment: the launcher (an unsandboxed interpreter) runs with
+    :data:`LAUNCHER_ENV` and installs ``env`` only when it execs ``argv``.
     """
     try:
         proc = popen(
-            limits_launcher_argv(limits, argv),
+            limits_launcher_argv(limits, argv, env),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             close_fds=True,
-            env=dict(env),
+            env=dict(LAUNCHER_ENV),
             cwd=str(cwd),
             start_new_session=True,
         )
@@ -514,6 +555,9 @@ def run_confined(
                 pass
             exit_code = -int(signal.SIGKILL)
     dog.kill_family()
+    if sweep is not None:
+        # Before draining the pipes: an escapee holding them open would otherwise hold EOF off.
+        sweep()
     out.join(timeout=5.0)
     err.join(timeout=5.0)
     stdout, stderr = bytes(out.data), bytes(err.data)
@@ -528,6 +572,169 @@ def run_confined(
         if reader.truncated:
             stderr += f"\n[blastbox] {name} truncated at {max_output_bytes} bytes\n".encode()
     return SandboxResult(exit_code=exit_code, stdout=stdout, stderr=stderr, killed=killed)
+
+
+# --------------------------------------------------------------------------------------------
+# Post-run sweep: find a run's processes by their SANDBOX, not their ancestry.
+# --------------------------------------------------------------------------------------------
+#
+# A child that forks, setsid()s and lets the leader exit between two watchdog samples is no
+# longer in the run's process group or under its leader. It still carries the run's sandbox,
+# though, and the sandbox is specific to the run:
+#
+# - seatbelt: only this run's profile grants write to its per-run scratch dir, so a process that
+#   is sandboxed AND may write that dir is this run's (``sandbox_check`` with a path filter);
+# - appsandbox: the kernel reports a process's container (``sandbox_container_path_for_pid``),
+#   which is per slot -- also for a forked, setsid()'d, exec'd orphan.
+#
+# Unsandboxed processes are never matched, nor is the worker itself.
+
+_PROC_UID_ONLY = 4
+_SANDBOX_FILTER_PATH = 1
+_SANDBOX_CHECK_NO_REPORT = 0x40000000
+
+
+def _libsystem() -> ctypes.CDLL | None:
+    if not IS_DARWIN:
+        return None
+    try:
+        lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        # Fixed args only: the rest is variadic, which ctypes must pass as such on arm64.
+        lib.sandbox_check.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        lib.sandbox_check.restype = ctypes.c_int
+        lib.sandbox_container_path_for_pid.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t]
+        lib.sandbox_container_path_for_pid.restype = ctypes.c_int
+        lib.proc_listpids.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_int]
+        lib.proc_listpids.restype = ctypes.c_int
+        lib.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p,
+                                     ctypes.c_int]
+        lib.proc_pidinfo.restype = ctypes.c_int
+        return lib
+    except (OSError, AttributeError):
+        return None
+
+
+_LIBSYSTEM = _libsystem()
+
+
+class _ProcBsdInfo(ctypes.Structure):
+    _fields_ = [("pbi_flags", ctypes.c_uint32), ("pbi_status", ctypes.c_uint32),
+                ("pbi_xstatus", ctypes.c_uint32), ("pbi_pid", ctypes.c_uint32),
+                ("pbi_ppid", ctypes.c_uint32), ("pbi_uid", ctypes.c_uint32),
+                ("pbi_gid", ctypes.c_uint32), ("pbi_ruid", ctypes.c_uint32),
+                ("pbi_rgid", ctypes.c_uint32), ("pbi_svuid", ctypes.c_uint32),
+                ("pbi_svgid", ctypes.c_uint32), ("rfu_1", ctypes.c_uint32),
+                ("pbi_comm", ctypes.c_char * 16), ("pbi_name", ctypes.c_char * 32),
+                ("pbi_nfiles", ctypes.c_uint32), ("pbi_pgid", ctypes.c_uint32),
+                ("pbi_pjobc", ctypes.c_uint32), ("e_tdev", ctypes.c_uint32),
+                ("e_tpgid", ctypes.c_uint32), ("pbi_nice", ctypes.c_int32),
+                ("pbi_start_tvsec", ctypes.c_uint64), ("pbi_start_tvusec", ctypes.c_uint64)]
+
+
+_PROC_PIDTBSDINFO = 3
+
+
+def proc_start_time(pid: int) -> float | None:
+    """When ``pid`` started (epoch seconds), or None."""
+    if _LIBSYSTEM is None:
+        return None
+    info = _ProcBsdInfo()
+    size = ctypes.sizeof(info)
+    if _LIBSYSTEM.proc_pidinfo(pid, _PROC_PIDTBSDINFO, 0, ctypes.byref(info), size) != size:
+        return None
+    return info.pbi_start_tvsec + info.pbi_start_tvusec / 1e6
+
+
+def uid_pids(uid: int | None = None) -> list[int]:
+    """Every pid owned by ``uid`` (default: ours)."""
+    if _LIBSYSTEM is None:
+        return []
+    uid = os.getuid() if uid is None else uid
+    n = _LIBSYSTEM.proc_listpids(_PROC_UID_ONLY, uid, None, 0)
+    if n <= 0:
+        return []
+    buf = (ctypes.c_int * (n // 4 + 256))()
+    got = _LIBSYSTEM.proc_listpids(_PROC_UID_ONLY, uid, buf, ctypes.sizeof(buf))
+    return [p for p in buf[: max(0, got) // 4] if p > 0]
+
+
+def is_sandboxed(pid: int) -> bool:
+    return _LIBSYSTEM is not None and _LIBSYSTEM.sandbox_check(pid, None, 0) == 1
+
+
+def sandbox_may_write(pid: int, path: Path) -> bool:
+    """True if ``pid``'s sandbox allows writing under ``path`` (an existing directory)."""
+    if _LIBSYSTEM is None:
+        return False
+    return _LIBSYSTEM.sandbox_check(pid, b"file-write-data",
+                                    _SANDBOX_FILTER_PATH | _SANDBOX_CHECK_NO_REPORT,
+                                    os.fsencode(path)) == 0
+
+
+def container_of(pid: int) -> str | None:
+    """``pid``'s App Sandbox container (``.../Containers/<id>/Data``), or None."""
+    if _LIBSYSTEM is None:
+        return None
+    buf = ctypes.create_string_buffer(4096)
+    if _LIBSYSTEM.sandbox_container_path_for_pid(pid, buf, len(buf)) != 0:
+        return None
+    return os.fsdecode(buf.value) or None
+
+
+def sweep_sandboxed(match: Callable[[int], bool], *, what: str, rounds: int = 400) -> int:
+    """SIGKILL every SANDBOXED process of our uid that ``match``es, until none is left.
+
+    Loops because a match may fork while being killed (bounded by the launcher's NPROC cap).
+    Returns how many were killed; raises ``SandboxError`` if they keep coming -- a run whose
+    processes can't be removed must not be reported, nor its slot reused."""
+    me = os.getpid()
+    killed: set[int] = set()
+    for _ in range(rounds):
+        live = [p for p in uid_pids() if p != me and is_sandboxed(p) and match(p)]
+        live = [p for p in live if p not in killed or _alive(p)]
+        if not live:
+            if killed:
+                _log.warning("macos sandbox: swept %d process(es) that escaped %s",
+                             len(killed), what)
+            return len(killed)
+        for p in live:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(p, signal.SIGKILL)
+            killed.add(p)
+        threading.Event().wait(0.005)
+    raise SandboxError(f"could not kill the processes left by {what}")
+
+
+def _alive(pid: int) -> bool:
+    """False once ``pid`` is gone or a zombie (killed, awaiting its reaper)."""
+    try:
+        out = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(pid)], capture_output=True,
+                             text=True, timeout=5, check=False).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return bool(out) and not out.startswith("Z")
+
+
+def sweep_writers(path: Path, *, started_after: float) -> int:
+    """Kill every sandboxed process that started at/after ``started_after`` and may write
+    ``path`` (a seatbelt run's scratch dir, which only that run's profile grants). The start
+    time keeps out a long-running same-uid agent whose own profile happens to allow the
+    user's temp dir."""
+    if not os.path.isdir(path):
+        return 0
+
+    def match(p: int) -> bool:
+        t = proc_start_time(p)
+        return t is not None and t >= started_after and sandbox_may_write(p, path)
+    return sweep_sandboxed(match, what=f"the run in {path}")
+
+
+def sweep_container(container: Path) -> int:
+    """Kill every process whose App Sandbox container is ``container`` (an appsandbox slot)."""
+    want = os.path.realpath(container)
+    return sweep_sandboxed(
+        lambda p: (c := container_of(p)) is not None and os.path.realpath(c) == want,
+        what=f"container {container}")
 
 
 # --------------------------------------------------------------------------------------------

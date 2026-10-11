@@ -258,3 +258,88 @@ def test_a_slot_that_cannot_be_wiped_is_retired(tmp_path, monkeypatch):
         sb.run(SandboxRequest(argv=["/bin/echo", "x"]))
     asb.prepare(root, slots=1, ro_paths=[], runner=_fake_runner([]))
     assert not asb.AppSandboxSandbox.retired_marker(slot).exists()
+
+
+class _PrimingPopen(_Popen):
+    """Like _Popen, but a launch of ``/usr/bin/true`` creates the slot's container, the way
+    containermanagerd does on a real slot's first launch."""
+
+    def __init__(self, container):
+        super().__init__()
+        self.container = container
+
+    def __call__(self, argv, **kw):
+        if mc.unwrap_launcher(argv)[1:] == ["/usr/bin/true"]:
+            self.container.mkdir(parents=True, exist_ok=True)
+        return super().__call__(argv, **kw)
+
+
+def _seed(tmp_path):
+    seed = tmp_path / "seed"
+    (seed / "Library" / "Caches" / "x").mkdir(parents=True)
+    (seed / "Library" / "Caches" / "x" / "p").write_text("plan\n")
+    return seed
+
+
+def test_a_fresh_slot_is_primed_so_the_first_run_gets_its_seed(tmp_path):
+    root = tmp_path / "root"
+    asb.prepare(root, slots=1, ro_paths=[], runner=_fake_runner([]))
+    home = tmp_path / "home"
+    m = asb.Manifest.load(root)
+    container = m.slots[0].container_data(home)
+    popen = _PrimingPopen(container)
+    sb = asb.AppSandboxSandbox(root=root, popen=popen, home=home, platform_ok=True,
+                               verify=False, slot_wait_s=0)
+    assert not container.exists()
+    r = sb.run(SandboxRequest(argv=["/bin/sh", "-c", f'cat "{container}/Library/Caches/x/p"'],
+                              seed_home=_seed(tmp_path)))
+    assert r.stdout == b"plan\n", r.stderr
+    assert popen.calls[0][0][1:] == ["/usr/bin/true"]     # the priming launch came first
+
+
+def test_a_seed_that_cannot_be_applied_fails_the_run_loudly(tmp_path):
+    root = tmp_path / "root"
+    asb.prepare(root, slots=1, ro_paths=[], runner=_fake_runner([]))
+    sb = asb.AppSandboxSandbox(root=root, popen=_Popen(), home=tmp_path / "home",
+                               platform_ok=True, verify=False, slot_wait_s=0)
+    with pytest.raises(SandboxError, match="seed_home cannot be applied"):
+        sb.run(SandboxRequest(argv=["/usr/bin/true"], seed_home=_seed(tmp_path)))
+
+
+def test_a_container_swapped_for_a_symlink_retires_the_slot(tmp_path):
+    root = tmp_path / "root"
+    asb.prepare(root, slots=1, ro_paths=[], runner=_fake_runner([]))
+    home = tmp_path / "home"
+    sb = asb.AppSandboxSandbox(root=root, popen=_Popen(), home=home, platform_ok=True,
+                               verify=False, slot_wait_s=0)
+    slot = sb.manifest.slots[0]
+    victim = tmp_path / "engine-install"
+    victim.mkdir()
+    (victim / "keep").write_text("x")
+    data = slot.container_data(home)
+    data.parent.mkdir(parents=True)
+    data.symlink_to(victim)
+    with pytest.raises(SandboxError, match="symlink"):
+        sb.run(SandboxRequest(argv=["/usr/bin/true"]))
+    assert (victim / "keep").read_text() == "x"
+    assert asb.AppSandboxSandbox.retired_marker(slot).exists()
+
+
+@needs_real
+def test_an_escapee_is_swept_from_the_slot_container(real_sb, tmp_path, monkeypatch):
+    # Blind the watchdog: only the container sweep can find a forked, setsid()'d orphan.
+    monkeypatch.setattr(mc.RssWatchdog, "_sample", lambda self: None)
+    escape = ("use POSIX; my $pid = fork(); "
+              "if ($pid) { select(undef, undef, undef, 0.01) until -s $ARGV[0]; exit 0 } "
+              "POSIX::setsid(); close STDIN; close STDOUT; close STDERR; "
+              "open(my $f, '>', $ARGV[0] . '.tmp') or die; print $f $$; close $f; "
+              "rename($ARGV[0] . '.tmp', $ARGV[0]); sleep 30;")
+    rw = tmp_path / "rw"
+    rw.mkdir()
+    r = real_sb.run(SandboxRequest(argv=["/usr/bin/perl", "-e", escape, str(rw / "pid")],
+                                   rw_mounts=[Mount(rw, rw)]))
+    assert r.exit_code == 0, r.stderr
+    pid = int((rw / "pid").read_text())
+    out = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(pid)], capture_output=True,
+                         text=True).stdout.strip()
+    assert not out or out.startswith("Z"), f"escapee {pid} survived the run"
