@@ -660,7 +660,12 @@ class AppSandboxSandbox:
         mount, a regular file for a file mount. Its staging parent is writable, so the child can
         replace it (with a symlink, say), which a real bind mount does not allow: that would
         empty the host directory, or plant an attacker-chosen symlink at the host path. So the
-        root is checked before ``dest`` is touched, and a changed type fails the run."""
+        root is checked before ``dest`` is touched, and a changed type fails the run.
+
+        The replacement is built first, beside the original (a hidden entry inside a directory
+        mount, so the directory itself is kept as a bind mount would; a sibling for a file
+        mount), and only swapped in by rename once it is complete: a copy-back that fails
+        partway (budget, disk) leaves ``dest`` as it was, never half-written."""
         try:
             st = os.lstat(staged)
         except FileNotFoundError:
@@ -673,10 +678,23 @@ class AppSandboxSandbox:
         if was_dir:
             if not stat.S_ISDIR(os.lstat(dest).st_mode):
                 raise SandboxError(f"appsandbox: rw mount {dest} is no longer a directory")
+            new = dest / f".blastbox-copyback-{secrets.token_hex(8)}"
+            try:
+                mc.copy_no_follow(staged, new, budget=budget)
+            except BaseException:
+                mc.remove_tree(new)
+                raise
             for child in dest.iterdir():
-                mc.remove_tree(child)
-            for child in staged.iterdir():
-                mc.copy_no_follow(child, dest / child.name, budget=budget)
+                if child != new:
+                    mc.remove_tree(child)
+            for child in new.iterdir():
+                os.rename(child, dest / child.name)
+            os.rmdir(new)
         else:
-            mc.remove_tree(dest)
-            mc.copy_no_follow(staged, dest, budget=budget)
+            new = dest.with_name(f".{dest.name}.blastbox-copyback-{secrets.token_hex(8)}")
+            try:
+                mc.copy_no_follow(staged, new, budget=budget)
+            except BaseException:
+                mc.remove_tree(new)
+                raise
+            os.replace(new, dest)

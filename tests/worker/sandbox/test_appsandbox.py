@@ -547,6 +547,39 @@ class TestCopyBackRootType:
                                   rw_mounts=[Mount(out, out)]))
         assert (out / "keep").read_text() == "x"
 
+    def test_a_copy_back_that_fails_partway_leaves_the_host_dir_intact(self, tmp_path):
+        # the replacement is built before anything in the host dir is removed: a copy-back that
+        # runs out of budget mid-tree leaves the original contents, and no temp dir behind
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "keep").write_text("original")
+        budget = mc.CopyBudget(max_bytes=1 << 20, max_entries=5)
+        staged = tmp_path / "staged"
+        staged.mkdir()
+        for i in range(20):
+            (staged / f"f{i}").write_text("new")
+        with pytest.raises(SandboxError, match="entries"):
+            asb.AppSandboxSandbox._copy_back(staged, out, budget, was_dir=True)
+        assert sorted(p.name for p in out.iterdir()) == ["keep"]
+        assert (out / "keep").read_text() == "original"
+
+    def test_a_completed_copy_back_mirrors_the_staged_tree(self, tmp_path):
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "gone").write_text("old")
+        staged = tmp_path / "staged"
+        (staged / "sub").mkdir(parents=True)
+        (staged / "sub" / "f").write_text("new")
+        asb.AppSandboxSandbox._copy_back(staged, out, mc.CopyBudget(max_bytes=1 << 20), was_dir=True)
+        assert sorted(p.name for p in out.iterdir()) == ["sub"]
+        assert (out / "sub" / "f").read_text() == "new"
+        f = tmp_path / "file"
+        f.write_text("old")
+        (tmp_path / "sf").write_text("new file")
+        asb.AppSandboxSandbox._copy_back(tmp_path / "sf", f, mc.CopyBudget(max_bytes=1 << 20), was_dir=False)
+        assert f.read_text() == "new file"
+        assert not [p for p in tmp_path.iterdir() if "blastbox-copyback" in p.name]
+
 
 def test_an_executable_named_by_its_mount_target_runs(tmp_path):
     engine = tmp_path / "engine"
