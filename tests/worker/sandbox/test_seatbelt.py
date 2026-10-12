@@ -366,3 +366,39 @@ def test_selecting_a_sandbox_is_not_a_confined_run(monkeypatch):
     before = confined_runs()
     assert select_sandbox(backend="seatbelt").name == "seatbelt"
     assert confined_runs() == before
+
+
+class _FailingProc(_FakeProc):
+    def wait(self, timeout=None):
+        return 3
+
+    def poll(self):
+        return 3
+
+
+def test_a_failed_launch_is_not_counted(tmp_path):
+    # The shim ran (handshake written) but the target exited nonzero: an engine falling back to
+    # an in-process parse after this must not look confined.
+    from blastbox.worker.sandbox.base import confined_runs
+    sb = SeatbeltSandbox(popen=lambda argv, **kw: _FailingProc(argv, **kw), platform_ok=True,
+                         sandbox_exec="/bin/sh", scratch_base=tmp_path / "s")
+    before = confined_runs()
+    assert sb.run(SandboxRequest(argv=["/bin/echo"])).exit_code == 3
+    assert confined_runs() == before
+
+
+@needs_darwin
+def test_a_killed_run_is_not_counted(tmp_path):
+    from blastbox.worker.sandbox.base import confined_runs
+    before = confined_runs()
+    r = SeatbeltSandbox(scratch_base=tmp_path / "s").run(
+        SandboxRequest(argv=["/bin/sleep", "5"], limits=Limits(timeout_s=1)))
+    assert r.killed
+    assert confined_runs() == before
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin requires the process APIs")
+def test_seatbelt_refuses_without_process_apis(monkeypatch):
+    monkeypatch.setattr(mc, "_LIBSYSTEM", None)
+    with pytest.raises(SandboxUnavailable, match="process APIs"):
+        SeatbeltSandbox(platform_ok=True, sandbox_exec="/bin/sh")

@@ -415,3 +415,123 @@ class TestDirUsageRoots:
     def test_env_nul_is_refused(self, tmp_path):
         with pytest.raises(SandboxError, match="invalid env entry"):
             mc.build_child_env(tmp_path, {"K": "a\0b"})
+
+
+class TestCopyPreservesModes:
+    def test_byte_copy_keeps_permission_bits(self, tmp_path, monkeypatch):
+        # The fallback path (no clonefile, e.g. across APFS volumes) must not reset modes.
+        monkeypatch.setattr(mc, "_CLONEFILE", None)
+        src = tmp_path / "src"
+        (src / "d").mkdir(parents=True)
+        (src / "secret").write_text("s")
+        os.chmod(src / "secret", 0o600)
+        (src / "tool").write_text("#!/bin/sh\n")
+        os.chmod(src / "tool", 0o755)
+        os.chmod(src / "d", 0o750)
+        (src / "ro").mkdir()
+        (src / "ro" / "f").write_text("x")
+        os.chmod(src / "ro", 0o555)                     # read-only dir still gets filled
+        dst = tmp_path / "dst"
+        try:
+            mc.copy_no_follow(src, dst, budget_bytes=1000)
+            mode = lambda p: stat.S_IMODE(os.lstat(p).st_mode)  # noqa: E731
+            assert mode(dst / "secret") == 0o600
+            assert mode(dst / "tool") == 0o755
+            assert mode(dst / "d") == 0o750
+            assert mode(dst / "ro") == 0o555 and (dst / "ro" / "f").read_text() == "x"
+        finally:
+            for d in (src / "ro", dst / "ro"):
+                if d.exists():
+                    os.chmod(d, 0o755)
+
+    def test_setuid_bits_are_never_copied(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mc, "_CLONEFILE", None)
+        f = tmp_path / "f"
+        f.write_text("x")
+        os.chmod(f, 0o4755)
+        mc.copy_no_follow(f, tmp_path / "g", budget_bytes=10)
+        assert stat.S_IMODE(os.lstat(tmp_path / "g").st_mode) == 0o755
+
+
+class TestSharedCopyBudget:
+    def test_bytes_are_shared_across_copies(self, tmp_path):
+        for n in ("a", "b"):
+            (tmp_path / n).write_bytes(b"x" * 60)
+        budget = mc.CopyBudget(100)
+        mc.copy_no_follow(tmp_path / "a", tmp_path / "a2", budget=budget)
+        with pytest.raises(SandboxError, match="budget"):
+            mc.copy_no_follow(tmp_path / "b", tmp_path / "b2", budget=budget)
+
+    def test_entries_are_capped(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        for i in range(20):
+            (src / f"e{i}").symlink_to("/nowhere")      # zero bytes each: only entries count
+        with pytest.raises(SandboxError, match="entries"):
+            mc.copy_no_follow(src, tmp_path / "dst", budget=mc.CopyBudget(1000, max_entries=10))
+
+
+class TestWatchdogStop:
+    def test_exit_waits_for_an_in_flight_sample_and_it_kills_nothing(self):
+        # A sample still running when the run ends (a slow `ps`) must finish before the context
+        # exits, and must not trip afterwards -- by then the slot may be serving the next job.
+        proc = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+        calls = []
+
+        def slow_rss(pgid):
+            calls.append(pgid)
+            if len(calls) == 2:
+                time.sleep(2.5)
+                return 10 ** 15                      # "over budget", but only after the run
+            return 0
+        try:
+            dog = mc.RssWatchdog(proc, 1 << 30, rss_fn=slow_rss, table_fn=lambda: [])
+            with dog:
+                while len(calls) < 2:
+                    time.sleep(0.01)
+            assert not dog._thread.is_alive()
+            assert dog.tripped is None
+            assert proc.poll() is None                # not killed by the stale sample
+        finally:
+            proc.kill()
+            proc.wait()
+
+
+class TestEnumerationFailsClosed:
+    class _Lib:
+        def __init__(self, sizing, listing):
+            self.sizing, self.listing = sizing, listing
+
+        def proc_listpids(self, kind, uid, buf, size):
+            return self.sizing if buf is None else self.listing
+
+    @pytest.mark.parametrize("sizing,listing", [(0, 0), (-1, -1), (4096, 0), (4096, -1)])
+    def test_a_failed_listing_raises_not_empty(self, monkeypatch, sizing, listing):
+        monkeypatch.setattr(mc, "_LIBSYSTEM", self._Lib(sizing, listing))
+        with pytest.raises(SandboxError, match="enumerate"):
+            mc.uid_pids()
+        with pytest.raises(SandboxError, match="enumerate"):
+            mc.sweep_sandboxed(lambda p: True, what="test")
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="Darwin requires the process APIs")
+    def test_missing_apis_raise_on_darwin(self, monkeypatch):
+        monkeypatch.setattr(mc, "_LIBSYSTEM", None)
+        with pytest.raises(SandboxError, match="enumerate"):
+            mc.uid_pids()
+
+    def test_the_watchdog_stops_a_run_it_cannot_enumerate(self, monkeypatch):
+        proc = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+
+        def broken():
+            raise SandboxError("cannot enumerate processes: test")
+        monkeypatch.setattr(mc, "uid_pids", broken)
+        try:
+            dog = mc.RssWatchdog(proc, 1 << 30, rss_fn=lambda pgid: 0, table_fn=lambda: [],
+                                 member_fn=lambda pid: True)
+            with dog:
+                proc.wait(timeout=10)
+            assert dog.tripped == "process"
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()

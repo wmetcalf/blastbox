@@ -457,7 +457,10 @@ class RssWatchdog:
 
     def __exit__(self, *exc: object) -> None:
         self._stop.set()
-        self._thread.join(timeout=2.0)
+        # Fully joined: a sample still in flight (``ps`` may block for seconds, a big walk too)
+        # must not land after the run -- once the slot is wiped and reused, its stale view could
+        # match the NEXT job (same container identity) and kill it with this job's limits.
+        self._thread.join()
 
     def _ancestry(self, table: list[_Proc]) -> set[int]:
         """The run's group, its leader and every member seen before."""
@@ -491,7 +494,14 @@ class RssWatchdog:
 
     def _sample(self) -> None:
         table = self._table_fn()
-        family = self._family(table)
+        try:
+            family = self._family(table)
+        except SandboxError as exc:
+            # The run's processes can't be enumerated: nothing can be metered, so stop the run.
+            self._trip("process", str(exc))
+            return
+        if self._stop.is_set():
+            return
         self.seen.update(r.pid for r in family)
         rss = self._rss_fn(self._pgid) if self._rss_fn else sum(r.rss for r in family)
         self.peak_bytes = max(self.peak_bytes, rss)
@@ -509,6 +519,8 @@ class RssWatchdog:
                                    f"(limit {self._disk_limit} bytes / {MAX_SCRATCH_ENTRIES} entries)")
 
     def _trip(self, why: str, detail: str) -> None:
+        if self._stop.is_set():
+            return          # the run is over; its own exit path does the final kill
         self.tripped = why
         _log.warning("macos sandbox: %s; killing the run", detail)
         self.kill_family()
@@ -536,7 +548,13 @@ class RssWatchdog:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(self._pgid, signal.SIGKILL)
         table = self._table_fn()
-        live = {r.pid for r in self._family(table)} - {os.getpid()}
+        try:
+            family = {r.pid for r in self._family(table)}
+        except SandboxError:
+            # Can't match by sandbox identity: still kill everything known by ancestry. (The
+            # post-run sweep then fails the run, since it can't prove the rest gone either.)
+            family = {r.pid for r in table if r.pgid == self._pgid} | self.seen
+        live = family - {os.getpid()}
         for pid in live:
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.kill(pid, signal.SIGKILL)
@@ -638,6 +656,8 @@ def run_confined(
         killed = True
         what = ("process-family RSS exceeded " + str(limits.memory_bytes) + " bytes"
                 if dog.tripped == "memory" else
+                "the run's processes could not be enumerated"
+                if dog.tripped == "process" else
                 "writable dirs exceeded " + str(limits.tmpfs_bytes) + " bytes or "
                 + str(MAX_SCRATCH_ENTRIES) + " entries")
         stderr += f"\n[blastbox] killed: {what}\n".encode()
@@ -718,17 +738,30 @@ def proc_start_time(pid: int) -> float | None:
     return info.pbi_start_tvsec + info.pbi_start_tvusec / 1e6
 
 
+def process_apis_available() -> bool:
+    """The private libSystem calls the sweeps and the watchdog's identity match rely on."""
+    return _LIBSYSTEM is not None
+
+
 def uid_pids(uid: int | None = None) -> list[int]:
-    """Every pid owned by ``uid`` (default: ours)."""
+    """Every pid owned by ``uid`` (default: ours).
+
+    Raises ``SandboxError`` when the process list can't be read: an empty answer would read as
+    "nothing left" and let a sweep release a slot an escaped child still runs in. (Off Darwin
+    there are no macOS sandboxes to find, so the answer is genuinely empty.)"""
     if _LIBSYSTEM is None:
+        if IS_DARWIN:
+            raise SandboxError("cannot enumerate processes: libSystem process APIs unavailable")
         return []
     uid = os.getuid() if uid is None else uid
     n = _LIBSYSTEM.proc_listpids(_PROC_UID_ONLY, uid, None, 0)
     if n <= 0:
-        return []
+        raise SandboxError(f"cannot enumerate processes: proc_listpids sizing returned {n}")
     buf = (ctypes.c_int * (n // 4 + 256))()
     got = _LIBSYSTEM.proc_listpids(_PROC_UID_ONLY, uid, buf, ctypes.sizeof(buf))
-    return [p for p in buf[: max(0, got) // 4] if p > 0]
+    if got <= 0:
+        raise SandboxError(f"cannot enumerate processes: proc_listpids returned {got}")
+    return [p for p in buf[: got // 4] if p > 0]
 
 
 def is_sandboxed(pid: int) -> bool:
@@ -840,50 +873,84 @@ _CLONEFILE = _clonefile_fn()
 _CLONE_NOFOLLOW = 0x0001
 
 
-def _copy_regular(src: Path, dst: Path) -> None:
-    """APFS clone when possible (O(1), copy-on-write), else a byte copy. Never follows links."""
+def _copy_regular(src: Path, dst: Path, mode: int) -> None:
+    """APFS clone when possible (O(1), copy-on-write; keeps the mode), else a byte copy that
+    then gets ``src``'s permission bits. Never follows links."""
     if _CLONEFILE is not None:
         if _CLONEFILE(os.fsencode(src), os.fsencode(dst), _CLONE_NOFOLLOW) == 0:
             return
     with open(src, "rb", opener=lambda p, f: os.open(p, f | os.O_NOFOLLOW)) as fin, \
             open(dst, "xb") as fout:
         shutil.copyfileobj(fin, fout, 1024 * 1024)
+    os.chmod(dst, _perm_bits(mode), follow_symlinks=False)
 
 
-def copy_no_follow(src: Path, dst: Path, *, budget_bytes: int) -> int:
+def _perm_bits(mode: int) -> int:
+    # rwx for user/group/other only: a copy never carries setuid/setgid/sticky.
+    return stat.S_IMODE(mode) & 0o777
+
+
+class CopyBudget:
+    """Bytes and entries one run's copies may use together, across every call that shares it --
+    so N mounts staged (or copied back) for one run can't each take the whole budget, and a
+    tree of empty files or symlinks can't exhaust inodes."""
+
+    def __init__(self, max_bytes: int, max_entries: int | None = None) -> None:
+        self.max_bytes = max_bytes
+        self.max_entries = MAX_SCRATCH_ENTRIES if max_entries is None else max_entries
+        self.bytes = 0
+        self.entries = 0
+
+    def charge(self, nbytes: int, at: Path) -> None:
+        self.entries += 1
+        self.bytes += nbytes
+        if self.bytes > self.max_bytes:
+            raise SandboxError(f"sandbox copy exceeds budget of {self.max_bytes} bytes at {at}")
+        if self.entries > self.max_entries:
+            raise SandboxError(f"sandbox copy exceeds {self.max_entries} entries at {at}")
+
+
+def copy_no_follow(src: Path, dst: Path, *, budget_bytes: int | None = None,
+                   budget: CopyBudget | None = None) -> int:
     """Copy ``src`` (file or tree) to ``dst`` without ever following a symlink.
 
-    Regular files and directories are copied; a symlink is recreated as a symlink (its target
-    is never opened -- the host trust gate confines artifact paths); FIFOs, sockets and device
-    nodes are skipped, because opening a FIFO a hostile child left behind would block the
-    worker forever. Raises :class:`SandboxError` once more than ``budget_bytes`` would be
-    copied, so a child cannot fill the worker's disk through the copy-back. Returns bytes copied.
+    Regular files and directories are copied with their permission bits; a symlink is recreated
+    as a symlink (its target is never opened -- the host trust gate confines artifact paths);
+    FIFOs, sockets and device nodes are skipped, because opening a FIFO a hostile child left
+    behind would block the worker forever. Every entry is charged to ``budget`` (or a fresh one
+    of ``budget_bytes``), which raises :class:`SandboxError` once its bytes or entries are
+    exceeded, so a child cannot fill the worker's disk through the copy-back. Returns bytes
+    copied by this call.
     """
-    copied = 0
+    if budget is None:
+        if budget_bytes is None:
+            raise TypeError("copy_no_follow needs budget_bytes or budget")
+        budget = CopyBudget(budget_bytes)
+    start = budget.bytes
 
     def _one(s: Path, d: Path) -> None:
-        nonlocal copied
         st = os.lstat(s)
         mode = st.st_mode
         if stat.S_ISLNK(mode):
+            budget.charge(0, s)
             os.symlink(os.readlink(s), d)
         elif stat.S_ISDIR(mode):
+            budget.charge(0, s)
             d.mkdir(mode=0o700)
             with os.scandir(s) as it:
                 for entry in it:
                     _one(Path(entry.path), d / entry.name)
+            # After the children: a read-only source dir must not block filling its copy.
+            os.chmod(d, _perm_bits(mode), follow_symlinks=False)
         elif stat.S_ISREG(mode):
-            copied += st.st_size
-            if copied > budget_bytes:
-                raise SandboxError(
-                    f"sandbox copy exceeds budget of {budget_bytes} bytes at {s}"
-                )
-            _copy_regular(s, d)
+            budget.charge(st.st_size, s)
+            _copy_regular(s, d, mode)
         else:
+            budget.charge(0, s)
             _log.warning("macos sandbox: skipping non-regular file %s (mode %o)", s, mode)
 
     _one(src, dst)
-    return copied
+    return budget.bytes - start
 
 
 def rewrite_path_args(

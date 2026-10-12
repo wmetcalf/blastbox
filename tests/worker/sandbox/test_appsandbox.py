@@ -445,3 +445,206 @@ def test_a_real_sandboxed_launch_is_credited(real_sb):
     before = confined_runs()
     assert real_sb.run(SandboxRequest(argv=["/usr/bin/true"])).exit_code == 0
     assert confined_runs() == before + 1
+
+
+def _sb_with(tmp_path, popen=None, ro_paths=(), **kw):
+    root = tmp_path / "root"
+    asb.prepare(root, slots=1, ro_paths=list(ro_paths), runner=_fake_runner([]))
+    home = tmp_path / "home"
+    sb = asb.AppSandboxSandbox(root=root, popen=popen or _Popen(), home=home, platform_ok=True,
+                               verify=False, slot_wait_s=0, **kw)
+    return sb, home
+
+
+class TestStagingBudgetIsRunWide:
+    def test_mounts_share_one_byte_budget(self, tmp_path):
+        sb, _ = _sb_with(tmp_path)
+        mounts = []
+        for n in ("a", "b"):
+            d = tmp_path / n
+            d.mkdir()
+            (d / "blob").write_bytes(b"x" * 600)
+            mounts.append(Mount(d, d))
+        with pytest.raises(SandboxError, match="budget"):
+            sb.run(SandboxRequest(argv=["/usr/bin/true"], rw_mounts=mounts,
+                                  limits=Limits(tmpfs_bytes=1000)))
+        assert list(sb.manifest.slots[0].io_dir.iterdir()) == []      # staging cleaned up
+
+    def test_an_entry_bomb_stops_staging(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mc, "MAX_SCRATCH_ENTRIES", 50)
+        sb, _ = _sb_with(tmp_path)
+        d = tmp_path / "bomb"
+        d.mkdir()
+        for i in range(100):
+            (d / f"e{i}").touch()
+        with pytest.raises(SandboxError, match="entries"):
+            sb.run(SandboxRequest(argv=["/usr/bin/true"], ro_mounts=[Mount(d, d)]))
+
+
+class TestSlotWait:
+    @pytest.mark.parametrize("raw", ["nan", "inf", "-1", "soon"])
+    def test_a_bad_env_value_refuses_the_backend(self, tmp_path, monkeypatch, raw):
+        root = tmp_path / "root"
+        asb.prepare(root, slots=1, ro_paths=[], runner=_fake_runner([]))
+        monkeypatch.setenv("BLASTBOX_APPSANDBOX_SLOT_WAIT_S", raw)
+        with pytest.raises(SandboxUnavailable, match="slot wait"):
+            asb.AppSandboxSandbox(root=root, platform_ok=True, verify=False)
+
+    def test_a_nan_argument_is_refused(self, tmp_path):
+        root = tmp_path / "root"
+        asb.prepare(root, slots=1, ro_paths=[], runner=_fake_runner([]))
+        with pytest.raises(SandboxUnavailable, match="slot wait"):
+            asb.AppSandboxSandbox(root=root, platform_ok=True, verify=False,
+                                  slot_wait_s=float("nan"))
+
+
+class TestCreditOnlyForCompletedRuns:
+    def test_failed_or_killed_runs_are_not_credited(self, tmp_path):
+        from blastbox.worker.sandbox.base import confined_runs
+        sb, _ = _sb_with(tmp_path)
+        before = confined_runs()
+        sb.run(SandboxRequest(argv=["/bin/sh", "-c", "exit 3"]))
+        r = sb.run(SandboxRequest(argv=["/bin/sleep", "5"], limits=Limits(timeout_s=1)))
+        assert r.killed
+        assert confined_runs() == before
+        assert sb.run(SandboxRequest(argv=["/usr/bin/true"])).exit_code == 0
+        assert confined_runs() == before + 1
+
+    def test_a_copy_back_that_raises_is_not_credited(self, tmp_path):
+        from blastbox.worker.sandbox.base import confined_runs
+        sb, _ = _sb_with(tmp_path)
+        out = tmp_path / "out"
+        out.mkdir()
+        before = confined_runs()
+        with pytest.raises(SandboxError):
+            sb.run(SandboxRequest(argv=["/bin/sh", "-c", 'head -c 5000 /dev/zero > "$0/big"',
+                                        str(out)],
+                                  rw_mounts=[Mount(out, out)], limits=Limits(tmpfs_bytes=1000)))
+        assert confined_runs() == before
+
+
+class TestCopyBackRootType:
+    def test_a_file_mount_replaced_by_a_symlink_is_not_planted(self, tmp_path):
+        sb, _ = _sb_with(tmp_path)
+        target = tmp_path / "result.json"
+        target.write_text("{}")
+        elsewhere = tmp_path / "victim"
+        elsewhere.write_text("host data")
+        with pytest.raises(SandboxError, match="replaced inside the sandbox"):
+            sb.run(SandboxRequest(argv=["/bin/sh", "-c", 'rm "$0" && ln -s "$1" "$0"',
+                                        str(target), str(elsewhere)],
+                                  rw_mounts=[Mount(target, target)]))
+        assert not target.is_symlink() and target.read_text() == "{}"
+
+    def test_a_dir_mount_replaced_by_a_symlink_does_not_empty_the_host_dir(self, tmp_path):
+        sb, _ = _sb_with(tmp_path)
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "keep").write_text("x")
+        with pytest.raises(SandboxError, match="replaced inside the sandbox"):
+            sb.run(SandboxRequest(argv=["/bin/sh", "-c", 'rm -rf "$0" && ln -s /tmp "$0"',
+                                        str(out)],
+                                  rw_mounts=[Mount(out, out)]))
+        assert (out / "keep").read_text() == "x"
+
+
+def test_an_executable_named_by_its_mount_target_runs(tmp_path):
+    engine = tmp_path / "engine"
+    (engine / "bin").mkdir(parents=True)
+    tool = engine / "bin" / "parser"
+    tool.write_text("#!/bin/sh\necho parsed\n")
+    tool.chmod(0o755)
+    sb, _ = _sb_with(tmp_path, ro_paths=[engine])
+    target = Path("/bb-test-engine-not-on-host")
+    assert not target.exists()
+    r = sb.run(SandboxRequest(argv=[str(target / "bin" / "parser")],
+                              ro_mounts=[Mount(engine, target)]))
+    assert r.exit_code == 0 and r.stdout == b"parsed\n", r.stderr
+
+
+def test_overlapping_rw_mounts_copy_back_parent_first(tmp_path):
+    sb, _ = _sb_with(tmp_path)
+    parent = tmp_path / "work"
+    nested = parent / "out"
+    nested.mkdir(parents=True)
+    # nested listed first; the child writes through the nested mount's path
+    r = sb.run(SandboxRequest(argv=["/bin/sh", "-c", 'echo new > "$0/f"', str(nested)],
+                              rw_mounts=[Mount(nested, nested), Mount(parent, parent)]))
+    assert r.exit_code == 0, r.stderr
+    assert (nested / "f").read_text() == "new\n"
+
+
+def test_a_container_swapped_during_the_run_is_never_captured(tmp_path):
+    root = tmp_path / "root"
+    asb.prepare(root, slots=1, ro_paths=[], runner=_fake_runner([]))
+    home = tmp_path / "home"
+    container = asb.Manifest.load(root).slots[0].container_data(home)
+    container.mkdir(parents=True)
+    sb = asb.AppSandboxSandbox(root=root, popen=_Popen(), home=home, platform_ok=True,
+                               verify=False, slot_wait_s=0)
+    victim = tmp_path / "host-secrets"
+    victim.mkdir()
+    (victim / "key").write_text("secret")
+    cap = tmp_path / "capture"
+    with pytest.raises(SandboxError):
+        sb.run(SandboxRequest(argv=["/bin/sh", "-c", 'rm -rf "$0" && ln -s "$1" "$0"',
+                                    str(container), str(victim)],
+                              capture_home=cap))
+    assert not (cap / "key").exists()
+    assert (victim / "key").read_text() == "secret"
+
+
+class TestVerifySlotEntitlements:
+    def _runner(self, slot, ents, ident=None):
+        xml = plistlib.dumps(ents)
+
+        def run(argv, **kw):
+            if "--verify" in argv:
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            if "-v" in argv:
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout="", stderr=f"Executable=x\nIdentifier={ident or slot.bundle_id}\n")
+            return subprocess.CompletedProcess(argv, 0, stdout=xml, stderr=b"")
+        return run
+
+    def _slot(self, tmp_path):
+        engine = tmp_path / "engine"
+        engine.mkdir()
+        m = asb.prepare(tmp_path / "root", slots=2, ro_paths=[engine], runner=_fake_runner([]))
+        return m
+
+    def test_exact_entitlements_pass(self, tmp_path):
+        m = self._slot(tmp_path)
+        s = m.slots[0]
+        want = asb.expected_entitlements(s, m.ro_paths)
+        assert asb.verify_slot(s, ro_paths=m.ro_paths, runner=self._runner(s, want)) is None
+
+    def test_extra_or_wrong_grants_fail(self, tmp_path):
+        m = self._slot(tmp_path)
+        s, other = m.slots
+        want = asb.expected_entitlements(s, m.ro_paths)
+        net = {**want, "com.apple.security.network.client": True}
+        assert "unexpected" in asb.verify_slot(s, ro_paths=m.ro_paths, runner=self._runner(s, net))
+        wrong_io = {**want, asb._RW_EXCEPTION: [str(other.io_dir) + "/"]}
+        assert "mismatched" in asb.verify_slot(s, ro_paths=m.ro_paths,
+                                               runner=self._runner(s, wrong_io))
+        broad = {**want, asb._RO_EXCEPTION: ["/"]}
+        assert "mismatched" in asb.verify_slot(s, ro_paths=m.ro_paths,
+                                               runner=self._runner(s, broad))
+
+    def test_wrong_signing_identifier_fails(self, tmp_path):
+        m = self._slot(tmp_path)
+        s = m.slots[0]
+        want = asb.expected_entitlements(s, m.ro_paths)
+        why = asb.verify_slot(s, ro_paths=m.ro_paths,
+                              runner=self._runner(s, want, ident=m.slots[1].bundle_id))
+        assert why and "signed as" in why
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin requires the process APIs")
+def test_backend_refuses_without_process_apis(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    asb.prepare(root, slots=1, ro_paths=[], runner=_fake_runner([]))
+    monkeypatch.setattr(mc, "_LIBSYSTEM", None)
+    with pytest.raises(SandboxUnavailable, match="process APIs"):
+        asb.AppSandboxSandbox(root=root, platform_ok=True, verify=False)

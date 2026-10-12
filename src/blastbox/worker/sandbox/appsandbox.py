@@ -48,6 +48,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import math
 import os
 import plistlib
 import pwd
@@ -108,6 +109,20 @@ int main(int argc, char **argv) {
 }
 """
 HANDSHAKE_NAME = ".bb-handshake"
+
+
+def _host_path(argv0: str, mounts: list) -> str:
+    """``argv0`` with a mount TARGET prefix replaced by that mount's source (longest target
+    first, as path rewriting does); unchanged when no mount covers it."""
+    for m in sorted(mounts, key=lambda m: len(str(m.target)), reverse=True):
+        target, source = str(Path(m.target)), str(Path(m.source))
+        if target == source:
+            continue
+        if argv0 == target:
+            return source
+        if argv0.startswith(target.rstrip("/") + "/"):
+            return source.rstrip("/") + argv0[len(target.rstrip("/")):]
+    return argv0
 
 
 class AppSandboxNotPrepared(SandboxUnavailable):
@@ -278,19 +293,15 @@ def prepare(
                 "CFBundleName": f"blastbox slot {i}",
                 "LSUIElement": True,
             }, fh)
-        ent: dict[str, object] = {
-            _APP_SANDBOX: True,
-            _RW_EXCEPTION: [_dir_entitlement(io_dir.resolve())],
-        }
-        if resolved_ro:
-            ent[_RO_EXCEPTION] = [_dir_entitlement(p) for p in resolved_ro]
+        slot = Slot(index=i, bundle_id=bundle_id, bundle=bundle, io_dir=io_dir.resolve(),
+                    lock_path=root / "locks" / f"{i}.lock")
+        ent = expected_entitlements(slot, resolved_ro)
         ent_path = slot_dir / "entitlements.plist"
         with open(ent_path, "wb") as fh:
             plistlib.dump(ent, fh)
         _run([codesign, "--force", "--sign", "-", "--options", "runtime",
               "--entitlements", str(ent_path), str(bundle)], runner)
-        built.append(Slot(index=i, bundle_id=bundle_id, bundle=bundle,
-                          io_dir=io_dir.resolve(), lock_path=root / "locks" / f"{i}.lock"))
+        built.append(slot)
 
     # Drop slots beyond the new count so a shrink cannot leave stale signed launchers around.
     slots_root = root / "slots"
@@ -306,19 +317,50 @@ def prepare(
     return manifest
 
 
+def expected_entitlements(slot: Slot, ro_paths: tuple[Path, ...] | list[Path]) -> dict[str, object]:
+    """Exactly what :func:`prepare` signs into ``slot``: App Sandbox, read-write on the slot's
+    own ``io/`` and read-only on the manifest's paths -- nothing else."""
+    ent: dict[str, object] = {
+        _APP_SANDBOX: True,
+        _RW_EXCEPTION: [_dir_entitlement(slot.io_dir)],
+    }
+    if ro_paths:
+        ent[_RO_EXCEPTION] = [_dir_entitlement(Path(p)) for p in ro_paths]
+    return ent
+
+
+def _codesign_text(proc: subprocess.CompletedProcess) -> str:
+    out = []
+    for stream in (proc.stdout, proc.stderr):
+        out.append(stream.decode(errors="replace") if isinstance(stream, bytes) else (stream or ""))
+    return "\n".join(out)
+
+
 def verify_slot(
     slot: Slot,
     *,
+    ro_paths: tuple[Path, ...] | list[Path] | None = None,
     codesign: str = "/usr/bin/codesign",
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
 ) -> str | None:
-    """None if the slot's signature is valid and carries App Sandbox, else why not."""
+    """None if the slot's signature is valid, names the slot's bundle id, and carries exactly
+    the entitlements :func:`prepare` grants it (``ro_paths``: the manifest's), else why not.
+
+    A launcher re-signed or copied with other grants -- a broader path, another slot's ``io/``,
+    a network entitlement -- would run hostile parsers with permissions that match neither the
+    manifest nor the slot's lock/container identity, so any difference fails the check."""
     if not slot.launcher.is_file():
         return f"slot {slot.index}: launcher missing"
     proc = runner([codesign, "--verify", "--strict", str(slot.bundle)],
                   capture_output=True, text=True, check=False)
     if proc.returncode != 0:
         return f"slot {slot.index}: signature invalid ({proc.stderr.strip()})"
+    proc = runner([codesign, "-d", "-v", str(slot.bundle)], capture_output=True, text=True,
+                  check=False)
+    ident = next((ln.split("=", 1)[1].strip() for ln in _codesign_text(proc).splitlines()
+                  if ln.startswith("Identifier=")), None)
+    if ident != slot.bundle_id:
+        return f"slot {slot.index}: signed as {ident!r}, expected {slot.bundle_id!r}"
     proc = runner([codesign, "-d", "--entitlements", "-", "--xml", str(slot.bundle)],
                   capture_output=True, check=False)
     blob = proc.stdout if isinstance(proc.stdout, bytes) else (proc.stdout or "").encode()
@@ -328,7 +370,29 @@ def verify_slot(
         ents = {}
     if ents.get(_APP_SANDBOX) is not True:
         return f"slot {slot.index}: app-sandbox entitlement missing"
+    want = expected_entitlements(slot, tuple(ro_paths or ()))
+    if ents != want:
+        extra = sorted(set(ents) - set(want))
+        changed = sorted(k for k in want if ents.get(k) != want[k])
+        return (f"slot {slot.index}: entitlements differ from the manifest "
+                f"(unexpected: {extra}, mismatched: {changed})")
     return None
+
+
+def _slot_wait(value: float | None) -> float:
+    """``slot_wait_s``, else ``$BLASTBOX_APPSANDBOX_SLOT_WAIT_S`` (default 30): finite and >= 0,
+    or the backend refuses to start (a NaN deadline never expires, so a busy slot would hang
+    the job until the agent's hard deadline)."""
+    raw: object = value
+    if raw is None:
+        raw = os.environ.get("BLASTBOX_APPSANDBOX_SLOT_WAIT_S", "") or "30"
+    try:
+        wait = float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise SandboxUnavailable(f"appsandbox slot wait {raw!r} is not a number") from exc
+    if not math.isfinite(wait) or wait < 0:
+        raise SandboxUnavailable(f"appsandbox slot wait {raw!r} must be finite and >= 0")
+    return wait
 
 
 class AppSandboxSandbox:
@@ -356,12 +420,15 @@ class AppSandboxSandbox:
         self._popen = popen
         self._rss_fn = rss_fn
         self._home = home or Path(pwd.getpwuid(os.getuid()).pw_dir)
-        self._slot_wait_s = slot_wait_s if slot_wait_s is not None else float(
-            os.environ.get("BLASTBOX_APPSANDBOX_SLOT_WAIT_S", "30") or "30")
+        self._slot_wait_s = _slot_wait(slot_wait_s)
+        if mc.IS_DARWIN and not mc.process_apis_available():
+            # Without them a run's escaped processes can't be found, so a slot can't be proven
+            # empty before reuse.
+            raise SandboxUnavailable("appsandbox: libSystem process APIs unavailable")
         self._insecurity_reasons: list[str] = []
         if verify:
             for slot in self._manifest.slots:
-                why = verify_slot(slot, runner=runner)
+                why = verify_slot(slot, ro_paths=self._manifest.ro_paths, runner=runner)
                 if why:
                     raise SandboxUnavailable(f"appsandbox {why}; re-run `blastbox macos prepare`")
 
@@ -473,7 +540,11 @@ class AppSandboxSandbox:
             raise SandboxError("argv must be a non-empty list of strings")
         if request.limits.net_egress:
             _log.warning("appsandbox: net_egress requested; network stays DENIED (fail-closed)")
-        exe, exe_real = mc.resolve_executable(request.argv[0])
+        # argv[0] may name a mount TARGET (source /opt/engine at /engine, exe /engine/bin/x),
+        # which need not exist on the host: resolve and check the mounted source it stands for,
+        # and exec that -- the prepared ro paths, not the staged copy, are what may be exec'd.
+        exe, exe_real = mc.resolve_executable(
+            _host_path(request.argv[0], [*request.ro_mounts, *request.rw_mounts]))
         self._check_exec_allowed(exe)
         self._check_exec_allowed(exe_real)
 
@@ -485,6 +556,8 @@ class AppSandboxSandbox:
                 self._wipe_slot(slot)
 
     def _run_in_slot(self, slot: Slot, exe: Path, request: SandboxRequest) -> SandboxResult:
+        # Every staging and copy-back copy of the run draws on ONE budget (bytes and entries):
+        # the run-wide limit holds before the watchdog starts, however many mounts there are.
         io = slot.io_dir
         home = io / "home"
         (home / "tmp").mkdir(parents=True)
@@ -503,17 +576,18 @@ class AppSandboxSandbox:
             mc.seed_scratch(container, request.seed_home, budget)
 
         mapping: list[tuple[str, str]] = []
-        rw_staged: list[tuple[Path, Path]] = []
+        rw_staged: list[tuple[Path, Path, bool]] = []
+        staging = mc.CopyBudget(budget)
         for i, m in enumerate([*request.ro_mounts, *request.rw_mounts]):
             src = Path(m.source).resolve(strict=True)
             staged = io / "m" / str(i) / (src.name or "root")
             staged.parent.mkdir(parents=True)
-            mc.copy_no_follow(src, staged, budget_bytes=budget)
+            mc.copy_no_follow(src, staged, budget=staging)
             mapping.append((str(m.target), str(staged)))
             if str(Path(m.target)) != str(src):
                 mapping.append((str(src), str(staged)))
             if i >= len(request.ro_mounts):
-                rw_staged.append((src, staged))
+                rw_staged.append((src, staged, stat.S_ISDIR(os.lstat(src).st_mode)))
 
         args = mc.rewrite_path_args(request.argv[1:], mapping)
         extra_env = {k: mc.rewrite_path_args([v], mapping)[0] for k, v in request.env.items()}
@@ -527,18 +601,32 @@ class AppSandboxSandbox:
             sweep=lambda: self._sweep_slot(slot),
             member_fn=mc.container_matcher(container),
         )
-        # Credited only on the handshake the launcher writes once it is sandboxed: a failure
-        # anywhere before that must not pass as a confined run.
-        if _handshake_ok(marker, nonce):
+        # The handshake the launcher writes once it is sandboxed proves the chain reached the
+        # sandbox; read (and remove) it now, credit it only at the end.
+        handshake = _handshake_ok(marker, nonce)
+
+        copy_back = mc.CopyBudget(budget)
+        # Parent-first, so a nested rw mount's result lands over its parent's stale snapshot of
+        # that subtree, whatever order the request listed them in.
+        for src, staged, was_dir in sorted(rw_staged, key=lambda t: len(t[0].parts)):
+            self._copy_back(staged, src, copy_back, was_dir)
+        ok = result.exit_code == 0 and not result.killed
+        if ok and request.capture_home is not None and os.path.lexists(container):
+            # The child owns its container and may have swapped Data/ for a symlink to a host
+            # dir: never follow it into a capture.
+            if not stat.S_ISDIR(os.lstat(container).st_mode):
+                raise SandboxError(f"appsandbox: refusing to capture {container}: "
+                                   "it is no longer a real directory")
+            mc.capture_scratch(container, request.capture_home, budget)
+
+        # Credited only for a run that reached the sandbox AND completed: an engine that falls
+        # back to parsing in-process after a failed or killed sandboxed run (or a copy-back that
+        # raised) must not pass that parse off as confined.
+        if handshake and ok:
             note_confined_run()
-        else:
+        elif not handshake:
             _log.warning("appsandbox: no handshake from the sandboxed launcher; run not counted "
                          "as confined (exit %s)", result.exit_code)
-
-        for src, staged in rw_staged:
-            self._copy_back(staged, src, budget)
-        if result.exit_code == 0 and not result.killed and container.is_dir():
-            mc.capture_scratch(container, request.capture_home, budget)
 
         if result.exit_code in _SIGTRAP_CODES and not result.killed:
             result.stderr += (
@@ -565,18 +653,30 @@ class AppSandboxSandbox:
         mc.wipe_dir(container)
 
     @staticmethod
-    def _copy_back(staged: Path, dest: Path, budget: int) -> None:
-        """Make ``dest`` mirror the staged copy the child left (bind-mount semantics)."""
-        if not os.path.lexists(staged):
+    def _copy_back(staged: Path, dest: Path, budget: mc.CopyBudget, was_dir: bool) -> None:
+        """Make ``dest`` mirror the staged copy the child left (bind-mount semantics).
+
+        The staged ROOT must still be what was mounted -- a real directory for a directory
+        mount, a regular file for a file mount. Its staging parent is writable, so the child can
+        replace it (with a symlink, say), which a real bind mount does not allow: that would
+        empty the host directory, or plant an attacker-chosen symlink at the host path. So the
+        root is checked before ``dest`` is touched, and a changed type fails the run."""
+        try:
+            st = os.lstat(staged)
+        except FileNotFoundError:
             return
-        if dest.is_dir() and not dest.is_symlink():
+        same_type = stat.S_ISDIR(st.st_mode) if was_dir else stat.S_ISREG(st.st_mode)
+        if not same_type:
+            raise SandboxError(
+                f"appsandbox: rw mount {dest} was replaced inside the sandbox (expected a "
+                f"{'directory' if was_dir else 'regular file'}); not copied back")
+        if was_dir:
+            if not stat.S_ISDIR(os.lstat(dest).st_mode):
+                raise SandboxError(f"appsandbox: rw mount {dest} is no longer a directory")
             for child in dest.iterdir():
                 mc.remove_tree(child)
-            used = 0
-            if staged.is_dir() and not staged.is_symlink():
-                for child in staged.iterdir():
-                    used += mc.copy_no_follow(child, dest / child.name,
-                                              budget_bytes=budget - used)
+            for child in staged.iterdir():
+                mc.copy_no_follow(child, dest / child.name, budget=budget)
         else:
             mc.remove_tree(dest)
-            mc.copy_no_follow(staged, dest, budget_bytes=budget)
+            mc.copy_no_follow(staged, dest, budget=budget)

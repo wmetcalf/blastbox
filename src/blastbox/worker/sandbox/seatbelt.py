@@ -178,6 +178,9 @@ class SeatbeltSandbox:
             raise SandboxUnavailable("seatbelt is macOS-only")
         if not (Path(sandbox_exec).is_file() and os.access(sandbox_exec, os.X_OK)):
             raise SandboxUnavailable(f"{sandbox_exec} not found")
+        if mc.IS_DARWIN and not mc.process_apis_available():
+            # Without them a run's escaped processes can't be found or swept.
+            raise SandboxUnavailable("seatbelt: libSystem process APIs unavailable")
         self._sandbox_exec = sandbox_exec
         raw_base = scratch_base if scratch_base is not None else os.environ.get(
             "BLASTBOX_MACOS_SCRATCH_DIR", "")
@@ -239,16 +242,21 @@ class SeatbeltSandbox:
                 sweep=lambda: mc.sweep_writers(scratch, started_after=launched),
                 member_fn=mc.writer_matcher(scratch, started_after=launched),
             )
-            # Counted only when the handshake proves a process ran under the profile: not for a
-            # failure before launch (bad seed, Popen error) nor a profile sandbox-exec rejected,
-            # so an engine's in-process fallback can't pass as confined.
-            if self._handshake_ok(marker, nonce):
+            # The handshake proves a process ran under the profile (not a failure before launch,
+            # nor a profile sandbox-exec rejected). Read -- and removed, so it is never captured
+            # -- now; credited only at the end.
+            handshake = self._handshake_ok(marker, nonce)
+            ok = result.exit_code == 0 and not result.killed
+            if ok:
+                mc.capture_scratch(scratch, request.capture_home, request.limits.tmpfs_bytes)
+            # Counted only for a run that reached the profile AND completed, after everything
+            # that can still raise: an engine that falls back to an in-process parse after a
+            # failed or killed sandboxed run must not pass it off as confined.
+            if handshake and ok:
                 note_confined_run()
-            else:
+            elif not handshake:
                 _log.warning("seatbelt: no handshake from inside the profile; run not counted "
                              "as confined (exit %s)", result.exit_code)
-            if result.exit_code == 0 and not result.killed:
-                mc.capture_scratch(scratch, request.capture_home, request.limits.tmpfs_bytes)
             return result
         finally:
             # The same unlock-and-verify wipe as a reused slot: a child can lock files or dirs
