@@ -82,3 +82,35 @@ def test_nono_backend_refuses_on_darwin():
     from blastbox.worker.sandbox.nono import NonoSandbox
     with pytest.raises(SandboxUnavailable, match="seatbelt"):
         NonoSandbox(platform="darwin")
+
+
+def test_a_container_marker_on_darwin_does_not_select_the_linux_container_backend(on, monkeypatch):
+    # A stale /.dockerenv (or any _in_container() hit) on a Mac must not bypass the macOS-only
+    # candidate list and pick the `container` backend (a direct host subprocess).
+    on("darwin")
+    monkeypatch.setattr(detect, "_in_container", lambda: True)
+    tried = []
+
+    def make(name, **kw):
+        tried.append(name)
+        raise SandboxUnavailable("no")
+
+    monkeypatch.setattr(detect, "_make_backend", make)
+    with pytest.raises(SandboxUnavailable):
+        detect.select_sandbox()
+    assert set(tried) == {"seatbelt", "appsandbox"}
+
+
+def test_linux_still_prefers_the_container_backend_inside_a_container(on, monkeypatch):
+    on("linux")
+    monkeypatch.setattr(detect, "_in_container", lambda: True)
+    tried = []
+
+    def make(name, **kw):
+        tried.append(name)
+        raise SandboxUnavailable("no")
+
+    monkeypatch.setattr(detect, "_make_backend", make)
+    with pytest.raises(SandboxUnavailable):
+        detect.select_sandbox()
+    assert tried == list(detect._CONTAINER_BACKENDS)

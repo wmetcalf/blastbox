@@ -402,3 +402,19 @@ def test_seatbelt_refuses_without_process_apis(monkeypatch):
     monkeypatch.setattr(mc, "_LIBSYSTEM", None)
     with pytest.raises(SandboxUnavailable, match="process APIs"):
         SeatbeltSandbox(platform_ok=True, sandbox_exec="/bin/sh")
+
+
+def test_a_run_whose_scratch_cannot_be_removed_is_not_credited(monkeypatch, tmp_path):
+    # The credit comes after the final scratch removal: an engine that catches this failure and
+    # falls back to parsing in-process must not pass the fallback off as confined.
+    from blastbox.worker.sandbox.base import confined_runs
+
+    def stuck(path):
+        raise SandboxError(f"could not empty {path}: ['locked']")
+    monkeypatch.setattr(mc, "wipe_dir", stuck)
+    before = confined_runs()
+    sb = SeatbeltSandbox(popen=lambda argv, **kw: _FakeProc(argv, **kw), platform_ok=True,
+                         sandbox_exec="/bin/sh", scratch_base=tmp_path / "scratch")
+    with pytest.raises(SandboxError, match="could not remove the run's scratch"):
+        sb.run(SandboxRequest(argv=["/bin/echo"]))
+    assert confined_runs() == before

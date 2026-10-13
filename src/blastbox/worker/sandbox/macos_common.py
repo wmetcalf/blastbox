@@ -116,7 +116,9 @@ def seed_scratch(scratch: Path, seed: Path | None, budget_bytes: int) -> None:
         return
     if not seed.is_dir():
         raise SandboxError(f"seed_home {seed} is not a directory")
-    used = 0
+    # ONE budget (bytes and entries) for the whole seed, merges included: a seed of many
+    # top-level entries must not get the entry cap once per entry.
+    budget = CopyBudget(budget_bytes)
     for child in seed.iterdir():
         if child.name == "tmp":
             continue
@@ -124,20 +126,19 @@ def seed_scratch(scratch: Path, seed: Path | None, budget_bytes: int) -> None:
         if dest.is_dir() and child.is_dir() and not child.is_symlink():
             # Merge into the dirs make_scratch pre-created (Library/Caches).
             for sub in child.iterdir():
-                used += _merge_into(sub, dest / sub.name, budget_bytes - used)
+                _merge_into(sub, dest / sub.name, budget)
         else:
             remove_tree(dest)
-            used += copy_no_follow(child, dest, budget_bytes=budget_bytes - used)
+            copy_no_follow(child, dest, budget=budget)
 
 
-def _merge_into(src: Path, dest: Path, budget: int) -> int:
+def _merge_into(src: Path, dest: Path, budget: CopyBudget) -> None:
     if dest.is_dir() and src.is_dir() and not src.is_symlink():
-        used = 0
         for sub in src.iterdir():
-            used += _merge_into(sub, dest / sub.name, budget - used)
-        return used
+            _merge_into(sub, dest / sub.name, budget)
+        return
     remove_tree(dest)
-    return copy_no_follow(src, dest, budget_bytes=budget)
+    copy_no_follow(src, dest, budget=budget)
 
 
 def capture_scratch(scratch: Path, dest: Path | None, budget_bytes: int) -> None:
@@ -147,11 +148,11 @@ def capture_scratch(scratch: Path, dest: Path | None, budget_bytes: int) -> None
     dest.mkdir(parents=True, exist_ok=True, mode=0o700)
     for child in dest.iterdir():
         remove_tree(child)
-    used = 0
+    budget = CopyBudget(budget_bytes)
     for child in scratch.iterdir():
         if child.name == "tmp":
             continue
-        used += copy_no_follow(child, dest / child.name, budget_bytes=budget_bytes - used)
+        copy_no_follow(child, dest / child.name, budget=budget)
 
 
 def remove_tree(path: Path) -> None:
@@ -316,7 +317,7 @@ def make_apply_rlimits(limits: Limits) -> Callable[[], None]:
 
 
 def group_rss_bytes(pgid: int, ps_runner: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> int:
-    """Sum RSS (bytes) of every live process in group ``pgid``; 0 when unknown."""
+    """Sum RSS (bytes) of every live process in group ``pgid``; raises like :func:`process_table`."""
     return sum(r.rss for r in process_table(ps_runner) if r.pgid == pgid)
 
 
@@ -328,20 +329,30 @@ class _Proc:
 
 
 def process_table(ps_runner: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> list[_Proc]:
-    """Every process's pid, ppid, pgid and RSS (bytes); empty when ``ps`` fails."""
+    """Every process's pid, ppid, pgid and RSS (bytes).
+
+    Raises ``SandboxError`` when ``ps`` fails, times out or lists nothing: an empty table would
+    read as "the run uses no memory", and the watchdog would stop metering while ``ps`` is down.
+    """
     try:
-        out = ps_runner(
+        proc = ps_runner(
             ["/bin/ps", "-A", "-o", "pid=,ppid=,pgid=,rss="],
             capture_output=True, text=True, timeout=5, check=False,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return []
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SandboxError(f"cannot read the process table: {exc}") from exc
+    if proc.returncode != 0:
+        raise SandboxError(f"cannot read the process table: ps exited {proc.returncode}")
+    out = proc.stdout or ""
     rows: list[_Proc] = []
     for line in out.splitlines():
         parts = line.split()
         if len(parts) == 4 and all(p.isdigit() for p in parts):
             pid, ppid, pgid, rss = (int(p) for p in parts)
             rows.append(_Proc(pid, ppid, pgid, rss * 1024))
+    if not rows:
+        # ps always lists at least itself and the worker.
+        raise SandboxError("cannot read the process table: ps listed no processes")
     return rows
 
 
@@ -412,8 +423,10 @@ class RssWatchdog:
     - **disk**: bytes and entries under ``watch_dirs`` (the run's writable dirs) against
       ``disk_limit_bytes`` / ``MAX_SCRATCH_ENTRIES``. ``RLIMIT_FSIZE`` caps one file; this caps
       the run;
-    - it records every family member it ever saw, so :meth:`kill_family` can reap descendants
-      that outlive the leader (reparented to launchd, or in their own session).
+    - it records every family member it ever saw -- by pid AND start time, so a pid the kernel
+      has since handed to an unrelated process is dropped, never metered or killed -- so
+      :meth:`kill_family` can reap descendants that outlive the leader (reparented to launchd,
+      or in their own session).
 
     Polling means a burst between samples can overshoot; it bounds a runaway run, it is not a
     hard ceiling.
@@ -430,9 +443,11 @@ class RssWatchdog:
         disk_limit_bytes: int | None = None,
         table_fn: Callable[[], list[_Proc]] = process_table,
         member_fn: Callable[[int], bool] | None = None,
+        start_fn: Callable[[int], float | None] | None = None,
     ) -> None:
         self._proc = proc
         self._member_fn = member_fn
+        self._start_fn = start_fn or proc_start_time
         self._limit = limit_bytes
         self._interval = interval_s
         self._rss_fn = rss_fn
@@ -442,7 +457,8 @@ class RssWatchdog:
         self._stop = threading.Event()
         self.tripped: str | None = None     # "memory" / "disk" / None
         self.peak_bytes = 0
-        self.seen: set[int] = set()
+        # pid -> start time when first seen: the identity a later sample must still match.
+        self.seen: dict[int, float] = {}
         try:
             self._pgid = os.getpgid(proc.pid)
         except (ProcessLookupError, OSError):
@@ -462,9 +478,26 @@ class RssWatchdog:
         # match the NEXT job (same container identity) and kill it with this job's limits.
         self._thread.join()
 
+    def _seen_alive(self) -> set[int]:
+        """Members seen before that are still the SAME process (same start time); a pid that
+        exited -- and may since belong to another job -- is forgotten."""
+        for pid, started in list(self.seen.items()):
+            if self._start_fn(pid) != started:
+                del self.seen[pid]
+        return set(self.seen)
+
+    def _remember(self, pids: Iterable[int]) -> None:
+        for pid in pids:
+            if pid not in self.seen:
+                started = self._start_fn(pid)
+                if started is not None:     # already gone: nothing to remember
+                    self.seen[pid] = started
+
     def _ancestry(self, table: list[_Proc]) -> set[int]:
-        """The run's group, its leader and every member seen before."""
-        return {r.pid for r in table if r.pgid == self._pgid} | {self._proc.pid} | self.seen
+        """The run's group, its leader (until it is reaped: then its pid is free for reuse) and
+        every member seen before that is still the same process."""
+        leader = {self._proc.pid} if self._proc.returncode is None else set()
+        return {r.pid for r in table if r.pgid == self._pgid} | leader | self._seen_alive()
 
     def _by_identity(self, table: list[_Proc]) -> set[int]:
         """Processes that carry the run's sandbox (``member_fn``), wherever they sit in the
@@ -493,8 +526,8 @@ class RssWatchdog:
         return [r for r in table if r.pid in members]
 
     def _sample(self) -> None:
-        table = self._table_fn()
         try:
+            table = self._table_fn()
             family = self._family(table)
         except SandboxError as exc:
             # The run's processes can't be enumerated: nothing can be metered, so stop the run.
@@ -502,7 +535,7 @@ class RssWatchdog:
             return
         if self._stop.is_set():
             return
-        self.seen.update(r.pid for r in family)
+        self._remember(r.pid for r in family)
         rss = self._rss_fn(self._pgid) if self._rss_fn else sum(r.rss for r in family)
         self.peak_bytes = max(self.peak_bytes, rss)
         if rss > self._limit:
@@ -547,13 +580,14 @@ class RssWatchdog:
             return
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(self._pgid, signal.SIGKILL)
-        table = self._table_fn()
+        table: list[_Proc] = []
         try:
+            table = self._table_fn()
             family = {r.pid for r in self._family(table)}
         except SandboxError:
-            # Can't match by sandbox identity: still kill everything known by ancestry. (The
-            # post-run sweep then fails the run, since it can't prove the rest gone either.)
-            family = {r.pid for r in table if r.pgid == self._pgid} | self.seen
+            # Can't list or match by sandbox identity: still kill everything known by ancestry.
+            # (The post-run sweep then fails the run, since it can't prove the rest gone either.)
+            family = {r.pid for r in table if r.pgid == self._pgid} | self._seen_alive()
         live = family - {os.getpid()}
         for pid in live:
             with contextlib.suppress(ProcessLookupError, PermissionError):
@@ -833,10 +867,18 @@ def writer_matcher(path: Path, *, started_after: float) -> Callable[[int], bool]
     return match
 
 
+def _container_identity(path: str | os.PathLike[str]) -> str:
+    """``path`` with its PARENT resolved but its final component (``Data``) kept as named: the
+    sandboxed child owns ``Data`` and can swap it for a symlink, which must not change which
+    container a process is matched to. ``Containers/<id>`` above it is not the child's."""
+    norm = os.path.normpath(os.fspath(path))
+    return os.path.join(os.path.realpath(os.path.dirname(norm)), os.path.basename(norm))
+
+
 def container_matcher(container: Path) -> Callable[[int], bool]:
     """Matches a process whose App Sandbox container is ``container`` (an appsandbox slot)."""
-    want = os.path.realpath(container)
-    return lambda p: (c := container_of(p)) is not None and os.path.realpath(c) == want
+    want = _container_identity(container)
+    return lambda p: (c := container_of(p)) is not None and _container_identity(c) == want
 
 
 def sweep_writers(path: Path, *, started_after: float) -> int:
@@ -874,14 +916,15 @@ _CLONE_NOFOLLOW = 0x0001
 
 
 def _copy_regular(src: Path, dst: Path, mode: int) -> None:
-    """APFS clone when possible (O(1), copy-on-write; keeps the mode), else a byte copy that
-    then gets ``src``'s permission bits. Never follows links."""
-    if _CLONEFILE is not None:
-        if _CLONEFILE(os.fsencode(src), os.fsencode(dst), _CLONE_NOFOLLOW) == 0:
-            return
-    with open(src, "rb", opener=lambda p, f: os.open(p, f | os.O_NOFOLLOW)) as fin, \
-            open(dst, "xb") as fout:
-        shutil.copyfileobj(fin, fout, 1024 * 1024)
+    """APFS clone when possible (O(1), copy-on-write), else a byte copy. Either way the copy
+    then gets only ``src``'s rwx bits: a clone keeps setuid/setgid, which must not survive into
+    a host copy. Never follows links."""
+    cloned = (_CLONEFILE is not None
+              and _CLONEFILE(os.fsencode(src), os.fsencode(dst), _CLONE_NOFOLLOW) == 0)
+    if not cloned:
+        with open(src, "rb", opener=lambda p, f: os.open(p, f | os.O_NOFOLLOW)) as fin, \
+                open(dst, "xb") as fout:
+            shutil.copyfileobj(fin, fout, 1024 * 1024)
     os.chmod(dst, _perm_bits(mode), follow_symlinks=False)
 
 

@@ -52,6 +52,7 @@ import math
 import os
 import plistlib
 import pwd
+import re
 import secrets
 import stat
 import subprocess
@@ -109,6 +110,15 @@ int main(int argc, char **argv) {
 }
 """
 HANDSHAKE_NAME = ".bb-handshake"
+
+# A reverse-DNS bundle identifier: dot-separated labels of letters, digits and '-'. The id
+# becomes a path component (~/Library/Containers/<id>, the per-id lock file), so a '/', '..'
+# or an absolute value must never get through.
+_BUNDLE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*(\.[A-Za-z0-9][A-Za-z0-9-]*)*")
+
+
+def _valid_bundle_id(value: object) -> bool:
+    return isinstance(value, str) and len(value) <= 200 and bool(_BUNDLE_ID_RE.fullmatch(value))
 
 
 def _host_path(argv0: str, mounts: list) -> str:
@@ -197,6 +207,13 @@ class Manifest:
                 f"appsandbox manifest version {raw.get('version')!r} != {MANIFEST_VERSION}; "
                 "re-run `blastbox macos prepare`"
             )
+        # Bundle ids are used as paths (container, lock): an edited manifest must not point a
+        # wipe outside ~/Library/Containers.
+        bad = [v for v in [raw.get("bundle_prefix"), *(s.get("bundle_id") for s in raw["slots"])]
+               if not _valid_bundle_id(v)]
+        if bad:
+            raise SandboxUnavailable(f"appsandbox manifest has invalid bundle ids {bad!r}; "
+                                     "re-run `blastbox macos prepare`")
         return cls(
             root=root,
             bundle_prefix=raw["bundle_prefix"],
@@ -262,6 +279,9 @@ def prepare(
         resolved_ro.append(rp)
     prefix = bundle_prefix or "io.blastbox.sbx." + hashlib.sha256(
         str(root).encode()).hexdigest()[:10]
+    if not _valid_bundle_id(prefix):
+        raise SandboxError(f"invalid bundle prefix {prefix!r}: use reverse-DNS labels of "
+                           "letters, digits and '-' (e.g. io.example.sbx)")
 
     build = root / "build"
     build.mkdir(exist_ok=True)
@@ -551,11 +571,20 @@ class AppSandboxSandbox:
         with self._acquire_slot() as slot:
             self._wipe_slot(slot)
             try:
-                return self._run_in_slot(slot, exe, request)
+                result, confined = self._run_in_slot(slot, exe, request)
             finally:
                 self._wipe_slot(slot)
+        # Credited only once the final sweep and wipe have succeeded: a run whose cleanup
+        # raised is a failed run, and an engine falling back to an in-process parse after it
+        # must not pass that parse off as confined.
+        if confined:
+            note_confined_run()
+        return result
 
-    def _run_in_slot(self, slot: Slot, exe: Path, request: SandboxRequest) -> SandboxResult:
+    def _run_in_slot(self, slot: Slot, exe: Path,
+                     request: SandboxRequest) -> tuple[SandboxResult, bool]:
+        """The run and whether it may be credited as confined (the caller credits it once the
+        slot is clean)."""
         # Every staging and copy-back copy of the run draws on ONE budget (bytes and entries):
         # the run-wide limit holds before the watchdog starts, however many mounts there are.
         io = slot.io_dir
@@ -619,12 +648,10 @@ class AppSandboxSandbox:
                                    "it is no longer a real directory")
             mc.capture_scratch(container, request.capture_home, budget)
 
-        # Credited only for a run that reached the sandbox AND completed: an engine that falls
+        # Creditable only for a run that reached the sandbox AND completed: an engine that falls
         # back to parsing in-process after a failed or killed sandboxed run (or a copy-back that
         # raised) must not pass that parse off as confined.
-        if handshake and ok:
-            note_confined_run()
-        elif not handshake:
+        if not handshake:
             _log.warning("appsandbox: no handshake from the sandboxed launcher; run not counted "
                          "as confined (exit %s)", result.exit_code)
 
@@ -636,7 +663,7 @@ class AppSandboxSandbox:
             )
         elif result.exit_code == 70:
             result.stderr += b"\n[blastbox] launcher was not sandboxed; slot signature broken\n"
-        return result
+        return result, handshake and ok
 
     def _prime_container(self, slot: Slot, home: Path) -> None:
         """Launch the slot once with ``/usr/bin/true`` so its container exists, or raise."""
@@ -665,11 +692,16 @@ class AppSandboxSandbox:
         The replacement is built first, beside the original (a hidden entry inside a directory
         mount, so the directory itself is kept as a bind mount would; a sibling for a file
         mount), and only swapped in by rename once it is complete: a copy-back that fails
-        partway (budget, disk) leaves ``dest`` as it was, never half-written."""
+        partway (budget, disk) leaves ``dest`` as it was, never half-written.
+
+        A staged root that is GONE fails too: a mounted root cannot be removed from inside a
+        bind mount, and silently keeping the host's stale contents would report the run's
+        output as written when it was not."""
         try:
             st = os.lstat(staged)
-        except FileNotFoundError:
-            return
+        except FileNotFoundError as exc:
+            raise SandboxError(f"appsandbox: rw mount {dest} was deleted inside the sandbox; "
+                               "not copied back") from exc
         same_type = stat.S_ISDIR(st.st_mode) if was_dir else stat.S_ISREG(st.st_mode)
         if not same_type:
             raise SandboxError(

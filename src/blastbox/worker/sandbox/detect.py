@@ -265,8 +265,10 @@ def select_sandbox(
             status_path=_status_path,
         )
 
-    # Auto-select: prefer container if we're already inside one.
-    candidates = _CONTAINER_BACKENDS if _in_container() else _all_backends()
+    # Auto-select: prefer container if we're already inside one. Linux only: the container
+    # markers are Linux ones, and macOS must only ever pick Seatbelt / App Sandbox.
+    in_container = host_platform() == "linux" and _in_container()
+    candidates = _CONTAINER_BACKENDS if in_container else _all_backends()
 
     # EVERY rejection, not just the last one. When no backend survives, the reason the
     # operator needs is usually the FIRST candidate's (nsjail's) -- "last error" reported

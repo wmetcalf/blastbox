@@ -217,6 +217,7 @@ class SeatbeltSandbox:
                 )
 
         scratch = mc.make_scratch(self._scratch_base)
+        confined = False
         try:
             mc.seed_scratch(scratch, request.seed_home, request.limits.tmpfs_bytes)
             profile, params = build_profile(
@@ -249,12 +250,11 @@ class SeatbeltSandbox:
             ok = result.exit_code == 0 and not result.killed
             if ok:
                 mc.capture_scratch(scratch, request.capture_home, request.limits.tmpfs_bytes)
-            # Counted only for a run that reached the profile AND completed, after everything
-            # that can still raise: an engine that falls back to an in-process parse after a
-            # failed or killed sandboxed run must not pass it off as confined.
-            if handshake and ok:
-                note_confined_run()
-            elif not handshake:
+            # Counted only for a run that reached the profile AND completed, and only after the
+            # scratch removal below succeeded: an engine that falls back to an in-process parse
+            # after a failed, killed or uncleanable sandboxed run must not pass it off as confined.
+            confined = handshake and ok
+            if not handshake:
                 _log.warning("seatbelt: no handshake from inside the profile; run not counted "
                              "as confined (exit %s)", result.exit_code)
             return result
@@ -267,6 +267,8 @@ class SeatbeltSandbox:
             except (SandboxError, OSError) as exc:
                 raise SandboxError(
                     f"seatbelt: could not remove the run's scratch {scratch}: {exc}") from exc
+            if confined:
+                note_confined_run()
 
     @staticmethod
     def _handshake_ok(marker: Path, nonce: str) -> bool:

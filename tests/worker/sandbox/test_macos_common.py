@@ -4,7 +4,9 @@ Pure-logic tests run on any POSIX host; nothing here needs Seatbelt.
 """
 from __future__ import annotations
 
+import contextlib
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -535,3 +537,127 @@ class TestEnumerationFailsClosed:
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
+
+
+class TestProcessTableFailsClosed:
+    @pytest.mark.parametrize("runner", [
+        lambda *a, **k: (_ for _ in ()).throw(subprocess.TimeoutExpired("ps", 5)),
+        lambda *a, **k: (_ for _ in ()).throw(OSError("no ps")),
+        lambda *a, **k: subprocess.CompletedProcess([], 1, stdout="", stderr="boom"),
+        lambda *a, **k: subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+    ])
+    def test_an_unreadable_table_raises_not_empty(self, runner):
+        with pytest.raises(SandboxError, match="process table"):
+            mc.process_table(runner)
+
+    def test_the_watchdog_trips_when_ps_is_unavailable(self):
+        def no_ps():
+            raise SandboxError("cannot read the process table: ps exited 1")
+        proc = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+        try:
+            dog = mc.RssWatchdog(proc, 1 << 30, table_fn=no_ps)
+            dog._sample()
+            assert dog.tripped == "process"
+            assert proc.wait(timeout=5) != 0       # killed, not left running unmetered
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            proc.wait()
+
+
+class TestWatchdogPidIdentity:
+    def test_a_reused_pid_is_forgotten_not_trusted(self):
+        proc = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+        try:
+            starts = {4242: 100.0}
+            dog = mc.RssWatchdog(proc, 1 << 30, table_fn=lambda: [],
+                                 start_fn=lambda pid: starts.get(pid))
+            dog._remember([4242])
+            assert 4242 in dog._ancestry([])
+            starts[4242] = 200.0                   # same pid, a different (unrelated) process
+            assert 4242 not in dog._ancestry([])
+            assert 4242 not in dog.seen
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_a_gone_pid_is_never_recorded(self):
+        proc = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+        try:
+            dog = mc.RssWatchdog(proc, 1 << 30, table_fn=lambda: [], start_fn=lambda pid: None)
+            dog._remember([4242])
+            assert dog.seen == {}
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_a_reaped_leader_pid_is_not_part_of_the_family(self):
+        proc = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+        dog = mc.RssWatchdog(proc, 1 << 30, table_fn=lambda: [], start_fn=lambda pid: None)
+        assert proc.pid in dog._ancestry([])
+        proc.kill()
+        proc.wait()
+        assert proc.pid not in dog._ancestry([])
+
+
+class TestContainerIdentity:
+    def test_a_data_root_swapped_for_a_symlink_still_matches(self, tmp_path, monkeypatch):
+        cont = tmp_path / "Containers" / "io.x.slot0"
+        data = cont / "Data"
+        data.mkdir(parents=True)
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        match = mc.container_matcher(data)
+        monkeypatch.setattr(mc, "container_of", lambda pid: str(data))
+        assert match(1)
+        data.rmdir()
+        data.symlink_to(elsewhere)             # the child swaps its own Data root
+        assert match(1)
+        monkeypatch.setattr(mc, "container_of", lambda pid: str(elsewhere))
+        assert not match(1)
+        other = tmp_path / "Containers" / "io.x.slot1" / "Data"
+        monkeypatch.setattr(mc, "container_of", lambda pid: str(other))
+        assert not match(1)
+
+
+class TestCloneSanitizesModes:
+    def test_a_cloned_file_loses_setuid(self, tmp_path, monkeypatch):
+        src = tmp_path / "f"
+        src.write_text("x")
+        try:
+            os.chmod(src, 0o4755)
+        except PermissionError:
+            pytest.skip("cannot set setuid here")
+        if not os.stat(src).st_mode & stat.S_ISUID:
+            pytest.skip("setuid not kept on this filesystem")
+
+        def fake_clone(s, d, flags):
+            # Like APFS clonefile: the copy keeps the source's mode, special bits included.
+            shutil.copyfile(s, d)
+            os.chmod(d, stat.S_IMODE(os.stat(s).st_mode))
+            return 0
+        monkeypatch.setattr(mc, "_CLONEFILE", fake_clone)
+        dst = tmp_path / "g"
+        mc.copy_no_follow(src, dst, budget_bytes=1 << 20)
+        assert stat.S_IMODE(os.stat(dst).st_mode) == 0o755
+
+
+class TestSeedEntryBudgetIsShared:
+    def test_many_top_level_entries_hit_one_cap(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mc, "MAX_SCRATCH_ENTRIES", 3)
+        seed = tmp_path / "seed"
+        seed.mkdir()
+        for i in range(5):
+            (seed / f"f{i}").write_text("")
+        with pytest.raises(SandboxError, match="entries"):
+            mc.seed_scratch(mc.make_scratch(tmp_path / "s"), seed, budget_bytes=1 << 20)
+
+    def test_merged_entries_share_the_cap_too(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mc, "MAX_SCRATCH_ENTRIES", 3)
+        seed = tmp_path / "seed"
+        caches = seed / "Library" / "Caches"
+        caches.mkdir(parents=True)
+        for i in range(5):
+            (caches / f"f{i}").write_text("")
+        with pytest.raises(SandboxError, match="entries"):
+            mc.seed_scratch(mc.make_scratch(tmp_path / "s"), seed, budget_bytes=1 << 20)

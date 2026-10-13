@@ -681,3 +681,74 @@ def test_backend_refuses_without_process_apis(tmp_path, monkeypatch):
     monkeypatch.setattr(mc, "_LIBSYSTEM", None)
     with pytest.raises(SandboxUnavailable, match="process APIs"):
         asb.AppSandboxSandbox(root=root, platform_ok=True, verify=False)
+
+
+def test_a_run_whose_final_wipe_fails_is_not_credited(tmp_path, monkeypatch):
+    # Credit only after the post-run sweep + wipe: a run whose cleanup raised is a failed run.
+    from blastbox.worker.sandbox.base import confined_runs
+    sb, _ = _sb_with(tmp_path)
+    real_wipe = sb._wipe_slot
+    calls = []
+
+    def wipe(slot):
+        calls.append(slot)
+        if len(calls) == 2:
+            raise SandboxError("could not empty the slot")
+        real_wipe(slot)
+    monkeypatch.setattr(sb, "_wipe_slot", wipe)
+    before = confined_runs()
+    with pytest.raises(SandboxError, match="could not empty"):
+        sb.run(SandboxRequest(argv=["/usr/bin/true"]))
+    assert len(calls) == 2
+    assert confined_runs() == before
+
+
+class TestDeletedMountRoot:
+    def test_a_deleted_dir_mount_fails_the_run(self, tmp_path):
+        from blastbox.worker.sandbox.base import confined_runs
+        sb, _ = _sb_with(tmp_path)
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "stale").write_text("old")
+        before = confined_runs()
+        with pytest.raises(SandboxError, match="deleted inside the sandbox"):
+            sb.run(SandboxRequest(argv=["/bin/sh", "-c", 'rm -rf "$0"', str(out)],
+                                  rw_mounts=[Mount(out, out)]))
+        assert (out / "stale").read_text() == "old"
+        assert confined_runs() == before
+
+    def test_a_deleted_file_mount_fails_the_run(self, tmp_path):
+        sb, _ = _sb_with(tmp_path)
+        target = tmp_path / "result.json"
+        target.write_text("{}")
+        with pytest.raises(SandboxError, match="deleted inside the sandbox"):
+            sb.run(SandboxRequest(argv=["/bin/rm", str(target)],
+                                  rw_mounts=[Mount(target, target)]))
+        assert target.read_text() == "{}"
+
+
+class TestBundleIds:
+    @pytest.mark.parametrize("prefix", ["../../evil", "/abs/path", "a/b", "a..b", ".x", "x.",
+                                        "has space", "a/../b"])
+    def test_prepare_refuses_a_path_like_prefix(self, tmp_path, prefix):
+        with pytest.raises(SandboxError, match="invalid bundle prefix"):
+            asb.prepare(tmp_path / "root", slots=1, ro_paths=[], bundle_prefix=prefix,
+                        runner=_fake_runner([]))
+
+    def test_a_valid_prefix_is_accepted(self, tmp_path):
+        m = asb.prepare(tmp_path / "root", slots=1, ro_paths=[], bundle_prefix="io.ex-ample.sbx2",
+                        runner=_fake_runner([]))
+        assert m.slots[0].bundle_id == "io.ex-ample.sbx2.slot0"
+
+    @pytest.mark.parametrize("field", ["bundle_prefix", "bundle_id"])
+    def test_a_tampered_manifest_is_refused(self, tmp_path, field):
+        root = _fake_root(tmp_path)
+        path = root / asb.MANIFEST_NAME
+        raw = json.loads(path.read_text())
+        if field == "bundle_prefix":
+            raw["bundle_prefix"] = "../../../../tmp/victim"
+        else:
+            raw["slots"][0]["bundle_id"] = "/Users/someone/important"
+        path.write_text(json.dumps(raw))
+        with pytest.raises(SandboxUnavailable, match="invalid bundle ids"):
+            asb.Manifest.load(root)
