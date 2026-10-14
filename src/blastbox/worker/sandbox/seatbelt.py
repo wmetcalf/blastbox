@@ -139,6 +139,9 @@ def build_profile(
         mounts = [p for p in rw_paths if p != scratch]
         if mounts:
             lines.append("(deny file-write-flags " + refs("RWF", mounts, "subpath") + ")")
+        # No ACLs anywhere it may write, scratch included: a deny ACL (`everyone deny delete`)
+        # would keep the worker's own cleanup from removing the tree. No engine needs one.
+        lines.append("(deny file-write-acl " + refs("RWA", rw_paths, "subpath") + ")")
     for accel in sorted(accelerators):
         lines.extend(_ACCEL_RULES[accel])
     if "ane" in accelerators and scratch:

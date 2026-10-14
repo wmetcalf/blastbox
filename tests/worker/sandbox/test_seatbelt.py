@@ -189,6 +189,26 @@ class TestRealConfinement:
         finally:
             subprocess.run(["/usr/bin/chflags", "-R", "nouchg,nouappnd", str(out)], check=False)
 
+    def test_a_child_cannot_set_acls_on_scratch_or_an_rw_mount(self, sb, tmp_path):
+        # A deny ACL ("everyone deny delete") would keep the worker's own cleanup from removing
+        # the tree; ordinary writes and chmod still work.
+        out = tmp_path / "out"
+        out.mkdir()
+        try:
+            r = sb.run(SandboxRequest(argv=["/bin/sh", "-c",
+                                            'echo hi > "$0/f" && chmod 600 "$0/f" && echo ok; '
+                                            'echo s > "$HOME/s"; '
+                                            'chmod +a "everyone deny delete" "$0/f" && echo mount-acl; '
+                                            'chmod +a "everyone deny delete_child" "$0" && echo root-acl; '
+                                            'chmod +a "everyone deny delete" "$HOME/s" && echo scratch-acl; '
+                                            'exit 0', str(out)],
+                                      rw_mounts=[Mount(out, out)]))
+            assert r.exit_code == 0 and r.stdout == b"ok\n", (r.stdout, r.stderr)
+            assert subprocess.run(["/bin/ls", "-led", str(out), str(out / "f")],
+                                  capture_output=True, text=True).stdout.count(" deny ") == 0
+        finally:
+            subprocess.run(["/bin/chmod", "-RN", str(out)], check=False)
+
     def test_network_denied(self, sb):
         r = sb.run(SandboxRequest(argv=["/usr/bin/nc", "-z", "-w", "3", "1.1.1.1", "80"],
                                   limits=Limits(timeout_s=20)))

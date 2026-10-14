@@ -7,7 +7,14 @@
 
   Configuration comes from ONE env file (KEY=value lines, sourced with `set -a`), so serve and
   dispatch can't drift apart: they must agree on BLASTBOX_DATABASE_URL, BLASTBOX_JOB_ROOT and
-  every BLASTBOX_ENGINE_<NAME>_* knob. Keep it 0600: it holds the worker-agent token.
+  every BLASTBOX_ENGINE_<NAME>_* knob. Keep it 0600: it holds the worker-agent token. For the
+  dispatcher it needs at least:
+
+    BLASTBOX_POOL_RUNTIME=static
+    BLASTBOX_STATIC_WORKERS=127.0.0.1:8765
+    BLASTBOX_STATIC_WORKER_TOKEN=<the agent's BLASTBOX_WORKER_AGENT_TOKEN, same value>
+
+  (without the token every /healthz probe gets 401 and the dispatcher refuses the fleet).
 
     cp io.blastbox.dispatcher.plist ~/Library/LaunchAgents/
     # edit the two REPLACE_ME paths below

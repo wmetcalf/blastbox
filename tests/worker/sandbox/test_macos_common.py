@@ -5,6 +5,7 @@ Pure-logic tests run on any POSIX host; nothing here needs Seatbelt.
 from __future__ import annotations
 
 import contextlib
+import signal
 import os
 import shutil
 import stat
@@ -326,8 +327,15 @@ class TestSweep:
     def _sandboxed_sleeper(self, rw):
         prof = (f'(version 1)(allow default)(deny file-write*)'
                 f'(allow file-write* (subpath "{rw}"))')
-        return subprocess.Popen(["/usr/bin/sandbox-exec", "-p", prof, "/bin/sleep", "30"],
-                                start_new_session=True)
+        p = subprocess.Popen(["/usr/bin/sandbox-exec", "-p", prof, "/bin/sleep", "30"],
+                             start_new_session=True)
+        # Wait until the kernel has it sandboxed (a fixed sleep raced a loaded machine: the
+        # sweep then ran before the profile applied and found nothing to kill).
+        deadline = time.monotonic() + 10
+        while not mc.is_sandboxed(p.pid):
+            assert p.poll() is None and time.monotonic() < deadline, "sleeper never got sandboxed"
+            time.sleep(0.02)
+        return p
 
     def test_kills_only_sandboxed_processes_that_may_write_the_run_dir(self, tmp_path):
         mine, other = (tmp_path / "mine").resolve(), (tmp_path / "other").resolve()
@@ -375,6 +383,39 @@ class TestSweep:
 
 
 
+class TestSweepRevalidatesIdentity:
+    def test_a_target_whose_pid_was_reused_after_matching_is_not_killed(self, monkeypatch):
+        # matched at start time 100.0; by the time of the kill the pid is another process
+        starts = iter([100.0, 200.0])
+        monkeypatch.setattr(mc, "uid_pids", lambda uid=None: [4242])
+        monkeypatch.setattr(mc, "is_sandboxed", lambda p: True)
+        monkeypatch.setattr(mc, "proc_start_time", lambda p: next(starts, None))
+        monkeypatch.setattr(mc, "_alive", lambda p: False)
+        sent = []
+        monkeypatch.setattr(mc.os, "kill", lambda p, sig: sent.append(p))
+        assert mc.sweep_sandboxed(lambda p: True, what="test") == 0
+        assert sent == []
+
+    def test_the_same_process_is_killed(self, monkeypatch):
+        monkeypatch.setattr(mc, "uid_pids", lambda uid=None: [4242])
+        monkeypatch.setattr(mc, "is_sandboxed", lambda p: True)
+        monkeypatch.setattr(mc, "proc_start_time", lambda p: 100.0)
+        monkeypatch.setattr(mc, "_alive", lambda p: False)
+        sent = []
+        monkeypatch.setattr(mc.os, "kill", lambda p, sig: sent.append(p))
+        assert mc.sweep_sandboxed(lambda p: True, what="test") == 1
+        assert sent == [4242]
+
+    def test_a_live_match_with_no_readable_identity_fails_the_sweep(self, monkeypatch):
+        monkeypatch.setattr(mc, "uid_pids", lambda uid=None: [4242])
+        monkeypatch.setattr(mc, "is_sandboxed", lambda p: True)
+        monkeypatch.setattr(mc, "proc_start_time", lambda p: None)
+        monkeypatch.setattr(mc, "_alive", lambda p: True)
+        monkeypatch.setattr(mc.os, "kill", lambda p, sig: None)
+        with pytest.raises(SandboxError, match="cannot identify"):
+            mc.sweep_sandboxed(lambda p: True, what="test")
+
+
 class TestFailClosedMeasurement:
     def test_an_unreadable_subdir_makes_usage_incomplete(self, tmp_path):
         d = tmp_path / "w"
@@ -408,6 +449,25 @@ class TestWipeDirLockedRoot:
         os.chflags(d, stat.UF_IMMUTABLE)       # locked after the chmod (uchg blocks chmod)
         mc.wipe_dir(d)
         assert list(d.iterdir()) == []
+
+    def test_deny_acls_on_the_root_and_children_are_stripped_and_emptied(self, tmp_path):
+        # what a sandboxed child (App Sandbox, or Seatbelt before ACLs were denied) can leave:
+        # deny-delete ACLs on files, a deny-delete_child ACL on a subdir and on the root itself
+        d = tmp_path / "Data"
+        (d / "sub").mkdir(parents=True)
+        (d / "sub" / "f").write_text("x")
+        (d / "g").write_text("x")
+        acl = ["/bin/chmod", "+a"]
+        subprocess.run([*acl, "everyone deny delete,writesecurity", str(d / "sub" / "f")], check=True)
+        subprocess.run([*acl, "everyone deny delete,writesecurity", str(d / "g")], check=True)
+        subprocess.run([*acl, "everyone deny delete,delete_child,writesecurity", str(d / "sub")],
+                       check=True)
+        subprocess.run([*acl, "everyone deny delete_child,writesecurity", str(d)], check=True)
+        try:
+            mc.wipe_dir(d)
+            assert list(d.iterdir()) == []
+        finally:
+            subprocess.run(["/bin/chmod", "-RN", str(d)], check=False)
 
     def test_an_enumeration_failure_is_a_sandbox_error(self, tmp_path, monkeypatch):
         d = tmp_path / "Data"
@@ -921,6 +981,31 @@ class TestOpenUnlinkedFilesCount:
 
 
 class TestWatchdogExitIsBounded:
+    @pytest.mark.timeout(60)
+    def test_a_stuck_watchdog_still_gets_the_run_killed_and_swept(self, tmp_path, monkeypatch):
+        # __exit__ raising (the watchdog would not stop) must not skip the family kill and the
+        # backend sweep: a detached child would otherwise outlive the failed run
+        monkeypatch.setattr(mc, "WATCHDOG_JOIN_S", 0.5)
+        monkeypatch.setattr(mc, "held_unlinked_bytes", lambda pids: time.sleep(5) or 0)
+        w = tmp_path / "w"
+        w.mkdir()
+        pidfile = tmp_path / "bg.pid"
+        swept = []
+        with pytest.raises(SandboxError, match="did not stop"):
+            mc.run_confined(["/bin/sh", "-c", f'/bin/sleep 30 & echo $! > "{pidfile}"; /bin/sleep 1'],
+                            env={"PATH": mc.MINIMAL_PATH}, limits=Limits(timeout_s=30),
+                            cwd=tmp_path, watch_dirs=[w], sweep=lambda: swept.append(1))
+        assert swept == [1]
+        bg = int(pidfile.read_text())
+        deadline = time.monotonic() + 5
+        while mc.proc_start_time(bg) is not None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        try:
+            assert mc.proc_start_time(bg) is None, "the detached child outlived the failed run"
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(bg, signal.SIGKILL)
+
     @pytest.mark.timeout(30)
     def test_a_watchdog_that_will_not_stop_fails_the_run(self, monkeypatch):
         monkeypatch.setattr(mc, "WATCHDOG_JOIN_S", 0.5)

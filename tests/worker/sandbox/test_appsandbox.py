@@ -775,6 +775,27 @@ def test_a_container_swapped_during_the_run_is_never_captured(tmp_path):
     assert (victim / "key").read_text() == "secret"
 
 
+def test_a_container_removed_during_the_run_fails_a_requested_capture(tmp_path):
+    # capture_home was asked for and the child deleted Data/: that is a failed capture, not a
+    # run that "succeeded" while the destination keeps an earlier run's contents
+    root = tmp_path / "root"
+    asb.prepare(root, slots=1, ro_paths=[], runner=_fake_runner([]))
+    home = tmp_path / "home"
+    container = asb.Manifest.load(root).slots[0].container_data(home)
+    container.mkdir(parents=True)
+    sb = asb.AppSandboxSandbox(root=root, popen=_Popen(), home=home, platform_ok=True,
+                               verify=False, slot_wait_s=0)
+    cap = tmp_path / "capture"
+    cap.mkdir()
+    (cap / "stale").write_text("from an earlier run")
+    from blastbox.worker.sandbox.base import confined_runs
+    before = confined_runs()
+    with pytest.raises(SandboxError, match="removed"):
+        sb.run(SandboxRequest(argv=["/bin/sh", "-c", 'rm -rf "$0"', str(container)],
+                              capture_home=cap))
+    assert confined_runs() == before
+
+
 class TestVerifySlotEntitlements:
     def _runner(self, slot, ents, ident=None):
         xml = plistlib.dumps(ents)

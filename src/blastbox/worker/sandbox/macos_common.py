@@ -222,10 +222,37 @@ def locked_file_target(path: Path) -> str | None:
     return None
 
 
+_ACL_TYPE_EXTENDED = 0x00000100
+
+
+def _acl_stripper() -> Callable[[bytes], int] | None:
+    """``acl_set_link_np(path, ACL_TYPE_EXTENDED, <empty ACL>)`` -- ``chmod -N`` on one entry,
+    without following a symlink -- or None off Darwin."""
+    if not IS_DARWIN:
+        return None
+    try:
+        lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+        lib.acl_init.restype = ctypes.c_void_p
+        lib.acl_init.argtypes = [ctypes.c_int]
+        lib.acl_set_link_np.restype = ctypes.c_int
+        lib.acl_set_link_np.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p]
+        empty = lib.acl_init(0)
+    except (OSError, AttributeError):
+        return None
+    if not empty:
+        return None
+    return lambda p: lib.acl_set_link_np(p, _ACL_TYPE_EXTENDED, empty)
+
+
+_STRIP_ACL = _acl_stripper()
+
+
 def unlock_tree(path: Path) -> None:
-    """Clear user flags (``uchg``) and restore owner permissions under ``path``, never following
-    a symlink. A sandboxed child owns its files and can lock them; the worker (same uid) can undo
-    that, which is what makes a fail-closed wipe possible."""
+    """Clear user flags (``uchg``), extended ACLs and restore owner permissions under ``path``,
+    never following a symlink. A sandboxed child owns its files and can lock them -- a flag, or a
+    deny ACL (``everyone deny delete``) on a file or its directory; the worker (same uid, the
+    owner, who may always rewrite an ACL) can undo both, which is what makes a fail-closed wipe
+    possible."""
     try:
         st = os.lstat(path)
     except OSError:
@@ -233,6 +260,8 @@ def unlock_tree(path: Path) -> None:
     if hasattr(os, "lchflags"):
         with contextlib.suppress(OSError):
             os.lchflags(path, 0)
+    if _STRIP_ACL is not None:
+        _STRIP_ACL(os.fsencode(path))     # best effort, like the rest: wipe_dir proves the result
     if stat.S_ISLNK(st.st_mode):
         return
     if stat.S_ISDIR(st.st_mode):
@@ -262,11 +291,14 @@ def wipe_dir(path: Path) -> None:
     if not stat.S_ISDIR(st.st_mode):
         kind = "a symlink" if stat.S_ISLNK(st.st_mode) else "not a directory"
         raise SandboxError(f"refusing to wipe {path}: it is {kind}")
-    # The child owns the root too and may have locked it (chflags uchg, chmod 000). It is a real
-    # directory (checked above), so undo that on the root itself, never following a link.
+    # The child owns the root too and may have locked it (chflags uchg, chmod 000, a deny ACL).
+    # It is a real directory (checked above), so undo that on the root itself, never following
+    # a link.
     if hasattr(os, "lchflags"):
         with contextlib.suppress(OSError):
             os.lchflags(path, 0)
+    if _STRIP_ACL is not None:
+        _STRIP_ACL(os.fsencode(path))
     with contextlib.suppress(OSError):
         os.chmod(path, 0o700, follow_symlinks=False)
     try:
@@ -633,7 +665,7 @@ class RssWatchdog:
         exited -- and may since belong to another job -- is forgotten."""
         for pid, started in list(self.seen.items()):
             if self._start_fn(pid) != started:
-                del self.seen[pid]
+                self.seen.pop(pid, None)   # pop: kill_family may run while a sample does
         return set(self.seen)
 
     def _remember(self, pids: Iterable[int]) -> None:
@@ -774,8 +806,30 @@ class RssWatchdog:
                 family |= {r.pid for r in table if r.pgid == self._pgid}
         live = family - {os.getpid()}
         for pid in live:
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(pid, signal.SIGKILL)
+            # A member known by pid+start time is signalled only while it is still that process.
+            started = self.seen.get(pid)
+            if started is not None:
+                kill_if_same(pid, started, start_fn=self._start_fn)
+            else:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.kill(pid, signal.SIGKILL)
+
+
+def kill_if_same(pid: int, started: float, *,
+                 start_fn: Callable[[int], float | None] | None = None) -> bool:
+    """SIGKILL ``pid`` only if it is still the process that started at ``started`` (its start
+    time, :func:`proc_start_time`): a pid that exited and was reused by an unrelated process --
+    another job of the same uid -- is left alone. Returns whether the signal was sent.
+
+    (Darwin has no pidfd, so a reuse in the microseconds between the check and ``kill`` can't
+    be excluded; this narrows the window from a whole sweep round to that.)"""
+    if (start_fn or proc_start_time)(pid) != started:
+        return False
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
 
 
 class _CappedReader(threading.Thread):
@@ -850,23 +904,29 @@ def run_confined(
     out.start()
     err.start()
     killed = False
-    with RssWatchdog(proc, limits.memory_bytes, rss_fn=rss_fn, watch_dirs=watch_dirs,
-                     disk_limit_bytes=limits.tmpfs_bytes, member_fn=member_fn) as dog:
-        try:
-            exit_code = proc.wait(timeout=limits.timeout_s)
-        except subprocess.TimeoutExpired:
-            killed = True
-            dog.kill_family()
-            kill_sandbox_group(proc)
+    dog = RssWatchdog(proc, limits.memory_bytes, rss_fn=rss_fn, watch_dirs=watch_dirs,
+                      disk_limit_bytes=limits.tmpfs_bytes, member_fn=member_fn)
+    try:
+        with dog:
             try:
-                proc.wait(timeout=5.0)
+                exit_code = proc.wait(timeout=limits.timeout_s)
             except subprocess.TimeoutExpired:
-                pass
-            exit_code = -int(signal.SIGKILL)
-    dog.kill_family()
-    if sweep is not None:
-        # Before draining the pipes: an escapee holding them open would otherwise hold EOF off.
-        sweep()
+                killed = True
+                dog.kill_family()
+                kill_sandbox_group(proc)
+                try:
+                    proc.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    pass
+                exit_code = -int(signal.SIGKILL)
+    finally:
+        # Also when the watchdog failed to stop (its ``__exit__`` raises) or anything above
+        # raised: the run fails, but a detached child must not survive it with the run's grants.
+        # The sweep runs before draining the pipes: an escapee holding them would hold EOF off.
+        # Should the kill or sweep raise as well, the original error stays chained to it.
+        dog.kill_family()
+        if sweep is not None:
+            sweep()
     out.join(timeout=5.0)
     err.join(timeout=5.0)
     stdout, stderr = bytes(out.data), bytes(err.data)
@@ -1109,21 +1169,39 @@ def sweep_sandboxed(match: Callable[[int], bool], *, what: str, rounds: int = 40
     Returns how many were killed; raises ``SandboxError`` if they keep coming -- a run whose
     processes can't be removed must not be reported, nor its slot reused."""
     me = os.getpid()
-    killed: set[int] = set()
+    # (pid, start time): the identity each kill was aimed at. A pid alone could by now name
+    # another job's process.
+    killed: set[tuple[int, float]] = set()
     for _ in range(rounds):
         if before_round is not None:
             before_round()
-        live = [p for p in uid_pids() if p != me and is_sandboxed(p) and match(p)]
-        live = [p for p in live if p not in killed or _alive(p)]
+        live: list[tuple[int, float]] = []
+        for p in uid_pids():
+            if p == me:
+                continue
+            # The identity is taken BEFORE matching: a match then vouches for this start time.
+            started = proc_start_time(p)
+            if not (is_sandboxed(p) and match(p)):
+                continue
+            if started is None:
+                if _alive(p) and proc_start_time(p) is None:
+                    # A live match whose identity can't be read can't be killed safely, and
+                    # isn't gone: fail the sweep rather than report the run clean.
+                    raise SandboxError(f"cannot identify process {p} left by {what}")
+                continue                    # it exited between listing and matching
+            if (p, started) in killed and not _alive(p):
+                continue                    # already killed, a zombie awaiting its reaper
+            live.append((p, started))
         if not live:
             if killed:
                 _log.warning("macos sandbox: swept %d process(es) that escaped %s",
                              len(killed), what)
             return len(killed)
-        for p in live:
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(p, signal.SIGKILL)
-            killed.add(p)
+        for p, started in live:
+            # Revalidated right before signalling: a target that exited after matching (its
+            # pid possibly reused by an unrelated process) is skipped, not killed.
+            if kill_if_same(p, started):
+                killed.add((p, started))
         threading.Event().wait(0.005)
     raise SandboxError(f"could not kill the processes left by {what}")
 

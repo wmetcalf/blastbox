@@ -34,6 +34,7 @@ from blastbox.contract import (
 from blastbox.contract.nodes import Record
 from blastbox.errors import sanitize_public_error
 from blastbox.limits import Limits
+from blastbox.worker.sandbox.base import not_counted
 
 if TYPE_CHECKING:
     from blastbox.worker.engine import Engine
@@ -192,7 +193,11 @@ def run_detonation(
     detected: Detection | None = None
     if pre_detect and hasattr(engine, "detect"):
         try:
-            detected = engine.detect(input_path)
+            # A detector's sandboxed runs are not the result's parse: on a host with no outer
+            # boundary (macOS) the agent credits only confined runs made by ``detonate()``, so a
+            # sandboxed detect() can't vouch for a detonate() that parsed in-process.
+            with not_counted():
+                detected = engine.detect(input_path)
         except Exception as exc:  # noqa: BLE001
             logger.warning("engine.detect() failed: %s", sanitize_public_error(str(exc)))
             detected = None

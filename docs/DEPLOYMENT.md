@@ -239,7 +239,13 @@ BLASTBOX_WORKER_AGENT_TOKEN=... python -m blastbox.worker.http_agent       # :87
 # Mac-only: dispatcher on the same Mac            # or a Linux dispatcher on the LAN
 BLASTBOX_POOL_RUNTIME=static                       BLASTBOX_POOL_RUNTIME=static
 BLASTBOX_STATIC_WORKERS=127.0.0.1:8765             BLASTBOX_STATIC_WORKERS=mac1:8765,mac2:8765
+BLASTBOX_STATIC_WORKER_TOKEN=...                   BLASTBOX_STATIC_WORKER_TOKEN=...
 ```
+
+`BLASTBOX_STATIC_WORKER_TOKEN` is the dispatcher's side of the agent's
+`BLASTBOX_WORKER_AGENT_TOKEN`: the **same value**. With a token set, the agent answers even
+`/healthz` only to an authenticated caller, so a dispatcher without it gets 401 from every
+startup probe and refuses the fleet.
 
 `deploy/macos/` has launchd agents for all three processes: `io.blastbox.worker-agent` on every
 Mac, plus `io.blastbox.ingress` and `io.blastbox.dispatcher` for a Mac-only deployment. They are

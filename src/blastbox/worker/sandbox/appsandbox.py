@@ -725,10 +725,16 @@ class AppSandboxSandbox:
         for src, staged, was_dir in rw_staged:
             self._copy_back(staged, src, copy_back, was_dir)
         ok = result.exit_code == 0 and not result.killed
-        if ok and request.capture_home is not None and os.path.lexists(container):
-            # The child owns its container and may have swapped Data/ for a symlink to a host
-            # dir: never follow it into a capture.
-            if not stat.S_ISDIR(os.lstat(container).st_mode):
+        if ok and request.capture_home is not None:
+            # The child owns its container and may have deleted Data/ or swapped it for a
+            # symlink to a host dir: never follow it into a capture, and never report a capture
+            # that didn't happen (the destination would keep an earlier run's contents).
+            try:
+                is_dir = stat.S_ISDIR(os.lstat(container).st_mode)
+            except FileNotFoundError:
+                raise SandboxError(f"appsandbox: cannot capture {container}: the run "
+                                   "removed it") from None
+            if not is_dir:
                 raise SandboxError(f"appsandbox: refusing to capture {container}: "
                                    "it is no longer a real directory")
             mc.capture_scratch(container, request.capture_home, budget)

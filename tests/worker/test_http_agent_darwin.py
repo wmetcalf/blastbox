@@ -206,6 +206,40 @@ def test_an_engine_may_declare_its_detect_sandboxed():
         _stop(httpd)
 
 
+def test_a_sandboxed_detect_is_not_credit_for_an_in_process_detonate():
+    # detect() goes through the sandbox (a confined run) but detonate() then parses in-process
+    # and returns ok: the detector's run must not satisfy the result gate
+    class DetectsSandboxedParsesInProcess(_Detecting):
+        sandboxed_detect = True
+
+        def detect(self, input_path: Path):
+            super().detect(input_path)
+            note_confined_run()          # what a sandboxed detector's backend run records
+            return None
+    eng = DetectsSandboxedParsesInProcess(confine=False)
+    httpd, port = _agent(eng)
+    try:
+        assert _detonate(port) == 500
+        assert eng.detect_calls == 1
+    finally:
+        _stop(httpd)
+
+
+def test_a_confined_detonate_after_a_sandboxed_detect_still_passes():
+    class Declared(_Detecting):
+        sandboxed_detect = True
+
+        def detect(self, input_path: Path):
+            super().detect(input_path)
+            note_confined_run()
+            return None
+    httpd, port = _agent(Declared(confine=True))
+    try:
+        assert _detonate(port) == 200
+    finally:
+        _stop(httpd)
+
+
 def test_detect_still_runs_off_macos(monkeypatch):
     monkeypatch.setattr(ha, "host_platform", lambda: "linux")
     eng = _Detecting()
