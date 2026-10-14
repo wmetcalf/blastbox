@@ -341,6 +341,25 @@ def test_a_seed_that_cannot_be_applied_fails_the_run_loudly(tmp_path):
         sb.run(SandboxRequest(argv=["/usr/bin/true"], seed_home=_seed(tmp_path)))
 
 
+def test_the_seed_and_the_staged_mounts_share_one_budget(tmp_path):
+    # each fits the run's limit alone; together they'd stage twice it before the watchdog runs
+    root = tmp_path / "root"
+    asb.prepare(root, slots=1, ro_paths=[], runner=_fake_runner([]))
+    home = tmp_path / "home"
+    container = asb.Manifest.load(root).slots[0].container_data(home)
+    sb = asb.AppSandboxSandbox(root=root, popen=_PrimingPopen(container), home=home,
+                               platform_ok=True, verify=False, slot_wait_s=0)
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    (seed / "plan").write_bytes(b"s" * 40_000)
+    data = tmp_path / "data"
+    data.write_bytes(b"d" * 40_000)
+    with pytest.raises(SandboxError, match="budget"):
+        sb.run(SandboxRequest(argv=["/usr/bin/true"], seed_home=seed,
+                              ro_mounts=[Mount(data, data)],
+                              limits=Limits(tmpfs_bytes=60_000)))
+
+
 def test_a_container_swapped_for_a_symlink_retires_the_slot(tmp_path):
     root = tmp_path / "root"
     asb.prepare(root, slots=1, ro_paths=[], runner=_fake_runner([]))
@@ -628,6 +647,35 @@ class TestCopyBackRootType:
             assert (out / "a").read_text() == "A" and (out / "sub" / "locked").read_text() == "L"
         finally:
             os.chflags(out / "sub" / "locked", 0)
+
+    @pytest.mark.skipif(not hasattr(os, "chflags"), reason="BSD file flags")
+    def test_an_immutable_host_file_fails_the_copy_back_before_copying(self, tmp_path):
+        f = tmp_path / "host.json"
+        f.write_text("orig")
+        os.chflags(f, stat.UF_IMMUTABLE)
+        try:
+            (tmp_path / "staged").write_text("new")
+            with pytest.raises(SandboxError, match="can't be replaced"):
+                asb.AppSandboxSandbox._copy_back(tmp_path / "staged", f,
+                                                 mc.CopyBudget(max_bytes=1 << 20), was_dir=False)
+            assert f.read_text() == "orig"
+            assert not [p for p in tmp_path.iterdir() if "blastbox-copyback" in p.name]
+        finally:
+            os.chflags(f, 0)
+
+    def test_a_failed_file_replace_removes_the_sibling_copy(self, tmp_path, monkeypatch):
+        f = tmp_path / "host.json"
+        f.write_text("orig")
+        (tmp_path / "staged").write_text("untrusted")
+
+        def no_replace(src, dst):
+            raise PermissionError("EPERM")
+        monkeypatch.setattr(asb.os, "replace", no_replace)
+        with pytest.raises(PermissionError):
+            asb.AppSandboxSandbox._copy_back(tmp_path / "staged", f,
+                                             mc.CopyBudget(max_bytes=1 << 20), was_dir=False)
+        assert f.read_text() == "orig"
+        assert not [p for p in tmp_path.iterdir() if "blastbox-copyback" in p.name]
 
     def test_a_rename_that_fails_mid_swap_restores_the_host_dir(self, tmp_path, monkeypatch):
         out = tmp_path / "out"

@@ -110,15 +110,22 @@ def make_scratch(base: Path | None = None) -> Path:
     return scratch
 
 
-def seed_scratch(scratch: Path, seed: Path | None, budget_bytes: int) -> None:
-    """Clone ``seed``'s contents into ``scratch`` (no-follow, size-capped). Never written back."""
+def seed_scratch(scratch: Path, seed: Path | None, budget_bytes: int | None = None, *,
+                 budget: CopyBudget | None = None) -> None:
+    """Clone ``seed``'s contents into ``scratch`` (no-follow, size-capped). Never written back.
+
+    Charged to ``budget`` when given -- the run's one pre-launch budget, shared with mount
+    staging -- else to a fresh one of ``budget_bytes``."""
     if seed is None:
         return
     if not seed.is_dir():
         raise SandboxError(f"seed_home {seed} is not a directory")
     # ONE budget (bytes and entries) for the whole seed, merges included: a seed of many
     # top-level entries must not get the entry cap once per entry.
-    budget = CopyBudget(budget_bytes)
+    if budget is None:
+        if budget_bytes is None:
+            raise TypeError("seed_scratch needs budget_bytes or budget")
+        budget = CopyBudget(budget_bytes)
     for child in seed.iterdir():
         if child.name == "tmp":
             continue
@@ -189,6 +196,21 @@ def locked_entry(path: Path) -> Path | None:
                         return hit
         return None
     return _walk(path)
+
+
+def locked_file_target(path: Path) -> str | None:
+    """Why the host FILE ``path`` can't be replaced by renaming a sibling over it (an
+    immutable/append-only flag on it or its directory, or a directory its owner can't write),
+    else None. The flags are the operator's: reported, never cleared."""
+    st = os.lstat(path)
+    if getattr(st, "st_flags", 0) & _LOCK_FLAGS:
+        return f"{path} is immutable/append-only"
+    parent = os.lstat(path.parent)
+    if getattr(parent, "st_flags", 0) & _LOCK_FLAGS:
+        return f"{path.parent} is immutable/append-only"
+    if parent.st_mode & (stat.S_IWUSR | stat.S_IXUSR) != (stat.S_IWUSR | stat.S_IXUSR):
+        return f"{path.parent} is not writable"
+    return None
 
 
 def unlock_tree(path: Path) -> None:
@@ -272,21 +294,40 @@ setlim(resource.RLIMIT_NOFILE, cfg["nofile"])
 setlim(resource.RLIMIT_CPU, cfg["cpu"])
 setlim(resource.RLIMIT_CORE, 0)
 # RLIMIT_NPROC is per-UID on Darwin: cap the uid at what it runs now plus this job's allowance.
+# Mandatory: without it a fork bomb has until the next watchdog sample, so a baseline or limit
+# that can't be installed stops the run here, before anything untrusted is exec'd.
+def nproc_fail(why):
+    sys.stderr.write("[blastbox] refusing to run: cannot install the process limit (%s)\n" % why)
+    sys.stderr.flush()
+    os._exit(cfg["nproc_fail_exit"])
 try:
-    lib = ctypes.CDLL(ctypes.util.find_library("proc") or "/usr/lib/libproc.dylib")
+    lib = ctypes.CDLL(cfg.get("libproc") or ctypes.util.find_library("proc")
+                      or "/usr/lib/libproc.dylib")
     n = lib.proc_listpids(4, os.getuid(), None, 0)          # PROC_UID_ONLY -> bytes needed
-    if n > 0:
-        buf = (ctypes.c_int * (n // 4 + 64))()
-        got = lib.proc_listpids(4, os.getuid(), buf, ctypes.sizeof(buf))
-        if got > 0:
-            setlim(resource.RLIMIT_NPROC, got // 4 + cfg["nproc"])
-except OSError:
-    pass
+    if n <= 0:
+        nproc_fail("proc_listpids size query failed")
+    buf = (ctypes.c_int * (n // 4 + 64))()
+    got = lib.proc_listpids(4, os.getuid(), buf, ctypes.sizeof(buf))
+    if got <= 0:
+        nproc_fail("proc_listpids failed")
+    want = got // 4 + cfg["nproc"]
+    soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
+    v = want if hard == resource.RLIM_INFINITY else min(want, hard)
+    resource.setrlimit(resource.RLIMIT_NPROC, (v, v))
+    # The kernel may clamp it lower still (kern.maxprocperuid); higher, or none, is a failure.
+    cur = resource.getrlimit(resource.RLIMIT_NPROC)[0]
+    if cur == resource.RLIM_INFINITY or cur > v:
+        nproc_fail("limit did not take")
+except (OSError, ValueError, AttributeError) as exc:
+    nproc_fail(exc)
 os.execve(argv[0], argv, cfg["env"])
 """
 
 # Processes a run may create on top of the uid's current count (Darwin's NPROC is per-UID).
 NPROC_ALLOWANCE = 64
+# The launcher's exit status when it could not install the NPROC limit (nothing was exec'd;
+# the run fails like any nonzero exit and, with no handshake, is never credited as confined).
+NPROC_FAIL_EXIT = 121
 # Per-stream cap on captured child output held in the worker's memory.
 MAX_CAPTURE_BYTES = 16 * 1024 * 1024
 # A run may create at most this many files/dirs in its writable dirs (inode-exhaustion guard).
@@ -303,7 +344,7 @@ def limits_launcher_argv(limits: Limits, argv: list[str],
     """``argv`` wrapped in the rlimit launcher (FSIZE, NOFILE, CPU, CORE, NPROC); ``env`` is
     what ``argv`` is exec'd with."""
     cfg = {"fsize": int(limits.tmpfs_bytes), "nofile": 4096, "cpu": int(limits.timeout_s) + 30,
-           "nproc": NPROC_ALLOWANCE, "env": dict(env or {})}
+           "nproc": NPROC_ALLOWANCE, "nproc_fail_exit": NPROC_FAIL_EXIT, "env": dict(env or {})}
     return [sys.executable, "-I", "-S", "-c", _LIMITS_LAUNCHER, json.dumps(cfg), *argv]
 
 
@@ -379,6 +420,20 @@ def process_table(ps_runner: Callable[..., subprocess.CompletedProcess] = subpro
         # ps always lists at least itself and the worker.
         raise SandboxError("cannot read the process table: ps listed no processes")
     return rows
+
+
+def disjoint_roots(paths: Iterable[Path]) -> list[Path]:
+    """``paths`` minus duplicates and any path under another one (compared resolved), so a tree
+    watched twice -- the same rw mount listed twice, or one nested in another -- is counted once.
+    The first spelling of each kept root is returned."""
+    resolved = [(Path(p), Path(os.path.realpath(p))) for p in paths]
+    kept: list[tuple[Path, Path]] = []
+    for p, r in sorted(resolved, key=lambda t: len(t[1].parts)):
+        if any(r == k or k in r.parents for _, k in kept):
+            continue
+        kept.append((p, r))
+    order = {id(p): i for i, (p, _) in enumerate(resolved)}
+    return [p for p, _ in sorted(kept, key=lambda t: order[id(t[0])])]
 
 
 def dir_usage(paths: Iterable[Path], max_entries: int) -> tuple[int, int, bool]:
@@ -477,7 +532,7 @@ class RssWatchdog:
         self._interval = interval_s
         self._rss_fn = rss_fn
         self._table_fn = table_fn
-        self._watch = list(watch_dirs)
+        self._watch = disjoint_roots(watch_dirs)
         self._disk_limit = disk_limit_bytes
         self._stop = threading.Event()
         self.tripped: str | None = None     # "memory" / "disk" / None
@@ -518,11 +573,34 @@ class RssWatchdog:
                 if started is not None:     # already gone: nothing to remember
                     self.seen[pid] = started
 
+    def _group_is_ours(self) -> bool:
+        """Whether ``_pgid`` still names THIS run's process group. It is the leader's pid, held
+        for us until the leader is reaped; after that the group can empty and the number go to
+        another job (as its pid, then its group).
+
+        - leader unreaped: ours;
+        - reaped, and the run has a sandbox identity (``member_fn``, which both macOS backends
+          pass): never again -- the run's processes are found by identity, seen pid+start time
+          and descent, and the backend's post-run sweep, not by the bare group number;
+        - reaped, no identity: ours only while no live process holds the number as its pid
+          (XNU won't hand out a pid that is still a live group's id, so a group whose number
+          is free is still the one the leader made)."""
+        if self._pgid is None:
+            return False
+        if self._proc.returncode is None:
+            return True
+        if self._member_fn is not None:
+            return False
+        return self._start_fn(self._pgid) is None
+
     def _ancestry(self, table: list[_Proc]) -> set[int]:
-        """The run's group, its leader (until it is reaped: then its pid is free for reuse) and
-        every member seen before that is still the same process."""
+        """The run's group and its leader (both only until the leader is reaped: then the pid
+        is free for reuse) and every member seen before that is still the same process."""
+        if not self._group_is_ours():
+            return self._seen_alive()
+        group = {r.pid for r in table if r.pgid == self._pgid}
         leader = {self._proc.pid} if self._proc.returncode is None else set()
-        return {r.pid for r in table if r.pgid == self._pgid} | leader | self._seen_alive()
+        return group | leader | self._seen_alive()
 
     def _by_identity(self, table: list[_Proc]) -> set[int]:
         """Processes that carry the run's sandbox (``member_fn``), wherever they sit in the
@@ -603,8 +681,9 @@ class RssWatchdog:
         leader exited normally (a forked child that closed its pipes must not outlive the run)."""
         if self._pgid is None:
             return
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(self._pgid, signal.SIGKILL)
+        if self._group_is_ours():
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(self._pgid, signal.SIGKILL)
         table: list[_Proc] = []
         try:
             table = self._table_fn()
@@ -612,7 +691,9 @@ class RssWatchdog:
         except SandboxError:
             # Can't list or match by sandbox identity: still kill everything known by ancestry.
             # (The post-run sweep then fails the run, since it can't prove the rest gone either.)
-            family = {r.pid for r in table if r.pgid == self._pgid} | self._seen_alive()
+            family = self._seen_alive()
+            if self._group_is_ours():
+                family |= {r.pid for r in table if r.pgid == self._pgid}
         live = family - {os.getpid()}
         for pid in live:
             with contextlib.suppress(ProcessLookupError, PermissionError):
@@ -846,7 +927,8 @@ def container_of(pid: int) -> str | None:
     return os.fsdecode(buf.value) or None
 
 
-def sweep_sandboxed(match: Callable[[int], bool], *, what: str, rounds: int = 400) -> int:
+def sweep_sandboxed(match: Callable[[int], bool], *, what: str, rounds: int = 400,
+                    before_round: Callable[[], object] | None = None) -> int:
     """SIGKILL every SANDBOXED process of our uid that ``match``es, until none is left.
 
     Loops because a match may fork while being killed (bounded by the launcher's NPROC cap).
@@ -855,6 +937,8 @@ def sweep_sandboxed(match: Callable[[int], bool], *, what: str, rounds: int = 40
     me = os.getpid()
     killed: set[int] = set()
     for _ in range(rounds):
+        if before_round is not None:
+            before_round()
         live = [p for p in uid_pids() if p != me and is_sandboxed(p) and match(p)]
         live = [p for p in live if p not in killed or _alive(p)]
         if not live:
@@ -906,12 +990,43 @@ def container_matcher(container: Path) -> Callable[[int], bool]:
     return lambda p: (c := container_of(p)) is not None and _container_identity(c) == want
 
 
+def restore_identity_dir(path: Path) -> None:
+    """Put a real, empty-or-existing directory back at ``path`` if the run removed it or
+    swapped it for a symlink/file. A seatbelt run is identified by the profile's write grant on
+    this PATH (``sandbox_check`` is path-based), so a fresh directory at the same path
+    identifies it again. Raises ``SandboxError`` if that can't be done."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        st = None
+    except OSError as exc:
+        raise SandboxError(f"cannot inspect {path} to sweep its run: {exc}") from exc
+    if st is not None and stat.S_ISDIR(st.st_mode):
+        return
+    try:
+        if st is not None:
+            if hasattr(os, "lchflags"):
+                with contextlib.suppress(OSError):
+                    os.lchflags(path, 0)
+            os.unlink(path)
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        if not stat.S_ISDIR(os.lstat(path).st_mode):
+            raise SandboxError(f"cannot restore {path} to sweep its run") from None
+    except OSError as exc:
+        raise SandboxError(f"cannot restore {path} to sweep its run: {exc}") from exc
+
+
 def sweep_writers(path: Path, *, started_after: float) -> int:
-    """Kill every sandboxed process :func:`writer_matcher` matches."""
-    if not os.path.isdir(path):
-        return 0
+    """Kill every sandboxed process :func:`writer_matcher` matches.
+
+    A missing or replaced ``path`` is NOT an empty run: a detached child can remove its scratch
+    dir (or swap in a symlink) to stop matching. The directory is put back before every round,
+    so the path the profile grants is a real directory again and its writers match; if it
+    can't be, the sweep fails (``SandboxError``) rather than reporting nothing to kill."""
     return sweep_sandboxed(writer_matcher(path, started_after=started_after),
-                           what=f"the run in {path}")
+                           what=f"the run in {path}",
+                           before_round=lambda: restore_identity_dir(path))
 
 
 def sweep_container(container: Path) -> int:

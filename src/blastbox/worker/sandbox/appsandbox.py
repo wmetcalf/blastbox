@@ -612,14 +612,16 @@ class AppSandboxSandbox:
         # container doesn't exist yet (containermanagerd creates it at launch), so a seeded run
         # on a fresh slot first primes it with a no-op launch -- the seed is never dropped.
         container = slot.container_data(self._home)
+        # ONE pre-launch budget for the seed AND every staged mount: nothing is metered by the
+        # watchdog until the child starts, so together they must stay within the run's limit.
+        staging = mc.CopyBudget(budget)
         if request.seed_home is not None:
             if not container.is_dir():
                 self._prime_container(slot, home)
-            mc.seed_scratch(container, request.seed_home, budget)
+            mc.seed_scratch(container, request.seed_home, budget=staging)
 
         mapping: list[tuple[str, str]] = []
         rw_staged: list[tuple[Path, Path, bool]] = []
-        staging = mc.CopyBudget(budget)
         for i, m in enumerate([*request.ro_mounts, *request.rw_mounts]):
             src = Path(m.source).resolve(strict=True)
             # Read-only mounts go under ro/ (granted read-only), writable ones under io/.
@@ -777,10 +779,16 @@ class AppSandboxSandbox:
                 raise
             AppSandboxSandbox._swap_children(dest, new, old)
         else:
+            locked = mc.locked_file_target(dest)
+            if locked is not None:
+                raise SandboxError(f"appsandbox: rw mount {dest} can't be replaced ({locked}); "
+                                   "not copied back")
             new = dest.with_name(f".{dest.name}.blastbox-copyback-{secrets.token_hex(8)}")
             try:
                 mc.copy_no_follow(staged, new, budget=budget)
+                os.replace(new, dest)
             except BaseException:
+                # Copy or swap failed: the sibling holds untrusted bytes outside every wipe and
+                # watchdog path, so it never outlives the attempt.
                 mc.remove_tree(new)
                 raise
-            os.replace(new, dest)

@@ -349,6 +349,27 @@ class TestSweep:
                 p.kill()
                 p.wait()
 
+    @pytest.mark.parametrize("swap", ["removed", "symlink"])
+    def test_a_removed_or_swapped_scratch_root_still_sweeps_its_run(self, tmp_path, swap):
+        # the child deletes (or symlinks away) its scratch dir to stop matching: the sweep puts
+        # the directory back and still finds -- and kills -- the run's detached processes
+        mine = (tmp_path / "mine").resolve()
+        mine.mkdir()
+        t0 = time.time() - 1
+        a = self._sandboxed_sleeper(mine)
+        try:
+            time.sleep(0.5)
+            mine.rmdir()
+            if swap == "symlink":
+                (tmp_path / "elsewhere").mkdir()
+                mine.symlink_to(tmp_path / "elsewhere")
+            assert mc.sweep_writers(mine, started_after=t0) == 1
+            assert a.wait(5) == -9
+            assert mine.is_dir() and not mine.is_symlink()
+        finally:
+            a.kill()
+            a.wait()
+
     def test_the_worker_itself_is_not_sandboxed(self):
         assert not mc.is_sandboxed(os.getpid())
 
@@ -598,6 +619,108 @@ class TestWatchdogPidIdentity:
         proc.kill()
         proc.wait()
         assert proc.pid not in dog._ancestry([])
+
+
+class TestWatchdogProcessGroup:
+    def test_the_group_is_not_trusted_once_its_leader_is_reaped(self, monkeypatch):
+        # after the leader is reaped its pid -- the group number -- can become another job's
+        # group: neither killpg nor "same pgid" membership may reach it
+        proc = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+        dog = mc.RssWatchdog(proc, 1 << 30, table_fn=lambda: [], start_fn=lambda pid: None,
+                             member_fn=lambda pid: False)   # a backend's sandbox identity
+        monkeypatch.setattr(mc, "uid_pids", lambda: [])
+        pgid = dog._pgid
+        stranger = mc._Proc(pid=999_991, ppid=1, pgid=pgid, rss=0)
+        assert 999_991 in dog._ancestry([stranger])        # leader alive: the group is ours
+        proc.kill()
+        proc.wait()
+        assert 999_991 not in dog._ancestry([stranger])
+        signalled = []
+        monkeypatch.setattr(mc.os, "killpg", lambda g, sig: signalled.append(("pg", g)))
+        monkeypatch.setattr(mc.os, "kill", lambda p, sig: signalled.append(("pid", p)))
+        dog._table_fn = lambda: [stranger]
+        dog.kill_family()
+        assert signalled == []
+
+    def test_without_an_identity_a_reaped_groups_reused_number_is_not_trusted(self, monkeypatch):
+        proc = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+        starts: dict[int, float] = {}
+        dog = mc.RssWatchdog(proc, 1 << 30, table_fn=lambda: [], start_fn=lambda p: starts.get(p))
+        pgid = dog._pgid
+        member = mc._Proc(pid=999_991, ppid=1, pgid=pgid, rss=0)
+        proc.kill()
+        proc.wait()
+        assert 999_991 in dog._ancestry([member])          # number still free: still our group
+        starts[pgid] = 12345.0                             # a new process now holds that pid
+        assert 999_991 not in dog._ancestry([member])
+        signalled = []
+        monkeypatch.setattr(mc.os, "killpg", lambda g, sig: signalled.append(g))
+        dog.kill_family()
+        assert signalled == []
+
+    def test_the_group_is_killed_while_the_leader_is_unreaped(self, monkeypatch):
+        proc = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+        try:
+            dog = mc.RssWatchdog(proc, 1 << 30, table_fn=lambda: [], start_fn=lambda pid: None)
+            dog.kill_family()
+            assert proc.wait(timeout=5) == -9
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            proc.wait()
+
+
+class TestWatchRoots:
+    def test_duplicate_and_nested_roots_are_counted_once(self, tmp_path):
+        parent = tmp_path / "p"
+        (parent / "nested").mkdir(parents=True)
+        (parent / "nested" / "f").write_bytes(b"x" * 8192)
+        other = tmp_path / "o"
+        other.mkdir()
+        roots = mc.disjoint_roots([parent / "nested", parent, parent, other,
+                                   tmp_path / "p" / "." / "nested"])
+        assert roots == [parent, other]
+        once = mc.dir_usage([parent], 1000)
+        assert mc.dir_usage(roots, 1000)[:2] == (once[0], once[1])
+
+    def test_the_watchdog_meters_overlapping_mounts_once(self, tmp_path):
+        parent = tmp_path / "p"
+        (parent / "nested").mkdir(parents=True)
+        (parent / "nested" / "f").write_bytes(b"x" * 600_000)
+        used = mc.dir_usage([parent], 1000)[0]
+        proc = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+        try:
+            dog = mc.RssWatchdog(proc, 1 << 30, rss_fn=lambda g: 0, table_fn=lambda: [],
+                                 watch_dirs=[parent, parent / "nested", parent],
+                                 disk_limit_bytes=used + used // 2)
+            dog._sample()
+            assert dog.tripped is None
+        finally:
+            proc.kill()
+            proc.wait()
+
+
+class TestNprocIsMandatory:
+    def test_a_launcher_that_cannot_install_nproc_never_execs(self, tmp_path):
+        import json
+        marker = tmp_path / "ran"
+        argv = mc.limits_launcher_argv(Limits(timeout_s=10), ["/usr/bin/touch", str(marker)],
+                                       {"PATH": mc.MINIMAL_PATH})
+        cfg = json.loads(argv[5])
+        cfg["libproc"] = str(tmp_path / "no-such-libproc.dylib")
+        argv[5] = json.dumps(cfg)
+        r = subprocess.run(argv, capture_output=True, env=dict(mc.LAUNCHER_ENV), timeout=30)
+        assert r.returncode == mc.NPROC_FAIL_EXIT
+        assert b"process limit" in r.stderr
+        assert not marker.exists()
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="libproc is Darwin's")
+    def test_the_launcher_installs_nproc_and_execs(self, tmp_path):
+        r = mc.run_confined([sys.executable, "-I", "-c",
+                             "import resource; print(resource.getrlimit(resource.RLIMIT_NPROC)[0])"],
+                            env={"PATH": mc.MINIMAL_PATH}, limits=Limits(timeout_s=10), cwd=tmp_path)
+        assert r.exit_code == 0, r.stderr
+        assert 0 < int(r.stdout) < 1 << 20
 
 
 class TestContainerIdentity:
