@@ -387,10 +387,11 @@ class TestSweepRevalidatesIdentity:
     def test_a_target_whose_pid_was_reused_after_matching_is_not_killed(self, monkeypatch):
         # matched at start time 100.0; by the time of the kill the pid is another process
         starts = iter([100.0, 200.0])
-        monkeypatch.setattr(mc, "uid_pids", lambda uid=None: [4242])
+        listings = iter([[4242]])                  # listed once; then it (the newcomer) exits
+        monkeypatch.setattr(mc, "uid_pids", lambda uid=None: next(listings, []))
         monkeypatch.setattr(mc, "is_sandboxed", lambda p: True)
         monkeypatch.setattr(mc, "proc_start_time", lambda p: next(starts, None))
-        monkeypatch.setattr(mc, "_alive", lambda p: False)
+        monkeypatch.setattr(mc, "_proc_state", lambda p: "gone")
         sent = []
         monkeypatch.setattr(mc.os, "kill", lambda p, sig: sent.append(p))
         assert mc.sweep_sandboxed(lambda p: True, what="test") == 0
@@ -410,7 +411,7 @@ class TestSweepRevalidatesIdentity:
         monkeypatch.setattr(mc, "uid_pids", lambda uid=None: [4242])
         monkeypatch.setattr(mc, "is_sandboxed", lambda p: True)
         monkeypatch.setattr(mc, "proc_start_time", lambda p: None)
-        monkeypatch.setattr(mc, "_alive", lambda p: True)
+        monkeypatch.setattr(mc, "_proc_state", lambda p: "alive")
         monkeypatch.setattr(mc.os, "kill", lambda p, sig: None)
         with pytest.raises(SandboxError, match="cannot identify"):
             mc.sweep_sandboxed(lambda p: True, what="test")
@@ -1025,3 +1026,183 @@ class TestWatchdogExitIsBounded:
         finally:
             proc.kill()
             proc.wait()
+
+
+class TestSweepNeedsAStableEmptyState:
+    def test_an_escapee_that_hands_off_mid_round_is_still_swept(self, monkeypatch):
+        # Round 1 lists the parent P, which forks C (not listed) and exits before it can be
+        # matched; round 2 lists C. A single empty round must not end the sweep.
+        listings = iter([[700], [701]])
+        monkeypatch.setattr(mc, "uid_pids", lambda uid=None: next(listings, []))
+        p_starts = iter([100.0])
+        monkeypatch.setattr(mc, "proc_start_time",
+                            lambda p: next(p_starts, None) if p == 700 else 300.0)
+        monkeypatch.setattr(mc, "is_sandboxed", lambda p: p == 701)   # P is gone by then
+        monkeypatch.setattr(mc, "_proc_state", lambda p: "gone")
+        monkeypatch.setattr(mc, "_alive", lambda p: False)
+        sent = []
+        monkeypatch.setattr(mc.os, "kill", lambda p, sig: sent.append(p))
+        assert mc.sweep_sandboxed(lambda p: True, what="test") == 1
+        assert sent == [701]
+
+    def test_it_takes_several_conclusive_empty_rounds_to_finish(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(mc, "uid_pids", lambda uid=None: calls.append(1) or [])
+        assert mc.sweep_sandboxed(lambda p: True, what="test") == 0
+        assert len(calls) == mc.SWEEP_QUIET_ROUNDS
+
+    def test_rounds_that_never_come_out_clean_fail_the_sweep(self, monkeypatch):
+        # every round lists a process that is gone before it can be ruled out
+        pids = iter(range(5000, 6000))
+        monkeypatch.setattr(mc, "uid_pids", lambda uid=None: [next(pids)])
+        monkeypatch.setattr(mc, "proc_start_time", lambda p: None)
+        monkeypatch.setattr(mc, "_proc_state", lambda p: "gone")
+        with pytest.raises(SandboxError, match="could not kill"):
+            mc.sweep_sandboxed(lambda p: True, what="test", rounds=20)
+
+    def test_a_zombie_does_not_keep_the_sweep_from_finishing(self, monkeypatch):
+        monkeypatch.setattr(mc, "uid_pids", lambda uid=None: [4242])
+        monkeypatch.setattr(mc, "proc_start_time", lambda p: None)
+        monkeypatch.setattr(mc, "_proc_state", lambda p: "zombie")
+        assert mc.sweep_sandboxed(lambda p: True, what="test", rounds=20) == 0
+
+
+class TestKillFamilyChecksNewMembers:
+    def _dog(self, proc, tables, starts):
+        it = iter(tables)
+        return mc.RssWatchdog(proc, 1 << 30, table_fn=lambda: next(it, []),
+                              start_fn=lambda p: starts.get(p))
+
+    def test_a_member_first_found_at_kill_time_is_reconfirmed_before_the_signal(self, monkeypatch):
+        proc = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+        try:
+            pgid = os.getpgid(proc.pid)
+            child = mc._Proc(pid=999_991, ppid=proc.pid, pgid=pgid, rss=0)
+            # the scan finds the child; by the re-check its pid belongs to an unrelated process
+            dog = self._dog(proc, [[child], [mc._Proc(pid=999_991, ppid=1, pgid=1, rss=0)]],
+                            {999_991: 500.0})
+            sent = []
+            monkeypatch.setattr(mc.os, "killpg", lambda g, sig: None)
+            monkeypatch.setattr(mc.os, "kill", lambda p, sig: sent.append(p))
+            dog.kill_family()
+            assert sent == []
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_a_confirmed_new_member_is_killed(self, monkeypatch):
+        proc = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+        try:
+            pgid = os.getpgid(proc.pid)
+            child = mc._Proc(pid=999_991, ppid=proc.pid, pgid=pgid, rss=0)
+            dog = self._dog(proc, [[child], [child]], {999_991: 500.0})
+            sent = []
+            monkeypatch.setattr(mc.os, "killpg", lambda g, sig: None)
+            monkeypatch.setattr(mc.os, "kill", lambda p, sig: sent.append(p))
+            dog.kill_family()
+            assert sent == [999_991]
+        finally:
+            proc.kill()
+            proc.wait()
+
+
+class TestFinalDiskSample:
+    def test_a_burst_after_the_last_sample_fails_the_run(self, tmp_path, monkeypatch):
+        # each file is under RLIMIT_FSIZE (= tmpfs_bytes); together they are over the limit.
+        # The watchdog never samples (as if the burst landed between samples and the run
+        # exited): the final measurement must still catch it.
+        monkeypatch.setattr(mc.RssWatchdog, "_loop", lambda self: None)
+        w = tmp_path / "w"
+        w.mkdir()
+        r = mc.run_confined(
+            ["/bin/sh", "-c", f'head -c 600000 /dev/zero > "{w}/a"; head -c 600000 /dev/zero > "{w}/b"'],
+            env={"PATH": mc.MINIMAL_PATH}, limits=Limits(timeout_s=30, tmpfs_bytes=1_000_000),
+            cwd=tmp_path, watch_dirs=[w])
+        assert r.exit_code == 0
+        assert r.killed
+        assert b"writable dirs exceeded" in r.stderr
+
+    def test_a_run_under_the_limit_is_not_flagged(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mc.RssWatchdog, "_loop", lambda self: None)
+        w = tmp_path / "w"
+        w.mkdir()
+        r = mc.run_confined(["/bin/sh", "-c", f'head -c 1000 /dev/zero > "{w}/a"'],
+                            env={"PATH": mc.MINIMAL_PATH},
+                            limits=Limits(timeout_s=30, tmpfs_bytes=1_000_000),
+                            cwd=tmp_path, watch_dirs=[w])
+        assert r.exit_code == 0 and not r.killed
+
+
+def _has_acl(path) -> bool:
+    out = subprocess.run(["/bin/ls", "-led", str(path)], capture_output=True, text=True).stdout
+    return any(line.strip().startswith("0:") for line in out.splitlines())
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS ACLs")
+class TestCopiesDropTheSourceACL:
+    @pytest.mark.parametrize("clone", [True, False])
+    def test_a_deny_delete_acl_does_not_reach_the_copy(self, tmp_path, monkeypatch, clone):
+        if not clone:
+            monkeypatch.setattr(mc, "_CLONEFILE", None)
+        src = tmp_path / "staged"
+        src.write_bytes(b"x" * 4096)
+        dst = tmp_path / "copy"
+        try:
+            subprocess.run(["/bin/chmod", "+a", "everyone deny delete", str(src)], check=True)
+            assert _has_acl(src)
+            mc.copy_no_follow(src, dst, budget_bytes=1 << 20)
+            assert dst.read_bytes() == b"x" * 4096
+            assert not _has_acl(dst)
+            os.unlink(dst)                  # deletable: nothing undeletable left behind
+        finally:
+            subprocess.run(["/bin/chmod", "-N", str(src)], check=False)
+            for p in (src, dst):
+                if os.path.lexists(p):
+                    subprocess.run(["/bin/chmod", "-N", str(p)], check=False)
+
+    def test_a_clone_that_carries_the_acl_has_it_stripped(self, tmp_path, monkeypatch):
+        # clonefile(2) on current macOS doesn't copy the ACL, but nothing promises that (and
+        # it does carry flags and modes): a clone that brings the source's ACL along must not
+        # put an undeletable file into the host tree.
+        def acl_clone(s, d, flags):
+            shutil.copyfile(s, d)
+            subprocess.run(["/bin/chmod", "+a", "everyone deny delete", os.fsdecode(d)], check=True)
+            return 0
+        monkeypatch.setattr(mc, "_CLONEFILE", acl_clone)
+        src, dst = tmp_path / "staged", tmp_path / "copy"
+        src.write_bytes(b"x")
+        try:
+            mc.copy_no_follow(src, dst, budget_bytes=1 << 20)
+            assert not _has_acl(dst)
+            os.unlink(dst)
+        finally:
+            if os.path.lexists(dst):
+                subprocess.run(["/bin/chmod", "-N", str(dst)], check=False)
+
+    def test_a_clone_whose_acl_cannot_be_cleared_fails_the_copy(self, tmp_path, monkeypatch):
+        if mc._CLONEFILE is None:
+            pytest.skip("no clonefile")
+        monkeypatch.setattr(mc, "_STRIP_ACL", lambda p: -1)
+        src = tmp_path / "staged"
+        src.write_bytes(b"x")
+        with pytest.raises(SandboxError, match="cannot clear the ACL"):
+            mc.copy_no_follow(src, tmp_path / "copy", budget_bytes=1 << 20)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS ACLs")
+class TestRemoveTreeUnlocks:
+    def test_a_tree_holding_a_deny_delete_acl_is_removed(self, tmp_path):
+        # e.g. a copy-back's half-built replacement, abandoned after a staged file's ACL could
+        # not be cleared: it must not stay behind on the host
+        d = tmp_path / ".blastbox-copyback-x"
+        (d / "sub").mkdir(parents=True)
+        f = d / "sub" / "locked"
+        f.write_bytes(b"x")
+        subprocess.run(["/bin/chmod", "+a", "everyone deny delete", str(f)], check=True)
+        subprocess.run(["/bin/chmod", "+a", "everyone deny delete_child", str(d / "sub")], check=True)
+        try:
+            mc.remove_tree(d)
+            assert not os.path.lexists(d)
+        finally:
+            if os.path.lexists(d):
+                subprocess.run(["/bin/chmod", "-RN", str(d)], check=False)

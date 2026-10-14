@@ -168,18 +168,26 @@ def remove_tree(path: Path) -> None:
 
     Classified by ``lstat``: everything that isn't a real directory -- a file, a symlink, but
     also a FIFO, socket or device node a sandboxed child made -- is unlinked; only a directory
-    goes to ``rmtree`` (which itself unlinks every non-directory inside)."""
-    try:
+    goes to ``rmtree`` (which itself unlinks every non-directory inside). Whatever a first pass
+    leaves -- an entry a child locked with a flag or a deny ACL -- is unlocked
+    (:func:`unlock_tree`) and removed again."""
+    for attempt in (1, 2):
         try:
-            st = os.lstat(path)
-        except FileNotFoundError:
-            return
-        if stat.S_ISDIR(st.st_mode):
-            shutil.rmtree(path, ignore_errors=True)
-        else:
-            os.unlink(path)
-    except OSError as exc:
-        _log.warning("macos sandbox: could not remove %s: %s", path, exc)
+            try:
+                st = os.lstat(path)
+            except FileNotFoundError:
+                return
+            if attempt == 2:
+                unlock_tree(path)
+            if stat.S_ISDIR(st.st_mode):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                os.unlink(path)
+        except OSError as exc:
+            if attempt == 2:
+                _log.warning("macos sandbox: could not remove %s: %s", path, exc)
+    if os.path.lexists(path):
+        _log.warning("macos sandbox: could not remove %s", path)
 
 
 _LOCK_FLAGS = (getattr(stat, "UF_IMMUTABLE", 0) | getattr(stat, "UF_APPEND", 0)
@@ -764,6 +772,24 @@ class RssWatchdog:
                 self._trip("disk", f"writable dirs hold {used} bytes / {entries} entries "
                                    f"(limit {self._disk_limit} bytes / {MAX_SCRATCH_ENTRIES} entries)")
 
+    def final_disk_check(self) -> None:
+        """One synchronous disk measurement after the run is over -- its processes killed and
+        swept, so the writable dirs can't change any more. Polling can miss a burst written
+        after the last sample (each file under ``RLIMIT_FSIZE``, the total over the limit) just
+        before a clean exit; this catches it, and an incomplete walk fails closed as in a
+        sample. Sets ``tripped`` to "disk" (the run is then reported killed, never credited)."""
+        if self.tripped or not self._watch or self._disk_limit is None:
+            return
+        used, entries, complete = dir_usage(self._watch, MAX_SCRATCH_ENTRIES)
+        if not complete:
+            self.tripped = "disk"
+            _log.warning("macos sandbox: part of the writable dirs could not be read after the run")
+        elif used > self._disk_limit or entries > MAX_SCRATCH_ENTRIES:
+            self.tripped = "disk"
+            _log.warning("macos sandbox: writable dirs hold %d bytes / %d entries after the run "
+                         "(limit %d bytes / %d entries)", used, entries, self._disk_limit,
+                         MAX_SCRATCH_ENTRIES)
+
     def _trip(self, why: str, detail: str) -> None:
         if self._stop.is_set():
             return          # the run is over; its own exit path does the final kill
@@ -794,25 +820,37 @@ class RssWatchdog:
         if self._group_is_ours():
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(self._pgid, signal.SIGKILL)
-        table: list[_Proc] = []
+        for pid, started in self._kill_targets().items():
+            # Every target is signalled only while it is still the process it was identified as.
+            kill_if_same(pid, started, start_fn=self._start_fn)
+
+    def _kill_targets(self) -> dict[int, float]:
+        """pid -> start time of every family member to kill. A member seen by an earlier sample
+        already has its identity. One first found by this scan gets its start time read NOW and
+        is then re-confirmed as a member by a second scan: had its pid been reused between the
+        first scan and the read, the start time would be the newcomer's, and the newcomer --
+        not in the run's family -- fails the second scan. (``kill_if_same`` then re-checks that
+        start time right before the signal.) If the run can't be listed or matched, only the
+        members already known by identity are killed; the post-run sweep then fails the run,
+        since it can't prove the rest gone either."""
+        me = os.getpid()
         try:
-            table = self._table_fn()
-            family = {r.pid for r in self._family(table)}
+            first = {r.pid for r in self._family(self._table_fn())}
         except SandboxError:
-            # Can't list or match by sandbox identity: still kill everything known by ancestry.
-            # (The post-run sweep then fails the run, since it can't prove the rest gone either.)
-            family = self._seen_alive()
-            if self._group_is_ours():
-                family |= {r.pid for r in table if r.pgid == self._pgid}
-        live = family - {os.getpid()}
-        for pid in live:
-            # A member known by pid+start time is signalled only while it is still that process.
-            started = self.seen.get(pid)
+            first = set()
+        known = {pid: started for pid, started in self.seen.items() if pid != me}
+        fresh: dict[int, float] = {}
+        for pid in first - set(known) - {me}:
+            started = self._start_fn(pid)
             if started is not None:
-                kill_if_same(pid, started, start_fn=self._start_fn)
-            else:
-                with contextlib.suppress(ProcessLookupError, PermissionError):
-                    os.kill(pid, signal.SIGKILL)
+                fresh[pid] = started
+        if fresh:
+            try:
+                again = {r.pid for r in self._family(self._table_fn())}
+            except SandboxError:
+                again = set()
+            known.update({pid: s for pid, s in fresh.items() if pid in again})
+        return known
 
 
 def kill_if_same(pid: int, started: float, *,
@@ -927,6 +965,8 @@ def run_confined(
         dog.kill_family()
         if sweep is not None:
             sweep()
+    # Everything of the run is dead now, so its writable dirs are final: measure them once more.
+    dog.final_disk_check()
     out.join(timeout=5.0)
     err.join(timeout=5.0)
     stdout, stderr = bytes(out.data), bytes(err.data)
@@ -1161,42 +1201,69 @@ def container_of(pid: int) -> str | None:
     return os.fsdecode(buf.value) or None
 
 
+# Consecutive conclusive empty rounds before a sweep calls the run gone (see sweep_sandboxed).
+SWEEP_QUIET_ROUNDS = 3
+
+
 def sweep_sandboxed(match: Callable[[int], bool], *, what: str, rounds: int = 400,
                     before_round: Callable[[], object] | None = None) -> int:
     """SIGKILL every SANDBOXED process of our uid that ``match``es, until none is left.
 
     Loops because a match may fork while being killed (bounded by the launcher's NPROC cap).
-    Returns how many were killed; raises ``SandboxError`` if they keep coming -- a run whose
-    processes can't be removed must not be reported, nor its slot reused."""
+    It returns only after :data:`SWEEP_QUIET_ROUNDS` consecutive rounds that matched nothing
+    AND in which every listed process was still there to be ruled out: a process that vanished
+    mid-round may have handed off to a child the listing missed. Returns how many were killed;
+    raises ``SandboxError`` if they keep coming (or the rounds never come out clean) -- a run
+    whose processes can't be shown gone must not be reported, nor its slot reused."""
     me = os.getpid()
     # (pid, start time): the identity each kill was aimed at. A pid alone could by now name
     # another job's process.
     killed: set[tuple[int, float]] = set()
+    quiet = 0
     for _ in range(rounds):
         if before_round is not None:
             before_round()
         live: list[tuple[int, float]] = []
+        # A listed process that is gone before it could be ruled out may have been the run's: an
+        # escapee that forks a successor and exits leaves the successor out of this listing and
+        # itself out of the matching. Such a round proves nothing.
+        inconclusive = False
         for p in uid_pids():
             if p == me:
                 continue
             # The identity is taken BEFORE matching: a match then vouches for this start time.
             started = proc_start_time(p)
-            if not (is_sandboxed(p) and match(p)):
-                continue
             if started is None:
-                if _alive(p) and proc_start_time(p) is None:
-                    # A live match whose identity can't be read can't be killed safely, and
-                    # isn't gone: fail the sweep rather than report the run clean.
+                state = _proc_state(p)
+                if state == "zombie":
+                    continue                # can't run any more: holds no grant
+                if state == "gone":
+                    inconclusive = True     # exited between listing and identifying
+                    continue
+                if proc_start_time(p) is None and is_sandboxed(p):
+                    # A live sandboxed process whose identity can't be read can't be ruled out
+                    # (the matchers need it) nor killed safely: fail the sweep rather than
+                    # report the run clean.
                     raise SandboxError(f"cannot identify process {p} left by {what}")
-                continue                    # it exited between listing and matching
+                inconclusive = True         # readable again (or unsandboxed): look again
+                continue
+            if not (is_sandboxed(p) and match(p)):
+                if proc_start_time(p) != started:
+                    inconclusive = True     # exited (or was replaced) while being matched
+                continue
             if (p, started) in killed and not _alive(p):
                 continue                    # already killed, a zombie awaiting its reaper
             live.append((p, started))
         if not live:
-            if killed:
-                _log.warning("macos sandbox: swept %d process(es) that escaped %s",
-                             len(killed), what)
-            return len(killed)
+            quiet = 0 if inconclusive else quiet + 1
+            if quiet >= SWEEP_QUIET_ROUNDS:
+                if killed:
+                    _log.warning("macos sandbox: swept %d process(es) that escaped %s",
+                                 len(killed), what)
+                return len(killed)
+            threading.Event().wait(0.005)
+            continue
+        quiet = 0
         for p, started in live:
             # Revalidated right before signalling: a target that exited after matching (its
             # pid possibly reused by an unrelated process) is skipped, not killed.
@@ -1206,14 +1273,22 @@ def sweep_sandboxed(match: Callable[[int], bool], *, what: str, rounds: int = 40
     raise SandboxError(f"could not kill the processes left by {what}")
 
 
-def _alive(pid: int) -> bool:
-    """False once ``pid`` is gone or a zombie (killed, awaiting its reaper)."""
+def _proc_state(pid: int) -> str:
+    """"gone", "zombie" (exited, awaiting its reaper) or "alive" -- also when ``ps`` fails,
+    the answer that never lets a sweep call a process gone."""
     try:
         out = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(pid)], capture_output=True,
                              text=True, timeout=5, check=False).stdout.strip()
     except (OSError, subprocess.SubprocessError):
-        return True
-    return bool(out) and not out.startswith("Z")
+        return "alive"
+    if not out:
+        return "gone"
+    return "zombie" if out.startswith("Z") else "alive"
+
+
+def _alive(pid: int) -> bool:
+    """False once ``pid`` is gone or a zombie (killed, awaiting its reaper)."""
+    return _proc_state(pid) == "alive"
 
 
 def writer_matcher(path: Path, *, started_after: float) -> Callable[[int], bool]:
@@ -1309,17 +1384,23 @@ _CLONE_NOFOLLOW = 0x0001
 
 def _copy_regular(src: Path, dst: Path, mode: int) -> None:
     """APFS clone when possible (O(1), copy-on-write), else a byte copy. Either way the copy
-    then gets only ``src``'s rwx bits: a clone keeps setuid/setgid, which must not survive into
-    a host copy. Never follows links."""
+    then gets only ``src``'s rwx bits: a clone keeps setuid/setgid, flags and the extended ACL,
+    none of which may survive into a host copy. Never follows links."""
     cloned = (_CLONEFILE is not None
               and _CLONEFILE(os.fsencode(src), os.fsencode(dst), _CLONE_NOFOLLOW) == 0)
     if not cloned:
         with open(src, "rb", opener=lambda p, f: os.open(p, f | os.O_NOFOLLOW)) as fin, \
                 open(dst, "xb") as fout:
             shutil.copyfileobj(fin, fout, 1024 * 1024)
-    elif hasattr(os, "lchflags"):
-        # A clone can carry the source's flags: a child must not plant an immutable host file.
-        os.lchflags(dst, 0)
+    else:
+        # A clone carries the source's flags and extended ACL: a child must not plant an
+        # immutable or undeletable (``everyone deny delete``) file in the host tree. A byte copy
+        # is a new file and gets neither from the source.
+        if hasattr(os, "lchflags"):
+            os.lchflags(dst, 0)
+        if _STRIP_ACL is not None and _STRIP_ACL(os.fsencode(dst)) != 0:
+            err = ctypes.get_errno()
+            raise SandboxError(f"cannot clear the ACL on {dst}: {os.strerror(err)}")
     os.chmod(dst, _perm_bits(mode), follow_symlinks=False)
 
 
