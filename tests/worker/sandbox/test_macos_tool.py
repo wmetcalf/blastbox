@@ -118,3 +118,17 @@ def test_a_probe_that_raises_is_a_failed_check_and_later_backends_still_run():
     assert len(failed) == 1 and failed[0].backend == "broken" and not failed[0].ok
     assert any(c.backend == "fake" and c.name == "write outside grants is denied" for c in checks)
     assert "SandboxError" in failed[0].detail and "prove the slot empty" in failed[0].detail
+
+
+@darwin
+def test_a_backend_that_crashes_while_being_built_is_a_failed_check():
+    def make(name):
+        if name == "broken":
+            raise KeyError("slots")
+        return _Unconfined()
+    checks = macos_tool.doctor(backends=["broken", "fake"], self_test=None,
+                               accelerators=frozenset(), ro=[], make=make)
+    first = checks[0]
+    assert (first.backend, first.name, first.ok) == ("broken", "backend available", False)
+    assert "KeyError" in first.detail
+    assert any(c.backend == "fake" and c.name == "runs /usr/bin/true" for c in checks)

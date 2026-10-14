@@ -118,6 +118,10 @@ def doctor(*, backends: list[str], self_test: list[str] | None, accelerators: fr
             checks.append(Check(name, "backend available", False, str(exc),
                                 unprepared=isinstance(exc, AppSandboxNotPrepared)))
             continue
+        except Exception as exc:  # noqa: BLE001 -- a broken install is what doctor diagnoses
+            checks.append(Check(name, "backend available", False,
+                                f"{type(exc).__name__}: {exc}"[:400]))
+            continue
         checks.append(Check(name, "backend available", True))
         probes: list[Check] = []
         try:

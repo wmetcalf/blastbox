@@ -209,28 +209,75 @@ class Manifest:
             ) from exc
         except (OSError, ValueError) as exc:
             raise SandboxUnavailable(f"appsandbox manifest unreadable: {path}: {exc}") from exc
-        if raw.get("version") != MANIFEST_VERSION:
-            raise SandboxUnavailable(
-                f"appsandbox manifest version {raw.get('version')!r} != {MANIFEST_VERSION}; "
-                "re-run `blastbox macos prepare`"
-            )
-        # Bundle ids are used as paths (container, lock): an edited manifest must not point a
-        # wipe outside ~/Library/Containers.
-        bad = [v for v in [raw.get("bundle_prefix"), *(s.get("bundle_id") for s in raw["slots"])]
-               if not _valid_bundle_id(v)]
-        if bad:
-            raise SandboxUnavailable(f"appsandbox manifest has invalid bundle ids {bad!r}; "
-                                     "re-run `blastbox macos prepare`")
-        return cls(
-            root=root,
-            bundle_prefix=raw["bundle_prefix"],
-            ro_paths=tuple(Path(p) for p in raw["ro_paths"]),
-            slots=tuple(
-                Slot(index=s["index"], bundle_id=s["bundle_id"], bundle=Path(s["bundle"]),
-                     io_dir=Path(s["io_dir"]), lock_path=Path(s["lock_path"]))
-                for s in raw["slots"]
-            ),
+        return _parse_manifest(raw, root, path)
+
+
+def _check_mapping(mapping: list[tuple[str, str]]) -> None:
+    """Refuse a request where one path would be rewritten to two different staged copies: two
+    mounts at the same target, or a target equal to another mount's source (which is also
+    rewritten). ``rewrite_path_args`` would silently pick one -- here the read-only copy, where
+    Linux's later bind mount would expose the writable one -- so an ambiguous request fails
+    instead of guessing. (Aliases of one writable tree map to the same copy and are fine.)"""
+    claimed: dict[str, str] = {}
+    for key, staged in mapping:
+        norm = os.path.normpath(key)
+        prior = claimed.setdefault(norm, staged)
+        if prior != staged:
+            raise SandboxError(
+                f"appsandbox: {norm} names two different mounts (same target, or one mount's "
+                "target is another's source); give each mount a distinct target")
+
+
+def _manifest_error(path: Path, why: str) -> SandboxUnavailable:
+    return SandboxUnavailable(f"appsandbox manifest {path} is malformed: {why}; "
+                              "re-run `blastbox macos prepare`")
+
+
+def _parse_manifest(raw: object, root: Path, path: Path) -> Manifest:
+    """Every field typed and every slot path where ``prepare`` puts it: slot paths are wiped
+    and launched, so an edited manifest must not aim them outside the root (or index a missing
+    key and crash backend selection)."""
+    if not isinstance(raw, dict):
+        raise _manifest_error(path, "not a JSON object")
+    if raw.get("version") != MANIFEST_VERSION:
+        raise SandboxUnavailable(
+            f"appsandbox manifest version {raw.get('version')!r} != {MANIFEST_VERSION}; "
+            "re-run `blastbox macos prepare`"
         )
+    prefix, ro_paths, slots = raw.get("bundle_prefix"), raw.get("ro_paths"), raw.get("slots")
+    # Bundle ids are used as paths (container, lock): they must stay plain identifiers.
+    if not _valid_bundle_id(prefix):
+        raise SandboxUnavailable(f"appsandbox manifest has invalid bundle ids {[prefix]!r}; "
+                                 "re-run `blastbox macos prepare`")
+    if not isinstance(ro_paths, list) or not all(
+            isinstance(p, str) and os.path.isabs(p) for p in ro_paths):
+        raise _manifest_error(path, "ro_paths must be a list of absolute paths")
+    if not isinstance(slots, list):
+        raise _manifest_error(path, "slots must be a list")
+    real_root = root.resolve()
+    parsed: list[Slot] = []
+    for pos, s in enumerate(slots):
+        if not isinstance(s, dict):
+            raise _manifest_error(path, f"slot {pos} is not an object")
+        index, bundle_id = s.get("index"), s.get("bundle_id")
+        if type(index) is not int or index != pos:
+            raise _manifest_error(path, f"slot {pos} has index {index!r}")
+        if not _valid_bundle_id(bundle_id) or bundle_id != f"{prefix}.slot{index}":
+            raise SandboxUnavailable(f"appsandbox manifest has invalid bundle ids {[bundle_id]!r}; "
+                                     "re-run `blastbox macos prepare`")
+        fields = {k: s.get(k) for k in ("bundle", "io_dir", "lock_path")}
+        if not all(isinstance(v, str) and os.path.isabs(v) for v in fields.values()):
+            raise _manifest_error(path, f"slot {pos} paths must be absolute strings")
+        want = {"bundle": real_root / "slots" / str(index) / f"bb-slot-{index}.app",
+                "io_dir": real_root / "slots" / str(index) / "io",
+                "lock_path": real_root / "locks" / f"{index}.lock"}
+        for k, v in fields.items():
+            if Path(v).resolve() != want[k]:
+                raise _manifest_error(path, f"slot {pos} {k} {v!r} is not {want[k]}")
+        parsed.append(Slot(index=index, bundle_id=bundle_id, bundle=Path(fields["bundle"]),
+                           io_dir=Path(fields["io_dir"]), lock_path=Path(fields["lock_path"])))
+    return Manifest(root=root, bundle_prefix=prefix, ro_paths=tuple(Path(p) for p in ro_paths),
+                    slots=tuple(parsed))
 
 
 def default_root() -> Path:
@@ -656,6 +703,7 @@ class AppSandboxSandbox:
             if str(Path(m.target)) != str(src):
                 mapping.append((str(src), str(staged)))
 
+        _check_mapping(mapping)
         args = mc.rewrite_path_args(request.argv[1:], mapping)
         extra_env = {k: mc.rewrite_path_args([v], mapping)[0] for k, v in request.env.items()}
         env = mc.build_child_env(home, extra_env)

@@ -912,3 +912,87 @@ class TestBundleIds:
         path.write_text(json.dumps(raw))
         with pytest.raises(SandboxUnavailable, match="invalid bundle ids"):
             asb.Manifest.load(root)
+
+
+class TestManifestShape:
+    """A syntactically valid but malformed manifest is SandboxUnavailable -- never a KeyError /
+    TypeError that crashes backend selection or `macos doctor`."""
+
+    def _tamper(self, tmp_path, edit):
+        root = _fake_root(tmp_path)
+        path = root / asb.MANIFEST_NAME
+        raw = json.loads(path.read_text())
+        raw = edit(raw)
+        path.write_text(json.dumps(raw))
+        return root
+
+    @pytest.mark.parametrize("edit", [
+        lambda r: {"version": asb.MANIFEST_VERSION},                         # no fields
+        lambda r: [r],                                                       # not an object
+        lambda r: {**r, "slots": {"0": r["slots"][0]}},                      # slots not a list
+        lambda r: {**r, "slots": ["not a slot"]},                            # slot not an object
+        lambda r: {**r, "slots": [{**r["slots"][0], "index": "0"}]},         # index not an int
+        lambda r: {**r, "slots": [{**r["slots"][0], "index": True}]},
+        lambda r: {**r, "slots": [{k: v for k, v in r["slots"][0].items() if k != "io_dir"}]},
+        lambda r: {**r, "ro_paths": "/opt"},                                 # not a list
+        lambda r: {**r, "ro_paths": ["relative"]},
+        lambda r: {**r, "bundle_prefix": 7},
+    ])
+    def test_malformed_manifests_are_unavailable(self, tmp_path, edit):
+        root = self._tamper(tmp_path, edit)
+        with pytest.raises(SandboxUnavailable):
+            asb.Manifest.load(root)
+        with pytest.raises(SandboxUnavailable):
+            asb.AppSandboxSandbox(root=root, platform_ok=True, verify=False)
+
+    @pytest.mark.parametrize("field", ["io_dir", "bundle", "lock_path"])
+    def test_slot_paths_must_be_where_prepare_put_them(self, tmp_path, field):
+        # io_dir is wiped before and after every run: an edited manifest must not aim it (or the
+        # launched bundle, or the lock) at another directory.
+        victim = tmp_path / "victim"
+        victim.mkdir()
+        root = self._tamper(tmp_path, lambda r: {
+            **r, "slots": [{**r["slots"][0], field: str(victim)}]})
+        with pytest.raises(SandboxUnavailable, match=field):
+            asb.Manifest.load(root)
+
+    def test_a_slot_id_not_derived_from_the_prefix_is_refused(self, tmp_path):
+        root = self._tamper(tmp_path, lambda r: {
+            **r, "slots": [{**r["slots"][0], "bundle_id": "com.apple.Safari"}]})
+        with pytest.raises(SandboxUnavailable, match="invalid bundle ids"):
+            asb.Manifest.load(root)
+
+    def test_a_prepared_manifest_still_loads(self, tmp_path):
+        root, ro = tmp_path / "root", tmp_path / "engine"
+        ro.mkdir()
+        m = asb.prepare(root, slots=3, ro_paths=[ro], runner=_fake_runner([]))
+        assert asb.Manifest.load(root) == m
+
+
+class TestMountRewriteCollisions:
+    def test_ro_and_rw_mounts_at_one_target_are_refused(self, tmp_path):
+        sb, _ = _sb_with(tmp_path)
+        src_ro, src_rw = tmp_path / "in", tmp_path / "out"
+        src_ro.mkdir()
+        src_rw.mkdir()
+        target = Path("/bb-test-collide")
+        popen = sb._popen
+        with pytest.raises(SandboxError, match="names two different mounts"):
+            sb.run(SandboxRequest(argv=["/bin/sh", "-c", 'echo hi > "$0/f"', str(target)],
+                                  ro_mounts=[Mount(src_ro, target)],
+                                  rw_mounts=[Mount(src_rw, target)]))
+        assert popen.calls == []                       # nothing was launched
+        assert list(src_rw.iterdir()) == []
+
+    def test_a_target_equal_to_another_mounts_source_is_refused(self, tmp_path):
+        sb, _ = _sb_with(tmp_path)
+        data, out = tmp_path / "data", tmp_path / "out"
+        data.mkdir()
+        out.mkdir()
+        with pytest.raises(SandboxError, match="names two different mounts"):
+            sb.run(SandboxRequest(argv=["/usr/bin/true"],
+                                  ro_mounts=[Mount(data, Path("/bb-test-in"))],
+                                  rw_mounts=[Mount(out, data)]))
+
+    def test_aliases_of_one_writable_tree_are_still_fine(self):
+        asb._check_mapping([("/a", "/s/x"), ("/b", "/s/x"), ("/a/", "/s/x")])

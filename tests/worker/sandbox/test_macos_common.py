@@ -784,3 +784,159 @@ class TestSeedEntryBudgetIsShared:
             (caches / f"f{i}").write_text("")
         with pytest.raises(SandboxError, match="entries"):
             mc.seed_scratch(mc.make_scratch(tmp_path / "s"), seed, budget_bytes=1 << 20)
+
+
+darwin_only = pytest.mark.skipif(sys.platform != "darwin", reason="libproc / macOS")
+
+
+class TestSpecialFilesAreWiped:
+    """A FIFO or socket the child leaves at the top of a wiped dir is neither a file nor a
+    symlink: it must still be unlinked, so the wipe proves the dir empty."""
+
+    def _specials(self, d):
+        import socket
+        os.mkfifo(d / "fifo")
+        s = socket.socket(socket.AF_UNIX)
+        with contextlib.chdir(d):        # a relative name: tmp paths overflow sun_path
+            s.bind("sock")
+        s.close()
+        (d / "sub").mkdir()
+        os.mkfifo(d / "sub" / "nested-fifo")
+
+    def test_remove_tree_unlinks_fifos_and_sockets(self, tmp_path):
+        self._specials(tmp_path)
+        for name in ("fifo", "sock", "sub"):
+            mc.remove_tree(tmp_path / name)
+        assert list(tmp_path.iterdir()) == []
+
+    def test_wipe_dir_empties_special_files(self, tmp_path):
+        d = tmp_path / "slot"
+        d.mkdir()
+        self._specials(d)
+        mc.wipe_dir(d)
+        assert list(d.iterdir()) == []
+
+
+class TestDiskWalkNeverFollowsASwappedDir:
+    def test_a_dir_swapped_for_a_symlink_mid_walk_is_not_followed(self, tmp_path, monkeypatch):
+        # Listed as a directory, then -- before the walk descends -- replaced by a symlink to a
+        # big host tree: the watchdog must not count (or block on) what the link points at.
+        root = tmp_path / "scratch"
+        (root / "sub").mkdir(parents=True)
+        outside = tmp_path / "host"
+        outside.mkdir()
+        (outside / "big").write_bytes(b"x" * (4 << 20))
+        swapped = []
+
+        def swap():
+            if not swapped:
+                swapped.append(1)
+                (root / "sub").rename(tmp_path / "moved")
+                (root / "sub").symlink_to(outside)
+
+        real_open, real_scandir = os.open, os.scandir
+
+        def hooked_open(path, flags, *a, dir_fd=None, **kw):
+            if os.fsdecode(path).endswith("sub"):
+                swap()
+            return real_open(path, flags, *a, dir_fd=dir_fd, **kw)
+
+        def hooked_scandir(path="."):
+            if isinstance(path, (str, os.PathLike)) and os.fsdecode(path).endswith("sub"):
+                swap()
+            return real_scandir(path)
+
+        monkeypatch.setattr(os, "open", hooked_open)
+        monkeypatch.setattr(os, "scandir", hooked_scandir)
+        used, entries, complete = mc.dir_usage([root], mc.MAX_SCRATCH_ENTRIES)
+        assert swapped
+        assert used < (1 << 20), used          # the 4 MiB behind the link was not counted
+        assert complete
+
+    def test_a_tree_deeper_than_the_walk_limit_is_unmeasured(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mc, "MAX_WALK_DEPTH", 3)
+        (tmp_path / "a" / "b" / "c" / "d").mkdir(parents=True)
+        assert mc.dir_usage([tmp_path], 1000)[2] is False
+        assert mc.dir_usage([tmp_path / "a" / "b"], 1000)[2] is True
+
+    def test_the_walk_stops_when_asked(self, tmp_path):
+        for i in range(20):
+            (tmp_path / f"d{i}").mkdir()
+        assert mc.dir_usage([tmp_path], 1000, stop=lambda: True)[2] is False
+
+
+_HOLDER = r'''
+import mmap, os, sys, time
+d = sys.argv[1]
+f = open(os.path.join(d, "a"), "wb"); os.unlink(f.name); f.write(b"x" * (3 << 20)); f.flush()
+g = os.open(os.path.join(d, "b"), os.O_RDWR | os.O_CREAT); os.unlink(os.path.join(d, "b"))
+os.ftruncate(g, 5 << 20); m = mmap.mmap(g, 5 << 20); m[:] = b"y" * (5 << 20); os.close(g)
+print("ready", flush=True); time.sleep(60)
+'''
+
+
+@darwin_only
+class TestOpenUnlinkedFilesCount:
+    def test_held_unlinked_bytes_sees_open_and_mapped_files(self, tmp_path):
+        p = subprocess.Popen([sys.executable, "-I", "-c", _HOLDER, str(tmp_path)],
+                             stdout=subprocess.PIPE)
+        try:
+            assert p.stdout.readline() == b"ready\n"
+            assert list(tmp_path.iterdir()) == []                 # no path leads to them
+            assert mc.dir_usage([tmp_path], 1000)[0] == 0
+            assert mc.held_unlinked_bytes([p.pid]) >= (8 << 20)   # 3 MiB fd + 5 MiB mmap
+        finally:
+            p.kill()
+            p.wait()
+
+    def test_an_exited_pid_is_skipped(self):
+        p = subprocess.Popen(["/usr/bin/true"])
+        p.wait()
+        assert mc.held_unlinked_bytes([p.pid]) == 0
+
+    def test_a_run_hiding_bytes_in_unlinked_files_trips_the_disk_limit(self, tmp_path):
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        r = mc.run_confined([sys.executable, "-I", "-c", _HOLDER, str(scratch)],
+                            env={"PATH": mc.MINIMAL_PATH},
+                            limits=Limits(timeout_s=20, tmpfs_bytes=6_000_000),
+                            cwd=scratch, watch_dirs=[scratch])
+        assert r.killed
+        assert b"writable dirs exceeded" in r.stderr
+
+    def test_unreadable_open_files_trip_the_run(self, tmp_path):
+        proc = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+
+        def blind(pids):
+            raise SandboxError("cannot list pid 1's open files")
+        try:
+            dog = mc.RssWatchdog(proc, 1 << 30, rss_fn=lambda pgid: 0, table_fn=lambda: [],
+                                 watch_dirs=[tmp_path], disk_limit_bytes=1 << 30, held_fn=blind)
+            with dog:
+                proc.wait(timeout=10)
+            assert dog.tripped == "disk"
+        finally:
+            proc.kill()
+            proc.wait()
+
+
+class TestWatchdogExitIsBounded:
+    @pytest.mark.timeout(30)
+    def test_a_watchdog_that_will_not_stop_fails_the_run(self, monkeypatch):
+        monkeypatch.setattr(mc, "WATCHDOG_JOIN_S", 0.5)
+        proc = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+        entered = []
+
+        def stuck_table():
+            entered.append(1)
+            time.sleep(5)
+            return []
+        try:
+            dog = mc.RssWatchdog(proc, 1 << 30, table_fn=stuck_table)
+            with pytest.raises(SandboxError, match="did not stop"), dog:
+                while not entered:
+                    time.sleep(0.01)
+            assert proc.poll() is None        # its stale sample, when it ends, kills nothing
+        finally:
+            proc.kill()
+            proc.wait()

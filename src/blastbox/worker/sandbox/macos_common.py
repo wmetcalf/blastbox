@@ -21,6 +21,7 @@ Darwin realities this module encodes (all measured on macOS 26 / Apple silicon):
 from __future__ import annotations
 
 import contextlib
+import errno
 import ctypes
 import ctypes.util
 import json
@@ -163,12 +164,20 @@ def capture_scratch(scratch: Path, dest: Path | None, budget_bytes: int) -> None
 
 
 def remove_tree(path: Path) -> None:
-    """Best-effort recursive delete that never follows a symlink out of ``path``."""
+    """Best-effort recursive delete that never follows a symlink out of ``path``.
+
+    Classified by ``lstat``: everything that isn't a real directory -- a file, a symlink, but
+    also a FIFO, socket or device node a sandboxed child made -- is unlinked; only a directory
+    goes to ``rmtree`` (which itself unlinks every non-directory inside)."""
     try:
-        if path.is_symlink() or path.is_file():
-            path.unlink()
-        elif path.exists():
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            return
+        if stat.S_ISDIR(st.st_mode):
             shutil.rmtree(path, ignore_errors=True)
+        else:
+            os.unlink(path)
     except OSError as exc:
         _log.warning("macos sandbox: could not remove %s: %s", path, exc)
 
@@ -436,61 +445,116 @@ def disjoint_roots(paths: Iterable[Path]) -> list[Path]:
     return [p for p, _ in sorted(kept, key=lambda t: order[id(t[0])])]
 
 
-def dir_usage(paths: Iterable[Path], max_entries: int) -> tuple[int, int, bool]:
+_OPEN_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+# Deeper than this is not measured (and so trips the disk limit): every level holds one open
+# directory fd, and no engine needs a tree this deep in its writable dirs.
+MAX_WALK_DEPTH = 256
+
+
+def _blocks(st: os.stat_result) -> int:
+    return st.st_blocks * 512 if hasattr(st, "st_blocks") else st.st_size
+
+
+def dir_usage(paths: Iterable[Path], max_entries: int,
+              stop: Callable[[], bool] | None = None) -> tuple[int, int, bool]:
     """(bytes, entries, complete) under ``paths`` without following symlinks; stops counting at
     ``max_entries`` + 1 so a directory bomb can't make the measurement itself expensive.
 
+    The walk is file-descriptor relative: each subdirectory is opened from its parent's fd with
+    ``O_NOFOLLOW | O_DIRECTORY`` and listed through that fd, never by re-resolving a textual
+    path. A running child that swaps a directory for a symlink between being listed and being
+    walked therefore can't redirect the (unsandboxed) watchdog into another host tree: the open
+    fails and the swapped-in link is counted as itself on the next sample.
+
     ``complete`` is False when part of the tree could not be read (a child can ``chmod 000`` a
-    full subdirectory to hide it): the caller must treat that as over budget, never as empty. A
-    path that vanished mid-walk (deleted by the run) is simply gone, not unmeasured."""
+    full subdirectory to hide it), is deeper than :data:`MAX_WALK_DEPTH`, or ``stop`` asked to
+    end the walk: the caller must treat that as over budget, never as empty. A path that
+    vanished mid-walk (deleted by the run) is simply gone, not unmeasured."""
     total = entries = 0
     complete = True
-    stack: list[str] = []
-    for root in paths:
-        # A root can be a file (an rw FILE mount) or a symlink: count it, never follow it. Only
-        # a directory is walked.
+    stack: list[tuple[int, object]] = []      # (dir fd, its scandir iterator)
+
+    def _open(name: str | Path, dir_fd: int | None) -> tuple[int, object] | None:
+        nonlocal complete
         try:
-            st = os.lstat(root)
+            fd = os.open(name, _OPEN_DIR, dir_fd=dir_fd)
         except FileNotFoundError:
-            continue
-        except OSError:
-            complete = False
-            continue
-        if stat.S_ISDIR(st.st_mode):
-            stack.append(str(root))
-        else:
-            entries += 1
-            total += st.st_blocks * 512 if hasattr(st, "st_blocks") else st.st_size
-    while stack:
-        top = stack.pop()
+            return None
+        except OSError as exc:
+            if exc.errno not in (errno.ELOOP, errno.ENOTDIR):
+                complete = False
+            return None     # replaced by a link/file since it was seen: never followed
         try:
-            it = os.scandir(top)
-        except FileNotFoundError:
-            continue
+            return fd, os.scandir(fd)
         except OSError:
+            os.close(fd)
             complete = False
-            continue
-        with it:
+            return None
+
+    try:
+        for root in paths:
+            # A root can be a file (an rw FILE mount) or a symlink: count it, never follow it.
+            # Only a directory is walked.
             try:
-                for e in it:
-                    entries += 1
-                    if entries > max_entries:
-                        return total, entries, complete
-                    try:
-                        st = e.stat(follow_symlinks=False)
-                    except FileNotFoundError:
-                        continue
-                    except OSError:
-                        complete = False
-                        continue
-                    total += st.st_blocks * 512 if hasattr(st, "st_blocks") else st.st_size
-                    if stat.S_ISDIR(st.st_mode):
-                        stack.append(e.path)
+                st = os.lstat(root)
             except FileNotFoundError:
                 continue
             except OSError:
                 complete = False
+                continue
+            if not stat.S_ISDIR(st.st_mode):
+                entries += 1
+                total += _blocks(st)
+                continue
+            frame = _open(root, None)
+            if frame is not None:
+                stack.append(frame)
+            while stack:
+                if stop is not None and stop():
+                    return total, entries, False
+                fd, it = stack[-1]
+                try:
+                    e = next(it, None)          # type: ignore[call-overload]
+                except FileNotFoundError:
+                    e = None
+                except OSError:
+                    complete = False
+                    e = None
+                if e is None:
+                    it.close()                  # type: ignore[attr-defined]
+                    os.close(fd)
+                    stack.pop()
+                    continue
+                entries += 1
+                if entries > max_entries:
+                    return total, entries, complete
+                try:
+                    st = e.stat(follow_symlinks=False)     # fstatat(fd, name, NOFOLLOW)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    complete = False
+                    continue
+                total += _blocks(st)
+                if stat.S_ISDIR(st.st_mode):
+                    if len(stack) >= MAX_WALK_DEPTH:
+                        complete = False
+                        continue
+                    frame = _open(e.name, fd)
+                    if frame is not None:
+                        stack.append(frame)
+    finally:
+        for fd, it in stack:
+            with contextlib.suppress(OSError):
+                it.close()                      # type: ignore[attr-defined]
+            with contextlib.suppress(OSError):
+                os.close(fd)
     return total, entries, complete
+
+
+# How long a finished run waits for its watchdog's in-flight sample (``ps`` has its own
+# timeout; the disk walk stops on request).
+WATCHDOG_JOIN_S = 30.0
 
 
 class RssWatchdog:
@@ -524,8 +588,10 @@ class RssWatchdog:
         table_fn: Callable[[], list[_Proc]] = process_table,
         member_fn: Callable[[int], bool] | None = None,
         start_fn: Callable[[int], float | None] | None = None,
+        held_fn: Callable[[Iterable[int]], int] | None = None,
     ) -> None:
         self._proc = proc
+        self._held_fn = held_fn or held_unlinked_bytes
         self._member_fn = member_fn
         self._start_fn = start_fn or proc_start_time
         self._limit = limit_bytes
@@ -553,10 +619,14 @@ class RssWatchdog:
 
     def __exit__(self, *exc: object) -> None:
         self._stop.set()
-        # Fully joined: a sample still in flight (``ps`` may block for seconds, a big walk too)
-        # must not land after the run -- once the slot is wiped and reused, its stale view could
-        # match the NEXT job (same container identity) and kill it with this job's limits.
-        self._thread.join()
+        # Joined, so a sample still in flight can't land after the run -- once the slot is
+        # wiped and reused, its stale view could match the NEXT job (same container identity).
+        # A sample checks ``_stop`` before it kills and the disk walk polls it, so this is quick;
+        # but it is bounded: a watchdog that won't stop is a failed run (and its stale sample,
+        # should it ever finish, still can't kill: ``_stop`` is set).
+        self._thread.join(timeout=WATCHDOG_JOIN_S)
+        if self._thread.is_alive():
+            raise SandboxError(f"the run's watchdog did not stop within {WATCHDOG_JOIN_S:g}s")
 
     def _seen_alive(self) -> set[int]:
         """Members seen before that are still the SAME process (same start time); a pid that
@@ -645,7 +715,15 @@ class RssWatchdog:
             self._trip("memory", f"RSS {rss} > limit {self._limit}")
             return
         if self._watch and self._disk_limit is not None:
-            used, entries, complete = dir_usage(self._watch, MAX_SCRATCH_ENTRIES)
+            used, entries, complete = dir_usage(self._watch, MAX_SCRATCH_ENTRIES,
+                                                stop=self._stop.is_set)
+            if self._stop.is_set():
+                return
+            try:
+                used += self._held_fn(r.pid for r in family)
+            except SandboxError as exc:
+                self._trip("disk", f"cannot measure files held open by the run: {exc}")
+                return
             if not complete:
                 # Fail closed: what can't be measured can't be shown to be under budget.
                 self._trip("disk", "part of the writable dirs could not be read "
@@ -831,7 +909,7 @@ def _libsystem() -> ctypes.CDLL | None:
     if not IS_DARWIN:
         return None
     try:
-        lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
         # Fixed args only: the rest is variadic, which ctypes must pass as such on arm64.
         lib.sandbox_check.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
         lib.sandbox_check.restype = ctypes.c_int
@@ -842,6 +920,9 @@ def _libsystem() -> ctypes.CDLL | None:
         lib.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p,
                                      ctypes.c_int]
         lib.proc_pidinfo.restype = ctypes.c_int
+        lib.proc_pidfdinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+                                       ctypes.c_int]
+        lib.proc_pidfdinfo.restype = ctypes.c_int
         return lib
     except (OSError, AttributeError):
         return None
@@ -876,6 +957,99 @@ def proc_start_time(pid: int) -> float | None:
     if _LIBSYSTEM.proc_pidinfo(pid, _PROC_PIDTBSDINFO, 0, ctypes.byref(info), size) != size:
         return None
     return info.pbi_start_tvsec + info.pbi_start_tvusec / 1e6
+
+
+# <sys/proc_info.h>
+_PROC_PIDLISTFDS = 1
+_PROC_PIDFDVNODEINFO = 1
+_PROX_FDTYPE_VNODE = 1
+_PROC_PIDREGIONPATHINFO = 8
+_VNODE_FDINFO_SIZE = 176            # struct vnode_fdinfo; its vinfo_stat at offset 24
+_VNODE_FDINFO_STAT = 24
+_REGION_PATHINFO_SIZE = 1272        # struct proc_regionwithpathinfo; vinfo_stat at offset 96
+_REGION_PATHINFO_STAT = 96
+_REGION_ADDR, _REGION_SIZE = 80, 88  # pri_address / pri_size within it
+# A process mapping more regions than this isn't measured (and so trips the disk limit): the
+# walk is one call per region, and no engine maps anywhere near this many.
+MAX_REGIONS = 50_000
+
+
+class _ProcFdInfo(ctypes.Structure):
+    _fields_ = [("proc_fd", ctypes.c_int32), ("proc_fdtype", ctypes.c_uint32)]
+
+
+def _vinfo_stat(raw: bytes, off: int) -> tuple[int, int, int, int, int] | None:
+    """(dev, ino, mode, nlink, bytes) from a ``struct vinfo_stat`` at ``off``; bytes is the
+    larger of the size and the allocated blocks."""
+    dev = int.from_bytes(raw[off:off + 4], "little")
+    mode = int.from_bytes(raw[off + 4:off + 6], "little")
+    nlink = int.from_bytes(raw[off + 6:off + 8], "little")
+    ino = int.from_bytes(raw[off + 8:off + 16], "little")
+    size = int.from_bytes(raw[off + 88:off + 96], "little", signed=True)
+    blocks = int.from_bytes(raw[off + 96:off + 104], "little", signed=True)
+    if not ino:
+        return None
+    return dev, ino, mode, nlink, max(size, blocks * 512, 0)
+
+
+def held_unlinked_bytes(pids: Iterable[int]) -> int:
+    """Bytes in regular files the processes ``pids`` hold open or mapped after unlinking them.
+
+    A file that is opened (or mmapped) and then unlinked keeps its blocks until the last
+    reference goes, but no path leads to it, so :func:`dir_usage` can't see it: a run could
+    park many such files near the per-file ``RLIMIT_FSIZE`` and fill the disk while the walk
+    reads zero. Counted once per (device, inode). Linked files are left to :func:`dir_usage`.
+
+    Raises ``SandboxError`` when a live process's descriptors or mappings can't be read -- what
+    can't be measured can't be shown to be under budget. A process that exited is skipped."""
+    if _LIBSYSTEM is None:
+        if IS_DARWIN:
+            raise SandboxError("cannot read open files: libSystem process APIs unavailable")
+        return 0
+    held: dict[tuple[int, int], int] = {}
+
+    def _note(st: tuple[int, int, int, int, int] | None) -> None:
+        if st is not None:
+            dev, ino, mode, nlink, nbytes = st
+            if stat.S_ISREG(mode) and nlink == 0:
+                held[(dev, ino)] = nbytes
+
+    vfi = ctypes.create_string_buffer(_VNODE_FDINFO_SIZE)
+    region = ctypes.create_string_buffer(_REGION_PATHINFO_SIZE)
+    for pid in set(pids):
+        n = _LIBSYSTEM.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, None, 0)
+        fds = (_ProcFdInfo * (max(n, 0) // ctypes.sizeof(_ProcFdInfo) + 64))()
+        got = (_LIBSYSTEM.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, fds, ctypes.sizeof(fds))
+               if n > 0 else n)
+        if got <= 0:
+            err = ctypes.get_errno()
+            if err == errno.ESRCH or proc_start_time(pid) is None:
+                continue        # exited
+            raise SandboxError(f"cannot list pid {pid}'s open files "
+                               f"(errno {err}: {os.strerror(err) if err else '?'})")
+        for f in fds[: got // ctypes.sizeof(_ProcFdInfo)]:
+            if f.proc_fdtype != _PROX_FDTYPE_VNODE:
+                continue
+            # A descriptor closed since the listing is simply gone.
+            if _LIBSYSTEM.proc_pidfdinfo(pid, f.proc_fd, _PROC_PIDFDVNODEINFO, vfi,
+                                         _VNODE_FDINFO_SIZE) == _VNODE_FDINFO_SIZE:
+                _note(_vinfo_stat(vfi.raw, _VNODE_FDINFO_STAT))
+        # Mapped files: an mmap keeps an unlinked file alive after its descriptor is closed.
+        addr = count = 0
+        while _LIBSYSTEM.proc_pidinfo(pid, _PROC_PIDREGIONPATHINFO, addr, region,
+                                      _REGION_PATHINFO_SIZE) > 0:
+            count += 1
+            if count > MAX_REGIONS:
+                raise SandboxError(f"pid {pid} maps more than {MAX_REGIONS} regions")
+            raw = region.raw
+            _note(_vinfo_stat(raw, _REGION_PATHINFO_STAT))
+            start = int.from_bytes(raw[_REGION_ADDR:_REGION_ADDR + 8], "little")
+            size = int.from_bytes(raw[_REGION_SIZE:_REGION_SIZE + 8], "little")
+            nxt = start + size
+            if nxt <= addr:
+                break
+            addr = nxt
+    return sum(held.values())
 
 
 def process_apis_available() -> bool:
