@@ -268,6 +268,13 @@ was granted.
   sandbox-exec rejects never gets there); under `appsandbox`, the signed launcher writes the
   nonce into the slot's `io/` once it has checked it is sandboxed, before it execs the target.
   (Slots prepared before this need `blastbox macos prepare` again: manifest version 2.)
+  Read-only mounts are staged in the slot's `ro/` dir, which the launcher's entitlement grants
+  read-only, so a child can't rewrite or chmod a mounted input or config; only `io/` is
+  writable. Slots prepared before `ro/` existed fail signature verification (their
+  entitlements no longer match): re-run `blastbox macos prepare`.
+  With the warmup gate on, the warmup self-test must itself complete a confined run, or
+  `/healthz` stays 503: a self-test that passed by parsing in-process proves nothing about the
+  sandbox's grants.
   `select_sandbox()`'s own `/usr/bin/true` probe never counts, so an engine that selects its
   backend mid-job gets no credit before its parser has run. `BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE=1` is the explicit escape hatch.
 - The engine's optional `detect()` isn't called in the agent (it would parse the input outside

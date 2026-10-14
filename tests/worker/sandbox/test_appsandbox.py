@@ -11,6 +11,7 @@ import json
 import os
 import plistlib
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -55,7 +56,10 @@ class TestPrepare:
             assert ent[asb._APP_SANDBOX] is True
             # Each slot may write ONLY its own io dir -- never a sibling's.
             assert ent[asb._RW_EXCEPTION] == [str(s.io_dir) + "/"]
-            assert ent[asb._RO_EXCEPTION] == [str(engine.resolve()) + "/"]
+            # Read-only: the slot's own ro/ staging dir (never under the writable io/) + the
+            # operator's paths.
+            assert ent[asb._RO_EXCEPTION] == [str(s.ro_dir) + "/", str(engine.resolve()) + "/"]
+            assert s.ro_dir.is_dir() and s.io_dir not in s.ro_dir.parents
             info = plistlib.loads((s.bundle / "Contents" / "Info.plist").read_bytes())
             assert info["CFBundleIdentifier"] == s.bundle_id
             assert info["CFBundleExecutable"] == asb.LAUNCHER_EXE
@@ -138,10 +142,25 @@ class TestRunStaging:
         slot = sb.manifest.slots[0]
         assert argv[0] == str(slot.launcher)
         # The child saw the staged copy, never the real job path.
-        assert str(inp) not in argv and r.stdout.decode().startswith(str(slot.io_dir))
+        assert str(inp) not in argv and r.stdout.decode().startswith(str(slot.ro_dir))
         assert (out / "copy").read_text() == "payload"
         assert not (out / "stale").exists()        # bind-mount semantics: a child delete lands
         assert list(slot.io_dir.iterdir()) == []    # wiped after the run
+        assert list(slot.ro_dir.iterdir()) == []
+
+    def test_ro_mounts_are_staged_outside_the_writable_dir(self, setup):
+        sb, popen, home, tmp = setup
+        inp = tmp / "cfg.json"
+        inp.write_text("{}")
+        out = tmp / "out"
+        out.mkdir()
+        r = sb.run(SandboxRequest(argv=["/bin/sh", "-c", 'echo "$0"; echo "$1"', str(inp), str(out)],
+                                  ro_mounts=[Mount(inp, inp)], rw_mounts=[Mount(out, out)]))
+        assert r.exit_code == 0, r.stderr
+        slot = sb.manifest.slots[0]
+        ro_seen, rw_seen = (Path(x) for x in r.stdout.decode().split())
+        assert slot.ro_dir in ro_seen.parents and slot.io_dir not in ro_seen.parents
+        assert slot.io_dir in rw_seen.parents
 
     def test_container_data_is_wiped(self, setup):
         sb, _, home, _ = setup
@@ -218,6 +237,16 @@ class TestRealAppSandbox:
             ro_mounts=[Mount(inp, inp)], rw_mounts=[Mount(out, out)]))
         assert r.exit_code == 0, r.stderr
         assert (out / "copy").read_text() == "payload"
+
+    def test_a_ro_mount_cannot_be_written_or_chmodded(self, sb, tmp_path):
+        cfg = tmp_path / "cfg.json"
+        cfg.write_text("{}")
+        cfg.chmod(0o644)
+        for cmd in ['echo pwned > "$0"', 'chmod 777 "$0"', 'rm -f "$0"']:
+            r = sb.run(SandboxRequest(argv=["/bin/sh", "-c", f'{cmd} && cat "$0"', str(cfg)],
+                                      ro_mounts=[Mount(cfg, cfg)]))
+            assert r.exit_code != 0, (cmd, r.stdout)
+        assert cfg.read_text() == "{}"
 
     def test_unsigned_launcher_fails_closed(self, sb, tmp_path):
         # Run the launcher binary OUTSIDE its bundle (no App Sandbox applied): it must refuse.
@@ -580,6 +609,50 @@ class TestCopyBackRootType:
         assert f.read_text() == "new file"
         assert not [p for p in tmp_path.iterdir() if "blastbox-copyback" in p.name]
 
+    @pytest.mark.skipif(not hasattr(os, "chflags"), reason="BSD file flags")
+    def test_an_immutable_host_entry_fails_the_copy_back_untouched(self, tmp_path):
+        # a uchg entry can't be removed or renamed: refuse up front, never erase its siblings
+        out = tmp_path / "out"
+        (out / "sub").mkdir(parents=True)
+        (out / "a").write_text("A")
+        (out / "sub" / "locked").write_text("L")
+        os.chflags(out / "sub" / "locked", stat.UF_IMMUTABLE)
+        try:
+            staged = tmp_path / "staged"
+            staged.mkdir()
+            (staged / "new").write_text("N")
+            with pytest.raises(SandboxError, match="can't be replaced"):
+                asb.AppSandboxSandbox._copy_back(staged, out, mc.CopyBudget(max_bytes=1 << 20),
+                                                 was_dir=True)
+            assert sorted(p.name for p in out.iterdir()) == ["a", "sub"]
+            assert (out / "a").read_text() == "A" and (out / "sub" / "locked").read_text() == "L"
+        finally:
+            os.chflags(out / "sub" / "locked", 0)
+
+    def test_a_rename_that_fails_mid_swap_restores_the_host_dir(self, tmp_path, monkeypatch):
+        out = tmp_path / "out"
+        out.mkdir()
+        for n in ("a", "b", "c"):
+            (out / n).write_text(n)
+        staged = tmp_path / "staged"
+        staged.mkdir()
+        for n in ("x", "y"):
+            (staged / n).write_text(n)
+        real_rename, count = os.rename, {"n": 0}
+
+        def flaky(src, dst):
+            count["n"] += 1
+            if count["n"] == 5:          # after a, b, c moved aside and x moved in
+                raise PermissionError("EPERM")
+            real_rename(src, dst)
+        monkeypatch.setattr(asb.os, "rename", flaky)
+        with pytest.raises(PermissionError):
+            asb.AppSandboxSandbox._copy_back(staged, out, mc.CopyBudget(max_bytes=1 << 20),
+                                             was_dir=True)
+        monkeypatch.setattr(asb.os, "rename", real_rename)
+        assert sorted(p.name for p in out.iterdir()) == ["a", "b", "c"]
+        assert [(out / n).read_text() for n in ("a", "b", "c")] == ["a", "b", "c"]
+
 
 def test_an_executable_named_by_its_mount_target_runs(tmp_path):
     engine = tmp_path / "engine"
@@ -734,6 +807,18 @@ class TestBundleIds:
         with pytest.raises(SandboxError, match="invalid bundle prefix"):
             asb.prepare(tmp_path / "root", slots=1, ro_paths=[], bundle_prefix=prefix,
                         runner=_fake_runner([]))
+
+    def test_a_prefix_too_long_with_its_slot_suffix_is_refused_before_building(self, tmp_path):
+        prefix = "a" * 194              # valid alone; "<prefix>.slot11" is 201 characters
+        assert asb._valid_bundle_id(prefix)
+        calls: list[list[str]] = []
+        with pytest.raises(SandboxError, match="too long"):
+            asb.prepare(tmp_path / "root", slots=12, ro_paths=[], bundle_prefix=prefix,
+                        runner=_fake_runner(calls))
+        assert calls == [] and not (tmp_path / "root" / "slots").exists()
+        m = asb.prepare(tmp_path / "root", slots=10, ro_paths=[], bundle_prefix=prefix,
+                        runner=_fake_runner([]))   # "<prefix>.slot9" is exactly 200: fits
+        assert asb.Manifest.load(m.root).slots == m.slots
 
     def test_a_valid_prefix_is_accepted(self, tmp_path):
         m = asb.prepare(tmp_path / "root", slots=1, ro_paths=[], bundle_prefix="io.ex-ample.sbx2",

@@ -487,14 +487,19 @@ def _guard_unsandboxed_engine(engine: Engine) -> bool:
     return True
 
 
-def _warmup(engine: Engine, require_warmup: bool) -> str | None:
-    """Run the engine's warmup; the error that keeps /healthz at 503, or None when ready."""
+def _warmup(engine: Engine, require_warmup: bool, require_confined: bool = False) -> str | None:
+    """Run the engine's warmup; the error that keeps /healthz at 503, or None when ready.
+
+    With ``require_confined`` (macOS, sandboxed engine) a required warmup also has to complete a
+    confined run: a self-test that passed by parsing in-process proves nothing about the
+    sandbox's grants, so the agent stays unready until one runs through the sandbox."""
     if not hasattr(engine, "warmup"):
         if require_warmup:
             # The gate is "a known-positive self-test passed": an engine without one isn't ready.
             _log.error("http_agent: engine has no warmup self-test; /healthz reports NOT ready")
             return "engine has no warmup self-test"
         return None
+    confined_before = confined_runs()
     try:
         engine.warmup()
     except Exception as exc:  # noqa: BLE001 -- warmup is best-effort (fail-open to cold)
@@ -502,6 +507,10 @@ def _warmup(engine: Engine, require_warmup: bool) -> str | None:
             _log.error("http_agent: warmup failed; /healthz reports NOT ready: %s", exc)
             return str(exc)[:500]
         _log.warning("http_agent: warmup failed (continuing cold): %s", exc)
+        return None
+    if require_warmup and require_confined and confined_runs() == confined_before:
+        _log.error("http_agent: warmup passed without a confined run; /healthz reports NOT ready")
+        return "warmup self-test did not complete a confined (sandboxed) run"
     return None
 
 
@@ -521,7 +530,8 @@ def retry_warmup(engine: Engine, handler: type[_Handler], *,
         delay = first_s
         while handler.warmup_error is not None and not stop.wait(delay):
             with _JOB_LOCK:
-                err = _warmup(engine, require_warmup=True)
+                err = _warmup(engine, require_warmup=True,
+                              require_confined=handler.require_confined)
             handler.warmup_error = err
             if err is None:
                 _log.info("http_agent: warmup passed on retry; /healthz reports ready")
@@ -593,7 +603,9 @@ def main(argv: list[str] | None = None) -> int:
     # results can't be trusted, so it gates /healthz there by default
     # (BLASTBOX_WORKER_AGENT_REQUIRE_WARMUP=0/1 overrides on any platform).
     require_warmup = _env_flag("BLASTBOX_WORKER_AGENT_REQUIRE_WARMUP", host_platform() == "darwin")
-    warmup_error = _warmup(engine, require_warmup)
+    # Refuse an unsandboxed engine before its warmup parses anything; serve() re-checks.
+    require_confined = _guard_unsandboxed_engine(engine)
+    warmup_error = _warmup(engine, require_warmup, require_confined)
     port = int(os.environ.get("BLASTBOX_WORKER_AGENT_PORT", "8765"))
     bind = os.environ.get("BLASTBOX_WORKER_AGENT_BIND", "0.0.0.0")
     token = os.environ.get("BLASTBOX_WORKER_AGENT_TOKEN") or None

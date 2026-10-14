@@ -15,16 +15,17 @@ not a restricted entitlement, so no provisioning profile is involved.
 **Slots.** Entitlements are fixed at signing time, so per-job paths cannot be granted per run.
 ``prepare()`` (``blastbox macos prepare``) builds N **slots** up front, each its own bundle id
 (=> its own ``~/Library/Containers/<id>``) whose entitlement grants read-write on that slot's
-private ``io/`` dir only, plus the operator's read-only engine paths. A run:
+private ``io/`` dir only, read-only on its ``ro/`` staging dir and the operator's engine
+paths. A run:
 
 1. locks a free slot (``flock``; concurrency == slot count);
-2. **stages** each mount into ``io/`` (APFS clone, never following links) and rewrites argv /
-   env tokens naming a mount to its staged path;
+2. **stages** each rw mount into ``io/`` and each ro mount into ``ro/`` (APFS clone, never
+   following links) and rewrites argv / env tokens naming a mount to its staged path;
 3. execs ``launcher <marker> <nonce> <exe> args...`` with the shared lifecycle (timeout, RSS
    watchdog, rlimits); once sandboxed, the launcher writes the run's nonce to ``<marker>`` in
    ``io/`` -- the proof the run was confined -- and execs the target;
 4. copies rw mounts back (no-follow, size-capped; FIFOs/devices skipped);
-5. wipes ``io/`` AND the slot's container ``Data/`` -- so nothing a job wrote survives into
+5. wipes ``io/``, ``ro/`` AND the slot's container ``Data/`` -- so nothing a job wrote survives into
    the next job on that slot.
 
 Versus ``seatbelt``: Apple maintains this profile (it already permits Metal and the Neural
@@ -168,6 +169,12 @@ class Slot:
     def launcher(self) -> Path:
         return self.bundle / "Contents" / "MacOS" / LAUNCHER_EXE
 
+    @property
+    def ro_dir(self) -> Path:
+        """Where read-only mounts are staged: beside ``io/``, never under it, and granted
+        read-only -- so the child cannot rewrite or chmod a mounted input or config mid-run."""
+        return self.io_dir.parent / "ro"
+
     def container_data(self, home: Path) -> Path:
         return home / "Library" / "Containers" / self.bundle_id / "Data"
 
@@ -282,6 +289,11 @@ def prepare(
     if not _valid_bundle_id(prefix):
         raise SandboxError(f"invalid bundle prefix {prefix!r}: use reverse-DNS labels of "
                            "letters, digits and '-' (e.g. io.example.sbx)")
+    # Every generated id (the longest is the last slot's) must pass the check Manifest.load()
+    # applies, or prepare would sign slots its own manifest then refuses.
+    if not _valid_bundle_id(f"{prefix}.slot{slots - 1}"):
+        raise SandboxError(f"bundle prefix {prefix!r} is too long: {prefix}.slot{slots - 1} "
+                           "exceeds the 200-character bundle id limit")
 
     build = root / "build"
     build.mkdir(exist_ok=True)
@@ -295,6 +307,7 @@ def prepare(
         slot_dir = root / "slots" / str(i)
         io_dir = slot_dir / "io"
         io_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        (slot_dir / "ro").mkdir(exist_ok=True, mode=0o700)
         bundle = slot_dir / f"bb-slot-{i}.app"
         mc.remove_tree(bundle)
         # A fresh prepare is the operator's "I inspected it": clear any retirement.
@@ -339,14 +352,14 @@ def prepare(
 
 def expected_entitlements(slot: Slot, ro_paths: tuple[Path, ...] | list[Path]) -> dict[str, object]:
     """Exactly what :func:`prepare` signs into ``slot``: App Sandbox, read-write on the slot's
-    own ``io/`` and read-only on the manifest's paths -- nothing else."""
-    ent: dict[str, object] = {
+    own ``io/``, read-only on its ``ro/`` staging dir and the manifest's paths -- nothing else.
+    (Slots prepared before ``ro/`` existed fail :func:`verify_slot`; re-run prepare.)"""
+    return {
         _APP_SANDBOX: True,
-        _RW_EXCEPTION: [_dir_entitlement(slot.io_dir)],
+        _RW_EXCEPTION: [str(slot.io_dir).rstrip("/") + "/"],
+        _RO_EXCEPTION: [str(slot.ro_dir).rstrip("/") + "/",
+                        *(_dir_entitlement(Path(p)) for p in ro_paths)],
     }
-    if ro_paths:
-        ent[_RO_EXCEPTION] = [_dir_entitlement(Path(p)) for p in ro_paths]
-    return ent
 
 
 def _codesign_text(proc: subprocess.CompletedProcess) -> str:
@@ -540,7 +553,7 @@ class AppSandboxSandbox:
             parent = container.parent
             if os.path.lexists(parent) and os.path.islink(parent):
                 raise SandboxError(f"refusing to wipe {container}: {parent} is a symlink")
-            for d in (slot.io_dir, container):
+            for d in (slot.io_dir, slot.ro_dir, container):
                 mc.wipe_dir(d)
         except SandboxError as exc:
             self.retired_marker(slot).write_text(f"{exc}\n")
@@ -609,7 +622,9 @@ class AppSandboxSandbox:
         staging = mc.CopyBudget(budget)
         for i, m in enumerate([*request.ro_mounts, *request.rw_mounts]):
             src = Path(m.source).resolve(strict=True)
-            staged = io / "m" / str(i) / (src.name or "root")
+            # Read-only mounts go under ro/ (granted read-only), writable ones under io/.
+            base = slot.ro_dir if i < len(request.ro_mounts) else io
+            staged = base / "m" / str(i) / (src.name or "root")
             staged.parent.mkdir(parents=True)
             mc.copy_no_follow(src, staged, budget=staging)
             mapping.append((str(m.target), str(staged)))
@@ -680,6 +695,40 @@ class AppSandboxSandbox:
         mc.wipe_dir(container)
 
     @staticmethod
+    def _swap_children(dest: Path, new: Path, old: Path) -> None:
+        """Replace ``dest``'s children with ``new``'s: old ones aside into ``old``, new ones in,
+        then drop ``old``. A failed rename undoes every move made so far (best effort, logged)
+        and re-raises, so ``dest`` ends up as it was rather than part-swapped."""
+        os.mkdir(old, 0o700)
+        moved_out: list[str] = []
+        moved_in: list[str] = []
+        try:
+            for child in list(dest.iterdir()):
+                if child not in (new, old):
+                    os.rename(child, old / child.name)
+                    moved_out.append(child.name)
+            for child in list(new.iterdir()):
+                os.rename(child, dest / child.name)
+                moved_in.append(child.name)
+        except BaseException:
+            for name, src, dst in [*((n, dest, new) for n in reversed(moved_in)),
+                                   *((n, old, dest) for n in reversed(moved_out))]:
+                try:
+                    os.rename(src / name, dst / name)
+                except OSError as exc:
+                    _log.error("appsandbox: could not undo copy-back move of %s: %s",
+                               src / name, exc)
+            mc.remove_tree(new)
+            with contextlib.suppress(OSError):
+                os.rmdir(old)
+            raise
+        os.rmdir(new)
+        mc.remove_tree(old)
+        if os.path.lexists(old):
+            raise SandboxError(f"appsandbox: copy-back of {dest} could not remove the replaced "
+                               f"contents ({old})")
+
+    @staticmethod
     def _copy_back(staged: Path, dest: Path, budget: mc.CopyBudget, was_dir: bool) -> None:
         """Make ``dest`` mirror the staged copy the child left (bind-mount semantics).
 
@@ -692,7 +741,11 @@ class AppSandboxSandbox:
         The replacement is built first, beside the original (a hidden entry inside a directory
         mount, so the directory itself is kept as a bind mount would; a sibling for a file
         mount), and only swapped in by rename once it is complete: a copy-back that fails
-        partway (budget, disk) leaves ``dest`` as it was, never half-written.
+        partway (budget, disk) leaves ``dest`` as it was, never half-written. For a directory the
+        swap moves the old children aside and the new ones in, undoing every move if a rename
+        fails; a host entry that can't be moved or removed (``uchg``/append-only flags, a
+        non-writable directory -- the operator's, so never cleared) fails the run before anything
+        is touched, rather than leaving the host directory part-erased.
 
         A staged root that is GONE fails too: a mounted root cannot be removed from inside a
         bind mount, and silently keeping the host's stale contents would report the run's
@@ -710,18 +763,19 @@ class AppSandboxSandbox:
         if was_dir:
             if not stat.S_ISDIR(os.lstat(dest).st_mode):
                 raise SandboxError(f"appsandbox: rw mount {dest} is no longer a directory")
-            new = dest / f".blastbox-copyback-{secrets.token_hex(8)}"
+            locked = mc.locked_entry(dest)
+            if locked is not None:
+                raise SandboxError(f"appsandbox: rw mount {dest} holds {locked}, which can't be "
+                                   "replaced (immutable/append-only or not writable); not copied back")
+            tag = secrets.token_hex(8)
+            new = dest / f".blastbox-copyback-{tag}"
+            old = dest / f".blastbox-copyback-old-{tag}"
             try:
                 mc.copy_no_follow(staged, new, budget=budget)
             except BaseException:
                 mc.remove_tree(new)
                 raise
-            for child in dest.iterdir():
-                if child != new:
-                    mc.remove_tree(child)
-            for child in new.iterdir():
-                os.rename(child, dest / child.name)
-            os.rmdir(new)
+            AppSandboxSandbox._swap_children(dest, new, old)
         else:
             new = dest.with_name(f".{dest.name}.blastbox-copyback-{secrets.token_hex(8)}")
             try:

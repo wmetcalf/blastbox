@@ -126,6 +126,46 @@ def test_a_required_warmup_that_the_engine_lacks_is_not_ready():
     assert ha._warmup(_Engine(), require_warmup=False) is None
 
 
+def test_a_required_warmup_must_complete_a_confined_run():
+    class InProcess(_Engine):
+        def warmup(self):
+            pass                         # "passed", but parsed in-process: nothing confined
+
+    class Confined(_Engine):
+        def warmup(self):
+            note_confined_run()
+    err = ha._warmup(InProcess(), require_warmup=True, require_confined=True)
+    assert err is not None and "confined" in err
+    assert ha._warmup(Confined(), require_warmup=True, require_confined=True) is None
+    # not required to be confined (Linux, or the logged escape hatch), or warmup not required
+    assert ha._warmup(InProcess(), require_warmup=True, require_confined=False) is None
+    assert ha._warmup(InProcess(), require_warmup=False, require_confined=True) is None
+
+
+def test_a_retried_warmup_that_never_confines_stays_unready():
+    import time
+
+    class InProcess(_Engine):
+        calls = 0
+
+        def warmup(self):
+            type(self).calls += 1
+    eng = InProcess()
+    err = ha._warmup(eng, require_warmup=True, require_confined=True)
+    httpd, port = _agent(eng, warmup_error=err)
+    stop = threading.Event()
+    try:
+        ha.retry_warmup(eng, httpd.RequestHandlerClass, first_s=0.02, max_s=0.02, stop=stop)
+        deadline = time.monotonic() + 5
+        while InProcess.calls < 4 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert InProcess.calls >= 4
+        assert httpd.RequestHandlerClass.warmup_error is not None
+    finally:
+        stop.set()
+        _stop(httpd)
+
+
 def test_warmup_errors_gate_only_when_required():
     class Boom(_Engine):
         def warmup(self):
@@ -219,8 +259,9 @@ def test_a_failed_required_warmup_is_retried_until_it_passes():
             self.calls += 1
             if self.calls < 3:
                 raise RuntimeError("ANE busy")
+            note_confined_run()
     eng = Flaky()
-    err = ha._warmup(eng, require_warmup=True)
+    err = ha._warmup(eng, require_warmup=True, require_confined=True)
     httpd, port = _agent(eng, warmup_error=err)
     stop = threading.Event()
     try:

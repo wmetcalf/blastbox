@@ -166,6 +166,31 @@ def remove_tree(path: Path) -> None:
         _log.warning("macos sandbox: could not remove %s: %s", path, exc)
 
 
+_LOCK_FLAGS = (getattr(stat, "UF_IMMUTABLE", 0) | getattr(stat, "UF_APPEND", 0)
+               | getattr(stat, "SF_IMMUTABLE", 0) | getattr(stat, "SF_APPEND", 0))
+
+
+def locked_entry(path: Path) -> Path | None:
+    """The first entry at or under ``path`` (never following a link) that can't be renamed or
+    removed as-is -- an immutable/append-only flag, or a directory its owner can't write or
+    search -- else None. For host directories, whose flags are the operator's and not ours to
+    clear."""
+    def _walk(p: Path) -> Path | None:
+        st = os.lstat(p)
+        if getattr(st, "st_flags", 0) & _LOCK_FLAGS:
+            return p
+        if stat.S_ISDIR(st.st_mode):
+            if st.st_mode & (stat.S_IWUSR | stat.S_IXUSR) != (stat.S_IWUSR | stat.S_IXUSR):
+                return p
+            with os.scandir(p) as it:
+                for entry in it:
+                    hit = _walk(Path(entry.path))
+                    if hit is not None:
+                        return hit
+        return None
+    return _walk(path)
+
+
 def unlock_tree(path: Path) -> None:
     """Clear user flags (``uchg``) and restore owner permissions under ``path``, never following
     a symlink. A sandboxed child owns its files and can lock them; the worker (same uid) can undo
@@ -925,6 +950,9 @@ def _copy_regular(src: Path, dst: Path, mode: int) -> None:
         with open(src, "rb", opener=lambda p, f: os.open(p, f | os.O_NOFOLLOW)) as fin, \
                 open(dst, "xb") as fout:
             shutil.copyfileobj(fin, fout, 1024 * 1024)
+    elif hasattr(os, "lchflags"):
+        # A clone can carry the source's flags: a child must not plant an immutable host file.
+        os.lchflags(dst, 0)
     os.chmod(dst, _perm_bits(mode), follow_symlinks=False)
 
 
