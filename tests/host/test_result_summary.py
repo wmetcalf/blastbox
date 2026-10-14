@@ -87,3 +87,18 @@ def test_a_huge_bare_record_is_bounded():
 def test_long_keys_are_skipped():
     s = _build_result_summary(_env({"k" * 65: 1, "ok": 2}))
     assert s["meta"] == {"ok": 2}
+
+
+def test_non_finite_floats_are_dropped():
+    import json
+    from blastbox.contract import Record
+
+    env = types.SimpleNamespace(
+        status="ok", artifacts=[], warnings=[], detected=None,
+        payload=Record(fields={"nan": float("nan"), "inf": float("inf"), "ninf": float("-inf"),
+                               "ok": 1.5}))
+    s = _build_result_summary(env)
+    assert s["meta"] == {"ok": 1.5}
+    json.dumps(s, allow_nan=False)                 # what a strict JSON response requires
+    s2 = _build_result_summary(_env({"nan": float("nan"), "n": 1}))
+    assert s2["meta"] == {"n": 1}

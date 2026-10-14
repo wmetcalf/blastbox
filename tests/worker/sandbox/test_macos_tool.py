@@ -89,3 +89,32 @@ def test_doctor_marks_only_a_missing_manifest_as_unprepared(tmp_path):
     old = macos_tool.doctor(backends=["appsandbox"], self_test=None, accelerators=frozenset(),
                             ro=[], appsandbox_root=tmp_path / "old")
     assert old[0].ok is False and old[0].unprepared is False
+
+
+class _BreaksMidProbe(_Unconfined):
+    """Runs the first probe, then raises like a slot that can't be proven empty."""
+
+    name = "broken"
+
+    def __init__(self):
+        self.calls = 0
+
+    def run(self, request):
+        from blastbox.errors import SandboxError
+        self.calls += 1
+        if self.calls > 1:
+            raise SandboxError("cleanup could not prove the slot empty")
+        return super().run(request)
+
+
+@darwin
+def test_a_probe_that_raises_is_a_failed_check_and_later_backends_still_run():
+    made = {"broken": _BreaksMidProbe(), "fake": _Unconfined()}
+    checks = macos_tool.doctor(backends=["broken", "fake"], self_test=None,
+                               accelerators=frozenset(), ro=[], make=lambda n: made[n])
+    first = [(c.backend, c.ok) for c in checks if c.name == "runs /usr/bin/true"]
+    assert first == [("broken", True), ("fake", True)]    # the broken one's earlier result kept
+    failed = [c for c in checks if c.name == "probes ran to completion"]
+    assert len(failed) == 1 and failed[0].backend == "broken" and not failed[0].ok
+    assert any(c.backend == "fake" and c.name == "write outside grants is denied" for c in checks)
+    assert "SandboxError" in failed[0].detail and "prove the slot empty" in failed[0].detail

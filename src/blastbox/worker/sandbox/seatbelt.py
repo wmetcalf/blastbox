@@ -132,6 +132,13 @@ def build_profile(
         lines.append("(allow file-read* process-exec " + refs("RO", ro_paths, "subpath") + ")")
     if rw_paths:
         lines.append("(allow file-read* file-write* " + refs("RW", rw_paths, "subpath") + ")")
+        # ...but not file flags on the mounts: they are the REAL host trees, and a uchg/uappnd
+        # file left in one makes the caller's cleanup fail (and the tree stick around). Later
+        # rules win, so this carves chflags out of the grant above. The per-run scratch is
+        # exempt: it is unlocked and wiped by the backend itself after every run.
+        mounts = [p for p in rw_paths if p != scratch]
+        if mounts:
+            lines.append("(deny file-write-flags " + refs("RWF", mounts, "subpath") + ")")
     for accel in sorted(accelerators):
         lines.extend(_ACCEL_RULES[accel])
     if "ane" in accelerators and scratch:

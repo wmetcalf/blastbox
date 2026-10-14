@@ -728,6 +728,33 @@ def test_overlapping_rw_mounts_copy_back_parent_first(tmp_path):
     assert (nested / "f").read_text() == "new\n"
 
 
+def test_duplicate_rw_sources_share_one_staged_tree(tmp_path):
+    # Two writable aliases of one host dir: a write through the first must survive (the second
+    # alias's unchanged snapshot used to be copied back over it) and be visible via the second.
+    sb, _ = _sb_with(tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+    a, b = Path("/bb-test-alias-a"), Path("/bb-test-alias-b")
+    r = sb.run(SandboxRequest(
+        argv=["/bin/sh", "-c", 'echo new > "$0/f" && cat "$1/f"', str(a), str(b)],
+        rw_mounts=[Mount(out, a), Mount(out, b)]))
+    assert r.exit_code == 0, r.stderr
+    assert r.stdout == b"new\n"
+    assert (out / "f").read_text() == "new\n"
+
+
+def test_a_write_through_the_parent_into_a_nested_rw_mount_survives(tmp_path):
+    sb, _ = _sb_with(tmp_path)
+    parent = tmp_path / "work"
+    nested = parent / "out"
+    nested.mkdir(parents=True)
+    # the child writes into out/ through the PARENT mount; the nested mount must not undo it
+    r = sb.run(SandboxRequest(argv=["/bin/sh", "-c", 'echo new > "$0/out/f"', str(parent)],
+                              rw_mounts=[Mount(parent, parent), Mount(nested, nested)]))
+    assert r.exit_code == 0, r.stderr
+    assert (nested / "f").read_text() == "new\n"
+
+
 def test_a_container_swapped_during_the_run_is_never_captured(tmp_path):
     root = tmp_path / "root"
     asb.prepare(root, slots=1, ro_paths=[], runner=_fake_runner([]))

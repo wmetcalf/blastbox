@@ -622,18 +622,39 @@ class AppSandboxSandbox:
 
         mapping: list[tuple[str, str]] = []
         rw_staged: list[tuple[Path, Path, bool]] = []
-        for i, m in enumerate([*request.ro_mounts, *request.rw_mounts]):
+        # Writable mounts of the same source, or of a source inside another writable mount, are
+        # views of ONE host tree: stage only the outermost and point the others into its staged
+        # copy, so aliases share state as bind mounts do and one copy-back carries every write
+        # (separate snapshots copied back in turn would let an unchanged one undo another's).
+        rw_srcs = [Path(m.source).resolve(strict=True) for m in request.rw_mounts]
+        rw_root: dict[int, int] = {}
+        for j, src in enumerate(rw_srcs):
+            owners = [k for k, other in enumerate(rw_srcs)
+                      if src == other or src.is_relative_to(other)]
+            # outermost source; the first listed among equal ones
+            rw_root[j] = min(owners, key=lambda k: (len(rw_srcs[k].parts), k))
+        staged_rw: dict[int, Path] = {}
+        mounts = list(enumerate([*request.ro_mounts, *request.rw_mounts]))
+        n_ro = len(request.ro_mounts)
+        # roots before the aliases that point into them, whatever order the request used
+        for i, m in sorted(mounts, key=lambda im: im[0] >= n_ro and rw_root[im[0] - n_ro] != im[0] - n_ro):
             src = Path(m.source).resolve(strict=True)
-            # Read-only mounts go under ro/ (granted read-only), writable ones under io/.
-            base = slot.ro_dir if i < len(request.ro_mounts) else io
-            staged = base / "m" / str(i) / (src.name or "root")
-            staged.parent.mkdir(parents=True)
-            mc.copy_no_follow(src, staged, budget=staging)
+            j = i - n_ro
+            if j >= 0 and rw_root[j] != j:
+                owner = rw_root[j]
+                staged = staged_rw[owner] / src.relative_to(rw_srcs[owner])
+            else:
+                # Read-only mounts go under ro/ (granted read-only), writable ones under io/.
+                base = slot.ro_dir if j < 0 else io
+                staged = base / "m" / str(i) / (src.name or "root")
+                staged.parent.mkdir(parents=True)
+                mc.copy_no_follow(src, staged, budget=staging)
+                if j >= 0:
+                    staged_rw[j] = staged
+                    rw_staged.append((src, staged, stat.S_ISDIR(os.lstat(src).st_mode)))
             mapping.append((str(m.target), str(staged)))
             if str(Path(m.target)) != str(src):
                 mapping.append((str(src), str(staged)))
-            if i >= len(request.ro_mounts):
-                rw_staged.append((src, staged, stat.S_ISDIR(os.lstat(src).st_mode)))
 
         args = mc.rewrite_path_args(request.argv[1:], mapping)
         extra_env = {k: mc.rewrite_path_args([v], mapping)[0] for k, v in request.env.items()}
@@ -652,9 +673,8 @@ class AppSandboxSandbox:
         handshake = _handshake_ok(marker, nonce)
 
         copy_back = mc.CopyBudget(budget)
-        # Parent-first, so a nested rw mount's result lands over its parent's stale snapshot of
-        # that subtree, whatever order the request listed them in.
-        for src, staged, was_dir in sorted(rw_staged, key=lambda t: len(t[0].parts)):
+        # Only outermost writable sources were staged, so these never overlap.
+        for src, staged, was_dir in rw_staged:
             self._copy_back(staged, src, copy_back, was_dir)
         ok = result.exit_code == 0 and not result.killed
         if ok and request.capture_home is not None and os.path.lexists(container):

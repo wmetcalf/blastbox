@@ -190,6 +190,10 @@ def _build_result_summary(envelope) -> dict:
                     continue
                 if not (isinstance(v, (bool, int, float)) or (isinstance(v, str) and len(v) <= 64)):
                     continue
+                # NaN/Infinity would be persisted on the Job and then fail JSON serialization of
+                # every job-list/status response that includes it.
+                if isinstance(v, float) and not math.isfinite(v):
+                    continue
                 add = len(json.dumps(k)) + len(json.dumps(v)) + 2
                 if size + add > _META_MAX_BYTES:
                     break

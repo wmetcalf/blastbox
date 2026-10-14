@@ -171,6 +171,24 @@ class TestRealConfinement:
         assert r.exit_code == 0, r.stderr
         assert (out / "f").read_text() == "hi\n"
 
+    def test_a_child_cannot_set_file_flags_on_an_rw_mount(self, sb, tmp_path):
+        # The mount is the real host tree: a uchg/uappnd file there would make the caller's own
+        # cleanup fail. Ordinary writes, chmod and utimes still work.
+        out = tmp_path / "out"
+        out.mkdir()
+        try:
+            r = sb.run(SandboxRequest(argv=["/bin/sh", "-c",
+                                            'echo hi > "$0/f" && chmod 600 "$0/f" && touch "$0/f" '
+                                            '&& mkdir "$0/d" && echo ok; '
+                                            'chflags uchg "$0/f"; chflags uappnd "$0/d"; '
+                                            'chflags -R uchg "$0"; exit 0', str(out)],
+                                      rw_mounts=[Mount(out, out)]))
+            assert r.exit_code == 0 and r.stdout == b"ok\n", r.stderr
+            for p in (out, out / "f", out / "d"):
+                assert os.lstat(p).st_flags == 0, p
+        finally:
+            subprocess.run(["/usr/bin/chflags", "-R", "nouchg,nouappnd", str(out)], check=False)
+
     def test_network_denied(self, sb):
         r = sb.run(SandboxRequest(argv=["/usr/bin/nc", "-z", "-w", "3", "1.1.1.1", "80"],
                                   limits=Limits(timeout_s=20)))

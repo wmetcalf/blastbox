@@ -41,9 +41,12 @@ class Check:
 
 
 def _probe_backend(sb: Sandbox, self_test: list[str] | None,
-                   accelerators: frozenset[str], ro: list[Path]) -> list[Check]:
+                   accelerators: frozenset[str], ro: list[Path],
+                   out: list[Check] | None = None) -> list[Check]:
+    """Run the probes, appending each result to ``out`` as it completes (so a caller that
+    catches a probe raising still has the results that came before it)."""
     name = sb.name
-    out: list[Check] = []
+    out = [] if out is None else out
     lim = Limits(timeout_s=30)
 
     def run(argv: list[str], **kw) -> tuple[int, str]:
@@ -116,7 +119,15 @@ def doctor(*, backends: list[str], self_test: list[str] | None, accelerators: fr
                                 unprepared=isinstance(exc, AppSandboxNotPrepared)))
             continue
         checks.append(Check(name, "backend available", True))
-        checks.extend(_probe_backend(sb, self_test, accelerators, ro))
+        probes: list[Check] = []
+        try:
+            _probe_backend(sb, self_test, accelerators, ro, out=probes)
+        except Exception as exc:  # noqa: BLE001 -- a broken runtime is what doctor diagnoses
+            # e.g. cleanup can't prove a slot empty, or process enumeration fails: report it as
+            # a failed check and go on to the next backend instead of aborting with a traceback.
+            probes.append(Check(name, "probes ran to completion", False,
+                                f"{type(exc).__name__}: {exc}"[:400]))
+        checks.extend(probes)
     return checks
 
 
