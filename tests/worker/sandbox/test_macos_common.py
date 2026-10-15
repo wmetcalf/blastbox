@@ -420,6 +420,34 @@ class TestSweepRevalidatesIdentity:
             mc.sweep_sandboxed(lambda p: True, what="test")
 
 
+class TestHardLinks:
+    def test_hard_links_are_charged_once_but_counted_per_name(self, tmp_path):
+        d = tmp_path / "w"
+        (d / "sub").mkdir(parents=True)
+        (d / "f").write_bytes(os.urandom(1 << 20))
+        for i in range(5):
+            os.link(d / "f", d / "sub" / f"l{i}")
+        one = os.lstat(d / "f").st_blocks * 512
+        total, entries, complete = mc.dir_usage([d], 1000)
+        assert complete
+        assert entries == 7                      # f, sub, l0..l4
+        assert one <= total < 2 * one            # the 1 MiB inode once, plus a directory
+        # also across roots: a hard link in a second watched tree is the same blocks
+        e = tmp_path / "e"
+        e.mkdir()
+        os.link(d / "f", e / "g")
+        both, _, _ = mc.dir_usage([d, e], 1000)
+        assert both - total < one // 2
+
+    def test_distinct_files_are_each_charged(self, tmp_path):
+        d = tmp_path / "w"
+        d.mkdir()
+        for i in range(3):
+            (d / f"f{i}").write_bytes(os.urandom(1 << 20))
+        total, entries, _ = mc.dir_usage([d], 1000)
+        assert entries == 3 and total >= 3 * (1 << 20)
+
+
 class TestFailClosedMeasurement:
     def test_an_unreadable_subdir_makes_usage_incomplete(self, tmp_path):
         d = tmp_path / "w"
@@ -1323,6 +1351,54 @@ class TestEmergencyCleanup:
         assert out["r"].exit_code == -9          # type: ignore[attr-defined]
         assert base._EMERGENCY == {}             # unregistered when the run ended
 
+    def test_the_emergency_cleanup_covers_the_child_from_its_spawn(self, tmp_path):
+        # The deadline passes while the child is being spawned: the cleanup is already
+        # registered, waits for the spawn to finish, and kills it (and sweeps).
+        from blastbox.worker.sandbox import base
+        swept: list[bool] = []
+        seen_registered: list[int] = []
+        ran: dict[str, int] = {}
+
+        def popen(*a, **kw):
+            seen_registered.append(len(base._EMERGENCY))
+            t = threading.Thread(target=lambda: ran.update(n=base.run_emergency_cleanups(10)))
+            t.start()
+            time.sleep(0.3)           # the emergency fires mid-spawn
+            return subprocess.Popen(*a, **kw)
+
+        t0 = time.monotonic()
+        r = mc.run_confined(["/bin/sleep", "60"], env={"PATH": mc.MINIMAL_PATH},
+                            limits=Limits(timeout_s=30), cwd=tmp_path, popen=popen,
+                            sweep=lambda: swept.append(True))
+        assert seen_registered == [1]            # registered before Popen ran
+        assert r.exit_code == -9 and time.monotonic() - t0 < 15
+        deadline = time.monotonic() + 5
+        while "n" not in ran and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ran["n"] == 1
+        assert swept                              # the emergency path swept too
+        assert base._EMERGENCY == {}
+
+    def test_a_failed_set_up_after_spawn_kills_the_child(self, tmp_path, monkeypatch):
+        from blastbox.worker.sandbox import base
+        procs: list[subprocess.Popen] = []
+        swept: list[bool] = []
+
+        def popen(*a, **kw):
+            procs.append(subprocess.Popen(*a, **kw))
+            return procs[-1]
+
+        def boom(*a, **kw):
+            raise RuntimeError("watchdog set-up failed")
+
+        monkeypatch.setattr(mc, "RssWatchdog", boom)
+        with pytest.raises(RuntimeError, match="set-up failed"):
+            mc.run_confined(["/bin/sleep", "60"], env={"PATH": mc.MINIMAL_PATH},
+                            limits=Limits(timeout_s=30), cwd=tmp_path, popen=popen,
+                            sweep=lambda: swept.append(True))
+        assert procs and procs[0].wait(5) == -9
+        assert swept and base._EMERGENCY == {}
+
     def test_a_hung_cleanup_does_not_hold_the_exit(self):
         from blastbox.worker.sandbox import base
         release = threading.Event()
@@ -1339,6 +1415,86 @@ class TestEmergencyCleanup:
         from blastbox.worker.sandbox import base
         assert base._EMERGENCY == {}
         assert base.run_emergency_cleanups(5) == 0
+
+
+class TestKillThenSweep:
+    def test_the_sweep_runs_even_when_the_family_kill_raises(self, tmp_path, monkeypatch):
+        swept: list[bool] = []
+
+        def kill_family(self):
+            raise RuntimeError("family kill failed")
+
+        monkeypatch.setattr(mc.RssWatchdog, "kill_family", kill_family)
+        with pytest.raises(RuntimeError, match="family kill failed"):
+            mc.run_confined(["/usr/bin/true"], env={"PATH": mc.MINIMAL_PATH},
+                            limits=Limits(timeout_s=10), cwd=tmp_path,
+                            sweep=lambda: swept.append(True))
+        assert swept == [True]
+
+    def test_the_emergency_sweep_runs_even_when_the_family_kill_raises(self, tmp_path,
+                                                                       monkeypatch):
+        from blastbox.worker.sandbox import base
+        swept: list[bool] = []
+        real_kill = mc.RssWatchdog.kill_family
+        calls = {"n": 0}
+
+        def kill_family(self):
+            calls["n"] += 1
+            if calls["n"] == 1:         # the emergency's kill
+                raise RuntimeError("family kill failed")
+            real_kill(self)
+
+        monkeypatch.setattr(mc.RssWatchdog, "kill_family", kill_family)
+        out: dict[str, object] = {}
+        t = threading.Thread(target=lambda: out.update(r=mc.run_confined(
+            ["/bin/sleep", "3"], env={"PATH": mc.MINIMAL_PATH}, limits=Limits(timeout_s=30),
+            cwd=tmp_path, sweep=lambda: swept.append(True))))
+        t.start()
+        deadline = time.monotonic() + 10
+        while not base._EMERGENCY and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.3)
+        assert base.run_emergency_cleanups(10) == 0     # it raised ...
+        assert swept                                     # ... but still swept
+        t.join(15)
+        assert not t.is_alive()
+
+
+class TestSeenIsThreadSafe:
+    def test_kill_targets_survive_concurrent_membership_changes(self, tmp_path):
+        # The sampling thread adds and drops members while a timeout/emergency cleanup lists
+        # them: that listing must never raise "dictionary changed size during iteration".
+        leader = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+        old_switch = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)          # switch threads as often as possible
+        try:
+            gone: set[int] = set()
+            dog = mc.RssWatchdog(leader, 1 << 40, table_fn=lambda: [],
+                                 start_fn=lambda pid: None if pid in gone else 1.0)
+            dog._remember(range(1_000_000, 1_020_000))      # a long dict to iterate
+            stop = threading.Event()
+
+            def churn():
+                # what samples do: remember new members, forget ones that exited
+                i = 0
+                while not stop.is_set():
+                    dog._remember(range(2_000_000 + i * 20, 2_000_000 + i * 20 + 20))
+                    gone.update(range(2_000_000 + (i - 2) * 20, 2_000_000 + (i - 1) * 20))
+                    dog._seen_alive()
+                    i += 1
+
+            th = threading.Thread(target=churn, daemon=True)
+            th.start()
+            try:
+                for _ in range(200):
+                    dog._kill_targets()
+            finally:
+                stop.set()
+                th.join(5)
+        finally:
+            sys.setswitchinterval(old_switch)
+            leader.kill()
+            leader.wait()
 
 
 class TestFdListing:

@@ -325,6 +325,9 @@ was granted.
   else refusing) and writes a new manifest generation. The running agent then refuses every
   `appsandbox` run until it is restarted, so no job launches under re-signed slots (another
   bundle id, other grants) that it didn't load and verify. Restart the agent after a prepare.
+  Before touching any slot, prepare replaces the manifest with a "preparing" marker: a
+  prepare that fails part-way (say `codesign` on a later slot) leaves every agent -- live or
+  newly started -- refusing App Sandbox until a prepare completes.
 - A `seatbelt` run can't unlink or rename the roots of its writable mounts or its scratch
   dir (nor a directory between a mount root and an outer writable mount); everything beneath
   a directory root stays writable. A scratch dir that is nonetheless gone or replaced after

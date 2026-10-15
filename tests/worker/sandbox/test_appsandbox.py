@@ -1015,6 +1015,30 @@ class TestMountRewriteCollisions:
                                   ro_mounts=[Mount(data, Path("/bb-test-in"))],
                                   rw_mounts=[Mount(out, data)]))
 
+    @pytest.mark.parametrize("ro_rel", ["", "sub", ".."])
+    def test_read_only_sources_overlapping_a_writable_source_are_refused(self, tmp_path, ro_rel):
+        # equal, inside, or containing: separate staged copies would not share writes
+        sb, _ = _sb_with(tmp_path)
+        out = tmp_path / "data" / "out"
+        (out / "sub").mkdir(parents=True)
+        ro_src = (out / ro_rel) if ro_rel else out
+        popen = sb._popen
+        with pytest.raises(SandboxError, match="overlaps writable mount"):
+            sb.run(SandboxRequest(argv=["/usr/bin/true"],
+                                  ro_mounts=[Mount(ro_src, Path("/bb-test-ro"))],
+                                  rw_mounts=[Mount(out, Path("/bb-test-rw"))]))
+        assert popen.calls == []
+
+    def test_disjoint_read_only_and_writable_sources_still_run(self, tmp_path):
+        sb, _ = _sb_with(tmp_path)
+        a, b = tmp_path / "a", tmp_path / "ab"     # a name prefix is not containment
+        a.mkdir()
+        b.mkdir()
+        r = sb.run(SandboxRequest(argv=["/usr/bin/true"],
+                                  ro_mounts=[Mount(a, Path("/bb-test-ro"))],
+                                  rw_mounts=[Mount(b, Path("/bb-test-rw"))]))
+        assert r.exit_code == 0
+
     def test_aliases_of_one_writable_tree_are_still_fine(self):
         asb._check_mapping([("/a", "/s/x"), ("/b", "/s/x"), ("/a/", "/s/x")])
 
@@ -1065,3 +1089,43 @@ def test_a_manifest_without_a_generation_still_loads(tmp_path):
     (root / asb.MANIFEST_NAME).write_text(json.dumps(raw))
     with pytest.raises(SandboxUnavailable, match="generation"):
         asb.Manifest.load(root)
+
+
+def test_a_prepare_that_fails_part_way_leaves_every_agent_refusing(tmp_path):
+    # A re-prepare under another prefix rebuilds slot 0, then codesign fails on slot 1: the
+    # old manifest must not survive (a live agent would launch slot 0 under the new bundle id
+    # while matching and sweeping the old one).
+    root = tmp_path / "root"
+    asb.prepare(root, slots=2, ro_paths=[], runner=_fake_runner([]))
+    live = asb.AppSandboxSandbox(root=root, popen=_Popen(), home=tmp_path / "home",
+                                 platform_ok=True, verify=False, slot_wait_s=0)
+    assert live.run(SandboxRequest(argv=["/bin/echo", "x"])).exit_code == 0
+
+    ok = _fake_runner([])
+    signed: list[str] = []
+
+    def failing(argv, **kw):
+        if argv[0].endswith("codesign"):
+            signed.append(argv[-1])
+            if len(signed) == 2:
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom")
+        return ok(argv, **kw)
+
+    with pytest.raises(SandboxError, match="codesign failed"):
+        asb.prepare(root, slots=2, ro_paths=[], bundle_prefix="io.example.other",
+                    runner=failing)
+    assert len(signed) == 2                     # slot 0 was rebuilt before the failure
+    with pytest.raises(SandboxUnavailable, match="changed since this agent loaded it"):
+        live.run(SandboxRequest(argv=["/bin/echo", "x"]))
+    with pytest.raises(SandboxUnavailable, match="running or failed part-way"):
+        asb.Manifest.load(root)
+    with pytest.raises(SandboxUnavailable, match="running or failed part-way"):
+        asb.AppSandboxSandbox(root=root, popen=_Popen(), home=tmp_path / "home",
+                              platform_ok=True, verify=False, slot_wait_s=0)
+    # a prepare that completes restores service (for a restarted agent)
+    asb.prepare(root, slots=2, ro_paths=[], bundle_prefix="io.example.other",
+                runner=_fake_runner([]))
+    fresh = asb.AppSandboxSandbox(root=root, popen=_Popen(), home=tmp_path / "home",
+                                  platform_ok=True, verify=False, slot_wait_s=0)
+    assert fresh.manifest.bundle_prefix == "io.example.other"
+    assert fresh.run(SandboxRequest(argv=["/bin/echo", "x"])).exit_code == 0

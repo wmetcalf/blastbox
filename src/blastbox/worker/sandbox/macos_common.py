@@ -564,6 +564,17 @@ def dir_usage(paths: Iterable[Path | WatchRoot], max_entries: int,
     total = entries = 0
     complete = True
     stack: list[tuple[int, object]] = []      # (dir fd, its scandir iterator)
+    # Hard links share one inode's blocks: charge them once (each name still counts as an
+    # entry). Only multiply-linked inodes need remembering.
+    charged: set[tuple[int, int]] = set()
+
+    def _charge(st: os.stat_result) -> int:
+        if st.st_nlink > 1 and not stat.S_ISDIR(st.st_mode):
+            key = (st.st_dev, st.st_ino)
+            if key in charged:
+                return 0
+            charged.add(key)
+        return _blocks(st)
 
     def _open(name: str | Path, dir_fd: int | None) -> tuple[int, object] | None:
         nonlocal complete
@@ -599,7 +610,7 @@ def dir_usage(paths: Iterable[Path | WatchRoot], max_entries: int,
                     continue
                 if not stat.S_ISDIR(st.st_mode):
                     entries += 1
-                    total += _blocks(st)
+                    total += _charge(st)
                     continue
                 frame = _open(path, None)
             if frame is not None:
@@ -630,7 +641,7 @@ def dir_usage(paths: Iterable[Path | WatchRoot], max_entries: int,
                 except OSError:
                     complete = False
                     continue
-                total += _blocks(st)
+                total += _charge(st)
                 if stat.S_ISDIR(st.st_mode):
                     if len(stack) >= MAX_WALK_DEPTH:
                         complete = False
@@ -704,6 +715,10 @@ class RssWatchdog:
         self.peak_bytes = 0
         # pid -> start time when first seen: the identity a later sample must still match.
         self.seen: dict[int, float] = {}
+        # Guards ``seen``: the sampling thread adds and drops members while a timeout or
+        # emergency cleanup reads them in kill_family() -- unguarded, that iteration can raise
+        # "dictionary changed size during iteration" and skip the kill.
+        self._seen_lock = threading.Lock()
         try:
             self._pgid = os.getpgid(proc.pid)
         except (ProcessLookupError, OSError):
@@ -730,17 +745,26 @@ class RssWatchdog:
     def _seen_alive(self) -> set[int]:
         """Members seen before that are still the SAME process (same start time); a pid that
         exited -- and may since belong to another job -- is forgotten."""
-        for pid, started in list(self.seen.items()):
+        for pid, started in self.seen_snapshot().items():
             if self._start_fn(pid) != started:
-                self.seen.pop(pid, None)   # pop: kill_family may run while a sample does
-        return set(self.seen)
+                with self._seen_lock:
+                    if self.seen.get(pid) == started:
+                        del self.seen[pid]
+        return set(self.seen_snapshot())
+
+    def seen_snapshot(self) -> dict[int, float]:
+        """A consistent copy of ``seen`` (pid -> start time)."""
+        with self._seen_lock:
+            return dict(self.seen)
 
     def _remember(self, pids: Iterable[int]) -> None:
+        known = self.seen_snapshot()
         for pid in pids:
-            if pid not in self.seen:
+            if pid not in known:
                 started = self._start_fn(pid)
                 if started is not None:     # already gone: nothing to remember
-                    self.seen[pid] = started
+                    with self._seen_lock:
+                        self.seen.setdefault(pid, started)
 
     def _remember_confirmed(self, pids: Iterable[int]) -> None:
         """Remember the members first seen in this sample -- but only once re-confirmed. The pid
@@ -749,8 +773,9 @@ class RssWatchdog:
         :meth:`kill_family`). So the family is listed again after the start times are read, and
         a pid is kept only if it is still a member and still the same process."""
         fresh: dict[int, float] = {}
+        known = self.seen_snapshot()
         for pid in pids:
-            if pid not in self.seen:
+            if pid not in known:
                 started = self._start_fn(pid)
                 if started is not None:     # already gone: nothing to remember
                     fresh[pid] = started
@@ -762,7 +787,8 @@ class RssWatchdog:
             return      # not confirmed now; the next sample (or its trip) handles them
         for pid, started in fresh.items():
             if pid in again and self._start_fn(pid) == started:
-                self.seen[pid] = started
+                with self._seen_lock:
+                    self.seen.setdefault(pid, started)
 
     def _group_is_ours(self) -> bool:
         """Whether ``_pgid`` still names THIS run's process group. It is the leader's pid, held
@@ -919,7 +945,7 @@ class RssWatchdog:
             first = {r.pid for r in self._family(self._table_fn())}
         except SandboxError:
             first = set()
-        known = {pid: started for pid, started in self.seen.items() if pid != me}
+        known = {pid: started for pid, started in self.seen_snapshot().items() if pid != me}
         fresh: dict[int, float] = {}
         for pid in first - set(known) - {me}:
             started = self._start_fn(pid)
@@ -1028,38 +1054,68 @@ def _run_pinned(
     member_fn: Callable[[int], bool] | None,
     pass_fds: tuple[int, ...],
 ) -> SandboxResult:
-    try:
-        proc = popen(
-            limits_launcher_argv(limits, argv, env),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            close_fds=True,
-            pass_fds=pass_fds,
-            env=dict(LAUNCHER_ENV),
-            cwd=str(cwd),
-            start_new_session=True,
-        )
-    except (FileNotFoundError, PermissionError) as exc:
-        raise SandboxError(f"failed to start sandboxed child: {exc}") from exc
-
-    out = _CappedReader(proc.stdout, max_output_bytes)
-    err = _CappedReader(proc.stderr, max_output_bytes)
-    out.start()
-    err.start()
-    killed = False
-    dog = RssWatchdog(proc, limits.memory_bytes, rss_fn=rss_fn, watch_dirs=roots,
-                      disk_limit_bytes=limits.tmpfs_bytes, member_fn=member_fn)
+    # The emergency cleanup (run if the agent hard-exits mid-run, skipping every `finally`
+    # here) is registered BEFORE the child exists, so no instant of its life is uncovered.
+    # ``spawn`` is held across Popen until the run's state is recorded: an emergency waits for
+    # it rather than run while a forked launcher is not yet visible to anyone.
+    spawn = threading.Lock()
+    state: dict[str, object] = {}
 
     def _emergency() -> None:
-        # The agent is about to hard-exit (its own deadline passed) and skip the `finally`
-        # below: kill and sweep this run first. Identity-gated like every other kill here.
-        dog.kill_family()
-        if sweep is not None:
-            sweep()
+        with spawn:
+            proc_ = state.get("proc")
+            dog_ = state.get("dog")
+        try:
+            if isinstance(dog_, RssWatchdog):
+                dog_.kill_family()      # identity-gated, like every other kill here
+            elif isinstance(proc_, subprocess.Popen) and proc_.poll() is None:
+                # No watchdog yet: the leader is our unreaped child, so its pid is still its
+                # own (it can't be reused before we reap it) and a plain kill is safe.
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    proc_.kill()
+        finally:
+            # By sandbox identity, so it also finds children the leader already forked -- and
+            # with no child yet, it simply finds nothing.
+            if sweep is not None:
+                sweep()
 
     token = register_emergency_cleanup(_emergency)
     try:
+        with spawn:
+            try:
+                proc = popen(
+                    limits_launcher_argv(limits, argv, env),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    close_fds=True,
+                    pass_fds=pass_fds,
+                    env=dict(LAUNCHER_ENV),
+                    cwd=str(cwd),
+                    start_new_session=True,
+                )
+            except (FileNotFoundError, PermissionError) as exc:
+                raise SandboxError(f"failed to start sandboxed child: {exc}") from exc
+            state["proc"] = proc
+            try:
+                out = _CappedReader(proc.stdout, max_output_bytes)
+                err = _CappedReader(proc.stderr, max_output_bytes)
+                out.start()
+                err.start()
+                killed = False
+                dog = RssWatchdog(proc, limits.memory_bytes, rss_fn=rss_fn, watch_dirs=roots,
+                                  disk_limit_bytes=limits.tmpfs_bytes, member_fn=member_fn)
+            except BaseException:
+                # Set-up failed with the child already running: it is our unreaped child, so
+                # a plain kill is safe; then sweep whatever it forked.
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    proc.kill()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=5.0)
+                if sweep is not None:
+                    sweep()
+                raise
+            state["dog"] = dog
         try:
             with dog:
                 try:
@@ -1082,10 +1138,12 @@ def _run_pinned(
             # raised: the run fails, but a detached child must not survive it with the run's
             # grants. The sweep runs before draining the pipes: an escapee holding them would
             # hold EOF off. Should the kill or sweep raise as well, the original error stays
-            # chained to it.
-            dog.kill_family()
-            if sweep is not None:
-                sweep()
+            # chained to it. And the sweep runs even if the family kill raised.
+            try:
+                dog.kill_family()
+            finally:
+                if sweep is not None:
+                    sweep()
     finally:
         unregister_emergency_cleanup(token)
     # Everything of the run is dead now, so its writable dirs are final: measure them once more.

@@ -235,6 +235,23 @@ def _check_mapping(mapping: list[tuple[str, str]]) -> None:
                 "target is another's source); give each mount a distinct target")
 
 
+def _check_ro_rw_disjoint(request: SandboxRequest) -> None:
+    """Refuse a read-only mount whose source equals, lies inside, or contains a writable
+    mount's source. Staged as separate copies, such views diverge -- a write through the
+    writable one is invisible through the read-only one, where bind mounts share the inode --
+    and staging the read-only view inside the writable copy would make it writable. Refused
+    before anything is staged."""
+    rw = [Path(m.source).resolve(strict=True) for m in request.rw_mounts]
+    for m in request.ro_mounts:
+        ro = Path(m.source).resolve(strict=True)
+        for w in rw:
+            if ro == w or ro.is_relative_to(w) or w.is_relative_to(ro):
+                raise SandboxError(
+                    f"appsandbox: read-only mount {ro} overlaps writable mount {w}; App Sandbox "
+                    "stages copies, so the two views would not share writes -- mount disjoint "
+                    "trees")
+
+
 def _manifest_error(path: Path, why: str) -> SandboxUnavailable:
     return SandboxUnavailable(f"appsandbox manifest {path} is malformed: {why}; "
                               "re-run `blastbox macos prepare`")
@@ -246,6 +263,10 @@ def _parse_manifest(raw: object, root: Path, path: Path) -> Manifest:
     key and crash backend selection)."""
     if not isinstance(raw, dict):
         raise _manifest_error(path, "not a JSON object")
+    if "preparing" in raw:
+        raise SandboxUnavailable(
+            f"appsandbox manifest {path} marks a `blastbox macos prepare` that is running or "
+            "failed part-way (slots may be half rebuilt); re-run `blastbox macos prepare`")
     if raw.get("version") != MANIFEST_VERSION:
         raise SandboxUnavailable(
             f"appsandbox manifest version {raw.get('version')!r} != {MANIFEST_VERSION}; "
@@ -405,8 +426,19 @@ def _all_slot_locks(root: Path, indexes: Iterable[int], wait_s: float) -> Iterat
             AppSandboxSandbox._unlock(fd)
 
 
+def _write_manifest_file(root: Path, obj: dict) -> None:
+    tmp = root / (MANIFEST_NAME + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2) + "\n")
+    os.replace(tmp, root / MANIFEST_NAME)
+
+
 def _prepare_locked(root: Path, *, slots: int, resolved_ro: list[Path], prefix: str, cc: str,
                     codesign: str, runner: Callable[..., subprocess.CompletedProcess]) -> Manifest:
+    # Before any slot is touched, replace the manifest with a "preparing" marker: a live agent
+    # sees the digest change and refuses (it never launches a half-rebuilt slot under its old
+    # bundle id), and a fresh load refuses it too. Only a prepare that completes replaces the
+    # marker with a real manifest, so one that fails part-way leaves every agent refusing.
+    _write_manifest_file(root, {"version": MANIFEST_VERSION, "preparing": secrets.token_hex(8)})
     build = root / "build"
     build.mkdir(exist_ok=True)
     (build / "launcher.c").write_text(LAUNCHER_C)
@@ -456,9 +488,7 @@ def _prepare_locked(root: Path, *, slots: int, resolved_ro: list[Path], prefix: 
 
     manifest = Manifest(root=root, bundle_prefix=prefix, ro_paths=tuple(resolved_ro),
                         slots=tuple(built), generation=secrets.token_hex(8))
-    tmp = root / (MANIFEST_NAME + ".tmp")
-    tmp.write_text(json.dumps(manifest.to_json(), indent=2) + "\n")
-    os.replace(tmp, root / MANIFEST_NAME)
+    _write_manifest_file(root, manifest.to_json())
     return manifest
 
 
@@ -749,6 +779,7 @@ class AppSandboxSandbox:
         # container doesn't exist yet (containermanagerd creates it at launch), so a seeded run
         # on a fresh slot first primes it with a no-op launch -- the seed is never dropped.
         container = slot.container_data(self._home)
+        _check_ro_rw_disjoint(request)
         # ONE pre-launch budget for the seed AND every staged mount: nothing is metered by the
         # watchdog until the child starts, so together they must stay within the run's limit.
         staging = mc.CopyBudget(budget)
