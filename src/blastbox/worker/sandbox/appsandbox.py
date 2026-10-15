@@ -233,6 +233,21 @@ def _check_mapping(mapping: list[tuple[str, str]]) -> None:
             raise SandboxError(
                 f"appsandbox: {norm} names two different mounts (same target, or one mount's "
                 "target is another's source); give each mount a distinct target")
+    # A path nested under another mapped path must be staged at the same place inside that
+    # one's copy (an alias of a writable tree is). Otherwise -- /mnt from X and /mnt/sub from Y
+    # -- an argument naming /mnt/sub reaches Y but one that builds it from /mnt reaches X/sub,
+    # where a nested bind mount would always show Y: refused rather than path-dependent.
+    keys = sorted(claimed, key=lambda k: len(Path(k).parts))
+    for i, outer in enumerate(keys):
+        for inner in keys[i + 1:]:
+            if not Path(inner).is_relative_to(outer) or inner == outer:
+                continue
+            want = os.path.normpath(Path(claimed[outer]) / Path(inner).relative_to(outer))
+            if os.path.normpath(claimed[inner]) != want:
+                raise SandboxError(
+                    f"appsandbox: mount path {inner} is nested under {outer} but is a "
+                    "different mount; App Sandbox stages copies and cannot overlay one inside "
+                    "another -- use targets that don't contain each other")
 
 
 def _check_ro_rw_disjoint(request: SandboxRequest) -> None:
@@ -250,6 +265,28 @@ def _check_ro_rw_disjoint(request: SandboxRequest) -> None:
                     f"appsandbox: read-only mount {ro} overlaps writable mount {w}; App Sandbox "
                     "stages copies, so the two views would not share writes -- mount disjoint "
                     "trees")
+
+
+#: What containermanagerd creates in a bundle container (``~/Library/Containers/<id>/``),
+#: measured on a prepared slot: the run's ``Data`` and the manager's own metadata.
+_CONTAINER_ENTRIES = frozenset({"Data", ".com.apple.containermanagerd.metadata.plist"})
+
+
+def _stray_container_entries(bundle_container: Path) -> list[str]:
+    try:
+        names = os.listdir(bundle_container)
+    except FileNotFoundError:
+        return []
+    return [n for n in names if n not in _CONTAINER_ENTRIES]
+
+
+def _dir_identity(path: Path) -> tuple[int, int] | None:
+    """``(st_dev, st_ino)`` of a real directory at ``path``; None if absent or not one."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    return (st.st_dev, st.st_ino) if stat.S_ISDIR(st.st_mode) else None
 
 
 def _manifest_error(path: Path, why: str) -> SandboxUnavailable:
@@ -710,10 +747,17 @@ class AppSandboxSandbox:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
 
-    def _wipe_slot(self, slot: Slot) -> None:
+    def _wipe_slot(self, slot: Slot) -> list[str]:
         """Kill what is left in the slot, then empty its io/ and container, or retire the slot
         and raise: a run that left a process or undeletable state (a ``uchg`` file, a locked dir,
-        a container swapped for a symlink) must not hand it to the next run."""
+        a container swapped for a symlink) must not hand it to the next run.
+
+        The bundle container (``Data/``'s parent) should hold only what containermanagerd puts
+        there. App Sandbox denies the child writes to it (measured: renaming ``Data`` or
+        creating a sibling fails with EPERM), but anything else found there -- a ``Data``
+        renamed aside with the run's files, say -- would sit outside every wiped root, so it is
+        removed, and returned so the caller fails the run; what can't be removed retires the
+        slot."""
         try:
             self._sweep_slot(slot)
             container = slot.container_data(self._home)
@@ -722,6 +766,13 @@ class AppSandboxSandbox:
                 raise SandboxError(f"refusing to wipe {container}: {parent} is a symlink")
             for d in (slot.io_dir, slot.ro_dir, container):
                 mc.wipe_dir(d)
+            stray = _stray_container_entries(parent)
+            for name in stray:
+                mc.remove_tree(parent / name)
+            left = _stray_container_entries(parent)
+            if left:
+                raise SandboxError(f"could not remove {sorted(left)} from {parent}")
+            return stray
         except SandboxError as exc:
             self.retired_marker(slot).write_text(f"{exc}\n")
             _log.error("appsandbox: retired slot %s: %s", slot.bundle_id, exc)
@@ -753,7 +804,12 @@ class AppSandboxSandbox:
             try:
                 result, confined = self._run_in_slot(slot, exe, request)
             finally:
-                self._wipe_slot(slot)
+                stray = self._wipe_slot(slot)
+            if stray:
+                # Removed by the wipe, but nothing the run did beside its Data/ is legitimate.
+                raise SandboxError(f"appsandbox: the run left {sorted(stray)} beside its "
+                                   f"container {slot.container_data(self._home)}; removed, "
+                                   "run failed")
         # Credited only once the final sweep and wipe have succeeded: a run whose cleanup
         # raised is a failed run, and an engine falling back to an in-process parse after it
         # must not pass that parse off as confined.
@@ -825,6 +881,9 @@ class AppSandboxSandbox:
                 mapping.append((str(src), str(staged)))
 
         _check_mapping(mapping)
+        # The container's identity now (None on a fresh slot whose first launch creates it):
+        # after the run Data/ must be the same directory, not one the child put in its place.
+        container_id = _dir_identity(container)
         args = mc.rewrite_path_args(request.argv[1:], mapping)
         extra_env = {k: mc.rewrite_path_args([v], mapping)[0] for k, v in request.env.items()}
         env = mc.build_child_env(home, extra_env)
@@ -840,6 +899,10 @@ class AppSandboxSandbox:
         # The handshake the launcher writes once it is sandboxed proves the chain reached the
         # sandbox; read (and remove) it now, credit it only at the end.
         handshake = _handshake_ok(marker, nonce)
+        if container_id is not None and os.path.lexists(container) \
+                and _dir_identity(container) != container_id:
+            raise SandboxError(f"appsandbox: {container} was replaced during the run; run "
+                               "failed, not credited")
 
         copy_back = mc.CopyBudget(budget)
         # Only outermost writable sources were staged, so these never overlap.

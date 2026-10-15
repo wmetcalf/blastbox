@@ -1039,6 +1039,33 @@ class TestMountRewriteCollisions:
                                   rw_mounts=[Mount(b, Path("/bb-test-rw"))]))
         assert r.exit_code == 0
 
+    @pytest.mark.parametrize("outer_rw", [True, False])
+    def test_a_target_nested_under_another_mounts_target_is_refused(self, tmp_path, outer_rw):
+        # X at /mnt and Y at /mnt/sub: "/mnt" + "sub" would reach X/sub, "/mnt/sub" reaches Y --
+        # a nested bind mount always shows Y, so the ambiguity is refused before launch
+        sb, _ = _sb_with(tmp_path)
+        x, y = tmp_path / "x", tmp_path / "y"
+        (x / "sub").mkdir(parents=True)
+        y.mkdir()
+        outer, inner = Mount(x, Path("/bb-test-mnt")), Mount(y, Path("/bb-test-mnt/sub"))
+        req = (SandboxRequest(argv=["/usr/bin/true"], rw_mounts=[outer, inner]) if outer_rw else
+               SandboxRequest(argv=["/usr/bin/true"], ro_mounts=[outer], rw_mounts=[inner]))
+        popen = sb._popen
+        with pytest.raises(SandboxError, match="nested under"):
+            sb.run(req)
+        assert popen.calls == []
+
+    def test_a_nested_alias_of_one_writable_tree_still_runs(self, tmp_path):
+        # the same tree at nested targets IS consistent: the inner one points into the outer copy
+        sb, _ = _sb_with(tmp_path)
+        out = tmp_path / "out"
+        (out / "sub").mkdir(parents=True)
+        r = sb.run(SandboxRequest(
+            argv=["/bin/sh", "-c", 'echo hi > "$0/f"', str(out / "sub")],
+            rw_mounts=[Mount(out, out), Mount(out / "sub", out / "sub")]))
+        assert r.exit_code == 0, r.stderr
+        assert (out / "sub" / "f").read_text() == "hi\n"
+
     def test_aliases_of_one_writable_tree_are_still_fine(self):
         asb._check_mapping([("/a", "/s/x"), ("/b", "/s/x"), ("/a/", "/s/x")])
 
@@ -1129,3 +1156,66 @@ def test_a_prepare_that_fails_part_way_leaves_every_agent_refusing(tmp_path):
                                   platform_ok=True, verify=False, slot_wait_s=0)
     assert fresh.manifest.bundle_prefix == "io.example.other"
     assert fresh.run(SandboxRequest(argv=["/bin/echo", "x"])).exit_code == 0
+
+
+class TestContainerIdentity:
+    """Data/ must be the directory it was before the run, and nothing may appear beside it."""
+
+    def _setup(self, tmp_path):
+        sb, home = _sb_with(tmp_path)
+        container = sb.manifest.slots[0].container_data(home)
+        container.mkdir(parents=True)
+        (container.parent / ".com.apple.containermanagerd.metadata.plist").write_text("meta")
+        return sb, container
+
+    def test_a_data_dir_renamed_aside_and_recreated_fails_and_is_removed(self, tmp_path):
+        from blastbox.worker.sandbox.base import confined_runs
+        sb, container = self._setup(tmp_path)
+        before = confined_runs()
+        with pytest.raises(SandboxError, match="replaced during the run"):
+            sb.run(SandboxRequest(argv=["/bin/sh", "-c",
+                                        'mv "$0" "$0.stash" && mkdir "$0" && '
+                                        'echo kept > "$0.stash/f"', str(container)]))
+        assert confined_runs() == before
+        # the stash sat outside every wiped root: gone, and containermanagerd's file kept
+        assert sorted(os.listdir(container.parent)) == [
+            ".com.apple.containermanagerd.metadata.plist", "Data"]
+        assert not asb.AppSandboxSandbox.retired_marker(sb.manifest.slots[0]).exists()
+
+    def test_an_entry_left_beside_the_container_fails_the_run(self, tmp_path):
+        from blastbox.worker.sandbox.base import confined_runs
+        sb, container = self._setup(tmp_path)
+        before = confined_runs()
+        with pytest.raises(SandboxError, match="beside its container"):
+            sb.run(SandboxRequest(argv=["/bin/sh", "-c", 'echo x > "$0/../extra"',
+                                        str(container)]))
+        assert confined_runs() == before
+        assert not (container.parent / "extra").exists()
+
+    def test_an_entry_that_cannot_be_removed_retires_the_slot(self, tmp_path, monkeypatch):
+        sb, container = self._setup(tmp_path)
+        real = mc.remove_tree
+        monkeypatch.setattr(mc, "remove_tree", lambda p: None if p.name == "stuck" else real(p))
+        with pytest.raises(SandboxError, match="could not remove"):
+            sb.run(SandboxRequest(argv=["/bin/sh", "-c", 'mkdir "$0/../stuck"',
+                                        str(container)]))
+        assert asb.AppSandboxSandbox.retired_marker(sb.manifest.slots[0]).exists()
+
+    def test_an_untouched_container_runs_clean(self, tmp_path):
+        sb, container = self._setup(tmp_path)
+        assert sb.run(SandboxRequest(argv=["/bin/sh", "-c", 'echo hi > "$0/f"',
+                                           str(container)])).exit_code == 0
+        assert list(container.iterdir()) == []          # wiped after the run
+
+
+@needs_real
+def test_app_sandbox_denies_renaming_data_or_writing_beside_it(real_sb):
+    # The OS guarantee the identity check backs up: the child cannot touch its bundle container.
+    slot = real_sb.manifest.slots[0]
+    container = slot.container_data(Path.home())
+    real_sb.run(SandboxRequest(argv=["/usr/bin/true"]))          # the container exists now
+    for cmd in ['mv "$0" "$0.stash"', 'echo x > "$0/../extra"', 'mkdir "$0/../d"']:
+        r = real_sb.run(SandboxRequest(argv=["/bin/sh", "-c", cmd, str(container)]))
+        assert r.exit_code != 0, cmd
+    assert sorted(os.listdir(container.parent)) == [
+        ".com.apple.containermanagerd.metadata.plist", "Data"]

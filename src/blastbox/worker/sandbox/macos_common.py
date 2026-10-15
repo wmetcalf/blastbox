@@ -152,17 +152,73 @@ def _merge_into(src: Path, dest: Path, budget: CopyBudget) -> None:
 
 
 def capture_scratch(scratch: Path, dest: Path | None, budget_bytes: int) -> None:
-    """Replace ``dest``'s contents with the scratch HOME (minus ``tmp/``). Trusted runs only."""
+    """Replace ``dest``'s contents with the scratch HOME (minus ``tmp/``). Trusted runs only.
+
+    The capture is built complete in a hidden sibling of ``dest`` and only then swapped into
+    place: a copy that fails partway (an entry the child made unreadable, the budget, a disk or
+    I/O error) leaves the previous ``dest`` -- usually the warm cache the next run seeds from --
+    exactly as it was, instead of emptied or half-written."""
     if dest is None:
         return
-    dest.mkdir(parents=True, exist_ok=True, mode=0o700)
-    for child in dest.iterdir():
-        remove_tree(child)
-    budget = CopyBudget(budget_bytes)
-    for child in scratch.iterdir():
-        if child.name == "tmp":
-            continue
-        copy_no_follow(child, dest / child.name, budget=budget)
+    if dest.is_symlink():
+        dest = dest.resolve()       # the operator's cache path; swap the directory it names
+    dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    new = dest.parent / f".{dest.name}.capture-{os.urandom(6).hex()}"
+    os.mkdir(new, 0o700)
+    try:
+        budget = CopyBudget(budget_bytes)
+        for child in scratch.iterdir():
+            if child.name == "tmp":
+                continue
+            copy_no_follow(child, new / child.name, budget=budget)
+        swap_into_place(new, dest)
+    except BaseException:
+        remove_tree(new)
+        raise
+
+
+_RENAME_SWAP = 0x2
+
+
+def _renamex_np() -> Callable[[bytes, bytes, int], int] | None:
+    if not IS_DARWIN:
+        return None
+    try:
+        fn = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True).renamex_np
+    except (OSError, AttributeError):
+        return None
+    fn.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+    fn.restype = ctypes.c_int
+    return fn
+
+
+def swap_into_place(new: Path, dest: Path) -> None:
+    """Make the complete directory ``new`` become ``dest``; the old ``dest`` is removed after.
+
+    ``renamex_np(RENAME_SWAP)`` exchanges the two in one step (APFS/HFS+), so ``dest`` is never
+    missing or partial. Where that's unsupported, ``dest`` is renamed aside and ``new`` in,
+    restoring the original if the second rename fails. On return ``new`` no longer exists."""
+    if not os.path.lexists(dest):
+        os.rename(new, dest)
+        return
+    if not stat.S_ISDIR(os.lstat(dest).st_mode):
+        raise SandboxError(f"cannot replace {dest}: it is not a directory")
+    swap = _renamex_np()
+    if swap is not None:
+        if swap(os.fsencode(new), os.fsencode(dest), _RENAME_SWAP) == 0:
+            remove_tree(new)            # now holds the old contents
+            return
+        err = ctypes.get_errno()
+        if err not in (errno.ENOTSUP, errno.EINVAL, errno.ENOSYS):
+            raise OSError(err, f"renamex_np(RENAME_SWAP) {new} -> {dest}: {os.strerror(err)}")
+    old = dest.parent / f".{dest.name}.old-{os.urandom(6).hex()}"
+    os.rename(dest, old)
+    try:
+        os.rename(new, dest)
+    except BaseException:
+        os.rename(old, dest)
+        raise
+    remove_tree(old)
 
 
 def remove_tree(path: Path) -> None:

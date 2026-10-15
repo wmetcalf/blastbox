@@ -258,6 +258,90 @@ class TestSeedAndCapture:
         mc.seed_scratch(tmp_path, None, 0)
         mc.capture_scratch(tmp_path, None, 0)
 
+    def _cache(self, tmp_path):
+        scratch = tmp_path / "scratch"
+        (scratch / "Library" / "Caches").mkdir(parents=True)
+        (scratch / "Library" / "Caches" / "c").write_text("new")
+        dest = tmp_path / "cache"
+        dest.mkdir()
+        (dest / "warm").write_text("previous capture")
+        return scratch, dest
+
+    def test_an_unreadable_entry_leaves_the_previous_cache_intact(self, tmp_path):
+        scratch, dest = self._cache(tmp_path)
+        bad = scratch / "Library" / "locked"
+        bad.write_text("x")
+        bad.chmod(0)
+        try:
+            with pytest.raises(OSError):
+                mc.capture_scratch(scratch, dest, budget_bytes=1 << 20)
+        finally:
+            bad.chmod(0o600)
+        assert sorted(os.listdir(dest)) == ["warm"]
+        assert (dest / "warm").read_text() == "previous capture"
+        assert [p.name for p in tmp_path.iterdir() if ".capture-" in p.name] == []
+
+    def test_an_io_error_partway_leaves_the_previous_cache_intact(self, tmp_path, monkeypatch):
+        scratch, dest = self._cache(tmp_path)
+        (scratch / "second").write_text("y")
+        real = mc.copy_no_follow
+        calls = []
+
+        def flaky(src, dst, **kw):
+            calls.append(src)
+            if len(calls) == 2:
+                raise OSError(errno.EIO, "simulated I/O error")
+            return real(src, dst, **kw)
+        monkeypatch.setattr(mc, "copy_no_follow", flaky)
+        with pytest.raises(OSError, match="simulated"):
+            mc.capture_scratch(scratch, dest, budget_bytes=1 << 20)
+        assert sorted(os.listdir(dest)) == ["warm"]
+        assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".cache.")] == []
+
+    def test_over_budget_leaves_the_previous_cache_intact(self, tmp_path):
+        scratch, dest = self._cache(tmp_path)
+        (scratch / "big").write_bytes(b"x" * 10_000)
+        with pytest.raises(SandboxError):
+            mc.capture_scratch(scratch, dest, budget_bytes=1000)
+        assert sorted(os.listdir(dest)) == ["warm"]
+
+    def test_a_complete_capture_replaces_the_cache_in_place(self, tmp_path):
+        scratch, dest = self._cache(tmp_path)
+        ino = os.stat(tmp_path).st_ino
+        mc.capture_scratch(scratch, dest, budget_bytes=1 << 20)
+        assert (dest / "Library" / "Caches" / "c").read_text() == "new"
+        assert not (dest / "warm").exists()
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["cache", "scratch"]
+        assert os.stat(tmp_path).st_ino == ino
+        # a missing destination is simply created
+        mc.capture_scratch(scratch, tmp_path / "fresh", budget_bytes=1 << 20)
+        assert (tmp_path / "fresh" / "Library" / "Caches" / "c").read_text() == "new"
+
+    def test_the_fallback_swap_restores_the_original_if_the_rename_fails(self, tmp_path,
+                                                                         monkeypatch):
+        scratch, dest = self._cache(tmp_path)
+        monkeypatch.setattr(mc, "_renamex_np", lambda: None)
+        real_rename = os.rename
+
+        def rename(a, b):
+            if ".capture-" in str(a):
+                raise OSError(errno.EIO, "simulated rename failure")
+            return real_rename(a, b)
+        monkeypatch.setattr(mc.os, "rename", rename)
+        with pytest.raises(OSError, match="simulated"):
+            mc.capture_scratch(scratch, dest, budget_bytes=1 << 20)
+        monkeypatch.setattr(mc.os, "rename", real_rename)
+        assert sorted(os.listdir(dest)) == ["warm"]
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["cache", "scratch"]
+
+    def test_a_symlinked_cache_path_keeps_its_symlink(self, tmp_path):
+        scratch, real = self._cache(tmp_path)
+        link = tmp_path / "link"
+        link.symlink_to(real)
+        mc.capture_scratch(scratch, link, budget_bytes=1 << 20)
+        assert link.is_symlink()
+        assert (real / "Library" / "Caches" / "c").read_text() == "new"
+
 
 class TestWipeDir:
     def test_unlocks_and_empties(self, tmp_path):
