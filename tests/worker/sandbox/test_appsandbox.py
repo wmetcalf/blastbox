@@ -1017,3 +1017,51 @@ class TestMountRewriteCollisions:
 
     def test_aliases_of_one_writable_tree_are_still_fine(self):
         asb._check_mapping([("/a", "/s/x"), ("/b", "/s/x"), ("/a/", "/s/x")])
+
+
+def test_prepare_refuses_while_a_run_holds_a_slot(tmp_path):
+    root = tmp_path / "root"
+    asb.prepare(root, slots=2, ro_paths=[], runner=_fake_runner([]))
+    before = (root / asb.MANIFEST_NAME).read_bytes()
+    fd = os.open(root / "locks" / "1.lock", os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        with pytest.raises(SandboxError, match="in use by a running job"):
+            asb.prepare(root, slots=2, ro_paths=[], runner=_fake_runner([]), lock_wait_s=0.2)
+        assert (root / asb.MANIFEST_NAME).read_bytes() == before
+    finally:
+        os.close(fd)
+    asb.prepare(root, slots=2, ro_paths=[], runner=_fake_runner([]), lock_wait_s=0.2)
+    assert (root / asb.MANIFEST_NAME).read_bytes() != before     # a new generation
+
+
+def test_a_live_instance_refuses_runs_once_the_slots_are_re_prepared(tmp_path):
+    # Re-prepared under another prefix, the slots now launch into other containers than the
+    # ones this instance matches and sweeps: it must not run until restarted.
+    root = tmp_path / "root"
+    asb.prepare(root, slots=1, ro_paths=[], runner=_fake_runner([]))
+    sb = asb.AppSandboxSandbox(root=root, popen=_Popen(), home=tmp_path / "home",
+                               platform_ok=True, verify=False, slot_wait_s=0)
+    assert sb.run(SandboxRequest(argv=["/bin/echo", "x"])).exit_code == 0
+    asb.prepare(root, slots=1, ro_paths=[], bundle_prefix="io.example.other",
+                runner=_fake_runner([]))
+    for _ in range(2):          # and stays refused
+        with pytest.raises(SandboxUnavailable, match="changed since this agent loaded it"):
+            sb.run(SandboxRequest(argv=["/bin/echo", "x"]))
+    fresh = asb.AppSandboxSandbox(root=root, popen=_Popen(), home=tmp_path / "home",
+                                  platform_ok=True, verify=False, slot_wait_s=0)
+    assert fresh.manifest.bundle_prefix == "io.example.other"
+    assert fresh.run(SandboxRequest(argv=["/bin/echo", "x"])).exit_code == 0
+
+
+def test_a_manifest_without_a_generation_still_loads(tmp_path):
+    root = tmp_path / "root"
+    asb.prepare(root, slots=1, ro_paths=[], runner=_fake_runner([]))
+    raw = json.loads((root / asb.MANIFEST_NAME).read_text())
+    raw.pop("generation")
+    (root / asb.MANIFEST_NAME).write_text(json.dumps(raw))
+    assert asb.Manifest.load(root).generation == ""
+    raw["generation"] = 7
+    (root / asb.MANIFEST_NAME).write_text(json.dumps(raw))
+    with pytest.raises(SandboxUnavailable, match="generation"):
+        asb.Manifest.load(root)

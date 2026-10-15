@@ -7,6 +7,7 @@ refuses an `ok` result that no confined run produced, and gates /healthz on warm
 from __future__ import annotations
 
 import json
+import concurrent.futures
 import threading
 import urllib.error
 import urllib.request
@@ -18,7 +19,7 @@ from blastbox.contract import Detection, Record
 from blastbox.limits import Limits
 from blastbox.worker import http_agent as ha
 from blastbox.worker.engine import DetonationResult
-from blastbox.worker.sandbox.base import note_confined_run
+from blastbox.worker.sandbox.base import confined_runs, not_counted, note_confined_run
 
 
 @pytest.fixture(autouse=True)
@@ -337,3 +338,42 @@ def test_a_mistyped_escape_hatch_stops_startup(monkeypatch):
     monkeypatch.setenv("BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE", "ture")
     with pytest.raises(SystemExit, match="ALLOW_UNSANDBOXED_ENGINE"):
         ha.serve(Plain(), bind="127.0.0.1", port=0)
+
+
+def test_a_detectors_sandbox_run_on_another_thread_is_not_credit_either():
+    # the detector makes its sandbox call on a thread it starts (no context is inherited):
+    # still not credit for a detonate() that then parses in-process
+    class ThreadedDetector(_Detecting):
+        sandboxed_detect = True
+
+        def detect(self, input_path: Path):
+            super().detect(input_path)
+            t = threading.Thread(target=note_confined_run)
+            t.start()
+            t.join()
+            with concurrent.futures.ThreadPoolExecutor(1) as ex:
+                ex.submit(note_confined_run).result()
+            return None
+    eng = ThreadedDetector(confine=False)
+    httpd, port = _agent(eng)
+    try:
+        assert _detonate(port) == 500
+        assert eng.detect_calls == 1
+    finally:
+        _stop(httpd)
+
+
+def test_not_counted_covers_threads_started_inside_it():
+    before = confined_runs()
+    with not_counted():
+        t = threading.Thread(target=note_confined_run)
+        t.start()
+        t.join()
+        with concurrent.futures.ThreadPoolExecutor(2) as ex:
+            list(ex.map(lambda _: note_confined_run(), range(3)))
+        with not_counted():          # nests
+            note_confined_run()
+        note_confined_run()
+    assert confined_runs() == before
+    note_confined_run()
+    assert confined_runs() == before + 1

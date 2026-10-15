@@ -58,8 +58,8 @@ import secrets
 import stat
 import subprocess
 import time
-from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from blastbox.errors import SandboxError, SandboxUnavailable
@@ -185,10 +185,16 @@ class Manifest:
     bundle_prefix: str
     ro_paths: tuple[Path, ...]
     slots: tuple[Slot, ...]
+    #: A fresh token per `prepare`, so every re-prepare changes the file a live instance
+    #: compares against (see AppSandboxSandbox._check_manifest_current).
+    generation: str = ""
+    #: sha256 of the manifest file this was loaded from ("" when built in memory).
+    digest: str = field(default="", compare=False)
 
     def to_json(self) -> dict:
         return {
             "version": MANIFEST_VERSION,
+            "generation": self.generation,
             "bundle_prefix": self.bundle_prefix,
             "ro_paths": [str(p) for p in self.ro_paths],
             "slots": [
@@ -202,14 +208,15 @@ class Manifest:
     def load(cls, root: Path) -> Manifest:
         path = root / MANIFEST_NAME
         try:
-            raw = json.loads(path.read_text())
+            data = path.read_bytes()
+            raw = json.loads(data)
         except FileNotFoundError as exc:
             raise AppSandboxNotPrepared(
                 f"appsandbox not prepared: {path} missing (run `blastbox macos prepare`)"
             ) from exc
         except (OSError, ValueError) as exc:
             raise SandboxUnavailable(f"appsandbox manifest unreadable: {path}: {exc}") from exc
-        return _parse_manifest(raw, root, path)
+        return replace(_parse_manifest(raw, root, path), digest=hashlib.sha256(data).hexdigest())
 
 
 def _check_mapping(mapping: list[tuple[str, str]]) -> None:
@@ -245,6 +252,9 @@ def _parse_manifest(raw: object, root: Path, path: Path) -> Manifest:
             "re-run `blastbox macos prepare`"
         )
     prefix, ro_paths, slots = raw.get("bundle_prefix"), raw.get("ro_paths"), raw.get("slots")
+    generation = raw.get("generation", "")
+    if not isinstance(generation, str):
+        raise _manifest_error(path, "generation must be a string")
     # Bundle ids are used as paths (container, lock): they must stay plain identifiers.
     if not _valid_bundle_id(prefix):
         raise SandboxUnavailable(f"appsandbox manifest has invalid bundle ids {[prefix]!r}; "
@@ -277,7 +287,7 @@ def _parse_manifest(raw: object, root: Path, path: Path) -> Manifest:
         parsed.append(Slot(index=index, bundle_id=bundle_id, bundle=Path(fields["bundle"]),
                            io_dir=Path(fields["io_dir"]), lock_path=Path(fields["lock_path"])))
     return Manifest(root=root, bundle_prefix=prefix, ro_paths=tuple(Path(p) for p in ro_paths),
-                    slots=tuple(parsed))
+                    slots=tuple(parsed), generation=generation)
 
 
 def default_root() -> Path:
@@ -314,11 +324,20 @@ def prepare(
     cc: str = "/usr/bin/clang",
     codesign: str = "/usr/bin/codesign",
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    lock_wait_s: float | None = None,
 ) -> Manifest:
     """Build (or rebuild) the slot bundles under ``root`` and write the manifest.
 
     Idempotent: every slot is rebuilt and re-signed, so changing ``ro_paths`` or the slot
     count is just a re-run. Needs the Xcode Command Line Tools (``clang``, ``codesign``).
+
+    Safe beside a running agent: every slot's lock (the one a run holds from its first wipe
+    to its last) is taken first -- waiting up to ``lock_wait_s`` (default
+    ``$BLASTBOX_APPSANDBOX_PREPARE_WAIT_S``, else 60s) for runs in progress, else refusing --
+    and held until the new manifest is in place. A live instance then sees a new manifest
+    generation before its next run and refuses to run until restarted, so no job launches
+    under a re-signed bundle (another bundle id, other grants) that its watchdog and sweep
+    don't match.
     """
     if not 1 <= slots <= 256:
         raise SandboxError("slots must be between 1 and 256")
@@ -342,6 +361,52 @@ def prepare(
         raise SandboxError(f"bundle prefix {prefix!r} is too long: {prefix}.slot{slots - 1} "
                            "exceeds the 200-character bundle id limit")
 
+    (root / "locks").mkdir(exist_ok=True, mode=0o700)
+    existing = [int(c.name) for c in (root / "slots").iterdir() if c.name.isdigit()] \
+        if (root / "slots").is_dir() else []
+    with _all_slot_locks(root, range(max([slots, *(i + 1 for i in existing)])),
+                         _prepare_wait(lock_wait_s)):
+        return _prepare_locked(root, slots=slots, resolved_ro=resolved_ro, prefix=prefix,
+                               cc=cc, codesign=codesign, runner=runner)
+
+
+def _prepare_wait(value: float | None) -> float:
+    raw: object = value
+    if raw is None:
+        raw = os.environ.get("BLASTBOX_APPSANDBOX_PREPARE_WAIT_S", "") or "60"
+    try:
+        wait = float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise SandboxError(f"appsandbox prepare wait {raw!r} is not a number") from exc
+    if not math.isfinite(wait) or wait < 0:
+        raise SandboxError(f"appsandbox prepare wait {raw!r} must be finite and >= 0")
+    return wait
+
+
+@contextlib.contextmanager
+def _all_slot_locks(root: Path, indexes: Iterable[int], wait_s: float) -> Iterator[None]:
+    """Hold every listed slot's run lock (``locks/<i>.lock``), or raise if a run keeps one
+    past ``wait_s``."""
+    held: list[int] = []
+    deadline = time.monotonic() + wait_s
+    try:
+        for i in indexes:
+            path = root / "locks" / f"{i}.lock"
+            while (fd := AppSandboxSandbox._try_lock(path)) is None:
+                if time.monotonic() >= deadline:
+                    raise SandboxError(
+                        f"appsandbox slot {i} is in use by a running job (lock {path} held "
+                        f"for {wait_s:g}s); stop the agent, or retry when it is idle")
+                time.sleep(0.05)
+            held.append(fd)
+        yield
+    finally:
+        for fd in reversed(held):
+            AppSandboxSandbox._unlock(fd)
+
+
+def _prepare_locked(root: Path, *, slots: int, resolved_ro: list[Path], prefix: str, cc: str,
+                    codesign: str, runner: Callable[..., subprocess.CompletedProcess]) -> Manifest:
     build = root / "build"
     build.mkdir(exist_ok=True)
     (build / "launcher.c").write_text(LAUNCHER_C)
@@ -390,7 +455,7 @@ def prepare(
             mc.remove_tree(child)
 
     manifest = Manifest(root=root, bundle_prefix=prefix, ro_paths=tuple(resolved_ro),
-                        slots=tuple(built))
+                        slots=tuple(built), generation=secrets.token_hex(8))
     tmp = root / (MANIFEST_NAME + ".tmp")
     tmp.write_text(json.dumps(manifest.to_json(), indent=2) + "\n")
     os.replace(tmp, root / MANIFEST_NAME)
@@ -494,7 +559,10 @@ class AppSandboxSandbox:
     ) -> None:
         if not platform_ok:
             raise SandboxUnavailable("appsandbox is macOS-only")
-        self._manifest = Manifest.load(Path(root) if root is not None else default_root())
+        self._root = Path(root) if root is not None else default_root()
+        self._manifest = Manifest.load(self._root)
+        # Set (for good) once the manifest on disk is no longer the one loaded here.
+        self._stale: str | None = None
         if not self._manifest.slots:
             raise SandboxUnavailable("appsandbox manifest has no slots")
         self._popen = popen
@@ -530,8 +598,29 @@ class AppSandboxSandbox:
         """Present when a slot could not be proven clean; `blastbox macos prepare` clears it."""
         return slot.lock_path.with_name(slot.lock_path.name + ".retired")
 
+    def _check_manifest_current(self) -> None:
+        """Refuse to run once `prepare` has replaced the manifest this instance loaded (and
+        verified): the slots may now carry another bundle id or other grants, which this
+        instance's container matching and verification don't cover. Stays refused until the
+        agent restarts and loads (and verifies) the new manifest. Called with the slot's lock
+        held, which `prepare` needs to change anything."""
+        if self._stale is None:
+            path = self._root / MANIFEST_NAME
+            try:
+                now = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError as exc:
+                now = f"unreadable ({exc})"
+            if now != self._manifest.digest:
+                self._stale = (f"appsandbox manifest {path} changed since this agent loaded it "
+                               "(re-prepared); restart the agent to use the new slots")
+                _log.error("appsandbox: %s", self._stale)
+        if self._stale is not None:
+            raise SandboxUnavailable(self._stale)
+
     @contextlib.contextmanager
     def _acquire_slot(self) -> Iterator[Slot]:
+        if self._stale is not None:
+            raise SandboxUnavailable(self._stale)
         deadline = time.monotonic() + self._slot_wait_s
         while True:
             usable = [s for s in self._manifest.slots if not self.retired_marker(s).exists()]
@@ -552,6 +641,7 @@ class AppSandboxSandbox:
                     self._unlock(fd)
                     continue
                 try:
+                    self._check_manifest_current()
                     yield slot
                 finally:
                     self._unlock(bfd)

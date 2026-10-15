@@ -40,7 +40,9 @@ from pathlib import Path
 
 from blastbox.errors import SandboxError
 from blastbox.limits import Limits
-from blastbox.worker.sandbox.base import SandboxResult, kill_sandbox_group
+from blastbox.worker.sandbox.base import (
+    SandboxResult, register_emergency_cleanup, unregister_emergency_cleanup,
+)
 
 _log = logging.getLogger("blastbox.worker.sandbox.macos")
 
@@ -491,11 +493,57 @@ _OPEN_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXE
 MAX_WALK_DEPTH = 256
 
 
+class WatchRoot:
+    """One writable root of a run, pinned BEFORE the child starts: a directory by an
+    ``O_NOFOLLOW`` fd -- its identity, whatever the child later does to the path (swap it for a
+    symlink to another root, rename it) -- anything else (a file mount) by its path."""
+
+    __slots__ = ("path", "fd")
+
+    def __init__(self, path: Path, fd: int | None) -> None:
+        self.path = path
+        self.fd = fd
+
+    def __repr__(self) -> str:
+        return f"WatchRoot({str(self.path)!r}, fd={self.fd})"
+
+
+def pin_watch_roots(paths: Iterable[Path]) -> list[WatchRoot]:
+    """Deduplicate (:func:`disjoint_roots`) and pin a run's writable roots. Called before the
+    child is launched, while every path still is what the request named: resolving them after
+    launch would follow whatever the child swapped in. Raises ``SandboxError`` if a root can't
+    be opened (it then couldn't be measured). Release with :func:`close_watch_roots`."""
+    roots: list[WatchRoot] = []
+    try:
+        for p in disjoint_roots(paths):
+            try:
+                fd: int | None = os.open(p, _OPEN_DIR)
+            except FileNotFoundError:
+                fd = None               # not there (yet): measured by path, as a non-directory
+            except OSError as exc:
+                if exc.errno not in (errno.ENOTDIR, errno.ELOOP):
+                    raise SandboxError(f"cannot open the writable dir {p} to meter it: {exc}") from exc
+                fd = None               # a file (or link) root: measured by path, never followed
+            roots.append(WatchRoot(Path(p), fd))
+    except BaseException:
+        close_watch_roots(roots)
+        raise
+    return roots
+
+
+def close_watch_roots(roots: Iterable[WatchRoot]) -> None:
+    for r in roots:
+        if r.fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(r.fd)
+            r.fd = None
+
+
 def _blocks(st: os.stat_result) -> int:
     return st.st_blocks * 512 if hasattr(st, "st_blocks") else st.st_size
 
 
-def dir_usage(paths: Iterable[Path], max_entries: int,
+def dir_usage(paths: Iterable[Path | WatchRoot], max_entries: int,
               stop: Callable[[], bool] | None = None) -> tuple[int, int, bool]:
     """(bytes, entries, complete) under ``paths`` without following symlinks; stops counting at
     ``max_entries`` + 1 so a directory bomb can't make the measurement itself expensive.
@@ -509,7 +557,10 @@ def dir_usage(paths: Iterable[Path], max_entries: int,
     ``complete`` is False when part of the tree could not be read (a child can ``chmod 000`` a
     full subdirectory to hide it), is deeper than :data:`MAX_WALK_DEPTH`, or ``stop`` asked to
     end the walk: the caller must treat that as over budget, never as empty. A path that
-    vanished mid-walk (deleted by the run) is simply gone, not unmeasured."""
+    vanished mid-walk (deleted by the run) is simply gone, not unmeasured.
+
+    A :class:`WatchRoot` directory is walked from its pinned fd (re-opened as ``"."``), so the
+    tree measured is the one pinned before launch, wherever the child moved its path."""
     total = entries = 0
     complete = True
     stack: list[tuple[int, object]] = []      # (dir fd, its scandir iterator)
@@ -533,20 +584,24 @@ def dir_usage(paths: Iterable[Path], max_entries: int,
 
     try:
         for root in paths:
-            # A root can be a file (an rw FILE mount) or a symlink: count it, never follow it.
-            # Only a directory is walked.
-            try:
-                st = os.lstat(root)
-            except FileNotFoundError:
-                continue
-            except OSError:
-                complete = False
-                continue
-            if not stat.S_ISDIR(st.st_mode):
-                entries += 1
-                total += _blocks(st)
-                continue
-            frame = _open(root, None)
+            if isinstance(root, WatchRoot) and root.fd is not None:
+                frame = _open(".", root.fd)         # the pinned directory itself
+            else:
+                path = root.path if isinstance(root, WatchRoot) else root
+                # A root can be a file (an rw FILE mount) or a symlink: count it, never follow
+                # it. Only a directory is walked.
+                try:
+                    st = os.lstat(path)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    complete = False
+                    continue
+                if not stat.S_ISDIR(st.st_mode):
+                    entries += 1
+                    total += _blocks(st)
+                    continue
+                frame = _open(path, None)
             if frame is not None:
                 stack.append(frame)
             while stack:
@@ -638,7 +693,11 @@ class RssWatchdog:
         self._interval = interval_s
         self._rss_fn = rss_fn
         self._table_fn = table_fn
-        self._watch = disjoint_roots(watch_dirs)
+        watch = list(watch_dirs)
+        # Pinned roots (run_confined pins them before launch) are already disjoint; plain paths
+        # (direct callers, tests) are deduplicated here.
+        self._watch: list[Path | WatchRoot] = (
+            watch if all(isinstance(w, WatchRoot) for w in watch) else disjoint_roots(watch))
         self._disk_limit = disk_limit_bytes
         self._stop = threading.Event()
         self.tripped: str | None = None     # "memory" / "disk" / None
@@ -682,6 +741,28 @@ class RssWatchdog:
                 started = self._start_fn(pid)
                 if started is not None:     # already gone: nothing to remember
                     self.seen[pid] = started
+
+    def _remember_confirmed(self, pids: Iterable[int]) -> None:
+        """Remember the members first seen in this sample -- but only once re-confirmed. The pid
+        of one listed by ``ps`` may have been reused before its start time is read; recorded,
+        that newcomer's identity would be trusted from then on (metered, and killed by
+        :meth:`kill_family`). So the family is listed again after the start times are read, and
+        a pid is kept only if it is still a member and still the same process."""
+        fresh: dict[int, float] = {}
+        for pid in pids:
+            if pid not in self.seen:
+                started = self._start_fn(pid)
+                if started is not None:     # already gone: nothing to remember
+                    fresh[pid] = started
+        if not fresh:
+            return
+        try:
+            again = {r.pid for r in self._family(self._table_fn())}
+        except SandboxError:
+            return      # not confirmed now; the next sample (or its trip) handles them
+        for pid, started in fresh.items():
+            if pid in again and self._start_fn(pid) == started:
+                self.seen[pid] = started
 
     def _group_is_ours(self) -> bool:
         """Whether ``_pgid`` still names THIS run's process group. It is the leader's pid, held
@@ -748,7 +829,7 @@ class RssWatchdog:
             return
         if self._stop.is_set():
             return
-        self._remember(r.pid for r in family)
+        self._remember_confirmed([r.pid for r in family])
         rss = self._rss_fn(self._pgid) if self._rss_fn else sum(r.rss for r in family)
         self.peak_bytes = max(self.peak_bytes, rss)
         if rss > self._limit:
@@ -922,6 +1003,31 @@ def run_confined(
     ``env`` is the TARGET's environment: the launcher (an unsandboxed interpreter) runs with
     :data:`LAUNCHER_ENV` and installs ``env`` only when it execs ``argv``.
     """
+    # The writable roots are pinned now, before the child exists to swap them (see
+    # pin_watch_roots), and stay pinned until the final disk check is done.
+    roots = pin_watch_roots(watch_dirs)
+    try:
+        return _run_pinned(argv, env=env, limits=limits, cwd=cwd, popen=popen, rss_fn=rss_fn,
+                           roots=roots, max_output_bytes=max_output_bytes, sweep=sweep,
+                           member_fn=member_fn, pass_fds=pass_fds)
+    finally:
+        close_watch_roots(roots)
+
+
+def _run_pinned(
+    argv: list[str],
+    *,
+    env: Mapping[str, str],
+    limits: Limits,
+    cwd: Path,
+    popen: Callable[..., subprocess.Popen[bytes]],
+    rss_fn: Callable[[int], int] | None,
+    roots: list[WatchRoot],
+    max_output_bytes: int,
+    sweep: Callable[[], object] | None,
+    member_fn: Callable[[int], bool] | None,
+    pass_fds: tuple[int, ...],
+) -> SandboxResult:
     try:
         proc = popen(
             limits_launcher_argv(limits, argv, env),
@@ -942,29 +1048,46 @@ def run_confined(
     out.start()
     err.start()
     killed = False
-    dog = RssWatchdog(proc, limits.memory_bytes, rss_fn=rss_fn, watch_dirs=watch_dirs,
+    dog = RssWatchdog(proc, limits.memory_bytes, rss_fn=rss_fn, watch_dirs=roots,
                       disk_limit_bytes=limits.tmpfs_bytes, member_fn=member_fn)
-    try:
-        with dog:
-            try:
-                exit_code = proc.wait(timeout=limits.timeout_s)
-            except subprocess.TimeoutExpired:
-                killed = True
-                dog.kill_family()
-                kill_sandbox_group(proc)
-                try:
-                    proc.wait(timeout=5.0)
-                except subprocess.TimeoutExpired:
-                    pass
-                exit_code = -int(signal.SIGKILL)
-    finally:
-        # Also when the watchdog failed to stop (its ``__exit__`` raises) or anything above
-        # raised: the run fails, but a detached child must not survive it with the run's grants.
-        # The sweep runs before draining the pipes: an escapee holding them would hold EOF off.
-        # Should the kill or sweep raise as well, the original error stays chained to it.
+
+    def _emergency() -> None:
+        # The agent is about to hard-exit (its own deadline passed) and skip the `finally`
+        # below: kill and sweep this run first. Identity-gated like every other kill here.
         dog.kill_family()
         if sweep is not None:
             sweep()
+
+    token = register_emergency_cleanup(_emergency)
+    try:
+        try:
+            with dog:
+                try:
+                    exit_code = proc.wait(timeout=limits.timeout_s)
+                except subprocess.TimeoutExpired:
+                    killed = True
+                    # Identity-gated: the group only while it is provably the run's (see
+                    # RssWatchdog._group_is_ours), members by pid + start time. No bare
+                    # getpgid()/killpg() on the leader's pid here: the watchdog's poll() may have
+                    # reaped it at the timeout boundary, and the number may already name
+                    # another job's group.
+                    dog.kill_family()
+                    try:
+                        proc.wait(timeout=5.0)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    exit_code = -int(signal.SIGKILL)
+        finally:
+            # Also when the watchdog failed to stop (its ``__exit__`` raises) or anything above
+            # raised: the run fails, but a detached child must not survive it with the run's
+            # grants. The sweep runs before draining the pipes: an escapee holding them would
+            # hold EOF off. Should the kill or sweep raise as well, the original error stays
+            # chained to it.
+            dog.kill_family()
+            if sweep is not None:
+                sweep()
+    finally:
+        unregister_emergency_cleanup(token)
     # Everything of the run is dead now, so its writable dirs are final: measure them once more.
     dog.final_disk_check()
     out.join(timeout=5.0)
@@ -1117,16 +1240,10 @@ def held_unlinked_bytes(pids: Iterable[int]) -> int:
     vfi = ctypes.create_string_buffer(_VNODE_FDINFO_SIZE)
     region = ctypes.create_string_buffer(_REGION_PATHINFO_SIZE)
     for pid in set(pids):
-        n = _LIBSYSTEM.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, None, 0)
-        fds = (_ProcFdInfo * (max(n, 0) // ctypes.sizeof(_ProcFdInfo) + 64))()
-        got = (_LIBSYSTEM.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, fds, ctypes.sizeof(fds))
-               if n > 0 else n)
-        if got <= 0:
-            err = ctypes.get_errno()
-            if err == errno.ESRCH or proc_start_time(pid) is None:
-                continue        # exited
-            raise SandboxError(f"cannot list pid {pid}'s open files "
-                               f"(errno {err}: {os.strerror(err) if err else '?'})")
+        listed = _list_fds(pid)
+        if listed is None:
+            continue            # exited (or exiting): it holds nothing any more
+        fds, got = listed
         for f in fds[: got // ctypes.sizeof(_ProcFdInfo)]:
             if f.proc_fdtype != _PROX_FDTYPE_VNODE:
                 continue
@@ -1150,6 +1267,40 @@ def held_unlinked_bytes(pids: Iterable[int]) -> int:
                 break
             addr = nxt
     return sum(held.values())
+
+
+# A process caught while it exits can fail the fd listing with an error other than ESRCH
+# (measured: ENOTSUP) before it is a zombie; a failure on one not (yet) flagged exiting is
+# retried this often.
+_FD_LIST_TRIES = 5
+
+
+def _list_fds(pid: int) -> tuple[ctypes.Array, int] | None:
+    """``pid``'s descriptor table as ``(buffer, bytes used)``, or None when it exited -- also
+    one that is exiting: a zombie has closed every descriptor and dropped its mappings. A live
+    process whose table still can't be read raises ``SandboxError``.
+
+    ``proc_pidinfo`` returns 0 both on failure and for a process with no descriptors open (a
+    child that closed its stdio, say): errno, cleared before each call, tells them apart."""
+    err = 0
+    for attempt in range(_FD_LIST_TRIES):
+        ctypes.set_errno(0)
+        n = _LIBSYSTEM.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, None, 0)
+        sized = n > 0 or (n == 0 and ctypes.get_errno() == 0)
+        fds = (_ProcFdInfo * (max(n, 0) // ctypes.sizeof(_ProcFdInfo) + 64))()
+        if sized:
+            ctypes.set_errno(0)
+            got = _LIBSYSTEM.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, fds, ctypes.sizeof(fds)) \
+                if n > 0 else 0
+            if got > 0 or (got == 0 and ctypes.get_errno() == 0):
+                return fds, got         # (an empty table is an answer too)
+        err = ctypes.get_errno()
+        if err == errno.ESRCH or proc_start_time(pid) is None \
+                or _proc_state(pid) in ("gone", "zombie", "exiting"):
+            return None
+        threading.Event().wait(0.01 * (attempt + 1))
+    raise SandboxError(f"cannot list pid {pid}'s open files "
+                       f"(errno {err}: {os.strerror(err) if err else '?'})")
 
 
 def process_apis_available() -> bool:
@@ -1235,7 +1386,7 @@ def sweep_sandboxed(match: Callable[[int], bool], *, what: str, rounds: int = 40
             started = proc_start_time(p)
             if started is None:
                 state = _proc_state(p)
-                if state == "zombie":
+                if state in ("zombie", "exiting"):
                     continue                # can't run any more: holds no grant
                 if state == "gone":
                     inconclusive = True     # exited between listing and identifying
@@ -1274,8 +1425,14 @@ def sweep_sandboxed(match: Callable[[int], bool], *, what: str, rounds: int = 40
 
 
 def _proc_state(pid: int) -> str:
-    """"gone", "zombie" (exited, awaiting its reaper) or "alive" -- also when ``ps`` fails,
-    the answer that never lets a sweep call a process gone."""
+    """"gone", "zombie" (exited, awaiting its reaper), "exiting" or "alive" -- also when ``ps``
+    fails, the answer that never lets a sweep call a process gone.
+
+    "exiting" is ps's ``E`` flag ("trying to exit"): the kernel is tearing the process down (a
+    killed process with a large address space can stay there a while). It can't return to user
+    space -- run, write, fork -- again, so like a zombie it holds no grant; meanwhile the
+    kernel may refuse to describe it (its fd list, its start time), which must not be taken for
+    a live process that can't be identified."""
     try:
         out = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(pid)], capture_output=True,
                              text=True, timeout=5, check=False).stdout.strip()
@@ -1283,11 +1440,13 @@ def _proc_state(pid: int) -> str:
         return "alive"
     if not out:
         return "gone"
-    return "zombie" if out.startswith("Z") else "alive"
+    if out.startswith("Z"):
+        return "zombie"
+    return "exiting" if "E" in out[1:] else "alive"
 
 
 def _alive(pid: int) -> bool:
-    """False once ``pid`` is gone or a zombie (killed, awaiting its reaper)."""
+    """False once ``pid`` is gone, exiting or a zombie (killed, awaiting its reaper)."""
     return _proc_state(pid) == "alive"
 
 

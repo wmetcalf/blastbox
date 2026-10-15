@@ -5,12 +5,15 @@ Pure-logic tests run on any POSIX host; nothing here needs Seatbelt.
 from __future__ import annotations
 
 import contextlib
+import errno
+import ctypes
 import signal
 import os
 import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -682,6 +685,40 @@ class TestWatchdogPidIdentity:
         assert proc.pid not in dog._ancestry([])
 
 
+    def test_a_new_member_is_remembered_only_once_reconfirmed(self):
+        # ps lists a family member; before its start time is read, the pid is reused by an
+        # unrelated process (the re-scan no longer finds it in the family): never trusted
+        proc = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+        try:
+            pgid = os.getpgid(proc.pid)
+            member = mc._Proc(pid=999_991, ppid=proc.pid, pgid=pgid, rss=0)
+            stranger = mc._Proc(pid=999_991, ppid=1, pgid=1, rss=0)
+            tables = iter([[member], [stranger]])
+            dog = mc.RssWatchdog(proc, 1 << 30, rss_fn=lambda g: 0,
+                                 table_fn=lambda: next(tables, []),
+                                 start_fn=lambda p: 7.0 if p == 999_991 else None)
+            dog._sample()
+            assert 999_991 not in dog.seen
+            assert dog.tripped is None
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_a_reconfirmed_new_member_is_remembered(self):
+        proc = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+        try:
+            pgid = os.getpgid(proc.pid)
+            member = mc._Proc(pid=999_991, ppid=proc.pid, pgid=pgid, rss=0)
+            dog = mc.RssWatchdog(proc, 1 << 30, rss_fn=lambda g: 0,
+                                 table_fn=lambda: [member],
+                                 start_fn=lambda p: 7.0 if p == 999_991 else None)
+            dog._sample()
+            assert dog.seen == {999_991: 7.0}
+        finally:
+            proc.kill()
+            proc.wait()
+
+
 class TestWatchdogProcessGroup:
     def test_the_group_is_not_trusted_once_its_leader_is_reaped(self, monkeypatch):
         # after the leader is reaped its pid -- the group number -- can become another job's
@@ -1206,3 +1243,154 @@ class TestRemoveTreeUnlocks:
         finally:
             if os.path.lexists(d):
                 subprocess.run(["/bin/chmod", "-RN", str(d)], check=False)
+
+
+class TestPinnedWatchRoots:
+    def test_roots_swapped_right_after_launch_are_still_measured(self, tmp_path):
+        # The child swaps the first rw root for a symlink to the second before the watchdog is
+        # built: resolved after launch, both spellings would name one tree and the real second
+        # root would go unmetered. Pinned before launch, both trees are measured.
+        a, b = tmp_path / "a", tmp_path / "b"
+        a.mkdir()
+        b.mkdir()
+        (b / "big").write_bytes(b"x" * 3_000_000)
+
+        def popen(*args, **kw):
+            p = subprocess.Popen(*args, **kw)
+            a.rmdir()
+            a.symlink_to(b)
+            return p
+        r = mc.run_confined(["/bin/sleep", "1"], env={"PATH": mc.MINIMAL_PATH},
+                            limits=Limits(timeout_s=20, tmpfs_bytes=2_000_000), cwd=tmp_path,
+                            popen=popen, watch_dirs=[a, b])
+        assert r.killed and b"writable dirs exceeded" in r.stderr
+
+    def test_a_pinned_root_is_measured_wherever_its_path_goes(self, tmp_path):
+        d = tmp_path / "d"
+        d.mkdir()
+        roots = mc.pin_watch_roots([d])
+        try:
+            d.rename(tmp_path / "moved")
+            d.symlink_to(tmp_path / "elsewhere")
+            (tmp_path / "moved" / "f").write_bytes(b"x" * 100_000)
+            used, entries, complete = mc.dir_usage(roots, 1000)
+            assert complete and entries == 1 and used >= 100_000
+        finally:
+            mc.close_watch_roots(roots)
+        assert roots[0].fd is None
+
+    def test_a_file_root_is_measured_by_path(self, tmp_path):
+        f = tmp_path / "f"
+        f.write_bytes(b"x" * 10_000)
+        roots = mc.pin_watch_roots([f])
+        try:
+            assert roots[0].fd is None
+            assert mc.dir_usage(roots, 1000)[1:] == (1, True)
+        finally:
+            mc.close_watch_roots(roots)
+
+
+class TestTimeoutKill:
+    def test_the_timeout_path_never_kills_by_a_bare_group_lookup(self, tmp_path, monkeypatch):
+        # After the leader is reaped (the watchdog's poll() can do it at the timeout boundary)
+        # getpgid(leader pid) may name another job's group: only identity-gated kills remain.
+        import blastbox.worker.sandbox.base as base
+        calls: list[object] = []
+        monkeypatch.setattr(base, "kill_sandbox_group", calls.append)
+        monkeypatch.setattr(mc, "kill_sandbox_group", calls.append, raising=False)
+        t0 = time.monotonic()
+        r = mc.run_confined(["/bin/sleep", "30"], env={"PATH": mc.MINIMAL_PATH},
+                            limits=Limits(timeout_s=1), cwd=tmp_path)
+        assert r.killed and r.exit_code == -9
+        assert time.monotonic() - t0 < 15
+        assert calls == []
+
+
+class TestEmergencyCleanup:
+    def test_an_emergency_cleanup_kills_a_run_in_flight(self, tmp_path):
+        from blastbox.worker.sandbox import base
+        out: dict[str, object] = {}
+        t = threading.Thread(target=lambda: out.update(r=mc.run_confined(
+            ["/bin/sleep", "60"], env={"PATH": mc.MINIMAL_PATH},
+            limits=Limits(timeout_s=60), cwd=tmp_path)))
+        t.start()
+        deadline = time.monotonic() + 10
+        while not base._EMERGENCY and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert base.run_emergency_cleanups(10) == 1
+        t.join(15)
+        assert not t.is_alive()
+        assert out["r"].exit_code == -9          # type: ignore[attr-defined]
+        assert base._EMERGENCY == {}             # unregistered when the run ended
+
+    def test_a_hung_cleanup_does_not_hold_the_exit(self):
+        from blastbox.worker.sandbox import base
+        release = threading.Event()
+        token = base.register_emergency_cleanup(lambda: release.wait(10))
+        try:
+            t0 = time.monotonic()
+            assert base.run_emergency_cleanups(0.2) == 0
+            assert time.monotonic() - t0 < 2
+        finally:
+            release.set()
+            base.unregister_emergency_cleanup(token)
+
+    def test_nothing_registered_is_a_no_op(self):
+        from blastbox.worker.sandbox import base
+        assert base._EMERGENCY == {}
+        assert base.run_emergency_cleanups(5) == 0
+
+
+class TestFdListing:
+    """A process caught exiting (or execing) can fail PROC_PIDLISTFDS with ENOTSUP before it is
+    a zombie: that is not a reason to kill the whole run for disk."""
+
+    class _Lib:
+        def __init__(self, fails: int) -> None:
+            self.fails = fails
+
+        def proc_pidinfo(self, pid, flavor, arg, buf, size):
+            if self.fails > 0:
+                self.fails -= 1
+                return 0
+            return ctypes.sizeof(mc._ProcFdInfo)
+
+    def _patch(self, monkeypatch, fails, state, started=1.0):
+        lib = self._Lib(fails)
+        monkeypatch.setattr(mc, "_LIBSYSTEM", lib)
+        monkeypatch.setattr(ctypes, "get_errno", lambda: errno.ENOTSUP)
+        monkeypatch.setattr(mc, "_proc_state", lambda pid: state)
+        monkeypatch.setattr(mc, "proc_start_time", lambda pid: started)
+        return lib
+
+    def test_a_transient_failure_is_retried(self, monkeypatch):
+        self._patch(monkeypatch, fails=2, state="alive")
+        listed = mc._list_fds(4242)
+        assert listed is not None and listed[1] == ctypes.sizeof(mc._ProcFdInfo)
+
+    def test_an_exiting_process_holds_nothing(self, monkeypatch):
+        for state in ("zombie", "gone"):
+            self._patch(monkeypatch, fails=99, state=state)
+            assert mc._list_fds(4242) is None
+        self._patch(monkeypatch, fails=99, state="alive", started=None)
+        assert mc._list_fds(4242) is None
+
+    @pytest.mark.skipif(not mc.IS_DARWIN, reason="needs libproc")
+    def test_a_process_with_no_descriptors_holds_nothing(self):
+        # A child that closed its stdio has an empty table: proc_pidinfo returns 0 with no
+        # error. That is an answer (nothing held), not a failure that kills the run for disk.
+        p = subprocess.Popen(["/usr/bin/perl", "-e", "close STDIN; close STDOUT; close STDERR; "
+                              "sleep 30"], close_fds=True)
+        try:
+            time.sleep(0.5)
+            assert mc._list_fds(p.pid) is not None
+            assert mc.held_unlinked_bytes([p.pid]) == 0
+        finally:
+            p.kill()
+            p.wait()
+
+    def test_a_live_process_that_keeps_failing_fails_closed(self, monkeypatch):
+        lib = self._patch(monkeypatch, fails=99, state="alive")
+        with pytest.raises(SandboxError, match="cannot list pid 4242's open files"):
+            mc._list_fds(4242)
+        assert lib.fails == 99 - mc._FD_LIST_TRIES        # one (failed) sizing call per try

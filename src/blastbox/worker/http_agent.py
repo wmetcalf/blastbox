@@ -45,7 +45,7 @@ from blastbox.limits import Limits
 from blastbox.worker.engine import Engine
 from blastbox.worker.harness import run_detonation
 from blastbox.worker.load import load_engine
-from blastbox.worker.sandbox.base import confined_runs, host_platform
+from blastbox.worker.sandbox.base import confined_runs, host_platform, run_emergency_cleanups
 
 _log = logging.getLogger("blastbox.worker.http_agent")
 
@@ -102,6 +102,8 @@ class _SlowBody(Exception):
 
 
 _HARD_EXIT = os._exit   # injectable seam: tests override this to avoid killing the test runner
+# How long a hard exit waits for the backends' emergency kill/sweep of the runs in flight.
+EMERGENCY_CLEANUP_S = 15.0
 
 
 def _hard_deadline_s(limits: Limits) -> float:
@@ -124,6 +126,12 @@ def _on_hard_deadline(hard_s: float) -> None:
     with contextlib.suppress(Exception):
         import faulthandler
         faulthandler.dump_traceback()
+    # os._exit skips every backend's `finally`. The macOS backends start their children in new
+    # sessions -- out of reach of a supervisor that kills the agent's process group (launchd)
+    # -- so kill and sweep the runs in flight first, bounded: a Seatbelt child must not outlive
+    # the agent with direct access to its writable mounts. (Linux backends register nothing.)
+    with contextlib.suppress(Exception):
+        run_emergency_cleanups(EMERGENCY_CLEANUP_S)
     _HARD_EXIT(75)
 
 

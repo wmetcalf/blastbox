@@ -6,9 +6,10 @@ import os
 import signal
 import sys
 import contextlib
-import contextvars
+import itertools
 import threading
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,19 +31,29 @@ def host_platform() -> str:
 
 _CONFINED_RUNS = 0
 _CONFINED_LOCK = threading.Lock()
-# Set while a run is a probe (select_sandbox's smoketest), not an engine's parse.
-_NOT_COUNTED: contextvars.ContextVar[bool] = contextvars.ContextVar("bb_not_counted", default=False)
+# Open not_counted() blocks, process-wide (see not_counted).
+_NOT_COUNTED_DEPTH = 0
 
 
 @contextlib.contextmanager
 def not_counted() -> Iterator[None]:
-    """Runs inside this block don't count as confined parses (a backend probe running
-    ``/usr/bin/true`` must not give an engine credit before its parser has run)."""
-    token = _NOT_COUNTED.set(True)
+    """Runs made while this block is open don't count as confined parses: a backend probe
+    running ``/usr/bin/true``, or an engine's ``detect()``, must not give the engine credit
+    before (or instead of) its ``detonate()`` parser.
+
+    Process-wide, not per-thread or per-context: a detector may make its sandbox call on a
+    thread it starts (a ``ThreadPoolExecutor``, its own joined thread), which inherits no
+    context. The agent that reads the count runs one job at a time, so nothing else of the job
+    is running meanwhile; a probe overlapping another thread's run can only withhold credit
+    (that result is refused), never grant it."""
+    global _NOT_COUNTED_DEPTH
+    with _CONFINED_LOCK:
+        _NOT_COUNTED_DEPTH += 1
     try:
         yield
     finally:
-        _NOT_COUNTED.reset(token)
+        with _CONFINED_LOCK:
+            _NOT_COUNTED_DEPTH -= 1
 
 
 def note_confined_run() -> None:
@@ -50,15 +61,65 @@ def note_confined_run() -> None:
     outer isolation boundary (macOS), the agent uses the count to prove an ``ok`` result came
     from a sandboxed parse rather than from the engine's own (unconfined) process."""
     global _CONFINED_RUNS
-    if _NOT_COUNTED.get():
-        return
     with _CONFINED_LOCK:
+        if _NOT_COUNTED_DEPTH:
+            return
         _CONFINED_RUNS += 1
 
 
 def confined_runs() -> int:
     with _CONFINED_LOCK:
         return _CONFINED_RUNS
+
+
+# Cleanups for runs in flight, for the agent to call before it hard-exits (see
+# run_emergency_cleanups). Only the macOS backends register: their children run in their own
+# sessions, which a supervisor's process-group kill doesn't reach.
+_EMERGENCY: dict[int, Callable[[], object]] = {}
+_EMERGENCY_LOCK = threading.Lock()
+_EMERGENCY_IDS = itertools.count()
+
+
+def register_emergency_cleanup(fn: Callable[[], object]) -> int:
+    """Register ``fn`` (kill and sweep one run in flight); returns a token for
+    :func:`unregister_emergency_cleanup`."""
+    with _EMERGENCY_LOCK:
+        token = next(_EMERGENCY_IDS)
+        _EMERGENCY[token] = fn
+        return token
+
+
+def unregister_emergency_cleanup(token: int) -> None:
+    with _EMERGENCY_LOCK:
+        _EMERGENCY.pop(token, None)
+
+
+def run_emergency_cleanups(timeout_s: float) -> int:
+    """Run every registered cleanup, each on its own daemon thread (one may hang on whatever
+    hung the run), waiting at most ``timeout_s`` in all. Returns how many completed without
+    raising. With nothing registered (every Linux backend) it returns 0 at once."""
+    with _EMERGENCY_LOCK:
+        fns = list(_EMERGENCY.values())
+    if not fns:
+        return 0
+    done: list[bool] = []
+
+    def _one(fn: Callable[[], object]) -> None:
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001 -- reported, the others still run
+            _log.error("sandbox: emergency cleanup failed: %s", exc)
+        else:
+            done.append(True)
+
+    threads = [threading.Thread(target=_one, args=(fn,), daemon=True, name="bb-emergency")
+               for fn in fns]
+    for t in threads:
+        t.start()
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    for t in threads:
+        t.join(timeout=max(0.0, deadline - time.monotonic()))
+    return len(done)
 
 
 def kill_sandbox_group(proc) -> None:

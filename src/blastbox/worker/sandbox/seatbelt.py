@@ -142,6 +142,14 @@ def build_profile(
         # No ACLs anywhere it may write, scratch included: a deny ACL (`everyone deny delete`)
         # would keep the worker's own cleanup from removing the tree. No engine needs one.
         lines.append("(deny file-write-acl " + refs("RWA", rw_paths, "subpath") + ")")
+        # The roots themselves stay put, as a bind mount's mountpoint does: the subtree grant
+        # would let the child unlink or rename the root (and so delete or move away the REAL
+        # host path of a mount, or its scratch -- what identifies the run to the sweep).
+        # file-write-unlink covers unlink, rmdir and either side of a rename. A root nested in
+        # another rw root is also reachable by renaming a directory between the two, so those
+        # are pinned as well. Everything beneath a directory root stays writable.
+        lines.append("(deny file-write-unlink "
+                     + refs("RWR", _pinned_paths(rw_paths), "literal") + ")")
     for accel in sorted(accelerators):
         lines.extend(_ACCEL_RULES[accel])
     if "ane" in accelerators and scratch:
@@ -157,6 +165,21 @@ def build_profile(
         )
     lines.append("(deny network*)")
     return "\n".join(lines) + "\n", params
+
+
+def _pinned_paths(rw_paths: list[str]) -> list[str]:
+    """Every rw root, plus each directory between a root and another rw root that contains
+    it (renaming one of those would carry the nested root away)."""
+    roots = [Path(p) for p in rw_paths]
+    pinned = {str(r) for r in roots}
+    for r in roots:
+        for outer in roots:
+            if outer != r and outer in r.parents:
+                d = r.parent
+                while d != outer:
+                    pinned.add(str(d))
+                    d = d.parent
+    return sorted(pinned)
 
 
 #: Runs INSIDE the profile: sandbox-exec execs it only after the profile attached, so the nonce it
@@ -227,6 +250,10 @@ class SeatbeltSandbox:
                 )
 
         scratch = mc.make_scratch(self._scratch_base)
+        # What the run's scratch IS: a sweep that finds it removed or replaced puts an empty
+        # directory back at the path (to find the run's processes), which must never be taken
+        # for the run's own scratch -- not captured, not read for the handshake.
+        scratch_id = self._dir_identity(scratch)
         confined = False
         try:
             mc.seed_scratch(scratch, request.seed_home, request.limits.tmpfs_bytes)
@@ -256,8 +283,15 @@ class SeatbeltSandbox:
             # The handshake proves a process ran under the profile (not a failure before launch,
             # nor a profile sandbox-exec rejected). Read -- and removed, so it is never captured
             # -- now; credited only at the end.
-            handshake = self._handshake_ok(marker, nonce)
+            intact = self._dir_identity(scratch) == scratch_id
+            handshake = intact and self._handshake_ok(marker, nonce)
             ok = result.exit_code == 0 and not result.killed
+            if ok and request.capture_home is not None and not intact:
+                # The profile pins the scratch root, so only a broken profile gets here; never
+                # capture the empty stand-in over the caller's cache (a later warmup would seed
+                # from it).
+                raise SandboxError(f"seatbelt: refusing to capture {scratch}: the run removed "
+                                   "or replaced its scratch dir")
             if ok:
                 mc.capture_scratch(scratch, request.capture_home, request.limits.tmpfs_bytes)
             # Counted only for a run that reached the profile AND completed, and only after the
@@ -279,6 +313,16 @@ class SeatbeltSandbox:
                     f"seatbelt: could not remove the run's scratch {scratch}: {exc}") from exc
             if confined:
                 note_confined_run()
+
+    @staticmethod
+    def _dir_identity(path: Path) -> tuple[int, int] | None:
+        """(device, inode) of the real directory at ``path``, or None if it is gone or is no
+        longer a directory (a symlink, a file)."""
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return None
+        return (st.st_dev, st.st_ino) if stat.S_ISDIR(st.st_mode) else None
 
     @staticmethod
     def _handshake_ok(marker: Path, nonce: str) -> bool:

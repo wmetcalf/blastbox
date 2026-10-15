@@ -320,6 +320,21 @@ was granted.
   symlink, or whose processes can't all be killed is retired until
   `blastbox macos prepare` is re-run. A seeded run on a never-launched slot primes the
   container with a no-op launch first, so the seed always applies (or the run fails).
+- `blastbox macos prepare` can run beside a live agent: it takes every slot's lock first
+  (waiting up to `BLASTBOX_APPSANDBOX_PREPARE_WAIT_S`, default 60 s, for a run in progress,
+  else refusing) and writes a new manifest generation. The running agent then refuses every
+  `appsandbox` run until it is restarted, so no job launches under re-signed slots (another
+  bundle id, other grants) that it didn't load and verify. Restart the agent after a prepare.
+- A `seatbelt` run can't unlink or rename the roots of its writable mounts or its scratch
+  dir (nor a directory between a mount root and an outer writable mount); everything beneath
+  a directory root stays writable. A scratch dir that is nonetheless gone or replaced after
+  the run is never captured into `capture_home`.
+- When the agent's hard deadline retires it (`os._exit`), it first kills and sweeps the
+  `seatbelt`/`appsandbox` runs in flight (bounded, 15 s): their processes run in their own
+  sessions, which launchd's process-group cleanup of the agent job doesn't reach. A crash
+  that skips this (SIGKILL of the agent) leaves `appsandbox` slots to the next start's
+  pre-run sweep and wipe; a `seatbelt` escapee from such a crash has no slot to be swept
+  from, so run the agent under a dedicated user and let launchd restart it in place.
 
 **The agent can be native.** The dispatcher only sees the protocol: `GET /healthz`, and
 `POST /detonate` answered with a tar holding a `metadata.json` that passes the host trust gate.

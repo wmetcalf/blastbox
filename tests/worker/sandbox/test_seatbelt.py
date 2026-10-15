@@ -16,9 +16,11 @@ import pytest
 
 from blastbox.errors import SandboxError, SandboxUnavailable
 from blastbox.limits import Limits
-from blastbox.worker.sandbox.base import Mount, SandboxRequest
+from blastbox.worker.sandbox.base import Mount, SandboxRequest, SandboxResult
 from blastbox.worker.sandbox import macos_common as mc
-from blastbox.worker.sandbox.seatbelt import HANDSHAKE_SHIM, SeatbeltSandbox, build_profile
+from blastbox.worker.sandbox.seatbelt import (
+    HANDSHAKE_SHIM, SeatbeltSandbox, _pinned_paths, build_profile,
+)
 
 pytestmark = pytest.mark.host_platform
 
@@ -93,6 +95,39 @@ class _FakeProc:
 
     def poll(self):
         return 0
+
+
+class TestPinnedRoots:
+    def test_roots_and_dirs_between_nested_roots_are_pinned(self):
+        assert _pinned_paths(["/w", "/w/a/b/n", "/s"]) == ["/s", "/w", "/w/a", "/w/a/b", "/w/a/b/n"]
+        assert _pinned_paths(["/x", "/y"]) == ["/x", "/y"]
+
+    def test_the_profile_denies_unlinking_them(self):
+        text, params = build_profile(exec_paths=["/x"], ro_paths=[], rw_paths=["/w", "/w/a/n"],
+                                     accelerators=frozenset(), scratch="/s")
+        line = next(ln for ln in text.splitlines() if ln.startswith("(deny file-write-unlink"))
+        keys = [k for k, v in params.items() if k.startswith("RWR_")]
+        assert sorted(params[k] for k in keys) == ["/w", "/w/a", "/w/a/n"]
+        assert all(f'(literal (param "{k}"))' in line for k in keys)
+
+
+@needs_darwin
+def test_a_removed_or_replaced_scratch_is_never_captured(tmp_path, monkeypatch):
+    # The sweep puts an empty directory back where a run removed its scratch (to find its
+    # processes); that stand-in must not be captured over the caller's cache.
+    dest = tmp_path / "cache"
+    dest.mkdir()
+    (dest / "keep").write_text("earlier")
+
+    def removes_its_scratch(argv, *, cwd, **kw):
+        mc.remove_tree(Path(cwd))
+        os.mkdir(cwd, 0o700)
+        return SandboxResult(exit_code=0, stdout=b"", stderr=b"", killed=False)
+    monkeypatch.setattr(mc, "run_confined", removes_its_scratch)
+    with pytest.raises(SandboxError, match="refusing to capture"):
+        SeatbeltSandbox(scratch_base=tmp_path / "s").run(
+            SandboxRequest(argv=["/usr/bin/true"], capture_home=dest))
+    assert (dest / "keep").read_text() == "earlier"
 
 
 class TestRunShape:
@@ -208,6 +243,33 @@ class TestRealConfinement:
                                   capture_output=True, text=True).stdout.count(" deny ") == 0
         finally:
             subprocess.run(["/bin/chmod", "-RN", str(out)], check=False)
+
+    def test_a_child_cannot_remove_or_rename_its_mount_roots_or_scratch(self, sb, tmp_path):
+        # The roots stay put like a bind mount's mountpoint; beneath a directory root anything
+        # goes. Each denial echoes a marker.
+        out = tmp_path / "out"
+        (out / "sub").mkdir(parents=True)
+        nested = out / "a" / "nested"
+        nested.mkdir(parents=True)
+        single = tmp_path / "single"
+        single.write_text("orig")
+        script = (
+            'echo hi > "$0/new" && mkdir "$0/d" && mv "$0/d" "$0/e" && rmdir "$0/e" '
+            '&& rmdir "$0/sub" && rm "$0/new" && echo "x" > "$1" && echo ok; '
+            'rm "$1" 2>/dev/null || echo file-root-kept; '
+            'mv "$0/a" "$0/b" 2>/dev/null || echo ancestor-kept; '
+            'rmdir "$2" 2>/dev/null || echo nested-kept; '
+            'rmdir "$0/a/nested" 2>/dev/null; '
+            'cd /; rm -rf "$HOME"/* "$HOME"/.bb-handshake; rmdir "$HOME" 2>/dev/null || echo scratch-kept; '
+            'exit 0')
+        r = sb.run(SandboxRequest(argv=["/bin/sh", "-c", script, str(out), str(single), str(nested)],
+                                  rw_mounts=[Mount(out, out), Mount(single, single),
+                                             Mount(nested, nested)]))
+        assert r.exit_code == 0, r.stderr
+        assert r.stdout.split() == [b"ok", b"file-root-kept", b"ancestor-kept", b"nested-kept",
+                                    b"scratch-kept"], (r.stdout, r.stderr)
+        assert out.is_dir() and nested.is_dir() and single.read_text() == "x\n"
+        assert not (out / "sub").exists()        # beneath the root: the child's to change
 
     def test_network_denied(self, sb):
         r = sb.run(SandboxRequest(argv=["/usr/bin/nc", "-z", "-w", "3", "1.1.1.1", "80"],

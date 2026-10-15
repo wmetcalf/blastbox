@@ -572,3 +572,26 @@ def test_mtls_end_to_end_and_rejects_uncertified_caller(tmp_path):
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_hard_deadline_kills_and_sweeps_runs_in_flight_before_exiting(monkeypatch):
+    # os._exit skips every backend's `finally`: the macOS backends' runs (in their own sessions,
+    # out of reach of launchd's process-group cleanup) are killed and swept first
+    import blastbox.worker.http_agent as hag
+    order: list[object] = []
+    monkeypatch.setattr(hag, "run_emergency_cleanups", lambda t: order.append(("cleanup", t)))
+    monkeypatch.setattr(hag, "_HARD_EXIT", lambda code: order.append(("exit", code)))
+    hag._on_hard_deadline(1.0)
+    assert order == [("cleanup", hag.EMERGENCY_CLEANUP_S), ("exit", 75)]
+
+
+def test_a_failing_emergency_cleanup_still_exits(monkeypatch):
+    import blastbox.worker.http_agent as hag
+    exited: list[int] = []
+
+    def boom(t):
+        raise RuntimeError("cleanup blew up")
+    monkeypatch.setattr(hag, "run_emergency_cleanups", boom)
+    monkeypatch.setattr(hag, "_HARD_EXIT", exited.append)
+    hag._on_hard_deadline(1.0)
+    assert exited == [75]
