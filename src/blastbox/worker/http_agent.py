@@ -223,6 +223,14 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._authed():
             self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
             return
+        if self.warmup_error is not None:
+            # A required warmup is failing (set only when the self-test gate is on -- macOS by
+            # default; never on a Linux worker running cold). /healthz alone gates only clients
+            # that honour it: a direct client must not get results from a sandbox whose
+            # self-test fails (e.g. one that lost a grant and returns plausible empty `ok`s).
+            # The retry clears this, reopening /detonate together with /healthz.
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "not_ready", "warmup": "failed"})
+            return
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:

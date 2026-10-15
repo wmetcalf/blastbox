@@ -595,3 +595,23 @@ def test_a_failing_emergency_cleanup_still_exits(monkeypatch):
     monkeypatch.setattr(hag, "_HARD_EXIT", exited.append)
     hag._on_hard_deadline(1.0)
     assert exited == [75]
+
+
+def test_a_failing_optional_warmup_does_not_gate_detonate():
+    # Linux default: the warmup gate is off, a failing warmup is logged and the agent runs
+    # cold -- /detonate must keep serving (the macOS-only 503 gate never engages here).
+    import blastbox.worker.http_agent as hag
+
+    class Boom(_NoopEngine):
+        def warmup(self):
+            raise RuntimeError("self-test decoded nothing")
+    err = hag._warmup(Boom(), require_warmup=False)
+    assert err is None
+    httpd = serve(Boom(), bind="127.0.0.1", port=0, warmup_error=err)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        with _post(f"http://127.0.0.1:{httpd.server_address[1]}/detonate?name=x", b"MZ") as r:
+            assert r.status == 200
+    finally:
+        httpd.shutdown()
+        httpd.server_close()

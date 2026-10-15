@@ -121,6 +121,41 @@ def test_failed_warmup_makes_healthz_not_ready():
         _stop(httpd)
 
 
+def test_a_failing_required_warmup_refuses_detonations_too():
+    # /healthz alone gates only clients that honour it (StaticPool); a direct client posting
+    # /detonate must not get results from a sandbox whose self-test is failing (e.g. one that
+    # lost an accelerator grant and returns plausible empty `ok`s). Nothing runs.
+    class Counting(_Engine):
+        calls = 0
+
+        def detonate(self, input, outdir, limits):
+            type(self).calls += 1
+            return super().detonate(input, outdir, limits)
+    httpd, port = _agent(Counting(), warmup_error="self-test failed")
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/detonate?name=x", data=b"x",
+                                     method="POST")
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(req, timeout=10)
+        assert exc.value.code == 503
+        assert json.loads(exc.value.read()) == {"error": "not_ready", "warmup": "failed"}
+        assert Counting.calls == 0
+        # the retry clearing the error (what retry_warmup does) reopens /detonate
+        httpd.RequestHandlerClass.warmup_error = None
+        assert _detonate(port) == 200 and Counting.calls == 1
+    finally:
+        _stop(httpd)
+
+
+def test_the_readiness_gate_on_detonate_still_checks_auth_first():
+    # an unauthenticated caller learns nothing about readiness (403/401 as before, not 503)
+    httpd, port = _agent(_Engine(), warmup_error="self-test failed", token="s3cret")
+    try:
+        assert _detonate(port) == 401
+    finally:
+        _stop(httpd)
+
+
 def test_a_required_warmup_that_the_engine_lacks_is_not_ready():
     # _Engine has no warmup(): when the self-test gate is on, that is "not ready", not "passed".
     assert ha._warmup(_Engine(), require_warmup=True) == "engine has no warmup self-test"

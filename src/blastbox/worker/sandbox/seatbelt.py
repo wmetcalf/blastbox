@@ -167,6 +167,26 @@ def build_profile(
     return "\n".join(lines) + "\n", params
 
 
+def _check_ro_rw_disjoint(ro_paths: list[str], rw_paths: list[str]) -> None:
+    """Refuse a read-only mount whose source equals, lies inside, or contains a writable
+    mount's source (both resolved), before anything is launched.
+
+    Inside or equal: the rw ``file-write*`` subpath grant covers the ro path as well, so the
+    child could rewrite an input or config its ``ro_mounts`` contract protects. Containing:
+    Seatbelt itself would keep the rest of the ro tree read-only, but App Sandbox refuses the
+    same layout (it stages copies), and a request should not run on one macOS backend and be
+    refused by the other. Only the request's mounts are compared, never the run's scratch."""
+    for r in ro_paths:
+        ro = Path(r)
+        for w in rw_paths:
+            rw = Path(w)
+            if ro == rw or ro.is_relative_to(rw) or rw.is_relative_to(ro):
+                raise SandboxError(
+                    f"seatbelt: read-only mount {ro} overlaps writable mount {rw}; the "
+                    "writable grant would cover it (and App Sandbox refuses the same layout) "
+                    "-- mount disjoint trees")
+
+
 def _pinned_paths(rw_paths: list[str]) -> list[str]:
     """Every rw root, plus each directory between a root and another rw root that contains
     it (renaming one of those would carry the nested root away)."""
@@ -248,6 +268,7 @@ class SeatbeltSandbox:
                 raise SandboxError(
                     f"seatbelt supports identity mounts only (source == target): {m}"
                 )
+        _check_ro_rw_disjoint(ro, rw)
 
         scratch = mc.make_scratch(self._scratch_base)
         # What the run's scratch IS: a sweep that finds it removed or replaced puts an empty

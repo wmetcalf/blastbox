@@ -206,6 +206,37 @@ class TestRealConfinement:
         assert r.exit_code == 0, r.stderr
         assert (out / "f").read_text() == "hi\n"
 
+    def test_a_read_only_mount_under_a_writable_one_is_refused(self, sb, tmp_path):
+        # The rw subtree grant would cover the ro path too: the child could rewrite an input
+        # its ro_mounts contract says is protected. Refused before launch, nothing written.
+        out = tmp_path / "out"
+        out.mkdir()
+        cfg = out / "config"
+        cfg.write_text("original\n")
+        with pytest.raises(SandboxError, match="overlaps writable mount"):
+            sb.run(SandboxRequest(argv=["/bin/sh", "-c", 'echo pwned > "$0"', str(cfg)],
+                                  ro_mounts=[Mount(cfg, cfg)], rw_mounts=[Mount(out, out)]))
+        assert cfg.read_text() == "original\n"
+
+    @pytest.mark.parametrize("layout", ["equal", "ro_contains_rw"])
+    def test_other_ro_rw_overlaps_are_refused_like_app_sandbox(self, sb, tmp_path, layout):
+        # Same rule as App Sandbox, so a request behaves the same on either macOS backend.
+        top = tmp_path / "top"
+        (top / "w").mkdir(parents=True)
+        ro, rw = (top, top) if layout == "equal" else (top, top / "w")
+        with pytest.raises(SandboxError, match="overlaps writable mount"):
+            sb.run(SandboxRequest(argv=["/usr/bin/true"],
+                                  ro_mounts=[Mount(ro, ro)], rw_mounts=[Mount(rw, rw)]))
+
+    def test_disjoint_ro_and_rw_mounts_still_run(self, sb, tmp_path):
+        inp, out = tmp_path / "in", tmp_path / "out"
+        inp.write_text("data\n")
+        out.mkdir()
+        r = sb.run(SandboxRequest(argv=["/bin/sh", "-c", 'cat "$0" > "$1/copy"', str(inp), str(out)],
+                                  ro_mounts=[Mount(inp, inp)], rw_mounts=[Mount(out, out)]))
+        assert r.exit_code == 0, r.stderr
+        assert (out / "copy").read_text() == "data\n"
+
     def test_a_child_cannot_set_file_flags_on_an_rw_mount(self, sb, tmp_path):
         # The mount is the real host tree: a uchg/uappnd file there would make the caller's own
         # cleanup fail. Ordinary writes, chmod and utimes still work.
