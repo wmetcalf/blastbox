@@ -437,6 +437,14 @@ def prepare(
     """
     if not 1 <= slots <= 256:
         raise SandboxError("slots must be between 1 and 256")
+    home = home or Path(pwd.getpwuid(os.getuid()).pw_dir)
+    # Resolved before anything is created, so the overlap checks below run first.
+    planned = root.expanduser().resolve()
+    planned_prefix = bundle_prefix or "io.blastbox.sbx." + hashlib.sha256(
+        str(planned).encode()).hexdigest()[:10]
+    if _valid_bundle_id(planned_prefix):
+        _check_root_outside_containers(planned, home,
+                                       (f"{planned_prefix}.slot{i}" for i in range(slots)))
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     root = root.resolve()
     os.chmod(root, 0o700)
@@ -471,7 +479,6 @@ def prepare(
     # slot lock when the bundle lock is busy -- it never waits holding one -- so prepare's waits
     # can't deadlock with a run; two prepares (on other roots sharing a prefix) take bundle locks
     # in the same global sorted order, so they can't deadlock with each other either.
-    home = home or Path(pwd.getpwuid(os.getuid()).pw_dir)
     with _held_lock(root / "locks" / PREPARE_LOCK, deadline, wait_s,
                     "another `blastbox macos prepare` is running on this root"):
         existing = _existing_slots(root)
@@ -485,10 +492,25 @@ def prepare(
             # SIGKILL that run's child and wipe its Data mid-job.
             ids = {bid for i in existing for bid in previous.get(i, set())}
             ids.update(f"{prefix}.slot{i}" for i in indexes)
+            _check_root_outside_containers(root, home, ids)
             with _all_bundle_locks(home, ids, wait_s, deadline=deadline):
                 _sweep_previous_slots(root, existing, prefix, home, previous=previous)
                 return _prepare_locked(root, slots=slots, resolved_ro=resolved_ro,
                                        prefix=prefix, cc=cc, codesign=codesign, runner=runner)
+
+
+def _check_root_outside_containers(root: Path, home: Path, ids: Iterable[str]) -> None:
+    """Refuse a root that is, sits inside, or holds the container of any of ``ids``.
+
+    A slot's container (``~/Library/Containers/<id>``) is swept and wiped before and after
+    every run: a root inside one would have its manifest, launchers and locks deleted by the
+    first pre-run wipe; a root holding one would put the child's container -- and its grant --
+    inside the tree prepare stages and signs."""
+    for bid in sorted(set(ids)):
+        container = (home / "Library" / "Containers" / bid).resolve()
+        if mc.paths_overlap(root, container):
+            raise SandboxError(f"appsandbox root {root} overlaps the slot container "
+                               f"{container}; use a root outside ~/Library/Containers/{bid}")
 
 
 def _previous_bundle_ids(root: Path, indexes: Iterable[int]) -> dict[int, set[str]]:
@@ -797,6 +819,39 @@ def _slot_wait(value: float | None) -> float:
     return wait
 
 
+class _CopyBack:
+    """A copy-back built beside its destination and not yet swapped in (see
+    ``AppSandboxSandbox._copy_back``). ``commit`` swaps it in; ``abort`` removes it. Either
+    way it is dropped from ``leftovers`` once it is gone."""
+
+    def __init__(self, dest: Path, new: Path, old: Path | None,
+                 leftovers: mc.Leftovers | None) -> None:
+        self._dest, self._new, self._old, self._leftovers = dest, new, old, leftovers
+
+    def commit(self) -> None:
+        try:
+            if self._old is not None:
+                AppSandboxSandbox._swap_children(self._dest, self._new, self._old)
+            else:
+                try:
+                    os.replace(self._new, self._dest)
+                except BaseException:
+                    mc.remove_tree(self._new)
+                    raise
+        finally:
+            self._forget()
+
+    def abort(self) -> None:
+        try:
+            mc.remove_tree(self._new)
+        finally:
+            self._forget()
+
+    def _forget(self) -> None:
+        if self._leftovers is not None and not os.path.lexists(self._new):
+            self._leftovers.discard(self._new)
+
+
 class AppSandboxSandbox:
     """:class:`~blastbox.worker.sandbox.base.Sandbox` backed by signed App Sandbox launchers."""
 
@@ -825,6 +880,14 @@ class AppSandboxSandbox:
         self._popen = popen
         self._rss_fn = rss_fn
         self._home = home or Path(pwd.getpwuid(os.getuid()).pw_dir)
+        # A manifest written before the check existed (or by hand) may still put the root in a
+        # slot's container, which the first pre-run wipe would delete: refuse to start on it.
+        try:
+            _check_root_outside_containers(self._root.resolve(), self._home,
+                                           (s.bundle_id for s in self._manifest.slots))
+        except SandboxError as exc:
+            raise SandboxUnavailable(f"{exc}; re-run `blastbox macos prepare` with another "
+                                     "--root") from None
         self._slot_wait_s = _slot_wait(slot_wait_s)
         if mc.IS_DARWIN and not mc.process_apis_available():
             # Without them a run's escaped processes can't be found, so a slot can't be proven
@@ -1032,6 +1095,18 @@ class AppSandboxSandbox:
                 if mc.paths_overlap(rp, area.resolve()):
                     raise SandboxError(f"appsandbox: {what} {p} overlaps {area}, where runs are "
                                        "staged; use a path outside it")
+        # A writable mount is staged by copy and copied back over the host tree, and the copier
+        # skips FIFOs, sockets and device nodes (opening a FIFO could block the worker): one
+        # already in a writable mount would be missing from the copy and so DELETED from the
+        # host by the copy-back. Refused up front instead. (Ones the child creates are dropped,
+        # as before: they were never the host's.) Read-only mounts aren't copied back.
+        for m in request.rw_mounts:
+            special = mc.find_special_entry(Path(m.source).expanduser().resolve())
+            if special is not None:
+                raise SandboxError(f"appsandbox: rw mount {m.source} holds {special}, a FIFO, "
+                                   "socket or device node, which App Sandbox staging can't "
+                                   "carry; its copy-back would delete it. Mount a directory "
+                                   "without it")
 
     def _run_in_slot(self, slot: Slot, exe: Path, request: SandboxRequest,
                      leftovers: mc.Leftovers | None = None) -> tuple[SandboxResult, bool]:
@@ -1074,6 +1149,11 @@ class AppSandboxSandbox:
             # outermost source; the first listed among equal ones
             rw_root[j] = min(owners, key=lambda k: (len(rw_srcs[k].parts), k))
         staged_rw: dict[int, Path] = {}
+        # ONE hard-link map for every writable mount: a file linked into two of them is one
+        # inode on the host, and as with bind mounts a write through one name must show through
+        # the other (and its bytes count once). Read-only copies each get their own, so a write
+        # through a writable copy can never reach a read-only one.
+        rw_links: mc.LinkMap = {}
         mounts = list(enumerate([*request.ro_mounts, *request.rw_mounts]))
         n_ro = len(request.ro_mounts)
         # roots before the aliases that point into them, whatever order the request used
@@ -1088,7 +1168,8 @@ class AppSandboxSandbox:
                 base = slot.ro_dir if j < 0 else io
                 staged = base / "m" / str(i) / (src.name or "root")
                 staged.parent.mkdir(parents=True)
-                mc.copy_no_follow(src, staged, budget=staging)
+                mc.copy_no_follow(src, staged, budget=staging,
+                                  links=rw_links if j >= 0 else None)
                 if j >= 0:
                     staged_rw[j] = staged
                     rw_staged.append((src, staged, stat.S_ISDIR(os.lstat(src).st_mode)))
@@ -1121,9 +1202,21 @@ class AppSandboxSandbox:
                                "failed, not credited")
 
         copy_back = mc.CopyBudget(budget)
-        # Only outermost writable sources were staged, so these never overlap.
-        for src, staged, was_dir in rw_staged:
-            self._copy_back(staged, src, copy_back, was_dir, leftovers)
+        # Only outermost writable sources were staged, so these never overlap. Every
+        # replacement is built first (sharing one link map, so links between the mounts stay
+        # links on the host) and only then swapped in: a later mount's link must reach an
+        # earlier one's copy before that copy has been renamed into place.
+        back_links: mc.LinkMap = {}
+        pending: list[_CopyBack] = []
+        try:
+            for src, staged, was_dir in rw_staged:
+                pending.append(self._build_copy_back(staged, src, copy_back, was_dir,
+                                                     leftovers, back_links))
+            while pending:
+                pending.pop(0).commit()
+        finally:
+            for left in pending:
+                left.abort()
         ok = result.exit_code == 0 and not result.killed
         if ok and request.capture_home is not None:
             # The child owns its container and may have deleted Data/ or swapped it for a
@@ -1214,7 +1307,8 @@ class AppSandboxSandbox:
 
     @staticmethod
     def _copy_back(staged: Path, dest: Path, budget: mc.CopyBudget, was_dir: bool,
-                   leftovers: mc.Leftovers | None = None) -> None:
+                   leftovers: mc.Leftovers | None = None,
+                   links: mc.LinkMap | None = None) -> None:
         """Make ``dest`` mirror the staged copy the child left (bind-mount semantics).
 
         The staged ROOT must still be what was mounted -- a real directory for a directory
@@ -1238,6 +1332,15 @@ class AppSandboxSandbox:
 
         The hidden replacement is listed in ``leftovers`` while it exists: it holds the child's
         bytes outside every wiped root, so an agent retiring mid-copy removes it."""
+        AppSandboxSandbox._build_copy_back(staged, dest, budget, was_dir, leftovers,
+                                           links).commit()
+
+    @staticmethod
+    def _build_copy_back(staged: Path, dest: Path, budget: mc.CopyBudget, was_dir: bool,
+                         leftovers: mc.Leftovers | None = None,
+                         links: mc.LinkMap | None = None) -> _CopyBack:
+        """The checks and the copy of :meth:`_copy_back`; the swap is the returned
+        :class:`_CopyBack`'s ``commit`` (or ``abort`` to drop the copy)."""
         try:
             st = os.lstat(staged)
         except FileNotFoundError as exc:
@@ -1248,6 +1351,7 @@ class AppSandboxSandbox:
             raise SandboxError(
                 f"appsandbox: rw mount {dest} was replaced inside the sandbox (expected a "
                 f"{'directory' if was_dir else 'regular file'}); not copied back")
+        old: Path | None
         if was_dir:
             if not stat.S_ISDIR(os.lstat(dest).st_mode):
                 raise SandboxError(f"appsandbox: rw mount {dest} is no longer a directory")
@@ -1258,34 +1362,22 @@ class AppSandboxSandbox:
             tag = secrets.token_hex(8)
             new = dest / f".blastbox-copyback-{tag}"
             old = dest / f".blastbox-copyback-old-{tag}"
-            if leftovers is not None:
-                leftovers.add(new)
-            try:
-                try:
-                    mc.copy_no_follow(staged, new, budget=budget)
-                except BaseException:
-                    mc.remove_tree(new)
-                    raise
-                AppSandboxSandbox._swap_children(dest, new, old)
-            finally:
-                if leftovers is not None and not os.path.lexists(new):
-                    leftovers.discard(new)
         else:
             locked_target = mc.locked_file_target(dest)
             if locked_target is not None:
                 raise SandboxError(f"appsandbox: rw mount {dest} can't be replaced ({locked_target}); "
                                    "not copied back")
             new = dest.with_name(f".{dest.name}.blastbox-copyback-{secrets.token_hex(8)}")
+            old = None
+        if leftovers is not None:
+            leftovers.add(new)
+        try:
+            mc.copy_no_follow(staged, new, budget=budget, links=links)
+        except BaseException:
+            # The copy holds untrusted bytes outside every wipe and watchdog path, so it never
+            # outlives the attempt.
+            mc.remove_tree(new)
             if leftovers is not None:
-                leftovers.add(new)
-            try:
-                mc.copy_no_follow(staged, new, budget=budget)
-                os.replace(new, dest)
-            except BaseException:
-                # Copy or swap failed: the sibling holds untrusted bytes outside every wipe and
-                # watchdog path, so it never outlives the attempt.
-                mc.remove_tree(new)
-                raise
-            finally:
-                if leftovers is not None and not os.path.lexists(new):
-                    leftovers.discard(new)
+                leftovers.discard(new)
+            raise
+        return _CopyBack(dest, new, old, leftovers)

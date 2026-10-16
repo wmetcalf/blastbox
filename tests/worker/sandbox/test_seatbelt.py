@@ -657,3 +657,33 @@ class TestCreditGoesToTheLedgerTheRunStartedIn:
         before = confined_runs()
         self._sb(tmp_path).run(SandboxRequest(argv=["/bin/echo"]))
         assert confined_runs() == before + 1        # the diagnostic total still sees it
+
+
+class TestSeedAndCaptureStayOutOfTheScratchRoot:
+    """A seed that is or holds the scratch root would reach the run's own scratch while being
+    copied into it; a capture there would swap the scratch root aside. A path inside the root
+    is only the scratch's sibling (the default root is the system temp dir), so it is fine."""
+
+    @staticmethod
+    def _sb(base):
+        return SeatbeltSandbox(popen=lambda argv, **kw: _FakeProc(argv, **kw), platform_ok=True,
+                               sandbox_exec="/bin/sh", scratch_base=base)
+
+    @pytest.mark.parametrize("which", ["seed_home", "capture_home"])
+    @pytest.mark.parametrize("holder", ["equal", "parent"])
+    def test_a_path_that_is_or_holds_the_root_is_refused(self, tmp_path, which, holder):
+        cache = tmp_path / "cache"
+        base = cache / "scratch"
+        base.mkdir(parents=True)
+        path = base if holder == "equal" else cache
+        with pytest.raises(SandboxError, match="contains the scratch root"):
+            self._sb(base).run(SandboxRequest(argv=["/bin/echo", "hi"], **{which: path}))
+        assert list(base.iterdir()) == []               # refused before the scratch existed
+
+    def test_a_seed_beside_the_scratch_is_fine(self, tmp_path):
+        base = tmp_path / "scratch"
+        seed = base / "seed"
+        (seed / "Library" / "Caches").mkdir(parents=True)
+        (seed / "Library" / "Caches" / "k").write_text("v")
+        r = self._sb(base).run(SandboxRequest(argv=["/bin/echo", "hi"], seed_home=seed))
+        assert r.exit_code == 0

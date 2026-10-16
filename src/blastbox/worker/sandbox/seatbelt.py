@@ -289,6 +289,18 @@ class SeatbeltSandbox:
             if Path(p) == base or Path(p) in base.parents:
                 raise SandboxError(f"seatbelt: rw mount {p} contains the scratch root {base}; "
                                    "mount a narrower directory")
+        # A seed that is or holds the scratch root would reach the run's own scratch (created
+        # inside it) while being copied into it, copying the growing copy into itself until a
+        # limit stops it; a capture there would swap the scratch root (every run's) aside.
+        # Checked before the scratch exists. A path INSIDE the root is only the scratch's
+        # sibling, which is harmless (the default root is the system temp dir).
+        for what, p_ in (("seed_home", request.seed_home), ("capture_home", request.capture_home)):
+            if p_ is None:
+                continue
+            rp = Path(p_).expanduser().resolve()
+            if rp == base or rp in base.parents:
+                raise SandboxError(f"seatbelt: {what} {p_} contains the scratch root {base}; "
+                                   "use a path outside it")
 
         # This run's own emergency cleanup (the agent retiring mid-run skips every `finally`
         # below), registered before the scratch exists and dropped only after it is removed:

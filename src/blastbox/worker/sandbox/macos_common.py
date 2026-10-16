@@ -1812,6 +1812,36 @@ class CopyBudget:
 LinkMap = dict[tuple[int, int], Path]
 
 
+def find_special_entry(root: Path, *, max_entries: int = MAX_SCRATCH_ENTRIES) -> Path | None:
+    """The first FIFO, socket or device node at or under ``root`` (never following a symlink),
+    or None. :func:`copy_no_follow` skips those, so a WRITABLE mount holding one can't be
+    staged faithfully: its copy-back would delete the host's entry (a live socket's path, say).
+    Stops looking after ``max_entries`` -- a tree that large fails the copy's own entry budget.
+    An unreadable directory raises ``SandboxError`` (the copy could not read it either)."""
+    seen = 0
+    stack = [root]
+    while stack:
+        p = stack.pop()
+        try:
+            mode = os.lstat(p).st_mode
+        except FileNotFoundError:
+            continue
+        if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode) or stat.S_ISLNK(mode)):
+            return p
+        if not stat.S_ISDIR(mode):
+            continue
+        try:
+            with os.scandir(p) as it:
+                for entry in it:
+                    seen += 1
+                    if seen > max_entries:
+                        return None
+                    stack.append(Path(entry.path))
+        except OSError as exc:
+            raise SandboxError(f"cannot read {p}: {exc}") from exc
+    return None
+
+
 def copy_no_follow(src: Path, dst: Path, *, budget_bytes: int | None = None,
                    budget: CopyBudget | None = None, links: LinkMap | None = None) -> int:
     """Copy ``src`` (file or tree) to ``dst`` without ever following a symlink.

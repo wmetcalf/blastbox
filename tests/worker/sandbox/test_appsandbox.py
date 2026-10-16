@@ -1290,7 +1290,7 @@ class TestShutdownCoversTheTeardown:
         out.mkdir()
         seen: dict[str, object] = {}
 
-        def copy_back(staged, dest, budget, was_dir, leftovers=None):
+        def copy_back(staged, dest, budget, was_dir, leftovers=None, links=None):
             half = dest / ".blastbox-copyback-half"
             half.mkdir()
             leftovers.add(half)
@@ -1299,7 +1299,7 @@ class TestShutdownCoversTheTeardown:
             seen["io"] = sorted(os.listdir(slot.io_dir))
             raise SandboxError("interrupted by the retirement")
 
-        monkeypatch.setattr(asb.AppSandboxSandbox, "_copy_back", staticmethod(copy_back))
+        monkeypatch.setattr(asb.AppSandboxSandbox, "_build_copy_back", staticmethod(copy_back))
         registered = len(base._EMERGENCY)
         with pytest.raises(SandboxError, match="interrupted"):
             sb.run(SandboxRequest(argv=["/bin/sh", "-c", 'echo x > "$0/f"', str(out)],
@@ -1598,3 +1598,143 @@ class TestPrepareTakesTheSharedBundleLocks:
                     runner=_fake_runner([]), home=home)
         for i in range(2):
             os.close(self._hold(asb.bundle_lock_path(home, f"io.example.r.slot{i}")))
+
+
+class TestWritableMountsShareHardLinks:
+    """A file hard-linked into two writable mounts is one inode on the host. Staged as bind
+    mounts would be, a write through one name shows through the other, its bytes count once
+    against the staging budget, and the copy-back keeps the two names linked. A read-only copy
+    never shares an inode with a writable one."""
+
+    @staticmethod
+    def _linked(tmp_path):
+        a, b = tmp_path / "a", tmp_path / "b"
+        a.mkdir()
+        b.mkdir()
+        (a / "f").write_bytes(b"x" * 600)
+        os.link(a / "f", b / "g")
+        return a, b
+
+    def test_a_write_through_one_mount_shows_through_the_other(self, tmp_path):
+        sb, _ = _sb_with(tmp_path)
+        a, b = self._linked(tmp_path)
+        r = sb.run(SandboxRequest(argv=["/bin/sh", "-c", 'echo new > "$0/f" && cat "$1/g"',
+                                        str(a), str(b)],
+                                  rw_mounts=[Mount(a, a), Mount(b, b)]))
+        assert r.exit_code == 0, r.stderr
+        assert r.stdout == b"new\n"                         # one inode inside the sandbox
+        assert (b / "g").read_text() == "new\n"
+        assert os.stat(a / "f").st_ino == os.stat(b / "g").st_ino    # still linked on the host
+
+    def test_the_shared_inode_is_charged_once(self, tmp_path):
+        sb, _ = _sb_with(tmp_path)
+        a, b = self._linked(tmp_path)
+        r = sb.run(SandboxRequest(argv=["/usr/bin/true"], rw_mounts=[Mount(a, a), Mount(b, b)],
+                                  limits=Limits(tmpfs_bytes=1000)))     # 600 fits once, not twice
+        assert r.exit_code == 0, r.stderr
+
+    def test_a_read_only_copy_never_shares_the_writable_inode(self, tmp_path):
+        sb, _ = _sb_with(tmp_path)
+        a, c = tmp_path / "a", tmp_path / "c"
+        a.mkdir()
+        c.mkdir()
+        (a / "f").write_text("old\n")
+        os.link(a / "f", c / "h")
+        r = sb.run(SandboxRequest(argv=["/bin/sh", "-c", 'echo new > "$0/f" && cat "$1/h"',
+                                        str(a), str(c)],
+                                  ro_mounts=[Mount(c, c)], rw_mounts=[Mount(a, a)]))
+        assert r.exit_code == 0, r.stderr
+        assert r.stdout == b"old\n"
+
+
+class TestWritableMountsWithSpecialFilesAreRefused:
+    """The copier skips FIFOs, sockets and device nodes, so one already in a writable mount
+    would be missing from the staged copy and deleted from the host by the copy-back."""
+
+    def test_a_fifo_in_a_writable_mount_is_refused_and_kept(self, tmp_path):
+        sb, _ = _sb_with(tmp_path)
+        out = tmp_path / "out"
+        (out / "sub").mkdir(parents=True)
+        os.mkfifo(out / "sub" / "pipe")
+        with pytest.raises(SandboxError, match="FIFO, socket or device node"):
+            sb.run(SandboxRequest(argv=["/usr/bin/true"], rw_mounts=[Mount(out, out)]))
+        assert stat.S_ISFIFO(os.lstat(out / "sub" / "pipe").st_mode)
+        assert list(sb.manifest.slots[0].io_dir.iterdir()) == []      # nothing was staged
+
+    def test_a_socket_in_a_writable_mount_is_refused_and_kept(self, tmp_path):
+        import socket
+        import tempfile
+        sb, _ = _sb_with(tmp_path)
+        # AF_UNIX paths are short (104 bytes on macOS): a socket under pytest's tmp may not fit
+        out = Path(tempfile.mkdtemp(prefix="bbsock", dir="/tmp")).resolve()
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.bind(str(out / "s"))
+            with pytest.raises(SandboxError, match="FIFO, socket or device node"):
+                sb.run(SandboxRequest(argv=["/usr/bin/true"], rw_mounts=[Mount(out, out)]))
+            assert stat.S_ISSOCK(os.lstat(out / "s").st_mode)
+        finally:
+            s.close()
+            shutil.rmtree(out)
+
+    def test_a_fifo_in_a_read_only_mount_is_simply_not_staged(self, tmp_path):
+        sb, _ = _sb_with(tmp_path)
+        src = tmp_path / "src"
+        src.mkdir()
+        os.mkfifo(src / "pipe")
+        r = sb.run(SandboxRequest(argv=["/usr/bin/true"], ro_mounts=[Mount(src, src)]))
+        assert r.exit_code == 0, r.stderr
+
+    def test_a_fifo_the_child_makes_is_dropped_not_refused(self, tmp_path):
+        sb, _ = _sb_with(tmp_path)
+        out = tmp_path / "out"
+        out.mkdir()
+        r = sb.run(SandboxRequest(argv=["/bin/sh", "-c", 'mkfifo "$0/p" && echo x > "$0/f"',
+                                        str(out)], rw_mounts=[Mount(out, out)]))
+        assert r.exit_code == 0, r.stderr
+        assert (out / "f").read_text() == "x\n"
+        assert not os.path.lexists(out / "p")
+
+
+class TestTheRootStaysOutsideTheSlotContainers:
+    """A slot's container is wiped before and after every run: a root inside one would lose its
+    manifest, launchers and locks to the first pre-run wipe; a root holding one would put the
+    child's container in the tree prepare stages."""
+
+    def test_prepare_refuses_a_root_inside_a_slot_container(self, tmp_path):
+        home = tmp_path / "home"
+        root = home / "Library" / "Containers" / "io.example.slot0" / "Data" / "root"
+        with pytest.raises(SandboxError, match="overlaps the slot container"):
+            asb.prepare(root, slots=1, ro_paths=[], bundle_prefix="io.example", home=home,
+                        runner=_fake_runner([]))
+        assert not root.exists()                                     # nothing written
+
+    def test_prepare_refuses_a_root_inside_a_later_slots_container(self, tmp_path):
+        home = tmp_path / "home"
+        root = home / "Library" / "Containers" / "io.example.slot2" / "r"
+        with pytest.raises(SandboxError, match="overlaps the slot container"):
+            asb.prepare(root, slots=3, ro_paths=[], bundle_prefix="io.example", home=home,
+                        runner=_fake_runner([]))
+
+    def test_prepare_refuses_a_root_that_holds_a_slot_container(self, tmp_path):
+        home = tmp_path / "home"
+        with pytest.raises(SandboxError, match="overlaps the slot container"):
+            asb.prepare(home / "Library", slots=1, ro_paths=[], bundle_prefix="io.example",
+                        home=home, runner=_fake_runner([]))
+
+    def test_the_backend_refuses_a_root_inside_a_slot_container(self, tmp_path):
+        # prepared for another user's home (so prepare's own check passes), then loaded by a
+        # worker whose home puts the root inside slot 0's container
+        home = tmp_path / "home"
+        root = home / "Library" / "Containers" / "io.example.slot0" / "Data" / "root"
+        asb.prepare(root, slots=1, ro_paths=[], bundle_prefix="io.example",
+                    home=tmp_path / "other", runner=_fake_runner([]))
+        with pytest.raises(SandboxUnavailable, match="overlaps the slot container"):
+            asb.AppSandboxSandbox(root=root, home=home, platform_ok=True, verify=False)
+
+    def test_a_root_beside_the_containers_is_fine(self, tmp_path):
+        home = tmp_path / "home"
+        root = home / "Library" / "Containers" / "io.other.slot0" / "root"
+        asb.prepare(root, slots=1, ro_paths=[], bundle_prefix="io.example", home=home,
+                    runner=_fake_runner([]))
+        assert (root / asb.MANIFEST_NAME).exists()

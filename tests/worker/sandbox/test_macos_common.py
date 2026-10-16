@@ -1847,3 +1847,92 @@ class TestCaptureListsItsSibling:
         leftovers.add(half)
         leftovers.remove_all()
         assert not half.exists() and leftovers._paths == set()
+
+
+class TestNestedEmergencyCleanupsRunInOrder:
+    """run_confined's family cleanup is registered inside a backend's run-wide one, on the same
+    thread. Run side by side they raced: the inner sweep restores the scratch root each round
+    while the outer cleanup removes it. A family now runs on one thread, innermost first."""
+
+    def test_the_inner_cleanup_finishes_before_the_outer_one_starts(self, tmp_path):
+        from blastbox.worker.sandbox import base
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        order: list[str] = []
+
+        def inner():                     # a late sweep round puts the scratch back
+            time.sleep(0.3)
+            scratch.mkdir(exist_ok=True)
+            order.append("inner")
+
+        def outer():
+            order.append("outer")
+            shutil.rmtree(scratch, ignore_errors=True)
+
+        t_outer = base.register_emergency_cleanup(outer)
+        t_inner = base.register_emergency_cleanup(inner)
+        try:
+            assert base.run_emergency_cleanups(10) == 2
+        finally:
+            base.unregister_emergency_cleanup(t_inner)
+            base.unregister_emergency_cleanup(t_outer)
+        assert order == ["inner", "outer"]
+        assert not scratch.exists()      # nothing recreated it after the outer cleanup
+
+    def test_unrelated_runs_still_clean_up_in_parallel(self):
+        from blastbox.worker.sandbox import base
+        both = threading.Barrier(2, timeout=5)
+        tokens: list[int] = []
+        hold = threading.Event()
+        registered = threading.Barrier(3, timeout=5)
+
+        def run_on_its_own_thread():
+            tokens.append(base.register_emergency_cleanup(both.wait))
+            registered.wait()
+            hold.wait(10)
+
+        threads = [threading.Thread(target=run_on_its_own_thread) for _ in range(2)]
+        for t in threads:
+            t.start()
+        try:
+            registered.wait()
+            # sequential would leave each waiting for the other at the barrier
+            assert base.run_emergency_cleanups(10) == 2
+        finally:
+            hold.set()
+            for t in threads:
+                t.join()
+            for tok in tokens:
+                base.unregister_emergency_cleanup(tok)
+
+    def test_a_cleanup_whose_outer_one_is_gone_runs_on_its_own(self):
+        from blastbox.worker.sandbox import base
+        ran: list[str] = []
+        t_outer = base.register_emergency_cleanup(lambda: ran.append("outer"))
+        t_inner = base.register_emergency_cleanup(lambda: ran.append("inner"))
+        base.unregister_emergency_cleanup(t_outer)
+        try:
+            assert base.run_emergency_cleanups(5) == 1
+        finally:
+            base.unregister_emergency_cleanup(t_inner)
+        assert ran == ["inner"]
+        # and the thread's stack is clean: a new registration is a root again
+        t = base.register_emergency_cleanup(lambda: None)
+        try:
+            assert base._EMERGENCY_PARENT[t] is None
+        finally:
+            base.unregister_emergency_cleanup(t)
+
+
+class TestFindSpecialEntry:
+    def test_finds_a_nested_fifo_and_ignores_regular_trees(self, tmp_path):
+        (tmp_path / "a" / "b").mkdir(parents=True)
+        (tmp_path / "a" / "f").write_text("x")
+        (tmp_path / "a" / "l").symlink_to("/dev/null")       # a link TO a device: not followed
+        assert mc.find_special_entry(tmp_path) is None
+        os.mkfifo(tmp_path / "a" / "b" / "p")
+        assert mc.find_special_entry(tmp_path) == tmp_path / "a" / "b" / "p"
+
+    def test_a_special_root_is_found(self, tmp_path):
+        os.mkfifo(tmp_path / "p")
+        assert mc.find_special_entry(tmp_path / "p") == tmp_path / "p"

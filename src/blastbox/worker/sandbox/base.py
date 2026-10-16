@@ -145,45 +145,94 @@ def confined_runs() -> int:
 # Cleanups for runs in flight, for the agent to call before it hard-exits (see
 # run_emergency_cleanups). Only the macOS backends register: their children run in their own
 # sessions, which a supervisor's process-group kill doesn't reach.
+#
+# Registrations NEST per thread: one made while the same thread holds another (run_confined's
+# family cleanup inside a backend's run-wide one) is that one's child, and a family runs on ONE
+# thread, innermost first, the outer one last. Run side by side they would race -- the inner
+# sweep restores the scratch root each round (to find its writers) while the outer one removes
+# it, so a late inner round could put it back after the outer cleanup was done with it.
 _EMERGENCY: dict[int, Callable[[], object]] = {}
+_EMERGENCY_PARENT: dict[int, int | None] = {}
 _EMERGENCY_LOCK = threading.Lock()
 _EMERGENCY_IDS = itertools.count()
+_EMERGENCY_LOCAL = threading.local()
+
+
+def _emergency_stack() -> list[int]:
+    stack = getattr(_EMERGENCY_LOCAL, "stack", None)
+    if stack is None:
+        stack = _EMERGENCY_LOCAL.stack = []
+    return stack
 
 
 def register_emergency_cleanup(fn: Callable[[], object]) -> int:
     """Register ``fn`` (kill and sweep one run in flight); returns a token for
-    :func:`unregister_emergency_cleanup`."""
+    :func:`unregister_emergency_cleanup`. Nested under the cleanup this thread registered last
+    and still holds, if any (see the note above)."""
+    stack = _emergency_stack()
     with _EMERGENCY_LOCK:
         token = next(_EMERGENCY_IDS)
         _EMERGENCY[token] = fn
-        return token
+        _EMERGENCY_PARENT[token] = stack[-1] if stack else None
+    stack.append(token)
+    return token
 
 
 def unregister_emergency_cleanup(token: int) -> None:
+    stack = _emergency_stack()
+    if token in stack:
+        stack.remove(token)
     with _EMERGENCY_LOCK:
         _EMERGENCY.pop(token, None)
+        _EMERGENCY_PARENT.pop(token, None)
+
+
+def _emergency_families() -> list[list[Callable[[], object]]]:
+    """The registered cleanups grouped by family, each family in run order (innermost first).
+    A cleanup whose parent is already gone heads its own family."""
+    with _EMERGENCY_LOCK:
+        fns = dict(_EMERGENCY)
+        parent = {t: p for t, p in _EMERGENCY_PARENT.items() if t in fns}
+    children: dict[int, list[int]] = {}
+    roots: list[int] = []
+    for t in sorted(fns):
+        p = parent.get(t)
+        if p is not None and p in fns:
+            children.setdefault(p, []).append(t)
+        else:
+            roots.append(t)
+
+    def _order(t: int) -> list[int]:
+        out: list[int] = []
+        for c in reversed(children.get(t, [])):     # later (inner) registrations first
+            out.extend(_order(c))
+        out.append(t)
+        return out
+
+    return [[fns[t] for t in _order(r)] for r in roots]
 
 
 def run_emergency_cleanups(timeout_s: float) -> int:
-    """Run every registered cleanup, each on its own daemon thread (one may hang on whatever
-    hung the run), waiting at most ``timeout_s`` in all. Returns how many completed without
-    raising. With nothing registered (every Linux backend) it returns 0 at once."""
-    with _EMERGENCY_LOCK:
-        fns = list(_EMERGENCY.values())
-    if not fns:
+    """Run every registered cleanup, each family on its own daemon thread (one may hang on
+    whatever hung the run), innermost first within a family, waiting at most ``timeout_s`` in
+    all. Returns how many cleanups completed without raising. With nothing registered (every
+    Linux backend) it returns 0 at once."""
+    families = _emergency_families()
+    if not families:
         return 0
     done: list[bool] = []
 
-    def _one(fn: Callable[[], object]) -> None:
-        try:
-            fn()
-        except Exception as exc:  # noqa: BLE001 -- reported, the others still run
-            _log.error("sandbox: emergency cleanup failed: %s", exc)
-        else:
-            done.append(True)
+    def _family(fns: list[Callable[[], object]]) -> None:
+        for fn in fns:
+            try:
+                fn()
+            except Exception as exc:  # noqa: BLE001 -- reported, the rest still run
+                _log.error("sandbox: emergency cleanup failed: %s", exc)
+            else:
+                done.append(True)
 
-    threads = [threading.Thread(target=_one, args=(fn,), daemon=True, name="bb-emergency")
-               for fn in fns]
+    threads = [threading.Thread(target=_family, args=(fns,), daemon=True, name="bb-emergency")
+               for fns in families]
     for t in threads:
         t.start()
     deadline = time.monotonic() + max(0.0, timeout_s)
