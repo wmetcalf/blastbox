@@ -290,6 +290,14 @@ class SeatbeltSandbox:
             raise SandboxError(f"seatbelt: writable mount file {split} has a hard link whose "
                                "other name is outside the writable mounts; the child could "
                                "change it through this one -- mount a copy instead")
+        # The workers' shared lock and cleanup state (mc.internal_state_dirs): a writable grant
+        # there would let the child release another run's lock or forge a cleanup record, and
+        # a seed or capture there would copy, or replace, files other runs hold.
+        mc.check_clear_of_state(
+            [*(("rw mount", Path(p)) for p in rw),
+             *((what, Path(p_)) for what, p_ in (("seed_home", request.seed_home),
+                                                  ("capture_home", request.capture_home))
+               if p_ is not None)], "seatbelt")
         # A writable mount that holds the scratch root would grant the child every concurrent
         # run's scratch (and the sweep's restore point for its own): mount something narrower.
         base = (self._scratch_base or Path(tempfile.gettempdir())).resolve()

@@ -27,6 +27,7 @@ import ctypes.util
 import json
 import logging
 import os
+import pwd
 import resource
 import shutil
 import signal
@@ -192,6 +193,7 @@ def capture_scratch(scratch: Path, dest: Path | None, budget_bytes: int,
     if dest.is_symlink():
         dest = dest.resolve()       # the operator's cache path; swap the directory it names
     dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    clear_recorded_siblings(dest)   # what an earlier capture's interrupted swap left beside it
     new = dest.parent / f".{dest.name}.capture-{os.urandom(6).hex()}"
     if leftovers is not None:
         leftovers.add(new)
@@ -203,7 +205,7 @@ def capture_scratch(scratch: Path, dest: Path | None, budget_bytes: int,
             if child.name == "tmp":
                 continue
             copy_no_follow(child, new / child.name, budget=budget, links=links)
-        swap_into_place(new, dest)
+        swap_into_place(new, dest, leftovers)
     except BaseException:
         remove_tree(new)
         raise
@@ -227,7 +229,7 @@ def _renamex_np() -> Callable[[bytes, bytes, int], int] | None:
     return fn
 
 
-def swap_into_place(new: Path, dest: Path) -> None:
+def swap_into_place(new: Path, dest: Path, leftovers: Leftovers | None = None) -> None:
     """Make the complete directory ``new`` become ``dest``; the old ``dest`` is removed after.
 
     ``renamex_np(RENAME_SWAP)`` exchanges the two in one step (APFS/HFS+), so ``dest`` is never
@@ -237,10 +239,10 @@ def swap_into_place(new: Path, dest: Path) -> None:
     A teardown section (see :func:`teardown_critical`): a retiring agent waits for it rather
     than exit between the two renames, which would leave ``dest`` missing."""
     with teardown_critical():
-        _swap_into_place(new, dest)
+        _swap_into_place(new, dest, leftovers)
 
 
-def _swap_into_place(new: Path, dest: Path) -> None:
+def _swap_into_place(new: Path, dest: Path, leftovers: Leftovers | None = None) -> None:
     if not os.path.lexists(dest):
         os.rename(new, dest)
         return
@@ -254,14 +256,18 @@ def _swap_into_place(new: Path, dest: Path) -> None:
         err = ctypes.get_errno()
         if err not in (errno.ENOTSUP, errno.EINVAL, errno.ENOSYS):
             raise OSError(err, f"renamex_np(RENAME_SWAP) {new} -> {dest}: {os.strerror(err)}")
-    old = dest.parent / f".{dest.name}.old-{os.urandom(6).hex()}"
+    tag = os.urandom(6).hex()
+    old = dest.parent / f".{dest.name}.old-{tag}"
     os.rename(dest, old)
     try:
         os.rename(new, dest)
     except BaseException:
         os.rename(old, dest)
         raise
-    remove_tree(old)
+    # Both renames done: `old` is now only the previous capture. Recorded and renamed `done-`,
+    # listed in `leftovers` until removed (a retiring agent finishes it), and a later capture
+    # of this destination removes it if this worker dies first (clear_recorded_siblings).
+    retire_replaced(old, dest.parent / f".{dest.name}{_COPY_BACK_DONE}{tag}", leftovers)
 
 
 def remove_tree(path: Path) -> None:
@@ -1776,7 +1782,126 @@ _CLONEFILE = _clonefile_fn()
 _AT_FDCWD = -2          # Darwin's value; the destination is passed as an absolute path
 
 
-def _copy_regular_fd(fd: int, dst: Path, mode: int) -> None:
+# Extended attributes (incl. a resource fork, com.apple.ResourceFork). A clone carries them; a
+# byte copy and a fresh directory don't, and a copy-back from such a copy would strip the host's
+# entries even after a no-op run. So they are copied explicitly, from the pinned source fd, onto
+# the new path without following a link, and charged (name + value) to the copy budget. NOT
+# copied: ``com.apple.system.*`` -- the ACL and other kernel-managed state, which a copy never
+# carries (the clone path strips the ACL too) -- and Linux's equivalents (``system.*`` POSIX
+# ACLs, ``security.*``, ``trusted.*``), so the copier behaves the same where its tests run.
+# Python's os.*xattr is Linux-only; on Darwin libc's f*xattr is called directly.
+_XATTR_NOFOLLOW = 0x0001
+_XATTR_SKIP_PREFIXES = ("com.apple.system.", "system.", "security.", "trusted.")
+
+
+def _darwin_xattr() -> "ctypes.CDLL | None":
+    if not IS_DARWIN:
+        return None
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.dylib", use_errno=True)
+        libc.flistxattr.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_int]
+        libc.flistxattr.restype = ctypes.c_ssize_t
+        libc.fgetxattr.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p,
+                                   ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int]
+        libc.fgetxattr.restype = ctypes.c_ssize_t
+        libc.setxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p,
+                                  ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int]
+        libc.setxattr.restype = ctypes.c_int
+    except (OSError, AttributeError):
+        return None
+    return libc
+
+
+_XATTR_LIB = _darwin_xattr()
+_NO_XATTRS = (errno.ENOTSUP, getattr(errno, "EOPNOTSUPP", errno.ENOTSUP))
+
+
+def _xattr_names(fd: int) -> list[bytes]:
+    """The extended attribute names on the open file ``fd``; [] where unsupported."""
+    if _XATTR_LIB is not None:
+        for _ in range(4):
+            n = _XATTR_LIB.flistxattr(fd, None, 0, 0)
+            if n < 0:
+                err = ctypes.get_errno()
+                if err in _NO_XATTRS:
+                    return []
+                raise OSError(err, os.strerror(err))
+            if n == 0:
+                return []
+            buf = ctypes.create_string_buffer(n)
+            got = _XATTR_LIB.flistxattr(fd, buf, n, 0)
+            if got >= 0:
+                return [x for x in buf.raw[:got].split(b"\0") if x]
+            if ctypes.get_errno() != errno.ERANGE:      # grew in between: size it again
+                err = ctypes.get_errno()
+                raise OSError(err, os.strerror(err))
+        raise OSError(errno.ERANGE, "extended attribute list kept growing")
+    if hasattr(os, "listxattr"):
+        try:
+            return [os.fsencode(n) for n in os.listxattr(fd)]
+        except OSError as exc:
+            if exc.errno in _NO_XATTRS:
+                return []
+            raise
+    return []
+
+
+def _xattr_get(fd: int, name: bytes) -> bytes:
+    if _XATTR_LIB is not None:
+        for _ in range(4):
+            n = _XATTR_LIB.fgetxattr(fd, name, None, 0, 0, 0)
+            if n < 0:
+                err = ctypes.get_errno()
+                raise OSError(err, os.strerror(err))
+            buf = ctypes.create_string_buffer(max(n, 1))
+            got = _XATTR_LIB.fgetxattr(fd, name, buf, n, 0, 0)
+            if got >= 0:
+                return buf.raw[:got]
+            if ctypes.get_errno() != errno.ERANGE:
+                err = ctypes.get_errno()
+                raise OSError(err, os.strerror(err))
+        raise OSError(errno.ERANGE, "extended attribute kept growing")
+    return os.getxattr(fd, name)
+
+
+def _xattr_set(path: Path, name: bytes, value: bytes) -> None:
+    if _XATTR_LIB is not None:
+        if _XATTR_LIB.setxattr(os.fsencode(path), name, value, len(value), 0,
+                               _XATTR_NOFOLLOW) != 0:
+            err = ctypes.get_errno()
+            raise OSError(err, os.strerror(err))
+        return
+    os.setxattr(path, name, value, follow_symlinks=False)
+
+
+def _copy_xattrs(fd: int, dst: Path, budget: "CopyBudget", at: Path, *, write: bool) -> None:
+    """Charge ``fd``'s extended attributes to ``budget`` and, if ``write``, set them on ``dst``
+    (a clone already has them). One that can't be read or reproduced fails the copy
+    (:class:`SandboxError`) rather than being dropped -- the copy-back would delete it."""
+    try:
+        names = _xattr_names(fd)
+    except OSError as exc:
+        raise SandboxError(f"sandbox copy: cannot list the extended attributes of {at}: "
+                           f"{exc}") from exc
+    for name in names:
+        if os.fsdecode(name).startswith(_XATTR_SKIP_PREFIXES):
+            continue
+        try:
+            value = _xattr_get(fd, name)
+        except OSError as exc:
+            raise SandboxError(f"sandbox copy: cannot read extended attribute "
+                               f"{os.fsdecode(name)} of {at}: {exc}") from exc
+        budget.charge_bytes(len(name) + len(value), at)
+        if write:
+            try:
+                _xattr_set(dst, name, value)
+            except OSError as exc:
+                raise SandboxError(f"sandbox copy: cannot copy extended attribute "
+                                   f"{os.fsdecode(name)} of {at}: {exc}") from exc
+
+
+def _copy_regular_fd(fd: int, dst: Path, mode: int,
+                     budget: "CopyBudget | None" = None, at: Path | None = None) -> None:
     """Copy the open regular file ``fd`` to the new path ``dst``: an APFS clone when possible
     (O(1), copy-on-write), else a byte copy. Either way the copy then gets only the source's
     rwx bits: a clone keeps setuid/setgid, flags and the extended ACL, none of which may survive
@@ -1788,7 +1913,10 @@ def _copy_regular_fd(fd: int, dst: Path, mode: int) -> None:
         with open(dst, "xb") as fout:
             while chunk := os.read(fd, 1024 * 1024):
                 fout.write(chunk)
-    else:
+    if budget is not None:
+        # the clone already carries them (only charged); a byte copy gets them written
+        _copy_xattrs(fd, dst, budget, at or dst, write=not cloned)
+    if cloned:
         # A clone carries the source's flags and extended ACL: a child must not plant an
         # immutable or undeletable (``everyone deny delete``) file in the host tree. A byte copy
         # is a new file and gets neither from the source.
@@ -1818,6 +1946,10 @@ class CopyBudget:
 
     def charge(self, nbytes: int, at: Path) -> None:
         self.entries += 1
+        self.charge_bytes(nbytes, at)
+
+    def charge_bytes(self, nbytes: int, at: Path) -> None:
+        """Bytes with no new entry (an entry's extended attributes)."""
         self.bytes += nbytes
         if self.bytes > self.max_bytes:
             raise SandboxError(f"sandbox copy exceeds budget of {self.max_bytes} bytes at {at}")
@@ -1866,6 +1998,156 @@ def find_special_entry(root: Path, *, max_entries: int = MAX_SCRATCH_ENTRIES) ->
 COPY_BACK_MARK = ".blastbox-copyback-"
 _COPY_BACK_DONE = COPY_BACK_MARK + "done-"
 
+#: Where a ``done-`` tree is recorded while it is removed (per user; tests point it elsewhere).
+#: A name alone proves nothing -- the mount's owner, or a sandboxed child, can create an entry
+#: called ``.blastbox-copyback-done-x`` as real output -- so cleanup deletes only a ``done-``
+#: entry whose (directory, name, device, inode) this worker recorded before renaming it there.
+DONE_RECORD_DIR: Path | None = None
+
+
+def _done_record_dir() -> Path:
+    d = DONE_RECORD_DIR or shared_state_dir() / "copyback-done"
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return d
+
+
+def shared_state_dir(home: Path | None = None) -> Path:
+    """The per-user directory of the native backends' shared state: App Sandbox bundle locks,
+    the writable-source claim registry, copy-back cleanup records. Every worker of this user
+    and every root relies on it, so no run may mount, seed from or capture over it."""
+    return (home or Path(pwd.getpwuid(os.getuid()).pw_dir)) / "Library" / "Caches" / "blastbox"
+
+
+def internal_state_dirs(home: Path | None = None) -> list[Path]:
+    """Every directory holding state a run must never reach (see :func:`shared_state_dir`):
+    a child with a writable grant there could release another run's lock or forge a cleanup
+    record (and so get a later worker to delete an entry it chose), and a copy-back or capture
+    over it would replace lock files still held by inode."""
+    dirs = [shared_state_dir(home), _done_record_dir()]
+    return [d for i, d in enumerate(dirs) if d not in dirs[:i]]
+
+
+def check_clear_of_state(paths: Iterable[tuple[str, Path]], backend: str,
+                         home: Path | None = None) -> None:
+    """Raise ``SandboxError`` if any ``(what, path)`` is, holds, or sits inside one of the
+    :func:`internal_state_dirs` (compared resolved)."""
+    protected = [d.resolve() for d in internal_state_dirs(home)]
+    for what, p in paths:
+        rp = Path(p).expanduser().resolve()
+        for area in protected:
+            if paths_overlap(rp, area):
+                raise SandboxError(f"{backend}: {what} {p} overlaps {area}, the workers' shared "
+                                   "lock and cleanup state; use a path outside it")
+
+
+def _fsync_dir(d: Path) -> None:
+    fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _read_done_records(parent: Path) -> list[tuple[Path, dict]]:
+    """(record file, record) for each done-record whose directory is ``parent`` (resolved)."""
+    want = os.path.realpath(parent)
+    out: list[tuple[Path, dict]] = []
+    d = _done_record_dir()
+    with os.scandir(d) as it:
+        for e in it:
+            if not e.name.endswith(".json"):
+                continue
+            try:
+                with open(os.open(e.path, os.O_RDONLY | os.O_NOFOLLOW), encoding="utf-8") as fh:
+                    rec = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            if isinstance(rec, dict) and rec.get("parent") == want:
+                out.append((Path(e.path), rec))
+    return out
+
+
+def retire_replaced(old: Path, done: Path, leftovers: "Leftovers | None") -> None:
+    """Rename ``old`` (replaced contents, every rename of its swap done) to ``done`` and remove
+    it, recording it first so a later worker can tell it apart from a user's own entry of that
+    name if this one dies or retires mid-removal (:func:`clear_stale_copy_backs`,
+    :func:`clear_recorded_siblings`). Listed in ``leftovers`` meanwhile; the record is dropped
+    once it is gone. Raises ``SandboxError`` if it can't be removed (the record then stays)."""
+    st = os.lstat(old)
+    rec = {"parent": os.path.realpath(done.parent), "name": done.name, "from": old.name,
+           "dev": st.st_dev, "ino": st.st_ino}
+    d = _done_record_dir()
+    rec_path = d / f"{os.urandom(8).hex()}.json"
+    fd = os.open(rec_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, json.dumps(rec).encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _fsync_dir(d)       # on disk before the rename that makes the name mean "garbage"
+    try:
+        os.rename(old, done)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(rec_path)
+        raise
+    if leftovers is not None:
+        leftovers.add(done)
+    remove_tree(done)
+    if os.path.lexists(done):
+        raise SandboxError(f"could not remove the replaced contents ({done})")
+    if leftovers is not None:
+        leftovers.discard(done)
+    with contextlib.suppress(OSError):
+        os.unlink(rec_path)
+
+
+def _remove_recorded(path: Path, records: list[tuple[Path, dict]]) -> bool:
+    """Remove ``path`` if a record names it (same name, device and inode); True if it's gone."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return True
+    for rec_path, rec in records:
+        if (rec.get("name") == path.name and rec.get("dev") == st.st_dev
+                and rec.get("ino") == st.st_ino):
+            remove_tree(path)
+            if os.path.lexists(path):
+                return False
+            with contextlib.suppress(OSError):
+                os.unlink(rec_path)
+            return True
+    return False
+
+
+def _prune_records(parent: Path, records: list[tuple[Path, dict]]) -> None:
+    """Drop records whose entry is gone under both names (removed by an emergency cleanup, say).
+    Only for ``parent``, which the caller holds: a record of a swap still in flight elsewhere
+    names an entry that exists under its ``from`` name."""
+    for rec_path, rec in records:
+        names = [rec.get("name"), rec.get("from")]
+        if not any(isinstance(n, str) and os.path.lexists(parent / n) for n in names):
+            with contextlib.suppress(OSError):
+                os.unlink(rec_path)
+
+
+def clear_recorded_siblings(dest: Path) -> None:
+    """Before a capture replaces ``dest``: remove the recorded ``done-`` siblings an interrupted
+    capture swap left beside it. Unrecorded entries are someone else's and are left alone (a
+    capture never stages its destination's siblings)."""
+    parent = dest.parent
+    if not parent.is_dir():
+        return
+    records = _read_done_records(parent)
+    if not records:
+        return
+    prefix = f".{dest.name}{_COPY_BACK_DONE}"
+    with os.scandir(parent) as it:
+        found = [Path(e.path) for e in it if e.name.startswith(prefix)]
+    for p in found:
+        _remove_recorded(p, records)
+    _prune_records(parent, _read_done_records(parent))
+
 
 def clear_stale_copy_backs(source: Path, *,
                            max_entries: int = MAX_SCRATCH_ENTRIES) -> Path | None:
@@ -1874,9 +2156,11 @@ def clear_stale_copy_backs(source: Path, *,
 
     A worker that exits mid-copy-back (killed, or past its shutdown budget) leaves hidden entries
     in the host tree, which a later run would stage -- an earlier run's bytes in a new job. A
-    ``done-`` tree is the replaced contents after every rename finished: removed here. Any other
-    (the replacement, or the host's own entries moved aside mid-swap) can't be told apart from
-    data the operator needs back, so it is returned for the caller to refuse the mount over.
+    ``done-`` tree is the replaced contents after every rename finished, and is removed here --
+    but only one this worker RECORDED (:func:`retire_replaced`): the same name, device and inode.
+    A ``done-`` name alone is not proof (the owner or a child may have made it), so an
+    unrecorded one is returned like any other leftover (the replacement, or the host's own
+    entries moved aside mid-swap) for the caller to refuse the mount over.
     Never follows a symlink; an unreadable directory, or more than ``max_entries`` entries,
     raises ``SandboxError`` (what can't be read can't be shown clean)."""
     candidates: list[Path] = []
@@ -1902,12 +2186,16 @@ def clear_stale_copy_backs(source: Path, *,
                             stack.append(Path(entry.path))
             except OSError as exc:
                 raise SandboxError(f"cannot read {p}: {exc}") from exc
+    records: dict[Path, list[tuple[Path, dict]]] = {}
     for c in sorted(candidates):
         if c.name.startswith(_COPY_BACK_DONE):
-            remove_tree(c)
-            if not os.path.lexists(c):
+            if c.parent not in records:
+                records[c.parent] = _read_done_records(c.parent)
+            if _remove_recorded(c, records[c.parent]):
                 continue
         return c
+    if stat.S_ISDIR(os.lstat(source).st_mode):
+        _prune_records(source, _read_done_records(source))
     return None
 
 
@@ -2021,6 +2309,7 @@ def copy_no_follow(src: Path, dst: Path, *, budget_bytes: int | None = None,
             fd = _open_checked(name, dir_fd, st, os.O_RDONLY | os.O_DIRECTORY, s)
             try:
                 d.mkdir(mode=0o700)
+                _copy_xattrs(fd, d, budget, s, write=True)
                 with os.scandir(fd) as it:
                     for entry in it:
                         _one(entry.name, fd, s / entry.name, d / entry.name)
@@ -2045,7 +2334,7 @@ def copy_no_follow(src: Path, dst: Path, *, budget_bytes: int | None = None,
             # (and the fstat check then refuses it).
             fd = _open_checked(name, dir_fd, st, os.O_RDONLY | os.O_NONBLOCK, s)
             try:
-                _copy_regular_fd(fd, d, mode)
+                _copy_regular_fd(fd, d, mode, budget, s)
             finally:
                 os.close(fd)
             if key is not None:

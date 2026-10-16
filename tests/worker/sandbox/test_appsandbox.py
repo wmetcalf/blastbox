@@ -1827,7 +1827,8 @@ class TestInterruptedCopyBacksAreNeverStaged:
     """Codex P1 (#198): a worker that exits mid-copy-back leaves hidden entries in the host tree,
     which a later run would stage into its job. The swap renames the replaced contents to a
     `done-` tree (and lists it for the emergency cleanup) once every rename is done; before
-    staging, a `done-` tree is removed and any other leftover refuses the mount."""
+    staging, a RECORDED `done-` tree is removed and any other leftover -- an unrecorded `done-`
+    name included -- refuses the mount."""
 
     def test_the_replaced_contents_are_listed_for_cleanup_until_removed(self, tmp_path,
                                                                         monkeypatch):
@@ -1853,13 +1854,14 @@ class TestInterruptedCopyBacksAreNeverStaged:
         assert sorted(p.name for p in dest.iterdir()) == ["new-file"]
         assert leftovers._paths == set()
 
-    def test_a_done_tree_is_removed_before_staging(self, tmp_path):
+    def test_an_unrecorded_done_name_is_refused_not_removed(self, tmp_path):
+        # a done- NAME alone proves nothing (Codex #198): only a recorded tree is removed
         src = tmp_path / "data"
         done = src / "sub" / f"{mc.COPY_BACK_MARK}done-abcd"
         done.mkdir(parents=True)
         (done / "earlier-run").write_text("x")
-        assert mc.clear_stale_copy_backs(src) is None
-        assert not done.exists()
+        assert mc.clear_stale_copy_backs(src) == done
+        assert (done / "earlier-run").exists()
 
     @pytest.mark.parametrize("name", [f"{mc.COPY_BACK_MARK}old-abcd", f"{mc.COPY_BACK_MARK}abcd"])
     def test_an_ambiguous_leftover_is_returned_not_removed(self, tmp_path, name):
@@ -1881,3 +1883,56 @@ class TestInterruptedCopyBacksAreNeverStaged:
         (src / "sub").mkdir(parents=True)
         (src / "sub" / "f").write_text("x")
         assert mc.clear_stale_copy_backs(src) is None
+
+
+class TestSharedStateIsNeverMounted:
+    """Codex P1 (#198): the workers' shared locks, writable-source claims and cleanup records
+    live in one per-user directory. A mount (or seed, or capture) holding it would let a copy-back
+    replace lock files other runs hold by inode -- refused before any claim is made."""
+
+    @pytest.mark.parametrize("which", ["state dir", "lock dir", "holds it", "records"])
+    def test_refused_before_a_claim(self, tmp_path, monkeypatch, which):
+        sb, home = _sb_with(tmp_path)
+        state = mc.shared_state_dir(home)
+        locks = asb.bundle_lock_path(home, "io.x").parent
+        src = {"state dir": state, "lock dir": locks, "holds it": home,
+               "records": mc.internal_state_dirs(home)[-1]}[which]
+        src.mkdir(parents=True, exist_ok=True)
+        claimed: list[object] = []
+        real = asb.hold_rw_sources
+        monkeypatch.setattr(asb, "hold_rw_sources", lambda h, s: claimed.append(s) or real(h, s))
+        with pytest.raises(SandboxError, match="shared lock and cleanup state"):
+            sb.run(SandboxRequest(argv=["/bin/echo"], rw_mounts=[Mount(src, src)]))
+        assert claimed == []
+
+    def test_a_capture_over_the_state_is_refused(self, tmp_path):
+        sb, home = _sb_with(tmp_path)
+        with pytest.raises(SandboxError, match="shared lock and cleanup state"):
+            sb.run(SandboxRequest(argv=["/bin/echo"],
+                                  capture_home=mc.shared_state_dir(home) / "cache"))
+
+
+class TestCapturesAreClaimed:
+    """Codex P2 (#198): a capture replaces its destination as a whole tree, like a copy-back.
+    It is claimed with the writable mounts, so it can't race another run over that tree."""
+
+    def test_a_capture_is_refused_while_another_run_holds_the_tree(self, tmp_path):
+        sb, home = _sb_with(tmp_path)
+        data = tmp_path / "data"
+        data.mkdir()
+        with asb.hold_rw_sources(home, [data.resolve()]):
+            with pytest.raises(SandboxError, match="in use by another run"):
+                sb.run(SandboxRequest(argv=["/bin/echo"], capture_home=data / "cache"))
+
+    def test_a_running_capture_blocks_a_writable_mount_of_the_tree(self, tmp_path, monkeypatch):
+        sb, home = _sb_with(tmp_path)
+        cache = tmp_path / "cache"
+        seen: list[list] = []
+        real = asb.hold_rw_sources
+        monkeypatch.setattr(asb, "hold_rw_sources", lambda h, s: seen.append(list(s)) or real(h, s))
+        try:        # (the fake child makes no container to capture; only the claim matters)
+            sb.run(SandboxRequest(argv=["/bin/echo"], capture_home=cache))
+        except SandboxError:
+            pass
+        assert seen and cache.resolve() in seen[-1]
+

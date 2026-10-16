@@ -646,13 +646,13 @@ def _all_slot_locks(root: Path, indexes: Iterable[int], wait_s: float, *,
 
 def bundle_lock_path(home: Path, bundle_id: str) -> Path:
     """Per-user lock for ``bundle_id`` (and so its container), shared by every root."""
-    d = home / "Library" / "Caches" / "blastbox" / "appsandbox-locks"
+    d = mc.shared_state_dir(home) / "appsandbox-locks"
     d.mkdir(parents=True, exist_ok=True, mode=0o700)
     return d / f"{bundle_id}.lock"
 
 
 def _rw_registry_dir(home: Path) -> Path:
-    d = home / "Library" / "Caches" / "blastbox" / "appsandbox-rw-sources"
+    d = mc.shared_state_dir(home) / "appsandbox-rw-sources"
     d.mkdir(parents=True, exist_ok=True, mode=0o700)
     return d
 
@@ -1121,7 +1121,12 @@ class AppSandboxSandbox:
         self._check_exec_allowed(exe_real)
         self._check_sources_clear(request)
         rw_sources = [Path(m.source).expanduser().resolve() for m in request.rw_mounts]
-        with hold_rw_sources(self._home, rw_sources), self._acquire_slot() as slot:
+        # A capture replaces its destination as a whole tree, as a copy-back does: claimed with
+        # the writable mounts, so it can't race another run's copy-back (or capture) of an
+        # overlapping tree -- whichever committed last would silently discard the other's.
+        claimed = [*rw_sources, *([request.capture_home.expanduser().resolve()]
+                                  if request.capture_home is not None else [])]
+        with hold_rw_sources(self._home, claimed), self._acquire_slot() as slot:
             # Under the claim, so no live run's copy-back is in flight in these trees: what an
             # interrupted one left is either removed or refused, never staged into this job.
             for src in rw_sources:
@@ -1175,6 +1180,10 @@ class AppSandboxSandbox:
         paths = [*(("mount", Path(m.source)) for m in (*request.ro_mounts, *request.rw_mounts)),
                  *(("seed_home", p) for p in [request.seed_home] if p is not None),
                  *(("capture_home", p) for p in [request.capture_home] if p is not None)]
+        # The workers' shared locks, claim registry and cleanup records (mc.internal_state_dirs):
+        # a copy-back or capture over them would replace lock files other runs hold by inode.
+        # Checked before any claim is made.
+        mc.check_clear_of_state(paths, "appsandbox", self._home)
         for what, p in paths:
             rp = p.expanduser().resolve()
             for area in protected:
@@ -1403,17 +1412,14 @@ class AppSandboxSandbox:
         # while removing it) is removed before staging, never staged into a job -- and listed
         # in `leftovers` meanwhile, so a retiring agent's cleanup finishes the removal. (Not
         # before now: while the renames run, `old` holds the host's own entries.)
+        # Recorded (directory, name, inode) before the rename, so a later worker removes only
+        # THIS tree and refuses a user's own entry that merely has the name (mc.retire_replaced).
         done = old.with_name(old.name.replace(f"{mc.COPY_BACK_MARK}old-",
                                               f"{mc.COPY_BACK_MARK}done-", 1))
-        os.rename(old, done)
-        if leftovers is not None:
-            leftovers.add(done)
-        mc.remove_tree(done)
-        if os.path.lexists(done):
-            raise SandboxError(f"appsandbox: copy-back of {dest} could not remove the replaced "
-                               f"contents ({done})")
-        if leftovers is not None:
-            leftovers.discard(done)
+        try:
+            mc.retire_replaced(old, done, leftovers)
+        except SandboxError as exc:
+            raise SandboxError(f"appsandbox: copy-back of {dest}: {exc}") from exc
 
     @staticmethod
     def _copy_back(staged: Path, dest: Path, budget: mc.CopyBudget, was_dir: bool,

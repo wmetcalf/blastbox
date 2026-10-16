@@ -2094,3 +2094,195 @@ class TestCopierNeverFollowsASwappedSource:
         mc.copy_no_follow(src, dst, budget_bytes=1 << 20)
         assert (dst / "a" / "b" / "f").read_text() == "data"
         assert os.readlink(dst / "l") == "a/b/f"
+
+
+class TestOnlyRecordedDoneTreesAreRemoved:
+    """Codex P2 (#198): a `.blastbox-copyback-done-*` NAME proves nothing -- the owner or a child
+    may have made it. Cleanup removes only a tree this worker recorded (directory, name, device,
+    inode) before renaming it; anything else is refused, not deleted."""
+
+    @staticmethod
+    def _interrupted(tmp_path, monkeypatch, src):
+        # a copy-back whose final removal of the replaced contents was cut short
+        old = src / f"{mc.COPY_BACK_MARK}old-abcd"
+        old.mkdir(parents=True)
+        (old / "earlier-run").write_text("x")
+        done = src / f"{mc.COPY_BACK_MARK}done-abcd"
+        monkeypatch.setattr(mc, "remove_tree", lambda p: None)
+        with pytest.raises(SandboxError, match="could not remove"):
+            mc.retire_replaced(old, done, None)
+        monkeypatch.undo()
+        return done
+
+    def test_a_recorded_done_tree_is_removed_before_staging(self, tmp_path, monkeypatch):
+        records = mc.DONE_RECORD_DIR
+        src = tmp_path / "data"
+        done = self._interrupted(tmp_path, monkeypatch, src)
+        monkeypatch.setattr(mc, "DONE_RECORD_DIR", records)
+        assert done.exists() and list(records.iterdir())
+        assert mc.clear_stale_copy_backs(src) is None
+        assert not done.exists()
+        assert list(records.iterdir()) == []                # record dropped with it
+
+    def test_a_done_name_with_another_inode_is_refused(self, tmp_path, monkeypatch):
+        records = mc.DONE_RECORD_DIR
+        src = tmp_path / "data"
+        done = self._interrupted(tmp_path, monkeypatch, src)
+        monkeypatch.setattr(mc, "DONE_RECORD_DIR", records)
+        mc.remove_tree(done)
+        done.mkdir()                                        # the user's own, same name
+        (done / "keep").write_text("mine")
+        assert mc.clear_stale_copy_backs(src) == done
+        assert (done / "keep").read_text() == "mine"
+
+    def test_a_record_in_another_directory_does_not_count(self, tmp_path, monkeypatch):
+        records = mc.DONE_RECORD_DIR
+        self._interrupted(tmp_path, monkeypatch, tmp_path / "a")
+        monkeypatch.setattr(mc, "DONE_RECORD_DIR", records)
+        other = tmp_path / "b" / f"{mc.COPY_BACK_MARK}done-abcd"
+        other.mkdir(parents=True)
+        assert mc.clear_stale_copy_backs(tmp_path / "b") == other
+        assert other.exists()
+
+    def test_a_completed_retire_leaves_no_record(self, tmp_path):
+        old = tmp_path / "d" / f"{mc.COPY_BACK_MARK}old-x"
+        old.mkdir(parents=True)
+        mc.retire_replaced(old, old.with_name(f"{mc.COPY_BACK_MARK}done-x"), None)
+        assert list((tmp_path / "d").iterdir()) == []
+        assert list(mc.DONE_RECORD_DIR.iterdir()) == []
+
+    def test_a_record_whose_tree_is_gone_is_pruned(self, tmp_path, monkeypatch):
+        records = mc.DONE_RECORD_DIR
+        src = tmp_path / "data"
+        done = self._interrupted(tmp_path, monkeypatch, src)
+        monkeypatch.setattr(mc, "DONE_RECORD_DIR", records)
+        mc.remove_tree(done)                                # an emergency cleanup finished it
+        assert mc.clear_stale_copy_backs(src) is None
+        assert list(records.iterdir()) == []
+
+
+class TestCaptureFallbackSwapRecordsTheOldTree:
+    """Codex P2 (#198): where RENAME_SWAP is unsupported, the capture swap renames the previous
+    capture aside. It is now renamed `done-` with a record, listed in `leftovers` while removed,
+    and a later capture of the same destination removes it if the worker died first."""
+
+    @staticmethod
+    def _scratch(tmp_path, text):
+        scratch = tmp_path / f"scratch-{text}"
+        (scratch / "Library").mkdir(parents=True)
+        (scratch / "Library" / "f").write_text(text)
+        return scratch
+
+    def test_the_old_capture_is_listed_while_removed(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mc, "_renamex_np", lambda: None)
+        dest = tmp_path / "cache"
+        mc.capture_scratch(self._scratch(tmp_path, "one"), dest, 1 << 20)
+        leftovers = mc.Leftovers()
+        seen: list[set] = []
+        real = mc.remove_tree
+        monkeypatch.setattr(mc, "remove_tree",
+                            lambda p: (seen.append(set(leftovers._paths)), real(p))[1])
+        mc.capture_scratch(self._scratch(tmp_path, "two"), dest, 1 << 20, leftovers)
+        assert any(any("done-" in q.name for q in paths) for paths in seen)
+        assert (dest / "Library" / "f").read_text() == "two"
+        assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith(".cache")) == []
+        assert leftovers._paths == set()
+
+    def test_an_interrupted_removal_is_finished_by_the_next_capture(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mc, "_renamex_np", lambda: None)
+        dest = tmp_path / "cache"
+        mc.capture_scratch(self._scratch(tmp_path, "one"), dest, 1 << 20)
+        real = mc.remove_tree
+        monkeypatch.setattr(mc, "remove_tree",
+                            lambda p: None if "done-" in p.name else real(p))
+        with pytest.raises(SandboxError, match="could not remove"):
+            mc.capture_scratch(self._scratch(tmp_path, "two"), dest, 1 << 20)
+        left = [p for p in tmp_path.iterdir() if "done-" in p.name]
+        assert len(left) == 1
+        monkeypatch.setattr(mc, "remove_tree", real)
+        mc.capture_scratch(self._scratch(tmp_path, "three"), dest, 1 << 20)
+        assert not left[0].exists()
+        assert (dest / "Library" / "f").read_text() == "three"
+
+    def test_an_unrecorded_sibling_is_left_alone(self, tmp_path):
+        dest = tmp_path / "cache"
+        mine = tmp_path / f".cache{mc.COPY_BACK_MARK}done-user"
+        mine.mkdir()
+        mc.capture_scratch(self._scratch(tmp_path, "one"), dest, 1 << 20)
+        assert mine.exists()
+
+
+def _xattr_name() -> bytes:
+    return b"com.example.blastbox-test" if sys.platform == "darwin" else b"user.blastbox-test"
+
+
+def _xattrs_supported(path) -> bool:
+    try:
+        mc._xattr_set(path, _xattr_name(), b"probe")
+    except OSError:
+        return False
+    return True
+
+
+def _xattr_of(path) -> bytes:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        return mc._xattr_get(fd, _xattr_name())
+    finally:
+        os.close(fd)
+
+
+class TestByteCopyKeepsExtendedAttributes:
+    """Codex P2 (#198): where a clone isn't possible (another volume, a non-APFS filesystem) the
+    byte copy dropped extended attributes, so a copy-back stripped them from the host even after
+    a no-op run. They are copied from the pinned fd, charged to the budget, and one that can't
+    be reproduced fails the copy instead of vanishing."""
+
+    @pytest.fixture
+    def tree(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mc, "_CLONEFILE", None)         # force the byte copy
+        src = tmp_path / "src"
+        (src / "sub").mkdir(parents=True)
+        (src / "sub" / "f").write_text("data")
+        if not _xattrs_supported(src / "sub" / "f"):
+            pytest.skip("this filesystem has no user extended attributes")
+        mc._xattr_set(src / "sub" / "f", _xattr_name(), b"file-value")
+        mc._xattr_set(src / "sub", _xattr_name(), b"dir-value")
+        return src
+
+    def test_files_and_directories_keep_them(self, tmp_path, tree):
+        dst = tmp_path / "dst"
+        mc.copy_no_follow(tree, dst, budget_bytes=1 << 20)
+        assert _xattr_of(dst / "sub" / "f") == b"file-value"
+        assert _xattr_of(dst / "sub") == b"dir-value"
+
+    def test_they_are_charged_to_the_budget(self, tmp_path, tree):
+        budget = mc.CopyBudget(1 << 20)
+        mc.copy_no_follow(tree, tmp_path / "dst", budget=budget)
+        assert budget.bytes >= 4 + 2 * len(_xattr_name()) + len(b"file-value") + len(b"dir-value")
+        small = 4 + len(_xattr_name()) + len(b"dir-value")   # the data and the dir's, not the file's
+        with pytest.raises(SandboxError, match="budget"):
+            mc.copy_no_follow(tree, tmp_path / "dst2", budget_bytes=small)
+
+    def test_one_that_cannot_be_set_fails_the_copy(self, tmp_path, tree, monkeypatch):
+        def refuse(path, name, value):
+            raise OSError(1, "Operation not permitted")
+        monkeypatch.setattr(mc, "_xattr_set", refuse)
+        with pytest.raises(SandboxError, match="cannot copy extended attribute"):
+            mc.copy_no_follow(tree, tmp_path / "dst", budget_bytes=1 << 20)
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="macOS resource forks")
+    def test_a_resource_fork_survives(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mc, "_CLONEFILE", None)
+        f = tmp_path / "src" / "f"
+        f.parent.mkdir()
+        f.write_text("data")
+        fork = os.urandom(70_000)
+        mc._xattr_set(f, b"com.apple.ResourceFork", fork)
+        mc.copy_no_follow(f.parent, tmp_path / "dst", budget_bytes=1 << 20)
+        fd = os.open(tmp_path / "dst" / "f", os.O_RDONLY)
+        try:
+            assert mc._xattr_get(fd, b"com.apple.ResourceFork") == fork
+        finally:
+            os.close(fd)
+

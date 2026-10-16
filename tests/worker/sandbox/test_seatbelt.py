@@ -724,3 +724,26 @@ class TestHardLinksOutOfTheWritableMountsAreRefused:
         r = self._sb(calls, tmp_path).run(SandboxRequest(
             argv=["/bin/echo", "hi"], rw_mounts=[Mount(a, a), Mount(b, b)]))
         assert r.stdout == b"out" and len(calls) == 1
+
+
+class TestSeatbeltNeverGrantsTheSharedState:
+    """Codex P1 (#198): a writable grant on the workers' shared state (locks, claims, cleanup
+    records) would let the child release another run's lock or forge a cleanup record."""
+
+    @staticmethod
+    def _sb(tmp_path):
+        return SeatbeltSandbox(popen=lambda argv, **kw: _FakeProc(argv, **kw), platform_ok=True,
+                               sandbox_exec="/bin/sh", scratch_base=tmp_path / "scratch")
+
+    def test_a_writable_mount_of_the_records_is_refused(self, tmp_path):
+        records = mc.internal_state_dirs()[-1]      # the per-test dir (conftest)
+        with pytest.raises(SandboxError, match="shared lock and cleanup state"):
+            self._sb(tmp_path).run(SandboxRequest(argv=["/bin/echo", "hi"],
+                                                  rw_mounts=[Mount(records, records)]))
+
+    def test_a_capture_into_the_records_is_refused(self, tmp_path):
+        records = mc.internal_state_dirs()[-1]
+        with pytest.raises(SandboxError, match="shared lock and cleanup state"):
+            self._sb(tmp_path).run(SandboxRequest(argv=["/bin/echo", "hi"],
+                                                  capture_home=records / "cache"))
+
