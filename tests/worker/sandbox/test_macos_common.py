@@ -1936,3 +1936,61 @@ class TestFindSpecialEntry:
     def test_a_special_root_is_found(self, tmp_path):
         os.mkfifo(tmp_path / "p")
         assert mc.find_special_entry(tmp_path / "p") == tmp_path / "p"
+
+
+class TestFindSplitHardLink:
+    """Every name of a multiply-linked file under the writable mounts must be inside them:
+    one elsewhere would be changed through the writable name (Seatbelt), or cut from the host's
+    file by the copy-back (App Sandbox)."""
+
+    def test_a_group_inside_one_root_is_complete(self, tmp_path):
+        w = tmp_path / "w"
+        (w / "d").mkdir(parents=True)
+        (w / "a").write_text("x")
+        os.link(w / "a", w / "d" / "b")
+        assert mc.find_split_hard_link([w]) is None
+
+    def test_a_group_across_two_roots_is_complete(self, tmp_path):
+        a, b = tmp_path / "a", tmp_path / "b"
+        a.mkdir()
+        b.mkdir()
+        (a / "f").write_text("x")
+        os.link(a / "f", b / "g")
+        assert mc.find_split_hard_link([a, b]) is None
+
+    def test_a_name_outside_the_roots_is_found(self, tmp_path):
+        w = tmp_path / "w"
+        w.mkdir()
+        (tmp_path / "outside").write_text("x")
+        os.link(tmp_path / "outside", w / "inside")
+        assert mc.find_split_hard_link([w]) == w / "inside"
+
+    def test_a_file_mount_is_checked_too(self, tmp_path):
+        (tmp_path / "f").write_text("x")
+        os.link(tmp_path / "f", tmp_path / "g")
+        assert mc.find_split_hard_link([tmp_path / "f"]) == tmp_path / "f"
+        assert mc.find_split_hard_link([tmp_path / "f", tmp_path / "g"]) is None
+
+    def test_a_nested_root_is_walked_once(self, tmp_path):
+        # walked twice, the inner name would count twice and hide the outside one
+        w = tmp_path / "w"
+        (w / "x").mkdir(parents=True)
+        (tmp_path / "outside").write_text("x")
+        os.link(tmp_path / "outside", w / "x" / "f")
+        assert mc.find_split_hard_link([w, w / "x"]) == w / "x" / "f"
+
+    def test_symlinks_are_not_followed(self, tmp_path):
+        w = tmp_path / "w"
+        w.mkdir()
+        (tmp_path / "outside").write_text("x")
+        os.link(tmp_path / "outside", tmp_path / "outside2")
+        (w / "l").symlink_to(tmp_path / "outside")
+        assert mc.find_split_hard_link([w]) is None
+
+    def test_too_many_entries_fail_closed(self, tmp_path):
+        w = tmp_path / "w"
+        w.mkdir()
+        for i in range(5):
+            (w / f"f{i}").write_text("")
+        with pytest.raises(SandboxError, match="can't all be checked"):
+            mc.find_split_hard_link([w], max_entries=3)

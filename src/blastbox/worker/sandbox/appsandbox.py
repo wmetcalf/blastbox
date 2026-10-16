@@ -1107,6 +1107,16 @@ class AppSandboxSandbox:
                                    "socket or device node, which App Sandbox staging can't "
                                    "carry; its copy-back would delete it. Mount a directory "
                                    "without it")
+        # Staging keeps hard links shared WITHIN the writable mounts, but one whose other name is
+        # outside them can't be: the copy-back would replace the mounted name with a new inode
+        # and cut the host's link, even after a no-op run. Refused up front.
+        if request.rw_mounts:
+            split = mc.find_split_hard_link(
+                [Path(m.source).expanduser().resolve() for m in request.rw_mounts])
+            if split is not None:
+                raise SandboxError(f"appsandbox: rw mount file {split} has a hard link whose "
+                                   "other name is outside the writable mounts; its copy-back "
+                                   "would split them -- mount a copy instead")
 
     def _run_in_slot(self, slot: Slot, exe: Path, request: SandboxRequest,
                      leftovers: mc.Leftovers | None = None) -> tuple[SandboxResult, bool]:

@@ -292,7 +292,9 @@ was granted.
 - A failed `warmup()` (where an engine runs its known-positive self-test), or an engine with no
   `warmup()` at all, makes `/healthz` answer 503, so the static pool skips that Mac. A failed
   warmup is retried in the background (30 s, doubling to 5 min, never during a job) and `/healthz`
-  turns 200 once it passes; launchd's `KeepAlive` wouldn't restart a process that is still up. `BLASTBOX_WORKER_AGENT_REQUIRE_WARMUP=0/1` overrides
+  turns 200 once it passes; launchd's `KeepAlive` wouldn't restart a process that is still up. A warmup
+  (first or retry) that never returns retires the agent at the detonation hard deadline
+  (`BLASTBOX_WORKER_AGENT_HARD_TIMEOUT_S`), so launchd restarts it. `BLASTBOX_WORKER_AGENT_REQUIRE_WARMUP=0/1` overrides
   the default (on for macOS, off elsewhere).
 - Each run's limits: an rlimit launcher sets `FSIZE`/`NOFILE`/`CPU`/`CORE` and a per-run
   `NPROC` allowance (no `preexec_fn` in the threaded agent); a watchdog caps the summed RSS of

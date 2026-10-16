@@ -282,6 +282,14 @@ class SeatbeltSandbox:
                     f"seatbelt supports identity mounts only (source == target): {m}"
                 )
         _check_ro_rw_disjoint(ro, rw)
+        # The path check above can't see hard links: a file linked into a writable mount AND
+        # somewhere else (a read-only mount, an input) would let the child edit it through the
+        # writable name. Every name of a multiply-linked file must be inside the writable mounts.
+        split = mc.find_split_hard_link([Path(p) for p in rw])
+        if split is not None:
+            raise SandboxError(f"seatbelt: writable mount file {split} has a hard link whose "
+                               "other name is outside the writable mounts; the child could "
+                               "change it through this one -- mount a copy instead")
         # A writable mount that holds the scratch root would grant the child every concurrent
         # run's scratch (and the sweep's restore point for its own): mount something narrower.
         base = (self._scratch_base or Path(tempfile.gettempdir())).resolve()

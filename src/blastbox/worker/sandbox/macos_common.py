@@ -1842,6 +1842,55 @@ def find_special_entry(root: Path, *, max_entries: int = MAX_SCRATCH_ENTRIES) ->
     return None
 
 
+def find_split_hard_link(roots: Iterable[Path], *,
+                         max_entries: int = MAX_SCRATCH_ENTRIES) -> Path | None:
+    """A regular file under the writable ``roots`` with a hard-link name OUTSIDE them, or None.
+
+    Counts the names of each multiply-linked file (``(st_dev, st_ino)``, never following a
+    symlink) across all the roots; one seen fewer times than its ``st_nlink`` has a name
+    elsewhere. Writable through one name and not the other, that splits the mount contract:
+    under Seatbelt the child edits a file that is read-only (or unmounted) under its other name,
+    and App Sandbox's copy-back replaces the mounted name with a new inode, cutting the host's
+    link. Directories are skipped (their link count is their subdirectories). Nested roots are
+    walked once. Fails closed: a tree over ``max_entries`` names, or an unreadable directory,
+    raises ``SandboxError`` -- what can't be counted can't be shown complete."""
+    names: dict[tuple[int, int], int] = {}
+    nlink: dict[tuple[int, int], tuple[int, Path]] = {}
+    seen = 0
+    stack = list(disjoint_roots(roots))
+    while stack:
+        p = stack.pop()
+        try:
+            st = os.lstat(p)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise SandboxError(f"cannot read {p}: {exc}") from exc
+        if stat.S_ISREG(st.st_mode):
+            if st.st_nlink > 1:
+                key = (st.st_dev, st.st_ino)
+                names[key] = names.get(key, 0) + 1
+                nlink.setdefault(key, (st.st_nlink, p))
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            continue
+        try:
+            with os.scandir(p) as it:
+                for entry in it:
+                    seen += 1
+                    if seen > max_entries:
+                        raise SandboxError(
+                            f"writable mounts hold over {max_entries} entries; their hard links "
+                            "can't all be checked")
+                    stack.append(Path(entry.path))
+        except OSError as exc:
+            raise SandboxError(f"cannot read {p}: {exc}") from exc
+    for key, (count, path) in nlink.items():
+        if names[key] < count:
+            return path
+    return None
+
+
 def copy_no_follow(src: Path, dst: Path, *, budget_bytes: int | None = None,
                    budget: CopyBudget | None = None, links: LinkMap | None = None) -> int:
     """Copy ``src`` (file or tree) to ``dst`` without ever following a symlink.

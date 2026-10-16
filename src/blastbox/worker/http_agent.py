@@ -124,13 +124,13 @@ def _hard_deadline_s(limits: Limits) -> float:
     return float(limits.timeout_s) * 2.0 + 30.0
 
 
-def _on_hard_deadline(hard_s: float) -> None:
+def _on_hard_deadline(hard_s: float, what: str = "detonation") -> None:
     # A hung engine (in-process infinite loop / a child ignoring its own timeout) holds _JOB_LOCK forever:
     # /healthz stays 200 but every /detonate 409s -- a black hole on a reused static/warm box. A Python
     # thread can't be killed and a per-job subprocess would forfeit engine warmth, so RETIRE the whole
     # worker; the supervisor / warm pool replaces the box (its /healthz stops answering -> fail-closed).
-    _log.critical("http_agent: detonation exceeded the %.0fs hard deadline -- retiring the worker (a hung "
-                  "engine can't be killed in-thread); the supervisor/pool will replace it", hard_s)
+    _log.critical("http_agent: %s exceeded the %.0fs hard deadline -- retiring the worker (a hung "
+                  "engine can't be killed in-thread); the supervisor/pool will replace it", what, hard_s)
     with contextlib.suppress(Exception):
         import faulthandler
         faulthandler.dump_traceback()
@@ -585,6 +585,24 @@ def _warmup(engine: Engine, require_warmup: bool, require_confined: bool = False
     return None
 
 
+def _bounded_warmup(engine: Engine, require_warmup: bool,
+                    require_confined: bool = False) -> str | None:
+    """:func:`_warmup` under the same hard deadline as a detonation: a warmup that never returns
+    (a framework call that hangs) would hold the job lock forever -- every /detonate 409s, and
+    /healthz stays at the old warmup error -- while the process looks alive to launchd, so
+    KeepAlive never restarts it. Past the deadline the worker retires (kill + sweep, exit 75)."""
+    hard_s = _hard_deadline_s(Limits.from_env())
+    wd = threading.Timer(hard_s, _on_hard_deadline, args=(hard_s, "warmup")) if hard_s > 0 else None
+    if wd is not None:
+        wd.daemon = True
+        wd.start()
+    try:
+        return _warmup(engine, require_warmup, require_confined)
+    finally:
+        if wd is not None:
+            wd.cancel()
+
+
 WARMUP_RETRY_FIRST_S = 30.0
 WARMUP_RETRY_MAX_S = 300.0
 
@@ -601,8 +619,8 @@ def retry_warmup(engine: Engine, handler: type[_Handler], *,
         delay = first_s
         while handler.warmup_error is not None and not stop.wait(delay):
             with _JOB_LOCK:
-                err = _warmup(engine, require_warmup=True,
-                              require_confined=handler.require_confined)
+                err = _bounded_warmup(engine, require_warmup=True,
+                                      require_confined=handler.require_confined)
             handler.warmup_error = err
             if err is None:
                 _log.info("http_agent: warmup passed on retry; /healthz reports ready")
@@ -678,7 +696,7 @@ def main(argv: list[str] | None = None) -> int:
     require_warmup = _env_flag("BLASTBOX_WORKER_AGENT_REQUIRE_WARMUP", host_platform() == "darwin")
     # Refuse an unsandboxed engine before its warmup parses anything; serve() re-checks.
     require_confined = _guard_unsandboxed_engine(engine)
-    warmup_error = _warmup(engine, require_warmup, require_confined)
+    warmup_error = _bounded_warmup(engine, require_warmup, require_confined)
     port = int(os.environ.get("BLASTBOX_WORKER_AGENT_PORT", "8765"))
     bind = os.environ.get("BLASTBOX_WORKER_AGENT_BIND", "0.0.0.0")
     token = os.environ.get("BLASTBOX_WORKER_AGENT_TOKEN") or None

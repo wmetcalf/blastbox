@@ -744,3 +744,73 @@ def test_no_teardown_section_starts_once_shutdown_has_begun():
         end_shutdown()
     with teardown_critical():
         pass
+
+
+class TestWarmupIsBoundedByTheHardDeadline:
+    """A warmup that never returns would hold the job lock forever -- /detonate 409s and /healthz
+    keeps the old warmup error -- while the process looks alive to launchd (KeepAlive never
+    restarts it). Every warmup, startup and retry, retires the worker at the hard deadline."""
+
+    class _Eng:
+        name = "w"
+        formats = frozenset({"*"})
+
+        def __init__(self, hang_from: int):
+            self.calls = 0
+            self.hang_from = hang_from
+            self.release = threading.Event()
+
+        def warmup(self):
+            self.calls += 1
+            if self.calls >= self.hang_from:
+                self.release.wait(10)
+            raise RuntimeError("self-test failed")
+
+        def detonate(self, input, outdir, limits):
+            raise AssertionError("not reached")
+
+    def test_a_hung_retry_retires_the_worker(self, monkeypatch):
+        import blastbox.worker.http_agent as hag
+        exits: list[int] = []
+        fired = threading.Event()
+        monkeypatch.setattr(hag, "_HARD_EXIT", lambda code: (exits.append(code), fired.set()))
+        monkeypatch.setenv("BLASTBOX_WORKER_AGENT_HARD_TIMEOUT_S", "0.3")
+        eng = self._Eng(hang_from=2)
+        err = hag._bounded_warmup(eng, require_warmup=True)
+        assert err is not None and exits == []          # a failed (not hung) warmup doesn't retire
+        httpd = hag.serve(eng, bind="127.0.0.1", port=0, warmup_error=err)
+        stop = threading.Event()
+        try:
+            t = hag.retry_warmup(eng, httpd.RequestHandlerClass, first_s=0.02, max_s=0.02,
+                                 stop=stop)
+            assert fired.wait(5), "a hung warmup retry never retired the worker"
+            assert exits == [75]
+        finally:
+            stop.set()
+            eng.release.set()
+            t.join(5)
+            httpd.server_close()
+
+    def test_a_hung_startup_warmup_retires_the_worker(self, monkeypatch):
+        import blastbox.worker.http_agent as hag
+        fired = threading.Event()
+        monkeypatch.setattr(hag, "_HARD_EXIT", lambda code: fired.set())
+        monkeypatch.setenv("BLASTBOX_WORKER_AGENT_HARD_TIMEOUT_S", "0.3")
+        eng = self._Eng(hang_from=1)
+        t = threading.Thread(target=hag._bounded_warmup, args=(eng, True), daemon=True)
+        t.start()
+        try:
+            assert fired.wait(5), "a hung startup warmup never retired the worker"
+        finally:
+            eng.release.set()
+            t.join(5)
+
+    def test_a_warmup_that_returns_cancels_the_deadline(self, monkeypatch):
+        import time
+        import blastbox.worker.http_agent as hag
+        exits: list[int] = []
+        monkeypatch.setattr(hag, "_HARD_EXIT", exits.append)
+        monkeypatch.setenv("BLASTBOX_WORKER_AGENT_HARD_TIMEOUT_S", "0.2")
+        hag._bounded_warmup(self._Eng(hang_from=99), True)
+        time.sleep(0.5)
+        assert exits == []

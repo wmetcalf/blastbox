@@ -687,3 +687,40 @@ class TestSeedAndCaptureStayOutOfTheScratchRoot:
         (seed / "Library" / "Caches" / "k").write_text("v")
         r = self._sb(base).run(SandboxRequest(argv=["/bin/echo", "hi"], seed_home=seed))
         assert r.exit_code == 0
+
+
+class TestHardLinksOutOfTheWritableMountsAreRefused:
+    """The ro/rw overlap check compares paths; a hard link aliases a file under another path.
+    A writable name for a file that is also read-only (or unmounted) elsewhere is refused."""
+
+    @staticmethod
+    def _sb(calls, tmp_path):
+        def popen(argv, **kw):
+            p = _FakeProc(argv, **kw)
+            calls.append(p)
+            return p
+        return SeatbeltSandbox(popen=popen, platform_ok=True, sandbox_exec="/bin/sh",
+                               scratch_base=tmp_path / "scratch")
+
+    def test_a_read_only_file_linked_into_a_writable_mount_is_refused(self, tmp_path):
+        ro, rw = tmp_path / "ro", tmp_path / "rw"
+        ro.mkdir()
+        rw.mkdir()
+        (ro / "config").write_text("protected")
+        os.link(ro / "config", rw / "alias")
+        calls: list[_FakeProc] = []
+        with pytest.raises(SandboxError, match="hard link"):
+            self._sb(calls, tmp_path).run(SandboxRequest(
+                argv=["/bin/echo", "hi"], ro_mounts=[Mount(ro, ro)], rw_mounts=[Mount(rw, rw)]))
+        assert calls == []
+
+    def test_links_kept_within_the_writable_mounts_run(self, tmp_path):
+        a, b = tmp_path / "a", tmp_path / "b"
+        a.mkdir()
+        b.mkdir()
+        (a / "f").write_text("x")
+        os.link(a / "f", b / "g")
+        calls: list[_FakeProc] = []
+        r = self._sb(calls, tmp_path).run(SandboxRequest(
+            argv=["/bin/echo", "hi"], rw_mounts=[Mount(a, a), Mount(b, b)]))
+        assert r.stdout == b"out" and len(calls) == 1

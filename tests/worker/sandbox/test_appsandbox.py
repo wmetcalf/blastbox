@@ -1633,18 +1633,20 @@ class TestWritableMountsShareHardLinks:
                                   limits=Limits(tmpfs_bytes=1000)))     # 600 fits once, not twice
         assert r.exit_code == 0, r.stderr
 
-    def test_a_read_only_copy_never_shares_the_writable_inode(self, tmp_path):
+    def test_a_writable_file_linked_into_a_read_only_mount_is_refused(self, tmp_path):
+        # Staged apart they would be two inodes, and the copy-back would cut the host's link;
+        # so the layout is refused before anything is staged (as Seatbelt refuses it too).
         sb, _ = _sb_with(tmp_path)
         a, c = tmp_path / "a", tmp_path / "c"
         a.mkdir()
         c.mkdir()
         (a / "f").write_text("old\n")
         os.link(a / "f", c / "h")
-        r = sb.run(SandboxRequest(argv=["/bin/sh", "-c", 'echo new > "$0/f" && cat "$1/h"',
-                                        str(a), str(c)],
+        with pytest.raises(SandboxError, match="hard link"):
+            sb.run(SandboxRequest(argv=["/bin/sh", "-c", 'echo new > "$0/f"', str(a)],
                                   ro_mounts=[Mount(c, c)], rw_mounts=[Mount(a, a)]))
-        assert r.exit_code == 0, r.stderr
-        assert r.stdout == b"old\n"
+        assert os.stat(a / "f").st_ino == os.stat(c / "h").st_ino
+        assert (c / "h").read_text() == "old\n"
 
 
 class TestWritableMountsWithSpecialFilesAreRefused:
@@ -1738,3 +1740,19 @@ class TestTheRootStaysOutsideTheSlotContainers:
         asb.prepare(root, slots=1, ro_paths=[], bundle_prefix="io.example", home=home,
                     runner=_fake_runner([]))
         assert (root / asb.MANIFEST_NAME).exists()
+
+
+class TestHardLinksOutOfTheWritableMountsAreRefused:
+    """Staging shares links within the writable mounts; a name outside them can't be shared,
+    so the copy-back would replace the mounted name with a new inode and cut the host's link."""
+
+    def test_a_link_to_a_file_outside_the_writable_mounts_is_refused(self, tmp_path):
+        sb, _ = _sb_with(tmp_path)
+        out = tmp_path / "out"
+        out.mkdir()
+        (tmp_path / "elsewhere").write_text("x")
+        os.link(tmp_path / "elsewhere", out / "f")
+        with pytest.raises(SandboxError, match="hard link"):
+            sb.run(SandboxRequest(argv=["/usr/bin/true"], rw_mounts=[Mount(out, out)]))
+        assert os.stat(out / "f").st_ino == os.stat(tmp_path / "elsewhere").st_ino
+        assert list(sb.manifest.slots[0].io_dir.iterdir()) == []      # nothing was staged
