@@ -125,35 +125,51 @@ def seed_scratch(scratch: Path, seed: Path | None, budget_bytes: int | None = No
     staging -- else to a fresh one of ``budget_bytes``."""
     if seed is None:
         return
-    if not seed.is_dir():
-        raise SandboxError(f"seed_home {seed} is not a directory")
     # ONE budget (bytes and entries) for the whole seed, merges included: a seed of many
     # top-level entries must not get the entry cap once per entry.
     if budget is None:
         if budget_bytes is None:
             raise TypeError("seed_scratch needs budget_bytes or budget")
         budget = CopyBudget(budget_bytes)
+    # Pinned once, then walked by descriptor: the path is resolved here and its last component
+    # opened no-follow, and nothing below is looked up by path again -- a symlink re-pointed on
+    # the way to the seed after the backend checked it can't redirect the copy elsewhere.
+    real = Path(os.path.realpath(seed))
+    try:
+        root = os.open(real, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                       | getattr(os, "O_CLOEXEC", 0))
+    except OSError as exc:
+        raise SandboxError(f"seed_home {seed} is not a directory ({exc})") from exc
     links: LinkMap = {}     # one seed is one tree: its hard links stay links across top-level entries
-    for child in seed.iterdir():
-        if child.name == "tmp":
+    try:
+        _seed_from(root, real, scratch, budget, links, top=True)
+    finally:
+        os.close(root)
+
+
+def _seed_from(dir_fd: int, src: Path, dest_dir: Path, budget: CopyBudget, links: LinkMap,
+               *, top: bool) -> None:
+    with os.scandir(dir_fd) as it:
+        names = [e.name for e in it]
+    for name in names:
+        if top and name == "tmp":
             continue
-        dest = scratch / child.name
-        if dest.is_dir() and child.is_dir() and not child.is_symlink():
+        dest = dest_dir / name
+        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        if stat.S_ISDIR(st.st_mode) and dest.is_dir() and not dest.is_symlink():
             # Merge into the dirs make_scratch pre-created (Library/Caches).
-            for sub in child.iterdir():
-                _merge_into(sub, dest / sub.name, budget, links)
+            sub = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                          | getattr(os, "O_CLOEXEC", 0), dir_fd=dir_fd)
+            try:
+                fst = os.fstat(sub)
+                if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino):
+                    raise SandboxError(f"seed_home: {src / name} changed while it was being copied")
+                _seed_from(sub, src / name, dest, budget, links, top=False)
+            finally:
+                os.close(sub)
         else:
             remove_tree(dest)
-            copy_no_follow(child, dest, budget=budget, links=links)
-
-
-def _merge_into(src: Path, dest: Path, budget: CopyBudget, links: LinkMap) -> None:
-    if dest.is_dir() and src.is_dir() and not src.is_symlink():
-        for sub in src.iterdir():
-            _merge_into(sub, dest / sub.name, budget, links)
-        return
-    remove_tree(dest)
-    copy_no_follow(src, dest, budget=budget, links=links)
+            copy_no_follow(src / name, dest, budget=budget, links=links, src_dir_fd=dir_fd)
 
 
 class Leftovers:
@@ -254,7 +270,13 @@ def _swap_into_place(new: Path, dest: Path, leftovers: Leftovers | None = None) 
     swap = _renamex_np()
     if swap is not None:
         if swap(os.fsencode(new), os.fsencode(dest), _RENAME_SWAP) == 0:
-            remove_tree(new)            # now holds the old contents
+            # `new` now holds the previous contents. Retired exactly like the fallback's `old`:
+            # recorded and renamed `done-` before removal, so an entry that can't be deleted
+            # (or a retire cut short) is a recorded sibling a later capture removes -- never an
+            # unrecorded `.capture-*` left to accumulate outside every budget. Fails the capture
+            # if it can't be removed and couldn't be recorded either.
+            retire_replaced(new, dest.parent / f".{dest.name}{_COPY_BACK_DONE}{os.urandom(6).hex()}",
+                            leftovers)
             return
         err = ctypes.get_errno()
         if err not in (errno.ENOTSUP, errno.EINVAL, errno.ENOSYS):
@@ -2364,7 +2386,8 @@ def find_split_hard_link(roots: Iterable[Path], *,
 
 
 def copy_no_follow(src: Path, dst: Path, *, budget_bytes: int | None = None,
-                   budget: CopyBudget | None = None, links: LinkMap | None = None) -> int:
+                   budget: CopyBudget | None = None, links: LinkMap | None = None,
+                   src_dir_fd: int | None = None) -> int:
     """Copy ``src`` (file or tree) to ``dst`` without ever following a symlink.
 
     Regular files and directories are copied with their permission bits; a symlink is recreated
@@ -2381,6 +2404,9 @@ def copy_no_follow(src: Path, dst: Path, *, budget_bytes: int | None = None,
     in a copy-back) and the bytes are charged once -- each name still counts as an entry.
     ``links`` lets several calls that build ONE tree (a seed, a capture) share that map; a
     fresh one per call otherwise, so separate trees (an ro and an rw mount) never share an inode.
+
+    With ``src_dir_fd``, ``src``'s final component is looked up in that pinned directory (its
+    other components are only for messages), so no symlink on the way to it can be followed.
     """
     if budget is None:
         if budget_bytes is None:
@@ -2462,7 +2488,7 @@ def copy_no_follow(src: Path, dst: Path, *, budget_bytes: int | None = None,
             budget.charge(0, s)
             _log.warning("macos sandbox: skipping non-regular file %s (mode %o)", s, mode)
 
-    _one(src, None, src, dst)
+    _one(src if src_dir_fd is None else src.name, src_dir_fd, src, dst)
     return budget.bytes - start
 
 
@@ -2585,7 +2611,10 @@ def hold_path_claims(claims: Iterable[tuple[str, "Path | str"]], backend: str,
     A claim is a file per run listing its paths, flock'd while the run lives: a worker that dies
     drops its lock with its descriptors, and the next run removes the stale file. Claims are
     checked and made under one registry lock, so two runs can't both see the other absent."""
-    mine_list = [(m, Path(p).expanduser().resolve()) for m, p in claims]
+    # Both spellings of each path (path_forms): a path whose resolved form is disjoint from
+    # another run's mount can still be SPELLED through a symlink inside it, which that run
+    # could re-point under this one.
+    mine_list = list(dict.fromkeys((m, f) for m, p in claims for f in path_forms(p)))
     for m, _ in mine_list:
         if m not in CLAIM_MODES:
             raise ValueError(f"unknown claim mode {m!r}")
@@ -2659,20 +2688,81 @@ def check_homes_clear_of_mounts(seed_home: "Path | str | None", capture_home: "P
       cache at teardown, so (part of) a request's input or output source would be swapped for
       the scratch home -- and, for a read-only mount, the child would get to write it after all.
     """
-    rw = [Path(p).expanduser().resolve() for p in rw_sources]
-    ro = [Path(p).expanduser().resolve() for p in ro_sources]
+    rw = [f for p in rw_sources for f in path_forms(p)]
+    ro = [f for p in ro_sources for f in path_forms(p)]
     if seed_home is not None:
-        seed = Path(seed_home).expanduser().resolve()
-        for w in rw:
-            if paths_overlap(seed, w):
-                raise SandboxError(f"{backend}: seed_home {seed_home} overlaps writable mount {w}; "
-                                   "the child could change what later runs are seeded from -- "
-                                   "use disjoint paths")
+        for seed in path_forms(seed_home):
+            for w in rw:
+                if paths_overlap(seed, w):
+                    raise SandboxError(f"{backend}: seed_home {seed_home} overlaps writable mount "
+                                       f"{w}; the child could change what later runs are seeded "
+                                       "from -- use disjoint paths")
+        _refuse_hops_in(seed_home, "seed_home", rw, backend)
     if capture_home is not None:
-        cap = Path(capture_home).expanduser().resolve()
-        for kind, sources in (("read-only", ro), ("writable", rw)):
-            for m in sources:
-                if paths_overlap(cap, m):
-                    raise SandboxError(f"{backend}: capture_home {capture_home} overlaps {kind} "
-                                       f"mount {m}; the capture would replace it with the run's "
-                                       "cache -- use disjoint paths")
+        for cap in path_forms(capture_home):
+            for kind, sources in (("read-only", ro), ("writable", rw)):
+                for m in sources:
+                    if paths_overlap(cap, m):
+                        raise SandboxError(f"{backend}: capture_home {capture_home} overlaps {kind} "
+                                           f"mount {m}; the capture would replace it with the "
+                                           "run's cache -- use disjoint paths")
+        _refuse_hops_in(capture_home, "capture_home", rw, backend)
+
+
+def path_forms(p: "Path | str") -> list[Path]:
+    """``p`` as written (absolute, ``~`` expanded, symlinks NOT resolved) and resolved -- one
+    entry when they agree. Overlap checks compare both: a path whose spelling lies inside a
+    writable mount can resolve somewhere disjoint (through a symlink the child can re-point)."""
+    lexical = Path(os.path.abspath(os.path.expanduser(os.fspath(p))))
+    resolved = lexical.resolve()
+    return [lexical] if lexical == resolved else [lexical, resolved]
+
+
+def symlink_hops(p: "Path | str", *, limit: int = 40) -> list[Path]:
+    """Where each symlink a lookup of ``p`` passes through lives: its directory resolved, plus
+    its own name. Followed the way the kernel does (an absolute target restarts at ``/``, a
+    relative one continues from the link's directory, chains included); a missing component
+    ends the walk. More than ``limit`` links raises, as ELOOP would."""
+    hops: list[Path] = []
+    # NOT abspath: that collapses `link/..` on paper, while the kernel follows `link` first.
+    raw = Path(os.path.expanduser(os.fspath(p)))
+    pending = list((raw if raw.is_absolute() else Path(os.getcwd()) / raw).parts[1:])
+    cur = Path("/")
+    while pending:
+        part = pending.pop(0)
+        if part in ("", "."):
+            continue
+        if part == "..":
+            cur = cur.parent            # `cur` has no symlinks in it, so this is the real parent
+            continue
+        nxt = cur / part
+        try:
+            st = os.lstat(nxt)
+        except OSError:
+            break
+        if not stat.S_ISLNK(st.st_mode):
+            cur = nxt
+            continue
+        if len(hops) >= limit:
+            raise SandboxError(f"{p}: too many levels of symbolic links")
+        hops.append(nxt)
+        target = Path(os.readlink(nxt))
+        if target.is_absolute():
+            cur = Path("/")
+            pending = list(target.parts[1:]) + pending
+        else:
+            pending = list(target.parts) + pending
+    return hops
+
+
+def _refuse_hops_in(home: "Path | str", what: str, writable: list[Path], backend: str) -> None:
+    """Refuse ``home`` if a symlink on its way lives in a writable mount: the child could
+    re-point it (Seatbelt in place, App Sandbox through copy-back), and the next run's
+    unsandboxed copier would then read -- or a capture replace -- whatever host directory the
+    child chose (``~/.ssh``, say)."""
+    for hop in symlink_hops(home):
+        for w in writable:
+            if hop == w or w in hop.parents:
+                raise SandboxError(f"{backend}: {what} {home} goes through the symlink {hop}, "
+                                   f"which is inside writable mount {w}; the child could re-point "
+                                   "it -- use a path with no symlink a run can write")

@@ -24,7 +24,7 @@ import os
 import socket
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from blastbox.contract import (
     Detection,
@@ -34,7 +34,8 @@ from blastbox.contract import (
 from blastbox.contract.nodes import Record
 from blastbox.errors import sanitize_public_error
 from blastbox.limits import Limits
-from blastbox.worker.sandbox.base import not_counted
+from blastbox.worker.engine import DetonationResult
+from blastbox.worker.sandbox.base import not_counted, note_rejected_before_parse
 
 if TYPE_CHECKING:
     from blastbox.worker.engine import Engine
@@ -189,6 +190,44 @@ def run_detonation(
     # Step 1: hash the input
     input_sha256 = _sha256_file(input_path)
 
+    # Step 1b: the engine's input-free precheck. It never sees the input, so a refusal here is
+    # provably reached before anything parsed it -- recorded on the confinement ledger, which
+    # is how an agent with no outer boundary tells it apart from a result an unconfined parse
+    # could have produced (see ConfinementLedger).
+    precheck = getattr(engine, "precheck", None)
+    if callable(precheck):
+        try:
+            reason = precheck(limits)
+        except Exception as exc:  # noqa: BLE001
+            raw_msg = f"engine.precheck() raised: {exc}"
+            logger.error("%s", sanitize_public_error(raw_msg))
+            note_rejected_before_parse()
+            env = _engine_error_envelope(engine=engine, output_dir=output_dir,
+                                         input_sha256=input_sha256, error=raw_msg)
+            return _write_meta(output_dir, env)
+        if reason is not None:
+            note_rejected_before_parse()
+            if isinstance(reason, DetonationResult):
+                # The engine's own refusal envelope (its error codes). Only a refusal: no
+                # artifacts (nothing was produced) and not `ok` (nothing was looked at).
+                if reason.status not in ("rejected", "engine_error") or reason.artifacts:
+                    env = _engine_error_envelope(
+                        engine=engine, output_dir=output_dir, input_sha256=input_sha256,
+                        error="engine.precheck() returned a result that is not a refusal")
+                else:
+                    env = seal_envelope(
+                        engine=engine.name, outdir=output_dir, input_sha256=input_sha256,
+                        detected=reason.detected, declared=[], warnings=reason.warnings,
+                        payload=reason.payload, status=reason.status)
+            else:
+                scrubbed = sanitize_public_error(str(reason))
+                env = seal_envelope(
+                    engine=engine.name, outdir=output_dir, input_sha256=input_sha256,
+                    detected=_synthetic_detection(), declared=[],
+                    warnings=[Warning(code="precheck_rejected", message=scrubbed)],
+                    payload=Record(fields={"error": scrubbed}), status="rejected")
+            return _write_meta(output_dir, env)
+
     # Step 2: optional pre-detection
     detected: Detection | None = None
     if pre_detect and hasattr(engine, "detect"):
@@ -244,13 +283,16 @@ def run_detonation(
         )
 
     # Step 4: write metadata.json
+    return _write_meta(output_dir, env)
+
+
+def _write_meta(output_dir: Path, env: Any) -> int:
     meta_path = output_dir / "metadata.json"
     try:
         meta_path.write_text(env.model_dump_json(by_alias=True), encoding="utf-8")
     except OSError as write_exc:
         logger.critical("failed to write metadata.json: %s", write_exc)
         return 1
-
     return 0
 
 

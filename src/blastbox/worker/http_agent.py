@@ -105,6 +105,11 @@ class _TruncatedBody(Exception):
     """The client sent fewer bytes than Content-Length declared."""
 
 
+class _Unconfined(Exception):
+    """A detonation on a host with no outer boundary made no confined run (and was not refused
+    before the input was handed to the engine)."""
+
+
 class _SlowBody(Exception):
     """The client trickled the request body past the total wall-clock budget while holding the single-
     flight job lock -- one slow uploader must not take the worker out of service (every other job 409s)."""
@@ -321,6 +326,17 @@ class _Handler(BaseHTTPRequestHandler):
             return
         try:
             tar = self._run_job(name, length, params)
+        except _Unconfined:
+            # Refuse the result AND retire: this process may have parsed hostile input with no
+            # boundary around it, so it must not serve another job. Retired while still holding
+            # _JOB_LOCK, so no job starts in between; launchd's KeepAlive starts a fresh agent.
+            _log.critical("http_agent: a detonation finished without a confined run -- refusing "
+                          "its result and retiring this agent (it may have parsed the input "
+                          "in-process)")
+            with contextlib.suppress(OSError):
+                self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "unconfined"})
+            _retire(75)
+            return
         except _TruncatedBody:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "truncated_body"})
             return
@@ -409,18 +425,17 @@ class _Handler(BaseHTTPRequestHandler):
                 finally:
                     if _wd is not None:
                         _wd.cancel()
+            if self.require_confined and ledger.runs == 0 and not ledger.rejected_before_parse:
+                # No outer boundary on this host. A job that made no sandboxed run may have parsed
+                # the input in THIS process -- whatever status it sealed: an engine whose sandbox
+                # call failed can fall back to inspecting the file and return `rejected`, an
+                # in-process parser that raised is sealed `engine_error`. Status says what the
+                # result means, not whether anything parsed the input; the only outcome provably
+                # reached before that is the harness's precheck() refusal (rejected_before_parse).
+                raise _Unconfined
             if rc != 0:
                 # harness could not seal metadata.json -- surface as a job failure, not a silent 200
                 raise RuntimeError(f"harness failed (rc={rc}); metadata.json not sealed")
-            if self.require_confined and ledger.runs == 0:
-                # No outer boundary on this host: an `ok` result produced without a single
-                # sandboxed run means the engine parsed the input in this (unconfined) process.
-                try:
-                    status = json.loads((out_dir / "metadata.json").read_bytes()).get("status")
-                except (OSError, ValueError):
-                    status = None
-                if status == "ok":
-                    raise RuntimeError("engine returned ok without a confined run; refusing the result")
             # tar the sealed output dir (metadata.json + artifacts) into a SPOOLED file (spills to disk
             # past 64MB) rather than a full in-memory BytesIO, and CAP the total so a buggy engine that
             # leaves huge undeclared files in out_dir can't OOM the agent. The host re-enforces its own

@@ -22,10 +22,17 @@ from blastbox.worker.engine import DetonationResult
 from blastbox.worker.sandbox.base import confinement_ledger, not_counted, note_confined_run
 
 
+#: Exit codes the agent retired with in the current test (the real exit is os._exit).
+RETIRED: list[int] = []
+
+
 @pytest.fixture(autouse=True)
 def _darwin(monkeypatch):
     monkeypatch.setattr(ha, "host_platform", lambda: "darwin")
     monkeypatch.delenv("BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE", raising=False)
+    RETIRED.clear()
+    # An unconfined detonation retires the agent; never let a test's os._exit end pytest.
+    monkeypatch.setattr(ha, "_HARD_EXIT", RETIRED.append)
 
 
 class _Engine:
@@ -101,11 +108,15 @@ def test_ok_without_any_confined_run_is_refused():
         _stop(httpd)
 
 
-def test_a_rejection_needs_no_confined_run():
-    # Refusing bad input before spawning anything is fine; only an `ok` needs the proof.
+def test_a_rejection_from_detonate_still_needs_a_confined_run():
+    # Codex P1 (#198): a `rejected` from detonate() proves nothing about whether the input was
+    # parsed in-process (an engine whose sandbox call failed can fall back to inspecting the
+    # file). Only a precheck() refusal -- made before the engine is handed the input -- is
+    # accepted without one (TestUnconfinedOutcomesFailClosed).
     httpd, port = _agent(_Engine(confine=False, status="rejected"))
     try:
-        assert _detonate(port) == 200
+        assert _detonate(port) == 500
+        assert RETIRED == [75]
     finally:
         _stop(httpd)
 
@@ -481,3 +492,93 @@ def test_a_run_on_a_thread_bound_to_the_detonation_is_credit():
         assert _detonate(port) == 200
     finally:
         _stop(httpd)
+
+
+class TestUnconfinedOutcomesFailClosed:
+    """Codex P1 (#198): the macOS confinement gate no longer depends on the sealed status. Any
+    detonation with no confined run is refused AND retires the agent (it may have parsed hostile
+    input in this process) -- except a refusal from the engine's input-free precheck(), which
+    the harness makes before detonate() is ever called."""
+
+    def test_rejected_with_no_confined_run_is_refused_and_retires(self):
+        httpd, port = _agent(_Engine(confine=False, status="rejected"))
+        try:
+            assert _detonate(port) == 500
+            assert RETIRED == [75]
+        finally:
+            _stop(httpd)
+
+    def test_an_engine_error_with_no_confined_run_is_refused_and_retires(self):
+        class Raises(_Engine):
+            def detonate(self, input, outdir, limits):
+                input.read_bytes()              # "parsed" in-process, then blew up
+                raise ValueError("parser crashed")
+        httpd, port = _agent(Raises(confine=False))
+        try:
+            assert _detonate(port) == 500
+            assert RETIRED == [75]
+        finally:
+            _stop(httpd)
+
+    def test_ok_with_no_confined_run_now_retires_too(self):
+        httpd, port = _agent(_Engine(confine=False))
+        try:
+            assert _detonate(port) == 500
+            assert RETIRED == [75]
+        finally:
+            _stop(httpd)
+
+    def test_a_precheck_refusal_is_accepted_without_a_confined_run(self):
+        seen: list[str] = []
+
+        class Prechecked(_Engine):
+            def precheck(self, limits):
+                return "WTQRK_MODE must be default or heavy"
+
+            def detonate(self, input, outdir, limits):
+                seen.append("detonate")
+                return super().detonate(input, outdir, limits)
+        httpd, port = _agent(Prechecked(confine=False))
+        try:
+            assert _detonate(port) == 200
+            assert seen == [] and RETIRED == []
+        finally:
+            _stop(httpd)
+
+    def test_a_precheck_that_raises_is_accepted_without_a_confined_run(self):
+        class Broken(_Engine):
+            def precheck(self, limits):
+                raise RuntimeError("scanner binary missing")
+        httpd, port = _agent(Broken(confine=False))
+        try:
+            assert _detonate(port) == 200       # sealed engine_error, input never handed over
+            assert RETIRED == []
+        finally:
+            _stop(httpd)
+
+    def test_a_precheck_that_passes_does_not_excuse_the_detonation(self):
+        class PassesThenParses(_Engine):
+            def precheck(self, limits):
+                return None
+        httpd, port = _agent(PassesThenParses(confine=False, status="rejected"))
+        try:
+            assert _detonate(port) == 500
+            assert RETIRED == [75]
+        finally:
+            _stop(httpd)
+
+    def test_ok_with_a_confined_run_is_served_and_does_not_retire(self):
+        httpd, port = _agent(_Engine(confine=True))
+        try:
+            assert _detonate(port) == 200
+            assert RETIRED == []
+        finally:
+            _stop(httpd)
+
+    def test_a_rejection_with_a_confined_run_is_served(self):
+        httpd, port = _agent(_Engine(confine=True, status="rejected"))
+        try:
+            assert _detonate(port) == 200
+            assert RETIRED == []
+        finally:
+            _stop(httpd)

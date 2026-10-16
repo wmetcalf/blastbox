@@ -114,6 +114,18 @@ class Engine(Protocol):
     # guards would silently stop calling detect/warmup on exactly those engines.
     #
     # See SupportsDetect and SupportsWarmup -- they are for TYPING.
+    #
+    #   precheck(limits) -> str | DetonationResult | None      (optional, read via hasattr())
+    #
+    # Called by the harness BEFORE the engine is handed the input -- it gets no path and no
+    # bytes -- inside the job's params env. Return a reason string to refuse the job (sealed
+    # ``rejected``; ``detonate()`` is then never called), or a refusal DetonationResult (status
+    # ``rejected``/``engine_error``, no artifacts) to keep the engine's own error payload, or
+    # None to proceed. Raising seals
+    # ``engine_error``, also without calling ``detonate()``. For refusals that don't depend on
+    # the input (a bad per-job parameter, a missing binary): on a host with no outer boundary
+    # (macOS) they are the only results the agent accepts without a confined run, because they
+    # are the only ones provably reached before anything parsed the input.
 
 
 @runtime_checkable

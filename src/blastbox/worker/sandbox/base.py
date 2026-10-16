@@ -53,18 +53,29 @@ class ConfinementLedger:
 
     Fail closed: an engine that makes its sandbox calls on a thread it starts gets no credit
     unless it runs that work in the detonation's context -- :func:`in_this_context` wraps a
-    callable for ``Thread(target=...)`` / ``executor.submit(...)``."""
+    callable for ``Thread(target=...)`` / ``executor.submit(...)``.
 
-    __slots__ = ("_runs", "_open")
+    ``rejected_before_parse`` is the one outcome that needs no credit: the harness refused the
+    job from the engine's ``precheck()`` -- which never receives the input -- so ``detonate()``
+    was never called and nothing parsed it. Only the harness sets it
+    (:func:`note_rejected_before_parse`)."""
+
+    __slots__ = ("_runs", "_open", "_rejected_before_parse")
 
     def __init__(self) -> None:
         self._runs = 0
         self._open = True
+        self._rejected_before_parse = False
 
     @property
     def runs(self) -> int:
         with _CONFINED_LOCK:
             return self._runs
+
+    @property
+    def rejected_before_parse(self) -> bool:
+        with _CONFINED_LOCK:
+            return self._rejected_before_parse
 
     def _credit(self) -> None:
         with _CONFINED_LOCK:
@@ -91,6 +102,17 @@ def confinement_ledger() -> Iterator[ConfinementLedger]:
     finally:
         ledger._close()
         _LEDGER.reset(token)
+
+
+def note_rejected_before_parse() -> None:
+    """Record, on the open ledger, that this job ended before the engine was handed its input.
+    For the harness only: it calls this when ``precheck()`` refuses the job, and then never
+    calls ``detonate()``."""
+    ledger = _LEDGER.get()
+    if ledger is not None:
+        with _CONFINED_LOCK:
+            if ledger._open:
+                ledger._rejected_before_parse = True
 
 
 def current_ledger() -> ConfinementLedger | None:

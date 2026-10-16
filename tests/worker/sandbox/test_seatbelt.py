@@ -887,3 +887,58 @@ class TestReadOnlyMountsStayClear:
         _plain_sb(tmp_path, calls).run(SandboxRequest(argv=["/bin/echo"],
                                                       ro_mounts=[Mount(inp, inp)]))
         assert len(calls) == 1
+
+
+class TestSymlinkedHomesThroughWritableMountsAreRefused:
+    """Codex P1 (#198): a seed (or capture) path compared only resolved could be spelled through
+    a symlink inside a writable mount while resolving somewhere disjoint. The child re-points the
+    link; the next run's unsandboxed copier then reads -- or a capture replaces -- whatever host
+    directory it chose. Both spellings are checked, and so is every symlink on the way."""
+
+    @staticmethod
+    def _sb(tmp_path, calls):
+        def popen(argv, **kw):
+            calls.append(argv)
+            return _FakeProc(argv, **kw)
+        return SeatbeltSandbox(popen=popen, platform_ok=True, sandbox_exec="/bin/sh",
+                               scratch_base=tmp_path / "scratch")
+
+    @staticmethod
+    def _layout(tmp_path):
+        data = tmp_path / "data"                       # the writable mount
+        data.mkdir()
+        elsewhere = tmp_path / "elsewhere"
+        (elsewhere / "seed").mkdir(parents=True)
+        (data / "link").symlink_to(elsewhere)          # a symlink the child can re-point
+        return data, elsewhere
+
+    @pytest.mark.parametrize("home", ["seed_home", "capture_home"])
+    def test_a_path_spelled_through_the_mount_is_refused(self, tmp_path, home):
+        data, _ = self._layout(tmp_path)
+        calls: list = []
+        with pytest.raises(SandboxError, match=f"{home} .* overlaps writable mount"):
+            self._sb(tmp_path, calls).run(SandboxRequest(
+                argv=["/bin/echo", "hi"], rw_mounts=[Mount(data, data)],
+                **{home: data / "link" / "seed"}))
+        assert calls == []
+
+    @pytest.mark.parametrize("home", ["seed_home", "capture_home"])
+    def test_a_symlink_hop_inside_the_mount_is_refused(self, tmp_path, home):
+        # Neither spelling is under the mount, but the lookup passes through data/link.
+        data, _ = self._layout(tmp_path)
+        (tmp_path / "alias").symlink_to(data / "link")
+        calls: list = []
+        with pytest.raises(SandboxError, match=f"{home} .* goes through the symlink"):
+            self._sb(tmp_path, calls).run(SandboxRequest(
+                argv=["/bin/echo", "hi"], rw_mounts=[Mount(data, data)],
+                **{home: tmp_path / "alias" / "seed"}))
+        assert calls == []
+
+    def test_a_symlink_outside_every_writable_mount_is_fine(self, tmp_path):
+        data, elsewhere = self._layout(tmp_path)
+        (tmp_path / "alias").symlink_to(elsewhere)
+        calls: list = []
+        self._sb(tmp_path, calls).run(SandboxRequest(
+            argv=["/bin/echo", "hi"], rw_mounts=[Mount(data, data)],
+            seed_home=tmp_path / "alias" / "seed"))
+        assert calls

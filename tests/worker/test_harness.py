@@ -376,3 +376,75 @@ def test_wait_for_egress_gateway_times_out(monkeypatch) -> None:
         clock=lambda: t["now"],
     )
     assert ok is False
+
+
+class TestPrecheckRunsBeforeTheInputIsHandedOver:
+    """Codex P1 (#198): an engine's optional precheck(limits) gets no input. A refusal there is
+    sealed without calling detonate() and is recorded on the confinement ledger as reached
+    before any parse -- the only outcome a macOS agent accepts without a confined run."""
+
+    class _Engine:
+        name = "pre"
+        formats = frozenset({"*"})
+
+        def __init__(self, precheck):
+            self._precheck = precheck
+            self.detonated = False
+
+        def precheck(self, limits):
+            return self._precheck(limits)
+
+        def detonate(self, input, outdir, limits):
+            self.detonated = True
+            return DetonationResult(payload=Record(fields={}), artifacts=[],
+                                    detected=Detection(label="x", mime="x/y", confidence=1.0,
+                                                       source="t"), status="ok")
+
+    @staticmethod
+    def _run(tmp_path, engine):
+        import json
+        from blastbox.worker.sandbox.base import confinement_ledger
+        inp = tmp_path / "in"
+        inp.write_bytes(b"hostile")
+        out = tmp_path / "out"
+        with confinement_ledger() as ledger:
+            assert run_detonation(engine, input_path=inp, output_dir=out, limits=Limits()) == 0
+        return json.loads((out / "metadata.json").read_text()), ledger
+
+    def test_a_reason_is_sealed_rejected_and_detonate_never_runs(self, tmp_path):
+        eng = self._Engine(lambda limits: "bad mode")
+        meta, ledger = self._run(tmp_path, eng)
+        assert meta["status"] == "rejected" and not eng.detonated
+        assert ledger.rejected_before_parse and ledger.runs == 0
+
+    def test_an_engine_refusal_result_keeps_its_payload(self, tmp_path):
+        res = DetonationResult(payload=Record(fields={"error": "bad_param"}), artifacts=[],
+                               detected=Detection(label="unknown", mime="application/octet-stream",
+                                                  confidence=0.0, source="t"),
+                               status="rejected")
+        eng = self._Engine(lambda limits: res)
+        meta, ledger = self._run(tmp_path, eng)
+        assert meta["status"] == "rejected" and meta["payload"]["fields"]["error"] == "bad_param"
+        assert not eng.detonated and ledger.rejected_before_parse
+
+    def test_a_precheck_result_that_is_not_a_refusal_is_an_engine_error(self, tmp_path):
+        ok = DetonationResult(payload=Record(fields={}), artifacts=[],
+                              detected=Detection(label="x", mime="x/y", confidence=1.0, source="t"),
+                              status="ok")
+        eng = self._Engine(lambda limits: ok)
+        meta, _ = self._run(tmp_path, eng)
+        assert meta["status"] == "engine_error" and not eng.detonated
+
+    def test_a_precheck_that_raises_is_an_engine_error_before_any_parse(self, tmp_path):
+        def boom(limits):
+            raise FileNotFoundError("scanner missing")
+        eng = self._Engine(boom)
+        meta, ledger = self._run(tmp_path, eng)
+        assert meta["status"] == "engine_error" and not eng.detonated
+        assert ledger.rejected_before_parse
+
+    def test_a_passing_precheck_runs_detonate_and_excuses_nothing(self, tmp_path):
+        eng = self._Engine(lambda limits: None)
+        meta, ledger = self._run(tmp_path, eng)
+        assert meta["status"] == "ok" and eng.detonated
+        assert not ledger.rejected_before_parse

@@ -2522,3 +2522,144 @@ class TestCopiesKeepTimestamps:
         mc.copy_no_follow(src, dst, budget_bytes=1 << 20)
         for rel in ["", "a", "a/b", "a/b/f", *(["a/link"] if links else [])]:
             assert os.stat(dst / rel, follow_symlinks=False).st_mtime_ns == old, rel
+
+
+class TestSymlinkHopsAndPathForms:
+    """Codex P1 (#198): the helpers behind the symlinked seed/capture refusal."""
+
+    def test_hops_follow_chains_and_relative_links(self, tmp_path):
+        real = tmp_path / "real"
+        (real / "d").mkdir(parents=True)
+        (tmp_path / "b").symlink_to("real")                  # relative
+        (tmp_path / "a").symlink_to(tmp_path / "b")          # absolute, to another link
+        hops = mc.symlink_hops(tmp_path / "a" / "d")
+        base = tmp_path.resolve()
+        assert base / "a" in hops and base / "b" in hops
+
+    def test_dotdot_after_a_link_is_the_targets_parent(self, tmp_path):
+        (tmp_path / "x" / "y").mkdir(parents=True)
+        (tmp_path / "l").symlink_to(tmp_path / "x" / "y")
+        (tmp_path / "x" / "z").symlink_to(tmp_path)          # reached only via l/..
+        hops = mc.symlink_hops(tmp_path / "l" / ".." / "z")
+        assert tmp_path.resolve() / "x" / "z" in hops
+
+    def test_a_loop_is_refused(self, tmp_path):
+        (tmp_path / "p").symlink_to(tmp_path / "q")
+        (tmp_path / "q").symlink_to(tmp_path / "p")
+        with pytest.raises(SandboxError, match="too many levels"):
+            mc.symlink_hops(tmp_path / "p" / "x")
+
+    def test_path_forms_keeps_both_spellings(self, tmp_path):
+        (tmp_path / "t").mkdir()
+        (tmp_path / "s").symlink_to(tmp_path / "t")
+        from pathlib import Path
+        forms = mc.path_forms(tmp_path / "s")
+        assert Path(os.path.abspath(tmp_path / "s")) in forms
+        assert (tmp_path / "t").resolve() in forms
+
+    def test_a_claim_spelled_through_another_runs_mount_conflicts(self, tmp_path):
+        data = tmp_path / "data"
+        data.mkdir()
+        (tmp_path / "elsewhere").mkdir()
+        (data / "link").symlink_to(tmp_path / "elsewhere")
+        with mc.hold_path_claims([("live", data)], "test"):
+            with pytest.raises(SandboxError):
+                with mc.hold_path_claims([("read", data / "link")], "test"):
+                    pass
+
+
+class TestTheSeedIsCopiedFromAPinnedRoot:
+    """Codex P1 (#198): seed_scratch resolves the seed once, opens it no-follow and walks by
+    descriptor, so the copy reads the directory the backend checked."""
+
+    def test_the_seed_contents_are_copied_and_merged(self, tmp_path):
+        seed = tmp_path / "seed"
+        (seed / "Library" / "Caches").mkdir(parents=True)
+        (seed / "Library" / "Caches" / "c").write_text("cache")
+        (seed / "top").write_text("t")
+        (seed / "tmp").mkdir()
+        (seed / "tmp" / "skip").write_text("no")
+        scratch = mc.make_scratch(tmp_path / "s")
+        mc.seed_scratch(scratch, seed, budget_bytes=1 << 20)
+        assert (scratch / "Library" / "Caches" / "c").read_text() == "cache"
+        assert (scratch / "top").read_text() == "t"
+        assert not (scratch / "tmp" / "skip").exists()
+
+    def test_a_seed_that_is_not_a_directory_is_refused(self, tmp_path):
+        f = tmp_path / "seed"
+        f.write_text("x")
+        with pytest.raises(SandboxError, match="not a directory"):
+            mc.seed_scratch(mc.make_scratch(tmp_path / "s"), f, budget_bytes=1 << 20)
+
+    def test_a_subdirectory_swapped_for_a_symlink_is_not_followed(self, tmp_path, monkeypatch):
+        seed = tmp_path / "seed"
+        (seed / "Library" / "Caches").mkdir(parents=True)
+        secret = tmp_path / "secret"
+        secret.mkdir()
+        (secret / "key").write_text("s3cret")
+        scratch = mc.make_scratch(tmp_path / "s")
+        real_stat = os.stat
+        swapped = []
+
+        def stat_then_swap(name, *a, **kw):
+            st = real_stat(name, *a, **kw)
+            if name == "Library" and not swapped:          # classified a dir; now swap it
+                swapped.append(1)
+                os.rename(seed / "Library", seed / "Library.old")
+                os.symlink(secret, seed / "Library")
+            return st
+        monkeypatch.setattr(mc.os, "stat", stat_then_swap)
+        with pytest.raises((SandboxError, OSError)):
+            mc.seed_scratch(scratch, seed, budget_bytes=1 << 20)
+        assert not any(p.name == "key" for p in scratch.rglob("*"))
+
+
+class TestTheNativeCaptureSwapRetiresTheOldTree:
+    """Codex P2 (#198): after a successful RENAME_SWAP the previous capture is retired through
+    the recorded `done-` path like the fallback's, so an entry that can't be removed is cleaned
+    by the next capture instead of being left as an unrecorded `.capture-*` sibling."""
+
+    @staticmethod
+    def _swap(a: bytes, b: bytes, flags: int) -> int:
+        tmp = a + b".swap"
+        os.rename(a, tmp)
+        os.rename(b, a)
+        os.rename(tmp, b)
+        return 0
+
+    @staticmethod
+    def _scratch(tmp_path, text):
+        scratch = tmp_path / f"scratch-{text}"
+        (scratch / "Library").mkdir(parents=True)
+        (scratch / "Library" / "f").write_text(text)
+        return scratch
+
+    def test_the_old_capture_goes_through_the_recorded_path(self, tmp_path, monkeypatch):
+        _need_done_tags(tmp_path)
+        monkeypatch.setattr(mc, "_renamex_np", lambda: self._swap)
+        dest = tmp_path / "cache"
+        mc.capture_scratch(self._scratch(tmp_path, "one"), dest, 1 << 20)
+        seen: list[str] = []
+        real = mc.remove_tree
+        monkeypatch.setattr(mc, "remove_tree", lambda p: (seen.append(p.name), real(p))[1])
+        mc.capture_scratch(self._scratch(tmp_path, "two"), dest, 1 << 20)
+        assert any("done-" in n for n in seen)
+        assert (dest / "Library" / "f").read_text() == "two"
+        assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".cache")] == []
+
+    def test_an_undeletable_old_capture_is_finished_by_the_next_capture(self, tmp_path,
+                                                                         monkeypatch):
+        _need_done_tags(tmp_path)
+        monkeypatch.setattr(mc, "_renamex_np", lambda: self._swap)
+        dest = tmp_path / "cache"
+        mc.capture_scratch(self._scratch(tmp_path, "one"), dest, 1 << 20)
+        real = mc.remove_tree
+        monkeypatch.setattr(mc, "remove_tree", lambda p: None if "done-" in p.name else real(p))
+        with pytest.raises(SandboxError, match="could not remove"):
+            mc.capture_scratch(self._scratch(tmp_path, "two"), dest, 1 << 20)
+        left = [p for p in tmp_path.iterdir() if p.name.startswith(".cache")]
+        assert len(left) == 1 and "done-" in left[0].name         # recorded, never `.capture-*`
+        monkeypatch.setattr(mc, "remove_tree", real)
+        mc.capture_scratch(self._scratch(tmp_path, "three"), dest, 1 << 20)
+        assert not left[0].exists()
+        assert (dest / "Library" / "f").read_text() == "three"

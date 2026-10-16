@@ -2060,3 +2060,33 @@ class TestCopyBackKeepsTimestamps:
                                          was_dir=True)
         for rel in ["", "a", "a/b", "a/b/f"]:
             assert os.stat(out / rel).st_mtime_ns == old, rel
+
+
+class TestSymlinkedHomesThroughWritableMountsAreRefused:
+    """Codex P1 (#198): the App Sandbox side of the symlinked seed/capture check -- refused
+    before any claim is made or anything is staged."""
+
+    @staticmethod
+    def _layout(tmp_path):
+        data = tmp_path / "data"
+        data.mkdir()
+        elsewhere = tmp_path / "elsewhere"
+        (elsewhere / "seed").mkdir(parents=True)
+        (data / "link").symlink_to(elsewhere)
+        (tmp_path / "alias").symlink_to(data / "link")
+        return data
+
+    @pytest.mark.parametrize("home", ["seed_home", "capture_home"])
+    @pytest.mark.parametrize("spelling", ["through_mount", "hop"])
+    def test_refused_before_any_claim(self, tmp_path, monkeypatch, home, spelling):
+        sb, _ = _sb_with(tmp_path)
+        data = self._layout(tmp_path)
+        claimed: list[object] = []
+        real = asb.hold_rw_sources
+        monkeypatch.setattr(asb, "hold_rw_sources",
+                            lambda h, s, *a: claimed.append(s) or real(h, s, *a))
+        path = {"through_mount": data / "link" / "seed", "hop": tmp_path / "alias" / "seed"}
+        with pytest.raises(SandboxError, match=f"{home} .* (overlaps writable mount|goes through)"):
+            sb.run(SandboxRequest(argv=["/bin/echo"], rw_mounts=[Mount(data, data)],
+                                  **{home: path[spelling]}))
+        assert claimed == []
