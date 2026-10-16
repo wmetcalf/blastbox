@@ -551,3 +551,67 @@ def test_a_run_whose_scratch_cannot_be_removed_is_not_credited(monkeypatch, tmp_
     with pytest.raises(SandboxError, match="could not remove the run's scratch"):
         sb.run(SandboxRequest(argv=["/bin/echo"]))
     assert confined_runs() == before
+
+
+class TestShutdownCoversTheTeardown:
+    """The agent retiring after the child is gone (run_confined's own cleanup dropped) but
+    while the backend still captures and wipes must still remove the scratch and any capture
+    left half-built beside its destination."""
+
+    def test_an_emergency_during_the_capture_removes_scratch_and_leftovers(self, tmp_path,
+                                                                           monkeypatch):
+        from blastbox.worker.sandbox import base
+        seen: dict[str, bool] = {}
+
+        def fake_run_confined(argv, *, cwd, **kw):
+            return SandboxResult(exit_code=0, stdout=b"", stderr=b"", killed=False)
+
+        def capture(scratch, dest, budget, leftovers=None):
+            half = tmp_path / ".cap-half"
+            half.mkdir()
+            leftovers.add(half)
+            assert base.run_emergency_cleanups(5) == 1      # the agent retires here
+            seen["half gone"] = not half.exists()
+            seen["scratch gone"] = not scratch.exists()
+            raise SandboxError("interrupted by the retirement")
+
+        monkeypatch.setattr(mc, "run_confined", fake_run_confined)
+        monkeypatch.setattr(mc, "sweep_writers", lambda path, started_after: 0)
+        monkeypatch.setattr(mc, "capture_scratch", capture)
+        sb = SeatbeltSandbox(popen=lambda argv, **kw: _FakeProc(argv, **kw), platform_ok=True,
+                             sandbox_exec="/bin/sh", scratch_base=tmp_path / "scratch")
+        registered = len(base._EMERGENCY)
+        with pytest.raises(SandboxError):
+            sb.run(SandboxRequest(argv=["/bin/echo", "hi"], capture_home=tmp_path / "cap"))
+        assert seen == {"half gone": True, "scratch gone": True}
+        assert len(base._EMERGENCY) == registered           # dropped once the run is over
+
+    def test_the_cleanup_stays_registered_until_the_scratch_is_removed(self, tmp_path,
+                                                                       monkeypatch):
+        from blastbox.worker.sandbox import base
+        counts: list[int] = []
+        real_wipe = mc.wipe_dir
+
+        def wipe(path):
+            counts.append(len(base._EMERGENCY))
+            real_wipe(path)
+        monkeypatch.setattr(mc, "run_confined", lambda argv, **kw: SandboxResult(
+            exit_code=0, stdout=b"", stderr=b"", killed=False))
+        monkeypatch.setattr(mc, "wipe_dir", wipe)
+        sb = SeatbeltSandbox(popen=lambda argv, **kw: _FakeProc(argv, **kw), platform_ok=True,
+                             sandbox_exec="/bin/sh", scratch_base=tmp_path / "scratch")
+        before = len(base._EMERGENCY)
+        sb.run(SandboxRequest(argv=["/bin/echo", "hi"]))
+        assert counts == [before + 1]                       # the final wipe was still covered
+        assert len(base._EMERGENCY) == before
+
+
+def test_a_writable_mount_holding_the_scratch_root_is_refused(tmp_path):
+    base = tmp_path / "scratch"
+    base.mkdir()
+    sb = SeatbeltSandbox(popen=lambda argv, **kw: _FakeProc(argv, **kw), platform_ok=True,
+                         sandbox_exec="/bin/sh", scratch_base=base)
+    for rw in (tmp_path, base):
+        with pytest.raises(SandboxError, match="contains the scratch root"):
+            sb.run(SandboxRequest(argv=["/bin/echo"], rw_mounts=[Mount(rw, rw)]))
+    assert list(base.iterdir()) == []                       # refused before any scratch

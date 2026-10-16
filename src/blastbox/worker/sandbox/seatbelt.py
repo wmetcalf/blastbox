@@ -40,12 +40,20 @@ import secrets
 import shutil
 import stat
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
 
 from blastbox.errors import SandboxError, SandboxUnavailable
-from blastbox.worker.sandbox.base import SandboxRequest, SandboxResult, note_confined_run
+from blastbox.worker.sandbox.base import (
+    SandboxRequest,
+    SandboxResult,
+    note_confined_run,
+    register_emergency_cleanup,
+    teardown_critical,
+    unregister_emergency_cleanup,
+)
 from blastbox.worker.sandbox import macos_common as mc
 
 _log = logging.getLogger("blastbox.worker.sandbox.seatbelt")
@@ -269,8 +277,49 @@ class SeatbeltSandbox:
                     f"seatbelt supports identity mounts only (source == target): {m}"
                 )
         _check_ro_rw_disjoint(ro, rw)
+        # A writable mount that holds the scratch root would grant the child every concurrent
+        # run's scratch (and the sweep's restore point for its own): mount something narrower.
+        base = (self._scratch_base or Path(tempfile.gettempdir())).resolve()
+        for p in rw:
+            if Path(p) == base or Path(p) in base.parents:
+                raise SandboxError(f"seatbelt: rw mount {p} contains the scratch root {base}; "
+                                   "mount a narrower directory")
 
-        scratch = mc.make_scratch(self._scratch_base)
+        # This run's own emergency cleanup (the agent retiring mid-run skips every `finally`
+        # below), registered before the scratch exists and dropped only after it is removed:
+        # run_confined's covers the child's lifetime, this one the teardown after it -- the
+        # capture, the handshake, the scratch wipe. It sweeps the scratch's writers, removes a
+        # capture left half-built beside its destination, and removes the scratch.
+        leftovers = mc.Leftovers()
+        state: dict[str, Path] = {}
+        sweep_after = time.time() - 1.0
+
+        def _emergency() -> None:
+            scratch_ = state.get("scratch")
+            try:
+                if scratch_ is not None:
+                    mc.sweep_writers(scratch_, started_after=sweep_after)
+            finally:
+                try:
+                    leftovers.remove_all()
+                finally:
+                    if scratch_ is not None:
+                        mc.wipe_dir(scratch_)
+                        os.rmdir(scratch_)
+
+        token = register_emergency_cleanup(_emergency)
+        try:
+            # a section, so a shutdown signal on this thread can't fall between the two lines
+            with teardown_critical():
+                scratch = mc.make_scratch(self._scratch_base)
+                state["scratch"] = scratch
+            return self._run_in_scratch(request, exe, exe_real, ro, rw, scratch, leftovers)
+        finally:
+            unregister_emergency_cleanup(token)
+
+    def _run_in_scratch(self, request: SandboxRequest, exe: Path, exe_real: Path,
+                        ro: list[str], rw: list[str], scratch: Path,
+                        leftovers: mc.Leftovers) -> SandboxResult:
         # What the run's scratch IS: a sweep that finds it removed or replaced puts an empty
         # directory back at the path (to find the run's processes), which must never be taken
         # for the run's own scratch -- not captured, not read for the handshake.
@@ -314,7 +363,8 @@ class SeatbeltSandbox:
                 raise SandboxError(f"seatbelt: refusing to capture {scratch}: the run removed "
                                    "or replaced its scratch dir")
             if ok:
-                mc.capture_scratch(scratch, request.capture_home, request.limits.tmpfs_bytes)
+                mc.capture_scratch(scratch, request.capture_home, request.limits.tmpfs_bytes,
+                                   leftovers)
             # Counted only for a run that reached the profile AND completed, and only after the
             # scratch removal below succeeded: an engine that falls back to an in-process parse
             # after a failed, killed or uncleanable sandboxed run must not pass it off as confined.

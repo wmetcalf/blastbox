@@ -41,7 +41,7 @@ from pathlib import Path
 from blastbox.errors import SandboxError
 from blastbox.limits import Limits
 from blastbox.worker.sandbox.base import (
-    SandboxResult, register_emergency_cleanup, unregister_emergency_cleanup,
+    SandboxResult, register_emergency_cleanup, teardown_critical, unregister_emergency_cleanup,
 )
 
 _log = logging.getLogger("blastbox.worker.sandbox.macos")
@@ -152,21 +152,51 @@ def _merge_into(src: Path, dest: Path, budget: CopyBudget, links: LinkMap) -> No
     copy_no_follow(src, dest, budget=budget, links=links)
 
 
-def capture_scratch(scratch: Path, dest: Path | None, budget_bytes: int) -> None:
+class Leftovers:
+    """Paths a run is building OUTSIDE its wiped roots -- a capture's or a copy-back's hidden
+    sibling of the destination. Each is listed while it exists, so a backend's emergency
+    cleanup (the agent retiring mid-teardown) can remove what an interrupted step left."""
+
+    def __init__(self) -> None:
+        self._paths: set[Path] = set()
+        self._lock = threading.Lock()
+
+    def add(self, path: Path) -> None:
+        with self._lock:
+            self._paths.add(path)
+
+    def discard(self, path: Path) -> None:
+        with self._lock:
+            self._paths.discard(path)
+
+    def remove_all(self) -> None:
+        with self._lock:
+            paths = list(self._paths)
+        for path in paths:
+            remove_tree(path)
+            if not os.path.lexists(path):
+                self.discard(path)
+
+
+def capture_scratch(scratch: Path, dest: Path | None, budget_bytes: int,
+                    leftovers: Leftovers | None = None) -> None:
     """Replace ``dest``'s contents with the scratch HOME (minus ``tmp/``). Trusted runs only.
 
     The capture is built complete in a hidden sibling of ``dest`` and only then swapped into
     place: a copy that fails partway (an entry the child made unreadable, the budget, a disk or
     I/O error) leaves the previous ``dest`` -- usually the warm cache the next run seeds from --
-    exactly as it was, instead of emptied or half-written."""
+    exactly as it was, instead of emptied or half-written. The sibling is listed in
+    ``leftovers`` while it exists."""
     if dest is None:
         return
     if dest.is_symlink():
         dest = dest.resolve()       # the operator's cache path; swap the directory it names
     dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     new = dest.parent / f".{dest.name}.capture-{os.urandom(6).hex()}"
-    os.mkdir(new, 0o700)
+    if leftovers is not None:
+        leftovers.add(new)
     try:
+        os.mkdir(new, 0o700)
         budget = CopyBudget(budget_bytes)
         links: LinkMap = {}
         for child in scratch.iterdir():
@@ -177,6 +207,9 @@ def capture_scratch(scratch: Path, dest: Path | None, budget_bytes: int) -> None
     except BaseException:
         remove_tree(new)
         raise
+    finally:
+        if leftovers is not None and not os.path.lexists(new):
+            leftovers.discard(new)
 
 
 _RENAME_SWAP = 0x2
@@ -199,7 +232,15 @@ def swap_into_place(new: Path, dest: Path) -> None:
 
     ``renamex_np(RENAME_SWAP)`` exchanges the two in one step (APFS/HFS+), so ``dest`` is never
     missing or partial. Where that's unsupported, ``dest`` is renamed aside and ``new`` in,
-    restoring the original if the second rename fails. On return ``new`` no longer exists."""
+    restoring the original if the second rename fails. On return ``new`` no longer exists.
+
+    A teardown section (see :func:`teardown_critical`): a retiring agent waits for it rather
+    than exit between the two renames, which would leave ``dest`` missing."""
+    with teardown_critical():
+        _swap_into_place(new, dest)
+
+
+def _swap_into_place(new: Path, dest: Path) -> None:
     if not os.path.lexists(dest):
         os.rename(new, dest)
         return
@@ -1765,7 +1806,8 @@ def copy_no_follow(src: Path, dst: Path, *, budget_bytes: int | None = None,
     """Copy ``src`` (file or tree) to ``dst`` without ever following a symlink.
 
     Regular files and directories are copied with their permission bits; a symlink is recreated
-    as a symlink (its target is never opened -- the host trust gate confines artifact paths);
+    as a symlink (its target is never opened -- the host trust gate confines artifact paths)
+    and charged its target text's length;
     FIFOs, sockets and device nodes are skipped, because opening a FIFO a hostile child left
     behind would block the worker forever. Every entry is charged to ``budget`` (or a fresh one
     of ``budget_bytes``), which raises :class:`SandboxError` once its bytes or entries are
@@ -1789,8 +1831,11 @@ def copy_no_follow(src: Path, dst: Path, *, budget_bytes: int | None = None,
         st = os.lstat(s)
         mode = st.st_mode
         if stat.S_ISLNK(mode):
-            budget.charge(0, s)
-            os.symlink(os.readlink(s), d)
+            # Charged its target's length (what lstat reports as its size): a link stores that
+            # text, so a tree of long symlinks can't copy back unmetered under a small budget.
+            target = os.readlink(s)
+            budget.charge(max(len(os.fsencode(target)), st.st_size), s)
+            os.symlink(target, d)
         elif stat.S_ISDIR(mode):
             budget.charge(0, s)
             d.mkdir(mode=0o700)
@@ -1883,3 +1928,8 @@ def resolve_executable(argv0: str) -> tuple[Path, Path]:
 
 def is_under(path: Path, roots: Iterable[Path]) -> bool:
     return any(path == r or r in path.parents for r in roots)
+
+
+def paths_overlap(a: Path, b: Path) -> bool:
+    """Whether ``a`` and ``b`` (both resolved) are the same path or one contains the other."""
+    return a == b or a in b.parents or b in a.parents

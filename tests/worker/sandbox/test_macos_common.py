@@ -72,7 +72,8 @@ class TestCopyNoFollow:
         (src / "link").symlink_to(secret)
         dst = tmp_path / "dst"
         n = mc.copy_no_follow(src, dst, budget_bytes=1000)
-        assert n == 11
+        # file bytes, plus the symlink's target text (a link stores it)
+        assert n == 11 + len(os.fsencode(str(secret)))
         assert (dst / "a.txt").read_text() == "A"
         assert (dst / "link").is_symlink()
         assert os.readlink(dst / "link") == str(secret)
@@ -1788,3 +1789,61 @@ class TestFdListing:
         with pytest.raises(SandboxError, match="cannot list pid 4242's open files"):
             mc._list_fds(4242)
         assert lib.fails == 99 - mc._FD_LIST_TRIES        # one (failed) sizing call per try
+
+
+class TestSymlinksAreChargedTheirTargetText:
+    """A link stores its target: a tree of long symlinks must not copy (back) unmetered."""
+
+    def test_long_symlinks_exhaust_a_small_byte_budget(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        for i in range(5):
+            (src / f"l{i}").symlink_to("x" * 200)
+        with pytest.raises(SandboxError, match="exceeds budget of 500 bytes"):
+            mc.copy_no_follow(src, tmp_path / "dst", budget_bytes=500)
+
+    def test_each_link_still_counts_as_an_entry(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        for i in range(3):
+            (src / f"l{i}").symlink_to("t")
+        budget = mc.CopyBudget(1 << 20)
+        mc.copy_no_follow(src, tmp_path / "dst", budget=budget)
+        assert budget.entries == 4 and budget.bytes == 3     # the dir + 3 links, 1 byte each
+
+    def test_a_capture_charges_symlinks_too(self, tmp_path):
+        scratch = tmp_path / "scratch"
+        (scratch / "Library").mkdir(parents=True)
+        for i in range(5):
+            (scratch / "Library" / f"l{i}").symlink_to("y" * 300)
+        with pytest.raises(SandboxError, match="exceeds budget"):
+            mc.capture_scratch(scratch, tmp_path / "cap", budget_bytes=1000)
+        assert not (tmp_path / "cap").exists()
+
+
+class TestCaptureListsItsSibling:
+    def test_listed_while_building_and_dropped_once_swapped_in(self, tmp_path, monkeypatch):
+        scratch = tmp_path / "scratch"
+        (scratch / "Library").mkdir(parents=True)
+        (scratch / "Library" / "f").write_text("x")
+        leftovers = mc.Leftovers()
+        during: list[list] = []
+        real = mc.copy_no_follow
+
+        def copy(src, dst, **kw):
+            during.append(list(leftovers._paths))
+            return real(src, dst, **kw)
+        monkeypatch.setattr(mc, "copy_no_follow", copy)
+        mc.capture_scratch(scratch, tmp_path / "cap", 1 << 20, leftovers)
+        assert len(during[0]) == 1 and during[0][0].name.startswith(".cap.capture-")
+        assert leftovers._paths == set()
+        assert (tmp_path / "cap" / "Library" / "f").read_text() == "x"
+
+    def test_remove_all_deletes_what_an_interrupted_step_left(self, tmp_path):
+        leftovers = mc.Leftovers()
+        half = tmp_path / ".half"
+        (half / "d").mkdir(parents=True)
+        (half / "d" / "f").write_text("x")
+        leftovers.add(half)
+        leftovers.remove_all()
+        assert not half.exists() and leftovers._paths == set()

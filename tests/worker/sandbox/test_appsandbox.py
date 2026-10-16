@@ -1274,3 +1274,205 @@ def test_app_sandbox_denies_renaming_data_or_writing_beside_it(real_sb):
         assert r.exit_code != 0, cmd
     assert sorted(os.listdir(container.parent)) == [
         ".com.apple.containermanagerd.metadata.plist", "Data"]
+
+
+class TestShutdownCoversTheTeardown:
+    """The agent retiring during the copy-back (after run_confined dropped its own cleanup)
+    must still remove a half-built copy-back beside the host dir and wipe the slot -- and must
+    never exit between the copy-back's renames."""
+
+    def test_an_emergency_during_the_copy_back_removes_leftovers_and_wipes_the_slot(
+            self, tmp_path, monkeypatch):
+        from blastbox.worker.sandbox import base
+        sb, _ = _sb_with(tmp_path)
+        slot = sb.manifest.slots[0]
+        out = tmp_path / "out"
+        out.mkdir()
+        seen: dict[str, object] = {}
+
+        def copy_back(staged, dest, budget, was_dir, leftovers=None):
+            half = dest / ".blastbox-copyback-half"
+            half.mkdir()
+            leftovers.add(half)
+            assert base.run_emergency_cleanups(5) == 1      # the agent retires here
+            seen["half gone"] = not half.exists()
+            seen["io"] = sorted(os.listdir(slot.io_dir))
+            raise SandboxError("interrupted by the retirement")
+
+        monkeypatch.setattr(asb.AppSandboxSandbox, "_copy_back", staticmethod(copy_back))
+        registered = len(base._EMERGENCY)
+        with pytest.raises(SandboxError, match="interrupted"):
+            sb.run(SandboxRequest(argv=["/bin/sh", "-c", 'echo x > "$0/f"', str(out)],
+                                  rw_mounts=[Mount(out, out)]))
+        assert seen == {"half gone": True, "io": []}
+        assert len(base._EMERGENCY) == registered
+
+    def test_a_retiring_agent_waits_for_the_swap_renames(self, tmp_path, monkeypatch):
+        import threading
+
+        from blastbox.worker.sandbox.base import begin_shutdown, end_shutdown
+        dest, new = tmp_path / "dest", tmp_path / "dest" / ".new"
+        new.mkdir(parents=True)
+        (dest / "a").write_text("old")
+        (new / "a").write_text("new")
+        entered, release = threading.Event(), threading.Event()
+        real_rename = os.rename
+
+        def slow_rename(src, dst):
+            entered.set()
+            release.wait(5)
+            real_rename(src, dst)
+        monkeypatch.setattr(asb.os, "rename", slow_rename)
+        t = threading.Thread(target=asb.AppSandboxSandbox._swap_children,
+                             args=(dest, new, dest / ".old"))
+        t.start()
+        try:
+            assert entered.wait(5)
+            assert begin_shutdown(0.2) is False             # mid-swap: still waiting
+            release.set()
+            assert begin_shutdown(5) is True
+            t.join(5)
+        finally:
+            release.set()
+            end_shutdown()
+        assert (dest / "a").read_text() == "new"
+        assert sorted(os.listdir(dest)) == ["a"]
+
+    def test_no_swap_starts_once_shutdown_has_begun(self, tmp_path):
+        from blastbox.worker.sandbox.base import begin_shutdown, end_shutdown
+        dest, new = tmp_path / "dest", tmp_path / "dest" / ".new"
+        new.mkdir(parents=True)
+        (dest / "a").write_text("old")
+        assert begin_shutdown(0)
+        try:
+            with pytest.raises(SandboxError, match="shutting down"):
+                asb.AppSandboxSandbox._swap_children(dest, new, dest / ".old")
+        finally:
+            end_shutdown()
+        assert (dest / "a").read_text() == "old"
+
+
+class TestSourcesMustNotOverlapStaging:
+    """A source that is, holds or sits inside the root (every slot's io/ and ro/) or a slot's
+    container would be copied into itself: refused before anything is created."""
+
+    @pytest.mark.parametrize("which", ["root", "parent of root", "inside root", "container"])
+    def test_refused_before_the_slot_is_touched(self, tmp_path, monkeypatch, which):
+        sb, home = _sb_with(tmp_path)
+        slot = sb.manifest.slots[0]
+        container_parent = slot.container_data(home).parent
+        container_parent.mkdir(parents=True)
+        src = {"root": tmp_path / "root", "parent of root": tmp_path,
+               "inside root": slot.io_dir, "container": container_parent}[which]
+        wiped: list[object] = []
+        monkeypatch.setattr(sb, "_wipe_slot", lambda s: wiped.append(s) or [])
+        with pytest.raises(SandboxError, match="overlaps"):
+            sb.run(SandboxRequest(argv=["/bin/echo"], ro_mounts=[Mount(src, src)]))
+        assert wiped == []
+
+    def test_a_seed_or_capture_inside_the_root_is_refused(self, tmp_path):
+        sb, _ = _sb_with(tmp_path)
+        inside = tmp_path / "root" / "cache"
+        inside.mkdir()
+        for req in (SandboxRequest(argv=["/bin/echo"], seed_home=inside),
+                    SandboxRequest(argv=["/bin/echo"], capture_home=inside)):
+            with pytest.raises(SandboxError, match="overlaps"):
+                sb.run(req)
+
+    def test_a_disjoint_source_still_runs(self, tmp_path):
+        sb, _ = _sb_with(tmp_path)
+        data = tmp_path / "data"
+        data.mkdir()
+        (data / "f").write_text("x")
+        r = sb.run(SandboxRequest(argv=["/bin/cat", str(data / "f")],
+                                  ro_mounts=[Mount(data, data)]))
+        assert r.exit_code == 0 and r.stdout == b"x"
+
+
+class TestPrepareSweepsRetiredSlots:
+    """A retired slot may still hold a process the run couldn't kill. Re-preparing under
+    another prefix (or dropping the slot) must sweep it under its OLD identity first, or that
+    process keeps its grant to the slot's io/ with no future sweep matching it."""
+
+    def _retire(self, root, i):
+        (root / "locks" / f"{i}.lock.retired").write_text("could not prove clean\n")
+
+    def test_a_retired_slot_is_swept_and_emptied_under_its_old_bundle_id(self, tmp_path,
+                                                                        monkeypatch):
+        root, home = tmp_path / "root", tmp_path / "home"
+        asb.prepare(root, slots=2, ro_paths=[], bundle_prefix="io.example.old",
+                    runner=_fake_runner([]), home=home)
+        self._retire(root, 1)
+        old_data = home / "Library" / "Containers" / "io.example.old.slot1" / "Data"
+        old_data.mkdir(parents=True)
+        (old_data / "left").write_text("x")
+        swept: list[Path] = []
+        monkeypatch.setattr(mc, "sweep_container", lambda c: swept.append(c) or 0)
+        m = asb.prepare(root, slots=1, ro_paths=[], bundle_prefix="io.example.new",
+                        runner=_fake_runner([]), home=home)
+        assert swept == [old_data]                  # only the retired slot, by its OLD id
+        assert list(old_data.iterdir()) == []
+        assert not (root / "locks" / "1.lock.retired").exists()
+        assert [s.bundle_id for s in m.slots] == ["io.example.new.slot0"]
+
+    def test_a_retired_slot_that_cannot_be_proven_empty_refuses_the_prepare(self, tmp_path,
+                                                                           monkeypatch):
+        root, home = tmp_path / "root", tmp_path / "home"
+        asb.prepare(root, slots=2, ro_paths=[], bundle_prefix="io.example.old",
+                    runner=_fake_runner([]), home=home)
+        self._retire(root, 1)
+        manifest = (root / asb.MANIFEST_NAME).read_bytes()
+
+        def stuck(container):
+            raise SandboxError("a process in the container keeps coming back")
+        monkeypatch.setattr(mc, "sweep_container", stuck)
+        with pytest.raises(SandboxError, match="retired slot 1 .* can't be proven empty"):
+            asb.prepare(root, slots=1, ro_paths=[], bundle_prefix="io.example.new",
+                        runner=_fake_runner([]), home=home)
+        # nothing changed: the manifest, the marker and the slot itself are all still there
+        assert (root / asb.MANIFEST_NAME).read_bytes() == manifest
+        assert (root / "locks" / "1.lock.retired").exists()
+        assert (root / "slots" / "1").is_dir()
+
+    def test_the_old_id_comes_from_the_bundle_when_the_manifest_is_gone(self, tmp_path,
+                                                                       monkeypatch):
+        # a prepare that failed part-way leaves only the "preparing" marker as the manifest
+        root, home = tmp_path / "root", tmp_path / "home"
+        asb.prepare(root, slots=1, ro_paths=[], bundle_prefix="io.example.old",
+                    runner=_fake_runner([]), home=home)
+        self._retire(root, 0)
+        (root / asb.MANIFEST_NAME).write_text(json.dumps({"version": asb.MANIFEST_VERSION,
+                                                          "preparing": "x"}))
+        swept: list[Path] = []
+        monkeypatch.setattr(mc, "sweep_container", lambda c: swept.append(c) or 0)
+        asb.prepare(root, slots=1, ro_paths=[], bundle_prefix="io.example.new",
+                    runner=_fake_runner([]), home=home)
+        assert swept == [home / "Library" / "Containers" / "io.example.old.slot0" / "Data"]
+
+    def test_an_unknowable_old_id_refuses_the_prepare(self, tmp_path, monkeypatch):
+        root, home = tmp_path / "root", tmp_path / "home"
+        asb.prepare(root, slots=1, ro_paths=[], runner=_fake_runner([]), home=home)
+        self._retire(root, 0)
+        (root / asb.MANIFEST_NAME).write_text("not json")
+        (root / "slots" / "0" / "bb-slot-0.app" / "Contents" / "Info.plist").unlink()
+        monkeypatch.setattr(mc, "sweep_container", lambda c: 0)
+        with pytest.raises(SandboxError, match="previous bundle id can't be read"):
+            asb.prepare(root, slots=1, ro_paths=[], runner=_fake_runner([]), home=home)
+        assert (root / "locks" / "0.lock.retired").exists()
+
+    def test_slots_that_were_not_retired_are_not_swept(self, tmp_path, monkeypatch):
+        root, home = tmp_path / "root", tmp_path / "home"
+        asb.prepare(root, slots=3, ro_paths=[], runner=_fake_runner([]), home=home)
+        swept: list[Path] = []
+        monkeypatch.setattr(mc, "sweep_container", lambda c: swept.append(c) or 0)
+        asb.prepare(root, slots=1, ro_paths=[], runner=_fake_runner([]), home=home)
+        assert swept == []
+
+    def test_a_dropped_retired_slot_does_not_come_back_retired(self, tmp_path, monkeypatch):
+        root, home = tmp_path / "root", tmp_path / "home"
+        asb.prepare(root, slots=2, ro_paths=[], runner=_fake_runner([]), home=home)
+        self._retire(root, 1)
+        monkeypatch.setattr(mc, "sweep_container", lambda c: 0)
+        asb.prepare(root, slots=1, ro_paths=[], runner=_fake_runner([]), home=home)
+        asb.prepare(root, slots=2, ro_paths=[], runner=_fake_runner([]), home=home)
+        assert not (root / "locks" / "1.lock.retired").exists()

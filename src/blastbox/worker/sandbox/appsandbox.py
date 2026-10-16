@@ -64,7 +64,14 @@ from pathlib import Path
 
 from blastbox.errors import SandboxError, SandboxUnavailable
 from blastbox.limits import Limits
-from blastbox.worker.sandbox.base import SandboxRequest, SandboxResult, note_confined_run
+from blastbox.worker.sandbox.base import (
+    SandboxRequest,
+    SandboxResult,
+    note_confined_run,
+    register_emergency_cleanup,
+    teardown_critical,
+    unregister_emergency_cleanup,
+)
 from blastbox.worker.sandbox import macos_common as mc
 
 _log = logging.getLogger("blastbox.worker.sandbox.appsandbox")
@@ -282,6 +289,24 @@ def _stray_container_entries(bundle_container: Path) -> list[str]:
     return [n for n in names if n not in _CONTAINER_ENTRIES]
 
 
+def _empty_slot(slot: Slot, home: Path) -> list[str]:
+    """Empty the (already swept) slot's io/, ro/ and container; remove anything beside its
+    ``Data/`` and return those names. Raises ``SandboxError`` if any of it can't be removed."""
+    container = slot.container_data(home)
+    parent = container.parent
+    if os.path.lexists(parent) and os.path.islink(parent):
+        raise SandboxError(f"refusing to wipe {container}: {parent} is a symlink")
+    for d in (slot.io_dir, slot.ro_dir, container):
+        mc.wipe_dir(d)
+    stray = _stray_container_entries(parent)
+    for name in stray:
+        mc.remove_tree(parent / name)
+    left = _stray_container_entries(parent)
+    if left:
+        raise SandboxError(f"could not remove {sorted(left)} from {parent}")
+    return stray
+
+
 def _dir_identity(path: Path) -> tuple[int, int] | None:
     """``(st_dev, st_ino)`` of a real directory at ``path``; None if absent or not one."""
     try:
@@ -386,6 +411,7 @@ def prepare(
     codesign: str = "/usr/bin/codesign",
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
     lock_wait_s: float | None = None,
+    home: Path | None = None,
 ) -> Manifest:
     """Build (or rebuild) the slot bundles under ``root`` and write the manifest.
 
@@ -399,6 +425,12 @@ def prepare(
     generation before its next run and refuses to run until restarted, so no job launches
     under a re-signed bundle (another bundle id, other grants) that its watchdog and sweep
     don't match.
+
+    A RETIRED slot (one a run could not prove clean) is swept and emptied under its PREVIOUS
+    bundle id -- the identity a surviving process still carries -- before anything changes;
+    a prepare that can't prove it empty refuses. Re-preparing under another prefix, or
+    dropping the slot, would otherwise leave that process with its grant to the slot's ``io/``
+    and no future sweep that matches it. ``home`` is the user's home (its containers).
     """
     if not 1 <= slots <= 256:
         raise SandboxError("slots must be between 1 and 256")
@@ -434,10 +466,61 @@ def prepare(
                     "another `blastbox macos prepare` is running on this root"):
         existing = [int(c.name) for c in (root / "slots").iterdir() if c.name.isdigit()] \
             if (root / "slots").is_dir() else []
-        with _all_slot_locks(root, range(max([slots, *(i + 1 for i in existing)])), wait_s,
-                             deadline=deadline):
+        indexes = range(max([slots, *(i + 1 for i in existing)]))
+        with _all_slot_locks(root, indexes, wait_s, deadline=deadline):
+            _clean_retired_slots(root, indexes,
+                                 home or Path(pwd.getpwuid(os.getuid()).pw_dir))
             return _prepare_locked(root, slots=slots, resolved_ro=resolved_ro, prefix=prefix,
                                    cc=cc, codesign=codesign, runner=runner)
+
+
+def _previous_bundle_ids(root: Path, indexes: Iterable[int]) -> dict[int, set[str]]:
+    """Each slot's bundle id(s) before this prepare: from the current manifest, and from the
+    slot's signed bundle on disk (all a failed earlier prepare leaves, its manifest being only
+    the "preparing" marker)."""
+    ids: dict[int, set[str]] = {}
+    try:
+        for s in Manifest.load(root).slots:
+            ids.setdefault(s.index, set()).add(s.bundle_id)
+    except SandboxError:
+        pass
+    for i in indexes:
+        info = root / "slots" / str(i) / f"bb-slot-{i}.app" / "Contents" / "Info.plist"
+        try:
+            with open(info, "rb", opener=lambda p, f: os.open(p, f | os.O_NOFOLLOW)) as fh:
+                bid = plistlib.load(fh).get("CFBundleIdentifier")
+        except (OSError, ValueError, plistlib.InvalidFileException, AttributeError):
+            continue
+        if _valid_bundle_id(bid):
+            ids.setdefault(i, set()).add(bid)
+    return ids
+
+
+def _clean_retired_slots(root: Path, indexes: Iterable[int], home: Path) -> None:
+    """Sweep and empty every retired slot under its previous identity, or raise."""
+    retired = [i for i in indexes if (root / "locks" / f"{i}.lock.retired").exists()]
+    if not retired:
+        return
+    previous = _previous_bundle_ids(root, retired)
+    for i in retired:
+        marker = root / "locks" / f"{i}.lock.retired"
+        if not previous.get(i):
+            raise SandboxError(
+                f"appsandbox: slot {i} is retired, but its previous bundle id can't be read "
+                f"(manifest and slot bundle both unreadable), so a process it left can't be "
+                f"swept; make sure none is left, delete {marker}, and re-run prepare")
+        for bid in sorted(previous[i]):
+            old = Slot(index=i, bundle_id=bid,
+                       bundle=root / "slots" / str(i) / f"bb-slot-{i}.app",
+                       io_dir=root / "slots" / str(i) / "io",
+                       lock_path=root / "locks" / f"{i}.lock")
+            try:
+                mc.sweep_container(old.container_data(home))
+                _empty_slot(old, home)
+            except SandboxError as exc:
+                raise SandboxError(
+                    f"appsandbox: retired slot {i} ({bid}) can't be proven empty: {exc}; "
+                    "inspect it, then re-run prepare") from exc
 
 
 def _prepare_wait(value: float | None) -> float:
@@ -544,11 +627,17 @@ def _prepare_locked(root: Path, *, slots: int, resolved_ro: list[Path], prefix: 
               "--entitlements", str(ent_path), str(bundle)], runner)
         built.append(slot)
 
-    # Drop slots beyond the new count so a shrink cannot leave stale signed launchers around.
+    # Drop slots beyond the new count so a shrink cannot leave stale signed launchers around --
+    # and their retirement markers, already swept and emptied (_clean_retired_slots): a marker
+    # left behind would retire the slot again, with no identity to sweep, if it is re-added.
     slots_root = root / "slots"
     for child in slots_root.iterdir():
         if child.name.isdigit() and int(child.name) >= slots:
             mc.remove_tree(child)
+    for marker in (root / "locks").glob("*.lock.retired"):
+        index = marker.name.split(".", 1)[0]
+        if index.isdigit() and int(index) >= slots:
+            marker.unlink(missing_ok=True)
 
     manifest = Manifest(root=root, bundle_prefix=prefix, ro_paths=tuple(resolved_ro),
                         slots=tuple(built), generation=secrets.token_hex(8))
@@ -787,19 +876,7 @@ class AppSandboxSandbox:
         slot."""
         try:
             self._sweep_slot(slot)
-            container = slot.container_data(self._home)
-            parent = container.parent
-            if os.path.lexists(parent) and os.path.islink(parent):
-                raise SandboxError(f"refusing to wipe {container}: {parent} is a symlink")
-            for d in (slot.io_dir, slot.ro_dir, container):
-                mc.wipe_dir(d)
-            stray = _stray_container_entries(parent)
-            for name in stray:
-                mc.remove_tree(parent / name)
-            left = _stray_container_entries(parent)
-            if left:
-                raise SandboxError(f"could not remove {sorted(left)} from {parent}")
-            return stray
+            return _empty_slot(slot, self._home)
         except SandboxError as exc:
             self.retired_marker(slot).write_text(f"{exc}\n")
             _log.error("appsandbox: retired slot %s: %s", slot.bundle_id, exc)
@@ -825,13 +902,31 @@ class AppSandboxSandbox:
             _host_path(request.argv[0], [*request.ro_mounts, *request.rw_mounts]))
         self._check_exec_allowed(exe)
         self._check_exec_allowed(exe_real)
+        self._check_sources_clear(request)
 
         with self._acquire_slot() as slot:
-            self._wipe_slot(slot)
+            # The slot's own emergency cleanup, held from the first wipe to the last: the agent
+            # retiring mid-run skips every `finally` here, and run_confined's covers only the
+            # child's lifetime -- not the copy-back, capture and final wipe after it. It removes
+            # a copy-back or capture left half-built beside its destination, then sweeps and
+            # wipes the slot (retiring it if that fails, as a run's own wipe does).
+            leftovers = mc.Leftovers()
+
+            def _emergency() -> None:
+                try:
+                    leftovers.remove_all()
+                finally:
+                    self._wipe_slot(slot)
+
+            token = register_emergency_cleanup(_emergency)
             try:
-                result, confined = self._run_in_slot(slot, exe, request)
+                self._wipe_slot(slot)
+                try:
+                    result, confined = self._run_in_slot(slot, exe, request, leftovers)
+                finally:
+                    stray = self._wipe_slot(slot)
             finally:
-                stray = self._wipe_slot(slot)
+                unregister_emergency_cleanup(token)
             if stray:
                 # Removed by the wipe, but nothing the run did beside its Data/ is legitimate.
                 raise SandboxError(f"appsandbox: the run left {sorted(stray)} beside its "
@@ -844,8 +939,25 @@ class AppSandboxSandbox:
             note_confined_run()
         return result
 
-    def _run_in_slot(self, slot: Slot, exe: Path,
-                     request: SandboxRequest) -> tuple[SandboxResult, bool]:
+    def _check_sources_clear(self, request: SandboxRequest) -> None:
+        """Refuse a mount, seed or capture path that is, holds, or sits inside this root (every
+        slot's io/ and ro/ staging) or a slot's container, before anything is created. Staging
+        or seeding such a source would copy the growing copy into itself until a limit stops
+        it; a capture there would land in a tree the next wipe empties."""
+        root = self._root.resolve()
+        protected = [root, *(s.container_data(self._home).parent for s in self._manifest.slots)]
+        paths = [*(("mount", Path(m.source)) for m in (*request.ro_mounts, *request.rw_mounts)),
+                 *(("seed_home", p) for p in [request.seed_home] if p is not None),
+                 *(("capture_home", p) for p in [request.capture_home] if p is not None)]
+        for what, p in paths:
+            rp = p.expanduser().resolve()
+            for area in protected:
+                if mc.paths_overlap(rp, area.resolve()):
+                    raise SandboxError(f"appsandbox: {what} {p} overlaps {area}, where runs are "
+                                       "staged; use a path outside it")
+
+    def _run_in_slot(self, slot: Slot, exe: Path, request: SandboxRequest,
+                     leftovers: mc.Leftovers | None = None) -> tuple[SandboxResult, bool]:
         """The run and whether it may be credited as confined (the caller credits it once the
         slot is clean)."""
         # Every staging and copy-back copy of the run draws on ONE budget (bytes and entries):
@@ -934,7 +1046,7 @@ class AppSandboxSandbox:
         copy_back = mc.CopyBudget(budget)
         # Only outermost writable sources were staged, so these never overlap.
         for src, staged, was_dir in rw_staged:
-            self._copy_back(staged, src, copy_back, was_dir)
+            self._copy_back(staged, src, copy_back, was_dir, leftovers)
         ok = result.exit_code == 0 and not result.killed
         if ok and request.capture_home is not None:
             # The child owns its container and may have deleted Data/ or swapped it for a
@@ -948,7 +1060,7 @@ class AppSandboxSandbox:
             if not is_dir:
                 raise SandboxError(f"appsandbox: refusing to capture {container}: "
                                    "it is no longer a real directory")
-            mc.capture_scratch(container, request.capture_home, budget)
+            mc.capture_scratch(container, request.capture_home, budget, leftovers)
 
         # Creditable only for a run that reached the sandbox AND completed: an engine that falls
         # back to parsing in-process after a failed or killed sandboxed run (or a copy-back that
@@ -985,7 +1097,15 @@ class AppSandboxSandbox:
     def _swap_children(dest: Path, new: Path, old: Path) -> None:
         """Replace ``dest``'s children with ``new``'s: old ones aside into ``old``, new ones in,
         then drop ``old``. A failed rename undoes every move made so far (best effort, logged)
-        and re-raises, so ``dest`` ends up as it was rather than part-swapped."""
+        and re-raises, so ``dest`` ends up as it was rather than part-swapped.
+
+        A teardown section (see :func:`teardown_critical`): a retiring agent waits for the
+        renames to finish rather than exit between them."""
+        with teardown_critical():
+            AppSandboxSandbox._swap_children_locked(dest, new, old)
+
+    @staticmethod
+    def _swap_children_locked(dest: Path, new: Path, old: Path) -> None:
         os.mkdir(old, 0o700)
         moved_out: list[str] = []
         moved_in: list[str] = []
@@ -1016,7 +1136,8 @@ class AppSandboxSandbox:
                                f"contents ({old})")
 
     @staticmethod
-    def _copy_back(staged: Path, dest: Path, budget: mc.CopyBudget, was_dir: bool) -> None:
+    def _copy_back(staged: Path, dest: Path, budget: mc.CopyBudget, was_dir: bool,
+                   leftovers: mc.Leftovers | None = None) -> None:
         """Make ``dest`` mirror the staged copy the child left (bind-mount semantics).
 
         The staged ROOT must still be what was mounted -- a real directory for a directory
@@ -1036,7 +1157,10 @@ class AppSandboxSandbox:
 
         A staged root that is GONE fails too: a mounted root cannot be removed from inside a
         bind mount, and silently keeping the host's stale contents would report the run's
-        output as written when it was not."""
+        output as written when it was not.
+
+        The hidden replacement is listed in ``leftovers`` while it exists: it holds the child's
+        bytes outside every wiped root, so an agent retiring mid-copy removes it."""
         try:
             st = os.lstat(staged)
         except FileNotFoundError as exc:
@@ -1057,18 +1181,26 @@ class AppSandboxSandbox:
             tag = secrets.token_hex(8)
             new = dest / f".blastbox-copyback-{tag}"
             old = dest / f".blastbox-copyback-old-{tag}"
+            if leftovers is not None:
+                leftovers.add(new)
             try:
-                mc.copy_no_follow(staged, new, budget=budget)
-            except BaseException:
-                mc.remove_tree(new)
-                raise
-            AppSandboxSandbox._swap_children(dest, new, old)
+                try:
+                    mc.copy_no_follow(staged, new, budget=budget)
+                except BaseException:
+                    mc.remove_tree(new)
+                    raise
+                AppSandboxSandbox._swap_children(dest, new, old)
+            finally:
+                if leftovers is not None and not os.path.lexists(new):
+                    leftovers.discard(new)
         else:
             locked_target = mc.locked_file_target(dest)
             if locked_target is not None:
                 raise SandboxError(f"appsandbox: rw mount {dest} can't be replaced ({locked_target}); "
                                    "not copied back")
             new = dest.with_name(f".{dest.name}.blastbox-copyback-{secrets.token_hex(8)}")
+            if leftovers is not None:
+                leftovers.add(new)
             try:
                 mc.copy_no_follow(staged, new, budget=budget)
                 os.replace(new, dest)
@@ -1077,3 +1209,6 @@ class AppSandboxSandbox:
                 # watchdog path, so it never outlives the attempt.
                 mc.remove_tree(new)
                 raise
+            finally:
+                if leftovers is not None and not os.path.lexists(new):
+                    leftovers.discard(new)

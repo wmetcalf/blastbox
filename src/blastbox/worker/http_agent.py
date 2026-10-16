@@ -46,7 +46,14 @@ from blastbox.limits import Limits
 from blastbox.worker.engine import Engine
 from blastbox.worker.harness import run_detonation
 from blastbox.worker.load import load_engine
-from blastbox.worker.sandbox.base import confined_runs, host_platform, run_emergency_cleanups
+from blastbox.worker.sandbox.base import (
+    begin_shutdown,
+    confined_runs,
+    defer_until_teardown_done,
+    end_shutdown,
+    host_platform,
+    run_emergency_cleanups,
+)
 
 _log = logging.getLogger("blastbox.worker.http_agent")
 
@@ -142,13 +149,24 @@ def _retire(code: int) -> None:
     os._exit skips every backend's `finally`. The macOS backends start their children in new
     sessions -- out of reach of a supervisor that kills the agent's process group (launchd) --
     so kill and sweep the runs in flight first, bounded: a Seatbelt child must not outlive the
-    agent with direct access to its writable mounts. (Linux backends register nothing.)"""
+    agent with direct access to its writable mounts. (Linux backends register nothing.)
+
+    Nor may it exit between a copy-back's renames (a host directory left part-replaced): new
+    teardown sections are refused, running ones are waited for -- within the same budget --
+    and a signal that lands on a thread inside one retires when that section ends."""
+    if defer_until_teardown_done(lambda: _retire(code)):
+        return
     if not _RETIRE_LOCK.acquire(blocking=False):
         return
     try:
+        deadline = time.monotonic() + EMERGENCY_CLEANUP_S
         with contextlib.suppress(Exception):
-            run_emergency_cleanups(EMERGENCY_CLEANUP_S)
+            # renames take milliseconds: most of the budget stays for killing the runs
+            if not begin_shutdown(EMERGENCY_CLEANUP_S / 3):
+                _log.error("http_agent: a copy-back was still running at the shutdown deadline")
+            run_emergency_cleanups(max(0.0, deadline - time.monotonic()))
         _HARD_EXIT(code)
+        end_shutdown()      # only reached when the exit returned (a test's fake exit)
     finally:
         _RETIRE_LOCK.release()
 

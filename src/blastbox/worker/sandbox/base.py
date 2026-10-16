@@ -122,6 +122,78 @@ def run_emergency_cleanups(timeout_s: float) -> int:
     return len(done)
 
 
+# Teardown steps a hard exit must not cut in half: a copy-back's renames, which move a host
+# directory's entries aside and the new ones in. Exiting between two of them would leave the
+# operator's directory part-replaced. A retiring agent waits for these sections to finish
+# (bounded), and refuses new ones once it has started. A shutdown signal lands on the main
+# thread, which may itself be inside a section (the warmup's runs are on it): the retirement
+# then runs when that section ends, since waiting on itself would only time out.
+_CRIT_COND = threading.Condition()
+_CRIT_ACTIVE = 0
+_CRIT_LOCAL = threading.local()
+_SHUTTING_DOWN = False
+
+
+@contextlib.contextmanager
+def teardown_critical() -> Iterator[None]:
+    """Mark a section a retiring agent waits for rather than exits in the middle of.
+
+    Raises ``SandboxError`` once shutdown has begun: the work is abandoned before it starts
+    (the backend's emergency cleanup removes what it staged), never interrupted midway."""
+    from blastbox.errors import SandboxError
+
+    global _CRIT_ACTIVE
+    with _CRIT_COND:
+        if _SHUTTING_DOWN:
+            raise SandboxError("the worker is shutting down; teardown step not started")
+        _CRIT_ACTIVE += 1
+    depth = getattr(_CRIT_LOCAL, "depth", 0)
+    _CRIT_LOCAL.depth = depth + 1
+    try:
+        yield
+    finally:
+        _CRIT_LOCAL.depth = depth
+        with _CRIT_COND:
+            _CRIT_ACTIVE -= 1
+            _CRIT_COND.notify_all()
+        if depth == 0:
+            deferred = getattr(_CRIT_LOCAL, "deferred", None)
+            _CRIT_LOCAL.deferred = None
+            if deferred is not None:
+                deferred()
+
+
+def defer_until_teardown_done(fn: Callable[[], object]) -> bool:
+    """If the calling thread is inside a :func:`teardown_critical` section, run ``fn`` when it
+    ends (on this thread) and return True; else return False and do nothing."""
+    if getattr(_CRIT_LOCAL, "depth", 0) == 0:
+        return False
+    _CRIT_LOCAL.deferred = fn
+    return True
+
+
+def begin_shutdown(timeout_s: float) -> bool:
+    """Refuse new teardown sections, then wait up to ``timeout_s`` for the running ones (on
+    other threads) to finish. True if none is left."""
+    global _SHUTTING_DOWN
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    with _CRIT_COND:
+        _SHUTTING_DOWN = True
+        while _CRIT_ACTIVE > getattr(_CRIT_LOCAL, "depth", 0):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            _CRIT_COND.wait(left)
+        return True
+
+
+def end_shutdown() -> None:
+    """Undo :func:`begin_shutdown` -- only for a retirement whose exit returned (a test's)."""
+    global _SHUTTING_DOWN
+    with _CRIT_COND:
+        _SHUTTING_DOWN = False
+
+
 def kill_sandbox_group(proc) -> None:
     """SIGKILL the timed-out sandbox's process group -- never the worker's own.
 

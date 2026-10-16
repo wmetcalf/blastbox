@@ -584,7 +584,10 @@ def test_hard_deadline_kills_and_sweeps_runs_in_flight_before_exiting(monkeypatc
     monkeypatch.setattr(hag, "run_emergency_cleanups", lambda t: order.append(("cleanup", t)))
     monkeypatch.setattr(hag, "_HARD_EXIT", lambda code: order.append(("exit", code)))
     hag._on_hard_deadline(1.0)
-    assert order == [("cleanup", hag.EMERGENCY_CLEANUP_S), ("exit", 75)]
+    # the cleanups get what is left of the budget after the (instant, here) teardown wait
+    assert [(k, v if k == "exit" else round(v)) for k, v in order] == [
+        ("cleanup", hag.EMERGENCY_CLEANUP_S), ("exit", 75)]
+    assert all(v <= hag.EMERGENCY_CLEANUP_S for k, v in order if k == "cleanup")
 
 
 def test_a_failing_emergency_cleanup_still_exits(monkeypatch):
@@ -610,8 +613,9 @@ def test_a_shutdown_signal_kills_and_sweeps_runs_in_flight_before_exiting(monkey
     monkeypatch.setattr(hag, "_HARD_EXIT", lambda code: order.append(("exit", code)))
     hag._on_shutdown_signal(_signal.SIGTERM, None)
     hag._on_shutdown_signal(_signal.SIGINT, None)
-    assert order == [("cleanup", hag.EMERGENCY_CLEANUP_S), ("exit", 143),
-                     ("cleanup", hag.EMERGENCY_CLEANUP_S), ("exit", 130)]
+    assert [(k, v if k == "exit" else round(v)) for k, v in order] == [
+        ("cleanup", hag.EMERGENCY_CLEANUP_S), ("exit", 143),
+        ("cleanup", hag.EMERGENCY_CLEANUP_S), ("exit", 130)]
 
 
 def test_only_one_retirement_runs_when_the_deadline_and_a_signal_race(monkeypatch):
@@ -682,3 +686,61 @@ def test_a_failing_optional_warmup_does_not_gate_detonate():
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+# A retiring agent must not exit between a copy-back's renames (a host dir left part-replaced).
+
+def test_a_retirement_waits_for_a_copy_back_in_progress(monkeypatch):
+    import blastbox.worker.http_agent as hag
+    from blastbox.worker.sandbox.base import teardown_critical
+    order: list[object] = []
+    monkeypatch.setattr(hag, "run_emergency_cleanups", lambda t: order.append("cleanup"))
+    monkeypatch.setattr(hag, "_HARD_EXIT", lambda code: order.append(("exit", code)))
+    inside, release = threading.Event(), threading.Event()
+
+    def copy_back():
+        with teardown_critical():
+            inside.set()
+            release.wait(5)
+            order.append("renames done")
+    t = threading.Thread(target=copy_back)
+    t.start()
+    assert inside.wait(5)
+    r = threading.Thread(target=hag._on_hard_deadline, args=(1.0,))
+    r.start()
+    r.join(0.3)
+    assert order == [] and r.is_alive()          # waiting on the renames, not exiting
+    release.set()
+    t.join(5)
+    r.join(5)
+    assert order == ["renames done", "cleanup", ("exit", 75)]
+
+
+def test_a_signal_landing_inside_a_teardown_section_retires_when_it_ends(monkeypatch):
+    # The handler runs on the main thread, which may itself be mid-copy-back (warmup runs
+    # there): waiting on itself would only time out, so the section's end retires instead.
+    import signal as _signal
+
+    import blastbox.worker.http_agent as hag
+    from blastbox.worker.sandbox.base import teardown_critical
+    order: list[object] = []
+    monkeypatch.setattr(hag, "run_emergency_cleanups", lambda t: order.append("cleanup"))
+    monkeypatch.setattr(hag, "_HARD_EXIT", lambda code: order.append(("exit", code)))
+    with teardown_critical():
+        hag._on_shutdown_signal(_signal.SIGTERM, None)
+        order.append("renames done")
+    assert order == ["renames done", "cleanup", ("exit", 143)]
+
+
+def test_no_teardown_section_starts_once_shutdown_has_begun():
+    from blastbox.errors import SandboxError
+    from blastbox.worker.sandbox.base import begin_shutdown, end_shutdown, teardown_critical
+    assert begin_shutdown(0)
+    try:
+        with pytest.raises(SandboxError, match="shutting down"):
+            with teardown_critical():
+                pytest.fail("a section started after shutdown began")
+    finally:
+        end_shutdown()
+    with teardown_critical():
+        pass
