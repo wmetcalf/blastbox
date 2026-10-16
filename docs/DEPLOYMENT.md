@@ -215,6 +215,172 @@ Source one, add a tier slice, done. The only non-config difference between engin
 worker image (ClippyShot bakes LibreOffice+PDFium; RedTusk bakes JDK+the Tika jar). Both are
 live-proven on the `aws-ec2` disposable tier.
 
+### 3a. macOS workers (Apple frameworks: Vision, the Neural Engine, PDFKit, …)
+
+Some engines only make sense on a Mac: they exist *because* they use Apple's own parsers or ML (a
+QR decoder that must behave exactly like an iPhone, for example). There's no Docker, gVisor or
+Firecracker per job on macOS, and macOS VMs don't get the Neural Engine. So the Mac runs the generic
+`http_agent`, and each job's engine subprocess runs in a **per-run Seatbelt sandbox**:
+
+```
+dispatcher ──remote_http──▶ Mac: http_agent ──▶ engine.detonate() ──▶ select_sandbox()
+                                                                      ├─ seatbelt   (default)
+                                                                      └─ appsandbox (opt-in)
+```
+
+Nothing new on the host side. A Mac is a `static` (or `cascade`) worker like any other box. A
+Mac-only deployment points its own dispatcher at a local agent:
+
+```sh
+# on the Mac
+BLASTBOX_ENGINE=william_tells.blastbox_engine:WilliamTellsEngine \
+BLASTBOX_WORKER_AGENT_TOKEN=... python -m blastbox.worker.http_agent       # :8765
+
+# Mac-only: dispatcher on the same Mac            # or a Linux dispatcher on the LAN
+BLASTBOX_POOL_RUNTIME=static                       BLASTBOX_POOL_RUNTIME=static
+BLASTBOX_STATIC_WORKERS=127.0.0.1:8765             BLASTBOX_STATIC_WORKERS=mac1:8765,mac2:8765
+BLASTBOX_STATIC_WORKER_TOKEN=...                   BLASTBOX_STATIC_WORKER_TOKEN=...
+```
+
+`BLASTBOX_STATIC_WORKER_TOKEN` is the dispatcher's side of the agent's
+`BLASTBOX_WORKER_AGENT_TOKEN`: the **same value**. With a token set, the agent answers even
+`/healthz` only to an authenticated caller, so a dispatcher without it gets 401 from every
+startup probe and refuses the fleet.
+
+`deploy/macos/` has launchd agents for all three processes: `io.blastbox.worker-agent` on every
+Mac, plus `io.blastbox.ingress` and `io.blastbox.dispatcher` for a Mac-only deployment. They are
+per-user agents, not LaunchDaemons: App Sandbox (the `appsandbox` backend) only initializes in a
+per-user launchd domain (`gui/<uid>` or, with no GUI login, `user/<uid>` with
+`LimitLoadToSessionType` `Background`); from the system domain `secinitd` refuses to register the
+sandboxed process. The worker-agent plist's header has the headless commands. The last
+two source **one** env file, so `serve` and `dispatch` can't disagree on the queue, the job root or
+an engine's `PARAM_KEYS`. A `static` dispatcher refuses to start until an agent answers `/healthz`,
+and the agent's `/healthz` waits on its engine's self-test (`warmup()`), so the dispatcher plist
+restarts on a throttle until the agent is ready. Measured on a Mac with the William Tells engine (`williamtells`): ingress,
+SQLite queue, dispatcher and agent on one host, about 270 ms per image end to end, with signed
+attestation. **Per-job isolation lives in the sandbox, not the
+agent.** The agent is long-lived and only spools bytes and seals output; every engine subprocess
+gets a fresh profile, a fresh scratch `HOME`/`TMPDIR`/cache dir, no network, and only the paths it
+was granted.
+
+**What the agent enforces on macOS** (there is no runsc/Firecracker boundary around it):
+
+- `BLASTBOX_SANDBOX` only picks the backend an engine *may* use through `select_sandbox()`; it
+  confines nothing on its own. So the agent refuses to start an engine that doesn't declare
+  `sandboxed_parsing = True`, and refuses to serve an `ok` result produced without a single
+  confined run (500, the job fails). A run counts only when it proves it ran confined: under
+  `seatbelt` the target is started through a `/bin/sh` shim that sandbox-exec execs only after
+  the profile attached, and the shim writes a per-run nonce into the scratch dir (a profile
+  sandbox-exec rejects never gets there); under `appsandbox`, the signed launcher writes the
+  nonce into the slot's `io/` once it has checked it is sandboxed, before it execs the target.
+  (Slots prepared before this need `blastbox macos prepare` again: manifest version 2.)
+  Read-only mounts are staged in the slot's `ro/` dir, which the launcher's entitlement grants
+  read-only, so a child can't rewrite or chmod a mounted input or config; only `io/` is
+  writable. Slots prepared before `ro/` existed fail signature verification (their
+  entitlements no longer match): re-run `blastbox macos prepare`.
+  With the warmup gate on, the warmup self-test must itself complete a confined run, or
+  `/healthz` stays 503: a self-test that passed by parsing in-process proves nothing about the
+  sandbox's grants.
+  `select_sandbox()`'s own `/usr/bin/true` probe never counts, so an engine that selects its
+  backend mid-job gets no credit before its parser has run. Credit is scoped to the job: a run
+  counts only if it starts and finishes during that detonation, in its context. A run on a
+  thread the engine starts without that context (a plain `Thread` or executor), a detector's
+  run, or one left over from an earlier job counts for nothing, so an engine that sandboxes on
+  its own threads must wrap the callable in `blastbox.worker.sandbox.base.in_this_context`. `BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE=1` is the explicit escape hatch.
+- The engine's optional `detect()` isn't called in the agent (it would parse the input outside
+  any sandbox) unless the engine declares `sandboxed_detect = True`.
+- A failed `warmup()` (where an engine runs its known-positive self-test), or an engine with no
+  `warmup()` at all, makes `/healthz` answer 503, so the static pool skips that Mac. A failed
+  warmup is retried in the background (30 s, doubling to 5 min, never during a job) and `/healthz`
+  turns 200 once it passes; launchd's `KeepAlive` wouldn't restart a process that is still up. A warmup
+  (first or retry) that never returns retires the agent at the detonation hard deadline
+  (`BLASTBOX_WORKER_AGENT_HARD_TIMEOUT_S`), so launchd restarts it. `BLASTBOX_WORKER_AGENT_REQUIRE_WARMUP=0/1` overrides
+  the default (on for macOS, off elsewhere).
+- Each run's limits: an rlimit launcher sets `FSIZE`/`NOFILE`/`CPU`/`CORE` and a per-run
+  `NPROC` allowance (no `preexec_fn` in the threaded agent); a watchdog caps the summed RSS of
+  the run's whole process family and the bytes/entries in its writable dirs (`tmpfs_bytes`) --
+  a writable dir it can't read (a child `chmod 000`'d it) counts as over budget, not empty;
+  captured output is capped per stream; and every process the run started is killed when it
+  ends, including one that outlived a normal exit or left its process group.
+- Processes are also found by their sandbox, not only their ancestry: a child can fork,
+  `setsid()` and let the leader (or a short-lived intermediate) exit between two watchdog
+  samples. Every sample, and a sweep after each run, also take in every process of the
+  agent's uid that is sandboxed and either has the slot's container (`appsandbox`, exact:
+  the kernel reports it per process) or started during the run and may write the run's private
+  scratch dir (`seatbelt`, which only that run's profile grants). Sandboxes are inherited and
+  can't be dropped, so an escapee stays matchable. Residual risk: the `seatbelt` match is a
+  heuristic (start time + `sandbox_check`), so a same-uid sandboxed process that started during
+  the run and whose own profile can write the worker's temp dir would be killed too; the
+  `appsandbox` container match is exact. Such processes are metered and killed during the run;
+  a sweep that can't empty the set fails the run.
+- An env entry with a NUL, an `=` in its key, or an empty key is refused up front (`execve`
+  would fail on it after the launcher started). `DYLD_*` / `LD_*` keys in a request env are dropped, and the request env is handed to the
+  target only by the rlimit launcher's `execve`; the launcher interpreter itself (which runs
+  before any sandbox) gets just `PATH`.
+- App Sandbox containers are keyed by bundle id, so two `appsandbox` roots prepared with the same
+  `--bundle-prefix` would share them; a per-user lock per bundle id
+  (`~/Library/Caches/blastbox/appsandbox-locks/`) is held for each run and its wipes.
+- `~/Library/Caches/blastbox/` is per-user state every native worker of the user shares (agents,
+  `macos doctor`, CLI runs): the path-claim registry, the shared `RLIMIT_NPROC` ceiling
+  (`nproc/`), the registry of prepared `appsandbox` roots (`roots/`, which every worker refuses
+  to mount, seed from or capture over), and the copy-back journal (`copyback-journal/`). An
+  `appsandbox` directory copy-back is journalled phase by phase, so a worker killed mid-swap
+  leaves the host directory recoverable: the next agent start (or the next run that mounts it)
+  puts it back fully old or fully new. A journal marked `broken` (a swap whose own undo also
+  failed) is never resolved automatically: runs mounting that directory are refused until it is
+  repaired by hand and the journal file removed.
+- A `seatbelt` run's scratch dir gets the same unlock-and-verify wipe; if it can't be removed
+  the run fails. An `appsandbox` slot whose `io/` or container can't be proven empty after a
+  run (including a root the child locked or `chmod 000`'d), whose container was swapped for a
+  symlink, or whose processes can't all be killed is retired until
+  `blastbox macos prepare` is re-run. A seeded run on a never-launched slot primes the
+  container with a no-op launch first, so the seed always applies (or the run fails).
+- `blastbox macos prepare` can run beside a live agent: it takes every slot's lock first
+  (waiting up to `BLASTBOX_APPSANDBOX_PREPARE_WAIT_S`, default 60 s, for a run in progress,
+  else refusing) and writes a new manifest generation. The running agent then refuses every
+  `appsandbox` run until it is restarted, so no job launches under re-signed slots (another
+  bundle id, other grants) that it didn't load and verify. Restart the agent after a prepare.
+  Before touching any slot, prepare replaces the manifest with a "preparing" marker: a
+  prepare that fails part-way (say `codesign` on a later slot) leaves every agent -- live or
+  newly started -- refusing App Sandbox until a prepare completes.
+  Before anything changes, prepare also sweeps EVERY existing slot (not only retired ones)
+  under each bundle id it may have carried -- the current manifest's, the signed bundle's, and
+  its new one -- and empties it, refusing if any can't be proven empty. A process left by an
+  agent that was SIGKILLed mid-run (no retirement marker) is so swept before a new prefix or a
+  shrink would leave its container unmatched by any future sweep.
+- A `seatbelt` run can't unlink or rename the roots of its writable mounts or its scratch
+  dir (nor a directory between a mount root and an outer writable mount); everything beneath
+  a directory root stays writable. A scratch dir that is nonetheless gone or replaced after
+  the run is never captured into `capture_home`.
+- When the agent's hard deadline retires it (`os._exit`), it first kills and sweeps the
+  `seatbelt`/`appsandbox` runs in flight (bounded, 15 s): their processes run in their own
+  sessions, which launchd's process-group cleanup of the agent job doesn't reach. A crash
+  that skips this (SIGKILL of the agent) leaves `appsandbox` slots to the next start's
+  pre-run sweep and wipe; a `seatbelt` escapee from such a crash has no slot to be swept
+  from, so run the agent under a dedicated user and let launchd restart it in place.
+
+**The agent can be native.** The dispatcher only sees the protocol: `GET /healthz`, and
+`POST /detonate` answered with a tar holding a `metadata.json` that passes the host trust gate.
+Any process that serves it is a `static` worker. William Tells ships `wtqrk-worker`, a Swift agent
+that runs each image in a fresh process the kernel App-Sandboxes at exec (no `sandbox-exec`, no
+Python), and its tests run the agent's output through `validate_worker_output`. That's the shape
+for an engine that is itself native code; the backends below are for Python engines.
+
+**Which macOS backend?**
+
+| | `seatbelt` (default) | `appsandbox` |
+|---|---|---|
+| Profile | per-run, deny-default, built from the request | Apple's application profile (+ per-slot path exceptions) |
+| Mach services / drivers | only what `accelerators` asks for | whatever App Sandbox allows apps (much broader) |
+| Applied by | `sandbox-exec` (deprecated CLI, same kernel mechanism) | the kernel at launch, from the launcher's signature |
+| Setup | none | `blastbox macos prepare --slots N --ro <engine dirs>` |
+| Paths | real (identity mounts) | mounts staged into the slot (APFS clone) and copied back |
+| Cost | free | free (ad-hoc signing, no Apple Developer account) |
+
+Run `blastbox macos doctor -- <engine self-test>` after install and after every macOS update. If a
+Neural Engine or GPU grant goes missing, an engine like Vision usually doesn't crash; it just
+returns **no result**. Only a known-positive self-test catches that.
+
 ### 4. Auto-sizing a multi-worker host (node pool autosizer)
 
 Shapes 2 and 3 hand-tune `BLASTBOX_POOL_CEILING`/`WARM_SIZE` per dispatcher. On a host that runs

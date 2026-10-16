@@ -376,3 +376,120 @@ def test_wait_for_egress_gateway_times_out(monkeypatch) -> None:
         clock=lambda: t["now"],
     )
     assert ok is False
+
+
+class TestPrecheckRunsBeforeTheInputIsHandedOver:
+    """Codex P1 (#198): an engine's optional precheck(limits) gets no input. A refusal there is
+    sealed without calling detonate() and is recorded on the confinement ledger as reached
+    before any parse -- the only outcome a macOS agent accepts without a confined run."""
+
+    class _Engine:
+        name = "pre"
+        formats = frozenset({"*"})
+
+        def __init__(self, precheck):
+            self._precheck = precheck
+            self.detonated = False
+
+        def precheck(self, limits):
+            return self._precheck(limits)
+
+        def detonate(self, input, outdir, limits):
+            self.detonated = True
+            return DetonationResult(payload=Record(fields={}), artifacts=[],
+                                    detected=Detection(label="x", mime="x/y", confidence=1.0,
+                                                       source="t"), status="ok")
+
+    @staticmethod
+    def _run(tmp_path, engine):
+        import json
+        from blastbox.worker.sandbox.base import confinement_ledger
+        inp = tmp_path / "in"
+        inp.write_bytes(b"hostile")
+        out = tmp_path / "out"
+        with confinement_ledger() as ledger:
+            assert run_detonation(engine, input_path=inp, output_dir=out, limits=Limits()) == 0
+        return json.loads((out / "metadata.json").read_text()), ledger
+
+    def test_a_reason_is_sealed_rejected_and_detonate_never_runs(self, tmp_path):
+        eng = self._Engine(lambda limits: "bad mode")
+        meta, ledger = self._run(tmp_path, eng)
+        assert meta["status"] == "rejected" and not eng.detonated
+        assert ledger.rejected_before_parse and ledger.runs == 0
+
+    def test_an_engine_refusal_result_keeps_its_payload(self, tmp_path):
+        res = DetonationResult(payload=Record(fields={"error": "bad_param"}), artifacts=[],
+                               detected=Detection(label="unknown", mime="application/octet-stream",
+                                                  confidence=0.0, source="t"),
+                               status="rejected")
+        eng = self._Engine(lambda limits: res)
+        meta, ledger = self._run(tmp_path, eng)
+        assert meta["status"] == "rejected" and meta["payload"]["fields"]["error"] == "bad_param"
+        assert not eng.detonated and ledger.rejected_before_parse
+
+    def test_a_precheck_result_that_is_not_a_refusal_is_an_engine_error(self, tmp_path):
+        ok = DetonationResult(payload=Record(fields={}), artifacts=[],
+                              detected=Detection(label="x", mime="x/y", confidence=1.0, source="t"),
+                              status="ok")
+        eng = self._Engine(lambda limits: ok)
+        meta, _ = self._run(tmp_path, eng)
+        assert meta["status"] == "engine_error" and not eng.detonated
+
+    def test_a_precheck_that_raises_is_an_engine_error_before_any_parse(self, tmp_path):
+        def boom(limits):
+            raise FileNotFoundError("scanner missing")
+        eng = self._Engine(boom)
+        meta, ledger = self._run(tmp_path, eng)
+        assert meta["status"] == "engine_error" and not eng.detonated
+        assert ledger.rejected_before_parse
+
+    def test_a_passing_precheck_runs_detonate_and_excuses_nothing(self, tmp_path):
+        eng = self._Engine(lambda limits: None)
+        meta, ledger = self._run(tmp_path, eng)
+        assert meta["status"] == "ok" and eng.detonated
+        assert not ledger.rejected_before_parse
+
+
+class TestMetadataIsNeverWrittenThroughALink:
+    """The output dir is the engine's to write (on a native macOS worker, a sandboxed parser's
+    writable mount): a `metadata.json` it leaves as a symlink must be replaced, never written
+    through -- the harness runs unsandboxed and could otherwise truncate any file it can write."""
+
+    def _engine(self, plant):
+        class _Planting(_NoopEngine):
+            def detonate(self, input: Path, outdir: Path, limits: Limits) -> DetonationResult:
+                result = super().detonate(input, outdir, limits)
+                plant(outdir / "metadata.json")
+                return result
+        return _Planting()
+
+    def _run(self, tmp_path, engine):
+        inp = tmp_path / "in" / "doc.docx"
+        inp.parent.mkdir()
+        inp.write_bytes(b"doc")
+        out = tmp_path / "out"
+        out.mkdir()
+        return run_detonation(engine, input_path=inp, output_dir=out, limits=_limits()), out
+
+    def test_a_planted_symlink_is_replaced_not_followed(self, tmp_path: Path) -> None:
+        victim = tmp_path / "victim"
+        victim.write_text("host secret")
+        rc, out = self._run(tmp_path, self._engine(lambda p: p.symlink_to(victim)))
+        assert rc == 0
+        assert victim.read_text() == "host secret"
+        meta = out / "metadata.json"
+        assert not meta.is_symlink() and meta.is_file()
+        from blastbox.contract import envelope_from_json
+        assert envelope_from_json(meta.read_bytes()).status == "ok"
+
+    def test_a_dangling_symlink_creates_nothing_at_its_target(self, tmp_path: Path) -> None:
+        target = tmp_path / "would-be-created"
+        rc, out = self._run(tmp_path, self._engine(lambda p: p.symlink_to(target)))
+        assert rc == 0
+        assert not target.exists()
+        assert not (out / "metadata.json").is_symlink()
+
+    def test_no_temp_file_is_left_behind(self, tmp_path: Path) -> None:
+        rc, out = self._run(tmp_path, _NoopEngine())
+        assert rc == 0
+        assert sorted(p.name for p in out.iterdir()) == ["metadata.json", "page-001.png"]

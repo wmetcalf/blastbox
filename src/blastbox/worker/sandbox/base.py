@@ -4,14 +4,354 @@ from __future__ import annotations
 import logging
 import os
 import signal
+import sys
+import contextlib
+import contextvars
+import itertools
+import threading
+import time
+from collections.abc import Callable, Iterator
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from types import EllipsisType
+from typing import Protocol, TypeVar, runtime_checkable
 
 from blastbox.limits import Limits  # noqa: F401 — re-exported for convenience
 
 _log = logging.getLogger("blastbox.worker.sandbox")
+
+T = TypeVar("T")
+
+
+def host_platform() -> str:
+    """``"darwin"`` or ``"linux"`` -- the one place backend selection asks which OS it is on.
+
+    A function (not a constant) so tests can exercise either platform's selection logic on
+    any host, and so the Linux and macOS backends agree on a single answer.
+    """
+    return "darwin" if sys.platform == "darwin" else "linux"
+
+
+_CONFINED_RUNS = 0
+_CONFINED_LOCK = threading.Lock()
+
+
+class ConfinementLedger:
+    """The confined runs credited to ONE detonation (or one warmup).
+
+    On a host with no outer isolation boundary (macOS) the agent refuses an ``ok`` result that
+    no sandboxed run vouches for. A process-wide count diffed around ``detonate()`` could be
+    moved by work that is not this parse: a detector's run finishing late on its own thread, a
+    run left over from an earlier failed job. Credit is therefore scoped to a ledger that the
+    agent opens for the detonation and carries in a context variable:
+
+    * a backend reads the ledger when a run STARTS and credits it when the run finishes, and
+      only while the ledger is still open -- so a run must start and end inside the detonation;
+    * a run with no ledger in its context (a thread started without the caller's context, a
+      detector inside :func:`not_counted`, a run of an earlier job) credits nothing.
+
+    Fail closed: an engine that makes its sandbox calls on a thread it starts gets no credit
+    unless it runs that work in the detonation's context -- :func:`in_this_context` wraps a
+    callable for ``Thread(target=...)`` / ``executor.submit(...)``.
+
+    ``rejected_before_parse`` is the one outcome that needs no credit: the harness refused the
+    job from the engine's ``precheck()`` -- which never receives the input -- so ``detonate()``
+    was never called and nothing parsed it. Only the harness sets it
+    (:func:`note_rejected_before_parse`)."""
+
+    __slots__ = ("_runs", "_open", "_rejected_before_parse")
+
+    def __init__(self) -> None:
+        self._runs = 0
+        self._open = True
+        self._rejected_before_parse = False
+
+    @property
+    def runs(self) -> int:
+        with _CONFINED_LOCK:
+            return self._runs
+
+    @property
+    def rejected_before_parse(self) -> bool:
+        with _CONFINED_LOCK:
+            return self._rejected_before_parse
+
+    def _credit(self) -> None:
+        with _CONFINED_LOCK:
+            if self._open:
+                self._runs += 1
+
+    def _close(self) -> None:
+        with _CONFINED_LOCK:
+            self._open = False
+
+
+_LEDGER: contextvars.ContextVar[ConfinementLedger | None] = contextvars.ContextVar(
+    "blastbox_confinement_ledger", default=None)
+
+
+@contextlib.contextmanager
+def confinement_ledger() -> Iterator[ConfinementLedger]:
+    """Open a ledger for the work done in this block (in this context); closed on exit, after
+    which a run that is still going credits nothing."""
+    ledger = ConfinementLedger()
+    token = _LEDGER.set(ledger)
+    try:
+        yield ledger
+    finally:
+        ledger._close()
+        _LEDGER.reset(token)
+
+
+def note_rejected_before_parse() -> None:
+    """Record, on the open ledger, that this job ended before the engine was handed its input.
+    For the harness only: it calls this when ``precheck()`` refuses the job, and then never
+    calls ``detonate()``."""
+    ledger = _LEDGER.get()
+    if ledger is not None:
+        with _CONFINED_LOCK:
+            if ledger._open:
+                ledger._rejected_before_parse = True
+
+
+def current_ledger() -> ConfinementLedger | None:
+    """The ledger a run starting now would credit (None: it credits nothing)."""
+    return _LEDGER.get()
+
+
+def in_this_context(fn: Callable[..., T]) -> Callable[..., T]:
+    """``fn`` bound to a copy of the caller's context, for an engine that runs its sandbox
+    calls on a thread it starts: a plain thread starts with no ledger, so its runs would not be
+    credited to the detonation that started it."""
+    ctx = contextvars.copy_context()
+
+    def _run(*args: object, **kwargs: object) -> T:
+        return ctx.copy().run(fn, *args, **kwargs)
+    return _run
+
+
+@contextlib.contextmanager
+def not_counted() -> Iterator[None]:
+    """Runs started in this block (in this context) credit no ledger: a backend probe running
+    ``/usr/bin/true``, or an engine's ``detect()``, must not give the engine credit before (or
+    instead of) its ``detonate()`` parser. A thread the block starts without copying the context
+    has no ledger either, so neither path can vouch for the parse."""
+    token = _LEDGER.set(None)
+    try:
+        yield
+    finally:
+        _LEDGER.reset(token)
+
+
+def note_confined_run(ledger: ConfinementLedger | None | EllipsisType = ...) -> None:
+    """Called by a backend that confines a run itself (seatbelt, appsandbox) once the run has
+    proven it ran confined. ``ledger`` is what :func:`current_ledger` returned when the run
+    STARTED (default: the current one, for a caller whose run is instantaneous); it is credited
+    only if still open. The process-wide :func:`confined_runs` total counts every such run."""
+    global _CONFINED_RUNS
+    target = current_ledger() if isinstance(ledger, EllipsisType) else ledger
+    with _CONFINED_LOCK:
+        _CONFINED_RUNS += 1
+    if target is not None:
+        target._credit()
+
+
+def confined_runs() -> int:
+    """Every confined run recorded in this process -- a diagnostic total. The agent's
+    confinement gate does not use it (see :class:`ConfinementLedger`)."""
+    with _CONFINED_LOCK:
+        return _CONFINED_RUNS
+
+
+# Cleanups for runs in flight, for the agent to call before it hard-exits (see
+# run_emergency_cleanups). Only the macOS backends register: their children run in their own
+# sessions, which a supervisor's process-group kill doesn't reach.
+#
+# Registrations NEST per thread: one made while the same thread holds another (run_confined's
+# family cleanup inside a backend's run-wide one) is that one's child, and a family runs on ONE
+# thread, innermost first, the outer one last. Run side by side they would race -- the inner
+# sweep restores the scratch root each round (to find its writers) while the outer one removes
+# it, so a late inner round could put it back after the outer cleanup was done with it.
+_EMERGENCY: dict[int, Callable[[], object]] = {}
+_EMERGENCY_PARENT: dict[int, int | None] = {}
+_EMERGENCY_LOCK = threading.Lock()
+_EMERGENCY_IDS = itertools.count()
+_EMERGENCY_LOCAL = threading.local()
+# Closed (under _EMERGENCY_LOCK) when retirement begins, BEFORE the cleanups are snapshotted: a
+# run registers before it starts its child, so it either lands in the snapshot (and is swept) or
+# is refused and never starts one -- no child can start after the snapshot and outlive the exit.
+_REGISTRATION_CLOSED = False
+
+
+def _emergency_stack() -> list[int]:
+    stack = getattr(_EMERGENCY_LOCAL, "stack", None)
+    if stack is None:
+        stack = _EMERGENCY_LOCAL.stack = []
+    return stack
+
+
+def register_emergency_cleanup(fn: Callable[[], object]) -> int:
+    """Register ``fn`` (kill and sweep one run in flight); returns a token for
+    :func:`unregister_emergency_cleanup`. Nested under the cleanup this thread registered last
+    and still holds, if any (see the note above)."""
+    from blastbox.errors import SandboxError
+
+    stack = _emergency_stack()
+    with _EMERGENCY_LOCK:
+        if _REGISTRATION_CLOSED:
+            raise SandboxError("the worker is shutting down; run not started")
+        token = next(_EMERGENCY_IDS)
+        _EMERGENCY[token] = fn
+        _EMERGENCY_PARENT[token] = stack[-1] if stack else None
+    stack.append(token)
+    return token
+
+
+def unregister_emergency_cleanup(token: int) -> None:
+    stack = _emergency_stack()
+    if token in stack:
+        stack.remove(token)
+    with _EMERGENCY_LOCK:
+        _EMERGENCY.pop(token, None)
+        _EMERGENCY_PARENT.pop(token, None)
+
+
+def _emergency_families() -> list[list[Callable[[], object]]]:
+    """The registered cleanups grouped by family, each family in run order (innermost first).
+    A cleanup whose parent is already gone heads its own family."""
+    with _EMERGENCY_LOCK:
+        fns = dict(_EMERGENCY)
+        parent = {t: p for t, p in _EMERGENCY_PARENT.items() if t in fns}
+    children: dict[int, list[int]] = {}
+    roots: list[int] = []
+    for t in sorted(fns):
+        p = parent.get(t)
+        if p is not None and p in fns:
+            children.setdefault(p, []).append(t)
+        else:
+            roots.append(t)
+
+    def _order(t: int) -> list[int]:
+        out: list[int] = []
+        for c in reversed(children.get(t, [])):     # later (inner) registrations first
+            out.extend(_order(c))
+        out.append(t)
+        return out
+
+    return [[fns[t] for t in _order(r)] for r in roots]
+
+
+def run_emergency_cleanups(timeout_s: float) -> int:
+    """Run every registered cleanup, each family on its own daemon thread (one may hang on
+    whatever hung the run), innermost first within a family, waiting at most ``timeout_s`` in
+    all. Returns how many cleanups completed without raising. With nothing registered (every
+    Linux backend) it returns 0 at once."""
+    families = _emergency_families()
+    if not families:
+        return 0
+    done: list[bool] = []
+
+    def _family(fns: list[Callable[[], object]]) -> None:
+        for fn in fns:
+            try:
+                fn()
+            except Exception as exc:  # noqa: BLE001 -- reported, the rest still run
+                _log.error("sandbox: emergency cleanup failed: %s", exc)
+            else:
+                done.append(True)
+
+    threads = [threading.Thread(target=_family, args=(fns,), daemon=True, name="bb-emergency")
+               for fns in families]
+    for t in threads:
+        t.start()
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    for t in threads:
+        t.join(timeout=max(0.0, deadline - time.monotonic()))
+    return len(done)
+
+
+# Teardown steps a hard exit must not cut in half: a copy-back's renames, which move a host
+# directory's entries aside and the new ones in. Exiting between two of them would leave the
+# operator's directory part-replaced. A retiring agent waits for these sections to finish
+# (bounded), and refuses new ones once it has started. A shutdown signal lands on the main
+# thread, which may itself be inside a section (the warmup's runs are on it): the retirement
+# then runs when that section ends, since waiting on itself would only time out.
+_CRIT_COND = threading.Condition()
+_CRIT_ACTIVE = 0
+_CRIT_LOCAL = threading.local()
+_SHUTTING_DOWN = False
+
+
+@contextlib.contextmanager
+def teardown_critical() -> Iterator[None]:
+    """Mark a section a retiring agent waits for rather than exits in the middle of.
+
+    Raises ``SandboxError`` once shutdown has begun: the work is abandoned before it starts
+    (the backend's emergency cleanup removes what it staged), never interrupted midway."""
+    from blastbox.errors import SandboxError
+
+    global _CRIT_ACTIVE
+    with _CRIT_COND:
+        if _SHUTTING_DOWN:
+            raise SandboxError("the worker is shutting down; teardown step not started")
+        _CRIT_ACTIVE += 1
+    depth = getattr(_CRIT_LOCAL, "depth", 0)
+    _CRIT_LOCAL.depth = depth + 1
+    try:
+        yield
+    finally:
+        _CRIT_LOCAL.depth = depth
+        with _CRIT_COND:
+            _CRIT_ACTIVE -= 1
+            _CRIT_COND.notify_all()
+        if depth == 0:
+            deferred = getattr(_CRIT_LOCAL, "deferred", None)
+            _CRIT_LOCAL.deferred = None
+            if deferred is not None:
+                deferred()
+
+
+def defer_until_teardown_done(fn: Callable[[], object]) -> bool:
+    """If the calling thread is inside a :func:`teardown_critical` section, run ``fn`` when it
+    ends (on this thread) and return True; else return False and do nothing."""
+    if getattr(_CRIT_LOCAL, "depth", 0) == 0:
+        return False
+    _CRIT_LOCAL.deferred = fn
+    return True
+
+
+def shutting_down() -> bool:
+    """True once retirement has begun: new runs and new detonations are refused."""
+    return _REGISTRATION_CLOSED
+
+
+def begin_shutdown(timeout_s: float) -> bool:
+    """Refuse new runs (emergency-cleanup registrations) and new teardown sections, then wait up
+    to ``timeout_s`` for the running sections (on other threads) to finish. True if none is
+    left. Call it before :func:`run_emergency_cleanups`, so the snapshot that call takes is
+    final."""
+    global _SHUTTING_DOWN, _REGISTRATION_CLOSED
+    with _EMERGENCY_LOCK:
+        _REGISTRATION_CLOSED = True
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    with _CRIT_COND:
+        _SHUTTING_DOWN = True
+        while _CRIT_ACTIVE > getattr(_CRIT_LOCAL, "depth", 0):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            _CRIT_COND.wait(left)
+        return True
+
+
+def end_shutdown() -> None:
+    """Undo :func:`begin_shutdown` -- only for a retirement whose exit returned (a test's)."""
+    global _SHUTTING_DOWN, _REGISTRATION_CLOSED
+    with _CRIT_COND:
+        _SHUTTING_DOWN = False
+    with _EMERGENCY_LOCK:
+        _REGISTRATION_CLOSED = False
 
 
 def kill_sandbox_group(proc) -> None:
@@ -102,6 +442,32 @@ class SandboxRequest:
 
     The subprocess never inherits ``os.environ``; it receives only a clean
     ``PATH`` + ``HOME=/tmp`` plus these explicit additions.
+    """
+
+    accelerators: frozenset[str] = frozenset()
+    """Hardware the child needs beyond the CPU: ``"gpu"`` (Metal) and/or ``"ane"`` (Neural Engine).
+
+    Default-deny: an empty set grants no accelerator. Honoured by the macOS ``seatbelt``
+    backend, which opens exactly the driver user clients and services each one needs; the
+    ``appsandbox`` backend (Apple's own profile) already permits both. The Linux backends
+    ignore it.
+    """
+
+    seed_home: Path | None = None
+    """A directory cloned into the per-run scratch HOME before the child starts (macOS backends).
+
+    For warm framework caches: Vision recompiles its Neural Engine plan into an empty cache on
+    every run (~1 s); cloning a cache built by a TRUSTED run makes it ~0.15 s. The child gets
+    its own APFS copy-on-write clone; nothing it writes ever flows back into the seed, so jobs
+    cannot poison each other. Ignored by the Linux backends.
+    """
+
+    capture_home: Path | None = None
+    """After the run, replace this directory's contents with the scratch HOME (minus ``tmp/``).
+
+    How a ``seed_home`` is produced. **Only for trusted runs** -- a self-test on a generated
+    input, never a job: whatever the child leaves in HOME becomes the seed every later run is
+    cloned from. Ignored by the Linux backends.
     """
 
 

@@ -46,6 +46,8 @@ blastbox/
 │   ├── harness     read input → detonate → seal → write metadata.json (+ egress-readiness barrier)
 │   ├── sandbox/    auto-selected in-process hardening: nsjail / bwrap / nono / container
 │   │               (BLASTBOX_SANDBOX override; container inside OCI; nono = Landlock, no userns)
+│   │               macOS: seatbelt (per-run deny-default profile, GPU/ANE opt-in) / appsandbox
+│   │               (ad-hoc-signed App Sandbox slots) — `blastbox macos prepare|doctor`
 │   ├── warm        service lifecycle: boot → warmup → one job → exit
 │   └── fc_warm / fc_guest   Firecracker guest: AF_VSOCK control plane + warm protocol
 └── engines/    reference EXAMPLES only (detonate, urlgrab) — domain engines live in their own repos

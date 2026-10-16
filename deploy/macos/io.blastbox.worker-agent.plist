@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd agent for a blastbox macOS worker: the generic http_agent serving one engine.
+  Install as the (dedicated, non-admin) worker user:
+
+    cp io.blastbox.worker-agent.plist ~/Library/LaunchAgents/
+    # edit the REPLACE_ME values below
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.blastbox.worker-agent.plist
+
+  A per-user agent, not a LaunchDaemon. App Sandbox (the appsandbox backend) only initializes in
+  a per-user launchd domain: from the system domain secinitd refuses to register the sandboxed
+  process (seen with William Tells' App-Sandboxed scanner); gui/<uid> and user/<uid> work. Metal
+  and the Neural Engine have been verified from those domains only. Run it as a dedicated user
+  that owns nothing else; per-job confinement is the seatbelt/appsandbox backend, not this agent.
+
+  Headless (no GUI login): add <key>LimitLoadToSessionType</key><string>Background</string> and
+    sudo launchctl bootstrap user/$(id -u worker) /Users/worker/Library/LaunchAgents/io.blastbox.worker-agent.plist
+  plus a one-shot RunAtLoad LaunchDaemon running that command at boot (the user domain isn't
+  started until something bootstraps into it).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.blastbox.worker-agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>REPLACE_ME/venv/bin/python</string>
+    <string>-I</string>
+    <string>-m</string>
+    <string>blastbox.worker.http_agent</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>BLASTBOX_ENGINE</key>
+    <string>REPLACE_ME module:Class</string>
+    <key>BLASTBOX_WORKER_AGENT_TOKEN</key>
+    <string>REPLACE_ME</string>
+    <!-- loopback for a Mac-only deployment (dispatcher on this Mac). For a LAN dispatcher,
+         bind the LAN address and keep the token (or mTLS / BLASTBOX_WORKER_AGENT_ALLOW_CIDRS). -->
+    <key>BLASTBOX_WORKER_AGENT_BIND</key>
+    <string>127.0.0.1</string>
+    <!-- seatbelt (default) or appsandbox (after `blastbox macos prepare`) -->
+    <key>BLASTBOX_SANDBOX</key>
+    <string>seatbelt</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>StandardOutPath</key>
+  <string>/tmp/blastbox-worker-agent.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/blastbox-worker-agent.log</string>
+</dict>
+</plist>

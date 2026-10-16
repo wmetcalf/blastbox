@@ -13,7 +13,15 @@ Selection order (auto mode):
 4. ``container`` — runs subprocesses directly, trusting the enclosing OCI
    container for isolation.  Always selected inside a Docker/OCI container.
 
-Override with ``BLASTBOX_SANDBOX={nsjail,bwrap,nono,container}``.
+On **macOS** the Linux backends do not exist and ``container`` would be a plain host
+subprocess, so auto mode considers only the Seatbelt family:
+
+1. ``seatbelt`` — a per-run deny-default ``sandbox-exec`` profile (no setup).
+2. ``appsandbox`` — ad-hoc-signed App Sandbox launcher slots; needs
+   ``blastbox macos prepare`` first, otherwise it is skipped as unavailable.
+
+Override with ``BLASTBOX_SANDBOX={nsjail,bwrap,nono,container,seatbelt,appsandbox}``. A
+backend forced on the wrong platform is refused, never silently substituted.
 
 In auto mode an insecure backend (``secure == False``) is refused unless
 ``BLASTBOX_WARN_ON_INSECURE=1``.  In forced mode the same rule applies
@@ -30,7 +38,7 @@ import os
 import shutil
 from pathlib import Path
 from blastbox.errors import SandboxUnavailable
-from blastbox.worker.sandbox.base import Sandbox, SandboxRequest
+from blastbox.worker.sandbox.base import Sandbox, SandboxRequest, host_platform, not_counted
 from blastbox.worker.sandbox.container import ContainerSandbox
 
 
@@ -41,7 +49,23 @@ _log = logging.getLogger("blastbox.worker.sandbox")
 # hosts where namespace sandboxes can't run; it is `secure=False` (no seccomp/ns) so
 # auto-mode only reaches it under BLASTBOX_WARN_ON_INSECURE — otherwise an explicit
 # opt-in via BLASTBOX_SANDBOX=nono.
-_ALL_BACKENDS = ("nsjail", "bwrap", "nono", "container")
+_LINUX_BACKENDS = ("nsjail", "bwrap", "nono", "container")
+# macOS: Seatbelt family only. `container` is deliberately absent -- on a Mac there is no
+# enclosing OCI container, so it would be an unconfined host subprocess.
+_DARWIN_BACKENDS = ("seatbelt", "appsandbox")
+
+
+def _all_backends() -> tuple[str, ...]:
+    """Auto-selection candidates for THIS host's platform, in preference order."""
+    return _DARWIN_BACKENDS if host_platform() == "darwin" else _LINUX_BACKENDS
+
+
+# `container` means "trust the enclosing OCI boundary (runsc / Firecracker)": there is none on a
+# Mac, where it would be a plain host subprocess, so it is Linux-only too.
+_PLATFORM_OF = {
+    **{name: "linux" for name in ("nsjail", "bwrap", "nono", "container")},
+    **{name: "darwin" for name in _DARWIN_BACKENDS},
+}
 
 # Backends preferred inside a container (skip namespace-based backends).
 _CONTAINER_BACKENDS = ("container",)
@@ -92,6 +116,12 @@ def _make_backend(
     if name == "nono":
         from blastbox.worker.sandbox.nono import NonoSandbox
         return NonoSandbox()
+    if name == "seatbelt":
+        from blastbox.worker.sandbox.seatbelt import SeatbeltSandbox
+        return SeatbeltSandbox()
+    if name == "appsandbox":
+        from blastbox.worker.sandbox.appsandbox import AppSandboxSandbox
+        return AppSandboxSandbox()
     raise SandboxUnavailable(f"unknown backend: {name!r}")
 
 
@@ -145,6 +175,11 @@ def _smoketest(sb: Sandbox) -> tuple[bool, Exception | None]:
     to fix, not one to quietly bypass -- but "fix your profile" and "this backend does not
     work here" are different afternoons.
     """
+    with not_counted():         # a probe is not an engine's confined parse
+        return _smoketest_inner(sb)
+
+
+def _smoketest_inner(sb: Sandbox) -> tuple[bool, Exception | None]:
     # Prefer /usr/bin/true which works on merged-usr systems.
     true_path = "/usr/bin/true" if Path("/usr/bin/true").exists() else "/bin/true"
     err = _probe(sb, [true_path])
@@ -230,8 +265,10 @@ def select_sandbox(
             status_path=_status_path,
         )
 
-    # Auto-select: prefer container if we're already inside one.
-    candidates = _CONTAINER_BACKENDS if _in_container() else _ALL_BACKENDS
+    # Auto-select: prefer container if we're already inside one. Linux only: the container
+    # markers are Linux ones, and macOS must only ever pick Seatbelt / App Sandbox.
+    in_container = host_platform() == "linux" and _in_container()
+    candidates = _CONTAINER_BACKENDS if in_container else _all_backends()
 
     # EVERY rejection, not just the last one. When no backend survives, the reason the
     # operator needs is usually the FIRST candidate's (nsjail's) -- "last error" reported
@@ -356,11 +393,18 @@ def _select_forced(
     status_path: Path,
 ) -> Sandbox:
     """Construct and smoketest a forced backend; raise on any failure."""
-    valid_names = _ALL_BACKENDS
+    valid_names = (*_LINUX_BACKENDS, *_DARWIN_BACKENDS)
     if name not in valid_names:
         raise SandboxUnavailable(
             f"BLASTBOX_SANDBOX={name!r} is not a valid backend; "
             f"valid values are: {sorted(valid_names)}"
+        )
+    wanted = _PLATFORM_OF.get(name)
+    here = host_platform()
+    if wanted is not None and wanted != here:
+        raise SandboxUnavailable(
+            f"BLASTBOX_SANDBOX={name!r} is a {wanted} backend and this host is {here}; "
+            f"valid here: {sorted(_all_backends())}"
         )
 
     try:

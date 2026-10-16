@@ -24,6 +24,7 @@ import hashlib
 import contextlib
 import logging
 import inspect
+import json
 import math
 import os
 import re
@@ -153,6 +154,10 @@ def _is_reserved_env_key(key: str, engine_reserved: frozenset[str] = frozenset()
     )
 
 
+_META_MAX_FIELDS = 64
+_META_MAX_BYTES = 8 * 1024
+
+
 def _build_result_summary(envelope) -> dict:
     """Small derivative of the envelope persisted on the Job for list views — kept
     minimal so the generic job layer stays small. Carries the generic detection
@@ -168,14 +173,32 @@ def _build_result_summary(envelope) -> dict:
         "detected": getattr(det, "label", None),
     }
     try:
-        pm = envelope.payload.metadata
+        # An EmbeddedResource payload carries its fields in `.metadata`; a bare Record
+        # payload (engines whose result is one structured record) IS the fields.
+        payload = envelope.payload
+        pm = payload if getattr(payload, "type", None) == "record" else payload.metadata
         if pm and pm.fields:
-            meta = {
-                k: v
-                for k, v in pm.fields.items()
-                if isinstance(v, (bool, int, float))
-                or (isinstance(v, str) and len(v) <= 64)
-            }
+            # Bounded: a bare Record is the engine's whole result, and the summary rides on every
+            # job row (and node_claim's 64 KiB budget). First _META_MAX_FIELDS short scalars, and
+            # stop before the serialized meta passes _META_MAX_BYTES.
+            meta: dict = {}
+            size = 2
+            for k, v in pm.fields.items():
+                if len(meta) >= _META_MAX_FIELDS:
+                    break
+                if not isinstance(k, str) or len(k) > 64:
+                    continue
+                if not (isinstance(v, (bool, int, float)) or (isinstance(v, str) and len(v) <= 64)):
+                    continue
+                # NaN/Infinity would be persisted on the Job and then fail JSON serialization of
+                # every job-list/status response that includes it.
+                if isinstance(v, float) and not math.isfinite(v):
+                    continue
+                add = len(json.dumps(k)) + len(json.dumps(v)) + 2
+                if size + add > _META_MAX_BYTES:
+                    break
+                meta[k] = v
+                size += add
             if meta:
                 summary["meta"] = meta
     except Exception:  # noqa: BLE001 — best-effort enrichment, never fail the job

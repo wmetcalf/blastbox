@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import contextlib
 import json
+import subprocess
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -21,6 +23,14 @@ from blastbox.host.runtime.remote_http import detonate_remote
 from blastbox.limits import Limits
 from blastbox.worker.engine import DetonationResult
 from blastbox.worker.http_agent import serve
+
+
+@pytest.fixture(autouse=True)
+def _linux_agent(monkeypatch):
+    """These tests cover the platform-neutral agent: simulate a Linux worker (inside its
+    runsc/Firecracker boundary) even on a Mac dev box. test_http_agent_darwin.py covers macOS."""
+    import blastbox.worker.http_agent as ha
+    monkeypatch.setattr(ha, "host_platform", lambda: "linux")
 
 
 class _NoopEngine:
@@ -564,3 +574,368 @@ def test_mtls_end_to_end_and_rejects_uncertified_caller(tmp_path):
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_hard_deadline_kills_and_sweeps_runs_in_flight_before_exiting(monkeypatch):
+    # os._exit skips every backend's `finally`: the macOS backends' runs (in their own sessions,
+    # out of reach of launchd's process-group cleanup) are killed and swept first
+    import blastbox.worker.http_agent as hag
+    order: list[object] = []
+    monkeypatch.setattr(hag, "run_emergency_cleanups", lambda t: order.append(("cleanup", t)))
+    monkeypatch.setattr(hag, "_HARD_EXIT", lambda code: order.append(("exit", code)))
+    hag._on_hard_deadline(1.0)
+    # the cleanups get what is left of the budget after the (instant, here) teardown wait
+    assert [(k, v if k == "exit" else round(v)) for k, v in order] == [
+        ("cleanup", hag.EMERGENCY_CLEANUP_S), ("exit", 75)]
+    assert all(v <= hag.EMERGENCY_CLEANUP_S for k, v in order if k == "cleanup")
+
+
+def test_a_failing_emergency_cleanup_still_exits(monkeypatch):
+    import blastbox.worker.http_agent as hag
+    exited: list[int] = []
+
+    def boom(t):
+        raise RuntimeError("cleanup blew up")
+    monkeypatch.setattr(hag, "run_emergency_cleanups", boom)
+    monkeypatch.setattr(hag, "_HARD_EXIT", exited.append)
+    hag._on_hard_deadline(1.0)
+    assert exited == [75]
+
+
+def test_a_shutdown_signal_kills_and_sweeps_runs_in_flight_before_exiting(monkeypatch):
+    # launchd stop/unload/restart sends SIGTERM mid-job: the default action would skip every
+    # cleanup and leave a native run's session holding the writable mounts
+    import signal as _signal
+
+    import blastbox.worker.http_agent as hag
+    order: list[object] = []
+    monkeypatch.setattr(hag, "run_emergency_cleanups", lambda t: order.append(("cleanup", t)))
+    monkeypatch.setattr(hag, "_HARD_EXIT", lambda code: order.append(("exit", code)))
+    hag._on_shutdown_signal(_signal.SIGTERM, None)
+    hag._on_shutdown_signal(_signal.SIGINT, None)
+    assert [(k, v if k == "exit" else round(v)) for k, v in order] == [
+        ("cleanup", hag.EMERGENCY_CLEANUP_S), ("exit", 143),
+        ("cleanup", hag.EMERGENCY_CLEANUP_S), ("exit", 130)]
+
+
+def test_only_one_retirement_runs_when_the_deadline_and_a_signal_race(monkeypatch):
+    import signal as _signal
+
+    import blastbox.worker.http_agent as hag
+    entered, release = threading.Event(), threading.Event()
+    calls: list[str] = []
+
+    def slow_cleanup(t):
+        calls.append("cleanup")
+        entered.set()
+        release.wait(5)
+    monkeypatch.setattr(hag, "run_emergency_cleanups", slow_cleanup)
+    exits: list[int] = []
+    monkeypatch.setattr(hag, "_HARD_EXIT", exits.append)
+    t = threading.Thread(target=hag._on_hard_deadline, args=(1.0,))
+    t.start()
+    assert entered.wait(5)
+    hag._on_shutdown_signal(_signal.SIGTERM, None)   # loses the race: returns, no second sweep
+    release.set()
+    t.join(5)
+    assert calls == ["cleanup"] and exits == [75]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
+@pytest.mark.parametrize("signame,code", [("SIGTERM", 143), ("SIGINT", 130)])
+def test_a_real_shutdown_signal_runs_the_registered_cleanups(tmp_path, signame, code):
+    # End to end in a real process: the handler main() installs reaches the backends' registry
+    import signal as _signal
+    marker = tmp_path / "swept"
+    script = (
+        "import sys, time\n"
+        "from blastbox.worker import http_agent as hag\n"
+        "from blastbox.worker.sandbox.base import register_emergency_cleanup\n"
+        f"register_emergency_cleanup(lambda: open({str(marker)!r}, 'w').write('ok'))\n"
+        "hag._install_shutdown_handlers()\n"
+        "print('ready', flush=True)\n"
+        "time.sleep(30)\n"
+        "sys.exit(9)\n")
+    proc = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE)
+    try:
+        assert proc.stdout.readline().strip() == b"ready"
+        proc.send_signal(getattr(_signal, signame))
+        assert proc.wait(timeout=20) == code
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    assert marker.read_text() == "ok"
+
+
+def test_a_failing_optional_warmup_does_not_gate_detonate():
+    # Linux default: the warmup gate is off, a failing warmup is logged and the agent runs
+    # cold -- /detonate must keep serving (the macOS-only 503 gate never engages here).
+    import blastbox.worker.http_agent as hag
+
+    class Boom(_NoopEngine):
+        def warmup(self):
+            raise RuntimeError("self-test decoded nothing")
+    err = hag._warmup(Boom(), require_warmup=False)
+    assert err is None
+    httpd = serve(Boom(), bind="127.0.0.1", port=0, warmup_error=err)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        with _post(f"http://127.0.0.1:{httpd.server_address[1]}/detonate?name=x", b"MZ") as r:
+            assert r.status == 200
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+# A retiring agent must not exit between a copy-back's renames (a host dir left part-replaced).
+
+def test_a_retirement_waits_for_a_copy_back_in_progress(monkeypatch):
+    import blastbox.worker.http_agent as hag
+    from blastbox.worker.sandbox.base import teardown_critical
+    order: list[object] = []
+    monkeypatch.setattr(hag, "run_emergency_cleanups", lambda t: order.append("cleanup"))
+    monkeypatch.setattr(hag, "_HARD_EXIT", lambda code: order.append(("exit", code)))
+    inside, release = threading.Event(), threading.Event()
+
+    def copy_back():
+        with teardown_critical():
+            inside.set()
+            release.wait(5)
+            order.append("renames done")
+    t = threading.Thread(target=copy_back)
+    t.start()
+    assert inside.wait(5)
+    r = threading.Thread(target=hag._on_hard_deadline, args=(1.0,))
+    r.start()
+    r.join(0.3)
+    assert order == [] and r.is_alive()          # waiting on the renames, not exiting
+    release.set()
+    t.join(5)
+    r.join(5)
+    assert order == ["renames done", "cleanup", ("exit", 75)]
+
+
+def test_a_signal_landing_inside_a_teardown_section_retires_when_it_ends(monkeypatch):
+    # The handler runs on the main thread, which may itself be mid-copy-back (warmup runs
+    # there): waiting on itself would only time out, so the section's end retires instead.
+    import signal as _signal
+
+    import blastbox.worker.http_agent as hag
+    from blastbox.worker.sandbox.base import teardown_critical
+    order: list[object] = []
+    monkeypatch.setattr(hag, "run_emergency_cleanups", lambda t: order.append("cleanup"))
+    monkeypatch.setattr(hag, "_HARD_EXIT", lambda code: order.append(("exit", code)))
+    with teardown_critical():
+        hag._on_shutdown_signal(_signal.SIGTERM, None)
+        order.append("renames done")
+    assert order == ["renames done", "cleanup", ("exit", 143)]
+
+
+def test_no_teardown_section_starts_once_shutdown_has_begun():
+    from blastbox.errors import SandboxError
+    from blastbox.worker.sandbox.base import begin_shutdown, end_shutdown, teardown_critical
+    assert begin_shutdown(0)
+    try:
+        with pytest.raises(SandboxError, match="shutting down"):
+            with teardown_critical():
+                pytest.fail("a section started after shutdown began")
+    finally:
+        end_shutdown()
+    with teardown_critical():
+        pass
+
+
+class TestWarmupIsBoundedByTheHardDeadline:
+    """A warmup that never returns would hold the job lock forever -- /detonate 409s and /healthz
+    keeps the old warmup error -- while the process looks alive to launchd (KeepAlive never
+    restarts it). Every warmup, startup and retry, retires the worker at the hard deadline."""
+
+    class _Eng:
+        name = "w"
+        formats = frozenset({"*"})
+
+        def __init__(self, hang_from: int):
+            self.calls = 0
+            self.hang_from = hang_from
+            self.release = threading.Event()
+
+        def warmup(self):
+            self.calls += 1
+            if self.calls >= self.hang_from:
+                self.release.wait(10)
+            raise RuntimeError("self-test failed")
+
+        def detonate(self, input, outdir, limits):
+            raise AssertionError("not reached")
+
+    def test_a_hung_retry_retires_the_worker(self, monkeypatch):
+        import blastbox.worker.http_agent as hag
+        exits: list[int] = []
+        fired = threading.Event()
+        monkeypatch.setattr(hag, "_HARD_EXIT", lambda code: (exits.append(code), fired.set()))
+        monkeypatch.setenv("BLASTBOX_WORKER_AGENT_HARD_TIMEOUT_S", "0.3")
+        eng = self._Eng(hang_from=2)
+        err = hag._bounded_warmup(eng, require_warmup=True)
+        assert err is not None and exits == []          # a failed (not hung) warmup doesn't retire
+        httpd = hag.serve(eng, bind="127.0.0.1", port=0, warmup_error=err)
+        stop = threading.Event()
+        try:
+            t = hag.retry_warmup(eng, httpd.RequestHandlerClass, first_s=0.02, max_s=0.02,
+                                 stop=stop)
+            assert fired.wait(5), "a hung warmup retry never retired the worker"
+            assert exits == [75]
+        finally:
+            stop.set()
+            eng.release.set()
+            t.join(5)
+            httpd.server_close()
+
+    def test_a_hung_startup_warmup_retires_the_worker(self, monkeypatch):
+        import blastbox.worker.http_agent as hag
+        fired = threading.Event()
+        monkeypatch.setattr(hag, "_HARD_EXIT", lambda code: fired.set())
+        monkeypatch.setenv("BLASTBOX_WORKER_AGENT_HARD_TIMEOUT_S", "0.3")
+        eng = self._Eng(hang_from=1)
+        t = threading.Thread(target=hag._bounded_warmup, args=(eng, True), daemon=True)
+        t.start()
+        try:
+            assert fired.wait(5), "a hung startup warmup never retired the worker"
+        finally:
+            eng.release.set()
+            t.join(5)
+
+    def test_a_warmup_that_returns_cancels_the_deadline(self, monkeypatch):
+        import time
+        import blastbox.worker.http_agent as hag
+        exits: list[int] = []
+        monkeypatch.setattr(hag, "_HARD_EXIT", exits.append)
+        monkeypatch.setenv("BLASTBOX_WORKER_AGENT_HARD_TIMEOUT_S", "0.2")
+        hag._bounded_warmup(self._Eng(hang_from=99), True)
+        time.sleep(0.5)
+        assert exits == []
+
+
+class TestShutdownStopsNewRuns:
+    """Codex P1 (#198): retirement snapshots the cleanups it runs. A run started after that
+    snapshot would not be swept, so once retirement begins no new run may start: /detonate and
+    /healthz answer 503, and registering a run's cleanup (which every backend does before it
+    starts its child) raises."""
+
+    @pytest.fixture
+    def shutting(self):
+        from blastbox.worker.sandbox.base import begin_shutdown, end_shutdown
+        assert begin_shutdown(0)
+        try:
+            yield
+        finally:
+            end_shutdown()
+
+    def test_a_detonation_arriving_during_shutdown_is_refused(self, shutting):
+        ran: list[bool] = []
+
+        class _Eng(_NoopEngine):
+            def detonate(self, input, outdir, limits):
+                ran.append(True)
+                return super().detonate(input, outdir, limits)
+
+        err = _serve_engine_and_post(_Eng())
+        assert err is not None and err.code == 503
+        assert json.loads(err.read())["error"] == "shutting_down"
+        assert ran == []
+
+    def test_healthz_reports_unavailable_during_shutdown(self, shutting):
+        httpd, port = _running_agent()
+        try:
+            with pytest.raises(urllib.error.HTTPError) as exc:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=10)
+            assert exc.value.code == 503
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_a_cleanup_registered_after_shutdown_began_is_refused(self, shutting):
+        from blastbox.errors import SandboxError
+        from blastbox.worker.sandbox.base import register_emergency_cleanup
+        with pytest.raises(SandboxError, match="shutting down"):
+            register_emergency_cleanup(lambda: None)
+
+    def test_a_run_whose_registration_is_refused_never_starts_its_child(self, shutting,
+                                                                        tmp_path):
+        from blastbox.errors import SandboxError
+        from blastbox.worker.sandbox import macos_common as mc
+        started: list[object] = []
+
+        def popen(*a, **kw):
+            started.append(a)
+            raise AssertionError("a child was started after the shutdown snapshot")
+
+        with pytest.raises(SandboxError, match="shutting down"):
+            mc.run_confined(["/bin/true"], env={"PATH": mc.MINIMAL_PATH},
+                            limits=Limits(timeout_s=5), cwd=tmp_path, popen=popen)
+        assert started == []
+
+    def test_registration_reopens_when_a_retirement_returns(self):
+        from blastbox.worker.sandbox.base import (
+            begin_shutdown, end_shutdown, register_emergency_cleanup, shutting_down,
+            unregister_emergency_cleanup)
+        assert begin_shutdown(0) and shutting_down()
+        end_shutdown()
+        assert not shutting_down()
+        unregister_emergency_cleanup(register_emergency_cleanup(lambda: None))
+
+
+class TestTheOutputTarNeverFollowsLinks:
+    """The agent archives the output dir unsandboxed: a symlink an engine (a sandboxed parser,
+    on macOS) left there must not make it read, size or ship a host file it points at."""
+
+    def _post_for_tar(self, engine):
+        import io
+        import tarfile
+        httpd = serve(engine, bind="127.0.0.1", port=0)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        port = httpd.server_address[1]
+        try:
+            with _post(f"http://127.0.0.1:{port}/detonate?name=x.bin", b"MZ") as r:
+                data = r.read()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        with tarfile.open(fileobj=io.BytesIO(data)) as tf:
+            return {m.name: (m, tf.extractfile(m).read() if m.isfile() else None)
+                    for m in tf.getmembers()}
+
+    def test_a_symlink_to_a_host_file_is_not_archived(self, tmp_path):
+        secret = tmp_path / "secret"
+        secret.write_bytes(b"host credentials")
+
+        class _Linking:
+            name = "linker"
+            formats = frozenset({"*"})
+
+            def detonate(self, input: Path, outdir: Path, limits: Limits) -> DetonationResult:
+                (outdir / "loot").symlink_to(secret)
+                (outdir / "sub").mkdir()
+                (outdir / "sub" / "deep").symlink_to(secret)
+                return _one_png_result(outdir)
+
+        members = self._post_for_tar(_Linking())
+        assert "loot" not in members and "sub/deep" not in members
+        assert all(b"host credentials" not in (body or b"") for _, body in members.values())
+        assert "page-001.png" in members and "metadata.json" in members
+
+    def test_a_symlink_to_a_huge_file_does_not_count_against_the_cap(self, tmp_path,
+                                                                     monkeypatch):
+        big = tmp_path / "big"
+        big.write_bytes(b"x" * 4096)
+        monkeypatch.setenv("BLASTBOX_MAX_TOTAL_ARTIFACTS", "1024")
+
+        class _Linking:
+            name = "linker"
+            formats = frozenset({"*"})
+
+            def detonate(self, input: Path, outdir: Path, limits: Limits) -> DetonationResult:
+                (outdir / "big").symlink_to(big)
+                return _one_png_result(outdir)
+
+        assert "big" not in self._post_for_tar(_Linking())

@@ -362,7 +362,7 @@ registered a different one, in either boot order, including local-versus-remote.
 
 | Var | Default | Notes |
 |---|---|---|
-| `BLASTBOX_SANDBOX` | auto | Force the inner backend: `nsjail` → `bwrap` → `nono` → `container`. Auto picks the best available; `container` is chosen inside an OCI host. |
+| `BLASTBOX_SANDBOX` | auto | Force the inner backend. Linux: `nsjail` → `bwrap` → `nono` → `container` (auto picks the best available; `container` is chosen inside an OCI host). **macOS:** `seatbelt` → `appsandbox` (see below); `container` is never auto-selected there. A backend forced on the wrong OS is refused, not substituted. |
 | `BLASTBOX_NONO_BIN` | `nono` on PATH | nono binary for the standalone `NonoSandbox` backend. |
 | `BLASTBOX_NONO_STATE_DIR` | `/var/lib/blastbox/nono-state` | nono's relocated `$HOME/.nono` state root (must be **off** the grants). |
 | `BLASTBOX_WORKER_NONO_WRAP` | off | **Outer** nono-wrap of the *whole worker command* (cold path). Landlock-gated: applied under `runc`, **skipped+warned under `runsc`** (gVisor Sentry has no Landlock — see DEPLOYMENT). |
@@ -370,6 +370,31 @@ registered a different one, in either boot order, including local-versus-remote.
 | `BLASTBOX_WORKER_NONO_PROFILE` | `""` | nono profile JSON (e.g. a `blastbox.profile`-generated policy) for the outer wrap; preferred over the coarse baseline grants. |
 | `BLASTBOX_WORKER_NONO_STATE_DIR` | `/run/nono` | Dedicated writable tmpfs for the outer wrap's nono state (off the grants). |
 | `BLASTBOX_ENGINE` | `""` | Worker-side engine selector breadcrumb (reserved; not client-settable). |
+
+### macOS backends (`seatbelt`, `appsandbox`)
+
+Both confine the child with the kernel's Sandbox.kext; design + measurements in
+[specs/2026-10-10-macos-sandbox-design.md](superpowers/specs/2026-10-10-macos-sandbox-design.md).
+`seatbelt` (default) needs no setup. `appsandbox` needs `blastbox macos prepare` once. Check both
+with `blastbox macos doctor [-- <engine self-test>]`. Network is always denied on macOS, even
+when a netpolicy grants egress: there is no netd/rooter there to steer it.
+
+| Var | Default | Notes |
+|---|---|---|
+| `BLASTBOX_MACOS_SCRATCH_DIR` | `$TMPDIR` | Parent of each run's fresh 0700 scratch dir (the child's `HOME`, `TMPDIR`, `CFFIXED_USER_HOME` → framework caches). Deleted after every run. |
+| `BLASTBOX_MACOS_NPROC_BUDGET` | `512` | Processes all of the worker's concurrent sandboxed runs (Seatbelt and App Sandbox) may create together. Darwin's `RLIMIT_NPROC` counts the whole user, so every run in flight gets the same absolute ceiling: the user's process count when the first of them started, plus this budget (each run is also capped at its own count + 64). Re-measured once no run is in flight. |
+| `BLASTBOX_APPSANDBOX_ROOT` | `~/Library/Application Support/blastbox/appsandbox` | Slot root written by `blastbox macos prepare` (manifest, signed launcher bundles, per-slot `io/`, locks). Must not overlap any `--ro` path. |
+| `BLASTBOX_APPSANDBOX_SLOT_WAIT_S` | `30` | How long a run waits for a free slot before failing. Concurrency == `prepare --slots`. |
+| `BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE` | `0` | macOS only: let the agent serve an engine that doesn't declare `sandboxed_parsing = True` (it may then parse hostile input inside the agent). Accepts `0/1/true/false/yes/no` (any case); any other value stops the agent at startup. |
+| `BLASTBOX_WORKER_AGENT_REQUIRE_WARMUP` | `1` on macOS, `0` elsewhere | A failed `engine.warmup()` (or an engine with none) makes `/healthz` 503 (retried with backoff until it passes) instead of continuing cold. Accepts `0/1/true/false/yes/no` (any case); any other value stops the agent at startup. |
+
+`SandboxRequest.accelerators` (`{"gpu", "ane"}`) is default-deny: `seatbelt` opens exactly the
+Metal / Neural Engine driver clients and services each needs; `appsandbox` (Apple's application
+profile) already permits both. Memory: Darwin does not enforce `RLIMIT_AS`, so
+`Limits.memory_bytes` is enforced by polling the summed RSS of the run's whole process family, and `tmpfs_bytes` by polling its writable dirs (SIGKILL when over).
+`SandboxRequest.seed_home` / `capture_home` (macOS only) clone a warm cache into each fresh run and
+capture one from a **trusted** run. Vision's Neural Engine plan drops from ~1.1 s to ~0.1–0.15 s per
+image, with no state flowing back between jobs.
 
 ## Warm pool
 
@@ -685,7 +710,7 @@ plain HTTP for a *trusted private VPC* — do not expose it to the public intern
 | `BLASTBOX_WORKER_AGENT_ALLOW_INSECURE` | `0` | Opt back into serving on a non-loopback address with **no** request gate — only when an **external** gate already fences the port (AWS microVM JWE proxy, a security group, a private worker network). Proxy-gated tiers (e.g. `aws-lambda-microvm`) that don't bake in a token must set this in the worker image env. |
 | `BLASTBOX_WORKER_AGENT_TOKEN` | — | Bearer token required on `/detonate` (`X-aws-proxy-auth` / `Authorization: Bearer`). |
 | `BLASTBOX_WORKER_AGENT_MAX_BYTES` | `512MiB` | Max request body. |
-| `BLASTBOX_WORKER_AGENT_HARD_TIMEOUT_S` | `2×timeout+30` | Hard ceiling for one detonation; a hung engine that blows past it **retires the worker** (`os._exit`, the supervisor/pool replaces the box) so it can't hold the single-flight lock forever. Defaults to twice the per-job `timeout_s` + 30s (never trips a normal job); `0` disables. |
+| `BLASTBOX_WORKER_AGENT_HARD_TIMEOUT_S` | `2×timeout+30` | Hard ceiling for one detonation, and for each warmup (startup and every retry); a hung engine that blows past it **retires the worker** (`os._exit`, the supervisor/pool replaces the box) so it can't hold the single-flight lock forever. Defaults to twice the per-job `timeout_s` + 30s (never trips a normal job); `0` disables. |
 | `BLASTBOX_WORKER_AGENT_TLS_CERT` / `_TLS_KEY` | — | Serve **HTTPS** with this server cert/key (mint via `blastbox pki issue-server`). |
 | `BLASTBOX_WORKER_AGENT_CLIENT_CA` | — | Require a **client** cert signed by this CA (**mTLS**) — the cryptographic allowed-caller gate. |
 | `BLASTBOX_WORKER_AGENT_ALLOW_CIDRS` | — | Comma-list of CIDRs allowed to POST `/detonate` (peer-IP allowlist; 403 otherwise). Defense-in-depth with mTLS + the SG. |

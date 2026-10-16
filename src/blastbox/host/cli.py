@@ -2436,6 +2436,12 @@ def build_parser() -> argparse.ArgumentParser:
     pv = sub.add_parser("version", help="print version and exit")
     pv.set_defaults(func=_version_cmd)
 
+    # macOS sandbox setup/verification. Lives in the lean worker package (it runs on the Mac
+    # worker, which may not install blastbox[host]); registered here so `blastbox macos ...`
+    # works wherever the full CLI is installed.
+    from blastbox.worker.sandbox.macos_tool import add_parser as _add_macos_parser
+    _add_macos_parser(sub)
+
     return p
 
 
@@ -3022,6 +3028,8 @@ def main(argv: list[str] | None = None) -> int:
     configure_logging(format_="text")
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "self_test", None) and args.self_test[0] == "--":
+        args.self_test = args.self_test[1:]
     return args.func(args)
 
 

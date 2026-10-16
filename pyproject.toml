@@ -110,6 +110,7 @@ markers = [
     "integration: needs sandbox + soffice (run in the image)",
     "docker: exercises the built Docker image",
     "perf: performance benchmark gate; needs a benchmarkable host (skipped otherwise)",
+    "host_platform: sandbox test that runs against the REAL host OS (opts out of Linux simulation)",
 ]
 
 [tool.ruff.lint]

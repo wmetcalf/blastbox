@@ -31,6 +31,8 @@ import ipaddress
 import json
 import logging
 import os
+import stat
+import signal
 import tarfile
 import tempfile
 import threading
@@ -45,6 +47,15 @@ from blastbox.limits import Limits
 from blastbox.worker.engine import Engine
 from blastbox.worker.harness import run_detonation
 from blastbox.worker.load import load_engine
+from blastbox.worker.sandbox.base import (
+    begin_shutdown,
+    confinement_ledger,
+    defer_until_teardown_done,
+    end_shutdown,
+    host_platform,
+    run_emergency_cleanups,
+    shutting_down,
+)
 
 _log = logging.getLogger("blastbox.worker.http_agent")
 
@@ -95,12 +106,19 @@ class _TruncatedBody(Exception):
     """The client sent fewer bytes than Content-Length declared."""
 
 
+class _Unconfined(Exception):
+    """A detonation on a host with no outer boundary made no confined run (and was not refused
+    before the input was handed to the engine)."""
+
+
 class _SlowBody(Exception):
     """The client trickled the request body past the total wall-clock budget while holding the single-
     flight job lock -- one slow uploader must not take the worker out of service (every other job 409s)."""
 
 
 _HARD_EXIT = os._exit   # injectable seam: tests override this to avoid killing the test runner
+# How long a hard exit waits for the backends' emergency kill/sweep of the runs in flight.
+EMERGENCY_CLEANUP_S = 15.0
 
 
 def _hard_deadline_s(limits: Limits) -> float:
@@ -113,23 +131,93 @@ def _hard_deadline_s(limits: Limits) -> float:
     return float(limits.timeout_s) * 2.0 + 30.0
 
 
-def _on_hard_deadline(hard_s: float) -> None:
+def _on_hard_deadline(hard_s: float, what: str = "detonation") -> None:
     # A hung engine (in-process infinite loop / a child ignoring its own timeout) holds _JOB_LOCK forever:
     # /healthz stays 200 but every /detonate 409s -- a black hole on a reused static/warm box. A Python
     # thread can't be killed and a per-job subprocess would forfeit engine warmth, so RETIRE the whole
     # worker; the supervisor / warm pool replaces the box (its /healthz stops answering -> fail-closed).
-    _log.critical("http_agent: detonation exceeded the %.0fs hard deadline -- retiring the worker (a hung "
-                  "engine can't be killed in-thread); the supervisor/pool will replace it", hard_s)
+    _log.critical("http_agent: %s exceeded the %.0fs hard deadline -- retiring the worker (a hung "
+                  "engine can't be killed in-thread); the supervisor/pool will replace it", what, hard_s)
     with contextlib.suppress(Exception):
         import faulthandler
         faulthandler.dump_traceback()
-    _HARD_EXIT(75)
+    _retire(75)
+
+
+# One retirement per process: the hard deadline (a watchdog thread) and a shutdown signal (the
+# main thread) can race, and a second SIGTERM can land while the first is still sweeping. The
+# loser returns; the winner exits. Released only if the exit returns (a test's fake exit).
+_RETIRE_LOCK = threading.Lock()
+
+
+def _retire(code: int) -> None:
+    """Kill and sweep the runs in flight (bounded), then exit with ``code``.
+
+    os._exit skips every backend's `finally`. The macOS backends start their children in new
+    sessions -- out of reach of a supervisor that kills the agent's process group (launchd) --
+    so kill and sweep the runs in flight first, bounded: a Seatbelt child must not outlive the
+    agent with direct access to its writable mounts. (Linux backends register nothing.)
+
+    Nor may it exit between a copy-back's renames (a host directory left part-replaced): new
+    teardown sections are refused, running ones are waited for -- within the same budget --
+    and a signal that lands on a thread inside one retires when that section ends."""
+    if defer_until_teardown_done(lambda: _retire(code)):
+        return
+    if not _RETIRE_LOCK.acquire(blocking=False):
+        return
+    try:
+        deadline = time.monotonic() + EMERGENCY_CLEANUP_S
+        with contextlib.suppress(Exception):
+            # renames take milliseconds: most of the budget stays for killing the runs
+            if not begin_shutdown(EMERGENCY_CLEANUP_S / 3):
+                # The cleanups still run -- killing the runs' processes can't wait -- but each
+                # backend's Leftovers skips the tree a still-running swap renames out of
+                # (Leftovers.busy): removing it mid-swap would leave the host directory
+                # part-replaced. It stays as a named leftover the next run deals with.
+                _log.error("http_agent: a copy-back was still running at the shutdown deadline; "
+                           "its tree is left in place")
+            run_emergency_cleanups(max(0.0, deadline - time.monotonic()))
+        _HARD_EXIT(code)
+        end_shutdown()      # only reached when the exit returned (a test's fake exit)
+    finally:
+        _RETIRE_LOCK.release()
+
+
+def _on_shutdown_signal(signum: int, frame: object) -> None:
+    # launchd stop/unload/restart sends SIGTERM (then SIGKILL after its exit timeout). Python's
+    # default action ends the process with no `finally` and no cleanup, leaving a native run's
+    # session -- and its access to the writable mounts -- behind. Python runs this handler on the
+    # main thread between bytecodes, not in the signal frame, so the bounded sweep is safe here.
+    _log.warning("http_agent: signal %d -- killing and sweeping runs in flight before exiting", signum)
+    _retire(128 + signum)
+
+
+def _install_shutdown_handlers() -> None:
+    """SIGTERM/SIGINT run the emergency cleanups before exiting. Installed by main() only (an
+    embedder of serve() keeps its own signal handling)."""
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, _on_shutdown_signal)
 
 
 class _Handler(BaseHTTPRequestHandler):
     engine: Engine = None  # type: ignore[assignment]  # set on the server
     token: str | None = None
+    # macOS (no outer isolation boundary): an `ok` result must come from a sandboxed run.
+    require_confined: bool = False
+    # Set when warmup (an engine's known-positive self-test) failed and health is gated on it.
+    warmup_error: str | None = None
     max_bytes: int = _DEFAULT_MAX_BYTES
+
+    def _pre_detect(self) -> bool:
+        """Whether to call the engine's optional ``detect()`` in this process. Not on macOS:
+        nothing contains this agent there, and ``sandboxed_parsing`` covers ``detonate()``, not a
+        detector that may parse the hostile file itself -- unless the engine declares
+        ``sandboxed_detect = True`` (its detect() also goes through the sandbox, or reads no
+        input bytes)."""
+        if host_platform() != "darwin":
+            return True
+        return bool(getattr(self.engine, "sandboxed_detect", False))
+
     allow_nets: list = []  # peer-IP allowlist (empty = allow any; mTLS is the stronger gate)
     # Socket read timeout (StreamRequestHandler.setup() applies it): a stalled/slowloris request body
     # would otherwise hold the single-flight _JOB_LOCK forever and wedge the whole worker. Overridable
@@ -178,6 +266,16 @@ class _Handler(BaseHTTPRequestHandler):
             if not self._authed():
                 self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
                 return
+            if shutting_down():
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                           {"ok": False, "engine": self.engine.name, "error": "shutting_down"})
+                return
+            if self.warmup_error is not None:
+                # Not ready: a static pool skips this box instead of feeding it jobs whose
+                # results can't be trusted (e.g. a sandbox that silently lost a grant).
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                           {"ok": False, "engine": self.engine.name, "warmup": "failed"})
+                return
             self._json(HTTPStatus.OK, {"ok": True, "engine": self.engine.name})
         else:
             self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
@@ -192,6 +290,18 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if not self._authed():
             self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+            return
+        if shutting_down():
+            # Retiring: its emergency sweep is final, so a run started now would not be swept.
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "shutting_down"})
+            return
+        if self.warmup_error is not None:
+            # A required warmup is failing (set only when the self-test gate is on -- macOS by
+            # default; never on a Linux worker running cold). /healthz alone gates only clients
+            # that honour it: a direct client must not get results from a sandbox whose
+            # self-test fails (e.g. one that lost a grant and returns plausible empty `ok`s).
+            # The retry clears this, reopening /detonate together with /healthz.
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "not_ready", "warmup": "failed"})
             return
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -214,8 +324,25 @@ class _Handler(BaseHTTPRequestHandler):
         if not _JOB_LOCK.acquire(blocking=False):
             self._json(HTTPStatus.CONFLICT, {"error": "busy"})
             return
+        if shutting_down():
+            # Retirement began while this request was being read (or the swept job just released
+            # the lock): refuse rather than start a run the final sweep has already passed.
+            _JOB_LOCK.release()
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "shutting_down"})
+            return
         try:
             tar = self._run_job(name, length, params)
+        except _Unconfined:
+            # Refuse the result AND retire: this process may have parsed hostile input with no
+            # boundary around it, so it must not serve another job. Retired while still holding
+            # _JOB_LOCK, so no job starts in between; launchd's KeepAlive starts a fresh agent.
+            _log.critical("http_agent: a detonation finished without a confined run -- refusing "
+                          "its result and retiring this agent (it may have parsed the input "
+                          "in-process)")
+            with contextlib.suppress(OSError):
+                self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "unconfined"})
+            _retire(75)
+            return
         except _TruncatedBody:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "truncated_body"})
             return
@@ -294,11 +421,24 @@ class _Handler(BaseHTTPRequestHandler):
                 if _wd is not None:
                     _wd.daemon = True
                     _wd.start()
+                # Credit for the macOS gate below is scoped to THIS detonation: only sandbox runs
+                # that start and finish inside it, in its context, count (see ConfinementLedger) --
+                # not a late detector run on its own thread or a leftover of an earlier job.
                 try:
-                    rc = run_detonation(self.engine, input_path=in_path, output_dir=out_dir, limits=limits)
+                    with confinement_ledger() as ledger:
+                        rc = run_detonation(self.engine, input_path=in_path, output_dir=out_dir,
+                                            limits=limits, pre_detect=self._pre_detect())
                 finally:
                     if _wd is not None:
                         _wd.cancel()
+            if self.require_confined and ledger.runs == 0 and not ledger.rejected_before_parse:
+                # No outer boundary on this host. A job that made no sandboxed run may have parsed
+                # the input in THIS process -- whatever status it sealed: an engine whose sandbox
+                # call failed can fall back to inspecting the file and return `rejected`, an
+                # in-process parser that raised is sealed `engine_error`. Status says what the
+                # result means, not whether anything parsed the input; the only outcome provably
+                # reached before that is the harness's precheck() refusal (rejected_before_parse).
+                raise _Unconfined
             if rc != 0:
                 # harness could not seal metadata.json -- surface as a job failure, not a silent 200
                 raise RuntimeError(f"harness failed (rc={rc}); metadata.json not sealed")
@@ -333,27 +473,49 @@ class _Handler(BaseHTTPRequestHandler):
                     if entry_cap is not None and entries > entry_cap:
                         spool.close()
                         raise RuntimeError(f"output exceeds {entry_cap} entries (directory bomb?)")
-                    if not f.is_file():
+                    # lstat, not is_file(): the output dir is the engine's (on macOS a sandboxed
+                    # parser's writable mount), and a symlink there must never lead this
+                    # process to read, size or archive a host file the parser couldn't reach.
+                    try:
+                        if not stat.S_ISREG(f.lstat().st_mode):
+                            continue
+                    except FileNotFoundError:
                         continue
                     candidates.append(f)
                     if file_cap is not None and len(candidates) > file_cap:
                         spool.close()
                         raise RuntimeError(f"output exceeds {file_cap} files")
                 for f in sorted(candidates):
-                    # metadata.json is a control file, not a declared artifact -- don't count it toward
-                    # the artifact byte budget (matches the cold trust gate + the host extractor), but DO
-                    # cap it by its OWN budget BEFORE archiving so a buggy engine's huge metadata can't
-                    # fill the worker disk (a second copy lands in the spooled tar) before the host rejects it.
-                    if f.name == "metadata.json" and f.parent == out_dir:
-                        if meta_cap is not None and f.stat().st_size > meta_cap:
+                    # Opened no-follow and sized from that descriptor: an entry swapped for a link
+                    # (or a FIFO) after the walk is refused, never read through.
+                    try:
+                        fd = os.open(f, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                                     | getattr(os, "O_CLOEXEC", 0))
+                    except OSError as exc:
+                        spool.close()
+                        raise RuntimeError(f"output entry {f.relative_to(out_dir)} changed "
+                                           f"while it was archived ({exc.strerror})") from None
+                    with os.fdopen(fd, "rb") as fh:
+                        st = os.fstat(fh.fileno())
+                        if not stat.S_ISREG(st.st_mode):
                             spool.close()
-                            raise RuntimeError(f"metadata.json is {f.stat().st_size} bytes (> {meta_cap})")
-                    else:
-                        total += f.stat().st_size
-                        if cap is not None and total > cap:
-                            spool.close()
-                            raise RuntimeError(f"output exceeds {cap} bytes")
-                    tf.add(f, arcname=str(f.relative_to(out_dir)))
+                            raise RuntimeError(f"output entry {f.relative_to(out_dir)} is not a "
+                                               "regular file")
+                        # metadata.json is a control file, not a declared artifact -- don't count it toward
+                        # the artifact byte budget (matches the cold trust gate + the host extractor), but DO
+                        # cap it by its OWN budget BEFORE archiving so a buggy engine's huge metadata can't
+                        # fill the worker disk (a second copy lands in the spooled tar) before the host rejects it.
+                        if f.name == "metadata.json" and f.parent == out_dir:
+                            if meta_cap is not None and st.st_size > meta_cap:
+                                spool.close()
+                                raise RuntimeError(f"metadata.json is {st.st_size} bytes (> {meta_cap})")
+                        else:
+                            total += st.st_size
+                            if cap is not None and total > cap:
+                                spool.close()
+                                raise RuntimeError(f"output exceeds {cap} bytes")
+                        info = tf.gettarinfo(arcname=str(f.relative_to(out_dir)), fileobj=fh)
+                        tf.addfile(info, fh)
             spool.seek(0)
             return spool
 
@@ -409,11 +571,130 @@ def _guard_exposure(bind: str, port: int, *, token, client_ca, allow_cidrs, allo
                  where)
 
 
+_TRUE_WORDS = ("1", "true", "yes")
+_FALSE_WORDS = ("0", "false", "no")
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """A security switch from the environment: 0/1/true/false/yes/no (any case); unset or empty
+    keeps ``default``. Anything else stops startup -- a typo must not silently pick a side."""
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in _TRUE_WORDS:
+        return True
+    if raw in _FALSE_WORDS:
+        return False
+    raise SystemExit(f"http_agent: {name}={os.environ.get(name)!r} is not one of "
+                     "0/1/true/false/yes/no; refusing to start")
+
+
+def _guard_unsandboxed_engine(engine: Engine) -> bool:
+    """On macOS, refuse an engine that doesn't sandbox its parsing; return whether each job must
+    prove a confined run.
+
+    A Linux agent sits inside a runsc/Firecracker boundary, so an engine that parses in-process is
+    still contained. A Mac has no outer boundary: ``BLASTBOX_SANDBOX`` only selects the backend an
+    engine *may* use through ``select_sandbox()``, it confines nothing by itself. So an engine must
+    declare ``sandboxed_parsing = True`` (it runs every untrusted parse through ``select_sandbox()``)
+    and each ``ok`` result must coincide with a confined run.
+    ``BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE=1`` is the explicit, logged escape hatch.
+    """
+    if host_platform() != "darwin":
+        return False
+    if _env_flag("BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE", False):
+        _log.warning("http_agent: macOS with BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE=1 -- engine "
+                     "%s may parse untrusted input in this unconfined process", engine.name)
+        return False
+    if not getattr(engine, "sandboxed_parsing", False):
+        raise SystemExit(
+            f"http_agent: refusing engine {engine.name!r} on macOS: it does not declare "
+            "sandboxed_parsing = True. There is no outer isolation boundary here, so an engine that "
+            "parses in-process would run hostile input in this long-lived agent. Run every parse "
+            "through select_sandbox() and declare it, or set "
+            "BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE=1 to accept the risk.")
+    return True
+
+
+def _warmup(engine: Engine, require_warmup: bool, require_confined: bool = False) -> str | None:
+    """Run the engine's warmup; the error that keeps /healthz at 503, or None when ready.
+
+    With ``require_confined`` (macOS, sandboxed engine) a required warmup also has to complete a
+    confined run: a self-test that passed by parsing in-process proves nothing about the
+    sandbox's grants, so the agent stays unready until one runs through the sandbox."""
+    if not hasattr(engine, "warmup"):
+        if require_warmup:
+            # The gate is "a known-positive self-test passed": an engine without one isn't ready.
+            _log.error("http_agent: engine has no warmup self-test; /healthz reports NOT ready")
+            return "engine has no warmup self-test"
+        return None
+    try:
+        with confinement_ledger() as ledger:
+            engine.warmup()
+    except Exception as exc:  # noqa: BLE001 -- warmup is best-effort (fail-open to cold)
+        if require_warmup:
+            _log.error("http_agent: warmup failed; /healthz reports NOT ready: %s", exc)
+            return str(exc)[:500]
+        _log.warning("http_agent: warmup failed (continuing cold): %s", exc)
+        return None
+    if require_warmup and require_confined and ledger.runs == 0:
+        _log.error("http_agent: warmup passed without a confined run; /healthz reports NOT ready")
+        return "warmup self-test did not complete a confined (sandboxed) run"
+    return None
+
+
+def _bounded_warmup(engine: Engine, require_warmup: bool,
+                    require_confined: bool = False) -> str | None:
+    """:func:`_warmup` under the same hard deadline as a detonation: a warmup that never returns
+    (a framework call that hangs) would hold the job lock forever -- every /detonate 409s, and
+    /healthz stays at the old warmup error -- while the process looks alive to launchd, so
+    KeepAlive never restarts it. Past the deadline the worker retires (kill + sweep, exit 75)."""
+    hard_s = _hard_deadline_s(Limits.from_env())
+    wd = threading.Timer(hard_s, _on_hard_deadline, args=(hard_s, "warmup")) if hard_s > 0 else None
+    if wd is not None:
+        wd.daemon = True
+        wd.start()
+    try:
+        return _warmup(engine, require_warmup, require_confined)
+    finally:
+        if wd is not None:
+            wd.cancel()
+
+
+WARMUP_RETRY_FIRST_S = 30.0
+WARMUP_RETRY_MAX_S = 300.0
+
+
+def retry_warmup(engine: Engine, handler: type[_Handler], *,
+                 first_s: float = WARMUP_RETRY_FIRST_S, max_s: float = WARMUP_RETRY_MAX_S,
+                 stop: threading.Event | None = None) -> threading.Thread:
+    """While ``handler.warmup_error`` is set, rerun the required warmup with backoff
+    (``first_s`` doubling to ``max_s``); success clears it and /healthz turns 200. Runs under the
+    job lock, so a retry never overlaps a detonation."""
+    stop = stop or threading.Event()
+
+    def loop() -> None:
+        delay = first_s
+        while handler.warmup_error is not None and not stop.wait(delay):
+            with _JOB_LOCK:
+                err = _bounded_warmup(engine, require_warmup=True,
+                                      require_confined=handler.require_confined)
+            handler.warmup_error = err
+            if err is None:
+                _log.info("http_agent: warmup passed on retry; /healthz reports ready")
+                return
+            delay = min(max_s, delay * 2)
+
+    t = threading.Thread(target=loop, name="bb-warmup-retry", daemon=True)
+    t.start()
+    return t
+
+
 def serve(engine: Engine, *, bind: str = "0.0.0.0", port: int = 8765,
           token: str | None = None, max_bytes: int = _DEFAULT_MAX_BYTES,
           tls_cert: str | None = None, tls_key: str | None = None,
           client_ca: str | None = None, allow_cidrs: str | None = None,
-          timeout_s: float = 300.0) -> ThreadingHTTPServer:
+          timeout_s: float = 300.0, warmup_error: str | None = None) -> ThreadingHTTPServer:
     """Serve the engine. ``tls_cert``/``tls_key`` enable HTTPS; adding ``client_ca`` requires a
     CA-signed **client** cert (mTLS). ``allow_cidrs`` restricts which peer IPs may POST /detonate.
     ``timeout_s`` bounds a request's socket reads so a slowloris body can't hold the job lock forever."""
@@ -431,9 +712,11 @@ def serve(engine: Engine, *, bind: str = "0.0.0.0", port: int = 8765,
         "1", "true", "yes", "on")
     _guard_exposure(bind, port, token=token, client_ca=client_ca, allow_cidrs=allow_cidrs,
                     allow_insecure=allow_insecure)
+    require_confined = _guard_unsandboxed_engine(engine)
     handler = type("_BoundHandler", (_Handler,),
                    {"engine": engine, "token": token, "max_bytes": max_bytes,
-                    "allow_nets": _parse_cidrs(allow_cidrs), "timeout": timeout_s})
+                    "allow_nets": _parse_cidrs(allow_cidrs), "timeout": timeout_s,
+                    "require_confined": require_confined, "warmup_error": warmup_error})
     httpd = ThreadingHTTPServer((bind, port), handler)
     if tls_cert and tls_key:
         from blastbox.tls import server_ssl_context
@@ -459,15 +742,19 @@ def serve(engine: Engine, *, bind: str = "0.0.0.0", port: int = 8765,
 
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO)
+    # Before warmup: an engine's self-test may already be a confined run.
+    _install_shutdown_handlers()
     spec = os.environ.get("BLASTBOX_ENGINE")
     if not spec:
         raise SystemExit("BLASTBOX_ENGINE=module:Class is required")
     engine = load_engine(spec)
-    if hasattr(engine, "warmup"):
-        try:
-            engine.warmup()
-        except Exception as exc:  # noqa: BLE001 -- warmup is best-effort (fail-open to cold)
-            _log.warning("http_agent: warmup failed (continuing cold): %s", exc)
+    # On macOS warmup is where an engine runs its known-positive self-test, and a failed one means
+    # results can't be trusted, so it gates /healthz there by default
+    # (BLASTBOX_WORKER_AGENT_REQUIRE_WARMUP=0/1 overrides on any platform).
+    require_warmup = _env_flag("BLASTBOX_WORKER_AGENT_REQUIRE_WARMUP", host_platform() == "darwin")
+    # Refuse an unsandboxed engine before its warmup parses anything; serve() re-checks.
+    require_confined = _guard_unsandboxed_engine(engine)
+    warmup_error = _bounded_warmup(engine, require_warmup, require_confined)
     port = int(os.environ.get("BLASTBOX_WORKER_AGENT_PORT", "8765"))
     bind = os.environ.get("BLASTBOX_WORKER_AGENT_BIND", "0.0.0.0")
     token = os.environ.get("BLASTBOX_WORKER_AGENT_TOKEN") or None
@@ -482,7 +769,11 @@ def main(argv: list[str] | None = None) -> int:
     timeout_s = float(os.environ.get("BLASTBOX_WORKER_AGENT_TIMEOUT_S") or "300")
     httpd = serve(engine, bind=bind, port=port, token=token, max_bytes=max_bytes,
                   tls_cert=tls_cert, tls_key=tls_key, client_ca=client_ca, allow_cidrs=allow_cidrs,
-                  timeout_s=timeout_s)
+                  timeout_s=timeout_s, warmup_error=warmup_error)
+    if warmup_error is not None and hasattr(engine, "warmup"):
+        # launchd/KeepAlive won't restart a live process, so a transient failure (a busy ANE, a
+        # slow first compile) would otherwise keep this Mac out of the pool until someone notices.
+        retry_warmup(engine, httpd.RequestHandlerClass)  # type: ignore[arg-type]  # serve() binds a _Handler subclass
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
