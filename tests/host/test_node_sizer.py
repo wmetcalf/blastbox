@@ -264,6 +264,24 @@ def test_node_capacity_survives_malformed_meminfo(monkeypatch, tmp_path):
     assert _mem_available_mib() is None               # malformed MemAvailable → None
 
 
+def test_node_capacity_without_proc_meminfo_uses_sysconf(monkeypatch):
+    # macOS has no /proc/meminfo: the budget must come from sysconf, not degrade to 0 RAM
+    # (which collapses every pool to the 1-slot baseline and starves the cold gate).
+    import builtins
+    real_open = builtins.open
+
+    def fake_open(path, *a, **k):
+        if path == "/proc/meminfo":
+            raise FileNotFoundError(path)
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+    pages = {"SC_PHYS_PAGES": 4 * 1024 * 1024, "SC_PAGE_SIZE": 4096}  # 16 GiB
+    monkeypatch.setattr("os.sysconf", lambda name: pages[name])
+    b = node_capacity(ram_headroom_frac=0.5, vcpu_oversubscription=1.0)
+    assert b.ram_mib == 8192.0
+
+
 # --- round-4: config clamping + optional url ---
 
 def test_from_env_clamps_footgun_config(monkeypatch):

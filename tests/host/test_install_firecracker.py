@@ -18,15 +18,23 @@ REPO = pathlib.Path(__file__).resolve().parents[2]
 LIB = REPO / "scripts" / "lib" / "fc-kernel.sh"
 
 
-def _kernel(path: pathlib.Path, banner: "str | None", *, repeat: int = 1) -> pathlib.Path:
-    body = b"\x7fELF" + os.urandom(64)
+# Fixed binary padding, not os.urandom: random bytes made the probe tests flaky (an invalid UTF-8
+# lead byte landing just before the banner hid it from BSD grep). That case is now pinned on its
+# own below, so the rest stay deterministic.
+_PAD = bytes(range(0x80, 0x100))
+
+
+def _kernel(path: pathlib.Path, banner: "str | None", *, repeat: int = 1,
+            lead: bytes = b"\n") -> pathlib.Path:
+    body = b"\x7fELF" + _PAD + lead
     if banner:
         body += (f"Linux version {banner} (builder@ci) #1 SMP\n".encode()) * repeat
-    path.write_bytes(body + os.urandom(64))
+    path.write_bytes(body + _PAD)
     return path
 
 
-def _run(dest: pathlib.Path, *, override: "str | None" = None, fetch_ok: bool = False):
+def _run(dest: pathlib.Path, *, override: "str | None" = None, fetch_ok: bool = False,
+         extra_env: "dict[str, str] | None" = None):
     """Source the lib and call it exactly as install-firecracker.sh does, under strict mode.
 
     `curl` is stubbed on PATH: it fails unless `fetch_ok`, in which case it writes a 6.1 kernel --
@@ -45,6 +53,7 @@ def _run(dest: pathlib.Path, *, override: "str | None" = None, fetch_ok: bool = 
     env.pop("BLASTBOX_FC_KERNEL", None)
     if override is not None:
         env["BLASTBOX_FC_KERNEL"] = override
+    env.update(extra_env or {})
     script = (f'set -euo pipefail; DEST="{dest}"; ARCH=x86_64; source "{LIB}"; '
               'fc_kernel_setup; echo REACHED-NEXT-STEPS')
     return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env,
@@ -95,6 +104,16 @@ def test_a_repeated_banner_does_not_die_of_sigpipe(tmp_path):
     _kernel(tmp_path / "vmlinux", "6.1.128", repeat=200_000)
     r = _run(tmp_path)
     assert r.returncode == 0, f"a valid kernel aborted the installer: rc={r.returncode}"
+
+
+@pytest.mark.parametrize("lead", [b"\xd6", b"\xe2\x82", b"\xf0\x9f\x98", b"\xff"])
+def test_an_invalid_utf8_byte_before_the_banner_does_not_hide_it(tmp_path, lead):
+    """A kernel is binary. In a UTF-8 locale BSD grep (macOS) let an invalid lead byte swallow the
+    `L` after it, so a too-old kernel read as bannerless: warned, then installed anyway."""
+    _kernel(tmp_path / "vmlinux", "5.10.0", lead=lead)
+    r = _run(tmp_path, extra_env={"LC_ALL": "en_US.UTF-8", "LANG": "en_US.UTF-8"})
+    assert r.returncode == 1, f"banner after {lead!r} was missed: {r.stdout}"
+    assert "too old" in r.stdout
 
 
 def test_with_nothing_cached_a_supported_kernel_is_fetched(tmp_path):

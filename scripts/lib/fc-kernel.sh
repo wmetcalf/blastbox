@@ -55,8 +55,10 @@ fc_kernel_setup() {
     # grep -a, not `strings`: no binutils dependency. And `|| true`, because under
     # `set -euo pipefail` a kernel with no matching banner made grep exit 1 and the whole
     # installer ABORTED here -- after firecracker was already installed, and without printing
-    # either the kernel warning or the next steps.
-    kver="$(grep -aoE 'Linux version [0-9]+\.[0-9]+' "$kern" 2>/dev/null | head -1 | awk '{print $3}' || true)"
+    # either the kernel warning or the next steps. LC_ALL=C because a kernel is binary: in a
+    # UTF-8 locale BSD grep (macOS) treats an invalid lead byte as eating the next character, so
+    # a banner right after one (e.g. \xd6Linux version ...) is silently missed.
+    kver="$(LC_ALL=C grep -aoE 'Linux version [0-9]+\.[0-9]+' "$kern" 2>/dev/null | head -1 | awk '{print $3}' || true)"
     if [[ -n "$kver" ]]; then
       kmaj="${kver%%.*}"; kmin="${kver#*.}"
       if (( kmaj < 5 || (kmaj == 5 && kmin < 18) )); then
