@@ -179,6 +179,7 @@ class Leftovers:
 
     def __init__(self) -> None:
         self._paths: set[Path] = set()
+        self._busy: set[Path] = set()
         self._lock = threading.Lock()
 
     def add(self, path: Path) -> None:
@@ -189,9 +190,28 @@ class Leftovers:
         with self._lock:
             self._paths.discard(path)
 
+    @contextlib.contextmanager
+    def busy(self, path: Path) -> Iterator[None]:
+        """Mark ``path`` as the tree a teardown section is renaming entries out of. A retiring
+        agent may give up waiting for that section (its budget is bounded) and run the emergency
+        cleanups while it is still going: removing the tree then would race the renames -- and
+        their rollback -- and leave the host directory part-replaced. A busy tree is skipped
+        and left where it is, under a name the next run refuses to stage or removes as a
+        recorded sibling; a leftover tree is recoverable, a half-swapped host directory is not."""
+        with self._lock:
+            self._busy.add(path)
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._busy.discard(path)
+
     def remove_all(self) -> None:
         with self._lock:
-            paths = list(self._paths)
+            paths = [p for p in self._paths if p not in self._busy]
+            skipped = [p for p in self._paths if p in self._busy]
+        for path in skipped:
+            _log.error("sandbox: %s is still being swapped into place; not removed", path)
         for path in paths:
             remove_tree(path)
             if not os.path.lexists(path):
@@ -257,7 +277,8 @@ def swap_into_place(new: Path, dest: Path, leftovers: Leftovers | None = None) -
 
     A teardown section (see :func:`teardown_critical`): a retiring agent waits for it rather
     than exit between the two renames, which would leave ``dest`` missing."""
-    with teardown_critical():
+    with teardown_critical(), \
+            (leftovers.busy(new) if leftovers is not None else contextlib.nullcontext()):
         _swap_into_place(new, dest, leftovers)
 
 
@@ -474,8 +495,10 @@ setlim(resource.RLIMIT_FSIZE, cfg["fsize"])
 setlim(resource.RLIMIT_NOFILE, cfg["nofile"])
 setlim(resource.RLIMIT_CPU, cfg["cpu"])
 setlim(resource.RLIMIT_CORE, 0)
-# RLIMIT_NPROC is per-UID on Darwin: cap the uid at what it runs now plus this job's allowance.
-# Mandatory: without it a fork bomb has until the next watchdog sample, so a baseline or limit
+# RLIMIT_NPROC is per-UID on Darwin: cap the uid at what it runs now plus this job's allowance,
+# and never above the worker's shared ceiling (cfg["nproc_ceiling"], the same absolute number for
+# every run in flight): each launch would otherwise count the processes earlier concurrent runs
+# made into its own baseline, so N slots could reach N allowances between them. Mandatory: without it a fork bomb has until the next watchdog sample, so a baseline or limit
 # that can't be installed stops the run here, before anything untrusted is exec'd.
 def nproc_fail(why):
     sys.stderr.write("[blastbox] refusing to run: cannot install the process limit (%s)\n" % why)
@@ -491,7 +514,7 @@ try:
     got = lib.proc_listpids(4, os.getuid(), buf, ctypes.sizeof(buf))
     if got <= 0:
         nproc_fail("proc_listpids failed")
-    want = got // 4 + cfg["nproc"]
+    want = min(got // 4 + cfg["nproc"], cfg["nproc_ceiling"])
     soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
     v = want if hard == resource.RLIM_INFINITY else min(want, hard)
     resource.setrlimit(resource.RLIMIT_NPROC, (v, v))
@@ -506,6 +529,9 @@ os.execve(argv[0], argv, cfg["env"])
 
 # Processes a run may create on top of the uid's current count (Darwin's NPROC is per-UID).
 NPROC_ALLOWANCE = 64
+# Processes ALL the worker's concurrent runs may create together, on top of what the uid ran when
+# the first of them started (BLASTBOX_MACOS_NPROC_BUDGET). Shared: see nproc_ceiling().
+NPROC_BUDGET_DEFAULT = 512
 # The launcher's exit status when it could not install the NPROC limit (nothing was exec'd;
 # the run fails like any nonzero exit and, with no handshake, is never credited as confined).
 NPROC_FAIL_EXIT = 121
@@ -520,12 +546,58 @@ MAX_SCRATCH_ENTRIES = 200_000
 LAUNCHER_ENV = {"PATH": MINIMAL_PATH}
 
 
+def nproc_budget() -> int:
+    """``BLASTBOX_MACOS_NPROC_BUDGET`` (default :data:`NPROC_BUDGET_DEFAULT`): how many
+    processes the worker's concurrent sandboxed runs may create in total."""
+    raw = os.environ.get("BLASTBOX_MACOS_NPROC_BUDGET", "") or str(NPROC_BUDGET_DEFAULT)
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise SandboxError(f"BLASTBOX_MACOS_NPROC_BUDGET={raw!r} is not an integer") from exc
+    if value < 1:
+        raise SandboxError(f"BLASTBOX_MACOS_NPROC_BUDGET={raw!r} must be >= 1")
+    return value
+
+
+_NPROC_LOCK = threading.Lock()
+_NPROC_ACTIVE = 0
+_NPROC_CEILING = 0
+
+
+@contextlib.contextmanager
+def nproc_ceiling() -> Iterator[int]:
+    """The absolute RLIMIT_NPROC ceiling every concurrent run shares, held for one run.
+
+    Darwin's NPROC counts the whole uid. A per-launch "current count + allowance" lets each run
+    count the processes concurrent runs already made into its baseline, so N slots could reach
+    N allowances between them -- thousands of processes before a watchdog samples. Instead the
+    ceiling is fixed while any run is in flight: the uid's count when the first of them started
+    plus :func:`nproc_budget`. Every process's limit is at or below it, so together they never
+    pass it. It is re-measured only when no run is in flight, so the user's own processes
+    growing between jobs doesn't starve later ones."""
+    global _NPROC_ACTIVE, _NPROC_CEILING
+    with _NPROC_LOCK:
+        if _NPROC_ACTIVE == 0:
+            _NPROC_CEILING = len(uid_pids()) + nproc_budget()
+        _NPROC_ACTIVE += 1
+        ceiling = _NPROC_CEILING
+    try:
+        yield ceiling
+    finally:
+        with _NPROC_LOCK:
+            _NPROC_ACTIVE -= 1
+
+
 def limits_launcher_argv(limits: Limits, argv: list[str],
-                         env: Mapping[str, str] | None = None) -> list[str]:
+                         env: Mapping[str, str] | None = None, *,
+                         ceiling: int | None = None) -> list[str]:
     """``argv`` wrapped in the rlimit launcher (FSIZE, NOFILE, CPU, CORE, NPROC); ``env`` is
-    what ``argv`` is exec'd with."""
+    what ``argv`` is exec'd with. ``ceiling`` is the shared NPROC ceiling (:func:`nproc_ceiling`);
+    without one the launcher falls back to its per-run allowance alone."""
     cfg = {"fsize": int(limits.tmpfs_bytes), "nofile": 4096, "cpu": int(limits.timeout_s) + 30,
-           "nproc": NPROC_ALLOWANCE, "nproc_fail_exit": NPROC_FAIL_EXIT, "env": dict(env or {})}
+           "nproc": NPROC_ALLOWANCE,
+           "nproc_ceiling": int(ceiling) if ceiling is not None else (1 << 30),
+           "nproc_fail_exit": NPROC_FAIL_EXIT, "env": dict(env or {})}
     return [sys.executable, "-I", "-S", "-c", _LIMITS_LAUNCHER, json.dumps(cfg), *argv]
 
 
@@ -1179,9 +1251,13 @@ def run_confined(
     # pin_watch_roots), and stay pinned until the final disk check is done.
     roots = pin_watch_roots(watch_dirs)
     try:
-        return _run_pinned(argv, env=env, limits=limits, cwd=cwd, popen=popen, rss_fn=rss_fn,
-                           roots=roots, max_output_bytes=max_output_bytes, sweep=sweep,
-                           member_fn=member_fn, pass_fds=pass_fds)
+        # Held until the family is killed and swept: while it is, a concurrent launch gets the
+        # same absolute NPROC ceiling instead of one counted on top of this run's processes.
+        with nproc_ceiling() as ceiling:
+            return _run_pinned(argv, env=env, limits=limits, cwd=cwd, popen=popen,
+                               rss_fn=rss_fn, roots=roots, max_output_bytes=max_output_bytes,
+                               sweep=sweep, member_fn=member_fn, pass_fds=pass_fds,
+                               nproc_ceiling_=ceiling)
     finally:
         close_watch_roots(roots)
 
@@ -1199,6 +1275,7 @@ def _run_pinned(
     sweep: Callable[[], object] | None,
     member_fn: Callable[[int], bool] | None,
     pass_fds: tuple[int, ...],
+    nproc_ceiling_: int | None = None,
 ) -> SandboxResult:
     # The emergency cleanup (run if the agent hard-exits mid-run, skipping every `finally`
     # here) is registered BEFORE the child exists, so no instant of its life is uncovered.
@@ -1230,7 +1307,7 @@ def _run_pinned(
         with spawn:
             try:
                 proc = popen(
-                    limits_launcher_argv(limits, argv, env),
+                    limits_launcher_argv(limits, argv, env, ceiling=nproc_ceiling_),
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -1926,6 +2003,34 @@ def _copy_xattrs(fd: int, dst: Path, budget: "CopyBudget", at: Path, *, write: b
                                    f"{os.fsdecode(name)} of {at}: {exc}") from exc
 
 
+_O_SYMLINK = getattr(os, "O_SYMLINK", 0)    # Darwin: open the link itself, not its target
+
+
+def _copy_link_xattrs(name: "str | Path", dir_fd: "int | None", st: os.stat_result,
+                      dst: Path, budget: "CopyBudget", at: Path) -> None:
+    """Copy the symlink ``name``'s own extended attributes onto the new link ``dst``.
+
+    Darwin keeps attributes on a link itself (Finder info, app metadata), and a copy-back from a
+    copy without them would strip the host's. The link is opened with ``O_SYMLINK`` relative to
+    its pinned parent and checked to be the one ``lstat`` saw, like every other entry. Linux
+    allows no ``user.*`` attribute on a symlink, and the namespaces it does allow there are never
+    copied (``_XATTR_SKIP_PREFIXES``), so there is nothing to carry."""
+    if not _O_SYMLINK:
+        return
+    try:
+        fd = os.open(name, os.O_RDONLY | _O_SYMLINK | getattr(os, "O_CLOEXEC", 0),
+                     dir_fd=dir_fd)
+    except OSError as exc:
+        raise SandboxError(f"sandbox copy: {at} changed while it was being copied") from exc
+    try:
+        fst = os.fstat(fd)
+        if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino) or not stat.S_ISLNK(fst.st_mode):
+            raise SandboxError(f"sandbox copy: {at} changed while it was being copied")
+        _copy_xattrs(fd, dst, budget, at, write=True)
+    finally:
+        os.close(fd)
+
+
 def _copy_regular_fd(fd: int, dst: Path, mode: int,
                      budget: "CopyBudget | None" = None, at: Path | None = None,
                      size: int | None = None) -> None:
@@ -2445,6 +2550,7 @@ def copy_no_follow(src: Path, dst: Path, *, budget_bytes: int | None = None,
             target = os.readlink(name, dir_fd=dir_fd)
             budget.charge(max(len(os.fsencode(target)), st.st_size), s)
             os.symlink(target, d)
+            _copy_link_xattrs(name, dir_fd, st, d, budget, s)
             _keep_times(d, st)
         elif stat.S_ISDIR(mode):
             budget.charge(0, s)
@@ -2707,6 +2813,45 @@ def check_homes_clear_of_mounts(seed_home: "Path | str | None", capture_home: "P
                                            f"mount {m}; the capture would replace it with the "
                                            "run's cache -- use disjoint paths")
         _refuse_hops_in(capture_home, "capture_home", rw, backend)
+
+
+def _enclosing_bundle(p: Path) -> Path | None:
+    for parent in p.parents:
+        if parent.suffix in (".app", ".framework", ".bundle"):
+            return parent
+    return None
+
+
+def check_writable_clear_of_exec(writable: Iterable[tuple[str, "Path | str"]],
+                                 exe_paths: Iterable["Path | str"],
+                                 protected: Iterable["Path | str"], backend: str) -> None:
+    """Refuse a writable host path (a writable mount, a capture destination) that holds the
+    executable or overlaps a directory the run executes from read-only.
+
+    Seatbelt grants a writable mount in place, App Sandbox copies its staged copy back over it:
+    either way a compromised parser could leave a modified binary or library behind that later
+    jobs execute outside their fresh per-run state. Protected, compared in both the spelled and
+    the resolved form:
+      * ``exe_paths`` (the executable as given and resolved): no writable path may be it or
+        contain it;
+      * ``protected`` (directories declared read-only for execution -- App Sandbox's prepared
+        ``--ro`` grants) and the executable's enclosing ``.app``/``.framework``/``.bundle``:
+        no writable path may be, contain, or lie inside one."""
+    exes = {f for e in exe_paths for f in path_forms(e)}
+    dirs = {f for d in protected for f in path_forms(d)}
+    dirs |= {b for e in exes for b in [_enclosing_bundle(e)] if b is not None}
+    for what, p in writable:
+        for w in path_forms(p):
+            for e in exes:
+                if w == e or w in e.parents:
+                    raise SandboxError(f"{backend}: {what} {p} holds the executable {e}; the "
+                                       "child could replace what later runs execute -- mount a "
+                                       "narrower directory")
+            for d in dirs:
+                if paths_overlap(w, d):
+                    raise SandboxError(f"{backend}: {what} {p} overlaps {d}, which runs execute "
+                                       "from read-only; the child could change what later runs "
+                                       "execute -- use disjoint paths")
 
 
 def path_forms(p: "Path | str") -> list[Path]:

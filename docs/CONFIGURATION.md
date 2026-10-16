@@ -382,6 +382,7 @@ when a netpolicy grants egress: there is no netd/rooter there to steer it.
 | Var | Default | Notes |
 |---|---|---|
 | `BLASTBOX_MACOS_SCRATCH_DIR` | `$TMPDIR` | Parent of each run's fresh 0700 scratch dir (the child's `HOME`, `TMPDIR`, `CFFIXED_USER_HOME` → framework caches). Deleted after every run. |
+| `BLASTBOX_MACOS_NPROC_BUDGET` | `512` | Processes all of the worker's concurrent sandboxed runs (Seatbelt and App Sandbox) may create together. Darwin's `RLIMIT_NPROC` counts the whole user, so every run in flight gets the same absolute ceiling: the user's process count when the first of them started, plus this budget (each run is also capped at its own count + 64). Re-measured once no run is in flight. |
 | `BLASTBOX_APPSANDBOX_ROOT` | `~/Library/Application Support/blastbox/appsandbox` | Slot root written by `blastbox macos prepare` (manifest, signed launcher bundles, per-slot `io/`, locks). Must not overlap any `--ro` path. |
 | `BLASTBOX_APPSANDBOX_SLOT_WAIT_S` | `30` | How long a run waits for a free slot before failing. Concurrency == `prepare --slots`. |
 | `BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE` | `0` | macOS only: let the agent serve an engine that doesn't declare `sandboxed_parsing = True` (it may then parse hostile input inside the agent). Accepts `0/1/true/false/yes/no` (any case); any other value stops the agent at startup. |

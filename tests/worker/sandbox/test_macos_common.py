@@ -2663,3 +2663,145 @@ class TestTheNativeCaptureSwapRetiresTheOldTree:
         mc.capture_scratch(self._scratch(tmp_path, "three"), dest, 1 << 20)
         assert not left[0].exists()
         assert (dest / "Library" / "f").read_text() == "three"
+
+
+class TestLeftoversSkipATreeBeingSwapped:
+    def test_a_busy_tree_is_left_and_the_rest_removed(self, tmp_path):
+        busy = tmp_path / "busy"
+        other = tmp_path / "other"
+        for d in (busy, other):
+            d.mkdir()
+            (d / "f").write_text("x")
+        left = mc.Leftovers()
+        left.add(busy)
+        left.add(other)
+        with left.busy(busy):
+            left.remove_all()
+            assert busy.exists() and not other.exists()
+        left.remove_all()                       # no longer busy: removed as before
+        assert not busy.exists()
+
+    def test_the_capture_swap_marks_its_source_busy(self, tmp_path, monkeypatch):
+        new = tmp_path / ".dest.new"
+        dest = tmp_path / "dest"
+        new.mkdir()
+        dest.mkdir()
+        left = mc.Leftovers()
+        left.add(new)
+        real = mc._swap_into_place
+        seen = {}
+
+        def emergency_midway(new_, dest_, leftovers_=None):
+            left.remove_all()
+            seen["survived"] = new_.exists()
+            return real(new_, dest_, leftovers_)
+        monkeypatch.setattr(mc, "_swap_into_place", emergency_midway)
+        mc.swap_into_place(new, dest, left)
+        assert seen["survived"]
+
+
+class TestNprocCeilingIsSharedAcrossRuns:
+    def test_concurrent_runs_get_one_ceiling(self, monkeypatch):
+        count = {"n": 100}
+        monkeypatch.setattr(mc, "uid_pids", lambda uid=None: list(range(count["n"])))
+        monkeypatch.setenv("BLASTBOX_MACOS_NPROC_BUDGET", "50")
+        with mc.nproc_ceiling() as first:
+            count["n"] = 140                    # the first run's processes, counted by a 2nd
+            with mc.nproc_ceiling() as second:
+                assert first == second == 150   # not 140 + 50: N runs share one budget
+        with mc.nproc_ceiling() as later:       # nothing in flight: measured afresh
+            assert later == 190
+
+    def test_the_launcher_caps_at_the_shared_ceiling(self):
+        import json
+        argv = mc.limits_launcher_argv(Limits(timeout_s=10), ["/usr/bin/true"], {}, ceiling=77)
+        cfg = json.loads(argv[5])
+        assert cfg["nproc_ceiling"] == 77 and cfg["nproc"] == mc.NPROC_ALLOWANCE
+        assert 'min(got // 4 + cfg["nproc"], cfg["nproc_ceiling"])' in mc._LIMITS_LAUNCHER
+
+    @pytest.mark.parametrize("raw", ["0", "-5", "lots"])
+    def test_a_bad_budget_refuses_the_run(self, monkeypatch, raw):
+        monkeypatch.setenv("BLASTBOX_MACOS_NPROC_BUDGET", raw)
+        with pytest.raises(SandboxError, match="NPROC_BUDGET"):
+            with mc.nproc_ceiling():
+                pass
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="libproc is Darwin's")
+    def test_a_real_run_gets_the_shared_ceiling(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("BLASTBOX_MACOS_NPROC_BUDGET", "100000")
+        with mc.nproc_ceiling() as ceiling:
+            r = mc.run_confined([sys.executable, "-I", "-c",
+                                 "import resource; print(resource.getrlimit(resource.RLIMIT_NPROC)[0])"],
+                                env={"PATH": mc.MINIMAL_PATH}, limits=Limits(timeout_s=10),
+                                cwd=tmp_path)
+        assert r.exit_code == 0, r.stderr
+        assert int(r.stdout) <= ceiling
+
+
+class TestWritableClearOfWhatRunsExecute:
+    def test_holding_the_executable(self, tmp_path):
+        exe = tmp_path / "engine" / "bin" / "tool"
+        with pytest.raises(SandboxError, match="holds the executable"):
+            mc.check_writable_clear_of_exec([("rw mount", tmp_path / "engine")], [exe], [], "t")
+
+    def test_the_executable_itself(self, tmp_path):
+        exe = tmp_path / "tool"
+        with pytest.raises(SandboxError, match="holds the executable"):
+            mc.check_writable_clear_of_exec([("rw mount", exe)], [exe], [], "t")
+
+    @pytest.mark.parametrize("rel", ["engine", "engine/lib", "."])
+    def test_overlapping_a_protected_dir(self, tmp_path, rel):
+        with pytest.raises(SandboxError, match="execute from read-only"):
+            mc.check_writable_clear_of_exec([("rw mount", tmp_path / rel)], [],
+                                            [tmp_path / "engine"], "t")
+
+    def test_inside_the_executables_bundle(self, tmp_path):
+        exe = tmp_path / "Tool.app" / "Contents" / "MacOS" / "tool"
+        with pytest.raises(SandboxError, match="execute from read-only"):
+            mc.check_writable_clear_of_exec(
+                [("rw mount", tmp_path / "Tool.app" / "Contents" / "Resources")], [exe], [], "t")
+
+    def test_a_spelling_through_a_symlink_counts(self, tmp_path):
+        (tmp_path / "engine").mkdir()
+        (tmp_path / "alias").symlink_to(tmp_path / "engine")
+        with pytest.raises(SandboxError, match="execute from read-only"):
+            mc.check_writable_clear_of_exec([("rw mount", tmp_path / "alias" / "lib")], [],
+                                            [tmp_path / "engine"], "t")
+
+    def test_disjoint_and_a_sibling_of_the_executable_are_fine(self, tmp_path):
+        exe = tmp_path / "bin" / "tool"
+        mc.check_writable_clear_of_exec(
+            [("rw mount", tmp_path / "out"), ("rw mount", tmp_path / "bin-data")],
+            [exe], [tmp_path / "engine"], "t")
+
+
+class TestSymlinkExtendedAttributesAreCopied:
+    @pytest.mark.skipif(sys.platform != "darwin", reason="symlink extended attributes are macOS's")
+    def test_a_link_keeps_its_own_attributes(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "l").symlink_to("/nowhere")
+        subprocess.run(["/usr/bin/xattr", "-s", "-w", "com.example.tag", "hello", str(src / "l")],
+                       check=True)
+        budget = mc.CopyBudget(1 << 20)
+        mc.copy_no_follow(src, tmp_path / "dst", budget=budget)
+        got = subprocess.run(["/usr/bin/xattr", "-s", "-p", "com.example.tag",
+                              str(tmp_path / "dst" / "l")], capture_output=True, text=True)
+        assert got.stdout.strip() == "hello"
+        assert os.readlink(tmp_path / "dst" / "l") == "/nowhere"
+
+    def test_a_link_swapped_before_its_attributes_are_read_is_refused(self, tmp_path, monkeypatch):
+        if not mc._O_SYMLINK:
+            pytest.skip("no O_SYMLINK on this platform")
+        d = tmp_path / "d"
+        d.mkdir()
+        (d / "l").symlink_to("/nowhere")
+        st = os.stat(d / "l", follow_symlinks=False)
+        (d / "l").unlink()
+        (d / "l").symlink_to("/elsewhere")      # a new link: another inode
+        dfd = os.open(d, os.O_RDONLY)
+        try:
+            with pytest.raises(SandboxError, match="changed while it was being copied"):
+                mc._copy_link_xattrs("l", dfd, st, tmp_path / "x", mc.CopyBudget(1 << 20), d / "l")
+        finally:
+            os.close(dfd)

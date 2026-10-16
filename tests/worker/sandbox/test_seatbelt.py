@@ -942,3 +942,86 @@ class TestSymlinkedHomesThroughWritableMountsAreRefused:
             argv=["/bin/echo", "hi"], rw_mounts=[Mount(data, data)],
             seed_home=tmp_path / "alias" / "seed"))
         assert calls
+
+
+class TestHardLinksAreDenied:
+    """A hard link made AFTER the preflight scan (find_split_hard_link sees only links that
+    already exist) would let the child write a read-only-granted file through a writable
+    alias: the profile denies link creation outright."""
+
+    def test_the_profile_denies_file_link(self):
+        text, _ = build_profile(exec_paths=["/bin/sh"], ro_paths=["/tmp/ro"],
+                                rw_paths=["/tmp/rw"], accelerators=frozenset())
+        assert "(deny file-link)" in text
+        # after every grant (later rules win in Seatbelt)
+        assert text.index("(deny file-link)") > text.index("(allow file-read* file-write*")
+
+    @needs_darwin
+    def test_a_child_cannot_link_a_read_only_file_into_a_writable_mount(self, tmp_path):
+        ro = tmp_path / "ro"
+        rw = tmp_path / "rw"
+        ro.mkdir()
+        rw.mkdir()
+        (ro / "f").write_text("original")
+        r = SeatbeltSandbox().run(SandboxRequest(
+            argv=["/bin/sh", "-c",
+                  'ln "$0/f" "$1/alias"; echo pwned >> "$1/alias"; touch "$1/new" && echo MADE',
+                  str(ro), str(rw)],
+            ro_mounts=[Mount(ro, ro)], rw_mounts=[Mount(rw, rw)]))
+        assert (ro / "f").read_text() == "original"
+        assert (ro / "f").stat().st_nlink == 1
+        assert b"MADE" in r.stdout            # ordinary files are still created
+
+
+class TestWritableMountsStayClearOfTheExecutable:
+    def _sb(self, tmp_path, calls):
+        def popen(argv, **kw):
+            calls.append(argv)
+            raise AssertionError("must be refused before launch")
+        return SeatbeltSandbox(popen=popen, platform_ok=True, sandbox_exec="/bin/sh",
+                               scratch_base=tmp_path / "scratch")
+
+    def _exe(self, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\n")
+        path.chmod(0o755)
+        return path
+
+    def test_a_writable_mount_holding_the_executable_is_refused(self, tmp_path):
+        calls: list = []
+        engine = tmp_path / "engine"
+        exe = self._exe(engine / "bin" / "tool")
+        with pytest.raises(SandboxError, match="holds the executable"):
+            self._sb(tmp_path, calls).run(SandboxRequest(argv=[str(exe)],
+                                                         rw_mounts=[Mount(engine, engine)]))
+        assert calls == []
+
+    def test_through_a_symlinked_executable_too(self, tmp_path):
+        calls: list = []
+        real = tmp_path / "real"
+        exe = self._exe(real / "tool")
+        (tmp_path / "bin").mkdir()
+        (tmp_path / "bin" / "tool").symlink_to(exe)
+        with pytest.raises(SandboxError, match="holds the executable"):
+            self._sb(tmp_path, calls).run(SandboxRequest(argv=[str(tmp_path / "bin" / "tool")],
+                                                         rw_mounts=[Mount(real, real)]))
+        assert calls == []
+
+    def test_a_capture_over_the_executable_is_refused(self, tmp_path):
+        calls: list = []
+        exe = self._exe(tmp_path / "engine" / "tool")
+        with pytest.raises(SandboxError, match="holds the executable"):
+            self._sb(tmp_path, calls).run(SandboxRequest(argv=[str(exe)],
+                                                         capture_home=tmp_path / "engine"))
+        assert calls == []
+
+    def test_a_writable_mount_inside_the_app_bundle_is_refused(self, tmp_path):
+        calls: list = []
+        app = tmp_path / "Tool.app"
+        exe = self._exe(app / "Contents" / "MacOS" / "tool")
+        res = app / "Contents" / "Resources"
+        res.mkdir()
+        with pytest.raises(SandboxError, match="execute from read-only"):
+            self._sb(tmp_path, calls).run(SandboxRequest(argv=[str(exe)],
+                                                         rw_mounts=[Mount(res, res)]))
+        assert calls == []

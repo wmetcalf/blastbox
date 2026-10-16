@@ -6,6 +6,7 @@ instead of minting new ones per tmp dir.
 """
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import os
@@ -2090,3 +2091,126 @@ class TestSymlinkedHomesThroughWritableMountsAreRefused:
             sb.run(SandboxRequest(argv=["/bin/echo"], rw_mounts=[Mount(data, data)],
                                   **{home: path[spelling]}))
         assert claimed == []
+
+
+class TestSourcesArePinnedAsClaimed:
+    """A writable source spelled through a symlink is claimed as spelled, and staging and
+    copy-back use the target it resolved to then -- re-verified before each use, so a link
+    repointed by another run can't redirect them to a tree that was never claimed or checked."""
+
+    def _tree(self, tmp_path):
+        a = tmp_path / "a"
+        b = tmp_path / "b"
+        for d in (a, b):
+            d.mkdir()
+            (d / "f").write_text(d.name)
+        link = tmp_path / "shared" / "link"
+        link.parent.mkdir()
+        link.symlink_to(a)
+        return a, b, link
+
+    def test_the_claim_takes_the_spelling(self, tmp_path, monkeypatch):
+        sb, _ = _sb_with(tmp_path)
+        _a, _b, link = self._tree(tmp_path)
+        seen: list = []
+        real = asb.hold_rw_sources
+
+        def spy(home, sources, reads=()):
+            seen.extend(sources)
+            return real(home, sources, reads)
+        monkeypatch.setattr(asb, "hold_rw_sources", spy)
+        sb.run(SandboxRequest(argv=["/usr/bin/true"], rw_mounts=[Mount(link, link)]))
+        assert link in seen
+
+    def test_a_link_repointed_after_the_check_is_refused(self, tmp_path, monkeypatch):
+        sb, _ = _sb_with(tmp_path)
+        _a, b, link = self._tree(tmp_path)
+        real = asb.hold_rw_sources
+
+        @contextlib.contextmanager
+        def repoint_then_hold(home, sources, reads=()):
+            with real(home, sources, reads):
+                link.unlink()
+                link.symlink_to(b)          # another run re-points it once the claim is in
+                yield
+        monkeypatch.setattr(asb, "hold_rw_sources", repoint_then_hold)
+        with pytest.raises(SandboxError, match="changed after it was checked"):
+            sb.run(SandboxRequest(argv=["/usr/bin/true"], rw_mounts=[Mount(link, link)]))
+        assert (b / "f").read_text() == "b"
+
+    def test_a_link_repointed_during_the_run_is_not_copied_back_over(self, tmp_path):
+        a, b, link = self._tree(tmp_path)
+
+        class RepointingPopen(_Popen):
+            def __call__(self, argv, **kw):
+                link.unlink()
+                link.symlink_to(b)
+                return super().__call__(argv, **kw)
+        sb, _ = _sb_with(tmp_path, popen=RepointingPopen())
+        with pytest.raises(SandboxError, match="changed after it was checked"):
+            sb.run(SandboxRequest(argv=["/bin/sh", "-c", 'echo child > "$0/f"', str(link)],
+                                  rw_mounts=[Mount(link, link)]))
+        assert (b / "f").read_text() == "b"         # never replaced from a's staged copy
+        assert (a / "f").read_text() == "a"         # and nothing copied back at all
+
+
+class TestASwapInProgressIsNotRemovedUnderIt:
+    def test_the_copy_back_source_is_busy_while_it_is_swapped(self, tmp_path, monkeypatch):
+        dest = tmp_path / "dest"
+        new = tmp_path / ".dest.new"
+        old = tmp_path / ".dest.old"
+        dest.mkdir()
+        (dest / "x").write_text("host")
+        new.mkdir()
+        (new / "x").write_text("child")
+        leftovers = mc.Leftovers()
+        leftovers.add(new)
+        real = asb.AppSandboxSandbox._swap_children_locked
+        seen = {}
+
+        def emergency_midway(dest_, new_, old_, left_):
+            leftovers.remove_all()           # a retiring agent gave up waiting for the section
+            seen["new_survived"] = new_.exists()
+            return real(dest_, new_, old_, left_)
+        monkeypatch.setattr(asb.AppSandboxSandbox, "_swap_children_locked",
+                            staticmethod(emergency_midway))
+        asb.AppSandboxSandbox._swap_children(dest, new, old, leftovers)
+        assert seen["new_survived"]
+        assert (dest / "x").read_text() == "child"
+
+
+class TestCopiedBackPathsStayClearOfWhatRunsExecute:
+    def _exe(self, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\n")
+        path.chmod(0o755)
+        return path
+
+    def test_a_writable_mount_inside_a_prepared_grant_is_refused(self, tmp_path):
+        engine = tmp_path / "engine"
+        exe = self._exe(engine / "bin" / "tool")
+        lib = engine / "lib"
+        lib.mkdir()
+        popen = _Popen()
+        sb, _ = _sb_with(tmp_path, popen=popen, ro_paths=[engine])
+        with pytest.raises(SandboxError, match="execute from read-only"):
+            sb.run(SandboxRequest(argv=[str(exe)], rw_mounts=[Mount(lib, lib)]))
+        assert popen.calls == []
+
+    def test_a_capture_over_a_prepared_grant_is_refused(self, tmp_path):
+        engine = tmp_path / "engine"
+        exe = self._exe(engine / "tool")
+        popen = _Popen()
+        sb, _ = _sb_with(tmp_path, popen=popen, ro_paths=[engine])
+        with pytest.raises(SandboxError, match="holds the executable|execute from read-only"):
+            sb.run(SandboxRequest(argv=[str(exe)], capture_home=engine))
+        assert popen.calls == []
+
+    def test_a_disjoint_writable_mount_still_runs(self, tmp_path):
+        engine = tmp_path / "engine"
+        exe = self._exe(engine / "tool")
+        out = tmp_path / "out"
+        out.mkdir()
+        sb, _ = _sb_with(tmp_path, ro_paths=[engine])
+        r = sb.run(SandboxRequest(argv=[str(exe)], rw_mounts=[Mount(out, out)]))
+        assert r.exit_code == 0, r.stderr

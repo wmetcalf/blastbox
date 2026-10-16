@@ -859,6 +859,58 @@ def _slot_wait(value: float | None) -> float:
     return wait
 
 
+def _identity(path: Path) -> tuple[int, int, int] | None:
+    try:
+        st = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    return st.st_dev, st.st_ino, stat.S_IFMT(st.st_mode)
+
+
+class _Pinned:
+    """A request's host path as the caller spelled it, the target it resolved to when it was
+    checked and claimed, and that target's identity.
+
+    A spelling can run through a symlink another run can repoint (a Seatbelt run with the
+    link's parent writable). Resolving it afresh at staging or copy-back could then read or
+    replace a tree that was never claimed or checked -- another live run's, or a protected
+    one. So the claim takes the spelling (mc.hold_path_claims records both forms) and every
+    later use goes through :meth:`verify`, which refuses if the spelling now leads elsewhere or
+    the target was replaced."""
+
+    def __init__(self, given: Path, what: str) -> None:
+        self.given = Path(os.path.abspath(Path(given).expanduser()))
+        self.what = what
+        self.real = self.given.resolve()
+        self.ident = _identity(self.real)
+
+    def verify(self, *, must_exist: bool = False) -> Path:
+        real = self.given.resolve()
+        ident = _identity(real)
+        if real != self.real or ident != self.ident:
+            raise SandboxError(f"appsandbox: {self.what} {self.given} changed after it was "
+                               f"checked (it led to {self.real}, now {real}); refused")
+        if must_exist and ident is None:
+            raise SandboxError(f"appsandbox: {self.what} {self.given} does not exist")
+        return self.real
+
+
+class _RunPins:
+    """A run's pinned host paths: its writable mounts (in request order), seed and capture."""
+
+    def __init__(self, rw: list[_Pinned], seed: _Pinned | None,
+                 capture: _Pinned | None) -> None:
+        self.rw, self.seed, self.capture = rw, seed, capture
+
+    @classmethod
+    def of(cls, request: SandboxRequest) -> "_RunPins":
+        return cls(rw=[_Pinned(Path(m.source), "rw mount") for m in request.rw_mounts],
+                   seed=(_Pinned(request.seed_home, "seed_home")
+                         if request.seed_home is not None else None),
+                   capture=(_Pinned(request.capture_home, "capture_home")
+                            if request.capture_home is not None else None))
+
+
 class _CopyBack:
     """A copy-back built beside its destination and not yet swapped in (see
     ``AppSandboxSandbox._copy_back``). ``commit`` swaps it in; ``abort`` removes it. Either
@@ -1092,15 +1144,30 @@ class AppSandboxSandbox:
         self._check_exec_allowed(exe)
         self._check_exec_allowed(exe_real)
         self._check_sources_clear(request)
-        rw_sources = [Path(m.source).expanduser().resolve() for m in request.rw_mounts]
+        # Nothing copied back may hold the executable, or overlap a prepared --ro grant (what
+        # runs execute from): the copy-back would replace it on the host for every later run.
+        mc.check_writable_clear_of_exec(
+            [*(("rw mount", Path(m.source)) for m in request.rw_mounts),
+             *([("capture_home", request.capture_home)] if request.capture_home is not None
+               else [])],
+            [exe, exe_real], [Path(p) for p in self._manifest.ro_paths], "appsandbox")
+        # Pinned as checked: the claim takes each path as spelled (both its forms are claimed),
+        # and staging, seeding, copy-back and capture use the target it resolved to then --
+        # re-verified before each, never resolved afresh (see _Pinned).
+        pins = _RunPins.of(request)
         # A capture replaces its destination as a whole tree, as a copy-back does: claimed with
         # the writable mounts, so it can't race another run's copy-back (or capture) of an
         # overlapping tree -- whichever committed last would silently discard the other's.
-        claimed = [*rw_sources, *([request.capture_home.expanduser().resolve()]
-                                  if request.capture_home is not None else [])]
-        seed = ([request.seed_home.expanduser().resolve()]
-                if request.seed_home is not None else [])
+        claimed = [*(p.given for p in pins.rw),
+                   *([pins.capture.given] if pins.capture is not None else [])]
+        seed = [pins.seed.given] if pins.seed is not None else []
         with hold_rw_sources(self._home, claimed, seed), self._acquire_slot() as slot:
+            # What was checked is what is claimed: a link repointed before the claim landed is
+            # caught here, one repointed later at each use.
+            rw_sources = [p.verify(must_exist=True) for p in pins.rw]
+            for p in (pins.seed, pins.capture):
+                if p is not None:
+                    p.verify()
             # Under the claim, so no live run's copy-back is in flight in these trees: what an
             # interrupted one left is either removed or refused, never staged into this job.
             for src in rw_sources:
@@ -1127,7 +1194,8 @@ class AppSandboxSandbox:
             try:
                 self._wipe_slot(slot)
                 try:
-                    result, confined = self._run_in_slot(slot, exe, request, leftovers)
+                    result, confined = self._run_in_slot(slot, exe, request, leftovers,
+                                                         pins)
                 finally:
                     stray = self._wipe_slot(slot)
             finally:
@@ -1197,7 +1265,8 @@ class AppSandboxSandbox:
                                    "would split them -- mount a copy instead")
 
     def _run_in_slot(self, slot: Slot, exe: Path, request: SandboxRequest,
-                     leftovers: mc.Leftovers | None = None) -> tuple[SandboxResult, bool]:
+                     leftovers: mc.Leftovers | None = None,
+                     pins: "_RunPins | None" = None) -> tuple[SandboxResult, bool]:
         """The run and whether it may be credited as confined (the caller credits it once the
         slot is clean)."""
         # Every staging and copy-back copy of the run draws on ONE budget (bytes and entries):
@@ -1218,10 +1287,12 @@ class AppSandboxSandbox:
         # ONE pre-launch budget for the seed AND every staged mount: nothing is metered by the
         # watchdog until the child starts, so together they must stay within the run's limit.
         staging = mc.CopyBudget(budget)
-        if request.seed_home is not None:
+        if pins is None:      # a direct caller (tests): pinned here, as run() would have
+            pins = _RunPins.of(request)
+        if pins.seed is not None:
             if not container.is_dir():
                 self._prime_container(slot, home)
-            mc.seed_scratch(container, request.seed_home, budget=staging)
+            mc.seed_scratch(container, pins.seed.verify(must_exist=True), budget=staging)
 
         mapping: list[tuple[str, str]] = []
         rw_staged: list[tuple[Path, Path, bool]] = []
@@ -1229,7 +1300,7 @@ class AppSandboxSandbox:
         # views of ONE host tree: stage only the outermost and point the others into its staged
         # copy, so aliases share state as bind mounts do and one copy-back carries every write
         # (separate snapshots copied back in turn would let an unchanged one undo another's).
-        rw_srcs = [Path(m.source).resolve(strict=True) for m in request.rw_mounts]
+        rw_srcs = [p.verify(must_exist=True) for p in pins.rw]
         rw_root: dict[int, int] = {}
         for j, src in enumerate(rw_srcs):
             owners = [k for k, other in enumerate(rw_srcs)
@@ -1246,8 +1317,10 @@ class AppSandboxSandbox:
         n_ro = len(request.ro_mounts)
         # roots before the aliases that point into them, whatever order the request used
         for i, m in sorted(mounts, key=lambda im: im[0] >= n_ro and rw_root[im[0] - n_ro] != im[0] - n_ro):
-            src = Path(m.source).resolve(strict=True)
             j = i - n_ro
+            # writable: the pinned target, re-verified just before it is copied
+            src = (pins.rw[j].verify(must_exist=True) if j >= 0
+                   else Path(m.source).resolve(strict=True))
             if j >= 0 and rw_root[j] != j:
                 owner = rw_root[j]
                 staged = staged_rw[owner] / src.relative_to(rw_srcs[owner])
@@ -1301,6 +1374,9 @@ class AppSandboxSandbox:
                 pending.append(self._build_copy_back(staged, src, copy_back, was_dir,
                                                      leftovers, back_links))
             while pending:
+                # the host tree about to be replaced is still the one claimed and staged
+                for p in pins.rw:
+                    p.verify(must_exist=True)
                 pending.pop(0).commit()
         finally:
             for left in pending:
@@ -1318,7 +1394,8 @@ class AppSandboxSandbox:
             if not is_dir:
                 raise SandboxError(f"appsandbox: refusing to capture {container}: "
                                    "it is no longer a real directory")
-            mc.capture_scratch(container, request.capture_home, budget, leftovers)
+            capture = pins.capture.verify() if pins.capture is not None else None
+            mc.capture_scratch(container, capture, budget, leftovers)
 
         # Creditable only for a run that reached the sandbox AND completed: an engine that falls
         # back to parsing in-process after a failed or killed sandboxed run (or a copy-back that
@@ -1360,7 +1437,8 @@ class AppSandboxSandbox:
 
         A teardown section (see :func:`teardown_critical`): a retiring agent waits for the
         renames to finish rather than exit between them."""
-        with teardown_critical():
+        with teardown_critical(), \
+                (leftovers.busy(new) if leftovers is not None else contextlib.nullcontext()):
             AppSandboxSandbox._swap_children_locked(dest, new, old, leftovers)
 
     @staticmethod

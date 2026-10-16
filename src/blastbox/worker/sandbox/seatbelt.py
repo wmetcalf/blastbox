@@ -160,6 +160,12 @@ def build_profile(
         # are pinned as well. Everything beneath a directory root stays writable.
         lines.append("(deny file-write-unlink "
                      + refs("RWR", _pinned_paths(rw_paths), "literal") + ")")
+        # No hard links at all (file-write* includes file-link). The preflight scan
+        # (mc.find_split_hard_link) only sees links that exist BEFORE launch: a child could
+        # otherwise link a read-only-granted file into a writable mount and then write through
+        # that alias, mutating the "read-only" host file. Symlinks are unaffected (a symlink is
+        # file-write-create), and no engine needs to hard-link.
+        lines.append("(deny file-link)")
     for accel in sorted(accelerators):
         lines.extend(_ACCEL_RULES[accel])
     if "ane" in accelerators and scratch:
@@ -282,6 +288,13 @@ class SeatbeltSandbox:
                     f"seatbelt supports identity mounts only (source == target): {m}"
                 )
         _check_ro_rw_disjoint(ro, rw)
+        # Nothing writable may hold the executable (or its .app/.framework bundle): the grant is
+        # the host tree itself, so a change would be executed by every later run.
+        mc.check_writable_clear_of_exec(
+            [*(("rw mount", Path(m.source)) for m in request.rw_mounts),
+             *([("capture_home", request.capture_home)] if request.capture_home is not None
+               else [])],
+            [request.argv[0], exe, exe_real], [], "seatbelt")
         # The seed and capture directories against the mounts: a writable mount over the
         # seed lets the child poison later runs' seeds; a capture over any mount replaces it.
         mc.check_homes_clear_of_mounts(request.seed_home, request.capture_home, ro, rw,

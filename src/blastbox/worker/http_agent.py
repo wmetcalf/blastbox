@@ -169,7 +169,12 @@ def _retire(code: int) -> None:
         with contextlib.suppress(Exception):
             # renames take milliseconds: most of the budget stays for killing the runs
             if not begin_shutdown(EMERGENCY_CLEANUP_S / 3):
-                _log.error("http_agent: a copy-back was still running at the shutdown deadline")
+                # The cleanups still run -- killing the runs' processes can't wait -- but each
+                # backend's Leftovers skips the tree a still-running swap renames out of
+                # (Leftovers.busy): removing it mid-swap would leave the host directory
+                # part-replaced. It stays as a named leftover the next run deals with.
+                _log.error("http_agent: a copy-back was still running at the shutdown deadline; "
+                           "its tree is left in place")
             run_emergency_cleanups(max(0.0, deadline - time.monotonic()))
         _HARD_EXIT(code)
         end_shutdown()      # only reached when the exit returned (a test's fake exit)
