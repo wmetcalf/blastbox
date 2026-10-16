@@ -24,11 +24,13 @@ import contextlib
 import errno
 import ctypes
 import ctypes.util
+import hmac
 import json
 import logging
 import os
 import pwd
 import resource
+import secrets
 import shutil
 import signal
 import stat
@@ -1791,7 +1793,8 @@ _AT_FDCWD = -2          # Darwin's value; the destination is passed as an absolu
 # ACLs, ``security.*``, ``trusted.*``), so the copier behaves the same where its tests run.
 # Python's os.*xattr is Linux-only; on Darwin libc's f*xattr is called directly.
 _XATTR_NOFOLLOW = 0x0001
-_XATTR_SKIP_PREFIXES = ("com.apple.system.", "system.", "security.", "trusted.")
+_XATTR_SKIP_PREFIXES = ("com.apple.system.", "system.", "security.", "trusted.",
+                        "user.blastbox.copyback-done")   # _DONE_XATTR: never reproduced
 
 
 def _darwin_xattr() -> "ctypes.CDLL | None":
@@ -2004,6 +2007,14 @@ _COPY_BACK_DONE = COPY_BACK_MARK + "done-"
 #: entry whose (directory, name, device, inode) this worker recorded before renaming it there.
 DONE_RECORD_DIR: Path | None = None
 
+#: The tag a recorded ``done-`` tree carries: a per-retire random nonce, also kept in the record.
+#: (device, inode) alone is not an identity -- a freed inode number is reused at once (ext4 and
+#: tmpfs hand the next mkdir the same one), so an owner's own ``done-x`` made after the tree was
+#: removed matched the record and was deleted. The nonce lives only in the record (in the
+#: protected state dir) and on the tree itself; nobody else can put it on an entry. ``user.`` is
+#: the namespace Linux requires; macOS takes the name as is. The copier never reproduces it.
+_DONE_XATTR = b"user.blastbox.copyback-done"
+
 
 def _done_record_dir() -> Path:
     d = DONE_RECORD_DIR or shared_state_dir() / "copyback-done"
@@ -2072,10 +2083,27 @@ def retire_replaced(old: Path, done: Path, leftovers: "Leftovers | None") -> Non
     it, recording it first so a later worker can tell it apart from a user's own entry of that
     name if this one dies or retires mid-removal (:func:`clear_stale_copy_backs`,
     :func:`clear_recorded_siblings`). Listed in ``leftovers`` meanwhile; the record is dropped
-    once it is gone. Raises ``SandboxError`` if it can't be removed (the record then stays)."""
+    once it is gone. Raises ``SandboxError`` if it can't be removed (the record then stays).
+
+    Where the tree can't carry the nonce tag (no extended attributes on that filesystem, or the
+    entry refuses one), nothing is recorded or renamed: it is removed in place under its
+    ``old-`` name, and if that can't finish the name stays -- which a later run refuses over
+    rather than deletes (fail closed)."""
+    nonce = secrets.token_hex(16)
+    try:
+        _xattr_set(old, _DONE_XATTR, nonce.encode())
+    except OSError:
+        if leftovers is not None:
+            leftovers.add(old)
+        remove_tree(old)
+        if os.path.lexists(old):
+            raise SandboxError(f"could not remove the replaced contents ({old})") from None
+        if leftovers is not None:
+            leftovers.discard(old)
+        return
     st = os.lstat(old)
     rec = {"parent": os.path.realpath(done.parent), "name": done.name, "from": old.name,
-           "dev": st.st_dev, "ino": st.st_ino}
+           "dev": st.st_dev, "ino": st.st_ino, "nonce": nonce}
     d = _done_record_dir()
     rec_path = d / f"{os.urandom(8).hex()}.json"
     fd = os.open(rec_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -2102,15 +2130,47 @@ def retire_replaced(old: Path, done: Path, leftovers: "Leftovers | None") -> Non
         os.unlink(rec_path)
 
 
-def _remove_recorded(path: Path, records: list[tuple[Path, dict]]) -> bool:
-    """Remove ``path`` if a record names it (same name, device and inode); True if it's gone."""
+def _done_nonce(path: Path) -> "tuple[os.stat_result, bytes] | None":
+    """``path``'s identity and the nonce tag it carries (:data:`_DONE_XATTR`), read through one
+    no-follow descriptor; None if it is not a directory or regular file, or carries no tag.
+    Anything else (a symlink, FIFO, device node) is never opened -- a FIFO would block, a
+    device open could act."""
     try:
         st = os.lstat(path)
-    except FileNotFoundError:
+    except OSError:
+        return None
+    if not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        fst = os.fstat(fd)
+        if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino):
+            return None             # swapped between the lstat and the open
+        try:
+            return fst, _xattr_get(fd, _DONE_XATTR)
+        except OSError:
+            return None
+    finally:
+        os.close(fd)
+
+
+def _remove_recorded(path: Path, records: list[tuple[Path, dict]]) -> bool:
+    """Remove ``path`` if a record names it -- same name, device, inode AND nonce tag (see
+    :data:`_DONE_XATTR`); True if it's gone."""
+    if not os.path.lexists(path):
         return True
+    tagged = _done_nonce(path)
+    if tagged is None:
+        return False
+    st, tag = tagged
     for rec_path, rec in records:
+        nonce = rec.get("nonce")
         if (rec.get("name") == path.name and rec.get("dev") == st.st_dev
-                and rec.get("ino") == st.st_ino):
+                and rec.get("ino") == st.st_ino and isinstance(nonce, str)
+                and hmac.compare_digest(tag, nonce.encode())):
             remove_tree(path)
             if os.path.lexists(path):
                 return False
@@ -2157,7 +2217,8 @@ def clear_stale_copy_backs(source: Path, *,
     A worker that exits mid-copy-back (killed, or past its shutdown budget) leaves hidden entries
     in the host tree, which a later run would stage -- an earlier run's bytes in a new job. A
     ``done-`` tree is the replaced contents after every rename finished, and is removed here --
-    but only one this worker RECORDED (:func:`retire_replaced`): the same name, device and inode.
+    but only one this worker RECORDED (:func:`retire_replaced`): the same name, device, inode
+    and nonce tag (an inode number alone is reused as soon as it is freed).
     A ``done-`` name alone is not proof (the owner or a child may have made it), so an
     unrecorded one is returned like any other leftover (the replacement, or the host's own
     entries moved aside mid-swap) for the caller to refuse the mount over.
@@ -2412,3 +2473,35 @@ def is_under(path: Path, roots: Iterable[Path]) -> bool:
 def paths_overlap(a: Path, b: Path) -> bool:
     """Whether ``a`` and ``b`` (both resolved) are the same path or one contains the other."""
     return a == b or a in b.parents or b in a.parents
+
+
+def check_homes_clear_of_mounts(seed_home: "Path | str | None", capture_home: "Path | str | None",
+                                ro_sources: Iterable["Path | str"],
+                                rw_sources: Iterable["Path | str"], backend: str) -> None:
+    """Refuse a seed or capture directory that overlaps the request's mounts (compared resolved;
+    equal, inside or containing), before anything is copied or launched.
+
+    * A ``seed_home`` overlapping a WRITABLE mount: the child could persist changes into the
+      seed every later job starts from -- Seatbelt writes the host tree in place, App Sandbox
+      copies the staged mount back over it. (A read-only mount over the seed is harmless.)
+    * A ``capture_home`` overlapping ANY mount: the capture replaces that tree with the run's
+      cache at teardown, so (part of) a request's input or output source would be swapped for
+      the scratch home -- and, for a read-only mount, the child would get to write it after all.
+    """
+    rw = [Path(p).expanduser().resolve() for p in rw_sources]
+    ro = [Path(p).expanduser().resolve() for p in ro_sources]
+    if seed_home is not None:
+        seed = Path(seed_home).expanduser().resolve()
+        for w in rw:
+            if paths_overlap(seed, w):
+                raise SandboxError(f"{backend}: seed_home {seed_home} overlaps writable mount {w}; "
+                                   "the child could change what later runs are seeded from -- "
+                                   "use disjoint paths")
+    if capture_home is not None:
+        cap = Path(capture_home).expanduser().resolve()
+        for kind, sources in (("read-only", ro), ("writable", rw)):
+            for m in sources:
+                if paths_overlap(cap, m):
+                    raise SandboxError(f"{backend}: capture_home {capture_home} overlaps {kind} "
+                                       f"mount {m}; the capture would replace it with the run's "
+                                       "cache -- use disjoint paths")

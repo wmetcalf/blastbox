@@ -747,3 +747,46 @@ class TestSeatbeltNeverGrantsTheSharedState:
             self._sb(tmp_path).run(SandboxRequest(argv=["/bin/echo", "hi"],
                                                   capture_home=records / "cache"))
 
+
+class TestSeedAndCaptureStayClearOfTheMounts:
+    """Codex P1 (#198): a seed under a writable mount let the child poison what later runs are
+    seeded from (Seatbelt writes the host tree in place); a capture over any mount replaced that
+    tree with the run's cache. Both refused before anything is created."""
+
+    @staticmethod
+    def _sb(tmp_path, calls):
+        def popen(argv, **kw):
+            calls.append(argv)
+            return _FakeProc(argv, **kw)
+        return SeatbeltSandbox(popen=popen, platform_ok=True, sandbox_exec="/bin/sh",
+                               scratch_base=tmp_path / "scratch")
+
+    @pytest.mark.parametrize("where", ["equal", "inside", "contains"])
+    def test_a_seed_overlapping_a_writable_mount_is_refused(self, tmp_path, where):
+        data = tmp_path / "x" / "data"
+        (data / "seed").mkdir(parents=True)
+        seed = {"equal": data, "inside": data / "seed", "contains": data.parent}[where]
+        calls: list = []
+        with pytest.raises(SandboxError, match="seed_home .* overlaps writable mount"):
+            self._sb(tmp_path, calls).run(SandboxRequest(
+                argv=["/bin/echo", "hi"], rw_mounts=[Mount(data, data)], seed_home=seed))
+        assert calls == []
+
+    def test_a_seed_under_a_read_only_mount_is_allowed(self, tmp_path):
+        data = tmp_path / "data"
+        (data / "seed").mkdir(parents=True)
+        calls: list = []
+        self._sb(tmp_path, calls).run(SandboxRequest(
+            argv=["/bin/echo", "hi"], ro_mounts=[Mount(data, data)], seed_home=data / "seed"))
+        assert calls
+
+    @pytest.mark.parametrize("kind", ["ro", "rw"])
+    def test_a_capture_overlapping_a_mount_is_refused(self, tmp_path, kind):
+        data = tmp_path / "data"
+        data.mkdir()
+        mounts = {f"{kind}_mounts": [Mount(data, data)]}
+        calls: list = []
+        with pytest.raises(SandboxError, match="capture_home .* overlaps"):
+            self._sb(tmp_path, calls).run(SandboxRequest(
+                argv=["/bin/echo", "hi"], capture_home=data / "cache", **mounts))
+        assert calls == []

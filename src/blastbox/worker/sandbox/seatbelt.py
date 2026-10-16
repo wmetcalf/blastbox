@@ -282,6 +282,10 @@ class SeatbeltSandbox:
                     f"seatbelt supports identity mounts only (source == target): {m}"
                 )
         _check_ro_rw_disjoint(ro, rw)
+        # The seed and capture directories against the mounts: a writable mount over the
+        # seed lets the child poison later runs' seeds; a capture over any mount replaces it.
+        mc.check_homes_clear_of_mounts(request.seed_home, request.capture_home, ro, rw,
+                                       "seatbelt")
         # The path check above can't see hard links: a file linked into a writable mount AND
         # somewhere else (a read-only mount, an input) would let the child edit it through the
         # writable name. Every name of a multiply-linked file must be inside the writable mounts.

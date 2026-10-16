@@ -2106,6 +2106,7 @@ class TestOnlyRecordedDoneTreesAreRemoved:
         # a copy-back whose final removal of the replaced contents was cut short
         old = src / f"{mc.COPY_BACK_MARK}old-abcd"
         old.mkdir(parents=True)
+        _need_done_tags(old)
         (old / "earlier-run").write_text("x")
         done = src / f"{mc.COPY_BACK_MARK}done-abcd"
         monkeypatch.setattr(mc, "remove_tree", lambda p: None)
@@ -2174,6 +2175,7 @@ class TestCaptureFallbackSwapRecordsTheOldTree:
         return scratch
 
     def test_the_old_capture_is_listed_while_removed(self, tmp_path, monkeypatch):
+        _need_done_tags(tmp_path)
         monkeypatch.setattr(mc, "_renamex_np", lambda: None)
         dest = tmp_path / "cache"
         mc.capture_scratch(self._scratch(tmp_path, "one"), dest, 1 << 20)
@@ -2189,6 +2191,7 @@ class TestCaptureFallbackSwapRecordsTheOldTree:
         assert leftovers._paths == set()
 
     def test_an_interrupted_removal_is_finished_by_the_next_capture(self, tmp_path, monkeypatch):
+        _need_done_tags(tmp_path)
         monkeypatch.setattr(mc, "_renamex_np", lambda: None)
         dest = tmp_path / "cache"
         mc.capture_scratch(self._scratch(tmp_path, "one"), dest, 1 << 20)
@@ -2286,3 +2289,108 @@ class TestByteCopyKeepsExtendedAttributes:
         finally:
             os.close(fd)
 
+
+def _need_done_tags(path) -> None:
+    """Skip where ``path``'s filesystem has no user extended attributes: retire_replaced then
+    records nothing (by design), so the recorded-cleanup path can't be exercised there."""
+    probe = path / ".xattr-probe"
+    probe.write_text("")
+    try:
+        mc._xattr_set(probe, mc._DONE_XATTR, b"probe")
+    except OSError:
+        pytest.skip("no user extended attributes on this filesystem")
+    finally:
+        probe.unlink()
+
+
+class TestDoneTreesCarryANonce:
+    """Linux CI (#198): a freed inode number is reused at once (ext4/tmpfs give the next mkdir
+    the same one), so a `done-` record matched by (name, device, inode) deleted an owner's own
+    directory of that name made after the recorded tree was gone. A recorded tree now also
+    carries a per-retire random nonce (an extended attribute, kept in the record); without it,
+    nothing is deleted. Where the tag can't be set, nothing is recorded at all."""
+
+    @staticmethod
+    def _recorded(tmp_path, monkeypatch):
+        src = tmp_path / "data"
+        old = src / f"{mc.COPY_BACK_MARK}old-n"
+        old.mkdir(parents=True)
+        _need_done_tags(old)
+        done = src / f"{mc.COPY_BACK_MARK}done-n"
+        with monkeypatch.context() as m:
+            m.setattr(mc, "remove_tree", lambda p: None)
+            with pytest.raises(SandboxError, match="could not remove"):
+                mc.retire_replaced(old, done, None)
+        return src, done
+
+    @staticmethod
+    def _record():
+        recs = list(mc.DONE_RECORD_DIR.iterdir())
+        assert len(recs) == 1
+        return recs[0]
+
+    def test_a_reused_inode_without_the_tag_is_refused(self, tmp_path, monkeypatch):
+        import json
+        src, done = self._recorded(tmp_path, monkeypatch)
+        mc.remove_tree(done)
+        done.mkdir()                                        # the owner's own, same name
+        (done / "keep").write_text("mine")
+        st = os.lstat(done)
+        rec_path = self._record()                           # as if the inode number were reused
+        rec = json.loads(rec_path.read_text())
+        rec.update(dev=st.st_dev, ino=st.st_ino)
+        rec_path.write_text(json.dumps(rec))
+        assert mc.clear_stale_copy_backs(src) == done
+        assert (done / "keep").read_text() == "mine"
+
+    def test_a_wrong_tag_is_refused(self, tmp_path, monkeypatch):
+        src, done = self._recorded(tmp_path, monkeypatch)
+        mc._xattr_set(done, mc._DONE_XATTR, b"0" * 32)
+        assert mc.clear_stale_copy_backs(src) == done
+        assert done.exists()
+
+    def test_the_tagged_tree_is_removed(self, tmp_path, monkeypatch):
+        src, done = self._recorded(tmp_path, monkeypatch)
+        assert "nonce" in __import__("json").loads(self._record().read_text())
+        assert mc.clear_stale_copy_backs(src) is None
+        assert not done.exists()
+        assert list(mc.DONE_RECORD_DIR.iterdir()) == []
+
+    def test_a_fifo_with_the_name_is_never_opened(self, tmp_path, monkeypatch):
+        src, done = self._recorded(tmp_path, monkeypatch)
+        mc.remove_tree(done)
+        os.mkfifo(done)                                     # opening it would block the worker
+        assert mc.clear_stale_copy_backs(src) == done
+        assert stat.S_ISFIFO(os.lstat(done).st_mode)
+
+    @staticmethod
+    def _untaggable(monkeypatch):
+        def refuse(path, name, value):
+            raise OSError(errno.ENOTSUP, "no extended attributes here")
+        monkeypatch.setattr(mc, "_xattr_set", refuse)
+
+    def test_without_tags_the_tree_is_removed_unrecorded(self, tmp_path, monkeypatch):
+        self._untaggable(monkeypatch)
+        old = tmp_path / "d" / f"{mc.COPY_BACK_MARK}old-x"
+        (old / "sub").mkdir(parents=True)
+        leftovers = mc.Leftovers()
+        mc.retire_replaced(old, old.with_name(f"{mc.COPY_BACK_MARK}done-x"), leftovers)
+        assert list((tmp_path / "d").iterdir()) == []
+        assert list(mc.DONE_RECORD_DIR.iterdir()) == []
+        assert leftovers._paths == set()
+
+    def test_without_tags_an_unfinished_removal_is_refused_later(self, tmp_path, monkeypatch):
+        self._untaggable(monkeypatch)
+        src = tmp_path / "data"
+        old = src / f"{mc.COPY_BACK_MARK}old-x"
+        old.mkdir(parents=True)
+        leftovers = mc.Leftovers()
+        with monkeypatch.context() as m:
+            m.setattr(mc, "remove_tree", lambda p: None)
+            with pytest.raises(SandboxError, match="could not remove"):
+                mc.retire_replaced(old, old.with_name(f"{mc.COPY_BACK_MARK}done-x"), leftovers)
+        assert old.exists()                                 # kept its old- name: never "garbage"
+        assert old in leftovers._paths                      # the emergency cleanup still has it
+        assert list(mc.DONE_RECORD_DIR.iterdir()) == []
+        assert mc.clear_stale_copy_backs(src) == old        # refused, not deleted
+        assert old.exists()

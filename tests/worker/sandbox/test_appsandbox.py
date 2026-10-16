@@ -1936,3 +1936,38 @@ class TestCapturesAreClaimed:
             pass
         assert seen and cache.resolve() in seen[-1]
 
+
+class TestSeedAndCaptureStayClearOfTheMounts:
+    """Codex P1 (#198): a seed under a writable mount was copied back over by the run (later runs
+    seeded from what the child wrote); a capture over any mount replaced that tree with the
+    slot's cache. Both refused before any claim is made or anything is staged."""
+
+    @staticmethod
+    def _claims(monkeypatch):
+        claimed: list[object] = []
+        real = asb.hold_rw_sources
+        monkeypatch.setattr(asb, "hold_rw_sources", lambda h, s: claimed.append(s) or real(h, s))
+        return claimed
+
+    @pytest.mark.parametrize("where", ["equal", "inside", "contains"])
+    def test_a_seed_overlapping_a_writable_mount_is_refused(self, tmp_path, monkeypatch, where):
+        sb, _ = _sb_with(tmp_path)
+        data = tmp_path / "x" / "data"
+        (data / "seed").mkdir(parents=True)
+        seed = {"equal": data, "inside": data / "seed", "contains": data.parent}[where]
+        claimed = self._claims(monkeypatch)
+        with pytest.raises(SandboxError, match="seed_home .* overlaps writable mount"):
+            sb.run(SandboxRequest(argv=["/bin/echo"], rw_mounts=[Mount(data, data)],
+                                  seed_home=seed))
+        assert claimed == []
+
+    @pytest.mark.parametrize("kind", ["ro", "rw"])
+    def test_a_capture_overlapping_a_mount_is_refused(self, tmp_path, monkeypatch, kind):
+        sb, _ = _sb_with(tmp_path)
+        data = tmp_path / "data"
+        data.mkdir()
+        claimed = self._claims(monkeypatch)
+        with pytest.raises(SandboxError, match="capture_home .* overlaps"):
+            sb.run(SandboxRequest(argv=["/bin/echo"], capture_home=data / "cache",
+                                  **{f"{kind}_mounts": [Mount(data, data)]}))
+        assert claimed == []

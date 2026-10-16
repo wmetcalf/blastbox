@@ -1184,6 +1184,12 @@ class AppSandboxSandbox:
         # a copy-back or capture over them would replace lock files other runs hold by inode.
         # Checked before any claim is made.
         mc.check_clear_of_state(paths, "appsandbox", self._home)
+        # The seed and capture directories against the mounts: a writable mount over the seed
+        # is copied back over it (later runs seeded from what the child wrote); a capture over
+        # any mount replaces that tree with the slot's cache.
+        mc.check_homes_clear_of_mounts(request.seed_home, request.capture_home,
+                                       [m.source for m in request.ro_mounts],
+                                       [m.source for m in request.rw_mounts], "appsandbox")
         for what, p in paths:
             rp = p.expanduser().resolve()
             for area in protected:
