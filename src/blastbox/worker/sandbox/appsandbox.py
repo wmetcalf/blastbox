@@ -67,6 +67,7 @@ from blastbox.limits import Limits
 from blastbox.worker.sandbox.base import (
     SandboxRequest,
     SandboxResult,
+    current_ledger,
     note_confined_run,
     register_emergency_cleanup,
     teardown_critical,
@@ -426,11 +427,13 @@ def prepare(
     under a re-signed bundle (another bundle id, other grants) that its watchdog and sweep
     don't match.
 
-    A RETIRED slot (one a run could not prove clean) is swept and emptied under its PREVIOUS
-    bundle id -- the identity a surviving process still carries -- before anything changes;
-    a prepare that can't prove it empty refuses. Re-preparing under another prefix, or
-    dropping the slot, would otherwise leave that process with its grant to the slot's ``io/``
-    and no future sweep that matches it. ``home`` is the user's home (its containers).
+    EVERY existing slot is swept and emptied under each bundle id it may have carried (the
+    current manifest's, its signed bundle's, and the one it is about to get) before anything
+    changes; a prepare that can't prove them empty refuses. A process can survive without its
+    slot being RETIRED -- an agent SIGKILLed mid-run writes no marker, and relies on the next
+    run's pre-run sweep -- and re-preparing under another prefix, or dropping the slot, would
+    leave it its grant to the slot's ``io/`` with no future sweep that matches it. A retired
+    slot whose previous id can't be read at all refuses. ``home`` is the user's home.
     """
     if not 1 <= slots <= 256:
         raise SandboxError("slots must be between 1 and 256")
@@ -464,12 +467,11 @@ def prepare(
     # so it never delays a run; it lives in locks/, which no slot cleanup touches.
     with _held_lock(root / "locks" / PREPARE_LOCK, deadline, wait_s,
                     "another `blastbox macos prepare` is running on this root"):
-        existing = [int(c.name) for c in (root / "slots").iterdir() if c.name.isdigit()] \
-            if (root / "slots").is_dir() else []
+        existing = _existing_slots(root)
         indexes = range(max([slots, *(i + 1 for i in existing)]))
         with _all_slot_locks(root, indexes, wait_s, deadline=deadline):
-            _clean_retired_slots(root, indexes,
-                                 home or Path(pwd.getpwuid(os.getuid()).pw_dir))
+            _sweep_previous_slots(root, existing, prefix,
+                                  home or Path(pwd.getpwuid(os.getuid()).pw_dir))
             return _prepare_locked(root, slots=slots, resolved_ro=resolved_ro, prefix=prefix,
                                    cc=cc, codesign=codesign, runner=runner)
 
@@ -496,31 +498,61 @@ def _previous_bundle_ids(root: Path, indexes: Iterable[int]) -> dict[int, set[st
     return ids
 
 
-def _clean_retired_slots(root: Path, indexes: Iterable[int], home: Path) -> None:
-    """Sweep and empty every retired slot under its previous identity, or raise."""
-    retired = [i for i in indexes if (root / "locks" / f"{i}.lock.retired").exists()]
-    if not retired:
+def _existing_slots(root: Path) -> list[int]:
+    """Every slot index this root may still have a process for: a slot directory, a slot in the
+    current manifest, or a retirement marker."""
+    found: set[int] = set()
+    if (root / "slots").is_dir():
+        found.update(int(c.name) for c in (root / "slots").iterdir() if c.name.isdigit())
+    if (root / "locks").is_dir():
+        for marker in (root / "locks").glob("*.lock.retired"):
+            index = marker.name.split(".", 1)[0]
+            if index.isdigit():
+                found.add(int(index))
+    try:
+        found.update(s.index for s in Manifest.load(root).slots)
+    except SandboxError:
+        pass                    # none yet, or a failed prepare's "preparing" marker
+    return sorted(i for i in found if 0 <= i < 256)
+
+
+def _sweep_previous_slots(root: Path, indexes: Iterable[int], prefix: str, home: Path) -> None:
+    """Sweep every given slot under every identity it may carry, then empty it, or raise.
+
+    Not only retired slots: an agent killed mid-run (SIGKILL) leaves no marker, and its
+    surviving process is matched only by its container -- which this prepare may be about to
+    rename (another prefix) or drop (a shrink). Nothing is changed if a slot can't be proven
+    empty."""
+    indexes = list(indexes)
+    if not indexes:
         return
-    previous = _previous_bundle_ids(root, retired)
-    for i in retired:
+    previous = _previous_bundle_ids(root, indexes)
+    for i in indexes:
         marker = root / "locks" / f"{i}.lock.retired"
-        if not previous.get(i):
+        if marker.exists() and not previous.get(i):
             raise SandboxError(
                 f"appsandbox: slot {i} is retired, but its previous bundle id can't be read "
                 f"(manifest and slot bundle both unreadable), so a process it left can't be "
                 f"swept; make sure none is left, delete {marker}, and re-run prepare")
-        for bid in sorted(previous[i]):
-            old = Slot(index=i, bundle_id=bid,
-                       bundle=root / "slots" / str(i) / f"bb-slot-{i}.app",
-                       io_dir=root / "slots" / str(i) / "io",
-                       lock_path=root / "locks" / f"{i}.lock")
-            try:
-                mc.sweep_container(old.container_data(home))
-                _empty_slot(old, home)
-            except SandboxError as exc:
-                raise SandboxError(
-                    f"appsandbox: retired slot {i} ({bid}) can't be proven empty: {exc}; "
-                    "inspect it, then re-run prepare") from exc
+    old = [Slot(index=i, bundle_id=bid,
+                bundle=root / "slots" / str(i) / f"bb-slot-{i}.app",
+                io_dir=root / "slots" / str(i) / "io",
+                lock_path=root / "locks" / f"{i}.lock")
+           for i in indexes
+           for bid in sorted(previous.get(i, set()) | {f"{prefix}.slot{i}"})]
+    try:
+        mc.sweep_containers([s.container_data(home) for s in old],
+                            what=f"appsandbox slots {indexes} of {root}")
+    except SandboxError as exc:
+        raise SandboxError(f"appsandbox: slots under {root} can't be proven free of a previous "
+                           f"run's processes: {exc}; inspect them, then re-run prepare") from exc
+    for s in old:
+        try:
+            _empty_slot(s, home)
+        except SandboxError as exc:
+            raise SandboxError(
+                f"appsandbox: slot {s.index} ({s.bundle_id}) can't be proven empty: {exc}; "
+                "inspect it, then re-run prepare") from exc
 
 
 def _prepare_wait(value: float | None) -> float:
@@ -628,7 +660,7 @@ def _prepare_locked(root: Path, *, slots: int, resolved_ro: list[Path], prefix: 
         built.append(slot)
 
     # Drop slots beyond the new count so a shrink cannot leave stale signed launchers around --
-    # and their retirement markers, already swept and emptied (_clean_retired_slots): a marker
+    # and their retirement markers, already swept and emptied (_sweep_previous_slots): a marker
     # left behind would retire the slot again, with no identity to sweep, if it is re-added.
     slots_root = root / "slots"
     for child in slots_root.iterdir():
@@ -891,6 +923,9 @@ class AppSandboxSandbox:
             )
 
     def run(self, request: SandboxRequest) -> SandboxResult:
+        # The detonation this run is part of, read at its START: credited only if the run also
+        # finishes while that ledger is open (see ConfinementLedger).
+        ledger = current_ledger()
         if not isinstance(request.argv, list) or not request.argv:
             raise SandboxError("argv must be a non-empty list of strings")
         if request.limits.net_egress:
@@ -936,7 +971,7 @@ class AppSandboxSandbox:
         # raised is a failed run, and an engine falling back to an in-process parse after it
         # must not pass that parse off as confined.
         if confined:
-            note_confined_run()
+            note_confined_run(ledger)
         return result
 
     def _check_sources_clear(self, request: SandboxRequest) -> None:

@@ -6,6 +6,7 @@ import os
 import signal
 import sys
 import contextlib
+import contextvars
 import itertools
 import threading
 import time
@@ -13,11 +14,14 @@ from collections.abc import Callable, Iterator
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from types import EllipsisType
+from typing import Protocol, TypeVar, runtime_checkable
 
 from blastbox.limits import Limits  # noqa: F401 — re-exported for convenience
 
 _log = logging.getLogger("blastbox.worker.sandbox")
+
+T = TypeVar("T")
 
 
 def host_platform() -> str:
@@ -31,43 +35,109 @@ def host_platform() -> str:
 
 _CONFINED_RUNS = 0
 _CONFINED_LOCK = threading.Lock()
-# Open not_counted() blocks, process-wide (see not_counted).
-_NOT_COUNTED_DEPTH = 0
+
+
+class ConfinementLedger:
+    """The confined runs credited to ONE detonation (or one warmup).
+
+    On a host with no outer isolation boundary (macOS) the agent refuses an ``ok`` result that
+    no sandboxed run vouches for. A process-wide count diffed around ``detonate()`` could be
+    moved by work that is not this parse: a detector's run finishing late on its own thread, a
+    run left over from an earlier failed job. Credit is therefore scoped to a ledger that the
+    agent opens for the detonation and carries in a context variable:
+
+    * a backend reads the ledger when a run STARTS and credits it when the run finishes, and
+      only while the ledger is still open -- so a run must start and end inside the detonation;
+    * a run with no ledger in its context (a thread started without the caller's context, a
+      detector inside :func:`not_counted`, a run of an earlier job) credits nothing.
+
+    Fail closed: an engine that makes its sandbox calls on a thread it starts gets no credit
+    unless it runs that work in the detonation's context -- :func:`in_this_context` wraps a
+    callable for ``Thread(target=...)`` / ``executor.submit(...)``."""
+
+    __slots__ = ("_runs", "_open")
+
+    def __init__(self) -> None:
+        self._runs = 0
+        self._open = True
+
+    @property
+    def runs(self) -> int:
+        with _CONFINED_LOCK:
+            return self._runs
+
+    def _credit(self) -> None:
+        with _CONFINED_LOCK:
+            if self._open:
+                self._runs += 1
+
+    def _close(self) -> None:
+        with _CONFINED_LOCK:
+            self._open = False
+
+
+_LEDGER: contextvars.ContextVar[ConfinementLedger | None] = contextvars.ContextVar(
+    "blastbox_confinement_ledger", default=None)
+
+
+@contextlib.contextmanager
+def confinement_ledger() -> Iterator[ConfinementLedger]:
+    """Open a ledger for the work done in this block (in this context); closed on exit, after
+    which a run that is still going credits nothing."""
+    ledger = ConfinementLedger()
+    token = _LEDGER.set(ledger)
+    try:
+        yield ledger
+    finally:
+        ledger._close()
+        _LEDGER.reset(token)
+
+
+def current_ledger() -> ConfinementLedger | None:
+    """The ledger a run starting now would credit (None: it credits nothing)."""
+    return _LEDGER.get()
+
+
+def in_this_context(fn: Callable[..., T]) -> Callable[..., T]:
+    """``fn`` bound to a copy of the caller's context, for an engine that runs its sandbox
+    calls on a thread it starts: a plain thread starts with no ledger, so its runs would not be
+    credited to the detonation that started it."""
+    ctx = contextvars.copy_context()
+
+    def _run(*args: object, **kwargs: object) -> T:
+        return ctx.copy().run(fn, *args, **kwargs)
+    return _run
 
 
 @contextlib.contextmanager
 def not_counted() -> Iterator[None]:
-    """Runs made while this block is open don't count as confined parses: a backend probe
-    running ``/usr/bin/true``, or an engine's ``detect()``, must not give the engine credit
-    before (or instead of) its ``detonate()`` parser.
-
-    Process-wide, not per-thread or per-context: a detector may make its sandbox call on a
-    thread it starts (a ``ThreadPoolExecutor``, its own joined thread), which inherits no
-    context. The agent that reads the count runs one job at a time, so nothing else of the job
-    is running meanwhile; a probe overlapping another thread's run can only withhold credit
-    (that result is refused), never grant it."""
-    global _NOT_COUNTED_DEPTH
-    with _CONFINED_LOCK:
-        _NOT_COUNTED_DEPTH += 1
+    """Runs started in this block (in this context) credit no ledger: a backend probe running
+    ``/usr/bin/true``, or an engine's ``detect()``, must not give the engine credit before (or
+    instead of) its ``detonate()`` parser. A thread the block starts without copying the context
+    has no ledger either, so neither path can vouch for the parse."""
+    token = _LEDGER.set(None)
     try:
         yield
     finally:
-        with _CONFINED_LOCK:
-            _NOT_COUNTED_DEPTH -= 1
+        _LEDGER.reset(token)
 
 
-def note_confined_run() -> None:
-    """Called by a backend that confines a run itself (seatbelt, appsandbox): on a host with no
-    outer isolation boundary (macOS), the agent uses the count to prove an ``ok`` result came
-    from a sandboxed parse rather than from the engine's own (unconfined) process."""
+def note_confined_run(ledger: ConfinementLedger | None | EllipsisType = ...) -> None:
+    """Called by a backend that confines a run itself (seatbelt, appsandbox) once the run has
+    proven it ran confined. ``ledger`` is what :func:`current_ledger` returned when the run
+    STARTED (default: the current one, for a caller whose run is instantaneous); it is credited
+    only if still open. The process-wide :func:`confined_runs` total counts every such run."""
     global _CONFINED_RUNS
+    target = current_ledger() if isinstance(ledger, EllipsisType) else ledger
     with _CONFINED_LOCK:
-        if _NOT_COUNTED_DEPTH:
-            return
         _CONFINED_RUNS += 1
+    if target is not None:
+        target._credit()
 
 
 def confined_runs() -> int:
+    """Every confined run recorded in this process -- a diagnostic total. The agent's
+    confinement gate does not use it (see :class:`ConfinementLedger`)."""
     with _CONFINED_LOCK:
         return _CONFINED_RUNS
 

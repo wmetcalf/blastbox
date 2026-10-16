@@ -1681,8 +1681,13 @@ def _container_identity(path: str | os.PathLike[str]) -> str:
 
 def container_matcher(container: Path) -> Callable[[int], bool]:
     """Matches a process whose App Sandbox container is ``container`` (an appsandbox slot)."""
-    want = _container_identity(container)
-    return lambda p: (c := container_of(p)) is not None and _container_identity(c) == want
+    return containers_matcher([container])
+
+
+def containers_matcher(containers: Iterable[Path]) -> Callable[[int], bool]:
+    """Matches a process whose App Sandbox container is any of ``containers``."""
+    want = {_container_identity(c) for c in containers}
+    return lambda p: (c := container_of(p)) is not None and _container_identity(c) in want
 
 
 def restore_identity_dir(path: Path) -> None:
@@ -1727,6 +1732,12 @@ def sweep_writers(path: Path, *, started_after: float) -> int:
 def sweep_container(container: Path) -> int:
     """Kill every process whose App Sandbox container is ``container``."""
     return sweep_sandboxed(container_matcher(container), what=f"container {container}")
+
+
+def sweep_containers(containers: Iterable[Path], *, what: str) -> int:
+    """Kill every process whose App Sandbox container is any of ``containers``: one sweep
+    (each lists every process of the uid, several rounds) rather than one per container."""
+    return sweep_sandboxed(containers_matcher(containers), what=what)
 
 
 # --------------------------------------------------------------------------------------------

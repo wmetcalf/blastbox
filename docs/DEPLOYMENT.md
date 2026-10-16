@@ -282,7 +282,11 @@ was granted.
   `/healthz` stays 503: a self-test that passed by parsing in-process proves nothing about the
   sandbox's grants.
   `select_sandbox()`'s own `/usr/bin/true` probe never counts, so an engine that selects its
-  backend mid-job gets no credit before its parser has run. `BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE=1` is the explicit escape hatch.
+  backend mid-job gets no credit before its parser has run. Credit is scoped to the job: a run
+  counts only if it starts and finishes during that detonation, in its context. A run on a
+  thread the engine starts without that context (a plain `Thread` or executor), a detector's
+  run, or one left over from an earlier job counts for nothing, so an engine that sandboxes on
+  its own threads must wrap the callable in `blastbox.worker.sandbox.base.in_this_context`. `BLASTBOX_WORKER_AGENT_ALLOW_UNSANDBOXED_ENGINE=1` is the explicit escape hatch.
 - The engine's optional `detect()` isn't called in the agent (it would parse the input outside
   any sandbox) unless the engine declares `sandboxed_detect = True`.
 - A failed `warmup()` (where an engine runs its known-positive self-test), or an engine with no
@@ -328,6 +332,11 @@ was granted.
   Before touching any slot, prepare replaces the manifest with a "preparing" marker: a
   prepare that fails part-way (say `codesign` on a later slot) leaves every agent -- live or
   newly started -- refusing App Sandbox until a prepare completes.
+  Before anything changes, prepare also sweeps EVERY existing slot (not only retired ones)
+  under each bundle id it may have carried -- the current manifest's, the signed bundle's, and
+  its new one -- and empties it, refusing if any can't be proven empty. A process left by an
+  agent that was SIGKILLed mid-run (no retirement marker) is so swept before a new prefix or a
+  shrink would leave its container unmatched by any future sweep.
 - A `seatbelt` run can't unlink or rename the roots of its writable mounts or its scratch
   dir (nor a directory between a mount root and an outer writable mount); everything beneath
   a directory root stays writable. A scratch dir that is nonetheless gone or replaced after

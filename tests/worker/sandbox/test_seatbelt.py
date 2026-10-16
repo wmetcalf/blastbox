@@ -494,11 +494,11 @@ def test_a_hidden_grandchild_is_metered_and_killed_during_the_run(monkeypatch):
 def test_selecting_a_sandbox_is_not_a_confined_run(monkeypatch):
     # select_sandbox()'s smoketest really launches /usr/bin/true under the profile; that probe
     # must not give an engine confinement credit before its parser runs.
-    from blastbox.worker.sandbox.base import confined_runs
+    from blastbox.worker.sandbox.base import confinement_ledger
     from blastbox.worker.sandbox.detect import select_sandbox
-    before = confined_runs()
-    assert select_sandbox(backend="seatbelt").name == "seatbelt"
-    assert confined_runs() == before
+    with confinement_ledger() as ledger:
+        assert select_sandbox(backend="seatbelt").name == "seatbelt"
+    assert ledger.runs == 0
 
 
 class _FailingProc(_FakeProc):
@@ -615,3 +615,45 @@ def test_a_writable_mount_holding_the_scratch_root_is_refused(tmp_path):
         with pytest.raises(SandboxError, match="contains the scratch root"):
             sb.run(SandboxRequest(argv=["/bin/echo"], rw_mounts=[Mount(rw, rw)]))
     assert list(base.iterdir()) == []                       # refused before any scratch
+
+
+class TestCreditGoesToTheLedgerTheRunStartedIn:
+    """A run credits the detonation it STARTED in, and only if it finishes while that
+    detonation's ledger is open: not a ledger opened while it ran, not one already closed."""
+
+    def _sb(self, tmp_path, during=None):
+        def popen(argv, **kw):
+            if during is not None:
+                during()
+            return _FakeProc(argv, **kw)
+        return SeatbeltSandbox(popen=popen, platform_ok=True, sandbox_exec="/bin/sh",
+                               scratch_base=tmp_path / "scratch")
+
+    def test_a_run_inside_the_ledger_is_credited(self, tmp_path):
+        from blastbox.worker.sandbox.base import confinement_ledger
+        with confinement_ledger() as ledger:
+            self._sb(tmp_path).run(SandboxRequest(argv=["/bin/echo"]))
+        assert ledger.runs == 1
+
+    def test_a_run_started_before_the_ledger_opened_is_not_credited(self, tmp_path):
+        from blastbox.worker.sandbox import base
+        late = base.ConfinementLedger()
+        # the context gains a ledger while the run is in flight (as a new detonation would)
+        self._sb(tmp_path, during=lambda: base._LEDGER.set(late)).run(
+            SandboxRequest(argv=["/bin/echo"]))
+        base._LEDGER.set(None)
+        assert late.runs == 0
+
+    def test_a_run_still_going_when_its_ledger_closes_is_not_credited(self, tmp_path):
+        from blastbox.worker.sandbox.base import confinement_ledger
+        with confinement_ledger() as ledger:
+            sb = self._sb(tmp_path, during=lambda: ledger._close())   # the detonation ended
+            sb.run(SandboxRequest(argv=["/bin/echo"]))
+        assert ledger.runs == 0
+
+    def test_a_run_with_no_ledger_credits_nothing_but_is_recorded(self, tmp_path):
+        from blastbox.worker.sandbox.base import confined_runs, current_ledger
+        assert current_ledger() is None
+        before = confined_runs()
+        self._sb(tmp_path).run(SandboxRequest(argv=["/bin/echo"]))
+        assert confined_runs() == before + 1        # the diagnostic total still sees it

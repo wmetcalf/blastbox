@@ -47,8 +47,10 @@ from pathlib import Path
 
 from blastbox.errors import SandboxError, SandboxUnavailable
 from blastbox.worker.sandbox.base import (
+    ConfinementLedger,
     SandboxRequest,
     SandboxResult,
+    current_ledger,
     note_confined_run,
     register_emergency_cleanup,
     teardown_critical,
@@ -259,6 +261,9 @@ class SeatbeltSandbox:
         return list(self._insecurity_reasons)
 
     def run(self, request: SandboxRequest) -> SandboxResult:
+        # The detonation this run is part of, read at its START: credited only if the run also
+        # finishes while that ledger is open (see ConfinementLedger).
+        ledger = current_ledger()
         if not isinstance(request.argv, list) or not request.argv:
             raise SandboxError("argv must be a non-empty list of strings")
         if request.limits.net_egress:
@@ -313,13 +318,15 @@ class SeatbeltSandbox:
             with teardown_critical():
                 scratch = mc.make_scratch(self._scratch_base)
                 state["scratch"] = scratch
-            return self._run_in_scratch(request, exe, exe_real, ro, rw, scratch, leftovers)
+            return self._run_in_scratch(request, exe, exe_real, ro, rw, scratch, leftovers,
+                                        ledger)
         finally:
             unregister_emergency_cleanup(token)
 
     def _run_in_scratch(self, request: SandboxRequest, exe: Path, exe_real: Path,
                         ro: list[str], rw: list[str], scratch: Path,
-                        leftovers: mc.Leftovers) -> SandboxResult:
+                        leftovers: mc.Leftovers,
+                        ledger: ConfinementLedger | None) -> SandboxResult:
         # What the run's scratch IS: a sweep that finds it removed or replaced puts an empty
         # directory back at the path (to find the run's processes), which must never be taken
         # for the run's own scratch -- not captured, not read for the handshake.
@@ -383,7 +390,7 @@ class SeatbeltSandbox:
                 raise SandboxError(
                     f"seatbelt: could not remove the run's scratch {scratch}: {exc}") from exc
             if confined:
-                note_confined_run()
+                note_confined_run(ledger)
 
     @staticmethod
     def _dir_identity(path: Path) -> tuple[int, int] | None:

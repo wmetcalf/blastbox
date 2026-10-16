@@ -48,7 +48,7 @@ from blastbox.worker.harness import run_detonation
 from blastbox.worker.load import load_engine
 from blastbox.worker.sandbox.base import (
     begin_shutdown,
-    confined_runs,
+    confinement_ledger,
     defer_until_teardown_done,
     end_shutdown,
     host_platform,
@@ -384,17 +384,20 @@ class _Handler(BaseHTTPRequestHandler):
                 if _wd is not None:
                     _wd.daemon = True
                     _wd.start()
-                confined_before = confined_runs()
+                # Credit for the macOS gate below is scoped to THIS detonation: only sandbox runs
+                # that start and finish inside it, in its context, count (see ConfinementLedger) --
+                # not a late detector run on its own thread or a leftover of an earlier job.
                 try:
-                    rc = run_detonation(self.engine, input_path=in_path, output_dir=out_dir, limits=limits,
-                                        pre_detect=self._pre_detect())
+                    with confinement_ledger() as ledger:
+                        rc = run_detonation(self.engine, input_path=in_path, output_dir=out_dir,
+                                            limits=limits, pre_detect=self._pre_detect())
                 finally:
                     if _wd is not None:
                         _wd.cancel()
             if rc != 0:
                 # harness could not seal metadata.json -- surface as a job failure, not a silent 200
                 raise RuntimeError(f"harness failed (rc={rc}); metadata.json not sealed")
-            if self.require_confined and confined_runs() == confined_before:
+            if self.require_confined and ledger.runs == 0:
                 # No outer boundary on this host: an `ok` result produced without a single
                 # sandboxed run means the engine parsed the input in this (unconfined) process.
                 try:
@@ -567,16 +570,16 @@ def _warmup(engine: Engine, require_warmup: bool, require_confined: bool = False
             _log.error("http_agent: engine has no warmup self-test; /healthz reports NOT ready")
             return "engine has no warmup self-test"
         return None
-    confined_before = confined_runs()
     try:
-        engine.warmup()
+        with confinement_ledger() as ledger:
+            engine.warmup()
     except Exception as exc:  # noqa: BLE001 -- warmup is best-effort (fail-open to cold)
         if require_warmup:
             _log.error("http_agent: warmup failed; /healthz reports NOT ready: %s", exc)
             return str(exc)[:500]
         _log.warning("http_agent: warmup failed (continuing cold): %s", exc)
         return None
-    if require_warmup and require_confined and confined_runs() == confined_before:
+    if require_warmup and require_confined and ledger.runs == 0:
         _log.error("http_agent: warmup passed without a confined run; /healthz reports NOT ready")
         return "warmup self-test did not complete a confined (sandboxed) run"
     return None

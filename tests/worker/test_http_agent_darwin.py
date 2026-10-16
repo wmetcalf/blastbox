@@ -19,7 +19,7 @@ from blastbox.contract import Detection, Record
 from blastbox.limits import Limits
 from blastbox.worker import http_agent as ha
 from blastbox.worker.engine import DetonationResult
-from blastbox.worker.sandbox.base import confined_runs, not_counted, note_confined_run
+from blastbox.worker.sandbox.base import confinement_ledger, not_counted, note_confined_run
 
 
 @pytest.fixture(autouse=True)
@@ -291,7 +291,7 @@ def test_a_selector_probe_during_a_job_is_not_confinement_credit(monkeypatch):
     # An engine that calls select_sandbox() inside detonate() and then parses in-process: the
     # selector's /usr/bin/true smoketest must not count as its confined run.
     from blastbox.worker.sandbox import detect
-    from blastbox.worker.sandbox.base import SandboxResult, confined_runs
+    from blastbox.worker.sandbox.base import SandboxResult, confinement_ledger
 
     class _Counting:
         name = "probe"
@@ -302,9 +302,9 @@ def test_a_selector_probe_during_a_job_is_not_confinement_credit(monkeypatch):
             note_confined_run()         # what seatbelt/appsandbox do for a real launch
             return SandboxResult(exit_code=0, stdout=b"", stderr=b"")
 
-    before = confined_runs()
-    assert detect._smoketest(_Counting()) == (True, None)
-    assert confined_runs() == before
+    with confinement_ledger() as ledger:
+        assert detect._smoketest(_Counting()) == (True, None)
+    assert ledger.runs == 0
 
     class SelectsThenParsesInProcess(_Engine):
         def detonate(self, input, outdir, limits):
@@ -399,16 +399,85 @@ def test_a_detectors_sandbox_run_on_another_thread_is_not_credit_either():
 
 
 def test_not_counted_covers_threads_started_inside_it():
-    before = confined_runs()
-    with not_counted():
-        t = threading.Thread(target=note_confined_run)
-        t.start()
-        t.join()
-        with concurrent.futures.ThreadPoolExecutor(2) as ex:
-            list(ex.map(lambda _: note_confined_run(), range(3)))
-        with not_counted():          # nests
+    with confinement_ledger() as ledger:
+        with not_counted():
+            t = threading.Thread(target=note_confined_run)
+            t.start()
+            t.join()
+            with concurrent.futures.ThreadPoolExecutor(2) as ex:
+                list(ex.map(lambda _: note_confined_run(), range(3)))
+            with not_counted():          # nests
+                note_confined_run()
             note_confined_run()
-        note_confined_run()
-    assert confined_runs() == before
-    note_confined_run()
-    assert confined_runs() == before + 1
+        assert ledger.runs == 0
+        note_confined_run()              # outside the block, in the ledger's context: credited
+        assert ledger.runs == 1
+
+
+def test_an_unrelated_threads_run_during_the_detonation_is_not_credit():
+    # A sandbox run on a thread that doesn't carry the detonation's context (a detector's
+    # async run, a helper the engine didn't bind) vouches for nothing: the in-process ok is
+    # refused.
+    class SideThread(_Engine):
+        def detonate(self, input, outdir, limits):
+            t = threading.Thread(target=note_confined_run)
+            t.start()
+            t.join()
+            with concurrent.futures.ThreadPoolExecutor(1) as ex:
+                ex.submit(note_confined_run).result()
+            return super().detonate(input, outdir, limits)
+    httpd, port = _agent(SideThread(confine=False))
+    try:
+        assert _detonate(port) == 500
+    finally:
+        _stop(httpd)
+
+
+def test_a_previous_jobs_run_finishing_during_this_detonation_is_not_credit():
+    # Job 1 leaves a run going (bound to ITS detonation) that finishes while job 2 parses
+    # in-process: job 1's ledger is closed, so job 2 gets no credit from it.
+    from blastbox.worker.sandbox.base import current_ledger, in_this_context
+    release, done = threading.Event(), threading.Event()
+
+    class LeavesARunBehind(_Engine):
+        def __init__(self):
+            super().__init__(confine=True)
+            self.jobs = 0
+
+        def detonate(self, input, outdir, limits):
+            self.jobs += 1
+            if self.jobs == 1:
+                def straggler():
+                    started_in = current_ledger()       # captured when the run starts
+                    release.wait(10)
+                    note_confined_run(started_in)
+                    done.set()
+                threading.Thread(target=in_this_context(straggler), daemon=True).start()
+                return super().detonate(input, outdir, limits)
+            release.set()                              # job 2: the straggler finishes now
+            done.wait(10)
+            self.confine = False                       # ...and job 2 parses in-process
+            return super().detonate(input, outdir, limits)
+    httpd, port = _agent(LeavesARunBehind())
+    try:
+        assert _detonate(port) == 200
+        assert _detonate(port) == 500
+        assert done.is_set()
+    finally:
+        _stop(httpd)
+
+
+def test_a_run_on_a_thread_bound_to_the_detonation_is_credit():
+    # The supported way for an engine to sandbox on its own thread.
+    from blastbox.worker.sandbox.base import in_this_context
+
+    class BoundThread(_Engine):
+        def detonate(self, input, outdir, limits):
+            with concurrent.futures.ThreadPoolExecutor(1) as ex:
+                ex.submit(in_this_context(note_confined_run)).result()
+            return super().detonate(input, outdir, limits)
+    httpd, port = _agent(BoundThread(confine=False))
+    try:
+        assert _detonate(port) == 200
+    finally:
+        _stop(httpd)
