@@ -320,6 +320,15 @@ was granted.
 - App Sandbox containers are keyed by bundle id, so two `appsandbox` roots prepared with the same
   `--bundle-prefix` would share them; a per-user lock per bundle id
   (`~/Library/Caches/blastbox/appsandbox-locks/`) is held for each run and its wipes.
+- `~/Library/Caches/blastbox/` is per-user state every native worker of the user shares (agents,
+  `macos doctor`, CLI runs): the path-claim registry, the shared `RLIMIT_NPROC` ceiling
+  (`nproc/`), the registry of prepared `appsandbox` roots (`roots/`, which every worker refuses
+  to mount, seed from or capture over), and the copy-back journal (`copyback-journal/`). An
+  `appsandbox` directory copy-back is journalled phase by phase, so a worker killed mid-swap
+  leaves the host directory recoverable: the next agent start (or the next run that mounts it)
+  puts it back fully old or fully new. A journal marked `broken` (a swap whose own undo also
+  failed) is never resolved automatically: runs mounting that directory are refused until it is
+  repaired by hand and the journal file removed.
 - A `seatbelt` run's scratch dir gets the same unlock-and-verify wipe; if it can't be removed
   the run fails. An `appsandbox` slot whose `io/` or container can't be proven empty after a
   run (including a root the child locked or `chmod 000`'d), whose container was swapped for a

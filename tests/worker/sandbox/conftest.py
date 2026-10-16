@@ -159,3 +159,7 @@ def _done_records_in_tmp(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(mc, "DONE_RECORD_DIR", tmp_path_factory.mktemp("done-records"))
     # the same for the path-claim registry of callers that pass no home (Seatbelt)
     monkeypatch.setattr(mc, "PATH_CLAIM_DIR", tmp_path_factory.mktemp("path-claims"))
+    # ...and the copy-back journal, the shared NPROC state and the root registry
+    monkeypatch.setattr(mc, "COPYBACK_JOURNAL_DIR", tmp_path_factory.mktemp("cb-journal"))
+    monkeypatch.setattr(mc, "NPROC_STATE_DIR", tmp_path_factory.mktemp("nproc"))
+    monkeypatch.setattr(mc, "ROOT_REGISTRY_DIR", tmp_path_factory.mktemp("roots"))

@@ -2337,3 +2337,205 @@ class TestEachCopyBackChecksOnlyMountsStillPending:
                 argv=["/bin/sh", "-c", 'echo F > "$0"; echo G > "$1"', str(f), str(g)],
                 rw_mounts=[Mount(f, f), Mount(g, g)]))
         assert g.read_text() == "outside"
+
+
+_CRASH_SWAP = r'''
+import os, sys
+from pathlib import Path
+from blastbox.worker.sandbox import appsandbox as asb, macos_common as mc
+mc.COPYBACK_JOURNAL_DIR = Path(sys.argv[1])
+mc.DONE_RECORD_DIR = Path(sys.argv[2])
+dest, new, old, k = Path(sys.argv[3]), Path(sys.argv[4]), Path(sys.argv[5]), int(sys.argv[6])
+n = [0]
+real = os.rename
+def rename(a, b):
+    n[0] += 1
+    if n[0] > k:
+        os._exit(9)          # the agent dies here: no except, no finally
+    real(a, b)
+os.rename = rename
+asb.AppSandboxSandbox._swap_children_locked(dest, new, old)
+os._exit(0)
+'''
+
+_OLD = {"a": "old-a", "b": "old-b", "sub/c": "old-c"}
+_NEW = {"x": "new-x", "sub/y": "new-y"}
+
+
+def _tree(d: Path) -> dict[str, str]:
+    return {str(p.relative_to(d)): p.read_text() for p in sorted(d.rglob("*")) if p.is_file()}
+
+
+class TestAnInterruptedCopyBackIsRecovered:
+    """Codex P1 (#198): a directory copy-back swap is journalled, so an agent that dies between
+    its renames (killed, or past its retirement budget) leaves the host directory recoverable:
+    the next worker puts it back fully old (died moving the originals aside) or fully new (died
+    moving the new tree in) -- never part-swapped."""
+
+    def _setup(self, tmp_path):
+        dest = tmp_path / "out"
+        for rel, text in _OLD.items():
+            (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+            (dest / rel).write_text(text)
+        new = dest / f"{mc.COPY_BACK_MARK}abcd"
+        for rel, text in _NEW.items():
+            (new / rel).parent.mkdir(parents=True, exist_ok=True)
+            (new / rel).write_text(text)
+        return dest, new, dest / f"{mc.COPY_BACK_MARK}old-abcd"
+
+    def _crash(self, tmp_path, k):
+        dest, new, old = self._setup(tmp_path)
+        r = subprocess.run([sys.executable, "-c", _CRASH_SWAP, str(mc.COPYBACK_JOURNAL_DIR),
+                            str(mc.DONE_RECORD_DIR), str(dest), str(new), str(old), str(k)],
+                           capture_output=True, text=True, timeout=60)
+        return dest, r
+
+    # 3 originals at the top (a, b, sub) go out, then 2 new entries (x, sub) go in, then the
+    # retire rename: dying before rename k+1.
+    @pytest.mark.parametrize("k,want", [(0, _OLD), (1, _OLD), (2, _OLD), (3, _NEW), (4, _NEW),
+                                        (5, _NEW)])
+    def test_recovery_leaves_the_tree_fully_old_or_fully_new(self, tmp_path, k, want):
+        dest, r = self._crash(tmp_path, k)
+        assert r.returncode == 9, r.stderr
+        assert list(mc.COPYBACK_JOURNAL_DIR.glob("*.json"))
+        mc.recover_copy_backs(dest, claimed=True)
+        assert _tree(dest) == want
+        assert not [p for p in dest.iterdir() if p.name.startswith(mc.COPY_BACK_MARK)]
+        assert list(mc.COPYBACK_JOURNAL_DIR.glob("*.json")) == []
+
+    def test_a_completed_swap_leaves_no_journal(self, tmp_path):
+        dest, r = self._crash(tmp_path, 100)
+        assert r.returncode == 0, r.stderr
+        assert _tree(dest) == _NEW
+        assert list(mc.COPYBACK_JOURNAL_DIR.glob("*.json")) == []
+
+    def test_an_agent_starting_recovers_every_dead_writers_swap(self, tmp_path):
+        dest, r = self._crash(tmp_path, 1)
+        assert r.returncode == 9
+        mc.recover_copy_backs()
+        assert _tree(dest) == _OLD
+
+    def test_the_next_run_recovers_before_it_stages(self, tmp_path):
+        dest, r = self._crash(tmp_path, 4)
+        assert r.returncode == 9
+        sb, _ = _sb_with(tmp_path)
+        r = sb.run(SandboxRequest(argv=["/usr/bin/true"], rw_mounts=[Mount(dest, dest)]))
+        assert r.exit_code == 0, r.stderr
+        assert _tree(dest) == _NEW
+        assert not [p for p in dest.iterdir() if p.name.startswith(mc.COPY_BACK_MARK)]
+
+    def _journal(self, tmp_path, **over):
+        dest, new, old = self._setup(tmp_path)
+        j = mc.CopyBackJournal(dest, new, old, os.stat(new))
+        if over:
+            j.rec.update(over)
+            mc._write_json_atomic(j.path, j.rec)
+        return dest, j
+
+    def test_a_swap_still_in_progress_is_refused(self, tmp_path):
+        dest, j = self._journal(tmp_path, writer=mc._pid_identity(os.getppid()))
+        with pytest.raises(SandboxError, match="still in progress"):
+            mc.recover_copy_backs(dest, claimed=True)
+        assert j.path.exists()
+
+    def test_a_broken_swap_is_left_for_a_person(self, tmp_path):
+        dest, j = self._journal(tmp_path, phase="broken",
+                                writer={"pid": _dead_pid_for_journal(), "start": None})
+        with pytest.raises(SandboxError, match="repair it by hand"):
+            mc.recover_copy_backs(dest, claimed=True)
+        assert j.path.exists()
+
+    def test_a_replaced_destination_is_refused(self, tmp_path):
+        dest, j = self._journal(tmp_path, dest_ino=1, phase="out",
+                                writer={"pid": _dead_pid_for_journal(), "start": None})
+        with pytest.raises(SandboxError, match="replaced"):
+            mc.recover_copy_backs(dest, claimed=True)
+        assert _tree(dest) != {}           # nothing was moved
+
+    def test_an_in_process_failure_undoes_the_swap_and_drops_the_journal(self, tmp_path,
+                                                                        monkeypatch):
+        dest, new, old = self._setup(tmp_path)
+        real = os.rename
+        n = [0]
+
+        def flaky(a, b):
+            n[0] += 1
+            if n[0] == 3:
+                raise OSError("disk went away")
+            real(a, b)
+
+        monkeypatch.setattr(os, "rename", flaky)
+        with pytest.raises(OSError, match="disk went away"):
+            asb.AppSandboxSandbox._swap_children_locked(dest, new, old)
+        monkeypatch.setattr(os, "rename", real)
+        assert _tree(dest) == _OLD
+        assert list(mc.COPYBACK_JOURNAL_DIR.glob("*.json")) == []
+
+
+def _dead_pid_for_journal() -> int:
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    p.wait()
+    return p.pid
+
+
+class TestContentChecksRunUnderTheClaim:
+    """Codex P1 (#198): the FIFO and split-link scans run after the run's claims are held,
+    against the pinned sources -- a run finishing a write to the same tree can no longer add
+    one after the scan and release its claim before this run's lands."""
+
+    def _late(self, monkeypatch, act):
+        real = asb.hold_rw_sources
+
+        @contextlib.contextmanager
+        def late(home, sources, reads=()):
+            act()
+            with real(home, sources, reads):
+                yield
+
+        monkeypatch.setattr(asb, "hold_rw_sources", late)
+
+    def test_a_fifo_added_before_the_claim_lands_is_caught(self, tmp_path, monkeypatch):
+        sb, _ = _sb_with(tmp_path)
+        out = tmp_path / "out"
+        out.mkdir()
+        self._late(monkeypatch, lambda: os.mkfifo(out / "late"))
+        with pytest.raises(SandboxError, match="FIFO, socket or device node"):
+            sb.run(SandboxRequest(argv=["/usr/bin/true"], rw_mounts=[Mount(out, out)]))
+        assert stat.S_ISFIFO(os.lstat(out / "late").st_mode)
+        assert list(sb.manifest.slots[0].io_dir.iterdir()) == []
+
+    def test_a_split_link_added_before_the_claim_lands_is_caught(self, tmp_path, monkeypatch):
+        sb, _ = _sb_with(tmp_path)
+        out = tmp_path / "out"
+        out.mkdir()
+        outside = tmp_path / "outside"
+        outside.write_text("host")
+        self._late(monkeypatch, lambda: os.link(outside, out / "alias"))
+        with pytest.raises(SandboxError, match="hard link"):
+            sb.run(SandboxRequest(argv=["/usr/bin/true"], rw_mounts=[Mount(out, out)]))
+        assert os.stat(outside).st_nlink == 2
+
+
+class TestEveryRootIsProtectedAcrossAgents:
+    """Codex P1 (#198): an App Sandbox root is registered for every worker of this user when it
+    is prepared and when a backend loads it; another root's runs refuse to mount it."""
+
+    def test_another_roots_run_refuses_this_root_as_a_mount(self, tmp_path):
+        home = tmp_path / "home"
+        a = asb.AppSandboxSandbox(root=_fake_root(tmp_path, "a"), popen=_Popen(), home=home,
+                                  platform_ok=True, verify=False, slot_wait_s=0)
+        b = asb.AppSandboxSandbox(root=_fake_root(tmp_path, "b"), popen=_Popen(), home=home,
+                                  platform_ok=True, verify=False, slot_wait_s=0)
+        for mount in (a.manifest.root, a.manifest.root / "slots",
+                      a.manifest.slots[0].io_dir):
+            with pytest.raises(SandboxError, match="native sandbox root"):
+                b.run(SandboxRequest(argv=["/usr/bin/true"], ro_mounts=[Mount(mount, mount)]))
+        with pytest.raises(SandboxError, match="native sandbox root"):
+            b.run(SandboxRequest(argv=["/usr/bin/true"],
+                                  seed_home=a.manifest.root / "slots"))
+
+    def test_prepare_registers_the_root(self, tmp_path):
+        home = tmp_path / "home"
+        root = tmp_path / "root"
+        asb.prepare(root, slots=1, ro_paths=[], runner=_fake_runner([]), home=home)
+        assert root.resolve() in mc.protected_roots(home)

@@ -11,6 +11,7 @@ import signal
 import os
 import shutil
 import stat
+import json
 import subprocess
 import sys
 import threading
@@ -2851,12 +2852,14 @@ class TestScratchIsMadeThroughAPinnedRoot:
 
 
 class TestTheBaseClaimIsDirectional:
-    """A `base` claim (a scratch root) conflicts only with a writer that is it or holds it;
-    writers inside it are just its other children, readers never conflict."""
+    """A `base` claim (a scratch root) conflicts with any claim -- writer, snapshot reader or
+    live view -- that is it or holds it; claims inside it are just its other children."""
 
     @pytest.mark.parametrize("other_mode,where,conflicts", [
         ("live", "root", True), ("live", "parent", True), ("write", "parent", True),
-        ("live", "child", False), ("write", "child", False), ("read", "parent", False),
+        ("live", "child", False), ("write", "child", False),
+        ("read", "parent", True), ("read", "root", True), ("read", "child", False),
+        ("view", "parent", True), ("view", "root", True), ("view", "child", False),
         ("base", "root", False),
     ])
     def test_conflicts(self, tmp_path, other_mode, where, conflicts):
@@ -2876,4 +2879,141 @@ class TestTheBaseClaimIsDirectional:
                    else contextlib.nullcontext())
             with ctx:
                 with mc.hold_path_claims([(other_mode, other)], "other"):
+                    pass
+
+
+def _dead_pid() -> int:
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    p.wait()
+    return p.pid
+
+
+class TestTheNprocCeilingIsSharedPerUser:
+    """Codex P1 (#198): RLIMIT_NPROC is per UID, so the ceiling and the runs in flight live in
+    per-user locked state every worker process shares -- a second agent (or `macos doctor`)
+    must not count the first one's children into a higher ceiling of its own."""
+
+    @pytest.fixture(autouse=True)
+    def _counts(self, monkeypatch):
+        self.count = 10
+        monkeypatch.setattr(mc, "uid_pids", lambda uid=None: [1] * self.count)
+        monkeypatch.setenv("BLASTBOX_MACOS_NPROC_BUDGET", "100")
+
+    def _state(self) -> dict:
+        return json.loads((mc.NPROC_STATE_DIR / "state.json").read_text())
+
+    def _seed(self, runs, ceiling=555):
+        mc._write_json_atomic(mc.NPROC_STATE_DIR / "state.json",
+                              {"ceiling": ceiling, "runs": runs})
+
+    def test_another_processs_run_in_flight_keeps_its_ceiling(self):
+        other = {"id": "other", **mc._pid_identity(os.getppid())}
+        self._seed([other])
+        self.count = 400                 # the other process's children, counted in the uid
+        with mc.nproc_ceiling() as ceiling:
+            assert ceiling == 555
+            assert len(self._state()["runs"]) == 2
+        assert self._state()["runs"] == [other]
+
+    def test_runs_whose_process_died_are_dropped_and_the_ceiling_remeasured(self):
+        self._seed([{"id": "gone", "pid": _dead_pid(), "start": None}])
+        with mc.nproc_ceiling() as ceiling:
+            assert ceiling == 10 + 100
+        assert self._state()["runs"] == []
+
+    def test_a_reused_pid_is_not_the_run_that_registered(self):
+        # the pid is alive, but the process holding it started at another time
+        self._seed([{"id": "reused", "pid": os.getppid(), "start": 1.0}])
+        with mc.nproc_ceiling() as ceiling:
+            assert ceiling == 110
+
+    def test_concurrent_runs_share_one_ceiling_until_none_is_in_flight(self):
+        with mc.nproc_ceiling() as first:
+            self.count = 300
+            with mc.nproc_ceiling() as second:
+                assert second == first == 110
+        assert self._state()["runs"] == []
+        with mc.nproc_ceiling() as later:
+            assert later == 300 + 100
+
+    def test_malformed_state_is_remeasured_not_trusted(self):
+        (mc.NPROC_STATE_DIR / "state.json").write_text("{not json")
+        with mc.nproc_ceiling() as ceiling:
+            assert ceiling == 110
+        self._seed([{"id": "x", "pid": "nope"}], ceiling=-5)
+        with mc.nproc_ceiling() as ceiling:
+            assert ceiling == 110
+
+
+class TestNativeRootsAreProtectedAcrossAgents:
+    """Codex P1 (#198): every prepared App Sandbox root is registered in per-user state, and
+    both backends refuse mounts, seeds and captures overlapping any of them -- not just the
+    instance that owns the root."""
+
+    def test_overlaps_are_refused_in_every_direction(self, tmp_path):
+        root = tmp_path / "root"
+        (root / "slots" / "0").mkdir(parents=True)
+        (tmp_path / "other").mkdir()
+        mc.register_protected_root(root, ".")
+        for p in (root, root / "slots" / "0", tmp_path):
+            with pytest.raises(SandboxError, match="native sandbox root"):
+                mc.check_clear_of_roots([("mount", p)], "x")
+        mc.check_clear_of_roots([("mount", tmp_path / "other")], "x")
+
+    def test_a_spelling_through_a_symlink_is_refused(self, tmp_path):
+        root = tmp_path / "root"
+        root.mkdir()
+        mc.register_protected_root(root, ".")
+        (tmp_path / "link").symlink_to(root)
+        with pytest.raises(SandboxError, match="native sandbox root"):
+            mc.check_clear_of_roots([("mount", tmp_path / "link" / "x")], "x")
+
+    def test_a_root_that_is_gone_is_pruned(self, tmp_path):
+        root = tmp_path / "root"
+        root.mkdir()
+        mc.register_protected_root(root, ".")
+        assert root.resolve() in mc.protected_roots()
+        root.rmdir()
+        assert mc.protected_roots() == []
+        assert list(mc.ROOT_REGISTRY_DIR.glob("*.root")) == []
+
+    def test_a_root_without_its_marker_is_pruned(self, tmp_path):
+        root = tmp_path / "root"
+        root.mkdir()
+        mc.register_protected_root(root, "manifest.json")
+        assert mc.protected_roots() == []
+        (root / "manifest.json").write_text("{}")
+        mc.register_protected_root(root, "manifest.json")
+        assert root.resolve() in mc.protected_roots()
+
+    def test_registering_twice_keeps_one_entry(self, tmp_path):
+        root = tmp_path / "root"
+        root.mkdir()
+        mc.register_protected_root(root, ".")
+        mc.register_protected_root(root, ".")
+        assert len(list(mc.ROOT_REGISTRY_DIR.glob("*.root"))) == 1
+
+
+class TestBaseClaimsConflictWithEnclosingReaders:
+    """Codex P1 (#198): a `base` (scratch root) conflicts with a snapshot reader or live view
+    of a tree that is or holds it, as it already did with writers."""
+
+    @pytest.mark.parametrize("mode", ["read", "view"])
+    def test_an_enclosing_reader_conflicts_both_ways(self, tmp_path, mode):
+        base = tmp_path / "scratch"
+        base.mkdir()
+        with mc.hold_path_claims([(mode, tmp_path)], "other"):
+            with pytest.raises(SandboxError, match="in use by another run"):
+                with mc.hold_path_claims([("base", base)], "seatbelt"):
+                    pass
+        with mc.hold_path_claims([("base", base)], "seatbelt"):
+            with pytest.raises(SandboxError, match="in use by another run"):
+                with mc.hold_path_claims([(mode, tmp_path)], "other"):
+                    pass
+
+    def test_views_conflict_with_nothing_else(self, tmp_path):
+        (tmp_path / "d").mkdir()
+        with mc.hold_path_claims([("view", tmp_path)], "a"):
+            for mode in ("write", "live", "read", "view"):
+                with mc.hold_path_claims([(mode, tmp_path / "d")], "b"):
                     pass

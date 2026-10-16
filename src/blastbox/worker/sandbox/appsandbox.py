@@ -491,6 +491,9 @@ def prepare(
             _check_root_outside_containers(root, home, ids)
             _check_ro_grants(resolved_ro, root, home, ids)
             with _all_bundle_locks(home, ids, wait_s, deadline=deadline):
+                # Registered for every worker of this user before anything is staged here:
+                # their mounts, seeds and captures must not overlap this root either.
+                mc.register_protected_root(root, ".", home)
                 _sweep_previous_slots(root, existing, prefix, home, previous=previous)
                 return _prepare_locked(root, slots=slots, resolved_ro=resolved_ro,
                                        prefix=prefix, cc=cc, codesign=codesign, runner=runner)
@@ -995,6 +998,22 @@ class AppSandboxSandbox:
         except SandboxError as exc:
             raise SandboxUnavailable(f"appsandbox manifest: {exc}; re-run `blastbox macos "
                                      "prepare` without it") from None
+        # Every worker of this user (other agents, other roots, Seatbelt) refuses mounts, seeds
+        # and captures over this root: its slots' io/ and ro/ staging and its locks are in use
+        # by this agent's runs (mc.check_clear_of_roots). Registered again on each load, in
+        # case the entry was pruned while the root was briefly gone.
+        try:
+            mc.register_protected_root(self._root, ".", self._home)
+        except OSError as exc:
+            raise SandboxUnavailable(f"appsandbox: can't register root {self._root} in the "
+                                     f"shared state: {exc}") from None
+        # Copy-backs a dead worker left mid-swap are finished or undone now, at agent start
+        # (each under a claim on its directory). One that can't be is logged here and refused
+        # by the next run that claims that directory -- never staged half-swapped.
+        try:
+            mc.recover_copy_backs()
+        except OSError as exc:
+            _log.error("appsandbox: copy-back recovery at start failed: %s", exc)
         self._slot_wait_s = _slot_wait(slot_wait_s)
         if mc.IS_DARWIN and not mc.process_apis_available():
             # Without them a run's escaped processes can't be found, so a slot can't be proven
@@ -1179,9 +1198,15 @@ class AppSandboxSandbox:
             for p in (pins.seed, pins.capture):
                 if p is not None:
                     p.verify()
+            # Content checks only now, with the claim held: no writer can change these trees
+            # until this run is done with them.
+            self._check_rw_contents(rw_sources)
             # Under the claim, so no live run's copy-back is in flight in these trees: what an
             # interrupted one left is either removed or refused, never staged into this job.
             for src in rw_sources:
+                # A copy-back a dead worker left mid-swap is finished or undone first (its
+                # journal says which), so its hidden trees aren't mistaken for stale ones.
+                mc.recover_copy_backs(src, claimed=True)
                 stale = mc.clear_stale_copy_backs(src)
                 if stale is not None:
                     raise SandboxError(
@@ -1240,6 +1265,9 @@ class AppSandboxSandbox:
         # Nor ~/Library/Containers as a whole: a copy of it would stage other roots' slots'
         # Data (their caches and job state) into this run.
         mc.check_clear_of_containers(paths, "appsandbox", self._home)
+        # Nor any other native root of this user (another agent's App Sandbox root): staging it
+        # would copy other jobs' io/ro state in, a copy-back would change their slots mid-run.
+        mc.check_clear_of_roots(paths, "appsandbox", self._home)
         # The seed and capture directories against the mounts: a writable mount over the seed
         # is copied back over it (later runs seeded from what the child wrote); a capture over
         # any mount replaces that tree with the slot's cache.
@@ -1252,24 +1280,30 @@ class AppSandboxSandbox:
                 if mc.paths_overlap(rp, area.resolve()):
                     raise SandboxError(f"appsandbox: {what} {p} overlaps {area}, where runs are "
                                        "staged; use a path outside it")
-        # A writable mount is staged by copy and copied back over the host tree, and the copier
-        # skips FIFOs, sockets and device nodes (opening a FIFO could block the worker): one
-        # already in a writable mount would be missing from the copy and so DELETED from the
-        # host by the copy-back. Refused up front instead. (Ones the child creates are dropped,
-        # as before: they were never the host's.) Read-only mounts aren't copied back.
-        for m in request.rw_mounts:
-            special = mc.find_special_entry(Path(m.source).expanduser().resolve())
+
+    @staticmethod
+    def _check_rw_contents(rw_sources: list[Path]) -> None:
+        """Refuse writable mounts whose CONTENTS staging can't carry. Run under the run's path
+        claims, against the pinned sources: checked before the claim, another native run still
+        finishing a write to the same tree could add a FIFO or an externally linked file after
+        the scan and release its claim before this one landed.
+
+        * A FIFO, socket or device node: the copier skips them (opening a FIFO could block the
+          worker), so it would be missing from the staged copy and DELETED from the host by the
+          copy-back. (Ones the child creates are dropped, as before: they were never the host's.)
+          Read-only mounts aren't copied back.
+        * A hard link whose other name is outside the writable mounts: staging keeps links
+          shared WITHIN them, but the copy-back would replace the mounted name with a new inode
+          and cut the host's link, even after a no-op run."""
+        for src in rw_sources:
+            special = mc.find_special_entry(src)
             if special is not None:
-                raise SandboxError(f"appsandbox: rw mount {m.source} holds {special}, a FIFO, "
+                raise SandboxError(f"appsandbox: rw mount {src} holds {special}, a FIFO, "
                                    "socket or device node, which App Sandbox staging can't "
                                    "carry; its copy-back would delete it. Mount a directory "
                                    "without it")
-        # Staging keeps hard links shared WITHIN the writable mounts, but one whose other name is
-        # outside them can't be: the copy-back would replace the mounted name with a new inode
-        # and cut the host's link, even after a no-op run. Refused up front.
-        if request.rw_mounts:
-            split = mc.find_split_hard_link(
-                [Path(m.source).expanduser().resolve() for m in request.rw_mounts])
+        if rw_sources:
+            split = mc.find_split_hard_link(rw_sources)
             if split is not None:
                 raise SandboxError(f"appsandbox: rw mount file {split} has a hard link whose "
                                    "other name is outside the writable mounts; its copy-back "
@@ -1465,7 +1499,12 @@ class AppSandboxSandbox:
         # The mount root is kept (as a bind mount would), but the swap's renames move its
         # modification time: restored, at the end, to the times of the tree the child left.
         times = os.stat(new, follow_symlinks=False)
+        # Journalled (mc.CopyBackJournal) before each phase: a worker that dies between these
+        # renames -- killed, or retiring past its budget -- leaves a record the next worker
+        # uses to put `dest` back together (fully old or fully new), never part-swapped.
+        journal = mc.CopyBackJournal(dest, new, old, times)
         os.mkdir(old, 0o700)
+        journal.advance("out", old_ino=os.lstat(old).st_ino)
         moved_out: list[str] = []
         moved_in: list[str] = []
         try:
@@ -1473,22 +1512,32 @@ class AppSandboxSandbox:
                 if child not in (new, old):
                     os.rename(child, old / child.name)
                     moved_out.append(child.name)
+            journal.advance("in")
             for child in list(new.iterdir()):
                 os.rename(child, dest / child.name)
                 moved_in.append(child.name)
         except BaseException:
+            undone = True
             for name, src, dst in [*((n, dest, new) for n in reversed(moved_in)),
                                    *((n, old, dest) for n in reversed(moved_out))]:
                 try:
                     os.rename(src / name, dst / name)
                 except OSError as exc:
+                    undone = False
                     _log.error("appsandbox: could not undo copy-back move of %s: %s",
                                src / name, exc)
-            mc.remove_tree(new)
-            with contextlib.suppress(OSError):
-                os.rmdir(old)
+            if undone:
+                mc.remove_tree(new)
+                with contextlib.suppress(OSError):
+                    os.rmdir(old)
+                journal.close()
+            else:
+                # Left for a person: neither direction can be finished safely by a later worker.
+                with contextlib.suppress(OSError):
+                    journal.advance("broken")
             raise
         os.rmdir(new)
+        journal.advance("retire")
         # Every rename is done: the replaced contents are now garbage. Renamed to say so -- a
         # `done-` tree a later worker finds (this one was killed, or retired past its budget,
         # while removing it) is removed before staging, never staged into a job -- and listed
@@ -1502,6 +1551,9 @@ class AppSandboxSandbox:
             mc.retire_replaced(old, done, leftovers)
         except SandboxError as exc:
             raise SandboxError(f"appsandbox: copy-back of {dest}: {exc}") from exc
+        finally:
+            # The swap itself is complete; what is left of `old` is retire_replaced's to track.
+            journal.close()
         os.utime(dest, ns=(times.st_atime_ns, times.st_mtime_ns), follow_symlinks=False)
 
     @staticmethod

@@ -299,14 +299,6 @@ class SeatbeltSandbox:
         # seed lets the child poison later runs' seeds; a capture over any mount replaces it.
         mc.check_homes_clear_of_mounts(request.seed_home, request.capture_home, ro, rw,
                                        "seatbelt")
-        # The path check above can't see hard links: a file linked into a writable mount AND
-        # somewhere else (a read-only mount, an input) would let the child edit it through the
-        # writable name. Every name of a multiply-linked file must be inside the writable mounts.
-        split = mc.find_split_hard_link([Path(p) for p in rw])
-        if split is not None:
-            raise SandboxError(f"seatbelt: writable mount file {split} has a hard link whose "
-                               "other name is outside the writable mounts; the child could "
-                               "change it through this one -- mount a copy instead")
         # The workers' shared lock and cleanup state (mc.internal_state_dirs): a writable grant
         # there would let the child release another run's lock or forge a cleanup record, and
         # a seed or capture there would copy, or replace, files other runs hold.
@@ -320,6 +312,9 @@ class SeatbeltSandbox:
         # Nor ~/Library/Containers as a whole: a grant there reaches every App Sandbox slot's
         # Data, with other runs' caches and job state.
         mc.check_clear_of_containers([*mounts, *homes], "seatbelt")
+        # Nor any App Sandbox root of this user (mc.protected_roots): a grant there reaches
+        # other jobs' staged io/ro state and their slot locks.
+        mc.check_clear_of_roots([*mounts, *homes], "seatbelt")
         # A mount that holds the scratch root would grant the child every concurrent run's
         # scratch (each 0700, but same-UID): a writable one to change them (and the sweep's
         # restore point for its own), a read-only one to read their inputs, caches and output.
@@ -381,11 +376,26 @@ class SeatbeltSandbox:
         # mount is or holds it -- or holds a link on the way to it -- could list, read or change
         # this run's scratch, or re-point the link under it; such a run is refused (and, while
         # this one lives, one that would be is). Runs writing INSIDE the root are unaffected.
+        # Read-only mounts are claimed as `view` (a live read grant): they don't stop anyone
+        # else's use of the tree, but one that is or holds ANOTHER run's scratch root would let
+        # this child read that run's scratch -- so it conflicts with that run's `base`.
         claims = [*(("live", Path(p)) for p in rw),
+                  *(("view", Path(p)) for p in ro),
                   *(("write", Path(p_)) for p_ in [request.capture_home] if p_ is not None),
                   *(("read", Path(p_)) for p_ in [request.seed_home] if p_ is not None),
                   ("base", base_given), ("base", base)]
         with mc.hold_path_claims(claims, "seatbelt"):
+            # The path checks above can't see hard links: a file linked into a writable mount
+            # AND somewhere else (a read-only mount, an input) would let the child edit it
+            # through the writable name. Every name of a multiply-linked file must be inside the
+            # writable mounts. Scanned with the claims held, so no snapshot writer (an App
+            # Sandbox copy-back) can add such a link after the scan; the child itself can't
+            # make one (the profile denies file-link).
+            split = mc.find_split_hard_link([Path(p) for p in rw])
+            if split is not None:
+                raise SandboxError(f"seatbelt: writable mount file {split} has a hard link whose "
+                                   "other name is outside the writable mounts; the child could "
+                                   "change it through this one -- mount a copy instead")
             token = register_emergency_cleanup(_emergency)
             try:
                 # Pinned by descriptor, every component opened no-follow: the scratch is made

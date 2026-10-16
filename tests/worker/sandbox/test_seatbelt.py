@@ -1096,3 +1096,69 @@ class TestScratchRootIsPinned:
         profile_args = " ".join(calls[0].argv)
         assert str(a.resolve()) in profile_args and str(b.resolve()) not in profile_args
         assert list(b.iterdir()) == []
+
+
+class TestReadOnlyGrantsAndOtherRunsScratch:
+    """Codex P1 (#198): read-only mounts are claimed (`view`), so one that is or holds ANOTHER
+    run's scratch root is refused -- the two children share a UID, and a read grant over that
+    root would let this one read the other's scratch. Registered App Sandbox roots are refused
+    as mounts too, and the writable-mount link scan runs with the claims held."""
+
+    def _sb(self, base, calls):
+        def popen(argv, **kw):
+            p = _FakeProc(argv, **kw)
+            calls.append(p)
+            return p
+        return SeatbeltSandbox(popen=popen, platform_ok=True, sandbox_exec="/bin/sh",
+                               scratch_base=base)
+
+    def test_a_read_only_mount_holding_another_runs_scratch_root_is_refused(self, tmp_path):
+        outer = tmp_path / "outer"
+        (outer / "their-scratch").mkdir(parents=True)
+        calls: list = []
+        with mc.hold_path_claims([("base", outer / "their-scratch")], "other"):
+            with pytest.raises(SandboxError, match="in use by another run"):
+                self._sb(tmp_path / "mine", calls).run(SandboxRequest(
+                    argv=["/bin/echo"], ro_mounts=[Mount(outer, outer)]))
+        assert calls == []
+
+    def test_a_read_only_mount_inside_another_runs_scratch_root_is_fine(self, tmp_path):
+        theirs = tmp_path / "theirs"
+        (theirs / "input").mkdir(parents=True)
+        calls: list = []
+        with mc.hold_path_claims([("base", theirs)], "other"):
+            r = self._sb(tmp_path / "mine", calls).run(SandboxRequest(
+                argv=["/bin/echo"], ro_mounts=[Mount(theirs / "input", theirs / "input")]))
+        assert r.exit_code == 0
+
+    def test_a_registered_app_sandbox_root_is_refused_as_a_mount(self, tmp_path):
+        root = tmp_path / "asb-root"
+        (root / "slots").mkdir(parents=True)
+        mc.register_protected_root(root, ".")
+        calls: list = []
+        for mount in (root / "slots", root, tmp_path):
+            with pytest.raises(SandboxError, match="native sandbox root"):
+                self._sb(tmp_path / "mine", calls).run(SandboxRequest(
+                    argv=["/bin/echo"], ro_mounts=[Mount(mount, mount)]))
+        assert calls == []
+
+    def test_a_split_link_made_before_the_claim_lands_is_caught(self, tmp_path, monkeypatch):
+        out = tmp_path / "out"
+        out.mkdir()
+        outside = tmp_path / "outside"
+        outside.write_text("host")
+        real = mc.hold_path_claims
+
+        @contextlib.contextmanager
+        def late_writer(claims, backend, home=None):
+            # another run, finishing, links a host file in just before this claim lands
+            os.link(outside, out / "alias")
+            with real(claims, backend, home):
+                yield
+
+        monkeypatch.setattr(mc, "hold_path_claims", late_writer)
+        calls: list = []
+        with pytest.raises(SandboxError, match="hard link"):
+            self._sb(tmp_path / "mine", calls).run(SandboxRequest(
+                argv=["/bin/echo"], rw_mounts=[Mount(out, out)]))
+        assert calls == []

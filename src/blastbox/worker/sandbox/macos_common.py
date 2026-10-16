@@ -25,6 +25,7 @@ import errno
 import ctypes
 import ctypes.util
 import fcntl
+import hashlib
 import hmac
 import json
 import logging
@@ -620,9 +621,92 @@ def nproc_budget() -> int:
     return value
 
 
-_NPROC_LOCK = threading.Lock()
-_NPROC_ACTIVE = 0
-_NPROC_CEILING = 0
+#: Where the shared NPROC state lives (tests point it elsewhere); default
+#: ``shared_state_dir()/nproc``.
+NPROC_STATE_DIR: Path | None = None
+
+
+def _nproc_state_dir() -> Path:
+    d = NPROC_STATE_DIR or shared_state_dir() / "nproc"
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return d
+
+
+def _pid_identity(pid: int) -> dict:
+    """What identifies a live process across a pid's reuse: its pid and start time (None where
+    the start time can't be read -- off Darwin -- and liveness alone is then checked)."""
+    return {"pid": pid, "start": proc_start_time(pid)}
+
+
+def _pid_entry_alive(entry: object) -> bool:
+    """Whether a recorded ``{"pid", "start"}`` names a process that is still running (the same
+    one: a recorded start time must still match). Malformed entries count as dead."""
+    if not isinstance(entry, dict):
+        return False
+    pid, start = entry.get("pid"), entry.get("start")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    if start is not None:
+        return proc_start_time(pid) == start
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _load_json_or(path: Path, default: dict) -> dict:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return default
+    try:
+        raw = b""
+        while chunk := os.read(fd, 1 << 16):
+            raw += chunk
+    finally:
+        os.close(fd)
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        return default
+    return obj if isinstance(obj, dict) else default
+
+
+def _write_json_atomic(path: Path, obj: dict) -> None:
+    """``obj`` at ``path``, all or nothing: written to a temp beside it, fsync'd, renamed over it
+    (a rename replaces a symlink at ``path`` rather than following it), the directory fsync'd."""
+    tmp = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, json.dumps(obj).encode())
+        os.fsync(fd)
+    except BaseException:
+        os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    os.close(fd)
+    os.replace(tmp, path)
+    _fsync_dir(path.parent)
+
+
+@contextlib.contextmanager
+def _nproc_state() -> Iterator[tuple[Path, dict]]:
+    """The shared NPROC state (``{"ceiling", "runs"}``), under its per-user lock."""
+    d = _nproc_state_dir()
+    lock = os.open(d / "state.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        path = d / "state.json"
+        state = _load_json_or(path, {})
+        runs = state.get("runs")
+        state["runs"] = runs if isinstance(runs, list) else []
+        yield path, state
+    finally:
+        os.close(lock)
 
 
 @contextlib.contextmanager
@@ -635,18 +719,29 @@ def nproc_ceiling() -> Iterator[int]:
     ceiling is fixed while any run is in flight: the uid's count when the first of them started
     plus :func:`nproc_budget`. Every process's limit is at or below it, so together they never
     pass it. It is re-measured only when no run is in flight, so the user's own processes
-    growing between jobs doesn't starve later ones."""
-    global _NPROC_ACTIVE, _NPROC_CEILING
-    with _NPROC_LOCK:
-        if _NPROC_ACTIVE == 0:
-            _NPROC_CEILING = len(uid_pids()) + nproc_budget()
-        _NPROC_ACTIVE += 1
-        ceiling = _NPROC_CEILING
+    growing between jobs doesn't starve later ones.
+
+    The limit is per UID, so the bookkeeping is too: the ceiling and the runs in flight live in
+    per-user locked state (:func:`shared_state_dir`), shared by every worker agent, ``macos
+    doctor`` and CLI run of this user. Process-local counters let a second agent see the first
+    one's children in its baseline and set a higher ceiling, recreating the growth. A run whose
+    process died (pid gone, or reused: start time differs) is dropped from the registry."""
+    run = {"id": secrets.token_hex(8), **_pid_identity(os.getpid())}
+    with _nproc_state() as (path, state):
+        live = [r for r in state["runs"] if _pid_entry_alive(r)]
+        ceiling = state.get("ceiling")
+        if not live or not isinstance(ceiling, int) or isinstance(ceiling, bool) or ceiling < 1:
+            ceiling = len(uid_pids()) + nproc_budget()
+        state.update(ceiling=ceiling, runs=[*live, run])
+        _write_json_atomic(path, state)
     try:
         yield ceiling
     finally:
-        with _NPROC_LOCK:
-            _NPROC_ACTIVE -= 1
+        with _nproc_state() as (path, state):
+            state["runs"] = [r for r in state["runs"]
+                             if _pid_entry_alive(r) and not (isinstance(r, dict)
+                                                             and r.get("id") == run["id"])]
+            _write_json_atomic(path, state)
 
 
 def limits_launcher_argv(limits: Limits, argv: list[str],
@@ -2451,6 +2546,228 @@ def clear_recorded_siblings(dest: Path) -> None:
     _prune_records(parent, _read_done_records(parent))
 
 
+#: Where in-flight copy-back swaps are journalled (tests point it elsewhere); default
+#: ``shared_state_dir()/copyback-journal``.
+COPYBACK_JOURNAL_DIR: Path | None = None
+
+
+def _journal_dir() -> Path:
+    d = COPYBACK_JOURNAL_DIR or shared_state_dir() / "copyback-journal"
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return d
+
+
+class CopyBackJournal:
+    """A durable record of one directory copy-back swap in flight, so a worker that dies (or
+    retires past its budget) between the swap's renames leaves a host directory the next worker
+    can put back together -- never one left part-old, part-new.
+
+    The swap moves ``dest``'s children into ``old`` (phase ``out``), then ``new``'s into
+    ``dest`` (phase ``in``), then drops ``new`` and retires ``old`` (phase ``retire``). The
+    journal is written (fsync'd, then its directory) before each phase begins, so whatever
+    point a death interrupts, :func:`recover_copy_backs` knows which way is consistent: during
+    ``prep``/``out`` the originals go back (fully old); from ``in`` on, the rest of the new tree
+    goes in (fully new). ``dest``, ``new`` and ``old`` are recorded by device and inode and must
+    still be those directories, or recovery refuses rather than move entries it can't vouch for.
+    A swap whose own in-process undo failed is marked ``broken``: refused until repaired by
+    hand. The journal lives in the protected per-user state (:func:`shared_state_dir`)."""
+
+    def __init__(self, dest: Path, new: Path, old: Path, times: os.stat_result) -> None:
+        dst, nst = os.lstat(dest), os.lstat(new)
+        self.path = _journal_dir() / f"{secrets.token_hex(12)}.json"
+        self.rec: dict = {
+            "v": 1, "dest": os.fspath(dest), "dest_dev": dst.st_dev, "dest_ino": dst.st_ino,
+            "new": new.name, "new_ino": nst.st_ino, "old": old.name, "old_ino": None,
+            "atime_ns": times.st_atime_ns, "mtime_ns": times.st_mtime_ns,
+            "phase": "prep", "writer": _pid_identity(os.getpid())}
+        _write_json_atomic(self.path, self.rec)
+
+    def advance(self, phase: str, **fields: object) -> None:
+        self.rec.update(phase=phase, **fields)
+        _write_json_atomic(self.path, self.rec)
+
+    def close(self) -> None:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(self.path)
+        _fsync_dir(self.path.parent)
+
+
+def _journal_writer_alive(rec: dict) -> bool:
+    """Whether the worker that wrote a journal may still be swapping. This process never is:
+    a journal with its pid is one left by an earlier process the pid was reused for, or one
+    this process abandoned (an undo that failed, marked ``broken``)."""
+    w = rec.get("writer")
+    if isinstance(w, dict) and w.get("pid") == os.getpid():
+        return False
+    return _pid_entry_alive(w)
+
+
+def _journal_dir_is(p: Path, ino: object) -> bool:
+    """Whether ``p`` exists as the directory recorded (``ino``; None = not yet recorded)."""
+    try:
+        st = os.lstat(p)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISDIR(st.st_mode) or (ino is not None and st.st_ino != ino):
+        raise SandboxError(f"{p} is no longer the directory its copy-back journal recorded")
+    return True
+
+
+def _journal_move_all(src: Path, dest: Path) -> None:
+    for name in sorted(os.listdir(src)):
+        if os.path.lexists(dest / name):
+            raise SandboxError(f"can't restore {src / name}: {dest / name} exists")
+        os.rename(src / name, dest / name)
+    os.rmdir(src)
+
+
+def _recover_journal(jpath: Path, rec: dict) -> None:
+    dest = Path(str(rec.get("dest")))
+    try:
+        dst = os.lstat(dest)
+    except FileNotFoundError:
+        # the host directory itself is gone (and the swap's trees with it): nothing to restore
+        os.unlink(jpath)
+        return
+    if (not stat.S_ISDIR(dst.st_mode) or dst.st_dev != rec.get("dest_dev")
+            or dst.st_ino != rec.get("dest_ino")):
+        raise SandboxError(f"{dest} was replaced since its copy-back was interrupted "
+                           f"(journal {jpath}); repair it by hand")
+    new, old = dest / str(rec.get("new")), dest / str(rec.get("old"))
+    for p_ in (new, old):
+        if p_.parent != dest or not p_.name.startswith(COPY_BACK_MARK):
+            raise SandboxError(f"copy-back journal {jpath} names {p_}; repair it by hand")
+    phase = rec.get("phase")
+    if phase in ("prep", "out"):
+        # Interrupted before any new entry went in: the originals go back (fully old) and the
+        # child's tree is dropped.
+        if _journal_dir_is(old, rec.get("old_ino")):
+            _journal_move_all(old, dest)
+        if _journal_dir_is(new, rec.get("new_ino")):
+            remove_tree(new)
+            if os.path.lexists(new):
+                raise SandboxError(f"could not remove the abandoned copy-back {new}")
+    elif phase in ("in", "retire"):
+        # Every original is already aside: the rest of the new tree goes in (fully new), and
+        # the originals are retired as a finished swap's are.
+        if _journal_dir_is(new, rec.get("new_ino")):
+            _journal_move_all(new, dest)
+        if _journal_dir_is(old, rec.get("old_ino")):
+            done = old.with_name(old.name.replace(f"{COPY_BACK_MARK}old-",
+                                                  f"{COPY_BACK_MARK}done-", 1))
+            retire_replaced(old, done, None)
+        with contextlib.suppress(OSError):
+            os.utime(dest, ns=(int(rec["atime_ns"]), int(rec["mtime_ns"])),
+                     follow_symlinks=False)
+    else:
+        raise SandboxError(f"the copy-back into {dest} failed and could not be undone "
+                           f"(journal {jpath}, phase {phase!r}); repair it by hand, then "
+                           "remove the journal")
+    os.unlink(jpath)
+    _fsync_dir(jpath.parent)
+
+
+def recover_copy_backs(dest: "Path | None" = None, *, claimed: bool = False) -> None:
+    """Finish or undo copy-backs a dead worker left in flight (:class:`CopyBackJournal`).
+
+    With ``dest`` (a run about to stage it, its path claim held -- ``claimed``): only journals
+    for that directory; one whose writer is still alive, or that can't be resolved safely,
+    raises ``SandboxError`` (the run must not stage a half-swapped tree). Without (an agent
+    starting): every journal whose writer is gone, each under a ``write`` claim on its
+    directory so no run stages it meanwhile; one that is claimed, alive or unresolvable is
+    logged and left for the run that next claims it."""
+    d = _journal_dir()
+    want = os.path.realpath(dest) if dest is not None else None
+    with os.scandir(d) as it:
+        journals = sorted(Path(e.path) for e in it
+                          if e.name.endswith(".json") and not e.name.startswith("."))
+    for jpath in journals:
+        rec = _load_json_or(jpath, {})
+        jdest = rec.get("dest")
+        if not isinstance(jdest, str):
+            _log.error("unreadable copy-back journal %s; left in place", jpath)
+            continue
+        if want is not None and os.path.realpath(jdest) != want:
+            continue
+        if _journal_writer_alive(rec):
+            if want is not None:
+                raise SandboxError(f"a copy-back into {dest} is still in progress (journal "
+                                   f"{jpath}); retry when it is done")
+            continue
+        try:
+            if want is not None and claimed:
+                _recover_journal(jpath, rec)
+            else:
+                with hold_path_claims([("write", Path(jdest))], "copy-back recovery"):
+                    _recover_journal(jpath, rec)
+        except (SandboxError, OSError) as exc:
+            if want is not None:
+                raise SandboxError(f"interrupted copy-back into {jdest}: {exc}") from exc
+            _log.error("could not recover the interrupted copy-back into %s: %s", jdest, exc)
+
+
+#: Where prepared App Sandbox roots are registered (tests point it elsewhere); default
+#: ``shared_state_dir()/roots``.
+ROOT_REGISTRY_DIR: Path | None = None
+
+
+def _root_registry_dir(home: Path | None = None) -> Path:
+    real_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    d = (ROOT_REGISTRY_DIR if ROOT_REGISTRY_DIR is not None and home in (None, real_home)
+         else shared_state_dir(home) / "roots")
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return d
+
+
+def register_protected_root(root: Path, marker: str, home: Path | None = None) -> None:
+    """Record ``root`` (both spellings) as a native backend's working tree -- an App Sandbox
+    root, with every slot's ``io/`` and ``ro/`` staging and its locks -- so every worker of this
+    user refuses mounts, seeds and captures that overlap it, not only the backend instance that
+    owns it (:func:`check_clear_of_roots`). Kept while ``root/marker`` exists; pruned once it is
+    gone. One file per root (named by its resolved path), written atomically."""
+    forms = [os.fspath(f) for f in path_forms(root)]
+    name = hashlib.sha256(forms[-1].encode()).hexdigest()[:32] + ".root"
+    _write_json_atomic(_root_registry_dir(home) / name, {"forms": forms, "marker": marker})
+
+
+def protected_roots(home: Path | None = None) -> list[Path]:
+    """Every registered root (:func:`register_protected_root`) still in use, both spellings;
+    entries whose root (or its marker) is gone are removed."""
+    d = _root_registry_dir(home)
+    out: list[Path] = []
+    with os.scandir(d) as it:
+        entries = [Path(e.path) for e in it if e.name.endswith(".root")]
+    for entry in entries:
+        rec = _load_json_or(entry, {})
+        forms, marker = rec.get("forms"), rec.get("marker")
+        if (not isinstance(forms, list) or not forms or not all(isinstance(f, str) for f in forms)
+                or not isinstance(marker, str) or "/" in marker):
+            continue            # unreadable: kept (never silently drops a protection), ignored
+        if not os.path.lexists(os.path.join(forms[-1], marker)):
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(entry)
+            continue
+        out.extend(Path(f) for f in forms)
+    return list(dict.fromkeys(out))
+
+
+def check_clear_of_roots(paths: Iterable[tuple[str, "Path | str"]], backend: str,
+                         home: Path | None = None) -> None:
+    """Raise ``SandboxError`` if any ``(what, path)`` -- either spelling -- is, holds or sits
+    inside a registered native root (:func:`protected_roots`): another agent's App Sandbox root,
+    say. Staging it would copy other jobs' ``io/``/``ro/`` state into this run; a writable grant
+    or copy-back there would change their slot locks and staged files mid-run."""
+    roots = protected_roots(home)
+    if not roots:
+        return
+    for what, p in paths:
+        for f in path_forms(p):
+            for r in roots:
+                if paths_overlap(f, r):
+                    raise SandboxError(f"{backend}: {what} {p} overlaps {r}, a native sandbox "
+                                       "root other runs stage in; use a path outside it")
+
+
 def clear_stale_copy_backs(source: Path, *,
                            max_entries: int = MAX_SCRATCH_ENTRIES) -> Path | None:
     """Before ``source`` is staged as a writable mount: remove what an interrupted copy-back
@@ -2736,14 +3053,17 @@ def paths_overlap(a: Path, b: Path) -> bool:
 #:     writers share one tree as bind mounts would, but a snapshot writer would discard their
 #:     writes and a seed copied from it would be taken mid-write.
 #:   * ``read`` -- copied as a snapshot (a seed). Only writers conflict.
+#:   * ``view`` -- granted to the child read-only, live (a Seatbelt read-only mount). It
+#:     conflicts with nothing but a ``base`` it is or holds (below).
 #:   * ``base`` -- a directory this run creates its scratch in (Seatbelt's scratch root). Unlike
-#:     the others it is directional: it conflicts only with a writer (``live``/``write``) whose
-#:     path IS it or CONTAINS it -- that run could list, read or change this run's scratch (or
-#:     re-point a link on the way to it). Writers inside it are just its other children.
-CLAIM_MODES = ("write", "live", "read", "base")
+#:     the others it is directional: it conflicts with ANY other claim (writer, snapshot reader
+#:     or live view) whose path IS it or CONTAINS it -- that run's child could list and read
+#:     this run's scratch (its input, cache, output), a writer change it too or re-point a link
+#:     on the way to it, and a snapshot of an enclosing tree would copy it. Claims inside it are
+#:     just its other children.
+CLAIM_MODES = ("write", "live", "read", "view", "base")
 _CLAIM_CONFLICTS = {("write", "write"), ("write", "live"), ("write", "read"),
                     ("live", "write"), ("live", "read"), ("read", "write"), ("read", "live")}
-_WRITERS = ("write", "live")
 
 
 def _claims_conflict(my_mode: str, mine: Path, other_mode: str, other: Path) -> bool:
@@ -2752,9 +3072,8 @@ def _claims_conflict(my_mode: str, mine: Path, other_mode: str, other: Path) -> 
     if my_mode == "base" or other_mode == "base":
         if my_mode == other_mode:
             return False
-        base, writer, writer_mode = ((mine, other, other_mode) if my_mode == "base"
-                                     else (other, mine, my_mode))
-        return writer_mode in _WRITERS and (base == writer or writer in base.parents)
+        base, encloser = (mine, other) if my_mode == "base" else (other, mine)
+        return base == encloser or encloser in base.parents
     return (my_mode, other_mode) in _CLAIM_CONFLICTS and paths_overlap(mine, other)
 
 
