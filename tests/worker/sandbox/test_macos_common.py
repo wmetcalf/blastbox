@@ -549,6 +549,68 @@ class TestHardLinks:
         total, entries, _ = mc.dir_usage([d], 1000)
         assert entries == 3 and total >= 3 * (1 << 20)
 
+    def test_a_copy_keeps_hard_links_within_the_tree(self, tmp_path):
+        src = tmp_path / "src"
+        (src / "sub").mkdir(parents=True)
+        (src / "f").write_bytes(b"x" * 600_000)
+        os.chmod(src / "f", 0o4755)               # setuid: the copy (both names) must drop it
+        os.link(src / "f", src / "sub" / "g")
+        budget = mc.CopyBudget(1_000_000)         # the two names together would be 1.2 MB
+        mc.copy_no_follow(src, tmp_path / "dst", budget=budget)
+        f, g = tmp_path / "dst" / "f", tmp_path / "dst" / "sub" / "g"
+        assert os.lstat(f).st_ino == os.lstat(g).st_ino
+        assert budget.bytes == 600_000 and budget.entries == 4    # src, f, sub, g
+        assert stat.S_IMODE(os.lstat(g).st_mode) == 0o755
+        with open(f, "ab") as fh:                 # a write through one name shows through the other
+            fh.write(b"y")
+        assert g.read_bytes().endswith(b"y")
+        assert os.lstat(src / "f").st_ino != os.lstat(f).st_ino   # never linked to the source
+
+    def test_a_link_to_a_file_outside_the_tree_is_copied(self, tmp_path):
+        outside = tmp_path / "outside"
+        outside.write_bytes(b"secret")
+        src = tmp_path / "src"
+        src.mkdir()
+        os.link(outside, src / "only")
+        mc.copy_no_follow(src, tmp_path / "dst", budget_bytes=1 << 20)
+        copied = tmp_path / "dst" / "only"
+        assert copied.read_bytes() == b"secret"
+        assert os.lstat(copied).st_ino != os.lstat(outside).st_ino
+        assert os.lstat(copied).st_nlink == 1
+
+    def test_separate_copies_never_share_an_inode(self, tmp_path):
+        # an ro and an rw mount staged by separate calls: a write through the rw copy must not
+        # reach the ro one, even when the host files are links to one inode
+        a, b = tmp_path / "a", tmp_path / "b"
+        a.mkdir()
+        b.mkdir()
+        (a / "f").write_bytes(b"x")
+        os.link(a / "f", b / "f")
+        budget = mc.CopyBudget(1 << 20)
+        mc.copy_no_follow(a, tmp_path / "ro", budget=budget)
+        mc.copy_no_follow(b, tmp_path / "rw", budget=budget)
+        assert os.lstat(tmp_path / "ro" / "f").st_ino != os.lstat(tmp_path / "rw" / "f").st_ino
+
+    def test_a_seed_keeps_links_across_its_top_level_entries(self, tmp_path):
+        seed = tmp_path / "seed"
+        (seed / "one").mkdir(parents=True)
+        (seed / "two").mkdir()
+        (seed / "one" / "f").write_bytes(b"x" * 600_000)
+        os.link(seed / "one" / "f", seed / "two" / "f")
+        scratch = mc.make_scratch(tmp_path / "s")
+        mc.seed_scratch(scratch, seed, budget_bytes=1_000_000)
+        assert os.lstat(scratch / "one" / "f").st_ino == os.lstat(scratch / "two" / "f").st_ino
+
+    def test_a_capture_keeps_links_across_its_top_level_entries(self, tmp_path):
+        scratch = tmp_path / "scratch"
+        (scratch / "one").mkdir(parents=True)
+        (scratch / "two").mkdir()
+        (scratch / "one" / "f").write_bytes(b"x" * 600_000)
+        os.link(scratch / "one" / "f", scratch / "two" / "f")
+        dest = tmp_path / "cache"
+        mc.capture_scratch(scratch, dest, 1_000_000)
+        assert os.lstat(dest / "one" / "f").st_ino == os.lstat(dest / "two" / "f").st_ino
+
 
 class TestFailClosedMeasurement:
     def test_an_unreadable_subdir_makes_usage_incomplete(self, tmp_path):

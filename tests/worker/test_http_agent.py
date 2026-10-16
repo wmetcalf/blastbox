@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import contextlib
 import json
+import subprocess
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -595,6 +597,71 @@ def test_a_failing_emergency_cleanup_still_exits(monkeypatch):
     monkeypatch.setattr(hag, "_HARD_EXIT", exited.append)
     hag._on_hard_deadline(1.0)
     assert exited == [75]
+
+
+def test_a_shutdown_signal_kills_and_sweeps_runs_in_flight_before_exiting(monkeypatch):
+    # launchd stop/unload/restart sends SIGTERM mid-job: the default action would skip every
+    # cleanup and leave a native run's session holding the writable mounts
+    import signal as _signal
+
+    import blastbox.worker.http_agent as hag
+    order: list[object] = []
+    monkeypatch.setattr(hag, "run_emergency_cleanups", lambda t: order.append(("cleanup", t)))
+    monkeypatch.setattr(hag, "_HARD_EXIT", lambda code: order.append(("exit", code)))
+    hag._on_shutdown_signal(_signal.SIGTERM, None)
+    hag._on_shutdown_signal(_signal.SIGINT, None)
+    assert order == [("cleanup", hag.EMERGENCY_CLEANUP_S), ("exit", 143),
+                     ("cleanup", hag.EMERGENCY_CLEANUP_S), ("exit", 130)]
+
+
+def test_only_one_retirement_runs_when_the_deadline_and_a_signal_race(monkeypatch):
+    import signal as _signal
+
+    import blastbox.worker.http_agent as hag
+    entered, release = threading.Event(), threading.Event()
+    calls: list[str] = []
+
+    def slow_cleanup(t):
+        calls.append("cleanup")
+        entered.set()
+        release.wait(5)
+    monkeypatch.setattr(hag, "run_emergency_cleanups", slow_cleanup)
+    exits: list[int] = []
+    monkeypatch.setattr(hag, "_HARD_EXIT", exits.append)
+    t = threading.Thread(target=hag._on_hard_deadline, args=(1.0,))
+    t.start()
+    assert entered.wait(5)
+    hag._on_shutdown_signal(_signal.SIGTERM, None)   # loses the race: returns, no second sweep
+    release.set()
+    t.join(5)
+    assert calls == ["cleanup"] and exits == [75]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
+@pytest.mark.parametrize("signame,code", [("SIGTERM", 143), ("SIGINT", 130)])
+def test_a_real_shutdown_signal_runs_the_registered_cleanups(tmp_path, signame, code):
+    # End to end in a real process: the handler main() installs reaches the backends' registry
+    import signal as _signal
+    marker = tmp_path / "swept"
+    script = (
+        "import sys, time\n"
+        "from blastbox.worker import http_agent as hag\n"
+        "from blastbox.worker.sandbox.base import register_emergency_cleanup\n"
+        f"register_emergency_cleanup(lambda: open({str(marker)!r}, 'w').write('ok'))\n"
+        "hag._install_shutdown_handlers()\n"
+        "print('ready', flush=True)\n"
+        "time.sleep(30)\n"
+        "sys.exit(9)\n")
+    proc = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE)
+    try:
+        assert proc.stdout.readline().strip() == b"ready"
+        proc.send_signal(getattr(_signal, signame))
+        assert proc.wait(timeout=20) == code
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    assert marker.read_text() == "ok"
 
 
 def test_a_failing_optional_warmup_does_not_gate_detonate():

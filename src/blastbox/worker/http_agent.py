@@ -31,6 +31,7 @@ import ipaddress
 import json
 import logging
 import os
+import signal
 import tarfile
 import tempfile
 import threading
@@ -126,13 +127,46 @@ def _on_hard_deadline(hard_s: float) -> None:
     with contextlib.suppress(Exception):
         import faulthandler
         faulthandler.dump_traceback()
-    # os._exit skips every backend's `finally`. The macOS backends start their children in new
-    # sessions -- out of reach of a supervisor that kills the agent's process group (launchd)
-    # -- so kill and sweep the runs in flight first, bounded: a Seatbelt child must not outlive
-    # the agent with direct access to its writable mounts. (Linux backends register nothing.)
-    with contextlib.suppress(Exception):
-        run_emergency_cleanups(EMERGENCY_CLEANUP_S)
-    _HARD_EXIT(75)
+    _retire(75)
+
+
+# One retirement per process: the hard deadline (a watchdog thread) and a shutdown signal (the
+# main thread) can race, and a second SIGTERM can land while the first is still sweeping. The
+# loser returns; the winner exits. Released only if the exit returns (a test's fake exit).
+_RETIRE_LOCK = threading.Lock()
+
+
+def _retire(code: int) -> None:
+    """Kill and sweep the runs in flight (bounded), then exit with ``code``.
+
+    os._exit skips every backend's `finally`. The macOS backends start their children in new
+    sessions -- out of reach of a supervisor that kills the agent's process group (launchd) --
+    so kill and sweep the runs in flight first, bounded: a Seatbelt child must not outlive the
+    agent with direct access to its writable mounts. (Linux backends register nothing.)"""
+    if not _RETIRE_LOCK.acquire(blocking=False):
+        return
+    try:
+        with contextlib.suppress(Exception):
+            run_emergency_cleanups(EMERGENCY_CLEANUP_S)
+        _HARD_EXIT(code)
+    finally:
+        _RETIRE_LOCK.release()
+
+
+def _on_shutdown_signal(signum: int, frame: object) -> None:
+    # launchd stop/unload/restart sends SIGTERM (then SIGKILL after its exit timeout). Python's
+    # default action ends the process with no `finally` and no cleanup, leaving a native run's
+    # session -- and its access to the writable mounts -- behind. Python runs this handler on the
+    # main thread between bytecodes, not in the signal frame, so the bounded sweep is safe here.
+    _log.warning("http_agent: signal %d -- killing and sweeping runs in flight before exiting", signum)
+    _retire(128 + signum)
+
+
+def _install_shutdown_handlers() -> None:
+    """SIGTERM/SIGINT run the emergency cleanups before exiting. Installed by main() only (an
+    embedder of serve() keeps its own signal handling)."""
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, _on_shutdown_signal)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -611,6 +645,8 @@ def serve(engine: Engine, *, bind: str = "0.0.0.0", port: int = 8765,
 
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO)
+    # Before warmup: an engine's self-test may already be a confined run.
+    _install_shutdown_handlers()
     spec = os.environ.get("BLASTBOX_ENGINE")
     if not spec:
         raise SystemExit("BLASTBOX_ENGINE=module:Class is required")

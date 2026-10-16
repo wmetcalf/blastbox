@@ -129,6 +129,7 @@ def seed_scratch(scratch: Path, seed: Path | None, budget_bytes: int | None = No
         if budget_bytes is None:
             raise TypeError("seed_scratch needs budget_bytes or budget")
         budget = CopyBudget(budget_bytes)
+    links: LinkMap = {}     # one seed is one tree: its hard links stay links across top-level entries
     for child in seed.iterdir():
         if child.name == "tmp":
             continue
@@ -136,19 +137,19 @@ def seed_scratch(scratch: Path, seed: Path | None, budget_bytes: int | None = No
         if dest.is_dir() and child.is_dir() and not child.is_symlink():
             # Merge into the dirs make_scratch pre-created (Library/Caches).
             for sub in child.iterdir():
-                _merge_into(sub, dest / sub.name, budget)
+                _merge_into(sub, dest / sub.name, budget, links)
         else:
             remove_tree(dest)
-            copy_no_follow(child, dest, budget=budget)
+            copy_no_follow(child, dest, budget=budget, links=links)
 
 
-def _merge_into(src: Path, dest: Path, budget: CopyBudget) -> None:
+def _merge_into(src: Path, dest: Path, budget: CopyBudget, links: LinkMap) -> None:
     if dest.is_dir() and src.is_dir() and not src.is_symlink():
         for sub in src.iterdir():
-            _merge_into(sub, dest / sub.name, budget)
+            _merge_into(sub, dest / sub.name, budget, links)
         return
     remove_tree(dest)
-    copy_no_follow(src, dest, budget=budget)
+    copy_no_follow(src, dest, budget=budget, links=links)
 
 
 def capture_scratch(scratch: Path, dest: Path | None, budget_bytes: int) -> None:
@@ -167,10 +168,11 @@ def capture_scratch(scratch: Path, dest: Path | None, budget_bytes: int) -> None
     os.mkdir(new, 0o700)
     try:
         budget = CopyBudget(budget_bytes)
+        links: LinkMap = {}
         for child in scratch.iterdir():
             if child.name == "tmp":
                 continue
-            copy_no_follow(child, new / child.name, budget=budget)
+            copy_no_follow(child, new / child.name, budget=budget, links=links)
         swap_into_place(new, dest)
     except BaseException:
         remove_tree(new)
@@ -1710,8 +1712,12 @@ class CopyBudget:
             raise SandboxError(f"sandbox copy exceeds {self.max_entries} entries at {at}")
 
 
+#: Hard-link aliases seen by one copy: (st_dev, st_ino) of a source file -> its first copy.
+LinkMap = dict[tuple[int, int], Path]
+
+
 def copy_no_follow(src: Path, dst: Path, *, budget_bytes: int | None = None,
-                   budget: CopyBudget | None = None) -> int:
+                   budget: CopyBudget | None = None, links: LinkMap | None = None) -> int:
     """Copy ``src`` (file or tree) to ``dst`` without ever following a symlink.
 
     Regular files and directories are copied with their permission bits; a symlink is recreated
@@ -1721,12 +1727,19 @@ def copy_no_follow(src: Path, dst: Path, *, budget_bytes: int | None = None,
     of ``budget_bytes``), which raises :class:`SandboxError` once its bytes or entries are
     exceeded, so a child cannot fill the worker's disk through the copy-back. Returns bytes
     copied by this call.
+
+    Hard links WITHIN the copy stay hard links: a later name for an inode already copied is
+    linked to that copy, so writes through one name show through the other (as on the host, and
+    in a copy-back) and the bytes are charged once -- each name still counts as an entry.
+    ``links`` lets several calls that build ONE tree (a seed, a capture) share that map; a
+    fresh one per call otherwise, so separate trees (an ro and an rw mount) never share an inode.
     """
     if budget is None:
         if budget_bytes is None:
             raise TypeError("copy_no_follow needs budget_bytes or budget")
         budget = CopyBudget(budget_bytes)
     start = budget.bytes
+    seen: LinkMap = {} if links is None else links
 
     def _one(s: Path, d: Path) -> None:
         st = os.lstat(s)
@@ -1743,8 +1756,21 @@ def copy_no_follow(src: Path, dst: Path, *, budget_bytes: int | None = None,
             # After the children: a read-only source dir must not block filling its copy.
             os.chmod(d, _perm_bits(mode), follow_symlinks=False)
         elif stat.S_ISREG(mode):
+            key = (st.st_dev, st.st_ino) if st.st_nlink > 1 else None
+            first = seen.get(key) if key is not None else None
+            if first is not None:
+                try:
+                    # the first copy already has the sanitized mode, no flags and no ACL
+                    os.link(first, d, follow_symlinks=False)
+                except OSError:
+                    first = None        # (another filesystem, say): copy it on its own
+                else:
+                    budget.charge(0, s)
+                    return
             budget.charge(st.st_size, s)
             _copy_regular(s, d, mode)
+            if key is not None:
+                seen.setdefault(key, d)
         else:
             budget.charge(0, s)
             _log.warning("macos sandbox: skipping non-regular file %s (mode %o)", s, mode)
