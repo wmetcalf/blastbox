@@ -9,6 +9,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import time
 import plistlib
 import shutil
 import stat
@@ -1084,6 +1085,60 @@ def test_prepare_refuses_while_a_run_holds_a_slot(tmp_path):
         os.close(fd)
     asb.prepare(root, slots=2, ro_paths=[], runner=_fake_runner([]), lock_wait_s=0.2)
     assert (root / asb.MANIFEST_NAME).read_bytes() != before     # a new generation
+
+
+def test_prepare_refuses_while_another_prepare_runs(tmp_path):
+    root = tmp_path / "root"
+    asb.prepare(root, slots=1, ro_paths=[], runner=_fake_runner([]))
+    before = (root / asb.MANIFEST_NAME).read_bytes()
+    fd = os.open(root / "locks" / asb.PREPARE_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        with pytest.raises(SandboxError, match="another `blastbox macos prepare` is running"):
+            asb.prepare(root, slots=1, ro_paths=[], runner=_fake_runner([]), lock_wait_s=0.2)
+        assert (root / asb.MANIFEST_NAME).read_bytes() == before
+    finally:
+        os.close(fd)
+
+
+def test_overlapping_prepares_never_drop_a_slot_the_first_one_added(tmp_path):
+    # Prepare A (holding the root lock) grows the root to 4 slots and an agent starts a run in
+    # slot 3. Prepare B, asking for 1 slot, was started meanwhile: it must read the slot set
+    # only once A is done, so it waits on slot 3's lock -- not lock just slot 0 and delete 3.
+    import threading
+    root = tmp_path / "root"
+    asb.prepare(root, slots=1, ro_paths=[], runner=_fake_runner([]))
+    a = os.open(root / "locks" / asb.PREPARE_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(a, fcntl.LOCK_EX)                      # A is running
+    errors: list[BaseException] = []
+
+    def prepare_b():
+        try:
+            asb.prepare(root, slots=1, ro_paths=[], runner=_fake_runner([]), lock_wait_s=2)
+        except BaseException as exc:
+            errors.append(exc)
+    b = threading.Thread(target=prepare_b)
+    b.start()
+    run = None
+    try:
+        time.sleep(0.2)                                 # B is now waiting for A
+        for i in (1, 2, 3):                             # what A creates
+            (root / "slots" / str(i) / "io").mkdir(parents=True)
+        (root / "slots" / "3" / "io" / "job").write_text("in use")
+        run = os.open(root / "locks" / "3.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(run, fcntl.LOCK_EX)                 # an agent runs in A's new slot 3
+        os.close(a)                                     # A finishes
+        a = -1
+        b.join(timeout=10)
+        assert not b.is_alive()
+        assert errors and "slot 3 is in use" in str(errors[0])
+        assert (root / "slots" / "3" / "io" / "job").read_text() == "in use"
+    finally:
+        if a != -1:
+            os.close(a)
+        if run is not None:
+            os.close(run)
+        b.join(timeout=10)
 
 
 def test_a_live_instance_refuses_runs_once_the_slots_are_re_prepared(tmp_path):

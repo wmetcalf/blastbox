@@ -1169,6 +1169,73 @@ print("ready", flush=True); time.sleep(60)
 
 
 @darwin_only
+class TestHeldFilesRevalidateIdentity:
+    """A run's held-file scan reads each process's tables by pid, after the family was listed.
+    A member that exited by then may have its pid reused by another job: that job's held files
+    must not be charged to this run (they could trip its disk limit)."""
+
+    def _scan(self, monkeypatch, per_pid):
+        calls = []
+        monkeypatch.setattr(mc, "_LIBSYSTEM", object())    # the real scan is replaced below
+
+        def scan(pid, vfi, region, held):
+            calls.append(pid)
+            out = per_pid[pid]
+            if isinstance(out, Exception):
+                raise out
+            held[(1, pid)] = out
+        monkeypatch.setattr(mc, "_scan_held", scan)
+        return calls
+
+    def test_a_pid_reused_before_the_scan_is_not_read(self, monkeypatch):
+        calls = self._scan(monkeypatch, {7: 500})
+        assert mc.held_unlinked_bytes({7: 100.0}, start_fn=lambda pid: 200.0) == 0
+        assert calls == []
+
+    def test_a_pid_reused_during_the_scan_is_discarded(self, monkeypatch):
+        self._scan(monkeypatch, {7: 500, 8: 30})
+        starts = iter([100.0, 200.0])           # matches before the read, not after
+        start_fn = lambda pid: next(starts) if pid == 7 else 50.0   # noqa: E731
+        assert mc.held_unlinked_bytes({7: 100.0, 8: 50.0}, start_fn=start_fn) == 30
+
+    def test_a_matching_process_is_counted(self, monkeypatch):
+        self._scan(monkeypatch, {7: 500})
+        assert mc.held_unlinked_bytes({7: 100.0}, start_fn=lambda pid: 100.0) == 500
+
+    def test_an_unreadable_process_fails_closed_only_while_it_is_still_ours(self, monkeypatch):
+        self._scan(monkeypatch, {7: SandboxError("cannot list pid 7's open files")})
+        with pytest.raises(SandboxError):
+            mc.held_unlinked_bytes({7: 100.0}, start_fn=lambda pid: 100.0)
+        starts = iter([100.0, 200.0])           # the failure came from the pid's new owner
+        assert mc.held_unlinked_bytes({7: 100.0}, start_fn=lambda pid: next(starts)) == 0
+
+    def test_the_watchdog_scans_confirmed_members_by_identity(self, tmp_path):
+        proc = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+        try:
+            pgid = os.getpgid(proc.pid)
+            member = mc._Proc(pid=999_991, ppid=proc.pid, pgid=pgid, rss=0)
+            starts = {proc.pid: 10.0, 999_991: 20.0}
+            got = []
+
+            def held(identities):
+                got.append(dict(identities))
+                return 0
+            dog = mc.RssWatchdog(proc, 1 << 30, rss_fn=lambda pgid: 0,
+                                 table_fn=lambda: [member], start_fn=starts.get,
+                                 watch_dirs=[tmp_path], disk_limit_bytes=1 << 30, held_fn=held)
+            dog._sample()
+            assert got and got[-1].get(999_991) == 20.0     # passed with its start time
+            # a member that was never confirmed is not scanned at all
+            dog.seen.pop(999_991)
+            dog._table_fn = lambda: [mc._Proc(pid=999_992, ppid=proc.pid, pgid=pgid, rss=0)]
+            dog._start_fn = lambda pid: None if pid == 999_992 else starts.get(pid)
+            dog._sample()
+            assert 999_992 not in got[-1]
+        finally:
+            proc.kill()
+            proc.wait()
+
+
 class TestOpenUnlinkedFilesCount:
     def test_held_unlinked_bytes_sees_open_and_mapped_files(self, tmp_path):
         p = subprocess.Popen([sys.executable, "-I", "-c", _HOLDER, str(tmp_path)],
@@ -1220,7 +1287,7 @@ class TestWatchdogExitIsBounded:
         # __exit__ raising (the watchdog would not stop) must not skip the family kill and the
         # backend sweep: a detached child would otherwise outlive the failed run
         monkeypatch.setattr(mc, "WATCHDOG_JOIN_S", 0.5)
-        monkeypatch.setattr(mc, "held_unlinked_bytes", lambda pids: time.sleep(5) or 0)
+        monkeypatch.setattr(mc, "held_unlinked_bytes", lambda pids, **kw: time.sleep(5) or 0)
         w = tmp_path / "w"
         w.mkdir()
         pidfile = tmp_path / "bg.pid"

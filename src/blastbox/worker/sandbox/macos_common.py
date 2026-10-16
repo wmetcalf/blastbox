@@ -752,12 +752,17 @@ class RssWatchdog:
         table_fn: Callable[[], list[_Proc]] = process_table,
         member_fn: Callable[[int], bool] | None = None,
         start_fn: Callable[[int], float | None] | None = None,
-        held_fn: Callable[[Iterable[int]], int] | None = None,
+        held_fn: Callable[[Mapping[int, float]], int] | None = None,
     ) -> None:
         self._proc = proc
-        self._held_fn = held_fn or held_unlinked_bytes
         self._member_fn = member_fn
         self._start_fn = start_fn or proc_start_time
+        if held_fn is None:
+            scan = held_unlinked_bytes
+
+            def held_fn(identities: Mapping[int, float]) -> int:
+                return scan(identities, start_fn=self._start_fn)
+        self._held_fn = held_fn
         self._limit = limit_bytes
         self._interval = interval_s
         self._rss_fn = rss_fn
@@ -929,8 +934,14 @@ class RssWatchdog:
                                                 stop=self._stop.is_set)
             if self._stop.is_set():
                 return
+            # Only members with a confirmed identity (pid + start time), each revalidated
+            # around its scan: a member that exited and whose pid another job reused since this
+            # family was listed must not have that job's held files charged to this run. One
+            # not confirmed yet is left to the next sample, as its kill identity is.
+            seen = self.seen_snapshot()
+            identities = {r.pid: seen[r.pid] for r in family if r.pid in seen}
             try:
-                used += self._held_fn(r.pid for r in family)
+                used += self._held_fn(identities)
             except SandboxError as exc:
                 self._trip("disk", f"cannot measure files held open by the run: {exc}")
                 return
@@ -1336,8 +1347,15 @@ def _vinfo_stat(raw: bytes, off: int) -> tuple[int, int, int, int, int] | None:
     return dev, ino, mode, nlink, max(size, blocks * 512, 0)
 
 
-def held_unlinked_bytes(pids: Iterable[int]) -> int:
+def held_unlinked_bytes(pids: Iterable[int] | Mapping[int, float], *,
+                        start_fn: Callable[[int], float | None] = proc_start_time) -> int:
     """Bytes in regular files the processes ``pids`` hold open or mapped after unlinking them.
+
+    ``pids`` may map each pid to its start time (the run's identity for it). Each such process
+    is then checked to still be that process just before AND just after its tables are read; if
+    not -- it exited and the pid went to another job, possibly mid-scan -- its sample is
+    discarded, so another job's files are never charged to this run. A plain list of pids is
+    read as-is.
 
     A file that is opened (or mmapped) and then unlinked keeps its blocks until the last
     reference goes, but no path leads to it, so :func:`dir_usage` can't see it: a run could
@@ -1351,6 +1369,36 @@ def held_unlinked_bytes(pids: Iterable[int]) -> int:
             raise SandboxError("cannot read open files: libSystem process APIs unavailable")
         return 0
     held: dict[tuple[int, int], int] = {}
+    identities: dict[int, float | None] = (
+        dict(pids) if isinstance(pids, Mapping) else dict.fromkeys(pids))
+    vfi = ctypes.create_string_buffer(_VNODE_FDINFO_SIZE)
+    region = ctypes.create_string_buffer(_REGION_PATHINFO_SIZE)
+
+    def _same(pid: int, started: float | None) -> bool:
+        return started is None or start_fn(pid) == started
+
+    for pid, started in identities.items():
+        if not _same(pid, started):
+            continue            # gone, or the pid is another process now: nothing of ours
+        mine: dict[tuple[int, int], int] = {}
+        try:
+            _scan_held(pid, vfi, region, mine)
+        except SandboxError:
+            if not _same(pid, started):
+                continue        # the failure was another process's (pid reused mid-scan)
+            raise               # ours, still alive, and unreadable: fail closed
+        if not _same(pid, started):
+            continue            # reused while it was read: the sample may be another job's
+        held.update(mine)
+    return sum(held.values())
+
+
+def _scan_held(pid: int, vfi: ctypes.Array, region: ctypes.Array,
+               held: dict[tuple[int, int], int]) -> None:
+    """Add ``pid``'s unlinked open or mapped regular files to ``held`` ((dev, ino) -> bytes)."""
+    lib = _LIBSYSTEM
+    if lib is None:     # held_unlinked_bytes checks first
+        raise SandboxError("cannot read open files: libSystem process APIs unavailable")
 
     def _note(st: tuple[int, int, int, int, int] | None) -> None:
         if st is not None:
@@ -1358,36 +1406,32 @@ def held_unlinked_bytes(pids: Iterable[int]) -> int:
             if stat.S_ISREG(mode) and nlink == 0:
                 held[(dev, ino)] = nbytes
 
-    vfi = ctypes.create_string_buffer(_VNODE_FDINFO_SIZE)
-    region = ctypes.create_string_buffer(_REGION_PATHINFO_SIZE)
-    for pid in set(pids):
-        listed = _list_fds(pid)
-        if listed is None:
-            continue            # exited (or exiting): it holds nothing any more
-        fds, got = listed
-        for f in fds[: got // ctypes.sizeof(_ProcFdInfo)]:
-            if f.proc_fdtype != _PROX_FDTYPE_VNODE:
-                continue
-            # A descriptor closed since the listing is simply gone.
-            if _LIBSYSTEM.proc_pidfdinfo(pid, f.proc_fd, _PROC_PIDFDVNODEINFO, vfi,
-                                         _VNODE_FDINFO_SIZE) == _VNODE_FDINFO_SIZE:
-                _note(_vinfo_stat(vfi.raw, _VNODE_FDINFO_STAT))
-        # Mapped files: an mmap keeps an unlinked file alive after its descriptor is closed.
-        addr = count = 0
-        while _LIBSYSTEM.proc_pidinfo(pid, _PROC_PIDREGIONPATHINFO, addr, region,
-                                      _REGION_PATHINFO_SIZE) > 0:
-            count += 1
-            if count > MAX_REGIONS:
-                raise SandboxError(f"pid {pid} maps more than {MAX_REGIONS} regions")
-            raw = region.raw
-            _note(_vinfo_stat(raw, _REGION_PATHINFO_STAT))
-            start = int.from_bytes(raw[_REGION_ADDR:_REGION_ADDR + 8], "little")
-            size = int.from_bytes(raw[_REGION_SIZE:_REGION_SIZE + 8], "little")
-            nxt = start + size
-            if nxt <= addr:
-                break
-            addr = nxt
-    return sum(held.values())
+    listed = _list_fds(pid)
+    if listed is None:
+        return                  # exited (or exiting): it holds nothing any more
+    fds, got = listed
+    for f in fds[: got // ctypes.sizeof(_ProcFdInfo)]:
+        if f.proc_fdtype != _PROX_FDTYPE_VNODE:
+            continue
+        # A descriptor closed since the listing is simply gone.
+        if lib.proc_pidfdinfo(pid, f.proc_fd, _PROC_PIDFDVNODEINFO, vfi,
+                              _VNODE_FDINFO_SIZE) == _VNODE_FDINFO_SIZE:
+            _note(_vinfo_stat(vfi.raw, _VNODE_FDINFO_STAT))
+    # Mapped files: an mmap keeps an unlinked file alive after its descriptor is closed.
+    addr = count = 0
+    while lib.proc_pidinfo(pid, _PROC_PIDREGIONPATHINFO, addr, region,
+                           _REGION_PATHINFO_SIZE) > 0:
+        count += 1
+        if count > MAX_REGIONS:
+            raise SandboxError(f"pid {pid} maps more than {MAX_REGIONS} regions")
+        raw = region.raw
+        _note(_vinfo_stat(raw, _REGION_PATHINFO_STAT))
+        start = int.from_bytes(raw[_REGION_ADDR:_REGION_ADDR + 8], "little")
+        size = int.from_bytes(raw[_REGION_SIZE:_REGION_SIZE + 8], "little")
+        nxt = start + size
+        if nxt <= addr:
+            break
+        addr = nxt
 
 
 # A process caught while it exits can fail the fd listing with an error other than ESRCH

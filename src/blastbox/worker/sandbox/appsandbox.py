@@ -70,6 +70,8 @@ from blastbox.worker.sandbox import macos_common as mc
 _log = logging.getLogger("blastbox.worker.sandbox.appsandbox")
 
 MANIFEST_NAME = "manifest.json"
+# Held by `prepare` for its whole run (locks/<this>); agents take only the per-slot locks.
+PREPARE_LOCK = "prepare.lock"
 MANIFEST_VERSION = 2          # 2: the launcher takes <marker> <nonce> before the target
 LAUNCHER_EXE = "bb-launcher"
 _APP_SANDBOX = "com.apple.security.app-sandbox"
@@ -421,12 +423,21 @@ def prepare(
                            "exceeds the 200-character bundle id limit")
 
     (root / "locks").mkdir(exist_ok=True, mode=0o700)
-    existing = [int(c.name) for c in (root / "slots").iterdir() if c.name.isdigit()] \
-        if (root / "slots").is_dir() else []
-    with _all_slot_locks(root, range(max([slots, *(i + 1 for i in existing)])),
-                         _prepare_wait(lock_wait_s)):
-        return _prepare_locked(root, slots=slots, resolved_ro=resolved_ro, prefix=prefix,
-                               cc=cc, codesign=codesign, runner=runner)
+    wait_s = _prepare_wait(lock_wait_s)
+    deadline = time.monotonic() + wait_s
+    # ONE prepare at a time, and the slot set read only once it holds that: two overlapping
+    # prepares that each listed the slots first could have the second (asking for fewer) lock
+    # only the slots it saw, then delete the higher-numbered ones the first had just created --
+    # while a freshly started agent ran in one. Agents never take this lock (only slot locks),
+    # so it never delays a run; it lives in locks/, which no slot cleanup touches.
+    with _held_lock(root / "locks" / PREPARE_LOCK, deadline, wait_s,
+                    "another `blastbox macos prepare` is running on this root"):
+        existing = [int(c.name) for c in (root / "slots").iterdir() if c.name.isdigit()] \
+            if (root / "slots").is_dir() else []
+        with _all_slot_locks(root, range(max([slots, *(i + 1 for i in existing)])), wait_s,
+                             deadline=deadline):
+            return _prepare_locked(root, slots=slots, resolved_ro=resolved_ro, prefix=prefix,
+                                   cc=cc, codesign=codesign, runner=runner)
 
 
 def _prepare_wait(value: float | None) -> float:
@@ -442,22 +453,37 @@ def _prepare_wait(value: float | None) -> float:
     return wait
 
 
+def _wait_lock(path: Path, deadline: float, wait_s: float, why: str) -> int:
+    """``path``'s lock fd, waiting until ``deadline``; else raise naming ``why``."""
+    while (fd := AppSandboxSandbox._try_lock(path)) is None:
+        if time.monotonic() >= deadline:
+            raise SandboxError(f"appsandbox: {why} (lock {path} held for {wait_s:g}s)")
+        time.sleep(0.05)
+    return fd
+
+
 @contextlib.contextmanager
-def _all_slot_locks(root: Path, indexes: Iterable[int], wait_s: float) -> Iterator[None]:
+def _held_lock(path: Path, deadline: float, wait_s: float, why: str) -> Iterator[None]:
+    fd = _wait_lock(path, deadline, wait_s, why)
+    try:
+        yield
+    finally:
+        AppSandboxSandbox._unlock(fd)
+
+
+@contextlib.contextmanager
+def _all_slot_locks(root: Path, indexes: Iterable[int], wait_s: float, *,
+                    deadline: float | None = None) -> Iterator[None]:
     """Hold every listed slot's run lock (``locks/<i>.lock``), or raise if a run keeps one
-    past ``wait_s``."""
+    past ``wait_s`` (or the given ``deadline``)."""
     held: list[int] = []
-    deadline = time.monotonic() + wait_s
+    if deadline is None:
+        deadline = time.monotonic() + wait_s
     try:
         for i in indexes:
-            path = root / "locks" / f"{i}.lock"
-            while (fd := AppSandboxSandbox._try_lock(path)) is None:
-                if time.monotonic() >= deadline:
-                    raise SandboxError(
-                        f"appsandbox slot {i} is in use by a running job (lock {path} held "
-                        f"for {wait_s:g}s); stop the agent, or retry when it is idle")
-                time.sleep(0.05)
-            held.append(fd)
+            held.append(_wait_lock(
+                root / "locks" / f"{i}.lock", deadline, wait_s,
+                f"slot {i} is in use by a running job; stop the agent, or retry when it is idle"))
         yield
     finally:
         for fd in reversed(held):
