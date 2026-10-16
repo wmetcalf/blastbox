@@ -2352,16 +2352,21 @@ def containers_dir(home: Path | None = None) -> Path:
 
 def check_clear_of_containers(paths: Iterable[tuple[str, "Path | str"]], backend: str,
                               home: Path | None = None) -> None:
-    """Raise ``SandboxError`` if any ``(what, path)`` is or holds ``~/Library/Containers``
-    (compared resolved): a grant there reaches every App Sandbox slot's ``Data`` -- other runs'
-    caches and job state -- and a copy of it would stage them. (A path inside one app's
-    container is checked by the App Sandbox backend against its own slots.)"""
-    area = containers_dir(home).resolve()
+    """Raise ``SandboxError`` if any ``(what, path)`` -- either spelling -- is, holds or sits
+    inside ``~/Library/Containers``: a grant over it reaches every App Sandbox slot's ``Data``
+    (other runs' caches and job state) and a copy of it would stage them; a path INSIDE it is
+    some app's container -- possibly a live slot of another root or agent, which this backend
+    can't tell from its own manifest (Seatbelt has none) -- and staging, granting or copying
+    back there would expose or change that slot's ``Data`` mid-run. No run has a reason to use
+    a path in there."""
+    areas = path_forms(containers_dir(home))
     for what, p in paths:
-        rp = Path(p).expanduser().resolve()
-        if rp == area or rp in area.parents:
-            raise SandboxError(f"{backend}: {what} {p} holds {area}, every App Sandbox slot's "
-                               "container; use a narrower path")
+        for f in path_forms(Path(p).expanduser()):
+            for area in areas:
+                if paths_overlap(f, area):
+                    raise SandboxError(f"{backend}: {what} {p} overlaps {area}, every App "
+                                       "Sandbox slot's container; use a path outside "
+                                       "~/Library/Containers")
 
 
 def internal_state_dirs(home: Path | None = None) -> list[Path]:
@@ -2724,10 +2729,25 @@ def register_protected_root(root: Path, marker: str, home: Path | None = None) -
     root, with every slot's ``io/`` and ``ro/`` staging and its locks -- so every worker of this
     user refuses mounts, seeds and captures that overlap it, not only the backend instance that
     owns it (:func:`check_clear_of_roots`). Kept while ``root/marker`` exists; pruned once it is
-    gone. One file per root (named by its resolved path), written atomically."""
+    gone. One file per root (named by its resolved path), written atomically.
+
+    Raises ``SandboxError`` if a live run already holds a claim over (or inside) the root."""
     forms = [os.fspath(f) for f in path_forms(root)]
     name = hashlib.sha256(forms[-1].encode()).hexdigest()[:32] + ".root"
-    _write_json_atomic(_root_registry_dir(home) / name, {"forms": forms, "marker": marker})
+    # Under the claim registry's lock, against every live claim: a run that already holds a
+    # path over (or inside) this root -- a Seatbelt child's live writable grant, say -- would
+    # keep its access to the locks, launchers, manifest and staging prepared here; only LATER
+    # runs are kept out by the registration. So such a root is refused while that run lives.
+    # And claims are made under the same lock (hold_path_claims checks the roots), so neither
+    # can slip in between the other's check and its write.
+    with _claim_registry(home) as (d, _guard):
+        for mode, other in _live_claims(d):
+            for f in path_forms(root):
+                if _claim_touches_root(mode, other, f):
+                    raise SandboxError(
+                        f"root {root} overlaps {other}, which a live run holds for {mode}; "
+                        "prepare it when that run is done, or use another root")
+        _write_json_atomic(_root_registry_dir(home) / name, {"forms": forms, "marker": marker})
 
 
 def protected_roots(home: Path | None = None) -> list[Path]:
@@ -3080,7 +3100,8 @@ def _claims_conflict(my_mode: str, mine: Path, other_mode: str, other: Path) -> 
 def path_claims_dir(home: Path | None = None) -> Path:
     """The per-user registry of host paths live runs hold (:func:`hold_path_claims`), shared by
     both native backends and every root, under :func:`shared_state_dir`."""
-    d = (PATH_CLAIM_DIR if home is None and PATH_CLAIM_DIR is not None
+    real_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    d = (PATH_CLAIM_DIR if PATH_CLAIM_DIR is not None and home in (None, real_home)
          else shared_state_dir(home) / "path-claims")
     d.mkdir(parents=True, exist_ok=True, mode=0o700)
     return d
@@ -3101,12 +3122,68 @@ def _parse_claim(raw: bytes) -> list[tuple[str, Path]]:
 
 
 @contextlib.contextmanager
+def _claim_registry(home: Path | None) -> Iterator[tuple[Path, int]]:
+    """The claim registry's directory and its guard, held exclusively for the block: every
+    claim, and every root registration, is checked and made under it, so no two can both see
+    the other absent."""
+    d = path_claims_dir(home)
+    guard = os.open(d / ".registry.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(guard, fcntl.LOCK_EX)
+        try:
+            yield d, guard
+        finally:
+            fcntl.flock(guard, fcntl.LOCK_UN)
+    finally:
+        os.close(guard)
+
+
+def _live_claims(d: Path) -> list[tuple[str, Path]]:
+    """Every ``(mode, path)`` a live run holds in registry ``d``; a claim file no run holds
+    (its worker died) is removed. Call under :func:`_claim_registry`."""
+    out: list[tuple[str, Path]] = []
+    with os.scandir(d) as it:
+        held_claims = [Path(e.path) for e in it if e.name.endswith(".claim")]
+    for claim in held_claims:
+        try:
+            fd = os.open(claim, os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            continue
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raw = b""
+                while chunk := os.read(fd, 1 << 16):
+                    raw += chunk
+                out.extend(_parse_claim(raw))
+                continue
+            os.unlink(claim)        # unlocked: its run is gone
+        finally:
+            os.close(fd)
+    return out
+
+
+def _claim_touches_root(mode: str, path: Path, root: Path) -> bool:
+    """Whether a claim ``(mode, path)`` reaches a registered native root: any claim on a path
+    that is, holds or sits inside it -- except a ``base`` (a scratch parent, which grants
+    nothing over what it holds), which only conflicts when the scratch would be made in the
+    root, or be the root."""
+    if mode == "base":
+        return path == root or root in path.parents
+    return paths_overlap(path, root)
+
+
+@contextlib.contextmanager
 def hold_path_claims(claims: Iterable[tuple[str, "Path | str"]], backend: str,
                      home: Path | None = None) -> Iterator[None]:
     """Hold this user's claim on each ``(mode, path)`` (resolved) for a whole run -- from before
     anything is copied or launched until its teardown (copy-back, capture) is done -- or raise
     ``SandboxError`` at once if a live run holds a conflicting claim (see :data:`CLAIM_MODES`)
-    on a path that is, holds or sits inside one of them.
+    on a path that is, holds or sits inside one of them, or if one of them reaches a registered
+    native root (:func:`register_protected_root`) -- checked under the same registry lock a
+    root is registered under, so a root prepared meanwhile can't slip between the check and
+    the claim.
 
     Runs that conflict are refused rather than queued: a run can hold its paths for its whole
     timeout, and waiting under a slot lock could deadlock.
@@ -3124,57 +3201,36 @@ def hold_path_claims(claims: Iterable[tuple[str, "Path | str"]], backend: str,
     if not mine_list:
         yield
         return
-    d = path_claims_dir(home)
-    guard = os.open(d / ".registry.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     mine: Path | None = None
     mine_fd: int | None = None
     try:
-        fcntl.flock(guard, fcntl.LOCK_EX)
-        try:
-            with os.scandir(d) as it:
-                held_claims = [Path(e.path) for e in it if e.name.endswith(".claim")]
-            for claim in held_claims:
-                try:
-                    fd = os.open(claim, os.O_RDONLY | os.O_NOFOLLOW)
-                except FileNotFoundError:
-                    continue
-                try:
-                    try:
-                        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-                    except BlockingIOError:
-                        raw = b""
-                        while chunk := os.read(fd, 1 << 16):
-                            raw += chunk
-                        for other_mode, other in _parse_claim(raw):
-                            for my_mode, path in mine_list:
-                                if _claims_conflict(my_mode, path, other_mode, other):
-                                    raise SandboxError(
-                                        f"{backend}: {path} is in use by another run (which "
-                                        f"holds {other} for {other_mode}, this run needs it for "
-                                        f"{my_mode}); retry when it is done") from None
-                        continue
-                    os.unlink(claim)        # unlocked: its run is gone
-                finally:
-                    os.close(fd)
+        with _claim_registry(home) as (d, _guard):
+            for other_mode, other in _live_claims(d):
+                for my_mode, path in mine_list:
+                    if _claims_conflict(my_mode, path, other_mode, other):
+                        raise SandboxError(
+                            f"{backend}: {path} is in use by another run (which holds {other} "
+                            f"for {other_mode}, this run needs it for {my_mode}); retry when "
+                            "it is done")
+            for root in protected_roots(home):
+                for my_mode, path in mine_list:
+                    if _claim_touches_root(my_mode, path, root):
+                        raise SandboxError(
+                            f"{backend}: {path} overlaps {root}, a native sandbox root other "
+                            "runs stage in; use a path outside it")
             mine = d / f"{secrets.token_hex(8)}.claim"
             mine_fd = os.open(mine, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             fcntl.flock(mine_fd, fcntl.LOCK_EX)
             os.write(mine_fd, b"".join(m.encode("ascii") + b"\x01" + os.fsencode(path) + b"\0"
                                        for m, path in mine_list))
-        finally:
-            fcntl.flock(guard, fcntl.LOCK_UN)
         yield
     finally:
         if mine_fd is not None:
             # removed under the registry lock: a checker never opens a claim mid-removal
-            fcntl.flock(guard, fcntl.LOCK_EX)
-            try:
+            with _claim_registry(home):
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(mine)   # type: ignore[arg-type]
                 os.close(mine_fd)
-            finally:
-                fcntl.flock(guard, fcntl.LOCK_UN)
-        os.close(guard)
 
 
 def check_homes_clear_of_mounts(seed_home: "Path | str | None", capture_home: "Path | str | None",

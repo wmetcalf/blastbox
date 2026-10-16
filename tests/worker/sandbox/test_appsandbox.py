@@ -2115,9 +2115,9 @@ class TestSourcesArePinnedAsClaimed:
         seen: list = []
         real = asb.hold_rw_sources
 
-        def spy(home, sources, reads=()):
+        def spy(home, sources, reads=(), views=()):
             seen.extend(sources)
-            return real(home, sources, reads)
+            return real(home, sources, reads, views)
         monkeypatch.setattr(asb, "hold_rw_sources", spy)
         sb.run(SandboxRequest(argv=["/usr/bin/true"], rw_mounts=[Mount(link, link)]))
         assert link in seen
@@ -2128,8 +2128,8 @@ class TestSourcesArePinnedAsClaimed:
         real = asb.hold_rw_sources
 
         @contextlib.contextmanager
-        def repoint_then_hold(home, sources, reads=()):
-            with real(home, sources, reads):
+        def repoint_then_hold(home, sources, reads=(), views=()):
+            with real(home, sources, reads, views):
                 link.unlink()
                 link.symlink_to(b)          # another run re-points it once the claim is in
                 yield
@@ -2238,9 +2238,9 @@ class TestReadOnlySourcesArePinned:
         seen: dict = {}
         real = asb.hold_rw_sources
 
-        def spy(home, sources, reads=()):
+        def spy(home, sources, reads=(), views=()):
             seen["reads"] = list(reads)
-            return real(home, sources, reads)
+            return real(home, sources, reads, views)
         monkeypatch.setattr(asb, "hold_rw_sources", spy)
         sb.run(SandboxRequest(argv=["/usr/bin/true"], ro_mounts=[Mount(link, link)]))
         assert link in seen["reads"]
@@ -2261,8 +2261,8 @@ class TestReadOnlySourcesArePinned:
         real = asb.hold_rw_sources
 
         @contextlib.contextmanager
-        def repoint_then_hold(home, sources, reads=()):
-            with real(home, sources, reads):
+        def repoint_then_hold(home, sources, reads=(), views=()):
+            with real(home, sources, reads, views):
                 link.unlink()
                 link.symlink_to(b)
                 yield
@@ -2487,9 +2487,9 @@ class TestContentChecksRunUnderTheClaim:
         real = asb.hold_rw_sources
 
         @contextlib.contextmanager
-        def late(home, sources, reads=()):
+        def late(home, sources, reads=(), views=()):
             act()
-            with real(home, sources, reads):
+            with real(home, sources, reads, views):
                 yield
 
         monkeypatch.setattr(asb, "hold_rw_sources", late)
@@ -2539,3 +2539,134 @@ class TestEveryRootIsProtectedAcrossAgents:
         root = tmp_path / "root"
         asb.prepare(root, slots=1, ro_paths=[], runner=_fake_runner([]), home=home)
         assert root.resolve() in mc.protected_roots(home)
+
+
+class TestPreparedReadGrantsAreClaimedAsViews:
+    """Codex P1 (#198): every launcher gets the manifest's --ro grants, so a run claims each as
+    a view for its whole run -- another agent's Seatbelt scratch base under one conflicts."""
+
+    def _grant(self, tmp_path):
+        grant = tmp_path / "engine"
+        grant.mkdir()
+        return grant
+
+    def test_the_prepared_grants_are_claimed_as_views(self, tmp_path, monkeypatch):
+        grant = self._grant(tmp_path)
+        sb, _ = _sb_with(tmp_path, ro_paths=[grant])
+        seen: dict = {}
+        real = asb.hold_rw_sources
+
+        def spy(home, sources, reads=(), views=()):
+            seen["views"] = [Path(v).resolve() for v in views]
+            return real(home, sources, reads, views)
+        monkeypatch.setattr(asb, "hold_rw_sources", spy)
+        assert sb.run(SandboxRequest(argv=["/usr/bin/true"])).exit_code == 0
+        assert grant.resolve() in seen["views"]
+
+    def test_a_scratch_base_under_a_grant_refuses_the_run(self, tmp_path):
+        grant = self._grant(tmp_path)
+        sb, home = _sb_with(tmp_path, ro_paths=[grant])
+        # the same per-user registry the backend uses (its home)
+        with mc.hold_path_claims([("base", grant / "scratch")], "seatbelt", home):
+            with pytest.raises(SandboxError, match="in use by another run"):
+                sb.run(SandboxRequest(argv=["/usr/bin/true"]))
+
+    def test_a_running_slot_keeps_a_scratch_base_out_of_its_grants(self, tmp_path):
+        grant = self._grant(tmp_path)
+        sb, home = _sb_with(tmp_path, ro_paths=[grant])
+        with asb.hold_rw_sources(home, [], [], [Path(p) for p in sb.manifest.ro_paths]):
+            with pytest.raises(SandboxError, match="in use by another run"):
+                with mc.hold_path_claims([("base", grant / "scratch")], "seatbelt", home):
+                    pass
+
+
+class TestRootsRegisterAgainstLiveClaims:
+    """Codex P1 (#198): prepare and backend load register the root under the claim registry's
+    lock, refused while a live run holds a path over it; a claim over a prepared root is
+    refused under the same lock."""
+
+    def test_prepare_under_a_live_claim_is_refused(self, tmp_path):
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        with mc.hold_path_claims([("live", shared)], "seatbelt"):
+            with pytest.raises(SandboxError, match="live run holds"):
+                asb.prepare(shared / "root", slots=1, ro_paths=[], runner=_fake_runner([]))
+        assert not [r for r in mc.protected_roots() if shared.resolve() in r.parents]
+
+    def test_a_claim_over_a_prepared_root_is_refused(self, tmp_path):
+        sb, _ = _sb_with(tmp_path)
+        with pytest.raises(SandboxError, match="native sandbox root"):
+            with mc.hold_path_claims([("live", tmp_path)], "seatbelt"):
+                pass
+        with mc.hold_path_claims([("base", tmp_path)], "seatbelt"):
+            pass
+
+    def test_loading_under_a_live_claim_is_unavailable(self, tmp_path):
+        root = _fake_root(tmp_path)
+        home = tmp_path / "home"
+        for entry in mc.ROOT_REGISTRY_DIR.glob("*.root"):
+            entry.unlink()                  # as if pruned while the root was briefly gone
+        # the same per-user registry the backend loads with (its home)
+        with mc.hold_path_claims([("live", tmp_path)], "seatbelt", home):
+            with pytest.raises(SandboxUnavailable, match="live run holds"):
+                asb.AppSandboxSandbox(root=root, popen=_Popen(), home=home,
+                                      platform_ok=True, verify=False, slot_wait_s=0)
+
+
+class TestACopyBackWhoseJournalCannotStartLeavesNothing:
+    """Codex P2 (#198): if the swap's journal (or its `old` dir) can't be set up, no host entry
+    has moved: the replacement is removed, so no unrecorded hidden tree is left in the mount
+    for every later run to refuse it over."""
+
+    def _setup(self, tmp_path):
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        (dest / "orig").write_text("o")
+        new = dest / f"{mc.COPY_BACK_MARK}abcd"
+        new.mkdir()
+        (new / "fresh").write_text("n")
+        return dest, new, dest / f"{mc.COPY_BACK_MARK}old-abcd"
+
+    def _marks(self, dest):
+        return [p.name for p in dest.iterdir() if p.name.startswith(mc.COPY_BACK_MARK)]
+
+    def test_a_journal_that_cannot_be_written(self, tmp_path, monkeypatch):
+        dest, new, old = self._setup(tmp_path)
+
+        def full(*a, **k):
+            raise OSError(28, "No space left on device")
+        monkeypatch.setattr(mc, "CopyBackJournal", full)
+        with pytest.raises(OSError, match="No space"):
+            asb.AppSandboxSandbox._swap_children(dest, new, old)
+        assert self._marks(dest) == []
+        assert sorted(p.name for p in dest.iterdir()) == ["orig"]
+        assert mc.clear_stale_copy_backs(dest) is None
+
+    def test_a_journal_that_cannot_advance(self, tmp_path, monkeypatch):
+        dest, new, old = self._setup(tmp_path)
+
+        def stuck(self, phase, **fields):
+            raise OSError(5, "Input/output error")
+        monkeypatch.setattr(mc.CopyBackJournal, "advance", stuck)
+        with pytest.raises(OSError, match="Input/output"):
+            asb.AppSandboxSandbox._swap_children(dest, new, old)
+        assert self._marks(dest) == []
+        assert list(mc.COPYBACK_JOURNAL_DIR.glob("*.json")) == []
+
+    def test_the_run_fails_and_the_next_one_is_not_refused(self, tmp_path, monkeypatch):
+        sb, _ = _sb_with(tmp_path)
+        dest = tmp_path / "mount"
+        dest.mkdir()
+        (dest / "orig").write_text("o")
+        real = mc.CopyBackJournal
+
+        def full(*a, **k):
+            raise OSError(28, "No space left on device")
+        monkeypatch.setattr(mc, "CopyBackJournal", full)
+        with pytest.raises((OSError, SandboxError)):
+            sb.run(SandboxRequest(argv=["/usr/bin/true"], rw_mounts=[Mount(dest, dest)]))
+        assert self._marks(dest) == []
+        monkeypatch.setattr(mc, "CopyBackJournal", real)
+        r = sb.run(SandboxRequest(argv=["/usr/bin/true"], rw_mounts=[Mount(dest, dest)]))
+        assert r.exit_code == 0, r.stderr
+        assert (dest / "orig").read_text() == "o"

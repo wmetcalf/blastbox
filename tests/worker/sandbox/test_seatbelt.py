@@ -1162,3 +1162,23 @@ class TestReadOnlyGrantsAndOtherRunsScratch:
             self._sb(tmp_path / "mine", calls).run(SandboxRequest(
                 argv=["/bin/echo"], rw_mounts=[Mount(out, out)]))
         assert calls == []
+
+
+class TestPathsInsideAnyContainerAreRefused:
+    """Codex P1 (#198): Seatbelt knows no slot, so it refuses every path inside
+    ~/Library/Containers -- another agent's live slot Data among them -- before launching."""
+
+    @pytest.mark.parametrize("kind", ["ro", "rw", "seed_home", "capture_home"])
+    def test_a_path_in_a_container_is_refused(self, tmp_path, monkeypatch, kind):
+        containers = tmp_path / "home" / "Library" / "Containers"
+        data = containers / "io.other.slot0" / "Data"
+        data.mkdir(parents=True)
+        monkeypatch.setattr(mc, "containers_dir", lambda home=None: containers)
+        calls: list = []
+        req = {"ro": dict(ro_mounts=[Mount(data, data)]),
+               "rw": dict(rw_mounts=[Mount(data, data)]),
+               "seed_home": dict(seed_home=data),
+               "capture_home": dict(capture_home=data)}[kind]
+        with pytest.raises(SandboxError, match="every App Sandbox slot's container"):
+            _plain_sb(tmp_path / "s", calls).run(SandboxRequest(argv=["/bin/echo"], **req))
+        assert calls == []

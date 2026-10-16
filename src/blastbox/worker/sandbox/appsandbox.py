@@ -680,18 +680,20 @@ def _rw_registry_dir(home: Path) -> Path:
     return mc.path_claims_dir(home)
 
 
-def hold_rw_sources(home: Path, sources: list[Path],
-                    reads: Iterable[Path] = ()) -> contextlib.AbstractContextManager[None]:
-    """Claim the writable ``sources`` (copy-back and capture destinations) for writing and the
-    ``reads`` (seed) for reading, in the per-user registry both native backends share, for the
-    whole run (see :func:`mc.hold_path_claims`).
+def hold_rw_sources(home: Path, sources: list[Path], reads: Iterable[Path] = (),
+                    views: Iterable[Path] = ()) -> contextlib.AbstractContextManager[None]:
+    """Claim the writable ``sources`` (copy-back and capture destinations) for writing, the
+    ``reads`` (seed, read-only sources) for reading and the ``views`` (the manifest's prepared
+    read-only grants, which the child reads live) as views, in the per-user registry both
+    native backends share, for the whole run (see :func:`mc.hold_path_claims`).
 
     Each run stages its OWN snapshot of a writable mount and replaces the host tree from it
     after: two runs on one tree (in any slot, any root, either backend) would each copy back a
     tree without the other's writes, silently undoing them -- bind mounts would have shared one
     tree. So such runs don't overlap; the second is refused rather than queued."""
     return mc.hold_path_claims([*(("write", p) for p in sources),
-                                *(("read", p) for p in reads)], "appsandbox", home)
+                                *(("read", p) for p in reads),
+                                *(("view", p) for p in views)], "appsandbox", home)
 
 
 @contextlib.contextmanager
@@ -1004,7 +1006,7 @@ class AppSandboxSandbox:
         # case the entry was pruned while the root was briefly gone.
         try:
             mc.register_protected_root(self._root, ".", self._home)
-        except OSError as exc:
+        except (OSError, SandboxError) as exc:
             raise SandboxUnavailable(f"appsandbox: can't register root {self._root} in the "
                                      f"shared state: {exc}") from None
         # Copy-backs a dead worker left mid-swap are finished or undone now, at agent start
@@ -1189,7 +1191,13 @@ class AppSandboxSandbox:
         # so a run writing that tree meanwhile (or holding a link on the way to it) conflicts.
         reads = [*([pins.seed.given] if pins.seed is not None else []),
                  *(p.given for p in pins.ro)]
-        with hold_rw_sources(self._home, claimed, reads), self._acquire_slot() as slot:
+        # The prepared --ro grants too: every launcher gets them, so the child can list and
+        # read them live for the whole run -- another agent's Seatbelt scratch under one (say
+        # --ro /private/tmp) would be readable. As views they conflict with such a scratch
+        # base (mc.CLAIM_MODES), so neither run starts over the other.
+        views = [Path(p) for p in self._manifest.ro_paths]
+        with hold_rw_sources(self._home, claimed, reads, views), \
+                self._acquire_slot() as slot:
             # What was checked is what is claimed: a link repointed before the claim landed is
             # caught here, one repointed later at each use.
             for ro_pin in pins.ro:
@@ -1498,13 +1506,29 @@ class AppSandboxSandbox:
                               leftovers: mc.Leftovers | None = None) -> None:
         # The mount root is kept (as a bind mount would), but the swap's renames move its
         # modification time: restored, at the end, to the times of the tree the child left.
-        times = os.stat(new, follow_symlinks=False)
         # Journalled (mc.CopyBackJournal) before each phase: a worker that dies between these
         # renames -- killed, or retiring past its budget -- leaves a record the next worker
         # uses to put `dest` back together (fully old or fully new), never part-swapped.
-        journal = mc.CopyBackJournal(dest, new, old, times)
-        os.mkdir(old, 0o700)
-        journal.advance("out", old_ino=os.lstat(old).st_ino)
+        # If the journal (or `old`) can't even be set up -- the state directory full, an I/O
+        # error -- no host entry has moved yet: the replacement is removed here, or it would be
+        # left in the host mount unrecorded, and every later run would refuse the mount over it.
+        journal: mc.CopyBackJournal | None = None
+        made_old = False
+        try:
+            times = os.stat(new, follow_symlinks=False)
+            journal = mc.CopyBackJournal(dest, new, old, times)
+            os.mkdir(old, 0o700)
+            made_old = True
+            journal.advance("out", old_ino=os.lstat(old).st_ino)
+        except BaseException:
+            mc.remove_tree(new)
+            if made_old:
+                with contextlib.suppress(OSError):
+                    os.rmdir(old)
+            if journal is not None:
+                with contextlib.suppress(OSError):
+                    journal.close()
+            raise
         moved_out: list[str] = []
         moved_in: list[str] = []
         try:

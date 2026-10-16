@@ -3017,3 +3017,85 @@ class TestBaseClaimsConflictWithEnclosingReaders:
             for mode in ("write", "live", "read", "view"):
                 with mc.hold_path_claims([(mode, tmp_path / "d")], "b"):
                     pass
+
+
+class TestRootRegistrationIsAtomicWithClaims:
+    """Codex P1 (#198): a root is registered under the claim registry's lock and refused while
+    a live run holds a path over or inside it (that run would keep its grant to the new root);
+    and a later claim reaching a registered root is refused under the same lock."""
+
+    def test_a_root_under_a_live_claim_is_refused(self, tmp_path):
+        shared = tmp_path / "shared"
+        (shared / "root").mkdir(parents=True)
+        with mc.hold_path_claims([("live", shared)], "seatbelt"):
+            with pytest.raises(SandboxError, match="live run holds"):
+                mc.register_protected_root(shared / "root", ".")
+        assert (shared / "root").resolve() not in mc.protected_roots()
+
+    def test_a_root_holding_a_claimed_path_is_refused(self, tmp_path):
+        (tmp_path / "root" / "inside").mkdir(parents=True)
+        with mc.hold_path_claims([("read", tmp_path / "root" / "inside")], "x"):
+            with pytest.raises(SandboxError, match="live run holds"):
+                mc.register_protected_root(tmp_path / "root", ".")
+
+    def test_a_scratch_base_holding_the_root_does_not_block_it(self, tmp_path):
+        (tmp_path / "root").mkdir()
+        with mc.hold_path_claims([("base", tmp_path)], "seatbelt"):
+            mc.register_protected_root(tmp_path / "root", ".")
+        assert (tmp_path / "root").resolve() in mc.protected_roots()
+
+    def test_once_the_run_is_done_the_root_registers(self, tmp_path):
+        (tmp_path / "root").mkdir()
+        with mc.hold_path_claims([("live", tmp_path)], "seatbelt"):
+            pass
+        mc.register_protected_root(tmp_path / "root", ".")
+        assert (tmp_path / "root").resolve() in mc.protected_roots()
+
+    @pytest.mark.parametrize("mode", ["write", "live", "read", "view"])
+    def test_a_claim_reaching_a_registered_root_is_refused(self, tmp_path, mode):
+        root = tmp_path / "root"
+        (root / "slots").mkdir(parents=True)
+        mc.register_protected_root(root, ".")
+        for p in (tmp_path, root, root / "slots"):
+            with pytest.raises(SandboxError, match="native sandbox root"):
+                with mc.hold_path_claims([(mode, p)], "x"):
+                    pass
+        assert list(mc.PATH_CLAIM_DIR.glob("*.claim")) == []
+
+    def test_a_scratch_base_is_refused_only_in_or_at_the_root(self, tmp_path):
+        root = tmp_path / "root"
+        root.mkdir()
+        mc.register_protected_root(root, ".")
+        with mc.hold_path_claims([("base", tmp_path)], "seatbelt"):
+            pass
+        for p in (root, root / "s"):
+            with pytest.raises(SandboxError, match="native sandbox root"):
+                with mc.hold_path_claims([("base", p)], "seatbelt"):
+                    pass
+
+
+class TestEveryContainerPathIsRefused:
+    """Codex P1 (#198): a path INSIDE ~/Library/Containers -- some app's container, possibly a
+    live slot of another root or agent -- is refused like the directory itself, in either
+    spelling."""
+
+    def _containers(self, tmp_path, monkeypatch):
+        containers = tmp_path / "home" / "Library" / "Containers"
+        (containers / "io.other.slot3" / "Data").mkdir(parents=True)
+        monkeypatch.setattr(mc, "containers_dir", lambda home=None: containers)
+        return containers
+
+    def test_inside_holding_and_equal_are_refused(self, tmp_path, monkeypatch):
+        containers = self._containers(tmp_path, monkeypatch)
+        for p in (containers / "io.other.slot3" / "Data", containers / "io.other.slot3",
+                  containers, containers.parent):
+            with pytest.raises(SandboxError, match="every App Sandbox slot's container"):
+                mc.check_clear_of_containers([("mount", p)], "x")
+        (tmp_path / "elsewhere").mkdir()
+        mc.check_clear_of_containers([("mount", tmp_path / "elsewhere")], "x")
+
+    def test_a_spelling_through_a_symlink_is_refused(self, tmp_path, monkeypatch):
+        containers = self._containers(tmp_path, monkeypatch)
+        (tmp_path / "link").symlink_to(containers / "io.other.slot3")
+        with pytest.raises(SandboxError, match="every App Sandbox slot's container"):
+            mc.check_clear_of_containers([("seed_home", tmp_path / "link" / "Data")], "x")
