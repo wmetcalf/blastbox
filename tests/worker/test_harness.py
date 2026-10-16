@@ -448,3 +448,48 @@ class TestPrecheckRunsBeforeTheInputIsHandedOver:
         meta, ledger = self._run(tmp_path, eng)
         assert meta["status"] == "ok" and eng.detonated
         assert not ledger.rejected_before_parse
+
+
+class TestMetadataIsNeverWrittenThroughALink:
+    """The output dir is the engine's to write (on a native macOS worker, a sandboxed parser's
+    writable mount): a `metadata.json` it leaves as a symlink must be replaced, never written
+    through -- the harness runs unsandboxed and could otherwise truncate any file it can write."""
+
+    def _engine(self, plant):
+        class _Planting(_NoopEngine):
+            def detonate(self, input: Path, outdir: Path, limits: Limits) -> DetonationResult:
+                result = super().detonate(input, outdir, limits)
+                plant(outdir / "metadata.json")
+                return result
+        return _Planting()
+
+    def _run(self, tmp_path, engine):
+        inp = tmp_path / "in" / "doc.docx"
+        inp.parent.mkdir()
+        inp.write_bytes(b"doc")
+        out = tmp_path / "out"
+        out.mkdir()
+        return run_detonation(engine, input_path=inp, output_dir=out, limits=_limits()), out
+
+    def test_a_planted_symlink_is_replaced_not_followed(self, tmp_path: Path) -> None:
+        victim = tmp_path / "victim"
+        victim.write_text("host secret")
+        rc, out = self._run(tmp_path, self._engine(lambda p: p.symlink_to(victim)))
+        assert rc == 0
+        assert victim.read_text() == "host secret"
+        meta = out / "metadata.json"
+        assert not meta.is_symlink() and meta.is_file()
+        from blastbox.contract import envelope_from_json
+        assert envelope_from_json(meta.read_bytes()).status == "ok"
+
+    def test_a_dangling_symlink_creates_nothing_at_its_target(self, tmp_path: Path) -> None:
+        target = tmp_path / "would-be-created"
+        rc, out = self._run(tmp_path, self._engine(lambda p: p.symlink_to(target)))
+        assert rc == 0
+        assert not target.exists()
+        assert not (out / "metadata.json").is_symlink()
+
+    def test_no_temp_file_is_left_behind(self, tmp_path: Path) -> None:
+        rc, out = self._run(tmp_path, _NoopEngine())
+        assert rc == 0
+        assert sorted(p.name for p in out.iterdir()) == ["metadata.json", "page-001.png"]

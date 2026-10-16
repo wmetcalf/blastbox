@@ -2214,3 +2214,126 @@ class TestCopiedBackPathsStayClearOfWhatRunsExecute:
         sb, _ = _sb_with(tmp_path, ro_paths=[engine])
         r = sb.run(SandboxRequest(argv=[str(exe)], rw_mounts=[Mount(out, out)]))
         assert r.exit_code == 0, r.stderr
+
+
+class TestReadOnlySourcesArePinned:
+    """Read-only sources are claimed for reading as spelled and staged from the target they
+    resolved to then, re-verified just before the copy: a link a concurrent run re-points
+    can't make the unsandboxed copier stage some other host tree into the child's view."""
+
+    def _tree(self, tmp_path):
+        a = tmp_path / "a"
+        b = tmp_path / "b"
+        for d in (a, b):
+            d.mkdir()
+            (d / "f").write_text(d.name)
+        link = tmp_path / "shared" / "link"
+        link.parent.mkdir()
+        link.symlink_to(a)
+        return a, b, link
+
+    def test_ro_sources_are_claimed_for_reading_as_spelled(self, tmp_path, monkeypatch):
+        sb, _ = _sb_with(tmp_path)
+        _a, _b, link = self._tree(tmp_path)
+        seen: dict = {}
+        real = asb.hold_rw_sources
+
+        def spy(home, sources, reads=()):
+            seen["reads"] = list(reads)
+            return real(home, sources, reads)
+        monkeypatch.setattr(asb, "hold_rw_sources", spy)
+        sb.run(SandboxRequest(argv=["/usr/bin/true"], ro_mounts=[Mount(link, link)]))
+        assert link in seen["reads"]
+
+    def test_a_writer_of_the_tree_refuses_the_run(self, tmp_path):
+        popen = _Popen()
+        sb, home = _sb_with(tmp_path, popen=popen)
+        a, _b, _link = self._tree(tmp_path)
+        with asb.hold_rw_sources(home, [a]):            # another run copies back into it
+            with pytest.raises(SandboxError, match="in use by another run"):
+                sb.run(SandboxRequest(argv=["/usr/bin/true"], ro_mounts=[Mount(a, a)]))
+        assert popen.calls == []
+
+    def test_a_link_repointed_after_the_claim_is_refused(self, tmp_path, monkeypatch):
+        popen = _Popen()
+        sb, _ = _sb_with(tmp_path, popen=popen)
+        _a, b, link = self._tree(tmp_path)
+        real = asb.hold_rw_sources
+
+        @contextlib.contextmanager
+        def repoint_then_hold(home, sources, reads=()):
+            with real(home, sources, reads):
+                link.unlink()
+                link.symlink_to(b)
+                yield
+        monkeypatch.setattr(asb, "hold_rw_sources", repoint_then_hold)
+        with pytest.raises(SandboxError, match="changed after it was checked"):
+            sb.run(SandboxRequest(argv=["/usr/bin/true"], ro_mounts=[Mount(link, link)]))
+        assert popen.calls == []
+
+    def test_a_link_repointed_just_before_staging_is_refused(self, tmp_path, monkeypatch):
+        popen = _Popen()
+        sb, _ = _sb_with(tmp_path, popen=popen)
+        _a, b, link = self._tree(tmp_path)
+        real_check = asb._check_ro_rw_disjoint
+
+        def repoint_then_check(request):     # runs in the slot, after run()'s own verify
+            link.unlink()
+            link.symlink_to(b)
+            return real_check(request)
+        monkeypatch.setattr(asb, "_check_ro_rw_disjoint", repoint_then_check)
+        with pytest.raises(SandboxError, match="changed after it was checked"):
+            sb.run(SandboxRequest(argv=["/usr/bin/true"], ro_mounts=[Mount(link, link)]))
+        assert popen.calls == []
+
+
+class TestEachCopyBackChecksOnlyMountsStillPending:
+    """Copy-back re-verifies the host trees it is about to replace -- not the ones this run has
+    already replaced: a file mount's commit gives it a new inode, which is this run's own
+    write, not an external change."""
+
+    def test_a_file_mount_committed_first_does_not_fail_the_next(self, tmp_path):
+        sb, _ = _sb_with(tmp_path)
+        f = tmp_path / "note.txt"
+        f.write_text("old")
+        d = tmp_path / "dir"
+        d.mkdir()
+        (d / "x").write_text("old")
+        r = sb.run(SandboxRequest(
+            argv=["/bin/sh", "-c", 'echo new > "$0"; echo new > "$1/x"', str(f), str(d)],
+            rw_mounts=[Mount(f, f), Mount(d, d)]))
+        assert r.exit_code == 0
+        assert f.read_text() == "new\n"
+        assert (d / "x").read_text() == "new\n"
+
+    def test_two_file_mounts_both_copy_back(self, tmp_path):
+        sb, _ = _sb_with(tmp_path)
+        f, g = tmp_path / "f.txt", tmp_path / "g.txt"
+        f.write_text("old")
+        g.write_text("old")
+        r = sb.run(SandboxRequest(
+            argv=["/bin/sh", "-c", 'echo F > "$0"; echo G > "$1"', str(f), str(g)],
+            rw_mounts=[Mount(f, f), Mount(g, g)]))
+        assert r.exit_code == 0
+        assert f.read_text() == "F\n" and g.read_text() == "G\n"
+
+    def test_a_pending_mount_changed_externally_is_still_refused(self, tmp_path, monkeypatch):
+        sb, _ = _sb_with(tmp_path)
+        f, g = tmp_path / "f.txt", tmp_path / "g.txt"
+        f.write_text("old")
+        g.write_text("old")
+        real_commit = asb._CopyBack.commit
+        state = {"n": 0}
+
+        def commit_then_swap_g(self_):
+            real_commit(self_)
+            state["n"] += 1
+            if state["n"] == 1:                # after f's commit, g is replaced from outside
+                g.unlink()
+                g.write_text("outside")
+        monkeypatch.setattr(asb._CopyBack, "commit", commit_then_swap_g)
+        with pytest.raises(SandboxError, match="changed after it was checked"):
+            sb.run(SandboxRequest(
+                argv=["/bin/sh", "-c", 'echo F > "$0"; echo G > "$1"', str(f), str(g)],
+                rw_mounts=[Mount(f, f), Mount(g, g)]))
+        assert g.read_text() == "outside"

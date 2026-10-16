@@ -5,6 +5,7 @@ platform-independent.
 """
 from __future__ import annotations
 
+import contextlib
 import io
 import os
 import subprocess
@@ -820,8 +821,11 @@ class TestSeatbeltClaimsItsPaths:
             argv=["/bin/echo"], rw_mounts=[Mount(data, data)], seed_home=seed,
             capture_home=cap))
         modes = {(m, Path(p).resolve()) for m, p in seen[-1]}
-        assert modes == {("live", data.resolve()), ("write", cap.resolve()),
-                         ("read", seed.resolve())}
+        # and the scratch root it creates the run's scratch in (see TestScratchRootIsPinned)
+        bases = {p for m, p in modes if m == "base"}
+        assert modes - {("base", b) for b in bases} == {
+            ("live", data.resolve()), ("write", cap.resolve()), ("read", seed.resolve())}
+        assert len(bases) == 1
 
     @pytest.mark.parametrize("held,field", [("write", "rw"), ("write", "seed"),
                                             ("live", "capture"), ("live", "seed")])
@@ -1025,3 +1029,70 @@ class TestWritableMountsStayClearOfTheExecutable:
             self._sb(tmp_path, calls).run(SandboxRequest(argv=[str(exe)],
                                                          rw_mounts=[Mount(res, res)]))
         assert calls == []
+
+
+class TestScratchRootIsPinned:
+    """BLASTBOX_MACOS_SCRATCH_DIR (or the temp dir) is resolved once, claimed, and the run's
+    scratch created through a descriptor pinned to it: a link on the way that a concurrent run's
+    writable mount holds is refused, never followed into that run's grant."""
+
+    def _sb(self, base, calls):
+        def popen(argv, **kw):
+            p = _FakeProc(argv, **kw)
+            calls.append(p)
+            return p
+        return SeatbeltSandbox(popen=popen, platform_ok=True, sandbox_exec="/bin/sh",
+                               scratch_base=base)
+
+    def test_a_root_spelled_through_another_runs_writable_mount_is_refused(self, tmp_path):
+        shared = tmp_path / "shared"            # another live run's writable mount
+        real = tmp_path / "real"
+        shared.mkdir()
+        real.mkdir()
+        (shared / "link").symlink_to(real)
+        calls: list = []
+        with mc.hold_path_claims([("live", shared)], "other"):
+            with pytest.raises(SandboxError, match="in use by another run"):
+                self._sb(shared / "link", calls).run(SandboxRequest(argv=["/bin/echo"]))
+        assert calls == []
+        assert list(real.iterdir()) == []
+
+    def test_a_root_inside_another_runs_writable_mount_is_refused(self, tmp_path):
+        shared = tmp_path / "shared"
+        (shared / "scratch").mkdir(parents=True)
+        calls: list = []
+        with mc.hold_path_claims([("live", shared)], "other"):
+            with pytest.raises(SandboxError, match="in use by another run"):
+                self._sb(shared / "scratch", calls).run(SandboxRequest(argv=["/bin/echo"]))
+        assert calls == []
+
+    def test_writers_inside_the_root_do_not_block_it(self, tmp_path):
+        base = tmp_path / "scratch"
+        (base / "job").mkdir(parents=True)
+        calls: list = []
+        with mc.hold_path_claims([("live", base / "job")], "other"):
+            self._sb(base, calls).run(SandboxRequest(argv=["/bin/echo"]))
+        assert calls
+
+    def test_the_scratch_is_made_in_the_root_resolved_at_the_check(self, tmp_path,
+                                                                    monkeypatch):
+        a, b = tmp_path / "a", tmp_path / "b"
+        a.mkdir()
+        b.mkdir()
+        link = tmp_path / "link"
+        link.symlink_to(a)
+        real_hold = mc.hold_path_claims
+
+        @contextlib.contextmanager
+        def repoint_then_hold(claims, *args, **kw):
+            with real_hold(claims, *args, **kw):
+                link.unlink()
+                link.symlink_to(b)          # re-pointed once the claim is in
+                yield
+        monkeypatch.setattr(mc, "hold_path_claims", repoint_then_hold)
+        calls: list = []
+        self._sb(link, calls).run(SandboxRequest(argv=["/bin/echo"]))
+        assert calls
+        profile_args = " ".join(calls[0].argv)
+        assert str(a.resolve()) in profile_args and str(b.resolve()) not in profile_args
+        assert list(b.iterdir()) == []

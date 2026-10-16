@@ -2805,3 +2805,75 @@ class TestSymlinkExtendedAttributesAreCopied:
                 mc._copy_link_xattrs("l", dfd, st, tmp_path / "x", mc.CopyBudget(1 << 20), d / "l")
         finally:
             os.close(dfd)
+
+
+class TestScratchIsMadeThroughAPinnedRoot:
+    """The scratch root's spelling can run through a link a concurrent run can re-point: the
+    scratch is created through a descriptor opened on the RESOLVED root, one component at a
+    time without following links, so it lands where the checked root is or nowhere."""
+
+    def test_a_link_on_the_way_is_refused_not_followed(self, tmp_path):
+        real = tmp_path.resolve()
+        (real / "target").mkdir()
+        (real / "link").symlink_to(real / "target")
+        with pytest.raises(SandboxError, match="not a plain directory path"):
+            mc.open_dir_no_follow(real / "link")
+        fd = mc.open_dir_no_follow(real / "target")
+        os.close(fd)
+
+    def test_the_scratch_lands_in_the_pinned_root_or_nowhere(self, tmp_path):
+        real = tmp_path.resolve()
+        a, b = real / "a", real / "b"
+        a.mkdir()
+        b.mkdir()
+        fd = mc.open_dir_no_follow(a)
+        try:
+            # another run moves the checked root away and puts a link to its own tree there
+            a.rename(real / "moved")
+            a.symlink_to(b)
+            with pytest.raises(SandboxError, match="not the directory just created"):
+                mc.make_scratch_at(fd, a)
+        finally:
+            os.close(fd)
+        assert list(b.iterdir()) == []                  # nothing created in the other tree
+        assert len(list((real / "moved").iterdir())) == 1   # only in the pinned one
+
+    def test_a_scratch_has_its_layout_and_mode(self, tmp_path):
+        real = tmp_path.resolve()
+        fd = mc.open_dir_no_follow(real)
+        try:
+            s = mc.make_scratch_at(fd, real)
+        finally:
+            os.close(fd)
+        assert s.parent == real and s.name.startswith("bb-sbx-")
+        assert stat.S_IMODE(os.lstat(s).st_mode) == 0o700
+        assert (s / "tmp").is_dir() and (s / "Library" / "Caches").is_dir()
+
+
+class TestTheBaseClaimIsDirectional:
+    """A `base` claim (a scratch root) conflicts only with a writer that is it or holds it;
+    writers inside it are just its other children, readers never conflict."""
+
+    @pytest.mark.parametrize("other_mode,where,conflicts", [
+        ("live", "root", True), ("live", "parent", True), ("write", "parent", True),
+        ("live", "child", False), ("write", "child", False), ("read", "parent", False),
+        ("base", "root", False),
+    ])
+    def test_conflicts(self, tmp_path, other_mode, where, conflicts):
+        root = tmp_path / "scratch-root"
+        child = root / "job"
+        child.mkdir(parents=True)
+        other = {"root": root, "parent": tmp_path, "child": child}[where]
+        with mc.hold_path_claims([(other_mode, other)], "other"):
+            ctx = (pytest.raises(SandboxError, match="in use by another run") if conflicts
+                   else contextlib.nullcontext())
+            with ctx:
+                with mc.hold_path_claims([("base", root)], "seatbelt"):
+                    pass
+        # and symmetrically: the base held first, the writer arrives second
+        with mc.hold_path_claims([("base", root)], "seatbelt"):
+            ctx = (pytest.raises(SandboxError, match="in use by another run") if conflicts
+                   else contextlib.nullcontext())
+            with ctx:
+                with mc.hold_path_claims([(other_mode, other)], "other"):
+                    pass

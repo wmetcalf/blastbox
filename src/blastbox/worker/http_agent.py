@@ -31,6 +31,7 @@ import ipaddress
 import json
 import logging
 import os
+import stat
 import signal
 import tarfile
 import tempfile
@@ -472,27 +473,49 @@ class _Handler(BaseHTTPRequestHandler):
                     if entry_cap is not None and entries > entry_cap:
                         spool.close()
                         raise RuntimeError(f"output exceeds {entry_cap} entries (directory bomb?)")
-                    if not f.is_file():
+                    # lstat, not is_file(): the output dir is the engine's (on macOS a sandboxed
+                    # parser's writable mount), and a symlink there must never lead this
+                    # process to read, size or archive a host file the parser couldn't reach.
+                    try:
+                        if not stat.S_ISREG(f.lstat().st_mode):
+                            continue
+                    except FileNotFoundError:
                         continue
                     candidates.append(f)
                     if file_cap is not None and len(candidates) > file_cap:
                         spool.close()
                         raise RuntimeError(f"output exceeds {file_cap} files")
                 for f in sorted(candidates):
-                    # metadata.json is a control file, not a declared artifact -- don't count it toward
-                    # the artifact byte budget (matches the cold trust gate + the host extractor), but DO
-                    # cap it by its OWN budget BEFORE archiving so a buggy engine's huge metadata can't
-                    # fill the worker disk (a second copy lands in the spooled tar) before the host rejects it.
-                    if f.name == "metadata.json" and f.parent == out_dir:
-                        if meta_cap is not None and f.stat().st_size > meta_cap:
+                    # Opened no-follow and sized from that descriptor: an entry swapped for a link
+                    # (or a FIFO) after the walk is refused, never read through.
+                    try:
+                        fd = os.open(f, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                                     | getattr(os, "O_CLOEXEC", 0))
+                    except OSError as exc:
+                        spool.close()
+                        raise RuntimeError(f"output entry {f.relative_to(out_dir)} changed "
+                                           f"while it was archived ({exc.strerror})") from None
+                    with os.fdopen(fd, "rb") as fh:
+                        st = os.fstat(fh.fileno())
+                        if not stat.S_ISREG(st.st_mode):
                             spool.close()
-                            raise RuntimeError(f"metadata.json is {f.stat().st_size} bytes (> {meta_cap})")
-                    else:
-                        total += f.stat().st_size
-                        if cap is not None and total > cap:
-                            spool.close()
-                            raise RuntimeError(f"output exceeds {cap} bytes")
-                    tf.add(f, arcname=str(f.relative_to(out_dir)))
+                            raise RuntimeError(f"output entry {f.relative_to(out_dir)} is not a "
+                                               "regular file")
+                        # metadata.json is a control file, not a declared artifact -- don't count it toward
+                        # the artifact byte budget (matches the cold trust gate + the host extractor), but DO
+                        # cap it by its OWN budget BEFORE archiving so a buggy engine's huge metadata can't
+                        # fill the worker disk (a second copy lands in the spooled tar) before the host rejects it.
+                        if f.name == "metadata.json" and f.parent == out_dir:
+                            if meta_cap is not None and st.st_size > meta_cap:
+                                spool.close()
+                                raise RuntimeError(f"metadata.json is {st.st_size} bytes (> {meta_cap})")
+                        else:
+                            total += st.st_size
+                            if cap is not None and total > cap:
+                                spool.close()
+                                raise RuntimeError(f"output exceeds {cap} bytes")
+                        info = tf.gettarinfo(arcname=str(f.relative_to(out_dir)), fileobj=fh)
+                        tf.addfile(info, fh)
             spool.seek(0)
             return spool
 

@@ -896,15 +896,21 @@ class _Pinned:
 
 
 class _RunPins:
-    """A run's pinned host paths: its writable mounts (in request order), seed and capture."""
+    """A run's pinned host paths: its read-only and writable mounts (each in request order),
+    seed and capture."""
 
     def __init__(self, rw: list[_Pinned], seed: _Pinned | None,
-                 capture: _Pinned | None) -> None:
+                 capture: _Pinned | None, ro: list[_Pinned] | None = None) -> None:
         self.rw, self.seed, self.capture = rw, seed, capture
+        self.ro = ro if ro is not None else []
 
     @classmethod
     def of(cls, request: SandboxRequest) -> "_RunPins":
-        return cls(rw=[_Pinned(Path(m.source), "rw mount") for m in request.rw_mounts],
+        # Read-only sources are pinned too: the unsandboxed copier stages them, so one spelled
+        # through a link a concurrent run can re-point would otherwise copy whatever it now
+        # leads to (the worker's credentials, say) into the child's view.
+        return cls(ro=[_Pinned(Path(m.source), "ro mount") for m in request.ro_mounts],
+                   rw=[_Pinned(Path(m.source), "rw mount") for m in request.rw_mounts],
                    seed=(_Pinned(request.seed_home, "seed_home")
                          if request.seed_home is not None else None),
                    capture=(_Pinned(request.capture_home, "capture_home")
@@ -1160,10 +1166,15 @@ class AppSandboxSandbox:
         # overlapping tree -- whichever committed last would silently discard the other's.
         claimed = [*(p.given for p in pins.rw),
                    *([pins.capture.given] if pins.capture is not None else [])]
-        seed = [pins.seed.given] if pins.seed is not None else []
-        with hold_rw_sources(self._home, claimed, seed), self._acquire_slot() as slot:
+        # Read-only sources are claimed for reading, like the seed: each is copied as a snapshot,
+        # so a run writing that tree meanwhile (or holding a link on the way to it) conflicts.
+        reads = [*([pins.seed.given] if pins.seed is not None else []),
+                 *(p.given for p in pins.ro)]
+        with hold_rw_sources(self._home, claimed, reads), self._acquire_slot() as slot:
             # What was checked is what is claimed: a link repointed before the claim landed is
             # caught here, one repointed later at each use.
+            for ro_pin in pins.ro:
+                ro_pin.verify(must_exist=True)
             rw_sources = [p.verify(must_exist=True) for p in pins.rw]
             for p in (pins.seed, pins.capture):
                 if p is not None:
@@ -1295,7 +1306,7 @@ class AppSandboxSandbox:
             mc.seed_scratch(container, pins.seed.verify(must_exist=True), budget=staging)
 
         mapping: list[tuple[str, str]] = []
-        rw_staged: list[tuple[Path, Path, bool]] = []
+        rw_staged: list[tuple[int, Path, Path, bool]] = []
         # Writable mounts of the same source, or of a source inside another writable mount, are
         # views of ONE host tree: stage only the outermost and point the others into its staged
         # copy, so aliases share state as bind mounts do and one copy-back carries every write
@@ -1318,9 +1329,8 @@ class AppSandboxSandbox:
         # roots before the aliases that point into them, whatever order the request used
         for i, m in sorted(mounts, key=lambda im: im[0] >= n_ro and rw_root[im[0] - n_ro] != im[0] - n_ro):
             j = i - n_ro
-            # writable: the pinned target, re-verified just before it is copied
-            src = (pins.rw[j].verify(must_exist=True) if j >= 0
-                   else Path(m.source).resolve(strict=True))
+            # the pinned target, re-verified just before it is copied (never resolved afresh)
+            src = (pins.rw[j] if j >= 0 else pins.ro[i]).verify(must_exist=True)
             if j >= 0 and rw_root[j] != j:
                 owner = rw_root[j]
                 staged = staged_rw[owner] / src.relative_to(rw_srcs[owner])
@@ -1333,7 +1343,7 @@ class AppSandboxSandbox:
                                   links=rw_links if j >= 0 else None)
                 if j >= 0:
                     staged_rw[j] = staged
-                    rw_staged.append((src, staged, stat.S_ISDIR(os.lstat(src).st_mode)))
+                    rw_staged.append((j, src, staged, stat.S_ISDIR(os.lstat(src).st_mode)))
             mapping.append((str(m.target), str(staged)))
             if str(Path(m.target)) != str(src):
                 mapping.append((str(src), str(staged)))
@@ -1368,18 +1378,26 @@ class AppSandboxSandbox:
         # links on the host) and only then swapped in: a later mount's link must reach an
         # earlier one's copy before that copy has been renamed into place.
         back_links: mc.LinkMap = {}
-        pending: list[_CopyBack] = []
+        pending: list[tuple[int, _CopyBack]] = []
+        committed: set[int] = set()
         try:
-            for src, staged, was_dir in rw_staged:
-                pending.append(self._build_copy_back(staged, src, copy_back, was_dir,
-                                                     leftovers, back_links))
+            for j, src, staged, was_dir in rw_staged:
+                pending.append((j, self._build_copy_back(staged, src, copy_back, was_dir,
+                                                         leftovers, back_links)))
             while pending:
-                # the host tree about to be replaced is still the one claimed and staged
-                for p in pins.rw:
-                    p.verify(must_exist=True)
-                pending.pop(0).commit()
+                # The host trees still to be replaced are still the ones claimed and staged.
+                # Only those: a mount already committed was replaced BY this run (a file
+                # mount's os.replace gives it a new inode, a directory's swap new children),
+                # and an alias inside it went with it -- re-checking them would refuse this
+                # run's own copy-back halfway, after the first mount was already written.
+                for k, p in enumerate(pins.rw):
+                    if rw_root[k] not in committed:
+                        p.verify(must_exist=True)
+                j, item = pending.pop(0)
+                item.commit()
+                committed.add(j)
         finally:
-            for left in pending:
+            for _, left in pending:
                 left.abort()
         ok = result.exit_code == 0 and not result.killed
         if ok and request.capture_home is not None:

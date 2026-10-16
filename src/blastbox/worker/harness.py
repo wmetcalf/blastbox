@@ -31,6 +31,7 @@ from blastbox.contract import (
     Warning,
     seal_envelope,
 )
+from blastbox.contract.envelope import atomic_write_confined
 from blastbox.contract.nodes import Record
 from blastbox.errors import sanitize_public_error
 from blastbox.limits import Limits
@@ -287,9 +288,15 @@ def run_detonation(
 
 
 def _write_meta(output_dir: Path, env: Any) -> int:
-    meta_path = output_dir / "metadata.json"
+    # The output dir is the engine's to write -- on a native macOS worker, a sandboxed parser's
+    # writable mount -- so `metadata.json` may already be a symlink to any file this process can
+    # write (credentials, a launchd plist). A path write would follow it; atomic_write_confined
+    # creates a random O_EXCL|O_NOFOLLOW temp under the dir's descriptor and renames it over the
+    # name, which replaces a planted link instead of writing through it. 0o644 as the host's
+    # own metadata writes: the API may serve it from another uid.
     try:
-        meta_path.write_text(env.model_dump_json(by_alias=True), encoding="utf-8")
+        atomic_write_confined(output_dir, "metadata.json",
+                              env.model_dump_json(by_alias=True).encode("utf-8"), mode=0o644)
     except OSError as write_exc:
         logger.critical("failed to write metadata.json: %s", write_exc)
         return 1

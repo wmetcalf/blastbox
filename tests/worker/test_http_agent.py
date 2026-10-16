@@ -883,3 +883,59 @@ class TestShutdownStopsNewRuns:
         end_shutdown()
         assert not shutting_down()
         unregister_emergency_cleanup(register_emergency_cleanup(lambda: None))
+
+
+class TestTheOutputTarNeverFollowsLinks:
+    """The agent archives the output dir unsandboxed: a symlink an engine (a sandboxed parser,
+    on macOS) left there must not make it read, size or ship a host file it points at."""
+
+    def _post_for_tar(self, engine):
+        import io
+        import tarfile
+        httpd = serve(engine, bind="127.0.0.1", port=0)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        port = httpd.server_address[1]
+        try:
+            with _post(f"http://127.0.0.1:{port}/detonate?name=x.bin", b"MZ") as r:
+                data = r.read()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        with tarfile.open(fileobj=io.BytesIO(data)) as tf:
+            return {m.name: (m, tf.extractfile(m).read() if m.isfile() else None)
+                    for m in tf.getmembers()}
+
+    def test_a_symlink_to_a_host_file_is_not_archived(self, tmp_path):
+        secret = tmp_path / "secret"
+        secret.write_bytes(b"host credentials")
+
+        class _Linking:
+            name = "linker"
+            formats = frozenset({"*"})
+
+            def detonate(self, input: Path, outdir: Path, limits: Limits) -> DetonationResult:
+                (outdir / "loot").symlink_to(secret)
+                (outdir / "sub").mkdir()
+                (outdir / "sub" / "deep").symlink_to(secret)
+                return _one_png_result(outdir)
+
+        members = self._post_for_tar(_Linking())
+        assert "loot" not in members and "sub/deep" not in members
+        assert all(b"host credentials" not in (body or b"") for _, body in members.values())
+        assert "page-001.png" in members and "metadata.json" in members
+
+    def test_a_symlink_to_a_huge_file_does_not_count_against_the_cap(self, tmp_path,
+                                                                     monkeypatch):
+        big = tmp_path / "big"
+        big.write_bytes(b"x" * 4096)
+        monkeypatch.setenv("BLASTBOX_MAX_TOTAL_ARTIFACTS", "1024")
+
+        class _Linking:
+            name = "linker"
+            formats = frozenset({"*"})
+
+            def detonate(self, input: Path, outdir: Path, limits: Limits) -> DetonationResult:
+                (outdir / "big").symlink_to(big)
+                return _one_png_result(outdir)
+
+        assert "big" not in self._post_for_tar(_Linking())

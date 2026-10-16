@@ -111,9 +111,70 @@ def make_scratch(base: Path | None = None) -> Path:
     """
     if base is not None:
         base.mkdir(parents=True, exist_ok=True)
-    scratch = Path(tempfile.mkdtemp(prefix="bb-sbx-", dir=str(base) if base else None)).resolve()
-    (scratch / "tmp").mkdir(mode=0o700)
-    (scratch / "Library" / "Caches").mkdir(mode=0o700, parents=True)
+    real = Path(os.path.realpath(base if base is not None else tempfile.gettempdir()))
+    fd = open_dir_no_follow(real)
+    try:
+        return make_scratch_at(fd, real)
+    finally:
+        os.close(fd)
+
+
+def open_dir_no_follow(real: Path) -> int:
+    """A descriptor for the RESOLVED directory ``real``, opened one component at a time with
+    ``O_NOFOLLOW`` from ``/``: a component that is (now) a symlink raises ``SandboxError``
+    instead of being followed. What the caller then creates relative to it lands in that
+    directory, whatever a link on the way to its spelling is re-pointed to afterwards."""
+    if not real.is_absolute():
+        raise ValueError(f"not absolute: {real}")
+    fd = os.open("/", _OPEN_DIR)
+    try:
+        for part in real.parts[1:]:
+            try:
+                nxt = os.open(part, _OPEN_DIR, dir_fd=fd)
+            except OSError as exc:
+                raise SandboxError(f"{real} is not a plain directory path ({part!r}: "
+                                   f"{exc.strerror})") from None
+            os.close(fd)
+            fd = nxt
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def make_scratch_at(base_fd: int, base_real: Path) -> Path:
+    """Create a fresh 0700 scratch dir inside the directory open as ``base_fd`` (whose resolved
+    path is ``base_real``) -- by descriptor, never by looking ``base_real`` up again -- and
+    return its path, checked to be the directory just made."""
+    for _ in range(100):
+        name = f"bb-sbx-{secrets.token_hex(8)}"
+        try:
+            os.mkdir(name, 0o700, dir_fd=base_fd)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise SandboxError(f"cannot create a scratch dir in {base_real}")
+    dfd = os.open(name, _OPEN_DIR, dir_fd=base_fd)
+    try:
+        os.mkdir("tmp", 0o700, dir_fd=dfd)
+        os.mkdir("Library", 0o700, dir_fd=dfd)
+        lfd = os.open("Library", _OPEN_DIR, dir_fd=dfd)
+        try:
+            os.mkdir("Caches", 0o700, dir_fd=lfd)
+        finally:
+            os.close(lfd)
+        made = os.fstat(dfd)
+    finally:
+        os.close(dfd)
+    scratch = base_real / name
+    try:
+        st = os.lstat(scratch)
+    except OSError:
+        st = None
+    if st is None or (st.st_dev, st.st_ino) != (made.st_dev, made.st_ino):
+        raise SandboxError(f"scratch dir {scratch} is not the directory just created in "
+                           f"{base_real}; refused")
     return scratch
 
 
@@ -2675,9 +2736,26 @@ def paths_overlap(a: Path, b: Path) -> bool:
 #:     writers share one tree as bind mounts would, but a snapshot writer would discard their
 #:     writes and a seed copied from it would be taken mid-write.
 #:   * ``read`` -- copied as a snapshot (a seed). Only writers conflict.
-CLAIM_MODES = ("write", "live", "read")
+#:   * ``base`` -- a directory this run creates its scratch in (Seatbelt's scratch root). Unlike
+#:     the others it is directional: it conflicts only with a writer (``live``/``write``) whose
+#:     path IS it or CONTAINS it -- that run could list, read or change this run's scratch (or
+#:     re-point a link on the way to it). Writers inside it are just its other children.
+CLAIM_MODES = ("write", "live", "read", "base")
 _CLAIM_CONFLICTS = {("write", "write"), ("write", "live"), ("write", "read"),
                     ("live", "write"), ("live", "read"), ("read", "write"), ("read", "live")}
+_WRITERS = ("write", "live")
+
+
+def _claims_conflict(my_mode: str, mine: Path, other_mode: str, other: Path) -> bool:
+    """Whether a claim ``(my_mode, mine)`` can't coexist with another run's ``(other_mode,
+    other)`` (see :data:`CLAIM_MODES`)."""
+    if my_mode == "base" or other_mode == "base":
+        if my_mode == other_mode:
+            return False
+        base, writer, writer_mode = ((mine, other, other_mode) if my_mode == "base"
+                                     else (other, mine, my_mode))
+        return writer_mode in _WRITERS and (base == writer or writer in base.parents)
+    return (my_mode, other_mode) in _CLAIM_CONFLICTS and paths_overlap(mine, other)
 
 
 def path_claims_dir(home: Path | None = None) -> Path:
@@ -2750,8 +2828,7 @@ def hold_path_claims(claims: Iterable[tuple[str, "Path | str"]], backend: str,
                             raw += chunk
                         for other_mode, other in _parse_claim(raw):
                             for my_mode, path in mine_list:
-                                if ((my_mode, other_mode) in _CLAIM_CONFLICTS
-                                        and paths_overlap(path, other)):
+                                if _claims_conflict(my_mode, path, other_mode, other):
                                     raise SandboxError(
                                         f"{backend}: {path} is in use by another run (which "
                                         f"holds {other} for {other_mode}, this run needs it for "

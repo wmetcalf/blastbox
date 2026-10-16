@@ -323,7 +323,15 @@ class SeatbeltSandbox:
         # A mount that holds the scratch root would grant the child every concurrent run's
         # scratch (each 0700, but same-UID): a writable one to change them (and the sweep's
         # restore point for its own), a read-only one to read their inputs, caches and output.
-        base = (self._scratch_base or Path(tempfile.gettempdir())).resolve()
+        # The scratch root, resolved ONCE: the spelling (BLASTBOX_MACOS_SCRATCH_DIR, or the
+        # system temp dir) can run through a symlink a concurrent run's writable mount holds,
+        # which it could re-point between this check and the scratch's creation. Everything
+        # below uses `base`, and the scratch is created through a descriptor pinned to it.
+        base_given = Path(os.path.abspath(os.path.expanduser(
+            self._scratch_base if self._scratch_base is not None else tempfile.gettempdir())))
+        if self._scratch_base is not None:
+            base_given.mkdir(parents=True, exist_ok=True)
+        base = Path(os.path.realpath(base_given))
         for what, p in mounts:
             if p == base or p in base.parents:
                 raise SandboxError(f"seatbelt: {what} {p} contains the scratch root {base}; "
@@ -369,16 +377,28 @@ class SeatbeltSandbox:
         # snapshot (read). An App Sandbox copy-back or another capture over a live mount would
         # discard the child's writes, and a seed taken while a tree is written or swapped would
         # be a mix of both -- so conflicting runs are refused (mc.hold_path_claims).
+        # The scratch root is claimed too (`base`, both spellings): a live run whose writable
+        # mount is or holds it -- or holds a link on the way to it -- could list, read or change
+        # this run's scratch, or re-point the link under it; such a run is refused (and, while
+        # this one lives, one that would be is). Runs writing INSIDE the root are unaffected.
         claims = [*(("live", Path(p)) for p in rw),
                   *(("write", Path(p_)) for p_ in [request.capture_home] if p_ is not None),
-                  *(("read", Path(p_)) for p_ in [request.seed_home] if p_ is not None)]
+                  *(("read", Path(p_)) for p_ in [request.seed_home] if p_ is not None),
+                  ("base", base_given), ("base", base)]
         with mc.hold_path_claims(claims, "seatbelt"):
             token = register_emergency_cleanup(_emergency)
             try:
-                # a section, so a shutdown signal on this thread can't fall between the two lines
-                with teardown_critical():
-                    scratch = mc.make_scratch(self._scratch_base)
-                    state["scratch"] = scratch
+                # Pinned by descriptor, every component opened no-follow: the scratch is made
+                # in the directory that was checked and claimed, never by resolving the spelling
+                # again. (Opened before the critical section: a refusal leaves nothing behind.)
+                base_fd = mc.open_dir_no_follow(base)
+                try:
+                    # a section, so a shutdown signal on this thread can't fall between the lines
+                    with teardown_critical():
+                        scratch = mc.make_scratch_at(base_fd, base)
+                        state["scratch"] = scratch
+                finally:
+                    os.close(base_fd)
                 return self._run_in_scratch(request, exe, exe_real, ro, rw, scratch, leftovers,
                                             ledger)
             finally:
