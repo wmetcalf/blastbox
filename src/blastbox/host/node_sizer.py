@@ -334,7 +334,9 @@ def node_capacity(ram_headroom_frac: float = 0.8,
     """Static node budget from /proc/meminfo + os.cpu_count() (dependency-free).
 
     Uses MemTotal × headroom (not MemAvailable — the pools' own RSS is part of the
-    node's live usage; we budget against total and let the adaptive loop correct)."""
+    node's live usage; we budget against total and let the adaptive loop correct).
+    A host with NO /proc/meminfo at all (macOS) reads physical RAM from sysconf instead —
+    else its budget is 0 and every pool collapses to the 1-slot baseline."""
     total_kib = 0.0
     try:
         with open("/proc/meminfo", encoding="ascii") as fh:
@@ -342,6 +344,8 @@ def node_capacity(ram_headroom_frac: float = 0.8,
                 if line.startswith("MemTotal:"):
                     total_kib = float(line.split()[1])
                     break
+    except FileNotFoundError:
+        total_kib = _sysconf_phys_kib()
     except (OSError, ValueError, IndexError):
         # malformed/empty/mocked /proc/meminfo (missing column, non-numeric) → 0 budget,
         # a safe degradation (every engine gets the viable baseline), not a crashed tick.
@@ -349,6 +353,18 @@ def node_capacity(ram_headroom_frac: float = 0.8,
     ram_mib = (total_kib / 1024.0) * ram_headroom_frac
     vcpus = float(os.cpu_count() or 1) * vcpu_oversubscription
     return NodeBudget(ram_mib=ram_mib, vcpus=vcpus)
+
+
+def _sysconf_phys_kib() -> float:
+    """Physical RAM in KiB via sysconf (macOS has no /proc/meminfo); 0 if unavailable."""
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, OSError, ValueError):
+        return 0.0
+    if pages <= 0 or page_size <= 0:
+        return 0.0
+    return pages * page_size / 1024.0
 
 
 def _mem_available_mib() -> Optional[float]:
