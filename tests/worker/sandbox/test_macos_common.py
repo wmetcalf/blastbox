@@ -2394,3 +2394,131 @@ class TestDoneTreesCarryANonce:
         assert list(mc.DONE_RECORD_DIR.iterdir()) == []
         assert mc.clear_stale_copy_backs(src) == old        # refused, not deleted
         assert old.exists()
+
+
+class TestPathClaimModes:
+    """Codex P2 (#198): one per-user registry of the host paths live runs hold, for both native
+    backends. A whole-tree replacement (write) excludes everything; a tree written in place
+    (live) admits other live writers but no snapshot writer or seed reader; a seed (read)
+    excludes only writers."""
+
+    @pytest.mark.parametrize("held,wanted,conflict", [
+        ("write", "write", True), ("write", "live", True), ("write", "read", True),
+        ("live", "write", True), ("live", "live", False), ("live", "read", True),
+        ("read", "write", True), ("read", "live", True), ("read", "read", False)])
+    def test_the_conflict_matrix(self, tmp_path, held, wanted, conflict):
+        home = tmp_path / "home"
+        data = tmp_path / "data"
+        (data / "sub").mkdir(parents=True)
+        with mc.hold_path_claims([(held, data)], "test", home):
+            if conflict:
+                with pytest.raises(SandboxError, match="in use by another run"):
+                    with mc.hold_path_claims([(wanted, data / "sub")], "test", home):
+                        pass
+            else:
+                with mc.hold_path_claims([(wanted, data / "sub")], "test", home):
+                    pass
+
+    def test_disjoint_paths_never_conflict(self, tmp_path):
+        home = tmp_path / "home"
+        a, b = tmp_path / "a", tmp_path / "b"
+        a.mkdir()
+        b.mkdir()
+        with mc.hold_path_claims([("write", a)], "test", home), \
+                mc.hold_path_claims([("write", b)], "test", home):
+            pass
+
+    def test_a_claim_without_a_mode_is_read_as_a_writer(self, tmp_path):
+        # a claim file in the older format (paths only) must never be ignored
+        home = tmp_path / "home"
+        data = tmp_path / "data"
+        data.mkdir()
+        import fcntl
+        claim = mc.path_claims_dir(home) / "old.claim"
+        fd = os.open(claim, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            os.write(fd, os.fsencode(data.resolve()) + b"\0")
+            with pytest.raises(SandboxError, match="in use by another run"):
+                with mc.hold_path_claims([("read", data)], "test", home):
+                    pass
+        finally:
+            os.close(fd)
+
+    def test_an_unknown_mode_is_a_programming_error(self, tmp_path):
+        with pytest.raises(ValueError):
+            with mc.hold_path_claims([("borrow", tmp_path)], "test", tmp_path / "home"):
+                pass
+
+    def test_the_registry_is_internal_state(self, tmp_path):
+        home = tmp_path / "home"
+        assert mc.shared_state_dir(home) in mc.path_claims_dir(home).parents
+
+
+class TestByteCopyPinsTheExtent:
+    """Codex P2 (#198): the byte-copy fallback streamed to EOF, charging only the size first
+    seen: a source still being appended to could be copied past the budget, or forever. It now
+    copies exactly the extent it pinned at open, and a source that changes mid-copy fails it."""
+
+    def test_a_file_growing_while_it_is_copied_is_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mc, "_CLONEFILE", None)
+        src = tmp_path / "src"
+        src.write_bytes(b"a" * 3_000_000)
+        real_read = os.read
+        grown = []
+
+        def read(fd, n):
+            if not grown:
+                grown.append(1)
+                with open(src, "ab") as fh:
+                    fh.write(b"b" * 5_000_000)
+            return real_read(fd, n)
+        monkeypatch.setattr(mc.os, "read", read)
+        dst = tmp_path / "dst"
+        with pytest.raises(SandboxError, match="changed while it was being copied"):
+            mc.copy_no_follow(src, dst, budget_bytes=4_000_000)
+        assert not dst.exists() or dst.stat().st_size <= 3_000_000
+
+    def test_a_size_that_changed_since_the_stat_is_refused(self, tmp_path):
+        src = tmp_path / "src"
+        src.write_bytes(b"a" * 10)
+        fd = os.open(src, os.O_RDONLY)
+        try:
+            with pytest.raises(SandboxError, match="changed while"):
+                mc._copy_regular_fd(fd, tmp_path / "dst", 0o644, size=5)
+        finally:
+            os.close(fd)
+
+    @pytest.mark.parametrize("clone", [True, False])
+    def test_an_unchanged_file_copies_whole(self, tmp_path, monkeypatch, clone):
+        if not clone:
+            monkeypatch.setattr(mc, "_CLONEFILE", None)
+        src = tmp_path / "src"
+        src.write_bytes(os.urandom(3_000_123))
+        mc.copy_no_follow(src, tmp_path / "dst", budget_bytes=4_000_000)
+        assert (tmp_path / "dst").read_bytes() == src.read_bytes()
+
+
+class TestCopiesKeepTimestamps:
+    """Codex P2 (#198): a copy recreated every directory with fresh times, so even a no-op
+    copy-back rewrote modification times through the host tree (build caches, backups and
+    timestamp-keyed inputs go by them). Directories, files and links keep the source's."""
+
+    @pytest.mark.parametrize("clone", [True, False])
+    def test_the_tree_keeps_its_times(self, tmp_path, monkeypatch, clone):
+        if not clone:
+            monkeypatch.setattr(mc, "_CLONEFILE", None)
+        src = tmp_path / "src"
+        (src / "a" / "b").mkdir(parents=True)
+        (src / "a" / "b" / "f").write_text("x")
+        (src / "a" / "link").symlink_to("b/f")
+        old = 1_500_000_000_123_456_789
+        links = os.utime in os.supports_follow_symlinks
+        for p in [src / "a" / "b" / "f", src / "a" / "b", src / "a", src]:
+            os.utime(p, ns=(old, old))
+        if links:
+            os.utime(src / "a" / "link", ns=(old, old), follow_symlinks=False)
+        dst = tmp_path / "dst"
+        mc.copy_no_follow(src, dst, budget_bytes=1 << 20)
+        for rel in ["", "a", "a/b", "a/b/f", *(["a/link"] if links else [])]:
+            assert os.stat(dst / rel, follow_symlinks=False).st_mtime_ns == old, rel

@@ -24,6 +24,7 @@ import contextlib
 import errno
 import ctypes
 import ctypes.util
+import fcntl
 import hmac
 import json
 import logging
@@ -38,7 +39,7 @@ import subprocess
 import sys
 import tempfile
 import threading
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from pathlib import Path
 
 from blastbox.errors import SandboxError
@@ -1904,18 +1905,37 @@ def _copy_xattrs(fd: int, dst: Path, budget: "CopyBudget", at: Path, *, write: b
 
 
 def _copy_regular_fd(fd: int, dst: Path, mode: int,
-                     budget: "CopyBudget | None" = None, at: Path | None = None) -> None:
+                     budget: "CopyBudget | None" = None, at: Path | None = None,
+                     size: int | None = None) -> None:
     """Copy the open regular file ``fd`` to the new path ``dst``: an APFS clone when possible
     (O(1), copy-on-write), else a byte copy. Either way the copy then gets only the source's
     rwx bits: a clone keeps setuid/setgid, flags and the extended ACL, none of which may survive
-    into a host copy."""
+    into a host copy.
+
+    Exactly the extent the source had when it was opened (``size``, what the caller charged)
+    is copied, never more: the source may be a tree another process still writes, and a file
+    growing while it is streamed would otherwise be copied past the budget -- or forever. A
+    source whose size or modification time changes during the copy fails it."""
+    pinned = os.fstat(fd)
+    if size is not None and pinned.st_size != size:
+        raise SandboxError(f"sandbox copy: {at or dst} changed while it was being copied")
     cloned = (_CLONEFILE is not None
               and _CLONEFILE(fd, _AT_FDCWD, os.fsencode(dst), 0) == 0)
     if not cloned:
         os.lseek(fd, 0, os.SEEK_SET)
+        left = pinned.st_size
         with open(dst, "xb") as fout:
-            while chunk := os.read(fd, 1024 * 1024):
+            while left > 0:
+                chunk = os.read(fd, min(left, 1024 * 1024))
+                if not chunk:
+                    break               # shrank: caught by the check below
                 fout.write(chunk)
+                left -= len(chunk)
+    after = os.fstat(fd)
+    copied = os.stat(dst, follow_symlinks=False).st_size
+    if ((after.st_size, after.st_mtime_ns) != (pinned.st_size, pinned.st_mtime_ns)
+            or copied != pinned.st_size):
+        raise SandboxError(f"sandbox copy: {at or dst} changed while it was being copied")
     if budget is not None:
         # the clone already carries them (only charged); a byte copy gets them written
         _copy_xattrs(fd, dst, budget, at or dst, write=not cloned)
@@ -1929,6 +1949,17 @@ def _copy_regular_fd(fd: int, dst: Path, mode: int,
             err = ctypes.get_errno()
             raise SandboxError(f"cannot clear the ACL on {dst}: {os.strerror(err)}")
     os.chmod(dst, _perm_bits(mode), follow_symlinks=False)
+
+
+def _keep_times(path: Path, st: os.stat_result) -> None:
+    """Give the copy ``path`` the source's access and modification times (``st``), without
+    following a symlink: a copy-back after even a no-op run must not touch every timestamp in
+    the host tree (build caches, backups and timestamp-keyed inputs go by them). A platform
+    that can't set a symlink's own times leaves the link's."""
+    follow = not stat.S_ISLNK(st.st_mode)
+    if not follow and os.utime not in os.supports_follow_symlinks:
+        return
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=follow)
 
 
 def _perm_bits(mode: int) -> int:
@@ -2006,6 +2037,8 @@ _COPY_BACK_DONE = COPY_BACK_MARK + "done-"
 #: called ``.blastbox-copyback-done-x`` as real output -- so cleanup deletes only a ``done-``
 #: entry whose (directory, name, device, inode) this worker recorded before renaming it there.
 DONE_RECORD_DIR: Path | None = None
+#: Path-claim registry override for tests (see :func:`path_claims_dir`).
+PATH_CLAIM_DIR: Path | None = None
 
 #: The tag a recorded ``done-`` tree carries: a per-retire random nonce, also kept in the record.
 #: (device, inode) alone is not an identity -- a freed inode number is reused at once (ext4 and
@@ -2029,12 +2062,33 @@ def shared_state_dir(home: Path | None = None) -> Path:
     return (home or Path(pwd.getpwuid(os.getuid()).pw_dir)) / "Library" / "Caches" / "blastbox"
 
 
+def containers_dir(home: Path | None = None) -> Path:
+    """``~/Library/Containers``: every App Sandbox bundle's container, every slot's ``Data``."""
+    return (home or Path(pwd.getpwuid(os.getuid()).pw_dir)) / "Library" / "Containers"
+
+
+def check_clear_of_containers(paths: Iterable[tuple[str, "Path | str"]], backend: str,
+                              home: Path | None = None) -> None:
+    """Raise ``SandboxError`` if any ``(what, path)`` is or holds ``~/Library/Containers``
+    (compared resolved): a grant there reaches every App Sandbox slot's ``Data`` -- other runs'
+    caches and job state -- and a copy of it would stage them. (A path inside one app's
+    container is checked by the App Sandbox backend against its own slots.)"""
+    area = containers_dir(home).resolve()
+    for what, p in paths:
+        rp = Path(p).expanduser().resolve()
+        if rp == area or rp in area.parents:
+            raise SandboxError(f"{backend}: {what} {p} holds {area}, every App Sandbox slot's "
+                               "container; use a narrower path")
+
+
 def internal_state_dirs(home: Path | None = None) -> list[Path]:
     """Every directory holding state a run must never reach (see :func:`shared_state_dir`):
     a child with a writable grant there could release another run's lock or forge a cleanup
     record (and so get a later worker to delete an entry it chose), and a copy-back or capture
     over it would replace lock files still held by inode."""
-    dirs = [shared_state_dir(home), _done_record_dir()]
+    claims = (PATH_CLAIM_DIR if home is None and PATH_CLAIM_DIR is not None
+              else shared_state_dir(home) / "path-claims")
+    dirs = [shared_state_dir(home), _done_record_dir(), claims]
     return [d for i, d in enumerate(dirs) if d not in dirs[:i]]
 
 
@@ -2365,6 +2419,7 @@ def copy_no_follow(src: Path, dst: Path, *, budget_bytes: int | None = None,
             target = os.readlink(name, dir_fd=dir_fd)
             budget.charge(max(len(os.fsencode(target)), st.st_size), s)
             os.symlink(target, d)
+            _keep_times(d, st)
         elif stat.S_ISDIR(mode):
             budget.charge(0, s)
             fd = _open_checked(name, dir_fd, st, os.O_RDONLY | os.O_DIRECTORY, s)
@@ -2376,8 +2431,10 @@ def copy_no_follow(src: Path, dst: Path, *, budget_bytes: int | None = None,
                         _one(entry.name, fd, s / entry.name, d / entry.name)
             finally:
                 os.close(fd)
-            # After the children: a read-only source dir must not block filling its copy.
+            # After the children: a read-only source dir must not block filling its copy, and
+            # filling it moved its modification time.
             os.chmod(d, _perm_bits(mode), follow_symlinks=False)
+            _keep_times(d, st)
         elif stat.S_ISREG(mode):
             key = (st.st_dev, st.st_ino) if st.st_nlink > 1 else None
             first = seen.get(key) if key is not None else None
@@ -2395,9 +2452,10 @@ def copy_no_follow(src: Path, dst: Path, *, budget_bytes: int | None = None,
             # (and the fstat check then refuses it).
             fd = _open_checked(name, dir_fd, st, os.O_RDONLY | os.O_NONBLOCK, s)
             try:
-                _copy_regular_fd(fd, d, mode, budget, s)
+                _copy_regular_fd(fd, d, mode, budget, s, size=st.st_size)
             finally:
                 os.close(fd)
+            _keep_times(d, st)
             if key is not None:
                 seen.setdefault(key, d)
         else:
@@ -2473,6 +2531,119 @@ def is_under(path: Path, roots: Iterable[Path]) -> bool:
 def paths_overlap(a: Path, b: Path) -> bool:
     """Whether ``a`` and ``b`` (both resolved) are the same path or one contains the other."""
     return a == b or a in b.parents or b in a.parents
+
+
+#: How a run uses a host path it claims, and which other claims on an overlapping path it
+#: can't coexist with:
+#:   * ``write`` -- replaced as a whole tree from a snapshot at teardown (an App Sandbox
+#:     writable mount's copy-back; either backend's capture). Excludes everything: another
+#:     writer's snapshot would undo this one, a live writer's changes would be discarded, and a
+#:     seed copied from it mid-swap would be a mix of both trees.
+#:   * ``live`` -- written in place while the run lives (a Seatbelt writable mount). Two live
+#:     writers share one tree as bind mounts would, but a snapshot writer would discard their
+#:     writes and a seed copied from it would be taken mid-write.
+#:   * ``read`` -- copied as a snapshot (a seed). Only writers conflict.
+CLAIM_MODES = ("write", "live", "read")
+_CLAIM_CONFLICTS = {("write", "write"), ("write", "live"), ("write", "read"),
+                    ("live", "write"), ("live", "read"), ("read", "write"), ("read", "live")}
+
+
+def path_claims_dir(home: Path | None = None) -> Path:
+    """The per-user registry of host paths live runs hold (:func:`hold_path_claims`), shared by
+    both native backends and every root, under :func:`shared_state_dir`."""
+    d = (PATH_CLAIM_DIR if home is None and PATH_CLAIM_DIR is not None
+         else shared_state_dir(home) / "path-claims")
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return d
+
+
+def _parse_claim(raw: bytes) -> list[tuple[str, Path]]:
+    out: list[tuple[str, Path]] = []
+    for entry in raw.split(b"\0"):
+        if not entry:
+            continue
+        mode, sep, path = entry.partition(b"\x01")
+        if not sep or mode.decode("ascii", "replace") not in CLAIM_MODES:
+            # unreadable: the strictest reading (a writer) so it is never ignored
+            out.append(("write", Path(os.fsdecode(path if sep else entry))))
+            continue
+        out.append((mode.decode("ascii"), Path(os.fsdecode(path))))
+    return out
+
+
+@contextlib.contextmanager
+def hold_path_claims(claims: Iterable[tuple[str, "Path | str"]], backend: str,
+                     home: Path | None = None) -> Iterator[None]:
+    """Hold this user's claim on each ``(mode, path)`` (resolved) for a whole run -- from before
+    anything is copied or launched until its teardown (copy-back, capture) is done -- or raise
+    ``SandboxError`` at once if a live run holds a conflicting claim (see :data:`CLAIM_MODES`)
+    on a path that is, holds or sits inside one of them.
+
+    Runs that conflict are refused rather than queued: a run can hold its paths for its whole
+    timeout, and waiting under a slot lock could deadlock.
+
+    A claim is a file per run listing its paths, flock'd while the run lives: a worker that dies
+    drops its lock with its descriptors, and the next run removes the stale file. Claims are
+    checked and made under one registry lock, so two runs can't both see the other absent."""
+    mine_list = [(m, Path(p).expanduser().resolve()) for m, p in claims]
+    for m, _ in mine_list:
+        if m not in CLAIM_MODES:
+            raise ValueError(f"unknown claim mode {m!r}")
+    if not mine_list:
+        yield
+        return
+    d = path_claims_dir(home)
+    guard = os.open(d / ".registry.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    mine: Path | None = None
+    mine_fd: int | None = None
+    try:
+        fcntl.flock(guard, fcntl.LOCK_EX)
+        try:
+            with os.scandir(d) as it:
+                held_claims = [Path(e.path) for e in it if e.name.endswith(".claim")]
+            for claim in held_claims:
+                try:
+                    fd = os.open(claim, os.O_RDONLY | os.O_NOFOLLOW)
+                except FileNotFoundError:
+                    continue
+                try:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        raw = b""
+                        while chunk := os.read(fd, 1 << 16):
+                            raw += chunk
+                        for other_mode, other in _parse_claim(raw):
+                            for my_mode, path in mine_list:
+                                if ((my_mode, other_mode) in _CLAIM_CONFLICTS
+                                        and paths_overlap(path, other)):
+                                    raise SandboxError(
+                                        f"{backend}: {path} is in use by another run (which "
+                                        f"holds {other} for {other_mode}, this run needs it for "
+                                        f"{my_mode}); retry when it is done") from None
+                        continue
+                    os.unlink(claim)        # unlocked: its run is gone
+                finally:
+                    os.close(fd)
+            mine = d / f"{secrets.token_hex(8)}.claim"
+            mine_fd = os.open(mine, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            fcntl.flock(mine_fd, fcntl.LOCK_EX)
+            os.write(mine_fd, b"".join(m.encode("ascii") + b"\x01" + os.fsencode(path) + b"\0"
+                                       for m, path in mine_list))
+        finally:
+            fcntl.flock(guard, fcntl.LOCK_UN)
+        yield
+    finally:
+        if mine_fd is not None:
+            # removed under the registry lock: a checker never opens a claim mid-removal
+            fcntl.flock(guard, fcntl.LOCK_EX)
+            try:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(mine)   # type: ignore[arg-type]
+                os.close(mine_fd)
+            finally:
+                fcntl.flock(guard, fcntl.LOCK_UN)
+        os.close(guard)
 
 
 def check_homes_clear_of_mounts(seed_home: "Path | str | None", capture_home: "Path | str | None",

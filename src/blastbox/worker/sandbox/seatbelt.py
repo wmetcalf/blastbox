@@ -297,17 +297,23 @@ class SeatbeltSandbox:
         # The workers' shared lock and cleanup state (mc.internal_state_dirs): a writable grant
         # there would let the child release another run's lock or forge a cleanup record, and
         # a seed or capture there would copy, or replace, files other runs hold.
-        mc.check_clear_of_state(
-            [*(("rw mount", Path(p)) for p in rw),
-             *((what, Path(p_)) for what, p_ in (("seed_home", request.seed_home),
-                                                  ("capture_home", request.capture_home))
-               if p_ is not None)], "seatbelt")
-        # A writable mount that holds the scratch root would grant the child every concurrent
-        # run's scratch (and the sweep's restore point for its own): mount something narrower.
+        # A read-only grant there would let it read the cleanup records (and so the tags that
+        # authenticate them) and every run's claims.
+        homes = [(what, Path(p_)) for what, p_ in (("seed_home", request.seed_home),
+                                                    ("capture_home", request.capture_home))
+                 if p_ is not None]
+        mounts = [*(("ro mount", Path(p)) for p in ro), *(("rw mount", Path(p)) for p in rw)]
+        mc.check_clear_of_state([*mounts, *homes], "seatbelt")
+        # Nor ~/Library/Containers as a whole: a grant there reaches every App Sandbox slot's
+        # Data, with other runs' caches and job state.
+        mc.check_clear_of_containers([*mounts, *homes], "seatbelt")
+        # A mount that holds the scratch root would grant the child every concurrent run's
+        # scratch (each 0700, but same-UID): a writable one to change them (and the sweep's
+        # restore point for its own), a read-only one to read their inputs, caches and output.
         base = (self._scratch_base or Path(tempfile.gettempdir())).resolve()
-        for p in rw:
-            if Path(p) == base or Path(p) in base.parents:
-                raise SandboxError(f"seatbelt: rw mount {p} contains the scratch root {base}; "
+        for what, p in mounts:
+            if p == base or p in base.parents:
+                raise SandboxError(f"seatbelt: {what} {p} contains the scratch root {base}; "
                                    "mount a narrower directory")
         # A seed that is or holds the scratch root would reach the run's own scratch (created
         # inside it) while being copied into it, copying the growing copy into itself until a
@@ -344,16 +350,26 @@ class SeatbeltSandbox:
                         mc.wipe_dir(scratch_)
                         os.rmdir(scratch_)
 
-        token = register_emergency_cleanup(_emergency)
-        try:
-            # a section, so a shutdown signal on this thread can't fall between the two lines
-            with teardown_critical():
-                scratch = mc.make_scratch(self._scratch_base)
-                state["scratch"] = scratch
-            return self._run_in_scratch(request, exe, exe_real, ro, rw, scratch, leftovers,
-                                        ledger)
-        finally:
-            unregister_emergency_cleanup(token)
+        # The host paths this run uses, claimed in the registry both native backends share for
+        # the whole run (through the capture swap): a writable mount is written in place (live),
+        # a capture replaces its destination as a whole tree (write), a seed is copied as a
+        # snapshot (read). An App Sandbox copy-back or another capture over a live mount would
+        # discard the child's writes, and a seed taken while a tree is written or swapped would
+        # be a mix of both -- so conflicting runs are refused (mc.hold_path_claims).
+        claims = [*(("live", Path(p)) for p in rw),
+                  *(("write", Path(p_)) for p_ in [request.capture_home] if p_ is not None),
+                  *(("read", Path(p_)) for p_ in [request.seed_home] if p_ is not None)]
+        with mc.hold_path_claims(claims, "seatbelt"):
+            token = register_emergency_cleanup(_emergency)
+            try:
+                # a section, so a shutdown signal on this thread can't fall between the two lines
+                with teardown_critical():
+                    scratch = mc.make_scratch(self._scratch_base)
+                    state["scratch"] = scratch
+                return self._run_in_scratch(request, exe, exe_real, ro, rw, scratch, leftovers,
+                                            ledger)
+            finally:
+                unregister_emergency_cleanup(token)
 
     def _run_in_scratch(self, request: SandboxRequest, exe: Path, exe_real: Path,
                         ro: list[str], rw: list[str], scratch: Path,

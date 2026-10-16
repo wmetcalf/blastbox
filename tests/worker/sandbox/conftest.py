@@ -157,3 +157,5 @@ def _done_records_in_tmp(tmp_path_factory, monkeypatch):
     ~/Library/Caches/blastbox (see macos_common.retire_replaced)."""
     from blastbox.worker.sandbox import macos_common as mc
     monkeypatch.setattr(mc, "DONE_RECORD_DIR", tmp_path_factory.mktemp("done-records"))
+    # the same for the path-claim registry of callers that pass no home (Seatbelt)
+    monkeypatch.setattr(mc, "PATH_CLAIM_DIR", tmp_path_factory.mktemp("path-claims"))

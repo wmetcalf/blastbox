@@ -442,18 +442,14 @@ def prepare(
     planned = root.expanduser().resolve()
     planned_prefix = bundle_prefix or "io.blastbox.sbx." + hashlib.sha256(
         str(planned).encode()).hexdigest()[:10]
-    if _valid_bundle_id(planned_prefix):
-        _check_root_outside_containers(planned, home,
-                                       (f"{planned_prefix}.slot{i}" for i in range(slots)))
+    planned_ids = ([f"{planned_prefix}.slot{i}" for i in range(slots)]
+                   if _valid_bundle_id(planned_prefix) else [])
+    _check_root_outside_containers(planned, home, planned_ids)
+    resolved_ro = [Path(p).expanduser().resolve(strict=True) for p in ro_paths]
+    _check_ro_grants(resolved_ro, planned, home, planned_ids)
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     root = root.resolve()
     os.chmod(root, 0o700)
-    resolved_ro: list[Path] = []
-    for p in ro_paths:
-        rp = Path(p).expanduser().resolve(strict=True)
-        if rp == root or root in rp.parents or rp in root.parents:
-            raise SandboxError(f"--ro {rp} overlaps the appsandbox root {root}")
-        resolved_ro.append(rp)
     prefix = bundle_prefix or "io.blastbox.sbx." + hashlib.sha256(
         str(root).encode()).hexdigest()[:10]
     if not _valid_bundle_id(prefix):
@@ -493,6 +489,7 @@ def prepare(
             ids = {bid for i in existing for bid in previous.get(i, set())}
             ids.update(f"{prefix}.slot{i}" for i in indexes)
             _check_root_outside_containers(root, home, ids)
+            _check_ro_grants(resolved_ro, root, home, ids)
             with _all_bundle_locks(home, ids, wait_s, deadline=deadline):
                 _sweep_previous_slots(root, existing, prefix, home, previous=previous)
                 return _prepare_locked(root, slots=slots, resolved_ro=resolved_ro,
@@ -511,6 +508,31 @@ def _check_root_outside_containers(root: Path, home: Path, ids: Iterable[str]) -
         if mc.paths_overlap(root, container):
             raise SandboxError(f"appsandbox root {root} overlaps the slot container "
                                f"{container}; use a root outside ~/Library/Containers/{bid}")
+
+
+def _check_ro_grants(ro: Iterable[Path], root: Path, home: Path, ids: Iterable[str]) -> None:
+    """Refuse a read-only grant (``prepare --ro``, signed into EVERY slot's entitlements) that
+    is, sits inside or holds this root, ``~/Library/Containers`` (as a whole), the container of
+    any of ``ids`` (each slot's, previous and planned), or the workers' shared state: a child in
+    one slot could then read the other slots' staging and ``Data`` -- their inputs, caches and
+    job state -- or the cleanup records and claims every worker relies on."""
+    ro = list(ro)
+    if not ro:
+        return
+    for rp in ro:
+        if mc.paths_overlap(rp, root):
+            raise SandboxError(f"--ro {rp} overlaps the appsandbox root {root}")
+    try:
+        mc.check_clear_of_containers((("--ro", rp) for rp in ro), "appsandbox", home)
+        mc.check_clear_of_state((("--ro", rp) for rp in ro), "appsandbox", home)
+    except SandboxError as exc:
+        raise SandboxError(str(exc).removeprefix("appsandbox: ")) from None
+    for bid in sorted(set(ids)):
+        container = (mc.containers_dir(home) / bid).resolve()
+        for rp in ro:
+            if mc.paths_overlap(rp, container):
+                raise SandboxError(f"--ro {rp} overlaps the slot container {container}; a child "
+                                   "in any slot could read it")
 
 
 def _previous_bundle_ids(root: Path, indexes: Iterable[int]) -> dict[int, set[str]]:
@@ -652,79 +674,21 @@ def bundle_lock_path(home: Path, bundle_id: str) -> Path:
 
 
 def _rw_registry_dir(home: Path) -> Path:
-    d = mc.shared_state_dir(home) / "appsandbox-rw-sources"
-    d.mkdir(parents=True, exist_ok=True, mode=0o700)
-    return d
+    return mc.path_claims_dir(home)
 
 
-@contextlib.contextmanager
-def hold_rw_sources(home: Path, sources: list[Path]) -> Iterator[None]:
-    """Hold this user's claim on the writable ``sources`` (resolved) for a whole run, from
-    staging through copy-back, or raise ``SandboxError`` at once if a run still holding a claim
-    has one that is, holds or sits inside any of them.
+def hold_rw_sources(home: Path, sources: list[Path],
+                    reads: Iterable[Path] = ()) -> contextlib.AbstractContextManager[None]:
+    """Claim the writable ``sources`` (copy-back and capture destinations) for writing and the
+    ``reads`` (seed) for reading, in the per-user registry both native backends share, for the
+    whole run (see :func:`mc.hold_path_claims`).
 
     Each run stages its OWN snapshot of a writable mount and replaces the host tree from it
-    after: two runs on one tree (in any slot, any root) would each copy back a tree without the
-    other's writes, silently undoing them -- bind mounts would have shared one tree. So such runs
-    don't overlap; the second is refused rather than queued (a run can hold its mounts for its
-    whole timeout, and waiting under a slot lock could deadlock).
-
-    A claim is a file per run listing its sources, flock'd while the run lives: a worker that
-    dies drops its lock with its descriptors, and the next run removes the stale file. Claims
-    are checked and made under one registry lock, so two runs can't both see the other absent."""
-    if not sources:
-        yield
-        return
-    d = _rw_registry_dir(home)
-    guard = os.open(d / ".registry.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    mine: Path | None = None
-    mine_fd: int | None = None
-    try:
-        fcntl.flock(guard, fcntl.LOCK_EX)
-        try:
-            with os.scandir(d) as it:
-                claims = [Path(e.path) for e in it if e.name.endswith(".claim")]
-            for claim in claims:
-                try:
-                    fd = os.open(claim, os.O_RDONLY | os.O_NOFOLLOW)
-                except FileNotFoundError:
-                    continue
-                try:
-                    try:
-                        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-                    except BlockingIOError:
-                        held = b""
-                        while chunk := os.read(fd, 1 << 16):
-                            held += chunk
-                        for other in (Path(os.fsdecode(x)) for x in held.split(b"\0") if x):
-                            for src in sources:
-                                if mc.paths_overlap(src, other):
-                                    raise SandboxError(
-                                        f"appsandbox: writable mount {src} is in use by another "
-                                        f"run (which holds {other} writable); runs can't share "
-                                        "a writable tree") from None
-                        continue
-                    os.unlink(claim)        # unlocked: its run is gone
-                finally:
-                    os.close(fd)
-            mine = d / f"{secrets.token_hex(8)}.claim"
-            mine_fd = os.open(mine, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-            fcntl.flock(mine_fd, fcntl.LOCK_EX)
-            os.write(mine_fd, b"".join(os.fsencode(src) + b"\0" for src in sources))
-        finally:
-            fcntl.flock(guard, fcntl.LOCK_UN)
-        yield
-    finally:
-        if mine_fd is not None:
-            # removed under the registry lock: a checker never opens a claim mid-removal
-            fcntl.flock(guard, fcntl.LOCK_EX)
-            try:
-                with contextlib.suppress(FileNotFoundError):
-                    os.unlink(mine)   # type: ignore[arg-type]
-                os.close(mine_fd)
-            finally:
-                fcntl.flock(guard, fcntl.LOCK_UN)
-        os.close(guard)
+    after: two runs on one tree (in any slot, any root, either backend) would each copy back a
+    tree without the other's writes, silently undoing them -- bind mounts would have shared one
+    tree. So such runs don't overlap; the second is refused rather than queued."""
+    return mc.hold_path_claims([*(("write", p) for p in sources),
+                                *(("read", p) for p in reads)], "appsandbox", home)
 
 
 @contextlib.contextmanager
@@ -965,6 +929,14 @@ class AppSandboxSandbox:
         except SandboxError as exc:
             raise SandboxUnavailable(f"{exc}; re-run `blastbox macos prepare` with another "
                                      "--root") from None
+        # The same for read-only grants signed by a prepare that predates their check.
+        try:
+            _check_ro_grants([Path(p).resolve() for p in self._manifest.ro_paths],
+                             self._root.resolve(), self._home,
+                             (s.bundle_id for s in self._manifest.slots))
+        except SandboxError as exc:
+            raise SandboxUnavailable(f"appsandbox manifest: {exc}; re-run `blastbox macos "
+                                     "prepare` without it") from None
         self._slot_wait_s = _slot_wait(slot_wait_s)
         if mc.IS_DARWIN and not mc.process_apis_available():
             # Without them a run's escaped processes can't be found, so a slot can't be proven
@@ -1126,7 +1098,9 @@ class AppSandboxSandbox:
         # overlapping tree -- whichever committed last would silently discard the other's.
         claimed = [*rw_sources, *([request.capture_home.expanduser().resolve()]
                                   if request.capture_home is not None else [])]
-        with hold_rw_sources(self._home, claimed), self._acquire_slot() as slot:
+        seed = ([request.seed_home.expanduser().resolve()]
+                if request.seed_home is not None else [])
+        with hold_rw_sources(self._home, claimed, seed), self._acquire_slot() as slot:
             # Under the claim, so no live run's copy-back is in flight in these trees: what an
             # interrupted one left is either removed or refused, never staged into this job.
             for src in rw_sources:
@@ -1184,6 +1158,9 @@ class AppSandboxSandbox:
         # a copy-back or capture over them would replace lock files other runs hold by inode.
         # Checked before any claim is made.
         mc.check_clear_of_state(paths, "appsandbox", self._home)
+        # Nor ~/Library/Containers as a whole: a copy of it would stage other roots' slots'
+        # Data (their caches and job state) into this run.
+        mc.check_clear_of_containers(paths, "appsandbox", self._home)
         # The seed and capture directories against the mounts: a writable mount over the seed
         # is copied back over it (later runs seeded from what the child wrote); a capture over
         # any mount replaces that tree with the slot's cache.
@@ -1389,6 +1366,9 @@ class AppSandboxSandbox:
     @staticmethod
     def _swap_children_locked(dest: Path, new: Path, old: Path,
                               leftovers: mc.Leftovers | None = None) -> None:
+        # The mount root is kept (as a bind mount would), but the swap's renames move its
+        # modification time: restored, at the end, to the times of the tree the child left.
+        times = os.stat(new, follow_symlinks=False)
         os.mkdir(old, 0o700)
         moved_out: list[str] = []
         moved_in: list[str] = []
@@ -1426,6 +1406,7 @@ class AppSandboxSandbox:
             mc.retire_replaced(old, done, leftovers)
         except SandboxError as exc:
             raise SandboxError(f"appsandbox: copy-back of {dest}: {exc}") from exc
+        os.utime(dest, ns=(times.st_atime_ns, times.st_mtime_ns), follow_symlinks=False)
 
     @staticmethod
     def _copy_back(staged: Path, dest: Path, budget: mc.CopyBudget, was_dir: bool,

@@ -790,3 +790,100 @@ class TestSeedAndCaptureStayClearOfTheMounts:
             self._sb(tmp_path, calls).run(SandboxRequest(
                 argv=["/bin/echo", "hi"], capture_home=data / "cache", **mounts))
         assert calls == []
+
+
+def _plain_sb(tmp_path, calls):
+    def popen(argv, **kw):
+        p = _FakeProc(argv, **kw)
+        calls.append(p)
+        return p
+    return SeatbeltSandbox(popen=popen, platform_ok=True, sandbox_exec="/bin/sh",
+                           scratch_base=tmp_path / "scratch")
+
+
+class TestSeatbeltClaimsItsPaths:
+    """Codex P2 (#198): Seatbelt never joined the path-claim registry, so its capture (a
+    whole-tree swap) could land on a tree another run wrote or seeded from. It now claims its
+    writable mounts (live), capture (write) and seed (read) for the whole run, against App
+    Sandbox runs and other Seatbelt runs alike."""
+
+    def test_the_run_claims_each_path_by_how_it_uses_it(self, tmp_path, monkeypatch):
+        data, seed, cap = tmp_path / "data", tmp_path / "seed", tmp_path / "cap"
+        data.mkdir()
+        seed.mkdir()
+        seen: list[list] = []
+        real = mc.hold_path_claims
+        monkeypatch.setattr(mc, "hold_path_claims",
+                            lambda c, *a, **k: seen.append(list(c)) or real(c, *a, **k))
+        calls: list = []
+        _plain_sb(tmp_path, calls).run(SandboxRequest(
+            argv=["/bin/echo"], rw_mounts=[Mount(data, data)], seed_home=seed,
+            capture_home=cap))
+        modes = {(m, Path(p).resolve()) for m, p in seen[-1]}
+        assert modes == {("live", data.resolve()), ("write", cap.resolve()),
+                         ("read", seed.resolve())}
+
+    @pytest.mark.parametrize("held,field", [("write", "rw"), ("write", "seed"),
+                                            ("live", "capture"), ("live", "seed")])
+    def test_a_conflicting_run_is_refused_before_launch(self, tmp_path, held, field):
+        data = tmp_path / "data"
+        data.mkdir()
+        req = {"rw": dict(rw_mounts=[Mount(data, data)]), "seed": dict(seed_home=data),
+               "capture": dict(capture_home=data)}[field]
+        calls: list = []
+        with mc.hold_path_claims([(held, data)], "other"):
+            with pytest.raises(SandboxError, match="in use by another run"):
+                _plain_sb(tmp_path, calls).run(SandboxRequest(argv=["/bin/echo"], **req))
+        assert calls == []
+
+    def test_two_live_writers_share_a_tree(self, tmp_path):
+        data = tmp_path / "data"
+        data.mkdir()
+        calls: list = []
+        with mc.hold_path_claims([("live", data)], "other"):
+            _plain_sb(tmp_path, calls).run(SandboxRequest(argv=["/bin/echo"],
+                                                          rw_mounts=[Mount(data, data)]))
+        assert len(calls) == 1
+
+
+class TestReadOnlyMountsStayClear:
+    """Codex P1 (#198): only writable mounts were checked against the scratch root, so a
+    read-only mount holding it (/private/tmp, say) let the child read every concurrent run's
+    scratch. Read-only grants are checked like writable ones -- against the scratch root, the
+    workers' shared state, and ~/Library/Containers as a whole."""
+
+    def test_a_read_only_mount_holding_the_scratch_root_is_refused(self, tmp_path):
+        calls: list = []
+        with pytest.raises(SandboxError, match="ro mount .* contains the scratch root"):
+            _plain_sb(tmp_path, calls).run(SandboxRequest(
+                argv=["/bin/echo"], ro_mounts=[Mount(tmp_path, tmp_path)]))
+        assert calls == []
+
+    def test_a_read_only_mount_of_the_shared_state_is_refused(self, tmp_path, monkeypatch):
+        state = tmp_path / "home" / "Library" / "Caches" / "blastbox"
+        state.mkdir(parents=True)
+        monkeypatch.setattr(mc, "shared_state_dir", lambda home=None: state)
+        calls: list = []
+        with pytest.raises(SandboxError, match="shared lock and cleanup state"):
+            _plain_sb(tmp_path / "s", calls).run(SandboxRequest(
+                argv=["/bin/echo"], ro_mounts=[Mount(state.parent, state.parent)]))
+        assert calls == []
+
+    def test_a_read_only_mount_holding_every_container_is_refused(self, tmp_path, monkeypatch):
+        containers = tmp_path / "home" / "Library" / "Containers"
+        containers.mkdir(parents=True)
+        monkeypatch.setattr(mc, "containers_dir", lambda home=None: containers)
+        calls: list = []
+        lib = containers.parent
+        with pytest.raises(SandboxError, match="every App Sandbox slot's container"):
+            _plain_sb(tmp_path / "s", calls).run(SandboxRequest(
+                argv=["/bin/echo"], ro_mounts=[Mount(lib, lib)]))
+        assert calls == []
+
+    def test_a_read_only_mount_beside_the_scratch_root_runs(self, tmp_path):
+        inp = tmp_path / "in"
+        inp.mkdir()
+        calls: list = []
+        _plain_sb(tmp_path, calls).run(SandboxRequest(argv=["/bin/echo"],
+                                                      ro_mounts=[Mount(inp, inp)]))
+        assert len(calls) == 1

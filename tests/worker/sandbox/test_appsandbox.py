@@ -1900,7 +1900,7 @@ class TestSharedStateIsNeverMounted:
         src.mkdir(parents=True, exist_ok=True)
         claimed: list[object] = []
         real = asb.hold_rw_sources
-        monkeypatch.setattr(asb, "hold_rw_sources", lambda h, s: claimed.append(s) or real(h, s))
+        monkeypatch.setattr(asb, "hold_rw_sources", lambda h, s, *a: claimed.append(s) or real(h, s, *a))
         with pytest.raises(SandboxError, match="shared lock and cleanup state"):
             sb.run(SandboxRequest(argv=["/bin/echo"], rw_mounts=[Mount(src, src)]))
         assert claimed == []
@@ -1929,7 +1929,7 @@ class TestCapturesAreClaimed:
         cache = tmp_path / "cache"
         seen: list[list] = []
         real = asb.hold_rw_sources
-        monkeypatch.setattr(asb, "hold_rw_sources", lambda h, s: seen.append(list(s)) or real(h, s))
+        monkeypatch.setattr(asb, "hold_rw_sources", lambda h, s, *a: seen.append(list(s)) or real(h, s, *a))
         try:        # (the fake child makes no container to capture; only the claim matters)
             sb.run(SandboxRequest(argv=["/bin/echo"], capture_home=cache))
         except SandboxError:
@@ -1946,7 +1946,7 @@ class TestSeedAndCaptureStayClearOfTheMounts:
     def _claims(monkeypatch):
         claimed: list[object] = []
         real = asb.hold_rw_sources
-        monkeypatch.setattr(asb, "hold_rw_sources", lambda h, s: claimed.append(s) or real(h, s))
+        monkeypatch.setattr(asb, "hold_rw_sources", lambda h, s, *a: claimed.append(s) or real(h, s, *a))
         return claimed
 
     @pytest.mark.parametrize("where", ["equal", "inside", "contains"])
@@ -1971,3 +1971,92 @@ class TestSeedAndCaptureStayClearOfTheMounts:
             sb.run(SandboxRequest(argv=["/bin/echo"], capture_home=data / "cache",
                                   **{f"{kind}_mounts": [Mount(data, data)]}))
         assert claimed == []
+
+
+class TestReadOnlyGrantsStayClearOfContainers:
+    """Codex P1 (#198): `prepare --ro` was checked only against the root, but it is signed into
+    EVERY slot's entitlements: a grant of ~/Library/Containers, a slot's container or anything
+    holding them let a child in one slot read the others' Data. Refused before anything is
+    written, and refused at load in a manifest that already has one."""
+
+    @pytest.mark.parametrize("which", ["containers", "a slot's container", "inside a slot's",
+                                       "home", "shared state"])
+    def test_prepare_refuses_the_grant_and_writes_nothing(self, tmp_path, which):
+        home = tmp_path / "home"
+        prefix = "io.example.ro"
+        containers = home / "Library" / "Containers"
+        grant = {"containers": containers,
+                 "a slot's container": containers / f"{prefix}.slot1",
+                 "inside a slot's": containers / f"{prefix}.slot0" / "Data",
+                 "home": home,
+                 "shared state": mc.shared_state_dir(home)}[which]
+        grant.mkdir(parents=True)
+        root = tmp_path / "root"
+        with pytest.raises(SandboxError, match="--ro"):
+            asb.prepare(root, slots=2, ro_paths=[grant], bundle_prefix=prefix, home=home,
+                        runner=_fake_runner([]))
+        assert not root.exists()
+
+    def test_a_grant_beside_the_containers_is_kept(self, tmp_path):
+        home = tmp_path / "home"
+        engine = tmp_path / "engine"
+        engine.mkdir()
+        (home / "Library" / "Containers").mkdir(parents=True)
+        m = asb.prepare(tmp_path / "root", slots=1, ro_paths=[engine], home=home,
+                        runner=_fake_runner([]))
+        assert m.ro_paths == (engine.resolve(),)
+
+    def test_a_manifest_with_such_a_grant_is_refused_at_load(self, tmp_path):
+        home = tmp_path / "home"
+        containers = home / "Library" / "Containers"
+        containers.mkdir(parents=True)
+        root = tmp_path / "root"
+        asb.prepare(root, slots=1, ro_paths=[], home=home, runner=_fake_runner([]))
+        path = root / asb.MANIFEST_NAME
+        raw = json.loads(path.read_text())
+        raw["ro_paths"] = [str(containers.resolve())]
+        path.write_text(json.dumps(raw))
+        with pytest.raises(SandboxUnavailable, match="--ro"):
+            asb.AppSandboxSandbox(root=root, popen=_Popen(), home=home, platform_ok=True,
+                                  verify=False, slot_wait_s=0)
+
+
+class TestSeedsAreClaimedForReading:
+    """Codex P2 (#198): a seed is copied as a snapshot; a run replacing (or writing) that tree
+    meanwhile would give it a mix of both. The seed is claimed for reading, in the registry
+    both native backends share."""
+
+    def test_a_seed_is_refused_while_another_run_replaces_its_tree(self, tmp_path):
+        sb, home = _sb_with(tmp_path)
+        seed = tmp_path / "seed"
+        seed.mkdir()
+        with mc.hold_path_claims([("write", seed)], "other", home):
+            with pytest.raises(SandboxError, match="in use by another run"):
+                sb.run(SandboxRequest(argv=["/bin/echo"], seed_home=seed))
+
+    def test_two_runs_may_seed_from_one_tree(self, tmp_path):
+        home = tmp_path / "home"
+        seed = tmp_path / "seed"
+        seed.mkdir()
+        with asb.hold_rw_sources(home, [], [seed]), asb.hold_rw_sources(home, [], [seed]):
+            pass
+
+
+class TestCopyBackKeepsTimestamps:
+    """Codex P2 (#198): even a no-op run's copy-back rewrote every directory's modification
+    time in the host tree, and the swap moved the mount root's own. The copy keeps the times,
+    and the root gets those of the tree the child left."""
+
+    def test_a_no_op_copy_back_leaves_every_time_as_it_was(self, tmp_path):
+        out = tmp_path / "out"
+        (out / "a" / "b").mkdir(parents=True)
+        (out / "a" / "b" / "f").write_text("x")
+        old = 1_500_000_000_000_000_000
+        for p in [out / "a" / "b" / "f", out / "a" / "b", out / "a", out]:
+            os.utime(p, ns=(old, old))
+        staged = tmp_path / "staged"
+        mc.copy_no_follow(out, staged, budget_bytes=1 << 20)        # what staging makes
+        asb.AppSandboxSandbox._copy_back(staged, out, mc.CopyBudget(max_bytes=1 << 20),
+                                         was_dir=True)
+        for rel in ["", "a", "a/b", "a/b/f"]:
+            assert os.stat(out / rel).st_mtime_ns == old, rel
