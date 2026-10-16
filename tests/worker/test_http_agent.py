@@ -814,3 +814,72 @@ class TestWarmupIsBoundedByTheHardDeadline:
         hag._bounded_warmup(self._Eng(hang_from=99), True)
         time.sleep(0.5)
         assert exits == []
+
+
+class TestShutdownStopsNewRuns:
+    """Codex P1 (#198): retirement snapshots the cleanups it runs. A run started after that
+    snapshot would not be swept, so once retirement begins no new run may start: /detonate and
+    /healthz answer 503, and registering a run's cleanup (which every backend does before it
+    starts its child) raises."""
+
+    @pytest.fixture
+    def shutting(self):
+        from blastbox.worker.sandbox.base import begin_shutdown, end_shutdown
+        assert begin_shutdown(0)
+        try:
+            yield
+        finally:
+            end_shutdown()
+
+    def test_a_detonation_arriving_during_shutdown_is_refused(self, shutting):
+        ran: list[bool] = []
+
+        class _Eng(_NoopEngine):
+            def detonate(self, input, outdir, limits):
+                ran.append(True)
+                return super().detonate(input, outdir, limits)
+
+        err = _serve_engine_and_post(_Eng())
+        assert err is not None and err.code == 503
+        assert json.loads(err.read())["error"] == "shutting_down"
+        assert ran == []
+
+    def test_healthz_reports_unavailable_during_shutdown(self, shutting):
+        httpd, port = _running_agent()
+        try:
+            with pytest.raises(urllib.error.HTTPError) as exc:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=10)
+            assert exc.value.code == 503
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_a_cleanup_registered_after_shutdown_began_is_refused(self, shutting):
+        from blastbox.errors import SandboxError
+        from blastbox.worker.sandbox.base import register_emergency_cleanup
+        with pytest.raises(SandboxError, match="shutting down"):
+            register_emergency_cleanup(lambda: None)
+
+    def test_a_run_whose_registration_is_refused_never_starts_its_child(self, shutting,
+                                                                        tmp_path):
+        from blastbox.errors import SandboxError
+        from blastbox.worker.sandbox import macos_common as mc
+        started: list[object] = []
+
+        def popen(*a, **kw):
+            started.append(a)
+            raise AssertionError("a child was started after the shutdown snapshot")
+
+        with pytest.raises(SandboxError, match="shutting down"):
+            mc.run_confined(["/bin/true"], env={"PATH": mc.MINIMAL_PATH},
+                            limits=Limits(timeout_s=5), cwd=tmp_path, popen=popen)
+        assert started == []
+
+    def test_registration_reopens_when_a_retirement_returns(self):
+        from blastbox.worker.sandbox.base import (
+            begin_shutdown, end_shutdown, register_emergency_cleanup, shutting_down,
+            unregister_emergency_cleanup)
+        assert begin_shutdown(0) and shutting_down()
+        end_shutdown()
+        assert not shutting_down()
+        unregister_emergency_cleanup(register_emergency_cleanup(lambda: None))

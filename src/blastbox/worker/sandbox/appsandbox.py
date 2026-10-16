@@ -651,6 +651,82 @@ def bundle_lock_path(home: Path, bundle_id: str) -> Path:
     return d / f"{bundle_id}.lock"
 
 
+def _rw_registry_dir(home: Path) -> Path:
+    d = home / "Library" / "Caches" / "blastbox" / "appsandbox-rw-sources"
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return d
+
+
+@contextlib.contextmanager
+def hold_rw_sources(home: Path, sources: list[Path]) -> Iterator[None]:
+    """Hold this user's claim on the writable ``sources`` (resolved) for a whole run, from
+    staging through copy-back, or raise ``SandboxError`` at once if a run still holding a claim
+    has one that is, holds or sits inside any of them.
+
+    Each run stages its OWN snapshot of a writable mount and replaces the host tree from it
+    after: two runs on one tree (in any slot, any root) would each copy back a tree without the
+    other's writes, silently undoing them -- bind mounts would have shared one tree. So such runs
+    don't overlap; the second is refused rather than queued (a run can hold its mounts for its
+    whole timeout, and waiting under a slot lock could deadlock).
+
+    A claim is a file per run listing its sources, flock'd while the run lives: a worker that
+    dies drops its lock with its descriptors, and the next run removes the stale file. Claims
+    are checked and made under one registry lock, so two runs can't both see the other absent."""
+    if not sources:
+        yield
+        return
+    d = _rw_registry_dir(home)
+    guard = os.open(d / ".registry.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    mine: Path | None = None
+    mine_fd: int | None = None
+    try:
+        fcntl.flock(guard, fcntl.LOCK_EX)
+        try:
+            with os.scandir(d) as it:
+                claims = [Path(e.path) for e in it if e.name.endswith(".claim")]
+            for claim in claims:
+                try:
+                    fd = os.open(claim, os.O_RDONLY | os.O_NOFOLLOW)
+                except FileNotFoundError:
+                    continue
+                try:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        held = b""
+                        while chunk := os.read(fd, 1 << 16):
+                            held += chunk
+                        for other in (Path(os.fsdecode(x)) for x in held.split(b"\0") if x):
+                            for src in sources:
+                                if mc.paths_overlap(src, other):
+                                    raise SandboxError(
+                                        f"appsandbox: writable mount {src} is in use by another "
+                                        f"run (which holds {other} writable); runs can't share "
+                                        "a writable tree") from None
+                        continue
+                    os.unlink(claim)        # unlocked: its run is gone
+                finally:
+                    os.close(fd)
+            mine = d / f"{secrets.token_hex(8)}.claim"
+            mine_fd = os.open(mine, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            fcntl.flock(mine_fd, fcntl.LOCK_EX)
+            os.write(mine_fd, b"".join(os.fsencode(src) + b"\0" for src in sources))
+        finally:
+            fcntl.flock(guard, fcntl.LOCK_UN)
+        yield
+    finally:
+        if mine_fd is not None:
+            # removed under the registry lock: a checker never opens a claim mid-removal
+            fcntl.flock(guard, fcntl.LOCK_EX)
+            try:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(mine)   # type: ignore[arg-type]
+                os.close(mine_fd)
+            finally:
+                fcntl.flock(guard, fcntl.LOCK_UN)
+        os.close(guard)
+
+
 @contextlib.contextmanager
 def _all_bundle_locks(home: Path, bundle_ids: Iterable[str], wait_s: float, *,
                       deadline: float) -> Iterator[None]:
@@ -831,7 +907,8 @@ class _CopyBack:
     def commit(self) -> None:
         try:
             if self._old is not None:
-                AppSandboxSandbox._swap_children(self._dest, self._new, self._old)
+                AppSandboxSandbox._swap_children(self._dest, self._new, self._old,
+                                                 self._leftovers)
             else:
                 try:
                     os.replace(self._new, self._dest)
@@ -1043,8 +1120,17 @@ class AppSandboxSandbox:
         self._check_exec_allowed(exe)
         self._check_exec_allowed(exe_real)
         self._check_sources_clear(request)
-
-        with self._acquire_slot() as slot:
+        rw_sources = [Path(m.source).expanduser().resolve() for m in request.rw_mounts]
+        with hold_rw_sources(self._home, rw_sources), self._acquire_slot() as slot:
+            # Under the claim, so no live run's copy-back is in flight in these trees: what an
+            # interrupted one left is either removed or refused, never staged into this job.
+            for src in rw_sources:
+                stale = mc.clear_stale_copy_backs(src)
+                if stale is not None:
+                    raise SandboxError(
+                        f"appsandbox: rw mount {src} holds {stale}, left by an interrupted "
+                        "copy-back; it may hold the mount's original entries -- restore or "
+                        "remove it, then retry")
             # The slot's own emergency cleanup, held from the first wipe to the last: the agent
             # retiring mid-run skips every `finally` here, and run_confined's covers only the
             # child's lifetime -- not the copy-back, capture and final wipe after it. It removes
@@ -1274,7 +1360,8 @@ class AppSandboxSandbox:
         mc.wipe_dir(container)
 
     @staticmethod
-    def _swap_children(dest: Path, new: Path, old: Path) -> None:
+    def _swap_children(dest: Path, new: Path, old: Path,
+                       leftovers: mc.Leftovers | None = None) -> None:
         """Replace ``dest``'s children with ``new``'s: old ones aside into ``old``, new ones in,
         then drop ``old``. A failed rename undoes every move made so far (best effort, logged)
         and re-raises, so ``dest`` ends up as it was rather than part-swapped.
@@ -1282,10 +1369,11 @@ class AppSandboxSandbox:
         A teardown section (see :func:`teardown_critical`): a retiring agent waits for the
         renames to finish rather than exit between them."""
         with teardown_critical():
-            AppSandboxSandbox._swap_children_locked(dest, new, old)
+            AppSandboxSandbox._swap_children_locked(dest, new, old, leftovers)
 
     @staticmethod
-    def _swap_children_locked(dest: Path, new: Path, old: Path) -> None:
+    def _swap_children_locked(dest: Path, new: Path, old: Path,
+                              leftovers: mc.Leftovers | None = None) -> None:
         os.mkdir(old, 0o700)
         moved_out: list[str] = []
         moved_in: list[str] = []
@@ -1310,10 +1398,22 @@ class AppSandboxSandbox:
                 os.rmdir(old)
             raise
         os.rmdir(new)
-        mc.remove_tree(old)
-        if os.path.lexists(old):
+        # Every rename is done: the replaced contents are now garbage. Renamed to say so -- a
+        # `done-` tree a later worker finds (this one was killed, or retired past its budget,
+        # while removing it) is removed before staging, never staged into a job -- and listed
+        # in `leftovers` meanwhile, so a retiring agent's cleanup finishes the removal. (Not
+        # before now: while the renames run, `old` holds the host's own entries.)
+        done = old.with_name(old.name.replace(f"{mc.COPY_BACK_MARK}old-",
+                                              f"{mc.COPY_BACK_MARK}done-", 1))
+        os.rename(old, done)
+        if leftovers is not None:
+            leftovers.add(done)
+        mc.remove_tree(done)
+        if os.path.lexists(done):
             raise SandboxError(f"appsandbox: copy-back of {dest} could not remove the replaced "
-                               f"contents ({old})")
+                               f"contents ({done})")
+        if leftovers is not None:
+            leftovers.discard(done)
 
     @staticmethod
     def _copy_back(staged: Path, dest: Path, budget: mc.CopyBudget, was_dir: bool,
@@ -1370,14 +1470,14 @@ class AppSandboxSandbox:
                 raise SandboxError(f"appsandbox: rw mount {dest} holds {locked}, which can't be "
                                    "replaced (immutable/append-only or not writable); not copied back")
             tag = secrets.token_hex(8)
-            new = dest / f".blastbox-copyback-{tag}"
-            old = dest / f".blastbox-copyback-old-{tag}"
+            new = dest / f"{mc.COPY_BACK_MARK}{tag}"
+            old = dest / f"{mc.COPY_BACK_MARK}old-{tag}"
         else:
             locked_target = mc.locked_file_target(dest)
             if locked_target is not None:
                 raise SandboxError(f"appsandbox: rw mount {dest} can't be replaced ({locked_target}); "
                                    "not copied back")
-            new = dest.with_name(f".{dest.name}.blastbox-copyback-{secrets.token_hex(8)}")
+            new = dest.with_name(f".{dest.name}{mc.COPY_BACK_MARK}{secrets.token_hex(8)}")
             old = None
         if leftovers is not None:
             leftovers.add(new)

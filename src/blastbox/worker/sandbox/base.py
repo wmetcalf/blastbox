@@ -156,6 +156,10 @@ _EMERGENCY_PARENT: dict[int, int | None] = {}
 _EMERGENCY_LOCK = threading.Lock()
 _EMERGENCY_IDS = itertools.count()
 _EMERGENCY_LOCAL = threading.local()
+# Closed (under _EMERGENCY_LOCK) when retirement begins, BEFORE the cleanups are snapshotted: a
+# run registers before it starts its child, so it either lands in the snapshot (and is swept) or
+# is refused and never starts one -- no child can start after the snapshot and outlive the exit.
+_REGISTRATION_CLOSED = False
 
 
 def _emergency_stack() -> list[int]:
@@ -169,8 +173,12 @@ def register_emergency_cleanup(fn: Callable[[], object]) -> int:
     """Register ``fn`` (kill and sweep one run in flight); returns a token for
     :func:`unregister_emergency_cleanup`. Nested under the cleanup this thread registered last
     and still holds, if any (see the note above)."""
+    from blastbox.errors import SandboxError
+
     stack = _emergency_stack()
     with _EMERGENCY_LOCK:
+        if _REGISTRATION_CLOSED:
+            raise SandboxError("the worker is shutting down; run not started")
         token = next(_EMERGENCY_IDS)
         _EMERGENCY[token] = fn
         _EMERGENCY_PARENT[token] = stack[-1] if stack else None
@@ -291,10 +299,19 @@ def defer_until_teardown_done(fn: Callable[[], object]) -> bool:
     return True
 
 
+def shutting_down() -> bool:
+    """True once retirement has begun: new runs and new detonations are refused."""
+    return _REGISTRATION_CLOSED
+
+
 def begin_shutdown(timeout_s: float) -> bool:
-    """Refuse new teardown sections, then wait up to ``timeout_s`` for the running ones (on
-    other threads) to finish. True if none is left."""
-    global _SHUTTING_DOWN
+    """Refuse new runs (emergency-cleanup registrations) and new teardown sections, then wait up
+    to ``timeout_s`` for the running sections (on other threads) to finish. True if none is
+    left. Call it before :func:`run_emergency_cleanups`, so the snapshot that call takes is
+    final."""
+    global _SHUTTING_DOWN, _REGISTRATION_CLOSED
+    with _EMERGENCY_LOCK:
+        _REGISTRATION_CLOSED = True
     deadline = time.monotonic() + max(0.0, timeout_s)
     with _CRIT_COND:
         _SHUTTING_DOWN = True
@@ -308,9 +325,11 @@ def begin_shutdown(timeout_s: float) -> bool:
 
 def end_shutdown() -> None:
     """Undo :func:`begin_shutdown` -- only for a retirement whose exit returned (a test's)."""
-    global _SHUTTING_DOWN
+    global _SHUTTING_DOWN, _REGISTRATION_CLOSED
     with _CRIT_COND:
         _SHUTTING_DOWN = False
+    with _EMERGENCY_LOCK:
+        _REGISTRATION_CLOSED = False
 
 
 def kill_sandbox_group(proc) -> None:

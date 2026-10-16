@@ -53,6 +53,7 @@ from blastbox.worker.sandbox.base import (
     end_shutdown,
     host_platform,
     run_emergency_cleanups,
+    shutting_down,
 )
 
 _log = logging.getLogger("blastbox.worker.http_agent")
@@ -254,6 +255,10 @@ class _Handler(BaseHTTPRequestHandler):
             if not self._authed():
                 self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
                 return
+            if shutting_down():
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                           {"ok": False, "engine": self.engine.name, "error": "shutting_down"})
+                return
             if self.warmup_error is not None:
                 # Not ready: a static pool skips this box instead of feeding it jobs whose
                 # results can't be trusted (e.g. a sandbox that silently lost a grant).
@@ -274,6 +279,10 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if not self._authed():
             self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+            return
+        if shutting_down():
+            # Retiring: its emergency sweep is final, so a run started now would not be swept.
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "shutting_down"})
             return
         if self.warmup_error is not None:
             # A required warmup is failing (set only when the self-test gate is on -- macOS by
@@ -303,6 +312,12 @@ class _Handler(BaseHTTPRequestHandler):
         # behind the stale job and cascading into more timeouts / overlapping detonations.
         if not _JOB_LOCK.acquire(blocking=False):
             self._json(HTTPStatus.CONFLICT, {"error": "busy"})
+            return
+        if shutting_down():
+            # Retirement began while this request was being read (or the swept job just released
+            # the lock): refuse rather than start a run the final sweep has already passed.
+            _JOB_LOCK.release()
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "shutting_down"})
             return
         try:
             tar = self._run_job(name, length, params)

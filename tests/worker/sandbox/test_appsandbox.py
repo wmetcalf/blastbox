@@ -1756,3 +1756,128 @@ class TestHardLinksOutOfTheWritableMountsAreRefused:
             sb.run(SandboxRequest(argv=["/usr/bin/true"], rw_mounts=[Mount(out, out)]))
         assert os.stat(out / "f").st_ino == os.stat(tmp_path / "elsewhere").st_ino
         assert list(sb.manifest.slots[0].io_dir.iterdir()) == []      # nothing was staged
+
+
+class TestWritableSourcesAreClaimedPerRun:
+    """Codex P2 (#198): each run stages its own snapshot of a writable mount and copies it back
+    over the host tree, so two runs on one tree (or on nested trees) would undo each other's
+    writes. A run holds a claim on its writable sources from staging through copy-back; an
+    overlapping run is refused at once."""
+
+    def test_the_same_source_is_refused_while_another_run_holds_it(self, tmp_path):
+        home = tmp_path / "home"
+        src = tmp_path / "data"
+        src.mkdir()
+        with asb.hold_rw_sources(home, [src]):
+            with pytest.raises(SandboxError, match="in use by another run"):
+                with asb.hold_rw_sources(home, [src]):
+                    pass
+
+    def test_nested_sources_conflict_both_ways(self, tmp_path):
+        home = tmp_path / "home"
+        outer = tmp_path / "data"
+        inner = outer / "sub"
+        inner.mkdir(parents=True)
+        with asb.hold_rw_sources(home, [outer]):
+            with pytest.raises(SandboxError, match="in use"):
+                with asb.hold_rw_sources(home, [inner]):
+                    pass
+        with asb.hold_rw_sources(home, [inner]):
+            with pytest.raises(SandboxError, match="in use"):
+                with asb.hold_rw_sources(home, [outer]):
+                    pass
+
+    def test_disjoint_sources_run_side_by_side(self, tmp_path):
+        home = tmp_path / "home"
+        a, b = tmp_path / "a", tmp_path / "b"
+        a.mkdir()
+        b.mkdir()
+        with asb.hold_rw_sources(home, [a]), asb.hold_rw_sources(home, [b]):
+            pass
+
+    def test_a_claim_is_released_when_its_run_ends(self, tmp_path):
+        home = tmp_path / "home"
+        src = tmp_path / "data"
+        src.mkdir()
+        with asb.hold_rw_sources(home, [src]):
+            pass
+        with asb.hold_rw_sources(home, [src]):
+            pass
+        reg = asb._rw_registry_dir(home)
+        assert [p for p in reg.iterdir() if p.suffix == ".claim"] == []
+
+    def test_a_dead_runs_claim_is_ignored_and_removed(self, tmp_path):
+        # a worker killed mid-run leaves its claim file, but not its lock
+        home = tmp_path / "home"
+        src = tmp_path / "data"
+        src.mkdir()
+        reg = asb._rw_registry_dir(home)
+        stale = reg / "dead.claim"
+        stale.write_bytes(os.fsencode(src) + b"\0")
+        with asb.hold_rw_sources(home, [src]):
+            assert not stale.exists()
+
+    def test_a_run_with_no_writable_mounts_claims_nothing(self, tmp_path):
+        home = tmp_path / "home"
+        with asb.hold_rw_sources(home, []):
+            assert not (home / "Library").exists()
+
+
+class TestInterruptedCopyBacksAreNeverStaged:
+    """Codex P1 (#198): a worker that exits mid-copy-back leaves hidden entries in the host tree,
+    which a later run would stage into its job. The swap renames the replaced contents to a
+    `done-` tree (and lists it for the emergency cleanup) once every rename is done; before
+    staging, a `done-` tree is removed and any other leftover refuses the mount."""
+
+    def test_the_replaced_contents_are_listed_for_cleanup_until_removed(self, tmp_path,
+                                                                        monkeypatch):
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        (dest / "old-file").write_text("host")
+        new = dest / f"{mc.COPY_BACK_MARK}abcd"
+        new.mkdir()
+        (new / "new-file").write_text("run")
+        old = dest / f"{mc.COPY_BACK_MARK}old-abcd"
+        leftovers = mc.Leftovers()
+        seen: list[set] = []
+        real_remove = mc.remove_tree
+
+        def remove_tree(p):
+            seen.append(set(leftovers._paths))
+            real_remove(p)
+
+        monkeypatch.setattr(mc, "remove_tree", remove_tree)
+        asb.AppSandboxSandbox._swap_children(dest, new, old, leftovers)
+        done = dest / f"{mc.COPY_BACK_MARK}done-abcd"
+        assert seen and done in seen[-1]            # listed while it was being removed
+        assert sorted(p.name for p in dest.iterdir()) == ["new-file"]
+        assert leftovers._paths == set()
+
+    def test_a_done_tree_is_removed_before_staging(self, tmp_path):
+        src = tmp_path / "data"
+        done = src / "sub" / f"{mc.COPY_BACK_MARK}done-abcd"
+        done.mkdir(parents=True)
+        (done / "earlier-run").write_text("x")
+        assert mc.clear_stale_copy_backs(src) is None
+        assert not done.exists()
+
+    @pytest.mark.parametrize("name", [f"{mc.COPY_BACK_MARK}old-abcd", f"{mc.COPY_BACK_MARK}abcd"])
+    def test_an_ambiguous_leftover_is_returned_not_removed(self, tmp_path, name):
+        src = tmp_path / "data"
+        left = src / name
+        left.mkdir(parents=True)
+        assert mc.clear_stale_copy_backs(src) == left
+        assert left.exists()                        # may hold the operator's own entries
+
+    def test_a_file_mounts_leftover_sibling_is_found(self, tmp_path):
+        f = tmp_path / "out.json"
+        f.write_text("{}")
+        sib = tmp_path / f".out.json{mc.COPY_BACK_MARK}abcd"
+        sib.write_text("run")
+        assert mc.clear_stale_copy_backs(f) == sib
+
+    def test_a_clean_tree_passes(self, tmp_path):
+        src = tmp_path / "data"
+        (src / "sub").mkdir(parents=True)
+        (src / "sub" / "f").write_text("x")
+        assert mc.clear_stale_copy_backs(src) is None

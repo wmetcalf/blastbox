@@ -1479,6 +1479,8 @@ def _scan_held(pid: int, vfi: ctypes.Array, region: ctypes.Array,
 # (measured: ENOTSUP) before it is a zombie; a failure on one not (yet) flagged exiting is
 # retried this often.
 _FD_LIST_TRIES = 5
+# Listings that fill their buffer are retried with a larger one this often, then fail closed.
+_PID_LIST_TRIES = 5
 
 
 def _list_fds(pid: int) -> tuple[ctypes.Array, int] | None:
@@ -1501,8 +1503,10 @@ def _list_fds(pid: int) -> tuple[ctypes.Array, int] | None:
             ctypes.set_errno(0)
             got = lib.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, fds, ctypes.sizeof(fds)) \
                 if n > 0 else 0
-            if got > 0 or (got == 0 and ctypes.get_errno() == 0):
+            if 0 < got < ctypes.sizeof(fds) or (got == 0 and ctypes.get_errno() == 0):
                 return fds, got         # (an empty table is an answer too)
+            if got >= ctypes.sizeof(fds):
+                continue    # a full buffer may be truncated: size again (the table grew)
         err = ctypes.get_errno()
         if err == errno.ESRCH or proc_start_time(pid) is None \
                 or _proc_state(pid) in ("gone", "zombie", "exiting"):
@@ -1528,14 +1532,22 @@ def uid_pids(uid: int | None = None) -> list[int]:
             raise SandboxError("cannot enumerate processes: libSystem process APIs unavailable")
         return []
     uid = os.getuid() if uid is None else uid
-    n = _LIBSYSTEM.proc_listpids(_PROC_UID_ONLY, uid, None, 0)
-    if n <= 0:
-        raise SandboxError(f"cannot enumerate processes: proc_listpids sizing returned {n}")
-    buf = (ctypes.c_int * (n // 4 + 256))()
-    got = _LIBSYSTEM.proc_listpids(_PROC_UID_ONLY, uid, buf, ctypes.sizeof(buf))
-    if got <= 0:
-        raise SandboxError(f"cannot enumerate processes: proc_listpids returned {got}")
-    return [p for p in buf[: got // 4] if p > 0]
+    # A FULL buffer may be a truncated one: the uid's process count can grow between the sizing
+    # call and the listing (concurrent slots forking). A sweep that read a truncated list could miss
+    # an escaped child and count a quiet round, so retry larger and fail closed if it stays full.
+    extra = 256
+    for _ in range(_PID_LIST_TRIES):
+        n = _LIBSYSTEM.proc_listpids(_PROC_UID_ONLY, uid, None, 0)
+        if n <= 0:
+            raise SandboxError(f"cannot enumerate processes: proc_listpids sizing returned {n}")
+        buf = (ctypes.c_int * (n // 4 + extra))()
+        got = _LIBSYSTEM.proc_listpids(_PROC_UID_ONLY, uid, buf, ctypes.sizeof(buf))
+        if got <= 0:
+            raise SandboxError(f"cannot enumerate processes: proc_listpids returned {got}")
+        if got < ctypes.sizeof(buf):
+            return [p for p in buf[: got // 4] if p > 0]
+        extra *= 4
+    raise SandboxError("cannot enumerate processes: the process list kept filling its buffer")
 
 
 def is_sandboxed(pid: int) -> bool:
@@ -1744,33 +1756,38 @@ def sweep_containers(containers: Iterable[Path], *, what: str) -> int:
 # No-follow copier (App Sandbox staging). Kept here so it is testable on any platform.
 # --------------------------------------------------------------------------------------------
 
-def _clonefile_fn() -> Callable[[bytes, bytes, int], int] | None:
+def _clonefile_fn() -> Callable[[int, int, bytes, int], int] | None:
+    """``fclonefileat(srcfd, dst_dirfd, dst, flags)``: clones the file an fd already pins, so
+    the clone is of exactly the inode the copier opened and checked (a path-based clonefile
+    would resolve the path again, through any directory swapped for a symlink meanwhile)."""
     if not IS_DARWIN:
         return None
     try:
         libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.dylib", use_errno=True)
-        fn = libc.clonefile
+        fn = libc.fclonefileat
     except (OSError, AttributeError):
         return None
-    fn.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32]
+    fn.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
     fn.restype = ctypes.c_int
     return fn
 
 
 _CLONEFILE = _clonefile_fn()
-_CLONE_NOFOLLOW = 0x0001
+_AT_FDCWD = -2          # Darwin's value; the destination is passed as an absolute path
 
 
-def _copy_regular(src: Path, dst: Path, mode: int) -> None:
-    """APFS clone when possible (O(1), copy-on-write), else a byte copy. Either way the copy
-    then gets only ``src``'s rwx bits: a clone keeps setuid/setgid, flags and the extended ACL,
-    none of which may survive into a host copy. Never follows links."""
+def _copy_regular_fd(fd: int, dst: Path, mode: int) -> None:
+    """Copy the open regular file ``fd`` to the new path ``dst``: an APFS clone when possible
+    (O(1), copy-on-write), else a byte copy. Either way the copy then gets only the source's
+    rwx bits: a clone keeps setuid/setgid, flags and the extended ACL, none of which may survive
+    into a host copy."""
     cloned = (_CLONEFILE is not None
-              and _CLONEFILE(os.fsencode(src), os.fsencode(dst), _CLONE_NOFOLLOW) == 0)
+              and _CLONEFILE(fd, _AT_FDCWD, os.fsencode(dst), 0) == 0)
     if not cloned:
-        with open(src, "rb", opener=lambda p, f: os.open(p, f | os.O_NOFOLLOW)) as fin, \
-                open(dst, "xb") as fout:
-            shutil.copyfileobj(fin, fout, 1024 * 1024)
+        os.lseek(fd, 0, os.SEEK_SET)
+        with open(dst, "xb") as fout:
+            while chunk := os.read(fd, 1024 * 1024):
+                fout.write(chunk)
     else:
         # A clone carries the source's flags and extended ACL: a child must not plant an
         # immutable or undeletable (``everyone deny delete``) file in the host tree. A byte copy
@@ -1839,6 +1856,58 @@ def find_special_entry(root: Path, *, max_entries: int = MAX_SCRATCH_ENTRIES) ->
                     stack.append(Path(entry.path))
         except OSError as exc:
             raise SandboxError(f"cannot read {p}: {exc}") from exc
+    return None
+
+
+#: Name marker of a copy-back's hidden entries (App Sandbox): ``<mark><tag>`` (the replacement
+#: being built), ``<mark>old-<tag>`` (the host's entries moved aside mid-swap), ``<mark>done-<tag>``
+#: (the replaced entries once every rename is done, being removed), and for a file mount the
+#: sibling ``.<name><mark><tag>``.
+COPY_BACK_MARK = ".blastbox-copyback-"
+_COPY_BACK_DONE = COPY_BACK_MARK + "done-"
+
+
+def clear_stale_copy_backs(source: Path, *,
+                           max_entries: int = MAX_SCRATCH_ENTRIES) -> Path | None:
+    """Before ``source`` is staged as a writable mount: remove what an interrupted copy-back
+    left that is certainly garbage, and return the first leftover that is NOT (or None).
+
+    A worker that exits mid-copy-back (killed, or past its shutdown budget) leaves hidden entries
+    in the host tree, which a later run would stage -- an earlier run's bytes in a new job. A
+    ``done-`` tree is the replaced contents after every rename finished: removed here. Any other
+    (the replacement, or the host's own entries moved aside mid-swap) can't be told apart from
+    data the operator needs back, so it is returned for the caller to refuse the mount over.
+    Never follows a symlink; an unreadable directory, or more than ``max_entries`` entries,
+    raises ``SandboxError`` (what can't be read can't be shown clean)."""
+    candidates: list[Path] = []
+    if not stat.S_ISDIR(os.lstat(source).st_mode):
+        prefix = f".{source.name}{COPY_BACK_MARK}"
+        with os.scandir(source.parent) as it:
+            candidates.extend(Path(e.path) for e in it if e.name.startswith(prefix))
+    else:
+        seen = 0
+        stack = [source]
+        while stack:
+            p = stack.pop()
+            try:
+                with os.scandir(p) as it:
+                    for entry in it:
+                        seen += 1
+                        if seen > max_entries:
+                            raise SandboxError(f"rw mount {source} holds over {max_entries} "
+                                               "entries; it can't be checked for leftovers")
+                        if COPY_BACK_MARK in entry.name:
+                            candidates.append(Path(entry.path))
+                        elif entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+            except OSError as exc:
+                raise SandboxError(f"cannot read {p}: {exc}") from exc
+    for c in sorted(candidates):
+        if c.name.startswith(_COPY_BACK_DONE):
+            remove_tree(c)
+            if not os.path.lexists(c):
+                continue
+        return c
     return None
 
 
@@ -1917,21 +1986,46 @@ def copy_no_follow(src: Path, dst: Path, *, budget_bytes: int | None = None,
     start = budget.bytes
     seen: LinkMap = {} if links is None else links
 
-    def _one(s: Path, d: Path) -> None:
-        st = os.lstat(s)
+    # The SOURCE is walked from pinned descriptors: each directory is opened O_NOFOLLOW and its
+    # children are looked up relative to that fd, and a file is opened O_NOFOLLOW and checked
+    # (fstat) to be the inode lstat classified. The source can be a tree another run can still
+    # write: a directory swapped for a symlink between the lstat and the open is refused, never
+    # followed into whatever host tree the link names.
+    def _open_checked(name: str | Path, dir_fd: int | None, st: os.stat_result,
+                      flags: int, at: Path) -> int:
+        try:
+            fd = os.open(name, flags | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                         dir_fd=dir_fd)
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.ENOENT):
+                raise SandboxError(f"sandbox copy: {at} changed while it was being copied") from exc
+            raise
+        fst = os.fstat(fd)
+        if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino) \
+                or stat.S_IFMT(fst.st_mode) != stat.S_IFMT(st.st_mode):
+            os.close(fd)
+            raise SandboxError(f"sandbox copy: {at} changed while it was being copied")
+        return fd
+
+    def _one(name: str | Path, dir_fd: int | None, s: Path, d: Path) -> None:
+        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
         mode = st.st_mode
         if stat.S_ISLNK(mode):
             # Charged its target's length (what lstat reports as its size): a link stores that
             # text, so a tree of long symlinks can't copy back unmetered under a small budget.
-            target = os.readlink(s)
+            target = os.readlink(name, dir_fd=dir_fd)
             budget.charge(max(len(os.fsencode(target)), st.st_size), s)
             os.symlink(target, d)
         elif stat.S_ISDIR(mode):
             budget.charge(0, s)
-            d.mkdir(mode=0o700)
-            with os.scandir(s) as it:
-                for entry in it:
-                    _one(Path(entry.path), d / entry.name)
+            fd = _open_checked(name, dir_fd, st, os.O_RDONLY | os.O_DIRECTORY, s)
+            try:
+                d.mkdir(mode=0o700)
+                with os.scandir(fd) as it:
+                    for entry in it:
+                        _one(entry.name, fd, s / entry.name, d / entry.name)
+            finally:
+                os.close(fd)
             # After the children: a read-only source dir must not block filling its copy.
             os.chmod(d, _perm_bits(mode), follow_symlinks=False)
         elif stat.S_ISREG(mode):
@@ -1947,14 +2041,20 @@ def copy_no_follow(src: Path, dst: Path, *, budget_bytes: int | None = None,
                     budget.charge(0, s)
                     return
             budget.charge(st.st_size, s)
-            _copy_regular(s, d, mode)
+            # O_NONBLOCK: if the entry became a FIFO since the stat, the open must not hang
+            # (and the fstat check then refuses it).
+            fd = _open_checked(name, dir_fd, st, os.O_RDONLY | os.O_NONBLOCK, s)
+            try:
+                _copy_regular_fd(fd, d, mode)
+            finally:
+                os.close(fd)
             if key is not None:
                 seen.setdefault(key, d)
         else:
             budget.charge(0, s)
             _log.warning("macos sandbox: skipping non-regular file %s (mode %o)", s, mode)
 
-    _one(src, dst)
+    _one(src, None, src, dst)
     return budget.bytes - start
 
 

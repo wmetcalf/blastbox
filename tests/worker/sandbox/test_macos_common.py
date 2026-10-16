@@ -1048,10 +1048,11 @@ class TestCloneSanitizesModes:
         if not os.stat(src).st_mode & stat.S_ISUID:
             pytest.skip("setuid not kept on this filesystem")
 
-        def fake_clone(s, d, flags):
-            # Like APFS clonefile: the copy keeps the source's mode, special bits included.
-            shutil.copyfile(s, d)
-            os.chmod(d, stat.S_IMODE(os.stat(s).st_mode))
+        def fake_clone(fd, dirfd, d, flags):
+            # Like APFS fclonefileat: the copy keeps the source's mode, special bits included.
+            with open(d, "wb") as f:
+                f.write(os.pread(fd, 1 << 20, 0))
+            os.chmod(d, stat.S_IMODE(os.fstat(fd).st_mode))
             return 0
         monkeypatch.setattr(mc, "_CLONEFILE", fake_clone)
         dst = tmp_path / "g"
@@ -1467,8 +1468,9 @@ class TestCopiesDropTheSourceACL:
         # clonefile(2) on current macOS doesn't copy the ACL, but nothing promises that (and
         # it does carry flags and modes): a clone that brings the source's ACL along must not
         # put an undeletable file into the host tree.
-        def acl_clone(s, d, flags):
-            shutil.copyfile(s, d)
+        def acl_clone(fd, dirfd, d, flags):
+            with open(d, "wb") as f:
+                f.write(os.pread(fd, 1 << 20, 0))
             subprocess.run(["/bin/chmod", "+a", "everyone deny delete", os.fsdecode(d)], check=True)
             return 0
         monkeypatch.setattr(mc, "_CLONEFILE", acl_clone)
@@ -1994,3 +1996,101 @@ class TestFindSplitHardLink:
             (w / f"f{i}").write_text("")
         with pytest.raises(SandboxError, match="can't all be checked"):
             mc.find_split_hard_link([w], max_entries=3)
+
+
+class TestSaturatedListingsAreRetried:
+    """Codex P2 (#198): a listing that fills its buffer may be truncated (the uid's processes, or
+    a pid's descriptors, grew between the sizing call and the listing). A sweep that read a
+    truncated process list could miss an escaped child: retry larger, then fail closed."""
+
+    class _Lib:
+        def __init__(self, pids, full_times):
+            self.pids, self.full_times, self.calls = pids, full_times, 0
+
+        def proc_listpids(self, kind, uid, buf, size):
+            if buf is None:
+                return len(self.pids) * 4
+            self.calls += 1
+            if self.calls <= self.full_times:
+                return size                     # filled to the brim: maybe truncated
+            for i, p in enumerate(self.pids):
+                buf[i] = p
+            return len(self.pids) * 4
+
+    def test_a_full_buffer_is_retried_larger(self, monkeypatch):
+        lib = self._Lib([11, 12, 13], full_times=2)
+        monkeypatch.setattr(mc, "_LIBSYSTEM", lib)
+        assert mc.uid_pids(501) == [11, 12, 13]
+        assert lib.calls == 3
+
+    def test_a_buffer_that_stays_full_fails_closed(self, monkeypatch):
+        monkeypatch.setattr(mc, "_LIBSYSTEM", self._Lib([11], full_times=10 ** 6))
+        with pytest.raises(SandboxError, match="kept filling"):
+            mc.uid_pids(501)
+
+    def test_a_full_descriptor_table_is_listed_again(self, monkeypatch):
+        sizes: list[int] = []
+
+        class _Lib:
+            def proc_pidinfo(self, pid, flavor, arg, buf, size):
+                if buf is None:
+                    return 8 * ctypes.sizeof(mc._ProcFdInfo)
+                sizes.append(size)
+                return size if len(sizes) == 1 else 3 * ctypes.sizeof(mc._ProcFdInfo)
+
+        monkeypatch.setattr(mc, "_LIBSYSTEM", _Lib())
+        listed = mc._list_fds(4242)
+        assert listed is not None and listed[1] == 3 * ctypes.sizeof(mc._ProcFdInfo)
+        assert len(sizes) == 2
+
+
+class TestCopierNeverFollowsASwappedSource:
+    """Codex P1 (#198): the copier classifies an entry with lstat and then reads it. A source
+    another run can still write may swap a directory (or file) for a symlink in between; the
+    walk is pinned to O_NOFOLLOW descriptors, so the swap is refused, never followed."""
+
+    def _swap_on_open(self, monkeypatch, victim: str, target):
+        real_open = os.open
+
+        def opener(path, flags, mode=0o777, *, dir_fd=None):
+            if os.fspath(path) == victim and dir_fd is not None:
+                os.rename(victim, victim + ".moved", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+                os.symlink(target, victim, dir_fd=dir_fd)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(mc.os, "open", opener)
+
+    def test_a_directory_swapped_for_a_symlink_is_not_followed(self, tmp_path, monkeypatch):
+        secret = tmp_path / "secret"
+        secret.mkdir()
+        (secret / "key").write_text("host secret")
+        src = tmp_path / "src"
+        (src / "sub").mkdir(parents=True)
+        (src / "sub" / "f").write_text("x")
+        self._swap_on_open(monkeypatch, "sub", str(secret))
+        dst = tmp_path / "dst"
+        with pytest.raises(SandboxError, match="changed while it was being copied"):
+            mc.copy_no_follow(src, dst, budget_bytes=1 << 20)
+        assert not any(p.name == "key" for p in dst.rglob("*"))
+
+    def test_a_file_swapped_for_a_symlink_is_not_followed(self, tmp_path, monkeypatch):
+        secret = tmp_path / "secret"
+        secret.write_text("host secret")
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "f").write_text("x")
+        self._swap_on_open(monkeypatch, "f", str(secret))
+        dst = tmp_path / "dst"
+        with pytest.raises(SandboxError, match="changed while it was being copied"):
+            mc.copy_no_follow(src, dst, budget_bytes=1 << 20)
+        assert not (dst / "f").exists() or (dst / "f").read_text() != "host secret"
+
+    def test_an_untouched_tree_still_copies(self, tmp_path):
+        src = tmp_path / "src"
+        (src / "a" / "b").mkdir(parents=True)
+        (src / "a" / "b" / "f").write_text("data")
+        (src / "l").symlink_to("a/b/f")
+        dst = tmp_path / "dst"
+        mc.copy_no_follow(src, dst, budget_bytes=1 << 20)
+        assert (dst / "a" / "b" / "f").read_text() == "data"
+        assert os.readlink(dst / "l") == "a/b/f"
