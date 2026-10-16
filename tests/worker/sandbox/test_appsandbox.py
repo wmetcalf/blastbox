@@ -1510,3 +1510,91 @@ class TestPrepareSweepsEveryPreviousSlot:
         asb.prepare(root, slots=2, ro_paths=[], runner=_fake_runner([]), home=home)
         assert not (root / "locks" / "1.lock.retired").exists()
 
+
+
+class TestPrepareTakesTheSharedBundleLocks:
+    """Two roots prepared with the same --bundle-prefix share each slot's container (it is keyed
+    by bundle id, not root). A run in the other root holds the per-user bundle lock for the run
+    and both wipes; re-preparing this root must wait for it -- else its sweep SIGKILLs that
+    run's child and empties its Data mid-job."""
+
+    @staticmethod
+    def _hold(path):
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+
+    @staticmethod
+    def _record(monkeypatch):
+        swept: list[Path] = []
+        monkeypatch.setattr(mc, "sweep_containers",
+                            lambda cs, what: swept.extend(cs) or 0)
+        return swept
+
+    def test_a_run_in_another_root_holding_a_bundle_lock_refuses_the_prepare(
+            self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        mine, other = tmp_path / "mine", tmp_path / "other"
+        for r in (mine, other):
+            asb.prepare(r, slots=2, ro_paths=[], bundle_prefix="io.example.shared",
+                        runner=_fake_runner([]), home=home)
+        data = home / "Library" / "Containers" / "io.example.shared.slot1" / "Data"
+        data.mkdir(parents=True)
+        (data / "in-flight").write_text("the other root's job")
+        manifest = (mine / asb.MANIFEST_NAME).read_bytes()
+        swept = self._record(monkeypatch)
+        fd = self._hold(asb.bundle_lock_path(home, "io.example.shared.slot1"))  # other's run
+        try:
+            with pytest.raises(SandboxError, match="io.example.shared.slot1 is in use"):
+                asb.prepare(mine, slots=2, ro_paths=[], bundle_prefix="io.example.shared",
+                            runner=_fake_runner([]), home=home, lock_wait_s=0.2)
+        finally:
+            os.close(fd)
+        assert swept == []                                   # nothing killed
+        assert (data / "in-flight").exists()                 # nothing wiped
+        assert (mine / asb.MANIFEST_NAME).read_bytes() == manifest   # nothing changed
+
+    def test_a_previous_id_and_a_new_slots_id_are_both_locked(self, tmp_path, monkeypatch):
+        # the old prefix (what the sweep matches) and a slot only this prepare creates (what
+        # the rebuild empties) are each another root's container just the same
+        home, root = tmp_path / "home", tmp_path / "root"
+        asb.prepare(root, slots=1, ro_paths=[], bundle_prefix="io.example.old",
+                    runner=_fake_runner([]), home=home)
+        self._record(monkeypatch)
+        for held in ("io.example.old.slot0", "io.example.new.slot1"):
+            fd = self._hold(asb.bundle_lock_path(home, held))
+            try:
+                with pytest.raises(SandboxError, match=f"{held} is in use"):
+                    asb.prepare(root, slots=2, ro_paths=[], bundle_prefix="io.example.new",
+                                runner=_fake_runner([]), home=home, lock_wait_s=0.2)
+            finally:
+                os.close(fd)
+
+    def test_the_prepare_waits_for_the_run_then_proceeds(self, tmp_path, monkeypatch):
+        import threading
+        home, root = tmp_path / "home", tmp_path / "root"
+        asb.prepare(root, slots=1, ro_paths=[], bundle_prefix="io.example.p",
+                    runner=_fake_runner([]), home=home)
+        swept = self._record(monkeypatch)
+        fd = self._hold(asb.bundle_lock_path(home, "io.example.p.slot0"))
+        released = threading.Event()
+
+        def finish_run():
+            time.sleep(0.3)
+            released.set()
+            os.close(fd)
+        t = threading.Thread(target=finish_run)
+        t.start()
+        try:
+            asb.prepare(root, slots=1, ro_paths=[], bundle_prefix="io.example.p",
+                        runner=_fake_runner([]), home=home, lock_wait_s=10)
+        finally:
+            t.join()
+        assert released.is_set() and swept                   # swept only once the run ended
+
+    def test_the_locks_are_released_after_the_prepare(self, tmp_path):
+        home, root = tmp_path / "home", tmp_path / "root"
+        asb.prepare(root, slots=2, ro_paths=[], bundle_prefix="io.example.r",
+                    runner=_fake_runner([]), home=home)
+        for i in range(2):
+            os.close(self._hold(asb.bundle_lock_path(home, f"io.example.r.slot{i}")))

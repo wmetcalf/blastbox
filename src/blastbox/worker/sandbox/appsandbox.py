@@ -465,15 +465,30 @@ def prepare(
     # only the slots it saw, then delete the higher-numbered ones the first had just created --
     # while a freshly started agent ran in one. Agents never take this lock (only slot locks),
     # so it never delays a run; it lives in locks/, which no slot cleanup touches.
+    #
+    # LOCK ORDER (prepare): root prepare lock -> slot locks (ascending) -> bundle locks (sorted
+    # by id). A run takes its slot lock and then its bundle lock, both NON-blocking, and drops the
+    # slot lock when the bundle lock is busy -- it never waits holding one -- so prepare's waits
+    # can't deadlock with a run; two prepares (on other roots sharing a prefix) take bundle locks
+    # in the same global sorted order, so they can't deadlock with each other either.
+    home = home or Path(pwd.getpwuid(os.getuid()).pw_dir)
     with _held_lock(root / "locks" / PREPARE_LOCK, deadline, wait_s,
                     "another `blastbox macos prepare` is running on this root"):
         existing = _existing_slots(root)
         indexes = range(max([slots, *(i + 1 for i in existing)]))
         with _all_slot_locks(root, indexes, wait_s, deadline=deadline):
-            _sweep_previous_slots(root, existing, prefix,
-                                  home or Path(pwd.getpwuid(os.getuid()).pw_dir))
-            return _prepare_locked(root, slots=slots, resolved_ro=resolved_ro, prefix=prefix,
-                                   cc=cc, codesign=codesign, runner=runner)
+            previous = _previous_bundle_ids(root, existing)
+            # Every container this prepare may sweep, empty or rebuild: each existing slot's
+            # previous ids and new id, and each new slot's id. A container is keyed by bundle
+            # id, not root, so another root prepared with the same prefix shares it: its run
+            # holds the per-user bundle lock, and without taking it here the sweep below would
+            # SIGKILL that run's child and wipe its Data mid-job.
+            ids = {bid for i in existing for bid in previous.get(i, set())}
+            ids.update(f"{prefix}.slot{i}" for i in indexes)
+            with _all_bundle_locks(home, ids, wait_s, deadline=deadline):
+                _sweep_previous_slots(root, existing, prefix, home, previous=previous)
+                return _prepare_locked(root, slots=slots, resolved_ro=resolved_ro,
+                                       prefix=prefix, cc=cc, codesign=codesign, runner=runner)
 
 
 def _previous_bundle_ids(root: Path, indexes: Iterable[int]) -> dict[int, set[str]]:
@@ -516,7 +531,8 @@ def _existing_slots(root: Path) -> list[int]:
     return sorted(i for i in found if 0 <= i < 256)
 
 
-def _sweep_previous_slots(root: Path, indexes: Iterable[int], prefix: str, home: Path) -> None:
+def _sweep_previous_slots(root: Path, indexes: Iterable[int], prefix: str, home: Path, *,
+                          previous: dict[int, set[str]] | None = None) -> None:
     """Sweep every given slot under every identity it may carry, then empty it, or raise.
 
     Not only retired slots: an agent killed mid-run (SIGKILL) leaves no marker, and its
@@ -526,7 +542,8 @@ def _sweep_previous_slots(root: Path, indexes: Iterable[int], prefix: str, home:
     indexes = list(indexes)
     if not indexes:
         return
-    previous = _previous_bundle_ids(root, indexes)
+    if previous is None:
+        previous = _previous_bundle_ids(root, indexes)
     for i in indexes:
         marker = root / "locks" / f"{i}.lock.retired"
         if marker.exists() and not previous.get(i):
@@ -599,6 +616,31 @@ def _all_slot_locks(root: Path, indexes: Iterable[int], wait_s: float, *,
             held.append(_wait_lock(
                 root / "locks" / f"{i}.lock", deadline, wait_s,
                 f"slot {i} is in use by a running job; stop the agent, or retry when it is idle"))
+        yield
+    finally:
+        for fd in reversed(held):
+            AppSandboxSandbox._unlock(fd)
+
+
+def bundle_lock_path(home: Path, bundle_id: str) -> Path:
+    """Per-user lock for ``bundle_id`` (and so its container), shared by every root."""
+    d = home / "Library" / "Caches" / "blastbox" / "appsandbox-locks"
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return d / f"{bundle_id}.lock"
+
+
+@contextlib.contextmanager
+def _all_bundle_locks(home: Path, bundle_ids: Iterable[str], wait_s: float, *,
+                      deadline: float) -> Iterator[None]:
+    """Hold the per-user lock of every listed bundle id, in sorted order, or raise if a run
+    (in this root or another sharing the prefix) keeps one past ``deadline``."""
+    held: list[int] = []
+    try:
+        for bid in sorted(set(bundle_ids)):
+            held.append(_wait_lock(
+                bundle_lock_path(home, bid), deadline, wait_s,
+                f"bundle {bid} is in use by a running job (in this root or another prepared "
+                "with the same --bundle-prefix); stop it, or retry when it is idle"))
         yield
     finally:
         for fd in reversed(held):
@@ -850,7 +892,9 @@ class AppSandboxSandbox:
                 # The container is keyed by bundle id, not by root: two roots prepared with the
                 # same --bundle-prefix share ~/Library/Containers/<id>. A per-user lock on the id,
                 # held for the run and both wipes, keeps them from running in (and wiping) one
-                # container at once.
+                # container at once. Both locks are taken NON-blocking (slot, then bundle) and the
+                # slot lock dropped when the bundle one is busy: a run never waits holding a lock,
+                # so prepare (which waits, in the order documented there) can't deadlock with it.
                 bfd = self._try_lock(self.bundle_lock_path(slot))
                 if bfd is None:
                     self._unlock(fd)
@@ -876,9 +920,7 @@ class AppSandboxSandbox:
 
     def bundle_lock_path(self, slot: Slot) -> Path:
         """Per-user lock for ``slot``'s bundle id (and so its container), shared by every root."""
-        d = self._home / "Library" / "Caches" / "blastbox" / "appsandbox-locks"
-        d.mkdir(parents=True, exist_ok=True, mode=0o700)
-        return d / f"{slot.bundle_id}.lock"
+        return bundle_lock_path(self._home, slot.bundle_id)
 
     @staticmethod
     def _try_lock(path: Path) -> int | None:
