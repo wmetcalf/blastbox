@@ -22,6 +22,13 @@ from blastbox.errors import SandboxError
 from blastbox.limits import Limits
 from blastbox.worker.sandbox import macos_common as mc
 
+# What only macOS has. The launcher refuses to run without its libproc process limit, and BSD
+# file flags (chflags) and extended ACLs (chmod +a) don't exist on Linux: tests that run the
+# real launcher or set those are macOS-only. Everything else here runs on any POSIX host.
+macos_launcher = pytest.mark.skipif(sys.platform != "darwin",
+                                    reason="runs the macOS launcher (libproc process limit)")
+macos_file_flags = pytest.mark.skipif(not hasattr(os, "chflags"),
+                                      reason="BSD file flags are macOS's")
 
 class TestChildEnv:
     def test_points_home_tmp_and_caches_at_scratch(self, tmp_path):
@@ -138,6 +145,7 @@ class TestResolveExecutable:
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
 class TestLifecycle:
+    @macos_launcher
     def test_timeout_kills_the_group(self, tmp_path):
         t0 = time.monotonic()
         r = mc.run_confined(["/bin/sleep", "30"], env={"PATH": mc.MINIMAL_PATH},
@@ -145,6 +153,7 @@ class TestLifecycle:
         assert r.killed and r.exit_code == -9
         assert time.monotonic() - t0 < 10
 
+    @macos_launcher
     def test_rss_watchdog_kills_over_limit(self, tmp_path):
         r = mc.run_confined(["/bin/sleep", "30"], env={"PATH": mc.MINIMAL_PATH},
                             limits=Limits(timeout_s=20), cwd=tmp_path,
@@ -152,6 +161,7 @@ class TestLifecycle:
         assert r.killed
         assert b"RSS exceeded" in r.stderr
 
+    @macos_launcher
     def test_stdin_closed_and_output_captured(self, tmp_path):
         r = mc.run_confined(["/bin/sh", "-c", "cat; echo done"], env={"PATH": mc.MINIMAL_PATH},
                             limits=Limits(timeout_s=10), cwd=tmp_path)
@@ -164,6 +174,7 @@ class TestLifecycle:
             return False
         return True
 
+    @macos_launcher
     def test_a_forked_child_does_not_outlive_a_normal_exit(self, tmp_path):
         pidfile = tmp_path / "pid"
         r = mc.run_confined(["/bin/sh", "-c", f'sleep 60 </dev/null >/dev/null 2>&1 & echo $! > {pidfile}; exit 0'],
@@ -173,6 +184,7 @@ class TestLifecycle:
         time.sleep(0.2)
         assert not self._alive(pid)
 
+    @macos_launcher
     def test_a_setsid_escapee_is_reaped(self, tmp_path):
         # Leaves the process group, so only the watchdog's family tracking can find it.
         pidfile = tmp_path / "pid"
@@ -185,12 +197,14 @@ class TestLifecycle:
         time.sleep(0.2)
         assert not self._alive(pid)
 
+    @macos_launcher
     def test_captured_output_is_bounded(self, tmp_path):
         r = mc.run_confined(["/bin/sh", "-c", "head -c 5000000 /dev/zero"], env={"PATH": mc.MINIMAL_PATH},
                             limits=Limits(timeout_s=10), cwd=tmp_path, max_output_bytes=1000)
         assert len(r.stdout) == 1000
         assert b"stdout truncated at 1000 bytes" in r.stderr
 
+    @macos_launcher
     def test_disk_watchdog_caps_the_whole_run(self, tmp_path):
         # Many files, each under RLIMIT_FSIZE, adding up past tmpfs_bytes.
         scratch = tmp_path / "scratch"
@@ -201,11 +215,13 @@ class TestLifecycle:
         assert r.killed
         assert b"writable dirs exceeded" in r.stderr
 
+    @macos_launcher
     def test_process_count_is_capped(self, tmp_path):
         r = mc.run_confined(["/bin/sh", "-c", "i=0; while [ $i -lt 300 ]; do sleep 5 & i=$((i+1)); done; wait"],
                             env={"PATH": mc.MINIMAL_PATH}, limits=Limits(timeout_s=20), cwd=tmp_path)
         assert b"fork" in r.stderr.lower() or b"resource temporarily unavailable" in r.stderr.lower()
 
+    @macos_launcher
     def test_rlimits_come_from_the_launcher_not_preexec_fn(self, tmp_path):
         seen = {}
 
@@ -344,6 +360,7 @@ class TestSeedAndCapture:
 
 
 class TestWipeDir:
+    @macos_file_flags
     def test_unlocks_and_empties(self, tmp_path):
         d = tmp_path / "slot"
         (d / "locked").mkdir(parents=True)
@@ -375,6 +392,7 @@ class TestLoaderEnv:
         assert not [k for k in env if k.startswith(("DYLD_", "LD_"))]
         assert env["K"] == "v"
 
+    @macos_launcher
     def test_the_launcher_runs_with_its_own_env_and_execs_the_child_with_the_requested_one(
             self, tmp_path):
         seen = {}
@@ -546,6 +564,7 @@ class TestFailClosedMeasurement:
         assert mc.dir_usage([d], 1000)[2] is True
         assert mc.dir_usage([tmp_path / "missing"], 1000) == (0, 0, True)
 
+    @macos_launcher
     def test_the_watchdog_trips_on_what_it_cannot_measure(self, tmp_path):
         w = tmp_path / "w"
         w.mkdir()
@@ -557,6 +576,7 @@ class TestFailClosedMeasurement:
 
 
 class TestWipeDirLockedRoot:
+    @macos_file_flags
     def test_a_root_chmodded_000_is_unlocked_and_emptied(self, tmp_path):
         d = tmp_path / "Data"
         (d / "sub").mkdir(parents=True)
@@ -566,6 +586,7 @@ class TestWipeDirLockedRoot:
         mc.wipe_dir(d)
         assert list(d.iterdir()) == []
 
+    @pytest.mark.skipif(sys.platform != "darwin", reason="macOS ACLs")
     def test_deny_acls_on_the_root_and_children_are_stripped_and_emptied(self, tmp_path):
         # what a sandboxed child (App Sandbox, or Seatbelt before ACLs were denied) can leave:
         # deny-delete ACLs on files, a deny-delete_child ACL on a subdir and on the root itself
@@ -1131,6 +1152,7 @@ class TestOpenUnlinkedFilesCount:
 
 
 class TestWatchdogExitIsBounded:
+    @macos_launcher
     @pytest.mark.timeout(60)
     def test_a_stuck_watchdog_still_gets_the_run_killed_and_swept(self, tmp_path, monkeypatch):
         # __exit__ raising (the watchdog would not stop) must not skip the family kill and the
@@ -1256,6 +1278,7 @@ class TestKillFamilyChecksNewMembers:
 
 
 class TestFinalDiskSample:
+    @macos_launcher
     def test_a_burst_after_the_last_sample_fails_the_run(self, tmp_path, monkeypatch):
         # each file is under RLIMIT_FSIZE (= tmpfs_bytes); together they are over the limit.
         # The watchdog never samples (as if the burst landed between samples and the run
@@ -1271,6 +1294,7 @@ class TestFinalDiskSample:
         assert r.killed
         assert b"writable dirs exceeded" in r.stderr
 
+    @macos_launcher
     def test_a_run_under_the_limit_is_not_flagged(self, tmp_path, monkeypatch):
         monkeypatch.setattr(mc.RssWatchdog, "_loop", lambda self: None)
         w = tmp_path / "w"
@@ -1403,6 +1427,7 @@ class TestPinnedWatchRoots:
 
 
 class TestTimeoutKill:
+    @macos_launcher
     def test_the_timeout_path_never_kills_by_a_bare_group_lookup(self, tmp_path, monkeypatch):
         # After the leader is reaped (the watchdog's poll() can do it at the timeout boundary)
         # getpgid(leader pid) may name another job's group: only identity-gated kills remain.

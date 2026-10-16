@@ -745,7 +745,7 @@ class RssWatchdog:
         *,
         interval_s: float = 0.25,
         rss_fn: Callable[[int], int] | None = None,
-        watch_dirs: Iterable[Path] = (),
+        watch_dirs: Iterable[Path | WatchRoot] = (),
         disk_limit_bytes: int | None = None,
         table_fn: Callable[[], list[_Proc]] = process_table,
         member_fn: Callable[[int], bool] | None = None,
@@ -764,7 +764,8 @@ class RssWatchdog:
         # Pinned roots (run_confined pins them before launch) are already disjoint; plain paths
         # (direct callers, tests) are deduplicated here.
         self._watch: list[Path | WatchRoot] = (
-            watch if all(isinstance(w, WatchRoot) for w in watch) else disjoint_roots(watch))
+            watch if all(isinstance(w, WatchRoot) for w in watch)
+            else [*disjoint_roots(w for w in watch if isinstance(w, Path))])
         self._disk_limit = disk_limit_bytes
         self._stop = threading.Event()
         self.tripped: str | None = None     # "memory" / "disk" / None
@@ -775,6 +776,7 @@ class RssWatchdog:
         # emergency cleanup reads them in kill_family() -- unguarded, that iteration can raise
         # "dictionary changed size during iteration" and skip the kill.
         self._seen_lock = threading.Lock()
+        self._pgid: int | None
         try:
             self._pgid = os.getpgid(proc.pid)
         except (ProcessLookupError, OSError):
@@ -912,7 +914,10 @@ class RssWatchdog:
         if self._stop.is_set():
             return
         self._remember_confirmed([r.pid for r in family])
-        rss = self._rss_fn(self._pgid) if self._rss_fn else sum(r.rss for r in family)
+        # rss_fn is keyed by group id; with no usable group, the leader's pid (which a
+        # session leader's group id equals) rather than None.
+        key = self._pgid if self._pgid is not None else self._proc.pid
+        rss = self._rss_fn(key) if self._rss_fn else sum(r.rss for r in family)
         self.peak_bytes = max(self.peak_bytes, rss)
         if rss > self._limit:
             self._trip("memory", f"RSS {rss} > limit {self._limit}")
@@ -1396,15 +1401,18 @@ def _list_fds(pid: int) -> tuple[ctypes.Array, int] | None:
 
     ``proc_pidinfo`` returns 0 both on failure and for a process with no descriptors open (a
     child that closed its stdio, say): errno, cleared before each call, tells them apart."""
+    lib = _LIBSYSTEM
+    if lib is None:     # callers check first; kept so a new caller can't skip it silently
+        raise SandboxError("cannot list descriptors: libSystem process APIs unavailable")
     err = 0
     for attempt in range(_FD_LIST_TRIES):
         ctypes.set_errno(0)
-        n = _LIBSYSTEM.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, None, 0)
+        n = lib.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, None, 0)
         sized = n > 0 or (n == 0 and ctypes.get_errno() == 0)
         fds = (_ProcFdInfo * (max(n, 0) // ctypes.sizeof(_ProcFdInfo) + 64))()
         if sized:
             ctypes.set_errno(0)
-            got = _LIBSYSTEM.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, fds, ctypes.sizeof(fds)) \
+            got = lib.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, fds, ctypes.sizeof(fds)) \
                 if n > 0 else 0
             if got > 0 or (got == 0 and ctypes.get_errno() == 0):
                 return fds, got         # (an empty table is an answer too)

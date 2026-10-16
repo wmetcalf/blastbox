@@ -152,7 +152,9 @@ class TestRunShape:
         dashdash = argv.index("--")
         # sandbox-exec runs the handshake shim, which execs the target with its own argv
         assert argv[dashdash + 1:dashdash + 4] == ["/bin/sh", "-c", HANDSHAKE_SHIM]
-        assert argv[dashdash + 7:] == ["/bin/echo", "hi"]
+        # the target is resolved (no symlinks): /bin/echo on macOS, /usr/bin/echo on a
+        # merged-/usr Linux
+        assert argv[dashdash + 7:] == [os.path.realpath("/bin/echo"), "hi"]
         params = dict(a.split("=", 1) for a in argv[3:dashdash] if a != "-D")
         assert str(data.resolve()) in params.values()
         # the request env reaches the target through the launcher, never the launcher itself

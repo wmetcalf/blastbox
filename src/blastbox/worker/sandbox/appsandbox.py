@@ -314,7 +314,7 @@ def _parse_manifest(raw: object, root: Path, path: Path) -> Manifest:
     if not isinstance(generation, str):
         raise _manifest_error(path, "generation must be a string")
     # Bundle ids are used as paths (container, lock): they must stay plain identifiers.
-    if not _valid_bundle_id(prefix):
+    if not isinstance(prefix, str) or not _valid_bundle_id(prefix):
         raise SandboxUnavailable(f"appsandbox manifest has invalid bundle ids {[prefix]!r}; "
                                  "re-run `blastbox macos prepare`")
     if not isinstance(ro_paths, list) or not all(
@@ -333,8 +333,9 @@ def _parse_manifest(raw: object, root: Path, path: Path) -> Manifest:
         if not _valid_bundle_id(bundle_id) or bundle_id != f"{prefix}.slot{index}":
             raise SandboxUnavailable(f"appsandbox manifest has invalid bundle ids {[bundle_id]!r}; "
                                      "re-run `blastbox macos prepare`")
-        fields = {k: s.get(k) for k in ("bundle", "io_dir", "lock_path")}
-        if not all(isinstance(v, str) and os.path.isabs(v) for v in fields.values()):
+        raw_fields = {k: s.get(k) for k in ("bundle", "io_dir", "lock_path")}
+        fields = {k: v for k, v in raw_fields.items() if isinstance(v, str) and os.path.isabs(v)}
+        if len(fields) != len(raw_fields):
             raise _manifest_error(path, f"slot {pos} paths must be absolute strings")
         want = {"bundle": real_root / "slots" / str(index) / f"bb-slot-{index}.app",
                 "io_dir": real_root / "slots" / str(index) / "io",
@@ -1037,9 +1038,9 @@ class AppSandboxSandbox:
                 raise
             AppSandboxSandbox._swap_children(dest, new, old)
         else:
-            locked = mc.locked_file_target(dest)
-            if locked is not None:
-                raise SandboxError(f"appsandbox: rw mount {dest} can't be replaced ({locked}); "
+            locked_target = mc.locked_file_target(dest)
+            if locked_target is not None:
+                raise SandboxError(f"appsandbox: rw mount {dest} can't be replaced ({locked_target}); "
                                    "not copied back")
             new = dest.with_name(f".{dest.name}.blastbox-copyback-{secrets.token_hex(8)}")
             try:
