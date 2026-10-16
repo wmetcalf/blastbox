@@ -1168,7 +1168,6 @@ print("ready", flush=True); time.sleep(60)
 '''
 
 
-@darwin_only
 class TestHeldFilesRevalidateIdentity:
     """A run's held-file scan reads each process's tables by pid, after the family was listed.
     A member that exited by then may have its pid reused by another job: that job's held files
@@ -1236,6 +1235,7 @@ class TestHeldFilesRevalidateIdentity:
             proc.wait()
 
 
+@darwin_only
 class TestOpenUnlinkedFilesCount:
     def test_held_unlinked_bytes_sees_open_and_mapped_files(self, tmp_path):
         p = subprocess.Popen([sys.executable, "-I", "-c", _HOLDER, str(tmp_path)],
