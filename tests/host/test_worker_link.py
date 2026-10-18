@@ -1,0 +1,369 @@
+"""Pure tests for ``blastbox worker-link`` (host half): validation, allocation, rendering, and
+its COEXISTENCE with the egress overlay.
+
+The egress compatibility block at the bottom is the reason this file exists as much as the
+rest: worker-link is a second WireGuard overlay on hosts and workers that may already run the
+egress tier, and the two point in opposite trust directions. Each of those tests names the
+specific way they could interfere.
+"""
+from __future__ import annotations
+
+import ipaddress
+import json
+
+import pytest
+
+from blastbox.host.worker_link import (
+    NFT_TABLE,
+    RFC1918,
+    JoinBundle,
+    WorkerLinkConfig,
+    firewall_in_force,
+    firewall_unit,
+    host_firewall_nft,
+    host_wg_config,
+    link_peer_stanza,
+    next_free_ip,
+    parse_endpoint,
+)
+
+KEY_A = "A" * 43 + "="
+KEY_B = "B" * 43 + "="
+CERT = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
+
+
+def _chain(ruleset: str, name: str) -> str:
+    """The body of one chain (up to its closing tab-brace; sets contain braces too)."""
+    return ruleset.split(f"chain {name} {{\n", 1)[1].split("\n\t}", 1)[0]
+
+
+def _cfg(**kw) -> WorkerLinkConfig:
+    kw.setdefault("endpoint", "gw.example.org")
+    return WorkerLinkConfig(**kw)
+
+
+# ------------------------------------------------------------------------------ config
+
+def test_defaults_are_the_documented_ones():
+    c = WorkerLinkConfig()
+    assert (c.wg_iface, c.overlay_net, c.host_ip, c.wg_port, c.agent_port) == (
+        "wtwg0", "10.78.0.0/24", "10.78.0.1", 51822, 8765)
+
+
+@pytest.mark.parametrize("iface", ["", "wt wg0", "wtwg0;rm", "a" * 16, "-wt", "../x"])
+def test_unsafe_or_overlong_interface_names_are_refused(iface):
+    # The name reaches argv, a filename and an nft string; 15 is IFNAMSIZ-1 (and wg-quick's
+    # own limit on macOS).
+    with pytest.raises(ValueError):
+        WorkerLinkConfig(wg_iface=iface)
+
+
+@pytest.mark.parametrize("net", ["203.0.113.0/24", "100.64.0.0/24", "fd00::/64", "10.78.0.0/30",
+                                 "10.0.0.0/15", "nonsense"])
+def test_overlay_must_be_a_sane_rfc1918_v4_prefix(net):
+    with pytest.raises(ValueError):
+        WorkerLinkConfig(overlay_net=net)
+
+
+def test_every_allowed_overlay_range_is_one_the_job_leak_guard_already_blocks():
+    """The leak guard's block_internal drops netwire._INTERNAL_NETS. Restricting the overlay to
+    RFC 1918 is what makes "a sample cannot reach the control link" true at that layer too,
+    not only at the worker firewall. If either list changes, this must be re-decided."""
+    from blastbox.host.netwire import _INTERNAL_NETS
+
+    internal = [ipaddress.ip_network(n) for n in _INTERNAL_NETS]
+    for block in RFC1918:
+        assert any(ipaddress.ip_network(block).subnet_of(i) for i in internal), block
+
+
+@pytest.mark.parametrize("host", ["10.78.0.0", "10.78.0.255", "10.79.0.1", "x"])
+def test_host_ip_must_be_usable_inside_the_overlay(host):
+    with pytest.raises(ValueError):
+        WorkerLinkConfig(host_ip=host)
+
+
+@pytest.mark.parametrize("port", [0, 65536, -1, "x"])
+def test_ports_are_validated(port):
+    with pytest.raises(ValueError):
+        WorkerLinkConfig(wg_port=port)
+    with pytest.raises(ValueError):
+        WorkerLinkConfig(agent_port=port)
+
+
+@pytest.mark.parametrize("src,why", [("0.0.0.0/0", "ANY"), ("10.78.0.0/16", "overlaps"),
+                                     ("fe80::/10", "IPv4")])
+def test_dispatcher_sources_cannot_open_the_link_to_everything(src, why):
+    with pytest.raises(ValueError, match=why):
+        WorkerLinkConfig(dispatcher_sources=(src,))
+
+
+def test_env_round_trip_and_no_key_material():
+    c = _cfg(dispatcher_sources=("172.18.0.0/16",), overlay_net="192.168.77.0/24")
+    lines = c.to_env_lines()
+    env = dict(line.split("=", 1) for line in lines)
+    assert WorkerLinkConfig.from_env(env) == c
+    text = "\n".join(lines).lower()
+    for secret in ("private", "secret", "token", "key=", "pass"):
+        assert secret not in text
+
+
+@pytest.mark.parametrize("raw,want", [
+    ("gw.example.org", ("gw.example.org", 51822)),
+    ("GW.Example.org:4500", ("gw.example.org", 4500)),
+    ("192.0.2.7", ("192.0.2.7", 51822)),
+    ("[2001:db8::1]:51900", ("[2001:db8::1]", 51900)),
+])
+def test_endpoint_parsing(raw, want):
+    assert parse_endpoint(raw) == want
+
+
+@pytest.mark.parametrize("raw", ["", "http://gw:1", "gw:0", "gw:70000", "gw /x", "2001:db8::1",
+                                 "-gw.example.org", "gw.example.org:1:2", "a b", "1.2.3"])
+def test_bad_endpoints_are_refused(raw):
+    # It lands in an `Endpoint =` line on every worker that joins.
+    with pytest.raises(ValueError):
+        parse_endpoint(raw)
+
+
+# -------------------------------------------------------------------------- allocation
+
+def test_next_free_ip_is_the_lowest_unused_and_skips_the_host():
+    c = _cfg()
+    assert next_free_ip(c, []) == "10.78.0.2"
+    assert next_free_ip(c, ["10.78.0.2/32", "10.78.0.3"]) == "10.78.0.4"
+    assert next_free_ip(c, ["garbage", "10.78.0.2/32"]) == "10.78.0.3"
+
+
+def test_next_free_ip_reports_a_full_overlay():
+    c = _cfg(overlay_net="10.78.0.0/29")     # .1 host, .2-.6 workers
+    taken = [f"10.78.0.{i}" for i in range(2, 7)]
+    with pytest.raises(RuntimeError, match="full"):
+        next_free_ip(c, taken)
+
+
+def test_member_refuses_the_host_and_out_of_overlay_addresses():
+    c = _cfg()
+    for bad in ("10.78.0.1", "10.78.1.2", "10.78.0.255", "10.78.0.0", "nope"):
+        with pytest.raises(ValueError):
+            c.member(bad)
+    assert c.member(" 10.78.0.9 ") == "10.78.0.9"
+
+
+# ------------------------------------------------------------------------------ wg config
+
+def test_host_config_never_enables_forwarding():
+    """Unlike the egress exit host, nothing is ever routed THROUGH this end."""
+    conf = host_wg_config(_cfg(), "PRIV")
+    assert "ip_forward" not in conf and "PostUp" not in conf and "PostDown" not in conf
+    assert "Address = 10.78.0.1/24" in conf and "ListenPort = 51822" in conf
+
+
+def test_peer_stanza_pins_the_worker_to_its_own_32():
+    s = link_peer_stanza("mac1", "10.78.0.5", KEY_A, cfg=_cfg(), expires="2026-11-01T00:00:00+00:00")
+    assert "\n# peer:mac1\n# expires:2026-11-01T00:00:00+00:00\n[Peer]\n" in s
+    assert "AllowedIPs = 10.78.0.5/32\n" in s
+    assert "Endpoint" not in s and "Keepalive" not in s      # the worker dials and keeps alive
+
+
+@pytest.mark.parametrize("name,ip,key", [
+    ("bad name", "10.78.0.5", KEY_A), ("mac1", "10.78.0.1", KEY_A),
+    ("mac1", "10.99.0.5", KEY_A), ("mac1", "10.78.0.5", "A" * 43),
+    ("mac1", "10.78.0.5", "A" * 44 + "AA=="),
+])
+def test_peer_stanza_validates_everything(name, ip, key):
+    with pytest.raises(ValueError):
+        link_peer_stanza(name, ip, key, cfg=_cfg())
+
+
+def test_stanza_parses_back_through_the_shared_egress_helpers():
+    """Worker-link reuses egress's # peer: parsing; the formats must agree byte-for-byte."""
+    from blastbox.host.egress_apply import _peer_blocks, drop_peer_blocks
+
+    c = _cfg()
+    body = host_wg_config(c, "P") + link_peer_stanza("a", "10.78.0.2", KEY_A, cfg=c) \
+        + link_peer_stanza("b", "10.78.0.3", KEY_B, cfg=c)
+    assert _peer_blocks(body) == [("a", "10.78.0.2/32", KEY_A), ("b", "10.78.0.3/32", KEY_B)]
+    left = drop_peer_blocks(body, ["a"])
+    assert _peer_blocks(left) == [("b", "10.78.0.3/32", KEY_B)]
+    assert left.startswith(host_wg_config(c, "P"))
+
+
+# ------------------------------------------------------------------------------ firewall
+
+def test_host_firewall_lets_only_the_host_open_the_agent_port():
+    fw = host_firewall_nft(_cfg())
+    assert f"table inet {NFT_TABLE} {{}}\ndelete table inet {NFT_TABLE}\n" in fw   # atomic replace
+    out = _chain(fw, "output")
+    assert 'oifname "wtwg0" ip saddr 10.78.0.1 ip daddr 10.78.0.0/24 tcp dport 8765 ct state new accept' in out
+    assert out.strip().splitlines()[-1].strip() == 'oifname "wtwg0" drop'
+    inp = _chain(fw, "input")
+    # a worker can never start anything toward the host
+    lines = [ln.strip() for ln in inp.strip().splitlines()]
+    assert lines[1:4] == ['iifname "wtwg0" ct state established,related accept',
+                          'iifname "wtwg0" drop',
+                          'iifname != { "lo", "wtwg0" } ip daddr 10.78.0.0/24 drop']
+    fwd = _chain(fw, "forward")
+    # nothing is routed from a link peer; with no dispatcher source nothing is routed INTO it
+    assert 'iifname "wtwg0" drop' in fwd and "ct state new accept" not in fwd
+    assert "masquerade" not in fw and "ip_forward" not in fw
+
+
+def test_a_containerised_dispatcher_is_admitted_and_masqueraded_only_from_its_source():
+    fw = host_firewall_nft(_cfg(dispatcher_sources=("172.18.0.0/16", "172.19.0.0/16")))
+    fwd = _chain(fw, "forward")
+    assert ('oifname "wtwg0" ip saddr { 172.18.0.0/16, 172.19.0.0/16 } ip daddr 10.78.0.0/24 '
+            'tcp dport 8765 ct state new accept') in fwd
+    # worker-originated forwarding is dropped BEFORE the dispatcher accept can be reached
+    assert fwd.index('iifname "wtwg0" drop') < fwd.index("ct state new accept")
+    assert 'oifname "wtwg0" ip saddr { 172.18.0.0/16, 172.19.0.0/16 } masquerade' in fw
+    assert "type nat hook postrouting priority srcnat" in fw
+
+
+def test_every_base_chain_is_policy_accept_and_matches_only_the_link():
+    """nftables requires EVERY base chain on a hook to accept, so an accept here cannot
+    override docker's FORWARD drop, and a rule that is not scoped to the link interface would
+    change verdicts for docker / egress traffic. Every rule names the link."""
+    fw = host_firewall_nft(_cfg(dispatcher_sources=("172.18.0.0/16",)))
+    rules = [ln.strip() for ln in fw.splitlines()
+             if ln.startswith("\t\t") and not ln.strip().startswith("type ")]
+    assert rules and all('"wtwg0"' in r for r in rules), rules
+    assert fw.count("policy accept;") == 4
+
+
+def test_firewall_in_force_reads_the_kernel_listing_not_the_file():
+    cfg = _cfg()
+    # The shape `nft list table` prints (tabs, the hook line, a counter-less drop).
+    listing = host_firewall_nft(cfg).split(f"delete table inet {NFT_TABLE}\n", 1)[1]
+    assert firewall_in_force(listing, iface="wtwg0") == []
+    no_drop = listing.replace('\t\tiifname "wtwg0" drop\n', "", 1)
+    assert any("input" in m for m in firewall_in_force(no_drop, iface="wtwg0"))
+    unhooked = listing.replace("type filter hook output priority filter; policy accept;", "")
+    assert any("output" in m and "hooked" in m for m in firewall_in_force(unhooked, iface="wtwg0"))
+    assert len(firewall_in_force("", iface="wtwg0")) == 3
+    # another interface's drop is not ours
+    assert firewall_in_force(listing.replace('"wtwg0"', '"other"'), iface="wtwg0")
+
+
+def test_a_counter_on_the_drop_still_counts():
+    listing = ("table inet t {\n\tchain input {\n\t\ttype filter hook input priority filter; "
+               "policy accept;\n\t\tiifname \"wtwg0\" counter packets 3 bytes 180 drop\n\t}\n}\n")
+    assert firewall_in_force(listing, iface="wtwg0", chains=("input",)) == []
+
+
+def test_firewall_unit_loads_before_the_link_and_deletes_only_its_table():
+    u = firewall_unit(nft_bin="/usr/sbin/nft", nft_file="/etc/blastbox/worker-link.nft",
+                      table=NFT_TABLE, iface="wtwg0", description="d")
+    assert "Before=wg-quick@wtwg0.service" in u
+    # REQUIRED by the link, not merely wanted: a ruleset that fails to load at boot must keep
+    # the interface down rather than let it come up open.
+    assert "RequiredBy=wg-quick@wtwg0.service" in u
+    assert "AssertPathExists=/etc/blastbox/worker-link.nft" in u and "ConditionPath" not in u
+    assert "ExecStart=/usr/sbin/nft -f /etc/blastbox/worker-link.nft" in u
+    assert f"ExecStop=-/usr/sbin/nft delete table inet {NFT_TABLE}" in u
+    assert "flush ruleset" not in u
+
+
+# ------------------------------------------------------------------------------- bundle
+
+def _bundle(**kw) -> JoinBundle:
+    base = dict(name="mac1", iface="wtwg0", worker_ip="10.78.0.5", host_ip="10.78.0.1",
+                overlay_net="10.78.0.0/24", endpoint="gw.example.org:51822",
+                host_public_key=KEY_A, agent_port=8765, ca_pem=CERT, cert_pem=CERT)
+    base.update(kw)
+    return JoinBundle(**base)
+
+
+def test_bundle_round_trips_and_carries_no_private_material():
+    b = _bundle()
+    text = b.to_json()
+    assert JoinBundle.from_json(text) == b
+    assert "PRIVATE" not in text and "PrivateKey" not in text
+
+
+@pytest.mark.parametrize("kw", [
+    {"worker_ip": "10.78.0.1"}, {"worker_ip": "10.99.0.5"}, {"host_public_key": "x"},
+    {"endpoint": "http://x"}, {"cert_pem": CERT + CERT}, {"ca_pem": "nope"},
+    {"name": "a/b"}, {"iface": "wt;wg"},
+])
+def test_bundle_validates_every_field(kw):
+    with pytest.raises(ValueError):
+        _bundle(**kw)
+
+
+def test_bundle_from_json_refuses_foreign_or_partial_documents():
+    with pytest.raises(ValueError, match="not a blastbox"):
+        JoinBundle.from_json(json.dumps({"name": "x"}))
+    obj = json.loads(_bundle().to_json())
+    del obj["cert_pem"]
+    with pytest.raises(ValueError, match="missing cert_pem"):
+        JoinBundle.from_json(json.dumps(obj))
+    obj = json.loads(_bundle().to_json())
+    obj["blastbox_worker_link"] = 2
+    with pytest.raises(ValueError, match="version"):
+        JoinBundle.from_json(json.dumps(obj))
+    with pytest.raises(ValueError, match="not JSON"):
+        JoinBundle.from_json("{")
+
+
+# ------------------------------------------------------------- coexistence with egress (1)
+
+def test_egress_teardown_cannot_touch_the_worker_link():
+    """`egress teardown` deletes by match. Nothing it matches may be worker-link's: not the
+    interface, not the nft table, not an ip rule over the link overlay."""
+    from blastbox.host.egress import EgressConfig, teardown_steps
+
+    for cfg in (EgressConfig(), EgressConfig(mode="global", upstream_gw="10.77.0.1",
+                                             exit_host=True)):
+        text = "\n".join(" ".join(s.argv) for s in teardown_steps(cfg, exit_iface="br-x"))
+        assert "wtwg0" not in text and "10.78." not in text and "nft" not in text
+        assert NFT_TABLE not in text
+
+
+def test_the_worker_link_ruleset_never_touches_egress_state():
+    """Worker-link is nftables in its own table: no iptables, no BB-WG-* chain, no ip rule
+    (egress owns priorities 99-101), no routing table, no egress unit."""
+    link = _cfg(dispatcher_sources=("172.18.0.0/16",))
+    text = host_firewall_nft(link) + host_wg_config(link, "P") + firewall_unit(
+        nft_bin="nft", nft_file="f", table=NFT_TABLE, iface="wtwg0", description="d")
+    for forbidden in ("iptables", "BB-WG", "ip rule", "lookup", "priority 99", "priority 100",
+                      "priority 101", "bbwg", "blastbox-egress", "flush ruleset", "table ip "):
+        assert forbidden not in text, forbidden
+
+
+def test_default_overlays_ports_and_interfaces_are_disjoint():
+    from blastbox.host.egress import EgressConfig
+
+    e, w = EgressConfig(), WorkerLinkConfig()
+    assert e.wg_iface != w.wg_iface and e.wg_port != w.wg_port
+    assert not ipaddress.ip_network(e.overlay_net).overlaps(ipaddress.ip_network(w.overlay_net))
+
+
+# ------------------------------------------------------- coexistence with egress (2): underlay
+
+def test_egress_global_mode_never_captures_the_worker_links_underlay_traffic():
+    """In egress GLOBAL mode a worker node source-routes the forwarder's traffic into bbwg0.
+    The worker-link handshake is this node's OWN UDP to the host endpoint: it must not be
+    selected by any rule egress installs, or the control link would ride the egress exit.
+
+    Proven from the plan, not assumed: every `ip rule add` egress emits selects either the
+    forwarder's /32 source or the EGRESS overlay as destination; neither can match a packet
+    sourced from the node's own address toward a public endpoint or the link overlay. And the
+    egress peer config is `Table = off` with no fwmark, so wg-quick adds no catch-all rules.
+    """
+    from blastbox.host.egress import EgressConfig, forwarder_source_route_steps, peer_wg_config
+
+    eg = EgressConfig(mode="global", upstream_gw="10.77.0.1")
+    link = WorkerLinkConfig()
+    fwd = ipaddress.ip_network(f"{eg.forwarder_uplink_ip}/32")
+    for st in forwarder_source_route_steps(eg, "br-net0"):
+        a = list(st.argv)
+        if a[:3] != ["ip", "rule", "add"]:
+            continue
+        sel, val = a[3], ipaddress.ip_network(a[4], strict=False)
+        if sel == "from":
+            assert val == fwd, a          # only the forwarder's own source is captured
+        else:
+            assert sel == "to" and val == ipaddress.ip_network(eg.overlay_net), a
+            assert not val.overlaps(ipaddress.ip_network(link.overlay_net))
+    peer = peer_wg_config(eg, "PRIV", "10.77.0.2", "192.0.2.10", KEY_A)
+    assert "Table = off" in peer and "FwMark" not in peer
