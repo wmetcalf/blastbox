@@ -196,6 +196,13 @@ def _takes_budget(fn: Any) -> bool:
         return False
 
 
+def _propagate_require_egress(rt: Any) -> None:
+    """Tell ``rt`` to place only on egress-capable workers, if it places per worker at all."""
+    req = getattr(rt, "require_egress", None)
+    if callable(req):
+        req()
+
+
 class CascadingRuntime:
     """SlotRuntime that routes each spawn to the first non-full tier, in declared order.
 
@@ -316,6 +323,12 @@ class CascadingRuntime:
         #: on, a predecessor's parked instances would accrue cost indefinitely across the
         #: stop/start lifecycle this runtime now supports.
         self._sweep_owed: list = []
+        #: Set by the dispatcher (``vm_dispatch._place_egress``) when this cascade's net policy
+        #: grants egress. Every tier that places per worker (a static fleet) is told, and so is
+        #: every tier ADMITTED LATER -- otherwise a static tier inside a cascade hands an egress
+        #: job to a macOS / ``egress: false`` worker, which refuses it (422) and fails the job
+        #: permanently instead of the cascade falling through to capable capacity.
+        self._require_egress = False
         # Consecutive per-tier spawn failures before that tier's base is invalidated. 0 disables
         # per-tier repair (the tier then stays broken until something else notices, which behind
         # a working fallback is "never").
@@ -351,6 +364,33 @@ class CascadingRuntime:
         # Tiers whose streak was reset BY A REPAIR, not by a success. They stay attributable for
         # the pool's own (slightly later) global repair decision; a successful spawn clears them.
         self._recently_guilty: set[int] = set()
+
+    def require_egress(self) -> None:
+        """Only place this cascade's jobs on workers that can provide egress: forwarded to every
+        admitted tier that places per worker, and remembered for tiers admitted later."""
+        with self._lock:
+            self._require_egress = True
+            tiers = list(self.tiers)
+        for t in tiers:
+            _propagate_require_egress(t.runtime)
+
+    def egress_census(self) -> "tuple[int, int, int] | None":
+        """``(advertise egress, do not, unknown)`` summed over the tiers, or None when some tier
+        does not advertise per worker (AWS builds its own workers) or is still deferred -- then no
+        fleet-wide verdict exists and the agent's own 422 refusal is the backstop."""
+        with self._lock:
+            tiers = list(self.tiers)
+            deferred = bool(self._deferred)
+        if deferred:
+            return None
+        total = [0, 0, 0]
+        for t in tiers:
+            census = getattr(t.runtime, "egress_census", None)
+            got = census() if callable(census) else None
+            if got is None:
+                return None
+            total = [a + b for a, b in zip(total, got)]
+        return total[0], total[1], total[2]
 
     def _admit_deferred(self) -> int:
         """Re-probe tiers whose availability was UNDECIDED at startup and admit the ones that answer.
@@ -619,6 +659,8 @@ class CascadingRuntime:
                     still.append(d)
                     still.extend(pending[_i + 1:])
                     break
+                if self._require_egress:
+                    _propagate_require_egress(rt)
                 self.tiers.append(Tier(name=d.name, runtime=rt, capacity=d.capacity))
                 self._admitted_deferred.add(d.pos)
                 admitted_count += 1

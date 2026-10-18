@@ -399,6 +399,8 @@ def watchdog_script(*, iface: str, worker_ip: str, host_ip: str, agent_port: int
     import hashlib
 
     digest = hashlib.sha256(rules.encode()).hexdigest()[:16]
+    canon = "\n".join(pf_canon(rules))
+    sed = _PF_CANON_SED
     stamp = f"{state_dir.rstrip('/')}/blastbox-worker-link.{i}.pf"
     path = ":".join([*_EXTRA_BIN[:2], "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
     return f"""#!/bin/sh
@@ -480,8 +482,15 @@ else
 fi
 
 WANT="$REAL $DIGEST"
-if [ "$(cat "$STAMP" 2>/dev/null)" != "$WANT" ] \
-        || ! "$PFCTL" -a "$ANCHOR" -s rules 2>/dev/null | grep -q "pass in quick on $REAL "; then
+# The anchor must hold EXACTLY our rules (canonicalised as blastbox.worker.link.pf_canon does):
+# a broader rule added ahead of ours -- `pass in quick on $REAL all` -- is not ours, and the
+# expected pass line being present somewhere proves nothing once one is.
+EXPECTED=$(cat <<EOF
+{canon}
+EOF
+)
+LIVE=$("$PFCTL" -a "$ANCHOR" -s rules 2>/dev/null | {sed})
+if [ "$(cat "$STAMP" 2>/dev/null)" != "$WANT" ] || [ "$LIVE" != "$EXPECTED" ]; then
     if ! pf_open; then
         log "pf refused the link ruleset for $REAL; taking the link DOWN"
         rm -f "$STAMP"
@@ -536,9 +545,34 @@ def agent_env_lines(*, worker_ip: str, host_ip: str, agent_port: int,
     ]
 
 
+#: How the watchdog canonicalises a pf listing; MUST stay identical to :func:`pf_canon`.
+#: pfctl re-renders what it was given: runs of whitespace, ``port 8765`` as ``port = 8765``,
+#: and the defaults ``flags S/SA keep state`` it adds to (or prints on) a pass rule. None of
+#: that changes which packets match, so it is normalised away; every address, interface,
+#: direction and verdict is kept.
+_PF_CANON_SED = (r"sed -e 's/[[:space:]][[:space:]]*/ /g' -e 's/^ //' -e 's/ $//' "
+                 r"-e 's/ port = / port /g' -e 's| flags S/SA||g' -e 's/ keep state//g' "
+                 r"-e '/^$/d'")
+
+
+def pf_canon(text: str) -> list[str]:
+    """A pf rule listing as canonical lines (see ``_PF_CANON_SED``, its shell twin)."""
+    out: list[str] = []
+    for raw in (text or "").splitlines():
+        ln = " ".join(raw.split())
+        ln = ln.replace(" port = ", " port ").replace(" flags S/SA", "").replace(" keep state", "")
+        if ln:
+            out.append(ln)
+    return out
+
+
 def pf_in_force(*, info: str, main_rules: str, anchor_rules: str, real_iface: str | None,
                 worker_ip: str, host_ip: str, agent_port: int) -> list[str]:
-    """What is missing for the macOS pf rules to be IN FORCE, or []."""
+    """What is missing for the macOS pf rules to be IN FORCE, or [].
+
+    The anchor must hold EXACTLY our rules, in our order (canonical form, :func:`pf_canon`):
+    a rule that is merely PRESENT proves nothing if a broader one -- ``pass in quick on utun7
+    all`` -- was added ahead of it, since ``quick`` makes the first match final."""
     missing: list[str] = []
     if not re.search(r"^Status: Enabled", info or "", re.M):
         missing.append("pf is DISABLED (no anchor is evaluated)")
@@ -547,17 +581,14 @@ def pf_in_force(*, info: str, main_rules: str, anchor_rules: str, real_iface: st
     if not real_iface:
         missing.append("no live utun recorded for the link")
         return missing
-    rules = anchor_rules or ""
-    agent = re.compile(rf"pass in quick on {re.escape(real_iface)} inet proto tcp from "
-                       rf"{re.escape(host_ip)} to {re.escape(worker_ip)} port (= )?{int(agent_port)}\b")
-    if not agent.search(rules):
-        missing.append(f"the agent rule ({host_ip} -> {worker_ip}:{agent_port} on {real_iface})")
-    for want in (f"block drop in quick on {real_iface} all",
-                 f"block drop out quick on {real_iface} all"):
-        if want not in rules:
-            missing.append(f"`{want}`")
-    if f"block drop in quick on ! {real_iface} inet from any to {worker_ip}" not in rules:
-        missing.append("the off-link drop for the overlay address")
+    want = pf_canon(pf_rules(real_iface=real_iface, worker_ip=worker_ip, host_ip=host_ip,
+                             agent_port=agent_port))
+    got = pf_canon(anchor_rules)
+    if got != want:
+        missing += [f"`{ln}`" for ln in want if ln not in got]
+        missing += [f"unexpected rule `{ln}`" for ln in got if ln not in want]
+        if sorted(got) == sorted(want):
+            missing.append("the anchor's rules are ours but in a different order")
     return missing
 
 
@@ -722,6 +753,67 @@ def _egress_env() -> dict[str, str]:
     return out
 
 
+#: ``ip -d link`` kinds / link types that are a tunnel or VPN, not an underlay. A route to the
+#: host endpoint through any of them makes the control link depend on that tunnel.
+_TUNNEL_KINDS = frozenset({"wireguard", "tun", "ipip", "gre", "gretap", "ip6gre", "ip6gretap",
+                           "sit", "vti", "vti6", "ip6tnl", "xfrm", "erspan", "ip6erspan"})
+_TUNNEL_LINK_TYPES = frozenset({"none", "ipip", "gre", "sit", "tunnel6", "ip6gre", "ip6tnl"})
+
+
+def _linux_tunnel_kind(dev: str) -> str | None:
+    """What kind of tunnel ``dev`` is (``"wireguard"``, ``"tun"``, ...), or None for an
+    ordinary underlay device. Asked of the kernel (``ip -d -j link show``), not guessed from
+    the name. A device whose kind cannot be read is refused: "cannot tell" is not "underlay"."""
+    import json as _json
+
+    proc = _run(["ip", "-d", "-j", "link", "show", "dev", dev])
+    try:
+        info = (_json.loads(proc.stdout or "[]") or [None])[0]
+    except (ValueError, IndexError):
+        info = None
+    if proc.returncode != 0 or not isinstance(info, dict):
+        return f"a device whose type could not be read ({dev})"
+    kind = str((info.get("linkinfo") or {}).get("info_kind") or "")
+    if kind in _TUNNEL_KINDS:
+        return f"a {kind} tunnel"
+    link_type = str(info.get("link_type") or "")
+    if link_type in _TUNNEL_LINK_TYPES:
+        return f"a tunnel (link type {link_type})"
+    return None
+
+
+def _tunnel_route_error(ip: str, dev: str, kind: str) -> str:
+    return (f"the route to the host endpoint {ip} goes via {dev} ({kind}): the link's handshake "
+            "would ride that tunnel instead of the underlay, so the control link would break "
+            "whenever it restarts or changes policy. Exclude the host's address from that VPN "
+            f"(split-tunnel {ip}/32 to the local network, or add a host route for {ip} via your "
+            "underlay gateway) and re-run join. Other VPNs may stay up; only the route to "
+            f"{ip} must not use one.")
+
+
+def darwin_preflight(bundle: JoinBundle) -> list[str]:
+    """macOS: the route to the host endpoint must not go through a tunnel. Other VPN utuns
+    may exist and stay up (a corporate split-tunnel VPN is fine); what is refused is the
+    endpoint's OWN route using one, as ``route -n get`` reports it for that address."""
+    notes: list[str] = []
+    host = bundle.endpoint.rsplit(":", 1)[0]
+    routable = 0
+    for ip in _resolve(host):
+        proc = _run(["route", "-n", "get", *(["-inet6"] if ":" in ip else []), ip])
+        m = re.search(r"^\s*interface:\s*(\S+)", proc.stdout or "", re.M)
+        if proc.returncode != 0 or not m:
+            notes.append(f"no underlay route to the endpoint address {ip} (unused)")
+            continue
+        routable += 1
+        dev = m.group(1)
+        if re.fullmatch(r"(utun|ipsec|tun)[0-9]+", dev):
+            raise RuntimeError(_tunnel_route_error(ip, dev, "a VPN/tunnel interface"))
+        notes.append(f"underlay route to the endpoint {ip}: via {dev}")
+    if not routable:
+        raise RuntimeError(f"no underlay route to the host endpoint {host}")
+    return notes
+
+
 def linux_preflight(bundle: JoinBundle) -> list[str]:
     """Linux-only checks against the EGRESS overlay and this node's routing. Raises on a
     conflict; returns notes.
@@ -783,10 +875,10 @@ def linux_preflight(bundle: JoinBundle) -> list[str]:
             notes.append(f"no underlay route to the endpoint address {ip} (unused)")
             continue
         routable += 1
-        if dev in (bundle.iface, egress_if):
-            raise RuntimeError(
-                f"the route to the host endpoint {ip} goes via {dev}: the handshake would ride "
-                "a tunnel instead of the underlay. Fix this node's routing first.")
+        kind = "the link itself" if dev == bundle.iface else (
+            "the egress overlay" if dev == egress_if else _linux_tunnel_kind(dev))
+        if kind:
+            raise RuntimeError(_tunnel_route_error(ip, dev, kind))
         notes.append(f"underlay route to the endpoint {ip}: via {dev}")
     if not routable:
         raise RuntimeError(f"no underlay route to the host endpoint {host}")
@@ -830,8 +922,45 @@ def _verify_live_peer(wg: str, bundle: JoinBundle, real_iface: str | None = None
             "is still in effect. Bring it down by hand and re-run join")
 
 
+def _installed_linux_links() -> set[str]:
+    """Link interfaces this Linux node already has a worker-link installed for, from disk:
+    the firewall boot unit (``RequiredBy=wg-quick@<iface>.service``) and every joined
+    keygen record (one with a ``host_ip``) whose interface config still exists."""
+    found: set[str] = set()
+    try:
+        unit = FW_UNIT.read_text()
+    except FileNotFoundError:
+        unit = ""
+    except OSError as exc:
+        raise RuntimeError(f"cannot read {FW_UNIT}: {exc.strerror}") from None
+    found.update(re.findall(r"^RequiredBy=wg-quick@(\S+)\.service$", unit, flags=re.M))
+    for rec in sorted(STATE_DIR.glob("*.json")) if STATE_DIR.is_dir() else []:
+        try:
+            st = json.loads(rec.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(st, dict) and st.get("host_ip") and isinstance(st.get("iface"), str):
+            if _paths(st["iface"])["conf"].exists():
+                found.add(st["iface"])
+    return found
+
+
+def _refuse_second_linux_link(iface: str) -> None:
+    """ONE worker-link per Linux node. Its nft table, ruleset file and firewall units are
+    node-global, so joining a second interface would atomically replace the first link's
+    firewall with one that matches only the new interface -- leaving the first tunnel up
+    unfirewalled -- and rewrite the boot unit the first link Requires."""
+    other = sorted(_installed_linux_links() - {iface})
+    if other:
+        raise RuntimeError(
+            f"this node already has a worker-link on {', '.join(other)}; a Linux node runs one "
+            f"link (its firewall is node-wide). Run `blastbox worker-link leave --iface "
+            f"{other[0]}` first, or re-join on {other[0]}.")
+
+
 def _apply_linux(bundle: JoinBundle, p: dict[str, Path], wg: str) -> list[str]:
     notes: list[str] = []
+    _refuse_second_linux_link(bundle.iface)     # (also in join's preflight; cheap, and safe)
     nft = _need("nft", "nftables")
     _need("wg-quick", "wireguard-tools")
     # FIREWALL FIRST, read back, before the link exists. Loaded from a temp file and moved into
@@ -911,6 +1040,15 @@ def _apply_darwin(bundle: JoinBundle, p: dict[str, Path], wg: str, *,
         # host key / endpoint / address would otherwise leave the old config live indefinitely.
         # Down it here; the watchdog run below brings it up behind closed rules, as at boot.
         _run([wg_quick, "down", bundle.iface])
+        # VERIFIED, not assumed: the watchdog leaves any live utun alone, so a down that failed
+        # (or did nothing) would leave the PREVIOUS host key / endpoint / address running and
+        # the handshake check below would happily observe the old peer.
+        stale = _real_iface_darwin(bundle.iface)
+        if stale is not None and _ok([wg, "show", stale]):
+            raise RuntimeError(
+                f"`wg-quick down {bundle.iface}` did not stop {stale}, which still runs the "
+                f"previous config; stop it by hand (`sudo wg-quick down {bundle.iface}`) and "
+                "re-run join")
         notes.append(f"{bundle.iface} taken down to apply the changed config")
     label = label_for(bundle.iface)
     script = watchdog_script(iface=bundle.iface, worker_ip=bundle.worker_ip,
@@ -953,6 +1091,7 @@ def _apply_darwin(bundle: JoinBundle, p: dict[str, Path], wg: str, *,
         _sleep(1.0)
     if real is None:
         raise RuntimeError(f"the watchdog did not bring {bundle.iface} up; see {LOG_FILE}")
+    _verify_live_peer(wg, bundle, real)
     notes.append(f"{bundle.iface} up as {real}")
     notes.append(_wait_handshake(wg, real))
     return notes
@@ -988,7 +1127,9 @@ def join(bundle_text: str, *, agent_user: str | None = None) -> list[str]:
     if not p["wg_key"].exists() or not p["tls_key"].exists():
         raise RuntimeError("this worker's keys are missing; run keygen first")
     # Every check that can refuse runs before anything is written.
-    pre = linux_preflight(bundle) if plat == "linux" else []
+    if plat == "linux":
+        _refuse_second_linux_link(bundle.iface)
+    pre = linux_preflight(bundle) if plat == "linux" else darwin_preflight(bundle)
     if _wg_pubkey(wg, p["wg_key"].read_text()) == bundle.host_public_key:
         raise RuntimeError("the bundle's host key is THIS worker's own key")
     with tempfile.TemporaryDirectory(dir=STATE_DIR) as td:

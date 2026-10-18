@@ -40,6 +40,8 @@ class FakeHost:
         self.nft_refuses = False
         self.dump = ""
         self.stuck_up = False
+        self.live_peers: dict[str, set[str]] = {}    # iface -> public keys on the LIVE interface
+        self.syncconf_fails = False
 
     def run(self, argv, check: bool = True, capture: bool = True):
         a = [str(x) for x in argv]
@@ -72,6 +74,17 @@ class FakeHost:
         elif a[:3] == ["systemctl", "disable", "--now"] and a[3].startswith("wg-quick@"):
             if not self.stuck_up:
                 self.links.discard(a[3].split("@")[1])
+        elif a[:2] == ["wg-quick", "strip"]:
+            body = Path(a[2]).read_text()
+            out = "\n".join(ln for ln in body.splitlines()
+                            if ln.split("=")[0].strip() not in ("Address", "DNS", "MTU"))
+        elif a[:2] == ["wg", "syncconf"]:
+            if self.syncconf_fails:
+                rc, err = 1, "Unable to modify interface"
+            else:
+                self.live_peers[a[2]] = {ln.split("=", 1)[1].strip()
+                                         for ln in Path(a[3]).read_text().splitlines()
+                                         if ln.startswith("PublicKey")}
         elif a[:2] == ["wg-quick", "down"]:
             if not self.stuck_up:
                 self.links.discard(a[2])
@@ -411,10 +424,71 @@ def test_remove_takes_the_worker_off_the_live_interface(host, pki):
     wla.add_worker(cfg, "mac2", KEY_B, _csr(_ip("10.78.0.3")), pki_dir=pki)
     host.calls.clear()
     assert wla.remove_worker(cfg, "mac1", pki_dir=pki) is True
-    assert ["systemctl", "restart", "wg-quick@wtwg0"] in host.calls   # the reload happened
+    # applied IN PLACE to the live link (wg syncconf), never by restarting it
+    assert any(c[:3] == ["wg", "syncconf", "wtwg0"] for c in host.calls)
+    assert host.live_peers["wtwg0"] == {KEY_B}
+    assert not any(c[:2] == ["systemctl", "restart"] for c in host.calls)
     assert [r["name"] for r in wla.list_workers(cfg)] == ["mac2"]
     assert not (pki / "worker-link" / "mac1.crt").exists()
     assert wla.remove_worker(cfg, "mac1") is False
+
+
+def test_add_and_remove_refuse_an_override_the_host_is_not_running(host, pki, monkeypatch):
+    """REGRESSION (review): BLASTBOX_WORKER_LINK_* overrides reach every host action. `add`
+    with a stale HOST_IP / OVERLAY_NET / AGENT_PORT in the environment registered a peer and
+    issued a bundle for an address or port the live interface and firewall do not serve."""
+    wla.init_host(_cfg())
+    conf = ea.WG_DIR / "wtwg0.conf"
+    before = conf.read_text()
+    for key, val in (("BLASTBOX_WORKER_LINK_HOST_IP", "10.78.0.9"),
+                     ("BLASTBOX_WORKER_LINK_AGENT_PORT", "9443"),
+                     ("BLASTBOX_WORKER_LINK_OVERLAY_NET", "10.78.0.0/25"),
+                     ("BLASTBOX_WORKER_LINK_ENDPOINT", "other.example.org")):
+        monkeypatch.setenv(key, val)
+        with pytest.raises(RuntimeError, match="not running"):
+            wla.add_worker(wla.load_config(), "mac1", KEY_A, _csr(_ip("10.78.0.2")),
+                           pki_dir=pki)
+        monkeypatch.delenv(key)
+    assert conf.read_text() == before                         # nothing registered
+    wla.add_worker(wla.load_config(), "mac1", KEY_A, _csr(_ip("10.78.0.2")), pki_dir=pki)
+    monkeypatch.setenv("BLASTBOX_WORKER_LINK_AGENT_PORT", "9443")
+    with pytest.raises(RuntimeError, match="agent port 9443"):
+        wla.remove_worker(wla.load_config(), "mac1")
+
+
+def test_peer_changes_are_synced_in_place_never_by_restarting_any_tunnel(host, pki):
+    """REGRESSION (review): every add/remove/renewal went through egress_apply._reload_wg,
+    which RESTARTS wg-quick@<iface> under systemd -- forgetting every worker's learned
+    (roaming) endpoint and cutting them all off until their next keepalive. Peer-only
+    changes are now `wg syncconf` on the LINK interface alone; a comment-only change (a
+    renewal's new `# expires:`) touches nothing live; no other tunnel is ever named."""
+    cfg = _cfg()
+    wla.init_host(cfg)
+    host.links.add("bbwg0")                                    # the egress overlay, also up
+    host.calls.clear()
+    wla.add_worker(cfg, "mac1", KEY_A, _csr(_ip("10.78.0.2")), pki_dir=pki)
+    wla.add_worker(cfg, "mac2", KEY_B, _csr(_ip("10.78.0.3")), pki_dir=pki)
+    assert host.live_peers["wtwg0"] == {KEY_A, KEY_B}
+    host.calls.clear()
+    _b, changed = wla.add_worker(cfg, "mac1", KEY_A, _csr(_ip("10.78.0.2")), days=20,
+                                 pki_dir=pki)                  # renewal: only # expires: moves
+    assert changed and not any(c[:2] == ["wg", "syncconf"] for c in host.calls)
+    flat = host.flat()
+    assert "systemctl restart" not in flat and "wg-quick down" not in flat
+    assert "bbwg0" not in flat
+    # an idempotent re-init does not bounce a live, unchanged link either
+    host.calls.clear()
+    wla.init_host(cfg)
+    assert "systemctl restart" not in host.flat() and "wg syncconf" not in host.flat()
+
+
+def test_a_peer_change_that_cannot_reach_the_live_link_is_loud(host, pki):
+    cfg = _cfg()
+    wla.init_host(cfg)
+    host.syncconf_fails = True
+    with pytest.raises(RuntimeError, match="could NOT apply it to the live wtwg0"):
+        wla.add_worker(cfg, "mac1", KEY_A, _csr(_ip("10.78.0.2")), pki_dir=pki)
+    assert not any(c[:2] == ["systemctl", "restart"] for c in host.calls)
 
 
 # ----------------------------------------------------------------------------- status

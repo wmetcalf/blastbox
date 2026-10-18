@@ -1583,24 +1583,32 @@ def _claim_resumable_slot(pool: Any, timeout_s: float, *,
 def _place_egress(runtime: Any, tier: str) -> None:
     """This tier's policy grants egress: only place its jobs on workers that can provide it.
 
-    A static pool is told to claim only workers whose /healthz advertises ``"egress": true``,
-    and the fleet is asked once, now: if every worker ANSWERED and none can, no job of this tier
-    could ever be placed, so refuse to start rather than requeue every job until it ages out.
-    Unknown answers (unreachable now) are not a verdict and do not block startup.
+    Any runtime that places per worker is told (``require_egress``): a static pool claims only
+    workers whose /healthz advertises ``"egress": true``, and a CASCADE forwards that to every
+    static tier it holds, including tiers it admits later -- so an egress job skips a macOS
+    worker and falls through to capable capacity rather than being refused by it. Then the
+    fleet is asked once, now: if every worker ANSWERED and none can, no job of this tier could
+    ever be placed, so refuse to start rather than requeue every job until it ages out. Unknown
+    answers (unreachable now) are not a verdict and do not block startup.
 
-    Other runtimes (AWS, cascade) build their own workers from operator-chosen images and do
-    not advertise per worker; there the agent's own refusal (HTTP 422 ``egress_unavailable``,
-    surfaced as ``remote_http.EGRESS_PLACEMENT_ERROR``) is the backstop, and it fails the job
-    with that reason rather than letting it run without a network.
+    Runtimes that do not advertise per worker (AWS; a cascade containing one, or with a tier
+    still deferred) give no fleet-wide verdict; there the agent's own refusal (HTTP 422
+    ``egress_unavailable``, surfaced as ``remote_http.EGRESS_PLACEMENT_ERROR``) is the backstop,
+    and it fails the job with that reason rather than letting it run without a network.
     """
-    from blastbox.host.runtime.static_pool import StaticPoolRuntime
-
-    if not isinstance(runtime, StaticPoolRuntime):
+    require = getattr(runtime, "require_egress", None)
+    if not callable(require):
         logger.info("vm_dispatch: %s grants egress; this runtime does not advertise per-worker "
                     "egress, so a worker that cannot provide it refuses the job (422)", tier)
         return
-    runtime.require_egress()
-    yes, no, unknown = runtime.egress_census()
+    require()
+    census = getattr(runtime, "egress_census", None)
+    counts = census() if callable(census) else None
+    if counts is None:
+        logger.info("vm_dispatch: %s grants egress; static members place only on workers that "
+                    "advertise it, other tiers rely on the agent's refusal (422)", tier)
+        return
+    yes, no, unknown = counts
     if yes == 0 and unknown == 0 and no > 0:
         raise ValueError(
             f"{tier}: this tier's net policy grants egress, but none of its {no} static "

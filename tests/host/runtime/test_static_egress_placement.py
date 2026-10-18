@@ -147,3 +147,98 @@ def test_an_odd_responder_does_not_crash_the_census():
     rt = StaticPoolRuntime(StaticPoolConfig(workers=(StaticWorker(host="x"),)),
                            http_probe=lambda u, h, t: True, capability_probe=boom)
     assert rt.egress_census() == (0, 0, 1)
+
+
+# ------------------------------------------------------------------ review round 2
+
+def test_the_startup_census_is_bounded_not_one_timeout_per_unreachable_worker():
+    """REGRESSION (review): the census probed every worker SERIALLY, so one healthy box plus
+    99 unreachable ones delayed dispatcher construction by ~99 probe timeouts (minutes at the
+    5 s default). It now asks concurrently and waits about one timeout in total; a straggler is
+    UNKNOWN, which is not a verdict."""
+    import threading
+    import time
+
+    hosts = ["linux0"] + [f"dead{i}" for i in range(99)]
+    workers = tuple(StaticWorker.parse(h, default_port=8765, default_token=None) for h in hosts)
+    peak = {"now": 0, "max": 0}
+    lock = threading.Lock()
+
+    def caps(url, headers, timeout):
+        host = url.split("//")[1].split(":")[0]
+        if host == "linux0":
+            return {"ok": True, "egress": True}
+        with lock:
+            peak["now"] += 1
+            peak["max"] = max(peak["max"], peak["now"])
+        time.sleep(timeout)             # an unreachable box: the probe runs out its timeout
+        with lock:
+            peak["now"] -= 1
+        return None
+
+    rt = StaticPoolRuntime(StaticPoolConfig(workers=workers, probe_timeout_s=0.25),
+                           http_probe=lambda u, h, t: True, capability_probe=caps)
+    t0 = time.monotonic()
+    yes, no, unknown = rt.egress_census()
+    elapsed = time.monotonic() - t0
+    assert (yes, no, yes + no + unknown) == (1, 0, 100)
+    assert elapsed < 3.0, elapsed               # serially: 99 x 0.25 s ~ 25 s
+    assert peak["max"] <= StaticPoolRuntime.CENSUS_PARALLELISM
+
+
+class _Slot:
+    def __init__(self, sid):
+        self.slot_id = sid
+
+
+class _AwsTier:
+    """A tier that builds its own workers and does not advertise per worker."""
+    dispatch_style = "network"
+    ssl_context = None
+
+    def __init__(self):
+        self.spawned = 0
+
+    def spawn(self):
+        self.spawned += 1
+        return _Slot(f"aws-{self.spawned}")
+
+
+def test_a_cascade_passes_the_egress_requirement_to_its_static_tiers_including_late_ones():
+    """REGRESSION (review): `_place_egress` returned early for anything but a bare
+    StaticPoolRuntime, so in a static -> AWS cascade the static tier never learned the policy
+    grants egress and handed the job to a macOS worker, which refused it (422) -- a permanent
+    failure instead of falling through to capable capacity. Tiers admitted LATER (deferred at
+    startup) must be told as well."""
+    from blastbox.host.runtime.cascade import CascadingRuntime, DeferredTier, Tier
+    from blastbox.host.runtime.vm_dispatch import _place_egress
+
+    macs = _rt({"mac1": False})
+    late = _rt({"mac2": False})
+    aws = _AwsTier()
+    cascade = CascadingRuntime(
+        [Tier("static", macs, 2), Tier("aws-ec2", aws, 2)],
+        deferred=[DeferredTier(name="static", capacity=2, reason="throttled",
+                               build=lambda: late, pos=2, dispatch_style="network")],
+        admit_retry_s=0.0)
+    _place_egress(cascade, "cascade")                  # AWS present: no fleet verdict, no raise
+    assert macs._require_egress is True
+    slot = cascade._spawn_from_admitted()              # the Mac is skipped, AWS takes the job
+    assert slot.slot_id == "aws-1" and aws.spawned == 1
+    assert late._require_egress is False
+    cascade._admit_probe(list(cascade._deferred))
+    assert cascade.tiers[-1].runtime is late and late._require_egress is True
+
+
+def test_an_all_static_cascade_that_can_never_place_egress_refuses_to_start():
+    from blastbox.host.runtime.cascade import CascadingRuntime, Tier
+    from blastbox.host.runtime.vm_dispatch import _place_egress
+
+    cascade = CascadingRuntime([Tier("static", _rt({"mac1": False}), 1),
+                                Tier("static", _rt({"mac2": False}), 1)])
+    with pytest.raises(ValueError, match="none of its 2 static worker"):
+        _place_egress(cascade, "cascade")
+    ok = CascadingRuntime([Tier("static", _rt({"mac1": False}), 1),
+                           Tier("static", _rt({"linux1": True}), 1)])
+    _place_egress(ok, "cascade")
+    assert ok._spawn_from_admitted().ip == "linux1"

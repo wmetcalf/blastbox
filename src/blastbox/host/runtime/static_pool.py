@@ -328,13 +328,38 @@ class StaticPoolRuntime:
             return None
         return info.get("egress") is True
 
+    #: Upper bound on concurrent capability probes in one census.
+    CENSUS_PARALLELISM = 32
+
     def egress_census(self) -> tuple[int, int, int]:
         """``(advertise egress, do not, unknown)`` across the configured fleet -- for the
         dispatcher's startup check, so a tier that can never place an egress job refuses to
-        start instead of requeueing every job until it ages out."""
+        start instead of requeueing every job until it ages out.
+
+        CONCURRENT and BOUNDED. Asked serially, every unreachable worker burned
+        probe_timeout_s on dispatcher construction: a 100-worker fleet with one healthy box
+        delayed startup by minutes -- the eager-probe latency ``available()`` short-circuits
+        to avoid. The fleet is asked in parallel, and the census as a whole waits at most about
+        one probe timeout: a worker that has not answered by then counts as UNKNOWN, which is
+        not a verdict either way (it neither blocks startup nor counts as capable)."""
+        from concurrent.futures import ThreadPoolExecutor, wait
+
+        workers = list(self.cfg.workers)
+        if not workers:
+            return 0, 0, 0
+        timeout = max(_MIN_PROBE_S, float(self.cfg.probe_timeout_s))
+        pool = ThreadPoolExecutor(max_workers=min(len(workers), self.CENSUS_PARALLELISM),
+                                  thread_name_prefix="blastbox-static-census")
+        try:
+            futs = [pool.submit(self._advertises_egress, w, timeout) for w in workers]
+            done, _pending = wait(futs, timeout=timeout + 1.0)
+        finally:
+            # never wait on a straggler: its probe is bounded by its own timeout, and its
+            # verdict (if any) still lands in _egress_seen for spawn() to use later.
+            pool.shutdown(wait=False, cancel_futures=True)
         yes = no = unknown = 0
-        for w in self.cfg.workers:
-            v = self._advertises_egress(w)
+        for f in futs:
+            v = f.result() if f in done and f.exception() is None else None
             if v is True:
                 yes += 1
             elif v is False:

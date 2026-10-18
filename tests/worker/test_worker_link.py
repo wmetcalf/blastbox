@@ -44,6 +44,11 @@ class FakeNode:
         self.root = True
         self.nft_drop_missing = False
         self.genkeys = 0
+        #: device -> `ip -d -j link` info_kind for a tunnel; anything else reads as ethernet
+        self.tunnels: dict[str, str] = {}
+        #: what `route -n get` (macOS) reports as the endpoint's interface
+        self.mac_route_dev = "en0"
+        self.wg_quick_down_works = True
 
     def run(self, argv, *, input=None):
         a = [str(x) for x in argv]
@@ -83,6 +88,20 @@ class FakeNode:
                 out = self.loaded
         elif tool == "nft" and a[1:3] == ["delete", "table"]:
             self.loaded = None
+        elif a[:4] == ["ip", "-d", "-j", "link"]:
+            dev = a[-1]
+            kind = self.tunnels.get(dev)
+            out = json.dumps([{"ifname": dev, "link_type": "none" if kind else "ether",
+                               **({"linkinfo": {"info_kind": kind}} if kind else {})}])
+        elif a[:3] == ["route", "-n", "get"]:
+            out = (f"   route to: {a[-1]}\ndestination: default\n"
+                   f"  interface: {self.mac_route_dev}\n")
+        elif tool == "wg-quick" and a[1] in ("down", "up"):
+            if a[1] == "down" and self.wg_quick_down_works:
+                self.links.discard(a[2])
+                (link.WG_RUN_DIR / f"{a[2]}.name").unlink(missing_ok=True)
+            elif a[1] == "up":
+                self.links.add(a[2])
         elif a[:3] == ["ip", "-j", "route"] and "get" in a:
             out = json.dumps([{"dst": a[-1], "dev": self.route_dev}])
         elif a[:2] == ["ip", "-j"]:
@@ -854,3 +873,133 @@ def test_writers_never_follow_a_symlink_and_refuse_a_directory(tmp_path):
     (tmp_path / "adir").mkdir()
     with pytest.raises(RuntimeError, match="not a regular file"):
         link._write_public(tmp_path / "adir", "x")
+
+
+# ------------------------------------------------------------------ review round 2
+
+def test_macos_rejoin_refuses_when_the_old_tunnel_does_not_go_down(node, tmp_path):
+    """REGRESSION (review): a failed / no-op `wg-quick down` on a changed re-join was ignored;
+    the watchdog leaves a live utun alone, so the PREVIOUS config stayed up and join reported
+    success off the old peer's handshake."""
+    n = node("darwin")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    n.wg_quick_down_works = False
+    with pytest.raises(RuntimeError, match="did not stop utun7"):
+        link.join(_bundle(tmp_path, csr, endpoint="gw2.example.org:51822"))
+    n.wg_quick_down_works = True
+    assert any("up as utun7" in x
+               for x in link.join(_bundle(tmp_path, csr, endpoint="gw2.example.org:51822")))
+
+
+def test_macos_join_verifies_the_live_peer_not_just_a_handshake(node, tmp_path, monkeypatch):
+    n = node("darwin")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    real = n.run
+
+    def run(argv, **kw):
+        p = real(argv, **kw)
+        a = [str(x) for x in argv]
+        if Path(a[0]).name == "wg" and a[1] == "show":
+            p = subprocess.CompletedProcess(a, 0, p.stdout.replace(KEY_HOST, "Z" * 43 + "="), "")
+        return p
+
+    monkeypatch.setattr(link, "_run", run)
+    with pytest.raises(RuntimeError, match="previous config is still in effect"):
+        link.join(_bundle(tmp_path, csr))
+
+
+def test_the_pf_read_back_rejects_a_broader_rule_added_to_the_anchor():
+    """REGRESSION (review): the verifier only searched for our lines, so an EARLIER broad rule
+    (`pass in quick on utun7 all` -- quick, so final) left it reporting in force."""
+    rules = link.pf_rules(real_iface="utun7", worker_ip="10.78.0.5", host_ip="10.78.0.1",
+                          agent_port=8765)
+    ok = dict(info="Status: Enabled", main_rules='anchor "com.apple/*" all', anchor_rules=rules,
+              real_iface="utun7", worker_ip="10.78.0.5", host_ip="10.78.0.1", agent_port=8765)
+    broad = "pass in quick on utun7 all\n" + rules
+    assert any("unexpected rule `pass in quick on utun7 all`" in m
+               for m in link.pf_in_force(**{**ok, "anchor_rules": broad}))
+    swapped = "\n".join([rules.splitlines()[1], rules.splitlines()[0], *rules.splitlines()[2:]])
+    assert any("different order" in m for m in link.pf_in_force(**{**ok, "anchor_rules": swapped}))
+    # pfctl's re-rendering is cosmetic: `port = N`, explicit default flags/state, spacing
+    rendered = ("pass in quick on utun7 inet proto tcp from 10.78.0.1 to 10.78.0.5 port = 8765 "
+                "flags S/SA keep state\n"
+                "block drop in quick on utun7 all\nblock drop out  quick on utun7 all\n"
+                "block drop in quick on ! utun7 inet from any to 10.78.0.5\n")
+    assert link.pf_in_force(**{**ok, "anchor_rules": rendered}) == []
+    stateless = rendered.replace(" flags S/SA keep state", "")
+    assert link.pf_in_force(**{**ok, "anchor_rules": stateless}) == []
+
+
+def test_the_watchdog_reloads_an_anchor_that_gained_a_broader_rule(mac, tmp_path):
+    """The same check in the watchdog: an anchor that still CONTAINS our pass line but has
+    gained another rule is reloaded, not left in force; pfctl's own rendering converges."""
+    mac.up("utun7")
+    mac.run()
+    anchor = tmp_path / "state" / "anchor"
+    anchor.write_text("pass in quick on utun7 all\n" + anchor.read_text())
+    calls = mac.run()
+    assert any(c.startswith("LOADED pass in quick on utun7 inet") for c in calls), calls
+    assert "pass in quick on utun7 all" not in mac.anchor()
+    # what pfctl prints back (`port = N`, extra spacing) must not reload every 30 s
+    anchor.write_text(mac.anchor().replace("port 8765", "port = 8765").replace(" all", "  all"))
+    assert not any(c.startswith("LOADED") for c in mac.run())
+
+
+def test_a_second_linux_link_is_refused_before_the_firewall_is_replaced(node, tmp_path):
+    """REGRESSION (review): the Linux nft table, ruleset file and firewall units are node-wide.
+    Joining another interface replaced the first link's firewall with one for the new
+    interface only (first tunnel left up, unfirewalled) and rewrote the boot unit it Requires."""
+    n = node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    loaded, unit = n.loaded, link.FW_UNIT.read_text()
+    _pub, csr2, _ = link.keygen("wtwg1", "10.79.0.5")
+    with pytest.raises(RuntimeError, match="already has a worker-link on wtwg0"):
+        link.join(_bundle(tmp_path, csr2, ip="10.79.0.5", iface="wtwg1", host_ip="10.79.0.1",
+                          overlay_net="10.79.0.0/24"))
+    assert n.loaded == loaded and link.FW_UNIT.read_text() == unit
+    assert "wtwg1" not in n.links and not link._paths("wtwg1")["conf"].exists()
+    link.join(_bundle(tmp_path, csr))                      # re-joining the SAME link is fine
+
+
+@pytest.mark.parametrize("kind", ["wireguard", "tun", "gre", "ipip"])
+def test_an_endpoint_route_through_any_tunnel_is_refused_with_the_fix(node, tmp_path, kind):
+    """REGRESSION (review): only the link's own name and bbwg0 were recognised, so a route to
+    the host endpoint through `tun0`/`wg1`/a corporate VPN was accepted as underlay -- the
+    control link then silently depended on that VPN."""
+    n = node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    n.route_dev = "vpn0"
+    n.tunnels["vpn0"] = kind
+    with pytest.raises(RuntimeError, match=r"via vpn0 .*Exclude the host's address"):
+        link.join(_bundle(tmp_path, csr))
+    assert "wtwg0" not in n.links and n.loaded is None
+
+
+def test_an_unreadable_device_type_is_not_assumed_to_be_underlay(node, tmp_path, monkeypatch):
+    n = node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    real = n.run
+
+    def run(argv, **kw):
+        if list(argv)[:2] == ["ip", "-d"]:
+            return subprocess.CompletedProcess(list(argv), 1, "", "Cannot find device")
+        return real(argv, **kw)
+
+    monkeypatch.setattr(link, "_run", run)
+    with pytest.raises(RuntimeError, match="could not be read"):
+        link.join(_bundle(tmp_path, csr))
+
+
+def test_macos_coexists_with_other_vpns_unless_the_endpoint_route_uses_one(node, tmp_path):
+    """Other VPN utuns may exist and stay up (a split-tunnel corporate VPN): only the
+    endpoint's OWN route going through a tunnel is refused, and the error says how to fix it."""
+    n = node("darwin")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    n.mac_route_dev = "utun3"
+    with pytest.raises(RuntimeError, match=r"via utun3 .*split-tunnel 192\.0\.2\.10/32"):
+        link.join(_bundle(tmp_path, csr))
+    n.mac_route_dev = "en0"                     # VPN still up elsewhere; endpoint via en0
+    notes = link.join(_bundle(tmp_path, csr))
+    assert any("underlay route to the endpoint 192.0.2.10: via en0" in x for x in notes)

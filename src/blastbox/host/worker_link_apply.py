@@ -404,6 +404,7 @@ def init_host(cfg: WorkerLinkConfig) -> tuple[str, list[str]]:
     conf = _conf(cfg)
     want = host_wg_config(cfg, priv.read_text().strip())
     with ea.conf_lock(cfg):
+        rewritten = True
         if not conf.exists():
             ea._write_conf(conf, want)
         else:
@@ -411,10 +412,15 @@ def init_host(cfg: WorkerLinkConfig) -> tuple[str, list[str]]:
             # gateway, for the same reason (a changed port or address must reach the file).
             body = conf.read_text()
             peers = body[body.index("\n# peer:"):] if "\n# peer:" in body else ""
-            if body != want + peers:
+            rewritten = body != want + peers
+            if rewritten:
                 ea._write_conf(conf, want + peers)
             os.chmod(conf, 0o600)
-        ea.wg_up(cfg)
+        # An idempotent re-run with the link already up and its config unchanged leaves the
+        # interface alone: wg_up would RESTART it, forgetting every worker's learned endpoint.
+        # A changed [Interface] (address, port) does need the restart, and gets it.
+        if rewritten or not ea._ok(["ip", "link", "show", cfg.wg_iface]):
+            ea.wg_up(cfg)
     persist_config(cfg)
     notes.append(f"{cfg.wg_iface} up at {cfg.host_ip}/{cfg.prefixlen}, udp/{cfg.wg_port}")
     notes.append(f"config persisted to {ENV_FILE}")
@@ -432,6 +438,73 @@ def init_host(cfg: WorkerLinkConfig) -> tuple[str, list[str]]:
 def _registered(body: str) -> dict[str, tuple[str, str]]:
     """``name -> (bare worker ip, public key)`` from the host config."""
     return {name: (ip.split("/")[0], key) for name, ip, key in ea._peer_blocks(body)}
+
+
+def _refuse_uninstalled_override(cfg: WorkerLinkConfig, what: str) -> None:
+    """Refuse an enrolment change made with a config the host is not RUNNING.
+
+    ``cfg`` merges BLASTBOX_WORKER_LINK_* (and CLI flags) over the persisted file. Every value
+    a worker is configured with -- interface, overlay, host address, listen port, agent port,
+    endpoint -- is what ``init`` put on the live interface, routes and firewall. An override
+    left in the environment would have ``add`` register a peer and hand out a bundle for an
+    address or port nothing on this host serves: a worker enrolled unable to communicate.
+    Changing any of them is ``init``'s job (which also checks it against the registered fleet).
+    """
+    file_env = _persisted_env()
+    if not file_env:
+        raise WorkerLinkNotInitialised(
+            f"{ENV_FILE} does not exist: run `blastbox worker-link init` first")
+    installed = WorkerLinkConfig.from_env(file_env)
+    diff = [f"{label} {got!r} (installed: {want!r})"
+            for label, got, want in (
+                ("interface", cfg.wg_iface, installed.wg_iface),
+                ("overlay", cfg.overlay_net, installed.overlay_net),
+                ("host address", cfg.host_ip, installed.host_ip),
+                ("listen port", cfg.wg_port, installed.wg_port),
+                ("agent port", cfg.agent_port, installed.agent_port),
+                ("endpoint", cfg.endpoint, installed.endpoint))
+            if got != want]
+    if diff:
+        raise RuntimeError(
+            f"refusing to {what} with a configuration this host is not running: "
+            + "; ".join(diff) + ". Unset the BLASTBOX_WORKER_LINK_* override (or drop the flag), "
+            "or change the installed link with `blastbox worker-link init` first.")
+
+
+def _apply_peers(cfg: WorkerLinkConfig, old_body: str, new_body: str) -> None:
+    """Apply a PEER-ONLY change to the live link interface, without restarting it.
+
+    ``egress_apply._reload_wg`` restarts ``wg-quick@<iface>`` when systemd manages it. Here that
+    is wrong: the host learns each worker's NATed endpoint from its handshakes (peers carry no
+    ``Endpoint``), so a restart forgets every one of them and cuts EVERY worker off until its
+    next keepalive -- for a routine add, a removal or a monthly renewal. ``wg syncconf`` diffs
+    the peer set in place and keeps learned endpoints of unchanged peers. It is run against THIS
+    link's interface only; no other WireGuard interface (the egress overlay, a hand-managed one)
+    is touched. A change to the comments alone (``# expires:``) reaches nothing live at all.
+    """
+    if ea._peer_blocks(old_body) == ea._peer_blocks(new_body):
+        return
+    iface = cfg.wg_iface
+    if not ea._ok(["ip", "link", "show", iface]):
+        return          # down: wg-quick reads the file when it comes up
+    conf = _conf(cfg)
+    stripped = ea._run(["wg-quick", "strip", str(conf)], check=False)
+    if stripped.returncode == 0 and stripped.stdout:
+        tmp = conf.with_suffix(".stripped")
+        try:
+            ea._write_conf(tmp, stripped.stdout)
+            synced = ea._run(["wg", "syncconf", iface, str(tmp)], check=False)
+        finally:
+            tmp.unlink(missing_ok=True)
+        if synced.returncode == 0:
+            return
+        tail = (synced.stderr or "").strip().splitlines()[-1:] or ["no detail"]
+    else:
+        tail = (stripped.stderr or "").strip().splitlines()[-1:] or ["no detail"]
+    raise RuntimeError(
+        f"changed {conf} but could NOT apply it to the live {iface} ({tail[0]}); the running "
+        f"interface still has the old peers. Run `wg syncconf {iface} <(wg-quick strip {iface})` "
+        "by hand before trusting this.")
 
 
 def _cert_expiry(cert_pem: bytes) -> str:
@@ -470,6 +543,7 @@ def add_worker(cfg: WorkerLinkConfig, name: str, public_key: str, csr_pem: bytes
     if not cfg.endpoint:
         raise RuntimeError("no endpoint recorded for this host: re-run `blastbox worker-link "
                            "init --endpoint <public-host>[:port]` so workers know where to dial")
+    _refuse_uninstalled_override(cfg, "add a worker")
     conf = _conf(cfg)
     pub_path = ea.KEY_DIR / f"{cfg.wg_iface}.pub"
     if not conf.exists() or not pub_path.exists():
@@ -513,7 +587,7 @@ def add_worker(cfg: WorkerLinkConfig, name: str, public_key: str, csr_pem: bytes
         changed = new_body != body
         if changed:
             ea._write_conf(conf, new_body)
-            ea._reload_wg(cfg)
+            _apply_peers(cfg, body, new_body)
     cert_dir = Path(pki_dir) / CERT_SUBDIR
     cert_dir.mkdir(parents=True, exist_ok=True)
     (cert_dir / f"{name}.crt").write_bytes(cert_pem)
@@ -536,12 +610,14 @@ def remove_worker(cfg: WorkerLinkConfig, name: str, *, pki_dir: Path | None = No
     conf = _conf(cfg)
     if not conf.exists():
         raise WorkerLinkNotInitialised(f"{conf} does not exist: nothing is registered")
+    _refuse_uninstalled_override(cfg, "remove a worker")
     with ea.conf_lock(cfg):
         body = conf.read_text()
         if name not in _registered(body):
             return False
-        ea._write_conf(conf, ea.drop_peer_blocks(body, [name]))
-        ea._reload_wg(cfg)
+        new_body = ea.drop_peer_blocks(body, [name])
+        ea._write_conf(conf, new_body)
+        _apply_peers(cfg, body, new_body)
     if pki_dir is not None:
         (Path(pki_dir) / CERT_SUBDIR / f"{name}.crt").unlink(missing_ok=True)
     return True
