@@ -119,3 +119,31 @@ def test_a_fleet_that_is_merely_down_at_startup_is_unknown_not_incapable(monkeyp
                            http_probe=lambda u, h, t: False,
                            capability_probe=make_capability_probe(None))
     assert rt.egress_census() == (0, 0, 1)
+
+
+def test_a_busy_capable_worker_is_backpressure_not_a_fault():
+    """REGRESSION (review): with the only capable worker CLAIMED, the free set is all Macs --
+    that is the fleet being busy, and the next release frees it."""
+    rt = _rt({"mac1": False, "linux1": True})
+    rt.require_egress()
+    assert rt.spawn().ip == "linux1"
+    with pytest.raises(StaticPoolExhausted):
+        rt.spawn()
+
+
+def test_an_unanswered_capable_worker_is_not_a_fault_either():
+    rt = _rt({"mac1": False, "linux1": None})
+    rt.require_egress()
+    with pytest.raises(StaticPoolExhausted):
+        rt.spawn()
+
+
+def test_an_odd_responder_does_not_crash_the_census():
+    import http.client
+
+    def boom(url, headers, timeout):
+        raise http.client.BadStatusLine("garbage")
+
+    rt = StaticPoolRuntime(StaticPoolConfig(workers=(StaticWorker(host="x"),)),
+                           http_probe=lambda u, h, t: True, capability_probe=boom)
+    assert rt.egress_census() == (0, 0, 1)

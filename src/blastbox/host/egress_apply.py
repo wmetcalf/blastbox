@@ -817,6 +817,16 @@ def overlay_conflict(cfg: WgInterface, *, own_addresses: bool = False) -> str | 
         except (json.JSONDecodeError, TypeError):
             ours = set()
     if own_addresses:
+        # iproute2 prints a host route WITHOUT its prefix ("10.78.0.1" for the /32 wg-quick
+        # adds for a peer), while claimed_cidrs() normalises the same route to
+        # "10.78.0.1/32" -- so compared raw, our own route was "someone else's".
+        norm: set[str] = set()
+        for d in ours:
+            try:
+                norm.add(str(ipaddress.ip_network(d, strict=False)))
+            except ValueError:
+                continue
+        ours |= norm
         held = _run(["ip", "-j", "addr", "show", "dev", cfg.wg_iface], check=False)
         if held.returncode == 0:
             try:

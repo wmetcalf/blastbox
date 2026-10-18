@@ -32,11 +32,20 @@ from blastbox.host.worker_link import (
     host_wg_config,
     link_peer_stanza,
     next_free_ip,
+    reassert_units,
 )
 
 ENV_FILE = Path("/etc/blastbox/worker-link.env")
 FW_FILE = Path("/etc/blastbox/worker-link.nft")
 FW_UNIT = Path("/etc/systemd/system") / FW_UNIT_NAME
+_FW_BASE = FW_UNIT_NAME.removesuffix(".service")
+REASSERT_TIMER_NAME = f"{_FW_BASE}-reassert.timer"
+
+
+def _reassert_paths() -> tuple[Path, Path]:
+    """``(service, timer)`` paths, beside FW_UNIT -- resolved at CALL time so they follow it."""
+    return (FW_UNIT.with_name(f"{_FW_BASE}-reassert.service"),
+            FW_UNIT.with_name(REASSERT_TIMER_NAME))
 #: Signed worker certificates, by worker name, under the PKI dir. Public material; kept so
 #: an operator can see what was issued (and when it lapses) without the worker.
 CERT_SUBDIR = "worker-link"
@@ -174,7 +183,7 @@ def firewall_status(cfg: WorkerLinkConfig) -> tuple[bool | None, str]:
     listing, why = _nft_listing()
     if listing is None:
         return (None if "needs root" in why or "not installed" in why else False), why
-    missing = firewall_in_force(listing, iface=cfg.wg_iface)
+    missing = firewall_in_force(listing, host_firewall_nft(cfg))
     if missing:
         return False, "INCOMPLETE: missing " + ", ".join(missing)
     return True, f"in force (table inet {NFT_TABLE})"
@@ -203,23 +212,38 @@ def install_firewall(cfg: WorkerLinkConfig) -> list[str]:
     if state is not True:
         raise RuntimeError(f"loaded the worker-link ruleset but it is not in force: {why}")
     notes = [f"firewall: {why}"]
+    # Persistence is part of the guarantee, not a nicety: without the boot unit enabled
+    # (RequiredBy=wg-quick@<iface>) the link would come up OPEN after a reboot, and without
+    # the re-assert timer a `systemctl restart nftables` would leave it open until one. So a
+    # failure here is fatal -- raised before init brings the interface up.
     body = firewall_unit(nft_bin=nft, nft_file=str(FW_FILE), table=NFT_TABLE,
                          iface=cfg.wg_iface,
                          description="blastbox worker-link host firewall")
+    service, timer = reassert_units(nft_bin=nft, nft_file=str(FW_FILE), iface=cfg.wg_iface,
+                                    base=_FW_BASE,
+                                    description="blastbox worker-link host firewall")
     try:
-        if not (FW_UNIT.exists() and FW_UNIT.read_text() == body):
-            FW_UNIT.parent.mkdir(parents=True, exist_ok=True)
-            FW_UNIT.write_text(body)
-            os.chmod(FW_UNIT, 0o644)
-            ea._run(["systemctl", "daemon-reload"], check=False)
+        changed = False
+        for path, text in ((FW_UNIT, body), (_reassert_paths()[0], service), (_reassert_paths()[1], timer)):
+            if not (path.exists() and path.read_text() == text):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text)
+                os.chmod(path, 0o644)
+                changed = True
     except OSError as exc:
-        notes.append(f"WARNING: firewall unit NOT installed ({exc.strerror}); the ruleset "
-                     "will not be reloaded after a reboot")
-        return notes
-    rc = ea._run(["systemctl", "enable", FW_UNIT_NAME], check=False)
-    notes.append(f"firewall unit {FW_UNIT_NAME}: "
-                 + ("enabled (reloads before the link at boot)" if rc.returncode == 0 else
-                    "NOT ENABLED — the ruleset will not survive a reboot"))
+        raise RuntimeError(f"could not install the firewall units ({exc.strerror}); without "
+                           "them the link would come up unfirewalled after a reboot") from None
+    if changed:
+        ea._run(["systemctl", "daemon-reload"], check=False)
+    for argv in (["systemctl", "enable", FW_UNIT_NAME],
+                 ["systemctl", "enable", "--now", REASSERT_TIMER_NAME]):
+        rc = ea._run(argv, check=False)
+        if rc.returncode != 0 or not ea._ok(["systemctl", "is-enabled", argv[-1]]):
+            tail = (rc.stderr or "").strip().splitlines()[-1:] or ["systemctl failed"]
+            raise RuntimeError(f"could not enable {argv[-1]} ({tail[0]}); refusing to bring the "
+                               "link up without its firewall persisted")
+    notes.append(f"firewall units enabled: {FW_UNIT_NAME} (loads before the link at boot; "
+                 f"the link Requires it) and {REASSERT_TIMER_NAME} (re-asserts every minute)")
     return notes
 
 
@@ -242,10 +266,19 @@ def _refuse_incompatible_reinit(cfg: WorkerLinkConfig) -> list[str]:
     * A different PORT or ENDPOINT is allowed but every worker must re-join (their config
       carries the old one), so say so.
     """
-    prev = load_config(required=False) if ENV_FILE.exists() else None
+    # The FILE alone, not load_config(): that merges BLASTBOX_WORKER_LINK_* from the
+    # environment, which is also how `cfg` was built -- so an override in the environment
+    # would make prev == cfg and strand every worker unchecked.
+    try:
+        file_env = _parse_env(ENV_FILE.read_text())
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise RuntimeError(f"cannot read {ENV_FILE}: {exc.strerror}") from None
     notes: list[str] = []
-    if prev is None:
+    if not file_env:
         return notes
+    prev = WorkerLinkConfig.from_env(file_env)
     if prev.wg_iface != cfg.wg_iface:
         raise RuntimeError(f"worker-link is already set up on {prev.wg_iface}; run "
                            "`blastbox worker-link teardown` before moving it to "
@@ -266,6 +299,10 @@ def _refuse_incompatible_reinit(cfg: WorkerLinkConfig) -> list[str]:
     if workers and (prev.wg_port != cfg.wg_port or prev.endpoint != cfg.endpoint):
         notes.append(f"NOTE: the endpoint/port changed; the {len(workers)} registered worker(s) "
                      "must be re-added and re-joined to dial the new one")
+    if workers and prev.agent_port != cfg.agent_port:
+        notes.append(f"NOTE: the agent port changed ({prev.agent_port} -> {cfg.agent_port}); every "
+                     f"worker's firewall and agent env are pinned to the old one: re-add and "
+                     "re-join each, then restart its agent on the new port")
     return notes
 
 
@@ -460,7 +497,7 @@ def status(cfg: WorkerLinkConfig, *, now: float | None = None) -> tuple[bool, li
     fw, why = firewall_status(cfg)
     rows.append("firewall: " + (why if fw is True else
                                 ("NOT IN FORCE — " if fw is False else "UNVERIFIED — ") + why))
-    for unit in (f"wg-quick@{cfg.wg_iface}", FW_UNIT_NAME):
+    for unit in (f"wg-quick@{cfg.wg_iface}", FW_UNIT_NAME, REASSERT_TIMER_NAME):
         enabled = ea._ok(["systemctl", "is-enabled", unit])
         rows.append(f"{unit}: {'enabled' if enabled else 'NOT enabled (will not survive a reboot)'}")
     try:
@@ -511,6 +548,7 @@ def teardown(cfg: WorkerLinkConfig) -> list[str]:
                      "until it is down. Bring it down by hand and re-run teardown.")
         return notes
     notes.append(f"{cfg.wg_iface} down; wg-quick@{cfg.wg_iface} disabled")
+    ea._run(["systemctl", "disable", "--now", REASSERT_TIMER_NAME], check=False)
     ea._run(["systemctl", "disable", "--now", FW_UNIT_NAME], check=False)
     ea._run(["nft", "delete", "table", "inet", NFT_TABLE], check=False)
     listing, why = _nft_listing()
@@ -520,7 +558,7 @@ def teardown(cfg: WorkerLinkConfig) -> list[str]:
         notes.append(f"table inet {NFT_TABLE} removed (no other table touched)")
     else:
         notes.append(f"WARNING: could not verify table inet {NFT_TABLE} was removed ({why})")
-    for path in (FW_UNIT, FW_FILE, ENV_FILE):
+    for path in (*_reassert_paths(), FW_UNIT, FW_FILE, ENV_FILE):
         try:
             path.unlink()
         except FileNotFoundError:

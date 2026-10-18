@@ -125,6 +125,8 @@ def node(tmp_path, monkeypatch):
         monkeypatch.setattr(link, "_platform", lambda: platform)
         monkeypatch.setattr(link, "_euid", lambda: 0)
         monkeypatch.setattr(link, "_sleep", lambda s: None)
+        monkeypatch.setattr(link, "_chown", lambda path, uid, gid: None)
+        monkeypatch.setattr(link, "_root_owned_and_private", lambda st: True)
         monkeypatch.setattr(link, "HANDSHAKE_WAIT_S", 0.0)
         monkeypatch.setattr(link, "_resolve", lambda host: ["192.0.2.10"])
         monkeypatch.setattr(link, "_which", lambda name: (
@@ -190,8 +192,7 @@ def test_worker_firewall_admits_only_the_host_to_the_agent_port():
     out = fw.split("chain output {\n", 1)[1].split("\n\t}", 1)[0]
     assert "new" not in out and out.strip().endswith('oifname "wtwg0" drop')
     from blastbox.host.worker_link import firewall_in_force
-    assert firewall_in_force(fw.split(f"delete table inet {link.NFT_TABLE}\n", 1)[1],
-                             iface="wtwg0") == []
+    assert firewall_in_force(fw.split(f"delete table inet {link.NFT_TABLE}\n", 1)[1], fw) == []
 
 
 def test_a_job_container_cannot_reach_the_control_link_from_inside_the_worker():
@@ -279,6 +280,7 @@ def mac(tmp_path):
     state.mkdir()
     (state / "up").write_text("")
     (state / "pf").write_text("Enabled")
+    (state / "main").write_text('anchor "com.apple/*" all\n')
     env_hdr = f'LOG={log}; ST={state}; RUN={run_d}\necho "$(basename "$0") $*" >> "$LOG"\n'
     wg = _fake_bin(bin_d, "wg", env_hdr + (
         '[ "$1" = show ] && grep -qx "$2" "$ST/up" && exit 0\nexit 1\n'))
@@ -289,13 +291,14 @@ def mac(tmp_path):
         'case "$*" in\n'
         '  *"-s info"*) echo "Status: $(cat "$ST/pf")"; exit 0 ;;\n'
         '  *"-E"*) echo Enabled > "$ST/pf"; exit 0 ;;\n'
-        '  *"-s rules"*) cat "$ST/anchor" 2>/dev/null; exit 0 ;;\n'
+        '  *"-a "*"-s rules"*) cat "$ST/anchor" 2>/dev/null; exit 0 ;;\n'
+        '  *"-s rules"*) cat "$ST/main"; exit 0 ;;\n'
         '  *"-f -"*) cat > "$ST/anchor"; echo "LOADED $(head -1 "$ST/anchor")" >> "$LOG"; exit 0 ;;\n'
         "esac\nexit 0\n"))
     script = tmp_path / "watchdog.sh"
     script.write_text(link.watchdog_script(
         iface="wtwg0", worker_ip="10.78.0.5", host_ip="10.78.0.1", agent_port=8765,
-        wg=wg, wg_quick=wgq, pfctl=pfctl, run_dir=str(run_d)))
+        wg=wg, wg_quick=wgq, pfctl=pfctl, run_dir=str(run_d), state_dir=str(state)))
 
     class Mac:
         def run(self) -> list[str]:
@@ -317,6 +320,16 @@ def mac(tmp_path):
 
         def anchor(self) -> str:
             return (state / "anchor").read_text()
+
+        def main_rules(self, text: str) -> None:
+            (state / "main").write_text(text)
+
+        def rerender(self, **kw) -> None:
+            args = dict(iface="wtwg0", worker_ip="10.78.0.5", host_ip="10.78.0.1",
+                        agent_port=8765, wg=wg, wg_quick=wgq, pfctl=pfctl, run_dir=str(run_d),
+                        state_dir=str(state))
+            args.update(kw)
+            script.write_text(link.watchdog_script(**args))
 
     return Mac()
 
@@ -361,6 +374,24 @@ def test_watchdog_enables_pf_when_macos_left_it_disabled(mac):
     assert "pfctl -E" in calls
 
 
+def test_watchdog_takes_the_link_down_when_pf_no_longer_evaluates_the_anchor(mac):
+    """A VPN/kill-switch app that loads its own main ruleset drops anchor "com.apple/*": our
+    anchor is then text, so the link must go down."""
+    mac.up("utun7")
+    mac.main_rules("pass all\n")
+    with pytest.raises(AssertionError, match="does not evaluate"):
+        mac.run()
+
+
+def test_a_changed_agent_port_reloads_pf_even_with_the_tunnel_up(mac):
+    mac.up("utun7")
+    mac.run()
+    mac.rerender(agent_port=9443)
+    calls = mac.run()
+    assert not any(c.startswith("wg-quick") for c in calls)
+    assert "port 9443" in mac.anchor()
+
+
 def test_watchdog_takes_the_link_down_when_pf_cannot_be_enabled(tmp_path):
     """Rules in a disabled pf are text, not enforcement: no pf, no link."""
     bin_d, run_d = tmp_path / "bin", tmp_path / "run"
@@ -386,12 +417,16 @@ def test_pf_rules_and_their_read_back():
     rules = link.pf_rules(real_iface="utun7", worker_ip="10.78.0.5", host_ip="10.78.0.1",
                           agent_port=8765)
     ok = dict(info="Status: Enabled for 1 days", main_rules='anchor "com.apple/*" all',
-              anchor_rules=rules, real_iface="utun7", worker_ip="10.78.0.5")
+              anchor_rules=rules, real_iface="utun7", worker_ip="10.78.0.5",
+              host_ip="10.78.0.1", agent_port=8765)
     assert link.pf_in_force(**ok) == []
     assert link.pf_in_force(**{**ok, "info": "Status: Disabled"})
     assert link.pf_in_force(**{**ok, "main_rules": ""})
     assert link.pf_in_force(**{**ok, "real_iface": "utun8"})          # stale utun
     assert link.pf_in_force(**{**ok, "anchor_rules": rules.splitlines()[0]})
+    assert link.pf_in_force(**{**ok, "agent_port": 9443})               # stale port
+    # pfctl's own rendering (`port = N`) is accepted
+    assert link.pf_in_force(**{**ok, "anchor_rules": rules.replace("port 8765", "port = 8765")}) == []
     with pytest.raises(ValueError):
         link.pf_rules(real_iface="en0", worker_ip="10.78.0.5", host_ip="10.78.0.1",
                       agent_port=8765)
@@ -646,3 +681,79 @@ def test_macos_rejoin_with_a_changed_config_re_ups_the_live_tunnel(node, tmp_pat
     assert "/fake/bin/wg-quick down wtwg0" not in n.flat()
     link.join(_bundle(tmp_path, csr, endpoint="gw2.example.org:51822"))
     assert "/fake/bin/wg-quick down wtwg0" in n.flat()
+
+
+def test_a_linux_rejoin_with_the_link_up_does_not_refuse_its_own_routes(node, tmp_path, monkeypatch):
+    """REGRESSION (review): iproute2 prints the host /32 wg-quick installs as a BARE address
+    ("10.78.0.1"), while claimed_cidrs() reports "10.78.0.1/32". Compared raw, the link's own
+    route read as someone else's and every renewal re-join was refused."""
+    from blastbox.host import egress_apply as ea
+
+    n = node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    monkeypatch.setattr(ea, "claimed_cidrs", lambda: ["192.168.1.0/24", "10.78.0.1/32",
+                                                      "10.78.0.5/32"])
+
+    def run(argv, **kw):
+        a = list(argv)
+        if a[:5] == ["ip", "-j", "route", "show", "dev"]:
+            return subprocess.CompletedProcess(a, 0, json.dumps(
+                [{"dst": "10.78.0.1", "dev": "wtwg0", "scope": "link"}]), "")
+        if a[:5] == ["ip", "-j", "addr", "show", "dev"]:
+            return subprocess.CompletedProcess(a, 0, json.dumps([{"addr_info": [
+                {"family": "inet", "local": "10.78.0.5", "prefixlen": 32}]}]), "")
+        return n.run(argv)
+
+    monkeypatch.setattr(ea, "_run", run)
+    link.join(_bundle(tmp_path, csr))                      # renewal: must not raise
+
+
+def test_an_unroutable_aaaa_record_does_not_block_a_v4_endpoint(node, tmp_path, monkeypatch):
+    n = node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    monkeypatch.setattr(link, "_resolve", lambda host: ["192.0.2.10", "2001:db8::10"])
+    real = n.run
+
+    def run(argv, **kw):
+        if list(argv)[:2] == ["ip", "-6"]:
+            return subprocess.CompletedProcess(list(argv), 2, "", "Network is unreachable")
+        return real(argv, **kw)
+
+    monkeypatch.setattr(link, "_run", run)
+    notes = link.join(_bundle(tmp_path, csr))
+    assert any("2001:db8::10 (unused)" in x for x in notes)
+    monkeypatch.setattr(link, "_resolve", lambda host: ["2001:db8::10"])
+    with pytest.raises(RuntimeError, match="no underlay route"):
+        link.join(_bundle(tmp_path, csr))
+
+
+def test_join_refuses_to_bring_the_link_up_when_the_firewall_cannot_be_persisted(
+        node, tmp_path, monkeypatch):
+    n = node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    real = n.run
+
+    def run(argv, **kw):
+        if list(argv)[:2] == ["systemctl", "enable"] and "--now" not in argv:
+            return subprocess.CompletedProcess(list(argv), 1, "", "Failed to enable")
+        return real(argv, **kw)
+
+    monkeypatch.setattr(link, "_run", run)
+    with pytest.raises(RuntimeError, match="persisted"):
+        link.join(_bundle(tmp_path, csr))
+    assert "wtwg0" not in n.links
+
+
+def test_join_tells_the_operator_to_restart_the_agent(node, tmp_path):
+    node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    assert any("RESTARTED" in x for x in link.join(_bundle(tmp_path, csr)))
+
+
+def test_the_macos_root_script_refuses_a_user_writable_path(node, tmp_path, monkeypatch):
+    node("darwin")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    monkeypatch.setattr(link, "_root_owned_and_private", lambda st: False)
+    with pytest.raises(RuntimeError, match="not root-owned"):
+        link.join(_bundle(tmp_path, csr))

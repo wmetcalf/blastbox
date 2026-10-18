@@ -447,8 +447,12 @@ sudo blastbox worker-link status                 # per-worker handshake age, fir
 pointing at the files it installed under `/etc/blastbox/worker-link/`. The agent binds the overlay
 address, so it needs the link up before it starts (launchd/systemd restart it until it is). The
 certificate is SAN-pinned to the overlay address because the dispatcher verifies the hostname it
-dialled; renewal is `add` again for the same name with a fresh CSR (`--days`, default 30): the
+dialled; renewal is `add` again for the same name with a fresh CSR (`--days`, default 30), then
+`join` the new bundle and **restart the agent** (it loads its certificate once at startup): the
 address and tunnel are kept, the certificate and the recorded expiry (`list`, `status`) change.
+Changing the host address, or an overlay that would no longer contain a registered worker, is
+refused by `init`; a changed endpoint, port or agent port is allowed but every worker must be
+re-added and re-joined (`init` says so).
 `remove <name>` takes a worker off the live interface; `teardown` removes the host end (interface
 down first, then its firewall), keeping registrations and keys so a later `init` restores them.
 
@@ -461,8 +465,14 @@ pf anchor under `com.apple/`): only the host's /32 may open the agent port; noth
 or out of the link. Every base chain is `policy accept` and matches only the link interface, so it
 changes no verdict for docker or egress traffic — and nftables needs **every** base chain on a hook
 to accept, so it can't override docker's own `FORWARD` drop either. Each side loads its ruleset,
-reads it back from the kernel, and only then brings the interface up; a oneshot unit reloads it
-before `wg-quick@wtwg0` at boot. `status` reports the ruleset the kernel holds, not the file.
+reads it back from the kernel (every rendered drop present, no rule added), and only then brings
+the interface up. A oneshot unit reloads it before `wg-quick@wtwg0` at boot and the link
+**Requires** it (a ruleset that fails to load, or a missing file, keeps the link down); it is
+`PartOf=nftables.service`, so a restart of nftables (whose stock config flushes every table)
+puts it back; and a timer re-asserts it every minute (an atomic `nft -f`), stopping the link if
+that fails — the answer to a firewalld/ufw reload or a hand-run flush. If those units cannot be
+installed and enabled, `init`/`join` refuse to bring the link up. `status` reports the ruleset
+the kernel holds, not the file.
 
 **A dispatcher in docker** reaches workers by being forwarded out of its bridge into `wtwg0`.
 Pass that network's CIDR as `--dispatcher-source` (repeatable): only those sources may open the
@@ -483,7 +493,12 @@ endpoint would be reached through `bbwg0` or the link itself.
 
 **macOS workers.** The link runs as a root LaunchDaemon (`io.blastbox.worker-link.wtwg0`) that
 runs a root-owned watchdog script every 30 s; it only re-ups the tunnel when it is down and
-re-asserts the pf anchor (enabling pf, which macOS boots with off). Two details were each found the
+re-asserts the pf anchor for the current utun and rules (enabling pf, which macOS boots with
+off). It takes the link DOWN if pf cannot be enabled, refuses a ruleset, or the main ruleset no
+longer evaluates `anchor "com.apple/*"` (a VPN or kill-switch app that loads its own) — rules pf
+does not evaluate are text, not enforcement. A re-join with a changed config takes the live
+tunnel down so the watchdog brings it back with the new one. The script, its plist and every
+directory above them must be root-owned and not group/world-writable, or `join` refuses. Two details were each found the
 hard way and have regression tests: the daemon must set **`AbandonProcessGroup`** (`wg-quick up`
 leaves `wireguard-go` in the watchdog's process group, which launchd otherwise kills when the
 watchdog exits), and "is it up?" must be asked of the **real `utunN`** recorded in

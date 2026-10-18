@@ -60,6 +60,7 @@ __all__ = [
     "JoinBundle",
     "WorkerLinkConfig",
     "firewall_in_force",
+    "reassert_units",
     "firewall_unit",
     "host_firewall_nft",
     "host_wg_config",
@@ -471,6 +472,10 @@ def firewall_unit(*, nft_bin: str, nft_file: str, table: str, iface: str,
 [Unit]
 Description={description}
 Before=wg-quick@{iface}.service
+# A restart of nftables.service (whose stock config flushes EVERY table) restarts this unit
+# after it, so the table is put back rather than silently lost.
+After=nftables.service
+PartOf=nftables.service
 # ASSERT, not Condition: a failed condition counts as success to a unit that Requires this
 # one, so a missing ruleset file would let the link start open. An assertion fails it.
 AssertPathExists={nft_file}
@@ -487,22 +492,17 @@ RequiredBy=wg-quick@{iface}.service
 """
 
 
-def firewall_in_force(listing: str, *, iface: str,
-                      chains: Iterable[str] = ("input", "forward", "output")) -> list[str]:
-    """What is MISSING from a live ``nft list table`` listing, or [] if the ruleset is in force.
+_COUNTER = re.compile(r"\bcounter packets \d+ bytes \d+ ")
 
-    PRESENT IS NOT IN FORCE: the ruleset file on disk, or an enabled unit, proves nothing
-    about the kernel. This reads the kernel's own listing and requires, for every chain,
-    the hook that makes it a base chain and the terminal per-interface drop that is the
-    whole point of it. An accept rule alone is worthless if its drop has gone, so the drop
-    is what is checked.
-    """
-    missing: list[str] = []
-    text = listing or ""
+
+def _chains(text: str) -> dict[str, list[str]]:
+    """``chain name -> [normalised rule lines]`` for an nft table listing (or our rendering).
+    Whitespace is collapsed and ``counter packets N bytes N`` dropped, so a counter on a rule
+    does not make it a different rule."""
     blocks: dict[str, list[str]] = {}
     current: str | None = None
-    for raw in text.splitlines():
-        line = " ".join(raw.split())
+    for raw in (text or "").splitlines():
+        line = _COUNTER.sub("", " ".join(raw.split()) + " ").strip()
         m = re.match(r"^chain (\S+) \{$", line)
         if m:
             current = m.group(1)
@@ -511,20 +511,89 @@ def firewall_in_force(listing: str, *, iface: str,
         if line == "}":
             current = None
             continue
-        if current is not None:
+        if current is not None and line and not line.startswith("#"):
             blocks[current].append(line)
-    q = f'"{iface}"'
-    for chain in chains:
-        body = blocks.get(chain)
-        if body is None:
+    return blocks
+
+
+def firewall_in_force(listing: str, expected: str) -> list[str]:
+    """What is MISSING from a live ``nft list table`` listing, or [] if ``expected`` (the
+    ruleset we rendered) is in force.
+
+    PRESENT IS NOT IN FORCE: the ruleset file on disk, or an enabled unit, proves nothing
+    about the kernel, so this reads the kernel's own listing. For every chain we rendered it
+    requires: the chain, its hook, EVERY drop (and the masquerade) we rendered -- an accept is
+    worthless if a drop behind it has gone -- and no rule we did not render, so an accept
+    inserted ahead of a drop cannot pass as ours. Accept lines themselves are compared by
+    count rather than text: nft re-renders sets and matches in its own canonical form, and a
+    cosmetic difference there must not read as "the firewall is down"; the drops are simple
+    enough to compare exactly.
+    """
+    missing: list[str] = []
+    have = _chains(listing)
+    for chain, want in _chains(expected).items():
+        got = have.get(chain)
+        if got is None:
             missing.append(f"chain {chain}")
             continue
-        if not any(f"hook {chain} " in ln for ln in body):
-            missing.append(f"chain {chain} is not hooked into {chain}")
-        sel = "oifname" if chain == "output" else "iifname"
-        if not any(ln.split()[:2] == [sel, q] and ln.endswith(" drop") for ln in body):
-            missing.append(f"chain {chain}: terminal `{sel} {q} drop`")
+        hook = next((ln for ln in want if ln.startswith("type ")), None)
+        if hook and not any(ln.split(";")[0] == hook.split(";")[0] for ln in got):
+            missing.append(f"chain {chain} is not hooked as `{hook.split(';')[0]}`")
+        for ln in want:
+            if ln.endswith(" drop") and ln not in got:
+                missing.append(f"chain {chain}: `{ln}`")
+            if ln.endswith(" masquerade") and not any(
+                    g.endswith(" masquerade") and g.split()[:2] == ln.split()[:2] for g in got):
+                missing.append(f"chain {chain}: the masquerade")
+        rules_want = [ln for ln in want if not ln.startswith("type ")]
+        rules_got = [ln for ln in got if not ln.startswith("type ")]
+        if len(rules_got) != len(rules_want):
+            missing.append(f"chain {chain} holds {len(rules_got)} rules, not the "
+                           f"{len(rules_want)} rendered (something was added or removed)")
     return missing
+
+
+def reassert_units(*, nft_bin: str, nft_file: str, iface: str, base: str,
+                   description: str, interval: str = "1min") -> tuple[str, str]:
+    """``(service, timer)`` that re-load the ruleset every ``interval`` while the link exists.
+
+    A loaded ruleset can disappear with the interface still up: ``systemctl restart
+    nftables`` (Debian's /etc/nftables.conf begins with ``flush ruleset``), a firewalld or
+    ufw reload, or a hand-run ``nft flush ruleset``. The boot unit is ``RemainAfterExit`` and
+    never runs again, so nothing would put it back. ``nft -f`` replaces our table atomically
+    (no window), and if it FAILS the link is stopped: an unfirewalled link is worse than none.
+    """
+    import shlex
+
+    cmd = (f"{shlex.quote(nft_bin)} -f {shlex.quote(nft_file)} || "
+           f"systemctl stop wg-quick@{_link_iface(iface)}.service")
+    service = f"""# {description} -- periodic re-assert. Generated from
+# blastbox.host.worker_link.reassert_units; triggered by {base}-reassert.timer.
+
+[Unit]
+Description={description} (re-assert)
+After={base}.service
+ConditionPathExists={nft_file}
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c {shlex.quote(cmd)}
+"""
+    timer = f"""# {description} -- re-load the ruleset every {interval} while the link is up.
+
+[Unit]
+Description={description} (re-assert timer)
+
+[Timer]
+OnBootSec={interval}
+OnUnitActiveSec={interval}
+AccuracySec=10s
+Unit={base}-reassert.service
+
+[Install]
+WantedBy=timers.target
+"""
+    return service, timer
 
 
 # --------------------------------------------------------------------------------------

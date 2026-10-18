@@ -194,6 +194,30 @@ def test_init_is_idempotent_and_keeps_registered_workers(host, pki):
     assert "ListenPort = 51900" in body and "# peer:mac1" in body
 
 
+def test_init_refuses_to_bring_the_link_up_if_the_firewall_cannot_be_persisted(host, monkeypatch):
+    real = host.run
+
+    def run(argv, **kw):
+        if list(argv)[:2] == ["systemctl", "enable"] and "--now" not in argv:
+            return subprocess.CompletedProcess(list(argv), 1, "", "Failed to enable unit")
+        return real(argv, **kw)
+
+    monkeypatch.setattr(ea, "_run", run)
+    with pytest.raises(RuntimeError, match="without its firewall persisted"):
+        wla.init_host(_cfg())
+    assert "wtwg0" not in host.links
+
+
+def test_an_environment_override_cannot_strand_workers_past_the_reinit_check(
+        host, pki, monkeypatch):
+    cfg = _cfg()
+    wla.init_host(cfg)
+    wla.add_worker(cfg, "mac1", KEY_A, _csr(_ip("10.78.0.2")), pki_dir=pki)
+    monkeypatch.setenv("BLASTBOX_WORKER_LINK_HOST_IP", "10.78.0.9")
+    with pytest.raises(RuntimeError, match="strand"):
+        wla.init_host(wla.load_config())
+
+
 def test_reinit_refuses_changes_that_would_strand_registered_workers(host, pki):
     cfg = _cfg()
     wla.init_host(cfg)
@@ -206,6 +230,8 @@ def test_reinit_refuses_changes_that_would_strand_registered_workers(host, pki):
         wla.init_host(_cfg(overlay_net="10.78.0.0/29"))
     _pub, notes = wla.init_host(_cfg(endpoint="gw2.example.org"))
     assert any("re-joined" in n for n in notes)
+    _pub, notes = wla.init_host(_cfg(endpoint="gw2.example.org", agent_port=9443))
+    assert any("agent port changed" in n for n in notes)
 
 
 @pytest.mark.parametrize("egress_env,why", [
@@ -513,6 +539,8 @@ def test_the_cli_drives_init_add_list_remove(host, pki, tmp_path, capsys):
     assert "mac1" in out and "next free address: 10.78.0.3" in err
     assert link.main(["remove", "mac1", "--pki-dir", str(pki)]) == 0
     assert link.main(["remove", "mac1"]) == 1
+    assert link.main(["init", "--no-dispatcher-source"]) == 0
+    assert wla.load_config().dispatcher_sources == ()
 
 
 def test_the_cli_reports_errors_without_a_traceback(host, capsys):

@@ -85,6 +85,7 @@ def make_capability_probe(ssl_context: Any = None) -> CapabilityProbe:
     shares it; only a static pool serving an egress-granting policy needs to know more, and only
     then is this second request made. Same no-redirect, no-proxy opener as the transport.
     """
+    import http.client
     import json as _json
     import urllib.error
     import urllib.request
@@ -98,7 +99,8 @@ def make_capability_probe(ssl_context: Any = None) -> CapabilityProbe:
                 if not 200 <= resp.status < 300:
                     return None
                 raw = resp.read(65536)
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError,
+                http.client.HTTPException):
             # Down, refusing, not ready (a 503 is an HTTPError) or our own exhaustion: none of
             # those says what the box CAN do. Reading them as "no egress" made a fleet that was
             # merely unreachable at dispatcher start look like one that can never serve the
@@ -243,6 +245,9 @@ class StaticPoolRuntime:
         # Set by build_remote_vm_dispatcher when the tier's net policy grants egress: only
         # workers whose /healthz advertises "egress": true may then be claimed.
         self._require_egress = False
+        # worker_index -> its last ANSWERED egress advertisement. Lets spawn() tell "the
+        # capable workers are all busy" (backpressure) from "no worker can" (a fault).
+        self._egress_seen: dict[int, bool] = {}
         self._clock = clock or time.monotonic
         # client (m)TLS context for https workers -- the dispatcher hands this to make_remote_validate
         # so the transport verifies the worker + presents its client cert.
@@ -303,14 +308,22 @@ class StaticPoolRuntime:
         self._require_egress = True
 
     def _advertises_egress(self, w: StaticWorker, timeout: float | None = None) -> "bool | None":
+        verdict = self._ask_egress(w, timeout)
+        if verdict is not None:
+            idx = self.cfg.workers.index(w)
+            with self._lock:
+                self._egress_seen[idx] = verdict
+        return verdict
+
+    def _ask_egress(self, w: StaticWorker, timeout: float | None = None) -> "bool | None":
         url = self._base_url(w) + self.cfg.health_path
         headers = {"X-aws-proxy-auth": w.token} if w.token else {}
         try:
             info = self._cap_probe(
                 url, headers,
                 max(_MIN_PROBE_S, float(self.cfg.probe_timeout_s) if timeout is None else timeout))
-        except (OSError, ValueError):
-            return None
+        except Exception:  # noqa: BLE001 -- e.g. http.client.HTTPException from an odd peer:
+            return None    # no answer is not a verdict, and must not crash dispatcher build
         if info is None:
             return None
         return info.get("egress") is True
@@ -397,6 +410,7 @@ class StaticPoolRuntime:
         saw_unhealthy = False
         saw_cooling = False
         saw_no_egress = False
+        saw_egress_unknown = False
         for idx in candidates:
             with self._lock:
                 cool = self._cooldown_until.get(idx, 0.0)
@@ -425,6 +439,8 @@ class StaticPoolRuntime:
                     # policy. Unknown (could not ask) is not counted as a verdict either way.
                     if cap is False:
                         saw_no_egress = True
+                    else:
+                        saw_egress_unknown = True
                     _log.warning("static: worker[%d] %s egress, which this tier's net policy "
                                  "requires; skipping", idx,
                                  "does not advertise" if cap is False else "could not be asked about")
@@ -446,7 +462,14 @@ class StaticPoolRuntime:
             )
             _log.info("static: claimed worker[%d] %s for slot=%s", idx, self._base_url(w), slot.slot_id)
             return slot
-        if saw_no_egress and not saw_unhealthy and not saw_cooling:
+        with self._lock:
+            # A capable worker that is merely CLAIMED (or was last seen capable) means this is
+            # backpressure: the next release frees it. Only a fleet with no known-capable
+            # worker at all, every free one having ANSWERED no, is the configuration fault.
+            known_capable = any(v for i, v in self._egress_seen.items()
+                                if i not in self._burned_out)
+        if (saw_no_egress and not saw_unhealthy and not saw_cooling
+                and not saw_egress_unknown and not known_capable):
             raise StaticPoolNoEgress(
                 "no free static worker advertises egress, and this tier's net policy grants it "
                 "(macOS workers never do; a Linux agent may be running with "

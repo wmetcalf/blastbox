@@ -231,23 +231,42 @@ def test_every_base_chain_is_policy_accept_and_matches_only_the_link():
 
 
 def test_firewall_in_force_reads_the_kernel_listing_not_the_file():
-    cfg = _cfg()
-    # The shape `nft list table` prints (tabs, the hook line, a counter-less drop).
-    listing = host_firewall_nft(cfg).split(f"delete table inet {NFT_TABLE}\n", 1)[1]
-    assert firewall_in_force(listing, iface="wtwg0") == []
-    no_drop = listing.replace('\t\tiifname "wtwg0" drop\n', "", 1)
-    assert any("input" in m for m in firewall_in_force(no_drop, iface="wtwg0"))
+    fw = host_firewall_nft(_cfg(dispatcher_sources=("172.18.0.0/16",)))
+    # The shape `nft list table` prints (the table without our preamble).
+    listing = fw.split(f"delete table inet {NFT_TABLE}\n", 1)[1]
+    assert firewall_in_force(listing, fw) == []
+    # EVERY drop is required, not just one per chain
+    for drop in ('\t\tiifname != { "lo", "wtwg0" } ip daddr 10.78.0.0/24 drop\n',
+                 '\t\toifname "wtwg0" drop\n'):
+        assert firewall_in_force(listing.replace(drop, "", 1), fw), drop
     unhooked = listing.replace("type filter hook output priority filter; policy accept;", "")
-    assert any("output" in m and "hooked" in m for m in firewall_in_force(unhooked, iface="wtwg0"))
-    assert len(firewall_in_force("", iface="wtwg0")) == 3
-    # another interface's drop is not ours
-    assert firewall_in_force(listing.replace('"wtwg0"', '"other"'), iface="wtwg0")
+    assert any("output" in m and "hooked" in m for m in firewall_in_force(unhooked, fw))
+    assert len(firewall_in_force("", fw)) == 4
+    # an accept slipped in ahead of the drops is not ours
+    extra = listing.replace('\t\tiifname "wtwg0" drop\n',
+                            '\t\tiifname "wtwg0" accept\n\t\tiifname "wtwg0" drop\n', 1)
+    assert any("rules" in m for m in firewall_in_force(extra, fw))
+    # the masquerade is required when sources are configured
+    assert firewall_in_force(listing.replace(" masquerade", " accept"), fw)
+    # another interface's drops are not ours
+    assert firewall_in_force(listing.replace('"wtwg0"', '"other"'), fw)
 
 
-def test_a_counter_on_the_drop_still_counts():
-    listing = ("table inet t {\n\tchain input {\n\t\ttype filter hook input priority filter; "
-               "policy accept;\n\t\tiifname \"wtwg0\" counter packets 3 bytes 180 drop\n\t}\n}\n")
-    assert firewall_in_force(listing, iface="wtwg0", chains=("input",)) == []
+def test_a_counter_on_a_rule_still_counts():
+    fw = host_firewall_nft(_cfg())
+    listing = fw.split(f"delete table inet {NFT_TABLE}\n", 1)[1].replace(
+        'iifname "wtwg0" drop', 'iifname "wtwg0" counter packets 3 bytes 180 drop')
+    assert firewall_in_force(listing, fw) == []
+
+
+def test_the_reassert_units_restore_a_flushed_ruleset_or_stop_the_link():
+    from blastbox.host.worker_link import reassert_units
+
+    svc, timer = reassert_units(nft_bin="/usr/sbin/nft", nft_file="/etc/blastbox/worker-link.nft",
+                                iface="wtwg0", base="blastbox-worker-link-fw", description="d")
+    assert ("ExecStart=/bin/sh -c '/usr/sbin/nft -f /etc/blastbox/worker-link.nft || "
+            "systemctl stop wg-quick@wtwg0.service'") in svc
+    assert "OnUnitActiveSec=1min" in timer and "Unit=blastbox-worker-link-fw-reassert.service" in timer
 
 
 def test_firewall_unit_loads_before_the_link_and_deletes_only_its_table():
@@ -261,6 +280,7 @@ def test_firewall_unit_loads_before_the_link_and_deletes_only_its_table():
     assert "ExecStart=/usr/sbin/nft -f /etc/blastbox/worker-link.nft" in u
     assert f"ExecStop=-/usr/sbin/nft delete table inet {NFT_TABLE}" in u
     assert "flush ruleset" not in u
+    assert "PartOf=nftables.service" in u and "After=nftables.service" in u
 
 
 # ------------------------------------------------------------------------------- bundle

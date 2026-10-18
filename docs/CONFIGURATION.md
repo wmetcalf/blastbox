@@ -921,7 +921,7 @@ overrides the file. Contains no key material.
 | `BLASTBOX_WORKER_LINK_WG_PORT` | `51822` | host UDP listen port; must differ from the egress port, and be reachable from the workers |
 | `BLASTBOX_WORKER_LINK_AGENT_PORT` | `8765` | the agents' TCP port — the ONLY port the firewall lets the host open to a worker |
 | `BLASTBOX_WORKER_LINK_ENDPOINT` | — | `host[:port]` workers dial (this host's public address); required before `add` |
-| `BLASTBOX_WORKER_LINK_DISPATCHER_SOURCES` | — | comma-list of CIDRs a **containerised** dispatcher connects from (its docker network); admitted into the link and MASQUERADEd to the host's overlay address. Empty = only a dispatcher on the host itself. `0.0.0.0/0` is refused |
+| `BLASTBOX_WORKER_LINK_DISPATCHER_SOURCES` | — | comma-list of CIDRs a **containerised** dispatcher connects from (its docker network); admitted into the link and MASQUERADEd to the host's overlay address. Empty = only a dispatcher on the host itself. `0.0.0.0/0` is refused. A later `init --dispatcher-source` replaces the list; `--no-dispatcher-source` clears it |
 
 Worker side: `sudo blastbox worker-link keygen --ip <addr>` (WireGuard + TLS keys, root-only,
 and a CSR whose only SAN is that address), then `join --bundle <file> [--agent-user U]`, `status`,
