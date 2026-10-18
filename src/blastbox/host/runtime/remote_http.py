@@ -105,6 +105,17 @@ class WorkerBusy(RuntimeError):
     pressure, NOT a job failure -- the dispatcher requeues (like NoWarmSlot) instead of FAILing the job."""
 
 
+class WorkerLacksEgress(RuntimeError):
+    """The agent answered 422 ``egress_unavailable``: this job's net policy grants egress and the
+    worker cannot provide it (every macOS worker; a Linux one declared
+    ``BLASTBOX_WORKER_AGENT_EGRESS=0``). Nothing ran on the worker.
+
+    A PLACEMENT error, so neither the worker's fault nor the sample's: the job fails with a
+    reason that names the fix, and the slot is released CLEAN -- it did exactly what it should.
+    Before this, a macOS sandbox logged "network stays DENIED" and the job came back as an
+    ``ok`` result that had never reached the network."""
+
+
 class ParamsTooLargeForRemote(RuntimeError):
     """The forwarded per-job params serialize to a header larger than the stdlib HTTP line limit, so the
     worker would reject the request before parsing them. Fail fast with an actionable error."""
@@ -122,6 +133,8 @@ def _sanitized_failure(exc: Exception) -> str:
     import urllib.error as _ue
     if isinstance(exc, RemoteOutputTooLarge):
         return "remote output exceeded configured limits"
+    if isinstance(exc, WorkerLacksEgress):
+        return EGRESS_PLACEMENT_ERROR
     if type(exc).__name__ == "OutputTrustError":
         return "remote output failed host trust validation"
     if isinstance(exc, (_ssl.SSLError,)):
@@ -129,6 +142,26 @@ def _sanitized_failure(exc: Exception) -> str:
     if isinstance(exc, (_ue.URLError, TimeoutError, ConnectionError, OSError)):
         return "remote worker transport error"
     return "remote job failed"
+
+
+#: The job error for a WorkerLacksEgress refusal. Names the fix: this is configuration, and the
+#: same job will fail the same way on every worker of the tier until it is corrected.
+EGRESS_PLACEMENT_ERROR = (
+    "worker cannot provide network egress, but this job's net policy requires it (the agent "
+    "refused before running anything). Serve egress-granting policies from workers whose "
+    "/healthz advertises egress -- macOS workers never do")
+
+
+def _egress_refusal(exc: urllib.error.HTTPError) -> bool:
+    """Is this HTTP error the agent's ``egress_unavailable`` refusal? Reads a BOUNDED body: it
+    is worker-controlled, and only its ``error`` field is consulted."""
+    if exc.code != 422:
+        return False
+    try:
+        body = json.loads(exc.read(4096) or b"{}")
+    except (ValueError, OSError, AttributeError):
+        return False
+    return isinstance(body, dict) and body.get("error") == "egress_unavailable"
 
 
 def _check_params_header_size(params: dict[str, str] | None) -> None:
@@ -477,6 +510,8 @@ def detonate_remote(
             # Other 4xx/5xx are real failures and propagate.
             if exc.code == 409:
                 raise WorkerBusy(f"worker busy (409) at {url}") from exc
+            if _egress_refusal(exc):
+                raise WorkerLacksEgress(f"worker at {url} cannot provide egress (422)") from exc
             raise
         with resp_cm as resp, tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024) as spool:
             _bounded_copy(resp, spool, stream_cap, deadline=read_deadline)
@@ -604,6 +639,15 @@ def make_remote_validate(
             # Propagate so the dispatcher requeues the job (like NoWarmSlot); the finally still
             # releases this slot DIRTY, quarantining the box so it is not immediately re-offered.
             raise
+        except WorkerLacksEgress:
+            # Nothing ran: the agent refused on the job's net policy before the engine saw a
+            # byte. A placement fault -- not evidence about the worker (it answered exactly as
+            # it should) and not about the sample -- so release CLEAN and fail the job with a
+            # reason that names the fix. "job" so the answer clears any streak before it.
+            fault = "job"
+            dirty = False
+            _log.error("remote_http: %s", EGRESS_PLACEMENT_ERROR)
+            return {"error": EGRESS_PLACEMENT_ERROR}, False
         except ClaimLost as exc:
             # A PEER already reclaimed or finished this job -- our claim simply outlived itself.
             # The worker did nothing wrong, so attributing it as a wedge let two stale attempts

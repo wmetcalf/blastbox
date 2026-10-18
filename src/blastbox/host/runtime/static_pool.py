@@ -46,6 +46,14 @@ class StaticPoolUnhealthy(RuntimeError):
     and the only symptom would be a sagging warm-hit rate."""
 
 
+class StaticPoolNoEgress(StaticPoolUnhealthy):
+    """Healthy free workers exist, but none ADVERTISES egress and this tier's net policy grants it.
+
+    A configuration fault (a macOS-only fleet behind an egress personality, or Linux agents run
+    with BLASTBOX_WORKER_AGENT_EGRESS=0), so it is loud like an unhealthy fleet rather than
+    quiet like backpressure. Handing the job to such a worker would only get it refused (422)."""
+
+
 class StaticPoolUnavailable(RuntimeError):
     """No worker is configured / reachable -- the tier must not be selected."""
 
@@ -62,6 +70,47 @@ class StaticPoolNoVerdict(StaticPoolUnavailable):
 
     Subclasses StaticPoolUnavailable so every existing `except StaticPoolUnavailable` still catches
     it -- this narrows the meaning, it does not change who handles it."""
+
+
+#: ``(url, headers, timeout) -> parsed /healthz JSON``; None = no usable ANSWER (the box was
+#: unreachable, not ready, or we could not ask) -- never a verdict on what it advertises.
+#: ``{}`` = a ready agent that answered without a usable body (e.g. one predating the field).
+CapabilityProbe = Callable[[str, dict[str, str], float], "dict[str, Any] | None"]
+
+
+def make_capability_probe(ssl_context: Any = None) -> CapabilityProbe:
+    """Read a worker's /healthz BODY (bounded) for what it advertises, e.g. ``"egress"``.
+
+    Separate from the health probe on purpose: that seam answers alive-or-not and every tier
+    shares it; only a static pool serving an egress-granting policy needs to know more, and only
+    then is this second request made. Same no-redirect, no-proxy opener as the transport.
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    def probe(url: str, headers: dict[str, str], timeout: float) -> "dict[str, Any] | None":
+        from blastbox.host.runtime.remote_http import _default_open
+
+        req = urllib.request.Request(url, headers=headers, method="GET")  # noqa: S310
+        try:
+            with _default_open(req, timeout, context=ssl_context) as resp:
+                if not 200 <= resp.status < 300:
+                    return None
+                raw = resp.read(65536)
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+            # Down, refusing, not ready (a 503 is an HTTPError) or our own exhaustion: none of
+            # those says what the box CAN do. Reading them as "no egress" made a fleet that was
+            # merely unreachable at dispatcher start look like one that can never serve the
+            # policy, and the dispatcher refused to start on it.
+            return None
+        try:
+            body = _json.loads(raw or b"{}")
+        except ValueError:
+            return {}
+        return body if isinstance(body, dict) else {}
+
+    return probe
 
 
 def _env(get: Callable[[str], str | None], key: str, default: str | None = None) -> str | None:
@@ -186,9 +235,14 @@ class StaticPoolRuntime:
         http_probe: HttpProbe | None = None,
         clock: Callable[[], float] | None = None,
         ssl_context: Any = None,
+        capability_probe: CapabilityProbe | None = None,
     ) -> None:
         self.cfg = cfg
         self._probe = http_probe or _default_http_probe
+        self._cap_probe = capability_probe or make_capability_probe(ssl_context)
+        # Set by build_remote_vm_dispatcher when the tier's net policy grants egress: only
+        # workers whose /healthz advertises "egress": true may then be claimed.
+        self._require_egress = False
         self._clock = clock or time.monotonic
         # client (m)TLS context for https workers -- the dispatcher hands this to make_remote_validate
         # so the transport verifies the worker + presents its client cert.
@@ -237,6 +291,44 @@ class StaticPoolRuntime:
         except OSError as exc:
             _log.debug("static: health probe %s could not be attempted: %s", url, exc)
             return None
+
+    # -- placement ----------------------------------------------------------
+    def require_egress(self) -> None:
+        """Only hand out workers that ADVERTISE egress (``/healthz`` ``"egress": true``).
+
+        Called once, at dispatcher build, when this tier's provisioned net policy grants
+        egress. A worker that says false (every macOS worker) or says nothing (an agent from
+        before the field existed) is skipped: fail-closed, because the alternative is a job
+        that silently runs with no network. An old agent is upgraded, not trusted."""
+        self._require_egress = True
+
+    def _advertises_egress(self, w: StaticWorker, timeout: float | None = None) -> "bool | None":
+        url = self._base_url(w) + self.cfg.health_path
+        headers = {"X-aws-proxy-auth": w.token} if w.token else {}
+        try:
+            info = self._cap_probe(
+                url, headers,
+                max(_MIN_PROBE_S, float(self.cfg.probe_timeout_s) if timeout is None else timeout))
+        except (OSError, ValueError):
+            return None
+        if info is None:
+            return None
+        return info.get("egress") is True
+
+    def egress_census(self) -> tuple[int, int, int]:
+        """``(advertise egress, do not, unknown)`` across the configured fleet -- for the
+        dispatcher's startup check, so a tier that can never place an egress job refuses to
+        start instead of requeueing every job until it ages out."""
+        yes = no = unknown = 0
+        for w in self.cfg.workers:
+            v = self._advertises_egress(w)
+            if v is True:
+                yes += 1
+            elif v is False:
+                no += 1
+            else:
+                unknown += 1
+        return yes, no, unknown
 
     # -- fail-closed availability ------------------------------------------
     def available(self) -> "bool | None":
@@ -303,12 +395,15 @@ class StaticPoolRuntime:
         # own -- no probe failed -- so a fleet that is merely cooling must not be reported as
         # broken (upstream, PR #82).
         saw_unhealthy = False
+        saw_cooling = False
+        saw_no_egress = False
         for idx in candidates:
             with self._lock:
                 cool = self._cooldown_until.get(idx, 0.0)
             if cool > now:
                 _log.info("static: worker[%d] cooling down (%.0fs left), skipping for this claim",
                           idx, cool - now)
+                saw_cooling = True
                 continue
             verdict = self._health_ok(self.cfg.workers[idx])
             if verdict is not True:
@@ -323,6 +418,17 @@ class StaticPoolRuntime:
                 _log.warning("static: worker[%d] %s, skipping for this claim",
                              idx, "unhealthy" if verdict is False else "health UNKNOWN")
                 continue
+            if self._require_egress:
+                cap = self._advertises_egress(self.cfg.workers[idx])
+                if cap is not True:
+                    # PLACEMENT, not health: the box is fine, it just cannot serve this tier's
+                    # policy. Unknown (could not ask) is not counted as a verdict either way.
+                    if cap is False:
+                        saw_no_egress = True
+                    _log.warning("static: worker[%d] %s egress, which this tier's net policy "
+                                 "requires; skipping", idx,
+                                 "does not advertise" if cap is False else "could not be asked about")
+                    continue
             with self._lock:
                 if idx not in self._free:
                     continue
@@ -340,6 +446,11 @@ class StaticPoolRuntime:
             )
             _log.info("static: claimed worker[%d] %s for slot=%s", idx, self._base_url(w), slot.slot_id)
             return slot
+        if saw_no_egress and not saw_unhealthy and not saw_cooling:
+            raise StaticPoolNoEgress(
+                "no free static worker advertises egress, and this tier's net policy grants it "
+                "(macOS workers never do; a Linux agent may be running with "
+                "BLASTBOX_WORKER_AGENT_EGRESS=0)")
         if not saw_unhealthy:
             # Every free worker was skipped ONLY for cooldown: routine backpressure, and it
             # clears itself. Reporting a fault here would advance the pool's spawn-failure
