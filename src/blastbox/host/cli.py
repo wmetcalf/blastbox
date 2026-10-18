@@ -359,6 +359,19 @@ def _parse_default_params(raw: str | None) -> dict[str, str]:
     return out
 
 
+def _parse_operator_mounts(raw: str) -> tuple[tuple[str, str], ...]:
+    from blastbox.host.runtime.docker import validate_readonly_mounts
+    if not raw:
+        return ()
+    mounts = []
+    for item in raw.split(","):
+        pair = item.split(":")
+        if len(pair) != 2:
+            raise ValueError("operator mount must be /absolute/source:/absolute/destination")
+        mounts.append((pair[0], pair[1]))
+    return validate_readonly_mounts(mounts)
+
+
 def _parse_engine_specs(engines_raw: str) -> dict:
     """Parse ``BLASTBOX_ENGINES='NAME=image:tag[,NAME2=image2:tag2]'`` into a
     ``{name: EngineSpec}`` map.
@@ -470,6 +483,7 @@ def _parse_engine_specs(engines_raw: str) -> dict:
                 reserved_param_keys=reserved,
                 default_params=default_params,
                 net_policy=net_policy,
+                mounts=_parse_operator_mounts(os.environ.get(f"BLASTBOX_ENGINE_{env_name}_MOUNTS", "")),
                 allowed_runtimes=allowed_runtimes,
             )
     return engines
