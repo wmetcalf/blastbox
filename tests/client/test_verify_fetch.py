@@ -396,6 +396,53 @@ def test_a_stalled_connect_phase_is_a_timeout(srv, pinned):
     assert ei.value.code == "timeout" and ei.value.retryable
 
 
+def test_a_receipt_that_goes_stale_during_the_metadata_download_fails(srv, key, pinned):
+    """Fresh at the first check, past max_age by the time the metadata has arrived: the
+    returned result would break the caller's freshness policy, so it is refused."""
+    srv.routes[A] = (200, _receipt(key, issued_at_ms=time.time_ns() // 1_000_000 - 59_500),
+                     {})
+
+    def slow_metadata(h):
+        time.sleep(1.0)
+        h.send_response(200)
+        h.send_header("Content-Length", str(len(METADATA)))
+        h.end_headers()
+        h.wfile.write(METADATA)
+
+    srv.routes[M] = slow_metadata
+    with pytest.raises(v.ReceiptMismatch) as ei:
+        v.fetch_and_verify(srv.url, JOB, keys=pinned, max_age=60, timeout=5)
+    assert ei.value.code == "stale"
+    assert [p for p, _ in srv.seen] == [A, M]               # failed AFTER the download
+    # Without max_age the same slow pair still verifies.
+    assert v.fetch_and_verify(srv.url, JOB, keys=pinned, timeout=5).metadata == METADATA
+
+
+@pytest.mark.parametrize("status", [401, 400, 404, 503])
+def test_an_error_status_whose_body_stalls_is_a_timeout(srv, pinned, status):
+    """Error headers arrive, then the body stalls past the budget: that is a retryable
+    timeout, not the non-retryable status (or NoReceipt) it began as."""
+    release = threading.Event()
+
+    def stall_error_body(h):
+        h.send_response(status)
+        h.send_header("Content-Length", "1000")
+        h.end_headers()
+        h.wfile.write(b'{"detail": "')
+        h.wfile.flush()
+        release.wait(10)
+
+    srv.routes[A] = stall_error_body
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(v.FetchError) as ei:
+            v.fetch_and_verify(srv.url, JOB, keys=pinned, timeout=0.5)
+    finally:
+        release.set()
+    assert ei.value.code == "timeout" and ei.value.retryable
+    assert time.monotonic() - t0 < 1.5
+
+
 def test_connection_refused_is_retryable(pinned):
     import socket
     s = socket.socket()

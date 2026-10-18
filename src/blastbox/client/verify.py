@@ -649,6 +649,18 @@ def _check_engine(expect_engine: object) -> None:
         raise ValueError("expect_engine must be a non-empty engine name")
 
 
+def _check_age(issued_ms: int, max_age_s: float, skew_s: float, now_ms: int | None) -> None:
+    now = time.time_ns() // 1_000_000 if now_ms is None else now_ms
+    age_ms = now - issued_ms
+    if age_ms > max_age_s * 1000:
+        raise ReceiptMismatch(f"receipt was issued {age_ms // 1000}s ago, older than "
+                              f"max_age {max_age_s:g}s", code="stale")
+    if -age_ms > skew_s * 1000:
+        raise ReceiptMismatch(f"receipt issued_at_ms is {-age_ms // 1000}s in the future "
+                              f"(beyond the {skew_s:g}s clock-skew allowance)",
+                              code="issued_in_future")
+
+
 def _check_metadata(signed_sha256: str, held_sha256: str) -> None:
     if signed_sha256 != held_sha256:
         raise ReceiptMismatch(f"receipt metadata_sha256 {signed_sha256} is not the sha256 of "
@@ -754,15 +766,7 @@ def verify_receipt(
 
     issued = _int("issued_at_ms")
     if max_age_s is not None:
-        now = time.time_ns() // 1_000_000 if now_ms is None else now_ms
-        age_ms = now - issued
-        if age_ms > max_age_s * 1000:
-            raise ReceiptMismatch(f"receipt was issued {age_ms // 1000}s ago, older than "
-                                  f"max_age {max_age_s:g}s", code="stale")
-        if -age_ms > skew_s * 1000:
-            raise ReceiptMismatch(f"receipt issued_at_ms is {-age_ms // 1000}s in the future "
-                                  f"(beyond the {skew_s:g}s clock-skew allowance)",
-                                  code="issued_in_future")
+        _check_age(issued, max_age_s, skew_s, now_ms)
 
     network = None
     if "net_policy_effective" in doc:
@@ -1014,9 +1018,14 @@ def _get_within(opener: urllib.request.OpenerDirector, url: str, *, headers: dic
         resp = opener.open(req, timeout=deadline.socket_timeout())
     except urllib.error.HTTPError as err:
         try:
-            return err.code, b"", _error_detail(err)
+            detail = _error_detail(err)
         finally:
             err.close()
+        if deadline.expired:
+            # _error_detail swallows the interrupted read; a status whose body stalled past the
+            # budget is a (retryable) timeout, not the non-retryable status it began as.
+            raise _timed_out(what) from err
+        return err.code, b"", detail
     except Exception as exc:  # noqa: BLE001 - also http.client protocol errors, bad headers
         if deadline.expired or _is_timeout(exc):
             raise _timed_out(what) from exc
@@ -1145,5 +1154,10 @@ def fetch_and_verify(
         raise _status_failure(status, detail, "metadata")
 
     _check_metadata(receipt.metadata_sha256, hashlib.sha256(metadata).hexdigest())
+    if max_age is not None:
+        # Freshness is a property of the result as RETURNED: a slow metadata download can carry
+        # a receipt that was fresh at the first check past the caller's max_age.
+        _check_age(receipt.issued_at_ms, _seconds(max_age, "max_age"),
+                   DEFAULT_MAX_CLOCK_SKEW_S, None)
     receipt = dataclasses.replace(receipt, metadata_bound=True)
     return VerifiedResult(receipt=receipt, metadata=metadata)
