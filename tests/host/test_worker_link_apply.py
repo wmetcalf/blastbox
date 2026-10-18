@@ -491,6 +491,61 @@ def test_teardown_leaves_the_firewall_if_the_link_will_not_go_down(host):
     assert wla.ENV_FILE.exists()
 
 
+def test_teardown_acts_on_the_persisted_interface_not_an_override(host, monkeypatch):
+    """REGRESSION (review): `cfg` merges BLASTBOX_WORKER_LINK_IF over the persisted file. An
+    override naming another interface made teardown stop and verify THAT one, then delete the
+    (global) worker-link table and units -- leaving the real link up without its firewall."""
+    wla.init_host(_cfg())
+    host.links.add("other0")
+    monkeypatch.setenv("BLASTBOX_WORKER_LINK_IF", "other0")
+    host.calls.clear()
+    with pytest.raises(RuntimeError, match="installed on wtwg0, not other0"):
+        wla.teardown(wla.load_config())
+    assert host.calls == []                         # nothing stopped, nothing deleted
+    assert "wtwg0" in host.links and host.loaded is not None
+    assert wla.FW_UNIT.exists() and wla.ENV_FILE.exists()
+    # the firewall unit names the installed interface even if the env file is gone
+    wla.ENV_FILE.unlink()
+    with pytest.raises(RuntimeError, match="installed on wtwg0"):
+        wla.teardown(_cfg(wg_iface="other0"))
+    assert host.loaded is not None
+    monkeypatch.delenv("BLASTBOX_WORKER_LINK_IF")
+    wla.teardown(_cfg())                            # the installed one: proceeds
+    assert host.loaded is None and "wtwg0" not in host.links
+
+
+def test_reinit_after_teardown_still_refuses_to_strand_retained_workers(host, pki):
+    """REGRESSION (review): teardown removes the env file but KEEPS the interface config and
+    its registered workers. With no env file the re-init compatibility check returned early,
+    so a new host address or a narrower overlay rewrote [Interface] under workers that still
+    route and firewall only the old host /32. It is now checked against the retained file."""
+    cfg = _cfg()
+    wla.init_host(cfg)
+    wla.add_worker(cfg, "mac1", KEY_A, _csr(_ip("10.78.0.9")), ip="10.78.0.9", pki_dir=pki)
+    wla.teardown(cfg)
+    assert not wla.ENV_FILE.exists() and "# peer:mac1" in (ea.WG_DIR / "wtwg0.conf").read_text()
+    with pytest.raises(RuntimeError, match="10.78.0.1; changing it to 10.78.0.2 would strand"):
+        wla.init_host(_cfg(host_ip="10.78.0.2"))
+    with pytest.raises(RuntimeError, match="outside the new overlay"):
+        wla.init_host(_cfg(overlay_net="10.78.0.0/29"))
+    assert "Address = 10.78.0.1/24" in (ea.WG_DIR / "wtwg0.conf").read_text()   # untouched
+    _pub, notes = wla.init_host(_cfg(wg_port=51900))
+    assert any("listen port changed" in n for n in notes)
+    assert any("was absent" in n for n in notes)
+    assert "# peer:mac1" in (ea.WG_DIR / "wtwg0.conf").read_text()
+
+
+def test_reinit_refuses_when_retained_workers_config_cannot_be_read_back(host, pki):
+    cfg = _cfg()
+    wla.init_host(cfg)
+    wla.add_worker(cfg, "mac1", KEY_A, _csr(_ip("10.78.0.2")), pki_dir=pki)
+    wla.teardown(cfg)
+    conf = ea.WG_DIR / "wtwg0.conf"
+    conf.write_text(conf.read_text().replace("Address = 10.78.0.1/24\n", ""))
+    with pytest.raises(RuntimeError, match="cannot be read back"):
+        wla.init_host(cfg)
+
+
 # ----------------------------------------------------------------------------- config
 
 def test_load_config_requires_init_and_lets_the_environment_override(host, monkeypatch):

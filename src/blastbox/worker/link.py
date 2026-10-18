@@ -184,26 +184,53 @@ def _supported_platform() -> str:
         "VMs on a Linux host: join that host, and reach the VM through it.")
 
 
-def _write_private(path: Path, data: str) -> None:
-    """0600, created that way (umask) and enforced after (an existing looser file)."""
+def _write_atomic(path: Path, data: str | bytes, mode: int) -> None:
+    """Write ``path`` as a NEW file and rename it into place; never open the old one.
+
+    Opening ``path`` itself (``O_TRUNC``, ``Path.write_text``) FOLLOWS a symlink at the leaf:
+    if anyone else could create entries in the directory before it was locked down (the
+    macOS support dir may have been made by a user tool), a pre-planted
+    ``worker-link-<iface>.sh -> /some/root/file`` would have root truncate, overwrite and
+    chmod the target. Instead the data goes to a fresh ``mkstemp`` file (``O_CREAT|O_EXCL``:
+    never an existing entry, never through a link), gets its mode by ``fchmod`` on that fd,
+    and ``rename`` replaces the directory ENTRY -- a symlink there is replaced, its target
+    never touched. A directory or other non-file at ``path`` is refused before anything is
+    written.
+    """
+    import stat as _stat
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    old = os.umask(0o077)
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            os.fchmod(fd, 0o600)
-            fh.write(data)
-    finally:
-        os.umask(old)
+        st = os.lstat(path)
+    except FileNotFoundError:
+        pass
+    else:
+        if not (_stat.S_ISREG(st.st_mode) or _stat.S_ISLNK(st.st_mode)):
+            raise RuntimeError(f"{path} exists and is not a regular file; refusing to replace it")
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data if isinstance(data, bytes) else data.encode())
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _write_private(path: Path, data: str) -> None:
+    """0600 from creation (never a looser window), replacing -- not following -- whatever
+    entry was at ``path``."""
+    _write_atomic(path, data, 0o600)
 
 
 def _write_public(path: Path, data: str | bytes, mode: int = 0o644) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if isinstance(data, bytes):
-        path.write_bytes(data)
-    else:
-        path.write_text(data)
-    os.chmod(path, mode)
+    _write_atomic(path, data, mode)
 
 
 # --------------------------------------------------------------------------------------
@@ -781,6 +808,28 @@ def _wait_handshake(wg: str, real_iface: str) -> str:
         _sleep(1.0)
 
 
+def _verify_live_peer(wg: str, bundle: JoinBundle, real_iface: str | None = None) -> None:
+    """Raise unless the LIVE interface holds exactly the bundle's host as its one peer,
+    allowed only the host /32 -- read from ``wg show <iface> dump``, not from the file. A link
+    that is up with some earlier config (another host key, another host address) is not the
+    link this join configured."""
+    from blastbox.host.exit_attest import parse_wg_dump
+
+    iface = real_iface or bundle.iface
+    proc = _run([wg, "show", iface, "dump"])
+    if proc.returncode != 0:
+        tail = (proc.stderr or "").strip().splitlines()[-1:] or ["no detail"]
+        raise RuntimeError(f"cannot read the live config of {iface} ({tail[0]})")
+    peers = parse_wg_dump(proc.stdout or "")
+    want = (bundle.host_public_key.strip(), (f"{bundle.host_ip}/32",))
+    got = [(p.public_key, tuple(sorted(p.allowed_ips))) for p in peers]
+    if got != [want]:
+        raise RuntimeError(
+            f"{iface} is up but its live peers are not this bundle's host "
+            f"({bundle.host_public_key[:10]}… allowed {bundle.host_ip}/32): the previous config "
+            "is still in effect. Bring it down by hand and re-run join")
+
+
 def _apply_linux(bundle: JoinBundle, p: dict[str, Path], wg: str) -> list[str]:
     notes: list[str] = []
     nft = _need("nft", "nftables")
@@ -829,13 +878,25 @@ def _apply_linux(bundle: JoinBundle, p: dict[str, Path], wg: str) -> list[str]:
         ok = _ok(["systemctl", "restart", unit])     # the config may have changed
     else:
         ok = _ok(["systemctl", "enable", "--now", unit])
-    if not ok and not _ok(["ip", "link", "show", bundle.iface]):
+    if not ok:
+        # A FAILED start/restart proves nothing about which config is live: on a re-join the
+        # old interface can still be up holding the PREVIOUS host key / endpoint / address, and
+        # "the interface exists" would then pass for success. Take it down (it must really go)
+        # and bring it up once from the file just written.
+        _run(["systemctl", "stop", unit])
+        _run(["wg-quick", "down", bundle.iface])
+        if _ok(["ip", "link", "show", bundle.iface]):
+            raise RuntimeError(
+                f"{unit} failed to (re)start and {bundle.iface} is still up with what may be "
+                f"the previous config; bring it down by hand (`wg-quick down {bundle.iface}`) "
+                "and re-run join")
         proc = _run(["wg-quick", "up", bundle.iface])
         if proc.returncode != 0:
             tail = (proc.stderr or "").strip().splitlines()[-1:] or ["no detail"]
             raise RuntimeError(f"could not bring up {bundle.iface}: {tail[0]}")
     if not _ok(["ip", "link", "show", bundle.iface]):
         raise RuntimeError(f"{bundle.iface} is not up after starting {unit}")
+    _verify_live_peer(wg, bundle)
     notes.append(f"{bundle.iface} up ({unit})")
     notes.append(_wait_handshake(wg, bundle.iface))
     return notes

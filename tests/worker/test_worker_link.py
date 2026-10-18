@@ -757,3 +757,100 @@ def test_the_macos_root_script_refuses_a_user_writable_path(node, tmp_path, monk
     monkeypatch.setattr(link, "_root_owned_and_private", lambda st: False)
     with pytest.raises(RuntimeError, match="not root-owned"):
         link.join(_bundle(tmp_path, csr))
+
+
+def test_a_failed_restart_with_the_stale_interface_up_is_not_success(node, tmp_path, monkeypatch):
+    """REGRESSION (review): on a Linux re-join with the link up, a FAILED `systemctl restart`
+    was accepted whenever the old interface still existed -- which it does, holding the
+    previous host key/endpoint/address. Now a failed (re)start takes the interface down and
+    brings it up from the new file; if it will not go down, join raises."""
+    n = node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    real = n.run
+    state = {"stuck": True}
+
+    def run(argv, **kw):
+        a = [str(x) for x in argv]
+        if a[:2] == ["systemctl", "is-active"]:
+            return subprocess.CompletedProcess(a, 0, "", "")
+        if a[:2] == ["systemctl", "restart"]:
+            n.calls.append(a)
+            return subprocess.CompletedProcess(a, 1, "", "Job failed")
+        if Path(a[0]).name == "wg-quick":
+            n.calls.append(a)
+            if a[1] == "down" and not state["stuck"]:
+                n.links.discard(a[2])
+            if a[1] == "up":
+                n.links.add(a[2])
+            return subprocess.CompletedProcess(a, 0, "", "")
+        return real(argv, **kw)
+
+    monkeypatch.setattr(link, "_run", run)
+    assert "wtwg0" in n.links
+    with pytest.raises(RuntimeError, match="still up with what may be the previous config"):
+        link.join(_bundle(tmp_path, csr, endpoint="gw2.example.org:51822"))
+    state["stuck"] = False
+    n.calls.clear()
+    notes = link.join(_bundle(tmp_path, csr, endpoint="gw2.example.org:51822"))
+    flat = n.flat()
+    assert flat.index("wg-quick down wtwg0") < flat.index("wg-quick up wtwg0")
+    assert any("wtwg0 up" in x for x in notes)
+
+
+def test_join_refuses_a_live_interface_holding_another_hosts_peer(node, tmp_path, monkeypatch):
+    """The link being UP is not proof it runs this bundle's config: the live peer set is read
+    back from `wg show dump` and must be exactly the bundle's host key, allowed its /32."""
+    n = node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    real = n.run
+
+    def run(argv, **kw):
+        p = real(argv, **kw)
+        a = [str(x) for x in argv]
+        if Path(a[0]).name == "wg" and a[1] == "show":
+            p = subprocess.CompletedProcess(a, 0, p.stdout.replace(KEY_HOST, "Z" * 43 + "="), "")
+        return p
+
+    monkeypatch.setattr(link, "_run", run)
+    with pytest.raises(RuntimeError, match="previous config is still in effect"):
+        link.join(_bundle(tmp_path, csr))
+
+
+def test_a_planted_symlink_at_the_root_script_path_is_replaced_not_followed(node, tmp_path):
+    """REGRESSION (review): the support dir may pre-exist, made by a non-root user, who could
+    plant `worker-link-<iface>.sh -> <some root file>`. The write followed the link and root
+    truncated + chmodded the target before the path check ran. Writes now go to a fresh file
+    renamed over the ENTRY, so the target is never opened."""
+    node("darwin")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    p = link._paths("wtwg0")
+    victim = tmp_path / "victim"
+    victim.write_text("precious\n")
+    victim.chmod(0o600)
+    p["script"].parent.mkdir(parents=True, exist_ok=True)
+    p["script"].symlink_to(victim)
+    p["plist"].parent.mkdir(parents=True, exist_ok=True)
+    p["plist"].symlink_to(victim)
+    link.join(_bundle(tmp_path, csr))
+    assert victim.read_text() == "precious\n"
+    assert oct(victim.stat().st_mode & 0o777) == "0o600"
+    for f in (p["script"], p["plist"]):
+        assert not f.is_symlink() and f.is_file()
+    assert "/fake/bin/wg-quick" in p["script"].read_text()
+    assert not [x for x in p["script"].parent.iterdir() if x.name.startswith(".")]
+
+
+def test_writers_never_follow_a_symlink_and_refuse_a_directory(tmp_path):
+    victim = tmp_path / "victim"
+    victim.write_text("keep\n")
+    for writer in (link._write_public, link._write_private):
+        target = tmp_path / f"t-{writer.__name__}"
+        target.symlink_to(victim)
+        writer(target, "new\n")
+        assert victim.read_text() == "keep\n" and target.read_text() == "new\n"
+        assert not target.is_symlink()
+    assert oct((tmp_path / "t-_write_private").stat().st_mode & 0o777) == "0o600"
+    (tmp_path / "adir").mkdir()
+    with pytest.raises(RuntimeError, match="not a regular file"):
+        link._write_public(tmp_path / "adir", "x")

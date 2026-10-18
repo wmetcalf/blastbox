@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import re
 import shutil
+from dataclasses import replace
 from pathlib import Path
 
 from blastbox.host import egress_apply as ea
@@ -255,6 +257,60 @@ def _conf(cfg: WorkerLinkConfig) -> Path:
     return ea.WG_DIR / f"{cfg.wg_iface}.conf"
 
 
+def _persisted_env() -> dict[str, str]:
+    """The persisted env FILE's keys -- never the environment -- or {} when it is absent."""
+    try:
+        return _parse_env(ENV_FILE.read_text())
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise RuntimeError(f"cannot read {ENV_FILE}: {exc.strerror}") from None
+
+
+def _retained_interface(cfg: WorkerLinkConfig, body: str) -> WorkerLinkConfig | None:
+    """The config a retained interface file was written with, from its ``[Interface]``
+    (``Address = <host_ip>/<prefix>``, ``ListenPort``), or None if it cannot be read back.
+    Fields the file does not carry (endpoint, agent port, sources) are taken from ``cfg``."""
+    head = body.split("\n# peer:", 1)[0]
+    addr = port = None
+    for line in head.splitlines():
+        k, sep, v = line.partition("=")
+        if not sep:
+            continue
+        k, v = k.strip().lower(), v.strip()
+        if k == "address":
+            addr = v
+        elif k == "listenport":
+            port = v
+    if not addr:
+        return None
+    try:
+        iface = ipaddress.IPv4Interface(addr)
+        return replace(cfg, overlay_net=str(iface.network), host_ip=str(iface.ip),
+                       wg_port=int(port) if port else cfg.wg_port)
+    except ValueError:
+        return None
+
+
+def _installed_ifaces() -> set[str]:
+    """The link interface(s) THIS host's installed worker-link records name: the persisted
+    env file and the firewall boot unit (``RequiredBy=wg-quick@<iface>.service``). Read from
+    disk only -- never the environment or the command line, which describe intent, not what
+    is installed."""
+    found: set[str] = set()
+    iface = _persisted_env().get("BLASTBOX_WORKER_LINK_IF", "").strip()
+    if iface:
+        found.add(iface)
+    try:
+        unit = FW_UNIT.read_text()
+    except FileNotFoundError:
+        unit = ""
+    except OSError as exc:
+        raise RuntimeError(f"cannot read {FW_UNIT}: {exc.strerror}") from None
+    found.update(re.findall(r"^RequiredBy=wg-quick@(\S+)\.service$", unit, flags=re.M))
+    return found
+
+
 def _refuse_incompatible_reinit(cfg: WorkerLinkConfig) -> list[str]:
     """A re-run of ``init`` may change what workers can absorb, never what strands them.
 
@@ -269,22 +325,40 @@ def _refuse_incompatible_reinit(cfg: WorkerLinkConfig) -> list[str]:
     # The FILE alone, not load_config(): that merges BLASTBOX_WORKER_LINK_* from the
     # environment, which is also how `cfg` was built -- so an override in the environment
     # would make prev == cfg and strand every worker unchecked.
-    try:
-        file_env = _parse_env(ENV_FILE.read_text())
-    except FileNotFoundError:
-        return []
-    except OSError as exc:
-        raise RuntimeError(f"cannot read {ENV_FILE}: {exc.strerror}") from None
+    file_env = _persisted_env()
     notes: list[str] = []
-    if not file_env:
-        return notes
-    prev = WorkerLinkConfig.from_env(file_env)
-    if prev.wg_iface != cfg.wg_iface:
-        raise RuntimeError(f"worker-link is already set up on {prev.wg_iface}; run "
-                           "`blastbox worker-link teardown` before moving it to "
-                           f"{cfg.wg_iface}")
     conf = _conf(cfg)
-    workers = _registered(conf.read_text()) if conf.exists() else {}
+    try:
+        body = conf.read_text()
+    except FileNotFoundError:
+        body = ""
+    except OSError as exc:
+        raise RuntimeError(f"cannot read {conf}: {exc.strerror}") from None
+    workers = _registered(body)
+    if file_env:
+        prev = WorkerLinkConfig.from_env(file_env)
+        if prev.wg_iface != cfg.wg_iface:
+            raise RuntimeError(f"worker-link is already set up on {prev.wg_iface}; run "
+                               "`blastbox worker-link teardown` before moving it to "
+                               f"{cfg.wg_iface}")
+    elif workers:
+        # No env file -- `teardown` removed it -- but teardown deliberately KEEPS the interface
+        # config and its registered workers, so a later init restores them. Those workers still
+        # route and firewall only the OLD host address, so the checks below must run against
+        # the parameters the retained config was written with, recovered from its [Interface].
+        recovered = _retained_interface(cfg, body)
+        if recovered is None:
+            raise RuntimeError(
+                f"{conf} keeps {len(workers)} registered worker(s) but its [Interface] cannot be "
+                "read back, so this init cannot be checked against the host address they were "
+                "configured for. Restore the file or remove the workers first.")
+        prev = recovered
+        notes.append(f"NOTE: {ENV_FILE} was absent; checked against {conf} "
+                     f"({prev.host_ip}/{prev.prefixlen}, udp/{prev.wg_port}), which keeps "
+                     f"{len(workers)} registered worker(s). Their endpoint and agent port are "
+                     "not recorded there: if either changed, re-add and re-join each worker")
+    else:
+        return notes
     if workers and prev.host_ip != cfg.host_ip:
         raise RuntimeError(
             f"{len(workers)} registered worker(s) are configured for the host address "
@@ -296,6 +370,12 @@ def _refuse_incompatible_reinit(cfg: WorkerLinkConfig) -> list[str]:
             raise RuntimeError(
                 f"registered worker {name} ({ip}) is outside the new overlay "
                 f"{cfg.overlay_net}; remove it first") from None
+    if not file_env:
+        if prev.wg_port != cfg.wg_port:
+            notes.append(f"NOTE: the listen port changed (udp/{prev.wg_port} -> udp/"
+                         f"{cfg.wg_port}); the {len(workers)} registered worker(s) must be "
+                         "re-added and re-joined to dial the new one")
+        return notes
     if workers and (prev.wg_port != cfg.wg_port or prev.endpoint != cfg.endpoint):
         notes.append(f"NOTE: the endpoint/port changed; the {len(workers)} registered worker(s) "
                      "must be re-added and re-joined to dial the new one")
@@ -540,6 +620,17 @@ def teardown(cfg: WorkerLinkConfig) -> list[str]:
     ``init`` restores every registered worker; say so rather than leave the operator to
     discover it. Every outcome is VERIFIED, not announced.
     """
+    # Destructive, and the firewall table and units it deletes are GLOBAL to worker-link, so
+    # the interface it stops first must be the INSTALLED one. `cfg` merges
+    # BLASTBOX_WORKER_LINK_IF / --iface over the persisted file; an override naming some other
+    # interface would stop (and verify down) the wrong one, then strip the firewall from the
+    # real link while it stays up.
+    installed = _installed_ifaces()
+    if installed and installed != {cfg.wg_iface}:
+        raise RuntimeError(
+            "worker-link is installed on " + ", ".join(sorted(installed)) + f", not "
+            f"{cfg.wg_iface}: refusing to tear down. Unset BLASTBOX_WORKER_LINK_IF / drop "
+            "--iface so teardown acts on the installed interface.")
     notes: list[str] = []
     ea._run(["systemctl", "disable", "--now", f"wg-quick@{cfg.wg_iface}"], check=False)
     ea._run(["wg-quick", "down", cfg.wg_iface], check=False)

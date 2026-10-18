@@ -259,14 +259,136 @@ def test_a_counter_on_a_rule_still_counts():
     assert firewall_in_force(listing, fw) == []
 
 
+#: GOLDEN: the real `nft list table inet blastbox_worker_link` output (nftables 1.0.9,
+#: Ubuntu) after `init --iface wltest0 --overlay-net 10.79.0.0/24 --dispatcher-source
+#: 172.31.0.0/16`. Note the kernel's re-rendering: our one-element `{ 172.31.0.0/16 }` sets
+#: come back as the bare prefix. Whatever the comparison checks, it must accept this.
+REAL_NFT_1_0_9_LISTING = """table inet blastbox_worker_link {
+\tchain input {
+\t\ttype filter hook input priority filter; policy accept;
+\t\tiifname "wltest0" ct state established,related accept
+\t\tiifname "wltest0" drop
+\t\tiifname != { "lo", "wltest0" } ip daddr 10.79.0.0/24 drop
+\t}
+\tchain forward {
+\t\ttype filter hook forward priority filter; policy accept;
+\t\tiifname "wltest0" ct state established,related accept
+\t\tiifname "wltest0" drop
+\t\toifname "wltest0" ip saddr 172.31.0.0/16 ip daddr 10.79.0.0/24 tcp dport 8765 ct state new accept
+\t\toifname "wltest0" ct state established,related accept
+\t\toifname "wltest0" drop
+\t}
+\tchain output {
+\t\ttype filter hook output priority filter; policy accept;
+\t\toifname "wltest0" ip saddr 10.79.0.1 ip daddr 10.79.0.0/24 tcp dport 8765 ct state new accept
+\t\toifname "wltest0" ct state established,related accept
+\t\toifname "wltest0" drop
+\t}
+\tchain postrouting {
+\t\ttype nat hook postrouting priority srcnat; policy accept;
+\t\toifname "wltest0" ip saddr 172.31.0.0/16 masquerade
+\t}
+}
+"""
+
+
+def _real_cfg(**kw) -> WorkerLinkConfig:
+    kw.setdefault("dispatcher_sources", ("172.31.0.0/16",))
+    return WorkerLinkConfig(wg_iface="wltest0", overlay_net="10.79.0.0/24", agent_port=8765, **kw)
+
+
+def test_the_real_kernel_listing_reads_as_in_force():
+    assert firewall_in_force(REAL_NFT_1_0_9_LISTING, host_firewall_nft(_real_cfg())) == []
+
+
+def test_a_broadened_accept_is_not_in_force_even_with_the_same_rule_count():
+    """REGRESSION (review): accepts were compared by COUNT, so replacing the host's
+    port-scoped output accept with a blanket one -- same number of rules, every drop intact --
+    read as in force."""
+    fw = host_firewall_nft(_real_cfg())
+    scoped = ('oifname "wltest0" ip saddr 10.79.0.1 ip daddr 10.79.0.0/24 tcp dport 8765 '
+              "ct state new accept")
+    assert scoped in REAL_NFT_1_0_9_LISTING
+    for broader in ('oifname "wltest0" accept',
+                    'oifname "wltest0" ip daddr 10.79.0.0/24 tcp dport 8765 ct state new accept',
+                    scoped.replace("8765", "22"),
+                    scoped.replace("10.79.0.0/24", "10.0.0.0/8")):
+        missing = firewall_in_force(REAL_NFT_1_0_9_LISTING.replace(scoped, broader), fw)
+        assert any("output" in m for m in missing), broader
+    # the forward accept's SOURCE widened
+    wide = REAL_NFT_1_0_9_LISTING.replace(
+        "ip saddr 172.31.0.0/16 ip daddr", "ip saddr 172.16.0.0/12 ip daddr")
+    assert any("forward" in m for m in firewall_in_force(wide, fw))
+    # an accept moved AHEAD of a drop (same rules, different order) is not ours either
+    reordered = REAL_NFT_1_0_9_LISTING.replace(
+        '\t\toifname "wltest0" ct state established,related accept\n'
+        '\t\toifname "wltest0" drop\n\t}\n\tchain postrouting',
+        '\t\toifname "wltest0" drop\n'
+        '\t\toifname "wltest0" ct state established,related accept\n\t}\n\tchain postrouting')
+    assert reordered != REAL_NFT_1_0_9_LISTING
+    assert any("order" in m for m in firewall_in_force(reordered, fw))
+
+
+def test_set_rendering_differences_are_cosmetic():
+    """nft may reorder a set, merge adjacent prefixes, or print a one-element set bare; the
+    SAME set must compare equal however it is spelled, and a different one must not."""
+    fw = host_firewall_nft(_real_cfg(dispatcher_sources=("172.18.0.0/16", "172.19.0.0/16",
+                                                         "10.200.0.0/16")))
+    listing = fw.split(f"delete table inet {NFT_TABLE}\n", 1)[1]
+    assert "{ 172.18.0.0/16, 172.19.0.0/16, 10.200.0.0/16 }" in listing
+    for spelled in ("{ 10.200.0.0/16, 172.18.0.0/15 }", "{ 172.19.0.0/16, 10.200.0.0/16, "
+                    "172.18.0.0/16 }"):
+        assert firewall_in_force(listing.replace(
+            "{ 172.18.0.0/16, 172.19.0.0/16, 10.200.0.0/16 }", spelled), fw) == [], spelled
+    assert firewall_in_force(listing.replace(
+        "{ 172.18.0.0/16, 172.19.0.0/16, 10.200.0.0/16 }", "{ 172.18.0.0/16, 10.200.0.0/16 }"),
+        fw)
+    assert firewall_in_force(listing.replace('{ "lo", "wltest0" }', '{ "wltest0", "lo" }'),
+                             fw) == []
+    assert firewall_in_force(listing.replace('{ "lo", "wltest0" }', '{ "lo", "eth0" }'), fw)
+
+
 def test_the_reassert_units_restore_a_flushed_ruleset_or_stop_the_link():
     from blastbox.host.worker_link import reassert_units
 
     svc, timer = reassert_units(nft_bin="/usr/sbin/nft", nft_file="/etc/blastbox/worker-link.nft",
                                 iface="wtwg0", base="blastbox-worker-link-fw", description="d")
     assert ("ExecStart=/bin/sh -c '/usr/sbin/nft -f /etc/blastbox/worker-link.nft || "
-            "systemctl stop wg-quick@wtwg0.service'") in svc
+            "{ systemctl stop wg-quick@wtwg0.service; exit 1; }'") in svc
     assert "OnUnitActiveSec=1min" in timer and "Unit=blastbox-worker-link-fw-reassert.service" in timer
+
+
+def test_the_reassert_service_stops_the_link_when_the_ruleset_file_is_gone(tmp_path):
+    """REGRESSION (review): `ConditionPathExists=<ruleset>` made systemd SKIP the re-assert
+    when the file was deleted, so the `|| systemctl stop` never ran and a later flush left the
+    link up unfirewalled. No condition/assertion now gates it, and the command itself -- run
+    here for real with stub nft/systemctl -- stops the link when the file is missing."""
+    import shlex
+    import subprocess
+
+    from blastbox.host.worker_link import reassert_units
+
+    rec = tmp_path / "calls"
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    for name, body in (("nft", f'echo "nft $*" >> {rec}\n[ -f "$2" ]\n'),
+                       ("systemctl", f'echo "systemctl $*" >> {rec}\n')):
+        (bindir / name).write_text("#!/bin/sh\n" + body)
+        (bindir / name).chmod(0o755)
+    missing = tmp_path / "worker-link.nft"
+    svc, _timer = reassert_units(nft_bin=str(bindir / "nft"), nft_file=str(missing),
+                                 iface="wtwg0", base="b", description="d")
+    assert "ConditionPath" not in svc and "AssertPath" not in svc
+    line = next(ln for ln in svc.splitlines() if ln.startswith("ExecStart="))
+    argv = shlex.split(line.removeprefix("ExecStart="))
+    env = {"PATH": f"{bindir}:/usr/bin:/bin"}
+    proc = subprocess.run(argv, env=env, capture_output=True, text=True)
+    assert proc.returncode != 0                       # visible as a failed unit
+    assert "systemctl stop wg-quick@wtwg0.service" in rec.read_text()
+    rec.write_text("")
+    missing.write_text("table inet x {}\n")          # present and loadable: link left alone
+    assert subprocess.run(argv, env=env).returncode == 0
+    assert "systemctl" not in rec.read_text()
 
 
 def test_firewall_unit_loads_before_the_link_and_deletes_only_its_table():

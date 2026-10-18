@@ -516,18 +516,70 @@ def _chains(text: str) -> dict[str, list[str]]:
     return blocks
 
 
+_SET = re.compile(r"\{([^{}]*)\}")
+
+
+def _canon_atom(tok: str) -> str:
+    """One match operand in canonical form: an IPv4 address or prefix as nft prints it
+    (``10.0.0.0/24``, a /32 as the bare address), a comma list of keywords sorted
+    (``established,related``), anything else unchanged."""
+    if "/" in tok or tok.count(".") == 3:
+        try:
+            net = ipaddress.IPv4Network(tok, strict=False)
+        except ValueError:
+            pass
+        else:
+            return str(net.network_address) if net.prefixlen == 32 else str(net)
+    if "," in tok and '"' not in tok:
+        return ",".join(sorted(tok.split(",")))
+    return tok
+
+
+def _canon_set(body: str) -> str:
+    """An anonymous set's elements in canonical form. nft re-renders sets: it may reorder
+    their elements, merge adjacent/overlapping prefixes, and print a one-element set as the
+    bare element (``ip saddr { 172.31.0.0/16 }`` lists as ``ip saddr 172.31.0.0/16``). So
+    address elements are collapsed, every element sorted, and a single element unbraced --
+    the SAME set compares equal however it was spelled, a different one never does."""
+    elems = [e.strip() for e in body.split(",") if e.strip()]
+    nets: list[ipaddress.IPv4Network] = []
+    other: list[str] = []
+    for e in elems:
+        try:
+            nets.append(ipaddress.IPv4Network(e, strict=False))
+        except ValueError:
+            other.append(e)
+    canon = sorted(other) + [_canon_atom(str(n)) for n in ipaddress.collapse_addresses(nets)]
+    return canon[0] if len(canon) == 1 else "{ " + ", ".join(canon) + " }"
+
+
+def _canon_rule(line: str) -> str:
+    """A rule line in canonical form, for comparing what we rendered with what the kernel
+    lists. Only RENDERING is normalised (set spelling, prefix spelling, keyword-list order,
+    whitespace, counters -- see :func:`_chains`); every match, operand and verdict is kept,
+    so a rule that matches more (or less) than ours never compares equal to it."""
+    out: list[str] = []
+    pos = 0
+    for m in _SET.finditer(line):
+        out += [_canon_atom(t) for t in line[pos:m.start()].split()]
+        out.append(_canon_set(m.group(1)))
+        pos = m.end()
+    out += [_canon_atom(t) for t in line[pos:].split()]
+    return " ".join(out)
+
+
 def firewall_in_force(listing: str, expected: str) -> list[str]:
     """What is MISSING from a live ``nft list table`` listing, or [] if ``expected`` (the
     ruleset we rendered) is in force.
 
     PRESENT IS NOT IN FORCE: the ruleset file on disk, or an enabled unit, proves nothing
     about the kernel, so this reads the kernel's own listing. For every chain we rendered it
-    requires: the chain, its hook, EVERY drop (and the masquerade) we rendered -- an accept is
-    worthless if a drop behind it has gone -- and no rule we did not render, so an accept
-    inserted ahead of a drop cannot pass as ours. Accept lines themselves are compared by
-    count rather than text: nft re-renders sets and matches in its own canonical form, and a
-    cosmetic difference there must not read as "the firewall is down"; the drops are simple
-    enough to compare exactly.
+    requires the chain, its hook, and EXACTLY our rules in our order -- accepts included, so
+    a port-scoped accept rewritten as a broader one (``oifname "wtwg0" accept``) is caught
+    even though the rule count and every drop are unchanged, and an accept inserted ahead
+    of a drop cannot pass as ours. Each rule is compared in canonical form
+    (:func:`_canon_rule`): nft re-renders sets and prefixes in its own spelling, and a
+    cosmetic difference there must not read as "the firewall is down".
     """
     missing: list[str] = []
     have = _chains(listing)
@@ -539,15 +591,19 @@ def firewall_in_force(listing: str, expected: str) -> list[str]:
         hook = next((ln for ln in want if ln.startswith("type ")), None)
         if hook and not any(ln.split(";")[0] == hook.split(";")[0] for ln in got):
             missing.append(f"chain {chain} is not hooked as `{hook.split(';')[0]}`")
-        for ln in want:
-            if ln.endswith(" drop") and ln not in got:
+        rules_want = [_canon_rule(ln) for ln in want if not ln.startswith("type ")]
+        rules_got = [_canon_rule(ln) for ln in got if not ln.startswith("type ")]
+        if rules_got == rules_want:
+            continue
+        for ln in rules_want:
+            if ln not in rules_got:
                 missing.append(f"chain {chain}: `{ln}`")
-            if ln.endswith(" masquerade") and not any(
-                    g.endswith(" masquerade") and g.split()[:2] == ln.split()[:2] for g in got):
-                missing.append(f"chain {chain}: the masquerade")
-        rules_want = [ln for ln in want if not ln.startswith("type ")]
-        rules_got = [ln for ln in got if not ln.startswith("type ")]
-        if len(rules_got) != len(rules_want):
+        for ln in rules_got:
+            if ln not in rules_want:
+                missing.append(f"chain {chain}: unexpected rule `{ln}`")
+        if sorted(rules_got) == sorted(rules_want):
+            missing.append(f"chain {chain}: our rules are present but in a different order")
+        elif len(rules_got) != len(rules_want):
             missing.append(f"chain {chain} holds {len(rules_got)} rules, not the "
                            f"{len(rules_want)} rendered (something was added or removed)")
     return missing
@@ -565,15 +621,22 @@ def reassert_units(*, nft_bin: str, nft_file: str, iface: str, base: str,
     """
     import shlex
 
+    # NO ConditionPathExists / AssertPathExists on the ruleset file. A failed CONDITION skips
+    # the unit without running ExecStart, and a failed ASSERTION fails it -- either way the
+    # `|| systemctl stop` below never runs, so a DELETED ruleset file would leave a live link
+    # unfirewalled after the next flush. A missing file must reach the command and fail it:
+    # `nft -f <missing>` exits non-zero, which stops the link. (While the link is down the
+    # stop is a no-op, so a timer that outlives a teardown is harmless.) The unit still exits
+    # non-zero after stopping the link so the failure is visible in `systemctl --failed`.
     cmd = (f"{shlex.quote(nft_bin)} -f {shlex.quote(nft_file)} || "
-           f"systemctl stop wg-quick@{_link_iface(iface)}.service")
+           f"{{ systemctl stop wg-quick@{_link_iface(iface)}.service; exit 1; }}")
     service = f"""# {description} -- periodic re-assert. Generated from
 # blastbox.host.worker_link.reassert_units; triggered by {base}-reassert.timer.
+# Deliberately unconditional: a missing ruleset file must STOP the link, not skip this.
 
 [Unit]
 Description={description} (re-assert)
 After={base}.service
-ConditionPathExists={nft_file}
 
 [Service]
 Type=oneshot
