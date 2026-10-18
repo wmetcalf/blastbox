@@ -224,6 +224,110 @@ the signed JSON contains no floats.
 And, plainly: **any pinned key whose holder can write the shared results prefix can attach a
 receipt to a job it never ran.** Pin only keys of hosts you trust as much as the control plane.
 
+### Verifying results (clients)
+
+A consumer that submits files (`POST /v1/jobs`) and acts on the results should not reimplement
+the check above: `blastbox.client.verify` (and `blastbox attest verify`) does it, failing closed.
+It needs only the core package plus `cryptography` — never the host stack:
+
+```
+pip install 'blastbox[verify]'
+```
+
+**1. Pin each signing dispatcher's key, out of band.** On every host that signs (each dispatcher,
+each signing federated node), as the dispatcher's service user:
+
+```
+sudo -u blastbox blastbox attest-key --key /var/lib/blastbox/attest.key > dispatcher-a.pem
+```
+
+Ship that file to the consumer through a channel you trust (config management, a reviewed
+commit). It works as-is: the `key_id:`/`alg:` lines above the PEM are checked against the key, and
+a mismatch refuses the file. A plain PEM public key, or the JSON body of `GET /v1/attestation/key`,
+also works — but that route is a convenience: a key is trusted because **you** pinned it, never
+because a host served it, so compare its `key_id` with the `attest-key` output on the signing host
+before pinning it. One key per signing host; the verifier always **recomputes** each `key_id` from
+the key (sha256 of its SubjectPublicKeyInfo, first 16 hex digits) and refuses two different keys
+under one `key_id`. A receipt naming a `key_id` that is not pinned fails; the verifier never
+fetches a key.
+
+**2. Verify.** From a shell (exit `0` verified, `1` not verified, `2` usage or key error, `3`
+not verified *yet*: the job is still running, or a 429/5xx/network error/timeout — retry):
+
+```
+blastbox attest verify --url https://ingress.example:8443 --job "$JOB_ID" \
+    --key dispatcher-a.pem --key dispatcher-b.pem \
+    --input sample.pdf --metadata-out metadata.json [--engine williamtells] [--max-age 86400] \
+    [--cacert blastbox-ca.pem] [--token-file token] [--json]
+```
+
+The bearer token comes from `--token-file`, else `BLASTBOX_API_KEY` (never from the command
+line). `--metadata-out` writes the metadata.json bytes **only after** they verified; act on those
+bytes, not on a second fetch. Or from Python (standard library HTTP only; no redirects; the
+receipt is read up to 1 MiB, metadata up to `max_metadata_bytes`, default 64 MiB):
+
+```python
+import hashlib
+from pathlib import Path
+from blastbox.client.verify import ReceiptError, fetch_and_verify, load_pinned_keys
+
+keys = load_pinned_keys(Path("dispatcher-a.pem"), Path("dispatcher-b.pem"))
+try:
+    result = fetch_and_verify(url, job_id, keys=keys, token=token,
+                              expect_input_sha256=hashlib.sha256(submitted).hexdigest())
+except ReceiptError as exc:         # NoReceipt, FetchError(.retryable), BadSignature, ...
+    reject(job_id, exc.code)        # fail closed
+else:
+    act_on(result.metadata)         # the exact bytes metadata_sha256 signs
+```
+
+`verify_receipt(body_bytes, keys=..., expect_job_id=..., expect_input_sha256=...,
+metadata_bytes=..., expect_engine=..., max_age=...)` does the same for bytes you fetched yourself;
+pass the raw response bytes (a parsed object cannot be checked for duplicate keys) and always
+`metadata_bytes` when you act on the metadata.
+
+It checks, in order, and fails with a typed `ReceiptError` whose `code` names the failure:
+strict JSON (no duplicate keys, floats, `NaN`; at most 1 MiB) of exactly
+`{"attestation", "signature"}` (`malformed`); a tombstone or a `404`/`410` from the route
+(`NoReceipt`: `tombstone`, `no_receipt`, `expired`, with the server's reason — unauthenticated,
+display only); `v == 1` and `alg == "ES256"` (`unsupported`); a pinned `key_id` (`unknown_key`);
+exactly the v1 fields with their types (`malformed` — an unknown field is refused, not ignored);
+the ES256 signature over `canonical(attestation)` under that pinned key (`bad_signature`); then
+`status == "done"`, `job_id`, and when given `engine`, `input_sha256` (= sha256 of the bytes you
+**submitted** — the dispatcher hashes the file it hands the sandbox, which is your upload unless
+something altered it on the way),
+`metadata_sha256` (= sha256 of the metadata bytes you hold) and the age of `issued_at_ms`
+(`status_not_done`, `job_id_mismatch`, `engine_mismatch`, `input_mismatch`, `metadata_mismatch`,
+`stale`, `issued_in_future`). A verified receipt reports whether the input and the metadata were
+bound (`input_bound`, `metadata_bound`).
+
+**What a verified receipt proves:** that the holder of a key **you pinned** sealed exactly the
+metadata.json bytes you hold, for this `job_id` and `engine`, having hashed an input equal to the
+bytes you submitted (with `--input` / `expect_input_sha256`), and launched it under
+`worker_runtime`/`worker_tier`. The artifacts are covered transitively: the verified envelope
+lists each declared artifact's `sha256`, so check every artifact you fetch (or every member of
+the `/result` ZIP) against it.
+
+**What it does not prove:**
+
+- That the detections are true: the envelope is still the worker's account of the run.
+- That the key holder actually ran the job, if it can write the shared results prefix (above).
+  Pin only hosts you trust as much as the control plane.
+- **Anything about the network unless the receipt says so.** `network` (`net_policy_effective`,
+  `net_exit`, `net_downgraded`, `net_inspect`) is present only where the dispatcher enforced —
+  and, for containment, verified — the posture itself: local cold and local warm runs. Every
+  VM / network-endpoint tier (libvirt, AWS, static, a network-style cascade) omits it, as does a
+  containment the dispatcher could not verify. **Absent means "not attested", never "no
+  network"**: `VerifiedReceipt.network` is `None`, the CLI prints `NOT ATTESTED`. If your policy
+  requires contained detonation, require `network` and an `exit` your operator has defined as
+  contained (the exit *name* is operator-defined).
+- Freshness, unless you pass `max_age`: the timestamps are the signer's clock, and a receipt is
+  bound to its `job_id`, so it can only ever be replayed for the same job.
+- Anything for a result without a receipt: a keyless dispatcher, a withheld receipt, a `FAILED`
+  job and results stored by 0.1.45 or earlier (until re-marked) all answer `404`. Whether to
+  accept an unattested result is your policy; the library reports it as `NoReceipt`, never as
+  verified.
+
 ## Startup store canary
 
 Before a dispatcher claims its first job it proves it can actually **store and serve a result**:

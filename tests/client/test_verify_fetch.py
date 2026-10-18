@@ -1,0 +1,350 @@
+"""fetch_and_verify over real HTTP (a stdlib server on loopback): status mapping, caps,
+timeouts, redirects, URL/job-id validation, and the bearer token."""
+from __future__ import annotations
+
+import hashlib
+import json
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import pytest
+
+from blastbox.attest_wire import canonical
+from blastbox.client import verify as v
+from blastbox.host import attest
+
+JOB = "0b9d6a0e-6c1d-4f43-9d55-0f6a3c1c7e21"
+INPUT_SHA = hashlib.sha256(b"sample").hexdigest()
+METADATA = b'{"engine":"williamtells"}'
+
+
+@pytest.fixture
+def key(tmp_path):
+    return attest.load_or_create_key(tmp_path / "attest.key")
+
+
+@pytest.fixture
+def pinned(key):
+    return v.load_pinned_keys(key.public_key_pem)
+
+
+def _receipt(key, metadata=METADATA, job_id=JOB) -> bytes:
+    obs = attest.RunObservation(job_id=job_id, engine="williamtells", input_sha256=INPUT_SHA,
+                                worker_runtime="warm", worker_tier="static", started_at_ms=1,
+                                finished_at_ms=2)
+    doc = attest.build_receipt(obs, key_id=key.key_id,
+                               metadata_sha256=hashlib.sha256(metadata).hexdigest(), host="h")
+    return canonical({"attestation": doc, "signature": key.sign(doc)})
+
+
+class _Server:
+    """routes: path -> (status, body bytes, extra headers) or a callable(handler)."""
+
+    def __init__(self):
+        self.routes: dict = {}
+        self.seen: list[tuple[str, dict]] = []
+        server = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                server.seen.append((self.path, dict(self.headers)))
+                route = server.routes.get(self.path)
+                if route is None:
+                    route = (404, b'{"detail":"not routed"}', {})
+                if callable(route):
+                    return route(self)
+                status, body, headers = route
+                self.send_response(status)
+                for k, val in headers.items():
+                    self.send_header(k, val)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.httpd.daemon_threads = True
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+@pytest.fixture
+def srv():
+    s = _Server()
+    yield s
+    s.close()
+
+
+A = f"/v1/jobs/{JOB}/attestation"
+M = f"/v1/jobs/{JOB}/metadata"
+
+
+def test_fetches_both_and_verifies(srv, key, pinned):
+    srv.routes[A] = (200, _receipt(key), {})
+    srv.routes[M] = (200, METADATA, {})
+    out = v.fetch_and_verify(srv.url, JOB, keys=pinned, expect_input_sha256=INPUT_SHA,
+                             token="s3cret")
+    assert out.metadata == METADATA and out.receipt.metadata_bound and out.receipt.input_bound
+    assert [p for p, _ in srv.seen] == [A, M]
+    for _, headers in srv.seen:
+        assert headers["Authorization"] == "Bearer s3cret"
+
+
+def test_a_base_path_prefix_is_kept(srv, key, pinned):
+    srv.routes["/bb" + A] = (200, _receipt(key), {})
+    srv.routes["/bb" + M] = (200, METADATA, {})
+    assert v.fetch_and_verify(srv.url + "/bb/", JOB, keys=pinned).metadata == METADATA
+
+
+def test_metadata_swapped_after_the_seal_fails(srv, key, pinned):
+    srv.routes[A] = (200, _receipt(key), {})
+    srv.routes[M] = (200, METADATA + b" ", {})
+    with pytest.raises(v.ReceiptMismatch) as ei:
+        v.fetch_and_verify(srv.url, JOB, keys=pinned)
+    assert ei.value.code == "metadata_mismatch"
+
+
+def test_a_receipt_for_another_job_fails(srv, key, pinned):
+    srv.routes[A] = (200, _receipt(key, job_id="11111111-1111-4111-8111-111111111111"), {})
+    srv.routes[M] = (200, METADATA, {})
+    with pytest.raises(v.ReceiptMismatch) as ei:
+        v.fetch_and_verify(srv.url, JOB, keys=pinned)
+    assert ei.value.code == "job_id_mismatch"
+
+
+def test_404_is_no_receipt_with_the_sanitised_detail(srv, pinned):
+    detail = "no execution receipt for this job: the uploader stored no receipt\x1b[2J"
+    srv.routes[A] = (404, json.dumps({"detail": detail}).encode(), {})
+    with pytest.raises(v.NoReceipt) as ei:
+        v.fetch_and_verify(srv.url, JOB, keys=pinned)
+    assert ei.value.code == "no_receipt"
+    assert "stored no receipt" in ei.value.reason and "\x1b" not in ei.value.reason
+    assert [p for p, _ in srv.seen] == [A]                  # metadata never fetched
+
+
+def test_410_is_expired(srv, pinned):
+    srv.routes[A] = (410, b'{"detail":"result expired"}', {})
+    with pytest.raises(v.NoReceipt) as ei:
+        v.fetch_and_verify(srv.url, JOB, keys=pinned)
+    assert ei.value.code == "expired"
+
+
+def test_a_served_tombstone_is_no_receipt(srv, pinned):
+    srv.routes[A] = (200, canonical(attest.tombstone_body("signing failed")), {})
+    srv.routes[M] = (200, METADATA, {})
+    with pytest.raises(v.NoReceipt) as ei:
+        v.fetch_and_verify(srv.url, JOB, keys=pinned)
+    assert ei.value.code == "tombstone"
+
+
+@pytest.mark.parametrize("status,code,retryable", [
+    (409, "not_ready", True), (503, "unavailable", True), (500, "unavailable", True),
+    (429, "unavailable", True), (401, "unauthorized", False), (403, "unauthorized", False),
+    (400, "http_error", False), (204, "http_error", False),
+])
+def test_http_statuses_map_to_typed_fetch_errors(srv, pinned, status, code, retryable):
+    srv.routes[A] = (status, b"" if status == 204 else b'{"detail":"x"}', {})
+    with pytest.raises(v.FetchError) as ei:
+        v.fetch_and_verify(srv.url, JOB, keys=pinned)
+    assert (ei.value.code, ei.value.retryable, ei.value.status) == (code, retryable, status)
+
+
+@pytest.mark.parametrize("status", [301, 302, 307, 308])
+def test_redirects_are_refused_and_the_token_never_follows(srv, pinned, status):
+    other = _Server()
+    try:
+        srv.routes[A] = (status, b"", {"Location": other.url + A})
+        with pytest.raises(v.FetchError) as ei:
+            v.fetch_and_verify(srv.url, JOB, keys=pinned, token="s3cret")
+        assert ei.value.code == "redirect" and not ei.value.retryable
+        assert other.seen == []
+    finally:
+        other.close()
+
+
+def test_metadata_404_after_a_receipt_is_a_fetch_error(srv, key, pinned):
+    srv.routes[A] = (200, _receipt(key), {})
+    srv.routes[M] = (404, b'{"detail":"metadata.json not found"}', {})
+    with pytest.raises(v.FetchError) as ei:
+        v.fetch_and_verify(srv.url, JOB, keys=pinned)
+    assert ei.value.code == "metadata_missing"
+
+
+def test_metadata_409_is_retryable(srv, key, pinned):
+    srv.routes[A] = (200, _receipt(key), {})
+    srv.routes[M] = (409, b"{}", {})
+    with pytest.raises(v.FetchError) as ei:
+        v.fetch_and_verify(srv.url, JOB, keys=pinned)
+    assert ei.value.retryable
+
+
+def test_an_oversized_receipt_is_refused(srv, pinned):
+    srv.routes[A] = (200, b" " * (v.RECEIPT_MAX_BYTES + 1), {})
+    with pytest.raises(v.FetchError) as ei:
+        v.fetch_and_verify(srv.url, JOB, keys=pinned)
+    assert ei.value.code == "too_large"
+
+
+def test_oversized_metadata_is_refused_even_without_a_content_length(srv, key, pinned):
+    big = b"x" * 5000
+    srv.routes[A] = (200, _receipt(key, metadata=big), {})
+
+    def chunked(h):
+        h.send_response(200)
+        h.send_header("Transfer-Encoding", "chunked")
+        h.end_headers()
+        for _ in range(5):
+            h.wfile.write(b"3e8\r\n" + b"x" * 1000 + b"\r\n")
+        h.wfile.write(b"0\r\n\r\n")
+
+    srv.routes[M] = chunked
+    with pytest.raises(v.FetchError) as ei:
+        v.fetch_and_verify(srv.url, JOB, keys=pinned, max_metadata_bytes=4096)
+    assert ei.value.code == "too_large"
+    assert v.fetch_and_verify(srv.url, JOB, keys=pinned, max_metadata_bytes=5000).metadata == big
+
+
+def test_a_stalled_server_times_out_retryably(srv, pinned):
+    release = threading.Event()
+
+    def stall(h):
+        release.wait(5)
+
+    srv.routes[A] = stall
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(v.FetchError) as ei:
+            v.fetch_and_verify(srv.url, JOB, keys=pinned, timeout=0.3)
+    finally:
+        release.set()
+    assert ei.value.retryable and time.monotonic() - t0 < 4
+
+
+def test_a_trickling_server_hits_the_total_deadline(srv, pinned):
+    """Each byte arrives inside the socket timeout; the request's TOTAL budget still ends it."""
+    release = threading.Event()
+
+    def trickle(h):
+        h.send_response(200)
+        h.send_header("Content-Length", "100000")
+        h.end_headers()
+        for _ in range(100):
+            if release.wait(0.1):
+                return
+            try:
+                h.wfile.write(b" ")
+                h.wfile.flush()
+            except OSError:
+                return
+
+    srv.routes[A] = trickle
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(v.FetchError) as ei:
+            v.fetch_and_verify(srv.url, JOB, keys=pinned, timeout=0.5)
+    finally:
+        release.set()
+    assert ei.value.code == "timeout" and ei.value.retryable
+    assert time.monotonic() - t0 < 3
+
+
+def test_connection_refused_is_retryable(pinned):
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    with pytest.raises(v.FetchError) as ei:
+        v.fetch_and_verify(f"http://127.0.0.1:{port}", JOB, keys=pinned, timeout=2)
+    assert ei.value.code == "network" and ei.value.retryable
+
+
+@pytest.mark.parametrize("url", [
+    "file:///etc", "ftp://h/", "h:8000", "http://", "http://u:p@h/", "http://h/?q=1",
+    "http://h/#f", "javascript:alert(1)",
+])
+def test_only_plain_http_and_https_base_urls(pinned, url):
+    with pytest.raises(ValueError):
+        v.fetch_and_verify(url, JOB, keys=pinned)
+
+
+@pytest.mark.parametrize("job_id", [
+    "../../etc/passwd", JOB.upper(), "{" + JOB + "}", "urn:uuid:" + JOB, JOB.replace("-", ""),
+    "", "x",
+])
+def test_the_job_id_must_be_a_canonical_uuid(pinned, job_id):
+    with pytest.raises(ValueError):
+        v.fetch_and_verify("http://127.0.0.1:9", job_id, keys=pinned)
+
+
+@pytest.mark.parametrize("kw", [
+    {"token": "a\r\nX-Evil: 1"}, {"token": ""}, {"timeout": 0}, {"timeout": -1},
+    {"max_metadata_bytes": 0}, {"max_metadata_bytes": 1.5}, {"timeout": float("inf")},
+    {"timeout": float("nan")}, {"max_age": -5},
+])
+def test_bad_fetch_arguments(pinned, kw):
+    with pytest.raises((TypeError, ValueError)):
+        v.fetch_and_verify("http://127.0.0.1:9", JOB, keys=pinned, **kw)
+
+
+def test_tls_certificate_failures_are_not_retryable(pinned):
+    """An https URL to a plain-HTTP server fails the handshake; a cert error must never be
+    retried into success, and nothing is verified."""
+    import socket
+    import ssl
+    import tempfile
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+    import datetime
+
+    k = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+            .public_key(k.public_key()).serial_number(1)
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=1))
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), False)
+            .sign(k, hashes.SHA256()))
+    with tempfile.TemporaryDirectory() as d:
+        cf, kf = f"{d}/c.pem", f"{d}/k.pem"
+        with open(cf, "wb") as fh:
+            fh.write(cert.public_bytes(serialization.Encoding.PEM))
+        with open(kf, "wb") as fh:
+            fh.write(k.private_bytes(serialization.Encoding.PEM,
+                                     serialization.PrivateFormat.PKCS8,
+                                     serialization.NoEncryption()))
+        sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        sctx.load_cert_chain(cf, kf)
+        lsock = socket.socket()
+        lsock.bind(("127.0.0.1", 0))
+        lsock.listen()
+        port = lsock.getsockname()[1]
+
+        def serve():
+            try:
+                conn, _ = lsock.accept()
+                with sctx.wrap_socket(conn, server_side=True) as tls:
+                    tls.recv(1)
+            except (OSError, ssl.SSLError):
+                pass
+
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        try:
+            with pytest.raises(v.FetchError) as ei:
+                v.fetch_and_verify(f"https://localhost:{port}", JOB, keys=pinned, timeout=3)
+        finally:
+            lsock.close()
+        assert ei.value.code == "tls" and not ei.value.retryable

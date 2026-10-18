@@ -117,7 +117,9 @@ disposable worker for it; `GET /v1/jobs/{id}/artifacts/{artifact_id}` serves val
 Opt-in execution receipts: with `BLASTBOX_ATTEST_KEY` set, the dispatcher signs what it observed of
 each `DONE` run, served at `GET /v1/jobs/{id}/attestation` (pin the key printed by
 `blastbox attest-key --key PATH`; see [docs/CONFIGURATION.md](docs/CONFIGURATION.md#execution-receipts-opt-in)
-for what a receipt does and does not prove).
+for what a receipt does and does not prove). Consumers verify receipts with
+`blastbox attest verify` or `blastbox.client.verify` (`pip install 'blastbox[verify]'`; see
+[Verifying results (clients)](docs/CONFIGURATION.md#verifying-results-clients)).
 
 The defaults run a secure single-host deployment — you set almost nothing. For the warm-pool /
 runtime / sandbox tiers, **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** is the tier-decision guide

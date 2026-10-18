@@ -69,6 +69,14 @@ from pathlib import Path, PurePosixPath
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
+from blastbox.attest_wire import ALG as ALG
+from blastbox.attest_wire import VERSION as VERSION
+from blastbox.attest_wire import VerifyKey as VerifyKey
+from blastbox.attest_wire import VerifyKeyRefused as VerifyKeyRefused
+from blastbox.attest_wire import _reject_floats as _reject_floats  # noqa: F401 - re-export
+from blastbox.attest_wire import canonical as canonical
+from blastbox.attest_wire import signature_valid
+from blastbox.attest_wire import spki_key_id as _spki_key_id
 from blastbox.limits import Limits
 
 _log = logging.getLogger("blastbox.host.attest")
@@ -117,9 +125,6 @@ WITHHELD_MARKER_MAX_BYTES = 4096
 RESERVED_NAMES = (RECEIPT_NAME, WITHHELD_NAME)
 _SEAL_NAME = "metadata.json"
 
-VERSION = 1
-ALG = "ES256"
-
 #: Sentinel for dispatcher constructors: resolve the key from the environment.
 FROM_ENV = object()
 
@@ -128,28 +133,6 @@ _READ_CHUNK = 1024 * 1024
 
 class AttestKeyRefused(ValueError):
     """An existing key file this process will not sign with (unsafe or not P-256)."""
-
-
-# ---------------------------------------------------------------------------
-# Canonical form
-# ---------------------------------------------------------------------------
-
-
-def _reject_floats(x: object, path: str = "$") -> None:
-    if isinstance(x, float):
-        raise TypeError(f"canonical(): float at {path} -- the signed form carries integers only")
-    if isinstance(x, dict):
-        for k, v in x.items():
-            _reject_floats(v, f"{path}.{k}")
-    elif isinstance(x, (list, tuple)):
-        for i, v in enumerate(x):
-            _reject_floats(v, f"{path}[{i}]")
-
-
-def canonical(x: object) -> bytes:
-    """The exact bytes that are signed. Part of the contract -- do not change."""
-    _reject_floats(x)
-    return json.dumps(x, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
 
 
 # ---------------------------------------------------------------------------
@@ -198,70 +181,6 @@ class AttestKey:
     def sign(self, doc: Mapping[str, object]) -> str:
         der = self.private_key.sign(canonical(doc), ec.ECDSA(hashes.SHA256()))
         return base64.urlsafe_b64encode(der).decode()
-
-
-def _spki_key_id(public_key: ec.EllipticCurvePublicKey) -> str:
-    spki = public_key.public_bytes(
-        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
-    return hashlib.sha256(spki).hexdigest()[:16]
-
-
-class VerifyKeyRefused(ValueError):
-    """A ``--verify-key`` file is not a usable EC P-256 public key (or states a wrong key_id)."""
-
-
-@dataclass(frozen=True)
-class VerifyKey:
-    """The PUBLIC half of an attest key: verifies receipts, cannot sign. What a host that does
-    not hold a node's private key (the control plane) checks that node's receipts with."""
-
-    public_key: ec.EllipticCurvePublicKey
-
-    @property
-    def key_id(self) -> str:
-        return _spki_key_id(self.public_key)
-
-    @classmethod
-    def from_attest_key(cls, key: AttestKey) -> VerifyKey:
-        return cls(key.private_key.public_key())
-
-    @classmethod
-    def parse(cls, data: bytes, source: str = "verify key") -> VerifyKey:
-        """A PEM SubjectPublicKeyInfo, or the JSON body ``GET /v1/attestation/key`` serves
-        (``{"key_id", "alg", "public_key_pem"}``; a stated key_id/alg must match the PEM)."""
-        stated: dict = {}
-        text = data.strip()
-        if text.startswith(b"{"):
-            # Explicit checks, not asserts: they must survive python -O.
-            try:
-                stated = json.loads(text)
-            except Exception as exc:  # noqa: BLE001 -- any parse problem is a refusal
-                raise VerifyKeyRefused(
-                    f"{source}: not a JSON key body with a public_key_pem") from exc
-            pem = stated.get("public_key_pem") if isinstance(stated, dict) else None
-            if not isinstance(pem, str):
-                raise VerifyKeyRefused(f"{source}: not a JSON key body with a public_key_pem")
-            try:
-                text = pem.encode()
-            except UnicodeEncodeError as exc:
-                raise VerifyKeyRefused(f"{source}: public_key_pem is not valid text") from exc
-        if text.count(b"-----BEGIN ") != 1:
-            # load_pem_public_key reads the first block and silently drops the rest.
-            raise VerifyKeyRefused(f"{source}: must hold exactly one PEM public key (one "
-                                   "--verify-key per signing host)")
-        try:
-            pub = serialization.load_pem_public_key(text)
-        except (ValueError, TypeError) as exc:
-            raise VerifyKeyRefused(f"{source}: not a readable PEM public key") from exc
-        if not isinstance(pub, ec.EllipticCurvePublicKey) or pub.curve.name != "secp256r1":
-            raise VerifyKeyRefused(f"{source}: not an EC P-256 public key (alg is fixed at {ALG})")
-        key = cls(pub)
-        if "alg" in stated and stated["alg"] != ALG:
-            raise VerifyKeyRefused(f"{source}: alg {stated['alg']!r} is not {ALG}")
-        if "key_id" in stated and stated["key_id"] != key.key_id:
-            raise VerifyKeyRefused(f"{source}: stated key_id {stated['key_id']!r} does not match "
-                                   f"its public key (key_id {key.key_id})")
-        return key
 
 
 def load_verify_key(path: Path) -> VerifyKey:
@@ -1107,11 +1026,10 @@ def verify_body(key: AttestKey | VerifyKey, body: object) -> bool:
         assert isinstance(body, dict)
         doc, sig = body["attestation"], body["signature"]
         assert isinstance(doc, dict) and isinstance(sig, str)
-        pub.verify(
-            base64.urlsafe_b64decode(sig), canonical(doc), ec.ECDSA(hashes.SHA256()))
+        der = base64.urlsafe_b64decode(sig)
     except Exception:  # noqa: BLE001 - anything short of a clean verify is "no"
         return False
-    return True
+    return signature_valid(pub, doc, der)
 
 
 #: A receipt is a few hundred bytes; anything past this is not one of ours.

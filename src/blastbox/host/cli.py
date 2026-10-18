@@ -2442,6 +2442,12 @@ def build_parser() -> argparse.ArgumentParser:
     from blastbox.worker.sandbox.macos_tool import add_parser as _add_macos_parser
     _add_macos_parser(sub)
 
+    # Client-side receipt verification (`blastbox attest verify`). Lives in the lean client
+    # package (needs only `cryptography`, via blastbox[verify]); registered here for the same
+    # reason as `macos` above.
+    from blastbox.client.cli import add_parser as _add_attest_parser
+    _add_attest_parser(sub)
+
     return p
 
 
