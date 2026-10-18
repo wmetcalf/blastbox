@@ -158,6 +158,10 @@ for the full setup (incl. building a `probe`-engine rootfs and the userns workar
   a confined path, and (optionally) sits behind a bearer token / auth proxy.
 - The contract bounds payload size/depth and validates every node; engine subtypes are validated
   against their registered schema.
+- Workers behind NAT are reached over **`blastbox worker-link`**, a WireGuard control link the
+  worker dials (it may only answer on it; a separate interface, overlay and nftables table from the
+  egress overlay) — see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) 3b. macOS workers serve sealed
+  jobs only: their agent advertises `"egress": false` and refuses (422) a job that needs egress.
 
 ## Network overlay (opt-in egress)
 

@@ -381,6 +381,120 @@ Run `blastbox macos doctor -- <engine self-test>` after install and after every 
 Neural Engine or GPU grant goes missing, an engine like Vision usually doesn't crash; it just
 returns **no result**. Only a known-positive self-test catches that.
 
+**macOS workers: no egress (by design, for now).** A Mac worker serves only sealed jobs. On
+Linux, "egress granted" means the inner sandbox shares a netns that netd (the egress rooter)
+already steers through fakenet / tor / a VPN; macOS has no such rooter, so letting `seatbelt` or
+`appsandbox` open the network would be direct egress from the Mac's own LAN. Both keep the network
+denied, and the agent now refuses an egress job outright instead of running it degraded: its
+`/healthz` advertises `"egress": false`, `POST /detonate` with `BLASTBOX_NET_EGRESS=1` in effect
+answers **422 `egress_unavailable`** before the engine sees a byte, and the dispatcher fails that
+job with a reason that names the fix (and releases the worker clean). A `static` pool whose
+engine's net policy grants egress only claims workers that advertise it, and refuses to start if
+none of its workers can (`BLASTBOX_WORKER_AGENT_EGRESS=1` on a Mac stops the agent at startup).
+macOS VMs were considered and rejected as the way round this: a guest gets no Neural Engine (the
+reason these engines run on a Mac at all), the macOS licence caps a host at two VMs, and they are
+slow. Supporting egress later would take: a sandbox profile that allows exactly one loopback port
+(a local proxy) and nothing else, and an agent-side proxy on that port that forwards over the
+worker-link (3b) to the egress forwarder on the host, so the Mac never egresses itself and the exit
+stays the same audited one Linux workers use.
+
+### 3b. Reaching workers behind NAT (worker-link)
+
+A `static` worker is dialled by the dispatcher (`https://<host>:8765`). A worker on a home LAN,
+behind carrier NAT or behind a one-way firewall cannot be dialled at all. `blastbox worker-link`
+turns the direction round at the transport layer: the **worker** dials the dispatcher host over
+WireGuard (`PersistentKeepalive = 25` holds its NAT mapping open), and the dispatcher then reaches
+the worker's unchanged `http_agent` (mTLS as before) at its overlay address.
+
+```
+dispatcher host (wtwg0 10.78.0.1, udp/51822)  ◀── WireGuard, dialled BY the worker ──  worker (wtwg0 10.78.0.5)
+dispatcher ── https://10.78.0.5:8765 (mTLS) ───────────────────────────────────────▶  http_agent
+```
+
+It is **separate from the egress overlay** (`bbwg0`, 10.77.0.0/24, udp/51821) by construction:
+own interface (`wtwg0`), own overlay (10.78.0.0/24), own port (51822), own env file
+(`/etc/blastbox/worker-link.env`), own nftables table (`inet blastbox_worker_link`). Egress carries
+sample traffic toward an exit; worker-link carries only dispatcher → agent control traffic, and a
+worker may only **answer** on it. `egress teardown` never touches worker-link and vice versa; both
+can run on one host, and a Linux worker can be on both.
+
+Bring-up (each private key is generated where it is used and never travels; everything carried
+between machines is public):
+
+```sh
+# 1. dispatcher host, once. --endpoint is what workers dial (this host's PUBLIC address).
+#    Needs wireguard-tools + nftables, and the dispatcher's CA (`blastbox pki init`).
+sudo blastbox worker-link init --endpoint gw.example.org [--dispatcher-source 172.18.0.0/16]
+sudo blastbox worker-link list                       # ... prints the next free address
+
+# 2. worker (Linux or macOS): keys + a CSR for that address. Prints ONLY the public key + CSR.
+sudo blastbox worker-link keygen --ip 10.78.0.5
+
+# 3. dispatcher host: register the worker and sign its CSR (its SAN must be exactly that
+#    address). Prints a join bundle (public material only) and the static-pool line.
+sudo blastbox worker-link add mac1 --public-key <key from 2> --csr mac1.csr --out mac1.json
+
+# 4. worker: install the bundle, bring the link up (firewall first), print the agent env.
+sudo blastbox worker-link join --bundle mac1.json --agent-user <the agent's user>
+
+# 5. dispatcher: add the worker; verify from both ends (exit 0 only when IN FORCE)
+BLASTBOX_STATIC_WORKERS=https://10.78.0.5:8765   # + BLASTBOX_DISPATCH_TLS_CA/_CERT/_KEY
+sudo blastbox worker-link status                 # per-worker handshake age, firewall read back
+```
+
+`join` prints the agent environment to use — `BLASTBOX_WORKER_AGENT_BIND=<overlay ip>`,
+`BLASTBOX_WORKER_AGENT_ALLOW_CIDRS=<host overlay ip>/32`, and `_TLS_CERT`/`_TLS_KEY`/`_CLIENT_CA`
+pointing at the files it installed under `/etc/blastbox/worker-link/`. The agent binds the overlay
+address, so it needs the link up before it starts (launchd/systemd restart it until it is). The
+certificate is SAN-pinned to the overlay address because the dispatcher verifies the hostname it
+dialled; renewal is `add` again for the same name with a fresh CSR (`--days`, default 30): the
+address and tunnel are kept, the certificate and the recorded expiry (`list`, `status`) change.
+`remove <name>` takes a worker off the live interface; `teardown` removes the host end (interface
+down first, then its firewall), keeping registrations and keys so a later `init` restores them.
+
+**Firewall.** Host (`inet blastbox_worker_link`): on `wtwg0` only the host may open
+`tcp/<agent port>` to a worker; a worker can open nothing toward the host, toward another worker,
+or through the host; the overlay address is reachable only over the link (Linux accepts a packet
+for a local address on any interface, so a job container on the host, or a packet arriving over the
+egress overlay, would otherwise reach it). Worker (Linux `inet blastbox_worker_link_peer`, macOS a
+pf anchor under `com.apple/`): only the host's /32 may open the agent port; nothing is routed into
+or out of the link. Every base chain is `policy accept` and matches only the link interface, so it
+changes no verdict for docker or egress traffic — and nftables needs **every** base chain on a hook
+to accept, so it can't override docker's own `FORWARD` drop either. Each side loads its ruleset,
+reads it back from the kernel, and only then brings the interface up; a oneshot unit reloads it
+before `wg-quick@wtwg0` at boot. `status` reports the ruleset the kernel holds, not the file.
+
+**A dispatcher in docker** reaches workers by being forwarded out of its bridge into `wtwg0`.
+Pass that network's CIDR as `--dispatcher-source` (repeatable): only those sources may open the
+agent port through the host, and they are **MASQUERADEd to the host's overlay address** — the
+worker routes and allows only that /32, so an un-NATed container source would handshake and never
+get a reply. (Docker's own MASQUERADE for a non-`--internal` network usually does this already;
+the rule makes it independent of docker's configuration. An `--internal` network has no route out
+at all, so the dispatcher must not be on one.) A dispatcher running on the host needs no source.
+
+**Linux workers that also run egress.** A job's netns is routed by the node: toward the host's
+overlay address it is FORWARDED (dropped: nothing is forwarded into the link), and toward the
+worker's own overlay address it arrives on a docker bridge, not the link (dropped). The overlay must
+be RFC 1918, so the leak guard's `block_internal` (which drops 10/8, 172.16/12, 192.168/16) covers
+it too. In egress **global** mode the only policy rules select the forwarder's own source address
+and the egress peer runs `Table = off`, so the worker's own UDP to the host endpoint is never
+captured into `bbwg0`; `join` still asks the kernel (`ip route get <endpoint>`) and refuses if the
+endpoint would be reached through `bbwg0` or the link itself.
+
+**macOS workers.** The link runs as a root LaunchDaemon (`io.blastbox.worker-link.wtwg0`) that
+runs a root-owned watchdog script every 30 s; it only re-ups the tunnel when it is down and
+re-asserts the pf anchor (enabling pf, which macOS boots with off). Two details were each found the
+hard way and have regression tests: the daemon must set **`AbandonProcessGroup`** (`wg-quick up`
+leaves `wireguard-go` in the watchdog's process group, which launchd otherwise kills when the
+watchdog exits), and "is it up?" must be asked of the **real `utunN`** recorded in
+`/var/run/wireguard/wtwg0.name` — `wg show wtwg0` cannot work on macOS. The watchdog is a shell
+script, not Python, because it runs as root and must not execute a user-writable virtualenv; it
+does run Homebrew's `wg-quick`, which is user-writable — the standard trade-off for WireGuard on
+macOS, and a reason the worker should be a dedicated machine.
+
+**Windows workers** are out of scope for worker-link: they are libvirt VMs on a Linux host
+(see *Runtime: libvirt VM*), so that Linux host is what joins the link.
+
 ### 4. Auto-sizing a multi-worker host (node pool autosizer)
 
 Shapes 2 and 3 hand-tune `BLASTBOX_POOL_CEILING`/`WARM_SIZE` per dispatcher. On a host that runs
@@ -482,6 +596,11 @@ only ever *which container sits at that address*. Nothing in Python changes:
 | `172.31.0.10` | the exit sidecar | credential-free forwarder |
 | blast radius of a node compromise | a VPN profile / proxy key | a wg transport key |
 | exit IP | this node's provider session | shared, central |
+
+This overlay carries SAMPLE traffic to the exits. Reaching workers behind NAT for dispatch is a
+different overlay with the opposite trust direction — `blastbox worker-link` (section 3b: `wtwg0`,
+10.78.0.0/24, udp/51822, its own nftables table). The two never share an interface, prefix, port,
+firewall or unit, and either can be torn down without touching the other.
 
 Bring-up, exit host first (order matters — the forwarder refuses to start until the node-side
 source route exists):
