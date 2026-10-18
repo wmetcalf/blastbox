@@ -19,7 +19,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Iterable, Iterator, Protocol
 
 from blastbox.host.egress import (
     ALL_CHAINS,
@@ -61,6 +61,25 @@ ENV_FILE = Path("/etc/blastbox/egress.env")
 UNIT_SRC_NAME = "blastbox-egress.service"
 UNIT_DST = Path("/etc/systemd/system/blastbox-egress.service")
 RT_TABLES = Path("/etc/iproute2/rt_tables")
+
+
+class WgInterface(Protocol):
+    """What the generic WireGuard helpers below actually read: an interface name and the
+    overlay prefix it carries.
+
+    They were written against :class:`EgressConfig`, but none of them touches anything
+    egress-specific, and ``blastbox worker-link`` (a SEPARATE interface, overlay and
+    firewall -- see :mod:`blastbox.host.worker_link`) needs exactly the same locked
+    read-modify-write, reload and bring-up discipline. Typing them against this protocol
+    lets both share one implementation without either config having to impersonate the
+    other. Properties, not attributes, so a frozen dataclass satisfies it.
+    """
+
+    @property
+    def wg_iface(self) -> str: ...
+
+    @property
+    def overlay_net(self) -> str: ...
 
 
 # --------------------------------------------------------------------------------------
@@ -760,10 +779,36 @@ def check_overlay_net(cfg: EgressConfig) -> None:
     for the same reason the bridge allocator treats it as advisory: an interface
     configured 10.0.12.34/8 must not veto every 10/8 candidate on the host.
     """
+    cidr = overlay_conflict(cfg)
+    if cidr is None:
+        return
+    raise RuntimeError(
+        f"the overlay prefix {cfg.overlay_net} overlaps {cidr}, which this host "
+        "already routes. Bringing the overlay up would put its address and the "
+        f"`to {cfg.overlay_net} lookup main` rule over a live network — and on an "
+        "exit host source-route the whole prefix into the exit sidecar. Choose a "
+        "free range with --overlay-net (and the matching --upstream-gw), or remove "
+        "the conflicting route first.")
+
+
+def overlay_conflict(cfg: WgInterface, *, own_addresses: bool = False) -> str | None:
+    """The first claimed CIDR that ``cfg.overlay_net`` collides with, or None.
+
+    The decision half of :func:`check_overlay_net`, split out so ``worker-link`` can ask
+    the same question about ITS overlay and phrase its own refusal (the egress message
+    names egress flags). Routes on ``cfg.wg_iface`` itself are ours and never a conflict,
+    which is what keeps a re-run idempotent.
+
+    ``own_addresses`` also counts the ADDRESSES held by ``cfg.wg_iface`` as ours.
+    :func:`host_route_cidrs` emits every held address as a /32 (and every route's
+    ``prefsrc``), so with the interface already up its own address is "claimed" and a
+    re-run refuses itself. Worker-link passes True; the egress caller keeps its existing
+    behaviour unchanged.
+    """
     try:
         want = ipaddress.ip_network(cfg.overlay_net, strict=False)
     except ValueError:
-        return
+        return None
     ours: set[str] = set()
     proc = _run(["ip", "-j", "route", "show", "dev", cfg.wg_iface], check=False)
     if proc.returncode == 0:
@@ -771,6 +816,18 @@ def check_overlay_net(cfg: EgressConfig) -> None:
             ours = {r["dst"] for r in json.loads(proc.stdout or "[]") if r.get("dst")}
         except (json.JSONDecodeError, TypeError):
             ours = set()
+    if own_addresses:
+        held = _run(["ip", "-j", "addr", "show", "dev", cfg.wg_iface], check=False)
+        if held.returncode == 0:
+            try:
+                for row in json.loads(held.stdout or "[]"):
+                    for a in row.get("addr_info", []) or []:
+                        if a.get("family") == "inet" and a.get("local"):
+                            ours.add(f"{a['local']}/32")
+                            ours.add(str(ipaddress.ip_network(
+                                f"{a['local']}/{a.get('prefixlen', 32)}", strict=False)))
+            except (json.JSONDecodeError, TypeError, AttributeError, ValueError):
+                pass
     for cidr in claimed_cidrs():
         if cidr in ours:
             continue
@@ -782,13 +839,8 @@ def check_overlay_net(cfg: EgressConfig) -> None:
             continue
         if other.prefixlen <= SUMMARY_PREFIXLEN and other.prefixlen < want.prefixlen:
             continue        # advisory summary, same rule the bridge allocator uses
-        raise RuntimeError(
-            f"the overlay prefix {cfg.overlay_net} overlaps {cidr}, which this host "
-            "already routes. Bringing the overlay up would put its address and the "
-            f"`to {cfg.overlay_net} lookup main` rule over a live network — and on an "
-            "exit host source-route the whole prefix into the exit sidecar. Choose a "
-            "free range with --overlay-net (and the matching --upstream-gw), or remove "
-            "the conflicting route first.")
+        return cidr
+    return None
 
 
 def ensure_bridges(cfg: EgressConfig, *, dry_run: bool = False) -> list[str]:
@@ -870,7 +922,7 @@ def ensure_keypair(stem: str) -> tuple[Path, str]:
 
 
 @contextlib.contextmanager
-def conf_lock(cfg: EgressConfig) -> Iterator[None]:
+def conf_lock(cfg: WgInterface) -> Iterator[None]:
     """Hold an exclusive lock across a WireGuard config read-modify-write-reload.
 
     EVERY MUTATION OF ``<iface>.conf`` IS A READ-MODIFY-WRITE, AND NOTHING SERIALISED
@@ -949,7 +1001,7 @@ def ensure_rt_table(cfg: EgressConfig) -> None:
             fh.write(line + "\n")
 
 
-def wg_up(cfg: EgressConfig) -> None:
+def wg_up(cfg: WgInterface) -> None:
     """Bring the overlay interface up WITH THE CURRENT CONFIG, or raise.
 
     Discarding the fallback's return code meant `egress gateway`/`peer` printed a public
@@ -1055,15 +1107,7 @@ def prune_expired_peers(cfg: EgressConfig) -> list[str]:
         gone = expired_peers(body)
         if not gone:
             return []
-        out, drop, current = [], False, None
-        for line in body.splitlines(keepends=True):
-            stripped = line.strip()
-            if stripped.startswith("# peer:"):
-                current = stripped[len("# peer:"):].strip()
-                drop = current in gone
-            if not drop:
-                out.append(line)
-        _write_conf(conf, "".join(out))
+        _write_conf(conf, drop_peer_blocks(body, gone))
         # If this raises, the caller learns the peers were removed from DISK but not
         # from the live interface — which is the difference between revocation and the
         # appearance of it.
@@ -1071,7 +1115,26 @@ def prune_expired_peers(cfg: EgressConfig) -> list[str]:
         return gone
 
 
-def _reload_wg(cfg: EgressConfig) -> None:
+def drop_peer_blocks(body: str, names: Iterable[str]) -> str:
+    """``body`` with every ``# peer:<name>`` block for ``names`` removed, byte-for-byte
+    otherwise.
+
+    A block runs from its marker to the next marker (or end of file), which is exactly how
+    :func:`add_peer` writes and reconciles them. Shared by the expiry prune and by
+    ``worker-link remove``, so the two cannot disagree about where a peer ends.
+    """
+    gone = set(names)
+    out, drop = [], False
+    for line in body.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith("# peer:"):
+            drop = stripped[len("# peer:"):].strip() in gone
+        if not drop:
+            out.append(line)
+    return "".join(out)
+
+
+def _reload_wg(cfg: WgInterface) -> None:
     """Apply a changed wg config to the LIVE interface, or raise.
 
     Two ways this silently did nothing. `systemctl enable --now` does not restart an
