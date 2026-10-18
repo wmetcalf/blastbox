@@ -34,24 +34,29 @@ This module imports only the standard library, ``cryptography`` and :mod:`blastb
 from __future__ import annotations
 
 import base64
+import dataclasses
+import functools
 import hashlib
+import http.client
 import json
 import math
 import os
 import re
+import socket
 import ssl
 import stat
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from types import MappingProxyType
-from typing import NoReturn
+from typing import Any, NoReturn
 
 try:
     from cryptography.hazmat.primitives import serialization
@@ -66,6 +71,7 @@ from blastbox.attest_wire import (
     VerifyKey,
     VerifyKeyRefused,
     canonical,
+    is_p256_public_key,
     signature_valid,
 )
 
@@ -236,6 +242,11 @@ class PinnedKeys(Mapping[str, VerifyKey]):
         for key in keys:
             if not isinstance(key, VerifyKey):
                 raise TypeError(f"PinnedKeys: expected VerifyKey, got {type(key).__name__}")
+            if not is_p256_public_key(key.public_key):
+                # VerifyKey checks this on construction; re-checked here because a frozen
+                # dataclass can still be mutated with object.__setattr__.
+                raise VerifyKeyRefused("PinnedKeys: not an EC P-256 public key (alg is fixed "
+                                       f"at {ALG})")
             key_id = key.key_id
             prev = by_id.get(key_id)
             if prev is None:
@@ -638,6 +649,13 @@ def _check_engine(expect_engine: object) -> None:
         raise ValueError("expect_engine must be a non-empty engine name")
 
 
+def _check_metadata(signed_sha256: str, held_sha256: str) -> None:
+    if signed_sha256 != held_sha256:
+        raise ReceiptMismatch(f"receipt metadata_sha256 {signed_sha256} is not the sha256 of "
+                              f"the metadata bytes held ({held_sha256})",
+                              code="metadata_mismatch")
+
+
 # ---------------------------------------------------------------------------
 # Verify
 # ---------------------------------------------------------------------------
@@ -726,10 +744,8 @@ def verify_receipt(
     if want_input is not None and doc["input_sha256"] != want_input:
         raise ReceiptMismatch(f"receipt input_sha256 {doc['input_sha256']} is not the sha256 of "
                               f"the submitted input ({want_input})", code="input_mismatch")
-    if want_metadata is not None and doc["metadata_sha256"] != want_metadata:
-        raise ReceiptMismatch(f"receipt metadata_sha256 {doc['metadata_sha256']} is not the "
-                              f"sha256 of the metadata bytes held ({want_metadata})",
-                              code="metadata_mismatch")
+    if want_metadata is not None:
+        _check_metadata(str(doc["metadata_sha256"]), want_metadata)
     def _int(name: str) -> int:
         value = doc[name]
         if type(value) is not int:  # checked by _check_doc; never an assert (python -O)
@@ -809,6 +825,12 @@ def _base_url(base_url: str) -> str:
         raise ValueError("base_url must not carry credentials; pass token= instead")
     if parts.query or parts.fragment:
         raise ValueError("base_url must not carry a query or fragment")
+    try:
+        port = parts.port  # raises ValueError for a non-numeric or out-of-range port
+    except ValueError as exc:
+        raise ValueError("base_url has an invalid port (must be 1-65535)") from exc
+    if port == 0:
+        raise ValueError("base_url has an invalid port (must be 1-65535)")
     return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
 
 
@@ -823,22 +845,144 @@ def _canonical_job_id(job_id: str) -> str:
     return job_id
 
 
-def _read_capped(resp, cap: int, deadline: float, what: str) -> bytes:  # noqa: ANN001
+class _Deadline:
+    """One request's TOTAL wall-clock budget. Every socket the request opens is registered; when
+    the budget runs out a watchdog shuts them down, so a read blocked in recv() -- on headers or
+    body, however the server paces its bytes -- returns at the deadline instead of waiting out a
+    fresh per-operation socket timeout. ``expired`` then turns whatever error (or early EOF) the
+    interrupted read produced into a ``timeout``."""
+
+    def __init__(self, timeout: float) -> None:
+        self.end = time.monotonic() + timeout
+        self._lock = threading.Lock()
+        self._socks: list[socket.socket] = []
+        self._fired = False
+        self._timer = threading.Timer(timeout, self._fire)
+        self._timer.daemon = True
+
+    def remaining(self) -> float:
+        return self.end - time.monotonic()
+
+    @property
+    def expired(self) -> bool:
+        return self._fired or self.remaining() <= 0
+
+    def socket_timeout(self) -> float:
+        """The per-operation socket timeout for the next blocking step: what is left."""
+        left = self.remaining()
+        if left <= 0:
+            raise TimeoutError("request deadline exceeded")
+        return left
+
+    def register(self, sock: socket.socket | None) -> None:
+        if sock is None:
+            return
+        with self._lock:
+            self._socks.append(sock)
+            fired = self._fired
+        if fired:
+            self._shutdown(sock)
+
+    @staticmethod
+    def _shutdown(sock: socket.socket) -> None:
+        # socket.socket.shutdown, not SSLSocket.shutdown: interrupt the fd without touching the
+        # TLS state another thread is reading through.
+        try:
+            if sock.fileno() != -1:
+                socket.socket.shutdown(sock, socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def _fire(self) -> None:
+        with self._lock:
+            self._fired = True
+            socks = list(self._socks)
+        for sock in socks:
+            self._shutdown(sock)
+
+    def __enter__(self) -> _Deadline:
+        self._timer.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._timer.cancel()
+
+
+class _DeadlineConnection(http.client.HTTPConnection):
+    """An HTTPConnection that connects within the remaining budget and registers its socket."""
+
+    def __init__(self, *args: Any, deadline: _Deadline, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._deadline = deadline
+        create: Callable[..., socket.socket] = self._create_connection  # type: ignore[has-type]
+
+        def _create(*a: Any, **kw: Any) -> socket.socket:
+            sock = create(*a, **kw)
+            deadline.register(sock)
+            return sock
+
+        self._create_connection = _create
+
+    def connect(self) -> None:
+        self.timeout = self._deadline.socket_timeout()
+        super().connect()
+        self._deadline.register(self.sock)
+
+
+class _DeadlineHTTPSConnection(_DeadlineConnection, http.client.HTTPSConnection):
+    pass
+
+
+class _DeadlineHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, deadline: _Deadline) -> None:
+        super().__init__()
+        self._deadline = deadline
+
+    def http_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        return self.do_open(  # type: ignore[arg-type]
+            functools.partial(_DeadlineConnection, deadline=self._deadline), req)
+
+
+class _DeadlineHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, deadline: _Deadline, context: ssl.SSLContext | None) -> None:
+        super().__init__(context=context)
+        self._deadline = deadline
+        self._ctx = context
+
+    def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        return self.do_open(  # type: ignore[arg-type]
+            functools.partial(_DeadlineHTTPSConnection, deadline=self._deadline), req,
+            context=self._ctx)
+
+
+def _read_capped(resp, cap: int, deadline: _Deadline, what: str) -> bytes:  # noqa: ANN001
     length = resp.headers.get("Content-Length")
     if length is not None and length.strip().isdigit() and int(length) > cap:
         raise FetchError(f"{what} is larger than {cap} bytes", code="too_large")
     chunks: list[bytes] = []
     total = 0
     while True:
-        if time.monotonic() > deadline:
-            raise FetchError(f"{what}: timed out", code="timeout", retryable=True)
+        if deadline.expired:
+            raise _timed_out(what)
         chunk = resp.read1(min(65536, cap + 1 - total))
         if not chunk:
+            if deadline.expired:
+                # The watchdog's shutdown reads as EOF: a truncated body, never a complete one.
+                raise _timed_out(what)
             return b"".join(chunks)
         total += len(chunk)
         if total > cap:
             raise FetchError(f"{what} is larger than {cap} bytes", code="too_large")
         chunks.append(chunk)
+
+
+def _timed_out(what: str) -> FetchError:
+    return FetchError(f"{what}: timed out", code="timeout", retryable=True)
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    return isinstance(exc, TimeoutError) or isinstance(getattr(exc, "reason", None),
+                                                       TimeoutError)
 
 
 def _error_detail(err: urllib.error.HTTPError) -> str | None:
@@ -850,30 +994,38 @@ def _error_detail(err: urllib.error.HTTPError) -> str | None:
     return _shown(detail) if isinstance(detail, str) else None
 
 
-def _get(opener: urllib.request.OpenerDirector, url: str, *, headers: dict[str, str],
-         timeout: float, cap: int, what: str) -> tuple[int, bytes, str | None]:
+def _get(url: str, *, headers: dict[str, str], timeout: float, cap: int, what: str,
+         ssl_context: ssl.SSLContext | None) -> tuple[int, bytes, str | None]:
     """GET ``url``: (status, body, None) on 2xx; (status, b"", detail) on an HTTP error status.
-    Network failures and caps raise FetchError."""
-    deadline = time.monotonic() + timeout
+    Network failures, caps and the total ``timeout`` raise FetchError."""
+    with _Deadline(timeout) as deadline:
+        opener = urllib.request.build_opener(
+            _RefuseRedirect, _DeadlineHTTPHandler(deadline),
+            _DeadlineHTTPSHandler(deadline, ssl_context))
+        return _get_within(opener, url, headers=headers, deadline=deadline, cap=cap, what=what)
+
+
+def _get_within(opener: urllib.request.OpenerDirector, url: str, *, headers: dict[str, str],
+                deadline: _Deadline, cap: int, what: str) -> tuple[int, bytes, str | None]:
     req = urllib.request.Request(url, method="GET")
     for name, value in headers.items():
         req.add_unredirected_header(name, value)
     try:
-        resp = opener.open(req, timeout=timeout)
+        resp = opener.open(req, timeout=deadline.socket_timeout())
     except urllib.error.HTTPError as err:
         try:
             return err.code, b"", _error_detail(err)
         finally:
             err.close()
-    except (TimeoutError, ssl.SSLError, urllib.error.URLError, OSError) as exc:
+    except Exception as exc:  # noqa: BLE001 - also http.client protocol errors, bad headers
+        if deadline.expired or _is_timeout(exc):
+            raise _timed_out(what) from exc
         reason = getattr(exc, "reason", exc)
         if isinstance(reason, ssl.SSLError):
             # A certificate or handshake failure is a configuration problem (wrong CA, wrong
             # name, not TLS at all), never something to retry into success.
             raise FetchError(f"{what}: TLS failed: {_shown(reason)}", code="tls") from exc
         raise FetchError(f"{what}: {_shown(reason)}", code="network", retryable=True) from exc
-    except Exception as exc:  # noqa: BLE001 - http.client protocol errors, bad header values
-        raise FetchError(f"{what}: {_shown(exc)}", code="network", retryable=True) from exc
     try:
         with resp:
             status = resp.status
@@ -882,6 +1034,8 @@ def _get(opener: urllib.request.OpenerDirector, url: str, *, headers: dict[str, 
             except FetchError:
                 raise
             except Exception as exc:  # noqa: BLE001 - a read that died partway
+                if deadline.expired or _is_timeout(exc):
+                    raise _timed_out(what) from exc
                 raise FetchError(f"{what}: {_shown(exc)}", code="network",
                                  retryable=True) from exc
     except FetchError:
@@ -929,8 +1083,11 @@ def fetch_and_verify(
     Standard library only (urllib). Only http/https; redirects are refused; the bearer
     ``token`` (``BLASTBOX_API_KEY`` on the ingress) is sent as ``Authorization: Bearer``. The
     receipt is read up to 1 MiB and the metadata up to ``max_metadata_bytes``; ``timeout``
-    bounds each request's connect, each read, and the request's total wall time (checked
-    between reads). Certificates are verified (pass ``ssl_context`` to pin a private CA).
+    is each request's TOTAL wall-clock budget -- connect, TLS, headers and body together (name
+    resolution is the system resolver's own); a read still blocked when it runs out is
+    interrupted (``FetchError`` code ``timeout``). The receipt is fully verified (signature,
+    job, input, engine, age) before the metadata is fetched; the metadata is then bound to it.
+    Certificates are verified (pass ``ssl_context`` to pin a private CA).
 
     Raises :class:`NoReceipt` (404/410/tombstone), :class:`FetchError` (``retryable`` for 409,
     429/5xx, network errors and timeouts), or any failure of :func:`verify_receipt`."""
@@ -954,13 +1111,11 @@ def fetch_and_verify(
                 c in token for c in "\r\n\x00"):
             raise ValueError("token must be a non-empty single-line string")
         headers["Authorization"] = f"Bearer {token.strip()}"
-    opener = urllib.request.build_opener(
-        _RefuseRedirect, urllib.request.HTTPSHandler(context=ssl_context))
     job_url = f"{root}/v1/jobs/{urllib.parse.quote(job_id, safe='')}"
 
-    status, receipt_body, detail = _get(opener, f"{job_url}/attestation", headers=headers,
+    status, receipt_body, detail = _get(f"{job_url}/attestation", headers=headers,
                                         timeout=timeout_s, cap=RECEIPT_MAX_BYTES,
-                                        what="attestation")
+                                        what="attestation", ssl_context=ssl_context)
     if status == 404:
         raise NoReceipt("no execution receipt for this job (404)"
                         + (f": {detail}" if detail else ""), reason=detail)
@@ -969,8 +1124,17 @@ def fetch_and_verify(
     if status != 200:
         raise _status_failure(status, detail, "attestation")
 
-    status, metadata, detail = _get(opener, f"{job_url}/metadata", headers=headers,
-                                    timeout=timeout_s, cap=max_metadata_bytes, what="metadata")
+    # Everything that does not depend on the metadata -- tombstone, shape, pinned key,
+    # signature, job/input/engine/age bindings -- is settled BEFORE the metadata is fetched: an
+    # unusable receipt never costs a metadata download, and a tombstone is NoReceipt however
+    # the metadata route would have answered.
+    receipt = verify_receipt(receipt_body, keys=pinned, expect_job_id=job_id,
+                             expect_input_sha256=expect_input_sha256,
+                             expect_engine=expect_engine, max_age=max_age)
+
+    status, metadata, detail = _get(f"{job_url}/metadata", headers=headers, timeout=timeout_s,
+                                    cap=max_metadata_bytes, what="metadata",
+                                    ssl_context=ssl_context)
     if status == 410:
         raise NoReceipt("the result has expired (410)", reason=detail, code="expired")
     if status == 404:
@@ -980,7 +1144,6 @@ def fetch_and_verify(
     if status != 200:
         raise _status_failure(status, detail, "metadata")
 
-    receipt = verify_receipt(receipt_body, keys=pinned, expect_job_id=job_id,
-                             expect_input_sha256=expect_input_sha256, metadata_bytes=metadata,
-                             expect_engine=expect_engine, max_age=max_age)
+    _check_metadata(receipt.metadata_sha256, hashlib.sha256(metadata).hexdigest())
+    receipt = dataclasses.replace(receipt, metadata_bound=True)
     return VerifiedResult(receipt=receipt, metadata=metadata)

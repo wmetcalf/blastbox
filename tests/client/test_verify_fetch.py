@@ -29,12 +29,13 @@ def pinned(key):
     return v.load_pinned_keys(key.public_key_pem)
 
 
-def _receipt(key, metadata=METADATA, job_id=JOB) -> bytes:
+def _receipt(key, metadata=METADATA, job_id=JOB, **over) -> bytes:
     obs = attest.RunObservation(job_id=job_id, engine="williamtells", input_sha256=INPUT_SHA,
                                 worker_runtime="warm", worker_tier="static", started_at_ms=1,
                                 finished_at_ms=2)
     doc = attest.build_receipt(obs, key_id=key.key_id,
-                               metadata_sha256=hashlib.sha256(metadata).hexdigest(), host="h")
+                               metadata_sha256=hashlib.sha256(metadata).hexdigest(), host="h",
+                               **over)
     return canonical({"attestation": doc, "signature": key.sign(doc)})
 
 
@@ -143,6 +144,58 @@ def test_a_served_tombstone_is_no_receipt(srv, pinned):
     with pytest.raises(v.NoReceipt) as ei:
         v.fetch_and_verify(srv.url, JOB, keys=pinned)
     assert ei.value.code == "tombstone"
+
+
+def test_a_tombstone_is_no_receipt_even_when_metadata_is_unavailable(srv, pinned):
+    """The receipt is settled before the metadata is fetched: a tombstone is NoReceipt, not a
+    retryable 503 from a metadata request that should never have been made."""
+    srv.routes[A] = (200, canonical(attest.tombstone_body("signing failed")), {})
+    srv.routes[M] = (503, b'{"detail":"down"}', {})
+    with pytest.raises(v.NoReceipt) as ei:
+        v.fetch_and_verify(srv.url, JOB, keys=pinned)
+    assert ei.value.code == "tombstone"
+    assert [p for p, _ in srv.seen] == [A]
+
+
+def _other_key(tmp_path):
+    return attest.load_or_create_key(tmp_path / "other" / "attest.key")
+
+
+@pytest.mark.parametrize("case", ["malformed", "unknown_key", "bad_signature", "job_id",
+                                  "input", "engine", "stale"])
+def test_an_unusable_receipt_never_fetches_the_metadata(srv, key, pinned, tmp_path, case):
+    other = _other_key(tmp_path)
+    receipt = _receipt(key)
+    kw: dict = {}
+    if case == "malformed":
+        receipt = b'{"attestation": {"v": 1}, "signature": 5}'
+        exc = v.ReceiptMalformed
+    elif case == "unknown_key":
+        receipt = _receipt(other)
+        exc = v.UnknownSigningKey
+    elif case == "bad_signature":
+        body = json.loads(_receipt(key))
+        body["signature"] = json.loads(_receipt(other))["signature"]
+        receipt = canonical(body)
+        exc = v.BadSignature
+    elif case == "job_id":
+        receipt = _receipt(key, job_id="11111111-1111-4111-8111-111111111111")
+        exc = v.ReceiptMismatch
+    elif case == "input":
+        kw["expect_input_sha256"] = "0" * 64
+        exc = v.ReceiptMismatch
+    elif case == "engine":
+        kw["expect_engine"] = "other-engine"
+        exc = v.ReceiptMismatch
+    else:
+        receipt = _receipt(key, issued_at_ms=1_000)          # 1970: far past any max_age
+        kw["max_age"] = 60
+        exc = v.ReceiptMismatch
+    srv.routes[A] = (200, receipt, {})
+    srv.routes[M] = (200, METADATA, {})
+    with pytest.raises(exc):
+        v.fetch_and_verify(srv.url, JOB, keys=pinned, **kw)
+    assert [p for p, _ in srv.seen] == [A]                  # metadata never fetched
 
 
 @pytest.mark.parametrize("status,code,retryable", [
@@ -256,6 +309,93 @@ def test_a_trickling_server_hits_the_total_deadline(srv, pinned):
     assert time.monotonic() - t0 < 3
 
 
+def test_a_body_stall_after_slow_headers_ends_at_the_total_deadline(srv, pinned):
+    """Headers use most of the budget, then the body stalls: the read is interrupted when the
+    REMAINING budget runs out, not after a fresh full socket timeout, and it is a timeout."""
+    release = threading.Event()
+
+    def slow_then_stall(h):
+        if release.wait(0.8):
+            return
+        h.send_response(200)
+        h.send_header("Content-Length", "1000")
+        h.end_headers()
+        h.wfile.write(b" ")
+        h.wfile.flush()
+        release.wait(10)
+
+    srv.routes[A] = slow_then_stall
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(v.FetchError) as ei:
+            v.fetch_and_verify(srv.url, JOB, keys=pinned, timeout=1.0)
+    finally:
+        release.set()
+    elapsed = time.monotonic() - t0
+    assert ei.value.code == "timeout" and ei.value.retryable
+    assert elapsed < 1.6, elapsed                           # not ~0.8 + a fresh 1.0
+
+
+def test_trickled_headers_hit_the_total_deadline(srv, pinned):
+    """Each header byte arrives inside the socket timeout; the total budget still ends it."""
+    release = threading.Event()
+
+    def trickle_headers(h):
+        h.wfile.write(b"HTTP/1.1 200 OK\r\n")
+        for _ in range(100):
+            if release.wait(0.1):
+                return
+            try:
+                h.wfile.write(b"X")
+                h.wfile.flush()
+            except OSError:
+                return
+
+    srv.routes[A] = trickle_headers
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(v.FetchError) as ei:
+            v.fetch_and_verify(srv.url, JOB, keys=pinned, timeout=0.5)
+    finally:
+        release.set()
+    assert ei.value.code == "timeout" and ei.value.retryable
+    assert time.monotonic() - t0 < 1.5
+
+
+def test_a_body_cut_by_the_deadline_is_a_timeout_not_a_short_body(srv, pinned):
+    """A close-delimited body (no Content-Length, no chunking) interrupted at the deadline reads
+    as EOF; it must be reported as a timeout, never parsed as a complete body."""
+    release = threading.Event()
+
+    def close_delimited(h):
+        h.protocol_version = "HTTP/1.0"
+        h.send_response(200)
+        h.end_headers()
+        h.wfile.write(b'{"attestation": ')
+        h.wfile.flush()
+        release.wait(10)
+
+    srv.routes[A] = close_delimited
+    try:
+        with pytest.raises(v.FetchError) as ei:
+            v.fetch_and_verify(srv.url, JOB, keys=pinned, timeout=0.5)
+    finally:
+        release.set()
+    assert ei.value.code == "timeout"
+
+
+def test_a_stalled_connect_phase_is_a_timeout(srv, pinned):
+    """No response at all within the budget is code timeout (retryable), not network."""
+    release = threading.Event()
+    srv.routes[A] = lambda h: release.wait(5)
+    try:
+        with pytest.raises(v.FetchError) as ei:
+            v.fetch_and_verify(srv.url, JOB, keys=pinned, timeout=0.3)
+    finally:
+        release.set()
+    assert ei.value.code == "timeout" and ei.value.retryable
+
+
 def test_connection_refused_is_retryable(pinned):
     import socket
     s = socket.socket()
@@ -269,11 +409,30 @@ def test_connection_refused_is_retryable(pinned):
 
 @pytest.mark.parametrize("url", [
     "file:///etc", "ftp://h/", "h:8000", "http://", "http://u:p@h/", "http://h/?q=1",
-    "http://h/#f", "javascript:alert(1)",
+    "http://h/#f", "javascript:alert(1)", "http://h:abc", "http://h:70000", "http://h:65536",
+    "http://h:0", "http://h:-1", "http://h:+80", "https://[::1]:99999",
 ])
 def test_only_plain_http_and_https_base_urls(pinned, url):
     with pytest.raises(ValueError):
         v.fetch_and_verify(url, JOB, keys=pinned)
+
+
+@pytest.mark.parametrize("url", ["http://127.0.0.1:abc", "http://127.0.0.1:70000",
+                                 "http://127.0.0.1:0"])
+def test_an_invalid_port_is_a_usage_error_before_any_request(url, pinned, monkeypatch):
+    """A malformed port is a ValueError up front, never a (retryable) network/http error."""
+    def no_request(*a, **kw):
+        raise AssertionError("a request was issued for an invalid URL")
+
+    monkeypatch.setattr(v, "_get", no_request)
+    with pytest.raises(ValueError, match="port"):
+        v.fetch_and_verify(url, JOB, keys=pinned)
+
+
+def test_valid_ports_still_work(srv, key, pinned):
+    srv.routes[A] = (200, _receipt(key), {})
+    srv.routes[M] = (200, METADATA, {})
+    assert v.fetch_and_verify(srv.url, JOB, keys=pinned).metadata == METADATA
 
 
 @pytest.mark.parametrize("job_id", [

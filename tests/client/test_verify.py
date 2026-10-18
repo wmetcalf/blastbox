@@ -2,16 +2,17 @@
 every way it can be wrong."""
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
-from blastbox.attest_wire import VerifyKey, canonical
+from blastbox.attest_wire import VerifyKey, canonical, signature_valid
 from blastbox.client import verify as v
 from blastbox.host import attest
 
@@ -534,6 +535,44 @@ def _pem(pub) -> str:
 def test_a_key_that_is_not_P256_is_refused(make):
     with pytest.raises(v.VerifyKeyRefused):
         v.load_pinned_keys(make())
+
+
+class _P384Signer:
+    """An attest-key look-alike on P-384: signs ECDSA/SHA-256 over the canonical doc."""
+
+    def __init__(self):
+        self.private_key = ec.generate_private_key(ec.SECP384R1())
+
+    def sign(self, doc):
+        der = self.private_key.sign(canonical(doc), ec.ECDSA(hashes.SHA256()))
+        return base64.urlsafe_b64encode(der).decode()
+
+
+def test_a_programmatic_non_P256_verify_key_is_refused():
+    """The PEM path refuses P-384; the programmatic constructors must too, or a P-384
+    ECDSA/SHA-256 signature would verify under a receipt claiming ES256."""
+    signer = _P384Signer()
+    with pytest.raises(v.VerifyKeyRefused, match="P-256"):
+        VerifyKey(signer.private_key.public_key())
+    with pytest.raises(v.VerifyKeyRefused, match="P-256"):
+        VerifyKey.from_attest_key(signer)
+    with pytest.raises(v.VerifyKeyRefused, match="P-256"):
+        VerifyKey("not a key")  # type: ignore[arg-type]
+
+
+def test_pinning_a_mutated_non_P256_verify_key_is_refused(key):
+    """Even a VerifyKey forced onto P-384 after construction cannot be pinned, and the wire
+    check itself says no for a non-P-256 key."""
+    signer = _P384Signer()
+    vk = VerifyKey(key.private_key.public_key())
+    object.__setattr__(vk, "public_key", signer.private_key.public_key())
+    with pytest.raises(v.VerifyKeyRefused, match="P-256"):
+        v.PinnedKeys([vk])
+    with pytest.raises(v.VerifyKeyRefused, match="P-256"):
+        v.verify_receipt(b"{}", keys=vk, expect_job_id=JOB)
+    doc = _doc(key)
+    der = base64.urlsafe_b64decode(signer.sign(doc))
+    assert not signature_valid(signer.private_key.public_key(), doc, der)
 
 
 def test_two_pem_blocks_in_one_source_are_refused(key, other_key):

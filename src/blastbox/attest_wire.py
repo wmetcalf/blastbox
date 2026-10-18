@@ -16,7 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, TypeGuard
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -73,12 +73,28 @@ class _HasPrivateKey(Protocol):
     def private_key(self) -> ec.EllipticCurvePrivateKey: ...
 
 
+def is_p256_public_key(public_key: object) -> TypeGuard[ec.EllipticCurvePublicKey]:
+    """Whether ``public_key`` is an EC public key on P-256 -- the only curve ES256 names."""
+    return (isinstance(public_key, ec.EllipticCurvePublicKey)
+            and isinstance(public_key.curve, ec.SECP256R1))
+
+
+def _require_p256(public_key: object, source: str) -> None:
+    if not is_p256_public_key(public_key):
+        raise VerifyKeyRefused(f"{source}: not an EC P-256 public key (alg is fixed at {ALG})")
+
+
 @dataclass(frozen=True)
 class VerifyKey:
     """The PUBLIC half of an attest key: verifies receipts, cannot sign. What a host that does
     not hold a node's private key (the control plane) checks that node's receipts with."""
 
     public_key: ec.EllipticCurvePublicKey
+
+    def __post_init__(self) -> None:
+        # Every constructor (parse, from_attest_key, a direct VerifyKey(...)) lands here, so no
+        # path can pin a key the fixed ES256 alg does not name. Explicit, never an assert.
+        _require_p256(self.public_key, "verify key")
 
     @property
     def key_id(self) -> str:
@@ -122,7 +138,7 @@ class VerifyKey:
             pub = serialization.load_pem_public_key(text)
         except (ValueError, TypeError) as exc:
             raise VerifyKeyRefused(f"{source}: not a readable PEM public key") from exc
-        if not isinstance(pub, ec.EllipticCurvePublicKey) or pub.curve.name != "secp256r1":
+        if not is_p256_public_key(pub):
             raise VerifyKeyRefused(f"{source}: not an EC P-256 public key (alg is fixed at {ALG})")
         key = cls(pub)
         if "alg" in stated and stated["alg"] != ALG:
@@ -140,7 +156,10 @@ class VerifyKey:
 
 def signature_valid(public_key: ec.EllipticCurvePublicKey, doc: object, der: bytes) -> bool:
     """Whether ``der`` is a valid ES256 signature by ``public_key`` over ``canonical(doc)``.
-    False for anything short of a clean verify -- including a ``doc`` canonical() refuses."""
+    False for anything short of a clean verify -- including a ``doc`` canonical() refuses, and
+    any key that is not P-256 (ES256 is ECDSA over P-256 only; another curve is "no")."""
+    if not is_p256_public_key(public_key):
+        return False
     try:
         public_key.verify(der, canonical(doc), ec.ECDSA(hashes.SHA256()))
     except Exception:  # noqa: BLE001 - anything short of a clean verify is "no"
