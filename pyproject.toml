@@ -52,6 +52,12 @@ host = [
     "pyzipper>=0.3.6",            # AES-256 result ZIPs (the 'infected' malware-handling convention)
     "cryptography>=42",           # worker-mTLS PKI: blastbox.host.pki (CA + cert issuance)
 ]
+# Client-side receipt verification (blastbox.client.verify, `blastbox attest verify`) for a
+# consumer of an ingress: verifies a job's signed execution receipt against pinned dispatcher
+# keys. Only `cryptography` -- never the host stack.
+verify = [
+    "cryptography>=42",
+]
 # Object-storage backend (MinIO / AWS S3) for multi-node deployments. NOT required
 # by `blastbox[host]`: BLASTBOX_BLOB_URL unset uses the local filesystem and never
 # imports boto3.
