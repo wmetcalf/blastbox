@@ -1003,3 +1003,48 @@ def test_macos_coexists_with_other_vpns_unless_the_endpoint_route_uses_one(node,
     n.mac_route_dev = "en0"                     # VPN still up elsewhere; endpoint via en0
     notes = link.join(_bundle(tmp_path, csr))
     assert any("underlay route to the endpoint 192.0.2.10: via en0" in x for x in notes)
+
+
+# ------------------------------------------------------------------ review round 5
+
+def test_linux_leave_of_another_name_never_strips_the_installed_links_firewall(node, tmp_path):
+    """REGRESSION (review): `leave --iface <other>` (a typo) only checked that <other> was
+    down, then removed the NODE-WIDE nft table and units -- the installed link stayed up,
+    its wg-quick unit enabled, with no worker-side firewall. Refused before anything runs."""
+    n = node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    link.keygen("wtwg1", "10.79.0.5")              # even with a keygen record for the typo
+    loaded = n.loaded
+    n.calls.clear()
+    with pytest.raises(RuntimeError, match="worker-link on this node is wtwg0, not wtwg1"):
+        link.leave("wtwg1")
+    assert n.calls == []
+    assert n.loaded == loaded and link.FW_UNIT.exists() and link.FW_FILE.exists()
+    assert "wtwg0" in n.links
+    link.leave("wtwg0")                             # the installed one: proceeds
+    assert n.loaded is None and "wtwg0" not in n.links
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_leave_never_takes_down_an_interface_worker_link_did_not_create(node, platform):
+    """The same sweep, both platforms: `leave --iface wg0` on a node where worker-link never
+    made wg0 (the operator's own VPN) ran `wg-quick down wg0` / `systemctl disable --now
+    wg-quick@wg0`, and on macOS booted out and flushed the anchor/label derived from it."""
+    n = node(platform)
+    with pytest.raises(RuntimeError, match="no worker-link was set up on wg0"):
+        link.leave("wg0")
+    assert n.calls == []
+
+
+def test_macos_leave_of_another_name_touches_no_label_anchor_or_tunnel(node, tmp_path):
+    n = node("darwin")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    n.calls.clear()
+    with pytest.raises(RuntimeError, match="no worker-link was set up on wtwg1"):
+        link.leave("wtwg1")
+    assert n.calls == []
+    assert link._paths("wtwg0")["plist"].exists()
+    notes = link.leave("wtwg0")
+    assert any("LaunchDaemon" in x and "unloaded" in x for x in notes)

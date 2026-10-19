@@ -660,6 +660,19 @@ def test_status_teardown_list_and_remove_recover_without_the_env_file(host, pki,
     assert "wtwg3" not in host.links and host.loaded is None and not wla.FW_UNIT.exists()
 
 
+def test_status_for_a_name_that_is_not_installed_says_so_and_is_never_ok(host, monkeypatch):
+    """Sweep (review round 5): a status for an interface other than the installed one compared
+    the node-wide firewall against the wrong interface and described a link that does not
+    exist. It now names the installed link and is never OK."""
+    host.dump = "PRIV\tPUB\t51822\toff\n"
+    wla.init_host(_cfg())
+    ok, _rows = wla.status(_cfg())
+    assert ok
+    monkeypatch.setenv("BLASTBOX_WORKER_LINK_IF", "wtwg9")
+    ok, rows = wla.status(wla.load_config())
+    assert not ok and "installed on wtwg0, not wtwg9" in rows[0]
+
+
 # ----------------------------------------------------------------------------- status
 
 def _dump(*peers) -> str:

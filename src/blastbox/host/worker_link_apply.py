@@ -770,6 +770,15 @@ def status(cfg: WorkerLinkConfig, *, now: float | None = None) -> tuple[bool, li
     from blastbox.host.exit_attest import parse_wg_dump
 
     rows: list[str] = []
+    # A status for an interface that is not the installed one (a BLASTBOX_WORKER_LINK_IF /
+    # --iface override, a typo) would compare the node-wide firewall against the wrong
+    # interface and report on a link that does not exist. Say which one IS installed.
+    installed = _installed_ifaces()
+    foreign = bool(installed) and cfg.wg_iface not in installed
+    if foreign:
+        rows.append(f"WARNING: worker-link is installed on {', '.join(sorted(installed))}, not "
+                    f"{cfg.wg_iface}; this status describes {cfg.wg_iface} (unset "
+                    "BLASTBOX_WORKER_LINK_IF / drop --iface to see the installed link)")
     recovered = not ENV_FILE.exists()
     if recovered:
         rows.append(f"WARNING: {ENV_FILE} is MISSING; showing the link recovered from its "
@@ -819,7 +828,7 @@ def status(cfg: WorkerLinkConfig, *, now: float | None = None) -> tuple[bool, li
         for w in workers:
             if w["public_key"] not in seen:
                 rows.append(f"  {w['name']} {w['ip']}: registered but NOT on the live interface")
-    ok = bool(up) and fw is True and observed is not None
+    ok = bool(up) and fw is True and observed is not None and not foreign
     return ok, rows
 
 

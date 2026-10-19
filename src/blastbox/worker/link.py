@@ -1260,6 +1260,41 @@ def status(iface: str = DEFAULT_IFACE) -> tuple[bool, list[str]]:
     return bool(dump_if) and fresh and fw is True, rows
 
 
+def _refuse_leaving_what_is_not_ours(iface: str, plat: str) -> None:
+    """Raise unless ``iface`` is a link worker-link set up here -- checked BEFORE ``leave``
+    touches anything.
+
+    ``leave`` stops ``wg-quick@<iface>`` / runs ``wg-quick down <iface>`` and then removes
+    firewall state. Two ways a mistyped ``--iface`` did damage:
+
+    * Linux: the nft table, ruleset file and firewall units are NODE-WIDE. Leaving another
+      name (merely confirmed down) removed the firewall of the link that IS installed, which
+      stayed up -- its wg-quick unit still enabled -- with no worker-side firewall.
+    * Either platform: a name worker-link never created (``wg0``, the operator's own VPN) was
+      taken down. The pf anchor and LaunchDaemon label on macOS are derived from the name, so
+      they are ours exactly when the name is.
+
+    Ours means: this node's keygen record for ``iface`` (``join`` requires it), its
+    LaunchDaemon plist (macOS), or the installed Linux link itself.
+    """
+    p = _paths(iface)
+    installed = _installed_linux_links() if plat == "linux" else set()
+    if plat == "linux" and installed and iface not in installed:
+        other = sorted(installed)
+        raise RuntimeError(
+            f"the worker-link on this node is {', '.join(other)}, not {iface}: refusing to "
+            f"leave. Its firewall is node-wide, so leaving {iface} would strip it from the "
+            f"running link. Did you mean `leave --iface {other[0]}`?")
+    ours = (p["state"].exists() or iface in installed
+            or (plat == "darwin" and p["plist"].exists()))
+    if not ours:
+        raise RuntimeError(
+            f"no worker-link was set up on {iface} here (no keygen record"
+            + (", no LaunchDaemon" if plat == "darwin" else "")
+            + "); refusing to take down an interface worker-link did not create. Check "
+            "--iface: it must be the name given to `worker-link keygen` / `join`.")
+
+
 def leave(iface: str = DEFAULT_IFACE, *, purge: bool = False) -> list[str]:
     """Take the link down and remove what ``join`` installed. The tunnel goes down BEFORE the
     firewall is removed. Keys and TLS material stay unless ``purge``."""
@@ -1267,6 +1302,7 @@ def leave(iface: str = DEFAULT_IFACE, *, purge: bool = False) -> list[str]:
     plat = _supported_platform()
     iface = _link_iface(iface)
     p = _paths(iface)
+    _refuse_leaving_what_is_not_ours(iface, plat)
     notes: list[str] = []
     if plat == "darwin":
         label = label_for(iface)
