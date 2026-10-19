@@ -971,13 +971,52 @@ def conf_lock(cfg: WgInterface) -> Iterator[None]:
         os.close(fd)
 
 
-def _write_conf(path: Path, content: str) -> None:
-    old = os.umask(0o077)
+def atomic_write(path: Path, data: "str | bytes", mode: int = 0o600) -> None:
+    """Replace ``path`` with ``data`` ATOMICALLY and durably, created with ``mode``.
+
+    ``write_text`` truncates then writes: an interrupt (Ctrl-C, OOM, power) leaves an empty or
+    half-written file where a complete one was -- for an interface config, a firewall unit or
+    an install record, the very file a later command needs to recover. Instead: a fresh temp
+    file in the SAME directory (so the rename cannot cross filesystems), the mode set on its
+    descriptor before any byte is written, fsync, ``rename`` over the target (atomic: readers
+    see the old file or the new one, never a mix), then fsync the directory so the rename
+    itself survives a crash."""
+    import tempfile
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
     try:
-        path.write_text(content)
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data if isinstance(data, bytes) else data.encode())
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+    fsync_dir(path.parent)
+
+
+def fsync_dir(path: Path) -> None:
+    """fsync a directory so a rename/unlink in it is durable (best effort where unsupported)."""
+    try:
+        dfd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dfd)
+    except OSError:
+        pass
     finally:
-        os.umask(old)
-    os.chmod(path, 0o600)
+        os.close(dfd)
+
+
+def _write_conf(path: Path, content: str) -> None:
+    atomic_write(path, content, 0o600)
 
 
 def ensure_rt_table(cfg: EgressConfig) -> None:

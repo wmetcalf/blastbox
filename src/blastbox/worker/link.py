@@ -221,6 +221,62 @@ def _write_atomic(path: Path, data: str | bytes, mode: int) -> None:
         except FileNotFoundError:
             pass
         raise
+    _fsync_dir(path.parent)
+
+
+def _fsync_dir(path: Path) -> None:
+    """fsync a directory so a rename into it survives a crash (best effort)."""
+    try:
+        dfd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dfd)
+    except OSError:
+        pass
+    finally:
+        os.close(dfd)
+
+
+def _replace_durably(src: Path, dst: Path) -> None:
+    """fsync ``src``, rename it over ``dst``, fsync the directory: the rename is atomic, and
+    neither the file's bytes nor the rename are lost to a crash."""
+    fd = os.open(src, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(src, dst)
+    _fsync_dir(dst.parent)
+
+
+def _lock_path() -> Path:
+    """The worker's node-wide lock (resolved at CALL time, so it follows STATE_DIR)."""
+    return STATE_DIR.parent / ".worker-link-peer.lock"
+
+
+def _node_locked(fn):  # type: ignore[no-untyped-def]
+    """Hold ONE node-wide exclusive lock across keygen / join / leave.
+
+    Each of them reads state, checks it, then rewrites keys, configs, the firewall and the
+    service units: two overlapping runs (a re-join racing a leave, two joins) could interleave
+    those steps and leave a link up under another run's firewall, or a firewall removed under a
+    link the other run just brought up. ``flock``: released if the process dies."""
+    import fcntl
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):  # type: ignore[no-untyped-def]
+        path = _lock_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            return fn(*args, **kwargs)
+        finally:
+            os.close(fd)
+
+    return wrapper
 
 
 def _write_private(path: Path, data: str) -> None:
@@ -637,6 +693,7 @@ def _wg_pubkey(wg: str, private: str) -> str:
     return proc.stdout.strip()
 
 
+@_node_locked
 def keygen(iface: str, ip: str, *, rotate: bool = False) -> tuple[str, str, list[str]]:
     """Make (or reuse) this worker's WireGuard key, TLS key and a CSR for ``ip``.
 
@@ -684,7 +741,7 @@ def keygen(iface: str, ip: str, *, rotate: bool = False) -> tuple[str, str, list
             if proc.returncode != 0 or not tmp.exists():
                 raise RuntimeError("openssl could not generate the TLS key")
             os.chmod(tmp, 0o600)
-            os.replace(tmp, p["tls_key"])
+            _replace_durably(tmp, p["tls_key"])
         notes.append(f"TLS key generated ({p['tls_key']}, 0600)")
     else:
         os.chmod(p["tls_key"], 0o600)
@@ -974,7 +1031,7 @@ def _apply_linux(bundle: JoinBundle, p: dict[str, Path], wg: str) -> list[str]:
         tmp.unlink(missing_ok=True)
         tail = (proc.stderr or "").strip().splitlines()[-1:] or ["no detail"]
         raise RuntimeError(f"nft refused the worker ruleset: {tail[0]}")
-    os.replace(tmp, FW_FILE)
+    _replace_durably(tmp, FW_FILE)
     expected = worker_firewall_nft(iface=bundle.iface, worker_ip=bundle.worker_ip,
                                    host_ip=bundle.host_ip, agent_port=bundle.agent_port)
     listing = _run([nft, "list", "table", "inet", NFT_TABLE])
@@ -1105,6 +1162,7 @@ def _real_iface_darwin(iface: str) -> str | None:
     return real if re.fullmatch(r"utun[0-9]{1,3}", real) else None
 
 
+@_node_locked
 def join(bundle_text: str, *, agent_user: str | None = None) -> list[str]:
     """Install the bundle the host's ``add`` printed and bring the link up. Idempotent.
 
@@ -1138,8 +1196,8 @@ def join(bundle_text: str, *, agent_user: str | None = None) -> list[str]:
         cert_t.write_text(bundle.cert_pem)
         ca_t.write_text(bundle.ca_pem)
         verify_cert(openssl, cert=cert_t, ca=ca_t, key=p["tls_key"], ip=bundle.worker_ip)
-        os.replace(cert_t, p["cert"])
-        os.replace(ca_t, p["ca"])
+        _replace_durably(cert_t, p["cert"])
+        _replace_durably(ca_t, p["ca"])
     for f in (p["cert"], p["ca"]):
         os.chmod(f, 0o644)
     notes = [*pre, f"certificate for {bundle.worker_ip} verified and installed"]
@@ -1351,6 +1409,7 @@ def _refuse_leaving_what_is_not_ours(iface: str, plat: str) -> None:
             "interface it did not bring up. Check --iface.")
 
 
+@_node_locked
 def leave(iface: str = DEFAULT_IFACE, *, purge: bool = False) -> list[str]:
     """Take the link down and remove what ``join`` installed. The tunnel goes down BEFORE the
     firewall is removed. Keys and TLS material stay unless ``purge``."""

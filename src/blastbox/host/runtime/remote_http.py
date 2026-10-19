@@ -10,10 +10,13 @@ Plugs into `VmJobDispatcher(validate=...)` (or a pool_manager-style claim loop) 
 
 from __future__ import annotations
 
+import contextlib
+import http.client
 import io
 import json
 import logging
 import os
+import socket
 import ssl
 import threading
 import time
@@ -54,6 +57,63 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+#: Per-thread list the worker transport's connections register their sockets in, so a caller
+#: that gives up on an exchange (:func:`_open_bounded`) can END its I/O, not just stop waiting.
+_IO_REGISTRY = threading.local()
+
+
+def _track(sock: Any) -> None:
+    lst = getattr(_IO_REGISTRY, "socks", None)
+    if lst is not None:
+        lst.append(sock)
+
+
+class _TrackedHTTPConnection(http.client.HTTPConnection):
+    def connect(self) -> None:
+        super().connect()
+        _track(self.sock)
+
+
+class _TrackedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPSConnection whose sockets are registered BEFORE the TLS handshake, so a worker that
+    stalls or trickles the handshake can be cut off too (the handshake is run explicitly)."""
+
+    def connect(self) -> None:
+        http.client.HTTPConnection.connect(self)
+        _track(self.sock)
+        host = self._tunnel_host or self.host  # type: ignore[attr-defined]
+        ctx = self._context  # type: ignore[attr-defined]
+        self.sock = ctx.wrap_socket(self.sock, server_hostname=host,
+                                    do_handshake_on_connect=False)
+        _track(self.sock)
+        self.sock.do_handshake()
+
+
+class _TrackedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req: Any) -> Any:
+        return self.do_open(_TrackedHTTPConnection, req)
+
+
+class _TrackedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req: Any) -> Any:
+        return self.do_open(_TrackedHTTPSConnection, req,
+                            context=self._context)  # type: ignore[attr-defined]
+
+
+def _abort_io(socks: list) -> None:
+    """End in-flight I/O on ``socks`` from ANOTHER thread: ``shutdown`` wakes a thread blocked
+    in recv/send on them (it returns or raises at once), ``close`` releases the descriptor."""
+    for sk in socks:
+        try:
+            sk.shutdown(socket.SHUT_RDWR)
+        except (OSError, ValueError):
+            pass
+        try:
+            sk.close()
+        except (OSError, ValueError):
+            pass
+
+
 def _default_open(req: urllib.request.Request, timeout: float, context: ssl.SSLContext | None = None) -> Any:
     # build a fresh opener with redirects DISABLED (+ the caller's mTLS context for https workers) rather
     # than urlopen's default opener, which would auto-follow a worker's redirect and leak the auth headers.
@@ -61,9 +121,10 @@ def _default_open(req: urllib.request.Request, timeout: float, context: ssl.SSLC
     # private/direct-reach, and routing the /detonate body + X-aws-proxy-auth through an env proxy would
     # leak them in cleartext for http:// workers. (Worker EGRESS proxying is the netpolicy httpproxy driver
     # injected into the WORKER's env -- independent of this dispatcher-side transport opener.)
-    handlers: list[Any] = [_NoRedirect(), urllib.request.ProxyHandler({})]
-    if context is not None:
-        handlers.append(urllib.request.HTTPSHandler(context=context))
+    # The TRACKED handlers register each connection's socket (see _open_bounded); with no context
+    # the HTTPS handler builds urllib's own default one, exactly as the stock handler would.
+    handlers: list[Any] = [_NoRedirect(), urllib.request.ProxyHandler({}),
+                           _TrackedHTTPHandler(), _TrackedHTTPSHandler(context=context)]
     return urllib.request.build_opener(*handlers).open(req, timeout=timeout)  # noqa: S310 (url is host-built)
 
 
@@ -189,22 +250,38 @@ def _open_bounded(opener: Any, req: Any, timeout: float, context: Any, deadline:
     wall-clock ``deadline``, not just urllib's PER-OP socket timeout. A worker that slowly reads our request
     or trickles response headers would otherwise keep opener() blocked past the job budget while the daemon
     validate thread pins the claimed slot (the watchdog can fail the job but can't retire the slot). On
-    timeout raise RemoteReadTimeout so the caller's finally frees the slot promptly. The stuck opener runs
-    in a DAEMON thread so it never blocks process exit (a non-daemon executor thread with wait=False would)
-    and reaps on its own per-op socket timeout. HTTPError from opener (e.g. 409) is re-raised so the caller's
-    existing handling still fires."""
+    timeout raise RemoteReadTimeout so the caller's finally frees the slot promptly. HTTPError from opener
+    (e.g. 409) is re-raised so the caller's existing handling still fires.
+
+    GIVING UP MUST END THE I/O. The opener runs in a daemon thread, and merely abandoning it was a leak:
+    a worker trickling bytes faster than the per-op socket timeout keeps that thread (and its socket)
+    blocked forever, and the recurring /healthz and capability probes abandoned another one on every
+    tick until the dispatcher ran out of threads or descriptors. So the connection's sockets are
+    registered (``_TrackedHTTP(S)Connection``) and, on expiry, shut down and closed from here: the
+    blocked recv/send returns at once and the thread exits."""
     box: dict[str, Any] = {}
+    socks: list = []
 
     def _run() -> None:
+        _IO_REGISTRY.socks = socks
         try:
             box["resp"] = opener(req, timeout, context=context)
         except BaseException as exc:   # noqa: BLE001 -- surfaced to the caller below
             box["exc"] = exc
+        finally:
+            _IO_REGISTRY.socks = None
 
     t = threading.Thread(target=_run, name="bb-open", daemon=True)
     t.start()
     t.join(timeout=max(0.0, deadline - time.monotonic()))
     if t.is_alive():
+        if socks:
+            _abort_io(socks)
+            t.join(timeout=1.0)  # it returns promptly once its socket is shut down
+        resp = box.get("resp")
+        if resp is not None:     # finished in the window between the deadline and the abort
+            with contextlib.suppress(Exception):
+                resp.close()
         raise RemoteReadTimeout("remote opener (connect/send/headers) exceeded the wall-clock deadline")
     if "exc" in box:
         raise box["exc"]

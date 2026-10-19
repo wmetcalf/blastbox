@@ -48,6 +48,7 @@ class FakeHost:
         self.disable_fails = False
         self.addrs: dict[str, str] = {}               # iface -> LIVE "ip/prefix"
         self.restart_fails = False
+        self.nft_delete_fails = False
 
     def _up(self, iface: str) -> None:
         """A (re)start reads the interface's config file, as wg-quick does."""
@@ -75,7 +76,10 @@ class FakeHost:
             else:
                 out = self.loaded
         elif tool == "nft" and a[1:3] == ["delete", "table"]:
-            self.loaded = None
+            if self.nft_delete_fails:
+                rc, err = 1, "Error: Could not process rule: Device or resource busy"
+            else:
+                self.loaded = None
         elif a[:3] == ["ip", "link", "show"]:
             rc = 0 if a[3] in self.links else 1
         elif a[:5] == ["ip", "-j", "addr", "show", "dev"]:
@@ -742,6 +746,117 @@ def test_an_unverified_teardown_exits_non_zero(host, capsys):
     assert "STILL ENABLED" in capsys.readouterr().out
     host.disable_fails = False
     assert link.main(["teardown"]) == 0
+
+
+def _lock_is_held() -> bool:
+    """True if another holder has the node-wide install lock (a non-blocking try fails)."""
+    import fcntl
+
+    path = wla.ENV_FILE.with_name(".worker-link.lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def test_every_host_mutation_holds_one_node_wide_lock_end_to_end(host, pki, monkeypatch):
+    """REGRESSION (review): init loaded its firewall BEFORE taking conf_lock, so two inits
+    could interleave (B's firewall, A's interface, both "succeeding"), and an add could slip
+    between an init's compatibility check and its address change. One lock now spans the
+    whole of init / add / remove / teardown -- observed from inside each one's steps."""
+    seen: dict[str, bool] = {}
+
+    def spy(name, fn):
+        def wrapped(*a, **kw):
+            seen[name] = _lock_is_held()
+            return fn(*a, **kw)
+        return wrapped
+
+    monkeypatch.setattr(wla, "_refuse_incompatible_reinit",
+                        spy("init:checks", wla._refuse_incompatible_reinit))
+    monkeypatch.setattr(wla, "install_firewall", spy("init:firewall", wla.install_firewall))
+    monkeypatch.setattr(wla, "persist_config", spy("init:persist", wla.persist_config))
+    monkeypatch.setattr(wla, "_apply_peers", spy("add/remove:apply", wla._apply_peers))
+    monkeypatch.setattr(wla, "_nft_listing", spy("teardown:verify", wla._nft_listing))
+    cfg = _cfg()
+    wla.init_host(cfg)
+    wla.add_worker(cfg, "mac1", KEY_A, _csr(_ip("10.78.0.2")), pki_dir=pki)
+    wla.remove_worker(cfg, "mac1")
+    wla.teardown(cfg)
+    assert seen and all(seen.values()), seen
+    assert not _lock_is_held()                      # and released afterwards
+
+
+def test_teardown_keeps_its_recovery_records_until_the_table_is_gone(host):
+    """REGRESSION (review): a failed `nft delete table` was only a warning -- the env file and
+    firewall unit were deleted anyway, so a retry had nothing left to find the install by,
+    while the stale table kept filtering whatever later took that interface name."""
+    wla.init_host(_cfg())
+    host.nft_delete_fails = True
+    notes = wla.teardown(_cfg())
+    assert "still loaded" in notes[-1] and host.loaded is not None
+    assert wla.ENV_FILE.exists() and wla.FW_UNIT.exists()
+    assert wla._installed_ifaces() == {"wtwg0"}      # the retry can still find it
+    # a removal that cannot be VERIFIED (no permission to list nftables) keeps them too
+    host.nft_delete_fails = False
+    host.root = False
+    notes = wla.teardown(wla.load_config(recover=True))
+    assert "could not verify" in notes[-1]
+    assert wla.ENV_FILE.exists() and wla.FW_UNIT.exists()
+    host.root = True
+    wla.teardown(wla.load_config(recover=True))
+    assert host.loaded is None and not wla.ENV_FILE.exists() and not wla.FW_UNIT.exists()
+
+
+def test_an_interrupted_env_write_never_leaves_a_partial_record(host, monkeypatch):
+    """REGRESSION (review): ENV_FILE.write_text truncated the record in place, so a failure
+    mid-write left an empty or partial file where every recovery command looks."""
+    from pathlib import Path as _P
+
+    wla.init_host(_cfg())
+    good = wla.ENV_FILE.read_text()
+    real_write_text = _P.write_text
+
+    def torn_write_text(self, data, *a, **kw):
+        if self == wla.ENV_FILE:
+            real_write_text(self, data[:10])          # what an interrupted write leaves
+            raise OSError(28, "No space left on device")
+        return real_write_text(self, data, *a, **kw)
+
+    def failing_replace(src, dst):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(_P, "write_text", torn_write_text)
+    monkeypatch.setattr(ea.os, "replace", failing_replace)
+    with pytest.raises(OSError):
+        wla.persist_config(_cfg(agent_port=9443))
+    assert wla.ENV_FILE.read_text() == good
+    assert not [p for p in wla.ENV_FILE.parent.iterdir() if p.name.startswith(".worker-link.env.")]
+
+
+def test_recovery_commands_survive_a_garbled_env_file(host, pki, capsys):
+    """An env record that EXISTS but is empty or garbled (left by an older version, a hand
+    edit) no longer blocks status/list/remove/teardown: they recover from the install."""
+    from blastbox.worker import link
+
+    cfg = _cfg()
+    wla.init_host(cfg)
+    wla.add_worker(cfg, "mac1", KEY_A, _csr(_ip("10.78.0.2")), pki_dir=pki)
+    for garbage in ("", "BLASTBOX_WORKER_LINK_OVERLAY_NET=not-a-network\n"):
+        wla.ENV_FILE.write_text(garbage)
+        capsys.readouterr()
+        assert link.main(["status"]) == 1
+        assert "MISSING or unusable" in capsys.readouterr().out
+        assert link.main(["list"]) == 0 and "mac1" in capsys.readouterr().out
+    assert link.main(["teardown"]) == 0
+    assert host.loaded is None and not wla.ENV_FILE.exists()
 
 
 # ----------------------------------------------------------------------------- status

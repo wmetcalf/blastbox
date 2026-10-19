@@ -362,3 +362,63 @@ def test_a_trickled_refusal_body_does_not_hold_the_job_thread(monkeypatch):
     t0 = time.monotonic()
     assert remote_http._egress_refusal(exc) is False
     assert time.monotonic() - t0 < 1.5            # 4096 bytes x 0.02 s unbounded = 80 s
+
+
+# ------------------------------------------------------------------ review round 7
+
+def test_repeated_probes_against_a_trickling_worker_do_not_leak_threads():
+    """REGRESSION (review): a timed-out opener was only ABANDONED -- its daemon thread stayed
+    blocked in urllib for as long as the worker kept trickling bytes, so every recurring
+    /healthz or capability probe leaked another thread and socket. The deadline now shuts the
+    connection's socket down, so the opener thread returns."""
+    import socket
+    import threading
+    import time
+
+    from blastbox.host.runtime.aws_worker import _default_http_probe
+    from blastbox.host.runtime.static_pool import make_capability_probe
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(64)
+    stop = threading.Event()
+
+    def trickle(conn):
+        with conn:
+            try:
+                conn.recv(65536)
+                conn.sendall(b"HTTP/1.1 200 OK\r\n")
+                while not stop.is_set():          # a header that never ends, one byte at a time
+                    conn.sendall(b"X")
+                    time.sleep(0.02)
+            except OSError:
+                pass                              # the client cut us off: what we want
+
+    def serve():
+        srv.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                continue
+            threading.Thread(target=trickle, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=serve, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.getsockname()[1]}/healthz"
+    cap = make_capability_probe(None)
+
+    def openers() -> int:
+        return sum(1 for t in threading.enumerate() if t.name == "bb-open" and t.is_alive())
+
+    try:
+        base = openers()
+        for _ in range(8):
+            assert _default_http_probe(url, {}, 0.3) is False
+            assert cap(url, {}, 0.3) is None
+        deadline = time.monotonic() + 3.0
+        while openers() > base and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert openers() <= base, f"{openers() - base} opener threads leaked over 16 probes"
+    finally:
+        stop.set()
+        srv.close()

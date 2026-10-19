@@ -53,6 +53,40 @@ def _reassert_paths() -> tuple[Path, Path]:
 CERT_SUBDIR = "worker-link"
 
 
+def _lock_path() -> Path:
+    """The node-wide installation lock, beside the env file (resolved at CALL time)."""
+    return ENV_FILE.with_name(".worker-link.lock")
+
+
+def _installation_locked(fn):  # type: ignore[no-untyped-def]
+    """Run ``fn`` holding ONE node-wide exclusive lock for every host mutation (init, add,
+    remove, teardown).
+
+    ``conf_lock`` serialises only the interface-config read-modify-write. Each of these
+    commands also checks, installs and persists things OUTSIDE it -- compatibility checks,
+    the firewall, the unit files, the env record -- so two overlapping commands could
+    interleave: init B loads its firewall, init A then applies its interface and both report
+    success; or an ``add`` registers a worker after a concurrent init's compatibility check
+    saw none, and that init then moves the host address under it. One lock across the whole
+    command makes each one atomic with respect to the others. ``flock``: released by the
+    kernel if the process dies, never left stale."""
+    import fcntl
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):  # type: ignore[no-untyped-def]
+        path = _lock_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            return fn(*args, **kwargs)
+        finally:
+            os.close(fd)        # releases the lock
+
+    return wrapper
+
+
 class WorkerLinkNotInitialised(RuntimeError):
     """``init`` has not been run on this host (no persisted config / interface config)."""
 
@@ -99,10 +133,34 @@ def load_config(*, required: bool = True, recover: bool = False) -> WorkerLinkCo
     except OSError as exc:
         raise RuntimeError(f"cannot read {ENV_FILE}: {exc.strerror}") from None
     env = _parse_env(text)
-    if not env:
-        raise RuntimeError(f"{ENV_FILE} exists but holds no configuration")
+    try:
+        if not env:
+            raise ValueError(f"{ENV_FILE} exists but holds no configuration")
+        file_cfg = WorkerLinkConfig.from_env(env)
+    except ValueError as exc:
+        # Empty or garbled (an interrupted write by an older version, a hand edit): the
+        # commands that inspect or dismantle the install must still reach it.
+        if recover:
+            rec = recover_installed_config()
+            if rec is not None:
+                return rec
+        raise RuntimeError(str(exc) if not env else f"{ENV_FILE} is not usable: {exc}") from None
+    del file_cfg
     env.update({k: v for k, v in os.environ.items() if k.startswith("BLASTBOX_WORKER_LINK_")})
     return WorkerLinkConfig.from_env(env)
+
+
+def persisted_config_usable() -> bool:
+    """Whether the env record exists AND parses into a config (status uses this to say when
+    it is showing a recovered one)."""
+    env = _persisted_env()
+    if not env:
+        return False
+    try:
+        WorkerLinkConfig.from_env(env)
+    except ValueError:
+        return False
+    return True
 
 
 def recover_installed_config() -> WorkerLinkConfig | None:
@@ -126,12 +184,12 @@ def recover_installed_config() -> WorkerLinkConfig | None:
 
 
 def persist_config(cfg: WorkerLinkConfig) -> None:
-    ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
-    ENV_FILE.write_text("\n".join([
+    # Atomic (temp + fsync + rename): an interrupted write must never leave an empty or partial
+    # record where the install's recovery commands look for it.
+    ea.atomic_write(ENV_FILE, "\n".join([
         "# Written by `blastbox worker-link init`. Contains no key material by design.",
         *cfg.to_env_lines(), "",
-    ]))
-    os.chmod(ENV_FILE, 0o644)
+    ]), 0o644)
 
 
 # --------------------------------------------------------------------------------------
@@ -232,14 +290,14 @@ def install_firewall(cfg: WorkerLinkConfig) -> list[str]:
     # Loaded from a temp file and moved into place only once the kernel took it: the boot
     # unit loads FW_FILE, so a ruleset nft refuses must never replace the last good one.
     tmp = FW_FILE.with_name(FW_FILE.name + ".new")
-    tmp.write_text(host_firewall_nft(cfg))
-    os.chmod(tmp, 0o644)
+    ea.atomic_write(tmp, host_firewall_nft(cfg), 0o644)
     proc = ea._run([nft, "-f", str(tmp)], check=False)
     if proc.returncode != 0:
         tmp.unlink(missing_ok=True)
         tail = (proc.stderr or "").strip().splitlines()[-1:] or ["no detail"]
         raise RuntimeError(f"nft refused the worker-link ruleset: {tail[0]}")
     os.replace(tmp, FW_FILE)
+    ea.fsync_dir(FW_FILE.parent)
     state, why = firewall_status(cfg)
     if state is not True:
         raise RuntimeError(f"loaded the worker-link ruleset but it is not in force: {why}")
@@ -258,9 +316,7 @@ def install_firewall(cfg: WorkerLinkConfig) -> list[str]:
         changed = False
         for path, text in ((FW_UNIT, body), (_reassert_paths()[0], service), (_reassert_paths()[1], timer)):
             if not (path.exists() and path.read_text() == text):
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(text)
-                os.chmod(path, 0o644)
+                ea.atomic_write(path, text, 0o644)
                 changed = True
     except OSError as exc:
         raise RuntimeError(f"could not install the firewall units ({exc.strerror}); without "
@@ -510,12 +566,7 @@ def _reconcile_host_key(cfg: WorkerLinkConfig, *, rotate: bool) -> list[str]:
     if not on_disk and in_conf:
         ea.KEY_DIR.mkdir(parents=True, exist_ok=True)
         os.chmod(ea.KEY_DIR, 0o700)
-        old = os.umask(0o077)
-        try:
-            priv.write_text(in_conf + "\n")
-        finally:
-            os.umask(old)
-        os.chmod(priv, 0o600)
+        ea.atomic_write(priv, in_conf + "\n", 0o600)
         pub.unlink(missing_ok=True)          # ensure_keypair re-derives it from the private key
         return [f"NOTE: {priv} was missing; restored from {conf} (the key the link runs with), "
                 "so registered workers keep their bundles"]
@@ -533,6 +584,7 @@ def _reconcile_host_key(cfg: WorkerLinkConfig, *, rotate: bool) -> list[str]:
     return []
 
 
+@_installation_locked
 def init_host(cfg: WorkerLinkConfig, *, rotate_key: bool = False) -> tuple[str, list[str]]:
     """Stand up the host end. Idempotent. Returns ``(host public key, notes)``.
 
@@ -743,6 +795,7 @@ def _cert_expiry(cert_pem: bytes) -> str:
     return x509.load_pem_x509_certificate(cert_pem).not_valid_after_utc.isoformat()
 
 
+@_installation_locked
 def add_worker(cfg: WorkerLinkConfig, name: str, public_key: str, csr_pem: bytes, *,
                ip: str | None = None, days: int = 30,
                pki_dir: Path) -> tuple[JoinBundle, bool]:
@@ -822,8 +875,7 @@ def add_worker(cfg: WorkerLinkConfig, name: str, public_key: str, csr_pem: bytes
         _apply_peers(cfg, new_body)
     cert_dir = Path(pki_dir) / CERT_SUBDIR
     cert_dir.mkdir(parents=True, exist_ok=True)
-    (cert_dir / f"{name}.crt").write_bytes(cert_pem)
-    os.chmod(cert_dir / f"{name}.crt", 0o644)
+    ea.atomic_write(cert_dir / f"{name}.crt", cert_pem, 0o644)
     bundle = JoinBundle(name=name, iface=cfg.wg_iface, worker_ip=want, host_ip=cfg.host_ip,
                         overlay_net=cfg.overlay_net, endpoint=cfg.endpoint,
                         host_public_key=host_pub, agent_port=cfg.agent_port,
@@ -831,6 +883,7 @@ def add_worker(cfg: WorkerLinkConfig, name: str, public_key: str, csr_pem: bytes
     return bundle, changed
 
 
+@_installation_locked
 def remove_worker(cfg: WorkerLinkConfig, name: str, *, pki_dir: Path | None = None) -> bool:
     """Drop a worker from the live interface and the config. False if it was not registered.
 
@@ -891,9 +944,10 @@ def status(cfg: WorkerLinkConfig, *, now: float | None = None) -> tuple[bool, li
         rows.append(f"WARNING: worker-link is installed on {', '.join(sorted(installed))}, not "
                     f"{cfg.wg_iface}; this status describes {cfg.wg_iface} (unset "
                     "BLASTBOX_WORKER_LINK_IF / drop --iface to see the installed link)")
-    recovered = not ENV_FILE.exists()
+    recovered = not persisted_config_usable()
     if recovered:
-        rows.append(f"WARNING: {ENV_FILE} is MISSING; showing the link recovered from its "
+        rows.append(f"WARNING: {ENV_FILE} is MISSING or unusable; showing the link recovered "
+                    "from its "
                     "installed unit/config. Re-run `blastbox worker-link init` (same --iface, "
                     "--endpoint, --agent-port) to restore it, or `teardown` to remove it.")
     up = ea._ok(["ip", "link", "show", cfg.wg_iface])
@@ -944,6 +998,7 @@ def status(cfg: WorkerLinkConfig, *, now: float | None = None) -> tuple[bool, li
     return ok, rows
 
 
+@_installation_locked
 def teardown(cfg: WorkerLinkConfig) -> list[str]:
     """Remove only what ``init`` created: the interface, its unit, the firewall table, its
     unit and file, and the env file. Never an iptables chain, an ``ip rule``, a routing
@@ -986,19 +1041,31 @@ def teardown(cfg: WorkerLinkConfig) -> list[str]:
     ea._run(["systemctl", "disable", "--now", FW_UNIT_NAME], check=False)
     ea._run(["nft", "delete", "table", "inet", NFT_TABLE], check=False)
     listing, why = _nft_listing()
+    # The env file and the firewall boot unit are the RECOVERY RECORDS: _installed_ifaces()
+    # reads them to find this install again. Removing them while the table may still be
+    # loaded left a retry nothing to find -- and a stale table filtering whatever interface
+    # later takes that name. So they go only once the table is confirmed gone, and LAST.
     if listing is not None:
-        notes.append(f"WARNING: table inet {NFT_TABLE} is still loaded")
-    elif why == "table not loaded":
-        notes.append(f"table inet {NFT_TABLE} removed (no other table touched)")
-    else:
-        notes.append(f"WARNING: could not verify table inet {NFT_TABLE} was removed ({why})")
-    for path in (*_reassert_paths(), FW_UNIT, FW_FILE, ENV_FILE):
+        notes.append(f"WARNING: table inet {NFT_TABLE} is still loaded; {ENV_FILE} and "
+                     f"{FW_UNIT_NAME} are kept so teardown can be re-run")
+        return notes
+    if why != "table not loaded":
+        notes.append(f"WARNING: could not verify table inet {NFT_TABLE} was removed ({why}); "
+                     f"{ENV_FILE} and {FW_UNIT_NAME} are kept so teardown can be re-run")
+        return notes
+    notes.append(f"table inet {NFT_TABLE} removed (no other table touched)")
+    failed = False
+    for path in (*_reassert_paths(), FW_FILE, FW_UNIT, ENV_FILE):
+        if failed and path in (FW_UNIT, ENV_FILE):
+            break                   # keep the recovery records if anything before them stuck
         try:
             path.unlink()
         except FileNotFoundError:
             pass
         except OSError as exc:
+            failed = True
             notes.append(f"WARNING: could not remove {path} ({exc.strerror})")
+    ea.fsync_dir(ENV_FILE.parent)
     ea._run(["systemctl", "daemon-reload"], check=False)
     notes.append(f"kept {_conf(cfg)} (registered workers), keys in {ea.KEY_DIR}; a later "
                  "`init` restores them")

@@ -1159,3 +1159,44 @@ def test_purge_removes_the_keygen_directories_once_they_are_empty(node, tmp_path
     assert link._paths("wtwg1")["state"].exists()
     link.leave("wtwg1", purge=True)
     assert not link.STATE_DIR.exists() and not link.KEY_DIR.exists()
+
+
+# ------------------------------------------------------------------ review round 7
+
+def test_keygen_join_and_leave_hold_one_node_wide_lock(node, tmp_path, monkeypatch):
+    """Sweep (review round 7): keygen / join / leave each read state, check it and rewrite
+    keys, configs, the firewall and units; overlapping runs could interleave. One node-wide
+    lock spans each -- observed from inside their steps."""
+    import fcntl
+
+    def held() -> bool:
+        path = tmp_path / ".worker-link-peer.lock"     # STATE_DIR.parent in the fixture
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+        finally:
+            os.close(fd)
+
+    seen: dict[str, bool] = {}
+
+    def spy(name, fn):
+        def wrapped(*a, **kw):
+            seen[name] = held()
+            return fn(*a, **kw)
+        return wrapped
+
+    node("linux")
+    monkeypatch.setattr(link, "_wg_pubkey", spy("keygen/join", link._wg_pubkey))
+    monkeypatch.setattr(link, "_apply_linux", spy("join:apply", link._apply_linux))
+    monkeypatch.setattr(link, "_refuse_leaving_what_is_not_ours",
+                        spy("leave", link._refuse_leaving_what_is_not_ours))
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    link.leave("wtwg0")
+    assert len(seen) == 3 and all(seen.values()), seen
+    assert not held()
