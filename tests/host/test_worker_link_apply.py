@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime
 import ipaddress
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -45,6 +46,15 @@ class FakeHost:
         self.syncconf_fails = False
         self.enabled: set[str] = set()                 # unit names `systemctl enable`d
         self.disable_fails = False
+        self.addrs: dict[str, str] = {}               # iface -> LIVE "ip/prefix"
+        self.restart_fails = False
+
+    def _up(self, iface: str) -> None:
+        """A (re)start reads the interface's config file, as wg-quick does."""
+        self.links.add(iface)
+        for ln in (ea.WG_DIR / f"{iface}.conf").read_text().splitlines():
+            if ln.split("=")[0].strip() == "Address":
+                self.addrs[iface] = ln.split("=", 1)[1].strip()
 
     def run(self, argv, check: bool = True, capture: bool = True):
         a = [str(x) for x in argv]
@@ -68,14 +78,26 @@ class FakeHost:
             self.loaded = None
         elif a[:3] == ["ip", "link", "show"]:
             rc = 0 if a[3] in self.links else 1
+        elif a[:5] == ["ip", "-j", "addr", "show", "dev"]:
+            ip, _, plen = self.addrs.get(a[5], "/").partition("/")
+            out = json.dumps([{"ifname": a[5], "addr_info": [
+                {"family": "inet", "local": ip, "prefixlen": int(plen)}]}]
+                if a[5] in self.links and ip else [])
         elif a[:3] == ["ip", "-j", "route"] or a[:3] == ["ip", "-j", "addr"]:
             out = "[]"
+        elif a[:2] == ["systemctl", "restart"] and a[2].startswith("wg-quick@"):
+            if self.restart_fails:
+                rc, err = 1, "Job for wg-quick failed"
+            else:
+                self._up(a[2].split("@")[1])
+        elif a[:2] == ["wg-quick", "up"]:
+            self._up(a[2])
         elif a[:2] == ["systemctl", "is-enabled"]:
             rc = 0 if a[2] in self.enabled else 1
         elif a[:2] == ["systemctl", "enable"]:
             self.enabled.add(a[-1])
             if a[2] == "--now" and a[3].startswith("wg-quick@"):
-                self.links.add(a[3].split("@")[1])
+                self._up(a[3].split("@")[1])
         elif a[:2] == ["systemctl", "disable"] and self.disable_fails \
                 and a[-1].startswith("wg-quick@"):
             rc, err = 1, "Failed to disable unit"
@@ -566,6 +588,76 @@ def test_init_refuses_a_second_interface_when_the_env_file_is_gone(host):
     assert host.loaded == loaded and wla.FW_UNIT.read_text() == unit
     assert "wtwg1" not in host.links
     wla.init_host(_cfg())                                  # the installed one: fine
+
+
+def test_a_changed_address_on_a_live_link_needs_a_real_restart(host):
+    """REGRESSION (review): re-init with a new host address on a LIVE link went through
+    egress_apply.wg_up, which accepts a `wg-quick strip` + `wg syncconf` fallback when the
+    restart fails -- and the stripped config has no Address, so the interface kept the OLD
+    address while init persisted and reported the new one under a firewall for the new one."""
+    wla.init_host(_cfg())
+    assert host.addrs["wtwg0"] == "10.78.0.1/24"
+    host.restart_fails = True
+    with pytest.raises(RuntimeError, match="NOT running the new config"):
+        wla.init_host(_cfg(host_ip="10.78.0.7"))
+    assert host.addrs["wtwg0"] == "10.78.0.1/24"
+    assert not any(c[:2] == ["wg", "syncconf"] for c in host.calls)
+    assert "HOST_IP=10.78.0.7" not in wla.ENV_FILE.read_text()      # not persisted
+    host.restart_fails = False
+    wla.init_host(_cfg(host_ip="10.78.0.7"))
+    assert host.addrs["wtwg0"] == "10.78.0.7/24"
+    assert "HOST_IP=10.78.0.7" in wla.ENV_FILE.read_text()
+
+
+def test_init_checks_the_live_address_not_just_the_file(host):
+    """The file can be current while the interface is not (a restart that failed after the
+    file was written; a hand edit of the live address): init compares the KERNEL's address,
+    restarts to apply the config, and refuses to report success if it still differs."""
+    wla.init_host(_cfg())
+    host.addrs["wtwg0"] = "10.78.0.99/24"          # drifted under an unchanged file
+    host.calls.clear()
+    wla.init_host(_cfg())
+    assert ["systemctl", "restart", "wg-quick@wtwg0"] in host.calls
+    assert host.addrs["wtwg0"] == "10.78.0.1/24"
+    host.addrs["wtwg0"] = "10.78.0.99/24"
+    host.restart_fails = True
+    with pytest.raises(RuntimeError, match="NOT running the new config"):
+        wla.init_host(_cfg())
+    # and a restart that "succeeds" but leaves another address is still caught
+    real = host._up
+    host.restart_fails = False
+    host._up = lambda iface: (real(iface), host.addrs.__setitem__(iface, "10.78.0.99/24"))
+    with pytest.raises(RuntimeError, match="is up with 10.78.0.99/24, not 10.78.0.1/24"):
+        wla.init_host(_cfg())
+
+
+def test_status_teardown_list_and_remove_recover_without_the_env_file(host, pki, capsys):
+    """REGRESSION (review): with /etc/blastbox/worker-link.env deleted but the link and its
+    firewall unit still installed, `status` and `teardown` died loading the missing file --
+    and for a non-default interface there was no way to name it. They now recover the
+    installed config from the boot unit and the retained interface config."""
+    from blastbox.worker import link
+
+    cfg = _cfg(wg_iface="wtwg3", overlay_net="10.79.0.0/24")
+    wla.init_host(cfg)
+    wla.add_worker(cfg, "mac1", KEY_A, _csr(_ip("10.79.0.2")), pki_dir=pki)
+    wla.add_worker(cfg, "mac2", KEY_B, _csr(_ip("10.79.0.3")), pki_dir=pki)
+    wla.ENV_FILE.unlink()
+    capsys.readouterr()
+    assert link._role(type("A", (), {"role": None})()) == "host"     # the unit still says so
+    assert link.main(["status"]) == 1                                # never OK, but it RUNS
+    out = capsys.readouterr().out
+    assert "MISSING" in out and "interface wtwg3: up (10.79.0.1/24" in out
+    assert link.main(["list"]) == 0 and "mac1" in capsys.readouterr().out
+    assert link.main(["remove", "mac2", "--pki-dir", str(pki)]) == 0
+    assert set(host.live_peers["wtwg3"]) == {KEY_A}
+    csr = pki / "w.csr"
+    csr.write_bytes(_csr(_ip("10.79.0.4")))
+    assert link.main(["add", "mac3", "--public-key", KEY_B, "--csr", str(csr),
+                      "--pki-dir", str(pki)]) == 1                   # enrolment needs the file
+    assert "worker-link init" in capsys.readouterr().err
+    assert link.main(["teardown"]) == 0
+    assert "wtwg3" not in host.links and host.loaded is None and not wla.FW_UNIT.exists()
 
 
 # ----------------------------------------------------------------------------- status

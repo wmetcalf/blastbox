@@ -1325,13 +1325,21 @@ def _host_mod():
     return worker_link_apply
 
 
+#: Host actions that inspect or dismantle what is INSTALLED, and so must work from the
+#: installed unit/config when the env file is missing (see worker_link_apply.load_config).
+_RECOVERABLE_ACTIONS = frozenset({"status", "list", "remove", "teardown"})
+
+
 def _host_cfg(args: argparse.Namespace, *, base_required: bool):
     from dataclasses import replace
 
     from blastbox.host.worker_link import WorkerLinkConfig
 
     wla = _host_mod()
-    base = wla.load_config(required=base_required) or WorkerLinkConfig()
+    base = wla.load_config(
+        required=base_required,
+        recover=getattr(args, "worker_link_action", None) in _RECOVERABLE_ACTIONS,
+    ) or WorkerLinkConfig()
     over: dict[str, object] = {}
     for attr, field_name in (("iface", "wg_iface"), ("overlay_net", "overlay_net"),
                              ("host_ip", "host_ip"), ("port", "wg_port"),
@@ -1355,7 +1363,9 @@ def _role(args: argparse.Namespace) -> str:
         return str(args.role)
     try:
         from blastbox.host import worker_link_apply as wla
-        if wla.ENV_FILE.exists():
+        # The env file OR the host's firewall boot unit: with the file deleted, the installed
+        # unit still says this is a host (the worker's unit has a different name).
+        if wla.ENV_FILE.exists() or wla.FW_UNIT.exists():
             return "host"
     except ImportError:             # pragma: no cover - lean worker install
         pass

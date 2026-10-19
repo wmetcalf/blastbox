@@ -152,14 +152,21 @@ EGRESS_PLACEMENT_ERROR = (
     "/healthz advertises egress -- macOS workers never do")
 
 
-def _egress_refusal(exc: urllib.error.HTTPError) -> bool:
-    """Is this HTTP error the agent's ``egress_unavailable`` refusal? Reads a BOUNDED body: it
+#: Wall-clock cap on reading a worker's 422 refusal body (it is a few bytes of JSON).
+_REFUSAL_READ_S = 5.0
+
+
+def _egress_refusal(exc: urllib.error.HTTPError, deadline: float | None = None) -> bool:
+    """Is this HTTP error the agent's ``egress_unavailable`` refusal? Reads a BOUNDED body --
+    in size AND in wall-clock time (a worker trickling it must not hold the job's thread): it
     is worker-controlled, and only its ``error`` field is consulted."""
     if exc.code != 422:
         return False
+    limit_at = time.monotonic() + _REFUSAL_READ_S
     try:
-        body = json.loads(exc.read(4096) or b"{}")
-    except (ValueError, OSError, AttributeError):
+        raw = read_bounded(exc, 4096, limit_at if deadline is None else min(deadline, limit_at))
+        body = json.loads(raw or b"{}")
+    except (ValueError, OSError, AttributeError, RemoteOutputTooLarge, RemoteReadTimeout):
         return False
     return isinstance(body, dict) and body.get("error") == "egress_unavailable"
 
@@ -245,6 +252,36 @@ def _bounded_copy(src: Any, dst: Any, limit: int | None, deadline: float | None 
     return total
 
 
+def read_bounded(src: Any, limit: int, deadline: float) -> bytes:
+    """Read a WORKER-CONTROLLED body under both a byte cap and a TOTAL wall-clock ``deadline``.
+
+    ``resp.read(n)`` is bounded in size but not in time: the socket timeout only limits each
+    idle gap, so a worker sending one byte just inside it keeps the read going indefinitely.
+    Raises :class:`RemoteOutputTooLarge` past ``limit`` and :class:`RemoteReadTimeout` past the
+    deadline (same machinery as the job-output read, :func:`_bounded_copy`)."""
+    import io
+
+    buf = io.BytesIO()
+    _bounded_copy(src, buf, limit, deadline=deadline)
+    return buf.getvalue()
+
+
+def open_bounded_get(url: str, headers: dict, timeout: float,
+                     context: ssl.SSLContext | None = None) -> tuple[Any, float]:
+    """``(response, deadline)`` for a GET whose connect + request + status/headers phase is held
+    to ``timeout`` of WALL-CLOCK time in total (:func:`_open_bounded`), not per socket op. The
+    caller reads any body with :func:`read_bounded` against the same deadline, so the whole
+    exchange with a worker -- which may trickle bytes -- is bounded by ``timeout``."""
+    deadline = time.monotonic() + timeout
+    req = urllib.request.Request(url, headers=headers, method="GET")  # noqa: S310 (host-built url)
+
+    def _open(r: Any, t: float, context: ssl.SSLContext | None = None) -> Any:
+        # resolved at CALL time (a test may swap _default_open); no context -> the plain call shape
+        return _default_open(r, t) if context is None else _default_open(r, t, context=context)
+
+    return _open_bounded(_open, req, timeout, context, deadline), deadline
+
+
 def dispatch_ssl_context_from_env(get: Callable[[str], str | None] = os.environ.get) -> ssl.SSLContext | None:
     """Build the dispatcher's client (m)TLS context from env, or None if no CA is configured:
     ``BLASTBOX_DISPATCH_TLS_CA`` (verify workers) + optional ``_CERT``/``_KEY`` (present the client cert
@@ -278,13 +315,17 @@ def make_tls_probe(ssl_context: ssl.SSLContext | None) -> "Callable[[str, dict, 
     """A health-probe (``(url, headers, timeout) -> bool | None``; None = could not ask) that carries the client (m)TLS context, so a
     pool's ``/healthz`` check works against ``https://`` workers. Matches the ``HttpProbe`` seam shape."""
     def probe(url: str, headers: dict, timeout: float) -> "bool | None":
-        req = urllib.request.Request(url, headers=headers, method="GET")  # noqa: S310 (host-built url)
         try:
             # no-redirect opener: a worker answering /healthz with a 3xx must NOT be followed (it would
             # re-send X-aws-proxy-auth to the Location -- and on a downgrade to http:// the mTLS context
             # wouldn't apply, so the token would go out in the clear). A 3xx -> HTTPError -> False below.
-            with _default_open(req, timeout, context=ssl_context) as resp:
+            # ...and held to a WALL-CLOCK deadline (open_bounded_get): a worker trickling its
+            # status line / headers must not pin the pool's health tick past the probe timeout.
+            resp, _deadline = open_bounded_get(url, headers, timeout, ssl_context)
+            with resp:
                 return 200 <= resp.status < 300
+        except RemoteReadTimeout:
+            return False      # it answered, too slowly: a verdict, like a socket timeout
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
             # Same tri-state as _default_http_probe: None = we could not even ASK (local resource
             # exhaustion), False = the box answered and the answer was no. This probe is the DEFAULT
@@ -510,7 +551,7 @@ def detonate_remote(
             # Other 4xx/5xx are real failures and propagate.
             if exc.code == 409:
                 raise WorkerBusy(f"worker busy (409) at {url}") from exc
-            if _egress_refusal(exc):
+            if _egress_refusal(exc, read_deadline):
                 raise WorkerLacksEgress(f"worker at {url} cannot provide egress (422)") from exc
             raise
         with resp_cm as resp, tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024) as spool:

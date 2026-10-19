@@ -242,3 +242,123 @@ def test_an_all_static_cascade_that_can_never_place_egress_refuses_to_start():
                            Tier("static", _rt({"linux1": True}), 1)])
     _place_egress(ok, "cascade")
     assert ok._spawn_from_admitted().ip == "linux1"
+
+
+# ------------------------------------------------------------------ review round 4
+
+def test_a_health_unknown_worker_is_unknown_egress_capacity_not_a_no():
+    """REGRESSION (review): with one healthy `egress: false` worker and one whose health probe
+    could not even be ATTEMPTED (None: local EMFILE/ENOMEM), the second set no flag, so spawn
+    raised StaticPoolNoEgress -- a configuration FAULT, advancing cascade repair streaks -- as
+    though every worker had answered no."""
+    rt = _rt({"mac1": False, "linux1": True},
+             healthy=lambda url: None if "linux1" in url else True)
+    rt.require_egress()
+    with pytest.raises(StaticPoolExhausted):
+        rt.spawn()
+    # ...whereas a fleet that really did all answer "no" is still the loud fault
+    rt = _rt({"mac1": False, "mac2": False})
+    rt.require_egress()
+    with pytest.raises(StaticPoolNoEgress):
+        rt.spawn()
+
+
+def _trickle_server(chunks: "list[bytes]", gap: float):
+    """A one-request HTTP server that sends ``chunks`` with ``gap`` seconds between them --
+    each gap well inside a socket timeout, the total far beyond it."""
+    import socket
+    import threading
+    import time
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(4)
+    stop = threading.Event()
+
+    def serve():
+        srv.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                continue
+            with conn:
+                try:
+                    conn.recv(65536)
+                    for c in chunks:
+                        if stop.is_set():
+                            break
+                        conn.sendall(c)
+                        time.sleep(gap)
+                except OSError:
+                    pass
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    return f"http://127.0.0.1:{srv.getsockname()[1]}", stop, srv
+
+
+def test_a_trickled_capability_body_is_cut_off_by_a_wall_clock_deadline():
+    """REGRESSION (review): `resp.read(65536)` is bounded in size, not time -- the socket
+    timeout only limits each idle gap -- so a worker sending its /healthz body one byte at a
+    time kept the read (and the spawn thread calling it) going indefinitely."""
+    import time
+
+    from blastbox.host.runtime.static_pool import make_capability_probe
+
+    head = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4000\r\n\r\n"
+    url, stop, srv = _trickle_server([head] + [b" "] * 4000, gap=0.05)
+    try:
+        t0 = time.monotonic()
+        assert make_capability_probe(None)(url + "/healthz", {}, 0.5) is None
+        assert time.monotonic() - t0 < 2.0             # unbounded: 4000 x 0.05 s = 200 s
+    finally:
+        stop.set()
+        srv.close()
+
+
+@pytest.mark.parametrize("probe_name", ["plain", "tls-seam"])
+def test_a_trickled_health_answer_is_cut_off_too(probe_name):
+    """The same pattern in the /healthz HEALTH probes (status line + headers trickled): held to
+    the probe timeout of wall-clock time, and read as an answer that came too slowly (False)."""
+    import time
+
+    from blastbox.host.runtime.aws_worker import _default_http_probe
+    from blastbox.host.runtime.remote_http import make_tls_probe
+
+    status = b"HTTP/1.1 200 OK\r\n" + b"X-Pad: " + b"a" * 3000 + b"\r\n\r\n"
+    url, stop, srv = _trickle_server([status[i:i + 1] for i in range(len(status))], gap=0.05)
+    probe = _default_http_probe if probe_name == "plain" else make_tls_probe(None)
+    try:
+        t0 = time.monotonic()
+        assert probe(url + "/healthz", {}, 0.5) is False
+        assert time.monotonic() - t0 < 2.0
+    finally:
+        stop.set()
+        srv.close()
+
+
+def test_a_trickled_refusal_body_does_not_hold_the_job_thread(monkeypatch):
+    """The 422 refusal body is worker-controlled too: `exc.read(4096)` on a buffered stream
+    blocks until 4096 bytes arrive, however slowly they trickle."""
+    import io
+    import time
+    import urllib.error
+
+    from blastbox.host.runtime import remote_http
+
+    class Trickle(io.RawIOBase):
+        def readable(self):
+            return True
+
+        def readinto(self, b):
+            time.sleep(0.02)
+            b[0:1] = b" "
+            return 1
+
+    monkeypatch.setattr(remote_http, "_REFUSAL_READ_S", 0.3, raising=False)
+    exc = urllib.error.HTTPError("http://w/detonate", 422, "Unprocessable", {},
+                                 io.BufferedReader(Trickle(), buffer_size=1))
+    t0 = time.monotonic()
+    assert remote_http._egress_refusal(exc) is False
+    assert time.monotonic() - t0 < 1.5            # 4096 bytes x 0.02 s unbounded = 80 s

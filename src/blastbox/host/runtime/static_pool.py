@@ -88,18 +88,27 @@ def make_capability_probe(ssl_context: Any = None) -> CapabilityProbe:
     import http.client
     import json as _json
     import urllib.error
-    import urllib.request
 
     def probe(url: str, headers: dict[str, str], timeout: float) -> "dict[str, Any] | None":
-        from blastbox.host.runtime.remote_http import _default_open
+        from blastbox.host.runtime.remote_http import (
+            RemoteOutputTooLarge,
+            RemoteReadTimeout,
+            open_bounded_get,
+            read_bounded,
+        )
 
-        req = urllib.request.Request(url, headers=headers, method="GET")  # noqa: S310
         try:
-            with _default_open(req, timeout, context=ssl_context) as resp:
+            # The WHOLE exchange -- connect, headers, body -- is held to `timeout` of WALL-CLOCK
+            # time. resp.read(n) bounded only the size: the socket timeout limits each idle gap,
+            # so a worker trickling its body one byte at a time could pin a spawn thread forever.
+            resp, deadline = open_bounded_get(url, headers, timeout, ssl_context)
+            with resp:
                 if not 200 <= resp.status < 300:
                     return None
-                raw = resp.read(65536)
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError,
+                raw = read_bounded(resp, 65536, deadline)
+        except RemoteOutputTooLarge:
+            return {}          # it answered, with a body we will not parse: no advertisement
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError, RemoteReadTimeout,
                 http.client.HTTPException):
             # Down, refusing, not ready (a 503 is an HTTPError) or our own exhaustion: none of
             # those says what the box CAN do. Reading them as "no egress" made a fleet that was
@@ -436,6 +445,7 @@ class StaticPoolRuntime:
         saw_cooling = False
         saw_no_egress = False
         saw_egress_unknown = False
+        saw_health_unknown = False
         for idx in candidates:
             with self._lock:
                 cool = self._cooldown_until.get(idx, 0.0)
@@ -454,6 +464,10 @@ class StaticPoolRuntime:
                 # erroring control plane must never read as dead" invariant as issue #77.
                 if verdict is False:
                     saw_unhealthy = True
+                else:
+                    # Not attempted (local EMFILE/ENOMEM): its egress capability is therefore
+                    # UNKNOWN too, and must keep this from reading as "every worker said no".
+                    saw_health_unknown = True
                 _log.warning("static: worker[%d] %s, skipping for this claim",
                              idx, "unhealthy" if verdict is False else "health UNKNOWN")
                 continue
@@ -494,17 +508,19 @@ class StaticPoolRuntime:
             known_capable = any(v for i, v in self._egress_seen.items()
                                 if i not in self._burned_out)
         if (saw_no_egress and not saw_unhealthy and not saw_cooling
-                and not saw_egress_unknown and not known_capable):
+                and not saw_egress_unknown and not saw_health_unknown and not known_capable):
             raise StaticPoolNoEgress(
                 "no free static worker advertises egress, and this tier's net policy grants it "
                 "(macOS workers never do; a Linux agent may be running with "
                 "BLASTBOX_WORKER_AGENT_EGRESS=0)")
         if not saw_unhealthy:
-            # Every free worker was skipped ONLY for cooldown: routine backpressure, and it
-            # clears itself. Reporting a fault here would advance the pool's spawn-failure
-            # streak on every tick and could invalidate an unrelated snapshot base.
+            # Every free worker was skipped for cooldown, or because it could not even be ASKED
+            # (local resource exhaustion), or for an unanswered egress question: none of that is
+            # a verdict, all of it clears itself. Reporting a fault here would advance the pool's
+            # spawn-failure streak on every tick and could invalidate an unrelated snapshot base.
             raise StaticPoolExhausted(
-                "all free static workers are within dirty_cooldown_s (transient)"
+                "no free static worker is claimable right now (cooling down within "
+                "dirty_cooldown_s, or its health/egress could not be asked; transient)"
             )
         raise StaticPoolUnhealthy("no free static worker is currently healthy")
 

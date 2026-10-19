@@ -72,16 +72,26 @@ def _parse_env(text: str) -> dict[str, str]:
     return out
 
 
-def load_config(*, required: bool = True) -> WorkerLinkConfig | None:
+def load_config(*, required: bool = True, recover: bool = False) -> WorkerLinkConfig | None:
     """This host's persisted worker-link config, with ``BLASTBOX_WORKER_LINK_*`` overriding.
 
     Same precedence as the egress tier: the file is the base, an explicit environment value
     is unambiguous intent and wins. An EXISTING-but-empty file raises rather than falling
     back to defaults -- defaults would describe some other host's link.
+
+    ``recover``: for the actions that INSPECT or DISMANTLE what is installed (status, list,
+    remove, teardown), a missing env file is not the end of the road -- the link and its
+    firewall can still be installed (the file was deleted by hand, or a teardown died
+    half-way). Their configuration is then recovered from what IS on disk
+    (:func:`recover_installed_config`), so the operator can still see and remove it.
     """
     try:
         text = ENV_FILE.read_text()
     except FileNotFoundError:
+        if recover:
+            rec = recover_installed_config()
+            if rec is not None:
+                return rec
         if required:
             raise WorkerLinkNotInitialised(
                 f"{ENV_FILE} does not exist: run `blastbox worker-link init` first") from None
@@ -93,6 +103,26 @@ def load_config(*, required: bool = True) -> WorkerLinkConfig | None:
         raise RuntimeError(f"{ENV_FILE} exists but holds no configuration")
     env.update({k: v for k, v in os.environ.items() if k.startswith("BLASTBOX_WORKER_LINK_")})
     return WorkerLinkConfig.from_env(env)
+
+
+def recover_installed_config() -> WorkerLinkConfig | None:
+    """The installed link's config from the records that outlive the env file, or None.
+
+    The interface comes from the firewall boot unit (``RequiredBy=wg-quick@<iface>``) -- and
+    the env file when present, via :func:`_installed_ifaces`; address, overlay and listen port
+    from that interface's retained ``[Interface]``. The agent port, endpoint and dispatcher
+    sources live only in the env file, so they are the defaults here: good enough to inspect
+    and dismantle the link, never to enrol a worker (``add`` refuses without the file).
+    """
+    ifaces = _installed_ifaces()
+    if len(ifaces) != 1:
+        return None
+    base = WorkerLinkConfig(wg_iface=next(iter(ifaces)))
+    try:
+        body = _conf(base).read_text()
+    except OSError:
+        return base
+    return _retained_interface(base, body) or base
 
 
 def persist_config(cfg: WorkerLinkConfig) -> None:
@@ -428,8 +458,14 @@ def init_host(cfg: WorkerLinkConfig) -> tuple[str, list[str]]:
         # An idempotent re-run with the link already up and its config unchanged leaves the
         # interface alone: wg_up would RESTART it, forgetting every worker's learned endpoint.
         # A changed [Interface] (address, port) does need the restart, and gets it.
-        if rewritten or not ea._ok(["ip", "link", "show", cfg.wg_iface]):
+        if not ea._ok(["ip", "link", "show", cfg.wg_iface]):
             ea.wg_up(cfg)
+        elif rewritten or _live_addresses(cfg) != [f"{cfg.host_ip}/{cfg.prefixlen}"]:
+            # Also when the FILE is unchanged: a previous run may have written it and then
+            # failed to restart, leaving the interface on the old address -- a retry must apply
+            # it, not see "nothing changed".
+            _restart_link(cfg)
+        _verify_live_address(cfg)
     persist_config(cfg)
     notes.append(f"{cfg.wg_iface} up at {cfg.host_ip}/{cfg.prefixlen}, udp/{cfg.wg_port}")
     notes.append(f"config persisted to {ENV_FILE}")
@@ -442,6 +478,53 @@ def init_host(cfg: WorkerLinkConfig) -> tuple[str, list[str]]:
                      "(its connections are then MASQUERADEd to "
                      f"{cfg.host_ip}).")
     return pub, notes
+
+
+def _restart_link(cfg: WorkerLinkConfig) -> None:
+    """Bring a LIVE link down and up again from its (changed) config, or raise.
+
+    Not ``egress_apply.wg_up``: when the restart fails it accepts a ``wg-quick strip`` +
+    ``wg syncconf`` fallback, and the stripped config has no ``Address`` -- syncconf cannot
+    move the interface address or its route. A changed host address or overlay would then be
+    persisted and reported while the interface kept the old one, under a firewall loaded for
+    the new one. Only a real down/up applies it.
+    """
+    unit = f"wg-quick@{cfg.wg_iface}"
+    if ea._ok(["systemctl", "is-active", unit]):
+        proc = ea._run(["systemctl", "restart", unit], check=False)
+    else:
+        ea._run(["wg-quick", "down", cfg.wg_iface], check=False)
+        proc = ea._run(["wg-quick", "up", cfg.wg_iface], check=False)
+    if proc.returncode != 0:
+        tail = (proc.stderr or "").strip().splitlines()[-1:] or ["no detail"]
+        raise RuntimeError(f"could not restart {cfg.wg_iface} with its changed address/port "
+                           f"({tail[0]}); it is NOT running the new config")
+
+
+def _live_addresses(cfg: WorkerLinkConfig) -> list[str]:
+    """The IPv4 ``ip/prefix`` list the LIVE interface carries, read from the kernel."""
+    import json as _json
+
+    proc = ea._run(["ip", "-j", "addr", "show", "dev", cfg.wg_iface], check=False)
+    try:
+        info = _json.loads(proc.stdout or "[]") if proc.returncode == 0 else []
+    except ValueError:
+        info = []
+    return sorted(f"{a.get('local')}/{a.get('prefixlen')}"
+                  for dev in info if isinstance(dev, dict)
+                  for a in dev.get("addr_info", []) if a.get("family") == "inet")
+
+
+def _verify_live_address(cfg: WorkerLinkConfig) -> None:
+    """Raise unless the LIVE interface carries exactly ``host_ip/prefix`` -- what the firewall
+    just loaded describes and what every worker routes to. Read from the kernel."""
+    got = _live_addresses(cfg)
+    want = f"{cfg.host_ip}/{cfg.prefixlen}"
+    if got != [want]:
+        raise RuntimeError(f"{cfg.wg_iface} is up with {', '.join(got) or 'no IPv4 address'}, "
+                           f"not {want}: the live interface does not match the config just "
+                           "written. Restart it (`systemctl restart wg-quick@"
+                           f"{cfg.wg_iface}`) and re-run init.")
 
 
 def _registered(body: str) -> dict[str, tuple[str, str]]:
@@ -461,8 +544,12 @@ def _refuse_uninstalled_override(cfg: WorkerLinkConfig, what: str) -> None:
     """
     file_env = _persisted_env()
     if not file_env:
+        if what.startswith("remove") and cfg.wg_iface in _installed_ifaces():
+            return      # dropping a peer from the INSTALLED interface needs nothing else
         raise WorkerLinkNotInitialised(
-            f"{ENV_FILE} does not exist: run `blastbox worker-link init` first")
+            f"{ENV_FILE} does not exist, so the endpoint and agent port workers must be given "
+            "are unknown: re-run `blastbox worker-link init` (with the same --iface / "
+            "--endpoint / --agent-port) to restore it first")
     installed = WorkerLinkConfig.from_env(file_env)
     diff = [f"{label} {got!r} (installed: {want!r})"
             for label, got, want in (
@@ -683,12 +770,26 @@ def status(cfg: WorkerLinkConfig, *, now: float | None = None) -> tuple[bool, li
     from blastbox.host.exit_attest import parse_wg_dump
 
     rows: list[str] = []
+    recovered = not ENV_FILE.exists()
+    if recovered:
+        rows.append(f"WARNING: {ENV_FILE} is MISSING; showing the link recovered from its "
+                    "installed unit/config. Re-run `blastbox worker-link init` (same --iface, "
+                    "--endpoint, --agent-port) to restore it, or `teardown` to remove it.")
     up = ea._ok(["ip", "link", "show", cfg.wg_iface])
     rows.append(f"interface {cfg.wg_iface}: {'up' if up else 'DOWN'}"
                 f" ({cfg.host_ip}/{cfg.prefixlen}, udp/{cfg.wg_port})")
-    fw, why = firewall_status(cfg)
-    rows.append("firewall: " + (why if fw is True else
-                                ("NOT IN FORCE — " if fw is False else "UNVERIFIED — ") + why))
+    if recovered:
+        # The agent port and dispatcher sources are recorded only in the missing file, so the
+        # rules cannot be compared; report what can be observed, and never call it OK.
+        listing, why = _nft_listing()
+        fw = None
+        rows.append("firewall: UNVERIFIED — " + (
+            f"table inet {NFT_TABLE} is loaded, but its rules cannot be checked without "
+            f"{ENV_FILE}" if listing is not None else why))
+    else:
+        fw, why = firewall_status(cfg)
+        rows.append("firewall: " + (why if fw is True else
+                                    ("NOT IN FORCE — " if fw is False else "UNVERIFIED — ") + why))
     for unit in (f"wg-quick@{cfg.wg_iface}", FW_UNIT_NAME, REASSERT_TIMER_NAME):
         enabled = ea._ok(["systemctl", "is-enabled", unit])
         rows.append(f"{unit}: {'enabled' if enabled else 'NOT enabled (will not survive a reboot)'}")
