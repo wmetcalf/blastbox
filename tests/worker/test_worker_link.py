@@ -49,6 +49,10 @@ class FakeNode:
         #: what `route -n get` (macOS) reports as the endpoint's interface
         self.mac_route_dev = "en0"
         self.wg_quick_down_works = True
+        self.enabled: set[str] = set()          # units `systemctl enable`d
+        self.disable_fails = False
+        self.launchd_loaded = False
+        self.bootout_fails = False
 
     def run(self, argv, *, input=None):
         a = [str(x) for x in argv]
@@ -110,17 +114,33 @@ class FakeNode:
             rc = 0 if a[3] in self.links else 1
         elif a[:2] == ["systemctl", "is-active"]:
             rc = 3
-        elif a[:3] == ["systemctl", "enable", "--now"] and a[3].startswith("wg-quick@"):
-            self.links.add(a[3].split("@")[1])
-        elif a[:3] == ["systemctl", "disable", "--now"] and a[3].startswith("wg-quick@"):
-            self.links.discard(a[3].split("@")[1])
+        elif a[:2] == ["systemctl", "is-enabled"]:
+            rc = 0 if a[2] in self.enabled else 1
+        elif a[:2] == ["systemctl", "enable"]:
+            self.enabled.add(a[-1])
+            if a[2] == "--now" and a[3].startswith("wg-quick@"):
+                self.links.add(a[3].split("@")[1])
+        elif a[:2] == ["systemctl", "disable"]:
+            if a[2] == "--now" and a[3].startswith("wg-quick@"):
+                self.links.discard(a[3].split("@")[1])
+            if self.disable_fails and a[-1].startswith("wg-quick@"):
+                rc, err = 1, "Failed to disable unit"
+            else:
+                self.enabled.discard(a[-1])
         elif tool == "launchctl" and a[1] == "print":
-            rc = 1
+            rc = 0 if self.launchd_loaded else 1
         elif tool == "launchctl" and a[1] == "bootstrap":
             # what RunAtLoad would do: the watchdog brings the tunnel up as some utun
+            self.launchd_loaded = True
             (link.WG_RUN_DIR / "wtwg0.name").write_text("utun7\n")
+        elif tool == "launchctl" and a[1] == "kickstart" and self.launchd_loaded:
+            (link.WG_RUN_DIR / "wtwg0.name").write_text("utun7\n")   # the watchdog re-ups it
         elif tool == "launchctl" and a[1] == "bootout":
-            (link.WG_RUN_DIR / "wtwg0.name").unlink(missing_ok=True)
+            if self.bootout_fails:
+                rc, err = 5, "Boot-out failed: 5: Input/output error"
+            else:
+                self.launchd_loaded = False
+                (link.WG_RUN_DIR / "wtwg0.name").unlink(missing_ok=True)
         elif tool == "pfctl" and "info" in a:
             out = "Status: Enabled for 0 days\n"
         elif tool == "pfctl" and "rules" in a and "-a" not in a:
@@ -1048,3 +1068,94 @@ def test_macos_leave_of_another_name_touches_no_label_anchor_or_tunnel(node, tmp
     assert link._paths("wtwg0")["plist"].exists()
     notes = link.leave("wtwg0")
     assert any("LaunchDaemon" in x and "unloaded" in x for x in notes)
+
+
+# ------------------------------------------------------------------ review round 6
+
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_join_refuses_to_overwrite_a_wireguard_config_it_did_not_write(node, tmp_path, platform):
+    """Sweep (review round 6): join wrote /etc/wireguard/<iface>.conf unconditionally, so a
+    bundle for `wg1` -- the operator's own VPN -- replaced its config and restarted it."""
+    n = node(platform)
+    _pub, csr, _ = link.keygen("wg1", "10.78.0.5")
+    conf = link._paths("wg1")["conf"]
+    theirs = "[Interface]\nPrivateKey = THEIRS\n\n[Peer]\nPublicKey = X\n"
+    conf.write_text(theirs)
+    n.calls.clear()
+    with pytest.raises(RuntimeError, match="not written by worker-link"):
+        link.join(_bundle(tmp_path, csr, iface="wg1"))
+    assert conf.read_text() == theirs
+    assert not any(c.startswith(("systemctl", "/fake/bin/nft", "launchctl", "/fake/bin/wg-quick"))
+                   for c in n.flat())
+
+
+def test_linux_join_refuses_a_live_interface_it_has_no_config_for(node, tmp_path):
+    n = node("linux")
+    _pub, csr, _ = link.keygen("wg1", "10.78.0.5")
+    n.links.add("wg1")                              # up, brought up by something else
+    with pytest.raises(RuntimeError, match="already exists here and is not worker-link's"):
+        link.join(_bundle(tmp_path, csr, iface="wg1"))
+    assert n.loaded is None
+
+
+def test_leave_refuses_a_config_it_did_not_write_even_with_a_keygen_record(node):
+    n = node("linux")
+    link.keygen("wg1", "10.78.0.5")
+    conf = link._paths("wg1")["conf"]
+    conf.write_text("[Interface]\nPrivateKey = THEIRS\n")
+    n.calls.clear()
+    with pytest.raises(RuntimeError, match="not written by worker-link"):
+        link.leave("wg1")
+    assert conf.exists()
+    assert not any(c.startswith(("systemctl disable", "wg-quick", "nft")) for c in n.flat())
+
+
+def test_linux_leave_keeps_everything_while_the_unit_is_still_enabled(node, tmp_path):
+    """REGRESSION (review): `disable --now` stopped the unit but failed to remove its
+    enablement; leave then deleted the config and reported it disabled, leaving an enabled
+    wg-quick@ to fail at every boot. Verified with is-enabled, as host teardown does."""
+    n = node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    n.disable_fails = True
+    notes = link.leave("wtwg0")
+    assert "STILL ENABLED" in notes[-1]
+    assert link._paths("wtwg0")["conf"].exists() and link.FW_UNIT.exists()
+    assert n.loaded is not None
+    assert link.main(["leave"]) == 1                     # not reported as a clean leave
+    n.disable_fails = False
+    assert link.main(["leave"]) == 0
+    assert n.loaded is None and not link._paths("wtwg0")["conf"].exists()
+
+
+def test_macos_leave_keeps_pf_while_the_watchdog_is_still_loaded(node, tmp_path):
+    """REGRESSION (review): a failed `launchctl bootout` was ignored; with the interface down
+    leave flushed the pf anchor and removed the watchdog files -- and the still-loaded
+    watchdog brought the tunnel back up with no rules."""
+    n = node("darwin")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    p = link._paths("wtwg0")
+    n.bootout_fails = True
+    n.calls.clear()
+    notes = link.leave("wtwg0")
+    assert "STILL LOADED" in notes[-1]
+    assert not any("-F all" in c for c in n.flat())                  # pf untouched
+    assert p["plist"].exists() and p["script"].exists() and p["conf"].exists()
+    n.bootout_fails = False
+    n.calls.clear()
+    link.leave("wtwg0")
+    assert any("-F all" in c for c in n.flat()) and not p["plist"].exists()
+
+
+def test_purge_removes_the_keygen_directories_once_they_are_empty(node, tmp_path):
+    """From the live Linux run: `leave --purge` left an empty /etc/blastbox/worker-link."""
+    node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.keygen("wtwg1", "10.79.0.5")               # a second record keeps the dirs in use
+    link.join(_bundle(tmp_path, csr))
+    link.leave("wtwg0", purge=True)
+    assert link.STATE_DIR.is_dir() and link.KEY_DIR.is_dir()
+    assert link._paths("wtwg1")["state"].exists()
+    link.leave("wtwg1", purge=True)
+    assert not link.STATE_DIR.exists() and not link.KEY_DIR.exists()

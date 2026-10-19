@@ -159,13 +159,21 @@ def host(tmp_path, monkeypatch):
     monkeypatch.setattr(wla, "FW_UNIT", tmp_path / "units" / "blastbox-worker-link-fw.service")
     monkeypatch.setattr(wla, "_require", lambda binary, package: binary)
 
+    generated = []
+
     def keypair(stem):
+        """Like the real ensure_keypair: REUSE a non-empty key, generate only when missing."""
         ea.KEY_DIR.mkdir(parents=True, exist_ok=True)
         priv, pub = ea.KEY_DIR / f"{stem}.key", ea.KEY_DIR / f"{stem}.pub"
-        priv.write_text("PRIVATE-HOST-KEY\n")
+        if not priv.exists() or not priv.read_text().strip():
+            generated.append(stem)
+            priv.write_text("PRIVATE-HOST-KEY\n" if len(generated) == 1
+                            else f"PRIVATE-HOST-KEY-{len(generated)}\n")
         os.chmod(priv, 0o600)
-        pub.write_text(HOST_PUB + "\n")
-        return priv, HOST_PUB
+        key = priv.read_text().strip()
+        pubkey = HOST_PUB if key == "PRIVATE-HOST-KEY" else (key[-1] * 43 + "=")
+        pub.write_text(pubkey + "\n")
+        return priv, pubkey
 
     monkeypatch.setattr(ea, "ensure_keypair", keypair)
     return h
@@ -671,6 +679,69 @@ def test_status_for_a_name_that_is_not_installed_says_so_and_is_never_ok(host, m
     monkeypatch.setenv("BLASTBOX_WORKER_LINK_IF", "wtwg9")
     ok, rows = wla.status(wla.load_config())
     assert not ok and "installed on wtwg0, not wtwg9" in rows[0]
+
+
+def test_init_refuses_a_wireguard_interface_it_did_not_create(host):
+    """REGRESSION (review): `init --iface wg1` on the operator's own VPN rewrote
+    /etc/wireguard/wg1.conf (its plain [Peer] blocks dropped) and restarted wg-quick@wg1.
+    Refused before anything is written unless an install record or our own header proves
+    the interface is worker-link's."""
+    ea.WG_DIR.mkdir(parents=True, exist_ok=True)
+    theirs = "[Interface]\nAddress = 10.66.0.2/24\nPrivateKey = THEIRS\n\n[Peer]\nPublicKey = X\n"
+    (ea.WG_DIR / "wg1.conf").write_text(theirs)
+    with pytest.raises(RuntimeError, match="wg1 is not a worker-link interface .*not written"):
+        wla.init_host(_cfg(wg_iface="wg1"))
+    assert (ea.WG_DIR / "wg1.conf").read_text() == theirs
+    assert host.loaded is None and not wla.ENV_FILE.exists()
+    assert not any(c[:2] in (["systemctl", "restart"], ["systemctl", "enable"]) for c in host.calls)
+    # a live interface / an enabled unit under that name, with no config, is not ours either
+    host.links.add("wg2")
+    with pytest.raises(RuntimeError, match="interface wg2 is up"):
+        wla.init_host(_cfg(wg_iface="wg2"))
+    host.enabled.add("wg-quick@wg3")
+    with pytest.raises(RuntimeError, match="wg-quick@wg3 is enabled or running"):
+        wla.init_host(_cfg(wg_iface="wg3"))
+    # ours (fresh, or retained by a teardown with our header) is fine
+    wla.init_host(_cfg())
+    wla.teardown(_cfg())
+    wla.init_host(_cfg())
+
+
+def test_reinit_never_silently_rotates_the_host_key(host, pki):
+    """REGRESSION (review): with the key file deleted or emptied, ensure_keypair generated a
+    NEW key and init restarted the interface with it -- every registered worker pins the old
+    public key, so all of them lost their handshakes. The key is restored from the retained
+    config; a mismatching one is refused; rotating takes --rotate-key."""
+    cfg = _cfg()
+    wla.init_host(cfg)
+    wla.add_worker(cfg, "mac1", KEY_A, _csr(_ip("10.78.0.2")), pki_dir=pki)
+    key = ea.KEY_DIR / "wtwg0.key"
+    conf = ea.WG_DIR / "wtwg0.conf"
+    for damage in (key.unlink, lambda: key.write_text("")):
+        damage()
+        pub, notes = wla.init_host(cfg)
+        assert pub == HOST_PUB and "PrivateKey = PRIVATE-HOST-KEY\n" in conf.read_text()
+        assert any("restored from" in n for n in notes)
+    key.write_text("SOME-OTHER-KEY\n")
+    with pytest.raises(RuntimeError, match="would silently rotate it"):
+        wla.init_host(cfg)
+    assert "PrivateKey = PRIVATE-HOST-KEY\n" in conf.read_text()        # untouched
+    pub, notes = wla.init_host(cfg, rotate_key=True)
+    assert pub != HOST_PUB and "PrivateKey = PRIVATE-HOST-KEY\n" not in conf.read_text()
+    assert any("ROTATED" in n and "re-joined" in n for n in notes)
+    assert "# peer:mac1" in conf.read_text()
+
+
+def test_an_unverified_teardown_exits_non_zero(host, capsys):
+    from blastbox.worker import link
+
+    assert link.main(["init"]) == 0
+    host.enabled.add("wg-quick@wtwg0")
+    host.disable_fails = True
+    assert link.main(["teardown"]) == 1
+    assert "STILL ENABLED" in capsys.readouterr().out
+    host.disable_fails = False
+    assert link.main(["teardown"]) == 0
 
 
 # ----------------------------------------------------------------------------- status

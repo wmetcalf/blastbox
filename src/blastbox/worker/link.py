@@ -1129,6 +1129,7 @@ def join(bundle_text: str, *, agent_user: str | None = None) -> list[str]:
     # Every check that can refuse runs before anything is written.
     if plat == "linux":
         _refuse_second_linux_link(bundle.iface)
+    _refuse_foreign_interface(bundle.iface, plat)
     pre = linux_preflight(bundle) if plat == "linux" else darwin_preflight(bundle)
     if _wg_pubkey(wg, p["wg_key"].read_text()) == bundle.host_public_key:
         raise RuntimeError("the bundle's host key is THIS worker's own key")
@@ -1260,6 +1261,48 @@ def status(iface: str = DEFAULT_IFACE) -> tuple[bool, list[str]]:
     return bool(dump_if) and fresh and fw is True, rows
 
 
+#: First line of every interface config ``join`` writes (worker_wg_config): the proof that a
+#: /etc/wireguard/<iface>.conf is ours.
+WORKER_CONF_MARKER = "# blastbox worker-link — WORKER end."
+
+
+def _conf_is_ours(iface: str) -> "bool | None":
+    """True/False for an existing interface config written / not written by ``join``; None
+    when there is none."""
+    try:
+        return _paths(iface)["conf"].read_text().startswith(WORKER_CONF_MARKER)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RuntimeError(f"cannot read {_paths(iface)['conf']}: {exc.strerror}") from None
+
+
+def _iface_is_live(iface: str, plat: str) -> bool:
+    if plat == "darwin":
+        return _real_iface_darwin(iface) is not None
+    return _ok(["ip", "link", "show", iface]) or _ok(["systemctl", "is-enabled",
+                                                      f"wg-quick@{iface}"])
+
+
+def _refuse_foreign_interface(iface: str, plat: str) -> None:
+    """Raise if ``iface`` is a WireGuard interface worker-link did not create on this node.
+
+    ``join`` overwrites ``/etc/wireguard/<iface>.conf`` and (re)starts the interface; for the
+    operator's own ``wg1`` that is a destroyed VPN. Ours: its config carries the line ``join``
+    writes first. With no config, a live interface (or an enabled wg-quick unit) under that
+    name is someone else's.
+    """
+    ours = _conf_is_ours(iface)
+    if ours is False:
+        raise RuntimeError(
+            f"{_paths(iface)['conf']} exists and was not written by worker-link; refusing to "
+            "overwrite it. Use another interface name for the link (`keygen --iface ...`).")
+    if ours is None and _iface_is_live(iface, plat):
+        raise RuntimeError(
+            f"a WireGuard interface {iface} already exists here and is not worker-link's; "
+            "refusing to take it over. Use another interface name for the link.")
+
+
 def _refuse_leaving_what_is_not_ours(iface: str, plat: str) -> None:
     """Raise unless ``iface`` is a link worker-link set up here -- checked BEFORE ``leave``
     touches anything.
@@ -1293,6 +1336,19 @@ def _refuse_leaving_what_is_not_ours(iface: str, plat: str) -> None:
             + (", no LaunchDaemon" if plat == "darwin" else "")
             + "); refusing to take down an interface worker-link did not create. Check "
             "--iface: it must be the name given to `worker-link keygen` / `join`.")
+    # A keygen record alone is not ownership of the INTERFACE: keygen for a name that is also
+    # the operator's own VPN leaves their config / live tunnel under it, which join refuses to
+    # take over -- so leave must not take it down or delete that config either.
+    conf_ours = _conf_is_ours(iface)
+    if conf_ours is False:
+        raise RuntimeError(
+            f"{p['conf']} was not written by worker-link; refusing to take {iface} down or "
+            "delete that config. Check --iface.")
+    if conf_ours is None and iface not in installed and _iface_is_live(iface, plat) \
+            and not (plat == "darwin" and p["plist"].exists()):
+        raise RuntimeError(
+            f"{iface} is up but worker-link has no config for it here; refusing to take down an "
+            "interface it did not bring up. Check --iface.")
 
 
 def leave(iface: str = DEFAULT_IFACE, *, purge: bool = False) -> list[str]:
@@ -1307,6 +1363,14 @@ def leave(iface: str = DEFAULT_IFACE, *, purge: bool = False) -> list[str]:
     if plat == "darwin":
         label = label_for(iface)
         _run(["launchctl", "bootout", f"system/{label}"])
+        # VERIFIED, not assumed: a watchdog still loaded (bootout failed, or an invocation was
+        # already running) brings the tunnel straight back up -- after this function flushed
+        # its pf rules. So nothing is removed until launchd no longer knows the label.
+        if _ok(["launchctl", "print", f"system/{label}"]):
+            notes.append(f"WARNING: LaunchDaemon {label} is STILL LOADED (bootout failed); the "
+                         "link, its pf rules and its files are left in place. Run "
+                         f"`sudo launchctl bootout system/{label}` and re-run leave.")
+            return notes
         wg_quick = _which("wg-quick")
         if wg_quick:
             _run([wg_quick, "down", iface])
@@ -1327,6 +1391,14 @@ def leave(iface: str = DEFAULT_IFACE, *, purge: bool = False) -> list[str]:
         if _ok(["ip", "link", "show", iface]):
             notes.append(f"WARNING: {iface} is STILL UP; firewall left in place")
             return notes
+        # ...and DISABLED, verified (as host teardown does): `disable --now` can stop the unit
+        # yet fail to remove its enablement, and an enabled wg-quick@ would start the link at
+        # the next boot with its config and firewall gone.
+        if _ok(["systemctl", "is-enabled", f"wg-quick@{iface}"]):
+            notes.append(f"WARNING: wg-quick@{iface} is STILL ENABLED; its config and firewall "
+                         f"are left in place. Run `systemctl disable wg-quick@{iface}` and "
+                         "re-run leave.")
+            return notes
         notes.append(f"{iface} down; wg-quick@{iface} disabled")
         _run(["systemctl", "disable", "--now", REASSERT_TIMER_NAME])
         _run(["systemctl", "disable", "--now", FW_UNIT_NAME])
@@ -1343,6 +1415,13 @@ def leave(iface: str = DEFAULT_IFACE, *, purge: bool = False) -> list[str]:
     if purge:
         for key in ("wg_key", "wg_pub", "tls_key", "csr", "cert", "ca", "state"):
             p[key].unlink(missing_ok=True)
+        # ...and the directories keygen created, once nothing else is in them (another
+        # interface's keys may be): rmdir refuses a non-empty directory, never recurses.
+        for d in (STATE_DIR, KEY_DIR):
+            try:
+                d.rmdir()
+            except OSError:
+                pass
         notes.append("keys, certificates and keygen state removed")
     else:
         notes.append(f"keys kept in {KEY_DIR} and {STATE_DIR} (--purge removes them)")
@@ -1435,9 +1514,12 @@ def _dispatch(args: argparse.Namespace) -> int:
             print(f"  {n}")
         return 0
     if action == "leave":
-        for n in leave(args.iface or DEFAULT_IFACE, purge=args.purge):
+        notes = leave(args.iface or DEFAULT_IFACE, purge=args.purge)
+        for n in notes:
             print(f"  {n}")
-        return 0
+        # A step that could not be verified (still up / enabled / loaded) is not a clean
+        # leave: say so in the exit status too, so automation does not read it as done.
+        return 1 if any(n.startswith("WARNING") for n in notes) else 0
     if action == "status" and _role(args) == "worker":
         ok, rows = status(args.iface or DEFAULT_IFACE)
         for r in rows:
@@ -1448,7 +1530,7 @@ def _dispatch(args: argparse.Namespace) -> int:
     wla = _host_mod()
     if action == "init":
         cfg = _host_cfg(args, base_required=False)
-        pub, notes = wla.init_host(cfg)
+        pub, notes = wla.init_host(cfg, rotate_key=bool(getattr(args, "rotate_key", False)))
         for n in notes:
             print(f"  {n}")
         print(f"  host public key: {pub}")
@@ -1504,9 +1586,10 @@ def _dispatch(args: argparse.Namespace) -> int:
             print(f"  {r}")
         return 0 if ok else 1
     if action == "teardown":
-        for n in wla.teardown(cfg):
+        notes = wla.teardown(cfg)
+        for n in notes:
             print(f"  {n}")
-        return 0
+        return 1 if any(n.startswith("WARNING") for n in notes) else 0
     raise SystemExit(f"unknown worker-link action {action!r}")
 
 
@@ -1533,6 +1616,9 @@ def add_parser(sub: argparse._SubParsersAction) -> None:
     pi.add_argument("--dispatcher-source", action="append", default=None, metavar="CIDR",
                     help="docker network of a CONTAINERISED dispatcher (repeatable); its "
                          "connections are allowed into the link and MASQUERADEd")
+    pi.add_argument("--rotate-key", action="store_true",
+                    help="generate a NEW host key; every registered worker must then be "
+                         "re-added and re-joined (init otherwise always keeps the key)")
     pi.add_argument("--no-dispatcher-source", action="store_true",
                     help="clear every recorded --dispatcher-source (they are otherwise kept)")
     pi.set_defaults(func=_cmd)

@@ -425,16 +425,128 @@ def _refuse_incompatible_reinit(cfg: WorkerLinkConfig) -> list[str]:
     return notes
 
 
-def init_host(cfg: WorkerLinkConfig) -> tuple[str, list[str]]:
+#: First line of every interface config ``init`` writes (host_wg_config). It is the proof,
+#: surviving a teardown that keeps the config, that a /etc/wireguard/<iface>.conf is ours.
+HOST_CONF_MARKER = "# blastbox worker-link — HOST end."
+
+
+def _refuse_foreign_interface(cfg: WorkerLinkConfig) -> None:
+    """Raise if ``cfg.wg_iface`` is a WireGuard interface worker-link cannot prove it created.
+
+    ``init`` rewrites ``/etc/wireguard/<iface>.conf`` (a foreign config's ordinary peer blocks,
+    without our ``# peer:`` markers, would be dropped) and starts or restarts ``wg-quick@<iface>``.
+    For the operator's own ``wg1`` that is a destroyed VPN. Ours means: an install record names
+    it (:func:`_installed_ifaces`), or its config carries the line ``init`` writes first.
+    Anything else that already exists under that name -- a config, a live interface, an
+    enabled or active wg-quick unit -- is refused before anything is written.
+    """
+    iface = cfg.wg_iface
+    if iface in _installed_ifaces():
+        return
+    conf = _conf(cfg)
+    try:
+        body = conf.read_text()
+    except FileNotFoundError:
+        body = None
+    except OSError as exc:
+        raise RuntimeError(f"cannot read {conf}: {exc.strerror}") from None
+    if body is not None and body.startswith(HOST_CONF_MARKER):
+        return
+    evidence = []
+    if body is not None:
+        evidence.append(f"{conf} exists and was not written by worker-link")
+    if ea._ok(["ip", "link", "show", iface]):
+        evidence.append(f"interface {iface} is up")
+    unit = f"wg-quick@{iface}"
+    if ea._ok(["systemctl", "is-enabled", unit]) or ea._ok(["systemctl", "is-active", unit]):
+        evidence.append(f"{unit} is enabled or running")
+    if evidence:
+        raise RuntimeError(
+            f"{iface} is not a worker-link interface ({'; '.join(evidence)}); refusing to "
+            "overwrite or restart it. Choose another --iface for the link.")
+
+
+def _conf_private_key(body: str) -> str:
+    head = body.split("\n# peer:", 1)[0]
+    for line in head.splitlines():
+        k, sep, v = line.partition("=")
+        if sep and k.strip() == "PrivateKey":
+            return v.strip()
+    return ""
+
+
+def _reconcile_host_key(cfg: WorkerLinkConfig, *, rotate: bool) -> list[str]:
+    """Make sure ``init`` keeps the host key every registered worker pins, unless told not to.
+
+    ``ensure_keypair`` GENERATES a key when the key file is missing or empty, and ``init`` then
+    rewrites and restarts the interface with it: every worker's bundle pins the previous public
+    key, so all of them silently lose their handshakes. The retained interface config holds
+    the key the link actually runs with (``PrivateKey``), so:
+
+    * key file missing/empty, config has the key -> restore the file from it (same key);
+    * key file DIFFERENT from the config's key while workers are registered -> refuse;
+    * no key anywhere while workers are registered -> refuse;
+    * ``rotate`` -> a new key on purpose, with the re-join that implies spelled out.
+    """
+    conf = _conf(cfg)
+    try:
+        body = conf.read_text()
+    except FileNotFoundError:
+        body = ""
+    workers = _registered(body)
+    in_conf = _conf_private_key(body)
+    priv = ea.KEY_DIR / f"{cfg.wg_iface}.key"
+    pub = ea.KEY_DIR / f"{cfg.wg_iface}.pub"
+    try:
+        on_disk = priv.read_text().strip()
+    except FileNotFoundError:
+        on_disk = ""
+    if rotate:
+        priv.unlink(missing_ok=True)
+        pub.unlink(missing_ok=True)
+        return [f"NOTE: the host key was ROTATED on request: every one of the {len(workers)} "
+                "registered worker(s) pins the old public key and must be re-added "
+                "(`worker-link add`) and re-joined with its new bundle"] if workers else []
+    if not on_disk and in_conf:
+        ea.KEY_DIR.mkdir(parents=True, exist_ok=True)
+        os.chmod(ea.KEY_DIR, 0o700)
+        old = os.umask(0o077)
+        try:
+            priv.write_text(in_conf + "\n")
+        finally:
+            os.umask(old)
+        os.chmod(priv, 0o600)
+        pub.unlink(missing_ok=True)          # ensure_keypair re-derives it from the private key
+        return [f"NOTE: {priv} was missing; restored from {conf} (the key the link runs with), "
+                "so registered workers keep their bundles"]
+    if workers and in_conf and on_disk != in_conf:
+        raise RuntimeError(
+            f"{priv} does not hold the key {conf} runs with, and {len(workers)} registered "
+            "worker(s) pin that key: re-init would silently rotate it and cut every one of them "
+            "off. Restore the key file, or pass --rotate-key to rotate on purpose (every worker "
+            "must then be re-added and re-joined).")
+    if workers and not on_disk:
+        raise RuntimeError(
+            f"{priv} is missing and {conf} records no key, but {len(workers)} registered "
+            "worker(s) pin the old one: restore the key file, or pass --rotate-key (every "
+            "worker must then be re-added and re-joined).")
+    return []
+
+
+def init_host(cfg: WorkerLinkConfig, *, rotate_key: bool = False) -> tuple[str, list[str]]:
     """Stand up the host end. Idempotent. Returns ``(host public key, notes)``.
 
     Order is the safety property: preconditions, then the FIREWALL (loaded and read back),
     then the interface. A failure at any step leaves the link down rather than up and open.
+    Every refusal (a foreign interface, an incompatible re-init, a key that would rotate)
+    happens before anything is written.
     """
     _require("wg", "wireguard-tools")
     _require("wg-quick", "wireguard-tools")
+    _refuse_foreign_interface(cfg)
     changed = _refuse_incompatible_reinit(cfg)
     check_host(cfg)
+    changed += _reconcile_host_key(cfg, rotate=rotate_key)
     notes = install_firewall(cfg)
     notes += changed
     ea.WG_DIR.mkdir(parents=True, exist_ok=True)
