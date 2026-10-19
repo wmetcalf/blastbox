@@ -447,7 +447,8 @@ def test_a_receipt_from_the_future_fails_when_age_is_checked(key, pinned):
     {"expect_job_id": ""}, {"expect_job_id": None}, {"expect_input_sha256": "abc"},
     {"expect_input_sha256": b"x" * 64}, {"metadata_bytes": "text"}, {"max_age": -1},
     {"max_age": float("nan")}, {"max_age": True}, {"expect_engine": ""},
-    {"now_ms": 1.5},
+    {"now_ms": 1.5}, {"max_age": float("inf")}, {"max_clock_skew": float("inf")},
+    {"max_clock_skew": float("nan")}, {"max_age": 1e999},
 ])
 def test_bad_arguments_raise_not_verify(key, pinned, kw):
     with pytest.raises((TypeError, ValueError)):

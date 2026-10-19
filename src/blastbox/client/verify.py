@@ -51,7 +51,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -630,8 +630,9 @@ def _seconds(value: float | int | timedelta, name: str) -> float:
         secs = float(value)
     else:
         raise TypeError(f"{name} must be seconds (int/float) or a timedelta")
-    if not secs >= 0:  # also rejects NaN
-        raise ValueError(f"{name} must be >= 0")
+    if not 0 <= secs < math.inf:  # also rejects NaN
+        # An infinite duration would silently disable the bound it configures.
+        raise ValueError(f"{name} must be a finite number of seconds >= 0")
     return secs
 
 
@@ -918,14 +919,38 @@ class _DeadlineConnection(http.client.HTTPConnection):
     def __init__(self, *args: Any, deadline: _Deadline, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._deadline = deadline
-        create: Callable[..., socket.socket] = self._create_connection  # type: ignore[has-type]
+        self._create_connection = self._connect_within_deadline
 
-        def _create(*a: Any, **kw: Any) -> socket.socket:
-            sock = create(*a, **kw)
-            deadline.register(sock)
-            return sock
-
-        self._create_connection = _create
+    def _connect_within_deadline(self, address: tuple[str, int], timeout: object = None,
+                                 source_address: tuple[str, int] | None = None,
+                                 *_: Any, **__: Any) -> socket.socket:
+        """socket.create_connection, deadline-aware: each candidate address's socket is
+        registered with the watchdog BEFORE its connect() and gets only the REMAINING budget,
+        so a hostname with several unreachable addresses cannot spend one full timeout per
+        address."""
+        host, port = address
+        deadline = self._deadline
+        last: OSError | None = None
+        for family, kind, proto, _canon, sockaddr in socket.getaddrinfo(
+                host, port, 0, socket.SOCK_STREAM):
+            sock: socket.socket | None = None
+            try:
+                sock = socket.socket(family, kind, proto)
+                deadline.register(sock)
+                sock.settimeout(deadline.socket_timeout())
+                if source_address:
+                    sock.bind(source_address)
+                sock.connect(sockaddr)
+                return sock
+            except OSError as exc:
+                last = exc
+                if sock is not None:
+                    sock.close()
+                if deadline.expired:
+                    raise TimeoutError("request deadline exceeded while connecting") from exc
+        if last is not None:
+            raise last
+        raise OSError(f"getaddrinfo returned no addresses for {host!r}")
 
     def connect(self) -> None:
         self.timeout = self._deadline.socket_timeout()
@@ -1144,10 +1169,14 @@ def fetch_and_verify(
         raise ValueError("max_metadata_bytes must be a positive int")
     headers = {"Accept": "application/json", "Accept-Encoding": "identity"}
     if token is not None:
-        if not isinstance(token, str) or not token.strip() or any(
-                c in token for c in "\r\n\x00"):
-            raise ValueError("token must be a non-empty single-line string")
-        headers["Authorization"] = f"Bearer {token.strip()}"
+        # Visible ASCII only: anything else either cannot be encoded as a header (a non-Latin-1
+        # character fails inside http.client, which would surface as a retryable network
+        # error) or is not a bearer token (spaces, controls, CR/LF injection).
+        stripped = token.strip() if isinstance(token, str) else ""
+        if not stripped or not all("!" <= c <= "~" for c in stripped):
+            raise ValueError("token must be a non-empty bearer token of visible ASCII "
+                             "characters (no spaces or control characters)")
+        headers["Authorization"] = f"Bearer {stripped}"
     job_url = f"{root}/v1/jobs/{urllib.parse.quote(job_id, safe='')}"
 
     status, receipt_body, detail = _get(f"{job_url}/attestation", headers=headers,

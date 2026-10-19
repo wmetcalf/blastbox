@@ -502,7 +502,9 @@ def test_the_job_id_must_be_a_canonical_uuid(pinned, job_id):
 @pytest.mark.parametrize("kw", [
     {"token": "a\r\nX-Evil: 1"}, {"token": ""}, {"timeout": 0}, {"timeout": -1},
     {"max_metadata_bytes": 0}, {"max_metadata_bytes": 1.5}, {"timeout": float("inf")},
-    {"timeout": float("nan")}, {"max_age": -5},
+    {"timeout": float("nan")}, {"max_age": -5}, {"max_age": float("inf")},
+    {"token": "t\u00f6ken\u2603"}, {"token": "caf\u00e9"}, {"token": "a b"}, {"token": "a\tb"},
+    {"token": "a\x7fb"},
 ])
 def test_bad_fetch_arguments(pinned, kw):
     with pytest.raises((TypeError, ValueError)):
@@ -634,3 +636,40 @@ def test_a_stalled_tls_handshake_after_a_slow_connect_ends_at_the_total_deadline
     elapsed = time.monotonic() - t0
     assert ei.value.code == "timeout" and ei.value.retryable
     assert elapsed < 1.35, elapsed                          # not ~0.5 + a fresh 1.0
+
+
+def test_a_multi_address_host_cannot_spend_one_budget_per_address(srv, pinned, monkeypatch):
+    """A hostname resolving to several unreachable addresses: every candidate connect gets only
+    the REMAINING budget (and is registered with the watchdog first), so the request ends at
+    its total deadline instead of after one full timeout per address."""
+    import socket
+
+    real_getaddrinfo = socket.getaddrinfo
+    real_socket = socket.socket
+
+    def getaddrinfo(host, port, *a, **kw):
+        if host == "multi.test":
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 9))] * 3
+        return real_getaddrinfo(host, port, *a, **kw)
+
+    class BlackholeSocket(real_socket):
+        """connect() to port 9 behaves like an unanswered SYN: it waits out the socket's
+        timeout (or a shutdown) and then times out."""
+
+        def connect(self, address):
+            if address[1] != 9:
+                return super().connect(address)
+            budget = self.gettimeout()
+            end = time.monotonic() + (5 if budget is None else budget)
+            while time.monotonic() < end:
+                time.sleep(0.01)
+            raise TimeoutError("timed out")
+
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    monkeypatch.setattr(socket, "socket", BlackholeSocket)
+    t0 = time.monotonic()
+    with pytest.raises(v.FetchError) as ei:
+        v.fetch_and_verify("http://multi.test:9", JOB, keys=pinned, timeout=0.6)
+    elapsed = time.monotonic() - t0
+    assert ei.value.code == "timeout" and ei.value.retryable
+    assert elapsed < 1.0, elapsed                           # not ~3 x 0.6

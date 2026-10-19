@@ -303,3 +303,43 @@ def _unknown_algorithm_pem() -> bytes:
     spki = bytes([0x30, len(alg) + len(bits)]) + alg + bits
     return (b"-----BEGIN PUBLIC KEY-----\n" + base64.b64encode(spki)
             + b"\n-----END PUBLIC KEY-----\n")
+
+
+@pytest.mark.parametrize("extra,env_token,token_file", [
+    (["--cacert", ""], None, None),
+    (["--metadata-out", ""], None, None),
+    (["--token-file", ""], None, None),
+    (["--engine", ""], None, None),
+    (["--key", ""], None, None),
+    (["--max-age", "inf"], None, None),
+    (["--max-age", "1e999"], None, None),
+    (["--max-age", "nan"], None, None),
+    (["--timeout", "inf"], None, None),
+    ([], "töken☃", None),                        # not encodable as a header
+    ([], "has space", None),
+    ([], None, "t☃ken\n"),
+])
+def test_cli_empty_or_malformed_options_are_usage_errors(
+        tmp_path, key, capsys, monkeypatch, extra, env_token, token_file):
+    """An option given with an empty value is never treated as absent (that would silently
+    use the system CAs, skip the metadata write, or drop the token file); an infinite
+    freshness bound or a token that cannot be a bearer header is a usage error (exit 2), never
+    a verification or a retryable network failure. The URL is a closed port: had a request
+    been issued it would be exit 3."""
+    monkeypatch.delenv("BLASTBOX_API_KEY", raising=False)
+    if env_token is not None:
+        monkeypatch.setenv("BLASTBOX_API_KEY", env_token)
+    if token_file is not None:
+        (tmp_path / "tok").write_text(token_file, encoding="utf-8")
+        extra = ["--token-file", str(tmp_path / "tok")]
+    (tmp_path / "pin.pem").write_text(key.public_key_pem)
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    rc, cap = _cli(["attest", "verify", "--url", f"http://127.0.0.1:{port}", "--job",
+                    "0b9d6a0e-6c1d-4f43-9d55-0f6a3c1c7e21", "--key", str(tmp_path / "pin.pem"),
+                    *extra], capsys)
+    assert rc == client_cli.EXIT_USAGE, cap.err
+    for secret in ("töken", "has space", "t☃ken"):
+        assert secret not in cap.err                        # the token is never echoed

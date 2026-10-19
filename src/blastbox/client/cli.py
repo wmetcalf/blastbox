@@ -97,7 +97,7 @@ def _write_atomic(path: Path, data: bytes) -> None:
 
 
 def _token(args: argparse.Namespace) -> str | None:
-    if args.token_file:
+    if args.token_file is not None:
         text = Path(args.token_file).read_text(encoding="utf-8").strip()
         if not text:
             raise ValueError(f"{args.token_file} is empty")
@@ -140,6 +140,18 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         _err(f"error: {exc}")
         return EXIT_USAGE
 
+    # An option given with an EMPTY value (`--cacert "$CA"` with CA unset) is a usage error,
+    # never "absent": treating it as absent would silently drop what the caller asked for
+    # (input binding, a private CA, the token file, the metadata output).
+    empty = ["--key"] if "" in args.key else []
+    empty += [name for name, value in (
+        ("--input", args.input), ("--cacert", args.cacert), ("--token-file", args.token_file),
+        ("--metadata-out", args.metadata_out), ("--engine", args.engine),
+    ) if value == ""]
+    if empty:
+        _err(f"error: {empty[0]}: empty value")
+        return EXIT_USAGE
+
     try:
         keys = v.load_pinned_keys(*(Path(p) for p in args.key))
     except v.VerifyKeyRefused as exc:
@@ -147,11 +159,6 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         return EXIT_USAGE
     expect_input = None
     if args.input is not None:
-        if not args.input:
-            # `--input "$FILE"` with FILE unset: the caller asked for input binding; never
-            # silently verify without it.
-            _err("error: --input: empty path")
-            return EXIT_USAGE
         try:
             expect_input = _sha256_file(args.input)
         except OSError as exc:
@@ -163,7 +170,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         _err(f"error: --token-file: {exc}")
         return EXIT_USAGE
     ctx = None
-    if args.cacert:
+    if args.cacert is not None:
         try:
             ctx = ssl.create_default_context(cafile=args.cacert)
         except (OSError, ssl.SSLError) as exc:
@@ -188,7 +195,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         _err(f"error: {exc}")
         return EXIT_USAGE
 
-    if args.metadata_out:
+    if args.metadata_out is not None:
         try:
             _write_atomic(Path(args.metadata_out), result.metadata)
         except OSError as exc:
