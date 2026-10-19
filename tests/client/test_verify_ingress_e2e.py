@@ -270,3 +270,36 @@ def test_cli_exit_codes_for_retry_and_usage(tmp_path, ingress, key, capsys, monk
     rc, cap = _cli(["attest", "verify", "--url", "file:///etc", "--job", job_id, "--key",
                     str(tmp_path / "pin.pem")], capsys)
     assert rc == client_cli.EXIT_USAGE
+
+
+@pytest.mark.parametrize("unsupported_key", [False, True])
+def test_cli_usage_errors_never_fetch(tmp_path, key, capsys, monkeypatch, unsupported_key):
+    """`--input ""` (an unset shell variable) is a usage error, never a verification that
+    silently skips input binding; a PEM key of a type the backend cannot load is a --key
+    refusal (exit 2), never a traceback. Neither issues a request."""
+    def no_fetch(*a, **kw):
+        raise AssertionError("fetch_and_verify was called")
+
+    monkeypatch.setattr(v, "fetch_and_verify", no_fetch)
+    (tmp_path / "pin.pem").write_text(key.public_key_pem)
+    job_id = "0b9d6a0e-6c1d-4f43-9d55-0f6a3c1c7e21"
+    argv = ["attest", "verify", "--url", "http://127.0.0.1:9", "--job", job_id, "--key"]
+    if unsupported_key:
+        (tmp_path / "odd.pem").write_bytes(_unknown_algorithm_pem())
+        rc, cap = _cli(argv + [str(tmp_path / "odd.pem")], capsys)
+        assert rc == client_cli.EXIT_USAGE and "--key" in cap.err
+    else:
+        rc, cap = _cli(argv + [str(tmp_path / "pin.pem"), "--input", ""], capsys)
+        assert rc == client_cli.EXIT_USAGE and "--input" in cap.err
+
+
+def _unknown_algorithm_pem() -> bytes:
+    """A well-formed SubjectPublicKeyInfo PEM whose algorithm OID (1.2.3.4) no backend
+    implements: load_pem_public_key raises UnsupportedAlgorithm, not ValueError."""
+    import base64
+    oid = bytes([0x06, 0x03, 0x2A, 0x03, 0x04])
+    alg = bytes([0x30, len(oid)]) + oid
+    bits = bytes([0x03, 0x03, 0x00, 0x01, 0x02])
+    spki = bytes([0x30, len(alg) + len(bits)]) + alg + bits
+    return (b"-----BEGIN PUBLIC KEY-----\n" + base64.b64encode(spki)
+            + b"\n-----END PUBLIC KEY-----\n")

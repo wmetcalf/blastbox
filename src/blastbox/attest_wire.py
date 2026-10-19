@@ -18,6 +18,7 @@ import json
 from dataclasses import dataclass
 from typing import Protocol, TypeGuard
 
+from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
@@ -136,7 +137,8 @@ class VerifyKey:
                                    "--verify-key per signing host)")
         try:
             pub = serialization.load_pem_public_key(text)
-        except (ValueError, TypeError) as exc:
+        except (ValueError, TypeError, UnsupportedAlgorithm) as exc:
+            # UnsupportedAlgorithm: well-formed PEM whose key type the backend cannot load.
             raise VerifyKeyRefused(f"{source}: not a readable PEM public key") from exc
         if not is_p256_public_key(pub):
             raise VerifyKeyRefused(f"{source}: not an EC P-256 public key (alg is fixed at {ALG})")

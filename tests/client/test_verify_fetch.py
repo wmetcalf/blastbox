@@ -201,7 +201,7 @@ def test_an_unusable_receipt_never_fetches_the_metadata(srv, key, pinned, tmp_pa
 @pytest.mark.parametrize("status,code,retryable", [
     (409, "not_ready", True), (503, "unavailable", True), (500, "unavailable", True),
     (429, "unavailable", True), (401, "unauthorized", False), (403, "unauthorized", False),
-    (400, "http_error", False), (204, "http_error", False),
+    (400, "http_error", False), (204, "http_error", False), (408, "timeout", True),
 ])
 def test_http_statuses_map_to_typed_fetch_errors(srv, pinned, status, code, retryable):
     srv.routes[A] = (status, b"" if status == 204 else b'{"detail":"x"}', {})
@@ -229,6 +229,14 @@ def test_metadata_404_after_a_receipt_is_a_fetch_error(srv, key, pinned):
     with pytest.raises(v.FetchError) as ei:
         v.fetch_and_verify(srv.url, JOB, keys=pinned)
     assert ei.value.code == "metadata_missing"
+
+
+def test_metadata_408_is_a_retryable_timeout(srv, key, pinned):
+    srv.routes[A] = (200, _receipt(key), {})
+    srv.routes[M] = (408, b'{"detail":"request timeout"}', {})
+    with pytest.raises(v.FetchError) as ei:
+        v.fetch_and_verify(srv.url, JOB, keys=pinned)
+    assert (ei.value.code, ei.value.retryable, ei.value.status) == ("timeout", True, 408)
 
 
 def test_metadata_409_is_retryable(srv, key, pinned):
@@ -554,3 +562,75 @@ def test_tls_certificate_failures_are_not_retryable(pinned):
         finally:
             lsock.close()
         assert ei.value.code == "tls" and not ei.value.retryable
+
+
+def _raw_listener(handle):
+    """A bare TCP listener on loopback whose accepted connections go to ``handle(conn)``."""
+    import socket
+    lsock = socket.socket()
+    lsock.bind(("127.0.0.1", 0))
+    lsock.listen()
+
+    def serve():
+        while True:
+            try:
+                conn, _ = lsock.accept()
+            except OSError:
+                return
+            threading.Thread(target=handle, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return lsock, lsock.getsockname()[1]
+
+
+def test_a_tls_handshake_dropped_by_the_peer_is_retryable(pinned):
+    """A load balancer closing the connection mid-handshake (SSLEOFError) is transport
+    trouble, retryable -- not the non-retryable `tls` a certificate failure is."""
+    def drop(conn):
+        try:
+            conn.recv(4096)                                 # the ClientHello
+        finally:
+            conn.close()
+
+    lsock, port = _raw_listener(drop)
+    try:
+        with pytest.raises(v.FetchError) as ei:
+            v.fetch_and_verify(f"https://localhost:{port}", JOB, keys=pinned, timeout=3)
+    finally:
+        lsock.close()
+    assert ei.value.code == "network" and ei.value.retryable
+
+
+def test_a_stalled_tls_handshake_after_a_slow_connect_ends_at_the_total_deadline(
+        pinned, monkeypatch):
+    """TCP connect eats half the budget, then the peer never answers the ClientHello: the
+    handshake must end at the request's TOTAL deadline (the TLS socket is registered with the
+    watchdog before its handshake), not after a fresh socket timeout set before connect."""
+    import socket
+    release = threading.Event()
+
+    def stall(conn):
+        try:
+            conn.recv(4096)
+            release.wait(10)
+        finally:
+            conn.close()
+
+    real_create = socket.create_connection
+
+    def slow_create(*a, **kw):
+        time.sleep(0.5)
+        return real_create(*a, **kw)
+
+    monkeypatch.setattr(socket, "create_connection", slow_create)
+    lsock, port = _raw_listener(stall)
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(v.FetchError) as ei:
+            v.fetch_and_verify(f"https://localhost:{port}", JOB, keys=pinned, timeout=1.0)
+    finally:
+        release.set()
+        lsock.close()
+    elapsed = time.monotonic() - t0
+    assert ei.value.code == "timeout" and ei.value.retryable
+    assert elapsed < 1.35, elapsed                          # not ~0.5 + a fresh 1.0

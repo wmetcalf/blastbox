@@ -146,7 +146,12 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         _err(f"error: --key {exc}")
         return EXIT_USAGE
     expect_input = None
-    if args.input:
+    if args.input is not None:
+        if not args.input:
+            # `--input "$FILE"` with FILE unset: the caller asked for input binding; never
+            # silently verify without it.
+            _err("error: --input: empty path")
+            return EXIT_USAGE
         try:
             expect_input = _sha256_file(args.input)
         except OSError as exc:

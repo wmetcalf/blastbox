@@ -531,6 +531,11 @@ def _pem(pub) -> str:
     lambda: _pem(ec.generate_private_key(ec.SECP384R1()).public_key()),
     lambda: _pem(rsa.generate_private_key(public_exponent=65537, key_size=2048).public_key()),
     lambda: "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n",
+    # Well-formed SPKI with an algorithm OID (1.2.3.4) no backend implements:
+    # load_pem_public_key raises UnsupportedAlgorithm, which must still be a refusal.
+    lambda: ("-----BEGIN PUBLIC KEY-----\n"
+             + base64.b64encode(bytes.fromhex("300c300506032a03040303000102")).decode()
+             + "\n-----END PUBLIC KEY-----\n"),
 ])
 def test_a_key_that_is_not_P256_is_refused(make):
     with pytest.raises(v.VerifyKeyRefused):

@@ -934,7 +934,24 @@ class _DeadlineConnection(http.client.HTTPConnection):
 
 
 class _DeadlineHTTPSConnection(_DeadlineConnection, http.client.HTTPSConnection):
-    pass
+    """HTTPSConnection.connect, with the TLS socket registered BEFORE its handshake: wrapping
+    detaches the raw socket the watchdog holds, so a handshake on an unregistered SSLSocket
+    could outlive the deadline (a peer trickling handshake bytes never trips the per-operation
+    socket timeout)."""
+
+    def connect(self) -> None:
+        self.timeout = self._deadline.socket_timeout()
+        # TCP connect (and any proxy CONNECT tunnel) on the raw socket, which _create registers.
+        http.client.HTTPConnection.connect(self)
+        # Private stdlib attributes (unchanged since 3.4/3.5); untyped in typeshed.
+        server_hostname = getattr(self, "_tunnel_host", None) or self.host
+        context: ssl.SSLContext = getattr(self, "_context")  # noqa: B009
+        sock = context.wrap_socket(self.sock, server_hostname=server_hostname,
+                                   do_handshake_on_connect=False)
+        self.sock = sock
+        self._deadline.register(sock)
+        sock.settimeout(self._deadline.socket_timeout())
+        sock.do_handshake()
 
 
 class _DeadlineHTTPHandler(urllib.request.HTTPHandler):
@@ -978,6 +995,12 @@ def _read_capped(resp, cap: int, deadline: _Deadline, what: str) -> bytes:  # no
         if total > cap:
             raise FetchError(f"{what} is larger than {cap} bytes", code="too_large")
         chunks.append(chunk)
+
+
+#: TLS errors that mean the transport broke during the handshake (a load balancer closing the
+#: connection, a reset), not that the endpoint is misconfigured.
+_TRANSIENT_TLS = (ssl.SSLEOFError, ssl.SSLZeroReturnError, ssl.SSLSyscallError,
+                  ssl.SSLWantReadError, ssl.SSLWantWriteError)
 
 
 def _timed_out(what: str) -> FetchError:
@@ -1030,9 +1053,10 @@ def _get_within(opener: urllib.request.OpenerDirector, url: str, *, headers: dic
         if deadline.expired or _is_timeout(exc):
             raise _timed_out(what) from exc
         reason = getattr(exc, "reason", exc)
-        if isinstance(reason, ssl.SSLError):
-            # A certificate or handshake failure is a configuration problem (wrong CA, wrong
-            # name, not TLS at all), never something to retry into success.
+        if isinstance(reason, ssl.SSLError) and not isinstance(reason, _TRANSIENT_TLS):
+            # A certificate or protocol failure is a configuration problem (wrong CA, wrong
+            # name, not TLS at all), never something to retry into success. A connection the
+            # peer dropped mid-handshake (EOF, reset) is transport trouble: retryable, below.
             raise FetchError(f"{what}: TLS failed: {_shown(reason)}", code="tls") from exc
         raise FetchError(f"{what}: {_shown(reason)}", code="network", retryable=True) from exc
     try:
@@ -1059,6 +1083,10 @@ def _status_failure(status: int, detail: str | None, what: str) -> FetchError:
     if status == 409:
         return FetchError(f"{what}: the job is not finished yet (409){suffix}", code="not_ready",
                           retryable=True, status=status)
+    if status == 408:
+        # The server (or a proxy) timed the request out; both GETs are idempotent.
+        return FetchError(f"{what}: the server timed the request out (408){suffix}",
+                          code="timeout", retryable=True, status=status)
     if status in (401, 403):
         return FetchError(f"{what}: not authorized ({status}){suffix}", code="unauthorized",
                           status=status)
