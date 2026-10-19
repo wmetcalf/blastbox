@@ -628,8 +628,16 @@ def reassert_units(*, nft_bin: str, nft_file: str, iface: str, base: str,
     # `nft -f <missing>` exits non-zero, which stops the link. (While the link is down the
     # stop is a no-op, so a timer that outlives a teardown is harmless.) The unit still exits
     # non-zero after stopping the link so the failure is visible in `systemctl --failed`.
+    #
+    # Stopping the UNIT is not enough: `wg_up` (host) and `join` (Linux worker) fall back to a
+    # direct `wg-quick up` when systemd will not start it, leaving the interface live with the
+    # unit INACTIVE -- `systemctl stop` is then a no-op and the link stays up unfirewalled. So
+    # the failure path also runs `wg-quick down`, and as a last resort deletes the interface;
+    # each step is a harmless no-op when the one before it already took the link down.
+    i = _link_iface(iface)
     cmd = (f"{shlex.quote(nft_bin)} -f {shlex.quote(nft_file)} || "
-           f"{{ systemctl stop wg-quick@{_link_iface(iface)}.service; exit 1; }}")
+           f"{{ systemctl stop wg-quick@{i}.service; wg-quick down {i} >/dev/null 2>&1; "
+           f"ip link delete dev {i} >/dev/null 2>&1; exit 1; }}")
     service = f"""# {description} -- periodic re-assert. Generated from
 # blastbox.host.worker_link.reassert_units; triggered by {base}-reassert.timer.
 # Deliberately unconditional: a missing ruleset file must STOP the link, not skip this.

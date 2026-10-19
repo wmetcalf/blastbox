@@ -326,6 +326,15 @@ def _refuse_incompatible_reinit(cfg: WorkerLinkConfig) -> list[str]:
     # environment, which is also how `cfg` was built -- so an override in the environment
     # would make prev == cfg and strand every worker unchecked.
     file_env = _persisted_env()
+    # The firewall table, ruleset file and boot unit are node-global. If ANY record on disk --
+    # the env file or the boot unit (which survives a deleted env file) -- names another
+    # interface, installing for this one would replace that link's firewall while its tunnel
+    # stays up. Checked first, before the per-interface config below is even consulted.
+    other = sorted(_installed_ifaces() - {cfg.wg_iface})
+    if other:
+        raise RuntimeError(f"worker-link is already set up on {', '.join(other)}; run "
+                           "`blastbox worker-link teardown` before moving it to "
+                           f"{cfg.wg_iface}")
     notes: list[str] = []
     conf = _conf(cfg)
     try:
@@ -471,8 +480,26 @@ def _refuse_uninstalled_override(cfg: WorkerLinkConfig, what: str) -> None:
             "or change the installed link with `blastbox worker-link init` first.")
 
 
-def _apply_peers(cfg: WorkerLinkConfig, old_body: str, new_body: str) -> None:
-    """Apply a PEER-ONLY change to the live link interface, without restarting it.
+def _live_peers(iface: str) -> "set[tuple[str, str]] | None":
+    """``{(public key, allowed-ips)}`` on the LIVE interface, or None if it cannot be read."""
+    proc = ea._run(["wg", "show", iface, "allowed-ips"], check=False)
+    if proc.returncode != 0:
+        return None
+    out: set[tuple[str, str]] = set()
+    for line in (proc.stdout or "").splitlines():
+        key, _, ips = line.partition("\t")
+        if key.strip():
+            out.add((key.strip(), ",".join(sorted(ips.split()))))
+    return out
+
+
+def _apply_peers(cfg: WorkerLinkConfig, body: str) -> None:
+    """Make the LIVE link interface's peers match ``body`` (the config on disk), in place.
+
+    Compared against the interface itself, not against the previous file: the file is written
+    first, so after a sync that FAILED the file already holds the new peer and a retry would
+    see "nothing changed" and hand out a bundle for a peer the interface never got. Reading
+    the live peer set makes every run reconcile, whatever an earlier one left behind.
 
     ``egress_apply._reload_wg`` restarts ``wg-quick@<iface>`` when systemd manages it. Here that
     is wrong: the host learns each worker's NATed endpoint from its handshakes (peers carry no
@@ -482,11 +509,13 @@ def _apply_peers(cfg: WorkerLinkConfig, old_body: str, new_body: str) -> None:
     link's interface only; no other WireGuard interface (the egress overlay, a hand-managed one)
     is touched. A change to the comments alone (``# expires:``) reaches nothing live at all.
     """
-    if ea._peer_blocks(old_body) == ea._peer_blocks(new_body):
-        return
     iface = cfg.wg_iface
     if not ea._ok(["ip", "link", "show", iface]):
         return          # down: wg-quick reads the file when it comes up
+    want = {(key, ",".join(sorted(ip.replace(",", " ").split())))
+            for _n, ip, key in ea._peer_blocks(body)}
+    if _live_peers(iface) == want:
+        return
     conf = _conf(cfg)
     stripped = ea._run(["wg-quick", "strip", str(conf)], check=False)
     if stripped.returncode == 0 and stripped.stdout:
@@ -496,15 +525,17 @@ def _apply_peers(cfg: WorkerLinkConfig, old_body: str, new_body: str) -> None:
             synced = ea._run(["wg", "syncconf", iface, str(tmp)], check=False)
         finally:
             tmp.unlink(missing_ok=True)
-        if synced.returncode == 0:
+        if synced.returncode == 0 and _live_peers(iface) == want:
             return
-        tail = (synced.stderr or "").strip().splitlines()[-1:] or ["no detail"]
+        tail = ((synced.stderr or "").strip().splitlines()[-1:]
+                or ["the live peers still differ after syncconf"])
     else:
         tail = (stripped.stderr or "").strip().splitlines()[-1:] or ["no detail"]
     raise RuntimeError(
-        f"changed {conf} but could NOT apply it to the live {iface} ({tail[0]}); the running "
-        f"interface still has the old peers. Run `wg syncconf {iface} <(wg-quick strip {iface})` "
-        "by hand before trusting this.")
+        f"{conf} is written but could NOT be applied to the live {iface} ({tail[0]}); the "
+        "running interface still has the old peers. Re-run the same command once the cause is "
+        f"fixed (it reconciles the live interface), or run `wg syncconf {iface} "
+        f"<(wg-quick strip {iface})` by hand.")
 
 
 def _cert_expiry(cert_pem: bytes) -> str:
@@ -587,7 +618,9 @@ def add_worker(cfg: WorkerLinkConfig, name: str, public_key: str, csr_pem: bytes
         changed = new_body != body
         if changed:
             ea._write_conf(conf, new_body)
-            _apply_peers(cfg, body, new_body)
+        # ALWAYS, not only when the file changed: a previous run may have written the file and
+        # then failed to apply it. This reconciles against the live interface (a no-op if equal).
+        _apply_peers(cfg, new_body)
     cert_dir = Path(pki_dir) / CERT_SUBDIR
     cert_dir.mkdir(parents=True, exist_ok=True)
     (cert_dir / f"{name}.crt").write_bytes(cert_pem)
@@ -614,10 +647,13 @@ def remove_worker(cfg: WorkerLinkConfig, name: str, *, pki_dir: Path | None = No
     with ea.conf_lock(cfg):
         body = conf.read_text()
         if name not in _registered(body):
+            # ...but still reconcile: a previous remove may have dropped it from the file and
+            # then failed to take it off the live interface, where it would keep its tunnel.
+            _apply_peers(cfg, body)
             return False
         new_body = ea.drop_peer_blocks(body, [name])
         ea._write_conf(conf, new_body)
-        _apply_peers(cfg, body, new_body)
+        _apply_peers(cfg, new_body)
     if pki_dir is not None:
         (Path(pki_dir) / CERT_SUBDIR / f"{name}.crt").unlink(missing_ok=True)
     return True
@@ -713,6 +749,15 @@ def teardown(cfg: WorkerLinkConfig) -> list[str]:
     if ea._ok(["ip", "link", "show", cfg.wg_iface]):
         notes.append(f"WARNING: {cfg.wg_iface} is STILL UP; the firewall is left in place "
                      "until it is down. Bring it down by hand and re-run teardown.")
+        return notes
+    # ...and DISABLED, verified. The interface config is deliberately kept, so a wg-quick unit
+    # still enabled (its `disable` failed even though `wg-quick down` then worked) would bring
+    # that interface back at the next boot -- after this function removed the firewall unit
+    # it Requires. `is-enabled` exits 0 for every state that starts at boot.
+    if ea._ok(["systemctl", "is-enabled", f"wg-quick@{cfg.wg_iface}"]):
+        notes.append(f"WARNING: wg-quick@{cfg.wg_iface} is STILL ENABLED, so it would start "
+                     f"{cfg.wg_iface} at the next boot; the firewall is left in place. Run "
+                     f"`systemctl disable wg-quick@{cfg.wg_iface}` and re-run teardown.")
         return notes
     notes.append(f"{cfg.wg_iface} down; wg-quick@{cfg.wg_iface} disabled")
     ea._run(["systemctl", "disable", "--now", REASSERT_TIMER_NAME], check=False)

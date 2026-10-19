@@ -40,8 +40,11 @@ class FakeHost:
         self.nft_refuses = False
         self.dump = ""
         self.stuck_up = False
-        self.live_peers: dict[str, set[str]] = {}    # iface -> public keys on the LIVE interface
+        #: iface -> {public key: allowed-ips} on the LIVE interface
+        self.live_peers: dict[str, dict[str, str]] = {}
         self.syncconf_fails = False
+        self.enabled: set[str] = set()                 # unit names `systemctl enable`d
+        self.disable_fails = False
 
     def run(self, argv, check: bool = True, capture: bool = True):
         a = [str(x) for x in argv]
@@ -67,13 +70,21 @@ class FakeHost:
             rc = 0 if a[3] in self.links else 1
         elif a[:3] == ["ip", "-j", "route"] or a[:3] == ["ip", "-j", "addr"]:
             out = "[]"
+        elif a[:2] == ["systemctl", "is-enabled"]:
+            rc = 0 if a[2] in self.enabled else 1
+        elif a[:2] == ["systemctl", "enable"]:
+            self.enabled.add(a[-1])
+            if a[2] == "--now" and a[3].startswith("wg-quick@"):
+                self.links.add(a[3].split("@")[1])
+        elif a[:2] == ["systemctl", "disable"] and self.disable_fails \
+                and a[-1].startswith("wg-quick@"):
+            rc, err = 1, "Failed to disable unit"
+        elif a[:2] == ["systemctl", "disable"]:
+            self.enabled.discard(a[-1])
+            if a[2] == "--now" and a[3].startswith("wg-quick@") and not self.stuck_up:
+                self.links.discard(a[3].split("@")[1])
         elif a[:2] == ["systemctl", "is-active"]:
             rc = 0 if a[2].split("@")[-1] in self.links else 3
-        elif a[:3] == ["systemctl", "enable", "--now"] and a[3].startswith("wg-quick@"):
-            self.links.add(a[3].split("@")[1])
-        elif a[:3] == ["systemctl", "disable", "--now"] and a[3].startswith("wg-quick@"):
-            if not self.stuck_up:
-                self.links.discard(a[3].split("@")[1])
         elif a[:2] == ["wg-quick", "strip"]:
             body = Path(a[2]).read_text()
             out = "\n".join(ln for ln in body.splitlines()
@@ -82,9 +93,18 @@ class FakeHost:
             if self.syncconf_fails:
                 rc, err = 1, "Unable to modify interface"
             else:
-                self.live_peers[a[2]] = {ln.split("=", 1)[1].strip()
-                                         for ln in Path(a[3]).read_text().splitlines()
-                                         if ln.startswith("PublicKey")}
+                peers: dict[str, str] = {}
+                key = ""
+                for ln in Path(a[3]).read_text().splitlines():
+                    k, _, v = ln.partition("=")
+                    if k.strip() == "PublicKey":
+                        key = v.strip()
+                        peers[key] = ""
+                    elif k.strip() == "AllowedIPs" and key:
+                        peers[key] = v.strip()
+                self.live_peers[a[2]] = peers
+        elif a[:2] == ["wg", "show"] and a[3:] == ["allowed-ips"]:
+            out = "".join(f"{k}\t{v}\n" for k, v in self.live_peers.get(a[2], {}).items())
         elif a[:2] == ["wg-quick", "down"]:
             if not self.stuck_up:
                 self.links.discard(a[2])
@@ -426,7 +446,7 @@ def test_remove_takes_the_worker_off_the_live_interface(host, pki):
     assert wla.remove_worker(cfg, "mac1", pki_dir=pki) is True
     # applied IN PLACE to the live link (wg syncconf), never by restarting it
     assert any(c[:3] == ["wg", "syncconf", "wtwg0"] for c in host.calls)
-    assert host.live_peers["wtwg0"] == {KEY_B}
+    assert set(host.live_peers["wtwg0"]) == {KEY_B}
     assert not any(c[:2] == ["systemctl", "restart"] for c in host.calls)
     assert [r["name"] for r in wla.list_workers(cfg)] == ["mac2"]
     assert not (pki / "worker-link" / "mac1.crt").exists()
@@ -468,7 +488,7 @@ def test_peer_changes_are_synced_in_place_never_by_restarting_any_tunnel(host, p
     host.calls.clear()
     wla.add_worker(cfg, "mac1", KEY_A, _csr(_ip("10.78.0.2")), pki_dir=pki)
     wla.add_worker(cfg, "mac2", KEY_B, _csr(_ip("10.78.0.3")), pki_dir=pki)
-    assert host.live_peers["wtwg0"] == {KEY_A, KEY_B}
+    assert set(host.live_peers["wtwg0"]) == {KEY_A, KEY_B}
     host.calls.clear()
     _b, changed = wla.add_worker(cfg, "mac1", KEY_A, _csr(_ip("10.78.0.2")), days=20,
                                  pki_dir=pki)                  # renewal: only # expires: moves
@@ -486,9 +506,66 @@ def test_a_peer_change_that_cannot_reach_the_live_link_is_loud(host, pki):
     cfg = _cfg()
     wla.init_host(cfg)
     host.syncconf_fails = True
-    with pytest.raises(RuntimeError, match="could NOT apply it to the live wtwg0"):
+    with pytest.raises(RuntimeError, match="to the live wtwg0"):
         wla.add_worker(cfg, "mac1", KEY_A, _csr(_ip("10.78.0.2")), pki_dir=pki)
     assert not any(c[:2] == ["systemctl", "restart"] for c in host.calls)
+
+
+def test_a_retry_after_a_failed_live_sync_reconciles_the_interface(host, pki):
+    """REGRESSION (review): the file is written before `wg syncconf`; when the sync failed, a
+    retry compared the file with ITSELF ("nothing changed"), skipped the sync and returned a
+    bundle for a peer the live interface never got. The live peer set is now what is compared."""
+    cfg = _cfg()
+    wla.init_host(cfg)
+    host.syncconf_fails = True
+    with pytest.raises(RuntimeError, match="to the live wtwg0"):
+        wla.add_worker(cfg, "mac1", KEY_A, _csr(_ip("10.78.0.2")), pki_dir=pki)
+    assert "# peer:mac1" in (ea.WG_DIR / "wtwg0.conf").read_text()     # on disk already
+    assert not host.live_peers.get("wtwg0")
+    with pytest.raises(RuntimeError, match="to the live wtwg0"):     # still failing: loud
+        wla.add_worker(cfg, "mac1", KEY_A, _csr(_ip("10.78.0.2")), pki_dir=pki)
+    host.syncconf_fails = False
+    _b, changed = wla.add_worker(cfg, "mac1", KEY_A, _csr(_ip("10.78.0.2")), pki_dir=pki)
+    assert host.live_peers["wtwg0"] == {KEY_A: "10.78.0.2/32"}
+    # the same for remove: file updated, live sync failed, the retry still takes it off
+    host.syncconf_fails = True
+    with pytest.raises(RuntimeError, match="to the live wtwg0"):
+        wla.remove_worker(cfg, "mac1")
+    host.syncconf_fails = False
+    assert wla.remove_worker(cfg, "mac1") is False                      # gone from the file...
+    assert host.live_peers["wtwg0"] == {}                               # ...and now live too
+
+
+def test_teardown_keeps_the_firewall_while_the_link_unit_is_still_enabled(host):
+    """REGRESSION (review): `systemctl disable --now` failing while `wg-quick down` succeeded
+    passed the interface check, so teardown removed the firewall unit the still-ENABLED
+    wg-quick unit Requires -- and the kept interface config came up unfirewalled at boot."""
+    cfg = _cfg()
+    wla.init_host(cfg)
+    host.enabled.add("wg-quick@wtwg0")
+    host.disable_fails = True
+    notes = wla.teardown(cfg)
+    assert "STILL ENABLED" in notes[-1]
+    assert "wtwg0" not in host.links                                    # it did go down
+    assert host.loaded is not None and wla.FW_UNIT.exists() and wla.FW_FILE.exists()
+    assert wla.ENV_FILE.exists()
+    host.disable_fails = False
+    wla.teardown(cfg)
+    assert host.loaded is None and not wla.FW_UNIT.exists()
+
+
+def test_init_refuses_a_second_interface_when_the_env_file_is_gone(host):
+    """REGRESSION (review): with the env file deleted but the old link's boot unit (and
+    tunnel) still in place, init on a disjoint interface looked like a fresh install and
+    replaced the node-global table and boot unit, leaving the old tunnel up unfirewalled."""
+    wla.init_host(_cfg())
+    loaded, unit = host.loaded, wla.FW_UNIT.read_text()
+    wla.ENV_FILE.unlink()
+    with pytest.raises(RuntimeError, match="already set up on wtwg0"):
+        wla.init_host(_cfg(wg_iface="wtwg1", overlay_net="10.79.0.0/24", wg_port=51900))
+    assert host.loaded == loaded and wla.FW_UNIT.read_text() == unit
+    assert "wtwg1" not in host.links
+    wla.init_host(_cfg())                                  # the installed one: fine
 
 
 # ----------------------------------------------------------------------------- status

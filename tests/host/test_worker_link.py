@@ -354,7 +354,8 @@ def test_the_reassert_units_restore_a_flushed_ruleset_or_stop_the_link():
     svc, timer = reassert_units(nft_bin="/usr/sbin/nft", nft_file="/etc/blastbox/worker-link.nft",
                                 iface="wtwg0", base="blastbox-worker-link-fw", description="d")
     assert ("ExecStart=/bin/sh -c '/usr/sbin/nft -f /etc/blastbox/worker-link.nft || "
-            "{ systemctl stop wg-quick@wtwg0.service; exit 1; }'") in svc
+            "{ systemctl stop wg-quick@wtwg0.service; wg-quick down wtwg0 >/dev/null 2>&1; "
+            "ip link delete dev wtwg0 >/dev/null 2>&1; exit 1; }'") in svc
     assert "OnUnitActiveSec=1min" in timer and "Unit=blastbox-worker-link-fw-reassert.service" in timer
 
 
@@ -372,7 +373,9 @@ def test_the_reassert_service_stops_the_link_when_the_ruleset_file_is_gone(tmp_p
     bindir = tmp_path / "bin"
     bindir.mkdir()
     for name, body in (("nft", f'echo "nft $*" >> {rec}\n[ -f "$2" ]\n'),
-                       ("systemctl", f'echo "systemctl $*" >> {rec}\n')):
+                       ("systemctl", f'echo "systemctl $*" >> {rec}\n'),
+                       ("wg-quick", f'echo "wg-quick $*" >> {rec}\nexit 1\n'),
+                       ("ip", f'echo "ip $*" >> {rec}\n')):
         (bindir / name).write_text("#!/bin/sh\n" + body)
         (bindir / name).chmod(0o755)
     missing = tmp_path / "worker-link.nft"
@@ -385,6 +388,14 @@ def test_the_reassert_service_stops_the_link_when_the_ruleset_file_is_gone(tmp_p
     proc = subprocess.run(argv, env=env, capture_output=True, text=True)
     assert proc.returncode != 0                       # visible as a failed unit
     assert "systemctl stop wg-quick@wtwg0.service" in rec.read_text()
+    rec.write_text("")
+    # REGRESSION (review): a link brought up by the direct `wg-quick up` FALLBACK has no
+    # active unit, so `systemctl stop` alone left it up unfirewalled. The failure path also
+    # runs `wg-quick down` and, should that fail (stubbed to here), deletes the interface.
+    missing.unlink(missing_ok=True)
+    assert subprocess.run(argv, env=env).returncode != 0
+    calls = rec.read_text()
+    assert "wg-quick down wtwg0" in calls and "ip link delete dev wtwg0" in calls
     rec.write_text("")
     missing.write_text("table inet x {}\n")          # present and loadable: link left alone
     assert subprocess.run(argv, env=env).returncode == 0
