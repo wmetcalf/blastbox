@@ -42,8 +42,9 @@ def key(tmp_path):
 
 
 @pytest.fixture
-def ingress(tmp_path):
-    client, store = _make_client(tmp_path, api_key=TOKEN)
+def ingress(tmp_path, request):
+    # indirect parametrisation may substitute the ingress's BLASTBOX_API_KEY
+    client, store = _make_client(tmp_path, api_key=getattr(request, "param", TOKEN))
     server = uvicorn.Server(uvicorn.Config(client.app, log_level="warning", lifespan="off"))
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
@@ -62,7 +63,7 @@ def ingress(tmp_path):
         sock.close()
 
 
-def _submit(url: str) -> str:
+def _submit(url: str, token: str = TOKEN) -> str:
     """POST /v1/jobs over real HTTP, as a client does."""
     boundary = uuid.uuid4().hex
     body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"engine\"\r\n\r\n"
@@ -71,7 +72,7 @@ def _submit(url: str) -> str:
         + SAMPLE + f"\r\n--{boundary}--\r\n".encode()
     req = urllib.request.Request(f"{url}/v1/jobs", data=body, method="POST", headers={
         "Content-Type": f"multipart/form-data; boundary={boundary}",
-        "Authorization": f"Bearer {TOKEN}"})
+        "Authorization": f"Bearer {token}"})
     with urllib.request.urlopen(req, timeout=10) as resp:
         assert resp.status == 202
         return json.loads(resp.read())["job_id"]
@@ -316,7 +317,9 @@ def _unknown_algorithm_pem() -> bytes:
     (["--max-age", "nan"], None, None),
     (["--timeout", "inf"], None, None),
     ([], "töken☃", None),                        # not encodable as a header
-    ([], "has space", None),
+    ([], "a\tb", None),
+    (["--timeout", "1e20"], None, None),
+    (["--url", "http://bad host"], None, None),
     ([], None, "t☃ken\n"),
 ])
 def test_cli_empty_or_malformed_options_are_usage_errors(
@@ -341,5 +344,36 @@ def test_cli_empty_or_malformed_options_are_usage_errors(
                     "0b9d6a0e-6c1d-4f43-9d55-0f6a3c1c7e21", "--key", str(tmp_path / "pin.pem"),
                     *extra], capsys)
     assert rc == client_cli.EXIT_USAGE, cap.err
-    for secret in ("töken", "has space", "t☃ken"):
+    for secret in ("töken", "a\tb", "t☃ken"):
         assert secret not in cap.err                        # the token is never echoed
+
+
+LATIN1_KEY = "my key caf\u00e9"
+
+
+@pytest.mark.parametrize("ingress", [LATIN1_KEY], indirect=True)
+def test_a_key_the_ingress_accepts_works_with_the_client(tmp_path, ingress, key, capsys,
+                                                        monkeypatch):
+    """An API key with an inner space and a Latin-1 letter is a valid ingress credential (it
+    strips outer whitespace and compares the rest): the client and the CLI must accept and
+    send it unchanged, and a WRONG key must still be refused by the ingress."""
+    url, store = ingress
+    job_id = _submit(url, token=LATIN1_KEY)
+    _dispatch(tmp_path, store, job_id, key)
+    keys = v.load_pinned_keys(key.public_key_pem)
+    out = v.fetch_and_verify(url, job_id, keys=keys, token=f" {LATIN1_KEY}\n")
+    assert out.receipt.job_id == job_id
+    with pytest.raises(v.FetchError) as ei:
+        v.fetch_and_verify(url, job_id, keys=keys, token="my key cafe")
+    assert ei.value.code == "unauthorized"
+
+    (tmp_path / "pin.pem").write_text(key.public_key_pem)
+    monkeypatch.setenv("BLASTBOX_API_KEY", LATIN1_KEY)
+    rc, cap = _cli(["attest", "verify", "--url", url, "--job", job_id, "--key",
+                    str(tmp_path / "pin.pem")], capsys)
+    assert rc == client_cli.EXIT_VERIFIED, cap.err
+    monkeypatch.delenv("BLASTBOX_API_KEY")
+    (tmp_path / "tok").write_text(LATIN1_KEY + "\n", encoding="utf-8")
+    rc, cap = _cli(["attest", "verify", "--url", url, "--job", job_id, "--key",
+                    str(tmp_path / "pin.pem"), "--token-file", str(tmp_path / "tok")], capsys)
+    assert rc == client_cli.EXIT_VERIFIED, cap.err

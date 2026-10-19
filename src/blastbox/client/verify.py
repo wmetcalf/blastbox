@@ -110,6 +110,9 @@ KEY_FILE_MAX_BYTES = 64 << 10
 DEFAULT_METADATA_MAX_BYTES = 64 << 20
 #: Default per-request budget, in seconds, for :func:`fetch_and_verify`.
 DEFAULT_TIMEOUT_S = 30.0
+#: The largest per-request budget :func:`fetch_and_verify` accepts (a day). Far past any real
+#: request, and well inside what socket timeouts and timers can represent.
+MAX_TIMEOUT_S = 86400.0
 #: How far a receipt's issued_at_ms may lie in the verifier's future when ``max_age`` is checked.
 DEFAULT_MAX_CLOCK_SKEW_S = 300.0
 #: The most of an HTTP error body read for its ``detail``.
@@ -821,7 +824,13 @@ class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
 def _base_url(base_url: str) -> str:
     if not isinstance(base_url, str):
         raise TypeError("base_url must be a str")
-    parts = urllib.parse.urlsplit(base_url.strip())
+    if not base_url.isascii() or any(c.isspace() or not c.isprintable() for c in base_url):
+        # urlsplit silently DROPS tabs/newlines (changing the destination) and http.client
+        # refuses spaces/controls only when sending -- which would surface as a retryable
+        # network error. A non-ASCII host cannot go in a Host header: use its xn-- form.
+        raise ValueError("base_url must be plain ASCII with no whitespace or control "
+                         "characters (use the xn-- form of an internationalised host)")
+    parts = urllib.parse.urlsplit(base_url)
     if parts.scheme not in ("http", "https"):
         raise ValueError("base_url must be an http:// or https:// URL")
     if not parts.hostname:
@@ -1028,6 +1037,10 @@ _TRANSIENT_TLS = (ssl.SSLEOFError, ssl.SSLZeroReturnError, ssl.SSLSyscallError,
                   ssl.SSLWantReadError, ssl.SSLWantWriteError)
 
 
+#: Errors raised while BUILDING or sending a request from local values, never by the network.
+_LOCAL_REQUEST_ERRORS = (http.client.InvalidURL, UnicodeError, OverflowError)
+
+
 def _timed_out(what: str) -> FetchError:
     return FetchError(f"{what}: timed out", code="timeout", retryable=True)
 
@@ -1077,6 +1090,14 @@ def _get_within(opener: urllib.request.OpenerDirector, url: str, *, headers: dic
     except Exception as exc:  # noqa: BLE001 - also http.client protocol errors, bad headers
         if deadline.expired or _is_timeout(exc):
             raise _timed_out(what) from exc
+        # URLError wraps the underlying error in .reason; a UnicodeError's own .reason is a str.
+        local = exc if isinstance(exc, _LOCAL_REQUEST_ERRORS) else getattr(exc, "reason", None)
+        if isinstance(local, _LOCAL_REQUEST_ERRORS):
+            # The request itself could not be built or sent (a URL or header value http.client
+            # refuses, a value the socket API cannot represent): a permanent usage error,
+            # never a retryable network failure. fetch_and_verify validates its arguments so
+            # this should not happen; if it does, it must not be retried forever.
+            raise ValueError(f"{what}: the request cannot be sent: {_shown(local)}") from exc
         reason = getattr(exc, "reason", exc)
         if isinstance(reason, ssl.SSLError) and not isinstance(reason, _TRANSIENT_TLS):
             # A certificate or protocol failure is a configuration problem (wrong CA, wrong
@@ -1152,7 +1173,10 @@ def fetch_and_verify(
     Certificates are verified (pass ``ssl_context`` to pin a private CA).
 
     Raises :class:`NoReceipt` (404/410/tombstone), :class:`FetchError` (``retryable`` for 409,
-    429/5xx, network errors and timeouts), or any failure of :func:`verify_receipt`."""
+    429/5xx, network errors and timeouts), or any failure of :func:`verify_receipt`. A bad
+    argument -- including a ``base_url``, ``token`` or ``timeout`` (at most
+    :data:`MAX_TIMEOUT_S`) that a request could not carry -- is a TypeError/ValueError before
+    any request, never a retryable FetchError."""
     pinned = _as_pinned(keys)
     # Every argument is checked BEFORE the first request, so a typo is a TypeError/ValueError
     # up front, never a fetch followed by a late argument error.
@@ -1163,19 +1187,22 @@ def fetch_and_verify(
     root = _base_url(base_url)
     job_id = _canonical_job_id(job_id)
     timeout_s = _seconds(timeout, "timeout")
-    if not 0 < timeout_s < math.inf:
-        raise ValueError("timeout must be a finite number of seconds > 0")
+    if not 0 < timeout_s <= MAX_TIMEOUT_S:
+        raise ValueError(f"timeout must be a number of seconds > 0 and <= {MAX_TIMEOUT_S:g}")
     if type(max_metadata_bytes) is not int or max_metadata_bytes <= 0:
         raise ValueError("max_metadata_bytes must be a positive int")
     headers = {"Accept": "application/json", "Accept-Encoding": "identity"}
     if token is not None:
-        # Visible ASCII only: anything else either cannot be encoded as a header (a non-Latin-1
-        # character fails inside http.client, which would surface as a retryable network
-        # error) or is not a bearer token (spaces, controls, CR/LF injection).
+        # Exactly what the ingress accepts and a header can carry: the ingress strips outer
+        # whitespace from BLASTBOX_API_KEY and from the presented token, then compares the
+        # rest byte-for-byte (Starlette decodes headers as Latin-1). So inner spaces and
+        # Latin-1 letters are fine; anything outside Latin-1 cannot be sent, and a control
+        # character (CR/LF/NUL, tab, DEL, C1) is either header injection or not a key.
         stripped = token.strip() if isinstance(token, str) else ""
-        if not stripped or not all("!" <= c <= "~" for c in stripped):
-            raise ValueError("token must be a non-empty bearer token of visible ASCII "
-                             "characters (no spaces or control characters)")
+        if not stripped or not all(" " <= c <= "~" or "\xa0" <= c <= "\xff"
+                                   for c in stripped):
+            raise ValueError("token must be a non-empty single-line Latin-1 string without "
+                             "control characters")
         headers["Authorization"] = f"Bearer {stripped}"
     job_url = f"{root}/v1/jobs/{urllib.parse.quote(job_id, safe='')}"
 

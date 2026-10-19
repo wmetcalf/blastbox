@@ -466,6 +466,8 @@ def test_connection_refused_is_retryable(pinned):
     "file:///etc", "ftp://h/", "h:8000", "http://", "http://u:p@h/", "http://h/?q=1",
     "http://h/#f", "javascript:alert(1)", "http://h:abc", "http://h:70000", "http://h:65536",
     "http://h:0", "http://h:-1", "http://h:+80", "https://[::1]:99999",
+    "http://bad host", "http://h/base path", "http://h\t/", "http://h/\n", " http://h",
+    "http://h/ ", "http://h\x00/", "http://h/\x7f", "http://b\u00fccher.example",
 ])
 def test_only_plain_http_and_https_base_urls(pinned, url):
     with pytest.raises(ValueError):
@@ -503,7 +505,8 @@ def test_the_job_id_must_be_a_canonical_uuid(pinned, job_id):
     {"token": "a\r\nX-Evil: 1"}, {"token": ""}, {"timeout": 0}, {"timeout": -1},
     {"max_metadata_bytes": 0}, {"max_metadata_bytes": 1.5}, {"timeout": float("inf")},
     {"timeout": float("nan")}, {"max_age": -5}, {"max_age": float("inf")},
-    {"token": "t\u00f6ken\u2603"}, {"token": "caf\u00e9"}, {"token": "a b"}, {"token": "a\tb"},
+    {"token": "t\u00f6ken\u2603"}, {"token": "a\tb"}, {"token": "a\x85b"}, {"token": "a\x01b"},
+    {"timeout": 1e20}, {"timeout": 86400.5},
     {"token": "a\x7fb"},
 ])
 def test_bad_fetch_arguments(pinned, kw):
@@ -618,14 +621,28 @@ def test_a_stalled_tls_handshake_after_a_slow_connect_ends_at_the_total_deadline
         finally:
             conn.close()
 
-    real_create = socket.create_connection
-
-    def slow_create(*a, **kw):
-        time.sleep(0.5)
-        return real_create(*a, **kw)
-
-    monkeypatch.setattr(socket, "create_connection", slow_create)
     lsock, port = _raw_listener(stall)
+    delayed: list[tuple] = []
+
+    class SlowConnectSocket(socket.socket):
+        """The socket class the production connect path constructs: its connect() to the
+        listener takes 0.5s, as a slow TCP connect would."""
+
+        def connect(self, address):
+            if address[:2] == ("127.0.0.1", port):
+                delayed.append(address)
+                time.sleep(0.5)
+            return super().connect(address)
+
+    real_getaddrinfo = socket.getaddrinfo
+
+    def ipv4_only(host, p, *a, **kw):
+        if host == "localhost":     # one deterministic address: the delayed listener
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", p))]
+        return real_getaddrinfo(host, p, *a, **kw)
+
+    monkeypatch.setattr(socket, "getaddrinfo", ipv4_only)
+    monkeypatch.setattr(socket, "socket", SlowConnectSocket)
     t0 = time.monotonic()
     try:
         with pytest.raises(v.FetchError) as ei:
@@ -633,6 +650,7 @@ def test_a_stalled_tls_handshake_after_a_slow_connect_ends_at_the_total_deadline
     finally:
         release.set()
         lsock.close()
+    assert delayed, "the slow connect path was not exercised"
     elapsed = time.monotonic() - t0
     assert ei.value.code == "timeout" and ei.value.retryable
     assert elapsed < 1.35, elapsed                          # not ~0.5 + a fresh 1.0
@@ -673,3 +691,26 @@ def test_a_multi_address_host_cannot_spend_one_budget_per_address(srv, pinned, m
     elapsed = time.monotonic() - t0
     assert ei.value.code == "timeout" and ei.value.retryable
     assert elapsed < 1.0, elapsed                           # not ~3 x 0.6
+
+
+def test_a_latin1_token_with_inner_spaces_is_sent_exactly(srv, key, pinned):
+    """The ingress strips outer whitespace and compares the rest as Latin-1: a key with inner
+    spaces or Latin-1 letters is a valid credential and is sent byte-for-byte."""
+    srv.routes[A] = (200, _receipt(key), {})
+    srv.routes[M] = (200, METADATA, {})
+    out = v.fetch_and_verify(srv.url, JOB, keys=pinned, token="  my key caf\u00e9  ")
+    assert out.metadata == METADATA
+    for _, headers in srv.seen:
+        assert headers["Authorization"] == "Bearer my key caf\u00e9"
+
+
+def test_a_request_that_cannot_be_built_is_a_usage_error_not_a_retry():
+    """Whatever slips past argument validation and is refused by http.client or the socket API
+    while BUILDING the request (InvalidURL, UnicodeEncodeError, OverflowError) is a permanent
+    ValueError, never a retryable network FetchError."""
+    with pytest.raises(ValueError, match="cannot be sent"):
+        v._get("http://127.0.0.1:9/a b", headers={}, timeout=2, cap=10, what="attestation",
+               ssl_context=None)
+    with pytest.raises(ValueError, match="cannot be sent"):
+        v._get("http://127.0.0.1:9/", headers={"Authorization": "Bearer \u2603"}, timeout=2,
+               cap=10, what="attestation", ssl_context=None)
