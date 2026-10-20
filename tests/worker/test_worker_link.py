@@ -62,6 +62,9 @@ class FakeNode:
         self.stale_sock_kills = False           # removing its control socket stops it
         self.route_type = "unicast"
         self.nft_list_error: str | None = None
+        #: utun -> public key of ANOTHER WireGuard tunnel (macOS reuses utun numbers)
+        self.foreign_utuns: dict[str, str] = {}
+        self.name_at_down: list = []            # what each `wg-quick down` would have acted on
 
     def run(self, argv, *, input=None):
         a = [str(x) for x in argv]
@@ -76,7 +79,7 @@ class FakeNode:
             out = base64.b64encode(os.urandom(32)).decode() + "\n"
         elif tool == "wg" and a[1] == "pubkey":
             out = _wg_pub(input or "") + "\n"
-        elif tool == "wg" and a[1] == "show" and a[2] != "all":
+        elif tool == "wg" and a[1] == "show" and a[2] != "all" and a[3:] != ["public-key"]:
             if not self.root:
                 rc, err = 1, "Operation not permitted"
             else:
@@ -119,6 +122,17 @@ class FakeNode:
             p2p = dev in self.tunnels or not dev.startswith("en")
             out = (f"{dev}: flags=8051<UP,{'POINTOPOINT' if p2p else 'BROADCAST'},RUNNING,"
                    "MULTICAST> mtu 1500\n")
+        elif tool == "wg" and a[1] == "show" and a[2] != "all" and a[3:] == ["public-key"]:
+            key = link._paths("wtwg0")["wg_key"]
+            stale = self.stale_utun and not (self.stale_sock_kills
+                                             and not (link.WG_RUN_DIR / "utun7.sock").exists())
+            ours_live = (link.WG_RUN_DIR / "wtwg0.name").exists() or stale
+            if a[2] in self.foreign_utuns:
+                out = self.foreign_utuns[a[2]] + "\n"
+            elif a[2] == "utun7" and ours_live and key.exists():
+                out = _wg_pub(key.read_text()) + "\n"
+            else:
+                rc, err = 1, "Unable to access interface: No such device"
         elif tool == "wg" and a[1:3] == ["show", "all"]:
             key = link._paths("wtwg0")["wg_key"]
             stale = self.stale_utun and not (self.stale_sock_kills
@@ -126,6 +140,9 @@ class FakeNode:
             live = (link.WG_RUN_DIR / "wtwg0.name").exists() or stale
             out = f"utun7\t{_wg_pub(key.read_text())}\n" if live and key.exists() else ""
         elif tool == "wg-quick" and a[1] in ("down", "up"):
+            if a[1] == "down":
+                name = link.WG_RUN_DIR / f"{a[2]}.name"
+                self.name_at_down.append(name.read_text().strip() if name.exists() else None)
             if a[1] == "down" and self.wg_quick_down_works:
                 self.links.discard(a[2])
                 (link.WG_RUN_DIR / f"{a[2]}.name").unlink(missing_ok=True)
@@ -350,6 +367,9 @@ def mac(tmp_path):
     (state / "main").write_text('anchor "com.apple/*" all\n')
     env_hdr = f'LOG={log}; ST={state}; RUN={run_d}\necho "$(basename "$0") $*" >> "$LOG"\n'
     wg = _fake_bin(bin_d, "wg", env_hdr + (
+        'if [ "$1" = show ] && [ "$2" != all ] && [ "$3" = public-key ]; then\n'
+        '  [ -f "$ST/keys" ] && awk -v u="$2" \'$1 == u { print $2 }\' "$ST/keys"\n'
+        '  exit 0\nfi\n'
         'if [ "$1" = show ] && [ "$2" = all ]; then\n'
         '  [ -f "$ST/keys" ] && while read -r u k; do\n'
         '    [ -e "${RUN:?}/$u.sock" ] && printf "%s\\t%s\\n" "$u" "$k"; done < "$ST/keys"\n'
@@ -1537,3 +1557,58 @@ def test_linux_status_does_not_read_an_nft_failure_as_an_absent_table(node, tmp_
     n.nft_list_error = "Error: netlink: Cannot allocate memory"
     ok, rows = link.status("wtwg0")
     assert not ok and any("UNVERIFIED" in r and "Cannot allocate memory" in r for r in rows)
+
+
+# ------------------------------------------------------------------ review round 11
+
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_keygen_rotate_is_refused_while_the_link_is_live(node, tmp_path, platform):
+    """REGRESSION (review): `keygen --rotate` replaced the key the live tunnel is FOUND by (and
+    the running config still carries the old one). A later leave then derived the new key,
+    found no tunnel and called it down while it still handshook with the host."""
+    n = node(platform)
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    key = link._paths("wtwg0")["wg_key"].read_text()
+    with pytest.raises(RuntimeError, match="refusing to rotate"):
+        link.keygen("wtwg0", "10.78.0.5", rotate=True)
+    assert link._paths("wtwg0")["wg_key"].read_text() == key
+    link.leave("wtwg0")
+    if platform == "darwin":
+        n.launchd_loaded = False
+    link.keygen("wtwg0", "10.78.0.5", rotate=True)      # down and uninstalled: allowed
+    assert link._paths("wtwg0")["wg_key"].read_text() != key
+
+
+def test_watchdog_never_adopts_a_utun_that_runs_another_key(mac):
+    """REGRESSION (review): the name-file fast path accepted ANY live WireGuard utun -- macOS
+    reuses utun numbers, so a stale note naming another VPN's tunnel made the watchdog load
+    this link's block rules on it (and a later down could hit it). The recorded utun must run
+    the link's key; a foreign one is ignored, never brought down, and the link is re-upped."""
+    pub = "P" * 43 + "="
+    mac.rerender(public_key=pub)
+    mac.up("utun3")                                   # the note names utun3 ...
+    mac.keys(f"utun3\t{'F' * 43}=\n")                 # ... which runs SOMEONE ELSE'S key
+    calls = mac.run()
+    assert mac.sock("utun3")                          # their tunnel untouched
+    assert "wg-quick up wtwg0" in calls
+    assert "utun3" not in mac.anchor() and "on utun9" in mac.anchor()
+
+
+def test_python_paths_never_trust_a_name_file_naming_another_key(node, tmp_path):
+    """Sweep (review round 11): status, leave and re-join used the name file's utun without
+    checking its key. A stale note naming another VPN's utun read as "up", and `wg-quick down`
+    would have acted on it."""
+    n = node("darwin")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    link.leave("wtwg0")                              # our tunnel is gone ...
+    n.launchd_loaded = False
+    (link.WG_RUN_DIR / "wtwg0.name").write_text("utun3\n")   # ... the note names a reused utun
+    n.foreign_utuns["utun3"] = "F" * 43 + "="
+    _ok, rows = link.status("wtwg0")
+    assert any(r.startswith("interface wtwg0:") for r in rows), rows
+    assert all("utun3" not in r for r in rows), rows
+    n.name_at_down.clear()
+    link._darwin_link_down("/fake/bin/wg", "/fake/bin/wg-quick", "wtwg0")
+    assert n.name_at_down == [None]                  # the foreign note was dropped first

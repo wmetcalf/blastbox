@@ -601,3 +601,50 @@ def test_an_exhausted_resolver_is_no_verdict_on_a_worker(monkeypatch, probe_name
         assert probe("http://healthy-worker.stall.invalid:8765/healthz", {}, 0.5) is None
     finally:
         release.set()
+
+
+def test_an_unreached_worker_is_not_convicted_on_the_job_path(tmp_path, monkeypatch):
+    """REGRESSION (review): ProbeNotAttempted (this dispatcher's resolver stalled or its lookup
+    budget spent -- no request reached the worker) fell into make_remote_validate's generic
+    handler as fault="worker": a resolver incident burned out healthy static workers and
+    advanced cascade repair. It is released CLEAN, unattributed, and re-raised to requeue."""
+    from types import SimpleNamespace
+
+    from blastbox.host.runtime import remote_http
+
+    def unreached(*a, **kw):
+        raise remote_http.ProbeNotAttempted("8 name lookups already in flight")
+
+    monkeypatch.setattr(remote_http, "detonate_remote", unreached)
+    released = []
+    slot = SimpleNamespace(url="http://w1.example:8765", ip=None, auth_token=None,
+                           agent_port=8765)
+    validate = remote_http.make_remote_validate(
+        lambda: slot, lambda s, dirty=False, fault=None: released.append((dirty, fault)),
+        output_dir_for=lambda p: tmp_path / "o")
+    inp = tmp_path / "in.bin"
+    inp.write_bytes(b"x")
+    with pytest.raises(remote_http.ProbeNotAttempted):
+        validate(inp)
+    assert released == [(False, "unknown")]
+
+
+def test_the_dispatcher_requeues_a_job_whose_worker_was_never_reached(tmp_path):
+    from blastbox.host.jobs.base import Job, JobStatus
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    from blastbox.host.runtime.remote_http import ProbeNotAttempted
+    from blastbox.host.runtime.vm_dispatch import VmJobDispatcher
+
+    store = InMemoryJobStore()
+    job = Job.new(engine="redtusk", filename="a.doc")
+    store.create(job)
+    d = tmp_path / job.job_id / "input"
+    d.mkdir(parents=True)
+    (d / "a.doc").write_bytes(b"x")
+
+    def unreached(path):
+        raise ProbeNotAttempted("resolver stalled")
+
+    VmJobDispatcher(store=store, job_root=tmp_path, validate=unreached)._process(
+        store.claim_next())
+    assert store.get(job.job_id).status is JobStatus.QUEUED       # requeued, not FAILED

@@ -491,11 +491,33 @@ our_utuns() {{
     "$WG" show all public-key 2>/dev/null | awk -v k="$PUB" '$2 == k {{ print $1 }}'
 }}
 
+# Is the utun named by wg-quick's name file OURS? It must be live AND (with a known key) run
+# THIS link's key: macOS reuses utun numbers, so a stale name file can name another VPN's tunnel.
+ours_live() {{
+    real_iface || return 1
+    "$WG" show "$REAL" >/dev/null 2>&1 || return 1
+    [ -z "$PUB" ] && return 0
+    [ "$("$WG" show "$REAL" public-key 2>/dev/null)" = "$PUB" ]
+}}
+
+# A name file that does not name OUR tunnel must not steer `wg-quick down $IFACE` onto someone
+# else's: drop it first (wg-quick recreates it on `up`).
+drop_foreign_name() {{
+    [ -n "$PUB" ] || return 0
+    if real_iface && "$WG" show "$REAL" >/dev/null 2>&1 \
+            && [ "$("$WG" show "$REAL" public-key 2>/dev/null)" != "$PUB" ]; then
+        log "$NAMEFILE names $REAL, which runs another key: ignoring it"
+        rm -f "${{NAMEFILE:?}}"
+    fi
+    REAL=''
+}}
+
 # Take the link DOWN and verify it by key. A failed `wg-quick down` (no name file, a stale one)
 # must not leave the tunnel up without enforcement: wireguard-go exits when its control socket
 # is removed -- exactly how wg-quick stops it on macOS -- so that is done for every utun still
 # running our key, and the result is checked. Still up: logged; the next run tries again.
 force_down() {{
+    drop_foreign_name
     "$WG_QUICK" down "$IFACE" >/dev/null 2>&1
     for U in $(our_utuns); do
         case "$U" in
@@ -575,7 +597,7 @@ fi
 # wg-quick's name file is only its NOTE of the utun it got. If it is missing or stale while a
 # utun still runs THIS link's key, that tunnel is up: re-record it rather than `wg-quick up` a
 # second tunnel with the same key next to it (found by key via `wg show all public-key`).
-if [ -n "$PUB" ] && ! {{ real_iface && "$WG" show "$REAL" >/dev/null 2>&1; }}; then
+if [ -n "$PUB" ] && ! ours_live; then
     LIVE=$("$WG" show all public-key 2>/dev/null | awk -v k="$PUB" '$2 == k {{ print $1; exit }}')
     case "$LIVE" in
         utun[0-9]|utun[0-9][0-9]|utun[0-9][0-9][0-9])
@@ -584,8 +606,8 @@ if [ -n "$PUB" ] && ! {{ real_iface && "$WG" show "$REAL" >/dev/null 2>&1; }}; t
     esac
 fi
 
-if real_iface && "$WG" show "$REAL" >/dev/null 2>&1; then
-    :   # up: leave the tunnel alone
+if ours_live; then
+    :   # up, and ours: leave the tunnel alone
 else
     log "link down; bringing it up"
     if ! pf_closed; then
@@ -593,6 +615,7 @@ else
         exit 1
     fi
     rm -f "$STAMP"
+    drop_foreign_name
     "$WG_QUICK" down "$IFACE" >/dev/null 2>&1 || true
     if ! "$WG_QUICK" up "$IFACE"; then
         log "wg-quick up failed"
@@ -793,6 +816,34 @@ def _wg_pubkey(wg: str, private: str) -> str:
 
 
 @_node_locked
+def _refuse_rotating_a_live_link(wg: str, iface: str) -> None:
+    """``keygen --rotate`` replaces the private key the link is FOUND by (macOS: the live utun
+    is identified by its public key; the running tunnel and the installed config keep the old
+    one until a re-join). Rotating under a live or installed link would leave a tunnel nothing
+    can identify any more: leave/re-join would then call it down while it still handshakes
+    with the host. So the link must be down and uninstalled first."""
+    plat = _supported_platform()
+    why: list[str] = []
+    if plat == "darwin":
+        live = _our_live_utuns(wg, iface)
+        if live is None:
+            why.append("its tunnel cannot be verified down")
+        elif live:
+            why.append(f"{', '.join(live)} runs its current key")
+        if _ok(["launchctl", "print", f"system/{label_for(iface)}"]):
+            why.append(f"LaunchDaemon {label_for(iface)} is loaded")
+    else:
+        if _ok(["ip", "link", "show", iface]):
+            why.append(f"{iface} is up")
+        if _ok(["systemctl", "is-enabled", f"wg-quick@{iface}"]):
+            why.append(f"wg-quick@{iface} is enabled")
+    if why:
+        raise RuntimeError(
+            f"refusing to rotate the {iface} key while the link is live ({'; '.join(why)}): the "
+            "running tunnel would no longer be identifiable. Run `blastbox worker-link leave "
+            f"--iface {iface}` first, then keygen --rotate, `add` on the host, and join again.")
+
+
 def keygen(iface: str, ip: str, *, rotate: bool = False) -> tuple[str, str, list[str]]:
     """Make (or reuse) this worker's WireGuard key, TLS key and a CSR for ``ip``.
 
@@ -816,6 +867,8 @@ def keygen(iface: str, ip: str, *, rotate: bool = False) -> tuple[str, str, list
         os.chmod(d, 0o700 if d == KEY_DIR else 0o755)
     os.chmod(WG_DIR, 0o700)
 
+    if rotate and p["wg_key"].exists():
+        _refuse_rotating_a_live_link(wg, iface)
     if rotate or not p["wg_key"].exists() or p["wg_key"].stat().st_size == 0:
         gen = _run([wg, "genkey"])
         if gen.returncode != 0 or not gen.stdout.strip():
@@ -977,8 +1030,8 @@ def _darwin_tunnel_kind(dev: str) -> str | None:
 def _darwin_own_utuns(iface: str) -> set[str]:
     """The utun(s) this link itself is running on, so a re-join does not refuse its own
     overlay routes/addresses."""
-    own = {r for r in [_real_iface_darwin(iface)] if r}
     wg = _which("wg")
+    own = {r for r in [_our_real_iface_darwin(wg, iface)] if r}
     if wg:
         own.update(_our_live_utuns(wg, iface) or [])
     return own
@@ -1326,8 +1379,7 @@ def _apply_darwin(bundle: JoinBundle, p: dict[str, Path], wg: str, *,
                   conf_changed: bool = True) -> list[str]:
     notes: list[str] = []
     wg_quick = _need("wg-quick", "wireguard-tools (brew install wireguard-tools)")
-    live_real = _real_iface_darwin(bundle.iface) or next(iter(_our_live_utuns(wg, bundle.iface)
-                                                              or []), None)
+    live_real = _our_real_iface_darwin(wg, bundle.iface)
     # Restart when the FILE changed -- or when the LIVE peer is not this bundle's: a previous
     # join may have written the new config and failed before applying it, and the retry then
     # sees an unchanged file over a tunnel still running the old host's peer.
@@ -1340,7 +1392,7 @@ def _apply_darwin(bundle: JoinBundle, p: dict[str, Path], wg: str, *,
         # the watchdog leaves any live utun alone, so a down that failed (or did nothing) would
         # leave the PREVIOUS host key / endpoint / address running and the handshake check
         # below would happily observe the old peer.
-        stale = _real_iface_darwin(bundle.iface)
+        stale = live_real
         why = _darwin_link_down(wg, wg_quick, bundle.iface)
         if why:
             raise RuntimeError(
@@ -1389,7 +1441,7 @@ def _apply_darwin(bundle: JoinBundle, p: dict[str, Path], wg: str, *,
     deadline = time.monotonic() + HANDSHAKE_WAIT_S
     missing: list[str] = ["the watchdog has not run"]
     while True:
-        real = _real_iface_darwin(bundle.iface)
+        real = _our_real_iface_darwin(wg, bundle.iface)
         if real is not None:
             missing = _darwin_pf_missing(bundle, real)
         if (real is not None and not missing) or time.monotonic() >= deadline:
@@ -1449,10 +1501,51 @@ def _our_live_utuns(wg: str, iface: str) -> "list[str] | None":
     return out
 
 
+def _utun_key(wg: str, utun: str) -> "str | None":
+    proc = _run([wg, "show", utun, "public-key"])
+    return proc.stdout.strip() if proc.returncode == 0 and proc.stdout.strip() else None
+
+
+def _our_pub(wg: str, iface: str) -> "str | None":
+    try:
+        return _wg_pubkey(wg, _paths(iface)["wg_key"].read_text())
+    except (OSError, RuntimeError):
+        return None
+
+
+def _name_file_is_foreign(wg: str, iface: str) -> bool:
+    """True when wg-quick's name file names a LIVE utun running ANOTHER key: macOS reuses utun
+    numbers, so a stale note can point at someone else's VPN."""
+    named = _real_iface_darwin(iface)
+    if named is None:
+        return False
+    key, ours = _utun_key(wg, named), _our_pub(wg, iface)
+    return key is not None and ours is not None and key != ours
+
+
+def _our_real_iface_darwin(wg: str | None, iface: str) -> str | None:
+    """The utun THIS link runs on, verified by key: the name file's utun only if it runs our
+    key, else whichever live utun does (the note may be gone). Without ``wg`` or our key,
+    nothing can be verified, so nothing is claimed."""
+    if not wg:
+        return None
+    named = _real_iface_darwin(iface)
+    ours = _our_pub(wg, iface)
+    if ours is None:
+        return None
+    if named is not None and _utun_key(wg, named) == ours:
+        return named
+    live = _our_live_utuns(wg, iface) or []
+    return live[0] if live else None
+
+
 def _darwin_link_down(wg: str, wg_quick: str, iface: str) -> "str | None":
     """Take this macOS link down and VERIFY it, by key; None when confirmed down, otherwise why
     not. A failed ``wg-quick down`` is fatal unless the tunnel is verified gone (a re-run on an
     already-down link fails the command but has nothing running)."""
+    if _name_file_is_foreign(wg, iface):
+        # never let `wg-quick down <iface>` act on another VPN's tunnel through a stale note
+        (WG_RUN_DIR / f"{iface}.name").unlink(missing_ok=True)
     down = _run([wg_quick, "down", iface])
     live = _our_live_utuns(wg, iface)
     if live:
@@ -1470,7 +1563,7 @@ def _darwin_link_down(wg: str, wg_quick: str, iface: str) -> "str | None":
         return ("cannot verify the tunnel is down (`wg show all public-key` unreadable or no "
                 "key on disk)" + ("" if down.returncode == 0 else
                                   "; `wg-quick down` failed too"))
-    still = sorted(set(live) | ({r for r in [_real_iface_darwin(iface)] if r} & set(live)))
+    still = sorted(set(live))
     if still:
         return f"{', '.join(still)} still runs this link's key"
     return None
@@ -1593,10 +1686,8 @@ def status(iface: str = DEFAULT_IFACE) -> tuple[bool, list[str]]:
         return False, [f"{iface}: keys made for {ip}, but this worker has not joined yet"]
     wg = _which("wg") or "wg"
     if plat == "darwin":
-        real = _real_iface_darwin(iface)
-        if real is None and _which("wg"):
-            live = _our_live_utuns(str(_which("wg")), iface) or []
-            real = live[0] if live else None      # running, but wg-quick's note of it is gone
+        # verified by KEY: the name file's utun only if it runs ours (macOS reuses utun numbers)
+        real = _our_real_iface_darwin(_which("wg"), iface)
         rows.append(f"interface {iface}: " + (f"up as {real}" if real else "DOWN (no utun recorded)"))
         info = _run([PFCTL, "-s", "info"])
         main = _run([PFCTL, "-s", "rules"])

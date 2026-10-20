@@ -895,6 +895,15 @@ def make_remote_validate(
             # Propagate so the dispatcher requeues the job (like NoWarmSlot); the finally still
             # releases this slot DIRTY, quarantining the box so it is not immediately re-offered.
             raise
+        except ProbeNotAttempted:
+            # The request never REACHED the worker: this dispatcher's name resolution is stalled
+            # or its lookup budget is spent (no socket was even created). Not evidence about the
+            # worker, the slot or its tier -- a "worker" fault here let a local resolver incident
+            # burn out healthy static workers and advance cascade repair. Release CLEAN with no
+            # attribution and propagate, so the dispatcher REQUEUES the job (nothing ran).
+            fault = "unknown"
+            dirty = False
+            raise
         except WorkerLacksEgress:
             # Nothing ran: the agent refused on the job's net policy before the engine saw a
             # byte. A placement fault -- not evidence about the worker (it answered exactly as

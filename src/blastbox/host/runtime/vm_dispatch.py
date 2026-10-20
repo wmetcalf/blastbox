@@ -48,6 +48,8 @@ from blastbox.host.jobs.retention import (
     retry_pending_uploads,
 )
 from blastbox.host.runtime.remote_http import WorkerBusy   # 409 from a busy worker -> requeue, not fail
+# never reached the worker (this dispatcher's resolver) -> requeue, not fail
+from blastbox.host.runtime.remote_http import ProbeNotAttempted
 from blastbox.observability.metrics import (
     observe_job_duration,
     record_job_dispatched,
@@ -912,10 +914,11 @@ class VmJobDispatcher:
                 # index per-page perceptual hashes for /v1/similar, same as the cold/file-warm paths --
                 # else a network-endpoint (static/AWS) page-hash job is DONE but invisible to search.
                 self._index_page_hashes(job, sealed_env)
-        except (NoWarmSlot, WorkerBusy):
+        except (NoWarmSlot, WorkerBusy, ProbeNotAttempted):
             # capacity pressure, not a job failure -- the job NEVER ran (no slot, or the claimed worker's
-            # single-flight lock was held by a stale detonation -> 409). REQUEUE it (CAS back to QUEUED,
-            # clear our claim + warm stamp) so it waits for a slot / another dispatcher instead of FAILing.
+            # single-flight lock was held by a stale detonation -> 409, or this dispatcher could not even
+            # resolve the worker's name). REQUEUE it (CAS back to QUEUED, clear our claim + warm stamp) so
+            # it waits for a slot / another dispatcher instead of FAILing.
             record_warm_claim(hit=False)   # warm-pool miss (parity with the cold dispatcher's metric)
             logger.info("vm_dispatch: no usable warm slot for %s; requeuing (not failing)", job.job_id)
             owned = self._store.update_if_status(
