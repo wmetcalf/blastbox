@@ -51,6 +51,7 @@ class FakeHost:
         self.nft_delete_fails = False
         self.enable_fails = False                     # `systemctl enable [--now] wg-quick@*`
         self.nft_drop_missing = False                 # the kernel loses a rule on load
+        self.nft_list_error: str | None = None        # `nft list table` fails some other way
 
     def _up(self, iface: str) -> None:
         """A (re)start reads the interface's config file, as wg-quick does."""
@@ -72,6 +73,8 @@ class FakeHost:
                 self.loaded = text.split(f"delete table inet {NFT_TABLE}\n", 1)[1]
                 if self.nft_drop_missing:
                     self.loaded = self.loaded.replace('\t\toifname "wtwg0" drop\n', "", 1)
+        elif tool == "nft" and a[1:3] == ["list", "table"] and self.nft_list_error:
+            rc, err = 1, self.nft_list_error
         elif tool == "nft" and a[1:3] == ["list", "table"]:
             if not self.root:
                 rc, err = 1, "Error: Operation not permitted"
@@ -906,6 +909,23 @@ def test_init_refuses_an_endpoint_name_that_resolves_into_the_overlay(host, monk
     with pytest.raises(RuntimeError, match="inside the link overlay"):
         wla.init_host(_cfg(endpoint="gw.example.org"))
     assert host.loaded is None and not wla.ENV_FILE.exists()
+
+
+def test_only_nfts_not_found_answer_counts_as_an_absent_table(host):
+    """REGRESSION (review): every listing failure that was not a permission error read as
+    "table not loaded" -- so a teardown whose delete failed, followed by a listing that hit
+    netlink ENOMEM/EIO, deleted its recovery records with a stale filtering table left."""
+    wla.init_host(_cfg())
+    host.nft_delete_fails = True
+    host.nft_list_error = "Error: netlink: Cannot allocate memory"
+    notes = wla.teardown(_cfg())
+    assert "could not verify" in notes[-1] and "Cannot allocate memory" in notes[-1]
+    assert wla.ENV_FILE.exists() and wla.FW_UNIT.exists() and host.loaded is not None
+    assert wla.firewall_status(_cfg())[0] is None               # unknown, not "absent"
+    host.nft_delete_fails = False
+    host.nft_list_error = None
+    wla.teardown(wla.load_config(recover=True))
+    assert not wla.ENV_FILE.exists()
 
 
 # ----------------------------------------------------------------------------- status

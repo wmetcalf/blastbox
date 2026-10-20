@@ -533,3 +533,11 @@ def test_an_endpoint_inside_the_overlay_is_rejected():
     WorkerLinkConfig(endpoint="192.0.2.10")              # an underlay address is fine
     with pytest.raises(ValueError, match="inside the link overlay"):
         _bundle(endpoint="10.78.0.1:51822")
+
+
+def test_a_loopback_or_unroutable_endpoint_is_rejected():
+    """Sweep (review round 9): an endpoint the worker can only reach as ITSELF (loopback) or
+    not at all is refused at the source, before any bundle carries it."""
+    for ep in ("127.0.0.1", "0.0.0.0", "169.254.1.1", "224.0.0.1:51822"):
+        with pytest.raises(ValueError, match="loopback|non-routable"):
+            WorkerLinkConfig(endpoint=ep)

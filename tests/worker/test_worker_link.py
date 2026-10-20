@@ -59,6 +59,9 @@ class FakeNode:
         self.stale_utun = False                 # a utun still runs our key, name file gone
         self.kickstart_fails = False
         self.pf_anchor_override: str | None = None
+        self.stale_sock_kills = False           # removing its control socket stops it
+        self.route_type = "unicast"
+        self.nft_list_error: str | None = None
 
     def run(self, argv, *, input=None):
         a = [str(x) for x in argv]
@@ -89,6 +92,8 @@ class FakeNode:
             if self.nft_drop_missing:
                 body = body.replace('\t\tiifname "wtwg0" drop\n', "")
             self.loaded = body
+        elif tool == "nft" and a[1:3] == ["list", "table"] and self.nft_list_error:
+            rc, err = 1, self.nft_list_error
         elif tool == "nft" and a[1:3] == ["list", "table"]:
             if not self.root:
                 rc, err = 1, "Error: Operation not permitted"
@@ -116,7 +121,9 @@ class FakeNode:
                    "MULTICAST> mtu 1500\n")
         elif tool == "wg" and a[1:3] == ["show", "all"]:
             key = link._paths("wtwg0")["wg_key"]
-            live = (link.WG_RUN_DIR / "wtwg0.name").exists() or self.stale_utun
+            stale = self.stale_utun and not (self.stale_sock_kills
+                                             and not (link.WG_RUN_DIR / "utun7.sock").exists())
+            live = (link.WG_RUN_DIR / "wtwg0.name").exists() or stale
             out = f"utun7\t{_wg_pub(key.read_text())}\n" if live and key.exists() else ""
         elif tool == "wg-quick" and a[1] in ("down", "up"):
             if a[1] == "down" and self.wg_quick_down_works:
@@ -125,7 +132,7 @@ class FakeNode:
             elif a[1] == "up":
                 self.links.add(a[2])
         elif a[:3] == ["ip", "-j", "route"] and "get" in a:
-            out = json.dumps([{"dst": a[-1], "dev": self.route_dev}])
+            out = json.dumps([{"dst": a[-1], "dev": self.route_dev, "type": self.route_type}])
         elif a[:2] == ["ip", "-j"]:
             out = "[]"
         elif a[:3] == ["ip", "link", "show"]:
@@ -343,11 +350,16 @@ def mac(tmp_path):
     (state / "main").write_text('anchor "com.apple/*" all\n')
     env_hdr = f'LOG={log}; ST={state}; RUN={run_d}\necho "$(basename "$0") $*" >> "$LOG"\n'
     wg = _fake_bin(bin_d, "wg", env_hdr + (
-        'if [ "$1" = show ] && [ "$2" = all ]; then cat "$ST/keys" 2>/dev/null; exit 0; fi\n'
+        'if [ "$1" = show ] && [ "$2" = all ]; then\n'
+        '  [ -f "$ST/keys" ] && while read -r u k; do\n'
+        '    [ -e "${RUN:?}/$u.sock" ] && printf "%s\\t%s\\n" "$u" "$k"; done < "$ST/keys"\n'
+        '  exit 0\nfi\n'
         '[ "$1" = show ] && grep -qx "$2" "$ST/up" && exit 0\nexit 1\n'))
     wgq = _fake_bin(bin_d, "wg-quick", env_hdr + (
         'if [ "$1" = up ]; then echo utun9 > "$RUN/$2.name"; echo utun9 >> "$ST/up"; fi\n'
-        'if [ "$1" = down ]; then rm -f "$RUN/$2.name"; fi\nexit 0\n'))
+        'if [ "$1" = down ] && [ -n "$2" ]; then\n'
+        '  [ -f "${RUN:?}/$2.name" ] && rm -f "${RUN:?}/$(cat "${RUN:?}/$2.name").sock"\n'
+        '  rm -f "${RUN:?}/$2.name"\nfi\nexit 0\n'))
     pfctl = _fake_bin(bin_d, "pfctl", env_hdr + (
         'case "$*" in\n'
         '  *"-s info"*) echo "Status: $(cat "$ST/pf")"; exit 0 ;;\n'
@@ -393,6 +405,11 @@ def mac(tmp_path):
 
         def keys(self, text: str) -> None:
             (state / "keys").write_text(text)
+            for line in text.splitlines():          # each listed utun is a live wireguard-go
+                (run_d / f"{line.split()[0]}.sock").write_text("")
+
+        def sock(self, utun: str) -> bool:
+            return (run_d / f"{utun}.sock").exists()
 
         def rerender(self, **kw) -> None:
             args = dict(iface="wtwg0", worker_ip="10.78.0.5", host_ip="10.78.0.1",
@@ -1259,7 +1276,7 @@ def test_macos_leave_finds_the_live_tunnel_by_its_key_not_its_name_file(node, tm
     _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
     link.join(_bundle(tmp_path, csr))
     (link.WG_RUN_DIR / "wtwg0.name").unlink()
-    n.stale_utun = True                            # still running our key
+    n.stale_utun = True                            # still running our key, and stuck
     n.calls.clear()
     notes = link.leave("wtwg0")
     assert "not confirmed down" in notes[-1] and "utun7 still runs this link's key" in notes[-1]
@@ -1382,3 +1399,141 @@ def test_watchdog_finds_a_live_tunnel_by_key_when_its_name_file_is_gone(mac):
     mac.drop_name()
     mac.keys(f"utun3\t{'Q' * 43}=\n")
     assert "wg-quick up wtwg0" in mac.run()
+
+
+# ------------------------------------------------------------------ review round 9
+
+def test_watchdog_forces_a_tunnel_down_by_key_when_wg_quick_cannot(mac):
+    """REGRESSION (review): on losing pf enforcement the watchdog ran `wg-quick down`, ignored
+    the result and exited -- with the name file gone that does nothing, and the tunnel stayed
+    up with no enforcement on every retry. It now stops wireguard-go by its control socket for
+    every utun running the link's key, and checks."""
+    pub = "P" * 43 + "="
+    mac.rerender(public_key=pub)
+    mac.up("utun7")
+    mac.keys(f"utun7\t{pub}\n")
+    mac.run()
+    mac.drop_name()                            # wg-quick down can no longer find it
+    mac.main_rules("pass all\n")               # enforcement lost
+    with pytest.raises(AssertionError, match="does not evaluate"):
+        mac.run()
+    assert not mac.sock("utun7")               # wireguard-go stopped, verified by key
+
+
+@pytest.mark.parametrize("main,bad", [
+    ('pass quick all flags S/SA keep state\nanchor "com.apple/*" all\n', True),
+    ('pass in quick on ! en0 all\nanchor "com.apple/*" all\n', True),
+    ('pass quick on utun all\nanchor "com.apple/*" all\n', True),
+    ('pass in quick on utun7 all\nanchor "com.apple/*" all\n', True),
+    ('pass quick on utun3 all\nanchor "com.apple/*" all\n', False),   # another VPN's utun
+    ('pass quick on lo0 all\nanchor "com.apple/*" all\n', False),
+    ('anchor "com.apple/*" all\npass quick all\n', False),             # AFTER our anchor
+    ('pass in all\nanchor "com.apple/*" all\n', False),                 # not quick
+])
+def test_a_main_ruleset_pass_quick_before_the_anchor_is_not_enforcement(mac, main, bad):
+    """REGRESSION (review): only the PRESENCE of `anchor "com.apple/*"` was checked; a
+    `pass ... quick` placed before it that can match the link's utun ends evaluation first, so
+    status and the watchdog called a bypassed anchor enforced."""
+    rules = link.pf_rules(real_iface="utun7", worker_ip="10.78.0.5", host_ip="10.78.0.1",
+                          agent_port=8765)
+    missing = link.pf_in_force(info="Status: Enabled", main_rules=main, anchor_rules=rules,
+                               real_iface="utun7", worker_ip="10.78.0.5", host_ip="10.78.0.1",
+                               agent_port=8765)
+    assert bool(missing) is bad, missing
+    mac.up("utun7")
+    mac.main_rules(main)
+    if bad:
+        with pytest.raises(AssertionError, match="passes"):
+            mac.run()
+    else:
+        mac.run()
+
+
+def test_macos_leave_stops_a_tunnel_whose_name_file_is_gone(node, tmp_path):
+    """The Python side of the same fix: leave stops wireguard-go by its control socket when
+    wg-quick cannot, then verifies by key -- and proceeds only once it is gone."""
+    n = node("darwin")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    (link.WG_RUN_DIR / "wtwg0.name").unlink()
+    (link.WG_RUN_DIR / "utun7.sock").write_text("")
+    n.stale_utun = n.stale_sock_kills = True
+    n.calls.clear()
+    link.leave("wtwg0")
+    assert not (link.WG_RUN_DIR / "utun7.sock").exists()
+    assert any("-F all" in c for c in n.flat()) and not link._paths("wtwg0")["conf"].exists()
+
+
+@pytest.mark.parametrize("how", ["lo", "local", "loopback-literal"])
+def test_a_linux_endpoint_that_is_this_machine_is_refused(node, tmp_path, monkeypatch, how):
+    """REGRESSION (review): an endpoint routed via `lo` (127.0.0.1, or a name resolving to one
+    of this worker's own addresses) was accepted as underlay -- WireGuard dialled itself."""
+    n = node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    if how == "lo":
+        n.route_dev = "lo"
+    elif how == "local":
+        n.route_type = "local"
+    else:
+        monkeypatch.setattr(link, "_resolve", lambda host: ["127.0.0.1"])
+    with pytest.raises(RuntimeError, match="is THIS machine|loopback"):
+        link.join(_bundle(tmp_path, csr))
+    assert n.loaded is None
+
+
+def test_a_macos_endpoint_that_is_this_machine_is_refused(node, tmp_path):
+    n = node("darwin")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    n.mac_route_dev = "lo0"
+    with pytest.raises(RuntimeError, match="is THIS machine"):
+        link.join(_bundle(tmp_path, csr))
+
+
+def test_a_macos_rejoin_restarts_and_then_fails_closed_on_a_stale_live_peer(node, tmp_path):
+    """REGRESSION (review): a retry after a join that wrote the new config but failed before
+    applying it saw conf_changed=False, left the old tunnel running and raised on the stale
+    peer without taking anything down -- every retry repeating it."""
+    n = node("darwin")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    other = "O" * 43 + "="
+    new = _bundle(tmp_path, csr, host_public_key=other)
+    p = link._paths("wtwg0")
+    p["conf"].write_text(link.worker_wg_config(          # the failed join's leftover
+        private_key=p["wg_key"].read_text(), worker_ip="10.78.0.5", host_ip="10.78.0.1",
+        host_public_key=other, endpoint="gw.example.org:51822"))
+    n.calls.clear()
+    with pytest.raises(RuntimeError, match="not this bundle's host.*taken DOWN"):
+        link.join(new)                     # the live peer stays the OLD host (fake dump)
+    assert "/fake/bin/wg-quick down wtwg0" in n.flat()          # restarted despite same file
+    assert not n.launchd_loaded and not (link.WG_RUN_DIR / "wtwg0.name").exists()
+
+
+def test_a_linux_join_whose_live_peer_stays_stale_takes_the_link_down(node, tmp_path,
+                                                                       monkeypatch):
+    n = node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    real = n.run
+
+    def run(argv, **kw):
+        p = real(argv, **kw)
+        a = [str(x) for x in argv]
+        if Path(a[0]).name == "wg" and a[1] == "show" and a[2] != "all":
+            p = subprocess.CompletedProcess(a, 0, p.stdout.replace(KEY_HOST, "Z" * 43 + "="), "")
+        return p
+
+    monkeypatch.setattr(link, "_run", run)
+    with pytest.raises(RuntimeError, match="previous config is still in effect.*taken DOWN"):
+        link.join(_bundle(tmp_path, csr))
+    assert "wtwg0" not in n.links
+
+
+def test_linux_status_does_not_read_an_nft_failure_as_an_absent_table(node, tmp_path):
+    """Sweep (review round 9): only nft's not-found answer means "no table"; another failure
+    (netlink ENOMEM, EIO) is UNVERIFIED, not "NOT IN FORCE -- missing the table"."""
+    n = node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    n.nft_list_error = "Error: netlink: Cannot allocate memory"
+    ok, rows = link.status("wtwg0")
+    assert not ok and any("UNVERIFIED" in r and "Cannot allocate memory" in r for r in rows)

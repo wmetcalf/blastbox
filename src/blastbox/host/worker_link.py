@@ -174,6 +174,10 @@ def refuse_endpoint_in_overlay(addrs: Iterable[str], overlay: "ipaddress.IPv4Net
             ip = ipaddress.ip_address(str(a).strip("[]"))
         except ValueError:
             continue                      # a hostname: checked once resolved
+        if ip.is_loopback or ip.is_unspecified or ip.is_multicast or ip.is_link_local:
+            raise ValueError(f"{what} is a {'loopback' if ip.is_loopback else 'non-routable'} "
+                             "address: a worker would dial itself (or nothing), never the "
+                             "host. Use the host's public/underlay address.")
         if ip.version == 4 and ip in net:
             raise ValueError(f"{what} is inside the link overlay {net}: WireGuard's packets "
                              "to it would be routed into the tunnel they establish. Use the "

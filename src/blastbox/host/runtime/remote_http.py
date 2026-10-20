@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import http.client
 import io
+import ipaddress
 import json
 import logging
 import os
@@ -68,6 +69,64 @@ def _track(sock: Any) -> None:
         lst.append(sock)
 
 
+#: At most this many name lookups in flight at once, process-wide (see _resolve_bounded).
+_MAX_RESOLVERS = 8
+_RESOLVE_LOCK = threading.Lock()
+_RESOLVING: dict[tuple, "_Lookup"] = {}
+
+
+class _Lookup:
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.result: list | None = None
+        self.error: BaseException | None = None
+
+
+def _resolve_bounded(host: str, port: Any, deadline: float | None) -> list:
+    """``getaddrinfo`` for a worker transport, with the OUTSTANDING work bounded.
+
+    A system resolver can stall, and ``getaddrinfo`` cannot be interrupted: called inline, a
+    probe abandoned at its deadline left its thread blocked in the lookup with no socket to
+    shut down, and every recurring /healthz or capability probe abandoned another one. So a
+    lookup runs in ONE resolver thread per (host, port) -- probes of the same worker share it
+    rather than each starting their own -- with at most ``_MAX_RESOLVERS`` in flight in total,
+    and a caller waits only until its own deadline. A numeric address needs no lookup.
+    """
+    try:
+        ipaddress.ip_address(str(host).strip("[]"))
+    except ValueError:
+        pass
+    else:
+        return socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    key = (host, port)
+    with _RESOLVE_LOCK:
+        job = _RESOLVING.get(key)
+        if job is None:
+            if len(_RESOLVING) >= _MAX_RESOLVERS:
+                raise TimeoutError(f"{_MAX_RESOLVERS} name lookups already in flight; the "
+                                   "resolver is not answering")
+            job = _Lookup()
+            _RESOLVING[key] = job
+
+            def _work(job: _Lookup = job) -> None:
+                try:
+                    job.result = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+                except BaseException as exc:   # noqa: BLE001 -- handed to the waiters
+                    job.error = exc
+                finally:
+                    with _RESOLVE_LOCK:
+                        _RESOLVING.pop(key, None)
+                    job.done.set()
+
+            threading.Thread(target=_work, name="bb-resolve", daemon=True).start()
+    wait = None if deadline is None else max(0.0, deadline - time.monotonic())
+    if not job.done.wait(wait):
+        raise TimeoutError(f"name lookup for {host!r} exceeded the wall-clock deadline")
+    if job.error is not None:
+        raise job.error
+    return list(job.result or [])
+
+
 def _tracked_create_connection(address: tuple, timeout: Any = None,
                                source_address: Any = None, *args: Any, **kwargs: Any) -> Any:
     """``socket.create_connection`` whose sockets are registered BEFORE the blocking connect,
@@ -84,7 +143,7 @@ def _tracked_create_connection(address: tuple, timeout: Any = None,
     deadline = getattr(_IO_REGISTRY, "deadline", None)
     cancelled = getattr(_IO_REGISTRY, "cancelled", None)
     per_op = timeout if isinstance(timeout, (int, float)) else None
-    infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    infos = _resolve_bounded(host, port, deadline)
     err: OSError | None = None
     for family, socktype, proto, _canon, sockaddr in infos:
         if cancelled is not None and cancelled.is_set():

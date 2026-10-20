@@ -476,6 +476,7 @@ WG={_sh_quote(wg)}
 WG_QUICK={_sh_quote(wg_quick)}
 PFCTL={_sh_quote(pfctl)}
 NAMEFILE={_sh_quote(namefile)}
+RUNDIR={_sh_quote(run_dir.rstrip('/'))}
 ANCHOR={_sh_quote(anchor)}
 STAMP={_sh_quote(stamp)}
 DIGEST={_sh_quote(digest)}
@@ -483,6 +484,50 @@ PUB={_sh_quote(pub)}
 REAL=''
 
 log() {{ echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) worker-link[$IFACE]: $*"; }}
+
+# The utun(s) running THIS link's key (wg-quick's name file is only a note; see join/leave).
+our_utuns() {{
+    [ -n "$PUB" ] || return 0
+    "$WG" show all public-key 2>/dev/null | awk -v k="$PUB" '$2 == k {{ print $1 }}'
+}}
+
+# Take the link DOWN and verify it by key. A failed `wg-quick down` (no name file, a stale one)
+# must not leave the tunnel up without enforcement: wireguard-go exits when its control socket
+# is removed -- exactly how wg-quick stops it on macOS -- so that is done for every utun still
+# running our key, and the result is checked. Still up: logged; the next run tries again.
+force_down() {{
+    "$WG_QUICK" down "$IFACE" >/dev/null 2>&1
+    for U in $(our_utuns); do
+        case "$U" in
+            utun[0-9]|utun[0-9][0-9]|utun[0-9][0-9][0-9]) rm -f "${{RUNDIR:?}}/$U.sock" ;;
+        esac
+    done
+    i=0
+    while [ -n "$(our_utuns)" ] && [ "$i" -lt 10 ]; do sleep 0.5; i=$((i + 1)); done
+    rm -f "$STAMP"
+    if [ -n "$(our_utuns)" ]; then
+        log "$1; the link could NOT be taken down: $(our_utuns | tr '\n' ' ')still runs its key"
+    else
+        log "$1; link taken DOWN"
+    fi
+}}
+
+# `pass ... quick` rules in the MAIN ruleset, before our anchor, that can match the link's
+# utun ($1, or empty before the link is up): they make every rule in our anchor moot.
+# Mirrors blastbox.worker.link.pf_main_bypass.
+main_bypass() {{
+    "$PFCTL" -s rules 2>/dev/null | awk -v real="$1" '
+        /^anchor "com\\.apple\\/\\*"/ {{ exit }}
+        $1 == "pass" {{
+            q = 0; on = ""
+            for (i = 2; i <= NF; i++) {{
+                if ($i == "quick") q = 1
+                if ($i == "on" && on == "" && i < NF) on = $(i + 1)
+            }}
+            if (!q) next
+            if (on == "" || on == "!" || on == "{{" || on == "utun" || (real != "" && on == real)) print
+        }}'
+}}
 
 # The utun wg-quick actually created. `wg show $IFACE` can never work on macOS.
 real_iface() {{
@@ -510,16 +555,20 @@ pf_open() {{
 if ! "$PFCTL" -s info 2>/dev/null | grep -q '^Status: Enabled'; then
     "$PFCTL" -E >/dev/null 2>&1
     if ! "$PFCTL" -s info 2>/dev/null | grep -q '^Status: Enabled'; then
-        log "pf could not be enabled; taking the link DOWN"
-        "$WG_QUICK" down "$IFACE" >/dev/null 2>&1
+        force_down "pf could not be enabled"
         exit 1
     fi
 fi
 # ...and the main ruleset must still EVALUATE our anchor. A VPN client or kill-switch app that
 # loads its own main ruleset drops `anchor "com.apple/*"`, and every rule below is then text.
 if ! "$PFCTL" -s rules 2>/dev/null | grep -qF 'anchor "com.apple/*"'; then
-    log 'the main pf ruleset does not evaluate anchor "com.apple/*"; taking the link DOWN'
-    "$WG_QUICK" down "$IFACE" >/dev/null 2>&1
+    force_down 'the main pf ruleset does not evaluate anchor "com.apple/*"'
+    exit 1
+fi
+# ...and nothing BEFORE it may pass the link's traffic with `quick` (that would bypass it).
+BYPASS=$(main_bypass "")
+if [ -n "$BYPASS" ]; then
+    force_down "the main pf ruleset passes traffic before our anchor: $BYPASS"
     exit 1
 fi
 
@@ -566,13 +615,17 @@ EOF
 LIVE=$("$PFCTL" -a "$ANCHOR" -s rules 2>/dev/null | {sed})
 if [ "$(cat "$STAMP" 2>/dev/null)" != "$WANT" ] || [ "$LIVE" != "$EXPECTED" ]; then
     if ! pf_open; then
-        log "pf refused the link ruleset for $REAL; taking the link DOWN"
-        rm -f "$STAMP"
-        "$WG_QUICK" down "$IFACE" >/dev/null 2>&1
+        force_down "pf refused the link ruleset for $REAL"
         exit 1
     fi
     echo "$WANT" > "$STAMP"
     log "pf rules loaded for $REAL"
+fi
+# Now that the utun is known, a rule naming IT before our anchor counts too.
+BYPASS=$(main_bypass "$REAL")
+if [ -n "$BYPASS" ]; then
+    force_down "the main pf ruleset passes $REAL traffic before our anchor: $BYPASS"
+    exit 1
 fi
 exit 0
 """
@@ -640,6 +693,32 @@ def pf_canon(text: str) -> list[str]:
     return out
 
 
+def pf_main_bypass(main_rules: str, real_iface: str | None) -> list[str]:
+    """Rules in the MAIN pf ruleset that let the link's traffic bypass our anchor.
+
+    pf evaluates the main ruleset top-down and a ``quick`` match is final, so a ``pass ...
+    quick`` rule BEFORE ``anchor "com.apple/*"`` that can match the link's utun (a VPN or
+    firewall manager inserting one) means our anchor -- however exactly in force -- is never
+    reached for that traffic. Such a rule can match the link unless it names another
+    interface: no ``on``, a negated or listed interface, the ``utun`` group, or the link's own
+    utun all can. ``real_iface`` None (link not up yet): only the rules that would match
+    WHICHEVER utun it gets are counted, so another VPN's ``pass quick on utun3`` does not keep
+    the link down. Mirrored in the watchdog's ``main_bypass`` (awk).
+    """
+    out: list[str] = []
+    for raw in (main_rules or "").splitlines():
+        line = " ".join(raw.split())
+        if line.startswith('anchor "com.apple/*"'):
+            break
+        toks = line.split()
+        if not toks or toks[0] != "pass" or "quick" not in toks:
+            continue
+        on = toks[toks.index("on") + 1] if "on" in toks[:-1] else ""
+        if on in ("", "!", "{", "utun") or (real_iface is not None and on == real_iface):
+            out.append(line)
+    return out
+
+
 def pf_in_force(*, info: str, main_rules: str, anchor_rules: str, real_iface: str | None,
                 worker_ip: str, host_ip: str, agent_port: int) -> list[str]:
     """What is missing for the macOS pf rules to be IN FORCE, or [].
@@ -652,6 +731,8 @@ def pf_in_force(*, info: str, main_rules: str, anchor_rules: str, real_iface: st
         missing.append("pf is DISABLED (no anchor is evaluated)")
     if 'anchor "com.apple/*"' not in (main_rules or ""):
         missing.append('the main pf ruleset does not evaluate anchor "com.apple/*"')
+    for rule in pf_main_bypass(main_rules, real_iface):
+        missing.append(f'the main ruleset passes the link\'s traffic before our anchor (`{rule}`)')
     if not real_iface:
         missing.append("no live utun recorded for the link")
         return missing
@@ -858,6 +939,12 @@ def _linux_tunnel_kind(dev: str) -> str | None:
     return None
 
 
+def _local_endpoint_error(ip: str, dev: str | None) -> str:
+    return (f"the host endpoint {ip} is THIS machine (routed via {dev or 'loopback'}): "
+            "WireGuard would dial itself, never the host, and the link could never handshake. "
+            "The bundle's endpoint must be the host's public/underlay address.")
+
+
 def _tunnel_route_error(ip: str, dev: str, kind: str) -> str:
     return (f"the route to the host endpoint {ip} goes via {dev} ({kind}): the link's handshake "
             "would ride that tunnel instead of the underlay, so the control link would break "
@@ -960,6 +1047,8 @@ def darwin_preflight(bundle: JoinBundle) -> list[str]:
             continue
         routable += 1
         dev = m.group(1)
+        if re.fullmatch(r"lo[0-9]*", dev) or ipaddress.ip_address(ip).is_loopback:
+            raise RuntimeError(_local_endpoint_error(ip, dev))
         kind = _darwin_tunnel_kind(dev)
         if kind:
             raise RuntimeError(_tunnel_route_error(ip, dev, kind))
@@ -1022,9 +1111,10 @@ def linux_preflight(bundle: JoinBundle) -> list[str]:
         fam = ["-6"] if ":" in ip else []
         proc = _run(["ip", *fam, "-j", "route", "get", ip])
         try:
-            dev = (_json.loads(proc.stdout or "[]") or [{}])[0].get("dev")
+            entry = (_json.loads(proc.stdout or "[]") or [{}])[0]
+            dev, rtype = entry.get("dev"), entry.get("type")
         except (ValueError, AttributeError, IndexError):
-            dev = None
+            dev, rtype = None, None
         if proc.returncode != 0 or not dev:
             # An address family this node cannot route (an AAAA record on a v4-only node) is
             # not a refusal: WireGuard will use one it can. What must never happen is ANY
@@ -1032,6 +1122,8 @@ def linux_preflight(bundle: JoinBundle) -> list[str]:
             notes.append(f"no underlay route to the endpoint address {ip} (unused)")
             continue
         routable += 1
+        if rtype == "local" or dev == "lo" or ipaddress.ip_address(ip).is_loopback:
+            raise RuntimeError(_local_endpoint_error(ip, dev))
         kind = "the link itself" if dev == bundle.iface else (
             "the egress overlay" if dev == egress_if else _linux_tunnel_kind(dev))
         if kind:
@@ -1055,6 +1147,14 @@ def _wait_handshake(wg: str, real_iface: str) -> str:
             return ("handshake with the host: NOT YET — check the host registered this key "
                     "(`worker-link list`) and that udp to the endpoint is not blocked")
         _sleep(1.0)
+
+
+def _live_peer_matches(wg: str, bundle: JoinBundle, real_iface: str) -> bool:
+    try:
+        _verify_live_peer(wg, bundle, real_iface)
+    except RuntimeError:
+        return False
+    return True
 
 
 def _verify_live_peer(wg: str, bundle: JoinBundle, real_iface: str | None = None) -> None:
@@ -1213,7 +1313,10 @@ def _apply_linux(bundle: JoinBundle, p: dict[str, Path], wg: str) -> list[str]:
             raise RuntimeError(f"{bundle.iface} is up but {unit} could not be ENABLED, so it would "
                                "not come back after a reboot; enable it (`systemctl enable "
                                f"{unit}`) and re-run join")
-    _verify_live_peer(wg, bundle)
+    try:
+        _verify_live_peer(wg, bundle)
+    except RuntimeError as exc:
+        raise RuntimeError(str(exc) + _linux_fail_closed(bundle.iface)) from None
     notes.append(f"{bundle.iface} up ({unit})")
     notes.append(_wait_handshake(wg, bundle.iface))
     return notes
@@ -1223,7 +1326,13 @@ def _apply_darwin(bundle: JoinBundle, p: dict[str, Path], wg: str, *,
                   conf_changed: bool = True) -> list[str]:
     notes: list[str] = []
     wg_quick = _need("wg-quick", "wireguard-tools (brew install wireguard-tools)")
-    if conf_changed and _real_iface_darwin(bundle.iface) is not None:
+    live_real = _real_iface_darwin(bundle.iface) or next(iter(_our_live_utuns(wg, bundle.iface)
+                                                              or []), None)
+    # Restart when the FILE changed -- or when the LIVE peer is not this bundle's: a previous
+    # join may have written the new config and failed before applying it, and the retry then
+    # sees an unchanged file over a tunnel still running the old host's peer.
+    if live_real is not None and (conf_changed
+                                  or not _live_peer_matches(wg, bundle, live_real)):
         # The watchdog deliberately never touches a tunnel that is UP, so a re-join with a new
         # host key / endpoint / address would otherwise leave the old config live indefinitely.
         # Down it here; the watchdog run below brings it up behind closed rules, as at boot.
@@ -1299,7 +1408,16 @@ def _apply_darwin(bundle: JoinBundle, p: dict[str, Path], wg: str, *,
                f". The watchdog was unloaded but the link could NOT be confirmed down ({why})")
             + f"; see {LOG_FILE}, fix pf and re-run join.")
     notes.append(f"pf: in force (anchor {pf_anchor_for(bundle.iface)})")
-    _verify_live_peer(wg, bundle, real)
+    try:
+        _verify_live_peer(wg, bundle, real)
+    except RuntimeError as exc:
+        # Fail CLOSED: a tunnel up with someone else's peer is not left running for the next
+        # retry to trip over. Unload the watchdog (it would re-up it) and verify it is down.
+        _run(["launchctl", "bootout", f"system/{label}"])
+        why = _darwin_link_down(wg, wg_quick, bundle.iface)
+        raise RuntimeError(f"{exc}. The watchdog was unloaded and "
+                           + ("the link taken DOWN" if not why else
+                              f"the link could NOT be confirmed down ({why})")) from None
     notes.append(f"{bundle.iface} up as {real}")
     notes.append(_wait_handshake(wg, real))
     return notes
@@ -1337,6 +1455,17 @@ def _darwin_link_down(wg: str, wg_quick: str, iface: str) -> "str | None":
     already-down link fails the command but has nothing running)."""
     down = _run([wg_quick, "down", iface])
     live = _our_live_utuns(wg, iface)
+    if live:
+        # wg-quick could not (its name file is gone or stale): stop wireguard-go the way
+        # wg-quick does on macOS -- by removing its control socket -- and look again.
+        for utun in live:
+            if re.fullmatch(r"utun[0-9]{1,3}", utun):
+                (WG_RUN_DIR / f"{utun}.sock").unlink(missing_ok=True)
+        for _ in range(10):
+            live = _our_live_utuns(wg, iface)
+            if not live:
+                break
+            _sleep(0.5)
     if live is None:
         return ("cannot verify the tunnel is down (`wg show all public-key` unreadable or no "
                 "key on disk)" + ("" if down.returncode == 0 else
@@ -1494,6 +1623,11 @@ def status(iface: str = DEFAULT_IFACE) -> tuple[bool, list[str]]:
                                         or "Permission denied" in err or listing.returncode == 127):
             fw = None
             rows.append("firewall: UNVERIFIED — cannot read nftables (needs root)")
+        elif listing.returncode != 0 and "No such file or directory" not in err:
+            # only nft's not-found answer means the table is absent; anything else is unknown
+            fw = None
+            tail = err.strip().splitlines()[-1:] or [f"exit {listing.returncode}"]
+            rows.append(f"firewall: UNVERIFIED — cannot read nftables ({tail[0]})")
         else:
             expected = worker_firewall_nft(iface=iface, worker_ip=ip, host_ip=host_ip,
                                            agent_port=agent_port)

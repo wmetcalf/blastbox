@@ -270,7 +270,13 @@ def _nft_listing(table: str = NFT_TABLE) -> tuple[str | None, str]:
         return None, "nft is not installed"
     if "Operation not permitted" in err or "Permission denied" in err:
         return None, "cannot read nftables (needs root)"
-    return None, "table not loaded"
+    # ONLY nft's own not-found answer (ENOENT for the table) is absence. Any other failure --
+    # netlink ENOMEM/EIO, a crashed nft -- says nothing about the table, and teardown treats
+    # "table not loaded" as permission to delete its recovery records.
+    if "No such file or directory" in err:
+        return None, "table not loaded"
+    tail = err.splitlines()[-1:] or [f"exit {proc.returncode}"]
+    return None, f"cannot read nftables ({tail[0]})"
 
 
 def firewall_status(cfg: WorkerLinkConfig) -> tuple[bool | None, str]:
@@ -278,7 +284,8 @@ def firewall_status(cfg: WorkerLinkConfig) -> tuple[bool | None, str]:
     None = could not observe. The ruleset FILE is never consulted: it is what was meant."""
     listing, why = _nft_listing()
     if listing is None:
-        return (None if "needs root" in why or "not installed" in why else False), why
+        # absent is a verdict (False); not being able to ask is not (None)
+        return (False if why == "table not loaded" else None), why
     missing = firewall_in_force(listing, host_firewall_nft(cfg))
     if missing:
         return False, "INCOMPLETE: missing " + ", ".join(missing)

@@ -528,3 +528,42 @@ def test_each_connect_is_capped_by_the_exchange_deadline(monkeypatch):
         remote_http._IO_REGISTRY.deadline = None
     assert timeouts and all(t <= 0.5 for t in timeouts), timeouts
     assert registered_before_connect == [True, True]
+
+
+def test_a_stalled_resolver_does_not_pile_up_threads(monkeypatch):
+    """REGRESSION (review): getaddrinfo ran inline in each probe's opener thread, before any
+    socket existed, so a probe abandoned at its deadline left that thread blocked in the
+    lookup -- one more per recurring probe. Lookups now run in ONE resolver thread per host
+    (shared), at most _MAX_RESOLVERS in total, and a probe waits only until its deadline."""
+    import socket
+    import threading
+    import time
+
+    from blastbox.host.runtime.aws_worker import _default_http_probe
+
+    release = threading.Event()
+    real_gai = socket.getaddrinfo
+
+    def stalled(host, *a, **kw):
+        if str(host).endswith(".stall.invalid"):
+            release.wait(10)
+            raise socket.gaierror(socket.EAI_AGAIN, "stalled")
+        return real_gai(host, *a, **kw)
+
+    def alive(name):
+        return sum(1 for t in threading.enumerate() if t.name == name and t.is_alive())
+
+    monkeypatch.setattr(socket, "getaddrinfo", stalled)
+    base_open, base_res = alive("bb-open"), alive("bb-resolve")
+    try:
+        for _ in range(10):                    # the same worker, probed again and again
+            assert _default_http_probe("http://w1.stall.invalid:8765/healthz", {}, 0.15) is False
+        time.sleep(0.3)
+        assert alive("bb-open") <= base_open, "opener threads stuck in the lookup"
+        assert alive("bb-resolve") - base_res == 1     # ONE shared lookup for that host
+        from blastbox.host.runtime import remote_http
+        for i in range(2 * remote_http._MAX_RESOLVERS):
+            _default_http_probe(f"http://w{i}.x.stall.invalid:8765/healthz", {}, 0.05)
+        assert alive("bb-resolve") - base_res <= remote_http._MAX_RESOLVERS
+    finally:
+        release.set()
