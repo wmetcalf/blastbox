@@ -475,7 +475,8 @@ def test_a_stalled_name_lookup_does_not_go_on_to_connect_after_the_deadline(monk
     monkeypatch.setattr(socket, "getaddrinfo", slow_gai)
     try:
         t0 = time.monotonic()
-        assert _default_http_probe(f"http://slow-dns.invalid:{port}/healthz", {}, 0.3) is False
+        # never reached the worker (this host's resolver): NO verdict, not "unhealthy"
+        assert _default_http_probe(f"http://slow-dns.invalid:{port}/healthz", {}, 0.3) is None
         assert time.monotonic() - t0 < 1.0
         time.sleep(1.5)                              # the lookup has long returned by now
         alive = [t for t in threading.enumerate() if t.name == "bb-open" and t.is_alive()]
@@ -557,7 +558,7 @@ def test_a_stalled_resolver_does_not_pile_up_threads(monkeypatch):
     base_open, base_res = alive("bb-open"), alive("bb-resolve")
     try:
         for _ in range(10):                    # the same worker, probed again and again
-            assert _default_http_probe("http://w1.stall.invalid:8765/healthz", {}, 0.15) is False
+            assert _default_http_probe("http://w1.stall.invalid:8765/healthz", {}, 0.15) is None
         time.sleep(0.3)
         assert alive("bb-open") <= base_open, "opener threads stuck in the lookup"
         assert alive("bb-resolve") - base_res == 1     # ONE shared lookup for that host
@@ -565,5 +566,38 @@ def test_a_stalled_resolver_does_not_pile_up_threads(monkeypatch):
         for i in range(2 * remote_http._MAX_RESOLVERS):
             _default_http_probe(f"http://w{i}.x.stall.invalid:8765/healthz", {}, 0.05)
         assert alive("bb-resolve") - base_res <= remote_http._MAX_RESOLVERS
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize("probe_name", ["plain", "tls-seam", "capability"])
+def test_an_exhausted_resolver_is_no_verdict_on_a_worker(monkeypatch, probe_name):
+    """REGRESSION (review): with the resolver cap full, a probe of another host raised a plain
+    TimeoutError, which the health probes read as False -- a resolver incident on THIS host
+    turned into "unhealthy" for every hostname-based worker, enough to evict them. It is now
+    ProbeNotAttempted: None from the health probes, None (unknown) from the capability probe."""
+    import socket
+    import threading
+
+    from blastbox.host.runtime import remote_http
+    from blastbox.host.runtime.aws_worker import _default_http_probe
+    from blastbox.host.runtime.static_pool import make_capability_probe
+
+    release = threading.Event()
+    real_gai = socket.getaddrinfo
+
+    def stalled(host, *a, **kw):
+        if str(host).endswith(".stall.invalid"):
+            release.wait(10)
+            raise socket.gaierror(socket.EAI_AGAIN, "stalled")
+        return real_gai(host, *a, **kw)
+
+    monkeypatch.setattr(socket, "getaddrinfo", stalled)
+    probe = {"plain": _default_http_probe, "tls-seam": remote_http.make_tls_probe(None),
+             "capability": make_capability_probe(None)}[probe_name]
+    try:
+        for i in range(remote_http._MAX_RESOLVERS):          # fill the cap with stalled lookups
+            _default_http_probe(f"http://fill{i}.stall.invalid:8765/healthz", {}, 0.05)
+        assert probe("http://healthy-worker.stall.invalid:8765/healthz", {}, 0.5) is None
     finally:
         release.set()

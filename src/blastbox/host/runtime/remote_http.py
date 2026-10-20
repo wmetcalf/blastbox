@@ -103,8 +103,8 @@ def _resolve_bounded(host: str, port: Any, deadline: float | None) -> list:
         job = _RESOLVING.get(key)
         if job is None:
             if len(_RESOLVING) >= _MAX_RESOLVERS:
-                raise TimeoutError(f"{_MAX_RESOLVERS} name lookups already in flight; the "
-                                   "resolver is not answering")
+                raise ProbeNotAttempted(f"{_MAX_RESOLVERS} name lookups already in flight; "
+                                        "this host's resolver is not answering")
             job = _Lookup()
             _RESOLVING[key] = job
 
@@ -121,7 +121,8 @@ def _resolve_bounded(host: str, port: Any, deadline: float | None) -> list:
             threading.Thread(target=_work, name="bb-resolve", daemon=True).start()
     wait = None if deadline is None else max(0.0, deadline - time.monotonic())
     if not job.done.wait(wait):
-        raise TimeoutError(f"name lookup for {host!r} exceeded the wall-clock deadline")
+        raise ProbeNotAttempted(f"name lookup for {host!r} did not finish within the deadline "
+                                "(this host's resolver is stalled)")
     if job.error is not None:
         raise job.error
     return list(job.result or [])
@@ -296,6 +297,16 @@ class RemoteReadTimeout(RuntimeError):
     kept the stream open). Abort so the validate finally can release the slot instead of pinning it."""
 
 
+class ProbeNotAttempted(RemoteReadTimeout):
+    """The exchange never REACHED the worker: this host's name resolution is stalled or its
+    lookup budget is exhausted, or the deadline passed before a connection was even started.
+
+    That is a LOCAL condition, not an answer from the worker -- the same rule as local
+    resource exhaustion (issue #77): a probe must report it as "no verdict" (None), never as
+    "the worker is unhealthy", or one resolver incident evicts a healthy hostname-based fleet.
+    A RemoteReadTimeout subclass, so the job path's existing handling is unchanged."""
+
+
 def _sanitized_failure(exc: Exception) -> str:
     """Map a transport/trust exception to a COARSE, non-sensitive reason for the job's error field
     (never the raw message -- it can carry hosts/paths/tokens)."""
@@ -397,6 +408,11 @@ def _open_bounded(opener: Any, req: Any, timeout: float, context: Any, deadline:
         if resp is not None:     # finished in the window between the deadline and the abort
             with contextlib.suppress(Exception):
                 resp.close()
+        if not socks:
+            # No socket was ever created (sockets are registered BEFORE connect): the time went
+            # on resolving the name, i.e. on THIS host -- not an answer from the worker.
+            raise ProbeNotAttempted("the deadline passed before a connection to the worker "
+                                    "was started (name resolution)")
         raise RemoteReadTimeout("remote opener (connect/send/headers) exceeded the wall-clock deadline")
     if "exc" in box:
         raise box["exc"]
@@ -516,6 +532,8 @@ def make_tls_probe(ssl_context: ssl.SSLContext | None) -> "Callable[[str, dict, 
             resp, _deadline = open_bounded_get(url, headers, timeout, ssl_context)
             with resp:
                 return 200 <= resp.status < 300
+        except ProbeNotAttempted:
+            return None       # never reached the worker (local resolver): no verdict
         except RemoteReadTimeout:
             return False      # it answered, too slowly: a verdict, like a socket timeout
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:

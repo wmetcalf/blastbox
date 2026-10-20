@@ -240,7 +240,7 @@ def test_firewall_in_force_reads_the_kernel_listing_not_the_file():
                  '\t\toifname "wtwg0" drop\n'):
         assert firewall_in_force(listing.replace(drop, "", 1), fw), drop
     unhooked = listing.replace("type filter hook output priority filter; policy accept;", "")
-    assert any("output" in m and "hooked" in m for m in firewall_in_force(unhooked, fw))
+    assert any("output" in m and "declared" in m for m in firewall_in_force(unhooked, fw))
     assert len(firewall_in_force("", fw)) == 4
     # an accept slipped in ahead of the drops is not ours
     extra = listing.replace('\t\tiifname "wtwg0" drop\n',
@@ -541,3 +541,31 @@ def test_a_loopback_or_unroutable_endpoint_is_rejected():
     for ep in ("127.0.0.1", "0.0.0.0", "169.254.1.1", "224.0.0.1:51822"):
         with pytest.raises(ValueError, match="loopback|non-routable"):
             WorkerLinkConfig(endpoint=ep)
+
+
+def test_a_base_chain_whose_policy_changed_is_not_in_force():
+    """REGRESSION (review): only the part of a base-chain declaration before the first `;` was
+    compared, so a chain flipped to `policy drop` (a reload, a hand edit) -- dropping unrelated
+    traffic on every interface -- still read as in force. The whole declaration counts."""
+    fw = host_firewall_nft(_real_cfg())
+    assert firewall_in_force(REAL_NFT_1_0_9_LISTING, fw) == []
+    for chain, hook in (("input", "input priority filter"), ("output", "output priority filter"),
+                        ("postrouting", "postrouting priority srcnat")):
+        flipped = REAL_NFT_1_0_9_LISTING.replace(f"hook {hook}; policy accept;",
+                                                 f"hook {hook}; policy drop;")
+        assert flipped != REAL_NFT_1_0_9_LISTING
+        assert any(chain in m and "policy accept" in m for m in firewall_in_force(flipped, fw))
+    moved = REAL_NFT_1_0_9_LISTING.replace("hook input priority filter;",
+                                           "hook input priority filter - 10;")
+    assert any("input" in m for m in firewall_in_force(moved, fw))
+
+
+def test_the_worker_readback_checks_chain_policies_too():
+    """Sweep: the worker's read-back goes through the same predicate."""
+    from blastbox.worker import link
+
+    fw = link.worker_firewall_nft(iface="wtwg0", worker_ip="10.78.0.5", host_ip="10.78.0.1",
+                                  agent_port=8765)
+    listing = fw.split(f"delete table inet {link.NFT_TABLE}\n", 1)[1]
+    assert firewall_in_force(listing, fw) == []
+    assert firewall_in_force(listing.replace("policy accept;", "policy drop;", 1), fw)

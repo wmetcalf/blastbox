@@ -325,7 +325,11 @@ def _default_http_probe(url: str, headers: dict[str, str], timeout: float) -> "b
     ANSWERED otherwise (non-2xx, refused, reset, timed out); None if we could not even ask because
     the LOCAL side ran out of resources (issue #77 marla-loop 3)."""
     # no-redirect opener, under a WALL-CLOCK deadline (no import cycle: imported here)
-    from blastbox.host.runtime.remote_http import RemoteReadTimeout, open_bounded_get
+    from blastbox.host.runtime.remote_http import (
+        ProbeNotAttempted,
+        RemoteReadTimeout,
+        open_bounded_get,
+    )
     try:
         # NEVER follow a worker-chosen 3xx on /healthz: it would re-send X-aws-proxy-auth (the shared
         # EC2/static agent_token, or a Lambda JWE) to the Location + SSRF-GET, and a 2xx there would
@@ -335,6 +339,8 @@ def _default_http_probe(url: str, headers: dict[str, str], timeout: float) -> "b
         resp, _deadline = open_bounded_get(url, headers, timeout)
         with resp:
             return 200 <= resp.status < 300
+    except ProbeNotAttempted:
+        return None       # never reached the worker (local resolver): no verdict
     except RemoteReadTimeout:
         return False      # it answered, too slowly: a verdict, like a socket timeout
     except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:

@@ -592,6 +592,13 @@ def _canon_rule(line: str) -> str:
     return " ".join(out)
 
 
+def _chain_decl(line: str) -> tuple[str, ...]:
+    """A base-chain declaration (``type filter hook input priority filter; policy accept;``)
+    as its normalised clauses, e.g. ``("type filter hook input priority filter",
+    "policy accept")`` -- every clause compared, whitespace and the trailing ``;`` aside."""
+    return tuple(" ".join(part.split()) for part in line.split(";") if part.strip())
+
+
 def firewall_in_force(listing: str, expected: str) -> list[str]:
     """What is MISSING from a live ``nft list table`` listing, or [] if ``expected`` (the
     ruleset we rendered) is in force.
@@ -612,9 +619,16 @@ def firewall_in_force(listing: str, expected: str) -> list[str]:
         if got is None:
             missing.append(f"chain {chain}")
             continue
+        # The WHOLE base-chain declaration -- type, hook, priority AND policy. Comparing only
+        # the part before the first `;` let a chain flipped to `policy drop` (a reload, a hand
+        # edit) read as in force while it dropped unrelated traffic on every other interface.
         hook = next((ln for ln in want if ln.startswith("type ")), None)
-        if hook and not any(ln.split(";")[0] == hook.split(";")[0] for ln in got):
-            missing.append(f"chain {chain} is not hooked as `{hook.split(';')[0]}`")
+        if hook:
+            got_decl = [_chain_decl(ln) for ln in got if ln.startswith("type ")]
+            if _chain_decl(hook) not in got_decl:
+                shown = "; ".join(_chain_decl(hook))
+                found = " / ".join("; ".join(d) for d in got_decl) or "none"
+                missing.append(f"chain {chain} is not declared as `{shown}` (found: {found})")
         rules_want = [_canon_rule(ln) for ln in want if not ln.startswith("type ")]
         rules_got = [_canon_rule(ln) for ln in got if not ln.startswith("type ")]
         if rules_got == rules_want:
