@@ -87,6 +87,12 @@ def _installation_locked(fn):  # type: ignore[no-untyped-def]
     return wrapper
 
 
+class FirewallNotInForce(RuntimeError):
+    """The NEW ruleset was loaded but could not be verified, or could not be persisted. Unlike
+    nft refusing the file (the previous ruleset then stays loaded), a live link is no longer
+    known to be firewalled -- see init_host."""
+
+
 class WorkerLinkNotInitialised(RuntimeError):
     """``init`` has not been run on this host (no persisted config / interface config)."""
 
@@ -300,7 +306,7 @@ def install_firewall(cfg: WorkerLinkConfig) -> list[str]:
     ea.fsync_dir(FW_FILE.parent)
     state, why = firewall_status(cfg)
     if state is not True:
-        raise RuntimeError(f"loaded the worker-link ruleset but it is not in force: {why}")
+        raise FirewallNotInForce(f"loaded the worker-link ruleset but it is not in force: {why}")
     notes = [f"firewall: {why}"]
     # Persistence is part of the guarantee, not a nicety: without the boot unit enabled
     # (RequiredBy=wg-quick@<iface>) the link would come up OPEN after a reboot, and without
@@ -319,8 +325,9 @@ def install_firewall(cfg: WorkerLinkConfig) -> list[str]:
                 ea.atomic_write(path, text, 0o644)
                 changed = True
     except OSError as exc:
-        raise RuntimeError(f"could not install the firewall units ({exc.strerror}); without "
-                           "them the link would come up unfirewalled after a reboot") from None
+        raise FirewallNotInForce(f"could not install the firewall units ({exc.strerror}); "
+                                 "without them the link would come up unfirewalled after a "
+                                 "reboot") from None
     if changed:
         ea._run(["systemctl", "daemon-reload"], check=False)
     for argv in (["systemctl", "enable", FW_UNIT_NAME],
@@ -328,8 +335,8 @@ def install_firewall(cfg: WorkerLinkConfig) -> list[str]:
         rc = ea._run(argv, check=False)
         if rc.returncode != 0 or not ea._ok(["systemctl", "is-enabled", argv[-1]]):
             tail = (rc.stderr or "").strip().splitlines()[-1:] or ["systemctl failed"]
-            raise RuntimeError(f"could not enable {argv[-1]} ({tail[0]}); refusing to bring the "
-                               "link up without its firewall persisted")
+            raise FirewallNotInForce(f"could not enable {argv[-1]} ({tail[0]}); refusing to "
+                                     "bring the link up without its firewall persisted")
     notes.append(f"firewall units enabled: {FW_UNIT_NAME} (loads before the link at boot; "
                  f"the link Requires it) and {REASSERT_TIMER_NAME} (re-asserts every minute)")
     return notes
@@ -599,7 +606,13 @@ def init_host(cfg: WorkerLinkConfig, *, rotate_key: bool = False) -> tuple[str, 
     changed = _refuse_incompatible_reinit(cfg)
     check_host(cfg)
     changed += _reconcile_host_key(cfg, rotate=rotate_key)
-    notes = install_firewall(cfg)
+    _refuse_endpoint_resolving_into_overlay(cfg)
+    try:
+        notes = install_firewall(cfg)
+    except FirewallNotInForce as exc:
+        # On a re-init the link may be LIVE: it must not keep running (or boot) behind a
+        # ruleset nobody can vouch for. Down it, verified, and disable its unit.
+        raise FirewallNotInForce(str(exc) + _host_fail_closed(cfg)) from None
     notes += changed
     ea.WG_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(ea.WG_DIR, 0o700)
@@ -630,6 +643,7 @@ def init_host(cfg: WorkerLinkConfig, *, rotate_key: bool = False) -> tuple[str, 
             # it, not see "nothing changed".
             _restart_link(cfg)
         _verify_live_address(cfg)
+        _ensure_link_enabled(cfg)
     persist_config(cfg)
     notes.append(f"{cfg.wg_iface} up at {cfg.host_ip}/{cfg.prefixlen}, udp/{cfg.wg_port}")
     notes.append(f"config persisted to {ENV_FILE}")
@@ -642,6 +656,67 @@ def init_host(cfg: WorkerLinkConfig, *, rotate_key: bool = False) -> tuple[str, 
                      "(its connections are then MASQUERADEd to "
                      f"{cfg.host_ip}).")
     return pub, notes
+
+
+def _ensure_link_enabled(cfg: WorkerLinkConfig) -> None:
+    """Raise unless ``wg-quick@<iface>`` is ENABLED. ``egress_apply.wg_up`` falls back to a
+    direct ``wg-quick up`` when ``enable --now`` fails: the link is then up but would not
+    return after a reboot, while init persisted everything else as if it would."""
+    unit = f"wg-quick@{cfg.wg_iface}"
+    if ea._ok(["systemctl", "is-enabled", unit]):
+        return
+    ea._run(["systemctl", "enable", unit], check=False)
+    if not ea._ok(["systemctl", "is-enabled", unit]):
+        raise RuntimeError(f"{cfg.wg_iface} is up but {unit} could not be ENABLED, so the link "
+                           "would not come back after a reboot (its firewall is installed and "
+                           f"kept). Run `systemctl enable {unit}` and re-run init.")
+
+
+def _host_fail_closed(cfg: WorkerLinkConfig) -> str:
+    """Take a live host link DOWN (verified) and disable its unit, because its firewall
+    cannot be vouched for; returns the sentence to append to the error."""
+    iface, unit = cfg.wg_iface, f"wg-quick@{cfg.wg_iface}"
+    ea._run(["systemctl", "disable", unit], check=False)
+    if not ea._ok(["ip", "link", "show", iface]):
+        return ""
+    ea._run(["systemctl", "stop", unit], check=False)
+    ea._run(["wg-quick", "down", iface], check=False)
+    if ea._ok(["ip", "link", "show", iface]):
+        ea._run(["ip", "link", "delete", "dev", iface], check=False)
+    if ea._ok(["ip", "link", "show", iface]):
+        return (f". {iface} could NOT be taken down and may be running without its firewall: "
+                f"`ip link delete dev {iface}` by hand NOW")
+    return f". {iface} was taken DOWN (and {unit} disabled) rather than left running without it"
+
+
+def _resolve_host(host: str) -> list[str]:
+    """Addresses ``host`` resolves to from here, or [] if it does not (one seam for tests)."""
+    import socket
+
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_UDP)
+    except (socket.gaierror, UnicodeError, OSError):
+        return []
+    return sorted({str(i[4][0]) for i in infos})
+
+
+def _refuse_endpoint_resolving_into_overlay(cfg: WorkerLinkConfig) -> None:
+    """A HOSTNAME endpoint that resolves into the overlay is as recursive as a literal one
+    (rejected in WorkerLinkConfig). Resolved here, best effort: a name that does not resolve
+    from this host is not proof of anything, and every worker checks it again at join."""
+    from blastbox.host.worker_link import refuse_endpoint_in_overlay
+
+    if not cfg.endpoint:
+        return
+    host = cfg.endpoint.rsplit(":", 1)[0].strip("[]")
+    addrs = _resolve_host(host)
+    if not addrs:
+        return
+    try:
+        refuse_endpoint_in_overlay(addrs, cfg.overlay_net,
+                                   what=f"endpoint {host} (resolves to {', '.join(addrs)})")
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from None
 
 
 def _restart_link(cfg: WorkerLinkConfig) -> None:

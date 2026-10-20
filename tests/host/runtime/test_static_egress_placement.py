@@ -422,3 +422,109 @@ def test_repeated_probes_against_a_trickling_worker_do_not_leak_threads():
     finally:
         stop.set()
         srv.close()
+
+
+# ------------------------------------------------------------------ review round 8
+
+def test_a_stalled_name_lookup_does_not_go_on_to_connect_after_the_deadline(monkeypatch):
+    """REGRESSION (review): the socket was registered only after connect() returned, so a
+    stalled lookup or connect could not be aborted: once the lookup finished, the abandoned
+    thread went on to connect -- here into a trickling worker -- and stayed blocked. Now an
+    exchange given up on at its deadline does not connect at all."""
+    import socket
+    import threading
+    import time
+
+    from blastbox.host.runtime.aws_worker import _default_http_probe
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    stop = threading.Event()
+    accepted = []
+
+    def serve():
+        srv.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                continue
+            accepted.append(conn)
+            def trickle(c=conn):
+                try:
+                    c.recv(65536)
+                    c.sendall(b"HTTP/1.1 200 OK\r\n")
+                    while not stop.is_set():
+                        c.sendall(b"X")
+                        time.sleep(0.02)
+                except OSError:
+                    pass
+            threading.Thread(target=trickle, daemon=True).start()
+
+    threading.Thread(target=serve, daemon=True).start()
+    port = srv.getsockname()[1]
+    real_gai = socket.getaddrinfo
+
+    def slow_gai(host, *a, **kw):
+        if host == "slow-dns.invalid":
+            time.sleep(1.0)                          # resolution outlives the 0.3 s deadline
+            return real_gai("127.0.0.1", *a, **kw)
+        return real_gai(host, *a, **kw)
+
+    monkeypatch.setattr(socket, "getaddrinfo", slow_gai)
+    try:
+        t0 = time.monotonic()
+        assert _default_http_probe(f"http://slow-dns.invalid:{port}/healthz", {}, 0.3) is False
+        assert time.monotonic() - t0 < 1.0
+        time.sleep(1.5)                              # the lookup has long returned by now
+        alive = [t for t in threading.enumerate() if t.name == "bb-open" and t.is_alive()]
+        assert accepted == [] and alive == []
+    finally:
+        stop.set()
+        srv.close()
+
+
+def test_each_connect_is_capped_by_the_exchange_deadline(monkeypatch):
+    """Black-holed addresses: each connect gets min(per-op timeout, time left), and the
+    socket is registered (abortable) before the blocking connect starts."""
+    import socket
+    import time
+
+    from blastbox.host.runtime import remote_http
+
+    timeouts, registered_before_connect = [], []
+    socks: list = []
+
+    class FakeSock:
+        def __init__(self, *a):
+            pass
+
+        def settimeout(self, t):
+            timeouts.append(t)
+
+        def bind(self, a):
+            pass
+
+        def connect(self, sa):
+            registered_before_connect.append(self in socks)
+            raise TimeoutError("black hole")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 80)),
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.2", 80))])
+    monkeypatch.setattr(socket, "socket", FakeSock)
+    remote_http._IO_REGISTRY.socks = socks
+    remote_http._IO_REGISTRY.deadline = time.monotonic() + 0.5
+    remote_http._IO_REGISTRY.cancelled = None
+    try:
+        with pytest.raises(OSError):
+            remote_http._tracked_create_connection(("w", 80), 30.0)
+    finally:
+        remote_http._IO_REGISTRY.socks = None
+        remote_http._IO_REGISTRY.deadline = None
+    assert timeouts and all(t <= 0.5 for t in timeouts), timeouts
+    assert registered_before_connect == [True, True]

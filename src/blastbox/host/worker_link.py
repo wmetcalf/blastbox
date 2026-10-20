@@ -52,6 +52,7 @@ from typing import Iterable, Mapping
 from blastbox.host.egress import _SAFE_NAME, _iface, _is_wg_key
 
 __all__ = [
+    "refuse_endpoint_in_overlay",
     "DEFAULT_IFACE",
     "DEFAULT_OVERLAY",
     "DEFAULT_PORT",
@@ -161,6 +162,24 @@ def parse_endpoint(value: str, default_port: int = DEFAULT_PORT) -> tuple[str, i
     return host.lower(), port
 
 
+def refuse_endpoint_in_overlay(addrs: Iterable[str], overlay: "ipaddress.IPv4Network | str",
+                               *, what: str) -> None:
+    """Raise if any of ``addrs`` (the endpoint, literal or as resolved) is inside the link's
+    overlay. The worker routes the host's overlay /32 INTO the tunnel; an endpoint there sends
+    WireGuard's own UDP into the tunnel it is meant to establish, and the link can never
+    handshake. Any overlay address is refused, not only the host's: none is an underlay."""
+    net = ipaddress.ip_network(overlay) if isinstance(overlay, str) else overlay
+    for a in addrs:
+        try:
+            ip = ipaddress.ip_address(str(a).strip("[]"))
+        except ValueError:
+            continue                      # a hostname: checked once resolved
+        if ip.version == 4 and ip in net:
+            raise ValueError(f"{what} is inside the link overlay {net}: WireGuard's packets "
+                             "to it would be routed into the tunnel they establish. Use the "
+                             "host's public/underlay address.")
+
+
 @dataclass(frozen=True)
 class WorkerLinkConfig:
     """The host side of one worker-link overlay, validated on construction.
@@ -209,6 +228,7 @@ class WorkerLinkConfig:
         object.__setattr__(self, "agent_port", _port(self.agent_port, "agent_port"))
         if self.endpoint:
             h, p = parse_endpoint(self.endpoint, self.wg_port)
+            refuse_endpoint_in_overlay([h], net, what=f"endpoint {h}")
             object.__setattr__(self, "endpoint", f"{h}:{p}")
         srcs: list[str] = []
         for s in self.dispatcher_sources:

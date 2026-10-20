@@ -520,3 +520,16 @@ def test_egress_global_mode_never_captures_the_worker_links_underlay_traffic():
             assert not val.overlaps(ipaddress.ip_network(link.overlay_net))
     peer = peer_wg_config(eg, "PRIV", "10.77.0.2", "192.0.2.10", KEY_A)
     assert "Table = off" in peer and "FwMark" not in peer
+
+
+def test_an_endpoint_inside_the_overlay_is_rejected():
+    """REGRESSION (review): `--endpoint 10.78.0.1` (the host's own overlay address) was
+    accepted and distributed: the worker routes that /32 INTO the tunnel, so WireGuard's own
+    packets to its endpoint went into the tunnel they establish -- a link that can never
+    handshake, reported as joined."""
+    for ep in ("10.78.0.1", "10.78.0.5:51822", "10.78.0.200"):
+        with pytest.raises(ValueError, match="inside the link overlay"):
+            WorkerLinkConfig(endpoint=ep)
+    WorkerLinkConfig(endpoint="192.0.2.10")              # an underlay address is fine
+    with pytest.raises(ValueError, match="inside the link overlay"):
+        _bundle(endpoint="10.78.0.1:51822")

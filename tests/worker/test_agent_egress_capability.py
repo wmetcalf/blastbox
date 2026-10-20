@@ -184,3 +184,29 @@ def test_the_dispatcher_turns_the_refusal_into_a_clear_job_error(platform, tmp_p
         assert eng.ran == []
     finally:
         _stop(httpd)
+
+
+def test_a_422_refusal_for_a_job_that_did_not_ask_for_egress_is_not_a_free_pass(tmp_path):
+    """REGRESSION (review): the 422 `egress_unavailable` body is worker-controlled. Honoured
+    for a SEALED job it released the worker clean (fault="job"), so a broken or lying worker
+    could refuse everything and keep receiving jobs. Only a job whose host-owned params asked
+    for egress (BLASTBOX_NET_EGRESS=1) may be refused that way."""
+    import io
+    import urllib.error
+
+    from blastbox.host.runtime.remote_http import WorkerLacksEgress, detonate_remote
+
+    def refusing(req, timeout, context=None):
+        raise urllib.error.HTTPError(req.full_url, 422, "Unprocessable", {},
+                                     io.BytesIO(b'{"error": "egress_unavailable"}'))
+
+    inp = tmp_path / "in.bin"
+    inp.write_bytes(b"x")
+    for params in (None, {}, {"BLASTBOX_NET_EGRESS": "0"}):
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            detonate_remote("http://w", inp, tmp_path / "o", http_open=refusing, params=params)
+        assert not isinstance(ei.value, WorkerLacksEgress) and ei.value.code == 422
+        assert not isinstance(ei.value.__context__, WorkerLacksEgress)
+    with pytest.raises(WorkerLacksEgress):
+        detonate_remote("http://w", inp, tmp_path / "o", http_open=refusing,
+                        params={"BLASTBOX_NET_EGRESS": "1"})

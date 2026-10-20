@@ -68,7 +68,53 @@ def _track(sock: Any) -> None:
         lst.append(sock)
 
 
+def _tracked_create_connection(address: tuple, timeout: Any = None,
+                               source_address: Any = None, *args: Any, **kwargs: Any) -> Any:
+    """``socket.create_connection`` whose sockets are registered BEFORE the blocking connect,
+    and whose connects are held to the caller's wall-clock deadline.
+
+    The stock one registers nothing until it returns: a stalled connect -- or a name resolving
+    to several black-holed addresses, each tried for a full socket timeout -- could not be
+    aborted, and the abandoned thread outlived the caller. Here each socket is tracked as soon
+    as it exists (so :func:`_open_bounded` can shut it down), each connect gets
+    ``min(timeout, time left)``, and an exchange already given up on (the deadline passed while
+    name resolution was still running) does not go on to connect at all.
+    """
+    host, port = address
+    deadline = getattr(_IO_REGISTRY, "deadline", None)
+    cancelled = getattr(_IO_REGISTRY, "cancelled", None)
+    per_op = timeout if isinstance(timeout, (int, float)) else None
+    infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    err: OSError | None = None
+    for family, socktype, proto, _canon, sockaddr in infos:
+        if cancelled is not None and cancelled.is_set():
+            raise TimeoutError("the exchange was abandoned at its deadline")
+        budget = per_op
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("connect exceeded the wall-clock deadline")
+            budget = left if budget is None else min(budget, left)
+        sk = socket.socket(family, socktype, proto)
+        _track(sk)
+        try:
+            sk.settimeout(budget)
+            if source_address:
+                sk.bind(source_address)
+            sk.connect(sockaddr)
+            sk.settimeout(per_op)
+            return sk
+        except OSError as exc:
+            err = exc
+            sk.close()
+    raise err if err is not None else OSError(f"getaddrinfo returned no address for {host!r}")
+
+
 class _TrackedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._create_connection = _tracked_create_connection
+
     def connect(self) -> None:
         super().connect()
         _track(self.sock)
@@ -77,6 +123,10 @@ class _TrackedHTTPConnection(http.client.HTTPConnection):
 class _TrackedHTTPSConnection(http.client.HTTPSConnection):
     """HTTPSConnection whose sockets are registered BEFORE the TLS handshake, so a worker that
     stalls or trickles the handshake can be cut off too (the handshake is run explicitly)."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._create_connection = _tracked_create_connection
 
     def connect(self) -> None:
         http.client.HTTPConnection.connect(self)
@@ -261,20 +311,26 @@ def _open_bounded(opener: Any, req: Any, timeout: float, context: Any, deadline:
     blocked recv/send returns at once and the thread exits."""
     box: dict[str, Any] = {}
     socks: list = []
+    cancelled = threading.Event()
 
     def _run() -> None:
         _IO_REGISTRY.socks = socks
+        _IO_REGISTRY.deadline = deadline
+        _IO_REGISTRY.cancelled = cancelled
         try:
             box["resp"] = opener(req, timeout, context=context)
         except BaseException as exc:   # noqa: BLE001 -- surfaced to the caller below
             box["exc"] = exc
         finally:
             _IO_REGISTRY.socks = None
+            _IO_REGISTRY.deadline = None
+            _IO_REGISTRY.cancelled = None
 
     t = threading.Thread(target=_run, name="bb-open", daemon=True)
     t.start()
     t.join(timeout=max(0.0, deadline - time.monotonic()))
     if t.is_alive():
+        cancelled.set()          # a connect not yet started (name resolution still running) won't
         if socks:
             _abort_io(socks)
             t.join(timeout=1.0)  # it returns promptly once its socket is shut down
@@ -628,7 +684,12 @@ def detonate_remote(
             # Other 4xx/5xx are real failures and propagate.
             if exc.code == 409:
                 raise WorkerBusy(f"worker busy (409) at {url}") from exc
-            if _egress_refusal(exc, read_deadline):
+            # Only when THIS job asked for egress (the host-owned BLASTBOX_NET_EGRESS param):
+            # the body is worker-controlled, and honouring the refusal releases the worker CLEAN
+            # with fault="job". A worker answering it for a sealed job is broken or lying, and
+            # must take the ordinary failure path (and its streak), not a free pass.
+            if (params or {}).get("BLASTBOX_NET_EGRESS") == "1" \
+                    and _egress_refusal(exc, read_deadline):
                 raise WorkerLacksEgress(f"worker at {url} cannot provide egress (422)") from exc
             raise
         with resp_cm as resp, tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024) as spool:

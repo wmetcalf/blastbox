@@ -53,6 +53,12 @@ class FakeNode:
         self.disable_fails = False
         self.launchd_loaded = False
         self.bootout_fails = False
+        #: macOS: addr -> (destination, interface) for `route -n get`; default via mac_route_dev
+        self.mac_routes: dict[str, tuple[str, str]] = {}
+        self.ifconfig_a = ""                    # `ifconfig -a` output (no overlay addresses)
+        self.stale_utun = False                 # a utun still runs our key, name file gone
+        self.kickstart_fails = False
+        self.pf_anchor_override: str | None = None
 
     def run(self, argv, *, input=None):
         a = [str(x) for x in argv]
@@ -67,7 +73,7 @@ class FakeNode:
             out = base64.b64encode(os.urandom(32)).decode() + "\n"
         elif tool == "wg" and a[1] == "pubkey":
             out = _wg_pub(input or "") + "\n"
-        elif tool == "wg" and a[1] == "show":
+        elif tool == "wg" and a[1] == "show" and a[2] != "all":
             if not self.root:
                 rc, err = 1, "Operation not permitted"
             else:
@@ -98,8 +104,20 @@ class FakeNode:
             out = json.dumps([{"ifname": dev, "link_type": "none" if kind else "ether",
                                **({"linkinfo": {"info_kind": kind}} if kind else {})}])
         elif a[:3] == ["route", "-n", "get"]:
-            out = (f"   route to: {a[-1]}\ndestination: default\n"
-                   f"  interface: {self.mac_route_dev}\n")
+            dest, dev = self.mac_routes.get(a[-1], ("default", self.mac_route_dev))
+            out = (f"   route to: {a[-1]}\ndestination: {dest}\n"
+                   f"  interface: {dev}\n")
+        elif tool == "ifconfig" and a[1:] == ["-a"]:
+            out = self.ifconfig_a
+        elif tool == "ifconfig":
+            dev = a[1]
+            p2p = dev in self.tunnels or not dev.startswith("en")
+            out = (f"{dev}: flags=8051<UP,{'POINTOPOINT' if p2p else 'BROADCAST'},RUNNING,"
+                   "MULTICAST> mtu 1500\n")
+        elif tool == "wg" and a[1:3] == ["show", "all"]:
+            key = link._paths("wtwg0")["wg_key"]
+            live = (link.WG_RUN_DIR / "wtwg0.name").exists() or self.stale_utun
+            out = f"utun7\t{_wg_pub(key.read_text())}\n" if live and key.exists() else ""
         elif tool == "wg-quick" and a[1] in ("down", "up"):
             if a[1] == "down" and self.wg_quick_down_works:
                 self.links.discard(a[2])
@@ -133,6 +151,8 @@ class FakeNode:
             # what RunAtLoad would do: the watchdog brings the tunnel up as some utun
             self.launchd_loaded = True
             (link.WG_RUN_DIR / "wtwg0.name").write_text("utun7\n")
+        elif tool == "launchctl" and a[1] == "kickstart" and self.kickstart_fails:
+            rc, err = 113, "Could not find service"
         elif tool == "launchctl" and a[1] == "kickstart" and self.launchd_loaded:
             (link.WG_RUN_DIR / "wtwg0.name").write_text("utun7\n")   # the watchdog re-ups it
         elif tool == "launchctl" and a[1] == "bootout":
@@ -146,8 +166,9 @@ class FakeNode:
         elif tool == "pfctl" and "rules" in a and "-a" not in a:
             out = 'anchor "com.apple/*" all\n'
         elif tool == "pfctl" and "rules" in a:
-            out = link.pf_rules(real_iface="utun7", worker_ip="10.78.0.5", host_ip="10.78.0.1",
-                                agent_port=8765)
+            out = (self.pf_anchor_override if self.pf_anchor_override is not None else
+                   link.pf_rules(real_iface="utun7", worker_ip="10.78.0.5", host_ip="10.78.0.1",
+                                 agent_port=8765))
         return subprocess.CompletedProcess(a, rc, out, err)
 
     def flat(self) -> list[str]:
@@ -322,6 +343,7 @@ def mac(tmp_path):
     (state / "main").write_text('anchor "com.apple/*" all\n')
     env_hdr = f'LOG={log}; ST={state}; RUN={run_d}\necho "$(basename "$0") $*" >> "$LOG"\n'
     wg = _fake_bin(bin_d, "wg", env_hdr + (
+        'if [ "$1" = show ] && [ "$2" = all ]; then cat "$ST/keys" 2>/dev/null; exit 0; fi\n'
         '[ "$1" = show ] && grep -qx "$2" "$ST/up" && exit 0\nexit 1\n'))
     wgq = _fake_bin(bin_d, "wg-quick", env_hdr + (
         'if [ "$1" = up ]; then echo utun9 > "$RUN/$2.name"; echo utun9 >> "$ST/up"; fi\n'
@@ -362,6 +384,15 @@ def mac(tmp_path):
 
         def main_rules(self, text: str) -> None:
             (state / "main").write_text(text)
+
+        def drop_name(self) -> None:
+            (run_d / "wtwg0.name").unlink(missing_ok=True)
+
+        def name_file(self) -> str:
+            return (run_d / "wtwg0.name").read_text().strip()
+
+        def keys(self, text: str) -> None:
+            (state / "keys").write_text(text)
 
         def rerender(self, **kw) -> None:
             args = dict(iface="wtwg0", worker_ip="10.78.0.5", host_ip="10.78.0.1",
@@ -1200,3 +1231,154 @@ def test_keygen_join_and_leave_hold_one_node_wide_lock(node, tmp_path, monkeypat
     link.leave("wtwg0")
     assert len(seen) == 3 and all(seen.values()), seen
     assert not held()
+
+
+# ------------------------------------------------------------------ review round 8
+
+def test_macos_rejoin_takes_the_link_down_when_pf_cannot_be_verified(node, tmp_path):
+    """REGRESSION (review): on a re-join of a live link a failed `launchctl kickstart` was
+    ignored; the name file and live peer passed, so join reported success with the pf anchor
+    (flushed by something else) never restored. pf is now read back; unverifiable -> down."""
+    n = node("darwin")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    n.pf_anchor_override = ""                     # the anchor was flushed under the live link
+    n.kickstart_fails = True
+    with pytest.raises(RuntimeError, match=r"NOT in force.*kickstart` also failed.*taken DOWN"):
+        link.join(_bundle(tmp_path, csr))
+    assert not n.launchd_loaded and not (link.WG_RUN_DIR / "wtwg0.name").exists()
+    n.pf_anchor_override = None
+    n.kickstart_fails = False
+    assert any("pf: in force" in x for x in link.join(_bundle(tmp_path, csr)))
+
+
+def test_macos_leave_finds_the_live_tunnel_by_its_key_not_its_name_file(node, tmp_path):
+    """REGRESSION (review): leave took a missing /var/run/wireguard/<iface>.name as proof the
+    utun was gone, then flushed pf and deleted the config with the tunnel still running."""
+    n = node("darwin")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    (link.WG_RUN_DIR / "wtwg0.name").unlink()
+    n.stale_utun = True                            # still running our key
+    n.calls.clear()
+    notes = link.leave("wtwg0")
+    assert "not confirmed down" in notes[-1] and "utun7 still runs this link's key" in notes[-1]
+    assert not any("-F all" in c for c in n.flat())
+    assert link._paths("wtwg0")["conf"].exists() and link._paths("wtwg0")["plist"].exists()
+    n.stale_utun = False
+    link.leave("wtwg0")
+    assert not link._paths("wtwg0")["conf"].exists()
+
+
+@pytest.mark.parametrize("where", ["route", "address"])
+def test_macos_join_refuses_overlay_addresses_this_mac_already_uses(node, tmp_path, where):
+    """REGRESSION (review): the macOS preflight never checked whether worker_ip / host_ip were
+    already routed or assigned (Linux does), so the watchdog's closed pf rules could cut off a
+    LAN or VPN using them -- and keep doing so on every run."""
+    n = node("darwin")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    if where == "route":
+        n.mac_routes["10.78.0.1"] = ("10.78.0.0", "en0")
+    else:
+        n.ifconfig_a = ("en0: flags=8863<UP,BROADCAST,RUNNING> mtu 1500\n"
+                        "\tinet 10.78.0.5 netmask 0xffffff00 broadcast 10.78.0.255\n")
+    with pytest.raises(RuntimeError, match="collide with this Mac's network"):
+        link.join(_bundle(tmp_path, csr))
+    assert not link._paths("wtwg0")["plist"].exists() and not n.launchd_loaded
+    # ...but the link's OWN utun holding them (a re-join) is not a collision
+    n.mac_routes.clear()
+    n.ifconfig_a = ""
+    link.join(_bundle(tmp_path, csr))
+    n.mac_routes["10.78.0.1"] = ("10.78.0.1", "utun7")
+    n.ifconfig_a = "utun7: flags=8051<UP,POINTOPOINT,RUNNING> mtu 1380\n\tinet 10.78.0.5 --> 10.78.0.5\n"
+    link.join(_bundle(tmp_path, csr))
+
+
+@pytest.mark.parametrize("dev", ["gif0", "stf0", "ppp0", "vpnx3"])
+def test_macos_endpoint_routes_through_any_tunnel_family_are_refused(node, tmp_path, dev):
+    """REGRESSION (review): only utun/ipsec/tun names counted as tunnels; gif (IP-in-IP), stf
+    (6to4), ppp (L2TP/PPTP) -- or any POINTOPOINT interface -- passed as underlay."""
+    n = node("darwin")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    n.mac_route_dev = dev
+    with pytest.raises(RuntimeError, match=f"via {dev} "):
+        link.join(_bundle(tmp_path, csr))
+
+
+def test_linux_ppp_endpoint_route_is_a_tunnel_too(node, tmp_path):
+    n = node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    real = n.run
+
+    def run(argv, **kw):
+        if list(argv)[:4] == ["ip", "-d", "-j", "link"] and argv[-1] == "ppp0":
+            return subprocess.CompletedProcess(list(argv), 0, json.dumps(
+                [{"ifname": "ppp0", "link_type": "ppp"}]), "")
+        return real(argv, **kw)
+
+    n.route_dev = "ppp0"
+    link._run, saved = run, link._run
+    try:
+        with pytest.raises(RuntimeError, match="via ppp0"):
+            link.join(_bundle(tmp_path, csr))
+    finally:
+        link._run = saved
+
+
+def test_a_linux_rejoin_whose_firewall_fails_read_back_takes_the_link_down(node, tmp_path):
+    """REGRESSION (review): on a re-join the old interface is live; a new ruleset that then
+    failed read-back raised with that tunnel still running behind an incomplete firewall."""
+    n = node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    assert "wtwg0" in n.links
+    n.nft_drop_missing = True
+    with pytest.raises(RuntimeError, match="not in force.*taken DOWN"):
+        link.join(_bundle(tmp_path, csr))
+    assert "wtwg0" not in n.links
+
+
+def test_a_linux_join_verifies_its_unit_is_enabled_after_the_fallback(node, tmp_path, monkeypatch):
+    """Sweep (review round 8, the worker twin of the host fix): the direct `wg-quick up`
+    fallback brought the link up with wg-quick@ NOT enabled -- gone after a reboot."""
+    n = node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    real = n.run
+
+    def run(argv, **kw):
+        a = [str(x) for x in argv]
+        if a[:2] == ["systemctl", "enable"] and a[-1] == "wg-quick@wtwg0":
+            n.calls.append(a)
+            return subprocess.CompletedProcess(a, 1, "", "Unit file is masked.")
+        return real(argv, **kw)
+
+    monkeypatch.setattr(link, "_run", run)
+    with pytest.raises(RuntimeError, match="could not be ENABLED"):
+        link.join(_bundle(tmp_path, csr))
+
+
+def test_join_refuses_an_endpoint_name_resolving_into_the_overlay(node, tmp_path, monkeypatch):
+    node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    monkeypatch.setattr(link, "_resolve", lambda host: ["10.78.0.1"])
+    with pytest.raises(RuntimeError, match="inside the link overlay"):
+        link.join(_bundle(tmp_path, csr))
+
+
+def test_watchdog_finds_a_live_tunnel_by_key_when_its_name_file_is_gone(mac):
+    """Sweep (review round 8, the same name-file trust as leave): with wg-quick's name file
+    missing but the utun still running our key, the watchdog took the link for DOWN and ran
+    `wg-quick up` -- a second tunnel with the same key. It now finds the tunnel by its key."""
+    pub = "P" * 43 + "="
+    mac.rerender(public_key=pub)
+    mac.up("utun7")
+    mac.run()
+    mac.drop_name()                          # the note is gone; the tunnel is not
+    mac.keys(f"utun7\t{pub}\n")
+    calls = mac.run()
+    assert not any(c.startswith("wg-quick") for c in calls), calls
+    assert mac.name_file() == "utun7"
+    # a tunnel running some OTHER key is not ours: the link really is down -> re-up
+    mac.drop_name()
+    mac.keys(f"utun3\t{'Q' * 43}=\n")
+    assert "wg-quick up wtwg0" in mac.run()

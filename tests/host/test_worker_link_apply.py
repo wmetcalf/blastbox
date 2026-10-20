@@ -49,6 +49,8 @@ class FakeHost:
         self.addrs: dict[str, str] = {}               # iface -> LIVE "ip/prefix"
         self.restart_fails = False
         self.nft_delete_fails = False
+        self.enable_fails = False                     # `systemctl enable [--now] wg-quick@*`
+        self.nft_drop_missing = False                 # the kernel loses a rule on load
 
     def _up(self, iface: str) -> None:
         """A (re)start reads the interface's config file, as wg-quick does."""
@@ -68,6 +70,8 @@ class FakeHost:
             else:
                 text = Path(a[2]).read_text()
                 self.loaded = text.split(f"delete table inet {NFT_TABLE}\n", 1)[1]
+                if self.nft_drop_missing:
+                    self.loaded = self.loaded.replace('\t\toifname "wtwg0" drop\n', "", 1)
         elif tool == "nft" and a[1:3] == ["list", "table"]:
             if not self.root:
                 rc, err = 1, "Error: Operation not permitted"
@@ -98,6 +102,9 @@ class FakeHost:
             self._up(a[2])
         elif a[:2] == ["systemctl", "is-enabled"]:
             rc = 0 if a[2] in self.enabled else 1
+        elif a[:2] == ["systemctl", "enable"] and self.enable_fails \
+                and a[-1].startswith("wg-quick@"):
+            rc, err = 1, "Failed to enable unit: Unit file is masked."
         elif a[:2] == ["systemctl", "enable"]:
             self.enabled.add(a[-1])
             if a[2] == "--now" and a[3].startswith("wg-quick@"):
@@ -162,6 +169,8 @@ def host(tmp_path, monkeypatch):
     monkeypatch.setattr(wla, "FW_FILE", tmp_path / "worker-link.nft")
     monkeypatch.setattr(wla, "FW_UNIT", tmp_path / "units" / "blastbox-worker-link-fw.service")
     monkeypatch.setattr(wla, "_require", lambda binary, package: binary)
+    monkeypatch.setattr(wla, "_resolve_host", lambda host: ["192.0.2.10"],   # no real DNS
+                        raising=False)
 
     generated = []
 
@@ -856,6 +865,46 @@ def test_recovery_commands_survive_a_garbled_env_file(host, pki, capsys):
         assert "MISSING or unusable" in capsys.readouterr().out
         assert link.main(["list"]) == 0 and "mac1" in capsys.readouterr().out
     assert link.main(["teardown"]) == 0
+    assert host.loaded is None and not wla.ENV_FILE.exists()
+
+
+def test_init_fails_when_the_link_unit_cannot_be_enabled_after_the_fallback(host):
+    """REGRESSION (review): when `systemctl enable --now` failed, egress_apply.wg_up fell back
+    to a direct `wg-quick up` and init reported success -- with the unit NOT enabled, so the
+    link silently did not come back after a reboot. Enablement is now verified."""
+    host.enable_fails = True
+    with pytest.raises(RuntimeError, match="could not be ENABLED"):
+        wla.init_host(_cfg())
+    assert "wtwg0" in host.links                       # the fallback did bring it up...
+    assert host.loaded is not None                     # ...and its firewall stays in place
+    host.enable_fails = False
+    wla.init_host(_cfg())
+    assert "wg-quick@wtwg0" in host.enabled
+
+
+def test_a_reinit_whose_firewall_fails_read_back_takes_the_live_link_down(host):
+    """Sweep (review round 8, the host twin of the worker fix): a re-init that loaded a new
+    ruleset which then failed read-back raised with the link still LIVE behind a firewall
+    nobody could vouch for. It is now taken down (verified) and its unit disabled."""
+    wla.init_host(_cfg())
+    assert "wtwg0" in host.links
+    host.nft_drop_missing = True
+    with pytest.raises(wla.FirewallNotInForce, match="taken DOWN"):
+        wla.init_host(_cfg(agent_port=9443))
+    assert "wtwg0" not in host.links and "wg-quick@wtwg0" not in host.enabled
+    # nft REFUSING the file is different: nothing new was loaded, the old rules still hold
+    host.nft_drop_missing = False
+    wla.init_host(_cfg())
+    host.nft_refuses = True
+    with pytest.raises(RuntimeError, match="nft refused"):
+        wla.init_host(_cfg(agent_port=9443))
+    assert "wtwg0" in host.links
+
+
+def test_init_refuses_an_endpoint_name_that_resolves_into_the_overlay(host, monkeypatch):
+    monkeypatch.setattr(wla, "_resolve_host", lambda h: ["10.78.0.1"])
+    with pytest.raises(RuntimeError, match="inside the link overlay"):
+        wla.init_host(_cfg(endpoint="gw.example.org"))
     assert host.loaded is None and not wla.ENV_FILE.exists()
 
 
