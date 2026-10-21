@@ -648,3 +648,43 @@ def test_the_dispatcher_requeues_a_job_whose_worker_was_never_reached(tmp_path):
     VmJobDispatcher(store=store, job_root=tmp_path, validate=unreached)._process(
         store.claim_next())
     assert store.get(job.job_id).status is JobStatus.QUEUED       # requeued, not FAILED
+
+
+def test_a_census_that_cannot_start_threads_counts_workers_unknown(monkeypatch):
+    """REGRESSION (review): at the process's thread limit ThreadPoolExecutor.submit raises
+    RuntimeError; it escaped egress_census and aborted dispatcher construction although no
+    worker had answered "no". Unscheduled workers are now counted UNKNOWN."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from blastbox.host.runtime.vm_dispatch import _place_egress
+
+    real_submit = ThreadPoolExecutor.submit
+    calls = {"n": 0}
+
+    def limited(self, fn, *a, **kw):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise RuntimeError("can't start new thread")
+        return real_submit(self, fn, *a, **kw)
+
+    monkeypatch.setattr(ThreadPoolExecutor, "submit", limited)
+    rt = _rt({"mac1": False, "mac2": False, "mac3": False})
+    assert rt.egress_census() == (0, 1, 2)
+    calls["n"] = 0
+    _place_egress(rt, "static")                     # unknowns: no refusal to start
+
+
+def test_an_exchange_that_cannot_start_its_thread_is_no_verdict(monkeypatch):
+    """Sweep: the same resource limit inside a probe (the opener or resolver thread cannot
+    start) is local -- ProbeNotAttempted -> None, not "unhealthy"."""
+    import threading
+
+    from blastbox.host.runtime import remote_http
+    from blastbox.host.runtime.aws_worker import _default_http_probe
+
+    def no_threads(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(threading.Thread, "start", no_threads)
+    assert _default_http_probe("http://127.0.0.1:9/healthz", {}, 0.5) is None
+    assert remote_http.make_tls_probe(None)("http://w.example.invalid:9/healthz", {}, 0.5) is None

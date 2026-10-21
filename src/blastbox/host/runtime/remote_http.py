@@ -118,7 +118,11 @@ def _resolve_bounded(host: str, port: Any, deadline: float | None) -> list:
                         _RESOLVING.pop(key, None)
                     job.done.set()
 
-            threading.Thread(target=_work, name="bb-resolve", daemon=True).start()
+            try:
+                threading.Thread(target=_work, name="bb-resolve", daemon=True).start()
+            except RuntimeError as exc:      # cannot start a thread: a LOCAL condition
+                _RESOLVING.pop(key, None)
+                raise ProbeNotAttempted(f"could not start a name lookup ({exc})") from None
     wait = None if deadline is None else max(0.0, deadline - time.monotonic())
     if not job.done.wait(wait):
         raise ProbeNotAttempted(f"name lookup for {host!r} did not finish within the deadline "
@@ -397,7 +401,12 @@ def _open_bounded(opener: Any, req: Any, timeout: float, context: Any, deadline:
             _IO_REGISTRY.cancelled = None
 
     t = threading.Thread(target=_run, name="bb-open", daemon=True)
-    t.start()
+    try:
+        t.start()
+    except RuntimeError as exc:
+        # this process cannot start a thread: nothing was sent, and it says nothing about the
+        # worker -- the same "no verdict" as a stalled resolver
+        raise ProbeNotAttempted(f"could not start the exchange ({exc})") from None
     t.join(timeout=max(0.0, deadline - time.monotonic()))
     if t.is_alive():
         cancelled.set()          # a connect not yet started (name resolution still running) won't

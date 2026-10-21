@@ -1649,6 +1649,17 @@ def join(bundle_text: str, *, agent_user: str | None = None) -> list[str]:
         _refuse_second_linux_link(bundle.iface)
     _refuse_foreign_interface(bundle.iface, plat)
     pre = linux_preflight(bundle) if plat == "linux" else darwin_preflight(bundle)
+    agent_pw = None
+    if agent_user:
+        # Resolved BEFORE anything is installed: a mistyped account used to fail only after the
+        # bundle's certificate and CA had replaced the ones the agent loads on its next start.
+        import pwd
+
+        try:
+            agent_pw = pwd.getpwnam(agent_user)
+        except KeyError:
+            raise RuntimeError(f"no such user {agent_user!r} (--agent-user); nothing was "
+                               "installed") from None
     mine = _wg_pubkey(wg, p["wg_key"].read_text())
     if mine == bundle.host_public_key:
         raise RuntimeError("the bundle's host key is THIS worker's own key")
@@ -1670,14 +1681,8 @@ def join(bundle_text: str, *, agent_user: str | None = None) -> list[str]:
     for f in (p["cert"], p["ca"]):
         os.chmod(f, 0o644)
     notes = [*pre, f"certificate for {bundle.worker_ip} verified and installed"]
-    if agent_user:
-        import pwd
-
-        try:
-            pw = pwd.getpwnam(agent_user)
-        except KeyError:
-            raise RuntimeError(f"no such user {agent_user!r}") from None
-        os.chown(p["tls_key"], pw.pw_uid, pw.pw_gid)
+    if agent_pw is not None:
+        os.chown(p["tls_key"], agent_pw.pw_uid, agent_pw.pw_gid)
         os.chmod(p["tls_key"], 0o600)
         notes.append(f"TLS key owned by {agent_user} (0600) so the agent can read it")
     else:

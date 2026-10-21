@@ -536,6 +536,45 @@ def _refuse_foreign_interface(cfg: WorkerLinkConfig) -> None:
             "overwrite or restart it. Choose another --iface for the link.")
 
 
+def _derive_public_key(private_key: str) -> str:
+    """``wg pubkey`` of ``private_key`` (one seam, so tests need no wireguard-tools)."""
+    import subprocess
+
+    try:
+        proc = subprocess.run(["wg", "pubkey"], input=private_key.strip() + "\n", text=True,
+                              capture_output=True, check=False)
+    except FileNotFoundError:
+        raise RuntimeError("`wg` is not installed (package: wireguard-tools)") from None
+    pub = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not pub:
+        raise RuntimeError("`wg pubkey` could not derive the host public key")
+    return pub
+
+
+def _host_public_key(cfg: WorkerLinkConfig) -> str:
+    """The host's public key, DERIVED from the private key the link runs with -- never read from
+    the ``.pub`` file. ``ensure_keypair`` only regenerates a MISSING ``.pub``: a stale or
+    corrupted one was trusted, handed to every worker in its join bundle, and none of them
+    could ever handshake. The ``.pub`` file is rewritten when it disagrees."""
+    priv = ea.KEY_DIR / f"{cfg.wg_iface}.key"
+    try:
+        private = priv.read_text().strip()
+    except FileNotFoundError:
+        raise WorkerLinkNotInitialised(
+            f"{priv} is missing: run `blastbox worker-link init` first") from None
+    if not private:
+        raise WorkerLinkNotInitialised(f"{priv} is empty: run `blastbox worker-link init`")
+    pub = _derive_public_key(private)
+    pub_path = ea.KEY_DIR / f"{cfg.wg_iface}.pub"
+    try:
+        current = pub_path.read_text().strip()
+    except FileNotFoundError:
+        current = ""
+    if current != pub:
+        ea.atomic_write(pub_path, pub + "\n", 0o644)
+    return pub
+
+
 def _conf_private_key(body: str) -> str:
     head = body.split("\n# peer:", 1)[0]
     for line in head.splitlines():
@@ -623,7 +662,8 @@ def init_host(cfg: WorkerLinkConfig, *, rotate_key: bool = False) -> tuple[str, 
     notes += changed
     ea.WG_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(ea.WG_DIR, 0o700)
-    priv, pub = ea.ensure_keypair(cfg.wg_iface)
+    priv, _stale_pub = ea.ensure_keypair(cfg.wg_iface)
+    pub = _host_public_key(cfg)           # derived from priv; a stale .pub is repaired
     conf = _conf(cfg)
     want = host_wg_config(cfg, priv.read_text().strip())
     with ea.conf_lock(cfg):
@@ -910,10 +950,8 @@ def add_worker(cfg: WorkerLinkConfig, name: str, public_key: str, csr_pem: bytes
                            "init --endpoint <public-host>[:port]` so workers know where to dial")
     _refuse_uninstalled_override(cfg, "add a worker")
     conf = _conf(cfg)
-    pub_path = ea.KEY_DIR / f"{cfg.wg_iface}.pub"
-    if not conf.exists() or not pub_path.exists():
-        raise WorkerLinkNotInitialised(
-            f"{conf} or its key is missing: run `blastbox worker-link init` first")
+    if not conf.exists():
+        raise WorkerLinkNotInitialised(f"{conf} is missing: run `blastbox worker-link init` first")
     try:
         ca = load_ca(Path(pki_dir))
     except FileNotFoundError:
@@ -922,7 +960,14 @@ def add_worker(cfg: WorkerLinkConfig, name: str, public_key: str, csr_pem: bytes
         raise RuntimeError(f"no CA in {pki_dir}: run `blastbox pki init` (the dispatcher's CA) "
                            "first, or pass --pki-dir") from None
     ca_pem = (Path(pki_dir) / "ca.crt").read_text()
-    host_pub = pub_path.read_text().strip()
+    # DERIVED from the private key (and checked against the interface config it runs with),
+    # never read from the .pub file, so a stale .pub cannot be handed to workers.
+    host_pub = _host_public_key(cfg)
+    in_conf = _conf_private_key(conf.read_text())
+    if in_conf and _derive_public_key(in_conf) != host_pub:
+        raise RuntimeError(
+            f"{ea.KEY_DIR / (cfg.wg_iface + '.key')} does not hold the key {conf} runs with; "
+            "re-run `blastbox worker-link init` (it restores/reconciles the key) before `add`")
     key = public_key.strip()
     with ea.conf_lock(cfg):
         body = conf.read_text()

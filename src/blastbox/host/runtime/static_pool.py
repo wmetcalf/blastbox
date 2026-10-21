@@ -359,14 +359,25 @@ class StaticPoolRuntime:
         timeout = max(_MIN_PROBE_S, float(self.cfg.probe_timeout_s))
         pool = ThreadPoolExecutor(max_workers=min(len(workers), self.CENSUS_PARALLELISM),
                                   thread_name_prefix="blastbox-static-census")
+        futs: list = []
         try:
-            futs = [pool.submit(self._advertises_egress, w, timeout) for w in workers]
-            done, _pending = wait(futs, timeout=timeout + 1.0)
+            try:
+                for w in workers:
+                    futs.append(pool.submit(self._advertises_egress, w, timeout))
+            except RuntimeError as exc:
+                # The process cannot start another thread (its thread/process limit): THIS host
+                # is short of resources -- not a verdict on any worker. The unscheduled ones are
+                # counted UNKNOWN below, never allowed to abort dispatcher construction.
+                _log.warning("static: egress census could not schedule %d of %d probes (%s); "
+                             "counting them as unknown", len(workers) - len(futs), len(workers),
+                             exc)
+            done, _pending = wait(futs, timeout=timeout + 1.0) if futs else (set(), set())
         finally:
             # never wait on a straggler: its probe is bounded by its own timeout, and its
             # verdict (if any) still lands in _egress_seen for spawn() to use later.
             pool.shutdown(wait=False, cancel_futures=True)
-        yes = no = unknown = 0
+        yes = no = 0
+        unknown = len(workers) - len(futs)
         for f in futs:
             v = f.result() if f in done and f.exception() is None else None
             if v is True:

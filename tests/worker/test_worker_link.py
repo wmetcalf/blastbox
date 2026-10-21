@@ -1805,3 +1805,18 @@ def test_a_bundle_without_the_registered_worker_key_is_refused():
             '"host_ip": "10.78.0.1", "overlay_net": "10.78.0.0/24", "endpoint": "gw.example.org", '
             '"host_public_key": "' + "H" * 43 + '=", "agent_port": 8765, "ca_pem": "x", '
             '"cert_pem": "x"'))
+
+
+def test_a_mistyped_agent_user_is_refused_before_the_trust_files_change(node, tmp_path):
+    """REGRESSION (review): --agent-user was resolved only after the bundle's certificate and
+    CA had replaced the installed ones, so a typo on a re-join failed with the agent's trust
+    files already changed. It is resolved before anything is installed now."""
+    node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    p = link._paths("wtwg0")
+    cert, ca = p["cert"].read_bytes(), p["ca"].read_bytes()
+    renewed = _bundle(tmp_path / "other-ca", csr)            # a different CA and certificate
+    with pytest.raises(RuntimeError, match="no such user .*nothing was installed"):
+        link.join(renewed, agent_user="no-such-user-blastbox-test")
+    assert p["cert"].read_bytes() == cert and p["ca"].read_bytes() == ca

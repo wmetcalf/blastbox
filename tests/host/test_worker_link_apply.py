@@ -186,10 +186,15 @@ def host(tmp_path, monkeypatch):
             priv.write_text("PRIVATE-HOST-KEY\n" if len(generated) == 1
                             else f"PRIVATE-HOST-KEY-{len(generated)}\n")
         os.chmod(priv, 0o600)
-        key = priv.read_text().strip()
-        pubkey = HOST_PUB if key == "PRIVATE-HOST-KEY" else (key[-1] * 43 + "=")
-        pub.write_text(pubkey + "\n")
-        return priv, pubkey
+        if not pub.exists():                      # like the real one: only a MISSING .pub
+            pub.write_text(derive(priv.read_text()) + "\n")
+        return priv, pub.read_text().strip()
+
+    def derive(private: str) -> str:              # the fake `wg pubkey`
+        key = private.strip()
+        return HOST_PUB if key == "PRIVATE-HOST-KEY" else (key[-1] * 43 + "=")
+
+    monkeypatch.setattr(wla, "_derive_public_key", derive, raising=False)
 
     monkeypatch.setattr(ea, "ensure_keypair", keypair)
     return h
@@ -926,6 +931,21 @@ def test_only_nfts_not_found_answer_counts_as_an_absent_table(host):
     host.nft_list_error = None
     wla.teardown(wla.load_config(recover=True))
     assert not wla.ENV_FILE.exists()
+
+
+def test_a_stale_public_key_file_never_reaches_a_join_bundle(host, pki):
+    """REGRESSION (review): ensure_keypair only regenerates a MISSING .pub; a stale or corrupted
+    one was trusted by init and embedded by `add` in every join bundle, while the interface ran
+    the private key -- so no newly joined worker could ever handshake. The public key is now
+    derived from the private key, and the .pub file repaired."""
+    wla.init_host(_cfg())
+    pub_file = ea.KEY_DIR / "wtwg0.pub"
+    pub_file.write_text("Z" * 43 + "=\n")                  # stale / from another key
+    bundle, _ = wla.add_worker(_cfg(), "mac1", KEY_A, _csr(_ip("10.78.0.2")), pki_dir=pki)
+    assert bundle.host_public_key == HOST_PUB
+    pub_file.write_text("garbage\n")
+    pub, _notes = wla.init_host(_cfg())
+    assert pub == HOST_PUB and pub_file.read_text().strip() == HOST_PUB
 
 
 # ----------------------------------------------------------------------------- status
