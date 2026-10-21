@@ -961,7 +961,7 @@ def add_worker(cfg: WorkerLinkConfig, name: str, public_key: str, csr_pem: bytes
     bundle = JoinBundle(name=name, iface=cfg.wg_iface, worker_ip=want, host_ip=cfg.host_ip,
                         overlay_net=cfg.overlay_net, endpoint=cfg.endpoint,
                         host_public_key=host_pub, agent_port=cfg.agent_port,
-                        ca_pem=ca_pem, cert_pem=cert_pem.decode())
+                        ca_pem=ca_pem, cert_pem=cert_pem.decode(), worker_public_key=key)
     return bundle, changed
 
 

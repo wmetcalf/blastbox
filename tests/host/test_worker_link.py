@@ -422,6 +422,8 @@ def _bundle(**kw) -> JoinBundle:
     base = dict(name="mac1", iface="wtwg0", worker_ip="10.78.0.5", host_ip="10.78.0.1",
                 overlay_net="10.78.0.0/24", endpoint="gw.example.org:51822",
                 host_public_key=KEY_A, agent_port=8765, ca_pem=CERT, cert_pem=CERT)
+    if "worker_public_key" in JoinBundle.__dataclass_fields__:
+        base["worker_public_key"] = "W" * 43 + "="
     base.update(kw)
     return JoinBundle(**base)
 
@@ -539,7 +541,7 @@ def test_a_loopback_or_unroutable_endpoint_is_rejected():
     """Sweep (review round 9): an endpoint the worker can only reach as ITSELF (loopback) or
     not at all is refused at the source, before any bundle carries it."""
     for ep in ("127.0.0.1", "0.0.0.0", "169.254.1.1", "224.0.0.1:51822"):
-        with pytest.raises(ValueError, match="loopback|non-routable"):
+        with pytest.raises(ValueError, match="loopback|non-unicast"):
             WorkerLinkConfig(endpoint=ep)
 
 
@@ -569,3 +571,30 @@ def test_the_worker_readback_checks_chain_policies_too():
     listing = fw.split(f"delete table inet {link.NFT_TABLE}\n", 1)[1]
     assert firewall_in_force(listing, fw) == []
     assert firewall_in_force(listing.replace("policy accept;", "policy drop;", 1), fw)
+
+
+@pytest.mark.parametrize("ep", ["240.0.0.1", "255.255.255.255", "250.1.2.3:51822",
+                                "[::ffff:127.0.0.1]:51822", "[::ffff:240.0.0.9]:51822"])
+def test_reserved_and_broadcast_endpoints_are_rejected(ep):
+    """REGRESSION (review): 240.0.0.0/4 and the limited broadcast 255.255.255.255 passed as an
+    endpoint (neither loopback, unspecified, multicast nor link-local). Reserved classes are
+    refused too -- and an IPv4-mapped IPv6 literal is judged as the IPv4 address it is."""
+    with pytest.raises(ValueError, match="loopback|non-unicast"):
+        WorkerLinkConfig(endpoint=ep)
+
+
+def test_a_resolved_reserved_endpoint_is_refused_by_the_same_check():
+    from blastbox.host.worker_link import refuse_endpoint_in_overlay
+
+    with pytest.raises(ValueError, match="non-unicast"):
+        refuse_endpoint_in_overlay(["192.0.2.10", "255.255.255.255"], "10.78.0.0/24",
+                                   what="endpoint gw.example.org")
+
+
+def test_the_bundle_carries_and_requires_the_registered_worker_key():
+    b = _bundle()
+    assert JoinBundle.from_json(b.to_json()).worker_public_key == "W" * 43 + "="
+    with pytest.raises(ValueError, match="worker_public_key"):
+        _bundle(worker_public_key="not-a-key")
+    with pytest.raises(ValueError, match="same key"):
+        _bundle(worker_public_key=KEY_A)

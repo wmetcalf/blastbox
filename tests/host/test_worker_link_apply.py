@@ -1116,3 +1116,10 @@ def test_the_cli_reports_errors_without_a_traceback(host, capsys):
     assert "worker-link init" in capsys.readouterr().err
     assert link.main(["init", "--overlay-net", "203.0.113.0/24"]) == 1
     assert "RFC 1918" in capsys.readouterr().err
+
+
+def test_add_puts_the_registered_worker_key_in_the_bundle(host, pki):
+    wla.init_host(_cfg())
+    bundle, _ = wla.add_worker(_cfg(), "mac1", KEY_A, _csr(_ip("10.78.0.2")), pki_dir=pki)
+    assert bundle.worker_public_key == KEY_A
+    assert JoinBundle.from_json(bundle.to_json()).worker_public_key == KEY_A

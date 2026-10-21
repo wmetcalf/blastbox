@@ -65,6 +65,8 @@ class FakeNode:
         #: utun -> public key of ANOTHER WireGuard tunnel (macOS reuses utun numbers)
         self.foreign_utuns: dict[str, str] = {}
         self.name_at_down: list = []            # what each `wg-quick down` would have acted on
+        self.pf_flushed = False
+        self.pf_flush_fails = False
 
     def run(self, argv, *, input=None):
         a = [str(x) for x in argv]
@@ -178,6 +180,7 @@ class FakeNode:
         elif tool == "launchctl" and a[1] == "bootstrap":
             # what RunAtLoad would do: the watchdog brings the tunnel up as some utun
             self.launchd_loaded = True
+            self.pf_flushed = False
             (link.WG_RUN_DIR / "wtwg0.name").write_text("utun7\n")
         elif tool == "launchctl" and a[1] == "kickstart" and self.kickstart_fails:
             rc, err = 113, "Could not find service"
@@ -193,8 +196,12 @@ class FakeNode:
             out = "Status: Enabled for 0 days\n"
         elif tool == "pfctl" and "rules" in a and "-a" not in a:
             out = 'anchor "com.apple/*" all\n'
+        elif tool == "pfctl" and "-F" in a:
+            if not self.pf_flush_fails:
+                self.pf_flushed = True
         elif tool == "pfctl" and "rules" in a:
-            out = (self.pf_anchor_override if self.pf_anchor_override is not None else
+            out = ("" if self.pf_flushed else
+                   self.pf_anchor_override if self.pf_anchor_override is not None else
                    link.pf_rules(real_iface="utun7", worker_ip="10.78.0.5", host_ip="10.78.0.1",
                                  agent_port=8765))
         return subprocess.CompletedProcess(a, rc, out, err)
@@ -254,6 +261,9 @@ def _bundle(tmp_path: Path, csr: str, ip: str = "10.78.0.5", **kw) -> str:
              overlay_net="10.78.0.0/24", endpoint="gw.example.org:51822",
              host_public_key=KEY_HOST, agent_port=8765, ca_pem=ca, cert_pem=cert)
     b.update(kw)
+    if "worker_public_key" not in b and "worker_public_key" in JoinBundle.__dataclass_fields__:
+        pub = link._paths(str(b["iface"]))["wg_pub"]
+        b["worker_public_key"] = pub.read_text().strip() if pub.exists() else "W" * 43 + "="
     return JoinBundle(**b).to_json()
 
 
@@ -1577,7 +1587,7 @@ def test_keygen_rotate_is_refused_while_the_link_is_live(node, tmp_path, platfor
     _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
     link.join(_bundle(tmp_path, csr))
     key = link._paths("wtwg0")["wg_key"].read_text()
-    with pytest.raises(RuntimeError, match="refusing to rotate"):
+    with pytest.raises(RuntimeError, match="refusing to generate a new wtwg0 key"):
         link.keygen("wtwg0", "10.78.0.5", rotate=True)
     assert link._paths("wtwg0")["wg_key"].read_text() == key
     link.leave("wtwg0")
@@ -1609,9 +1619,7 @@ def test_python_paths_never_trust_a_name_file_naming_another_key(node, tmp_path)
     n = node("darwin")
     _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
     link.join(_bundle(tmp_path, csr))
-    link.leave("wtwg0")                              # our tunnel is gone ...
-    n.launchd_loaded = False
-    (link.WG_RUN_DIR / "wtwg0.name").write_text("utun3\n")   # ... the note names a reused utun
+    (link.WG_RUN_DIR / "wtwg0.name").write_text("utun3\n")   # the note names a reused utun
     n.foreign_utuns["utun3"] = "F" * 43 + "="
     _ok, rows = link.status("wtwg0")
     assert any(r.startswith("interface wtwg0:") for r in rows), rows
@@ -1694,3 +1702,106 @@ def test_encapsulating_overlays_are_not_an_underlay(node, tmp_path, kind):
     n.tunnels["ovl0"] = kind
     with pytest.raises(RuntimeError, match="via ovl0"):
         link.join(_bundle(tmp_path, csr))
+
+
+# ------------------------------------------------------------------ review round 13
+
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+@pytest.mark.parametrize("damage", ["deleted", "emptied"])
+def test_an_implicit_key_regeneration_is_refused_under_an_installed_link(node, tmp_path,
+                                                                          platform, damage):
+    """REGRESSION (review): only --rotate was checked; a key file deleted or emptied made plain
+    keygen generate a NEW key under a live/installed link -- the identity its tunnel is found
+    by. Every key generation is checked now, by the install records as well as the key."""
+    node(platform)
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    key = link._paths("wtwg0")["wg_key"]
+    if damage == "deleted":
+        key.unlink()
+    else:
+        key.write_text("")
+    with pytest.raises(RuntimeError, match="refusing to generate a new wtwg0 key"):
+        link.keygen("wtwg0", "10.78.0.5")
+    assert not key.exists() or key.read_text() == ""          # nothing generated
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_a_fresh_node_can_still_keygen(node, platform):
+    """...and the check does not block the FIRST keygen on a node with nothing installed, nor
+    re-creating a lost key on a node that is NOT joined."""
+    node(platform)
+    link.keygen("wtwg0", "10.78.0.5")
+    link._paths("wtwg0")["wg_key"].unlink()
+    link.keygen("wtwg0", "10.78.0.5")
+    assert link._paths("wtwg0")["wg_key"].read_text().strip()
+
+
+def test_linux_leave_keeps_every_recovery_file_until_the_table_is_gone(node, tmp_path):
+    """REGRESSION (review, twice): with `nft delete table` failing, leave removed the firewall
+    units and ruleset BEFORE checking, then the config -- and with --purge the keys and state
+    -- so a stale hooked table was left with nothing to find the install by."""
+    n = node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    loaded = n.loaded
+    real = n.run
+
+    def run(argv, **kw):
+        a = [str(x) for x in argv]
+        if a[:3] == ["nft", "delete", "table"]:
+            n.calls.append(a)
+            return subprocess.CompletedProcess(a, 1, "", "Error: Device or resource busy")
+        return real(argv, **kw)
+
+    link._run, saved = run, link._run
+    try:
+        notes = link.leave("wtwg0", purge=True)
+    finally:
+        link._run = saved
+    assert "could not verify" in notes[-1] and n.loaded == loaded
+    p = link._paths("wtwg0")
+    for f in (link.FW_UNIT, link.FW_FILE, *link._reassert_paths(), p["conf"], p["wg_key"],
+              p["state"]):
+        assert f.exists(), f
+    notes = link.leave("wtwg0", purge=True)                # once the table goes: all of it
+    assert n.loaded is None and not link.FW_UNIT.exists() and not p["wg_key"].exists()
+
+
+def test_macos_leave_keeps_its_files_until_the_anchor_is_verified_empty(node, tmp_path):
+    """Sweep: the macOS leave flushed the anchor, warned when it could not verify it empty --
+    and removed the plist, script, config (and on --purge the keys) anyway."""
+    n = node("darwin")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    n.pf_flush_fails = True
+    notes = link.leave("wtwg0", purge=True)
+    p = link._paths("wtwg0")
+    assert "could not verify pf anchor" in notes[-1]
+    assert p["plist"].exists() and p["conf"].exists() and p["wg_key"].exists()
+    n.pf_flush_fails = False
+    link.leave("wtwg0", purge=True)
+    assert not p["plist"].exists() and not p["wg_key"].exists()
+
+
+def test_join_refuses_a_bundle_that_registered_another_workers_key(node, tmp_path):
+    """REGRESSION (review): the bundle did not carry the key the host registered, so A's CSR
+    with B's public key at `add` installed a link that could never handshake -- and join only
+    noted a slow handshake. The registered key is now compared before anything is written."""
+    n = node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    n.calls.clear()
+    with pytest.raises(RuntimeError, match="registers .* as this worker's key"):
+        link.join(_bundle(tmp_path, csr, worker_public_key="B" * 43 + "="))
+    assert not link._paths("wtwg0")["conf"].exists() and n.loaded is None
+
+
+def test_a_bundle_without_the_registered_worker_key_is_refused():
+    from blastbox.host.worker_link import JoinBundle
+
+    with pytest.raises(ValueError, match="missing worker_public_key"):
+        JoinBundle.from_json(json.dumps({"blastbox_worker_link": 1, "name": "w1"}).replace(
+            '"name": "w1"', '"name": "w1", "iface": "wtwg0", "worker_ip": "10.78.0.5", '
+            '"host_ip": "10.78.0.1", "overlay_net": "10.78.0.0/24", "endpoint": "gw.example.org", '
+            '"host_public_key": "' + "H" * 43 + '=", "agent_port": 8765, "ca_pem": "x", '
+            '"cert_pem": "x"'))

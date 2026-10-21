@@ -823,15 +823,29 @@ def _refuse_rotating_a_live_link(wg: str, iface: str) -> None:
     can identify any more: leave/re-join would then call it down while it still handshakes
     with the host. So the link must be down and uninstalled first."""
     plat = _supported_platform()
+    p = _paths(iface)
     why: list[str] = []
+    # Install records first: they are there whatever has happened to the key file, and with the
+    # key gone the live tunnel can no longer be found by it.
+    if _conf_is_ours(iface):
+        why.append(f"{p['conf']} is installed")
+    try:
+        joined = bool(json.loads(p["state"].read_text()).get("host_ip"))
+    except (OSError, ValueError, AttributeError):
+        joined = False
+    if joined:
+        why.append(f"{iface} is joined")
     if plat == "darwin":
-        live = _our_live_utuns(wg, iface)
-        if live is None:
-            why.append("its tunnel cannot be verified down")
-        elif live:
-            why.append(f"{', '.join(live)} runs its current key")
-        if _ok(["launchctl", "print", f"system/{label_for(iface)}"]):
-            why.append(f"LaunchDaemon {label_for(iface)} is loaded")
+        if p["plist"].exists() or _ok(["launchctl", "print", f"system/{label_for(iface)}"]):
+            why.append(f"LaunchDaemon {label_for(iface)} is installed")
+        if _real_iface_darwin(iface) is not None:
+            why.append(f"{WG_RUN_DIR / (iface + '.name')} records a live tunnel")
+        if p["wg_key"].exists() and p["wg_key"].stat().st_size:
+            live = _our_live_utuns(wg, iface)
+            if live is None:
+                why.append("its tunnel cannot be verified down")
+            elif live:
+                why.append(f"{', '.join(live)} runs its current key")
     else:
         if _ok(["ip", "link", "show", iface]):
             why.append(f"{iface} is up")
@@ -839,9 +853,10 @@ def _refuse_rotating_a_live_link(wg: str, iface: str) -> None:
             why.append(f"wg-quick@{iface} is enabled")
     if why:
         raise RuntimeError(
-            f"refusing to rotate the {iface} key while the link is live ({'; '.join(why)}): the "
-            "running tunnel would no longer be identifiable. Run `blastbox worker-link leave "
-            f"--iface {iface}` first, then keygen --rotate, `add` on the host, and join again.")
+            f"refusing to generate a new {iface} key while the link is live or installed "
+            f"({'; '.join(why)}): the running tunnel would no longer be identifiable. If a key "
+            "file was lost, restore it; otherwise run `blastbox worker-link leave --iface "
+            f"{iface}` first, then keygen (--rotate), `add` on the host, and join again.")
 
 
 @_node_locked
@@ -868,9 +883,15 @@ def keygen(iface: str, ip: str, *, rotate: bool = False) -> tuple[str, str, list
         os.chmod(d, 0o700 if d == KEY_DIR else 0o755)
     os.chmod(WG_DIR, 0o700)
 
-    if rotate and p["wg_key"].exists():
+    def _missing(path: Path) -> bool:
+        return not path.exists() or path.stat().st_size == 0
+
+    if rotate or _missing(p["wg_key"]) or _missing(p["tls_key"]):
+        # EVERY key generation, explicit (--rotate) or implicit (a deleted or emptied key
+        # file): a new key under a live or installed link leaves a tunnel nothing can identify,
+        # or an installed certificate for a key that no longer exists.
         _refuse_rotating_a_live_link(wg, iface)
-    if rotate or not p["wg_key"].exists() or p["wg_key"].stat().st_size == 0:
+    if rotate or _missing(p["wg_key"]):
         gen = _run([wg, "genkey"])
         if gen.returncode != 0 or not gen.stdout.strip():
             raise RuntimeError("`wg genkey` failed")
@@ -1628,8 +1649,17 @@ def join(bundle_text: str, *, agent_user: str | None = None) -> list[str]:
         _refuse_second_linux_link(bundle.iface)
     _refuse_foreign_interface(bundle.iface, plat)
     pre = linux_preflight(bundle) if plat == "linux" else darwin_preflight(bundle)
-    if _wg_pubkey(wg, p["wg_key"].read_text()) == bundle.host_public_key:
+    mine = _wg_pubkey(wg, p["wg_key"].read_text())
+    if mine == bundle.host_public_key:
         raise RuntimeError("the bundle's host key is THIS worker's own key")
+    if mine != bundle.worker_public_key:
+        # The host registered ANOTHER key as this worker's peer (a mixed-up --public-key at
+        # `add`): the certificate would verify, the handshake never would, and join would only
+        # note a slow handshake. Refused before anything is installed.
+        raise RuntimeError(
+            f"the bundle registers {bundle.worker_public_key[:10]}… as this worker's key, but this "
+            f"worker's key is {mine[:10]}… -- re-run `worker-link add` on the host with the "
+            "public key `keygen` printed here")
     with tempfile.TemporaryDirectory(dir=STATE_DIR) as td:
         cert_t, ca_t = Path(td) / "c.crt", Path(td) / "ca.crt"
         cert_t.write_text(bundle.cert_pem)
@@ -1886,9 +1916,13 @@ def leave(iface: str = DEFAULT_IFACE, *, purge: bool = False) -> list[str]:
         notes.append(f"{iface} down; LaunchDaemon {label} unloaded")
         _run([PFCTL, "-a", pf_anchor_for(iface), "-F", "all"])
         left = _run([PFCTL, "-a", pf_anchor_for(iface), "-s", "rules"])
-        notes.append(f"pf anchor {pf_anchor_for(iface)} flushed (pf itself left as it was)"
-                     if left.returncode == 0 and not left.stdout.strip() else
-                     f"WARNING: could not verify pf anchor {pf_anchor_for(iface)} is empty")
+        if left.returncode != 0 or left.stdout.strip():
+            # Nothing is removed until the anchor is VERIFIED empty: the plist, script, config
+            # and keys are what a re-run of leave identifies this install by.
+            notes.append(f"WARNING: could not verify pf anchor {pf_anchor_for(iface)} is empty; "
+                         "its files, config and keys are left in place. Re-run leave.")
+            return notes
+        notes.append(f"pf anchor {pf_anchor_for(iface)} flushed (pf itself left as it was)")
         for f in (p["plist"], p["script"]):
             f.unlink(missing_ok=True)
     else:
@@ -1909,14 +1943,20 @@ def leave(iface: str = DEFAULT_IFACE, *, purge: bool = False) -> list[str]:
         _run(["systemctl", "disable", "--now", REASSERT_TIMER_NAME])
         _run(["systemctl", "disable", "--now", FW_UNIT_NAME])
         _run(["nft", "delete", "table", "inet", NFT_TABLE])
+        # VERIFY BEFORE REMOVING ANYTHING (as host teardown does): the firewall unit, ruleset
+        # file, config and -- with --purge -- keys and state are the recovery records a re-run
+        # of leave finds this install by. Only nft's own not-found answer is "gone".
+        still = _run(["nft", "list", "table", "inet", NFT_TABLE])
+        if not (still.returncode != 0 and "No such file or directory" in (still.stderr or "")):
+            detail = "it is still loaded" if still.returncode == 0 else (
+                (still.stderr or "").strip().splitlines()[-1:] or [f"exit {still.returncode}"])[0]
+            notes.append(f"WARNING: could not verify table inet {NFT_TABLE} was removed ({detail}); "
+                         "its units, ruleset, config and keys are left in place. Re-run leave.")
+            return notes
         for f in (*_reassert_paths(), FW_UNIT, FW_FILE):
             f.unlink(missing_ok=True)
         _run(["systemctl", "daemon-reload"])
-        still = _run(["nft", "list", "table", "inet", NFT_TABLE])
-        gone = still.returncode != 0 and "No such file" in (still.stderr or "")
-        notes.append(f"table inet {NFT_TABLE} and its unit removed (no other table touched)"
-                     if gone else
-                     f"WARNING: could not verify table inet {NFT_TABLE} was removed")
+        notes.append(f"table inet {NFT_TABLE} and its unit removed (no other table touched)")
     p["conf"].unlink(missing_ok=True)
     if purge:
         for key in ("wg_key", "wg_pub", "tls_key", "csr", "cert", "ca", "state"):
@@ -1930,6 +1970,16 @@ def leave(iface: str = DEFAULT_IFACE, *, purge: bool = False) -> list[str]:
                 pass
         notes.append("keys, certificates and keygen state removed")
     else:
+        # The link is gone: the keygen record must no longer say JOINED (status, and the
+        # key-generation check, read it). The keys and the address they were made for stay.
+        try:
+            st = json.loads(p["state"].read_text())
+        except (OSError, ValueError):
+            st = None
+        if isinstance(st, dict) and any(k in st for k in ("host_ip", "agent_port", "name")):
+            for k in ("host_ip", "agent_port", "name"):
+                st.pop(k, None)
+            _write_public(p["state"], json.dumps(st) + "\n")
         notes.append(f"keys kept in {KEY_DIR} and {STATE_DIR} (--purge removes them)")
     return notes
 

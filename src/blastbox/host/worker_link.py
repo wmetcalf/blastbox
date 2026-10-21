@@ -174,8 +174,11 @@ def refuse_endpoint_in_overlay(addrs: Iterable[str], overlay: "ipaddress.IPv4Net
             ip = ipaddress.ip_address(str(a).strip("[]"))
         except ValueError:
             continue                      # a hostname: checked once resolved
-        if ip.is_loopback or ip.is_unspecified or ip.is_multicast or ip.is_link_local:
-            raise ValueError(f"{what} is a {'loopback' if ip.is_loopback else 'non-routable'} "
+        if ip.version == 6 and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped                # ::ffff:a.b.c.d is that IPv4 address
+        if (ip.is_loopback or ip.is_unspecified or ip.is_multicast or ip.is_link_local
+                or ip.is_reserved):            # 240.0.0.0/4 incl. 255.255.255.255; IPv6 too
+            raise ValueError(f"{what} is a {'loopback' if ip.is_loopback else 'non-unicast/reserved'} "
                              "address: a worker would dial itself (or nothing), never the "
                              "host. Use the host's public/underlay address.")
         if ip.version == 4 and ip in net:
@@ -730,6 +733,9 @@ class JoinBundle:
     agent_port: int
     ca_pem: str
     cert_pem: str
+    #: The WireGuard key the host REGISTERED as this worker's peer. join compares it with the
+    #: worker's own: a mixed-up key at `add` is caught before anything is installed.
+    worker_public_key: str
     version: int = 1
 
     def __post_init__(self) -> None:
@@ -746,6 +752,12 @@ class JoinBundle:
         if not _is_wg_key(self.host_public_key.strip()):
             raise ValueError("host_public_key is not a 32-byte base64 WireGuard key")
         object.__setattr__(self, "host_public_key", self.host_public_key.strip())
+        if not isinstance(self.worker_public_key, str) or not _is_wg_key(
+                self.worker_public_key.strip()):
+            raise ValueError("worker_public_key is not a 32-byte base64 WireGuard key")
+        object.__setattr__(self, "worker_public_key", self.worker_public_key.strip())
+        if self.worker_public_key == self.host_public_key:
+            raise ValueError("the bundle's worker and host keys are the same key")
         for what in ("ca_pem", "cert_pem"):
             pem = getattr(self, what)
             if not (isinstance(pem, str) and pem.count("-----BEGIN CERTIFICATE-----") == 1
@@ -759,6 +771,7 @@ class JoinBundle:
             "overlay_net": self.overlay_net, "endpoint": self.endpoint,
             "host_public_key": self.host_public_key, "agent_port": self.agent_port,
             "ca_pem": self.ca_pem, "cert_pem": self.cert_pem,
+            "worker_public_key": self.worker_public_key,
         }, indent=1) + "\n"
 
     @classmethod
@@ -770,7 +783,7 @@ class JoinBundle:
         if not isinstance(obj, dict) or "blastbox_worker_link" not in obj:
             raise ValueError("not a blastbox worker-link join bundle")
         keys = ("name", "iface", "worker_ip", "host_ip", "overlay_net", "endpoint",
-                "host_public_key", "agent_port", "ca_pem", "cert_pem")
+                "host_public_key", "agent_port", "ca_pem", "cert_pem", "worker_public_key")
         missing = [k for k in keys if k not in obj]
         if missing:
             raise ValueError(f"join bundle is missing {', '.join(missing)}")
