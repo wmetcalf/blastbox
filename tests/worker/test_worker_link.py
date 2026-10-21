@@ -67,6 +67,8 @@ class FakeNode:
         self.name_at_down: list = []            # what each `wg-quick down` would have acted on
         self.pf_flushed = False
         self.pf_flush_fails = False
+        self.active: set[str] = set()           # non-link units that were STARTED
+        self.start_fails: set[str] = set()
 
     def run(self, argv, *, input=None):
         a = [str(x) for x in argv]
@@ -161,11 +163,16 @@ class FakeNode:
         elif a[:3] == ["ip", "link", "show"]:
             rc = 0 if a[3] in self.links else 1
         elif a[:2] == ["systemctl", "is-active"]:
-            rc = 3
+            rc = 0 if a[2] in self.active else 3
         elif a[:2] == ["systemctl", "is-enabled"]:
             rc = 0 if a[2] in self.enabled else 1
+        elif a[:2] == ["systemctl", "enable"] and "--now" in a and a[-1] in self.start_fails:
+            self.enabled.add(a[-1])
+            rc, err = 1, f"Job for {a[-1]} failed because the control process exited"
         elif a[:2] == ["systemctl", "enable"]:
             self.enabled.add(a[-1])
+            if a[2] == "--now" and not a[3].startswith("wg-quick@"):
+                self.active.add(a[3])
             if a[2] == "--now" and a[3].startswith("wg-quick@"):
                 self.links.add(a[3].split("@")[1])
         elif a[:2] == ["systemctl", "disable"]:
@@ -624,7 +631,7 @@ def test_linux_join_firewalls_before_the_link_and_prints_the_agent_env(node, tmp
                  f"BLASTBOX_WORKER_AGENT_CLIENT_CA={p['ca']}", "handshake with the host: OK",
                  "firewall: in force"):
         assert want in text, want
-    assert f"systemctl enable {link.FW_UNIT_NAME}" in flat
+    assert f"systemctl enable --now {link.FW_UNIT_NAME}" in flat
     assert link.FW_UNIT.read_text().count("Before=wg-quick@wtwg0.service") == 1
 
 
@@ -859,7 +866,7 @@ def test_join_refuses_to_bring_the_link_up_when_the_firewall_cannot_be_persisted
     real = n.run
 
     def run(argv, **kw):
-        if list(argv)[:2] == ["systemctl", "enable"] and "--now" not in argv:
+        if list(argv)[:2] == ["systemctl", "enable"] and argv[-1] == link.FW_UNIT_NAME:
             return subprocess.CompletedProcess(list(argv), 1, "", "Failed to enable")
         return real(argv, **kw)
 
@@ -1820,3 +1827,18 @@ def test_a_mistyped_agent_user_is_refused_before_the_trust_files_change(node, tm
     with pytest.raises(RuntimeError, match="no such user .*nothing was installed"):
         link.join(renewed, agent_user="no-such-user-blastbox-test")
     assert p["cert"].read_bytes() == cert and p["ca"].read_bytes() == ca
+
+
+def test_linux_join_starts_the_firewall_boot_unit_not_just_enables_it(node, tmp_path):
+    """The worker twin of the host fix: enabled AND started (verified), or the join fails
+    before the link is up."""
+    n = node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    assert f"systemctl enable --now {link.FW_UNIT_NAME}" in n.flat()
+    assert link.FW_UNIT_NAME in n.active
+    link.leave("wtwg0")
+    n.start_fails.add(link.FW_UNIT_NAME)
+    with pytest.raises(RuntimeError, match="could not enable and start"):
+        link.join(_bundle(tmp_path, csr))
+    assert "wtwg0" not in n.links

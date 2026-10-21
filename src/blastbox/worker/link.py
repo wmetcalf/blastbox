@@ -1358,13 +1358,17 @@ def _apply_linux(bundle: JoinBundle, p: dict[str, Path], wg: str) -> list[str]:
                        (_reassert_paths()[0], service), (_reassert_paths()[1], timer)):
         _write_public(path, text)
     _run(["systemctl", "daemon-reload"])
-    for argv in (["systemctl", "enable", FW_UNIT_NAME],
+    # ENABLED *and* STARTED, both verified (see the host's install_firewall): an enabled but
+    # inactive boot unit is not restarted by `PartOf=nftables.service`, so a nftables restart
+    # would leave the live link unfiltered until the re-assert timer fired.
+    for argv in (["systemctl", "enable", "--now", FW_UNIT_NAME],
                  ["systemctl", "enable", "--now", REASSERT_TIMER_NAME]):
-        if not _ok(argv) or not _ok(["systemctl", "is-enabled", argv[-1]]):
+        if (not _ok(argv) or not _ok(["systemctl", "is-enabled", argv[-1]])
+                or not _ok(["systemctl", "is-active", argv[-1]])):
             # Not persisted: a live link (re-join) would come back at boot WITHOUT the unit it
             # Requires. Down it and disable its unit, so it neither runs nor boots unfirewalled.
-            raise RuntimeError(f"could not enable {argv[-1]}; refusing to bring the link up "
-                               "without its firewall persisted"
+            raise RuntimeError(f"could not enable and start {argv[-1]}; refusing to bring the "
+                               "link up without its firewall persisted and active"
                                + _linux_fail_closed(bundle.iface, disable=True))
     notes.append(f"firewall units enabled: {FW_UNIT_NAME}, {REASSERT_TIMER_NAME}")
     unit = f"wg-quick@{bundle.iface}"

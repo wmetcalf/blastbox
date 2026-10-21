@@ -337,13 +337,20 @@ def install_firewall(cfg: WorkerLinkConfig) -> list[str]:
                                  "reboot") from None
     if changed:
         ea._run(["systemctl", "daemon-reload"], check=False)
-    for argv in (["systemctl", "enable", FW_UNIT_NAME],
+    # ENABLED *and* STARTED (`--now`), both verified. The rules were loaded with `nft -f` above,
+    # so merely enabling left the boot unit INACTIVE -- and `PartOf=nftables.service` only
+    # propagates a restart to an ACTIVE unit: `systemctl restart nftables` (a flush) would then
+    # leave the live link unfiltered until the re-assert timer fired. Starting the oneshot just
+    # re-loads the same ruleset atomically.
+    for argv in (["systemctl", "enable", "--now", FW_UNIT_NAME],
                  ["systemctl", "enable", "--now", REASSERT_TIMER_NAME]):
         rc = ea._run(argv, check=False)
-        if rc.returncode != 0 or not ea._ok(["systemctl", "is-enabled", argv[-1]]):
-            tail = (rc.stderr or "").strip().splitlines()[-1:] or ["systemctl failed"]
-            raise FirewallNotInForce(f"could not enable {argv[-1]} ({tail[0]}); refusing to "
-                                     "bring the link up without its firewall persisted")
+        if (rc.returncode != 0 or not ea._ok(["systemctl", "is-enabled", argv[-1]])
+                or not ea._ok(["systemctl", "is-active", argv[-1]])):
+            tail = (rc.stderr or "").strip().splitlines()[-1:] or ["not enabled and active"]
+            raise FirewallNotInForce(f"could not enable and start {argv[-1]} ({tail[0]}); "
+                                     "refusing to bring the link up without its firewall "
+                                     "persisted and active")
     notes.append(f"firewall units enabled: {FW_UNIT_NAME} (loads before the link at boot; "
                  f"the link Requires it) and {REASSERT_TIMER_NAME} (re-asserts every minute)")
     return notes

@@ -52,6 +52,8 @@ class FakeHost:
         self.enable_fails = False                     # `systemctl enable [--now] wg-quick@*`
         self.nft_drop_missing = False                 # the kernel loses a rule on load
         self.nft_list_error: str | None = None        # `nft list table` fails some other way
+        self.active: set[str] = set()                 # non-link units that were STARTED
+        self.start_fails: set[str] = set()            # units whose start (--now) fails
 
     def _up(self, iface: str) -> None:
         """A (re)start reads the interface's config file, as wg-quick does."""
@@ -108,8 +110,13 @@ class FakeHost:
         elif a[:2] == ["systemctl", "enable"] and self.enable_fails \
                 and a[-1].startswith("wg-quick@"):
             rc, err = 1, "Failed to enable unit: Unit file is masked."
+        elif a[:2] == ["systemctl", "enable"] and "--now" in a and a[-1] in self.start_fails:
+            self.enabled.add(a[-1])
+            rc, err = 1, f"Job for {a[-1]} failed because the control process exited"
         elif a[:2] == ["systemctl", "enable"]:
             self.enabled.add(a[-1])
+            if a[2] == "--now" and not a[3].startswith("wg-quick@"):
+                self.active.add(a[3])
             if a[2] == "--now" and a[3].startswith("wg-quick@"):
                 self._up(a[3].split("@")[1])
         elif a[:2] == ["systemctl", "disable"] and self.disable_fails \
@@ -117,10 +124,13 @@ class FakeHost:
             rc, err = 1, "Failed to disable unit"
         elif a[:2] == ["systemctl", "disable"]:
             self.enabled.discard(a[-1])
+            if a[2] == "--now":
+                self.active.discard(a[-1])
             if a[2] == "--now" and a[3].startswith("wg-quick@") and not self.stuck_up:
                 self.links.discard(a[3].split("@")[1])
         elif a[:2] == ["systemctl", "is-active"]:
-            rc = 0 if a[2].split("@")[-1] in self.links else 3
+            rc = 0 if (a[2] in self.active or (a[2].startswith("wg-quick@")
+                                               and a[2].split("@")[-1] in self.links)) else 3
         elif a[:2] == ["wg-quick", "strip"]:
             body = Path(a[2]).read_text()
             out = "\n".join(ln for ln in body.splitlines()
@@ -237,7 +247,7 @@ def test_init_loads_and_reads_back_the_firewall_before_the_link_exists(host):
     assert load < readback < up
     assert "wtwg0" in host.links
     assert any("in force" in n for n in notes)
-    assert "systemctl enable blastbox-worker-link-fw.service" in flat
+    assert "systemctl enable --now blastbox-worker-link-fw.service" in flat
 
 
 def test_init_does_not_bring_the_link_up_when_nft_refuses_the_ruleset(host):
@@ -282,7 +292,7 @@ def test_init_refuses_to_bring_the_link_up_if_the_firewall_cannot_be_persisted(h
     real = host.run
 
     def run(argv, **kw):
-        if list(argv)[:2] == ["systemctl", "enable"] and "--now" not in argv:
+        if list(argv)[:2] == ["systemctl", "enable"] and argv[-1] == "blastbox-worker-link-fw.service":
             return subprocess.CompletedProcess(list(argv), 1, "", "Failed to enable unit")
         return real(argv, **kw)
 
@@ -1143,3 +1153,20 @@ def test_add_puts_the_registered_worker_key_in_the_bundle(host, pki):
     bundle, _ = wla.add_worker(_cfg(), "mac1", KEY_A, _csr(_ip("10.78.0.2")), pki_dir=pki)
     assert bundle.worker_public_key == KEY_A
     assert JoinBundle.from_json(bundle.to_json()).worker_public_key == KEY_A
+
+
+def test_init_starts_the_firewall_boot_unit_not_just_enables_it(host):
+    """REGRESSION (review): the boot unit was only ENABLED (the rules had been loaded with
+    `nft -f`), so it stayed inactive -- and PartOf=nftables.service restarts only an ACTIVE
+    unit: a `systemctl restart nftables` left the live link unfiltered until the re-assert
+    timer fired. It is enabled AND started now, both verified."""
+    wla.init_host(_cfg())
+    assert ["systemctl", "enable", "--now", "blastbox-worker-link-fw.service"] in host.calls
+    assert "blastbox-worker-link-fw.service" in host.active
+
+
+def test_init_refuses_when_the_firewall_boot_unit_will_not_start(host):
+    host.start_fails.add("blastbox-worker-link-fw.service")
+    with pytest.raises(wla.FirewallNotInForce, match="could not enable and start"):
+        wla.init_host(_cfg())
+    assert "wtwg0" not in host.links
