@@ -504,9 +504,10 @@ ours_live() {{
 # else's: drop it first (wg-quick recreates it on `up`).
 drop_foreign_name() {{
     [ -n "$PUB" ] || return 0
-    if real_iface && "$WG" show "$REAL" >/dev/null 2>&1 \
-            && [ "$("$WG" show "$REAL" public-key 2>/dev/null)" != "$PUB" ]; then
-        log "$NAMEFILE names $REAL, which runs another key: ignoring it"
+    # kept ONLY when its utun's key is positively ours; unreadable (not WireGuard, `wg show`
+    # failed) counts as foreign -- wg-quick down acts on whatever the note names
+    if real_iface && [ "$("$WG" show "$REAL" public-key 2>/dev/null)" != "$PUB" ]; then
+        log "$NAMEFILE names $REAL, which is not verifiably this link's tunnel: ignoring it"
         rm -f "${{NAMEFILE:?}}"
     fi
     REAL=''
@@ -815,7 +816,6 @@ def _wg_pubkey(wg: str, private: str) -> str:
     return proc.stdout.strip()
 
 
-@_node_locked
 def _refuse_rotating_a_live_link(wg: str, iface: str) -> None:
     """``keygen --rotate`` replaces the private key the link is FOUND by (macOS: the live utun
     is identified by its public key; the running tunnel and the installed config keep the old
@@ -844,6 +844,7 @@ def _refuse_rotating_a_live_link(wg: str, iface: str) -> None:
             f"--iface {iface}` first, then keygen --rotate, `add` on the host, and join again.")
 
 
+@_node_locked
 def keygen(iface: str, ip: str, *, rotate: bool = False) -> tuple[str, str, list[str]]:
     """Make (or reuse) this worker's WireGuard key, TLS key and a CSR for ``ip``.
 
@@ -965,7 +966,11 @@ def _egress_env() -> dict[str, str]:
 #: ``ip -d link`` kinds / link types that are a tunnel or VPN, not an underlay. A route to the
 #: host endpoint through any of them makes the control link depend on that tunnel.
 _TUNNEL_KINDS = frozenset({"wireguard", "tun", "ipip", "gre", "gretap", "ip6gre", "ip6gretap",
-                           "sit", "vti", "vti6", "ip6tnl", "xfrm", "erspan", "ip6erspan"})
+                           "sit", "vti", "vti6", "ip6tnl", "xfrm", "erspan", "ip6erspan",
+                           # encapsulating overlays: they report an ETHERNET link type
+                           "vxlan", "geneve", "bareudp", "gtp", "amt", "l2tp_eth", "batadv",
+                           # OpenVPN's data-channel-offload drivers
+                           "ovpn", "ovpn-dco"})
 _TUNNEL_LINK_TYPES = frozenset({"none", "ipip", "gre", "sit", "tunnel6", "ip6gre", "ip6tnl",
                                 "ppp"})
 
@@ -983,9 +988,15 @@ def _linux_tunnel_kind(dev: str) -> str | None:
         info = None
     if proc.returncode != 0 or not isinstance(info, dict):
         return f"a device whose type could not be read ({dev})"
-    kind = str((info.get("linkinfo") or {}).get("info_kind") or "")
+    linkinfo = info.get("linkinfo") or {}
+    kind = str(linkinfo.get("info_kind") or "")
     if kind in _TUNNEL_KINDS:
         return f"a {kind} tunnel"
+    data = linkinfo.get("info_data")
+    if isinstance(data, dict) and any(k in data for k in ("remote", "remote6", "peer")):
+        # any device whose kernel description names a REMOTE endpoint is an encapsulation,
+        # whatever its kind is called -- a kind added after this list still reads as a tunnel
+        return f"a {kind or 'tunnel'} device with a remote endpoint"
     link_type = str(info.get("link_type") or "")
     if link_type in _TUNNEL_LINK_TYPES:
         return f"a tunnel (link type {link_type})"
@@ -1514,13 +1525,15 @@ def _our_pub(wg: str, iface: str) -> "str | None":
 
 
 def _name_file_is_foreign(wg: str, iface: str) -> bool:
-    """True when wg-quick's name file names a LIVE utun running ANOTHER key: macOS reuses utun
-    numbers, so a stale note can point at someone else's VPN."""
+    """True unless wg-quick's name file names a utun POSITIVELY verified to run this link's key.
+    macOS reuses utun numbers, so a stale note can point at someone else's VPN; a key that
+    cannot be read (the utun is not WireGuard's, `wg show` failed, or our own key is missing)
+    is not proof of ownership -- and `wg-quick down <iface>` acts on whatever the note names."""
     named = _real_iface_darwin(iface)
     if named is None:
-        return False
+        return False                      # no note: nothing for wg-quick to act on
     key, ours = _utun_key(wg, named), _our_pub(wg, iface)
-    return key is not None and ours is not None and key != ours
+    return key is None or ours is None or key != ours
 
 
 def _our_real_iface_darwin(wg: str | None, iface: str) -> str | None:

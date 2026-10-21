@@ -109,8 +109,12 @@ class FakeNode:
         elif a[:4] == ["ip", "-d", "-j", "link"]:
             dev = a[-1]
             kind = self.tunnels.get(dev)
-            out = json.dumps([{"ifname": dev, "link_type": "none" if kind else "ether",
-                               **({"linkinfo": {"info_kind": kind}} if kind else {})}])
+            ether = kind in (None, "vxlan", "geneve", "fancytun")
+            info = {"info_kind": kind}
+            if kind == "fancytun":                  # an unlisted kind naming a remote endpoint
+                info["info_data"] = {"remote": "198.51.100.7", "id": 42}
+            out = json.dumps([{"ifname": dev, "link_type": "ether" if ether else "none",
+                               **({"linkinfo": info} if kind else {})}])
         elif a[:3] == ["route", "-n", "get"]:
             dest, dev = self.mac_routes.get(a[-1], ("default", self.mac_route_dev))
             out = (f"   route to: {a[-1]}\ndestination: {dest}\n"
@@ -427,6 +431,9 @@ def mac(tmp_path):
             (state / "keys").write_text(text)
             for line in text.splitlines():          # each listed utun is a live wireguard-go
                 (run_d / f"{line.split()[0]}.sock").write_text("")
+
+        def touch_sock(self, utun: str) -> None:
+            (run_d / f"{utun}.sock").write_text("")
 
         def sock(self, utun: str) -> bool:
             return (run_d / f"{utun}.sock").exists()
@@ -1259,7 +1266,7 @@ def test_keygen_join_and_leave_hold_one_node_wide_lock(node, tmp_path, monkeypat
         return wrapped
 
     node("linux")
-    monkeypatch.setattr(link, "_wg_pubkey", spy("keygen/join", link._wg_pubkey))
+    monkeypatch.setattr(link, "csr_config", spy("keygen", link.csr_config))
     monkeypatch.setattr(link, "_apply_linux", spy("join:apply", link._apply_linux))
     monkeypatch.setattr(link, "_refuse_leaving_what_is_not_ours",
                         spy("leave", link._refuse_leaving_what_is_not_ours))
@@ -1612,3 +1619,78 @@ def test_python_paths_never_trust_a_name_file_naming_another_key(node, tmp_path)
     n.name_at_down.clear()
     link._darwin_link_down("/fake/bin/wg", "/fake/bin/wg-quick", "wtwg0")
     assert n.name_at_down == [None]                  # the foreign note was dropped first
+
+
+# ------------------------------------------------------------------ review round 12
+
+def test_keygen_holds_the_node_lock_for_its_whole_run(node, tmp_path, monkeypatch):
+    """REGRESSION (review): the lock decorator had slid onto the rotation check, so keygen's
+    key, CSR and state writes ran UNLOCKED -- racing a join or leave."""
+    import fcntl
+
+    def held() -> bool:
+        fd = os.open(tmp_path / ".worker-link-peer.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+        finally:
+            os.close(fd)
+
+    seen = []
+    real_csr, real_write = link.csr_config, link._write_public
+
+    def csr(ip):
+        seen.append(("csr", held()))
+        return real_csr(ip)
+
+    def write(path, *a, **kw):
+        seen.append((Path(path).name, held()))
+        return real_write(path, *a, **kw)
+
+    node("linux")
+    monkeypatch.setattr(link, "csr_config", csr)
+    monkeypatch.setattr(link, "_write_public", write)
+    link.keygen("wtwg0", "10.78.0.5")
+    link.keygen("wtwg0", "10.78.0.5", rotate=True)
+    assert seen and all(h for _n, h in seen), seen
+
+
+def test_a_name_file_whose_utun_key_cannot_be_read_is_never_acted_on(node, tmp_path):
+    """REGRESSION (review): only a utun POSITIVELY running another key counted as foreign; one
+    whose key could not be read (not WireGuard, `wg show` failing) was kept, and
+    `wg-quick down` acted through it. Only a verified OWN key keeps the note now."""
+    n = node("darwin")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    link.leave("wtwg0")
+    n.launchd_loaded = False
+    (link.WG_RUN_DIR / "wtwg0.name").write_text("utun3\n")   # utun3: key unreadable
+    n.name_at_down.clear()
+    link._darwin_link_down("/fake/bin/wg", "/fake/bin/wg-quick", "wtwg0")
+    assert n.name_at_down == [None]
+
+
+def test_watchdog_drops_a_name_file_whose_utun_key_cannot_be_read(mac):
+    pub = "P" * 43 + "="
+    mac.rerender(public_key=pub)
+    mac.name("utun3\n")                         # names utun3: not WireGuard, no key
+    mac.touch_sock("utun3")                      # ...something else's socket lives there
+    mac.run()
+    assert mac.sock("utun3")                     # `wg-quick down` never acted through it
+
+
+@pytest.mark.parametrize("kind", ["vxlan", "geneve", "fancytun"])
+def test_encapsulating_overlays_are_not_an_underlay(node, tmp_path, kind):
+    """REGRESSION (review): VXLAN/Geneve devices report an ETHERNET link type and were not in
+    the tunnel set, so an endpoint routed over one passed as underlay. They are listed now,
+    and any kind whose kernel description names a remote endpoint is classified as a tunnel."""
+    n = node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    n.route_dev = "ovl0"
+    n.tunnels["ovl0"] = kind
+    with pytest.raises(RuntimeError, match="via ovl0"):
+        link.join(_bundle(tmp_path, csr))
