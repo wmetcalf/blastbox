@@ -428,7 +428,14 @@ def mac(tmp_path):
     pfctl = _fake_bin(bin_d, "pfctl", env_hdr + (
         'case "$*" in\n'
         '  *"-s info"*) echo "Status: $(cat "$ST/pf")"; exit 0 ;;\n'
-        '  *"-E"*) echo Enabled > "$ST/pf"; echo "pf enabled" >&2; echo "Token : 4242" >&2; exit 0 ;;\n'
+        # pf's enable REFERENCE COUNT, as xnu keeps it: -E adds a reference (a new token each
+        # time), -X releases one, and pf stops when the last one goes.
+        '  *"-s References"*) cat "$ST/refs" 2>/dev/null; exit 0 ;;\n'
+        '  *"-E"*) n=$(( $(cat "$ST/tokctr" 2>/dev/null || echo 4241) + 1 )); echo $n > "$ST/tokctr";'
+        ' echo $n >> "$ST/refs"; echo Enabled > "$ST/pf"; echo "pf enabled" >&2;'
+        ' echo "Token : $n" >&2; exit 0 ;;\n'
+        '  *"-X"*) tok="$2"; grep -vx -e "$tok" "$ST/refs" > "$ST/refs.n" 2>/dev/null;'
+        ' mv "$ST/refs.n" "$ST/refs"; [ -s "$ST/refs" ] || echo Disabled > "$ST/pf"; exit 0 ;;\n'
         '  *"-a "*"-s rules"*) cat "$ST/anchor" 2>/dev/null; exit 0 ;;\n'
         '  *"-s rules"*) cat "$ST/main"; exit 0 ;;\n'
         '  *"-f -"*) cat > "$ST/anchor"; echo "LOADED $(head -1 "$ST/anchor")" >> "$LOG"; exit 0 ;;\n'
@@ -472,6 +479,32 @@ def mac(tmp_path):
             (state / "keys").write_text(text)
             for line in text.splitlines():          # each listed utun is a live wireguard-go
                 (run_d / f"{line.split()[0]}.sock").write_text("")
+
+        def tokens(self, iface: str = "wtwg0") -> list[str]:
+            f = state / f"blastbox-worker-link.{iface}.pftokens"
+            return f.read_text().split() if f.exists() else []
+
+        def refs(self) -> list[str]:
+            f = state / "refs"
+            return f.read_text().split() if f.exists() else []
+
+        def pf_state(self) -> str:
+            return (state / "pf").read_text().strip()
+
+        def release(self, token: str) -> None:
+            """What `leave` does with a link's token: pfctl -X <token>."""
+            subprocess.run([pfctl, "-X", token], check=True)
+
+        def run_link(self, iface: str, worker_ip: str) -> list[str]:
+            """Run the watchdog of ANOTHER link (another iface/overlay) against the same pf."""
+            other = tmp_path / f"watchdog-{iface}.sh"
+            other.write_text(link.watchdog_script(
+                iface=iface, worker_ip=worker_ip, host_ip="10.79.0.1", agent_port=8765,
+                wg=wg, wg_quick=wgq, pfctl=pfctl, run_dir=str(run_d), state_dir=str(state)))
+            log.write_text("")
+            subprocess.run(["/bin/sh", str(other)], capture_output=True, text=True,
+                           timeout=30, check=False)
+            return log.read_text().splitlines()
 
         def touch_sock(self, utun: str) -> None:
             (run_d / f"{utun}.sock").write_text("")
@@ -2079,3 +2112,45 @@ def test_linux_leave_stops_and_verifies_an_in_flight_reassert_run(node, tmp_path
     n.stop_fails.clear()
     link.leave("wtwg0")
     assert n.loaded is None
+
+
+# ------------------------------------------------------------------ review round 21
+
+def test_a_link_takes_its_own_pf_reference_even_when_pf_is_already_on(mac):
+    """REGRESSION (review): the watchdog took a pf enable reference only when pf was OFF, so a
+    link joining while pf was already on (another link, a VPN) held none -- and when the link
+    that did hold one left (pfctl -X), pf stopped with this one still live."""
+    mac.up("utun7")
+    assert mac.pf_state() == "Enabled" and mac.refs() == []    # on, but not by us
+    mac.run()
+    assert len(mac.tokens()) == 1 and mac.tokens() == mac.refs()
+
+
+def test_the_watchdog_reuses_its_reference_instead_of_accumulating(mac):
+    """One reference per link, reused every run; a stale one (pf disabled / rebooted) is
+    REPLACED, never added to."""
+    mac.up("utun7")
+    for _ in range(4):
+        calls = mac.run()
+    assert "pfctl -E" not in calls                               # reused, not re-taken
+    assert len(mac.refs()) == 1 and len(mac.tokens()) == 1
+    stale = mac.tokens()[0]
+    (mac.release(stale))                                          # pf disabled underneath us
+    mac.run()
+    assert len(mac.tokens()) == 1 and mac.tokens()[0] != stale
+    assert mac.refs() == mac.tokens()
+
+
+def test_leaving_one_link_keeps_pf_on_for_the_other(mac):
+    """Two links on different overlays, pf initially off: each takes its OWN reference, so
+    releasing the first (its leave) leaves pf enabled for the second."""
+    mac.pf("Disabled")
+    mac.up("utun7")
+    mac.run()                                                     # link A enables pf
+    mac.run_link("wtwg1", "10.79.0.5")                            # link B: pf already on
+    a, b = mac.tokens("wtwg0"), mac.tokens("wtwg1")
+    assert len(a) == 1 and len(b) == 1 and a != b                 # separate files, separate refs
+    mac.release(a[0])                                             # A leaves
+    assert mac.pf_state() == "Enabled"                            # still held by B
+    mac.release(b[0])
+    assert mac.pf_state() == "Disabled"                           # last reference gone

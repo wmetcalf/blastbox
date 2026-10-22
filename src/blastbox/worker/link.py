@@ -607,16 +607,31 @@ pf_open() {{
 
 # pf must be ENABLED for any anchor to be evaluated; macOS boots with it disabled. If it cannot
 # be enabled the link must not be up: its rules would be text, not enforcement.
-if ! "$PFCTL" -s info 2>/dev/null | grep -q '^Status: Enabled'; then
-    # -E takes an enable REFERENCE and prints its token: keep it, so `leave` can release it
-    # (pfctl -X) and a pf that was off before worker-link goes back to being off.
+#
+# ONE enable REFERENCE per installed link, in this link's own token file -- taken even when pf is
+# already on (another link, a VPN): pf stops when its LAST reference is released, so a link
+# holding none would be left unfiltered when the one that enabled pf leaves. Reused on every run;
+# re-taken only when the stored token is no longer valid (pf was disabled, the machine rebooted,
+# or `pfctl -s References` no longer lists it), and REPLACED, never accumulated. `leave`
+# releases exactly this one (pfctl -X).
+TOK=$(head -1 "$PFTOKENS" 2>/dev/null)
+TOK_OK=0
+if [ -n "$TOK" ] && "$PFCTL" -s info 2>/dev/null | grep -q '^Status: Enabled'; then
+    REFS=$("$PFCTL" -s References 2>/dev/null)
+    if [ -z "$REFS" ] || printf '%s\\n' "$REFS" | grep -qw "$TOK"; then
+        TOK_OK=1
+    fi
+fi
+if [ "$TOK_OK" != 1 ]; then
     OUT=$("$PFCTL" -E 2>&1)
     TOKEN=$(printf '%s\\n' "$OUT" | sed -n 's/^Token : *\\([0-9][0-9]*\\).*/\\1/p' | head -1)
-    [ -n "$TOKEN" ] && echo "$TOKEN" >> "$PFTOKENS"
-    if ! "$PFCTL" -s info 2>/dev/null | grep -q '^Status: Enabled'; then
-        force_down "pf could not be enabled"
-        exit 1
+    if [ -n "$TOKEN" ]; then
+        echo "$TOKEN" > "$PFTOKENS"
     fi
+fi
+if ! "$PFCTL" -s info 2>/dev/null | grep -q '^Status: Enabled'; then
+    force_down "pf could not be enabled"
+    exit 1
 fi
 # ...and the main ruleset must still EVALUATE our anchor. A VPN client or kill-switch app that
 # loads its own main ruleset drops `anchor "com.apple/*"`, and every rule below is then text.
