@@ -324,14 +324,25 @@ def _default_http_probe(url: str, headers: dict[str, str], timeout: float) -> "b
     """GET ``url`` with ``headers``. True iff a 2xx comes back within ``timeout``; False if the box
     ANSWERED otherwise (non-2xx, refused, reset, timed out); None if we could not even ask because
     the LOCAL side ran out of resources (issue #77 marla-loop 3)."""
-    from blastbox.host.runtime.remote_http import _default_open   # no-redirect opener (no import cycle)
-    req = urllib.request.Request(url, headers=headers, method="GET")  # noqa: S310 (url is host-built)
+    # no-redirect opener, under a WALL-CLOCK deadline (no import cycle: imported here)
+    from blastbox.host.runtime.remote_http import (
+        ProbeNotAttempted,
+        RemoteReadTimeout,
+        open_bounded_get,
+    )
     try:
         # NEVER follow a worker-chosen 3xx on /healthz: it would re-send X-aws-proxy-auth (the shared
         # EC2/static agent_token, or a Lambda JWE) to the Location + SSRF-GET, and a 2xx there would
-        # falsely mark the slot READY. A redirect -> HTTPError -> not-ready (False) below.
-        with _default_open(req, timeout) as resp:
+        # falsely mark the slot READY. A redirect -> HTTPError -> not-ready (False) below. The whole
+        # exchange is held to `timeout` of wall-clock time: the socket timeout bounds only each idle
+        # gap, so a box trickling its status line could otherwise pin the pool's tick indefinitely.
+        resp, _deadline = open_bounded_get(url, headers, timeout)
+        with resp:
             return 200 <= resp.status < 300
+    except ProbeNotAttempted:
+        return None       # never reached the worker (local resolver): no verdict
+    except RemoteReadTimeout:
+        return False      # it answered, too slowly: a verdict, like a socket timeout
     except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
         # Distinguish "the box gave us an answer" from "we could not even ASK". A refusal, reset or
         # timeout IS a verdict about the worker. Local resource exhaustion is not: it is the HOST

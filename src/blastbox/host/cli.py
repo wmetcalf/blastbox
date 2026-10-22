@@ -5,6 +5,7 @@ Subcommands:
 - ``dispatch`` — run the Dispatcher loop (claim + launch worker containers).
 - ``bench``    — run a performance benchmark scenario (or ``--list`` them).
 - ``egress``   — set up this node's egress tier (bridges, local/global exit, wg overlay).
+- ``worker-link`` — WireGuard control link so the dispatcher can reach workers behind NAT.
 - ``version``  — print version and exit.
 """
 
@@ -2447,6 +2448,12 @@ def build_parser() -> argparse.ArgumentParser:
     # reason as `macos` above.
     from blastbox.client.cli import add_parser as _add_attest_parser
     _add_attest_parser(sub)
+
+    # Worker-link: the WireGuard control link that lets a dispatcher reach workers behind NAT.
+    # Also lean (the worker half runs on boxes without blastbox[host]); its host subcommands
+    # import the host modules lazily.
+    from blastbox.worker.link import add_parser as _add_worker_link_parser
+    _add_worker_link_parser(sub)
 
     return p
 

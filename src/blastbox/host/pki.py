@@ -300,6 +300,52 @@ class CertAuthority:
         cert = self._sign(cn, csr.public_key(), sans, server=True, client=False, days=days)
         return cert.public_bytes(serialization.Encoding.PEM)
 
+    def sign_csr_for_ip(self, csr_pem: bytes, ip: str, *, cn: str, days: int = 30) -> bytes:
+        """Sign a worker CSR whose ONLY subjectAltName is exactly ``ip``. Returns the cert PEM.
+
+        :meth:`sign_csr` copies whatever SANs the CSR asks for, which is right for an
+        operator signing a CSR they built themselves and wrong for ``worker-link add``,
+        where the CSR arrives from the worker being enrolled. The dispatcher verifies a
+        worker by hostname == the address it dialled (``remote_http``), so a CSR that also
+        asked for a second overlay address -- or a DNS name, or nothing at all -- would mint
+        a certificate that lets this worker answer for ANOTHER worker's address: the link
+        delivers by WireGuard key, but TLS is the layer that says who answered. So the
+        rule is equality, not inclusion: one SAN, an IP, the allocated one.
+
+        The subject CN is ours (``cn``), not the CSR's, for the same reason: the worker
+        names nothing in its own certificate. ``serverAuth`` only -- never ``clientAuth``,
+        or a worker's key could present itself to OTHER workers as the dispatcher (the
+        agent's mTLS checks the chain, not the EKU's holder).
+        """
+        want = ipaddress.ip_address(str(ip).strip())
+        csr = x509.load_pem_x509_csr(csr_pem)
+        if not csr.is_signature_valid:
+            raise ValueError("CSR signature is invalid")
+        pub = csr.public_key()
+        if isinstance(pub, ec.EllipticCurvePublicKey):
+            if pub.curve.key_size < 256:
+                raise ValueError(f"CSR key is a {pub.curve.key_size}-bit EC key; need >= 256")
+        else:
+            from cryptography.hazmat.primitives.asymmetric import rsa
+            if not isinstance(pub, rsa.RSAPublicKey) or pub.key_size < 2048:
+                raise ValueError("CSR key must be EC (>= P-256) or RSA (>= 2048 bits)")
+        try:
+            ext = csr.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+        except x509.ExtensionNotFound:
+            raise ValueError(
+                f"CSR has no subjectAltName; it must name exactly IP:{want}") from None
+        names = list(ext.value)
+        got = [g.value for g in names if isinstance(g, x509.IPAddress)]
+        if len(names) != 1 or got != [want]:
+            shown = ", ".join(
+                f"IP:{g.value}" if isinstance(g, x509.IPAddress) else f"{type(g).__name__}:{g.value}"
+                for g in names) or "nothing"
+            raise ValueError(
+                f"CSR subjectAltName must be exactly IP:{want} (the allocated overlay address); "
+                f"it asks for {shown}")
+        cert = self._sign(cn, pub, [str(want)], server=True, client=False, days=days)
+        return cert.public_bytes(serialization.Encoding.PEM)
+
 
 class TrustAnchor:
     """A CA's PUBLIC half only — enough to VERIFY, not to issue.

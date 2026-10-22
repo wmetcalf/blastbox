@@ -13,11 +13,15 @@ into the worker image (EC2 AMI / Lambda MicroVM image), listening on port 8765.
 
 Contract (deliberately mirrors the win-validator myatg agent so one host transport talks to both):
 
-    GET  /healthz                -> 200 {"ok": true}
+    GET  /healthz                -> 200 {"ok": true, "engine": <name>, "egress": <bool>}
+                                    ("egress": can a job granted egress get it here? never on
+                                    macOS; a static pool whose tier grants egress places by it)
     POST /detonate?name=<fn>     body = raw input bytes
                                  -> 200 application/x-tar  (the sealed output dir: metadata.json + every
                                     declared artifact). The host extracts it into the job's output/ dir,
                                     exactly as if a local sandbox had written there.
+                                 -> 422 {"error": "egress_unavailable"} when the job's net policy
+                                    grants egress and this worker cannot provide it (nothing ran)
 
 Optional bearer auth: set `BLASTBOX_WORKER_AGENT_TOKEN`; the agent then requires it in
 `Authorization: Bearer <t>` OR `X-aws-proxy-auth: <t>` (the header the Lambda-MicroVM runtime sends).
@@ -109,6 +113,11 @@ class _TruncatedBody(Exception):
 class _Unconfined(Exception):
     """A detonation on a host with no outer boundary made no confined run (and was not refused
     before the input was handed to the engine)."""
+
+
+class _EgressUnavailable(Exception):
+    """The job's net policy grants egress and this worker cannot provide it (a macOS worker,
+    or one declared ``BLASTBOX_WORKER_AGENT_EGRESS=0``). Refused before the engine runs."""
 
 
 class _SlowBody(Exception):
@@ -207,6 +216,10 @@ class _Handler(BaseHTTPRequestHandler):
     # Set when warmup (an engine's known-positive self-test) failed and health is gated on it.
     warmup_error: str | None = None
     max_bytes: int = _DEFAULT_MAX_BYTES
+    # Whether a job whose net policy grants egress can actually get it here (see
+    # _egress_capable). Advertised on /healthz so a dispatcher can place by it, and ENFORCED on
+    # /detonate so a dispatcher that does not is refused instead of served a degraded run.
+    egress_capable: bool = True
 
     def _pre_detect(self) -> bool:
         """Whether to call the engine's optional ``detect()`` in this process. Not on macOS:
@@ -276,7 +289,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.SERVICE_UNAVAILABLE,
                            {"ok": False, "engine": self.engine.name, "warmup": "failed"})
                 return
-            self._json(HTTPStatus.OK, {"ok": True, "engine": self.engine.name})
+            self._json(HTTPStatus.OK, {"ok": True, "engine": self.engine.name,
+                                       "egress": bool(self.egress_capable)})
         else:
             self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -342,6 +356,17 @@ class _Handler(BaseHTTPRequestHandler):
             with contextlib.suppress(OSError):
                 self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "unconfined"})
             _retire(75)
+            return
+        except _EgressUnavailable:
+            # A PLACEMENT error, not a worker fault and not an engine result: nothing ran. 422
+            # so the dispatcher can tell it from every other answer and fail the job with a
+            # reason an operator can act on (see remote_http.WorkerLacksEgress).
+            _log.warning("http_agent: refusing a job whose net policy requires egress -- this "
+                         "worker cannot provide it")
+            self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {
+                "error": "egress_unavailable",
+                "detail": "this worker cannot provide network egress, and the job's net policy "
+                          "requires it; nothing was run"})
             return
         except _TruncatedBody:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "truncated_body"})
@@ -412,6 +437,13 @@ class _Handler(BaseHTTPRequestHandler):
                 # render tunables, ...) forwarded via X-Blastbox-Params actually take effect -- reading
                 # them before _job_env would pin Limits to the worker-image defaults (sealed egress).
                 limits = Limits.from_env()
+                if limits.net_egress and not self.egress_capable:
+                    # Refuse rather than run degraded. On macOS the sandboxes would only log
+                    # "network stays DENIED" and carry on, so an egress job came back as a
+                    # plausible `ok` that never reached the network -- a wrong answer that
+                    # looks like a right one. Checked here, on the EFFECTIVE limits (the
+                    # forwarded params applied), before the engine sees a byte.
+                    raise _EgressUnavailable
                 # AGENT-side hard-deadline backstop, armed ONLY around the detonation (the body is already
                 # read, so a slow uploader -- handled by _SlowBody -- can't trip it): a hung engine would
                 # otherwise pin _JOB_LOCK forever. The deadline is strictly > the engine's own timeout, so
@@ -690,11 +722,35 @@ def retry_warmup(engine: Engine, handler: type[_Handler], *,
     return t
 
 
+def _egress_capable() -> bool:
+    """Can a job that is GRANTED egress actually get it on this worker?
+
+    macOS: never. There is no egress rooter there -- nothing like netd steering a worker's
+    traffic through fakenet/tor/VPN -- so seatbelt and appsandbox keep the network denied
+    whatever the job asked for (see seatbelt.py). Opening it would be direct host egress
+    from the analyst's own network, so the answer is fixed: setting
+    ``BLASTBOX_WORKER_AGENT_EGRESS=1`` on a Mac stops startup rather than lie.
+
+    Elsewhere: yes by default (a Linux worker's inner sandbox shares a rooter-routed netns,
+    the behaviour this agent always had), and ``BLASTBOX_WORKER_AGENT_EGRESS=0`` declares a
+    worker that has no exit wired, so egress jobs are refused instead of failing late.
+    """
+    if host_platform() == "darwin":
+        if _env_flag("BLASTBOX_WORKER_AGENT_EGRESS", False):
+            raise SystemExit(
+                "http_agent: BLASTBOX_WORKER_AGENT_EGRESS=1 on macOS -- macOS workers cannot "
+                "provide egress (no egress rooter; the sandboxes keep the network denied). "
+                "Unset it; egress jobs belong on a Linux worker.")
+        return False
+    return _env_flag("BLASTBOX_WORKER_AGENT_EGRESS", True)
+
+
 def serve(engine: Engine, *, bind: str = "0.0.0.0", port: int = 8765,
           token: str | None = None, max_bytes: int = _DEFAULT_MAX_BYTES,
           tls_cert: str | None = None, tls_key: str | None = None,
           client_ca: str | None = None, allow_cidrs: str | None = None,
-          timeout_s: float = 300.0, warmup_error: str | None = None) -> ThreadingHTTPServer:
+          timeout_s: float = 300.0, warmup_error: str | None = None,
+          egress_capable: bool | None = None) -> ThreadingHTTPServer:
     """Serve the engine. ``tls_cert``/``tls_key`` enable HTTPS; adding ``client_ca`` requires a
     CA-signed **client** cert (mTLS). ``allow_cidrs`` restricts which peer IPs may POST /detonate.
     ``timeout_s`` bounds a request's socket reads so a slowloris body can't hold the job lock forever."""
@@ -713,10 +769,16 @@ def serve(engine: Engine, *, bind: str = "0.0.0.0", port: int = 8765,
     _guard_exposure(bind, port, token=token, client_ca=client_ca, allow_cidrs=allow_cidrs,
                     allow_insecure=allow_insecure)
     require_confined = _guard_unsandboxed_engine(engine)
+    if egress_capable is None:
+        egress_capable = _egress_capable()
+    elif egress_capable and host_platform() == "darwin":
+        raise SystemExit("serve(): egress_capable=True on macOS -- macOS workers cannot "
+                         "provide egress")
     handler = type("_BoundHandler", (_Handler,),
                    {"engine": engine, "token": token, "max_bytes": max_bytes,
                     "allow_nets": _parse_cidrs(allow_cidrs), "timeout": timeout_s,
-                    "require_confined": require_confined, "warmup_error": warmup_error})
+                    "require_confined": require_confined, "warmup_error": warmup_error,
+                    "egress_capable": bool(egress_capable)})
     httpd = ThreadingHTTPServer((bind, port), handler)
     if tls_cert and tls_key:
         from blastbox.tls import server_ssl_context
@@ -735,8 +797,9 @@ def serve(engine: Engine, *, bind: str = "0.0.0.0", port: int = 8765,
                 f"uid ({os.getuid()}) -- a 0600 key owned by root is unreadable when the image runs as "
                 f"a non-root USER; chown the key to the agent uid or loosen its mode.") from exc
         httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
-    _log.info("http_agent: serving engine=%s on %s:%d (tls=%s mtls=%s allowlist=%s)",
-              engine.name, bind, port, bool(tls_cert), bool(client_ca), bool(allow_cidrs))
+    _log.info("http_agent: serving engine=%s on %s:%d (tls=%s mtls=%s allowlist=%s egress=%s)",
+              engine.name, bind, port, bool(tls_cert), bool(client_ca), bool(allow_cidrs),
+              bool(egress_capable))
     return httpd
 
 
@@ -754,6 +817,7 @@ def main(argv: list[str] | None = None) -> int:
     require_warmup = _env_flag("BLASTBOX_WORKER_AGENT_REQUIRE_WARMUP", host_platform() == "darwin")
     # Refuse an unsandboxed engine before its warmup parses anything; serve() re-checks.
     require_confined = _guard_unsandboxed_engine(engine)
+    egress_capable = _egress_capable()      # a contradictory flag stops startup before warmup
     warmup_error = _bounded_warmup(engine, require_warmup, require_confined)
     port = int(os.environ.get("BLASTBOX_WORKER_AGENT_PORT", "8765"))
     bind = os.environ.get("BLASTBOX_WORKER_AGENT_BIND", "0.0.0.0")
@@ -769,7 +833,8 @@ def main(argv: list[str] | None = None) -> int:
     timeout_s = float(os.environ.get("BLASTBOX_WORKER_AGENT_TIMEOUT_S") or "300")
     httpd = serve(engine, bind=bind, port=port, token=token, max_bytes=max_bytes,
                   tls_cert=tls_cert, tls_key=tls_key, client_ca=client_ca, allow_cidrs=allow_cidrs,
-                  timeout_s=timeout_s, warmup_error=warmup_error)
+                  timeout_s=timeout_s, warmup_error=warmup_error,
+                  egress_capable=egress_capable)
     if warmup_error is not None and hasattr(engine, "warmup"):
         # launchd/KeepAlive won't restart a live process, so a transient failure (a busy ANE, a
         # slow first compile) would otherwise keep this Mac out of the pool until someone notices.

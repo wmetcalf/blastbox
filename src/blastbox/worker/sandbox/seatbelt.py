@@ -25,7 +25,9 @@ profile text is built only from this module's literals and counters.
 **Why ``net_egress`` is ignored.** On Linux, granted egress means "share the worker netns that
 netd/rooter already steers through fakenet/tor/VPN". macOS has no such rooter, so allowing the
 network here would be direct host egress. Fail-closed: the network stays denied, and a request
-that asked for it is logged.
+that asked for it is logged. A JOB that needs egress never gets this far on a Mac: the
+http_agent advertises ``"egress": false`` and refuses it (422 ``egress_unavailable``) before the
+engine runs, because a run with the network silently denied returns a plausible wrong answer.
 
 ``sandbox-exec(1)`` is marked deprecated, but it is the documented front-end to the same
 Sandbox.kext that App Sandbox, Chrome and Safari's helpers use, and ships in macOS 26. If it

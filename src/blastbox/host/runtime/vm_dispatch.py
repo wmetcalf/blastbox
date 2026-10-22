@@ -48,6 +48,8 @@ from blastbox.host.jobs.retention import (
     retry_pending_uploads,
 )
 from blastbox.host.runtime.remote_http import WorkerBusy   # 409 from a busy worker -> requeue, not fail
+# never reached the worker (this dispatcher's resolver) -> requeue, not fail
+from blastbox.host.runtime.remote_http import ProbeNotAttempted
 from blastbox.observability.metrics import (
     observe_job_duration,
     record_job_dispatched,
@@ -912,10 +914,11 @@ class VmJobDispatcher:
                 # index per-page perceptual hashes for /v1/similar, same as the cold/file-warm paths --
                 # else a network-endpoint (static/AWS) page-hash job is DONE but invisible to search.
                 self._index_page_hashes(job, sealed_env)
-        except (NoWarmSlot, WorkerBusy):
+        except (NoWarmSlot, WorkerBusy, ProbeNotAttempted):
             # capacity pressure, not a job failure -- the job NEVER ran (no slot, or the claimed worker's
-            # single-flight lock was held by a stale detonation -> 409). REQUEUE it (CAS back to QUEUED,
-            # clear our claim + warm stamp) so it waits for a slot / another dispatcher instead of FAILing.
+            # single-flight lock was held by a stale detonation -> 409, or this dispatcher could not even
+            # resolve the worker's name). REQUEUE it (CAS back to QUEUED, clear our claim + warm stamp) so
+            # it waits for a slot / another dispatcher instead of FAILing.
             record_warm_claim(hit=False)   # warm-pool miss (parity with the cold dispatcher's metric)
             logger.info("vm_dispatch: no usable warm slot for %s; requeuing (not failing)", job.job_id)
             owned = self._store.update_if_status(
@@ -1580,6 +1583,47 @@ def _claim_resumable_slot(pool: Any, timeout_s: float, *,
     return None
 
 
+def _place_egress(runtime: Any, tier: str) -> None:
+    """This tier's policy grants egress: only place its jobs on workers that can provide it.
+
+    Any runtime that places per worker is told (``require_egress``): a static pool claims only
+    workers whose /healthz advertises ``"egress": true``, and a CASCADE forwards that to every
+    static tier it holds, including tiers it admits later -- so an egress job skips a macOS
+    worker and falls through to capable capacity rather than being refused by it. Then the
+    fleet is asked once, now: if every worker ANSWERED and none can, no job of this tier could
+    ever be placed, so refuse to start rather than requeue every job until it ages out. Unknown
+    answers (unreachable now) are not a verdict and do not block startup.
+
+    Runtimes that do not advertise per worker (AWS; a cascade containing one, or with a tier
+    still deferred) give no fleet-wide verdict; there the agent's own refusal (HTTP 422
+    ``egress_unavailable``, surfaced as ``remote_http.EGRESS_PLACEMENT_ERROR``) is the backstop,
+    and it fails the job with that reason rather than letting it run without a network.
+    """
+    require = getattr(runtime, "require_egress", None)
+    if not callable(require):
+        logger.info("vm_dispatch: %s grants egress; this runtime does not advertise per-worker "
+                    "egress, so a worker that cannot provide it refuses the job (422)", tier)
+        return
+    require()
+    census = getattr(runtime, "egress_census", None)
+    counts = census() if callable(census) else None
+    if counts is None:
+        logger.info("vm_dispatch: %s grants egress; static members place only on workers that "
+                    "advertise it, other tiers rely on the agent's refusal (422)", tier)
+        return
+    yes, no, unknown = counts
+    if yes == 0 and unknown == 0 and no > 0:
+        raise ValueError(
+            f"{tier}: this tier's net policy grants egress, but none of its {no} static "
+            "worker(s) advertises egress (macOS workers never do; a Linux agent may run with "
+            "BLASTBOX_WORKER_AGENT_EGRESS=0). Serve this policy from workers that can, or give "
+            "this engine a sealed policy.")
+    if no:
+        logger.warning("vm_dispatch: %s grants egress; %d of %d static worker(s) do not "
+                       "advertise it and will not be given this tier's jobs", tier, no,
+                       yes + no + unknown)
+
+
 def build_remote_vm_dispatcher(
     store: JobStore,
     job_root: str | Path,
@@ -1751,6 +1795,8 @@ def build_remote_vm_dispatcher(
         # UNdeclared engine (net_policy None) stays enforcement-opt-out exactly as before.
         _resolved_net_policy = _personality.name if getattr(engine_spec, "net_policy", None) else None
         _net_env = {"BLASTBOX_NET_EGRESS": "1" if _personality.exit_driver not in ("none", "drop") else "0"}
+        if _net_env["BLASTBOX_NET_EGRESS"] == "1":
+            _place_egress(pool.runtime, tier)
         # For an httpproxy personality, inject the SAME validated HTTP_PROXY/HTTPS_PROXY the cold dispatcher
         # sets (Dispatcher._httpproxy_env) into the worker env -- else the inner sandbox is opened for egress
         # but proxy-aware clients get no proxy and go direct / fail, silently differing from the cold tier.

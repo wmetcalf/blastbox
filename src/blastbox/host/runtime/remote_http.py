@@ -10,10 +10,14 @@ Plugs into `VmJobDispatcher(validate=...)` (or a pool_manager-style claim loop) 
 
 from __future__ import annotations
 
+import contextlib
+import http.client
 import io
+import ipaddress
 import json
 import logging
 import os
+import socket
 import ssl
 import threading
 import time
@@ -54,6 +58,176 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+#: Per-thread list the worker transport's connections register their sockets in, so a caller
+#: that gives up on an exchange (:func:`_open_bounded`) can END its I/O, not just stop waiting.
+_IO_REGISTRY = threading.local()
+
+
+def _track(sock: Any) -> None:
+    lst = getattr(_IO_REGISTRY, "socks", None)
+    if lst is not None:
+        lst.append(sock)
+
+
+#: At most this many name lookups in flight at once, process-wide (see _resolve_bounded).
+_MAX_RESOLVERS = 8
+_RESOLVE_LOCK = threading.Lock()
+_RESOLVING: dict[tuple, "_Lookup"] = {}
+
+
+class _Lookup:
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.result: list | None = None
+        self.error: BaseException | None = None
+
+
+def _resolve_bounded(host: str, port: Any, deadline: float | None) -> list:
+    """``getaddrinfo`` for a worker transport, with the OUTSTANDING work bounded.
+
+    A system resolver can stall, and ``getaddrinfo`` cannot be interrupted: called inline, a
+    probe abandoned at its deadline left its thread blocked in the lookup with no socket to
+    shut down, and every recurring /healthz or capability probe abandoned another one. So a
+    lookup runs in ONE resolver thread per (host, port) -- probes of the same worker share it
+    rather than each starting their own -- with at most ``_MAX_RESOLVERS`` in flight in total,
+    and a caller waits only until its own deadline. A numeric address needs no lookup.
+    """
+    try:
+        ipaddress.ip_address(str(host).strip("[]"))
+    except ValueError:
+        pass
+    else:
+        return socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    key = (host, port)
+    with _RESOLVE_LOCK:
+        job = _RESOLVING.get(key)
+        if job is None:
+            if len(_RESOLVING) >= _MAX_RESOLVERS:
+                raise ProbeNotAttempted(f"{_MAX_RESOLVERS} name lookups already in flight; "
+                                        "this host's resolver is not answering")
+            job = _Lookup()
+            _RESOLVING[key] = job
+
+            def _work(job: _Lookup = job) -> None:
+                try:
+                    job.result = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+                except BaseException as exc:   # noqa: BLE001 -- handed to the waiters
+                    job.error = exc
+                finally:
+                    with _RESOLVE_LOCK:
+                        _RESOLVING.pop(key, None)
+                    job.done.set()
+
+            try:
+                threading.Thread(target=_work, name="bb-resolve", daemon=True).start()
+            except RuntimeError as exc:      # cannot start a thread: a LOCAL condition
+                _RESOLVING.pop(key, None)
+                raise ProbeNotAttempted(f"could not start a name lookup ({exc})") from None
+    wait = None if deadline is None else max(0.0, deadline - time.monotonic())
+    if not job.done.wait(wait):
+        raise ProbeNotAttempted(f"name lookup for {host!r} did not finish within the deadline "
+                                "(this host's resolver is stalled)")
+    if job.error is not None:
+        raise job.error
+    return list(job.result or [])
+
+
+def _tracked_create_connection(address: tuple, timeout: Any = None,
+                               source_address: Any = None, *args: Any, **kwargs: Any) -> Any:
+    """``socket.create_connection`` whose sockets are registered BEFORE the blocking connect,
+    and whose connects are held to the caller's wall-clock deadline.
+
+    The stock one registers nothing until it returns: a stalled connect -- or a name resolving
+    to several black-holed addresses, each tried for a full socket timeout -- could not be
+    aborted, and the abandoned thread outlived the caller. Here each socket is tracked as soon
+    as it exists (so :func:`_open_bounded` can shut it down), each connect gets
+    ``min(timeout, time left)``, and an exchange already given up on (the deadline passed while
+    name resolution was still running) does not go on to connect at all.
+    """
+    host, port = address
+    deadline = getattr(_IO_REGISTRY, "deadline", None)
+    cancelled = getattr(_IO_REGISTRY, "cancelled", None)
+    per_op = timeout if isinstance(timeout, (int, float)) else None
+    infos = _resolve_bounded(host, port, deadline)
+    err: OSError | None = None
+    for family, socktype, proto, _canon, sockaddr in infos:
+        if cancelled is not None and cancelled.is_set():
+            raise TimeoutError("the exchange was abandoned at its deadline")
+        budget = per_op
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("connect exceeded the wall-clock deadline")
+            budget = left if budget is None else min(budget, left)
+        sk = socket.socket(family, socktype, proto)
+        _track(sk)
+        try:
+            sk.settimeout(budget)
+            if source_address:
+                sk.bind(source_address)
+            sk.connect(sockaddr)
+            sk.settimeout(per_op)
+            return sk
+        except OSError as exc:
+            err = exc
+            sk.close()
+    raise err if err is not None else OSError(f"getaddrinfo returned no address for {host!r}")
+
+
+class _TrackedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._create_connection = _tracked_create_connection
+
+    def connect(self) -> None:
+        super().connect()
+        _track(self.sock)
+
+
+class _TrackedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPSConnection whose sockets are registered BEFORE the TLS handshake, so a worker that
+    stalls or trickles the handshake can be cut off too (the handshake is run explicitly)."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._create_connection = _tracked_create_connection
+
+    def connect(self) -> None:
+        http.client.HTTPConnection.connect(self)
+        _track(self.sock)
+        host = self._tunnel_host or self.host  # type: ignore[attr-defined]
+        ctx = self._context  # type: ignore[attr-defined]
+        self.sock = ctx.wrap_socket(self.sock, server_hostname=host,
+                                    do_handshake_on_connect=False)
+        _track(self.sock)
+        self.sock.do_handshake()
+
+
+class _TrackedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req: Any) -> Any:
+        return self.do_open(_TrackedHTTPConnection, req)
+
+
+class _TrackedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req: Any) -> Any:
+        return self.do_open(_TrackedHTTPSConnection, req,
+                            context=self._context)  # type: ignore[attr-defined]
+
+
+def _abort_io(socks: list) -> None:
+    """End in-flight I/O on ``socks`` from ANOTHER thread: ``shutdown`` wakes a thread blocked
+    in recv/send on them (it returns or raises at once), ``close`` releases the descriptor."""
+    for sk in socks:
+        try:
+            sk.shutdown(socket.SHUT_RDWR)
+        except (OSError, ValueError):
+            pass
+        try:
+            sk.close()
+        except (OSError, ValueError):
+            pass
+
+
 def _default_open(req: urllib.request.Request, timeout: float, context: ssl.SSLContext | None = None) -> Any:
     # build a fresh opener with redirects DISABLED (+ the caller's mTLS context for https workers) rather
     # than urlopen's default opener, which would auto-follow a worker's redirect and leak the auth headers.
@@ -61,9 +235,10 @@ def _default_open(req: urllib.request.Request, timeout: float, context: ssl.SSLC
     # private/direct-reach, and routing the /detonate body + X-aws-proxy-auth through an env proxy would
     # leak them in cleartext for http:// workers. (Worker EGRESS proxying is the netpolicy httpproxy driver
     # injected into the WORKER's env -- independent of this dispatcher-side transport opener.)
-    handlers: list[Any] = [_NoRedirect(), urllib.request.ProxyHandler({})]
-    if context is not None:
-        handlers.append(urllib.request.HTTPSHandler(context=context))
+    # The TRACKED handlers register each connection's socket (see _open_bounded); with no context
+    # the HTTPS handler builds urllib's own default one, exactly as the stock handler would.
+    handlers: list[Any] = [_NoRedirect(), urllib.request.ProxyHandler({}),
+                           _TrackedHTTPHandler(), _TrackedHTTPSHandler(context=context)]
     return urllib.request.build_opener(*handlers).open(req, timeout=timeout)  # noqa: S310 (url is host-built)
 
 
@@ -105,6 +280,17 @@ class WorkerBusy(RuntimeError):
     pressure, NOT a job failure -- the dispatcher requeues (like NoWarmSlot) instead of FAILing the job."""
 
 
+class WorkerLacksEgress(RuntimeError):
+    """The agent answered 422 ``egress_unavailable``: this job's net policy grants egress and the
+    worker cannot provide it (every macOS worker; a Linux one declared
+    ``BLASTBOX_WORKER_AGENT_EGRESS=0``). Nothing ran on the worker.
+
+    A PLACEMENT error, so neither the worker's fault nor the sample's: the job fails with a
+    reason that names the fix, and the slot is released CLEAN -- it did exactly what it should.
+    Before this, a macOS sandbox logged "network stays DENIED" and the job came back as an
+    ``ok`` result that had never reached the network."""
+
+
 class ParamsTooLargeForRemote(RuntimeError):
     """The forwarded per-job params serialize to a header larger than the stdlib HTTP line limit, so the
     worker would reject the request before parsing them. Fail fast with an actionable error."""
@@ -115,6 +301,16 @@ class RemoteReadTimeout(RuntimeError):
     kept the stream open). Abort so the validate finally can release the slot instead of pinning it."""
 
 
+class ProbeNotAttempted(RemoteReadTimeout):
+    """The exchange never REACHED the worker: this host's name resolution is stalled or its
+    lookup budget is exhausted, or the deadline passed before a connection was even started.
+
+    That is a LOCAL condition, not an answer from the worker -- the same rule as local
+    resource exhaustion (issue #77): a probe must report it as "no verdict" (None), never as
+    "the worker is unhealthy", or one resolver incident evicts a healthy hostname-based fleet.
+    A RemoteReadTimeout subclass, so the job path's existing handling is unchanged."""
+
+
 def _sanitized_failure(exc: Exception) -> str:
     """Map a transport/trust exception to a COARSE, non-sensitive reason for the job's error field
     (never the raw message -- it can carry hosts/paths/tokens)."""
@@ -122,6 +318,8 @@ def _sanitized_failure(exc: Exception) -> str:
     import urllib.error as _ue
     if isinstance(exc, RemoteOutputTooLarge):
         return "remote output exceeded configured limits"
+    if isinstance(exc, WorkerLacksEgress):
+        return EGRESS_PLACEMENT_ERROR
     if type(exc).__name__ == "OutputTrustError":
         return "remote output failed host trust validation"
     if isinstance(exc, (_ssl.SSLError,)):
@@ -129,6 +327,33 @@ def _sanitized_failure(exc: Exception) -> str:
     if isinstance(exc, (_ue.URLError, TimeoutError, ConnectionError, OSError)):
         return "remote worker transport error"
     return "remote job failed"
+
+
+#: The job error for a WorkerLacksEgress refusal. Names the fix: this is configuration, and the
+#: same job will fail the same way on every worker of the tier until it is corrected.
+EGRESS_PLACEMENT_ERROR = (
+    "worker cannot provide network egress, but this job's net policy requires it (the agent "
+    "refused before running anything). Serve egress-granting policies from workers whose "
+    "/healthz advertises egress -- macOS workers never do")
+
+
+#: Wall-clock cap on reading a worker's 422 refusal body (it is a few bytes of JSON).
+_REFUSAL_READ_S = 5.0
+
+
+def _egress_refusal(exc: urllib.error.HTTPError, deadline: float | None = None) -> bool:
+    """Is this HTTP error the agent's ``egress_unavailable`` refusal? Reads a BOUNDED body --
+    in size AND in wall-clock time (a worker trickling it must not hold the job's thread): it
+    is worker-controlled, and only its ``error`` field is consulted."""
+    if exc.code != 422:
+        return False
+    limit_at = time.monotonic() + _REFUSAL_READ_S
+    try:
+        raw = read_bounded(exc, 4096, limit_at if deadline is None else min(deadline, limit_at))
+        body = json.loads(raw or b"{}")
+    except (ValueError, OSError, AttributeError, RemoteOutputTooLarge, RemoteReadTimeout):
+        return False
+    return isinstance(body, dict) and body.get("error") == "egress_unavailable"
 
 
 def _check_params_header_size(params: dict[str, str] | None) -> None:
@@ -149,22 +374,54 @@ def _open_bounded(opener: Any, req: Any, timeout: float, context: Any, deadline:
     wall-clock ``deadline``, not just urllib's PER-OP socket timeout. A worker that slowly reads our request
     or trickles response headers would otherwise keep opener() blocked past the job budget while the daemon
     validate thread pins the claimed slot (the watchdog can fail the job but can't retire the slot). On
-    timeout raise RemoteReadTimeout so the caller's finally frees the slot promptly. The stuck opener runs
-    in a DAEMON thread so it never blocks process exit (a non-daemon executor thread with wait=False would)
-    and reaps on its own per-op socket timeout. HTTPError from opener (e.g. 409) is re-raised so the caller's
-    existing handling still fires."""
+    timeout raise RemoteReadTimeout so the caller's finally frees the slot promptly. HTTPError from opener
+    (e.g. 409) is re-raised so the caller's existing handling still fires.
+
+    GIVING UP MUST END THE I/O. The opener runs in a daemon thread, and merely abandoning it was a leak:
+    a worker trickling bytes faster than the per-op socket timeout keeps that thread (and its socket)
+    blocked forever, and the recurring /healthz and capability probes abandoned another one on every
+    tick until the dispatcher ran out of threads or descriptors. So the connection's sockets are
+    registered (``_TrackedHTTP(S)Connection``) and, on expiry, shut down and closed from here: the
+    blocked recv/send returns at once and the thread exits."""
     box: dict[str, Any] = {}
+    socks: list = []
+    cancelled = threading.Event()
 
     def _run() -> None:
+        _IO_REGISTRY.socks = socks
+        _IO_REGISTRY.deadline = deadline
+        _IO_REGISTRY.cancelled = cancelled
         try:
             box["resp"] = opener(req, timeout, context=context)
         except BaseException as exc:   # noqa: BLE001 -- surfaced to the caller below
             box["exc"] = exc
+        finally:
+            _IO_REGISTRY.socks = None
+            _IO_REGISTRY.deadline = None
+            _IO_REGISTRY.cancelled = None
 
     t = threading.Thread(target=_run, name="bb-open", daemon=True)
-    t.start()
+    try:
+        t.start()
+    except RuntimeError as exc:
+        # this process cannot start a thread: nothing was sent, and it says nothing about the
+        # worker -- the same "no verdict" as a stalled resolver
+        raise ProbeNotAttempted(f"could not start the exchange ({exc})") from None
     t.join(timeout=max(0.0, deadline - time.monotonic()))
     if t.is_alive():
+        cancelled.set()          # a connect not yet started (name resolution still running) won't
+        if socks:
+            _abort_io(socks)
+            t.join(timeout=1.0)  # it returns promptly once its socket is shut down
+        resp = box.get("resp")
+        if resp is not None:     # finished in the window between the deadline and the abort
+            with contextlib.suppress(Exception):
+                resp.close()
+        if not socks:
+            # No socket was ever created (sockets are registered BEFORE connect): the time went
+            # on resolving the name, i.e. on THIS host -- not an answer from the worker.
+            raise ProbeNotAttempted("the deadline passed before a connection to the worker "
+                                    "was started (name resolution)")
         raise RemoteReadTimeout("remote opener (connect/send/headers) exceeded the wall-clock deadline")
     if "exc" in box:
         raise box["exc"]
@@ -182,6 +439,54 @@ def _cap_read_timeout(src: Any, remaining: float) -> None:
         pass
 
 
+def _find_sock(src: Any) -> Any:
+    """The socket under a urllib/http.client response (or an HTTPError wrapping one), or None."""
+    obj = src
+    for _ in range(4):
+        sk = getattr(obj, "_sock", None)
+        if sk is not None:
+            return sk
+        nxt = getattr(obj, "raw", None) or getattr(obj, "fp", None)
+        if nxt is None or nxt is obj:
+            return None
+        obj = nxt
+    return None
+
+
+class _DeadlineGuard:
+    """Shut a response's socket down when ``deadline`` passes, from a timer thread.
+
+    The per-read checks below bound the time BETWEEN reads, and the socket timeout bounds each
+    idle gap -- but one read can still run past the deadline: a chunked body's ``read1`` calls
+    ``readline`` for the chunk-size line, and a worker trickling that line (or a long chunk
+    extension) keeps it returning bytes inside every socket timeout. Shutting the socket down
+    ends that read wherever it is. ``fired`` tells the caller the EOF it then sees is the
+    deadline, not the end of the body."""
+
+    def __init__(self, src: Any, deadline: float | None) -> None:
+        self.fired = False
+        self._timer: threading.Timer | None = None
+        sk = _find_sock(src) if deadline is not None else None
+        if sk is None or deadline is None:
+            return
+
+        def _fire() -> None:
+            self.fired = True
+            _abort_io([sk])
+
+        timer = threading.Timer(max(0.0, deadline - time.monotonic()), _fire)
+        timer.daemon = True
+        try:
+            timer.start()
+        except RuntimeError:      # cannot start a thread: the per-read checks still apply
+            return
+        self._timer = timer
+
+    def cancel(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+
+
 def _bounded_copy(src: Any, dst: Any, limit: int | None, deadline: float | None = None) -> int:
     """copyfileobj that aborts once ``limit`` bytes have been read (None = unbounded). When ``deadline``
     (a ``time.monotonic()`` value) is given, also aborts if the TOTAL wall-clock read exceeds it -- the
@@ -191,25 +496,64 @@ def _bounded_copy(src: Any, dst: Any, limit: int | None, deadline: float | None 
     is enforced both between AND during a blocking read."""
     total = 0
     read = getattr(src, "read1", None) or src.read
-    while True:
-        if deadline is not None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise RemoteReadTimeout(f"remote output read exceeded the {deadline:.0f}s wall-clock deadline")
-            _cap_read_timeout(src, remaining)   # bound THIS read to the remaining budget
-        try:
-            chunk = read(1024 * 1024)
-        except (TimeoutError, OSError) as exc:   # incl. socket.timeout from the capped read
-            if deadline is not None and time.monotonic() >= deadline:
-                raise RemoteReadTimeout("remote output read exceeded the wall-clock deadline") from exc
-            raise
-        if not chunk:
-            break
-        total += len(chunk)
-        if limit is not None and total > limit:
-            raise RemoteOutputTooLarge(f"remote output exceeded {limit} bytes")
-        dst.write(chunk)
+    guard = _DeadlineGuard(src, deadline)
+    try:
+        while True:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or guard.fired:
+                    raise RemoteReadTimeout(f"remote output read exceeded the {deadline:.0f}s wall-clock deadline")
+                _cap_read_timeout(src, remaining)   # bound THIS read to the remaining budget
+            try:
+                chunk = read(1024 * 1024)
+            except (TimeoutError, OSError, ValueError, http.client.HTTPException) as exc:
+                # incl. socket.timeout from the capped read, and whatever a read cut off by the
+                # guard's shutdown raises (a closed file, an incomplete chunk)
+                if deadline is not None and (guard.fired or time.monotonic() >= deadline):
+                    raise RemoteReadTimeout("remote output read exceeded the wall-clock deadline") from exc
+                raise
+            if guard.fired:
+                # the guard shut the socket: what reads as end-of-body is the deadline
+                raise RemoteReadTimeout("remote output read exceeded the wall-clock deadline")
+            if not chunk:
+                break
+            total += len(chunk)
+            if limit is not None and total > limit:
+                raise RemoteOutputTooLarge(f"remote output exceeded {limit} bytes")
+            dst.write(chunk)
+    finally:
+        guard.cancel()
     return total
+
+
+def read_bounded(src: Any, limit: int, deadline: float) -> bytes:
+    """Read a WORKER-CONTROLLED body under both a byte cap and a TOTAL wall-clock ``deadline``.
+
+    ``resp.read(n)`` is bounded in size but not in time: the socket timeout only limits each
+    idle gap, so a worker sending one byte just inside it keeps the read going indefinitely.
+    Raises :class:`RemoteOutputTooLarge` past ``limit`` and :class:`RemoteReadTimeout` past the
+    deadline (same machinery as the job-output read, :func:`_bounded_copy`)."""
+    import io
+
+    buf = io.BytesIO()
+    _bounded_copy(src, buf, limit, deadline=deadline)
+    return buf.getvalue()
+
+
+def open_bounded_get(url: str, headers: dict, timeout: float,
+                     context: ssl.SSLContext | None = None) -> tuple[Any, float]:
+    """``(response, deadline)`` for a GET whose connect + request + status/headers phase is held
+    to ``timeout`` of WALL-CLOCK time in total (:func:`_open_bounded`), not per socket op. The
+    caller reads any body with :func:`read_bounded` against the same deadline, so the whole
+    exchange with a worker -- which may trickle bytes -- is bounded by ``timeout``."""
+    deadline = time.monotonic() + timeout
+    req = urllib.request.Request(url, headers=headers, method="GET")  # noqa: S310 (host-built url)
+
+    def _open(r: Any, t: float, context: ssl.SSLContext | None = None) -> Any:
+        # resolved at CALL time (a test may swap _default_open); no context -> the plain call shape
+        return _default_open(r, t) if context is None else _default_open(r, t, context=context)
+
+    return _open_bounded(_open, req, timeout, context, deadline), deadline
 
 
 def dispatch_ssl_context_from_env(get: Callable[[str], str | None] = os.environ.get) -> ssl.SSLContext | None:
@@ -245,13 +589,19 @@ def make_tls_probe(ssl_context: ssl.SSLContext | None) -> "Callable[[str, dict, 
     """A health-probe (``(url, headers, timeout) -> bool | None``; None = could not ask) that carries the client (m)TLS context, so a
     pool's ``/healthz`` check works against ``https://`` workers. Matches the ``HttpProbe`` seam shape."""
     def probe(url: str, headers: dict, timeout: float) -> "bool | None":
-        req = urllib.request.Request(url, headers=headers, method="GET")  # noqa: S310 (host-built url)
         try:
             # no-redirect opener: a worker answering /healthz with a 3xx must NOT be followed (it would
             # re-send X-aws-proxy-auth to the Location -- and on a downgrade to http:// the mTLS context
             # wouldn't apply, so the token would go out in the clear). A 3xx -> HTTPError -> False below.
-            with _default_open(req, timeout, context=ssl_context) as resp:
+            # ...and held to a WALL-CLOCK deadline (open_bounded_get): a worker trickling its
+            # status line / headers must not pin the pool's health tick past the probe timeout.
+            resp, _deadline = open_bounded_get(url, headers, timeout, ssl_context)
+            with resp:
                 return 200 <= resp.status < 300
+        except ProbeNotAttempted:
+            return None       # never reached the worker (local resolver): no verdict
+        except RemoteReadTimeout:
+            return False      # it answered, too slowly: a verdict, like a socket timeout
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
             # Same tri-state as _default_http_probe: None = we could not even ASK (local resource
             # exhaustion), False = the box answered and the answer was no. This probe is the DEFAULT
@@ -477,6 +827,13 @@ def detonate_remote(
             # Other 4xx/5xx are real failures and propagate.
             if exc.code == 409:
                 raise WorkerBusy(f"worker busy (409) at {url}") from exc
+            # Only when THIS job asked for egress (the host-owned BLASTBOX_NET_EGRESS param):
+            # the body is worker-controlled, and honouring the refusal releases the worker CLEAN
+            # with fault="job". A worker answering it for a sealed job is broken or lying, and
+            # must take the ordinary failure path (and its streak), not a free pass.
+            if (params or {}).get("BLASTBOX_NET_EGRESS") == "1" \
+                    and _egress_refusal(exc, read_deadline):
+                raise WorkerLacksEgress(f"worker at {url} cannot provide egress (422)") from exc
             raise
         with resp_cm as resp, tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024) as spool:
             _bounded_copy(resp, spool, stream_cap, deadline=read_deadline)
@@ -604,6 +961,24 @@ def make_remote_validate(
             # Propagate so the dispatcher requeues the job (like NoWarmSlot); the finally still
             # releases this slot DIRTY, quarantining the box so it is not immediately re-offered.
             raise
+        except ProbeNotAttempted:
+            # The request never REACHED the worker: this dispatcher's name resolution is stalled
+            # or its lookup budget is spent (no socket was even created). Not evidence about the
+            # worker, the slot or its tier -- a "worker" fault here let a local resolver incident
+            # burn out healthy static workers and advance cascade repair. Release CLEAN with no
+            # attribution and propagate, so the dispatcher REQUEUES the job (nothing ran).
+            fault = "unknown"
+            dirty = False
+            raise
+        except WorkerLacksEgress:
+            # Nothing ran: the agent refused on the job's net policy before the engine saw a
+            # byte. A placement fault -- not evidence about the worker (it answered exactly as
+            # it should) and not about the sample -- so release CLEAN and fail the job with a
+            # reason that names the fix. "job" so the answer clears any streak before it.
+            fault = "job"
+            dirty = False
+            _log.error("remote_http: %s", EGRESS_PLACEMENT_ERROR)
+            return {"error": EGRESS_PLACEMENT_ERROR}, False
         except ClaimLost as exc:
             # A PEER already reclaimed or finished this job -- our claim simply outlived itself.
             # The worker did nothing wrong, so attributing it as a wedge let two stale attempts

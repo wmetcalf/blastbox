@@ -752,6 +752,15 @@ The fleet is finite, so **size the pool to it**: keep `BLASTBOX_POOL_CEILING <= 
 size too. This is the "bare-metal worker pool" shape — the same warm-pool scaler + generic agent as the
 cloud tiers, just pointed at machines you already own.
 
+**Egress placement:** when the engine's provisioned net policy grants egress, the pool only claims
+workers whose `/healthz` advertises `"egress": true` (see `BLASTBOX_WORKER_AGENT_EGRESS`); a worker
+that says `false` — every macOS worker — or says nothing (an agent from before the field) is skipped,
+and the dispatcher refuses to start if every worker answered and none can. Other network tiers do not
+place by it; there the agent's own 422 refusal fails the job with a clear reason instead.
+
+**Workers behind NAT:** use `blastbox worker-link` (below, and DEPLOYMENT.md 3b) and list the
+workers by their overlay address, e.g. `BLASTBOX_STATIC_WORKERS=https://10.78.0.5:8765`.
+
 **mTLS:** when `BLASTBOX_DISPATCH_TLS_CA` is set (see *Worker HTTP agent + mTLS*), the pool automatically
 probes `/healthz` and drives the transport over **https + client-cert mTLS** — declare workers as
 `https://host:port` (bare `host:port` entries are upgraded to `https` in TLS mode). The pool exposes the
@@ -818,6 +827,7 @@ plain HTTP for a *trusted private VPC* — do not expose it to the public intern
 | `BLASTBOX_WORKER_AGENT_TLS_CERT` / `_TLS_KEY` | — | Serve **HTTPS** with this server cert/key (mint via `blastbox pki issue-server`). |
 | `BLASTBOX_WORKER_AGENT_CLIENT_CA` | — | Require a **client** cert signed by this CA (**mTLS**) — the cryptographic allowed-caller gate. |
 | `BLASTBOX_WORKER_AGENT_ALLOW_CIDRS` | — | Comma-list of CIDRs allowed to POST `/detonate` (peer-IP allowlist; 403 otherwise). Defense-in-depth with mTLS + the SG. |
+| `BLASTBOX_WORKER_AGENT_EGRESS` | `1` (Linux) / `0` (macOS, fixed) | Whether a job whose net policy grants egress can get it on this worker. Advertised on `/healthz` as `"egress"`; a job that needs egress on a worker that says `0` is **refused with 422 `egress_unavailable`** before the engine runs (the dispatcher fails it with that reason and releases the worker clean). macOS has no egress rooter, so a Mac always says `0` and setting `1` there stops the agent at startup. Set `0` on a Linux worker with no exit wired. |
 
 **Dispatcher (client) side** — build the mTLS context the transport presents:
 
@@ -892,6 +902,35 @@ Any bridge `apply` relocates carries its pinned addresses with it, so after a
 reallocation **update every personality's `gateway=`** to the new
 `BLASTBOX_EGRESS_VPN_GATEWAY_IP` — they are separate sources of truth and nothing
 reconciles them.
+
+### Worker link (`blastbox worker-link`)
+
+A WireGuard control link so a dispatcher can reach `http_agent` workers behind NAT / one-way
+firewalls: the worker dials the host, the dispatcher reaches `https://<worker overlay ip>:8765`.
+SEPARATE from the egress overlay above (own interface, prefix, port, env file and nftables table);
+see DEPLOYMENT.md 3b. Written to `/etc/blastbox/worker-link.env` by `worker-link init` (flags
+`--iface`, `--overlay-net`, `--host-ip`, `--port`, `--agent-port`, `--endpoint`,
+`--dispatcher-source`) and read by every other host subcommand; an explicit environment value
+overrides the file. Contains no key material.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BLASTBOX_WORKER_LINK_IF` | `wtwg0` | link interface (≤15 chars); must differ from the egress interface |
+| `BLASTBOX_WORKER_LINK_OVERLAY_NET` | `10.78.0.0/24` | link overlay, IPv4 RFC 1918 only, /16–/29; must not overlap the egress overlay or any route the host has |
+| `BLASTBOX_WORKER_LINK_HOST_IP` | first address of the overlay | the host's overlay address; workers' agents allow only this /32 |
+| `BLASTBOX_WORKER_LINK_WG_PORT` | `51822` | host UDP listen port; must differ from the egress port, and be reachable from the workers |
+| `BLASTBOX_WORKER_LINK_AGENT_PORT` | `8765` | the agents' TCP port — the ONLY port the firewall lets the host open to a worker |
+| `BLASTBOX_WORKER_LINK_ENDPOINT` | — | `host[:port]` workers dial (this host's public address); required before `add` |
+| `BLASTBOX_WORKER_LINK_DISPATCHER_SOURCES` | — | comma-list of CIDRs a **containerised** dispatcher connects from (its docker network); admitted into the link and MASQUERADEd to the host's overlay address. Empty = only a dispatcher on the host itself. `0.0.0.0/0` is refused. A later `init --dispatcher-source` replaces the list; `--no-dispatcher-source` clears it |
+
+Worker side: `sudo blastbox worker-link keygen --ip <addr>` (WireGuard + TLS keys, root-only,
+and a CSR whose only SAN is that address), then `join --bundle <file> [--agent-user U]`, `status`,
+`leave [--purge]`. Linux uses `wg-quick@<iface>` plus the nftables table
+`inet blastbox_worker_link_peer`; macOS a root LaunchDaemon (`io.blastbox.worker-link.<iface>`) with
+a pf anchor under `com.apple/`. Host: `init`, `add <name> --public-key K --csr F [--ip A] [--days N]
+[--pki-dir D] [--out F]`, `remove`, `list`, `status`, `teardown`. `status` exits 0 only when the
+interface is up, the firewall was read back from the kernel complete, and (on a worker) the
+handshake is fresh; without root it reports UNVERIFIED and exits 1.
 
 ### Node grants (who this node may run work for)
 

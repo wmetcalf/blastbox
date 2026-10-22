@@ -1,0 +1,772 @@
+"""Placement by advertised egress: a static pool serving an egress-granting policy only claims
+workers whose /healthz says ``"egress": true``, and a tier that could never place such a job
+refuses to start. The agent's own 422 refusal is the backstop for runtimes that do not place
+(tested in tests/worker/test_agent_egress_capability.py)."""
+from __future__ import annotations
+
+import pytest
+
+from blastbox.host.runtime.static_pool import (
+    StaticPoolConfig,
+    StaticPoolExhausted,
+    StaticPoolNoEgress,
+    StaticPoolRuntime,
+    StaticWorker,
+)
+
+
+def _rt(adverts: dict[str, object], *, healthy=None) -> StaticPoolRuntime:
+    """adverts: host -> the /healthz body's "egress" value (missing key = legacy agent),
+    or None = could not ask."""
+    workers = tuple(StaticWorker.parse(h, default_port=8765, default_token=None) for h in adverts)
+
+    def caps(url, headers, timeout):
+        host = url.split("//")[1].split(":")[0]
+        v = adverts[host]
+        if v is None:
+            return None
+        return {} if v == "legacy" else {"ok": True, "egress": v}
+
+    return StaticPoolRuntime(StaticPoolConfig(workers=workers),
+                             http_probe=lambda u, h, t: True if healthy is None else healthy(u),
+                             capability_probe=caps)
+
+
+def test_without_an_egress_policy_capability_is_never_asked():
+    asked = []
+    rt = StaticPoolRuntime(StaticPoolConfig(workers=(StaticWorker(host="mac1"),)),
+                           http_probe=lambda u, h, t: True,
+                           capability_probe=lambda *a: asked.append(a) or {"egress": False})
+    assert rt.spawn().ip == "mac1" and asked == []
+
+
+def test_an_egress_tier_skips_workers_that_cannot_provide_it():
+    rt = _rt({"mac1": False, "legacy": "legacy", "linux1": True})
+    rt.require_egress()
+    assert rt.spawn().ip == "linux1"
+
+
+def test_a_legacy_agent_that_advertises_nothing_is_not_trusted_with_egress():
+    rt = _rt({"old": "legacy"})
+    rt.require_egress()
+    with pytest.raises(StaticPoolNoEgress):
+        rt.spawn()
+
+
+def test_only_incapable_workers_is_a_loud_configuration_fault():
+    rt = _rt({"mac1": False, "mac2": False})
+    rt.require_egress()
+    with pytest.raises(StaticPoolNoEgress, match="advertises egress"):
+        rt.spawn()
+
+
+def test_an_unanswered_capability_question_is_not_a_verdict():
+    rt = _rt({"mac1": None})
+    rt.require_egress()
+    with pytest.raises(StaticPoolExhausted):       # backpressure, not a fault
+        rt.spawn()
+
+
+def test_the_census_separates_yes_no_and_unknown():
+    rt = _rt({"a": True, "b": False, "c": "legacy", "d": None})
+    assert rt.egress_census() == (1, 2, 1)
+
+
+def test_the_dispatcher_refuses_to_start_a_tier_that_can_never_place_egress():
+    from blastbox.host.runtime.vm_dispatch import _place_egress
+
+    rt = _rt({"mac1": False, "mac2": False})
+    with pytest.raises(ValueError, match="none of its 2 static worker"):
+        _place_egress(rt, "static")
+
+
+def test_a_partly_capable_fleet_starts_and_places_only_on_the_capable():
+    from blastbox.host.runtime.vm_dispatch import _place_egress
+
+    rt = _rt({"mac1": False, "linux1": True})
+    _place_egress(rt, "static")
+    assert rt.spawn().ip == "linux1"
+
+
+def test_an_unreachable_fleet_does_not_block_startup():
+    from blastbox.host.runtime.vm_dispatch import _place_egress
+
+    _place_egress(_rt({"mac1": None}), "static")
+
+
+def test_other_runtimes_rely_on_the_agents_refusal():
+    from types import SimpleNamespace
+
+    from blastbox.host.runtime.vm_dispatch import _place_egress
+
+    _place_egress(SimpleNamespace(), "aws")          # no attributes touched, no raise
+
+
+def test_a_fleet_that_is_merely_down_at_startup_is_unknown_not_incapable(monkeypatch):
+    """The default capability probe must not read "unreachable" as "advertises no egress":
+    that made a fleet that was down at dispatcher start look permanently unable to serve the
+    policy, and the dispatcher refused to start."""
+    import urllib.error
+
+    from blastbox.host.runtime import remote_http
+    from blastbox.host.runtime.static_pool import make_capability_probe
+
+    def refused(req, timeout, context=None):
+        raise urllib.error.URLError(ConnectionRefusedError(61, "refused"))
+
+    monkeypatch.setattr(remote_http, "_default_open", refused)
+    rt = StaticPoolRuntime(StaticPoolConfig(workers=(StaticWorker(host="mac1"),)),
+                           http_probe=lambda u, h, t: False,
+                           capability_probe=make_capability_probe(None))
+    assert rt.egress_census() == (0, 0, 1)
+
+
+def test_a_busy_capable_worker_is_backpressure_not_a_fault():
+    """REGRESSION (review): with the only capable worker CLAIMED, the free set is all Macs --
+    that is the fleet being busy, and the next release frees it."""
+    rt = _rt({"mac1": False, "linux1": True})
+    rt.require_egress()
+    assert rt.spawn().ip == "linux1"
+    with pytest.raises(StaticPoolExhausted):
+        rt.spawn()
+
+
+def test_an_unanswered_capable_worker_is_not_a_fault_either():
+    rt = _rt({"mac1": False, "linux1": None})
+    rt.require_egress()
+    with pytest.raises(StaticPoolExhausted):
+        rt.spawn()
+
+
+def test_an_odd_responder_does_not_crash_the_census():
+    import http.client
+
+    def boom(url, headers, timeout):
+        raise http.client.BadStatusLine("garbage")
+
+    rt = StaticPoolRuntime(StaticPoolConfig(workers=(StaticWorker(host="x"),)),
+                           http_probe=lambda u, h, t: True, capability_probe=boom)
+    assert rt.egress_census() == (0, 0, 1)
+
+
+# ------------------------------------------------------------------ review round 2
+
+def test_the_startup_census_is_bounded_not_one_timeout_per_unreachable_worker():
+    """REGRESSION (review): the census probed every worker SERIALLY, so one healthy box plus
+    99 unreachable ones delayed dispatcher construction by ~99 probe timeouts (minutes at the
+    5 s default). It now asks concurrently and waits about one timeout in total; a straggler is
+    UNKNOWN, which is not a verdict."""
+    import threading
+    import time
+
+    hosts = ["linux0"] + [f"dead{i}" for i in range(99)]
+    workers = tuple(StaticWorker.parse(h, default_port=8765, default_token=None) for h in hosts)
+    peak = {"now": 0, "max": 0}
+    lock = threading.Lock()
+
+    def caps(url, headers, timeout):
+        host = url.split("//")[1].split(":")[0]
+        if host == "linux0":
+            return {"ok": True, "egress": True}
+        with lock:
+            peak["now"] += 1
+            peak["max"] = max(peak["max"], peak["now"])
+        time.sleep(timeout)             # an unreachable box: the probe runs out its timeout
+        with lock:
+            peak["now"] -= 1
+        return None
+
+    rt = StaticPoolRuntime(StaticPoolConfig(workers=workers, probe_timeout_s=0.25),
+                           http_probe=lambda u, h, t: True, capability_probe=caps)
+    t0 = time.monotonic()
+    yes, no, unknown = rt.egress_census()
+    elapsed = time.monotonic() - t0
+    assert (yes, no, yes + no + unknown) == (1, 0, 100)
+    assert elapsed < 3.0, elapsed               # serially: 99 x 0.25 s ~ 25 s
+    assert peak["max"] <= StaticPoolRuntime.CENSUS_PARALLELISM
+
+
+class _Slot:
+    def __init__(self, sid):
+        self.slot_id = sid
+
+
+class _AwsTier:
+    """A tier that builds its own workers and does not advertise per worker."""
+    dispatch_style = "network"
+    ssl_context = None
+
+    def __init__(self):
+        self.spawned = 0
+
+    def spawn(self):
+        self.spawned += 1
+        return _Slot(f"aws-{self.spawned}")
+
+
+def test_a_cascade_passes_the_egress_requirement_to_its_static_tiers_including_late_ones():
+    """REGRESSION (review): `_place_egress` returned early for anything but a bare
+    StaticPoolRuntime, so in a static -> AWS cascade the static tier never learned the policy
+    grants egress and handed the job to a macOS worker, which refused it (422) -- a permanent
+    failure instead of falling through to capable capacity. Tiers admitted LATER (deferred at
+    startup) must be told as well."""
+    from blastbox.host.runtime.cascade import CascadingRuntime, DeferredTier, Tier
+    from blastbox.host.runtime.vm_dispatch import _place_egress
+
+    macs = _rt({"mac1": False})
+    late = _rt({"mac2": False})
+    aws = _AwsTier()
+    cascade = CascadingRuntime(
+        [Tier("static", macs, 2), Tier("aws-ec2", aws, 2)],
+        deferred=[DeferredTier(name="static", capacity=2, reason="throttled",
+                               build=lambda: late, pos=2, dispatch_style="network")],
+        admit_retry_s=0.0)
+    _place_egress(cascade, "cascade")                  # AWS present: no fleet verdict, no raise
+    assert macs._require_egress is True
+    slot = cascade._spawn_from_admitted()              # the Mac is skipped, AWS takes the job
+    assert slot.slot_id == "aws-1" and aws.spawned == 1
+    assert late._require_egress is False
+    cascade._admit_probe(list(cascade._deferred))
+    assert cascade.tiers[-1].runtime is late and late._require_egress is True
+
+
+def test_an_all_static_cascade_that_can_never_place_egress_refuses_to_start():
+    from blastbox.host.runtime.cascade import CascadingRuntime, Tier
+    from blastbox.host.runtime.vm_dispatch import _place_egress
+
+    cascade = CascadingRuntime([Tier("static", _rt({"mac1": False}), 1),
+                                Tier("static", _rt({"mac2": False}), 1)])
+    with pytest.raises(ValueError, match="none of its 2 static worker"):
+        _place_egress(cascade, "cascade")
+    ok = CascadingRuntime([Tier("static", _rt({"mac1": False}), 1),
+                           Tier("static", _rt({"linux1": True}), 1)])
+    _place_egress(ok, "cascade")
+    assert ok._spawn_from_admitted().ip == "linux1"
+
+
+# ------------------------------------------------------------------ review round 4
+
+def test_a_health_unknown_worker_is_unknown_egress_capacity_not_a_no():
+    """REGRESSION (review): with one healthy `egress: false` worker and one whose health probe
+    could not even be ATTEMPTED (None: local EMFILE/ENOMEM), the second set no flag, so spawn
+    raised StaticPoolNoEgress -- a configuration FAULT, advancing cascade repair streaks -- as
+    though every worker had answered no."""
+    rt = _rt({"mac1": False, "linux1": True},
+             healthy=lambda url: None if "linux1" in url else True)
+    rt.require_egress()
+    with pytest.raises(StaticPoolExhausted):
+        rt.spawn()
+    # ...whereas a fleet that really did all answer "no" is still the loud fault
+    rt = _rt({"mac1": False, "mac2": False})
+    rt.require_egress()
+    with pytest.raises(StaticPoolNoEgress):
+        rt.spawn()
+
+
+def _trickle_server(chunks: "list[bytes]", gap: float):
+    """A one-request HTTP server that sends ``chunks`` with ``gap`` seconds between them --
+    each gap well inside a socket timeout, the total far beyond it."""
+    import socket
+    import threading
+    import time
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(4)
+    stop = threading.Event()
+
+    def serve():
+        srv.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                continue
+            with conn:
+                try:
+                    conn.recv(65536)
+                    for c in chunks:
+                        if stop.is_set():
+                            break
+                        conn.sendall(c)
+                        time.sleep(gap)
+                except OSError:
+                    pass
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    return f"http://127.0.0.1:{srv.getsockname()[1]}", stop, srv
+
+
+def test_a_trickled_capability_body_is_cut_off_by_a_wall_clock_deadline():
+    """REGRESSION (review): `resp.read(65536)` is bounded in size, not time -- the socket
+    timeout only limits each idle gap -- so a worker sending its /healthz body one byte at a
+    time kept the read (and the spawn thread calling it) going indefinitely."""
+    import time
+
+    from blastbox.host.runtime.static_pool import make_capability_probe
+
+    head = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4000\r\n\r\n"
+    url, stop, srv = _trickle_server([head] + [b" "] * 4000, gap=0.05)
+    try:
+        t0 = time.monotonic()
+        assert make_capability_probe(None)(url + "/healthz", {}, 0.5) is None
+        assert time.monotonic() - t0 < 2.0             # unbounded: 4000 x 0.05 s = 200 s
+    finally:
+        stop.set()
+        srv.close()
+
+
+@pytest.mark.parametrize("probe_name", ["plain", "tls-seam"])
+def test_a_trickled_health_answer_is_cut_off_too(probe_name):
+    """The same pattern in the /healthz HEALTH probes (status line + headers trickled): held to
+    the probe timeout of wall-clock time, and read as an answer that came too slowly (False)."""
+    import time
+
+    from blastbox.host.runtime.aws_worker import _default_http_probe
+    from blastbox.host.runtime.remote_http import make_tls_probe
+
+    status = b"HTTP/1.1 200 OK\r\n" + b"X-Pad: " + b"a" * 3000 + b"\r\n\r\n"
+    url, stop, srv = _trickle_server([status[i:i + 1] for i in range(len(status))], gap=0.05)
+    probe = _default_http_probe if probe_name == "plain" else make_tls_probe(None)
+    try:
+        t0 = time.monotonic()
+        assert probe(url + "/healthz", {}, 0.5) is False
+        assert time.monotonic() - t0 < 2.0
+    finally:
+        stop.set()
+        srv.close()
+
+
+def test_a_trickled_refusal_body_does_not_hold_the_job_thread(monkeypatch):
+    """The 422 refusal body is worker-controlled too: `exc.read(4096)` on a buffered stream
+    blocks until 4096 bytes arrive, however slowly they trickle."""
+    import io
+    import time
+    import urllib.error
+
+    from blastbox.host.runtime import remote_http
+
+    class Trickle(io.RawIOBase):
+        def readable(self):
+            return True
+
+        def readinto(self, b):
+            time.sleep(0.02)
+            b[0:1] = b" "
+            return 1
+
+    monkeypatch.setattr(remote_http, "_REFUSAL_READ_S", 0.3, raising=False)
+    exc = urllib.error.HTTPError("http://w/detonate", 422, "Unprocessable", {},
+                                 io.BufferedReader(Trickle(), buffer_size=1))
+    t0 = time.monotonic()
+    assert remote_http._egress_refusal(exc) is False
+    assert time.monotonic() - t0 < 1.5            # 4096 bytes x 0.02 s unbounded = 80 s
+
+
+# ------------------------------------------------------------------ review round 7
+
+def test_repeated_probes_against_a_trickling_worker_do_not_leak_threads():
+    """REGRESSION (review): a timed-out opener was only ABANDONED -- its daemon thread stayed
+    blocked in urllib for as long as the worker kept trickling bytes, so every recurring
+    /healthz or capability probe leaked another thread and socket. The deadline now shuts the
+    connection's socket down, so the opener thread returns."""
+    import socket
+    import threading
+    import time
+
+    from blastbox.host.runtime.aws_worker import _default_http_probe
+    from blastbox.host.runtime.static_pool import make_capability_probe
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(64)
+    stop = threading.Event()
+
+    def trickle(conn):
+        with conn:
+            try:
+                conn.recv(65536)
+                conn.sendall(b"HTTP/1.1 200 OK\r\n")
+                while not stop.is_set():          # a header that never ends, one byte at a time
+                    conn.sendall(b"X")
+                    time.sleep(0.02)
+            except OSError:
+                pass                              # the client cut us off: what we want
+
+    def serve():
+        srv.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                continue
+            threading.Thread(target=trickle, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=serve, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.getsockname()[1]}/healthz"
+    cap = make_capability_probe(None)
+
+    def openers() -> int:
+        return sum(1 for t in threading.enumerate() if t.name == "bb-open" and t.is_alive())
+
+    try:
+        base = openers()
+        for _ in range(8):
+            assert _default_http_probe(url, {}, 0.3) is False
+            assert cap(url, {}, 0.3) is None
+        deadline = time.monotonic() + 3.0
+        while openers() > base and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert openers() <= base, f"{openers() - base} opener threads leaked over 16 probes"
+    finally:
+        stop.set()
+        srv.close()
+
+
+# ------------------------------------------------------------------ review round 8
+
+def test_a_stalled_name_lookup_does_not_go_on_to_connect_after_the_deadline(monkeypatch):
+    """REGRESSION (review): the socket was registered only after connect() returned, so a
+    stalled lookup or connect could not be aborted: once the lookup finished, the abandoned
+    thread went on to connect -- here into a trickling worker -- and stayed blocked. Now an
+    exchange given up on at its deadline does not connect at all."""
+    import socket
+    import threading
+    import time
+
+    from blastbox.host.runtime.aws_worker import _default_http_probe
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    stop = threading.Event()
+    accepted = []
+
+    def serve():
+        srv.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                continue
+            accepted.append(conn)
+            def trickle(c=conn):
+                try:
+                    c.recv(65536)
+                    c.sendall(b"HTTP/1.1 200 OK\r\n")
+                    while not stop.is_set():
+                        c.sendall(b"X")
+                        time.sleep(0.02)
+                except OSError:
+                    pass
+            threading.Thread(target=trickle, daemon=True).start()
+
+    threading.Thread(target=serve, daemon=True).start()
+    port = srv.getsockname()[1]
+    real_gai = socket.getaddrinfo
+
+    def slow_gai(host, *a, **kw):
+        if host == "slow-dns.invalid":
+            time.sleep(1.0)                          # resolution outlives the 0.3 s deadline
+            return real_gai("127.0.0.1", *a, **kw)
+        return real_gai(host, *a, **kw)
+
+    monkeypatch.setattr(socket, "getaddrinfo", slow_gai)
+    try:
+        t0 = time.monotonic()
+        # never reached the worker (this host's resolver): NO verdict, not "unhealthy"
+        assert _default_http_probe(f"http://slow-dns.invalid:{port}/healthz", {}, 0.3) is None
+        assert time.monotonic() - t0 < 1.0
+        time.sleep(1.5)                              # the lookup has long returned by now
+        alive = [t for t in threading.enumerate() if t.name == "bb-open" and t.is_alive()]
+        assert accepted == [] and alive == []
+    finally:
+        stop.set()
+        srv.close()
+
+
+def test_each_connect_is_capped_by_the_exchange_deadline(monkeypatch):
+    """Black-holed addresses: each connect gets min(per-op timeout, time left), and the
+    socket is registered (abortable) before the blocking connect starts."""
+    import socket
+    import time
+
+    from blastbox.host.runtime import remote_http
+
+    timeouts, registered_before_connect = [], []
+    socks: list = []
+
+    class FakeSock:
+        def __init__(self, *a):
+            pass
+
+        def settimeout(self, t):
+            timeouts.append(t)
+
+        def bind(self, a):
+            pass
+
+        def connect(self, sa):
+            registered_before_connect.append(self in socks)
+            raise TimeoutError("black hole")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 80)),
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.2", 80))])
+    monkeypatch.setattr(socket, "socket", FakeSock)
+    remote_http._IO_REGISTRY.socks = socks
+    remote_http._IO_REGISTRY.deadline = time.monotonic() + 0.5
+    remote_http._IO_REGISTRY.cancelled = None
+    try:
+        with pytest.raises(OSError):
+            remote_http._tracked_create_connection(("w", 80), 30.0)
+    finally:
+        remote_http._IO_REGISTRY.socks = None
+        remote_http._IO_REGISTRY.deadline = None
+    assert timeouts and all(t <= 0.5 for t in timeouts), timeouts
+    assert registered_before_connect == [True, True]
+
+
+def test_a_stalled_resolver_does_not_pile_up_threads(monkeypatch):
+    """REGRESSION (review): getaddrinfo ran inline in each probe's opener thread, before any
+    socket existed, so a probe abandoned at its deadline left that thread blocked in the
+    lookup -- one more per recurring probe. Lookups now run in ONE resolver thread per host
+    (shared), at most _MAX_RESOLVERS in total, and a probe waits only until its deadline."""
+    import socket
+    import threading
+    import time
+
+    from blastbox.host.runtime.aws_worker import _default_http_probe
+
+    release = threading.Event()
+    real_gai = socket.getaddrinfo
+
+    def stalled(host, *a, **kw):
+        if str(host).endswith(".stall.invalid"):
+            release.wait(10)
+            raise socket.gaierror(socket.EAI_AGAIN, "stalled")
+        return real_gai(host, *a, **kw)
+
+    def alive(name):
+        return sum(1 for t in threading.enumerate() if t.name == name and t.is_alive())
+
+    monkeypatch.setattr(socket, "getaddrinfo", stalled)
+    base_open, base_res = alive("bb-open"), alive("bb-resolve")
+    try:
+        for _ in range(10):                    # the same worker, probed again and again
+            assert _default_http_probe("http://w1.stall.invalid:8765/healthz", {}, 0.15) is None
+        time.sleep(0.3)
+        assert alive("bb-open") <= base_open, "opener threads stuck in the lookup"
+        assert alive("bb-resolve") - base_res == 1     # ONE shared lookup for that host
+        from blastbox.host.runtime import remote_http
+        for i in range(2 * remote_http._MAX_RESOLVERS):
+            _default_http_probe(f"http://w{i}.x.stall.invalid:8765/healthz", {}, 0.05)
+        assert alive("bb-resolve") - base_res <= remote_http._MAX_RESOLVERS
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize("probe_name", ["plain", "tls-seam", "capability"])
+def test_an_exhausted_resolver_is_no_verdict_on_a_worker(monkeypatch, probe_name):
+    """REGRESSION (review): with the resolver cap full, a probe of another host raised a plain
+    TimeoutError, which the health probes read as False -- a resolver incident on THIS host
+    turned into "unhealthy" for every hostname-based worker, enough to evict them. It is now
+    ProbeNotAttempted: None from the health probes, None (unknown) from the capability probe."""
+    import socket
+    import threading
+
+    from blastbox.host.runtime import remote_http
+    from blastbox.host.runtime.aws_worker import _default_http_probe
+    from blastbox.host.runtime.static_pool import make_capability_probe
+
+    release = threading.Event()
+    real_gai = socket.getaddrinfo
+
+    def stalled(host, *a, **kw):
+        if str(host).endswith(".stall.invalid"):
+            release.wait(10)
+            raise socket.gaierror(socket.EAI_AGAIN, "stalled")
+        return real_gai(host, *a, **kw)
+
+    monkeypatch.setattr(socket, "getaddrinfo", stalled)
+    probe = {"plain": _default_http_probe, "tls-seam": remote_http.make_tls_probe(None),
+             "capability": make_capability_probe(None)}[probe_name]
+    try:
+        for i in range(remote_http._MAX_RESOLVERS):          # fill the cap with stalled lookups
+            _default_http_probe(f"http://fill{i}.stall.invalid:8765/healthz", {}, 0.05)
+        assert probe("http://healthy-worker.stall.invalid:8765/healthz", {}, 0.5) is None
+    finally:
+        release.set()
+
+
+def test_an_unreached_worker_is_not_convicted_on_the_job_path(tmp_path, monkeypatch):
+    """REGRESSION (review): ProbeNotAttempted (this dispatcher's resolver stalled or its lookup
+    budget spent -- no request reached the worker) fell into make_remote_validate's generic
+    handler as fault="worker": a resolver incident burned out healthy static workers and
+    advanced cascade repair. It is released CLEAN, unattributed, and re-raised to requeue."""
+    from types import SimpleNamespace
+
+    from blastbox.host.runtime import remote_http
+
+    def unreached(*a, **kw):
+        raise remote_http.ProbeNotAttempted("8 name lookups already in flight")
+
+    monkeypatch.setattr(remote_http, "detonate_remote", unreached)
+    released = []
+    slot = SimpleNamespace(url="http://w1.example:8765", ip=None, auth_token=None,
+                           agent_port=8765)
+    validate = remote_http.make_remote_validate(
+        lambda: slot, lambda s, dirty=False, fault=None: released.append((dirty, fault)),
+        output_dir_for=lambda p: tmp_path / "o")
+    inp = tmp_path / "in.bin"
+    inp.write_bytes(b"x")
+    with pytest.raises(remote_http.ProbeNotAttempted):
+        validate(inp)
+    assert released == [(False, "unknown")]
+
+
+def test_the_dispatcher_requeues_a_job_whose_worker_was_never_reached(tmp_path):
+    from blastbox.host.jobs.base import Job, JobStatus
+    from blastbox.host.jobs.memory import InMemoryJobStore
+    from blastbox.host.runtime.remote_http import ProbeNotAttempted
+    from blastbox.host.runtime.vm_dispatch import VmJobDispatcher
+
+    store = InMemoryJobStore()
+    job = Job.new(engine="redtusk", filename="a.doc")
+    store.create(job)
+    d = tmp_path / job.job_id / "input"
+    d.mkdir(parents=True)
+    (d / "a.doc").write_bytes(b"x")
+
+    def unreached(path):
+        raise ProbeNotAttempted("resolver stalled")
+
+    VmJobDispatcher(store=store, job_root=tmp_path, validate=unreached)._process(
+        store.claim_next())
+    assert store.get(job.job_id).status is JobStatus.QUEUED       # requeued, not FAILED
+
+
+def test_a_census_that_cannot_start_threads_counts_workers_unknown(monkeypatch):
+    """REGRESSION (review): at the process's thread limit ThreadPoolExecutor.submit raises
+    RuntimeError; it escaped egress_census and aborted dispatcher construction although no
+    worker had answered "no". Unscheduled workers are now counted UNKNOWN."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from blastbox.host.runtime.vm_dispatch import _place_egress
+
+    real_submit = ThreadPoolExecutor.submit
+    calls = {"n": 0}
+
+    def limited(self, fn, *a, **kw):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise RuntimeError("can't start new thread")
+        return real_submit(self, fn, *a, **kw)
+
+    monkeypatch.setattr(ThreadPoolExecutor, "submit", limited)
+    rt = _rt({"mac1": False, "mac2": False, "mac3": False})
+    assert rt.egress_census() == (0, 1, 2)
+    calls["n"] = 0
+    _place_egress(rt, "static")                     # unknowns: no refusal to start
+
+
+def test_an_exchange_that_cannot_start_its_thread_is_no_verdict(monkeypatch):
+    """Sweep: the same resource limit inside a probe (the opener or resolver thread cannot
+    start) is local -- ProbeNotAttempted -> None, not "unhealthy"."""
+    import threading
+
+    from blastbox.host.runtime import remote_http
+    from blastbox.host.runtime.aws_worker import _default_http_probe
+
+    def no_threads(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(threading.Thread, "start", no_threads)
+    assert _default_http_probe("http://127.0.0.1:9/healthz", {}, 0.5) is None
+    assert remote_http.make_tls_probe(None)("http://w.example.invalid:9/healthz", {}, 0.5) is None
+
+
+def _chunked_framing_trickler():
+    """A server whose /healthz answers 200 CHUNKED, then trickles the chunk-size line (with a
+    long chunk extension) one byte at a time -- each byte well inside any socket timeout."""
+    import socket
+    import threading
+    import time
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    stop = threading.Event()
+
+    def handle(conn):
+        with conn:
+            try:
+                conn.recv(65536)
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                             b"Transfer-Encoding: chunked\r\n\r\n")
+                conn.sendall(b"2;")
+                for _ in range(400):                  # a chunk extension that never ends
+                    if stop.is_set():
+                        break
+                    conn.sendall(b"x")
+                    time.sleep(0.03)
+            except OSError:
+                pass
+
+    def serve():
+        srv.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                continue
+            threading.Thread(target=handle, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return f"http://127.0.0.1:{srv.getsockname()[1]}", stop, srv
+
+
+def test_a_trickled_chunk_framing_line_cannot_outrun_the_capability_deadline():
+    """REGRESSION (review): read_bounded() checks its deadline between reads, but a chunked
+    body's read1() calls readline() for the chunk-size line, and a worker trickling that line
+    (a long chunk extension) kept it returning bytes inside every socket timeout -- the probe
+    ran far past its budget, stalling spawn and the census. The response socket is now shut
+    down at the deadline, wherever the read is."""
+    import time
+
+    from blastbox.host.runtime.static_pool import make_capability_probe
+
+    url, stop, srv = _chunked_framing_trickler()
+    try:
+        t0 = time.monotonic()
+        assert make_capability_probe(None)(url + "/healthz", {}, 0.4) is None
+        assert time.monotonic() - t0 < 2.0             # unbounded: 400 x 0.03 s = 12 s
+    finally:
+        stop.set()
+        srv.close()
+
+
+def test_the_job_output_read_is_cut_off_inside_chunk_framing_too():
+    """Sweep: the same guard covers _bounded_copy -- the job's output read and every
+    read_bounded caller (capability body, the 422 refusal body)."""
+    import io
+    import time
+    import urllib.request
+
+    from blastbox.host.runtime import remote_http
+
+    url, stop, srv = _chunked_framing_trickler()
+    try:
+        resp, deadline = remote_http.open_bounded_get(url + "/x", {}, 0.5)
+        t0 = time.monotonic()
+        with resp, pytest.raises(remote_http.RemoteReadTimeout):
+            remote_http._bounded_copy(resp, io.BytesIO(), None, deadline=deadline)
+        assert time.monotonic() - t0 < 2.0
+    finally:
+        stop.set()
+        srv.close()
+    del urllib
