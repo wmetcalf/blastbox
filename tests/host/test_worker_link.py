@@ -263,6 +263,9 @@ def test_a_counter_on_a_rule_still_counts():
 #: Ubuntu) after `init --iface wltest0 --overlay-net 10.79.0.0/24 --dispatcher-source
 #: 172.31.0.0/16`. Note the kernel's re-rendering: our one-element `{ 172.31.0.0/16 }` sets
 #: come back as the bare prefix. Whatever the comparison checks, it must accept this.
+#: The forward chain's `iifname != ... ct direction original ct original ip daddr ... drop`
+#: line was added to the ruleset later (review round 15, off-link DNAT); it is written here in
+#: the form nft prints that expression, and is the one line not yet observed on a live kernel.
 REAL_NFT_1_0_9_LISTING = """table inet blastbox_worker_link {
 \tchain input {
 \t\ttype filter hook input priority filter; policy accept;
@@ -274,6 +277,7 @@ REAL_NFT_1_0_9_LISTING = """table inet blastbox_worker_link {
 \t\ttype filter hook forward priority filter; policy accept;
 \t\tiifname "wltest0" ct state established,related accept
 \t\tiifname "wltest0" drop
+\t\tiifname != "wltest0" oifname != "wltest0" ct direction original ct original ip daddr 10.79.0.0/24 drop
 \t\toifname "wltest0" ip saddr 172.31.0.0/16 ip daddr 10.79.0.0/24 tcp dport 8765 ct state new accept
 \t\toifname "wltest0" ct state established,related accept
 \t\toifname "wltest0" drop
@@ -598,3 +602,26 @@ def test_the_bundle_carries_and_requires_the_registered_worker_key():
         _bundle(worker_public_key="not-a-key")
     with pytest.raises(ValueError, match="same key"):
         _bundle(worker_public_key=KEY_A)
+
+
+def test_no_off_link_path_reaches_a_dnat_target_on_an_overlay_address():
+    """REGRESSION (review): an agent (worker) or dispatcher (host) container publishing a port
+    on an OVERLAY address is reached by DNAT -- through the FORWARD chain, which the input
+    chain's off-link drop never sees. Both rulesets now drop, in forward, original-direction
+    traffic to an overlay destination that does not come over the link (host: nor leave by
+    it -- the dispatcher's own path to the workers)."""
+    from blastbox.worker import link
+
+    worker = link.worker_firewall_nft(iface="wtwg0", worker_ip="10.78.0.5", host_ip="10.78.0.1",
+                                      agent_port=8765)
+    fwd = worker.split("chain forward {", 1)[1].split("}", 1)[0]
+    assert 'iifname != "wtwg0" ct direction original ct original ip daddr 10.78.0.5 drop' in fwd
+    host = host_firewall_nft(_cfg(dispatcher_sources=("172.18.0.0/16",)))
+    hfwd = host.split("chain forward {", 1)[1].split("}", 1)[0]
+    assert ('iifname != "wtwg0" oifname != "wtwg0" ct direction original '
+            'ct original ip daddr 10.78.0.0/24 drop') in hfwd
+    # it is part of what the read-back requires: a listing without it is not in force
+    listing = host.split(f"delete table inet {NFT_TABLE}\n", 1)[1]
+    assert firewall_in_force(listing, host) == []
+    stripped = "\n".join(ln for ln in listing.splitlines() if "ct direction original" not in ln)
+    assert firewall_in_force(stripped, host)

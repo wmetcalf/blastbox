@@ -47,6 +47,8 @@ class FakeHost:
         self.enabled: set[str] = set()                 # unit names `systemctl enable`d
         self.disable_fails = False
         self.addrs: dict[str, str] = {}               # iface -> LIVE "ip/prefix"
+        self.ports: dict[str, str] = {}               # iface -> LIVE listen port
+        self.pubs: dict[str, str] = {}                # iface -> LIVE public key
         self.restart_fails = False
         self.nft_delete_fails = False
         self.enable_fails = False                     # `systemctl enable [--now] wg-quick@*`
@@ -59,8 +61,14 @@ class FakeHost:
         """A (re)start reads the interface's config file, as wg-quick does."""
         self.links.add(iface)
         for ln in (ea.WG_DIR / f"{iface}.conf").read_text().splitlines():
-            if ln.split("=")[0].strip() == "Address":
-                self.addrs[iface] = ln.split("=", 1)[1].strip()
+            k, _, v = ln.partition("=")
+            if k.strip() == "Address":
+                self.addrs[iface] = v.strip()
+            elif k.strip() == "ListenPort":
+                self.ports[iface] = v.strip()
+            elif k.strip() == "PrivateKey":
+                key = v.strip()
+                self.pubs[iface] = HOST_PUB if key == "PRIVATE-HOST-KEY" else key[-1] * 43 + "="
 
     def run(self, argv, check: bool = True, capture: bool = True):
         a = [str(x) for x in argv]
@@ -149,6 +157,12 @@ class FakeHost:
                     elif k.strip() == "AllowedIPs" and key:
                         peers[key] = v.strip()
                 self.live_peers[a[2]] = peers
+        elif a[:2] == ["wg", "show"] and a[3:] in (["listen-port"], ["public-key"]):
+            table = self.ports if a[3] == "listen-port" else self.pubs
+            if a[2] in self.links and a[2] in table:
+                out = table[a[2]] + "\n"
+            else:
+                rc, err = 1, "Unable to access interface: No such device"
         elif a[:2] == ["wg", "show"] and a[3:] == ["allowed-ips"]:
             out = "".join(f"{k}\t{v}\n" for k, v in self.live_peers.get(a[2], {}).items())
         elif a[:2] == ["wg-quick", "down"]:
@@ -1170,3 +1184,34 @@ def test_init_refuses_when_the_firewall_boot_unit_will_not_start(host):
     with pytest.raises(wla.FirewallNotInForce, match="could not enable and start"):
         wla.init_host(_cfg())
     assert "wtwg0" not in host.links
+
+
+def test_a_retry_applies_a_port_change_an_interrupted_init_never_restarted(host):
+    """REGRESSION (review): a port-only change interrupted after the config was written left
+    the interface on the OLD port. The retry saw an unchanged file (and a matching address),
+    skipped the restart, persisted the new port -- and every bundle then sent workers to a port
+    nothing listened on. The live listen port (and public key) are read back and reconciled."""
+    wla.init_host(_cfg())
+    assert host.ports["wtwg0"] == "51822"
+    conf = ea.WG_DIR / "wtwg0.conf"
+    conf.write_text(conf.read_text().replace("ListenPort = 51822", "ListenPort = 51900"))
+    host.calls.clear()                                  # ^ the interrupted run's write
+    wla.init_host(_cfg(wg_port=51900))
+    assert ["systemctl", "restart", "wg-quick@wtwg0"] in host.calls
+    assert host.ports["wtwg0"] == "51900"
+    host.restart_fails = True                           # and if it will not apply: loud
+    conf.write_text(conf.read_text().replace("ListenPort = 51900", "ListenPort = 51901"))
+    with pytest.raises(RuntimeError):
+        wla.init_host(_cfg(wg_port=51901))
+
+
+def test_init_reconciles_live_peers_a_failed_sync_left_behind(host, pki):
+    """Sweep: the same "file written, live never reconciled" gap for PEERS -- init now syncs
+    the live peer set to the file (a no-op when they match)."""
+    wla.init_host(_cfg())
+    host.syncconf_fails = True
+    with pytest.raises(RuntimeError, match="to the live wtwg0"):
+        wla.add_worker(_cfg(), "mac1", KEY_A, _csr(_ip("10.78.0.2")), pki_dir=pki)
+    host.syncconf_fails = False
+    wla.init_host(_cfg())
+    assert set(host.live_peers["wtwg0"]) == {KEY_A}

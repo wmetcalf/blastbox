@@ -439,6 +439,54 @@ def _cap_read_timeout(src: Any, remaining: float) -> None:
         pass
 
 
+def _find_sock(src: Any) -> Any:
+    """The socket under a urllib/http.client response (or an HTTPError wrapping one), or None."""
+    obj = src
+    for _ in range(4):
+        sk = getattr(obj, "_sock", None)
+        if sk is not None:
+            return sk
+        nxt = getattr(obj, "raw", None) or getattr(obj, "fp", None)
+        if nxt is None or nxt is obj:
+            return None
+        obj = nxt
+    return None
+
+
+class _DeadlineGuard:
+    """Shut a response's socket down when ``deadline`` passes, from a timer thread.
+
+    The per-read checks below bound the time BETWEEN reads, and the socket timeout bounds each
+    idle gap -- but one read can still run past the deadline: a chunked body's ``read1`` calls
+    ``readline`` for the chunk-size line, and a worker trickling that line (or a long chunk
+    extension) keeps it returning bytes inside every socket timeout. Shutting the socket down
+    ends that read wherever it is. ``fired`` tells the caller the EOF it then sees is the
+    deadline, not the end of the body."""
+
+    def __init__(self, src: Any, deadline: float | None) -> None:
+        self.fired = False
+        self._timer: threading.Timer | None = None
+        sk = _find_sock(src) if deadline is not None else None
+        if sk is None or deadline is None:
+            return
+
+        def _fire() -> None:
+            self.fired = True
+            _abort_io([sk])
+
+        timer = threading.Timer(max(0.0, deadline - time.monotonic()), _fire)
+        timer.daemon = True
+        try:
+            timer.start()
+        except RuntimeError:      # cannot start a thread: the per-read checks still apply
+            return
+        self._timer = timer
+
+    def cancel(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+
+
 def _bounded_copy(src: Any, dst: Any, limit: int | None, deadline: float | None = None) -> int:
     """copyfileobj that aborts once ``limit`` bytes have been read (None = unbounded). When ``deadline``
     (a ``time.monotonic()`` value) is given, also aborts if the TOTAL wall-clock read exceeds it -- the
@@ -448,24 +496,33 @@ def _bounded_copy(src: Any, dst: Any, limit: int | None, deadline: float | None 
     is enforced both between AND during a blocking read."""
     total = 0
     read = getattr(src, "read1", None) or src.read
-    while True:
-        if deadline is not None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise RemoteReadTimeout(f"remote output read exceeded the {deadline:.0f}s wall-clock deadline")
-            _cap_read_timeout(src, remaining)   # bound THIS read to the remaining budget
-        try:
-            chunk = read(1024 * 1024)
-        except (TimeoutError, OSError) as exc:   # incl. socket.timeout from the capped read
-            if deadline is not None and time.monotonic() >= deadline:
-                raise RemoteReadTimeout("remote output read exceeded the wall-clock deadline") from exc
-            raise
-        if not chunk:
-            break
-        total += len(chunk)
-        if limit is not None and total > limit:
-            raise RemoteOutputTooLarge(f"remote output exceeded {limit} bytes")
-        dst.write(chunk)
+    guard = _DeadlineGuard(src, deadline)
+    try:
+        while True:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or guard.fired:
+                    raise RemoteReadTimeout(f"remote output read exceeded the {deadline:.0f}s wall-clock deadline")
+                _cap_read_timeout(src, remaining)   # bound THIS read to the remaining budget
+            try:
+                chunk = read(1024 * 1024)
+            except (TimeoutError, OSError, ValueError, http.client.HTTPException) as exc:
+                # incl. socket.timeout from the capped read, and whatever a read cut off by the
+                # guard's shutdown raises (a closed file, an incomplete chunk)
+                if deadline is not None and (guard.fired or time.monotonic() >= deadline):
+                    raise RemoteReadTimeout("remote output read exceeded the wall-clock deadline") from exc
+                raise
+            if guard.fired:
+                # the guard shut the socket: what reads as end-of-body is the deadline
+                raise RemoteReadTimeout("remote output read exceeded the wall-clock deadline")
+            if not chunk:
+                break
+            total += len(chunk)
+            if limit is not None and total > limit:
+                raise RemoteOutputTooLarge(f"remote output exceeded {limit} bytes")
+            dst.write(chunk)
+    finally:
+        guard.cancel()
     return total
 
 

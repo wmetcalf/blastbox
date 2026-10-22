@@ -688,3 +688,85 @@ def test_an_exchange_that_cannot_start_its_thread_is_no_verdict(monkeypatch):
     monkeypatch.setattr(threading.Thread, "start", no_threads)
     assert _default_http_probe("http://127.0.0.1:9/healthz", {}, 0.5) is None
     assert remote_http.make_tls_probe(None)("http://w.example.invalid:9/healthz", {}, 0.5) is None
+
+
+def _chunked_framing_trickler():
+    """A server whose /healthz answers 200 CHUNKED, then trickles the chunk-size line (with a
+    long chunk extension) one byte at a time -- each byte well inside any socket timeout."""
+    import socket
+    import threading
+    import time
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    stop = threading.Event()
+
+    def handle(conn):
+        with conn:
+            try:
+                conn.recv(65536)
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                             b"Transfer-Encoding: chunked\r\n\r\n")
+                conn.sendall(b"2;")
+                for _ in range(400):                  # a chunk extension that never ends
+                    if stop.is_set():
+                        break
+                    conn.sendall(b"x")
+                    time.sleep(0.03)
+            except OSError:
+                pass
+
+    def serve():
+        srv.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                continue
+            threading.Thread(target=handle, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return f"http://127.0.0.1:{srv.getsockname()[1]}", stop, srv
+
+
+def test_a_trickled_chunk_framing_line_cannot_outrun_the_capability_deadline():
+    """REGRESSION (review): read_bounded() checks its deadline between reads, but a chunked
+    body's read1() calls readline() for the chunk-size line, and a worker trickling that line
+    (a long chunk extension) kept it returning bytes inside every socket timeout -- the probe
+    ran far past its budget, stalling spawn and the census. The response socket is now shut
+    down at the deadline, wherever the read is."""
+    import time
+
+    from blastbox.host.runtime.static_pool import make_capability_probe
+
+    url, stop, srv = _chunked_framing_trickler()
+    try:
+        t0 = time.monotonic()
+        assert make_capability_probe(None)(url + "/healthz", {}, 0.4) is None
+        assert time.monotonic() - t0 < 2.0             # unbounded: 400 x 0.03 s = 12 s
+    finally:
+        stop.set()
+        srv.close()
+
+
+def test_the_job_output_read_is_cut_off_inside_chunk_framing_too():
+    """Sweep: the same guard covers _bounded_copy -- the job's output read and every
+    read_bounded caller (capability body, the 422 refusal body)."""
+    import io
+    import time
+    import urllib.request
+
+    from blastbox.host.runtime import remote_http
+
+    url, stop, srv = _chunked_framing_trickler()
+    try:
+        resp, deadline = remote_http.open_bounded_get(url + "/x", {}, 0.5)
+        t0 = time.monotonic()
+        with resp, pytest.raises(remote_http.RemoteReadTimeout):
+            remote_http._bounded_copy(resp, io.BytesIO(), None, deadline=deadline)
+        assert time.monotonic() - t0 < 2.0
+    finally:
+        stop.set()
+        srv.close()
+    del urllib

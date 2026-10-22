@@ -449,6 +449,13 @@ def host_firewall_nft(cfg: WorkerLinkConfig) -> str:
         "\t\ttype filter hook forward priority filter; policy accept;",
         f'\t\tiifname "{i}" ct state established,related accept',
         f'\t\tiifname "{i}" drop',
+        # A container publishing a port on an OVERLAY address (the dispatcher's, on host_ip) is
+        # reached by DNAT -- forwarded, so the input chain's off-link drop never sees it. Nothing
+        # that neither arrives on nor leaves by the link may reach an overlay destination
+        # (original tuple, original direction: replies, and the dispatcher's own path out over
+        # the link, are untouched).
+        f'\t\tiifname != "{i}" oifname != "{i}" ct direction original '
+        f"ct original ip daddr {net} drop",
     ]
     if cfg.dispatcher_sources:
         srcs = ", ".join(cfg.dispatcher_sources)

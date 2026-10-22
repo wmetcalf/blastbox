@@ -376,6 +376,11 @@ def worker_firewall_nft(*, iface: str, worker_ip: str, host_ip: str, agent_port:
         # published address/port, matched on conntrack's ORIGINAL tuple (pre-DNAT).
         f'\t\tiifname "{i}" ip saddr {h} ct original ip daddr {w} ct original proto-dst {p} '
         "ct status dnat ct state new accept",
+        # ...and NOTHING else may reach a DNAT target that was addressed to our overlay address:
+        # a job bridge or physical interface sending to <w>:<published port> is forwarded (not
+        # input), so the input chain's off-link drop never sees it. Matched on the ORIGINAL
+        # destination and the ORIGINAL direction only, so the agent's replies still flow.
+        f'\t\tiifname != "{i}" ct direction original ct original ip daddr {w} drop',
         f'\t\tiifname "{i}" ct state established,related accept',
         f'\t\toifname "{i}" ct state established,related accept',
         f'\t\tiifname "{i}" drop',

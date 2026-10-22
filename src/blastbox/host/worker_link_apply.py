@@ -691,12 +691,20 @@ def init_host(cfg: WorkerLinkConfig, *, rotate_key: bool = False) -> tuple[str, 
         # A changed [Interface] (address, port) does need the restart, and gets it.
         if not ea._ok(["ip", "link", "show", cfg.wg_iface]):
             ea.wg_up(cfg)
-        elif rewritten or _live_addresses(cfg) != [f"{cfg.host_ip}/{cfg.prefixlen}"]:
+        elif rewritten or _live_interface_mismatch(cfg, pub):
             # Also when the FILE is unchanged: a previous run may have written it and then
-            # failed to restart, leaving the interface on the old address -- a retry must apply
-            # it, not see "nothing changed".
+            # failed to restart, leaving the interface on the old address, port or key -- a
+            # retry must apply it, not see "nothing changed".
             _restart_link(cfg)
         _verify_live_address(cfg)
+        stale = _live_interface_mismatch(cfg, pub)
+        if stale:
+            raise RuntimeError(f"{cfg.wg_iface} is up but does not run the config just written "
+                               f"({'; '.join(stale)}); restart it (`systemctl restart wg-quick@"
+                               f"{cfg.wg_iface}`) and re-run init")
+        # ...and its PEERS: a previous `add`/`remove` may have written the file and failed to
+        # apply it to the live interface (a no-op when they already match).
+        _apply_peers(cfg, conf.read_text())
         _ensure_link_enabled(cfg)
     persist_config(cfg)
     notes.append(f"{cfg.wg_iface} up at {cfg.host_ip}/{cfg.prefixlen}, udp/{cfg.wg_port}")
@@ -806,6 +814,24 @@ def _live_addresses(cfg: WorkerLinkConfig) -> list[str]:
     return sorted(f"{a.get('local')}/{a.get('prefixlen')}"
                   for dev in info if isinstance(dev, dict)
                   for a in dev.get("addr_info", []) if a.get("family") == "inet")
+
+
+def _live_interface_mismatch(cfg: WorkerLinkConfig, pub: str) -> list[str]:
+    """How the LIVE interface differs from the config just written, read from the kernel:
+    its address, its listen port and its public key (= the private key it runs). Any of them
+    can be stale after a run that rewrote the file and was interrupted before the restart --
+    and a retry then sees an unchanged file."""
+    out: list[str] = []
+    got = _live_addresses(cfg)
+    if got != [f"{cfg.host_ip}/{cfg.prefixlen}"]:
+        out.append(f"address {', '.join(got) or 'none'} (want {cfg.host_ip}/{cfg.prefixlen})")
+    port = ea._run(["wg", "show", cfg.wg_iface, "listen-port"], check=False)
+    if port.returncode != 0 or (port.stdout or "").strip() != str(cfg.wg_port):
+        out.append(f"listen port {(port.stdout or '').strip() or '?'} (want {cfg.wg_port})")
+    key = ea._run(["wg", "show", cfg.wg_iface, "public-key"], check=False)
+    if key.returncode != 0 or (key.stdout or "").strip() != pub:
+        out.append(f"public key {((key.stdout or '').strip() or '?')[:10]}… (want {pub[:10]}…)")
+    return out
 
 
 def _verify_live_address(cfg: WorkerLinkConfig) -> None:
