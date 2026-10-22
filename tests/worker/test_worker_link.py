@@ -1922,3 +1922,54 @@ def test_a_keygen_for_a_new_address_keeps_status_on_the_installed_link(node, tmp
     link.leave("wtwg0")
     rec = json.loads(link._paths("wtwg0")["state"].read_text())
     assert not any(k in rec for k in ("host_ip", "agent_port", "name", "joined_worker_ip"))
+
+
+#: What `pfctl -s rules` prints for the stock macOS /etc/pf.conf (observed as root on a Mac).
+STOCK_MAIN_RULES = 'scrub-anchor "com.apple/*" all fragment reassemble\nanchor "com.apple/*" all\n'
+
+
+@pytest.mark.parametrize("main,ok", [
+    (STOCK_MAIN_RULES, True),                                            # the stock form
+    ('anchor "com.apple/*"    all\n', True),                             # spacing only
+    ('anchor "com.apple/*" on en0 all\n', False),                        # an interface
+    ('anchor "com.apple/*" in all\n', False),                            # one direction
+    ('anchor "com.apple/*" inet6 all\n', False),                         # another family
+    ('anchor "com.apple/*" proto tcp all\n', False),                     # one protocol
+    ('anchor "com.apple/*" from 192.0.2.0/24 to any\n', False),          # addresses
+    ('anchor "com.apple/*" tagged X all\n', False),                      # a tag
+    ('anchor "com.apple/*" on en0 all\nanchor "com.apple/*" all\n', True),  # plus the real one
+])
+def test_only_an_unconditional_parent_anchor_counts_as_enforcement(mac, main, ok):
+    """REGRESSION (review): any main-ruleset line CONTAINING `anchor "com.apple/*"` passed --
+    but `anchor "com.apple/*" on en0 all` (or a direction/family/proto/address/tag selector)
+    never evaluates the child anchor for the link's utun. Only the bare form counts, in
+    pf_in_force and in the watchdog."""
+    rules = link.pf_rules(real_iface="utun7", worker_ip="10.78.0.5", host_ip="10.78.0.1",
+                          agent_port=8765)
+    missing = link.pf_in_force(info="Status: Enabled", main_rules=main, anchor_rules=rules,
+                               real_iface="utun7", worker_ip="10.78.0.5", host_ip="10.78.0.1",
+                               agent_port=8765)
+    assert (missing == []) is ok, missing
+    mac.up("utun7")
+    mac.main_rules(main)
+    if ok:
+        mac.run()
+    else:
+        with pytest.raises(AssertionError, match="unconditionally"):
+            mac.run()
+
+
+def test_a_bypass_before_the_unconditional_anchor_is_still_caught_behind_a_conditional_one(mac):
+    """The pass-quick ordering check now stops only at the UNCONDITIONAL invocation: a broad
+    `pass quick` placed after a conditional anchor but before the real one still bypasses."""
+    main = ('anchor "com.apple/*" on en0 all\npass quick all\nanchor "com.apple/*" all\n')
+    rules = link.pf_rules(real_iface="utun7", worker_ip="10.78.0.5", host_ip="10.78.0.1",
+                          agent_port=8765)
+    assert link.pf_main_bypass(main, "utun7") == ["pass quick all"]
+    assert link.pf_in_force(info="Status: Enabled", main_rules=main, anchor_rules=rules,
+                            real_iface="utun7", worker_ip="10.78.0.5", host_ip="10.78.0.1",
+                            agent_port=8765)
+    mac.up("utun7")
+    mac.main_rules(main)
+    with pytest.raises(AssertionError, match="passes"):
+        mac.run()

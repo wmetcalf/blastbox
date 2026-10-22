@@ -545,7 +545,7 @@ force_down() {{
 # Mirrors blastbox.worker.link.pf_main_bypass.
 main_bypass() {{
     "$PFCTL" -s rules 2>/dev/null | awk -v real="$1" '
-        /^anchor "com\\.apple\\/\\*"/ {{ exit }}
+        /^anchor "com\\.apple\\/\\*" all[ \\t]*$/ {{ exit }}
         $1 == "pass" {{
             q = 0; on = ""
             for (i = 2; i <= NF; i++) {{
@@ -589,8 +589,13 @@ if ! "$PFCTL" -s info 2>/dev/null | grep -q '^Status: Enabled'; then
 fi
 # ...and the main ruleset must still EVALUATE our anchor. A VPN client or kill-switch app that
 # loads its own main ruleset drops `anchor "com.apple/*"`, and every rule below is then text.
-if ! "$PFCTL" -s rules 2>/dev/null | grep -qF 'anchor "com.apple/*"'; then
-    force_down 'the main pf ruleset does not evaluate anchor "com.apple/*"'
+# UNCONDITIONALLY: only the bare `anchor "com.apple/*" all` (how pfctl prints the stock
+# /etc/pf.conf's invocation) reaches our child anchor for every packet. A parent narrowed by
+# interface, direction, family, protocol, address or tag (`anchor "com.apple/*" on en0 all`)
+# never evaluates it for the link's utun. Mirrors blastbox.worker.link.pf_parent_anchor_ok.
+if ! "$PFCTL" -s rules 2>/dev/null | sed -e 's/[[:space:]][[:space:]]*/ /g' -e 's/^ //' -e 's/ $//' \
+        | grep -qx 'anchor "com\\.apple/\\*" all'; then
+    force_down 'the main pf ruleset does not evaluate anchor "com.apple/*" unconditionally'
     exit 1
 fi
 # ...and nothing BEFORE it may pass the link's traffic with `quick` (that would bypass it).
@@ -722,6 +727,21 @@ def pf_canon(text: str) -> list[str]:
     return out
 
 
+#: The parent invocation that evaluates our child anchor for EVERY packet: pfctl's
+#: normalised form of the stock /etc/pf.conf line ``anchor "com.apple/*"``.
+_PF_PARENT_ANCHOR = 'anchor "com.apple/*" all'
+
+
+def pf_parent_anchor_ok(main_rules: str) -> bool:
+    """Whether the main ruleset invokes ``com.apple/*`` UNCONDITIONALLY. A line merely
+    CONTAINING the anchor is not enough: ``anchor "com.apple/*" on en0 all`` (or narrowed by
+    direction, family, protocol, address or tag) never evaluates our child anchor for the
+    link's utun, so its rules would be text. Only the bare form counts. Mirrored in the
+    watchdog."""
+    return any(" ".join(raw.split()) == _PF_PARENT_ANCHOR
+               for raw in (main_rules or "").splitlines())
+
+
 def pf_main_bypass(main_rules: str, real_iface: str | None) -> list[str]:
     """Rules in the MAIN pf ruleset that let the link's traffic bypass our anchor.
 
@@ -737,7 +757,7 @@ def pf_main_bypass(main_rules: str, real_iface: str | None) -> list[str]:
     out: list[str] = []
     for raw in (main_rules or "").splitlines():
         line = " ".join(raw.split())
-        if line.startswith('anchor "com.apple/*"'):
+        if line == _PF_PARENT_ANCHOR:
             break
         toks = line.split()
         if not toks or toks[0] != "pass" or "quick" not in toks:
@@ -758,8 +778,10 @@ def pf_in_force(*, info: str, main_rules: str, anchor_rules: str, real_iface: st
     missing: list[str] = []
     if not re.search(r"^Status: Enabled", info or "", re.M):
         missing.append("pf is DISABLED (no anchor is evaluated)")
-    if 'anchor "com.apple/*"' not in (main_rules or ""):
-        missing.append('the main pf ruleset does not evaluate anchor "com.apple/*"')
+    if not pf_parent_anchor_ok(main_rules):
+        missing.append('the main pf ruleset does not evaluate anchor "com.apple/*" '
+                       "unconditionally (only `anchor \"com.apple/*\" all` reaches the link's "
+                       "anchor for all of its traffic)")
     for rule in pf_main_bypass(main_rules, real_iface):
         missing.append(f'the main ruleset passes the link\'s traffic before our anchor (`{rule}`)')
     if not real_iface:
