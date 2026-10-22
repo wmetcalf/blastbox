@@ -1106,7 +1106,7 @@ def test_reinit_refuses_when_retained_workers_config_cannot_be_read_back(host, p
 def test_load_config_requires_init_and_lets_the_environment_override(host, monkeypatch):
     with pytest.raises(wla.WorkerLinkNotInitialised):
         wla.load_config()
-    assert wla.load_config(required=False) is None
+    assert wla.load_config(required=False) == WorkerLinkConfig()   # not installed: env/defaults
     wla.persist_config(_cfg())
     monkeypatch.setenv("BLASTBOX_WORKER_LINK_AGENT_PORT", "9443")
     cfg = wla.load_config()
@@ -1215,3 +1215,20 @@ def test_init_reconciles_live_peers_a_failed_sync_left_behind(host, pki):
     host.syncconf_fails = False
     wla.init_host(_cfg())
     assert set(host.live_peers["wtwg0"]) == {KEY_A}
+
+
+def test_a_first_init_applies_the_environment_settings(host, monkeypatch, capsys):
+    """REGRESSION (review): with no env file yet, load_config(required=False) returned None
+    BEFORE merging BLASTBOX_WORKER_LINK_*, so a first init configured through the documented
+    environment silently installed the default interface, overlay and ports with no endpoint --
+    and `add` then refused the configured endpoint as an uninstalled override. CLI flags still
+    win over the environment."""
+    from blastbox.worker import link
+
+    monkeypatch.setenv("BLASTBOX_WORKER_LINK_OVERLAY_NET", "10.79.0.0/24")
+    monkeypatch.setenv("BLASTBOX_WORKER_LINK_ENDPOINT", "gw.example.org:51900")
+    monkeypatch.setenv("BLASTBOX_WORKER_LINK_AGENT_PORT", "9443")
+    assert link.main(["init", "--agent-port", "9555"]) == 0
+    installed = wla.WorkerLinkConfig.from_env(wla._persisted_env())
+    assert installed.overlay_net == "10.79.0.0/24" and installed.endpoint == "gw.example.org:51900"
+    assert installed.agent_port == 9555                      # the flag overrides the env

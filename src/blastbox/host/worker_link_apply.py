@@ -135,7 +135,12 @@ def load_config(*, required: bool = True, recover: bool = False) -> WorkerLinkCo
         if required:
             raise WorkerLinkNotInitialised(
                 f"{ENV_FILE} does not exist: run `blastbox worker-link init` first") from None
-        return None
+        # Not installed yet (a first `init`): the documented BLASTBOX_WORKER_LINK_* settings
+        # still apply -- returning nothing made init silently install the DEFAULT interface,
+        # overlay and ports with no endpoint, after which `add` refused the configured endpoint
+        # as an uninstalled override. CLI flags are applied over this by the caller.
+        return WorkerLinkConfig.from_env(
+            {k: v for k, v in os.environ.items() if k.startswith("BLASTBOX_WORKER_LINK_")})
     except OSError as exc:
         raise RuntimeError(f"cannot read {ENV_FILE}: {exc.strerror}") from None
     env = _parse_env(text)

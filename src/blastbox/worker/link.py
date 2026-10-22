@@ -1240,33 +1240,78 @@ def _wait_handshake(wg: str, real_iface: str) -> str:
 
 
 def _live_peer_matches(wg: str, bundle: JoinBundle, real_iface: str) -> bool:
-    try:
-        _verify_live_peer(wg, bundle, real_iface)
-    except RuntimeError:
-        return False
-    return True
+    return not _live_mismatch(wg, bundle, real_iface)
 
 
-def _verify_live_peer(wg: str, bundle: JoinBundle, real_iface: str | None = None) -> None:
-    """Raise unless the LIVE interface holds exactly the bundle's host as its one peer,
-    allowed only the host /32 -- read from ``wg show <iface> dump``, not from the file. A link
-    that is up with some earlier config (another host key, another host address) is not the
-    link this join configured."""
-    from blastbox.host.exit_attest import parse_wg_dump
-
+def _live_mismatch(wg: str, bundle: JoinBundle, real_iface: str | None = None) -> list[str]:
+    """How the LIVE interface differs from what this bundle configures, read from the kernel /
+    wireguard-go -- never from the file: exactly the bundle's host as the one peer (key and
+    AllowedIPs = the host /32), that peer's ENDPOINT (port, and an address the endpoint name
+    resolves to) and keepalive, the interface's own key (this worker's) and its overlay address.
+    A retry after a join that wrote the config but was interrupted before applying it sees an
+    unchanged file over a tunnel still running the old endpoint/peer/key; only this catches it."""
     iface = real_iface or bundle.iface
     proc = _run([wg, "show", iface, "dump"])
     if proc.returncode != 0:
         tail = (proc.stderr or "").strip().splitlines()[-1:] or ["no detail"]
-        raise RuntimeError(f"cannot read the live config of {iface} ({tail[0]})")
-    peers = parse_wg_dump(proc.stdout or "")
-    want = (bundle.host_public_key.strip(), (f"{bundle.host_ip}/32",))
-    got = [(p.public_key, tuple(sorted(p.allowed_ips))) for p in peers]
-    if got != [want]:
+        return [f"its live config cannot be read ({tail[0]})"]
+    lines = (proc.stdout or "").splitlines()
+    out: list[str] = []
+    peers = [ln.split("\t") for ln in lines[1:] if len(ln.split("\t")) >= 8]
+    keys = [(f[0], tuple(sorted(x for x in f[3].split(",") if x))) for f in peers]
+    if keys != [(bundle.host_public_key, (f"{bundle.host_ip}/32",))]:
+        out.append(f"its peers are not exactly this bundle's host ({bundle.host_public_key[:10]}… "
+                   f"allowed {bundle.host_ip}/32)")
+    else:
+        f = peers[0]
+        live_ep, keepalive = f[2], f[7]
+        want_host, _, want_port = bundle.endpoint.rpartition(":")
+        live_host, _, live_port = live_ep.rpartition(":")
+        if live_ep in ("", "(none)") or live_port != want_port:
+            out.append(f"its endpoint is {live_ep or 'unset'}, not port {want_port} of "
+                       f"{bundle.endpoint}")
+        else:
+            try:
+                resolved = set(_resolve(want_host))
+            except RuntimeError:
+                resolved = set()
+            if resolved and live_host.strip("[]") not in resolved:
+                out.append(f"its endpoint {live_ep} is not {bundle.endpoint} "
+                           f"({', '.join(sorted(resolved))})")
+        if keepalive.strip() not in ("25",):
+            out.append(f"its keepalive is {keepalive or 'off'}, not 25")
+    own = (lines[0].split("\t") + ["", ""])[1] if lines else ""
+    if own != bundle.worker_public_key:
+        out.append(f"it runs another key ({own[:10] or '?'}…, not this worker's "
+                   f"{bundle.worker_public_key[:10]}…)")
+    if bundle.worker_ip not in _live_iface_addresses(iface):
+        out.append(f"it does not carry {bundle.worker_ip}")
+    return out
+
+
+def _live_iface_addresses(iface: str) -> set[str]:
+    """IPv4 addresses on ``iface`` (Linux ``ip -j addr``, macOS ``ifconfig``)."""
+    if _supported_platform() == "darwin":
+        proc = _run(["ifconfig", iface])
+        return set(re.findall(r"^\s*inet\s+(\S+)", proc.stdout or "", re.M))
+    proc = _run(["ip", "-j", "addr", "show", "dev", iface])
+    try:
+        info = json.loads(proc.stdout or "[]") if proc.returncode == 0 else []
+    except ValueError:
+        info = []
+    return {str(a.get("local")) for dev in info if isinstance(dev, dict)
+            for a in dev.get("addr_info", []) if a.get("family") == "inet"}
+
+
+def _verify_live_peer(wg: str, bundle: JoinBundle, real_iface: str | None = None) -> None:
+    """Raise unless the LIVE interface runs exactly what this bundle configures (see
+    :func:`_live_mismatch`). A link that is up with some earlier config is not the link this
+    join configured."""
+    why = _live_mismatch(wg, bundle, real_iface)
+    if why:
         raise RuntimeError(
-            f"{iface} is up but its live peers are not this bundle's host "
-            f"({bundle.host_public_key[:10]}… allowed {bundle.host_ip}/32): the previous config "
-            "is still in effect. Bring it down by hand and re-run join")
+            f"{real_iface or bundle.iface} is up but {'; '.join(why)}: the previous config is "
+            "still in effect. Bring it down by hand and re-run join")
 
 
 def _installed_linux_links() -> set[str]:

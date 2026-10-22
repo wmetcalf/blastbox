@@ -68,6 +68,10 @@ class FakeNode:
         self.pf_flushed = False
         self.pf_flush_fails = False
         self.active: set[str] = set()           # non-link units that were STARTED
+        #: what the LIVE tunnel runs (wg show dump / addresses), as a restart would set it
+        self.live_endpoint = "192.0.2.10:51822"
+        self.live_addr = "10.78.0.5"
+        self.live_own_key: str | None = None
         self.start_fails: set[str] = set()
 
     def run(self, argv, *, input=None):
@@ -88,8 +92,10 @@ class FakeNode:
                 rc, err = 1, "Operation not permitted"
             else:
                 hs = "1700000000" if self.handshake else "0"
-                out = ("PRIV\tPUB\t0\toff\n"
-                       f"{KEY_HOST}\t(none)\t192.0.2.10:51822\t10.78.0.1/32\t{hs}\t1\t2\t25\n")
+                key = link._paths("wtwg0")["wg_key"]
+                own = (self.live_own_key or (_wg_pub(key.read_text()) if key.exists() else "PUB"))
+                out = (f"PRIV\t{own}\t0\toff\n"
+                       f"{KEY_HOST}\t(none)\t{self.live_endpoint}\t10.78.0.1/32\t{hs}\t1\t2\t25\n")
                 if self.handshake:
                     import time
                     out = out.replace("1700000000", str(int(time.time()) - 5))
@@ -130,6 +136,8 @@ class FakeNode:
             p2p = dev in self.tunnels or not dev.startswith("en")
             out = (f"{dev}: flags=8051<UP,{'POINTOPOINT' if p2p else 'BROADCAST'},RUNNING,"
                    "MULTICAST> mtu 1500\n")
+            if dev == "utun7" and (link.WG_RUN_DIR / "wtwg0.name").exists():
+                out += f"\tinet {self.live_addr} --> {self.live_addr} netmask 0xffffffff\n"
         elif tool == "wg" and a[1] == "show" and a[2] != "all" and a[3:] == ["public-key"]:
             key = link._paths("wtwg0")["wg_key"]
             stale = self.stale_utun and not (self.stale_sock_kills
@@ -158,6 +166,9 @@ class FakeNode:
                 self.links.add(a[2])
         elif a[:3] == ["ip", "-j", "route"] and "get" in a:
             out = json.dumps([{"dst": a[-1], "dev": self.route_dev, "type": self.route_type}])
+        elif a[:5] == ["ip", "-j", "addr", "show", "dev"] and a[5] in self.links:
+            out = json.dumps([{"ifname": a[5], "addr_info": [
+                {"family": "inet", "local": self.live_addr, "prefixlen": 32}]}])
         elif a[:2] == ["ip", "-j"]:
             out = "[]"
         elif a[:3] == ["ip", "link", "show"]:
@@ -1547,7 +1558,7 @@ def test_a_macos_rejoin_restarts_and_then_fails_closed_on_a_stale_live_peer(node
         private_key=p["wg_key"].read_text(), worker_ip="10.78.0.5", host_ip="10.78.0.1",
         host_public_key=other, endpoint="gw.example.org:51822"))
     n.calls.clear()
-    with pytest.raises(RuntimeError, match="not this bundle's host.*taken DOWN"):
+    with pytest.raises(RuntimeError, match="this bundle's host.*taken DOWN"):
         link.join(new)                     # the live peer stays the OLD host (fake dump)
     assert "/fake/bin/wg-quick down wtwg0" in n.flat()          # restarted despite same file
     assert not n.launchd_loaded and not (link.WG_RUN_DIR / "wtwg0.name").exists()
@@ -1840,5 +1851,39 @@ def test_linux_join_starts_the_firewall_boot_unit_not_just_enables_it(node, tmp_
     link.leave("wtwg0")
     n.start_fails.add(link.FW_UNIT_NAME)
     with pytest.raises(RuntimeError, match="could not enable and start"):
+        link.join(_bundle(tmp_path, csr))
+    assert "wtwg0" not in n.links
+
+
+@pytest.mark.parametrize("stale", ["endpoint", "port", "own-key", "address"])
+def test_a_macos_rejoin_restarts_a_tunnel_still_running_old_settings(node, tmp_path, stale):
+    """REGRESSION (review): a join that wrote a new config (here: only the endpoint changed)
+    and was interrupted before applying it left, on retry, conf_changed=False -- and the live
+    check compared only the host key and AllowedIPs, so the tunnel kept dialling the OLD
+    endpoint while join reported success. Every field the bundle sets is compared now."""
+    n = node("darwin")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    if stale == "endpoint":
+        n.live_endpoint = "198.51.100.9:51822"         # the old host address
+    elif stale == "port":
+        n.live_endpoint = "192.0.2.10:4500"
+    elif stale == "own-key":
+        n.live_own_key = "Q" * 43 + "="
+    else:
+        n.live_addr = "10.78.0.66"
+    n.calls.clear()
+    with pytest.raises(RuntimeError, match="previous config is still in effect.*taken DOWN"):
+        link.join(_bundle(tmp_path, csr))                # same file: only the LIVE side is stale
+    assert "/fake/bin/wg-quick down wtwg0" in n.flat()  # it was restarted, then failed closed
+
+
+def test_a_linux_join_verifies_the_live_endpoint_too(node, tmp_path):
+    """The Linux counterpart: the post-start verification now covers the endpoint, keepalive,
+    own key and address, failing closed (link taken down) on any mismatch."""
+    n = node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    n.live_endpoint = "198.51.100.9:51822"
+    with pytest.raises(RuntimeError, match="endpoint .* is not gw.example.org:51822.*taken DOWN"):
         link.join(_bundle(tmp_path, csr))
     assert "wtwg0" not in n.links
