@@ -708,6 +708,9 @@ def reassert_units(*, nft_bin: str, nft_file: str, iface: str, base: str,
 [Unit]
 Description={description} (re-assert)
 After={base}.service
+# Stopping the timer (teardown/leave) stops a run already in flight too, so a pending
+# `nft -f` cannot re-create the table after it was removed. Teardown/leave still verify.
+PartOf={base}-reassert.timer
 
 [Service]
 Type=oneshot

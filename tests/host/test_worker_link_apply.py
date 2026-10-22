@@ -57,6 +57,8 @@ class FakeHost:
         self.active: set[str] = set()                 # non-link units that were STARTED
         self.start_fails: set[str] = set()            # units whose start (--now) fails
         self.disable_fails_units: set[str] = set()    # non-link units whose disable fails
+        self.activating: set[str] = set()             # oneshots with a run IN FLIGHT
+        self.stop_fails: set[str] = set()
 
     def _up(self, iface: str) -> None:
         """A (re)start reads the interface's config file, as wg-quick does."""
@@ -139,6 +141,13 @@ class FakeHost:
                 self.active.discard(a[-1])
             if a[2] == "--now" and a[3].startswith("wg-quick@") and not self.stuck_up:
                 self.links.discard(a[3].split("@")[1])
+        elif a[:2] == ["systemctl", "is-active"] and a[2] in self.activating:
+            rc, out = 3, "activating\n"                 # an in-flight oneshot: exit code 3
+        elif a[:2] == ["systemctl", "stop"] and a[2] in self.activating:
+            if a[2] not in self.stop_fails:
+                self.activating.discard(a[2])
+            else:
+                rc, err = 1, f"Failed to stop {a[2]}"
         elif a[:2] == ["systemctl", "is-active"]:
             rc = 0 if (a[2] in self.active or (a[2].startswith("wg-quick@")
                                                and a[2].split("@")[-1] in self.links)) else 3
@@ -1266,3 +1275,29 @@ def test_teardown_keeps_everything_while_the_reassert_timer_or_boot_unit_still_r
     host.disable_fails_units.clear()
     wla.teardown(_cfg())
     assert host.loaded is None and not wla.ENV_FILE.exists()
+
+
+def test_teardown_stops_and_verifies_an_in_flight_reassert_run(host):
+    """REGRESSION (review): teardown stopped and checked the re-assert TIMER, not the oneshot
+    it fires: a run already in flight ("activating" -- is-active exits non-zero for it) had a
+    pending `nft -f` that re-created the table after the absence read-back. The service is now
+    stopped and verified not running (by its state text) before anything is removed."""
+    wla.init_host(_cfg())
+    svc = "blastbox-worker-link-fw-reassert.service"
+    host.activating.add(svc)
+    host.stop_fails.add(svc)
+    notes = wla.teardown(_cfg())
+    assert ["systemctl", "stop", svc] in host.calls
+    assert svc in notes[-1] and "could not be stopped" in notes[-1]
+    assert host.loaded is not None and wla.ENV_FILE.exists() and wla.FW_UNIT.exists()
+    host.stop_fails.clear()                                # a stop that works: it proceeds
+    wla.teardown(_cfg())
+    assert host.loaded is None and not wla.ENV_FILE.exists()
+
+
+def test_the_reassert_run_is_part_of_its_timer():
+    from blastbox.host.worker_link import reassert_units
+
+    svc, _timer = reassert_units(nft_bin="/usr/sbin/nft", nft_file="/etc/blastbox/x.nft",
+                                 iface="wtwg0", base="b-fw", description="d")
+    assert "PartOf=b-fw-reassert.timer" in svc

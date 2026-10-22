@@ -69,6 +69,8 @@ class FakeNode:
         self.pf_flush_fails = False
         self.active: set[str] = set()           # non-link units that were STARTED
         self.disable_fails_units: set[str] = set()
+        self.activating: set[str] = set()
+        self.stop_fails: set[str] = set()
         #: what the LIVE tunnel runs (wg show dump / addresses), as a restart would set it
         self.live_endpoint = "192.0.2.10:51822"
         self.live_addr = "10.78.0.5"
@@ -174,6 +176,13 @@ class FakeNode:
             out = "[]"
         elif a[:3] == ["ip", "link", "show"]:
             rc = 0 if a[3] in self.links else 1
+        elif a[:2] == ["systemctl", "is-active"] and a[2] in self.activating:
+            rc, out = 3, "activating\n"
+        elif a[:2] == ["systemctl", "stop"] and a[2] in self.activating:
+            if a[2] not in self.stop_fails:
+                self.activating.discard(a[2])
+            else:
+                rc, err = 1, f"Failed to stop {a[2]}"
         elif a[:2] == ["systemctl", "is-active"]:
             rc = 0 if a[2] in self.active else 3
         elif a[:2] == ["systemctl", "is-enabled"]:
@@ -2055,3 +2064,18 @@ def test_leave_releases_the_pf_enable_token_and_handles_a_lapsed_one(node, tmp_p
     assert any(c[-2:] == ["-X", "4242"] for c in n.calls)
     assert any("released 1 enable reference" in x and "1 had already lapsed" in x for x in notes)
     assert not tok.exists()
+
+
+def test_linux_leave_stops_and_verifies_an_in_flight_reassert_run(node, tmp_path):
+    """The worker twin of the host fix: the re-assert oneshot, not only its timer."""
+    n = node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    n.activating.add(link.REASSERT_SERVICE_NAME)
+    n.stop_fails.add(link.REASSERT_SERVICE_NAME)
+    notes = link.leave("wtwg0")
+    assert link.REASSERT_SERVICE_NAME in notes[-1] and "could not be stopped" in notes[-1]
+    assert n.loaded is not None and link.FW_UNIT.exists()
+    n.stop_fails.clear()
+    link.leave("wtwg0")
+    assert n.loaded is None

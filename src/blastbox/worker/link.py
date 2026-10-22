@@ -72,6 +72,16 @@ FW_UNIT_NAME = "blastbox-worker-link-peer-fw.service"
 FW_UNIT = Path("/etc/systemd/system") / FW_UNIT_NAME
 _FW_BASE = FW_UNIT_NAME.removesuffix(".service")
 REASSERT_TIMER_NAME = f"{_FW_BASE}-reassert.timer"
+REASSERT_SERVICE_NAME = f"{_FW_BASE}-reassert.service"
+#: `systemctl is-active` states in which a unit may still DO something (an in-flight oneshot is
+#: "activating", and `is-active` exits non-zero for it -- so its text is read, not just its code).
+_RUNNING_STATES = frozenset({"active", "activating", "deactivating", "reloading", "refreshing"})
+
+
+def _unit_running(unit: str) -> bool:
+    """Whether ``unit`` may still act: active, or IN FLIGHT (activating/deactivating...)."""
+    proc = _run(["systemctl", "is-active", unit])
+    return proc.returncode == 0 or (proc.stdout or "").strip() in _RUNNING_STATES
 
 
 def _reassert_paths() -> tuple[Path, Path]:
@@ -2091,12 +2101,16 @@ def leave(iface: str = DEFAULT_IFACE, *, purge: bool = False) -> list[str]:
             return notes
         notes.append(f"{iface} down; wg-quick@{iface} disabled")
         _run(["systemctl", "disable", "--now", REASSERT_TIMER_NAME])
+        # ...and the oneshot it fires: a run IN FLIGHT would re-create the table after the
+        # absence read-back below.
+        _run(["systemctl", "stop", REASSERT_SERVICE_NAME])
         _run(["systemctl", "disable", "--now", FW_UNIT_NAME])
-        # STOPPED and DISABLED, verified, before the table or any file goes: a timer still
-        # running would reload the table after the read-back (or a still-enabled boot unit at
-        # the next boot) -- an active filtering table with no records left to remove it by.
-        live = [u for u in (REASSERT_TIMER_NAME, FW_UNIT_NAME)
-                if _ok(["systemctl", "is-active", u]) or _ok(["systemctl", "is-enabled", u])]
+        # STOPPED and DISABLED, verified, before the table or any file goes: a timer or run
+        # still going would reload the table after the read-back (or a still-enabled boot unit
+        # at the next boot) -- an active filtering table with no records left to remove it by.
+        live = [u for u in (REASSERT_TIMER_NAME, REASSERT_SERVICE_NAME, FW_UNIT_NAME)
+                if _unit_running(u)
+                or (u != REASSERT_SERVICE_NAME and _ok(["systemctl", "is-enabled", u]))]
         if live:
             notes.append(f"WARNING: {', '.join(live)} could not be stopped and disabled; the "
                          "table, its units, config and keys are left in place. Re-run leave.")
