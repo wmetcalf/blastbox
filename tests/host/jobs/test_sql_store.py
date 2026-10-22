@@ -255,6 +255,28 @@ def test_postgres_crud():
 
 
 @pytest.mark.skipif(not POSTGRES_DSN, reason="BLASTBOX_TEST_PG_DSN not set")
+def test_postgres_replaces_a_dead_idle_connection_before_serving_a_request(monkeypatch):
+    import psycopg
+    monkeypatch.setenv('BLASTBOX_DB_POOL_MIN','1')
+    monkeypatch.setenv('BLASTBOX_DB_POOL_MAX','1')
+    store=SqlJobStore(POSTGRES_DSN)
+    job=_make_job(filename='retained-after-db-connection-loss.vbs')
+    try:
+        store.create(job)
+        with store.connection() as conn:
+            backend=conn.info.backend_pid
+        # Emulate a database restart dropping an existing pooled connection. Only
+        # this test's backend is terminated; no other caller's sessions are touched.
+        with psycopg.connect(POSTGRES_DSN,autocommit=True) as control:
+            assert control.execute('SELECT pg_terminate_backend(%s)',(backend,)).fetchone()[0]
+        recovered=store.get(job.job_id)
+        assert recovered is not None and recovered.filename==job.filename
+        store.delete(job.job_id)
+    finally:
+        store._pool.close()
+
+
+@pytest.mark.skipif(not POSTGRES_DSN, reason="BLASTBOX_TEST_PG_DSN not set")
 def test_postgres_claim_next_skip_locked():
     store = SqlJobStore(POSTGRES_DSN)
     job = _make_job()

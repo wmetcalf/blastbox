@@ -114,6 +114,11 @@ class SqlJobStore:
                 min_size=_env_int("BLASTBOX_DB_POOL_MIN", 2, low=1),
                 max_size=_env_int("BLASTBOX_DB_POOL_MAX", 32, low=1),
                 timeout=float(os.environ.get("BLASTBOX_DB_POOL_TIMEOUT", "10.0")),
+                # A restart can invalidate idle connections without updating their
+                # local closed flag. Reject those before lending them to a request;
+                # retrying a mutation after it starts could execute it twice.
+                check=ConnectionPool.check_connection,
+                open=True,
             )
         self._init_db()
 
