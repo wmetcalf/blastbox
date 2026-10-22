@@ -937,7 +937,21 @@ def keygen(iface: str, ip: str, *, rotate: bool = False) -> tuple[str, str, list
             raise RuntimeError(f"openssl could not make the CSR: {tail[0]}")
         csr = out.read_text()
     _write_public(p["csr"], csr)
-    _write_public(p["state"], json.dumps({"iface": iface, "worker_ip": str(addr)}) + "\n")
+    # MERGE into the existing record, never replace it: a keygen on a JOINED worker (a fresh
+    # CSR for a renewal, the same keys) used to rewrite it with only iface/worker_ip, dropping
+    # the join's host_ip/agent_port/name -- and status then reported the running link as not
+    # joined and skipped every live check. The join fields describe the INSTALLED link (whose
+    # address is joined_worker_ip), so they stay until a join or leave changes them.
+    try:
+        rec = json.loads(p["state"].read_text())
+    except (OSError, ValueError):
+        rec = None
+    if not isinstance(rec, dict) or rec.get("iface") != iface:
+        rec = {}
+    if rec.get("host_ip") and "joined_worker_ip" not in rec:
+        rec["joined_worker_ip"] = rec.get("worker_ip")      # a record written before this field
+    rec.update(iface=iface, worker_ip=str(addr))
+    _write_public(p["state"], json.dumps(rec) + "\n")
     return pub, csr, notes
 
 
@@ -1755,7 +1769,8 @@ def join(bundle_text: str, *, agent_user: str | None = None) -> list[str]:
         notes += _apply_linux(bundle, p, wg)
     else:
         notes += _apply_darwin(bundle, p, wg, conf_changed=conf_changed)
-    st.update(host_ip=bundle.host_ip, agent_port=bundle.agent_port, name=bundle.name)
+    st.update(host_ip=bundle.host_ip, agent_port=bundle.agent_port, name=bundle.name,
+              joined_worker_ip=bundle.worker_ip)
     _write_public(p["state"], json.dumps(st) + "\n")
     notes.append("(re)start the agent with the environment below -- it loads its certificate "
                  "once, so after a renewal it must be RESTARTED to serve the new one:")
@@ -1780,7 +1795,9 @@ def status(iface: str = DEFAULT_IFACE) -> tuple[bool, list[str]]:
     rows: list[str] = []
     try:
         st = _load_state(iface)
-        ip = st["worker_ip"]
+        # the INSTALLED link's address: a later keygen for a new address (before the re-join)
+        # changes worker_ip, not what is running
+        ip = st.get("joined_worker_ip") or st["worker_ip"]
     except RuntimeError as exc:
         return False, [str(exc)]
     host_ip, agent_port = st.get("host_ip"), st.get("agent_port")
@@ -2035,8 +2052,9 @@ def leave(iface: str = DEFAULT_IFACE, *, purge: bool = False) -> list[str]:
             st = json.loads(p["state"].read_text())
         except (OSError, ValueError):
             st = None
-        if isinstance(st, dict) and any(k in st for k in ("host_ip", "agent_port", "name")):
-            for k in ("host_ip", "agent_port", "name"):
+        joined = ("host_ip", "agent_port", "name", "joined_worker_ip")
+        if isinstance(st, dict) and any(k in st for k in joined):
+            for k in joined:
                 st.pop(k, None)
             _write_public(p["state"], json.dumps(st) + "\n")
         notes.append(f"keys kept in {KEY_DIR} and {STATE_DIR} (--purge removes them)")

@@ -1887,3 +1887,38 @@ def test_a_linux_join_verifies_the_live_endpoint_too(node, tmp_path):
     with pytest.raises(RuntimeError, match="endpoint .* is not gw.example.org:51822.*taken DOWN"):
         link.join(_bundle(tmp_path, csr))
     assert "wtwg0" not in n.links
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_a_csr_refresh_on_a_joined_worker_keeps_it_joined(node, tmp_path, platform):
+    """REGRESSION (review): a non-rotating keygen (a fresh CSR for a renewal) on a JOINED
+    worker rewrote the state record with only iface/worker_ip, dropping host_ip, agent_port and
+    name -- status then called the running link "not joined" and skipped every live check. The
+    record is merged now; the join fields stay until a join or leave changes them."""
+    node(platform)
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    before = json.loads(link._paths("wtwg0")["state"].read_text())
+    link.keygen("wtwg0", "10.78.0.5")                    # same keys, fresh CSR
+    after = json.loads(link._paths("wtwg0")["state"].read_text())
+    for k in ("host_ip", "agent_port", "name", "joined_worker_ip"):
+        assert after.get(k) == before.get(k), k
+    _ok, rows = link.status("wtwg0")
+    assert not any("has not joined" in r for r in rows), rows
+
+
+def test_a_keygen_for_a_new_address_keeps_status_on_the_installed_link(node, tmp_path):
+    """Sweep: keygen for a NEW address on a joined worker (the address-move flow, before the
+    re-join) records the new CSR address but status keeps checking the link that is actually
+    installed, at its joined address; leave clears every join field."""
+    node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    link.keygen("wtwg0", "10.78.0.6")
+    rec = json.loads(link._paths("wtwg0")["state"].read_text())
+    assert rec["worker_ip"] == "10.78.0.6" and rec["joined_worker_ip"] == "10.78.0.5"
+    _ok, rows = link.status("wtwg0")
+    assert any(r == "overlay address: 10.78.0.5" for r in rows), rows
+    link.leave("wtwg0")
+    rec = json.loads(link._paths("wtwg0")["state"].read_text())
+    assert not any(k in rec for k in ("host_ip", "agent_port", "name", "joined_worker_ip"))
