@@ -744,15 +744,21 @@ def _host_fail_closed(cfg: WorkerLinkConfig) -> str:
     cannot be vouched for; returns the sentence to append to the error."""
     iface, unit = cfg.wg_iface, f"wg-quick@{cfg.wg_iface}"
     ea._run(["systemctl", "disable", unit], check=False)
+    still_enabled = ""
+    if ea._ok(["systemctl", "is-enabled", unit]):        # verified, not assumed
+        still_enabled = (f" {unit} could NOT be disabled and would start {iface} at the next "
+                         f"boot without its firewall: `systemctl disable {unit}` by hand NOW.")
     if not ea._ok(["ip", "link", "show", iface]):
-        return ""
+        return f".{still_enabled}" if still_enabled else ""
     ea._run(["systemctl", "stop", unit], check=False)
     ea._run(["wg-quick", "down", iface], check=False)
     if ea._ok(["ip", "link", "show", iface]):
         ea._run(["ip", "link", "delete", "dev", iface], check=False)
     if ea._ok(["ip", "link", "show", iface]):
         return (f". {iface} could NOT be taken down and may be running without its firewall: "
-                f"`ip link delete dev {iface}` by hand NOW")
+                f"`ip link delete dev {iface}` by hand NOW.{still_enabled}")
+    if still_enabled:
+        return f". {iface} was taken DOWN.{still_enabled}"
     return f". {iface} was taken DOWN (and {unit} disabled) rather than left running without it"
 
 
@@ -1204,6 +1210,15 @@ def teardown(cfg: WorkerLinkConfig) -> list[str]:
     notes.append(f"{cfg.wg_iface} down; wg-quick@{cfg.wg_iface} disabled")
     ea._run(["systemctl", "disable", "--now", REASSERT_TIMER_NAME], check=False)
     ea._run(["systemctl", "disable", "--now", FW_UNIT_NAME], check=False)
+    # STOPPED and DISABLED, verified, before the table or any record goes: a re-assert timer
+    # still running would reload the table after the read-back below (or a still-enabled boot
+    # unit at the next boot) -- an active filtering table with no records left to find it by.
+    live = [u for u in (REASSERT_TIMER_NAME, FW_UNIT_NAME)
+            if ea._ok(["systemctl", "is-active", u]) or ea._ok(["systemctl", "is-enabled", u])]
+    if live:
+        notes.append(f"WARNING: {', '.join(live)} could not be stopped and disabled; the table, "
+                     f"{ENV_FILE} and the units are left in place. Re-run teardown.")
+        return notes
     ea._run(["nft", "delete", "table", "inet", NFT_TABLE], check=False)
     listing, why = _nft_listing()
     # The env file and the firewall boot unit are the RECOVERY RECORDS: _installed_ifaces()

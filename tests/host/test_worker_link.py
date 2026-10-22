@@ -199,7 +199,9 @@ def test_host_firewall_lets_only_the_host_open_the_agent_port():
     inp = _chain(fw, "input")
     # a worker can never start anything toward the host
     lines = [ln.strip() for ln in inp.strip().splitlines()]
-    assert lines[1:4] == ['iifname "wtwg0" ct state established,related accept',
+    assert lines[1:4] == ['iifname "wtwg0" ct direction reply ct original ip saddr 10.78.0.1 '
+                          'ct original ip daddr 10.78.0.0/24 ct original proto-dst 8765 '
+                          'ct state established,related accept',
                           'iifname "wtwg0" drop',
                           'iifname != { "lo", "wtwg0" } ip daddr 10.78.0.0/24 drop']
     fwd = _chain(fw, "forward")
@@ -265,27 +267,29 @@ def test_a_counter_on_a_rule_still_counts():
 #: come back as the bare prefix. Whatever the comparison checks, it must accept this.
 #: The forward chain's `iifname != ... ct direction original ct original ip daddr ... drop`
 #: line was added to the ruleset later (review round 15, off-link DNAT); it is written here in
-#: the form nft prints that expression, and is the one line not yet observed on a live kernel.
+#: the form nft prints that expression (since confirmed on a live kernel). The four
+#: `ct direction ... ct original ...` established lines (review round 19) are likewise written
+#: as nft prints them and are not yet observed on a live kernel.
 REAL_NFT_1_0_9_LISTING = """table inet blastbox_worker_link {
 \tchain input {
 \t\ttype filter hook input priority filter; policy accept;
-\t\tiifname "wltest0" ct state established,related accept
+\t\tiifname "wltest0" ct direction reply ct original ip saddr 10.79.0.1 ct original ip daddr 10.79.0.0/24 ct original proto-dst 8765 ct state established,related accept
 \t\tiifname "wltest0" drop
 \t\tiifname != { "lo", "wltest0" } ip daddr 10.79.0.0/24 drop
 \t}
 \tchain forward {
 \t\ttype filter hook forward priority filter; policy accept;
-\t\tiifname "wltest0" ct state established,related accept
+\t\tiifname "wltest0" ct direction reply ct original ip saddr 172.31.0.0/16 ct original ip daddr 10.79.0.0/24 ct original proto-dst 8765 ct state established,related accept
 \t\tiifname "wltest0" drop
 \t\tiifname != "wltest0" oifname != "wltest0" ct direction original ct original ip daddr 10.79.0.0/24 drop
 \t\toifname "wltest0" ip saddr 172.31.0.0/16 ip daddr 10.79.0.0/24 tcp dport 8765 ct state new accept
-\t\toifname "wltest0" ct state established,related accept
+\t\toifname "wltest0" ct direction original ct original ip saddr 172.31.0.0/16 ct original ip daddr 10.79.0.0/24 ct original proto-dst 8765 ct state established accept
 \t\toifname "wltest0" drop
 \t}
 \tchain output {
 \t\ttype filter hook output priority filter; policy accept;
 \t\toifname "wltest0" ip saddr 10.79.0.1 ip daddr 10.79.0.0/24 tcp dport 8765 ct state new accept
-\t\toifname "wltest0" ct state established,related accept
+\t\toifname "wltest0" ct direction original ct original ip saddr 10.79.0.1 ct original ip daddr 10.79.0.0/24 ct original proto-dst 8765 ct state established accept
 \t\toifname "wltest0" drop
 \t}
 \tchain postrouting {
@@ -325,10 +329,10 @@ def test_a_broadened_accept_is_not_in_force_even_with_the_same_rule_count():
     assert any("forward" in m for m in firewall_in_force(wide, fw))
     # an accept moved AHEAD of a drop (same rules, different order) is not ours either
     reordered = REAL_NFT_1_0_9_LISTING.replace(
-        '\t\toifname "wltest0" ct state established,related accept\n'
+        '\t\toifname "wltest0" ct direction original ct original ip saddr 10.79.0.1 ct original ip daddr 10.79.0.0/24 ct original proto-dst 8765 ct state established accept\n'
         '\t\toifname "wltest0" drop\n\t}\n\tchain postrouting',
         '\t\toifname "wltest0" drop\n'
-        '\t\toifname "wltest0" ct state established,related accept\n\t}\n\tchain postrouting')
+        '\t\toifname "wltest0" ct direction original ct original ip saddr 10.79.0.1 ct original ip daddr 10.79.0.0/24 ct original proto-dst 8765 ct state established accept\n\t}\n\tchain postrouting')
     assert reordered != REAL_NFT_1_0_9_LISTING
     assert any("order" in m for m in firewall_in_force(reordered, fw))
 
@@ -614,10 +618,10 @@ def test_no_off_link_path_reaches_a_dnat_target_on_an_overlay_address():
 
     worker = link.worker_firewall_nft(iface="wtwg0", worker_ip="10.78.0.5", host_ip="10.78.0.1",
                                       agent_port=8765)
-    fwd = worker.split("chain forward {", 1)[1].split("}", 1)[0]
+    fwd = worker.split("chain forward {", 1)[1].split("\n\t}", 1)[0]
     assert 'iifname != "wtwg0" ct direction original ct original ip daddr 10.78.0.5 drop' in fwd
     host = host_firewall_nft(_cfg(dispatcher_sources=("172.18.0.0/16",)))
-    hfwd = host.split("chain forward {", 1)[1].split("}", 1)[0]
+    hfwd = host.split("chain forward {", 1)[1].split("\n\t}", 1)[0]
     assert ('iifname != "wtwg0" oifname != "wtwg0" ct direction original '
             'ct original ip daddr 10.78.0.0/24 drop') in hfwd
     # it is part of what the read-back requires: a listing without it is not in force
@@ -625,3 +629,39 @@ def test_no_off_link_path_reaches_a_dnat_target_on_an_overlay_address():
     assert firewall_in_force(listing, host) == []
     stripped = "\n".join(ln for ln in listing.splitlines() if "ct direction original" not in ln)
     assert firewall_in_force(stripped, host)
+
+
+def test_established_traffic_is_pinned_to_the_permitted_flow_on_both_ends():
+    """REGRESSION (review): an unrestricted `ct state established,related accept` (host input/
+    output; worker input/output) kept passing a flow a worker -- or anything -- opened while
+    the table was flushed: conntrack outlives the ruleset, and a reload does not revoke it.
+    Established traffic is now accepted only in the direction, and with the original tuple, of
+    the connection the ruleset admits NEW (host/dispatcher -> worker : agent port)."""
+    from blastbox.worker import link
+
+    host = host_firewall_nft(_cfg(dispatcher_sources=("172.18.0.0/16",)))
+    worker = link.worker_firewall_nft(iface="wtwg0", worker_ip="10.78.0.5", host_ip="10.78.0.1",
+                                      agent_port=8765)
+    for fw in (host, worker):
+        for ln in fw.splitlines():
+            if "established" in ln:
+                assert "ct direction" in ln and "ct original ip saddr" in ln, ln
+                assert "ct original proto-dst 8765" in ln, ln
+    hin = _chain(host, "input")
+    assert ('iifname "wtwg0" ct direction reply ct original ip saddr 10.78.0.1 ct original ip '
+            'daddr 10.78.0.0/24 ct original proto-dst 8765 ct state established,related accept'
+            ) in hin
+    win = worker.split("chain input {", 1)[1].split("\n\t}", 1)[0]
+    assert ('iifname "wtwg0" ct direction original ct original ip saddr 10.78.0.1 ct original '
+            'ip daddr 10.78.0.5 ct original proto-dst 8765 ct state established accept') in win
+    wout = worker.split("chain output {", 1)[1].split("\n\t}", 1)[0]
+    assert ('oifname "wtwg0" ct direction reply ct original ip saddr 10.78.0.1 ct original ip '
+            'daddr 10.78.0.5 ct original proto-dst 8765 ct state established,related accept'
+            ) in wout
+    # the read-back requires the pinned form: the old unrestricted accept is NOT in force
+    listing = host.split(f"delete table inet {NFT_TABLE}\n", 1)[1]
+    loose = listing.replace(
+        'iifname "wtwg0" ct direction reply ct original ip saddr 10.78.0.1 ct original ip daddr '
+        '10.78.0.0/24 ct original proto-dst 8765 ct state established,related accept',
+        'iifname "wtwg0" ct state established,related accept')
+    assert loose != listing and firewall_in_force(loose, host)

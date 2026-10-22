@@ -56,6 +56,7 @@ class FakeHost:
         self.nft_list_error: str | None = None        # `nft list table` fails some other way
         self.active: set[str] = set()                 # non-link units that were STARTED
         self.start_fails: set[str] = set()            # units whose start (--now) fails
+        self.disable_fails_units: set[str] = set()    # non-link units whose disable fails
 
     def _up(self, iface: str) -> None:
         """A (re)start reads the interface's config file, as wg-quick does."""
@@ -130,6 +131,8 @@ class FakeHost:
         elif a[:2] == ["systemctl", "disable"] and self.disable_fails \
                 and a[-1].startswith("wg-quick@"):
             rc, err = 1, "Failed to disable unit"
+        elif a[:2] == ["systemctl", "disable"] and a[-1] in self.disable_fails_units:
+            rc, err = 1, f"Failed to disable {a[-1]}"
         elif a[:2] == ["systemctl", "disable"]:
             self.enabled.discard(a[-1])
             if a[2] == "--now":
@@ -1232,3 +1235,34 @@ def test_a_first_init_applies_the_environment_settings(host, monkeypatch, capsys
     installed = wla.WorkerLinkConfig.from_env(wla._persisted_env())
     assert installed.overlay_net == "10.79.0.0/24" and installed.endpoint == "gw.example.org:51900"
     assert installed.agent_port == 9555                      # the flag overrides the env
+
+
+def test_fail_closed_cleanup_verifies_the_link_unit_was_really_disabled(host):
+    """REGRESSION (review): when the firewall failed read-back on a re-init, the fail-closed
+    cleanup ignored a failed `systemctl disable wg-quick@` and reported the unit disabled -- a
+    link that would boot without its firewall. Now verified with is-enabled, and said loudly."""
+    wla.init_host(_cfg())
+    host.nft_drop_missing = True
+    host.disable_fails = True
+    with pytest.raises(wla.FirewallNotInForce) as ei:
+        wla.init_host(_cfg(agent_port=9443))
+    msg = str(ei.value)
+    assert "wg-quick@wtwg0 could NOT be disabled" in msg
+    assert "disabled) rather than left" not in msg
+    assert "wg-quick@wtwg0" in host.enabled
+
+
+@pytest.mark.parametrize("unit", ["blastbox-worker-link-fw-reassert.timer",
+                                  "blastbox-worker-link-fw.service"])
+def test_teardown_keeps_everything_while_the_reassert_timer_or_boot_unit_still_runs(host, unit):
+    """REGRESSION (review): teardown did not verify the re-assert timer (and boot unit) were
+    stopped and disabled before deleting the table and files -- a timer firing after the
+    read-back reloaded the table with no records left to remove it by."""
+    wla.init_host(_cfg())
+    host.disable_fails_units.add(unit)
+    notes = wla.teardown(_cfg())
+    assert "could not be stopped and disabled" in notes[-1]
+    assert host.loaded is not None and wla.ENV_FILE.exists() and wla.FW_UNIT.exists()
+    host.disable_fails_units.clear()
+    wla.teardown(_cfg())
+    assert host.loaded is None and not wla.ENV_FILE.exists()

@@ -68,6 +68,7 @@ class FakeNode:
         self.pf_flushed = False
         self.pf_flush_fails = False
         self.active: set[str] = set()           # non-link units that were STARTED
+        self.disable_fails_units: set[str] = set()
         #: what the LIVE tunnel runs (wg show dump / addresses), as a restart would set it
         self.live_endpoint = "192.0.2.10:51822"
         self.live_addr = "10.78.0.5"
@@ -189,10 +190,13 @@ class FakeNode:
         elif a[:2] == ["systemctl", "disable"]:
             if a[2] == "--now" and a[3].startswith("wg-quick@"):
                 self.links.discard(a[3].split("@")[1])
-            if self.disable_fails and a[-1].startswith("wg-quick@"):
+            if (self.disable_fails and a[-1].startswith("wg-quick@")) \
+                    or a[-1] in self.disable_fails_units:
                 rc, err = 1, "Failed to disable unit"
             else:
                 self.enabled.discard(a[-1])
+                if a[2] == "--now":
+                    self.active.discard(a[-1])
         elif tool == "launchctl" and a[1] == "print":
             rc = 0 if self.launchd_loaded else 1
         elif tool == "launchctl" and a[1] == "bootstrap":
@@ -415,7 +419,7 @@ def mac(tmp_path):
     pfctl = _fake_bin(bin_d, "pfctl", env_hdr + (
         'case "$*" in\n'
         '  *"-s info"*) echo "Status: $(cat "$ST/pf")"; exit 0 ;;\n'
-        '  *"-E"*) echo Enabled > "$ST/pf"; exit 0 ;;\n'
+        '  *"-E"*) echo Enabled > "$ST/pf"; echo "pf enabled" >&2; echo "Token : 4242" >&2; exit 0 ;;\n'
         '  *"-a "*"-s rules"*) cat "$ST/anchor" 2>/dev/null; exit 0 ;;\n'
         '  *"-s rules"*) cat "$ST/main"; exit 0 ;;\n'
         '  *"-f -"*) cat > "$ST/anchor"; echo "LOADED $(head -1 "$ST/anchor")" >> "$LOG"; exit 0 ;;\n'
@@ -1973,3 +1977,81 @@ def test_a_bypass_before_the_unconditional_anchor_is_still_caught_behind_a_condi
     mac.main_rules(main)
     with pytest.raises(AssertionError, match="passes"):
         mac.run()
+
+
+def test_linux_leave_keeps_everything_while_the_reassert_timer_still_runs(node, tmp_path):
+    """Sweep (review round 19): the worker's Linux leave had the same unchecked timer/boot-unit
+    shutdown as host teardown."""
+    n = node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    n.disable_fails_units.add(link.REASSERT_TIMER_NAME)
+    notes = link.leave("wtwg0")
+    assert "could not be stopped and disabled" in notes[-1]
+    assert n.loaded is not None and link.FW_UNIT.exists() and link._paths("wtwg0")["conf"].exists()
+    n.disable_fails_units.clear()
+    link.leave("wtwg0")
+    assert n.loaded is None
+
+
+def test_linux_fail_closed_verifies_the_link_unit_was_really_disabled(node, tmp_path,
+                                                                      monkeypatch):
+    n = node("linux")
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))                 # installed, wg-quick@ enabled
+    real = n.run
+
+    def run(argv, **kw):
+        if list(argv)[:2] == ["systemctl", "enable"] and argv[-1] == link.FW_UNIT_NAME:
+            return subprocess.CompletedProcess(list(argv), 1, "", "Failed to enable")
+        return real(argv, **kw)
+
+    monkeypatch.setattr(link, "_run", run)
+    n.disable_fails = True                            # ...and its disable will fail
+    with pytest.raises(RuntimeError, match="wg-quick@wtwg0 could NOT be disabled"):
+        link.join(_bundle(tmp_path, csr))
+
+
+def test_the_watchdog_keeps_its_pf_enable_token(mac, tmp_path):
+    """REGRESSION (review): `pfctl -E` returns an enable-reference token, which was discarded
+    -- so removing worker-link left pf globally enabled when it had been off. The watchdog
+    keeps the token for `leave` to release."""
+    mac.up("utun7")
+    mac.pf("Disabled")
+    mac.run()
+    tokens = tmp_path / "state" / "blastbox-worker-link.wtwg0.pftokens"
+    assert tokens.read_text().split() == ["4242"]
+
+
+def test_the_watchdog_kills_worker_initiated_pf_states_when_it_loads_the_anchor(mac):
+    """Sweep of the established-flow finding for macOS: pf matches STATES before rules, so a
+    connection the worker opened while the anchor was flushed would survive the reload. The
+    watchdog kills states from this worker to the host whenever it (re)loads the anchor."""
+    mac.up("utun7")
+    calls = mac.run()
+    assert "pfctl -k 10.78.0.5 -k 10.78.0.1" in calls
+
+
+def test_leave_releases_the_pf_enable_token_and_handles_a_lapsed_one(node, tmp_path,
+                                                                     monkeypatch):
+    n = node("darwin")
+    monkeypatch.setattr(link, "PF_STATE_DIR", tmp_path / "varrun")
+    (tmp_path / "varrun").mkdir()
+    _pub, csr, _ = link.keygen("wtwg0", "10.78.0.5")
+    link.join(_bundle(tmp_path, csr))
+    tok = Path(link.pf_token_file("wtwg0"))
+    tok.write_text("4242\n5151\n")
+    real = n.run
+
+    def run(argv, **kw):
+        a = [str(x) for x in argv]
+        if Path(a[0]).name == "pfctl" and a[1:2] == ["-X"]:
+            n.calls.append(a)
+            return subprocess.CompletedProcess(a, 0 if a[2] == "4242" else 1, "", "")
+        return real(argv, **kw)
+
+    monkeypatch.setattr(link, "_run", run)
+    notes = link.leave("wtwg0")
+    assert any(c[-2:] == ["-X", "4242"] for c in n.calls)
+    assert any("released 1 enable reference" in x and "1 had already lapsed" in x for x in notes)
+    assert not tok.exists()
