@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import concurrent.futures
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -73,6 +74,16 @@ def _stop(httpd):
     httpd.server_close()
 
 
+def _await_retired(timeout: float = 10.0) -> list[int]:
+    """The agent writes its refusal BEFORE it retires (the bounded sweep, then the exit), so the
+    client can see the 500 while the handler thread is still on its way to the exit: wait for
+    the retirement instead of racing it."""
+    deadline = time.monotonic() + timeout
+    while not RETIRED and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return RETIRED
+
+
 def test_an_engine_that_does_not_declare_sandboxed_parsing_is_refused():
     class Plain(_Engine):
         sandboxed_parsing = False
@@ -116,7 +127,7 @@ def test_a_rejection_from_detonate_still_needs_a_confined_run():
     httpd, port = _agent(_Engine(confine=False, status="rejected"))
     try:
         assert _detonate(port) == 500
-        assert RETIRED == [75]
+        assert _await_retired() == [75]
     finally:
         _stop(httpd)
 
@@ -504,7 +515,18 @@ class TestUnconfinedOutcomesFailClosed:
         httpd, port = _agent(_Engine(confine=False, status="rejected"))
         try:
             assert _detonate(port) == 500
-            assert RETIRED == [75]
+            assert _await_retired() == [75]
+        finally:
+            _stop(httpd)
+
+    def test_the_retirement_is_awaited_not_raced(self, monkeypatch):
+        # CI flake (#201): the refusal reaches the client before the handler thread exits. A
+        # slow sweep makes that window wide; the assertion must still see the retirement.
+        monkeypatch.setattr(ha, "run_emergency_cleanups", lambda t: time.sleep(0.5))
+        httpd, port = _agent(_Engine(confine=False, status="rejected"))
+        try:
+            assert _detonate(port) == 500
+            assert _await_retired() == [75]
         finally:
             _stop(httpd)
 
@@ -516,7 +538,7 @@ class TestUnconfinedOutcomesFailClosed:
         httpd, port = _agent(Raises(confine=False))
         try:
             assert _detonate(port) == 500
-            assert RETIRED == [75]
+            assert _await_retired() == [75]
         finally:
             _stop(httpd)
 
@@ -524,7 +546,7 @@ class TestUnconfinedOutcomesFailClosed:
         httpd, port = _agent(_Engine(confine=False))
         try:
             assert _detonate(port) == 500
-            assert RETIRED == [75]
+            assert _await_retired() == [75]
         finally:
             _stop(httpd)
 
@@ -563,7 +585,7 @@ class TestUnconfinedOutcomesFailClosed:
         httpd, port = _agent(PassesThenParses(confine=False, status="rejected"))
         try:
             assert _detonate(port) == 500
-            assert RETIRED == [75]
+            assert _await_retired() == [75]
         finally:
             _stop(httpd)
 
