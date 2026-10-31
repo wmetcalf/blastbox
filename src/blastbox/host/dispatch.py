@@ -2511,6 +2511,7 @@ class Dispatcher:
         from blastbox.host.netpolicy import resolve_net_policy
         from blastbox.host.netapply import (
             BRIDGE_NAME_RE,
+            RESERVED_BRIDGES,
             docker_network_args,
             inspect_routes_via_gateway,
             worker_resolv_conf,
@@ -2657,11 +2658,21 @@ class Dispatcher:
                     f"the proxy sidecar shares). Remove bridge= or use httpproxy.",
                 )
                 return
-            if not BRIDGE_NAME_RE.fullmatch(personality.config["bridge"]):
+            named_bridge = personality.config["bridge"]
+            if not BRIDGE_NAME_RE.fullmatch(named_bridge) or named_bridge in RESERVED_BRIDGES:
                 self._fail_job(
                     job,
-                    f"netpolicy {personality.name!r}: bridge={personality.config['bridge'][:80]!r} "
-                    f"is not a valid bridge name (must match {BRIDGE_NAME_RE.pattern}).",
+                    f"netpolicy {personality.name!r}: bridge={named_bridge[:80]!r} is not a valid "
+                    f"bridge name (must match {BRIDGE_NAME_RE.pattern} and not be a blastbox-managed "
+                    f"bridge: {', '.join(sorted(RESERVED_BRIDGES))}).",
+                )
+                return
+            if not self._bridge_is_internal(named_bridge):
+                self._fail_job(
+                    job,
+                    f"netpolicy {personality.name!r}: bridge={named_bridge!r} is not verified "
+                    f"--internal (missing or docker reports external); the bridge must be created "
+                    f"with `docker network create --internal`.",
                 )
                 return
         # Egress-hardening knobs (egress_ports / block_internal) are only enforceable on the

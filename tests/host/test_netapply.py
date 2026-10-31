@@ -293,3 +293,10 @@ def test_bridge_invalid_name_fails_closed(bad, caplog):
     p = _p("httpproxy", config={"proxy": "http://p:8888", "bridge": bad})
     with caplog.at_level(logging.WARNING):
         assert docker_network_args(p) == ["--network=none"]
+
+
+@pytest.mark.parametrize("reserved", ["bb-net0", "bb-fakenet", "bb-socks", "bb-vpn", "bb-inspect",
+                                      "bb-isolated", "bb-launcher"])
+def test_bridge_reserved_name_fails_closed(reserved):
+    p = _p("httpproxy", config={"proxy": "http://p:8888", "bridge": reserved})
+    assert docker_network_args(p) == ["--network=none"]

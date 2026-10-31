@@ -93,6 +93,12 @@ _RESOLV_DRIVERS = _EGRESS_DRIVERS | frozenset({"httpproxy"})
 INSPECT_BRIDGE = "bb-inspect"
 
 
+# Blastbox-managed bridge names an operator-named ``bridge=`` may never take: they carry direct
+# egress / other tiers' wiring, so naming one would bypass the httpproxy-only-route property.
+RESERVED_BRIDGES = frozenset(_BRIDGE_NETWORKS.values()) | frozenset(
+    {INSPECT_BRIDGE, "bb-isolated", "bb-launcher"})
+
+
 def inspect_routes_via_gateway(personality: Personality) -> bool:
     """True iff an inspected worker is route-wired to the MITM gateway (rides ``bb-inspect``).
 
@@ -141,7 +147,8 @@ def docker_network_args(personality: Personality) -> list[str]:
     # ``bb-`` prefixed docker-safe name, fails closed (never ``host``/``bridge``/a path).
     if "bridge" in personality.config:
         named = personality.config["bridge"]
-        if driver != "httpproxy" or not BRIDGE_NAME_RE.fullmatch(named):
+        if (driver != "httpproxy" or not BRIDGE_NAME_RE.fullmatch(named)
+                or named in RESERVED_BRIDGES):
             _log.warning(
                 "netpolicy: bridge=%r invalid or not allowed for exit_driver %r (httpproxy only, "
                 "name must match %s); failing closed to --network=none",

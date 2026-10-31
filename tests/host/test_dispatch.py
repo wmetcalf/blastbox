@@ -2000,6 +2000,63 @@ def test_bridge_on_non_httpproxy_fails_job(tmp_path, monkeypatch):
     assert "bridge=" in (final.error or "") and "httpproxy" in (final.error or "")
 
 
+def _run_bridge_job(tmp_path, monkeypatch, decl, internal):
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_BRX", decl)
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    output_dir = tmp_path / job.job_id / "output"
+    launched: list[list[str]] = []
+
+    def fake_runner(argv, **kw):
+        launched.append(list(argv))
+        if argv[:2] == ["docker", "run"]:
+            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+                     net_policy="brx")
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng},
+                                  subprocess_runner=fake_runner)
+    dispatcher._bridge_is_internal = lambda name: internal
+    assert dispatcher.dispatch_once() is True
+    return store.get(job.job_id), launched
+
+
+_BRX = "exit=httpproxy,proxy=http://172.30.0.30:8888,bridge="
+
+
+@pytest.mark.parametrize("bad", ["BB-X", "host", "bb-", "../x"])
+def test_httpproxy_invalid_bridge_name_fails_job(tmp_path, monkeypatch, bad):
+    final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + bad, True)
+    assert final.status == JobStatus.FAILED and "bridge=" in (final.error or "")
+    assert not any(a[:2] == ["docker", "run"] for a in launched)
+
+
+@pytest.mark.parametrize("reserved", ["bb-net0", "bb-fakenet", "bb-socks", "bb-vpn", "bb-inspect"])
+def test_httpproxy_reserved_bridge_fails_job(tmp_path, monkeypatch, reserved):
+    final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + reserved, True)
+    assert final.status == JobStatus.FAILED and "bridge=" in (final.error or "")
+    assert not any(a[:2] == ["docker", "run"] for a in launched)
+
+
+def test_httpproxy_non_internal_bridge_fails_job(tmp_path, monkeypatch):
+    final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + "bb-rea-model", False)
+    assert final.status == JobStatus.FAILED
+    assert "--internal" in (final.error or "")
+    assert not any(a[:2] == ["docker", "run"] for a in launched)
+
+
+def test_httpproxy_internal_bridge_runs_on_named_network(tmp_path, monkeypatch):
+    final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + "bb-rea-model", True)
+    argv = next(a for a in launched if a[:2] == ["docker", "run"])
+    i = argv.index("--network")
+    assert argv[i + 1] == "bb-rea-model"
+    assert "blastbox.net.leakguard=strict" in argv
+
+
 def test_decrypt_seals_decrypted_and_mixed_when_keylog_present(tmp_path, monkeypatch):
     """With BLASTBOX_NET_DECRYPT + a keylog in the capture dir, the dispatcher runs GoGoRoboCap
     and seals decrypted+mixed pcaps as trusted artifacts."""
