@@ -74,6 +74,12 @@ clamav = [
 magika = [
     "magika>=1.0.0",
 ]
+# The REA (reverse-engineering) engine's in-worker helpers: PE resource/icon parsing and
+# icon decoding. Worker-image only (deploy/docker/Dockerfile.rea-cold-worker).
+rea = [
+    "pefile==2024.8.26",
+    "Pillow==13.0.0",
+]
 dev = [
     "blastbox[host]",              # the http/ingress tests need the host stack (fastapi, etc.)
     "blastbox[clamav]",

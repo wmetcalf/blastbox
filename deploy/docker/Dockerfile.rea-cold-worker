@@ -1,0 +1,198 @@
+# syntax=docker/dockerfile:1
+# Cold-path (runsc/runc) worker image for the REA reverse-engineering engine.
+#
+# REA (github.com/morluto/rea) is a CLI + MCP server that drives Ghidra headless. The
+# engine (src/blastbox/engines/rea) runs analyzeHeadless once, then opens the saved
+# project through `rea --mcp` in REA's existing-project mode (a private copy, no
+# re-import). See deploy/rea/SPIKE.md for the measurements behind every choice here.
+#
+# EVERYTHING IS PINNED (deploy/rea/PINS records the same values):
+#   * REA is BUILT FROM SOURCE at a fixed commit. The npm release (rea-agents 6.8.0)
+#     lacks existing-project reuse and ignores REA_GHIDRA_PROJECT_PATH without a
+#     warning. The codeload tarball is sha256-checked. `npm pack` is not usable because
+#     it runs `prepare` even with --ignore-scripts, so the runtime tree is copied from
+#     package.json's own "files" list plus production node_modules.
+#   * Ghidra by release URL + sha256; Node by official tarball + sha256 (checked against
+#     both the pin and SHASUMS256.txt); the JDK base by digest.
+#   * The build smoke asserts REA's tool-catalog digest, so a different REA build fails
+#     the image build even though it still says "6.8.0".
+#
+# FULL JDK, NOT A JRE. Ghidra compiles Java GhidraScripts (REA's bridge, our scripts)
+# at run time with javax.tools, which only a JDK has.
+#
+# NO NETWORK AT RUN TIME. REA's Ghidra bridge is a unix socket in its runtime root.
+# frida is an optional dependency whose native binding is never fetched
+# (--ignore-scripts), so frida tools stay unavailable, as intended.
+#
+# WRITABLE STATE. REA puts its runtime root (project copy, logs, fscache, bridge.sock)
+# at $TMPDIR/rea-ghidra-XXXX and needs a writable HOME. The engine sets
+# TMPDIR=$BLASTBOX_WORK_DIR/tmp and HOME=$BLASTBOX_WORK_DIR/home; the build smoke proves
+# REA honours TMPDIR.
+#
+# Build context = blastbox repo root:
+#   docker build -f deploy/docker/Dockerfile.rea-cold-worker -t blastbox-rea:dev .
+# Regenerate the committed fixtures (deploy/rea/fixtures/build.sh):
+#   docker build -f deploy/docker/Dockerfile.rea-cold-worker --target rea-fixtures \
+#     --output type=local,dest=<dir> .
+
+ARG JDK_IMAGE=eclipse-temurin:21-jdk@sha256:ebfbb18d11ff163ee83b21258acf12248af48d22a0fdfdc68fa1a1516c05976a
+
+# ---------------------------------------------------------------- node (pinned tarball)
+FROM ${JDK_IMAGE} AS node
+ARG NODE_VERSION=v22.23.4
+ARG NODE_TARBALL_SHA256=1805bcd35e6815559bd2eb97db438d3fdb0eb3a5e6a977b7c1badca76337e9ce
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       ca-certificates curl xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build/node
+RUN tarball="node-${NODE_VERSION}-linux-x64.tar.xz" \
+    && curl -fsSLO "https://nodejs.org/dist/${NODE_VERSION}/${tarball}" \
+    && curl -fsSLO "https://nodejs.org/dist/${NODE_VERSION}/SHASUMS256.txt" \
+    && echo "${NODE_TARBALL_SHA256}  ${tarball}" | sha256sum -c - \
+    && grep " ${tarball}\$" SHASUMS256.txt | sha256sum -c - \
+    && mkdir -p /opt/node \
+    && tar -xJf "${tarball}" -C /opt/node --strip-components=1 \
+    && rm -rf /build/node \
+    && /opt/node/bin/node --version
+
+# ------------------------------------------------------------ rea (source build, pinned)
+FROM node AS rea-build
+ARG REA_COMMIT=cd878ad57d3e27e835d0db533c9603b24ae8607a
+ARG REA_TARBALL_SHA256=44cec1b6be85a8ccf1576ca397594cdab2aacfbfc316cc817e5f568f7b7ad766
+ENV PATH=/opt/node/bin:$PATH
+WORKDIR /build
+RUN curl -fsSL -o rea.tar.gz "https://codeload.github.com/morluto/rea/tar.gz/${REA_COMMIT}" \
+    && echo "${REA_TARBALL_SHA256}  rea.tar.gz" | sha256sum -c - \
+    && mkdir src && tar -xzf rea.tar.gz -C src --strip-components=1 && rm rea.tar.gz
+WORKDIR /build/src
+# Dev deps are needed only to compile (TypeScript + bundler). No install scripts run.
+RUN npm ci --ignore-scripts --no-audit --no-fund \
+    && npm run compile \
+    && npm prune --omit=dev --ignore-scripts --no-audit --no-fund
+# Runtime tree = what `npm pack` would ship (package.json "files", plus package.json
+# itself) + production node_modules. Entries that only `prepack` generates (skills,
+# npm-shrinkwrap.json) are absent from a source tree and are reported, not faked.
+RUN node -e ' \
+      const fs = require("fs"), path = require("path"); \
+      const pkg = JSON.parse(fs.readFileSync("package.json", "utf8")); \
+      const dest = "/opt/rea"; \
+      for (const f of ["package.json", "node_modules", ...pkg.files]) { \
+        if (!fs.existsSync(f)) { console.log("absent from source tree:", f); continue; } \
+        fs.mkdirSync(path.dirname(path.join(dest, f)), { recursive: true }); \
+        fs.cpSync(f, path.join(dest, f), { recursive: true, verbatimSymlinks: true }); \
+      }' \
+    && mkdir -p /opt/rea/bin \
+    && printf '#!/bin/sh\nexec /opt/node/bin/node /opt/rea/scripts/rea.mjs "$@"\n' > /opt/rea/bin/rea \
+    && chmod 0755 /opt/rea/bin/rea \
+    && du -sh /opt/rea
+
+# ------------------------------------------------------------------- ghidra (pinned zip)
+FROM node AS ghidra
+ARG GHIDRA_URL=https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.1.4_build/ghidra_12.1.4_PUBLIC_20260921.zip
+ARG GHIDRA_SHA256=ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends unzip \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+RUN curl -fsSL -o ghidra.zip "${GHIDRA_URL}" \
+    && echo "${GHIDRA_SHA256}  ghidra.zip" | sha256sum -c - \
+    && unzip -q ghidra.zip -d /build/x && rm ghidra.zip \
+    && mv /build/x/ghidra_* /opt/ghidra && rm -rf /build/x
+
+# ------------------------------------------- fixtures (regeneration only; not in image)
+FROM ${JDK_IMAGE} AS rea-fixtures-build
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       gcc libc6-dev gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 python3 \
+    && rm -rf /var/lib/apt/lists/*
+COPY deploy/rea/fixtures /src/fixtures
+RUN sh /src/fixtures/build.sh /out
+
+FROM scratch AS rea-fixtures
+COPY --from=rea-fixtures-build /out/ /
+
+# -------------------------------------------------------------------------- final image
+FROM ${JDK_IMAGE}
+# REA's MCP tool-catalog digest for the pinned commit (see deploy/rea/PINS).
+ARG REA_TOOLS_SHA256=c819d694c65bd1482a0e780ff1848542f2046fe50a6b68fc366066b593d7e58f
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       procps python3 python3-venv \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -u 10001 -m worker
+
+COPY --from=node /opt/node /opt/node
+COPY --from=ghidra /opt/ghidra /opt/ghidra
+COPY --from=rea-build /opt/rea /opt/rea
+COPY deploy/rea/ghidra_scripts /opt/rea/ghidra_scripts
+
+COPY pyproject.toml README.md /src/blastbox/
+COPY src /src/blastbox/src
+RUN python3 -m venv /opt/blastbox \
+    && /opt/blastbox/bin/pip install --no-cache-dir "/src/blastbox[rea]" \
+    && rm -rf /src
+
+# Operator-fixed engine, never job-derived. `rea-agent` images override BLASTBOX_ENGINE
+# with blastbox.engines.rea:ReaAgentEngine.
+ENV PATH=/opt/blastbox/bin:/opt/node/bin:$PATH \
+    BLASTBOX_ENGINE=blastbox.engines.rea:ReaSweepEngine \
+    BLASTBOX_DETONATE_NAME=rea \
+    GHIDRA_INSTALL_DIR=/opt/ghidra \
+    REA_BIN=/opt/rea/bin/rea \
+    REA_GHIDRA_SCRIPTS=/opt/rea/ghidra_scripts \
+    REA_ANALYSIS_PROVIDER=ghidra
+
+USER 10001:10001
+
+# A BARE analyzeHeadless IGNORES $HOME AND $TMPDIR: the JVM takes user.home from
+# /etc/passwd (Ghidra writes ~/.config/ghidra there), java.io.tmpdir defaults to /tmp
+# (/tmp/<user>-ghidra, /tmp/hsperfdata_<user>), and without XDG_CACHE_HOME Ghidra's
+# cache goes to /var/tmp/<user>-ghidra. On a read-only rootfs it fails with
+# "java_home.save (Read-only file system)". Whoever runs analyzeHeadless must pass
+#   XDG_CACHE_HOME=$HOME/.cache XDG_CONFIG_HOME=$HOME/.config
+#   JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=$TMPDIR -Duser.home=$HOME -XX:-UsePerfData"
+# as below (verified to leave /tmp and /var/tmp untouched). `rea --mcp` honours $TMPDIR: its runtime root lands there and it hands
+# Ghidra -Duser.home/-Djava.io.tmpdir inside that root. One residue it does not control
+# on Linux: its JVM creates /tmp/hsperfdata_<user> (REA adds -XX:-UsePerfData only on
+# win32 and drops JAVA_TOOL_OPTIONS/_JAVA_OPTIONS/JDK_JAVA_OPTIONS from the environment
+# it passes on). That write is non-fatal: with a read-only /tmp the session still
+# succeeds (verified). The smoke allows exactly that one path and fails on anything else
+# written outside HOME/TMPDIR.
+#
+# Build-time smoke, as the worker user, in a scratch dir that is removed afterwards
+# (fixtures and the driver are bind-mounted, so they never enter a layer). Any failure
+# fails the build. HOME and TMPDIR are pointed into the scratch dir exactly as the
+# engine does at run time.
+RUN --mount=type=bind,source=deploy/rea,target=/mnt/rea \
+    set -eu; \
+    w=/home/worker/smoke; mkdir -p "$w/home" "$w/tmp" "$w/proj" "$w/in"; touch "$w/.start"; \
+    export HOME="$w/home" TMPDIR="$w/tmp"; \
+    cp /mnt/rea/fixtures/sample.elf "$w/in/sample.elf"; \
+    echo '== rea --version --json'; rea_out=$("$REA_BIN" --version --json); echo "$rea_out"; \
+    echo '== rea providers --json | grep ghidra'; "$REA_BIN" providers --json | grep -q ghidra; \
+    echo '== analyzeHeadless (ELF fixture)'; \
+    XDG_CACHE_HOME="$HOME/.cache" XDG_CONFIG_HOME="$HOME/.config" \
+    JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=$TMPDIR -Duser.home=$HOME -XX:-UsePerfData" \
+    /opt/ghidra/support/analyzeHeadless "$w/proj" sample -import "$w/in/sample.elf" \
+        > "$w/ah.log" 2>&1 || { tail -50 "$w/ah.log"; exit 1; }; \
+    grep -E 'Import succeeded|REPORT: Save succeeded' "$w/ah.log"; \
+    echo '== rea --mcp over the saved project'; \
+    REA_GHIDRA_PROJECT_PATH="$w/proj/sample.gpr" REA_GHIDRA_PROGRAM_NAME=sample.elf \
+        python -I /mnt/rea/smoke_mcp.py "$w/in/sample.elf" "$REA_TOOLS_SHA256"; \
+    echo '== import blastbox.engines.rea'; \
+    python -c "import blastbox.worker.cold, blastbox.engines.rea, pefile, PIL; print('blastbox rea worker ready')"; \
+    echo '== nothing written outside HOME/TMPDIR'; \
+    leaks=$(find /tmp /var/tmp /home/worker -mindepth 1 -newer "$w/.start" -not -path "$w" -not -path "$w/*" \
+        -not -path /tmp/hsperfdata_worker -not -path '/tmp/hsperfdata_worker/*'); \
+    if [ -n "$leaks" ]; then echo "FAIL writes outside HOME/TMPDIR: $leaks"; exit 1; fi; \
+    echo 'only /tmp/hsperfdata_worker (JVM perf counters, non-fatal if unwritable)'; \
+    rm -rf "$w" /tmp/hsperfdata_worker
+
+WORKDIR /home/worker
+ENTRYPOINT ["python", "-m", "blastbox.worker.cold"]
+
+LABEL org.opencontainers.image.title="blastbox-rea-cold-worker" \
+      org.opencontainers.image.description="REA reverse-engineering worker (REA source build cd878ad, Ghidra 12.1.4 headless, Temurin JDK 21, Node 22.23.4)" \
+      org.opencontainers.image.version="0.1.0"

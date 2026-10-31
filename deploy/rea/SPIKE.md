@@ -304,3 +304,91 @@ engine should check that `path` equals the admitted sample.
 `img/Dockerfile` (image `rea-spike:local`), `scripts/{hello.c,mcp_drive.py,run_mcp.sh,run_mcp2.sh}`,
 `out/*.jsonl|*.stderr|*.tools.json` (raw MCP transcripts per run: `s3*` = 6.8.0, `m3*`/`m4*` = main),
 `work/` (samples + projects), `src-main/` (main source build), `npm/` (6.8.0 install).
+
+## Image
+
+Built 2026-10-31 on toolz2 from `deploy/docker/Dockerfile.rea-cold-worker`
+(`docker build -f deploy/docker/Dockerfile.rea-cold-worker -t blastbox-rea:dev .`,
+context synced to `~/rea-build/ctx`). Pins are in `deploy/rea/PINS`. REA is built from
+source at `cd878ad`.
+
+```text
+image                blastbox-rea:dev  sha256:328f42938158cc4b486eeea795cb7eaf39d11beabcdbc6f09898e3284237832c
+size                 925 MB content (compressed), 2.86 GB on disk
+largest parts        /opt/ghidra 882M   /opt/node 203M   /opt/rea 178M   /opt/blastbox (venv) 57M
+python in image      3.14.4 (Ubuntu 26.04 python3; venv /opt/blastbox)
+blastbox[rea]        pefile 2024.8.26, Pillow 13.0.0
+user                 uid 10001 (worker); ENTRYPOINT python -m blastbox.worker.cold
+cold build           ~4 min; Dockerfile-only change ~1 min (smoke itself ~37 s)
+```
+
+The REA runtime tree is copied from package.json's `files` list plus pruned production
+`node_modules`. These entries are absent from a source tree because only `prepack`
+makes them: `skills`, `npm-shrinkwrap.json`, and `native/windows/build/*` (Windows only).
+The smoke shows the Ghidra path does not need them.
+
+Build smoke output (the RUN fails the build on any miss):
+
+```text
+== rea --version --json
+{"name":"rea-agents","version":"6.8.0","runtime":{"id":"node","version":"22.23.4"},"platform":"linux","architecture":"x64","supported_runtime":{"range":"^22.23.4 || ^24.22.1 || >=26.12.1","satisfied":true}}
+== rea providers --json | grep ghidra
+== analyzeHeadless (ELF fixture)
+INFO  REPORT: Save succeeded for: /sample.elf (sample:/sample.elf) (HeadlessAnalyzer)
+INFO  REPORT: Import succeeded (HeadlessAnalyzer)
+== rea --mcp over the saved project
+tools/list: 233 tools
+tools_sha256: c819d694c65bd1482a0e780ff1848542f2046fe50a6b68fc366066b593d7e58f
+import_mode: existing-project-private-copy-v1
+procedure_pseudo_code main: decompiled, fixture string present
+runtime roots under TMPDIR=/home/worker/smoke/tmp: ['/home/worker/smoke/tmp/rea-ghidra-jXla8h']
+new runtime roots under /tmp: []
+runtime root contents: ['bridge.sock', 'cache', 'config', 'data', 'ghidra.log', 'home', 'ownership.json', 'project', 'script.log', 'target-c0f94b8533d8.elf', 'tmp']
+REA MCP smoke OK (17.7s)
+== import blastbox.engines.rea
+blastbox rea worker ready
+== nothing written outside HOME/TMPDIR
+only /tmp/hsperfdata_worker (JVM perf counters, non-fatal if unwritable)
+```
+
+**Catalog digest.** `tools_sha256` is REA's own field. It appears in the
+`binary_session` result as `server_identity.catalog.digests.tools_sha256`. The value
+for this commit is also recorded statically in `dist/recordedCatalogDigests.js`
+(profile `compact`/`full`). The smoke reads the live value over MCP and compares it with
+the pinned ARG `REA_TOOLS_SHA256`.
+
+**TMPDIR and HOME (findings for the engine).**
+
+- `rea --mcp` honours `TMPDIR`. Its runtime root lands at `$TMPDIR/rea-ghidra-XXXX`,
+  and it gives Ghidra `-Duser.home`/`-Djava.io.tmpdir`/`XDG_*` inside that root. REA does
+  not hardcode `/tmp`. One residue: on Linux its JVM creates `/tmp/hsperfdata_<user>`.
+  REA adds `-XX:-UsePerfData` only on win32, and it strips `JAVA_TOOL_OPTIONS`,
+  `_JAVA_OPTIONS` and `JDK_JAVA_OPTIONS` from the environment it passes on, so this
+  cannot be switched off from outside. The write is non-fatal: with a read-only rootfs
+  and `/tmp`, the full MCP session still passed.
+- A **bare `analyzeHeadless` ignores `$HOME` and `$TMPDIR`**:
+  - `user.home` comes from /etc/passwd, so it writes `~/.config/ghidra/.../java_home.save`.
+  - `java.io.tmpdir` defaults to `/tmp`, giving `/tmp/<user>-ghidra` and `/tmp/hsperfdata_<user>`.
+  - Without `XDG_CACHE_HOME`, the cache goes to `/var/tmp/<user>-ghidra`.
+
+  On a read-only rootfs it fails (`java_home.save (Read-only file system)`, then
+  `Unable to prompt user for JDK path`). The engine must run it with
+  `XDG_CACHE_HOME=$HOME/.cache XDG_CONFIG_HOME=$HOME/.config
+  JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=$TMPDIR -Duser.home=$HOME -XX:-UsePerfData"`.
+  With those set, a read-only rootfs (writable work tmpfs only) passes, and `/tmp`
+  and `/var/tmp` stay empty.
+
+**JRE rejected.** Ghidra 12.1.4 headless on `eclipse-temurin:21-jre`
+(`sha256:0b99b3376fbb50dbf9c0af8535fdd5b8eb0d3fdfc8b1e4967f383b6919f6901a`) refuses to
+start: `JAVA_HOME environment specifies unsupported java version` and then
+`Unable to prompt user for JDK path, no TTY detected`. The image keeps the pinned
+21-jdk.
+
+**Fixtures** (`deploy/rea/fixtures/`, built by `build.sh` in the `rea-fixtures` stage).
+Two `--no-cache` builds were byte-identical.
+
+```text
+sample.exe  PE32+ x86-64 mingw, 75185 B, TimeDateStamp 0, sha256 dd4fc087aa16a9519990d49e2232c82d3f35630f7619bd9a677a263bde888531
+            resources: RT_ICON[1] (16x16 32bpp, 1128 B), RT_GROUP_ICON[1], RT_VERSION[1]
+sample.elf  ELF64 PIE gcc, not stripped, 15960 B, sha256 c0f94b8533d83d06773c56719db67bc8dee06df36b63ae89f92edfec48be2388
+```
