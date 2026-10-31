@@ -88,6 +88,7 @@ dev = [
     # singleton, the identify() wrapper, onnxruntime version handling — is never
     # executed by anything, and the asymmetry is invisible in "N passed / M skipped".
     "blastbox[magika]",
+    "blastbox[rea]",               # tests/engines/test_rea_icons.py needs pefile+Pillow; must not skip in CI
     "pytest>=8.0.0",
     "mypy>=1.9.0",
     # 0.16 expanded ruff's default rule set -> 244 pre-existing violations across the
