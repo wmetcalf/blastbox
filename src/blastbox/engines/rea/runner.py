@@ -26,7 +26,15 @@ MAX_STDOUT = 4 * 1024 * 1024
 MAX_MEMBERS = 256
 MAX_MEMBER_BYTES = 64 * 1024 * 1024
 
-_ENV_ALLOW = ("PATH", "JAVA_HOME", "GHIDRA_INSTALL_DIR", "REA_BIN", "LANG")
+# Exact allowlist: no REA_* prefix rule (REA_OPENAI_API_KEY etc. must never pass).
+_ENV_ALLOW = (
+    "PATH",
+    "JAVA_HOME",
+    "GHIDRA_INSTALL_DIR",
+    "REA_BIN",
+    "LANG",
+    "REA_ANALYSIS_PROVIDER",
+)
 
 INSPECT_MAP: dict[str, tuple[str, ...]] = {
     "pe": (
@@ -80,11 +88,7 @@ def rea_env(work_dir: Path, base: Mapping[str, str]) -> dict[str, str]:
     config = home / ".config"
     for d in (tmp, home, cache, config):
         d.mkdir(parents=True, exist_ok=True)
-    env = {
-        k: v
-        for k, v in base.items()
-        if k in _ENV_ALLOW or (k.startswith("REA_") and k not in ("REA_BIN",))
-    }
+    env = {k: v for k, v in base.items() if k in _ENV_ALLOW}
     env.update(
         TMPDIR=str(tmp),
         HOME=str(home),
@@ -263,22 +267,17 @@ class ExtractResult:
     error: str | None = None
 
 
-def _find_extraction(node: Any, depth: int = 0) -> dict[str, Any] | None:
-    """Locate the artifact-extraction result (has ``output_root`` + ``artifacts``)."""
-    if depth > 8:
+def _normalized_extraction(data: Any) -> dict[str, Any] | None:
+    """``normalized_result`` of the Evidence envelope, if it has the extraction shape."""
+    if not isinstance(data, dict):
         return None
-    if isinstance(node, dict):
-        if isinstance(node.get("output_root"), str) and isinstance(node.get("artifacts"), list):
-            return node
-        for v in node.values():
-            r = _find_extraction(v, depth + 1)
-            if r is not None:
-                return r
-    elif isinstance(node, list):
-        for v in node:
-            r = _find_extraction(v, depth + 1)
-            if r is not None:
-                return r
+    norm = data.get("normalized_result")
+    if (
+        isinstance(norm, dict)
+        and isinstance(norm.get("output_root"), str)
+        and isinstance(norm.get("artifacts"), list)
+    ):
+        return norm
     return None
 
 
@@ -299,6 +298,16 @@ def _is_within(child: Path, root: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _copy_capped(src: Any, dst: Any) -> int:
+    copied = 0
+    while chunk := src.read(1 << 20):
+        copied += len(chunk)
+        if copied > MAX_MEMBER_BYTES:
+            break
+        dst.write(chunk)
+    return copied
 
 
 class ReaRunner:
@@ -345,13 +354,21 @@ class ReaRunner:
         return {"ok": True, "result": data}
 
     def extract(self, sample: Path, outdir: Path, timeout_s: float) -> ExtractResult:
+        try:
+            return self._extract(sample, outdir, timeout_s)
+        finally:
+            # REA picks its own extraction dir; never leave one behind, even on early exit.
+            for d in (self.workdir / "tmp").glob("rea-extracted-*"):
+                shutil.rmtree(d, ignore_errors=True)
+
+    def _extract(self, sample: Path, outdir: Path, timeout_s: float) -> ExtractResult:
         argv = [self.rea_bin, "extract-artifact", str(sample.resolve()), "--json"]
         data, err, _rc = self._run_json(argv, timeout_s)
         if err is not None:
             return ExtractResult(error=err)
         if _error_code(data) == "unsupported_target":
             return ExtractResult()
-        ext = _find_extraction(data)
+        ext = _normalized_extraction(data)
         if ext is None:
             return ExtractResult(error=_error_code(data) or "unrecognized_result")
 
@@ -379,7 +396,7 @@ class ReaRunner:
                 except OSError:
                     res.dropped.append((rel, "missing"))
                     continue
-                if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
                     res.dropped.append((rel, "not_regular"))
                     continue
                 if not _is_within(cand.resolve(), real_root):
@@ -394,13 +411,16 @@ class ReaRunner:
                 except OSError:
                     res.dropped.append((rel, "not_regular"))
                     continue
-                with os.fdopen(fd, "rb") as src, dest.open("wb") as dst:
-                    copied = 0
-                    while chunk := src.read(1 << 20):
-                        copied += len(chunk)
-                        if copied > MAX_MEMBER_BYTES:
-                            break
-                        dst.write(chunk)
+                with os.fdopen(fd, "rb") as src:
+                    fst = os.fstat(src.fileno())
+                    if not stat.S_ISREG(fst.st_mode) or fst.st_nlink > 1:
+                        res.dropped.append((rel, "not_regular"))
+                        continue
+                    if fst.st_size > MAX_MEMBER_BYTES:
+                        res.dropped.append((rel, "too_large"))
+                        continue
+                    with dest.open("wb") as dst:
+                        copied = _copy_capped(src, dst)
                 if copied > MAX_MEMBER_BYTES:
                     dest.unlink(missing_ok=True)
                     res.dropped.append((rel, "too_large"))
@@ -427,6 +447,8 @@ def run_ghidra_analysis(
     install = env.get("GHIDRA_INSTALL_DIR")
     if not install:
         return "failed"
+    sample = sample.resolve()
+    project_dir = project_dir.resolve()
     project_dir.mkdir(parents=True, exist_ok=True)
     argv = [
         f"{install}/support/analyzeHeadless",

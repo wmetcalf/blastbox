@@ -44,7 +44,8 @@ def _runner(tmp_path: Path, fake) -> ReaRunner:
 def test_rea_env_scopes_and_filters(tmp_path: Path) -> None:
     base = {
         "PATH": "/bin", "JAVA_HOME": "/j", "GHIDRA_INSTALL_DIR": "/g", "REA_BIN": "/r",
-        "LANG": "C", "REA_GHIDRA_PROGRAM_NAME": "x", "HTTPS_PROXY": "http://p",
+        "LANG": "C", "REA_ANALYSIS_PROVIDER": "ghidra", "REA_GHIDRA_PROGRAM_NAME": "x",
+        "REA_OPENAI_API_KEY": "sk-x", "REA_ANTHROPIC_API_KEY": "k", "REA_FOO": "1", "HTTPS_PROXY": "http://p",
         "http_proxy": "http://p", "SECRET": "s", "HOME": "/root", "TMPDIR": "/tmp",
     }
     env = rea_env(tmp_path / "w", base)
@@ -55,9 +56,10 @@ def test_rea_env_scopes_and_filters(tmp_path: Path) -> None:
     assert env["JAVA_TOOL_OPTIONS"] == (
         f"-Djava.io.tmpdir={w / 'tmp'} -Duser.home={w / 'home'} -XX:-UsePerfData"
     )
-    for k in ("HTTPS_PROXY", "http_proxy", "SECRET"):
+    for k in ("HTTPS_PROXY", "http_proxy", "SECRET", "REA_OPENAI_API_KEY",
+              "REA_ANTHROPIC_API_KEY", "REA_FOO", "REA_GHIDRA_PROGRAM_NAME"):
         assert k not in env
-    assert env["REA_GHIDRA_PROGRAM_NAME"] == "x" and env["GHIDRA_INSTALL_DIR"] == "/g"
+    assert env["REA_ANALYSIS_PROVIDER"] == "ghidra" and env["GHIDRA_INSTALL_DIR"] == "/g"
     for d in ("tmp", "home", "home/.cache", "home/.config"):
         assert (w / d).is_dir()
 
@@ -165,15 +167,25 @@ def test_classify_fixtures() -> None:
 
 
 # --------------------------------------------------------------- extract
+REAL = Path(__file__).resolve().parent / "fixtures" / "rea"
+
+
+def _envelope(root: Path, arts: list) -> dict:
+    """The real extract-artifact envelope with output_root/artifacts substituted."""
+    doc = json.loads((REAL / "extract_ok.json").read_text())
+    doc["parameters"]["output_root"] = str(root)
+    doc["normalized_result"]["output_root"] = str(root)
+    doc["normalized_result"]["artifacts"] = arts
+    return doc
+
+
 def _extract_fake(tmp_path: Path, build, payload=None):
     """Fake REA: creates its extraction dir under TMPDIR, reports it."""
     def hook(argv, kw):
         root = Path(kw["env"]["TMPDIR"]) / "rea-extracted-abc"
         root.mkdir()
         arts = build(root)
-        doc = payload(root, arts) if payload else {
-            "result": {"output_root": str(root), "artifacts": arts, "containment_verified": True}
-        }
+        doc = payload(root, arts) if payload else _envelope(root, arts)
         return RunOutcome(0, json.dumps(doc).encode())
     return Fake(hook=hook)
 
@@ -231,7 +243,8 @@ def test_extract_constants() -> None:
 
 
 def test_extract_unsupported_target_is_empty(tmp_path: Path) -> None:
-    body = b'{"code":"unsupported_target","message":"Artifact format has no extraction reader: pe"}'
+    body = (REAL / "extract_unsupported.json").read_bytes()
+    assert json.loads(body)["code"] == "unsupported_target"
     res = _runner(tmp_path, Fake(RunOutcome(1, body))).extract(tmp_path / "s", tmp_path / "o", 5)
     assert res == ExtractResult()
 
@@ -240,7 +253,7 @@ def test_extract_rejects_root_outside_tmp(tmp_path: Path) -> None:
     victim = tmp_path / "victim"
     victim.mkdir()
     (victim / "f").write_bytes(b"x")
-    doc = {"output_root": str(victim), "artifacts": [{"relative_path": "f"}]}
+    doc = _envelope(victim, [{"relative_path": "f"}])
     res = _runner(tmp_path, Fake(RunOutcome(0, json.dumps(doc).encode()))).extract(
         tmp_path / "s", tmp_path / "o", 5)
     assert res.files == [] and res.error == "output_root_outside_tmp"
@@ -252,6 +265,7 @@ def test_extract_error_modes(tmp_path: Path) -> None:
         (RunOutcome(None, b"", timed_out=True), "timeout"),
         (RunOutcome(0, b"zzz"), "invalid_json"),
         (RunOutcome(0, b"{}"), "unrecognized_result"),
+        (RunOutcome(0, b'{"raw_result":{"output_root":"/x","artifacts":[]}}'), "unrecognized_result"),
         (RunOutcome(1, b'{"code":"invalid_request"}'), "invalid_request"),
     ):
         res = _runner(tmp_path, Fake(out)).extract(tmp_path / "s", tmp_path / "o", 5)
@@ -325,3 +339,73 @@ def test_bounded_run_normal_and_discard(tmp_path: Path) -> None:
 
 def test_no_tmp_literal_in_source() -> None:
     assert '"/tmp' not in Path(r.__file__).read_text()
+
+
+def test_extract_real_fixture_shape(tmp_path: Path) -> None:
+    def build(root: Path):
+        (root / "a.txt").write_bytes(b"hello")
+        return json.loads((REAL / "extract_ok.json").read_text())["normalized_result"]["artifacts"]
+    res = _runner(tmp_path, _extract_fake(tmp_path, build)).extract(tmp_path / "s", tmp_path / "o", 5)
+    assert res.error is None and [p.read_bytes() for p in res.files] == [b"hello"]
+
+
+def test_extract_ignores_raw_result(tmp_path: Path) -> None:
+    def hook(argv, kw):
+        root = Path(kw["env"]["TMPDIR"]) / "rea-extracted-x"
+        root.mkdir()
+        (root / "good").write_bytes(b"g")
+        doc = _envelope(root, [{"relative_path": "good"}])
+        doc["raw_result"] = {"output_root": "/etc", "artifacts": [{"relative_path": "passwd"}]}
+        return RunOutcome(0, json.dumps(doc).encode())
+    res = _runner(tmp_path, Fake(hook=hook)).extract(tmp_path / "s", tmp_path / "o", 5)
+    assert [p.read_bytes() for p in res.files] == [b"g"]
+
+
+def test_extract_drops_hardlinks(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"private")
+    def build(root: Path):
+        os.link(outside, root / "hl")
+        (root / "ok").write_bytes(b"ok")
+        return [{"relative_path": "hl"}, {"relative_path": "ok"}]
+    res = _runner(tmp_path, _extract_fake(tmp_path, build)).extract(tmp_path / "s", tmp_path / "o", 5)
+    assert [p.read_bytes() for p in res.files] == [b"ok"]
+    assert res.dropped == [("hl", "not_regular")]
+    assert outside.read_bytes() == b"private"
+
+
+def test_extract_fstat_recheck_after_open(tmp_path: Path, monkeypatch) -> None:
+    real_open = os.open
+    def build(root: Path):
+        (root / "f").write_bytes(b"data")
+        return [{"relative_path": "f"}]
+    def racy_open(path, flags, *a, **k):
+        fd = real_open(path, flags, *a, **k)
+        if str(path).endswith("/f"):
+            os.link(path, str(path) + "_hl")  # file gains a second link after lstat
+        return fd
+    monkeypatch.setattr(r.os, "open", racy_open)
+    res = _runner(tmp_path, _extract_fake(tmp_path, build)).extract(tmp_path / "s", tmp_path / "o", 5)
+    assert res.files == [] and res.dropped == [("f", "not_regular")]
+
+
+def test_extract_sweeps_leftover_dirs(tmp_path: Path) -> None:
+    def hook(argv, kw):
+        (Path(kw["env"]["TMPDIR"]) / "rea-extracted-left").mkdir()
+        return RunOutcome(None, b"", timed_out=True)
+    rr = _runner(tmp_path, Fake(hook=hook))
+    rr.extract(tmp_path / "s", tmp_path / "o", 1)
+    assert not list((tmp_path / "w" / "tmp").glob("rea-extracted-*"))
+
+
+def test_ghidra_dash_sample_and_relative_project(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    env = _ghidra_env(tmp_path)
+    fake = Fake(hook=lambda a, kw: (Path(a[1], "sample.gpr").write_text(""), RunOutcome(0))[1])
+    res = run_ghidra_analysis(Path("-postScript"), Path("rel/proj"), 5, env=env, run_fn=fake)
+    argv, kw = fake.calls[0]
+    assert res == "ok"
+    assert argv[1] == str(tmp_path / "rel" / "proj") and kw["cwd"] == tmp_path / "rel" / "proj"
+    assert argv[4] == str(tmp_path / "-postScript") and argv[4].startswith("/")
+    assert (tmp_path / "rel" / "proj" / "sample.gpr").exists()
+    assert not (tmp_path / "rel" / "proj" / "rel").exists()
