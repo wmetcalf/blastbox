@@ -30,7 +30,16 @@ HERE = Path(__file__).resolve().parent
 FAKE = HERE / "fixtures" / "fake_mcp_server.py"
 SNAPSHOT = HERE.parents[1] / "deploy" / "rea" / "tools-snapshot.json"
 REA_BIN = "/opt/rea/bin/rea"
-SAMPLE_BYTES = b"MZ\x90\x00" + b"\x00" * 60 + b"fake pe body"
+SAMPLE_BYTES = (b"MZ\x90\x00" + b"\x00" * 60 + b"fake pe body\x00http://evil.example/a.php\x00"
+                b"C2 at 203.0.113.7\x00HKLM\\Software\\Evil\\Run\x00"
+                + "http://utf16.evil-example.com/x".encode("utf-16-le") + b"\x00\x00")
+# What the engine's own list_procedures (fixed arguments) reports for the fixture program.
+LISTING = json.dumps({"normalized_result": [
+    {"address": "0x140001420", "value": "entry", "symbol": {"external": False, "source": "imported"},
+     "procedure": {"external": False, "thunk": False}},
+    {"address": "0x140001500", "value": "FUN_140001500", "symbol": {"external": False, "source": "default"},
+     "procedure": {"external": False, "thunk": False}},
+]})
 
 
 # ------------------------------------------------------------------ helpers
@@ -82,7 +91,9 @@ class McpRig:
     def __init__(self, tmp_path, responses=None):
         self.log = tmp_path / "mcp.log"
         self.responses_path = tmp_path / "responses.json"
-        self.responses_path.write_text(json.dumps(responses or {}))
+        responses = dict(responses or {})
+        responses.setdefault("list_procedures", {"text": LISTING})
+        self.responses_path.write_text(json.dumps(responses))
         self.requests: list[dict] = []
 
     def __call__(self, argv, env, cwd):
@@ -563,7 +574,8 @@ def test_bad_args_are_refused_in_the_loop(tmp_path, name, args):
                        answer({"summary": "s", "functions": [], "iocs": [], "todo": [], "done": True})])
     res, _ = run(tmp_path, cont, model, rig)
     assert res.payload.fields["refused_calls"] == 1
-    assert [c["name"] for c in rig.calls()] == ["open_binary"]
+    # Only the engine's own calls reached MCP.
+    assert [c["name"] for c in rig.calls()] == ["open_binary", "list_procedures"]
 
 
 def test_decompiled_injection_reaches_model_only_as_tool_evidence(tmp_path):
@@ -595,16 +607,21 @@ def test_decompiled_injection_reaches_model_only_as_tool_evidence(tmp_path):
             assert all(t["id"] == "c1" for t in m["tool_calls"])
 
 
-def test_ioc_verified_only_by_deterministic_match(tmp_path):
+def test_ioc_verified_only_by_sample_bytes(tmp_path):
     cont = make_continuation(tmp_path)
+    # The tool output mentions an IOC the sample does not contain: that never verifies it.
     rig = McpRig(tmp_path, {"search_strings": {"text": json.dumps(
-        {"normalized_result": [{"value": "C2 at 203.0.113.7 and HKLM\\Software\\Evil\\Run"}]})}})
+        {"normalized_result": [{"value": "C2 at 203.0.113.8"}]})}})
     model = FakeModel([
         tc(("search_strings", {"pattern": "C2"}, "s1")),
         answer({"summary": "s", "functions": [], "iocs": [
             {"type": "ipv4", "value": "203.0.113.7", "source": "string"},
             {"type": "ipv4", "value": "203.0.113.8", "source": "string"},
             {"type": "registry", "value": "HKLM\\Software\\Evil\\Run", "source": "string"},
+            {"type": "registry", "value": "hklm\\software\\evil\\run", "source": "case differs"},
+            {"type": "url", "value": "HTTP://EVIL.EXAMPLE/A.PHP", "source": "caseless"},
+            {"type": "url", "value": "http://utf16.evil-example.com/x", "source": "utf-16le"},
+            {"type": "mutex", "value": "abc", "source": "too short"},
             {"type": "url", "value": "http://203.0.113.7/", "source": "made up"},
         ], "todo": [], "done": True}),
     ])
@@ -612,7 +629,19 @@ def test_ioc_verified_only_by_deterministic_match(tmp_path):
     io_ = cols(res.payload, "iocs")
     got = dict(zip(io_["value"], io_["verified"]))
     assert got == {"203.0.113.7": True, "203.0.113.8": False, "HKLM\\Software\\Evil\\Run": True,
-                   "http://203.0.113.7/": False}
+                   "hklm\\software\\evil\\run": False, "HTTP://EVIL.EXAMPLE/A.PHP": True,
+                   "http://utf16.evil-example.com/x": True, "abc": False, "http://203.0.113.7/": False}
+
+
+def test_ioc_check_is_capped(tmp_path):
+    cont = make_continuation(tmp_path)
+    iocs = [{"type": "domain", "value": f"n{i}.never.example", "source": "x"} for i in range(ag.MAX_VERIFY_IOCS)]
+    iocs.append({"type": "url", "value": "http://evil.example/a.php", "source": "beyond the cap"})
+    model = FakeModel([answer({"summary": "s", "functions": [], "iocs": iocs, "todo": [], "done": True})])
+    res, _ = run(tmp_path, cont, model, McpRig(tmp_path))
+    io_ = cols(res.payload, "iocs")
+    assert len(io_["value"]) == ag.MAX_VERIFY_IOCS + 1 and io_["verified"][-1] is False
+    assert any(w.code == "iocs_unverified_cap" for w in res.warnings)
 
 
 @pytest.mark.parametrize("script,status", [
@@ -859,58 +888,6 @@ def _final(**kw):
     return answer({**base, **kw})
 
 
-def test_searching_for_an_ioc_does_not_verify_it(tmp_path):
-    url = "http://c2.evil-example.com/gate.php"
-    echo = json.dumps({"operation": "search_strings", "parameters": {"pattern": url},
-                       "subject": {"local_path": "/work/x/http://subject.evil-example.com/p"},
-                       "normalized_result": {"query": url, "pattern": url, "matches": []}})
-    cont = make_continuation(tmp_path)
-    rig = McpRig(tmp_path, {"search_strings": {"text": echo},
-                            "procedure_info": {"error": "no such procedure http://err.evil-example.com/x"}})
-    model = FakeModel([
-        tc(("search_strings", {"pattern": url}, "a"), ("procedure_info", {"procedure": "nope"}, "b")),
-        _final(iocs=[{"type": "url", "value": url, "source": "t1"},
-                     {"type": "url", "value": "http://subject.evil-example.com/p", "source": "t1"},
-                     {"type": "url", "value": "http://err.evil-example.com/x", "source": "t2"}]),
-    ])
-    res, _ = run(tmp_path, cont, model, rig)
-    io_ = cols(res.payload, "iocs")
-    assert io_["value"] and not any(io_["verified"]), io_
-
-
-def test_ioc_found_by_another_call_is_still_verified(tmp_path):
-    url = "http://c2.evil-example.com/gate.php"
-    cont = make_continuation(tmp_path)
-    rig = McpRig(tmp_path, {
-        "search_strings": {"text": json.dumps({"normalized_result": {"query": url, "matches": [url]}})},
-        "procedure_pseudo_code": {"text": json.dumps({"normalized_result": f'connect("{url}")'})},
-    })
-    model = FakeModel([
-        tc(("search_strings", {"pattern": url}, "a"), ("procedure_pseudo_code", {"procedure": "0x140001420"}, "b")),
-        _final(iocs=[{"type": "url", "value": url, "source": "t2"}]),
-    ])
-    res, _ = run(tmp_path, cont, model, rig)
-    assert cols(res.payload, "iocs")["verified"] == [True]
-
-
-def test_citations_need_a_real_address_in_a_good_result(tmp_path):
-    cont = make_continuation(tmp_path)
-    rig = McpRig(tmp_path, {
-        "procedure_info": {"error": "procedure 0xdeadbeef01 not found"},
-        "procedure_pseudo_code": {"text": json.dumps({
-            "parameters": {"procedure": "0x7777777777"},
-            "normalized_result": "x = 1234; y = 0x4010a0; FUN_00402000(); z = abcd;"})},
-    })
-    model = FakeModel([
-        tc(("procedure_info", {"procedure": "0xdeadbeef01"}, "a"),
-           ("procedure_pseudo_code", {"procedure": "0x7777777777"}, "b")),
-        _final(functions=[{"address": a, "name": "f", "claim": "c", "evidence": ["t2"]}
-                          for a in ("0xdeadbeef01", "0x7777777777", "0x1234", "0xabcd", "0x4010a0", "0x402000")]),
-    ])
-    res, _ = run(tmp_path, cont, model, rig)
-    assert cols(res.payload, "functions")["address"] == ["0x4010a0", "0x402000"]
-
-
 def test_malformed_after_a_good_turn_is_budget(tmp_path):
     cont = make_continuation(tmp_path, summary="prior summary")
     model = FakeModel([tc(("binary_overview", {}, "a")), {"choices": []}, answer("still not json {")])
@@ -1001,23 +978,89 @@ def test_mcp_boolean_id_is_not_a_match(tmp_path):
         c.close()
 
 
-def test_ioc_echoed_in_matches_of_its_own_search_is_not_verified(tmp_path):
-    url = "http://c2.evil-example.com/gate.php"
+# ------------------------------------------------------------------ fix round 2 (Rulings R, S)
+
+
+@pytest.mark.parametrize("calls,responses", [
+    # the original repro: searching for the IOC
+    ([("search_strings", {"pattern": "http://c2.evil-example.com/gate.php"}, "a")],
+     {"search_strings": {"text": json.dumps({"parameters": {"pattern": "http://c2.evil-example.com/gate.php"},
+                                             "normalized_result": {"query": "http://c2.evil-example.com/gate.php"}})}}),
+    # (a) a dict argument echoed back
+    ([("get_evidence_bundle", {"filters": {"procedure_address": "http://c2.evil-example.com/gate.php"}}, "a")],
+     {"get_evidence_bundle": {"text": json.dumps({"normalized_result": {
+         "records": [{"procedure_address": "http://c2.evil-example.com/gate.php"}]}})}}),
+    # (b) an echo from a different call (cursor page re-echoing earlier request text)
+    ([("search_strings", {"pattern": "http://c2.evil-example.com/gate.php"}, "a"),
+      ("search_bytes", {"pattern": "00", "cursor": "page2"}, "b")],
+     {"search_bytes": {"text": json.dumps({"normalized_result": {
+         "request": {"text": "http://c2.evil-example.com/gate.php"}}})}}),
+    # (c) a transformed echo (case changed / percent-decoded)
+    ([("search_strings", {"pattern": "HTTP://C2.EVIL-EXAMPLE.COM/gate%2Ephp"}, "a")],
+     {"search_strings": {"text": json.dumps({"normalized_result": {
+         "matches": ["http://c2.evil-example.com/gate.php"]}})}}),
+    # an error message echoing the value
+    ([("procedure_info", {"procedure": "nope"}, "a")],
+     {"procedure_info": {"error": "no such procedure http://c2.evil-example.com/gate.php"}}),
+])
+def test_laundering_variants_stay_unverified(tmp_path, calls, responses):
     cont = make_continuation(tmp_path)
-    rig = McpRig(tmp_path, {"search_strings": {"text": json.dumps(
-        {"normalized_result": {"matches": [{"value": url}], "note": f"searched for {url}"}})}})
-    model = FakeModel([tc(("search_strings", {"pattern": url}, "a")),
-                       _final(iocs=[{"type": "url", "value": url, "source": "t1"}])])
-    res, _ = run(tmp_path, cont, model, rig)
+    model = FakeModel([tc(*calls), _final(iocs=[
+        {"type": "url", "value": "http://c2.evil-example.com/gate.php", "source": "t1"}])])
+    res, _ = run(tmp_path, cont, model, McpRig(tmp_path, responses))
     assert cols(res.payload, "iocs")["verified"] == [False]
 
 
-def test_ioc_shaped_artifact_path_echo_is_not_verified(tmp_path):
-    # The sample's file name is caller-chosen; REA echoes it as normalized_result.artifact.path.
+def test_sample_ioc_verified_even_when_searched_for(tmp_path):
     cont = make_continuation(tmp_path)
-    rig = McpRig(tmp_path, {"inspect_pe_imports": {"text": json.dumps({"normalized_result": {
-        "artifact": {"path": "/work/u/sample/http://name.evil-example.com/x"}, "imports": []}})}})
-    model = FakeModel([tc(("inspect_pe_imports", {}, "a")),
-                       _final(iocs=[{"type": "url", "value": "http://name.evil-example.com/x", "source": "t1"}])])
+    model = FakeModel([tc(("search_strings", {"pattern": "http://evil.example/a.php"}, "a")),
+                       _final(iocs=[{"type": "url", "value": "http://evil.example/a.php", "source": "t1"}])])
+    res, _ = run(tmp_path, cont, model, McpRig(tmp_path))
+    assert cols(res.payload, "iocs")["verified"] == [True]
+
+
+def test_citations_follow_ruling_s(tmp_path):
+    cont = make_continuation(tmp_path)
+    rig = McpRig(tmp_path, {
+        "list_procedures": {"text": json.dumps({"normalized_result": [{"address": "0x140001420"}]})},
+        "search_strings": {"text": json.dumps({"normalized_result": {"matches": ["0xdeadbeef01", "0x13371337"]}})},
+        "procedure_info": {"text": json.dumps({"normalized_result": {
+            "found": False, "procedure": "0x00cafe0001"}})},
+        "procedure_pseudo_code": {"text": json.dumps({
+            "parameters": {"procedure": "0x7777777777"},
+            "normalized_result": "x = 1048576; y = 0x4010a0; FUN_00402000(); return 0x140001420;"})},
+        "xrefs": {"error": "address 0x5555555555 not found"},
+    })
+    model = FakeModel([
+        tc(("search_strings", {"pattern": "0xdeadbeef01"}, "a"),
+           ("procedure_info", {"procedure": "0xcafe0001"}, "b"),
+           ("procedure_pseudo_code", {"procedure": "0x7777777777"}, "c"),
+           ("xrefs", {"address": "0x5555555555"}, "d")),
+        _final(functions=[{"address": a, "name": "f", "claim": "c", "evidence": ["t3"]}
+                          for a in ("0xdeadbeef01", "0x13371337", "0xcafe0001", "0x7777777777", "0x5555555555",
+                                    "0x100000", "0x1048576", "0x402000", "0x4010a0", "0x140001420")]),
+    ])
     res, _ = run(tmp_path, cont, model, rig)
-    assert cols(res.payload, "iocs")["verified"] == [False]
+    # search output, a not-found echo, a parameter echo, an error, decimals and a bare FUN_ suffix
+    # do not count; a 0x address in decompiled code does, and so does the engine's own listing.
+    assert cols(res.payload, "functions")["address"] == ["0x4010a0", "0x140001420"]
+
+
+def test_function_decompiled_by_address_stays_citable_via_engine_listing(tmp_path):
+    cont = make_continuation(tmp_path)
+    rig = McpRig(tmp_path, {"procedure_pseudo_code": {"text": DECOMP}})
+    model = FakeModel([tc(("procedure_pseudo_code", {"procedure": "0x140001420"}, "a")),
+                       _final(functions=[{"address": "0x140001420", "name": "entry", "claim": "c",
+                                          "evidence": ["t1"]}])])
+    res, _ = run(tmp_path, cont, model, rig)
+    assert cols(res.payload, "functions")["address"] == ["0x140001420"]
+    assert [c["name"] for c in rig.calls()][:2] == ["open_binary", "list_procedures"]
+
+
+def test_final_answer_arriving_at_the_deadline_is_used(tmp_path):
+    cont = make_continuation(tmp_path)
+    now = [1000.0]
+    model = FakeModel([_final(summary="just in time")], on_chat=lambda: now.__setitem__(0, now[0] + 10_000))
+    res, _ = run(tmp_path, cont, model, McpRig(tmp_path), clock=lambda: now[0])
+    f = res.payload.fields
+    assert f["model_status"] == "ok" and f["summary"] == "just in time"

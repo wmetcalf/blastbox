@@ -16,9 +16,8 @@ dir in ``BLASTBOX_WORK_DIR``:
    ``policy.check_call`` (a refusal never reaches MCP and is returned as a tool error), and each
    result is framed as untrusted evidence by ``prompts.Framer``;
 6. the final JSON answer (``response_format=json_object``) is parsed defensively. Function claims
-   whose address no tool result of this pass contained are dropped; a proposed IOC is
-   ``verified`` only when ``iocs.extract_iocs`` over this pass's tool results finds the same
-   (type, value);
+   are kept only for citable addresses (``_Evidence``, Ruling S); a proposed IOC is ``verified``
+   only when its value occurs in the sample's own bytes (``verify_iocs_in_sample``, Ruling R);
 7. the next continuation (same project, updated ``State``) and a capped JSONL transcript are
    declared, and a ``rea.pass/1`` Record is sealed.
 
@@ -35,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+import mmap
 import os
 import re
 import shutil
@@ -47,7 +47,6 @@ from typing import IO, Any
 
 from blastbox.contract import DeclaredArtifact, Detection, Record, Warning
 from blastbox.engines.rea.continuation import ContinuationError, GhidraStatus, State, pack, unpack
-from blastbox.engines.rea.iocs import extract_iocs
 from blastbox.engines.rea.mcp_client import McpError, McpStdioClient
 from blastbox.engines.rea.model import ModelClient, ModelError
 from blastbox.engines.rea.policy import ADDRESS_RE, TOOL_ALLOWLIST, CallRefused, check_call, model_tool_specs, safe_name
@@ -100,12 +99,23 @@ MAX_FINAL_CHARS = 1024 * 1024
 _MAIN_NAMES = ("main", "wmain", "_main", "WinMain", "wWinMain", "DllMain", "DllEntryPoint", "_start",
                "start", "entry")
 _NAMED_SOURCES = frozenset({"imported", "user_defined", "user-defined", "user"})
-# A citable address: 0x-prefixed, or a bare run of at least 6 hex digits (FUN_140001500).
-_ADDR_TOKEN = re.compile(r"(?<![0-9A-Za-z])(?:0x([0-9a-fA-F]{1,16})|([0-9a-fA-F]{6,16}))(?![0-9A-Za-z])")
-# Keys inside a normalized_result that echo the caller's input or the environment, not the sample.
-_ECHO_KEYS = frozenset({"parameters", "source_parameters", "arguments", "query", "pattern", "mask",
-                        "cursor", "view", "subject", "environment", "artifact", "path", "local_path",
-                        "caller_input_path", "locations"})
+# Ruling S: a citable address is 0x-prefixed hex in a content tool's normalized_result.
+_ADDR_TOKEN = re.compile(r"(?<![0-9A-Za-z])0x([0-9a-fA-F]{1,16})(?![0-9A-Za-z])")
+# Anything address-like the model typed (with or without 0x), anywhere in its arguments.
+_ARG_HEX = re.compile(r"(?<![0-9A-Za-z])(?:0x)?([0-9a-fA-F]{1,16})(?![0-9A-Za-z])")
+# Tools whose results describe the program (code, listings, references) rather than echo a query.
+# Excluded on purpose: search_* / trace_* (echo the query), get_evidence_bundle (replays earlier
+# records), inspect_* file parsers, binary_session, list_unknowns, address_name/comment/inline_comment.
+CONTENT_TOOLS: frozenset[str] = frozenset({
+    "analyze_function", "batch_decompile", "binary_overview", "find_xrefs_to_name", "get_call_graph",
+    "inspect_address_context", "inspect_native_instruction", "list_names", "list_procedures",
+    "list_segments", "list_strings", "procedure_address", "procedure_assembly", "procedure_callees",
+    "procedure_callers", "procedure_info", "procedure_pseudo_code", "procedure_references",
+    "read_function_instructions", "resolve_containing_procedure", "resolve_native_call_targets", "xrefs",
+})
+MAX_VERIFY_IOCS = 128  # Ruling R: sample-byte searches per pass
+MIN_IOC_CHARS = 4
+_CASELESS_IOCS = frozenset({"url", "domain", "email"})
 _PROGRAM_NAME = re.compile(r"^[^/\\\x00]{1,255}$")
 _RESULT_LEAD = re.compile(r"^Result of call ([st][0-9]+) \(")
 
@@ -290,63 +300,92 @@ def parse_final(text: object) -> FinalAnswer | None:
 
 
 class _Evidence:
-    """What this pass's tool results showed about the SAMPLE: addresses and IOC keys.
+    """Which addresses this pass may cite (Ruling S). IOCs are not verified from tool output at all.
 
-    Only the ``normalized_result`` of non-error results is harvested, with echo keys
-    (``_ECHO_KEYS``: parameters, query, pattern, artifact path, ...) removed at every depth.
-    REA's envelope (parameters, subject.local_path, ...), error text and the model's own
-    messages never count. IOC keys that also occur in the call's own arguments are dropped
-    for that call, so a model cannot "verify" an IOC by searching for it.
+    ``citable = engine_addresses | (content_addresses - model_addresses)``:
+    - ``content_addresses``: 0x-addresses in the ``normalized_result`` of non-error results of
+      ``CONTENT_TOOLS`` called by the model;
+    - ``model_addresses``: every address-like value the model supplied in any argument of any
+      call this pass (nested dicts/lists, refused calls included), normalised;
+    - ``engine_addresses``: the same harvest from calls the engine made with fixed arguments
+      (``list_procedures`` each pass, the seed ``procedure_info(entry)``). The model cannot shape
+      those arguments, so its echo cannot launder an address into them. Without this term every
+      function the model decompiled by address would be uncitable.
     """
 
     def __init__(self) -> None:
-        self.results: dict[str, str] = {}  # every call id (citable), errors included
-        self.addresses: set[str] = set()
-        self._ioc_sources: list[tuple[str, list[str], frozenset[tuple[str, str]]]] = []
+        self.results: dict[str, str] = {}  # every call id (citable as evidence), errors included
+        self.content_addresses: set[str] = set()
+        self.engine_addresses: set[str] = set()
+        self.model_addresses: set[str] = set()
 
-    @classmethod
-    def _strip_echo(cls, o: Any, depth: int = 0) -> Any:
-        """``o`` without ``_ECHO_KEYS`` at any depth (deeper than 64 levels is dropped)."""
-        if depth > 64:
-            return None
-        if isinstance(o, dict):
-            return {k: cls._strip_echo(v, depth + 1) for k, v in o.items() if k not in _ECHO_KEYS}
-        if isinstance(o, list):
-            return [cls._strip_echo(v, depth + 1) for v in o]
-        return o
+    @property
+    def addresses(self) -> set[str]:
+        return self.engine_addresses | (self.content_addresses - self.model_addresses)
 
-    def add(self, call_id: str, text: str, *, is_error: bool, args: dict[str, Any] | None = None) -> None:
+    def note_model_args(self, value: Any, depth: int = 0) -> None:
+        if depth > 32:
+            return
+        if isinstance(value, str):
+            for m in _ARG_HEX.finditer(value):
+                a = norm_addr(m.group(1))
+                if a is not None:
+                    self.model_addresses.add(a)
+        elif isinstance(value, dict):
+            for k, v in value.items():
+                self.note_model_args(k, depth + 1)
+                self.note_model_args(v, depth + 1)
+        elif isinstance(value, list):
+            for v in value:
+                self.note_model_args(v, depth + 1)
+
+    def add(self, call_id: str, tool: str, text: str, *, is_error: bool, engine: bool) -> None:
         self.results[call_id] = text
-        if is_error:
+        if is_error or tool not in CONTENT_TOOLS:
             return
         obj = _parse_json(text)
         if not isinstance(obj, dict) or "normalized_result" not in obj:
             return
-        nr = self._strip_echo(obj["normalized_result"])
-        leaves = list(_string_leaves(nr))
-        if isinstance(nr, (int, float)) and not isinstance(nr, bool):
-            leaves.append(str(nr))
-        for leaf in leaves:
+        dest = self.engine_addresses if engine else self.content_addresses
+        for leaf in _string_leaves(obj["normalized_result"]):
             for m in _ADDR_TOKEN.finditer(leaf):
-                if len(self.addresses) >= MAX_ADDRESSES:
-                    break
-                a = norm_addr(m.group(1) or m.group(2))
+                if len(dest) >= MAX_ADDRESSES:
+                    return
+                a = norm_addr(m.group(1))
                 if a is not None:
-                    self.addresses.add(a)
-        own: frozenset[tuple[str, str]] = frozenset()
-        if args:
-            arg_text = [v for v in args.values() if isinstance(v, str)]
-            arg_text += [x for v in args.values() if isinstance(v, list) for x in v if isinstance(x, str)]
-            own = frozenset((i.type, i.value) for i in
-                            extract_iocs(((f"arg:{call_id}", t) for t in arg_text), limit=256))
-        self._ioc_sources.append((call_id, leaves, own))
+                    dest.add(a)
 
-    def ioc_keys(self) -> set[tuple[str, str]]:
-        keys: set[tuple[str, str]] = set()
-        for cid, leaves, own in self._ioc_sources:
-            found = extract_iocs(((f"tool:{cid}", leaf) for leaf in leaves), limit=MAX_RESULT_IOCS)
-            keys |= {(i.type, i.value) for i in found} - own
-        return keys
+
+def verify_iocs_in_sample(sample: Path, iocs: list[tuple[str, str]]) -> list[bool]:
+    """Ruling R: an IOC is verified only if its value occurs in the sample's own bytes.
+
+    ASCII/UTF-8 and UTF-16LE encodings are searched; url/domain/email case-insensitively, the
+    rest exactly. Values outside ``MIN_IOC_CHARS..MAX_IOC_VALUE`` are never verified. The caller
+    caps the count (``MAX_VERIFY_IOCS``).
+    """
+    out = [False] * len(iocs)
+    try:
+        fd = os.open(sample, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return out
+    with os.fdopen(fd, "rb") as f:
+        try:
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        except (ValueError, OSError):  # empty file
+            return out
+        with mm:
+            for i, (typ, value) in enumerate(iocs):
+                if not MIN_IOC_CHARS <= len(value) <= MAX_IOC_VALUE:
+                    continue
+                for needle in (value.encode("utf-8"), value.encode("utf-16-le")):
+                    if typ in _CASELESS_IOCS:
+                        hit = re.search(re.escape(needle), mm, re.IGNORECASE) is not None  # type: ignore[call-overload]
+                    else:
+                        hit = mm.find(needle) != -1
+                    if hit:
+                        out[i] = True
+                        break
+    return out
 
 
 # ---------------------------------------------------------------- the engine
@@ -573,14 +612,15 @@ class ReaAgentEngine:
                 mcp.close()
 
     def _call_tool(self, mcp: Any, name: str, args: dict[str, Any], call_id: str, ev: _Evidence,
-                   tw: TranscriptWriter, remaining: Callable[[], float]) -> tuple[str, bool]:
+                   tw: TranscriptWriter, remaining: Callable[[], float], *,
+                   engine: bool = False) -> tuple[str, bool]:
         tool_timeout = _env_seconds("REA_TOOL_TIMEOUT_S", DEFAULT_TOOL_TIMEOUT_S)
         try:
             res = mcp.call(name, args, timeout_s=max(1.0, min(tool_timeout, remaining())))
             text, is_error = render_result(res)
         except McpError as exc:
             text, is_error = f"tool call failed: {exc}", True
-        ev.add(call_id, text, is_error=is_error, args=args)
+        ev.add(call_id, name, text, is_error=is_error, engine=engine)
         tw.write({"event": "tool_result", "call_id": call_id, "tool": name, "is_error": is_error,
                   "chars": len(text), "text": text[:TRANSCRIPT_TEXT]})
         return text, is_error
@@ -594,7 +634,8 @@ class ReaAgentEngine:
         Externals and thunks are skipped. At most ``SEED_TODO`` entries.
         """
         seeds: list[dict[str, str]] = []
-        entry_text, err = self._call_tool(mcp, "procedure_info", {"procedure": "entry"}, "s1", ev, tw, remaining)
+        entry_text, err = self._call_tool(mcp, "procedure_info", {"procedure": "entry"}, "s1", ev, tw, remaining,
+                                          engine=True)
         if not err:
             obj = _parse_json(entry_text)
             nr = obj.get("normalized_result", obj) if isinstance(obj, dict) else None
@@ -604,7 +645,8 @@ class ReaAgentEngine:
                     seeds.append({"address": a, "name": _cap(str(nr.get("name") or "entry"), MAX_NAME)})
         if remaining() < MIN_TURN_S:
             return seeds
-        list_text, err = self._call_tool(mcp, "list_procedures", {"detail": "complete"}, "s2", ev, tw, remaining)
+        list_text, err = self._call_tool(mcp, "list_procedures", {"detail": "complete"}, "s2", ev, tw, remaining,
+                                         engine=True)
         rows: Any = None
         if not err:
             obj = _parse_json(list_text)
@@ -669,6 +711,10 @@ class ReaAgentEngine:
             p.todo = [s["address"] for s in seeds]
             todo_view = seeds
             seed_note = "The todo list was seeded by the engine from the entry point and the procedure list."
+        else:
+            # The engine's own procedure list makes real function entries citable (Ruling S).
+            self._call_tool(mcp, "list_procedures", {"detail": "complete"}, "s0", ev, tw, explore_left,
+                            engine=True)
         messages: list[dict[str, Any]] = [
             framer.system_message(tool_names, max_steps=max_steps),
             framer.initial_user_message(state, p.pass_no, todo=todo_view, explored=p.explored[-200:],
@@ -707,10 +753,11 @@ class ReaAgentEngine:
                 self._model_failed(p, tw, exc.kind, str(exc))
                 return
             p.steps += 1
-            if remaining() <= 0:
+            parsed = _parse_message(resp)
+            if remaining() <= 0 and not (parsed is not None and not parsed[1] and parsed[0]):
+                # Out of time: only an already-received final answer (no tool calls) is still used.
                 p.model_status = "budget"
                 break
-            parsed = _parse_message(resp)
             if parsed is None:
                 if p.good_turns > 0:
                     self._turn_failed(p, tw, "malformed: response has no usable message / tool_calls")
@@ -734,6 +781,7 @@ class ReaAgentEngine:
                 counter += 1
                 cid = f"t{counter}"
                 tool = safe_name(c["name"])
+                ev.note_model_args(c["args"] if c["args"] is not None else c["raw"])
                 try:
                     if i >= MAX_CALLS_PER_TURN:
                         raise CallRefused(f"at most {MAX_CALLS_PER_TURN} tool calls per turn")
@@ -789,7 +837,7 @@ class ReaAgentEngine:
             if answer is None:
                 self._final_failed(p, tw, "malformed", "final answer is not the required JSON object")
                 return
-        self._accept(answer, ev, explored_now, p, tw)
+        self._accept(answer, ev, explored_now, p, tw, sample)
 
     @staticmethod
     def _turn_failed(p: _Pass, tw: TranscriptWriter, message: str) -> None:
@@ -816,7 +864,7 @@ class ReaAgentEngine:
 
     @staticmethod
     def _accept(answer: FinalAnswer, ev: _Evidence, explored_now: list[str], p: _Pass,
-                tw: TranscriptWriter) -> None:
+                tw: TranscriptWriter, sample: Path) -> None:
         dropped = 0
         for fn in answer.functions:
             if fn["address"] not in ev.addresses:
@@ -827,14 +875,20 @@ class ReaAgentEngine:
         if dropped:
             p.warnings.append(Warning(code="claims_dropped",
                                       message=f"{dropped} function claim(s) cited an address no tool result contained"))
-        keys = ev.ioc_keys() if answer.iocs else set()
         seen: set[tuple[str, str]] = set()
+        unique = []
         for ioc in answer.iocs:
             k = (ioc["type"], ioc["value"])
-            if k in seen:
-                continue
-            seen.add(k)
-            p.iocs.append({**ioc, "verified": k in keys})
+            if k not in seen:
+                seen.add(k)
+                unique.append(ioc)
+        checked = verify_iocs_in_sample(sample, [(i["type"], i["value"]) for i in unique[:MAX_VERIFY_IOCS]])
+        for i, ioc in enumerate(unique):
+            p.iocs.append({**ioc, "verified": i < len(checked) and checked[i]})
+        if len(unique) > MAX_VERIFY_IOCS:
+            p.warnings.append(Warning(code="iocs_unverified_cap",
+                                      message=f"{len(unique) - MAX_VERIFY_IOCS} IOC(s) beyond the "
+                                              f"{MAX_VERIFY_IOCS}-IOC check cap left unverified"))
         explored = _dedup(p.explored + explored_now + [f["address"] for f in p.functions])
         done = set(explored)
         new_todo = [a for a in answer.todo if a in ev.addresses]
@@ -955,7 +1009,7 @@ def _parse_message(resp: Any) -> tuple[str | None, list[dict[str, Any]]] | None:
 def _compact_context(messages: list[dict[str, Any]], framer: Framer) -> None:
     """Elide the oldest tool results once the conversation exceeds ``CONTEXT_CHARS``.
 
-    Elided evidence stays in ``_Evidence`` (still citable, still used for IOC checks).
+    Elided evidence stays in ``_Evidence`` (still citable).
     """
     total = sum(len(m.get("content") or "") for m in messages)
     if total <= CONTEXT_CHARS:
