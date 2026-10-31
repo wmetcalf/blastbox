@@ -2510,6 +2510,7 @@ class Dispatcher:
         # unknown driver falls back to --network=none in docker_network_args.
         from blastbox.host.netpolicy import resolve_net_policy
         from blastbox.host.netapply import (
+            BRIDGE_NAME_RE,
             docker_network_args,
             inspect_routes_via_gateway,
             worker_resolv_conf,
@@ -2647,6 +2648,22 @@ class Dispatcher:
                 f"egress would race netd. Add gateway=<netd gateway IP> to the personality.",
             )
             return
+        if "bridge" in personality.config:
+            if personality.exit_driver != "httpproxy":
+                self._fail_job(
+                    job,
+                    f"netpolicy {personality.name!r} (exit={personality.exit_driver}) declares "
+                    f"bridge=, which is only valid for exit=httpproxy (it names the internal bridge "
+                    f"the proxy sidecar shares). Remove bridge= or use httpproxy.",
+                )
+                return
+            if not BRIDGE_NAME_RE.fullmatch(personality.config["bridge"]):
+                self._fail_job(
+                    job,
+                    f"netpolicy {personality.name!r}: bridge={personality.config['bridge'][:80]!r} "
+                    f"is not a valid bridge name (must match {BRIDGE_NAME_RE.pattern}).",
+                )
+                return
         # Egress-hardening knobs (egress_ports / block_internal) are only enforceable on the
         # gateway-routed, netd-gated tiers (tor/openvpn/wireguard): there the worker's OWN netns OUTPUT
         # carries the real destination IP:port (so a port/destination filter is meaningful) AND egress

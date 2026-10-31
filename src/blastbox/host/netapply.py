@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import re
 
 from blastbox.host.netpolicy import Personality
 
@@ -64,6 +65,9 @@ _BRIDGE_NETWORKS: dict[str, str] = {
     "openvpn": "bb-vpn",
     "wireguard": "bb-vpn",
 }
+
+# Valid operator-named bridge for an httpproxy personality (``bridge=``): strictly ``bb-`` prefixed.
+BRIDGE_NAME_RE = re.compile(r"bb-[a-z0-9][a-z0-9-]{0,30}")
 
 # Exit drivers that put the worker on a network where name resolution matters. ``none`` /
 # ``drop`` never reach a resolver, so they are excluded. This is ALSO the set of drivers that can be
@@ -131,6 +135,20 @@ def docker_network_args(personality: Personality) -> list[str]:
             driver,
         )
         return ["--network=none"]
+
+    # Optional dedicated bridge: ``bridge=`` is honored ONLY for httpproxy (the operator-created
+    # INTERNAL bridge the proxy sidecar shares). Any other driver, or a name that isn't a strictly
+    # ``bb-`` prefixed docker-safe name, fails closed (never ``host``/``bridge``/a path).
+    if "bridge" in personality.config:
+        named = personality.config["bridge"]
+        if driver != "httpproxy" or not BRIDGE_NAME_RE.fullmatch(named):
+            _log.warning(
+                "netpolicy: bridge=%r invalid or not allowed for exit_driver %r (httpproxy only, "
+                "name must match %s); failing closed to --network=none",
+                named[:80], driver, BRIDGE_NAME_RE.pattern,
+            )
+            return ["--network=none"]
+        return ["--network", named]
 
     # Known bridge exits: directly supported.
     bridge = _BRIDGE_NETWORKS.get(driver)

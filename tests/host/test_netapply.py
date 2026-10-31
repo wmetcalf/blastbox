@@ -272,3 +272,24 @@ def test_resolv_socks_dns_tcp_opt_out():
     out = worker_resolv_conf(_p("socks", config={"dns": "172.30.0.20", "dns_tcp": "0"}))
     assert out == "nameserver 172.30.0.20\n"
     assert "use-vc" not in out
+
+
+# ---------------------------------------------------------------------------
+# httpproxy bridge= (dedicated internal bridge)
+# ---------------------------------------------------------------------------
+
+def test_httpproxy_bridge_selects_named_network():
+    p = _p("httpproxy", config={"proxy": "http://p:8888", "bridge": "bb-rea-model"})
+    assert docker_network_args(p) == ["--network", "bb-rea-model"]
+
+
+def test_httpproxy_without_bridge_unchanged():
+    p = _p("httpproxy", config={"proxy": "http://p:8888"})
+    assert docker_network_args(p) == ["--network", "bb-socks"]
+
+
+@pytest.mark.parametrize("bad", ["host", "bb-", "../x", "BB-X", "", "bb-a/b", "bb-" + "a" * 32])
+def test_bridge_invalid_name_fails_closed(bad, caplog):
+    p = _p("httpproxy", config={"proxy": "http://p:8888", "bridge": bad})
+    with caplog.at_level(logging.WARNING):
+        assert docker_network_args(p) == ["--network=none"]

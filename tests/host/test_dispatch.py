@@ -1983,6 +1983,23 @@ def test_routed_personality_without_gateway_fails_fast(tmp_path, monkeypatch):
     assert "gateway=" in (final.error or "")
 
 
+def test_bridge_on_non_httpproxy_fails_job(tmp_path, monkeypatch):
+    """bridge= only means something for httpproxy; on any other driver the dispatcher fails the job."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_DIRBR", "exit=direct,bridge=bb-x")
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+                     net_policy="dirbr")
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng})
+    assert dispatcher.dispatch_once() is True
+    final = store.get(job.job_id)
+    assert final.status == JobStatus.FAILED
+    assert "bridge=" in (final.error or "") and "httpproxy" in (final.error or "")
+
+
 def test_decrypt_seals_decrypted_and_mixed_when_keylog_present(tmp_path, monkeypatch):
     """With BLASTBOX_NET_DECRYPT + a keylog in the capture dir, the dispatcher runs GoGoRoboCap
     and seals decrypted+mixed pcaps as trusted artifacts."""
