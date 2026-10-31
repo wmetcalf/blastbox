@@ -409,3 +409,29 @@ def test_ghidra_dash_sample_and_relative_project(tmp_path: Path, monkeypatch) ->
     assert argv[4] == str(tmp_path / "-postScript") and argv[4].startswith("/")
     assert (tmp_path / "rel" / "proj" / "sample.gpr").exists()
     assert not (tmp_path / "rel" / "proj" / "rel").exists()
+
+
+def test_ghidra_post_script_argv_absolute(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    proj = tmp_path / "proj"
+    fake = Fake(hook=lambda a, kw: ((proj / "sample.gpr").write_text(""), RunOutcome(0))[1])
+    res = run_ghidra_analysis(
+        tmp_path / "s.exe", proj, 9, env=_ghidra_env(tmp_path), run_fn=fake,
+        post_script=(Path("scripts"), "ListStrings.java", Path("out/strings.jsonl")),
+    )
+    argv, _kw = fake.calls[0]
+    assert res == "ok"
+    assert argv == [
+        "/opt/ghidra/support/analyzeHeadless", str(proj), "sample", "-import", str(tmp_path / "s.exe"),
+        "-overwrite", "-scriptPath", str(tmp_path / "scripts"),
+        "-postScript", "ListStrings.java", str(tmp_path / "out" / "strings.jsonl"),
+    ]
+
+
+def test_ghidra_post_script_rejects_bad_name(tmp_path: Path) -> None:
+    for name in ("../x.java", "-import", "a/b.java", ""):
+        with pytest.raises(ValueError):
+            run_ghidra_analysis(
+                tmp_path / "s", tmp_path / "p", 1, env=_ghidra_env(tmp_path), run_fn=Fake(),
+                post_script=(tmp_path, name, tmp_path / "o"),
+            )

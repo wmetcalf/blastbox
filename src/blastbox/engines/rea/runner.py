@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import stat
@@ -432,6 +433,9 @@ class ReaRunner:
         return res
 
 
+_SCRIPT_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}\.(?:java|py)")
+
+
 def run_ghidra_analysis(
     sample: Path,
     project_dir: Path,
@@ -439,11 +443,16 @@ def run_ghidra_analysis(
     *,
     env: Mapping[str, str],
     run_fn: RunFn = bounded_run,
+    post_script: tuple[Path, str, Path] | None = None,
 ) -> Literal["ok", "timeout", "failed"]:
     """Import ``sample`` into a fresh Ghidra project named ``sample`` under ``project_dir``.
 
     ``env`` should come from :func:`rea_env` (must carry GHIDRA_INSTALL_DIR).
+    ``post_script`` is ``(script_dir, script_name, output_path)``: appends
+    ``-scriptPath <dir> -postScript <name> <output_path>`` (paths resolved absolute).
     """
+    if post_script is not None and not _SCRIPT_NAME.fullmatch(post_script[1]):
+        raise ValueError(f"bad Ghidra script name: {post_script[1]!r}")
     install = env.get("GHIDRA_INSTALL_DIR")
     if not install:
         return "failed"
@@ -458,6 +467,15 @@ def run_ghidra_analysis(
         str(sample),
         "-overwrite",
     ]
+    if post_script is not None:
+        script_dir, script_name, output_path = post_script
+        argv += [
+            "-scriptPath",
+            str(script_dir.resolve()),
+            "-postScript",
+            script_name,
+            str(output_path.resolve()),
+        ]
     out = run_fn(argv, env=env, cwd=project_dir, timeout_s=timeout_s, max_stdout=0)
     if out.timed_out:
         return "timeout"
