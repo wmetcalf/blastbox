@@ -12,6 +12,8 @@ was started with (``{"env": {...}, "argv": [...], "cwd": "..."}``).
   ``{"rpc_error": "..."}``       -> a JSON-RPC error response
   ``{"sleep": s, "text": ..}``   -> sleep first (timeouts)
   ``{"huge": n}``                -> a text result of ``n`` bytes (response caps)
+  ``{"bool_id_first": true, ..}`` -> first send a bogus reply with ``"id": true``
+Top-level ``"__init_bool_id": true`` sends a bogus ``"id": true`` reply before the real initialize.
 Tool names not in the map get ``{"text": "{\\"result\\": \\"ok <name>\\"}"}``.
 """
 
@@ -66,6 +68,8 @@ def main() -> None:
         if mid is None:
             continue  # notification
         if method == "initialize":
+            if responses.get("__init_bool_id"):
+                send({"jsonrpc": "2.0", "id": True, "result": {"protocolVersion": "BOGUS"}})
             send({"jsonrpc": "2.0", "id": mid, "result": {
                 "protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
                 "serverInfo": {"name": "fake-rea", "version": "0"}}})
@@ -77,6 +81,8 @@ def main() -> None:
             spec = responses.get(name, {"text": json.dumps({"result": f"ok {name}"})})
             if "sleep" in spec:
                 time.sleep(spec["sleep"])
+            if spec.get("bool_id_first"):
+                send({"jsonrpc": "2.0", "id": True, "result": {"content": [{"type": "text", "text": "bogus"}]}})
             if "rpc_error" in spec:
                 send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32000, "message": spec["rpc_error"]}})
                 continue

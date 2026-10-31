@@ -6,6 +6,10 @@
 - The default opener is ``urllib``'s, so ``HTTP(S)_PROXY`` from *this* process's env is
   honoured (the sealed route is an allowlisting proxy). Redirects are not followed.
 - The response body is capped at :data:`MAX_RESPONSE_BYTES` while reading.
+- Each call has a TOTAL deadline (``min(timeout_s ctor, timeout_s call)``), not just urllib's
+  per-socket-operation timeout: the exchange runs in a worker thread that reads in chunks and
+  checks the deadline, and the caller stops waiting at the deadline. A proxy trickling bytes
+  can therefore not stretch a call past the pass budget (Ruling Q).
 - Transport and HTTP failures raise ``ModelError("unavailable")``; an oversized, non-JSON or
   non-object body raises ``ModelError("malformed")``. Interpreting ``choices`` is the
   caller's job (the agent parses it defensively); ``reasoning_content`` is never used.
@@ -16,6 +20,8 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+import threading
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Literal
@@ -70,15 +76,7 @@ class ModelClient:
         req = urllib.request.Request(self.url, data=data, method="POST",
                                      headers={"Content-Type": "application/json", "Accept": "application/json"})
         timeout = self.timeout_s if timeout_s is None else max(1.0, min(self.timeout_s, timeout_s))
-        try:
-            with self._opener.open(req, timeout=timeout) as resp:
-                raw = resp.read(MAX_RESPONSE_BYTES + 1)
-        except urllib.error.HTTPError as exc:
-            _log.warning("model endpoint returned HTTP %s", exc.code)
-            raise ModelError("unavailable", f"http_{exc.code}") from None
-        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
-            _log.warning("model endpoint unreachable: %s", type(exc).__name__)
-            raise ModelError("unavailable", type(exc).__name__) from None
+        raw = self._exchange(req, timeout)
         if len(raw) > MAX_RESPONSE_BYTES:
             raise ModelError("malformed", "response_too_large")
         try:
@@ -88,3 +86,46 @@ class ModelClient:
         if not isinstance(out, dict):
             raise ModelError("malformed", "response is not an object")
         return out
+
+    def _exchange(self, req: urllib.request.Request, timeout: float) -> bytes:
+        deadline = time.monotonic() + timeout
+        box: dict[str, Any] = {}
+        stop = threading.Event()
+
+        def work() -> None:
+            try:
+                with self._opener.open(req, timeout=timeout) as resp:
+                    read = getattr(resp, "read1", None) or resp.read
+                    buf = bytearray()
+                    while not stop.is_set():
+                        if time.monotonic() >= deadline:
+                            box["late"] = True
+                            return
+                        chunk = read(65536)
+                        if not chunk:
+                            break
+                        buf += chunk
+                        if len(buf) > MAX_RESPONSE_BYTES:
+                            break
+                    box["raw"] = bytes(buf)
+            except BaseException as exc:  # handed to the caller below
+                box["exc"] = exc
+
+        t = threading.Thread(target=work, name="rea-model-call", daemon=True)
+        t.start()
+        t.join(max(0.0, deadline - time.monotonic()))
+        if t.is_alive() or box.get("late"):
+            stop.set()  # the thread exits at its next read; it is a daemon either way
+            _log.warning("model call exceeded its %.0fs deadline", timeout)
+            raise ModelError("unavailable", "deadline_exceeded")
+        exc = box.get("exc")
+        if isinstance(exc, urllib.error.HTTPError):
+            _log.warning("model endpoint returned HTTP %s", exc.code)
+            raise ModelError("unavailable", f"http_{exc.code}") from None
+        if isinstance(exc, (urllib.error.URLError, OSError, ValueError, http.client.HTTPException)):
+            _log.warning("model endpoint unreachable: %s", type(exc).__name__)
+            raise ModelError("unavailable", type(exc).__name__) from None
+        if exc is not None:
+            raise ModelError("unavailable", type(exc).__name__) from None
+        raw: bytes = box["raw"]
+        return raw

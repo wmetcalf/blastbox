@@ -45,8 +45,8 @@ list; extract indicators of compromise (IOCs); and rewrite the running summary.
 Tools: {tool_names}
 - Pass addresses as hex strings such as 0x401000. Procedures may be given by address or name.
 - No tool takes a file path. The inspect_* tools always run on the sample.
-- String arguments may not contain shell metacharacters, '..' or a leading '/'. Use literal \
-search mode for plain text.
+- Names (procedure, name, type, document) may not contain '..', a leading '/', control \
+characters or any of ;|`\\'"!#. Search patterns may be any printable text.
 - A call that breaks these rules is refused, and you get an error result instead.
 - You have at most {max_steps} tool-calling turns. Prefer a few focused calls.
 

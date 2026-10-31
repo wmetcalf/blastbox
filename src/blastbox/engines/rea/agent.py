@@ -40,7 +40,7 @@ import re
 import shutil
 import tempfile
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any
@@ -64,7 +64,7 @@ _log = logging.getLogger("blastbox.engines.rea.agent")
 SCHEMA = "rea.pass/1"
 DEFAULT_MODEL_ID = "deepseek-v4-flash"
 DEFAULT_PASS_WALL_S = 540.0
-DEFAULT_MAX_STEPS = 40
+DEFAULT_MAX_STEPS = 12  # Ruling O
 DEFAULT_MAX_TOKENS = 8192
 DEFAULT_MODEL_TIMEOUT_S = 240.0
 DEFAULT_TOOL_TIMEOUT_S = 120.0
@@ -100,7 +100,12 @@ MAX_FINAL_CHARS = 1024 * 1024
 _MAIN_NAMES = ("main", "wmain", "_main", "WinMain", "wWinMain", "DllMain", "DllEntryPoint", "_start",
                "start", "entry")
 _NAMED_SOURCES = frozenset({"imported", "user_defined", "user-defined", "user"})
-_ADDR_TOKEN = re.compile(r"(?<![0-9A-Za-z])(?:0x)?([0-9a-fA-F]{1,16})(?![0-9A-Za-z])")
+# A citable address: 0x-prefixed, or a bare run of at least 6 hex digits (FUN_140001500).
+_ADDR_TOKEN = re.compile(r"(?<![0-9A-Za-z])(?:0x([0-9a-fA-F]{1,16})|([0-9a-fA-F]{6,16}))(?![0-9A-Za-z])")
+# Keys inside a normalized_result that echo the caller's input or the environment, not the sample.
+_ECHO_KEYS = frozenset({"parameters", "source_parameters", "arguments", "query", "pattern", "mask",
+                        "cursor", "view", "subject", "environment", "artifact", "path", "local_path",
+                        "caller_input_path", "locations"})
 _PROGRAM_NAME = re.compile(r"^[^/\\\x00]{1,255}$")
 _RESULT_LEAD = re.compile(r"^Result of call ([st][0-9]+) \(")
 
@@ -285,32 +290,63 @@ def parse_final(text: object) -> FinalAnswer | None:
 
 
 class _Evidence:
-    """Everything tool results of this pass contained: full text, addresses, IOCs."""
+    """What this pass's tool results showed about the SAMPLE: addresses and IOC keys.
+
+    Only the ``normalized_result`` of non-error results is harvested, with echo keys
+    (``_ECHO_KEYS``: parameters, query, pattern, artifact path, ...) removed at every depth.
+    REA's envelope (parameters, subject.local_path, ...), error text and the model's own
+    messages never count. IOC keys that also occur in the call's own arguments are dropped
+    for that call, so a model cannot "verify" an IOC by searching for it.
+    """
 
     def __init__(self) -> None:
-        self.results: dict[str, str] = {}
+        self.results: dict[str, str] = {}  # every call id (citable), errors included
         self.addresses: set[str] = set()
+        self._ioc_sources: list[tuple[str, list[str], frozenset[tuple[str, str]]]] = []
 
-    def add(self, call_id: str, text: str) -> None:
+    @classmethod
+    def _strip_echo(cls, o: Any, depth: int = 0) -> Any:
+        """``o`` without ``_ECHO_KEYS`` at any depth (deeper than 64 levels is dropped)."""
+        if depth > 64:
+            return None
+        if isinstance(o, dict):
+            return {k: cls._strip_echo(v, depth + 1) for k, v in o.items() if k not in _ECHO_KEYS}
+        if isinstance(o, list):
+            return [cls._strip_echo(v, depth + 1) for v in o]
+        return o
+
+    def add(self, call_id: str, text: str, *, is_error: bool, args: dict[str, Any] | None = None) -> None:
         self.results[call_id] = text
-        for m in _ADDR_TOKEN.finditer(text):
-            if len(self.addresses) >= MAX_ADDRESSES:
-                break
-            a = norm_addr(m.group(1))
-            if a is not None:
-                self.addresses.add(a)
+        if is_error:
+            return
+        obj = _parse_json(text)
+        if not isinstance(obj, dict) or "normalized_result" not in obj:
+            return
+        nr = self._strip_echo(obj["normalized_result"])
+        leaves = list(_string_leaves(nr))
+        if isinstance(nr, (int, float)) and not isinstance(nr, bool):
+            leaves.append(str(nr))
+        for leaf in leaves:
+            for m in _ADDR_TOKEN.finditer(leaf):
+                if len(self.addresses) >= MAX_ADDRESSES:
+                    break
+                a = norm_addr(m.group(1) or m.group(2))
+                if a is not None:
+                    self.addresses.add(a)
+        own: frozenset[tuple[str, str]] = frozenset()
+        if args:
+            arg_text = [v for v in args.values() if isinstance(v, str)]
+            arg_text += [x for v in args.values() if isinstance(v, list) for x in v if isinstance(x, str)]
+            own = frozenset((i.type, i.value) for i in
+                            extract_iocs(((f"arg:{call_id}", t) for t in arg_text), limit=256))
+        self._ioc_sources.append((call_id, leaves, own))
 
     def ioc_keys(self) -> set[tuple[str, str]]:
-        def sources() -> Iterator[tuple[str, str]]:
-            for cid, text in self.results.items():
-                obj = _parse_json(text)
-                if obj is None:
-                    yield f"tool:{cid}", text
-                else:
-                    for leaf in _string_leaves(obj):
-                        yield f"tool:{cid}", leaf
-
-        return {(i.type, i.value) for i in extract_iocs(sources(), limit=MAX_RESULT_IOCS)}
+        keys: set[tuple[str, str]] = set()
+        for cid, leaves, own in self._ioc_sources:
+            found = extract_iocs(((f"tool:{cid}", leaf) for leaf in leaves), limit=MAX_RESULT_IOCS)
+            keys |= {(i.type, i.value) for i in found} - own
+        return keys
 
 
 # ---------------------------------------------------------------- the engine
@@ -333,6 +369,7 @@ class _Pass:
     explored: list[str] = field(default_factory=list)
     done: bool = False
     final_reserve_s: float = 0.0
+    good_turns: int = 0  # model responses that parsed (with or without tool calls)
     warnings: list[Warning] = field(default_factory=list)
 
 
@@ -543,7 +580,7 @@ class ReaAgentEngine:
             text, is_error = render_result(res)
         except McpError as exc:
             text, is_error = f"tool call failed: {exc}", True
-        ev.add(call_id, text)
+        ev.add(call_id, text, is_error=is_error, args=args)
         tw.write({"event": "tool_result", "call_id": call_id, "tool": name, "is_error": is_error,
                   "chars": len(text), "text": text[:TRANSCRIPT_TEXT]})
         return text, is_error
@@ -603,6 +640,18 @@ class ReaAgentEngine:
 
     def _loop(self, mcp: Any, listed: dict[str, str], sample: Path, state: State, p: _Pass,
               tw: TranscriptWriter, remaining: Callable[[], float], max_steps: int, max_tokens: int) -> None:
+        explored_now: list[str] = []
+        try:
+            self._loop_body(mcp, listed, sample, state, p, tw, remaining, max_steps, max_tokens, explored_now)
+        finally:
+            # Every exit (ok, budget, failure) keeps what this pass explored and prunes the todo.
+            p.explored = _dedup(p.explored + explored_now)
+            done = set(p.explored)
+            p.todo = [a for a in p.todo if a not in done]
+
+    def _loop_body(self, mcp: Any, listed: dict[str, str], sample: Path, state: State, p: _Pass,
+                   tw: TranscriptWriter, remaining: Callable[[], float], max_steps: int, max_tokens: int,
+                   explored_now: list[str]) -> None:
         ev = _Evidence()
         framer = Framer()
 
@@ -639,7 +688,6 @@ class ReaAgentEngine:
             return
 
         counter = 0
-        explored_now: list[str] = []
         final_text: str | None = None
         while True:
             if p.steps >= max_steps:
@@ -652,12 +700,9 @@ class ReaAgentEngine:
             try:
                 resp = model.chat(messages, tools, max_tokens, timeout_s=explore_left())
             except ModelError as exc:
-                if exc.kind == "unavailable" and p.tool_calls > 0:
-                    # Evidence is already gathered: one turn timing out must not waste it.
-                    p.warnings.append(Warning(code="model_turn_failed",
-                                              message=(f"{exc} after {p.tool_calls} tool call(s); "
-                                                       "asking for the final answer")[:2000]))
-                    tw.write({"event": "model_turn_failed", "message": str(exc)[:2000]})
+                if p.good_turns > 0:
+                    # Earlier turns worked: one failed turn must not waste them (Ruling O).
+                    self._turn_failed(p, tw, str(exc))
                     break
                 self._model_failed(p, tw, exc.kind, str(exc))
                 return
@@ -667,8 +712,12 @@ class ReaAgentEngine:
                 break
             parsed = _parse_message(resp)
             if parsed is None:
+                if p.good_turns > 0:
+                    self._turn_failed(p, tw, "malformed: response has no usable message / tool_calls")
+                    break
                 self._model_failed(p, tw, "malformed", "response has no usable message / tool_calls")
                 return
+            p.good_turns += 1
             content, calls = parsed
             tw.write({"event": "model_turn", "step": p.steps, "content": (content or "")[:TRANSCRIPT_TEXT],
                       "tool_calls": [{"id": c["id"], "name": c["name"], "arguments": c["raw"][:2048]}
@@ -731,16 +780,33 @@ class ReaAgentEngine:
                 resp = model.chat(messages, [], max_tokens, response_format={"type": "json_object"},
                                   timeout_s=remaining())
             except ModelError as exc:
-                self._model_failed(p, tw, exc.kind, str(exc))
+                self._final_failed(p, tw, exc.kind, str(exc))
                 return
             final_parsed = _parse_message(resp)
             final_content = final_parsed[0] if final_parsed is not None else None
             tw.write({"event": "final_turn", "content": (final_content or "")[:TRANSCRIPT_TEXT]})
             answer = parse_final(final_content)
             if answer is None:
-                self._model_failed(p, tw, "malformed", "final answer is not the required JSON object")
+                self._final_failed(p, tw, "malformed", "final answer is not the required JSON object")
                 return
         self._accept(answer, ev, explored_now, p, tw)
+
+    @staticmethod
+    def _turn_failed(p: _Pass, tw: TranscriptWriter, message: str) -> None:
+        p.warnings.append(Warning(code="model_turn_failed",
+                                  message=f"{message} after {p.good_turns} good turn(s); "
+                                          f"asking for the final answer"[:2000]))
+        tw.write({"event": "model_turn_failed", "message": message[:2000]})
+
+    def _final_failed(self, p: _Pass, tw: TranscriptWriter, kind: str, message: str) -> None:
+        """The final answer failed: ``budget`` (chain continues) once any turn succeeded."""
+        if p.good_turns == 0:
+            self._model_failed(p, tw, kind, message)
+            return
+        p.model_status = "budget"
+        p.warnings.append(Warning(code=f"model_{kind}",
+                                  message=f"final answer failed ({message}); sealed as budget"[:2000]))
+        tw.write({"event": "model_error", "kind": kind, "message": message[:2000], "sealed_as": "budget"})
 
     @staticmethod
     def _model_failed(p: _Pass, tw: TranscriptWriter, kind: str, message: str) -> None:

@@ -9,8 +9,10 @@ literal here on purpose: the engine never derives authority from a file or from 
 - a ``path`` argument (the 12 static ``inspect_*`` tools) is never taken from the model; it
   is overwritten with the admitted sample path;
 - addresses must match ``^(0x)?[0-9a-fA-F]{1,16}$``;
-- strings are capped at 256 chars and may not contain ``..``, start with ``/``, or contain
-  shell metacharacters or control characters;
+- search text (``pattern``/``query``/``mask``/``cursor``) is any printable text up to 256 chars;
+  name-like strings (procedure, name, type, document, ...) are capped at 256 chars and may not
+  contain ``..``, start with ``/``, or contain control characters or ``;|`\\'"!#`` (Ruling P:
+  arguments go over JSON-RPC, never a shell, so mangled C++/MSVC names are allowed);
 - integers are range-checked, enums must match exactly, and unknown arguments are refused.
 
 Object-typed arguments are not accepted (except ``get_evidence_bundle.filters``, which has a
@@ -85,7 +87,11 @@ TOOL_ALLOWLIST: frozenset[str] = frozenset({
 ADDRESS_RE = re.compile(r"^(0x)?[0-9a-fA-F]{1,16}$")
 MAX_STR = 256
 MAX_LIST = 16
-_SHELL_META = frozenset(";&|`$<>()\\'\"*?[]{}!~#")
+# Arguments travel as JSON-RPC values to REA (no shell anywhere), so the character rules only
+# keep names name-shaped (Ruling P). Name-like args may carry MSVC-mangled and C++/Rust names
+# (``?foo@@YAXXZ``, ``std::vector<int>::at(unsigned long) const&``, ``{{closure}}``); these
+# characters stay refused in them:
+_NAME_FORBIDDEN = frozenset(";|`\\'\"!#")
 _HEX64 = re.compile(r"^[a-f0-9]{64}$")
 _EVIDENCE_ID = re.compile(r"^ev_[a-f0-9]{64}$")
 _BIG = 1 << 30
@@ -98,7 +104,8 @@ class CallRefused(Exception):
 # Argument kinds.
 PATH = "path"
 ADDR = "addr"
-STR = "str"
+STR = "str"          # name-like: procedure/name/type/document/...
+SEARCH = "search"    # search text: pattern/query/mask/cursor
 BOOL = "bool"
 ADDR_LIST = "addr_list"
 STR_LIST = "str_list"
@@ -170,14 +177,14 @@ TOOL_ARGS: dict[str, dict[str, ArgSpec]] = {
     "read_function_instructions": {"procedure": STR, "document": _DOC},
     "resolve_containing_procedure": {"address": ADDR, "document": _DOC, "detail": _DETAIL},
     "resolve_native_call_targets": {"address": ADDR, "document": _DOC},
-    "search_bytes": {"pattern": STR, "mask": STR, "document": _DOC, "start": ADDR, "end": ADDR,
-                     "limit": _int(1, 1000), "cursor": STR},
-    "search_procedures": {"pattern": STR, "mode": _enum("literal", "regex"), "case_sensitive": BOOL,
+    "search_bytes": {"pattern": SEARCH, "mask": SEARCH, "document": _DOC, "start": ADDR, "end": ADDR,
+                     "limit": _int(1, 1000), "cursor": SEARCH},
+    "search_procedures": {"pattern": SEARCH, "mode": _enum("literal", "regex"), "case_sensitive": BOOL,
                           "document": _DOC, "detail": _DETAIL},
-    "search_strings": {"pattern": STR, "mode": _enum("literal", "regex"), "case_sensitive": BOOL,
+    "search_strings": {"pattern": SEARCH, "mode": _enum("literal", "regex"), "case_sensitive": BOOL,
                        "document": _DOC, "detail": _DETAIL},
     "trace_call_path": {"start": STR, "goal": STR, "direction": _enum("forward", "backward")},
-    "trace_feature": {"query": STR, "case_sensitive": BOOL},
+    "trace_feature": {"query": SEARCH, "case_sensitive": BOOL},
     "trace_native_values": {"procedure": STR, "max_depth": _int(0, 16), "max_functions": _int(1, 64),
                             "max_call_sites": _int(1, 4096), "max_nodes": _int(1, 20000),
                             "max_edges": _int(1, 40000), "offset": _int(0, _BIG), "limit": _int(1, 5000)},
@@ -231,14 +238,28 @@ def safe_name(name: object) -> str:
     return "<invalid name>"
 
 
-def _check_str(arg: str, value: Any) -> str:
+def _is_control(c: str) -> bool:
+    o = ord(c)
+    return o < 0x20 or 0x7F <= o < 0xA0 or 0xD800 <= o < 0xE000
+
+
+def _check_search(arg: str, value: Any) -> str:
+    """Search text: any printable characters (no control characters), 1..256 chars."""
     if not isinstance(value, str):
         raise CallRefused(f"argument {arg!r} must be a string")
     if not value or len(value) > MAX_STR:
         raise CallRefused(f"argument {arg!r} must be 1..{MAX_STR} characters")
+    if any(_is_control(c) for c in value):
+        raise CallRefused(f"argument {arg!r} contains a control character")
+    return value
+
+
+def _check_str(arg: str, value: Any) -> str:
+    """Name-like text: search rules plus no '..', no leading '/', none of ``_NAME_FORBIDDEN``."""
+    _check_search(arg, value)
     if ".." in value or value.startswith("/"):
         raise CallRefused(f"argument {arg!r} looks like a path; paths are not accepted")
-    if any(c in _SHELL_META or ord(c) < 0x20 or ord(c) == 0x7F for c in value):
+    if any(c in _NAME_FORBIDDEN for c in value):
         raise CallRefused(f"argument {arg!r} contains a forbidden character")
     return value
 
@@ -254,6 +275,8 @@ def _check(arg: str, spec: ArgSpec, value: Any) -> Any:
         return _check_addr(arg, value)
     if spec == STR:
         return _check_str(arg, value)
+    if spec == SEARCH:
+        return _check_search(arg, value)
     if spec == BOOL:
         if not isinstance(value, bool):
             raise CallRefused(f"argument {arg!r} must be a boolean")
@@ -321,7 +344,7 @@ def check_call(name: str, arguments: Any, *, sample_path: str) -> dict[str, Any]
 def _schema(spec: ArgSpec) -> dict[str, Any]:
     if spec == ADDR:
         return {"type": "string", "pattern": ADDRESS_RE.pattern, "description": "hex address, e.g. 0x401000"}
-    if spec == STR:
+    if spec in (STR, SEARCH):
         return {"type": "string", "maxLength": MAX_STR}
     if spec == BOOL:
         return {"type": "boolean"}

@@ -182,7 +182,8 @@ class McpStdioClient:
                 # is equally unusable). Either way this request fails, and the session lives.
                 raise McpError("response_too_large", f"{item.size}+ bytes > {cap}")
             raw, msg = item
-            if msg.get("id") != rid:
+            mid = msg.get("id")
+            if type(mid) is not int or mid != rid:  # `true == 1` must not match
                 continue  # a late reply to a request that already timed out
             if len(raw) > cap:
                 raise McpError("response_too_large", f"{len(raw)} bytes > {cap}")

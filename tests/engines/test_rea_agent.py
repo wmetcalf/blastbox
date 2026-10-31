@@ -225,11 +225,15 @@ def test_path_args_are_overwritten_with_the_sample():
     ("procedure_pseudo_code", {"procedure": "../../etc/passwd"}),
     ("procedure_pseudo_code", {"procedure": "/etc/passwd"}),
     ("procedure_pseudo_code", {"procedure": "main; rm -rf /"}),
-    ("procedure_pseudo_code", {"procedure": "$(id)"}),
+    ("procedure_pseudo_code", {"procedure": "a\x00b"}),
+    ("procedure_pseudo_code", {"procedure": "a\nb"}),
+    ("procedure_pseudo_code", {"procedure": "x\\y"}),
     ("procedure_pseudo_code", {"procedure": "a`b`"}),
     ("procedure_pseudo_code", {"procedure": "x" * 257}),
     ("procedure_pseudo_code", {"procedure": 7}),
-    ("search_strings", {"pattern": "a|b"}),
+    ("search_strings", {"pattern": "a\x01b"}),
+    ("search_strings", {"pattern": "x" * 257}),
+    ("document", {}),
     ("search_strings", {"pattern": "ok", "mode": "glob"}),
     ("batch_decompile", {"addresses": ["0x401000", "../x"]}),
     ("batch_decompile", {"addresses": ["0x1"] * 100}),
@@ -619,8 +623,6 @@ def test_ioc_verified_only_by_deterministic_match(tmp_path):
     ([{"choices": [{"message": {"tool_calls": [{"id": "a", "function": {"arguments": "{}"}}]}}]}], "malformed"),
     ([{"choices": []}], "malformed"),
     ([{"nope": 1}], "malformed"),
-    ([answer("not json at all"), answer("still not json {")], "malformed"),
-    ([answer("prose"), answer(json.dumps([1, 2]))], "malformed"),
 ])
 def test_model_failures_keep_prior_summary_and_stop_the_chain(tmp_path, script, status):
     cont = make_continuation(tmp_path, summary="prior summary")
@@ -833,3 +835,189 @@ def test_loop_turns_leave_a_reserve_for_the_final_answer(tmp_path):
     loop_turn = model.calls[0]["timeout_s"]
     assert loop_turn <= 540 - ag.final_reserve(540) + 1
     assert ag.final_reserve(540) >= 60
+
+
+# ------------------------------------------------------------------ fix round 1
+
+
+def test_relaxed_names_and_search_text_pass():
+    for proc in ("?foo@@YAXXZ", "std::vector<int>::at(unsigned long) const&", "main::{{closure}}",
+                 "operator<<", "$(id)", "Foo::Bar [thunk], ~Baz*"):
+        assert policy.check_call("procedure_pseudo_code", {"procedure": proc}, sample_path="/s")
+    for pat in ("a|b", "/etc/shadow", "http://c2.example/gate.php?x=1;y", "..\\..", "'\"`!#"):
+        assert policy.check_call("search_strings", {"pattern": pat, "mode": "regex"}, sample_path="/s")
+    assert policy.check_call("search_bytes", {"pattern": "4d 5a ?? 00", "mask": "ff ff 00 ff"}, sample_path="/s")
+    assert policy.check_call("trace_feature", {"query": "HKLM\\Software\\Run (persistence)"}, sample_path="/s")
+    # Path overwrite and unknown-arg refusal are unchanged.
+    assert policy.check_call("inspect_pe_imports", {"path": "/etc/x"}, sample_path="/s")["path"] == "/s"
+    with pytest.raises(policy.CallRefused):
+        policy.check_call("search_strings", {"pattern": "x", "evil": 1}, sample_path="/s")
+
+
+def _final(**kw):
+    base = {"summary": "s", "functions": [], "iocs": [], "todo": [], "done": True}
+    return answer({**base, **kw})
+
+
+def test_searching_for_an_ioc_does_not_verify_it(tmp_path):
+    url = "http://c2.evil-example.com/gate.php"
+    echo = json.dumps({"operation": "search_strings", "parameters": {"pattern": url},
+                       "subject": {"local_path": "/work/x/http://subject.evil-example.com/p"},
+                       "normalized_result": {"query": url, "pattern": url, "matches": []}})
+    cont = make_continuation(tmp_path)
+    rig = McpRig(tmp_path, {"search_strings": {"text": echo},
+                            "procedure_info": {"error": "no such procedure http://err.evil-example.com/x"}})
+    model = FakeModel([
+        tc(("search_strings", {"pattern": url}, "a"), ("procedure_info", {"procedure": "nope"}, "b")),
+        _final(iocs=[{"type": "url", "value": url, "source": "t1"},
+                     {"type": "url", "value": "http://subject.evil-example.com/p", "source": "t1"},
+                     {"type": "url", "value": "http://err.evil-example.com/x", "source": "t2"}]),
+    ])
+    res, _ = run(tmp_path, cont, model, rig)
+    io_ = cols(res.payload, "iocs")
+    assert io_["value"] and not any(io_["verified"]), io_
+
+
+def test_ioc_found_by_another_call_is_still_verified(tmp_path):
+    url = "http://c2.evil-example.com/gate.php"
+    cont = make_continuation(tmp_path)
+    rig = McpRig(tmp_path, {
+        "search_strings": {"text": json.dumps({"normalized_result": {"query": url, "matches": [url]}})},
+        "procedure_pseudo_code": {"text": json.dumps({"normalized_result": f'connect("{url}")'})},
+    })
+    model = FakeModel([
+        tc(("search_strings", {"pattern": url}, "a"), ("procedure_pseudo_code", {"procedure": "0x140001420"}, "b")),
+        _final(iocs=[{"type": "url", "value": url, "source": "t2"}]),
+    ])
+    res, _ = run(tmp_path, cont, model, rig)
+    assert cols(res.payload, "iocs")["verified"] == [True]
+
+
+def test_citations_need_a_real_address_in_a_good_result(tmp_path):
+    cont = make_continuation(tmp_path)
+    rig = McpRig(tmp_path, {
+        "procedure_info": {"error": "procedure 0xdeadbeef01 not found"},
+        "procedure_pseudo_code": {"text": json.dumps({
+            "parameters": {"procedure": "0x7777777777"},
+            "normalized_result": "x = 1234; y = 0x4010a0; FUN_00402000(); z = abcd;"})},
+    })
+    model = FakeModel([
+        tc(("procedure_info", {"procedure": "0xdeadbeef01"}, "a"),
+           ("procedure_pseudo_code", {"procedure": "0x7777777777"}, "b")),
+        _final(functions=[{"address": a, "name": "f", "claim": "c", "evidence": ["t2"]}
+                          for a in ("0xdeadbeef01", "0x7777777777", "0x1234", "0xabcd", "0x4010a0", "0x402000")]),
+    ])
+    res, _ = run(tmp_path, cont, model, rig)
+    assert cols(res.payload, "functions")["address"] == ["0x4010a0", "0x402000"]
+
+
+def test_malformed_after_a_good_turn_is_budget(tmp_path):
+    cont = make_continuation(tmp_path, summary="prior summary")
+    model = FakeModel([tc(("binary_overview", {}, "a")), {"choices": []}, answer("still not json {")])
+    res, out = run(tmp_path, cont, model, McpRig(tmp_path))
+    f = res.payload.fields
+    assert f["model_status"] == "budget" and f["more_pending"] is True and f["summary"] == "prior summary"
+
+
+@pytest.mark.parametrize("final", [ModelError("unavailable", "TimeoutError"), ModelError("malformed", "x"),
+                                   answer("not json"), answer(json.dumps([1]))])
+def test_final_failure_after_good_turns_is_budget(tmp_path, final):
+    cont = make_continuation(tmp_path, todo=["0x140001420", "0x140001500"], summary="prior summary")
+    model = FakeModel([answer("prose, no tools"), final])
+    res, _ = run(tmp_path, cont, model, McpRig(tmp_path))
+    f = res.payload.fields
+    assert f["model_status"] == "budget" and f["more_pending"] is True and f["summary"] == "prior summary"
+
+
+def test_steps_exhausted_then_final_fails_is_budget_and_saves_explored(tmp_path, monkeypatch):
+    monkeypatch.setenv("REA_MAX_STEPS", "1")
+    cont = make_continuation(tmp_path, todo=["0x140001420", "0x140001500"], explored=["0x140001000"])
+    rig = McpRig(tmp_path, {"procedure_pseudo_code": {"text": DECOMP}})
+    model = FakeModel([tc(("procedure_pseudo_code", {"procedure": "0x140001420"}, "a")),
+                       ModelError("unavailable", "TimeoutError")])
+    res, out = run(tmp_path, cont, model, rig)
+    f = res.payload.fields
+    assert f["model_status"] == "budget" and f["more_pending"] is True and f["steps"] == 1
+    st = next_state(out)
+    assert st.explored == ["0x140001000", "0x140001420"]
+    assert st.todo == ["0x140001500"]
+
+
+def test_only_refused_calls_then_failure_is_budget(tmp_path):
+    cont = make_continuation(tmp_path)
+    model = FakeModel([tc(("annotate_native_function", {"procedure": "main"}, "a")),
+                       ModelError("unavailable", "boom"), ModelError("unavailable", "boom")])
+    res, _ = run(tmp_path, cont, model, McpRig(tmp_path))
+    f = res.payload.fields
+    assert f["model_status"] == "budget" and f["more_pending"] is True and f["refused_calls"] == 1
+
+
+def test_default_max_steps_is_12():
+    assert ag.DEFAULT_MAX_STEPS == 12
+
+
+class _Trickle:
+    status = 200
+
+    def __init__(self):
+        self.reads = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return None
+
+    def read1(self, n=-1):
+        self.reads += 1
+        time.sleep(0.2)
+        return b" "
+
+    read = read1
+
+
+class TrickleOpener:
+    def open(self, req, timeout=None):
+        return _Trickle()
+
+
+def test_model_call_has_a_total_deadline_against_a_trickling_proxy():
+    m = ModelClient("http://m:1/v1", "x", 30, opener=TrickleOpener())
+    t = time.monotonic()
+    with pytest.raises(ModelError) as ei:
+        m.chat([{"role": "user", "content": "q"}], [], 16, timeout_s=1.5)
+    assert ei.value.kind == "unavailable"
+    assert time.monotonic() - t < 2.5
+
+
+def test_mcp_boolean_id_is_not_a_match(tmp_path):
+    # `true == 1` in Python: a reply with "id": true must not answer request id 1 (initialize).
+    rig = McpRig(tmp_path, {"__init_bool_id": True, "read_bytes": {"bool_id_first": True, "text": "real"}})
+    c = rig([REA_BIN, "--mcp"], {"PATH": "/usr/bin:/bin"}, tmp_path)
+    try:
+        assert c.start(timeout_s=30)["protocolVersion"] != "BOGUS"
+        assert c.call("read_bytes", {"address": "0x1"}, timeout_s=10)["content"][0]["text"] == "real"
+    finally:
+        c.close()
+
+
+def test_ioc_echoed_in_matches_of_its_own_search_is_not_verified(tmp_path):
+    url = "http://c2.evil-example.com/gate.php"
+    cont = make_continuation(tmp_path)
+    rig = McpRig(tmp_path, {"search_strings": {"text": json.dumps(
+        {"normalized_result": {"matches": [{"value": url}], "note": f"searched for {url}"}})}})
+    model = FakeModel([tc(("search_strings", {"pattern": url}, "a")),
+                       _final(iocs=[{"type": "url", "value": url, "source": "t1"}])])
+    res, _ = run(tmp_path, cont, model, rig)
+    assert cols(res.payload, "iocs")["verified"] == [False]
+
+
+def test_ioc_shaped_artifact_path_echo_is_not_verified(tmp_path):
+    # The sample's file name is caller-chosen; REA echoes it as normalized_result.artifact.path.
+    cont = make_continuation(tmp_path)
+    rig = McpRig(tmp_path, {"inspect_pe_imports": {"text": json.dumps({"normalized_result": {
+        "artifact": {"path": "/work/u/sample/http://name.evil-example.com/x"}, "imports": []}})}})
+    model = FakeModel([tc(("inspect_pe_imports", {}, "a")),
+                       _final(iocs=[{"type": "url", "value": "http://name.evil-example.com/x", "source": "t1"}])])
+    res, _ = run(tmp_path, cont, model, rig)
+    assert cols(res.payload, "iocs")["verified"] == [False]
