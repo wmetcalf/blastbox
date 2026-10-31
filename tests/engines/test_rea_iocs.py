@@ -43,3 +43,12 @@ def test_limit_truncates() -> None:
 
 def test_ipv6() -> None:
     assert ("ipv6", "2001:db8::1") in _by(extract_iocs([("s", "connect 2001:db8::1 now")]))
+
+
+def test_hostile_input_is_linear() -> None:
+    import time
+
+    for blob in ("a.a.a." * 170_000, "\\" * 1_000_000, "a." * 500_000, "x@a." * 250_000):
+        t0 = time.monotonic()
+        extract_iocs([("s", blob)])
+        assert time.monotonic() - t0 < 2.0, blob[:8]

@@ -160,3 +160,31 @@ def test_stops_writing_at_cap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         c.unpack(arc, tmp_path / "out", max_bytes=1000)
     a = tmp_path / "out" / "sample" / "a"
     assert not a.exists() or a.stat().st_size <= 1000 + 65536
+
+
+def test_huge_gnu_longname_is_bounded(tmp_path: Path) -> None:
+    """A multi-hundred-MB longname header must be refused without being buffered."""
+    import gzip
+    import resource
+
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w", format=tarfile.GNU_FORMAT) as tf:
+        ti = tarfile.TarInfo("sample/" + "a" * 300_000_000)
+        ti.size = 0
+        tf.addfile(ti)
+    arc = tmp_path / "ln.tar.gz"
+    arc.write_bytes(gzip.compress(raw.getvalue(), 1))
+    before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    with pytest.raises(ContinuationError):
+        unpack(arc, tmp_path / "out", max_bytes=1 << 20)
+    assert resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - before < 150 * 1024  # KiB
+
+
+def test_member_count_capped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import blastbox.engines.rea.continuation as c
+
+    monkeypatch.setattr(c, "MAX_MEMBERS", 5)
+    members = [(_file(f"project/f{i}", b"x")) for i in range(10)] + [_STATE]
+    arc = _raw(tmp_path / "many.tar.gz", members)
+    with pytest.raises(ContinuationError):
+        c.unpack(arc, tmp_path / "out", max_bytes=1 << 20)

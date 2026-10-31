@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import json
+import gzip
 import os
 import tarfile
 from dataclasses import asdict, dataclass, field
@@ -21,6 +22,33 @@ GhidraStatus = Literal["ok", "timeout", "failed", "skipped"]
 
 _STATE_NAME = "state.json"
 _CHUNK = 64 * 1024
+MAX_MEMBERS = 200_000
+_HEADER_SLACK = 1024 * 1024  # fixed decompressed-stream allowance beyond max_bytes
+_PER_MEMBER_OVERHEAD = 2048  # tar header + padding allowance per member
+
+
+class _CountingReader:
+    """Reads from a gzip stream and refuses to decompress past ``max_bytes`` plus tar overhead.
+
+    tarfile reads GNU longname / pax headers fully into memory before any per-member size
+    check can run, so the bound has to sit under tarfile, on the decompressed stream.
+    """
+
+    def __init__(self, raw: Any, max_bytes: int) -> None:
+        self._raw = raw
+        self._max = max_bytes
+        self.read_total = 0
+        self.members = 0
+
+    def read(self, n: int = -1) -> bytes:
+        allowed = self._max + _HEADER_SLACK + _PER_MEMBER_OVERHEAD * self.members - self.read_total
+        if n < 0 or n > allowed:
+            n = allowed + 1  # read just one past the budget so overflow is detected, not buffered
+        data: bytes = self._raw.read(n)
+        self.read_total += len(data)
+        if len(data) > allowed:
+            raise ContinuationError("archive exceeds max_bytes (decompressed)")
+        return data
 _FILE_MODE = 0o640
 _DIR_MODE = 0o750
 
@@ -98,12 +126,17 @@ def unpack(archive: Path, into: Path, *, max_bytes: int) -> tuple[Path, Path | N
     project: Path | None = None
     state: State | None = None
     try:
-        tf = tarfile.open(archive, "r:gz")
+        gz = gzip.open(archive, "rb")
+        reader = _CountingReader(gz, max_bytes)
+        tf = tarfile.open(fileobj=reader, mode="r|")  # type: ignore[call-overload]
     except (tarfile.TarError, OSError, EOFError) as exc:
         raise ContinuationError(f"unreadable archive: {exc}") from exc
-    with tf:
+    with gz, tf:
         try:
             for m in tf:
+                reader.members += 1
+                if reader.members > MAX_MEMBERS:
+                    raise ContinuationError("too many archive members")
                 parts = _safe_parts(m.name)
                 root = parts[0]
                 if root not in ("sample", "project", _STATE_NAME):
