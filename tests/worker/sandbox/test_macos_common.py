@@ -431,9 +431,11 @@ class TestWipeDirRoot:
 @pytest.mark.skipif(sys.platform != "darwin" or not os.path.exists("/usr/bin/sandbox-exec"),
                     reason="needs macOS")
 class TestSweep:
-    def _sandboxed_sleeper(self, rw):
+    def _sandboxed_sleeper(self, rw, canary=None):
         prof = (f'(version 1)(allow default)(deny file-write*)'
                 f'(allow file-write* (subpath "{rw}"))')
+        if canary:   # confined like a seatbelt run: its canary, and no network
+            prof += f'(allow mach-lookup (global-name "{canary}"))(deny network*)'
         p = subprocess.Popen(["/usr/bin/sandbox-exec", "-p", prof, "/bin/sleep", "30"],
                              start_new_session=True)
         # Wait until the kernel has it sandboxed (a fixed sleep raced a loaded machine: the
@@ -484,6 +486,36 @@ class TestSweep:
         finally:
             a.kill()
             a.wait()
+
+    def test_a_system_agent_that_may_write_the_scratch_is_not_taken_for_the_run(self, tmp_path):
+        # Many of the user's sandboxed system agents (secd, contactsd, VideoToolbox services, ...)
+        # may write the whole temp dir, scratch included, and a few allow nearly everything --
+        # this "agent" may write all of tmp_path, look up any Mach name and use the network. One
+        # that starts during a run must not be swept as its escapee; a process confined like
+        # the run (its canary, no network) must be.
+        mine = (tmp_path / "mine").resolve()
+        mine.mkdir()
+        canary = mc.run_canary()
+        t0 = time.time() - 1
+        agent = self._sandboxed_sleeper(tmp_path.resolve())
+        escapee = self._sandboxed_sleeper(mine, canary=canary)
+        try:
+            time.sleep(0.5)
+            assert mc.sandbox_may_write(agent.pid, mine)            # the old match killed it
+            assert mc.sandbox_may_lookup(agent.pid, canary)         # even the canary passes
+            assert mc.sweep_writers(mine, started_after=t0, canary=canary) == 1
+            assert escapee.wait(5) == -9
+            assert agent.poll() is None
+        finally:
+            for p in (agent, escapee):
+                p.kill()
+                p.wait()
+
+    def test_no_sandboxed_process_here_matches_a_runs_identity(self, tmp_path):
+        d = (tmp_path / "scratch").resolve()
+        d.mkdir()
+        match = mc.writer_matcher(d, started_after=0, canary=mc.run_canary())
+        assert [p for p in mc.uid_pids() if mc.is_sandboxed(p) and match(p)] == []
 
     def test_the_worker_itself_is_not_sandboxed(self):
         assert not mc.is_sandboxed(os.getpid())
@@ -546,6 +578,21 @@ class TestSweepRevalidatesIdentity:
         assert mc.sweep_sandboxed(lambda p: True, what="test", rounds=20,
                                   clock=_StepClock(step=0.01)) == 0
         assert sent == []                     # never signalled without an identity
+
+    def test_a_stream_of_new_unreadable_processes_still_exhausts_the_rounds(self, monkeypatch):
+        # Each poll meets a DIFFERENT process in the unreadable exit window (other runs' scanners
+        # exiting one after another): every one gets its own settle timer, so only the round
+        # budget can end this. It must, not hold teardown open indefinitely.
+        pids = iter(range(9000, 10000))
+        monkeypatch.setattr(mc, "uid_pids", lambda uid=None: [next(pids)])
+        monkeypatch.setattr(mc, "is_sandboxed", lambda p: True)
+        monkeypatch.setattr(mc, "proc_start_time", lambda p: None)
+        monkeypatch.setattr(mc, "_proc_state", lambda p: "alive")
+        monkeypatch.setattr(mc.threading.Event, "wait", lambda self, t=None: True)
+        clock = _StepClock(step=1.0)
+        with pytest.raises(SandboxError, match="could not kill"):
+            mc.sweep_sandboxed(lambda p: True, what="test", rounds=20, settle_s=5, clock=clock)
+        assert clock.t <= 21
 
     def test_a_killed_process_slow_to_die_is_waited_out(self, monkeypatch):
         # A SIGKILLed scanner tearing down GPU / Neural Engine state can stay alive for a while.

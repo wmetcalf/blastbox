@@ -38,6 +38,18 @@ class TestProfile:
         assert "(deny network*)" in lines
         assert "allow network" not in text
 
+    def test_the_runs_canary_is_granted_as_a_parameter_and_the_network_stays_denied(self):
+        # The sweep identifies a run's processes by the canary lookup AND the network denial
+        # (mc.writer_matcher): both must be in every run's profile.
+        canary = mc.run_canary()
+        text, params = build_profile(exec_paths=["/x"], ro_paths=[], rw_paths=["/s"],
+                                     accelerators=frozenset({"gpu", "ane"}), scratch="/s",
+                                     canary=canary)
+        assert params["CANARY"] == canary and canary not in text
+        lines = text.splitlines()
+        assert '(allow mach-lookup (global-name (param "CANARY")))' in lines
+        assert lines[-1] == "(deny network*)"
+
     def test_paths_never_appear_in_the_profile_text(self):
         hostile = '/tmp/a") (allow default) ("'
         text, params = build_profile(exec_paths=[hostile], ro_paths=[hostile + "ro"],
@@ -577,7 +589,7 @@ class TestShutdownCoversTheTeardown:
             raise SandboxError("interrupted by the retirement")
 
         monkeypatch.setattr(mc, "run_confined", fake_run_confined)
-        monkeypatch.setattr(mc, "sweep_writers", lambda path, started_after: 0)
+        monkeypatch.setattr(mc, "sweep_writers", lambda path, started_after, canary=None: 0)
         monkeypatch.setattr(mc, "capture_scratch", capture)
         sb = SeatbeltSandbox(popen=lambda argv, **kw: _FakeProc(argv, **kw), platform_ok=True,
                              sandbox_exec="/bin/sh", scratch_base=tmp_path / "scratch")
