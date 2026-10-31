@@ -520,8 +520,82 @@ class TestSweepRevalidatesIdentity:
         monkeypatch.setattr(mc, "proc_start_time", lambda p: None)
         monkeypatch.setattr(mc, "_proc_state", lambda p: "alive")
         monkeypatch.setattr(mc.os, "kill", lambda p, sig: None)
+        clock = _StepClock(step=1.0)
         with pytest.raises(SandboxError, match="cannot identify"):
-            mc.sweep_sandboxed(lambda p: True, what="test")
+            mc.sweep_sandboxed(lambda p: True, what="test", settle_s=5, clock=clock)
+        assert clock.t > 5                    # only once it had lasted past the settle time
+
+    def test_a_process_unreadable_only_while_it_exits_is_waited_out(self, monkeypatch):
+        # Seen under load: the kernel stops describing an exiting process (no start time) a
+        # moment before ps flags it, so for a few rounds it is "alive" with no identity; then it
+        # is gone. That is no reason to fail the run.
+        rounds = {"n": 0}
+
+        def listing(uid=None):
+            rounds["n"] += 1
+            return [4242] if rounds["n"] <= 30 else []
+        monkeypatch.setattr(mc, "uid_pids", listing)
+        monkeypatch.setattr(mc, "is_sandboxed", lambda p: True)
+        monkeypatch.setattr(mc, "proc_start_time", lambda p: None)
+        monkeypatch.setattr(mc, "_proc_state", lambda p: "alive")
+        sent = []
+        monkeypatch.setattr(mc.os, "kill", lambda p, sig: sent.append(p))
+        monkeypatch.setattr(mc.threading.Event, "wait", lambda self, t=None: True)
+        # 30 waiting rounds don't use up a 20-round budget: rounds bound processes that keep
+        # coming, not one being waited out.
+        assert mc.sweep_sandboxed(lambda p: True, what="test", rounds=20,
+                                  clock=_StepClock(step=0.01)) == 0
+        assert sent == []                     # never signalled without an identity
+
+    def test_a_killed_process_slow_to_die_is_waited_out(self, monkeypatch):
+        # A SIGKILLed scanner tearing down GPU / Neural Engine state can stay alive for a while.
+        checks = {"n": 0}
+
+        def alive(p):
+            checks["n"] += 1
+            return checks["n"] <= 50
+        monkeypatch.setattr(mc, "uid_pids", lambda uid=None: [4242])
+        monkeypatch.setattr(mc, "is_sandboxed", lambda p: True)
+        monkeypatch.setattr(mc, "proc_start_time", lambda p: 100.0)
+        monkeypatch.setattr(mc, "_alive", alive)
+        monkeypatch.setattr(mc.os, "kill", lambda p, sig: None)
+        monkeypatch.setattr(mc.threading.Event, "wait", lambda self, t=None: True)
+        assert mc.sweep_sandboxed(lambda p: True, what="test", rounds=20,
+                                  clock=_StepClock(step=0.01)) == 1
+
+    def test_a_killed_process_that_never_dies_fails_the_sweep(self, monkeypatch):
+        monkeypatch.setattr(mc, "uid_pids", lambda uid=None: [4242])
+        monkeypatch.setattr(mc, "is_sandboxed", lambda p: True)
+        monkeypatch.setattr(mc, "proc_start_time", lambda p: 100.0)
+        monkeypatch.setattr(mc, "_alive", lambda p: True)
+        monkeypatch.setattr(mc.os, "kill", lambda p, sig: None)
+        monkeypatch.setattr(mc.threading.Event, "wait", lambda self, t=None: True)
+        with pytest.raises(SandboxError, match="still alive 5s after SIGKILL"):
+            mc.sweep_sandboxed(lambda p: True, what="test", settle_s=5, clock=_StepClock(step=1.0))
+
+    def test_new_processes_that_keep_coming_still_exhaust_the_rounds(self, monkeypatch):
+        # Each round a fresh match appears (a fork that outruns the kills): the waiting rules
+        # don't apply to processes the sweep hasn't killed yet.
+        pids = iter(range(7000, 8000))
+        monkeypatch.setattr(mc, "uid_pids", lambda uid=None: [next(pids)])
+        monkeypatch.setattr(mc, "is_sandboxed", lambda p: True)
+        monkeypatch.setattr(mc, "proc_start_time", lambda p: float(p))
+        monkeypatch.setattr(mc, "_alive", lambda p: True)
+        monkeypatch.setattr(mc.os, "kill", lambda p, sig: None)
+        monkeypatch.setattr(mc.threading.Event, "wait", lambda self, t=None: True)
+        with pytest.raises(SandboxError, match="could not kill"):
+            mc.sweep_sandboxed(lambda p: True, what="test", rounds=20, clock=_StepClock(step=0.0))
+
+
+class _StepClock:
+    """A monotonic clock that advances ``step`` seconds per reading."""
+
+    def __init__(self, step: float) -> None:
+        self.t, self.step = 0.0, step
+
+    def __call__(self) -> float:
+        self.t += self.step
+        return self.t
 
 
 class TestHardLinks:
