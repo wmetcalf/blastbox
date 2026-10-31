@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import IO, Any
 
 from blastbox.contract import DeclaredArtifact, Detection, Record, Warning
+from blastbox.engines.rea.iocs import extract_iocs
 from blastbox.engines.rea.continuation import ContinuationError, GhidraStatus, State, pack, unpack
 from blastbox.engines.rea.mcp_client import McpError, McpStdioClient
 from blastbox.engines.rea.model import ModelClient, ModelError
@@ -114,6 +115,8 @@ CONTENT_TOOLS: frozenset[str] = frozenset({
     "read_function_instructions", "resolve_containing_procedure", "resolve_native_call_targets", "xrefs",
 })
 MAX_VERIFY_IOCS = 128  # Ruling R: sample-byte searches per pass
+VERIFY_BUDGET_S = 60.0  # Ruling W: wall-clock cap on the sample-byte scan (also clamped to the pass)
+VERIFY_CHUNK = 8 * 1024 * 1024
 MIN_IOC_CHARS = 4
 _CASELESS_IOCS = frozenset({"url", "domain", "email"})
 _PROGRAM_NAME = re.compile(r"^[^/\\\x00]{1,255}$")
@@ -356,36 +359,63 @@ class _Evidence:
                     dest.add(a)
 
 
-def verify_iocs_in_sample(sample: Path, iocs: list[tuple[str, str]]) -> list[bool]:
-    """Ruling R: an IOC is verified only if its value occurs in the sample's own bytes.
+def ioc_shape_ok(typ: str, value: str) -> bool:
+    """Ruling V: ``value`` alone must be exactly one IOC of ``typ`` under iocs.py's own rules.
 
-    ASCII/UTF-8 and UTF-16LE encodings are searched; url/domain/email case-insensitively, the
-    rest exactly. Values outside ``MIN_IOC_CHARS..MAX_IOC_VALUE`` are never verified. The caller
-    caps the count (``MAX_VERIFY_IOCS``).
+    ``extract_iocs`` on the bare value must report this very ``(type, value)``, so "Rich" is no
+    mutex, ".dll" no domain (a dot plus an allowlisted TLD is required), "This" no URL.
     """
-    out = [False] * len(iocs)
+    return any(i.type == typ and i.value == value for i in extract_iocs([("shape", value)], limit=16))
+
+
+def verify_iocs_in_sample(sample: Path, iocs: list[tuple[str, str]], time_left: Callable[[], float], *,
+                          chunk_size: int = VERIFY_CHUNK) -> tuple[list[bool], bool]:
+    """Ruling R/W: which IOC values occur in the sample's own bytes; (found flags, ran out of time).
+
+    One pass over the mmap in ``chunk_size`` chunks overlapping by (longest needle - 1). Each value
+    is searched as UTF-8 and UTF-16LE: exactly for most types, against ``chunk.lower()`` with
+    lowered needles for url/domain/email (``bytes.lower`` folds ASCII only, so UTF-16LE's 0x00
+    bytes survive). A needle leaves the search set once found. ``time_left()`` is checked per
+    chunk; when it reaches 0 the rest stays unverified. Shape/length checks are the caller's.
+    """
+    found = [False] * len(iocs)
+    exact: dict[bytes, set[int]] = {}
+    caseless: dict[bytes, set[int]] = {}
+    for i, (typ, value) in enumerate(iocs):
+        table = caseless if typ in _CASELESS_IOCS else exact
+        for enc in ("utf-8", "utf-16-le"):
+            needle = value.encode(enc, "surrogatepass")
+            if typ in _CASELESS_IOCS:
+                needle = needle.lower()
+            table.setdefault(needle, set()).add(i)
+    if not exact and not caseless:
+        return found, False
     try:
         fd = os.open(sample, os.O_RDONLY | os.O_NOFOLLOW)
     except OSError:
-        return out
+        return found, False
     with os.fdopen(fd, "rb") as f:
         try:
             mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
         except (ValueError, OSError):  # empty file
-            return out
+            return found, False
         with mm:
-            for i, (typ, value) in enumerate(iocs):
-                if not MIN_IOC_CHARS <= len(value) <= MAX_IOC_VALUE:
-                    continue
-                for needle in (value.encode("utf-8"), value.encode("utf-16-le")):
-                    if typ in _CASELESS_IOCS:
-                        hit = re.search(re.escape(needle), mm, re.IGNORECASE) is not None  # type: ignore[call-overload]
-                    else:
-                        hit = mm.find(needle) != -1
-                    if hit:
-                        out[i] = True
-                        break
-    return out
+            overlap = max(len(n) for n in (*exact, *caseless)) - 1
+            pos, size = 0, len(mm)
+            while pos < size and (exact or caseless):
+                if time_left() <= 0:
+                    return found, True
+                chunk = mm[pos:pos + chunk_size + overlap]
+                for table, hay in ((exact, chunk), (caseless, chunk.lower() if caseless else b"")):
+                    for needle in [n for n in table if hay.find(n) != -1]:
+                        for i in table.pop(needle):
+                            found[i] = True
+                # A needle is done once any of its encodings hit.
+                for table in (exact, caseless):
+                    for needle in [n for n, ids in table.items() if all(found[i] for i in ids)]:
+                        del table[needle]
+                pos += chunk_size
+    return found, False
 
 
 # ---------------------------------------------------------------- the engine
@@ -837,7 +867,7 @@ class ReaAgentEngine:
             if answer is None:
                 self._final_failed(p, tw, "malformed", "final answer is not the required JSON object")
                 return
-        self._accept(answer, ev, explored_now, p, tw, sample)
+        self._accept(answer, ev, explored_now, p, tw, sample, remaining, self._clock)
 
     @staticmethod
     def _turn_failed(p: _Pass, tw: TranscriptWriter, message: str) -> None:
@@ -864,7 +894,8 @@ class ReaAgentEngine:
 
     @staticmethod
     def _accept(answer: FinalAnswer, ev: _Evidence, explored_now: list[str], p: _Pass,
-                tw: TranscriptWriter, sample: Path) -> None:
+                tw: TranscriptWriter, sample: Path, remaining: Callable[[], float],
+                clock: Callable[[], float]) -> None:
         dropped = 0
         for fn in answer.functions:
             if fn["address"] not in ev.addresses:
@@ -882,9 +913,29 @@ class ReaAgentEngine:
             if k not in seen:
                 seen.add(k)
                 unique.append(ioc)
-        checked = verify_iocs_in_sample(sample, [(i["type"], i["value"]) for i in unique[:MAX_VERIFY_IOCS]])
+        reasons = ["cap"] * len(unique)
+        candidates: list[int] = []
+        for i, ioc in enumerate(unique[:MAX_VERIFY_IOCS]):
+            if not MIN_IOC_CHARS <= len(ioc["value"]) <= MAX_IOC_VALUE:
+                reasons[i] = "length"
+            elif not ioc_shape_ok(ioc["type"], ioc["value"]):
+                reasons[i] = "shape"
+            else:
+                candidates.append(i)
+        # remaining() ends at the pass deadline, which already sits the pack/seal reserve before
+        # Limits.timeout_s; VERIFY_BUDGET_S caps the scan below that.
+        scan_deadline = clock() + max(0.0, min(VERIFY_BUDGET_S, remaining()))
+        hits, timed_out = verify_iocs_in_sample(
+            sample, [(unique[i]["type"], unique[i]["value"]) for i in candidates],
+            lambda: scan_deadline - clock())
+        for i, hit in zip(candidates, hits):
+            reasons[i] = "" if hit else ("budget" if timed_out else "not_in_sample")
         for i, ioc in enumerate(unique):
-            p.iocs.append({**ioc, "verified": i < len(checked) and checked[i]})
+            p.iocs.append({**ioc, "verified": reasons[i] == "", "reason": reasons[i]})
+        if timed_out:
+            p.warnings.append(Warning(code="iocs_unverified_budget",
+                                      message=f"sample-byte IOC check stopped at its time budget; "
+                                              f"{sum(r == 'budget' for r in reasons)} IOC(s) left unverified"))
         if len(unique) > MAX_VERIFY_IOCS:
             p.warnings.append(Warning(code="iocs_unverified_cap",
                                       message=f"{len(unique) - MAX_VERIFY_IOCS} IOC(s) beyond the "
@@ -944,6 +995,8 @@ class ReaAgentEngine:
                     "value": [i["value"] for i in iocs],
                     "source": [i["source"] for i in iocs],
                     "verified": [i["verified"] for i in iocs],
+                    # "" when verified; else shape | length | not_in_sample | budget | cap
+                    "reason": [i["reason"] for i in iocs],
                 }),
                 "summary": p.summary,
                 "todo_count": len(p.todo),

@@ -540,7 +540,7 @@ def test_payload_field_set(tmp_path):
     assert {"schema", "pass_no", "model", "model_status", "steps", "refused_calls", "functions", "iocs",
             "summary", "done", "more_pending"} <= set(f)
     assert set(cols(res.payload, "functions")) == {"address", "name", "claim", "evidence"}
-    assert set(cols(res.payload, "iocs")) == {"type", "value", "source", "verified"}
+    assert set(cols(res.payload, "iocs")) == {"type", "value", "source", "verified", "reason"}
     assert f["more_pending"] is False  # todo empty after the pass
 
 
@@ -1064,3 +1064,96 @@ def test_final_answer_arriving_at_the_deadline_is_used(tmp_path):
     res, _ = run(tmp_path, cont, model, McpRig(tmp_path), clock=lambda: now[0])
     f = res.payload.fields
     assert f["model_status"] == "ok" and f["summary"] == "just in time"
+
+
+# ------------------------------------------------------------------ fix round 3 (Rulings V, W)
+
+
+def test_ioc_shape_is_checked_before_the_byte_search(tmp_path):
+    junk = [("mutex", "Rich"), ("domain", ".dll"), ("domain", "x.dll"), ("url", "This"), ("email", "mode"),
+            ("url", "junk http://evil.example/a.php"), ("ipv4", "1.0.0.0"), ("ipv4", "999.1.1.1")]
+    src = tmp_path / "s"
+    src.mkdir()
+    sample = src / "sample.exe"
+    sample.write_bytes(SAMPLE_BYTES + b"Rich.dll x.dll This mode 1.0.0.0 999.1.1.1 junk ")
+    st = State(pass_no=0, sample_name="sample.exe", sample_sha256=hashlib.sha256(sample.read_bytes()).hexdigest(),
+               program_name="sample.exe", ghidra_status="ok", todo=["0x140001420"], summary="", started_at=1.0)
+    proj = src / "proj"
+    (proj / "sample.rep").mkdir(parents=True)
+    (proj / "sample.gpr").write_text("gpr")
+    cont = tmp_path / "c.tar.gz"
+    pack(cont, sample=sample, project_dir=proj, state=st)
+    model = FakeModel([_final(iocs=[{"type": t, "value": v, "source": "x"} for t, v in junk])])
+    res, _ = run(tmp_path, cont, model, McpRig(tmp_path))
+    io_ = cols(res.payload, "iocs")
+    got = {v: (ok, why) for v, ok, why in zip(io_["value"], io_["verified"], io_["reason"])}
+    for v in ("Rich", ".dll", "x.dll", "This", "mode", "junk http://evil.example/a.php", "999.1.1.1"):
+        assert got[v] == (False, "shape"), v
+    assert got["1.0.0.0"] == (True, "")  # a real, well-formed IP literal in the sample stays verifiable
+
+
+def test_ioc_reasons(tmp_path):
+    cont = make_continuation(tmp_path)
+    model = FakeModel([_final(iocs=[
+        {"type": "url", "value": "http://evil.example/a.php", "source": "x"},
+        {"type": "domain", "value": "never.example", "source": "x"},
+        {"type": "mutex", "value": "Gl", "source": "x"},
+    ])])
+    res, _ = run(tmp_path, cont, model, McpRig(tmp_path))
+    io_ = cols(res.payload, "iocs")
+    assert io_["reason"] == ["", "not_in_sample", "length"]
+    assert io_["verified"] == [True, False, False]
+
+
+def _scan(tmp_path, data, iocs, **kw):
+    f = tmp_path / "blob.bin"
+    f.write_bytes(data)
+    return ag.verify_iocs_in_sample(f, iocs, kw.pop("time_left", lambda: 100.0), **kw)
+
+
+def test_scan_finds_needles_across_chunk_boundaries(tmp_path):
+    url = "http://boundary.example/x"
+    for off in range(0, 40):
+        data = b"\xAA" * off + url.upper().encode() + b"\xBB" * 50
+        assert _scan(tmp_path, data, [("url", url)], chunk_size=16) == ([True], False), off
+        data16 = b"\xAA" * off + "Global\\mtx".encode("utf-16-le") + b"\xBB" * 50
+        assert _scan(tmp_path, data16, [("mutex", "Global\\mtx")], chunk_size=16) == ([True], False), off
+    # exact types stay exact; caseless types fold ASCII only
+    assert _scan(tmp_path, b"global\\MTX", [("mutex", "Global\\mtx")], chunk_size=4) == ([False], False)
+
+
+def test_scan_stops_at_its_deadline(tmp_path):
+    calls = []
+
+    def time_left():
+        calls.append(1)
+        return 0.0 if len(calls) > 1 else 1.0
+
+    data = b"\x00" * 64 + b"http://late.example/x"
+    found, timed_out = _scan(tmp_path, data, [("url", "http://late.example/x")], chunk_size=16, time_left=time_left)
+    assert found == [False] and timed_out is True
+
+
+def test_ioc_scan_budget_exhausted_in_the_engine(tmp_path):
+    cont = make_continuation(tmp_path)
+    now = [1000.0]
+    # The final answer lands exactly at the pass deadline: there is no time left to scan.
+    model = FakeModel([_final(iocs=[{"type": "url", "value": "http://evil.example/a.php", "source": "x"}])],
+                      on_chat=lambda: now.__setitem__(0, now[0] + 10_000))
+    res, _ = run(tmp_path, cont, model, McpRig(tmp_path), clock=lambda: now[0])
+    io_ = cols(res.payload, "iocs")
+    assert io_["verified"] == [False] and io_["reason"] == ["budget"]
+    assert any(w.code == "iocs_unverified_budget" for w in res.warnings)
+
+
+def test_scan_perf_128_needles_over_64_mib(tmp_path):
+    import os as _os
+    f = tmp_path / "big.bin"
+    f.write_bytes(_os.urandom(64 * 1024 * 1024))
+    iocs = [("url", f"http://n{i}.never-example.com/gate{i}.php") for i in range(64)]
+    iocs += [("mutex", f"Global\\never_{i:04d}") for i in range(64)]
+    t = time.monotonic()
+    found, timed_out = ag.verify_iocs_in_sample(f, iocs, lambda: 100.0)
+    took = time.monotonic() - t
+    assert not any(found) and not timed_out
+    assert took < 10, f"{took:.1f}s"
