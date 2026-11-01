@@ -662,7 +662,9 @@ def test_model_failures_keep_prior_summary_and_stop_the_chain(tmp_path, script, 
     assert f["model_status"] == status
     assert f["more_pending"] is False
     assert f["summary"] == "prior summary"
-    assert next_state(out).summary == "prior summary"
+    # the chain stops here: no continuation is packed for a pass nobody will run
+    assert "continuation" not in {a.id for a in res.artifacts}
+    assert not (out / "continuation.tar.gz").exists()
 
 
 def test_wall_budget_stops_the_loop(tmp_path):
@@ -698,7 +700,7 @@ def test_max_steps_bounds_the_loop(tmp_path, monkeypatch):
 
 
 def test_no_project_runs_ghidra_first(tmp_path):
-    cont = make_continuation(tmp_path, project=False, ghidra_status="timeout", todo=[])
+    cont = make_continuation(tmp_path, project=False, ghidra_status="timeout", todo=["0x140001420"])
     seen = {}
 
     def ghidra(sample, project_dir, timeout_s, *, env, **kw):
@@ -709,7 +711,7 @@ def test_no_project_runs_ghidra_first(tmp_path):
         return "ok"
 
     rig = McpRig(tmp_path)
-    model = FakeModel([answer({"summary": "s", "functions": [], "iocs": [], "todo": [], "done": True})])
+    model = FakeModel([answer({"summary": "s", "functions": [], "iocs": [], "todo": [], "done": False})])
     res, out = run(tmp_path, cont, model, rig, ghidra_fn=ghidra, limits=Limits(timeout_s=600))
     assert seen, "ghidra was not run"
     assert 0 < seen["timeout_s"] <= 540
@@ -795,7 +797,7 @@ def test_mcp_start_failure_is_not_fatal(tmp_path):
     assert res.status == "ok" and f["model_status"] == "skipped" and f["more_pending"] is False
     assert f["summary"] == "prior summary"
     assert any(w.code == "mcp_failed" for w in res.warnings)
-    assert (out / "continuation.tar.gz").exists()
+    assert not (out / "continuation.tar.gz").exists()  # skipped stops the chain: nothing to continue
 
 
 def test_job_dir_is_cleaned(tmp_path):
@@ -1071,11 +1073,12 @@ def test_final_answer_arriving_at_the_deadline_is_used(tmp_path):
 
 def test_ioc_shape_is_checked_before_the_byte_search(tmp_path):
     junk = [("mutex", "Rich"), ("domain", ".dll"), ("domain", "x.dll"), ("url", "This"), ("email", "mode"),
-            ("url", "junk http://evil.example/a.php"), ("ipv4", "1.0.0.0"), ("ipv4", "999.1.1.1")]
+            ("url", "junk http://evil.example/a.php"), ("ipv4", "1.0.0.0"), ("ipv4", "999.1.1.1"),
+            ("ipv4", "45.33.2.17"), ("domain", "runtime.link")]
     src = tmp_path / "s"
     src.mkdir()
     sample = src / "sample.exe"
-    sample.write_bytes(SAMPLE_BYTES + b"Rich.dll x.dll This mode 1.0.0.0 999.1.1.1 junk ")
+    sample.write_bytes(SAMPLE_BYTES + b"Rich.dll x.dll This mode 1.0.0.0 999.1.1.1 45.33.2.17 runtime.link junk ")
     st = State(pass_no=0, sample_name="sample.exe", sample_sha256=hashlib.sha256(sample.read_bytes()).hexdigest(),
                program_name="sample.exe", ghidra_status="ok", todo=["0x140001420"], summary="", started_at=1.0)
     proj = src / "proj"
@@ -1087,9 +1090,10 @@ def test_ioc_shape_is_checked_before_the_byte_search(tmp_path):
     res, _ = run(tmp_path, cont, model, McpRig(tmp_path))
     io_ = cols(res.payload, "iocs")
     got = {v: (ok, why) for v, ok, why in zip(io_["value"], io_["verified"], io_["reason"])}
-    for v in ("Rich", ".dll", "x.dll", "This", "mode", "junk http://evil.example/a.php", "999.1.1.1"):
+    for v in ("Rich", ".dll", "x.dll", "This", "mode", "junk http://evil.example/a.php", "999.1.1.1",
+              "1.0.0.0", "runtime.link"):  # a version number and a Go symbol are not IOCs either
         assert got[v] == (False, "shape"), v
-    assert got["1.0.0.0"] == (True, "")  # a real, well-formed IP literal in the sample stays verifiable
+    assert got["45.33.2.17"] == (True, "")  # a real, well-formed IP literal in the sample stays verifiable
 
 
 def test_ioc_reasons(tmp_path):
@@ -1157,3 +1161,66 @@ def test_scan_perf_128_needles_over_64_mib(tmp_path):
     took = time.monotonic() - t
     assert not any(found) and not timed_out
     assert took < 10, f"{took:.1f}s"
+
+
+# ----------------------------------------------------- final pass / post-accept failure (I5, M8)
+def _findings_answer(done: bool):
+    return answer({
+        "summary": "Connects to evil.example.",
+        "functions": [{"address": "0x140001420", "name": "entry", "claim": "beacons out", "evidence": ["t1"]}],
+        "iocs": [{"type": "url", "value": "http://evil.example/a.php", "source": "0x140001420"}],
+        "todo": ["0x140001500"] if not done else [],
+        "done": done,
+    })
+
+
+def _findings_rig(tmp_path):
+    return McpRig(tmp_path, {"procedure_pseudo_code": {"text": DECOMP}})
+
+
+def test_final_pass_seals_no_continuation(tmp_path):
+    cont = make_continuation(tmp_path, todo=["0x140001420"])
+    model = FakeModel([tc(("procedure_pseudo_code", {"procedure": "0x140001420"}, "a")), _findings_answer(True)])
+    res, out = run(tmp_path, cont, model, _findings_rig(tmp_path))
+    f = res.payload.fields
+    assert f["model_status"] == "ok" and f["done"] is True and f["more_pending"] is False
+    assert cols(res.payload, "functions")["address"] == ["0x140001420"]
+    assert [a.id for a in res.artifacts] == ["transcript"]
+    assert not (out / "continuation.tar.gz").exists()
+
+
+def test_exception_inside_accept_drops_findings_consistently(tmp_path, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("verify bug")
+
+    monkeypatch.setattr(ag, "verify_iocs_in_sample", boom)  # after functions were appended
+    cont = make_continuation(tmp_path, todo=["0x140001420"], summary="prior summary")
+    model = FakeModel([tc(("procedure_pseudo_code", {"procedure": "0x140001420"}, "a")), _findings_answer(False)])
+    res, out = run(tmp_path, cont, model, _findings_rig(tmp_path))
+    f = res.payload.fields
+    # Loadout refuses findings with any status but ok: none may be sealed with "skipped"
+    assert f["model_status"] == "skipped" and f["more_pending"] is False
+    assert cols(res.payload, "functions")["address"] == [] and cols(res.payload, "iocs")["value"] == []
+    assert f["summary"] == "prior summary" and f["done"] is False
+    assert any(w.code == "agent_failed" for w in res.warnings)
+    assert not (out / "continuation.tar.gz").exists()
+
+
+def test_exception_after_accept_keeps_the_ok_pass(tmp_path, monkeypatch):
+    real_close = McpStdioClient.close
+
+    def close(self):
+        real_close(self)
+        raise RuntimeError("close bug")
+
+    monkeypatch.setattr(McpStdioClient, "close", close)
+    cont = make_continuation(tmp_path, todo=["0x140001420"])
+    model = FakeModel([tc(("procedure_pseudo_code", {"procedure": "0x140001420"}, "a")), _findings_answer(False)])
+    res, out = run(tmp_path, cont, model, _findings_rig(tmp_path))
+    f = res.payload.fields
+    assert f["model_status"] == "ok" and f["summary"] == "Connects to evil.example."
+    assert cols(res.payload, "functions")["address"] == ["0x140001420"]
+    assert cols(res.payload, "iocs")["value"] == ["http://evil.example/a.php"]
+    assert any(w.code == "agent_failed" for w in res.warnings)
+    # the answer left a todo: the chain continues with its continuation
+    assert f["more_pending"] is True and next_state(out).todo == ["0x140001500"]

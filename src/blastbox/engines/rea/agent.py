@@ -19,7 +19,8 @@ dir in ``BLASTBOX_WORK_DIR``:
    are kept only for citable addresses (``_Evidence``, Ruling S); a proposed IOC is ``verified``
    only when its value occurs in the sample's own bytes (``verify_iocs_in_sample``, Ruling R);
 7. the next continuation (same project, updated ``State``) and a capped JSONL transcript are
-   declared, and a ``rea.pass/1`` Record is sealed.
+   declared, and a ``rea.pass/1`` Record is sealed. The continuation is packed only when another
+   pass can follow (``more_pending``); a final pass seals the transcript alone.
 
 Budgets: the pass wall clock is ``min(REA_PASS_WALL_S (540), Limits.timeout_s - reserve)`` where the
 reserve keeps time for packing and sealing; REA's 13-20 s session start is inside it. Turns are
@@ -439,6 +440,7 @@ class _Pass:
     done: bool = False
     final_reserve_s: float = 0.0
     good_turns: int = 0  # model responses that parsed (with or without tool calls)
+    accepted: bool = False  # _accept finished: functions/iocs/summary are one consistent answer
     warnings: list[Warning] = field(default_factory=list)
 
 
@@ -525,10 +527,17 @@ class ReaAgentEngine:
                                   max_steps, max_tokens)
             elif p.model_status == "ok":
                 p.model_status = "skipped"
-        except Exception as exc:  # never lose the continuation over an engine bug
+        except Exception as exc:  # an engine bug never fails the job or seals a refused shape
             _log.exception("rea-agent pass failed")
-            p.model_status = "skipped"
             p.warnings.append(Warning(code="agent_failed", message=f"exception:{type(exc).__name__}"))
+            if not (p.accepted and p.model_status == "ok"):
+                # Loadout accepts findings only with model_status ok. A half-applied answer is
+                # dropped whole, so the sealed pass is a consistent "skipped" with no findings.
+                p.model_status = "skipped"
+                p.functions, p.iocs = [], []
+                p.summary, p.done = state.summary, False
+            # else: the final answer was fully accepted before the failure (e.g. MCP close):
+            # it is sealed as the ok pass it is.
 
         # 7. continuation, transcript, payload
         next_state = State(
@@ -543,13 +552,15 @@ class ReaAgentEngine:
             started_at=state.started_at,
         )
         transcript_reserve = min(MAX_TRANSCRIPT_BYTES, limits.max_artifact_bytes)
-        cont = self._continuation(outdir, sample, project, next_state, limits, transcript_reserve, p)
         if p.model_status == "ok":
             more = (not p.done) and bool(p.todo)
         elif p.model_status == "budget":
             more = True
         else:
             more = False
+        # No pass can follow a final one: its continuation would only be retained, never used.
+        cont = (self._continuation(outdir, sample, project, next_state, limits, transcript_reserve, p)
+                if more else None)
         more_pending = more and cont is not None
 
         tw.write({"event": "end", "model_status": p.model_status, "steps": p.steps, "refused_calls": p.refused,
@@ -948,6 +959,7 @@ class ReaAgentEngine:
         if answer.summary:
             p.summary = answer.summary
         p.done = answer.done
+        p.accepted = True
         tw.write({"event": "final", "summary": p.summary[:TRANSCRIPT_TEXT], "functions": p.functions,
                   "iocs": p.iocs, "todo": p.todo, "done": p.done, "claims_dropped": dropped})
 
