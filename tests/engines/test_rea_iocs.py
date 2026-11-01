@@ -120,3 +120,36 @@ def test_utf16le_urls() -> None:
     assert got == [("utf16le:0x8", url), (f"utf16le:{8 + 2 * len(url) + 6:#x}", "ftp://files.example/x")]
     assert len(utf16le_urls("http://a.example/ ".encode("utf-16-le") * 50, limit=3)) == 3
     assert utf16le_urls(b"") == []
+
+
+# ------------------------------------------------------------- G1: inspect-output false positives
+
+
+def test_certificate_oids_are_not_ipv4() -> None:
+    cert = "inspect:inspect-pe-certificates"
+    rows = [(cert, o) for o in ("2.5.4.6", "2.5.4.10", "2.5.4.3", "2.5.4.8", "2.5.4.7", "203.0.113.9")]
+    assert not [i for i in extract_iocs(rows) if i.type == "ipv4"]
+
+
+def test_oid_arcs_are_dropped_from_any_source() -> None:
+    rows = [("ghidra:0x1", o) for o in ("2.5.4.3", "1.2.840.113", "1.3.6.1", "2.5.29.17")]
+    rows.append(("ghidra:0x2", "C2 203.0.113.7"))
+    assert [(i.type, i.value) for i in extract_iocs(rows)] == [("ipv4", "203.0.113.7")]
+
+
+def test_certificate_inspect_still_yields_urls_and_domains() -> None:
+    m = _by(extract_iocs([("inspect:inspect-pe-certificates", "http://crl.evil.example/ca.crl")]))
+    assert ("url", "http://crl.evil.example/ca.crl") in m and ("domain", "crl.evil.example") in m
+
+
+def test_go_module_paths_are_not_domains_but_strings_keep_them() -> None:
+    go = "inspect:inspect-go-binary"
+    rows = [(go, "github.com/foo/dropper"), (go, "golang.org/x/sys"), (go, "dl.evil.com")]
+    assert not [i for i in extract_iocs(rows) if i.type == "domain"]
+    m = _by(extract_iocs(rows + [("ghidra:0x500000", "fetch github.com now")]))
+    assert m[("domain", "github.com")] == "ghidra:0x500000"
+
+
+def test_go_binary_urls_are_still_reported() -> None:
+    m = _by(extract_iocs([("inspect:inspect-go-binary", "https://evil.example/mod")]))
+    assert ("url", "https://evil.example/mod") in m

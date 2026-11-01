@@ -47,6 +47,20 @@ _GO_PKGS = frozenset({
     "stringslite", "routebsd", "singleflight", "goexperiment", "buildcfg", "ioutil", "textproto",
 })
 
+# Dotted quads that are ASN.1 object identifiers, not hosts: X.509 attribute types (2.5.4.x),
+# certificate extensions (2.5.29.x), RSADSI/PKCS (1.2.840.x), the Internet arc (1.3.6.1.x) and
+# OIW (1.3.14.x). Live, inspect-pe-certificates' 2.5.4.6/.10/.3/.8/.7 became ip_address IOCs.
+_OID_ARCS = ("2.5.4.", "2.5.29.", "1.2.840.", "1.3.6.1.", "1.3.14.")
+# Sources whose dotted quads are never addresses (certificate inspection: OIDs and serials).
+_NO_IPV4_SOURCES = frozenset({"inspect:inspect-pe-certificates"})
+# Sources whose bare domains are Go module paths (github.com/..., golang.org/x/...), not hosts.
+# URLs in them are still reported, and the same domain found by any other source is kept.
+_NO_BARE_DOMAIN_SOURCES = frozenset({"inspect:inspect-go-binary"})
+
+
+def _oid_quad(quad: str) -> bool:
+    return quad.startswith(_OID_ARCS) or quad == "1.3.6.1"
+
 
 @dataclass
 class Ioc:
@@ -154,10 +168,12 @@ def extract_iocs(strings: Iterable[tuple[str, str]], *, limit: int = 2048) -> li
         found += [("mutex", m.group(0)) for m in _MUTEX.finditer(no_reg)]
         found += [("path", m.group(0)) for m in _PATH.finditer(no_reg)]
         no_path = _PATH.sub(" ", no_reg)
-        found += [("domain", m.group(1).lower()) for m in _DOMAIN.finditer(no_path)
-                  if not _symbol_domain(no_path, m.start(1), m.end(1))]
-        found += [("ipv4", m.group(0)) for m in _IPV4.finditer(text)
-                  if not _version_quad(text, m.start(), m.end(), prev)]
+        if src not in _NO_BARE_DOMAIN_SOURCES:
+            found += [("domain", m.group(1).lower()) for m in _DOMAIN.finditer(no_path)
+                      if not _symbol_domain(no_path, m.start(1), m.end(1))]
+        if src not in _NO_IPV4_SOURCES:
+            found += [("ipv4", m.group(0)) for m in _IPV4.finditer(text)
+                      if not _version_quad(text, m.start(), m.end(), prev) and not _oid_quad(m.group(0))]
         found += [("ipv6", v) for v in _ipv6s(text)]
         prev = text
         for t, v in found:
