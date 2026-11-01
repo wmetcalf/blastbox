@@ -42,12 +42,17 @@ either the system bundle or `ca.crt` changes.
 
 ```text
 image                         from                                                     toolz2 id
-blastbox-rea:dev              Dockerfile.rea-cold-worker @ feat/rea-engine f0b5f1e      425523239093 (prev: blastbox-rea:dev-c1ac953 @ 4fe5f69)
-blastbox-rea-sweep:4255232    Dockerfile.stack-worker ENGINE_CLASS=ReaSweepEngine        a8c85690a080
-blastbox-rea-agent:4255232    Dockerfile.stack-worker ENGINE_CLASS=ReaAgentEngine        12e6da8245c0
+blastbox-rea:dev              Dockerfile.rea-cold-worker @ feat/rea-engine a03b1ca      849fe70bf168 (prev: blastbox-rea:dev-4255232 @ f0b5f1e)
+blastbox-rea-sweep:849fe70    Dockerfile.stack-worker ENGINE_CLASS=ReaSweepEngine        143affceef1f
+blastbox-rea-agent:849fe70    Dockerfile.stack-worker ENGINE_CLASS=ReaAgentEngine        0518940e22c0
 blastbox-rea-host:0def6b2     Dockerfile.host @ deploy/rea-toolz2 0def6b2                8f6eab0bb0eb
 rea-model-proxy               kalaksi/tinyproxy@sha256:fafafc7079ca29c6704564de1353f61d038f2166f09b01d4e460e8e499bf6b57 (tinyproxy 1.11.3)
 ```
+
+Slots: toolz2 sets `REA_CONCURRENCY=1` (Ruling AN). The DeepSeek endpoint serves one sequence at a
+time, so a second agent slot only queues behind the first and burns its wall. The dispatcher has a
+single slot count (`BLASTBOX_DISPATCH_CONCURRENCY`) for every engine it serves, so sweeps get one slot
+too. A separate rea-agent dispatcher would be needed to give sweeps more.
 
 `deploy/rea-toolz2` is a LOCAL merge branch (feat/rea-engine 4fe5f69 + feat/netpolicy-httpproxy-bridge
 fbbbaaf, merge commit 0def6b2). It is not pushed. The host image needs it for the httpproxy `bridge=` key.
@@ -58,9 +63,9 @@ docker tag blastbox-rea:dev blastbox-rea:dev-prev
 docker build -f deploy/docker/Dockerfile.rea-cold-worker -t blastbox-rea:dev .
 # A digest BASE_IMAGE for a freshly built local image failed to resolve on toolz2 (buildkit tried
 # docker.io). After checking that blastbox-rea:dev has the pinned id, pass the tag instead:
-docker build -f deploy/rea/Dockerfile.stack-worker -t blastbox-rea-sweep:4255232 --build-arg BASE_IMAGE=blastbox-rea:dev \
+docker build -f deploy/rea/Dockerfile.stack-worker -t blastbox-rea-sweep:849fe70 --build-arg BASE_IMAGE=blastbox-rea:dev \
   --build-arg ENGINE_CLASS=blastbox.engines.rea:ReaSweepEngine --build-arg ENGINE_NAME=rea .
-docker build -f deploy/rea/Dockerfile.stack-worker -t blastbox-rea-agent:4255232 --build-arg BASE_IMAGE=blastbox-rea:dev \
+docker build -f deploy/rea/Dockerfile.stack-worker -t blastbox-rea-agent:849fe70 --build-arg BASE_IMAGE=blastbox-rea:dev \
   --build-arg ENGINE_CLASS=blastbox.engines.rea:ReaAgentEngine --build-arg ENGINE_NAME=rea-agent .
 # host (context = repo root at deploy/rea-toolz2)
 docker build -f deploy/rea/Dockerfile.host -t blastbox-rea-host:0def6b2 .
