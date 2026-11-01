@@ -1,0 +1,45 @@
+# Per-engine worker tags for the rea-bb stack, derived from the pinned REA cold-worker image.
+#
+# WHY A DERIVED IMAGE AND NOT DISPATCHER ENV. The cold dispatcher forwards only job params and
+# BLASTBOX_ENGINE_<NAME>_DEFAULT_PARAMS into the worker, and both go through the SAME gate:
+#   * every BLASTBOX_* / LD_* / PYTHON* key is reserved and DROPPED (so BLASTBOX_ENGINE,
+#     BLASTBOX_DETONATE_NAME, BLASTBOX_WORK_DIR and the in-slot Limits (BLASTBOX_TIMEOUT, ...)
+#     cannot be set that way at all), and
+#   * a job param OVERRIDES a default of the same key whenever the key is forwardable, so a
+#     REA_MODEL_URL default would be job-overridable (a slot could be pointed at another URL).
+# So every operator-owned value is baked here, and the stack sets PARAM_KEYS to the empty
+# allowlist (no client param reaches the worker) plus RESERVED_KEYS naming every REA_* knob.
+#
+#   docker build -f deploy/rea/Dockerfile.stack-worker -t blastbox-rea-sweep:<tag> \
+#     --build-arg ENGINE_CLASS=blastbox.engines.rea:ReaSweepEngine --build-arg ENGINE_NAME=rea .
+#   docker build -f deploy/rea/Dockerfile.stack-worker -t blastbox-rea-agent:<tag> \
+#     --build-arg ENGINE_CLASS=blastbox.engines.rea:ReaAgentEngine --build-arg ENGINE_NAME=rea-agent .
+ARG BASE_IMAGE=blastbox-rea:dev
+FROM ${BASE_IMAGE}
+
+ARG ENGINE_CLASS=blastbox.engines.rea:ReaSweepEngine
+ARG ENGINE_NAME=rea
+ARG REA_MODEL_URL=http://172.18.101.13:8888/v1
+ARG REA_MODEL_ID=deepseek-v4-flash
+
+# BLASTBOX_WORK_DIR=/tmp: the cold dispatcher gives the worker a read-only rootfs and one
+# writable tmpfs, /tmp (nosuid,noexec,512m; docker.py _DEFAULT_TMPFS). Ghidra + REA run fine on
+# it under runsc (measured, README.md). BLASTBOX_TMPFS tells the engine the real size, so the
+# agent's continuation-unpack cap (min(2 GiB, tmpfs_bytes)) matches the mount.
+# BLASTBOX_TIMEOUT=840 < dispatcher BLASTBOX_WORKER_TIMEOUT_S=900 (plan Global Constraints).
+ENV BLASTBOX_ENGINE=${ENGINE_CLASS} \
+    BLASTBOX_DETONATE_NAME=${ENGINE_NAME} \
+    BLASTBOX_WORK_DIR=/tmp \
+    BLASTBOX_TMPFS=536870912 \
+    BLASTBOX_TIMEOUT=840 \
+    BLASTBOX_MAX_INPUT=1073741824 \
+    BLASTBOX_MAX_ARTIFACT=1073741824 \
+    BLASTBOX_MAX_TOTAL_ARTIFACTS=2147483648 \
+    REA_MODEL_URL=${REA_MODEL_URL} \
+    REA_MODEL_ID=${REA_MODEL_ID} \
+    REA_PASS_WALL_S=540 \
+    REA_GHIDRA_SWEEP_S=420 \
+    REA_MAX_STEPS=12
+
+LABEL org.opencontainers.image.title="blastbox-${ENGINE_NAME}-worker" \
+      org.opencontainers.image.description="REA worker for engine ${ENGINE_NAME} on the rea-bb stack"

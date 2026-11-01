@@ -1,0 +1,126 @@
+# REA corpus gate on toolz2 (rea-bb, 2026-10-31)
+
+Each sample went through the real stack (`https://172.18.101.15:8006`, bearer key, private CA):
+`POST /v1/jobs engine=rea`, wait for the job, fetch the sealed `continuation` artifact, then
+`POST /v1/jobs engine=rea-agent` with it. The driver uses the ingress HTTP API, the same calls
+Loadout's blastbox client makes. Receipts for the PE pair were checked with `blastbox attest verify`
+(README.md). Workers: runsc, 4 CPUs, 6 GiB, `/tmp` tmpfs 512 MiB noexec. Images:
+`blastbox-rea-sweep:c1ac953` / `blastbox-rea-agent:c1ac953` (base `blastbox-rea:dev` c1ac9539fe96,
+feat/rea-engine 4fe5f69), host `blastbox-rea-host:0def6b2`.
+
+All samples are benign and were built for this gate in containers (`~/rea-build/t8/build/build.sh`
+on toolz2). The PE and ELF are `deploy/rea/fixtures/`.
+
+```text
+sample          bytes     sha256 (16)       how it was built
+benign_pe.exe   75185     dd4fc087aa16a951  fixtures/sample.exe (mingw PE32+, RT_ICON)
+benign.elf      15960     c0f94b8533d83d06  fixtures/sample.elf (gcc PIE)
+benign_go.elf   2148516   c7c6c8851718081f  golang:1.23 CGO_ENABLED=0 -trimpath, URL + IP string constants
+benign_dotnet   4608      4a34ed97ba8bffe1  dotnet/sdk:8.0 net8.0 class library, const URL + mutex
+benign.apk      8523      515bcf9df9006360  ubuntu:22.04 aapt/dalvik-exchange/apksigner, platform 23, v1+v2 signed
+benign.zip      28597     7661e6821eb78116  readme.txt (URL + IP) + bin/hello.exe
+protected.zip   29057     545cd74728134a93  zip -P infected (ZipCrypto): secret.txt + hello.exe
+truncated_pe    20000     cf896f3da67ed543  first 20000 bytes of benign_pe.exe
+```
+
+**Malware PE: none.** I searched toolz2 for a malware corpus: CAPE storage, hash-named files,
+`*malware*`/`binaries`/`bazaar`/`theZoo`/`virusshare` dirs, and MZ files in the home test dirs.
+Nothing turned up outside the other stacks' job data, which I did not touch. toolz3 was not
+touched. So no real malware PE was run.
+
+## Results
+
+Sweep (`rea`, network none). Every sweep sealed `ok`.
+
+```text
+sample          time    kind     ghidra   more_pending  iocs (total, types)       icons  members  warnings
+benign_pe.exe   102.4s  pe       ok       true          1  ipv4 (1.0.0.0)          1      0        -
+benign.elf       66.3s  elf      ok       true          0                          0      0        -
+benign_go.elf   249.9s  elf      ok       true          3  domain                  0      0        -
+benign_dotnet    63.2s  dotnet   ok       true          2  ipv4 (1.0.0.0, 8.0.0.0) 0      0        -
+benign.apk       30.1s  apk      skipped  false         0                          0      5        -
+benign.zip       21.1s  archive  skipped  false         0                          0      2        -
+protected.zip    21.1s  archive  skipped  false         0                          0      0        -   (no warning; see notes)
+truncated_pe     90.3s  pe       ok       true          0                          0      0        inspect_failed x6
+```
+
+`rea-agent`, one pass per sample on its continuation (personality rea_model, DeepSeek
+`deepseek-v4-flash` at 172.18.101.13:8888 through rea-model-proxy). IOCs are shown as verified/total.
+Run 1 used two drivers in parallel (dispatcher concurrency 2). Run 2 re-ran the native samples one
+at a time.
+
+```text
+sample          run  time    model_status  steps  refused  tool_calls  functions  iocs v/t  more_pending  warnings
+benign_pe.exe   1    388.6s  ok            9      1        15          31         0/9 shape  false (done)  -
+benign.elf      1    548.5s  budget        4      0        14          0          0/0        true          model_turn_failed, model_unavailable
+benign.elf      2    548.1s  budget        8      1        18          0          0/0        true          model_turn_failed, model_unavailable
+benign_go.elf   1    599.2s  budget        4      0        12          0          0/0        true          model_turn_failed, model_unavailable
+benign_go.elf   2    578.2s  ok            12     0        31          6          2/2        true          -
+benign_dotnet   1    517.9s  ok            4      1        8           2          0/4 shape  false (done)  model_turn_failed
+benign_dotnet   2    548.1s  budget        7      0        18          0          0/0        true          model_turn_failed, model_unavailable
+benign.apk      1    548.5s  budget        6      7        15          0          0/0        true          model_turn_failed, model_unavailable
+benign.zip      1    548.1s  budget        4      6        13          0          0/0        true          model_turn_failed, model_unavailable
+protected.zip   1    547.9s  budget        3      1        17          0          0/0        true          model_turn_failed, model_unavailable
+truncated_pe    1    548.1s  budget        9      2        28          0          0/0        true          model_turn_failed, model_unavailable
+truncated_pe    2    548.1s  JOB FAILED (dispatcher: "requeued: worker container disappeared", relaunch hit a
+                             container-name conflict, rc=125, "metadata.json not found") - not an engine result
+```
+
+The PE pass is `more_pending=false` with `done=true`: the model declared the analysis complete
+and 3 todo entries were left. Its summary named main at 0x140008590, computing argc*3+7 and
+printing "hello loadout %d\n". The Go run-2 pass identified Go 1.23.12, `main.main` at 0x4910c0 and
+the hello.go build info, and verified 2 IOCs against the sample bytes. The dotnet run-1 summary read
+"IL-only managed PE ... LoadoutFixture.dll ... .NETCoreApp v8.0", which is correct.
+
+**Sizes.** The continuation is 338 KB for the PE, 41 KB for the ELF, 45 KB for .NET, 65 KB for the
+truncated PE, **21.2 MB for Go**, and 5-29 KB for the APK and ZIPs. Transcripts run 52-295 KB.
+
+## Model endpoint (honest)
+
+DeepSeek was up but slow and shared during the gate. A trivial "Say hi" (max_tokens 64) took
+**194.8 s** right after run 1, then 1.7 s when it was idle (vLLM `num_requests_running 0`). In
+every `budget` pass, the transcript shows `model_turn_failed: unavailable: deadline_exceeded` at
+t≈432 s. That is the start of the final-answer reserve (540 s wall − 108 s). The final-answer
+request then also hit `deadline_exceeded` at t≈540 s, so Ruling O sealed the pass as `budget`, kept
+its explored/todo, and set `more_pending=true`. Model turns took 20-200 s each, against ~13-15 s in
+Task 7's lightly loaded run. No pass sealed `unavailable` (zero good turns), and none crashed. The
+results above reflect endpoint load, not a fault in the engine.
+
+## Notes from the gate (for the engine owners)
+
+- **Agent on non-native continuations.** apk, zip and protected.zip sweep `more_pending=false`, so
+  Loadout never chains them. Run by hand anyway, the agent spends its full 540 s wall and seals
+  `budget` with `more_pending=true`. The model also called tools that do not exist in that session
+  (`inspect_artifact`, `inspect_apk_signature`, `extract_artifact`, `open_binary`; refused as
+  "not available").
+- **Refusals** were mostly the model passing `detail` to `inspect_*` tools whose schema lacks it,
+  the same pattern as Task 7. One was `batch_decompile` with more than 16 addresses.
+- **protected.zip** sealed `members=0` with no warning. The encrypted entries are visible only
+  inside report.json's `inspect-artifact` result. A `members_encrypted`-style warning would make
+  this visible.
+- **Sweep IOC quality.**
+  - Go runtime symbols became "domains" (`runtime.link`, `godebugs.info`, `runtime.work` via the
+    .link/.info/.work TLDs). The fixture's real URL `loadout-go-fixture.example.org` was not
+    extracted, because Go strings are not NUL-terminated, so Ghidra defines no string for it.
+  - .NET's const URL (UTF-16 in the metadata blob) was not extracted, while assembly versions
+    `1.0.0.0`/`8.0.0.0` became ipv4 IOCs. The PE's `1.0.0.0` is the same false positive.
+  - As noted in Task 6, member contents are not IOC-scanned: the ZIP readme's URL and IP are missing.
+- **truncated_pe run 2 job failure.** This is a dispatcher/host-side requeue race ("worker container
+  disappeared" while the runsc slot was still running → relaunch → name conflict), not a REA fault.
+  It happened once in 16 jobs and was not reproduced.
+
+## Fixtures for Loadout (Ruling E)
+
+`corpus-envelopes/` holds real sealed outputs from the stack: benign samples only, 992 KB total.
+
+```text
+benign-pe-sweep/metadata.json        sweep envelope, job e1327fda (sha256 b7136c97... = receipt metadata_sha256)
+benign-pe-sweep/artifacts/           report.json, icons/icon-0.png, continuation.tar.gz (338681 B, c3cb08e6...)
+benign-pe-sweep/receipt-verified.json
+benign-pe-agent/metadata.json        rea-agent envelope, job 11dbdb9e (197fffd6... = receipt metadata_sha256), model_status ok
+benign-pe-agent/artifacts/           continuation.tar.gz (340262 B), transcript.jsonl (239557 B)
+benign-pe-agent/receipt-verified.json
+```
+
+The agent's input is the sweep's `continuation.tar.gz`, byte-identical (sha256 c3cb08e6...). The
+sample itself is `fixtures/sample.exe`.

@@ -1,0 +1,251 @@
+# rea-bb: the REA engines on a blastbox host (toolz2)
+
+Two engines from one pinned image (`deploy/docker/Dockerfile.rea-cold-worker`):
+
+```text
+rea         pass 0  sweep + Ghidra auto-analysis + IOCs + icons + continuation   network none
+rea-agent   pass N  DeepSeek-driven Ghidra pass over the continuation            personality rea_model
+```
+
+Both run cold, one disposable gVisor (`runsc`) container per job. The only network either
+engine ever gets is `rea-agent`'s single HTTP route to the model, through `rea-model-proxy`.
+
+Deployed on toolz2 (172.18.101.15) on 2026-10-31:
+
+```text
+compose project   rea-bb  (~/rea-bb/compose.yml = this directory's compose.yml)
+ingress           https://172.18.101.15:8006   (bearer key; CA ~/rea-bb/ca.crt)
+bearer key        ~/rea-bb/.env  BLASTBOX_API_KEY   (0600, coz)
+attest key        ~/rea-bb-keys/attest.key  (dispatcher only)  key_id 436a71440f08b99f
+data              ~/rea-bb-data   (uid 10001)
+tls               ~/rea-bb/tls    (uid 10001; CA key in ~/rea-bb/pki-ca, 0700)
+containers        rea-bb-{api,dispatcher,postgres,docker-socket-proxy}-1, rea-model-proxy
+networks          rea-bb_backend (internal), rea-bb_frontend, rea-bb_model-egress,
+                  bb-rea-model (operator-created, --internal, 10.231.200.0/24)
+```
+
+Loadout: `LOADOUT_REA_URL=LOADOUT_REA_AGENT_URL=https://172.18.101.15:8006`, `LOADOUT_REA_API_KEY` and
+`LOADOUT_REA_AGENT_API_KEY` = the bearer key, and `LOADOUT_REA_CA_FILE` / `LOADOUT_REA_AGENT_CA_FILE` = a
+copy of `ca.crt`. This is the williamtells-bb scheme.
+
+## Build
+
+```text
+image                         from                                                     toolz2 id
+blastbox-rea:dev              Dockerfile.rea-cold-worker @ feat/rea-engine 4fe5f69      c1ac9539fe96 (prev: blastbox-rea:dev-prev 328f42938158)
+blastbox-rea-sweep:c1ac953    Dockerfile.stack-worker ENGINE_CLASS=ReaSweepEngine        f58318ecffe2
+blastbox-rea-agent:c1ac953    Dockerfile.stack-worker ENGINE_CLASS=ReaAgentEngine        7eaab019de71
+blastbox-rea-host:0def6b2     Dockerfile.host @ deploy/rea-toolz2 0def6b2                8f6eab0bb0eb
+rea-model-proxy               kalaksi/tinyproxy@sha256:fafafc7079ca29c6704564de1353f61d038f2166f09b01d4e460e8e499bf6b57 (tinyproxy 1.11.3)
+```
+
+`deploy/rea-toolz2` is a LOCAL merge branch (feat/rea-engine 4fe5f69 + feat/netpolicy-httpproxy-bridge
+fbbbaaf, merge commit 0def6b2). It is not pushed. The host image needs it for the httpproxy `bridge=` key.
+
+```sh
+# worker (context = repo root at feat/rea-engine)
+docker tag blastbox-rea:dev blastbox-rea:dev-prev
+docker build -f deploy/docker/Dockerfile.rea-cold-worker -t blastbox-rea:dev .
+docker build -f deploy/rea/Dockerfile.stack-worker -t blastbox-rea-sweep:c1ac953 \
+  --build-arg ENGINE_CLASS=blastbox.engines.rea:ReaSweepEngine --build-arg ENGINE_NAME=rea .
+docker build -f deploy/rea/Dockerfile.stack-worker -t blastbox-rea-agent:c1ac953 \
+  --build-arg ENGINE_CLASS=blastbox.engines.rea:ReaAgentEngine --build-arg ENGINE_NAME=rea-agent .
+# host (context = repo root at deploy/rea-toolz2)
+docker build -f deploy/rea/Dockerfile.host -t blastbox-rea-host:0def6b2 .
+```
+
+## Deploy
+
+```sh
+docker network create --internal --subnet 10.231.200.0/24 bb-rea-model
+mkdir -p ~/rea-bb ~/rea-bb-data/jobs ~/rea-bb-keys ~/rea-bb/tls
+cp compose.yml tinyproxy.conf tinyproxy.filter ~/rea-bb/
+install -m 600 env.example ~/rea-bb/.env            # fill in every REPLACE_ME
+# ingress cert: a private CA + a P-256 server cert with SAN IP:172.18.101.15 -> ~/rea-bb/tls/{ca.crt,ingress.crt,ingress.key}
+# data, keys and tls must be owned by uid 10001 (keys 0700)
+cd ~/rea-bb && docker compose -p rea-bb -f compose.yml up -d
+```
+
+## How the config maps onto blastbox (what the plan said vs. what works)
+
+Three things in the plan's Step 2 cannot work as written. Each was found live:
+
+1. **Personality name.** `parse_personalities` lower-cases the env suffix, so
+   `BLASTBOX_NETPOLICY_REA_MODEL` registers `rea_model`. With
+   `BLASTBOX_ENGINE_REA_AGENT_NETPOLICY=rea-model` (hyphen) the name is unknown and resolves,
+   fail-closed, to `none`. The first live `rea-agent` job ran with `--network=none`
+   (`net_policy_resolved ... personality=none driver=none`) and sealed `model_status=unavailable`,
+   `warnings=[model_unavailable]`. The compose file uses `rea_model`.
+2. **Operator values cannot go in `_DEFAULT_PARAMS`.** Defaults pass the same gate as job params:
+   every `BLASTBOX_*`/`LD_*`/`PYTHON*` key is dropped, so `BLASTBOX_ENGINE`,
+   `BLASTBOX_DETONATE_NAME`, `BLASTBOX_WORK_DIR` and the in-slot Limits (`BLASTBOX_TIMEOUT`, ...)
+   never reach the worker that way. Also, a forwardable key is job-overridable (`{**defaults, **params}`):
+   `REA_MODEL_URL` as a default would let a job re-point the model. A reserved key is dropped
+   entirely, default included. So the operator values are baked into two derived images
+   (`Dockerfile.stack-worker`). The stack sets `_PARAM_KEYS=""` (the empty allowlist blocks every
+   client param and every default) and lists every `REA_*`/JVM/proxy/HOME knob in `_RESERVED_KEYS`.
+   `BLASTBOX_ENGINES` therefore names two tags (`rea=blastbox-rea-sweep:…`,
+   `rea-agent=blastbox-rea-agent:…`), not `blastbox-rea:dev` twice.
+3. **Worker Limits and scratch.** The cold worker's `Limits` come only from the image env (the
+   dispatcher does not forward them). Without `BLASTBOX_TIMEOUT` the slot gets 120 s. The cold
+   dispatcher mounts exactly one writable dir: `/tmp` (`nosuid,noexec,size=512m`, hard-coded in
+   `docker.py` `_DEFAULT_TMPFS`). The engine default `/work` does not exist on the read-only rootfs.
+   The images therefore set `BLASTBOX_WORK_DIR=/tmp`, `BLASTBOX_TMPFS=536870912`,
+   `BLASTBOX_TIMEOUT=840` (dispatcher kill at 900), the 1 GiB / 2 GiB artifact caps, `REA_MODEL_URL`,
+   `REA_MODEL_ID`, `REA_PASS_WALL_S=540`, `REA_GHIDRA_SWEEP_S=420` and `REA_MAX_STEPS=12`. Ghidra + REA
+   work on the noexec 512 MiB tmpfs under runsc (benign PE sweep: 101 s with this exact flag set).
+   **Limit:** 512 MiB of scratch is the ceiling for a Ghidra project plus REA's private copy, so a
+   very large sample can fail in the slot even though `BLASTBOX_MAX_INPUT` is 1 GiB.
+
+One more: **the proxy is named by IP, not by name.** Under runsc a worker cannot reach docker's
+embedded DNS (127.0.0.11), so `proxy=http://rea-model-proxy:8888` fails closed with
+`curl: (5) Could not resolve proxy: rea-model-proxy`. Under runc the same name resolves to 10.231.200.2.
+The personality uses `proxy=http://10.231.200.2:8888`, and compose pins the proxy to that address.
+
+## Network
+
+`rea-agent` slots run on `bb-rea-model`, an operator-created `--internal` bridge. Only
+`rea-model-proxy` sits on it with them. The proxy is dual-homed (bb-rea-model 10.231.200.2 +
+rea-bb_model-egress 192.168.128.2) and listens on the bb-rea-model address only. The dispatcher
+injects `HTTP(S)_PROXY=http://10.231.200.2:8888` (both cases).
+
+tinyproxy (`tinyproxy.conf`, `tinyproxy.filter`):
+
+```text
+FilterURLs On / FilterType ERE / FilterCaseSensitive Yes / FilterDefaultDeny Yes
+filter      ^http://172\.18\.101\.13:8888/
+ConnectPort 1          (any ConnectPort line makes the CONNECT list an allowlist; 1 is never used -> every CONNECT is 403)
+Allow       10.231.200.0/24
+Listen      10.231.200.2
+```
+
+The brief asked for a host filter `^172\.18\.101\.13$` plus port 8888 "if tinyproxy can express
+that". A host filter cannot express a port: tinyproxy then forwards to any port on the model host.
+With `FilterURLs On`, tinyproxy matches the full request URL (`http://host:port/path`, built from
+the Host header for origin-form requests), so the regex pins scheme, host and port. Requests on
+port 8888 can use any path.
+
+### Gate inside the dispatcher
+
+The dispatcher's `bridge=` gate runs `docker network inspect` through the socket proxy (which
+needs `NETWORKS=1`). It accepts bb-rea-model as internal, and the agent job is launched on it.
+This was checked live inside `rea-bb-dispatcher-1` with the real `Dispatcher._bridge_is_internal`:
+
+```text
+bb-rea-model verified_internal= True
+bb-net0 verified_internal= False
+bb-does-not-exist verified_internal= False
+['none', 'rea_model']
+rea_model -> ['--network', 'bb-rea-model']
+```
+
+The dispatcher log and the containers it launched:
+
+```text
+net_policy_resolved job=e1327fda-9731-47b4-8b65-eb05e43b1cd5 personality=none driver=none          (rea)
+net_policy_resolved job=11dbdb9e-cf7a-4a65-b5f9-22a4ce48a14f personality=rea_model driver=httpproxy (rea-agent)
+/blastbox-worker-4842e20a-f73 image=blastbox-rea-sweep:c1ac953 runtime=runsc net=none
+/blastbox-worker-11dbdb9e-cf7 image=blastbox-rea-agent:c1ac953 runtime=runsc net=bb-rea-model labels={"blastbox.net.leakguard":"strict",...}
+  env: BLASTBOX_NET_EGRESS=1 HTTP_PROXY=HTTPS_PROXY=http_proxy=https_proxy=http://10.231.200.2:8888
+```
+
+The dispatcher's signed receipts, checked with `blastbox attest verify --key pub.pem --cacert ca.crt
+--engine <e> --input <file>` (rc 0, `verified: true`, `network_attested: true`, `worker_runtime: runsc`):
+
+```text
+rea        job e1327fda…  network {"exit": "none",      "policy_effective": "none",      "downgraded": false}
+rea-agent  job 11dbdb9e…  network {"exit": "httpproxy", "policy_effective": "rea_model", "downgraded": false}
+```
+
+### Acceptance from inside a slot
+
+The script below ran in two places: inside the live, dispatcher-launched `rea-agent` slot
+(`docker exec -i blastbox-worker-11dbdb9e-cf7 sh -s`, during job 11dbdb9e), and again in a manual
+runsc container on bb-rea-model with the same env. Both gave the same results. Output from the
+live slot (rc = the command's own exit status):
+
+```text
+slot /blastbox-worker-11dbdb9e-cf7 runtime=runsc net=bb-rea-model
+### env (as the dispatcher injects it)
+BLASTBOX_NET_EGRESS=1
+HTTP_PROXY=http://10.231.200.2:8888   (and HTTPS_PROXY, http_proxy, https_proxy)
+
+### 1. model through the proxy (MUST answer)
+$ curl -sS -m 30 http://172.18.101.13:8888/v1/models
+http=200 bytes=464  [rc=0]
+models: ['deepseek-v4-flash']
+
+### 2. direct, no proxy (MUST fail)
+$ curl --noproxy '*' http://1.1.1.1/                 curl: (7) Failed to connect to 1.1.1.1 port 80 after 0 ms   [rc=7]
+$ curl --noproxy '*' https://1.1.1.1/                curl: (7) Failed to connect to 1.1.1.1 port 443 after 0 ms  [rc=7]
+$ curl --noproxy '*' http://172.18.101.15:8001/      curl: (7) Failed to connect to 172.18.101.15 port 8001       [rc=7]
+$ curl --noproxy '*' http://172.18.101.13:8888/v1/models   curl: (7) Failed to connect to 172.18.101.13 port 8888 [rc=7]
+$ curl --noproxy '*' http://192.168.128.1/  (proxy's egress gateway)   curl: (7) Failed to connect               [rc=7]
+$ getaddrinfo('example.com')                         socket.gaierror: [Errno -3] Temporary failure in name resolution [rc=1]
+$ UDP sendto 1.1.1.1:53                              OSError: [Errno 101] Network is unreachable             [rc=1]
+
+### 3. other destinations via the proxy (MUST fail)
+$ curl https://example.com/                          curl: (7) CONNECT tunnel failed, response 403  [rc=7]
+$ curl -p http://example.com:443/  (forced CONNECT)  curl: (7) CONNECT tunnel failed, response 403  [rc=7]
+$ curl http://example.com/                           http=403  [rc=0]
+$ curl http://1.1.1.1/                               http=403  [rc=0]
+$ curl http://172.18.101.15:8001/                    http=403  [rc=0]
+$ curl https://172.18.101.13:8888/v1/models (CONNECT to the model)   CONNECT tunnel failed, response 403 [rc=7]
+
+### 4. request-line / Host: tricks sent raw to the proxy
+CONNECT example.com:443                                        -> HTTP/1.1 403 Access violation
+CONNECT 172.18.101.13:8888 (the model itself, still CONNECT)   -> HTTP/1.1 403 Access violation
+absolute URI allowed IP, other port :22                        -> HTTP/1.1 403 Filtered
+absolute URI allowed IP, no port (:80)                         -> HTTP/1.1 403 Filtered
+absolute URI to example.com, Host: says model                  -> HTTP/1.1 403 Filtered
+origin-form GET with Host: model                               -> HTTP/1.1 200 OK        (= the model; allowed)
+origin-form GET with Host: model host, port 22                 -> HTTP/1.1 403 Filtered
+origin-form GET with Host: model:8888@1.1.1.1                  -> HTTP/1.1 404 Not Found (vLLM's 404 for "/": tinyproxy connected to 172.18.101.13:8888, see log)
+origin-form GET, two Host: headers (example.com first)         -> HTTP/1.1 403 Filtered
+origin-form GET with Host: example.com                         -> HTTP/1.1 403 Filtered
+userinfo trick http://172.18.101.13:8888@example.com/          -> HTTP/1.1 403 Filtered
+userinfo trick http://172.18.101.13:8888@172.18.101.15:8001/   -> HTTP/1.1 403 Filtered
+prefix trick http://172.18.101.13:88880/                       -> HTTP/1.1 403 Filtered
+suffix-host trick http://172.18.101.13.nip.io:8888/            -> HTTP/1.1 403 Filtered
+hex IP http://0xac12650d:8888/v1/models                        -> HTTP/1.1 403 Filtered
+uppercase scheme HTTP://172.18.101.13:22/                      -> HTTP/1.1 403 Filtered
+ftp:// scheme to model host                                    -> HTTP/1.1 403 Filtered
+control: allowed URL raw (MUST be 200)                         -> HTTP/1.1 200 OK
+```
+
+tinyproxy's log for the `@` Host case shows that it connected only to the model:
+
+```text
+Request (file descriptor 4): GET / HTTP/1.1
+opensock: opening connection to 172.18.101.13:8888
+Established connection to host "172.18.101.13" using file descriptor 5.
+```
+
+The proxy cannot be used from anywhere other than bb-rea-model:
+
+```text
+$ (container on rea-bb_model-egress) curl -x http://192.168.128.2:8888 http://172.18.101.13:8888/v1/models
+curl: (7) Failed to connect to 172.18.101.13 port 8888 via 192.168.128.2 after 0 ms   [rc=7]
+$ (container on docker's default bridge) curl -x http://10.231.200.2:8888 ...
+curl: (28) Connection timed out after 8002 milliseconds                               [rc=28]
+```
+
+**The leak guard label is advisory here.** The dispatcher labels the slot
+`blastbox.net.leakguard=strict`, but no netd watches rea-bb's jobs (toolz2's `bb-netd` serves the
+redtusk job root), and a runsc slot has no host-visible netns anyway. Non-TCP containment comes
+from the bridge: on an `--internal` bridge there is no route out, so a UDP send to 1.1.1.1 fails
+with `ENETUNREACH`, as shown above.
+
+## Corpus gate
+
+See `CORPUS.md`. Real sealed envelopes and artifacts for Loadout's mapper tests (benign PE sweep and
+its `rea-agent` pass) are in `corpus-envelopes/`.
+
+## Operating notes
+
+- `docker compose -p rea-bb -f compose.yml ps`; logs: `docker logs rea-bb-dispatcher-1`.
+- The receipt public key comes from `docker exec rea-bb-dispatcher-1 blastbox attest-key --key /keys/attest.key`.
+  The ingress itself holds no signing key: `/v1/attestation/key` answers "no attestation key is
+  configured for this process".
+- The model endpoint is shared. Pass times depend on its load (CORPUS.md).
+- Teardown: `docker compose -p rea-bb -f compose.yml down` (keeps volumes), then `docker network rm bb-rea-model`.
