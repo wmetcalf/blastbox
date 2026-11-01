@@ -186,3 +186,4 @@ Engine follow-ups:
 - A Ghidra-timeout sweep still packs a continuation, and its pass seals `skipped`.
 - REA's Ghidra lane rejects MIPS-I although the sweep reports `ok`.
 - Full report: Loadout `.superpowers/sdd/2026-10-30-rea-engine/mbz-live-report.md`.
+- Engine changes since this run (G1, not yet re-run live): 2048-token tool turns and a 4096-token final answer with a throughput-sized reserve, phase-derived request timeouts, one retry on `unavailable`, 12 KiB tool results with `analyze_function` at `detail=summary`, `chain_stop` (Ruling AL), and OID / Go-module-path IOCs dropped.

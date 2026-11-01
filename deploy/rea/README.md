@@ -106,6 +106,18 @@ Three things in the plan's Step 2 cannot work as written. Each was found live:
    `BLASTBOX_TIMEOUT=840` (dispatcher kill at 900), the 1 GiB / 2 GiB artifact caps, `REA_MODEL_URL`,
    `REA_MODEL_ID`, `REA_PASS_WALL_S=540`, `REA_GHIDRA_SWEEP_S=420` and `REA_MAX_STEPS=12`. Ghidra + REA
    work on the noexec 512 MiB tmpfs under runsc (benign PE sweep: 101 s with this exact flag set).
+   The agent's model budgets use the engine defaults (not baked): `REA_TURN_MAX_TOKENS=2048` per
+   tool-choice turn, `REA_MAX_COMPLETION_TOKENS=4096` for the final answer, and
+   `REA_MODEL_TOKENS_PER_S=30`, which sizes the final-answer reserve (1.25 x 4096 / 30 = about 171 s
+   of the 540 s wall). `REA_MODEL_TIMEOUT_S` is unset, so each request's timeout is the time left
+   in its phase; set it only as an upper cap. An `unavailable` request is retried once while the
+   phase has time. Tool results reach the model cut to 12 KiB (head + tail), and
+   `analyze_function` always runs at `detail=summary`. To change a knob, add it to the agent
+   image's `ENV` in `Dockerfile.stack-worker` (all `REA_*` keys are reserved).
+   The sweep's `rea.report/1` carries an optional `chain_stop` (`not_native`, `ghidra_failed`,
+   `ghidra_timeout`, `unsupported_arch`, `packed`; see `sweep.py`). When it is set the sweep seals
+   `more_pending=false` with no continuation (Ruling AL). `packed` needs the `function_count` line
+   that `ghidra_scripts/ListStrings.java` now writes first, so rebuild the base image too.
    **Limit:** 512 MiB of scratch is the ceiling for a Ghidra project plus REA's private copy, so a
    very large sample can fail in the slot even though `BLASTBOX_MAX_INPUT` is 1 GiB.
 
