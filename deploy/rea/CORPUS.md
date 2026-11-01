@@ -30,9 +30,7 @@ truncated_pe    20000     cf896f3da67ed543  first 20000 bytes of benign_pe.exe
 Nothing turned up outside the other stacks' job data, which I did not touch. toolz3 was not
 touched. So no real malware PE was run.
 
-**Open item: the malware-PE row is missing**, waiting for a sample from Will (a read-only PE from a
-corpus he points to). Run it with the same two steps (`rea`, then one `rea-agent` pass) and add
-its row to both tables.
+**Closed 2026-11-01:** see "MalwareBazaar live run" below.
 
 ## Results
 
@@ -48,7 +46,7 @@ benign.apk       30.1s  apk      skipped  false         0                       
 benign.zip       21.1s  archive  skipped  false         0                          0      2        -
 protected.zip    21.1s  archive  skipped  false         0                          0      0        -   (no warning; see notes)
 truncated_pe     90.3s  pe       ok       true          0                          0      0        inspect_failed x6
-malware PE      OPEN    awaiting a sample from Will
+malware PE      see "MalwareBazaar live run" below (7 samples, 2026-11-01)
 ```
 
 These rows were recorded at 5a67f6b and have not been re-run since. The IOC columns for benign_pe.exe,
@@ -155,3 +153,36 @@ benign-pe-agent/receipt-verified.json
 
 The agent's input is the sweep's `continuation.tar.gz`, byte-identical (sha256 c3cb08e6...). The
 sample itself is `fixtures/sample.exe`.
+
+## MalwareBazaar live run (2026-11-01)
+
+Seven real samples from Will's MalwareBazaar store went through Loadout (feat/rea-engine 736cd5a,
+`engine: rea` with a room, `LOADOUT_REA_MAX_PASSES=2`) to this stack after it was rebuilt from
+feat/rea-engine f0b5f1e (`blastbox-rea-sweep:4255232` / `blastbox-rea-agent:4255232`). Only hashes and
+outcomes are recorded here: no bytes and no envelopes.
+
+```text
+sha256 (16)       bytes    type                    sweep    ghidra   procs  icons  iocs real/FP     passes (model_status)   room
+6a15e2734d22e9b1  217600   PE32 exe, RT_ICON       ~147s    ok       377    1      0              budget, unavailable     stopped: model unavailable
+6f434a3e0159ab48  362960   PE32 DLL, signed        ~101s    ok       360    0      0/5 (X.509 OIDs)  budget, unavailable  stopped: model unavailable
+595841b787c19459  184320   PE32 .NET               ~69s     ok       36     1      2/0 (utf16le URL) budget, unavailable  stopped: model unavailable
+c7a78d6ceddf6e5b  153600   PE32 UPX                ~84s     ok       6      1      0              budget, unavailable     stopped: model unavailable
+086d630b8c97e131  843864   ELF64 x86-64 Go/packed  ~96s     ok       5      0      0              budget, budget          stopped: pass limit
+dc264627ab136644  46856    ELF32 MIPS-I            ~83s     ok       n/a    0      1/0            budget, ok              complete (2 passes)
+efb1e519d5a9d527  6966272  PE32+ Go 1.19.1         ~474s    timeout  n/a    0      0/1 (github.com)  skipped              stopped: model skipped
+```
+
+Sweep time is dispatcher launch to seal. procs is `list_procedures.total` from the first pass. All
+sweeps ran with network none; all passes ran with rea_model/httpproxy. The proxy logged 57
+connections, all to the model, and 0 denials. There were no crashes, requeues or cap hits.
+Agent output: 0 findings and 0 verified IOCs over 13 passes. Causes:
+- The model endpoint serves about one sequence at a time at about 30 tok/s, against 2 agent slots.
+- `REA_MODEL_TIMEOUT_S` is 240 s, below what a full `max_tokens=8192` answer needs on this endpoint.
+  Each pass 2 that died at its first turn sealed `unavailable`.
+- `detail=complete` tool results of up to 297 KB slowed the turns.
+
+Engine follow-ups:
+- `inspect-pe-certificates` and `inspect-go-binary` output is IOC-scanned (OIDs and module paths).
+- A Ghidra-timeout sweep still packs a continuation, and its pass seals `skipped`.
+- REA's Ghidra lane rejects MIPS-I although the sweep reports `ok`.
+- Full report: Loadout `.superpowers/sdd/2026-10-30-rea-engine/mbz-live-report.md`.
