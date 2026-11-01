@@ -4,7 +4,7 @@
 # only in the worker image (deploy/docker/Dockerfile.rea-cold-worker).
 #
 # Built from the LOCAL source tree so the host carries the httpproxy `bridge=` key
-# (feat/netpolicy-httpproxy-bridge) that the rea-model personality needs. On toolz2 the tree is
+# (feat/netpolicy-httpproxy-bridge) that the rea_model personality needs. On toolz2 the tree is
 # the local merge branch deploy/rea-toolz2 (feat/rea-engine + the bridge branch); see README.md.
 #
 # Build context = blastbox repo root:

@@ -159,7 +159,7 @@ rea-agent  job 11dbdb9e…  network {"exit": "httpproxy", "policy_effective": "r
 
 ### Acceptance from inside a slot
 
-The script below ran in two places: inside the live, dispatcher-launched `rea-agent` slot
+`egress_check.sh` (in this directory) ran in two places: inside the live, dispatcher-launched `rea-agent` slot
 (`docker exec -i blastbox-worker-11dbdb9e-cf7 sh -s`, during job 11dbdb9e), and again in a manual
 runsc container on bb-rea-model with the same env. Both gave the same results. Output from the
 live slot (rc = the command's own exit status):
