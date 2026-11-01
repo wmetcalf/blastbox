@@ -24,9 +24,19 @@ networks          rea-bb_backend (internal), rea-bb_frontend, rea-bb_model-egres
                   bb-rea-model (operator-created, --internal, 10.231.200.0/24)
 ```
 
-Loadout: `LOADOUT_REA_URL=LOADOUT_REA_AGENT_URL=https://172.18.101.15:8006`, `LOADOUT_REA_API_KEY` and
-`LOADOUT_REA_AGENT_API_KEY` = the bearer key, and `LOADOUT_REA_CA_FILE` / `LOADOUT_REA_AGENT_CA_FILE` = a
-copy of `ca.crt`. This is the williamtells-bb scheme.
+Loadout: `LOADOUT_REA_URL=LOADOUT_REA_AGENT_URL=https://172.18.101.15:8006`, and `LOADOUT_REA_API_KEY` and
+`LOADOUT_REA_AGENT_API_KEY` = the bearer key. Loadout has no per-engine CA setting: its adapter uses
+Python's default TLS verification. Trust the private CA by pointing Loadout's process at a merged
+bundle, the system bundle plus `ca.crt`:
+
+```sh
+cat /etc/ssl/certs/ca-certificates.crt ~/rea-bb/ca.crt > ~/.config/loadout/ca-bundle.pem
+SSL_CERT_FILE=$HOME/.config/loadout/ca-bundle.pem   # in Loadout's environment, not this stack's
+```
+
+Keep the system bundle in it: `SSL_CERT_FILE` replaces the default trust store for the whole process,
+so a bundle holding only `ca.crt` would break every other HTTPS call Loadout makes. Rebuild it when
+either the system bundle or `ca.crt` changes.
 
 ## Build
 

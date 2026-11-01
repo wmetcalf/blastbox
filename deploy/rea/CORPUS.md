@@ -51,6 +51,10 @@ truncated_pe     90.3s  pe       ok       true          0                       
 malware PE      OPEN    awaiting a sample from Will
 ```
 
+These rows were recorded at 5a67f6b and have not been re-run since. The IOC columns for benign_pe.exe,
+benign_go.elf and benign_dotnet are false positives that the extractor now drops (see "Sweep IOC
+quality" below). The apk and zip sweeps no longer seal a continuation.
+
 `rea-agent`, one pass per sample on its continuation (personality rea_model, DeepSeek
 `deepseek-v4-flash` at 172.18.101.13:8888 through rea-model-proxy). IOCs are shown as verified/total.
 Run 1 used two drivers in parallel (dispatcher concurrency 2). Run 2 re-ran the native samples one
@@ -80,7 +84,8 @@ the hello.go build info, and verified 2 IOCs against the sample bytes. The dotne
 "IL-only managed PE ... LoadoutFixture.dll ... .NETCoreApp v8.0", which is correct.
 
 **Sizes.** The continuation is 338 KB for the PE, 41 KB for the ELF, 45 KB for .NET, 65 KB for the
-truncated PE, **21.2 MB for Go**, and 5-29 KB for the APK and ZIPs. Transcripts run 52-295 KB.
+truncated PE, **21.2 MB for Go**, and 5-29 KB for the APK and ZIPs. The APK and ZIP continuations are
+no longer packed (see below). Transcripts run 52-295 KB.
 
 ## Model endpoint (honest)
 
@@ -97,7 +102,10 @@ results above reflect endpoint load, not a fault in the engine.
 
 - **Agent on non-native continuations.** apk, zip and protected.zip sweep `more_pending=false`, so
   Loadout never chains them. Run by hand anyway, the agent spends its full 540 s wall and seals
-  `budget` with `more_pending=true`. The model also called tools that do not exist in that session
+  `budget` with `more_pending=true`. Since then the sweep packs a continuation only for native code
+  whose Ghidra run did not fail, so these inputs no longer produce one to run by hand. The agent
+  also packs none on a pass that ends the chain (`done`, no todo left, `unavailable`, `malformed`,
+  `skipped`). An absent continuation is already valid for Loadout whenever `more_pending=false`. The model also called tools that do not exist in that session
   (`inspect_artifact`, `inspect_apk_signature`, `extract_artifact`, `open_binary`; refused as
   "not available").
 - **Refusals** were mostly the model passing `detail` to `inspect_*` tools whose schema lacks it,
@@ -112,6 +120,22 @@ results above reflect endpoint load, not a fault in the engine.
   - .NET's const URL (UTF-16 in the metadata blob) was not extracted, while assembly versions
     `1.0.0.0`/`8.0.0.0` became ipv4 IOCs. The PE's `1.0.0.0` is the same false positive.
   - As noted in Task 6, member contents are not IOC-scanned: the ZIP readme's URL and IP are missing.
+  - **Fixed in the extractor after this gate** (unit-tested only; these runs were not repeated, so no
+    live numbers are claimed):
+    - A dotted quad is no longer an ipv4 IOC when it is version-shaped. That covers `N.N.0.0` with a
+      one- or two-digit major (`1.0.0.0`, `8.0.0.0`), `Version=`/`v` right before it,
+      `, Culture=`/`, PublicKeyToken=` right after it, or a string that follows a version-resource
+      key (`FileVersion`, `ProductVersion`, `AssemblyVersion`, ...).
+    - A bare domain is dropped when it is a code symbol: the first label is a Go runtime or stdlib
+      package (`runtime`, `godebugs`, `internal`, `sync`, ...; names that are also real hosts such
+      as `mail`, `time`, `net` and `go` are left out), it follows a single `/` (a package path),
+      or it has the `pkg.Member` shape (a lowercase label, then a capitalised one). The TLD
+      allowlist is unchanged. Domains taken from URLs and email addresses are never filtered.
+    - For native code, the sweep also scans the sample bytes (first 256 MiB) for UTF-16LE
+      `http(s)://` and `ftp://` strings, source `utf16le:0x<offset>`. That should recover the .NET
+      fixture's `Endpoint` URL. The UTF-16 mutex in the `#US` heap is still not extracted, because
+      only URLs are scanned. The Go fixture's URL (a non-NUL-terminated narrow string) is still
+      missed.
 - **truncated_pe run 2 job failure.** This is a dispatcher/host-side requeue race ("worker container
   disappeared" while the runsc slot was still running → relaunch → name conflict), not a REA fault.
   It happened once in 16 jobs and was not reproduced.
