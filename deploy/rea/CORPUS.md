@@ -187,3 +187,17 @@ Engine follow-ups:
 - REA's Ghidra lane rejects MIPS-I although the sweep reports `ok`.
 - Full report: Loadout `.superpowers/sdd/2026-10-30-rea-engine/mbz-live-report.md`.
 - Engine changes since this run (G1, not yet re-run live): 2048-token tool turns and a 4096-token final answer with a throughput-sized reserve, phase-derived request timeouts, one retry on `unavailable`, 12 KiB tool results with `analyze_function` at `detail=summary`, `chain_stop` (Ruling AL), and OID / Go-module-path IOCs dropped.
+
+### G1 rerun (2026-11-01, a03b1ca images `blastbox-rea-*:849fe70`, REA_CONCURRENCY=1, Loadout d430e7f)
+
+```text
+sha256 (16)       type           chain_stop  sweep IOCs real/FP   passes (model_status: findings, verified IOCs)   room
+595841b787c19459  PE32 .NET      -           2/0 (utf16le URL)    ok: 35 functions, 2 verified                    complete (1 passes)
+c7a78d6ceddf6e5b  PE32 UPX       packed      0                    none                                            sweep only: packed sample
+6f434a3e0159ab48  PE32 DLL       -           0 (OIDs filtered)    budget: 0, budget: 0                            stopped: pass limit
+6a15e2734d22e9b1  PE32 exe       -           0                    budget: 0 (final malformed), budget: 0          stopped: pass limit
+```
+
+The .NET summary matches the sweep: a SmartAssembly-obfuscated WinForms loader posing as Avast, with
+a hard-coded .jpg payload URL. The PE passes now explore quickly but lose the final answer, either as
+malformed JSON or as deadline_exceeded in the reserve.
