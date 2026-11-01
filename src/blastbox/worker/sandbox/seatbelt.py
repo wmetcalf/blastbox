@@ -100,6 +100,7 @@ def build_profile(
     rw_paths: list[str],
     accelerators: frozenset[str],
     scratch: str | None = None,
+    canary: str | None = None,
 ) -> tuple[str, dict[str, str]]:
     """Return ``(profile_text, params)`` for one run.
 
@@ -181,6 +182,12 @@ def build_profile(
             '(allow file-issue-extension (require-all '
             '(extension-class "com.apple.app-sandbox.read") (subpath (param "SCRATCH_EXT"))))'
         )
+    if canary:
+        # The run's identity for the sweep and the watchdog (mc.run_canary, mc.writer_matcher):
+        # a Mach name no other run's profile grants and nothing registers. The grant gives the
+        # child nothing; it only lets sandbox_check pick out this run's processes.
+        params["CANARY"] = canary
+        lines.append('(allow mach-lookup (global-name (param "CANARY")))')
     lines.append("(deny network*)")
     return "\n".join(lines) + "\n", params
 
@@ -354,12 +361,13 @@ class SeatbeltSandbox:
         leftovers = mc.Leftovers()
         state: dict[str, Path] = {}
         sweep_after = time.time() - 1.0
+        canary = mc.run_canary()
 
         def _emergency() -> None:
             scratch_ = state.get("scratch")
             try:
                 if scratch_ is not None:
-                    mc.sweep_writers(scratch_, started_after=sweep_after)
+                    mc.sweep_writers(scratch_, started_after=sweep_after, canary=canary)
             finally:
                 try:
                     leftovers.remove_all()
@@ -412,14 +420,14 @@ class SeatbeltSandbox:
                 finally:
                     os.close(base_fd)
                 return self._run_in_scratch(request, exe, exe_real, ro, rw, scratch, leftovers,
-                                            ledger)
+                                            ledger, canary)
             finally:
                 unregister_emergency_cleanup(token)
 
     def _run_in_scratch(self, request: SandboxRequest, exe: Path, exe_real: Path,
                         ro: list[str], rw: list[str], scratch: Path,
                         leftovers: mc.Leftovers,
-                        ledger: ConfinementLedger | None) -> SandboxResult:
+                        ledger: ConfinementLedger | None, canary: str) -> SandboxResult:
         # What the run's scratch IS: a sweep that finds it removed or replaced puts an empty
         # directory back at the path (to find the run's processes), which must never be taken
         # for the run's own scratch -- not captured, not read for the handshake.
@@ -433,6 +441,7 @@ class SeatbeltSandbox:
                 rw_paths=[*rw, str(scratch)],
                 accelerators=request.accelerators,
                 scratch=str(scratch),
+                canary=canary,
             )
             argv = [self._sandbox_exec, "-p", profile]
             for key, val in params.items():
@@ -447,8 +456,8 @@ class SeatbeltSandbox:
                 argv, env=env, limits=request.limits, cwd=scratch,
                 popen=self._popen, rss_fn=self._rss_fn,
                 watch_dirs=[scratch, *(Path(p) for p in rw)],
-                sweep=lambda: mc.sweep_writers(scratch, started_after=launched),
-                member_fn=mc.writer_matcher(scratch, started_after=launched),
+                sweep=lambda: mc.sweep_writers(scratch, started_after=launched, canary=canary),
+                member_fn=mc.writer_matcher(scratch, started_after=launched, canary=canary),
             )
             # The handshake proves a process ran under the profile (not a failure before launch,
             # nor a profile sandbox-exec rejected). Read -- and removed, so it is never captured

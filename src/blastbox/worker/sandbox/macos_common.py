@@ -40,6 +40,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from pathlib import Path
 
@@ -1562,6 +1563,7 @@ def _run_pinned(
 
 _PROC_UID_ONLY = 4
 _SANDBOX_FILTER_PATH = 1
+_SANDBOX_FILTER_GLOBAL_NAME = 2
 _SANDBOX_CHECK_NO_REPORT = 0x40000000
 
 
@@ -1827,6 +1829,23 @@ def sandbox_may_write(pid: int, path: Path) -> bool:
                                     os.fsencode(path)) == 0
 
 
+def sandbox_may_lookup(pid: int, name: str) -> bool:
+    """True if ``pid``'s sandbox allows looking up the Mach service ``name``."""
+    if _LIBSYSTEM is None:
+        return False
+    return _LIBSYSTEM.sandbox_check(pid, b"mach-lookup",
+                                    _SANDBOX_FILTER_GLOBAL_NAME | _SANDBOX_CHECK_NO_REPORT,
+                                    name.encode()) == 0
+
+
+def sandbox_may_use_network(pid: int) -> bool:
+    """True if ``pid``'s sandbox allows outbound network use (any destination)."""
+    if _LIBSYSTEM is None:
+        return True
+    return _LIBSYSTEM.sandbox_check(pid, b"network-outbound", _SANDBOX_CHECK_NO_REPORT,
+                                    None) == 0
+
+
 def container_of(pid: int) -> str | None:
     """``pid``'s App Sandbox container (``.../Containers/<id>/Data``), or None."""
     if _LIBSYSTEM is None:
@@ -1839,10 +1858,17 @@ def container_of(pid: int) -> str | None:
 
 # Consecutive conclusive empty rounds before a sweep calls the run gone (see sweep_sandboxed).
 SWEEP_QUIET_ROUNDS = 3
+# How long a sweep waits out a process it can do nothing more about (see sweep_sandboxed): one
+# already SIGKILLed that hasn't died yet, or one mid-exit that the kernel no longer describes.
+# Either is normal for a moment -- seconds under load, while a process tears down GPU / Neural
+# Engine state -- and a failure if it lasts.
+SWEEP_SETTLE_S = 30.0
 
 
 def sweep_sandboxed(match: Callable[[int], bool], *, what: str, rounds: int = 400,
-                    before_round: Callable[[], object] | None = None) -> int:
+                    before_round: Callable[[], object] | None = None,
+                    settle_s: float = SWEEP_SETTLE_S,
+                    clock: Callable[[], float] = time.monotonic) -> int:
     """SIGKILL every SANDBOXED process of our uid that ``match``es, until none is left.
 
     Loops because a match may fork while being killed (bounded by the launcher's NPROC cap).
@@ -1850,20 +1876,38 @@ def sweep_sandboxed(match: Callable[[int], bool], *, what: str, rounds: int = 40
     AND in which every listed process was still there to be ruled out: a process that vanished
     mid-round may have handed off to a child the listing missed. Returns how many were killed;
     raises ``SandboxError`` if they keep coming (or the rounds never come out clean) -- a run
-    whose processes can't be shown gone must not be reported, nor its slot reused."""
+    whose processes can't be shown gone must not be reported, nor its slot reused.
+
+    Two states are waited out for up to ``settle_s`` each, in rounds that don't count against
+    ``rounds`` (which bounds processes that keep COMING): a process this sweep already killed
+    that is still alive, and a live sandboxed process whose identity can't be read -- a process
+    mid-exit, which the kernel stops describing before ``ps`` flags it as exiting. Either one
+    still there after ``settle_s`` fails the sweep. Waiting is free only for a process already
+    being waited out: a round that kills a new match or meets a new unreadable process counts,
+    so churn (other runs' processes exiting, one after another) can't hold the sweep open
+    beyond ``rounds``."""
     me = os.getpid()
     # (pid, start time): the identity each kill was aimed at. A pid alone could by now name
     # another job's process.
     killed: set[tuple[int, float]] = set()
+    # When each process the sweep is waiting out was first seen in that state.
+    unreadable_since: dict[int, float] = {}
+    dying_since: dict[tuple[int, float], float] = {}
     quiet = 0
-    for _ in range(rounds):
+    budget = rounds
+    while True:
         if before_round is not None:
             before_round()
+        now = clock()
         live: list[tuple[int, float]] = []
         # A listed process that is gone before it could be ruled out may have been the run's: an
         # escapee that forks a successor and exits leaves the successor out of this listing and
         # itself out of the matching. Such a round proves nothing.
         inconclusive = False
+        # The round's only obstacles are processes being waited out (see the docstring).
+        waiting = False
+        # A process met in the unreadable state for the first time: counts like a new match.
+        fresh_unreadable = False
         for p in uid_pids():
             if p == me:
                 continue
@@ -1878,35 +1922,49 @@ def sweep_sandboxed(match: Callable[[int], bool], *, what: str, rounds: int = 40
                     continue
                 if proc_start_time(p) is None and is_sandboxed(p):
                     # A live sandboxed process whose identity can't be read can't be ruled out
-                    # (the matchers need it) nor killed safely: fail the sweep rather than
-                    # report the run clean.
-                    raise SandboxError(f"cannot identify process {p} left by {what}")
+                    # (the matchers need it) nor killed safely. Mid-exit, that lasts a moment:
+                    # look again. If it lasts, fail the sweep rather than report the run clean.
+                    if p not in unreadable_since:
+                        unreadable_since[p] = now
+                        fresh_unreadable = True
+                    elif now - unreadable_since[p] > settle_s:
+                        raise SandboxError(f"cannot identify process {p} left by {what}")
+                    waiting = True
+                    continue
                 inconclusive = True         # readable again (or unsandboxed): look again
                 continue
             if not (is_sandboxed(p) and match(p)):
                 if proc_start_time(p) != started:
                     inconclusive = True     # exited (or was replaced) while being matched
                 continue
-            if (p, started) in killed and not _alive(p):
-                continue                    # already killed, a zombie awaiting its reaper
+            if (p, started) in killed:
+                if not _alive(p):
+                    continue                # already killed, a zombie awaiting its reaper
+                if now - dying_since.setdefault((p, started), now) > settle_s:
+                    raise SandboxError(f"could not kill the processes left by {what}: process {p} "
+                                       f"is still alive {settle_s:.0f}s after SIGKILL")
             live.append((p, started))
+        new = [t for t in live if t not in killed]
         if not live:
-            quiet = 0 if inconclusive else quiet + 1
+            quiet = 0 if (inconclusive or waiting) else quiet + 1
             if quiet >= SWEEP_QUIET_ROUNDS:
                 if killed:
                     _log.warning("macos sandbox: swept %d process(es) that escaped %s",
                                  len(killed), what)
                 return len(killed)
-            threading.Event().wait(0.005)
-            continue
-        quiet = 0
-        for p, started in live:
-            # Revalidated right before signalling: a target that exited after matching (its
-            # pid possibly reused by an unrelated process) is skipped, not killed.
-            if kill_if_same(p, started):
-                killed.add((p, started))
-        threading.Event().wait(0.005)
-    raise SandboxError(f"could not kill the processes left by {what}")
+        else:
+            quiet = 0
+            for p, started in live:
+                # Revalidated right before signalling: a target that exited after matching (its
+                # pid possibly reused by an unrelated process) is skipped, not killed.
+                if kill_if_same(p, started):
+                    killed.add((p, started))
+        if new or fresh_unreadable or inconclusive or not waiting and not live:
+            budget -= 1
+            if budget <= 0:
+                raise SandboxError(f"could not kill the processes left by {what}")
+        # Waiting out a dying or exiting process: no need to list every process 200 times a second.
+        threading.Event().wait(0.05 if waiting or (live and not new) else 0.005)
 
 
 def _proc_state(pid: int) -> str:
@@ -1935,15 +1993,33 @@ def _alive(pid: int) -> bool:
     return _proc_state(pid) == "alive"
 
 
-def writer_matcher(path: Path, *, started_after: float) -> Callable[[int], bool]:
+def run_canary() -> str:
+    """A Mach service name for ONE seatbelt run's profile to grant (``mach-lookup``) and no
+    other run's to; see :func:`writer_matcher` for how it identifies the run's processes.
+    Nothing registers it, so the grant gives the child nothing."""
+    return f"io.blastbox.run.{secrets.token_hex(16)}"
+
+
+def writer_matcher(path: Path, *, started_after: float,
+                   canary: str | None = None) -> Callable[[int], bool]:
     """Matches a (sandboxed) process that started at/after ``started_after`` and may write
-    ``path`` -- a seatbelt run's scratch dir, which only that run's profile grants. The start
-    time keeps out a long-running same-uid agent whose own profile happens to allow the
-    user's temp dir."""
+    ``path`` -- a seatbelt run's scratch dir. The start time keeps out a long-running same-uid
+    agent whose own profile happens to allow the user's temp dir.
+
+    With the run's ``canary`` (:func:`run_canary`) it also requires what only that run's
+    profile gives: the canary may be looked up, and the network may not be used (every
+    seatbelt profile ends ``(deny network*)``). Writing the scratch alone doesn't identify a
+    run: many of the user's sandboxed system agents (secd, contactsd, containermanagerd,
+    VideoToolbox services, ...) may write anywhere in the temp dir, so one that started during
+    a run matched it and the sweep SIGKILLed it as an escapee. A few agents' sandboxes allow
+    nearly everything, the canary lookup included -- but not one of those denies the network,
+    and a process can't loosen its sandbox to pass for a run's."""
     def match(p: int) -> bool:
         t = proc_start_time(p)
         return (t is not None and t >= started_after and os.path.isdir(path)
-                and sandbox_may_write(p, path))
+                and sandbox_may_write(p, path)
+                and (canary is None
+                     or (sandbox_may_lookup(p, canary) and not sandbox_may_use_network(p))))
     return match
 
 
@@ -1993,14 +2069,14 @@ def restore_identity_dir(path: Path) -> None:
         raise SandboxError(f"cannot restore {path} to sweep its run: {exc}") from exc
 
 
-def sweep_writers(path: Path, *, started_after: float) -> int:
+def sweep_writers(path: Path, *, started_after: float, canary: str | None = None) -> int:
     """Kill every sandboxed process :func:`writer_matcher` matches.
 
     A missing or replaced ``path`` is NOT an empty run: a detached child can remove its scratch
     dir (or swap in a symlink) to stop matching. The directory is put back before every round,
     so the path the profile grants is a real directory again and its writers match; if it
     can't be, the sweep fails (``SandboxError``) rather than reporting nothing to kill."""
-    return sweep_sandboxed(writer_matcher(path, started_after=started_after),
+    return sweep_sandboxed(writer_matcher(path, started_after=started_after, canary=canary),
                            what=f"the run in {path}",
                            before_round=lambda: restore_identity_dir(path))
 
