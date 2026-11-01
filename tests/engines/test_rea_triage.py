@@ -9,7 +9,7 @@ from blastbox.engines.rea import triage
 FIXTURES = Path(__file__).resolve().parents[2] / "deploy" / "rea" / "fixtures"
 
 
-def make_pe(path: Path, sections: list[tuple[bytes, int, bytes]]) -> Path:
+def make_pe(path: Path, sections: list[tuple[bytes, int, bytes]], *, clr: bool = False) -> Path:
     """A minimal PE32: (name, characteristics, raw data) per section."""
     n = len(sections)
     pe_off = 0x40
@@ -18,7 +18,12 @@ def make_pe(path: Path, sections: list[tuple[bytes, int, bytes]]) -> Path:
     raw = (hdr_end + 0x1FF) & ~0x1FF
     out = bytearray(b"MZ" + b"\x00" * 58 + struct.pack("<I", pe_off))
     out += b"PE\x00\x00" + struct.pack("<HHIIIHH", 0x14C, n, 0, 0, 0, opt_size, 0x102)
-    out += struct.pack("<H", 0x10B) + b"\x00" * (opt_size - 2)
+    opt = bytearray(opt_size)
+    struct.pack_into("<H", opt, 0, 0x10B)
+    struct.pack_into("<I", opt, 92, 16)  # NumberOfRvaAndSizes
+    if clr:
+        struct.pack_into("<II", opt, 96 + 14 * 8, 0x2008, 0x48)  # COM descriptor directory
+    out += bytes(opt)
     datas = b""
     for name, chars, data in sections:
         out += name.ljust(8, b"\x00") + struct.pack("<IIIIIIHHI", len(data), 0x1000, len(data),
@@ -29,16 +34,18 @@ def make_pe(path: Path, sections: list[tuple[bytes, int, bytes]]) -> Path:
     return path
 
 
-def make_elf32(path: Path, *, machine: int, flags: int, segments: list[tuple[int, bytes]] = ()) -> Path:
-    """A minimal little-endian ELF32 with (p_flags, data) PT_LOAD segments."""
+def make_elf32(path: Path, *, machine: int, flags: int, segments: list[tuple[int, bytes]] = (),
+               big: bool = False) -> Path:
+    """A minimal ELF32 (little-endian unless ``big``) with (p_flags, data) PT_LOAD segments."""
     phoff, phnum = 52, len(segments)
     data_off = phoff + 32 * phnum
-    out = bytearray(b"\x7fELF\x01\x01\x01" + b"\x00" * 9)
-    out += struct.pack("<HHIIIIIHHHHHH", 2, machine, 1, 0x400000, phoff if phnum else 0, 0, flags, 52,
+    e = ">" if big else "<"
+    out = bytearray(b"\x7fELF\x01" + (b"\x02" if big else b"\x01") + b"\x01" + b"\x00" * 9)
+    out += struct.pack(e + "HHIIIIIHHHHHH", 2, machine, 1, 0x400000, phoff if phnum else 0, 0, flags, 52,
                        32, phnum, 40, 0, 0)
     blobs = b""
     for pflags, data in segments:
-        out += struct.pack("<IIIIIIII", 1, data_off + len(blobs), 0x400000, 0x400000, len(data), len(data),
+        out += struct.pack(e + "IIIIIIII", 1, data_off + len(blobs), 0x400000, 0x400000, len(data), len(data),
                            pflags, 0x1000)
         blobs += data
     path.write_bytes(bytes(out) + blobs)
@@ -96,12 +103,30 @@ def test_truncated_and_garbage_headers_are_not_packed(tmp_path):
         assert triage.unsupported_arch(p) is False
 
 
-def test_pre_r2_mips32_is_unsupported(tmp_path):
-    for arch in (0x0, 0x1, 0x5):  # MIPS-I, MIPS-II, MIPS32 (release 1)
+def test_mips_i_to_v_is_unsupported(tmp_path):
+    for arch in (0x0, 0x1, 0x4):  # MIPS-I, MIPS-II, MIPS-V
         p = make_elf32(tmp_path / f"m{arch}.elf", machine=8, flags=(arch << 28) | 0x1007)
         assert triage.unsupported_arch(p) is True
-    for arch in (0x7, 0x9):  # MIPS32R2, MIPS32R6
+    # MIPS32 r1 (the common Mirai 0x50001007) and arch 6 stay analysable until verified live
+    for arch in (0x5, 0x6, 0x7, 0x9):  # MIPS32, MIPS64, MIPS32R2, MIPS32R6
         p = make_elf32(tmp_path / f"r{arch}.elf", machine=8, flags=arch << 28)
         assert triage.unsupported_arch(p) is False
     assert triage.unsupported_arch(FIXTURES / "sample.elf") is False
     assert triage.unsupported_arch(FIXTURES / "sample.exe") is False
+
+
+def test_big_endian_mips(tmp_path):
+    p = make_elf32(tmp_path / "be0.elf", machine=8, flags=0x1007, big=True)
+    assert triage.unsupported_arch(p) is True
+    p = make_elf32(tmp_path / "be5.elf", machine=8, flags=0x50001007, big=True)
+    assert triage.unsupported_arch(p) is False
+
+
+def test_dotnet_is_exempt_from_the_entropy_rule_but_not_upx(tmp_path):
+    p = make_pe(tmp_path / "net.exe", [(b".text", X, os.urandom(64 * 1024))], clr=True)
+    assert triage.packed(p, function_count=3) is False
+    assert triage.packed(p, function_count=3, dotnet=True) is False
+    plain = make_pe(tmp_path / "plain.exe", [(b".text", X, os.urandom(64 * 1024))])
+    assert triage.packed(plain, function_count=3, dotnet=True) is False
+    upx = make_pe(tmp_path / "upxnet.exe", [(b"UPX0", X, b""), (b"UPX1", X, CODE)], clr=True)
+    assert triage.packed(upx, function_count=3) is True

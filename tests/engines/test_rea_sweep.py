@@ -502,3 +502,19 @@ def test_chain_stop_unsupported_arch_mips1(tmp_path):
     f = _fields(res)
     assert f["kind"] == "elf" and f["ghidra_status"] == "ok"
     _not_pending(res, out, "unsupported_arch")
+
+
+def test_chain_stop_priority_with_combined_conditions(tmp_path):
+    mips = make_elf32(tmp_path / "m.elf", machine=8, flags=0x1007, segments=[(5, b"\x00" * 16 + b"UPX!" + b"\x00" * 4096)])
+    res, out, _g = _run(mips, tmp_path, ghidra=FakeGhidra(status="timeout"))
+    _not_pending(res, out, "ghidra_timeout")
+    res, out, _g = _run(mips, tmp_path)  # UPX! magic + MIPS-I: the arch wins
+    _not_pending(res, out, "unsupported_arch")
+    res, out, _g = _run(mips, tmp_path, ghidra=FakeGhidra(status="failed"))
+    _not_pending(res, out, "ghidra_failed")
+
+
+def test_unknown_ghidra_status_is_failed_not_timeout(tmp_path):
+    res, out, _g = _run(FIXTURES / "sample.exe", tmp_path, ghidra=FakeGhidra(status="weird"))
+    _not_pending(res, out, "ghidra_failed")
+    assert sw.ReaSweepEngine._chain_stop(FIXTURES / "sample.exe", "pe", "skipped", None) == "ghidra_failed"

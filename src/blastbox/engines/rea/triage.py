@@ -8,9 +8,11 @@ a chain that could have produced findings.
   in the first 4 KiB of an ELF, or *both* very few Ghidra procedures (``<= FEW_PROCEDURES``) and
   an executable section/segment of at least ``MIN_ENTROPY_BYTES`` with Shannon entropy
   ``>= HIGH_ENTROPY`` bits/byte. Without a procedure count the entropy rule never fires.
-- :func:`unsupported_arch` -- 32-bit MIPS ELF below release 2 (``EF_MIPS_ARCH`` MIPS-I..MIPS32,
-  i.e. 0..6). REA's Ghidra provider lane refused such a MIPS-I target live with
-  ``capability_unavailable`` ("needs 32R2"); R2 and R6 are left alone.
+- :func:`unsupported_arch` -- 32-bit MIPS ELF at ``EF_MIPS_ARCH`` MIPS I-V (0..4), either byte
+  order. REA's Ghidra provider lane refused a MIPS-I target live with ``capability_unavailable``
+  ("needs 32R2"); MIPS32 r1 (5), MIPS64 (6), R2 and R6 are left alone until verified live.
+- .NET assemblies (``dotnet=True`` or a CLR header) are exempt from the entropy rule: their
+  ``.text`` carries compressed resources and Ghidra sees few native procedures.
 """
 
 from __future__ import annotations
@@ -33,7 +35,9 @@ _SCN_MEM_EXECUTE = 0x20000000
 _PF_X = 1
 _EM_MIPS = 8
 _EF_MIPS_ARCH_SHIFT = 28
-_MIPS_PRE_R2 = frozenset(range(0, 7))
+# MIPS I-V only. MIPS32 r1 (5) and MIPS64 (6) stay analysable until a live run confirms the
+# lane rejects them; only a MIPS-I sample was observed.
+_MIPS_UNSUPPORTED = frozenset(range(0, 5))
 
 
 def _read(path: Path, offset: int, size: int) -> bytes:
@@ -137,13 +141,33 @@ def _high_entropy(path: Path, regions: list[tuple[int, int]]) -> bool:
     return False
 
 
-def packed(path: Path, *, function_count: int | None) -> bool:
+def _has_clr_header(head: bytes) -> bool:
+    """A PE whose COM descriptor (CLR) data directory is non-empty."""
+    try:
+        (pe,) = struct.unpack_from("<I", head, 0x3C)
+        opt = pe + 24
+        (magic,) = struct.unpack_from("<H", head, opt)
+        base = {0x10B: 96, 0x20B: 112}.get(magic)
+        if base is None:
+            return False
+        (ndirs,) = struct.unpack_from("<I", head, opt + base - 4)
+        if ndirs <= 14:
+            return False
+        rva, size = struct.unpack_from("<II", head, opt + base + 14 * 8)
+        return rva != 0 and size != 0
+    except struct.error:
+        return False
+
+
+def packed(path: Path, *, function_count: int | None, dotnet: bool = False) -> bool:
     """True when the sample looks packed (see the module docstring); never raises."""
     head = _read(path, 0, HEAD_BYTES)
     sections = _pe_sections(head)
     if sections:
         if any(name in _UPX_SECTIONS for name, *_ in sections):
             return True
+        if dotnet or _has_clr_header(head):
+            return False
         regions = [(off, size) for _n, chars, off, size in sections if chars & _SCN_MEM_EXECUTE]
     elif _elf_header(head) is not None:
         if b"UPX!" in head[:4096]:
@@ -157,9 +181,9 @@ def packed(path: Path, *, function_count: int | None) -> bool:
 
 
 def unsupported_arch(path: Path) -> bool:
-    """True for an architecture REA's Ghidra lane rejects: 32-bit MIPS ELF before release 2."""
+    """True for an architecture REA's Ghidra lane rejects: 32-bit MIPS ELF at MIPS I-V."""
     hdr = _elf_header(_read(path, 0, 64))
     if hdr is None:
         return False
     cls, _e, machine, flags, _o, _p = hdr
-    return cls == 1 and machine == _EM_MIPS and (flags >> _EF_MIPS_ARCH_SHIFT) & 0xF in _MIPS_PRE_R2
+    return cls == 1 and machine == _EM_MIPS and (flags >> _EF_MIPS_ARCH_SHIFT) & 0xF in _MIPS_UNSUPPORTED

@@ -23,10 +23,11 @@ one of, checked in this order:
 
 ```text
 not_native        not pe/elf/macho/dotnet (archives, APKs and every other kind)
-ghidra_failed     Ghidra import/analysis failed
+ghidra_failed     Ghidra import/analysis failed (any status other than ok or timeout)
 ghidra_timeout    Ghidra exceeded its sweep budget (the agent would only time out again)
-unsupported_arch  REA's Ghidra lane rejects the architecture (32-bit MIPS before release 2)
+unsupported_arch  REA's Ghidra lane rejects the architecture (32-bit MIPS I-V)
 packed            UPX sections / UPX! magic, or <= 16 procedures plus a high-entropy code section
+                  (the entropy rule never applies to .NET)
 ```
 
 ``more_pending=false`` without ``chain_stop`` means the continuation itself could not be packed
@@ -368,13 +369,13 @@ class ReaSweepEngine:
         """Why no model pass should follow this sweep, or None (see the module docstring)."""
         if kind not in NATIVE_KINDS:
             return "not_native"
-        if ghidra_status == "failed":
-            return "ghidra_failed"
-        if ghidra_status != "ok":
+        if ghidra_status == "timeout":
             return "ghidra_timeout"
+        if ghidra_status != "ok":
+            return "ghidra_failed"
         if unsupported_arch(sample):
             return "unsupported_arch"
-        if packed(sample, function_count=function_count):
+        if packed(sample, function_count=function_count, dotnet=kind == "dotnet"):
             return "packed"
         return None
 

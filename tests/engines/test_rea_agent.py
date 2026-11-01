@@ -1380,3 +1380,35 @@ def test_slow_first_turn_at_zero_steps_falls_back_to_the_final_reserve(tmp_path)
     f = res.payload.fields
     assert f["model_status"] == "ok" and f["summary"] == "from the reserve"
     assert model.calls[-1]["response_format"] == {"type": "json_object"}
+
+
+def test_slow_final_answer_leaves_time_for_ioc_verification(tmp_path, monkeypatch):
+    monkeypatch.setenv("REA_MAX_STEPS", "1")
+    cont = make_continuation(tmp_path)
+    now = [1000.0]
+    final = _final(iocs=[{"type": "url", "value": "http://evil.example/a.php", "source": "t1"}])
+
+    class M(FakeModel):
+        def chat(self, messages, tools, max_tokens, *, response_format=None, timeout_s=None):
+            out = super().chat(messages, tools, max_tokens, response_format=response_format, timeout_s=timeout_s)
+            if response_format is not None:
+                now[0] += timeout_s  # the final answer uses its whole timeout
+            return out
+
+    model = M([tc(("binary_overview", {}, "a")), final])
+    res, _ = run(tmp_path, cont, model, McpRig(tmp_path), clock=lambda: now[0])
+    io_ = cols(res.payload, "iocs")
+    assert res.payload.fields["model_status"] == "ok"
+    assert io_["verified"] == [True] and io_["reason"] == [""]
+
+
+@pytest.mark.parametrize("code,retried", [(400, False), (413, False), (404, False), (408, True), (429, True),
+                                          (500, True), (503, True)])
+def test_http_4xx_is_not_retried_except_408_and_429(tmp_path, code, retried):
+    cont = make_continuation(tmp_path)
+    model = FakeModel([ModelError("unavailable", f"http_{code}"), _final(summary="second")] +
+                      [ModelError("unavailable", f"http_{code}")] * 4)
+    res, _ = run(tmp_path, cont, model, McpRig(tmp_path))
+    assert any(w.code == "model_retry" for w in res.warnings) is retried
+    if retried:
+        assert res.payload.fields["summary"] == "second"

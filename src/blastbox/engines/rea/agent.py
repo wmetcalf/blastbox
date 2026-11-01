@@ -129,6 +129,7 @@ CONTENT_TOOLS: frozenset[str] = frozenset({
 })
 MAX_VERIFY_IOCS = 128  # Ruling R: sample-byte searches per pass
 VERIFY_BUDGET_S = 60.0  # Ruling W: wall-clock cap on the sample-byte scan (also clamped to the pass)
+VERIFY_RESERVE_S = 20.0  # kept out of the final answer's timeout for that scan
 VERIFY_CHUNK = 8 * 1024 * 1024
 MIN_IOC_CHARS = 4
 _CASELESS_IOCS = frozenset({"url", "domain", "email"})
@@ -906,13 +907,20 @@ class ReaAgentEngine:
             return
         answer = parse_final(final_text) if final_text is not None else None
         if answer is None:
-            if remaining() < MIN_TURN_S:
+            # Keep the sample-byte IOC check's time out of the final answer's timeout, so a slow
+            # answer cannot leave verification 0 s (every IOC would seal as "budget").
+            verify_reserve = min(VERIFY_RESERVE_S, p.final_reserve_s / 4)
+
+            def final_left() -> float:
+                return remaining() - verify_reserve
+
+            if final_left() < MIN_TURN_S:
                 p.model_status = "budget"
                 return
             messages.append(framer.final_request())
             _compact_context(messages, framer)
             try:
-                resp = self._chat(model, p, tw, remaining, messages, [], max_tokens,
+                resp = self._chat(model, p, tw, final_left, messages, [], max_tokens,
                                   response_format={"type": "json_object"})
             except ModelError as exc:
                 self._final_failed(p, tw, exc.kind, str(exc))
@@ -935,7 +943,7 @@ class ReaAgentEngine:
         try:
             return model.chat(messages, tools, max_tokens, timeout_s=max(1.0, budget()), **kw)
         except ModelError as exc:
-            if exc.kind != "unavailable" or budget() < MIN_TURN_S:
+            if exc.kind != "unavailable" or not _retryable(str(exc)) or budget() < MIN_TURN_S:
                 raise
             p.warnings.append(Warning(code="model_retry", message=f"{exc}; retrying once"[:2000]))
             tw.write({"event": "model_retry", "message": str(exc)[:2000]})
@@ -1088,6 +1096,18 @@ class ReaAgentEngine:
                                       message="functions/iocs trimmed to fit the metadata limit; "
                                               "the transcript artifact has the full lists"))
         return rec
+
+
+_HTTP_STATUS = re.compile(r"\bhttp_(\d{3})\b")
+
+
+def _retryable(message: str) -> bool:
+    """An ``unavailable`` failure worth one retry: not an HTTP 4xx other than 408/429."""
+    m = _HTTP_STATUS.search(message)
+    if m is None:
+        return True
+    code = int(m.group(1))
+    return not 400 <= code < 500 or code in (408, 429)
 
 
 def _parse_message(resp: Any) -> tuple[str | None, list[dict[str, Any]]] | None:
