@@ -24,7 +24,15 @@ dir in ``BLASTBOX_WORK_DIR``:
 
 Budgets: the pass wall clock is ``min(REA_PASS_WALL_S (540), Limits.timeout_s - reserve)`` where the
 reserve keeps time for packing and sealing; REA's 13-20 s session start is inside it. Turns are
-capped by ``REA_MAX_STEPS`` (40), completions by ``REA_MAX_COMPLETION_TOKENS``.
+capped by ``REA_MAX_STEPS`` (12). Tool-choice turns ask for at most ``REA_TURN_MAX_TOKENS`` (2048)
+completion tokens, the final answer for ``REA_MAX_COMPLETION_TOKENS`` (4096). The tail of the wall
+(:func:`final_reserve`, sized from the final budget at ``REA_MODEL_TOKENS_PER_S``) is kept for the
+final answer: once exploration reaches it, tool turns stop and the final answer is forced with the
+evidence gathered so far. Each model request's timeout is the time left for that phase, capped by
+``REA_MODEL_TIMEOUT_S`` only when it is set. A request that fails with ``unavailable`` (timeout,
+connection, HTTP error) is retried once while the phase still has time. Every tool result shown to
+the model is cut to ``TOOL_RESULT_CHARS`` (head + tail around a truncation marker), and
+``analyze_function`` always runs at ``detail=summary``.
 
 Model failures never fail the job: ``model_status`` records ``unavailable``/``malformed`` (prior
 summary kept, ``more_pending=False``) or ``budget`` (``more_pending=True``). ``skipped`` means the
@@ -66,8 +74,9 @@ SCHEMA = "rea.pass/1"
 DEFAULT_MODEL_ID = "deepseek-v4-flash"
 DEFAULT_PASS_WALL_S = 540.0
 DEFAULT_MAX_STEPS = 12  # Ruling O
-DEFAULT_MAX_TOKENS = 8192
-DEFAULT_MODEL_TIMEOUT_S = 240.0
+DEFAULT_MAX_TOKENS = 4096  # the final answer
+DEFAULT_TURN_MAX_TOKENS = 2048  # each tool-choice turn
+DEFAULT_TOKENS_PER_S = 30.0  # sizes the final-answer reserve (deepseek-v4-flash on vLLM, 1 sequence)
 DEFAULT_TOOL_TIMEOUT_S = 120.0
 DEFAULT_MAX_UNPACK_BYTES = 2 * 1024 * 1024 * 1024
 MCP_START_TIMEOUT_S = 120.0
@@ -77,7 +86,10 @@ MAX_STEPS_CEILING = 200
 
 MAX_CALLS_PER_TURN = 8
 MAX_ARGS_CHARS = 16 * 1024
-EVIDENCE_CHARS = 24_000
+TOOL_RESULT_CHARS = 12 * 1024
+# Tools whose ``detail=complete`` results are too large to feed back (65-297 KB live, one 3.6 MB):
+# the engine always asks for ``summary``.
+LIGHT_DETAIL_TOOLS: frozenset[str] = frozenset({"analyze_function"})
 CONTEXT_CHARS = 300_000
 KEEP_RECENT_TOOL_MSGS = 4
 MAX_ADDRESSES = 500_000
@@ -132,9 +144,26 @@ Clock = Callable[[], float]
 # ---------------------------------------------------------------- helpers
 
 
-def final_reserve(wall_s: float) -> float:
-    """Seconds of the pass kept back for the final-answer request (exploration stops earlier)."""
-    return min(wall_s / 2, max(60.0, 0.2 * wall_s))
+def final_reserve(wall_s: float, final_tokens: int = DEFAULT_MAX_TOKENS,
+                  tokens_per_s: float = DEFAULT_TOKENS_PER_S) -> float:
+    """Seconds of the pass kept back for the final-answer request (exploration stops earlier).
+
+    Enough to generate ``final_tokens`` at ``tokens_per_s`` plus 25% for prompt processing, at
+    least 60 s / 20% of the wall, never more than half the wall.
+    """
+    need = 1.25 * final_tokens / max(tokens_per_s, 1e-3)
+    return min(wall_s / 2, max(60.0, 0.2 * wall_s, need))
+
+
+def cap_tool_text(text: str, cap: int = TOOL_RESULT_CHARS) -> tuple[str, int]:
+    """(text cut to about ``cap`` chars keeping head and tail, omitted chars); whole if it fits."""
+    if len(text) <= cap:
+        return text, 0
+    tail = cap // 4
+    head = cap - tail
+    omitted = len(text) - cap
+    return (text[:head] + f"\n[... {omitted} chars truncated by the engine; ask for a narrower view ...]\n"
+            + text[len(text) - tail:]), omitted
 
 
 def norm_addr(value: object) -> str | None:
@@ -439,6 +468,8 @@ class _Pass:
     explored: list[str] = field(default_factory=list)
     done: bool = False
     final_reserve_s: float = 0.0
+    wall_s: float = 0.0
+    turn_tokens: int = DEFAULT_TURN_MAX_TOKENS
     good_turns: int = 0  # model responses that parsed (with or without tool calls)
     accepted: bool = False  # _accept finished: functions/iocs/summary are one consistent answer
     warnings: list[Warning] = field(default_factory=list)
@@ -485,6 +516,8 @@ class ReaAgentEngine:
 
         max_steps = _env_int("REA_MAX_STEPS", DEFAULT_MAX_STEPS, 1, MAX_STEPS_CEILING)
         max_tokens = _env_int("REA_MAX_COMPLETION_TOKENS", DEFAULT_MAX_TOKENS, 256, 131072)
+        turn_tokens = min(max_tokens, _env_int("REA_TURN_MAX_TOKENS", DEFAULT_TURN_MAX_TOKENS, 256, 131072))
+        tokens_per_s = _env_seconds("REA_MODEL_TOKENS_PER_S", DEFAULT_TOKENS_PER_S)
         model_id = os.environ.get("REA_MODEL_ID") or DEFAULT_MODEL_ID
 
         # 1. unpack + integrity
@@ -500,11 +533,14 @@ class ReaAgentEngine:
             return self._rejected("bad_continuation", "bad program_name in state.json")
 
         p = _Pass(pass_no=state.pass_no + 1, model_id=model_id, summary=state.summary,
-                  todo=list(state.todo), explored=list(state.explored), final_reserve_s=final_reserve(wall))
+                  todo=list(state.todo), explored=list(state.explored),
+                  final_reserve_s=final_reserve(wall, max_tokens, tokens_per_s), wall_s=wall,
+                  turn_tokens=turn_tokens)
         transcript_path = outdir / "transcript.jsonl"
         tw = TranscriptWriter(transcript_path, min(MAX_TRANSCRIPT_BYTES, limits.max_artifact_bytes), self._clock)
         tw.write({"event": "start", "pass_no": p.pass_no, "model": model_id, "wall_budget_s": round(wall, 1),
-                  "max_steps": max_steps, "max_tokens": max_tokens})
+                  "max_steps": max_steps, "max_tokens": max_tokens, "turn_tokens": turn_tokens,
+                  "final_reserve_s": round(p.final_reserve_s, 1)})
 
         ghidra_status: GhidraStatus = state.ghidra_status
         program_name = state.program_name
@@ -660,7 +696,12 @@ class ReaAgentEngine:
             res = mcp.call(name, args, timeout_s=max(1.0, min(tool_timeout, remaining())))
             text, is_error = render_result(res)
         except McpError as exc:
-            text, is_error = f"tool call failed: {exc}", True
+            if exc.code == "response_too_large":
+                text = ("tool call failed: the result was too large to return. Ask for a narrower view: "
+                        "detail=summary, one procedure at a time, or a smaller address range.")
+            else:
+                text = f"tool call failed: {exc}"
+            is_error = True
         ev.add(call_id, name, text, is_error=is_error, engine=engine)
         tw.write({"event": "tool_result", "call_id": call_id, "tool": name, "is_error": is_error,
                   "chars": len(text), "text": text[:TRANSCRIPT_TEXT]})
@@ -767,8 +808,10 @@ class ReaAgentEngine:
             p.warnings.append(Warning(code="model_unavailable", message="REA_MODEL_URL is not set"))
             return
         try:
+            # No fixed per-request ceiling unless REA_MODEL_TIMEOUT_S is set: each request gets the
+            # time left in its phase (a full answer at ~30 tok/s outlasts any fixed 240 s).
             model = self._model_factory(url, p.model_id,
-                                        _env_seconds("REA_MODEL_TIMEOUT_S", DEFAULT_MODEL_TIMEOUT_S))
+                                        _env_seconds("REA_MODEL_TIMEOUT_S", max(1.0, p.wall_s)))
         except ValueError as exc:
             p.model_status = "unavailable"
             p.warnings.append(Warning(code="model_unavailable", message=str(exc)[:2000]))
@@ -785,10 +828,12 @@ class ReaAgentEngine:
             if explore_left() < MIN_TURN_S:
                 break  # keep the reserve for the final answer
             try:
-                resp = model.chat(messages, tools, max_tokens, timeout_s=explore_left())
+                resp = self._chat(model, p, tw, explore_left, messages, tools, p.turn_tokens)
             except ModelError as exc:
-                if p.good_turns > 0:
-                    # Earlier turns worked: one failed turn must not waste them (Ruling O).
+                if p.good_turns > 0 or (exc.kind == "unavailable" and remaining() >= 2 * MIN_TURN_S):
+                    # Earlier turns worked: one failed turn must not waste them (Ruling O). With
+                    # no good turn yet, the final-answer reserve is the last retry of an
+                    # unreachable or slow endpoint before the pass seals ``unavailable``.
                     self._turn_failed(p, tw, str(exc))
                     break
                 self._model_failed(p, tw, exc.kind, str(exc))
@@ -829,6 +874,8 @@ class ReaAgentEngine:
                     if c["args"] is None:
                         raise CallRefused("arguments are not a valid JSON object")
                     args = check_call(c["name"], c["args"], sample_path=sample_path)
+                    if c["name"] in LIGHT_DETAIL_TOOLS:
+                        args["detail"] = "summary"
                 except CallRefused as exc:
                     p.refused += 1
                     tw.write({"event": "tool_call", "call_id": cid, "tool": c["name"][:128],
@@ -848,9 +895,8 @@ class ReaAgentEngine:
                         a = norm_addr(args.get(key))
                         if a is not None:
                             explored_now.append(a)
-                shown = compact_for_model(text)
-                omitted = max(0, len(shown) - EVIDENCE_CHARS)
-                messages.append(framer.tool_result(c["id"], cid, c["name"], shown[:EVIDENCE_CHARS],
+                shown, omitted = cap_tool_text(compact_for_model(text))
+                messages.append(framer.tool_result(c["id"], cid, c["name"], shown,
                                                    is_error=is_error, omitted_chars=omitted))
             if out_of_time:
                 break  # straight to the final answer
@@ -866,8 +912,8 @@ class ReaAgentEngine:
             messages.append(framer.final_request())
             _compact_context(messages, framer)
             try:
-                resp = model.chat(messages, [], max_tokens, response_format={"type": "json_object"},
-                                  timeout_s=remaining())
+                resp = self._chat(model, p, tw, remaining, messages, [], max_tokens,
+                                  response_format={"type": "json_object"})
             except ModelError as exc:
                 self._final_failed(p, tw, exc.kind, str(exc))
                 return
@@ -879,6 +925,21 @@ class ReaAgentEngine:
                 self._final_failed(p, tw, "malformed", "final answer is not the required JSON object")
                 return
         self._accept(answer, ev, explored_now, p, tw, sample, remaining, self._clock)
+
+    @staticmethod
+    def _chat(model: Any, p: _Pass, tw: TranscriptWriter, budget: Callable[[], float],
+              messages: list[dict[str, Any]], tools: list[dict[str, Any]], max_tokens: int,
+              **kw: Any) -> Any:
+        """One model request with the phase's remaining time as its timeout; an ``unavailable``
+        failure (timeout, connection, HTTP) is retried once while ``budget()`` leaves a turn."""
+        try:
+            return model.chat(messages, tools, max_tokens, timeout_s=max(1.0, budget()), **kw)
+        except ModelError as exc:
+            if exc.kind != "unavailable" or budget() < MIN_TURN_S:
+                raise
+            p.warnings.append(Warning(code="model_retry", message=f"{exc}; retrying once"[:2000]))
+            tw.write({"event": "model_retry", "message": str(exc)[:2000]})
+        return model.chat(messages, tools, max_tokens, timeout_s=max(1.0, budget()), **kw)
 
     @staticmethod
     def _turn_failed(p: _Pass, tw: TranscriptWriter, message: str) -> None:

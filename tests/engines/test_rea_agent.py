@@ -645,8 +645,9 @@ def test_ioc_check_is_capped(tmp_path):
 
 
 @pytest.mark.parametrize("script,status", [
-    ([ModelError("unavailable", "connection refused")], "unavailable"),
-    ([ModelError("unavailable", "http_500")], "unavailable"),
+    # unavailable is retried once per request, and the final-answer reserve is a last retry
+    ([ModelError("unavailable", "connection refused")] * 4, "unavailable"),
+    ([ModelError("unavailable", "http_500")] * 4, "unavailable"),
     ([ModelError("malformed", "invalid_json")], "malformed"),
     ([{"choices": [{"message": {"tool_calls": "not-a-list"}}]}], "malformed"),
     ([{"choices": [{"message": {"tool_calls": [{"id": "a", "function": {"arguments": "{}"}}]}}]}], "malformed"),
@@ -845,7 +846,7 @@ def test_model_timeout_after_tool_work_still_asks_for_the_final_answer(tmp_path)
     rig = McpRig(tmp_path, {"procedure_pseudo_code": {"text": DECOMP}})
     model = FakeModel([
         tc(("procedure_pseudo_code", {"procedure": "0x140001420"}, "a")),
-        ModelError("unavailable", "TimeoutError"),
+        ModelError("unavailable", "TimeoutError"), ModelError("unavailable", "TimeoutError"),
         answer({"summary": "salvaged", "functions": [
             {"address": "0x140001420", "name": "entry", "claim": "c", "evidence": ["t1"]}],
             "iocs": [], "todo": [], "done": True}),
@@ -902,7 +903,8 @@ def test_malformed_after_a_good_turn_is_budget(tmp_path):
                                    answer("not json"), answer(json.dumps([1]))])
 def test_final_failure_after_good_turns_is_budget(tmp_path, final):
     cont = make_continuation(tmp_path, todo=["0x140001420", "0x140001500"], summary="prior summary")
-    model = FakeModel([answer("prose, no tools"), final])
+    retry = [final] if isinstance(final, ModelError) and final.kind == "unavailable" else []
+    model = FakeModel([answer("prose, no tools"), final, *retry])
     res, _ = run(tmp_path, cont, model, McpRig(tmp_path))
     f = res.payload.fields
     assert f["model_status"] == "budget" and f["more_pending"] is True and f["summary"] == "prior summary"
@@ -913,7 +915,7 @@ def test_steps_exhausted_then_final_fails_is_budget_and_saves_explored(tmp_path,
     cont = make_continuation(tmp_path, todo=["0x140001420", "0x140001500"], explored=["0x140001000"])
     rig = McpRig(tmp_path, {"procedure_pseudo_code": {"text": DECOMP}})
     model = FakeModel([tc(("procedure_pseudo_code", {"procedure": "0x140001420"}, "a")),
-                       ModelError("unavailable", "TimeoutError")])
+                       ModelError("unavailable", "TimeoutError"), ModelError("unavailable", "TimeoutError")])
     res, out = run(tmp_path, cont, model, rig)
     f = res.payload.fields
     assert f["model_status"] == "budget" and f["more_pending"] is True and f["steps"] == 1
@@ -925,7 +927,7 @@ def test_steps_exhausted_then_final_fails_is_budget_and_saves_explored(tmp_path,
 def test_only_refused_calls_then_failure_is_budget(tmp_path):
     cont = make_continuation(tmp_path)
     model = FakeModel([tc(("annotate_native_function", {"procedure": "main"}, "a")),
-                       ModelError("unavailable", "boom"), ModelError("unavailable", "boom")])
+                       *[ModelError("unavailable", "boom")] * 4])
     res, _ = run(tmp_path, cont, model, McpRig(tmp_path))
     f = res.payload.fields
     assert f["model_status"] == "budget" and f["more_pending"] is True and f["refused_calls"] == 1
@@ -1224,3 +1226,157 @@ def test_exception_after_accept_keeps_the_ok_pass(tmp_path, monkeypatch):
     assert any(w.code == "agent_failed" for w in res.warnings)
     # the answer left a todo: the chain continues with its continuation
     assert f["more_pending"] is True and next_state(out).todo == ["0x140001500"]
+
+
+# ------------------------------------------------------------------ G1: passes that land findings
+
+
+def test_tool_turns_use_a_small_token_budget_and_the_final_answer_a_larger_one(tmp_path, monkeypatch):
+    monkeypatch.setenv("REA_MAX_STEPS", "1")
+    cont = make_continuation(tmp_path)
+    model = FakeModel([tc(("binary_overview", {}, "a")), _final()])
+    res, _ = run(tmp_path, cont, model, McpRig(tmp_path))
+    assert res.payload.fields["model_status"] == "ok"
+    assert model.calls[0]["max_tokens"] == ag.DEFAULT_TURN_MAX_TOKENS == 2048
+    assert model.calls[-1]["response_format"] == {"type": "json_object"}
+    assert model.calls[-1]["max_tokens"] == ag.DEFAULT_MAX_TOKENS > 2048
+
+
+def test_model_request_timeout_derives_from_the_wall_not_a_fixed_240s(tmp_path, monkeypatch):
+    monkeypatch.delenv("REA_MODEL_TIMEOUT_S", raising=False)
+    cont = make_continuation(tmp_path)
+    model = FakeModel([_final()])
+    run(tmp_path, cont, model, McpRig(tmp_path), limits=Limits(timeout_s=600))
+    assert model.ctor[2] >= 540 - 1  # no ctor cap below the pass wall
+    # the first turn may use everything up to the final-answer reserve (> the old 240 s)
+    assert model.calls[0]["timeout_s"] > 240
+
+
+def test_model_timeout_env_is_an_upper_cap_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("REA_MODEL_TIMEOUT_S", "100")
+    cont = make_continuation(tmp_path)
+    model = FakeModel([_final()])
+    run(tmp_path, cont, model, McpRig(tmp_path))
+    assert model.ctor[2] == 100
+
+
+def test_final_reserve_fits_the_final_answer_at_endpoint_throughput():
+    need = ag.DEFAULT_MAX_TOKENS / ag.DEFAULT_TOKENS_PER_S
+    assert ag.final_reserve(540) >= need
+    assert ag.final_reserve(540) <= 270
+    assert ag.final_reserve(100) <= 50  # never more than half the wall
+
+
+def test_tool_results_are_capped_head_and_tail_with_a_marker(tmp_path, monkeypatch):
+    monkeypatch.setenv("REA_MAX_STEPS", "1")
+    body = "HEAD-" + "x" * 100_000 + "-TAIL"
+    cont = make_continuation(tmp_path)
+    rig = McpRig(tmp_path, {"procedure_pseudo_code": {"text": body}})
+    model = FakeModel([tc(("procedure_pseudo_code", {"procedure": "0x140001420"}, "a")), _final()])
+    run(tmp_path, cont, model, rig)
+    tool_msgs = [m for m in model.calls[-1]["messages"] if m["role"] == "tool"]
+    content = tool_msgs[0]["content"]
+    assert len(content) < ag.TOOL_RESULT_CHARS + 2000
+    assert "HEAD-" in content and "-TAIL" in content
+    assert "truncated" in content
+
+
+def test_cap_tool_text_keeps_short_text_whole():
+    assert ag.cap_tool_text("short") == ("short", 0)
+    text, omitted = ag.cap_tool_text("a" * 50_000, 12_000)
+    assert omitted == 50_000 - 12_000 and len(text) < 12_200 and text.startswith("a") and text.endswith("a")
+
+
+def test_analyze_function_complete_is_rewritten_to_summary(tmp_path, monkeypatch):
+    monkeypatch.setenv("REA_MAX_STEPS", "1")
+    cont = make_continuation(tmp_path)
+    rig = McpRig(tmp_path)
+    model = FakeModel([tc(("analyze_function", {"procedure": "0x140001420", "detail": "complete"}, "a"),
+                          ("analyze_function", {"procedure": "0x140001500"}, "b")), _final()])
+    run(tmp_path, cont, model, rig)
+    sent = [c["arguments"] for c in rig.calls() if c["name"] == "analyze_function"]
+    assert sent == [{"procedure": "0x140001420", "detail": "summary"},
+                    {"procedure": "0x140001500", "detail": "summary"}]
+
+
+def test_response_too_large_is_explained_to_the_model(tmp_path, monkeypatch):
+    monkeypatch.setenv("REA_MAX_STEPS", "1")
+    cont = make_continuation(tmp_path)
+    rig = McpRig(tmp_path, {"procedure_pseudo_code": {"huge": 2 * 1024 * 1024}})
+    model = FakeModel([tc(("procedure_pseudo_code", {"procedure": "0x140001420"}, "a")), _final()])
+    res, _ = run(tmp_path, cont, model, rig)
+    assert res.payload.fields["model_status"] == "ok"
+    content = [m for m in model.calls[-1]["messages"] if m["role"] == "tool"][0]["content"]
+    assert "too large" in content and len(content) < 4000
+
+
+def test_first_turn_unavailable_is_retried_once(tmp_path):
+    cont = make_continuation(tmp_path)
+    model = FakeModel([ModelError("unavailable", "deadline_exceeded"), _final(summary="after retry")])
+    res, _ = run(tmp_path, cont, model, McpRig(tmp_path))
+    f = res.payload.fields
+    assert f["model_status"] == "ok" and f["summary"] == "after retry"
+    assert len(model.calls) == 2
+    assert any(w.code == "model_retry" for w in res.warnings)
+
+
+def test_malformed_is_not_retried(tmp_path):
+    cont = make_continuation(tmp_path)
+    model = FakeModel([ModelError("malformed", "invalid_json")])
+    res, _ = run(tmp_path, cont, model, McpRig(tmp_path))
+    assert res.payload.fields["model_status"] == "malformed" and len(model.calls) == 1
+
+
+def test_no_retry_without_wall_left(tmp_path):
+    cont = make_continuation(tmp_path)
+    now = [1000.0]
+    model = FakeModel([ModelError("unavailable", "deadline_exceeded")],
+                      on_chat=lambda: now.__setitem__(0, now[0] + 10_000))
+    res, _ = run(tmp_path, cont, model, McpRig(tmp_path), clock=lambda: now[0])
+    assert len(model.calls) == 1 and res.payload.fields["model_status"] == "unavailable"
+
+
+def test_final_answer_is_forced_at_the_reserve_and_partial_findings_land(tmp_path):
+    cont = make_continuation(tmp_path)
+    now = [1000.0]
+    rig = McpRig(tmp_path, {"procedure_pseudo_code": {"text": DECOMP}})
+    script = [tc(("procedure_pseudo_code", {"procedure": "0x140001420"}, f"c{i}")) for i in range(10)]
+    finals = {"summary": "partial", "functions": [
+        {"address": "0x140001420", "name": "entry", "claim": "calls C2", "evidence": ["t1"]}],
+        "iocs": [], "todo": [], "done": False}
+
+    class M(FakeModel):
+        def chat(self, messages, tools, max_tokens, *, response_format=None, timeout_s=None):
+            now[0] += 100.0
+            if response_format is not None:
+                self.calls.append({"messages": messages, "max_tokens": max_tokens,
+                                   "response_format": response_format, "timeout_s": timeout_s})
+                return answer(finals)
+            return super().chat(messages, tools, max_tokens, response_format=response_format,
+                                timeout_s=timeout_s)
+
+    model = M(script)
+    res, _ = run(tmp_path, cont, model, rig, clock=lambda: now[0])
+    f = res.payload.fields
+    assert f["model_status"] == "ok" and f["summary"] == "partial"
+    assert cols(res.payload, "functions")["address"] == ["0x140001420"]
+    final = model.calls[-1]
+    assert final["response_format"] == {"type": "json_object"}
+    assert final["timeout_s"] >= ag.final_reserve(540) - 100 - 1
+
+
+def test_slow_first_turn_at_zero_steps_falls_back_to_the_final_reserve(tmp_path):
+    """Live pass 2: the first turn queued past its timeout and the pass sealed unavailable."""
+    cont = make_continuation(tmp_path)
+    now = [1000.0]
+    script = [ModelError("unavailable", "deadline_exceeded"), _final(summary="from the reserve")]
+
+    def slow_first():
+        if len(model.calls) == 1:
+            now[0] += 540 - ag.final_reserve(540) + 1  # the first turn eats the exploration budget
+
+    model = FakeModel(script, on_chat=slow_first)
+    res, _ = run(tmp_path, cont, model, McpRig(tmp_path), clock=lambda: now[0])
+    f = res.payload.fields
+    assert f["model_status"] == "ok" and f["summary"] == "from the reserve"
+    assert model.calls[-1]["response_format"] == {"type": "json_object"}
