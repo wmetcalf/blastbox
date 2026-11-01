@@ -8,8 +8,11 @@ One job, in order, everything under a fresh per-job dir in ``BLASTBOX_WORK_DIR``
 4. icons -> ``icon-<n>``;
 5. native code (pe/elf/macho/dotnet): ``analyzeHeadless`` import + auto-analysis with the
    bundled ``ListStrings.java`` post-script dumping defined strings;
-6. deterministic IOCs over the inspect JSON string leaves and the Ghidra strings;
-7. a continuation archive (sample + Ghidra project when analysis finished + ``State``);
+6. deterministic IOCs over the inspect JSON string leaves, the Ghidra strings and, for native
+   code, UTF-16LE URL strings in the sample bytes (a .NET ``#US`` heap has no Ghidra string);
+7. a continuation archive (sample + Ghidra project when analysis finished + ``State``), only
+   when a model pass can follow: native code whose Ghidra run did not fail. Containers and
+   other inputs never chain, so they seal no continuation;
 8. a ``rea.report/1`` Record payload plus a full JSON ``report`` artifact.
 
 Nothing here is fatal on its own: a failing inspect command, extraction, Ghidra run or pack
@@ -24,6 +27,7 @@ import hashlib
 import json
 import logging
 import math
+import mmap
 import os
 import shutil
 import tempfile
@@ -35,7 +39,7 @@ from typing import Any
 from blastbox.contract import DeclaredArtifact, Detection, Record, Warning
 from blastbox.engines.rea.continuation import GhidraStatus, State, pack
 from blastbox.engines.rea.icons import extract_icons
-from blastbox.engines.rea.iocs import Ioc, extract_iocs
+from blastbox.engines.rea.iocs import Ioc, extract_iocs, utf16le_urls
 from blastbox.engines.rea.runner import (
     INSPECT_MAP,
     ReaRunner,
@@ -62,6 +66,8 @@ MAX_STRINGS_BYTES = 64 * 1024 * 1024
 MAX_STRINGS = 50_000
 MAX_STRING_CHARS = 4096
 MAX_IOCS = 2048
+MAX_UTF16_SCAN_BYTES = 256 * 1024 * 1024
+MAX_UTF16_URLS = 1024
 MAX_ICONS = 8
 MAX_REPORT_BYTES = 16 * 1024 * 1024
 MAX_LEAVES = 200_000
@@ -103,6 +109,20 @@ def _sha256(path: Path) -> str:
         while chunk := f.read(1 << 20):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _utf16_urls(path: Path) -> list[tuple[str, str]]:
+    """UTF-16LE URL strings in the first ``MAX_UTF16_SCAN_BYTES`` of the sample (mmap, no copy)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return []
+    with os.fdopen(fd, "rb") as f:
+        size = os.fstat(f.fileno()).st_size
+        if size == 0:
+            return []
+        with mmap.mmap(f.fileno(), min(size, MAX_UTF16_SCAN_BYTES), access=mmap.ACCESS_READ) as m:
+            return utf16le_urls(m, limit=MAX_UTF16_URLS)
 
 
 def _string_leaves(obj: Any) -> Iterator[str]:
@@ -239,6 +259,13 @@ class ReaSweepEngine:
                 warnings.append(Warning(code="ghidra_strings_malformed",
                                         message=f"{bad} malformed line(s) in the Ghidra strings dump"))
 
+        wide_urls: list[tuple[str, str]] = []
+        if kind in NATIVE_KINDS:
+            try:
+                wide_urls = _utf16_urls(input)
+            except (OSError, ValueError) as exc:
+                warnings.append(Warning(code="utf16_scan_failed", message=f"exception:{type(exc).__name__}"))
+
         def sources() -> Iterator[tuple[str, str]]:
             for cmd, res in inspect.items():
                 if res.get("ok"):
@@ -246,23 +273,24 @@ class ReaSweepEngine:
                         yield f"inspect:{cmd}", leaf
             for addr, value in gstrings:
                 yield f"ghidra:{addr}", value
+            yield from wide_urls
 
         iocs = extract_iocs(sources(), limit=MAX_IOCS)
         if len(iocs) >= MAX_IOCS:
             warnings.append(Warning(code="iocs_capped", message=f"IOC extraction stopped at {MAX_IOCS}"))
 
-        # 6. continuation
-        cont = self._continuation(input, outdir, project, ghidra_status, limits, warnings)
+        # 6. continuation: only when a model pass can follow it. Ghidra runs only for native
+        # kinds, and a failed run would just repeat in the agent, so everything else (archives,
+        # APKs, other inputs, failed Ghidra) seals no continuation and more_pending=false.
+        chainable = kind in NATIVE_KINDS and ghidra_status != "failed"
+        cont = (self._continuation(input, outdir, project, ghidra_status, limits, warnings)
+                if chainable else None)
 
         # 7. artifact budget (report + continuation reserved first)
         report_cap = min(MAX_REPORT_BYTES, limits.max_artifact_bytes)
         icons, members = self._budget(icons, members, cont, report_cap, limits, warnings)
 
-        more_pending = (
-            (kind in NATIVE_KINDS or ghidra_status == "timeout")
-            and ghidra_status != "failed"
-            and cont is not None
-        )
+        more_pending = chainable and cont is not None
 
         summary: dict[str, Any] = {
             "schema": SCHEMA,

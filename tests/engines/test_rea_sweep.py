@@ -198,9 +198,9 @@ def test_zip_members_capped_no_ghidra(tmp_path: Path) -> None:
     assert "member_dropped" in _codes(res)
     assert ghidra.calls == []
     assert f["kind"] == "archive" and f["ghidra_status"] == "skipped" and f["more_pending"] is False
-    # continuation without project
-    _s, proj, state = unpack(out / arts["continuation"].path, tmp_path / "unp", max_bytes=1 << 30)
-    assert proj is None and state.ghidra_status == "skipped"
+    # no pass can follow an archive sweep: no continuation is packed or declared
+    assert "continuation" not in arts
+    assert not (out / "continuation.tar.gz").exists()
 
 
 def test_extract_error_is_warning(tmp_path: Path) -> None:
@@ -231,6 +231,7 @@ def test_ghidra_failed_not_pending(tmp_path: Path) -> None:
     f = _fields(res)
     assert f["kind"] == "elf" and f["ghidra_status"] == "failed" and f["more_pending"] is False
     assert res.status == "ok"
+    assert "continuation" not in _by_id(res)
 
 
 def test_ghidra_exception_is_failed(tmp_path: Path) -> None:
@@ -272,6 +273,7 @@ def test_non_native_skips_ghidra(tmp_path: Path) -> None:
     f = _fields(res)
     assert g.calls == [] and f["kind"] == "other" and f["ghidra_status"] == "skipped"
     assert f["more_pending"] is False
+    assert "continuation" not in _by_id(res)
     assert [c[0] for c in FakeRunner.instances[0].inspect_calls] == list(INSPECT_MAP["other"])
 
 
@@ -360,7 +362,7 @@ def test_artifact_budget_respected(tmp_path: Path) -> None:
     res, out, _g = _run(_zip(tmp_path / "a.zip"), tmp_path, runner=factory(extract_fn=extract), limits=lim)
     assert len(res.artifacts) <= 7
     ids = _by_id(res)
-    assert "continuation" in ids and "report" in ids
+    assert "continuation" not in ids and "report" in ids  # an archive never chains
     assert "artifact_budget" in _codes(res)
     # undeclared files were removed from outdir
     declared = {a.path for a in res.artifacts}
@@ -393,3 +395,42 @@ def test_continuation_too_large_not_pending(tmp_path: Path) -> None:
 
 def test_no_tmp_literal_in_source() -> None:
     assert '"/tmp' not in Path(sw.__file__).read_text()
+
+
+# ------------------------------------------------- IOC false positives (I4)
+def test_version_and_go_symbol_noise_dropped_real_iocs_kept(tmp_path: Path) -> None:
+    strings = [
+        {"address": "0x1400106ae", "value": "FileVersion"},
+        {"address": "0x1400106c8", "value": "1.0.0.0"},
+        {"address": "0x1400106d0", "value": "8.0.0.0"},
+        {"address": "0x401100", "value": "runtime.link"},
+        {"address": "0x401200", "value": "godebugs.Info"},
+        {"address": "0x401300", "value": "runtime.work"},
+        {"address": "0x401400", "value": "beacon 185.220.101.47 via cdn-update.info"},
+    ]
+    res, _o, _g = _run(FIXTURES / "sample.exe", tmp_path, ghidra=FakeGhidra(strings=strings),
+                       runner=factory(inspect_fn=lambda cmd: {"ok": True, "result": {}}))
+    got = {(t, v) for t, v, _s in _iocs(_fields(res))}
+    assert ("ipv4", "185.220.101.47") in got and ("domain", "cdn-update.info") in got
+    assert not {("ipv4", "1.0.0.0"), ("ipv4", "8.0.0.0")} & got
+    assert not {v for t, v in got if t == "domain"} & {"runtime.link", "godebugs.info", "runtime.work"}
+
+
+def test_utf16le_url_in_native_sample_bytes(tmp_path: Path) -> None:
+    url = "https://loadout-dotnet-fixture.example.net/api/v1"
+    sample = tmp_path / "s.exe"
+    # a .NET #US heap entry: length byte, UTF-16LE chars, trailing flag byte
+    sample.write_bytes((FIXTURES / "sample.exe").read_bytes() + b"\x63" + url.encode("utf-16-le") + b"\x00")
+    res, _o, _g = _run(sample, tmp_path, ghidra=FakeGhidra(strings=[]),
+                       runner=factory(inspect_fn=lambda cmd: {"ok": True, "result": {}}))
+    rows = _iocs(_fields(res))
+    assert ("url", url) in {(t, v) for t, v, _s in rows}
+    assert ("domain", "loadout-dotnet-fixture.example.net") in {(t, v) for t, v, _s in rows}
+    assert all(s.startswith("utf16le:0x") for t, v, s in rows if v == url)
+
+
+def test_utf16le_scan_skipped_for_non_native(tmp_path: Path) -> None:
+    p = tmp_path / "x.txt"
+    p.write_bytes("see http://wide.example/x".encode("utf-16-le"))
+    res, _o, _g = _run(p, tmp_path, runner=factory(inspect_fn=lambda cmd: {"ok": True, "result": {}}))
+    assert _iocs(_fields(res)) == []
