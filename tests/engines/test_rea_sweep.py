@@ -1,5 +1,4 @@
 import json
-import tarfile
 import zipfile
 from pathlib import Path
 
@@ -211,18 +210,15 @@ def test_extract_error_is_warning(tmp_path: Path) -> None:
 
 # ---------------------------------------------------------- ghidra timeout
 def test_ghidra_timeout_still_ok(tmp_path: Path) -> None:
+    # Ruling AL: a Ghidra timeout still seals ok with the inspect evidence, but no longer chains.
     res, out, _g = _run(FIXTURES / "sample.exe", tmp_path, ghidra=FakeGhidra(status="timeout"))
     f = _fields(res)
     assert res.status == "ok"
-    assert f["ghidra_status"] == "timeout" and f["more_pending"] is True
+    assert f["ghidra_status"] == "timeout" and f["more_pending"] is False
+    assert f["chain_stop"] == "ghidra_timeout"
     assert set(f["inspect"].fields) == set(INSPECT_MAP["pe"])
     assert any(s.startswith("inspect:") for _t, _v, s in _iocs(f))
-    arts = _by_id(res)
-    with tarfile.open(out / arts["continuation"].path) as tf:
-        names = tf.getnames()
-    assert not any(n.startswith("project") for n in names)
-    _s, proj, state = unpack(out / arts["continuation"].path, tmp_path / "unp", max_bytes=1 << 30)
-    assert proj is None and state.ghidra_status == "timeout" and state.program_name is None
+    assert "continuation" not in _by_id(res) and not (out / "continuation.tar.gz").exists()
     assert "ghidra_timeout" in _codes(res)
 
 
@@ -434,3 +430,75 @@ def test_utf16le_scan_skipped_for_non_native(tmp_path: Path) -> None:
     p.write_bytes("see http://wide.example/x".encode("utf-16-le"))
     res, _o, _g = _run(p, tmp_path, runner=factory(inspect_fn=lambda cmd: {"ok": True, "result": {}}))
     assert _iocs(_fields(res)) == []
+
+
+# ------------------------------------------------------- chain_stop (Ruling AL)
+from tests.engines.test_rea_triage import X, make_elf32, make_pe  # noqa: E402
+
+
+def _not_pending(res, out, stop):
+    f = _fields(res)
+    assert f["more_pending"] is False and f["chain_stop"] == stop
+    assert "continuation" not in _by_id(res) and not (out / "continuation.tar.gz").exists()
+    assert sw.CHAIN_STOPS == ("ghidra_timeout", "ghidra_failed", "packed", "unsupported_arch", "not_native")
+
+
+def test_chain_stop_absent_when_chaining(tmp_path):
+    res, _out, _g = _run(FIXTURES / "sample.exe", tmp_path)
+    f = _fields(res)
+    assert f["more_pending"] is True and "chain_stop" not in f
+    assert "chain_stop" not in json.loads((tmp_path / "out" / "report.json").read_text())
+
+
+def test_chain_stop_ghidra_timeout_packs_no_continuation(tmp_path):
+    res, out, _g = _run(FIXTURES / "sample.exe", tmp_path, ghidra=FakeGhidra(status="timeout"))
+    _not_pending(res, out, "ghidra_timeout")
+    assert json.loads((out / "report.json").read_text())["chain_stop"] == "ghidra_timeout"
+
+
+def test_chain_stop_ghidra_failed(tmp_path):
+    res, out, _g = _run(FIXTURES / "sample.elf", tmp_path, ghidra=FakeGhidra(status="failed"))
+    _not_pending(res, out, "ghidra_failed")
+
+
+def test_chain_stop_not_native_for_archives_and_apks(tmp_path):
+    res, out, _g = _run(_zip(tmp_path / "a.zip"), tmp_path)
+    _not_pending(res, out, "not_native")
+    apk = tmp_path / "x.apk"
+    with zipfile.ZipFile(apk, "w") as z:
+        z.writestr("AndroidManifest.xml", "x")
+    res, out, _g = _run(apk, tmp_path)
+    assert _fields(res)["kind"] == "apk"
+    _not_pending(res, out, "not_native")
+
+
+def test_chain_stop_packed_upx(tmp_path):
+    p = make_pe(tmp_path / "upx.exe", [(b"UPX0", X, b""), (b"UPX1", X, b"\x90" * 4096)])
+    res, out, _g = _run(p, tmp_path)
+    _not_pending(res, out, "packed")
+
+
+def test_chain_stop_packed_from_function_count(tmp_path):
+    import os as _os
+    p = make_pe(tmp_path / "hi.exe", [(b".text", X, _os.urandom(64 * 1024))])
+    few = FakeGhidra(strings=[{"function_count": 4}, {"address": "0x401000", "value": "hello"}])
+    res, out, _g = _run(p, tmp_path, ghidra=few)
+    _not_pending(res, out, "packed")
+    many = FakeGhidra(strings=[{"function_count": 300}])
+    res, _out, _g = _run(p, tmp_path, ghidra=many)
+    assert _fields(res)["more_pending"] is True and "chain_stop" not in _fields(res)
+
+
+def test_function_count_line_is_not_a_bad_string_line(tmp_path):
+    g = FakeGhidra(strings=[{"function_count": 300}, {"address": "0x401000", "value": "http://a.example/x"}])
+    res, _out, _g = _run(FIXTURES / "sample.exe", tmp_path, ghidra=g)
+    assert "ghidra_strings_malformed" not in _codes(res)
+    assert ("url", "http://a.example/x", "ghidra:0x401000") in _iocs(_fields(res))
+
+
+def test_chain_stop_unsupported_arch_mips1(tmp_path):
+    p = make_elf32(tmp_path / "mips.elf", machine=8, flags=0x1007, segments=[(5, b"\x00" * 4096)])
+    res, out, _g = _run(p, tmp_path)
+    f = _fields(res)
+    assert f["kind"] == "elf" and f["ghidra_status"] == "ok"
+    _not_pending(res, out, "unsupported_arch")

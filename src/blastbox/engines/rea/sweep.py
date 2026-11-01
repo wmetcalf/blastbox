@@ -10,10 +10,27 @@ One job, in order, everything under a fresh per-job dir in ``BLASTBOX_WORK_DIR``
    bundled ``ListStrings.java`` post-script dumping defined strings;
 6. deterministic IOCs over the inspect JSON string leaves, the Ghidra strings and, for native
    code, UTF-16LE URL strings in the sample bytes (a .NET ``#US`` heap has no Ghidra string);
-7. a continuation archive (sample + Ghidra project when analysis finished + ``State``), only
-   when a model pass can follow: native code whose Ghidra run did not fail. Containers and
-   other inputs never chain, so they seal no continuation;
+7. a continuation archive (sample + Ghidra project + ``State``), only when a model pass can
+   follow. Otherwise the payload names why in ``chain_stop`` (Ruling AL, superseding "a Ghidra
+   timeout still continues"), seals ``more_pending=false`` and packs no continuation;
 8. a ``rea.report/1`` Record payload plus a full JSON ``report`` artifact.
+
+``rea.report/1`` payload fields: ``schema``, ``kind``, ``inspect`` (``{cmd: {ok[, error]}}``),
+``ghidra_status`` (ok | timeout | failed | skipped), ``members``, ``icons``, ``more_pending``,
+``iocs_total``, ``iocs`` (parallel columns ``type``/``value``/``source``) and the optional
+``chain_stop``. ``chain_stop`` is absent while the chain can continue; otherwise it is exactly
+one of, checked in this order:
+
+```text
+not_native        not pe/elf/macho/dotnet (archives, APKs and every other kind)
+ghidra_failed     Ghidra import/analysis failed
+ghidra_timeout    Ghidra exceeded its sweep budget (the agent would only time out again)
+unsupported_arch  REA's Ghidra lane rejects the architecture (32-bit MIPS before release 2)
+packed            UPX sections / UPX! magic, or <= 16 procedures plus a high-entropy code section
+```
+
+``more_pending=false`` without ``chain_stop`` means the continuation itself could not be packed
+or exceeded the artifact limits (a warning says which).
 
 Nothing here is fatal on its own: a failing inspect command, extraction, Ghidra run or pack
 becomes a Warning and the job still seals ``ok``. Every attacker-influenced quantity is
@@ -40,6 +57,7 @@ from blastbox.contract import DeclaredArtifact, Detection, Record, Warning
 from blastbox.engines.rea.continuation import GhidraStatus, State, pack
 from blastbox.engines.rea.icons import extract_icons
 from blastbox.engines.rea.iocs import Ioc, extract_iocs, utf16le_urls
+from blastbox.engines.rea.triage import packed, unsupported_arch
 from blastbox.engines.rea.runner import (
     INSPECT_MAP,
     ReaRunner,
@@ -53,6 +71,7 @@ from blastbox.worker.engine import DetonationResult
 _log = logging.getLogger("blastbox.engines.rea.sweep")
 
 SCHEMA = "rea.report/1"
+CHAIN_STOPS = ("ghidra_timeout", "ghidra_failed", "packed", "unsupported_arch", "not_native")
 NATIVE_KINDS = frozenset({"pe", "elf", "macho", "dotnet"})
 EXTRACT_KINDS = frozenset({"archive", "apk", "asar", "firmware"})
 
@@ -140,12 +159,16 @@ def _string_leaves(obj: Any) -> Iterator[str]:
             stack.extend(reversed(cur))
 
 
-def _read_ghidra_strings(path: Path) -> tuple[list[tuple[str, str]], bool, int]:
-    """(``[(address, value)]``, truncated, malformed_lines) from ListStrings' JSONL."""
+def _read_ghidra_strings(path: Path) -> tuple[list[tuple[str, str]], bool, int, int | None]:
+    """(``[(address, value)]``, truncated, malformed_lines, function_count) from ListStrings' JSONL.
+
+    The first line may be ``{"function_count": N}`` (the program's function count); every
+    other line is ``{"address", "value"}``.
+    """
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except OSError:
-        return [], False, 0
+        return [], False, 0, None
     with os.fdopen(fd, "rb") as f:
         data = f.read(MAX_STRINGS_BYTES + 1)
     truncated = len(data) > MAX_STRINGS_BYTES
@@ -154,7 +177,8 @@ def _read_ghidra_strings(path: Path) -> tuple[list[tuple[str, str]], bool, int]:
         data = data[: data.rfind(b"\n") + 1]
     out: list[tuple[str, str]] = []
     bad = 0
-    for line in data.splitlines():
+    function_count: int | None = None
+    for n, line in enumerate(data.splitlines()):
         if len(out) >= MAX_STRINGS:
             truncated = True
             break
@@ -165,13 +189,18 @@ def _read_ghidra_strings(path: Path) -> tuple[list[tuple[str, str]], bool, int]:
         except (ValueError, RecursionError):
             bad += 1
             continue
+        if n == 0 and isinstance(d, dict) and set(d) == {"function_count"}:
+            fc = d["function_count"]
+            if isinstance(fc, int) and not isinstance(fc, bool) and fc >= 0:
+                function_count = fc
+                continue
         addr = d.get("address") if isinstance(d, dict) else None
         val = d.get("value") if isinstance(d, dict) else None
         if not isinstance(addr, str) or not isinstance(val, str) or not 0 < len(addr) <= 64:
             bad += 1
             continue
         out.append((addr, val[:MAX_STRING_CHARS]))
-    return out, truncated, bad
+    return out, truncated, bad, function_count
 
 
 class ReaSweepEngine:
@@ -249,8 +278,9 @@ class ReaSweepEngine:
 
         # 5. IOCs
         gstrings: list[tuple[str, str]] = []
+        function_count: int | None = None
         if ghidra_status == "ok":
-            gstrings, truncated, bad = _read_ghidra_strings(strings_path)
+            gstrings, truncated, bad, function_count = _read_ghidra_strings(strings_path)
             if truncated:
                 warnings.append(Warning(code="ghidra_strings_truncated",
                                         message=f"Ghidra strings dump capped at {MAX_STRINGS_BYTES} "
@@ -279,10 +309,11 @@ class ReaSweepEngine:
         if len(iocs) >= MAX_IOCS:
             warnings.append(Warning(code="iocs_capped", message=f"IOC extraction stopped at {MAX_IOCS}"))
 
-        # 6. continuation: only when a model pass can follow it. Ghidra runs only for native
-        # kinds, and a failed run would just repeat in the agent, so everything else (archives,
-        # APKs, other inputs, failed Ghidra) seals no continuation and more_pending=false.
-        chainable = kind in NATIVE_KINDS and ghidra_status != "failed"
+        # 6. continuation: only when a model pass can follow it (Ruling AL). A failed or timed-out
+        # Ghidra run would only repeat in the agent; non-native inputs, architectures REA's lane
+        # rejects and packed stubs give the model nothing to analyse.
+        chain_stop = self._chain_stop(input, kind, ghidra_status, function_count)
+        chainable = chain_stop is None
         cont = (self._continuation(input, outdir, project, ghidra_status, limits, warnings)
                 if chainable else None)
 
@@ -303,6 +334,8 @@ class ReaSweepEngine:
             "more_pending": more_pending,
             "iocs_total": len(iocs),
         }
+        if chain_stop is not None:
+            summary["chain_stop"] = chain_stop
 
         # 8. report artifact, then the payload
         report_path = outdir / "report.json"
@@ -329,6 +362,22 @@ class ReaSweepEngine:
         )
 
     # ------------------------------------------------------------------ steps
+    @staticmethod
+    def _chain_stop(sample: Path, kind: str, ghidra_status: GhidraStatus,
+                    function_count: int | None) -> str | None:
+        """Why no model pass should follow this sweep, or None (see the module docstring)."""
+        if kind not in NATIVE_KINDS:
+            return "not_native"
+        if ghidra_status == "failed":
+            return "ghidra_failed"
+        if ghidra_status != "ok":
+            return "ghidra_timeout"
+        if unsupported_arch(sample):
+            return "unsupported_arch"
+        if packed(sample, function_count=function_count):
+            return "packed"
+        return None
+
     @staticmethod
     def _extract(runner: Any, sample: Path, dest: Path, timeout_s: float,
                  warnings: list[Warning]) -> list[Path]:

@@ -1,6 +1,7 @@
 // Writes the program's defined data strings to a JSON Lines file for the REA sweep engine.
 // Usage (analyzeHeadless): -scriptPath <dir> -postScript ListStrings.java <output.jsonl>
-// One {"address":"0x..","value":".."} per line, at most MAX_ENTRIES lines, each value cut to
+// The first line is {"function_count":N} (non-external functions, counted up to MAX_FUNCTIONS,
+// for the sweep's packed-sample check). Then one {"address":"0x..","value":".."} per line, at most MAX_ENTRIES lines, each value cut to
 // MAX_CHARS UTF-16 units (never splitting a surrogate pair). Output is pure ASCII: every
 // character outside 0x20..0x7e is written as a JSON backslash-u escape, so the file is valid JSON
 // whatever the sample's strings contain.
@@ -9,6 +10,7 @@ import ghidra.app.script.GhidraScript;
 import ghidra.program.model.data.StringDataInstance;
 import ghidra.program.model.listing.Data;
 import ghidra.program.model.listing.DataIterator;
+import ghidra.program.model.listing.FunctionIterator;
 
 import java.io.BufferedWriter;
 import java.io.FileOutputStream;
@@ -19,6 +21,7 @@ import java.nio.charset.StandardCharsets;
 public class ListStrings extends GhidraScript {
     private static final int MAX_ENTRIES = 50000;
     private static final int MAX_CHARS = 4096;
+    private static final int MAX_FUNCTIONS = 1000000;
 
     @Override
     public void run() throws Exception {
@@ -29,6 +32,9 @@ public class ListStrings extends GhidraScript {
         int written = 0;
         try (Writer w = new BufferedWriter(new OutputStreamWriter(
                 new FileOutputStream(args[0]), StandardCharsets.US_ASCII))) {
+            w.write("{\"function_count\":");
+            w.write(Integer.toString(countFunctions()));
+            w.write("}\n");
             DataIterator it = currentProgram.getListing().getDefinedData(true);
             while (it.hasNext() && written < MAX_ENTRIES && !monitor.isCancelled()) {
                 Data d = it.next();
@@ -55,6 +61,18 @@ public class ListStrings extends GhidraScript {
             }
         }
         println("ListStrings: wrote " + written + " strings");
+    }
+
+    private int countFunctions() {
+        // getFunctions(true) iterates non-external functions only; getFunctionCount() includes
+        // externals, which would hide a packer stub's handful of real procedures.
+        FunctionIterator fi = currentProgram.getFunctionManager().getFunctions(true);
+        int n = 0;
+        while (fi.hasNext() && n < MAX_FUNCTIONS && !monitor.isCancelled()) {
+            fi.next();
+            n++;
+        }
+        return n;
     }
 
     private static void escape(Writer w, String s) throws java.io.IOException {
