@@ -2114,7 +2114,7 @@ def test_httpproxy_bridge_inspect_glitch_defers_not_fails(tmp_path, monkeypatch,
 ])
 def test_httpproxy_bridge_on_preexisting_linux_bridge_fails_job(tmp_path, monkeypatch, answer):
     final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + "bb-rea-model", answer)
-    assert final.status == JobStatus.FAILED and "pre-existing" in (final.error or "")
+    assert final.status == JobStatus.FAILED and "explicit Linux bridge" in (final.error or "")
     assert not _ran(launched)
 
 
@@ -2234,6 +2234,17 @@ def test_httpproxy_internal_bridge_runs_pinned_to_inspected_network_id(tmp_path,
     assert "blastbox.net.leakguard=strict" in argv
     inspected = [a for a in launched if a[:3] == ["docker", "network", "inspect"]]
     assert inspected and inspected[0][-1] == "bb-rea-model"
+    # The template must ask for every field the gate judges, incl. the Linux bridge name option.
+    template = inspected[0][inspected[0].index("-f") + 1]
+    for field in (".Id", ".Driver", ".Scope", ".Internal", "com.docker.network.bridge.name"):
+        assert field in template
+
+
+def test_httpproxy_bridge_with_inspect_fails_with_clear_reason(tmp_path, monkeypatch):
+    final, launched = _run_bridge_job(
+        tmp_path, monkeypatch, "exit=httpproxy,proxy=http://172.30.0.30:8888,inspect=1,bridge=bb-rea-model")
+    assert final.status == JobStatus.FAILED and "inspect is not supported" in (final.error or "")
+    assert not _ran(launched)
 
 
 def test_decrypt_seals_decrypted_and_mixed_when_keylog_present(tmp_path, monkeypatch):

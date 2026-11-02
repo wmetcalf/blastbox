@@ -682,6 +682,7 @@ class Dispatcher:
         # for each such job (bounded by EGRESS_DEFER_MAX, like the egress-health maps).
         self._bridge_inspect_errors: dict[str, int] = {}
         self._bridge_cooldown: dict[str, float] = {}
+        self._bridge_inspect_floor = 0
         # ONE implementation, shared with VmJobDispatcher. Two dispatch classes with two
         # copies of "may I run this" is how one of them ends up with no copy at all —
         # which is exactly what happened before this was extracted.
@@ -2567,6 +2568,14 @@ class Dispatcher:
                     f"the proxy sidecar shares). Remove bridge= or use httpproxy.",
                 )
                 return
+            if personality.inspect:
+                self._fail_job(
+                    job,
+                    f"netpolicy {personality.name!r}: inspect is not supported with httpproxy "
+                    f"bridge= (an app-level proxy hop cannot be route-inspected). Drop inspect= "
+                    f"or bridge=.",
+                )
+                return
             named_bridge = personality.config["bridge"]
             if not BRIDGE_NAME_RE.fullmatch(named_bridge) or named_bridge in RESERVED_BRIDGES:
                 self._fail_job(
@@ -2693,12 +2702,17 @@ class Dispatcher:
                 # so this node stops re-claiming it, and a WARNING on every power-of-two attempt
                 # so a persistent problem is loud. Expiry stays with max_queued_age.
                 with self._egress_defer_lock:
-                    n = self._bridge_inspect_errors.get(job.job_id, 0) + 1
+                    n = max(self._bridge_inspect_errors.get(job.job_id, 0),
+                            self._bridge_inspect_floor) + 1
                     self._bridge_inspect_errors[job.job_id] = n
                     if len(self._bridge_inspect_errors) > self.EGRESS_DEFER_MAX:
+                        # Evicting a live count must not reset backoff (and re-arm the attempt-1
+                        # WARNING) for everyone: raise the floor to what was forgotten, as the
+                        # egress-health map does.
                         stale = next(iter(self._bridge_inspect_errors))
-                        self._bridge_inspect_errors.pop(stale, None)
+                        stale_n = self._bridge_inspect_errors.pop(stale, 0)
                         self._bridge_cooldown.pop(stale, None)
+                        self._bridge_inspect_floor = max(self._bridge_inspect_floor, stale_n)
                     shared_defer, delay = self._egress_defer_plan(n)
                     self._bridge_cooldown[job.job_id] = time.time() + delay
                 if n & (n - 1) == 0:
@@ -2716,6 +2730,8 @@ class Dispatcher:
             with self._egress_defer_lock:
                 self._bridge_inspect_errors.pop(job.job_id, None)
                 self._bridge_cooldown.pop(job.job_id, None)
+                if not self._bridge_inspect_errors:
+                    self._bridge_inspect_floor = 0
             if verdict != "ok":
                 self._fail_job(
                     job,
@@ -3311,9 +3327,13 @@ class Dispatcher:
         if driver != "bridge" or scope != "local" or internal.lower() != "true":
             return "reject", f"driver={driver} scope={scope} internal={internal}"
         # `-o com.docker.network.bridge.name=br0` makes docker REUSE an existing host bridge, which
-        # may carry other hosts/VMs on its L2 segment; only docker's own per-network bridge is OK.
+        # may carry other hosts/VMs on its L2 segment. Docker's answer can't tell a reused bridge
+        # from one it created under that name, so any explicit name is refused: only docker's own
+        # per-network br-<id12> is OK.
         if linux_bridge not in ("", f"br-{net_id[:12]}"):
-            return "reject", f"network rides a pre-existing Linux bridge {linux_bridge[:32]!r}"
+            return "reject", (f"network names an explicit Linux bridge {linux_bridge[:32]!r} "
+                              f"(com.docker.network.bridge.name), which may be a pre-existing "
+                              f"shared host bridge; recreate it without that option")
         cache = self.__dict__.setdefault("_bridge_internal_cache", {})
         cache[net_id] = (True, time.monotonic())
         return "ok", net_id
