@@ -2278,7 +2278,7 @@ def test_httpproxy_bridge_cooldown_jobs_do_not_starve_newer_work(tmp_path, monke
 @pytest.mark.parametrize("legacy", [True, False])
 def test_httpproxy_bridge_cooldown_backstop_without_store_exclude(tmp_path, monkeypatch, legacy):
     """A store whose claim_next lacks ``exclude`` (legacy shape) must never get it, and one that
-    accepts-and-drops it (HttpJobStore) must still not re-inspect a job this node is cooling down
+    accepts-and-drops it (a store that ignores it) must still not re-inspect a job this node is cooling down
     from: the gate bounces it back with only the short shared defer."""
     monkeypatch.setenv("BLASTBOX_NETPOLICY_BRX", _BRX + "bb-rea-model")
     store = InMemoryJobStore()
@@ -2314,6 +2314,26 @@ def test_httpproxy_bridge_cooldown_backstop_without_store_exclude(tmp_path, monk
     bounced = store.get(job.job_id).claimable_after - time.time()
     assert store.get(job.job_id).status == JobStatus.QUEUED
     assert 0 < bounced <= d._egress_shared_defer_s + 1
+
+
+def test_httpproxy_bridge_claim_exclude_is_ordered_oldest_cooldown_first(tmp_path):
+    """Stores that must trim an exclusion keep its FRONT (sql_store, http_store). A frozenset
+    gave them an arbitrary front, so the trim could drop the head of the cooling wall -- the
+    job oldest-first claim_next offers next. The dispatcher passes cooldowns in the order they
+    started, and only the live ones."""
+    store = InMemoryJobStore()
+    seen = []
+
+    def claim_next(*, claimant_tier=None, exclude=()):
+        seen.append(exclude)
+        return None
+    store.claim_next = claim_next
+    d = _make_dispatcher(store, job_root=tmp_path, engines={})
+    now = time.time()
+    d._bridge_cooldown = {"first": now + 100, "lapsed": now - 1, "second": now + 100,
+                          "third": now + 100}
+    d.dispatch_once()
+    assert seen == [("first", "second", "third")]
 
 
 def test_httpproxy_static_bridge_checks_precede_egress_health_defer(tmp_path, monkeypatch):

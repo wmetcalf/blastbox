@@ -154,9 +154,42 @@ def test_a_trimmed_exclusion_keeps_what_it_was_given_FIRST_not_what_sorts_first(
     given."""
     from blastbox.host.jobs.sql_store import SqlJobStore
 
+    from blastbox.host.jobs import sql_store
+
     store = SqlJobStore(f"sqlite:///{tmp_path / 't.db'}")
     monkeypatch.setattr(store, "_max_exclude", lambda: 3)
+    # The trim is now only the fallback for a SQLite without JSON1; force that path.
+    monkeypatch.setattr(sql_store, "_JSON1", False)
     oldest_first = ("zz-old-1", "zz-old-2", "zz-old-3", "aa-new-1", "aa-new-2")
     _clause, params = store._exclude_clause(oldest_first)
     assert params == ["zz-old-1", "zz-old-2", "zz-old-3"], (
         f"the trim kept {params}: it dropped the head of the wall because it sorts late")
+
+
+def test_old_sqlite_excludes_the_WHOLE_wall_via_json_each_not_a_trimmed_prefix(tmp_path,
+                                                                                monkeypatch):
+    """SQLite before 3.32 binds only 999 variables, so the exclusion used to be trimmed to 900
+    ids and a node cooling down from ~1000 jobs was offered #900 again. With JSON1 the whole
+    list travels as ONE bound parameter: every excluded job stays excluded, and the claim lands
+    on the first job NOT in the list."""
+    import sqlite3
+
+    from blastbox.host.jobs import sql_store
+    from blastbox.host.jobs.sql_store import SqlJobStore
+
+    if not sql_store._sqlite_has_json1():
+        pytest.skip("this SQLite has no JSON1; the trim fallback is covered above")
+    real_connect = sqlite3.connect
+
+    def old_sqlite_connect(*a, **k):
+        conn = real_connect(*a, **k)
+        conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", old_sqlite_connect)
+    monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 31, 1))
+    store = SqlJobStore(f"sqlite:///{tmp_path / 'old.db'}")
+    engine, ids = _seed(store, 1001)
+    job = store.claim_next(engine=engine, exclude=tuple(ids[:1000]))
+    assert job is not None and job.job_id == ids[1000], (
+        f"claimed {job and job.job_id}: the exclusion was trimmed, so an excluded job came back")

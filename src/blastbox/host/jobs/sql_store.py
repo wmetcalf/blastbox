@@ -71,6 +71,23 @@ _COLUMNS = (
 _JSON_FIELDS = {"security_warnings", "params", "result_summary"}
 
 
+_JSON1: "bool | None" = None
+
+
+def _sqlite_has_json1() -> bool:
+    """Whether this process's SQLite has JSON1 (`json_each`), probed once. Built in since 3.38
+    and compiled into nearly every older Python build, but not guaranteed before that."""
+    global _JSON1
+    if _JSON1 is None:
+        try:
+            with sqlite3.connect(":memory:") as conn:
+                conn.execute("SELECT value FROM json_each('[1]')").fetchall()
+            _JSON1 = True
+        except sqlite3.Error:
+            _JSON1 = False
+    return _JSON1
+
+
 class SqlJobStore:
     """Portable job store with SQLite (dev/single-node) and Postgres backends.
 
@@ -764,6 +781,13 @@ class SqlJobStore:
         # over whatever the store still offers -- so trimming is the right failure.
         cap = self._max_exclude()
         if len(ids) > cap:
+            # ONE PARAMETER, NO TRIM, where the driver allows it. SQLite's JSON1 `json_each`
+            # turns a single bound JSON array into the id set, so an old SQLite's 999-variable
+            # limit no longer decides which refusals survive. Only when JSON1 is missing (a
+            # rare custom build) does the trim below remain the fallback.
+            if self._driver == "sqlite" and _sqlite_has_json1():
+                return ("AND job_id NOT IN (SELECT value FROM json_each("
+                        f"{self._param})) ", [json.dumps(ids)])
             ids = ids[:cap]
         placeholders = ",".join([self._param] * len(ids))
         return f"AND job_id NOT IN ({placeholders}) ", ids

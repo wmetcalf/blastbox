@@ -457,3 +457,37 @@ def test_a_zero_claim_delay_is_the_ordinary_node_claim(control_plane, fleet, bac
     s = node_store(control_plane, fleet, "alpha")
     job = s.claim_next(engine="clamav", untargeted_min_age_s=0.0)
     assert job is not None and job.job_id == "job-1"
+
+
+def test_exclude_reaches_the_control_plane_so_a_cooling_job_is_not_handed_back(
+        control_plane, fleet, backing):
+    """A node cooling down from a job it cannot run locally (a bridge= inspect error) passes it
+    in `exclude`. This store used to drop the argument, so oldest-first claim_next handed the
+    SAME job back on every poll while newer work waited behind it."""
+    backing.create(Job(job_id="old", engine="clamav", filename="s.bin",
+                       status=JobStatus.QUEUED, created_at=time.time() - 60))
+    queued(backing, "new")
+    s = node_store(control_plane, fleet, "alpha")
+    job = s.claim_next(engine="clamav", exclude=("old",))
+    assert job is not None and job.job_id == "new", (
+        f"claimed {job and job.job_id}: the exclusion never reached the control plane")
+    assert backing.get("old").status == JobStatus.QUEUED
+
+
+def test_exclude_is_capped_and_cleaned_so_it_cannot_fail_the_claim(control_plane, fleet,
+                                                                   backing):
+    """The control plane rejects more than 256 ids, or one over 128 chars, with a 422. The client
+    trims to the cap and drops non-ids, so a long cooldown list degrades instead of failing."""
+    queued(backing, "only")
+    s = node_store(control_plane, fleet, "alpha")
+    noise = tuple(f"cool-{i}" for i in range(400)) + ("x" * 500,)
+    job = s.claim_next(engine="clamav", exclude=noise)
+    assert job is not None and job.job_id == "only"
+
+
+def test_the_control_plane_refuses_an_oversized_exclude(control_plane, fleet):
+    """The cap is enforced server-side too: a raw request with 257 ids is a 422, not a long
+    query built from a node's say-so."""
+    r = control_plane.post("/v1/nodes/claim", json={"exclude": [f"j{i}" for i in range(257)]},
+                           headers={"x-blastbox-node-session": "bogus"})
+    assert r.status_code == 422

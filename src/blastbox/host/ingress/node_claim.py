@@ -64,10 +64,10 @@ import math
 import os
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 from fastapi import APIRouter, Header, HTTPException, Query, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
 
 from blastbox.host import node_auth
 from blastbox.host.jobs.base import NODE_CLAIM_PREFIX as _NODE_CLAIM_PREFIX
@@ -420,6 +420,12 @@ class ClaimRequest(BaseModel):
     """
 
     engine: str | None = Field(None, max_length=64)
+    exclude: list[Annotated[str, StringConstraints(max_length=128)]] = Field(
+        default_factory=list, max_length=256,
+        description="Job ids this node asks NOT to be offered (oldest first), e.g. jobs it is "
+                    "locally cooling down from. It can only NARROW what this node is handed: "
+                    "the ids are appended after the control plane's own exclusions and never "
+                    "make an ungranted job eligible.")
     claimant_tier: str | None = Field(
         None, max_length=64,
         description="NOT ACCEPTED over this path -- see the claim route. Present so a client "
@@ -782,7 +788,12 @@ def register_node_claim_routes(
                     # can run, so if a store must trim the exclusion it keeps these. Then this
                     # node's own refusals, oldest first. Order-preserving, deduplicated.
                     exclude=tuple(dict.fromkeys(
-                        _unrunnable_now() + _refusals.remembered_for(memo_key))))
+                        _unrunnable_now() + _refusals.remembered_for(memo_key)
+                        # LAST: the node's own ask (its local cooldowns). A trimming store
+                        # keeps the control plane's exclusions first. Narrowing only -- an
+                        # id can make this node skip a job it was entitled to, never reach
+                        # one it was not.
+                        + tuple(req.exclude))))
                 if candidate is None:
                     break
                 # STAMP THE PREFIX FIRST, before judging and before the memo check. The prefix

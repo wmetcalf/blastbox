@@ -111,6 +111,12 @@ class NodeStoreUnsupported(NotImplementedError):
     """
 
 
+#: How many ``exclude`` ids one claim carries -- ClaimRequest's own cap. The control plane
+#: rejects a longer list (422), so the client trims; the dispatcher's gate-level cooldown
+#: bounce still covers anything past the cap.
+_MAX_SENT_EXCLUDE = 256
+
+
 class HttpJobStore:
     """A node's view of the queue: only what it is entitled to, over an authenticated link."""
 
@@ -272,8 +278,13 @@ class HttpJobStore:
                    engine: "str | Any | None" = None,
                    exclude: "Any" = (),
                    untargeted_min_age_s: float = 0.0) -> "Job | None":
-        # `exclude` is accepted for JobStore conformance and deliberately NOT sent: which jobs a
-        # node has been refused is the control plane's memory, not something a node may steer.
+        # `exclude` IS SENT (the first _MAX_SENT_EXCLUDE ids, order kept: callers pass the
+        # head of a wall first). It used to be dropped, so a node cooling down from jobs it
+        # could not run locally (a bridge= inspect error) was handed those same jobs on every
+        # poll while newer work waited. The control plane appends these AFTER its own refusal
+        # memory, so a node can only narrow what it is offered -- never widen it. An older
+        # control plane ignores the unknown field (pydantic's default), so this degrades to
+        # the previous behaviour rather than failing the claim.
         """Claim work this node is granted. The control plane decides, not this process."""
         from blastbox.host.jobs.base import Job, untargeted_cutoff
 
@@ -296,10 +307,16 @@ class HttpJobStore:
         # control plane for anything this certificate grants, which it can answer because it
         # holds the certificate store.
         engines: list[str | None] = list(_as_engine_list(engine)) or [None]
+        # An id the control plane would reject (over its 128-char item cap) is not a job id;
+        # dropping it keeps one bad entry from failing the whole claim with a 422.
+        sent_exclude = [x for x in dict.fromkeys(str(x) for x in exclude)
+                        if len(x) <= 128][:_MAX_SENT_EXCLUDE]
         for name in engines:
             body_out: dict[str, Any] = {}
             if name is not None:
                 body_out["engine"] = name
+            if sent_exclude:
+                body_out["exclude"] = sent_exclude
             # claimant_tier is NOT SENT, and NOT an error either. `Dispatcher` passes it on
             # EVERY claim -- its default is the non-empty string "cold" -- so raising here (as the
             # previous version did) broke every credential-less dispatcher before its first
