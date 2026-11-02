@@ -2275,6 +2275,47 @@ def test_httpproxy_bridge_cooldown_jobs_do_not_starve_newer_work(tmp_path, monke
     assert all(store.get(j.job_id).status == JobStatus.QUEUED for j in stuck)
 
 
+@pytest.mark.parametrize("legacy", [True, False])
+def test_httpproxy_bridge_cooldown_backstop_without_store_exclude(tmp_path, monkeypatch, legacy):
+    """A store whose claim_next lacks ``exclude`` (legacy shape) must never get it, and one that
+    accepts-and-drops it (HttpJobStore) must still not re-inspect a job this node is cooling down
+    from: the gate bounces it back with only the short shared defer."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_BRX", _BRX + "bb-rea-model")
+    store = InMemoryJobStore()
+    real_claim = store.claim_next
+    if legacy:
+        def claim_next(*, claimant_tier=None):
+            return real_claim(claimant_tier=claimant_tier)
+    else:
+        def claim_next(*, claimant_tier=None, exclude=()):
+            return real_claim(claimant_tier=claimant_tier)      # accepted, dropped
+    store.claim_next = claim_next
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    inspects = []
+
+    def fake_runner(argv, **kw):
+        if argv[:3] == ["docker", "network", "inspect"]:
+            inspects.append(argv)
+            raise OSError("blip")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+                     net_policy="brx")
+    d = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng},
+                         subprocess_runner=fake_runner)
+    d._warm_requeue_backoff_s = 0.0
+    assert d.dispatch_once() is True                  # error: cooldown starts
+    store.update(job.job_id, claimable_after=None)
+    assert d.dispatch_once() is True                  # re-claimed (no exclude) ...
+    assert len(inspects) == 1                         # ... but bounced, not re-inspected
+    bounced = store.get(job.job_id).claimable_after - time.time()
+    assert store.get(job.job_id).status == JobStatus.QUEUED
+    assert 0 < bounced <= d._egress_shared_defer_s + 1
+
+
 def test_httpproxy_static_bridge_checks_precede_egress_health_defer(tmp_path, monkeypatch):
     """bridge= on a gateway-routed driver must fail at once, not sit deferred behind an
     unhealthy-egress gate that would otherwise release it to the fleet forever."""

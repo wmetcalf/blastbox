@@ -892,12 +892,13 @@ class Dispatcher:
             claim_kw["untargeted_min_age_s"] = self._claim_untargeted_after_s
         # Jobs this node is cooling down from after a bridge= inspect error are skipped at CLAIM
         # time, so they can't monopolise this node's threads bouncing in and out while newer work
-        # waits (the gate's own cooldown bounce remains the backstop for stores that ignore
-        # exclude). Passed only when non-empty, keeping the legacy claim_next shape otherwise.
+        # waits (the gate's own cooldown bounce remains the backstop for stores that ignore or
+        # lack exclude). Passed only when non-empty AND the store's claim_next accepts it, so a
+        # legacy claim_next(*, claimant_tier=) never sees an unexpected kwarg.
         now_t = time.time()
         with self._egress_defer_lock:
             cooling = [k for k, until in self._bridge_cooldown.items() if until > now_t]
-        if cooling:
+        if cooling and _accepts_kwarg(self._job_store.claim_next, "exclude"):
             claim_kw["exclude"] = frozenset(cooling)
         try:
             job = self._job_store.claim_next(**claim_kw)
