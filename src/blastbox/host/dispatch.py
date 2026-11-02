@@ -890,6 +890,15 @@ class Dispatcher:
             claim_kw["engine"] = frozenset(self._engines)
         if self._claim_untargeted_after_s:
             claim_kw["untargeted_min_age_s"] = self._claim_untargeted_after_s
+        # Jobs this node is cooling down from after a bridge= inspect error are skipped at CLAIM
+        # time, so they can't monopolise this node's threads bouncing in and out while newer work
+        # waits (the gate's own cooldown bounce remains the backstop for stores that ignore
+        # exclude). Passed only when non-empty, keeping the legacy claim_next shape otherwise.
+        now_t = time.time()
+        with self._egress_defer_lock:
+            cooling = [k for k, until in self._bridge_cooldown.items() if until > now_t]
+        if cooling:
+            claim_kw["exclude"] = frozenset(cooling)
         try:
             job = self._job_store.claim_next(**claim_kw)
         except BaseException:
@@ -2706,6 +2715,15 @@ class Dispatcher:
                             self._bridge_inspect_floor) + 1
                     self._bridge_inspect_errors[job.job_id] = n
                     if len(self._bridge_inspect_errors) > self.EGRESS_DEFER_MAX:
+                        # Jobs a peer ran (or that were cancelled) never come back to clear their
+                        # entry: drop those whose cooldown lapsed long ago first, WITHOUT touching
+                        # the floor -- they are not live, so forgetting them resets nothing.
+                        lapsed = time.time() - self._egress_defer_cap_s
+                        for k in [k for k, until in self._bridge_cooldown.items()
+                                  if until < lapsed and k != job.job_id]:
+                            self._bridge_cooldown.pop(k, None)
+                            self._bridge_inspect_errors.pop(k, None)
+                    if len(self._bridge_inspect_errors) > self.EGRESS_DEFER_MAX:
                         # Evicting a live count must not reset backoff (and re-arm the attempt-1
                         # WARNING) for everyone: raise the floor to what was forgotten, as the
                         # egress-health map does.
@@ -3312,7 +3330,10 @@ class Dispatcher:
         if rc != 0:
             err = str(getattr(proc, "stderr", "") or "").strip()
             low = err.lower()
-            if "not found" in low or "no such network" in low:
+            # Only a "no such network" answer about THIS network is a verdict on the job; a bare
+            # "not found" can be docker's own problem (missing context, daemon 404) -> error.
+            if (f"network {network.lower()} not found" in low or "no such network" in low
+                    or "network not found" in low):
                 return "reject", "docker reports no such network"
             if "ambiguous" in low or "matches found" in low:
                 return "reject", "docker reports the name is ambiguous (duplicate networks)"

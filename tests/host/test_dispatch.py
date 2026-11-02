@@ -2099,6 +2099,8 @@ def test_httpproxy_missing_bridge_fails_job(tmp_path, monkeypatch):
     subprocess.TimeoutExpired(["docker"], 10),
     OSError("docker socket unavailable"),
     (1, "", "Cannot connect to the Docker daemon"),
+    (1, "", 'context "prod": context not found'),
+    (1, "", "Error response from daemon: 404 page not found"),
 ])
 def test_httpproxy_bridge_inspect_glitch_defers_not_fails(tmp_path, monkeypatch, glitch):
     """A docker hiccup is about the node, not the job: release it to the fleet, don't fail it."""
@@ -2167,11 +2169,10 @@ def test_httpproxy_bridge_inspect_errors_back_off_loudly_never_fail(tmp_path, mo
             shared.append(round(j.claimable_after - time.time()))
             local.append(dispatcher._bridge_cooldown[job.job_id] - time.time())
             store.update(job.job_id, claimable_after=None)
-            # Still cooling down locally: re-claimed but NOT re-inspected.
+            # Still cooling down locally: excluded at claim time, so NOT re-claimed or re-inspected.
             n_before = len(inspects)
-            assert dispatcher.dispatch_once() is True
+            assert dispatcher.dispatch_once() is False
             assert len(inspects) == n_before
-            store.update(job.job_id, claimable_after=None)
             dispatcher._bridge_cooldown[job.job_id] = 0.0      # end the local cooldown
     assert len(inspects) == 8
     # The store never hears the escalation: its defer stays at the short shared cap.
@@ -2180,6 +2181,98 @@ def test_httpproxy_bridge_inspect_errors_back_off_loudly_never_fail(tmp_path, mo
     warns = [r for r in caplog.records if "could not inspect bridge" in r.getMessage()]
     assert len(warns) == 4                                     # attempts 1, 2, 4, 8
     assert store.get(job.job_id).status == JobStatus.QUEUED
+
+
+def test_httpproxy_bridge_inspect_map_overflow_floor_and_lapsed_pruning(tmp_path, monkeypatch):
+    """Over the cap, entries whose cooldown lapsed long ago are pruned without raising the floor;
+    only evicting a LIVE count raises it, and a later success with an empty map resets it."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_BRX", _BRX + "bb-rea-model")
+    store = InMemoryJobStore()
+    jobs = []
+    for _ in range(3):
+        j = _make_job()
+        j.input_sha256 = _INPUT_SHA
+        store.create(j)
+        _setup_job_dirs(tmp_path, j)
+        jobs.append(j)
+    ok = {"on": False}
+
+    def fake_runner(argv, **kw):
+        if argv[:3] == ["docker", "network", "inspect"]:
+            if ok["on"]:
+                return subprocess.CompletedProcess(argv, 0, _INTERNAL_BRIDGE + "\n", "")
+            raise OSError("blip")
+        if argv[:2] == ["docker", "run"]:
+            for j in jobs:
+                if any(j.job_id in a for a in argv):
+                    _make_valid_output_dir(tmp_path / j.job_id / "output", input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+                     net_policy="brx")
+    d = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng},
+                         subprocess_runner=fake_runner)
+    monkeypatch.setattr(d, "EGRESS_DEFER_MAX", 1)
+    # Job 0 errors twice; its cooldown then lapses long ago (a peer ran it elsewhere).
+    for _ in range(2):
+        assert d.dispatch_once() is True
+        store.update(jobs[0].job_id, claimable_after=None)
+        d._bridge_cooldown[jobs[0].job_id] = 0.0
+    store.update(jobs[0].job_id, status=JobStatus.DONE)
+    d._bridge_cooldown[jobs[0].job_id] = time.time() - 10 * d._egress_defer_cap_s
+    assert d.dispatch_once() is True                 # job 1 errors: job 0 pruned, floor untouched
+    assert jobs[0].job_id not in d._bridge_inspect_errors and d._bridge_inspect_floor == 0
+    store.update(jobs[1].job_id, claimable_after=None)
+    d._bridge_cooldown[jobs[1].job_id] = time.time() + 999   # job 1 stays LIVE
+    store.update(jobs[1].job_id, status=JobStatus.DONE)      # (keep it out of the claim order)
+    assert d.dispatch_once() is True                 # job 2 errors: live job 1 evicted
+    assert d._bridge_inspect_floor == 1
+    assert list(d._bridge_inspect_errors) == [jobs[2].job_id]
+    store.update(jobs[2].job_id, claimable_after=None)
+    d._bridge_cooldown[jobs[2].job_id] = 0.0
+    ok["on"] = True
+    assert d.dispatch_once() is True                 # success empties the map
+    assert d._bridge_inspect_errors == {} and d._bridge_inspect_floor == 0
+
+
+def test_httpproxy_bridge_cooldown_jobs_do_not_starve_newer_work(tmp_path, monkeypatch):
+    """Several bridge= jobs whose inspect keeps failing must not monopolise a single-thread node:
+    while this node cools down from them they are excluded at claim time, so a newer job runs."""
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_BRX", _BRX + "bb-rea-model")
+    store = InMemoryJobStore()
+    stuck = []
+    for _ in range(8):
+        j = _make_job()
+        j.input_sha256 = _INPUT_SHA
+        store.create(j)
+        _setup_job_dirs(tmp_path, j)
+        stuck.append(j)
+    other_eng = EngineSpec(name="plain", image=_ENGINE_IMAGE, worker_argv=["worker", "run"])
+    newer = _make_job(engine="plain")
+    newer.input_sha256 = _INPUT_SHA
+    store.create(newer)
+    _setup_job_dirs(tmp_path, newer)
+
+    def fake_runner(argv, **kw):
+        if argv[:3] == ["docker", "network", "inspect"]:
+            raise subprocess.TimeoutExpired(argv, 10)
+        if argv[:2] == ["docker", "run"] and any(newer.job_id in a for a in argv):
+            _make_valid_output_dir(tmp_path / newer.job_id / "output", engine="plain",
+                                   input_sha256=_INPUT_SHA)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+                     net_policy="brx")
+    d = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng, "plain": other_eng},
+                         subprocess_runner=fake_runner)
+    d._warm_requeue_backoff_s = 0.0
+    for _ in range(len(stuck) + 1):
+        d.dispatch_once()
+        for j in stuck:                               # ignore the store-side shared defer
+            if store.get(j.job_id).status == JobStatus.QUEUED:
+                store.update(j.job_id, claimable_after=None)
+    assert store.get(newer.job_id).status != JobStatus.QUEUED
+    assert all(store.get(j.job_id).status == JobStatus.QUEUED for j in stuck)
 
 
 def test_httpproxy_static_bridge_checks_precede_egress_health_defer(tmp_path, monkeypatch):
