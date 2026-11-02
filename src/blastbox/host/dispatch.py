@@ -678,8 +678,10 @@ class Dispatcher:
         self._egress_shared_defer_s = max(
             1.0, float(os.environ.get("BLASTBOX_EGRESS_SHARED_DEFER_S", "5") or 5))
         self._egress_cooldown: dict[str, float] = {}
-        # Consecutive bridge= inspect errors per job (see BRIDGE_INSPECT_MAX_DEFERS).
+        # Consecutive bridge= inspect errors per job on THIS node, and this node's local cooldown
+        # for each such job (bounded by EGRESS_DEFER_MAX, like the egress-health maps).
         self._bridge_inspect_errors: dict[str, int] = {}
+        self._bridge_cooldown: dict[str, float] = {}
         # ONE implementation, shared with VmJobDispatcher. Two dispatch classes with two
         # copies of "may I run this" is how one of them ends up with no copy at all —
         # which is exactly what happened before this was extracted.
@@ -1636,9 +1638,6 @@ class Dispatcher:
     #: Cap on the per-job egress-defer attempt map, and how many entries one overflow
     #: sheds. Both arbitrary; what matters is that shedding cannot lose escalation.
     EGRESS_DEFER_MAX = 4096
-    # A bridge= inspect that keeps erroring is deferred with doubling backoff this many times on
-    # this node, then the job fails with the docker error rather than spinning silently.
-    BRIDGE_INSPECT_MAX_DEFERS = 6
     EGRESS_DEFER_EVICT = 1024
 
     def _note_grants_refusal(self, job_id: str) -> "tuple[int, float]":
@@ -2677,38 +2676,46 @@ class Dispatcher:
             return
         named_bridge_id: str | None = None
         if named_bridge is not None:
+            # Inside this node's own cooldown for this job after an inspect error: hand it straight
+            # back with the short shared defer, without re-inspecting (a peer may run it now).
+            if (until := self._bridge_cooldown.get(job.job_id)) and time.time() < until:
+                self._requeue_claimed(
+                    job, defer=True, defer_s=self._egress_shared_defer_s,
+                    reason=f"this node is in a bridge-inspect cooldown for another "
+                           f"{until - time.time():.0f}s; releasing to the fleet",
+                )
+                return
             verdict, detail = self._inspect_named_bridge(named_bridge)
             if verdict == "error":
-                # A docker hiccup says nothing about the job: release it to the fleet rather than
-                # fail it -- but count, warn and back off, and fail once it is clearly not a blip,
-                # so a persistent docker problem can't spin the job forever without a trace.
+                # A docker problem on THIS node says nothing about the job, and a peer whose
+                # docker answers may run it: never fail it here. Same shape as the egress-health
+                # gate -- a short constant defer in the shared store, an escalating LOCAL cooldown
+                # so this node stops re-claiming it, and a WARNING on every power-of-two attempt
+                # so a persistent problem is loud. Expiry stays with max_queued_age.
                 with self._egress_defer_lock:
                     n = self._bridge_inspect_errors.get(job.job_id, 0) + 1
                     self._bridge_inspect_errors[job.job_id] = n
                     if len(self._bridge_inspect_errors) > self.EGRESS_DEFER_MAX:
-                        self._bridge_inspect_errors.pop(next(iter(self._bridge_inspect_errors)))
-                if n > self.BRIDGE_INSPECT_MAX_DEFERS:
-                    with self._egress_defer_lock:
-                        self._bridge_inspect_errors.pop(job.job_id, None)
-                    self._fail_job(
-                        job,
-                        f"netpolicy {personality.name!r}: could not inspect bridge="
-                        f"{named_bridge!r} after {n} attempts ({detail}).",
-                    )
-                    return
-                delay = min(self._egress_defer_cap_s, self._egress_shared_defer_s * (2 ** (n - 1)))
-                _log.warning(
-                    "could not inspect bridge %r for netpolicy %r (%s); deferring job %s %.0fs "
-                    "(attempt %d/%d)", named_bridge, personality.name, detail, job.job_id, delay,
-                    n, self.BRIDGE_INSPECT_MAX_DEFERS)
+                        stale = next(iter(self._bridge_inspect_errors))
+                        self._bridge_inspect_errors.pop(stale, None)
+                        self._bridge_cooldown.pop(stale, None)
+                    shared_defer, delay = self._egress_defer_plan(n)
+                    self._bridge_cooldown[job.job_id] = time.time() + delay
+                if n & (n - 1) == 0:
+                    _log.warning(
+                        "could not inspect bridge %r for netpolicy %r (%s): job %s attempt %d on "
+                        "this node; releasing it to the fleet, this node backs off %.0fs. Check "
+                        "`docker network inspect %s` on this node.", named_bridge,
+                        personality.name, detail, job.job_id, n, delay, named_bridge)
                 self._requeue_claimed(
-                    job, defer=True, defer_s=delay,
+                    job, defer=True, defer_s=shared_defer,
                     reason=f"could not inspect bridge {named_bridge!r} ({detail}); releasing "
                            f"netpolicy {personality.name!r} to the fleet",
                 )
                 return
             with self._egress_defer_lock:
                 self._bridge_inspect_errors.pop(job.job_id, None)
+                self._bridge_cooldown.pop(job.job_id, None)
             if verdict != "ok":
                 self._fail_job(
                     job,

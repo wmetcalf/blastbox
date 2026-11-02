@@ -2136,19 +2136,21 @@ def test_httpproxy_ambiguous_bridge_name_fails_job(tmp_path, monkeypatch):
     assert not _ran(launched)
 
 
-def test_httpproxy_bridge_inspect_errors_back_off_then_fail(tmp_path, monkeypatch, caplog):
-    """A docker error that never clears must not spin silently: each defer warns and backs off,
-    and after BRIDGE_INSPECT_MAX_DEFERS the job fails with the docker error."""
-    from blastbox.host.dispatch import Dispatcher
+def test_httpproxy_bridge_inspect_errors_back_off_loudly_never_fail(tmp_path, monkeypatch, caplog):
+    """A docker error on THIS node must not fail a job a peer could run, nor spin silently: the
+    store gets a short constant defer, this node's own cooldown escalates, it skips re-inspecting
+    while cooling down, and it WARNs on every power-of-two attempt."""
     monkeypatch.setenv("BLASTBOX_NETPOLICY_BRX", _BRX + "bb-rea-model")
     store = InMemoryJobStore()
     job = _make_job()
     job.input_sha256 = _INPUT_SHA
     store.create(job)
     _setup_job_dirs(tmp_path, job)
+    inspects = []
 
     def fake_runner(argv, **kw):
         if argv[:3] == ["docker", "network", "inspect"]:
+            inspects.append(argv)
             raise FileNotFoundError("docker")
         return subprocess.CompletedProcess(argv, 0, "", "")
 
@@ -2156,20 +2158,28 @@ def test_httpproxy_bridge_inspect_errors_back_off_then_fail(tmp_path, monkeypatc
                      net_policy="brx")
     dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng},
                                   subprocess_runner=fake_runner)
-    defers = []
+    shared, local = [], []
     with caplog.at_level("WARNING"):
-        for _ in range(Dispatcher.BRIDGE_INSPECT_MAX_DEFERS):
+        for _ in range(8):
             assert dispatcher.dispatch_once() is True
             j = store.get(job.job_id)
             assert j.status == JobStatus.QUEUED
-            defers.append(j.claimable_after - time.time())
-            store.update(job.job_id, claimable_after=None)   # skip the defer window
-    assert sum("could not inspect bridge" in r.getMessage() for r in caplog.records) \
-        == Dispatcher.BRIDGE_INSPECT_MAX_DEFERS
-    assert defers == sorted(defers) and defers[-1] > defers[0]   # backoff grows
-    assert dispatcher.dispatch_once() is True
-    final = store.get(job.job_id)
-    assert final.status == JobStatus.FAILED and "could not inspect" in (final.error or "")
+            shared.append(round(j.claimable_after - time.time()))
+            local.append(dispatcher._bridge_cooldown[job.job_id] - time.time())
+            store.update(job.job_id, claimable_after=None)
+            # Still cooling down locally: re-claimed but NOT re-inspected.
+            n_before = len(inspects)
+            assert dispatcher.dispatch_once() is True
+            assert len(inspects) == n_before
+            store.update(job.job_id, claimable_after=None)
+            dispatcher._bridge_cooldown[job.job_id] = 0.0      # end the local cooldown
+    assert len(inspects) == 8
+    # The store never hears the escalation: its defer stays at the short shared cap.
+    assert max(shared) <= round(dispatcher._egress_shared_defer_s)
+    assert local == sorted(local) and local[-1] > local[0]     # escalating local cooldown
+    warns = [r for r in caplog.records if "could not inspect bridge" in r.getMessage()]
+    assert len(warns) == 4                                     # attempts 1, 2, 4, 8
+    assert store.get(job.job_id).status == JobStatus.QUEUED
 
 
 def test_httpproxy_static_bridge_checks_precede_egress_health_defer(tmp_path, monkeypatch):
