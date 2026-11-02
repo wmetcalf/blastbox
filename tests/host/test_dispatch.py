@@ -2000,61 +2000,135 @@ def test_bridge_on_non_httpproxy_fails_job(tmp_path, monkeypatch):
     assert "bridge=" in (final.error or "") and "httpproxy" in (final.error or "")
 
 
-def _run_bridge_job(tmp_path, monkeypatch, decl, internal):
+_NET_ID = "a" * 64
+_INTERNAL_BRIDGE = f"{_NET_ID} bridge local true"
+
+
+def _run_bridge_job(tmp_path, monkeypatch, decl, inspect=_INTERNAL_BRIDGE, *, dispatches=1,
+                    extra_jobs=0):
+    """Dispatch one bridge= job. ``inspect`` is what ``docker network inspect`` answers: a
+    stdout string (rc 0), a ``(rc, stdout, stderr)`` tuple, or an exception to raise. The fake
+    answers ONLY for the bridge the personality names, so a gate that inspects any other network
+    (e.g. bb-socks) gets an error rather than a free pass."""
     monkeypatch.setenv("BLASTBOX_NETPOLICY_BRX", decl)
+    named = decl.rsplit("bridge=", 1)[-1]
     store = InMemoryJobStore()
     job = _make_job()
     job.input_sha256 = _INPUT_SHA
     store.create(job)
     _setup_job_dirs(tmp_path, job)
-    output_dir = tmp_path / job.job_id / "output"
+    jobs = [job]
+    for _ in range(extra_jobs):
+        extra = _make_job()
+        extra.input_sha256 = _INPUT_SHA
+        store.create(extra)
+        _setup_job_dirs(tmp_path, extra)
+        jobs.append(extra)
     launched: list[list[str]] = []
 
     def fake_runner(argv, **kw):
         launched.append(list(argv))
         if argv[:2] == ["docker", "run"]:
-            _make_valid_output_dir(output_dir, input_sha256=_INPUT_SHA)
+            for j in jobs:
+                if any(j.job_id in a for a in argv):
+                    _make_valid_output_dir(tmp_path / j.job_id / "output",
+                                           input_sha256=_INPUT_SHA)
+        if argv[:3] == ["docker", "network", "inspect"]:
+            if argv[-1] not in (named, _NET_ID):
+                return subprocess.CompletedProcess(argv, 1, "", f"network {argv[-1]} not found")
+            answer = inspect() if callable(inspect) else inspect
+            if isinstance(answer, BaseException):
+                raise answer
+            if isinstance(answer, tuple):
+                return subprocess.CompletedProcess(argv, *answer)
+            return subprocess.CompletedProcess(argv, 0, answer + "\n", "")
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
                      net_policy="brx")
     dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng},
                                   subprocess_runner=fake_runner)
-    dispatcher._bridge_is_internal = lambda name: internal
-    assert dispatcher.dispatch_once() is True
+    for _ in range(dispatches):
+        assert dispatcher.dispatch_once() is True
     return store.get(job.job_id), launched
 
 
 _BRX = "exit=httpproxy,proxy=http://172.30.0.30:8888,bridge="
 
 
+def _ran(launched):
+    return [a for a in launched if a[:2] == ["docker", "run"]]
+
+
 @pytest.mark.parametrize("bad", ["BB-X", "host", "bb-", "../x"])
 def test_httpproxy_invalid_bridge_name_fails_job(tmp_path, monkeypatch, bad):
-    final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + bad, True)
+    final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + bad)
     assert final.status == JobStatus.FAILED and "bridge=" in (final.error or "")
-    assert not any(a[:2] == ["docker", "run"] for a in launched)
+    assert not _ran(launched)
 
 
 @pytest.mark.parametrize("reserved", ["bb-net0", "bb-fakenet", "bb-socks", "bb-vpn", "bb-inspect"])
 def test_httpproxy_reserved_bridge_fails_job(tmp_path, monkeypatch, reserved):
-    final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + reserved, True)
+    final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + reserved)
     assert final.status == JobStatus.FAILED and "bridge=" in (final.error or "")
-    assert not any(a[:2] == ["docker", "run"] for a in launched)
+    assert not _ran(launched)
 
 
-def test_httpproxy_non_internal_bridge_fails_job(tmp_path, monkeypatch):
-    final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + "bb-rea-model", False)
+@pytest.mark.parametrize("answer", [
+    f"{_NET_ID} bridge local false",      # created without --internal
+    f"{_NET_ID} overlay swarm true",      # internal, but an attachable swarm overlay
+    f"{_NET_ID} macvlan local true",      # internal flag on a non-bridge driver
+    "garbage",                            # unparseable answer is not verified
+])
+def test_httpproxy_unverified_bridge_fails_job(tmp_path, monkeypatch, answer):
+    final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + "bb-rea-model", answer)
     assert final.status == JobStatus.FAILED
     assert "--internal" in (final.error or "")
-    assert not any(a[:2] == ["docker", "run"] for a in launched)
+    assert not _ran(launched)
 
 
-def test_httpproxy_internal_bridge_runs_on_named_network(tmp_path, monkeypatch):
-    final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + "bb-rea-model", True)
-    argv = next(a for a in launched if a[:2] == ["docker", "run"])
+def test_httpproxy_missing_bridge_fails_job(tmp_path, monkeypatch):
+    final, launched = _run_bridge_job(
+        tmp_path, monkeypatch, _BRX + "bb-rea-model",
+        (1, "", "Error response from daemon: network bb-rea-model not found"))
+    assert final.status == JobStatus.FAILED and "bb-rea-model" in (final.error or "")
+    assert not _ran(launched)
+
+
+@pytest.mark.parametrize("glitch", [
+    subprocess.TimeoutExpired(["docker"], 10),
+    OSError("docker socket unavailable"),
+    (1, "", "Cannot connect to the Docker daemon"),
+])
+def test_httpproxy_bridge_inspect_glitch_defers_not_fails(tmp_path, monkeypatch, glitch):
+    """A docker hiccup is about the node, not the job: release it to the fleet, don't fail it."""
+    final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + "bb-rea-model", glitch)
+    assert final.status == JobStatus.QUEUED
+    assert final.claimable_after is not None
+    assert not _ran(launched)
+
+
+def test_httpproxy_bridge_verdict_is_not_cached_across_jobs(tmp_path, monkeypatch):
+    """Each dispatch re-inspects: a glitch on job 1 must not stick to job 2 on the same node."""
+    answers = [OSError("blip"), _INTERNAL_BRIDGE]
+    final, launched = _run_bridge_job(
+        tmp_path, monkeypatch, _BRX + "bb-rea-model", lambda: answers.pop(0),
+        extra_jobs=1, dispatches=2)
+    assert final.status == JobStatus.QUEUED          # job 1: deferred on the glitch
+    assert len(_ran(launched)) == 1                  # job 2: re-inspected, verified, ran
+    assert answers == []
+
+
+def test_httpproxy_internal_bridge_runs_pinned_to_inspected_network_id(tmp_path, monkeypatch):
+    """docker run attaches by the ID that was verified, not the name, so a bridge recreated
+    without --internal between the check and the run can't be picked up by name."""
+    final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + "bb-rea-model")
+    argv = _ran(launched)[0]
     i = argv.index("--network")
-    assert argv[i + 1] == "bb-rea-model"
+    assert argv[i + 1] == _NET_ID
     assert "blastbox.net.leakguard=strict" in argv
+    inspected = [a for a in launched if a[:3] == ["docker", "network", "inspect"]]
+    assert inspected and inspected[0][-1] == "bb-rea-model"
 
 
 def test_decrypt_seals_decrypted_and_mixed_when_keylog_present(tmp_path, monkeypatch):

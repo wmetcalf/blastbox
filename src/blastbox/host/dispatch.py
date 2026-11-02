@@ -2649,6 +2649,7 @@ class Dispatcher:
                 f"egress would race netd. Add gateway=<netd gateway IP> to the personality.",
             )
             return
+        named_bridge_id: str | None = None
         if "bridge" in personality.config:
             if personality.exit_driver != "httpproxy":
                 self._fail_job(
@@ -2667,14 +2668,25 @@ class Dispatcher:
                     f"bridge: {', '.join(sorted(RESERVED_BRIDGES))}).",
                 )
                 return
-            if not self._bridge_is_internal(named_bridge):
+            verdict, detail = self._inspect_named_bridge(named_bridge)
+            if verdict == "error":
+                # A docker hiccup says nothing about the job: release it to the fleet, exactly as
+                # the egress-health gate does, rather than fail it terminally.
+                self._requeue_claimed(
+                    job, defer=True, defer_s=self._egress_shared_defer_s,
+                    reason=f"could not inspect bridge {named_bridge!r} ({detail}); releasing "
+                           f"netpolicy {personality.name!r} to the fleet",
+                )
+                return
+            if verdict != "ok":
                 self._fail_job(
                     job,
                     f"netpolicy {personality.name!r}: bridge={named_bridge!r} is not verified "
-                    f"--internal (missing or docker reports external); the bridge must be created "
-                    f"with `docker network create --internal`.",
+                    f"as a local --internal bridge ({detail}); create it with "
+                    f"`docker network create --internal {named_bridge}`.",
                 )
                 return
+            named_bridge_id = detail
         # Egress-hardening knobs (egress_ports / block_internal) are only enforceable on the
         # gateway-routed, netd-gated tiers (tor/openvpn/wireguard): there the worker's OWN netns OUTPUT
         # carries the real destination IP:port (so a port/destination filter is meaningful) AND egress
@@ -2705,6 +2717,10 @@ class Dispatcher:
             )
             return
         network_args = docker_network_args(personality)
+        if named_bridge_id is not None and network_args == ["--network", named_bridge]:
+            # Attach by the network ID just verified, never by name: a bridge recreated without
+            # --internal after the check cannot be picked up by name at `docker run`.
+            network_args = ["--network", named_bridge_id]
 
         # Optional resolv.conf injection for an egress personality (per-personality ``dns=``).
         # On a docker user-defined bridge the worker's only nameserver is docker's embedded
@@ -3211,6 +3227,38 @@ class Dispatcher:
             verdict = False
         cache[network] = (verdict, now)
         return verdict
+
+    def _inspect_named_bridge(self, network: str) -> tuple[str, str]:
+        """Verify an operator-named ``bridge=`` right now (uncached) for this dispatch.
+
+        Returns ``("ok", <network id>)`` only when docker reports a local-scope ``bridge`` driver
+        network with Internal=true; ``("reject", why)`` when docker answered and the network is
+        missing, external, a different driver/scope, or the answer is unparseable; and
+        ``("error", why)`` when docker itself could not answer (timeout, socket error, daemon
+        error), which is a node problem, not a job problem. A verified ID is seeded into the
+        receipt cache: an ID names one immutable network, so its verdict cannot go stale."""
+        try:
+            proc = self._subprocess_runner(
+                ["docker", "network", "inspect", "-f",
+                 "{{.Id}} {{.Driver}} {{.Scope}} {{.Internal}}", network],
+                capture_output=True, text=True, check=False, timeout=10)
+        except Exception as exc:  # noqa: BLE001 - docker unreachable: defer, don't fail
+            return "error", f"docker network inspect failed: {type(exc).__name__}"
+        rc = getattr(proc, "returncode", 1)
+        if rc != 0:
+            err = str(getattr(proc, "stderr", "") or "").strip()
+            if "not found" in err.lower() or "no such network" in err.lower():
+                return "reject", "docker reports no such network"
+            return "error", f"docker network inspect rc={rc}: {err[:120]}"
+        fields = str(getattr(proc, "stdout", "") or "").split()
+        if len(fields) != 4 or not re.fullmatch(r"[0-9a-f]{64}", fields[0]):
+            return "reject", "unparseable docker network inspect answer"
+        net_id, driver, scope, internal = fields
+        if driver != "bridge" or scope != "local" or internal.lower() != "true":
+            return "reject", f"driver={driver} scope={scope} internal={internal}"
+        cache = self.__dict__.setdefault("_bridge_internal_cache", {})
+        cache[net_id] = (True, time.monotonic())
+        return "ok", net_id
 
     def _verified_net_claim(self, personality, network_args: list[str],
                             gateway_health) -> dict:
