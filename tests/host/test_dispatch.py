@@ -2108,6 +2108,101 @@ def test_httpproxy_bridge_inspect_glitch_defers_not_fails(tmp_path, monkeypatch,
     assert not _ran(launched)
 
 
+@pytest.mark.parametrize("answer", [
+    f"{_NET_ID} bridge local true br0",               # reuses a pre-existing host bridge
+    f"{_NET_ID} bridge local true virbr0",
+])
+def test_httpproxy_bridge_on_preexisting_linux_bridge_fails_job(tmp_path, monkeypatch, answer):
+    final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + "bb-rea-model", answer)
+    assert final.status == JobStatus.FAILED and "pre-existing" in (final.error or "")
+    assert not _ran(launched)
+
+
+@pytest.mark.parametrize("answer", [
+    f"{_NET_ID} bridge local true <no value>",        # option unset (docker's template output)
+    f"{_NET_ID} bridge local true br-{_NET_ID[:12]}",  # docker's own per-network bridge
+])
+def test_httpproxy_bridge_default_linux_bridge_runs(tmp_path, monkeypatch, answer):
+    final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + "bb-rea-model", answer)
+    assert len(_ran(launched)) == 1
+
+
+def test_httpproxy_ambiguous_bridge_name_fails_job(tmp_path, monkeypatch):
+    final, launched = _run_bridge_job(
+        tmp_path, monkeypatch, _BRX + "bb-rea-model",
+        (1, "", "Error response from daemon: network bb-rea-model is ambiguous (2 matches found "
+                "based on name)"))
+    assert final.status == JobStatus.FAILED and "ambiguous" in (final.error or "")
+    assert not _ran(launched)
+
+
+def test_httpproxy_bridge_inspect_errors_back_off_then_fail(tmp_path, monkeypatch, caplog):
+    """A docker error that never clears must not spin silently: each defer warns and backs off,
+    and after BRIDGE_INSPECT_MAX_DEFERS the job fails with the docker error."""
+    from blastbox.host.dispatch import Dispatcher
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_BRX", _BRX + "bb-rea-model")
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+
+    def fake_runner(argv, **kw):
+        if argv[:3] == ["docker", "network", "inspect"]:
+            raise FileNotFoundError("docker")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+                     net_policy="brx")
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng},
+                                  subprocess_runner=fake_runner)
+    defers = []
+    with caplog.at_level("WARNING"):
+        for _ in range(Dispatcher.BRIDGE_INSPECT_MAX_DEFERS):
+            assert dispatcher.dispatch_once() is True
+            j = store.get(job.job_id)
+            assert j.status == JobStatus.QUEUED
+            defers.append(j.claimable_after - time.time())
+            store.update(job.job_id, claimable_after=None)   # skip the defer window
+    assert sum("could not inspect bridge" in r.getMessage() for r in caplog.records) \
+        == Dispatcher.BRIDGE_INSPECT_MAX_DEFERS
+    assert defers == sorted(defers) and defers[-1] > defers[0]   # backoff grows
+    assert dispatcher.dispatch_once() is True
+    final = store.get(job.job_id)
+    assert final.status == JobStatus.FAILED and "could not inspect" in (final.error or "")
+
+
+def test_httpproxy_static_bridge_checks_precede_egress_health_defer(tmp_path, monkeypatch):
+    """bridge= on a gateway-routed driver must fail at once, not sit deferred behind an
+    unhealthy-egress gate that would otherwise release it to the fleet forever."""
+    from types import SimpleNamespace
+    monkeypatch.setenv("BLASTBOX_NETPOLICY_VX",
+                       "exit=openvpn,gateway=172.31.0.2,bridge=bb-rea-model")
+    store = InMemoryJobStore()
+    job = _make_job()
+    job.input_sha256 = _INPUT_SHA
+    store.create(job)
+    _setup_job_dirs(tmp_path, job)
+    eng = EngineSpec(name=_ENGINE_NAME, image=_ENGINE_IMAGE, worker_argv=["worker", "run"],
+                     net_policy="vx")
+    dispatcher = _make_dispatcher(store, job_root=tmp_path, engines={_ENGINE_NAME: eng})
+    dispatcher._node_egress_health = lambda: SimpleNamespace(healthy=False, reason="down")
+    assert dispatcher.dispatch_once() is True
+    final = store.get(job.job_id)
+    assert final.status == JobStatus.FAILED and "bridge=" in (final.error or "")
+
+
+def test_httpproxy_bridge_args_mismatch_refuses_unpinned_run(tmp_path, monkeypatch):
+    """If docker_network_args ever disagrees with the verified bridge, refuse -- never fall back
+    to attaching by name."""
+    import blastbox.host.netapply as netapply
+    monkeypatch.setattr(netapply, "docker_network_args",
+                        lambda p: ["--network", "bb-rea-model", "--network-alias", "x"])
+    final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + "bb-rea-model")
+    assert final.status == JobStatus.FAILED and "unpinned" in (final.error or "")
+    assert not _ran(launched)
+
+
 def test_httpproxy_bridge_verdict_is_not_cached_across_jobs(tmp_path, monkeypatch):
     """Each dispatch re-inspects: a glitch on job 1 must not stick to job 2 on the same node."""
     answers = [OSError("blip"), _INTERNAL_BRIDGE]

@@ -678,6 +678,8 @@ class Dispatcher:
         self._egress_shared_defer_s = max(
             1.0, float(os.environ.get("BLASTBOX_EGRESS_SHARED_DEFER_S", "5") or 5))
         self._egress_cooldown: dict[str, float] = {}
+        # Consecutive bridge= inspect errors per job (see BRIDGE_INSPECT_MAX_DEFERS).
+        self._bridge_inspect_errors: dict[str, int] = {}
         # ONE implementation, shared with VmJobDispatcher. Two dispatch classes with two
         # copies of "may I run this" is how one of them ends up with no copy at all —
         # which is exactly what happened before this was extracted.
@@ -1634,6 +1636,9 @@ class Dispatcher:
     #: Cap on the per-job egress-defer attempt map, and how many entries one overflow
     #: sheds. Both arbitrary; what matters is that shedding cannot lose escalation.
     EGRESS_DEFER_MAX = 4096
+    # A bridge= inspect that keeps erroring is deferred with doubling backoff this many times on
+    # this node, then the job fails with the docker error rather than spinning silently.
+    BRIDGE_INSPECT_MAX_DEFERS = 6
     EGRESS_DEFER_EVICT = 1024
 
     def _note_grants_refusal(self, job_id: str) -> "tuple[int, float]":
@@ -2551,6 +2556,27 @@ class Dispatcher:
                 f"(direct / inetsim / httpproxy).",
             )
             return
+        # Static bridge= checks run before any gate that can DEFER the job (egress health), so an
+        # invalid declaration fails at once instead of sitting queued through an outage.
+        named_bridge: str | None = None
+        if "bridge" in personality.config:
+            if personality.exit_driver != "httpproxy":
+                self._fail_job(
+                    job,
+                    f"netpolicy {personality.name!r} (exit={personality.exit_driver}) declares "
+                    f"bridge=, which is only valid for exit=httpproxy (it names the internal bridge "
+                    f"the proxy sidecar shares). Remove bridge= or use httpproxy.",
+                )
+                return
+            named_bridge = personality.config["bridge"]
+            if not BRIDGE_NAME_RE.fullmatch(named_bridge) or named_bridge in RESERVED_BRIDGES:
+                self._fail_job(
+                    job,
+                    f"netpolicy {personality.name!r}: bridge={named_bridge[:80]!r} is not a valid "
+                    f"bridge name (must match {BRIDGE_NAME_RE.pattern} and not be a blastbox-managed "
+                    f"bridge: {', '.join(sorted(RESERVED_BRIDGES))}).",
+                )
+                return
         # A gateway-routed tier cannot work at all if this node's own exit is down — the
         # worker would sit waiting for a route into a sidecar that is gone, and fail closed
         # on its gateway barrier. That is the right outcome for the SAMPLE but the wrong one
@@ -2650,34 +2676,39 @@ class Dispatcher:
             )
             return
         named_bridge_id: str | None = None
-        if "bridge" in personality.config:
-            if personality.exit_driver != "httpproxy":
-                self._fail_job(
-                    job,
-                    f"netpolicy {personality.name!r} (exit={personality.exit_driver}) declares "
-                    f"bridge=, which is only valid for exit=httpproxy (it names the internal bridge "
-                    f"the proxy sidecar shares). Remove bridge= or use httpproxy.",
-                )
-                return
-            named_bridge = personality.config["bridge"]
-            if not BRIDGE_NAME_RE.fullmatch(named_bridge) or named_bridge in RESERVED_BRIDGES:
-                self._fail_job(
-                    job,
-                    f"netpolicy {personality.name!r}: bridge={named_bridge[:80]!r} is not a valid "
-                    f"bridge name (must match {BRIDGE_NAME_RE.pattern} and not be a blastbox-managed "
-                    f"bridge: {', '.join(sorted(RESERVED_BRIDGES))}).",
-                )
-                return
+        if named_bridge is not None:
             verdict, detail = self._inspect_named_bridge(named_bridge)
             if verdict == "error":
-                # A docker hiccup says nothing about the job: release it to the fleet, exactly as
-                # the egress-health gate does, rather than fail it terminally.
+                # A docker hiccup says nothing about the job: release it to the fleet rather than
+                # fail it -- but count, warn and back off, and fail once it is clearly not a blip,
+                # so a persistent docker problem can't spin the job forever without a trace.
+                with self._egress_defer_lock:
+                    n = self._bridge_inspect_errors.get(job.job_id, 0) + 1
+                    self._bridge_inspect_errors[job.job_id] = n
+                    if len(self._bridge_inspect_errors) > self.EGRESS_DEFER_MAX:
+                        self._bridge_inspect_errors.pop(next(iter(self._bridge_inspect_errors)))
+                if n > self.BRIDGE_INSPECT_MAX_DEFERS:
+                    with self._egress_defer_lock:
+                        self._bridge_inspect_errors.pop(job.job_id, None)
+                    self._fail_job(
+                        job,
+                        f"netpolicy {personality.name!r}: could not inspect bridge="
+                        f"{named_bridge!r} after {n} attempts ({detail}).",
+                    )
+                    return
+                delay = min(self._egress_defer_cap_s, self._egress_shared_defer_s * (2 ** (n - 1)))
+                _log.warning(
+                    "could not inspect bridge %r for netpolicy %r (%s); deferring job %s %.0fs "
+                    "(attempt %d/%d)", named_bridge, personality.name, detail, job.job_id, delay,
+                    n, self.BRIDGE_INSPECT_MAX_DEFERS)
                 self._requeue_claimed(
-                    job, defer=True, defer_s=self._egress_shared_defer_s,
+                    job, defer=True, defer_s=delay,
                     reason=f"could not inspect bridge {named_bridge!r} ({detail}); releasing "
                            f"netpolicy {personality.name!r} to the fleet",
                 )
                 return
+            with self._egress_defer_lock:
+                self._bridge_inspect_errors.pop(job.job_id, None)
             if verdict != "ok":
                 self._fail_job(
                     job,
@@ -2717,9 +2748,17 @@ class Dispatcher:
             )
             return
         network_args = docker_network_args(personality)
-        if named_bridge_id is not None and network_args == ["--network", named_bridge]:
+        if named_bridge_id is not None:
             # Attach by the network ID just verified, never by name: a bridge recreated without
-            # --internal after the check cannot be picked up by name at `docker run`.
+            # --internal after the check cannot be picked up by name at `docker run`. Any other
+            # shape means the args and the verification disagree -- refuse rather than run.
+            if network_args != ["--network", named_bridge]:
+                self._fail_job(
+                    job,
+                    f"netpolicy {personality.name!r}: network args {network_args!r} do not match "
+                    f"the verified bridge={named_bridge!r}; refusing to run unpinned.",
+                )
+                return
             network_args = ["--network", named_bridge_id]
 
         # Optional resolv.conf injection for an egress personality (per-personality ``dns=``).
@@ -3232,30 +3271,42 @@ class Dispatcher:
         """Verify an operator-named ``bridge=`` right now (uncached) for this dispatch.
 
         Returns ``("ok", <network id>)`` only when docker reports a local-scope ``bridge`` driver
-        network with Internal=true; ``("reject", why)`` when docker answered and the network is
-        missing, external, a different driver/scope, or the answer is unparseable; and
+        network with Internal=true on docker's own per-network Linux bridge; ``("reject", why)``
+        when docker answered and the network is missing, ambiguous, external, a different
+        driver/scope, rides a pre-existing host bridge, or the answer is unparseable; and
         ``("error", why)`` when docker itself could not answer (timeout, socket error, daemon
         error), which is a node problem, not a job problem. A verified ID is seeded into the
         receipt cache: an ID names one immutable network, so its verdict cannot go stale."""
         try:
             proc = self._subprocess_runner(
                 ["docker", "network", "inspect", "-f",
-                 "{{.Id}} {{.Driver}} {{.Scope}} {{.Internal}}", network],
+                 "{{.Id}} {{.Driver}} {{.Scope}} {{.Internal}} "
+                 '{{index .Options "com.docker.network.bridge.name"}}', network],
                 capture_output=True, text=True, check=False, timeout=10)
         except Exception as exc:  # noqa: BLE001 - docker unreachable: defer, don't fail
             return "error", f"docker network inspect failed: {type(exc).__name__}"
         rc = getattr(proc, "returncode", 1)
         if rc != 0:
             err = str(getattr(proc, "stderr", "") or "").strip()
-            if "not found" in err.lower() or "no such network" in err.lower():
+            low = err.lower()
+            if "not found" in low or "no such network" in low:
                 return "reject", "docker reports no such network"
+            if "ambiguous" in low or "matches found" in low:
+                return "reject", "docker reports the name is ambiguous (duplicate networks)"
             return "error", f"docker network inspect rc={rc}: {err[:120]}"
-        fields = str(getattr(proc, "stdout", "") or "").split()
-        if len(fields) != 4 or not re.fullmatch(r"[0-9a-f]{64}", fields[0]):
+        # An unset Options key renders as "<no value>": normalise it away before splitting.
+        fields = str(getattr(proc, "stdout", "") or "").replace("<no value>", "").split()
+        if len(fields) == 4:
+            fields.append("")              # no bridge.name option: docker names it br-<id12>
+        if len(fields) != 5 or not re.fullmatch(r"[0-9a-f]{64}", fields[0]):
             return "reject", "unparseable docker network inspect answer"
-        net_id, driver, scope, internal = fields
+        net_id, driver, scope, internal, linux_bridge = fields
         if driver != "bridge" or scope != "local" or internal.lower() != "true":
             return "reject", f"driver={driver} scope={scope} internal={internal}"
+        # `-o com.docker.network.bridge.name=br0` makes docker REUSE an existing host bridge, which
+        # may carry other hosts/VMs on its L2 segment; only docker's own per-network bridge is OK.
+        if linux_bridge not in ("", f"br-{net_id[:12]}"):
+            return "reject", f"network rides a pre-existing Linux bridge {linux_bridge[:32]!r}"
         cache = self.__dict__.setdefault("_bridge_internal_cache", {})
         cache[net_id] = (True, time.monotonic())
         return "ok", net_id
