@@ -15,7 +15,9 @@ dir in ``BLASTBOX_WORK_DIR``:
 5. the model loop: the model sees only allowlisted tools (``policy.py``); each call is checked by
    ``policy.check_call`` (a refusal never reaches MCP and is returned as a tool error), and each
    result is framed as untrusted evidence by ``prompts.Framer``;
-6. the final JSON answer (``response_format=json_object``) is parsed defensively. Function claims
+6. the final JSON answer (``response_format`` json_schema, bounded by ``prompts.final_schema``,
+   reasoning off unless ``REA_FINAL_THINKING``) is parsed defensively; a cut-off answer keeps its
+   complete rows (``salvage_json_prefix``), an unusable one is asked for once more. Function claims
    are kept only for citable addresses (``_Evidence``, Ruling S); a proposed IOC is ``verified``
    only when its value occurs in the sample's own bytes (``verify_iocs_in_sample``, Ruling R);
 7. the next continuation (same project, updated ``State``) and a capped JSONL transcript are
@@ -60,13 +62,14 @@ from blastbox.engines.rea.continuation import ContinuationError, GhidraStatus, S
 from blastbox.engines.rea.mcp_client import McpError, McpStdioClient
 from blastbox.engines.rea.model import ModelClient, ModelError
 from blastbox.engines.rea.policy import ADDRESS_RE, TOOL_ALLOWLIST, CallRefused, check_call, model_tool_specs, safe_name
-from blastbox.engines.rea.prompts import IOC_TYPES, Framer
+from blastbox.engines.rea.prompts import IOC_TYPES, Framer, final_response_format
 from blastbox.engines.rea.runner import rea_env, run_ghidra_analysis
 from blastbox.engines.rea.sweep import _env_seconds, _sha256, _string_leaves
 from blastbox.limits import Limits
 from blastbox.worker.engine import DetonationResult
 
-__all__ = ["TOOL_ALLOWLIST", "FinalAnswer", "ReaAgentEngine", "TranscriptWriter", "parse_final"]
+__all__ = ["TOOL_ALLOWLIST", "FinalAnswer", "ReaAgentEngine", "TranscriptWriter", "parse_final",
+           "salvage_json_prefix"]
 
 _log = logging.getLogger("blastbox.engines.rea.agent")
 
@@ -109,6 +112,10 @@ MAX_TODO = 256
 MAX_EXPLORED = 4096
 SEED_TODO = 32
 MAX_FINAL_CHARS = 1024 * 1024
+MAX_SALVAGE_CHARS = 256 * 1024
+MAX_SALVAGE_DEPTH = 64
+MAX_SALVAGE_TRIES = 64
+MIN_RETRY_TOKENS = 512  # a final-answer retry shorter than this cannot hold a useful answer
 
 _MAIN_NAMES = ("main", "wmain", "_main", "WinMain", "wWinMain", "DllMain", "DllEntryPoint", "_start",
                "start", "entry")
@@ -330,6 +337,69 @@ def parse_final(text: object) -> FinalAnswer | None:
     return ans
 
 
+_CLOSERS = {"{": "}", "[": "]"}
+
+
+def salvage_json_prefix(text: object) -> str | None:
+    """A cut-off JSON object closed right after its last complete value, or None.
+
+    For a final answer that hit the token limit mid-way (live 2026-11-03: cut inside the 22nd
+    function). Candidate cut points are the ends of complete strings, arrays and objects, the
+    position before each comma and right after each ``[``; from the last one backwards (at most
+    ``MAX_SALVAGE_TRIES``) the prefix plus the closers of the open containers is parsed, and the
+    first that parses as an object wins. A cut-off value (string, number, row) is dropped whole.
+    """
+    if not isinstance(text, str) or len(text) > MAX_SALVAGE_CHARS:
+        return None
+    s = text.strip()
+    if s.startswith("```"):
+        s = s.lstrip("`")
+        if s[:4].lower() == "json":
+            s = s[4:]
+        s = s.lstrip()
+    if not s.startswith("{"):
+        return None
+    stack: list[str] = []
+    cuts: list[tuple[int, str]] = []
+
+    def closers() -> str:
+        return "".join(_CLOSERS[c] for c in reversed(stack))
+
+    in_str = esc = False
+    for i, ch in enumerate(s):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+                cuts.append((i + 1, closers()))
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append(ch)
+            if len(stack) > MAX_SALVAGE_DEPTH:
+                return None
+            if ch == "[":
+                cuts.append((i + 1, closers()))
+        elif ch in "}]":
+            if not stack or _CLOSERS[stack[-1]] != ch:
+                return None
+            stack.pop()
+            if not stack:
+                return s[:i + 1]
+            cuts.append((i + 1, closers()))
+        elif ch == ",":
+            cuts.append((i, closers()))
+    for end, close in reversed(cuts[-MAX_SALVAGE_TRIES:]):
+        cand = s[:end] + close
+        if isinstance(_parse_json(cand), dict):
+            return cand
+    return None
+
+
 # ---------------------------------------------------------------- per-pass evidence
 
 
@@ -471,6 +541,8 @@ class _Pass:
     final_reserve_s: float = 0.0
     wall_s: float = 0.0
     turn_tokens: int = DEFAULT_TURN_MAX_TOKENS
+    tokens_per_s: float = DEFAULT_TOKENS_PER_S
+    final_thinking: bool = False  # REA_FINAL_THINKING: keep the model's reasoning on for the final answer
     good_turns: int = 0  # model responses that parsed (with or without tool calls)
     accepted: bool = False  # _accept finished: functions/iocs/summary are one consistent answer
     warnings: list[Warning] = field(default_factory=list)
@@ -536,7 +608,9 @@ class ReaAgentEngine:
         p = _Pass(pass_no=state.pass_no + 1, model_id=model_id, summary=state.summary,
                   todo=list(state.todo), explored=list(state.explored),
                   final_reserve_s=final_reserve(wall, max_tokens, tokens_per_s), wall_s=wall,
-                  turn_tokens=turn_tokens)
+                  turn_tokens=turn_tokens, tokens_per_s=tokens_per_s,
+                  final_thinking=os.environ.get("REA_FINAL_THINKING", "").strip().lower()
+                  in ("1", "true", "yes", "on"))
         transcript_path = outdir / "transcript.jsonl"
         tw = TranscriptWriter(transcript_path, min(MAX_TRANSCRIPT_BYTES, limits.max_artifact_bytes), self._clock)
         tw.write({"event": "start", "pass_no": p.pass_no, "model": model_id, "wall_budget_s": round(wall, 1),
@@ -854,6 +928,7 @@ class ReaAgentEngine:
             p.good_turns += 1
             content, calls = parsed
             tw.write({"event": "model_turn", "step": p.steps, "content": (content or "")[:TRANSCRIPT_TEXT],
+                      **_response_info(resp),
                       "tool_calls": [{"id": c["id"], "name": c["name"], "arguments": c["raw"][:2048]}
                                      for c in calls]})
             if not calls:
@@ -919,20 +994,57 @@ class ReaAgentEngine:
                 return
             messages.append(framer.final_request())
             _compact_context(messages, framer)
-            try:
-                resp = self._chat(model, p, tw, final_left, messages, [], max_tokens,
-                                  response_format={"type": "json_object"})
-            except ModelError as exc:
-                self._final_failed(p, tw, exc.kind, str(exc))
-                return
-            final_parsed = _parse_message(resp)
-            final_content = final_parsed[0] if final_parsed is not None else None
-            tw.write({"event": "final_turn", "content": (final_content or "")[:TRANSCRIPT_TEXT]})
-            answer = parse_final(final_content)
+            answer = self._final_answer(model, p, tw, final_left, messages, framer, max_tokens)
             if answer is None:
-                self._final_failed(p, tw, "malformed", "final answer is not the required JSON object")
                 return
         self._accept(answer, ev, explored_now, p, tw, sample, remaining, self._clock)
+
+    def _final_answer(self, model: Any, p: _Pass, tw: TranscriptWriter, final_left: Callable[[], float],
+                      messages: list[dict[str, Any]], framer: Framer, max_tokens: int) -> FinalAnswer | None:
+        """The final answer: schema-constrained, reasoning off (unless ``REA_FINAL_THINKING``).
+
+        An answer that does not parse is salvaged (a cut-off object keeps its complete findings,
+        ``done`` forced false); one with nothing to salvage is asked for once more, shorter, when
+        the time left still holds ``MIN_RETRY_TOKENS`` at ``tokens_per_s``. None = pass sealed.
+        """
+        kw: dict[str, Any] = {"response_format": final_response_format()}
+        if not p.final_thinking:
+            kw["chat_template_kwargs"] = {"thinking": False}
+        tokens = max_tokens
+        for attempt in range(2):
+            try:
+                resp = self._chat(model, p, tw, final_left, messages, [], tokens, **kw)
+            except ModelError as exc:
+                self._final_failed(p, tw, exc.kind, str(exc))
+                return None
+            parsed = _parse_message(resp)
+            content = parsed[0] if parsed is not None else None
+            info = _response_info(resp)
+            tw.write({"event": "final_turn", "attempt": attempt + 1, "content": (content or "")[:TRANSCRIPT_TEXT],
+                      **info})
+            answer = parse_final(content)
+            if answer is not None:
+                return answer
+            salvaged = parse_final(salvage_json_prefix(content))
+            if salvaged is not None and (salvaged.summary or salvaged.functions or salvaged.iocs):
+                salvaged.done = False
+                p.warnings.append(Warning(
+                    code="model_final_salvaged",
+                    message=f"final answer was cut off (finish_reason={info['finish_reason']}); kept its "
+                            f"{len(salvaged.functions)} complete function(s) and {len(salvaged.iocs)} IOC(s)"))
+                tw.write({"event": "final_salvaged", "functions": len(salvaged.functions),
+                          "iocs": len(salvaged.iocs)})
+                return salvaged
+            tokens = min(max_tokens, int(max(0.0, final_left() - MIN_TURN_S) * p.tokens_per_s / 1.25))
+            if attempt or tokens < MIN_RETRY_TOKENS:
+                break
+            p.warnings.append(Warning(code="model_final_retry",
+                                      message=f"final answer unusable (finish_reason={info['finish_reason']}); "
+                                              f"asking once more with {tokens} tokens"))
+            tw.write({"event": "final_retry", "max_tokens": tokens})
+            messages[-1] = framer.final_retry()
+        self._final_failed(p, tw, "malformed", "final answer is not the required JSON object")
+        return None
 
     @staticmethod
     def _chat(model: Any, p: _Pass, tw: TranscriptWriter, budget: Callable[[], float],
@@ -1108,6 +1220,20 @@ def _retryable(message: str) -> bool:
         return True
     code = int(m.group(1))
     return not 400 <= code < 500 or code in (408, 429)
+
+
+def _response_info(resp: Any) -> dict[str, Any]:
+    """``finish_reason`` and ``completion_tokens`` of a response for the transcript (None if absent)."""
+    finish = tokens = None
+    if isinstance(resp, dict):
+        choices = resp.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            fr = choices[0].get("finish_reason")
+            finish = fr[:32] if isinstance(fr, str) else None
+        usage = resp.get("usage")
+        if isinstance(usage, dict) and isinstance(usage.get("completion_tokens"), int):
+            tokens = usage["completion_tokens"]
+    return {"finish_reason": finish, "completion_tokens": tokens}
 
 
 def _parse_message(resp: Any) -> tuple[str | None, list[dict[str, Any]]] | None:

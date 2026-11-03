@@ -138,10 +138,11 @@ class FakeModel:
         self.ctor = (url, model, timeout_s)
         return self
 
-    def chat(self, messages, tools, max_tokens, *, response_format=None, timeout_s=None):
+    def chat(self, messages, tools, max_tokens, *, response_format=None, timeout_s=None,
+             chat_template_kwargs=None):
         self.calls.append({"messages": copy.deepcopy(messages), "tools": copy.deepcopy(tools),
                            "max_tokens": max_tokens, "response_format": response_format,
-                           "timeout_s": timeout_s})
+                           "timeout_s": timeout_s, "chat_template_kwargs": chat_template_kwargs})
         if self.on_chat:
             self.on_chat()
         if not self.script:
@@ -506,7 +507,7 @@ def test_happy_path(tmp_path, monkeypatch):
     assert "thinking..." not in json.dumps(model.calls[-1]["messages"])
     offered = {t["function"]["name"] for t in model.calls[0]["tools"]}
     assert offered <= policy.TOOL_ALLOWLIST and "annotate_native_function" not in offered
-    assert model.calls[-1]["response_format"] == {"type": "json_object"}
+    assert model.calls[-1]["response_format"]["type"] == "json_schema"
     assert model.ctor[:2] == ("http://model.invalid:8888/v1", "deepseek-v4-flash")
 
     st = next_state(out)
@@ -697,7 +698,7 @@ def test_max_steps_bounds_the_loop(tmp_path, monkeypatch):
     res, _ = run(tmp_path, cont, model, McpRig(tmp_path))
     f = res.payload.fields
     assert f["steps"] == 2 and f["model_status"] == "ok" and f["summary"] == "s2"
-    assert model.calls[-1]["response_format"] == {"type": "json_object"}
+    assert model.calls[-1]["response_format"]["type"] == "json_schema"
 
 
 def test_no_project_runs_ghidra_first(tmp_path):
@@ -855,7 +856,7 @@ def test_model_timeout_after_tool_work_still_asks_for_the_final_answer(tmp_path)
     f = res.payload.fields
     assert f["model_status"] == "ok" and f["summary"] == "salvaged"
     assert cols(res.payload, "functions")["address"] == ["0x140001420"]
-    assert model.calls[-1]["response_format"] == {"type": "json_object"}
+    assert model.calls[-1]["response_format"]["type"] == "json_schema"
     assert any(w.code == "model_turn_failed" for w in res.warnings)
 
 
@@ -893,7 +894,9 @@ def _final(**kw):
 
 def test_malformed_after_a_good_turn_is_budget(tmp_path):
     cont = make_continuation(tmp_path, summary="prior summary")
-    model = FakeModel([tc(("binary_overview", {}, "a")), {"choices": []}, answer("still not json {")])
+    # the unusable final answer is retried once, then the pass seals budget
+    model = FakeModel([tc(("binary_overview", {}, "a")), {"choices": []}, answer("still not json {"),
+                       answer("still not json {")])
     res, out = run(tmp_path, cont, model, McpRig(tmp_path))
     f = res.payload.fields
     assert f["model_status"] == "budget" and f["more_pending"] is True and f["summary"] == "prior summary"
@@ -903,7 +906,8 @@ def test_malformed_after_a_good_turn_is_budget(tmp_path):
                                    answer("not json"), answer(json.dumps([1]))])
 def test_final_failure_after_good_turns_is_budget(tmp_path, final):
     cont = make_continuation(tmp_path, todo=["0x140001420", "0x140001500"], summary="prior summary")
-    retry = [final] if isinstance(final, ModelError) and final.kind == "unavailable" else []
+    # an unavailable final is retried by _chat, an unusable answer by the final-answer retry
+    retry = [final] if not isinstance(final, ModelError) or final.kind == "unavailable" else []
     model = FakeModel([answer("prose, no tools"), final, *retry])
     res, _ = run(tmp_path, cont, model, McpRig(tmp_path))
     f = res.payload.fields
@@ -1238,7 +1242,7 @@ def test_tool_turns_use_a_small_token_budget_and_the_final_answer_a_larger_one(t
     res, _ = run(tmp_path, cont, model, McpRig(tmp_path))
     assert res.payload.fields["model_status"] == "ok"
     assert model.calls[0]["max_tokens"] == ag.DEFAULT_TURN_MAX_TOKENS == 2048
-    assert model.calls[-1]["response_format"] == {"type": "json_object"}
+    assert model.calls[-1]["response_format"]["type"] == "json_schema"
     assert model.calls[-1]["max_tokens"] == ag.DEFAULT_MAX_TOKENS > 2048
 
 
@@ -1346,14 +1350,14 @@ def test_final_answer_is_forced_at_the_reserve_and_partial_findings_land(tmp_pat
         "iocs": [], "todo": [], "done": False}
 
     class M(FakeModel):
-        def chat(self, messages, tools, max_tokens, *, response_format=None, timeout_s=None):
+        def chat(self, messages, tools, max_tokens, *, response_format=None, timeout_s=None, **kw):
             now[0] += 100.0
             if response_format is not None:
                 self.calls.append({"messages": messages, "max_tokens": max_tokens,
                                    "response_format": response_format, "timeout_s": timeout_s})
                 return answer(finals)
             return super().chat(messages, tools, max_tokens, response_format=response_format,
-                                timeout_s=timeout_s)
+                                timeout_s=timeout_s, **kw)
 
     model = M(script)
     res, _ = run(tmp_path, cont, model, rig, clock=lambda: now[0])
@@ -1361,7 +1365,7 @@ def test_final_answer_is_forced_at_the_reserve_and_partial_findings_land(tmp_pat
     assert f["model_status"] == "ok" and f["summary"] == "partial"
     assert cols(res.payload, "functions")["address"] == ["0x140001420"]
     final = model.calls[-1]
-    assert final["response_format"] == {"type": "json_object"}
+    assert final["response_format"]["type"] == "json_schema"
     assert final["timeout_s"] >= ag.final_reserve(540) - 100 - 1
 
 
@@ -1379,7 +1383,7 @@ def test_slow_first_turn_at_zero_steps_falls_back_to_the_final_reserve(tmp_path)
     res, _ = run(tmp_path, cont, model, McpRig(tmp_path), clock=lambda: now[0])
     f = res.payload.fields
     assert f["model_status"] == "ok" and f["summary"] == "from the reserve"
-    assert model.calls[-1]["response_format"] == {"type": "json_object"}
+    assert model.calls[-1]["response_format"]["type"] == "json_schema"
 
 
 def test_slow_final_answer_leaves_time_for_ioc_verification(tmp_path, monkeypatch):
@@ -1389,8 +1393,9 @@ def test_slow_final_answer_leaves_time_for_ioc_verification(tmp_path, monkeypatc
     final = _final(iocs=[{"type": "url", "value": "http://evil.example/a.php", "source": "t1"}])
 
     class M(FakeModel):
-        def chat(self, messages, tools, max_tokens, *, response_format=None, timeout_s=None):
-            out = super().chat(messages, tools, max_tokens, response_format=response_format, timeout_s=timeout_s)
+        def chat(self, messages, tools, max_tokens, *, response_format=None, timeout_s=None, **kw):
+            out = super().chat(messages, tools, max_tokens, response_format=response_format, timeout_s=timeout_s,
+                               **kw)
             if response_format is not None:
                 now[0] += timeout_s  # the final answer uses its whole timeout
             return out
@@ -1412,3 +1417,153 @@ def test_http_4xx_is_not_retried_except_408_and_429(tmp_path, code, retried):
     assert any(w.code == "model_retry" for w in res.warnings) is retried
     if retried:
         assert res.payload.fields["summary"] == "second"
+
+
+# ------------------------------------------------------------------ G2: a final answer that lands
+
+# The live 2026-11-03 benign_pe.exe pass: the final answer (4096 max tokens, thinking on) took 143 s
+# and came back cut off inside the 22nd function, so the whole pass sealed budget with 0 findings.
+LIVE_TRUNCATED = (
+    '{\n  "summary": "benign_pe.exe is a 64-bit MinGW console executable.",\n  "functions": [\n'
+    '    {"address": "0x140001420", "name": "entry", "claim": "CRT entry.", "evidence": ["t1"]},\n'
+    '    {"address": "0x140001500", "name": "FUN_140001500", "claim": "Helper.", "evidence": ["t1"]},\n'
+    '    {"address": "0x140001ca0", "name": "__mingw_raise_matherr", "claim": "Invokes the user math error'
+    ' handler if')
+
+
+def _final_kw(model):
+    """kwargs of the final-answer request (the last chat call with a response_format)."""
+    return [c for c in model.calls if c["response_format"] is not None][-1]
+
+
+def test_final_request_is_schema_constrained_and_bounded(tmp_path):
+    cont = make_continuation(tmp_path)
+    model = FakeModel([answer("prose, no tools"), _final()])
+    run(tmp_path, cont, model, McpRig(tmp_path))
+    rf = _final_kw(model)["response_format"]
+    assert rf["type"] == "json_schema"
+    schema = rf["json_schema"]["schema"]
+    assert schema == prompts.final_schema()
+    props = schema["properties"]
+    assert set(schema["required"]) == {"summary", "functions", "iocs", "todo", "done"}
+    assert props["functions"]["maxItems"] == prompts.FINAL_FUNCTIONS
+    assert props["functions"]["items"]["properties"]["claim"]["maxLength"] == prompts.FINAL_CLAIM
+    assert props["summary"]["maxLength"] == prompts.FINAL_SUMMARY
+    assert props["iocs"]["items"]["properties"]["type"]["enum"] == list(prompts.IOC_TYPES)
+
+
+def test_final_schema_worst_case_fits_the_final_token_budget():
+    # ~4 chars/token for the bounded strings, plus ~12 tokens of syntax per row.
+    p = prompts
+    fn = 18 + p.FINAL_NAME // 4 + p.FINAL_CLAIM // 4 + 6 * 4 + 12
+    ioc = 4 + p.FINAL_IOC_VALUE // 4 + p.FINAL_SOURCE // 4 + 12
+    worst = p.FINAL_SUMMARY // 4 + p.FINAL_FUNCTIONS * fn + p.FINAL_IOCS * ioc + p.FINAL_TODO * 8 + 32
+    assert worst <= ag.DEFAULT_MAX_TOKENS * 1.25  # typical answers are far below the worst case
+
+
+def test_final_request_turns_thinking_off_but_tool_turns_keep_it(tmp_path, monkeypatch):
+    monkeypatch.setenv("REA_MAX_STEPS", "1")
+    cont = make_continuation(tmp_path)
+    model = FakeModel([tc(("binary_overview", {}, "a")), _final()])
+    run(tmp_path, cont, model, McpRig(tmp_path))
+    assert model.calls[0]["chat_template_kwargs"] is None
+    assert _final_kw(model)["chat_template_kwargs"] == {"thinking": False}
+
+
+def test_final_thinking_can_be_turned_back_on(tmp_path, monkeypatch):
+    monkeypatch.setenv("REA_FINAL_THINKING", "1")
+    cont = make_continuation(tmp_path)
+    model = FakeModel([answer("prose, no tools"), _final()])
+    run(tmp_path, cont, model, McpRig(tmp_path))
+    assert _final_kw(model)["chat_template_kwargs"] is None
+
+
+def test_model_client_sends_chat_template_kwargs():
+    op = FakeOpener(json.dumps({"choices": [{"message": {"content": "{}"}}]}).encode())
+    m = ModelClient("http://m:1/v1", "x", 30, opener=op)
+    m.chat([{"role": "user", "content": "q"}], [], 16, chat_template_kwargs={"thinking": False})
+    assert json.loads(op.requests[0].data)["chat_template_kwargs"] == {"thinking": False}
+    m.chat([{"role": "user", "content": "q"}], [], 16)
+    assert "chat_template_kwargs" not in json.loads(op.requests[1].data)
+
+
+@pytest.mark.parametrize("text,expect", [
+    ('{"a": [1, 2', {"a": [1]}),  # a number cut at the end may be a prefix: dropped
+    ('{"a": [{"x": 1}, {"x": 2}, {"x"', {"a": [{"x": 1}, {"x": 2}]}),
+    ('{"s": "done", "f": [{"c": "cut off mid str', {"s": "done", "f": []}),
+    ('{"s": "a \\" quote", "t": [', {"s": 'a " quote', "t": []}),
+    ('{"s": "x"}', {"s": "x"}),
+])
+def test_salvage_json_prefix_closes_a_cut_off_object(text, expect):
+    assert json.loads(ag.salvage_json_prefix(text)) == expect
+
+
+@pytest.mark.parametrize("text", ["", "not json", "[1, 2", '{"unterminated', "{" * 5000],
+                         ids=["empty", "prose", "list", "unterminated", "deep"])
+def test_salvage_json_prefix_gives_up_on_non_objects(text):
+    out = ag.salvage_json_prefix(text)
+    assert out is None or not isinstance(json.loads(out), dict) or json.loads(out) == {}
+
+
+def test_cut_off_final_answer_keeps_its_complete_findings(tmp_path):
+    cont = make_continuation(tmp_path, todo=["0x140001420", "0x140001500"])
+    cut = {"choices": [{"finish_reason": "length", "message": {"role": "assistant", "content": LIVE_TRUNCATED}}],
+           "usage": {"completion_tokens": 4096}}
+    # the cut-off answer is salvaged, not retried
+    model = FakeModel([answer("prose, no tools"), cut])
+    res, out = run(tmp_path, cont, model, McpRig(tmp_path))
+    f = res.payload.fields
+    assert f["model_status"] == "ok"
+    assert f["summary"] == "benign_pe.exe is a 64-bit MinGW console executable."
+    assert cols(res.payload, "functions")["address"] == ["0x140001420", "0x140001500"]
+    assert f["done"] is False
+    w = [x for x in res.warnings if x.code == "model_final_salvaged"]
+    assert w and "length" in w[0].message
+    ev = [json.loads(x) for x in (out / "transcript.jsonl").read_text().splitlines()]
+    fin = next(e for e in ev if e.get("event") == "final_turn")
+    assert fin["finish_reason"] == "length" and fin["completion_tokens"] == 4096
+
+
+def test_unusable_final_answer_is_retried_once_with_a_shorter_budget(tmp_path):
+    cont = make_continuation(tmp_path)
+    model = FakeModel([answer("prose, no tools"), answer("still prose"), _final(summary="second try")])
+    res, _ = run(tmp_path, cont, model, McpRig(tmp_path))
+    f = res.payload.fields
+    assert f["model_status"] == "ok" and f["summary"] == "second try"
+    assert any(w.code == "model_final_retry" for w in res.warnings)
+    retry = model.calls[-1]
+    assert retry["response_format"]["type"] == "json_schema"
+    assert retry["max_tokens"] <= ag.DEFAULT_MAX_TOKENS
+    assert "could not be used" in retry["messages"][-1]["content"]
+
+
+def test_final_retry_needs_time_for_a_useful_answer(tmp_path, monkeypatch):
+    monkeypatch.setenv("REA_MAX_STEPS", "1")
+    cont = make_continuation(tmp_path, summary="prior summary")
+    now = [1000.0]
+
+    class M(FakeModel):
+        def chat(self, messages, tools, max_tokens, **kw):
+            out = super().chat(messages, tools, max_tokens, **kw)
+            if kw.get("response_format") is not None:
+                now[0] += kw["timeout_s"] - 10  # the bad final answer used nearly all its time
+            return out
+
+    model = M([tc(("binary_overview", {}, "a")), answer("not json")])
+    res, _ = run(tmp_path, cont, model, McpRig(tmp_path), clock=lambda: now[0])
+    f = res.payload.fields
+    assert f["model_status"] == "budget" and f["summary"] == "prior summary"
+    assert len(model.calls) == 2  # no retry without time for one
+
+
+def test_tool_turn_transcript_records_finish_reason_and_tokens(tmp_path, monkeypatch):
+    monkeypatch.setenv("REA_MAX_STEPS", "1")
+    cont = make_continuation(tmp_path)
+    turn = tc(("binary_overview", {}, "a"))
+    turn["choices"][0]["finish_reason"] = "tool_calls"
+    turn["usage"] = {"completion_tokens": 77}
+    model = FakeModel([turn, _final()])
+    _, out = run(tmp_path, cont, model, McpRig(tmp_path))
+    ev = [json.loads(x) for x in (out / "transcript.jsonl").read_text().splitlines()]
+    mt = next(e for e in ev if e.get("event") == "model_turn")
+    assert mt["finish_reason"] == "tool_calls" and mt["completion_tokens"] == 77

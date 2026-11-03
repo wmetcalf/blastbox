@@ -64,8 +64,12 @@ class ModelClient:
         self._opener = opener if opener is not None else default_opener()
 
     def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], max_tokens: int, *,
-             response_format: dict[str, Any] | None = None, timeout_s: float | None = None) -> dict[str, Any]:
+             response_format: dict[str, Any] | None = None, timeout_s: float | None = None,
+             chat_template_kwargs: dict[str, Any] | None = None) -> dict[str, Any]:
         body: dict[str, Any] = {"model": self.model, "messages": messages, "max_tokens": int(max_tokens)}
+        if chat_template_kwargs is not None:
+            # vLLM extension; {"thinking": False} turns DeepSeek's reasoning off for this request.
+            body["chat_template_kwargs"] = chat_template_kwargs
         if tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"

@@ -27,13 +27,70 @@ from blastbox.engines.rea.continuation import State
 
 IOC_TYPES = ("url", "domain", "ipv4", "ipv6", "email", "registry", "path", "mutex")
 
-FINAL_SHAPE = """{
-  "summary": "<rewritten running summary of what the binary does, <= 4000 chars>",
-  "functions": [{"address": "0x...", "name": "...", "claim": "<what it does>", "evidence": ["t1", "t4"]}],
-  "iocs": [{"type": "url|domain|ipv4|ipv6|email|registry|path|mutex", "value": "...", "source": "<address or call id>"}],
+# Bounds of the final answer. The final request is schema-constrained (vLLM guided decoding,
+# ``final_schema``), so the answer is valid JSON of this shape and its worst case fits the final
+# token budget (REA_MAX_COMPLETION_TOKENS, 4096): the live 2026-11-03 PE pass wrote an unbounded
+# answer that was cut off at the token limit and lost every finding.
+FINAL_FUNCTIONS = 20
+FINAL_NAME = 96
+FINAL_CLAIM = 200
+FINAL_EVIDENCE = 6
+FINAL_IOCS = 16
+FINAL_IOC_VALUE = 256
+FINAL_SOURCE = 64
+FINAL_TODO = 24
+FINAL_SUMMARY = 2000
+_ADDR_PATTERN = "^0x[0-9a-fA-F]{1,16}$"
+
+FINAL_SHAPE = f"""{{
+  "summary": "<rewritten running summary of what the binary does, <= {FINAL_SUMMARY} chars>",
+  "functions": [{{"address": "0x...", "name": "...", "claim": "<what it does, <= {FINAL_CLAIM} chars>", \
+"evidence": ["t1", "t4"]}}],
+  "iocs": [{{"type": "url|domain|ipv4|ipv6|email|registry|path|mutex", "value": "...", \
+"source": "<address or call id>"}}],
   "todo": ["0x... functions still worth analysing next pass"],
   "done": false
-}"""
+}}
+At most {FINAL_FUNCTIONS} functions (the most important first), {FINAL_IOCS} IOCs and {FINAL_TODO} todo \
+addresses; later passes continue from the todo list."""
+
+
+def final_schema() -> dict[str, Any]:
+    """JSON Schema of the final answer, sent as ``response_format`` (guided decoding)."""
+    addr = {"type": "string", "pattern": _ADDR_PATTERN}
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["summary", "functions", "iocs", "todo", "done"],
+        "properties": {
+            "summary": {"type": "string", "maxLength": FINAL_SUMMARY},
+            "functions": {"type": "array", "maxItems": FINAL_FUNCTIONS, "items": {
+                "type": "object", "additionalProperties": False,
+                "required": ["address", "name", "claim", "evidence"],
+                "properties": {
+                    "address": addr,
+                    "name": {"type": "string", "maxLength": FINAL_NAME},
+                    "claim": {"type": "string", "maxLength": FINAL_CLAIM},
+                    "evidence": {"type": "array", "maxItems": FINAL_EVIDENCE,
+                                 "items": {"type": "string", "pattern": "^[st][0-9]{1,6}$"}},
+                }}},
+            "iocs": {"type": "array", "maxItems": FINAL_IOCS, "items": {
+                "type": "object", "additionalProperties": False,
+                "required": ["type", "value", "source"],
+                "properties": {
+                    "type": {"type": "string", "enum": list(IOC_TYPES)},
+                    "value": {"type": "string", "maxLength": FINAL_IOC_VALUE},
+                    "source": {"type": "string", "maxLength": FINAL_SOURCE},
+                }}},
+            "todo": {"type": "array", "maxItems": FINAL_TODO, "items": addr},
+            "done": {"type": "boolean"},
+        },
+    }
+
+
+def final_response_format() -> dict[str, Any]:
+    return {"type": "json_schema", "json_schema": {"name": "rea_final", "schema": final_schema(), "strict": True}}
+
 
 _SYSTEM = """You are a static reverse-engineering analyst. You examine ONE binary through read-only \
 Ghidra analysis tools. Nothing you do can run the sample, change the Ghidra database or reach \
@@ -67,6 +124,8 @@ Set "done" to true only when nothing in the binary is left worth analysing."""
 
 _FINAL_REQUEST = ("Stop calling tools now. Reply with ONLY the final JSON object described in the "
                   "system message (summary, functions, iocs, todo, done). No prose, no code fence.")
+_FINAL_RETRY = ("Stop calling tools now. Your previous reply could not be used (it was not the JSON object, or it was cut off). "
+                "Reply again with ONLY the final JSON object, shorter: fewer functions, one-line claims.")
 
 
 class Framer:
@@ -143,3 +202,7 @@ class Framer:
     @staticmethod
     def final_request() -> dict[str, Any]:
         return {"role": "user", "content": _FINAL_REQUEST}
+
+    @staticmethod
+    def final_retry() -> dict[str, Any]:
+        return {"role": "user", "content": _FINAL_RETRY}
