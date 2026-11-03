@@ -14,11 +14,11 @@
 #     --build-arg ENGINE_CLASS=blastbox.engines.rea:ReaSweepEngine --build-arg ENGINE_NAME=rea .
 #   docker build -f deploy/rea/Dockerfile.stack-worker -t blastbox-rea-agent:<tag> \
 #     --build-arg ENGINE_CLASS=blastbox.engines.rea:ReaAgentEngine --build-arg ENGINE_NAME=rea-agent .
-# Pinned to the exact blastbox-rea:dev build deployed on rea-bb (feat/rea-engine a03b1ca). The value
+# Pinned to the exact blastbox-rea:dev build deployed on rea-bb (feat/rea-engine 8704872). The value
 # is that image's local id, which the containerd image store also lists as a repo digest:
 #   docker image inspect blastbox-rea:dev --format '{{index .RepoDigests 0}}'
 # Update it after every rebuild of Dockerfile.rea-cold-worker (or pass --build-arg BASE_IMAGE=...).
-ARG BASE_IMAGE=blastbox-rea@sha256:849fe70bf1689b456f8c49b7973a2b7c82185478c7d70e3df23b355b1f984e8d
+ARG BASE_IMAGE=blastbox-rea@sha256:d1812afe42287181ab9f45c26ba60d93d538fe080625f6d0aa20920f13fa8f1c
 FROM ${BASE_IMAGE}
 
 ARG ENGINE_CLASS=blastbox.engines.rea:ReaSweepEngine
