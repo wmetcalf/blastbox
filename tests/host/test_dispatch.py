@@ -2001,7 +2001,15 @@ def test_bridge_on_non_httpproxy_fails_job(tmp_path, monkeypatch):
 
 
 _NET_ID = "a" * 64
-_INTERNAL_BRIDGE = f"{_NET_ID} bridge local true"
+
+
+def _net(driver="bridge", scope="local", internal="true", name="<no value>", gw4="isolated",
+         v6="false", gw6="<no value>"):
+    """A ``docker network inspect`` answer in the dispatcher's ``|``-separated template."""
+    return "|".join([_NET_ID, driver, scope, internal, name, gw4, v6, gw6])
+
+
+_INTERNAL_BRIDGE = _net()
 
 
 def _run_bridge_job(tmp_path, monkeypatch, decl, inspect=_INTERNAL_BRIDGE, *, dispatches=1,
@@ -2075,9 +2083,9 @@ def test_httpproxy_reserved_bridge_fails_job(tmp_path, monkeypatch, reserved):
 
 
 @pytest.mark.parametrize("answer", [
-    f"{_NET_ID} bridge local false",      # created without --internal
-    f"{_NET_ID} overlay swarm true",      # internal, but an attachable swarm overlay
-    f"{_NET_ID} macvlan local true",      # internal flag on a non-bridge driver
+    _net(internal="false"),               # created without --internal
+    _net(driver="overlay", scope="swarm"),  # internal, but an attachable swarm overlay
+    _net(driver="macvlan"),               # internal flag on a non-bridge driver
     "garbage",                            # unparseable answer is not verified
 ])
 def test_httpproxy_unverified_bridge_fails_job(tmp_path, monkeypatch, answer):
@@ -2111,8 +2119,8 @@ def test_httpproxy_bridge_inspect_glitch_defers_not_fails(tmp_path, monkeypatch,
 
 
 @pytest.mark.parametrize("answer", [
-    f"{_NET_ID} bridge local true br0",               # reuses a pre-existing host bridge
-    f"{_NET_ID} bridge local true virbr0",
+    _net(name="br0"),                                 # reuses a pre-existing host bridge
+    _net(name="virbr0"),
 ])
 def test_httpproxy_bridge_on_preexisting_linux_bridge_fails_job(tmp_path, monkeypatch, answer):
     final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + "bb-rea-model", answer)
@@ -2121,12 +2129,31 @@ def test_httpproxy_bridge_on_preexisting_linux_bridge_fails_job(tmp_path, monkey
 
 
 @pytest.mark.parametrize("answer", [
-    f"{_NET_ID} bridge local true <no value>",        # option unset (docker's template output)
-    f"{_NET_ID} bridge local true br-{_NET_ID[:12]}",  # docker's own per-network bridge
+    _net(),                                           # option unset (docker's template output)
+    _net(name=""),                                    # ...or rendered empty
+    _net(name=f"br-{_NET_ID[:12]}"),                  # docker's own per-network bridge
+    _net(v6="true", gw6="isolated"),                  # IPv6 too, also isolated
 ])
 def test_httpproxy_bridge_default_linux_bridge_runs(tmp_path, monkeypatch, answer):
     final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + "bb-rea-model", answer)
     assert len(_ran(launched)) == 1
+
+
+@pytest.mark.parametrize("answer", [
+    _net(gw4="<no value>"),                 # default gateway mode: the host owns an address
+    _net(gw4="nat"),
+    _net(gw4="routed"),
+    _net(gw4="nat-unprotected"),
+    _net(v6="true", gw6="<no value>"),      # IPv4 isolated, but the host has an IPv6 gateway
+    _net(v6="true", gw6="nat"),
+])
+def test_httpproxy_bridge_with_a_host_gateway_fails_job(tmp_path, monkeypatch, answer):
+    """A worker on an internal bridge whose gateway mode is not ``isolated`` can reach every
+    host service listening on the bridge's gateway address (sshd, published ports): refuse it."""
+    final, launched = _run_bridge_job(tmp_path, monkeypatch, _BRX + "bb-rea-model", answer)
+    assert final.status == JobStatus.FAILED
+    assert "gateway_mode_ipv" in (final.error or "")
+    assert not _ran(launched)
 
 
 def test_httpproxy_ambiguous_bridge_name_fails_job(tmp_path, monkeypatch):

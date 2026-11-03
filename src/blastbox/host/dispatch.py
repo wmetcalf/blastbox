@@ -2759,7 +2759,8 @@ class Dispatcher:
                     job,
                     f"netpolicy {personality.name!r}: bridge={named_bridge!r} is not verified "
                     f"as a local --internal bridge ({detail}); create it with "
-                    f"`docker network create --internal {named_bridge}`.",
+                    f"`docker network create --internal -o "
+                    f"com.docker.network.bridge.gateway_mode_ipv4=isolated {named_bridge}`.",
                 )
                 return
             named_bridge_id = detail
@@ -3316,17 +3317,22 @@ class Dispatcher:
         """Verify an operator-named ``bridge=`` right now (uncached) for this dispatch.
 
         Returns ``("ok", <network id>)`` only when docker reports a local-scope ``bridge`` driver
-        network with Internal=true on docker's own per-network Linux bridge; ``("reject", why)``
-        when docker answered and the network is missing, ambiguous, external, a different
-        driver/scope, rides a pre-existing host bridge, or the answer is unparseable; and
+        network with Internal=true and an ``isolated`` gateway (no host address on the bridge,
+        for IPv4 and, when enabled, IPv6) on docker's own per-network Linux bridge;
+        ``("reject", why)`` when docker answered and the network is missing, ambiguous,
+        external, a different driver/scope, gives the host a gateway address, rides a
+        pre-existing host bridge, or the answer is unparseable; and
         ``("error", why)`` when docker itself could not answer (timeout, socket error, daemon
         error), which is a node problem, not a job problem. A verified ID is seeded into the
         receipt cache: an ID names one immutable network, so its verdict cannot go stale."""
         try:
             proc = self._subprocess_runner(
                 ["docker", "network", "inspect", "-f",
-                 "{{.Id}} {{.Driver}} {{.Scope}} {{.Internal}} "
-                 '{{index .Options "com.docker.network.bridge.name"}}', network],
+                 "{{.Id}}|{{.Driver}}|{{.Scope}}|{{.Internal}}|"
+                 '{{index .Options "com.docker.network.bridge.name"}}|'
+                 '{{index .Options "com.docker.network.bridge.gateway_mode_ipv4"}}|'
+                 "{{.EnableIPv6}}|"
+                 '{{index .Options "com.docker.network.bridge.gateway_mode_ipv6"}}', network],
                 capture_output=True, text=True, check=False, timeout=10)
         except Exception as exc:  # noqa: BLE001 - docker unreachable: defer, don't fail
             return "error", f"docker network inspect failed: {type(exc).__name__}"
@@ -3342,15 +3348,26 @@ class Dispatcher:
             if "ambiguous" in low or "matches found" in low:
                 return "reject", "docker reports the name is ambiguous (duplicate networks)"
             return "error", f"docker network inspect rc={rc}: {err[:120]}"
-        # An unset Options key renders as "<no value>": normalise it away before splitting.
-        fields = str(getattr(proc, "stdout", "") or "").replace("<no value>", "").split()
-        if len(fields) == 4:
-            fields.append("")              # no bridge.name option: docker names it br-<id12>
-        if len(fields) != 5 or not re.fullmatch(r"[0-9a-f]{64}", fields[0]):
+        # An unset Options key renders as "<no value>": normalise it away.
+        fields = [f.strip() for f in str(getattr(proc, "stdout", "") or "").strip()
+                  .replace("<no value>", "").split("|")]
+        if len(fields) != 8 or not re.fullmatch(r"[0-9a-f]{64}", fields[0]):
             return "reject", "unparseable docker network inspect answer"
-        net_id, driver, scope, internal, linux_bridge = fields
+        net_id, driver, scope, internal, linux_bridge, gw4, ipv6, gw6 = fields
         if driver != "bridge" or scope != "local" or internal.lower() != "true":
             return "reject", f"driver={driver} scope={scope} internal={internal}"
+        # --internal stops forwarding off the bridge, but docker still gives the HOST an address
+        # on it (the gateway), so the worker reaches every host service bound to 0.0.0.0. The
+        # `isolated` gateway mode leaves the bridge address-less: only the proxy sidecar on the
+        # same L2 segment is reachable, with no host firewall rule involved.
+        if gw4 != "isolated":
+            return "reject", (f"gateway_mode_ipv4={gw4 or 'unset'} gives the host an address on "
+                              f"the bridge; recreate it with "
+                              f"-o com.docker.network.bridge.gateway_mode_ipv4=isolated")
+        if ipv6.lower() == "true" and gw6 != "isolated":
+            return "reject", (f"gateway_mode_ipv6={gw6 or 'unset'} gives the host an IPv6 "
+                              f"address on the bridge; recreate it with "
+                              f"-o com.docker.network.bridge.gateway_mode_ipv6=isolated")
         # `-o com.docker.network.bridge.name=br0` makes docker REUSE an existing host bridge, which
         # may carry other hosts/VMs on its L2 segment. Docker's answer can't tell a reused bridge
         # from one it created under that name, so any explicit name is refused: only docker's own
