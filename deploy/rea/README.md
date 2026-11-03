@@ -74,7 +74,7 @@ docker build -f deploy/rea/Dockerfile.host -t blastbox-rea-host:0def6b2 .
 ## Deploy
 
 ```sh
-docker network create --internal --subnet 10.231.200.0/24 bb-rea-model
+docker network create --internal -o com.docker.network.bridge.gateway_mode_ipv4=isolated --subnet 10.231.200.0/24 bb-rea-model   # isolated: the host gets no address on it
 mkdir -p ~/rea-bb ~/rea-bb-data/jobs ~/rea-bb-keys ~/rea-bb/tls
 cp compose.yml tinyproxy.conf tinyproxy.filter ~/rea-bb/
 install -m 600 env.example ~/rea-bb/.env            # fill in every REPLACE_ME

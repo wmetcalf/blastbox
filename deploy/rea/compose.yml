@@ -3,7 +3,7 @@
 # as the other *-bb stacks on toolz2) + rea-model-proxy, the only route to the model endpoint.
 #
 #   # once, as the operator (see README.md "Network"): the INTERNAL bridge the agent slots ride
-#   docker network create --internal --subnet 10.231.200.0/24 bb-rea-model
+#   docker network create --internal -o com.docker.network.bridge.gateway_mode_ipv4=isolated --subnet 10.231.200.0/24 bb-rea-model
 #   install -m 600 env.example .env       # fill in every REPLACE_ME
 #   docker compose -p rea-bb -f compose.yml up -d
 #
