@@ -117,7 +117,14 @@ Three things in the plan's Step 2 cannot work as written. Each was found live:
    of the 540 s wall). `REA_MODEL_TIMEOUT_S` is unset, so each request's timeout is the time left
    in its phase; set it only as an upper cap. An `unavailable` request is retried once while the
    phase has time. Tool results reach the model cut to 12 KiB (head + tail), and
-   `analyze_function` always runs at `detail=summary`. To change a knob, add it to the agent
+   `analyze_function` always runs at `detail=summary`. The final answer is schema-constrained
+   (`response_format` json_schema from `prompts.final_schema`: at most 20 functions, 16 IOCs, 24 todo
+   addresses, a 2000-char summary) and asks for `chat_template_kwargs {"thinking": false}`
+   (`REA_FINAL_THINKING=1` keeps reasoning on). Live on 2026-11-03 the reasoning ate the 4096-token
+   budget and cut the answer off mid-function. A cut-off answer keeps its complete rows
+   (`model_final_salvaged`); an unusable one is asked for once more with the tokens the time left
+   allows (`model_final_retry`, at least 512). Transcript turns record `finish_reason` and
+   `completion_tokens`. To change a knob, add it to the agent
    image's `ENV` in `Dockerfile.stack-worker` (all `REA_*` keys are reserved).
    The sweep's `rea.report/1` carries an optional `chain_stop` (`not_native`, `ghidra_failed`,
    `ghidra_timeout`, `unsupported_arch`, `packed`; see `sweep.py`). When it is set the sweep seals
