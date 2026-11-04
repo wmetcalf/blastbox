@@ -65,8 +65,10 @@ cannot hold lists of objects), at most ``MAX_REPORT_JSON`` chars:
 
 The verdict is a model opinion, never a detection; the whole object is untrusted model output.
 
-The report's tokens (``REA_REPORT_MAX_TOKENS``, 3500; 0 turns the call off) join the final
-answer's in the reserve. At report time the call asks for ``min(REA_REPORT_MAX_TOKENS, what the
+The report call is capped at ``REA_REPORT_MAX_TOKENS`` (3500; 0 turns it off). The final reserve
+plans for what the final answer and report actually use, not their caps: ``REA_RESERVE_TOKENS``
+(4096; never more than the two caps together). Live G3 gate passes used at most 1816 + 1601. At
+report time the call asks for ``min(REA_REPORT_MAX_TOKENS, what the
 time left holds at the measured rate)`` and is skipped below ``MIN_REPORT_TOKENS``; the measured
 rate is completion tokens over seconds of this pass's calls that reported usage.
 
@@ -117,6 +119,7 @@ DEFAULT_MAX_TOKENS = 4096  # the final answer
 DEFAULT_TURN_MAX_TOKENS = 2048  # each tool-choice turn
 DEFAULT_TOKENS_PER_S = 30.0  # sizes the final-answer reserve (deepseek-v4-flash on vLLM, 1 sequence)
 DEFAULT_REPORT_TOKENS = 3500  # the analysis-report call (REA_REPORT_MAX_TOKENS; 0 turns it off)
+DEFAULT_RESERVE_TOKENS = 4096  # what the final reserve plans for (REA_RESERVE_TOKENS): final + report
 MIN_REPORT_TOKENS = 1024  # below this the report call is skipped (report_skipped_deadline)
 MAX_REPORT_JSON = 64 * 1024  # the sealed analysis_report JSON text
 DEFAULT_TOOL_TIMEOUT_S = 120.0
@@ -638,6 +641,8 @@ class ReaAgentEngine:
         turn_tokens = min(max_tokens, _env_int("REA_TURN_MAX_TOKENS", DEFAULT_TURN_MAX_TOKENS, 256, 131072))
         tokens_per_s = _env_seconds("REA_MODEL_TOKENS_PER_S", DEFAULT_TOKENS_PER_S)
         report_tokens = _env_int("REA_REPORT_MAX_TOKENS", DEFAULT_REPORT_TOKENS, 0, 131072)
+        reserve_tokens = min(max_tokens + report_tokens,
+                             _env_int("REA_RESERVE_TOKENS", DEFAULT_RESERVE_TOKENS, 256, 262144))
         model_id = os.environ.get("REA_MODEL_ID") or DEFAULT_MODEL_ID
 
         # 1. unpack + integrity
@@ -654,7 +659,7 @@ class ReaAgentEngine:
 
         p = _Pass(pass_no=state.pass_no + 1, model_id=model_id, summary=state.summary,
                   todo=list(state.todo), explored=list(state.explored),
-                  final_reserve_s=final_reserve(wall, max_tokens + report_tokens, tokens_per_s), wall_s=wall,
+                  final_reserve_s=final_reserve(wall, reserve_tokens, tokens_per_s), wall_s=wall,
                   turn_tokens=turn_tokens, tokens_per_s=tokens_per_s,
                   final_thinking=os.environ.get("REA_FINAL_THINKING", "").strip().lower()
                   in ("1", "true", "yes", "on"),

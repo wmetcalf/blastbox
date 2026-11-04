@@ -53,7 +53,7 @@ def _env(tmp_path, monkeypatch):
     monkeypatch.setenv("REA_BIN", REA_BIN)
     monkeypatch.setenv("REA_MODEL_URL", "http://model.invalid:8888/v1")
     monkeypatch.setenv("REA_MODEL_ID", "deepseek-v4-flash")
-    for k in ("REA_PASS_WALL_S", "REA_MAX_STEPS", "REA_MAX_COMPLETION_TOKENS"):
+    for k in ("REA_PASS_WALL_S", "REA_MAX_STEPS", "REA_MAX_COMPLETION_TOKENS", "REA_RESERVE_TOKENS"):
         monkeypatch.delenv(k, raising=False)
     # The analysis-report call (G3) is off unless a test turns it on: the scripted models below
     # end at the final answer.
@@ -1799,7 +1799,19 @@ def test_report_tokens_sized_from_the_measured_rate(tmp_path, monkeypatch):
     assert model.calls[-1]["max_tokens"] == want
 
 
-def test_final_reserve_holds_the_report_too(tmp_path, monkeypatch):
+def test_final_reserve_plans_for_measured_use_not_the_caps(tmp_path, monkeypatch):
+    monkeypatch.delenv("REA_RESERVE_TOKENS", raising=False)
+    res, out, _m = _report_run(tmp_path, monkeypatch, answer(_report()))
+    start = json.loads((out / "transcript.jsonl").read_text().splitlines()[0])
+    assert start["final_reserve_s"] == round(ag.final_reserve(540.0, ag.DEFAULT_RESERVE_TOKENS), 1)
+    # The G3 gate's largest pass (final 1816 + report 1601 tokens) fits with the 1.25 margin.
+    assert ag.final_reserve(540.0, ag.DEFAULT_RESERVE_TOKENS) >= (1816 + 1601) / ag.DEFAULT_TOKENS_PER_S
+    # ... and exploration gets back what the cap-sized reserve (270 s) held.
+    assert ag.final_reserve(540.0, ag.DEFAULT_RESERVE_TOKENS) <= 180
+
+
+def test_reserve_tokens_knob_is_bounded_by_the_caps(tmp_path, monkeypatch):
+    monkeypatch.setenv("REA_RESERVE_TOKENS", "100000")
     res, out, _m = _report_run(tmp_path, monkeypatch, answer(_report()))
     start = json.loads((out / "transcript.jsonl").read_text().splitlines()[0])
     assert start["final_reserve_s"] == round(ag.final_reserve(540.0, ag.DEFAULT_MAX_TOKENS
@@ -1832,3 +1844,10 @@ def test_every_rea_knob_the_engines_read_is_a_reserved_compose_key():
     reserved = set(re.search(r"RESERVED_KEYS: &rea-reserved (\S+)", compose).group(1).split(","))
     assert "REA_REPORT_MAX_TOKENS" in read
     assert read - reserved == set()
+
+
+def test_report_prompt_ties_observed_to_the_programs_own_code():
+    # Live G3 (dotnet): "network" came back observed while its text said no network calls.
+    sysmsg = prompts._REPORT_SYSTEM
+    assert "program's own code doing it" in sysmsg
+    assert "its status is not_observed, never observed" in sysmsg

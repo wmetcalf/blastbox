@@ -135,8 +135,9 @@ Three things in the plan's Step 2 cannot work as written. Each was found live:
    rewrites). Evidence addresses the passes never saw are dropped (`report_evidence_dropped`); an
    `observed` section left without evidence becomes `not_analysed`. It is sealed in `rea.pass/1`
    as compact JSON text (Record values cannot hold lists of objects; see `agent.py`). The call gets
-   `REA_REPORT_MAX_TOKENS=3500` (0 turns it off), counted into the final reserve
-   (1.25 x (4096 + 3500) / 30 = 316 s, capped at half the 540 s wall = 270 s), and is cut to what
+   `REA_REPORT_MAX_TOKENS=3500` (0 turns it off). The final reserve plans for measured use, not
+   the caps: `REA_RESERVE_TOKENS=4096` covers the final answer plus the report (the G3 gate's
+   largest pass used 1816 + 1601), so 1.25 x 4096 / 30 = 171 s of the 540 s wall. The report is cut to what
    the time left holds at the pass's measured tokens/s, or skipped under 1024 tokens
    (`report_skipped_deadline`). A failed or invalid report (`report_failed`, `report_invalid`)
    never costs the pass its findings; a cut-off one keeps its complete sections (`report_salvaged`).

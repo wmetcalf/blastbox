@@ -95,7 +95,7 @@ def final_response_format() -> dict[str, Any]:
 # The analysis report (rea.analysis/1, G3): one extra schema-constrained call after the final
 # answer. REPORT_* are the wire limits (Loadout's interface); GEN_* are the tighter limits the
 # model is decoded under, so the worst case fits the report token budget
-# (REA_REPORT_MAX_TOKENS, 3500).
+# (REA_REPORT_MAX_TOKENS, 3500); the final reserve plans for measured use (REA_RESERVE_TOKENS).
 REPORT_SCHEMA = "rea.analysis/1"
 REPORT_KEYS = ("overview", "execution_flow", "capabilities", "network", "persistence", "host_activity",
                "anti_analysis", "unknowns")
@@ -176,10 +176,10 @@ You get the findings of the analysis so far: function claims with their addresse
 Describe what the PROGRAM DOES: its behaviour, its execution flow from the entry point, and its capabilities. In each section's evidence, cite the function addresses its statements rest on (address, function name, a short note). Use only addresses that appear in the findings or the previous report; any other address is discarded by the engine.
 
 Sections, each exactly once, in this order: {keys}.
-- status "observed": the findings show it (cite evidence; overview and unknowns may have none).
+- status "observed": the findings show the program's own code doing it (cite evidence; overview and unknowns may have none).
 - status "not_observed": the analysed code shows no such behaviour.
 - status "not_analysed": the analysis has not looked far enough to say.
-Say not_observed or not_analysed rather than guess. Compiler and runtime startup code (CRT initialisation, the Go or .NET runtime, library internals) is not the program's own behaviour: mention it at most in the overview. not_observed and not_analysed sections get one short sentence and no evidence. Plain prose, no markdown headings, no lists.
+If a section's text says the program does not do something, its status is not_observed, never observed. Say not_observed or not_analysed rather than guess. Compiler and runtime startup code (CRT initialisation, the Go or .NET runtime, library internals) is not the program's own behaviour: mention it at most in the overview. not_observed and not_analysed sections get one short sentence and no evidence. Plain prose, no markdown headings, no lists.
 
 verdict: benign, suspicious, malicious or unknown, with a confidence and a short rationale. It is an opinion from the evidence above. Prefer "unknown" when the evidence is thin, and never call a program malicious for using ordinary APIs.
 
