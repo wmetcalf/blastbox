@@ -43,7 +43,7 @@ ENV BLASTBOX_ENGINE=${ENGINE_CLASS} \
     REA_MODEL_ID=${REA_MODEL_ID} \
     REA_PASS_WALL_S=540 \
     REA_GHIDRA_SWEEP_S=420 \
-    REA_MAX_STEPS=12
+    REA_MAX_STEPS=16
 
 LABEL org.opencontainers.image.title="blastbox-${ENGINE_NAME}-worker" \
       org.opencontainers.image.description="REA worker for engine ${ENGINE_NAME} on the rea-bb stack"

@@ -109,7 +109,7 @@ Three things in the plan's Step 2 cannot work as written. Each was found live:
    `docker.py` `_DEFAULT_TMPFS`). The engine default `/work` does not exist on the read-only rootfs.
    The images therefore set `BLASTBOX_WORK_DIR=/tmp`, `BLASTBOX_TMPFS=536870912`,
    `BLASTBOX_TIMEOUT=840` (dispatcher kill at 900), the 1 GiB / 2 GiB artifact caps, `REA_MODEL_URL`,
-   `REA_MODEL_ID`, `REA_PASS_WALL_S=540`, `REA_GHIDRA_SWEEP_S=420` and `REA_MAX_STEPS=12`. Ghidra + REA
+   `REA_MODEL_ID`, `REA_PASS_WALL_S=540`, `REA_GHIDRA_SWEEP_S=420` and `REA_MAX_STEPS=16`. Ghidra + REA
    work on the noexec 512 MiB tmpfs under runsc (benign PE sweep: 101 s with this exact flag set).
    The agent's model budgets use the engine defaults (not baked): `REA_TURN_MAX_TOKENS=2048` per
    tool-choice turn, `REA_MAX_COMPLETION_TOKENS=4096` for the final answer, and

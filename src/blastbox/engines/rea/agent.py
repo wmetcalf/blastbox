@@ -28,7 +28,7 @@ dir in ``BLASTBOX_WORK_DIR``:
 
 Budgets: the pass wall clock is ``min(REA_PASS_WALL_S (540), Limits.timeout_s - reserve)`` where the
 reserve keeps time for packing and sealing; REA's 13-20 s session start is inside it. Turns are
-capped by ``REA_MAX_STEPS`` (12). Tool-choice turns ask for at most ``REA_TURN_MAX_TOKENS`` (2048)
+capped by ``REA_MAX_STEPS`` (16). Tool-choice turns ask for at most ``REA_TURN_MAX_TOKENS`` (2048)
 completion tokens, the final answer for ``REA_MAX_COMPLETION_TOKENS`` (4096). The tail of the wall
 (:func:`final_reserve`, sized from the final budget at ``REA_MODEL_TOKENS_PER_S``) is kept for the
 final answer: once exploration reaches it, tool turns stop and the final answer is forced with the
@@ -79,7 +79,7 @@ _log = logging.getLogger("blastbox.engines.rea.agent")
 SCHEMA = "rea.pass/1"
 DEFAULT_MODEL_ID = "deepseek-v4-flash"
 DEFAULT_PASS_WALL_S = 540.0
-DEFAULT_MAX_STEPS = 12  # Ruling O
+DEFAULT_MAX_STEPS = 16  # Ruling O; 12 -> 16 in G3 (the bounded final answer freed the time)
 DEFAULT_MAX_TOKENS = 4096  # the final answer
 DEFAULT_TURN_MAX_TOKENS = 2048  # each tool-choice turn
 DEFAULT_TOKENS_PER_S = 30.0  # sizes the final-answer reserve (deepseek-v4-flash on vLLM, 1 sequence)

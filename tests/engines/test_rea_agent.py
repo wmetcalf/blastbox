@@ -971,10 +971,6 @@ def test_only_refused_calls_then_failure_is_budget(tmp_path):
     assert f["model_status"] == "budget" and f["more_pending"] is True and f["refused_calls"] == 1
 
 
-def test_default_max_steps_is_12():
-    assert ag.DEFAULT_MAX_STEPS == 12
-
-
 class _Trickle:
     status = 200
 
@@ -1601,3 +1597,10 @@ def test_tool_turn_transcript_records_finish_reason_and_tokens(tmp_path, monkeyp
     ev = [json.loads(x) for x in (out / "transcript.jsonl").read_text().splitlines()]
     mt = next(e for e in ev if e.get("event") == "model_turn")
     assert mt["finish_reason"] == "tool_calls" and mt["completion_tokens"] == 77
+
+
+def test_default_step_cap_is_16_in_the_engine_and_the_image():
+    # G3: the final answer now takes 40-80 s, so the step cap (12) bound before the wall did.
+    assert ag.DEFAULT_MAX_STEPS == 16
+    dockerfile = (HERE.parents[1] / "deploy" / "rea" / "Dockerfile.stack-worker").read_text()
+    assert re.search(r"\bREA_MAX_STEPS=16\b", dockerfile) and "REA_MAX_STEPS=12" not in dockerfile
