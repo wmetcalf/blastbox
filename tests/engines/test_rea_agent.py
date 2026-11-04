@@ -58,11 +58,11 @@ def _env(tmp_path, monkeypatch):
 
 
 def make_continuation(tmp_path, *, project=True, todo=None, explored=None, summary="prior summary",
-                      ghidra_status="ok", pass_no=0) -> Path:
+                      ghidra_status="ok", pass_no=0, sample_bytes=SAMPLE_BYTES, **state_kw) -> Path:
     src = tmp_path / "contsrc"
     src.mkdir(exist_ok=True)
     sample = src / "sample.exe"
-    sample.write_bytes(SAMPLE_BYTES)
+    sample.write_bytes(sample_bytes)
     proj = None
     if project:
         proj = src / "proj"
@@ -72,13 +72,14 @@ def make_continuation(tmp_path, *, project=True, todo=None, explored=None, summa
     state = State(
         pass_no=pass_no,
         sample_name="sample.exe",
-        sample_sha256=hashlib.sha256(SAMPLE_BYTES).hexdigest(),
+        sample_sha256=hashlib.sha256(sample_bytes).hexdigest(),
         program_name="sample.exe" if project else None,
         ghidra_status=ghidra_status,
         explored=list(explored or []),
         todo=list(todo if todo is not None else ["0x140001420"]),
         summary=summary,
         started_at=1.0,
+        **state_kw,
     )
     dest = tmp_path / "continuation.tar.gz"
     pack(dest, sample=sample, project_dir=proj, state=state)
@@ -632,6 +633,39 @@ def test_ioc_verified_only_by_sample_bytes(tmp_path):
     assert got == {"203.0.113.7": True, "203.0.113.8": False, "HKLM\\Software\\Evil\\Run": True,
                    "hklm\\software\\evil\\run": False, "HTTP://EVIL.EXAMPLE/A.PHP": True,
                    "http://utf16.evil-example.com/x": True, "abc": False, "http://203.0.113.7/": False}
+
+
+def _go_fixture():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("rea_go_fixture", HERE / "fixtures" / "rea" / "go_fixture.py")
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_go_ioc_read_across_a_packed_literal_is_clipped_to_the_literal(tmp_path):
+    # Live G2 benign_go.elf: read_bytes(0x4b823d, 64) showed the URL glued to the strconv digits,
+    # and the substring check "verified" the overrun because those bytes do occur in the sample.
+    gf = _go_fixture()
+    cont = make_continuation(tmp_path, sample_bytes=gf.go_elf())
+    model = FakeModel([answer({"summary": "s", "functions": [], "iocs": [
+        {"type": "url", "value": gf.URL_OVERRUN, "source": "0x4b823d"},
+        {"type": "url", "value": gf.URL + "173472347597680709", "source": "0x4b823d"},
+        {"type": "ipv4", "value": gf.IP, "source": "0x4b22f5"},
+    ], "todo": [], "done": True})])
+    res, _ = run(tmp_path, cont, model, McpRig(tmp_path))
+    io_ = cols(res.payload, "iocs")
+    assert list(zip(io_["type"], io_["value"], io_["verified"])) == [
+        ("url", gf.URL, True), ("ipv4", gf.IP, True)]
+
+
+def test_non_go_ioc_values_are_not_clipped(tmp_path):
+    cont = make_continuation(tmp_path)
+    model = FakeModel([answer({"summary": "s", "functions": [], "iocs": [
+        {"type": "url", "value": "http://evil.example/a.php", "source": "x"}], "todo": [], "done": True})])
+    res, _ = run(tmp_path, cont, model, McpRig(tmp_path))
+    assert cols(res.payload, "iocs")["value"] == ["http://evil.example/a.php"]
 
 
 def test_ioc_check_is_capped(tmp_path):

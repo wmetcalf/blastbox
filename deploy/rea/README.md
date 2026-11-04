@@ -130,6 +130,14 @@ Three things in the plan's Step 2 cannot work as written. Each was found live:
    `ghidra_timeout`, `unsupported_arch`, `packed`; see `sweep.py`). When it is set the sweep seals
    `more_pending=false` with no continuation (Ruling AL). `packed` needs the `function_count` line
    that `ghidra_scripts/ListStrings.java` now writes first, so rebuild the base image too.
+   **Go string literals.** Go packs literals with no terminator, so a defined-string scan reads
+   one literal into the next (live 2026-11-03: `http://loadout-go-fixture.example.org/ping`
+   sealed with the strconv digits `1734723475976807094411` glued on, and the agent's byte check
+   "verified" it). `gostrings.py` takes the exact bounds from Go's own string headers: static
+   `{ptr, len}` pairs in the data sections and, on amd64, `LEA reg,[rip+x]` + `MOV next_reg,len`
+   ABI register pairs. The sweep adds those literals as IOC source `gostring:0x<va>`; sweep and
+   agent clip an IOC that starts with a literal's IOC but runs past it back to that IOC. A literal
+   no header names keeps its old boundary.
    **Limit:** 512 MiB of scratch is the ceiling for a Ghidra project plus REA's private copy, so a
    very large sample can fail in the slot even though `BLASTBOX_MAX_INPUT` is 1 GiB.
 

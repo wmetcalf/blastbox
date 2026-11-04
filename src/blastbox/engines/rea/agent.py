@@ -19,7 +19,9 @@ dir in ``BLASTBOX_WORK_DIR``:
    reasoning off unless ``REA_FINAL_THINKING``) is parsed defensively; a cut-off answer keeps its
    complete rows (``salvage_json_prefix``), an unusable one is asked for once more. Function claims
    are kept only for citable addresses (``_Evidence``, Ruling S); a proposed IOC is ``verified``
-   only when its value occurs in the sample's own bytes (``verify_iocs_in_sample``, Ruling R);
+   only when its value occurs in the sample's own bytes (``verify_iocs_in_sample``, Ruling R),
+   after a value read across a Go string literal's end is clipped to the literal
+   (``gostrings.clip_overruns``);
 7. the next continuation (same project, updated ``State``) and a capped JSONL transcript are
    declared, and a ``rea.pass/1`` Record is sealed. The continuation is packed only when another
    pass can follow (``more_pending``); a final pass seals the transcript alone.
@@ -59,6 +61,7 @@ from typing import IO, Any
 from blastbox.contract import DeclaredArtifact, Detection, Record, Warning
 from blastbox.engines.rea.iocs import extract_iocs
 from blastbox.engines.rea.continuation import ContinuationError, GhidraStatus, State, pack, unpack
+from blastbox.engines.rea.gostrings import clip_overruns, exact_iocs, go_strings
 from blastbox.engines.rea.mcp_client import McpError, McpStdioClient
 from blastbox.engines.rea.model import ModelClient, ModelError
 from blastbox.engines.rea.policy import ADDRESS_RE, TOOL_ALLOWLIST, CallRefused, check_call, model_tool_specs, safe_name
@@ -138,6 +141,7 @@ MAX_VERIFY_IOCS = 128  # Ruling R: sample-byte searches per pass
 VERIFY_BUDGET_S = 60.0  # Ruling W: wall-clock cap on the sample-byte scan (also clamped to the pass)
 VERIFY_RESERVE_S = 20.0  # kept out of the final answer's timeout for that scan
 VERIFY_CHUNK = 8 * 1024 * 1024
+GO_SCAN_S = 15.0  # Go string-header scan before the IOC byte check (gostrings.py)
 MIN_IOC_CHARS = 4
 _CASELESS_IOCS = frozenset({"url", "domain", "email"})
 _PROGRAM_NAME = re.compile(r"^[^/\\\x00]{1,255}$")
@@ -1105,6 +1109,14 @@ class ReaAgentEngine:
             if k not in seen:
                 seen.add(k)
                 unique.append(ioc)
+        if unique:
+            # Go packs literals with no terminator: a value read across a literal's end (live
+            # 2026-11-03, a URL plus the next literal's digits) still occurs in the sample bytes,
+            # so it is clipped to the exact literal's IOC before the byte check.
+            lits = go_strings(sample, deadline=clock() + max(0.0, min(GO_SCAN_S, remaining() / 4)), clock=clock)
+            if lits:
+                unique = clip_overruns(unique, exact_iocs(lits), key=lambda i: (i["type"], i["value"]),
+                                       replace=lambda i, v: {**i, "value": v})
         reasons = ["cap"] * len(unique)
         candidates: list[int] = []
         for i, ioc in enumerate(unique[:MAX_VERIFY_IOCS]):

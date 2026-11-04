@@ -518,3 +518,37 @@ def test_unknown_ghidra_status_is_failed_not_timeout(tmp_path):
     res, out, _g = _run(FIXTURES / "sample.exe", tmp_path, ghidra=FakeGhidra(status="weird"))
     _not_pending(res, out, "ghidra_failed")
     assert sw.ReaSweepEngine._chain_stop(FIXTURES / "sample.exe", "pe", "skipped", None) == "ghidra_failed"
+
+
+# ------------------------------------------- Go packed string table (G3, live 2026-11-03)
+def _go_fixture():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "rea_go_fixture", Path(__file__).resolve().parent / "fixtures" / "rea" / "go_fixture.py")
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_go_iocs_end_at_the_literal_not_in_the_next_packed_string(tmp_path: Path) -> None:
+    gf = _go_fixture()
+    sample = tmp_path / "benign_go.elf"
+    sample.write_bytes(gf.go_elf())
+    # Ghidra-style defined strings run on through the packed table into the strconv digits.
+    strings = [{"address": "0x4b823d", "value": gf.URL_OVERRUN},
+               {"address": "0x4b22f5", "value": "198.51.100.233814697265625wakeableSleep"}]
+    res, _o, _g = _run(sample, tmp_path, ghidra=FakeGhidra(strings=strings),
+                       runner=factory(inspect_fn=lambda cmd: {"ok": True, "result": {}}))
+    rows = _iocs(_fields(res))
+    got = {(t, v) for t, v, _s in rows}
+    assert ("url", gf.URL) in got and ("ipv4", gf.IP) in got
+    assert ("domain", "loadout-go-fixture.example.org") in got
+    assert not [v for t, v in got if t == "url" and v != gf.URL]
+    assert dict(((t, v), s) for t, v, s in rows)[("url", gf.URL)] == "gostring:0x4b823d"
+
+
+def test_go_literals_skipped_for_non_go_native(tmp_path: Path) -> None:
+    res, _o, _g = _run(FIXTURES / "sample.exe", tmp_path,
+                       runner=factory(inspect_fn=lambda cmd: {"ok": True, "result": {}}))
+    assert not [s for _t, _v, s in _iocs(_fields(res)) if s.startswith("gostring:")]

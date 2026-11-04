@@ -9,7 +9,10 @@ One job, in order, everything under a fresh per-job dir in ``BLASTBOX_WORK_DIR``
 5. native code (pe/elf/macho/dotnet): ``analyzeHeadless`` import + auto-analysis with the
    bundled ``ListStrings.java`` post-script dumping defined strings;
 6. deterministic IOCs over the inspect JSON string leaves, the Ghidra strings and, for native
-   code, UTF-16LE URL strings in the sample bytes (a .NET ``#US`` heap has no Ghidra string);
+   code, UTF-16LE URL strings in the sample bytes (a .NET ``#US`` heap has no Ghidra string)
+   and, for Go binaries, the exact string literals named by Go string headers
+   (``gostrings.py``, source ``gostring:0x<va>``); an IOC read across a Go literal's end is
+   clipped to that literal's own IOC;
 7. a continuation archive (sample + Ghidra project + ``State``), only when a model pass can
    follow. Otherwise the payload names why in ``chain_stop`` (Ruling AL, superseding "a Ghidra
    timeout still continues"), seals ``more_pending=false`` and packs no continuation;
@@ -56,6 +59,7 @@ from typing import Any
 
 from blastbox.contract import DeclaredArtifact, Detection, Record, Warning
 from blastbox.engines.rea.continuation import GhidraStatus, State, pack
+from blastbox.engines.rea.gostrings import clip_overruns, exact_iocs, go_strings
 from blastbox.engines.rea.icons import extract_icons
 from blastbox.engines.rea.iocs import Ioc, extract_iocs, utf16le_urls
 from blastbox.engines.rea.triage import packed, unsupported_arch
@@ -88,6 +92,7 @@ MAX_STRING_CHARS = 4096
 MAX_IOCS = 2048
 MAX_UTF16_SCAN_BYTES = 256 * 1024 * 1024
 MAX_UTF16_URLS = 1024
+GO_SCAN_S = 30.0  # wall-clock cap on the Go string-header scan
 MAX_ICONS = 8
 MAX_REPORT_BYTES = 16 * 1024 * 1024
 MAX_LEAVES = 200_000
@@ -297,7 +302,18 @@ class ReaSweepEngine:
             except (OSError, ValueError) as exc:
                 warnings.append(Warning(code="utf16_scan_failed", message=f"exception:{type(exc).__name__}"))
 
+        # Go packs string literals with no terminator: their exact bounds come from the string
+        # headers (gostrings.py), and IOCs read across a literal's end are clipped to it.
+        go_lits: list[tuple[int, str]] = []
+        if kind in NATIVE_KINDS:
+            try:
+                go_lits = go_strings(input, deadline=time.monotonic() + max(0.0, min(GO_SCAN_S, remaining())))
+            except (OSError, ValueError) as exc:
+                warnings.append(Warning(code="go_strings_failed", message=f"exception:{type(exc).__name__}"))
+
         def sources() -> Iterator[tuple[str, str]]:
+            for va, value in go_lits:
+                yield f"gostring:{va:#x}", value
             for cmd, res in inspect.items():
                 if res.get("ok"):
                     for leaf in _string_leaves(res.get("result")):
@@ -307,6 +323,9 @@ class ReaSweepEngine:
             yield from wide_urls
 
         iocs = extract_iocs(sources(), limit=MAX_IOCS)
+        if go_lits:
+            iocs = clip_overruns(iocs, exact_iocs(go_lits), key=lambda i: (i.type, i.value),
+                                 replace=lambda i, v: Ioc(i.type, v, i.source))
         if len(iocs) >= MAX_IOCS:
             warnings.append(Warning(code="iocs_capped", message=f"IOC extraction stopped at {MAX_IOCS}"))
 
