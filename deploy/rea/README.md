@@ -113,8 +113,8 @@ Three things in the plan's Step 2 cannot work as written. Each was found live:
    work on the noexec 512 MiB tmpfs under runsc (benign PE sweep: 101 s with this exact flag set).
    The agent's model budgets use the engine defaults (not baked): `REA_TURN_MAX_TOKENS=2048` per
    tool-choice turn, `REA_MAX_COMPLETION_TOKENS=4096` for the final answer, and
-   `REA_MODEL_TOKENS_PER_S=30`, which sizes the final-answer reserve (1.25 x 4096 / 30 = about 171 s
-   of the 540 s wall). `REA_MODEL_TIMEOUT_S` is unset, so each request's timeout is the time left
+   `REA_MODEL_TOKENS_PER_S=30`, which sizes the final-answer reserve (with the report below,
+   270 s of the 540 s wall; 171 s before G3). `REA_MODEL_TIMEOUT_S` is unset, so each request's timeout is the time left
    in its phase; set it only as an upper cap. An `unavailable` request is retried once while the
    phase has time. Tool results reach the model cut to 12 KiB (head + tail), and
    `analyze_function` always runs at `detail=summary`. The final answer is schema-constrained
@@ -124,7 +124,23 @@ Three things in the plan's Step 2 cannot work as written. Each was found live:
    budget and cut the answer off mid-function. A cut-off answer keeps its complete rows
    (`model_final_salvaged`); an unusable one is asked for once more with the tokens the time left
    allows (`model_final_retry`, at least 512). Transcript turns record `finish_reason` and
-   `completion_tokens`. To change a knob, add it to the agent
+   `completion_tokens`.
+   **Analysis report (G3).** After an accepted final answer the agent makes one more
+   schema-bound call (thinking off, `prompts.report_schema`) that writes `analysis_report`, a
+   `rea.analysis/1` object describing what the program does (overview, execution flow,
+   capabilities, network, persistence, host activity, anti-analysis, unknowns), each section
+   `observed`/`not_observed`/`not_analysed` with function-address evidence, plus an AI-proposed
+   verdict. It sees this pass's findings, IOCs and summary, the sweep's kind and first 64 IOCs
+   (`State.sweep`) and the previous pass's report (`State.analysis_report`, which pass N+1
+   rewrites). Evidence addresses the passes never saw are dropped (`report_evidence_dropped`); an
+   `observed` section left without evidence becomes `not_analysed`. It is sealed in `rea.pass/1`
+   as compact JSON text (Record values cannot hold lists of objects; see `agent.py`). The call gets
+   `REA_REPORT_MAX_TOKENS=3500` (0 turns it off), counted into the final reserve
+   (1.25 x (4096 + 3500) / 30 = 316 s, capped at half the 540 s wall = 270 s), and is cut to what
+   the time left holds at the pass's measured tokens/s, or skipped under 1024 tokens
+   (`report_skipped_deadline`). A failed or invalid report (`report_failed`, `report_invalid`)
+   never costs the pass its findings; a cut-off one keeps its complete sections (`report_salvaged`).
+   To change a knob, add it to the agent
    image's `ENV` in `Dockerfile.stack-worker` (all `REA_*` keys are reserved).
    The sweep's `rea.report/1` carries an optional `chain_stop` (`not_native`, `ghidra_failed`,
    `ghidra_timeout`, `unsupported_arch`, `packed`; see `sweep.py`). When it is set the sweep seals

@@ -552,3 +552,11 @@ def test_go_literals_skipped_for_non_go_native(tmp_path: Path) -> None:
     res, _o, _g = _run(FIXTURES / "sample.exe", tmp_path,
                        runner=factory(inspect_fn=lambda cmd: {"ok": True, "result": {}}))
     assert not [s for _t, _v, s in _iocs(_fields(res)) if s.startswith("gostring:")]
+
+
+def test_continuation_carries_the_sweep_evidence_for_the_report(tmp_path: Path) -> None:
+    res, out, _g = _run(FIXTURES / "sample.exe", tmp_path)
+    _s, _p, st = unpack(out / "continuation.tar.gz", tmp_path / "chk", max_bytes=1 << 26)
+    assert st.sweep["kind"] == _fields(res)["kind"]
+    assert {"type": "url", "value": "http://evil.example/a.php?x=1", "source": "ghidra:0x401000"} in st.sweep["iocs"]
+    assert st.analysis_report is None

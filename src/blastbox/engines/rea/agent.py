@@ -22,7 +22,14 @@ dir in ``BLASTBOX_WORK_DIR``:
    only when its value occurs in the sample's own bytes (``verify_iocs_in_sample``, Ruling R),
    after a value read across a Go string literal's end is clipped to the literal
    (``gostrings.clip_overruns``);
-7. the next continuation (same project, updated ``State``) and a capped JSONL transcript are
+7. the analysis report (G3, ``_report``): when the answer was accepted, one more schema-bound
+   call (``prompts.report_schema``, reasoning off unless ``REA_FINAL_THINKING``) in its own short
+   conversation, given this pass's findings, IOCs and summary, the sweep's evidence
+   (``State.sweep``) and the previous report (``State.analysis_report``). ``report.validate_report``
+   drops evidence addresses the analysis never saw and downgrades a section left without evidence;
+   a skipped / failed / invalid report (``report_skipped_deadline`` / ``report_failed`` /
+   ``report_invalid``) leaves the rest of the pass unchanged;
+8. the next continuation (same project, updated ``State``) and a capped JSONL transcript are
    declared, and a ``rea.pass/1`` Record is sealed. The continuation is packed only when another
    pass can follow (``more_pending``); a final pass seals the transcript alone.
 
@@ -30,13 +37,38 @@ Budgets: the pass wall clock is ``min(REA_PASS_WALL_S (540), Limits.timeout_s - 
 reserve keeps time for packing and sealing; REA's 13-20 s session start is inside it. Turns are
 capped by ``REA_MAX_STEPS`` (16). Tool-choice turns ask for at most ``REA_TURN_MAX_TOKENS`` (2048)
 completion tokens, the final answer for ``REA_MAX_COMPLETION_TOKENS`` (4096). The tail of the wall
-(:func:`final_reserve`, sized from the final budget at ``REA_MODEL_TOKENS_PER_S``) is kept for the
-final answer: once exploration reaches it, tool turns stop and the final answer is forced with the
+(:func:`final_reserve`, sized from the final answer's plus the report's budget at
+``REA_MODEL_TOKENS_PER_S``, at most half the wall) is kept for the final answer and the report:
+once exploration reaches it, tool turns stop and the final answer is forced with the
 evidence gathered so far. Each model request's timeout is the time left for that phase, capped by
 ``REA_MODEL_TIMEOUT_S`` only when it is set. A request that fails with ``unavailable`` (timeout,
 connection, HTTP error) is retried once while the phase still has time. Every tool result shown to
 the model is cut to ``TOOL_RESULT_CHARS`` (head + tail around a truncation marker), and
 ``analyze_function`` always runs at ``detail=summary``.
+
+``rea.pass/1`` payload fields: ``schema``, ``pass_no``, ``model``, ``model_status``, ``steps``,
+``refused_calls``, ``tool_calls``, ``functions`` (columns ``address``/``name``/``claim``/``evidence``),
+``iocs`` (columns ``type``/``value``/``source``/``verified``/``reason``), ``summary``,
+``todo_count``, ``explored_count``, ``done``, ``more_pending`` and, only when this pass wrote a
+valid report, ``analysis_report``: the ``rea.analysis/1`` object as compact JSON text (a Record
+cannot hold lists of objects), at most ``MAX_REPORT_JSON`` chars:
+
+```text
+{"schema": "rea.analysis/1", "pass": N,
+ "verdict": {"label": benign|suspicious|malicious|unknown, "confidence": low|medium|high,
+             "rationale": <= 600 chars},
+ "sections": [{"key": overview|execution_flow|capabilities|network|persistence|host_activity|
+                      anti_analysis|unknowns (each once, in this order),
+               "title": <= 80, "status": observed|not_observed|not_analysed, "text": <= 1500,
+               "evidence": [{"address": "0x<hex>", "function"?: <= 128, "note"?: <= 200}] <= 12}]}
+```
+
+The verdict is a model opinion, never a detection; the whole object is untrusted model output.
+
+The report's tokens (``REA_REPORT_MAX_TOKENS``, 3500; 0 turns the call off) join the final
+answer's in the reserve. At report time the call asks for ``min(REA_REPORT_MAX_TOKENS, what the
+time left holds at the measured rate)`` and is skipped below ``MIN_REPORT_TOKENS``; the measured
+rate is completion tokens over seconds of this pass's calls that reported usage.
 
 Model failures never fail the job: ``model_status`` records ``unavailable``/``malformed`` (prior
 summary kept, ``more_pending=False``) or ``budget`` (``more_pending=True``). ``skipped`` means the
@@ -65,7 +97,8 @@ from blastbox.engines.rea.gostrings import clip_overruns, exact_iocs, go_strings
 from blastbox.engines.rea.mcp_client import McpError, McpStdioClient
 from blastbox.engines.rea.model import ModelClient, ModelError
 from blastbox.engines.rea.policy import ADDRESS_RE, TOOL_ALLOWLIST, CallRefused, check_call, model_tool_specs, safe_name
-from blastbox.engines.rea.prompts import IOC_TYPES, Framer, final_response_format
+from blastbox.engines.rea.prompts import IOC_TYPES, Framer, final_response_format, report_response_format
+from blastbox.engines.rea.report import ReportInvalid, complete_sections, report_addresses, validate_report
 from blastbox.engines.rea.runner import rea_env, run_ghidra_analysis
 from blastbox.engines.rea.sweep import _env_seconds, _sha256, _string_leaves
 from blastbox.limits import Limits
@@ -83,6 +116,9 @@ DEFAULT_MAX_STEPS = 16  # Ruling O; 12 -> 16 in G3 (the bounded final answer fre
 DEFAULT_MAX_TOKENS = 4096  # the final answer
 DEFAULT_TURN_MAX_TOKENS = 2048  # each tool-choice turn
 DEFAULT_TOKENS_PER_S = 30.0  # sizes the final-answer reserve (deepseek-v4-flash on vLLM, 1 sequence)
+DEFAULT_REPORT_TOKENS = 3500  # the analysis-report call (REA_REPORT_MAX_TOKENS; 0 turns it off)
+MIN_REPORT_TOKENS = 1024  # below this the report call is skipped (report_skipped_deadline)
+MAX_REPORT_JSON = 64 * 1024  # the sealed analysis_report JSON text
 DEFAULT_TOOL_TIMEOUT_S = 120.0
 DEFAULT_MAX_UNPACK_BYTES = 2 * 1024 * 1024 * 1024
 MCP_START_TIMEOUT_S = 120.0
@@ -548,6 +584,12 @@ class _Pass:
     tokens_per_s: float = DEFAULT_TOKENS_PER_S
     final_thinking: bool = False  # REA_FINAL_THINKING: keep the model's reasoning on for the final answer
     good_turns: int = 0  # model responses that parsed (with or without tool calls)
+    report_tokens: int = DEFAULT_REPORT_TOKENS
+    report: dict[str, Any] | None = None  # this pass's validated rea.analysis/1 report
+    prior_report: dict[str, Any] | None = None  # the continuation's (last valid) report
+    sweep: dict[str, Any] = field(default_factory=dict)
+    model_tokens: int = 0  # completion tokens of the calls that reported usage ...
+    model_seconds: float = 0.0  # ... and the seconds those calls took (the measured rate)
     accepted: bool = False  # _accept finished: functions/iocs/summary are one consistent answer
     warnings: list[Warning] = field(default_factory=list)
 
@@ -595,6 +637,7 @@ class ReaAgentEngine:
         max_tokens = _env_int("REA_MAX_COMPLETION_TOKENS", DEFAULT_MAX_TOKENS, 256, 131072)
         turn_tokens = min(max_tokens, _env_int("REA_TURN_MAX_TOKENS", DEFAULT_TURN_MAX_TOKENS, 256, 131072))
         tokens_per_s = _env_seconds("REA_MODEL_TOKENS_PER_S", DEFAULT_TOKENS_PER_S)
+        report_tokens = _env_int("REA_REPORT_MAX_TOKENS", DEFAULT_REPORT_TOKENS, 0, 131072)
         model_id = os.environ.get("REA_MODEL_ID") or DEFAULT_MODEL_ID
 
         # 1. unpack + integrity
@@ -611,15 +654,17 @@ class ReaAgentEngine:
 
         p = _Pass(pass_no=state.pass_no + 1, model_id=model_id, summary=state.summary,
                   todo=list(state.todo), explored=list(state.explored),
-                  final_reserve_s=final_reserve(wall, max_tokens, tokens_per_s), wall_s=wall,
+                  final_reserve_s=final_reserve(wall, max_tokens + report_tokens, tokens_per_s), wall_s=wall,
                   turn_tokens=turn_tokens, tokens_per_s=tokens_per_s,
                   final_thinking=os.environ.get("REA_FINAL_THINKING", "").strip().lower()
-                  in ("1", "true", "yes", "on"))
+                  in ("1", "true", "yes", "on"),
+                  report_tokens=report_tokens, prior_report=_sealed_report(state.analysis_report),
+                  sweep=dict(state.sweep))
         transcript_path = outdir / "transcript.jsonl"
         tw = TranscriptWriter(transcript_path, min(MAX_TRANSCRIPT_BYTES, limits.max_artifact_bytes), self._clock)
         tw.write({"event": "start", "pass_no": p.pass_no, "model": model_id, "wall_budget_s": round(wall, 1),
                   "max_steps": max_steps, "max_tokens": max_tokens, "turn_tokens": turn_tokens,
-                  "final_reserve_s": round(p.final_reserve_s, 1)})
+                  "report_tokens": report_tokens, "final_reserve_s": round(p.final_reserve_s, 1)})
 
         ghidra_status: GhidraStatus = state.ghidra_status
         program_name = state.program_name
@@ -665,6 +710,9 @@ class ReaAgentEngine:
             todo=p.todo[:MAX_TODO],
             summary=p.summary,
             started_at=state.started_at,
+            # Pass N+1 rewrites the latest valid report, this pass's or the one it was given.
+            analysis_report=p.report if p.report is not None else p.prior_report,
+            sweep=p.sweep,
         )
         transcript_reserve = min(MAX_TRANSCRIPT_BYTES, limits.max_artifact_bytes)
         if p.model_status == "ok":
@@ -1002,6 +1050,9 @@ class ReaAgentEngine:
             if answer is None:
                 return
         self._accept(answer, ev, explored_now, p, tw, sample, remaining, self._clock)
+        if p.report_tokens > 0:
+            known = ev.addresses | set(p.explored) | report_addresses(p.prior_report)
+            self._report(model, p, tw, remaining, framer, state.sample_name, known)
 
     def _final_answer(self, model: Any, p: _Pass, tw: TranscriptWriter, final_left: Callable[[], float],
                       messages: list[dict[str, Any]], framer: Framer, max_tokens: int) -> FinalAnswer | None:
@@ -1050,20 +1101,107 @@ class ReaAgentEngine:
         self._final_failed(p, tw, "malformed", "final answer is not the required JSON object")
         return None
 
-    @staticmethod
-    def _chat(model: Any, p: _Pass, tw: TranscriptWriter, budget: Callable[[], float],
+    def _chat(self, model: Any, p: _Pass, tw: TranscriptWriter, budget: Callable[[], float],
               messages: list[dict[str, Any]], tools: list[dict[str, Any]], max_tokens: int,
               **kw: Any) -> Any:
         """One model request with the phase's remaining time as its timeout; an ``unavailable``
         failure (timeout, connection, HTTP) is retried once while ``budget()`` leaves a turn."""
         try:
-            return model.chat(messages, tools, max_tokens, timeout_s=max(1.0, budget()), **kw)
+            return self._timed_chat(model, p, messages, tools, max_tokens, budget, **kw)
         except ModelError as exc:
             if exc.kind != "unavailable" or not _retryable(str(exc)) or budget() < MIN_TURN_S:
                 raise
             p.warnings.append(Warning(code="model_retry", message=f"{exc}; retrying once"[:2000]))
             tw.write({"event": "model_retry", "message": str(exc)[:2000]})
-        return model.chat(messages, tools, max_tokens, timeout_s=max(1.0, budget()), **kw)
+        return self._timed_chat(model, p, messages, tools, max_tokens, budget, **kw)
+
+    def _timed_chat(self, model: Any, p: _Pass, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
+                    max_tokens: int, budget: Callable[[], float], **kw: Any) -> Any:
+        """``model.chat``; a response that reports ``completion_tokens`` adds to the measured rate."""
+        t0 = self._clock()
+        resp = model.chat(messages, tools, max_tokens, timeout_s=max(1.0, budget()), **kw)
+        tokens = _response_info(resp)["completion_tokens"]
+        if isinstance(tokens, int) and tokens > 0:
+            p.model_tokens += tokens
+            p.model_seconds += max(0.0, self._clock() - t0)
+        return resp
+
+    @staticmethod
+    def _measured_tps(p: _Pass) -> float:
+        """Tokens/s over this pass's calls that reported usage (prompt time included), else the
+        configured ``REA_MODEL_TOKENS_PER_S``; clamped to [1, 4 x configured]."""
+        if p.model_tokens <= 0 or p.model_seconds <= 0:
+            return p.tokens_per_s
+        return max(1.0, min(4 * p.tokens_per_s, p.model_tokens / p.model_seconds))
+
+    def _report(self, model: Any, p: _Pass, tw: TranscriptWriter, remaining: Callable[[], float],
+                framer: Framer, sample_name: str, known: set[str]) -> None:
+        """The analysis report (rea.analysis/1): one schema-bound call after the accepted answer.
+
+        Skipped (``report_skipped_deadline``) when the time left cannot hold ``MIN_REPORT_TOKENS``
+        at the measured rate; otherwise asks for ``min(REA_REPORT_MAX_TOKENS, what fits)``. A model
+        error is ``report_failed``, a report that violates the schema ``report_invalid``; either
+        way the rest of the pass seals unchanged. A cut-off report keeps its complete sections
+        (``report_salvaged``).
+        """
+        try:
+            tps = self._measured_tps(p)
+            fit = int(max(0.0, remaining() - MIN_TURN_S) * tps / 1.25)
+            if fit < MIN_REPORT_TOKENS:
+                p.warnings.append(Warning(
+                    code="report_skipped_deadline",
+                    message=f"{remaining():.0f}s left at {tps:.1f} tok/s holds {fit} tokens, "
+                            f"under the report's {MIN_REPORT_TOKENS}"))
+                tw.write({"event": "report_skipped", "fit_tokens": fit, "tokens_per_s": round(tps, 2)})
+                return
+            tokens = min(p.report_tokens, fit)
+            messages = framer.report_messages(pass_no=p.pass_no, sample_name=sample_name, summary=p.summary,
+                                              functions=p.functions, iocs=p.iocs, sweep=p.sweep,
+                                              prior_report=p.prior_report)
+            kw: dict[str, Any] = {"response_format": report_response_format()}
+            if not p.final_thinking:
+                kw["chat_template_kwargs"] = {"thinking": False}
+            try:
+                resp = self._chat(model, p, tw, remaining, messages, [], tokens, **kw)
+            except ModelError as exc:
+                p.warnings.append(Warning(code="report_failed", message=f"report call failed: {exc}"[:2000]))
+                tw.write({"event": "report_failed", "message": str(exc)[:2000]})
+                return
+            parsed = _parse_message(resp)
+            content = parsed[0] if parsed is not None else None
+            tw.write({"event": "report_turn", "max_tokens": tokens, "content": (content or "")[:TRANSCRIPT_TEXT],
+                      **_response_info(resp)})
+            obj = _parse_json(content.strip()) if isinstance(content, str) else None
+            salvaged = False
+            if not isinstance(obj, dict):
+                obj = _parse_json(salvage_json_prefix(content) or "")
+                salvaged = isinstance(obj, dict)
+                if salvaged and isinstance(obj.get("sections"), dict):
+                    obj["sections"] = complete_sections(obj["sections"])
+            try:
+                v = validate_report(obj, p.pass_no, known)
+            except ReportInvalid as exc:
+                p.warnings.append(Warning(code="report_invalid", message=f"analysis report dropped: {exc}"[:2000]))
+                tw.write({"event": "report_invalid", "reason": str(exc)[:2000]})
+                return
+            text = json.dumps(v.report, ensure_ascii=False, separators=(",", ":"))
+            if len(text) > MAX_REPORT_JSON:
+                p.warnings.append(Warning(code="report_invalid",
+                                          message=f"analysis report is {len(text)} chars, over {MAX_REPORT_JSON}"))
+                return
+            if salvaged:
+                p.warnings.append(Warning(code="report_salvaged",
+                                          message="analysis report was cut off; its complete sections were kept"))
+            if v.dropped:
+                p.warnings.append(Warning(
+                    code="report_evidence_dropped",
+                    message=f"{v.dropped} report evidence address(es) the analysis never saw were dropped"
+                            + (f"; downgraded to not_analysed: {', '.join(v.downgraded)}" if v.downgraded else "")))
+            p.report = v.report
+            tw.write({"event": "report", "report": v.report, "evidence_dropped": v.dropped})
+        except Exception as exc:  # the report never costs the pass its findings
+            _log.exception("rea-agent report failed")
+            p.warnings.append(Warning(code="report_failed", message=f"exception:{type(exc).__name__}"))
 
     @staticmethod
     def _turn_failed(p: _Pass, tw: TranscriptWriter, message: str) -> None:
@@ -1178,8 +1316,12 @@ class ReaAgentEngine:
     def _payload(p: _Pass, more_pending: bool, limits: Limits) -> Record:
         functions, iocs = list(p.functions), list(p.iocs)
         budget = max(64 * 1024, limits.max_metadata_bytes // 2)
+        # rea.analysis/1 travels as JSON text: Record values cannot hold lists of objects.
+        report = (json.dumps(p.report, ensure_ascii=False, separators=(",", ":"))
+                  if p.report is not None and p.model_status == "ok" else None)
 
         def build() -> Record:
+            extra: dict[str, Any] = {"analysis_report": report} if report is not None else {}
             return Record(fields={
                 "schema": SCHEMA,
                 "pass_no": p.pass_no,
@@ -1208,6 +1350,7 @@ class ReaAgentEngine:
                 "explored_count": len(p.explored),
                 "done": p.done,
                 "more_pending": more_pending,
+                **extra,
             })
 
         rec = build()
@@ -1215,11 +1358,29 @@ class ReaAgentEngine:
             functions = functions[: len(functions) // 2]
             iocs = iocs[: len(iocs) // 2]
             rec = build()
+        if len(rec.model_dump_json()) > budget and report is not None:
+            report = None
+            rec = build()
+            p.warnings.append(Warning(code="report_invalid",
+                                      message="analysis_report dropped to fit the metadata limit"))
         if len(functions) < len(p.functions) or len(iocs) < len(p.iocs):
             p.warnings.append(Warning(code="payload_truncated",
                                       message="functions/iocs trimmed to fit the metadata limit; "
                                               "the transcript artifact has the full lists"))
         return rec
+
+
+def _sealed_report(obj: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The continuation's report when it is still a valid rea.analysis/1 object, else None."""
+    if obj is None:
+        return None
+    pass_no = obj.get("pass")
+    if not isinstance(pass_no, int) or isinstance(pass_no, bool) or pass_no < 1:
+        return None
+    try:
+        return validate_report(obj, pass_no, None).report
+    except ReportInvalid:
+        return None
 
 
 _HTTP_STATUS = re.compile(r"\bhttp_(\d{3})\b")

@@ -188,3 +188,20 @@ def test_member_count_capped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     arc = _raw(tmp_path / "many.tar.gz", members)
     with pytest.raises(ContinuationError):
         c.unpack(arc, tmp_path / "out", max_bytes=1 << 20)
+
+
+def test_state_carries_the_analysis_report_and_sweep_evidence() -> None:
+    rep = {"schema": "rea.analysis/1", "pass": 2, "verdict": {}, "sections": []}
+    st = State(pass_no=2, sample_name="s", sample_sha256="0" * 64, program_name="s", ghidra_status="ok",
+               analysis_report=rep, sweep={"kind": "elf", "iocs": []})
+    back = State.from_json(st.to_json())
+    assert back.analysis_report == rep and back.sweep == {"kind": "elf", "iocs": []}
+
+
+def test_state_from_an_older_continuation_has_no_report() -> None:
+    old = {"pass_no": 1, "sample_name": "s", "sample_sha256": "0" * 64, "program_name": None,
+           "ghidra_status": "ok", "explored": [], "todo": [], "summary": "", "started_at": 0.0}
+    st = State.from_json(json.dumps(old))
+    assert st.analysis_report is None and st.sweep == {}
+    with pytest.raises(ContinuationError):
+        State.from_json(json.dumps({**old, "analysis_report": ["not", "an", "object"]}))

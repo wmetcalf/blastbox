@@ -13,7 +13,8 @@ One job, in order, everything under a fresh per-job dir in ``BLASTBOX_WORK_DIR``
    and, for Go binaries, the exact string literals named by Go string headers
    (``gostrings.py``, source ``gostring:0x<va>``); an IOC read across a Go literal's end is
    clipped to that literal's own IOC;
-7. a continuation archive (sample + Ghidra project + ``State``), only when a model pass can
+7. a continuation archive (sample + Ghidra project + ``State``, whose ``sweep`` holds the kind and
+   the first ``STATE_IOCS`` IOCs for the agent's analysis report), only when a model pass can
    follow. Otherwise the payload names why in ``chain_stop`` (Ruling AL, superseding "a Ghidra
    timeout still continues"), seals ``more_pending=false`` and packs no continuation;
 8. a ``rea.report/1`` Record payload plus a full JSON ``report`` artifact.
@@ -92,6 +93,7 @@ MAX_STRING_CHARS = 4096
 MAX_IOCS = 2048
 MAX_UTF16_SCAN_BYTES = 256 * 1024 * 1024
 MAX_UTF16_URLS = 1024
+STATE_IOCS = 64  # sweep IOCs carried in the continuation for the agent's analysis report
 GO_SCAN_S = 30.0  # wall-clock cap on the Go string-header scan
 MAX_ICONS = 8
 MAX_REPORT_BYTES = 16 * 1024 * 1024
@@ -334,7 +336,9 @@ class ReaSweepEngine:
         # rejects and packed stubs give the model nothing to analyse.
         chain_stop = self._chain_stop(input, kind, ghidra_status, function_count)
         chainable = chain_stop is None
-        cont = (self._continuation(input, outdir, project, ghidra_status, limits, warnings)
+        sweep_evidence = {"kind": kind, "iocs": [{"type": i.type, "value": i.value, "source": i.source}
+                                                 for i in iocs[:STATE_IOCS]]}
+        cont = (self._continuation(input, outdir, project, ghidra_status, limits, warnings, sweep_evidence)
                 if chainable else None)
 
         # 7. artifact budget (report + continuation reserved first)
@@ -448,7 +452,8 @@ class ReaSweepEngine:
 
     @staticmethod
     def _continuation(sample: Path, outdir: Path, project: Path, ghidra_status: GhidraStatus,
-                      limits: Limits, warnings: list[Warning]) -> Path | None:
+                      limits: Limits, warnings: list[Warning],
+                      sweep_evidence: dict[str, Any] | None = None) -> Path | None:
         dest = outdir / "continuation.tar.gz"
         state = State(
             pass_no=0,
@@ -457,6 +462,7 @@ class ReaSweepEngine:
             program_name=sample.name if ghidra_status == "ok" else None,
             ghidra_status=ghidra_status,
             started_at=time.time(),
+            sweep=dict(sweep_evidence or {}),
         )
         try:
             pack(dest, sample=sample, project_dir=project if ghidra_status == "ok" else None, state=state)

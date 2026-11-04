@@ -55,6 +55,9 @@ def _env(tmp_path, monkeypatch):
     monkeypatch.setenv("REA_MODEL_ID", "deepseek-v4-flash")
     for k in ("REA_PASS_WALL_S", "REA_MAX_STEPS", "REA_MAX_COMPLETION_TOKENS"):
         monkeypatch.delenv(k, raising=False)
+    # The analysis-report call (G3) is off unless a test turns it on: the scripted models below
+    # end at the final answer.
+    monkeypatch.setenv("REA_REPORT_MAX_TOKENS", "0")
 
 
 def make_continuation(tmp_path, *, project=True, todo=None, explored=None, summary="prior summary",
@@ -1604,3 +1607,228 @@ def test_default_step_cap_is_16_in_the_engine_and_the_image():
     assert ag.DEFAULT_MAX_STEPS == 16
     dockerfile = (HERE.parents[1] / "deploy" / "rea" / "Dockerfile.stack-worker").read_text()
     assert re.search(r"\bREA_MAX_STEPS=16\b", dockerfile) and "REA_MAX_STEPS=12" not in dockerfile
+
+
+
+# ------------------------------------------------------------------ G3: the analysis report
+
+FN_MAIN = "0x140001420"
+PRIOR_REPORT = {
+    "schema": "rea.analysis/1", "pass": 1,
+    "verdict": {"label": "unknown", "confidence": "low", "rationale": "only the entry point seen"},
+    "sections": [{"key": "overview", "title": "Overview", "status": "observed", "text": "prior overview",
+                  "evidence": [{"address": "0x140001500", "function": "FUN_140001500", "note": "seen in pass 1"}]}],
+}
+
+
+def _section(status="not_analysed", text="Not analysed.", evidence=None, title=""):
+    return {"title": title, "status": status, "text": text, "evidence": list(evidence or [])}
+
+
+def _report(**over):
+    sections = {k: _section() for k in prompts.REPORT_KEYS}
+    sections["overview"] = _section("observed", "Prints a greeting and exits.", [], "Overview")
+    sections["execution_flow"] = _section("observed", "entry calls main, which prints.", [
+        {"address": FN_MAIN, "function": "entry", "note": "start"},
+        {"address": "0xdeadbeef", "function": "ghost", "note": "invented"}])
+    sections["capabilities"] = _section("observed", "Talks to a C2.", [
+        {"address": "0x41414141", "function": "made_up", "note": "invented"}])
+    sections["network"] = _section("not_observed", "No sockets.", [{"address": FN_MAIN, "function": "", "note": ""}],
+                                   "network")
+    sections.update(over.pop("sections", {}))
+    obj = {"verdict": {"label": "benign", "confidence": "medium", "rationale": "prints and exits"},
+           "sections": sections}
+    obj.update(over)
+    return obj
+
+
+FINAL_OK = {"summary": "Prints hello.", "functions": [
+    {"address": FN_MAIN, "name": "entry", "claim": "prints hello", "evidence": ["t1"]}],
+    "iocs": [{"type": "url", "value": "http://evil.example/a.php", "source": FN_MAIN}],
+    "todo": ["0x140001500"], "done": False}
+
+
+def _with_usage(resp, tokens):
+    return {**resp, "usage": {"completion_tokens": tokens}}
+
+
+def _report_run(tmp_path, monkeypatch, report_resp, *, prior=None, clock=time.monotonic, on_chat=None,
+                tokens=None, tool_turn=None):
+    monkeypatch.delenv("REA_REPORT_MAX_TOKENS", raising=False)
+    if tokens is not None:
+        monkeypatch.setenv("REA_REPORT_MAX_TOKENS", str(tokens))
+    cont = make_continuation(tmp_path, analysis_report=prior,
+                             sweep={"kind": "pe", "iocs": [{"type": "domain", "value": "sweep.example",
+                                                            "source": "ghidra:0x1"}]})
+    script = [tool_turn or tc(("procedure_pseudo_code", {"procedure": FN_MAIN}, "a")), answer(FINAL_OK)]
+    if report_resp is not None:
+        script.append(report_resp)
+    model = FakeModel(script, on_chat=on_chat)
+    res, out = run(tmp_path, cont, model, McpRig(tmp_path, {"procedure_pseudo_code": {"text": DECOMP}}),
+                   clock=clock)
+    return res, out, model
+
+
+def _codes(res):
+    return [w.code for w in res.warnings]
+
+
+def test_report_schema_is_the_interface_shape_and_fits_the_token_budget():
+    p = prompts
+    sch = p.report_schema()
+    assert list(sch["properties"]["sections"]["properties"]) == list(p.REPORT_KEYS)
+    assert sch["properties"]["sections"]["required"] == list(p.REPORT_KEYS)
+    v = sch["properties"]["verdict"]["properties"]
+    assert v["label"]["enum"] == ["benign", "suspicious", "malicious", "unknown"]
+    assert v["confidence"]["enum"] == ["low", "medium", "high"]
+    assert p.GEN_RATIONALE <= p.REPORT_RATIONALE and p.GEN_TITLE <= p.REPORT_TITLE
+    assert p.GEN_FUNCTION <= p.REPORT_FUNCTION and p.GEN_NOTE <= p.REPORT_NOTE
+    assert all(t <= p.REPORT_TEXT and e <= p.REPORT_EVIDENCE for t, e in p.GEN_SECTIONS.values())
+    # ~4 chars/token for bounded strings, ~12 tokens of syntax per evidence row, ~20 per section.
+    ev = 6 + p.GEN_FUNCTION // 4 + p.GEN_NOTE // 4 + 12
+    worst = (p.GEN_RATIONALE // 4 + 20
+             + sum(p.GEN_TITLE // 4 + t // 4 + e * ev + 20 for t, e in p.GEN_SECTIONS.values()))
+    assert worst <= ag.DEFAULT_REPORT_TOKENS
+
+
+def test_report_is_written_validated_and_carried_to_the_next_pass(tmp_path, monkeypatch):
+    res, out, model = _report_run(tmp_path, monkeypatch, answer(_report()), prior=PRIOR_REPORT)
+    f = res.payload.fields
+    assert f["model_status"] == "ok" and cols(res.payload, "functions")["address"] == [FN_MAIN]
+    rep = json.loads(f["analysis_report"])
+    assert rep["schema"] == "rea.analysis/1" and rep["pass"] == 1
+    assert rep["verdict"] == {"label": "benign", "confidence": "medium", "rationale": "prints and exits"}
+    secs = {s["key"]: s for s in rep["sections"]}
+    assert [s["key"] for s in rep["sections"]] == list(prompts.REPORT_KEYS)
+    assert secs["overview"]["status"] == "observed" and secs["overview"]["evidence"] == []
+    assert secs["execution_flow"]["evidence"] == [{"address": FN_MAIN, "function": "entry", "note": "start"}]
+    # Only invented addresses: downgraded, its unsupported claim not repeated.
+    assert secs["capabilities"]["status"] == "not_analysed" and secs["capabilities"]["evidence"] == []
+    assert "C2" not in secs["capabilities"]["text"]
+    assert secs["network"]["status"] == "not_observed" and secs["network"]["evidence"] == []
+    assert secs["persistence"]["title"] == "Persistence"  # empty title -> the default one
+    assert secs["network"]["title"] == "Network"  # a title that only repeats the key, too
+    assert "report_evidence_dropped" in _codes(res)
+    # The call: its own conversation, schema-bound, thinking off, the prior report and findings in it.
+    call = model.calls[-1]
+    assert call["tools"] == [] and call["max_tokens"] == ag.DEFAULT_REPORT_TOKENS
+    assert call["response_format"]["json_schema"]["name"] == "rea_analysis"
+    assert call["chat_template_kwargs"] == {"thinking": False}
+    body = json.dumps(call["messages"])
+    assert "prior overview" in body and "prints hello" in body and "sweep.example" in body
+    assert "found_in_sample" in body and len(call["messages"]) == 2
+    st = next_state(out)
+    assert st.analysis_report == rep and st.sweep["kind"] == "pe"
+
+
+def test_prior_report_addresses_stay_citable(tmp_path, monkeypatch):
+    sections = {"overview": _section("observed", "o", [{"address": "0x140001500", "function": "f", "note": "n"}])}
+    res, _o, _m = _report_run(tmp_path, monkeypatch, answer(_report(sections=sections)), prior=PRIOR_REPORT)
+    rep = json.loads(res.payload.fields["analysis_report"])
+    assert rep["sections"][0]["evidence"][0]["address"] == "0x140001500"
+
+
+@pytest.mark.parametrize("bad", [
+    {"verdict": {"label": "evil", "confidence": "high", "rationale": "x"}},
+    {"verdict": {"label": "benign", "confidence": "high", "rationale": "x" * 601}},
+    {"sections": {"overview": _section("seen", "x")}},
+    {"sections": {"network": _section("not_observed", "x" * 1501)}},
+    {"sections": {"execution_flow": _section("observed", "x", [{"address": "not-an-address"}])}},
+    {"sections": {"execution_flow": _section("observed", "x", [{"address": FN_MAIN}] * 13)}},
+])
+def test_invalid_report_is_dropped_and_the_pass_still_seals(tmp_path, monkeypatch, bad):
+    res, out, _m = _report_run(tmp_path, monkeypatch, answer(_report(**bad)), prior=PRIOR_REPORT)
+    f = res.payload.fields
+    assert "analysis_report" not in f and "report_invalid" in _codes(res)
+    assert f["model_status"] == "ok" and f["summary"] == "Prints hello."
+    assert cols(res.payload, "functions")["address"] == [FN_MAIN]
+    carried = next_state(out).analysis_report  # the last valid report carries on (all 8 keys filled)
+    assert carried["pass"] == 1 and carried["sections"][0] == PRIOR_REPORT["sections"][0]
+    assert [s["key"] for s in carried["sections"]] == list(prompts.REPORT_KEYS)
+
+
+def test_unparseable_report_is_invalid(tmp_path, monkeypatch):
+    res, _o, _m = _report_run(tmp_path, monkeypatch, answer("not json at all"))
+    assert "analysis_report" not in res.payload.fields and "report_invalid" in _codes(res)
+
+
+def test_report_model_error_is_report_failed(tmp_path, monkeypatch):
+    res, _o, _m = _report_run(tmp_path, monkeypatch, ModelError("malformed", "invalid_json"))
+    f = res.payload.fields
+    assert "analysis_report" not in f and "report_failed" in _codes(res) and f["model_status"] == "ok"
+
+
+def test_cut_off_report_keeps_its_complete_sections(tmp_path, monkeypatch):
+    text = json.dumps(_report())
+    cut = text[:text.index('"capabilities"') + 30]
+    res, _o, _m = _report_run(tmp_path, monkeypatch, answer(cut))
+    rep = json.loads(res.payload.fields["analysis_report"])
+    secs = {s["key"]: s for s in rep["sections"]}
+    assert len(rep["sections"]) == 8
+    assert secs["execution_flow"]["status"] == "observed"
+    assert secs["capabilities"]["status"] == "not_analysed" and secs["unknowns"]["status"] == "not_analysed"
+    assert "report_salvaged" in _codes(res)
+
+
+def test_report_skipped_when_the_wall_cannot_hold_it(tmp_path, monkeypatch):
+    now = [0.0]
+
+    def on_chat():
+        now[0] += 265.0  # the final answer lands 10 s before the 540 s wall
+
+    res, _o, model = _report_run(tmp_path, monkeypatch, None, clock=lambda: now[0], on_chat=on_chat)
+    f = res.payload.fields
+    assert len(model.calls) == 2 and "analysis_report" not in f
+    assert "report_skipped_deadline" in _codes(res) and f["model_status"] == "ok"
+
+
+def test_report_tokens_sized_from_the_measured_rate(tmp_path, monkeypatch):
+    now = [0.0]
+
+    def on_chat():
+        now[0] += 40.0  # each call: 40 s
+
+    # 160 tokens in 40 s = 4 tok/s measured (the final answer reports no usage and is not counted).
+    turn = _with_usage(tc(("procedure_pseudo_code", {"procedure": FN_MAIN}, "a")), 160)
+    res, _o, model = _report_run(tmp_path, monkeypatch, answer(_report()), clock=lambda: now[0],
+                                 on_chat=on_chat, tool_turn=turn)
+    assert "analysis_report" in res.payload.fields
+    left = 540.0 - 80.0  # two calls before the report
+    want = int((left - ag.MIN_TURN_S) * 4.0 / 1.25)
+    assert ag.MIN_REPORT_TOKENS <= want < ag.DEFAULT_REPORT_TOKENS
+    assert model.calls[-1]["max_tokens"] == want
+
+
+def test_final_reserve_holds_the_report_too(tmp_path, monkeypatch):
+    res, out, _m = _report_run(tmp_path, monkeypatch, answer(_report()))
+    start = json.loads((out / "transcript.jsonl").read_text().splitlines()[0])
+    assert start["final_reserve_s"] == round(ag.final_reserve(540.0, ag.DEFAULT_MAX_TOKENS
+                                                              + ag.DEFAULT_REPORT_TOKENS), 1)
+
+
+def test_report_off_keeps_the_old_payload(tmp_path):
+    cont = make_continuation(tmp_path)
+    model = FakeModel([answer(FINAL_OK)])
+    res, _ = run(tmp_path, cont, model, McpRig(tmp_path))
+    assert "analysis_report" not in res.payload.fields and len(model.calls) == 1
+
+
+def test_report_never_written_without_an_accepted_answer(tmp_path, monkeypatch):
+    monkeypatch.delenv("REA_REPORT_MAX_TOKENS", raising=False)
+    cont = make_continuation(tmp_path)
+    model = FakeModel([answer("nope"), answer("still nope"), answer("nope again")])
+    res, _ = run(tmp_path, cont, model, McpRig(tmp_path))
+    assert "analysis_report" not in res.payload.fields
+    assert not any((c["response_format"] or {}).get("json_schema", {}).get("name") == "rea_analysis"
+                   for c in model.calls)
+
+
+def test_every_rea_knob_the_engines_read_is_a_reserved_compose_key():
+    src = HERE.parents[1] / "src" / "blastbox" / "engines" / "rea"
+    read = set()
+    for f in src.glob("*.py"):
+        read |= set(re.findall(r'"(REA_[A-Z_]+)"', f.read_text()))
+    compose = (HERE.parents[1] / "deploy" / "rea" / "compose.yml").read_text()
+    reserved = set(re.search(r"RESERVED_KEYS: &rea-reserved (\S+)", compose).group(1).split(","))
+    assert "REA_REPORT_MAX_TOKENS" in read
+    assert read - reserved == set()

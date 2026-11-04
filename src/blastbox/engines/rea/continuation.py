@@ -68,6 +68,11 @@ class State:
     todo: list[str] = field(default_factory=list)
     summary: str = ""
     started_at: float = 0.0
+    # G3: the last valid rea.analysis/1 report (each pass rewrites it) and the sweep's evidence
+    # for the report call (``{"kind", "iocs": [{"type", "value", "source"}]}``). Both are absent
+    # from older continuations and default to empty.
+    analysis_report: dict[str, Any] | None = None
+    sweep: dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), sort_keys=True)
@@ -86,9 +91,19 @@ class State:
                 todo=[str(x) for x in d["todo"]],
                 summary=str(d["summary"]),
                 started_at=float(d["started_at"]),
+                analysis_report=_opt_dict(d.get("analysis_report")),
+                sweep=_opt_dict(d.get("sweep")) or {},
             )
         except (ValueError, KeyError, TypeError) as exc:
             raise ContinuationError(f"bad state.json: {exc}") from exc
+
+
+def _opt_dict(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise TypeError("expected an object or null")
+    return value
 
 
 def pack(dest: Path, *, sample: Path, project_dir: Path | None, state: State) -> Path:
