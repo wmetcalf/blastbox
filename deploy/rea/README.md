@@ -42,9 +42,9 @@ either the system bundle or `ca.crt` changes.
 
 ```text
 image                         from                                                     toolz2 id
-blastbox-rea:dev              Dockerfile.rea-cold-worker @ feat/rea-engine 8704872      d1812afe4228 (prev: blastbox-rea:dev-849fe70 @ a03b1ca)
-blastbox-rea-sweep:d1812af    Dockerfile.stack-worker ENGINE_CLASS=ReaSweepEngine        32e8a1d22773
-blastbox-rea-agent:d1812af    Dockerfile.stack-worker ENGINE_CLASS=ReaAgentEngine        9bab4f5d934e
+blastbox-rea:dev              Dockerfile.rea-cold-worker @ feat/rea-engine 31b56e2      9854db3f8bdf (prev: blastbox-rea:dev-d1812af @ 8704872)
+blastbox-rea-sweep:9854db3    Dockerfile.stack-worker ENGINE_CLASS=ReaSweepEngine        c69ee105eadb
+blastbox-rea-agent:9854db3    Dockerfile.stack-worker ENGINE_CLASS=ReaAgentEngine        ca0e7394f9ae
 blastbox-rea-host:0def6b2     Dockerfile.host @ deploy/rea-toolz2 0def6b2                8f6eab0bb0eb
 rea-model-proxy               kalaksi/tinyproxy@sha256:fafafc7079ca29c6704564de1353f61d038f2166f09b01d4e460e8e499bf6b57 (tinyproxy 1.11.3)
 ```
@@ -63,9 +63,9 @@ docker tag blastbox-rea:dev blastbox-rea:dev-prev
 docker build -f deploy/docker/Dockerfile.rea-cold-worker -t blastbox-rea:dev .
 # A digest BASE_IMAGE for a freshly built local image failed to resolve on toolz2 (buildkit tried
 # docker.io). After checking that blastbox-rea:dev has the pinned id, pass the tag instead:
-docker build -f deploy/rea/Dockerfile.stack-worker -t blastbox-rea-sweep:d1812af --build-arg BASE_IMAGE=blastbox-rea:dev \
+docker build -f deploy/rea/Dockerfile.stack-worker -t blastbox-rea-sweep:9854db3 --build-arg BASE_IMAGE=blastbox-rea:dev \
   --build-arg ENGINE_CLASS=blastbox.engines.rea:ReaSweepEngine --build-arg ENGINE_NAME=rea .
-docker build -f deploy/rea/Dockerfile.stack-worker -t blastbox-rea-agent:d1812af --build-arg BASE_IMAGE=blastbox-rea:dev \
+docker build -f deploy/rea/Dockerfile.stack-worker -t blastbox-rea-agent:9854db3 --build-arg BASE_IMAGE=blastbox-rea:dev \
   --build-arg ENGINE_CLASS=blastbox.engines.rea:ReaAgentEngine --build-arg ENGINE_NAME=rea-agent .
 # host (context = repo root at deploy/rea-toolz2)
 docker build -f deploy/rea/Dockerfile.host -t blastbox-rea-host:0def6b2 .
