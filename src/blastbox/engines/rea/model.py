@@ -13,11 +13,16 @@
 - Transport and HTTP failures raise ``ModelError("unavailable")``; an oversized, non-JSON or
   non-object body raises ``ModelError("malformed")``. Interpreting ``choices`` is the
   caller's job (the agent parses it defensively); ``reasoning_content`` is never used.
+- ``REA_MODEL_DIALECT`` (baked into the agent image; default ``vllm``) says how the "thinking
+  off" switch is spelled: ``vllm`` sends ``chat_template_kwargs``; ``openrouter`` sends
+  ``reasoning: {"enabled": false}`` (OpenRouter ignores ``chat_template_kwargs``). Credentials
+  for a hosted endpoint live in the operator's gateway, never here.
 """
 
 from __future__ import annotations
 
 import http.client
+import os
 import json
 import logging
 import threading
@@ -32,6 +37,9 @@ MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 _log = logging.getLogger("blastbox.engines.rea.model")
 
 ModelErrorKind = Literal["unavailable", "malformed"]
+
+
+DIALECTS = ("vllm", "openrouter")
 
 
 class ModelError(Exception):
@@ -53,11 +61,14 @@ def default_opener() -> urllib.request.OpenerDirector:
 
 class ModelClient:
     def __init__(self, url: str, model: str, timeout_s: float,
-                 opener: urllib.request.OpenerDirector | Any | None = None) -> None:
+                 opener: urllib.request.OpenerDirector | Any | None = None, dialect: str | None = None) -> None:
         parts = urlsplit(url)
         if parts.scheme not in ("http", "https") or not parts.netloc:
             raise ValueError(f"model URL must be http(s)://host[:port]/...: {url!r}")
         self.url = url.rstrip("/") + "/chat/completions"
+        self.dialect = dialect if dialect is not None else (os.environ.get("REA_MODEL_DIALECT") or "vllm")
+        if self.dialect not in DIALECTS:
+            raise ValueError(f"REA_MODEL_DIALECT must be one of {', '.join(DIALECTS)}: {self.dialect!r}")
         self.model = model
         self.timeout_s = timeout_s
         # Built per client (not at import) so the proxy env in force at job time applies.
@@ -68,8 +79,13 @@ class ModelClient:
              chat_template_kwargs: dict[str, Any] | None = None) -> dict[str, Any]:
         body: dict[str, Any] = {"model": self.model, "messages": messages, "max_tokens": int(max_tokens)}
         if chat_template_kwargs is not None:
-            # vLLM extension; {"thinking": False} turns DeepSeek's reasoning off for this request.
-            body["chat_template_kwargs"] = chat_template_kwargs
+            if self.dialect == "openrouter":
+                # OpenRouter's spelling; only the thinking switch has an equivalent.
+                if "thinking" in chat_template_kwargs:
+                    body["reasoning"] = {"enabled": bool(chat_template_kwargs["thinking"])}
+            else:
+                # vLLM extension; {"thinking": False} turns DeepSeek's reasoning off for this request.
+                body["chat_template_kwargs"] = chat_template_kwargs
         if tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"

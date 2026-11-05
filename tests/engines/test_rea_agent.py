@@ -1851,3 +1851,26 @@ def test_report_prompt_ties_observed_to_the_programs_own_code():
     sysmsg = prompts._REPORT_SYSTEM
     assert "program's own code doing it" in sysmsg
     assert "its status is not_observed, never observed" in sysmsg
+
+
+@pytest.mark.parametrize("dialect, thinking, want", [
+    ("vllm", False, {"chat_template_kwargs": {"thinking": False}}),
+    ("openrouter", False, {"reasoning": {"enabled": False}}),
+    ("openrouter", True, {"reasoning": {"enabled": True}}),
+])
+def test_model_dialect_spells_the_thinking_switch(monkeypatch, dialect, thinking, want):
+    monkeypatch.setenv("REA_MODEL_DIALECT", dialect)
+    op = FakeOpener(json.dumps({"choices": [{"message": {"content": "{}"}}]}).encode())
+    m = ModelClient("http://gw:8080/api/v1", "deepseek/deepseek-v4.1-flash", 30, opener=op)
+    m.chat([{"role": "user", "content": "hi"}], [], 512, chat_template_kwargs={"thinking": thinking})
+    body = json.loads(op.requests[0].data)
+    assert {k: body[k] for k in ("chat_template_kwargs", "reasoning") if k in body} == want
+    assert "authorization" not in {k.lower() for k, _ in op.requests[0].header_items()}
+
+
+def test_model_dialect_defaults_to_vllm_and_rejects_unknown(monkeypatch):
+    monkeypatch.delenv("REA_MODEL_DIALECT", raising=False)
+    assert ModelClient("http://m:1/v1", "x", 5).dialect == "vllm"
+    monkeypatch.setenv("REA_MODEL_DIALECT", "anthropic")
+    with pytest.raises(ValueError, match="REA_MODEL_DIALECT"):
+        ModelClient("http://m:1/v1", "x", 5)
