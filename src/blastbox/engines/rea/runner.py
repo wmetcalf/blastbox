@@ -435,6 +435,12 @@ class ReaRunner:
 
 _SCRIPT_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}\.(?:java|py)")
 
+# Auto-analysis runs one native decompiler process per analysis thread, and on a .NET
+# assembly each one grew past 1 GiB until the 6 GiB slot was OOM-killed (no output at all).
+# Two threads keep the JVM's 2 GiB heap plus the decompilers inside the slot; the image's
+# decompile wrapper caps each process's address space so one runaway function fails alone.
+GHIDRA_MAX_CPU = 2
+
 
 def run_ghidra_analysis(
     sample: Path,
@@ -466,6 +472,8 @@ def run_ghidra_analysis(
         "-import",
         str(sample),
         "-overwrite",
+        "-max-cpu",
+        str(GHIDRA_MAX_CPU),
     ]
     if post_script is not None:
         script_dir, script_name, output_path = post_script
@@ -482,3 +490,36 @@ def run_ghidra_analysis(
     if out.rc == 0 and (project_dir / "sample.gpr").exists():
         return "ok"
     return "failed"
+
+
+def upx_unpack(
+    sample: Path,
+    dest: Path,
+    timeout_s: float,
+    *,
+    env: Mapping[str, str],
+    max_bytes: int,
+    run_fn: RunFn = bounded_run,
+) -> Literal["ok", "timeout", "failed"]:
+    """``upx -d`` ``sample`` into ``dest`` (a static decompressor: the sample never runs).
+
+    The output is attacker-sized, so ``ulimit -f`` stops the write at ``max_bytes`` (upx dies
+    with SIGXFSZ) and an over-size or missing ``dest`` is a failure. A scrambled UPX header,
+    the common anti-unpack trick, makes upx exit non-zero: also a failure.
+    """
+    sample, dest = sample.resolve(), dest.resolve()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    blocks = max(1, max_bytes // 512)  # sh's ulimit -f counts 512-byte blocks
+    argv = ["sh", "-c", 'ulimit -f "$1" && exec upx -d -q -o "$2" "$3"', "sh", str(blocks), str(dest), str(sample)]
+    out = run_fn(argv, env=env, cwd=dest.parent, timeout_s=timeout_s, max_stdout=0)
+    if out.timed_out:
+        dest.unlink(missing_ok=True)
+        return "timeout"
+    try:
+        ok = out.rc == 0 and dest.is_file() and not dest.is_symlink() and 0 < dest.stat().st_size <= max_bytes
+    except OSError:
+        ok = False
+    if not ok:
+        dest.unlink(missing_ok=True)
+        return "failed"
+    return "ok"

@@ -84,11 +84,26 @@ def _workdir(tmp_path, monkeypatch):
     return wd
 
 
-def _run(sample: Path, tmp_path: Path, *, runner=None, ghidra=None, limits=None):
+class FakeUnpack:
+    """Stands in for upx_unpack: writes ``image`` to dest on "ok"."""
+
+    def __init__(self, status="ok", image=None):
+        self.status, self.image = status, image
+        self.calls: list[dict] = []
+
+    def __call__(self, sample, dest, timeout_s, *, env, max_bytes):
+        self.calls.append(dict(sample=sample, dest=dest, timeout_s=timeout_s, max_bytes=max_bytes))
+        if self.status == "ok":
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(self.image if self.image is not None else (FIXTURES / "sample.exe").read_bytes())
+        return self.status
+
+
+def _run(sample: Path, tmp_path: Path, *, runner=None, ghidra=None, limits=None, unpack=None):
     out = tmp_path / "out"
     out.mkdir(exist_ok=True)
     ghidra = ghidra or FakeGhidra()
-    eng = ReaSweepEngine(runner_factory=runner or factory(), ghidra_fn=ghidra)
+    eng = ReaSweepEngine(runner_factory=runner or factory(), ghidra_fn=ghidra, unpack_fn=unpack or FakeUnpack("failed"))
     res = eng.detonate(sample, out, limits or Limits(timeout_s=600))
     return res, out, ghidra
 
@@ -476,6 +491,41 @@ def test_chain_stop_packed_upx(tmp_path):
     p = make_pe(tmp_path / "upx.exe", [(b"UPX0", X, b""), (b"UPX1", X, b"\x90" * 4096)])
     res, out, _g = _run(p, tmp_path)
     _not_pending(res, out, "packed")
+    assert "unpack_failed" in _codes(res) and "unpacked" not in _fields(res)
+
+
+def test_upx_sample_is_unpacked_and_the_image_analysed(tmp_path):
+    import hashlib
+    p = make_pe(tmp_path / "upx.exe", [(b"UPX0", X, b""), (b"UPX1", X, b"\x90" * 4096)])
+    image = (FIXTURES / "sample.exe").read_bytes()
+    up = FakeUnpack("ok", image)
+    res, out, g = _run(p, tmp_path, unpack=up)
+    f = _fields(res)
+    assert up.calls[0]["sample"] == p and up.calls[0]["dest"].name == "upx.exe"
+    assert up.calls[0]["max_bytes"] == sw.MAX_UNPACKED_BYTES
+    assert g.calls[0]["sample"] == up.calls[0]["dest"]  # Ghidra sees the unpacked image
+    assert f["unpacked"] == "upx" and f["unpacked_sha256"] == hashlib.sha256(image).hexdigest()
+    assert f["more_pending"] is True and "chain_stop" not in f and "unpack_failed" not in _codes(res)
+    sample, _proj, state = unpack(out / "continuation.tar.gz", tmp_path / "cont", max_bytes=1 << 30)
+    assert state.sample_name == "upx.exe" and sample.read_bytes() == image
+    assert state.sweep["unpacked"] == {"packer": "upx", "packed_sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+
+
+def test_unmarked_samples_are_never_unpacked(tmp_path):
+    up = FakeUnpack("ok")
+    _run(FIXTURES / "sample.exe", tmp_path, unpack=up)
+    _run(FIXTURES / "sample.elf", tmp_path, unpack=up)
+    assert up.calls == []
+
+
+def test_unpack_exception_is_a_warning(tmp_path):
+    p = make_pe(tmp_path / "upx.exe", [(b"UPX0", X, b""), (b"UPX1", X, b"\x90" * 4096)])
+
+    def boom(*a, **kw):
+        raise OSError("no upx")
+
+    res, out, _g = _run(p, tmp_path, unpack=boom)
+    assert _fields(res)["chain_stop"] == "packed" and "unpack_failed" in _codes(res)
 
 
 def test_chain_stop_packed_from_function_count(tmp_path):

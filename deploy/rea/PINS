@@ -23,3 +23,6 @@ GHIDRA_SHA256=ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db
 # Ghidra compiles Java GhidraScripts (REA's bridge and our ghidra_scripts) at run
 # time with the in-process javax.tools compiler, which a JRE lacks.
 JDK_IMAGE=eclipse-temurin:21-jdk@sha256:ebfbb18d11ff163ee83b21258acf12248af48d22a0fdfdc68fa1a1516c05976a
+
+# upx-ucl from the base image's Ubuntu archive (the sweep upx -d-s UPX-marked samples).
+UPX_VERSION=4.2.4-1.1build1

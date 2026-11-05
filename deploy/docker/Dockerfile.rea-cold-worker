@@ -116,15 +116,26 @@ COPY --from=rea-fixtures-build /out/ /
 FROM ${JDK_IMAGE}
 # REA's MCP tool-catalog digest for the pinned commit (see deploy/rea/PINS).
 ARG REA_TOOLS_SHA256=c819d694c65bd1482a0e780ff1848542f2046fe50a6b68fc366066b593d7e58f
+# The sweep upx -d-s UPX-marked samples (a static decompressor; the sample never runs).
+ARG UPX_VERSION=4.2.4-1.1build1
+# Address-space cap (KiB) on each Ghidra decompiler process. Auto-analysis runs one per
+# analysis thread; on a .NET assembly each grew past 1 GiB until the 6 GiB slot was
+# OOM-killed with no output. Capped, a runaway function fails alone and analysis goes on.
+ARG DECOMPILE_MAX_KB=786432
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-       procps python3 python3-venv \
+       procps python3 python3-venv "upx-ucl=${UPX_VERSION}" \
     && rm -rf /var/lib/apt/lists/* \
+    && upx --version | head -1 \
     && useradd -u 10001 -m worker
 
 COPY --from=node /opt/node /opt/node
 COPY --from=ghidra /opt/ghidra /opt/ghidra
+RUN d=/opt/ghidra/Ghidra/Features/Decompiler/os/linux_x86_64 \
+    && mv "$d/decompile" "$d/decompile.bin" \
+    && printf '#!/bin/sh\nulimit -v %s || exit 1\nexec "$0.bin" "$@"\n' "${DECOMPILE_MAX_KB}" > "$d/decompile" \
+    && chmod 755 "$d/decompile"
 COPY --from=rea-build /opt/rea /opt/rea
 COPY deploy/rea/ghidra_scripts /opt/rea/ghidra_scripts
 

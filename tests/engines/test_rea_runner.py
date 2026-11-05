@@ -18,6 +18,7 @@ from blastbox.engines.rea.runner import (
     classify,
     rea_env,
     run_ghidra_analysis,
+    upx_unpack,
 )
 
 FIXTURES = Path(__file__).resolve().parents[2] / "deploy" / "rea" / "fixtures"
@@ -286,7 +287,8 @@ def test_ghidra_argv_and_ok(tmp_path: Path) -> None:
     sample = tmp_path / "s.exe"
     assert run_ghidra_analysis(sample, proj, 9, env=_ghidra_env(tmp_path), run_fn=fake) == "ok"
     argv, kw = fake.calls[0]
-    assert argv == ["/opt/ghidra/support/analyzeHeadless", str(proj), "sample", "-import", str(sample), "-overwrite"]
+    assert argv == ["/opt/ghidra/support/analyzeHeadless", str(proj), "sample", "-import", str(sample), "-overwrite",
+                    "-max-cpu", "2"]
     assert kw["env"]["JAVA_TOOL_OPTIONS"].endswith("-XX:-UsePerfData") and kw["timeout_s"] == 9
 
 
@@ -423,7 +425,7 @@ def test_ghidra_post_script_argv_absolute(tmp_path: Path, monkeypatch) -> None:
     assert res == "ok"
     assert argv == [
         "/opt/ghidra/support/analyzeHeadless", str(proj), "sample", "-import", str(tmp_path / "s.exe"),
-        "-overwrite", "-scriptPath", str(tmp_path / "scripts"),
+        "-overwrite", "-max-cpu", "2", "-scriptPath", str(tmp_path / "scripts"),
         "-postScript", "ListStrings.java", str(tmp_path / "out" / "strings.jsonl"),
     ]
 
@@ -435,3 +437,32 @@ def test_ghidra_post_script_rejects_bad_name(tmp_path: Path) -> None:
                 tmp_path / "s", tmp_path / "p", 1, env=_ghidra_env(tmp_path), run_fn=Fake(),
                 post_script=(tmp_path, name, tmp_path / "o"),
             )
+
+
+# ------------------------------------------------------------------- upx
+def test_upx_unpack_argv_caps_the_output_size(tmp_path: Path) -> None:
+    dest = tmp_path / "u" / "s.exe"
+    fake = Fake(hook=lambda a, kw: (dest.write_bytes(b"MZ" * 10), RunOutcome(0))[1])
+    assert upx_unpack(tmp_path / "s.exe", dest, 30, env={"PATH": "/bin"}, max_bytes=1 << 20, run_fn=fake) == "ok"
+    argv, kw = fake.calls[0]
+    assert argv[:3] == ["sh", "-c", 'ulimit -f "$1" && exec upx -d -q -o "$2" "$3"']
+    assert argv[3:] == ["sh", str((1 << 20) // 512), str(dest), str(tmp_path / "s.exe")]
+    assert kw["timeout_s"] == 30 and kw["max_stdout"] == 0
+
+
+@pytest.mark.parametrize("outcome,write,expect", [
+    (RunOutcome(2), b"", "failed"),                    # scrambled header: upx refuses
+    (RunOutcome(0), None, "failed"),                   # rc 0 but nothing written
+    (RunOutcome(0), b"x" * 2048, "failed"),            # over max_bytes
+    (RunOutcome(None, timed_out=True), b"x", "timeout"),
+])
+def test_upx_unpack_failures_leave_no_output(tmp_path: Path, outcome, write, expect) -> None:
+    dest = tmp_path / "s.exe"
+
+    def hook(argv, kw):
+        if write is not None:
+            dest.write_bytes(write)
+        return outcome
+
+    assert upx_unpack(tmp_path / "in.exe", dest, 30, env={}, max_bytes=1024, run_fn=Fake(hook=hook)) == expect
+    assert not dest.exists()

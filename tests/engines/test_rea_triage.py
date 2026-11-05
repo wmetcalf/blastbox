@@ -130,3 +130,10 @@ def test_dotnet_is_exempt_from_the_entropy_rule_but_not_upx(tmp_path):
     assert triage.packed(plain, function_count=3, dotnet=True) is False
     upx = make_pe(tmp_path / "upxnet.exe", [(b"UPX0", X, b""), (b"UPX1", X, CODE)], clr=True)
     assert triage.packed(upx, function_count=3) is True
+
+
+def test_upx_marked_pe_and_elf_only(tmp_path):
+    from blastbox.engines.rea.triage import upx_marked
+    assert upx_marked(make_pe(tmp_path / "u.exe", [(b"UPX0", X, b""), (b"UPX1", X, b"\x90" * 512)]))
+    assert not upx_marked(make_pe(tmp_path / "p.exe", [(b".text", X, b"\x90" * 512)]))
+    assert not upx_marked(tmp_path / "missing")

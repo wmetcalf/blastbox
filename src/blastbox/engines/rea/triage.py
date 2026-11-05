@@ -159,6 +159,15 @@ def _has_clr_header(head: bytes) -> bool:
         return False
 
 
+def upx_marked(path: Path) -> bool:
+    """True for a PE with UPX section names or an ELF with the ``UPX!`` magic; never raises."""
+    head = _read(path, 0, HEAD_BYTES)
+    sections = _pe_sections(head)
+    if sections:
+        return any(name in _UPX_SECTIONS for name, *_ in sections)
+    return _elf_header(head) is not None and b"UPX!" in head[:4096]
+
+
 def packed(path: Path, *, function_count: int | None, dotnet: bool = False) -> bool:
     """True when the sample looks packed (see the module docstring); never raises."""
     head = _read(path, 0, HEAD_BYTES)

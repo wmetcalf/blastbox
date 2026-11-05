@@ -6,6 +6,9 @@ One job, in order, everything under a fresh per-job dir in ``BLASTBOX_WORK_DIR``
 2. run the fixed ``INSPECT_MAP[kind]`` REA inspect commands (no caller arguments);
 3. ``extract-artifact`` for containers (archive/apk/asar/firmware) -> ``member-<n>``;
 4. icons -> ``icon-<n>``;
+4a. a UPX-marked PE/ELF is ``upx -d``-ed (a static decompressor; the sample never runs) and
+   every later step analyses the unpacked image instead (``unpacked: "upx"``); a failed unpack
+   is a warning and the packed original goes on, to stop at ``chain_stop: packed``;
 5. native code (pe/elf/macho/dotnet): ``analyzeHeadless`` import + auto-analysis with the
    bundled ``ListStrings.java`` post-script dumping defined strings;
 6. deterministic IOCs over the inspect JSON string leaves, the Ghidra strings and, for native
@@ -21,9 +24,10 @@ One job, in order, everything under a fresh per-job dir in ``BLASTBOX_WORK_DIR``
 
 ``rea.report/1`` payload fields: ``schema``, ``kind``, ``inspect`` (``{cmd: {ok[, error]}}``),
 ``ghidra_status`` (ok | timeout | failed | skipped), ``members``, ``icons``, ``more_pending``,
-``iocs_total``, ``iocs`` (parallel columns ``type``/``value``/``source``) and the optional
-``chain_stop``. ``chain_stop`` is absent while the chain can continue; otherwise it is exactly
-one of, checked in this order:
+``iocs_total``, ``iocs`` (parallel columns ``type``/``value``/``source``), the optional
+``unpacked`` (``"upx"``, with ``unpacked_sha256``) and the optional ``chain_stop``.
+``chain_stop`` is absent while the chain can continue; otherwise it is exactly one of, checked
+in this order:
 
 ```text
 not_native        not pe/elf/macho/dotnet (archives, APKs and every other kind)
@@ -63,13 +67,14 @@ from blastbox.engines.rea.continuation import GhidraStatus, State, pack
 from blastbox.engines.rea.gostrings import clip_overruns, exact_iocs, go_strings
 from blastbox.engines.rea.icons import extract_icons
 from blastbox.engines.rea.iocs import Ioc, extract_iocs, utf16le_urls
-from blastbox.engines.rea.triage import packed, unsupported_arch
+from blastbox.engines.rea.triage import packed, unsupported_arch, upx_marked
 from blastbox.engines.rea.runner import (
     INSPECT_MAP,
     ReaRunner,
     classify,
     rea_env,
     run_ghidra_analysis,
+    upx_unpack,
 )
 from blastbox.limits import Limits
 from blastbox.worker.engine import DetonationResult
@@ -84,6 +89,8 @@ EXTRACT_KINDS = frozenset({"archive", "apk", "asar", "firmware"})
 DEFAULT_GHIDRA_SWEEP_S = 420.0
 DEFAULT_INSPECT_TIMEOUT_S = 60.0
 EXTRACT_TIMEOUT_S = 120.0
+UNPACK_TIMEOUT_S = 60.0
+MAX_UNPACKED_BYTES = 256 * 1024 * 1024
 GHIDRA_SCRIPT = "ListStrings.java"
 DEFAULT_SCRIPTS_DIR = "/opt/rea/ghidra_scripts"
 
@@ -109,6 +116,7 @@ _MIME = {
 }
 
 GhidraFn = Callable[..., str]
+UnpackFn = Callable[..., str]
 RunnerFactory = Callable[..., Any]
 
 
@@ -222,9 +230,11 @@ class ReaSweepEngine:
         self,
         runner_factory: RunnerFactory = ReaRunner,
         ghidra_fn: GhidraFn = run_ghidra_analysis,
+        unpack_fn: UnpackFn = upx_unpack,
     ) -> None:
         self._runner_factory = runner_factory
         self._ghidra_fn = ghidra_fn
+        self._unpack_fn = unpack_fn
 
     def detonate(self, input: Path, outdir: Path, limits: Limits) -> DetonationResult:
         base = Path(os.environ.get("BLASTBOX_WORK_DIR") or "/work")
@@ -277,12 +287,19 @@ class ReaSweepEngine:
         icons_dir.mkdir(parents=True, exist_ok=True)
         icons = extract_icons(input, icons_dir, max_icons=MAX_ICONS)
 
+        # 4a. UPX: everything from here on analyses the unpacked image when there is one.
+        analysed = input
+        unpacked = False
+        if kind in ("pe", "elf") and upx_marked(input):
+            analysed = self._unpack(input, job, min(UNPACK_TIMEOUT_S, remaining()), warnings)
+            unpacked = analysed != input
+
         # 4. Ghidra
         ghidra_status: GhidraStatus = "skipped"
         project = job / "proj"
         strings_path = job / "strings.jsonl"
         if kind in NATIVE_KINDS:
-            ghidra_status = self._ghidra(input, project, strings_path, job, remaining(), warnings)
+            ghidra_status = self._ghidra(analysed, project, strings_path, job, remaining(), warnings)
 
         # 5. IOCs
         gstrings: list[tuple[str, str]] = []
@@ -300,7 +317,7 @@ class ReaSweepEngine:
         wide_urls: list[tuple[str, str]] = []
         if kind in NATIVE_KINDS:
             try:
-                wide_urls = _utf16_urls(input)
+                wide_urls = _utf16_urls(analysed)
             except (OSError, ValueError) as exc:
                 warnings.append(Warning(code="utf16_scan_failed", message=f"exception:{type(exc).__name__}"))
 
@@ -309,7 +326,7 @@ class ReaSweepEngine:
         go_lits: list[tuple[int, str]] = []
         if kind in NATIVE_KINDS:
             try:
-                go_lits = go_strings(input, deadline=time.monotonic() + max(0.0, min(GO_SCAN_S, remaining())))
+                go_lits = go_strings(analysed, deadline=time.monotonic() + max(0.0, min(GO_SCAN_S, remaining())))
             except (OSError, ValueError) as exc:
                 warnings.append(Warning(code="go_strings_failed", message=f"exception:{type(exc).__name__}"))
 
@@ -334,11 +351,13 @@ class ReaSweepEngine:
         # 6. continuation: only when a model pass can follow it (Ruling AL). A failed or timed-out
         # Ghidra run would only repeat in the agent; non-native inputs, architectures REA's lane
         # rejects and packed stubs give the model nothing to analyse.
-        chain_stop = self._chain_stop(input, kind, ghidra_status, function_count)
+        chain_stop = self._chain_stop(analysed, kind, ghidra_status, function_count)
         chainable = chain_stop is None
-        sweep_evidence = {"kind": kind, "iocs": [{"type": i.type, "value": i.value, "source": i.source}
+        sweep_evidence: dict[str, Any] = {"kind": kind, "iocs": [{"type": i.type, "value": i.value, "source": i.source}
                                                  for i in iocs[:STATE_IOCS]]}
-        cont = (self._continuation(input, outdir, project, ghidra_status, limits, warnings, sweep_evidence)
+        if unpacked:
+            sweep_evidence["unpacked"] = {"packer": "upx", "packed_sha256": _sha256(input)}
+        cont = (self._continuation(analysed, outdir, project, ghidra_status, limits, warnings, sweep_evidence)
                 if chainable else None)
 
         # 7. artifact budget (report + continuation reserved first)
@@ -358,6 +377,9 @@ class ReaSweepEngine:
             "more_pending": more_pending,
             "iocs_total": len(iocs),
         }
+        if unpacked:
+            summary["unpacked"] = "upx"
+            summary["unpacked_sha256"] = _sha256(analysed)
         if chain_stop is not None:
             summary["chain_stop"] = chain_stop
 
@@ -401,6 +423,25 @@ class ReaSweepEngine:
         if packed(sample, function_count=function_count, dotnet=kind == "dotnet"):
             return "packed"
         return None
+
+    def _unpack(self, sample: Path, job: Path, timeout_s: float, warnings: list[Warning]) -> Path:
+        """The ``upx -d`` image of ``sample`` (same file name, so the agent sees the same name), or
+        ``sample`` itself with an ``unpack_failed`` warning."""
+        if timeout_s < 1:
+            warnings.append(Warning(code="unpack_failed", message="no time left for upx -d"))
+            return sample
+        dest = job / "unpacked" / sample.name
+        try:
+            status = self._unpack_fn(sample, dest, timeout_s, env=rea_env(job / "upx", os.environ),
+                                     max_bytes=MAX_UNPACKED_BYTES)
+        except Exception as exc:
+            warnings.append(Warning(code="unpack_failed", message=f"upx -d: exception:{type(exc).__name__}"))
+            return sample
+        if status != "ok":
+            warnings.append(Warning(code="unpack_failed", message=f"upx -d: {status} (a modified UPX header "
+                                                                  f"defeats it); analysing the packed sample"))
+            return sample
+        return dest
 
     @staticmethod
     def _extract(runner: Any, sample: Path, dest: Path, timeout_s: float,
