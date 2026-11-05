@@ -16,6 +16,7 @@ One job, in order, everything under a fresh per-job dir in ``BLASTBOX_WORK_DIR``
    (``capa_status``, ``capabilities_total``, ``capabilities`` columns), the report and
    ``State.sweep["capabilities"]``, where the agent seeds its todo with those functions. A capa
    failure or timeout is a warning; ``unsupported`` (capa's architecture/format refusal) is not;
+   Go binaries and images over ``CAPA_MAX_INPUT_BYTES`` are ``skipped`` (``capa_skipped``);
 6. deterministic IOCs over the inspect JSON string leaves, the Ghidra strings and, for native
    code, UTF-16LE URL strings in the sample bytes (a .NET ``#US`` heap has no Ghidra string)
    and, for Go binaries, the exact string literals named by Go string headers
@@ -109,6 +110,9 @@ DEFAULT_CAPA_S = 300.0
 # Address-space cap on capa (KiB). vivisect on an 876 KB PE64 peaked at 2.8 GB RSS (MemoryError
 # under a 2 GiB cap). capa runs after Ghidra, never beside it: the two together outgrow a 6 GiB slot.
 CAPA_MAX_KB = 4 * 1024 * 1024
+# vivisect's memory grows with the image: a 4 MB Go PE ran out under 4 GiB after 306 s. Larger
+# images, and Go binaries (a statically linked runtime in every one), skip capa: "skipped".
+CAPA_MAX_INPUT_BYTES = 2 * 1024 * 1024
 MAX_CAPA_JSON = 64 * 1024 * 1024
 STATE_CAPABILITIES = 64  # capa rules carried in the continuation for the agent
 DEFAULT_CAPA_BIN = "/opt/capa/bin/capa"
@@ -386,7 +390,13 @@ class ReaSweepEngine:
         capa_status: CapaStatus | None = None
         capabilities: list[dict[str, Any]] = []
         if kind in CAPA_BACKENDS:
-            capa_status, capabilities = self._capa(analysed, kind, job, image_base, remaining(), warnings)
+            skip = ("go binary" if go_lits else
+                    "image over the size limit" if analysed.stat().st_size > CAPA_MAX_INPUT_BYTES else None)
+            if skip is not None:
+                capa_status = "skipped"
+                warnings.append(Warning(code="capa_skipped", message=f"capa skipped: {skip}"))
+            else:
+                capa_status, capabilities = self._capa(analysed, kind, job, image_base, remaining(), warnings)
 
         iocs = extract_iocs(sources(), limit=MAX_IOCS)
         if go_lits:

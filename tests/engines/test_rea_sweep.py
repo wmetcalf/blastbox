@@ -691,3 +691,18 @@ def test_ghidra_strings_first_line_carries_the_image_base(tmp_path):
     assert (gs.function_count, gs.image_base, gs.strings) == (7, 0x140000000, [("0x1", "v")])
     p.write_text('{"function_count": 7, "image_base": "ram:00400000"}\n')
     assert sw._read_ghidra_strings(p).image_base is None
+
+
+def test_capa_skips_large_images(tmp_path, monkeypatch):
+    monkeypatch.setattr(sw, "CAPA_MAX_INPUT_BYTES", 1024)
+    fc = FakeCapa()
+    res, _out, _g = _run(FIXTURES / "sample.exe", tmp_path, capa=fc)
+    assert fc.calls == [] and _fields(res)["capa_status"] == "skipped" and "capa_skipped" in _codes(res)
+
+
+def test_capa_skips_go_binaries(tmp_path, monkeypatch):
+    monkeypatch.setattr(sw, "go_strings", lambda *a, **kw: [(0x401000, "main.main")])
+    fc = FakeCapa()
+    res, _out, _g = _run(FIXTURES / "sample.exe", tmp_path, capa=fc)
+    assert fc.calls == [] and _fields(res)["capa_status"] == "skipped"
+    assert any(w.message == "capa skipped: go binary" for w in res.warnings)

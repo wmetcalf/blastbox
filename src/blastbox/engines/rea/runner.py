@@ -528,7 +528,7 @@ def upx_unpack(
 CAPA_BACKENDS = {"pe": ("pe", "vivisect"), "elf": ("elf", "vivisect"), "dotnet": ("dotnet", "dotnet")}
 # capa's exit codes for a file it does not handle (main.py E_INVALID_FILE_TYPE/_ARCH/_OS).
 _CAPA_UNSUPPORTED = frozenset({16, 17, 18})
-CapaStatus = Literal["ok", "timeout", "failed", "unsupported", "too_large"]
+CapaStatus = Literal["ok", "timeout", "failed", "unsupported", "too_large", "skipped"]
 
 
 def run_capa(
