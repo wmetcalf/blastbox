@@ -11,7 +11,8 @@ dir in ``BLASTBOX_WORK_DIR``:
    proxy variables (only ``ModelClient``, in this process, talks to the network);
 4. ``open_binary`` on the unpacked sample; when ``State.todo`` and ``State.explored`` are both empty
    (pass 1 after the sweep), seed the todo list with ``procedure_info(entry)`` and
-   ``list_procedures(detail=complete)``;
+   ``list_procedures(detail=complete)``, putting the functions capa matched (``State.sweep``
+   ``capabilities``) right after the entry point and the main names;
 5. the model loop: the model sees only allowlisted tools (``policy.py``); each call is checked by
    ``policy.check_call`` (a refusal never reaches MCP and is returned as a tool error), and each
    result is framed as untrusted evidence by ``prompts.Framer``;
@@ -591,6 +592,18 @@ def verify_iocs_in_sample(sample: Path, iocs: list[tuple[str, str]], time_left: 
 # ---------------------------------------------------------------- the engine
 
 
+def capa_functions(sweep: dict[str, Any]) -> list[str]:
+    """The function addresses capa matched, in the sweep's rule order, each once."""
+    out: list[str] = []
+    caps = sweep.get("capabilities")
+    for c in caps if isinstance(caps, list) else []:
+        fns = c.get("functions") if isinstance(c, dict) else None
+        for f in fns if isinstance(fns, list) else []:
+            if isinstance(f, str) and f.startswith("0x") and f not in out:
+                out.append(f)
+    return out
+
+
 @dataclass
 class _Pass:
     """Mutable state of one pass, gathered for the payload."""
@@ -866,12 +879,13 @@ class ReaAgentEngine:
         return text, is_error
 
     def _seed(self, mcp: Any, ev: _Evidence, tw: TranscriptWriter,
-              remaining: Callable[[], float]) -> list[dict[str, str]]:
+              remaining: Callable[[], float], capa_functions: list[str] | None = None) -> list[dict[str, str]]:
         """Todo seed from ``procedure_info(entry)`` + ``list_procedures(detail=complete)``.
 
-        Order: the entry point, well-known main names, functions named by the binary's own
-        symbols (exports / symbol table, ``symbol.source == imported``), then the rest by address.
-        Externals and thunks are skipped. At most ``SEED_TODO`` entries.
+        Order: the entry point, well-known main names, functions capa matched (``capa_functions``,
+        in the sweep's rule order; only those that are procedure entries here), functions named by
+        the binary's own symbols (exports / symbol table, ``symbol.source == imported``), then the
+        rest by address. Externals and thunks are skipped. At most ``SEED_TODO`` entries.
         """
         seeds: list[dict[str, str]] = []
         entry_text, err = self._call_tool(mcp, "procedure_info", {"procedure": "entry"}, "s1", ev, tw, remaining,
@@ -892,6 +906,7 @@ class ReaAgentEngine:
             obj = _parse_json(list_text)
             rows = obj.get("normalized_result", obj) if isinstance(obj, dict) else obj
         main, named, rest = [], [], []
+        by_addr: dict[str, dict[str, str]] = {}
         for row in rows if isinstance(rows, list) else []:
             if not isinstance(row, dict):
                 continue
@@ -902,6 +917,7 @@ class ReaAgentEngine:
             if a is None or proc.get("external") or proc.get("thunk") or sym.get("external"):
                 continue
             entry = {"address": a, "name": _cap(str(row.get("value") or ""), MAX_NAME)}
+            by_addr.setdefault(a, entry)
             if entry["name"] in _MAIN_NAMES:
                 main.append(entry)
             elif sym.get("source") in _NAMED_SOURCES:
@@ -910,14 +926,16 @@ class ReaAgentEngine:
                 rest.append(entry)
         main.sort(key=lambda e: _MAIN_NAMES.index(e["name"]))
         rest.sort(key=lambda e: int(e["address"], 16))
+        matched = [by_addr[a] for a in (norm_addr(x) for x in capa_functions or []) if a in by_addr]
         seen = {s["address"] for s in seeds}
-        for e in main + named + rest:
+        for e in main + matched + named + rest:
             if len(seeds) >= SEED_TODO:
                 break
             if e["address"] not in seen:
                 seen.add(e["address"])
                 seeds.append(e)
-        tw.write({"event": "seed", "todo": seeds})
+        tw.write({"event": "seed", "todo": seeds, "capa_functions": len(capa_functions or []),
+                  "capa_matched": len(matched)})
         return seeds
 
     def _loop(self, mcp: Any, listed: dict[str, str], sample: Path, state: State, p: _Pass,
@@ -947,7 +965,7 @@ class ReaAgentEngine:
         todo_view = [{"address": a, "name": ""} for a in p.todo[:SEED_TODO * 2]]
         seed_note = ""
         if not p.todo and not p.explored:
-            seeds = self._seed(mcp, ev, tw, explore_left)
+            seeds = self._seed(mcp, ev, tw, explore_left, capa_functions=capa_functions(state.sweep))
             p.todo = [s["address"] for s in seeds]
             todo_view = seeds
             seed_note = "The todo list was seeded by the engine from the entry point and the procedure list."

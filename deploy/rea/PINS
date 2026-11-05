@@ -26,3 +26,11 @@ JDK_IMAGE=eclipse-temurin:21-jdk@sha256:ebfbb18d11ff163ee83b21258acf12248af48d22
 
 # upx-ucl from the base image's Ubuntu archive (the sweep upx -d-s UPX-marked samples).
 UPX_VERSION=4.2.4-1.1build1
+
+# capa 10.0.0 (flare-capa wheel + deps, hash-locked in capa-requirements.txt), with the
+# same release's rules (capa-rules tag) and FLIRT signatures (capa tag, sigs/ only).
+CAPA_VERSION=10.0.0
+CAPA_RULES_URL=https://codeload.github.com/mandiant/capa-rules/tar.gz/refs/tags/v10.0.0
+CAPA_RULES_SHA256=3d14dbdaf5b71731e42395ed5fa4d287418e6a2e5d6b0a348c7fd9fbe1699611
+CAPA_SRC_URL=https://codeload.github.com/mandiant/capa/tar.gz/refs/tags/v10.0.0
+CAPA_SRC_SHA256=d3f6006ad61e6591896f524566c191eca89c6220611969e1bd485bd9a1098180

@@ -1,7 +1,8 @@
 // Writes the program's defined data strings to a JSON Lines file for the REA sweep engine.
 // Usage (analyzeHeadless): -scriptPath <dir> -postScript ListStrings.java <output.jsonl>
-// The first line is {"function_count":N} (non-external functions, counted up to MAX_FUNCTIONS,
-// for the sweep's packed-sample check). Then one {"address":"0x..","value":".."} per line, at most MAX_ENTRIES lines, each value cut to
+// The first line is {"function_count":N,"image_base":"0x.."} (non-external functions, counted up
+// to MAX_FUNCTIONS, for the sweep's packed-sample check; the image base, to move capa's
+// addresses into Ghidra's image). Then one {"address":"0x..","value":".."} per line, at most MAX_ENTRIES lines, each value cut to
 // MAX_CHARS UTF-16 units (never splitting a surrogate pair). Output is pure ASCII: every
 // character outside 0x20..0x7e is written as a JSON backslash-u escape, so the file is valid JSON
 // whatever the sample's strings contain.
@@ -34,7 +35,9 @@ public class ListStrings extends GhidraScript {
                 new FileOutputStream(args[0]), StandardCharsets.US_ASCII))) {
             w.write("{\"function_count\":");
             w.write(Integer.toString(countFunctions()));
-            w.write("}\n");
+            w.write(",\"image_base\":\"0x");
+            w.write(currentProgram.getImageBase().toString(false));
+            w.write("\"}\n");
             DataIterator it = currentProgram.getListing().getDefinedData(true);
             while (it.hasNext() && written < MAX_ENTRIES && !monitor.isCancelled()) {
                 Data d = it.next();

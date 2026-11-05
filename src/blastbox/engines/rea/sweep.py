@@ -10,7 +10,12 @@ One job, in order, everything under a fresh per-job dir in ``BLASTBOX_WORK_DIR``
    every later step analyses the unpacked image instead (``unpacked: "upx"``); a failed unpack
    is a warning and the packed original goes on, to stop at ``chain_stop: packed``;
 5. native code (pe/elf/macho/dotnet): ``analyzeHeadless`` import + auto-analysis with the
-   bundled ``ListStrings.java`` post-script dumping defined strings;
+   bundled ``ListStrings.java`` post-script dumping defined strings and the image base;
+5a. beside it, on its own thread, ``capa`` (pe/elf/dotnet; ``capa.py``): rule matches with ATT&CK/MBC
+   ids and the functions they hit, moved into Ghidra's image base. They go to the payload
+   (``capa_status``, ``capabilities_total``, ``capabilities`` columns), the report and
+   ``State.sweep["capabilities"]``, where the agent seeds its todo with those functions. A capa
+   failure or timeout is a warning; ``unsupported`` (capa's architecture/format refusal) is not;
 6. deterministic IOCs over the inspect JSON string leaves, the Ghidra strings and, for native
    code, UTF-16LE URL strings in the sample bytes (a .NET ``#US`` heap has no Ghidra string)
    and, for Go binaries, the exact string literals named by Go string headers
@@ -25,7 +30,9 @@ One job, in order, everything under a fresh per-job dir in ``BLASTBOX_WORK_DIR``
 ``rea.report/1`` payload fields: ``schema``, ``kind``, ``inspect`` (``{cmd: {ok[, error]}}``),
 ``ghidra_status`` (ok | timeout | failed | skipped), ``members``, ``icons``, ``more_pending``,
 ``iocs_total``, ``iocs`` (parallel columns ``type``/``value``/``source``), the optional
-``unpacked`` (``"upx"``, with ``unpacked_sha256``) and the optional ``chain_stop``.
+``unpacked`` (``"upx"``, with ``unpacked_sha256``), the optional ``capa_status`` /
+``capabilities_total`` / ``capabilities`` (parallel columns ``rule``/``namespace``/``attack``) and
+the optional ``chain_stop``.
 ``chain_stop`` is absent while the chain can continue; otherwise it is exactly one of, checked
 in this order:
 
@@ -57,12 +64,16 @@ import mmap
 import os
 import shutil
 import tempfile
+import threading
+import re
 import time
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from blastbox.contract import DeclaredArtifact, Detection, Record, Warning
+from blastbox.engines.rea import capa
 from blastbox.engines.rea.continuation import GhidraStatus, State, pack
 from blastbox.engines.rea.gostrings import clip_overruns, exact_iocs, go_strings
 from blastbox.engines.rea.icons import extract_icons
@@ -72,7 +83,10 @@ from blastbox.engines.rea.runner import (
     INSPECT_MAP,
     ReaRunner,
     classify,
+    CAPA_BACKENDS,
+    CapaStatus,
     rea_env,
+    run_capa,
     run_ghidra_analysis,
     upx_unpack,
 )
@@ -80,6 +94,7 @@ from blastbox.limits import Limits
 from blastbox.worker.engine import DetonationResult
 
 _log = logging.getLogger("blastbox.engines.rea.sweep")
+_HEX_ADDR = re.compile(r"0x[0-9a-fA-F]{1,16}")
 
 SCHEMA = "rea.report/1"
 CHAIN_STOPS = ("ghidra_timeout", "ghidra_failed", "packed", "unsupported_arch", "not_native")
@@ -91,6 +106,12 @@ DEFAULT_INSPECT_TIMEOUT_S = 60.0
 EXTRACT_TIMEOUT_S = 120.0
 UNPACK_TIMEOUT_S = 60.0
 MAX_UNPACKED_BYTES = 256 * 1024 * 1024
+DEFAULT_CAPA_S = 300.0
+CAPA_MAX_KB = 2 * 1024 * 1024  # address-space cap on capa (KiB): it runs beside Ghidra in the slot
+MAX_CAPA_JSON = 64 * 1024 * 1024
+STATE_CAPABILITIES = 64  # capa rules carried in the continuation for the agent
+DEFAULT_CAPA_BIN = "/opt/capa/bin/capa"
+DEFAULT_CAPA_DATA = "/opt/capa"
 GHIDRA_SCRIPT = "ListStrings.java"
 DEFAULT_SCRIPTS_DIR = "/opt/rea/ghidra_scripts"
 
@@ -117,6 +138,7 @@ _MIME = {
 
 GhidraFn = Callable[..., str]
 UnpackFn = Callable[..., str]
+CapaFn = Callable[..., tuple[CapaStatus, bytes]]
 RunnerFactory = Callable[..., Any]
 
 
@@ -175,16 +197,25 @@ def _string_leaves(obj: Any) -> Iterator[str]:
             stack.extend(reversed(cur))
 
 
-def _read_ghidra_strings(path: Path) -> tuple[list[tuple[str, str]], bool, int, int | None]:
-    """(``[(address, value)]``, truncated, malformed_lines, function_count) from ListStrings' JSONL.
+@dataclass
+class GhidraStrings:
+    strings: list[tuple[str, str]] = field(default_factory=list)  # (address, value)
+    truncated: bool = False
+    malformed: int = 0
+    function_count: int | None = None
+    image_base: int | None = None
 
-    The first line may be ``{"function_count": N}`` (the program's function count); every
-    other line is ``{"address", "value"}``.
+
+def _read_ghidra_strings(path: Path) -> GhidraStrings:
+    """ListStrings' JSONL: strings, truncation, malformed lines, function count, image base.
+
+    The first line may be ``{"function_count": N[, "image_base": "0x.."]}``; every other line
+    is ``{"address", "value"}``.
     """
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except OSError:
-        return [], False, 0, None
+        return GhidraStrings()
     with os.fdopen(fd, "rb") as f:
         data = f.read(MAX_STRINGS_BYTES + 1)
     truncated = len(data) > MAX_STRINGS_BYTES
@@ -194,6 +225,7 @@ def _read_ghidra_strings(path: Path) -> tuple[list[tuple[str, str]], bool, int, 
     out: list[tuple[str, str]] = []
     bad = 0
     function_count: int | None = None
+    image_base: int | None = None
     for n, line in enumerate(data.splitlines()):
         if len(out) >= MAX_STRINGS:
             truncated = True
@@ -205,10 +237,13 @@ def _read_ghidra_strings(path: Path) -> tuple[list[tuple[str, str]], bool, int, 
         except (ValueError, RecursionError):
             bad += 1
             continue
-        if n == 0 and isinstance(d, dict) and set(d) == {"function_count"}:
-            fc = d["function_count"]
+        if n == 0 and isinstance(d, dict) and "function_count" in d and set(d) <= {"function_count",
+                                                                                   "image_base"}:
+            fc, ib = d["function_count"], d.get("image_base")
             if isinstance(fc, int) and not isinstance(fc, bool) and fc >= 0:
                 function_count = fc
+                if isinstance(ib, str) and _HEX_ADDR.fullmatch(ib):
+                    image_base = int(ib, 16)
                 continue
         addr = d.get("address") if isinstance(d, dict) else None
         val = d.get("value") if isinstance(d, dict) else None
@@ -216,7 +251,14 @@ def _read_ghidra_strings(path: Path) -> tuple[list[tuple[str, str]], bool, int, 
             bad += 1
             continue
         out.append((addr, val[:MAX_STRING_CHARS]))
-    return out, truncated, bad, function_count
+    return GhidraStrings(out, truncated, bad, function_count, image_base)
+
+
+@dataclass
+class _CapaJob:
+    thread: threading.Thread | None = None
+    result: tuple[CapaStatus, bytes] | None = None
+    error: str | None = None
 
 
 class ReaSweepEngine:
@@ -231,10 +273,12 @@ class ReaSweepEngine:
         runner_factory: RunnerFactory = ReaRunner,
         ghidra_fn: GhidraFn = run_ghidra_analysis,
         unpack_fn: UnpackFn = upx_unpack,
+        capa_fn: CapaFn = run_capa,
     ) -> None:
         self._runner_factory = runner_factory
         self._ghidra_fn = ghidra_fn
         self._unpack_fn = unpack_fn
+        self._capa_fn = capa_fn
 
     def detonate(self, input: Path, outdir: Path, limits: Limits) -> DetonationResult:
         base = Path(os.environ.get("BLASTBOX_WORK_DIR") or "/work")
@@ -294,6 +338,9 @@ class ReaSweepEngine:
             analysed = self._unpack(input, job, min(UNPACK_TIMEOUT_S, remaining()), warnings)
             unpacked = analysed != input
 
+        # 4b. capa runs beside Ghidra (its own process, its own address-space cap).
+        capa_job = self._start_capa(analysed, kind, job, remaining()) if kind in CAPA_BACKENDS else None
+
         # 4. Ghidra
         ghidra_status: GhidraStatus = "skipped"
         project = job / "proj"
@@ -304,8 +351,11 @@ class ReaSweepEngine:
         # 5. IOCs
         gstrings: list[tuple[str, str]] = []
         function_count: int | None = None
+        image_base: int | None = None
         if ghidra_status == "ok":
-            gstrings, truncated, bad, function_count = _read_ghidra_strings(strings_path)
+            gs = _read_ghidra_strings(strings_path)
+            gstrings, truncated, bad = gs.strings, gs.truncated, gs.malformed
+            function_count, image_base = gs.function_count, gs.image_base
             if truncated:
                 warnings.append(Warning(code="ghidra_strings_truncated",
                                         message=f"Ghidra strings dump capped at {MAX_STRINGS_BYTES} "
@@ -341,6 +391,11 @@ class ReaSweepEngine:
                 yield f"ghidra:{addr}", value
             yield from wide_urls
 
+        capa_status: CapaStatus | None = None
+        capabilities: list[dict[str, Any]] = []
+        if capa_job is not None:
+            capa_status, capabilities = self._finish_capa(capa_job, image_base, warnings)
+
         iocs = extract_iocs(sources(), limit=MAX_IOCS)
         if go_lits:
             iocs = clip_overruns(iocs, exact_iocs(go_lits), key=lambda i: (i.type, i.value),
@@ -357,6 +412,8 @@ class ReaSweepEngine:
                                                  for i in iocs[:STATE_IOCS]]}
         if unpacked:
             sweep_evidence["unpacked"] = {"packer": "upx", "packed_sha256": _sha256(input)}
+        if capabilities:
+            sweep_evidence["capabilities"] = capabilities[:STATE_CAPABILITIES]
         cont = (self._continuation(analysed, outdir, project, ghidra_status, limits, warnings, sweep_evidence)
                 if chainable else None)
 
@@ -380,13 +437,16 @@ class ReaSweepEngine:
         if unpacked:
             summary["unpacked"] = "upx"
             summary["unpacked_sha256"] = _sha256(analysed)
+        if capa_status is not None:
+            summary["capa_status"] = capa_status
+            summary["capabilities_total"] = len(capabilities)
         if chain_stop is not None:
             summary["chain_stop"] = chain_stop
 
         # 8. report artifact, then the payload
         report_path = outdir / "report.json"
-        self._write_report(report_path, summary, iocs, inspect, report_cap, warnings)
-        payload = self._payload(summary, iocs, limits, warnings)
+        self._write_report(report_path, summary, iocs, inspect, report_cap, warnings, capabilities)
+        payload = self._payload(summary, iocs, limits, warnings, capabilities)
 
         artifacts = [DeclaredArtifact(id=f"member-{i}", path=p.relative_to(outdir).as_posix(), kind="extracted")
                      for i, p in enumerate(members)]
@@ -423,6 +483,54 @@ class ReaSweepEngine:
         if packed(sample, function_count=function_count, dotnet=kind == "dotnet"):
             return "packed"
         return None
+
+    def _start_capa(self, sample: Path, kind: str, job: Path, remaining_s: float) -> _CapaJob:
+        """Start ``capa`` on a thread; ``_finish_capa`` joins it."""
+        budget = min(_env_seconds("REA_CAPA_TIMEOUT_S", DEFAULT_CAPA_S), remaining_s)
+        cj = _CapaJob()
+        if budget < 1:
+            cj.result = ("timeout", b"")
+            return cj
+        data = Path(DEFAULT_CAPA_DATA)
+        env = rea_env(job / "capa", os.environ)
+
+        def run() -> None:
+            try:
+                cj.result = self._capa_fn(sample, kind, budget, env=env, capa_bin=DEFAULT_CAPA_BIN,
+                                          rules=data / "rules", signatures=data / "sigs",
+                                          max_kb=CAPA_MAX_KB, max_stdout=MAX_CAPA_JSON)
+            except Exception as exc:
+                cj.error = f"exception:{type(exc).__name__}"
+
+        cj.thread = threading.Thread(target=run, name="rea-capa", daemon=True)
+        cj.thread.start()
+        return cj
+
+    @staticmethod
+    def _finish_capa(cj: _CapaJob, image_base: int | None,
+                     warnings: list[Warning]) -> tuple[CapaStatus, list[dict[str, Any]]]:
+        """capa's status and its summarized capabilities, rebased into Ghidra's image."""
+        if cj.thread is not None:
+            cj.thread.join()
+        if cj.error is not None or cj.result is None:
+            warnings.append(Warning(code="capa_failed", message=cj.error or "capa returned nothing"))
+            return "failed", []
+        status, out = cj.result
+        if status != "ok":
+            if status != "unsupported":
+                warnings.append(Warning(code=f"capa_{status}", message=f"capa: {status}"))
+            return status, []
+        try:
+            doc = json.loads(out)
+        except (ValueError, RecursionError):
+            warnings.append(Warning(code="capa_failed", message="capa output is not JSON"))
+            return "failed", []
+        capa_base = capa.base_address(doc)
+        rebase: Callable[[int], int] | None = None
+        if capa_base is not None and image_base is not None and capa_base != image_base:
+            delta = image_base - capa_base
+            rebase = lambda va: va + delta  # noqa: E731
+        return "ok", capa.summarize(doc, rebase=rebase)
 
     def _unpack(self, sample: Path, job: Path, timeout_s: float, warnings: list[Warning]) -> Path:
         """The ``upx -d`` image of ``sample`` (same file name, so the agent sees the same name), or
@@ -545,12 +653,15 @@ class ReaSweepEngine:
 
     @staticmethod
     def _write_report(path: Path, summary: dict[str, Any], iocs: list[Ioc],
-                      inspect: dict[str, dict[str, Any]], cap: int, warnings: list[Warning]) -> None:
+                      inspect: dict[str, dict[str, Any]], cap: int, warnings: list[Warning],
+                      capabilities: list[dict[str, Any]] | None = None) -> None:
         results = dict(inspect)
         ioc_rows = [{"type": i.type, "value": i.value, "source": i.source} for i in iocs]
+        caps = list(capabilities or [])
 
         def encode() -> bytes:
-            return json.dumps({**summary, "iocs": ioc_rows, "inspect_results": results}).encode()
+            return json.dumps({**summary, "iocs": ioc_rows, "capabilities": caps,
+                               "inspect_results": results}).encode()
 
         data = encode()
         if len(data) > cap:
@@ -562,8 +673,9 @@ class ReaSweepEngine:
                 data = encode()
                 if len(data) <= cap:
                     break
-            while len(data) > cap and ioc_rows:
+            while len(data) > cap and (ioc_rows or caps):
                 ioc_rows = ioc_rows[: len(ioc_rows) // 2]
+                caps = caps[: len(caps) // 2]
                 data = encode()
             if len(data) > cap:
                 data = json.dumps({"schema": SCHEMA, "truncated": True}).encode()
@@ -571,7 +683,7 @@ class ReaSweepEngine:
 
     @staticmethod
     def _payload(summary: dict[str, Any], iocs: list[Ioc], limits: Limits,
-                 warnings: list[Warning]) -> Record:
+                 warnings: list[Warning], capabilities: list[dict[str, Any]] | None = None) -> Record:
         budget = min(1024 * 1024, limits.max_metadata_bytes // 4)
         types: list[str | int | float | bool | None] = []
         values: list[str | int | float | bool | None] = []
@@ -588,9 +700,18 @@ class ReaSweepEngine:
             values.append(i.value)
             srcs.append(i.source)
         inspect = Record(fields={c: Record(fields=dict(r)) for c, r in summary["inspect"].items()})
-        return Record(fields={
+        fields: dict[str, Any] = {
             **{k: v for k, v in summary.items() if k != "inspect"},
             "inspect": inspect,
             # Record values cannot be lists of objects: IOCs travel as parallel columns.
             "iocs": Record(fields={"type": types, "value": values, "source": srcs}),
-        })
+        }
+        if capabilities:
+            # Rule name, namespace and ATT&CK ids; the functions stay in the report artifact.
+            caps = capabilities[:STATE_CAPABILITIES]
+            fields["capabilities"] = Record(fields={
+                "rule": [c["rule"] for c in caps],
+                "namespace": [c["namespace"] for c in caps],
+                "attack": [",".join(c["attack"]) for c in caps],
+            })
+        return Record(fields=fields)

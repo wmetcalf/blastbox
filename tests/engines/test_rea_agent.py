@@ -1907,3 +1907,29 @@ def test_model_dialect_defaults_to_vllm_and_rejects_unknown(monkeypatch):
     monkeypatch.setenv("REA_MODEL_DIALECT", "anthropic")
     with pytest.raises(ValueError, match="REA_MODEL_DIALECT"):
         ModelClient("http://m:1/v1", "x", 5)
+
+
+def test_capa_matched_functions_are_seeded_after_main(tmp_path):
+    caps = [{"rule": "create reverse shell", "namespace": "communication/c2/shell", "attack": ["T1059"],
+             "mbc": [], "functions": ["0x140001600", "0x140009999", "token:0x6000001"]}]
+    cont = make_continuation(tmp_path, todo=[], explored=[], sweep={"kind": "pe", "capabilities": caps})
+    rows = [{"address": a, "value": n, "symbol": {"external": False, "source": src},
+             "procedure": {"external": False, "thunk": False}}
+            for a, n, src in [("0x140001500", "main", "imported"), ("0x140001550", "exported_fn", "imported"),
+                              ("0x140001600", "FUN_140001600", "default")]]
+    rig = McpRig(tmp_path, {
+        "procedure_info": {"text": json.dumps({"normalized_result": {"name": "entry", "entrypoint": "0x140001420"}})},
+        "list_procedures": {"text": json.dumps({"normalized_result": rows})},
+    })
+    model = FakeModel([answer({"summary": "s", "functions": [], "iocs": [], "todo": [], "done": False})])
+    _res, out = run(tmp_path, cont, model, rig)
+    # entry, main, the capa-matched function (0x140009999 is no procedure here), then the named one.
+    assert next_state(out).todo[:4] == ["0x140001420", "0x140001500", "0x140001600", "0x140001550"]
+    first_user = model.calls[0]["messages"][1]["content"]
+    assert "create reverse shell" in first_user and "not proof" in first_user
+
+
+def test_capa_functions_keeps_addresses_once_in_rule_order():
+    sweep = {"capabilities": [{"functions": ["0x2", "0x1"]}, {"functions": ["0x1", "token:0x6", 5]}, "junk"]}
+    assert ag.capa_functions(sweep) == ["0x2", "0x1"]
+    assert ag.capa_functions({}) == []

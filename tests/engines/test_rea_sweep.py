@@ -99,11 +99,24 @@ class FakeUnpack:
         return self.status
 
 
-def _run(sample: Path, tmp_path: Path, *, runner=None, ghidra=None, limits=None, unpack=None):
+class FakeCapa:
+    """Stands in for run_capa: returns ``doc`` as capa's JSON on "ok"."""
+
+    def __init__(self, status="ok", doc=None):
+        self.status, self.doc = status, doc if doc is not None else {"rules": {}}
+        self.calls: list[dict] = []
+
+    def __call__(self, sample, kind, timeout_s, *, env, capa_bin, rules, signatures, max_kb, max_stdout):
+        self.calls.append(dict(sample=sample, kind=kind, timeout_s=timeout_s, max_kb=max_kb))
+        return (self.status, json.dumps(self.doc).encode() if self.status == "ok" else b"")
+
+
+def _run(sample: Path, tmp_path: Path, *, runner=None, ghidra=None, limits=None, unpack=None, capa=None):
     out = tmp_path / "out"
     out.mkdir(exist_ok=True)
     ghidra = ghidra or FakeGhidra()
-    eng = ReaSweepEngine(runner_factory=runner or factory(), ghidra_fn=ghidra, unpack_fn=unpack or FakeUnpack("failed"))
+    eng = ReaSweepEngine(runner_factory=runner or factory(), ghidra_fn=ghidra, unpack_fn=unpack or FakeUnpack("failed"),
+                         capa_fn=capa or FakeCapa())
     res = eng.detonate(sample, out, limits or Limits(timeout_s=600))
     return res, out, ghidra
 
@@ -610,3 +623,63 @@ def test_continuation_carries_the_sweep_evidence_for_the_report(tmp_path: Path) 
     assert st.sweep["kind"] == _fields(res)["kind"]
     assert {"type": "url", "value": "http://evil.example/a.php?x=1", "source": "ghidra:0x401000"} in st.sweep["iocs"]
     assert st.analysis_report is None
+
+
+CAPA_DOC = {
+    "meta": {"analysis": {"base_address": {"type": "absolute", "value": 0x2000000},
+                          "layout": {"functions": [{"address": {"type": "absolute", "value": 0x2001000},
+                                                    "matched_basic_blocks": []}]}}},
+    "rules": {"create reverse shell": {"meta": {"namespace": "communication/c2/shell", "lib": False,
+                                                "is_subscope_rule": False, "attack": [{"id": "T1059"}],
+                                                "mbc": []},
+                                       "matches": [[{"type": "absolute", "value": 0x2001000}, {}]]}},
+}
+
+
+def test_capa_capabilities_are_rebased_and_reach_payload_report_and_continuation(tmp_path):
+    ghidra = FakeGhidra(strings=[{"function_count": 40, "image_base": "0x100000"},
+                                 {"address": "0x101000", "value": "hello"}])
+    fc = FakeCapa(doc=CAPA_DOC)
+    res, out, _g = _run(FIXTURES / "sample.elf", tmp_path, ghidra=ghidra, capa=fc)
+    f = _fields(res)
+    assert fc.calls[0]["kind"] == "elf" and fc.calls[0]["max_kb"] == sw.CAPA_MAX_KB
+    assert f["capa_status"] == "ok" and f["capabilities_total"] == 1
+    assert f["capabilities"].fields == {"rule": ["create reverse shell"], "namespace": ["communication/c2/shell"],
+                                        "attack": ["T1059"]}
+    report = json.loads((out / "report.json").read_text())
+    assert report["capabilities"][0]["functions"] == ["0x101000"]  # vivisect 0x2001000 -> Ghidra's image
+    _s, _p, state = unpack(out / "continuation.tar.gz", tmp_path / "cont", max_bytes=1 << 30)
+    assert state.sweep["capabilities"] == report["capabilities"]
+
+
+def test_capa_runs_only_on_pe_elf_dotnet(tmp_path):
+    fc = FakeCapa()
+    _run(FIXTURES / "sample.exe", tmp_path, capa=fc)
+    assert [c["kind"] for c in fc.calls] == ["pe"]
+    z = tmp_path / "a.zip"
+    with zipfile.ZipFile(z, "w") as zf:
+        zf.writestr("x.txt", "hi")
+    res, _out, _g = _run(z, tmp_path, capa=fc)
+    assert len(fc.calls) == 1 and "capa_status" not in _fields(res)
+
+
+@pytest.mark.parametrize("capa_fn,status,code", [
+    (FakeCapa("unsupported"), "unsupported", None),
+    (FakeCapa("timeout"), "timeout", "capa_timeout"),
+    (lambda *a, **kw: (_ for _ in ()).throw(OSError("no capa")), "failed", "capa_failed"),
+])
+def test_capa_failures_are_warnings_and_the_sweep_goes_on(tmp_path, capa_fn, status, code):
+    res, _out, _g = _run(FIXTURES / "sample.exe", tmp_path, capa=capa_fn)
+    f = _fields(res)
+    assert res.status == "ok" and f["capa_status"] == status and f["capabilities_total"] == 0
+    assert "capabilities" not in f
+    assert (code in _codes(res)) if code else not any(c.startswith("capa") for c in _codes(res))
+
+
+def test_ghidra_strings_first_line_carries_the_image_base(tmp_path):
+    p = tmp_path / "s.jsonl"
+    p.write_text('{"function_count": 7, "image_base": "0x140000000"}\n{"address": "0x1", "value": "v"}\n')
+    gs = sw._read_ghidra_strings(p)
+    assert (gs.function_count, gs.image_base, gs.strings) == (7, 0x140000000, [("0x1", "v")])
+    p.write_text('{"function_count": 7, "image_base": "ram:00400000"}\n')
+    assert sw._read_ghidra_strings(p).image_base is None

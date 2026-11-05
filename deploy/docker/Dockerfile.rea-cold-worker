@@ -100,6 +100,33 @@ RUN curl -fsSL -o ghidra.zip "${GHIDRA_URL}" \
     && unzip -q ghidra.zip -d /build/x && rm ghidra.zip \
     && mv /build/x/ghidra_* /opt/ghidra && rm -rf /build/x
 
+# --------------------------------------------- capa (hash-locked wheels + pinned rules)
+# The sweep runs capa beside Ghidra. Not the standalone release binary: that is a PyInstaller
+# one-file build, which unpacks itself to $TMPDIR and runs from there, and the slot's only
+# writable dir (/tmp) is noexec. Rules and FLIRT signatures are the same release's, by sha256.
+FROM ${JDK_IMAGE} AS capa
+ARG CAPA_RULES_SHA256=3d14dbdaf5b71731e42395ed5fa4d287418e6a2e5d6b0a348c7fd9fbe1699611
+ARG CAPA_SRC_SHA256=d3f6006ad61e6591896f524566c191eca89c6220611969e1bd485bd9a1098180
+ARG CAPA_VERSION=10.0.0
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       ca-certificates curl python3 python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+COPY deploy/rea/capa-requirements.txt /build/capa-requirements.txt
+RUN python3 -m venv /opt/capa \
+    && /opt/capa/bin/pip install --no-cache-dir --require-hashes --no-deps --only-binary :all: \
+       -r /build/capa-requirements.txt \
+    && /opt/capa/bin/pip check \
+    && /opt/capa/bin/capa --version | grep -qx "capa ${CAPA_VERSION}"
+WORKDIR /build
+RUN curl -fsSL -o rules.tgz "https://codeload.github.com/mandiant/capa-rules/tar.gz/refs/tags/v${CAPA_VERSION}" \
+    && echo "${CAPA_RULES_SHA256}  rules.tgz" | sha256sum -c - \
+    && mkdir /opt/capa/rules && tar -xzf rules.tgz -C /opt/capa/rules --strip-components=1 \
+    && curl -fsSL -o capa.tgz "https://codeload.github.com/mandiant/capa/tar.gz/refs/tags/v${CAPA_VERSION}" \
+    && echo "${CAPA_SRC_SHA256}  capa.tgz" | sha256sum -c - \
+    && tar -xzf capa.tgz --strip-components=1 "capa-${CAPA_VERSION}/sigs" \
+    && mv sigs /opt/capa/sigs && rm -rf /build/*
+
 # ------------------------------------------- fixtures (regeneration only; not in image)
 FROM ${JDK_IMAGE} AS rea-fixtures-build
 RUN apt-get update \
@@ -137,6 +164,7 @@ RUN d=/opt/ghidra/Ghidra/Features/Decompiler/os/linux_x86_64 \
     && printf '#!/bin/sh\nulimit -v %s || exit 1\nexec "$0.bin" "$@"\n' "${DECOMPILE_MAX_KB}" > "$d/decompile" \
     && chmod 755 "$d/decompile"
 COPY --from=rea-build /opt/rea /opt/rea
+COPY --from=capa /opt/capa /opt/capa
 COPY deploy/rea/ghidra_scripts /opt/rea/ghidra_scripts
 
 COPY pyproject.toml README.md /src/blastbox/
@@ -192,6 +220,11 @@ RUN --mount=type=bind,source=deploy/rea,target=/mnt/rea \
     echo '== rea --mcp over the saved project'; \
     REA_GHIDRA_PROJECT_PATH="$w/proj/sample.gpr" REA_GHIDRA_PROGRAM_NAME=sample.elf \
         python -I /mnt/rea/smoke_mcp.py "$w/in/sample.elf" "$REA_TOOLS_SHA256"; \
+    echo '== capa (ELF fixture)'; \
+    /opt/capa/bin/capa -j -q -f elf -b vivisect -r /opt/capa/rules -s /opt/capa/sigs -- "$w/in/sample.elf" \
+        > "$w/capa.json"; \
+    python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print('capa rules matched:', len(d['rules']))" \
+        "$w/capa.json"; \
     echo '== import blastbox.engines.rea'; \
     python -c "import blastbox.worker.cold, blastbox.engines.rea, pefile, PIL; print('blastbox rea worker ready')"; \
     echo '== nothing written outside HOME/TMPDIR'; \

@@ -466,3 +466,33 @@ def test_upx_unpack_failures_leave_no_output(tmp_path: Path, outcome, write, exp
 
     assert upx_unpack(tmp_path / "in.exe", dest, 30, env={}, max_bytes=1024, run_fn=Fake(hook=hook)) == expect
     assert not dest.exists()
+
+
+def test_run_capa_pins_format_backend_rules_and_caps(tmp_path: Path) -> None:
+    fake = Fake(RunOutcome(0, b'{"rules": {}}'))
+    status, out = r.run_capa(tmp_path / "s.exe", "pe", 90, env={"PATH": "/bin"}, capa_bin="/opt/capa/bin/capa",
+                             rules=Path("/opt/capa/rules"), signatures=Path("/opt/capa/sigs"), max_kb=1024,
+                             max_stdout=1 << 20, run_fn=fake)
+    assert (status, out) == ("ok", b'{"rules": {}}')
+    argv, kw = fake.calls[0]
+    assert argv[3:] == ["sh", "1024", "/opt/capa/bin/capa", "pe", "vivisect", "/opt/capa/rules", "/opt/capa/sigs",
+                        str((tmp_path / "s.exe").resolve())]
+    assert kw["timeout_s"] == 90 and kw["max_stdout"] == 1 << 20
+    assert kw["env"]["CAPA_SAVE_WORKSPACE"] == "0" and "CAPA_LOAD_VIV_WORKSPACE" not in kw["env"]
+    r.run_capa(tmp_path / "s.exe", "dotnet", 9, env={}, capa_bin="c", rules=Path("r"), signatures=Path("s"),
+               max_kb=1, max_stdout=1, run_fn=fake)
+    assert fake.calls[1][0][6:8] == ["dotnet", "dotnet"]
+
+
+@pytest.mark.parametrize("outcome,expect", [
+    (RunOutcome(17), "unsupported"),                  # E_INVALID_FILE_ARCH (an ARM ELF)
+    (RunOutcome(16), "unsupported"),
+    (RunOutcome(1, b"{}"), "failed"),
+    (RunOutcome(0, b""), "failed"),
+    (RunOutcome(None, timed_out=True), "timeout"),
+    (RunOutcome(None, b"{", capped=True), "too_large"),
+])
+def test_run_capa_statuses(tmp_path: Path, outcome, expect) -> None:
+    status, out = r.run_capa(tmp_path / "s", "elf", 9, env={}, capa_bin="c", rules=Path("r"), signatures=Path("s"),
+                             max_kb=1, max_stdout=1, run_fn=Fake(outcome))
+    assert (status, out) == (expect, b"")

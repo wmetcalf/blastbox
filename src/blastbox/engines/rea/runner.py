@@ -523,3 +523,45 @@ def upx_unpack(
         dest.unlink(missing_ok=True)
         return "failed"
     return "ok"
+
+
+CAPA_BACKENDS = {"pe": ("pe", "vivisect"), "elf": ("elf", "vivisect"), "dotnet": ("dotnet", "dotnet")}
+# capa's exit codes for a file it does not handle (main.py E_INVALID_FILE_TYPE/_ARCH/_OS).
+_CAPA_UNSUPPORTED = frozenset({16, 17, 18})
+CapaStatus = Literal["ok", "timeout", "failed", "unsupported", "too_large"]
+
+
+def run_capa(
+    sample: Path,
+    kind: str,
+    timeout_s: float,
+    *,
+    env: Mapping[str, str],
+    capa_bin: str,
+    rules: Path,
+    signatures: Path,
+    max_kb: int,
+    max_stdout: int,
+    run_fn: RunFn = bounded_run,
+) -> tuple[CapaStatus, bytes]:
+    """``capa -j`` over ``sample`` (static: vivisect or dnfile extract features, nothing runs).
+
+    The format and backend are fixed per ``kind`` (``CAPA_BACKENDS``), never auto-detected, and
+    the rule and signature sets are the pinned ones. ``ulimit -v`` caps the address space
+    (vivisect's workspace grows with the image), ``max_stdout`` the JSON document.
+    """
+    fmt, backend = CAPA_BACKENDS[kind]
+    argv = ["sh", "-c",
+            'ulimit -v "$1" || exit 1; exec "$2" -j -q -f "$3" -b "$4" -r "$5" -s "$6" -- "$7"',
+            "sh", str(max_kb), capa_bin, fmt, backend, str(rules), str(signatures), str(sample.resolve())]
+    out = run_fn(argv, env={**env, "CAPA_SAVE_WORKSPACE": "0"}, cwd=None, timeout_s=timeout_s,
+                 max_stdout=max_stdout)
+    if out.timed_out:
+        return "timeout", b""
+    if out.capped:
+        return "too_large", b""
+    if out.rc in _CAPA_UNSUPPORTED:
+        return "unsupported", b""
+    if out.rc != 0 or not out.stdout:
+        return "failed", b""
+    return "ok", out.stdout
