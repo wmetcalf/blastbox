@@ -1,4 +1,4 @@
-"""capa (github.com/mandiant/capa) over the sample, run by the sweep beside Ghidra.
+"""capa (github.com/mandiant/capa) over the sample, run by the sweep after Ghidra.
 
 capa matches its rule set (``-r``, the pinned capa-rules release) against the features
 vivisect (PE/ELF) or dnfile (.NET) extracts statically. The sample never runs. The result is a

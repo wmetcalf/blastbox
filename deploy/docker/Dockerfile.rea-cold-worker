@@ -101,7 +101,7 @@ RUN curl -fsSL -o ghidra.zip "${GHIDRA_URL}" \
     && mv /build/x/ghidra_* /opt/ghidra && rm -rf /build/x
 
 # --------------------------------------------- capa (hash-locked wheels + pinned rules)
-# The sweep runs capa beside Ghidra. Not the standalone release binary: that is a PyInstaller
+# The sweep runs capa after Ghidra. Not the standalone release binary: that is a PyInstaller
 # one-file build, which unpacks itself to $TMPDIR and runs from there, and the slot's only
 # writable dir (/tmp) is noexec. Rules and FLIRT signatures are the same release's, by sha256.
 FROM ${JDK_IMAGE} AS capa

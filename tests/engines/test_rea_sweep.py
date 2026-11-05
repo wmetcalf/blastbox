@@ -640,7 +640,15 @@ def test_capa_capabilities_are_rebased_and_reach_payload_report_and_continuation
     ghidra = FakeGhidra(strings=[{"function_count": 40, "image_base": "0x100000"},
                                  {"address": "0x101000", "value": "hello"}])
     fc = FakeCapa(doc=CAPA_DOC)
-    res, out, _g = _run(FIXTURES / "sample.elf", tmp_path, ghidra=ghidra, capa=fc)
+    seen_ghidra = []
+    real_call = fc.__call__
+
+    def capa_after_ghidra(*a, **kw):
+        seen_ghidra.append(len(ghidra.calls))  # capa runs after Ghidra, never beside it
+        return real_call(*a, **kw)
+
+    res, out, _g = _run(FIXTURES / "sample.elf", tmp_path, ghidra=ghidra, capa=capa_after_ghidra)
+    assert seen_ghidra == [1]
     f = _fields(res)
     assert fc.calls[0]["kind"] == "elf" and fc.calls[0]["max_kb"] == sw.CAPA_MAX_KB
     assert f["capa_status"] == "ok" and f["capabilities_total"] == 1

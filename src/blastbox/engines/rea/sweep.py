@@ -11,7 +11,7 @@ One job, in order, everything under a fresh per-job dir in ``BLASTBOX_WORK_DIR``
    is a warning and the packed original goes on, to stop at ``chain_stop: packed``;
 5. native code (pe/elf/macho/dotnet): ``analyzeHeadless`` import + auto-analysis with the
    bundled ``ListStrings.java`` post-script dumping defined strings and the image base;
-5a. beside it, on its own thread, ``capa`` (pe/elf/dotnet; ``capa.py``): rule matches with ATT&CK/MBC
+5a. after it, ``capa`` (pe/elf/dotnet; ``capa.py``): rule matches with ATT&CK/MBC
    ids and the functions they hit, moved into Ghidra's image base. They go to the payload
    (``capa_status``, ``capabilities_total``, ``capabilities`` columns), the report and
    ``State.sweep["capabilities"]``, where the agent seeds its todo with those functions. A capa
@@ -64,7 +64,6 @@ import mmap
 import os
 import shutil
 import tempfile
-import threading
 import re
 import time
 from collections.abc import Callable, Iterator
@@ -107,7 +106,9 @@ EXTRACT_TIMEOUT_S = 120.0
 UNPACK_TIMEOUT_S = 60.0
 MAX_UNPACKED_BYTES = 256 * 1024 * 1024
 DEFAULT_CAPA_S = 300.0
-CAPA_MAX_KB = 2 * 1024 * 1024  # address-space cap on capa (KiB): it runs beside Ghidra in the slot
+# Address-space cap on capa (KiB). vivisect on an 876 KB PE64 peaked at 2.8 GB RSS (MemoryError
+# under a 2 GiB cap). capa runs after Ghidra, never beside it: the two together outgrow a 6 GiB slot.
+CAPA_MAX_KB = 4 * 1024 * 1024
 MAX_CAPA_JSON = 64 * 1024 * 1024
 STATE_CAPABILITIES = 64  # capa rules carried in the continuation for the agent
 DEFAULT_CAPA_BIN = "/opt/capa/bin/capa"
@@ -254,13 +255,6 @@ def _read_ghidra_strings(path: Path) -> GhidraStrings:
     return GhidraStrings(out, truncated, bad, function_count, image_base)
 
 
-@dataclass
-class _CapaJob:
-    thread: threading.Thread | None = None
-    result: tuple[CapaStatus, bytes] | None = None
-    error: str | None = None
-
-
 class ReaSweepEngine:
     """Pass 0 of the REA chain: deterministic inspection, extraction and Ghidra import."""
 
@@ -338,9 +332,6 @@ class ReaSweepEngine:
             analysed = self._unpack(input, job, min(UNPACK_TIMEOUT_S, remaining()), warnings)
             unpacked = analysed != input
 
-        # 4b. capa runs beside Ghidra (its own process, its own address-space cap).
-        capa_job = self._start_capa(analysed, kind, job, remaining()) if kind in CAPA_BACKENDS else None
-
         # 4. Ghidra
         ghidra_status: GhidraStatus = "skipped"
         project = job / "proj"
@@ -391,10 +382,11 @@ class ReaSweepEngine:
                 yield f"ghidra:{addr}", value
             yield from wide_urls
 
+        # 4b. capa, after Ghidra (see CAPA_MAX_KB), moved into Ghidra's image base.
         capa_status: CapaStatus | None = None
         capabilities: list[dict[str, Any]] = []
-        if capa_job is not None:
-            capa_status, capabilities = self._finish_capa(capa_job, image_base, warnings)
+        if kind in CAPA_BACKENDS:
+            capa_status, capabilities = self._capa(analysed, kind, job, image_base, remaining(), warnings)
 
         iocs = extract_iocs(sources(), limit=MAX_IOCS)
         if go_lits:
@@ -484,38 +476,21 @@ class ReaSweepEngine:
             return "packed"
         return None
 
-    def _start_capa(self, sample: Path, kind: str, job: Path, remaining_s: float) -> _CapaJob:
-        """Start ``capa`` on a thread; ``_finish_capa`` joins it."""
-        budget = min(_env_seconds("REA_CAPA_TIMEOUT_S", DEFAULT_CAPA_S), remaining_s)
-        cj = _CapaJob()
-        if budget < 1:
-            cj.result = ("timeout", b"")
-            return cj
-        data = Path(DEFAULT_CAPA_DATA)
-        env = rea_env(job / "capa", os.environ)
-
-        def run() -> None:
-            try:
-                cj.result = self._capa_fn(sample, kind, budget, env=env, capa_bin=DEFAULT_CAPA_BIN,
-                                          rules=data / "rules", signatures=data / "sigs",
-                                          max_kb=CAPA_MAX_KB, max_stdout=MAX_CAPA_JSON)
-            except Exception as exc:
-                cj.error = f"exception:{type(exc).__name__}"
-
-        cj.thread = threading.Thread(target=run, name="rea-capa", daemon=True)
-        cj.thread.start()
-        return cj
-
-    @staticmethod
-    def _finish_capa(cj: _CapaJob, image_base: int | None,
-                     warnings: list[Warning]) -> tuple[CapaStatus, list[dict[str, Any]]]:
+    def _capa(self, sample: Path, kind: str, job: Path, image_base: int | None, remaining_s: float,
+              warnings: list[Warning]) -> tuple[CapaStatus, list[dict[str, Any]]]:
         """capa's status and its summarized capabilities, rebased into Ghidra's image."""
-        if cj.thread is not None:
-            cj.thread.join()
-        if cj.error is not None or cj.result is None:
-            warnings.append(Warning(code="capa_failed", message=cj.error or "capa returned nothing"))
+        budget = min(_env_seconds("REA_CAPA_TIMEOUT_S", DEFAULT_CAPA_S), remaining_s)
+        if budget < 1:
+            warnings.append(Warning(code="capa_timeout", message="no time left for capa"))
+            return "timeout", []
+        data = Path(DEFAULT_CAPA_DATA)
+        try:
+            status, out = self._capa_fn(sample, kind, budget, env=rea_env(job / "capa", os.environ),
+                                        capa_bin=DEFAULT_CAPA_BIN, rules=data / "rules",
+                                        signatures=data / "sigs", max_kb=CAPA_MAX_KB, max_stdout=MAX_CAPA_JSON)
+        except Exception as exc:
+            warnings.append(Warning(code="capa_failed", message=f"exception:{type(exc).__name__}"))
             return "failed", []
-        status, out = cj.result
         if status != "ok":
             if status != "unsupported":
                 warnings.append(Warning(code=f"capa_{status}", message=f"capa: {status}"))
