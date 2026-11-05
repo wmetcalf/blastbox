@@ -63,10 +63,13 @@ class Validated:
     downgraded: list[str]  # observed sections left without evidence
 
 
+_C0 = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")  # control characters other than \t and \n
+
+
 def _str(value: Any, cap: int, what: str) -> str:
     if not isinstance(value, str) or len(value) > cap:
         raise ReportInvalid(f"{what}: not a string of at most {cap} chars")
-    return value.strip()
+    return _C0.sub(" ", value).strip()
 
 
 def _norm(addr: str) -> str:

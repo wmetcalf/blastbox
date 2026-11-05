@@ -1780,6 +1780,15 @@ def test_invalid_report_is_dropped_and_the_pass_still_seals(tmp_path, monkeypatc
     assert [s["key"] for s in carried["sections"]] == list(prompts.REPORT_KEYS)
 
 
+def test_report_with_a_raw_control_character_is_kept_and_cleaned(tmp_path, monkeypatch):
+    # A real ELF's report copied a sample string with a raw control character into its JSON.
+    raw = json.dumps(_report()).replace('"prints and exits"', '"prints\x01and\x1bexits"')
+    assert "\x01" in raw
+    res, _o, _m = _report_run(tmp_path, monkeypatch, answer(raw), prior=PRIOR_REPORT)
+    rep = json.loads(res.payload.fields["analysis_report"])
+    assert rep["verdict"]["rationale"] == "prints and exits" and "report_invalid" not in _codes(res)
+
+
 def test_unparseable_report_is_invalid(tmp_path, monkeypatch):
     res, _o, _m = _report_run(tmp_path, monkeypatch, answer("not json at all"))
     assert "analysis_report" not in res.payload.fields and "report_invalid" in _codes(res)

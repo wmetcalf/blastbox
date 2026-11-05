@@ -267,8 +267,10 @@ def render_result(result: dict[str, Any]) -> tuple[str, bool]:
 
 
 def _parse_json(text: str) -> Any:
+    # strict=False: the model copies sample strings into its JSON, raw control characters and all
+    # (a rejected report on a real ELF held one); they are cleaned where the text is kept.
     try:
-        return json.loads(text)
+        return json.loads(text, strict=False)
     except (ValueError, RecursionError):
         return None
 
