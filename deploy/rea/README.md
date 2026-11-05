@@ -186,6 +186,28 @@ With `FilterURLs On`, tinyproxy matches the full request URL (`http://host:port/
 the Host header for origin-form requests), so the regex pins scheme, host and port. Requests on
 port 8888 can use any path.
 
+### Hosted model (OpenRouter) through `rea-model-gw`
+
+The engine never holds a hosted-model key. `rea-model-gw` (nginx, pinned by digest, read-only,
+no capabilities) is the only holder: it sits on `model-gw`, an `--internal` /29 shared only with
+`rea-model-proxy` (10.231.201.2), and on `model-egress` for the outbound leg. It serves exactly
+`POST /api/v1/chat/completions` on 10.231.201.3:8080 (anything else is 403), adds the
+`Authorization` header from `model-gw/secret/auth.conf` and forwards to openrouter.ai over
+verified TLS with SNI, stripping client identity headers. tinyproxy gets one more filter line,
+`^http://10\.231\.201\.3:8080/api/v1/chat/completions$`, so a slot can reach that one URL and
+nothing else on the gateway.
+
+Agent images for it are built with `--build-arg REA_MODEL_URL=http://10.231.201.3:8080/api/v1
+--build-arg REA_MODEL_ID=deepseek/deepseek-v4.1-flash --build-arg REA_MODEL_DIALECT=openrouter`
+(OpenRouter ignores `chat_template_kwargs`; the `openrouter` dialect sends `reasoning` instead).
+
+The key file is one line, mode 0400, owned by the gateway's uid (1000), never committed
+(`model-gw/.gitignore`):
+
+```text
+proxy_set_header Authorization "Bearer <key>";
+```
+
 ### Gate inside the dispatcher
 
 The dispatcher's `bridge=` gate runs `docker network inspect` through the socket proxy (which
